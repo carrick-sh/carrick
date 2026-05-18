@@ -96,6 +96,9 @@ pub const LINUX_MADV_SEQUENTIAL: u64 = 2;
 pub const LINUX_MADV_WILLNEED: u64 = 3;
 pub const LINUX_MADV_DONTNEED: u64 = 4;
 pub const LINUX_MADV_FREE: u64 = 8;
+pub const LINUX_MREMAP_MAYMOVE: u64 = 0x01;
+pub const LINUX_MREMAP_FIXED: u64 = 0x02;
+pub const LINUX_MREMAP_DONTUNMAP: u64 = 0x04;
 pub const LINUX_RLIM_INFINITY: u64 = u64::MAX;
 pub const LINUX_RUSAGE_SELF: i32 = 0;
 pub const LINUX_RUSAGE_CHILDREN: i32 = -1;
@@ -632,6 +635,7 @@ impl SyscallDispatcher {
             178 => self.getpid(),
             214 => self.brk(request),
             215 => self.munmap(request),
+            216 => self.mremap(request),
             222 => self.mmap(request, memory)?,
             226 => self.mprotect(request, memory),
             233 => self.madvise(request, memory),
@@ -3138,6 +3142,36 @@ impl SyscallDispatcher {
             };
         }
         DispatchOutcome::Returned { value: 0 }
+    }
+
+    fn mremap(&self, request: SyscallRequest) -> DispatchOutcome {
+        let old_address = request.arg(0);
+        let old_size = request.arg(1);
+        let new_size = request.arg(2);
+        let flags = request.arg(3);
+        if new_size == 0 {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+        if flags & !(LINUX_MREMAP_MAYMOVE | LINUX_MREMAP_FIXED | LINUX_MREMAP_DONTUNMAP) != 0 {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+        if !range_within(old_address, old_size, LINUX_MMAP_BASE, LINUX_MMAP_SIZE) {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+        if new_size <= old_size {
+            return DispatchOutcome::Returned {
+                value: old_address as i64,
+            };
+        }
+        DispatchOutcome::Errno {
+            errno: LINUX_ENOMEM,
+        }
     }
 
     fn mprotect(&self, request: SyscallRequest, memory: &impl GuestMemory) -> DispatchOutcome {

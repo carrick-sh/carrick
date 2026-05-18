@@ -173,6 +173,7 @@ fn names_linux_aarch64_bringup_syscalls() {
         (176, "getgid"),
         (177, "getegid"),
         (178, "gettid"),
+        (216, "mremap"),
         (260, "wait4"),
         (261, "prlimit64"),
         (266, "clock_adjtime"),
