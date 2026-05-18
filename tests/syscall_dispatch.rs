@@ -908,6 +908,161 @@ fn readlinkat_reports_synthetic_proc_self_exe() {
 }
 
 #[test]
+fn openat_reads_synthetic_proc_maps_and_cpuinfo() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
+    memory.write_bytes(0x4000, b"/proc/self/maps\0").unwrap();
+    memory.write_bytes(0x4040, b"/proc/cpuinfo\0").unwrap();
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    56,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 3 }
+    );
+    let maps_read = dispatcher
+        .dispatch(
+            SyscallRequest::new(63, SyscallArgs::from([3, 0x4100, 0x400, 0, 0, 0])),
+            &mut memory,
+            &mut reporter,
+        )
+        .unwrap();
+    let DispatchOutcome::Returned { value: maps_len } = maps_read else {
+        panic!("expected /proc/self/maps read success, got {maps_read:?}");
+    };
+    let maps = String::from_utf8(memory.read_bytes(0x4100, maps_len as usize).unwrap()).unwrap();
+    assert!(maps.contains(" r-xp "));
+    assert!(maps.contains("/proc/self/exe"));
+    assert!(maps.contains("[heap]"));
+    assert!(maps.ends_with('\n'));
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    56,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4040, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 4 }
+    );
+    let cpuinfo_read = dispatcher
+        .dispatch(
+            SyscallRequest::new(63, SyscallArgs::from([4, 0x4500, 0x200, 0, 0, 0])),
+            &mut memory,
+            &mut reporter,
+        )
+        .unwrap();
+    let DispatchOutcome::Returned { value: cpuinfo_len } = cpuinfo_read else {
+        panic!("expected /proc/cpuinfo read success, got {cpuinfo_read:?}");
+    };
+    let cpuinfo =
+        String::from_utf8(memory.read_bytes(0x4500, cpuinfo_len as usize).unwrap()).unwrap();
+    assert!(cpuinfo.contains("processor\t: 0"));
+    assert!(cpuinfo.contains("CPU architecture\t: 8"));
+    assert!(cpuinfo.contains("Features\t:"));
+
+    let report = reporter.finish();
+    assert!(report.unhandled_syscalls.is_empty());
+    assert!(report.proc_read_unimplemented.is_empty());
+}
+
+#[test]
+fn synthetic_proc_files_write_regular_packed_stat_records() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
+    memory.write_bytes(0x4000, b"/proc/cpuinfo\0").unwrap();
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    79,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4000, 0x4100, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let stat = read_stat(&memory, 0x4100);
+    let mode = stat.st_mode;
+    let size = stat.st_size;
+    assert_eq!(mode & LINUX_S_IFMT, LINUX_S_IFREG);
+    assert_eq!(mode & 0o777, 0o444);
+    assert!(size > 0);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    56,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 3 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(80, SyscallArgs::from([3, 0x4200, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let fd_stat = read_stat(&memory, 0x4200);
+    let fd_mode = fd_stat.st_mode;
+    let fd_size = fd_stat.st_size;
+    assert_eq!(fd_mode & LINUX_S_IFMT, LINUX_S_IFREG);
+    assert_eq!(fd_mode & 0o777, 0o444);
+    assert_eq!(fd_size, size);
+
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn missing_proc_file_records_compat_report_entry() {
+    let mut memory = LinearMemory::new(0x4000, b"/proc/self/status\0".to_vec());
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    let outcome = dispatcher
+        .dispatch(
+            SyscallRequest::new(
+                56,
+                SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
+            ),
+            &mut memory,
+            &mut reporter,
+        )
+        .unwrap();
+
+    assert_eq!(outcome, DispatchOutcome::Errno { errno: 2 });
+    let report = reporter.finish();
+    assert!(report.unhandled_syscalls.is_empty());
+    assert_eq!(report.proc_read_unimplemented[0].path, "/proc/self/status");
+    assert_eq!(report.proc_read_unimplemented[0].count, 1);
+}
+
+#[test]
 fn newfstatat_and_fstat_write_typed_linux_stat() {
     let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
         "etc/motd",

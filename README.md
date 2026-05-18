@@ -58,6 +58,10 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
   using `getdents64`.
 - Rootfs symlink target text is preserved for Linux `readlinkat(2)`, and
   `/proc/self/exe` is synthesized from the launched executable path.
+- Synthetic procfs support now serves `/proc/self/maps` and `/proc/cpuinfo`
+  through normal `openat(2)`/`read(2)` descriptors, writes their `stat(2)`
+  records with the packed Linux ABI struct path, and records compatibility-report
+  entries for proc/sys files that are not synthesized yet.
 - USDT support wires compatibility events to DTrace probes through the Apache-2.0
   `usdt` crate.
 - `carrick syscalls` exposes the initial Linux/aarch64 syscall table and support

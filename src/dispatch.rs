@@ -222,6 +222,12 @@ enum OpenDescription {
         offset: usize,
         status_flags: u64,
     },
+    SyntheticFile {
+        path: String,
+        contents: Vec<u8>,
+        offset: usize,
+        status_flags: u64,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -234,14 +240,16 @@ impl OpenDescription {
     fn status_flags(&self) -> u64 {
         match self {
             OpenDescription::File { status_flags, .. }
-            | OpenDescription::Directory { status_flags, .. } => *status_flags,
+            | OpenDescription::Directory { status_flags, .. }
+            | OpenDescription::SyntheticFile { status_flags, .. } => *status_flags,
         }
     }
 
     fn set_status_flags(&mut self, next: u64) {
         match self {
             OpenDescription::File { status_flags, .. }
-            | OpenDescription::Directory { status_flags, .. } => *status_flags = next,
+            | OpenDescription::Directory { status_flags, .. }
+            | OpenDescription::SyntheticFile { status_flags, .. } => *status_flags = next,
         }
     }
 }
@@ -319,7 +327,7 @@ impl SyscallDispatcher {
             48 => self.faccessat(request, memory)?,
             49 => self.chdir(request, memory)?,
             50 => self.fchdir(request),
-            56 => self.openat(request, memory)?,
+            56 => self.openat(request, memory, reporter)?,
             57 => self.close(request),
             61 => self.getdents64(request, memory)?,
             62 => self.lseek(request),
@@ -422,6 +430,9 @@ impl SyscallDispatcher {
             Ok(path) => path,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
+        if let Some(outcome) = self.synthetic_access(&path, mode) {
+            return Ok(outcome);
+        }
         let Some(rootfs) = &self.rootfs else {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_ENOENT,
@@ -508,9 +519,43 @@ impl SyscallDispatcher {
                 self.cwd = display_rootfs_path(&metadata.path);
                 DispatchOutcome::Returned { value: 0 }
             }
-            OpenDescription::File { .. } => DispatchOutcome::Errno {
-                errno: LINUX_ENOTDIR,
-            },
+            OpenDescription::File { .. } | OpenDescription::SyntheticFile { .. } => {
+                DispatchOutcome::Errno {
+                    errno: LINUX_ENOTDIR,
+                }
+            }
+        }
+    }
+
+    fn synthetic_access(&self, path: &str, mode: u64) -> Option<DispatchOutcome> {
+        if synthetic_proc_file(path, &self.executable_path).is_none() {
+            return None;
+        }
+        if mode & LINUX_W_OK != 0 {
+            Some(DispatchOutcome::Errno {
+                errno: LINUX_EACCES,
+            })
+        } else {
+            Some(DispatchOutcome::Returned { value: 0 })
+        }
+    }
+
+    fn record_unimplemented_virtual_file(
+        reporter: &mut CompatReporter,
+        path: &str,
+    ) -> Option<DispatchOutcome> {
+        if path.starts_with("/proc/") {
+            reporter.record(CompatEvent::proc_read_unimplemented(path.to_owned()));
+            Some(DispatchOutcome::Errno {
+                errno: LINUX_ENOENT,
+            })
+        } else if path.starts_with("/sys/") {
+            reporter.record(CompatEvent::sys_read_unimplemented(path.to_owned()));
+            Some(DispatchOutcome::Errno {
+                errno: LINUX_ENOENT,
+            })
+        } else {
+            None
         }
     }
 
@@ -788,6 +833,7 @@ impl SyscallDispatcher {
         &mut self,
         request: SyscallRequest,
         memory: &impl GuestMemory,
+        reporter: &mut CompatReporter,
     ) -> Result<DispatchOutcome, DispatchError> {
         let dirfd = request.arg(0);
         let pathname = request.arg(1);
@@ -807,59 +853,72 @@ impl SyscallDispatcher {
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
 
-        let Some(rootfs) = &self.rootfs else {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_ENOENT,
-            });
-        };
-        let metadata = match rootfs.metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(errno) => {
-                return Ok(DispatchOutcome::Errno {
-                    errno: rootfs_errno(errno),
-                });
+        let description = if let Some(contents) = synthetic_proc_file(&path, &self.executable_path)
+        {
+            OpenDescription::SyntheticFile {
+                path,
+                contents,
+                offset: 0,
+                status_flags: flags & !LINUX_O_CLOEXEC,
             }
-        };
+        } else {
+            if let Some(outcome) = Self::record_unimplemented_virtual_file(reporter, &path) {
+                return Ok(outcome);
+            }
+            let Some(rootfs) = &self.rootfs else {
+                return Ok(DispatchOutcome::Errno {
+                    errno: LINUX_ENOENT,
+                });
+            };
+            let metadata = match rootfs.metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(errno) => {
+                    return Ok(DispatchOutcome::Errno {
+                        errno: rootfs_errno(errno),
+                    });
+                }
+            };
 
-        let description = match metadata.kind {
-            RootFsEntryKind::File => {
-                let contents = match rootfs.read(&path) {
-                    Ok(contents) => contents,
-                    Err(errno) => {
-                        return Ok(DispatchOutcome::Errno {
-                            errno: rootfs_errno(errno),
-                        });
+            match metadata.kind {
+                RootFsEntryKind::File => {
+                    let contents = match rootfs.read(&path) {
+                        Ok(contents) => contents,
+                        Err(errno) => {
+                            return Ok(DispatchOutcome::Errno {
+                                errno: rootfs_errno(errno),
+                            });
+                        }
+                    };
+                    OpenDescription::File {
+                        path,
+                        metadata,
+                        contents,
+                        offset: 0,
+                        status_flags: flags & !LINUX_O_CLOEXEC,
                     }
-                };
-                OpenDescription::File {
-                    path,
-                    metadata,
-                    contents,
-                    offset: 0,
-                    status_flags: flags & !LINUX_O_CLOEXEC,
                 }
-            }
-            RootFsEntryKind::Directory => {
-                let entries = match rootfs.directory_entries(&path) {
-                    Ok(entries) => entries,
-                    Err(errno) => {
-                        return Ok(DispatchOutcome::Errno {
-                            errno: rootfs_errno(errno),
-                        });
+                RootFsEntryKind::Directory => {
+                    let entries = match rootfs.directory_entries(&path) {
+                        Ok(entries) => entries,
+                        Err(errno) => {
+                            return Ok(DispatchOutcome::Errno {
+                                errno: rootfs_errno(errno),
+                            });
+                        }
+                    };
+                    OpenDescription::Directory {
+                        path,
+                        metadata,
+                        entries,
+                        offset: 0,
+                        status_flags: flags & !LINUX_O_CLOEXEC,
                     }
-                };
-                OpenDescription::Directory {
-                    path,
-                    metadata,
-                    entries,
-                    offset: 0,
-                    status_flags: flags & !LINUX_O_CLOEXEC,
                 }
-            }
-            RootFsEntryKind::Symlink => {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_EINVAL,
-                });
+                RootFsEntryKind::Symlink => {
+                    return Ok(DispatchOutcome::Errno {
+                        errno: LINUX_EINVAL,
+                    });
+                }
             }
         };
 
@@ -976,6 +1035,9 @@ impl SyscallDispatcher {
         let (current, end) = match &*open {
             OpenDescription::File {
                 contents, offset, ..
+            }
+            | OpenDescription::SyntheticFile {
+                contents, offset, ..
             } => (*offset as i64, contents.len() as i64),
             OpenDescription::Directory {
                 entries, offset, ..
@@ -998,9 +1060,9 @@ impl SyscallDispatcher {
         }
 
         match &mut *open {
-            OpenDescription::File { offset, .. } | OpenDescription::Directory { offset, .. } => {
-                *offset = next as usize;
-            }
+            OpenDescription::File { offset, .. }
+            | OpenDescription::Directory { offset, .. }
+            | OpenDescription::SyntheticFile { offset, .. } => *offset = next as usize,
         }
         DispatchOutcome::Returned { value: next }
     }
@@ -1068,8 +1130,12 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
             };
             let open = open_file.description.borrow();
-            let OpenDescription::File { contents, .. } = &*open else {
-                return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+            let contents = match &*open {
+                OpenDescription::File { contents, .. }
+                | OpenDescription::SyntheticFile { contents, .. } => contents,
+                OpenDescription::Directory { .. } => {
+                    return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+                }
             };
             let offset =
                 usize::try_from(offset).map_err(|_| DispatchError::LengthTooLarge(offset))?;
@@ -1202,13 +1268,18 @@ impl SyscallDispatcher {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         };
         let mut open = open_file.description.borrow_mut();
-        let OpenDescription::File {
-            contents, offset, ..
-        } = &mut *open
-        else {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EISDIR,
-            });
+        let (contents, offset) = match &mut *open {
+            OpenDescription::File {
+                contents, offset, ..
+            }
+            | OpenDescription::SyntheticFile {
+                contents, offset, ..
+            } => (contents, offset),
+            OpenDescription::Directory { .. } => {
+                return Ok(DispatchOutcome::Errno {
+                    errno: LINUX_EISDIR,
+                });
+            }
         };
         let remaining = &contents[*offset..];
         let read_len = remaining.len().min(length);
@@ -1241,13 +1312,18 @@ impl SyscallDispatcher {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         };
         let mut open = open_file.description.borrow_mut();
-        let OpenDescription::File {
-            contents, offset, ..
-        } = &mut *open
-        else {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EISDIR,
-            });
+        let (contents, offset) = match &mut *open {
+            OpenDescription::File {
+                contents, offset, ..
+            }
+            | OpenDescription::SyntheticFile {
+                contents, offset, ..
+            } => (contents, offset),
+            OpenDescription::Directory { .. } => {
+                return Ok(DispatchOutcome::Errno {
+                    errno: LINUX_EISDIR,
+                });
+            }
         };
         let read_len = read_from_contents_at(memory, contents, *offset, &iovecs)?;
         *offset += read_len;
@@ -1271,10 +1347,14 @@ impl SyscallDispatcher {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         };
         let open = open_file.description.borrow();
-        let OpenDescription::File { contents, .. } = &*open else {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EISDIR,
-            });
+        let contents = match &*open {
+            OpenDescription::File { contents, .. }
+            | OpenDescription::SyntheticFile { contents, .. } => contents,
+            OpenDescription::Directory { .. } => {
+                return Ok(DispatchOutcome::Errno {
+                    errno: LINUX_EISDIR,
+                });
+            }
         };
 
         let read_len = if offset < contents.len() {
@@ -1443,6 +1523,9 @@ impl SyscallDispatcher {
             Ok(path) => path,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
+        if let Some(contents) = synthetic_proc_file(&path, &self.executable_path) {
+            return Ok(write_synthetic_stat(memory, statbuf, &path, contents.len()));
+        }
         let Some(rootfs) = &self.rootfs else {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_ENOENT,
@@ -1476,6 +1559,9 @@ impl SyscallDispatcher {
         let metadata = match &*open {
             OpenDescription::File { metadata, .. }
             | OpenDescription::Directory { metadata, .. } => metadata,
+            OpenDescription::SyntheticFile { path, contents, .. } => {
+                return write_synthetic_stat(memory, statbuf, path, contents.len());
+            }
         };
         write_stat(memory, statbuf, metadata)
     }
@@ -1497,7 +1583,9 @@ impl SyscallDispatcher {
         match self.open_files.get(&(dirfd as i32)) {
             Some(open_file) => match &*open_file.description.borrow() {
                 OpenDescription::Directory { path: dir, .. } => Ok(join_rootfs_path(dir, path)),
-                OpenDescription::File { .. } => Err(LINUX_ENOTDIR),
+                OpenDescription::File { .. } | OpenDescription::SyntheticFile { .. } => {
+                    Err(LINUX_ENOTDIR)
+                }
             },
             None => Err(LINUX_EBADF),
         }
@@ -1619,6 +1707,71 @@ fn write_stat(
     } else {
         DispatchOutcome::Returned { value: 0 }
     }
+}
+
+fn write_synthetic_stat(
+    memory: &mut impl GuestMemory,
+    statbuf: u64,
+    path: &str,
+    size: usize,
+) -> DispatchOutcome {
+    let stat = LinuxStat {
+        st_dev: 1,
+        st_ino: inode_for_path(Path::new(path)),
+        st_mode: LINUX_S_IFREG | 0o444,
+        st_nlink: 1,
+        st_uid: 0,
+        st_gid: 0,
+        st_rdev: 0,
+        __pad1: 0,
+        st_size: size as i64,
+        st_blksize: 4096,
+        __pad2: 0,
+        st_blocks: blocks_512(size),
+        st_atime: 0,
+        st_atime_nsec: 0,
+        st_mtime: 0,
+        st_mtime_nsec: 0,
+        st_ctime: 0,
+        st_ctime_nsec: 0,
+        __unused4: 0,
+        __unused5: 0,
+    };
+    write_packed(memory, statbuf, stat.as_bytes())
+}
+
+fn synthetic_proc_file(path: &str, executable_path: &str) -> Option<Vec<u8>> {
+    match path {
+        "/proc/self/maps" => Some(synthetic_proc_maps(executable_path).into_bytes()),
+        "/proc/cpuinfo" => Some(synthetic_proc_cpuinfo().to_vec()),
+        _ => None,
+    }
+}
+
+fn synthetic_proc_maps(executable_path: &str) -> String {
+    format!(
+        "0000000000400000-0000000000410000 r-xp 00000000 00:00 0 {executable_path}\n\
+         {heap_base:016x}-{heap_end:016x} rw-p 00000000 00:00 0 [heap]\n\
+         {mmap_base:016x}-{mmap_end:016x} rwxp 00000000 00:00 0 [carrick-mmap]\n\
+         0000007fffe00000-0000008000000000 rw-p 00000000 00:00 0 [stack]\n",
+        heap_base = LINUX_HEAP_BASE,
+        heap_end = LINUX_HEAP_BASE + LINUX_HEAP_SIZE,
+        mmap_base = LINUX_MMAP_BASE,
+        mmap_end = LINUX_MMAP_BASE + LINUX_MMAP_SIZE,
+    )
+}
+
+fn synthetic_proc_cpuinfo() -> &'static [u8] {
+    b"processor\t: 0\n\
+BogoMIPS\t: 48.00\n\
+Features\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm lrcpc dcpop asimddp\n\
+CPU implementer\t: 0x61\n\
+CPU architecture\t: 8\n\
+CPU variant\t: 0x0\n\
+CPU part\t: 0x000\n\
+CPU revision\t: 0\n\
+\n\
+Hardware\t: Carrick\n"
 }
 
 fn read_iovecs(
