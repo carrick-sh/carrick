@@ -50,6 +50,8 @@ enum Commands {
     },
     Run {
         image: String,
+        #[arg(long, default_value_t = DEFAULT_MAX_TRAPS)]
+        max_traps: usize,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
@@ -182,7 +184,11 @@ async fn main() -> anyhow::Result<()> {
             let summary = pull_image(&image, &store).await?;
             println!("{}", serde_json::to_string_pretty(&summary)?);
         }
-        Commands::Run { image, command } => {
+        Commands::Run {
+            image,
+            max_traps,
+            command,
+        } => {
             let image = ImageReference::parse(&image)?;
             let command = if command.is_empty() {
                 vec!["/bin/sh".to_owned()]
@@ -205,7 +211,7 @@ async fn main() -> anyhow::Result<()> {
                 &rootfs,
                 command.clone(),
                 std::iter::empty(),
-                DEFAULT_MAX_TRAPS,
+                max_traps,
             )
             .with_context(|| {
                 format!(
