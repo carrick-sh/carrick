@@ -33,6 +33,18 @@ pub const LINUX_EEXIST: i32 = 17;
 pub const LINUX_EPIPE: i32 = 32;
 pub const LINUX_ESPIPE: i32 = 29;
 pub const LINUX_EROFS: i32 = 30;
+pub const LINUX_FALLOC_FL_KEEP_SIZE: u64 = 0x01;
+pub const LINUX_FALLOC_FL_PUNCH_HOLE: u64 = 0x02;
+pub const LINUX_FALLOC_FL_COLLAPSE_RANGE: u64 = 0x08;
+pub const LINUX_FALLOC_FL_ZERO_RANGE: u64 = 0x10;
+pub const LINUX_FALLOC_FL_INSERT_RANGE: u64 = 0x20;
+pub const LINUX_FALLOC_FL_UNSHARE_RANGE: u64 = 0x40;
+pub const LINUX_FALLOC_FL_SUPPORTED: u64 = LINUX_FALLOC_FL_KEEP_SIZE
+    | LINUX_FALLOC_FL_PUNCH_HOLE
+    | LINUX_FALLOC_FL_COLLAPSE_RANGE
+    | LINUX_FALLOC_FL_ZERO_RANGE
+    | LINUX_FALLOC_FL_INSERT_RANGE
+    | LINUX_FALLOC_FL_UNSHARE_RANGE;
 pub const LINUX_ENOTDIR: i32 = 20;
 pub const LINUX_EISDIR: i32 = 21;
 pub const LINUX_EINVAL: i32 = 22;
@@ -476,6 +488,7 @@ impl SyscallDispatcher {
             44 => self.fstatfs(request, memory),
             45 => self.truncate(request, memory)?,
             46 => self.ftruncate(request),
+            47 => self.fallocate(request),
             48 => self.faccessat(request, memory)?,
             49 => self.chdir(request, memory)?,
             50 => self.fchdir(request),
@@ -1553,6 +1566,42 @@ impl SyscallDispatcher {
             RootFsEntryKind::File | RootFsEntryKind::Symlink => LINUX_EROFS,
         };
         Ok(DispatchOutcome::Errno { errno })
+    }
+
+    fn fallocate(&self, request: SyscallRequest) -> DispatchOutcome {
+        let fd = request.arg(0) as i32;
+        let mode = request.arg(1);
+        let offset = i64::from_ne_bytes(request.arg(2).to_ne_bytes());
+        let length = i64::from_ne_bytes(request.arg(3).to_ne_bytes());
+        if mode & !LINUX_FALLOC_FL_SUPPORTED != 0 {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+        if length <= 0 || offset < 0 {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+        if is_stdio_fd(fd) {
+            return DispatchOutcome::Errno {
+                errno: LINUX_ESPIPE,
+            };
+        }
+        let Some(open_file) = self.open_files.get(&fd) else {
+            return DispatchOutcome::Errno { errno: LINUX_EBADF };
+        };
+        let open = open_file.description.borrow();
+        let errno = match &*open {
+            OpenDescription::File { .. } | OpenDescription::SyntheticFile { .. } => LINUX_EROFS,
+            OpenDescription::Directory { .. } => LINUX_EISDIR,
+            OpenDescription::PipeReader { .. }
+            | OpenDescription::PipeWriter { .. }
+            | OpenDescription::EventFd { .. }
+            | OpenDescription::TimerFd { .. }
+            | OpenDescription::Epoll { .. } => LINUX_ESPIPE,
+        };
+        DispatchOutcome::Errno { errno }
     }
 
     fn ftruncate(&self, request: SyscallRequest) -> DispatchOutcome {

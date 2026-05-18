@@ -12,6 +12,7 @@ pub const SYS_LINKAT: u64 = 37;
 pub const SYS_RENAMEAT: u64 = 38;
 pub const SYS_TRUNCATE: u64 = 45;
 pub const SYS_FTRUNCATE: u64 = 46;
+pub const SYS_FALLOCATE: u64 = 47;
 pub const SYS_FCHMOD: u64 = 52;
 pub const SYS_FCHMODAT: u64 = 53;
 pub const SYS_FCHOWNAT: u64 = 54;

@@ -157,6 +157,17 @@ pub extern "C" fn _start() -> ! {
             exit(71);
         }
 
+        // fallocate: 47 (stdio is non-seekable)
+        if syscall4(SYS_FALLOCATE, 1, 0, 0, 4096) != ESPIPE {
+            exit(75);
+        }
+        if syscall4(SYS_FALLOCATE, 999, 0, 0, 4096) != EBADF {
+            exit(76);
+        }
+        if syscall4(SYS_FALLOCATE, 1, 0, 0, 0) != EINVAL {
+            exit(77);
+        }
+
         // fchmod: 52
         if syscall2(SYS_FCHMOD, 1, 0o644) != EROFS {
             exit(80);

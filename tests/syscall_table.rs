@@ -99,6 +99,7 @@ fn names_linux_aarch64_bringup_syscalls() {
         (44, "fstatfs"),
         (45, "truncate"),
         (46, "ftruncate"),
+        (47, "fallocate"),
         (59, "pipe2"),
         (71, "sendfile"),
         (72, "pselect6"),

@@ -4885,6 +4885,96 @@ fn truncate_bootstrap_returns_erofs_for_known_paths_and_enoent_for_missing() {
 }
 
 #[test]
+fn fallocate_bootstrap_reports_read_only_rootfs_and_validates_arguments() {
+    let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
+        "etc/motd",
+        b"fallocate fixture\n".as_slice(),
+    )]))])
+    .unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
+    memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(47, SyscallArgs::from([1, 0, 0, 4096, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 29 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(47, SyscallArgs::from([999, 0, 0, 4096, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 9 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(47, SyscallArgs::from([1, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 22 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(47, SyscallArgs::from([1, 0xdead, 0, 4096, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 22 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(47, SyscallArgs::from([1, 0, (-1_i64) as u64, 4096, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 22 }
+    );
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    56,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 3 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(47, SyscallArgs::from([3, 0, 0, 4096, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 30 }
+    );
+
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
 fn ftruncate_bootstrap_rejects_streams_and_read_only_rootfs_fds() {
     let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
         "etc/motd",
