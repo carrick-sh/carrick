@@ -37,6 +37,8 @@ pub struct RunResult {
     pub stderr: Vec<u8>,
     pub traps: usize,
     pub report: CompatReport,
+    #[serde(default)]
+    pub trap_limit_hit: bool,
 }
 
 pub fn run_static_elf_with_hvf(
@@ -208,6 +210,15 @@ where
 
     for traps in 1..=max_traps {
         let frame = runtime.next_syscall()?;
+        if std::env::var_os("CARRICK_TRACE_TRAPS").is_some() {
+            let name = crate::syscall::lookup_aarch64(frame.x8)
+                .map(|s| s.name)
+                .unwrap_or("<unknown>");
+            eprintln!(
+                "trap#{traps}: x8={} ({name}) x0={:#x} x1={:#x} x2={:#x} x3={:#x} x4={:#x} x5={:#x}",
+                frame.x8, frame.x0, frame.x1, frame.x2, frame.x3, frame.x4, frame.x5
+            );
+        }
         let outcome = dispatcher.dispatch(
             SyscallRequest::from_aarch64_frame(frame),
             runtime,
@@ -222,6 +233,7 @@ where
                     stderr: dispatcher.stderr().to_vec(),
                     traps,
                     report: reporter.finish(),
+                    trap_limit_hit: false,
                 });
             }
             DispatchOutcome::Returned { value } => runtime.complete_syscall(value)?,
@@ -229,7 +241,14 @@ where
         }
     }
 
-    Err(RuntimeError::TrapLimitExceeded { max_traps })
+    Ok(RunResult {
+        exit_code: -1,
+        stdout: dispatcher.stdout().to_vec(),
+        stderr: dispatcher.stderr().to_vec(),
+        traps: max_traps,
+        report: reporter.finish(),
+        trap_limit_hit: true,
+    })
 }
 
 fn run_split_loop<M, T>(
@@ -260,6 +279,7 @@ where
                     stderr: dispatcher.stderr().to_vec(),
                     traps,
                     report: reporter.finish(),
+                    trap_limit_hit: false,
                 });
             }
             DispatchOutcome::Returned { value } => trap.complete_syscall(value)?,
@@ -267,7 +287,14 @@ where
         }
     }
 
-    Err(RuntimeError::TrapLimitExceeded { max_traps })
+    Ok(RunResult {
+        exit_code: -1,
+        stdout: dispatcher.stdout().to_vec(),
+        stderr: dispatcher.stderr().to_vec(),
+        traps: max_traps,
+        report: reporter.finish(),
+        trap_limit_hit: true,
+    })
 }
 
 impl SyscallTrap for HvfTrapEngine {

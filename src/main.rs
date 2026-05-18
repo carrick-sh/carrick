@@ -175,9 +175,16 @@ async fn main() -> anyhow::Result<()> {
                     "stdout": String::from_utf8_lossy(&result.stdout),
                     "stderr": String::from_utf8_lossy(&result.stderr),
                     "traps": result.traps,
+                    "trap_limit_hit": result.trap_limit_hit,
                     "report": result.report,
                 }))?
             );
+            if result.trap_limit_hit {
+                bail!(
+                    "guest did not exit after {} traps (compat report above)",
+                    result.traps
+                );
+            }
         }
         Commands::Pull { image } => {
             let image = ImageReference::parse(&image)?;
@@ -231,10 +238,17 @@ async fn main() -> anyhow::Result<()> {
                     "stdout": String::from_utf8_lossy(&result.stdout),
                     "stderr": String::from_utf8_lossy(&result.stderr),
                     "traps": result.traps,
+                    "trap_limit_hit": result.trap_limit_hit,
                     "report": result.report,
                     "trap": hvf_capabilities(),
                 }))?
             );
+            if result.trap_limit_hit {
+                bail!(
+                    "guest did not exit after {} traps (compat report above)",
+                    result.traps
+                );
+            }
         }
         Commands::Shell { image } => {
             let image = ImageReference::parse(&image)?;

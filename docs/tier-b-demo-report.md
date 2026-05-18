@@ -344,3 +344,194 @@ codesign --force --sign - --entitlements scripts/entitlements.plist target/relea
 # expected today: "guest did not exit after 1000000 traps" (or HV_DENIED 0xfae94007 on faster machines)
 # previously (before the hvf_perms fix): "guest exception is not an AArch64 SVC trap: syndrome=0x92000005, virtual_address=0xfffffeff40"
 ```
+
+## Fourth attempt — musl startup loop (post HVC-PC-advance fix)
+
+Date: 2026-05-18, after `src/trap.rs::HvfTrapEngine::complete_syscall` was already
+extended to advance `PC` by 4 when the last exit class was `EC = 0x16` (HVC), and
+after `RuntimeError::TrapLimitExceeded` was demoted from an `Err` into an
+`Ok(RunResult { trap_limit_hit: true, .. })` so the compat report survives a
+trap-budget cut-off.
+
+### Setup
+
+- `Commands::Run` now accepts `--max-traps` (it must precede the image/command,
+  because the trailing-vararg `command: Vec<String>` would otherwise swallow
+  `--max-traps 200`). Reproduce with:
+
+  ```bash
+  cargo build --release --bin carrick
+  codesign --force --sign - --entitlements scripts/entitlements.plist \
+    target/release/carrick
+  CARRICK_TRACE_TRAPS=1 ./target/release/carrick run --max-traps 200 \
+    docker.io/library/alpine@sha256:378c4c5418f7493bd500ad21ffb43818d0689daaad43e3261859fb417d1481a0 \
+    /bin/busybox echo hello \
+    > /tmp/busybox-200.json 2> /tmp/busybox-200.trace
+  ```
+
+- A one-line `eprintln!` in `run_combined_syscall_loop_with_dispatcher`
+  (gated on the `CARRICK_TRACE_TRAPS` env var) records every syscall frame
+  as it is observed by the dispatcher. Output goes to stderr; the JSON
+  result still lands on stdout.
+
+### What the JSON says (compat report, 200-trap budget)
+
+```json
+"summary": {
+  "syscall_invocations": 200,
+  "syscall_returns_ok": 1,
+  "syscall_returns_errno": 199,
+  "distinct_unhandled_syscalls": 1,
+  "unhandled_syscall_invocations": 199,
+  ...
+},
+"unhandled_syscalls": [
+  { "count": 199, "name": "unknown", "number": 1685382482 }
+],
+"proc_read_unimplemented": [],
+"sys_read_unimplemented": [],
+"unhandled_ioctls": [],
+"trap_limit_hit": true,
+"traps": 200,
+"exit_code": -1
+```
+
+Only **one** unhandled syscall number is observed (199 times). No
+`/proc` / `/sys` reads, no ioctls, no partial syscalls. The CompatReport
+is therefore not the diagnostic surface here — the trace is.
+
+### What the trace says (first five distinct calls + loop body)
+
+The trace has **exactly two** distinct events. Trap #1 is real, traps #2..#200
+are byte-identical:
+
+```
+trap#1:   x8=96         (set_tid_address) x0=0x80000c2e80 x1=0x1     x2=0x8 x3=0x800009fb50 x4=0x0     x5=0x8000004554
+trap#2:   x8=1685382482 (<unknown>)       x0=0x1000e0b10  x1=0x0     x2=0x4f0 x3=0xe0b10      x4=0xdc000 x5=0xfffffffffffff000
+trap#3:   x8=1685382482 (<unknown>)       x0=0xffffffffffffffda x1=0x0 x2=0x4f0 x3=0xe0b10    x4=0xdc000 x5=0xfffffffffffff000
+trap#4..#200: identical to trap#3.
+```
+
+Decoding `x8 = 1685382482 = 0x6473_5f4d`: that is ASCII `"M_sd"` in
+little-endian bytes (`4d 5f 73 64`). It is not a Linux/aarch64 syscall
+number (the largest valid one is < 500). So trap #2 onward is not a real
+syscall: the guest's `X8` at the moment we observe it is a snapshot of
+musl-`ldso` *data* (a half-word fragment of an ELF/auxv string or a
+relocation slot), not a syscall number.
+
+The key signal is `x0` between trap #2 and trap #3:
+
+- **trap #2**: `x0 = 0x1_000e_0b10` (whatever musl had in `x0` at the
+  faulting instruction).
+- **trap #3..#200**: `x0 = 0xffff_ffff_ffff_ffda`, i.e. `(i64)-38`, which
+  is exactly the value `complete_syscall` just wrote in response to
+  `Errno { errno: ENOSYS (38) }`.
+
+So between trap #2 and trap #3 the only thing that demonstrably changed in
+the guest is the value we wrote into `X0`. `x1..x5, x8`, and the trap class
+are all bit-for-bit identical. The vCPU is **not** advancing past whatever
+instruction produced trap #2 — it re-enters with the same architectural
+state we last saw, plus our return value clobbered into `X0`.
+
+The loop is first detectable at **trap #2** (i.e. one trap after the first
+real syscall). The compat report's 199 identical "unknown" entries are
+just N copies of the same stuck instruction; they are not 199 distinct
+musl decisions.
+
+### Best guess at root cause
+
+This is exactly the failure mode predicted in the "Third attempt — next
+wall" section, but the predicted fix is *already* present in
+`src/trap.rs::HvfTrapEngine::complete_syscall` (it advances `PC += 4`
+when `last_exit_class == AARCH64_HVC_EXCEPTION_CLASS`). The loop persists
+despite that, so the PC-advance is either being applied to the wrong
+program counter or being applied at the wrong instant. Three concrete
+hypotheses, in declining order of likelihood:
+
+1. **HVF already auto-advances `PC` past `HVC`, so our `+4` skips the
+   `eret` and lands in the per-slot `nop` fill.** The Third-attempt
+   trace recorded `pc=0x20404` at HVC entry — that is `vector_base +
+   0x400 + 4`, i.e. one instruction past the `hvc #0` at `0x20400`,
+   which is the address of the `eret`. If HVF surfaces that PC because
+   it has already retired the HVC, then `complete_syscall` adds another
+   `4` → `0x20408`, which is inside the `nop` pad that `el1_vectors_bytes`
+   writes after `eret`. The vCPU then runs `nop`s until it reaches the
+   next vector slot (`0x20480` = "Lower EL using AArch64, IRQ"), which
+   is a bare `eret`. That `eret` consumes the **stale** `SPSR_EL1` /
+   `ELR_EL1` from the original `set_tid_address` SVC (they were never
+   updated, because no real EL0→EL1 transition occurred on the runaway
+   path), drops back into EL0 at a stale PC, and the user code at that
+   stale PC happens to re-trigger the same trampoline path on its next
+   instruction — re-presenting the SAME `X8`/`X1..X5`. This is
+   consistent with `x1..x5,x8` being byte-identical across iterations.
+
+2. **`set_reg(PC, …)` is writing the wrong register from HVF's point
+   of view.** On Apple HVF, the vCPU has both an `EL0_PC` (the saved
+   user PC) and the current EL1 PC; `Reg::PC` may select the EL1 PC at
+   the point of trap, which is unrelated to the EL0 user PC. Advancing
+   it has no observable effect on the `eret`. The frozen `x1..x5,x8`
+   then come from a runaway EL0 that's re-issuing the same syscall path.
+
+3. **`last_exit_class` is being set from the wrong syndrome.** Looking
+   at `run_until_syscall`, `last_exit_class` is updated from the
+   exception that just arrived. If the first SVC arrives as `EC = 0x16`
+   (because the EL1 vector stub re-traps via `hvc #0`), then the
+   PC-advance path *is* exercised on trap #1. But if the very first
+   exception that HVF reports is in fact `EC = 0x15` (direct SVC, with
+   HVF auto-advance), `last_exit_class` would be `0x15`, and
+   `complete_syscall` would skip the advance, leaving us re-entering at
+   PC=PC-of-HVC and looping. The brief's existing description of trap #1
+   ("EC=0x16 pc=0x20404") makes (1) more likely than (3), but both are
+   worth ruling out before touching the vector stub.
+
+Hypothesis (1) fits the data best: the `+4` is being applied on top of
+an already-advanced PC. The simplest empirical test is to either drop
+the `+4` (and see whether things instead get stuck *at* the HVC),
+or to read `PC` from HVF after the trap and compare to the known HVC
+address `LINUX_EL1_VECTORS_BASE + AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET`
+(`0x20400`) — if HVF reports `0x20404`, hypothesis (1) is confirmed
+and the right fix is *not* to advance PC at all on `EC = 0x16`.
+
+### Smallest concrete fix that would advance the demo
+
+Before changing any code: **add one more piece of evidence**. Extend
+the existing trace `eprintln!` (or add a sibling print inside
+`HvfInner::run_until_syscall`) to also log `pc`, `elr_el1`, and
+`spsr_el1` on every trap. Re-run with `--max-traps 4`. Then:
+
+- If `pc` on trap entry is `0x20404` (one past the HVC), **remove
+  the `PC += 4` advance from `complete_syscall`** — HVF is
+  already advancing it, and our extra `+4` skips the `eret`. (Smallest
+  delta: gate the advance behind an explicit "HVF did not advance"
+  detection, or just drop the conditional entirely if the assumption
+  holds across all trap classes on this HVF version.)
+
+- If `pc` is `0x20400` (at the HVC) and `elr_el1` / `spsr_el1` are
+  frozen across iterations, the `eret` itself isn't running — most
+  likely because the user-side PSTATE in `SPSR_EL1` is corrupt
+  (e.g. EL1h instead of EL0t). Fix by checking `SPSR_EL1` in
+  `complete_syscall` and forcing the user-mode bits if they got
+  clobbered, OR by switching the vector stub from `hvc #0; eret` to
+  an explicit "restore SPSR/ELR/SP_EL0 from per-thread save area, then
+  eret" sequence (which is what real kernels do, and what `ldso`
+  expects on syscall return).
+
+- If `elr_el1` changes per iteration but `x1..x5,x8` don't, the user
+  is running but not making progress because the syscall return path
+  is leaving the call site unchanged — most likely because we're
+  failing to update `SP_EL0` or the user-side return PC after our
+  HVC trap. This would point at adding `SP_EL0` / `ELR_EL1` plumbing
+  to `complete_syscall`.
+
+The minimum-viable fix is therefore: **add a four-line diagnostic dump
+of (`pc`, `elr_el1`, `spsr_el1`, `sp_el0`) at trap entry**, run
+`--max-traps 4` once, then pick exactly one of the three branches
+above. Each branch is a five-to-ten-line edit in `src/trap.rs`; none
+require new dependencies, new mappings, or syscall-dispatch changes.
+
+Once the loop breaks, expect to immediately surface a real second
+syscall from `_dlstart` — almost certainly one of
+`set_robust_list` (#99), `rseq` (#293), `prlimit64` (#261),
+`mprotect` (#226), `mmap` (#222), `openat` (#56), or `getrandom`
+(#278). At that point the compat report becomes the right diagnostic
+surface and Tier B has reached "running musl, missing syscall X."
