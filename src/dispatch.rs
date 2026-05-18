@@ -468,6 +468,7 @@ impl SyscallDispatcher {
             32 => self.flock(request),
             34 => self.mkdirat(request, memory)?,
             35 => self.unlinkat(request, memory)?,
+            36 => self.symlinkat(request, memory)?,
             38 => self.renameat(request, memory)?,
             43 => self.statfs(request, memory)?,
             44 => self.fstatfs(request, memory),
@@ -3433,6 +3434,59 @@ impl SyscallDispatcher {
                 errno: rootfs_errno(errno),
             }),
         }
+    }
+
+    fn symlinkat(
+        &self,
+        request: SyscallRequest,
+        memory: &impl GuestMemory,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let target = request.arg(0);
+        let newdirfd = request.arg(1);
+        let linkpath = request.arg(2);
+        let target_path = match read_guest_c_string(memory, target) {
+            Ok(target) => target,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        if target_path.is_empty() {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_ENOENT,
+            });
+        }
+        let link = match read_guest_c_string(memory, linkpath) {
+            Ok(link) => link,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        if link.is_empty() {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_ENOENT,
+            });
+        }
+        let resolved_link = match self.resolve_at_path(newdirfd, &link) {
+            Ok(resolved) => resolved,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        if synthetic_proc_file(&resolved_link, &self.executable_path).is_some() {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EEXIST,
+            });
+        }
+        if let Some(rootfs) = &self.rootfs {
+            match rootfs.symlink_metadata(&resolved_link) {
+                Ok(_) => {
+                    return Ok(DispatchOutcome::Errno {
+                        errno: LINUX_EEXIST,
+                    });
+                }
+                Err(RootFsError::NotFound(_)) => {}
+                Err(other) => {
+                    return Ok(DispatchOutcome::Errno {
+                        errno: rootfs_errno(other),
+                    });
+                }
+            }
+        }
+        Ok(DispatchOutcome::Errno { errno: LINUX_EROFS })
     }
 
     fn renameat(

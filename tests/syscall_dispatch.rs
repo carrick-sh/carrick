@@ -4134,6 +4134,77 @@ fn fchmod_and_fchmodat_bootstrap_report_read_only_rootfs() {
 }
 
 #[test]
+fn symlinkat_bootstrap_reports_eexist_for_known_links_and_erofs_for_new_paths() {
+    let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
+        "etc/motd",
+        b"symlinkat fixture\n".as_slice(),
+    )]))])
+    .unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
+    memory.write_bytes(0x4000, b"target\0").unwrap();
+    memory.write_bytes(0x4020, b"/etc/motd\0").unwrap();
+    memory.write_bytes(0x4040, b"/etc/new-link\0").unwrap();
+    memory.write_bytes(0x4060, b"\0").unwrap();
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    36,
+                    SyscallArgs::from([0x4000, (-100_i64) as u64, 0x4020, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 17 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    36,
+                    SyscallArgs::from([0x4000, (-100_i64) as u64, 0x4040, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 30 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    36,
+                    SyscallArgs::from([0x4060, (-100_i64) as u64, 0x4040, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 2 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    36,
+                    SyscallArgs::from([0x4000, (-100_i64) as u64, 0x4060, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 2 }
+    );
+
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
 fn renameat_bootstrap_reports_erofs_for_known_sources_and_enoent_otherwise() {
     let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
         "etc/motd",
