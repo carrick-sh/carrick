@@ -6,14 +6,14 @@ use carrick::dispatch::{
 use carrick::elf::SegmentPerms;
 use carrick::linux_abi::{
     LINUX_DIRENT64_HEADER_SIZE, LINUX_DT_REG, LINUX_S_IFDIR, LINUX_S_IFMT, LINUX_S_IFREG,
-    LinuxDirent64Header, LinuxRlimit, LinuxStat, LinuxUtsname,
+    LinuxDirent64Header, LinuxIovec, LinuxRlimit, LinuxStat, LinuxUtsname,
 };
 use carrick::memory::{AddressSpace, LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE};
 use carrick::rootfs::{LayerSource, RootFs};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use std::io::Write;
-use zerocopy::FromBytes;
+use zerocopy::{FromBytes, IntoBytes};
 
 #[test]
 fn write_syscall_reads_guest_memory_and_writes_stdout() {
@@ -404,6 +404,128 @@ fn lseek_repositions_rootfs_file_reads() {
         DispatchOutcome::Returned { value: 4 }
     );
     assert_eq!(memory.read_bytes(0x4100, 4).unwrap(), b"says");
+}
+
+#[test]
+fn pread64_reads_from_offset_without_changing_file_offset() {
+    let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
+        "etc/motd",
+        b"rootfs says hello\n".as_slice(),
+    )]))])
+    .unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
+    memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    56,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 3 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(67, SyscallArgs::from([3, 0x4100, 4, 7, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 4 }
+    );
+    assert_eq!(memory.read_bytes(0x4100, 4).unwrap(), b"says");
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(63, SyscallArgs::from([3, 0x4200, 4, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 4 }
+    );
+    assert_eq!(memory.read_bytes(0x4200, 4).unwrap(), b"root");
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn readv_reads_file_across_packed_iovecs() {
+    let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
+        "etc/motd",
+        b"rootfs says hello\n".as_slice(),
+    )]))])
+    .unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x500]);
+    memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();
+    write_iovecs(
+        &mut memory,
+        0x4100,
+        [LinuxIovec::new(0x4200, 6), LinuxIovec::new(0x4300, 4)],
+    );
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    56,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 3 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(65, SyscallArgs::from([3, 0x4100, 2, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 10 }
+    );
+    assert_eq!(memory.read_bytes(0x4200, 6).unwrap(), b"rootfs");
+    assert_eq!(memory.read_bytes(0x4300, 4).unwrap(), b" say");
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn writev_writes_stdout_from_packed_iovecs() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
+    memory.write_bytes(0x4200, b"hello ").unwrap();
+    memory.write_bytes(0x4300, b"linux\n").unwrap();
+    write_iovecs(
+        &mut memory,
+        0x4100,
+        [LinuxIovec::new(0x4200, 6), LinuxIovec::new(0x4300, 6)],
+    );
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(66, SyscallArgs::from([1, 0x4100, 2, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 12 }
+    );
+    assert_eq!(dispatcher.stdout(), b"hello linux\n");
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
 #[test]
@@ -961,6 +1083,18 @@ fn read_rlimit(memory: &impl GuestMemory, address: u64) -> LinuxRlimit {
 fn linux_c_string<const N: usize>(field: [u8; N]) -> String {
     let end = field.iter().position(|byte| *byte == 0).unwrap_or(N);
     String::from_utf8(field[..end].to_vec()).unwrap()
+}
+
+fn write_iovecs<const N: usize>(
+    memory: &mut impl GuestMemory,
+    address: u64,
+    iovecs: [LinuxIovec; N],
+) {
+    let mut bytes = Vec::new();
+    for iovec in iovecs {
+        bytes.extend_from_slice(iovec.as_bytes());
+    }
+    memory.write_bytes(address, &bytes).unwrap();
 }
 
 fn rw_perms() -> SegmentPerms {

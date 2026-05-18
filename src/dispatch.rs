@@ -4,15 +4,15 @@ use std::path::Path;
 use crate::compat::{CompatEvent, CompatReporter, SyscallArgs};
 use crate::linux_abi::{
     LINUX_DIRENT64_HEADER_SIZE, LINUX_DT_DIR, LINUX_DT_LNK, LINUX_DT_REG, LINUX_PAGE_SIZE,
-    LINUX_S_IFDIR, LINUX_S_IFLNK, LINUX_S_IFREG, LinuxDirent64Header, LinuxRlimit, LinuxSigaction,
-    LinuxStat, LinuxUtsname,
+    LINUX_S_IFDIR, LINUX_S_IFLNK, LINUX_S_IFREG, LinuxDirent64Header, LinuxIovec, LinuxRlimit,
+    LinuxSigaction, LinuxStat, LinuxUtsname,
 };
 use crate::memory::{LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE, LINUX_MMAP_SIZE};
 use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsError, RootFsMetadata};
 use crate::syscall::lookup_aarch64;
 use serde::Serialize;
 use thiserror::Error;
-use zerocopy::IntoBytes;
+use zerocopy::{FromBytes, IntoBytes};
 
 pub const LINUX_ENOENT: i32 = 2;
 pub const LINUX_EBADF: i32 = 9;
@@ -42,6 +42,7 @@ pub const LINUX_MAP_ANONYMOUS: u64 = 0x20;
 pub const LINUX_RLIM_INFINITY: u64 = u64::MAX;
 const LINUX_RT_SIGSET_SIZE: u64 = 8;
 const MAX_GUEST_PATH: usize = 4096;
+const LINUX_IOV_MAX: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct SyscallRequest {
@@ -271,6 +272,9 @@ impl SyscallDispatcher {
             62 => self.lseek(request),
             63 => self.read(request, memory)?,
             64 => self.write(request, memory)?,
+            65 => self.readv(request, memory)?,
+            66 => self.writev(request, memory)?,
+            67 => self.pread64(request, memory)?,
             78 => self.readlinkat(request, memory)?,
             79 => self.newfstatat(request, memory)?,
             80 => self.fstat(request, memory),
@@ -923,6 +927,73 @@ impl SyscallDispatcher {
         })
     }
 
+    fn readv(
+        &mut self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let fd = request.arg(0) as i32;
+        let iov = request.arg(1);
+        let iovcnt = usize::try_from(request.arg(2))
+            .map_err(|_| DispatchError::LengthTooLarge(request.arg(2)))?;
+        let iovecs = match read_iovecs(memory, iov, iovcnt) {
+            Ok(iovecs) => iovecs,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        let Some(open) = self.open_files.get_mut(&fd) else {
+            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+        };
+        let OpenDescription::File {
+            contents, offset, ..
+        } = open
+        else {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EISDIR,
+            });
+        };
+        let read_len = read_from_contents_at(memory, contents, *offset, &iovecs)?;
+        *offset += read_len;
+        Ok(DispatchOutcome::Returned {
+            value: read_len as i64,
+        })
+    }
+
+    fn pread64(
+        &mut self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let fd = request.arg(0) as i32;
+        let buffer = request.arg(1);
+        let length = usize::try_from(request.arg(2))
+            .map_err(|_| DispatchError::LengthTooLarge(request.arg(2)))?;
+        let offset = usize::try_from(request.arg(3))
+            .map_err(|_| DispatchError::LengthTooLarge(request.arg(3)))?;
+        let Some(open) = self.open_files.get(&fd) else {
+            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+        };
+        let OpenDescription::File { contents, .. } = open else {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EISDIR,
+            });
+        };
+
+        let read_len = if offset < contents.len() {
+            let bytes = &contents[offset..][..contents[offset..].len().min(length)];
+            if memory.write_bytes(buffer, bytes).is_err() {
+                return Ok(DispatchOutcome::Errno {
+                    errno: LINUX_EFAULT,
+                });
+            }
+            bytes.len()
+        } else {
+            0
+        };
+        Ok(DispatchOutcome::Returned {
+            value: read_len as i64,
+        })
+    }
+
     fn write(
         &mut self,
         request: SyscallRequest,
@@ -951,6 +1022,48 @@ impl SyscallDispatcher {
 
         Ok(DispatchOutcome::Returned {
             value: length as i64,
+        })
+    }
+
+    fn writev(
+        &mut self,
+        request: SyscallRequest,
+        memory: &impl GuestMemory,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let fd = request.arg(0);
+        let iov = request.arg(1);
+        let iovcnt = usize::try_from(request.arg(2))
+            .map_err(|_| DispatchError::LengthTooLarge(request.arg(2)))?;
+        let iovecs = match read_iovecs(memory, iov, iovcnt) {
+            Ok(iovecs) => iovecs,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+
+        let mut total = 0usize;
+        for iovec in iovecs {
+            let iov_base = iovec.iov_base;
+            let iov_len = usize::try_from(iovec.iov_len)
+                .map_err(|_| DispatchError::LengthTooLarge(iovec.iov_len))?;
+            let bytes = match memory.read_bytes(iov_base, iov_len) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    return Ok(DispatchOutcome::Errno {
+                        errno: LINUX_EFAULT,
+                    });
+                }
+            };
+            match fd {
+                1 => self.stdout.extend_from_slice(&bytes),
+                2 => self.stderr.extend_from_slice(&bytes),
+                _ => return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF }),
+            }
+            total = total
+                .checked_add(bytes.len())
+                .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
+        }
+
+        Ok(DispatchOutcome::Returned {
+            value: total as i64,
         })
     }
 
@@ -1128,6 +1241,67 @@ fn write_stat(
     } else {
         DispatchOutcome::Returned { value: 0 }
     }
+}
+
+fn read_iovecs(
+    memory: &impl GuestMemory,
+    address: u64,
+    count: usize,
+) -> Result<Vec<LinuxIovec>, i32> {
+    if count > LINUX_IOV_MAX {
+        return Err(LINUX_EINVAL);
+    }
+
+    let mut iovecs = Vec::with_capacity(count);
+    let size = core::mem::size_of::<LinuxIovec>();
+    for index in 0..count {
+        let offset = index
+            .checked_mul(size)
+            .and_then(|offset| u64::try_from(offset).ok())
+            .ok_or(LINUX_EINVAL)?;
+        let iovec_address = address.checked_add(offset).ok_or(LINUX_EFAULT)?;
+        let bytes = memory
+            .read_bytes(iovec_address, size)
+            .map_err(|_| LINUX_EFAULT)?;
+        iovecs.push(LinuxIovec::read_from_bytes(&bytes).map_err(|_| LINUX_EFAULT)?);
+    }
+    Ok(iovecs)
+}
+
+fn read_from_contents_at(
+    memory: &mut impl GuestMemory,
+    contents: &[u8],
+    mut offset: usize,
+    iovecs: &[LinuxIovec],
+) -> Result<usize, DispatchError> {
+    let mut total = 0usize;
+    for iovec in iovecs {
+        let iov_base = iovec.iov_base;
+        let iov_len = usize::try_from(iovec.iov_len)
+            .map_err(|_| DispatchError::LengthTooLarge(iovec.iov_len))?;
+        if iov_len == 0 {
+            continue;
+        }
+        let remaining = contents.get(offset..).unwrap_or_default();
+        let read_len = remaining.len().min(iov_len);
+        if read_len == 0 {
+            break;
+        }
+        if memory
+            .write_bytes(iov_base, &remaining[..read_len])
+            .is_err()
+        {
+            return Ok(total);
+        }
+        offset += read_len;
+        total = total
+            .checked_add(read_len)
+            .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
+        if read_len < iov_len {
+            break;
+        }
+    }
+    Ok(total)
 }
 
 fn linux_mode(metadata: &RootFsMetadata) -> u32 {

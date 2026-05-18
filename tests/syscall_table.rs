@@ -12,6 +12,9 @@ fn names_linux_aarch64_bringup_syscalls() {
     let lseek = lookup_aarch64(62).unwrap();
     let read = lookup_aarch64(63).unwrap();
     let write = lookup_aarch64(64).unwrap();
+    let readv = lookup_aarch64(65).unwrap();
+    let writev = lookup_aarch64(66).unwrap();
+    let pread64 = lookup_aarch64(67).unwrap();
     let readlinkat = lookup_aarch64(78).unwrap();
     let newfstatat = lookup_aarch64(79).unwrap();
     let fstat = lookup_aarch64(80).unwrap();
@@ -42,6 +45,12 @@ fn names_linux_aarch64_bringup_syscalls() {
     assert_eq!(read.support, SupportLevel::BringUp);
     assert_eq!(write.name, "write");
     assert_eq!(write.support, SupportLevel::BringUp);
+    assert_eq!(readv.name, "readv");
+    assert_eq!(readv.support, SupportLevel::BringUp);
+    assert_eq!(writev.name, "writev");
+    assert_eq!(writev.support, SupportLevel::BringUp);
+    assert_eq!(pread64.name, "pread64");
+    assert_eq!(pread64.support, SupportLevel::BringUp);
     assert_eq!(readlinkat.name, "readlinkat");
     assert_eq!(readlinkat.support, SupportLevel::BringUp);
     assert_eq!(newfstatat.name, "newfstatat");

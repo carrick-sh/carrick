@@ -34,9 +34,10 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
 - `carrick dispatch-syscall <nr> --args ...` exercises the host-side syscall
   dispatcher that the HVF trap loop will call; `getcwd(2)`, `faccessat(2)`,
   `chdir(2)`, `fchdir(2)`, `openat(2)`, `getdents64(2)`, `lseek(2)`,
-  `readlinkat(2)`, `read(2)`, `write(2)`, `close(2)`, `newfstatat(2)`,
-  `fstat(2)`, `exit(2)`, `ENOENT`, `EACCES`, `EFAULT`, `EBADF`, and `ENOSYS`
-  paths are covered by tests.
+  `readlinkat(2)`, `read(2)`, `readv(2)`, `pread64(2)`, `write(2)`,
+  `writev(2)`, `close(2)`, `newfstatat(2)`, `fstat(2)`, `exit(2)`,
+  `ENOENT`, `EACCES`, `EFAULT`, `EBADF`, and `ENOSYS` paths are covered by
+  tests.
 - Loaded ELFs include bootstrap heap and mmap arenas. The dispatcher can
   service `brk(2)`, file-backed and anonymous `mmap(2)`, bootstrap no-op
   `mprotect(2)`/`munmap(2)`, and `exit_group(2)`, which gives `ld-linux` a
@@ -45,9 +46,9 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
   and uid/gid identity calls, `set_tid_address(2)`, `set_robust_list(2)`,
   `prlimit64(2)`, `getrandom(2)`, and minimal `rt_sigaction(2)`/
   `rt_sigprocmask(2)` stubs.
-- Linux ABI outputs for `stat`, `getdents64`, auxv entries, `utsname`,
-  `rlimit`, and signal-action stubs are represented by packed Rust structs in
-  `linux_abi`, with `zerocopy` used to expose initialized bytes for
+- Linux ABI outputs for `stat`, `getdents64`, `iovec`, auxv entries,
+  `utsname`, `rlimit`, and signal-action stubs are represented by packed Rust
+  structs in `linux_abi`, with `zerocopy` used to expose initialized bytes for
   guest-memory writes.
 - The dispatcher now has a rootfs-backed file descriptor table for read-only
   file opens from composed OCI layers, and the runtime loop can drive a scripted

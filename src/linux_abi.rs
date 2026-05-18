@@ -87,6 +87,21 @@ impl LinuxAuxvEntry {
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
 )]
+pub struct LinuxIovec {
+    pub iov_base: u64,
+    pub iov_len: u64,
+}
+
+impl LinuxIovec {
+    pub const fn new(iov_base: u64, iov_len: u64) -> Self {
+        Self { iov_base, iov_len }
+    }
+}
+
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
 pub struct LinuxUtsname {
     pub sysname: [u8; LINUX_UTSNAME_FIELD_SIZE],
     pub nodename: [u8; LINUX_UTSNAME_FIELD_SIZE],
