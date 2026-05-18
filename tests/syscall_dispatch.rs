@@ -4954,6 +4954,48 @@ fn truncate_bootstrap_returns_erofs_for_known_paths_and_enoent_for_missing() {
 }
 
 #[test]
+fn planned_process_syscalls_surface_by_name_in_compat_report() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x80]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    let expected: &[(u64, &str)] = &[
+        (95, "waitid"),
+        (220, "clone"),
+        (221, "execve"),
+        (260, "wait4"),
+        (281, "execveat"),
+        (435, "clone3"),
+    ];
+
+    for (number, _name) in expected {
+        let outcome = dispatcher
+            .dispatch(
+                SyscallRequest::new(*number, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap();
+        assert_eq!(
+            outcome,
+            DispatchOutcome::Errno { errno: 38 },
+            "syscall {number} should report ENOSYS until a real handler lands"
+        );
+    }
+
+    let report = reporter.finish();
+    for (number, name) in expected {
+        let entry = report
+            .unhandled_syscalls
+            .iter()
+            .find(|entry| entry.number == *number)
+            .unwrap_or_else(|| panic!("missing compat entry for {name}"));
+        assert_eq!(entry.name, *name);
+        assert_eq!(entry.count, 1);
+    }
+}
+
+#[test]
 fn signalfd4_vmsplice_tee_bootstrap_return_enosys() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x80]);
     let mut reporter = CompatReporter::default();
