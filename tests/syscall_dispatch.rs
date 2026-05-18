@@ -30,6 +30,9 @@ const LINUX_LOCK_NB: u64 = 4;
 const LINUX_LOCK_UN: u64 = 8;
 const LINUX_MADV_WILLNEED: u64 = 3;
 const LINUX_MADV_DONTNEED: u64 = 4;
+const LINUX_MEMBARRIER_CMD_QUERY: u64 = 0;
+const LINUX_MEMBARRIER_CMD_GLOBAL: u64 = 1;
+const LINUX_MEMBARRIER_CMD_FLAG_CPU: u64 = 1;
 const LINUX_O_CLOEXEC: u64 = 0o2000000;
 const LINUX_O_NONBLOCK: u64 = 0o4000;
 const LINUX_OVERLAYFS_SUPER_MAGIC: i64 = 0x794c7630;
@@ -2508,6 +2511,61 @@ fn rseq_reports_clean_bootstrap_fallback() {
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 38 }
+    );
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn membarrier_query_reports_no_bootstrap_commands() {
+    let mut memory = LinearMemory::new(0x4000, Vec::new());
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    283,
+                    SyscallArgs::from([LINUX_MEMBARRIER_CMD_QUERY, 0, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    283,
+                    SyscallArgs::from([
+                        LINUX_MEMBARRIER_CMD_QUERY,
+                        LINUX_MEMBARRIER_CMD_FLAG_CPU,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 22 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    283,
+                    SyscallArgs::from([LINUX_MEMBARRIER_CMD_GLOBAL, 0, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 22 }
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }

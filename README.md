@@ -52,8 +52,9 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
   bootstrap private `futex(2)` wait/wake polling, `clock_gettime(2)`,
   `clock_getres(2)`, `nanosleep(2)`,
   `clock_nanosleep(2)`, `gettimeofday(2)`, `prlimit64(2)`, `getrandom(2)`,
-  clean `rseq(2)` fallback, process capability probes, `personality(2)`, and minimal
-  `rt_sigaction(2)`/`rt_sigprocmask(2)` stubs.
+  `membarrier(2)` capability queries, clean `rseq(2)` fallback, process
+  capability probes, `personality(2)`, and minimal `rt_sigaction(2)`/
+  `rt_sigprocmask(2)` stubs.
 - Linux ABI outputs for `stat`, `statfs`, `getdents64`, `iovec`,
   `eventfd` counters, `timerfd` timers and expiration counts, `epoll_event`,
   `pollfd`, capability headers/data, `pipe2` fd pairs, `winsize`, `timespec`,
@@ -90,9 +91,9 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
   `openat(2)`, `eventfd2(2)`, `pselect6(2)`, `ppoll(2)`, `timerfd_create(2)`,
   `timerfd_settime(2)`, `epoll_pwait(2)`, `capget(2)`, `capset(2)`,
   `personality(2)`, `futex(2)`, `nanosleep(2)`, `clock_nanosleep(2)`,
-  `rseq(2)` fallback, `flock(2)`, `sendfile(2)`, `preadv(2)`, `read(2)`,
-  `close(2)`, and `exit(2)`, giving the loader, HVF loop, rootfs, and dispatcher a tight
-  feedback loop.
+  `membarrier(2)` queries, `rseq(2)` fallback, `flock(2)`, `sendfile(2)`,
+  `preadv(2)`, `read(2)`, `close(2)`, and `exit(2)`, giving the loader, HVF
+  loop, rootfs, and dispatcher a tight feedback loop.
 
 `shell` and `exec` are present as CLI surfaces, but they still stop before
 interactive process execution. `run` can map a dynamic ELF's rootfs-backed

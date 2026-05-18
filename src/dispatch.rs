@@ -97,6 +97,7 @@ const LINUX_FUTEX_WAKE: u64 = 1;
 const LINUX_FUTEX_CMD_MASK: u64 = 0x7f;
 const LINUX_FUTEX_PRIVATE_FLAG: u64 = 128;
 const LINUX_FUTEX_CLOCK_REALTIME: u64 = 256;
+const LINUX_MEMBARRIER_CMD_QUERY: u64 = 0;
 const LINUX_TIOCGWINSZ: u64 = 0x5413;
 const LINUX_PIPE_BUF_SIZE: i64 = 65_536;
 const LINUX_RT_SIGSET_SIZE: u64 = 8;
@@ -488,6 +489,7 @@ impl SyscallDispatcher {
             233 => self.madvise(request, memory),
             261 => self.prlimit64(request, memory),
             278 => self.getrandom(request, memory)?,
+            283 => self.membarrier(request),
             293 => self.rseq(),
             _ => {
                 reporter.record(CompatEvent::unhandled_syscall(
@@ -2240,6 +2242,18 @@ impl SyscallDispatcher {
     fn rseq(&self) -> DispatchOutcome {
         DispatchOutcome::Errno {
             errno: LINUX_ENOSYS,
+        }
+    }
+
+    fn membarrier(&self, request: SyscallRequest) -> DispatchOutcome {
+        let command = request.arg(0);
+        let flags = request.arg(1);
+
+        if command == LINUX_MEMBARRIER_CMD_QUERY && flags == 0 {
+            return DispatchOutcome::Returned { value: 0 };
+        }
+        DispatchOutcome::Errno {
+            errno: LINUX_EINVAL,
         }
     }
 
