@@ -87,7 +87,7 @@ const AARCH64_SYSCALLS: &[Syscall] = &[
     syscall(42, "nfsservctl", "fs", SupportLevel::Deferred),
     syscall(43, "statfs", "fs", SupportLevel::BringUp),
     syscall(44, "fstatfs", "fs", SupportLevel::BringUp),
-    syscall(45, "truncate", "fs", SupportLevel::Planned),
+    syscall(45, "truncate", "fs", SupportLevel::BringUp),
     syscall(46, "ftruncate", "fs", SupportLevel::BringUp),
     syscall(47, "fallocate", "fs", SupportLevel::Planned),
     syscall(48, "faccessat", "fs", SupportLevel::BringUp),

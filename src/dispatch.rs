@@ -471,6 +471,7 @@ impl SyscallDispatcher {
             38 => self.renameat(request, memory)?,
             43 => self.statfs(request, memory)?,
             44 => self.fstatfs(request, memory),
+            45 => self.truncate(request, memory)?,
             46 => self.ftruncate(request),
             48 => self.faccessat(request, memory)?,
             49 => self.chdir(request, memory)?,
@@ -1500,6 +1501,55 @@ impl SyscallDispatcher {
             return DispatchOutcome::Errno { errno: LINUX_EBADF };
         }
         write_statfs(memory, request.arg(1))
+    }
+
+    fn truncate(
+        &self,
+        request: SyscallRequest,
+        memory: &impl GuestMemory,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let pathname = request.arg(0);
+        let length = i64::from_ne_bytes(request.arg(1).to_ne_bytes());
+        if length < 0 {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            });
+        }
+        let path = match read_guest_c_string(memory, pathname) {
+            Ok(path) => path,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        if path.is_empty() {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_ENOENT,
+            });
+        }
+        let resolved = match self.resolve_at_path(LINUX_AT_FDCWD, &path) {
+            Ok(resolved) => resolved,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        let kind = if synthetic_proc_file(&resolved, &self.executable_path).is_some() {
+            RootFsEntryKind::File
+        } else {
+            let Some(rootfs) = &self.rootfs else {
+                return Ok(DispatchOutcome::Errno {
+                    errno: LINUX_ENOENT,
+                });
+            };
+            match rootfs.metadata(&resolved) {
+                Ok(metadata) => metadata.kind,
+                Err(errno) => {
+                    return Ok(DispatchOutcome::Errno {
+                        errno: rootfs_errno(errno),
+                    });
+                }
+            }
+        };
+        let errno = match kind {
+            RootFsEntryKind::Directory => LINUX_EISDIR,
+            RootFsEntryKind::File | RootFsEntryKind::Symlink => LINUX_EROFS,
+        };
+        Ok(DispatchOutcome::Errno { errno })
     }
 
     fn ftruncate(&self, request: SyscallRequest) -> DispatchOutcome {
