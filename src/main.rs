@@ -7,6 +7,7 @@ use carrick::elf::{inspect_elf, plan_elf_load};
 use carrick::memory::AddressSpace;
 use carrick::oci::{ImageReference, ImageStore, pull_image};
 use carrick::rootfs::RootFs;
+use carrick::runtime::{DEFAULT_MAX_TRAPS, run_static_elf_with_hvf};
 use carrick::syscall::{aarch64_table, lookup_aarch64};
 use carrick::trap::hvf_capabilities;
 use clap::{Parser, Subcommand};
@@ -32,6 +33,11 @@ enum Commands {
         path: PathBuf,
         #[arg(long)]
         find_text: Option<String>,
+    },
+    RunElf {
+        path: PathBuf,
+        #[arg(long, default_value_t = DEFAULT_MAX_TRAPS)]
+        max_traps: usize,
     },
     Pull {
         image: String,
@@ -125,6 +131,21 @@ async fn main() -> anyhow::Result<()> {
                     "region_count": image.regions().len(),
                     "regions": image.regions(),
                     "found_address": found_address,
+                }))?
+            );
+        }
+        Commands::RunElf { path, max_traps } => {
+            let result = run_static_elf_with_hvf(&path, max_traps)
+                .with_context(|| format!("failed to run static ELF {}", path.display()))?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "path": path,
+                    "exit_code": result.exit_code,
+                    "stdout": String::from_utf8_lossy(&result.stdout),
+                    "stderr": String::from_utf8_lossy(&result.stderr),
+                    "traps": result.traps,
+                    "report": result.report,
                 }))?
             );
         }

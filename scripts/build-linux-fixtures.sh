@@ -21,8 +21,11 @@ fi
 
 out_dir="$fixture_dir/target/$target/release"
 mkdir -p "$out_dir"
-object="$out_dir/carrick-linux-aarch64-hello.o"
 artifact="$out_dir/carrick-linux-aarch64-hello"
+tmp_dir="$(mktemp -d "$out_dir/carrick-linux-aarch64-hello.XXXXXX")"
+object="$tmp_dir/carrick-linux-aarch64-hello.o"
+artifact_tmp="$tmp_dir/carrick-linux-aarch64-hello"
+trap 'rm -rf "$tmp_dir"' EXIT
 
 rustc "$fixture_dir/src/main.rs" \
   --target "$target" \
@@ -36,8 +39,10 @@ rustc "$fixture_dir/src/main.rs" \
   -static \
   --entry=_start \
   --gc-sections \
-  -o "$artifact" \
+  -o "$artifact_tmp" \
   "$object"
+
+mv -f "$artifact_tmp" "$artifact"
 
 cargo metadata \
   --manifest-path "$fixture_dir/Cargo.toml" \

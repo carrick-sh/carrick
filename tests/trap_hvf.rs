@@ -1,7 +1,8 @@
 use carrick::elf::SegmentPerms;
 use carrick::memory::AddressSpace;
 use carrick::trap::{
-    GuestMappingPlan, HVF_PAGE_SIZE, HvfTrapEngine, TrapBackend, hvf_capabilities,
+    AARCH64_SVC_EXCEPTION_CLASS, GuestMappingPlan, HVF_PAGE_SIZE, HvfTrapEngine, TrapBackend,
+    aarch64_exception_class, hvf_capabilities, is_aarch64_svc_exception,
 };
 
 #[test]
@@ -45,6 +46,19 @@ fn guest_mapping_plan_rounds_regions_to_pages() {
     assert_eq!(plan.mappings[0].mapped_size, HVF_PAGE_SIZE);
     assert_eq!(plan.mappings[0].payload_size, 40);
     assert!(plan.mappings[0].perms.execute);
+}
+
+#[test]
+fn classifies_aarch64_svc_exception_syndrome() {
+    let svc_syndrome = AARCH64_SVC_EXCEPTION_CLASS << 26;
+    let brk_syndrome = 0x3c_u64 << 26;
+
+    assert_eq!(
+        aarch64_exception_class(svc_syndrome),
+        AARCH64_SVC_EXCEPTION_CLASS
+    );
+    assert!(is_aarch64_svc_exception(svc_syndrome));
+    assert!(!is_aarch64_svc_exception(brk_syndrome));
 }
 
 #[test]

@@ -128,6 +128,43 @@ fn load_elf_command_prints_address_space_summary() {
         .stdout(contains("\"found_address\""));
 }
 
+#[test]
+fn run_elf_command_executes_or_reports_hvf_backend_error() {
+    let output = std::process::Command::new("scripts/build-linux-fixtures.sh")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "fixture build failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = Command::cargo_bin("carrick")
+        .unwrap()
+        .args([
+            "run-elf",
+            "fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-hello",
+            "--max-traps",
+            "8",
+        ])
+        .output()
+        .unwrap();
+
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("\"exit_code\": 0"));
+        assert!(stdout.contains("hello from carrick"));
+        assert!(stdout.contains("\"traps\": 2"));
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("Hypervisor.framework"),
+            "unexpected run-elf failure:\n{stderr}"
+        );
+    }
+}
+
 fn minimal_aarch64_elf() -> Vec<u8> {
     let mut elf = vec![0_u8; 64];
     elf[0..4].copy_from_slice(b"\x7fELF");

@@ -12,6 +12,10 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
   mapping plan for the Mach VM/HVF runtime.
 - `carrick load-elf <path>` materializes that plan into typed guest memory
   regions with permissions and zero-filled memory past the file-backed bytes.
+- `carrick run-elf <path>` loads a static Linux/aarch64 ELF, maps it into the
+  HVF backend, runs `svc #0` exits through the host syscall dispatcher, and emits
+  stdout, stderr, exit status, trap count, and compatibility report JSON. This is
+  the tight bring-up path for the static Rust fixture.
 - `carrick pull <image>` uses `oci-distribution` to fetch image layers into a
   content-addressed store under `$CARRICK_HOME` or `~/.carrick`.
 - `carrick rootfs --layer <layer.tar.gz> ...` composes OCI tar layers in memory,
@@ -28,16 +32,16 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
   status for the bring-up tranche.
 - `carrick trap-capabilities` reports the Hypervisor.framework backend.
 - On macOS/aarch64, the HVF backend uses the permissively licensed `applevisor`
-  crate to create the VM/vCPU, map ELF-backed guest address-space regions, and
-  seed the program counter. The actual `svc #0` trap/run loop is still the next
-  runtime milestone.
+  crate to create the VM/vCPU, map ELF-backed guest address-space regions, seed
+  the program counter, decode AArch64 SVC exits, and write syscall return values
+  back into guest registers.
 - `scripts/build-linux-fixtures.sh` builds a static Linux/aarch64 Rust fixture
   whose first guest syscalls are `write(2)` and `exit(2)`, giving the loader and
   dispatcher a tight feedback loop.
 
-`run`, `shell`, and `exec` are present as CLI surfaces, but they stop before process
-execution because the HVF `svc #0` trap/run loop has not been wired to the loader and
-syscall dispatcher yet.
+`run`, `shell`, and `exec` are present as CLI surfaces, but they still stop before
+OCI-backed process execution. The current executable path is `run-elf`, which is
+deliberately scoped to static Linux/aarch64 ELF bring-up.
 
 ## License policy
 

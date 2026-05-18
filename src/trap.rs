@@ -1,9 +1,13 @@
+use crate::dispatch::Aarch64SyscallFrame;
 use crate::elf::SegmentPerms;
 use crate::memory::AddressSpace;
 use serde::Serialize;
 use thiserror::Error;
 
 pub const HVF_PAGE_SIZE: u64 = 0x4000;
+pub const AARCH64_SVC_EXCEPTION_CLASS: u64 = 0x15;
+const AARCH64_EXCEPTION_CLASS_SHIFT: u64 = 26;
+const AARCH64_EXCEPTION_CLASS_MASK: u64 = 0x3f;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -21,6 +25,16 @@ pub enum TrapError {
     MappingTooLarge(u64),
     #[error("guest mapping at 0x{guest_start:x} with size {mapped_size} overflows")]
     MappingOverflow { guest_start: u64, mapped_size: u64 },
+    #[error("Hypervisor.framework exited for an unexpected reason: {reason}")]
+    UnexpectedExit { reason: String },
+    #[error(
+        "guest exception is not an AArch64 SVC trap: syndrome=0x{syndrome:x}, virtual_address=0x{virtual_address:x}, physical_address=0x{physical_address:x}"
+    )]
+    UnexpectedException {
+        syndrome: u64,
+        virtual_address: u64,
+        physical_address: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -138,6 +152,14 @@ impl HvfTrapEngine {
         Ok(plan)
     }
 
+    pub fn run_until_syscall(&mut self) -> Result<Aarch64SyscallFrame, TrapError> {
+        self.inner.run_until_syscall()
+    }
+
+    pub fn complete_syscall(&mut self, return_value: i64) -> Result<(), TrapError> {
+        self.inner.complete_syscall(return_value)
+    }
+
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn new_platform() -> Result<Self, TrapError> {
         use applevisor::prelude::*;
@@ -204,6 +226,45 @@ impl HvfInner {
 
         self.vcpu.get_reg(Reg::PC).map_err(hvf_error)
     }
+
+    fn run_until_syscall(&mut self) -> Result<Aarch64SyscallFrame, TrapError> {
+        use applevisor::prelude::*;
+
+        self.vcpu.run().map_err(hvf_error)?;
+        let exit = self.vcpu.get_exit_info();
+        if exit.reason != ExitReason::EXCEPTION {
+            return Err(TrapError::UnexpectedExit {
+                reason: format!("{:?}", exit.reason),
+            });
+        }
+
+        let exception = exit.exception;
+        if !is_aarch64_svc_exception(exception.syndrome) {
+            return Err(TrapError::UnexpectedException {
+                syndrome: exception.syndrome,
+                virtual_address: exception.virtual_address,
+                physical_address: exception.physical_address,
+            });
+        }
+
+        Ok(Aarch64SyscallFrame {
+            x0: self.vcpu.get_reg(Reg::X0).map_err(hvf_error)?,
+            x1: self.vcpu.get_reg(Reg::X1).map_err(hvf_error)?,
+            x2: self.vcpu.get_reg(Reg::X2).map_err(hvf_error)?,
+            x3: self.vcpu.get_reg(Reg::X3).map_err(hvf_error)?,
+            x4: self.vcpu.get_reg(Reg::X4).map_err(hvf_error)?,
+            x5: self.vcpu.get_reg(Reg::X5).map_err(hvf_error)?,
+            x8: self.vcpu.get_reg(Reg::X8).map_err(hvf_error)?,
+        })
+    }
+
+    fn complete_syscall(&mut self, return_value: i64) -> Result<(), TrapError> {
+        use applevisor::prelude::*;
+
+        self.vcpu
+            .set_reg(Reg::X0, return_value as u64)
+            .map_err(hvf_error)
+    }
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -215,6 +276,22 @@ impl HvfInner {
     fn program_counter(&self) -> Result<u64, TrapError> {
         Err(TrapError::UnsupportedPlatform)
     }
+
+    fn run_until_syscall(&mut self) -> Result<Aarch64SyscallFrame, TrapError> {
+        Err(TrapError::UnsupportedPlatform)
+    }
+
+    fn complete_syscall(&mut self, _: i64) -> Result<(), TrapError> {
+        Err(TrapError::UnsupportedPlatform)
+    }
+}
+
+pub fn aarch64_exception_class(syndrome: u64) -> u64 {
+    (syndrome >> AARCH64_EXCEPTION_CLASS_SHIFT) & AARCH64_EXCEPTION_CLASS_MASK
+}
+
+pub fn is_aarch64_svc_exception(syndrome: u64) -> bool {
+    aarch64_exception_class(syndrome) == AARCH64_SVC_EXCEPTION_CLASS
 }
 
 fn align_down(value: u64, alignment: u64) -> u64 {
