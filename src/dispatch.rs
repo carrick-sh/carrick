@@ -10,7 +10,7 @@ use crate::linux_abi::{
     LINUX_DIRENT64_HEADER_SIZE, LINUX_DT_DIR, LINUX_DT_LNK, LINUX_DT_REG, LINUX_PAGE_SIZE,
     LINUX_S_IFDIR, LINUX_S_IFLNK, LINUX_S_IFREG, LinuxCapabilityData, LinuxCapabilityHeader,
     LinuxDirent64Header, LinuxEpollEvent, LinuxEventfdValue, LinuxFdPair, LinuxIovec,
-    LinuxItimerspec, LinuxItimerval, LinuxOpenHow, LinuxPollFd, LinuxRlimit, LinuxRusage, LinuxSigaction,
+    LinuxItimerspec, LinuxItimerval, LinuxOpenHow, LinuxPollFd, LinuxRlimit, LinuxRusage, LinuxSigaction, LinuxSysinfo,
     LinuxSigaltstack, LinuxStat, LinuxStatfs, LinuxStatx, LinuxStatxTimestamp,
     LinuxTimerfdExpirations, LinuxTimespec, LinuxTimeval, LinuxTimezone, LinuxTms,
     LinuxTermios, LinuxUtsname, LinuxWinsize,
@@ -105,6 +105,10 @@ pub const LINUX_MS_SYNC: u64 = 0x04;
 pub const LINUX_MCL_CURRENT: u64 = 0x01;
 pub const LINUX_MCL_FUTURE: u64 = 0x02;
 pub const LINUX_MCL_ONFAULT: u64 = 0x04;
+pub const LINUX_PRIO_PROCESS: u64 = 0;
+pub const LINUX_PRIO_PGRP: u64 = 1;
+pub const LINUX_PRIO_USER: u64 = 2;
+pub const LINUX_DEFAULT_UMASK: u32 = 0o022;
 pub const LINUX_RLIM_INFINITY: u64 = u64::MAX;
 pub const LINUX_RUSAGE_SELF: i32 = 0;
 pub const LINUX_RUSAGE_CHILDREN: i32 = -1;
@@ -356,6 +360,7 @@ pub struct SyscallDispatcher {
     personality: u64,
     dumpable: i64,
     task_name: [u8; LINUX_TASK_COMM_LEN],
+    umask: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -491,6 +496,7 @@ impl SyscallDispatcher {
             personality: 0,
             dumpable: 1,
             task_name: linux_task_name_from_bytes(b"carrick"),
+            umask: LINUX_DEFAULT_UMASK,
         }
     }
 
@@ -624,6 +630,8 @@ impl SyscallDispatcher {
             137 => self.rt_sigtimedwait(request, memory),
             138 => self.rt_sigqueueinfo(request),
             139 => self.rt_sigreturn(),
+            140 => self.setpriority(request),
+            141 => self.getpriority(request),
             153 => self.times(request, memory),
             154 => self.setpgid(request),
             155 => self.getpgid(request),
@@ -631,6 +639,7 @@ impl SyscallDispatcher {
             157 => self.setsid(),
             160 => self.uname(request, memory),
             165 => self.getrusage(request, memory),
+            166 => self.umask(request),
             167 => self.prctl(request, memory),
             168 => self.getcpu(request, memory),
             169 => self.gettimeofday(request, memory),
@@ -639,6 +648,7 @@ impl SyscallDispatcher {
             173 => DispatchOutcome::Returned { value: 1 },
             174..=177 => DispatchOutcome::Returned { value: 0 },
             178 => self.getpid(),
+            179 => self.sysinfo(request, memory),
             214 => self.brk(request),
             215 => self.munmap(request),
             216 => self.mremap(request),
@@ -2588,6 +2598,73 @@ impl SyscallDispatcher {
         DispatchOutcome::Returned {
             value: std::process::id() as i64,
         }
+    }
+
+    fn umask(&mut self, request: SyscallRequest) -> DispatchOutcome {
+        let new = request.arg(0) as u32 & 0o777;
+        let previous = self.umask;
+        self.umask = new;
+        DispatchOutcome::Returned {
+            value: previous as i64,
+        }
+    }
+
+    fn setpriority(&self, request: SyscallRequest) -> DispatchOutcome {
+        let which = request.arg(0);
+        let who = request.arg(1) as i32;
+        let prio = request.arg(2) as i32;
+        if which > LINUX_PRIO_USER || prio < -20 || prio > 19 {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+        if which == LINUX_PRIO_PROCESS && who != 0 && who != LINUX_BOOTSTRAP_PID as i32 {
+            return DispatchOutcome::Errno { errno: LINUX_ESRCH };
+        }
+        DispatchOutcome::Returned { value: 0 }
+    }
+
+    fn getpriority(&self, request: SyscallRequest) -> DispatchOutcome {
+        let which = request.arg(0);
+        let who = request.arg(1) as i32;
+        if which > LINUX_PRIO_USER {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+        if which == LINUX_PRIO_PROCESS && who != 0 && who != LINUX_BOOTSTRAP_PID as i32 {
+            return DispatchOutcome::Errno { errno: LINUX_ESRCH };
+        }
+        // Linux returns 20 - nice. Default nice is 0 → return 20. This is a
+        // bootstrap value; we don't model per-process priority.
+        DispatchOutcome::Returned { value: 20 }
+    }
+
+    fn sysinfo(&self, request: SyscallRequest, memory: &mut impl GuestMemory) -> DispatchOutcome {
+        let info = LinuxSysinfo {
+            uptime: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
+            loads: [0; 3],
+            totalram: 16 * 1024 * 1024 * 1024,
+            freeram: 16 * 1024 * 1024 * 1024,
+            sharedram: 0,
+            bufferram: 0,
+            totalswap: 0,
+            freeswap: 0,
+            procs: 1,
+            totalhigh: 0,
+            freehigh: 0,
+            mem_unit: 1,
+            _padding: [0; 8],
+        };
+        if memory.write_bytes(request.arg(0), info.as_bytes()).is_err() {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EFAULT,
+            };
+        }
+        DispatchOutcome::Returned { value: 0 }
     }
 
     fn times(&self, request: SyscallRequest, memory: &mut impl GuestMemory) -> DispatchOutcome {
