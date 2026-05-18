@@ -124,6 +124,7 @@ fn names_linux_aarch64_bringup_syscalls() {
         (283, "membarrier"),
         (291, "statx"),
         (293, "rseq"),
+        (439, "faccessat2"),
     ] {
         let syscall = lookup_aarch64(number).unwrap();
         assert_eq!(syscall.name, name);

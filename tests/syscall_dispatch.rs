@@ -57,7 +57,11 @@ const LINUX_TFD_NONBLOCK: u64 = LINUX_O_NONBLOCK;
 const LINUX_TIMER_ABSTIME: u64 = 0x1;
 const LINUX_CLOCK_MONOTONIC: u64 = 1;
 const LINUX_TIOCGWINSZ: u64 = 0x5413;
+const LINUX_R_OK: u64 = 4;
+const LINUX_W_OK: u64 = 2;
+const LINUX_X_OK: u64 = 1;
 const LINUX_AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+const LINUX_AT_EACCESS: u64 = 0x200;
 const LINUX_AT_EMPTY_PATH: u64 = 0x1000;
 const LINUX_STATX_BASIC_STATS: u32 = 0x7ff;
 const LINUX_STATX_RESERVED: u64 = 0x8000_0000;
@@ -1265,6 +1269,156 @@ fn cwd_and_access_syscalls_use_rootfs_state() {
         DispatchOutcome::Returned { value: 0 }
     );
     assert_eq!(dispatcher.cwd(), "/etc");
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn faccessat2_supports_bootstrap_access_flags_and_fd_checks() {
+    let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar_with_links(
+        [("etc/motd", b"rootfs says hello\n".as_slice())],
+        [("etc/motd-link", "motd")],
+    ))])
+    .unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
+    memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();
+    memory.write_bytes(0x4020, b"/etc/motd-link\0").unwrap();
+    memory.write_bytes(0x4040, b"/proc/cpuinfo\0").unwrap();
+    memory.write_bytes(0x4060, b"\0").unwrap();
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    439,
+                    SyscallArgs::from([
+                        (-100_i64) as u64,
+                        0x4000,
+                        LINUX_R_OK,
+                        LINUX_AT_EACCESS,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    439,
+                    SyscallArgs::from([
+                        (-100_i64) as u64,
+                        0x4000,
+                        LINUX_W_OK,
+                        LINUX_AT_EACCESS,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 13 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    439,
+                    SyscallArgs::from([
+                        (-100_i64) as u64,
+                        0x4020,
+                        LINUX_X_OK,
+                        LINUX_AT_SYMLINK_NOFOLLOW,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    56,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 3 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    439,
+                    SyscallArgs::from([3, 0x4060, LINUX_R_OK, LINUX_AT_EMPTY_PATH, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    439,
+                    SyscallArgs::from([
+                        (-100_i64) as u64,
+                        0x4040,
+                        LINUX_R_OK,
+                        LINUX_AT_EACCESS,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    439,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4000, 8, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 22 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    439,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4000, LINUX_R_OK, 0x80, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 22 }
+    );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 

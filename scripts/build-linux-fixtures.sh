@@ -68,6 +68,7 @@ build_fixture "nanosleep.rs" "carrick-linux-aarch64-nanosleep"
 build_fixture "clock_nanosleep.rs" "carrick-linux-aarch64-clock-nanosleep"
 build_fixture "madvise.rs" "carrick-linux-aarch64-madvise"
 build_fixture "statx_motd.rs" "carrick-linux-aarch64-statx-motd"
+build_fixture "faccessat2_motd.rs" "carrick-linux-aarch64-faccessat2-motd"
 build_fixture "sendfile_motd.rs" "carrick-linux-aarch64-sendfile-motd"
 build_fixture "preadv_motd.rs" "carrick-linux-aarch64-preadv-motd"
 

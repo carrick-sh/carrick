@@ -41,6 +41,7 @@ pub const LINUX_ENOSYS: i32 = 38;
 pub const LINUX_ETIMEDOUT: i32 = 110;
 pub const LINUX_AT_FDCWD: u64 = (-100_i64) as u64;
 pub const LINUX_AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+pub const LINUX_AT_EACCESS: u64 = 0x200;
 pub const LINUX_AT_EMPTY_PATH: u64 = 0x1000;
 pub const LINUX_AT_NO_AUTOMOUNT: u64 = 0x800;
 pub const LINUX_AT_STATX_FORCE_SYNC: u64 = 0x2000;
@@ -512,6 +513,7 @@ impl SyscallDispatcher {
             283 => self.membarrier(request),
             291 => self.statx(request, memory)?,
             293 => self.rseq(),
+            439 => self.faccessat2(request, memory)?,
             _ => {
                 reporter.record(CompatEvent::unhandled_syscall(
                     request.number,
@@ -565,11 +567,40 @@ impl SyscallDispatcher {
         request: SyscallRequest,
         memory: &impl GuestMemory,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let dirfd = request.arg(0);
-        let pathname = request.arg(1);
-        let mode = request.arg(2);
         let flags = request.arg(3);
-        if mode & !(LINUX_R_OK | LINUX_W_OK | LINUX_X_OK) != 0 || flags != 0 {
+        if flags != 0 {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            });
+        }
+        self.access_at(request.arg(0), request.arg(1), request.arg(2), 0, memory)
+    }
+
+    fn faccessat2(
+        &self,
+        request: SyscallRequest,
+        memory: &impl GuestMemory,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        self.access_at(
+            request.arg(0),
+            request.arg(1),
+            request.arg(2),
+            request.arg(3),
+            memory,
+        )
+    }
+
+    fn access_at(
+        &self,
+        dirfd: u64,
+        pathname: u64,
+        mode: u64,
+        flags: u64,
+        memory: &impl GuestMemory,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        if mode & !(LINUX_R_OK | LINUX_W_OK | LINUX_X_OK) != 0
+            || !linux_access_flags_are_supported(flags)
+        {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
             });
@@ -579,50 +610,69 @@ impl SyscallDispatcher {
             Ok(path) => path,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
+        if path.is_empty() {
+            if flags & LINUX_AT_EMPTY_PATH == 0 {
+                return Ok(DispatchOutcome::Errno {
+                    errno: LINUX_ENOENT,
+                });
+            }
+            if dirfd == LINUX_AT_FDCWD {
+                return Ok(self.access_resolved_path(&self.cwd, mode, flags));
+            }
+            return Ok(self.fd_access(dirfd as i32, mode));
+        }
+
         let path = match self.resolve_at_path(dirfd, &path) {
             Ok(path) => path,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
+        Ok(self.access_resolved_path(&path, mode, flags))
+    }
+
+    fn access_resolved_path(&self, path: &str, mode: u64, flags: u64) -> DispatchOutcome {
         if let Some(outcome) = self.synthetic_access(&path, mode) {
-            return Ok(outcome);
+            return outcome;
         }
         let Some(rootfs) = &self.rootfs else {
-            return Ok(DispatchOutcome::Errno {
+            return DispatchOutcome::Errno {
                 errno: LINUX_ENOENT,
-            });
+            };
         };
-        let metadata = match rootfs.metadata(path) {
+        let metadata = if flags & LINUX_AT_SYMLINK_NOFOLLOW != 0 {
+            rootfs.symlink_metadata(path)
+        } else {
+            rootfs.metadata(path)
+        };
+        let metadata = match metadata {
             Ok(metadata) => metadata,
             Err(errno) => {
-                return Ok(DispatchOutcome::Errno {
+                return DispatchOutcome::Errno {
                     errno: rootfs_errno(errno),
-                });
+                };
             }
         };
+        access_metadata(&metadata, mode)
+    }
 
-        if mode & LINUX_W_OK != 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EACCES,
-            });
+    fn fd_access(&self, fd: i32, mode: u64) -> DispatchOutcome {
+        let Some(open_file) = self.open_files.get(&fd) else {
+            return DispatchOutcome::Errno { errno: LINUX_EBADF };
+        };
+        let open = open_file.description.borrow();
+        match &*open {
+            OpenDescription::File { metadata, .. }
+            | OpenDescription::Directory { metadata, .. } => access_metadata(metadata, mode),
+            OpenDescription::SyntheticFile { path, .. } => self
+                .synthetic_access(path, mode)
+                .unwrap_or(DispatchOutcome::Errno {
+                    errno: LINUX_ENOENT,
+                }),
+            OpenDescription::EventFd { .. }
+            | OpenDescription::TimerFd { .. }
+            | OpenDescription::Epoll { .. }
+            | OpenDescription::PipeReader { .. }
+            | OpenDescription::PipeWriter { .. } => synthetic_readonly_access(mode),
         }
-        if mode & LINUX_R_OK != 0
-            && metadata.kind == RootFsEntryKind::File
-            && metadata.mode & 0o444 == 0
-        {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EACCES,
-            });
-        }
-        if mode & LINUX_X_OK != 0
-            && metadata.kind == RootFsEntryKind::File
-            && metadata.mode & 0o111 == 0
-        {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EACCES,
-            });
-        }
-
-        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
     fn chdir(
@@ -688,13 +738,7 @@ impl SyscallDispatcher {
         if synthetic_proc_file(path, &self.executable_path).is_none() {
             return None;
         }
-        if mode & LINUX_W_OK != 0 {
-            Some(DispatchOutcome::Errno {
-                errno: LINUX_EACCES,
-            })
-        } else {
-            Some(DispatchOutcome::Returned { value: 0 })
-        }
+        Some(synthetic_readonly_access(mode))
     }
 
     fn record_unimplemented_virtual_file(
@@ -3166,6 +3210,11 @@ fn linux_statx_flags_are_supported(flags: u64) -> bool {
     flags & !SUPPORTED == 0
 }
 
+fn linux_access_flags_are_supported(flags: u64) -> bool {
+    const SUPPORTED: u64 = LINUX_AT_SYMLINK_NOFOLLOW | LINUX_AT_EACCESS | LINUX_AT_EMPTY_PATH;
+    flags & !SUPPORTED == 0
+}
+
 fn realtime_duration() -> Duration {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3776,6 +3825,41 @@ fn linux_mode(metadata: &RootFsMetadata) -> u32 {
         RootFsEntryKind::Symlink => LINUX_S_IFLNK,
     };
     kind | (metadata.mode & 0o7777)
+}
+
+fn access_metadata(metadata: &RootFsMetadata, mode: u64) -> DispatchOutcome {
+    if mode & LINUX_W_OK != 0 {
+        return DispatchOutcome::Errno {
+            errno: LINUX_EACCES,
+        };
+    }
+    if mode & LINUX_R_OK != 0
+        && metadata.kind == RootFsEntryKind::File
+        && metadata.mode & 0o444 == 0
+    {
+        return DispatchOutcome::Errno {
+            errno: LINUX_EACCES,
+        };
+    }
+    if mode & LINUX_X_OK != 0
+        && metadata.kind == RootFsEntryKind::File
+        && metadata.mode & 0o111 == 0
+    {
+        return DispatchOutcome::Errno {
+            errno: LINUX_EACCES,
+        };
+    }
+    DispatchOutcome::Returned { value: 0 }
+}
+
+fn synthetic_readonly_access(mode: u64) -> DispatchOutcome {
+    if mode & LINUX_W_OK != 0 {
+        DispatchOutcome::Errno {
+            errno: LINUX_EACCES,
+        }
+    } else {
+        DispatchOutcome::Returned { value: 0 }
+    }
 }
 
 fn blocks_512(size: usize) -> i64 {
