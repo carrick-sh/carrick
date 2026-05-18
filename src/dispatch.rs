@@ -99,6 +99,12 @@ pub const LINUX_MADV_FREE: u64 = 8;
 pub const LINUX_MREMAP_MAYMOVE: u64 = 0x01;
 pub const LINUX_MREMAP_FIXED: u64 = 0x02;
 pub const LINUX_MREMAP_DONTUNMAP: u64 = 0x04;
+pub const LINUX_MS_ASYNC: u64 = 0x01;
+pub const LINUX_MS_INVALIDATE: u64 = 0x02;
+pub const LINUX_MS_SYNC: u64 = 0x04;
+pub const LINUX_MCL_CURRENT: u64 = 0x01;
+pub const LINUX_MCL_FUTURE: u64 = 0x02;
+pub const LINUX_MCL_ONFAULT: u64 = 0x04;
 pub const LINUX_RLIM_INFINITY: u64 = u64::MAX;
 pub const LINUX_RUSAGE_SELF: i32 = 0;
 pub const LINUX_RUSAGE_CHILDREN: i32 = -1;
@@ -638,6 +644,12 @@ impl SyscallDispatcher {
             216 => self.mremap(request),
             222 => self.mmap(request, memory)?,
             226 => self.mprotect(request, memory),
+            227 => self.msync(request, memory),
+            228 => self.mlock(request, memory),
+            229 => self.munlock(request, memory),
+            230 => self.mlockall(request),
+            231 => self.munlockall(),
+            232 => self.mincore(request, memory),
             233 => self.madvise(request, memory),
             260 => self.wait4(request),
             261 => self.prlimit64(request, memory),
@@ -3139,6 +3151,87 @@ impl SyscallDispatcher {
         if length == 0 || !range_within(address, length, LINUX_MMAP_BASE, LINUX_MMAP_SIZE) {
             return DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
+            };
+        }
+        DispatchOutcome::Returned { value: 0 }
+    }
+
+    fn msync(&self, request: SyscallRequest, memory: &impl GuestMemory) -> DispatchOutcome {
+        let address = request.arg(0);
+        let length = request.arg(1);
+        let flags = request.arg(2);
+        if flags & !(LINUX_MS_ASYNC | LINUX_MS_INVALIDATE | LINUX_MS_SYNC) != 0 {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+        if flags & LINUX_MS_ASYNC != 0 && flags & LINUX_MS_SYNC != 0 {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+        if length == 0 {
+            return DispatchOutcome::Returned { value: 0 };
+        }
+        if memory.read_bytes(address, 1).is_err() {
+            return DispatchOutcome::Errno {
+                errno: LINUX_ENOMEM,
+            };
+        }
+        DispatchOutcome::Returned { value: 0 }
+    }
+
+    fn mlock(&self, request: SyscallRequest, memory: &impl GuestMemory) -> DispatchOutcome {
+        let address = request.arg(0);
+        let length = request.arg(1);
+        if length == 0 {
+            return DispatchOutcome::Returned { value: 0 };
+        }
+        if memory.read_bytes(address, 1).is_err() {
+            return DispatchOutcome::Errno {
+                errno: LINUX_ENOMEM,
+            };
+        }
+        DispatchOutcome::Returned { value: 0 }
+    }
+
+    fn munlock(&self, request: SyscallRequest, memory: &impl GuestMemory) -> DispatchOutcome {
+        self.mlock(request, memory)
+    }
+
+    fn mlockall(&self, request: SyscallRequest) -> DispatchOutcome {
+        let flags = request.arg(0);
+        if flags == 0
+            || flags & !(LINUX_MCL_CURRENT | LINUX_MCL_FUTURE | LINUX_MCL_ONFAULT) != 0
+        {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+        DispatchOutcome::Returned { value: 0 }
+    }
+
+    fn munlockall(&self) -> DispatchOutcome {
+        DispatchOutcome::Returned { value: 0 }
+    }
+
+    fn mincore(&self, request: SyscallRequest, memory: &mut impl GuestMemory) -> DispatchOutcome {
+        let address = request.arg(0);
+        let length = request.arg(1);
+        let vec = request.arg(2);
+        if length == 0 {
+            return DispatchOutcome::Returned { value: 0 };
+        }
+        if memory.read_bytes(address, 1).is_err() {
+            return DispatchOutcome::Errno {
+                errno: LINUX_ENOMEM,
+            };
+        }
+        let pages = (length + LINUX_PAGE_SIZE as u64 - 1) / LINUX_PAGE_SIZE as u64;
+        let bytes = vec![1u8; pages as usize];
+        if memory.write_bytes(vec, &bytes).is_err() {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EFAULT,
             };
         }
         DispatchOutcome::Returned { value: 0 }
