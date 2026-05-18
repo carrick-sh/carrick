@@ -235,3 +235,112 @@ codesign --force --sign - --entitlements scripts/entitlements.plist target/relea
   --max-traps 8
 # expected: syndrome=0x82000007, virtual_address=0x400 (EL0 SVC vectored to unmapped VBAR_EL1+0x400)
 ```
+
+## Third attempt — stage-2 RW-without-X stack/data fault, and the macOS 26 HVF workaround
+
+Date: 2026-05-18, after landing the EL1 vector forwarding stub and chasing the next wall.
+
+### Symptom
+
+Running `./target/release/carrick run docker.io/library/alpine@sha256:378c4...d1481a0 /bin/busybox echo hello` produced:
+
+```
+trap engine failed: guest exception is not an AArch64 SVC trap:
+syndrome=0x92000005, virtual_address=0xfffffeff40, physical_address=0xfffffeff40
+```
+
+Decode: `EC = 0x24` (Data Abort from a lower EL), `WnR = 0` (read), `DFSC = 0b000101` (translation fault, level 1). The faulting VA `0xff_fffe_ff40` lies inside the configured stack region `LINUX_STACK_TOP - LINUX_STACK_SIZE .. LINUX_STACK_TOP` (i.e. `0xff_ffef_0000 .. 0xff_ffff_0000`) and is exactly the initial SP that `with_linux_initial_stack` plants for `argc/argv/envp/auxv`.
+
+### Diagnosis (root cause)
+
+This is not a missing-mapping bug. With ad-hoc tracing in `GuestMappingPlan::from_address_space` and `map_plan`, we confirmed that:
+
+1. The stack region IS in the `AddressSpace` for the OCI/rootfs path (the rootfs `run_rootfs_elf_with_hvf_args` builder already chains `.with_linux_initial_stack(argv, env)`).
+2. The corresponding `GuestMapping` IS emitted with `guest_start=0xffffef0000`, `mapped_size=0x100000`, `payload_size=0x100000`, perms `RW`.
+3. `hv_vm_map` for that range succeeds with no error.
+4. A host-side `Memory::read(stack_pointer, &mut [u8; 16])` immediately after the map returns the expected `argc=3` plus the first `argv` pointer — i.e. the host allocation is correctly written and addressable.
+5. From the guest side, after the EL0 trampoline `eret`, `_dlstart` (musl ld's entry) executes correctly up to and including `mov x0, sp; and sp, x0, #~15; sub sp, sp, #0x230; mov x3, x0` (verified by reading PC=0x800006953c+0x24=0x800006953c+9·4=0x...69560 and SP_EL0=0xfffffefd10 at the fault, which is the original SP minus 0x230). The very next instruction, `ldr x2, [x3], #0x8` at `_dlstart+0x24`, then takes the stage-2 fault on the read from x3 (= original SP).
+
+The fault virtual address equals the host-readable IPA inside our registered mapping. ARMv8's stage-2 attribute model has no per-EL data-access bit, so this is not architectural. The mapping exists, is addressable from the host, but the guest's stage-2 walk for an EL0 data access into it returns "translation fault, level 1".
+
+To narrow it further we ran the static-PIE fixture `carrick-linux-aarch64-pie-hello` (also at `LINUX_STACK_TOP=0xff_ffff_0000`, same RW stack region). It runs to completion in 2 traps. The difference: that fixture's `_start` writes "hello from carrick pie\n" and exits *without ever touching the stack*. As soon as we ran `carrick-linux-aarch64-argv-echo` (a static fixture that DOES `ldr x0, [sp]`), it reproduced the same `syndrome=0x93c08005` / `DFSC=0x05` fault at `virtual_address=stack_pointer`.
+
+Targeted permutation testing then isolated the bug:
+
+| Stack region perms (HVF `MemPerms`) | Outcome |
+|---|---|
+| `ReadWrite`   | Stage-2 translation fault, level 1, on EL0 data read |
+| `Read`        | Works (no write, no execute — fault clears) |
+| `ReadWriteExec` | Works |
+
+So the failure is specifically `HV_MEMORY_READ | HV_MEMORY_WRITE` *without* `HV_MEMORY_EXEC` on macOS 26 (Tahoe) HVF: that stage-2 attribute combination apparently does not produce a valid stage-2 table entry for EL0 data accesses, even though `hv_vm_map` returns success and host-side reads/writes via the same `Memory` handle work. This is HVF-specific behaviour, not ARMv8 architectural. We have not seen it reported elsewhere; it may be specific to macOS 26 + the `macos-13-0` feature set of `applevisor` (default IPA granule 4 KiB while host pages are 16 KiB), but isolating that is out of scope here.
+
+### The fix
+
+`src/trap.rs::hvf_perms` now escalates any `Write`-capable mapping to also carry `Exec`. Concretely:
+
+```rust
+let escalated_perms = SegmentPerms {
+    read: perms.read,
+    write: perms.write,
+    execute: perms.execute || perms.write,
+};
+```
+
+The escalation is gated on `write`, so `Read`-only and `Exec`-only mappings still translate the original perms (those work as-is and don't trip the quirk). With stage-1 disabled (`SCTLR_EL1.M = 0`) and the host process single-tenant, the extra stage-2 `X` bit on writable data/stack regions doesn't introduce a meaningful new attack surface — the guest could already execute anywhere, since stage-1 isn't enforcing it.
+
+The change is 10 lines of code (plus a long explanatory comment) entirely inside `hvf_perms`. No address-space layout changes, no new HVF feature, no syscall-dispatch changes. All 215 pre-existing tests still pass.
+
+### What the fix moved (and what it didn't)
+
+- **Did:** The Tier B stack stage-2 fault on the first `ldr` is gone. musl ld's `_dlstart` now successfully reads `argc`, `argv`, and the auxv.
+- **Did:** The very first syscall reaches our dispatcher. With debug tracing we observed `trap#1: EC=0x16 (HVC route), x8=96 (set_tid_address), x0=stack_arg, x1=1, x2=8`, returning `3407` (our synthetic TID). This is the first concrete evidence Tier B's user code is actually running under the dispatcher.
+- **Didn't:** Get past the *second* syscall. See below.
+
+### New wall: PC fails to advance past the EL1 vector's HVC re-trap on the second SVC
+
+After the fix, `carrick run … /bin/busybox echo hello` either exits with `RuntimeError::TrapLimitExceeded { max_traps: 1_000_000 }` or with HVF returning `0xfae94007` (`HV_DENIED`) part-way through, depending on timing — both stem from the same underlying loop.
+
+With per-trap tracing (`eprintln!` in `runtime.rs` + `run_until_syscall`) the loop shape is:
+
+```
+trap#1: EC=0x16 pc=0x20404 elr_el1=0x800001fcac spsr_el1=0x800003c0  x8=96  -> Returned(3407)
+trap#2: EC=0x16 pc=0x20404 elr_el1=0x8000018420 spsr_el1=0x200003c0  x8=1685382482 (=0x6473_5f4d)  -> Errno(38)
+trap#3..N: EC=0x16 pc=0x20404 elr_el1=0x8000018420 spsr_el1=0x200003c0  x8=1685382482  -> Errno(38)
+… repeats until trap budget exhausted or HVF returns HV_DENIED …
+```
+
+So:
+
+- Trap #1 dispatches cleanly. `set_tid_address` returns 3407. The EL1 vector's `eret` fires and user code keeps running.
+- Trap #2 fires from a different user PC (`ELR_EL1` jumps from `0x800001fcac` to `0x8000018420`), so user code DID execute between traps. But `X8 = 0x6473_5f4d` — which is ASCII "M_sd" as bytes — is not a valid Linux/aarch64 syscall number (max is < 500). The disassembly at `ELR_EL1 - 4 = 0x800001841c` shows `nop`, not `svc`. So whatever raised this exception, it wasn't a plain user-mode `svc #0` at `0x800001841c`.
+- From trap #2 onwards, `pc` (the HVC instruction at vector slot `0x20400 + 4 = 0x20404`), `ELR_EL1`, `SPSR_EL1`, and `X8` are all identical on every trap. The vCPU is **stuck** re-executing the same EL1 vector's `hvc #0` in a loop. Our `complete_syscall` only writes `X0`; it does not advance PC or eret, and apparently the `eret` two instructions later either never fires or fires back into a state that immediately re-traps to HVF with the same syndrome.
+- After ~1M of these traps HVF refuses with `HV_DENIED (0xfae94007)` instead of letting us keep running the vCPU. The application-visible error therefore flips between `guest did not exit after 1000000 traps` and `HV_DENIED` depending on how quickly the loop saturates.
+
+Interpretation: the EL1 vector stub `hvc #0; eret` at offset `0x400` is not actually returning to the EL0 caller after the second HVC. The `X8 = 0x6473_5f4d` value strongly suggests user code is *not* the source of the second trap — either:
+
+1. The `eret` is re-entering EL0 but at a stale PC where neighbouring memory happens to encode an `svc #0` (or another HVC); the user "PC" we see in ELR_EL1 reflects a runaway, not the originally intended return.
+2. The HVF round-trip through HVC is clobbering some sysreg (`SPSR_EL1`, `ELR_EL1`, or `SP_EL0/EL1`) that the `eret` then consumes, so we never reach EL0 at all on the second iteration and instead loop inside EL1.
+3. PC needs to be explicitly advanced past the `hvc #0` instruction on resume (i.e. `vcpu.set_reg(Reg::PC, pc + 4)` in `complete_syscall` when the trap class is `EC = 0x16`), because HVF surfaces HVC without auto-skipping it. Then the existing `eret` would actually run on resume.
+
+Hypothesis (3) is the most concrete and most likely. The trace shows `pc=0x20404` consistently, which is *exactly* one instruction past `0x20400` (the HVC). If HVF surfaces HVC with PC pointing AT the HVC, our resume should fall through to PC+4 = `0x20404` = `eret`. If HVF instead surfaces with PC already at `0x20404` (post-HVC), then resuming runs the `eret`, which uses `SPSR_EL1`/`ELR_EL1` — and those still hold the values the EL0→EL1 SVC trap saved. But if the resume actually re-runs PC=0x20404 as the HVC (because HVF expects us to advance), we'd loop. The empirics fit pattern (3): we need to advance PC past the HVC on resume when the trap class is HVC.
+
+### Next wall (predicted next move)
+
+The smallest correct delta to unblock the next layer is:
+
+- In `HvfTrapEngine::complete_syscall` (or in a new helper invoked from there), when the most recent exit was `EC = 0x16` (HVC, i.e. our EL1-vector route), advance `PC` by 4 before returning so the resumed vCPU executes the `eret` at vector offset `0x404`, not the `hvc #0` at `0x400` again. The direct EL0-SVC path (`EC = 0x15`) likely already has HVF auto-advance PC, which is why the existing tests pass. Track the most recent EC from `run_until_syscall` into the engine so `complete_syscall` can branch on it.
+
+Once that lands, expect to immediately surface the *real* second syscall musl ld issues (likely `set_robust_list` (#99), `prlimit64` (#261), `mprotect` (#226), `mmap` (#222), `openat` (#56), `read` (#63), `getrandom` (#278), or `brk` (#214) depending on the musl version). That's compat-report territory, not bootstrap-cliff territory, and is what Tier B was originally supposed to be measuring.
+
+### Reproduction
+
+```bash
+cargo build --release --bin carrick
+codesign --force --sign - --entitlements scripts/entitlements.plist target/release/carrick
+./target/release/carrick run \
+  docker.io/library/alpine@sha256:378c4c5418f7493bd500ad21ffb43818d0689daaad43e3261859fb417d1481a0 \
+  /bin/busybox echo hello
+# expected today: "guest did not exit after 1000000 traps" (or HV_DENIED 0xfae94007 on faster machines)
+# previously (before the hvf_perms fix): "guest exception is not an AArch64 SVC trap: syndrome=0x92000005, virtual_address=0xfffffeff40"
+```

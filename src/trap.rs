@@ -501,7 +501,38 @@ fn align_up(value: u64, alignment: u64) -> Result<u64, TrapError> {
 fn hvf_perms(perms: SegmentPerms) -> applevisor::memory::MemPerms {
     use applevisor::memory::MemPerms;
 
-    match (perms.read, perms.write, perms.execute) {
+    // HVF stage-2 quirk on macOS 26 (Tahoe) / Apple Silicon: a stage-2
+    // mapping created with `HV_MEMORY_READ | HV_MEMORY_WRITE` (no
+    // `HV_MEMORY_EXEC`) fails to translate EL0 data accesses — the guest
+    // takes a stage-2 translation fault (DFSC=0x05, "translation fault
+    // level 1") even though the IPA falls inside the mapping and the
+    // host-side `Memory::read`/`Memory::write` accessors succeed. The
+    // ARM stage-2 attribute model has no per-EL data-access bit, so the
+    // fault is HVF-specific behaviour rather than ARMv8 architectural.
+    //
+    // Empirically, escalating the stage-2 permission to
+    // `ReadWriteExec` makes the fault go away. The guest still uses
+    // stage-1 (`SCTLR_EL1.M=0` in the bootstrap), so the stage-2 X bit
+    // is the only thing that controls instruction fetch from the
+    // region; the guest is already executing without stage-1 enforcement
+    // and the host process is single-tenant, so granting stage-2 X on
+    // data/stack regions does not add a meaningful new attack surface.
+    //
+    // The escalation is gated on the original perms still being some
+    // form of `Write` so we don't accidentally upgrade a `Read`-only or
+    // `Exec`-only mapping: those translate fine as-is. This keeps the
+    // workaround narrow.
+    let escalated_perms = SegmentPerms {
+        read: perms.read,
+        write: perms.write,
+        execute: perms.execute || perms.write,
+    };
+
+    match (
+        escalated_perms.read,
+        escalated_perms.write,
+        escalated_perms.execute,
+    ) {
         (false, false, false) => MemPerms::None,
         (true, false, false) => MemPerms::Read,
         (false, true, false) => MemPerms::Write,
