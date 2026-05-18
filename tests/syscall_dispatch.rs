@@ -4116,6 +4116,173 @@ fn rt_signal_stubs_zero_old_state() {
 }
 
 #[test]
+fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
+    const LINUX_EINTR: i32 = 4;
+    const LINUX_EAGAIN: i32 = 11;
+    const LINUX_EFAULT: i32 = 14;
+    const LINUX_EINVAL: i32 = 22;
+    const LINUX_ESRCH: i32 = 3;
+    const LINUX_ENOSYS: i32 = 38;
+
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    // rt_sigsuspend(mask=0x4000, sigsetsize=8) -> EINTR (no signals to wake us).
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(133, SyscallArgs::from([0x4000, 8, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno {
+            errno: LINUX_EINTR
+        }
+    );
+    // rt_sigsuspend with wrong sigsetsize -> EINVAL.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(133, SyscallArgs::from([0x4000, 9, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno {
+            errno: LINUX_EINVAL
+        }
+    );
+    // rt_sigsuspend with bad mask pointer -> EFAULT.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(133, SyscallArgs::from([0xdead_0000, 8, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno {
+            errno: LINUX_EFAULT
+        }
+    );
+
+    // rt_sigtimedwait(set=0x4000, info=NULL, timeout=NULL, sigsetsize=8) -> EAGAIN.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(137, SyscallArgs::from([0x4000, 0, 0, 8, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno {
+            errno: LINUX_EAGAIN
+        }
+    );
+    // rt_sigtimedwait with zero timeout -> EAGAIN.
+    memory
+        .write_bytes(0x4040, LinuxTimespec::new(0, 0).as_bytes())
+        .unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(137, SyscallArgs::from([0x4000, 0, 0x4040, 8, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno {
+            errno: LINUX_EAGAIN
+        }
+    );
+    // rt_sigtimedwait with wrong sigsetsize -> EINVAL.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(137, SyscallArgs::from([0x4000, 0, 0, 9, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno {
+            errno: LINUX_EINVAL
+        }
+    );
+    // rt_sigtimedwait with tv_nsec out of range -> EINVAL.
+    memory
+        .write_bytes(0x4040, LinuxTimespec::new(0, 1_000_000_001).as_bytes())
+        .unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(137, SyscallArgs::from([0x4000, 0, 0x4040, 8, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno {
+            errno: LINUX_EINVAL
+        }
+    );
+
+    // rt_sigqueueinfo(1, 65, NULL) -> EINVAL (signum out of range).
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(138, SyscallArgs::from([1, 65, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno {
+            errno: LINUX_EINVAL
+        }
+    );
+    // rt_sigqueueinfo(99, 1, NULL) -> ESRCH (no such tgid).
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(138, SyscallArgs::from([99, 1, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: LINUX_ESRCH }
+    );
+    // rt_sigqueueinfo(1, 1, NULL) -> ENOSYS (no signal delivery).
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(138, SyscallArgs::from([1, 1, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno {
+            errno: LINUX_ENOSYS
+        }
+    );
+
+    // rt_sigreturn (no args meaningful) -> ENOSYS.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(139, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno {
+            errno: LINUX_ENOSYS
+        }
+    );
+
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
 fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
     const LINUX_EINVAL: i32 = 22;
     const LINUX_ESRCH: i32 = 3;

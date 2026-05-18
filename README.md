@@ -70,7 +70,11 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
   `setsid(2)`/`getsid(2)` single-session bootstrap, minimal `rt_sigaction(2)`/
   `rt_sigprocmask(2)` stubs, bootstrap `kill(2)`/`tkill(2)`/`tgkill(2)` that
   validate signum range and target pid (returning `ENOSYS` for real signals
-  since the runtime has no signal delivery yet), a `sigaltstack(2)` stub that
+  since the runtime has no signal delivery yet), `rt_sigsuspend(2)` returning
+  `EINTR`, `rt_sigtimedwait(2)` returning `EAGAIN` after validating the set
+  and timeout, `rt_sigqueueinfo(2)` returning `ENOSYS` after validating the
+  signum/tgid, and `rt_sigreturn(2)` reporting `ENOSYS` in the unreachable
+  case that a trampoline invokes it, a `sigaltstack(2)` stub that
   reports `SS_DISABLE` for the old stack and validates incoming requests, and
   bootstrap `waitid(2)`/`wait4(2)` argument validators that return `ECHILD`
   since the runtime has no children yet.

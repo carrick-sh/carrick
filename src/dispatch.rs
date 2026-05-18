@@ -28,6 +28,7 @@ pub const LINUX_ESRCH: i32 = 3;
 pub const LINUX_EBADF: i32 = 9;
 pub const LINUX_ECHILD: i32 = 10;
 pub const LINUX_EAGAIN: i32 = 11;
+pub const LINUX_EINTR: i32 = 4;
 pub const LINUX_ENOMEM: i32 = 12;
 pub const LINUX_EACCES: i32 = 13;
 pub const LINUX_EFAULT: i32 = 14;
@@ -580,8 +581,12 @@ impl SyscallDispatcher {
             130 => self.tkill(request),
             131 => self.tgkill(request),
             132 => self.sigaltstack(request, memory),
+            133 => self.rt_sigsuspend(request, memory),
             134 => self.rt_sigaction(request, memory),
             135 => self.rt_sigprocmask(request, memory)?,
+            137 => self.rt_sigtimedwait(request, memory),
+            138 => self.rt_sigqueueinfo(request),
+            139 => self.rt_sigreturn(),
             153 => self.times(request, memory),
             154 => self.setpgid(request),
             155 => self.getpgid(request),
@@ -2103,6 +2108,36 @@ impl SyscallDispatcher {
         DispatchOutcome::Returned { value: 0 }
     }
 
+    fn rt_sigsuspend(
+        &self,
+        request: SyscallRequest,
+        memory: &impl GuestMemory,
+    ) -> DispatchOutcome {
+        let mask_ptr = request.arg(0);
+        let sigset_size = request.arg(1);
+        if sigset_size != LINUX_RT_SIGSET_SIZE {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+        // Validate readability of the mask. The bootstrap has no signal
+        // delivery, so we don't need to honour the mask — but we do owe the
+        // caller an EFAULT if the pointer is bad. rt_sigsuspend is documented
+        // to always return -1; with no signals to deliver, EINTR is the only
+        // honest answer.
+        if memory
+            .read_bytes(mask_ptr, LINUX_RT_SIGSET_SIZE as usize)
+            .is_err()
+        {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EFAULT,
+            };
+        }
+        DispatchOutcome::Errno {
+            errno: LINUX_EINTR,
+        }
+    }
+
     fn rt_sigaction(
         &self,
         request: SyscallRequest,
@@ -2150,6 +2185,78 @@ impl SyscallDispatcher {
             }
         }
         Ok(DispatchOutcome::Returned { value: 0 })
+    }
+
+    fn rt_sigtimedwait(
+        &self,
+        request: SyscallRequest,
+        memory: &impl GuestMemory,
+    ) -> DispatchOutcome {
+        let set_ptr = request.arg(0);
+        let timeout_ptr = request.arg(2);
+        let sigset_size = request.arg(3);
+        if sigset_size != LINUX_RT_SIGSET_SIZE {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+        if memory
+            .read_bytes(set_ptr, LINUX_RT_SIGSET_SIZE as usize)
+            .is_err()
+        {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EFAULT,
+            };
+        }
+        if timeout_ptr != 0 {
+            let timeout = match read_timespec(memory, timeout_ptr) {
+                Ok(timeout) => timeout,
+                Err(errno) => return DispatchOutcome::Errno { errno },
+            };
+            let tv_sec = timeout.tv_sec;
+            let tv_nsec = timeout.tv_nsec;
+            if tv_sec < 0 || !(0..1_000_000_000).contains(&tv_nsec) {
+                return DispatchOutcome::Errno {
+                    errno: LINUX_EINVAL,
+                };
+            }
+            // A zero timeout is a polling check that must return immediately.
+            // We have no signal queue, so the answer is always "timed out".
+        }
+        // Non-zero timeout: a real implementation would block. With no signal
+        // source we'd block forever, so report the timeout. info is only
+        // written on success, and we never succeed.
+        DispatchOutcome::Errno {
+            errno: LINUX_EAGAIN,
+        }
+    }
+
+    fn rt_sigqueueinfo(&self, request: SyscallRequest) -> DispatchOutcome {
+        let tgid = request.arg(0) as i64;
+        let signum = request.arg(1);
+        if !is_valid_signum(signum) {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+        if tgid != LINUX_BOOTSTRAP_PID as i64 {
+            return DispatchOutcome::Errno { errno: LINUX_ESRCH };
+        }
+        // No signal delivery; surface the gap explicitly rather than silently
+        // swallowing the queued siginfo.
+        DispatchOutcome::Errno {
+            errno: LINUX_ENOSYS,
+        }
+    }
+
+    fn rt_sigreturn(&self) -> DispatchOutcome {
+        // rt_sigreturn is invoked from a signal trampoline to restore the
+        // pre-signal context; a real kernel never returns from it. We never
+        // deliver a signal, so this is unreachable in practice. Surface
+        // ENOSYS if it is somehow invoked directly.
+        DispatchOutcome::Errno {
+            errno: LINUX_ENOSYS,
+        }
     }
 
     fn uname(&self, request: SyscallRequest, memory: &mut impl GuestMemory) -> DispatchOutcome {
