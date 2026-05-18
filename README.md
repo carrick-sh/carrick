@@ -67,8 +67,12 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
   capability probes, scheduler affinity/yield and `getcpu(2)` probes,
   `prctl(2)` process controls, `personality(2)`, `setpgid(2)`/`getpgid(2)`/
   `setsid(2)`/`getsid(2)` single-session bootstrap, minimal `rt_sigaction(2)`/
-  `rt_sigprocmask(2)` stubs, and bootstrap `waitid(2)`/`wait4(2)` argument
-  validators that return `ECHILD` since the runtime has no children yet.
+  `rt_sigprocmask(2)` stubs, bootstrap `kill(2)`/`tkill(2)`/`tgkill(2)` that
+  validate signum range and target pid (returning `ENOSYS` for real signals
+  since the runtime has no signal delivery yet), a `sigaltstack(2)` stub that
+  reports `SS_DISABLE` for the old stack and validates incoming requests, and
+  bootstrap `waitid(2)`/`wait4(2)` argument validators that return `ECHILD`
+  since the runtime has no children yet.
 - Linux ABI outputs for `stat`, `statx`, `statfs`, `getdents64`, `iovec`,
   `eventfd` counters, `timerfd` timers and expiration counts, `epoll_event`,
   `pollfd`, capability headers/data, `pipe2` fd pairs, `winsize`, `timespec`,

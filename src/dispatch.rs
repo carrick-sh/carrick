@@ -10,9 +10,9 @@ use crate::linux_abi::{
     LINUX_DIRENT64_HEADER_SIZE, LINUX_DT_DIR, LINUX_DT_LNK, LINUX_DT_REG, LINUX_PAGE_SIZE,
     LINUX_S_IFDIR, LINUX_S_IFLNK, LINUX_S_IFREG, LinuxCapabilityData, LinuxCapabilityHeader,
     LinuxDirent64Header, LinuxEpollEvent, LinuxEventfdValue, LinuxFdPair, LinuxIovec,
-    LinuxItimerspec, LinuxOpenHow, LinuxPollFd, LinuxRlimit, LinuxSigaction, LinuxStat,
-    LinuxStatfs, LinuxStatx, LinuxStatxTimestamp, LinuxTimerfdExpirations, LinuxTimespec,
-    LinuxTimeval, LinuxTimezone, LinuxUtsname, LinuxWinsize,
+    LinuxItimerspec, LinuxOpenHow, LinuxPollFd, LinuxRlimit, LinuxSigaction, LinuxSigaltstack,
+    LinuxStat, LinuxStatfs, LinuxStatx, LinuxStatxTimestamp, LinuxTimerfdExpirations,
+    LinuxTimespec, LinuxTimeval, LinuxTimezone, LinuxUtsname, LinuxWinsize,
 };
 use crate::memory::{LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE, LINUX_MMAP_SIZE};
 use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsError, RootFsMetadata};
@@ -131,6 +131,12 @@ const LINUX_MEMBARRIER_CMD_QUERY: u64 = 0;
 const LINUX_TIOCGWINSZ: u64 = 0x5413;
 const LINUX_PIPE_BUF_SIZE: i64 = 65_536;
 const LINUX_RT_SIGSET_SIZE: u64 = 8;
+const LINUX_MAX_SIGNUM: u64 = 64;
+const LINUX_BOOTSTRAP_PID: u64 = 1;
+#[allow(dead_code)]
+const LINUX_SS_ONSTACK: u64 = 1;
+const LINUX_SS_DISABLE: u64 = 2;
+const LINUX_MINSIGSTKSZ: u64 = 2048;
 const LINUX_BOOTSTRAP_AFFINITY_BYTES: usize = 8;
 const LINUX_CLOCK_REALTIME: u64 = 0;
 const LINUX_CLOCK_MONOTONIC: u64 = 1;
@@ -565,6 +571,10 @@ impl SyscallDispatcher {
             115 => self.clock_nanosleep(request, memory),
             123 => self.sched_getaffinity(request, memory),
             124 => self.sched_yield(),
+            129 => self.kill(request),
+            130 => self.tkill(request),
+            131 => self.tgkill(request),
+            132 => self.sigaltstack(request, memory),
             134 => self.rt_sigaction(request, memory),
             135 => self.rt_sigprocmask(request, memory)?,
             154 => self.setpgid(request),
@@ -1992,6 +2002,98 @@ impl SyscallDispatcher {
             address,
             LinuxTimespec::new(0, LINUX_CLOCK_RESOLUTION_NSEC).as_bytes(),
         )
+    }
+
+    fn kill(&self, request: SyscallRequest) -> DispatchOutcome {
+        let pid = request.arg(0) as i64;
+        let signum = request.arg(1);
+        bootstrap_signal_send(pid, /*tid_required=*/ false, signum)
+    }
+
+    fn tkill(&self, request: SyscallRequest) -> DispatchOutcome {
+        let tid = request.arg(0) as i64;
+        let signum = request.arg(1);
+        // tkill's target is a thread id, not a "0 means self" pid form.
+        bootstrap_signal_send(tid, /*tid_required=*/ true, signum)
+    }
+
+    fn tgkill(&self, request: SyscallRequest) -> DispatchOutcome {
+        let tgid = request.arg(0) as i64;
+        let tid = request.arg(1) as i64;
+        let signum = request.arg(2);
+        if !is_valid_signum(signum) {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+        if tgid != LINUX_BOOTSTRAP_PID as i64 || tid != LINUX_BOOTSTRAP_PID as i64 {
+            return DispatchOutcome::Errno { errno: LINUX_ESRCH };
+        }
+        if signum == 0 {
+            return DispatchOutcome::Returned { value: 0 };
+        }
+        DispatchOutcome::Errno {
+            errno: LINUX_ENOSYS,
+        }
+    }
+
+    fn sigaltstack(
+        &self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+    ) -> DispatchOutcome {
+        let ss = request.arg(0);
+        let old_ss = request.arg(1);
+
+        if old_ss != 0
+            && memory
+                .write_bytes(old_ss, LinuxSigaltstack::disabled().as_bytes())
+                .is_err()
+        {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EFAULT,
+            };
+        }
+
+        if ss != 0 {
+            let bytes = match memory.read_bytes(ss, core::mem::size_of::<LinuxSigaltstack>()) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    return DispatchOutcome::Errno {
+                        errno: LINUX_EFAULT,
+                    };
+                }
+            };
+            let new_stack = match LinuxSigaltstack::read_from_bytes(&bytes) {
+                Ok(stack) => stack,
+                Err(_) => {
+                    return DispatchOutcome::Errno {
+                        errno: LINUX_EFAULT,
+                    };
+                }
+            };
+            let flags = new_stack.ss_flags as u32 as u64;
+            // SS_ONSTACK is a query-only flag; reject it along with anything
+            // unrecognized. Only SS_DISABLE is accepted from userspace.
+            if flags & !LINUX_SS_DISABLE != 0 {
+                return DispatchOutcome::Errno {
+                    errno: LINUX_EINVAL,
+                };
+            }
+            if flags == 0 {
+                let size = new_stack.ss_size;
+                if size < LINUX_MINSIGSTKSZ {
+                    return DispatchOutcome::Errno {
+                        errno: LINUX_ENOMEM,
+                    };
+                }
+            }
+            // SS_DISABLE or a request with a sufficiently large stack is
+            // silently dropped: we have no alternate signal stack machinery
+            // yet, so there's nothing to install.
+        }
+
+        DispatchOutcome::Returned { value: 0 }
     }
 
     fn rt_sigaction(
@@ -4191,6 +4293,35 @@ impl SyscallDispatcher {
             },
             None => Err(LINUX_EBADF),
         }
+    }
+}
+
+fn is_valid_signum(signum: u64) -> bool {
+    signum <= LINUX_MAX_SIGNUM
+}
+
+fn bootstrap_signal_send(target: i64, tid_required: bool, signum: u64) -> DispatchOutcome {
+    if !is_valid_signum(signum) {
+        return DispatchOutcome::Errno {
+            errno: LINUX_EINVAL,
+        };
+    }
+    let pid = LINUX_BOOTSTRAP_PID as i64;
+    let self_target = if tid_required {
+        target == pid
+    } else {
+        // kill(0, sig) targets the calling process's process group; in our
+        // single-process bootstrap that's still just us.
+        target == pid || target == 0
+    };
+    if !self_target {
+        return DispatchOutcome::Errno { errno: LINUX_ESRCH };
+    }
+    if signum == 0 {
+        return DispatchOutcome::Returned { value: 0 };
+    }
+    DispatchOutcome::Errno {
+        errno: LINUX_ENOSYS,
     }
 }
 

@@ -420,6 +420,37 @@ impl LinuxSigaction {
     }
 }
 
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct LinuxSigaltstack {
+    pub ss_sp: u64,
+    pub ss_flags: i32,
+    pub __pad: u32,
+    pub ss_size: u64,
+}
+
+impl LinuxSigaltstack {
+    pub const fn empty() -> Self {
+        Self {
+            ss_sp: 0,
+            ss_flags: 0,
+            __pad: 0,
+            ss_size: 0,
+        }
+    }
+
+    pub const fn disabled() -> Self {
+        Self {
+            ss_sp: 0,
+            ss_flags: 2, // SS_DISABLE
+            __pad: 0,
+            ss_size: 0,
+        }
+    }
+}
+
 fn write_linux_c_field<const N: usize>(field: &mut [u8; N], value: &[u8]) {
     let len = value.len().min(N.saturating_sub(1));
     field[..len].copy_from_slice(&value[..len]);

@@ -8,8 +8,8 @@ use carrick::linux_abi::{
     LINUX_DIRENT64_HEADER_SIZE, LINUX_DT_REG, LINUX_S_IFDIR, LINUX_S_IFLNK, LINUX_S_IFMT,
     LINUX_S_IFREG, LinuxCapabilityData, LinuxCapabilityHeader, LinuxDirent64Header,
     LinuxEpollEvent, LinuxEventfdValue, LinuxFdPair, LinuxIovec, LinuxItimerspec, LinuxPollFd,
-    LinuxRlimit, LinuxStat, LinuxStatfs, LinuxStatx, LinuxTimerfdExpirations, LinuxTimespec,
-    LinuxTimeval, LinuxTimezone, LinuxUtsname, LinuxWinsize,
+    LinuxRlimit, LinuxSigaltstack, LinuxStat, LinuxStatfs, LinuxStatx, LinuxTimerfdExpirations,
+    LinuxTimespec, LinuxTimeval, LinuxTimezone, LinuxUtsname, LinuxWinsize,
 };
 use carrick::memory::{AddressSpace, LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE};
 use carrick::rootfs::{LayerSource, RootFs};
@@ -3965,6 +3965,311 @@ fn rt_signal_stubs_zero_old_state() {
             .iter()
             .all(|byte| *byte == 0)
     );
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
+    const LINUX_EINVAL: i32 = 22;
+    const LINUX_ESRCH: i32 = 3;
+    const LINUX_ENOSYS: i32 = 38;
+
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    // kill(1, 0) -> existence check, success.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(129, SyscallArgs::from([1, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    // kill(0, 0) -> existence check against calling pid, success.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(129, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    // kill(1, 65) -> EINVAL (signum out of range).
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(129, SyscallArgs::from([1, 65, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno {
+            errno: LINUX_EINVAL
+        }
+    );
+    // kill(99, 0) -> ESRCH (only pid 1/0 are known).
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(129, SyscallArgs::from([99, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: LINUX_ESRCH }
+    );
+    // kill(1, SIGTERM=15) -> ENOSYS (no signal delivery machinery).
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(129, SyscallArgs::from([1, 15, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno {
+            errno: LINUX_ENOSYS
+        }
+    );
+
+    // tkill(1, 0) -> success; tkill(0, 0) -> ESRCH (tid 0 isn't us).
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(130, SyscallArgs::from([1, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(130, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: LINUX_ESRCH }
+    );
+    // tkill(1, 65) -> EINVAL, tkill(99, 0) -> ESRCH, tkill(1, 1) -> ENOSYS.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(130, SyscallArgs::from([1, 65, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno {
+            errno: LINUX_EINVAL
+        }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(130, SyscallArgs::from([99, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: LINUX_ESRCH }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(130, SyscallArgs::from([1, 1, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno {
+            errno: LINUX_ENOSYS
+        }
+    );
+
+    // tgkill(1, 1, 0) -> success.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(131, SyscallArgs::from([1, 1, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    // tgkill(1, 1, 65) -> EINVAL.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(131, SyscallArgs::from([1, 1, 65, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno {
+            errno: LINUX_EINVAL
+        }
+    );
+    // tgkill(99, 1, 0) and tgkill(1, 99, 0) -> ESRCH.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(131, SyscallArgs::from([99, 1, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: LINUX_ESRCH }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(131, SyscallArgs::from([1, 99, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: LINUX_ESRCH }
+    );
+    // tgkill(1, 1, 1) -> ENOSYS.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(131, SyscallArgs::from([1, 1, 1, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno {
+            errno: LINUX_ENOSYS
+        }
+    );
+
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn sigaltstack_bootstrap_zeroes_old_stack_and_validates_new() {
+    const LINUX_EINVAL: i32 = 22;
+    const LINUX_ENOMEM: i32 = 12;
+    const LINUX_SS_DISABLE: i32 = 2;
+    const LINUX_SS_ONSTACK: i32 = 1;
+    const LINUX_MINSIGSTKSZ: u64 = 2048;
+
+    let mut memory = LinearMemory::new(0x4000, vec![0xaa; 0x200]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    let old_ptr: u64 = 0x4000;
+    let new_ptr: u64 = 0x4040;
+    let stack_size = core::mem::size_of::<LinuxSigaltstack>();
+
+    // sigaltstack(NULL, old) -> writes SS_DISABLE descriptor into old.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(132, SyscallArgs::from([0, old_ptr, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let read_back = memory.read_bytes(old_ptr, stack_size).unwrap();
+    let old_stack = LinuxSigaltstack::read_from_bytes(&read_back).unwrap();
+    assert_eq!({ old_stack.ss_sp }, 0u64);
+    assert_eq!({ old_stack.ss_flags }, LINUX_SS_DISABLE);
+    assert_eq!({ old_stack.ss_size }, 0u64);
+
+    // sigaltstack(SS_DISABLE in ss, NULL) -> success (silent drop).
+    let disabled = LinuxSigaltstack {
+        ss_sp: 0,
+        ss_flags: LINUX_SS_DISABLE,
+        __pad: 0,
+        ss_size: 0,
+    };
+    memory.write_bytes(new_ptr, disabled.as_bytes()).unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(132, SyscallArgs::from([new_ptr, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    // sigaltstack with SS_ONSTACK (or any unknown flag) -> EINVAL.
+    let bad_flags = LinuxSigaltstack {
+        ss_sp: 0x9000,
+        ss_flags: LINUX_SS_ONSTACK,
+        __pad: 0,
+        ss_size: LINUX_MINSIGSTKSZ,
+    };
+    memory.write_bytes(new_ptr, bad_flags.as_bytes()).unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(132, SyscallArgs::from([new_ptr, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno {
+            errno: LINUX_EINVAL
+        }
+    );
+
+    // sigaltstack with flags=0 but undersized stack -> ENOMEM.
+    let too_small = LinuxSigaltstack {
+        ss_sp: 0x9000,
+        ss_flags: 0,
+        __pad: 0,
+        ss_size: 0,
+    };
+    memory.write_bytes(new_ptr, too_small.as_bytes()).unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(132, SyscallArgs::from([new_ptr, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno {
+            errno: LINUX_ENOMEM
+        }
+    );
+
+    // sigaltstack with flags=0 and a usable stack -> success.
+    let usable = LinuxSigaltstack {
+        ss_sp: 0x9000,
+        ss_flags: 0,
+        __pad: 0,
+        ss_size: LINUX_MINSIGSTKSZ,
+    };
+    memory.write_bytes(new_ptr, usable.as_bytes()).unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(132, SyscallArgs::from([new_ptr, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
