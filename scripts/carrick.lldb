@@ -1,15 +1,45 @@
-# Standard lldb breakpoints + convenience commands for debugging Carrick's
-# HVF trap loop and dispatcher. Source this with `lldb -s scripts/carrick.lldb`
-# or `(lldb) command source scripts/carrick.lldb`.
+# Standard lldb breakpoints + Python plugin loader for debugging Carrick's
+# HVF trap loop and dispatcher.
 #
-# Convenience commands (defined at the bottom):
-#   carrick-regs       — dump (PC, ELR_EL1, SPSR_EL1, FAR_EL1, ESR_EL1,
-#                        SP_EL0, X0..X8) at the current stop
-#   carrick-bt         — backtrace skipping libsystem frames
-#   carrick-mappings   — print the active HvfMappedRegion vector
-#   carrick-hvf-state  — combined dump for HVF debugging
+# Sourced from `scripts/lldb-tier-b.sh` or by hand:
 #
-# Use `breakpoint disable` / `enable` to toggle individual stop points.
+#     (lldb) command source scripts/carrick.lldb
+#
+# After this loads you get:
+#
+# Plain lldb aliases:
+#   carrick-regs       — dump host-side PC + X0..X30
+#   carrick-bt         — backtrace, 24 frames
+#   carrick-hvf-state  — convenience dump for HVF inspection
+#
+# Python plugin (carrick_lldb.py) commands:
+#   carrick load-state <path>   — point at a debug-state.json
+#   carrick info                 — what we know about the active run
+#   carrick mappings             — guest stage-2 map listing
+#   carrick decode-esr <hex>     — ARMv8 ESR_EL1 decoder
+#   carrick gva <addr>           — guest VA → region/segment
+#   carrick where                — live host-side register summary
+#
+# Set `CARRICK_DEBUG_STATE_PATH=/tmp/carrick-debug-state.json` (or write
+# to one of the default locations the plugin scans) so `carrick info`
+# auto-loads.
+
+# Load the Python plugin first so its commands are available before we
+# install breakpoints. The path is computed relative to this script.
+script
+import os, sys, lldb
+here = os.path.dirname(os.path.realpath(__file__))
+if not here:
+    here = os.getcwd()
+plugin_path = os.path.join(here, "carrick_lldb.py")
+if not os.path.exists(plugin_path):
+    # Fallback: try the cargo-manifest directory (when sourced from CWD).
+    alt = os.path.join(os.path.dirname(os.path.realpath(lldb.SBDebugger.GetSelectedTarget().GetExecutable().GetDirectory() if lldb.SBDebugger.GetSelectedTarget() else here)), "scripts", "carrick_lldb.py")
+    if os.path.exists(alt):
+        plugin_path = alt
+print(f"carrick.lldb: loading plugin from {plugin_path}")
+lldb.debugger.HandleCommand(f"command script import {plugin_path}")
+end
 
 # Stop when an HVF mapping fails or an unexpected exit fires.
 breakpoint set --name carrick::trap::HvfTrapEngine::map_address_space --auto-continue 1

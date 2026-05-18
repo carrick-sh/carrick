@@ -20,6 +20,49 @@ CARRICK_TRACE_REGS=1 CARRICK_TRACE_MAPS=1 \
 ./scripts/lldb-tier-b.sh busybox
 ```
 
+## `carrick debug` and the lldb plugin
+
+The CLI now exposes a `debug` subcommand for ad-hoc inspection that pairs
+with the lldb Python plugin (`scripts/carrick_lldb.py`):
+
+```sh
+# Decode a syndrome on the command line (matches the lldb command exactly):
+./target/release/carrick debug decode-esr 0x92000035
+
+# Print the plugin path (for `command script import` from lldb):
+./target/release/carrick debug lldb-plugin
+
+# Pretty-print the JSON dump that `run --debug-state-path` produces:
+./target/release/carrick debug inspect-state /tmp/carrick-debug-state.json
+```
+
+Run carrick with `--debug-state-path` to drop a JSON layout dump for the
+plugin:
+
+```sh
+./target/release/carrick run docker.io/library/alpine:latest \
+    --max-traps 30 \
+    --debug-state-path /tmp/carrick-debug-state.json \
+    /bin/busybox echo hello
+```
+
+Once the JSON is on disk, attach lldb (via `./scripts/lldb-tier-b.sh` or
+hand-rolled) and use the `carrick` command from the plugin:
+
+```
+(lldb) carrick load-state /tmp/carrick-debug-state.json
+(lldb) carrick info                       # summary
+(lldb) carrick mappings                   # guest stage-2 regions
+(lldb) carrick gva 0x80000c2ab4           # guest VA → region
+(lldb) carrick decode-esr 0x92000035      # syndrome decoder
+(lldb) carrick where                      # live host-side register summary
+```
+
+The plugin also auto-loads the JSON from
+`$CARRICK_DEBUG_STATE_PATH`, `/tmp/carrick-debug-state.json`, or
+`./carrick-debug-state.json` if any of those exist — so once you set
+the env var, `carrick info` works without an explicit `load-state`.
+
 ## Trace knobs
 
 Set in the environment of `carrick run` / `carrick run-elf`:
