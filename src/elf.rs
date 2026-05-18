@@ -198,6 +198,14 @@ fn load_plan_from_elf(elf: &Elf<'_>) -> LoadPlan {
         .program_headers
         .iter()
         .filter(|header| header.p_type == PT_LOAD)
+        .inspect(|header| {
+            if std::env::var_os("CARRICK_TRACE_ELF").is_some() {
+                eprintln!(
+                    "LOAD p_offset=0x{:x} p_vaddr=0x{:x} p_filesz=0x{:x} p_memsz=0x{:x} bias=0x{:x}",
+                    header.p_offset, header.p_vaddr, header.p_filesz, header.p_memsz, load_bias
+                );
+            }
+        })
         .map(|header| LoadSegment {
             file_offset: header.p_offset,
             virtual_address: load_bias.wrapping_add(header.p_vaddr),

@@ -232,6 +232,17 @@ impl HvfTrapEngine {
             memory
                 .write(mapping.guest_start, &mapping.image)
                 .map_err(hvf_error)?;
+            if std::env::var_os("CARRICK_TRACE_MAPS").is_some() {
+                eprintln!(
+                    "MAP guest_start=0x{:x} mapped_size=0x{:x} payload_size=0x{:x} perms=r{}w{}x{}",
+                    mapping.guest_start,
+                    mapping.mapped_size,
+                    mapping.payload_size,
+                    if mapping.perms.read { '+' } else { '-' },
+                    if mapping.perms.write { '+' } else { '-' },
+                    if mapping.perms.execute { '+' } else { '-' },
+                );
+            }
             self.inner.mappings.push(HvfMappedRegion {
                 start: mapping.guest_start,
                 end: mapping.guest_start.checked_add(mapping.mapped_size).ok_or(
@@ -291,6 +302,18 @@ impl HvfTrapEngine {
         self.inner
             .vcpu
             .set_sys_reg(SysReg::SCTLR_EL1, SCTLR_EL1_BOOTSTRAP)
+            .map_err(hvf_error)?;
+        // Enable FP/SIMD for the guest. Without this, CPACR_EL1.FPEN defaults
+        // to "trap at EL0", and musl's `memset` (which uses NEON `dup`/`stp`
+        // instructions) faults on its very first call — the trap is misrouted
+        // through our EL1 vector as if it were an SVC, the dispatcher sees
+        // garbage syscall numbers, and the guest spins forever. FPEN=0b11
+        // turns the trap off; the bottom two bits of each TRC* field are kept
+        // at zero (trace unsupported, no SME).
+        const CPACR_EL1_FPEN_NO_TRAP: u64 = 0x3 << 20;
+        self.inner
+            .vcpu
+            .set_sys_reg(SysReg::CPACR_EL1, CPACR_EL1_FPEN_NO_TRAP)
             .map_err(hvf_error)?;
         // Route lower-EL synchronous exceptions (EL0 `svc #0`) through our
         // vector page. Without this, VBAR_EL1 defaults to 0 (or whatever
@@ -355,6 +378,42 @@ impl HvfInner {
         }
         self.last_exit_class = aarch64_exception_class(exception.syndrome);
 
+        if std::env::var_os("CARRICK_TRACE_REGS").is_some() {
+            let pc = self.vcpu.get_reg(Reg::PC).map_err(hvf_error)?;
+            let elr = self
+                .vcpu
+                .get_sys_reg(SysReg::ELR_EL1)
+                .map_err(hvf_error)?;
+            let spsr = self
+                .vcpu
+                .get_sys_reg(SysReg::SPSR_EL1)
+                .map_err(hvf_error)?;
+            let sp_el0 = self
+                .vcpu
+                .get_sys_reg(SysReg::SP_EL0)
+                .map_err(hvf_error)?;
+            let far = self
+                .vcpu
+                .get_sys_reg(SysReg::FAR_EL1)
+                .map_err(hvf_error)?;
+            let x0 = self.vcpu.get_reg(Reg::X0).map_err(hvf_error)?;
+            let x1 = self.vcpu.get_reg(Reg::X1).map_err(hvf_error)?;
+            let x2 = self.vcpu.get_reg(Reg::X2).map_err(hvf_error)?;
+            let x3 = self.vcpu.get_reg(Reg::X3).map_err(hvf_error)?;
+            let x4 = self.vcpu.get_reg(Reg::X4).map_err(hvf_error)?;
+            let x5 = self.vcpu.get_reg(Reg::X5).map_err(hvf_error)?;
+            let x8 = self.vcpu.get_reg(Reg::X8).map_err(hvf_error)?;
+            let esr = self
+                .vcpu
+                .get_sys_reg(SysReg::ESR_EL1)
+                .map_err(hvf_error)?;
+            eprintln!(
+                "TRAP exit_va=0x{:x} exit_pa=0x{:x} esr_el1=0x{:x} (ec=0x{:02x}) pc=0x{:x} elr=0x{:x} sp=0x{:x} far=0x{:x} x8={} x0=0x{:x} x1=0x{:x}",
+                exception.virtual_address, exception.physical_address, esr, (esr >> 26) & 0x3f, pc, elr, sp_el0, far, x8, x0, x1
+            );
+            let _ = (spsr, x2, x3, x4, x5);
+        }
+
         Ok(Aarch64SyscallFrame {
             x0: self.vcpu.get_reg(Reg::X0).map_err(hvf_error)?,
             x1: self.vcpu.get_reg(Reg::X1).map_err(hvf_error)?,
@@ -371,7 +430,19 @@ impl HvfInner {
 
         self.vcpu
             .set_reg(Reg::X0, return_value as u64)
-            .map_err(hvf_error)
+            .map_err(hvf_error)?;
+        if std::env::var_os("CARRICK_TRACE_REGS").is_some() {
+            let pc = self.vcpu.get_reg(Reg::PC).map_err(hvf_error)?;
+            let elr = self
+                .vcpu
+                .get_sys_reg(SysReg::ELR_EL1)
+                .map_err(hvf_error)?;
+            eprintln!(
+                "COMPLETE return=0x{:x} pc=0x{:x} elr_el1=0x{:x}",
+                return_value, pc, elr
+            );
+        }
+        Ok(())
     }
 
     fn read_guest_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
