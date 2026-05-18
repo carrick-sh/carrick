@@ -109,6 +109,7 @@ fn names_linux_aarch64_bringup_syscalls() {
         (134, "rt_sigaction"),
         (135, "rt_sigprocmask"),
         (160, "uname"),
+        (167, "prctl"),
         (169, "gettimeofday"),
         (172, "getpid"),
         (173, "getppid"),

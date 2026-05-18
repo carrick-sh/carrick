@@ -109,10 +109,15 @@ const LINUX_CLOCK_REALTIME_COARSE: u64 = 5;
 const LINUX_CLOCK_MONOTONIC_COARSE: u64 = 6;
 const LINUX_CLOCK_BOOTTIME: u64 = 7;
 const LINUX_CLOCK_RESOLUTION_NSEC: i64 = 1_000_000;
+const LINUX_TASK_COMM_LEN: usize = 16;
 const LINUX_CAPABILITY_VERSION_1: u32 = 0x1998_0330;
 const LINUX_CAPABILITY_VERSION_2: u32 = 0x2007_1026;
 const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
 const LINUX_PERSONALITY_QUERY: u64 = 0xffff_ffff;
+const LINUX_PR_GET_DUMPABLE: u64 = 3;
+const LINUX_PR_SET_DUMPABLE: u64 = 4;
+const LINUX_PR_SET_NAME: u64 = 15;
+const LINUX_PR_GET_NAME: u64 = 16;
 const MAX_GUEST_PATH: usize = 4096;
 const LINUX_IOV_MAX: usize = 1024;
 
@@ -255,6 +260,8 @@ pub struct SyscallDispatcher {
     mmap_next: u64,
     executable_path: String,
     personality: u64,
+    dumpable: i64,
+    task_name: [u8; LINUX_TASK_COMM_LEN],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -382,6 +389,8 @@ impl SyscallDispatcher {
             mmap_next: LINUX_MMAP_BASE,
             executable_path: "/proc/self/exe".to_owned(),
             personality: 0,
+            dumpable: 1,
+            task_name: linux_task_name_from_bytes(b"carrick"),
         }
     }
 
@@ -480,6 +489,7 @@ impl SyscallDispatcher {
             134 => self.rt_sigaction(request, memory),
             135 => self.rt_sigprocmask(request, memory)?,
             160 => self.uname(request, memory),
+            167 => self.prctl(request, memory),
             169 => self.gettimeofday(request, memory),
             172 => self.getpid(),
             173 => DispatchOutcome::Returned { value: 1 },
@@ -1477,6 +1487,47 @@ impl SyscallDispatcher {
         }
         DispatchOutcome::Returned {
             value: previous as i64,
+        }
+    }
+
+    fn prctl(&mut self, request: SyscallRequest, memory: &mut impl GuestMemory) -> DispatchOutcome {
+        let option = request.arg(0);
+        match option {
+            LINUX_PR_GET_DUMPABLE => DispatchOutcome::Returned {
+                value: self.dumpable,
+            },
+            LINUX_PR_SET_DUMPABLE => {
+                let value = request.arg(1);
+                if value > 1 {
+                    return DispatchOutcome::Errno {
+                        errno: LINUX_EINVAL,
+                    };
+                }
+                self.dumpable = value as i64;
+                DispatchOutcome::Returned { value: 0 }
+            }
+            LINUX_PR_SET_NAME => {
+                let address = request.arg(1);
+                let Ok(bytes) = memory.read_bytes(address, LINUX_TASK_COMM_LEN) else {
+                    return DispatchOutcome::Errno {
+                        errno: LINUX_EFAULT,
+                    };
+                };
+                self.task_name = linux_task_name_from_bytes(&bytes);
+                DispatchOutcome::Returned { value: 0 }
+            }
+            LINUX_PR_GET_NAME => {
+                let address = request.arg(1);
+                if memory.write_bytes(address, &self.task_name).is_err() {
+                    return DispatchOutcome::Errno {
+                        errno: LINUX_EFAULT,
+                    };
+                }
+                DispatchOutcome::Returned { value: 0 }
+            }
+            _ => DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            },
         }
     }
 
@@ -2971,6 +3022,17 @@ fn linux_madvise_advice_is_supported(advice: u64) -> bool {
             | LINUX_MADV_DONTNEED
             | LINUX_MADV_FREE
     )
+}
+
+fn linux_task_name_from_bytes(bytes: &[u8]) -> [u8; LINUX_TASK_COMM_LEN] {
+    let mut name = [0; LINUX_TASK_COMM_LEN];
+    let length = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len())
+        .min(LINUX_TASK_COMM_LEN - 1);
+    name[..length].copy_from_slice(&bytes[..length]);
+    name
 }
 
 fn realtime_duration() -> Duration {

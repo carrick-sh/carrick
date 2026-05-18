@@ -49,6 +49,10 @@ const LINUX_FUTEX_PRIVATE_FLAG: u64 = 128;
 const LINUX_POLLIN: i16 = 0x0001;
 const LINUX_POLLOUT: i16 = 0x0004;
 const LINUX_POLLNVAL: i16 = 0x0020;
+const LINUX_PR_GET_DUMPABLE: u64 = 3;
+const LINUX_PR_SET_DUMPABLE: u64 = 4;
+const LINUX_PR_SET_NAME: u64 = 15;
+const LINUX_PR_GET_NAME: u64 = 16;
 const LINUX_TFD_NONBLOCK: u64 = LINUX_O_NONBLOCK;
 const LINUX_TIMER_ABSTIME: u64 = 0x1;
 const LINUX_CLOCK_MONOTONIC: u64 = 1;
@@ -2463,6 +2467,121 @@ fn personality_query_and_set_round_trip_bootstrap_flags() {
         DispatchOutcome::Returned {
             value: LINUX_ADDR_NO_RANDOMIZE as i64
         }
+    );
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn prctl_handles_bootstrap_process_controls() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
+    memory.write_bytes(0x4000, b"carrick-prctl\0").unwrap();
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    167,
+                    SyscallArgs::from([LINUX_PR_GET_DUMPABLE, 0, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 1 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    167,
+                    SyscallArgs::from([LINUX_PR_SET_DUMPABLE, 0, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    167,
+                    SyscallArgs::from([LINUX_PR_GET_DUMPABLE, 0, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    167,
+                    SyscallArgs::from([LINUX_PR_SET_NAME, 0x4000, 0, 0, 0, 0])
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    167,
+                    SyscallArgs::from([LINUX_PR_GET_NAME, 0x4040, 0, 0, 0, 0])
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        memory.read_bytes(0x4040, 16).unwrap(),
+        b"carrick-prctl\0\0\0"
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    167,
+                    SyscallArgs::from([LINUX_PR_SET_DUMPABLE, 99, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 22 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    167,
+                    SyscallArgs::from([LINUX_PR_SET_NAME, 0x5000, 0, 0, 0, 0])
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 14 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(167, SyscallArgs::from([999, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 22 }
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }

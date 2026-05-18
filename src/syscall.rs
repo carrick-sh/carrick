@@ -149,6 +149,7 @@ const AARCH64_SYSCALLS: &[Syscall] = &[
     syscall(134, "rt_sigaction", "signal", SupportLevel::BringUp),
     syscall(135, "rt_sigprocmask", "signal", SupportLevel::BringUp),
     syscall(160, "uname", "process", SupportLevel::BringUp),
+    syscall(167, "prctl", "process", SupportLevel::BringUp),
     syscall(169, "gettimeofday", "time", SupportLevel::BringUp),
     syscall(172, "getpid", "process", SupportLevel::BringUp),
     syscall(173, "getppid", "process", SupportLevel::BringUp),
