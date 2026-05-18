@@ -4,7 +4,7 @@ use carrick::linux_abi::{
     LINUX_AT_BASE, LINUX_AT_ENTRY, LINUX_AT_NULL, LINUX_AT_PAGESZ, LINUX_AT_PHDR, LINUX_AT_PHENT,
     LINUX_AT_PHNUM, LinuxAuxvEntry,
 };
-use carrick::memory::{AddressSpace, LINUX_INTERPRETER_BASE};
+use carrick::memory::{AddressSpace, LINUX_HEAP_BASE, LINUX_INTERPRETER_BASE, LINUX_MMAP_BASE};
 use carrick::rootfs::{LayerSource, RootFs};
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -127,6 +127,8 @@ fn load_elf_from_rootfs_maps_pt_interp_at_base_and_sets_at_base() {
     assert_eq!(image.entry(), LINUX_INTERPRETER_BASE + 0x120);
     assert!(image.read_bytes(0x400120, 4).is_ok());
     assert!(image.read_bytes(LINUX_INTERPRETER_BASE + 0x120, 4).is_ok());
+    assert!(image.read_bytes(LINUX_HEAP_BASE, 1).is_ok());
+    assert!(image.read_bytes(LINUX_MMAP_BASE, 1).is_ok());
     assert!(auxv.contains(&(LINUX_AT_ENTRY, 0x400120)));
     assert!(auxv.contains(&(LINUX_AT_BASE, LINUX_INTERPRETER_BASE)));
 }

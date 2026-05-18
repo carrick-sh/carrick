@@ -15,6 +15,11 @@ fn names_linux_aarch64_bringup_syscalls() {
     let newfstatat = lookup_aarch64(79).unwrap();
     let fstat = lookup_aarch64(80).unwrap();
     let exit = lookup_aarch64(93).unwrap();
+    let exit_group = lookup_aarch64(94).unwrap();
+    let brk = lookup_aarch64(214).unwrap();
+    let munmap = lookup_aarch64(215).unwrap();
+    let mmap = lookup_aarch64(222).unwrap();
+    let mprotect = lookup_aarch64(226).unwrap();
 
     assert_eq!(getcwd.name, "getcwd");
     assert_eq!(getcwd.support, SupportLevel::BringUp);
@@ -41,6 +46,16 @@ fn names_linux_aarch64_bringup_syscalls() {
     assert_eq!(fstat.name, "fstat");
     assert_eq!(fstat.support, SupportLevel::BringUp);
     assert_eq!(exit.name, "exit");
+    assert_eq!(exit_group.name, "exit_group");
+    assert_eq!(exit_group.support, SupportLevel::BringUp);
+    assert_eq!(brk.name, "brk");
+    assert_eq!(brk.support, SupportLevel::BringUp);
+    assert_eq!(munmap.name, "munmap");
+    assert_eq!(munmap.support, SupportLevel::BringUp);
+    assert_eq!(mmap.name, "mmap");
+    assert_eq!(mmap.support, SupportLevel::BringUp);
+    assert_eq!(mprotect.name, "mprotect");
+    assert_eq!(mprotect.support, SupportLevel::BringUp);
 }
 
 #[test]

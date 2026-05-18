@@ -136,4 +136,9 @@ const AARCH64_SYSCALLS: &[Syscall] = &[
     syscall(91, "capset", "process", SupportLevel::Planned),
     syscall(92, "personality", "process", SupportLevel::Planned),
     syscall(93, "exit", "process", SupportLevel::BringUp),
+    syscall(94, "exit_group", "process", SupportLevel::BringUp),
+    syscall(214, "brk", "mm", SupportLevel::BringUp),
+    syscall(215, "munmap", "mm", SupportLevel::BringUp),
+    syscall(222, "mmap", "mm", SupportLevel::BringUp),
+    syscall(226, "mprotect", "mm", SupportLevel::BringUp),
 ];

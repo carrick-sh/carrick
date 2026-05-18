@@ -3,10 +3,12 @@ use carrick::dispatch::{
     Aarch64SyscallFrame, DispatchOutcome, GuestMemory, LinearMemory, SyscallDispatcher,
     SyscallRequest,
 };
+use carrick::elf::SegmentPerms;
 use carrick::linux_abi::{
     LINUX_DIRENT64_HEADER_SIZE, LINUX_DT_REG, LINUX_S_IFDIR, LINUX_S_IFMT, LINUX_S_IFREG,
     LinuxDirent64Header, LinuxStat,
 };
+use carrick::memory::{AddressSpace, LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE};
 use carrick::rootfs::{LayerSource, RootFs};
 use flate2::Compression;
 use flate2::write::GzEncoder;
@@ -68,6 +70,24 @@ fn exit_syscall_requests_process_exit() {
         .unwrap();
 
     assert_eq!(outcome, DispatchOutcome::Exit { code: 42 });
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn exit_group_syscall_requests_process_exit() {
+    let mut memory = LinearMemory::new(0x4000, Vec::new());
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    let outcome = dispatcher
+        .dispatch(
+            SyscallRequest::new(94, SyscallArgs::from([7, 0, 0, 0, 0, 0])),
+            &mut memory,
+            &mut reporter,
+        )
+        .unwrap();
+
+    assert_eq!(outcome, DispatchOutcome::Exit { code: 7 });
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
@@ -530,12 +550,174 @@ fn getdents64_lists_rootfs_directory_entries() {
     );
 }
 
+#[test]
+fn brk_tracks_heap_within_runtime_arena() {
+    let mut memory = LinearMemory::new(0x4000, Vec::new());
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(214, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned {
+            value: LINUX_HEAP_BASE as i64
+        }
+    );
+
+    let next = LINUX_HEAP_BASE + 0x1000;
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(214, SyscallArgs::from([next, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: next as i64 }
+    );
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    214,
+                    SyscallArgs::from([LINUX_HEAP_BASE + LINUX_HEAP_SIZE + 1, 0, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: next as i64 }
+    );
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn mmap_maps_file_bytes_into_guest_memory_arena() {
+    let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
+        "lib/libc.so",
+        b"0123456789abcdef".as_slice(),
+    )]))])
+    .unwrap();
+    let mut memory = AddressSpace::from_segments(
+        0,
+        [
+            (0x4000, rw_perms(), b"/lib/libc.so\0".to_vec(), 0x100),
+            (LINUX_MMAP_BASE, rwx_perms(), Vec::new(), 0x4000),
+        ],
+    )
+    .unwrap();
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    56,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 3 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(222, SyscallArgs::from([0, 4, 1, 0x02, 3, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned {
+            value: LINUX_MMAP_BASE as i64
+        }
+    );
+    assert_eq!(memory.read_bytes(LINUX_MMAP_BASE, 4).unwrap(), b"0123");
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn mmap_anonymous_fixed_mapping_zeroes_guest_memory_and_mprotect_munmap_are_noops() {
+    let mut memory = AddressSpace::from_segments(
+        0,
+        [(LINUX_MMAP_BASE, rwx_perms(), b"dirty".to_vec(), 0x4000)],
+    )
+    .unwrap();
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    222,
+                    SyscallArgs::from([LINUX_MMAP_BASE, 5, 3, 0x12 | 0x20, (-1_i64) as u64, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned {
+            value: LINUX_MMAP_BASE as i64
+        }
+    );
+    assert_eq!(
+        memory.read_bytes(LINUX_MMAP_BASE, 5).unwrap(),
+        b"\0\0\0\0\0"
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(226, SyscallArgs::from([LINUX_MMAP_BASE, 5, 1, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(215, SyscallArgs::from([LINUX_MMAP_BASE, 5, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
 fn read_stat(memory: &impl GuestMemory, address: u64) -> LinuxStat {
     let bytes = memory
         .read_bytes(address, std::mem::size_of::<LinuxStat>())
         .unwrap();
     let (stat, _) = LinuxStat::read_from_prefix(&bytes).unwrap();
     stat
+}
+
+fn rw_perms() -> SegmentPerms {
+    SegmentPerms {
+        read: true,
+        write: true,
+        execute: false,
+    }
+}
+
+fn rwx_perms() -> SegmentPerms {
+    SegmentPerms {
+        read: true,
+        write: true,
+        execute: true,
+    }
 }
 
 fn gzip_tar<const N: usize>(files: [(&str, &[u8]); N]) -> Vec<u8> {

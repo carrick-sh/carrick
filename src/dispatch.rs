@@ -3,9 +3,10 @@ use std::path::Path;
 
 use crate::compat::{CompatEvent, CompatReporter, SyscallArgs};
 use crate::linux_abi::{
-    LINUX_DIRENT64_HEADER_SIZE, LINUX_DT_DIR, LINUX_DT_LNK, LINUX_DT_REG, LINUX_S_IFDIR,
-    LINUX_S_IFLNK, LINUX_S_IFREG, LinuxDirent64Header, LinuxStat,
+    LINUX_DIRENT64_HEADER_SIZE, LINUX_DT_DIR, LINUX_DT_LNK, LINUX_DT_REG, LINUX_PAGE_SIZE,
+    LINUX_S_IFDIR, LINUX_S_IFLNK, LINUX_S_IFREG, LinuxDirent64Header, LinuxStat,
 };
+use crate::memory::{LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE, LINUX_MMAP_SIZE};
 use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsError, RootFsMetadata};
 use crate::syscall::lookup_aarch64;
 use serde::Serialize;
@@ -14,6 +15,7 @@ use zerocopy::IntoBytes;
 
 pub const LINUX_ENOENT: i32 = 2;
 pub const LINUX_EBADF: i32 = 9;
+pub const LINUX_ENOMEM: i32 = 12;
 pub const LINUX_EACCES: i32 = 13;
 pub const LINUX_EFAULT: i32 = 14;
 pub const LINUX_ENOTDIR: i32 = 20;
@@ -30,6 +32,12 @@ pub const LINUX_X_OK: u64 = 1;
 pub const LINUX_SEEK_SET: u64 = 0;
 pub const LINUX_SEEK_CUR: u64 = 1;
 pub const LINUX_SEEK_END: u64 = 2;
+pub const LINUX_PROT_READ: u64 = 0x1;
+pub const LINUX_PROT_WRITE: u64 = 0x2;
+pub const LINUX_PROT_EXEC: u64 = 0x4;
+pub const LINUX_MAP_PRIVATE: u64 = 0x02;
+pub const LINUX_MAP_FIXED: u64 = 0x10;
+pub const LINUX_MAP_ANONYMOUS: u64 = 0x20;
 const MAX_GUEST_PATH: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -165,6 +173,8 @@ pub struct SyscallDispatcher {
     open_files: HashMap<i32, OpenDescription>,
     next_fd: i32,
     cwd: String,
+    brk_current: u64,
+    mmap_next: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -198,6 +208,8 @@ impl SyscallDispatcher {
             open_files: HashMap::new(),
             next_fd: 3,
             cwd: "/".to_owned(),
+            brk_current: LINUX_HEAP_BASE,
+            mmap_next: LINUX_MMAP_BASE,
         }
     }
 
@@ -249,6 +261,11 @@ impl SyscallDispatcher {
             79 => self.newfstatat(request, memory)?,
             80 => self.fstat(request, memory),
             93 => self.exit(request),
+            94 => self.exit(request),
+            214 => self.brk(request),
+            215 => self.munmap(request),
+            222 => self.mmap(request, memory)?,
+            226 => self.mprotect(request, memory),
             _ => {
                 reporter.record(CompatEvent::unhandled_syscall(
                     request.number,
@@ -585,6 +602,145 @@ impl SyscallDispatcher {
         DispatchOutcome::Returned { value: next }
     }
 
+    fn brk(&mut self, request: SyscallRequest) -> DispatchOutcome {
+        let requested = request.arg(0);
+        if requested == 0 {
+            return DispatchOutcome::Returned {
+                value: self.brk_current as i64,
+            };
+        }
+
+        if range_within(requested, 0, LINUX_HEAP_BASE, LINUX_HEAP_SIZE) {
+            self.brk_current = requested;
+        }
+        DispatchOutcome::Returned {
+            value: self.brk_current as i64,
+        }
+    }
+
+    fn mmap(
+        &mut self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let requested = request.arg(0);
+        let length = request.arg(1);
+        let prot = request.arg(2);
+        let flags = request.arg(3);
+        let fd = request.arg(4) as i32;
+        let offset = request.arg(5);
+
+        if length == 0
+            || prot & !(LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC) != 0
+            || flags & LINUX_MAP_PRIVATE == 0
+            || (flags & LINUX_MAP_ANONYMOUS == 0 && offset % LINUX_PAGE_SIZE != 0)
+            || (flags & LINUX_MAP_FIXED != 0 && requested % LINUX_PAGE_SIZE != 0)
+        {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            });
+        }
+        let length = match align_up_u64(length, LINUX_PAGE_SIZE) {
+            Some(length) => length,
+            None => {
+                return Ok(DispatchOutcome::Errno {
+                    errno: LINUX_ENOMEM,
+                });
+            }
+        };
+        let address = match self.next_mmap_address(requested, length, flags) {
+            Some(address) => address,
+            None => {
+                return Ok(DispatchOutcome::Errno {
+                    errno: LINUX_ENOMEM,
+                });
+            }
+        };
+
+        let length_usize =
+            usize::try_from(length).map_err(|_| DispatchError::LengthTooLarge(length))?;
+        let mut bytes = vec![0; length_usize];
+        if flags & LINUX_MAP_ANONYMOUS == 0 {
+            let Some(OpenDescription::File { contents, .. }) = self.open_files.get(&fd) else {
+                return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+            };
+            let offset =
+                usize::try_from(offset).map_err(|_| DispatchError::LengthTooLarge(offset))?;
+            if offset < contents.len() {
+                let available = &contents[offset..];
+                let copy_len = available.len().min(length_usize);
+                bytes[..copy_len].copy_from_slice(&available[..copy_len]);
+            }
+        }
+
+        if memory.write_bytes(address, &bytes).is_err() {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_ENOMEM,
+            });
+        }
+        Ok(DispatchOutcome::Returned {
+            value: address as i64,
+        })
+    }
+
+    fn next_mmap_address(&mut self, requested: u64, length: u64, flags: u64) -> Option<u64> {
+        if flags & LINUX_MAP_FIXED != 0 {
+            if requested == 0 || !range_within(requested, length, LINUX_MMAP_BASE, LINUX_MMAP_SIZE)
+            {
+                return None;
+            }
+            return Some(requested);
+        }
+
+        let address = align_up_u64(self.mmap_next, LINUX_PAGE_SIZE)?;
+        if !range_within(address, length, LINUX_MMAP_BASE, LINUX_MMAP_SIZE) {
+            return None;
+        }
+        self.mmap_next = address.checked_add(length)?;
+        Some(address)
+    }
+
+    fn munmap(&self, request: SyscallRequest) -> DispatchOutcome {
+        let address = request.arg(0);
+        let length = request.arg(1);
+        if length == 0 || !range_within(address, length, LINUX_MMAP_BASE, LINUX_MMAP_SIZE) {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+        DispatchOutcome::Returned { value: 0 }
+    }
+
+    fn mprotect(&self, request: SyscallRequest, memory: &impl GuestMemory) -> DispatchOutcome {
+        let address = request.arg(0);
+        let length = request.arg(1);
+        let prot = request.arg(2);
+        if prot & !(LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC) != 0 {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+        if length == 0 {
+            return DispatchOutcome::Returned { value: 0 };
+        }
+        let Ok(length) = usize::try_from(length) else {
+            return DispatchOutcome::Errno {
+                errno: LINUX_ENOMEM,
+            };
+        };
+        let Some(last_address) = address.checked_add(length as u64 - 1) else {
+            return DispatchOutcome::Errno {
+                errno: LINUX_ENOMEM,
+            };
+        };
+        if memory.read_bytes(address, 1).is_err() || memory.read_bytes(last_address, 1).is_err() {
+            return DispatchOutcome::Errno {
+                errno: LINUX_ENOMEM,
+            };
+        }
+        DispatchOutcome::Returned { value: 0 }
+    }
+
     fn read(
         &mut self,
         request: SyscallRequest,
@@ -814,6 +970,20 @@ fn linux_dirent_type(kind: RootFsEntryKind) -> u8 {
 
 fn align_to(value: usize, alignment: usize) -> usize {
     value.div_ceil(alignment) * alignment
+}
+
+fn align_up_u64(value: u64, alignment: u64) -> Option<u64> {
+    Some(value.div_ceil(alignment).checked_mul(alignment)?)
+}
+
+fn range_within(address: u64, length: u64, base: u64, size: u64) -> bool {
+    let Some(end) = address.checked_add(length) else {
+        return false;
+    };
+    let Some(limit) = base.checked_add(size) else {
+        return false;
+    };
+    address >= base && end <= limit
 }
 
 fn inode_for_path(path: &Path) -> u64 {

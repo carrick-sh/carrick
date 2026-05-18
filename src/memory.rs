@@ -15,6 +15,10 @@ use zerocopy::IntoBytes;
 pub const LINUX_INTERPRETER_BASE: u64 = 0x7000_0000_0000;
 pub const LINUX_STACK_TOP: u64 = 0x7fff_ffff_0000;
 pub const LINUX_STACK_SIZE: u64 = 1024 * 1024;
+pub const LINUX_HEAP_BASE: u64 = 0x5000_0000_0000;
+pub const LINUX_HEAP_SIZE: u64 = 4 * 1024 * 1024;
+pub const LINUX_MMAP_BASE: u64 = 0x6000_0000_0000;
+pub const LINUX_MMAP_SIZE: u64 = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AddressSpace {
@@ -121,7 +125,8 @@ impl AddressSpace {
 
     fn load_elf_segments(file: &[u8], plan: LoadPlan) -> Result<Self, AddressSpaceError> {
         let linux_auxv = linux_auxv_from_load_plan(&plan, None);
-        let regions = regions_from_load_plan(file, &plan, 0)?;
+        let mut regions = regions_from_load_plan(file, &plan, 0)?;
+        regions.extend(linux_runtime_regions()?);
 
         let mut image = Self::from_regions(plan.entry, regions)?;
         image.linux_auxv = linux_auxv;
@@ -153,6 +158,7 @@ impl AddressSpace {
                 })?;
             interpreter_base = Some(LINUX_INTERPRETER_BASE);
         }
+        regions.extend(linux_runtime_regions()?);
 
         let linux_auxv = linux_auxv_from_load_plan(&plan, interpreter_base);
         let mut image = Self::from_regions(entry, regions)?;
@@ -452,6 +458,46 @@ fn regions_from_load_plan(
     }
 
     Ok(regions)
+}
+
+fn linux_runtime_regions() -> Result<Vec<MemoryRegion>, AddressSpaceError> {
+    Ok(vec![
+        zeroed_region(
+            LINUX_HEAP_BASE,
+            LINUX_HEAP_SIZE,
+            SegmentPerms {
+                read: true,
+                write: true,
+                execute: false,
+            },
+        )?,
+        zeroed_region(
+            LINUX_MMAP_BASE,
+            LINUX_MMAP_SIZE,
+            SegmentPerms {
+                read: true,
+                write: true,
+                execute: true,
+            },
+        )?,
+    ])
+}
+
+fn zeroed_region(
+    start: u64,
+    size: u64,
+    perms: SegmentPerms,
+) -> Result<MemoryRegion, AddressSpaceError> {
+    let bytes_len = usize::try_from(size).map_err(|_| AddressSpaceError::RegionTooLarge(size))?;
+    let end = start
+        .checked_add(size)
+        .ok_or(AddressSpaceError::RegionOverflow { start, size })?;
+    Ok(MemoryRegion {
+        start,
+        end,
+        perms,
+        bytes: vec![0; bytes_len],
+    })
 }
 
 fn linux_auxv_from_load_plan(

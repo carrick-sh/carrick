@@ -37,6 +37,10 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
   `read(2)`, `write(2)`, `close(2)`, `newfstatat(2)`, `fstat(2)`, `exit(2)`,
   `ENOENT`, `EACCES`, `EFAULT`, `EBADF`, and `ENOSYS` paths are covered by
   tests.
+- Loaded ELFs include bootstrap heap and mmap arenas. The dispatcher can
+  service `brk(2)`, file-backed and anonymous `mmap(2)`, bootstrap no-op
+  `mprotect(2)`/`munmap(2)`, and `exit_group(2)`, which gives `ld-linux` a
+  first place to map shared objects while fuller VM semantics land.
 - Linux ABI outputs for `stat`, `getdents64`, and auxv entries are represented
   by packed Rust structs in `linux_abi`, with `zerocopy` used to expose
   initialized bytes for guest-memory writes.
