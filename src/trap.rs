@@ -371,20 +371,7 @@ impl HvfInner {
 
         self.vcpu
             .set_reg(Reg::X0, return_value as u64)
-            .map_err(hvf_error)?;
-        // For EL0 SVC exits HVF leaves PC at the SVC instruction; the kernel
-        // architecture says re-entry to EL0 advances PC by 4 automatically
-        // when ERET takes effect, so we leave PC alone. For our EL1 vector's
-        // HVC re-trap, PC is at the HVC itself — re-entry would re-execute
-        // it. Advance PC by 4 so the vCPU resumes at the `eret` that follows
-        // the HVC in the vector stub.
-        if self.last_exit_class == AARCH64_HVC_EXCEPTION_CLASS {
-            let pc = self.vcpu.get_reg(Reg::PC).map_err(hvf_error)?;
-            self.vcpu
-                .set_reg(Reg::PC, pc.wrapping_add(4))
-                .map_err(hvf_error)?;
-        }
-        Ok(())
+            .map_err(hvf_error)
     }
 
     fn read_guest_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
