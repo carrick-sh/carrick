@@ -306,7 +306,9 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
                 RootfsCommand::Cat { path } => {
-                    print!("{}", rootfs.read_to_string(path)?);
+                    use std::io::Write;
+                    let bytes = rootfs.read(path)?;
+                    std::io::stdout().write_all(&bytes)?;
                 }
             }
         }
