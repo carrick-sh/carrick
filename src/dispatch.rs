@@ -469,6 +469,7 @@ impl SyscallDispatcher {
             34 => self.mkdirat(request, memory)?,
             35 => self.unlinkat(request, memory)?,
             36 => self.symlinkat(request, memory)?,
+            37 => self.linkat(request, memory)?,
             38 => self.renameat(request, memory)?,
             43 => self.statfs(request, memory)?,
             44 => self.fstatfs(request, memory),
@@ -3434,6 +3435,98 @@ impl SyscallDispatcher {
                 errno: rootfs_errno(errno),
             }),
         }
+    }
+
+    fn linkat(
+        &self,
+        request: SyscallRequest,
+        memory: &impl GuestMemory,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let olddirfd = request.arg(0);
+        let oldpath = request.arg(1);
+        let newdirfd = request.arg(2);
+        let newpath = request.arg(3);
+        let flags = request.arg(4);
+        if flags & !(LINUX_AT_SYMLINK_NOFOLLOW | LINUX_AT_EMPTY_PATH) != 0 {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            });
+        }
+        let old = match read_guest_c_string(memory, oldpath) {
+            Ok(path) => path,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        let new_path = match read_guest_c_string(memory, newpath) {
+            Ok(path) => path,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        if new_path.is_empty() {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_ENOENT,
+            });
+        }
+        if old.is_empty() && flags & LINUX_AT_EMPTY_PATH == 0 {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_ENOENT,
+            });
+        }
+        let source_exists = if old.is_empty() {
+            self.fd_is_valid(olddirfd as i32)
+        } else {
+            let resolved = match self.resolve_at_path(olddirfd, &old) {
+                Ok(resolved) => resolved,
+                Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            };
+            if synthetic_proc_file(&resolved, &self.executable_path).is_some() {
+                true
+            } else if let Some(rootfs) = &self.rootfs {
+                match rootfs.symlink_metadata(&resolved) {
+                    Ok(_) => true,
+                    Err(RootFsError::NotFound(_)) => false,
+                    Err(other) => {
+                        return Ok(DispatchOutcome::Errno {
+                            errno: rootfs_errno(other),
+                        });
+                    }
+                }
+            } else {
+                false
+            }
+        };
+        if !source_exists {
+            return Ok(DispatchOutcome::Errno {
+                errno: if old.is_empty() {
+                    LINUX_EBADF
+                } else {
+                    LINUX_ENOENT
+                },
+            });
+        }
+        let resolved_new = match self.resolve_at_path(newdirfd, &new_path) {
+            Ok(resolved) => resolved,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        if synthetic_proc_file(&resolved_new, &self.executable_path).is_some() {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EEXIST,
+            });
+        }
+        if let Some(rootfs) = &self.rootfs {
+            match rootfs.symlink_metadata(&resolved_new) {
+                Ok(_) => {
+                    return Ok(DispatchOutcome::Errno {
+                        errno: LINUX_EEXIST,
+                    });
+                }
+                Err(RootFsError::NotFound(_)) => {}
+                Err(other) => {
+                    return Ok(DispatchOutcome::Errno {
+                        errno: rootfs_errno(other),
+                    });
+                }
+            }
+        }
+        Ok(DispatchOutcome::Errno { errno: LINUX_EROFS })
     }
 
     fn symlinkat(
