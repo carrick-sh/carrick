@@ -465,6 +465,7 @@ impl SyscallDispatcher {
             25 => self.fcntl(request),
             29 => self.ioctl(request, memory, reporter),
             32 => self.flock(request),
+            34 => self.mkdirat(request, memory)?,
             43 => self.statfs(request, memory)?,
             44 => self.fstatfs(request, memory),
             46 => self.ftruncate(request),
@@ -3223,6 +3224,49 @@ impl SyscallDispatcher {
         Ok(DispatchOutcome::Returned {
             value: written as i64,
         })
+    }
+
+    fn mkdirat(
+        &self,
+        request: SyscallRequest,
+        memory: &impl GuestMemory,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let dirfd = request.arg(0);
+        let pathname = request.arg(1);
+        let path = match read_guest_c_string(memory, pathname) {
+            Ok(path) => path,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        if path.is_empty() {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_ENOENT,
+            });
+        }
+        let resolved = match self.resolve_at_path(dirfd, &path) {
+            Ok(resolved) => resolved,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        if synthetic_proc_file(&resolved, &self.executable_path).is_some() {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EEXIST,
+            });
+        }
+        if let Some(rootfs) = &self.rootfs {
+            match rootfs.metadata(&resolved) {
+                Ok(_) => {
+                    return Ok(DispatchOutcome::Errno {
+                        errno: LINUX_EEXIST,
+                    });
+                }
+                Err(RootFsError::NotFound(_)) => {}
+                Err(other) => {
+                    return Ok(DispatchOutcome::Errno {
+                        errno: rootfs_errno(other),
+                    });
+                }
+            }
+        }
+        Ok(DispatchOutcome::Errno { errno: LINUX_EROFS })
     }
 
     fn utimensat(

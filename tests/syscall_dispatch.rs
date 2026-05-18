@@ -3924,6 +3924,88 @@ fn madvise_accepts_common_advice_for_mapped_ranges() {
 }
 
 #[test]
+fn mkdirat_bootstrap_returns_eexist_for_known_paths_and_erofs_otherwise() {
+    let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
+        "etc/motd",
+        b"mkdirat fixture\n".as_slice(),
+    )]))])
+    .unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
+    memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();
+    memory.write_bytes(0x4020, b"/etc/new-dir\0").unwrap();
+    memory.write_bytes(0x4040, b"\0").unwrap();
+    memory.write_bytes(0x4060, b"/proc/self/maps\0").unwrap();
+    memory.write_bytes(0x4080, b"relative/dir\0").unwrap();
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    34,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4000, 0o755, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 17 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    34,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4060, 0o755, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 17 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    34,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4020, 0o755, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 30 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    34,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4040, 0o755, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 2 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(34, SyscallArgs::from([99, 0x4080, 0o755, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 9 }
+    );
+
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
 fn utimensat_bootstrap_reports_read_only_rootfs_and_validates_timestamps() {
     const UTIME_NOW: i64 = (1 << 30) - 1;
     const UTIME_OMIT: i64 = (1 << 30) - 2;
