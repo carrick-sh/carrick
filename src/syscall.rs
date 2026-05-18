@@ -74,7 +74,7 @@ const AARCH64_SYSCALLS: &[Syscall] = &[
     syscall(29, "ioctl", "fs", SupportLevel::BringUp),
     syscall(30, "ioprio_set", "sched", SupportLevel::Deferred),
     syscall(31, "ioprio_get", "sched", SupportLevel::Deferred),
-    syscall(32, "flock", "fs", SupportLevel::Planned),
+    syscall(32, "flock", "fs", SupportLevel::BringUp),
     syscall(33, "mknodat", "fs", SupportLevel::Planned),
     syscall(34, "mkdirat", "fs", SupportLevel::Planned),
     syscall(35, "unlinkat", "fs", SupportLevel::Planned),

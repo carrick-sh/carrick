@@ -74,6 +74,10 @@ const LINUX_EPOLL_CTL_ADD: u64 = 1;
 const LINUX_EPOLL_CTL_DEL: u64 = 2;
 const LINUX_EPOLL_CTL_MOD: u64 = 3;
 const LINUX_EPOLLIN: u32 = 0x001;
+const LINUX_LOCK_SH: u64 = 1;
+const LINUX_LOCK_EX: u64 = 2;
+const LINUX_LOCK_NB: u64 = 4;
+const LINUX_LOCK_UN: u64 = 8;
 const LINUX_POLLIN: i16 = 0x0001;
 const LINUX_POLLOUT: i16 = 0x0004;
 const LINUX_POLLERR: i16 = 0x0008;
@@ -425,6 +429,7 @@ impl SyscallDispatcher {
             24 => self.dup3(request),
             25 => self.fcntl(request),
             29 => self.ioctl(request, memory, reporter),
+            32 => self.flock(request),
             43 => self.statfs(request, memory)?,
             44 => self.fstatfs(request, memory),
             48 => self.faccessat(request, memory)?,
@@ -1340,6 +1345,22 @@ impl SyscallDispatcher {
 
     fn fd_is_valid(&self, fd: i32) -> bool {
         is_stdio_fd(fd) || self.open_files.contains_key(&fd)
+    }
+
+    fn flock(&self, request: SyscallRequest) -> DispatchOutcome {
+        let fd = request.arg(0) as i32;
+        let operation = request.arg(1);
+        if !self.fd_is_valid(fd) {
+            return DispatchOutcome::Errno { errno: LINUX_EBADF };
+        }
+
+        let lock_operation = operation & !LINUX_LOCK_NB;
+        match lock_operation {
+            LINUX_LOCK_SH | LINUX_LOCK_EX | LINUX_LOCK_UN => DispatchOutcome::Returned { value: 0 },
+            _ => DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            },
+        }
     }
 
     fn statfs(

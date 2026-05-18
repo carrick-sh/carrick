@@ -80,6 +80,7 @@ fn names_linux_aarch64_bringup_syscalls() {
         (23, "dup"),
         (24, "dup3"),
         (25, "fcntl"),
+        (32, "flock"),
         (29, "ioctl"),
         (43, "statfs"),
         (44, "fstatfs"),

@@ -25,6 +25,9 @@ const LINUX_F_GETFL: u64 = 3;
 const LINUX_FD_CLOEXEC: u64 = 1;
 const LINUX_F_DUPFD_CLOEXEC: u64 = 1030;
 const LINUX_F_GETPIPE_SZ: u64 = 1032;
+const LINUX_LOCK_SH: u64 = 1;
+const LINUX_LOCK_NB: u64 = 4;
+const LINUX_LOCK_UN: u64 = 8;
 const LINUX_O_CLOEXEC: u64 = 0o2000000;
 const LINUX_O_NONBLOCK: u64 = 0o4000;
 const LINUX_OVERLAYFS_SUPER_MAGIC: i64 = 0x794c7630;
@@ -440,6 +443,77 @@ fn fcntl_getpipe_size_reports_bootstrap_pipe_capacity() {
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 65536 }
+    );
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn flock_accepts_bootstrap_advisory_locks_on_open_files() {
+    let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
+        "etc/motd",
+        b"rootfs says hello\n".as_slice(),
+    )]))])
+    .unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
+    memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    56,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 3 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    32,
+                    SyscallArgs::from([3, LINUX_LOCK_SH | LINUX_LOCK_NB, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(32, SyscallArgs::from([3, LINUX_LOCK_UN, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(32, SyscallArgs::from([3, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 22 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(32, SyscallArgs::from([99, LINUX_LOCK_SH, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 9 }
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
