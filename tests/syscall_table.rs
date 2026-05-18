@@ -92,6 +92,7 @@ fn names_linux_aarch64_bringup_syscalls() {
         (72, "pselect6"),
         (73, "ppoll"),
         (68, "pwrite64"),
+        (70, "pwritev"),
         (76, "splice"),
         (81, "sync"),
         (82, "fsync"),

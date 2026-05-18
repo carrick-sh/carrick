@@ -112,7 +112,7 @@ const AARCH64_SYSCALLS: &[Syscall] = &[
     syscall(67, "pread64", "fs", SupportLevel::BringUp),
     syscall(68, "pwrite64", "fs", SupportLevel::BringUp),
     syscall(69, "preadv", "fs", SupportLevel::BringUp),
-    syscall(70, "pwritev", "fs", SupportLevel::Planned),
+    syscall(70, "pwritev", "fs", SupportLevel::BringUp),
     syscall(71, "sendfile", "fs", SupportLevel::BringUp),
     syscall(72, "pselect6", "fs", SupportLevel::BringUp),
     syscall(73, "ppoll", "fs", SupportLevel::BringUp),

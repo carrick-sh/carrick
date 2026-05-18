@@ -479,6 +479,7 @@ impl SyscallDispatcher {
             67 => self.pread64(request, memory)?,
             68 => self.pwrite64(request, memory)?,
             69 => self.preadv(request, memory)?,
+            70 => self.pwritev(request, memory)?,
             71 => self.sendfile(request, memory)?,
             72 => self.pselect6(request, memory)?,
             73 => self.ppoll(request, memory)?,
@@ -2686,6 +2687,55 @@ impl SyscallDispatcher {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EFAULT,
             });
+        }
+        if is_stdio_fd(fd) {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_ESPIPE,
+            });
+        }
+        let Some(open_file) = self.open_files.get(&fd) else {
+            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+        };
+        let open = open_file.description.borrow();
+        let errno = match &*open {
+            OpenDescription::File { .. } | OpenDescription::SyntheticFile { .. } => LINUX_EBADF,
+            OpenDescription::Directory { .. } => LINUX_EISDIR,
+            OpenDescription::PipeReader { .. }
+            | OpenDescription::PipeWriter { .. }
+            | OpenDescription::EventFd { .. }
+            | OpenDescription::TimerFd { .. }
+            | OpenDescription::Epoll { .. } => LINUX_ESPIPE,
+        };
+        Ok(DispatchOutcome::Errno { errno })
+    }
+
+    fn pwritev(
+        &mut self,
+        request: SyscallRequest,
+        memory: &impl GuestMemory,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let fd = request.arg(0) as i32;
+        let iov = request.arg(1);
+        let iovcnt = usize::try_from(request.arg(2))
+            .map_err(|_| DispatchError::LengthTooLarge(request.arg(2)))?;
+        let offset = i64::from_ne_bytes(request.arg(3).to_ne_bytes());
+        let iovecs = match read_iovecs(memory, iov, iovcnt) {
+            Ok(iovecs) => iovecs,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        if offset < 0 {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            });
+        }
+        for iovec in &iovecs {
+            let iov_len = usize::try_from(iovec.iov_len)
+                .map_err(|_| DispatchError::LengthTooLarge(iovec.iov_len))?;
+            if memory.read_bytes(iovec.iov_base, iov_len).is_err() {
+                return Ok(DispatchOutcome::Errno {
+                    errno: LINUX_EFAULT,
+                });
+            }
         }
         if is_stdio_fd(fd) {
             return Ok(DispatchOutcome::Errno {
