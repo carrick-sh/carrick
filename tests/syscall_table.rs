@@ -89,6 +89,8 @@ fn names_linux_aarch64_bringup_syscalls() {
         (38, "renameat"),
         (52, "fchmod"),
         (53, "fchmodat"),
+        (54, "fchownat"),
+        (55, "fchown"),
         (29, "ioctl"),
         (43, "statfs"),
         (44, "fstatfs"),

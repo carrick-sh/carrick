@@ -82,6 +82,7 @@ build_fixture "mkdirat_motd.rs" "carrick-linux-aarch64-mkdirat-motd"
 build_fixture "unlinkat_motd.rs" "carrick-linux-aarch64-unlinkat-motd"
 build_fixture "renameat_motd.rs" "carrick-linux-aarch64-renameat-motd"
 build_fixture "fchmod_motd.rs" "carrick-linux-aarch64-fchmod-motd"
+build_fixture "fchown_motd.rs" "carrick-linux-aarch64-fchown-motd"
 
 cargo metadata \
   --manifest-path "$fixture_dir/Cargo.toml" \

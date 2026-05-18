@@ -477,6 +477,8 @@ impl SyscallDispatcher {
             50 => self.fchdir(request),
             52 => self.fchmod(request),
             53 => self.fchmodat(request, memory)?,
+            54 => self.fchownat(request, memory)?,
+            55 => self.fchown(request),
             56 => self.openat(request, memory, reporter)?,
             57 => self.close(request),
             59 => self.pipe2(request, memory),
@@ -3280,6 +3282,65 @@ impl SyscallDispatcher {
             return DispatchOutcome::Errno { errno: LINUX_EBADF };
         }
         DispatchOutcome::Errno { errno: LINUX_EROFS }
+    }
+
+    fn fchown(&self, request: SyscallRequest) -> DispatchOutcome {
+        let fd = request.arg(0) as i32;
+        if !self.fd_is_valid(fd) {
+            return DispatchOutcome::Errno { errno: LINUX_EBADF };
+        }
+        DispatchOutcome::Errno { errno: LINUX_EROFS }
+    }
+
+    fn fchownat(
+        &self,
+        request: SyscallRequest,
+        memory: &impl GuestMemory,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let dirfd = request.arg(0);
+        let pathname = request.arg(1);
+        let flags = request.arg(4);
+        if flags & !(LINUX_AT_SYMLINK_NOFOLLOW | LINUX_AT_EMPTY_PATH) != 0 {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            });
+        }
+        let path = match read_guest_c_string(memory, pathname) {
+            Ok(path) => path,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        if path.is_empty() {
+            if flags & LINUX_AT_EMPTY_PATH == 0 {
+                return Ok(DispatchOutcome::Errno {
+                    errno: LINUX_ENOENT,
+                });
+            }
+            if dirfd == LINUX_AT_FDCWD {
+                return Ok(DispatchOutcome::Errno { errno: LINUX_EROFS });
+            }
+            if !self.fd_is_valid(dirfd as i32) {
+                return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+            }
+            return Ok(DispatchOutcome::Errno { errno: LINUX_EROFS });
+        }
+        let resolved = match self.resolve_at_path(dirfd, &path) {
+            Ok(resolved) => resolved,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        if synthetic_proc_file(&resolved, &self.executable_path).is_some() {
+            return Ok(DispatchOutcome::Errno { errno: LINUX_EROFS });
+        }
+        let Some(rootfs) = &self.rootfs else {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_ENOENT,
+            });
+        };
+        match rootfs.symlink_metadata(&resolved) {
+            Ok(_) => Ok(DispatchOutcome::Errno { errno: LINUX_EROFS }),
+            Err(errno) => Ok(DispatchOutcome::Errno {
+                errno: rootfs_errno(errno),
+            }),
+        }
     }
 
     fn fchmodat(
