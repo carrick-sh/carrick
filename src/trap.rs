@@ -68,6 +68,10 @@ pub struct GuestMappingPlan {
     /// Guest physical address to program into VBAR_EL1 so EL0 SVC traps are
     /// routed through the EL1 vector page (which forwards them via HVC).
     pub el1_vectors_base: Option<u64>,
+    /// Guest physical address of the stage-1 identity page-table root.
+    /// When set, the trap engine programs TTBR0_EL1 / TCR_EL1 / MAIR_EL1
+    /// and enables stage-1 (`SCTLR_EL1.M=1`).
+    pub stage1_page_tables_base: Option<u64>,
     pub mappings: Vec<GuestMapping>,
 }
 
@@ -120,6 +124,7 @@ impl GuestMappingPlan {
             initial_stack_pointer: address_space.initial_stack_pointer(),
             el0_trampoline_entry: address_space.el0_trampoline_entry(),
             el1_vectors_base: address_space.el1_vectors_base(),
+            stage1_page_tables_base: address_space.stage1_page_tables_base(),
             mappings,
         })
     }
@@ -310,10 +315,52 @@ impl HvfTrapEngine {
         // and Apple HVF appears to abort externally rather than treat it as
         // implementation-defined; musl's `ldaxr` on first mutex acquire
         // depends on this.
-        const SCTLR_EL1_BOOTSTRAP: u64 = (1 << 2) | (1 << 12);
+        // If a stage-1 page-table region is installed, program TTBR0_EL1,
+        // TCR_EL1 and MAIR_EL1 to point at our identity-mapping tables,
+        // and set SCTLR_EL1.M = 1 so EL0/EL1 data accesses go through
+        // the Normal-cacheable mapping. ARMv8-A treats data accesses as
+        // Device-nGnRnE memory whenever stage-1 is disabled, and
+        // `ldaxr`/`stlxr` on Device memory abort externally — which is
+        // exactly the wall musl's pthread_mutex_lock hits otherwise.
+        let mut sctlr_el1: u64 = (1 << 2) | (1 << 12); // C=1, I=1
+        // The stage-1 MMU path is still experimental (the page tables we
+        // generate aren't yet trusted on every vCPU layout). Gate it behind
+        // an env var so Tier A demos keep working while we iterate on the
+        // table format. When this stabilises, remove the gate.
+        let stage1_enabled = std::env::var_os("CARRICK_ENABLE_STAGE1").is_some();
+        if let (true, Some(pt_base)) = (stage1_enabled, plan.stage1_page_tables_base) {
+            // MAIR_EL1 slot 0 = Normal memory, Inner & Outer Write-Back
+            // Cacheable, RW-allocate (0xFF). Slot 1..7 stay 0 (Device-
+            // nGnRnE), unused for now.
+            self.inner
+                .vcpu
+                .set_sys_reg(SysReg::MAIR_EL1, 0xFF)
+                .map_err(hvf_error)?;
+            // TCR_EL1:
+            //   T0SZ = 24  (40-bit VA, start at L0)
+            //   IRGN0 = 0b11 (Inner WB Cacheable)
+            //   ORGN0 = 0b11 (Outer WB Cacheable)
+            //   SH0   = 0b11 (Inner Shareable)
+            //   TG0   = 0b00 (4K granule)
+            //   EPD1  = 1    (disable TTBR1 walks)
+            //   IPS   = 0b010 (40-bit IPA, max for M-series HVF)
+            const T0SZ: u64 = 24;
+            const TCR_EL1_BOOTSTRAP: u64 =
+                T0SZ | (0b11 << 8) | (0b11 << 10) | (0b11 << 12) | (1 << 23) | (0b010 << 32);
+            self.inner
+                .vcpu
+                .set_sys_reg(SysReg::TCR_EL1, TCR_EL1_BOOTSTRAP)
+                .map_err(hvf_error)?;
+            self.inner
+                .vcpu
+                .set_sys_reg(SysReg::TTBR0_EL1, pt_base)
+                .map_err(hvf_error)?;
+            // Enable stage-1 MMU (M=1) on top of the C=1, I=1 flags above.
+            sctlr_el1 |= 1;
+        }
         self.inner
             .vcpu
-            .set_sys_reg(SysReg::SCTLR_EL1, SCTLR_EL1_BOOTSTRAP)
+            .set_sys_reg(SysReg::SCTLR_EL1, sctlr_el1)
             .map_err(hvf_error)?;
         // Enable FP/SIMD for the guest. Without this, CPACR_EL1.FPEN defaults
         // to "trap at EL0", and musl's `memset` (which uses NEON `dup`/`stp`
