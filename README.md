@@ -62,7 +62,8 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
   and uid/gid identity calls, `set_tid_address(2)`, `set_robust_list(2)`,
   bootstrap private `futex(2)` wait/wake polling, `clock_gettime(2)`,
   `clock_getres(2)`, `nanosleep(2)`,
-  `clock_nanosleep(2)`, `gettimeofday(2)`, `prlimit64(2)`, `getrandom(2)`,
+  `clock_nanosleep(2)`, `gettimeofday(2)`, `times(2)`, `getrusage(2)`,
+  `prlimit64(2)`, `getrandom(2)`,
   `membarrier(2)` capability queries, clean `rseq(2)` fallback, process
   capability probes, scheduler affinity/yield and `getcpu(2)` probes,
   `prctl(2)` process controls, `personality(2)`, `setpgid(2)`/`getpgid(2)`/

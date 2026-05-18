@@ -10,9 +10,10 @@ use crate::linux_abi::{
     LINUX_DIRENT64_HEADER_SIZE, LINUX_DT_DIR, LINUX_DT_LNK, LINUX_DT_REG, LINUX_PAGE_SIZE,
     LINUX_S_IFDIR, LINUX_S_IFLNK, LINUX_S_IFREG, LinuxCapabilityData, LinuxCapabilityHeader,
     LinuxDirent64Header, LinuxEpollEvent, LinuxEventfdValue, LinuxFdPair, LinuxIovec,
-    LinuxItimerspec, LinuxOpenHow, LinuxPollFd, LinuxRlimit, LinuxSigaction, LinuxSigaltstack,
-    LinuxStat, LinuxStatfs, LinuxStatx, LinuxStatxTimestamp, LinuxTimerfdExpirations,
-    LinuxTimespec, LinuxTimeval, LinuxTimezone, LinuxUtsname, LinuxWinsize,
+    LinuxItimerspec, LinuxOpenHow, LinuxPollFd, LinuxRlimit, LinuxRusage, LinuxSigaction,
+    LinuxSigaltstack, LinuxStat, LinuxStatfs, LinuxStatx, LinuxStatxTimestamp,
+    LinuxTimerfdExpirations, LinuxTimespec, LinuxTimeval, LinuxTimezone, LinuxTms,
+    LinuxUtsname, LinuxWinsize,
 };
 use crate::memory::{LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE, LINUX_MMAP_SIZE};
 use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsError, RootFsMetadata};
@@ -95,6 +96,10 @@ pub const LINUX_MADV_WILLNEED: u64 = 3;
 pub const LINUX_MADV_DONTNEED: u64 = 4;
 pub const LINUX_MADV_FREE: u64 = 8;
 pub const LINUX_RLIM_INFINITY: u64 = u64::MAX;
+pub const LINUX_RUSAGE_SELF: i32 = 0;
+pub const LINUX_RUSAGE_CHILDREN: i32 = -1;
+pub const LINUX_RUSAGE_THREAD: i32 = 1;
+pub const LINUX_CLK_TCK: i64 = 100;
 pub const LINUX_OVERLAYFS_SUPER_MAGIC: i64 = 0x794c7630;
 const LINUX_EFD_SEMAPHORE: u64 = 0x1;
 const LINUX_EFD_NONBLOCK: u64 = LINUX_O_NONBLOCK;
@@ -577,11 +582,13 @@ impl SyscallDispatcher {
             132 => self.sigaltstack(request, memory),
             134 => self.rt_sigaction(request, memory),
             135 => self.rt_sigprocmask(request, memory)?,
+            153 => self.times(request, memory),
             154 => self.setpgid(request),
             155 => self.getpgid(request),
             156 => self.getsid(request),
             157 => self.setsid(),
             160 => self.uname(request, memory),
+            165 => self.getrusage(request, memory),
             167 => self.prctl(request, memory),
             168 => self.getcpu(request, memory),
             169 => self.gettimeofday(request, memory),
@@ -2193,6 +2200,52 @@ impl SyscallDispatcher {
         DispatchOutcome::Returned {
             value: std::process::id() as i64,
         }
+    }
+
+    fn times(&self, request: SyscallRequest, memory: &mut impl GuestMemory) -> DispatchOutcome {
+        let buf = request.arg(0);
+        let secs = realtime_duration().as_secs();
+        let clock = i64::try_from(secs)
+            .ok()
+            .and_then(|s| s.checked_mul(LINUX_CLK_TCK))
+            .unwrap_or(i64::MAX);
+        if buf != 0
+            && memory
+                .write_bytes(buf, LinuxTms::zeroed().as_bytes())
+                .is_err()
+        {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EFAULT,
+            };
+        }
+        DispatchOutcome::Returned { value: clock }
+    }
+
+    fn getrusage(&self, request: SyscallRequest, memory: &mut impl GuestMemory) -> DispatchOutcome {
+        let who = request.arg(0) as i32;
+        let usage = request.arg(1);
+        match who {
+            LINUX_RUSAGE_SELF | LINUX_RUSAGE_CHILDREN | LINUX_RUSAGE_THREAD => {}
+            _ => {
+                return DispatchOutcome::Errno {
+                    errno: LINUX_EINVAL,
+                };
+            }
+        }
+        if usage == 0 {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EFAULT,
+            };
+        }
+        if memory
+            .write_bytes(usage, LinuxRusage::zeroed().as_bytes())
+            .is_err()
+        {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EFAULT,
+            };
+        }
+        DispatchOutcome::Returned { value: 0 }
     }
 
     fn setpgid(&self, request: SyscallRequest) -> DispatchOutcome {

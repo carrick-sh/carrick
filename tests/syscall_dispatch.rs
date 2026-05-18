@@ -8,8 +8,9 @@ use carrick::linux_abi::{
     LINUX_DIRENT64_HEADER_SIZE, LINUX_DT_REG, LINUX_S_IFDIR, LINUX_S_IFLNK, LINUX_S_IFMT,
     LINUX_S_IFREG, LinuxCapabilityData, LinuxCapabilityHeader, LinuxDirent64Header,
     LinuxEpollEvent, LinuxEventfdValue, LinuxFdPair, LinuxIovec, LinuxItimerspec, LinuxPollFd,
-    LinuxRlimit, LinuxSigaltstack, LinuxStat, LinuxStatfs, LinuxStatx, LinuxTimerfdExpirations,
-    LinuxTimespec, LinuxTimeval, LinuxTimezone, LinuxUtsname, LinuxWinsize,
+    LinuxRlimit, LinuxRusage, LinuxSigaltstack, LinuxStat, LinuxStatfs, LinuxStatx,
+    LinuxTimerfdExpirations, LinuxTimespec, LinuxTimeval, LinuxTimezone, LinuxTms,
+    LinuxUtsname, LinuxWinsize,
 };
 use carrick::memory::{AddressSpace, LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE};
 use carrick::rootfs::{LayerSource, RootFs};
@@ -3906,6 +3907,152 @@ fn prlimit64_writes_packed_rlimit() {
 }
 
 #[test]
+fn times_bootstrap_writes_zero_tms_and_returns_monotonic_clock() {
+    let mut memory = LinearMemory::new(0x4000, vec![0xff; core::mem::size_of::<LinuxTms>()]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    // Valid buffer: write zeroed tms, return positive clock value.
+    let outcome = dispatcher
+        .dispatch(
+            SyscallRequest::new(153, SyscallArgs::from([0x4000, 0, 0, 0, 0, 0])),
+            &mut memory,
+            &mut reporter,
+        )
+        .unwrap();
+    let clock_with_buf = match outcome {
+        DispatchOutcome::Returned { value } => value,
+        other => panic!("expected Returned, got {other:?}"),
+    };
+    assert!(clock_with_buf > 0);
+    let tms = read_tms(&memory, 0x4000);
+    let utime = tms.tms_utime;
+    let stime = tms.tms_stime;
+    let cutime = tms.tms_cutime;
+    let cstime = tms.tms_cstime;
+    assert_eq!(utime, 0);
+    assert_eq!(stime, 0);
+    assert_eq!(cutime, 0);
+    assert_eq!(cstime, 0);
+
+    // NULL buffer: just return the clock value, nothing written.
+    let outcome = dispatcher
+        .dispatch(
+            SyscallRequest::new(153, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+            &mut memory,
+            &mut reporter,
+        )
+        .unwrap();
+    let clock_null = match outcome {
+        DispatchOutcome::Returned { value } => value,
+        other => panic!("expected Returned, got {other:?}"),
+    };
+    assert!(clock_null > 0);
+
+    // Bad pointer: EFAULT.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(153, SyscallArgs::from([0xdead_0000, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 14 }
+    );
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn getrusage_bootstrap_zeros_rusage_for_self_and_validates_who() {
+    const LINUX_RUSAGE_SELF: u64 = 0;
+    const LINUX_RUSAGE_CHILDREN: u64 = (-1_i64) as u64;
+    const LINUX_EINVAL: i32 = 22;
+    const LINUX_EFAULT: i32 = 14;
+
+    let mut memory = LinearMemory::new(0x4000, vec![0xff; core::mem::size_of::<LinuxRusage>()]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    // RUSAGE_SELF with valid pointer -> zeroed rusage, returns 0.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(165, SyscallArgs::from([LINUX_RUSAGE_SELF, 0x4000, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(read_rusage(&memory, 0x4000), LinuxRusage::zeroed());
+
+    // RUSAGE_CHILDREN with valid pointer -> same.
+    // Pre-poison the buffer so we can prove the handler zeroed it.
+    memory.write_bytes(0x4000, &vec![0xaa; core::mem::size_of::<LinuxRusage>()]).unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    165,
+                    SyscallArgs::from([LINUX_RUSAGE_CHILDREN, 0x4000, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(read_rusage(&memory, 0x4000), LinuxRusage::zeroed());
+
+    // who = 99 -> EINVAL.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(165, SyscallArgs::from([99, 0x4000, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno {
+            errno: LINUX_EINVAL,
+        }
+    );
+
+    // Valid who, bad pointer -> EFAULT.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    165,
+                    SyscallArgs::from([LINUX_RUSAGE_SELF, 0xdead_0000, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno {
+            errno: LINUX_EFAULT,
+        }
+    );
+
+    // Valid who, NULL pointer -> EFAULT.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(165, SyscallArgs::from([LINUX_RUSAGE_SELF, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno {
+            errno: LINUX_EFAULT,
+        }
+    );
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
 fn getrandom_fills_guest_buffer() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 32]);
     let mut reporter = CompatReporter::default();
@@ -6345,6 +6492,22 @@ fn read_rlimit(memory: &impl GuestMemory, address: u64) -> LinuxRlimit {
         .unwrap();
     let (rlimit, _) = LinuxRlimit::read_from_prefix(&bytes).unwrap();
     rlimit
+}
+
+fn read_tms(memory: &impl GuestMemory, address: u64) -> LinuxTms {
+    let bytes = memory
+        .read_bytes(address, std::mem::size_of::<LinuxTms>())
+        .unwrap();
+    let (tms, _) = LinuxTms::read_from_prefix(&bytes).unwrap();
+    tms
+}
+
+fn read_rusage(memory: &impl GuestMemory, address: u64) -> LinuxRusage {
+    let bytes = memory
+        .read_bytes(address, std::mem::size_of::<LinuxRusage>())
+        .unwrap();
+    let (rusage, _) = LinuxRusage::read_from_prefix(&bytes).unwrap();
+    rusage
 }
 
 fn read_timespec(memory: &impl GuestMemory, address: u64) -> LinuxTimespec {
