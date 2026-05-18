@@ -9,8 +9,9 @@ use crate::compat::{CompatEvent, CompatReporter, SyscallArgs};
 use crate::linux_abi::{
     LINUX_DIRENT64_HEADER_SIZE, LINUX_DT_DIR, LINUX_DT_LNK, LINUX_DT_REG, LINUX_PAGE_SIZE,
     LINUX_S_IFDIR, LINUX_S_IFLNK, LINUX_S_IFREG, LinuxDirent64Header, LinuxEpollEvent,
-    LinuxEventfdValue, LinuxFdPair, LinuxIovec, LinuxRlimit, LinuxSigaction, LinuxStat,
-    LinuxStatfs, LinuxTimespec, LinuxTimeval, LinuxTimezone, LinuxUtsname, LinuxWinsize,
+    LinuxEventfdValue, LinuxFdPair, LinuxIovec, LinuxItimerspec, LinuxRlimit, LinuxSigaction,
+    LinuxStat, LinuxStatfs, LinuxTimerfdExpirations, LinuxTimespec, LinuxTimeval, LinuxTimezone,
+    LinuxUtsname, LinuxWinsize,
 };
 use crate::memory::{LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE, LINUX_MMAP_SIZE};
 use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsError, RootFsMetadata};
@@ -69,6 +70,9 @@ const LINUX_EPOLL_CTL_ADD: u64 = 1;
 const LINUX_EPOLL_CTL_DEL: u64 = 2;
 const LINUX_EPOLL_CTL_MOD: u64 = 3;
 const LINUX_EPOLLIN: u32 = 0x001;
+const LINUX_TFD_NONBLOCK: u64 = LINUX_O_NONBLOCK;
+const LINUX_TFD_CLOEXEC: u64 = LINUX_O_CLOEXEC;
+const LINUX_TIMER_ABSTIME: u64 = 0x1;
 const LINUX_TIOCGWINSZ: u64 = 0x5413;
 const LINUX_PIPE_BUF_SIZE: i64 = 65_536;
 const LINUX_RT_SIGSET_SIZE: u64 = 8;
@@ -249,6 +253,13 @@ enum OpenDescription {
         semaphore: bool,
         status_flags: u64,
     },
+    TimerFd {
+        clock_id: u64,
+        interval: Option<Duration>,
+        deadline: Option<Duration>,
+        expirations: u64,
+        status_flags: u64,
+    },
     Epoll {
         interest: HashMap<i32, LinuxEpollEvent>,
         status_flags: u64,
@@ -283,6 +294,7 @@ impl OpenDescription {
             | OpenDescription::Directory { status_flags, .. }
             | OpenDescription::SyntheticFile { status_flags, .. }
             | OpenDescription::EventFd { status_flags, .. }
+            | OpenDescription::TimerFd { status_flags, .. }
             | OpenDescription::Epoll { status_flags, .. }
             | OpenDescription::PipeReader { status_flags, .. }
             | OpenDescription::PipeWriter { status_flags, .. } => *status_flags,
@@ -295,6 +307,7 @@ impl OpenDescription {
             | OpenDescription::Directory { status_flags, .. }
             | OpenDescription::SyntheticFile { status_flags, .. }
             | OpenDescription::EventFd { status_flags, .. }
+            | OpenDescription::TimerFd { status_flags, .. }
             | OpenDescription::Epoll { status_flags, .. }
             | OpenDescription::PipeReader { status_flags, .. }
             | OpenDescription::PipeWriter { status_flags, .. } => *status_flags = next,
@@ -393,6 +406,9 @@ impl SyscallDispatcher {
             78 => self.readlinkat(request, memory)?,
             79 => self.newfstatat(request, memory)?,
             80 => self.fstat(request, memory),
+            85 => self.timerfd_create(request),
+            86 => self.timerfd_settime(request, memory),
+            87 => self.timerfd_gettime(request, memory),
             93 => self.exit(request),
             94 => self.exit(request),
             96 => self.set_tid_address(),
@@ -576,6 +592,7 @@ impl SyscallDispatcher {
             OpenDescription::File { .. }
             | OpenDescription::SyntheticFile { .. }
             | OpenDescription::EventFd { .. }
+            | OpenDescription::TimerFd { .. }
             | OpenDescription::Epoll { .. }
             | OpenDescription::PipeReader { .. }
             | OpenDescription::PipeWriter { .. } => DispatchOutcome::Errno {
@@ -630,6 +647,113 @@ impl SyscallDispatcher {
             status_flags: flags & LINUX_EFD_NONBLOCK,
         };
         self.install_fd(description, linux_fd_flags_from_open_flags(flags))
+    }
+
+    fn timerfd_create(&mut self, request: SyscallRequest) -> DispatchOutcome {
+        let clock_id = request.arg(0);
+        let flags = request.arg(1);
+        if linux_clock_duration(clock_id).is_none()
+            || flags & !(LINUX_TFD_NONBLOCK | LINUX_TFD_CLOEXEC) != 0
+        {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+        let description = OpenDescription::TimerFd {
+            clock_id,
+            interval: None,
+            deadline: None,
+            expirations: 0,
+            status_flags: flags & LINUX_TFD_NONBLOCK,
+        };
+        self.install_fd(description, linux_fd_flags_from_open_flags(flags))
+    }
+
+    fn timerfd_settime(
+        &mut self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+    ) -> DispatchOutcome {
+        let fd = request.arg(0) as i32;
+        let flags = request.arg(1);
+        let new_value = request.arg(2);
+        let old_value = request.arg(3);
+        if flags & !LINUX_TIMER_ABSTIME != 0 {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+        let spec = match read_itimerspec(memory, new_value) {
+            Ok(spec) => spec,
+            Err(errno) => return DispatchOutcome::Errno { errno },
+        };
+        let (next_interval, next_value) = match itimerspec_durations(spec) {
+            Ok(value) => value,
+            Err(errno) => return DispatchOutcome::Errno { errno },
+        };
+        let Some(open_file) = self.open_files.get(&fd) else {
+            return DispatchOutcome::Errno { errno: LINUX_EBADF };
+        };
+        let mut open = open_file.description.borrow_mut();
+        let OpenDescription::TimerFd {
+            clock_id,
+            interval,
+            deadline,
+            expirations,
+            ..
+        } = &mut *open
+        else {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        };
+
+        if old_value != 0 {
+            let previous = timerfd_itimerspec(*clock_id, *interval, *deadline);
+            if memory.write_bytes(old_value, previous.as_bytes()).is_err() {
+                return DispatchOutcome::Errno {
+                    errno: LINUX_EFAULT,
+                };
+            }
+        }
+
+        let now = linux_clock_duration(*clock_id).unwrap_or(Duration::ZERO);
+        *interval = next_interval;
+        *deadline = next_value.map(|value| {
+            if flags & LINUX_TIMER_ABSTIME != 0 {
+                value
+            } else {
+                now.saturating_add(value)
+            }
+        });
+        *expirations = 0;
+        DispatchOutcome::Returned { value: 0 }
+    }
+
+    fn timerfd_gettime(
+        &self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+    ) -> DispatchOutcome {
+        let fd = request.arg(0) as i32;
+        let current_value = request.arg(1);
+        let Some(open_file) = self.open_files.get(&fd) else {
+            return DispatchOutcome::Errno { errno: LINUX_EBADF };
+        };
+        let open = open_file.description.borrow();
+        let OpenDescription::TimerFd {
+            clock_id,
+            interval,
+            deadline,
+            ..
+        } = &*open
+        else {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        };
+        let current = timerfd_itimerspec(*clock_id, *interval, *deadline);
+        write_packed(memory, current_value, current.as_bytes())
     }
 
     fn epoll_create1(&mut self, request: SyscallRequest) -> DispatchOutcome {
@@ -799,6 +923,17 @@ impl SyscallDispatcher {
                 } else {
                     0
                 }
+            }
+            OpenDescription::TimerFd {
+                clock_id,
+                interval,
+                deadline,
+                expirations,
+                ..
+            } if requested_events & LINUX_EPOLLIN != 0
+                && timerfd_expirations(*clock_id, *interval, *deadline, *expirations).0 > 0 =>
+            {
+                LINUX_EPOLLIN
             }
             _ => 0,
         }
@@ -1417,6 +1552,7 @@ impl SyscallDispatcher {
                 entries, offset, ..
             } => (*offset as i64, entries.len() as i64),
             OpenDescription::EventFd { .. }
+            | OpenDescription::TimerFd { .. }
             | OpenDescription::Epoll { .. }
             | OpenDescription::PipeReader { .. }
             | OpenDescription::PipeWriter { .. } => {
@@ -1446,6 +1582,7 @@ impl SyscallDispatcher {
             | OpenDescription::Directory { offset, .. }
             | OpenDescription::SyntheticFile { offset, .. } => *offset = next as usize,
             OpenDescription::EventFd { .. }
+            | OpenDescription::TimerFd { .. }
             | OpenDescription::Epoll { .. }
             | OpenDescription::PipeReader { .. }
             | OpenDescription::PipeWriter { .. } => {}
@@ -1521,6 +1658,7 @@ impl SyscallDispatcher {
                 | OpenDescription::SyntheticFile { contents, .. } => contents,
                 OpenDescription::Directory { .. }
                 | OpenDescription::EventFd { .. }
+                | OpenDescription::TimerFd { .. }
                 | OpenDescription::Epoll { .. }
                 | OpenDescription::PipeReader { .. }
                 | OpenDescription::PipeWriter { .. } => {
@@ -1668,6 +1806,23 @@ impl SyscallDispatcher {
             OpenDescription::EventFd {
                 counter, semaphore, ..
             } => return Ok(read_eventfd(memory, address, length, counter, *semaphore)),
+            OpenDescription::TimerFd {
+                clock_id,
+                interval,
+                deadline,
+                expirations,
+                ..
+            } => {
+                return Ok(read_timerfd(
+                    memory,
+                    address,
+                    length,
+                    *clock_id,
+                    interval,
+                    deadline,
+                    expirations,
+                ));
+            }
             OpenDescription::PipeReader { pipe, status_flags } => {
                 return Ok(read_pipe(memory, address, length, pipe, *status_flags));
             }
@@ -1722,6 +1877,7 @@ impl SyscallDispatcher {
             } => (contents, offset),
             OpenDescription::Directory { .. }
             | OpenDescription::EventFd { .. }
+            | OpenDescription::TimerFd { .. }
             | OpenDescription::Epoll { .. }
             | OpenDescription::PipeReader { .. }
             | OpenDescription::PipeWriter { .. } => {
@@ -1757,6 +1913,7 @@ impl SyscallDispatcher {
             | OpenDescription::SyntheticFile { contents, .. } => contents,
             OpenDescription::Directory { .. }
             | OpenDescription::EventFd { .. }
+            | OpenDescription::TimerFd { .. }
             | OpenDescription::Epoll { .. }
             | OpenDescription::PipeReader { .. }
             | OpenDescription::PipeWriter { .. } => {
@@ -2002,6 +2159,9 @@ impl SyscallDispatcher {
             OpenDescription::EventFd { .. } => {
                 return write_synthetic_stat(memory, statbuf, "anon_inode:[eventfd]", 0);
             }
+            OpenDescription::TimerFd { .. } => {
+                return write_synthetic_stat(memory, statbuf, "anon_inode:[timerfd]", 0);
+            }
             OpenDescription::Epoll { .. } => {
                 return write_synthetic_stat(memory, statbuf, "anon_inode:[eventpoll]", 0);
             }
@@ -2032,6 +2192,7 @@ impl SyscallDispatcher {
                 OpenDescription::File { .. }
                 | OpenDescription::SyntheticFile { .. }
                 | OpenDescription::EventFd { .. }
+                | OpenDescription::TimerFd { .. }
                 | OpenDescription::Epoll { .. }
                 | OpenDescription::PipeReader { .. }
                 | OpenDescription::PipeWriter { .. } => Err(LINUX_ENOTDIR),
@@ -2320,6 +2481,131 @@ fn write_eventfd(bytes: &[u8], counter: &mut u64) -> DispatchOutcome {
     }
 }
 
+fn read_timerfd(
+    memory: &mut impl GuestMemory,
+    address: u64,
+    length: usize,
+    clock_id: u64,
+    interval: &Option<Duration>,
+    deadline: &mut Option<Duration>,
+    expirations: &mut u64,
+) -> DispatchOutcome {
+    if length < core::mem::size_of::<LinuxTimerfdExpirations>() {
+        return DispatchOutcome::Errno {
+            errno: LINUX_EINVAL,
+        };
+    }
+    let (ready, next_deadline) = timerfd_expirations(clock_id, *interval, *deadline, *expirations);
+    *deadline = next_deadline;
+    *expirations = ready;
+    if *expirations == 0 {
+        return DispatchOutcome::Errno {
+            errno: LINUX_EAGAIN,
+        };
+    }
+    let value = LinuxTimerfdExpirations {
+        expirations: *expirations,
+    };
+    if memory.write_bytes(address, value.as_bytes()).is_err() {
+        return DispatchOutcome::Errno {
+            errno: LINUX_EFAULT,
+        };
+    }
+    *expirations = 0;
+    DispatchOutcome::Returned {
+        value: core::mem::size_of::<LinuxTimerfdExpirations>() as i64,
+    }
+}
+
+fn timerfd_itimerspec(
+    clock_id: u64,
+    interval: Option<Duration>,
+    deadline: Option<Duration>,
+) -> LinuxItimerspec {
+    let now = linux_clock_duration(clock_id).unwrap_or(Duration::ZERO);
+    let remaining = deadline.map(|deadline| deadline.saturating_sub(now));
+    LinuxItimerspec::new(
+        linux_timespec_from_optional_duration(interval),
+        linux_timespec_from_optional_duration(remaining),
+    )
+}
+
+fn timerfd_expirations(
+    clock_id: u64,
+    interval: Option<Duration>,
+    deadline: Option<Duration>,
+    expirations: u64,
+) -> (u64, Option<Duration>) {
+    let Some(deadline) = deadline else {
+        return (expirations, None);
+    };
+    let Some(now) = linux_clock_duration(clock_id) else {
+        return (expirations, Some(deadline));
+    };
+    if now < deadline {
+        return (expirations, Some(deadline));
+    }
+    let Some(interval) = interval else {
+        return (expirations.saturating_add(1), None);
+    };
+    if interval.is_zero() {
+        return (expirations.saturating_add(1), None);
+    }
+
+    let now_nanos = duration_to_nanos(now);
+    let deadline_nanos = duration_to_nanos(deadline);
+    let interval_nanos = duration_to_nanos(interval);
+    let elapsed_periods = ((now_nanos - deadline_nanos) / interval_nanos).saturating_add(1);
+    let count = u64::try_from(elapsed_periods).unwrap_or(u64::MAX);
+    let next_deadline_nanos =
+        deadline_nanos.saturating_add(interval_nanos.saturating_mul(elapsed_periods));
+    (
+        expirations.saturating_add(count),
+        Some(duration_from_nanos_saturating(next_deadline_nanos)),
+    )
+}
+
+fn itimerspec_durations(
+    spec: LinuxItimerspec,
+) -> Result<(Option<Duration>, Option<Duration>), i32> {
+    let interval = spec.it_interval;
+    let value = spec.it_value;
+    Ok((
+        duration_from_linux_timespec(interval)?,
+        duration_from_linux_timespec(value)?,
+    ))
+}
+
+fn duration_from_linux_timespec(timespec: LinuxTimespec) -> Result<Option<Duration>, i32> {
+    let seconds = timespec.tv_sec;
+    let nanoseconds = timespec.tv_nsec;
+    if seconds < 0 || !(0..1_000_000_000).contains(&nanoseconds) {
+        return Err(LINUX_EINVAL);
+    }
+    if seconds == 0 && nanoseconds == 0 {
+        return Ok(None);
+    }
+    Ok(Some(Duration::new(seconds as u64, nanoseconds as u32)))
+}
+
+fn linux_timespec_from_optional_duration(duration: Option<Duration>) -> LinuxTimespec {
+    duration.map_or(LinuxTimespec::new(0, 0), linux_timespec_from_duration)
+}
+
+fn duration_to_nanos(duration: Duration) -> u128 {
+    const NANOS_PER_SEC: u128 = 1_000_000_000;
+    u128::from(duration.as_secs()) * NANOS_PER_SEC + u128::from(duration.subsec_nanos())
+}
+
+fn duration_from_nanos_saturating(nanos: u128) -> Duration {
+    const NANOS_PER_SEC: u128 = 1_000_000_000;
+    let seconds = nanos / NANOS_PER_SEC;
+    if seconds > u128::from(u64::MAX) {
+        return Duration::new(u64::MAX, 999_999_999);
+    }
+    Duration::new(seconds as u64, (nanos % NANOS_PER_SEC) as u32)
+}
+
 fn read_pipe(
     memory: &mut impl GuestMemory,
     address: u64,
@@ -2374,6 +2660,13 @@ fn read_epoll_event(memory: &impl GuestMemory, address: u64) -> Result<LinuxEpol
         .read_bytes(address, core::mem::size_of::<LinuxEpollEvent>())
         .map_err(|_| LINUX_EFAULT)?;
     LinuxEpollEvent::read_from_bytes(&bytes).map_err(|_| LINUX_EFAULT)
+}
+
+fn read_itimerspec(memory: &impl GuestMemory, address: u64) -> Result<LinuxItimerspec, i32> {
+    let bytes = memory
+        .read_bytes(address, core::mem::size_of::<LinuxItimerspec>())
+        .map_err(|_| LINUX_EFAULT)?;
+    LinuxItimerspec::read_from_bytes(&bytes).map_err(|_| LINUX_EFAULT)
 }
 
 fn read_iovecs(

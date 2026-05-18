@@ -184,6 +184,32 @@ impl LinuxTimespec {
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
 )]
+pub struct LinuxItimerspec {
+    pub it_interval: LinuxTimespec,
+    pub it_value: LinuxTimespec,
+}
+
+impl LinuxItimerspec {
+    pub const fn new(it_interval: LinuxTimespec, it_value: LinuxTimespec) -> Self {
+        Self {
+            it_interval,
+            it_value,
+        }
+    }
+}
+
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct LinuxTimerfdExpirations {
+    pub expirations: u64,
+}
+
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
 pub struct LinuxTimeval {
     pub tv_sec: i64,
     pub tv_usec: i64,

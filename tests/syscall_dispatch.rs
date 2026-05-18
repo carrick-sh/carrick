@@ -6,8 +6,9 @@ use carrick::dispatch::{
 use carrick::elf::SegmentPerms;
 use carrick::linux_abi::{
     LINUX_DIRENT64_HEADER_SIZE, LINUX_DT_REG, LINUX_S_IFDIR, LINUX_S_IFMT, LINUX_S_IFREG,
-    LinuxDirent64Header, LinuxEpollEvent, LinuxEventfdValue, LinuxFdPair, LinuxIovec, LinuxRlimit,
-    LinuxStat, LinuxStatfs, LinuxTimespec, LinuxTimeval, LinuxTimezone, LinuxUtsname, LinuxWinsize,
+    LinuxDirent64Header, LinuxEpollEvent, LinuxEventfdValue, LinuxFdPair, LinuxIovec,
+    LinuxItimerspec, LinuxRlimit, LinuxStat, LinuxStatfs, LinuxTimerfdExpirations, LinuxTimespec,
+    LinuxTimeval, LinuxTimezone, LinuxUtsname, LinuxWinsize,
 };
 use carrick::memory::{AddressSpace, LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE};
 use carrick::rootfs::{LayerSource, RootFs};
@@ -29,6 +30,7 @@ const LINUX_OVERLAYFS_SUPER_MAGIC: i64 = 0x794c7630;
 const LINUX_EFD_NONBLOCK: u64 = LINUX_O_NONBLOCK;
 const LINUX_EPOLL_CTL_ADD: u64 = 1;
 const LINUX_EPOLLIN: u32 = 0x001;
+const LINUX_TFD_NONBLOCK: u64 = LINUX_O_NONBLOCK;
 const LINUX_TIOCGWINSZ: u64 = 0x5413;
 
 #[test]
@@ -426,6 +428,235 @@ fn fcntl_getpipe_size_reports_bootstrap_pipe_capacity() {
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 65536 }
+    );
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn timerfd_settime_read_round_trip_uses_packed_records() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(85, SyscallArgs::from([1, LINUX_TFD_NONBLOCK, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 3 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(25, SyscallArgs::from([3, LINUX_F_GETFL, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned {
+            value: LINUX_O_NONBLOCK as i64
+        }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(63, SyscallArgs::from([3, 0x4100, 8, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 11 }
+    );
+
+    let one_shot = LinuxItimerspec {
+        it_interval: LinuxTimespec::new(0, 0),
+        it_value: LinuxTimespec::new(0, 1),
+    };
+    memory.write_bytes(0x4000, one_shot.as_bytes()).unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(86, SyscallArgs::from([3, 0, 0x4000, 0x4080, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let old = read_itimerspec(&memory, 0x4080);
+    let old_value_sec = old.it_value.tv_sec;
+    let old_value_nsec = old.it_value.tv_nsec;
+    assert_eq!(old_value_sec, 0);
+    assert_eq!(old_value_nsec, 0);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(63, SyscallArgs::from([3, 0x4100, 8, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 8 }
+    );
+    let expirations = read_timerfd_expirations(&memory, 0x4100).expirations;
+    assert!(expirations >= 1);
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(63, SyscallArgs::from([3, 0x4100, 8, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 11 }
+    );
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn timerfd_gettime_writes_packed_itimerspec_for_armed_timer() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(85, SyscallArgs::from([1, LINUX_TFD_NONBLOCK, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 3 }
+    );
+    let armed = LinuxItimerspec {
+        it_interval: LinuxTimespec::new(2, 0),
+        it_value: LinuxTimespec::new(5, 0),
+    };
+    memory.write_bytes(0x4000, armed.as_bytes()).unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(86, SyscallArgs::from([3, 0, 0x4000, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(87, SyscallArgs::from([3, 0x4080, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let current = read_itimerspec(&memory, 0x4080);
+    let interval_sec = current.it_interval.tv_sec;
+    let remaining_sec = current.it_value.tv_sec;
+    assert_eq!(interval_sec, 2);
+    assert!((0..=5).contains(&remaining_sec));
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn epoll_reports_timerfd_readiness_with_packed_event() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(85, SyscallArgs::from([1, LINUX_TFD_NONBLOCK, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 3 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(20, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 4 }
+    );
+    let wanted = LinuxEpollEvent {
+        events: LINUX_EPOLLIN,
+        data: 0x544d,
+    };
+    memory.write_bytes(0x4000, wanted.as_bytes()).unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    21,
+                    SyscallArgs::from([4, LINUX_EPOLL_CTL_ADD, 3, 0x4000, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let one_shot = LinuxItimerspec {
+        it_interval: LinuxTimespec::new(0, 0),
+        it_value: LinuxTimespec::new(0, 1),
+    };
+    memory.write_bytes(0x4040, one_shot.as_bytes()).unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(86, SyscallArgs::from([3, 0, 0x4040, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(22, SyscallArgs::from([4, 0x4100, 4, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 1 }
+    );
+    let ready = read_epoll_event(&memory, 0x4100);
+    let data = ready.data;
+    assert_eq!(data, 0x544d);
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(63, SyscallArgs::from([3, 0x4200, 8, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 8 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(22, SyscallArgs::from([4, 0x4100, 4, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
@@ -2019,6 +2250,20 @@ fn read_fd_pair(memory: &impl GuestMemory, address: u64) -> LinuxFdPair {
         .read_bytes(address, std::mem::size_of::<LinuxFdPair>())
         .unwrap();
     LinuxFdPair::read_from_bytes(&bytes).unwrap()
+}
+
+fn read_itimerspec(memory: &impl GuestMemory, address: u64) -> LinuxItimerspec {
+    let bytes = memory
+        .read_bytes(address, std::mem::size_of::<LinuxItimerspec>())
+        .unwrap();
+    LinuxItimerspec::read_from_bytes(&bytes).unwrap()
+}
+
+fn read_timerfd_expirations(memory: &impl GuestMemory, address: u64) -> LinuxTimerfdExpirations {
+    let bytes = memory
+        .read_bytes(address, std::mem::size_of::<LinuxTimerfdExpirations>())
+        .unwrap();
+    LinuxTimerfdExpirations::read_from_bytes(&bytes).unwrap()
 }
 
 fn read_eventfd_value(memory: &impl GuestMemory, address: u64) -> LinuxEventfdValue {
