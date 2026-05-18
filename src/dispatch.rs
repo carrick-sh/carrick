@@ -618,6 +618,7 @@ impl SyscallDispatcher {
             113 => self.clock_gettime(request, memory),
             114 => self.clock_getres(request, memory),
             115 => self.clock_nanosleep(request, memory),
+            117 => self.ptrace(),
             123 => self.sched_getaffinity(request, memory),
             124 => self.sched_yield(),
             129 => self.kill(request),
@@ -632,17 +633,21 @@ impl SyscallDispatcher {
             139 => self.rt_sigreturn(),
             140 => self.setpriority(request),
             141 => self.getpriority(request),
+            142 => self.reboot(),
             153 => self.times(request, memory),
             154 => self.setpgid(request),
             155 => self.getpgid(request),
             156 => self.getsid(request),
             157 => self.setsid(),
             160 => self.uname(request, memory),
+            161 => self.sethostname(),
+            162 => self.setdomainname(),
             165 => self.getrusage(request, memory),
             166 => self.umask(request),
             167 => self.prctl(request, memory),
             168 => self.getcpu(request, memory),
             169 => self.gettimeofday(request, memory),
+            170 => self.settimeofday(),
             171 => self.adjtimex(request, memory),
             172 => self.getpid(),
             173 => DispatchOutcome::Returned { value: 1 },
@@ -2598,6 +2603,32 @@ impl SyscallDispatcher {
         DispatchOutcome::Returned {
             value: std::process::id() as i64,
         }
+    }
+
+    fn ptrace(&self) -> DispatchOutcome {
+        // Bootstrap: no debugger surface yet. Linux returns ENOSYS when ptrace
+        // is built out of the kernel; we surface the same answer so glibc /
+        // gdb fall back cleanly.
+        DispatchOutcome::Errno {
+            errno: LINUX_ENOSYS,
+        }
+    }
+
+    fn reboot(&self) -> DispatchOutcome {
+        // We're not root and we wouldn't honour the request anyway.
+        DispatchOutcome::Errno { errno: LINUX_EPERM }
+    }
+
+    fn sethostname(&self) -> DispatchOutcome {
+        DispatchOutcome::Errno { errno: LINUX_EPERM }
+    }
+
+    fn setdomainname(&self) -> DispatchOutcome {
+        DispatchOutcome::Errno { errno: LINUX_EPERM }
+    }
+
+    fn settimeofday(&self) -> DispatchOutcome {
+        DispatchOutcome::Errno { errno: LINUX_EPERM }
     }
 
     fn umask(&mut self, request: SyscallRequest) -> DispatchOutcome {

@@ -5301,6 +5301,41 @@ fn mmap_maps_file_bytes_into_guest_memory_arena() {
 }
 
 #[test]
+fn privileged_op_stubs_return_eperm_or_enosys() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    // ptrace → ENOSYS (no debugger surface yet).
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(117, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 38 }
+    );
+    // reboot / sethostname / setdomainname / settimeofday → EPERM.
+    for number in [142_u64, 161, 162, 170] {
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    SyscallRequest::new(number, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+                    &mut memory,
+                    &mut reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::Errno { errno: 1 },
+            "syscall {number} should return EPERM"
+        );
+    }
+
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
 fn umask_setpriority_getpriority_sysinfo_bootstrap_stubs() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
     let mut reporter = CompatReporter::default();
