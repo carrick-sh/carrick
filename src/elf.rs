@@ -2,10 +2,15 @@ use std::fs;
 use std::path::Path;
 
 use goblin::elf::Elf;
-use goblin::elf::header::{EM_AARCH64, EM_X86_64};
+use goblin::elf::header::{EM_AARCH64, EM_X86_64, ET_DYN, ET_EXEC};
 use goblin::elf::program_header::{PF_R, PF_W, PF_X, PT_LOAD};
 use serde::Serialize;
 use thiserror::Error;
+
+/// Default load base for ET_DYN (PIE) main executables. Picked so it lives
+/// well above page zero and well below `LINUX_MMAP_BASE` / `LINUX_HEAP_BASE`,
+/// while still being page-aligned for HVF stage-2 mappings.
+pub const LINUX_PIE_DEFAULT_BASE: u64 = 0x1_0000_0000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -29,6 +34,14 @@ pub enum Machine {
     Other(u16),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ElfType {
+    Exec,
+    Dyn,
+    Other(u16),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ElfMetadata {
     pub class: ElfClass,
@@ -39,6 +52,7 @@ pub struct ElfMetadata {
     pub is_dynamic: bool,
     pub program_header_count: usize,
     pub shared_object: bool,
+    pub e_type: ElfType,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -49,6 +63,39 @@ pub struct LoadPlan {
     pub program_header_entry_size: u16,
     pub program_header_count: u16,
     pub segments: Vec<LoadSegment>,
+    /// The load bias that has already been baked into `entry`, `segments`,
+    /// and `program_header_address`. For ET_EXEC this is zero. For ET_DYN
+    /// (PIE executables and dynamic interpreters) this is the address where
+    /// the runtime intends to place the image.
+    pub load_bias: u64,
+    pub e_type: ElfType,
+}
+
+impl LoadPlan {
+    /// Re-rebase the plan so its load bias becomes `new_bias`. Returns a new
+    /// plan whose `entry`, segment virtual addresses, and program-header
+    /// address have been shifted by `new_bias - self.load_bias`.
+    ///
+    /// Calling this on an ET_EXEC plan with a non-zero bias is allowed; it
+    /// just shifts every address by the requested amount. This is primarily
+    /// useful for the dynamic interpreter (ET_DYN), which the runtime maps
+    /// at a fixed `LINUX_INTERPRETER_BASE` rather than at the default PIE
+    /// base.
+    pub fn with_load_bias(mut self, new_bias: u64) -> Self {
+        if new_bias == self.load_bias {
+            return self;
+        }
+        let delta = new_bias.wrapping_sub(self.load_bias);
+        self.entry = self.entry.wrapping_add(delta);
+        if let Some(phdr) = self.program_header_address {
+            self.program_header_address = Some(phdr.wrapping_add(delta));
+        }
+        for segment in &mut self.segments {
+            segment.virtual_address = segment.virtual_address.wrapping_add(delta);
+        }
+        self.load_bias = new_bias;
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -128,17 +175,32 @@ fn metadata_from_elf(elf: &Elf<'_>) -> ElfMetadata {
         is_dynamic: elf.dynamic.is_some(),
         program_header_count: elf.program_headers.len(),
         shared_object: elf.is_lib,
+        e_type: elf_type_from(elf.header.e_type),
+    }
+}
+
+fn elf_type_from(e_type: u16) -> ElfType {
+    match e_type {
+        ET_EXEC => ElfType::Exec,
+        ET_DYN => ElfType::Dyn,
+        other => ElfType::Other(other),
     }
 }
 
 fn load_plan_from_elf(elf: &Elf<'_>) -> LoadPlan {
+    let e_type = elf_type_from(elf.header.e_type);
+    let load_bias = match e_type {
+        ElfType::Dyn => LINUX_PIE_DEFAULT_BASE,
+        ElfType::Exec | ElfType::Other(_) => 0,
+    };
+
     let segments: Vec<LoadSegment> = elf
         .program_headers
         .iter()
         .filter(|header| header.p_type == PT_LOAD)
         .map(|header| LoadSegment {
             file_offset: header.p_offset,
-            virtual_address: header.p_vaddr,
+            virtual_address: load_bias.wrapping_add(header.p_vaddr),
             file_size: header.p_filesz,
             memory_size: header.p_memsz,
             alignment: header.p_align,
@@ -151,12 +213,14 @@ fn load_plan_from_elf(elf: &Elf<'_>) -> LoadPlan {
         .collect();
 
     LoadPlan {
-        entry: elf.entry,
+        entry: load_bias.wrapping_add(elf.entry),
         interpreter: elf.interpreter.map(str::to_owned),
         program_header_address: program_header_address(elf, &segments),
         program_header_entry_size: elf.header.e_phentsize,
         program_header_count: elf.header.e_phnum,
         segments,
+        load_bias,
+        e_type,
     }
 }
 
@@ -174,4 +238,86 @@ fn program_header_address(elf: &Elf<'_>, segments: &[LoadSegment]) -> Option<u64
             None
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ET_EXEC_TYPE: u16 = 2;
+    const ET_DYN_TYPE: u16 = 3;
+    const EM_AARCH64_VALUE: u16 = 183;
+    const PT_LOAD_VALUE: u32 = 1;
+    const PF_X_VALUE: u32 = 1;
+    const PF_R_VALUE: u32 = 4;
+
+    fn synthetic_aarch64_elf(e_type: u16, entry: u64, segment_vaddr: u64) -> Vec<u8> {
+        // Layout: ELF header (64) + 1 program header (56) + a one-page LOAD.
+        let mut elf = vec![0_u8; 0x1004];
+
+        elf[0..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2; // ELFCLASS64
+        elf[5] = 1; // ELFDATA2LSB
+        elf[6] = 1; // EV_CURRENT
+        elf[16..18].copy_from_slice(&e_type.to_le_bytes());
+        elf[18..20].copy_from_slice(&EM_AARCH64_VALUE.to_le_bytes());
+        elf[20..24].copy_from_slice(&1_u32.to_le_bytes()); // version
+        elf[24..32].copy_from_slice(&entry.to_le_bytes()); // e_entry
+        elf[32..40].copy_from_slice(&64_u64.to_le_bytes()); // e_phoff
+        elf[52..54].copy_from_slice(&64_u16.to_le_bytes()); // e_ehsize
+        elf[54..56].copy_from_slice(&56_u16.to_le_bytes()); // e_phentsize
+        elf[56..58].copy_from_slice(&1_u16.to_le_bytes()); // e_phnum
+
+        let ph = 64;
+        elf[ph..ph + 4].copy_from_slice(&PT_LOAD_VALUE.to_le_bytes());
+        elf[ph + 4..ph + 8].copy_from_slice(&(PF_R_VALUE | PF_X_VALUE).to_le_bytes());
+        elf[ph + 8..ph + 16].copy_from_slice(&0x1000_u64.to_le_bytes()); // p_offset
+        elf[ph + 16..ph + 24].copy_from_slice(&segment_vaddr.to_le_bytes()); // p_vaddr
+        elf[ph + 24..ph + 32].copy_from_slice(&segment_vaddr.to_le_bytes()); // p_paddr
+        elf[ph + 32..ph + 40].copy_from_slice(&4_u64.to_le_bytes()); // p_filesz
+        elf[ph + 40..ph + 48].copy_from_slice(&0x1000_u64.to_le_bytes()); // p_memsz
+        elf[ph + 48..ph + 56].copy_from_slice(&0x1000_u64.to_le_bytes()); // p_align
+
+        // Tiny ret instruction at the start of the LOAD segment so the file
+        // contents are well-formed.
+        elf[0x1000..0x1004].copy_from_slice(b"\x1f\x20\x03\xd5");
+        elf
+    }
+
+    #[test]
+    fn et_exec_plan_uses_zero_load_bias() {
+        let bytes = synthetic_aarch64_elf(ET_EXEC_TYPE, 0x400000, 0x400000);
+        let plan = plan_elf_load_bytes(&bytes).unwrap();
+
+        assert_eq!(plan.e_type, ElfType::Exec);
+        assert_eq!(plan.load_bias, 0);
+        assert_eq!(plan.entry, 0x400000);
+        assert_eq!(plan.segments.len(), 1);
+        assert_eq!(plan.segments[0].virtual_address, 0x400000);
+    }
+
+    #[test]
+    fn et_dyn_plan_rebases_to_default_pie_base() {
+        // p_vaddr == 0, entry == 0x7500 — the same shape Alpine's busybox uses.
+        let bytes = synthetic_aarch64_elf(ET_DYN_TYPE, 0x7500, 0);
+        let plan = plan_elf_load_bytes(&bytes).unwrap();
+
+        assert_eq!(plan.e_type, ElfType::Dyn);
+        assert_eq!(plan.load_bias, LINUX_PIE_DEFAULT_BASE);
+        assert_eq!(plan.entry, LINUX_PIE_DEFAULT_BASE + 0x7500);
+        assert_eq!(plan.segments.len(), 1);
+        assert_eq!(plan.segments[0].virtual_address, LINUX_PIE_DEFAULT_BASE);
+    }
+
+    #[test]
+    fn with_load_bias_reshifts_a_dyn_plan() {
+        let bytes = synthetic_aarch64_elf(ET_DYN_TYPE, 0x120, 0);
+        let plan = plan_elf_load_bytes(&bytes).unwrap();
+        assert_eq!(plan.load_bias, LINUX_PIE_DEFAULT_BASE);
+
+        let rebased = plan.with_load_bias(0x7000_0000_0000);
+        assert_eq!(rebased.load_bias, 0x7000_0000_0000);
+        assert_eq!(rebased.entry, 0x7000_0000_0000 + 0x120);
+        assert_eq!(rebased.segments[0].virtual_address, 0x7000_0000_0000);
+    }
 }

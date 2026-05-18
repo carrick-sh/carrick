@@ -125,7 +125,7 @@ impl AddressSpace {
 
     fn load_elf_segments(file: &[u8], plan: LoadPlan) -> Result<Self, AddressSpaceError> {
         let linux_auxv = linux_auxv_from_load_plan(&plan, None);
-        let mut regions = regions_from_load_plan(file, &plan, 0)?;
+        let mut regions = regions_from_load_plan(file, &plan)?;
         regions.extend(linux_runtime_regions()?);
 
         let mut image = Self::from_regions(plan.entry, regions)?;
@@ -138,24 +138,16 @@ impl AddressSpace {
         plan: LoadPlan,
         rootfs: &RootFs,
     ) -> Result<Self, AddressSpaceError> {
-        let mut regions = regions_from_load_plan(file, &plan, 0)?;
+        let mut regions = regions_from_load_plan(file, &plan)?;
         let mut entry = plan.entry;
         let mut interpreter_base = None;
 
         if let Some(interpreter_path) = plan.interpreter.as_deref() {
             let interpreter = rootfs.read(interpreter_path)?;
-            let interpreter_plan = plan_elf_load_bytes(&interpreter)?;
-            regions.extend(regions_from_load_plan(
-                &interpreter,
-                &interpreter_plan,
-                LINUX_INTERPRETER_BASE,
-            )?);
-            entry = LINUX_INTERPRETER_BASE
-                .checked_add(interpreter_plan.entry)
-                .ok_or(AddressSpaceError::RegionOverflow {
-                    start: LINUX_INTERPRETER_BASE,
-                    size: interpreter_plan.entry,
-                })?;
+            let interpreter_plan =
+                plan_elf_load_bytes(&interpreter)?.with_load_bias(LINUX_INTERPRETER_BASE);
+            regions.extend(regions_from_load_plan(&interpreter, &interpreter_plan)?);
+            entry = interpreter_plan.entry;
             interpreter_base = Some(LINUX_INTERPRETER_BASE);
         }
         regions.extend(linux_runtime_regions()?);
@@ -397,17 +389,14 @@ fn align_down_usize(value: usize, alignment: usize) -> usize {
 fn regions_from_load_plan(
     file: &[u8],
     plan: &LoadPlan,
-    load_bias: u64,
 ) -> Result<Vec<MemoryRegion>, AddressSpaceError> {
     let mut regions = Vec::with_capacity(plan.segments.len());
 
     for segment in &plan.segments {
-        let start = segment.virtual_address.checked_add(load_bias).ok_or(
-            AddressSpaceError::RegionOverflow {
-                start: segment.virtual_address,
-                size: load_bias,
-            },
-        )?;
+        // `virtual_address` is already rebased by the load plan (including
+        // the PIE bias for ET_DYN binaries). Treat it as the final guest
+        // address without further adjustment.
+        let start = segment.virtual_address;
 
         if segment.file_size > segment.memory_size {
             return Err(AddressSpaceError::FileLargerThanMemory {
