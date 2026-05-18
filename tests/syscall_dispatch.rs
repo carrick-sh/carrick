@@ -60,7 +60,14 @@ const LINUX_TIMER_ABSTIME: u64 = 0x1;
 const LINUX_CLOCK_MONOTONIC: u64 = 1;
 const LINUX_TCGETS: u64 = 0x5401;
 const LINUX_TCSETS: u64 = 0x5402;
+const LINUX_TIOCSCTTY: u64 = 0x540E;
+const LINUX_TIOCGPGRP: u64 = 0x540F;
+const LINUX_TIOCSPGRP: u64 = 0x5410;
 const LINUX_TIOCGWINSZ: u64 = 0x5413;
+const LINUX_FIONREAD: u64 = 0x541B;
+const LINUX_FIONBIO: u64 = 0x5421;
+const LINUX_TIOCNOTTY: u64 = 0x5422;
+const LINUX_TIOCGSID: u64 = 0x5429;
 const LINUX_R_OK: u64 = 4;
 const LINUX_W_OK: u64 = 2;
 const LINUX_X_OK: u64 = 1;
@@ -317,6 +324,209 @@ fn ioctl_tcgets_writes_default_termios_for_stdio_and_enotty_for_files() {
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 14 }
+    );
+
+    assert!(reporter.finish().unhandled_ioctls.is_empty());
+}
+
+#[test]
+fn tty_ioctls_handle_pgrp_sid_and_controlling_terminal_calls() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    // TIOCGPGRP on stdio fd 0 → writes pgid=1.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(29, SyscallArgs::from([0, LINUX_TIOCGPGRP, 0x4000, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(read_i32_le(&memory, 0x4000), 1);
+
+    // TIOCGSID on stdio fd 2 → writes sid=1.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(29, SyscallArgs::from([2, LINUX_TIOCGSID, 0x4010, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(read_i32_le(&memory, 0x4010), 1);
+
+    // TIOCGPGRP on unknown fd 99 → EBADF.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(29, SyscallArgs::from([99, LINUX_TIOCGPGRP, 0x4020, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 9 }
+    );
+
+    // TIOCSPGRP on stdio with pgid=1 → 0; with pgid=99 → EPERM.
+    memory.write_bytes(0x4030, &1_i32.to_le_bytes()).unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(29, SyscallArgs::from([0, LINUX_TIOCSPGRP, 0x4030, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    memory.write_bytes(0x4040, &99_i32.to_le_bytes()).unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(29, SyscallArgs::from([0, LINUX_TIOCSPGRP, 0x4040, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 1 }
+    );
+
+    // TIOCSCTTY / TIOCNOTTY on stdio → 0.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(29, SyscallArgs::from([1, LINUX_TIOCSCTTY, 1, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(29, SyscallArgs::from([0, LINUX_TIOCNOTTY, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    // On a rootfs-backed file fd: TIOCGPGRP/TIOCGSID → ENOTTY.
+    let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
+        "etc/motd",
+        b"hello\n".as_slice(),
+    )]))])
+    .unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
+    memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
+    let opened = dispatcher
+        .dispatch(
+            SyscallRequest::new(
+                56,
+                SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
+            ),
+            &mut memory,
+            &mut reporter,
+        )
+        .unwrap();
+    let file_fd = match opened {
+        DispatchOutcome::Returned { value } => value,
+        other => panic!("expected fd, got {:?}", other),
+    };
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    29,
+                    SyscallArgs::from([file_fd as u64, LINUX_TIOCGPGRP, 0x4040, 0, 0, 0])
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 25 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    29,
+                    SyscallArgs::from([file_fd as u64, LINUX_TIOCGSID, 0x4048, 0, 0, 0])
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 25 }
+    );
+
+    assert!(reporter.finish().unhandled_ioctls.is_empty());
+}
+
+#[test]
+fn fionread_and_fionbio_bootstrap_succeed_for_valid_fds() {
+    let mut memory = LinearMemory::new(0x4000, vec![0xee; 0x200]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    // FIONREAD on stdio writes 0.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(29, SyscallArgs::from([0, LINUX_FIONREAD, 0x4000, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(read_i32_le(&memory, 0x4000), 0);
+
+    // FIONBIO on stdio with enable=1 → 0.
+    memory.write_bytes(0x4010, &1_i32.to_le_bytes()).unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(29, SyscallArgs::from([1, LINUX_FIONBIO, 0x4010, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    // FIONBIO on fd 99 → EBADF.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(29, SyscallArgs::from([99, LINUX_FIONBIO, 0x4010, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 9 }
+    );
+
+    // FIONREAD on unknown fd 99 → EBADF too.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(29, SyscallArgs::from([99, LINUX_FIONREAD, 0x4020, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 9 }
     );
 
     assert!(reporter.finish().unhandled_ioctls.is_empty());
@@ -6716,6 +6926,13 @@ fn read_statfs(memory: &impl GuestMemory, address: u64) -> LinuxStatfs {
         .unwrap();
     let (statfs, _) = LinuxStatfs::read_from_prefix(&bytes).unwrap();
     statfs
+}
+
+fn read_i32_le(memory: &impl GuestMemory, address: u64) -> i32 {
+    let bytes = memory.read_bytes(address, 4).unwrap();
+    let mut buf = [0u8; 4];
+    buf.copy_from_slice(&bytes);
+    i32::from_le_bytes(buf)
 }
 
 fn read_winsize(memory: &impl GuestMemory, address: u64) -> LinuxWinsize {

@@ -138,7 +138,16 @@ const LINUX_TCGETS: u64 = 0x5401;
 const LINUX_TCSETS: u64 = 0x5402;
 const LINUX_TCSETSW: u64 = 0x5403;
 const LINUX_TCSETSF: u64 = 0x5404;
+const LINUX_TIOCSCTTY: u64 = 0x540E;
+const LINUX_TIOCGPGRP: u64 = 0x540F;
+const LINUX_TIOCSPGRP: u64 = 0x5410;
 const LINUX_TIOCGWINSZ: u64 = 0x5413;
+const LINUX_FIONREAD: u64 = 0x541B;
+const LINUX_FIONBIO: u64 = 0x5421;
+const LINUX_TIOCNOTTY: u64 = 0x5422;
+const LINUX_TIOCGSID: u64 = 0x5429;
+const LINUX_BOOTSTRAP_PGID: i32 = 1;
+const LINUX_BOOTSTRAP_SID: i32 = 1;
 const LINUX_PIPE_BUF_SIZE: i64 = 65_536;
 const LINUX_RT_SIGSET_SIZE: u64 = 8;
 const LINUX_MAX_SIGNUM: u64 = 64;
@@ -393,6 +402,12 @@ struct PipeState {
     buffer: VecDeque<u8>,
     readers: usize,
     writers: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TtyFdKind {
+    Stdio,
+    Other,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1531,12 +1546,104 @@ impl SyscallDispatcher {
             LINUX_TCSETS | LINUX_TCSETSW | LINUX_TCSETSF => DispatchOutcome::Errno {
                 errno: LINUX_ENOTTY,
             },
+            LINUX_TIOCSCTTY => match self.tty_ioctl_fd_kind(fd) {
+                Ok(TtyFdKind::Stdio) => DispatchOutcome::Returned { value: 0 },
+                Ok(TtyFdKind::Other) => DispatchOutcome::Errno {
+                    errno: LINUX_ENOTTY,
+                },
+                Err(errno) => DispatchOutcome::Errno { errno },
+            },
+            LINUX_TIOCGPGRP => match self.tty_ioctl_fd_kind(fd) {
+                Ok(TtyFdKind::Stdio) => {
+                    write_packed(memory, arg, &LINUX_BOOTSTRAP_PGID.to_le_bytes())
+                }
+                Ok(TtyFdKind::Other) => DispatchOutcome::Errno {
+                    errno: LINUX_ENOTTY,
+                },
+                Err(errno) => DispatchOutcome::Errno { errno },
+            },
+            LINUX_TIOCSPGRP => match self.tty_ioctl_fd_kind(fd) {
+                Ok(TtyFdKind::Stdio) => {
+                    let mut buf = [0u8; 4];
+                    match memory.read_bytes(arg, 4) {
+                        Ok(bytes) => buf.copy_from_slice(&bytes),
+                        Err(_) => {
+                            return DispatchOutcome::Errno {
+                                errno: LINUX_EFAULT,
+                            };
+                        }
+                    }
+                    let pgid = i32::from_le_bytes(buf);
+                    if pgid == LINUX_BOOTSTRAP_PGID {
+                        DispatchOutcome::Returned { value: 0 }
+                    } else {
+                        DispatchOutcome::Errno { errno: LINUX_EPERM }
+                    }
+                }
+                Ok(TtyFdKind::Other) => DispatchOutcome::Errno {
+                    errno: LINUX_ENOTTY,
+                },
+                Err(errno) => DispatchOutcome::Errno { errno },
+            },
+            LINUX_FIONREAD => {
+                // Stdio, eventfd, timerfd, epoll, pipe writer, directory, regular file,
+                // synthetic file: writing 0 ("nothing pending") is benign. Pipe reader
+                // gets the actual buffered byte count.
+                let available: i32 = match self.open_files.get(&fd) {
+                    Some(open_file) => match &*open_file.description.borrow() {
+                        OpenDescription::PipeReader { pipe, .. } => {
+                            let len = pipe.borrow().buffer.len();
+                            i32::try_from(len).unwrap_or(i32::MAX)
+                        }
+                        _ => 0,
+                    },
+                    // stdio fd (already validated above) or any other valid fd: 0.
+                    None => 0,
+                };
+                write_packed(memory, arg, &available.to_le_bytes())
+            }
+            LINUX_FIONBIO => {
+                if memory.read_bytes(arg, 4).is_err() {
+                    return DispatchOutcome::Errno {
+                        errno: LINUX_EFAULT,
+                    };
+                }
+                // Bootstrap: accept and ignore — we don't persist nonblocking
+                // state for most fd kinds. Real fcntl(F_SETFL) is the durable path.
+                DispatchOutcome::Returned { value: 0 }
+            }
+            LINUX_TIOCNOTTY => match self.tty_ioctl_fd_kind(fd) {
+                Ok(TtyFdKind::Stdio) => DispatchOutcome::Returned { value: 0 },
+                Ok(TtyFdKind::Other) => DispatchOutcome::Errno {
+                    errno: LINUX_ENOTTY,
+                },
+                Err(errno) => DispatchOutcome::Errno { errno },
+            },
+            LINUX_TIOCGSID => match self.tty_ioctl_fd_kind(fd) {
+                Ok(TtyFdKind::Stdio) => {
+                    write_packed(memory, arg, &LINUX_BOOTSTRAP_SID.to_le_bytes())
+                }
+                Ok(TtyFdKind::Other) => DispatchOutcome::Errno {
+                    errno: LINUX_ENOTTY,
+                },
+                Err(errno) => DispatchOutcome::Errno { errno },
+            },
             _ => {
                 reporter.record(CompatEvent::unhandled_ioctl(fd, ioctl_request, arg));
                 DispatchOutcome::Errno {
                     errno: LINUX_ENOTTY,
                 }
             }
+        }
+    }
+
+    fn tty_ioctl_fd_kind(&self, fd: i32) -> Result<TtyFdKind, i32> {
+        if is_stdio_fd(fd) {
+            Ok(TtyFdKind::Stdio)
+        } else if self.open_files.contains_key(&fd) {
+            Ok(TtyFdKind::Other)
+        } else {
+            Err(LINUX_EBADF)
         }
     }
 

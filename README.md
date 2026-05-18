@@ -40,7 +40,12 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
   `dup3(2)`, `fcntl(2)`, `flock(2)`, `truncate(2)`, `ftruncate(2)`, `fallocate(2)`,
   `ioctl(2)` (`TIOCGWINSZ` returns 80x24, `TCGETS` returns a cooked-TTY
   termios for stdio and `ENOTTY` for files; `TCSETS`/`TCSETSW`/`TCSETSF`
-  validate the buffer and discard the write), `mkdirat(2)`,
+  validate the buffer and discard the write; `TIOCGPGRP`/`TIOCGSID` report
+  the bootstrap pgid/sid of `1` on stdio; `TIOCSPGRP` accepts only `1`
+  (else `EPERM`); `TIOCSCTTY`/`TIOCNOTTY` succeed silently on stdio;
+  `FIONREAD` returns the pipe-reader buffer length or `0` for other fds;
+  `FIONBIO` validates the flag pointer and returns 0 without persisting),
+  `mkdirat(2)`,
   `mknodat(2)`, `unlinkat(2)`, `symlinkat(2)`, `linkat(2)`, `renameat(2)`,
   `fchmod(2)`, `fchmodat(2)`,
   `fchown(2)`, `fchownat(2)`, `statfs(2)`, `fstatfs(2)`,
