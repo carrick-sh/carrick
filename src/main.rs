@@ -1,0 +1,254 @@
+use std::path::PathBuf;
+
+use anyhow::{Context, bail};
+use carrick::compat::{CompatReportFormat, CompatReporter, SyscallArgs};
+use carrick::dispatch::{LinearMemory, SyscallDispatcher, SyscallRequest};
+use carrick::elf::{inspect_elf, plan_elf_load};
+use carrick::memory::AddressSpace;
+use carrick::oci::{ImageReference, ImageStore, pull_image};
+use carrick::rootfs::RootFs;
+use carrick::syscall::{aarch64_table, lookup_aarch64};
+use carrick::trap::hvf_capabilities;
+use clap::{Parser, Subcommand};
+
+#[derive(Debug, Parser)]
+#[command(author, version, about)]
+struct Cli {
+    #[arg(long, env = "CARRICK_HOME", global = true)]
+    store: Option<PathBuf>,
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Debug, Subcommand)]
+enum Commands {
+    InspectElf {
+        path: PathBuf,
+    },
+    PlanElfLoad {
+        path: PathBuf,
+    },
+    LoadElf {
+        path: PathBuf,
+        #[arg(long)]
+        find_text: Option<String>,
+    },
+    Pull {
+        image: String,
+    },
+    Run {
+        image: String,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+    Shell {
+        #[arg(default_value = "alpine:latest")]
+        image: String,
+    },
+    Exec {
+        context: String,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+    CompatReport {
+        #[arg(long, value_enum, default_value_t = CompatReportFormat::Json)]
+        format: CompatReportFormat,
+        #[arg(last = true)]
+        command: Vec<String>,
+    },
+    DispatchSyscall {
+        number: u64,
+        #[arg(long, value_delimiter = ',')]
+        args: Vec<u64>,
+        #[arg(long, default_value_t = 0x4000)]
+        memory_base: u64,
+        #[arg(long, default_value = "")]
+        memory_text: String,
+    },
+    Rootfs {
+        #[arg(long = "layer", required = true)]
+        layers: Vec<PathBuf>,
+        #[command(subcommand)]
+        command: RootfsCommand,
+    },
+    Syscalls {
+        #[arg(long)]
+        number: Option<u64>,
+    },
+    TrapCapabilities,
+}
+
+#[derive(Debug, Subcommand)]
+enum RootfsCommand {
+    Summary,
+    Ls { path: PathBuf },
+    Cat { path: PathBuf },
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .init();
+    register_dtrace_probes();
+
+    let cli = Cli::parse();
+    let store = cli
+        .store
+        .map(ImageStore::new)
+        .unwrap_or_else(ImageStore::default_for_user);
+
+    match cli.command {
+        Commands::InspectElf { path } => {
+            let metadata = inspect_elf(&path)
+                .with_context(|| format!("failed to inspect {}", path.display()))?;
+            println!("{}", serde_json::to_string_pretty(&metadata)?);
+        }
+        Commands::PlanElfLoad { path } => {
+            let plan = plan_elf_load(&path)
+                .with_context(|| format!("failed to plan ELF load for {}", path.display()))?;
+            println!("{}", serde_json::to_string_pretty(&plan)?);
+        }
+        Commands::LoadElf { path, find_text } => {
+            let image = AddressSpace::load_elf(&path)
+                .with_context(|| format!("failed to load ELF image for {}", path.display()))?;
+            let found_address = find_text
+                .as_ref()
+                .and_then(|needle| image.find_bytes(needle.as_bytes()));
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "entry": image.entry(),
+                    "region_count": image.regions().len(),
+                    "regions": image.regions(),
+                    "found_address": found_address,
+                }))?
+            );
+        }
+        Commands::Pull { image } => {
+            let image = ImageReference::parse(&image)?;
+            let summary = pull_image(&image, &store).await?;
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+        }
+        Commands::Run { image, command } => {
+            let image = ImageReference::parse(&image)?;
+            let command = if command.is_empty() {
+                vec!["/bin/sh".to_owned()]
+            } else {
+                command
+            };
+            println!(
+                "{}",
+                serde_json::json!({
+                    "image": image.canonical(),
+                    "command": command,
+                    "store": store.root(),
+                    "trap": hvf_capabilities(),
+                })
+            );
+            bail!("Linux process execution is not implemented in this bootstrap yet");
+        }
+        Commands::Shell { image } => {
+            let image = ImageReference::parse(&image)?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "image": image.canonical(),
+                    "command": ["/bin/sh"],
+                    "store": store.root(),
+                    "trap": hvf_capabilities(),
+                })
+            );
+            bail!("interactive Linux shell execution is not implemented in this bootstrap yet");
+        }
+        Commands::Exec { context, command } => {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "context": context,
+                    "command": command,
+                })
+            );
+            bail!("existing Carrick execution contexts are not implemented in this bootstrap yet");
+        }
+        Commands::CompatReport { format, command } => {
+            if command.is_empty() {
+                bail!("compat-report needs a command after --");
+            }
+            eprintln!(
+                "compat-report runtime hooks are scaffolded; returning an empty report for {:?}",
+                command
+            );
+            let report = CompatReporter::default().finish();
+            println!("{}", report.render(format)?);
+        }
+        Commands::DispatchSyscall {
+            number,
+            args,
+            memory_base,
+            memory_text,
+        } => {
+            if args.len() != 6 {
+                bail!("dispatch-syscall requires exactly six --args values");
+            }
+            let memory = LinearMemory::new(memory_base, memory_text.into_bytes());
+            let mut dispatcher = SyscallDispatcher::new(&memory);
+            let mut reporter = CompatReporter::default();
+            let outcome = dispatcher.dispatch(
+                SyscallRequest::new(
+                    number,
+                    SyscallArgs::from([args[0], args[1], args[2], args[3], args[4], args[5]]),
+                ),
+                &mut reporter,
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "outcome": outcome,
+                    "stdout": String::from_utf8_lossy(dispatcher.stdout()),
+                    "stderr": String::from_utf8_lossy(dispatcher.stderr()),
+                    "report": reporter.finish(),
+                }))?
+            );
+        }
+        Commands::Rootfs { layers, command } => {
+            let rootfs = RootFs::from_layer_paths(&layers)?;
+            match command {
+                RootfsCommand::Summary => {
+                    println!("{}", serde_json::to_string_pretty(&rootfs.summary())?);
+                }
+                RootfsCommand::Ls { path } => {
+                    for name in rootfs.list_dir(path)? {
+                        println!("{name}");
+                    }
+                }
+                RootfsCommand::Cat { path } => {
+                    print!("{}", rootfs.read_to_string(path)?);
+                }
+            }
+        }
+        Commands::Syscalls { number } => {
+            if let Some(number) = number {
+                let syscall = lookup_aarch64(number)
+                    .with_context(|| format!("unknown Linux/aarch64 syscall {}", number))?;
+                println!("{}", serde_json::to_string_pretty(syscall)?);
+            } else {
+                println!("{}", serde_json::to_string_pretty(aarch64_table())?);
+            }
+        }
+        Commands::TrapCapabilities => {
+            println!("{}", serde_json::to_string_pretty(&hvf_capabilities())?);
+        }
+    }
+
+    Ok(())
+}
+
+fn register_dtrace_probes() {
+    if let Err(err) = carrick::probes::register_dtrace_probes() {
+        tracing::debug!("failed to register DTrace probes: {err}");
+    }
+}

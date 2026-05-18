@@ -1,0 +1,139 @@
+use serde::Serialize;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SupportLevel {
+    BringUp,
+    Planned,
+    Deferred,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Syscall {
+    pub number: u64,
+    pub name: &'static str,
+    pub subsystem: &'static str,
+    pub support: SupportLevel,
+}
+
+pub fn lookup_aarch64(number: u64) -> Option<&'static Syscall> {
+    AARCH64_SYSCALLS
+        .binary_search_by_key(&number, |syscall| syscall.number)
+        .ok()
+        .map(|index| &AARCH64_SYSCALLS[index])
+}
+
+pub fn aarch64_table() -> &'static [Syscall] {
+    AARCH64_SYSCALLS
+}
+
+const fn syscall(
+    number: u64,
+    name: &'static str,
+    subsystem: &'static str,
+    support: SupportLevel,
+) -> Syscall {
+    Syscall {
+        number,
+        name,
+        subsystem,
+        support,
+    }
+}
+
+const AARCH64_SYSCALLS: &[Syscall] = &[
+    syscall(0, "io_setup", "io", SupportLevel::Deferred),
+    syscall(1, "io_destroy", "io", SupportLevel::Deferred),
+    syscall(2, "io_submit", "io", SupportLevel::Deferred),
+    syscall(3, "io_cancel", "io", SupportLevel::Deferred),
+    syscall(4, "io_getevents", "io", SupportLevel::Deferred),
+    syscall(5, "setxattr", "fs", SupportLevel::Planned),
+    syscall(6, "lsetxattr", "fs", SupportLevel::Planned),
+    syscall(7, "fsetxattr", "fs", SupportLevel::Planned),
+    syscall(8, "getxattr", "fs", SupportLevel::Planned),
+    syscall(9, "lgetxattr", "fs", SupportLevel::Planned),
+    syscall(10, "fgetxattr", "fs", SupportLevel::Planned),
+    syscall(11, "listxattr", "fs", SupportLevel::Planned),
+    syscall(12, "llistxattr", "fs", SupportLevel::Planned),
+    syscall(13, "flistxattr", "fs", SupportLevel::Planned),
+    syscall(14, "removexattr", "fs", SupportLevel::Planned),
+    syscall(15, "lremovexattr", "fs", SupportLevel::Planned),
+    syscall(16, "fremovexattr", "fs", SupportLevel::Planned),
+    syscall(17, "getcwd", "fs", SupportLevel::Planned),
+    syscall(18, "lookup_dcookie", "fs", SupportLevel::Deferred),
+    syscall(19, "eventfd2", "ipc", SupportLevel::Planned),
+    syscall(20, "epoll_create1", "net", SupportLevel::Planned),
+    syscall(21, "epoll_ctl", "net", SupportLevel::Planned),
+    syscall(22, "epoll_pwait", "net", SupportLevel::Planned),
+    syscall(23, "dup", "fs", SupportLevel::Planned),
+    syscall(24, "dup3", "fs", SupportLevel::Planned),
+    syscall(25, "fcntl", "fs", SupportLevel::Planned),
+    syscall(26, "inotify_init1", "fs", SupportLevel::Deferred),
+    syscall(27, "inotify_add_watch", "fs", SupportLevel::Deferred),
+    syscall(28, "inotify_rm_watch", "fs", SupportLevel::Deferred),
+    syscall(29, "ioctl", "fs", SupportLevel::Planned),
+    syscall(30, "ioprio_set", "sched", SupportLevel::Deferred),
+    syscall(31, "ioprio_get", "sched", SupportLevel::Deferred),
+    syscall(32, "flock", "fs", SupportLevel::Planned),
+    syscall(33, "mknodat", "fs", SupportLevel::Planned),
+    syscall(34, "mkdirat", "fs", SupportLevel::Planned),
+    syscall(35, "unlinkat", "fs", SupportLevel::Planned),
+    syscall(36, "symlinkat", "fs", SupportLevel::Planned),
+    syscall(37, "linkat", "fs", SupportLevel::Planned),
+    syscall(38, "renameat", "fs", SupportLevel::Planned),
+    syscall(39, "umount2", "fs", SupportLevel::Deferred),
+    syscall(40, "mount", "fs", SupportLevel::Deferred),
+    syscall(41, "pivot_root", "fs", SupportLevel::Deferred),
+    syscall(42, "nfsservctl", "fs", SupportLevel::Deferred),
+    syscall(43, "statfs", "fs", SupportLevel::Planned),
+    syscall(44, "fstatfs", "fs", SupportLevel::Planned),
+    syscall(45, "truncate", "fs", SupportLevel::Planned),
+    syscall(46, "ftruncate", "fs", SupportLevel::Planned),
+    syscall(47, "fallocate", "fs", SupportLevel::Planned),
+    syscall(48, "faccessat", "fs", SupportLevel::Planned),
+    syscall(49, "chdir", "fs", SupportLevel::Planned),
+    syscall(50, "fchdir", "fs", SupportLevel::Planned),
+    syscall(51, "chroot", "fs", SupportLevel::Deferred),
+    syscall(52, "fchmod", "fs", SupportLevel::Planned),
+    syscall(53, "fchmodat", "fs", SupportLevel::Planned),
+    syscall(54, "fchownat", "fs", SupportLevel::Planned),
+    syscall(55, "fchown", "fs", SupportLevel::Planned),
+    syscall(56, "openat", "fs", SupportLevel::Planned),
+    syscall(57, "close", "fs", SupportLevel::Planned),
+    syscall(58, "vhangup", "tty", SupportLevel::Deferred),
+    syscall(59, "pipe2", "fs", SupportLevel::Planned),
+    syscall(60, "quotactl", "fs", SupportLevel::Deferred),
+    syscall(61, "getdents64", "fs", SupportLevel::Planned),
+    syscall(62, "lseek", "fs", SupportLevel::Planned),
+    syscall(63, "read", "fs", SupportLevel::BringUp),
+    syscall(64, "write", "fs", SupportLevel::BringUp),
+    syscall(65, "readv", "fs", SupportLevel::Planned),
+    syscall(66, "writev", "fs", SupportLevel::Planned),
+    syscall(67, "pread64", "fs", SupportLevel::Planned),
+    syscall(68, "pwrite64", "fs", SupportLevel::Planned),
+    syscall(69, "preadv", "fs", SupportLevel::Planned),
+    syscall(70, "pwritev", "fs", SupportLevel::Planned),
+    syscall(71, "sendfile", "fs", SupportLevel::Planned),
+    syscall(72, "pselect6", "fs", SupportLevel::Planned),
+    syscall(73, "ppoll", "fs", SupportLevel::Planned),
+    syscall(74, "signalfd4", "signal", SupportLevel::Planned),
+    syscall(75, "vmsplice", "fs", SupportLevel::Planned),
+    syscall(76, "splice", "fs", SupportLevel::Planned),
+    syscall(77, "tee", "fs", SupportLevel::Planned),
+    syscall(78, "readlinkat", "fs", SupportLevel::Planned),
+    syscall(79, "newfstatat", "fs", SupportLevel::Planned),
+    syscall(80, "fstat", "fs", SupportLevel::Planned),
+    syscall(81, "sync", "fs", SupportLevel::Planned),
+    syscall(82, "fsync", "fs", SupportLevel::Planned),
+    syscall(83, "fdatasync", "fs", SupportLevel::Planned),
+    syscall(84, "sync_file_range", "fs", SupportLevel::Deferred),
+    syscall(85, "timerfd_create", "time", SupportLevel::Planned),
+    syscall(86, "timerfd_settime", "time", SupportLevel::Planned),
+    syscall(87, "timerfd_gettime", "time", SupportLevel::Planned),
+    syscall(88, "utimensat", "fs", SupportLevel::Planned),
+    syscall(89, "acct", "process", SupportLevel::Deferred),
+    syscall(90, "capget", "process", SupportLevel::Planned),
+    syscall(91, "capset", "process", SupportLevel::Planned),
+    syscall(92, "personality", "process", SupportLevel::Planned),
+    syscall(93, "exit", "process", SupportLevel::BringUp),
+];
