@@ -5301,6 +5301,88 @@ fn mmap_maps_file_bytes_into_guest_memory_arena() {
 }
 
 #[test]
+fn mremap_bootstrap_accepts_shrinking_and_rejects_growth_with_enomem() {
+    const MREMAP_MAYMOVE: u64 = 0x01;
+    let mut memory = AddressSpace::from_segments(
+        0,
+        [(LINUX_MMAP_BASE, rwx_perms(), b"".to_vec(), 0x4000)],
+    )
+    .unwrap();
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    216,
+                    SyscallArgs::from([LINUX_MMAP_BASE, 0x4000, 0x2000, MREMAP_MAYMOVE, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned {
+            value: LINUX_MMAP_BASE as i64,
+        }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    216,
+                    SyscallArgs::from([LINUX_MMAP_BASE, 0x1000, 0x8000, MREMAP_MAYMOVE, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 12 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    216,
+                    SyscallArgs::from([LINUX_MMAP_BASE, 0x1000, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 22 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    216,
+                    SyscallArgs::from([LINUX_MMAP_BASE, 0x1000, 0x2000, 0xdead, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 22 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    216,
+                    SyscallArgs::from([0x1000, 0x1000, 0x2000, MREMAP_MAYMOVE, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 22 }
+    );
+
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
 fn mmap_anonymous_fixed_mapping_zeroes_guest_memory_and_mprotect_munmap_are_noops() {
     let mut memory = AddressSpace::from_segments(
         0,

@@ -195,6 +195,7 @@ const AARCH64_SYSCALLS: &[Syscall] = &[
     syscall(212, "recvmsg", "net", SupportLevel::Planned),
     syscall(214, "brk", "mm", SupportLevel::BringUp),
     syscall(215, "munmap", "mm", SupportLevel::BringUp),
+    syscall(216, "mremap", "mm", SupportLevel::BringUp),
     syscall(220, "clone", "process", SupportLevel::Planned),
     syscall(221, "execve", "process", SupportLevel::Planned),
     syscall(222, "mmap", "mm", SupportLevel::BringUp),
