@@ -2,9 +2,14 @@ use std::fs;
 use std::path::Path;
 
 use crate::dispatch::{GuestMemory, MemoryError};
-use crate::elf::{ElfInspectError, SegmentPerms, plan_elf_load, plan_elf_load_bytes};
+use crate::elf::{ElfInspectError, LoadPlan, SegmentPerms, plan_elf_load, plan_elf_load_bytes};
+use crate::linux_abi::{
+    LINUX_AT_ENTRY, LINUX_AT_NULL, LINUX_AT_PAGESZ, LINUX_AT_PHDR, LINUX_AT_PHENT, LINUX_AT_PHNUM,
+    LINUX_PAGE_SIZE, LinuxAuxvEntry,
+};
 use serde::Serialize;
 use thiserror::Error;
+use zerocopy::IntoBytes;
 
 pub const LINUX_STACK_TOP: u64 = 0x7fff_ffff_0000;
 pub const LINUX_STACK_SIZE: u64 = 1024 * 1024;
@@ -14,6 +19,8 @@ pub struct AddressSpace {
     entry: u64,
     regions: Vec<MemoryRegion>,
     initial_stack_pointer: Option<u64>,
+    #[serde(skip)]
+    linux_auxv: Vec<LinuxAuxvEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -99,10 +106,8 @@ impl AddressSpace {
         Self::load_elf_segments(bytes, plan)
     }
 
-    fn load_elf_segments(
-        file: &[u8],
-        plan: crate::elf::LoadPlan,
-    ) -> Result<Self, AddressSpaceError> {
+    fn load_elf_segments(file: &[u8], plan: LoadPlan) -> Result<Self, AddressSpaceError> {
+        let linux_auxv = linux_auxv_from_load_plan(&plan);
         let mut regions = Vec::with_capacity(plan.segments.len());
 
         for segment in plan.segments {
@@ -155,7 +160,9 @@ impl AddressSpace {
             });
         }
 
-        Self::from_regions(plan.entry, regions)
+        let mut image = Self::from_regions(plan.entry, regions)?;
+        image.linux_auxv = linux_auxv;
+        Ok(image)
     }
 
     pub fn from_segments<I>(entry: u64, segments: I) -> Result<Self, AddressSpaceError>
@@ -212,6 +219,7 @@ impl AddressSpace {
             entry,
             regions,
             initial_stack_pointer: None,
+            linux_auxv: Vec::new(),
         })
     }
 
@@ -246,14 +254,19 @@ impl AddressSpace {
         A: IntoIterator<Item = String>,
         E: IntoIterator<Item = String>,
     {
+        let AddressSpace {
+            entry,
+            regions,
+            linux_auxv,
+            ..
+        } = self;
         let argv = argv.into_iter().collect::<Vec<_>>();
         let env = env.into_iter().collect::<Vec<_>>();
-        let (region, stack_pointer) = build_linux_initial_stack(argv, env, stack_top, stack_size)?;
-        let mut image = Self::from_regions(
-            self.entry,
-            self.regions.into_iter().chain([region]).collect(),
-        )?;
+        let (region, stack_pointer) =
+            build_linux_initial_stack(argv, env, &linux_auxv, stack_top, stack_size)?;
+        let mut image = Self::from_regions(entry, regions.into_iter().chain([region]).collect())?;
         image.initial_stack_pointer = Some(stack_pointer);
+        image.linux_auxv = linux_auxv;
         Ok(image)
     }
 
@@ -275,6 +288,7 @@ impl AddressSpace {
 fn build_linux_initial_stack(
     argv: Vec<String>,
     env: Vec<String>,
+    auxv: &[LinuxAuxvEntry],
     stack_top: u64,
     stack_size: u64,
 ) -> Result<(MemoryRegion, u64), AddressSpaceError> {
@@ -294,27 +308,40 @@ fn build_linux_initial_stack(
     let env_addrs = write_stack_strings(&mut bytes, stack_start, &mut cursor, &env, stack_size)?;
     cursor = align_down_usize(cursor, 16);
 
-    let mut entries = Vec::with_capacity(1 + argv_addrs.len() + 1 + env_addrs.len() + 1 + 2);
+    let mut entries = Vec::with_capacity(1 + argv_addrs.len() + 1 + env_addrs.len() + 1);
     entries.push(argv_addrs.len() as u64);
     entries.extend(argv_addrs);
     entries.push(0);
     entries.extend(env_addrs);
     entries.push(0);
-    entries.push(0);
-    entries.push(0);
 
+    let auxv_len = auxv
+        .len()
+        .checked_add(1)
+        .and_then(|len| len.checked_mul(core::mem::size_of::<LinuxAuxvEntry>()))
+        .ok_or(AddressSpaceError::InitialStackTooLarge { stack_size })?;
     let entries_len = entries
         .len()
         .checked_mul(8)
+        .and_then(|len| len.checked_add(auxv_len))
         .ok_or(AddressSpaceError::InitialStackTooLarge { stack_size })?;
     if cursor < entries_len {
         return Err(AddressSpaceError::InitialStackTooLarge { stack_size });
     }
     let stack_pointer_offset = align_down_usize(cursor - entries_len, 16);
+    let entries_words = entries.len();
     for (index, entry) in entries.into_iter().enumerate() {
         let offset = stack_pointer_offset + index * 8;
         bytes[offset..offset + 8].copy_from_slice(&entry.to_le_bytes());
     }
+    let mut auxv_offset = stack_pointer_offset + entries_words * 8;
+    for entry in auxv.iter().copied() {
+        bytes[auxv_offset..auxv_offset + core::mem::size_of::<LinuxAuxvEntry>()]
+            .copy_from_slice(entry.as_bytes());
+        auxv_offset += core::mem::size_of::<LinuxAuxvEntry>();
+    }
+    bytes[auxv_offset..auxv_offset + core::mem::size_of::<LinuxAuxvEntry>()]
+        .copy_from_slice(LinuxAuxvEntry::new(LINUX_AT_NULL, 0).as_bytes());
 
     Ok((
         MemoryRegion {
@@ -364,6 +391,24 @@ fn write_stack_strings(
 
 fn align_down_usize(value: usize, alignment: usize) -> usize {
     value / alignment * alignment
+}
+
+fn linux_auxv_from_load_plan(plan: &LoadPlan) -> Vec<LinuxAuxvEntry> {
+    let mut auxv = Vec::new();
+    if let Some(phdr) = plan.program_header_address {
+        auxv.push(LinuxAuxvEntry::new(LINUX_AT_PHDR, phdr));
+        auxv.push(LinuxAuxvEntry::new(
+            LINUX_AT_PHENT,
+            u64::from(plan.program_header_entry_size),
+        ));
+        auxv.push(LinuxAuxvEntry::new(
+            LINUX_AT_PHNUM,
+            u64::from(plan.program_header_count),
+        ));
+    }
+    auxv.push(LinuxAuxvEntry::new(LINUX_AT_PAGESZ, LINUX_PAGE_SIZE));
+    auxv.push(LinuxAuxvEntry::new(LINUX_AT_ENTRY, plan.entry));
+    auxv
 }
 
 impl GuestMemory for AddressSpace {

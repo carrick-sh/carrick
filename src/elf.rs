@@ -45,6 +45,9 @@ pub struct ElfMetadata {
 pub struct LoadPlan {
     pub entry: u64,
     pub interpreter: Option<String>,
+    pub program_header_address: Option<u64>,
+    pub program_header_entry_size: u16,
+    pub program_header_count: u16,
     pub segments: Vec<LoadSegment>,
 }
 
@@ -129,7 +132,7 @@ fn metadata_from_elf(elf: &Elf<'_>) -> ElfMetadata {
 }
 
 fn load_plan_from_elf(elf: &Elf<'_>) -> LoadPlan {
-    let segments = elf
+    let segments: Vec<LoadSegment> = elf
         .program_headers
         .iter()
         .filter(|header| header.p_type == PT_LOAD)
@@ -150,6 +153,25 @@ fn load_plan_from_elf(elf: &Elf<'_>) -> LoadPlan {
     LoadPlan {
         entry: elf.entry,
         interpreter: elf.interpreter.map(str::to_owned),
+        program_header_address: program_header_address(elf, &segments),
+        program_header_entry_size: elf.header.e_phentsize,
+        program_header_count: elf.header.e_phnum,
         segments,
     }
+}
+
+fn program_header_address(elf: &Elf<'_>, segments: &[LoadSegment]) -> Option<u64> {
+    let phoff = elf.header.e_phoff;
+    let phsize = u64::from(elf.header.e_phentsize).checked_mul(u64::from(elf.header.e_phnum))?;
+    let phend = phoff.checked_add(phsize)?;
+
+    segments.iter().find_map(|segment| {
+        let file_end = segment.file_offset.checked_add(segment.file_size)?;
+        if phoff >= segment.file_offset && phend <= file_end {
+            let offset_in_segment = phoff - segment.file_offset;
+            segment.virtual_address.checked_add(offset_in_segment)
+        } else {
+            None
+        }
+    })
 }

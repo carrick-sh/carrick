@@ -50,6 +50,19 @@ fn creates_load_plan_for_pt_load_segments() {
     );
 }
 
+#[test]
+fn load_plan_derives_linux_auxv_program_header_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hello");
+    std::fs::write(&path, minimal_aarch64_elf_with_mapped_headers()).unwrap();
+
+    let plan = plan_elf_load(&path).unwrap();
+
+    assert_eq!(plan.program_header_address, Some(0x400040));
+    assert_eq!(plan.program_header_entry_size, 56);
+    assert_eq!(plan.program_header_count, 1);
+}
+
 fn minimal_aarch64_elf() -> Vec<u8> {
     let mut elf = vec![0_u8; 64];
     elf[0..4].copy_from_slice(b"\x7fELF");
@@ -63,6 +76,17 @@ fn minimal_aarch64_elf() -> Vec<u8> {
     elf[24..32].copy_from_slice(&0x400000_u64.to_le_bytes());
     elf[52..54].copy_from_slice(&64_u16.to_le_bytes());
     elf[54..56].copy_from_slice(&56_u16.to_le_bytes());
+    elf
+}
+
+fn minimal_aarch64_elf_with_mapped_headers() -> Vec<u8> {
+    let mut elf = minimal_aarch64_elf_with_load_segment();
+    let len = elf.len() as u64;
+    let ph = 64;
+    elf[ph + 8..ph + 16].copy_from_slice(&0_u64.to_le_bytes());
+    elf[ph + 16..ph + 24].copy_from_slice(&0x400000_u64.to_le_bytes());
+    elf[ph + 32..ph + 40].copy_from_slice(&len.to_le_bytes());
+    elf[ph + 40..ph + 48].copy_from_slice(&len.to_le_bytes());
     elf
 }
 

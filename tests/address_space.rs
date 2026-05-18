@@ -1,5 +1,8 @@
 use carrick::dispatch::{GuestMemory, SyscallDispatcher, SyscallRequest};
 use carrick::elf::SegmentPerms;
+use carrick::linux_abi::{
+    LINUX_AT_ENTRY, LINUX_AT_NULL, LINUX_AT_PAGESZ, LINUX_AT_PHDR, LINUX_AT_PHENT, LINUX_AT_PHNUM,
+};
 use carrick::memory::AddressSpace;
 
 use carrick::compat::{CompatReporter, SyscallArgs};
@@ -79,6 +82,31 @@ fn builds_linux_initial_stack_with_argv_envp_and_auxv() {
 }
 
 #[test]
+fn loaded_elf_initial_stack_includes_linux_auxv() {
+    build_fixture();
+    let artifact = "fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-hello";
+    let image = AddressSpace::load_elf(artifact)
+        .unwrap()
+        .with_linux_initial_stack([artifact.to_owned()], std::iter::empty::<String>())
+        .unwrap();
+    let sp = image.initial_stack_pointer().unwrap();
+    let auxv = read_auxv(&image, sp + 32);
+
+    assert!(auxv.contains(&(LINUX_AT_ENTRY, image.entry())));
+    assert!(
+        auxv.iter()
+            .any(|(tag, value)| *tag == LINUX_AT_PHDR && *value != 0)
+    );
+    assert!(auxv.contains(&(LINUX_AT_PHENT, 56)));
+    assert!(
+        auxv.iter()
+            .any(|(tag, value)| *tag == LINUX_AT_PHNUM && *value > 0)
+    );
+    assert!(auxv.contains(&(LINUX_AT_PAGESZ, 4096)));
+    assert_eq!(auxv.last(), Some(&(LINUX_AT_NULL, 0)));
+}
+
+#[test]
 fn dispatcher_can_write_from_loaded_guest_memory() {
     let mut image = AddressSpace::from_segments(
         0x1000,
@@ -155,6 +183,20 @@ fn read_c_string(image: &AddressSpace, address: u64) -> String {
         }
         bytes.push(byte);
         cursor += 1;
+    }
+}
+
+fn read_auxv(image: &AddressSpace, address: u64) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    let mut cursor = address;
+    loop {
+        let tag = read_u64(image, cursor);
+        let value = read_u64(image, cursor + 8);
+        out.push((tag, value));
+        if tag == LINUX_AT_NULL {
+            return out;
+        }
+        cursor += 16;
     }
 }
 

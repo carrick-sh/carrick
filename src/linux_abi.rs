@@ -9,6 +9,14 @@ pub const LINUX_DT_DIR: u8 = 4;
 pub const LINUX_DT_REG: u8 = 8;
 pub const LINUX_DT_LNK: u8 = 10;
 
+pub const LINUX_AT_NULL: u64 = 0;
+pub const LINUX_AT_PHDR: u64 = 3;
+pub const LINUX_AT_PHENT: u64 = 4;
+pub const LINUX_AT_PHNUM: u64 = 5;
+pub const LINUX_AT_PAGESZ: u64 = 6;
+pub const LINUX_AT_ENTRY: u64 = 9;
+pub const LINUX_PAGE_SIZE: u64 = 4096;
+
 pub const LINUX_DIRENT64_HEADER_SIZE: usize = core::mem::size_of::<LinuxDirent64Header>();
 
 #[repr(C, packed)]
@@ -47,4 +55,27 @@ pub struct LinuxDirent64Header {
     pub d_off: i64,
     pub d_reclen: u16,
     pub d_type: u8,
+}
+
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct LinuxAuxvEntry {
+    pub a_type: u64,
+    pub a_val: u64,
+}
+
+impl LinuxAuxvEntry {
+    pub const fn new(a_type: u64, a_val: u64) -> Self {
+        Self { a_type, a_val }
+    }
+
+    pub fn tag(self) -> u64 {
+        self.a_type
+    }
+
+    pub fn value(self) -> u64 {
+        self.a_val
+    }
 }
