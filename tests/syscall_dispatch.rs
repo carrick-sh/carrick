@@ -1349,6 +1349,62 @@ fn pread64_reads_from_offset_without_changing_file_offset() {
 }
 
 #[test]
+fn preadv_reads_from_offset_across_iovecs_without_changing_file_offset() {
+    let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
+        "etc/motd",
+        b"rootfs says hello\n".as_slice(),
+    )]))])
+    .unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x600]);
+    memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();
+    write_iovecs(
+        &mut memory,
+        0x4100,
+        [LinuxIovec::new(0x4200, 4), LinuxIovec::new(0x4300, 5)],
+    );
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    56,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 3 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(69, SyscallArgs::from([3, 0x4100, 2, 7, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 9 }
+    );
+    assert_eq!(memory.read_bytes(0x4200, 4).unwrap(), b"says");
+    assert_eq!(memory.read_bytes(0x4300, 5).unwrap(), b" hell");
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(63, SyscallArgs::from([3, 0x4400, 4, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 4 }
+    );
+    assert_eq!(memory.read_bytes(0x4400, 4).unwrap(), b"root");
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
 fn sendfile_copies_rootfs_file_to_stdout_and_updates_offset_pointer() {
     let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
         "etc/motd",

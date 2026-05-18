@@ -58,6 +58,7 @@ build_fixture "ppoll_eventfd.rs" "carrick-linux-aarch64-ppoll-eventfd"
 build_fixture "pselect_eventfd.rs" "carrick-linux-aarch64-pselect-eventfd"
 build_fixture "process_bootstrap.rs" "carrick-linux-aarch64-process-bootstrap"
 build_fixture "sendfile_motd.rs" "carrick-linux-aarch64-sendfile-motd"
+build_fixture "preadv_motd.rs" "carrick-linux-aarch64-preadv-motd"
 
 cargo metadata \
   --manifest-path "$fixture_dir/Cargo.toml" \

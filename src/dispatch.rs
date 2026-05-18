@@ -434,6 +434,7 @@ impl SyscallDispatcher {
             65 => self.readv(request, memory)?,
             66 => self.writev(request, memory)?,
             67 => self.pread64(request, memory)?,
+            69 => self.preadv(request, memory)?,
             71 => self.sendfile(request, memory)?,
             72 => self.pselect6(request, memory)?,
             73 => self.ppoll(request, memory)?,
@@ -2208,6 +2209,45 @@ impl SyscallDispatcher {
         } else {
             0
         };
+        Ok(DispatchOutcome::Returned {
+            value: read_len as i64,
+        })
+    }
+
+    fn preadv(
+        &mut self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let fd = request.arg(0) as i32;
+        let iov = request.arg(1);
+        let iovcnt = usize::try_from(request.arg(2))
+            .map_err(|_| DispatchError::LengthTooLarge(request.arg(2)))?;
+        let offset = usize::try_from(request.arg(3))
+            .map_err(|_| DispatchError::LengthTooLarge(request.arg(3)))?;
+        let iovecs = match read_iovecs(memory, iov, iovcnt) {
+            Ok(iovecs) => iovecs,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        let Some(open_file) = self.open_files.get(&fd) else {
+            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+        };
+        let open = open_file.description.borrow();
+        let contents = match &*open {
+            OpenDescription::File { contents, .. }
+            | OpenDescription::SyntheticFile { contents, .. } => contents,
+            OpenDescription::Directory { .. }
+            | OpenDescription::EventFd { .. }
+            | OpenDescription::TimerFd { .. }
+            | OpenDescription::Epoll { .. }
+            | OpenDescription::PipeReader { .. }
+            | OpenDescription::PipeWriter { .. } => {
+                return Ok(DispatchOutcome::Errno {
+                    errno: LINUX_EINVAL,
+                });
+            }
+        };
+        let read_len = read_from_contents_at(memory, contents, offset, &iovecs)?;
         Ok(DispatchOutcome::Returned {
             value: read_len as i64,
         })
