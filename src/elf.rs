@@ -108,7 +108,7 @@ pub struct LoadSegment {
     pub perms: SegmentPerms,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct SegmentPerms {
     pub read: bool,
     pub write: bool,

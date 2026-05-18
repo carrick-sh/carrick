@@ -34,6 +34,8 @@ pub const LINUX_EL1_VECTORS_BASE: u64 = 0x20000;
 pub const LINUX_EL1_VECTORS_SIZE: u64 = 0x4000;
 // AArch64 `eret` opcode, little-endian.
 const AARCH64_ERET_OPCODE: u32 = 0xd69f_03e0;
+// AArch64 `clrex` opcode (clears the local Exclusives monitor).
+const AARCH64_CLREX_OPCODE: u32 = 0xd5033f5f;
 // AArch64 `hvc #0` opcode, used to re-trap from EL1 to HVF.
 const AARCH64_HVC0_OPCODE: u32 = 0xd400_0002;
 // AArch64 `nop` opcode, used as trampoline page padding.
@@ -45,12 +47,12 @@ const AARCH64_VECTOR_SLOT_SIZE: usize = 0x80;
 const AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET: usize = 0x400;
 
 pub const LINUX_HEAP_BASE: u64 = 0x40_0000_0000; // 256 GiB
-pub const LINUX_HEAP_SIZE: u64 = 64 * 1024 * 1024; // 64 MiB
+pub const LINUX_HEAP_SIZE: u64 = 16 * 1024 * 1024; // 16 MiB
 pub const LINUX_MMAP_BASE: u64 = 0x60_0000_0000; // 384 GiB
-pub const LINUX_MMAP_SIZE: u64 = 128 * 1024 * 1024; // 128 MiB
+pub const LINUX_MMAP_SIZE: u64 = 32 * 1024 * 1024; // 32 MiB
 pub const LINUX_INTERPRETER_BASE: u64 = 0x80_0000_0000; // 512 GiB
 pub const LINUX_STACK_TOP: u64 = 0xff_ffff_0000; // just under 1 TiB
-pub const LINUX_STACK_SIZE: u64 = 8 * 1024 * 1024; // 8 MiB
+pub const LINUX_STACK_SIZE: u64 = 2 * 1024 * 1024; // 2 MiB
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AddressSpace {
@@ -539,6 +541,83 @@ fn regions_from_load_plan(
     file: &[u8],
     plan: &LoadPlan,
 ) -> Result<Vec<MemoryRegion>, AddressSpaceError> {
+    // Apple HVF on macOS 26 mis-translates stage-2 page tables when an ELF
+    // image is split into multiple non-contiguous mappings within the same
+    // ~1 MiB block (Alpine's `ld-musl-aarch64.so.1` r-x text at 0x0 and r-w
+    // data at 0xbfb00 reproduces this — second segment's pages report
+    // DFSC=0x35, "external abort on TT walk, level 1"). Collapse a plan's
+    // PT_LOAD segments into one contiguous region per image whenever they
+    // sit within a small window of each other. Permissions widen to the
+    // union of the segments' perms (we then escalate to RWX in
+    // `hvf_perms` anyway), and gaps are zero-padded in the host buffer.
+    const MERGE_WINDOW: u64 = 16 * 1024 * 1024;
+
+    if plan.segments.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let min_start = plan
+        .segments
+        .iter()
+        .map(|seg| seg.virtual_address)
+        .min()
+        .expect("non-empty segments");
+    let max_end = plan
+        .segments
+        .iter()
+        .map(|seg| seg.virtual_address.wrapping_add(seg.memory_size))
+        .max()
+        .expect("non-empty segments");
+    if max_end.saturating_sub(min_start) <= MERGE_WINDOW {
+        let total_size_u64 = max_end
+            .checked_sub(min_start)
+            .ok_or(AddressSpaceError::RegionOverflow {
+                start: min_start,
+                size: 0,
+            })?;
+        let total_size = usize::try_from(total_size_u64)
+            .map_err(|_| AddressSpaceError::RegionTooLarge(total_size_u64))?;
+        let mut bytes = vec![0_u8; total_size];
+        let mut merged_perms = SegmentPerms::default();
+        for segment in &plan.segments {
+            merged_perms.read |= segment.perms.read;
+            merged_perms.write |= segment.perms.write;
+            merged_perms.execute |= segment.perms.execute;
+            let file_offset = usize::try_from(segment.file_offset).map_err(|_| {
+                AddressSpaceError::SegmentBeyondFile {
+                    virtual_address: segment.virtual_address,
+                }
+            })?;
+            let file_size = usize::try_from(segment.file_size).map_err(|_| {
+                AddressSpaceError::SegmentBeyondFile {
+                    virtual_address: segment.virtual_address,
+                }
+            })?;
+            let file_end = file_offset.checked_add(file_size).ok_or(
+                AddressSpaceError::SegmentBeyondFile {
+                    virtual_address: segment.virtual_address,
+                },
+            )?;
+            if file_end > file.len() {
+                return Err(AddressSpaceError::SegmentBeyondFile {
+                    virtual_address: segment.virtual_address,
+                });
+            }
+            let offset_in_region = usize::try_from(
+                segment.virtual_address.wrapping_sub(min_start),
+            )
+            .map_err(|_| AddressSpaceError::RegionTooLarge(total_size_u64))?;
+            bytes[offset_in_region..offset_in_region + file_size]
+                .copy_from_slice(&file[file_offset..file_end]);
+        }
+        return Ok(vec![MemoryRegion {
+            start: min_start,
+            end: max_end,
+            perms: merged_perms,
+            bytes,
+        }]);
+    }
+
     let mut regions = Vec::with_capacity(plan.segments.len());
 
     for segment in &plan.segments {
@@ -604,10 +683,17 @@ fn regions_from_load_plan(
 pub fn el0_trampoline_bytes() -> Vec<u8> {
     let size = LINUX_EL0_TRAMPOLINE_SIZE as usize;
     let mut bytes = vec![0_u8; size];
+    // Clear the local exclusives monitor before dropping to EL0. Musl's
+    // pthread_mutex_lock fast path executes `ldaxr` on its first lock,
+    // which on Apple Silicon HVF takes an external abort if the
+    // exclusives monitor is in an unexpected reset state. `clrex` puts
+    // it into a known-empty state before user code runs.
+    let clrex = AARCH64_CLREX_OPCODE.to_le_bytes();
+    bytes[..clrex.len()].copy_from_slice(&clrex);
     let eret = AARCH64_ERET_OPCODE.to_le_bytes();
-    bytes[..eret.len()].copy_from_slice(&eret);
+    bytes[clrex.len()..clrex.len() + eret.len()].copy_from_slice(&eret);
     let nop = AARCH64_NOP_OPCODE.to_le_bytes();
-    let mut offset = eret.len();
+    let mut offset = clrex.len() + eret.len();
     while offset + nop.len() <= size {
         bytes[offset..offset + nop.len()].copy_from_slice(&nop);
         offset += nop.len();

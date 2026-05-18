@@ -1,0 +1,77 @@
+# Standard lldb breakpoints + convenience commands for debugging Carrick's
+# HVF trap loop and dispatcher. Source this with `lldb -s scripts/carrick.lldb`
+# or `(lldb) command source scripts/carrick.lldb`.
+#
+# Convenience commands (defined at the bottom):
+#   carrick-regs       — dump (PC, ELR_EL1, SPSR_EL1, FAR_EL1, ESR_EL1,
+#                        SP_EL0, X0..X8) at the current stop
+#   carrick-bt         — backtrace skipping libsystem frames
+#   carrick-mappings   — print the active HvfMappedRegion vector
+#   carrick-hvf-state  — combined dump for HVF debugging
+#
+# Use `breakpoint disable` / `enable` to toggle individual stop points.
+
+# Stop when an HVF mapping fails or an unexpected exit fires.
+breakpoint set --name carrick::trap::HvfTrapEngine::map_address_space --auto-continue 1
+breakpoint set --name carrick::trap::HvfTrapEngine::run_until_syscall --auto-continue 1
+
+# The really interesting breakpoints — stop on unexpected exits and on the
+# specific HVF error paths.
+breakpoint set --name carrick::trap::hvf_error
+breakpoint set --name carrick::trap::TrapError
+
+# Catch unhandled signals in the child (SIGSEGV, SIGABRT, SIGBUS).
+process handle SIGABRT --stop true --pass true --notify true
+process handle SIGSEGV --stop true --pass true --notify true
+process handle SIGBUS  --stop true --pass true --notify true
+
+# Common assertion/abort points — useful when HVF panics inside libsystem.
+breakpoint set --name abort
+breakpoint set --name __assert_rtn
+
+# ----- convenience commands ------------------------------------------------
+
+command alias carrick-regs   register read pc sp x0 x1 x2 x3 x4 x5 x6 x7 x8 x9 x10 x11 x12 x13 x14 x15 x16 x17 x18 x19 x20 x21 x22 x23 x24 x25 x26 x27 x28 x29 x30
+command alias carrick-bt     thread backtrace --count 24
+command alias carrick-mappings frame variable -P 5 self.inner.mappings
+
+command script add -h "Dump (PC, ELR_EL1, SPSR_EL1, FAR_EL1, ESR_EL1, SP_EL0) for the current HVF vCPU" -f carrick.dump_hvf_state carrick-hvf-state
+
+# ----- python helper for carrick-hvf-state --------------------------------
+script
+
+import lldb
+
+def dump_hvf_state(debugger, command, result, internal_dict):
+    """Print the AArch64 vCPU state that matters for trap debugging."""
+    target = debugger.GetSelectedTarget()
+    process = target.GetProcess() if target else None
+    if not process or not process.IsValid():
+        result.AppendMessage("no process")
+        return
+    thread = process.GetSelectedThread()
+    frame = thread.GetSelectedFrame() if thread else None
+    if not frame or not frame.IsValid():
+        result.AppendMessage("no frame")
+        return
+
+    # Try to find the HvfTrapEngine's vcpu through `self.inner.vcpu` in the
+    # current frame. Many frames in the trap loop have `self` as
+    # &HvfTrapEngine or similar.
+    for var_name in ("self", "engine", "inner"):
+        var = frame.FindVariable(var_name)
+        if var.IsValid():
+            result.AppendMessage(f"frame has `{var_name}`: {var.GetTypeName()}")
+
+    result.AppendMessage("--- vCPU registers (via host-side getter — exact values depend on frame) ---")
+    debugger.HandleCommand("register read pc sp")
+    debugger.HandleCommand("register read x0 x1 x2 x3 x4 x5 x6 x7 x8 x29 x30")
+    result.AppendMessage("--- For HVF guest state, prefer CARRICK_TRACE_REGS=1 ---")
+
+# (end script)
+end
+
+# Quiet noisy linker warnings inside lldb itself.
+settings set target.x86-disassembly-flavor intel
+settings set target.skip-prologue true
+settings set frame-format "frame #${frame.index}: ${ansi.fg.green}${frame.pc}${ansi.normal}${module.file.basename}`${function.name-with-args}${function.pc-offset} at ${ansi.fg.cyan}${line.file.basename}:${line.number}${ansi.normal}\n"
