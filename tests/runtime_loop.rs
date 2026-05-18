@@ -5,7 +5,7 @@ use carrick::dispatch::{Aarch64SyscallFrame, GuestMemory, LinearMemory, SyscallD
 use carrick::memory::AddressSpace;
 use carrick::rootfs::{LayerSource, RootFs};
 use carrick::runtime::{
-    RuntimeError, SyscallTrap, run_syscall_loop, run_syscall_loop_with_dispatcher,
+    SyscallTrap, run_syscall_loop, run_syscall_loop_with_dispatcher,
 };
 use carrick::trap::TrapError;
 use flate2::Compression;
@@ -66,12 +66,11 @@ fn runtime_loop_stops_when_guest_never_exits() {
         x8: 64,
     }]);
 
-    let err = run_syscall_loop(&mut memory, &mut trap, 0).unwrap_err();
+    let result = run_syscall_loop(&mut memory, &mut trap, 0).unwrap();
 
-    assert!(matches!(
-        err,
-        RuntimeError::TrapLimitExceeded { max_traps: 0 }
-    ));
+    assert!(result.trap_limit_hit);
+    assert_eq!(result.exit_code, -1);
+    assert_eq!(result.traps, 0);
 }
 
 #[test]
