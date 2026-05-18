@@ -33,6 +33,7 @@ pub const LINUX_EEXIST: i32 = 17;
 pub const LINUX_EPIPE: i32 = 32;
 pub const LINUX_ESPIPE: i32 = 29;
 pub const LINUX_EROFS: i32 = 30;
+pub const LINUX_ENOTSUP: i32 = 95;
 pub const LINUX_FALLOC_FL_KEEP_SIZE: u64 = 0x01;
 pub const LINUX_FALLOC_FL_PUNCH_HOLE: u64 = 0x02;
 pub const LINUX_FALLOC_FL_COLLAPSE_RANGE: u64 = 0x08;
@@ -468,6 +469,7 @@ impl SyscallDispatcher {
         });
 
         let outcome = match request.number {
+            5..=16 => self.xattr_unsupported(),
             17 => self.getcwd(request, memory)?,
             19 => self.eventfd2(request),
             20 => self.epoll_create1(request),
@@ -3141,6 +3143,12 @@ impl SyscallDispatcher {
 
     fn sync(&self) -> DispatchOutcome {
         DispatchOutcome::Returned { value: 0 }
+    }
+
+    fn xattr_unsupported(&self) -> DispatchOutcome {
+        DispatchOutcome::Errno {
+            errno: LINUX_ENOTSUP,
+        }
     }
 
     fn fsync(&self, request: SyscallRequest) -> DispatchOutcome {

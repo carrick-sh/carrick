@@ -4885,6 +4885,31 @@ fn truncate_bootstrap_returns_erofs_for_known_paths_and_enoent_for_missing() {
 }
 
 #[test]
+fn xattr_family_bootstrap_returns_enotsup_for_every_call() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
+    memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();
+    memory.write_bytes(0x4020, b"user.test\0").unwrap();
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    for number in 5..=16 {
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    SyscallRequest::new(number, SyscallArgs::from([0x4000, 0x4020, 0, 0, 0, 0])),
+                    &mut memory,
+                    &mut reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::Errno { errno: 95 },
+            "syscall {number} should return ENOTSUP"
+        );
+    }
+
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
 fn fallocate_bootstrap_reports_read_only_rootfs_and_validates_arguments() {
     let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
         "etc/motd",

@@ -32,7 +32,9 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
 - `carrick compat-report -- <cmd>` emits the machine-parseable compatibility report
   shape that runtime hooks will populate.
 - `carrick dispatch-syscall <nr> --args ...` exercises the host-side syscall
-  dispatcher that the HVF trap loop will call; `getcwd(2)`, `faccessat(2)`,
+  dispatcher that the HVF trap loop will call; `getcwd(2)`, the xattr family
+  (`{set,lset,fset,get,lget,fget,list,llist,flist,remove,lremove,fremove}xattr(2)`
+  all bootstrapping to `ENOTSUP`), `faccessat(2)`,
   `faccessat2(2)`, `chdir(2)`, `fchdir(2)`, `eventfd2(2)`, `epoll_create1(2)`,
   `epoll_ctl(2)`, `epoll_pwait(2)`, `openat(2)`, `openat2(2)`, `dup(2)`,
   `dup3(2)`, `fcntl(2)`, `flock(2)`, `truncate(2)`, `ftruncate(2)`, `fallocate(2)`,

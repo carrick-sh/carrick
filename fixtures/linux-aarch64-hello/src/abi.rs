@@ -3,6 +3,9 @@
 use core::arch::asm;
 use core::panic::PanicInfo;
 
+pub const SYS_SETXATTR: u64 = 5;
+pub const SYS_GETXATTR: u64 = 8;
+pub const SYS_LISTXATTR: u64 = 11;
 pub const SYS_GETCWD: u64 = 17;
 pub const SYS_MKNODAT: u64 = 33;
 pub const SYS_MKDIRAT: u64 = 34;
@@ -41,6 +44,7 @@ pub const EINVAL: i64 = -22;
 pub const ESPIPE: i64 = -29;
 pub const EROFS: i64 = -30;
 pub const EEXIST: i64 = -17;
+pub const ENOTSUP: i64 = -95;
 
 pub const UTIME_NOW: i64 = (1 << 30) - 1;
 pub const UTIME_OMIT: i64 = (1 << 30) - 2;

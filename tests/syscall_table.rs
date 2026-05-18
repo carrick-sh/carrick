@@ -76,6 +76,18 @@ fn names_linux_aarch64_bringup_syscalls() {
     assert_eq!(madvise.support, SupportLevel::BringUp);
 
     for (number, name) in [
+        (5, "setxattr"),
+        (6, "lsetxattr"),
+        (7, "fsetxattr"),
+        (8, "getxattr"),
+        (9, "lgetxattr"),
+        (10, "fgetxattr"),
+        (11, "listxattr"),
+        (12, "llistxattr"),
+        (13, "flistxattr"),
+        (14, "removexattr"),
+        (15, "lremovexattr"),
+        (16, "fremovexattr"),
         (19, "eventfd2"),
         (20, "epoll_create1"),
         (21, "epoll_ctl"),
