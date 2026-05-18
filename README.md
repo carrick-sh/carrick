@@ -65,7 +65,8 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
   `clock_nanosleep(2)`, `gettimeofday(2)`, `prlimit64(2)`, `getrandom(2)`,
   `membarrier(2)` capability queries, clean `rseq(2)` fallback, process
   capability probes, scheduler affinity/yield and `getcpu(2)` probes,
-  `prctl(2)` process controls, `personality(2)`, and minimal `rt_sigaction(2)`/
+  `prctl(2)` process controls, `personality(2)`, `setpgid(2)`/`getpgid(2)`/
+  `setsid(2)`/`getsid(2)` single-session bootstrap, and minimal `rt_sigaction(2)`/
   `rt_sigprocmask(2)` stubs.
 - Linux ABI outputs for `stat`, `statx`, `statfs`, `getdents64`, `iovec`,
   `eventfd` counters, `timerfd` timers and expiration counts, `epoll_event`,

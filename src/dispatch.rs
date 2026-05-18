@@ -544,6 +544,10 @@ impl SyscallDispatcher {
             124 => self.sched_yield(),
             134 => self.rt_sigaction(request, memory),
             135 => self.rt_sigprocmask(request, memory)?,
+            154 => self.setpgid(request),
+            155 => self.getpgid(request),
+            156 => self.getsid(request),
+            157 => self.setsid(),
             160 => self.uname(request, memory),
             167 => self.prctl(request, memory),
             168 => self.getcpu(request, memory),
@@ -2058,6 +2062,40 @@ impl SyscallDispatcher {
         DispatchOutcome::Returned {
             value: std::process::id() as i64,
         }
+    }
+
+    fn setpgid(&self, request: SyscallRequest) -> DispatchOutcome {
+        let pid = request.arg(0) as i32;
+        let pgid = i32::from_ne_bytes((request.arg(1) as u32).to_ne_bytes());
+        if pgid < 0 {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+        if pid != 0 && pid != 1 {
+            return DispatchOutcome::Errno { errno: LINUX_ESRCH };
+        }
+        DispatchOutcome::Returned { value: 0 }
+    }
+
+    fn getpgid(&self, request: SyscallRequest) -> DispatchOutcome {
+        let pid = request.arg(0) as i32;
+        if pid != 0 && pid != 1 {
+            return DispatchOutcome::Errno { errno: LINUX_ESRCH };
+        }
+        DispatchOutcome::Returned { value: 1 }
+    }
+
+    fn getsid(&self, request: SyscallRequest) -> DispatchOutcome {
+        let pid = request.arg(0) as i32;
+        if pid != 0 && pid != 1 {
+            return DispatchOutcome::Errno { errno: LINUX_ESRCH };
+        }
+        DispatchOutcome::Returned { value: 1 }
+    }
+
+    fn setsid(&self) -> DispatchOutcome {
+        DispatchOutcome::Returned { value: 1 }
     }
 
     fn openat(
