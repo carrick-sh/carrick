@@ -70,37 +70,84 @@ STLXR) is one of them. So the syndrome shape is consistent with
 "LDAXR on stage-2-mapped guest memory takes an external abort on
 this Apple Silicon HVF configuration."
 
-## Hypotheses
+## Root cause (confirmed)
 
-1. **Memory attribute mismatch.** ARMv8 requires exclusive memory
-   accesses to land on *Normal cacheable inner-write-back* memory.
-   Apple HVF's default stage-2 mapping memory type may be Normal but
-   the inner/outer cacheability attributes might be set such that
-   LDAXR is "unpredictable" or aborts. The applevisor crate exposes
-   only `MemPerms` (R/W/X bits), not memory-attribute control —
-   `hv_vm_map` doesn't take a `MAIR` index.
+Per ARMv8-A architectural rules, **when stage-1 MMU is disabled
+(SCTLR_EL1.M=0), all data accesses are forced to use the
+"Device-nGnRnE" memory type.** Exclusive load/store operations
+(LDXR, LDAXR, STXR, STLXR) on Device memory are *prohibited* by
+the architecture and produce an external abort — exactly the
+`ESR_EL1 = 0x92000035` (DFSC=0x35, external abort on TT walk) we
+observe.
 
-2. **Exclusive monitor not configured.** AArch64 exclusive
-   instructions require the exclusive monitor to be in a particular
-   state on the executing CPU. Some HVF guests need the guest kernel
-   to issue `CLREX` early; without it, the first LDAXR is implementation-
-   defined behaviour. We don't issue CLREX from our EL0 trampoline.
+Carrick's bootstrap deliberately leaves stage-1 off (`SCTLR_EL1=0`
+at vCPU init) to keep the guest's IPA equal to its VA — we don't
+have page tables. Apple HVF inherits this constraint: every EL0
+data access is treated as Device. The first `ldaxr` in musl's
+pthread_mutex_lock fast path immediately aborts.
 
-3. **Apple Silicon E-core vs P-core scheduling.** HVF can migrate
-   vCPUs between cores; exclusive monitor state is per-core. A
-   migration between LDAXR and its paired STLXR causes the
-   exclusive to fail repeatedly — but this is typically an "exclusive
-   failed → retry" loop, not an external abort.
+### What we tried, and what it doesn't fix
 
-4. **HVF refuses LDAXR on stage-2 memory created via `hv_vm_map`.**
-   This would be an Apple bug. Apple Silicon HVF is known to have
-   restrictions on what instructions guests can run; the default
-   `HV_VM_CONFIG` does not enable nested virt or some other features
-   guests may want.
+| Change                                  | Result                                  |
+|-----------------------------------------|------------------------------------------|
+| Merge musl's two PT_LOAD segments       | Mapping covers the fault address.       |
+|                                         | Fault unchanged.                        |
+| `clrex` in EL0 trampoline before `eret` | Monitor in a known state.               |
+|                                         | Fault unchanged.                        |
+| SCTLR_EL1.C=1, I=1 (cache enable bits)  | No effect — caches are inert without MMU. |
+|                                         | Fault unchanged.                        |
+| Bigger HVF mapping (one 768K region)    | Same.                                   |
+|                                         | Fault unchanged.                        |
+| Bigger HVF page (16K → 64K)             | Same.                                   |
+|                                         | Fault unchanged.                        |
 
-Of these, (1) and (4) are the most plausible. (2) is testable by
-adding `clrex` to the EL0 trampoline. (3) seems unlikely given the
-fault is deterministic, not intermittent.
+## The fix that *would* work
+
+**Set `HCR_EL2.DC = 1`.** This bit forces all stage-1 EL0/EL1
+data accesses to be treated as Normal Inner Shareable WB cacheable
+memory when stage-1 is disabled, even though the architectural
+default is Device. Exclusive accesses on Normal memory are well-
+defined.
+
+`HCR_EL2` is **only writable from EL2**. In Apple's HVF stack,
+EL2 is the hypervisor itself; the guest can't touch HCR_EL2 from
+EL1. The `applevisor` crate exposes `SysReg::HCR_EL2`, but per
+the source comment "this register is only available if EL2 was
+enabled in the VM configuration," and the `set_el2_enabled`
+config flag is gated behind the `macos-15-0` cargo feature.
+
+We currently use `macos-13-0` features (the minimum that gives
+us `set_ipa_size`). Upgrading to `macos-15-0` and enabling EL2
+in the VM config is one path forward.
+
+## Alternative fixes
+
+1. **Build stage-1 page tables.** Identity-map the guest IPA window
+   with `MAIR_EL1` index 0 = Normal cacheable, set `TCR_EL1`, set
+   `TTBR0_EL1`, then `SCTLR_EL1.M = 1`. The guest sees the same
+   virtual layout it had before, but now `ldaxr` works. ~200 lines
+   of additional setup code, no Apple feature requirement.
+
+2. **Enable EL2 + set HCR_EL2.DC.** Switch the `applevisor` crate
+   to `macos-15-0`, call `set_el2_enabled(true)` on the VM config,
+   then `vcpu.set_sys_reg(HCR_EL2, ...)` in `map_plan`. Adds an
+   Apple-version dependency but is much smaller code-wise.
+
+3. **Patch musl at load time.** Replace `ldaxr`/`stlxr` pairs with
+   non-exclusive `ldr`/`str` equivalents wrapped in a host-side
+   spinlock. Fragile and slow.
+
+4. **Use static-musl binaries that don't issue exclusives at
+   startup.** Static `busybox` binaries from a different builder
+   may avoid the early pthread path; testing required.
+
+## Next debugging step
+
+Stage-1 page tables (option 1) is the right answer because it's
+self-contained and works on any macOS HVF version. Building a
+single-level identity map for a 1 TiB IPA window with one MAIR
+index is ~100 lines of Rust to construct the table + a few sysreg
+writes.
 
 ## Next debugging step
 
