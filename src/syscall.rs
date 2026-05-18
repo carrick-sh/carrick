@@ -88,7 +88,7 @@ const AARCH64_SYSCALLS: &[Syscall] = &[
     syscall(43, "statfs", "fs", SupportLevel::BringUp),
     syscall(44, "fstatfs", "fs", SupportLevel::BringUp),
     syscall(45, "truncate", "fs", SupportLevel::Planned),
-    syscall(46, "ftruncate", "fs", SupportLevel::Planned),
+    syscall(46, "ftruncate", "fs", SupportLevel::BringUp),
     syscall(47, "fallocate", "fs", SupportLevel::Planned),
     syscall(48, "faccessat", "fs", SupportLevel::BringUp),
     syscall(49, "chdir", "fs", SupportLevel::BringUp),

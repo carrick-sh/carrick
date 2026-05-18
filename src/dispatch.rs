@@ -464,6 +464,7 @@ impl SyscallDispatcher {
             32 => self.flock(request),
             43 => self.statfs(request, memory)?,
             44 => self.fstatfs(request, memory),
+            46 => self.ftruncate(request),
             48 => self.faccessat(request, memory)?,
             49 => self.chdir(request, memory)?,
             50 => self.fchdir(request),
@@ -1487,6 +1488,35 @@ impl SyscallDispatcher {
             return DispatchOutcome::Errno { errno: LINUX_EBADF };
         }
         write_statfs(memory, request.arg(1))
+    }
+
+    fn ftruncate(&self, request: SyscallRequest) -> DispatchOutcome {
+        let fd = request.arg(0) as i32;
+        let length = i64::from_ne_bytes(request.arg(1).to_ne_bytes());
+        if length < 0 {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+        if is_stdio_fd(fd) {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+        let Some(open_file) = self.open_files.get(&fd) else {
+            return DispatchOutcome::Errno { errno: LINUX_EBADF };
+        };
+        let open = open_file.description.borrow();
+        let errno = match &*open {
+            OpenDescription::File { .. } | OpenDescription::SyntheticFile { .. } => LINUX_EBADF,
+            OpenDescription::Directory { .. } => LINUX_EISDIR,
+            OpenDescription::PipeReader { .. }
+            | OpenDescription::PipeWriter { .. }
+            | OpenDescription::EventFd { .. }
+            | OpenDescription::TimerFd { .. }
+            | OpenDescription::Epoll { .. } => LINUX_EINVAL,
+        };
+        DispatchOutcome::Errno { errno }
     }
 
     fn capget(&self, request: SyscallRequest, memory: &mut impl GuestMemory) -> DispatchOutcome {
