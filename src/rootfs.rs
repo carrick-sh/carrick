@@ -20,7 +20,7 @@ pub enum LayerSource {
 pub struct RootFs {
     files: HashMap<PathBuf, FileEntry>,
     directories: HashSet<PathBuf>,
-    symlinks: HashMap<PathBuf, PathBuf>,
+    symlinks: HashMap<PathBuf, SymlinkEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -30,6 +30,13 @@ pub struct FileEntry {
     pub size: usize,
     #[serde(skip)]
     contents: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SymlinkEntry {
+    path: PathBuf,
+    target: PathBuf,
+    target_text: String,
 }
 
 impl FileEntry {
@@ -132,6 +139,14 @@ impl RootFs {
         Ok(String::from_utf8(self.read(path)?)?)
     }
 
+    pub fn read_link(&self, path: impl AsRef<Path>) -> Result<String, RootFsError> {
+        let path = normalize_rootfs_path(path.as_ref())?;
+        self.symlinks
+            .get(&path)
+            .map(|entry| entry.target_text.clone())
+            .ok_or_else(|| RootFsError::NotFound(display_rootfs_path(&path)))
+    }
+
     pub fn list_dir(&self, path: impl AsRef<Path>) -> Result<Vec<String>, RootFsError> {
         let dir = normalize_rootfs_path(path.as_ref())?;
         if !self.directories.contains(&dir) {
@@ -229,8 +244,19 @@ impl RootFs {
                     .link_name()?
                     .ok_or_else(|| RootFsError::UnsafePath(path.display().to_string()))?
                     .into_owned();
+                let target_text = target
+                    .to_str()
+                    .ok_or_else(|| RootFsError::UnsafePath(path.display().to_string()))?
+                    .to_owned();
                 let target = normalize_symlink_target(&path, &target)?;
-                self.symlinks.insert(path, target);
+                self.symlinks.insert(
+                    path.clone(),
+                    SymlinkEntry {
+                        path,
+                        target,
+                        target_text,
+                    },
+                );
                 continue;
             }
 
@@ -290,7 +316,7 @@ impl RootFs {
         }
 
         match self.symlinks.get(path) {
-            Some(target) => self.resolve_symlink(target, depth + 1),
+            Some(target) => self.resolve_symlink(&target.target, depth + 1),
             None => Ok(path.to_path_buf()),
         }
     }
@@ -319,7 +345,7 @@ impl RootFs {
                 path: path.to_path_buf(),
                 kind: RootFsEntryKind::Symlink,
                 mode: 0o777,
-                size: target.as_os_str().len(),
+                size: target.target_text.len(),
             });
         }
 

@@ -8,8 +8,7 @@ use carrick::memory::AddressSpace;
 use carrick::oci::{ImageReference, ImageStore, pull_image};
 use carrick::rootfs::RootFs;
 use carrick::runtime::{
-    DEFAULT_MAX_TRAPS, run_rootfs_elf_with_hvf_args_and_dispatcher,
-    run_static_elf_with_hvf_args_and_dispatcher,
+    DEFAULT_MAX_TRAPS, run_rootfs_elf_with_hvf_args, run_static_elf_with_hvf_args_and_dispatcher,
 };
 use carrick::syscall::{aarch64_table, lookup_aarch64};
 use carrick::trap::hvf_capabilities;
@@ -201,10 +200,9 @@ async fn main() -> anyhow::Result<()> {
             let rootfs = RootFs::from_layer_paths(&rootfs_layers)
                 .context("failed to compose image rootfs layers")?;
             let executable_path = &command[0];
-            let result = run_rootfs_elf_with_hvf_args_and_dispatcher(
+            let result = run_rootfs_elf_with_hvf_args(
                 executable_path.as_str(),
                 &rootfs,
-                SyscallDispatcher::with_rootfs(rootfs.clone()),
                 command.clone(),
                 std::iter::empty(),
                 DEFAULT_MAX_TRAPS,

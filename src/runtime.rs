@@ -117,6 +117,31 @@ where
     run_address_space_with_hvf_and_dispatcher(image, dispatcher, max_traps)
 }
 
+pub fn run_rootfs_elf_with_hvf_args<A, E>(
+    path: impl AsRef<Path>,
+    rootfs: &RootFs,
+    argv: A,
+    env: E,
+    max_traps: usize,
+) -> Result<RunResult, RuntimeError>
+where
+    A: IntoIterator<Item = String>,
+    E: IntoIterator<Item = String>,
+{
+    let path = path.as_ref();
+    run_rootfs_elf_with_hvf_args_and_dispatcher(
+        path,
+        rootfs,
+        SyscallDispatcher::with_rootfs_and_executable(
+            rootfs.clone(),
+            path.to_string_lossy().into_owned(),
+        ),
+        argv,
+        env,
+        max_traps,
+    )
+}
+
 fn run_address_space_with_hvf_and_dispatcher(
     image: AddressSpace,
     dispatcher: SyscallDispatcher,

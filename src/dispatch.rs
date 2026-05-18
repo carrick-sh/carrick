@@ -178,6 +178,7 @@ pub struct SyscallDispatcher {
     cwd: String,
     brk_current: u64,
     mmap_next: u64,
+    executable_path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,12 +214,21 @@ impl SyscallDispatcher {
             cwd: "/".to_owned(),
             brk_current: LINUX_HEAP_BASE,
             mmap_next: LINUX_MMAP_BASE,
+            executable_path: "/proc/self/exe".to_owned(),
         }
     }
 
     pub fn with_rootfs(rootfs: RootFs) -> Self {
         Self {
             rootfs: Some(rootfs),
+            ..Self::new()
+        }
+    }
+
+    pub fn with_rootfs_and_executable(rootfs: RootFs, executable_path: impl Into<String>) -> Self {
+        Self {
+            rootfs: Some(rootfs),
+            executable_path: executable_path.into(),
             ..Self::new()
         }
     }
@@ -261,6 +271,7 @@ impl SyscallDispatcher {
             62 => self.lseek(request),
             63 => self.read(request, memory)?,
             64 => self.write(request, memory)?,
+            78 => self.readlinkat(request, memory)?,
             79 => self.newfstatat(request, memory)?,
             80 => self.fstat(request, memory),
             93 => self.exit(request),
@@ -940,6 +951,61 @@ impl SyscallDispatcher {
 
         Ok(DispatchOutcome::Returned {
             value: length as i64,
+        })
+    }
+
+    fn readlinkat(
+        &self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let dirfd = request.arg(0);
+        let pathname = request.arg(1);
+        let buffer = request.arg(2);
+        let buffer_size = usize::try_from(request.arg(3))
+            .map_err(|_| DispatchError::LengthTooLarge(request.arg(3)))?;
+        if buffer_size == 0 {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            });
+        }
+
+        let path = match read_guest_c_string(memory, pathname) {
+            Ok(path) => path,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        let path = match self.resolve_at_path(dirfd, &path) {
+            Ok(path) => path,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+
+        let target = if path == "/proc/self/exe" || path == "/proc/curproc/exe" {
+            self.executable_path.clone()
+        } else {
+            let Some(rootfs) = &self.rootfs else {
+                return Ok(DispatchOutcome::Errno {
+                    errno: LINUX_ENOENT,
+                });
+            };
+            match rootfs.read_link(&path) {
+                Ok(target) => target,
+                Err(errno) => {
+                    return Ok(DispatchOutcome::Errno {
+                        errno: rootfs_errno(errno),
+                    });
+                }
+            }
+        };
+
+        let bytes = target.as_bytes();
+        let written = bytes.len().min(buffer_size);
+        if memory.write_bytes(buffer, &bytes[..written]).is_err() {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EFAULT,
+            });
+        }
+        Ok(DispatchOutcome::Returned {
+            value: written as i64,
         })
     }
 

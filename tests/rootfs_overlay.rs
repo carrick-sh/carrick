@@ -64,6 +64,17 @@ fn follows_relative_symlinks_within_rootfs() {
 }
 
 #[test]
+fn read_link_preserves_symlink_target_text() {
+    let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar_with_links(
+        [("bin/busybox", b"busybox".as_slice())],
+        [("bin/sh", "busybox")],
+    ))])
+    .unwrap();
+
+    assert_eq!(rootfs.read_link("/bin/sh").unwrap(), "busybox");
+}
+
+#[test]
 fn rejects_paths_that_escape_root() {
     let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
         "safe.txt",

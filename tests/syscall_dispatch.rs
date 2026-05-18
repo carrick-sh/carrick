@@ -407,6 +407,75 @@ fn lseek_repositions_rootfs_file_reads() {
 }
 
 #[test]
+fn readlinkat_reads_rootfs_symlink_target_without_nul() {
+    let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar_with_links(
+        [("lib/ld-musl-aarch64.so.1", b"loader".as_slice())],
+        [("lib/ld-linux-aarch64.so.1", "ld-musl-aarch64.so.1")],
+    ))])
+    .unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0xff; 0x200]);
+    memory
+        .write_bytes(0x4000, b"/lib/ld-linux-aarch64.so.1\0")
+        .unwrap();
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
+
+    let outcome = dispatcher
+        .dispatch(
+            SyscallRequest::new(
+                78,
+                SyscallArgs::from([(-100_i64) as u64, 0x4000, 0x4100, 64, 0, 0]),
+            ),
+            &mut memory,
+            &mut reporter,
+        )
+        .unwrap();
+
+    let target = b"ld-musl-aarch64.so.1";
+    assert_eq!(
+        outcome,
+        DispatchOutcome::Returned {
+            value: target.len() as i64
+        }
+    );
+    assert_eq!(memory.read_bytes(0x4100, target.len()).unwrap(), target);
+    assert_eq!(
+        memory.read_bytes(0x4100 + target.len() as u64, 1).unwrap(),
+        [0xff]
+    );
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn readlinkat_reports_synthetic_proc_self_exe() {
+    let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
+        "bin/app",
+        b"app".as_slice(),
+    )]))])
+    .unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0xff; 0x200]);
+    memory.write_bytes(0x4000, b"/proc/self/exe\0").unwrap();
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::with_rootfs_and_executable(rootfs, "/bin/app");
+
+    let outcome = dispatcher
+        .dispatch(
+            SyscallRequest::new(
+                78,
+                SyscallArgs::from([(-100_i64) as u64, 0x4000, 0x4100, 64, 0, 0]),
+            ),
+            &mut memory,
+            &mut reporter,
+        )
+        .unwrap();
+
+    assert_eq!(outcome, DispatchOutcome::Returned { value: 8 });
+    assert_eq!(memory.read_bytes(0x4100, 8).unwrap(), b"/bin/app");
+    assert_eq!(memory.read_bytes(0x4108, 1).unwrap(), [0xff]);
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
 fn newfstatat_and_fstat_write_typed_linux_stat() {
     let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
         "etc/motd",
@@ -920,6 +989,36 @@ fn gzip_tar<const N: usize>(files: [(&str, &[u8]); N]) -> Vec<u8> {
             header.set_mode(0o644);
             header.set_cksum();
             builder.append_data(&mut header, path, contents).unwrap();
+        }
+        builder.finish().unwrap();
+    }
+
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&tar_bytes).unwrap();
+    encoder.finish().unwrap()
+}
+
+fn gzip_tar_with_links<const N: usize, const M: usize>(
+    files: [(&str, &[u8]); N],
+    links: [(&str, &str); M],
+) -> Vec<u8> {
+    let mut tar_bytes = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut tar_bytes);
+        for (path, contents) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, path, contents).unwrap();
+        }
+        for (path, target) in links {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_size(0);
+            header.set_mode(0o777);
+            header.set_cksum();
+            builder.append_link(&mut header, path, target).unwrap();
         }
         builder.finish().unwrap();
     }

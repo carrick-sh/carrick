@@ -120,7 +120,7 @@ const AARCH64_SYSCALLS: &[Syscall] = &[
     syscall(75, "vmsplice", "fs", SupportLevel::Planned),
     syscall(76, "splice", "fs", SupportLevel::Planned),
     syscall(77, "tee", "fs", SupportLevel::Planned),
-    syscall(78, "readlinkat", "fs", SupportLevel::Planned),
+    syscall(78, "readlinkat", "fs", SupportLevel::BringUp),
     syscall(79, "newfstatat", "fs", SupportLevel::BringUp),
     syscall(80, "fstat", "fs", SupportLevel::BringUp),
     syscall(81, "sync", "fs", SupportLevel::Planned),
