@@ -1,4 +1,5 @@
 use assert_cmd::Command;
+use carrick::oci::{ImageReference, ImageStore, LayerSummary, PullSummary};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use predicates::prelude::PredicateBooleanExt;
@@ -208,6 +209,77 @@ fn run_elf_command_can_use_rootfs_layers_for_static_fixture() {
         assert!(
             stderr.contains("Hypervisor.framework"),
             "unexpected run-elf failure:\n{stderr}"
+        );
+    }
+}
+
+#[test]
+fn run_command_loads_static_elf_from_pulled_image_rootfs() {
+    let output = std::process::Command::new("scripts/build-linux-fixtures.sh")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "fixture build failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = ImageStore::new(dir.path());
+    let image = ImageReference::parse("registry.example.com/team/app:v1").unwrap();
+    let executable = std::fs::read(
+        "fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-cat-motd",
+    )
+    .unwrap();
+    let layer_bytes = gzip_tar([
+        ("bin/cat-motd", executable.as_slice()),
+        ("etc/motd", b"rootfs says hello\n".as_slice()),
+    ]);
+    let layer_path = store.blob_path("sha256:abcdef").unwrap();
+    std::fs::create_dir_all(layer_path.parent().unwrap()).unwrap();
+    std::fs::write(&layer_path, &layer_bytes).unwrap();
+
+    let summary = PullSummary {
+        image: image.canonical(),
+        digest: Some("sha256:manifest".to_owned()),
+        image_dir: store.image_dir(&image),
+        config_size: 0,
+        layers: vec![LayerSummary {
+            digest: "sha256:abcdef".to_owned(),
+            media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_owned(),
+            size: layer_bytes.len(),
+            path: layer_path,
+        }],
+    };
+    std::fs::create_dir_all(store.image_dir(&image)).unwrap();
+    std::fs::write(
+        store.image_summary_path(&image),
+        serde_json::to_vec_pretty(&summary).unwrap(),
+    )
+    .unwrap();
+
+    let output = Command::cargo_bin("carrick")
+        .unwrap()
+        .args([
+            "--store",
+            store.root().to_str().unwrap(),
+            "run",
+            image.canonical().as_str(),
+            "/bin/cat-motd",
+        ])
+        .output()
+        .unwrap();
+
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("\"exit_code\": 0"));
+        assert!(stdout.contains("rootfs says hello"));
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("Hypervisor.framework"),
+            "unexpected run failure:\n{stderr}"
         );
     }
 }

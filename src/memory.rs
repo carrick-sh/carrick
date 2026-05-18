@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 
 use crate::dispatch::{GuestMemory, MemoryError};
-use crate::elf::{ElfInspectError, SegmentPerms, plan_elf_load};
+use crate::elf::{ElfInspectError, SegmentPerms, plan_elf_load, plan_elf_load_bytes};
 use serde::Serialize;
 use thiserror::Error;
 
@@ -81,6 +81,18 @@ impl AddressSpace {
         let path = path.as_ref();
         let plan = plan_elf_load(path)?;
         let file = fs::read(path)?;
+        Self::load_elf_segments(&file, plan)
+    }
+
+    pub fn load_elf_bytes(bytes: &[u8]) -> Result<Self, AddressSpaceError> {
+        let plan = plan_elf_load_bytes(bytes)?;
+        Self::load_elf_segments(bytes, plan)
+    }
+
+    fn load_elf_segments(
+        file: &[u8],
+        plan: crate::elf::LoadPlan,
+    ) -> Result<Self, AddressSpaceError> {
         let mut regions = Vec::with_capacity(plan.segments.len());
 
         for segment in plan.segments {

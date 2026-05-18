@@ -1,4 +1,4 @@
-use carrick::oci::{ImageReference, ImageStore};
+use carrick::oci::{ImageReference, ImageStore, LayerSummary, PullSummary};
 
 #[test]
 fn normalizes_short_docker_hub_references() {
@@ -34,4 +34,33 @@ fn rejects_unsafe_digests_for_blob_paths() {
 
     assert!(store.blob_path("sha256:../escape").is_err());
     assert!(store.blob_path("md5:abcdef").is_err());
+}
+
+#[tokio::test]
+async fn loads_pull_summary_from_image_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = ImageStore::new(dir.path());
+    let image = ImageReference::parse("registry.example.com/team/app:v1").unwrap();
+    let summary = PullSummary {
+        image: image.canonical(),
+        digest: Some("sha256:manifest".to_owned()),
+        image_dir: store.image_dir(&image),
+        config_size: 0,
+        layers: vec![LayerSummary {
+            digest: "sha256:abcdef".to_owned(),
+            media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_owned(),
+            size: 12,
+            path: store.blob_path("sha256:abcdef").unwrap(),
+        }],
+    };
+    std::fs::create_dir_all(store.image_dir(&image)).unwrap();
+    std::fs::write(
+        store.image_summary_path(&image),
+        serde_json::to_vec_pretty(&summary).unwrap(),
+    )
+    .unwrap();
+
+    let loaded = store.load_pull_summary(&image).await.unwrap();
+
+    assert_eq!(loaded, summary);
 }

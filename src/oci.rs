@@ -7,7 +7,7 @@ use oci_distribution::manifest::{
 };
 use oci_distribution::secrets::RegistryAuth;
 use oci_distribution::{Client, Reference};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::fs;
 
@@ -104,7 +104,7 @@ impl ImageStore {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullSummary {
     pub image: String,
     pub digest: Option<String>,
@@ -113,7 +113,7 @@ pub struct PullSummary {
     pub layers: Vec<LayerSummary>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LayerSummary {
     pub digest: String,
     pub media_type: String,
@@ -133,6 +133,20 @@ pub enum OciBootstrapError {
     Io(#[from] std::io::Error),
     #[error("failed to serialize OCI metadata: {0}")]
     Json(#[from] serde_json::Error),
+}
+
+impl ImageStore {
+    pub fn image_summary_path(&self, image: &ImageReference) -> PathBuf {
+        self.image_dir(image).join("carrick-image.json")
+    }
+
+    pub async fn load_pull_summary(
+        &self,
+        image: &ImageReference,
+    ) -> Result<PullSummary, OciBootstrapError> {
+        let bytes = fs::read(self.image_summary_path(image)).await?;
+        Ok(serde_json::from_slice(&bytes)?)
+    }
 }
 
 pub async fn pull_image(

@@ -19,6 +19,11 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
   Rust fixtures, including a rootfs-backed `/etc/motd` reader.
 - `carrick pull <image>` uses `oci-distribution` to fetch image layers into a
   content-addressed store under `$CARRICK_HOME` or `~/.carrick`.
+- `carrick run <image> /path/to/static-elf` loads a previously pulled image
+  summary, composes its layer blobs as a read-only rootfs, loads the executable
+  from that rootfs, and runs it through the same HVF/syscall loop. Guest argv/env
+  stack setup is not implemented yet, so this path is currently for no-argv
+  static ELF bring-up binaries.
 - `carrick rootfs --layer <layer.tar.gz> ...` composes OCI tar layers in memory,
   including whiteouts, opaque directory markers, and symlinks, without extracting
   the root filesystem.
@@ -52,9 +57,10 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
   `exit(2)`, giving the loader, HVF loop, rootfs, and dispatcher a tight
   feedback loop.
 
-`run`, `shell`, and `exec` are present as CLI surfaces, but they still stop before
-OCI-backed process execution. The current executable path is `run-elf`, which is
-deliberately scoped to static Linux/aarch64 ELF bring-up.
+`shell` and `exec` are present as CLI surfaces, but they still stop before
+interactive process execution. `run` and `run-elf` are deliberately scoped to
+static Linux/aarch64 ELF bring-up until guest stack, argv/env, and dynamic linker
+setup land.
 
 ## License policy
 

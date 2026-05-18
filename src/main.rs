@@ -7,7 +7,10 @@ use carrick::elf::{inspect_elf, plan_elf_load};
 use carrick::memory::AddressSpace;
 use carrick::oci::{ImageReference, ImageStore, pull_image};
 use carrick::rootfs::RootFs;
-use carrick::runtime::{DEFAULT_MAX_TRAPS, run_static_elf_with_hvf_and_dispatcher};
+use carrick::runtime::{
+    DEFAULT_MAX_TRAPS, run_static_elf_bytes_with_hvf_and_dispatcher,
+    run_static_elf_with_hvf_and_dispatcher,
+};
 use carrick::syscall::{aarch64_table, lookup_aarch64};
 use carrick::trap::hvf_capabilities;
 use clap::{Parser, Subcommand};
@@ -176,16 +179,52 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 command
             };
+            if command.len() != 1 {
+                bail!(
+                    "guest argv/env stack setup is not implemented yet; pass only the executable path"
+                );
+            }
+            let summary = store.load_pull_summary(&image).await.with_context(|| {
+                format!("image {} is not pulled into the store", image.canonical())
+            })?;
+            let rootfs_layers: Vec<PathBuf> = summary
+                .layers
+                .iter()
+                .map(|layer| layer.path.clone())
+                .collect();
+            let rootfs = RootFs::from_layer_paths(&rootfs_layers)
+                .context("failed to compose image rootfs layers")?;
+            let executable_path = &command[0];
+            let executable = rootfs.read(executable_path.as_str()).with_context(|| {
+                format!("failed to read executable {executable_path} from rootfs")
+            })?;
+            let result = run_static_elf_bytes_with_hvf_and_dispatcher(
+                &executable,
+                SyscallDispatcher::with_rootfs(rootfs),
+                DEFAULT_MAX_TRAPS,
+            )
+            .with_context(|| {
+                format!(
+                    "failed to run static ELF {} from image {}",
+                    executable_path,
+                    image.canonical()
+                )
+            })?;
             println!(
                 "{}",
-                serde_json::json!({
+                serde_json::to_string_pretty(&serde_json::json!({
                     "image": image.canonical(),
                     "command": command,
                     "store": store.root(),
+                    "rootfs_layers": rootfs_layers,
+                    "exit_code": result.exit_code,
+                    "stdout": String::from_utf8_lossy(&result.stdout),
+                    "stderr": String::from_utf8_lossy(&result.stderr),
+                    "traps": result.traps,
+                    "report": result.report,
                     "trap": hvf_capabilities(),
-                })
+                }))?
             );
-            bail!("Linux process execution is not implemented in this bootstrap yet");
         }
         Commands::Shell { image } => {
             let image = ImageReference::parse(&image)?;

@@ -7,13 +7,15 @@ use carrick::compat::{CompatReporter, SyscallArgs};
 #[test]
 fn loads_static_linux_fixture_into_guest_address_space() {
     build_fixture();
-    let image = AddressSpace::load_elf(
-        "fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-hello",
-    )
-    .unwrap();
+    let artifact = "fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-hello";
+    let image = AddressSpace::load_elf(artifact).unwrap();
 
     assert!(image.entry() >= image.regions()[0].start);
     assert!(image.regions().iter().any(|region| region.perms.execute));
+    assert!(image.find_bytes(b"hello from carrick\n").is_some());
+
+    let bytes = std::fs::read(artifact).unwrap();
+    let image = AddressSpace::load_elf_bytes(&bytes).unwrap();
     assert!(image.find_bytes(b"hello from carrick\n").is_some());
 }
 

@@ -80,15 +80,19 @@ pub fn inspect_elf(path: impl AsRef<Path>) -> Result<ElfMetadata, ElfInspectErro
     inspect_elf_bytes(&bytes)
 }
 
-pub fn plan_elf_load(path: impl AsRef<Path>) -> Result<LoadPlan, ElfInspectError> {
-    let bytes = fs::read(path)?;
-    let elf = parse_elf_bytes(&bytes)?;
-    Ok(load_plan_from_elf(&elf))
-}
-
-fn inspect_elf_bytes(bytes: &[u8]) -> Result<ElfMetadata, ElfInspectError> {
+pub fn inspect_elf_bytes(bytes: &[u8]) -> Result<ElfMetadata, ElfInspectError> {
     let elf = parse_elf_bytes(bytes)?;
     Ok(metadata_from_elf(&elf))
+}
+
+pub fn plan_elf_load(path: impl AsRef<Path>) -> Result<LoadPlan, ElfInspectError> {
+    let bytes = fs::read(path)?;
+    plan_elf_load_bytes(&bytes)
+}
+
+pub fn plan_elf_load_bytes(bytes: &[u8]) -> Result<LoadPlan, ElfInspectError> {
+    let elf = parse_elf_bytes(bytes)?;
+    Ok(load_plan_from_elf(&elf))
 }
 
 fn parse_elf_bytes(bytes: &[u8]) -> Result<Elf<'_>, ElfInspectError> {
