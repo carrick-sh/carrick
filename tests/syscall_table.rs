@@ -73,6 +73,8 @@ fn names_linux_aarch64_bringup_syscalls() {
         (23, "dup"),
         (24, "dup3"),
         (25, "fcntl"),
+        (43, "statfs"),
+        (44, "fstatfs"),
         (96, "set_tid_address"),
         (99, "set_robust_list"),
         (113, "clock_gettime"),

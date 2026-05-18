@@ -6,8 +6,8 @@ use carrick::dispatch::{
 use carrick::elf::SegmentPerms;
 use carrick::linux_abi::{
     LINUX_DIRENT64_HEADER_SIZE, LINUX_DT_REG, LINUX_S_IFDIR, LINUX_S_IFMT, LINUX_S_IFREG,
-    LinuxDirent64Header, LinuxIovec, LinuxRlimit, LinuxStat, LinuxTimespec, LinuxTimeval,
-    LinuxTimezone, LinuxUtsname,
+    LinuxDirent64Header, LinuxIovec, LinuxRlimit, LinuxStat, LinuxStatfs, LinuxTimespec,
+    LinuxTimeval, LinuxTimezone, LinuxUtsname,
 };
 use carrick::memory::{AddressSpace, LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE};
 use carrick::rootfs::{LayerSource, RootFs};
@@ -23,6 +23,7 @@ const LINUX_F_GETFL: u64 = 3;
 const LINUX_FD_CLOEXEC: u64 = 1;
 const LINUX_F_DUPFD_CLOEXEC: u64 = 1030;
 const LINUX_O_CLOEXEC: u64 = 0o2000000;
+const LINUX_OVERLAYFS_SUPER_MAGIC: i64 = 0x794c7630;
 
 #[test]
 fn write_syscall_reads_guest_memory_and_writes_stdout() {
@@ -364,6 +365,81 @@ fn cwd_and_access_syscalls_use_rootfs_state() {
         DispatchOutcome::Returned { value: 0 }
     );
     assert_eq!(dispatcher.cwd(), "/etc");
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn statfs_writes_packed_linux_statfs_for_rootfs_path() {
+    let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
+        "etc/motd",
+        b"rootfs says hello\n".as_slice(),
+    )]))])
+    .unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
+    memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(43, SyscallArgs::from([0x4000, 0x4100, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let statfs = read_statfs(&memory, 0x4100);
+    let fs_type = statfs.f_type;
+    let block_size = statfs.f_bsize;
+    let name_len = statfs.f_namelen;
+    assert_eq!(fs_type, LINUX_OVERLAYFS_SUPER_MAGIC);
+    assert_eq!(block_size, 4096);
+    assert!(name_len >= 255);
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn fstatfs_writes_packed_linux_statfs_for_open_fd() {
+    let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
+        "etc/motd",
+        b"rootfs says hello\n".as_slice(),
+    )]))])
+    .unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
+    memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    56,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 3 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(44, SyscallArgs::from([3, 0x4100, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let statfs = read_statfs(&memory, 0x4100);
+    let fs_type = statfs.f_type;
+    let free_blocks = statfs.f_bfree;
+    assert_eq!(fs_type, LINUX_OVERLAYFS_SUPER_MAGIC);
+    assert!(free_blocks > 0);
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
@@ -1374,6 +1450,14 @@ fn read_stat(memory: &impl GuestMemory, address: u64) -> LinuxStat {
         .unwrap();
     let (stat, _) = LinuxStat::read_from_prefix(&bytes).unwrap();
     stat
+}
+
+fn read_statfs(memory: &impl GuestMemory, address: u64) -> LinuxStatfs {
+    let bytes = memory
+        .read_bytes(address, std::mem::size_of::<LinuxStatfs>())
+        .unwrap();
+    let (statfs, _) = LinuxStatfs::read_from_prefix(&bytes).unwrap();
+    statfs
 }
 
 fn read_utsname(memory: &impl GuestMemory, address: u64) -> LinuxUtsname {

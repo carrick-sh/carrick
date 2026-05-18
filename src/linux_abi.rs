@@ -53,6 +53,25 @@ pub struct LinuxStat {
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
 )]
+pub struct LinuxStatfs {
+    pub f_type: i64,
+    pub f_bsize: i64,
+    pub f_blocks: u64,
+    pub f_bfree: u64,
+    pub f_bavail: u64,
+    pub f_files: u64,
+    pub f_ffree: u64,
+    pub f_fsid: [i32; 2],
+    pub f_namelen: i64,
+    pub f_frsize: i64,
+    pub f_flags: i64,
+    pub f_spare: [i64; 4],
+}
+
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
 pub struct LinuxDirent64Header {
     pub d_ino: u64,
     pub d_off: i64,

@@ -9,7 +9,8 @@ use crate::compat::{CompatEvent, CompatReporter, SyscallArgs};
 use crate::linux_abi::{
     LINUX_DIRENT64_HEADER_SIZE, LINUX_DT_DIR, LINUX_DT_LNK, LINUX_DT_REG, LINUX_PAGE_SIZE,
     LINUX_S_IFDIR, LINUX_S_IFLNK, LINUX_S_IFREG, LinuxDirent64Header, LinuxIovec, LinuxRlimit,
-    LinuxSigaction, LinuxStat, LinuxTimespec, LinuxTimeval, LinuxTimezone, LinuxUtsname,
+    LinuxSigaction, LinuxStat, LinuxStatfs, LinuxTimespec, LinuxTimeval, LinuxTimezone,
+    LinuxUtsname,
 };
 use crate::memory::{LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE, LINUX_MMAP_SIZE};
 use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsError, RootFsMetadata};
@@ -53,6 +54,7 @@ pub const LINUX_MAP_PRIVATE: u64 = 0x02;
 pub const LINUX_MAP_FIXED: u64 = 0x10;
 pub const LINUX_MAP_ANONYMOUS: u64 = 0x20;
 pub const LINUX_RLIM_INFINITY: u64 = u64::MAX;
+pub const LINUX_OVERLAYFS_SUPER_MAGIC: i64 = 0x794c7630;
 const LINUX_RT_SIGSET_SIZE: u64 = 8;
 const LINUX_CLOCK_REALTIME: u64 = 0;
 const LINUX_CLOCK_MONOTONIC: u64 = 1;
@@ -312,6 +314,8 @@ impl SyscallDispatcher {
             23 => self.dup(request),
             24 => self.dup3(request),
             25 => self.fcntl(request),
+            43 => self.statfs(request, memory)?,
+            44 => self.fstatfs(request, memory),
             48 => self.faccessat(request, memory)?,
             49 => self.chdir(request, memory)?,
             50 => self.fchdir(request),
@@ -591,6 +595,42 @@ impl SyscallDispatcher {
                 errno: LINUX_EINVAL,
             },
         }
+    }
+
+    fn statfs(
+        &self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let pathname = request.arg(0);
+        let buffer = request.arg(1);
+        let path = match read_guest_c_string(memory, pathname) {
+            Ok(path) => path,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        let path = match self.resolve_at_path(LINUX_AT_FDCWD, &path) {
+            Ok(path) => path,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        let Some(rootfs) = &self.rootfs else {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_ENOENT,
+            });
+        };
+        if let Err(errno) = rootfs.metadata(path) {
+            return Ok(DispatchOutcome::Errno {
+                errno: rootfs_errno(errno),
+            });
+        }
+        Ok(write_statfs(memory, buffer))
+    }
+
+    fn fstatfs(&self, request: SyscallRequest, memory: &mut impl GuestMemory) -> DispatchOutcome {
+        let fd = request.arg(0) as i32;
+        if !self.open_files.contains_key(&fd) {
+            return DispatchOutcome::Errno { errno: LINUX_EBADF };
+        }
+        write_statfs(memory, request.arg(1))
     }
 
     fn set_tid_address(&self) -> DispatchOutcome {
@@ -1472,6 +1512,25 @@ fn write_packed(memory: &mut impl GuestMemory, address: u64, bytes: &[u8]) -> Di
     } else {
         DispatchOutcome::Returned { value: 0 }
     }
+}
+
+fn write_statfs(memory: &mut impl GuestMemory, statfsbuf: u64) -> DispatchOutcome {
+    let blocks = 1_048_576;
+    let statfs = LinuxStatfs {
+        f_type: LINUX_OVERLAYFS_SUPER_MAGIC,
+        f_bsize: LINUX_PAGE_SIZE as i64,
+        f_blocks: blocks,
+        f_bfree: blocks / 2,
+        f_bavail: blocks / 2,
+        f_files: 1_048_576,
+        f_ffree: 1_048_576,
+        f_fsid: [0, 0],
+        f_namelen: 255,
+        f_frsize: LINUX_PAGE_SIZE as i64,
+        f_flags: 0,
+        f_spare: [0; 4],
+    };
+    write_packed(memory, statfsbuf, statfs.as_bytes())
 }
 
 fn linux_fd_flags_from_open_flags(flags: u64) -> u64 {
