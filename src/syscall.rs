@@ -159,6 +159,7 @@ const AARCH64_SYSCALLS: &[Syscall] = &[
     syscall(215, "munmap", "mm", SupportLevel::BringUp),
     syscall(222, "mmap", "mm", SupportLevel::BringUp),
     syscall(226, "mprotect", "mm", SupportLevel::BringUp),
+    syscall(233, "madvise", "mm", SupportLevel::BringUp),
     syscall(261, "prlimit64", "process", SupportLevel::BringUp),
     syscall(278, "getrandom", "random", SupportLevel::BringUp),
 ];

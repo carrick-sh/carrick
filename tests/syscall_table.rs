@@ -25,6 +25,7 @@ fn names_linux_aarch64_bringup_syscalls() {
     let munmap = lookup_aarch64(215).unwrap();
     let mmap = lookup_aarch64(222).unwrap();
     let mprotect = lookup_aarch64(226).unwrap();
+    let madvise = lookup_aarch64(233).unwrap();
 
     assert_eq!(getcwd.name, "getcwd");
     assert_eq!(getcwd.support, SupportLevel::BringUp);
@@ -71,6 +72,8 @@ fn names_linux_aarch64_bringup_syscalls() {
     assert_eq!(mmap.support, SupportLevel::BringUp);
     assert_eq!(mprotect.name, "mprotect");
     assert_eq!(mprotect.support, SupportLevel::BringUp);
+    assert_eq!(madvise.name, "madvise");
+    assert_eq!(madvise.support, SupportLevel::BringUp);
 
     for (number, name) in [
         (19, "eventfd2"),

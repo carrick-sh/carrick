@@ -64,6 +64,12 @@ pub const LINUX_PROT_EXEC: u64 = 0x4;
 pub const LINUX_MAP_PRIVATE: u64 = 0x02;
 pub const LINUX_MAP_FIXED: u64 = 0x10;
 pub const LINUX_MAP_ANONYMOUS: u64 = 0x20;
+pub const LINUX_MADV_NORMAL: u64 = 0;
+pub const LINUX_MADV_RANDOM: u64 = 1;
+pub const LINUX_MADV_SEQUENTIAL: u64 = 2;
+pub const LINUX_MADV_WILLNEED: u64 = 3;
+pub const LINUX_MADV_DONTNEED: u64 = 4;
+pub const LINUX_MADV_FREE: u64 = 8;
 pub const LINUX_RLIM_INFINITY: u64 = u64::MAX;
 pub const LINUX_OVERLAYFS_SUPER_MAGIC: i64 = 0x794c7630;
 const LINUX_EFD_SEMAPHORE: u64 = 0x1;
@@ -479,6 +485,7 @@ impl SyscallDispatcher {
             215 => self.munmap(request),
             222 => self.mmap(request, memory)?,
             226 => self.mprotect(request, memory),
+            233 => self.madvise(request, memory),
             261 => self.prlimit64(request, memory),
             278 => self.getrandom(request, memory)?,
             _ => {
@@ -2156,6 +2163,38 @@ impl SyscallDispatcher {
         DispatchOutcome::Returned { value: 0 }
     }
 
+    fn madvise(&self, request: SyscallRequest, memory: &impl GuestMemory) -> DispatchOutcome {
+        let address = request.arg(0);
+        let length = request.arg(1);
+        let advice = request.arg(2);
+
+        if address % LINUX_PAGE_SIZE != 0 || !linux_madvise_advice_is_supported(advice) {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+        if length == 0 {
+            return DispatchOutcome::Returned { value: 0 };
+        }
+
+        let Ok(length) = usize::try_from(length) else {
+            return DispatchOutcome::Errno {
+                errno: LINUX_ENOMEM,
+            };
+        };
+        let Some(last_address) = address.checked_add(length as u64 - 1) else {
+            return DispatchOutcome::Errno {
+                errno: LINUX_ENOMEM,
+            };
+        };
+        if memory.read_bytes(address, 1).is_err() || memory.read_bytes(last_address, 1).is_err() {
+            return DispatchOutcome::Errno {
+                errno: LINUX_ENOMEM,
+            };
+        }
+        DispatchOutcome::Returned { value: 0 }
+    }
+
     fn prlimit64(&self, request: SyscallRequest, memory: &mut impl GuestMemory) -> DispatchOutcome {
         let new_limit = request.arg(2);
         let old_limit = request.arg(3);
@@ -2861,6 +2900,18 @@ fn linux_clock_duration(clock_id: u64) -> Option<Duration> {
         | LINUX_CLOCK_BOOTTIME => Some(monotonic_duration()),
         _ => None,
     }
+}
+
+fn linux_madvise_advice_is_supported(advice: u64) -> bool {
+    matches!(
+        advice,
+        LINUX_MADV_NORMAL
+            | LINUX_MADV_RANDOM
+            | LINUX_MADV_SEQUENTIAL
+            | LINUX_MADV_WILLNEED
+            | LINUX_MADV_DONTNEED
+            | LINUX_MADV_FREE
+    )
 }
 
 fn realtime_duration() -> Duration {

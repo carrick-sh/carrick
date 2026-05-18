@@ -28,6 +28,8 @@ const LINUX_F_GETPIPE_SZ: u64 = 1032;
 const LINUX_LOCK_SH: u64 = 1;
 const LINUX_LOCK_NB: u64 = 4;
 const LINUX_LOCK_UN: u64 = 8;
+const LINUX_MADV_WILLNEED: u64 = 3;
+const LINUX_MADV_DONTNEED: u64 = 4;
 const LINUX_O_CLOEXEC: u64 = 0o2000000;
 const LINUX_O_NONBLOCK: u64 = 0o4000;
 const LINUX_OVERLAYFS_SUPER_MAGIC: i64 = 0x794c7630;
@@ -2997,6 +2999,84 @@ fn mmap_anonymous_fixed_mapping_zeroes_guest_memory_and_mprotect_munmap_are_noop
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
+    );
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn madvise_accepts_common_advice_for_mapped_ranges() {
+    let mut memory = AddressSpace::from_segments(
+        0,
+        [(LINUX_MMAP_BASE, rwx_perms(), b"dirty".to_vec(), 0x4000)],
+    )
+    .unwrap();
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    233,
+                    SyscallArgs::from([LINUX_MMAP_BASE, 0x1000, LINUX_MADV_DONTNEED, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    233,
+                    SyscallArgs::from([LINUX_MMAP_BASE, 0x1000, LINUX_MADV_WILLNEED, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    233,
+                    SyscallArgs::from([LINUX_MMAP_BASE + 1, 0x1000, 0, 0, 0, 0])
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 22 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    233,
+                    SyscallArgs::from([LINUX_MMAP_BASE, 0x1000, 999, 0, 0, 0])
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 22 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    233,
+                    SyscallArgs::from([LINUX_MMAP_BASE + 0x8000, 0x1000, 0, 0, 0, 0])
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 12 }
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
