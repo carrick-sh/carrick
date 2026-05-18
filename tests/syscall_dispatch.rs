@@ -6,8 +6,8 @@ use carrick::dispatch::{
 use carrick::elf::SegmentPerms;
 use carrick::linux_abi::{
     LINUX_DIRENT64_HEADER_SIZE, LINUX_DT_REG, LINUX_S_IFDIR, LINUX_S_IFMT, LINUX_S_IFREG,
-    LinuxDirent64Header, LinuxIovec, LinuxRlimit, LinuxStat, LinuxStatfs, LinuxTimespec,
-    LinuxTimeval, LinuxTimezone, LinuxUtsname, LinuxWinsize,
+    LinuxDirent64Header, LinuxEpollEvent, LinuxEventfdValue, LinuxIovec, LinuxRlimit, LinuxStat,
+    LinuxStatfs, LinuxTimespec, LinuxTimeval, LinuxTimezone, LinuxUtsname, LinuxWinsize,
 };
 use carrick::memory::{AddressSpace, LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE};
 use carrick::rootfs::{LayerSource, RootFs};
@@ -23,7 +23,11 @@ const LINUX_F_GETFL: u64 = 3;
 const LINUX_FD_CLOEXEC: u64 = 1;
 const LINUX_F_DUPFD_CLOEXEC: u64 = 1030;
 const LINUX_O_CLOEXEC: u64 = 0o2000000;
+const LINUX_O_NONBLOCK: u64 = 0o4000;
 const LINUX_OVERLAYFS_SUPER_MAGIC: i64 = 0x794c7630;
+const LINUX_EFD_NONBLOCK: u64 = LINUX_O_NONBLOCK;
+const LINUX_EPOLL_CTL_ADD: u64 = 1;
+const LINUX_EPOLLIN: u32 = 0x001;
 const LINUX_TIOCGWINSZ: u64 = 0x5413;
 
 #[test]
@@ -162,6 +166,157 @@ fn ioctl_writes_packed_winsize_and_reports_unknown_requests() {
     assert!(report.unhandled_syscalls.is_empty());
     assert_eq!(report.unhandled_ioctls[0].request, 0xdead_beef);
     assert_eq!(report.unhandled_ioctls[0].count, 1);
+}
+
+#[test]
+fn eventfd2_read_write_round_trip_uses_packed_counter() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(19, SyscallArgs::from([7, LINUX_EFD_NONBLOCK, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 3 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(63, SyscallArgs::from([3, 0x4000, 8, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 8 }
+    );
+    let value = read_eventfd_value(&memory, 0x4000).value;
+    assert_eq!(value, 7);
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(63, SyscallArgs::from([3, 0x4000, 8, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 11 }
+    );
+
+    memory
+        .write_bytes(0x4010, LinuxEventfdValue { value: 5 }.as_bytes())
+        .unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(64, SyscallArgs::from([3, 0x4010, 8, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 8 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(63, SyscallArgs::from([3, 0x4020, 8, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 8 }
+    );
+    let value = read_eventfd_value(&memory, 0x4020).value;
+    assert_eq!(value, 5);
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn epoll_reports_eventfd_readiness_with_packed_events() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(19, SyscallArgs::from([1, LINUX_EFD_NONBLOCK, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 3 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(20, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 4 }
+    );
+    let wanted = LinuxEpollEvent {
+        events: LINUX_EPOLLIN,
+        data: 0xabc,
+    };
+    memory.write_bytes(0x4000, wanted.as_bytes()).unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    21,
+                    SyscallArgs::from([4, LINUX_EPOLL_CTL_ADD, 3, 0x4000, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(22, SyscallArgs::from([4, 0x4100, 4, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 1 }
+    );
+    let ready = read_epoll_event(&memory, 0x4100);
+    let events = ready.events;
+    let data = ready.data;
+    assert_eq!(events & LINUX_EPOLLIN, LINUX_EPOLLIN);
+    assert_eq!(data, 0xabc);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(63, SyscallArgs::from([3, 0x4200, 8, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 8 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(22, SyscallArgs::from([4, 0x4100, 4, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
 #[test]
@@ -1662,6 +1817,20 @@ fn read_winsize(memory: &impl GuestMemory, address: u64) -> LinuxWinsize {
         .read_bytes(address, std::mem::size_of::<LinuxWinsize>())
         .unwrap();
     LinuxWinsize::read_from_bytes(&bytes).unwrap()
+}
+
+fn read_eventfd_value(memory: &impl GuestMemory, address: u64) -> LinuxEventfdValue {
+    let bytes = memory
+        .read_bytes(address, std::mem::size_of::<LinuxEventfdValue>())
+        .unwrap();
+    LinuxEventfdValue::read_from_bytes(&bytes).unwrap()
+}
+
+fn read_epoll_event(memory: &impl GuestMemory, address: u64) -> LinuxEpollEvent {
+    let bytes = memory
+        .read_bytes(address, std::mem::size_of::<LinuxEpollEvent>())
+        .unwrap();
+    LinuxEpollEvent::read_from_bytes(&bytes).unwrap()
 }
 
 fn read_utsname(memory: &impl GuestMemory, address: u64) -> LinuxUtsname {

@@ -70,6 +70,10 @@ fn names_linux_aarch64_bringup_syscalls() {
     assert_eq!(mprotect.support, SupportLevel::BringUp);
 
     for (number, name) in [
+        (19, "eventfd2"),
+        (20, "epoll_create1"),
+        (21, "epoll_ctl"),
+        (22, "epoll_pwait"),
         (23, "dup"),
         (24, "dup3"),
         (25, "fcntl"),

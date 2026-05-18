@@ -8,9 +8,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::compat::{CompatEvent, CompatReporter, SyscallArgs};
 use crate::linux_abi::{
     LINUX_DIRENT64_HEADER_SIZE, LINUX_DT_DIR, LINUX_DT_LNK, LINUX_DT_REG, LINUX_PAGE_SIZE,
-    LINUX_S_IFDIR, LINUX_S_IFLNK, LINUX_S_IFREG, LinuxDirent64Header, LinuxIovec, LinuxRlimit,
-    LinuxSigaction, LinuxStat, LinuxStatfs, LinuxTimespec, LinuxTimeval, LinuxTimezone,
-    LinuxUtsname, LinuxWinsize,
+    LINUX_S_IFDIR, LINUX_S_IFLNK, LINUX_S_IFREG, LinuxDirent64Header, LinuxEpollEvent,
+    LinuxEventfdValue, LinuxIovec, LinuxRlimit, LinuxSigaction, LinuxStat, LinuxStatfs,
+    LinuxTimespec, LinuxTimeval, LinuxTimezone, LinuxUtsname, LinuxWinsize,
 };
 use crate::memory::{LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE, LINUX_MMAP_SIZE};
 use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsError, RootFsMetadata};
@@ -21,9 +21,11 @@ use zerocopy::{FromBytes, IntoBytes};
 
 pub const LINUX_ENOENT: i32 = 2;
 pub const LINUX_EBADF: i32 = 9;
+pub const LINUX_EAGAIN: i32 = 11;
 pub const LINUX_ENOMEM: i32 = 12;
 pub const LINUX_EACCES: i32 = 13;
 pub const LINUX_EFAULT: i32 = 14;
+pub const LINUX_EEXIST: i32 = 17;
 pub const LINUX_ENOTDIR: i32 = 20;
 pub const LINUX_EISDIR: i32 = 21;
 pub const LINUX_EINVAL: i32 = 22;
@@ -47,6 +49,7 @@ pub const LINUX_SEEK_SET: u64 = 0;
 pub const LINUX_SEEK_CUR: u64 = 1;
 pub const LINUX_SEEK_END: u64 = 2;
 pub const LINUX_O_ACCMODE: u64 = 0b11;
+pub const LINUX_O_NONBLOCK: u64 = 0o4000;
 pub const LINUX_O_CLOEXEC: u64 = 0o2000000;
 pub const LINUX_PROT_READ: u64 = 0x1;
 pub const LINUX_PROT_WRITE: u64 = 0x2;
@@ -56,6 +59,14 @@ pub const LINUX_MAP_FIXED: u64 = 0x10;
 pub const LINUX_MAP_ANONYMOUS: u64 = 0x20;
 pub const LINUX_RLIM_INFINITY: u64 = u64::MAX;
 pub const LINUX_OVERLAYFS_SUPER_MAGIC: i64 = 0x794c7630;
+const LINUX_EFD_SEMAPHORE: u64 = 0x1;
+const LINUX_EFD_NONBLOCK: u64 = LINUX_O_NONBLOCK;
+const LINUX_EFD_CLOEXEC: u64 = LINUX_O_CLOEXEC;
+const LINUX_EPOLL_CLOEXEC: u64 = LINUX_O_CLOEXEC;
+const LINUX_EPOLL_CTL_ADD: u64 = 1;
+const LINUX_EPOLL_CTL_DEL: u64 = 2;
+const LINUX_EPOLL_CTL_MOD: u64 = 3;
+const LINUX_EPOLLIN: u32 = 0x001;
 const LINUX_TIOCGWINSZ: u64 = 0x5413;
 const LINUX_RT_SIGSET_SIZE: u64 = 8;
 const LINUX_CLOCK_REALTIME: u64 = 0;
@@ -230,6 +241,15 @@ enum OpenDescription {
         offset: usize,
         status_flags: u64,
     },
+    EventFd {
+        counter: u64,
+        semaphore: bool,
+        status_flags: u64,
+    },
+    Epoll {
+        interest: HashMap<i32, LinuxEpollEvent>,
+        status_flags: u64,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -243,7 +263,9 @@ impl OpenDescription {
         match self {
             OpenDescription::File { status_flags, .. }
             | OpenDescription::Directory { status_flags, .. }
-            | OpenDescription::SyntheticFile { status_flags, .. } => *status_flags,
+            | OpenDescription::SyntheticFile { status_flags, .. }
+            | OpenDescription::EventFd { status_flags, .. }
+            | OpenDescription::Epoll { status_flags, .. } => *status_flags,
         }
     }
 
@@ -251,7 +273,9 @@ impl OpenDescription {
         match self {
             OpenDescription::File { status_flags, .. }
             | OpenDescription::Directory { status_flags, .. }
-            | OpenDescription::SyntheticFile { status_flags, .. } => *status_flags = next,
+            | OpenDescription::SyntheticFile { status_flags, .. }
+            | OpenDescription::EventFd { status_flags, .. }
+            | OpenDescription::Epoll { status_flags, .. } => *status_flags = next,
         }
     }
 }
@@ -321,6 +345,10 @@ impl SyscallDispatcher {
 
         let outcome = match request.number {
             17 => self.getcwd(request, memory)?,
+            19 => self.eventfd2(request),
+            20 => self.epoll_create1(request),
+            21 => self.epoll_ctl(request, memory)?,
+            22 => self.epoll_pwait(request, memory)?,
             23 => self.dup(request),
             24 => self.dup3(request),
             25 => self.fcntl(request),
@@ -522,11 +550,12 @@ impl SyscallDispatcher {
                 self.cwd = display_rootfs_path(&metadata.path);
                 DispatchOutcome::Returned { value: 0 }
             }
-            OpenDescription::File { .. } | OpenDescription::SyntheticFile { .. } => {
-                DispatchOutcome::Errno {
-                    errno: LINUX_ENOTDIR,
-                }
-            }
+            OpenDescription::File { .. }
+            | OpenDescription::SyntheticFile { .. }
+            | OpenDescription::EventFd { .. }
+            | OpenDescription::Epoll { .. } => DispatchOutcome::Errno {
+                errno: LINUX_ENOTDIR,
+            },
         }
     }
 
@@ -559,6 +588,186 @@ impl SyscallDispatcher {
             })
         } else {
             None
+        }
+    }
+
+    fn eventfd2(&mut self, request: SyscallRequest) -> DispatchOutcome {
+        let initial_value = request.arg(0);
+        let flags = request.arg(1);
+        if flags & !(LINUX_EFD_SEMAPHORE | LINUX_EFD_NONBLOCK | LINUX_EFD_CLOEXEC) != 0 {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+        let description = OpenDescription::EventFd {
+            counter: initial_value,
+            semaphore: flags & LINUX_EFD_SEMAPHORE != 0,
+            status_flags: flags & LINUX_EFD_NONBLOCK,
+        };
+        self.install_fd(description, linux_fd_flags_from_open_flags(flags))
+    }
+
+    fn epoll_create1(&mut self, request: SyscallRequest) -> DispatchOutcome {
+        let flags = request.arg(0);
+        if flags & !LINUX_EPOLL_CLOEXEC != 0 {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+        let description = OpenDescription::Epoll {
+            interest: HashMap::new(),
+            status_flags: 0,
+        };
+        self.install_fd(description, linux_fd_flags_from_open_flags(flags))
+    }
+
+    fn epoll_ctl(
+        &mut self,
+        request: SyscallRequest,
+        memory: &impl GuestMemory,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let epfd = request.arg(0) as i32;
+        let operation = request.arg(1);
+        let fd = request.arg(2) as i32;
+        let event_address = request.arg(3);
+        if epfd == fd || !self.fd_is_valid(fd) {
+            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+        }
+
+        let Some(open_file) = self.open_files.get(&epfd) else {
+            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+        };
+        let mut open = open_file.description.borrow_mut();
+        let OpenDescription::Epoll { interest, .. } = &mut *open else {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            });
+        };
+
+        match operation {
+            LINUX_EPOLL_CTL_ADD => {
+                let event = match read_epoll_event(memory, event_address) {
+                    Ok(event) => event,
+                    Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                };
+                if interest.contains_key(&fd) {
+                    return Ok(DispatchOutcome::Errno {
+                        errno: LINUX_EEXIST,
+                    });
+                }
+                interest.insert(fd, event);
+                Ok(DispatchOutcome::Returned { value: 0 })
+            }
+            LINUX_EPOLL_CTL_MOD => {
+                let event = match read_epoll_event(memory, event_address) {
+                    Ok(event) => event,
+                    Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                };
+                let Some(slot) = interest.get_mut(&fd) else {
+                    return Ok(DispatchOutcome::Errno {
+                        errno: LINUX_ENOENT,
+                    });
+                };
+                *slot = event;
+                Ok(DispatchOutcome::Returned { value: 0 })
+            }
+            LINUX_EPOLL_CTL_DEL => {
+                if interest.remove(&fd).is_some() {
+                    Ok(DispatchOutcome::Returned { value: 0 })
+                } else {
+                    Ok(DispatchOutcome::Errno {
+                        errno: LINUX_ENOENT,
+                    })
+                }
+            }
+            _ => Ok(DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            }),
+        }
+    }
+
+    fn epoll_pwait(
+        &self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let epfd = request.arg(0) as i32;
+        let events_address = request.arg(1);
+        let max_events = usize::try_from(request.arg(2))
+            .map_err(|_| DispatchError::LengthTooLarge(request.arg(2)))?;
+        if max_events == 0 {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            });
+        }
+
+        let Some(open_file) = self.open_files.get(&epfd) else {
+            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+        };
+        let interests = {
+            let open = open_file.description.borrow();
+            let OpenDescription::Epoll { interest, .. } = &*open else {
+                return Ok(DispatchOutcome::Errno {
+                    errno: LINUX_EINVAL,
+                });
+            };
+            interest
+                .iter()
+                .map(|(fd, event)| (*fd, *event))
+                .collect::<Vec<_>>()
+        };
+
+        let mut ready = Vec::new();
+        for (fd, event) in interests {
+            let requested_events = event.events;
+            let ready_events = self.epoll_ready_events(fd, requested_events);
+            if ready_events != 0 {
+                ready.push(LinuxEpollEvent {
+                    events: ready_events,
+                    data: event.data,
+                });
+                if ready.len() == max_events {
+                    break;
+                }
+            }
+        }
+
+        let event_size = core::mem::size_of::<LinuxEpollEvent>();
+        for (index, event) in ready.iter().enumerate() {
+            let offset = index
+                .checked_mul(event_size)
+                .and_then(|offset| u64::try_from(offset).ok())
+                .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
+            let address = events_address.checked_add(offset).ok_or(LINUX_EFAULT);
+            let Ok(address) = address else {
+                return Ok(DispatchOutcome::Errno {
+                    errno: LINUX_EFAULT,
+                });
+            };
+            if memory.write_bytes(address, event.as_bytes()).is_err() {
+                return Ok(DispatchOutcome::Errno {
+                    errno: LINUX_EFAULT,
+                });
+            }
+        }
+
+        Ok(DispatchOutcome::Returned {
+            value: ready.len() as i64,
+        })
+    }
+
+    fn epoll_ready_events(&self, fd: i32, requested_events: u32) -> u32 {
+        let Some(open_file) = self.open_files.get(&fd) else {
+            return 0;
+        };
+        let open = open_file.description.borrow();
+        match &*open {
+            OpenDescription::EventFd { counter, .. }
+                if *counter > 0 && requested_events & LINUX_EPOLLIN != 0 =>
+            {
+                LINUX_EPOLLIN
+            }
+            _ => 0,
         }
     }
 
@@ -1014,6 +1223,22 @@ impl SyscallDispatcher {
         Some(fd)
     }
 
+    fn install_fd(&mut self, description: OpenDescription, fd_flags: u64) -> DispatchOutcome {
+        let Some(fd) = self.allocate_fd(3) else {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        };
+        self.open_files.insert(
+            fd,
+            OpenFile {
+                description: Rc::new(RefCell::new(description)),
+                fd_flags,
+            },
+        );
+        DispatchOutcome::Returned { value: fd as i64 }
+    }
+
     fn getdents64(
         &mut self,
         request: SyscallRequest,
@@ -1079,6 +1304,11 @@ impl SyscallDispatcher {
             OpenDescription::Directory {
                 entries, offset, ..
             } => (*offset as i64, entries.len() as i64),
+            OpenDescription::EventFd { .. } | OpenDescription::Epoll { .. } => {
+                return DispatchOutcome::Errno {
+                    errno: LINUX_EINVAL,
+                };
+            }
         };
         let next = match whence {
             LINUX_SEEK_SET => offset,
@@ -1100,6 +1330,7 @@ impl SyscallDispatcher {
             OpenDescription::File { offset, .. }
             | OpenDescription::Directory { offset, .. }
             | OpenDescription::SyntheticFile { offset, .. } => *offset = next as usize,
+            OpenDescription::EventFd { .. } | OpenDescription::Epoll { .. } => {}
         }
         DispatchOutcome::Returned { value: next }
     }
@@ -1170,7 +1401,9 @@ impl SyscallDispatcher {
             let contents = match &*open {
                 OpenDescription::File { contents, .. }
                 | OpenDescription::SyntheticFile { contents, .. } => contents,
-                OpenDescription::Directory { .. } => {
+                OpenDescription::Directory { .. }
+                | OpenDescription::EventFd { .. }
+                | OpenDescription::Epoll { .. } => {
                     return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
                 }
             };
@@ -1312,9 +1545,17 @@ impl SyscallDispatcher {
             | OpenDescription::SyntheticFile {
                 contents, offset, ..
             } => (contents, offset),
+            OpenDescription::EventFd {
+                counter, semaphore, ..
+            } => return Ok(read_eventfd(memory, address, length, counter, *semaphore)),
             OpenDescription::Directory { .. } => {
                 return Ok(DispatchOutcome::Errno {
                     errno: LINUX_EISDIR,
+                });
+            }
+            OpenDescription::Epoll { .. } => {
+                return Ok(DispatchOutcome::Errno {
+                    errno: LINUX_EINVAL,
                 });
             }
         };
@@ -1356,9 +1597,11 @@ impl SyscallDispatcher {
             | OpenDescription::SyntheticFile {
                 contents, offset, ..
             } => (contents, offset),
-            OpenDescription::Directory { .. } => {
+            OpenDescription::Directory { .. }
+            | OpenDescription::EventFd { .. }
+            | OpenDescription::Epoll { .. } => {
                 return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_EISDIR,
+                    errno: LINUX_EINVAL,
                 });
             }
         };
@@ -1387,9 +1630,11 @@ impl SyscallDispatcher {
         let contents = match &*open {
             OpenDescription::File { contents, .. }
             | OpenDescription::SyntheticFile { contents, .. } => contents,
-            OpenDescription::Directory { .. } => {
+            OpenDescription::Directory { .. }
+            | OpenDescription::EventFd { .. }
+            | OpenDescription::Epoll { .. } => {
                 return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_EISDIR,
+                    errno: LINUX_EINVAL,
                 });
             }
         };
@@ -1432,7 +1677,14 @@ impl SyscallDispatcher {
             1 => self.stdout.extend_from_slice(&bytes),
             2 => self.stderr.extend_from_slice(&bytes),
             _ => {
-                return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+                let Some(open_file) = self.open_files.get(&(fd as i32)) else {
+                    return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+                };
+                let mut open = open_file.description.borrow_mut();
+                let OpenDescription::EventFd { counter, .. } = &mut *open else {
+                    return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+                };
+                return Ok(write_eventfd(&bytes, counter));
             }
         }
 
@@ -1599,6 +1851,12 @@ impl SyscallDispatcher {
             OpenDescription::SyntheticFile { path, contents, .. } => {
                 return write_synthetic_stat(memory, statbuf, path, contents.len());
             }
+            OpenDescription::EventFd { .. } => {
+                return write_synthetic_stat(memory, statbuf, "anon_inode:[eventfd]", 0);
+            }
+            OpenDescription::Epoll { .. } => {
+                return write_synthetic_stat(memory, statbuf, "anon_inode:[eventpoll]", 0);
+            }
         };
         write_stat(memory, statbuf, metadata)
     }
@@ -1620,9 +1878,10 @@ impl SyscallDispatcher {
         match self.open_files.get(&(dirfd as i32)) {
             Some(open_file) => match &*open_file.description.borrow() {
                 OpenDescription::Directory { path: dir, .. } => Ok(join_rootfs_path(dir, path)),
-                OpenDescription::File { .. } | OpenDescription::SyntheticFile { .. } => {
-                    Err(LINUX_ENOTDIR)
-                }
+                OpenDescription::File { .. }
+                | OpenDescription::SyntheticFile { .. }
+                | OpenDescription::EventFd { .. }
+                | OpenDescription::Epoll { .. } => Err(LINUX_ENOTDIR),
             },
             None => Err(LINUX_EBADF),
         }
@@ -1813,6 +2072,78 @@ CPU part\t: 0x000\n\
 CPU revision\t: 0\n\
 \n\
 Hardware\t: Carrick\n"
+}
+
+fn read_eventfd(
+    memory: &mut impl GuestMemory,
+    address: u64,
+    length: usize,
+    counter: &mut u64,
+    semaphore: bool,
+) -> DispatchOutcome {
+    if length < core::mem::size_of::<LinuxEventfdValue>() {
+        return DispatchOutcome::Errno {
+            errno: LINUX_EINVAL,
+        };
+    }
+    if *counter == 0 {
+        return DispatchOutcome::Errno {
+            errno: LINUX_EAGAIN,
+        };
+    }
+    let value = if semaphore { 1 } else { *counter };
+    let eventfd_value = LinuxEventfdValue { value };
+    if memory
+        .write_bytes(address, eventfd_value.as_bytes())
+        .is_err()
+    {
+        return DispatchOutcome::Errno {
+            errno: LINUX_EFAULT,
+        };
+    }
+    if semaphore {
+        *counter -= 1;
+    } else {
+        *counter = 0;
+    }
+    DispatchOutcome::Returned {
+        value: core::mem::size_of::<LinuxEventfdValue>() as i64,
+    }
+}
+
+fn write_eventfd(bytes: &[u8], counter: &mut u64) -> DispatchOutcome {
+    if bytes.len() != core::mem::size_of::<LinuxEventfdValue>() {
+        return DispatchOutcome::Errno {
+            errno: LINUX_EINVAL,
+        };
+    }
+    let Ok(value) = LinuxEventfdValue::read_from_bytes(bytes) else {
+        return DispatchOutcome::Errno {
+            errno: LINUX_EINVAL,
+        };
+    };
+    let increment = value.value;
+    if increment == u64::MAX {
+        return DispatchOutcome::Errno {
+            errno: LINUX_EINVAL,
+        };
+    }
+    let Some(next) = counter.checked_add(increment) else {
+        return DispatchOutcome::Errno {
+            errno: LINUX_EAGAIN,
+        };
+    };
+    *counter = next;
+    DispatchOutcome::Returned {
+        value: core::mem::size_of::<LinuxEventfdValue>() as i64,
+    }
+}
+
+fn read_epoll_event(memory: &impl GuestMemory, address: u64) -> Result<LinuxEpollEvent, i32> {
+    let bytes = memory
+        .read_bytes(address, core::mem::size_of::<LinuxEpollEvent>())
+        .map_err(|_| LINUX_EFAULT)?;
+    LinuxEpollEvent::read_from_bytes(&bytes).map_err(|_| LINUX_EFAULT)
 }
 
 fn read_iovecs(
