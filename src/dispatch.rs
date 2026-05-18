@@ -10,7 +10,7 @@ use crate::linux_abi::{
     LINUX_DIRENT64_HEADER_SIZE, LINUX_DT_DIR, LINUX_DT_LNK, LINUX_DT_REG, LINUX_PAGE_SIZE,
     LINUX_S_IFDIR, LINUX_S_IFLNK, LINUX_S_IFREG, LinuxDirent64Header, LinuxIovec, LinuxRlimit,
     LinuxSigaction, LinuxStat, LinuxStatfs, LinuxTimespec, LinuxTimeval, LinuxTimezone,
-    LinuxUtsname,
+    LinuxUtsname, LinuxWinsize,
 };
 use crate::memory::{LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE, LINUX_MMAP_SIZE};
 use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsError, RootFsMetadata};
@@ -27,6 +27,7 @@ pub const LINUX_EFAULT: i32 = 14;
 pub const LINUX_ENOTDIR: i32 = 20;
 pub const LINUX_EISDIR: i32 = 21;
 pub const LINUX_EINVAL: i32 = 22;
+pub const LINUX_ENOTTY: i32 = 25;
 pub const LINUX_ERANGE: i32 = 34;
 pub const LINUX_ENAMETOOLONG: i32 = 36;
 pub const LINUX_ENOSYS: i32 = 38;
@@ -55,6 +56,7 @@ pub const LINUX_MAP_FIXED: u64 = 0x10;
 pub const LINUX_MAP_ANONYMOUS: u64 = 0x20;
 pub const LINUX_RLIM_INFINITY: u64 = u64::MAX;
 pub const LINUX_OVERLAYFS_SUPER_MAGIC: i64 = 0x794c7630;
+const LINUX_TIOCGWINSZ: u64 = 0x5413;
 const LINUX_RT_SIGSET_SIZE: u64 = 8;
 const LINUX_CLOCK_REALTIME: u64 = 0;
 const LINUX_CLOCK_MONOTONIC: u64 = 1;
@@ -322,6 +324,7 @@ impl SyscallDispatcher {
             23 => self.dup(request),
             24 => self.dup3(request),
             25 => self.fcntl(request),
+            29 => self.ioctl(request, memory, reporter),
             43 => self.statfs(request, memory)?,
             44 => self.fstatfs(request, memory),
             48 => self.faccessat(request, memory)?,
@@ -640,6 +643,40 @@ impl SyscallDispatcher {
                 errno: LINUX_EINVAL,
             },
         }
+    }
+
+    fn ioctl(
+        &self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+        reporter: &mut CompatReporter,
+    ) -> DispatchOutcome {
+        let fd = request.arg(0) as i32;
+        let ioctl_request = request.arg(1);
+        let arg = request.arg(2);
+        if !self.fd_is_valid(fd) {
+            return DispatchOutcome::Errno { errno: LINUX_EBADF };
+        }
+
+        match ioctl_request {
+            LINUX_TIOCGWINSZ if is_stdio_fd(fd) => {
+                let winsize = LinuxWinsize::terminal_80x24();
+                write_packed(memory, arg, winsize.as_bytes())
+            }
+            LINUX_TIOCGWINSZ => DispatchOutcome::Errno {
+                errno: LINUX_ENOTTY,
+            },
+            _ => {
+                reporter.record(CompatEvent::unhandled_ioctl(fd, ioctl_request, arg));
+                DispatchOutcome::Errno {
+                    errno: LINUX_ENOTTY,
+                }
+            }
+        }
+    }
+
+    fn fd_is_valid(&self, fd: i32) -> bool {
+        is_stdio_fd(fd) || self.open_files.contains_key(&fd)
     }
 
     fn statfs(
@@ -1627,6 +1664,10 @@ fn linux_fd_flags_from_open_flags(flags: u64) -> u64 {
     } else {
         0
     }
+}
+
+fn is_stdio_fd(fd: i32) -> bool {
+    matches!(fd, 0..=2)
 }
 
 fn linux_min_fd(value: u64) -> Result<i32, i32> {

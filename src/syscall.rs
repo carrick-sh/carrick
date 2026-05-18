@@ -71,7 +71,7 @@ const AARCH64_SYSCALLS: &[Syscall] = &[
     syscall(26, "inotify_init1", "fs", SupportLevel::Deferred),
     syscall(27, "inotify_add_watch", "fs", SupportLevel::Deferred),
     syscall(28, "inotify_rm_watch", "fs", SupportLevel::Deferred),
-    syscall(29, "ioctl", "fs", SupportLevel::Planned),
+    syscall(29, "ioctl", "fs", SupportLevel::BringUp),
     syscall(30, "ioprio_set", "sched", SupportLevel::Deferred),
     syscall(31, "ioprio_get", "sched", SupportLevel::Deferred),
     syscall(32, "flock", "fs", SupportLevel::Planned),

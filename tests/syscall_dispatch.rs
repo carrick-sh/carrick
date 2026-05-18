@@ -7,7 +7,7 @@ use carrick::elf::SegmentPerms;
 use carrick::linux_abi::{
     LINUX_DIRENT64_HEADER_SIZE, LINUX_DT_REG, LINUX_S_IFDIR, LINUX_S_IFMT, LINUX_S_IFREG,
     LinuxDirent64Header, LinuxIovec, LinuxRlimit, LinuxStat, LinuxStatfs, LinuxTimespec,
-    LinuxTimeval, LinuxTimezone, LinuxUtsname,
+    LinuxTimeval, LinuxTimezone, LinuxUtsname, LinuxWinsize,
 };
 use carrick::memory::{AddressSpace, LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE};
 use carrick::rootfs::{LayerSource, RootFs};
@@ -24,6 +24,7 @@ const LINUX_FD_CLOEXEC: u64 = 1;
 const LINUX_F_DUPFD_CLOEXEC: u64 = 1030;
 const LINUX_O_CLOEXEC: u64 = 0o2000000;
 const LINUX_OVERLAYFS_SUPER_MAGIC: i64 = 0x794c7630;
+const LINUX_TIOCGWINSZ: u64 = 0x5413;
 
 #[test]
 fn write_syscall_reads_guest_memory_and_writes_stdout() {
@@ -120,6 +121,47 @@ fn unknown_syscall_returns_enosys_and_records_report_entry() {
     assert_eq!(report.unhandled_syscalls[0].number, 9999);
     assert_eq!(report.unhandled_syscalls[0].name, "unknown");
     assert_eq!(report.unhandled_syscalls[0].count, 1);
+}
+
+#[test]
+fn ioctl_writes_packed_winsize_and_reports_unknown_requests() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    29,
+                    SyscallArgs::from([1, LINUX_TIOCGWINSZ, 0x4000, 0, 0, 0])
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let winsize = read_winsize(&memory, 0x4000);
+    let rows = winsize.ws_row;
+    let cols = winsize.ws_col;
+    assert_eq!(rows, 24);
+    assert_eq!(cols, 80);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(29, SyscallArgs::from([1, 0xdead_beef, 0x4040, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 25 }
+    );
+    let report = reporter.finish();
+    assert!(report.unhandled_syscalls.is_empty());
+    assert_eq!(report.unhandled_ioctls[0].request, 0xdead_beef);
+    assert_eq!(report.unhandled_ioctls[0].count, 1);
 }
 
 #[test]
@@ -1613,6 +1655,13 @@ fn read_statfs(memory: &impl GuestMemory, address: u64) -> LinuxStatfs {
         .unwrap();
     let (statfs, _) = LinuxStatfs::read_from_prefix(&bytes).unwrap();
     statfs
+}
+
+fn read_winsize(memory: &impl GuestMemory, address: u64) -> LinuxWinsize {
+    let bytes = memory
+        .read_bytes(address, std::mem::size_of::<LinuxWinsize>())
+        .unwrap();
+    LinuxWinsize::read_from_bytes(&bytes).unwrap()
 }
 
 fn read_utsname(memory: &impl GuestMemory, address: u64) -> LinuxUtsname {
