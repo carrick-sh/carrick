@@ -6,9 +6,10 @@ use carrick::dispatch::{
 use carrick::elf::SegmentPerms;
 use carrick::linux_abi::{
     LINUX_DIRENT64_HEADER_SIZE, LINUX_DT_REG, LINUX_S_IFDIR, LINUX_S_IFMT, LINUX_S_IFREG,
-    LinuxDirent64Header, LinuxEpollEvent, LinuxEventfdValue, LinuxFdPair, LinuxIovec,
-    LinuxItimerspec, LinuxPollFd, LinuxRlimit, LinuxStat, LinuxStatfs, LinuxTimerfdExpirations,
-    LinuxTimespec, LinuxTimeval, LinuxTimezone, LinuxUtsname, LinuxWinsize,
+    LinuxCapabilityData, LinuxCapabilityHeader, LinuxDirent64Header, LinuxEpollEvent,
+    LinuxEventfdValue, LinuxFdPair, LinuxIovec, LinuxItimerspec, LinuxPollFd, LinuxRlimit,
+    LinuxStat, LinuxStatfs, LinuxTimerfdExpirations, LinuxTimespec, LinuxTimeval, LinuxTimezone,
+    LinuxUtsname, LinuxWinsize,
 };
 use carrick::memory::{AddressSpace, LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE};
 use carrick::rootfs::{LayerSource, RootFs};
@@ -30,6 +31,9 @@ const LINUX_OVERLAYFS_SUPER_MAGIC: i64 = 0x794c7630;
 const LINUX_EFD_NONBLOCK: u64 = LINUX_O_NONBLOCK;
 const LINUX_EPOLL_CTL_ADD: u64 = 1;
 const LINUX_EPOLLIN: u32 = 0x001;
+const LINUX_CAPABILITY_VERSION_3: u32 = 0x20080522;
+const LINUX_PERSONALITY_QUERY: u64 = 0xffff_ffff;
+const LINUX_ADDR_NO_RANDOMIZE: u64 = 0x0040_0000;
 const LINUX_POLLIN: i16 = 0x0001;
 const LINUX_POLLOUT: i16 = 0x0004;
 const LINUX_POLLNVAL: i16 = 0x0020;
@@ -2087,6 +2091,113 @@ fn process_identity_syscalls_return_bootstrap_ids() {
 }
 
 #[test]
+fn capget_writes_empty_bootstrap_capability_sets() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
+    write_capability_header(&mut memory, 0x4000, LINUX_CAPABILITY_VERSION_3, 0);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(90, SyscallArgs::from([0x4000, 0x4080, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        read_capability_data(&memory, 0x4080, 2),
+        vec![(0, 0, 0), (0, 0, 0)]
+    );
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn capset_accepts_empty_sets_and_rejects_nonempty_sets() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
+    write_capability_header(&mut memory, 0x4000, LINUX_CAPABILITY_VERSION_3, 0);
+    write_capability_data(&mut memory, 0x4080, [(0, 0, 0), (0, 0, 0)]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(91, SyscallArgs::from([0x4000, 0x4080, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    write_capability_data(&mut memory, 0x4080, [(1, 0, 0), (0, 0, 0)]);
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(91, SyscallArgs::from([0x4000, 0x4080, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 1 }
+    );
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn personality_query_and_set_round_trip_bootstrap_flags() {
+    let mut memory = LinearMemory::new(0x4000, Vec::new());
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    92,
+                    SyscallArgs::from([LINUX_PERSONALITY_QUERY, 0, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    92,
+                    SyscallArgs::from([LINUX_ADDR_NO_RANDOMIZE, 0, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    92,
+                    SyscallArgs::from([LINUX_PERSONALITY_QUERY, 0, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned {
+            value: LINUX_ADDR_NO_RANDOMIZE as i64
+        }
+    );
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
 fn set_tid_address_and_robust_list_are_bootstrap_successes() {
     let mut memory = LinearMemory::new(0x4000, Vec::new());
     let mut reporter = CompatReporter::default();
@@ -2569,6 +2680,49 @@ fn read_fd_set(memory: &impl GuestMemory, address: u64, nfds: usize) -> Vec<i32>
 
 fn linux_fd_set_len(nfds: usize) -> usize {
     nfds.div_ceil(64) * 8
+}
+
+fn write_capability_header(memory: &mut impl GuestMemory, address: u64, version: u32, pid: i32) {
+    memory
+        .write_bytes(address, LinuxCapabilityHeader { version, pid }.as_bytes())
+        .unwrap();
+}
+
+fn write_capability_data<const N: usize>(
+    memory: &mut impl GuestMemory,
+    address: u64,
+    data: [(u32, u32, u32); N],
+) {
+    let mut bytes = Vec::new();
+    for (effective, permitted, inheritable) in data {
+        bytes.extend_from_slice(
+            LinuxCapabilityData {
+                effective,
+                permitted,
+                inheritable,
+            }
+            .as_bytes(),
+        );
+    }
+    memory.write_bytes(address, &bytes).unwrap();
+}
+
+fn read_capability_data(
+    memory: &impl GuestMemory,
+    address: u64,
+    count: usize,
+) -> Vec<(u32, u32, u32)> {
+    let bytes = memory.read_bytes(address, count * 12).unwrap();
+    bytes
+        .chunks_exact(12)
+        .map(|data| {
+            let data = LinuxCapabilityData::read_from_bytes(data).unwrap();
+            let effective = data.effective;
+            let permitted = data.permitted;
+            let inheritable = data.inheritable;
+            (effective, permitted, inheritable)
+        })
+        .collect()
 }
 
 fn rw_perms() -> SegmentPerms {

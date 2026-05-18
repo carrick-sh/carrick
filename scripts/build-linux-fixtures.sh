@@ -56,6 +56,7 @@ build_fixture "argv_echo.rs" "carrick-linux-aarch64-argv-echo"
 build_fixture "timerfd_epoll.rs" "carrick-linux-aarch64-timerfd-epoll"
 build_fixture "ppoll_eventfd.rs" "carrick-linux-aarch64-ppoll-eventfd"
 build_fixture "pselect_eventfd.rs" "carrick-linux-aarch64-pselect-eventfd"
+build_fixture "process_bootstrap.rs" "carrick-linux-aarch64-process-bootstrap"
 
 cargo metadata \
   --manifest-path "$fixture_dir/Cargo.toml" \

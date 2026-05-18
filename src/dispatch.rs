@@ -8,10 +8,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::compat::{CompatEvent, CompatReporter, SyscallArgs};
 use crate::linux_abi::{
     LINUX_DIRENT64_HEADER_SIZE, LINUX_DT_DIR, LINUX_DT_LNK, LINUX_DT_REG, LINUX_PAGE_SIZE,
-    LINUX_S_IFDIR, LINUX_S_IFLNK, LINUX_S_IFREG, LinuxDirent64Header, LinuxEpollEvent,
-    LinuxEventfdValue, LinuxFdPair, LinuxIovec, LinuxItimerspec, LinuxPollFd, LinuxRlimit,
-    LinuxSigaction, LinuxStat, LinuxStatfs, LinuxTimerfdExpirations, LinuxTimespec, LinuxTimeval,
-    LinuxTimezone, LinuxUtsname, LinuxWinsize,
+    LINUX_S_IFDIR, LINUX_S_IFLNK, LINUX_S_IFREG, LinuxCapabilityData, LinuxCapabilityHeader,
+    LinuxDirent64Header, LinuxEpollEvent, LinuxEventfdValue, LinuxFdPair, LinuxIovec,
+    LinuxItimerspec, LinuxPollFd, LinuxRlimit, LinuxSigaction, LinuxStat, LinuxStatfs,
+    LinuxTimerfdExpirations, LinuxTimespec, LinuxTimeval, LinuxTimezone, LinuxUtsname,
+    LinuxWinsize,
 };
 use crate::memory::{LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE, LINUX_MMAP_SIZE};
 use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsError, RootFsMetadata};
@@ -20,7 +21,9 @@ use serde::Serialize;
 use thiserror::Error;
 use zerocopy::{FromBytes, IntoBytes};
 
+pub const LINUX_EPERM: i32 = 1;
 pub const LINUX_ENOENT: i32 = 2;
+pub const LINUX_ESRCH: i32 = 3;
 pub const LINUX_EBADF: i32 = 9;
 pub const LINUX_EAGAIN: i32 = 11;
 pub const LINUX_ENOMEM: i32 = 12;
@@ -88,6 +91,10 @@ const LINUX_CLOCK_REALTIME_COARSE: u64 = 5;
 const LINUX_CLOCK_MONOTONIC_COARSE: u64 = 6;
 const LINUX_CLOCK_BOOTTIME: u64 = 7;
 const LINUX_CLOCK_RESOLUTION_NSEC: i64 = 1_000_000;
+const LINUX_CAPABILITY_VERSION_1: u32 = 0x1998_0330;
+const LINUX_CAPABILITY_VERSION_2: u32 = 0x2007_1026;
+const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+const LINUX_PERSONALITY_QUERY: u64 = 0xffff_ffff;
 const MAX_GUEST_PATH: usize = 4096;
 const LINUX_IOV_MAX: usize = 1024;
 
@@ -229,6 +236,7 @@ pub struct SyscallDispatcher {
     brk_current: u64,
     mmap_next: u64,
     executable_path: String,
+    personality: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -355,6 +363,7 @@ impl SyscallDispatcher {
             brk_current: LINUX_HEAP_BASE,
             mmap_next: LINUX_MMAP_BASE,
             executable_path: "/proc/self/exe".to_owned(),
+            personality: 0,
         }
     }
 
@@ -433,6 +442,9 @@ impl SyscallDispatcher {
             85 => self.timerfd_create(request),
             86 => self.timerfd_settime(request, memory),
             87 => self.timerfd_gettime(request, memory),
+            90 => self.capget(request, memory),
+            91 => self.capset(request, memory),
+            92 => self.personality(request),
             93 => self.exit(request),
             94 => self.exit(request),
             96 => self.set_tid_address(),
@@ -1353,6 +1365,74 @@ impl SyscallDispatcher {
             return DispatchOutcome::Errno { errno: LINUX_EBADF };
         }
         write_statfs(memory, request.arg(1))
+    }
+
+    fn capget(&self, request: SyscallRequest, memory: &mut impl GuestMemory) -> DispatchOutcome {
+        let header_address = request.arg(0);
+        let data_address = request.arg(1);
+        let header = match read_capability_header(memory, header_address) {
+            Ok(header) => header,
+            Err(errno) => return DispatchOutcome::Errno { errno },
+        };
+        if !linux_capability_version_is_supported(header.version) {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+        if header.pid < 0 {
+            return DispatchOutcome::Errno { errno: LINUX_ESRCH };
+        }
+        if data_address == 0 {
+            return DispatchOutcome::Returned { value: 0 };
+        }
+        let words = linux_capability_data_words(header.version);
+        let empty = vec![LinuxCapabilityData::empty(); words];
+        if memory
+            .write_bytes(data_address, capability_data_bytes(&empty).as_slice())
+            .is_err()
+        {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EFAULT,
+            };
+        }
+        DispatchOutcome::Returned { value: 0 }
+    }
+
+    fn capset(&self, request: SyscallRequest, memory: &impl GuestMemory) -> DispatchOutcome {
+        let header_address = request.arg(0);
+        let data_address = request.arg(1);
+        let header = match read_capability_header(memory, header_address) {
+            Ok(header) => header,
+            Err(errno) => return DispatchOutcome::Errno { errno },
+        };
+        if !linux_capability_version_is_supported(header.version) {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+        if header.pid < 0 {
+            return DispatchOutcome::Errno { errno: LINUX_ESRCH };
+        }
+        let words = linux_capability_data_words(header.version);
+        let data = match read_capability_data(memory, data_address, words) {
+            Ok(data) => data,
+            Err(errno) => return DispatchOutcome::Errno { errno },
+        };
+        if data.iter().any(|word| !word.is_empty()) {
+            return DispatchOutcome::Errno { errno: LINUX_EPERM };
+        }
+        DispatchOutcome::Returned { value: 0 }
+    }
+
+    fn personality(&mut self, request: SyscallRequest) -> DispatchOutcome {
+        let requested = request.arg(0);
+        let previous = self.personality;
+        if requested != LINUX_PERSONALITY_QUERY {
+            self.personality = requested;
+        }
+        DispatchOutcome::Returned {
+            value: previous as i64,
+        }
     }
 
     fn set_tid_address(&self) -> DispatchOutcome {
@@ -2860,6 +2940,55 @@ fn read_pollfd(memory: &impl GuestMemory, address: u64) -> Result<LinuxPollFd, i
         .read_bytes(address, core::mem::size_of::<LinuxPollFd>())
         .map_err(|_| LINUX_EFAULT)?;
     LinuxPollFd::read_from_bytes(&bytes).map_err(|_| LINUX_EFAULT)
+}
+
+fn read_capability_header(
+    memory: &impl GuestMemory,
+    address: u64,
+) -> Result<LinuxCapabilityHeader, i32> {
+    let bytes = memory
+        .read_bytes(address, core::mem::size_of::<LinuxCapabilityHeader>())
+        .map_err(|_| LINUX_EFAULT)?;
+    LinuxCapabilityHeader::read_from_bytes(&bytes).map_err(|_| LINUX_EFAULT)
+}
+
+fn read_capability_data(
+    memory: &impl GuestMemory,
+    address: u64,
+    count: usize,
+) -> Result<Vec<LinuxCapabilityData>, i32> {
+    let size = core::mem::size_of::<LinuxCapabilityData>();
+    let length = count.checked_mul(size).ok_or(LINUX_EINVAL)?;
+    let bytes = memory
+        .read_bytes(address, length)
+        .map_err(|_| LINUX_EFAULT)?;
+    bytes
+        .chunks_exact(size)
+        .map(|chunk| LinuxCapabilityData::read_from_bytes(chunk).map_err(|_| LINUX_EFAULT))
+        .collect()
+}
+
+fn capability_data_bytes(data: &[LinuxCapabilityData]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(data.len() * core::mem::size_of::<LinuxCapabilityData>());
+    for word in data {
+        bytes.extend_from_slice(word.as_bytes());
+    }
+    bytes
+}
+
+fn linux_capability_version_is_supported(version: u32) -> bool {
+    matches!(
+        version,
+        LINUX_CAPABILITY_VERSION_1 | LINUX_CAPABILITY_VERSION_2 | LINUX_CAPABILITY_VERSION_3
+    )
+}
+
+fn linux_capability_data_words(version: u32) -> usize {
+    if version == LINUX_CAPABILITY_VERSION_1 {
+        1
+    } else {
+        2
+    }
 }
 
 fn read_fd_set(memory: &impl GuestMemory, address: u64, nfds: usize) -> Result<Vec<u8>, i32> {

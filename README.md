@@ -38,9 +38,9 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
   `statfs(2)`, `fstatfs(2)`, `getdents64(2)`, `lseek(2)`, `readlinkat(2)`,
   `pipe2(2)`, `read(2)`, `readv(2)`, `pread64(2)`, `write(2)`, `writev(2)`,
   `pselect6(2)`, `ppoll(2)`, `timerfd_create(2)`, `timerfd_settime(2)`,
-  `timerfd_gettime(2)`, `close(2)`, `newfstatat(2)`, `fstat(2)`, `exit(2)`,
-  `ENOENT`, `EACCES`, `EFAULT`,
-  `EBADF`, and `ENOSYS` paths are covered by tests.
+  `timerfd_gettime(2)`, `close(2)`, `newfstatat(2)`, `fstat(2)`, `capget(2)`,
+  `capset(2)`, `personality(2)`, `exit(2)`, `ENOENT`, `EACCES`, `EFAULT`,
+  `EPERM`, `EBADF`, and `ENOSYS` paths are covered by tests.
 - Loaded ELFs include bootstrap heap and mmap arenas. The dispatcher can
   service `brk(2)`, file-backed and anonymous `mmap(2)`, bootstrap no-op
   `mprotect(2)`/`munmap(2)`, and `exit_group(2)`, which gives `ld-linux` a
@@ -48,13 +48,14 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
 - Dynamic-linker bring-up syscalls now include bootstrap `uname(2)`, `getpid(2)`
   and uid/gid identity calls, `set_tid_address(2)`, `set_robust_list(2)`,
   `clock_gettime(2)`, `clock_getres(2)`, `gettimeofday(2)`, `prlimit64(2)`,
-  `getrandom(2)`, and minimal `rt_sigaction(2)`/`rt_sigprocmask(2)` stubs.
+  `getrandom(2)`, process capability probes, `personality(2)`, and minimal
+  `rt_sigaction(2)`/`rt_sigprocmask(2)` stubs.
 - Linux ABI outputs for `stat`, `statfs`, `getdents64`, `iovec`,
-  `eventfd` counters, `timerfd` timers and expiration counts, `epoll_event`, `pollfd`,
-  `pipe2` fd pairs, `winsize`, `timespec`, `timeval`, `timezone`, auxv entries,
-  `utsname`, `rlimit`, and signal-action stubs are represented by packed Rust
-  structs in `linux_abi`, with `zerocopy` used to expose initialized bytes for
-  guest-memory writes.
+  `eventfd` counters, `timerfd` timers and expiration counts, `epoll_event`,
+  `pollfd`, capability headers/data, `pipe2` fd pairs, `winsize`, `timespec`,
+  `timeval`, `timezone`, auxv entries, `utsname`, `rlimit`, and signal-action
+  stubs are represented by packed Rust structs in `linux_abi`, with `zerocopy`
+  used to expose initialized bytes for guest-memory writes.
 - The dispatcher now has a rootfs-backed file descriptor table for read-only
   file opens from composed OCI layers. Duplicated descriptors share open-file
   offsets while keeping descriptor flags such as `FD_CLOEXEC` per descriptor,
@@ -81,9 +82,9 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
 - `scripts/build-linux-fixtures.sh` builds static Linux/aarch64 Rust fixtures
   whose guest behavior covers direct `write(2)`, initial-stack argv reads,
   `openat(2)`, `eventfd2(2)`, `pselect6(2)`, `ppoll(2)`, `timerfd_create(2)`,
-  `timerfd_settime(2)`, `epoll_pwait(2)`, `read(2)`, `close(2)`, and
-  `exit(2)`, giving the loader, HVF loop, rootfs, and dispatcher a tight
-  feedback loop.
+  `timerfd_settime(2)`, `epoll_pwait(2)`, `capget(2)`, `capset(2)`,
+  `personality(2)`, `read(2)`, `close(2)`, and `exit(2)`, giving the loader,
+  HVF loop, rootfs, and dispatcher a tight feedback loop.
 
 `shell` and `exec` are present as CLI surfaces, but they still stop before
 interactive process execution. `run` can map a dynamic ELF's rootfs-backed

@@ -121,6 +121,39 @@ pub struct LinuxPollFd {
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
 )]
+pub struct LinuxCapabilityHeader {
+    pub version: u32,
+    pub pid: i32,
+}
+
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct LinuxCapabilityData {
+    pub effective: u32,
+    pub permitted: u32,
+    pub inheritable: u32,
+}
+
+impl LinuxCapabilityData {
+    pub const fn empty() -> Self {
+        Self {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        }
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.effective == 0 && self.permitted == 0 && self.inheritable == 0
+    }
+}
+
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
 pub struct LinuxFdPair {
     pub read_fd: i32,
     pub write_fd: i32,
