@@ -42,10 +42,18 @@ pub fn run_static_elf_with_hvf(
     path: impl AsRef<Path>,
     max_traps: usize,
 ) -> Result<RunResult, RuntimeError> {
+    run_static_elf_with_hvf_and_dispatcher(path, SyscallDispatcher::new(), max_traps)
+}
+
+pub fn run_static_elf_with_hvf_and_dispatcher(
+    path: impl AsRef<Path>,
+    dispatcher: SyscallDispatcher,
+    max_traps: usize,
+) -> Result<RunResult, RuntimeError> {
     let image = AddressSpace::load_elf(path)?;
     let mut trap = HvfTrapEngine::new()?;
     trap.map_address_space(&image)?;
-    run_combined_syscall_loop(&mut trap, max_traps)
+    run_combined_syscall_loop_with_dispatcher(&mut trap, dispatcher, max_traps)
 }
 
 pub fn run_syscall_loop<M, T>(

@@ -7,7 +7,7 @@ use carrick::elf::{inspect_elf, plan_elf_load};
 use carrick::memory::AddressSpace;
 use carrick::oci::{ImageReference, ImageStore, pull_image};
 use carrick::rootfs::RootFs;
-use carrick::runtime::{DEFAULT_MAX_TRAPS, run_static_elf_with_hvf};
+use carrick::runtime::{DEFAULT_MAX_TRAPS, run_static_elf_with_hvf_and_dispatcher};
 use carrick::syscall::{aarch64_table, lookup_aarch64};
 use carrick::trap::hvf_capabilities;
 use clap::{Parser, Subcommand};
@@ -36,6 +36,8 @@ enum Commands {
     },
     RunElf {
         path: PathBuf,
+        #[arg(long = "rootfs-layer")]
+        rootfs_layers: Vec<PathBuf>,
         #[arg(long, default_value_t = DEFAULT_MAX_TRAPS)]
         max_traps: usize,
     },
@@ -134,13 +136,26 @@ async fn main() -> anyhow::Result<()> {
                 }))?
             );
         }
-        Commands::RunElf { path, max_traps } => {
-            let result = run_static_elf_with_hvf(&path, max_traps)
+        Commands::RunElf {
+            path,
+            rootfs_layers,
+            max_traps,
+        } => {
+            let dispatcher = if rootfs_layers.is_empty() {
+                SyscallDispatcher::new()
+            } else {
+                SyscallDispatcher::with_rootfs(
+                    RootFs::from_layer_paths(&rootfs_layers)
+                        .context("failed to compose rootfs layers")?,
+                )
+            };
+            let result = run_static_elf_with_hvf_and_dispatcher(&path, dispatcher, max_traps)
                 .with_context(|| format!("failed to run static ELF {}", path.display()))?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
                     "path": path,
+                    "rootfs_layers": rootfs_layers,
                     "exit_code": result.exit_code,
                     "stdout": String::from_utf8_lossy(&result.stdout),
                     "stderr": String::from_utf8_lossy(&result.stderr),

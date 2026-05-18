@@ -165,6 +165,53 @@ fn run_elf_command_executes_or_reports_hvf_backend_error() {
     }
 }
 
+#[test]
+fn run_elf_command_can_use_rootfs_layers_for_static_fixture() {
+    let output = std::process::Command::new("scripts/build-linux-fixtures.sh")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "fixture build failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let layer = dir.path().join("rootfs.tar.gz");
+    std::fs::write(
+        &layer,
+        gzip_tar([("etc/motd", b"rootfs says hello\n".as_slice())]),
+    )
+    .unwrap();
+
+    let output = Command::cargo_bin("carrick")
+        .unwrap()
+        .args([
+            "run-elf",
+            "fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-cat-motd",
+            "--rootfs-layer",
+            layer.to_str().unwrap(),
+            "--max-traps",
+            "16",
+        ])
+        .output()
+        .unwrap();
+
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("\"exit_code\": 0"));
+        assert!(stdout.contains("rootfs says hello"));
+        assert!(stdout.contains("\"traps\": 5"));
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("Hypervisor.framework"),
+            "unexpected run-elf failure:\n{stderr}"
+        );
+    }
+}
+
 fn minimal_aarch64_elf() -> Vec<u8> {
     let mut elf = vec![0_u8; 64];
     elf[0..4].copy_from_slice(b"\x7fELF");

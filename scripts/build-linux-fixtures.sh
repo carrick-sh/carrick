@@ -21,32 +21,39 @@ fi
 
 out_dir="$fixture_dir/target/$target/release"
 mkdir -p "$out_dir"
-artifact="$out_dir/carrick-linux-aarch64-hello"
-tmp_dir="$(mktemp -d "$out_dir/carrick-linux-aarch64-hello.XXXXXX")"
-object="$tmp_dir/carrick-linux-aarch64-hello.o"
-artifact_tmp="$tmp_dir/carrick-linux-aarch64-hello"
+tmp_dir="$(mktemp -d "$out_dir/carrick-linux-aarch64-fixtures.XXXXXX")"
 trap 'rm -rf "$tmp_dir"' EXIT
 
-rustc "$fixture_dir/src/main.rs" \
-  --target "$target" \
-  --edition 2024 \
-  -C panic=abort \
-  -C opt-level=z \
-  --emit=obj \
-  -o "$object"
+build_fixture() {
+  local source="$1"
+  local name="$2"
+  local object="$tmp_dir/$name.o"
+  local artifact_tmp="$tmp_dir/$name"
+  local artifact="$out_dir/$name"
 
-"$lld" -flavor gnu \
-  -static \
-  --entry=_start \
-  --gc-sections \
-  -o "$artifact_tmp" \
-  "$object"
+  rustc "$fixture_dir/src/$source" \
+    --target "$target" \
+    --edition 2024 \
+    -C panic=abort \
+    -C opt-level=z \
+    --emit=obj \
+    -o "$object"
 
-mv -f "$artifact_tmp" "$artifact"
+  "$lld" -flavor gnu \
+    -static \
+    --entry=_start \
+    --gc-sections \
+    -o "$artifact_tmp" \
+    "$object"
+
+  mv -f "$artifact_tmp" "$artifact"
+  file "$artifact"
+}
+
+build_fixture "main.rs" "carrick-linux-aarch64-hello"
+build_fixture "cat_motd.rs" "carrick-linux-aarch64-cat-motd"
 
 cargo metadata \
   --manifest-path "$fixture_dir/Cargo.toml" \
   --format-version 1 \
   >/dev/null
-
-file "$artifact"

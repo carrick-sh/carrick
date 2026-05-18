@@ -12,10 +12,11 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
   mapping plan for the Mach VM/HVF runtime.
 - `carrick load-elf <path>` materializes that plan into typed guest memory
   regions with permissions and zero-filled memory past the file-backed bytes.
-- `carrick run-elf <path>` loads a static Linux/aarch64 ELF, maps it into the
-  HVF backend, runs `svc #0` exits through the host syscall dispatcher, and emits
-  stdout, stderr, exit status, trap count, and compatibility report JSON. This is
-  the tight bring-up path for the static Rust fixture.
+- `carrick run-elf <path> [--rootfs-layer layer.tar.gz ...]` loads a static
+  Linux/aarch64 ELF, maps it into the HVF backend, runs `svc #0` exits through
+  the host syscall dispatcher, and emits stdout, stderr, exit status, trap count,
+  and compatibility report JSON. This is the tight bring-up path for the static
+  Rust fixtures, including a rootfs-backed `/etc/motd` reader.
 - `carrick pull <image>` uses `oci-distribution` to fetch image layers into a
   content-addressed store under `$CARRICK_HOME` or `~/.carrick`.
 - `carrick rootfs --layer <layer.tar.gz> ...` composes OCI tar layers in memory,
@@ -46,9 +47,10 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
   back into guest registers. The same mapped HVF memory implements Carrick's
   guest-memory read/write trait, so syscall handlers can copy data into guest
   buffers.
-- `scripts/build-linux-fixtures.sh` builds a static Linux/aarch64 Rust fixture
-  whose first guest syscalls are `write(2)` and `exit(2)`, giving the loader and
-  dispatcher a tight feedback loop.
+- `scripts/build-linux-fixtures.sh` builds static Linux/aarch64 Rust fixtures
+  whose guest syscalls cover `write(2)`, `openat(2)`, `read(2)`, `close(2)`, and
+  `exit(2)`, giving the loader, HVF loop, rootfs, and dispatcher a tight
+  feedback loop.
 
 `run`, `shell`, and `exec` are present as CLI surfaces, but they still stop before
 OCI-backed process execution. The current executable path is `run-elf`, which is
