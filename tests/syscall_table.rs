@@ -91,6 +91,7 @@ fn names_linux_aarch64_bringup_syscalls() {
         (71, "sendfile"),
         (72, "pselect6"),
         (73, "ppoll"),
+        (76, "splice"),
         (85, "timerfd_create"),
         (86, "timerfd_settime"),
         (87, "timerfd_gettime"),

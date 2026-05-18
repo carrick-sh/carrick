@@ -97,6 +97,12 @@ const LINUX_POLLNVAL: i16 = 0x0020;
 const LINUX_TFD_NONBLOCK: u64 = LINUX_O_NONBLOCK;
 const LINUX_TFD_CLOEXEC: u64 = LINUX_O_CLOEXEC;
 const LINUX_TIMER_ABSTIME: u64 = 0x1;
+const LINUX_SPLICE_F_MOVE: u64 = 0x1;
+const LINUX_SPLICE_F_NONBLOCK: u64 = 0x2;
+const LINUX_SPLICE_F_MORE: u64 = 0x4;
+const LINUX_SPLICE_F_GIFT: u64 = 0x8;
+const LINUX_SPLICE_SUPPORTED_FLAGS: u64 =
+    LINUX_SPLICE_F_MOVE | LINUX_SPLICE_F_NONBLOCK | LINUX_SPLICE_F_MORE | LINUX_SPLICE_F_GIFT;
 const LINUX_FUTEX_WAIT: u64 = 0;
 const LINUX_FUTEX_WAKE: u64 = 1;
 const LINUX_FUTEX_CMD_MASK: u64 = 0x7f;
@@ -474,6 +480,7 @@ impl SyscallDispatcher {
             71 => self.sendfile(request, memory)?,
             72 => self.pselect6(request, memory)?,
             73 => self.ppoll(request, memory)?,
+            76 => self.splice(request, memory)?,
             78 => self.readlinkat(request, memory)?,
             79 => self.newfstatat(request, memory)?,
             80 => self.fstat(request, memory),
@@ -2759,6 +2766,139 @@ impl SyscallDispatcher {
         Ok(available[..write_len].to_vec())
     }
 
+    fn splice(
+        &mut self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let in_fd = request.arg(0) as i32;
+        let off_in_address = request.arg(1);
+        let out_fd = request.arg(2) as i32;
+        let off_out_address = request.arg(3);
+        let count = usize::try_from(request.arg(4))
+            .map_err(|_| DispatchError::LengthTooLarge(request.arg(4)))?;
+        let flags = request.arg(5);
+        if flags & !LINUX_SPLICE_SUPPORTED_FLAGS != 0 {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            });
+        }
+        if count == 0 {
+            return Ok(DispatchOutcome::Returned { value: 0 });
+        }
+
+        if let Some((pipe, status_flags)) = self.pipe_reader(in_fd) {
+            if off_in_address != 0 || off_out_address != 0 {
+                return Ok(DispatchOutcome::Errno {
+                    errno: LINUX_EINVAL,
+                });
+            }
+            if let Some(errno) = self.splice_output_errno(out_fd) {
+                return Ok(DispatchOutcome::Errno { errno });
+            }
+            let bytes = match take_pipe_bytes(&pipe, count, status_flags) {
+                Ok(bytes) => bytes,
+                Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            };
+            let outcome = self.write_output_fd(out_fd, &bytes);
+            return Ok(outcome);
+        }
+
+        if off_out_address != 0 {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            });
+        }
+        match self.fd_is_pipe_writer(out_fd) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Ok(DispatchOutcome::Errno {
+                    errno: LINUX_EINVAL,
+                });
+            }
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        }
+
+        let mut offset = match self.sendfile_offset(in_fd, off_in_address, memory)? {
+            Ok(offset) => offset,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        let bytes = match self.sendfile_bytes(in_fd, offset, count) {
+            Ok(bytes) => bytes,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        let outcome = self.write_output_fd(out_fd, &bytes);
+        let DispatchOutcome::Returned { value } = outcome else {
+            return Ok(outcome);
+        };
+        let written = usize::try_from(value).unwrap_or(0);
+        offset = offset.saturating_add(written);
+        if off_in_address == 0 {
+            if let Some(open_file) = self.open_files.get(&in_fd) {
+                let mut open = open_file.description.borrow_mut();
+                match &mut *open {
+                    OpenDescription::File {
+                        offset: current, ..
+                    }
+                    | OpenDescription::SyntheticFile {
+                        offset: current, ..
+                    } => *current = offset,
+                    _ => {}
+                }
+            }
+        } else if memory
+            .write_bytes(off_in_address, &(offset as u64).to_ne_bytes())
+            .is_err()
+        {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EFAULT,
+            });
+        }
+
+        Ok(DispatchOutcome::Returned { value })
+    }
+
+    fn pipe_reader(&self, fd: i32) -> Option<(Rc<RefCell<PipeState>>, u64)> {
+        let open_file = self.open_files.get(&fd)?;
+        let open = open_file.description.borrow();
+        match &*open {
+            OpenDescription::PipeReader { pipe, status_flags } => {
+                Some((Rc::clone(pipe), *status_flags))
+            }
+            _ => None,
+        }
+    }
+
+    fn fd_is_pipe_writer(&self, fd: i32) -> Result<bool, i32> {
+        let Some(open_file) = self.open_files.get(&fd) else {
+            return if is_stdio_fd(fd) {
+                Ok(false)
+            } else {
+                Err(LINUX_EBADF)
+            };
+        };
+        let open = open_file.description.borrow();
+        Ok(matches!(&*open, OpenDescription::PipeWriter { .. }))
+    }
+
+    fn splice_output_errno(&self, fd: i32) -> Option<i32> {
+        if is_stdio_fd(fd) {
+            return None;
+        }
+        let Some(open_file) = self.open_files.get(&fd) else {
+            return Some(LINUX_EBADF);
+        };
+        let open = open_file.description.borrow();
+        let OpenDescription::PipeWriter { pipe, .. } = &*open else {
+            return Some(LINUX_EINVAL);
+        };
+        if pipe.borrow().readers == 0 {
+            Some(LINUX_EPIPE)
+        } else {
+            None
+        }
+    }
+
     fn write(
         &mut self,
         request: SyscallRequest,
@@ -3676,6 +3816,23 @@ fn read_pipe(
     DispatchOutcome::Returned {
         value: read_len as i64,
     }
+}
+
+fn take_pipe_bytes(
+    pipe: &Rc<RefCell<PipeState>>,
+    length: usize,
+    _status_flags: u64,
+) -> Result<Vec<u8>, i32> {
+    let mut pipe = pipe.borrow_mut();
+    if pipe.buffer.is_empty() {
+        if pipe.writers == 0 {
+            return Ok(Vec::new());
+        }
+        return Err(LINUX_EAGAIN);
+    }
+
+    let read_len = pipe.buffer.len().min(length);
+    Ok(pipe.buffer.drain(..read_len).collect())
 }
 
 fn write_pipe(bytes: &[u8], pipe: &Rc<RefCell<PipeState>>) -> DispatchOutcome {

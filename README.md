@@ -39,7 +39,7 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
   `getdents64(2)`,
   `lseek(2)`, `readlinkat(2)`,
   `pipe2(2)`, `read(2)`, `readv(2)`, `pread64(2)`, `preadv(2)`, `write(2)`,
-  `writev(2)`, `sendfile(2)`, `pselect6(2)`, `ppoll(2)`, `timerfd_create(2)`,
+  `writev(2)`, `sendfile(2)`, `splice(2)`, `pselect6(2)`, `ppoll(2)`, `timerfd_create(2)`,
   `timerfd_settime(2)`, `timerfd_gettime(2)`, `close(2)`, `newfstatat(2)`,
   `fstat(2)`, `statx(2)`, `capget(2)`, `capset(2)`, `personality(2)`,
   `exit(2)`, `ENOENT`, `EACCES`, `EFAULT`, `EPERM`, `EBADF`, and `ENOSYS` paths
@@ -96,7 +96,7 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
   `personality(2)`, `futex(2)`, `nanosleep(2)`, `clock_nanosleep(2)`,
   `membarrier(2)` queries, scheduler affinity/yield calls, `getcpu(2)`,
   `prctl(2)`, `rseq(2)` fallback, `flock(2)`, `statx(2)`, `openat2(2)`,
-  `faccessat2(2)`, `sendfile(2)`, `preadv(2)`, `read(2)`, `close(2)`, and
+  `faccessat2(2)`, `sendfile(2)`, `splice(2)`, `preadv(2)`, `read(2)`, `close(2)`, and
   `exit(2)`, giving the loader, HVF loop, rootfs, and dispatcher a tight
   feedback loop.
 

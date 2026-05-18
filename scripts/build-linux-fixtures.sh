@@ -72,6 +72,7 @@ build_fixture "openat2_motd.rs" "carrick-linux-aarch64-openat2-motd"
 build_fixture "faccessat2_motd.rs" "carrick-linux-aarch64-faccessat2-motd"
 build_fixture "sendfile_motd.rs" "carrick-linux-aarch64-sendfile-motd"
 build_fixture "preadv_motd.rs" "carrick-linux-aarch64-preadv-motd"
+build_fixture "splice_motd.rs" "carrick-linux-aarch64-splice-motd"
 
 cargo metadata \
   --manifest-path "$fixture_dir/Cargo.toml" \
