@@ -101,6 +101,7 @@ const LINUX_MEMBARRIER_CMD_QUERY: u64 = 0;
 const LINUX_TIOCGWINSZ: u64 = 0x5413;
 const LINUX_PIPE_BUF_SIZE: i64 = 65_536;
 const LINUX_RT_SIGSET_SIZE: u64 = 8;
+const LINUX_BOOTSTRAP_AFFINITY_BYTES: usize = 8;
 const LINUX_CLOCK_REALTIME: u64 = 0;
 const LINUX_CLOCK_MONOTONIC: u64 = 1;
 const LINUX_CLOCK_MONOTONIC_RAW: u64 = 4;
@@ -474,6 +475,8 @@ impl SyscallDispatcher {
             113 => self.clock_gettime(request, memory),
             114 => self.clock_getres(request, memory),
             115 => self.clock_nanosleep(request, memory),
+            123 => self.sched_getaffinity(request, memory),
+            124 => self.sched_yield(),
             134 => self.rt_sigaction(request, memory),
             135 => self.rt_sigprocmask(request, memory)?,
             160 => self.uname(request, memory),
@@ -1489,6 +1492,41 @@ impl SyscallDispatcher {
             };
         }
         DispatchOutcome::Returned { value: 0 }
+    }
+
+    fn sched_yield(&self) -> DispatchOutcome {
+        std::thread::yield_now();
+        DispatchOutcome::Returned { value: 0 }
+    }
+
+    fn sched_getaffinity(
+        &self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+    ) -> DispatchOutcome {
+        let pid = request.arg(0);
+        let size = request.arg(1);
+        let address = request.arg(2);
+        let current_pid = std::process::id() as u64;
+
+        if pid != 0 && pid != current_pid {
+            return DispatchOutcome::Errno { errno: LINUX_ESRCH };
+        }
+        if size < LINUX_BOOTSTRAP_AFFINITY_BYTES as u64 {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+        let mut mask = [0_u8; LINUX_BOOTSTRAP_AFFINITY_BYTES];
+        mask[0] = 1;
+        if memory.write_bytes(address, &mask).is_err() {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EFAULT,
+            };
+        }
+        DispatchOutcome::Returned {
+            value: LINUX_BOOTSTRAP_AFFINITY_BYTES as i64,
+        }
     }
 
     fn futex(&self, request: SyscallRequest, memory: &impl GuestMemory) -> DispatchOutcome {

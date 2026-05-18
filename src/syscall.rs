@@ -144,6 +144,8 @@ const AARCH64_SYSCALLS: &[Syscall] = &[
     syscall(113, "clock_gettime", "time", SupportLevel::BringUp),
     syscall(114, "clock_getres", "time", SupportLevel::BringUp),
     syscall(115, "clock_nanosleep", "time", SupportLevel::BringUp),
+    syscall(123, "sched_getaffinity", "sched", SupportLevel::BringUp),
+    syscall(124, "sched_yield", "sched", SupportLevel::BringUp),
     syscall(134, "rt_sigaction", "signal", SupportLevel::BringUp),
     syscall(135, "rt_sigprocmask", "signal", SupportLevel::BringUp),
     syscall(160, "uname", "process", SupportLevel::BringUp),

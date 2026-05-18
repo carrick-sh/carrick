@@ -42,6 +42,7 @@ const LINUX_EPOLLIN: u32 = 0x001;
 const LINUX_CAPABILITY_VERSION_3: u32 = 0x20080522;
 const LINUX_PERSONALITY_QUERY: u64 = 0xffff_ffff;
 const LINUX_ADDR_NO_RANDOMIZE: u64 = 0x0040_0000;
+const LINUX_BOOTSTRAP_AFFINITY_BYTES: usize = 8;
 const LINUX_FUTEX_WAIT: u64 = 0;
 const LINUX_FUTEX_WAKE: u64 = 1;
 const LINUX_FUTEX_PRIVATE_FLAG: u64 = 128;
@@ -2566,6 +2567,77 @@ fn membarrier_query_reports_no_bootstrap_commands() {
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 22 }
+    );
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn scheduler_bootstrap_yields_and_writes_current_affinity() {
+    let mut memory = LinearMemory::new(0x4000, vec![0xff; 0x20]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    let pid = std::process::id() as u64;
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(124, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    123,
+                    SyscallArgs::from([0, LINUX_BOOTSTRAP_AFFINITY_BYTES as u64, 0x4000, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned {
+            value: LINUX_BOOTSTRAP_AFFINITY_BYTES as i64
+        }
+    );
+    assert_eq!(
+        memory
+            .read_bytes(0x4000, LINUX_BOOTSTRAP_AFFINITY_BYTES)
+            .unwrap(),
+        [1, 0, 0, 0, 0, 0, 0, 0]
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(123, SyscallArgs::from([pid, 4, 0x4000, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 22 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    123,
+                    SyscallArgs::from([
+                        pid + 10_000,
+                        LINUX_BOOTSTRAP_AFFINITY_BYTES as u64,
+                        0x4000,
+                        0,
+                        0,
+                        0
+                    ]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 3 }
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
