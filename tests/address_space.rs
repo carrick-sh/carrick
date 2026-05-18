@@ -40,6 +40,45 @@ fn zero_fills_memory_past_file_backing() {
 }
 
 #[test]
+fn builds_linux_initial_stack_with_argv_envp_and_auxv() {
+    let image = AddressSpace::from_segments(
+        0x1000,
+        [(
+            0x1000,
+            SegmentPerms {
+                read: true,
+                write: false,
+                execute: true,
+            },
+            vec![0xd4, 0x20, 0x00, 0x00],
+            4,
+        )],
+    )
+    .unwrap()
+    .with_linux_initial_stack(
+        ["/bin/cat-motd".to_owned(), "/etc/motd".to_owned()],
+        ["PATH=/bin".to_owned()],
+    )
+    .unwrap();
+
+    let sp = image.initial_stack_pointer().unwrap();
+    assert_eq!(sp % 16, 0);
+    assert_eq!(read_u64(&image, sp), 2);
+
+    let argv0 = read_u64(&image, sp + 8);
+    let argv1 = read_u64(&image, sp + 16);
+    assert_eq!(read_c_string(&image, argv0), "/bin/cat-motd");
+    assert_eq!(read_c_string(&image, argv1), "/etc/motd");
+    assert_eq!(read_u64(&image, sp + 24), 0);
+
+    let env0 = read_u64(&image, sp + 32);
+    assert_eq!(read_c_string(&image, env0), "PATH=/bin");
+    assert_eq!(read_u64(&image, sp + 40), 0);
+    assert_eq!(read_u64(&image, sp + 48), 0);
+    assert_eq!(read_u64(&image, sp + 56), 0);
+}
+
+#[test]
 fn dispatcher_can_write_from_loaded_guest_memory() {
     let mut image = AddressSpace::from_segments(
         0x1000,
@@ -99,6 +138,24 @@ fn rejects_overlapping_regions() {
     .unwrap_err();
 
     assert!(err.to_string().contains("overlaps"));
+}
+
+fn read_u64(image: &AddressSpace, address: u64) -> u64 {
+    let bytes: [u8; 8] = image.read_bytes(address, 8).unwrap().try_into().unwrap();
+    u64::from_le_bytes(bytes)
+}
+
+fn read_c_string(image: &AddressSpace, address: u64) -> String {
+    let mut bytes = Vec::new();
+    let mut cursor = address;
+    loop {
+        let byte = image.read_bytes(cursor, 1).unwrap()[0];
+        if byte == 0 {
+            return String::from_utf8(bytes).unwrap();
+        }
+        bytes.push(byte);
+        cursor += 1;
+    }
 }
 
 fn build_fixture() {

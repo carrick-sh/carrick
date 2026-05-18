@@ -8,8 +8,8 @@ use carrick::memory::AddressSpace;
 use carrick::oci::{ImageReference, ImageStore, pull_image};
 use carrick::rootfs::RootFs;
 use carrick::runtime::{
-    DEFAULT_MAX_TRAPS, run_static_elf_bytes_with_hvf_and_dispatcher,
-    run_static_elf_with_hvf_and_dispatcher,
+    DEFAULT_MAX_TRAPS, run_static_elf_bytes_with_hvf_args_and_dispatcher,
+    run_static_elf_with_hvf_args_and_dispatcher,
 };
 use carrick::syscall::{aarch64_table, lookup_aarch64};
 use carrick::trap::hvf_capabilities;
@@ -43,6 +43,8 @@ enum Commands {
         rootfs_layers: Vec<PathBuf>,
         #[arg(long, default_value_t = DEFAULT_MAX_TRAPS)]
         max_traps: usize,
+        #[arg(last = true)]
+        args: Vec<String>,
     },
     Pull {
         image: String,
@@ -143,6 +145,7 @@ async fn main() -> anyhow::Result<()> {
             path,
             rootfs_layers,
             max_traps,
+            args,
         } => {
             let dispatcher = if rootfs_layers.is_empty() {
                 SyscallDispatcher::new()
@@ -152,8 +155,16 @@ async fn main() -> anyhow::Result<()> {
                         .context("failed to compose rootfs layers")?,
                 )
             };
-            let result = run_static_elf_with_hvf_and_dispatcher(&path, dispatcher, max_traps)
-                .with_context(|| format!("failed to run static ELF {}", path.display()))?;
+            let mut argv = vec![path.to_string_lossy().into_owned()];
+            argv.extend(args);
+            let result = run_static_elf_with_hvf_args_and_dispatcher(
+                &path,
+                dispatcher,
+                argv,
+                std::iter::empty(),
+                max_traps,
+            )
+            .with_context(|| format!("failed to run static ELF {}", path.display()))?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
@@ -179,11 +190,6 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 command
             };
-            if command.len() != 1 {
-                bail!(
-                    "guest argv/env stack setup is not implemented yet; pass only the executable path"
-                );
-            }
             let summary = store.load_pull_summary(&image).await.with_context(|| {
                 format!("image {} is not pulled into the store", image.canonical())
             })?;
@@ -198,9 +204,11 @@ async fn main() -> anyhow::Result<()> {
             let executable = rootfs.read(executable_path.as_str()).with_context(|| {
                 format!("failed to read executable {executable_path} from rootfs")
             })?;
-            let result = run_static_elf_bytes_with_hvf_and_dispatcher(
+            let result = run_static_elf_bytes_with_hvf_args_and_dispatcher(
                 &executable,
                 SyscallDispatcher::with_rootfs(rootfs),
+                command.clone(),
+                std::iter::empty(),
                 DEFAULT_MAX_TRAPS,
             )
             .with_context(|| {

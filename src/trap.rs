@@ -55,6 +55,7 @@ pub fn hvf_capabilities() -> TrapCapabilities {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GuestMappingPlan {
     pub entry: u64,
+    pub initial_stack_pointer: Option<u64>,
     pub mappings: Vec<GuestMapping>,
 }
 
@@ -104,6 +105,7 @@ impl GuestMappingPlan {
 
         Ok(Self {
             entry: address_space.entry(),
+            initial_stack_pointer: address_space.initial_stack_pointer(),
             mappings,
         })
     }
@@ -223,6 +225,12 @@ impl HvfTrapEngine {
             .vcpu
             .set_reg(Reg::PC, plan.entry)
             .map_err(hvf_error)?;
+        if let Some(stack_pointer) = plan.initial_stack_pointer {
+            self.inner
+                .vcpu
+                .set_sys_reg(SysReg::SP_EL0, stack_pointer)
+                .map_err(hvf_error)?;
+        }
         Ok(())
     }
 

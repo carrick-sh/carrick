@@ -50,7 +50,28 @@ pub fn run_static_elf_with_hvf_and_dispatcher(
     dispatcher: SyscallDispatcher,
     max_traps: usize,
 ) -> Result<RunResult, RuntimeError> {
-    let image = AddressSpace::load_elf(path)?;
+    let path = path.as_ref();
+    run_static_elf_with_hvf_args_and_dispatcher(
+        path,
+        dispatcher,
+        [path.to_string_lossy().into_owned()],
+        std::iter::empty(),
+        max_traps,
+    )
+}
+
+pub fn run_static_elf_with_hvf_args_and_dispatcher<A, E>(
+    path: impl AsRef<Path>,
+    dispatcher: SyscallDispatcher,
+    argv: A,
+    env: E,
+    max_traps: usize,
+) -> Result<RunResult, RuntimeError>
+where
+    A: IntoIterator<Item = String>,
+    E: IntoIterator<Item = String>,
+{
+    let image = AddressSpace::load_elf(path)?.with_linux_initial_stack(argv, env)?;
     run_address_space_with_hvf_and_dispatcher(image, dispatcher, max_traps)
 }
 
@@ -60,6 +81,21 @@ pub fn run_static_elf_bytes_with_hvf_and_dispatcher(
     max_traps: usize,
 ) -> Result<RunResult, RuntimeError> {
     let image = AddressSpace::load_elf_bytes(bytes)?;
+    run_address_space_with_hvf_and_dispatcher(image, dispatcher, max_traps)
+}
+
+pub fn run_static_elf_bytes_with_hvf_args_and_dispatcher<A, E>(
+    bytes: &[u8],
+    dispatcher: SyscallDispatcher,
+    argv: A,
+    env: E,
+    max_traps: usize,
+) -> Result<RunResult, RuntimeError>
+where
+    A: IntoIterator<Item = String>,
+    E: IntoIterator<Item = String>,
+{
+    let image = AddressSpace::load_elf_bytes(bytes)?.with_linux_initial_stack(argv, env)?;
     run_address_space_with_hvf_and_dispatcher(image, dispatcher, max_traps)
 }
 

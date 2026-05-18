@@ -49,6 +49,31 @@ fn guest_mapping_plan_rounds_regions_to_pages() {
 }
 
 #[test]
+fn guest_mapping_plan_carries_initial_stack_pointer() {
+    let image = AddressSpace::from_segments(
+        0x1000,
+        [(
+            0x1000,
+            SegmentPerms {
+                read: true,
+                write: false,
+                execute: true,
+            },
+            vec![0xd4, 0x20, 0x00, 0x00],
+            4,
+        )],
+    )
+    .unwrap()
+    .with_linux_initial_stack(["/bin/echo".to_owned()], std::iter::empty::<String>())
+    .unwrap();
+
+    let plan = GuestMappingPlan::from_address_space(&image).unwrap();
+
+    assert_eq!(plan.initial_stack_pointer, image.initial_stack_pointer());
+    assert_eq!(plan.mappings.len(), 2);
+}
+
+#[test]
 fn classifies_aarch64_svc_exception_syndrome() {
     let svc_syndrome = AARCH64_SVC_EXCEPTION_CLASS << 26;
     let brk_syndrome = 0x3c_u64 << 26;
