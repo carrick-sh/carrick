@@ -10,7 +10,7 @@ use crate::linux_abi::{
     LINUX_DIRENT64_HEADER_SIZE, LINUX_DT_DIR, LINUX_DT_LNK, LINUX_DT_REG, LINUX_PAGE_SIZE,
     LINUX_S_IFDIR, LINUX_S_IFLNK, LINUX_S_IFREG, LinuxCapabilityData, LinuxCapabilityHeader,
     LinuxDirent64Header, LinuxEpollEvent, LinuxEventfdValue, LinuxFdPair, LinuxIovec,
-    LinuxItimerspec, LinuxOpenHow, LinuxPollFd, LinuxRlimit, LinuxRusage, LinuxSigaction,
+    LinuxItimerspec, LinuxItimerval, LinuxOpenHow, LinuxPollFd, LinuxRlimit, LinuxRusage, LinuxSigaction,
     LinuxSigaltstack, LinuxStat, LinuxStatfs, LinuxStatx, LinuxStatxTimestamp,
     LinuxTimerfdExpirations, LinuxTimespec, LinuxTimeval, LinuxTimezone, LinuxTms,
     LinuxTermios, LinuxUtsname, LinuxWinsize,
@@ -163,7 +163,13 @@ const LINUX_CLOCK_MONOTONIC_RAW: u64 = 4;
 const LINUX_CLOCK_REALTIME_COARSE: u64 = 5;
 const LINUX_CLOCK_MONOTONIC_COARSE: u64 = 6;
 const LINUX_CLOCK_BOOTTIME: u64 = 7;
+const LINUX_CLOCK_REALTIME_ALARM: u64 = 8;
+const LINUX_CLOCK_BOOTTIME_ALARM: u64 = 9;
+const LINUX_CLOCK_TAI: u64 = 11;
 const LINUX_CLOCK_RESOLUTION_NSEC: i64 = 1_000_000;
+const LINUX_ITIMER_REAL: u64 = 0;
+const LINUX_ITIMER_VIRTUAL: u64 = 1;
+const LINUX_ITIMER_PROF: u64 = 2;
 const LINUX_TASK_COMM_LEN: usize = 16;
 const LINUX_CAPABILITY_VERSION_1: u32 = 0x1998_0330;
 const LINUX_CAPABILITY_VERSION_2: u32 = 0x2007_1026;
@@ -591,6 +597,9 @@ impl SyscallDispatcher {
             98 => self.futex(request, memory),
             99 => self.set_robust_list(request),
             101 => self.nanosleep(request, memory),
+            102 => self.getitimer(request, memory),
+            103 => self.setitimer(request, memory, reporter),
+            112 => self.clock_settime(request, memory),
             113 => self.clock_gettime(request, memory),
             114 => self.clock_getres(request, memory),
             115 => self.clock_nanosleep(request, memory),
@@ -616,6 +625,7 @@ impl SyscallDispatcher {
             167 => self.prctl(request, memory),
             168 => self.getcpu(request, memory),
             169 => self.gettimeofday(request, memory),
+            171 => self.adjtimex(request, memory),
             172 => self.getpid(),
             173 => DispatchOutcome::Returned { value: 1 },
             174..=177 => DispatchOutcome::Returned { value: 0 },
@@ -627,6 +637,7 @@ impl SyscallDispatcher {
             233 => self.madvise(request, memory),
             260 => self.wait4(request),
             261 => self.prlimit64(request, memory),
+            266 => self.clock_adjtime(request, memory),
             278 => self.getrandom(request, memory)?,
             283 => self.membarrier(request),
             291 => self.statx(request, memory)?,
@@ -2138,6 +2149,136 @@ impl SyscallDispatcher {
             address,
             LinuxTimespec::new(0, LINUX_CLOCK_RESOLUTION_NSEC).as_bytes(),
         )
+    }
+
+    fn clock_settime(
+        &self,
+        request: SyscallRequest,
+        memory: &impl GuestMemory,
+    ) -> DispatchOutcome {
+        let clock_id = request.arg(0);
+        let address = request.arg(1);
+        if !linux_clock_is_known(clock_id) {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+        // Reading the timespec lets us surface EFAULT for bad pointers and
+        // EINVAL for invalid tv_nsec, matching the order real Linux performs
+        // these checks before the privilege check kicks in for unsupported
+        // clocks.
+        let timespec = match read_timespec(memory, address) {
+            Ok(timespec) => timespec,
+            Err(errno) => return DispatchOutcome::Errno { errno },
+        };
+        let tv_nsec = timespec.tv_nsec;
+        if !(0..1_000_000_000).contains(&tv_nsec) {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+        // Monotonic-family clocks can never be set; report EINVAL like the
+        // real kernel.
+        if !linux_clock_is_settable(clock_id) {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+        // For settable clocks (CLOCK_REALTIME, CLOCK_REALTIME_ALARM, CLOCK_TAI)
+        // we still refuse: we are not root and we do not actually mutate the
+        // host clock.
+        DispatchOutcome::Errno { errno: LINUX_EPERM }
+    }
+
+    fn getitimer(
+        &self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+    ) -> DispatchOutcome {
+        let which = request.arg(0);
+        let address = request.arg(1);
+        if !linux_itimer_which_is_valid(which) {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+        if address == 0 {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EFAULT,
+            };
+        }
+        // No timer is ever armed, so the truthful answer is a zeroed
+        // itimerval (interval and value both zero == "disarmed").
+        write_packed(memory, address, LinuxItimerval::zeroed().as_bytes())
+    }
+
+    fn setitimer(
+        &self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+        reporter: &mut CompatReporter,
+    ) -> DispatchOutcome {
+        let which = request.arg(0);
+        let new_address = request.arg(1);
+        let old_address = request.arg(2);
+        if !linux_itimer_which_is_valid(which) {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+        if new_address != 0 {
+            let new_value = match read_itimerval(memory, new_address) {
+                Ok(value) => value,
+                Err(errno) => return DispatchOutcome::Errno { errno },
+            };
+            if !linux_timeval_usec_is_valid(new_value.it_interval)
+                || !linux_timeval_usec_is_valid(new_value.it_value)
+            {
+                return DispatchOutcome::Errno {
+                    errno: LINUX_EINVAL,
+                };
+            }
+        }
+        if old_address != 0 {
+            let outcome = write_packed(memory, old_address, LinuxItimerval::zeroed().as_bytes());
+            if !matches!(outcome, DispatchOutcome::Returned { .. }) {
+                return outcome;
+            }
+        }
+        reporter.record(CompatEvent::partial_syscall(
+            request.number,
+            "setitimer",
+            request.args,
+            "bootstrap: no SIGALRM delivery yet",
+        ));
+        DispatchOutcome::Returned { value: 0 }
+    }
+
+    fn adjtimex(
+        &self,
+        request: SyscallRequest,
+        memory: &impl GuestMemory,
+    ) -> DispatchOutcome {
+        let address = request.arg(0);
+        adjtimex_bootstrap(memory, address)
+    }
+
+    fn clock_adjtime(
+        &self,
+        request: SyscallRequest,
+        memory: &impl GuestMemory,
+    ) -> DispatchOutcome {
+        let clock_id = request.arg(0);
+        let address = request.arg(1);
+        // Linux only accepts CLOCK_REALTIME for unprivileged callers (and
+        // generally only CLOCK_REALTIME at all for adjtime semantics); anything
+        // else is EINVAL.
+        if clock_id != LINUX_CLOCK_REALTIME {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+        adjtimex_bootstrap(memory, address)
     }
 
     fn kill(&self, request: SyscallRequest) -> DispatchOutcome {
@@ -4702,6 +4843,59 @@ fn linux_clock_duration(clock_id: u64) -> Option<Duration> {
     }
 }
 
+fn linux_clock_is_known(clock_id: u64) -> bool {
+    matches!(
+        clock_id,
+        LINUX_CLOCK_REALTIME
+            | LINUX_CLOCK_MONOTONIC
+            | LINUX_CLOCK_MONOTONIC_RAW
+            | LINUX_CLOCK_REALTIME_COARSE
+            | LINUX_CLOCK_MONOTONIC_COARSE
+            | LINUX_CLOCK_BOOTTIME
+            | LINUX_CLOCK_REALTIME_ALARM
+            | LINUX_CLOCK_BOOTTIME_ALARM
+            | LINUX_CLOCK_TAI
+    )
+}
+
+fn linux_clock_is_settable(clock_id: u64) -> bool {
+    matches!(
+        clock_id,
+        LINUX_CLOCK_REALTIME | LINUX_CLOCK_REALTIME_ALARM | LINUX_CLOCK_TAI
+    )
+}
+
+fn linux_itimer_which_is_valid(which: u64) -> bool {
+    matches!(
+        which,
+        LINUX_ITIMER_REAL | LINUX_ITIMER_VIRTUAL | LINUX_ITIMER_PROF
+    )
+}
+
+fn linux_timeval_usec_is_valid(tv: LinuxTimeval) -> bool {
+    let usec = tv.tv_usec;
+    (0..1_000_000).contains(&usec)
+}
+
+fn adjtimex_bootstrap(memory: &impl GuestMemory, address: u64) -> DispatchOutcome {
+    if address == 0 {
+        return DispatchOutcome::Errno {
+            errno: LINUX_EFAULT,
+        };
+    }
+    // Probe the leading 8 bytes (modes + frequency word) to detect a bad
+    // pointer; we deliberately do not interpret the rest of the timex struct.
+    if memory.read_bytes(address, 8).is_err() {
+        return DispatchOutcome::Errno {
+            errno: LINUX_EFAULT,
+        };
+    }
+    // We are unprivileged and we do not actually adjust the host clock.
+    // Real Linux short-circuits modes==0 to "return current clock state",
+    // but for bootstrap we always return EPERM and let glibc fall back.
+    DispatchOutcome::Errno { errno: LINUX_EPERM }
+}
+
 fn linux_madvise_advice_is_supported(advice: u64) -> bool {
     matches!(
         advice,
@@ -5617,6 +5811,13 @@ fn read_itimerspec(memory: &impl GuestMemory, address: u64) -> Result<LinuxItime
         .read_bytes(address, core::mem::size_of::<LinuxItimerspec>())
         .map_err(|_| LINUX_EFAULT)?;
     LinuxItimerspec::read_from_bytes(&bytes).map_err(|_| LINUX_EFAULT)
+}
+
+fn read_itimerval(memory: &impl GuestMemory, address: u64) -> Result<LinuxItimerval, i32> {
+    let bytes = memory
+        .read_bytes(address, core::mem::size_of::<LinuxItimerval>())
+        .map_err(|_| LINUX_EFAULT)?;
+    LinuxItimerval::read_from_bytes(&bytes).map_err(|_| LINUX_EFAULT)
 }
 
 fn read_timespec(memory: &impl GuestMemory, address: u64) -> Result<LinuxTimespec, i32> {

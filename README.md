@@ -68,8 +68,14 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
 - Dynamic-linker bring-up syscalls now include bootstrap `uname(2)`, `getpid(2)`
   and uid/gid identity calls, `set_tid_address(2)`, `set_robust_list(2)`,
   bootstrap private `futex(2)` wait/wake polling, `clock_gettime(2)`,
-  `clock_getres(2)`, `nanosleep(2)`,
-  `clock_nanosleep(2)`, `gettimeofday(2)`, `times(2)`, `getrusage(2)`,
+  `clock_getres(2)`, `clock_settime(2)` (EINVAL for unknown/monotonic
+  clocks, EPERM for the settable ones since we are unprivileged and do not
+  mutate the host clock), `nanosleep(2)`,
+  `clock_nanosleep(2)`, `gettimeofday(2)`, `getitimer(2)`/`setitimer(2)`
+  (accepted but no SIGALRM delivery, so they always report a disarmed
+  timer and emit a `partial_syscall` event noting that timers will never
+  fire), `adjtimex(2)`/`clock_adjtime(2)` (validate the clock id and the
+  timex pointer, then return EPERM), `times(2)`, `getrusage(2)`,
   `prlimit64(2)`, `getrandom(2)`,
   `membarrier(2)` capability queries, clean `rseq(2)` fallback, process
   capability probes, scheduler affinity/yield and `getcpu(2)` probes,

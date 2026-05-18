@@ -385,6 +385,31 @@ impl LinuxTimeval {
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
 )]
+pub struct LinuxItimerval {
+    pub it_interval: LinuxTimeval,
+    pub it_value: LinuxTimeval,
+}
+
+impl LinuxItimerval {
+    pub const fn new(it_interval: LinuxTimeval, it_value: LinuxTimeval) -> Self {
+        Self {
+            it_interval,
+            it_value,
+        }
+    }
+
+    pub const fn zeroed() -> Self {
+        Self {
+            it_interval: LinuxTimeval::new(0, 0),
+            it_value: LinuxTimeval::new(0, 0),
+        }
+    }
+}
+
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
 pub struct LinuxTimezone {
     pub tz_minuteswest: i32,
     pub tz_dsttime: i32,
