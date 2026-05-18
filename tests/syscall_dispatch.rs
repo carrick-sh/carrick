@@ -2587,6 +2587,47 @@ fn prctl_handles_bootstrap_process_controls() {
 }
 
 #[test]
+fn getcpu_writes_bootstrap_cpu_and_numa_node() {
+    let mut memory = LinearMemory::new(0x4000, vec![0xff; 0x20]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(168, SyscallArgs::from([0x4000, 0x4004, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(memory.read_bytes(0x4000, 4).unwrap(), 0u32.to_ne_bytes());
+    assert_eq!(memory.read_bytes(0x4004, 4).unwrap(), 0u32.to_ne_bytes());
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(168, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(168, SyscallArgs::from([0x5000, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 14 }
+    );
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
 fn set_tid_address_and_robust_list_are_bootstrap_successes() {
     let mut memory = LinearMemory::new(0x4000, Vec::new());
     let mut reporter = CompatReporter::default();

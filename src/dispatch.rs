@@ -490,6 +490,7 @@ impl SyscallDispatcher {
             135 => self.rt_sigprocmask(request, memory)?,
             160 => self.uname(request, memory),
             167 => self.prctl(request, memory),
+            168 => self.getcpu(request, memory),
             169 => self.gettimeofday(request, memory),
             172 => self.getpid(),
             173 => DispatchOutcome::Returned { value: 1 },
@@ -1529,6 +1530,24 @@ impl SyscallDispatcher {
                 errno: LINUX_EINVAL,
             },
         }
+    }
+
+    fn getcpu(&self, request: SyscallRequest, memory: &mut impl GuestMemory) -> DispatchOutcome {
+        let cpu_address = request.arg(0);
+        let node_address = request.arg(1);
+        let bootstrap_value = 0u32.to_ne_bytes();
+
+        if cpu_address != 0 && memory.write_bytes(cpu_address, &bootstrap_value).is_err() {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EFAULT,
+            };
+        }
+        if node_address != 0 && memory.write_bytes(node_address, &bootstrap_value).is_err() {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EFAULT,
+            };
+        }
+        DispatchOutcome::Returned { value: 0 }
     }
 
     fn set_tid_address(&self) -> DispatchOutcome {
