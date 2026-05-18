@@ -75,6 +75,26 @@ fn read_link_preserves_symlink_target_text() {
 }
 
 #[test]
+fn symlink_with_parent_dir_in_target_resolves_across_layers() {
+    // Alpine ships /etc/mtab -> ../proc/mounts. Layer 1 provides /proc/mounts,
+    // layer 2 lays down the /etc/mtab symlink with a `..` in the target.
+    let rootfs = RootFs::from_layers([
+        LayerSource::TarGz(gzip_tar([("proc/mounts", b"rootfs / rootfs rw 0 0\n".as_slice())])),
+        LayerSource::TarGz(gzip_tar_with_links([], [("etc/mtab", "../proc/mounts")])),
+    ])
+    .unwrap();
+
+    // read_link returns the original target text verbatim.
+    assert_eq!(rootfs.read_link("/etc/mtab").unwrap(), "../proc/mounts");
+
+    // Following the symlink reads the layer-1 contents.
+    assert_eq!(
+        rootfs.read_to_string("/etc/mtab").unwrap(),
+        "rootfs / rootfs rw 0 0\n"
+    );
+}
+
+#[test]
 fn rejects_paths_that_escape_root() {
     let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
         "safe.txt",

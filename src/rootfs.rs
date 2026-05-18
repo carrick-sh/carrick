@@ -401,7 +401,9 @@ fn normalize_path(path: &Path, allow_absolute: bool) -> Result<PathBuf, RootFsEr
             }
             Component::CurDir => {}
             Component::ParentDir => {
-                return Err(RootFsError::UnsafePath(path.display().to_string()));
+                if !out.pop() {
+                    return Err(RootFsError::UnsafePath(path.display().to_string()));
+                }
             }
             Component::Normal(component) => out.push(component),
         }
@@ -426,5 +428,80 @@ fn insert_child_name(names: &mut BTreeSet<String>, dir: &Path, child: &Path) {
         && let Some(component) = stripped.components().next()
     {
         names.insert(component.as_os_str().to_string_lossy().into_owned());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn symlink_target_with_parent_dir_resolves_within_root() {
+        // etc/mtab -> ../proc/mounts should resolve to /proc/mounts
+        let resolved =
+            normalize_symlink_target(Path::new("etc/mtab"), Path::new("../proc/mounts")).unwrap();
+        assert_eq!(resolved, PathBuf::from("proc/mounts"));
+    }
+
+    #[test]
+    fn symlink_target_with_multiple_parent_dirs_resolves_within_root() {
+        // a/b/c -> ../../x: resolution starts in the symlink's parent dir (a/b),
+        // .. -> a, .. -> "" (root), then x -> /x.
+        let resolved =
+            normalize_symlink_target(Path::new("a/b/c"), Path::new("../../x")).unwrap();
+        assert_eq!(resolved, PathBuf::from("x"));
+    }
+
+    #[test]
+    fn symlink_target_one_parent_dir_pops_one_segment() {
+        // a/b/c -> ../x: from a/b, .. -> a, x -> a/x.
+        let resolved = normalize_symlink_target(Path::new("a/b/c"), Path::new("../x")).unwrap();
+        assert_eq!(resolved, PathBuf::from("a/x"));
+    }
+
+    #[test]
+    fn symlink_target_escaping_root_from_shallow_path_is_rejected() {
+        // a -> ../../../etc/passwd (one level deep) MUST still be unsafe.
+        let err =
+            normalize_symlink_target(Path::new("a"), Path::new("../../../etc/passwd")).unwrap_err();
+        assert!(matches!(err, RootFsError::UnsafePath(_)));
+    }
+
+    #[test]
+    fn symlink_target_escaping_root_via_second_parent_dir_is_rejected() {
+        // etc/foo -> ../../etc/passwd
+        // First .. from /etc lands at /; second .. from / is the escape.
+        let err =
+            normalize_symlink_target(Path::new("etc/foo"), Path::new("../../etc/passwd"))
+                .unwrap_err();
+        assert!(matches!(err, RootFsError::UnsafePath(_)));
+    }
+
+    #[test]
+    fn symlink_target_with_curdir_resolves() {
+        // bin/sh -> ./busybox should resolve to /bin/busybox
+        let resolved =
+            normalize_symlink_target(Path::new("bin/sh"), Path::new("./busybox")).unwrap();
+        assert_eq!(resolved, PathBuf::from("bin/busybox"));
+    }
+
+    #[test]
+    fn layer_path_with_parent_dir_collapses() {
+        // foo/../bar inside a layer path should collapse to bar
+        let normalized = normalize_layer_path(Path::new("foo/../bar")).unwrap();
+        assert_eq!(normalized, PathBuf::from("bar"));
+    }
+
+    #[test]
+    fn layer_path_escaping_root_is_rejected() {
+        let err = normalize_layer_path(Path::new("../escape")).unwrap_err();
+        assert!(matches!(err, RootFsError::UnsafePath(_)));
+    }
+
+    #[test]
+    fn rootfs_path_escaping_via_root_then_parent_is_rejected() {
+        // "/../safe.txt" — / then .. on empty stack escapes.
+        let err = normalize_rootfs_path(Path::new("/../safe.txt")).unwrap_err();
+        assert!(matches!(err, RootFsError::UnsafePath(_)));
     }
 }
