@@ -8,7 +8,7 @@ use carrick::memory::AddressSpace;
 use carrick::oci::{ImageReference, ImageStore, pull_image};
 use carrick::rootfs::RootFs;
 use carrick::runtime::{
-    DEFAULT_MAX_TRAPS, run_static_elf_bytes_with_hvf_args_and_dispatcher,
+    DEFAULT_MAX_TRAPS, run_rootfs_elf_with_hvf_args_and_dispatcher,
     run_static_elf_with_hvf_args_and_dispatcher,
 };
 use carrick::syscall::{aarch64_table, lookup_aarch64};
@@ -201,19 +201,17 @@ async fn main() -> anyhow::Result<()> {
             let rootfs = RootFs::from_layer_paths(&rootfs_layers)
                 .context("failed to compose image rootfs layers")?;
             let executable_path = &command[0];
-            let executable = rootfs.read(executable_path.as_str()).with_context(|| {
-                format!("failed to read executable {executable_path} from rootfs")
-            })?;
-            let result = run_static_elf_bytes_with_hvf_args_and_dispatcher(
-                &executable,
-                SyscallDispatcher::with_rootfs(rootfs),
+            let result = run_rootfs_elf_with_hvf_args_and_dispatcher(
+                executable_path.as_str(),
+                &rootfs,
+                SyscallDispatcher::with_rootfs(rootfs.clone()),
                 command.clone(),
                 std::iter::empty(),
                 DEFAULT_MAX_TRAPS,
             )
             .with_context(|| {
                 format!(
-                    "failed to run static ELF {} from image {}",
+                    "failed to run ELF {} from image {}",
                     executable_path,
                     image.canonical()
                 )

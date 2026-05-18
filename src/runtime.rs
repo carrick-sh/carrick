@@ -6,6 +6,7 @@ use crate::dispatch::{
     SyscallRequest,
 };
 use crate::memory::{AddressSpace, AddressSpaceError};
+use crate::rootfs::RootFs;
 use crate::trap::{HvfTrapEngine, TrapError};
 use serde::Serialize;
 use thiserror::Error;
@@ -96,6 +97,23 @@ where
     E: IntoIterator<Item = String>,
 {
     let image = AddressSpace::load_elf_bytes(bytes)?.with_linux_initial_stack(argv, env)?;
+    run_address_space_with_hvf_and_dispatcher(image, dispatcher, max_traps)
+}
+
+pub fn run_rootfs_elf_with_hvf_args_and_dispatcher<A, E>(
+    path: impl AsRef<Path>,
+    rootfs: &RootFs,
+    dispatcher: SyscallDispatcher,
+    argv: A,
+    env: E,
+    max_traps: usize,
+) -> Result<RunResult, RuntimeError>
+where
+    A: IntoIterator<Item = String>,
+    E: IntoIterator<Item = String>,
+{
+    let image =
+        AddressSpace::load_elf_from_rootfs(path, rootfs)?.with_linux_initial_stack(argv, env)?;
     run_address_space_with_hvf_and_dispatcher(image, dispatcher, max_traps)
 }
 

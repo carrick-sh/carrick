@@ -1,9 +1,12 @@
 use carrick::dispatch::{GuestMemory, SyscallDispatcher, SyscallRequest};
 use carrick::elf::SegmentPerms;
 use carrick::linux_abi::{
-    LINUX_AT_ENTRY, LINUX_AT_NULL, LINUX_AT_PAGESZ, LINUX_AT_PHDR, LINUX_AT_PHENT, LINUX_AT_PHNUM,
+    LINUX_AT_BASE, LINUX_AT_ENTRY, LINUX_AT_NULL, LINUX_AT_PAGESZ, LINUX_AT_PHDR, LINUX_AT_PHENT,
+    LINUX_AT_PHNUM, LinuxAuxvEntry,
 };
-use carrick::memory::AddressSpace;
+use carrick::memory::{AddressSpace, LINUX_INTERPRETER_BASE};
+use carrick::rootfs::{LayerSource, RootFs};
+use zerocopy::{FromBytes, IntoBytes};
 
 use carrick::compat::{CompatReporter, SyscallArgs};
 
@@ -107,6 +110,28 @@ fn loaded_elf_initial_stack_includes_linux_auxv() {
 }
 
 #[test]
+fn load_elf_from_rootfs_maps_pt_interp_at_base_and_sets_at_base() {
+    let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([
+        ("bin/app", dynamic_aarch64_elf("/lib/ld-linux-aarch64.so.1")),
+        ("lib/ld-linux-aarch64.so.1", interpreter_aarch64_elf()),
+    ]))])
+    .unwrap();
+
+    let image = AddressSpace::load_elf_from_rootfs("/bin/app", &rootfs)
+        .unwrap()
+        .with_linux_initial_stack(["/bin/app".to_owned()], std::iter::empty::<String>())
+        .unwrap();
+    let sp = image.initial_stack_pointer().unwrap();
+    let auxv = read_auxv(&image, sp + 32);
+
+    assert_eq!(image.entry(), LINUX_INTERPRETER_BASE + 0x120);
+    assert!(image.read_bytes(0x400120, 4).is_ok());
+    assert!(image.read_bytes(LINUX_INTERPRETER_BASE + 0x120, 4).is_ok());
+    assert!(auxv.contains(&(LINUX_AT_ENTRY, 0x400120)));
+    assert!(auxv.contains(&(LINUX_AT_BASE, LINUX_INTERPRETER_BASE)));
+}
+
+#[test]
 fn dispatcher_can_write_from_loaded_guest_memory() {
     let mut image = AddressSpace::from_segments(
         0x1000,
@@ -190,14 +215,22 @@ fn read_auxv(image: &AddressSpace, address: u64) -> Vec<(u64, u64)> {
     let mut out = Vec::new();
     let mut cursor = address;
     loop {
-        let tag = read_u64(image, cursor);
-        let value = read_u64(image, cursor + 8);
+        let entry = read_auxv_entry(image, cursor);
+        let tag = entry.tag();
+        let value = entry.value();
         out.push((tag, value));
         if tag == LINUX_AT_NULL {
             return out;
         }
-        cursor += 16;
+        cursor += core::mem::size_of::<LinuxAuxvEntry>() as u64;
     }
+}
+
+fn read_auxv_entry(image: &AddressSpace, address: u64) -> LinuxAuxvEntry {
+    let bytes = image
+        .read_bytes(address, core::mem::size_of::<LinuxAuxvEntry>())
+        .unwrap();
+    LinuxAuxvEntry::read_from_bytes(&bytes).unwrap()
 }
 
 fn build_fixture() {
@@ -210,4 +243,183 @@ fn build_fixture() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn dynamic_aarch64_elf(interpreter: &str) -> Vec<u8> {
+    let mut elf = aarch64_elf_header(0x400120, 2, ET_EXEC);
+    let interp_offset = 0x100;
+    let code_offset = 0x120;
+    let code = 0xd4200000_u32.to_le_bytes();
+
+    write_program_header(
+        &mut elf,
+        0,
+        ProgramHeader {
+            p_type: PT_LOAD,
+            p_flags: PF_R | PF_X,
+            p_offset: 0,
+            p_vaddr: 0x400000,
+            p_filesz: 0x124,
+            p_memsz: 0x124,
+            p_align: 0x1000,
+        },
+    );
+    write_program_header(
+        &mut elf,
+        1,
+        ProgramHeader {
+            p_type: PT_INTERP,
+            p_flags: PF_R,
+            p_offset: interp_offset as u64,
+            p_vaddr: 0x400100,
+            p_filesz: interpreter.len() as u64 + 1,
+            p_memsz: interpreter.len() as u64 + 1,
+            p_align: 1,
+        },
+    );
+
+    elf[interp_offset..interp_offset + interpreter.len()].copy_from_slice(interpreter.as_bytes());
+    elf[interp_offset + interpreter.len()] = 0;
+    elf[code_offset..code_offset + code.len()].copy_from_slice(&code);
+    elf
+}
+
+fn interpreter_aarch64_elf() -> Vec<u8> {
+    let mut elf = aarch64_elf_header(0x120, 1, ET_DYN);
+    let code_offset = 0x120;
+    let code = 0xd4200000_u32.to_le_bytes();
+    write_program_header(
+        &mut elf,
+        0,
+        ProgramHeader {
+            p_type: PT_LOAD,
+            p_flags: PF_R | PF_X,
+            p_offset: 0,
+            p_vaddr: 0,
+            p_filesz: 0x124,
+            p_memsz: 0x124,
+            p_align: 0x1000,
+        },
+    );
+    elf[code_offset..code_offset + code.len()].copy_from_slice(&code);
+    elf
+}
+
+fn aarch64_elf_header(entry: u64, phnum: u16, elf_type: u16) -> Vec<u8> {
+    let mut elf = vec![0_u8; 0x124];
+    let header = Elf64Header {
+        e_ident: elf64_ident(),
+        e_type: elf_type,
+        e_machine: EM_AARCH64,
+        e_version: 1,
+        e_entry: entry,
+        e_phoff: ELF64_HEADER_SIZE as u64,
+        e_shoff: 0,
+        e_flags: 0,
+        e_ehsize: ELF64_HEADER_SIZE as u16,
+        e_phentsize: ELF64_PROGRAM_HEADER_SIZE as u16,
+        e_phnum: phnum,
+        e_shentsize: 0,
+        e_shnum: 0,
+        e_shstrndx: 0,
+    };
+    elf[..ELF64_HEADER_SIZE].copy_from_slice(header.as_bytes());
+    elf
+}
+
+struct ProgramHeader {
+    p_type: u32,
+    p_flags: u32,
+    p_offset: u64,
+    p_vaddr: u64,
+    p_filesz: u64,
+    p_memsz: u64,
+    p_align: u64,
+}
+
+fn write_program_header(elf: &mut [u8], index: usize, header: ProgramHeader) {
+    let ph = ELF64_HEADER_SIZE + index * ELF64_PROGRAM_HEADER_SIZE;
+    let packed = Elf64ProgramHeader {
+        p_type: header.p_type,
+        p_flags: header.p_flags,
+        p_offset: header.p_offset,
+        p_vaddr: header.p_vaddr,
+        p_paddr: header.p_vaddr,
+        p_filesz: header.p_filesz,
+        p_memsz: header.p_memsz,
+        p_align: header.p_align,
+    };
+    elf[ph..ph + ELF64_PROGRAM_HEADER_SIZE].copy_from_slice(packed.as_bytes());
+}
+
+const ET_EXEC: u16 = 2;
+const ET_DYN: u16 = 3;
+const EM_AARCH64: u16 = 183;
+const PT_LOAD: u32 = 1;
+const PT_INTERP: u32 = 3;
+const PF_X: u32 = 1;
+const PF_R: u32 = 4;
+const ELF64_HEADER_SIZE: usize = core::mem::size_of::<Elf64Header>();
+const ELF64_PROGRAM_HEADER_SIZE: usize = core::mem::size_of::<Elf64ProgramHeader>();
+
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, zerocopy::IntoBytes, zerocopy::Immutable)]
+struct Elf64Header {
+    e_ident: [u8; 16],
+    e_type: u16,
+    e_machine: u16,
+    e_version: u32,
+    e_entry: u64,
+    e_phoff: u64,
+    e_shoff: u64,
+    e_flags: u32,
+    e_ehsize: u16,
+    e_phentsize: u16,
+    e_phnum: u16,
+    e_shentsize: u16,
+    e_shnum: u16,
+    e_shstrndx: u16,
+}
+
+#[repr(C, packed)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, zerocopy::IntoBytes, zerocopy::Immutable)]
+struct Elf64ProgramHeader {
+    p_type: u32,
+    p_flags: u32,
+    p_offset: u64,
+    p_vaddr: u64,
+    p_paddr: u64,
+    p_filesz: u64,
+    p_memsz: u64,
+    p_align: u64,
+}
+
+fn elf64_ident() -> [u8; 16] {
+    let mut ident = [0; 16];
+    ident[0..4].copy_from_slice(b"\x7fELF");
+    ident[4] = 2;
+    ident[5] = 1;
+    ident[6] = 1;
+    ident
+}
+
+fn gzip_tar<const N: usize>(files: [(&str, Vec<u8>); N]) -> Vec<u8> {
+    let mut tar_bytes = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut tar_bytes);
+        for (path, contents) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, path, contents.as_slice())
+                .unwrap();
+        }
+        builder.finish().unwrap();
+    }
+
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    std::io::Write::write_all(&mut encoder, &tar_bytes).unwrap();
+    encoder.finish().unwrap()
 }

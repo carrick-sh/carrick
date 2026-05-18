@@ -21,10 +21,11 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
   `/etc/motd` reader and an argv reader.
 - `carrick pull <image>` uses `oci-distribution` to fetch image layers into a
   content-addressed store under `$CARRICK_HOME` or `~/.carrick`.
-- `carrick run <image> /path/to/static-elf [args ...]` loads a previously pulled image
+- `carrick run <image> /path/to/elf [args ...]` loads a previously pulled image
   summary, composes its layer blobs as a read-only rootfs, loads the executable
-  from that rootfs, and runs it through the same HVF/syscall loop with the
-  command vector installed on the guest stack.
+  from that rootfs, maps any `PT_INTERP` interpreter from the same rootfs at a
+  deterministic base with `AT_BASE`, and runs it through the same HVF/syscall
+  loop with the command vector installed on the guest stack.
 - `carrick rootfs --layer <layer.tar.gz> ...` composes OCI tar layers in memory,
   including whiteouts, opaque directory markers, and symlinks, without extracting
   the root filesystem.
@@ -36,9 +37,9 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
   `read(2)`, `write(2)`, `close(2)`, `newfstatat(2)`, `fstat(2)`, `exit(2)`,
   `ENOENT`, `EACCES`, `EFAULT`, `EBADF`, and `ENOSYS` paths are covered by
   tests.
-- Linux ABI outputs for `stat` and `getdents64` are represented by packed Rust
-  structs in `linux_abi`, with `zerocopy` used to expose initialized bytes for
-  guest-memory writes.
+- Linux ABI outputs for `stat`, `getdents64`, and auxv entries are represented
+  by packed Rust structs in `linux_abi`, with `zerocopy` used to expose
+  initialized bytes for guest-memory writes.
 - The dispatcher now has a rootfs-backed file descriptor table for read-only
   file opens from composed OCI layers, and the runtime loop can drive a scripted
   `cat`-style `openat -> read -> write -> close -> exit` flow and a directory
@@ -60,9 +61,9 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
   loop, rootfs, and dispatcher a tight feedback loop.
 
 `shell` and `exec` are present as CLI surfaces, but they still stop before
-interactive process execution. `run` and `run-elf` are deliberately scoped to
-static Linux/aarch64 ELF bring-up until full auxv population and dynamic linker
-setup land.
+interactive process execution. `run` can map a dynamic ELF's rootfs-backed
+interpreter and seed `AT_BASE`, but real dynamically linked program execution is
+still gated on broader dynamic-linker syscall/runtime coverage.
 
 ## License policy
 

@@ -14,6 +14,7 @@ pub const LINUX_AT_PHDR: u64 = 3;
 pub const LINUX_AT_PHENT: u64 = 4;
 pub const LINUX_AT_PHNUM: u64 = 5;
 pub const LINUX_AT_PAGESZ: u64 = 6;
+pub const LINUX_AT_BASE: u64 = 7;
 pub const LINUX_AT_ENTRY: u64 = 9;
 pub const LINUX_PAGE_SIZE: u64 = 4096;
 

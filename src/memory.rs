@@ -4,13 +4,15 @@ use std::path::Path;
 use crate::dispatch::{GuestMemory, MemoryError};
 use crate::elf::{ElfInspectError, LoadPlan, SegmentPerms, plan_elf_load, plan_elf_load_bytes};
 use crate::linux_abi::{
-    LINUX_AT_ENTRY, LINUX_AT_NULL, LINUX_AT_PAGESZ, LINUX_AT_PHDR, LINUX_AT_PHENT, LINUX_AT_PHNUM,
-    LINUX_PAGE_SIZE, LinuxAuxvEntry,
+    LINUX_AT_BASE, LINUX_AT_ENTRY, LINUX_AT_NULL, LINUX_AT_PAGESZ, LINUX_AT_PHDR, LINUX_AT_PHENT,
+    LINUX_AT_PHNUM, LINUX_PAGE_SIZE, LinuxAuxvEntry,
 };
+use crate::rootfs::{RootFs, RootFsError};
 use serde::Serialize;
 use thiserror::Error;
 use zerocopy::IntoBytes;
 
+pub const LINUX_INTERPRETER_BASE: u64 = 0x7000_0000_0000;
 pub const LINUX_STACK_TOP: u64 = 0x7fff_ffff_0000;
 pub const LINUX_STACK_SIZE: u64 = 1024 * 1024;
 
@@ -62,6 +64,8 @@ pub enum AddressSpaceError {
     Elf(#[from] ElfInspectError),
     #[error("failed to read ELF bytes: {0}")]
     Io(#[from] std::io::Error),
+    #[error("failed to read rootfs-backed ELF dependency: {0}")]
+    RootFs(#[from] RootFsError),
     #[error(
         "ELF segment at 0x{virtual_address:x} has file size {file_size} greater than memory size {memory_size}"
     )]
@@ -106,61 +110,52 @@ impl AddressSpace {
         Self::load_elf_segments(bytes, plan)
     }
 
+    pub fn load_elf_from_rootfs(
+        path: impl AsRef<Path>,
+        rootfs: &RootFs,
+    ) -> Result<Self, AddressSpaceError> {
+        let file = rootfs.read(path)?;
+        let plan = plan_elf_load_bytes(&file)?;
+        Self::load_elf_segments_with_interpreter(&file, plan, rootfs)
+    }
+
     fn load_elf_segments(file: &[u8], plan: LoadPlan) -> Result<Self, AddressSpaceError> {
-        let linux_auxv = linux_auxv_from_load_plan(&plan);
-        let mut regions = Vec::with_capacity(plan.segments.len());
-
-        for segment in plan.segments {
-            if segment.file_size > segment.memory_size {
-                return Err(AddressSpaceError::FileLargerThanMemory {
-                    virtual_address: segment.virtual_address,
-                    file_size: segment.file_size,
-                    memory_size: segment.memory_size,
-                });
-            }
-
-            let file_offset = usize::try_from(segment.file_offset).map_err(|_| {
-                AddressSpaceError::SegmentBeyondFile {
-                    virtual_address: segment.virtual_address,
-                }
-            })?;
-            let file_size = usize::try_from(segment.file_size).map_err(|_| {
-                AddressSpaceError::SegmentBeyondFile {
-                    virtual_address: segment.virtual_address,
-                }
-            })?;
-            let file_end =
-                file_offset
-                    .checked_add(file_size)
-                    .ok_or(AddressSpaceError::SegmentBeyondFile {
-                        virtual_address: segment.virtual_address,
-                    })?;
-            if file_end > file.len() {
-                return Err(AddressSpaceError::SegmentBeyondFile {
-                    virtual_address: segment.virtual_address,
-                });
-            }
-
-            let memory_size = usize::try_from(segment.memory_size)
-                .map_err(|_| AddressSpaceError::RegionTooLarge(segment.memory_size))?;
-            let mut bytes = vec![0; memory_size];
-            bytes[..file_size].copy_from_slice(&file[file_offset..file_end]);
-
-            regions.push(MemoryRegion {
-                start: segment.virtual_address,
-                end: segment
-                    .virtual_address
-                    .checked_add(segment.memory_size)
-                    .ok_or(AddressSpaceError::RegionOverflow {
-                        start: segment.virtual_address,
-                        size: segment.memory_size,
-                    })?,
-                perms: segment.perms,
-                bytes,
-            });
-        }
+        let linux_auxv = linux_auxv_from_load_plan(&plan, None);
+        let regions = regions_from_load_plan(file, &plan, 0)?;
 
         let mut image = Self::from_regions(plan.entry, regions)?;
+        image.linux_auxv = linux_auxv;
+        Ok(image)
+    }
+
+    fn load_elf_segments_with_interpreter(
+        file: &[u8],
+        plan: LoadPlan,
+        rootfs: &RootFs,
+    ) -> Result<Self, AddressSpaceError> {
+        let mut regions = regions_from_load_plan(file, &plan, 0)?;
+        let mut entry = plan.entry;
+        let mut interpreter_base = None;
+
+        if let Some(interpreter_path) = plan.interpreter.as_deref() {
+            let interpreter = rootfs.read(interpreter_path)?;
+            let interpreter_plan = plan_elf_load_bytes(&interpreter)?;
+            regions.extend(regions_from_load_plan(
+                &interpreter,
+                &interpreter_plan,
+                LINUX_INTERPRETER_BASE,
+            )?);
+            entry = LINUX_INTERPRETER_BASE
+                .checked_add(interpreter_plan.entry)
+                .ok_or(AddressSpaceError::RegionOverflow {
+                    start: LINUX_INTERPRETER_BASE,
+                    size: interpreter_plan.entry,
+                })?;
+            interpreter_base = Some(LINUX_INTERPRETER_BASE);
+        }
+
+        let linux_auxv = linux_auxv_from_load_plan(&plan, interpreter_base);
+        let mut image = Self::from_regions(entry, regions)?;
         image.linux_auxv = linux_auxv;
         Ok(image)
     }
@@ -393,7 +388,76 @@ fn align_down_usize(value: usize, alignment: usize) -> usize {
     value / alignment * alignment
 }
 
-fn linux_auxv_from_load_plan(plan: &LoadPlan) -> Vec<LinuxAuxvEntry> {
+fn regions_from_load_plan(
+    file: &[u8],
+    plan: &LoadPlan,
+    load_bias: u64,
+) -> Result<Vec<MemoryRegion>, AddressSpaceError> {
+    let mut regions = Vec::with_capacity(plan.segments.len());
+
+    for segment in &plan.segments {
+        let start = segment.virtual_address.checked_add(load_bias).ok_or(
+            AddressSpaceError::RegionOverflow {
+                start: segment.virtual_address,
+                size: load_bias,
+            },
+        )?;
+
+        if segment.file_size > segment.memory_size {
+            return Err(AddressSpaceError::FileLargerThanMemory {
+                virtual_address: start,
+                file_size: segment.file_size,
+                memory_size: segment.memory_size,
+            });
+        }
+
+        let file_offset = usize::try_from(segment.file_offset).map_err(|_| {
+            AddressSpaceError::SegmentBeyondFile {
+                virtual_address: start,
+            }
+        })?;
+        let file_size = usize::try_from(segment.file_size).map_err(|_| {
+            AddressSpaceError::SegmentBeyondFile {
+                virtual_address: start,
+            }
+        })?;
+        let file_end =
+            file_offset
+                .checked_add(file_size)
+                .ok_or(AddressSpaceError::SegmentBeyondFile {
+                    virtual_address: start,
+                })?;
+        if file_end > file.len() {
+            return Err(AddressSpaceError::SegmentBeyondFile {
+                virtual_address: start,
+            });
+        }
+
+        let memory_size = usize::try_from(segment.memory_size)
+            .map_err(|_| AddressSpaceError::RegionTooLarge(segment.memory_size))?;
+        let mut bytes = vec![0; memory_size];
+        bytes[..file_size].copy_from_slice(&file[file_offset..file_end]);
+
+        regions.push(MemoryRegion {
+            start,
+            end: start.checked_add(segment.memory_size).ok_or(
+                AddressSpaceError::RegionOverflow {
+                    start,
+                    size: segment.memory_size,
+                },
+            )?,
+            perms: segment.perms,
+            bytes,
+        });
+    }
+
+    Ok(regions)
+}
+
+fn linux_auxv_from_load_plan(
+    plan: &LoadPlan,
+    interpreter_base: Option<u64>,
+) -> Vec<LinuxAuxvEntry> {
     let mut auxv = Vec::new();
     if let Some(phdr) = plan.program_header_address {
         auxv.push(LinuxAuxvEntry::new(LINUX_AT_PHDR, phdr));
@@ -407,6 +471,9 @@ fn linux_auxv_from_load_plan(plan: &LoadPlan) -> Vec<LinuxAuxvEntry> {
         ));
     }
     auxv.push(LinuxAuxvEntry::new(LINUX_AT_PAGESZ, LINUX_PAGE_SIZE));
+    if let Some(base) = interpreter_base {
+        auxv.push(LinuxAuxvEntry::new(LINUX_AT_BASE, base));
+    }
     auxv.push(LinuxAuxvEntry::new(LINUX_AT_ENTRY, plan.entry));
     auxv
 }
