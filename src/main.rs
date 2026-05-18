@@ -8,7 +8,8 @@ use carrick::memory::AddressSpace;
 use carrick::oci::{ImageReference, ImageStore, pull_image};
 use carrick::rootfs::RootFs;
 use carrick::runtime::{
-    DEFAULT_MAX_TRAPS, run_rootfs_elf_with_hvf_args, run_static_elf_with_hvf_args_and_dispatcher,
+    DEFAULT_MAX_TRAPS, DebugStateSnapshot, run_rootfs_elf_with_hvf_args_debug,
+    run_static_elf_with_hvf_args_and_dispatcher_debug,
 };
 use carrick::syscall::{aarch64_table, lookup_aarch64};
 use carrick::trap::hvf_capabilities;
@@ -42,6 +43,13 @@ enum Commands {
         rootfs_layers: Vec<PathBuf>,
         #[arg(long, default_value_t = DEFAULT_MAX_TRAPS)]
         max_traps: usize,
+        /// Write a JSON dump of the guest address-space layout (PIE base,
+        /// interpreter base, HVF mappings, vector + trampoline pages) to
+        /// this path BEFORE starting the vCPU. The dump is what the
+        /// `carrick.lldb` Python plugin reads to translate guest addresses
+        /// back to image / segment / file context.
+        #[arg(long = "debug-state-path")]
+        debug_state_path: Option<PathBuf>,
         #[arg(last = true)]
         args: Vec<String>,
     },
@@ -52,6 +60,9 @@ enum Commands {
         image: String,
         #[arg(long, default_value_t = DEFAULT_MAX_TRAPS)]
         max_traps: usize,
+        /// See `run-elf --debug-state-path`.
+        #[arg(long = "debug-state-path")]
+        debug_state_path: Option<PathBuf>,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
@@ -90,6 +101,31 @@ enum Commands {
         number: Option<u64>,
     },
     TrapCapabilities,
+    /// Tools for debugging Carrick under lldb. Pairs with the Python plugin
+    /// at `scripts/carrick_lldb.py`.
+    Debug {
+        #[command(subcommand)]
+        command: DebugCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DebugCommand {
+    /// Decode an AArch64 ESR_EL1 value into its exception class, IL, ISS
+    /// (with DFSC for data aborts) so the operator doesn't have to hand-
+    /// parse syndromes during an interactive session.
+    DecodeEsr {
+        /// Syndrome value, hex (0xN) or decimal.
+        syndrome: String,
+    },
+    /// Print the path to the `carrick_lldb.py` plugin so the operator can
+    /// `command script import` it from their lldb session.
+    LldbPlugin,
+    /// Read the JSON dumped by `run --debug-state-path` and print it as a
+    /// human-readable summary. Useful for one-shot inspection without lldb.
+    InspectState {
+        path: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -146,6 +182,7 @@ async fn main() -> anyhow::Result<()> {
             path,
             rootfs_layers,
             max_traps,
+            debug_state_path,
             args,
         } => {
             let dispatcher = if rootfs_layers.is_empty() {
@@ -158,12 +195,13 @@ async fn main() -> anyhow::Result<()> {
             };
             let mut argv = vec![path.to_string_lossy().into_owned()];
             argv.extend(args);
-            let result = run_static_elf_with_hvf_args_and_dispatcher(
+            let result = run_static_elf_with_hvf_args_and_dispatcher_debug(
                 &path,
                 dispatcher,
                 argv,
                 std::iter::empty(),
                 max_traps,
+                debug_state_path.as_ref(),
             )
             .with_context(|| format!("failed to run static ELF {}", path.display()))?;
             println!(
@@ -194,6 +232,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Run {
             image,
             max_traps,
+            debug_state_path,
             command,
         } => {
             let image = ImageReference::parse(&image)?;
@@ -213,12 +252,13 @@ async fn main() -> anyhow::Result<()> {
             let rootfs = RootFs::from_layer_paths(&rootfs_layers)
                 .context("failed to compose image rootfs layers")?;
             let executable_path = &command[0];
-            let result = run_rootfs_elf_with_hvf_args(
+            let result = run_rootfs_elf_with_hvf_args_debug(
                 executable_path.as_str(),
                 &rootfs,
                 command.clone(),
                 std::iter::empty(),
                 max_traps,
+                debug_state_path.as_ref(),
             )
             .with_context(|| {
                 format!(
@@ -344,9 +384,159 @@ async fn main() -> anyhow::Result<()> {
         Commands::TrapCapabilities => {
             println!("{}", serde_json::to_string_pretty(&hvf_capabilities())?);
         }
+        Commands::Debug { command } => match command {
+            DebugCommand::DecodeEsr { syndrome } => {
+                let stripped = syndrome.trim();
+                let value = if let Some(hex) = stripped.strip_prefix("0x").or_else(|| stripped.strip_prefix("0X")) {
+                    u64::from_str_radix(hex, 16)?
+                } else {
+                    stripped.parse::<u64>()?
+                };
+                println!("{}", serde_json::to_string_pretty(&decode_esr_el1(value))?);
+            }
+            DebugCommand::LldbPlugin => {
+                let manifest_dir = env!("CARGO_MANIFEST_DIR");
+                let path = std::path::Path::new(manifest_dir)
+                    .join("scripts")
+                    .join("carrick_lldb.py");
+                if !path.exists() {
+                    eprintln!(
+                        "warning: lldb plugin not found at {} (CARGO_MANIFEST_DIR may not match runtime tree)",
+                        path.display()
+                    );
+                }
+                println!("{}", path.display());
+            }
+            DebugCommand::InspectState { path } => {
+                let bytes = std::fs::read(&path)
+                    .with_context(|| format!("failed to read {}", path.display()))?;
+                let state: DebugStateSnapshot = serde_json::from_slice(&bytes)
+                    .with_context(|| format!("failed to parse {}", path.display()))?;
+                println!("{}", serde_json::to_string_pretty(&state)?);
+            }
+        },
     }
 
     Ok(())
+}
+
+/// Decode an `ESR_EL1` value into a human-readable struct. Mirrors the
+/// fields documented in the ARMv8-A ARM and the lldb plugin's table so
+/// CLI and lldb give the same answer for a given syndrome.
+fn decode_esr_el1(value: u64) -> serde_json::Value {
+    let ec = ((value >> 26) & 0x3f) as u8;
+    let il = (value >> 25) & 1;
+    let iss = value & 0x01_FF_FF_FF;
+    let ec_name = match ec {
+        0x00 => "Unknown",
+        0x01 => "WFI/WFE trap",
+        0x07 => "Trapped access to SVE/SIMD/FP (CPACR_EL1.FPEN)",
+        0x15 => "SVC instruction (AArch64)",
+        0x16 => "HVC instruction (AArch64)",
+        0x18 => "MSR/MRS trapped",
+        0x20 => "Instruction Abort from a lower EL",
+        0x21 => "Instruction Abort from current EL",
+        0x22 => "PC alignment fault",
+        0x24 => "Data Abort from a lower EL",
+        0x25 => "Data Abort from current EL",
+        0x26 => "SP alignment fault",
+        0x2c => "Trapped floating-point exception",
+        0x2f => "SError interrupt",
+        _ => "(other)",
+    };
+
+    let mut iss_detail = serde_json::Map::new();
+    if matches!(ec, 0x20 | 0x21 | 0x24 | 0x25) {
+        let dfsc = iss & 0x3f;
+        let wnr = (iss >> 6) & 1;
+        let s1ptw = (iss >> 7) & 1;
+        let cm = (iss >> 8) & 1;
+        let ea = (iss >> 9) & 1;
+        let sf = (iss >> 15) & 1;
+        let srt = (iss >> 16) & 0x1f;
+        let isv = (iss >> 24) & 1;
+        let dfsc_name = match dfsc {
+            0x00 => "Address size fault, level 0",
+            0x01 => "Address size fault, level 1",
+            0x02 => "Address size fault, level 2",
+            0x03 => "Address size fault, level 3",
+            0x04 => "Translation fault, level 0",
+            0x05 => "Translation fault, level 1",
+            0x06 => "Translation fault, level 2",
+            0x07 => "Translation fault, level 3",
+            0x09 => "Access flag fault, level 1",
+            0x0a => "Access flag fault, level 2",
+            0x0b => "Access flag fault, level 3",
+            0x0d => "Permission fault, level 1",
+            0x0e => "Permission fault, level 2",
+            0x0f => "Permission fault, level 3",
+            0x10 => "Synchronous External abort, not on TT walk",
+            0x21 => "Alignment fault",
+            0x30 => "TLB conflict abort",
+            0x31 => "Unsupported atomic hardware update fault",
+            0x34 => "IMPLEMENTATION DEFINED fault (Lockdown)",
+            0x35 => "External abort on translation table walk, level 1",
+            0x36 => "External abort on translation table walk, level 2",
+            0x37 => "External abort on translation table walk, level 3",
+            _ => "(other)",
+        };
+        iss_detail.insert("dfsc".into(), serde_json::Value::from(dfsc));
+        iss_detail.insert("dfsc_name".into(), serde_json::Value::from(dfsc_name));
+        iss_detail.insert("wnr".into(), serde_json::Value::from(wnr == 1));
+        iss_detail.insert("s1ptw".into(), serde_json::Value::from(s1ptw == 1));
+        iss_detail.insert("cm".into(), serde_json::Value::from(cm == 1));
+        iss_detail.insert("ea_external_abort".into(), serde_json::Value::from(ea == 1));
+        iss_detail.insert("sf_64bit_reg".into(), serde_json::Value::from(sf == 1));
+        iss_detail.insert("srt_register".into(), serde_json::Value::from(srt));
+        iss_detail.insert("isv".into(), serde_json::Value::from(isv == 1));
+    }
+
+    serde_json::json!({
+        "esr_el1": format!("0x{:x}", value),
+        "ec": ec,
+        "ec_hex": format!("0x{:02x}", ec),
+        "ec_name": ec_name,
+        "il": il == 1,
+        "iss": format!("0x{:x}", iss),
+        "iss_detail": iss_detail,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_esr_el1;
+
+    #[test]
+    fn decodes_tier_b_data_abort_syndrome() {
+        // Real syndrome captured from musl `ldaxr` failing at the Tier B wall.
+        let json = decode_esr_el1(0x92000035);
+        assert_eq!(json["ec_hex"], "0x24");
+        assert_eq!(json["ec_name"], "Data Abort from a lower EL");
+        assert_eq!(json["il"], true);
+        assert_eq!(json["iss_detail"]["dfsc"], 53);
+        assert_eq!(
+            json["iss_detail"]["dfsc_name"],
+            "External abort on translation table walk, level 1"
+        );
+        assert_eq!(json["iss_detail"]["wnr"], false);
+        assert_eq!(json["iss_detail"]["isv"], false);
+    }
+
+    #[test]
+    fn decodes_svc_from_lower_el() {
+        // EC=0x15 (SVC AArch64), IL=1, ISS=0 (immediate)
+        let json = decode_esr_el1(0x56000000);
+        assert_eq!(json["ec_hex"], "0x15");
+        assert_eq!(json["ec_name"], "SVC instruction (AArch64)");
+        assert_eq!(json["il"], true);
+    }
+
+    #[test]
+    fn decodes_hvc_from_el1() {
+        let json = decode_esr_el1(0x5a000000);
+        assert_eq!(json["ec_hex"], "0x16");
+        assert_eq!(json["ec_name"], "HVC instruction (AArch64)");
+    }
 }
 
 fn register_dtrace_probes() {
