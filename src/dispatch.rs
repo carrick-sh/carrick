@@ -9,9 +9,9 @@ use crate::compat::{CompatEvent, CompatReporter, SyscallArgs};
 use crate::linux_abi::{
     LINUX_DIRENT64_HEADER_SIZE, LINUX_DT_DIR, LINUX_DT_LNK, LINUX_DT_REG, LINUX_PAGE_SIZE,
     LINUX_S_IFDIR, LINUX_S_IFLNK, LINUX_S_IFREG, LinuxDirent64Header, LinuxEpollEvent,
-    LinuxEventfdValue, LinuxFdPair, LinuxIovec, LinuxItimerspec, LinuxRlimit, LinuxSigaction,
-    LinuxStat, LinuxStatfs, LinuxTimerfdExpirations, LinuxTimespec, LinuxTimeval, LinuxTimezone,
-    LinuxUtsname, LinuxWinsize,
+    LinuxEventfdValue, LinuxFdPair, LinuxIovec, LinuxItimerspec, LinuxPollFd, LinuxRlimit,
+    LinuxSigaction, LinuxStat, LinuxStatfs, LinuxTimerfdExpirations, LinuxTimespec, LinuxTimeval,
+    LinuxTimezone, LinuxUtsname, LinuxWinsize,
 };
 use crate::memory::{LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE, LINUX_MMAP_SIZE};
 use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsError, RootFsMetadata};
@@ -70,6 +70,11 @@ const LINUX_EPOLL_CTL_ADD: u64 = 1;
 const LINUX_EPOLL_CTL_DEL: u64 = 2;
 const LINUX_EPOLL_CTL_MOD: u64 = 3;
 const LINUX_EPOLLIN: u32 = 0x001;
+const LINUX_POLLIN: i16 = 0x0001;
+const LINUX_POLLOUT: i16 = 0x0004;
+const LINUX_POLLERR: i16 = 0x0008;
+const LINUX_POLLHUP: i16 = 0x0010;
+const LINUX_POLLNVAL: i16 = 0x0020;
 const LINUX_TFD_NONBLOCK: u64 = LINUX_O_NONBLOCK;
 const LINUX_TFD_CLOEXEC: u64 = LINUX_O_CLOEXEC;
 const LINUX_TIMER_ABSTIME: u64 = 0x1;
@@ -403,6 +408,7 @@ impl SyscallDispatcher {
             65 => self.readv(request, memory)?,
             66 => self.writev(request, memory)?,
             67 => self.pread64(request, memory)?,
+            73 => self.ppoll(request, memory)?,
             78 => self.readlinkat(request, memory)?,
             79 => self.newfstatat(request, memory)?,
             80 => self.fstat(request, memory),
@@ -937,6 +943,113 @@ impl SyscallDispatcher {
             }
             _ => 0,
         }
+    }
+
+    fn ppoll(
+        &self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let pollfds_address = request.arg(0);
+        let nfds = usize::try_from(request.arg(1))
+            .map_err(|_| DispatchError::LengthTooLarge(request.arg(1)))?;
+
+        let mut ready = 0i64;
+        let pollfd_size = core::mem::size_of::<LinuxPollFd>();
+        for index in 0..nfds {
+            let offset = index
+                .checked_mul(pollfd_size)
+                .and_then(|offset| u64::try_from(offset).ok())
+                .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
+            let address = match pollfds_address.checked_add(offset) {
+                Some(address) => address,
+                None => {
+                    return Ok(DispatchOutcome::Errno {
+                        errno: LINUX_EFAULT,
+                    });
+                }
+            };
+            let mut pollfd = match read_pollfd(memory, address) {
+                Ok(pollfd) => pollfd,
+                Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            };
+            pollfd.revents = self.poll_ready_events(pollfd.fd, pollfd.events);
+            if pollfd.revents != 0 {
+                ready += 1;
+            }
+            if memory.write_bytes(address, pollfd.as_bytes()).is_err() {
+                return Ok(DispatchOutcome::Errno {
+                    errno: LINUX_EFAULT,
+                });
+            }
+        }
+
+        Ok(DispatchOutcome::Returned { value: ready })
+    }
+
+    fn poll_ready_events(&self, fd: i32, requested_events: i16) -> i16 {
+        if fd < 0 {
+            return 0;
+        }
+        let Some(open_file) = self.open_files.get(&fd) else {
+            return if is_stdio_fd(fd) {
+                requested_events & LINUX_POLLOUT
+            } else {
+                LINUX_POLLNVAL
+            };
+        };
+        let open = open_file.description.borrow();
+        let mut ready = 0;
+        match &*open {
+            OpenDescription::File { .. } | OpenDescription::SyntheticFile { .. } => {
+                if requested_events & LINUX_POLLIN != 0 {
+                    ready |= LINUX_POLLIN;
+                }
+            }
+            OpenDescription::Directory { .. } => {}
+            OpenDescription::EventFd { counter, .. } => {
+                if requested_events & LINUX_POLLIN != 0 && *counter > 0 {
+                    ready |= LINUX_POLLIN;
+                }
+                if requested_events & LINUX_POLLOUT != 0 {
+                    ready |= LINUX_POLLOUT;
+                }
+            }
+            OpenDescription::TimerFd {
+                clock_id,
+                interval,
+                deadline,
+                expirations,
+                ..
+            } => {
+                if requested_events & LINUX_POLLIN != 0
+                    && timerfd_expirations(*clock_id, *interval, *deadline, *expirations).0 > 0
+                {
+                    ready |= LINUX_POLLIN;
+                }
+            }
+            OpenDescription::Epoll { .. } => {}
+            OpenDescription::PipeReader { pipe, .. } => {
+                if requested_events & LINUX_POLLIN != 0 {
+                    let pipe = pipe.borrow();
+                    if !pipe.buffer.is_empty() {
+                        ready |= LINUX_POLLIN;
+                    }
+                    if pipe.writers == 0 {
+                        ready |= LINUX_POLLHUP;
+                    }
+                }
+            }
+            OpenDescription::PipeWriter { pipe, .. } => {
+                let pipe = pipe.borrow();
+                if pipe.readers == 0 {
+                    ready |= LINUX_POLLERR;
+                } else if requested_events & LINUX_POLLOUT != 0 {
+                    ready |= LINUX_POLLOUT;
+                }
+            }
+        }
+        ready
     }
 
     fn pipe2(&mut self, request: SyscallRequest, memory: &mut impl GuestMemory) -> DispatchOutcome {
@@ -2660,6 +2773,13 @@ fn read_epoll_event(memory: &impl GuestMemory, address: u64) -> Result<LinuxEpol
         .read_bytes(address, core::mem::size_of::<LinuxEpollEvent>())
         .map_err(|_| LINUX_EFAULT)?;
     LinuxEpollEvent::read_from_bytes(&bytes).map_err(|_| LINUX_EFAULT)
+}
+
+fn read_pollfd(memory: &impl GuestMemory, address: u64) -> Result<LinuxPollFd, i32> {
+    let bytes = memory
+        .read_bytes(address, core::mem::size_of::<LinuxPollFd>())
+        .map_err(|_| LINUX_EFAULT)?;
+    LinuxPollFd::read_from_bytes(&bytes).map_err(|_| LINUX_EFAULT)
 }
 
 fn read_itimerspec(memory: &impl GuestMemory, address: u64) -> Result<LinuxItimerspec, i32> {

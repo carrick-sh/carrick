@@ -115,7 +115,7 @@ const AARCH64_SYSCALLS: &[Syscall] = &[
     syscall(70, "pwritev", "fs", SupportLevel::Planned),
     syscall(71, "sendfile", "fs", SupportLevel::Planned),
     syscall(72, "pselect6", "fs", SupportLevel::Planned),
-    syscall(73, "ppoll", "fs", SupportLevel::Planned),
+    syscall(73, "ppoll", "fs", SupportLevel::BringUp),
     syscall(74, "signalfd4", "signal", SupportLevel::Planned),
     syscall(75, "vmsplice", "fs", SupportLevel::Planned),
     syscall(76, "splice", "fs", SupportLevel::Planned),

@@ -7,8 +7,8 @@ use carrick::elf::SegmentPerms;
 use carrick::linux_abi::{
     LINUX_DIRENT64_HEADER_SIZE, LINUX_DT_REG, LINUX_S_IFDIR, LINUX_S_IFMT, LINUX_S_IFREG,
     LinuxDirent64Header, LinuxEpollEvent, LinuxEventfdValue, LinuxFdPair, LinuxIovec,
-    LinuxItimerspec, LinuxRlimit, LinuxStat, LinuxStatfs, LinuxTimerfdExpirations, LinuxTimespec,
-    LinuxTimeval, LinuxTimezone, LinuxUtsname, LinuxWinsize,
+    LinuxItimerspec, LinuxPollFd, LinuxRlimit, LinuxStat, LinuxStatfs, LinuxTimerfdExpirations,
+    LinuxTimespec, LinuxTimeval, LinuxTimezone, LinuxUtsname, LinuxWinsize,
 };
 use carrick::memory::{AddressSpace, LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE};
 use carrick::rootfs::{LayerSource, RootFs};
@@ -30,6 +30,9 @@ const LINUX_OVERLAYFS_SUPER_MAGIC: i64 = 0x794c7630;
 const LINUX_EFD_NONBLOCK: u64 = LINUX_O_NONBLOCK;
 const LINUX_EPOLL_CTL_ADD: u64 = 1;
 const LINUX_EPOLLIN: u32 = 0x001;
+const LINUX_POLLIN: i16 = 0x0001;
+const LINUX_POLLOUT: i16 = 0x0004;
+const LINUX_POLLNVAL: i16 = 0x0020;
 const LINUX_TFD_NONBLOCK: u64 = LINUX_O_NONBLOCK;
 const LINUX_TIOCGWINSZ: u64 = 0x5413;
 
@@ -742,6 +745,96 @@ fn epoll_reports_eventfd_readiness_with_packed_events() {
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
     );
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn ppoll_reports_eventfd_pipe_and_invalid_fd_readiness() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x800]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(19, SyscallArgs::from([1, LINUX_EFD_NONBLOCK, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 3 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    59,
+                    SyscallArgs::from([0x4000, LINUX_O_NONBLOCK, 0, 0, 0, 0])
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let pair = read_fd_pair(&memory, 0x4000);
+    memory.write_bytes(0x4080, b"x").unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    64,
+                    SyscallArgs::from([pair.write_fd as u64, 0x4080, 1, 0, 0, 0])
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 1 }
+    );
+
+    write_pollfds(
+        &mut memory,
+        0x4100,
+        [
+            LinuxPollFd {
+                fd: 3,
+                events: LINUX_POLLIN,
+                revents: 0,
+            },
+            LinuxPollFd {
+                fd: pair.read_fd,
+                events: LINUX_POLLIN,
+                revents: 0,
+            },
+            LinuxPollFd {
+                fd: pair.write_fd,
+                events: LINUX_POLLOUT,
+                revents: 0,
+            },
+            LinuxPollFd {
+                fd: 99,
+                events: LINUX_POLLIN,
+                revents: 0,
+            },
+        ],
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(73, SyscallArgs::from([0x4100, 4, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 4 }
+    );
+
+    let pollfds = read_pollfds(&memory, 0x4100, 4);
+    assert_eq!(pollfds[0].2 & LINUX_POLLIN, LINUX_POLLIN);
+    assert_eq!(pollfds[1].2 & LINUX_POLLIN, LINUX_POLLIN);
+    assert_eq!(pollfds[2].2 & LINUX_POLLOUT, LINUX_POLLOUT);
+    assert_eq!(pollfds[3].2, LINUX_POLLNVAL);
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
@@ -2335,6 +2428,34 @@ fn write_iovecs<const N: usize>(
         bytes.extend_from_slice(iovec.as_bytes());
     }
     memory.write_bytes(address, &bytes).unwrap();
+}
+
+fn write_pollfds<const N: usize>(
+    memory: &mut impl GuestMemory,
+    address: u64,
+    pollfds: [LinuxPollFd; N],
+) {
+    let mut bytes = Vec::new();
+    for pollfd in pollfds {
+        bytes.extend_from_slice(pollfd.as_bytes());
+    }
+    memory.write_bytes(address, &bytes).unwrap();
+}
+
+fn read_pollfds(memory: &impl GuestMemory, address: u64, count: usize) -> Vec<(i32, i16, i16)> {
+    let bytes = memory
+        .read_bytes(address, count * std::mem::size_of::<LinuxPollFd>())
+        .unwrap();
+    bytes
+        .chunks_exact(std::mem::size_of::<LinuxPollFd>())
+        .map(|pollfd| {
+            let pollfd = LinuxPollFd::read_from_bytes(pollfd).unwrap();
+            let fd = pollfd.fd;
+            let events = pollfd.events;
+            let revents = pollfd.revents;
+            (fd, events, revents)
+        })
+        .collect()
 }
 
 fn rw_perms() -> SegmentPerms {
