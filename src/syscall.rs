@@ -77,7 +77,7 @@ const AARCH64_SYSCALLS: &[Syscall] = &[
     syscall(32, "flock", "fs", SupportLevel::BringUp),
     syscall(33, "mknodat", "fs", SupportLevel::Planned),
     syscall(34, "mkdirat", "fs", SupportLevel::BringUp),
-    syscall(35, "unlinkat", "fs", SupportLevel::Planned),
+    syscall(35, "unlinkat", "fs", SupportLevel::BringUp),
     syscall(36, "symlinkat", "fs", SupportLevel::Planned),
     syscall(37, "linkat", "fs", SupportLevel::Planned),
     syscall(38, "renameat", "fs", SupportLevel::Planned),

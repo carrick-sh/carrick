@@ -45,6 +45,7 @@ pub const LINUX_AT_FDCWD: u64 = (-100_i64) as u64;
 pub const LINUX_AT_SYMLINK_NOFOLLOW: u64 = 0x100;
 pub const LINUX_AT_EACCESS: u64 = 0x200;
 pub const LINUX_AT_EMPTY_PATH: u64 = 0x1000;
+pub const LINUX_AT_REMOVEDIR: u64 = 0x200;
 pub const LINUX_AT_NO_AUTOMOUNT: u64 = 0x800;
 pub const LINUX_AT_STATX_FORCE_SYNC: u64 = 0x2000;
 pub const LINUX_AT_STATX_DONT_SYNC: u64 = 0x4000;
@@ -466,6 +467,7 @@ impl SyscallDispatcher {
             29 => self.ioctl(request, memory, reporter),
             32 => self.flock(request),
             34 => self.mkdirat(request, memory)?,
+            35 => self.unlinkat(request, memory)?,
             43 => self.statfs(request, memory)?,
             44 => self.fstatfs(request, memory),
             46 => self.ftruncate(request),
@@ -3267,6 +3269,58 @@ impl SyscallDispatcher {
             }
         }
         Ok(DispatchOutcome::Errno { errno: LINUX_EROFS })
+    }
+
+    fn unlinkat(
+        &self,
+        request: SyscallRequest,
+        memory: &impl GuestMemory,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let dirfd = request.arg(0);
+        let pathname = request.arg(1);
+        let flags = request.arg(2);
+        if flags & !LINUX_AT_REMOVEDIR != 0 {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            });
+        }
+        let path = match read_guest_c_string(memory, pathname) {
+            Ok(path) => path,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        if path.is_empty() {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_ENOENT,
+            });
+        }
+        let resolved = match self.resolve_at_path(dirfd, &path) {
+            Ok(resolved) => resolved,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        let kind = if synthetic_proc_file(&resolved, &self.executable_path).is_some() {
+            RootFsEntryKind::File
+        } else {
+            let Some(rootfs) = &self.rootfs else {
+                return Ok(DispatchOutcome::Errno {
+                    errno: LINUX_ENOENT,
+                });
+            };
+            match rootfs.symlink_metadata(&resolved) {
+                Ok(metadata) => metadata.kind,
+                Err(errno) => {
+                    return Ok(DispatchOutcome::Errno {
+                        errno: rootfs_errno(errno),
+                    });
+                }
+            }
+        };
+        let remove_dir = flags & LINUX_AT_REMOVEDIR != 0;
+        let errno = match (kind, remove_dir) {
+            (RootFsEntryKind::Directory, false) => LINUX_EISDIR,
+            (RootFsEntryKind::File | RootFsEntryKind::Symlink, true) => LINUX_ENOTDIR,
+            _ => LINUX_EROFS,
+        };
+        Ok(DispatchOutcome::Errno { errno })
     }
 
     fn utimensat(

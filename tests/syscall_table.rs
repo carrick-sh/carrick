@@ -85,6 +85,7 @@ fn names_linux_aarch64_bringup_syscalls() {
         (25, "fcntl"),
         (32, "flock"),
         (34, "mkdirat"),
+        (35, "unlinkat"),
         (29, "ioctl"),
         (43, "statfs"),
         (44, "fstatfs"),
