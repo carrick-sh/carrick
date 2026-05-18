@@ -6,8 +6,8 @@ use carrick::dispatch::{
 use carrick::elf::SegmentPerms;
 use carrick::linux_abi::{
     LINUX_DIRENT64_HEADER_SIZE, LINUX_DT_REG, LINUX_S_IFDIR, LINUX_S_IFMT, LINUX_S_IFREG,
-    LinuxDirent64Header, LinuxEpollEvent, LinuxEventfdValue, LinuxIovec, LinuxRlimit, LinuxStat,
-    LinuxStatfs, LinuxTimespec, LinuxTimeval, LinuxTimezone, LinuxUtsname, LinuxWinsize,
+    LinuxDirent64Header, LinuxEpollEvent, LinuxEventfdValue, LinuxFdPair, LinuxIovec, LinuxRlimit,
+    LinuxStat, LinuxStatfs, LinuxTimespec, LinuxTimeval, LinuxTimezone, LinuxUtsname, LinuxWinsize,
 };
 use carrick::memory::{AddressSpace, LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE};
 use carrick::rootfs::{LayerSource, RootFs};
@@ -22,6 +22,7 @@ const LINUX_F_SETFD: u64 = 2;
 const LINUX_F_GETFL: u64 = 3;
 const LINUX_FD_CLOEXEC: u64 = 1;
 const LINUX_F_DUPFD_CLOEXEC: u64 = 1030;
+const LINUX_F_GETPIPE_SZ: u64 = 1032;
 const LINUX_O_CLOEXEC: u64 = 0o2000000;
 const LINUX_O_NONBLOCK: u64 = 0o4000;
 const LINUX_OVERLAYFS_SUPER_MAGIC: i64 = 0x794c7630;
@@ -232,6 +233,200 @@ fn eventfd2_read_write_round_trip_uses_packed_counter() {
     );
     let value = read_eventfd_value(&memory, 0x4020).value;
     assert_eq!(value, 5);
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn pipe2_writes_packed_fd_pair_and_round_trips_bytes() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    59,
+                    SyscallArgs::from([0x4000, LINUX_O_CLOEXEC | LINUX_O_NONBLOCK, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let pair = read_fd_pair(&memory, 0x4000);
+    let read_fd = pair.read_fd as u64;
+    let write_fd = pair.write_fd as u64;
+    assert_eq!(read_fd, 3);
+    assert_eq!(write_fd, 4);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(25, SyscallArgs::from([read_fd, LINUX_F_GETFD, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned {
+            value: LINUX_FD_CLOEXEC as i64
+        }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(25, SyscallArgs::from([read_fd, LINUX_F_GETFL, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned {
+            value: LINUX_O_NONBLOCK as i64
+        }
+    );
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(63, SyscallArgs::from([read_fd, 0x4080, 8, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 11 }
+    );
+
+    memory.write_bytes(0x4040, b"pipe data").unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(64, SyscallArgs::from([write_fd, 0x4040, 9, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 9 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(63, SyscallArgs::from([read_fd, 0x4080, 32, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 9 }
+    );
+    assert_eq!(memory.read_bytes(0x4080, 9).unwrap(), b"pipe data");
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn pipe2_duplicate_writer_keeps_pipe_open_until_all_writers_close() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    59,
+                    SyscallArgs::from([0x4000, LINUX_O_NONBLOCK, 0, 0, 0, 0])
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let pair = read_fd_pair(&memory, 0x4000);
+    let read_fd = pair.read_fd as u64;
+    let write_fd = pair.write_fd as u64;
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(23, SyscallArgs::from([write_fd, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 5 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(57, SyscallArgs::from([write_fd, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(63, SyscallArgs::from([read_fd, 0x4080, 8, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 11 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(57, SyscallArgs::from([5, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(63, SyscallArgs::from([read_fd, 0x4080, 8, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn fcntl_getpipe_size_reports_bootstrap_pipe_capacity() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(59, SyscallArgs::from([0x4000, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let pair = read_fd_pair(&memory, 0x4000);
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    25,
+                    SyscallArgs::from([pair.read_fd as u64, LINUX_F_GETPIPE_SZ, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 65536 }
+    );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
@@ -1817,6 +2012,13 @@ fn read_winsize(memory: &impl GuestMemory, address: u64) -> LinuxWinsize {
         .read_bytes(address, std::mem::size_of::<LinuxWinsize>())
         .unwrap();
     LinuxWinsize::read_from_bytes(&bytes).unwrap()
+}
+
+fn read_fd_pair(memory: &impl GuestMemory, address: u64) -> LinuxFdPair {
+    let bytes = memory
+        .read_bytes(address, std::mem::size_of::<LinuxFdPair>())
+        .unwrap();
+    LinuxFdPair::read_from_bytes(&bytes).unwrap()
 }
 
 fn read_eventfd_value(memory: &impl GuestMemory, address: u64) -> LinuxEventfdValue {

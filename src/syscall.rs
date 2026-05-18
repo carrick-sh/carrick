@@ -101,7 +101,7 @@ const AARCH64_SYSCALLS: &[Syscall] = &[
     syscall(56, "openat", "fs", SupportLevel::BringUp),
     syscall(57, "close", "fs", SupportLevel::BringUp),
     syscall(58, "vhangup", "tty", SupportLevel::Deferred),
-    syscall(59, "pipe2", "fs", SupportLevel::Planned),
+    syscall(59, "pipe2", "fs", SupportLevel::BringUp),
     syscall(60, "quotactl", "fs", SupportLevel::Deferred),
     syscall(61, "getdents64", "fs", SupportLevel::BringUp),
     syscall(62, "lseek", "fs", SupportLevel::BringUp),

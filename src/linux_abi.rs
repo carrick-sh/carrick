@@ -111,6 +111,15 @@ pub struct LinuxEpollEvent {
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
 )]
+pub struct LinuxFdPair {
+    pub read_fd: i32,
+    pub write_fd: i32,
+}
+
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
 pub struct LinuxDirent64Header {
     pub d_ino: u64,
     pub d_off: i64,

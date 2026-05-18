@@ -80,6 +80,7 @@ fn names_linux_aarch64_bringup_syscalls() {
         (29, "ioctl"),
         (43, "statfs"),
         (44, "fstatfs"),
+        (59, "pipe2"),
         (96, "set_tid_address"),
         (99, "set_robust_list"),
         (113, "clock_gettime"),

@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::OnceLock;
@@ -9,8 +9,8 @@ use crate::compat::{CompatEvent, CompatReporter, SyscallArgs};
 use crate::linux_abi::{
     LINUX_DIRENT64_HEADER_SIZE, LINUX_DT_DIR, LINUX_DT_LNK, LINUX_DT_REG, LINUX_PAGE_SIZE,
     LINUX_S_IFDIR, LINUX_S_IFLNK, LINUX_S_IFREG, LinuxDirent64Header, LinuxEpollEvent,
-    LinuxEventfdValue, LinuxIovec, LinuxRlimit, LinuxSigaction, LinuxStat, LinuxStatfs,
-    LinuxTimespec, LinuxTimeval, LinuxTimezone, LinuxUtsname, LinuxWinsize,
+    LinuxEventfdValue, LinuxFdPair, LinuxIovec, LinuxRlimit, LinuxSigaction, LinuxStat,
+    LinuxStatfs, LinuxTimespec, LinuxTimeval, LinuxTimezone, LinuxUtsname, LinuxWinsize,
 };
 use crate::memory::{LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE, LINUX_MMAP_SIZE};
 use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsError, RootFsMetadata};
@@ -26,6 +26,7 @@ pub const LINUX_ENOMEM: i32 = 12;
 pub const LINUX_EACCES: i32 = 13;
 pub const LINUX_EFAULT: i32 = 14;
 pub const LINUX_EEXIST: i32 = 17;
+pub const LINUX_EPIPE: i32 = 32;
 pub const LINUX_ENOTDIR: i32 = 20;
 pub const LINUX_EISDIR: i32 = 21;
 pub const LINUX_EINVAL: i32 = 22;
@@ -44,6 +45,7 @@ pub const LINUX_F_SETFD: u64 = 2;
 pub const LINUX_F_GETFL: u64 = 3;
 pub const LINUX_F_SETFL: u64 = 4;
 pub const LINUX_F_DUPFD_CLOEXEC: u64 = 1030;
+pub const LINUX_F_GETPIPE_SZ: u64 = 1032;
 pub const LINUX_FD_CLOEXEC: u64 = 1;
 pub const LINUX_SEEK_SET: u64 = 0;
 pub const LINUX_SEEK_CUR: u64 = 1;
@@ -68,6 +70,7 @@ const LINUX_EPOLL_CTL_DEL: u64 = 2;
 const LINUX_EPOLL_CTL_MOD: u64 = 3;
 const LINUX_EPOLLIN: u32 = 0x001;
 const LINUX_TIOCGWINSZ: u64 = 0x5413;
+const LINUX_PIPE_BUF_SIZE: i64 = 65_536;
 const LINUX_RT_SIGSET_SIZE: u64 = 8;
 const LINUX_CLOCK_REALTIME: u64 = 0;
 const LINUX_CLOCK_MONOTONIC: u64 = 1;
@@ -250,12 +253,27 @@ enum OpenDescription {
         interest: HashMap<i32, LinuxEpollEvent>,
         status_flags: u64,
     },
+    PipeReader {
+        pipe: Rc<RefCell<PipeState>>,
+        status_flags: u64,
+    },
+    PipeWriter {
+        pipe: Rc<RefCell<PipeState>>,
+        status_flags: u64,
+    },
 }
 
 #[derive(Debug, Clone)]
 struct OpenFile {
     description: Rc<RefCell<OpenDescription>>,
     fd_flags: u64,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PipeState {
+    buffer: VecDeque<u8>,
+    readers: usize,
+    writers: usize,
 }
 
 impl OpenDescription {
@@ -265,7 +283,9 @@ impl OpenDescription {
             | OpenDescription::Directory { status_flags, .. }
             | OpenDescription::SyntheticFile { status_flags, .. }
             | OpenDescription::EventFd { status_flags, .. }
-            | OpenDescription::Epoll { status_flags, .. } => *status_flags,
+            | OpenDescription::Epoll { status_flags, .. }
+            | OpenDescription::PipeReader { status_flags, .. }
+            | OpenDescription::PipeWriter { status_flags, .. } => *status_flags,
         }
     }
 
@@ -275,7 +295,9 @@ impl OpenDescription {
             | OpenDescription::Directory { status_flags, .. }
             | OpenDescription::SyntheticFile { status_flags, .. }
             | OpenDescription::EventFd { status_flags, .. }
-            | OpenDescription::Epoll { status_flags, .. } => *status_flags = next,
+            | OpenDescription::Epoll { status_flags, .. }
+            | OpenDescription::PipeReader { status_flags, .. }
+            | OpenDescription::PipeWriter { status_flags, .. } => *status_flags = next,
         }
     }
 }
@@ -360,6 +382,7 @@ impl SyscallDispatcher {
             50 => self.fchdir(request),
             56 => self.openat(request, memory, reporter)?,
             57 => self.close(request),
+            59 => self.pipe2(request, memory),
             61 => self.getdents64(request, memory)?,
             62 => self.lseek(request),
             63 => self.read(request, memory)?,
@@ -553,7 +576,9 @@ impl SyscallDispatcher {
             OpenDescription::File { .. }
             | OpenDescription::SyntheticFile { .. }
             | OpenDescription::EventFd { .. }
-            | OpenDescription::Epoll { .. } => DispatchOutcome::Errno {
+            | OpenDescription::Epoll { .. }
+            | OpenDescription::PipeReader { .. }
+            | OpenDescription::PipeWriter { .. } => DispatchOutcome::Errno {
                 errno: LINUX_ENOTDIR,
             },
         }
@@ -767,8 +792,69 @@ impl SyscallDispatcher {
             {
                 LINUX_EPOLLIN
             }
+            OpenDescription::PipeReader { pipe, .. } if requested_events & LINUX_EPOLLIN != 0 => {
+                let pipe = pipe.borrow();
+                if !pipe.buffer.is_empty() || pipe.writers == 0 {
+                    LINUX_EPOLLIN
+                } else {
+                    0
+                }
+            }
             _ => 0,
         }
+    }
+
+    fn pipe2(&mut self, request: SyscallRequest, memory: &mut impl GuestMemory) -> DispatchOutcome {
+        let address = request.arg(0);
+        let flags = request.arg(1);
+        if flags & !(LINUX_O_CLOEXEC | LINUX_O_NONBLOCK) != 0 {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+
+        let Some(read_fd) = self.allocate_fd(3) else {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        };
+        let Some(write_fd) = self.allocate_fd(read_fd.saturating_add(1)) else {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        };
+        let pair = LinuxFdPair { read_fd, write_fd };
+        if memory.write_bytes(address, pair.as_bytes()).is_err() {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EFAULT,
+            };
+        }
+
+        let pipe = Rc::new(RefCell::new(PipeState::default()));
+        let status_flags = flags & LINUX_O_NONBLOCK;
+        let fd_flags = linux_fd_flags_from_open_flags(flags);
+        self.insert_open_file(
+            read_fd,
+            OpenFile {
+                description: Rc::new(RefCell::new(OpenDescription::PipeReader {
+                    pipe: Rc::clone(&pipe),
+                    status_flags,
+                })),
+                fd_flags,
+            },
+        );
+        self.insert_open_file(
+            write_fd,
+            OpenFile {
+                description: Rc::new(RefCell::new(OpenDescription::PipeWriter {
+                    pipe,
+                    status_flags,
+                })),
+                fd_flags,
+            },
+        );
+
+        DispatchOutcome::Returned { value: 0 }
     }
 
     fn dup(&mut self, request: SyscallRequest) -> DispatchOutcome {
@@ -789,6 +875,10 @@ impl SyscallDispatcher {
             return DispatchOutcome::Errno { errno: LINUX_EBADF };
         };
         let description = Rc::clone(&open_file.description);
+        if let Some(replaced) = self.open_files.remove(&new_fd) {
+            close_open_file(&replaced);
+        }
+        retain_open_file(&description);
         self.open_files.insert(
             new_fd,
             OpenFile {
@@ -814,6 +904,19 @@ impl SyscallDispatcher {
                 Ok(min_fd) => self.duplicate_fd(fd, min_fd, LINUX_FD_CLOEXEC),
                 Err(errno) => DispatchOutcome::Errno { errno },
             },
+            LINUX_F_GETPIPE_SZ => {
+                let Some(open_file) = self.open_files.get(&fd) else {
+                    return DispatchOutcome::Errno { errno: LINUX_EBADF };
+                };
+                match &*open_file.description.borrow() {
+                    OpenDescription::PipeReader { .. } | OpenDescription::PipeWriter { .. } => {
+                        DispatchOutcome::Returned {
+                            value: LINUX_PIPE_BUF_SIZE,
+                        }
+                    }
+                    _ => DispatchOutcome::Errno { errno: LINUX_EBADF },
+                }
+            }
             LINUX_F_GETFD => {
                 let Some(open_file) = self.open_files.get(&fd) else {
                     return DispatchOutcome::Errno { errno: LINUX_EBADF };
@@ -1173,7 +1276,7 @@ impl SyscallDispatcher {
                 errno: LINUX_EINVAL,
             });
         };
-        self.open_files.insert(
+        self.insert_open_file(
             fd,
             OpenFile {
                 description: Rc::new(RefCell::new(description)),
@@ -1185,7 +1288,8 @@ impl SyscallDispatcher {
 
     fn close(&mut self, request: SyscallRequest) -> DispatchOutcome {
         let fd = request.arg(0) as i32;
-        if self.open_files.remove(&fd).is_some() {
+        if let Some(open_file) = self.open_files.remove(&fd) {
+            close_open_file(&open_file);
             DispatchOutcome::Returned { value: 0 }
         } else {
             DispatchOutcome::Errno { errno: LINUX_EBADF }
@@ -1202,6 +1306,7 @@ impl SyscallDispatcher {
                 errno: LINUX_EINVAL,
             };
         };
+        retain_open_file(&description);
         self.open_files.insert(
             new_fd,
             OpenFile {
@@ -1223,13 +1328,20 @@ impl SyscallDispatcher {
         Some(fd)
     }
 
+    fn insert_open_file(&mut self, fd: i32, open_file: OpenFile) {
+        retain_open_file(&open_file.description);
+        if let Some(replaced) = self.open_files.insert(fd, open_file) {
+            close_open_file(&replaced);
+        }
+    }
+
     fn install_fd(&mut self, description: OpenDescription, fd_flags: u64) -> DispatchOutcome {
         let Some(fd) = self.allocate_fd(3) else {
             return DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
             };
         };
-        self.open_files.insert(
+        self.insert_open_file(
             fd,
             OpenFile {
                 description: Rc::new(RefCell::new(description)),
@@ -1304,7 +1416,10 @@ impl SyscallDispatcher {
             OpenDescription::Directory {
                 entries, offset, ..
             } => (*offset as i64, entries.len() as i64),
-            OpenDescription::EventFd { .. } | OpenDescription::Epoll { .. } => {
+            OpenDescription::EventFd { .. }
+            | OpenDescription::Epoll { .. }
+            | OpenDescription::PipeReader { .. }
+            | OpenDescription::PipeWriter { .. } => {
                 return DispatchOutcome::Errno {
                     errno: LINUX_EINVAL,
                 };
@@ -1330,7 +1445,10 @@ impl SyscallDispatcher {
             OpenDescription::File { offset, .. }
             | OpenDescription::Directory { offset, .. }
             | OpenDescription::SyntheticFile { offset, .. } => *offset = next as usize,
-            OpenDescription::EventFd { .. } | OpenDescription::Epoll { .. } => {}
+            OpenDescription::EventFd { .. }
+            | OpenDescription::Epoll { .. }
+            | OpenDescription::PipeReader { .. }
+            | OpenDescription::PipeWriter { .. } => {}
         }
         DispatchOutcome::Returned { value: next }
     }
@@ -1403,7 +1521,9 @@ impl SyscallDispatcher {
                 | OpenDescription::SyntheticFile { contents, .. } => contents,
                 OpenDescription::Directory { .. }
                 | OpenDescription::EventFd { .. }
-                | OpenDescription::Epoll { .. } => {
+                | OpenDescription::Epoll { .. }
+                | OpenDescription::PipeReader { .. }
+                | OpenDescription::PipeWriter { .. } => {
                     return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
                 }
             };
@@ -1548,12 +1668,15 @@ impl SyscallDispatcher {
             OpenDescription::EventFd {
                 counter, semaphore, ..
             } => return Ok(read_eventfd(memory, address, length, counter, *semaphore)),
+            OpenDescription::PipeReader { pipe, status_flags } => {
+                return Ok(read_pipe(memory, address, length, pipe, *status_flags));
+            }
             OpenDescription::Directory { .. } => {
                 return Ok(DispatchOutcome::Errno {
                     errno: LINUX_EISDIR,
                 });
             }
-            OpenDescription::Epoll { .. } => {
+            OpenDescription::Epoll { .. } | OpenDescription::PipeWriter { .. } => {
                 return Ok(DispatchOutcome::Errno {
                     errno: LINUX_EINVAL,
                 });
@@ -1599,7 +1722,9 @@ impl SyscallDispatcher {
             } => (contents, offset),
             OpenDescription::Directory { .. }
             | OpenDescription::EventFd { .. }
-            | OpenDescription::Epoll { .. } => {
+            | OpenDescription::Epoll { .. }
+            | OpenDescription::PipeReader { .. }
+            | OpenDescription::PipeWriter { .. } => {
                 return Ok(DispatchOutcome::Errno {
                     errno: LINUX_EINVAL,
                 });
@@ -1632,7 +1757,9 @@ impl SyscallDispatcher {
             | OpenDescription::SyntheticFile { contents, .. } => contents,
             OpenDescription::Directory { .. }
             | OpenDescription::EventFd { .. }
-            | OpenDescription::Epoll { .. } => {
+            | OpenDescription::Epoll { .. }
+            | OpenDescription::PipeReader { .. }
+            | OpenDescription::PipeWriter { .. } => {
                 return Ok(DispatchOutcome::Errno {
                     errno: LINUX_EINVAL,
                 });
@@ -1681,10 +1808,15 @@ impl SyscallDispatcher {
                     return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
                 };
                 let mut open = open_file.description.borrow_mut();
-                let OpenDescription::EventFd { counter, .. } = &mut *open else {
-                    return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
-                };
-                return Ok(write_eventfd(&bytes, counter));
+                match &mut *open {
+                    OpenDescription::EventFd { counter, .. } => {
+                        return Ok(write_eventfd(&bytes, counter));
+                    }
+                    OpenDescription::PipeWriter { pipe, .. } => {
+                        return Ok(write_pipe(&bytes, pipe));
+                    }
+                    _ => return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF }),
+                }
             }
         }
 
@@ -1723,7 +1855,23 @@ impl SyscallDispatcher {
             match fd {
                 1 => self.stdout.extend_from_slice(&bytes),
                 2 => self.stderr.extend_from_slice(&bytes),
-                _ => return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF }),
+                _ => {
+                    let Some(open_file) = self.open_files.get(&(fd as i32)) else {
+                        return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+                    };
+                    let mut open = open_file.description.borrow_mut();
+                    let OpenDescription::PipeWriter { pipe, .. } = &mut *open else {
+                        return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+                    };
+                    let outcome = write_pipe(&bytes, pipe);
+                    let DispatchOutcome::Returned { value } = outcome else {
+                        return Ok(outcome);
+                    };
+                    total = total
+                        .checked_add(value as usize)
+                        .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
+                    continue;
+                }
             }
             total = total
                 .checked_add(bytes.len())
@@ -1857,6 +2005,9 @@ impl SyscallDispatcher {
             OpenDescription::Epoll { .. } => {
                 return write_synthetic_stat(memory, statbuf, "anon_inode:[eventpoll]", 0);
             }
+            OpenDescription::PipeReader { .. } | OpenDescription::PipeWriter { .. } => {
+                return write_synthetic_stat(memory, statbuf, "pipe:[carrick]", 0);
+            }
         };
         write_stat(memory, statbuf, metadata)
     }
@@ -1881,7 +2032,9 @@ impl SyscallDispatcher {
                 OpenDescription::File { .. }
                 | OpenDescription::SyntheticFile { .. }
                 | OpenDescription::EventFd { .. }
-                | OpenDescription::Epoll { .. } => Err(LINUX_ENOTDIR),
+                | OpenDescription::Epoll { .. }
+                | OpenDescription::PipeReader { .. }
+                | OpenDescription::PipeWriter { .. } => Err(LINUX_ENOTDIR),
             },
             None => Err(LINUX_EBADF),
         }
@@ -1927,6 +2080,34 @@ fn linux_fd_flags_from_open_flags(flags: u64) -> u64 {
 
 fn is_stdio_fd(fd: i32) -> bool {
     matches!(fd, 0..=2)
+}
+
+fn retain_open_file(description: &Rc<RefCell<OpenDescription>>) {
+    match &*description.borrow() {
+        OpenDescription::PipeReader { pipe, .. } => {
+            let mut pipe = pipe.borrow_mut();
+            pipe.readers = pipe.readers.saturating_add(1);
+        }
+        OpenDescription::PipeWriter { pipe, .. } => {
+            let mut pipe = pipe.borrow_mut();
+            pipe.writers = pipe.writers.saturating_add(1);
+        }
+        _ => {}
+    }
+}
+
+fn close_open_file(open_file: &OpenFile) {
+    match &*open_file.description.borrow() {
+        OpenDescription::PipeReader { pipe, .. } => {
+            let mut pipe = pipe.borrow_mut();
+            pipe.readers = pipe.readers.saturating_sub(1);
+        }
+        OpenDescription::PipeWriter { pipe, .. } => {
+            let mut pipe = pipe.borrow_mut();
+            pipe.writers = pipe.writers.saturating_sub(1);
+        }
+        _ => {}
+    }
 }
 
 fn linux_min_fd(value: u64) -> Result<i32, i32> {
@@ -2136,6 +2317,55 @@ fn write_eventfd(bytes: &[u8], counter: &mut u64) -> DispatchOutcome {
     *counter = next;
     DispatchOutcome::Returned {
         value: core::mem::size_of::<LinuxEventfdValue>() as i64,
+    }
+}
+
+fn read_pipe(
+    memory: &mut impl GuestMemory,
+    address: u64,
+    length: usize,
+    pipe: &Rc<RefCell<PipeState>>,
+    _status_flags: u64,
+) -> DispatchOutcome {
+    if length == 0 {
+        return DispatchOutcome::Returned { value: 0 };
+    }
+    let mut pipe = pipe.borrow_mut();
+    if pipe.buffer.is_empty() {
+        if pipe.writers == 0 {
+            return DispatchOutcome::Returned { value: 0 };
+        }
+        return DispatchOutcome::Errno {
+            errno: LINUX_EAGAIN,
+        };
+    }
+
+    let read_len = pipe.buffer.len().min(length);
+    let bytes = pipe
+        .buffer
+        .iter()
+        .take(read_len)
+        .copied()
+        .collect::<Vec<_>>();
+    if memory.write_bytes(address, &bytes).is_err() {
+        return DispatchOutcome::Errno {
+            errno: LINUX_EFAULT,
+        };
+    }
+    pipe.buffer.drain(..read_len);
+    DispatchOutcome::Returned {
+        value: read_len as i64,
+    }
+}
+
+fn write_pipe(bytes: &[u8], pipe: &Rc<RefCell<PipeState>>) -> DispatchOutcome {
+    let mut pipe = pipe.borrow_mut();
+    if pipe.readers == 0 {
+        return DispatchOutcome::Errno { errno: LINUX_EPIPE };
+    }
+    pipe.buffer.extend(bytes.iter().copied());
+    DispatchOutcome::Returned {
+        value: bytes.len() as i64,
     }
 }
 
