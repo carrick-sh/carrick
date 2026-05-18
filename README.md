@@ -46,7 +46,8 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
   `lseek(2)`, `readlinkat(2)`,
   `pipe2(2)`, `read(2)`, `readv(2)`, `pread64(2)`, `preadv(2)`, `pwrite64(2)`,
   `pwritev(2)`, `write(2)`,
-  `writev(2)`, `sendfile(2)`, `splice(2)`, `sync(2)`, `fsync(2)`, `fdatasync(2)`,
+  `writev(2)`, `sendfile(2)`, `splice(2)`, `signalfd4(2)`, `vmsplice(2)`, `tee(2)`
+  (the last three currently `ENOSYS`), `sync(2)`, `fsync(2)`, `fdatasync(2)`,
   `pselect6(2)`, `ppoll(2)`, `timerfd_create(2)`,
   `timerfd_settime(2)`, `timerfd_gettime(2)`, `utimensat(2)`, `close(2)`, `newfstatat(2)`,
   `fstat(2)`, `statx(2)`, `capget(2)`, `capset(2)`, `personality(2)`,

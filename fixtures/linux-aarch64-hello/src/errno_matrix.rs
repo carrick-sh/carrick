@@ -17,6 +17,13 @@ static MESSAGE: [u8; 13] = *b"errno_matrix\n";
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     unsafe {
+        // signalfd4 / vmsplice / tee — bootstrap ENOSYS
+        for number in [74_u64, 75, 77] {
+            if syscall6(number, 0, 0, 0, 0, 0, 0) != ENOSYS {
+                exit(3);
+            }
+        }
+
         // xattr family: 5..=16 — all ENOTSUP
         let mut number = 5_u64;
         while number <= 16 {

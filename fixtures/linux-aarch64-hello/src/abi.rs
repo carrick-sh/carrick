@@ -43,6 +43,7 @@ pub const EISDIR: i64 = -21;
 pub const EINVAL: i64 = -22;
 pub const ESPIPE: i64 = -29;
 pub const EROFS: i64 = -30;
+pub const ENOSYS: i64 = -38;
 pub const EEXIST: i64 = -17;
 pub const ENOTSUP: i64 = -95;
 

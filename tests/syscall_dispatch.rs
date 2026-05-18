@@ -4885,6 +4885,28 @@ fn truncate_bootstrap_returns_erofs_for_known_paths_and_enoent_for_missing() {
 }
 
 #[test]
+fn signalfd4_vmsplice_tee_bootstrap_return_enosys() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x80]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    for number in [74_u64, 75, 77] {
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    SyscallRequest::new(number, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+                    &mut memory,
+                    &mut reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::Errno { errno: 38 },
+            "syscall {number} should return ENOSYS"
+        );
+    }
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
 fn xattr_family_bootstrap_returns_enotsup_for_every_call() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
     memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();

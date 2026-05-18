@@ -514,7 +514,10 @@ impl SyscallDispatcher {
             71 => self.sendfile(request, memory)?,
             72 => self.pselect6(request, memory)?,
             73 => self.ppoll(request, memory)?,
+            74 => self.bootstrap_enosys(),
+            75 => self.bootstrap_enosys(),
             76 => self.splice(request, memory)?,
+            77 => self.bootstrap_enosys(),
             78 => self.readlinkat(request, memory)?,
             79 => self.newfstatat(request, memory)?,
             80 => self.fstat(request, memory),
@@ -3148,6 +3151,12 @@ impl SyscallDispatcher {
     fn xattr_unsupported(&self) -> DispatchOutcome {
         DispatchOutcome::Errno {
             errno: LINUX_ENOTSUP,
+        }
+    }
+
+    fn bootstrap_enosys(&self) -> DispatchOutcome {
+        DispatchOutcome::Errno {
+            errno: LINUX_ENOSYS,
         }
     }
 
