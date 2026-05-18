@@ -4353,6 +4353,20 @@ fn synthetic_proc_file(path: &str, executable_path: &str) -> Option<Vec<u8>> {
     match path {
         "/proc/self/maps" => Some(synthetic_proc_maps(executable_path).into_bytes()),
         "/proc/cpuinfo" => Some(synthetic_proc_cpuinfo().to_vec()),
+        "/proc/version" => Some(synthetic_proc_version().to_vec()),
+        "/proc/uptime" => Some(synthetic_proc_uptime().into_bytes()),
+        "/proc/loadavg" => Some(synthetic_proc_loadavg().to_vec()),
+        "/proc/meminfo" => Some(synthetic_proc_meminfo().to_vec()),
+        "/proc/stat" => Some(synthetic_proc_stat().to_vec()),
+        "/proc/self/status" => Some(synthetic_proc_self_status(executable_path).into_bytes()),
+        "/proc/self/cmdline" => Some(synthetic_proc_self_cmdline(executable_path)),
+        "/proc/self/comm" => Some(synthetic_proc_self_comm(executable_path).into_bytes()),
+        "/proc/self/statm" => Some(synthetic_proc_self_statm().to_vec()),
+        "/proc/sys/kernel/osrelease" => Some(synthetic_proc_osrelease().to_vec()),
+        "/proc/sys/kernel/hostname" => Some(synthetic_proc_hostname().to_vec()),
+        "/proc/sys/kernel/random/boot_id" => {
+            Some(synthetic_proc_boot_id().to_vec())
+        }
         _ => None,
     }
 }
@@ -4381,6 +4395,150 @@ CPU part\t: 0x000\n\
 CPU revision\t: 0\n\
 \n\
 Hardware\t: Carrick\n"
+}
+
+fn synthetic_proc_version() -> &'static [u8] {
+    b"Linux version 6.6.0-carrick (carrick@bootstrap) (rustc) #1 SMP PREEMPT_DYNAMIC\n"
+}
+
+fn synthetic_proc_osrelease() -> &'static [u8] {
+    b"6.6.0-carrick\n"
+}
+
+fn synthetic_proc_hostname() -> &'static [u8] {
+    b"carrick\n"
+}
+
+fn synthetic_proc_loadavg() -> &'static [u8] {
+    b"0.00 0.00 0.00 1/1 1\n"
+}
+
+fn synthetic_proc_uptime() -> String {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0) as f64;
+    format!("{seconds:.2} {seconds:.2}\n")
+}
+
+fn synthetic_proc_meminfo() -> &'static [u8] {
+    b"MemTotal:       16777216 kB\n\
+MemFree:        16000000 kB\n\
+MemAvailable:   16000000 kB\n\
+Buffers:               0 kB\n\
+Cached:                0 kB\n\
+SwapCached:            0 kB\n\
+Active:                0 kB\n\
+Inactive:              0 kB\n\
+SwapTotal:             0 kB\n\
+SwapFree:              0 kB\n\
+Dirty:                 0 kB\n\
+Writeback:             0 kB\n\
+AnonPages:             0 kB\n\
+Mapped:                0 kB\n\
+Shmem:                 0 kB\n\
+Slab:                  0 kB\n\
+KernelStack:           0 kB\n\
+PageTables:            0 kB\n\
+NFS_Unstable:          0 kB\n\
+Bounce:                0 kB\n\
+WritebackTmp:          0 kB\n\
+CommitLimit:    16777216 kB\n\
+Committed_AS:          0 kB\n\
+VmallocTotal:   17179869184 kB\n\
+VmallocUsed:           0 kB\n\
+VmallocChunk:          0 kB\n"
+}
+
+fn synthetic_proc_stat() -> &'static [u8] {
+    b"cpu  0 0 0 0 0 0 0 0 0 0\n\
+cpu0 0 0 0 0 0 0 0 0 0 0\n\
+intr 0\n\
+ctxt 0\n\
+btime 0\n\
+processes 1\n\
+procs_running 1\n\
+procs_blocked 0\n\
+softirq 0\n"
+}
+
+fn synthetic_proc_self_status(executable_path: &str) -> String {
+    let comm = process_short_name(executable_path);
+    format!(
+        "Name:\t{comm}\n\
+Umask:\t0022\n\
+State:\tR (running)\n\
+Tgid:\t1\n\
+Ngid:\t0\n\
+Pid:\t1\n\
+PPid:\t0\n\
+TracerPid:\t0\n\
+Uid:\t0\t0\t0\t0\n\
+Gid:\t0\t0\t0\t0\n\
+FDSize:\t256\n\
+Groups:\t\n\
+VmPeak:\t       0 kB\n\
+VmSize:\t       0 kB\n\
+VmLck:\t       0 kB\n\
+VmPin:\t       0 kB\n\
+VmHWM:\t       0 kB\n\
+VmRSS:\t       0 kB\n\
+VmData:\t       0 kB\n\
+VmStk:\t       0 kB\n\
+VmExe:\t       0 kB\n\
+VmLib:\t       0 kB\n\
+VmPTE:\t       0 kB\n\
+VmSwap:\t       0 kB\n\
+Threads:\t1\n\
+SigQ:\t0/0\n\
+SigPnd:\t0000000000000000\n\
+ShdPnd:\t0000000000000000\n\
+SigBlk:\t0000000000000000\n\
+SigIgn:\t0000000000000000\n\
+SigCgt:\t0000000000000000\n\
+CapInh:\t0000000000000000\n\
+CapPrm:\t0000000000000000\n\
+CapEff:\t0000000000000000\n\
+CapBnd:\t0000000000000000\n\
+CapAmb:\t0000000000000000\n\
+Cpus_allowed:\t1\n\
+Cpus_allowed_list:\t0\n\
+Mems_allowed:\t1\n\
+Mems_allowed_list:\t0\n\
+voluntary_ctxt_switches:\t0\n\
+nonvoluntary_ctxt_switches:\t0\n"
+    )
+}
+
+fn synthetic_proc_self_cmdline(executable_path: &str) -> Vec<u8> {
+    let mut bytes = executable_path.as_bytes().to_vec();
+    bytes.push(0);
+    bytes
+}
+
+fn synthetic_proc_self_comm(executable_path: &str) -> String {
+    let mut comm = process_short_name(executable_path);
+    comm.push('\n');
+    comm
+}
+
+fn synthetic_proc_self_statm() -> &'static [u8] {
+    b"0 0 0 0 0 0 0\n"
+}
+
+fn synthetic_proc_boot_id() -> &'static [u8] {
+    b"00000000-0000-4000-8000-000000000000\n"
+}
+
+fn process_short_name(executable_path: &str) -> String {
+    Path::new(executable_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| {
+            let truncated: String = name.chars().take(15).collect();
+            truncated
+        })
+        .unwrap_or_else(|| "carrick".to_string())
 }
 
 fn read_eventfd(
