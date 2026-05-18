@@ -4954,6 +4954,58 @@ fn truncate_bootstrap_returns_erofs_for_known_paths_and_enoent_for_missing() {
 }
 
 #[test]
+fn planned_socket_syscalls_surface_by_name_in_compat_report() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x80]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    let expected: &[(u64, &str)] = &[
+        (198, "socket"),
+        (199, "socketpair"),
+        (200, "bind"),
+        (201, "listen"),
+        (202, "accept"),
+        (203, "connect"),
+        (204, "getsockname"),
+        (205, "getpeername"),
+        (206, "sendto"),
+        (207, "recvfrom"),
+        (208, "setsockopt"),
+        (209, "getsockopt"),
+        (210, "shutdown"),
+        (211, "sendmsg"),
+        (212, "recvmsg"),
+        (242, "accept4"),
+    ];
+
+    for (number, _name) in expected {
+        let outcome = dispatcher
+            .dispatch(
+                SyscallRequest::new(*number, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap();
+        assert_eq!(
+            outcome,
+            DispatchOutcome::Errno { errno: 38 },
+            "socket syscall {number} should report ENOSYS until a real handler lands"
+        );
+    }
+
+    let report = reporter.finish();
+    for (number, name) in expected {
+        let entry = report
+            .unhandled_syscalls
+            .iter()
+            .find(|entry| entry.number == *number)
+            .unwrap_or_else(|| panic!("missing compat entry for {name}"));
+        assert_eq!(entry.name, *name);
+        assert_eq!(entry.count, 1);
+    }
+}
+
+#[test]
 fn job_control_bootstrap_returns_single_session_values() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x80]);
     let mut reporter = CompatReporter::default();
