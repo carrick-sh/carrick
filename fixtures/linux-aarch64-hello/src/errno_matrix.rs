@@ -17,6 +17,28 @@ static MESSAGE: [u8; 13] = *b"errno_matrix\n";
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     unsafe {
+        // mknodat: 33
+        if syscall4(
+            SYS_MKNODAT,
+            AT_FDCWD,
+            EXISTING.as_ptr() as u64,
+            0o100644,
+            0,
+        ) != EEXIST
+        {
+            exit(5);
+        }
+        if syscall4(
+            SYS_MKNODAT,
+            AT_FDCWD,
+            FRESH_LINK.as_ptr() as u64,
+            0o100644,
+            0,
+        ) != EROFS
+        {
+            exit(6);
+        }
+
         // mkdirat: 34
         if syscall3(SYS_MKDIRAT, AT_FDCWD, EXISTING.as_ptr() as u64, 0o755) != EEXIST {
             exit(10);

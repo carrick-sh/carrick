@@ -84,6 +84,7 @@ fn names_linux_aarch64_bringup_syscalls() {
         (24, "dup3"),
         (25, "fcntl"),
         (32, "flock"),
+        (33, "mknodat"),
         (34, "mkdirat"),
         (35, "unlinkat"),
         (36, "symlinkat"),

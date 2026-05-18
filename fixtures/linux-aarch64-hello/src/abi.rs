@@ -4,6 +4,7 @@ use core::arch::asm;
 use core::panic::PanicInfo;
 
 pub const SYS_GETCWD: u64 = 17;
+pub const SYS_MKNODAT: u64 = 33;
 pub const SYS_MKDIRAT: u64 = 34;
 pub const SYS_UNLINKAT: u64 = 35;
 pub const SYS_SYMLINKAT: u64 = 36;

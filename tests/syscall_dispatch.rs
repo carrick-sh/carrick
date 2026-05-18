@@ -4525,6 +4525,63 @@ fn unlinkat_bootstrap_reports_directory_kind_and_read_only_rootfs() {
 }
 
 #[test]
+fn mknodat_bootstrap_returns_eexist_for_known_paths_and_erofs_otherwise() {
+    let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
+        "etc/motd",
+        b"mknodat fixture\n".as_slice(),
+    )]))])
+    .unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
+    memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();
+    memory.write_bytes(0x4020, b"/etc/new-node\0").unwrap();
+    memory.write_bytes(0x4040, b"\0").unwrap();
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    33,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4000, 0o100644, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 17 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    33,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4020, 0o100644, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 30 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    33,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4040, 0o100644, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 2 }
+    );
+
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
 fn mkdirat_bootstrap_returns_eexist_for_known_paths_and_erofs_otherwise() {
     let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
         "etc/motd",
