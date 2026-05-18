@@ -6,6 +6,7 @@ use thiserror::Error;
 
 pub const HVF_PAGE_SIZE: u64 = 0x4000;
 pub const AARCH64_SVC_EXCEPTION_CLASS: u64 = 0x15;
+pub const AARCH64_HVC_EXCEPTION_CLASS: u64 = 0x16;
 const AARCH64_EXCEPTION_CLASS_SHIFT: u64 = 26;
 const AARCH64_EXCEPTION_CLASS_MASK: u64 = 0x3f;
 
@@ -64,6 +65,9 @@ pub struct GuestMappingPlan {
     /// `eret` instruction). When set, the trap engine starts the vCPU here
     /// in EL1h and uses `entry` as the post-`eret` PC in EL0t.
     pub el0_trampoline_entry: Option<u64>,
+    /// Guest physical address to program into VBAR_EL1 so EL0 SVC traps are
+    /// routed through the EL1 vector page (which forwards them via HVC).
+    pub el1_vectors_base: Option<u64>,
     pub mappings: Vec<GuestMapping>,
 }
 
@@ -115,6 +119,7 @@ impl GuestMappingPlan {
             entry: address_space.entry(),
             initial_stack_pointer: address_space.initial_stack_pointer(),
             el0_trampoline_entry: address_space.el0_trampoline_entry(),
+            el1_vectors_base: address_space.el1_vectors_base(),
             mappings,
         })
     }
@@ -281,6 +286,15 @@ impl HvfTrapEngine {
             .vcpu
             .set_sys_reg(SysReg::SCTLR_EL1, SCTLR_EL1_BOOTSTRAP)
             .map_err(hvf_error)?;
+        // Route lower-EL synchronous exceptions (EL0 `svc #0`) through our
+        // vector page. Without this, VBAR_EL1 defaults to 0 (or whatever
+        // HVF leaves it at) and the SVC fetch faults on an unmapped page.
+        if let Some(vectors_base) = plan.el1_vectors_base {
+            self.inner
+                .vcpu
+                .set_sys_reg(SysReg::VBAR_EL1, vectors_base)
+                .map_err(hvf_error)?;
+        }
         if let Some(stack_pointer) = plan.initial_stack_pointer {
             // Running at EL1h, so seed both SP_EL1 (current SP) and SP_EL0
             // (in case anything ever drops back to EL0).
@@ -326,7 +340,7 @@ impl HvfInner {
         }
 
         let exception = exit.exception;
-        if !is_aarch64_svc_exception(exception.syndrome) {
+        if !is_aarch64_syscall_exception(exception.syndrome) {
             return Err(TrapError::UnexpectedException {
                 syndrome: exception.syndrome,
                 virtual_address: exception.virtual_address,
@@ -452,6 +466,17 @@ pub fn aarch64_exception_class(syndrome: u64) -> u64 {
 
 pub fn is_aarch64_svc_exception(syndrome: u64) -> bool {
     aarch64_exception_class(syndrome) == AARCH64_SVC_EXCEPTION_CLASS
+}
+
+pub fn is_aarch64_hvc_exception(syndrome: u64) -> bool {
+    aarch64_exception_class(syndrome) == AARCH64_HVC_EXCEPTION_CLASS
+}
+
+/// True for syscall-shaped traps that the host can dispatch identically:
+/// EL0 `svc #0` (`EC = 0x15`) and our EL1 vector's `hvc #0` re-trap
+/// (`EC = 0x16`). Both deliver the syscall ABI registers unchanged.
+pub fn is_aarch64_syscall_exception(syndrome: u64) -> bool {
+    is_aarch64_svc_exception(syndrome) || is_aarch64_hvc_exception(syndrome)
 }
 
 fn align_down(value: u64, alignment: u64) -> u64 {

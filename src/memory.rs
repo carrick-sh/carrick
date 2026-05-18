@@ -26,10 +26,23 @@ pub const LINUX_EL0_TRAMPOLINE_BASE: u64 = 0x10000;
 // stage-2 mapping is aligned. The first 4 bytes carry the `eret` opcode;
 // the rest is padded with `nop` so a runaway fetch is harmless.
 pub const LINUX_EL0_TRAMPOLINE_SIZE: u64 = 0x4000;
+// Guest physical address of the EL1 exception vector page. The AArch64
+// vector table is 2 KiB (16 slots of 0x80 bytes); we round up to one HVF
+// page (16 KiB) so the stage-2 mapping is aligned. VBAR_EL1 is set to this
+// base so EL0 `svc #0` synchronous traps land in the slot at offset 0x400.
+pub const LINUX_EL1_VECTORS_BASE: u64 = 0x20000;
+pub const LINUX_EL1_VECTORS_SIZE: u64 = 0x4000;
 // AArch64 `eret` opcode, little-endian.
 const AARCH64_ERET_OPCODE: u32 = 0xd69f_03e0;
+// AArch64 `hvc #0` opcode, used to re-trap from EL1 to HVF.
+const AARCH64_HVC0_OPCODE: u32 = 0xd400_0002;
 // AArch64 `nop` opcode, used as trampoline page padding.
 const AARCH64_NOP_OPCODE: u32 = 0xd503_201f;
+// Size of one AArch64 exception vector slot (16 slots in the 2 KiB table).
+const AARCH64_VECTOR_SLOT_SIZE: usize = 0x80;
+// Offset of the "Lower EL using AArch64, synchronous" slot in the vector
+// table. EL0 `svc #0` from AArch64 lands here.
+const AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET: usize = 0x400;
 
 pub const LINUX_HEAP_BASE: u64 = 0x40_0000_0000; // 256 GiB
 pub const LINUX_HEAP_SIZE: u64 = 4 * 1024 * 1024;
@@ -48,6 +61,10 @@ pub struct AddressSpace {
     /// physical address (the EL0 entry trampoline) and use `entry` as the
     /// user-mode ELR_EL1 target after the trampoline's `eret`.
     el0_trampoline_entry: Option<u64>,
+    /// When set, the HVF trap engine should program VBAR_EL1 with this guest
+    /// physical address. The matching memory region carries the AArch64
+    /// vector page whose lower-EL synchronous slot re-traps to HVF via HVC.
+    el1_vectors_base: Option<u64>,
     #[serde(skip)]
     linux_auxv: Vec<LinuxAuxvEntry>,
 }
@@ -236,6 +253,7 @@ impl AddressSpace {
             regions,
             initial_stack_pointer: None,
             el0_trampoline_entry: None,
+            el1_vectors_base: None,
             linux_auxv: Vec::new(),
         })
     }
@@ -258,6 +276,12 @@ impl AddressSpace {
     /// `eret` lands the vCPU at user code in EL0t.
     pub fn el0_trampoline_entry(&self) -> Option<u64> {
         self.el0_trampoline_entry
+    }
+
+    /// When set, the trap engine should program VBAR_EL1 with this guest
+    /// physical address so EL0 SVC traps are routed through our vector page.
+    pub fn el1_vectors_base(&self) -> Option<u64> {
+        self.el1_vectors_base
     }
 
     /// Append the EL0 entry trampoline region. The trampoline is a single
@@ -291,6 +315,7 @@ impl AddressSpace {
             regions,
             initial_stack_pointer,
             linux_auxv,
+            el1_vectors_base,
             ..
         } = self;
         let mut image =
@@ -298,6 +323,53 @@ impl AddressSpace {
         image.initial_stack_pointer = initial_stack_pointer;
         image.linux_auxv = linux_auxv;
         image.el0_trampoline_entry = Some(LINUX_EL0_TRAMPOLINE_BASE);
+        image.el1_vectors_base = el1_vectors_base;
+        Ok(image)
+    }
+
+    /// Append the EL1 exception vector page. Each 0x80-byte slot is either:
+    /// * the "Lower EL using AArch64, synchronous" slot at offset 0x400,
+    ///   which executes `hvc #0; eret` so the EL0 `svc #0` is forwarded to
+    ///   HVF as an HVC trap (`EC = 0x16`) that the host dispatches like a
+    ///   normal syscall; or
+    /// * any other slot, which executes a bare `eret` so a spurious
+    ///   exception just returns to wherever it came from instead of
+    ///   crashing on an unmapped vector fetch.
+    pub fn with_el1_vectors(self) -> Result<Self, AddressSpaceError> {
+        let bytes = el1_vectors_bytes();
+        let start = LINUX_EL1_VECTORS_BASE;
+        let end =
+            start
+                .checked_add(LINUX_EL1_VECTORS_SIZE)
+                .ok_or(AddressSpaceError::RegionOverflow {
+                    start,
+                    size: LINUX_EL1_VECTORS_SIZE,
+                })?;
+        let region = MemoryRegion {
+            start,
+            end,
+            perms: SegmentPerms {
+                read: true,
+                write: false,
+                execute: true,
+            },
+            bytes,
+        };
+
+        let AddressSpace {
+            entry,
+            regions,
+            initial_stack_pointer,
+            linux_auxv,
+            el0_trampoline_entry,
+            ..
+        } = self;
+        let mut image =
+            Self::from_regions(entry, regions.into_iter().chain([region]).collect())?;
+        image.initial_stack_pointer = initial_stack_pointer;
+        image.linux_auxv = linux_auxv;
+        image.el0_trampoline_entry = el0_trampoline_entry;
+        image.el1_vectors_base = Some(LINUX_EL1_VECTORS_BASE);
         Ok(image)
     }
 
@@ -325,6 +397,7 @@ impl AddressSpace {
             regions,
             linux_auxv,
             el0_trampoline_entry,
+            el1_vectors_base,
             ..
         } = self;
         let argv = argv.into_iter().collect::<Vec<_>>();
@@ -335,6 +408,7 @@ impl AddressSpace {
         image.initial_stack_pointer = Some(stack_pointer);
         image.linux_auxv = linux_auxv;
         image.el0_trampoline_entry = el0_trampoline_entry;
+        image.el1_vectors_base = el1_vectors_base;
         Ok(image)
     }
 
@@ -534,6 +608,51 @@ pub fn el0_trampoline_bytes() -> Vec<u8> {
     bytes[..eret.len()].copy_from_slice(&eret);
     let nop = AARCH64_NOP_OPCODE.to_le_bytes();
     let mut offset = eret.len();
+    while offset + nop.len() <= size {
+        bytes[offset..offset + nop.len()].copy_from_slice(&nop);
+        offset += nop.len();
+    }
+    bytes
+}
+
+/// Build the byte image of the EL1 exception vector page. The first 2 KiB
+/// is the AArch64 vector table (16 slots of 0x80 bytes each); the rest of
+/// the page is filled with `nop`. Slot 0x400 ("Lower EL using AArch64,
+/// synchronous") catches EL0 `svc #0` and re-traps to HVF via `hvc #0`;
+/// every other slot is a bare `eret` so spurious exceptions just return.
+pub fn el1_vectors_bytes() -> Vec<u8> {
+    let size = LINUX_EL1_VECTORS_SIZE as usize;
+    let mut bytes = vec![0_u8; size];
+    let hvc = AARCH64_HVC0_OPCODE.to_le_bytes();
+    let eret = AARCH64_ERET_OPCODE.to_le_bytes();
+    let nop = AARCH64_NOP_OPCODE.to_le_bytes();
+
+    // Fill the 16 vector slots covering the first 2 KiB of the page.
+    let mut slot_offset = 0;
+    while slot_offset + AARCH64_VECTOR_SLOT_SIZE <= 16 * AARCH64_VECTOR_SLOT_SIZE
+        && slot_offset + AARCH64_VECTOR_SLOT_SIZE <= size
+    {
+        let mut cursor = slot_offset;
+        if slot_offset == AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET {
+            bytes[cursor..cursor + hvc.len()].copy_from_slice(&hvc);
+            cursor += hvc.len();
+            bytes[cursor..cursor + eret.len()].copy_from_slice(&eret);
+            cursor += eret.len();
+        } else {
+            bytes[cursor..cursor + eret.len()].copy_from_slice(&eret);
+            cursor += eret.len();
+        }
+        // Pad the rest of the slot with `nop` so an over-run on the
+        // `eret`/`hvc;eret` body lands on harmless filler.
+        while cursor + nop.len() <= slot_offset + AARCH64_VECTOR_SLOT_SIZE {
+            bytes[cursor..cursor + nop.len()].copy_from_slice(&nop);
+            cursor += nop.len();
+        }
+        slot_offset += AARCH64_VECTOR_SLOT_SIZE;
+    }
+
+    // Fill the rest of the page (past the 2 KiB vector table) with `nop`.
+    let mut offset = 16 * AARCH64_VECTOR_SLOT_SIZE;
     while offset + nop.len() <= size {
         bytes[offset..offset + nop.len()].copy_from_slice(&nop);
         offset += nop.len();
