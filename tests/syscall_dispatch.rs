@@ -5301,6 +5301,111 @@ fn mmap_maps_file_bytes_into_guest_memory_arena() {
 }
 
 #[test]
+fn umask_setpriority_getpriority_sysinfo_bootstrap_stubs() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    // umask: default 0o022, returns previous value when changed.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(166, SyscallArgs::from([0o077, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0o022 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(166, SyscallArgs::from([0o644, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0o077 }
+    );
+
+    // setpriority: prio out of range -> EINVAL; which out of range -> EINVAL.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    140,
+                    SyscallArgs::from([0, 0, 21_u64.wrapping_neg(), 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 22 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(140, SyscallArgs::from([99, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 22 }
+    );
+    // setpriority for our pid succeeds.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(140, SyscallArgs::from([0, 0, 5_u64, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    // setpriority for an unknown pid -> ESRCH.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(140, SyscallArgs::from([0, 42, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 3 }
+    );
+
+    // getpriority returns 20 (nice = 0) for our pid.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(141, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 20 }
+    );
+
+    // sysinfo populates a 64-bit-aligned struct at the provided address.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(179, SyscallArgs::from([0x4000, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let bytes = memory.read_bytes(0x4000, 8).unwrap();
+    let uptime = i64::from_le_bytes(bytes.try_into().unwrap());
+    assert!(uptime >= 0);
+
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
 fn mm_lock_msync_mincore_stubs_validate_args_and_succeed() {
     const MS_SYNC: u64 = 0x04;
     const MS_ASYNC: u64 = 0x01;
