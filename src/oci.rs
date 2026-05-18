@@ -1,9 +1,10 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
+use oci_distribution::client::ClientConfig;
 use oci_distribution::manifest::{
     IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE, IMAGE_DOCKER_LAYER_TAR_MEDIA_TYPE,
-    IMAGE_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_MEDIA_TYPE,
+    IMAGE_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_MEDIA_TYPE, ImageIndexEntry,
 };
 use oci_distribution::secrets::RegistryAuth;
 use oci_distribution::{Client, Reference};
@@ -149,11 +150,125 @@ impl ImageStore {
     }
 }
 
+/// Environment variable used to override the platform that
+/// [`pull_image`] requests when a registry returns a multi-arch image
+/// index. Format: `os/arch[/variant]`, e.g. `linux/amd64` or
+/// `linux/arm64/v8`. When unset, defaults to `linux/arm64` (the
+/// architecture Carrick's HVF backend executes).
+pub const PLATFORM_OVERRIDE_ENV: &str = "CARRICK_PULL_PLATFORM";
+
+/// A parsed `os/arch[/variant]` platform target used to pick a manifest
+/// from an OCI image index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlatformTarget {
+    pub os: String,
+    pub arch: String,
+    /// `None` means "match either a missing variant or any variant
+    /// considered ABI-compatible by [`PlatformTarget::matches`]". A
+    /// concrete `Some("v8")` requires the manifest to either declare
+    /// that variant or declare no variant at all.
+    pub variant: Option<String>,
+}
+
+impl PlatformTarget {
+    /// The default Carrick target: linux/arm64 with no required variant.
+    pub fn default_target() -> Self {
+        Self {
+            os: "linux".to_string(),
+            arch: "arm64".to_string(),
+            variant: None,
+        }
+    }
+
+    /// Parse a `os/arch[/variant]` string. Returns `None` if the value
+    /// can't be split into at least two non-empty components.
+    pub fn parse(value: &str) -> Option<Self> {
+        let mut parts = value.split('/');
+        let os = parts.next()?.trim();
+        let arch = parts.next()?.trim();
+        if os.is_empty() || arch.is_empty() {
+            return None;
+        }
+        let variant = parts.next().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+        Some(Self {
+            os: os.to_string(),
+            arch: arch.to_string(),
+            variant,
+        })
+    }
+
+    /// Returns true if this target should accept the given platform
+    /// entry. The os and arch must match exactly. For arm64, a
+    /// missing required variant accepts entries with no variant or
+    /// the `v8` variant (the only ABI-compatible variant for arm64
+    /// on the host); other variants are rejected. If this target
+    /// declares a specific variant, the entry must either declare
+    /// the same variant or no variant at all.
+    pub fn matches(&self, entry_os: &str, entry_arch: &str, entry_variant: Option<&str>) -> bool {
+        if entry_os != self.os || entry_arch != self.arch {
+            return false;
+        }
+        match (&self.variant, entry_variant) {
+            (None, None) => true,
+            (None, Some(v)) => {
+                if self.arch == "arm64" {
+                    v == "v8"
+                } else {
+                    // For other architectures be permissive: variants
+                    // beyond the bare arch are typically ABI-compatible
+                    // (e.g. amd64 has no meaningful variants on Linux).
+                    true
+                }
+            }
+            (Some(required), Some(actual)) => required == actual,
+            (Some(_), None) => true,
+        }
+    }
+}
+
+/// Read the platform target from `CARRICK_PULL_PLATFORM`, falling
+/// back to [`PlatformTarget::default_target`] when unset or
+/// unparseable.
+pub fn platform_target_from_env() -> PlatformTarget {
+    env::var(PLATFORM_OVERRIDE_ENV)
+        .ok()
+        .as_deref()
+        .and_then(PlatformTarget::parse)
+        .unwrap_or_else(PlatformTarget::default_target)
+}
+
+/// Walk an OCI image index's manifest entries and return the digest
+/// of the manifest that matches `target`, or `None` if no entry
+/// matches. Entries without a `platform` block are skipped.
+pub fn select_manifest_digest(
+    entries: &[ImageIndexEntry],
+    target: &PlatformTarget,
+) -> Option<String> {
+    entries.iter().find_map(|entry| {
+        let platform = entry.platform.as_ref()?;
+        let variant = platform.variant.as_deref();
+        if target.matches(&platform.os, &platform.architecture, variant) {
+            Some(entry.digest.clone())
+        } else {
+            None
+        }
+    })
+}
+
+fn build_oci_client() -> Client {
+    let target = platform_target_from_env();
+    let mut config = ClientConfig::default();
+    config.platform_resolver = Some(Box::new(move |entries: &[ImageIndexEntry]| {
+        select_manifest_digest(entries, &target)
+    }));
+    Client::new(config)
+}
+
 pub async fn pull_image(
     image: &ImageReference,
     store: &ImageStore,
 ) -> Result<PullSummary, OciBootstrapError> {
-    let client = Client::default();
+    let client = build_oci_client();
     let data = client
         .pull(
             image.as_oci_reference(),
@@ -210,4 +325,132 @@ pub async fn pull_image(
     )
     .await?;
     Ok(summary)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oci_distribution::manifest::{
+        IMAGE_MANIFEST_MEDIA_TYPE, ImageIndexEntry, Platform,
+    };
+
+    fn entry(os: &str, arch: &str, variant: Option<&str>, digest: &str) -> ImageIndexEntry {
+        ImageIndexEntry {
+            media_type: IMAGE_MANIFEST_MEDIA_TYPE.to_string(),
+            digest: digest.to_string(),
+            size: 0,
+            platform: Some(Platform {
+                architecture: arch.to_string(),
+                os: os.to_string(),
+                os_version: None,
+                os_features: None,
+                variant: variant.map(|v| v.to_string()),
+                features: None,
+            }),
+            annotations: None,
+        }
+    }
+
+    #[test]
+    fn picks_linux_arm64_from_multi_arch_index() {
+        let entries = vec![
+            entry("linux", "amd64", None, "sha256:amd64"),
+            entry("linux", "arm64", None, "sha256:arm64"),
+            entry("linux", "arm", Some("v7"), "sha256:armv7"),
+        ];
+        let target = PlatformTarget::default_target();
+        assert_eq!(
+            select_manifest_digest(&entries, &target),
+            Some("sha256:arm64".to_string())
+        );
+    }
+
+    #[test]
+    fn override_selects_amd64_when_only_amd64_present() {
+        let entries = vec![entry("linux", "amd64", None, "sha256:amd64")];
+        let target = PlatformTarget::parse("linux/amd64").expect("parse");
+        assert_eq!(
+            select_manifest_digest(&entries, &target),
+            Some("sha256:amd64".to_string())
+        );
+    }
+
+    #[test]
+    fn returns_none_when_no_linux_arm64_present() {
+        let entries = vec![
+            entry("windows", "amd64", None, "sha256:win-amd64"),
+            entry("windows", "arm64", None, "sha256:win-arm64"),
+        ];
+        let target = PlatformTarget::default_target();
+        assert_eq!(select_manifest_digest(&entries, &target), None);
+    }
+
+    #[test]
+    fn accepts_arm64_v8_variant() {
+        let entries = vec![entry("linux", "arm64", Some("v8"), "sha256:arm64v8")];
+        let target = PlatformTarget::default_target();
+        assert_eq!(
+            select_manifest_digest(&entries, &target),
+            Some("sha256:arm64v8".to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_arm64_v7_variant() {
+        // arm64 with a non-v8 variant must NOT be selected; the ABI
+        // does not match the host's arm64/v8 expectation.
+        let entries = vec![entry("linux", "arm64", Some("v7"), "sha256:arm64v7")];
+        let target = PlatformTarget::default_target();
+        assert_eq!(select_manifest_digest(&entries, &target), None);
+    }
+
+    #[test]
+    fn parse_platform_target_with_variant() {
+        let target = PlatformTarget::parse("linux/arm64/v8").expect("parse");
+        assert_eq!(target.os, "linux");
+        assert_eq!(target.arch, "arm64");
+        assert_eq!(target.variant.as_deref(), Some("v8"));
+    }
+
+    #[test]
+    fn parse_platform_target_without_variant() {
+        let target = PlatformTarget::parse("linux/amd64").expect("parse");
+        assert_eq!(target.os, "linux");
+        assert_eq!(target.arch, "amd64");
+        assert_eq!(target.variant, None);
+    }
+
+    #[test]
+    fn parse_platform_target_rejects_garbage() {
+        assert!(PlatformTarget::parse("").is_none());
+        assert!(PlatformTarget::parse("linux").is_none());
+        assert!(PlatformTarget::parse("/amd64").is_none());
+        assert!(PlatformTarget::parse("linux/").is_none());
+    }
+
+    #[test]
+    fn override_arm64_v8_matches_unspecified_entry() {
+        // If the override pins variant=v8 but the registry's entry
+        // omits variant, we still accept it (a missing variant on the
+        // entry side is treated as compatible).
+        let entries = vec![entry("linux", "arm64", None, "sha256:arm64")];
+        let target = PlatformTarget::parse("linux/arm64/v8").expect("parse");
+        assert_eq!(
+            select_manifest_digest(&entries, &target),
+            Some("sha256:arm64".to_string())
+        );
+    }
+
+    #[test]
+    fn skips_entry_with_no_platform_block() {
+        let mut bad = entry("linux", "arm64", None, "sha256:nope");
+        bad.platform = None;
+        let good = entry("linux", "arm64", None, "sha256:arm64");
+        let entries = vec![bad, good];
+        let target = PlatformTarget::default_target();
+        assert_eq!(
+            select_manifest_digest(&entries, &target),
+            Some("sha256:arm64".to_string())
+        );
+    }
 }
