@@ -95,6 +95,15 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
   normal `openat(2)`/`read(2)` descriptors, writes their `stat(2)` records
   with the packed Linux ABI struct path, and records compatibility-report
   entries for proc/sys files that are not synthesized yet.
+- A parallel synthetic sysfs surface serves
+  `/sys/devices/system/cpu/{online,possible,present,kernel_max}`,
+  `/sys/devices/system/cpu/cpu0/online`,
+  `/sys/devices/system/cpu/cpu0/topology/{physical_package_id,core_id,thread_siblings_list,core_siblings_list}`,
+  `/sys/devices/system/cpu/cpufreq/policy0/{scaling_cur_freq,scaling_max_freq,scaling_min_freq}`,
+  `/sys/kernel/mm/transparent_hugepage/{enabled,defrag}`,
+  `/sys/kernel/random/{uuid,boot_id}`, and
+  `/sys/fs/cgroup/cgroup.controllers` so guests probing common sysfs paths
+  get sensible bootstrap content instead of `ENOENT`.
 - USDT support wires compatibility events to DTrace probes through the Apache-2.0
   `usdt` crate.
 - `carrick syscalls` exposes the initial Linux/aarch64 syscall table and support

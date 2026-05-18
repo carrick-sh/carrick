@@ -813,7 +813,7 @@ impl SyscallDispatcher {
     }
 
     fn synthetic_access(&self, path: &str, mode: u64) -> Option<DispatchOutcome> {
-        if synthetic_proc_file(path, &self.executable_path).is_none() {
+        if !is_synthetic_virtual_file(path, &self.executable_path) {
             return None;
         }
         Some(synthetic_readonly_access(mode))
@@ -829,6 +829,11 @@ impl SyscallDispatcher {
                 errno: LINUX_ENOENT,
             })
         } else if path.starts_with("/sys/") {
+            // /sys paths that are synthesized must not be recorded as unimplemented;
+            // they are handled by the synthetic open path before reaching ENOENT.
+            if synthetic_sys_file(path).is_some() {
+                return None;
+            }
             reporter.record(CompatEvent::sys_read_unimplemented(path.to_owned()));
             Some(DispatchOutcome::Errno {
                 errno: LINUX_ENOENT,
@@ -1577,7 +1582,7 @@ impl SyscallDispatcher {
             Ok(resolved) => resolved,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        let kind = if synthetic_proc_file(&resolved, &self.executable_path).is_some() {
+        let kind = if is_synthetic_virtual_file(&resolved, &self.executable_path) {
             RootFsEntryKind::File
         } else {
             let Some(rootfs) = &self.rootfs else {
@@ -2228,6 +2233,13 @@ impl SyscallDispatcher {
 
         let description = if let Some(contents) = synthetic_proc_file(&path, &self.executable_path)
         {
+            OpenDescription::SyntheticFile {
+                path,
+                contents,
+                offset: 0,
+                status_flags: flags & !LINUX_O_CLOEXEC,
+            }
+        } else if let Some(contents) = synthetic_sys_file(&path) {
             OpenDescription::SyntheticFile {
                 path,
                 contents,
@@ -3472,7 +3484,7 @@ impl SyscallDispatcher {
             Ok(resolved) => resolved,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        if synthetic_proc_file(&resolved, &self.executable_path).is_some() {
+        if is_synthetic_virtual_file(&resolved, &self.executable_path) {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EEXIST,
             });
@@ -3515,7 +3527,7 @@ impl SyscallDispatcher {
             Ok(resolved) => resolved,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        if synthetic_proc_file(&resolved, &self.executable_path).is_some() {
+        if is_synthetic_virtual_file(&resolved, &self.executable_path) {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EEXIST,
             });
@@ -3589,7 +3601,7 @@ impl SyscallDispatcher {
             Ok(resolved) => resolved,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        if synthetic_proc_file(&resolved, &self.executable_path).is_some() {
+        if is_synthetic_virtual_file(&resolved, &self.executable_path) {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EROFS });
         }
         let Some(rootfs) = &self.rootfs else {
@@ -3631,7 +3643,7 @@ impl SyscallDispatcher {
             Ok(resolved) => resolved,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        if synthetic_proc_file(&resolved, &self.executable_path).is_some() {
+        if is_synthetic_virtual_file(&resolved, &self.executable_path) {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EROFS });
         }
         let Some(rootfs) = &self.rootfs else {
@@ -3687,7 +3699,7 @@ impl SyscallDispatcher {
                 Ok(resolved) => resolved,
                 Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
             };
-            if synthetic_proc_file(&resolved, &self.executable_path).is_some() {
+            if is_synthetic_virtual_file(&resolved, &self.executable_path) {
                 true
             } else if let Some(rootfs) = &self.rootfs {
                 match rootfs.symlink_metadata(&resolved) {
@@ -3716,7 +3728,7 @@ impl SyscallDispatcher {
             Ok(resolved) => resolved,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        if synthetic_proc_file(&resolved_new, &self.executable_path).is_some() {
+        if is_synthetic_virtual_file(&resolved_new, &self.executable_path) {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EEXIST,
             });
@@ -3769,7 +3781,7 @@ impl SyscallDispatcher {
             Ok(resolved) => resolved,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        if synthetic_proc_file(&resolved_link, &self.executable_path).is_some() {
+        if is_synthetic_virtual_file(&resolved_link, &self.executable_path) {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EEXIST,
             });
@@ -3823,7 +3835,7 @@ impl SyscallDispatcher {
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
         let _ = resolved_new;
-        let synthetic = synthetic_proc_file(&resolved_old, &self.executable_path).is_some();
+        let synthetic = is_synthetic_virtual_file(&resolved_old, &self.executable_path);
         if synthetic {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EROFS });
         }
@@ -3866,7 +3878,7 @@ impl SyscallDispatcher {
             Ok(resolved) => resolved,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        let kind = if synthetic_proc_file(&resolved, &self.executable_path).is_some() {
+        let kind = if is_synthetic_virtual_file(&resolved, &self.executable_path) {
             RootFsEntryKind::File
         } else {
             let Some(rootfs) = &self.rootfs else {
@@ -3952,7 +3964,7 @@ impl SyscallDispatcher {
             Ok(path) => path,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        if synthetic_proc_file(&path, &self.executable_path).is_some() {
+        if is_synthetic_virtual_file(&path, &self.executable_path) {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EROFS });
         }
         let Some(rootfs) = &self.rootfs else {
@@ -3991,6 +4003,9 @@ impl SyscallDispatcher {
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
         if let Some(contents) = synthetic_proc_file(&path, &self.executable_path) {
+            return Ok(write_synthetic_stat(memory, statbuf, &path, contents.len()));
+        }
+        if let Some(contents) = synthetic_sys_file(&path) {
             return Ok(write_synthetic_stat(memory, statbuf, &path, contents.len()));
         }
         let Some(rootfs) = &self.rootfs else {
@@ -4045,6 +4060,14 @@ impl SyscallDispatcher {
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
         if let Some(contents) = synthetic_proc_file(&path, &self.executable_path) {
+            return Ok(write_synthetic_statx(
+                memory,
+                statxbuf,
+                &path,
+                contents.len(),
+            ));
+        }
+        if let Some(contents) = synthetic_sys_file(&path) {
             return Ok(write_synthetic_statx(
                 memory,
                 statxbuf,
@@ -4478,6 +4501,53 @@ fn synthetic_proc_file(path: &str, executable_path: &str) -> Option<Vec<u8>> {
     }
 }
 
+fn synthetic_sys_file(path: &str) -> Option<Vec<u8>> {
+    match path {
+        "/sys/devices/system/cpu/online" => Some(synthetic_sys_cpu_online().to_vec()),
+        "/sys/devices/system/cpu/possible" => Some(synthetic_sys_cpu_possible().to_vec()),
+        "/sys/devices/system/cpu/present" => Some(synthetic_sys_cpu_present().to_vec()),
+        "/sys/devices/system/cpu/kernel_max" => Some(synthetic_sys_cpu_kernel_max().to_vec()),
+        "/sys/devices/system/cpu/cpu0/online" => Some(synthetic_sys_cpu0_online().to_vec()),
+        "/sys/devices/system/cpu/cpu0/topology/physical_package_id" => {
+            Some(synthetic_sys_cpu0_physical_package_id().to_vec())
+        }
+        "/sys/devices/system/cpu/cpu0/topology/core_id" => {
+            Some(synthetic_sys_cpu0_core_id().to_vec())
+        }
+        "/sys/devices/system/cpu/cpu0/topology/thread_siblings_list" => {
+            Some(synthetic_sys_cpu0_thread_siblings_list().to_vec())
+        }
+        "/sys/devices/system/cpu/cpu0/topology/core_siblings_list" => {
+            Some(synthetic_sys_cpu0_core_siblings_list().to_vec())
+        }
+        "/sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq" => {
+            Some(synthetic_sys_cpufreq_scaling_cur_freq().to_vec())
+        }
+        "/sys/devices/system/cpu/cpufreq/policy0/scaling_max_freq" => {
+            Some(synthetic_sys_cpufreq_scaling_max_freq().to_vec())
+        }
+        "/sys/devices/system/cpu/cpufreq/policy0/scaling_min_freq" => {
+            Some(synthetic_sys_cpufreq_scaling_min_freq().to_vec())
+        }
+        "/sys/kernel/mm/transparent_hugepage/enabled" => {
+            Some(synthetic_sys_thp_enabled().to_vec())
+        }
+        "/sys/kernel/mm/transparent_hugepage/defrag" => {
+            Some(synthetic_sys_thp_defrag().to_vec())
+        }
+        "/sys/kernel/random/uuid" => Some(synthetic_sys_random_uuid().to_vec()),
+        "/sys/kernel/random/boot_id" => Some(synthetic_sys_random_boot_id().to_vec()),
+        "/sys/fs/cgroup/cgroup.controllers" => {
+            Some(synthetic_sys_cgroup_controllers().to_vec())
+        }
+        _ => None,
+    }
+}
+
+fn is_synthetic_virtual_file(path: &str, executable_path: &str) -> bool {
+    synthetic_proc_file(path, executable_path).is_some() || synthetic_sys_file(path).is_some()
+}
+
 fn synthetic_proc_maps(executable_path: &str) -> String {
     format!(
         "0000000000400000-0000000000410000 r-xp 00000000 00:00 0 {executable_path}\n\
@@ -4663,6 +4733,74 @@ fn synthetic_proc_diskstats() -> &'static [u8] {
 fn synthetic_proc_self_auxv() -> &'static [u8] {
     // A single AT_NULL entry (a_type=0, a_val=0), each 8 bytes on aarch64.
     &[0u8; 16]
+}
+
+fn synthetic_sys_cpu_online() -> &'static [u8] {
+    b"0\n"
+}
+
+fn synthetic_sys_cpu_possible() -> &'static [u8] {
+    b"0\n"
+}
+
+fn synthetic_sys_cpu_present() -> &'static [u8] {
+    b"0\n"
+}
+
+fn synthetic_sys_cpu_kernel_max() -> &'static [u8] {
+    b"0\n"
+}
+
+fn synthetic_sys_cpu0_online() -> &'static [u8] {
+    b"1\n"
+}
+
+fn synthetic_sys_cpu0_physical_package_id() -> &'static [u8] {
+    b"0\n"
+}
+
+fn synthetic_sys_cpu0_core_id() -> &'static [u8] {
+    b"0\n"
+}
+
+fn synthetic_sys_cpu0_thread_siblings_list() -> &'static [u8] {
+    b"0\n"
+}
+
+fn synthetic_sys_cpu0_core_siblings_list() -> &'static [u8] {
+    b"0\n"
+}
+
+fn synthetic_sys_cpufreq_scaling_cur_freq() -> &'static [u8] {
+    b"2400000\n"
+}
+
+fn synthetic_sys_cpufreq_scaling_max_freq() -> &'static [u8] {
+    b"2400000\n"
+}
+
+fn synthetic_sys_cpufreq_scaling_min_freq() -> &'static [u8] {
+    b"600000\n"
+}
+
+fn synthetic_sys_thp_enabled() -> &'static [u8] {
+    b"always [madvise] never\n"
+}
+
+fn synthetic_sys_thp_defrag() -> &'static [u8] {
+    b"always defer defer+madvise [madvise] never\n"
+}
+
+fn synthetic_sys_random_uuid() -> &'static [u8] {
+    b"00000000-0000-4000-8000-000000000000\n"
+}
+
+fn synthetic_sys_random_boot_id() -> &'static [u8] {
+    b"00000000-0000-4000-8000-000000000000\n"
+}
+
+fn synthetic_sys_cgroup_controllers() -> &'static [u8] {
+    b"\n"
 }
 
 fn synthetic_proc_self_limits() -> &'static [u8] {

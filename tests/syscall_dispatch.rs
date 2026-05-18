@@ -2584,6 +2584,140 @@ fn missing_proc_file_records_compat_report_entry() {
 }
 
 #[test]
+fn synthetic_sys_surface_serves_common_cpu_and_mm_files() {
+    let paths: [(&str, &[u8]); 17] = [
+        ("/sys/devices/system/cpu/online", b"0\n"),
+        ("/sys/devices/system/cpu/possible", b"0\n"),
+        ("/sys/devices/system/cpu/present", b"0\n"),
+        ("/sys/devices/system/cpu/kernel_max", b"0\n"),
+        ("/sys/devices/system/cpu/cpu0/online", b"1\n"),
+        (
+            "/sys/devices/system/cpu/cpu0/topology/physical_package_id",
+            b"0\n",
+        ),
+        ("/sys/devices/system/cpu/cpu0/topology/core_id", b"0\n"),
+        (
+            "/sys/devices/system/cpu/cpu0/topology/thread_siblings_list",
+            b"0\n",
+        ),
+        (
+            "/sys/devices/system/cpu/cpu0/topology/core_siblings_list",
+            b"0\n",
+        ),
+        (
+            "/sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq",
+            b"2400000\n",
+        ),
+        (
+            "/sys/devices/system/cpu/cpufreq/policy0/scaling_max_freq",
+            b"2400000\n",
+        ),
+        (
+            "/sys/devices/system/cpu/cpufreq/policy0/scaling_min_freq",
+            b"600000\n",
+        ),
+        (
+            "/sys/kernel/mm/transparent_hugepage/enabled",
+            b"always [madvise] never\n",
+        ),
+        (
+            "/sys/kernel/mm/transparent_hugepage/defrag",
+            b"always defer defer+madvise [madvise] never\n",
+        ),
+        (
+            "/sys/kernel/random/uuid",
+            b"00000000-0000-4000-8000-000000000000\n",
+        ),
+        (
+            "/sys/kernel/random/boot_id",
+            b"00000000-0000-4000-8000-000000000000\n",
+        ),
+        ("/sys/fs/cgroup/cgroup.controllers", b"\n"),
+    ];
+
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    let path_address = 0x4000_u64;
+    let read_buffer = 0x4400_u64;
+    let read_len_max = 0xC00_u64;
+    let mut next_fd = 3_i64;
+    for (path, expected) in paths {
+        let path_bytes: Vec<u8> = path.bytes().chain([0]).collect();
+        memory.write_bytes(path_address, &path_bytes).unwrap();
+        let open = dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    56,
+                    SyscallArgs::from([(-100_i64) as u64, path_address, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap();
+        assert_eq!(
+            open,
+            DispatchOutcome::Returned { value: next_fd },
+            "expected fd {next_fd} for {path}, got {open:?}"
+        );
+        let read = dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    63,
+                    SyscallArgs::from([next_fd as u64, read_buffer, read_len_max, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap();
+        let DispatchOutcome::Returned { value: read_len } = read else {
+            panic!("expected read success for {path}, got {read:?}");
+        };
+        let bytes = memory.read_bytes(read_buffer, read_len as usize).unwrap();
+        assert_eq!(
+            bytes.as_slice(),
+            expected,
+            "{path} content mismatch: got {bytes:?}"
+        );
+        next_fd += 1;
+    }
+
+    let report = reporter.finish();
+    assert!(report.sys_read_unimplemented.is_empty());
+    assert!(report.proc_read_unimplemented.is_empty());
+    assert!(report.unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn missing_sys_file_records_compat_report_entry() {
+    let mut memory =
+        LinearMemory::new(0x4000, b"/sys/devices/virtual/dmi/id/product_uuid\0".to_vec());
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    let outcome = dispatcher
+        .dispatch(
+            SyscallRequest::new(
+                56,
+                SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
+            ),
+            &mut memory,
+            &mut reporter,
+        )
+        .unwrap();
+
+    assert_eq!(outcome, DispatchOutcome::Errno { errno: 2 });
+    let report = reporter.finish();
+    assert!(report.unhandled_syscalls.is_empty());
+    assert_eq!(
+        report.sys_read_unimplemented[0].path,
+        "/sys/devices/virtual/dmi/id/product_uuid"
+    );
+    assert_eq!(report.sys_read_unimplemented[0].count, 1);
+}
+
+#[test]
 fn newfstatat_and_fstat_write_typed_linux_stat() {
     let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
         "etc/motd",
