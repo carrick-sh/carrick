@@ -6,7 +6,7 @@ use carrick::dispatch::{
 use carrick::elf::SegmentPerms;
 use carrick::linux_abi::{
     LINUX_DIRENT64_HEADER_SIZE, LINUX_DT_REG, LINUX_S_IFDIR, LINUX_S_IFMT, LINUX_S_IFREG,
-    LinuxDirent64Header, LinuxStat,
+    LinuxDirent64Header, LinuxRlimit, LinuxStat, LinuxUtsname,
 };
 use carrick::memory::{AddressSpace, LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE};
 use carrick::rootfs::{LayerSource, RootFs};
@@ -598,6 +598,175 @@ fn brk_tracks_heap_within_runtime_arena() {
 }
 
 #[test]
+fn process_identity_syscalls_return_bootstrap_ids() {
+    let mut memory = LinearMemory::new(0x4000, Vec::new());
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    let pid = std::process::id() as i64;
+
+    for (number, expected) in [
+        (172, pid),
+        (173, 1),
+        (174, 0),
+        (175, 0),
+        (176, 0),
+        (177, 0),
+        (178, pid),
+    ] {
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    SyscallRequest::new(number, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+                    &mut memory,
+                    &mut reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: expected }
+        );
+    }
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn set_tid_address_and_robust_list_are_bootstrap_successes() {
+    let mut memory = LinearMemory::new(0x4000, Vec::new());
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    let pid = std::process::id() as i64;
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(96, SyscallArgs::from([0x4000, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: pid }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(99, SyscallArgs::from([0x4000, 24, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn uname_writes_packed_linux_utsname() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; core::mem::size_of::<LinuxUtsname>()]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(160, SyscallArgs::from([0x4000, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let utsname = read_utsname(&memory, 0x4000);
+    assert_eq!(linux_c_string(utsname.sysname), "Linux");
+    assert_eq!(linux_c_string(utsname.machine), "aarch64");
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn prlimit64_writes_packed_rlimit() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; core::mem::size_of::<LinuxRlimit>()]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(261, SyscallArgs::from([0, 3, 0, 0x4000, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let rlimit = read_rlimit(&memory, 0x4000);
+    let current = rlimit.rlim_cur;
+    let maximum = rlimit.rlim_max;
+    assert_eq!(current, maximum);
+    assert!(current > 0);
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn getrandom_fills_guest_buffer() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 32]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(278, SyscallArgs::from([0x4000, 16, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 16 }
+    );
+    assert!(
+        memory
+            .read_bytes(0x4000, 16)
+            .unwrap()
+            .iter()
+            .any(|byte| *byte != 0)
+    );
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn rt_signal_stubs_zero_old_state() {
+    let mut memory = LinearMemory::new(0x4000, vec![0xff; 0x200]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(135, SyscallArgs::from([0, 0, 0x4000, 8, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(memory.read_bytes(0x4000, 8).unwrap(), [0; 8]);
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(134, SyscallArgs::from([2, 0, 0x4010, 8, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert!(
+        memory
+            .read_bytes(0x4010, 32)
+            .unwrap()
+            .iter()
+            .all(|byte| *byte == 0)
+    );
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
 fn mmap_maps_file_bytes_into_guest_memory_arena() {
     let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
         "lib/libc.so",
@@ -702,6 +871,27 @@ fn read_stat(memory: &impl GuestMemory, address: u64) -> LinuxStat {
         .unwrap();
     let (stat, _) = LinuxStat::read_from_prefix(&bytes).unwrap();
     stat
+}
+
+fn read_utsname(memory: &impl GuestMemory, address: u64) -> LinuxUtsname {
+    let bytes = memory
+        .read_bytes(address, std::mem::size_of::<LinuxUtsname>())
+        .unwrap();
+    let (utsname, _) = LinuxUtsname::read_from_prefix(&bytes).unwrap();
+    utsname
+}
+
+fn read_rlimit(memory: &impl GuestMemory, address: u64) -> LinuxRlimit {
+    let bytes = memory
+        .read_bytes(address, std::mem::size_of::<LinuxRlimit>())
+        .unwrap();
+    let (rlimit, _) = LinuxRlimit::read_from_prefix(&bytes).unwrap();
+    rlimit
+}
+
+fn linux_c_string<const N: usize>(field: [u8; N]) -> String {
+    let end = field.iter().position(|byte| *byte == 0).unwrap_or(N);
+    String::from_utf8(field[..end].to_vec()).unwrap()
 }
 
 fn rw_perms() -> SegmentPerms {

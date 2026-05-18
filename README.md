@@ -41,9 +41,14 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
   service `brk(2)`, file-backed and anonymous `mmap(2)`, bootstrap no-op
   `mprotect(2)`/`munmap(2)`, and `exit_group(2)`, which gives `ld-linux` a
   first place to map shared objects while fuller VM semantics land.
-- Linux ABI outputs for `stat`, `getdents64`, and auxv entries are represented
-  by packed Rust structs in `linux_abi`, with `zerocopy` used to expose
-  initialized bytes for guest-memory writes.
+- Dynamic-linker bring-up syscalls now include bootstrap `uname(2)`, `getpid(2)`
+  and uid/gid identity calls, `set_tid_address(2)`, `set_robust_list(2)`,
+  `prlimit64(2)`, `getrandom(2)`, and minimal `rt_sigaction(2)`/
+  `rt_sigprocmask(2)` stubs.
+- Linux ABI outputs for `stat`, `getdents64`, auxv entries, `utsname`,
+  `rlimit`, and signal-action stubs are represented by packed Rust structs in
+  `linux_abi`, with `zerocopy` used to expose initialized bytes for
+  guest-memory writes.
 - The dispatcher now has a rootfs-backed file descriptor table for read-only
   file opens from composed OCI layers, and the runtime loop can drive a scripted
   `cat`-style `openat -> read -> write -> close -> exit` flow and a directory

@@ -17,6 +17,8 @@ pub const LINUX_AT_PAGESZ: u64 = 6;
 pub const LINUX_AT_BASE: u64 = 7;
 pub const LINUX_AT_ENTRY: u64 = 9;
 pub const LINUX_PAGE_SIZE: u64 = 4096;
+pub const LINUX_UTSNAME_FIELD_SIZE: usize = 65;
+pub const LINUX_SIGSET_WORDS: usize = 16;
 
 pub const LINUX_DIRENT64_HEADER_SIZE: usize = core::mem::size_of::<LinuxDirent64Header>();
 
@@ -79,4 +81,79 @@ impl LinuxAuxvEntry {
     pub fn value(self) -> u64 {
         self.a_val
     }
+}
+
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct LinuxUtsname {
+    pub sysname: [u8; LINUX_UTSNAME_FIELD_SIZE],
+    pub nodename: [u8; LINUX_UTSNAME_FIELD_SIZE],
+    pub release: [u8; LINUX_UTSNAME_FIELD_SIZE],
+    pub version: [u8; LINUX_UTSNAME_FIELD_SIZE],
+    pub machine: [u8; LINUX_UTSNAME_FIELD_SIZE],
+    pub domainname: [u8; LINUX_UTSNAME_FIELD_SIZE],
+}
+
+impl LinuxUtsname {
+    pub fn carrick_aarch64() -> Self {
+        let mut utsname = Self {
+            sysname: [0; LINUX_UTSNAME_FIELD_SIZE],
+            nodename: [0; LINUX_UTSNAME_FIELD_SIZE],
+            release: [0; LINUX_UTSNAME_FIELD_SIZE],
+            version: [0; LINUX_UTSNAME_FIELD_SIZE],
+            machine: [0; LINUX_UTSNAME_FIELD_SIZE],
+            domainname: [0; LINUX_UTSNAME_FIELD_SIZE],
+        };
+        write_linux_c_field(&mut utsname.sysname, b"Linux");
+        write_linux_c_field(&mut utsname.nodename, b"carrick");
+        write_linux_c_field(&mut utsname.release, b"6.12.0-carrick");
+        write_linux_c_field(&mut utsname.version, b"#1 Carrick");
+        write_linux_c_field(&mut utsname.machine, b"aarch64");
+        write_linux_c_field(&mut utsname.domainname, b"localdomain");
+        utsname
+    }
+}
+
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct LinuxRlimit {
+    pub rlim_cur: u64,
+    pub rlim_max: u64,
+}
+
+impl LinuxRlimit {
+    pub const fn new(rlim_cur: u64, rlim_max: u64) -> Self {
+        Self { rlim_cur, rlim_max }
+    }
+}
+
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct LinuxSigaction {
+    pub sa_handler: u64,
+    pub sa_flags: u64,
+    pub sa_restorer: u64,
+    pub sa_mask: [u64; LINUX_SIGSET_WORDS],
+}
+
+impl LinuxSigaction {
+    pub const fn empty() -> Self {
+        Self {
+            sa_handler: 0,
+            sa_flags: 0,
+            sa_restorer: 0,
+            sa_mask: [0; LINUX_SIGSET_WORDS],
+        }
+    }
+}
+
+fn write_linux_c_field<const N: usize>(field: &mut [u8; N], value: &[u8]) {
+    let len = value.len().min(N.saturating_sub(1));
+    field[..len].copy_from_slice(&value[..len]);
 }

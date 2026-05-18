@@ -4,7 +4,8 @@ use std::path::Path;
 use crate::compat::{CompatEvent, CompatReporter, SyscallArgs};
 use crate::linux_abi::{
     LINUX_DIRENT64_HEADER_SIZE, LINUX_DT_DIR, LINUX_DT_LNK, LINUX_DT_REG, LINUX_PAGE_SIZE,
-    LINUX_S_IFDIR, LINUX_S_IFLNK, LINUX_S_IFREG, LinuxDirent64Header, LinuxStat,
+    LINUX_S_IFDIR, LINUX_S_IFLNK, LINUX_S_IFREG, LinuxDirent64Header, LinuxRlimit, LinuxSigaction,
+    LinuxStat, LinuxUtsname,
 };
 use crate::memory::{LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE, LINUX_MMAP_SIZE};
 use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsError, RootFsMetadata};
@@ -38,6 +39,8 @@ pub const LINUX_PROT_EXEC: u64 = 0x4;
 pub const LINUX_MAP_PRIVATE: u64 = 0x02;
 pub const LINUX_MAP_FIXED: u64 = 0x10;
 pub const LINUX_MAP_ANONYMOUS: u64 = 0x20;
+pub const LINUX_RLIM_INFINITY: u64 = u64::MAX;
+const LINUX_RT_SIGSET_SIZE: u64 = 8;
 const MAX_GUEST_PATH: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -262,10 +265,21 @@ impl SyscallDispatcher {
             80 => self.fstat(request, memory),
             93 => self.exit(request),
             94 => self.exit(request),
+            96 => self.set_tid_address(),
+            99 => self.set_robust_list(request),
+            134 => self.rt_sigaction(request, memory),
+            135 => self.rt_sigprocmask(request, memory)?,
+            160 => self.uname(request, memory),
+            172 => self.getpid(),
+            173 => DispatchOutcome::Returned { value: 1 },
+            174..=177 => DispatchOutcome::Returned { value: 0 },
+            178 => self.getpid(),
             214 => self.brk(request),
             215 => self.munmap(request),
             222 => self.mmap(request, memory)?,
             226 => self.mprotect(request, memory),
+            261 => self.prlimit64(request, memory),
+            278 => self.getrandom(request, memory)?,
             _ => {
                 reporter.record(CompatEvent::unhandled_syscall(
                     request.number,
@@ -425,6 +439,88 @@ impl SyscallDispatcher {
             OpenDescription::File { .. } => DispatchOutcome::Errno {
                 errno: LINUX_ENOTDIR,
             },
+        }
+    }
+
+    fn set_tid_address(&self) -> DispatchOutcome {
+        self.getpid()
+    }
+
+    fn set_robust_list(&self, request: SyscallRequest) -> DispatchOutcome {
+        let len = request.arg(1);
+        if len == 0 {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+        DispatchOutcome::Returned { value: 0 }
+    }
+
+    fn rt_sigaction(
+        &self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+    ) -> DispatchOutcome {
+        let signum = request.arg(0);
+        let old_action = request.arg(2);
+        let sigset_size = request.arg(3);
+        if signum == 0 || sigset_size != LINUX_RT_SIGSET_SIZE {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+        if old_action != 0
+            && memory
+                .write_bytes(old_action, LinuxSigaction::empty().as_bytes())
+                .is_err()
+        {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EFAULT,
+            };
+        }
+        DispatchOutcome::Returned { value: 0 }
+    }
+
+    fn rt_sigprocmask(
+        &self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let old_set = request.arg(2);
+        let sigset_size = request.arg(3);
+        if sigset_size == 0 || sigset_size > 128 {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            });
+        }
+        if old_set != 0 {
+            let len = usize::try_from(sigset_size)
+                .map_err(|_| DispatchError::LengthTooLarge(sigset_size))?;
+            if memory.write_bytes(old_set, &vec![0; len]).is_err() {
+                return Ok(DispatchOutcome::Errno {
+                    errno: LINUX_EFAULT,
+                });
+            }
+        }
+        Ok(DispatchOutcome::Returned { value: 0 })
+    }
+
+    fn uname(&self, request: SyscallRequest, memory: &mut impl GuestMemory) -> DispatchOutcome {
+        let address = request.arg(0);
+        if memory
+            .write_bytes(address, LinuxUtsname::carrick_aarch64().as_bytes())
+            .is_err()
+        {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EFAULT,
+            };
+        }
+        DispatchOutcome::Returned { value: 0 }
+    }
+
+    fn getpid(&self) -> DispatchOutcome {
+        DispatchOutcome::Returned {
+            value: std::process::id() as i64,
         }
     }
 
@@ -741,6 +837,47 @@ impl SyscallDispatcher {
         DispatchOutcome::Returned { value: 0 }
     }
 
+    fn prlimit64(&self, request: SyscallRequest, memory: &mut impl GuestMemory) -> DispatchOutcome {
+        let new_limit = request.arg(2);
+        let old_limit = request.arg(3);
+        if new_limit != 0 {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+        if old_limit != 0 {
+            let limit = LinuxRlimit::new(LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY);
+            if memory.write_bytes(old_limit, limit.as_bytes()).is_err() {
+                return DispatchOutcome::Errno {
+                    errno: LINUX_EFAULT,
+                };
+            }
+        }
+        DispatchOutcome::Returned { value: 0 }
+    }
+
+    fn getrandom(
+        &self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let address = request.arg(0);
+        let length = usize::try_from(request.arg(1))
+            .map_err(|_| DispatchError::LengthTooLarge(request.arg(1)))?;
+        let mut bytes = vec![0; length];
+        if getrandom::fill(&mut bytes).is_err() {
+            fill_deterministic_bootstrap_random(&mut bytes);
+        }
+        if memory.write_bytes(address, &bytes).is_err() {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EFAULT,
+            });
+        }
+        Ok(DispatchOutcome::Returned {
+            value: length as i64,
+        })
+    }
+
     fn read(
         &mut self,
         request: SyscallRequest,
@@ -984,6 +1121,16 @@ fn range_within(address: u64, length: u64, base: u64, size: u64) -> bool {
         return false;
     };
     address >= base && end <= limit
+}
+
+fn fill_deterministic_bootstrap_random(bytes: &mut [u8]) {
+    let mut state = 0xca22_1c_u64;
+    for byte in bytes {
+        state ^= state << 7;
+        state ^= state >> 9;
+        state ^= state << 8;
+        *byte = state as u8;
+    }
 }
 
 fn inode_for_path(path: &Path) -> u64 {

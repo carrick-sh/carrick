@@ -56,6 +56,27 @@ fn names_linux_aarch64_bringup_syscalls() {
     assert_eq!(mmap.support, SupportLevel::BringUp);
     assert_eq!(mprotect.name, "mprotect");
     assert_eq!(mprotect.support, SupportLevel::BringUp);
+
+    for (number, name) in [
+        (96, "set_tid_address"),
+        (99, "set_robust_list"),
+        (134, "rt_sigaction"),
+        (135, "rt_sigprocmask"),
+        (160, "uname"),
+        (172, "getpid"),
+        (173, "getppid"),
+        (174, "getuid"),
+        (175, "geteuid"),
+        (176, "getgid"),
+        (177, "getegid"),
+        (178, "gettid"),
+        (261, "prlimit64"),
+        (278, "getrandom"),
+    ] {
+        let syscall = lookup_aarch64(number).unwrap();
+        assert_eq!(syscall.name, name);
+        assert_eq!(syscall.support, SupportLevel::BringUp);
+    }
 }
 
 #[test]

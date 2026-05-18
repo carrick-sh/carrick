@@ -202,6 +202,7 @@ dependencies = [
  "camino",
  "clap",
  "flate2",
+ "getrandom 0.3.4",
  "goblin",
  "oci-distribution",
  "predicates",
