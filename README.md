@@ -47,9 +47,10 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
   first place to map shared objects while fuller VM semantics land.
 - Dynamic-linker bring-up syscalls now include bootstrap `uname(2)`, `getpid(2)`
   and uid/gid identity calls, `set_tid_address(2)`, `set_robust_list(2)`,
-  `clock_gettime(2)`, `clock_getres(2)`, `gettimeofday(2)`, `prlimit64(2)`,
-  `getrandom(2)`, process capability probes, `personality(2)`, `nanosleep(2)`,
-  and minimal `rt_sigaction(2)`/`rt_sigprocmask(2)` stubs.
+  `clock_gettime(2)`, `clock_getres(2)`, `nanosleep(2)`,
+  `clock_nanosleep(2)`, `gettimeofday(2)`, `prlimit64(2)`, `getrandom(2)`,
+  process capability probes, `personality(2)`, and minimal
+  `rt_sigaction(2)`/`rt_sigprocmask(2)` stubs.
 - Linux ABI outputs for `stat`, `statfs`, `getdents64`, `iovec`,
   `eventfd` counters, `timerfd` timers and expiration counts, `epoll_event`,
   `pollfd`, capability headers/data, `pipe2` fd pairs, `winsize`, `timespec`,
@@ -84,9 +85,9 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
   whose guest behavior covers direct `write(2)`, initial-stack argv reads,
   `openat(2)`, `eventfd2(2)`, `pselect6(2)`, `ppoll(2)`, `timerfd_create(2)`,
   `timerfd_settime(2)`, `epoll_pwait(2)`, `capget(2)`, `capset(2)`,
-  `personality(2)`, `nanosleep(2)`, `sendfile(2)`, `preadv(2)`, `read(2)`,
-  `close(2)`, and `exit(2)`, giving the loader, HVF loop, rootfs, and
-  dispatcher a tight feedback loop.
+  `personality(2)`, `nanosleep(2)`, `clock_nanosleep(2)`, `sendfile(2)`,
+  `preadv(2)`, `read(2)`, `close(2)`, and `exit(2)`, giving the loader, HVF
+  loop, rootfs, and dispatcher a tight feedback loop.
 
 `shell` and `exec` are present as CLI surfaces, but they still stop before
 interactive process execution. `run` can map a dynamic ELF's rootfs-backed

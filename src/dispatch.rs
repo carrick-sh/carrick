@@ -454,6 +454,7 @@ impl SyscallDispatcher {
             101 => self.nanosleep(request, memory),
             113 => self.clock_gettime(request, memory),
             114 => self.clock_getres(request, memory),
+            115 => self.clock_nanosleep(request, memory),
             134 => self.rt_sigaction(request, memory),
             135 => self.rt_sigprocmask(request, memory)?,
             160 => self.uname(request, memory),
@@ -1464,6 +1465,43 @@ impl SyscallDispatcher {
         };
         if let Some(duration) = duration {
             std::thread::sleep(duration);
+        }
+        DispatchOutcome::Returned { value: 0 }
+    }
+
+    fn clock_nanosleep(
+        &self,
+        request: SyscallRequest,
+        memory: &impl GuestMemory,
+    ) -> DispatchOutcome {
+        let clock_id = request.arg(0);
+        let flags = request.arg(1);
+        let request_address = request.arg(2);
+        if flags & !LINUX_TIMER_ABSTIME != 0 {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+        let Some(now) = linux_clock_duration(clock_id) else {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        };
+        let timespec = match read_timespec(memory, request_address) {
+            Ok(timespec) => timespec,
+            Err(errno) => return DispatchOutcome::Errno { errno },
+        };
+        let requested = match duration_from_linux_timespec(timespec) {
+            Ok(duration) => duration.unwrap_or(Duration::ZERO),
+            Err(errno) => return DispatchOutcome::Errno { errno },
+        };
+        let sleep_duration = if flags & LINUX_TIMER_ABSTIME != 0 {
+            requested.saturating_sub(now)
+        } else {
+            requested
+        };
+        if !sleep_duration.is_zero() {
+            std::thread::sleep(sleep_duration);
         }
         DispatchOutcome::Returned { value: 0 }
     }

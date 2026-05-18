@@ -38,6 +38,8 @@ const LINUX_POLLIN: i16 = 0x0001;
 const LINUX_POLLOUT: i16 = 0x0004;
 const LINUX_POLLNVAL: i16 = 0x0020;
 const LINUX_TFD_NONBLOCK: u64 = LINUX_O_NONBLOCK;
+const LINUX_TIMER_ABSTIME: u64 = 0x1;
+const LINUX_CLOCK_MONOTONIC: u64 = 1;
 const LINUX_TIOCGWINSZ: u64 = 0x5413;
 
 #[test]
@@ -2504,6 +2506,89 @@ fn nanosleep_accepts_packed_timespec_and_rejects_invalid_inputs() {
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 22 }
+    );
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn clock_nanosleep_accepts_relative_and_absolute_timespecs() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x80]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    memory
+        .write_bytes(0x4000, LinuxTimespec::new(0, 0).as_bytes())
+        .unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    115,
+                    SyscallArgs::from([LINUX_CLOCK_MONOTONIC, 0, 0x4000, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    115,
+                    SyscallArgs::from([
+                        LINUX_CLOCK_MONOTONIC,
+                        LINUX_TIMER_ABSTIME,
+                        0x4000,
+                        0,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(115, SyscallArgs::from([99, 0, 0x4000, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 22 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    115,
+                    SyscallArgs::from([LINUX_CLOCK_MONOTONIC, 2, 0x4000, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 22 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    115,
+                    SyscallArgs::from([LINUX_CLOCK_MONOTONIC, 0, 0x5000, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 14 }
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }

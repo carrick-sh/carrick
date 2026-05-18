@@ -98,6 +98,7 @@ fn names_linux_aarch64_bringup_syscalls() {
         (101, "nanosleep"),
         (113, "clock_gettime"),
         (114, "clock_getres"),
+        (115, "clock_nanosleep"),
         (134, "rt_sigaction"),
         (135, "rt_sigprocmask"),
         (160, "uname"),
