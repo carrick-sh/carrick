@@ -451,6 +451,7 @@ impl SyscallDispatcher {
             94 => self.exit(request),
             96 => self.set_tid_address(),
             99 => self.set_robust_list(request),
+            101 => self.nanosleep(request, memory),
             113 => self.clock_gettime(request, memory),
             114 => self.clock_getres(request, memory),
             134 => self.rt_sigaction(request, memory),
@@ -1447,6 +1448,22 @@ impl SyscallDispatcher {
             return DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
             };
+        }
+        DispatchOutcome::Returned { value: 0 }
+    }
+
+    fn nanosleep(&self, request: SyscallRequest, memory: &impl GuestMemory) -> DispatchOutcome {
+        let request_address = request.arg(0);
+        let timespec = match read_timespec(memory, request_address) {
+            Ok(timespec) => timespec,
+            Err(errno) => return DispatchOutcome::Errno { errno },
+        };
+        let duration = match duration_from_linux_timespec(timespec) {
+            Ok(duration) => duration,
+            Err(errno) => return DispatchOutcome::Errno { errno },
+        };
+        if let Some(duration) = duration {
+            std::thread::sleep(duration);
         }
         DispatchOutcome::Returned { value: 0 }
     }
@@ -3189,6 +3206,13 @@ fn read_itimerspec(memory: &impl GuestMemory, address: u64) -> Result<LinuxItime
         .read_bytes(address, core::mem::size_of::<LinuxItimerspec>())
         .map_err(|_| LINUX_EFAULT)?;
     LinuxItimerspec::read_from_bytes(&bytes).map_err(|_| LINUX_EFAULT)
+}
+
+fn read_timespec(memory: &impl GuestMemory, address: u64) -> Result<LinuxTimespec, i32> {
+    let bytes = memory
+        .read_bytes(address, core::mem::size_of::<LinuxTimespec>())
+        .map_err(|_| LINUX_EFAULT)?;
+    LinuxTimespec::read_from_bytes(&bytes).map_err(|_| LINUX_EFAULT)
 }
 
 fn read_iovecs(

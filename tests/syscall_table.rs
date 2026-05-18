@@ -95,6 +95,7 @@ fn names_linux_aarch64_bringup_syscalls() {
         (92, "personality"),
         (96, "set_tid_address"),
         (99, "set_robust_list"),
+        (101, "nanosleep"),
         (113, "clock_gettime"),
         (114, "clock_getres"),
         (134, "rt_sigaction"),

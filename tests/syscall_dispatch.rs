@@ -2462,6 +2462,53 @@ fn clock_getres_writes_packed_linux_timespec() {
 }
 
 #[test]
+fn nanosleep_accepts_packed_timespec_and_rejects_invalid_inputs() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x80]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    memory
+        .write_bytes(0x4000, LinuxTimespec::new(0, 0).as_bytes())
+        .unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(101, SyscallArgs::from([0x4000, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(101, SyscallArgs::from([0x5000, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 14 }
+    );
+
+    memory
+        .write_bytes(0x4010, LinuxTimespec::new(0, 1_000_000_000).as_bytes())
+        .unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(101, SyscallArgs::from([0x4010, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 22 }
+    );
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
 fn gettimeofday_writes_packed_linux_timeval_and_timezone() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x80]);
     let mut reporter = CompatReporter::default();

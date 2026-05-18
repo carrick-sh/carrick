@@ -139,6 +139,7 @@ const AARCH64_SYSCALLS: &[Syscall] = &[
     syscall(94, "exit_group", "process", SupportLevel::BringUp),
     syscall(96, "set_tid_address", "process", SupportLevel::BringUp),
     syscall(99, "set_robust_list", "process", SupportLevel::BringUp),
+    syscall(101, "nanosleep", "time", SupportLevel::BringUp),
     syscall(113, "clock_gettime", "time", SupportLevel::BringUp),
     syscall(114, "clock_getres", "time", SupportLevel::BringUp),
     syscall(134, "rt_sigaction", "signal", SupportLevel::BringUp),
