@@ -30,6 +30,7 @@ fn builds_static_linux_aarch64_hello_fixture() {
     let clock_nanosleep_artifact = "fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-clock-nanosleep";
     let madvise_artifact = "fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-madvise";
     let statx_artifact = "fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-statx-motd";
+    let openat2_artifact = "fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-openat2-motd";
     let faccessat2_artifact = "fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-faccessat2-motd";
     let sendfile_artifact = "fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-sendfile-motd";
     let preadv_artifact = "fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-preadv-motd";
@@ -68,6 +69,8 @@ fn builds_static_linux_aarch64_hello_fixture() {
     let metadata = inspect_elf(madvise_artifact).unwrap();
     assert_eq!(metadata.machine, Machine::Aarch64);
     let metadata = inspect_elf(statx_artifact).unwrap();
+    assert_eq!(metadata.machine, Machine::Aarch64);
+    let metadata = inspect_elf(openat2_artifact).unwrap();
     assert_eq!(metadata.machine, Machine::Aarch64);
     let metadata = inspect_elf(faccessat2_artifact).unwrap();
     assert_eq!(metadata.machine, Machine::Aarch64);
@@ -213,6 +216,14 @@ fn builds_static_linux_aarch64_hello_fixture() {
     }));
 
     let plan = plan_elf_load(statx_artifact).unwrap();
+    assert!(!plan.segments.is_empty());
+    assert!(plan.segments.iter().any(|segment| {
+        segment.perms.execute
+            && plan.entry >= segment.virtual_address
+            && plan.entry < segment.virtual_address + segment.memory_size
+    }));
+
+    let plan = plan_elf_load(openat2_artifact).unwrap();
     assert!(!plan.segments.is_empty());
     assert!(plan.segments.iter().any(|segment| {
         segment.perms.execute

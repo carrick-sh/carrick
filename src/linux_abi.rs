@@ -270,6 +270,16 @@ impl LinuxIovec {
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
 )]
+pub struct LinuxOpenHow {
+    pub flags: u64,
+    pub mode: u64,
+    pub resolve: u64,
+}
+
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
 pub struct LinuxTimespec {
     pub tv_sec: i64,
     pub tv_nsec: i64,

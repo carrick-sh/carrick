@@ -25,6 +25,7 @@ const LINUX_F_GETFL: u64 = 3;
 const LINUX_FD_CLOEXEC: u64 = 1;
 const LINUX_F_DUPFD_CLOEXEC: u64 = 1030;
 const LINUX_F_GETPIPE_SZ: u64 = 1032;
+const LINUX_O_WRONLY: u64 = 1;
 const LINUX_LOCK_SH: u64 = 1;
 const LINUX_LOCK_NB: u64 = 4;
 const LINUX_LOCK_UN: u64 = 8;
@@ -1126,6 +1127,103 @@ fn openat_missing_rootfs_file_returns_enoent() {
         .unwrap();
 
     assert_eq!(outcome, DispatchOutcome::Errno { errno: 2 });
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn openat2_reads_open_how_and_opens_readonly_rootfs_paths() {
+    let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
+        "etc/motd",
+        b"rootfs says hello\n".as_slice(),
+    )]))])
+    .unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
+    memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();
+    write_open_how(&mut memory, 0x4020, LINUX_O_CLOEXEC, 0, 0);
+    write_open_how(&mut memory, 0x4060, LINUX_O_WRONLY, 0, 0);
+    write_open_how(&mut memory, 0x40a0, 0, 0, 0x4);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    437,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4000, 0x4020, 24, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 3 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(25, SyscallArgs::from([3, LINUX_F_GETFD, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned {
+            value: LINUX_FD_CLOEXEC as i64
+        }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(63, SyscallArgs::from([3, 0x4100, 64, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 18 }
+    );
+    assert_eq!(
+        memory.read_bytes(0x4100, 18).unwrap(),
+        b"rootfs says hello\n"
+    );
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    437,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4000, 0x4060, 24, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 22 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    437,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4000, 0x40a0, 24, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 22 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    437,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4000, 0x4020, 16, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 22 }
+    );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
@@ -3951,6 +4049,18 @@ fn read_capability_data(
 
 fn write_u64(memory: &mut impl GuestMemory, address: u64, value: u64) {
     memory.write_bytes(address, &value.to_ne_bytes()).unwrap();
+}
+
+fn write_open_how(
+    memory: &mut impl GuestMemory,
+    address: u64,
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+) {
+    write_u64(memory, address, flags);
+    write_u64(memory, address + 8, mode);
+    write_u64(memory, address + 16, resolve);
 }
 
 fn read_u64(memory: &impl GuestMemory, address: u64) -> u64 {

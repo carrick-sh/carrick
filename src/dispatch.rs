@@ -10,9 +10,9 @@ use crate::linux_abi::{
     LINUX_DIRENT64_HEADER_SIZE, LINUX_DT_DIR, LINUX_DT_LNK, LINUX_DT_REG, LINUX_PAGE_SIZE,
     LINUX_S_IFDIR, LINUX_S_IFLNK, LINUX_S_IFREG, LinuxCapabilityData, LinuxCapabilityHeader,
     LinuxDirent64Header, LinuxEpollEvent, LinuxEventfdValue, LinuxFdPair, LinuxIovec,
-    LinuxItimerspec, LinuxPollFd, LinuxRlimit, LinuxSigaction, LinuxStat, LinuxStatfs, LinuxStatx,
-    LinuxStatxTimestamp, LinuxTimerfdExpirations, LinuxTimespec, LinuxTimeval, LinuxTimezone,
-    LinuxUtsname, LinuxWinsize,
+    LinuxItimerspec, LinuxOpenHow, LinuxPollFd, LinuxRlimit, LinuxSigaction, LinuxStat,
+    LinuxStatfs, LinuxStatx, LinuxStatxTimestamp, LinuxTimerfdExpirations, LinuxTimespec,
+    LinuxTimeval, LinuxTimezone, LinuxUtsname, LinuxWinsize,
 };
 use crate::memory::{LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE, LINUX_MMAP_SIZE};
 use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsError, RootFsMetadata};
@@ -127,6 +127,7 @@ const LINUX_STATX_BASIC_STATS: u32 = 0x7ff;
 const LINUX_STATX_RESERVED: u64 = 0x8000_0000;
 const MAX_GUEST_PATH: usize = 4096;
 const LINUX_IOV_MAX: usize = 1024;
+const LINUX_OPEN_HOW_SIZE: u64 = core::mem::size_of::<LinuxOpenHow>() as u64;
 
 static MONOTONIC_START: OnceLock<Instant> = OnceLock::new();
 
@@ -513,6 +514,7 @@ impl SyscallDispatcher {
             283 => self.membarrier(request),
             291 => self.statx(request, memory)?,
             293 => self.rseq(),
+            437 => self.openat2(request, memory, reporter)?,
             439 => self.faccessat2(request, memory)?,
             _ => {
                 reporter.record(CompatEvent::unhandled_syscall(
@@ -1902,9 +1904,51 @@ impl SyscallDispatcher {
         memory: &impl GuestMemory,
         reporter: &mut CompatReporter,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let dirfd = request.arg(0);
-        let pathname = request.arg(1);
-        let flags = request.arg(2);
+        self.open_at_path(
+            request.arg(0),
+            request.arg(1),
+            request.arg(2),
+            memory,
+            reporter,
+        )
+    }
+
+    fn openat2(
+        &mut self,
+        request: SyscallRequest,
+        memory: &impl GuestMemory,
+        reporter: &mut CompatReporter,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let how_address = request.arg(2);
+        let size = request.arg(3);
+        if size != LINUX_OPEN_HOW_SIZE {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            });
+        }
+        let how = match read_open_how(memory, how_address) {
+            Ok(how) => how,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        if how.mode != 0
+            || how.resolve != 0
+            || how.flags & !(LINUX_O_CLOEXEC | LINUX_O_NONBLOCK) != 0
+        {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            });
+        }
+        self.open_at_path(request.arg(0), request.arg(1), how.flags, memory, reporter)
+    }
+
+    fn open_at_path(
+        &mut self,
+        dirfd: u64,
+        pathname: u64,
+        flags: u64,
+        memory: &impl GuestMemory,
+        reporter: &mut CompatReporter,
+    ) -> Result<DispatchOutcome, DispatchError> {
         if flags & LINUX_O_ACCMODE != 0 {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
@@ -3755,6 +3799,13 @@ fn read_timespec(memory: &impl GuestMemory, address: u64) -> Result<LinuxTimespe
         .read_bytes(address, core::mem::size_of::<LinuxTimespec>())
         .map_err(|_| LINUX_EFAULT)?;
     LinuxTimespec::read_from_bytes(&bytes).map_err(|_| LINUX_EFAULT)
+}
+
+fn read_open_how(memory: &impl GuestMemory, address: u64) -> Result<LinuxOpenHow, i32> {
+    let bytes = memory
+        .read_bytes(address, core::mem::size_of::<LinuxOpenHow>())
+        .map_err(|_| LINUX_EFAULT)?;
+    LinuxOpenHow::read_from_bytes(&bytes).map_err(|_| LINUX_EFAULT)
 }
 
 fn read_iovecs(

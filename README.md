@@ -34,8 +34,9 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
 - `carrick dispatch-syscall <nr> --args ...` exercises the host-side syscall
   dispatcher that the HVF trap loop will call; `getcwd(2)`, `faccessat(2)`,
   `faccessat2(2)`, `chdir(2)`, `fchdir(2)`, `eventfd2(2)`, `epoll_create1(2)`,
-  `epoll_ctl(2)`, `epoll_pwait(2)`, `openat(2)`, `dup(2)`, `dup3(2)`, `fcntl(2)`,
-  `flock(2)`, `ioctl(2)`, `statfs(2)`, `fstatfs(2)`, `getdents64(2)`,
+  `epoll_ctl(2)`, `epoll_pwait(2)`, `openat(2)`, `openat2(2)`, `dup(2)`,
+  `dup3(2)`, `fcntl(2)`, `flock(2)`, `ioctl(2)`, `statfs(2)`, `fstatfs(2)`,
+  `getdents64(2)`,
   `lseek(2)`, `readlinkat(2)`,
   `pipe2(2)`, `read(2)`, `readv(2)`, `pread64(2)`, `preadv(2)`, `write(2)`,
   `writev(2)`, `sendfile(2)`, `pselect6(2)`, `ppoll(2)`, `timerfd_create(2)`,
@@ -94,9 +95,10 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
   `timerfd_settime(2)`, `epoll_pwait(2)`, `capget(2)`, `capset(2)`,
   `personality(2)`, `futex(2)`, `nanosleep(2)`, `clock_nanosleep(2)`,
   `membarrier(2)` queries, scheduler affinity/yield calls, `getcpu(2)`,
-  `prctl(2)`, `rseq(2)` fallback, `flock(2)`, `statx(2)`, `faccessat2(2)`,
-  `sendfile(2)`, `preadv(2)`, `read(2)`, `close(2)`, and `exit(2)`, giving the
-  loader, HVF loop, rootfs, and dispatcher a tight feedback loop.
+  `prctl(2)`, `rseq(2)` fallback, `flock(2)`, `statx(2)`, `openat2(2)`,
+  `faccessat2(2)`, `sendfile(2)`, `preadv(2)`, `read(2)`, `close(2)`, and
+  `exit(2)`, giving the loader, HVF loop, rootfs, and dispatcher a tight
+  feedback loop.
 
 `shell` and `exec` are present as CLI surfaces, but they still stop before
 interactive process execution. `run` can map a dynamic ELF's rootfs-backed
