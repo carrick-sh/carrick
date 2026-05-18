@@ -20,7 +20,10 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
   tight bring-up path for the static Rust fixtures, including a rootfs-backed
   `/etc/motd` reader, an argv reader, and a timerfd/epoll readiness probe.
 - `carrick pull <image>` uses `oci-distribution` to fetch image layers into a
-  content-addressed store under `$CARRICK_HOME` or `~/.carrick`.
+  content-addressed store under `$CARRICK_HOME` or `~/.carrick`. Multi-arch
+  manifests are resolved to `linux/arm64` by default so tag references like
+  `alpine:latest` work from a macOS host; set `CARRICK_PULL_PLATFORM=os/arch[/variant]`
+  (e.g. `linux/amd64`) to override.
 - `carrick run <image> /path/to/elf [args ...]` loads a previously pulled image
   summary, composes its layer blobs as a read-only rootfs, loads the executable
   from that rootfs, maps any `PT_INTERP` interpreter from the same rootfs at a
