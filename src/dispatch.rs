@@ -13,7 +13,7 @@ use crate::linux_abi::{
     LinuxItimerspec, LinuxOpenHow, LinuxPollFd, LinuxRlimit, LinuxRusage, LinuxSigaction,
     LinuxSigaltstack, LinuxStat, LinuxStatfs, LinuxStatx, LinuxStatxTimestamp,
     LinuxTimerfdExpirations, LinuxTimespec, LinuxTimeval, LinuxTimezone, LinuxTms,
-    LinuxUtsname, LinuxWinsize,
+    LinuxTermios, LinuxUtsname, LinuxWinsize,
 };
 use crate::memory::{LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE, LINUX_MMAP_SIZE};
 use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsError, RootFsMetadata};
@@ -134,6 +134,10 @@ const LINUX_FUTEX_CMD_MASK: u64 = 0x7f;
 const LINUX_FUTEX_PRIVATE_FLAG: u64 = 128;
 const LINUX_FUTEX_CLOCK_REALTIME: u64 = 256;
 const LINUX_MEMBARRIER_CMD_QUERY: u64 = 0;
+const LINUX_TCGETS: u64 = 0x5401;
+const LINUX_TCSETS: u64 = 0x5402;
+const LINUX_TCSETSW: u64 = 0x5403;
+const LINUX_TCSETSF: u64 = 0x5404;
 const LINUX_TIOCGWINSZ: u64 = 0x5413;
 const LINUX_PIPE_BUF_SIZE: i64 = 65_536;
 const LINUX_RT_SIGSET_SIZE: u64 = 8;
@@ -1512,6 +1516,19 @@ impl SyscallDispatcher {
                 write_packed(memory, arg, winsize.as_bytes())
             }
             LINUX_TIOCGWINSZ => DispatchOutcome::Errno {
+                errno: LINUX_ENOTTY,
+            },
+            LINUX_TCGETS if is_stdio_fd(fd) => {
+                let termios = LinuxTermios::default_cooked();
+                write_packed(memory, arg, termios.as_bytes())
+            }
+            LINUX_TCGETS => DispatchOutcome::Errno {
+                errno: LINUX_ENOTTY,
+            },
+            LINUX_TCSETS | LINUX_TCSETSW | LINUX_TCSETSF if is_stdio_fd(fd) => {
+                validate_termios_buffer(memory, arg)
+            }
+            LINUX_TCSETS | LINUX_TCSETSW | LINUX_TCSETSF => DispatchOutcome::Errno {
                 errno: LINUX_ENOTTY,
             },
             _ => {
@@ -4492,6 +4509,15 @@ fn write_packed(memory: &mut impl GuestMemory, address: u64, bytes: &[u8]) -> Di
         }
     } else {
         DispatchOutcome::Returned { value: 0 }
+    }
+}
+
+fn validate_termios_buffer(memory: &impl GuestMemory, address: u64) -> DispatchOutcome {
+    match memory.read_bytes(address, core::mem::size_of::<LinuxTermios>()) {
+        Ok(_) => DispatchOutcome::Returned { value: 0 },
+        Err(_) => DispatchOutcome::Errno {
+            errno: LINUX_EFAULT,
+        },
     }
 }
 

@@ -152,6 +152,55 @@ impl LinuxWinsize {
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
 )]
+pub struct LinuxTermios {
+    pub c_iflag: u32,
+    pub c_oflag: u32,
+    pub c_cflag: u32,
+    pub c_lflag: u32,
+    pub c_line: u8,
+    pub c_cc: [u8; 19],
+    pub c_ispeed: u32,
+    pub c_ospeed: u32,
+}
+
+impl LinuxTermios {
+    pub fn default_cooked() -> Self {
+        let mut c_cc = [0u8; 19];
+        c_cc[0] = 0x03; // VINTR  (Ctrl+C)
+        c_cc[1] = 0x1c; // VQUIT  (Ctrl+\)
+        c_cc[2] = 0x7f; // VERASE (DEL)
+        c_cc[3] = 0x15; // VKILL  (Ctrl+U)
+        c_cc[4] = 0x04; // VEOF   (Ctrl+D)
+        c_cc[5] = 0; // VTIME
+        c_cc[6] = 1; // VMIN
+        c_cc[7] = 0; // VSWTC
+        c_cc[8] = 0x11; // VSTART  (Ctrl+Q)
+        c_cc[9] = 0x13; // VSTOP   (Ctrl+S)
+        c_cc[10] = 0x1a; // VSUSP   (Ctrl+Z)
+        c_cc[11] = 0; // VEOL
+        c_cc[12] = 0x12; // VREPRINT (Ctrl+R)
+        c_cc[13] = 0x0f; // VDISCARD (Ctrl+O)
+        c_cc[14] = 0x17; // VWERASE  (Ctrl+W)
+        c_cc[15] = 0x16; // VLNEXT   (Ctrl+V)
+        c_cc[16] = 0; // VEOL2
+        // indices 17 and 18 reserved, remain 0
+        Self {
+            c_iflag: 0x4502,
+            c_oflag: 0x0005,
+            c_cflag: 0x04bf,
+            c_lflag: 0x803b,
+            c_line: 0,
+            c_cc,
+            c_ispeed: 38400,
+            c_ospeed: 38400,
+        }
+    }
+}
+
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
 pub struct LinuxEventfdValue {
     pub value: u64,
 }

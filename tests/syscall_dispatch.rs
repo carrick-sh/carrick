@@ -10,7 +10,7 @@ use carrick::linux_abi::{
     LinuxEpollEvent, LinuxEventfdValue, LinuxFdPair, LinuxIovec, LinuxItimerspec, LinuxPollFd,
     LinuxRlimit, LinuxRusage, LinuxSigaltstack, LinuxStat, LinuxStatfs, LinuxStatx,
     LinuxTimerfdExpirations, LinuxTimespec, LinuxTimeval, LinuxTimezone, LinuxTms,
-    LinuxUtsname, LinuxWinsize,
+    LinuxTermios, LinuxUtsname, LinuxWinsize,
 };
 use carrick::memory::{AddressSpace, LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE};
 use carrick::rootfs::{LayerSource, RootFs};
@@ -58,6 +58,8 @@ const LINUX_PR_GET_NAME: u64 = 16;
 const LINUX_TFD_NONBLOCK: u64 = LINUX_O_NONBLOCK;
 const LINUX_TIMER_ABSTIME: u64 = 0x1;
 const LINUX_CLOCK_MONOTONIC: u64 = 1;
+const LINUX_TCGETS: u64 = 0x5401;
+const LINUX_TCSETS: u64 = 0x5402;
 const LINUX_TIOCGWINSZ: u64 = 0x5413;
 const LINUX_R_OK: u64 = 4;
 const LINUX_W_OK: u64 = 2;
@@ -205,6 +207,119 @@ fn ioctl_writes_packed_winsize_and_reports_unknown_requests() {
     assert!(report.unhandled_syscalls.is_empty());
     assert_eq!(report.unhandled_ioctls[0].request, 0xdead_beef);
     assert_eq!(report.unhandled_ioctls[0].count, 1);
+}
+
+#[test]
+fn ioctl_tcgets_writes_default_termios_for_stdio_and_enotty_for_files() {
+    // 1. TCGETS on fd 0 → returns 0; struct has cooked-TTY defaults.
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(29, SyscallArgs::from([0, LINUX_TCGETS, 0x4000, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let termios = read_termios(&memory, 0x4000);
+    let c_iflag = termios.c_iflag;
+    let c_lflag = termios.c_lflag;
+    let c_cc = termios.c_cc;
+    assert_eq!(c_iflag, 0x4502);
+    assert_eq!(c_lflag, 0x803b);
+    assert_eq!(c_cc[0], 0x03); // VINTR
+    assert_eq!(c_cc[4], 0x04); // VEOF
+
+    // 2. TCGETS on bogus fd 99 → EBADF.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(29, SyscallArgs::from([99, LINUX_TCGETS, 0x4080, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 9 }
+    );
+
+    // 3. TCGETS on a rootfs-backed file fd → ENOTTY.
+    let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
+        "etc/motd",
+        b"rootfs says hello\n".as_slice(),
+    )]))])
+    .unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
+    memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
+    let opened = dispatcher
+        .dispatch(
+            SyscallRequest::new(
+                56,
+                SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
+            ),
+            &mut memory,
+            &mut reporter,
+        )
+        .unwrap();
+    let file_fd = match opened {
+        DispatchOutcome::Returned { value } => value,
+        other => panic!("expected fd, got {:?}", other),
+    };
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    29,
+                    SyscallArgs::from([file_fd as u64, LINUX_TCGETS, 0x4080, 0, 0, 0])
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 25 }
+    );
+
+    // 4. TCSETS on fd 0 with a valid termios buffer → 0.
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    // Seed any plausible bytes — the dispatcher only does a size check.
+    memory
+        .write_bytes(
+            0x4000,
+            LinuxTermios::default_cooked().as_bytes(),
+        )
+        .unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(29, SyscallArgs::from([0, LINUX_TCSETS, 0x4000, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    // 5. TCSETS on fd 0 with a bad pointer → EFAULT.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(29, SyscallArgs::from([0, LINUX_TCSETS, 0x1, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 14 }
+    );
+
+    assert!(reporter.finish().unhandled_ioctls.is_empty());
 }
 
 #[test]
@@ -6608,6 +6723,13 @@ fn read_winsize(memory: &impl GuestMemory, address: u64) -> LinuxWinsize {
         .read_bytes(address, std::mem::size_of::<LinuxWinsize>())
         .unwrap();
     LinuxWinsize::read_from_bytes(&bytes).unwrap()
+}
+
+fn read_termios(memory: &impl GuestMemory, address: u64) -> LinuxTermios {
+    let bytes = memory
+        .read_bytes(address, std::mem::size_of::<LinuxTermios>())
+        .unwrap();
+    LinuxTermios::read_from_bytes(&bytes).unwrap()
 }
 
 fn read_fd_pair(memory: &impl GuestMemory, address: u64) -> LinuxFdPair {
