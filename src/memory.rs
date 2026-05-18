@@ -223,4 +223,17 @@ impl GuestMemory for AddressSpace {
             .map_err(|_| MemoryError::OutOfBounds { address, length })?;
         Ok(region.bytes[offset..offset + length].to_vec())
     }
+
+    fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+        let length = bytes.len();
+        let region = self
+            .regions
+            .iter_mut()
+            .find(|region| region.contains_range(address, length))
+            .ok_or(MemoryError::OutOfBounds { address, length })?;
+        let offset = usize::try_from(address - region.start)
+            .map_err(|_| MemoryError::OutOfBounds { address, length })?;
+        region.bytes[offset..offset + length].copy_from_slice(bytes);
+        Ok(())
+    }
 }

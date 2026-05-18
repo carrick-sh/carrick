@@ -215,14 +215,15 @@ async fn main() -> anyhow::Result<()> {
             if args.len() != 6 {
                 bail!("dispatch-syscall requires exactly six --args values");
             }
-            let memory = LinearMemory::new(memory_base, memory_text.into_bytes());
-            let mut dispatcher = SyscallDispatcher::new(&memory);
+            let mut memory = LinearMemory::new(memory_base, memory_text.into_bytes());
+            let mut dispatcher = SyscallDispatcher::new();
             let mut reporter = CompatReporter::default();
             let outcome = dispatcher.dispatch(
                 SyscallRequest::new(
                     number,
                     SyscallArgs::from([args[0], args[1], args[2], args[3], args[4], args[5]]),
                 ),
+                &mut memory,
                 &mut reporter,
             )?;
             println!(

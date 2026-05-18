@@ -45,11 +45,11 @@ pub fn run_static_elf_with_hvf(
     let image = AddressSpace::load_elf(path)?;
     let mut trap = HvfTrapEngine::new()?;
     trap.map_address_space(&image)?;
-    run_syscall_loop(&image, &mut trap, max_traps)
+    run_combined_syscall_loop(&mut trap, max_traps)
 }
 
 pub fn run_syscall_loop<M, T>(
-    memory: &M,
+    memory: &mut M,
     trap: &mut T,
     max_traps: usize,
 ) -> Result<RunResult, RuntimeError>
@@ -57,13 +57,87 @@ where
     M: GuestMemory,
     T: SyscallTrap,
 {
+    run_syscall_loop_with_dispatcher(memory, trap, SyscallDispatcher::new(), max_traps)
+}
+
+pub fn run_syscall_loop_with_dispatcher<M, T>(
+    memory: &mut M,
+    trap: &mut T,
+    dispatcher: SyscallDispatcher,
+    max_traps: usize,
+) -> Result<RunResult, RuntimeError>
+where
+    M: GuestMemory,
+    T: SyscallTrap,
+{
+    run_split_loop(memory, trap, dispatcher, max_traps)
+}
+
+pub fn run_combined_syscall_loop<R>(
+    runtime: &mut R,
+    max_traps: usize,
+) -> Result<RunResult, RuntimeError>
+where
+    R: GuestMemory + SyscallTrap,
+{
+    run_combined_syscall_loop_with_dispatcher(runtime, SyscallDispatcher::new(), max_traps)
+}
+
+pub fn run_combined_syscall_loop_with_dispatcher<R>(
+    runtime: &mut R,
+    mut dispatcher: SyscallDispatcher,
+    max_traps: usize,
+) -> Result<RunResult, RuntimeError>
+where
+    R: GuestMemory + SyscallTrap,
+{
     let mut reporter = CompatReporter::default();
-    let mut dispatcher = SyscallDispatcher::new(memory);
+
+    for traps in 1..=max_traps {
+        let frame = runtime.next_syscall()?;
+        let outcome = dispatcher.dispatch(
+            SyscallRequest::from_aarch64_frame(frame),
+            runtime,
+            &mut reporter,
+        )?;
+
+        match outcome {
+            DispatchOutcome::Exit { code } => {
+                return Ok(RunResult {
+                    exit_code: code,
+                    stdout: dispatcher.stdout().to_vec(),
+                    stderr: dispatcher.stderr().to_vec(),
+                    traps,
+                    report: reporter.finish(),
+                });
+            }
+            DispatchOutcome::Returned { value } => runtime.complete_syscall(value)?,
+            DispatchOutcome::Errno { errno } => runtime.complete_syscall(-(errno as i64))?,
+        }
+    }
+
+    Err(RuntimeError::TrapLimitExceeded { max_traps })
+}
+
+fn run_split_loop<M, T>(
+    memory: &mut M,
+    trap: &mut T,
+    mut dispatcher: SyscallDispatcher,
+    max_traps: usize,
+) -> Result<RunResult, RuntimeError>
+where
+    M: GuestMemory,
+    T: SyscallTrap,
+{
+    let mut reporter = CompatReporter::default();
 
     for traps in 1..=max_traps {
         let frame = trap.next_syscall()?;
-        let outcome =
-            dispatcher.dispatch(SyscallRequest::from_aarch64_frame(frame), &mut reporter)?;
+        let outcome = dispatcher.dispatch(
+            SyscallRequest::from_aarch64_frame(frame),
+            memory,
+            &mut reporter,
+        )?;
 
         match outcome {
             DispatchOutcome::Exit { code } => {

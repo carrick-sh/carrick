@@ -24,8 +24,12 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
 - `carrick compat-report -- <cmd>` emits the machine-parseable compatibility report
   shape that runtime hooks will populate.
 - `carrick dispatch-syscall <nr> --args ...` exercises the host-side syscall
-  dispatcher that the HVF trap loop will call; `write(2)`, `exit(2)`, `EFAULT`,
-  `EBADF`, and `ENOSYS` paths are covered by tests.
+  dispatcher that the HVF trap loop will call; `openat(2)`, `read(2)`,
+  `close(2)`, `write(2)`, `exit(2)`, `ENOENT`, `EFAULT`, `EBADF`, and `ENOSYS`
+  paths are covered by tests.
+- The dispatcher now has a rootfs-backed file descriptor table for read-only
+  file opens from composed OCI layers, and the runtime loop can drive a scripted
+  `cat`-style `openat -> read -> write -> close -> exit` flow.
 - USDT support wires compatibility events to DTrace probes through the Apache-2.0
   `usdt` crate.
 - `carrick syscalls` exposes the initial Linux/aarch64 syscall table and support
@@ -34,7 +38,9 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
 - On macOS/aarch64, the HVF backend uses the permissively licensed `applevisor`
   crate to create the VM/vCPU, map ELF-backed guest address-space regions, seed
   the program counter, decode AArch64 SVC exits, and write syscall return values
-  back into guest registers.
+  back into guest registers. The same mapped HVF memory implements Carrick's
+  guest-memory read/write trait, so syscall handlers can copy data into guest
+  buffers.
 - `scripts/build-linux-fixtures.sh` builds a static Linux/aarch64 Rust fixture
   whose first guest syscalls are `write(2)` and `exit(2)`, giving the loader and
   dispatcher a tight feedback loop.

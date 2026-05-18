@@ -1,4 +1,4 @@
-use crate::dispatch::Aarch64SyscallFrame;
+use crate::dispatch::{Aarch64SyscallFrame, GuestMemory, MemoryError};
 use crate::elf::SegmentPerms;
 use crate::memory::AddressSpace;
 use serde::Serialize;
@@ -117,7 +117,15 @@ pub struct HvfTrapEngine {
 struct HvfInner {
     _vm: applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
     vcpu: applevisor::vcpu::Vcpu,
-    mappings: Vec<applevisor::memory::Memory>,
+    mappings: Vec<HvfMappedRegion>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+struct HvfMappedRegion {
+    start: u64,
+    end: u64,
+    memory: applevisor::memory::Memory,
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -199,7 +207,16 @@ impl HvfTrapEngine {
             memory
                 .write(mapping.guest_start, &mapping.image)
                 .map_err(hvf_error)?;
-            self.inner.mappings.push(memory);
+            self.inner.mappings.push(HvfMappedRegion {
+                start: mapping.guest_start,
+                end: mapping.guest_start.checked_add(mapping.mapped_size).ok_or(
+                    TrapError::MappingOverflow {
+                        guest_start: mapping.guest_start,
+                        mapped_size: mapping.mapped_size,
+                    },
+                )?,
+                memory,
+            });
         }
 
         self.inner
@@ -265,6 +282,58 @@ impl HvfInner {
             .set_reg(Reg::X0, return_value as u64)
             .map_err(hvf_error)
     }
+
+    fn read_guest_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+        let Some(mapping) = self.mapping_for_range(address, length) else {
+            return Err(MemoryError::OutOfBounds { address, length });
+        };
+        let mut bytes = vec![0; length];
+        mapping
+            .memory
+            .read(address, &mut bytes)
+            .map_err(|_| MemoryError::OutOfBounds { address, length })?;
+        Ok(bytes)
+    }
+
+    fn write_guest_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+        let length = bytes.len();
+        let Some(mapping) = self.mapping_for_range_mut(address, length) else {
+            return Err(MemoryError::OutOfBounds { address, length });
+        };
+        mapping
+            .memory
+            .write(address, bytes)
+            .map_err(|_| MemoryError::OutOfBounds { address, length })
+    }
+
+    fn mapping_for_range(&self, address: u64, length: usize) -> Option<&HvfMappedRegion> {
+        self.mappings
+            .iter()
+            .find(|mapping| mapping.contains_range(address, length))
+    }
+
+    fn mapping_for_range_mut(
+        &mut self,
+        address: u64,
+        length: usize,
+    ) -> Option<&mut HvfMappedRegion> {
+        self.mappings
+            .iter_mut()
+            .find(|mapping| mapping.contains_range(address, length))
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl HvfMappedRegion {
+    fn contains_range(&self, address: u64, length: usize) -> bool {
+        let Ok(length) = u64::try_from(length) else {
+            return false;
+        };
+        let Some(end) = address.checked_add(length) else {
+            return false;
+        };
+        address >= self.start && end <= self.end
+    }
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -283,6 +352,27 @@ impl HvfInner {
 
     fn complete_syscall(&mut self, _: i64) -> Result<(), TrapError> {
         Err(TrapError::UnsupportedPlatform)
+    }
+
+    fn read_guest_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+        Err(MemoryError::OutOfBounds { address, length })
+    }
+
+    fn write_guest_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+        Err(MemoryError::OutOfBounds {
+            address,
+            length: bytes.len(),
+        })
+    }
+}
+
+impl GuestMemory for HvfTrapEngine {
+    fn read_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+        self.inner.read_guest_bytes(address, length)
+    }
+
+    fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+        self.inner.write_guest_bytes(address, bytes)
     }
 }
 
