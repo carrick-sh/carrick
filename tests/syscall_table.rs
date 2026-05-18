@@ -70,6 +70,9 @@ fn names_linux_aarch64_bringup_syscalls() {
     assert_eq!(mprotect.support, SupportLevel::BringUp);
 
     for (number, name) in [
+        (23, "dup"),
+        (24, "dup3"),
+        (25, "fcntl"),
         (96, "set_tid_address"),
         (99, "set_robust_list"),
         (113, "clock_gettime"),

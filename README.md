@@ -33,11 +33,11 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
   shape that runtime hooks will populate.
 - `carrick dispatch-syscall <nr> --args ...` exercises the host-side syscall
   dispatcher that the HVF trap loop will call; `getcwd(2)`, `faccessat(2)`,
-  `chdir(2)`, `fchdir(2)`, `openat(2)`, `getdents64(2)`, `lseek(2)`,
-  `readlinkat(2)`, `read(2)`, `readv(2)`, `pread64(2)`, `write(2)`,
-  `writev(2)`, `close(2)`, `newfstatat(2)`, `fstat(2)`, `exit(2)`,
-  `ENOENT`, `EACCES`, `EFAULT`, `EBADF`, and `ENOSYS` paths are covered by
-  tests.
+  `chdir(2)`, `fchdir(2)`, `openat(2)`, `dup(2)`, `dup3(2)`, `fcntl(2)`,
+  `getdents64(2)`, `lseek(2)`, `readlinkat(2)`, `read(2)`, `readv(2)`,
+  `pread64(2)`, `write(2)`, `writev(2)`, `close(2)`, `newfstatat(2)`,
+  `fstat(2)`, `exit(2)`, `ENOENT`, `EACCES`, `EFAULT`, `EBADF`, and `ENOSYS`
+  paths are covered by tests.
 - Loaded ELFs include bootstrap heap and mmap arenas. The dispatcher can
   service `brk(2)`, file-backed and anonymous `mmap(2)`, bootstrap no-op
   `mprotect(2)`/`munmap(2)`, and `exit_group(2)`, which gives `ld-linux` a
@@ -51,9 +51,11 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
   represented by packed Rust structs in `linux_abi`, with `zerocopy` used to
   expose initialized bytes for guest-memory writes.
 - The dispatcher now has a rootfs-backed file descriptor table for read-only
-  file opens from composed OCI layers, and the runtime loop can drive a scripted
-  `cat`-style `openat -> read -> write -> close -> exit` flow and a directory
-  listing flow using `getdents64`.
+  file opens from composed OCI layers. Duplicated descriptors share open-file
+  offsets while keeping descriptor flags such as `FD_CLOEXEC` per descriptor,
+  and the runtime loop can drive a scripted `cat`-style
+  `openat -> read -> write -> close -> exit` flow and a directory listing flow
+  using `getdents64`.
 - Rootfs symlink target text is preserved for Linux `readlinkat(2)`, and
   `/proc/self/exe` is synthesized from the launched executable path.
 - USDT support wires compatibility events to DTrace probes through the Apache-2.0

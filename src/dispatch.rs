@@ -1,5 +1,7 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
+use std::rc::Rc;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -32,9 +34,18 @@ pub const LINUX_AT_EMPTY_PATH: u64 = 0x1000;
 pub const LINUX_R_OK: u64 = 4;
 pub const LINUX_W_OK: u64 = 2;
 pub const LINUX_X_OK: u64 = 1;
+pub const LINUX_F_DUPFD: u64 = 0;
+pub const LINUX_F_GETFD: u64 = 1;
+pub const LINUX_F_SETFD: u64 = 2;
+pub const LINUX_F_GETFL: u64 = 3;
+pub const LINUX_F_SETFL: u64 = 4;
+pub const LINUX_F_DUPFD_CLOEXEC: u64 = 1030;
+pub const LINUX_FD_CLOEXEC: u64 = 1;
 pub const LINUX_SEEK_SET: u64 = 0;
 pub const LINUX_SEEK_CUR: u64 = 1;
 pub const LINUX_SEEK_END: u64 = 2;
+pub const LINUX_O_ACCMODE: u64 = 0b11;
+pub const LINUX_O_CLOEXEC: u64 = 0o2000000;
 pub const LINUX_PROT_READ: u64 = 0x1;
 pub const LINUX_PROT_WRITE: u64 = 0x2;
 pub const LINUX_PROT_EXEC: u64 = 0x4;
@@ -185,7 +196,7 @@ pub struct SyscallDispatcher {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     rootfs: Option<RootFs>,
-    open_files: HashMap<i32, OpenDescription>,
+    open_files: HashMap<i32, OpenFile>,
     next_fd: i32,
     cwd: String,
     brk_current: u64,
@@ -200,13 +211,37 @@ enum OpenDescription {
         metadata: RootFsMetadata,
         contents: Vec<u8>,
         offset: usize,
+        status_flags: u64,
     },
     Directory {
         path: String,
         metadata: RootFsMetadata,
         entries: Vec<RootFsDirEntry>,
         offset: usize,
+        status_flags: u64,
     },
+}
+
+#[derive(Debug, Clone)]
+struct OpenFile {
+    description: Rc<RefCell<OpenDescription>>,
+    fd_flags: u64,
+}
+
+impl OpenDescription {
+    fn status_flags(&self) -> u64 {
+        match self {
+            OpenDescription::File { status_flags, .. }
+            | OpenDescription::Directory { status_flags, .. } => *status_flags,
+        }
+    }
+
+    fn set_status_flags(&mut self, next: u64) {
+        match self {
+            OpenDescription::File { status_flags, .. }
+            | OpenDescription::Directory { status_flags, .. } => *status_flags = next,
+        }
+    }
 }
 
 impl Default for SyscallDispatcher {
@@ -274,6 +309,9 @@ impl SyscallDispatcher {
 
         let outcome = match request.number {
             17 => self.getcwd(request, memory)?,
+            23 => self.dup(request),
+            24 => self.dup3(request),
+            25 => self.fcntl(request),
             48 => self.faccessat(request, memory)?,
             49 => self.chdir(request, memory)?,
             50 => self.fchdir(request),
@@ -457,16 +495,100 @@ impl SyscallDispatcher {
 
     fn fchdir(&mut self, request: SyscallRequest) -> DispatchOutcome {
         let fd = request.arg(0) as i32;
-        let Some(open) = self.open_files.get(&fd) else {
+        let Some(open_file) = self.open_files.get(&fd) else {
             return DispatchOutcome::Errno { errno: LINUX_EBADF };
         };
-        match open {
+        let open = open_file.description.borrow();
+        match &*open {
             OpenDescription::Directory { metadata, .. } => {
                 self.cwd = display_rootfs_path(&metadata.path);
                 DispatchOutcome::Returned { value: 0 }
             }
             OpenDescription::File { .. } => DispatchOutcome::Errno {
                 errno: LINUX_ENOTDIR,
+            },
+        }
+    }
+
+    fn dup(&mut self, request: SyscallRequest) -> DispatchOutcome {
+        let old_fd = request.arg(0) as i32;
+        self.duplicate_fd(old_fd, 3, 0)
+    }
+
+    fn dup3(&mut self, request: SyscallRequest) -> DispatchOutcome {
+        let old_fd = request.arg(0) as i32;
+        let new_fd = request.arg(1) as i32;
+        let flags = request.arg(2);
+        if old_fd == new_fd || flags & !LINUX_O_CLOEXEC != 0 || new_fd < 3 {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+        let Some(open_file) = self.open_files.get(&old_fd) else {
+            return DispatchOutcome::Errno { errno: LINUX_EBADF };
+        };
+        let description = Rc::clone(&open_file.description);
+        self.open_files.insert(
+            new_fd,
+            OpenFile {
+                description,
+                fd_flags: linux_fd_flags_from_open_flags(flags),
+            },
+        );
+        DispatchOutcome::Returned {
+            value: new_fd as i64,
+        }
+    }
+
+    fn fcntl(&mut self, request: SyscallRequest) -> DispatchOutcome {
+        let fd = request.arg(0) as i32;
+        let command = request.arg(1);
+        let arg = request.arg(2);
+        match command {
+            LINUX_F_DUPFD => match linux_min_fd(arg) {
+                Ok(min_fd) => self.duplicate_fd(fd, min_fd, 0),
+                Err(errno) => DispatchOutcome::Errno { errno },
+            },
+            LINUX_F_DUPFD_CLOEXEC => match linux_min_fd(arg) {
+                Ok(min_fd) => self.duplicate_fd(fd, min_fd, LINUX_FD_CLOEXEC),
+                Err(errno) => DispatchOutcome::Errno { errno },
+            },
+            LINUX_F_GETFD => {
+                let Some(open_file) = self.open_files.get(&fd) else {
+                    return DispatchOutcome::Errno { errno: LINUX_EBADF };
+                };
+                DispatchOutcome::Returned {
+                    value: open_file.fd_flags as i64,
+                }
+            }
+            LINUX_F_SETFD => {
+                let Some(open_file) = self.open_files.get_mut(&fd) else {
+                    return DispatchOutcome::Errno { errno: LINUX_EBADF };
+                };
+                open_file.fd_flags = arg & LINUX_FD_CLOEXEC;
+                DispatchOutcome::Returned { value: 0 }
+            }
+            LINUX_F_GETFL => {
+                let Some(open_file) = self.open_files.get(&fd) else {
+                    return DispatchOutcome::Errno { errno: LINUX_EBADF };
+                };
+                let open = open_file.description.borrow();
+                DispatchOutcome::Returned {
+                    value: open.status_flags() as i64,
+                }
+            }
+            LINUX_F_SETFL => {
+                let Some(open_file) = self.open_files.get(&fd) else {
+                    return DispatchOutcome::Errno { errno: LINUX_EBADF };
+                };
+                open_file
+                    .description
+                    .borrow_mut()
+                    .set_status_flags(arg & !LINUX_O_CLOEXEC);
+                DispatchOutcome::Returned { value: 0 }
+            }
+            _ => DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
             },
         }
     }
@@ -630,7 +752,7 @@ impl SyscallDispatcher {
         let dirfd = request.arg(0);
         let pathname = request.arg(1);
         let flags = request.arg(2);
-        if flags & 0b11 != 0 {
+        if flags & LINUX_O_ACCMODE != 0 {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
             });
@@ -674,6 +796,7 @@ impl SyscallDispatcher {
                     metadata,
                     contents,
                     offset: 0,
+                    status_flags: flags & !LINUX_O_CLOEXEC,
                 }
             }
             RootFsEntryKind::Directory => {
@@ -690,6 +813,7 @@ impl SyscallDispatcher {
                     metadata,
                     entries,
                     offset: 0,
+                    status_flags: flags & !LINUX_O_CLOEXEC,
                 }
             }
             RootFsEntryKind::Symlink => {
@@ -699,9 +823,18 @@ impl SyscallDispatcher {
             }
         };
 
-        let fd = self.next_fd;
-        self.next_fd += 1;
-        self.open_files.insert(fd, description);
+        let Some(fd) = self.allocate_fd(3) else {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            });
+        };
+        self.open_files.insert(
+            fd,
+            OpenFile {
+                description: Rc::new(RefCell::new(description)),
+                fd_flags: linux_fd_flags_from_open_flags(flags),
+            },
+        );
         Ok(DispatchOutcome::Returned { value: fd as i64 })
     }
 
@@ -714,6 +847,37 @@ impl SyscallDispatcher {
         }
     }
 
+    fn duplicate_fd(&mut self, old_fd: i32, min_fd: i32, fd_flags: u64) -> DispatchOutcome {
+        let Some(open_file) = self.open_files.get(&old_fd) else {
+            return DispatchOutcome::Errno { errno: LINUX_EBADF };
+        };
+        let description = Rc::clone(&open_file.description);
+        let Some(new_fd) = self.allocate_fd(min_fd) else {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        };
+        self.open_files.insert(
+            new_fd,
+            OpenFile {
+                description,
+                fd_flags,
+            },
+        );
+        DispatchOutcome::Returned {
+            value: new_fd as i64,
+        }
+    }
+
+    fn allocate_fd(&mut self, min_fd: i32) -> Option<i32> {
+        let mut fd = min_fd.max(3);
+        while self.open_files.contains_key(&fd) {
+            fd = fd.checked_add(1)?;
+        }
+        self.next_fd = self.next_fd.max(fd.saturating_add(1));
+        Some(fd)
+    }
+
     fn getdents64(
         &mut self,
         request: SyscallRequest,
@@ -723,9 +887,13 @@ impl SyscallDispatcher {
         let address = request.arg(1);
         let length = usize::try_from(request.arg(2))
             .map_err(|_| DispatchError::LengthTooLarge(request.arg(2)))?;
-        let Some(OpenDescription::Directory {
+        let Some(open_file) = self.open_files.get(&fd) else {
+            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+        };
+        let mut open = open_file.description.borrow_mut();
+        let OpenDescription::Directory {
             entries, offset, ..
-        }) = self.open_files.get_mut(&fd)
+        } = &mut *open
         else {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         };
@@ -760,11 +928,12 @@ impl SyscallDispatcher {
         let fd = request.arg(0) as i32;
         let offset = request.arg(1) as i64;
         let whence = request.arg(2);
-        let Some(open) = self.open_files.get_mut(&fd) else {
+        let Some(open_file) = self.open_files.get(&fd) else {
             return DispatchOutcome::Errno { errno: LINUX_EBADF };
         };
+        let mut open = open_file.description.borrow_mut();
 
-        let (current, end) = match open {
+        let (current, end) = match &*open {
             OpenDescription::File {
                 contents, offset, ..
             } => (*offset as i64, contents.len() as i64),
@@ -788,7 +957,7 @@ impl SyscallDispatcher {
             };
         }
 
-        match open {
+        match &mut *open {
             OpenDescription::File { offset, .. } | OpenDescription::Directory { offset, .. } => {
                 *offset = next as usize;
             }
@@ -855,7 +1024,11 @@ impl SyscallDispatcher {
             usize::try_from(length).map_err(|_| DispatchError::LengthTooLarge(length))?;
         let mut bytes = vec![0; length_usize];
         if flags & LINUX_MAP_ANONYMOUS == 0 {
-            let Some(OpenDescription::File { contents, .. }) = self.open_files.get(&fd) else {
+            let Some(open_file) = self.open_files.get(&fd) else {
+                return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+            };
+            let open = open_file.description.borrow();
+            let OpenDescription::File { contents, .. } = &*open else {
                 return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
             };
             let offset =
@@ -985,12 +1158,13 @@ impl SyscallDispatcher {
         let address = request.arg(1);
         let length = usize::try_from(request.arg(2))
             .map_err(|_| DispatchError::LengthTooLarge(request.arg(2)))?;
-        let Some(open) = self.open_files.get_mut(&fd) else {
+        let Some(open_file) = self.open_files.get(&fd) else {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         };
+        let mut open = open_file.description.borrow_mut();
         let OpenDescription::File {
             contents, offset, ..
-        } = open
+        } = &mut *open
         else {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EISDIR,
@@ -1023,12 +1197,13 @@ impl SyscallDispatcher {
             Ok(iovecs) => iovecs,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        let Some(open) = self.open_files.get_mut(&fd) else {
+        let Some(open_file) = self.open_files.get(&fd) else {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         };
+        let mut open = open_file.description.borrow_mut();
         let OpenDescription::File {
             contents, offset, ..
-        } = open
+        } = &mut *open
         else {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EISDIR,
@@ -1052,10 +1227,11 @@ impl SyscallDispatcher {
             .map_err(|_| DispatchError::LengthTooLarge(request.arg(2)))?;
         let offset = usize::try_from(request.arg(3))
             .map_err(|_| DispatchError::LengthTooLarge(request.arg(3)))?;
-        let Some(open) = self.open_files.get(&fd) else {
+        let Some(open_file) = self.open_files.get(&fd) else {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         };
-        let OpenDescription::File { contents, .. } = open else {
+        let open = open_file.description.borrow();
+        let OpenDescription::File { contents, .. } = &*open else {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EISDIR,
             });
@@ -1253,10 +1429,11 @@ impl SyscallDispatcher {
         statbuf: u64,
         memory: &mut impl GuestMemory,
     ) -> DispatchOutcome {
-        let Some(open) = self.open_files.get(&fd) else {
+        let Some(open_file) = self.open_files.get(&fd) else {
             return DispatchOutcome::Errno { errno: LINUX_EBADF };
         };
-        let metadata = match open {
+        let open = open_file.description.borrow();
+        let metadata = match &*open {
             OpenDescription::File { metadata, .. }
             | OpenDescription::Directory { metadata, .. } => metadata,
         };
@@ -1278,8 +1455,10 @@ impl SyscallDispatcher {
         }
 
         match self.open_files.get(&(dirfd as i32)) {
-            Some(OpenDescription::Directory { path: dir, .. }) => Ok(join_rootfs_path(dir, path)),
-            Some(OpenDescription::File { .. }) => Err(LINUX_ENOTDIR),
+            Some(open_file) => match &*open_file.description.borrow() {
+                OpenDescription::Directory { path: dir, .. } => Ok(join_rootfs_path(dir, path)),
+                OpenDescription::File { .. } => Err(LINUX_ENOTDIR),
+            },
             None => Err(LINUX_EBADF),
         }
     }
@@ -1293,6 +1472,18 @@ fn write_packed(memory: &mut impl GuestMemory, address: u64, bytes: &[u8]) -> Di
     } else {
         DispatchOutcome::Returned { value: 0 }
     }
+}
+
+fn linux_fd_flags_from_open_flags(flags: u64) -> u64 {
+    if flags & LINUX_O_CLOEXEC != 0 {
+        LINUX_FD_CLOEXEC
+    } else {
+        0
+    }
+}
+
+fn linux_min_fd(value: u64) -> Result<i32, i32> {
+    i32::try_from(value).map_err(|_| LINUX_EINVAL)
 }
 
 fn linux_clock_duration(clock_id: u64) -> Option<Duration> {
