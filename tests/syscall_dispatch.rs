@@ -196,6 +196,149 @@ fn openat_missing_rootfs_file_returns_enoent() {
 }
 
 #[test]
+fn cwd_and_access_syscalls_use_rootfs_state() {
+    let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
+        "etc/motd",
+        b"rootfs says hello\n".as_slice(),
+    )]))])
+    .unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
+    memory.write_bytes(0x4000, b"/etc\0").unwrap();
+    memory.write_bytes(0x4010, b"motd\0").unwrap();
+    memory.write_bytes(0x4020, b"/\0").unwrap();
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(17, SyscallArgs::from([0x4100, 16, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0x4100 }
+    );
+    assert_eq!(memory.read_bytes(0x4100, 2).unwrap(), b"/\0");
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(49, SyscallArgs::from([0x4000, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(dispatcher.cwd(), "/etc");
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(17, SyscallArgs::from([0x4100, 16, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0x4100 }
+    );
+    assert_eq!(memory.read_bytes(0x4100, 5).unwrap(), b"/etc\0");
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    48,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4010, 4, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    48,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4010, 2, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 13 }
+    );
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    56,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4010, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 3 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(63, SyscallArgs::from([3, 0x4200, 64, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 18 }
+    );
+    assert_eq!(
+        memory.read_bytes(0x4200, 18).unwrap(),
+        b"rootfs says hello\n"
+    );
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(49, SyscallArgs::from([0x4020, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(dispatcher.cwd(), "/");
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    56,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 4 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(50, SyscallArgs::from([4, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(dispatcher.cwd(), "/etc");
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
 fn lseek_repositions_rootfs_file_reads() {
     let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
         "etc/motd",

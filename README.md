@@ -30,9 +30,10 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
 - `carrick compat-report -- <cmd>` emits the machine-parseable compatibility report
   shape that runtime hooks will populate.
 - `carrick dispatch-syscall <nr> --args ...` exercises the host-side syscall
-  dispatcher that the HVF trap loop will call; `openat(2)`, `getdents64(2)`,
-  `lseek(2)`, `read(2)`, `write(2)`, `close(2)`, `newfstatat(2)`, `fstat(2)`,
-  `exit(2)`, `ENOENT`, `EFAULT`, `EBADF`, and `ENOSYS` paths are covered by
+  dispatcher that the HVF trap loop will call; `getcwd(2)`, `faccessat(2)`,
+  `chdir(2)`, `fchdir(2)`, `openat(2)`, `getdents64(2)`, `lseek(2)`,
+  `read(2)`, `write(2)`, `close(2)`, `newfstatat(2)`, `fstat(2)`, `exit(2)`,
+  `ENOENT`, `EACCES`, `EFAULT`, `EBADF`, and `ENOSYS` paths are covered by
   tests.
 - Linux ABI outputs for `stat` and `getdents64` are represented by packed Rust
   structs in `linux_abi`, with `zerocopy` used to expose initialized bytes for

@@ -14,14 +14,19 @@ use zerocopy::IntoBytes;
 
 pub const LINUX_ENOENT: i32 = 2;
 pub const LINUX_EBADF: i32 = 9;
+pub const LINUX_EACCES: i32 = 13;
 pub const LINUX_EFAULT: i32 = 14;
+pub const LINUX_ENOTDIR: i32 = 20;
 pub const LINUX_EISDIR: i32 = 21;
 pub const LINUX_EINVAL: i32 = 22;
+pub const LINUX_ERANGE: i32 = 34;
 pub const LINUX_ENAMETOOLONG: i32 = 36;
 pub const LINUX_ENOSYS: i32 = 38;
-pub const LINUX_ENOTDIR: i32 = 20;
 pub const LINUX_AT_FDCWD: u64 = (-100_i64) as u64;
 pub const LINUX_AT_EMPTY_PATH: u64 = 0x1000;
+pub const LINUX_R_OK: u64 = 4;
+pub const LINUX_W_OK: u64 = 2;
+pub const LINUX_X_OK: u64 = 1;
 pub const LINUX_SEEK_SET: u64 = 0;
 pub const LINUX_SEEK_CUR: u64 = 1;
 pub const LINUX_SEEK_END: u64 = 2;
@@ -159,6 +164,7 @@ pub struct SyscallDispatcher {
     rootfs: Option<RootFs>,
     open_files: HashMap<i32, OpenDescription>,
     next_fd: i32,
+    cwd: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,6 +197,7 @@ impl SyscallDispatcher {
             rootfs: None,
             open_files: HashMap::new(),
             next_fd: 3,
+            cwd: "/".to_owned(),
         }
     }
 
@@ -209,6 +216,10 @@ impl SyscallDispatcher {
         &self.stderr
     }
 
+    pub fn cwd(&self) -> &str {
+        &self.cwd
+    }
+
     pub fn dispatch(
         &mut self,
         request: SyscallRequest,
@@ -225,6 +236,10 @@ impl SyscallDispatcher {
         });
 
         let outcome = match request.number {
+            17 => self.getcwd(request, memory)?,
+            48 => self.faccessat(request, memory)?,
+            49 => self.chdir(request, memory)?,
+            50 => self.fchdir(request),
             56 => self.openat(request, memory)?,
             57 => self.close(request),
             61 => self.getdents64(request, memory)?,
@@ -255,6 +270,145 @@ impl SyscallDispatcher {
         });
 
         Ok(outcome)
+    }
+
+    fn getcwd(
+        &self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let address = request.arg(0);
+        let size = usize::try_from(request.arg(1))
+            .map_err(|_| DispatchError::LengthTooLarge(request.arg(1)))?;
+        let mut bytes = self.cwd.as_bytes().to_vec();
+        bytes.push(0);
+        if bytes.len() > size {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_ERANGE,
+            });
+        }
+        if memory.write_bytes(address, &bytes).is_err() {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EFAULT,
+            });
+        }
+        Ok(DispatchOutcome::Returned {
+            value: address as i64,
+        })
+    }
+
+    fn faccessat(
+        &self,
+        request: SyscallRequest,
+        memory: &impl GuestMemory,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let dirfd = request.arg(0);
+        let pathname = request.arg(1);
+        let mode = request.arg(2);
+        let flags = request.arg(3);
+        if mode & !(LINUX_R_OK | LINUX_W_OK | LINUX_X_OK) != 0 || flags != 0 {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            });
+        }
+
+        let path = match read_guest_c_string(memory, pathname) {
+            Ok(path) => path,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        let path = match self.resolve_at_path(dirfd, &path) {
+            Ok(path) => path,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        let Some(rootfs) = &self.rootfs else {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_ENOENT,
+            });
+        };
+        let metadata = match rootfs.metadata(path) {
+            Ok(metadata) => metadata,
+            Err(errno) => {
+                return Ok(DispatchOutcome::Errno {
+                    errno: rootfs_errno(errno),
+                });
+            }
+        };
+
+        if mode & LINUX_W_OK != 0 {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EACCES,
+            });
+        }
+        if mode & LINUX_R_OK != 0
+            && metadata.kind == RootFsEntryKind::File
+            && metadata.mode & 0o444 == 0
+        {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EACCES,
+            });
+        }
+        if mode & LINUX_X_OK != 0
+            && metadata.kind == RootFsEntryKind::File
+            && metadata.mode & 0o111 == 0
+        {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EACCES,
+            });
+        }
+
+        Ok(DispatchOutcome::Returned { value: 0 })
+    }
+
+    fn chdir(
+        &mut self,
+        request: SyscallRequest,
+        memory: &impl GuestMemory,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let pathname = request.arg(0);
+        let path = match read_guest_c_string(memory, pathname) {
+            Ok(path) => path,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        let path = match self.resolve_at_path(LINUX_AT_FDCWD, &path) {
+            Ok(path) => path,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        let Some(rootfs) = &self.rootfs else {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_ENOENT,
+            });
+        };
+        let metadata = match rootfs.metadata(path) {
+            Ok(metadata) => metadata,
+            Err(errno) => {
+                return Ok(DispatchOutcome::Errno {
+                    errno: rootfs_errno(errno),
+                });
+            }
+        };
+        if metadata.kind != RootFsEntryKind::Directory {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_ENOTDIR,
+            });
+        }
+        self.cwd = display_rootfs_path(&metadata.path);
+        Ok(DispatchOutcome::Returned { value: 0 })
+    }
+
+    fn fchdir(&mut self, request: SyscallRequest) -> DispatchOutcome {
+        let fd = request.arg(0) as i32;
+        let Some(open) = self.open_files.get(&fd) else {
+            return DispatchOutcome::Errno { errno: LINUX_EBADF };
+        };
+        match open {
+            OpenDescription::Directory { metadata, .. } => {
+                self.cwd = display_rootfs_path(&metadata.path);
+                DispatchOutcome::Returned { value: 0 }
+            }
+            OpenDescription::File { .. } => DispatchOutcome::Errno {
+                errno: LINUX_ENOTDIR,
+            },
+        }
     }
 
     fn openat(
@@ -561,14 +715,15 @@ impl SyscallDispatcher {
     }
 
     fn resolve_at_path(&self, dirfd: u64, path: &str) -> Result<String, i32> {
-        if path.is_empty() || Path::new(path).is_absolute() || dirfd == LINUX_AT_FDCWD {
+        if path.is_empty() || Path::new(path).is_absolute() {
             return Ok(path.to_owned());
+        }
+        if dirfd == LINUX_AT_FDCWD {
+            return Ok(join_rootfs_path(&self.cwd, path));
         }
 
         match self.open_files.get(&(dirfd as i32)) {
-            Some(OpenDescription::Directory { path: dir, .. }) => {
-                Ok(format!("{}/{}", dir.trim_end_matches('/'), path))
-            }
+            Some(OpenDescription::Directory { path: dir, .. }) => Ok(join_rootfs_path(dir, path)),
             Some(OpenDescription::File { .. }) => Err(LINUX_ENOTDIR),
             None => Err(LINUX_EBADF),
         }
@@ -668,6 +823,22 @@ fn inode_for_path(path: &Path) -> u64 {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     hash.max(1)
+}
+
+fn join_rootfs_path(base: &str, path: &str) -> String {
+    if base == "/" {
+        format!("/{path}")
+    } else {
+        format!("{}/{path}", base.trim_end_matches('/'))
+    }
+}
+
+fn display_rootfs_path(path: &Path) -> String {
+    if path.as_os_str().is_empty() {
+        "/".to_owned()
+    } else {
+        format!("/{}", path.display())
+    }
 }
 
 fn rootfs_errno(error: RootFsError) -> i32 {

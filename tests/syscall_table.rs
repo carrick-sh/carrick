@@ -2,6 +2,10 @@ use carrick::syscall::{SupportLevel, lookup_aarch64};
 
 #[test]
 fn names_linux_aarch64_bringup_syscalls() {
+    let getcwd = lookup_aarch64(17).unwrap();
+    let faccessat = lookup_aarch64(48).unwrap();
+    let chdir = lookup_aarch64(49).unwrap();
+    let fchdir = lookup_aarch64(50).unwrap();
     let openat = lookup_aarch64(56).unwrap();
     let close = lookup_aarch64(57).unwrap();
     let getdents64 = lookup_aarch64(61).unwrap();
@@ -12,6 +16,14 @@ fn names_linux_aarch64_bringup_syscalls() {
     let fstat = lookup_aarch64(80).unwrap();
     let exit = lookup_aarch64(93).unwrap();
 
+    assert_eq!(getcwd.name, "getcwd");
+    assert_eq!(getcwd.support, SupportLevel::BringUp);
+    assert_eq!(faccessat.name, "faccessat");
+    assert_eq!(faccessat.support, SupportLevel::BringUp);
+    assert_eq!(chdir.name, "chdir");
+    assert_eq!(chdir.support, SupportLevel::BringUp);
+    assert_eq!(fchdir.name, "fchdir");
+    assert_eq!(fchdir.support, SupportLevel::BringUp);
     assert_eq!(openat.name, "openat");
     assert_eq!(openat.support, SupportLevel::BringUp);
     assert_eq!(close.name, "close");
