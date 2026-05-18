@@ -80,7 +80,7 @@ const AARCH64_SYSCALLS: &[Syscall] = &[
     syscall(35, "unlinkat", "fs", SupportLevel::BringUp),
     syscall(36, "symlinkat", "fs", SupportLevel::Planned),
     syscall(37, "linkat", "fs", SupportLevel::Planned),
-    syscall(38, "renameat", "fs", SupportLevel::Planned),
+    syscall(38, "renameat", "fs", SupportLevel::BringUp),
     syscall(39, "umount2", "fs", SupportLevel::Deferred),
     syscall(40, "mount", "fs", SupportLevel::Deferred),
     syscall(41, "pivot_root", "fs", SupportLevel::Deferred),

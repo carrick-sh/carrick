@@ -36,7 +36,7 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
   `faccessat2(2)`, `chdir(2)`, `fchdir(2)`, `eventfd2(2)`, `epoll_create1(2)`,
   `epoll_ctl(2)`, `epoll_pwait(2)`, `openat(2)`, `openat2(2)`, `dup(2)`,
   `dup3(2)`, `fcntl(2)`, `flock(2)`, `ftruncate(2)`, `ioctl(2)`, `mkdirat(2)`,
-  `unlinkat(2)`, `statfs(2)`, `fstatfs(2)`,
+  `unlinkat(2)`, `renameat(2)`, `statfs(2)`, `fstatfs(2)`,
   `getdents64(2)`,
   `lseek(2)`, `readlinkat(2)`,
   `pipe2(2)`, `read(2)`, `readv(2)`, `pread64(2)`, `preadv(2)`, `pwrite64(2)`,

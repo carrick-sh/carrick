@@ -3924,6 +3924,105 @@ fn madvise_accepts_common_advice_for_mapped_ranges() {
 }
 
 #[test]
+fn renameat_bootstrap_reports_erofs_for_known_sources_and_enoent_otherwise() {
+    let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
+        "etc/motd",
+        b"renameat fixture\n".as_slice(),
+    )]))])
+    .unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
+    memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();
+    memory.write_bytes(0x4020, b"/etc/motd.bak\0").unwrap();
+    memory.write_bytes(0x4040, b"/etc/missing\0").unwrap();
+    memory.write_bytes(0x4060, b"\0").unwrap();
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    38,
+                    SyscallArgs::from([
+                        (-100_i64) as u64,
+                        0x4000,
+                        (-100_i64) as u64,
+                        0x4020,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 30 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    38,
+                    SyscallArgs::from([
+                        (-100_i64) as u64,
+                        0x4040,
+                        (-100_i64) as u64,
+                        0x4020,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 2 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    38,
+                    SyscallArgs::from([
+                        (-100_i64) as u64,
+                        0x4060,
+                        (-100_i64) as u64,
+                        0x4020,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 2 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    38,
+                    SyscallArgs::from([
+                        (-100_i64) as u64,
+                        0x4000,
+                        (-100_i64) as u64,
+                        0x4060,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 2 }
+    );
+
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
 fn unlinkat_bootstrap_reports_directory_kind_and_read_only_rootfs() {
     const AT_REMOVEDIR: u64 = 0x200;
     let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar_with_links(

@@ -468,6 +468,7 @@ impl SyscallDispatcher {
             32 => self.flock(request),
             34 => self.mkdirat(request, memory)?,
             35 => self.unlinkat(request, memory)?,
+            38 => self.renameat(request, memory)?,
             43 => self.statfs(request, memory)?,
             44 => self.fstatfs(request, memory),
             46 => self.ftruncate(request),
@@ -3269,6 +3270,54 @@ impl SyscallDispatcher {
             }
         }
         Ok(DispatchOutcome::Errno { errno: LINUX_EROFS })
+    }
+
+    fn renameat(
+        &self,
+        request: SyscallRequest,
+        memory: &impl GuestMemory,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let olddirfd = request.arg(0);
+        let oldpath = request.arg(1);
+        let newdirfd = request.arg(2);
+        let newpath = request.arg(3);
+        let old = match read_guest_c_string(memory, oldpath) {
+            Ok(path) => path,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        let new_path = match read_guest_c_string(memory, newpath) {
+            Ok(path) => path,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        if old.is_empty() || new_path.is_empty() {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_ENOENT,
+            });
+        }
+        let resolved_old = match self.resolve_at_path(olddirfd, &old) {
+            Ok(path) => path,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        let resolved_new = match self.resolve_at_path(newdirfd, &new_path) {
+            Ok(path) => path,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        let _ = resolved_new;
+        let synthetic = synthetic_proc_file(&resolved_old, &self.executable_path).is_some();
+        if synthetic {
+            return Ok(DispatchOutcome::Errno { errno: LINUX_EROFS });
+        }
+        let Some(rootfs) = &self.rootfs else {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_ENOENT,
+            });
+        };
+        match rootfs.symlink_metadata(&resolved_old) {
+            Ok(_) => Ok(DispatchOutcome::Errno { errno: LINUX_EROFS }),
+            Err(errno) => Ok(DispatchOutcome::Errno {
+                errno: rootfs_errno(errno),
+            }),
+        }
     }
 
     fn unlinkat(
