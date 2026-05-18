@@ -74,6 +74,7 @@ build_fixture "sendfile_motd.rs" "carrick-linux-aarch64-sendfile-motd"
 build_fixture "preadv_motd.rs" "carrick-linux-aarch64-preadv-motd"
 build_fixture "splice_motd.rs" "carrick-linux-aarch64-splice-motd"
 build_fixture "sync_motd.rs" "carrick-linux-aarch64-sync-motd"
+build_fixture "pwrite64_motd.rs" "carrick-linux-aarch64-pwrite64-motd"
 
 cargo metadata \
   --manifest-path "$fixture_dir/Cargo.toml" \

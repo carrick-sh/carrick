@@ -36,6 +36,7 @@ fn builds_static_linux_aarch64_hello_fixture() {
     let preadv_artifact = "fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-preadv-motd";
     let splice_artifact = "fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-splice-motd";
     let sync_artifact = "fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-sync-motd";
+    let pwrite64_artifact = "fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-pwrite64-motd";
     let metadata = inspect_elf(hello_artifact).unwrap();
     assert_eq!(metadata.machine, Machine::Aarch64);
     let metadata = inspect_elf(cat_artifact).unwrap();
@@ -83,6 +84,8 @@ fn builds_static_linux_aarch64_hello_fixture() {
     let metadata = inspect_elf(splice_artifact).unwrap();
     assert_eq!(metadata.machine, Machine::Aarch64);
     let metadata = inspect_elf(sync_artifact).unwrap();
+    assert_eq!(metadata.machine, Machine::Aarch64);
+    let metadata = inspect_elf(pwrite64_artifact).unwrap();
     assert_eq!(metadata.machine, Machine::Aarch64);
 
     let plan = plan_elf_load(hello_artifact).unwrap();
@@ -270,6 +273,14 @@ fn builds_static_linux_aarch64_hello_fixture() {
     }));
 
     let plan = plan_elf_load(sync_artifact).unwrap();
+    assert!(!plan.segments.is_empty());
+    assert!(plan.segments.iter().any(|segment| {
+        segment.perms.execute
+            && plan.entry >= segment.virtual_address
+            && plan.entry < segment.virtual_address + segment.memory_size
+    }));
+
+    let plan = plan_elf_load(pwrite64_artifact).unwrap();
     assert!(!plan.segments.is_empty());
     assert!(plan.segments.iter().any(|segment| {
         segment.perms.execute

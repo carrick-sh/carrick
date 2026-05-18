@@ -3924,6 +3924,129 @@ fn madvise_accepts_common_advice_for_mapped_ranges() {
 }
 
 #[test]
+fn pwrite64_bootstrap_returns_espipe_for_streams_and_ebadf_for_rootfs_fds() {
+    let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
+        "etc/motd",
+        b"pwrite fixture\n".as_slice(),
+    )]))])
+    .unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
+    memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();
+    memory.write_bytes(0x4100, b"payload!").unwrap();
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(68, SyscallArgs::from([1, 0x4100, 8, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 29 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(68, SyscallArgs::from([2, 0x4100, 8, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 29 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(68, SyscallArgs::from([99, 0x4100, 8, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 9 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    68,
+                    SyscallArgs::from([1, 0x4100, 8, (-1_i64) as u64, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 22 }
+    );
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    56,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 3 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(68, SyscallArgs::from([3, 0x4100, 8, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 9 }
+    );
+
+    let pipe_pair_address = 0x4180;
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(59, SyscallArgs::from([pipe_pair_address, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let pair = read_fd_pair(&memory, pipe_pair_address);
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    68,
+                    SyscallArgs::from([pair.write_fd as u64, 0x4100, 8, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 29 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    68,
+                    SyscallArgs::from([pair.read_fd as u64, 0x4100, 8, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 29 }
+    );
+
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
 fn sync_and_fsync_family_return_zero_for_valid_fds_and_ebadf_otherwise() {
     let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
         "etc/motd",

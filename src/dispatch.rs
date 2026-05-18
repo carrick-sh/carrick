@@ -31,6 +31,7 @@ pub const LINUX_EACCES: i32 = 13;
 pub const LINUX_EFAULT: i32 = 14;
 pub const LINUX_EEXIST: i32 = 17;
 pub const LINUX_EPIPE: i32 = 32;
+pub const LINUX_ESPIPE: i32 = 29;
 pub const LINUX_ENOTDIR: i32 = 20;
 pub const LINUX_EISDIR: i32 = 21;
 pub const LINUX_EINVAL: i32 = 22;
@@ -476,6 +477,7 @@ impl SyscallDispatcher {
             65 => self.readv(request, memory)?,
             66 => self.writev(request, memory)?,
             67 => self.pread64(request, memory)?,
+            68 => self.pwrite64(request, memory)?,
             69 => self.preadv(request, memory)?,
             71 => self.sendfile(request, memory)?,
             72 => self.pselect6(request, memory)?,
@@ -2663,6 +2665,47 @@ impl SyscallDispatcher {
         Ok(DispatchOutcome::Returned {
             value: read_len as i64,
         })
+    }
+
+    fn pwrite64(
+        &mut self,
+        request: SyscallRequest,
+        memory: &impl GuestMemory,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let fd = request.arg(0) as i32;
+        let address = request.arg(1);
+        let length = usize::try_from(request.arg(2))
+            .map_err(|_| DispatchError::LengthTooLarge(request.arg(2)))?;
+        let offset = i64::from_ne_bytes(request.arg(3).to_ne_bytes());
+        if offset < 0 {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            });
+        }
+        if memory.read_bytes(address, length).is_err() {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EFAULT,
+            });
+        }
+        if is_stdio_fd(fd) {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_ESPIPE,
+            });
+        }
+        let Some(open_file) = self.open_files.get(&fd) else {
+            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+        };
+        let open = open_file.description.borrow();
+        let errno = match &*open {
+            OpenDescription::File { .. } | OpenDescription::SyntheticFile { .. } => LINUX_EBADF,
+            OpenDescription::Directory { .. } => LINUX_EISDIR,
+            OpenDescription::PipeReader { .. }
+            | OpenDescription::PipeWriter { .. }
+            | OpenDescription::EventFd { .. }
+            | OpenDescription::TimerFd { .. }
+            | OpenDescription::Epoll { .. } => LINUX_ESPIPE,
+        };
+        Ok(DispatchOutcome::Errno { errno })
     }
 
     fn sendfile(
