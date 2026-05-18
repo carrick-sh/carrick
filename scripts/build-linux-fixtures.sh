@@ -50,6 +50,37 @@ build_fixture() {
   file "$artifact"
 }
 
+build_pie_fixture() {
+  local source="$1"
+  local name="$2"
+  local object="$tmp_dir/$name.o"
+  local artifact_tmp="$tmp_dir/$name"
+  local artifact="$out_dir/$name"
+
+  rustc "$fixture_dir/src/$source" \
+    --target "$target" \
+    --edition 2024 \
+    -C panic=abort \
+    -C opt-level=z \
+    -C relocation-model=pic \
+    --emit=obj \
+    -o "$object"
+
+  # Produce a static-PIE ELF: ET_DYN with no PT_INTERP, so the loader sees
+  # the same shape as Alpine's busybox without needing a dynamic linker.
+  "$lld" -flavor gnu \
+    -static \
+    -pie \
+    --no-dynamic-linker \
+    --entry=_start \
+    --gc-sections \
+    -o "$artifact_tmp" \
+    "$object"
+
+  mv -f "$artifact_tmp" "$artifact"
+  file "$artifact"
+}
+
 build_fixture "main.rs" "carrick-linux-aarch64-hello"
 build_fixture "cat_motd.rs" "carrick-linux-aarch64-cat-motd"
 build_fixture "argv_echo.rs" "carrick-linux-aarch64-argv-echo"
@@ -87,6 +118,7 @@ build_fixture "truncate_motd.rs" "carrick-linux-aarch64-truncate-motd"
 build_fixture "symlinkat_motd.rs" "carrick-linux-aarch64-symlinkat-motd"
 build_fixture "linkat_motd.rs" "carrick-linux-aarch64-linkat-motd"
 build_fixture "errno_matrix.rs" "carrick-linux-aarch64-errno-matrix"
+build_pie_fixture "pie_hello.rs" "carrick-linux-aarch64-pie-hello"
 
 cargo metadata \
   --manifest-path "$fixture_dir/Cargo.toml" \

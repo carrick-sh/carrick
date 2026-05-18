@@ -1,4 +1,4 @@
-use carrick::elf::{Machine, inspect_elf, plan_elf_load};
+use carrick::elf::{ElfType, LINUX_PIE_DEFAULT_BASE, Machine, inspect_elf, plan_elf_load};
 
 #[test]
 fn builds_static_linux_aarch64_hello_fixture() {
@@ -414,6 +414,40 @@ fn builds_static_linux_aarch64_hello_fixture() {
 
     let plan = plan_elf_load(errno_matrix_artifact).unwrap();
     assert!(!plan.segments.is_empty());
+    assert!(plan.segments.iter().any(|segment| {
+        segment.perms.execute
+            && plan.entry >= segment.virtual_address
+            && plan.entry < segment.virtual_address + segment.memory_size
+    }));
+
+    // Existing ET_EXEC fixtures must keep load_bias == 0 and not be rebased.
+    let plan = plan_elf_load(hello_artifact).unwrap();
+    assert_eq!(plan.e_type, ElfType::Exec);
+    assert_eq!(plan.load_bias, 0);
+
+    let pie_artifact = "fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-pie-hello";
+    let metadata = inspect_elf(pie_artifact).unwrap();
+    assert_eq!(metadata.machine, Machine::Aarch64);
+    assert_eq!(metadata.e_type, ElfType::Dyn);
+    assert!(
+        metadata.interpreter.is_none(),
+        "static-PIE fixture must not carry a PT_INTERP"
+    );
+
+    let plan = plan_elf_load(pie_artifact).unwrap();
+    assert_eq!(plan.e_type, ElfType::Dyn);
+    assert_eq!(plan.load_bias, LINUX_PIE_DEFAULT_BASE);
+    assert!(!plan.segments.is_empty());
+    assert!(
+        plan.segments
+            .iter()
+            .all(|segment| segment.virtual_address >= LINUX_PIE_DEFAULT_BASE),
+        "every PIE segment vaddr must live above the load bias"
+    );
+    assert!(
+        plan.entry >= LINUX_PIE_DEFAULT_BASE,
+        "PIE entry point must be rebased above the load bias"
+    );
     assert!(plan.segments.iter().any(|segment| {
         segment.perms.execute
             && plan.entry >= segment.virtual_address
