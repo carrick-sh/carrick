@@ -2494,6 +2494,25 @@ fn set_tid_address_and_robust_list_are_bootstrap_successes() {
 }
 
 #[test]
+fn rseq_reports_clean_bootstrap_fallback() {
+    let mut memory = LinearMemory::new(0x4000, Vec::new());
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(293, SyscallArgs::from([0x4000, 32, 0, 0x5305_3053, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 38 }
+    );
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
 fn futex_wait_and_wake_cover_bootstrap_private_operations() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x80]);
     let mut reporter = CompatReporter::default();

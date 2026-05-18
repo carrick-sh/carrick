@@ -488,6 +488,7 @@ impl SyscallDispatcher {
             233 => self.madvise(request, memory),
             261 => self.prlimit64(request, memory),
             278 => self.getrandom(request, memory)?,
+            293 => self.rseq(),
             _ => {
                 reporter.record(CompatEvent::unhandled_syscall(
                     request.number,
@@ -2234,6 +2235,12 @@ impl SyscallDispatcher {
         Ok(DispatchOutcome::Returned {
             value: length as i64,
         })
+    }
+
+    fn rseq(&self) -> DispatchOutcome {
+        DispatchOutcome::Errno {
+            errno: LINUX_ENOSYS,
+        }
     }
 
     fn read(

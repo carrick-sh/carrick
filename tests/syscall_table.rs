@@ -117,6 +117,7 @@ fn names_linux_aarch64_bringup_syscalls() {
         (178, "gettid"),
         (261, "prlimit64"),
         (278, "getrandom"),
+        (293, "rseq"),
     ] {
         let syscall = lookup_aarch64(number).unwrap();
         assert_eq!(syscall.name, name);
