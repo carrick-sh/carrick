@@ -298,7 +298,19 @@ impl HvfTrapEngine {
         // the first fetch faults with FSC=Translation fault, level 3. With
         // .M=0 the guest sees stage-2 mappings directly. Bits C/I (caches) are
         // also cleared since we have no maintenance ops yet.
-        const SCTLR_EL1_BOOTSTRAP: u64 = 0;
+        // SCTLR_EL1 layout:
+        //   bit  0 = M  (MMU enable)        — 0: stage-1 MMU off, identity
+        //   bit  2 = C  (D-cache enable)    — 1: data accesses cacheable
+        //   bit 12 = I  (I-cache enable)    — 1: instruction fetches cacheable
+        //   bits 22..21 = SED/UCT etc. (default 0 is fine)
+        //   bits 28..23 = RES1 (reserved-as-one); HVF accepts 0 for them.
+        // We keep M=0 (no page tables) but set C=1 and I=1 so the memory we
+        // use is treated as cacheable Normal memory. ARMv8-A defines
+        // exclusive load/store on non-cacheable memory as UNPREDICTABLE,
+        // and Apple HVF appears to abort externally rather than treat it as
+        // implementation-defined; musl's `ldaxr` on first mutex acquire
+        // depends on this.
+        const SCTLR_EL1_BOOTSTRAP: u64 = (1 << 2) | (1 << 12);
         self.inner
             .vcpu
             .set_sys_reg(SysReg::SCTLR_EL1, SCTLR_EL1_BOOTSTRAP)
