@@ -53,6 +53,7 @@ build_fixture() {
 build_fixture "main.rs" "carrick-linux-aarch64-hello"
 build_fixture "cat_motd.rs" "carrick-linux-aarch64-cat-motd"
 build_fixture "argv_echo.rs" "carrick-linux-aarch64-argv-echo"
+build_fixture "timerfd_epoll.rs" "carrick-linux-aarch64-timerfd-epoll"
 
 cargo metadata \
   --manifest-path "$fixture_dir/Cargo.toml" \

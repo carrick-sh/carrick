@@ -18,7 +18,7 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
   runs `svc #0` exits through the host syscall dispatcher, and emits stdout,
   stderr, exit status, trap count, and compatibility report JSON. This is the
   tight bring-up path for the static Rust fixtures, including a rootfs-backed
-  `/etc/motd` reader and an argv reader.
+  `/etc/motd` reader, an argv reader, and a timerfd/epoll readiness probe.
 - `carrick pull <image>` uses `oci-distribution` to fetch image layers into a
   content-addressed store under `$CARRICK_HOME` or `~/.carrick`.
 - `carrick run <image> /path/to/elf [args ...]` loads a previously pulled image
@@ -79,8 +79,9 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
   buffers.
 - `scripts/build-linux-fixtures.sh` builds static Linux/aarch64 Rust fixtures
   whose guest behavior covers direct `write(2)`, initial-stack argv reads,
-  `openat(2)`, `read(2)`, `close(2)`, and `exit(2)`, giving the loader, HVF
-  loop, rootfs, and dispatcher a tight feedback loop.
+  `openat(2)`, `timerfd_create(2)`, `timerfd_settime(2)`, `epoll_pwait(2)`,
+  `read(2)`, `close(2)`, and `exit(2)`, giving the loader, HVF loop, rootfs,
+  and dispatcher a tight feedback loop.
 
 `shell` and `exec` are present as CLI surfaces, but they still stop before
 interactive process execution. `run` can map a dynamic ELF's rootfs-backed
