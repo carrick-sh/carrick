@@ -122,6 +122,7 @@ fn names_linux_aarch64_bringup_syscalls() {
         (261, "prlimit64"),
         (278, "getrandom"),
         (283, "membarrier"),
+        (291, "statx"),
         (293, "rseq"),
     ] {
         let syscall = lookup_aarch64(number).unwrap();

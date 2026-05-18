@@ -5,11 +5,11 @@ use carrick::dispatch::{
 };
 use carrick::elf::SegmentPerms;
 use carrick::linux_abi::{
-    LINUX_DIRENT64_HEADER_SIZE, LINUX_DT_REG, LINUX_S_IFDIR, LINUX_S_IFMT, LINUX_S_IFREG,
-    LinuxCapabilityData, LinuxCapabilityHeader, LinuxDirent64Header, LinuxEpollEvent,
-    LinuxEventfdValue, LinuxFdPair, LinuxIovec, LinuxItimerspec, LinuxPollFd, LinuxRlimit,
-    LinuxStat, LinuxStatfs, LinuxTimerfdExpirations, LinuxTimespec, LinuxTimeval, LinuxTimezone,
-    LinuxUtsname, LinuxWinsize,
+    LINUX_DIRENT64_HEADER_SIZE, LINUX_DT_REG, LINUX_S_IFDIR, LINUX_S_IFLNK, LINUX_S_IFMT,
+    LINUX_S_IFREG, LinuxCapabilityData, LinuxCapabilityHeader, LinuxDirent64Header,
+    LinuxEpollEvent, LinuxEventfdValue, LinuxFdPair, LinuxIovec, LinuxItimerspec, LinuxPollFd,
+    LinuxRlimit, LinuxStat, LinuxStatfs, LinuxStatx, LinuxTimerfdExpirations, LinuxTimespec,
+    LinuxTimeval, LinuxTimezone, LinuxUtsname, LinuxWinsize,
 };
 use carrick::memory::{AddressSpace, LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE};
 use carrick::rootfs::{LayerSource, RootFs};
@@ -57,6 +57,10 @@ const LINUX_TFD_NONBLOCK: u64 = LINUX_O_NONBLOCK;
 const LINUX_TIMER_ABSTIME: u64 = 0x1;
 const LINUX_CLOCK_MONOTONIC: u64 = 1;
 const LINUX_TIOCGWINSZ: u64 = 0x5413;
+const LINUX_AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+const LINUX_AT_EMPTY_PATH: u64 = 0x1000;
+const LINUX_STATX_BASIC_STATS: u32 = 0x7ff;
+const LINUX_STATX_RESERVED: u64 = 0x8000_0000;
 
 #[test]
 fn write_syscall_reads_guest_memory_and_writes_stdout() {
@@ -2224,6 +2228,187 @@ fn newfstatat_and_fstat_write_typed_linux_stat() {
 }
 
 #[test]
+fn statx_writes_basic_rootfs_fd_and_symlink_metadata() {
+    let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar_with_links(
+        [("etc/motd", b"rootfs says hello\n".as_slice())],
+        [("etc/motd-link", "motd")],
+    ))])
+    .unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x700]);
+    memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();
+    memory.write_bytes(0x4020, b"/etc/motd-link\0").unwrap();
+    memory.write_bytes(0x4040, b"\0").unwrap();
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    291,
+                    SyscallArgs::from([
+                        (-100_i64) as u64,
+                        0x4000,
+                        0,
+                        LINUX_STATX_BASIC_STATS as u64,
+                        0x4100,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let statx = read_statx(&memory, 0x4100);
+    let mask = statx.stx_mask;
+    let blksize = statx.stx_blksize;
+    let mode = statx.stx_mode;
+    let nlink = statx.stx_nlink;
+    let uid = statx.stx_uid;
+    let gid = statx.stx_gid;
+    let size = statx.stx_size;
+    let blocks = statx.stx_blocks;
+    assert_eq!(mask & LINUX_STATX_BASIC_STATS, LINUX_STATX_BASIC_STATS);
+    assert_eq!(blksize, 4096);
+    assert_eq!(mode as u32 & LINUX_S_IFMT, LINUX_S_IFREG);
+    assert_eq!(mode as u32 & 0o777, 0o644);
+    assert_eq!(nlink, 1);
+    assert_eq!(uid, 0);
+    assert_eq!(gid, 0);
+    assert_eq!(size, 18);
+    assert_eq!(blocks, 1);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    56,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 3 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    291,
+                    SyscallArgs::from([
+                        3,
+                        0x4040,
+                        LINUX_AT_EMPTY_PATH,
+                        LINUX_STATX_BASIC_STATS as u64,
+                        0x4200,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let statx = read_statx(&memory, 0x4200);
+    let mode = statx.stx_mode;
+    let size = statx.stx_size;
+    assert_eq!(mode as u32 & LINUX_S_IFMT, LINUX_S_IFREG);
+    assert_eq!(size, 18);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    291,
+                    SyscallArgs::from([
+                        (-100_i64) as u64,
+                        0x4020,
+                        LINUX_AT_SYMLINK_NOFOLLOW,
+                        LINUX_STATX_BASIC_STATS as u64,
+                        0x4300,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let statx = read_statx(&memory, 0x4300);
+    let mode = statx.stx_mode;
+    let size = statx.stx_size;
+    assert_eq!(mode as u32 & LINUX_S_IFMT, LINUX_S_IFLNK);
+    assert_eq!(size, 4);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    291,
+                    SyscallArgs::from([
+                        (-100_i64) as u64,
+                        0x4000,
+                        0,
+                        LINUX_STATX_RESERVED,
+                        0x4400,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 22 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    291,
+                    SyscallArgs::from([
+                        (-100_i64) as u64,
+                        0x4000,
+                        0x80,
+                        LINUX_STATX_BASIC_STATS as u64,
+                        0x4400,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 22 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    291,
+                    SyscallArgs::from([
+                        (-100_i64) as u64,
+                        0x4000,
+                        0,
+                        LINUX_STATX_BASIC_STATS as u64,
+                        0x5000,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 14 }
+    );
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
 fn getdents64_lists_rootfs_directory_entries() {
     let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
         "etc/motd",
@@ -3396,6 +3581,14 @@ fn read_stat(memory: &impl GuestMemory, address: u64) -> LinuxStat {
         .unwrap();
     let (stat, _) = LinuxStat::read_from_prefix(&bytes).unwrap();
     stat
+}
+
+fn read_statx(memory: &impl GuestMemory, address: u64) -> LinuxStatx {
+    let bytes = memory
+        .read_bytes(address, std::mem::size_of::<LinuxStatx>())
+        .unwrap();
+    let (statx, _) = LinuxStatx::read_from_prefix(&bytes).unwrap();
+    statx
 }
 
 fn read_statfs(memory: &impl GuestMemory, address: u64) -> LinuxStatfs {

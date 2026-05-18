@@ -170,6 +170,11 @@ impl RootFs {
         self.metadata_for_normalized(&path)
     }
 
+    pub fn symlink_metadata(&self, path: impl AsRef<Path>) -> Result<RootFsMetadata, RootFsError> {
+        let path = normalize_rootfs_path(path.as_ref())?;
+        self.metadata_for_normalized(&path)
+    }
+
     pub fn directory_entries(
         &self,
         path: impl AsRef<Path>,

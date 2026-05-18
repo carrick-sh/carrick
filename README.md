@@ -40,8 +40,9 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
   `pipe2(2)`, `read(2)`, `readv(2)`, `pread64(2)`, `preadv(2)`, `write(2)`,
   `writev(2)`, `sendfile(2)`, `pselect6(2)`, `ppoll(2)`, `timerfd_create(2)`,
   `timerfd_settime(2)`, `timerfd_gettime(2)`, `close(2)`, `newfstatat(2)`,
-  `fstat(2)`, `capget(2)`, `capset(2)`, `personality(2)`, `exit(2)`, `ENOENT`,
-  `EACCES`, `EFAULT`, `EPERM`, `EBADF`, and `ENOSYS` paths are covered by tests.
+  `fstat(2)`, `statx(2)`, `capget(2)`, `capset(2)`, `personality(2)`,
+  `exit(2)`, `ENOENT`, `EACCES`, `EFAULT`, `EPERM`, `EBADF`, and `ENOSYS` paths
+  are covered by tests.
 - Loaded ELFs include bootstrap heap and mmap arenas. The dispatcher can
   service `brk(2)`, file-backed and anonymous `mmap(2)`, bootstrap no-op
   `mprotect(2)`, `madvise(2)`, and `munmap(2)`, plus `exit_group(2)`, which
@@ -56,7 +57,7 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
   capability probes, scheduler affinity/yield and `getcpu(2)` probes,
   `prctl(2)` process controls, `personality(2)`, and minimal `rt_sigaction(2)`/
   `rt_sigprocmask(2)` stubs.
-- Linux ABI outputs for `stat`, `statfs`, `getdents64`, `iovec`,
+- Linux ABI outputs for `stat`, `statx`, `statfs`, `getdents64`, `iovec`,
   `eventfd` counters, `timerfd` timers and expiration counts, `epoll_event`,
   `pollfd`, capability headers/data, `pipe2` fd pairs, `winsize`, `timespec`,
   `timeval`, `timezone`, auxv entries, `utsname`, `rlimit`, and signal-action
@@ -93,9 +94,9 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
   `timerfd_settime(2)`, `epoll_pwait(2)`, `capget(2)`, `capset(2)`,
   `personality(2)`, `futex(2)`, `nanosleep(2)`, `clock_nanosleep(2)`,
   `membarrier(2)` queries, scheduler affinity/yield calls, `getcpu(2)`,
-  `prctl(2)`, `rseq(2)` fallback, `flock(2)`, `sendfile(2)`, `preadv(2)`,
-  `read(2)`, `close(2)`, and `exit(2)`, giving the loader, HVF loop, rootfs,
-  and dispatcher a tight feedback loop.
+  `prctl(2)`, `rseq(2)` fallback, `flock(2)`, `statx(2)`, `sendfile(2)`,
+  `preadv(2)`, `read(2)`, `close(2)`, and `exit(2)`, giving the loader, HVF
+  loop, rootfs, and dispatcher a tight feedback loop.
 
 `shell` and `exec` are present as CLI surfaces, but they still stop before
 interactive process execution. `run` can map a dynamic ELF's rootfs-backed

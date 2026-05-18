@@ -10,9 +10,9 @@ use crate::linux_abi::{
     LINUX_DIRENT64_HEADER_SIZE, LINUX_DT_DIR, LINUX_DT_LNK, LINUX_DT_REG, LINUX_PAGE_SIZE,
     LINUX_S_IFDIR, LINUX_S_IFLNK, LINUX_S_IFREG, LinuxCapabilityData, LinuxCapabilityHeader,
     LinuxDirent64Header, LinuxEpollEvent, LinuxEventfdValue, LinuxFdPair, LinuxIovec,
-    LinuxItimerspec, LinuxPollFd, LinuxRlimit, LinuxSigaction, LinuxStat, LinuxStatfs,
-    LinuxTimerfdExpirations, LinuxTimespec, LinuxTimeval, LinuxTimezone, LinuxUtsname,
-    LinuxWinsize,
+    LinuxItimerspec, LinuxPollFd, LinuxRlimit, LinuxSigaction, LinuxStat, LinuxStatfs, LinuxStatx,
+    LinuxStatxTimestamp, LinuxTimerfdExpirations, LinuxTimespec, LinuxTimeval, LinuxTimezone,
+    LinuxUtsname, LinuxWinsize,
 };
 use crate::memory::{LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE, LINUX_MMAP_SIZE};
 use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsError, RootFsMetadata};
@@ -40,7 +40,11 @@ pub const LINUX_ENAMETOOLONG: i32 = 36;
 pub const LINUX_ENOSYS: i32 = 38;
 pub const LINUX_ETIMEDOUT: i32 = 110;
 pub const LINUX_AT_FDCWD: u64 = (-100_i64) as u64;
+pub const LINUX_AT_SYMLINK_NOFOLLOW: u64 = 0x100;
 pub const LINUX_AT_EMPTY_PATH: u64 = 0x1000;
+pub const LINUX_AT_NO_AUTOMOUNT: u64 = 0x800;
+pub const LINUX_AT_STATX_FORCE_SYNC: u64 = 0x2000;
+pub const LINUX_AT_STATX_DONT_SYNC: u64 = 0x4000;
 pub const LINUX_R_OK: u64 = 4;
 pub const LINUX_W_OK: u64 = 2;
 pub const LINUX_X_OK: u64 = 1;
@@ -118,6 +122,8 @@ const LINUX_PR_GET_DUMPABLE: u64 = 3;
 const LINUX_PR_SET_DUMPABLE: u64 = 4;
 const LINUX_PR_SET_NAME: u64 = 15;
 const LINUX_PR_GET_NAME: u64 = 16;
+const LINUX_STATX_BASIC_STATS: u32 = 0x7ff;
+const LINUX_STATX_RESERVED: u64 = 0x8000_0000;
 const MAX_GUEST_PATH: usize = 4096;
 const LINUX_IOV_MAX: usize = 1024;
 
@@ -504,6 +510,7 @@ impl SyscallDispatcher {
             261 => self.prlimit64(request, memory),
             278 => self.getrandom(request, memory)?,
             283 => self.membarrier(request),
+            291 => self.statx(request, memory)?,
             293 => self.rseq(),
             _ => {
                 reporter.record(CompatEvent::unhandled_syscall(
@@ -2881,6 +2888,70 @@ impl SyscallDispatcher {
         Ok(write_stat(memory, statbuf, &metadata))
     }
 
+    fn statx(
+        &self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let dirfd = request.arg(0);
+        let pathname = request.arg(1);
+        let flags = request.arg(2);
+        let mask = request.arg(3);
+        let statxbuf = request.arg(4);
+
+        if !linux_statx_flags_are_supported(flags) || mask & LINUX_STATX_RESERVED != 0 {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            });
+        }
+
+        let path = match read_guest_c_string(memory, pathname) {
+            Ok(path) => path,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+
+        if path.is_empty() {
+            if flags & LINUX_AT_EMPTY_PATH == 0 {
+                return Ok(DispatchOutcome::Errno {
+                    errno: LINUX_ENOENT,
+                });
+            }
+            return Ok(self.write_fd_statx(dirfd as i32, statxbuf, memory));
+        }
+
+        let path = match self.resolve_at_path(dirfd, &path) {
+            Ok(path) => path,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        if let Some(contents) = synthetic_proc_file(&path, &self.executable_path) {
+            return Ok(write_synthetic_statx(
+                memory,
+                statxbuf,
+                &path,
+                contents.len(),
+            ));
+        }
+        let Some(rootfs) = &self.rootfs else {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_ENOENT,
+            });
+        };
+        let metadata = if flags & LINUX_AT_SYMLINK_NOFOLLOW != 0 {
+            rootfs.symlink_metadata(path)
+        } else {
+            rootfs.metadata(path)
+        };
+        let metadata = match metadata {
+            Ok(metadata) => metadata,
+            Err(errno) => {
+                return Ok(DispatchOutcome::Errno {
+                    errno: rootfs_errno(errno),
+                });
+            }
+        };
+        Ok(write_statx(memory, statxbuf, &metadata))
+    }
+
     fn fstat(&self, request: SyscallRequest, memory: &mut impl GuestMemory) -> DispatchOutcome {
         self.write_fd_stat(request.arg(0) as i32, request.arg(1), memory)
     }
@@ -2915,6 +2986,38 @@ impl SyscallDispatcher {
             }
         };
         write_stat(memory, statbuf, metadata)
+    }
+
+    fn write_fd_statx(
+        &self,
+        fd: i32,
+        statxbuf: u64,
+        memory: &mut impl GuestMemory,
+    ) -> DispatchOutcome {
+        let Some(open_file) = self.open_files.get(&fd) else {
+            return DispatchOutcome::Errno { errno: LINUX_EBADF };
+        };
+        let open = open_file.description.borrow();
+        let metadata = match &*open {
+            OpenDescription::File { metadata, .. }
+            | OpenDescription::Directory { metadata, .. } => metadata,
+            OpenDescription::SyntheticFile { path, contents, .. } => {
+                return write_synthetic_statx(memory, statxbuf, path, contents.len());
+            }
+            OpenDescription::EventFd { .. } => {
+                return write_synthetic_statx(memory, statxbuf, "anon_inode:[eventfd]", 0);
+            }
+            OpenDescription::TimerFd { .. } => {
+                return write_synthetic_statx(memory, statxbuf, "anon_inode:[timerfd]", 0);
+            }
+            OpenDescription::Epoll { .. } => {
+                return write_synthetic_statx(memory, statxbuf, "anon_inode:[eventpoll]", 0);
+            }
+            OpenDescription::PipeReader { .. } | OpenDescription::PipeWriter { .. } => {
+                return write_synthetic_statx(memory, statxbuf, "pipe:[carrick]", 0);
+            }
+        };
+        write_statx(memory, statxbuf, metadata)
     }
 
     fn exit(&self, request: SyscallRequest) -> DispatchOutcome {
@@ -3054,6 +3157,15 @@ fn linux_task_name_from_bytes(bytes: &[u8]) -> [u8; LINUX_TASK_COMM_LEN] {
     name
 }
 
+fn linux_statx_flags_are_supported(flags: u64) -> bool {
+    const SUPPORTED: u64 = LINUX_AT_SYMLINK_NOFOLLOW
+        | LINUX_AT_EMPTY_PATH
+        | LINUX_AT_NO_AUTOMOUNT
+        | LINUX_AT_STATX_FORCE_SYNC
+        | LINUX_AT_STATX_DONT_SYNC;
+    flags & !SUPPORTED == 0
+}
+
 fn realtime_duration() -> Duration {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3119,6 +3231,52 @@ fn write_stat(
     }
 }
 
+fn write_statx(
+    memory: &mut impl GuestMemory,
+    statxbuf: u64,
+    metadata: &RootFsMetadata,
+) -> DispatchOutcome {
+    let zero_time = LinuxStatxTimestamp::zero();
+    let statx = LinuxStatx {
+        stx_mask: LINUX_STATX_BASIC_STATS,
+        stx_blksize: LINUX_PAGE_SIZE as u32,
+        stx_attributes: 0,
+        stx_nlink: if metadata.kind == RootFsEntryKind::Directory {
+            2
+        } else {
+            1
+        },
+        stx_uid: 0,
+        stx_gid: 0,
+        stx_mode: linux_mode(metadata) as u16,
+        __spare0: [0; 1],
+        stx_ino: inode_for_path(&metadata.path),
+        stx_size: metadata.size as u64,
+        stx_blocks: blocks_512(metadata.size) as u64,
+        stx_attributes_mask: 0,
+        stx_atime: zero_time,
+        stx_btime: zero_time,
+        stx_ctime: zero_time,
+        stx_mtime: zero_time,
+        stx_rdev_major: 0,
+        stx_rdev_minor: 0,
+        stx_dev_major: 0,
+        stx_dev_minor: 1,
+        stx_mnt_id: 1,
+        stx_dio_mem_align: 0,
+        stx_dio_offset_align: 0,
+        stx_subvol: 0,
+        stx_atomic_write_unit_min: 0,
+        stx_atomic_write_unit_max: 0,
+        stx_atomic_write_segments_max: 0,
+        stx_dio_read_offset_align: 0,
+        stx_atomic_write_unit_max_opt: 0,
+        __spare2: [0; 1],
+        __spare3: [0; 8],
+    };
+    write_packed(memory, statxbuf, statx.as_bytes())
+}
+
 fn write_synthetic_stat(
     memory: &mut impl GuestMemory,
     statbuf: u64,
@@ -3148,6 +3306,21 @@ fn write_synthetic_stat(
         __unused5: 0,
     };
     write_packed(memory, statbuf, stat.as_bytes())
+}
+
+fn write_synthetic_statx(
+    memory: &mut impl GuestMemory,
+    statxbuf: u64,
+    path: &str,
+    size: usize,
+) -> DispatchOutcome {
+    let metadata = RootFsMetadata {
+        path: Path::new(path).to_path_buf(),
+        kind: RootFsEntryKind::File,
+        mode: 0o444,
+        size,
+    };
+    write_statx(memory, statxbuf, &metadata)
 }
 
 fn synthetic_proc_file(path: &str, executable_path: &str) -> Option<Vec<u8>> {
