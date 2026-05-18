@@ -32,6 +32,15 @@ pub const LINUX_EL0_TRAMPOLINE_SIZE: u64 = 0x4000;
 // base so EL0 `svc #0` synchronous traps land in the slot at offset 0x400.
 pub const LINUX_EL1_VECTORS_BASE: u64 = 0x20000;
 pub const LINUX_EL1_VECTORS_SIZE: u64 = 0x4000;
+// Stage-1 identity page table for EL0/EL1. Three 4 KiB pages:
+//   - one L0 table (2 valid entries, 512 GiB each)
+//   - two L1 tables (512 block descriptors × 1 GiB each)
+// Identity-maps 0..1 TiB into the same VA range with "Normal Inner
+// Shareable WB cacheable" memory (MAIR index 0). This is what
+// `ldaxr`/`stlxr` need to work — without it ARMv8 treats every data
+// access as Device-nGnRnE and exclusive ops are prohibited.
+pub const LINUX_PAGE_TABLES_BASE: u64 = 0x30000;
+pub const LINUX_PAGE_TABLES_SIZE: u64 = 0x4000; // 16 KiB allocated, three pages used
 // AArch64 `eret` opcode, little-endian.
 const AARCH64_ERET_OPCODE: u32 = 0xd69f_03e0;
 // AArch64 `clrex` opcode (clears the local Exclusives monitor).
@@ -67,6 +76,10 @@ pub struct AddressSpace {
     /// physical address. The matching memory region carries the AArch64
     /// vector page whose lower-EL synchronous slot re-traps to HVF via HVC.
     el1_vectors_base: Option<u64>,
+    /// When set, the HVF trap engine should program TTBR0_EL1 with this
+    /// guest physical address and turn on the stage-1 MMU. The matching
+    /// region carries the identity-mapping page tables.
+    stage1_page_tables_base: Option<u64>,
     #[serde(skip)]
     linux_auxv: Vec<LinuxAuxvEntry>,
 }
@@ -256,6 +269,7 @@ impl AddressSpace {
             initial_stack_pointer: None,
             el0_trampoline_entry: None,
             el1_vectors_base: None,
+            stage1_page_tables_base: None,
             linux_auxv: Vec::new(),
         })
     }
@@ -284,6 +298,13 @@ impl AddressSpace {
     /// physical address so EL0 SVC traps are routed through our vector page.
     pub fn el1_vectors_base(&self) -> Option<u64> {
         self.el1_vectors_base
+    }
+
+    /// When set, the trap engine should program TTBR0_EL1 with this guest
+    /// physical address and turn on the stage-1 MMU (SCTLR_EL1.M=1) so EL0
+    /// data accesses are tagged Normal cacheable (required for `ldaxr`).
+    pub fn stage1_page_tables_base(&self) -> Option<u64> {
+        self.stage1_page_tables_base
     }
 
     /// Append the EL0 entry trampoline region. The trampoline is a single
@@ -318,6 +339,7 @@ impl AddressSpace {
             initial_stack_pointer,
             linux_auxv,
             el1_vectors_base,
+            stage1_page_tables_base,
             ..
         } = self;
         let mut image =
@@ -326,6 +348,7 @@ impl AddressSpace {
         image.linux_auxv = linux_auxv;
         image.el0_trampoline_entry = Some(LINUX_EL0_TRAMPOLINE_BASE);
         image.el1_vectors_base = el1_vectors_base;
+        image.stage1_page_tables_base = stage1_page_tables_base;
         Ok(image)
     }
 
@@ -364,6 +387,7 @@ impl AddressSpace {
             initial_stack_pointer,
             linux_auxv,
             el0_trampoline_entry,
+            stage1_page_tables_base,
             ..
         } = self;
         let mut image =
@@ -372,6 +396,50 @@ impl AddressSpace {
         image.linux_auxv = linux_auxv;
         image.el0_trampoline_entry = el0_trampoline_entry;
         image.el1_vectors_base = Some(LINUX_EL1_VECTORS_BASE);
+        image.stage1_page_tables_base = stage1_page_tables_base;
+        Ok(image)
+    }
+
+    /// Append the stage-1 identity-mapping page tables region. The vCPU
+    /// uses these so EL0/EL1 data accesses are tagged as Normal cacheable
+    /// memory (required for `ldaxr`/`stlxr`).
+    pub fn with_stage1_page_tables(self) -> Result<Self, AddressSpaceError> {
+        let bytes = stage1_identity_page_tables();
+        let start = LINUX_PAGE_TABLES_BASE;
+        let end =
+            start
+                .checked_add(LINUX_PAGE_TABLES_SIZE)
+                .ok_or(AddressSpaceError::RegionOverflow {
+                    start,
+                    size: LINUX_PAGE_TABLES_SIZE,
+                })?;
+        let region = MemoryRegion {
+            start,
+            end,
+            perms: SegmentPerms {
+                read: true,
+                write: false,
+                execute: false,
+            },
+            bytes,
+        };
+
+        let AddressSpace {
+            entry,
+            regions,
+            initial_stack_pointer,
+            linux_auxv,
+            el0_trampoline_entry,
+            el1_vectors_base,
+            ..
+        } = self;
+        let mut image =
+            Self::from_regions(entry, regions.into_iter().chain([region]).collect())?;
+        image.initial_stack_pointer = initial_stack_pointer;
+        image.linux_auxv = linux_auxv;
+        image.el0_trampoline_entry = el0_trampoline_entry;
+        image.el1_vectors_base = el1_vectors_base;
+        image.stage1_page_tables_base = Some(LINUX_PAGE_TABLES_BASE);
         Ok(image)
     }
 
@@ -680,6 +748,74 @@ fn regions_from_load_plan(
 /// Build the byte image of the EL0 entry trampoline page. Offset 0 is a
 /// single `eret`; the rest of the page is filled with `nop` so a stray fetch
 /// beyond the entry instruction doesn't immediately fault.
+/// Build a stage-1 identity-mapping page table for the EL0/EL1 guest. Layout:
+///
+/// * Page 0 of the buffer (offset 0..0x1000) is the L0 table, with two
+///   valid table descriptors pointing at the two L1 sub-tables.
+/// * Page 1 (offset 0x1000..0x2000) is the first L1 table — block
+///   descriptors identity-mapping VA 0..0x80_0000_0000 (0..512 GiB) in
+///   1 GiB blocks.
+/// * Page 2 (offset 0x2000..0x3000) is the second L1 table — block
+///   descriptors identity-mapping VA 0x80_0000_0000..0x100_0000_0000
+///   (512 GiB..1 TiB) in 1 GiB blocks.
+///
+/// Total 12 KiB of page-table data, padded to LINUX_PAGE_TABLES_SIZE
+/// (16 KiB) so the allocation is a single HVF page.
+///
+/// Each L1 block descriptor uses AttrIndex 0 of MAIR_EL1 (which the trap
+/// engine writes as 0xFF — Normal Inner Shareable WB cacheable), AP=RW
+/// for EL0+EL1, SH=Inner Shareable, AF=1, nG=0, NS=0. The output PA
+/// equals the input VA: every byte in the 1 TiB identity window goes
+/// straight to the same IPA.
+pub fn stage1_identity_page_tables() -> Vec<u8> {
+    let size = LINUX_PAGE_TABLES_SIZE as usize;
+    let mut bytes = vec![0_u8; size];
+
+    let l1_a_pa = LINUX_PAGE_TABLES_BASE + 0x1000;
+    let l1_b_pa = LINUX_PAGE_TABLES_BASE + 0x2000;
+
+    // L0 table descriptors are *table* descriptors (bit 1 = 1) that point
+    // at the L1 sub-tables. Bits [47:12] hold the PA of the next-level
+    // table; lower bits are the type + flags. AP/AttrIndex are deferred
+    // to the L1 block descriptors.
+    let l0_table_entry =
+        |next_pa: u64| -> u64 { (next_pa & 0x0000_FFFF_FFFF_F000) | 0b11 };
+    let l0 = l0_table_entry(l1_a_pa);
+    bytes[0..8].copy_from_slice(&l0.to_le_bytes());
+    let l0_b = l0_table_entry(l1_b_pa);
+    bytes[8..16].copy_from_slice(&l0_b.to_le_bytes());
+
+    // L1 block descriptor flags (1 GiB block at this level):
+    //   bit  0 = 1  (valid)
+    //   bit  1 = 0  (block, not table)
+    //   bits 2..4 = AttrIndex (0)
+    //   bit  5 = NS (0)
+    //   bits 6..7 = AP  (01 = RW EL0+EL1)
+    //   bits 8..9 = SH  (11 = Inner Shareable)
+    //   bit 10 = AF (1)
+    //   bit 11 = nG (0)
+    //   bit 50 = PXN (0)
+    //   bit 51 = XN (0)
+    const L1_BLOCK_FLAGS: u64 = (1 << 10) | (0b11 << 8) | (0b01 << 6) | 0b01;
+
+    // First L1 table covers VA 0..512 GiB. Each entry is a 1 GiB block.
+    for index in 0..512_u64 {
+        let pa = index << 30; // 1 GiB
+        let descriptor = (pa & 0x0000_FFFF_C000_0000) | L1_BLOCK_FLAGS;
+        let off = 0x1000 + (index as usize) * 8;
+        bytes[off..off + 8].copy_from_slice(&descriptor.to_le_bytes());
+    }
+    // Second L1 table covers VA 512 GiB..1 TiB.
+    for index in 0..512_u64 {
+        let pa = (index + 512) << 30;
+        let descriptor = (pa & 0x0000_FFFF_C000_0000) | L1_BLOCK_FLAGS;
+        let off = 0x2000 + (index as usize) * 8;
+        bytes[off..off + 8].copy_from_slice(&descriptor.to_le_bytes());
+    }
+
+    bytes
+}
+
 pub fn el0_trampoline_bytes() -> Vec<u8> {
     let size = LINUX_EL0_TRAMPOLINE_SIZE as usize;
     let mut bytes = vec![0_u8; size];
