@@ -109,8 +109,22 @@ impl CompatReporter {
         let mut sys_read_unimplemented = HashMap::<String, u64>::new();
         let mut unsupported_signals = HashMap::<(i32, String), u64>::new();
 
+        let mut syscall_entries = 0_u64;
+        let mut syscall_returns_ok = 0_u64;
+        let mut syscall_returns_errno = 0_u64;
+
         for event in self.events {
             match event {
+                CompatEvent::SyscallEntry { .. } => {
+                    syscall_entries += 1;
+                }
+                CompatEvent::SyscallReturn { errno, .. } => {
+                    if errno.is_some() {
+                        syscall_returns_errno += 1;
+                    } else {
+                        syscall_returns_ok += 1;
+                    }
+                }
                 CompatEvent::UnhandledSyscall { number, name, .. } => {
                     *unhandled_syscalls.entry((number, name)).or_default() += 1;
                 }
@@ -134,29 +148,71 @@ impl CompatReporter {
                 CompatEvent::SignalUnsupported { signum, reason } => {
                     *unsupported_signals.entry((signum, reason)).or_default() += 1;
                 }
-                CompatEvent::SyscallEntry { .. } | CompatEvent::SyscallReturn { .. } => {}
             }
         }
 
+        let unhandled_syscall_invocations = unhandled_syscalls.values().sum::<u64>();
+        let unhandled_syscalls = sorted_syscalls(unhandled_syscalls);
+        let partial_syscall_invocations = partial_syscalls.values().sum::<u64>();
+        let partial_syscalls = sorted_partials(partial_syscalls);
+        let unhandled_ioctl_invocations = unhandled_ioctls.values().sum::<u64>();
+        let unhandled_ioctls = sorted_ioctls(unhandled_ioctls);
+        let proc_read_unimplemented = sorted_paths(proc_read_unimplemented);
+        let sys_read_unimplemented = sorted_paths(sys_read_unimplemented);
+        let unsupported_signals = sorted_signals(unsupported_signals);
+
+        let summary = CompatSummary {
+            syscall_invocations: syscall_entries,
+            syscall_returns_ok,
+            syscall_returns_errno,
+            distinct_unhandled_syscalls: unhandled_syscalls.len() as u64,
+            unhandled_syscall_invocations,
+            distinct_partial_syscalls: partial_syscalls.len() as u64,
+            partial_syscall_invocations,
+            distinct_unhandled_ioctls: unhandled_ioctls.len() as u64,
+            unhandled_ioctl_invocations,
+            distinct_proc_read_unimplemented: proc_read_unimplemented.len() as u64,
+            distinct_sys_read_unimplemented: sys_read_unimplemented.len() as u64,
+            distinct_unsupported_signals: unsupported_signals.len() as u64,
+        };
+
         CompatReport {
-            unhandled_syscalls: sorted_syscalls(unhandled_syscalls),
-            partial_syscalls: sorted_partials(partial_syscalls),
-            unhandled_ioctls: sorted_ioctls(unhandled_ioctls),
-            proc_read_unimplemented: sorted_paths(proc_read_unimplemented),
-            sys_read_unimplemented: sorted_paths(sys_read_unimplemented),
-            unsupported_signals: sorted_signals(unsupported_signals),
+            summary,
+            unhandled_syscalls,
+            partial_syscalls,
+            unhandled_ioctls,
+            proc_read_unimplemented,
+            sys_read_unimplemented,
+            unsupported_signals,
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompatReport {
+    pub summary: CompatSummary,
     pub unhandled_syscalls: Vec<SyscallCount>,
     pub partial_syscalls: Vec<PartialSyscallCount>,
     pub unhandled_ioctls: Vec<IoctlCount>,
     pub proc_read_unimplemented: Vec<PathCount>,
     pub sys_read_unimplemented: Vec<PathCount>,
     pub unsupported_signals: Vec<SignalCount>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompatSummary {
+    pub syscall_invocations: u64,
+    pub syscall_returns_ok: u64,
+    pub syscall_returns_errno: u64,
+    pub distinct_unhandled_syscalls: u64,
+    pub unhandled_syscall_invocations: u64,
+    pub distinct_partial_syscalls: u64,
+    pub partial_syscall_invocations: u64,
+    pub distinct_unhandled_ioctls: u64,
+    pub unhandled_ioctl_invocations: u64,
+    pub distinct_proc_read_unimplemented: u64,
+    pub distinct_sys_read_unimplemented: u64,
+    pub distinct_unsupported_signals: u64,
 }
 
 impl CompatReport {
@@ -169,7 +225,37 @@ impl CompatReport {
 
     fn render_text(&self) -> String {
         let mut out = String::new();
-        out.push_str("Carrick compatibility report\n");
+        out.push_str("Carrick compatibility report\n\n");
+        out.push_str("Summary:\n");
+        let s = &self.summary;
+        out.push_str(&format!(
+            "  syscalls observed: {} (returned ok: {}, errno: {})\n",
+            s.syscall_invocations, s.syscall_returns_ok, s.syscall_returns_errno,
+        ));
+        out.push_str(&format!(
+            "  unhandled syscalls: {} distinct, {} invocations\n",
+            s.distinct_unhandled_syscalls, s.unhandled_syscall_invocations,
+        ));
+        out.push_str(&format!(
+            "  partial syscalls: {} distinct, {} invocations\n",
+            s.distinct_partial_syscalls, s.partial_syscall_invocations,
+        ));
+        out.push_str(&format!(
+            "  unhandled ioctls: {} distinct, {} invocations\n",
+            s.distinct_unhandled_ioctls, s.unhandled_ioctl_invocations,
+        ));
+        out.push_str(&format!(
+            "  unimplemented /proc reads: {} distinct paths\n",
+            s.distinct_proc_read_unimplemented,
+        ));
+        out.push_str(&format!(
+            "  unimplemented /sys reads: {} distinct paths\n",
+            s.distinct_sys_read_unimplemented,
+        ));
+        out.push_str(&format!(
+            "  unsupported signals: {} distinct\n",
+            s.distinct_unsupported_signals,
+        ));
         render_section(&mut out, "Unhandled syscalls", &self.unhandled_syscalls);
         render_section(&mut out, "Partial syscalls", &self.partial_syscalls);
         render_section(&mut out, "Unhandled ioctls", &self.unhandled_ioctls);

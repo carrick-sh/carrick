@@ -2,3 +2,4 @@
 /.carrick/
 /.serena/
 /fixtures/*/target/
+.claude/
