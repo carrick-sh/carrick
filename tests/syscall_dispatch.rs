@@ -5301,6 +5301,134 @@ fn mmap_maps_file_bytes_into_guest_memory_arena() {
 }
 
 #[test]
+fn mm_lock_msync_mincore_stubs_validate_args_and_succeed() {
+    const MS_SYNC: u64 = 0x04;
+    const MS_ASYNC: u64 = 0x01;
+    const MCL_CURRENT: u64 = 0x01;
+    let mut memory = AddressSpace::from_segments(
+        0,
+        [(LINUX_MMAP_BASE, rwx_perms(), b"".to_vec(), 0x4000)],
+    )
+    .unwrap();
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    227,
+                    SyscallArgs::from([LINUX_MMAP_BASE, 0x1000, MS_SYNC, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    227,
+                    SyscallArgs::from([LINUX_MMAP_BASE, 0x1000, MS_SYNC | MS_ASYNC, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 22 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    227,
+                    SyscallArgs::from([0xdead_0000, 0x1000, MS_SYNC, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 12 }
+    );
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    228,
+                    SyscallArgs::from([LINUX_MMAP_BASE, 0x1000, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(229, SyscallArgs::from([LINUX_MMAP_BASE, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(230, SyscallArgs::from([MCL_CURRENT, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(230, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 22 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(231, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    let vec_addr = LINUX_MMAP_BASE + 0x2000;
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    232,
+                    SyscallArgs::from([LINUX_MMAP_BASE, 0x4000, vec_addr, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let pages_present = memory.read_bytes(vec_addr, 1).unwrap();
+    assert_eq!(pages_present[0], 1);
+
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
 fn mremap_bootstrap_accepts_shrinking_and_rejects_growth_with_enomem() {
     const MREMAP_MAYMOVE: u64 = 0x01;
     let mut memory = AddressSpace::from_segments(
