@@ -3924,6 +3924,158 @@ fn madvise_accepts_common_advice_for_mapped_ranges() {
 }
 
 #[test]
+fn utimensat_bootstrap_reports_read_only_rootfs_and_validates_timestamps() {
+    const UTIME_NOW: i64 = (1 << 30) - 1;
+    const UTIME_OMIT: i64 = (1 << 30) - 2;
+
+    let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
+        "etc/motd",
+        b"utimensat fixture\n".as_slice(),
+    )]))])
+    .unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
+    memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();
+    memory.write_bytes(0x4020, b"/etc/missing\0").unwrap();
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
+
+    let now_pair = 0x4100;
+    write_linux_timespec(&mut memory, now_pair, 0, UTIME_NOW);
+    write_linux_timespec(&mut memory, now_pair + 16, 0, UTIME_NOW);
+    let omit_pair = 0x4140;
+    write_linux_timespec(&mut memory, omit_pair, 0, UTIME_OMIT);
+    write_linux_timespec(&mut memory, omit_pair + 16, 0, 1_000_000_001);
+    let valid_pair = 0x4180;
+    write_linux_timespec(&mut memory, valid_pair, 123, 456);
+    write_linux_timespec(&mut memory, valid_pair + 16, 789, 12);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    88,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4000, valid_pair, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 30 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    88,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4000, now_pair, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 30 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    88,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 30 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    88,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4020, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 2 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    88,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4000, valid_pair, 0xdead, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 22 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    88,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4000, omit_pair, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 22 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(88, SyscallArgs::from([(-100_i64) as u64, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 14 }
+    );
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    56,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 3 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(88, SyscallArgs::from([3, 0, valid_pair, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 30 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(88, SyscallArgs::from([99, 0, valid_pair, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 9 }
+    );
+
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
 fn ftruncate_bootstrap_rejects_streams_and_read_only_rootfs_fds() {
     let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
         "etc/motd",
@@ -4551,6 +4703,11 @@ fn read_capability_data(
             (effective, permitted, inheritable)
         })
         .collect()
+}
+
+fn write_linux_timespec(memory: &mut impl GuestMemory, address: u64, tv_sec: i64, tv_nsec: i64) {
+    let timespec = LinuxTimespec::new(tv_sec, tv_nsec);
+    memory.write_bytes(address, timespec.as_bytes()).unwrap();
 }
 
 fn write_u64(memory: &mut impl GuestMemory, address: u64, value: u64) {

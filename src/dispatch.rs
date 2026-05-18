@@ -32,6 +32,7 @@ pub const LINUX_EFAULT: i32 = 14;
 pub const LINUX_EEXIST: i32 = 17;
 pub const LINUX_EPIPE: i32 = 32;
 pub const LINUX_ESPIPE: i32 = 29;
+pub const LINUX_EROFS: i32 = 30;
 pub const LINUX_ENOTDIR: i32 = 20;
 pub const LINUX_EISDIR: i32 = 21;
 pub const LINUX_EINVAL: i32 = 22;
@@ -47,6 +48,8 @@ pub const LINUX_AT_EMPTY_PATH: u64 = 0x1000;
 pub const LINUX_AT_NO_AUTOMOUNT: u64 = 0x800;
 pub const LINUX_AT_STATX_FORCE_SYNC: u64 = 0x2000;
 pub const LINUX_AT_STATX_DONT_SYNC: u64 = 0x4000;
+pub const LINUX_UTIME_NOW: i64 = (1 << 30) - 1;
+pub const LINUX_UTIME_OMIT: i64 = (1 << 30) - 2;
 pub const LINUX_R_OK: u64 = 4;
 pub const LINUX_W_OK: u64 = 2;
 pub const LINUX_X_OK: u64 = 1;
@@ -494,6 +497,7 @@ impl SyscallDispatcher {
             85 => self.timerfd_create(request),
             86 => self.timerfd_settime(request, memory),
             87 => self.timerfd_gettime(request, memory),
+            88 => self.utimensat(request, memory)?,
             90 => self.capget(request, memory),
             91 => self.capset(request, memory),
             92 => self.personality(request),
@@ -3221,6 +3225,82 @@ impl SyscallDispatcher {
         })
     }
 
+    fn utimensat(
+        &self,
+        request: SyscallRequest,
+        memory: &impl GuestMemory,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let dirfd = request.arg(0);
+        let pathname = request.arg(1);
+        let times = request.arg(2);
+        let flags = request.arg(3);
+        if flags & !LINUX_AT_SYMLINK_NOFOLLOW != 0 {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            });
+        }
+        if times != 0 {
+            let atime = match read_timespec(memory, times) {
+                Ok(timespec) => timespec,
+                Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            };
+            let mtime_address = times
+                .checked_add(core::mem::size_of::<LinuxTimespec>() as u64)
+                .ok_or(DispatchError::LengthTooLarge(times))?;
+            let mtime = match read_timespec(memory, mtime_address) {
+                Ok(timespec) => timespec,
+                Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            };
+            if !linux_utimensat_timespec_is_valid(atime)
+                || !linux_utimensat_timespec_is_valid(mtime)
+            {
+                return Ok(DispatchOutcome::Errno {
+                    errno: LINUX_EINVAL,
+                });
+            }
+        }
+
+        if pathname == 0 {
+            if dirfd == LINUX_AT_FDCWD {
+                return Ok(DispatchOutcome::Errno {
+                    errno: LINUX_EFAULT,
+                });
+            }
+            if !self.fd_is_valid(dirfd as i32) {
+                return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+            }
+            return Ok(DispatchOutcome::Errno { errno: LINUX_EROFS });
+        }
+
+        let path = match read_guest_c_string(memory, pathname) {
+            Ok(path) => path,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        if path.is_empty() {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_ENOENT,
+            });
+        }
+        let path = match self.resolve_at_path(dirfd, &path) {
+            Ok(path) => path,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        if synthetic_proc_file(&path, &self.executable_path).is_some() {
+            return Ok(DispatchOutcome::Errno { errno: LINUX_EROFS });
+        }
+        let Some(rootfs) = &self.rootfs else {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_ENOENT,
+            });
+        };
+        match rootfs.metadata(&path) {
+            Ok(_) => Ok(DispatchOutcome::Errno { errno: LINUX_EROFS }),
+            Err(errno) => Ok(DispatchOutcome::Errno {
+                errno: rootfs_errno(errno),
+            }),
+        }
+    }
+
     fn newfstatat(
         &self,
         request: SyscallRequest,
@@ -4309,6 +4389,14 @@ fn rootfs_errno(error: RootFsError) -> i32 {
         }
         RootFsError::Io(_) => LINUX_EINVAL,
     }
+}
+
+fn linux_utimensat_timespec_is_valid(timespec: LinuxTimespec) -> bool {
+    let nsec = timespec.tv_nsec;
+    if nsec == LINUX_UTIME_NOW || nsec == LINUX_UTIME_OMIT {
+        return true;
+    }
+    (0..1_000_000_000).contains(&nsec)
 }
 
 fn read_guest_c_string(memory: &impl GuestMemory, address: u64) -> Result<String, i32> {

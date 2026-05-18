@@ -130,7 +130,7 @@ const AARCH64_SYSCALLS: &[Syscall] = &[
     syscall(85, "timerfd_create", "time", SupportLevel::BringUp),
     syscall(86, "timerfd_settime", "time", SupportLevel::BringUp),
     syscall(87, "timerfd_gettime", "time", SupportLevel::BringUp),
-    syscall(88, "utimensat", "fs", SupportLevel::Planned),
+    syscall(88, "utimensat", "fs", SupportLevel::BringUp),
     syscall(89, "acct", "process", SupportLevel::Deferred),
     syscall(90, "capget", "process", SupportLevel::BringUp),
     syscall(91, "capset", "process", SupportLevel::BringUp),

@@ -42,7 +42,7 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
   `pwritev(2)`, `write(2)`,
   `writev(2)`, `sendfile(2)`, `splice(2)`, `sync(2)`, `fsync(2)`, `fdatasync(2)`,
   `pselect6(2)`, `ppoll(2)`, `timerfd_create(2)`,
-  `timerfd_settime(2)`, `timerfd_gettime(2)`, `close(2)`, `newfstatat(2)`,
+  `timerfd_settime(2)`, `timerfd_gettime(2)`, `utimensat(2)`, `close(2)`, `newfstatat(2)`,
   `fstat(2)`, `statx(2)`, `capget(2)`, `capset(2)`, `personality(2)`,
   `exit(2)`, `ENOENT`, `EACCES`, `EFAULT`, `EPERM`, `EBADF`, and `ENOSYS` paths
   are covered by tests.

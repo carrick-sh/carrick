@@ -101,6 +101,7 @@ fn names_linux_aarch64_bringup_syscalls() {
         (85, "timerfd_create"),
         (86, "timerfd_settime"),
         (87, "timerfd_gettime"),
+        (88, "utimensat"),
         (90, "capget"),
         (91, "capset"),
         (92, "personality"),
