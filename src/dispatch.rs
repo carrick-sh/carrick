@@ -4389,17 +4389,24 @@ fn write_synthetic_statx(
 
 fn synthetic_proc_file(path: &str, executable_path: &str) -> Option<Vec<u8>> {
     match path {
-        "/proc/self/maps" => Some(synthetic_proc_maps(executable_path).into_bytes()),
+        "/proc/cmdline" => Some(synthetic_proc_cmdline().to_vec()),
         "/proc/cpuinfo" => Some(synthetic_proc_cpuinfo().to_vec()),
-        "/proc/version" => Some(synthetic_proc_version().to_vec()),
-        "/proc/uptime" => Some(synthetic_proc_uptime().into_bytes()),
+        "/proc/diskstats" => Some(synthetic_proc_diskstats().to_vec()),
+        "/proc/filesystems" => Some(synthetic_proc_filesystems().to_vec()),
         "/proc/loadavg" => Some(synthetic_proc_loadavg().to_vec()),
         "/proc/meminfo" => Some(synthetic_proc_meminfo().to_vec()),
+        "/proc/mounts" => Some(synthetic_proc_mounts().to_vec()),
+        "/proc/partitions" => Some(synthetic_proc_partitions().to_vec()),
         "/proc/stat" => Some(synthetic_proc_stat().to_vec()),
-        "/proc/self/status" => Some(synthetic_proc_self_status(executable_path).into_bytes()),
+        "/proc/uptime" => Some(synthetic_proc_uptime().into_bytes()),
+        "/proc/version" => Some(synthetic_proc_version().to_vec()),
+        "/proc/self/auxv" => Some(synthetic_proc_self_auxv().to_vec()),
         "/proc/self/cmdline" => Some(synthetic_proc_self_cmdline(executable_path)),
         "/proc/self/comm" => Some(synthetic_proc_self_comm(executable_path).into_bytes()),
+        "/proc/self/limits" => Some(synthetic_proc_self_limits().to_vec()),
+        "/proc/self/maps" => Some(synthetic_proc_maps(executable_path).into_bytes()),
         "/proc/self/statm" => Some(synthetic_proc_self_statm().to_vec()),
+        "/proc/self/status" => Some(synthetic_proc_self_status(executable_path).into_bytes()),
         "/proc/sys/kernel/osrelease" => Some(synthetic_proc_osrelease().to_vec()),
         "/proc/sys/kernel/hostname" => Some(synthetic_proc_hostname().to_vec()),
         "/proc/sys/kernel/random/boot_id" => {
@@ -4566,6 +4573,54 @@ fn synthetic_proc_self_statm() -> &'static [u8] {
 
 fn synthetic_proc_boot_id() -> &'static [u8] {
     b"00000000-0000-4000-8000-000000000000\n"
+}
+
+fn synthetic_proc_cmdline() -> &'static [u8] {
+    b"BOOT_IMAGE=/boot/Image root=/dev/vda1 ro\n"
+}
+
+fn synthetic_proc_mounts() -> &'static [u8] {
+    b"overlay / overlay ro,relatime 0 0\n"
+}
+
+fn synthetic_proc_filesystems() -> &'static [u8] {
+    b"nodev\ttmpfs\n\
+nodev\tproc\n\
+nodev\tsysfs\n\
+nodev\toverlay\n"
+}
+
+fn synthetic_proc_partitions() -> &'static [u8] {
+    b"major minor  #blocks  name\n\n"
+}
+
+fn synthetic_proc_diskstats() -> &'static [u8] {
+    b""
+}
+
+fn synthetic_proc_self_auxv() -> &'static [u8] {
+    // A single AT_NULL entry (a_type=0, a_val=0), each 8 bytes on aarch64.
+    &[0u8; 16]
+}
+
+fn synthetic_proc_self_limits() -> &'static [u8] {
+    b"Limit                     Soft Limit           Hard Limit           Units\n\
+Max cpu time              unlimited            unlimited            seconds\n\
+Max file size             unlimited            unlimited            bytes\n\
+Max data size             unlimited            unlimited            bytes\n\
+Max stack size            8388608              unlimited            bytes\n\
+Max core file size        0                    unlimited            bytes\n\
+Max resident set          unlimited            unlimited            bytes\n\
+Max processes             unlimited            unlimited            processes\n\
+Max open files            1024                 4096                 files\n\
+Max locked memory         65536                65536                bytes\n\
+Max address space         unlimited            unlimited            bytes\n\
+Max file locks            unlimited            unlimited            locks\n\
+Max pending signals       unlimited            unlimited            signals\n\
+Max msgqueue size         819200               819200               bytes\n\
+Max nice priority         0                    0                    \n\
+Max realtime priority     0                    0                    \n\
+Max realtime timeout      unlimited            unlimited            us\n"
 }
 
 fn process_short_name(executable_path: &str) -> String {

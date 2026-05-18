@@ -86,12 +86,14 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
   `/proc/self/exe` is synthesized from the launched executable path.
 - Synthetic procfs support now serves `/proc/self/maps`, `/proc/cpuinfo`,
   `/proc/version`, `/proc/uptime`, `/proc/loadavg`, `/proc/meminfo`,
-  `/proc/stat`, `/proc/self/status`, `/proc/self/cmdline`, `/proc/self/comm`,
-  `/proc/self/statm`, `/proc/sys/kernel/osrelease`, `/proc/sys/kernel/hostname`,
-  and `/proc/sys/kernel/random/boot_id` through normal `openat(2)`/`read(2)`
-  descriptors, writes their `stat(2)` records with the packed Linux ABI struct
-  path, and records compatibility-report entries for proc/sys files that are
-  not synthesized yet.
+  `/proc/stat`, `/proc/cmdline`, `/proc/mounts`, `/proc/filesystems`,
+  `/proc/partitions`, `/proc/diskstats`, `/proc/self/status`,
+  `/proc/self/cmdline`, `/proc/self/comm`, `/proc/self/statm`,
+  `/proc/self/limits`, `/proc/self/auxv`, `/proc/sys/kernel/osrelease`,
+  `/proc/sys/kernel/hostname`, and `/proc/sys/kernel/random/boot_id` through
+  normal `openat(2)`/`read(2)` descriptors, writes their `stat(2)` records
+  with the packed Linux ABI struct path, and records compatibility-report
+  entries for proc/sys files that are not synthesized yet.
 - USDT support wires compatibility events to DTrace probes through the Apache-2.0
   `usdt` crate.
 - `carrick syscalls` exposes the initial Linux/aarch64 syscall table and support

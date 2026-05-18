@@ -2413,27 +2413,35 @@ fn openat_reads_synthetic_proc_maps_and_cpuinfo() {
 
 #[test]
 fn synthetic_proc_surface_serves_common_process_and_system_files() {
-    let paths = [
-        ("/proc/version", "Linux version"),
-        ("/proc/uptime", " "),
-        ("/proc/loadavg", "0.00"),
-        ("/proc/meminfo", "MemTotal:"),
-        ("/proc/stat", "cpu  "),
-        ("/proc/self/status", "Name:\texe"),
-        ("/proc/self/cmdline", "/proc/self/exe"),
-        ("/proc/self/comm", "exe"),
-        ("/proc/self/statm", "0 0"),
-        ("/proc/sys/kernel/osrelease", "carrick"),
-        ("/proc/sys/kernel/hostname", "carrick"),
-        ("/proc/sys/kernel/random/boot_id", "-4000-8000-"),
+    let paths: [(&str, &[u8]); 19] = [
+        ("/proc/cmdline", b"BOOT_IMAGE="),
+        ("/proc/diskstats", b""),
+        ("/proc/filesystems", b"overlay"),
+        ("/proc/loadavg", b"0.00"),
+        ("/proc/meminfo", b"MemTotal:"),
+        ("/proc/mounts", b"overlay / overlay"),
+        ("/proc/partitions", b"major minor"),
+        ("/proc/stat", b"cpu  "),
+        ("/proc/uptime", b" "),
+        ("/proc/version", b"Linux version"),
+        ("/proc/self/auxv", &[0u8; 16]),
+        ("/proc/self/cmdline", b"/proc/self/exe"),
+        ("/proc/self/comm", b"exe"),
+        ("/proc/self/limits", b"Max open files"),
+        ("/proc/self/statm", b"0 0"),
+        ("/proc/self/status", b"Name:\texe"),
+        ("/proc/sys/kernel/osrelease", b"carrick"),
+        ("/proc/sys/kernel/hostname", b"carrick"),
+        ("/proc/sys/kernel/random/boot_id", b"-4000-8000-"),
     ];
 
-    let mut memory = LinearMemory::new(0x4000, vec![0; 0x800]);
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
     let mut reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     let path_address = 0x4000_u64;
     let read_buffer = 0x4400_u64;
+    let read_len_max = 0xC00_u64;
     let mut next_fd = 3_i64;
     for (path, expected_substr) in paths {
         let path_bytes: Vec<u8> = path.bytes().chain([0]).collect();
@@ -2457,7 +2465,7 @@ fn synthetic_proc_surface_serves_common_process_and_system_files() {
             .dispatch(
                 SyscallRequest::new(
                     63,
-                    SyscallArgs::from([next_fd as u64, read_buffer, 0x400, 0, 0, 0]),
+                    SyscallArgs::from([next_fd as u64, read_buffer, read_len_max, 0, 0, 0]),
                 ),
                 &mut memory,
                 &mut reporter,
@@ -2467,11 +2475,22 @@ fn synthetic_proc_surface_serves_common_process_and_system_files() {
             panic!("expected read success for {path}, got {read:?}");
         };
         let bytes = memory.read_bytes(read_buffer, read_len as usize).unwrap();
-        let body = String::from_utf8_lossy(&bytes);
-        assert!(
-            body.contains(expected_substr),
-            "{path} did not contain {expected_substr:?}: {body:?}"
-        );
+        if expected_substr.is_empty() {
+            assert_eq!(
+                bytes.len(),
+                0,
+                "{path} expected empty file, got {} bytes",
+                bytes.len()
+            );
+        } else {
+            let found = bytes
+                .windows(expected_substr.len())
+                .any(|window| window == expected_substr);
+            assert!(
+                found,
+                "{path} did not contain {expected_substr:?}: {bytes:?}"
+            );
+        }
         next_fd += 1;
     }
 
@@ -2542,7 +2561,7 @@ fn synthetic_proc_files_write_regular_packed_stat_records() {
 
 #[test]
 fn missing_proc_file_records_compat_report_entry() {
-    let mut memory = LinearMemory::new(0x4000, b"/proc/self/limits\0".to_vec());
+    let mut memory = LinearMemory::new(0x4000, b"/proc/self/io\0".to_vec());
     let mut reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
@@ -2560,7 +2579,7 @@ fn missing_proc_file_records_compat_report_entry() {
     assert_eq!(outcome, DispatchOutcome::Errno { errno: 2 });
     let report = reporter.finish();
     assert!(report.unhandled_syscalls.is_empty());
-    assert_eq!(report.proc_read_unimplemented[0].path, "/proc/self/limits");
+    assert_eq!(report.proc_read_unimplemented[0].path, "/proc/self/io");
     assert_eq!(report.proc_read_unimplemented[0].count, 1);
 }
 
