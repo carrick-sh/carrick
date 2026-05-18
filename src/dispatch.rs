@@ -434,6 +434,7 @@ impl SyscallDispatcher {
             65 => self.readv(request, memory)?,
             66 => self.writev(request, memory)?,
             67 => self.pread64(request, memory)?,
+            71 => self.sendfile(request, memory)?,
             72 => self.pselect6(request, memory)?,
             73 => self.ppoll(request, memory)?,
             78 => self.readlinkat(request, memory)?,
@@ -2212,6 +2213,110 @@ impl SyscallDispatcher {
         })
     }
 
+    fn sendfile(
+        &mut self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let out_fd = request.arg(0) as i32;
+        let in_fd = request.arg(1) as i32;
+        let offset_address = request.arg(2);
+        let count = usize::try_from(request.arg(3))
+            .map_err(|_| DispatchError::LengthTooLarge(request.arg(3)))?;
+        if count == 0 {
+            return Ok(DispatchOutcome::Returned { value: 0 });
+        }
+
+        let mut offset = match self.sendfile_offset(in_fd, offset_address, memory)? {
+            Ok(offset) => offset,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        let bytes = match self.sendfile_bytes(in_fd, offset, count) {
+            Ok(bytes) => bytes,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        let outcome = self.write_output_fd(out_fd, &bytes);
+        let DispatchOutcome::Returned { value } = outcome else {
+            return Ok(outcome);
+        };
+        let written = usize::try_from(value).unwrap_or(0);
+        offset = offset.saturating_add(written);
+        if offset_address == 0 {
+            if let Some(open_file) = self.open_files.get(&in_fd) {
+                let mut open = open_file.description.borrow_mut();
+                match &mut *open {
+                    OpenDescription::File {
+                        offset: current, ..
+                    }
+                    | OpenDescription::SyntheticFile {
+                        offset: current, ..
+                    } => *current = offset,
+                    _ => {}
+                }
+            }
+        } else if memory
+            .write_bytes(offset_address, &(offset as u64).to_ne_bytes())
+            .is_err()
+        {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EFAULT,
+            });
+        }
+
+        Ok(DispatchOutcome::Returned { value })
+    }
+
+    fn sendfile_offset(
+        &self,
+        in_fd: i32,
+        offset_address: u64,
+        memory: &impl GuestMemory,
+    ) -> Result<Result<usize, i32>, DispatchError> {
+        if offset_address != 0 {
+            return match read_u64(memory, offset_address) {
+                Ok(offset) => {
+                    Ok(Ok(usize::try_from(offset)
+                        .map_err(|_| DispatchError::LengthTooLarge(offset))?))
+                }
+                Err(errno) => Ok(Err(errno)),
+            };
+        }
+        let Some(in_file) = self.open_files.get(&in_fd) else {
+            return Ok(Err(LINUX_EBADF));
+        };
+        let open = in_file.description.borrow();
+        match &*open {
+            OpenDescription::File { offset, .. }
+            | OpenDescription::SyntheticFile { offset, .. } => Ok(Ok(*offset)),
+            OpenDescription::Directory { .. }
+            | OpenDescription::EventFd { .. }
+            | OpenDescription::TimerFd { .. }
+            | OpenDescription::Epoll { .. }
+            | OpenDescription::PipeReader { .. }
+            | OpenDescription::PipeWriter { .. } => Ok(Err(LINUX_EINVAL)),
+        }
+    }
+
+    fn sendfile_bytes(&self, in_fd: i32, offset: usize, count: usize) -> Result<Vec<u8>, i32> {
+        let Some(in_file) = self.open_files.get(&in_fd) else {
+            return Err(LINUX_EBADF);
+        };
+        let open = in_file.description.borrow();
+        let contents = match &*open {
+            OpenDescription::File { contents, .. }
+            | OpenDescription::SyntheticFile { contents, .. } => contents,
+            OpenDescription::Directory { .. }
+            | OpenDescription::EventFd { .. }
+            | OpenDescription::TimerFd { .. }
+            | OpenDescription::Epoll { .. }
+            | OpenDescription::PipeReader { .. }
+            | OpenDescription::PipeWriter { .. } => return Err(LINUX_EINVAL),
+        };
+        let available = contents.get(offset..).unwrap_or_default();
+        let write_len = available.len().min(count);
+        Ok(available[..write_len].to_vec())
+    }
+
     fn write(
         &mut self,
         request: SyscallRequest,
@@ -2253,6 +2358,26 @@ impl SyscallDispatcher {
         Ok(DispatchOutcome::Returned {
             value: length as i64,
         })
+    }
+
+    fn write_output_fd(&mut self, fd: i32, bytes: &[u8]) -> DispatchOutcome {
+        match fd {
+            1 => self.stdout.extend_from_slice(bytes),
+            2 => self.stderr.extend_from_slice(bytes),
+            _ => {
+                let Some(open_file) = self.open_files.get(&fd) else {
+                    return DispatchOutcome::Errno { errno: LINUX_EBADF };
+                };
+                let mut open = open_file.description.borrow_mut();
+                let OpenDescription::PipeWriter { pipe, .. } = &mut *open else {
+                    return DispatchOutcome::Errno { errno: LINUX_EBADF };
+                };
+                return write_pipe(bytes, pipe);
+            }
+        }
+        DispatchOutcome::Returned {
+            value: bytes.len() as i64,
+        }
     }
 
     fn writev(
@@ -2966,6 +3091,13 @@ fn read_capability_data(
         .chunks_exact(size)
         .map(|chunk| LinuxCapabilityData::read_from_bytes(chunk).map_err(|_| LINUX_EFAULT))
         .collect()
+}
+
+fn read_u64(memory: &impl GuestMemory, address: u64) -> Result<u64, i32> {
+    let bytes = memory.read_bytes(address, 8).map_err(|_| LINUX_EFAULT)?;
+    Ok(u64::from_ne_bytes(
+        bytes.as_slice().try_into().map_err(|_| LINUX_EFAULT)?,
+    ))
 }
 
 fn capability_data_bytes(data: &[LinuxCapabilityData]) -> Vec<u8> {

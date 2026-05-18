@@ -81,6 +81,7 @@ fn names_linux_aarch64_bringup_syscalls() {
         (43, "statfs"),
         (44, "fstatfs"),
         (59, "pipe2"),
+        (71, "sendfile"),
         (72, "pselect6"),
         (73, "ppoll"),
         (85, "timerfd_create"),

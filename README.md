@@ -37,10 +37,10 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
   `epoll_pwait(2)`, `openat(2)`, `dup(2)`, `dup3(2)`, `fcntl(2)`, `ioctl(2)`,
   `statfs(2)`, `fstatfs(2)`, `getdents64(2)`, `lseek(2)`, `readlinkat(2)`,
   `pipe2(2)`, `read(2)`, `readv(2)`, `pread64(2)`, `write(2)`, `writev(2)`,
-  `pselect6(2)`, `ppoll(2)`, `timerfd_create(2)`, `timerfd_settime(2)`,
-  `timerfd_gettime(2)`, `close(2)`, `newfstatat(2)`, `fstat(2)`, `capget(2)`,
-  `capset(2)`, `personality(2)`, `exit(2)`, `ENOENT`, `EACCES`, `EFAULT`,
-  `EPERM`, `EBADF`, and `ENOSYS` paths are covered by tests.
+  `sendfile(2)`, `pselect6(2)`, `ppoll(2)`, `timerfd_create(2)`,
+  `timerfd_settime(2)`, `timerfd_gettime(2)`, `close(2)`, `newfstatat(2)`,
+  `fstat(2)`, `capget(2)`, `capset(2)`, `personality(2)`, `exit(2)`, `ENOENT`,
+  `EACCES`, `EFAULT`, `EPERM`, `EBADF`, and `ENOSYS` paths are covered by tests.
 - Loaded ELFs include bootstrap heap and mmap arenas. The dispatcher can
   service `brk(2)`, file-backed and anonymous `mmap(2)`, bootstrap no-op
   `mprotect(2)`/`munmap(2)`, and `exit_group(2)`, which gives `ld-linux` a
@@ -59,9 +59,9 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
 - The dispatcher now has a rootfs-backed file descriptor table for read-only
   file opens from composed OCI layers. Duplicated descriptors share open-file
   offsets while keeping descriptor flags such as `FD_CLOEXEC` per descriptor,
-  and the runtime loop can drive a scripted `cat`-style
-  `openat -> read -> write -> close -> exit` flow and a directory listing flow
-  using `getdents64`.
+  and the runtime loop can drive scripted `cat`-style
+  `openat -> read -> write -> close -> exit`, `openat -> sendfile -> exit`, and
+  directory listing flows using `getdents64`.
 - Rootfs symlink target text is preserved for Linux `readlinkat(2)`, and
   `/proc/self/exe` is synthesized from the launched executable path.
 - Synthetic procfs support now serves `/proc/self/maps` and `/proc/cpuinfo`
@@ -83,8 +83,8 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
   whose guest behavior covers direct `write(2)`, initial-stack argv reads,
   `openat(2)`, `eventfd2(2)`, `pselect6(2)`, `ppoll(2)`, `timerfd_create(2)`,
   `timerfd_settime(2)`, `epoll_pwait(2)`, `capget(2)`, `capset(2)`,
-  `personality(2)`, `read(2)`, `close(2)`, and `exit(2)`, giving the loader,
-  HVF loop, rootfs, and dispatcher a tight feedback loop.
+  `personality(2)`, `sendfile(2)`, `read(2)`, `close(2)`, and `exit(2)`, giving
+  the loader, HVF loop, rootfs, and dispatcher a tight feedback loop.
 
 `shell` and `exec` are present as CLI surfaces, but they still stop before
 interactive process execution. `run` can map a dynamic ELF's rootfs-backed
