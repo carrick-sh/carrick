@@ -102,6 +102,54 @@ impl LinuxIovec {
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
 )]
+pub struct LinuxTimespec {
+    pub tv_sec: i64,
+    pub tv_nsec: i64,
+}
+
+impl LinuxTimespec {
+    pub const fn new(tv_sec: i64, tv_nsec: i64) -> Self {
+        Self { tv_sec, tv_nsec }
+    }
+}
+
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct LinuxTimeval {
+    pub tv_sec: i64,
+    pub tv_usec: i64,
+}
+
+impl LinuxTimeval {
+    pub const fn new(tv_sec: i64, tv_usec: i64) -> Self {
+        Self { tv_sec, tv_usec }
+    }
+}
+
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct LinuxTimezone {
+    pub tz_minuteswest: i32,
+    pub tz_dsttime: i32,
+}
+
+impl LinuxTimezone {
+    pub const fn utc() -> Self {
+        Self {
+            tz_minuteswest: 0,
+            tz_dsttime: 0,
+        }
+    }
+}
+
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
 pub struct LinuxUtsname {
     pub sysname: [u8; LINUX_UTSNAME_FIELD_SIZE],
     pub nodename: [u8; LINUX_UTSNAME_FIELD_SIZE],

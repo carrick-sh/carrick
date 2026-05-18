@@ -72,9 +72,12 @@ fn names_linux_aarch64_bringup_syscalls() {
     for (number, name) in [
         (96, "set_tid_address"),
         (99, "set_robust_list"),
+        (113, "clock_gettime"),
+        (114, "clock_getres"),
         (134, "rt_sigaction"),
         (135, "rt_sigprocmask"),
         (160, "uname"),
+        (169, "gettimeofday"),
         (172, "getpid"),
         (173, "getppid"),
         (174, "getuid"),

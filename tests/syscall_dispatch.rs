@@ -6,7 +6,8 @@ use carrick::dispatch::{
 use carrick::elf::SegmentPerms;
 use carrick::linux_abi::{
     LINUX_DIRENT64_HEADER_SIZE, LINUX_DT_REG, LINUX_S_IFDIR, LINUX_S_IFMT, LINUX_S_IFREG,
-    LinuxDirent64Header, LinuxIovec, LinuxRlimit, LinuxStat, LinuxUtsname,
+    LinuxDirent64Header, LinuxIovec, LinuxRlimit, LinuxStat, LinuxTimespec, LinuxTimeval,
+    LinuxTimezone, LinuxUtsname,
 };
 use carrick::memory::{AddressSpace, LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE};
 use carrick::rootfs::{LayerSource, RootFs};
@@ -849,6 +850,84 @@ fn set_tid_address_and_robust_list_are_bootstrap_successes() {
 }
 
 #[test]
+fn clock_gettime_writes_packed_linux_timespec() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; core::mem::size_of::<LinuxTimespec>()]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(113, SyscallArgs::from([0, 0x4000, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let timespec = read_timespec(&memory, 0x4000);
+    let sec = timespec.tv_sec;
+    let nsec = timespec.tv_nsec;
+    assert!(sec > 0);
+    assert!((0..1_000_000_000).contains(&nsec));
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn clock_getres_writes_packed_linux_timespec() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; core::mem::size_of::<LinuxTimespec>()]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(114, SyscallArgs::from([1, 0x4000, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let timespec = read_timespec(&memory, 0x4000);
+    let sec = timespec.tv_sec;
+    assert_eq!(sec, 0);
+    let nsec = timespec.tv_nsec;
+    assert!(nsec > 0);
+    assert!(nsec < 1_000_000_000);
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn gettimeofday_writes_packed_linux_timeval_and_timezone() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x80]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(169, SyscallArgs::from([0x4000, 0x4020, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let timeval = read_timeval(&memory, 0x4000);
+    let sec = timeval.tv_sec;
+    let usec = timeval.tv_usec;
+    assert!(sec > 0);
+    assert!((0..1_000_000).contains(&usec));
+    let timezone = read_timezone(&memory, 0x4020);
+    let minuteswest = timezone.tz_minuteswest;
+    let dsttime = timezone.tz_dsttime;
+    assert_eq!(minuteswest, 0);
+    assert_eq!(dsttime, 0);
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
 fn uname_writes_packed_linux_utsname() {
     let mut memory = LinearMemory::new(0x4000, vec![0; core::mem::size_of::<LinuxUtsname>()]);
     let mut reporter = CompatReporter::default();
@@ -1078,6 +1157,30 @@ fn read_rlimit(memory: &impl GuestMemory, address: u64) -> LinuxRlimit {
         .unwrap();
     let (rlimit, _) = LinuxRlimit::read_from_prefix(&bytes).unwrap();
     rlimit
+}
+
+fn read_timespec(memory: &impl GuestMemory, address: u64) -> LinuxTimespec {
+    let bytes = memory
+        .read_bytes(address, std::mem::size_of::<LinuxTimespec>())
+        .unwrap();
+    let (timespec, _) = LinuxTimespec::read_from_prefix(&bytes).unwrap();
+    timespec
+}
+
+fn read_timeval(memory: &impl GuestMemory, address: u64) -> LinuxTimeval {
+    let bytes = memory
+        .read_bytes(address, std::mem::size_of::<LinuxTimeval>())
+        .unwrap();
+    let (timeval, _) = LinuxTimeval::read_from_prefix(&bytes).unwrap();
+    timeval
+}
+
+fn read_timezone(memory: &impl GuestMemory, address: u64) -> LinuxTimezone {
+    let bytes = memory
+        .read_bytes(address, std::mem::size_of::<LinuxTimezone>())
+        .unwrap();
+    let (timezone, _) = LinuxTimezone::read_from_prefix(&bytes).unwrap();
+    timezone
 }
 
 fn linux_c_string<const N: usize>(field: [u8; N]) -> String {

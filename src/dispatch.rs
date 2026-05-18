@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::compat::{CompatEvent, CompatReporter, SyscallArgs};
 use crate::linux_abi::{
     LINUX_DIRENT64_HEADER_SIZE, LINUX_DT_DIR, LINUX_DT_LNK, LINUX_DT_REG, LINUX_PAGE_SIZE,
     LINUX_S_IFDIR, LINUX_S_IFLNK, LINUX_S_IFREG, LinuxDirent64Header, LinuxIovec, LinuxRlimit,
-    LinuxSigaction, LinuxStat, LinuxUtsname,
+    LinuxSigaction, LinuxStat, LinuxTimespec, LinuxTimeval, LinuxTimezone, LinuxUtsname,
 };
 use crate::memory::{LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE, LINUX_MMAP_SIZE};
 use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsError, RootFsMetadata};
@@ -41,8 +43,17 @@ pub const LINUX_MAP_FIXED: u64 = 0x10;
 pub const LINUX_MAP_ANONYMOUS: u64 = 0x20;
 pub const LINUX_RLIM_INFINITY: u64 = u64::MAX;
 const LINUX_RT_SIGSET_SIZE: u64 = 8;
+const LINUX_CLOCK_REALTIME: u64 = 0;
+const LINUX_CLOCK_MONOTONIC: u64 = 1;
+const LINUX_CLOCK_MONOTONIC_RAW: u64 = 4;
+const LINUX_CLOCK_REALTIME_COARSE: u64 = 5;
+const LINUX_CLOCK_MONOTONIC_COARSE: u64 = 6;
+const LINUX_CLOCK_BOOTTIME: u64 = 7;
+const LINUX_CLOCK_RESOLUTION_NSEC: i64 = 1_000_000;
 const MAX_GUEST_PATH: usize = 4096;
 const LINUX_IOV_MAX: usize = 1024;
+
+static MONOTONIC_START: OnceLock<Instant> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct SyscallRequest {
@@ -282,9 +293,12 @@ impl SyscallDispatcher {
             94 => self.exit(request),
             96 => self.set_tid_address(),
             99 => self.set_robust_list(request),
+            113 => self.clock_gettime(request, memory),
+            114 => self.clock_getres(request, memory),
             134 => self.rt_sigaction(request, memory),
             135 => self.rt_sigprocmask(request, memory)?,
             160 => self.uname(request, memory),
+            169 => self.gettimeofday(request, memory),
             172 => self.getpid(),
             173 => DispatchOutcome::Returned { value: 1 },
             174..=177 => DispatchOutcome::Returned { value: 0 },
@@ -471,6 +485,44 @@ impl SyscallDispatcher {
         DispatchOutcome::Returned { value: 0 }
     }
 
+    fn clock_gettime(
+        &self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+    ) -> DispatchOutcome {
+        let clock_id = request.arg(0);
+        let address = request.arg(1);
+        let Some(duration) = linux_clock_duration(clock_id) else {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        };
+        let timespec = linux_timespec_from_duration(duration);
+        write_packed(memory, address, timespec.as_bytes())
+    }
+
+    fn clock_getres(
+        &self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+    ) -> DispatchOutcome {
+        let clock_id = request.arg(0);
+        let address = request.arg(1);
+        if linux_clock_duration(clock_id).is_none() {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+        if address == 0 {
+            return DispatchOutcome::Returned { value: 0 };
+        }
+        write_packed(
+            memory,
+            address,
+            LinuxTimespec::new(0, LINUX_CLOCK_RESOLUTION_NSEC).as_bytes(),
+        )
+    }
+
     fn rt_sigaction(
         &self,
         request: SyscallRequest,
@@ -525,6 +577,37 @@ impl SyscallDispatcher {
         if memory
             .write_bytes(address, LinuxUtsname::carrick_aarch64().as_bytes())
             .is_err()
+        {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EFAULT,
+            };
+        }
+        DispatchOutcome::Returned { value: 0 }
+    }
+
+    fn gettimeofday(
+        &self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+    ) -> DispatchOutcome {
+        let timeval = request.arg(0);
+        let timezone = request.arg(1);
+        let now = realtime_duration();
+        if timeval != 0 {
+            let timeval = linux_timeval_from_duration(now);
+            if memory
+                .write_bytes(request.arg(0), timeval.as_bytes())
+                .is_err()
+            {
+                return DispatchOutcome::Errno {
+                    errno: LINUX_EFAULT,
+                };
+            }
+        }
+        if timezone != 0
+            && memory
+                .write_bytes(timezone, LinuxTimezone::utc().as_bytes())
+                .is_err()
         {
             return DispatchOutcome::Errno {
                 errno: LINUX_EFAULT,
@@ -1200,6 +1283,51 @@ impl SyscallDispatcher {
             None => Err(LINUX_EBADF),
         }
     }
+}
+
+fn write_packed(memory: &mut impl GuestMemory, address: u64, bytes: &[u8]) -> DispatchOutcome {
+    if memory.write_bytes(address, bytes).is_err() {
+        DispatchOutcome::Errno {
+            errno: LINUX_EFAULT,
+        }
+    } else {
+        DispatchOutcome::Returned { value: 0 }
+    }
+}
+
+fn linux_clock_duration(clock_id: u64) -> Option<Duration> {
+    match clock_id {
+        LINUX_CLOCK_REALTIME | LINUX_CLOCK_REALTIME_COARSE => Some(realtime_duration()),
+        LINUX_CLOCK_MONOTONIC
+        | LINUX_CLOCK_MONOTONIC_RAW
+        | LINUX_CLOCK_MONOTONIC_COARSE
+        | LINUX_CLOCK_BOOTTIME => Some(monotonic_duration()),
+        _ => None,
+    }
+}
+
+fn realtime_duration() -> Duration {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+}
+
+fn monotonic_duration() -> Duration {
+    MONOTONIC_START.get_or_init(Instant::now).elapsed()
+}
+
+fn linux_timespec_from_duration(duration: Duration) -> LinuxTimespec {
+    LinuxTimespec::new(
+        duration.as_secs() as i64,
+        i64::from(duration.subsec_nanos()),
+    )
+}
+
+fn linux_timeval_from_duration(duration: Duration) -> LinuxTimeval {
+    LinuxTimeval::new(
+        duration.as_secs() as i64,
+        i64::from(duration.subsec_micros()),
+    )
 }
 
 fn write_stat(
