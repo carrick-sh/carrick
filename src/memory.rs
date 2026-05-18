@@ -12,13 +12,18 @@ use serde::Serialize;
 use thiserror::Error;
 use zerocopy::IntoBytes;
 
-pub const LINUX_INTERPRETER_BASE: u64 = 0x7000_0000_0000;
-pub const LINUX_STACK_TOP: u64 = 0x7fff_ffff_0000;
-pub const LINUX_STACK_SIZE: u64 = 1024 * 1024;
-pub const LINUX_HEAP_BASE: u64 = 0x5000_0000_0000;
+// Guest layout for the bootstrap process. HVF on Apple Silicon limits the
+// guest intermediate physical address (IPA) range; M-series machines we run
+// on advertise a max IPA of 40 bits (1 TiB). Keep every region below that
+// ceiling. The layout uses the high half of the 1 TiB window so PIE/static
+// executables (loaded at 4–64 GiB) never collide with heap/mmap/stack.
+pub const LINUX_HEAP_BASE: u64 = 0x40_0000_0000; // 256 GiB
 pub const LINUX_HEAP_SIZE: u64 = 4 * 1024 * 1024;
-pub const LINUX_MMAP_BASE: u64 = 0x6000_0000_0000;
+pub const LINUX_MMAP_BASE: u64 = 0x60_0000_0000; // 384 GiB
 pub const LINUX_MMAP_SIZE: u64 = 16 * 1024 * 1024;
+pub const LINUX_INTERPRETER_BASE: u64 = 0x80_0000_0000; // 512 GiB
+pub const LINUX_STACK_TOP: u64 = 0xff_ffff_0000; // just under 1 TiB
+pub const LINUX_STACK_SIZE: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AddressSpace {

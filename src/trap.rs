@@ -174,7 +174,10 @@ impl HvfTrapEngine {
     fn new_platform() -> Result<Self, TrapError> {
         use applevisor::prelude::*;
 
-        let vm = VirtualMachine::new().map_err(hvf_error)?;
+        let max_ipa = VirtualMachineConfig::get_max_ipa_size().map_err(hvf_error)?;
+        let mut config = VirtualMachineConfig::new();
+        config.set_ipa_size(max_ipa).map_err(hvf_error)?;
+        let vm = VirtualMachine::with_config(config).map_err(hvf_error)?;
         let vcpu = vm.vcpu_create().map_err(hvf_error)?;
         Ok(Self {
             inner: HvfInner {
@@ -225,7 +228,36 @@ impl HvfTrapEngine {
             .vcpu
             .set_reg(Reg::PC, plan.entry)
             .map_err(hvf_error)?;
+        // PSTATE for "AArch64 EL0t, all interrupts masked": M[3:0]=0b0000 (EL0
+        // using SP_EL0) plus DAIF=0xf. The guest won't actually receive any
+        // interrupts via HVF, but the masks are harmless and match the typical
+        // Linux process entry state.
+        // M[3:0]=0b0101 = EL1h (AArch64 EL1 using SP_EL1) + DAIF masked.
+        // HVF reset CPSR is also EL1h; we set it explicitly so a re-entry
+        // after a syscall trap doesn't depend on whatever HVF left in place.
+        const AARCH64_PSTATE_EL1H_DAIF_MASKED: u64 = 0x3c5;
+        self.inner
+            .vcpu
+            .set_reg(Reg::CPSR, AARCH64_PSTATE_EL1H_DAIF_MASKED)
+            .map_err(hvf_error)?;
+        // Disable stage-1 MMU translation for the EL0/EL1 guest. Without this,
+        // the vCPU's reset value of SCTLR_EL1 has .M=1, which makes every
+        // instruction fetch translate through page tables we never built, and
+        // the first fetch faults with FSC=Translation fault, level 3. With
+        // .M=0 the guest sees stage-2 mappings directly. Bits C/I (caches) are
+        // also cleared since we have no maintenance ops yet.
+        const SCTLR_EL1_BOOTSTRAP: u64 = 0;
+        self.inner
+            .vcpu
+            .set_sys_reg(SysReg::SCTLR_EL1, SCTLR_EL1_BOOTSTRAP)
+            .map_err(hvf_error)?;
         if let Some(stack_pointer) = plan.initial_stack_pointer {
+            // Running at EL1h, so seed both SP_EL1 (current SP) and SP_EL0
+            // (in case anything ever drops back to EL0).
+            self.inner
+                .vcpu
+                .set_sys_reg(SysReg::SP_EL1, stack_pointer)
+                .map_err(hvf_error)?;
             self.inner
                 .vcpu
                 .set_sys_reg(SysReg::SP_EL0, stack_pointer)
