@@ -34,6 +34,9 @@ const LINUX_EPOLLIN: u32 = 0x001;
 const LINUX_CAPABILITY_VERSION_3: u32 = 0x20080522;
 const LINUX_PERSONALITY_QUERY: u64 = 0xffff_ffff;
 const LINUX_ADDR_NO_RANDOMIZE: u64 = 0x0040_0000;
+const LINUX_FUTEX_WAIT: u64 = 0;
+const LINUX_FUTEX_WAKE: u64 = 1;
+const LINUX_FUTEX_PRIVATE_FLAG: u64 = 128;
 const LINUX_POLLIN: i16 = 0x0001;
 const LINUX_POLLOUT: i16 = 0x0004;
 const LINUX_POLLNVAL: i16 = 0x0020;
@@ -2410,6 +2413,100 @@ fn set_tid_address_and_robust_list_are_bootstrap_successes() {
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
+    );
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn futex_wait_and_wake_cover_bootstrap_private_operations() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x80]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    memory.write_bytes(0x4000, &7u32.to_ne_bytes()).unwrap();
+    memory
+        .write_bytes(0x4010, LinuxTimespec::new(0, 0).as_bytes())
+        .unwrap();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    98,
+                    SyscallArgs::from([
+                        0x4000,
+                        LINUX_FUTEX_WAKE | LINUX_FUTEX_PRIVATE_FLAG,
+                        1,
+                        0,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    98,
+                    SyscallArgs::from([
+                        0x4000,
+                        LINUX_FUTEX_WAIT | LINUX_FUTEX_PRIVATE_FLAG,
+                        8,
+                        0,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 11 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    98,
+                    SyscallArgs::from([
+                        0x4000,
+                        LINUX_FUTEX_WAIT | LINUX_FUTEX_PRIVATE_FLAG,
+                        7,
+                        0x4010,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 110 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    98,
+                    SyscallArgs::from([
+                        0x5000,
+                        LINUX_FUTEX_WAKE | LINUX_FUTEX_PRIVATE_FLAG,
+                        1,
+                        0,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 14 }
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }

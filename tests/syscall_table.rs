@@ -94,6 +94,7 @@ fn names_linux_aarch64_bringup_syscalls() {
         (91, "capset"),
         (92, "personality"),
         (96, "set_tid_address"),
+        (98, "futex"),
         (99, "set_robust_list"),
         (101, "nanosleep"),
         (113, "clock_gettime"),

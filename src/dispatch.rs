@@ -38,6 +38,7 @@ pub const LINUX_ENOTTY: i32 = 25;
 pub const LINUX_ERANGE: i32 = 34;
 pub const LINUX_ENAMETOOLONG: i32 = 36;
 pub const LINUX_ENOSYS: i32 = 38;
+pub const LINUX_ETIMEDOUT: i32 = 110;
 pub const LINUX_AT_FDCWD: u64 = (-100_i64) as u64;
 pub const LINUX_AT_EMPTY_PATH: u64 = 0x1000;
 pub const LINUX_R_OK: u64 = 4;
@@ -81,6 +82,11 @@ const LINUX_POLLNVAL: i16 = 0x0020;
 const LINUX_TFD_NONBLOCK: u64 = LINUX_O_NONBLOCK;
 const LINUX_TFD_CLOEXEC: u64 = LINUX_O_CLOEXEC;
 const LINUX_TIMER_ABSTIME: u64 = 0x1;
+const LINUX_FUTEX_WAIT: u64 = 0;
+const LINUX_FUTEX_WAKE: u64 = 1;
+const LINUX_FUTEX_CMD_MASK: u64 = 0x7f;
+const LINUX_FUTEX_PRIVATE_FLAG: u64 = 128;
+const LINUX_FUTEX_CLOCK_REALTIME: u64 = 256;
 const LINUX_TIOCGWINSZ: u64 = 0x5413;
 const LINUX_PIPE_BUF_SIZE: i64 = 65_536;
 const LINUX_RT_SIGSET_SIZE: u64 = 8;
@@ -450,6 +456,7 @@ impl SyscallDispatcher {
             93 => self.exit(request),
             94 => self.exit(request),
             96 => self.set_tid_address(),
+            98 => self.futex(request, memory),
             99 => self.set_robust_list(request),
             101 => self.nanosleep(request, memory),
             113 => self.clock_gettime(request, memory),
@@ -1451,6 +1458,62 @@ impl SyscallDispatcher {
             };
         }
         DispatchOutcome::Returned { value: 0 }
+    }
+
+    fn futex(&self, request: SyscallRequest, memory: &impl GuestMemory) -> DispatchOutcome {
+        let address = request.arg(0);
+        let operation = request.arg(1);
+        let value = request.arg(2) as u32;
+        let timeout_address = request.arg(3);
+        let command = operation & LINUX_FUTEX_CMD_MASK;
+        let flags = operation & !LINUX_FUTEX_CMD_MASK;
+        if flags & !(LINUX_FUTEX_PRIVATE_FLAG | LINUX_FUTEX_CLOCK_REALTIME) != 0 {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+        if flags & LINUX_FUTEX_CLOCK_REALTIME != 0 {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+        let word = match read_u32(memory, address) {
+            Ok(word) => word,
+            Err(errno) => return DispatchOutcome::Errno { errno },
+        };
+
+        match command {
+            LINUX_FUTEX_WAKE => DispatchOutcome::Returned { value: 0 },
+            LINUX_FUTEX_WAIT => {
+                if word != value {
+                    return DispatchOutcome::Errno {
+                        errno: LINUX_EAGAIN,
+                    };
+                }
+                if timeout_address == 0 {
+                    return DispatchOutcome::Errno {
+                        errno: LINUX_EAGAIN,
+                    };
+                }
+                let timespec = match read_timespec(memory, timeout_address) {
+                    Ok(timespec) => timespec,
+                    Err(errno) => return DispatchOutcome::Errno { errno },
+                };
+                let timeout = match duration_from_linux_timespec(timespec) {
+                    Ok(timeout) => timeout,
+                    Err(errno) => return DispatchOutcome::Errno { errno },
+                };
+                if let Some(timeout) = timeout {
+                    std::thread::sleep(timeout);
+                }
+                DispatchOutcome::Errno {
+                    errno: LINUX_ETIMEDOUT,
+                }
+            }
+            _ => DispatchOutcome::Errno {
+                errno: LINUX_ENOSYS,
+            },
+        }
     }
 
     fn nanosleep(&self, request: SyscallRequest, memory: &impl GuestMemory) -> DispatchOutcome {
@@ -3191,6 +3254,13 @@ fn read_capability_data(
 fn read_u64(memory: &impl GuestMemory, address: u64) -> Result<u64, i32> {
     let bytes = memory.read_bytes(address, 8).map_err(|_| LINUX_EFAULT)?;
     Ok(u64::from_ne_bytes(
+        bytes.as_slice().try_into().map_err(|_| LINUX_EFAULT)?,
+    ))
+}
+
+fn read_u32(memory: &impl GuestMemory, address: u64) -> Result<u32, i32> {
+    let bytes = memory.read_bytes(address, 4).map_err(|_| LINUX_EFAULT)?;
+    Ok(u32::from_ne_bytes(
         bytes.as_slice().try_into().map_err(|_| LINUX_EFAULT)?,
     ))
 }
