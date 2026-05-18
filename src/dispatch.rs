@@ -484,6 +484,9 @@ impl SyscallDispatcher {
             78 => self.readlinkat(request, memory)?,
             79 => self.newfstatat(request, memory)?,
             80 => self.fstat(request, memory),
+            81 => self.sync(),
+            82 => self.fsync(request),
+            83 => self.fdatasync(request),
             85 => self.timerfd_create(request),
             86 => self.timerfd_settime(request, memory),
             87 => self.timerfd_gettime(request, memory),
@@ -2897,6 +2900,26 @@ impl SyscallDispatcher {
         } else {
             None
         }
+    }
+
+    fn sync(&self) -> DispatchOutcome {
+        DispatchOutcome::Returned { value: 0 }
+    }
+
+    fn fsync(&self, request: SyscallRequest) -> DispatchOutcome {
+        let fd = request.arg(0) as i32;
+        if !self.fd_is_valid(fd) {
+            return DispatchOutcome::Errno { errno: LINUX_EBADF };
+        }
+        DispatchOutcome::Returned { value: 0 }
+    }
+
+    fn fdatasync(&self, request: SyscallRequest) -> DispatchOutcome {
+        let fd = request.arg(0) as i32;
+        if !self.fd_is_valid(fd) {
+            return DispatchOutcome::Errno { errno: LINUX_EBADF };
+        }
+        DispatchOutcome::Returned { value: 0 }
     }
 
     fn write(
