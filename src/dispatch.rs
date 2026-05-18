@@ -292,6 +292,23 @@ struct PipeState {
     writers: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PollInterest {
+    Read,
+    Write,
+    Except,
+}
+
+impl PollInterest {
+    fn poll_events(self) -> i16 {
+        match self {
+            Self::Read => LINUX_POLLIN,
+            Self::Write => LINUX_POLLOUT,
+            Self::Except => LINUX_POLLERR,
+        }
+    }
+}
+
 impl OpenDescription {
     fn status_flags(&self) -> u64 {
         match self {
@@ -408,6 +425,7 @@ impl SyscallDispatcher {
             65 => self.readv(request, memory)?,
             66 => self.writev(request, memory)?,
             67 => self.pread64(request, memory)?,
+            72 => self.pselect6(request, memory)?,
             73 => self.ppoll(request, memory)?,
             78 => self.readlinkat(request, memory)?,
             79 => self.newfstatat(request, memory)?,
@@ -943,6 +961,68 @@ impl SyscallDispatcher {
             }
             _ => 0,
         }
+    }
+
+    fn pselect6(
+        &self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let nfds = usize::try_from(request.arg(0))
+            .map_err(|_| DispatchError::LengthTooLarge(request.arg(0)))?;
+        let readfds = request.arg(1);
+        let writefds = request.arg(2);
+        let exceptfds = request.arg(3);
+        let read = match self.filter_fd_set(memory, readfds, nfds, PollInterest::Read)? {
+            Ok(count) => count,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        let write = match self.filter_fd_set(memory, writefds, nfds, PollInterest::Write)? {
+            Ok(count) => count,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        let except = match self.filter_fd_set(memory, exceptfds, nfds, PollInterest::Except)? {
+            Ok(count) => count,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        Ok(DispatchOutcome::Returned {
+            value: (read + write + except) as i64,
+        })
+    }
+
+    fn filter_fd_set(
+        &self,
+        memory: &mut impl GuestMemory,
+        address: u64,
+        nfds: usize,
+        interest: PollInterest,
+    ) -> Result<Result<usize, i32>, DispatchError> {
+        if address == 0 {
+            return Ok(Ok(0));
+        }
+        let mut fd_set = match read_fd_set(memory, address, nfds) {
+            Ok(fd_set) => fd_set,
+            Err(errno) => return Ok(Err(errno)),
+        };
+        let mut ready_count = 0usize;
+        for fd in 0..nfds {
+            if !fd_set_contains(&fd_set, fd) {
+                continue;
+            }
+            let fd = i32::try_from(fd).map_err(|_| DispatchError::LengthTooLarge(u64::MAX))?;
+            if !self.fd_is_valid(fd) {
+                return Ok(Err(LINUX_EBADF));
+            }
+            if self.poll_ready_events(fd, interest.poll_events()) & interest.poll_events() == 0 {
+                fd_set_clear(&mut fd_set, fd as usize);
+            } else {
+                ready_count += 1;
+            }
+        }
+        if memory.write_bytes(address, &fd_set).is_err() {
+            return Ok(Err(LINUX_EFAULT));
+        }
+        Ok(Ok(ready_count))
     }
 
     fn ppoll(
@@ -2780,6 +2860,27 @@ fn read_pollfd(memory: &impl GuestMemory, address: u64) -> Result<LinuxPollFd, i
         .read_bytes(address, core::mem::size_of::<LinuxPollFd>())
         .map_err(|_| LINUX_EFAULT)?;
     LinuxPollFd::read_from_bytes(&bytes).map_err(|_| LINUX_EFAULT)
+}
+
+fn read_fd_set(memory: &impl GuestMemory, address: u64, nfds: usize) -> Result<Vec<u8>, i32> {
+    let length = linux_fd_set_len(nfds).ok_or(LINUX_EINVAL)?;
+    memory.read_bytes(address, length).map_err(|_| LINUX_EFAULT)
+}
+
+fn fd_set_contains(fd_set: &[u8], fd: usize) -> bool {
+    fd_set
+        .get(fd / 8)
+        .is_some_and(|byte| byte & (1 << (fd % 8)) != 0)
+}
+
+fn fd_set_clear(fd_set: &mut [u8], fd: usize) {
+    if let Some(byte) = fd_set.get_mut(fd / 8) {
+        *byte &= !(1 << (fd % 8));
+    }
+}
+
+fn linux_fd_set_len(nfds: usize) -> Option<usize> {
+    nfds.checked_add(63)?.checked_div(64)?.checked_mul(8)
 }
 
 fn read_itimerspec(memory: &impl GuestMemory, address: u64) -> Result<LinuxItimerspec, i32> {

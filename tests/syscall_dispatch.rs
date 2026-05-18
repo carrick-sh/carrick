@@ -839,6 +839,93 @@ fn ppoll_reports_eventfd_pipe_and_invalid_fd_readiness() {
 }
 
 #[test]
+fn pselect6_reports_eventfd_pipe_and_write_readiness() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(19, SyscallArgs::from([1, LINUX_EFD_NONBLOCK, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 3 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    59,
+                    SyscallArgs::from([0x4000, LINUX_O_NONBLOCK, 0, 0, 0, 0])
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let pair = read_fd_pair(&memory, 0x4000);
+    memory.write_bytes(0x4080, b"x").unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    64,
+                    SyscallArgs::from([pair.write_fd as u64, 0x4080, 1, 0, 0, 0])
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 1 }
+    );
+
+    let nfds = (pair.write_fd + 1) as usize;
+    write_fd_set(&mut memory, 0x4100, nfds, [3, pair.read_fd]);
+    write_fd_set(&mut memory, 0x4200, nfds, [pair.write_fd]);
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    72,
+                    SyscallArgs::from([nfds as u64, 0x4100, 0x4200, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 3 }
+    );
+
+    assert_eq!(read_fd_set(&memory, 0x4100, nfds), vec![3, pair.read_fd]);
+    assert_eq!(read_fd_set(&memory, 0x4200, nfds), vec![pair.write_fd]);
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn pselect6_invalid_fd_returns_ebadf() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    write_fd_set(&mut memory, 0x4100, 100, [99]);
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(72, SyscallArgs::from([100, 0x4100, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 9 }
+    );
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
 fn syscall_request_can_be_built_from_aarch64_register_frame() {
     let frame = Aarch64SyscallFrame {
         x0: 1,
@@ -2456,6 +2543,32 @@ fn read_pollfds(memory: &impl GuestMemory, address: u64, count: usize) -> Vec<(i
             (fd, events, revents)
         })
         .collect()
+}
+
+fn write_fd_set<const N: usize>(
+    memory: &mut impl GuestMemory,
+    address: u64,
+    nfds: usize,
+    fds: [i32; N],
+) {
+    let mut bytes = vec![0; linux_fd_set_len(nfds)];
+    for fd in fds {
+        let fd = usize::try_from(fd).unwrap();
+        bytes[fd / 8] |= 1 << (fd % 8);
+    }
+    memory.write_bytes(address, &bytes).unwrap();
+}
+
+fn read_fd_set(memory: &impl GuestMemory, address: u64, nfds: usize) -> Vec<i32> {
+    let bytes = memory.read_bytes(address, linux_fd_set_len(nfds)).unwrap();
+    (0..nfds)
+        .filter(|fd| bytes[*fd / 8] & (1 << (*fd % 8)) != 0)
+        .map(|fd| i32::try_from(fd).unwrap())
+        .collect()
+}
+
+fn linux_fd_set_len(nfds: usize) -> usize {
+    nfds.div_ceil(64) * 8
 }
 
 fn rw_perms() -> SegmentPerms {

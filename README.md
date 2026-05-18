@@ -37,8 +37,9 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
   `epoll_pwait(2)`, `openat(2)`, `dup(2)`, `dup3(2)`, `fcntl(2)`, `ioctl(2)`,
   `statfs(2)`, `fstatfs(2)`, `getdents64(2)`, `lseek(2)`, `readlinkat(2)`,
   `pipe2(2)`, `read(2)`, `readv(2)`, `pread64(2)`, `write(2)`, `writev(2)`,
-  `ppoll(2)`, `timerfd_create(2)`, `timerfd_settime(2)`, `timerfd_gettime(2)`, `close(2)`,
-  `newfstatat(2)`, `fstat(2)`, `exit(2)`, `ENOENT`, `EACCES`, `EFAULT`,
+  `pselect6(2)`, `ppoll(2)`, `timerfd_create(2)`, `timerfd_settime(2)`,
+  `timerfd_gettime(2)`, `close(2)`, `newfstatat(2)`, `fstat(2)`, `exit(2)`,
+  `ENOENT`, `EACCES`, `EFAULT`,
   `EBADF`, and `ENOSYS` paths are covered by tests.
 - Loaded ELFs include bootstrap heap and mmap arenas. The dispatcher can
   service `brk(2)`, file-backed and anonymous `mmap(2)`, bootstrap no-op
@@ -79,7 +80,7 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
   buffers.
 - `scripts/build-linux-fixtures.sh` builds static Linux/aarch64 Rust fixtures
   whose guest behavior covers direct `write(2)`, initial-stack argv reads,
-  `openat(2)`, `eventfd2(2)`, `ppoll(2)`, `timerfd_create(2)`,
+  `openat(2)`, `eventfd2(2)`, `pselect6(2)`, `ppoll(2)`, `timerfd_create(2)`,
   `timerfd_settime(2)`, `epoll_pwait(2)`, `read(2)`, `close(2)`, and
   `exit(2)`, giving the loader, HVF loop, rootfs, and dispatcher a tight
   feedback loop.
