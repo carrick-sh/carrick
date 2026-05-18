@@ -25,6 +25,7 @@ pub const LINUX_EPERM: i32 = 1;
 pub const LINUX_ENOENT: i32 = 2;
 pub const LINUX_ESRCH: i32 = 3;
 pub const LINUX_EBADF: i32 = 9;
+pub const LINUX_ECHILD: i32 = 10;
 pub const LINUX_EAGAIN: i32 = 11;
 pub const LINUX_ENOMEM: i32 = 12;
 pub const LINUX_EACCES: i32 = 13;
@@ -147,6 +148,27 @@ const LINUX_PR_GET_DUMPABLE: u64 = 3;
 const LINUX_PR_SET_DUMPABLE: u64 = 4;
 const LINUX_PR_SET_NAME: u64 = 15;
 const LINUX_PR_GET_NAME: u64 = 16;
+const LINUX_P_ALL: u64 = 0;
+const LINUX_P_PID: u64 = 1;
+const LINUX_P_PGID: u64 = 2;
+const LINUX_P_PIDFD: u64 = 3;
+const LINUX_WNOHANG: u64 = 1;
+const LINUX_WUNTRACED: u64 = 2;
+const LINUX_WSTOPPED: u64 = 2;
+const LINUX_WEXITED: u64 = 4;
+const LINUX_WCONTINUED: u64 = 8;
+const LINUX_WNOWAIT: u64 = 0x0100_0000;
+const LINUX_WAITID_STATE_MASK: u64 = LINUX_WEXITED | LINUX_WSTOPPED | LINUX_WCONTINUED;
+const LINUX_WAITID_SUPPORTED_FLAGS: u64 = LINUX_WAITID_STATE_MASK | LINUX_WNOHANG | LINUX_WNOWAIT;
+const LINUX_WCLONE: u64 = 0x8000_0000;
+const LINUX_WALL: u64 = 0x4000_0000;
+const LINUX_WNOTHREAD: u64 = 0x2000_0000;
+const LINUX_WAIT4_SUPPORTED_FLAGS: u64 = LINUX_WNOHANG
+    | LINUX_WUNTRACED
+    | LINUX_WCONTINUED
+    | LINUX_WCLONE
+    | LINUX_WALL
+    | LINUX_WNOTHREAD;
 const LINUX_STATX_BASIC_STATS: u32 = 0x7ff;
 const LINUX_STATX_RESERVED: u64 = 0x8000_0000;
 const MAX_GUEST_PATH: usize = 4096;
@@ -533,6 +555,7 @@ impl SyscallDispatcher {
             92 => self.personality(request),
             93 => self.exit(request),
             94 => self.exit(request),
+            95 => self.waitid(request),
             96 => self.set_tid_address(),
             98 => self.futex(request, memory),
             99 => self.set_robust_list(request),
@@ -561,6 +584,7 @@ impl SyscallDispatcher {
             222 => self.mmap(request, memory)?,
             226 => self.mprotect(request, memory),
             233 => self.madvise(request, memory),
+            260 => self.wait4(request),
             261 => self.prlimit64(request, memory),
             278 => self.getrandom(request, memory)?,
             283 => self.membarrier(request),
@@ -2096,6 +2120,44 @@ impl SyscallDispatcher {
 
     fn setsid(&self) -> DispatchOutcome {
         DispatchOutcome::Returned { value: 1 }
+    }
+
+    fn waitid(&self, request: SyscallRequest) -> DispatchOutcome {
+        let idtype = request.arg(0);
+        let options = request.arg(3);
+        match idtype {
+            LINUX_P_ALL | LINUX_P_PID | LINUX_P_PGID | LINUX_P_PIDFD => {}
+            _ => {
+                return DispatchOutcome::Errno {
+                    errno: LINUX_EINVAL,
+                };
+            }
+        }
+        if options & !LINUX_WAITID_SUPPORTED_FLAGS != 0 {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+        if options & LINUX_WAITID_STATE_MASK == 0 {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+        DispatchOutcome::Errno {
+            errno: LINUX_ECHILD,
+        }
+    }
+
+    fn wait4(&self, request: SyscallRequest) -> DispatchOutcome {
+        let options = request.arg(2);
+        if options & !LINUX_WAIT4_SUPPORTED_FLAGS != 0 {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+        DispatchOutcome::Errno {
+            errno: LINUX_ECHILD,
+        }
     }
 
     fn openat(

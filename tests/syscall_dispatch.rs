@@ -5111,10 +5111,8 @@ fn planned_process_syscalls_surface_by_name_in_compat_report() {
     let mut dispatcher = SyscallDispatcher::new();
 
     let expected: &[(u64, &str)] = &[
-        (95, "waitid"),
         (220, "clone"),
         (221, "execve"),
-        (260, "wait4"),
         (281, "execveat"),
         (435, "clone3"),
     ];
@@ -5144,6 +5142,141 @@ fn planned_process_syscalls_surface_by_name_in_compat_report() {
         assert_eq!(entry.name, *name);
         assert_eq!(entry.count, 1);
     }
+}
+
+#[test]
+fn wait_family_bootstrap_returns_echild() {
+    const LINUX_P_ALL: u64 = 0;
+    const LINUX_WNOHANG: u64 = 1;
+    const LINUX_WEXITED: u64 = 4;
+    const LINUX_ECHILD: i32 = 10;
+    const LINUX_EINVAL: i32 = 22;
+
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x80]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    // waitid with P_ALL and WEXITED -> ECHILD (no children)
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    95,
+                    SyscallArgs::from([LINUX_P_ALL, 0, 0, LINUX_WEXITED, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno {
+            errno: LINUX_ECHILD,
+        }
+    );
+
+    // waitid with unknown idtype -> EINVAL
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(95, SyscallArgs::from([99, 0, 0, LINUX_WEXITED, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno {
+            errno: LINUX_EINVAL,
+        }
+    );
+
+    // waitid with no state-bits set -> EINVAL
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(95, SyscallArgs::from([LINUX_P_ALL, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno {
+            errno: LINUX_EINVAL,
+        }
+    );
+
+    // waitid with unknown flag bits -> EINVAL
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    95,
+                    SyscallArgs::from([
+                        LINUX_P_ALL,
+                        0,
+                        0,
+                        LINUX_WEXITED | 0xdead_0000,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno {
+            errno: LINUX_EINVAL,
+        }
+    );
+
+    // wait4(-1, NULL, 0, NULL) -> ECHILD
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    260,
+                    SyscallArgs::from([(-1_i64) as u64, 0, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno {
+            errno: LINUX_ECHILD,
+        }
+    );
+
+    // wait4 with WNOHANG and no children -> ECHILD
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    260,
+                    SyscallArgs::from([(-1_i64) as u64, 0, LINUX_WNOHANG, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno {
+            errno: LINUX_ECHILD,
+        }
+    );
+
+    // wait4 with unsupported flag bits -> EINVAL
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    260,
+                    SyscallArgs::from([(-1_i64) as u64, 0, 0xdead_0000, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno {
+            errno: LINUX_EINVAL,
+        }
+    );
+
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
 #[test]
