@@ -24,12 +24,17 @@ the Hypervisor.framework trap boundary that later runtime work will fill in.
 - `carrick compat-report -- <cmd>` emits the machine-parseable compatibility report
   shape that runtime hooks will populate.
 - `carrick dispatch-syscall <nr> --args ...` exercises the host-side syscall
-  dispatcher that the HVF trap loop will call; `openat(2)`, `read(2)`,
-  `close(2)`, `write(2)`, `exit(2)`, `ENOENT`, `EFAULT`, `EBADF`, and `ENOSYS`
-  paths are covered by tests.
+  dispatcher that the HVF trap loop will call; `openat(2)`, `getdents64(2)`,
+  `lseek(2)`, `read(2)`, `write(2)`, `close(2)`, `newfstatat(2)`, `fstat(2)`,
+  `exit(2)`, `ENOENT`, `EFAULT`, `EBADF`, and `ENOSYS` paths are covered by
+  tests.
+- Linux ABI outputs for `stat` and `getdents64` are represented by packed Rust
+  structs in `linux_abi`, with `zerocopy` used to expose initialized bytes for
+  guest-memory writes.
 - The dispatcher now has a rootfs-backed file descriptor table for read-only
   file opens from composed OCI layers, and the runtime loop can drive a scripted
-  `cat`-style `openat -> read -> write -> close -> exit` flow.
+  `cat`-style `openat -> read -> write -> close -> exit` flow and a directory
+  listing flow using `getdents64`.
 - USDT support wires compatibility events to DTrace probes through the Apache-2.0
   `usdt` crate.
 - `carrick syscalls` exposes the initial Linux/aarch64 syscall table and support

@@ -215,6 +215,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "usdt",
+ "zerocopy",
 ]
 
 [[package]]

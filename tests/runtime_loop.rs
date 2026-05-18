@@ -146,6 +146,76 @@ fn runtime_loop_can_cat_a_rootfs_file() {
     assert!(result.report.unhandled_syscalls.is_empty());
 }
 
+#[test]
+fn runtime_loop_can_list_a_rootfs_directory() {
+    let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
+        "etc/motd",
+        b"rootfs says hello\n".as_slice(),
+    )]))])
+    .unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
+    memory.write_bytes(0x4000, b"/etc\0").unwrap();
+    let mut trap = ScriptedTrap::new([
+        Aarch64SyscallFrame {
+            x0: (-100_i64) as u64,
+            x1: 0x4000,
+            x2: 0,
+            x3: 0,
+            x4: 0,
+            x5: 0,
+            x8: 56,
+        },
+        Aarch64SyscallFrame {
+            x0: 3,
+            x1: 0x4100,
+            x2: 0x100,
+            x3: 0,
+            x4: 0,
+            x5: 0,
+            x8: 61,
+        },
+        Aarch64SyscallFrame {
+            x0: 3,
+            x1: 0,
+            x2: 0,
+            x3: 0,
+            x4: 0,
+            x5: 0,
+            x8: 57,
+        },
+        Aarch64SyscallFrame {
+            x0: 0,
+            x1: 0,
+            x2: 0,
+            x3: 0,
+            x4: 0,
+            x5: 0,
+            x8: 93,
+        },
+    ]);
+
+    let result = run_syscall_loop_with_dispatcher(
+        &mut memory,
+        &mut trap,
+        SyscallDispatcher::with_rootfs(rootfs),
+        8,
+    )
+    .unwrap();
+
+    assert_eq!(result.exit_code, 0);
+    assert_eq!(result.traps, 4);
+    assert_eq!(trap.return_values[0], 3);
+    assert!(trap.return_values[1] > 0);
+    assert_eq!(trap.return_values[2], 0);
+    assert!(
+        memory
+            .read_bytes(0x4100, trap.return_values[1] as usize)
+            .unwrap()[..]
+            .windows(4)
+            .any(|window| window == b"motd")
+    );
+}
+
 struct ScriptedTrap {
     frames: VecDeque<Aarch64SyscallFrame>,
     return_values: Vec<i64>,

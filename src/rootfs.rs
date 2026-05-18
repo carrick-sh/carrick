@@ -45,6 +45,28 @@ pub struct RootFsSummary {
     pub symlink_count: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RootFsEntryKind {
+    File,
+    Directory,
+    Symlink,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RootFsMetadata {
+    pub path: PathBuf,
+    pub kind: RootFsEntryKind,
+    pub mode: u32,
+    pub size: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RootFsDirEntry {
+    pub name: String,
+    pub metadata: RootFsMetadata,
+}
+
 #[derive(Debug, Error)]
 pub enum RootFsError {
     #[error("failed to decode OCI layer: {0}")]
@@ -125,6 +147,30 @@ impl RootFs {
         }
 
         Ok(names.into_iter().collect())
+    }
+
+    pub fn metadata(&self, path: impl AsRef<Path>) -> Result<RootFsMetadata, RootFsError> {
+        let path = normalize_rootfs_path(path.as_ref())?;
+        let path = self.resolve_symlink(&path, 0)?;
+        self.metadata_for_normalized(&path)
+    }
+
+    pub fn directory_entries(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> Result<Vec<RootFsDirEntry>, RootFsError> {
+        let dir = normalize_rootfs_path(path.as_ref())?;
+        if !self.directories.contains(&dir) {
+            return Err(RootFsError::NotFound(display_rootfs_path(&dir)));
+        }
+
+        self.list_dir(&dir)?
+            .into_iter()
+            .map(|name| {
+                let metadata = self.metadata_for_normalized(&dir.join(&name))?;
+                Ok(RootFsDirEntry { name, metadata })
+            })
+            .collect()
     }
 
     pub fn contains(&self, path: impl AsRef<Path>) -> Result<bool, RootFsError> {
@@ -247,6 +293,37 @@ impl RootFs {
             Some(target) => self.resolve_symlink(target, depth + 1),
             None => Ok(path.to_path_buf()),
         }
+    }
+
+    fn metadata_for_normalized(&self, path: &Path) -> Result<RootFsMetadata, RootFsError> {
+        if let Some(entry) = self.files.get(path) {
+            return Ok(RootFsMetadata {
+                path: path.to_path_buf(),
+                kind: RootFsEntryKind::File,
+                mode: entry.mode,
+                size: entry.size,
+            });
+        }
+
+        if self.directories.contains(path) {
+            return Ok(RootFsMetadata {
+                path: path.to_path_buf(),
+                kind: RootFsEntryKind::Directory,
+                mode: 0o755,
+                size: 0,
+            });
+        }
+
+        if let Some(target) = self.symlinks.get(path) {
+            return Ok(RootFsMetadata {
+                path: path.to_path_buf(),
+                kind: RootFsEntryKind::Symlink,
+                mode: 0o777,
+                size: target.as_os_str().len(),
+            });
+        }
+
+        Err(RootFsError::NotFound(display_rootfs_path(path)))
     }
 }
 

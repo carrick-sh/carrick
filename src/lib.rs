@@ -1,6 +1,7 @@
 pub mod compat;
 pub mod dispatch;
 pub mod elf;
+pub mod linux_abi;
 pub mod memory;
 pub mod oci;
 pub mod probes;

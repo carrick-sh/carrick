@@ -3,10 +3,15 @@ use carrick::dispatch::{
     Aarch64SyscallFrame, DispatchOutcome, GuestMemory, LinearMemory, SyscallDispatcher,
     SyscallRequest,
 };
+use carrick::linux_abi::{
+    LINUX_DIRENT64_HEADER_SIZE, LINUX_DT_REG, LINUX_S_IFDIR, LINUX_S_IFMT, LINUX_S_IFREG,
+    LinuxDirent64Header, LinuxStat,
+};
 use carrick::rootfs::{LayerSource, RootFs};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use std::io::Write;
+use zerocopy::FromBytes;
 
 #[test]
 fn write_syscall_reads_guest_memory_and_writes_stdout() {
@@ -188,6 +193,206 @@ fn openat_missing_rootfs_file_returns_enoent() {
 
     assert_eq!(outcome, DispatchOutcome::Errno { errno: 2 });
     assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn lseek_repositions_rootfs_file_reads() {
+    let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
+        "etc/motd",
+        b"rootfs says hello\n".as_slice(),
+    )]))])
+    .unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x300]);
+    memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    56,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 3 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(62, SyscallArgs::from([3, 7, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 7 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(63, SyscallArgs::from([3, 0x4100, 4, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 4 }
+    );
+    assert_eq!(memory.read_bytes(0x4100, 4).unwrap(), b"says");
+}
+
+#[test]
+fn newfstatat_and_fstat_write_typed_linux_stat() {
+    let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
+        "etc/motd",
+        b"rootfs says hello\n".as_slice(),
+    )]))])
+    .unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x500]);
+    memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    79,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4000, 0x4100, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let stat = read_stat(&memory, 0x4100);
+    let mode = stat.st_mode;
+    let size = stat.st_size;
+    assert_eq!(mode & LINUX_S_IFMT, LINUX_S_IFREG);
+    assert_eq!(mode & 0o777, 0o644);
+    assert_eq!(size, 18);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    56,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 3 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(80, SyscallArgs::from([3, 0x4200, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let stat = read_stat(&memory, 0x4200);
+    let mode = stat.st_mode;
+    let size = stat.st_size;
+    assert_eq!(mode & LINUX_S_IFMT, LINUX_S_IFREG);
+    assert_eq!(size, 18);
+
+    memory.write_bytes(0x4300, b"/etc\0").unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    79,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4300, 0x4400, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let stat = read_stat(&memory, 0x4400);
+    let mode = stat.st_mode;
+    assert_eq!(mode & LINUX_S_IFMT, LINUX_S_IFDIR);
+}
+
+#[test]
+fn getdents64_lists_rootfs_directory_entries() {
+    let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
+        "etc/motd",
+        b"rootfs says hello\n".as_slice(),
+    )]))])
+    .unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x500]);
+    memory.write_bytes(0x4000, b"/etc\0").unwrap();
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    56,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 3 }
+    );
+
+    let outcome = dispatcher
+        .dispatch(
+            SyscallRequest::new(61, SyscallArgs::from([3, 0x4100, 0x100, 0, 0, 0])),
+            &mut memory,
+            &mut reporter,
+        )
+        .unwrap();
+    let DispatchOutcome::Returned { value } = outcome else {
+        panic!("expected getdents64 success, got {outcome:?}");
+    };
+    assert!(value as usize >= LINUX_DIRENT64_HEADER_SIZE + "motd".len() + 1);
+
+    let dirent = memory.read_bytes(0x4100, value as usize).unwrap();
+    let (header, _) = LinuxDirent64Header::read_from_prefix(&dirent).unwrap();
+    let reclen = header.d_reclen;
+    let dtype = header.d_type;
+    assert_eq!(reclen as usize, value as usize);
+    assert_eq!(dtype, LINUX_DT_REG);
+    let name_start = LINUX_DIRENT64_HEADER_SIZE;
+    let name_end = dirent[name_start..]
+        .iter()
+        .position(|byte| *byte == 0)
+        .map(|offset| name_start + offset)
+        .unwrap();
+    assert_eq!(&dirent[name_start..name_end], b"motd");
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(61, SyscallArgs::from([3, 0x4100, 0x100, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+}
+
+fn read_stat(memory: &impl GuestMemory, address: u64) -> LinuxStat {
+    let bytes = memory
+        .read_bytes(address, std::mem::size_of::<LinuxStat>())
+        .unwrap();
+    let (stat, _) = LinuxStat::read_from_prefix(&bytes).unwrap();
+    stat
 }
 
 fn gzip_tar<const N: usize>(files: [(&str, &[u8]); N]) -> Vec<u8> {
