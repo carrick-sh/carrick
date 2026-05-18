@@ -54,8 +54,16 @@ pub fn hvf_capabilities() -> TrapCapabilities {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GuestMappingPlan {
+    /// The user-mode entry point (real `_start` of the loaded ELF, already
+    /// rebased through any PIE bias). When `el0_trampoline_entry` is `None`
+    /// this is also the vCPU's initial PC. When the trampoline is installed
+    /// this becomes ELR_EL1 instead, and the vCPU starts at the trampoline.
     pub entry: u64,
     pub initial_stack_pointer: Option<u64>,
+    /// Guest physical address of the EL0 entry trampoline page (a single
+    /// `eret` instruction). When set, the trap engine starts the vCPU here
+    /// in EL1h and uses `entry` as the post-`eret` PC in EL0t.
+    pub el0_trampoline_entry: Option<u64>,
     pub mappings: Vec<GuestMapping>,
 }
 
@@ -106,6 +114,7 @@ impl GuestMappingPlan {
         Ok(Self {
             entry: address_space.entry(),
             initial_stack_pointer: address_space.initial_stack_pointer(),
+            el0_trampoline_entry: address_space.el0_trampoline_entry(),
             mappings,
         })
     }
@@ -224,22 +233,43 @@ impl HvfTrapEngine {
             });
         }
 
+        // Start PC: if an EL0 entry trampoline is installed, the vCPU begins
+        // at the trampoline page (in EL1h) and executes the single `eret`
+        // there to drop into EL0t at the real user entry. Otherwise the vCPU
+        // starts directly at the user entry (used by the existing EL1-only
+        // unit tests).
+        let initial_pc = plan.el0_trampoline_entry.unwrap_or(plan.entry);
         self.inner
             .vcpu
-            .set_reg(Reg::PC, plan.entry)
+            .set_reg(Reg::PC, initial_pc)
             .map_err(hvf_error)?;
-        // PSTATE for "AArch64 EL0t, all interrupts masked": M[3:0]=0b0000 (EL0
-        // using SP_EL0) plus DAIF=0xf. The guest won't actually receive any
-        // interrupts via HVF, but the masks are harmless and match the typical
-        // Linux process entry state.
         // M[3:0]=0b0101 = EL1h (AArch64 EL1 using SP_EL1) + DAIF masked.
         // HVF reset CPSR is also EL1h; we set it explicitly so a re-entry
         // after a syscall trap doesn't depend on whatever HVF left in place.
+        // The vCPU stays at EL1h until the trampoline `eret` swaps PSTATE
+        // for the SPSR_EL1 value programmed below.
         const AARCH64_PSTATE_EL1H_DAIF_MASKED: u64 = 0x3c5;
         self.inner
             .vcpu
             .set_reg(Reg::CPSR, AARCH64_PSTATE_EL1H_DAIF_MASKED)
             .map_err(hvf_error)?;
+        // When using the trampoline, stage SPSR_EL1 with "AArch64 EL0t, DAIF
+        // masked" (M[3:0]=0b0000) and ELR_EL1 with the user-mode entry. The
+        // `eret` at the trampoline page then transitions to EL0t with
+        // PC=plan.entry, which is the state Linux user code expects so the
+        // first `svc #0` raises a "lower EL using AArch64" synchronous
+        // exception that HVF surfaces to the host.
+        if let Some(_trampoline) = plan.el0_trampoline_entry {
+            const AARCH64_PSTATE_EL0T_DAIF_MASKED: u64 = 0x3c0;
+            self.inner
+                .vcpu
+                .set_sys_reg(SysReg::SPSR_EL1, AARCH64_PSTATE_EL0T_DAIF_MASKED)
+                .map_err(hvf_error)?;
+            self.inner
+                .vcpu
+                .set_sys_reg(SysReg::ELR_EL1, plan.entry)
+                .map_err(hvf_error)?;
+        }
         // Disable stage-1 MMU translation for the EL0/EL1 guest. Without this,
         // the vCPU's reset value of SCTLR_EL1 has .M=1, which makes every
         // instruction fetch translate through page tables we never built, and

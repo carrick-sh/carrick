@@ -173,3 +173,65 @@ tar -tzvf ~/.carrick/blobs/sha256/d17f077ada118cc762df373ff803592abf2dfa3ddafaa7
 ```
 
 The cached image lives under `$HOME/.carrick/` by default (or `$CARRICK_HOME` if set). Removing that directory between runs forces a fresh pull.
+
+## Second attempt — EL0 entry trampoline added
+
+Date: 2026-05-18, after landing the `with_el0_trampoline()` builder in `src/memory.rs` and the matching `el0_trampoline_entry` handling in `src/trap.rs`.
+
+Setup: vCPU starts at the trampoline page (guest PA `LINUX_EL0_TRAMPOLINE_BASE = 0x10000`), executes a single `eret` at offset 0, and drops to EL0t with `PC = plan.entry`, `PSTATE = 0x3c0` (EL0t, DAIF masked). SPSR_EL1 and ELR_EL1 are staged before the run, CPSR remains EL1h, and SCTLR_EL1 stays `0` (stage-1 MMU off).
+
+Command (after `cargo build --release` + `codesign --force --sign - --entitlements scripts/entitlements.plist target/release/carrick`):
+
+```
+./target/release/carrick run-elf \
+  fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-hello \
+  --max-traps 8
+```
+
+Outcome: **new wall.** Exit code 1. Exact stderr:
+
+```
+Error: failed to run static ELF fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-hello
+
+Caused by:
+    0: trap engine failed: guest exception is not an AArch64 SVC trap: syndrome=0x82000007, virtual_address=0x400, physical_address=0x400
+    1: guest exception is not an AArch64 SVC trap: syndrome=0x82000007, virtual_address=0x400, physical_address=0x400
+```
+
+### Interpretation
+
+Comparing against the first-attempt symptom (same shape, but `virtual_address=0x200`):
+
+- First attempt vectored to PA `0x200` — the AArch64 "current EL with SPx, synchronous" vector entry. That happens when the vCPU is still at EL1 and takes a synchronous exception (the SVC instruction itself, or a fault from running user code in EL1h). Indicates the vCPU never reached EL0.
+- Second attempt vectors to PA `0x400` — the "lower EL using AArch64, synchronous" vector entry. That entry is **only** taken when the source EL is strictly lower than the current EL, i.e., EL0 → EL1.
+
+So the trampoline `eret` did fire, PSTATE flipped to EL0t, ELR_EL1 loaded into PC, the guest executed at least one user-mode instruction, and the first `svc #0` correctly raised "synchronous from lower EL using AArch64." The exception then vectored to `VBAR_EL1 + 0x400`. `VBAR_EL1 = 0`, stage-1 MMU is disabled, and stage-2 has no region mapped at `0x400`, so HVF reports an Instruction Abort from a lower EL (EC=`0x20`, IFSC=`0x07` — translation fault, level 3) at IPA `0x400`.
+
+This is success-shaped progress: Tier B is no longer blocked on getting to EL0, it is now blocked on the EL0 → EL1 exception path.
+
+### Next wall: routing the EL0 SVC to HVF
+
+`svc #0` from EL0 vectors to EL1 (the guest's own VBAR_EL1) by default. To surface it to the host (HVF) we need one of:
+
+1. **`HCR_EL2.TGE = 1`.** This is the canonical fix — TGE routes synchronous EL0 exceptions to EL2 (HVF) instead of EL1. *Not available on standard HVF.* `applevisor-sys` gates `HCR_EL2` behind the `macos-15-0` feature *and* "EL2 was enabled in the VM configuration." Plain HVF guests on Apple Silicon run with the host at EL2; the guest cannot directly program HCR_EL2. (Verified: `cargo build` with `SysReg::HCR_EL2` fails — the variant is not in the public enum on the current feature set.)
+2. **EL1 vector stub that re-traps to HVF via `hvc #0`.** Install a VBAR_EL1-aligned page (`0x800` boundary; the existing trampoline base `0x10000` qualifies) and put `hvc #0; eret` at offset `0x400`. `hvc` from EL1 unconditionally traps to EL2, which HVF surfaces as an `EXCEPTION` exit with `EC = 0x16` (HVC). The host dispatches the syscall, sets `X0`, resumes the vCPU; the vCPU continues at the `eret` two instructions later, which restores SPSR_EL1/ELR_EL1 (still holding the user's saved PSTATE and return PC) and drops back to EL0. The trap engine would need to accept `EC = 0x16` in addition to `EC = 0x15` — or treat HVC as the canonical syscall trap and stop expecting SVC at all.
+3. **Same vector stub, but the stub itself reads X8/X0..X5 and emits an `hvc` so the host knows it's a syscall.** Equivalent to (2) — `hvc #0` does not require a special encoding to convey syscall arguments; the X registers are preserved across the EL0 → EL1 transition.
+
+Option (2) is the smallest delta: one extra 16 KiB region, four extra bytes of trampoline (`hvc #0` at `0x10400`, `eret` immediately after), a `VBAR_EL1 = 0x10000` write in `map_plan`, and a single-line widening of `is_aarch64_svc_exception` to also accept `EC = 0x16`. The existing `Aarch64SyscallFrame` extraction works unchanged because X0–X5 and X8 are preserved across the EL0 → EL1 transition. Returning to user space is automatic: the `eret` immediately after `hvc` restores the hardware-saved SPSR_EL1 (= user PSTATE) and ELR_EL1 (= user PC after SVC). No host-side PC fix-up needed beyond writing X0.
+
+### What this change did (and didn't) move
+
+- **Did:** Wire the vCPU through one round-trip across EL1 → EL0. `_start` of the static musl-hello binary now executes in EL0.
+- **Did:** Confirm the trampoline `eret`, SPSR_EL1 staging, and ELR_EL1 staging are all functional under HVF.
+- **Didn't:** Surface the SVC to the dispatcher. We have moved the wall from "vCPU never leaves EL1" to "EL1 has no vector handler." Tier B is still gated on the EL1 vector stub described above.
+
+### Reproduction
+
+```bash
+cargo build --release --bin carrick
+codesign --force --sign - --entitlements scripts/entitlements.plist target/release/carrick
+./target/release/carrick run-elf \
+  fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-hello \
+  --max-traps 8
+# expected: syndrome=0x82000007, virtual_address=0x400 (EL0 SVC vectored to unmapped VBAR_EL1+0x400)
+```

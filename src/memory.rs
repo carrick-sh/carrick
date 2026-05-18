@@ -17,6 +17,20 @@ use zerocopy::IntoBytes;
 // on advertise a max IPA of 40 bits (1 TiB). Keep every region below that
 // ceiling. The layout uses the high half of the 1 TiB window so PIE/static
 // executables (loaded at 4–64 GiB) never collide with heap/mmap/stack.
+// Guest physical address of the EL0 entry trampoline page. The HVF vCPU
+// starts at EL1h; to deliver user code at EL0t we install a single-page
+// region whose first instruction is `eret`. The base is well below the
+// PIE/heap/mmap/stack window so it cannot collide with the user image.
+pub const LINUX_EL0_TRAMPOLINE_BASE: u64 = 0x10000;
+// Trampoline region size. Must be at least one HVF page (16 KiB) so the
+// stage-2 mapping is aligned. The first 4 bytes carry the `eret` opcode;
+// the rest is padded with `nop` so a runaway fetch is harmless.
+pub const LINUX_EL0_TRAMPOLINE_SIZE: u64 = 0x4000;
+// AArch64 `eret` opcode, little-endian.
+const AARCH64_ERET_OPCODE: u32 = 0xd69f_03e0;
+// AArch64 `nop` opcode, used as trampoline page padding.
+const AARCH64_NOP_OPCODE: u32 = 0xd503_201f;
+
 pub const LINUX_HEAP_BASE: u64 = 0x40_0000_0000; // 256 GiB
 pub const LINUX_HEAP_SIZE: u64 = 4 * 1024 * 1024;
 pub const LINUX_MMAP_BASE: u64 = 0x60_0000_0000; // 384 GiB
@@ -30,6 +44,10 @@ pub struct AddressSpace {
     entry: u64,
     regions: Vec<MemoryRegion>,
     initial_stack_pointer: Option<u64>,
+    /// When set, the HVF trap engine should start the vCPU at this guest
+    /// physical address (the EL0 entry trampoline) and use `entry` as the
+    /// user-mode ELR_EL1 target after the trampoline's `eret`.
+    el0_trampoline_entry: Option<u64>,
     #[serde(skip)]
     linux_auxv: Vec<LinuxAuxvEntry>,
 }
@@ -217,6 +235,7 @@ impl AddressSpace {
             entry,
             regions,
             initial_stack_pointer: None,
+            el0_trampoline_entry: None,
             linux_auxv: Vec::new(),
         })
     }
@@ -231,6 +250,55 @@ impl AddressSpace {
 
     pub fn initial_stack_pointer(&self) -> Option<u64> {
         self.initial_stack_pointer
+    }
+
+    /// When set, the trap engine should boot the vCPU at this guest physical
+    /// address (the EL0 entry trampoline) instead of `entry()`. The real user
+    /// entry remains in `entry()` and is wired into ELR_EL1 so the trampoline
+    /// `eret` lands the vCPU at user code in EL0t.
+    pub fn el0_trampoline_entry(&self) -> Option<u64> {
+        self.el0_trampoline_entry
+    }
+
+    /// Append the EL0 entry trampoline region. The trampoline is a single
+    /// page containing one `eret` instruction at offset 0. The vCPU starts
+    /// here at EL1h with SPSR_EL1 staged for EL0t, so the first instruction
+    /// drops the guest to EL0 with PC = user entry.
+    pub fn with_el0_trampoline(self) -> Result<Self, AddressSpaceError> {
+        let bytes = el0_trampoline_bytes();
+        let start = LINUX_EL0_TRAMPOLINE_BASE;
+        let end =
+            start
+                .checked_add(LINUX_EL0_TRAMPOLINE_SIZE)
+                .ok_or(AddressSpaceError::RegionOverflow {
+                    start,
+                    size: LINUX_EL0_TRAMPOLINE_SIZE,
+                })?;
+        let region = MemoryRegion {
+            start,
+            end,
+            perms: SegmentPerms {
+                read: true,
+                write: false,
+                execute: true,
+            },
+            bytes,
+        };
+
+        // Reconstruct via `from_regions` so the overlap check still runs.
+        let AddressSpace {
+            entry,
+            regions,
+            initial_stack_pointer,
+            linux_auxv,
+            ..
+        } = self;
+        let mut image =
+            Self::from_regions(entry, regions.into_iter().chain([region]).collect())?;
+        image.initial_stack_pointer = initial_stack_pointer;
+        image.linux_auxv = linux_auxv;
+        image.el0_trampoline_entry = Some(LINUX_EL0_TRAMPOLINE_BASE);
+        Ok(image)
     }
 
     pub fn with_linux_initial_stack<A, E>(self, argv: A, env: E) -> Result<Self, AddressSpaceError>
@@ -256,6 +324,7 @@ impl AddressSpace {
             entry,
             regions,
             linux_auxv,
+            el0_trampoline_entry,
             ..
         } = self;
         let argv = argv.into_iter().collect::<Vec<_>>();
@@ -265,6 +334,7 @@ impl AddressSpace {
         let mut image = Self::from_regions(entry, regions.into_iter().chain([region]).collect())?;
         image.initial_stack_pointer = Some(stack_pointer);
         image.linux_auxv = linux_auxv;
+        image.el0_trampoline_entry = el0_trampoline_entry;
         Ok(image)
     }
 
@@ -452,6 +522,23 @@ fn regions_from_load_plan(
     }
 
     Ok(regions)
+}
+
+/// Build the byte image of the EL0 entry trampoline page. Offset 0 is a
+/// single `eret`; the rest of the page is filled with `nop` so a stray fetch
+/// beyond the entry instruction doesn't immediately fault.
+pub fn el0_trampoline_bytes() -> Vec<u8> {
+    let size = LINUX_EL0_TRAMPOLINE_SIZE as usize;
+    let mut bytes = vec![0_u8; size];
+    let eret = AARCH64_ERET_OPCODE.to_le_bytes();
+    bytes[..eret.len()].copy_from_slice(&eret);
+    let nop = AARCH64_NOP_OPCODE.to_le_bytes();
+    let mut offset = eret.len();
+    while offset + nop.len() <= size {
+        bytes[offset..offset + nop.len()].copy_from_slice(&nop);
+        offset += nop.len();
+    }
+    bytes
 }
 
 fn linux_runtime_regions() -> Result<Vec<MemoryRegion>, AddressSpaceError> {
