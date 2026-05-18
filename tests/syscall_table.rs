@@ -87,6 +87,8 @@ fn names_linux_aarch64_bringup_syscalls() {
         (34, "mkdirat"),
         (35, "unlinkat"),
         (38, "renameat"),
+        (52, "fchmod"),
+        (53, "fchmodat"),
         (29, "ioctl"),
         (43, "statfs"),
         (44, "fstatfs"),

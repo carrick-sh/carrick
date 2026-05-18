@@ -860,6 +860,50 @@ fn run_elf_command_drives_preadv_static_fixture() {
 }
 
 #[test]
+fn run_elf_command_drives_fchmod_static_fixture() {
+    let output = std::process::Command::new("scripts/build-linux-fixtures.sh")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "fixture build failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let layer = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        layer.path(),
+        gzip_tar([("etc/motd", b"fchmod fixture\n".as_slice())]),
+    )
+    .unwrap();
+    let output = Command::cargo_bin("carrick")
+        .unwrap()
+        .args([
+            "run-elf",
+            "fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-fchmod-motd",
+            "--rootfs-layer",
+            layer.path().to_str().unwrap(),
+            "--max-traps",
+            "16",
+        ])
+        .output()
+        .unwrap();
+
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("\"exit_code\": 0"));
+        assert!(stdout.contains("fchmod\\n"));
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("Hypervisor.framework"),
+            "unexpected run-elf failure:\n{stderr}"
+        );
+    }
+}
+
+#[test]
 fn run_elf_command_drives_renameat_static_fixture() {
     let output = std::process::Command::new("scripts/build-linux-fixtures.sh")
         .output()

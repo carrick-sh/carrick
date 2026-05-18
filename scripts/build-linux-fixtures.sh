@@ -81,6 +81,7 @@ build_fixture "utimensat_motd.rs" "carrick-linux-aarch64-utimensat-motd"
 build_fixture "mkdirat_motd.rs" "carrick-linux-aarch64-mkdirat-motd"
 build_fixture "unlinkat_motd.rs" "carrick-linux-aarch64-unlinkat-motd"
 build_fixture "renameat_motd.rs" "carrick-linux-aarch64-renameat-motd"
+build_fixture "fchmod_motd.rs" "carrick-linux-aarch64-fchmod-motd"
 
 cargo metadata \
   --manifest-path "$fixture_dir/Cargo.toml" \
