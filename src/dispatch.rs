@@ -4293,19 +4293,33 @@ impl SyscallDispatcher {
     }
 
     fn write_output_fd(&mut self, fd: i32, bytes: &[u8]) -> DispatchOutcome {
+        // Mirror `write`/`writev`: any fd present in `open_files` (e.g.
+        // after a dup3 over stdio) takes precedence over the built-in
+        // stdout/stderr buffers. Without this, `busybox cat`'s
+        // `sendfile(1, infile, ...)` writes the file contents to the
+        // dispatcher's internal stdout instead of the pipe write end.
+        if let Some(open_file) = self.open_files.get(&fd) {
+            let mut open = open_file.description.borrow_mut();
+            return match &mut *open {
+                OpenDescription::PipeWriter { pipe, .. } => write_pipe(bytes, pipe),
+                OpenDescription::HostPipe {
+                    host_fd,
+                    is_read_end,
+                    ..
+                } => {
+                    if *is_read_end {
+                        DispatchOutcome::Errno { errno: LINUX_EBADF }
+                    } else {
+                        write_host_pipe(bytes, *host_fd)
+                    }
+                }
+                _ => DispatchOutcome::Errno { errno: LINUX_EBADF },
+            };
+        }
         match fd {
             1 => self.stdout.extend_from_slice(bytes),
             2 => self.stderr.extend_from_slice(bytes),
-            _ => {
-                let Some(open_file) = self.open_files.get(&fd) else {
-                    return DispatchOutcome::Errno { errno: LINUX_EBADF };
-                };
-                let mut open = open_file.description.borrow_mut();
-                let OpenDescription::PipeWriter { pipe, .. } = &mut *open else {
-                    return DispatchOutcome::Errno { errno: LINUX_EBADF };
-                };
-                return write_pipe(bytes, pipe);
-            }
+            _ => return DispatchOutcome::Errno { errno: LINUX_EBADF },
         }
         DispatchOutcome::Returned {
             value: bytes.len() as i64,
