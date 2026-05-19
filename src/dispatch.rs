@@ -2022,19 +2022,34 @@ impl SyscallDispatcher {
                 }
             }
             LINUX_F_GETFD => {
-                let Some(open_file) = self.open_files.get(&fd) else {
-                    return DispatchOutcome::Errno { errno: LINUX_EBADF };
-                };
-                DispatchOutcome::Returned {
-                    value: open_file.fd_flags as i64,
+                if let Some(open_file) = self.open_files.get(&fd) {
+                    return DispatchOutcome::Returned {
+                        value: open_file.fd_flags as i64,
+                    };
                 }
+                // stdio without an OpenDescription: not CLOEXEC by default
+                // (Linux semantics: stdio survives exec). Return 0.
+                if is_stdio_fd(fd) {
+                    return DispatchOutcome::Returned { value: 0 };
+                }
+                DispatchOutcome::Errno { errno: LINUX_EBADF }
             }
             LINUX_F_SETFD => {
-                let Some(open_file) = self.open_files.get_mut(&fd) else {
-                    return DispatchOutcome::Errno { errno: LINUX_EBADF };
-                };
-                open_file.fd_flags = arg & LINUX_FD_CLOEXEC;
-                DispatchOutcome::Returned { value: 0 }
+                if let Some(open_file) = self.open_files.get_mut(&fd) {
+                    open_file.fd_flags = arg & LINUX_FD_CLOEXEC;
+                    return DispatchOutcome::Returned { value: 0 };
+                }
+                // apt's http method fcntl(fd, F_SETFD, FD_CLOEXEC)s its
+                // inherited stdio fds on startup. Returning EBADF here
+                // makes apt abort with "Could not set close on exec".
+                // Carrick's exec inherits stdio via the host fd directly;
+                // CLOEXEC is meaningless for our model (we don't exec
+                // anything host-side after the syscall returns) but we
+                // accept the call so the guest's bookkeeping succeeds.
+                if is_stdio_fd(fd) {
+                    return DispatchOutcome::Returned { value: 0 };
+                }
+                DispatchOutcome::Errno { errno: LINUX_EBADF }
             }
             LINUX_F_GETFL => {
                 if let Some(open_file) = self.open_files.get(&fd) {
