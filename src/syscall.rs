@@ -220,6 +220,7 @@ const AARCH64_SYSCALLS: &[Syscall] = &[
     syscall(260, "wait4", "process", SupportLevel::BringUp),
     syscall(261, "prlimit64", "process", SupportLevel::BringUp),
     syscall(266, "clock_adjtime", "time", SupportLevel::BringUp),
+    syscall(276, "renameat2", "fs", SupportLevel::BringUp),
     syscall(278, "getrandom", "random", SupportLevel::BringUp),
     syscall(281, "execveat", "process", SupportLevel::Planned),
     syscall(283, "membarrier", "process", SupportLevel::BringUp),
