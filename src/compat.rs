@@ -98,6 +98,15 @@ pub struct CompatReporter {
 impl CompatReporter {
     pub fn record(&mut self, event: CompatEvent) {
         crate::probes::fire(&event);
+        // Opt-in syscall trace. Off by default; set
+        // `CARRICK_TRACE_SYSCALLS=1` to get one-line-per-event output on
+        // stderr. Useful when chasing "where does this EINVAL come
+        // from?" without standing up the full libdtrace consumer.
+        if std::env::var_os("CARRICK_TRACE_SYSCALLS").is_some() {
+            if let Ok(line) = serde_json::to_string(&event) {
+                eprintln!("[carrick-syscall] {line}");
+            }
+        }
         self.events.push(event);
     }
 
