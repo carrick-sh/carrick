@@ -4339,26 +4339,38 @@ impl SyscallDispatcher {
                     });
                 }
             };
+            // Mirror `write`: check open_files FIRST so post-dup3
+            // redirects (eg `dup3(pipe_write, 1)`) actually plumb
+            // through the redirected description rather than the
+            // built-in stdout buffer.
+            if let Some(open_file) = self.open_files.get(&(fd as i32)) {
+                let mut open = open_file.description.borrow_mut();
+                let outcome = match &mut *open {
+                    OpenDescription::PipeWriter { pipe, .. } => write_pipe(&bytes, pipe),
+                    OpenDescription::HostPipe {
+                        host_fd,
+                        is_read_end,
+                        ..
+                    } => {
+                        if *is_read_end {
+                            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+                        }
+                        write_host_pipe(&bytes, *host_fd)
+                    }
+                    _ => return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF }),
+                };
+                let DispatchOutcome::Returned { value } = outcome else {
+                    return Ok(outcome);
+                };
+                total = total
+                    .checked_add(value as usize)
+                    .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
+                continue;
+            }
             match fd {
                 1 => self.stdout.extend_from_slice(&bytes),
                 2 => self.stderr.extend_from_slice(&bytes),
-                _ => {
-                    let Some(open_file) = self.open_files.get(&(fd as i32)) else {
-                        return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
-                    };
-                    let mut open = open_file.description.borrow_mut();
-                    let OpenDescription::PipeWriter { pipe, .. } = &mut *open else {
-                        return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
-                    };
-                    let outcome = write_pipe(&bytes, pipe);
-                    let DispatchOutcome::Returned { value } = outcome else {
-                        return Ok(outcome);
-                    };
-                    total = total
-                        .checked_add(value as usize)
-                        .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
-                    continue;
-                }
+                _ => return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF }),
             }
             total = total
                 .checked_add(bytes.len())
