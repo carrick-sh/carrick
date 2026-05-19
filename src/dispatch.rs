@@ -914,12 +914,11 @@ impl SyscallDispatcher {
         request: SyscallRequest,
         memory: &impl GuestMemory,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let flags = request.arg(3);
-        if flags != 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
-        }
+        // Linux's `faccessat` (syscall 48) takes only (dirfd, pathname, mode).
+        // The 4-arg form with flags is `faccessat2` (syscall 439). We were
+        // erroneously reading x3 as flags here, which is whatever uninit
+        // register state the caller had — making glibc see EINVAL for normal
+        // access(F_OK)-style calls and abort with "stack smashing detected".
         self.access_at(request.arg(0), request.arg(1), request.arg(2), 0, memory)
     }
 
@@ -2746,7 +2745,12 @@ impl SyscallDispatcher {
                 errno: LINUX_EINVAL,
             };
         }
-        if tgid != LINUX_BOOTSTRAP_PID as i64 || tid != LINUX_BOOTSTRAP_PID as i64 {
+        let host_pid = std::process::id() as i64;
+        let bootstrap_pid = LINUX_BOOTSTRAP_PID as i64;
+        let valid_self =
+            (tgid == host_pid || tgid == bootstrap_pid)
+                && (tid == host_pid || tid == bootstrap_pid);
+        if !valid_self {
             return DispatchOutcome::Errno { errno: LINUX_ESRCH };
         }
         if signum == 0 {
@@ -3423,6 +3427,13 @@ impl SyscallDispatcher {
         let fd = request.arg(0) as i32;
         if let Some(open_file) = self.open_files.remove(&fd) {
             close_open_file(&open_file);
+            DispatchOutcome::Returned { value: 0 }
+        } else if is_stdio_fd(fd) {
+            // Guest closing its own stdio at exit: there's nothing for
+            // us to do (host fd stays open under stream_stdio so
+            // sibling processes keep working), but reporting EBADF
+            // here makes glibc print "write error: Bad file descriptor"
+            // after the program's real output. Return success.
             DispatchOutcome::Returned { value: 0 }
         } else {
             DispatchOutcome::Errno { errno: LINUX_EBADF }
@@ -4281,6 +4292,14 @@ impl SyscallDispatcher {
         let offset = request.arg(1) as i64;
         let whence = request.arg(2);
         let Some(open_file) = self.open_files.get(&fd) else {
+            // lseek on stdio with no OpenDescription is, on Linux, a
+            // valid call on an unseekable pipe/tty — kernel returns
+            // ESPIPE, not EBADF. Returning EBADF confuses glibc's
+            // ftell/fclose path into reporting "write error: Bad
+            // file descriptor" after every successful write.
+            if is_stdio_fd(fd) {
+                return DispatchOutcome::Errno { errno: LINUX_ESPIPE };
+            }
             return DispatchOutcome::Errno { errno: LINUX_EBADF };
         };
         let mut open = open_file.description.borrow_mut();
@@ -5517,6 +5536,20 @@ impl SyscallDispatcher {
                     .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
                 continue;
             }
+            if self.stream_stdio && (fd == 1 || fd == 2) {
+                let n = unsafe {
+                    libc::write(fd as i32, bytes.as_ptr() as *const _, bytes.len())
+                };
+                if n < 0 {
+                    return Ok(DispatchOutcome::Errno {
+                        errno: host_errno(),
+                    });
+                }
+                total = total
+                    .checked_add(n as usize)
+                    .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
+                continue;
+            }
             match fd {
                 1 => self.stdout.extend_from_slice(&bytes),
                 2 => self.stderr.extend_from_slice(&bytes),
@@ -6350,13 +6383,18 @@ fn bootstrap_signal_send(target: i64, tid_required: bool, signum: u64) -> Dispat
             errno: LINUX_EINVAL,
         };
     }
-    let pid = LINUX_BOOTSTRAP_PID as i64;
+    // getpid() exposes the host pid (std::process::id()) so glibc and
+    // friends use that as the self-id when calling kill/tkill/tgkill.
+    // Accept either that or LINUX_BOOTSTRAP_PID so existing callers
+    // that hard-coded `1` keep working.
+    let host_pid = std::process::id() as i64;
+    let bootstrap_pid = LINUX_BOOTSTRAP_PID as i64;
     let self_target = if tid_required {
-        target == pid
+        target == host_pid || target == bootstrap_pid
     } else {
         // kill(0, sig) targets the calling process's process group; in our
         // single-process bootstrap that's still just us.
-        target == pid || target == 0
+        target == host_pid || target == bootstrap_pid || target == 0
     };
     if !self_target {
         return DispatchOutcome::Errno { errno: LINUX_ESRCH };
