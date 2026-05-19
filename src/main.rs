@@ -8,7 +8,7 @@ use carrick::memory::AddressSpace;
 use carrick::oci::{ImageReference, ImageStore, pull_image};
 use carrick::rootfs::RootFs;
 use carrick::runtime::{
-    DEFAULT_MAX_TRAPS, DebugStateSnapshot, run_rootfs_elf_with_hvf_args_debug,
+    DEFAULT_MAX_TRAPS, DebugStateSnapshot, run_rootfs_elf_with_hvf_args_and_dispatcher_debug,
     run_static_elf_with_hvf_args_and_dispatcher_debug,
 };
 use carrick::syscall::{aarch64_table, lookup_aarch64};
@@ -225,7 +225,7 @@ fn main() -> anyhow::Result<()> {
             raw,
             args,
         } => {
-            let dispatcher = if rootfs_layers.is_empty() {
+            let mut dispatcher = if rootfs_layers.is_empty() {
                 SyscallDispatcher::new()
             } else {
                 SyscallDispatcher::with_rootfs(
@@ -233,6 +233,9 @@ fn main() -> anyhow::Result<()> {
                         .context("failed to compose rootfs layers")?,
                 )
             };
+            if raw {
+                dispatcher.set_stream_stdio(true);
+            }
             let mut argv = vec![path.to_string_lossy().into_owned()];
             argv.extend(args);
             let result = run_static_elf_with_hvf_args_and_dispatcher_debug(
@@ -301,9 +304,20 @@ fn main() -> anyhow::Result<()> {
             let rootfs = RootFs::from_layer_paths(&rootfs_layers)
                 .context("failed to compose image rootfs layers")?;
             let executable_path = &command[0];
-            let result = run_rootfs_elf_with_hvf_args_debug(
+            let mut dispatcher = SyscallDispatcher::with_rootfs_and_executable(
+                rootfs.clone(),
+                executable_path.clone(),
+            );
+            if raw {
+                // Stream guest fd 1/2 straight to host fds 1/2 so
+                // interactive prompts (`/ # `, ANSI cursor queries) reach
+                // the user's terminal before the guest exits.
+                dispatcher.set_stream_stdio(true);
+            }
+            let result = run_rootfs_elf_with_hvf_args_and_dispatcher_debug(
                 executable_path.as_str(),
                 &rootfs,
+                dispatcher,
                 command.clone(),
                 std::iter::empty(),
                 max_traps,
