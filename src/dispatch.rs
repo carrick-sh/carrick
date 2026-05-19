@@ -845,11 +845,27 @@ impl SyscallDispatcher {
             140 => self.setpriority(request),
             141 => self.getpriority(request),
             142 => self.reboot(),
+            // setregid/setgid/setreuid/setuid/setresuid/setresgid/setfsuid/setfsgid:
+            // carrick is single-user, runs as the host user (effectively root
+            // inside the guest). Any "drop privileges" request from a Linux
+            // tool (apt's _apt-user privsep, busybox's su, etc.) is a no-op
+            // for us — we already are who the caller wants to become. Return
+            // success regardless of the target uid/gid. Without these, apt
+            // update fails its sandbox setup and refuses to fetch.
+            143..=147 | 149 | 151 | 152 => DispatchOutcome::Returned { value: 0 },
+            // getresuid / getresgid: write 0/0/0 to the three pointers.
+            148 => self.getres_uid_gid(request, memory),
+            150 => self.getres_uid_gid(request, memory),
             153 => self.times(request, memory),
             154 => self.setpgid(request),
             155 => self.getpgid(request),
             156 => self.getsid(request),
             157 => self.setsid(),
+            // getgroups(size, list): we belong to no supplementary groups.
+            // size=0 means "tell me how many" — return 0. Otherwise write
+            // nothing and return 0. setgroups: accept and ignore.
+            158 => self.getgroups(request, memory),
+            159 => DispatchOutcome::Returned { value: 0 },
             160 => self.uname(request, memory),
             161 => self.sethostname(),
             162 => self.setdomainname(),
@@ -3380,6 +3396,42 @@ impl SyscallDispatcher {
         if pid != 0 && pid != 1 {
             return DispatchOutcome::Errno { errno: LINUX_ESRCH };
         }
+        DispatchOutcome::Returned { value: 0 }
+    }
+
+    /// `getresuid(*ruid, *euid, *suid)` / `getresgid(*rgid, *egid, *sgid)`.
+    /// We report 0/0/0 for both — carrick runs every guest as a single
+    /// effective identity, and apt's privsep code reads these to decide
+    /// whether it's already running as root.
+    fn getres_uid_gid(
+        &self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+    ) -> DispatchOutcome {
+        let zero = 0u32.to_le_bytes();
+        for index in 0..3 {
+            let ptr = request.arg(index);
+            if ptr == 0 {
+                continue;
+            }
+            if memory.write_bytes(ptr, &zero).is_err() {
+                return DispatchOutcome::Errno { errno: LINUX_EFAULT };
+            }
+        }
+        DispatchOutcome::Returned { value: 0 }
+    }
+
+    /// `getgroups(size, *list)`. Linux returns the number of
+    /// supplementary groups; in carrick the guest is a single user
+    /// with no supplementary groups, so the answer is always 0 (and
+    /// we leave `list` untouched, per the size=0 fast path).
+    fn getgroups(
+        &self,
+        request: SyscallRequest,
+        _memory: &mut impl GuestMemory,
+    ) -> DispatchOutcome {
+        let _size = request.arg(0);
+        let _list = request.arg(1);
         DispatchOutcome::Returned { value: 0 }
     }
 
