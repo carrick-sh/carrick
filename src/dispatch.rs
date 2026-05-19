@@ -1501,24 +1501,153 @@ impl SyscallDispatcher {
     ) -> Result<DispatchOutcome, DispatchError> {
         let nfds = usize::try_from(request.arg(0))
             .map_err(|_| DispatchError::LengthTooLarge(request.arg(0)))?;
-        let readfds = request.arg(1);
-        let writefds = request.arg(2);
-        let exceptfds = request.arg(3);
-        let read = match self.filter_fd_set(memory, readfds, nfds, PollInterest::Read)? {
-            Ok(count) => count,
+        let readfds_addr = request.arg(1);
+        let writefds_addr = request.arg(2);
+        let exceptfds_addr = request.arg(3);
+        let timeout_addr = request.arg(4);
+
+        // Decode timespec → millis for libc::poll. NULL = block forever (-1).
+        let timeout_ms: i32 = if timeout_addr == 0 {
+            -1
+        } else {
+            match memory.read_bytes(timeout_addr, 16) {
+                Ok(b) if b.len() == 16 => {
+                    let sec = i64::from_le_bytes(b[0..8].try_into().unwrap_or([0; 8]));
+                    let nsec = i64::from_le_bytes(b[8..16].try_into().unwrap_or([0; 8]));
+                    let ms = sec
+                        .saturating_mul(1000)
+                        .saturating_add(nsec / 1_000_000);
+                    if ms <= 0 {
+                        0
+                    } else if ms > i32::MAX as i64 {
+                        i32::MAX
+                    } else {
+                        ms as i32
+                    }
+                }
+                _ => 0,
+            }
+        };
+
+        // Pull each fd_set into memory.
+        let read_set = match self.read_optional_fd_set(memory, readfds_addr, nfds)? {
+            Ok(s) => s,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        let write = match self.filter_fd_set(memory, writefds, nfds, PollInterest::Write)? {
-            Ok(count) => count,
+        let write_set = match self.read_optional_fd_set(memory, writefds_addr, nfds)? {
+            Ok(s) => s,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        let except = match self.filter_fd_set(memory, exceptfds, nfds, PollInterest::Except)? {
-            Ok(count) => count,
+        let except_set = match self.read_optional_fd_set(memory, exceptfds_addr, nfds)? {
+            Ok(s) => s,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        Ok(DispatchOutcome::Returned {
-            value: (read + write + except) as i64,
-        })
+
+        // Build a pollfd array from the union of the three sets. Each fd
+        // gets the union of POLLIN/POLLOUT/POLLPRI flags. Then hand to
+        // libc::poll for kernel-blocking with the requested timeout.
+        let mut pollfds: Vec<libc::pollfd> = Vec::new();
+        let mut owners: Vec<(i32, i16)> = Vec::new(); // (fd, requested_mask)
+        for fd in 0..nfds {
+            let r = read_set.as_ref().map_or(false, |s| fd_set_contains(s, fd));
+            let w = write_set.as_ref().map_or(false, |s| fd_set_contains(s, fd));
+            let e = except_set.as_ref().map_or(false, |s| fd_set_contains(s, fd));
+            if !(r || w || e) {
+                continue;
+            }
+            let fd_i32 = i32::try_from(fd).map_err(|_| DispatchError::LengthTooLarge(u64::MAX))?;
+            if !self.fd_is_valid(fd_i32) {
+                return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+            }
+            let host_fd = self
+                .host_fd_for_poll(fd_i32)
+                .unwrap_or(fd_i32);
+            let mut events: i16 = 0;
+            if r { events |= libc::POLLIN; }
+            if w { events |= libc::POLLOUT; }
+            if e { events |= libc::POLLPRI; }
+            pollfds.push(libc::pollfd { fd: host_fd, events, revents: 0 });
+            let mut req_mask: i16 = 0;
+            if r { req_mask |= 0x01; }
+            if w { req_mask |= 0x02; }
+            if e { req_mask |= 0x04; }
+            owners.push((fd_i32, req_mask));
+        }
+
+        if !pollfds.is_empty() {
+            let n = unsafe {
+                libc::poll(
+                    pollfds.as_mut_ptr(),
+                    pollfds.len() as libc::nfds_t,
+                    timeout_ms,
+                )
+            };
+            if n < 0 {
+                return Ok(DispatchOutcome::Errno { errno: host_errno() });
+            }
+        } else if timeout_ms > 0 {
+            // No fds and a real timeout: just sleep.
+            unsafe {
+                let ts = libc::timespec {
+                    tv_sec: (timeout_ms / 1000) as libc::time_t,
+                    tv_nsec: ((timeout_ms % 1000) as i64 * 1_000_000) as libc::c_long,
+                };
+                libc::nanosleep(&ts, std::ptr::null_mut());
+            }
+        }
+
+        // Write back ready bits. Start with fully-cleared sets and only
+        // set bits for fds that fired.
+        let mut new_read = read_set.clone().map(|mut s| { for b in &mut s { *b = 0 } s });
+        let mut new_write = write_set.clone().map(|mut s| { for b in &mut s { *b = 0 } s });
+        let mut new_except = except_set.clone().map(|mut s| { for b in &mut s { *b = 0 } s });
+        let mut ready = 0i64;
+        for ((fd, req_mask), p) in owners.iter().zip(pollfds.iter()) {
+            let fd_usize = *fd as usize;
+            let revs = p.revents;
+            let mut fired = false;
+            if (req_mask & 0x01) != 0 && (revs & (libc::POLLIN | libc::POLLHUP)) != 0 {
+                if let Some(ref mut set) = new_read { fd_set_set(set, fd_usize); fired = true; }
+            }
+            if (req_mask & 0x02) != 0 && (revs & libc::POLLOUT) != 0 {
+                if let Some(ref mut set) = new_write { fd_set_set(set, fd_usize); fired = true; }
+            }
+            if (req_mask & 0x04) != 0 && (revs & (libc::POLLPRI | libc::POLLERR)) != 0 {
+                if let Some(ref mut set) = new_except { fd_set_set(set, fd_usize); fired = true; }
+            }
+            if fired { ready += 1; }
+        }
+        if let Some(s) = &new_read {
+            if memory.write_bytes(readfds_addr, s).is_err() {
+                return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
+            }
+        }
+        if let Some(s) = &new_write {
+            if memory.write_bytes(writefds_addr, s).is_err() {
+                return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
+            }
+        }
+        if let Some(s) = &new_except {
+            if memory.write_bytes(exceptfds_addr, s).is_err() {
+                return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
+            }
+        }
+        Ok(DispatchOutcome::Returned { value: ready })
+    }
+
+    fn read_optional_fd_set(
+        &self,
+        memory: &mut impl GuestMemory,
+        address: u64,
+        nfds: usize,
+    ) -> Result<Result<Option<Vec<u8>>, i32>, DispatchError> {
+        if address == 0 {
+            return Ok(Ok(None));
+        }
+        match read_fd_set(memory, address, nfds) {
+            Ok(s) => Ok(Ok(Some(s))),
+            Err(errno) => Ok(Err(errno)),
+        }
     }
 
     fn filter_fd_set(
@@ -7251,17 +7380,32 @@ fn bootstrap_signal_send(target: i64, tid_required: bool, signum: u64) -> Dispat
         // single-process bootstrap that's still just us.
         target == host_pid || target == bootstrap_pid || target == 0
     };
-    if !self_target {
+    if self_target {
+        if signum == 0 {
+            // POSIX: signum 0 is the null-signal "is this pid alive" probe.
+            return DispatchOutcome::Returned { value: 0 };
+        }
+        // Queue the signal for self-delivery. The runtime drains the pending
+        // slot between vCPU iterations and either injects a handler frame or
+        // applies the default action (terminate with 128 + signum).
+        crate::host_signal::raise_for_self(signum as i32);
+        return DispatchOutcome::Returned { value: 0 }
+    }
+    // Cross-process kill: target is some other host pid. After clone(),
+    // child guests run as separate host processes — apt's parent
+    // process uses kill(child_pid, SIGINT) as part of the AcquireMethod
+    // shutdown protocol, and ESRCH here breaks the protocol with
+    // "method did not start correctly". Defer to libc::kill on the host;
+    // the host kernel knows whether `target` is one of our descendants
+    // and returns ESRCH itself if not. Negative pids (process-group kill)
+    // pass through too.
+    if target == 0 || target < i32::MIN as i64 || target > i32::MAX as i64 {
         return DispatchOutcome::Errno { errno: LINUX_ESRCH };
     }
-    if signum == 0 {
-        // POSIX: signum 0 is the null-signal "is this pid alive" probe.
-        return DispatchOutcome::Returned { value: 0 };
+    let rc = unsafe { libc::kill(target as i32, signum as i32) };
+    if rc < 0 {
+        return DispatchOutcome::Errno { errno: host_errno() };
     }
-    // Queue the signal for self-delivery. The runtime drains the pending
-    // slot between vCPU iterations and either injects a handler frame or
-    // applies the default action (terminate with 128 + signum).
-    crate::host_signal::raise_for_self(signum as i32);
     DispatchOutcome::Returned { value: 0 }
 }
 
@@ -8499,6 +8643,12 @@ fn fd_set_contains(fd_set: &[u8], fd: usize) -> bool {
 fn fd_set_clear(fd_set: &mut [u8], fd: usize) {
     if let Some(byte) = fd_set.get_mut(fd / 8) {
         *byte &= !(1 << (fd % 8));
+    }
+}
+
+fn fd_set_set(fd_set: &mut [u8], fd: usize) {
+    if let Some(byte) = fd_set.get_mut(fd / 8) {
+        *byte |= 1 << (fd % 8);
     }
 }
 
