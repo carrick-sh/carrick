@@ -97,6 +97,10 @@ pub const LINUX_SEEK_SET: u64 = 0;
 pub const LINUX_SEEK_CUR: u64 = 1;
 pub const LINUX_SEEK_END: u64 = 2;
 pub const LINUX_O_ACCMODE: u64 = 0b11;
+pub const LINUX_O_RDONLY: u64 = 0;
+pub const LINUX_O_WRONLY: u64 = 1;
+#[allow(dead_code)]
+pub const LINUX_O_RDWR: u64 = 2;
 pub const LINUX_O_NONBLOCK: u64 = 0o4000;
 pub const LINUX_O_CLOEXEC: u64 = 0o2000000;
 pub const LINUX_PROT_READ: u64 = 0x1;
@@ -1887,13 +1891,26 @@ impl SyscallDispatcher {
                 DispatchOutcome::Returned { value: 0 }
             }
             LINUX_F_GETFL => {
-                let Some(open_file) = self.open_files.get(&fd) else {
-                    return DispatchOutcome::Errno { errno: LINUX_EBADF };
-                };
-                let open = open_file.description.borrow();
-                DispatchOutcome::Returned {
-                    value: open.status_flags() as i64,
+                if let Some(open_file) = self.open_files.get(&fd) {
+                    let open = open_file.description.borrow();
+                    return DispatchOutcome::Returned {
+                        value: open.status_flags() as i64,
+                    };
                 }
+                // stdio without an OpenDescription: glibc cat/head/etc
+                // probe `fcntl(1, F_GETFL)` on startup to decide whether
+                // stdout is append-only. Returning O_RDWR (with the
+                // appropriate direction for fd 0 vs 1/2) keeps them happy
+                // instead of bailing with "Bad file descriptor".
+                if is_stdio_fd(fd) {
+                    let flags: u64 = if fd == 0 {
+                        LINUX_O_RDONLY
+                    } else {
+                        LINUX_O_WRONLY
+                    };
+                    return DispatchOutcome::Returned { value: flags as i64 };
+                }
+                DispatchOutcome::Errno { errno: LINUX_EBADF }
             }
             LINUX_F_SETFL => {
                 let Some(open_file) = self.open_files.get(&fd) else {
@@ -6213,6 +6230,19 @@ impl SyscallDispatcher {
         memory: &mut impl GuestMemory,
     ) -> DispatchOutcome {
         let Some(open_file) = self.open_files.get(&fd) else {
+            if is_stdio_fd(fd) {
+                // Glibc cat/head/etc fstat stdout on startup to decide
+                // whether they're talking to a regular file (use POSIX
+                // sendfile fast path) or a TTY/pipe (default cooked
+                // path). Synthesize a character-device stat so they
+                // pick the right branch instead of bailing EBADF.
+                let label = match fd {
+                    0 => "/dev/stdin",
+                    1 => "/dev/stdout",
+                    _ => "/dev/stderr",
+                };
+                return write_synthetic_stat(memory, statbuf, label, 0);
+            }
             return DispatchOutcome::Errno { errno: LINUX_EBADF };
         };
         let open = open_file.description.borrow();
