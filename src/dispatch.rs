@@ -56,6 +56,7 @@ pub const LINUX_ENOTTY: i32 = 25;
 pub const LINUX_ERANGE: i32 = 34;
 pub const LINUX_ENAMETOOLONG: i32 = 36;
 pub const LINUX_ENOSYS: i32 = 38;
+pub const LINUX_E2BIG: i32 = 7;
 pub const LINUX_ETIMEDOUT: i32 = 110;
 pub const LINUX_AT_FDCWD: u64 = (-100_i64) as u64;
 pub const LINUX_AT_SYMLINK_NOFOLLOW: u64 = 0x100;
@@ -266,6 +267,19 @@ pub enum DispatchOutcome {
     /// a real macOS fork against the trap engine, then write the child
     /// pid (parent) or 0 (child) into x0 to complete the syscall.
     Fork,
+    /// `execve(2)` succeeded so far in the dispatcher (path readable,
+    /// argv/envp resolved). The runtime must:
+    ///   1. Tear down the current guest address space.
+    ///   2. Load the new ELF (handling the interpreter chain).
+    ///   3. Rebuild the trap engine's mappings and vCPU state.
+    /// Because `execve` does not return on success, the syscall has
+    /// no retval to write into x0 — the runtime simply resumes the
+    /// loop with the new entry point.
+    Execve {
+        path: String,
+        argv: Vec<String>,
+        env: Vec<String>,
+    },
 }
 
 impl DispatchOutcome {
@@ -275,6 +289,7 @@ impl DispatchOutcome {
             DispatchOutcome::Errno { errno } => (-(errno as i64), Some(errno)),
             DispatchOutcome::Exit { code } => (code as i64, None),
             DispatchOutcome::Fork => (0, None),
+            DispatchOutcome::Execve { .. } => (0, None),
         }
     }
 }
@@ -520,6 +535,13 @@ impl SyscallDispatcher {
         }
     }
 
+    /// Borrow the dispatcher's rootfs. Used by the runtime when the
+    /// dispatcher returns `DispatchOutcome::Execve` and the new image
+    /// has to be loaded from the same image layers.
+    pub fn rootfs(&self) -> Option<&RootFs> {
+        self.rootfs.as_ref()
+    }
+
     pub fn stdout(&self) -> &[u8] {
         &self.stdout
     }
@@ -663,6 +685,7 @@ impl SyscallDispatcher {
             215 => self.munmap(request),
             216 => self.mremap(request),
             220 => self.clone(request),
+            221 => self.execve(request, memory),
             222 => self.mmap(request, memory)?,
             226 => self.mprotect(request, memory),
             227 => self.msync(request, memory),
@@ -3174,6 +3197,36 @@ impl SyscallDispatcher {
             | OpenDescription::PipeWriter { .. } => {}
         }
         DispatchOutcome::Returned { value: next }
+    }
+
+    /// Linux `execve(2)` (aarch64 syscall 221). Reads pathname, argv,
+    /// and envp from guest memory, then surfaces `DispatchOutcome::Execve`
+    /// so the runtime can tear down the guest address space and load
+    /// the new image. Returns the usual errno on the failure paths
+    /// (EFAULT on bad pointers, ENAMETOOLONG on oversized strings).
+    fn execve(
+        &self,
+        request: SyscallRequest,
+        memory: &impl GuestMemory,
+    ) -> DispatchOutcome {
+        let pathname_addr = request.arg(0);
+        let argv_addr = request.arg(1);
+        let envp_addr = request.arg(2);
+
+        let path = match read_guest_c_string(memory, pathname_addr) {
+            Ok(p) => p,
+            Err(errno) => return DispatchOutcome::Errno { errno },
+        };
+        let argv = match read_guest_string_array(memory, argv_addr) {
+            Ok(v) => v,
+            Err(errno) => return DispatchOutcome::Errno { errno },
+        };
+        let env = match read_guest_string_array(memory, envp_addr) {
+            Ok(v) => v,
+            Err(errno) => return DispatchOutcome::Errno { errno },
+        };
+
+        DispatchOutcome::Execve { path, argv, env }
     }
 
     /// Linux `clone(2)` (aarch64 syscall 220). Real fork delegation:
@@ -6345,6 +6398,35 @@ fn linux_utimensat_timespec_is_valid(timespec: LinuxTimespec) -> bool {
         return true;
     }
     (0..1_000_000_000).contains(&nsec)
+}
+
+/// Read a NULL-terminated array of guest VA pointers, dereferencing
+/// each to a C string. Used for `argv` / `envp` in `execve(2)`.
+fn read_guest_string_array(
+    memory: &impl GuestMemory,
+    array_addr: u64,
+) -> Result<Vec<String>, i32> {
+    // execve(NULL, ...) is allowed by Linux for argv but treated as
+    // "no argv". Same for envp. Return empty Vec.
+    if array_addr == 0 {
+        return Ok(Vec::new());
+    }
+    const MAX_ENTRIES: usize = 4096;
+    let mut out = Vec::new();
+    for index in 0..MAX_ENTRIES {
+        let slot_addr = array_addr
+            .checked_add((index as u64) * 8)
+            .ok_or(LINUX_E2BIG)?;
+        let bytes = memory
+            .read_bytes(slot_addr, 8)
+            .map_err(|_| LINUX_EFAULT)?;
+        let ptr = u64::from_le_bytes(bytes.try_into().map_err(|_| LINUX_EFAULT)?);
+        if ptr == 0 {
+            return Ok(out);
+        }
+        out.push(read_guest_c_string(memory, ptr)?);
+    }
+    Err(LINUX_E2BIG)
 }
 
 fn read_guest_c_string(memory: &impl GuestMemory, address: u64) -> Result<String, i32> {

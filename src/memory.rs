@@ -482,6 +482,7 @@ impl AddressSpace {
             linux_auxv,
             el0_trampoline_entry,
             el1_vectors_base,
+            stage1_page_tables_base,
             ..
         } = self;
         let argv = argv.into_iter().collect::<Vec<_>>();
@@ -493,6 +494,7 @@ impl AddressSpace {
         image.linux_auxv = linux_auxv;
         image.el0_trampoline_entry = el0_trampoline_entry;
         image.el1_vectors_base = el1_vectors_base;
+        image.stage1_page_tables_base = stage1_page_tables_base;
         Ok(image)
     }
 

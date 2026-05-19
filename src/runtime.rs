@@ -93,6 +93,11 @@ pub trait SyscallTrap {
     /// memory; the runtime then writes the appropriate retval into the
     /// guest's x0 via `complete_syscall`.
     fn fork(&mut self) -> Result<crate::trap::ForkOutcome, TrapError>;
+    /// `execve(2)` — tear down the current guest address space and
+    /// re-initialise this engine with `new_image`. Does NOT advance
+    /// past a syscall (execve has no successful return); the next
+    /// `next_syscall` resumes at the new image's entry point.
+    fn execve_into(&mut self, new_image: &AddressSpace) -> Result<(), TrapError>;
     fn is_forked_child(&self) -> bool {
         false
     }
@@ -390,6 +395,22 @@ where
                 };
                 runtime.complete_syscall(retval)?;
             }
+            DispatchOutcome::Execve { path, argv, env } => {
+                match load_execve_image(&dispatcher, &path, argv, env) {
+                    Ok(new_image) => {
+                        crate::probes::execve_loaded(
+                            &path,
+                            new_image.entry(),
+                            new_image.initial_stack_pointer().unwrap_or(0),
+                            new_image.regions().len() as u64,
+                        );
+                        runtime.execve_into(&new_image)?;
+                    }
+                    Err(errno) => {
+                        runtime.complete_syscall(-(errno as i64))?;
+                    }
+                }
+            }
         }
     }
 
@@ -401,6 +422,34 @@ where
         report: reporter.finish(),
         trap_limit_hit: true,
     })
+}
+
+/// Build a new AddressSpace for an execve target. Resolves the path
+/// through the dispatcher's rootfs when present; falls back to the
+/// host filesystem otherwise (useful for tests where no rootfs is
+/// configured).
+fn load_execve_image(
+    dispatcher: &SyscallDispatcher,
+    path: &str,
+    argv: Vec<String>,
+    env: Vec<String>,
+) -> Result<AddressSpace, i32> {
+    use crate::dispatch::LINUX_ENOENT;
+    let argv = if argv.is_empty() {
+        vec![path.to_string()]
+    } else {
+        argv
+    };
+    let raw = if let Some(rootfs) = dispatcher.rootfs() {
+        AddressSpace::load_elf_from_rootfs(path, rootfs).map_err(|_| LINUX_ENOENT)?
+    } else {
+        AddressSpace::load_elf(path).map_err(|_| LINUX_ENOENT)?
+    };
+    raw.with_el0_trampoline()
+        .and_then(|a| a.with_el1_vectors())
+        .and_then(|a| a.with_stage1_page_tables())
+        .and_then(|a| a.with_linux_initial_stack(argv, env))
+        .map_err(|_| LINUX_ENOENT)
 }
 
 /// Called from a forked child when the guest hits `exit_group`. Flushes
@@ -463,6 +512,20 @@ where
                 };
                 trap.complete_syscall(retval)?;
             }
+            DispatchOutcome::Execve { path, argv, env } => {
+                match load_execve_image(&dispatcher, &path, argv, env) {
+                    Ok(new_image) => {
+                        crate::probes::execve_loaded(
+                            &path,
+                            new_image.entry(),
+                            new_image.initial_stack_pointer().unwrap_or(0),
+                            new_image.regions().len() as u64,
+                        );
+                        trap.execve_into(&new_image)?;
+                    }
+                    Err(errno) => trap.complete_syscall(-(errno as i64))?,
+                }
+            }
         }
     }
 
@@ -479,6 +542,10 @@ where
 impl SyscallTrap for HvfTrapEngine {
     fn fork(&mut self) -> Result<crate::trap::ForkOutcome, TrapError> {
         self.fork()
+    }
+
+    fn execve_into(&mut self, new_image: &AddressSpace) -> Result<(), TrapError> {
+        self.execve_into(new_image)
     }
 
     fn is_forked_child(&self) -> bool {

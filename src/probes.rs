@@ -31,6 +31,15 @@ mod carrick_usdt {
     /// Lower overhead than `syscall-entry` for cases where you only
     /// want to spot loops.
     fn vcpu__trap(_: u64, _: u64, _: u64) {}
+    /// Fires when `execve_into` has finished swapping the engine to
+    /// the new image. `path`, `entry`, `initial_sp`, `mapping_count`
+    /// let dtrace operators verify the new process layout.
+    fn execve__loaded(_: &str, _: u64, _: u64, _: u64) {}
+    /// Fires at the tail of `execve_into` with the actual SCTLR/TTBR0/
+    /// MAIR values read back from HVF. Use this to verify the new
+    /// process's stage-1 MMU state matches what the fresh-from-cli
+    /// case sets up.
+    fn execve__sysregs(_: u64, _: u64, _: u64) {}
 }
 
 pub fn fork_pre(pc: u64, elr: u64, cpsr: u64) {
@@ -43,6 +52,14 @@ pub fn fork_post(pid: i32, pc: u64, elr: u64) {
 
 pub fn vcpu_trap(guest_pc: u64, x8: u64, x0: u64) {
     carrick_usdt::vcpu__trap!(|| (guest_pc, x8, x0));
+}
+
+pub fn execve_loaded(path: &str, entry: u64, initial_sp: u64, mapping_count: u64) {
+    carrick_usdt::execve__loaded!(|| (path, entry, initial_sp, mapping_count));
+}
+
+pub fn execve_sysregs(sctlr: u64, ttbr0: u64, mair: u64) {
+    carrick_usdt::execve__sysregs!(|| (sctlr, ttbr0, mair));
 }
 
 pub fn register_dtrace_probes() -> Result<(), usdt::Error> {
