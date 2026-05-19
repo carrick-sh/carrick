@@ -6742,31 +6742,20 @@ fn truncate_bootstrap_returns_erofs_for_known_paths_and_enoent_for_missing() {
 }
 
 #[test]
-fn planned_socket_syscalls_surface_by_name_in_compat_report() {
+fn socket_syscalls_dispatch_to_real_host_handlers() {
+    // Now that the BSD socket family is wired through to libc, syscall
+    // numbers 198..=212 / 242 must NOT come back as ENOSYS. We don't
+    // care which specific errno the all-zero argument vector produces —
+    // we only require that the dispatcher answered itself rather than
+    // falling through to the "unhandled syscall" branch (which would
+    // set ENOSYS and record an entry in `unhandled_syscalls`).
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x80]);
     let mut reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
-    let expected: &[(u64, &str)] = &[
-        (198, "socket"),
-        (199, "socketpair"),
-        (200, "bind"),
-        (201, "listen"),
-        (202, "accept"),
-        (203, "connect"),
-        (204, "getsockname"),
-        (205, "getpeername"),
-        (206, "sendto"),
-        (207, "recvfrom"),
-        (208, "setsockopt"),
-        (209, "getsockopt"),
-        (210, "shutdown"),
-        (211, "sendmsg"),
-        (212, "recvmsg"),
-        (242, "accept4"),
-    ];
+    let numbers: &[u64] = &[198, 199, 200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 242];
 
-    for (number, _name) in expected {
+    for number in numbers {
         let outcome = dispatcher
             .dispatch(
                 SyscallRequest::new(*number, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
@@ -6774,23 +6763,15 @@ fn planned_socket_syscalls_surface_by_name_in_compat_report() {
                 &mut reporter,
             )
             .unwrap();
-        assert_eq!(
-            outcome,
-            DispatchOutcome::Errno { errno: 38 },
-            "socket syscall {number} should report ENOSYS until a real handler lands"
-        );
+        if let DispatchOutcome::Errno { errno } = outcome {
+            assert_ne!(
+                errno, 38,
+                "socket syscall {number} returned ENOSYS — handler not installed"
+            );
+        }
     }
 
-    let report = reporter.finish();
-    for (number, name) in expected {
-        let entry = report
-            .unhandled_syscalls
-            .iter()
-            .find(|entry| entry.number == *number)
-            .unwrap_or_else(|| panic!("missing compat entry for {name}"));
-        assert_eq!(entry.name, *name);
-        assert_eq!(entry.count, 1);
-    }
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
 #[test]
