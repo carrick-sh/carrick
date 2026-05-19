@@ -26,6 +26,7 @@ zerocopy = { version = "0.8.48", features = ["derive"] }
 
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 applevisor = { version = "1.0.0", default-features = false, features = ["macos-13-0"] }
+applevisor-sys = { version = "1.0.0", default-features = false, features = ["macos-13-0"] }
 
 [dev-dependencies]
 assert_cmd = "2.1.1"
