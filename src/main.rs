@@ -112,6 +112,11 @@ enum Commands {
     /// `dtrace_proc_create`, and streams live per-syscall events + a
     /// frequency-sorted aggregation when the child exits. Requires root.
     Trace {
+        /// Enable dtrace(1) `-F` style flow indentation. Each `entry/`
+        /// or `return/` event in the live stream is indented by call
+        /// depth, making it easier to follow nested syscall paths.
+        #[arg(short = 'F', long = "flowindent")]
+        flowindent: bool,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
@@ -143,8 +148,16 @@ enum RootfsCommand {
     Cat { path: PathBuf },
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// We deliberately do NOT use `#[tokio::main]`: a multi-thread tokio
+/// runtime initialised before the trap loop poisons every child of a
+/// `fork(2)` we perform inside a syscall handler. The worker threads
+/// don't exist in the child, the I/O driver's kqueue fd state is
+/// out-of-sync, and panic-on-stdio-flush is the polite failure mode.
+///
+/// Async work (image pulls, summary reads) runs inside a short-lived
+/// current-thread runtime that drops before the trap loop even begins,
+/// so by the time fork can fire there is no tokio state to break.
+fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -234,7 +247,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Pull { image } => {
             let image = ImageReference::parse(&image)?;
-            let summary = pull_image(&image, &store).await?;
+            let summary = block_on_oci(pull_image(&image, &store))?;
             println!("{}", serde_json::to_string_pretty(&summary)?);
         }
         Commands::Run {
@@ -249,7 +262,7 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 command
             };
-            let summary = store.load_pull_summary(&image).await.with_context(|| {
+            let summary = block_on_oci(store.load_pull_summary(&image)).with_context(|| {
                 format!("image {} is not pulled into the store", image.canonical())
             })?;
             let rootfs_layers: Vec<PathBuf> = summary
@@ -423,7 +436,7 @@ async fn main() -> anyhow::Result<()> {
                 println!("{}", serde_json::to_string_pretty(&state)?);
             }
         },
-        Commands::Trace { command } => {
+        Commands::Trace { flowindent, command } => {
             #[cfg(target_os = "macos")]
             {
                 if command.is_empty() {
@@ -442,12 +455,13 @@ async fn main() -> anyhow::Result<()> {
                         me.display()
                     );
                 }
-                carrick::dtrace_consumer::run_child_under_dtrace(&me, &command)
+                let opts = carrick::dtrace_consumer::TraceOptions { flowindent };
+                carrick::dtrace_consumer::run_child_under_dtrace(&me, &command, &opts)
                     .map_err(|e| anyhow::anyhow!("trace failed: {}", e))?;
             }
             #[cfg(not(target_os = "macos"))]
             {
-                let _ = command;
+                let _ = (flowindent, command);
                 bail!("carrick trace is only available on macOS (libdtrace).");
             }
         }
@@ -460,6 +474,18 @@ async fn main() -> anyhow::Result<()> {
 unsafe extern "C" {
     #[link_name = "geteuid"]
     fn libc_geteuid() -> u32;
+}
+
+/// Run a single OCI-related future on a short-lived current-thread tokio
+/// runtime. The runtime is dropped before returning, so by the time the
+/// guest issues `clone(2)` and we fork the host process there is no
+/// async runtime alive in the parent to corrupt the child.
+fn block_on_oci<F: std::future::Future>(fut: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build current-thread tokio runtime")
+        .block_on(fut)
 }
 
 /// Decode an `ESR_EL1` value into a human-readable struct. Mirrors the

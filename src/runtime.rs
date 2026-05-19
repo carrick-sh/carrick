@@ -93,6 +93,9 @@ pub trait SyscallTrap {
     /// memory; the runtime then writes the appropriate retval into the
     /// guest's x0 via `complete_syscall`.
     fn fork(&mut self) -> Result<crate::trap::ForkOutcome, TrapError>;
+    fn is_forked_child(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Error)]
@@ -365,6 +368,9 @@ where
 
         match outcome {
             DispatchOutcome::Exit { code } => {
+                if runtime.is_forked_child() {
+                    forked_child_exit(code, dispatcher.stdout(), dispatcher.stderr());
+                }
                 return Ok(RunResult {
                     exit_code: code,
                     stdout: dispatcher.stdout().to_vec(),
@@ -397,6 +403,22 @@ where
     })
 }
 
+/// Called from a forked child when the guest hits `exit_group`. Flushes
+/// any buffered guest stdout/stderr to the host's fd 1 / fd 2 (which
+/// the child inherited from the parent process) and then calls
+/// `_exit(2)` to bypass Rust's normal Drop chain. Without this, the
+/// rebuilt HVF context in the child would trigger an `applevisor::Vcpu`
+/// Drop panic ("no VM or vCPU available") during shutdown.
+fn forked_child_exit(code: i32, stdout_buf: &[u8], stderr_buf: &[u8]) -> ! {
+    unsafe extern "C" {
+        fn write(fd: i32, buf: *const u8, count: usize) -> isize;
+        fn _exit(code: i32) -> !;
+    }
+    let _ = unsafe { write(1, stdout_buf.as_ptr(), stdout_buf.len()) };
+    let _ = unsafe { write(2, stderr_buf.as_ptr(), stderr_buf.len()) };
+    unsafe { _exit(code) };
+}
+
 fn run_split_loop<M, T>(
     memory: &mut M,
     trap: &mut T,
@@ -419,6 +441,9 @@ where
 
         match outcome {
             DispatchOutcome::Exit { code } => {
+                if trap.is_forked_child() {
+                    forked_child_exit(code, dispatcher.stdout(), dispatcher.stderr());
+                }
                 return Ok(RunResult {
                     exit_code: code,
                     stdout: dispatcher.stdout().to_vec(),
@@ -454,6 +479,10 @@ where
 impl SyscallTrap for HvfTrapEngine {
     fn fork(&mut self) -> Result<crate::trap::ForkOutcome, TrapError> {
         self.fork()
+    }
+
+    fn is_forked_child(&self) -> bool {
+        HvfTrapEngine::is_forked_child(self)
     }
 
     fn next_syscall(&mut self) -> Result<Aarch64SyscallFrame, TrapError> {
