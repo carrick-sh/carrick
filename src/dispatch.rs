@@ -2287,10 +2287,37 @@ impl SyscallDispatcher {
                 let Some(open_file) = self.open_files.get(&fd) else {
                     return DispatchOutcome::Errno { errno: LINUX_EBADF };
                 };
+                let next_flags = arg & !LINUX_O_CLOEXEC;
+                // Propagate O_NONBLOCK to the underlying host fd when one
+                // exists. Without this, our libc::read still blocks even
+                // after the guest set O_NONBLOCK — apt's http method
+                // depends on this for the pselect6 wait pattern.
+                let open = open_file.description.borrow();
+                if let Some(host_fd) = match &*open {
+                    OpenDescription::HostPipe { host_fd, .. }
+                    | OpenDescription::HostSocket { host_fd, .. } => Some(*host_fd),
+                    _ => None,
+                } {
+                    let want_nonblock = next_flags & LINUX_O_NONBLOCK != 0;
+                    unsafe {
+                        let cur = libc::fcntl(host_fd, libc::F_GETFL, 0);
+                        if cur >= 0 {
+                            let next = if want_nonblock {
+                                cur | libc::O_NONBLOCK
+                            } else {
+                                cur & !libc::O_NONBLOCK
+                            };
+                            if next != cur {
+                                libc::fcntl(host_fd, libc::F_SETFL, next);
+                            }
+                        }
+                    }
+                }
+                drop(open);
                 open_file
                     .description
                     .borrow_mut()
-                    .set_status_flags(arg & !LINUX_O_CLOEXEC);
+                    .set_status_flags(next_flags);
                 DispatchOutcome::Returned { value: 0 }
             }
             // Advisory record locks: apt uses fcntl(F_SETLK) on
