@@ -149,7 +149,23 @@ impl GuestMappingPlan {
 }
 
 pub struct HvfTrapEngine {
-    inner: HvfInner,
+    inner: std::mem::ManuallyDrop<HvfInner>,
+}
+
+// On Drop we deliberately do NOT run applevisor's Vcpu / VirtualMachine
+// destructors. Once carrick has executed a single `fork(2)` inside the
+// trap loop, applevisor's internal state is no longer consistent with
+// HVF in either the parent or the child — Drop unwraps
+// `hv_vcpu_destroy` and panics with "no VM or vCPU available". Since
+// the carrick host process is exiting either way, we let the kernel
+// reclaim the HVF VM / vCPU at process exit and skip the Rust-side
+// teardown.
+impl Drop for HvfTrapEngine {
+    fn drop(&mut self) {
+        // `ManuallyDrop::drop` is the only thing that would invoke
+        // `HvfInner::Drop` (which in turn drops `applevisor::Vcpu` and
+        // `VirtualMachineInstance`). Skipping it is the whole point.
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -162,6 +178,14 @@ struct HvfInner {
     /// stub's `hvc` (`EC = 0x16`) so `complete_syscall` knows whether to
     /// advance PC past the HVC before resuming.
     last_exit_class: u64,
+    /// True iff this engine was produced by a `fork(2)` returning into a
+    /// child. The runtime checks this when the guest exits and calls
+    /// `_exit(2)` instead of running normal Rust drops — applevisor's
+    /// Vcpu Drop unwraps `hv_vcpu_destroy` and panics in the
+    /// post-fork child's HVF context (the new VM HVF tracks for the
+    /// child got swapped in by `fork()`; ordering of `_vm` vs `vcpu`
+    /// Drop trips a "no VM or vCPU available" assertion).
+    is_forked_child: bool,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -262,6 +286,21 @@ impl HvfTrapEngine {
         self.inner.fork()
     }
 
+    /// True iff this engine was produced by a successful `fork(2)`
+    /// returning into the child. The runtime uses this to short-circuit
+    /// host-side teardown when the guest exits (Rust drops on the
+    /// rebuilt HVF state would otherwise panic in applevisor's Vcpu
+    /// Drop). Always false on non-macOS/non-aarch64 builds.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn is_forked_child(&self) -> bool {
+        self.inner.is_forked_child
+    }
+
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    pub fn is_forked_child(&self) -> bool {
+        false
+    }
+
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     pub fn fork(&mut self) -> Result<ForkOutcome, TrapError> {
         Err(TrapError::UnsupportedPlatform)
@@ -277,12 +316,13 @@ impl HvfTrapEngine {
         let vm = VirtualMachine::with_config(config).map_err(hvf_error)?;
         let vcpu = vm.vcpu_create().map_err(hvf_error)?;
         Ok(Self {
-            inner: HvfInner {
+            inner: std::mem::ManuallyDrop::new(HvfInner {
                 _vm: vm,
                 vcpu,
                 mappings: Vec::new(),
                 last_exit_class: 0,
-            },
+                is_forked_child: false,
+            }),
         })
     }
 
@@ -720,11 +760,21 @@ impl HvfInner {
 
         // Pre-fork: snapshot vCPU state and capture mapping descriptors.
         let snapshot = self.snapshot_vcpu()?;
+        crate::probes::fork_pre(snapshot.pc, snapshot.elr_el1, snapshot.cpsr);
         let mapping_descs: Vec<(u64, u64, *mut u8, usize, MemPerms)> = self
             .mappings
             .iter()
             .map(|m| (m.start, m.end, m.host_addr, m.size, m.perms))
             .collect();
+
+        // Tear down the parent's HVF context BEFORE forking. macOS's
+        // HVF kernel state is not fork-safe: if a VM exists in the
+        // parent at fork(2) time, the child inherits a "resource is
+        // busy" state that prevents `hv_vm_create` from succeeding.
+        // Both processes then rebuild a fresh VM from the snapshot.
+        let inherited_vcpu_id = self.vcpu.id();
+        let _ = unsafe { applevisor_sys::hv_vcpu_destroy(inherited_vcpu_id) };
+        let _ = unsafe { applevisor_sys::hv_vm_destroy() };
 
         // Real fork. Caller is expected to have flushed any host-side
         // stdio buffers; for our JSON-at-end report flow this is fine.
@@ -737,38 +787,43 @@ impl HvfInner {
                 std::io::Error::last_os_error().to_string(),
             ));
         }
-        if pid > 0 {
-            // Parent: nothing to do. We keep the existing VM, vCPU, and
-            // mappings — the macOS process-level fork didn't touch HVF.
-            return Ok(ForkOutcome::Parent { child_pid: pid });
-        }
+        // Both parent and child fall through to the rebuild path below.
+        // The discriminator at the end of the function returns the
+        // appropriate `ForkOutcome` based on `pid`.
 
-        // ----- Child path -----
+        // ----- Symmetric rebuild path (parent AND child reach here) -----
         //
-        // The child's view of HVF state is invalid: the kernel resources
-        // (VM handle, vCPU handle, stage-2 mappings) belong to the parent
-        // process. We mem::forget the old inner so Drop doesn't call
-        // hv_vm_unmap / hv_vcpu_destroy / hv_vm_destroy on stale state
-        // (which would either no-op or error). The host buffers backing
-        // the mappings stay valid via Mach VM COW; we re-issue
-        // `hv_vm_map` in the fresh VM to register them at the same IPAs.
-
-        // Build a fresh dummy that we can swap in while we forget the old.
+        // Build a fresh VM + vCPU. Both processes have just had their
+        // HVF state torn down (parent did it pre-fork; child inherited
+        // the now-empty state via fork). Each side independently
+        // re-registers the inherited host buffers via raw `hv_vm_map`.
         let max_ipa = VirtualMachineConfig::get_max_ipa_size().map_err(hvf_error)?;
         let mut config = VirtualMachineConfig::new();
         config.set_ipa_size(max_ipa).map_err(hvf_error)?;
         let new_vm = VirtualMachine::with_config(config).map_err(hvf_error)?;
         let new_vcpu = new_vm.vcpu_create().map_err(hvf_error)?;
 
-        // Replace inner: hand-construct a new HvfInner and FORGET the old.
+        // Overwrite *self with the new HvfInner WITHOUT running Drop on
+        // the old contents. The old struct holds applevisor wrappers
+        // around HVF handles that we already destroyed via the raw API
+        // pre-fork; running their Drop now would unwrap NO_RESOURCES
+        // and panic.
+        //
+        // `is_forked_child` is true only in the child process; the
+        // parent kept its pre-fork host process identity, so its post-
+        // fork cleanup still uses the normal path (which now also goes
+        // through ManuallyDrop, so neither side runs the panicky
+        // destructors).
         let new_inner = HvfInner {
             _vm: new_vm,
             vcpu: new_vcpu,
             mappings: Vec::with_capacity(mapping_descs.len()),
             last_exit_class: snapshot.last_exit_class,
+            is_forked_child: pid == 0,
         };
-        let old_inner = std::mem::replace(self, new_inner);
-        std::mem::forget(old_inner);
+        unsafe {
+            std::ptr::write(self as *mut HvfInner, new_inner);
+        }
 
         // Re-map each region using raw hv_vm_map. The host buffer is
         // already valid in the child (COW); the new VM owns the new
@@ -805,11 +860,17 @@ impl HvfInner {
             });
         }
 
-        // Restore vCPU register state from the pre-fork snapshot. The
-        // child resumes inside the same `clone` syscall site; the
-        // dispatcher will then write 0 (child's clone retval) into X0.
+        // Restore vCPU register state from the pre-fork snapshot. Both
+        // parent and child resume inside the same `clone` syscall site;
+        // the dispatcher will then write the appropriate retval into
+        // X0 (child pid for parent, 0 for child).
         self.restore_vcpu(&snapshot)?;
-        Ok(ForkOutcome::Child)
+        crate::probes::fork_post(pid, snapshot.pc, snapshot.elr_el1);
+        if pid == 0 {
+            Ok(ForkOutcome::Child)
+        } else {
+            Ok(ForkOutcome::Parent { child_pid: pid })
+        }
     }
 }
 

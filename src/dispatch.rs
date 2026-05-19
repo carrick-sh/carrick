@@ -672,7 +672,7 @@ impl SyscallDispatcher {
             231 => self.munlockall(),
             232 => self.mincore(request, memory),
             233 => self.madvise(request, memory),
-            260 => self.wait4(request),
+            260 => self.wait4(request, memory),
             261 => self.prlimit64(request, memory),
             266 => self.clock_adjtime(request, memory),
             278 => self.getrandom(request, memory)?,
@@ -2810,16 +2810,44 @@ impl SyscallDispatcher {
         }
     }
 
-    fn wait4(&self, request: SyscallRequest) -> DispatchOutcome {
+    fn wait4(
+        &self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+    ) -> DispatchOutcome {
+        let pid = request.arg(0) as i32;
+        let wstatus_addr = request.arg(1);
         let options = request.arg(2);
         if options & !LINUX_WAIT4_SUPPORTED_FLAGS != 0 {
-            return DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            };
+            return DispatchOutcome::Errno { errno: LINUX_EINVAL };
         }
-        DispatchOutcome::Errno {
-            errno: LINUX_ECHILD,
+        // Linux WNOHANG = 1; macOS WNOHANG = 1. Same bit, pass through.
+        unsafe extern "C" {
+            fn waitpid(pid: i32, wstatus: *mut i32, options: i32) -> i32;
+            #[link_name = "__error"]
+            fn errno_loc() -> *mut i32;
         }
+        let mut host_status: i32 = 0;
+        let result = unsafe { waitpid(pid, &mut host_status, options as i32) };
+        if result < 0 {
+            let host_errno = unsafe { *errno_loc() };
+            // ECHILD on macOS == ECHILD on Linux (10).
+            return DispatchOutcome::Errno { errno: host_errno };
+        }
+        if result == 0 {
+            // WNOHANG and no child ready.
+            return DispatchOutcome::Returned { value: 0 };
+        }
+        // Linux and Darwin agree on the wstatus encoding for exited /
+        // signaled children: low 7 bits = signal, bit 7 = core flag,
+        // bits 8..15 = exit code. Pass through as-is.
+        if wstatus_addr != 0 {
+            let bytes = host_status.to_ne_bytes();
+            if memory.write_bytes(wstatus_addr, &bytes).is_err() {
+                return DispatchOutcome::Errno { errno: LINUX_EFAULT };
+            }
+        }
+        DispatchOutcome::Returned { value: i64::from(result) }
     }
 
     fn openat(

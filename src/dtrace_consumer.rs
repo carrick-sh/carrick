@@ -119,12 +119,22 @@ unsafe fn errmsg(hdl: *mut DtraceHdl) -> String {
     }
 }
 
+/// Toggles applied to the libdtrace consumer before `dtrace_go`.
+#[derive(Debug, Clone, Default)]
+pub struct TraceOptions {
+    /// When true, sets the libdtrace `flowindent` option — same as
+    /// running `dtrace -F`. Indents each entry/return event by call
+    /// depth.
+    pub flowindent: bool,
+}
+
 /// Spawn `child_path` with `child_argv` under DTrace, with our bundled
 /// D program enabled. Streams live events and aggregations to the
 /// parent's stdout. Returns when the child exits.
 pub fn run_child_under_dtrace(
     child_path: &Path,
     child_argv: &[String],
+    opts: &TraceOptions,
 ) -> Result<(), DTraceError> {
     // argv[0] convention: pass the child path as argv[0]. dtrace_proc_create
     // takes file + argv, and the argv array must be NULL-terminated.
@@ -147,17 +157,19 @@ pub fn run_child_under_dtrace(
         return Err(DTraceError::Open(err));
     }
 
-    // Sensible runtime defaults — match what dtrace(1) sets when invoked
-    // without flags. Without these, ring buffers are tiny and we lose
-    // probes the moment the workload is anything more than a hello.
-    let opts = &[
-        ("bufsize", "4m"),
-        ("aggsize", "4m"),
-        ("aggrate", "1ms"),
-        ("statusrate", "10ms"),
-        ("strsize", "512"),
-    ];
-    for (k, v) in opts {
+    // Sensible runtime defaults are appended to in `all_opts` below.
+    let mut all_opts: Vec<(&str, &str)> =
+        vec![
+            ("bufsize", "4m"),
+            ("aggsize", "4m"),
+            ("aggrate", "1ms"),
+            ("statusrate", "10ms"),
+            ("strsize", "512"),
+        ];
+    if opts.flowindent {
+        all_opts.push(("flowindent", ""));
+    }
+    for (k, v) in &all_opts {
         let kc = CString::new(*k).unwrap();
         let vc = CString::new(*v).unwrap();
         if unsafe { dtrace_setopt(hdl, kc.as_ptr(), vc.as_ptr()) } != 0 {

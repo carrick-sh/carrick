@@ -22,6 +22,12 @@ dtrace:::BEGIN
 carrick*:::syscall-entry
 {
     @entries[copyinstr(arg1)] = count();
+    /*
+     * arg2 is a pointer to the JSON-serialised SyscallArgs:
+     *   "[v0,v1,v2,v3,v4,v5]" — values are decimal u64s.
+     */
+    printf("[entry] %-24s nr=%-3d args=%s\n",
+        copyinstr(arg1), arg0, copyinstr(arg2));
 }
 
 carrick*:::syscall-return
@@ -39,7 +45,8 @@ carrick*:::syscall-return
 carrick*:::unhandled-syscall
 {
     @unhandled[copyinstr(arg1)] = count();
-    printf("[unh  ] %-24s nr=%d\n", copyinstr(arg1), arg0);
+    printf("[unh  ] %-24s nr=%-3d args=%s\n",
+        copyinstr(arg1), arg0, copyinstr(arg2));
 }
 
 carrick*:::partial-syscall
@@ -73,6 +80,26 @@ carrick*:::signal-unsupported
     @unsupported_signals[(int)arg0, copyinstr(arg1)] = count();
     printf("[sig  ] signum=%-2d reason=%s\n",
         (int)arg0, copyinstr(arg1));
+}
+
+carrick*:::fork-pre
+{
+    printf("[fork-pre ] pc=%#x elr=%#x cpsr=%#x\n", arg0, arg1, arg2);
+}
+
+carrick*:::fork-post
+/(int)arg0 == 0/
+{
+    printf("[fork-chld] pc=%#x elr=%#x\n", arg1, arg2);
+    @forks["child"] = count();
+}
+
+carrick*:::fork-post
+/(int)arg0 != 0/
+{
+    printf("[fork-prnt] child_pid=%d pc=%#x elr=%#x\n",
+        (int)arg0, arg1, arg2);
+    @forks["parent"] = count();
 }
 
 dtrace:::END
