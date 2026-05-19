@@ -540,7 +540,16 @@ mod tests {
 }
 
 fn register_dtrace_probes() {
-    if let Err(err) = carrick::probes::register_dtrace_probes() {
-        tracing::debug!("failed to register DTrace probes: {err}");
+    match carrick::probes::register_dtrace_probes() {
+        Ok(()) => {
+            if std::env::var_os("CARRICK_DTRACE_DEBUG").is_some() {
+                eprintln!("carrick: dtrace probes registered (pid={})", std::process::id());
+            }
+        }
+        Err(err) => {
+            // Always surface registration failures: silent failure here is
+            // what makes the dtrace path feel broken.
+            eprintln!("carrick: failed to register DTrace probes: {err}");
+        }
     }
 }
