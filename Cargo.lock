@@ -198,6 +198,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "applevisor",
+ "applevisor-sys",
  "assert_cmd",
  "camino",
  "clap",
