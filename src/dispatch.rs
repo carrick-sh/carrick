@@ -9353,7 +9353,164 @@ fn read_guest_string_array(
 fn host_errno() -> i32 {
     // SAFETY: `__errno_location` (Linux) and `__error` (macOS) both
     // return a thread-local int pointer.
-    unsafe { *libc::__error() }
+    let raw = unsafe { *libc::__error() };
+    macos_to_linux_errno(raw)
+}
+
+/// Linux UAPI errno values. Sourced from
+/// `linux/include/uapi/asm-generic/errno-base.h` and `errno.h`.
+/// Hardcoded here so the translation is independent of whatever the
+/// host's libc decided to name (or number) these — when we run on
+/// macOS, `libc::EAGAIN` is 35, but Linux's EAGAIN is 11. We need
+/// constant Linux numbers regardless of host.
+#[allow(dead_code)]
+pub mod linux_errno {
+    pub const EPERM: i32 = 1;
+    pub const ENOENT: i32 = 2;
+    pub const ESRCH: i32 = 3;
+    pub const EINTR: i32 = 4;
+    pub const EIO: i32 = 5;
+    pub const ENXIO: i32 = 6;
+    pub const E2BIG: i32 = 7;
+    pub const ENOEXEC: i32 = 8;
+    pub const EBADF: i32 = 9;
+    pub const ECHILD: i32 = 10;
+    pub const EAGAIN: i32 = 11; // ≡ EWOULDBLOCK
+    pub const ENOMEM: i32 = 12;
+    pub const EACCES: i32 = 13;
+    pub const EFAULT: i32 = 14;
+    pub const ENOTBLK: i32 = 15;
+    pub const EBUSY: i32 = 16;
+    pub const EEXIST: i32 = 17;
+    pub const EXDEV: i32 = 18;
+    pub const ENODEV: i32 = 19;
+    pub const ENOTDIR: i32 = 20;
+    pub const EISDIR: i32 = 21;
+    pub const EINVAL: i32 = 22;
+    pub const ENFILE: i32 = 23;
+    pub const EMFILE: i32 = 24;
+    pub const ENOTTY: i32 = 25;
+    pub const ETXTBSY: i32 = 26;
+    pub const EFBIG: i32 = 27;
+    pub const ENOSPC: i32 = 28;
+    pub const ESPIPE: i32 = 29;
+    pub const EROFS: i32 = 30;
+    pub const EMLINK: i32 = 31;
+    pub const EPIPE: i32 = 32;
+    pub const EDOM: i32 = 33;
+    pub const ERANGE: i32 = 34;
+    // ----- Linux SysV-style codes start here; macOS diverges -----
+    pub const EDEADLK: i32 = 35;
+    pub const ENAMETOOLONG: i32 = 36;
+    pub const ENOLCK: i32 = 37;
+    pub const ENOSYS: i32 = 38;
+    pub const ENOTEMPTY: i32 = 39;
+    pub const ELOOP: i32 = 40;
+    pub const ENOMSG: i32 = 42;
+    pub const EIDRM: i32 = 43;
+    pub const ENOLINK: i32 = 67;
+    pub const EBADMSG: i32 = 74;
+    pub const EOVERFLOW: i32 = 75;
+    pub const EILSEQ: i32 = 84;
+    pub const ENOTSOCK: i32 = 88;
+    pub const EDESTADDRREQ: i32 = 89;
+    pub const EMSGSIZE: i32 = 90;
+    pub const EPROTOTYPE: i32 = 91;
+    pub const ENOPROTOOPT: i32 = 92;
+    pub const EPROTONOSUPPORT: i32 = 93;
+    pub const ESOCKTNOSUPPORT: i32 = 94;
+    pub const EOPNOTSUPP: i32 = 95; // ≡ ENOTSUP
+    pub const EPFNOSUPPORT: i32 = 96;
+    pub const EAFNOSUPPORT: i32 = 97;
+    pub const EADDRINUSE: i32 = 98;
+    pub const EADDRNOTAVAIL: i32 = 99;
+    pub const ENETDOWN: i32 = 100;
+    pub const ENETUNREACH: i32 = 101;
+    pub const ENETRESET: i32 = 102;
+    pub const ECONNABORTED: i32 = 103;
+    pub const ECONNRESET: i32 = 104;
+    pub const ENOBUFS: i32 = 105;
+    pub const EISCONN: i32 = 106;
+    pub const ENOTCONN: i32 = 107;
+    pub const ESHUTDOWN: i32 = 108;
+    pub const ETOOMANYREFS: i32 = 109;
+    pub const ETIMEDOUT: i32 = 110;
+    pub const ECONNREFUSED: i32 = 111;
+    pub const EHOSTDOWN: i32 = 112;
+    pub const EHOSTUNREACH: i32 = 113;
+    pub const EALREADY: i32 = 114;
+    pub const EINPROGRESS: i32 = 115;
+    pub const ESTALE: i32 = 116;
+    pub const EUCLEAN: i32 = 117;
+    pub const EREMOTE: i32 = 121;
+    pub const EDQUOT: i32 = 122;
+    pub const ECANCELED: i32 = 125;
+}
+
+/// Robust, systematic macOS-errno → Linux-errno translation. Driven
+/// off the host's `libc::E*` constants on the macOS side so we don't
+/// hard-code macOS numeric values — if Apple ever renumbers something
+/// (they won't, but defensive coding) we pick up the new value
+/// automatically. Codes 1..=34 overlap between the two and pass
+/// through unchanged. Sources:
+/// - macOS: <sys/errno.h>
+/// - Linux: asm-generic/errno-base.h + asm-generic/errno.h
+fn macos_to_linux_errno(macos: i32) -> i32 {
+    use linux_errno::*;
+    #[cfg(target_os = "macos")]
+    {
+        match macos {
+            x if x == libc::EAGAIN => EAGAIN,
+            x if x == libc::EINPROGRESS => EINPROGRESS,
+            x if x == libc::EALREADY => EALREADY,
+            x if x == libc::ENOTSOCK => ENOTSOCK,
+            x if x == libc::EDESTADDRREQ => EDESTADDRREQ,
+            x if x == libc::EMSGSIZE => EMSGSIZE,
+            x if x == libc::EPROTOTYPE => EPROTOTYPE,
+            x if x == libc::ENOPROTOOPT => ENOPROTOOPT,
+            x if x == libc::EPROTONOSUPPORT => EPROTONOSUPPORT,
+            x if x == libc::ESOCKTNOSUPPORT => ESOCKTNOSUPPORT,
+            x if x == libc::EOPNOTSUPP => EOPNOTSUPP,
+            x if x == libc::EPFNOSUPPORT => EPFNOSUPPORT,
+            x if x == libc::EAFNOSUPPORT => EAFNOSUPPORT,
+            x if x == libc::EADDRINUSE => EADDRINUSE,
+            x if x == libc::EADDRNOTAVAIL => EADDRNOTAVAIL,
+            x if x == libc::ENETDOWN => ENETDOWN,
+            x if x == libc::ENETUNREACH => ENETUNREACH,
+            x if x == libc::ENETRESET => ENETRESET,
+            x if x == libc::ECONNABORTED => ECONNABORTED,
+            x if x == libc::ECONNRESET => ECONNRESET,
+            x if x == libc::ENOBUFS => ENOBUFS,
+            x if x == libc::EISCONN => EISCONN,
+            x if x == libc::ENOTCONN => ENOTCONN,
+            x if x == libc::ESHUTDOWN => ESHUTDOWN,
+            x if x == libc::ETOOMANYREFS => ETOOMANYREFS,
+            x if x == libc::ETIMEDOUT => ETIMEDOUT,
+            x if x == libc::ECONNREFUSED => ECONNREFUSED,
+            x if x == libc::ELOOP => ELOOP,
+            x if x == libc::ENAMETOOLONG => ENAMETOOLONG,
+            x if x == libc::EHOSTDOWN => EHOSTDOWN,
+            x if x == libc::EHOSTUNREACH => EHOSTUNREACH,
+            x if x == libc::ENOTEMPTY => ENOTEMPTY,
+            x if x == libc::EDQUOT => EDQUOT,
+            x if x == libc::ESTALE => ESTALE,
+            x if x == libc::EREMOTE => EREMOTE,
+            x if x == libc::ENOLCK => ENOLCK,
+            x if x == libc::ENOSYS => ENOSYS,
+            x if x == libc::EOVERFLOW => EOVERFLOW,
+            x if x == libc::ECANCELED => ECANCELED,
+            x if x == libc::EIDRM => EIDRM,
+            x if x == libc::ENOMSG => ENOMSG,
+            x if x == libc::EILSEQ => EILSEQ,
+            x if x == libc::EBADMSG => EBADMSG,
+            // Codes 1..=34 overlap; anything else falls through.
+            other => other,
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        macos
+    }
 }
 
 // ----- BSD socket translation helpers ------------------------------------
@@ -9979,4 +10136,68 @@ mod overlay_dispatch_tests {
     }
 
     const SYS_PIPE2: u64 = 59;
+
+    /// Systematic errno translation tests. Verifies every code where
+    /// macOS and Linux disagree maps correctly, plus that codes 1..=34
+    /// pass through unchanged. Pins the contract so a future libc
+    /// crate version that renumbers something fails CI rather than
+    /// silently producing wrong errnos for guest binaries.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn errno_translation_covers_every_divergent_code() {
+        use crate::dispatch::{linux_errno, macos_to_linux_errno};
+        // Overlap zone: 1..=34 must pass through.
+        for code in 1..=34 {
+            assert_eq!(
+                macos_to_linux_errno(code),
+                code,
+                "code {} should be identity in overlap zone",
+                code
+            );
+        }
+        // The divergence cases that bit us — apt's connect saw macOS
+        // EINPROGRESS=36 surface in the guest as ENAMETOOLONG=36.
+        assert_eq!(macos_to_linux_errno(libc::EINPROGRESS), linux_errno::EINPROGRESS);
+        assert_ne!(macos_to_linux_errno(libc::EINPROGRESS), 36, "EINPROGRESS != Linux ENAMETOOLONG");
+        // Sample of network errnos that matter for apt's HTTP method.
+        assert_eq!(macos_to_linux_errno(libc::EAGAIN), linux_errno::EAGAIN);
+        assert_eq!(macos_to_linux_errno(libc::ECONNREFUSED), linux_errno::ECONNREFUSED);
+        assert_eq!(macos_to_linux_errno(libc::EHOSTUNREACH), linux_errno::EHOSTUNREACH);
+        assert_eq!(macos_to_linux_errno(libc::ETIMEDOUT), linux_errno::ETIMEDOUT);
+        assert_eq!(macos_to_linux_errno(libc::ENOTCONN), linux_errno::ENOTCONN);
+        assert_eq!(macos_to_linux_errno(libc::ECONNRESET), linux_errno::ECONNRESET);
+        assert_eq!(macos_to_linux_errno(libc::EADDRINUSE), linux_errno::EADDRINUSE);
+        assert_eq!(macos_to_linux_errno(libc::EAFNOSUPPORT), linux_errno::EAFNOSUPPORT);
+        // Filesystem errnos that diverge.
+        assert_eq!(macos_to_linux_errno(libc::ENAMETOOLONG), linux_errno::ENAMETOOLONG);
+        assert_eq!(macos_to_linux_errno(libc::ENOTEMPTY), linux_errno::ENOTEMPTY);
+        assert_eq!(macos_to_linux_errno(libc::ELOOP), linux_errno::ELOOP);
+        assert_eq!(macos_to_linux_errno(libc::ENOSYS), linux_errno::ENOSYS);
+        assert_eq!(macos_to_linux_errno(libc::ENOLCK), linux_errno::ENOLCK);
+        // Misc.
+        assert_eq!(macos_to_linux_errno(libc::EIDRM), linux_errno::EIDRM);
+        assert_eq!(macos_to_linux_errno(libc::EILSEQ), linux_errno::EILSEQ);
+        assert_eq!(macos_to_linux_errno(libc::ECANCELED), linux_errno::ECANCELED);
+    }
+
+    /// The Linux errno constants we publish must match the
+    /// asm-generic kernel headers. Pinned values from
+    /// linux/include/uapi/asm-generic/errno{,-base}.h.
+    #[test]
+    fn linux_errno_constants_match_kernel_uapi() {
+        use crate::dispatch::linux_errno::*;
+        assert_eq!(EPERM, 1);
+        assert_eq!(ENOENT, 2);
+        assert_eq!(EAGAIN, 11);
+        assert_eq!(ENOMEM, 12);
+        assert_eq!(EFAULT, 14);
+        assert_eq!(EINVAL, 22);
+        assert_eq!(ESPIPE, 29);
+        assert_eq!(EDEADLK, 35);
+        assert_eq!(ENAMETOOLONG, 36);
+        assert_eq!(ENOSYS, 38);
+        assert_eq!(EINPROGRESS, 115);
+        assert_eq!(ETIMEDOUT, 110);
+        assert_eq!(ECONNREFUSED, 111);
+    }
 }
