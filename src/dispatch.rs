@@ -3695,6 +3695,13 @@ impl SyscallDispatcher {
         let address = request.arg(1);
         let length = usize::try_from(request.arg(2))
             .map_err(|_| DispatchError::LengthTooLarge(request.arg(2)))?;
+        // fd 0 with no explicit OpenDescription: read from host stdin.
+        // This is what makes `read` against the guest's stdin pick up
+        // input from the user's terminal (or whatever the carrick host
+        // process's stdin is — file, pipe, or terminal).
+        if fd == 0 && !self.open_files.contains_key(&0) {
+            return Ok(read_host_pipe(memory, address, length, 0));
+        }
         let Some(open_file) = self.open_files.get(&fd) else {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         };
