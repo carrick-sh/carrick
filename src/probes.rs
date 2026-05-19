@@ -17,6 +17,10 @@ mod carrick_usdt {
     fn proc__read__unimplemented(_: &str) {}
     fn sys__read__unimplemented(_: &str) {}
     fn signal__unsupported(_: i32, _: &str) {}
+    /// Fires on every guest syscall that passes flag bits we don't
+    /// recognise. Catches Linux ABI drift loudly instead of letting
+    /// the dispatcher silently drop behaviour the guest expected.
+    fn unknown__syscall__flags(_: u64, _: &str, _: u32, _: u64) {}
     /// Fires before `libc::fork` from the trap engine's clone path.
     /// Args are the captured pre-fork vCPU PC, ELR_EL1, and CPSR.
     fn fork__pre(_: u64, _: u64, _: u64) {}
@@ -107,6 +111,19 @@ fn fire_usdt(event: &CompatEvent) {
         }
         CompatEvent::SignalUnsupported { signum, reason } => {
             carrick_usdt::signal__unsupported!(|| (*signum, reason.as_str()));
+        }
+        CompatEvent::UnknownSyscallFlags {
+            number,
+            name,
+            argument,
+            unknown_bits,
+        } => {
+            carrick_usdt::unknown__syscall__flags!(|| (
+                *number,
+                name.as_str(),
+                *argument,
+                *unknown_bits
+            ));
         }
     }
 }

@@ -806,6 +806,25 @@ impl SyscallDispatcher {
             args: request.args,
         });
 
+        // Systematic unknown-flag check. For each syscall whose flag
+        // argument has a well-defined supported mask, validate the
+        // bits BEFORE the handler runs. The handler still executes
+        // (it makes its own EINVAL decisions); this just guarantees
+        // a structured report entry whenever a bit drifts.
+        for (nr, arg_index, mask) in SYSCALL_FLAG_VALIDATORS {
+            if *nr == request.number {
+                let value = request.arg(*arg_index as usize);
+                check_syscall_flags(
+                    reporter,
+                    request.number,
+                    name,
+                    *arg_index,
+                    value,
+                    *mask,
+                );
+            }
+        }
+
         let outcome = match request.number {
             5..=16 => self.xattr_unsupported(),
             17 => self.getcwd(request, memory)?,
@@ -7575,6 +7594,121 @@ fn write_into_file_contents(contents: &mut Vec<u8>, offset: &mut usize, bytes: &
     *offset = end;
 }
 
+/// (syscall_number, arg_index, supported_mask) for every syscall that
+/// takes a `flags`-style argument with a well-defined supported bit
+/// set on aarch64 Linux. The dispatch entry point consults this table
+/// BEFORE the handler runs, so any flag bit the guest sets that we
+/// don't recognise produces a `UnknownSyscallFlags` event in the
+/// compat report (and a `unknown-syscall-flags` USDT probe firing)
+/// regardless of whether the individual handler validates flags
+/// itself. Add entries here as new flag-bearing syscalls land.
+const SYSCALL_FLAG_VALIDATORS: &[(u64, u32, u64)] = &[
+    // eventfd2(initval, flags): EFD_SEMAPHORE | EFD_NONBLOCK | EFD_CLOEXEC
+    (19, 1, LINUX_EFD_SEMAPHORE | LINUX_EFD_NONBLOCK | LINUX_EFD_CLOEXEC),
+    // epoll_create1(flags): EPOLL_CLOEXEC
+    (20, 0, LINUX_EPOLL_CLOEXEC),
+    // dup3(oldfd, newfd, flags): O_CLOEXEC
+    (24, 2, LINUX_O_CLOEXEC),
+    // unlinkat(dirfd, pathname, flags): AT_REMOVEDIR (0x200) plus the
+    // AT_EMPTY_PATH/AT_SYMLINK_NOFOLLOW pair we accept elsewhere
+    (35, 2, 0x200 | LINUX_AT_EMPTY_PATH | LINUX_AT_SYMLINK_NOFOLLOW),
+    // renameat2(olddirfd, oldpath, newdirfd, newpath, flags):
+    // RENAME_NOREPLACE(1)|EXCHANGE(2)|WHITEOUT(4)
+    (276, 4, 0x1 | 0x2 | 0x4),
+    // openat(dirfd, pathname, flags, mode): the open flags we recognise
+    // — a superset that covers RDONLY/WRONLY/RDWR + the standard mods.
+    // Bits are kept liberal because openat is the most-touched syscall.
+    (
+        56,
+        2,
+        // access mode bits 0..1 = O_RDONLY/O_WRONLY/O_RDWR
+        0o3
+        // common bit flags
+        | 0o100      // O_CREAT
+        | 0o200      // O_EXCL
+        | 0o400      // O_NOCTTY
+        | 0o1000     // O_TRUNC
+        | 0o2000     // O_APPEND
+        | LINUX_O_NONBLOCK
+        | 0o10000    // O_DSYNC
+        | 0o20000    // FASYNC
+        | 0o40000    // O_DIRECT
+        | 0o100000   // O_LARGEFILE
+        | 0o200000   // O_DIRECTORY
+        | 0o400000   // O_NOFOLLOW
+        | 0o1000000  // O_NOATIME
+        | LINUX_O_CLOEXEC
+        | 0o4010000  // O_SYNC
+        | 0o010000000 // O_PATH
+        | 0o020000000 // O_TMPFILE
+    ),
+    // pipe2(pipefd, flags): O_CLOEXEC | O_NONBLOCK
+    (59, 1, LINUX_O_CLOEXEC | LINUX_O_NONBLOCK),
+    // signalfd4(fd, mask, sizemask, flags): SFD_NONBLOCK | SFD_CLOEXEC
+    (74, 3, LINUX_O_NONBLOCK | LINUX_O_CLOEXEC),
+    // timerfd_create(clockid, flags): TFD_NONBLOCK | TFD_CLOEXEC
+    (85, 1, LINUX_O_NONBLOCK | LINUX_O_CLOEXEC),
+    // timerfd_settime(fd, flags, ...): TFD_TIMER_ABSTIME (1) | TFD_TIMER_CANCEL_ON_SET (2)
+    (86, 1, 0x1 | 0x2),
+    // utimensat(dirfd, pathname, times, flags): AT_SYMLINK_NOFOLLOW (0x100)
+    (88, 3, LINUX_AT_SYMLINK_NOFOLLOW),
+    // accept4(sockfd, addr, addrlen, flags): SOCK_NONBLOCK | SOCK_CLOEXEC
+    (242, 3, LINUX_O_NONBLOCK | LINUX_O_CLOEXEC),
+    // close_range(first, last, flags): CLOSE_RANGE_UNSHARE(2) | CLOEXEC(4)
+    (436, 2, 0x2 | 0x4),
+    // openat2 — checked inside open_how, but the syscall flag arg is unused
+    // statx(dirfd, pathname, flags, mask, statxbuf): AT_* flags
+    (
+        291,
+        2,
+        LINUX_AT_EMPTY_PATH | LINUX_AT_SYMLINK_NOFOLLOW | 0x1000 /* AT_NO_AUTOMOUNT */ | 0x800 /* AT_STATX_SYNC_AS_STAT */ | 0x4000 /* AT_STATX_FORCE_SYNC */ | 0x6000,
+    ),
+    // faccessat2(dirfd, pathname, mode, flags)
+    (439, 3, LINUX_AT_EMPTY_PATH | LINUX_AT_SYMLINK_NOFOLLOW | 0x200 /* AT_EACCESS */),
+];
+
+/// Systematic unknown-flag detector for syscalls.
+///
+/// Every syscall that takes a "flags" argument knows which bits are
+/// actually defined by the Linux ABI. If the guest passes a bit we
+/// don't recognise, something has drifted — either the guest's libc
+/// is newer than ours, or we forgot to wire a flag. Either way, it
+/// shouldn't be silent. This helper records the unknown bits via the
+/// reporter (so the JSON compat report aggregates them) and via the
+/// `unknown-syscall-flags` USDT probe (so dtrace can fire on it
+/// live), then returns the unknown bits so the caller can decide
+/// whether to EINVAL or proceed.
+///
+/// Usage:
+/// ```ignore
+/// let unknown = check_syscall_flags(
+///     reporter, /*nr=*/ 56, /*name=*/ "openat", /*arg_index=*/ 2,
+///     flags, OPENAT_SUPPORTED_MASK,
+/// );
+/// if unknown != 0 {
+///     return DispatchOutcome::Errno { errno: LINUX_EINVAL };
+/// }
+/// ```
+pub fn check_syscall_flags(
+    reporter: &mut CompatReporter,
+    number: u64,
+    name: &str,
+    argument_index: u32,
+    value: u64,
+    supported_mask: u64,
+) -> u64 {
+    let unknown = value & !supported_mask;
+    if unknown != 0 {
+        reporter.record(CompatEvent::unknown_syscall_flags(
+            number,
+            name,
+            argument_index,
+            unknown,
+        ));
+    }
+    unknown
+}
+
 fn write_packed(memory: &mut impl GuestMemory, address: u64, bytes: &[u8]) -> DispatchOutcome {
     if memory.write_bytes(address, bytes).is_err() {
         DispatchOutcome::Errno {
@@ -9653,4 +9787,50 @@ mod overlay_dispatch_tests {
         let bytes = h.memory.read_bytes(dest, 4).unwrap();
         assert_eq!(&bytes, b"DATA");
     }
+
+    /// Validates the systematic unknown-flag detector: when the guest
+    /// passes a flag bit the dispatcher doesn't know about, the
+    /// compat report must surface it as an `UnknownSyscallFlags`
+    /// entry, regardless of whether the syscall ultimately returns
+    /// success or EINVAL. The user explicitly asked for this loudness.
+    #[test]
+    fn unknown_pipe2_flag_is_recorded_in_compat_report() {
+        let mut h = Harness::new();
+        let buf = h.reserve(8);
+        // Bit 0x80 (octal 0o200) is NOT one of O_CLOEXEC | O_NONBLOCK.
+        // Send it through pipe2 — the handler returns EINVAL, and we
+        // want the report to ALSO list the unknown bit so the operator
+        // can fix it.
+        const SYS_PIPE2: u64 = 59;
+        let _ = h.call(SYS_PIPE2, [buf, 0x80, 0, 0, 0, 0]);
+
+        // Finish the report and look for the entry.
+        let report = std::mem::take(&mut h.reporter).finish();
+        let entry = report
+            .unknown_syscall_flags
+            .iter()
+            .find(|e| e.number == 59 && e.argument == 1)
+            .expect("pipe2's unknown-flag bit 0x80 should appear in the report");
+        assert!(entry.unknown_bits.contains("0x80"), "got {:?}", entry);
+        assert_eq!(entry.count, 1);
+        assert_eq!(entry.name, "pipe2");
+    }
+
+    /// Negative test: a syscall flag arg that has NO unknown bits set
+    /// must NOT produce an UnknownSyscallFlags entry.
+    #[test]
+    fn known_pipe2_flag_is_silent() {
+        let mut h = Harness::new();
+        let buf = h.reserve(8);
+        // O_CLOEXEC | O_NONBLOCK — both are in the supported mask.
+        let _ = h.call(SYS_PIPE2, [buf, LINUX_O_CLOEXEC | LINUX_O_NONBLOCK, 0, 0, 0, 0]);
+        let report = std::mem::take(&mut h.reporter).finish();
+        assert!(
+            report.unknown_syscall_flags.is_empty(),
+            "no unknown bits should be reported; got {:?}",
+            report.unknown_syscall_flags
+        );
+    }
+
+    const SYS_PIPE2: u64 = 59;
 }
