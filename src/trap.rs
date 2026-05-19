@@ -323,12 +323,13 @@ impl HvfTrapEngine {
         // `ldaxr`/`stlxr` on Device memory abort externally — which is
         // exactly the wall musl's pthread_mutex_lock hits otherwise.
         let mut sctlr_el1: u64 = (1 << 2) | (1 << 12); // C=1, I=1
-        // The stage-1 MMU path is still experimental (the page tables we
-        // generate aren't yet trusted on every vCPU layout). Gate it behind
-        // an env var so Tier A demos keep working while we iterate on the
-        // table format. When this stabilises, remove the gate.
-        let stage1_enabled = std::env::var_os("CARRICK_ENABLE_STAGE1").is_some();
-        if let (true, Some(pt_base)) = (stage1_enabled, plan.stage1_page_tables_base) {
+        // Stage-1 MMU is on by default. The identity tables use AP=00 for
+        // kernel pages (trampoline/vectors/PT) and AP=01+PXN=1 for user
+        // pages, which is required on Apple Silicon because HVF starts
+        // vCPUs with PSTATE.PAN=1 and FEAT_PAN3 turns any EL1 fetch from
+        // an AP[1]=1 page into a permission fault. See
+        // `stage1_identity_page_tables` in src/memory.rs.
+        if let Some(pt_base) = plan.stage1_page_tables_base {
             // MAIR_EL1 slot 0 = Normal memory, Inner & Outer Write-Back
             // Cacheable, RW-allocate (0xFF). Slot 1..7 stay 0 (Device-
             // nGnRnE), unused for now.
