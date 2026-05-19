@@ -328,12 +328,24 @@ fn main() -> anyhow::Result<()> {
                 // the user's terminal before the guest exits.
                 dispatcher.set_stream_stdio(true);
             }
+            // Provide a sane default Linux env. Without PATH glibc-based
+            // tools like dpkg-query bail with "PATH is not set" and apt's
+            // pre-fork helpers (apt-config, dpkg-query) can't locate their
+            // siblings.
+            let env: Vec<String> = vec![
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_owned(),
+                "HOME=/root".to_owned(),
+                "TERM=xterm-256color".to_owned(),
+                "LANG=C.UTF-8".to_owned(),
+                "LC_ALL=C.UTF-8".to_owned(),
+                "DEBIAN_FRONTEND=noninteractive".to_owned(),
+            ];
             let result = run_rootfs_elf_with_hvf_args_and_dispatcher_debug(
                 executable_path.as_str(),
                 &rootfs,
                 dispatcher,
                 command.clone(),
-                std::iter::empty(),
+                env,
                 max_traps,
                 debug_state_path.as_ref(),
             )

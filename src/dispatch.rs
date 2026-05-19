@@ -4234,10 +4234,29 @@ impl SyscallDispatcher {
     }
 
     fn duplicate_fd(&mut self, old_fd: i32, min_fd: i32, fd_flags: u64) -> DispatchOutcome {
-        let Some(open_file) = self.open_files.get(&old_fd) else {
-            return DispatchOutcome::Errno { errno: LINUX_EBADF };
+        let description = match self.open_files.get(&old_fd) {
+            Some(open_file) => Rc::clone(&open_file.description),
+            None if is_stdio_fd(old_fd) => {
+                // dup/fcntl(F_DUPFD) of the process's bare stdio fds:
+                // mirror what dup3 does and grab the host fd into a
+                // HostPipe so future reads/writes still hit the right
+                // host endpoint (this is what dpkg-query needs at
+                // startup to redirect its diagnostic fd, and what most
+                // glibc fork+exec helpers expect to succeed).
+                let duped = unsafe { libc::dup(old_fd) };
+                if duped < 0 {
+                    return DispatchOutcome::Errno {
+                        errno: host_errno(),
+                    };
+                }
+                Rc::new(RefCell::new(OpenDescription::HostPipe {
+                    host_fd: duped,
+                    is_read_end: old_fd == 0,
+                    status_flags: 0,
+                }))
+            }
+            None => return DispatchOutcome::Errno { errno: LINUX_EBADF },
         };
-        let description = Rc::clone(&open_file.description);
         let Some(new_fd) = self.allocate_fd(min_fd) else {
             return DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
@@ -4361,13 +4380,23 @@ impl SyscallDispatcher {
             OpenDescription::Directory {
                 entries, offset, ..
             } => (*offset as i64, entries.len() as i64),
-            OpenDescription::EventFd { .. }
-            | OpenDescription::TimerFd { .. }
-            | OpenDescription::Epoll { .. }
-            | OpenDescription::PipeReader { .. }
+            // Linux returns ESPIPE for lseek on a pipe / socket / tty
+            // (the kernel's POSIX answer for "unseekable stream") and
+            // EINVAL only for nonsensical arg combinations. Returning
+            // EINVAL here made dpkg-query's ftell() retry-loop spin
+            // forever because POSIX says "EINVAL is recoverable" while
+            // ESPIPE means "give up, it's a stream".
+            OpenDescription::PipeReader { .. }
             | OpenDescription::PipeWriter { .. }
             | OpenDescription::HostPipe { .. }
             | OpenDescription::HostSocket { .. } => {
+                return DispatchOutcome::Errno {
+                    errno: LINUX_ESPIPE,
+                };
+            }
+            OpenDescription::EventFd { .. }
+            | OpenDescription::TimerFd { .. }
+            | OpenDescription::Epoll { .. } => {
                 return DispatchOutcome::Errno {
                     errno: LINUX_EINVAL,
                 };
