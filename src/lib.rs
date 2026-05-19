@@ -4,6 +4,7 @@ pub mod dispatch;
 pub mod dtrace_consumer;
 pub mod elf;
 pub mod host_signal;
+pub mod host_tty;
 pub mod linux_abi;
 pub mod memory;
 pub mod oci;

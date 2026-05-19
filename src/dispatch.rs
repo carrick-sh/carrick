@@ -15,7 +15,10 @@ use crate::linux_abi::{
     LinuxTimerfdExpirations, LinuxTimespec, LinuxTimeval, LinuxTimezone, LinuxTms,
     LinuxTermios, LinuxUtsname, LinuxWinsize,
 };
-use crate::memory::{LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE, LINUX_MMAP_SIZE};
+use crate::memory::{
+    LINUX_EL0_TRAMPOLINE_BASE, LINUX_EL1_VECTORS_BASE, LINUX_HEAP_BASE, LINUX_HEAP_SIZE,
+    LINUX_MMAP_BASE, LINUX_MMAP_SIZE, LINUX_PAGE_TABLES_BASE, LINUX_STACK_SIZE, LINUX_STACK_TOP,
+};
 use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsError, RootFsMetadata};
 use crate::syscall::lookup_aarch64;
 use serde::Serialize;
@@ -385,6 +388,22 @@ pub enum DispatchError {
     LengthTooLarge(u64),
 }
 
+/// One row of `/proc/self/maps`, captured from the guest's
+/// `AddressSpace` at boot. Stored on the dispatcher so that a guest
+/// `cat /proc/self/maps` (or Go runtime / glibc malloc introspection
+/// / gdb) sees the real loaded ELF, runtime regions, mmap arena,
+/// stack, and bootstrap pages — not the hard-coded four-line summary
+/// we shipped before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcMapsEntry {
+    pub start: u64,
+    pub end: u64,
+    pub read: bool,
+    pub write: bool,
+    pub execute: bool,
+    pub path: String,
+}
+
 pub struct SyscallDispatcher {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
@@ -406,6 +425,12 @@ pub struct SyscallDispatcher {
     /// state is what makes interactive `busybox sh`'s "is this signal
     /// owned?" introspection produce consistent answers.
     signal_handlers: HashMap<i32, LinuxSigaction>,
+    /// Snapshot of the guest's `AddressSpace` regions, captured at
+    /// boot via [`set_address_space_regions`]. When present,
+    /// `/proc/self/maps` is rendered from this list (with the heap
+    /// end tracking `brk_current` and the mmap arena end tracking
+    /// `mmap_next`) instead of the hard-coded four-line summary.
+    address_space_regions: Option<Vec<ProcMapsEntry>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -567,7 +592,18 @@ impl SyscallDispatcher {
             task_name: linux_task_name_from_bytes(b"carrick"),
             umask: LINUX_DEFAULT_UMASK,
             signal_handlers: HashMap::new(),
+            address_space_regions: None,
         }
+    }
+
+    /// Capture the guest's `AddressSpace` region list so that
+    /// `/proc/self/maps` reflects the real loaded layout (executable
+    /// ELF segments, runtime regions, mmap arena, stack, EL0
+    /// trampoline, EL1 vectors, page tables) instead of a fixed
+    /// summary. Called once after `HvfTrapEngine::map_address_space`
+    /// succeeds.
+    pub fn set_address_space_regions(&mut self, regions: Vec<ProcMapsEntry>) {
+        self.address_space_regions = Some(regions);
     }
 
     pub fn with_rootfs(rootfs: RootFs) -> Self {
@@ -1031,7 +1067,7 @@ impl SyscallDispatcher {
     }
 
     fn synthetic_access(&self, path: &str, mode: u64) -> Option<DispatchOutcome> {
-        if !is_synthetic_virtual_file(path, &self.executable_path) {
+        if !is_synthetic_virtual_file(path, &self.synthetic_proc_context()) {
             return None;
         }
         Some(synthetic_readonly_access(mode))
@@ -1771,21 +1807,55 @@ impl SyscallDispatcher {
 
         match ioctl_request {
             LINUX_TIOCGWINSZ if fd_is_tty(&self.open_files, fd) => {
-                let winsize = LinuxWinsize::terminal_80x24();
+                // Prefer the live host window size when stdin/stdout/stderr
+                // is a real macOS terminal; fall back to the 80x24 stub so
+                // headless invocations (CI, redirected pipes that we still
+                // synthesize a TTY for in tests) keep prior behaviour.
+                let winsize = if crate::host_tty::host_isatty(fd) {
+                    crate::host_tty::get_host_winsize(fd)
+                        .unwrap_or_else(LinuxWinsize::terminal_80x24)
+                } else {
+                    LinuxWinsize::terminal_80x24()
+                };
                 write_packed(memory, arg, winsize.as_bytes())
             }
             LINUX_TIOCGWINSZ => DispatchOutcome::Errno {
                 errno: LINUX_ENOTTY,
             },
             LINUX_TCGETS if fd_is_tty(&self.open_files, fd) => {
-                let termios = LinuxTermios::default_cooked();
+                // Mirror the live host terminal modes when available so
+                // `less`, `vi`, and an interactive shell see the actual
+                // ICANON/ECHO state the user has configured.
+                let termios = if crate::host_tty::host_isatty(fd) {
+                    crate::host_tty::get_host_termios(fd)
+                        .unwrap_or_else(LinuxTermios::default_cooked)
+                } else {
+                    LinuxTermios::default_cooked()
+                };
                 write_packed(memory, arg, termios.as_bytes())
             }
             LINUX_TCGETS => DispatchOutcome::Errno {
                 errno: LINUX_ENOTTY,
             },
             LINUX_TCSETS | LINUX_TCSETSW | LINUX_TCSETSF if fd_is_tty(&self.open_files, fd) => {
-                validate_termios_buffer(memory, arg)
+                // Validate the guest pointer first (preserves prior EFAULT
+                // semantics), then push the bytes to the host fd if it is
+                // a real terminal. tcsetattr failure is intentionally
+                // swallowed; the guest already considered the call
+                // successful pre-host-forwarding.
+                match memory.read_bytes(arg, core::mem::size_of::<LinuxTermios>()) {
+                    Ok(bytes) => {
+                        if crate::host_tty::host_isatty(fd) {
+                            if let Ok(t) = LinuxTermios::read_from_bytes(bytes.as_ref()) {
+                                let _ = crate::host_tty::set_host_termios_tracking(fd, &t);
+                            }
+                        }
+                        DispatchOutcome::Returned { value: 0 }
+                    }
+                    Err(_) => DispatchOutcome::Errno {
+                        errno: LINUX_EFAULT,
+                    },
+                }
             }
             LINUX_TCSETS | LINUX_TCSETSW | LINUX_TCSETSF => DispatchOutcome::Errno {
                 errno: LINUX_ENOTTY,
@@ -1972,7 +2042,7 @@ impl SyscallDispatcher {
             Ok(resolved) => resolved,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        let kind = if is_synthetic_virtual_file(&resolved, &self.executable_path) {
+        let kind = if is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context()) {
             RootFsEntryKind::File
         } else {
             let Some(rootfs) = &self.rootfs else {
@@ -3122,7 +3192,7 @@ impl SyscallDispatcher {
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
 
-        let description = if let Some(contents) = synthetic_proc_file(&path, &self.executable_path)
+        let description = if let Some(contents) = synthetic_proc_file(&path, &self.synthetic_proc_context())
         {
             OpenDescription::SyntheticFile {
                 path,
@@ -5389,7 +5459,7 @@ impl SyscallDispatcher {
             Ok(resolved) => resolved,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        if is_synthetic_virtual_file(&resolved, &self.executable_path) {
+        if is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context()) {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EEXIST,
             });
@@ -5432,7 +5502,7 @@ impl SyscallDispatcher {
             Ok(resolved) => resolved,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        if is_synthetic_virtual_file(&resolved, &self.executable_path) {
+        if is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context()) {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EEXIST,
             });
@@ -5506,7 +5576,7 @@ impl SyscallDispatcher {
             Ok(resolved) => resolved,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        if is_synthetic_virtual_file(&resolved, &self.executable_path) {
+        if is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context()) {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EROFS });
         }
         let Some(rootfs) = &self.rootfs else {
@@ -5548,7 +5618,7 @@ impl SyscallDispatcher {
             Ok(resolved) => resolved,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        if is_synthetic_virtual_file(&resolved, &self.executable_path) {
+        if is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context()) {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EROFS });
         }
         let Some(rootfs) = &self.rootfs else {
@@ -5604,7 +5674,7 @@ impl SyscallDispatcher {
                 Ok(resolved) => resolved,
                 Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
             };
-            if is_synthetic_virtual_file(&resolved, &self.executable_path) {
+            if is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context()) {
                 true
             } else if let Some(rootfs) = &self.rootfs {
                 match rootfs.symlink_metadata(&resolved) {
@@ -5633,7 +5703,7 @@ impl SyscallDispatcher {
             Ok(resolved) => resolved,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        if is_synthetic_virtual_file(&resolved_new, &self.executable_path) {
+        if is_synthetic_virtual_file(&resolved_new, &self.synthetic_proc_context()) {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EEXIST,
             });
@@ -5686,7 +5756,7 @@ impl SyscallDispatcher {
             Ok(resolved) => resolved,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        if is_synthetic_virtual_file(&resolved_link, &self.executable_path) {
+        if is_synthetic_virtual_file(&resolved_link, &self.synthetic_proc_context()) {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EEXIST,
             });
@@ -5740,7 +5810,7 @@ impl SyscallDispatcher {
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
         let _ = resolved_new;
-        let synthetic = is_synthetic_virtual_file(&resolved_old, &self.executable_path);
+        let synthetic = is_synthetic_virtual_file(&resolved_old, &self.synthetic_proc_context());
         if synthetic {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EROFS });
         }
@@ -5783,7 +5853,7 @@ impl SyscallDispatcher {
             Ok(resolved) => resolved,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        let kind = if is_synthetic_virtual_file(&resolved, &self.executable_path) {
+        let kind = if is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context()) {
             RootFsEntryKind::File
         } else {
             let Some(rootfs) = &self.rootfs else {
@@ -5869,7 +5939,7 @@ impl SyscallDispatcher {
             Ok(path) => path,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        if is_synthetic_virtual_file(&path, &self.executable_path) {
+        if is_synthetic_virtual_file(&path, &self.synthetic_proc_context()) {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EROFS });
         }
         let Some(rootfs) = &self.rootfs else {
@@ -5907,7 +5977,7 @@ impl SyscallDispatcher {
             Ok(path) => path,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        if let Some(contents) = synthetic_proc_file(&path, &self.executable_path) {
+        if let Some(contents) = synthetic_proc_file(&path, &self.synthetic_proc_context()) {
             return Ok(write_synthetic_stat(memory, statbuf, &path, contents.len()));
         }
         if let Some(contents) = synthetic_sys_file(&path) {
@@ -5964,7 +6034,7 @@ impl SyscallDispatcher {
             Ok(path) => path,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        if let Some(contents) = synthetic_proc_file(&path, &self.executable_path) {
+        if let Some(contents) = synthetic_proc_file(&path, &self.synthetic_proc_context()) {
             return Ok(write_synthetic_statx(
                 memory,
                 statxbuf,
@@ -6148,15 +6218,6 @@ fn write_packed(memory: &mut impl GuestMemory, address: u64, bytes: &[u8]) -> Di
         }
     } else {
         DispatchOutcome::Returned { value: 0 }
-    }
-}
-
-fn validate_termios_buffer(memory: &impl GuestMemory, address: u64) -> DispatchOutcome {
-    match memory.read_bytes(address, core::mem::size_of::<LinuxTermios>()) {
-        Ok(_) => DispatchOutcome::Returned { value: 0 },
-        Err(_) => DispatchOutcome::Errno {
-            errno: LINUX_EFAULT,
-        },
     }
 }
 
@@ -6519,7 +6580,29 @@ fn write_synthetic_statx(
     write_statx(memory, statxbuf, &metadata)
 }
 
-fn synthetic_proc_file(path: &str, executable_path: &str) -> Option<Vec<u8>> {
+/// Minimal view of the dispatcher needed by the synthetic /proc
+/// renderers. Keeps the synthetic helpers as free functions while
+/// letting them see live state (executable path, address-space
+/// regions, current brk, next mmap address) without taking `&self`.
+struct SyntheticProcContext<'a> {
+    executable_path: &'a str,
+    address_space_regions: Option<&'a [ProcMapsEntry]>,
+    brk_current: u64,
+    mmap_next: u64,
+}
+
+impl SyscallDispatcher {
+    fn synthetic_proc_context(&self) -> SyntheticProcContext<'_> {
+        SyntheticProcContext {
+            executable_path: &self.executable_path,
+            address_space_regions: self.address_space_regions.as_deref(),
+            brk_current: self.brk_current,
+            mmap_next: self.mmap_next,
+        }
+    }
+}
+
+fn synthetic_proc_file(path: &str, ctx: &SyntheticProcContext<'_>) -> Option<Vec<u8>> {
     match path {
         "/proc/cmdline" => Some(synthetic_proc_cmdline().to_vec()),
         "/proc/cpuinfo" => Some(synthetic_proc_cpuinfo().to_vec()),
@@ -6533,12 +6616,12 @@ fn synthetic_proc_file(path: &str, executable_path: &str) -> Option<Vec<u8>> {
         "/proc/uptime" => Some(synthetic_proc_uptime().into_bytes()),
         "/proc/version" => Some(synthetic_proc_version().to_vec()),
         "/proc/self/auxv" => Some(synthetic_proc_self_auxv().to_vec()),
-        "/proc/self/cmdline" => Some(synthetic_proc_self_cmdline(executable_path)),
-        "/proc/self/comm" => Some(synthetic_proc_self_comm(executable_path).into_bytes()),
+        "/proc/self/cmdline" => Some(synthetic_proc_self_cmdline(ctx.executable_path)),
+        "/proc/self/comm" => Some(synthetic_proc_self_comm(ctx.executable_path).into_bytes()),
         "/proc/self/limits" => Some(synthetic_proc_self_limits().to_vec()),
-        "/proc/self/maps" => Some(synthetic_proc_maps(executable_path).into_bytes()),
+        "/proc/self/maps" => Some(synthetic_proc_maps(ctx).into_bytes()),
         "/proc/self/statm" => Some(synthetic_proc_self_statm().to_vec()),
-        "/proc/self/status" => Some(synthetic_proc_self_status(executable_path).into_bytes()),
+        "/proc/self/status" => Some(synthetic_proc_self_status(ctx.executable_path).into_bytes()),
         "/proc/sys/kernel/osrelease" => Some(synthetic_proc_osrelease().to_vec()),
         "/proc/sys/kernel/hostname" => Some(synthetic_proc_hostname().to_vec()),
         "/proc/sys/kernel/random/boot_id" => {
@@ -6591,21 +6674,112 @@ fn synthetic_sys_file(path: &str) -> Option<Vec<u8>> {
     }
 }
 
-fn is_synthetic_virtual_file(path: &str, executable_path: &str) -> bool {
-    synthetic_proc_file(path, executable_path).is_some() || synthetic_sys_file(path).is_some()
+fn is_synthetic_virtual_file(path: &str, ctx: &SyntheticProcContext<'_>) -> bool {
+    synthetic_proc_file(path, ctx).is_some() || synthetic_sys_file(path).is_some()
 }
 
-fn synthetic_proc_maps(executable_path: &str) -> String {
+fn synthetic_proc_maps(ctx: &SyntheticProcContext<'_>) -> String {
+    if let Some(regions) = ctx.address_space_regions {
+        return render_proc_maps_from_regions(
+            regions,
+            ctx.executable_path,
+            ctx.brk_current,
+            ctx.mmap_next,
+        );
+    }
+    // Fallback for callers that didn't plumb the live region list
+    // (e.g. unit tests that drive the dispatcher in isolation). Mirrors
+    // the historical hard-coded summary so existing assertions still
+    // see r-xp / [heap] / a trailing newline.
     format!(
         "0000000000400000-0000000000410000 r-xp 00000000 00:00 0 {executable_path}\n\
          {heap_base:016x}-{heap_end:016x} rw-p 00000000 00:00 0 [heap]\n\
          {mmap_base:016x}-{mmap_end:016x} rwxp 00000000 00:00 0 [carrick-mmap]\n\
          0000007fffe00000-0000008000000000 rw-p 00000000 00:00 0 [stack]\n",
+        executable_path = ctx.executable_path,
         heap_base = LINUX_HEAP_BASE,
         heap_end = LINUX_HEAP_BASE + LINUX_HEAP_SIZE,
         mmap_base = LINUX_MMAP_BASE,
         mmap_end = LINUX_MMAP_BASE + LINUX_MMAP_SIZE,
     )
+}
+
+/// Render `/proc/self/maps` from the real guest region list. Each
+/// row matches the Linux kernel's `show_map_vma` format strictly:
+/// `{start:x}-{end:x} {perms} {offset:08x} {dev:02x}:{dev:02x} {inode}    {path}`
+/// where `perms` is `rwxp` (always private; we don't model MAP_SHARED).
+/// The heap region's end is replaced with `brk_current` and the mmap
+/// arena's end is replaced with `mmap_next`, both of which advance as
+/// the guest runs.
+fn render_proc_maps_from_regions(
+    regions: &[ProcMapsEntry],
+    executable_path: &str,
+    brk_current: u64,
+    mmap_next: u64,
+) -> String {
+    let mut sorted: Vec<&ProcMapsEntry> = regions.iter().collect();
+    sorted.sort_by_key(|r| r.start);
+    let mut out = String::new();
+    for region in sorted {
+        let (start, mut end, label) = label_for_region(region, executable_path);
+        // Track live end pointers for heap and mmap so the guest sees
+        // its own growth (brk(2) / mmap(2)) reflected in the map.
+        match label.as_str() {
+            "[heap]" => {
+                if brk_current > start && brk_current <= region.end {
+                    end = brk_current;
+                }
+            }
+            "[carrick-mmap]" => {
+                if mmap_next > start && mmap_next <= region.end {
+                    end = mmap_next;
+                }
+            }
+            _ => {}
+        }
+        let r = if region.read { 'r' } else { '-' };
+        let w = if region.write { 'w' } else { '-' };
+        let x = if region.execute { 'x' } else { '-' };
+        // Always private (`p`); we don't model MAP_SHARED.
+        out.push_str(&format!(
+            "{start:016x}-{end:016x} {r}{w}{x}p 00000000 00:00 0                          {label}\n",
+        ));
+    }
+    out
+}
+
+/// Pick a `/proc/self/maps` label for a region. Matches the kernel's
+/// convention: `[heap]`, `[stack]`, anonymous-named tags like
+/// `[carrick-mmap]` / `[carrick-vectors]` / `[carrick-trampoline]` /
+/// `[carrick-pagetables]` for our bootstrap pages, the executable
+/// path for the loaded ELF segments, and an empty path for everything
+/// else.
+fn label_for_region(region: &ProcMapsEntry, executable_path: &str) -> (u64, u64, String) {
+    let start = region.start;
+    let end = region.end;
+    let label = if start == LINUX_HEAP_BASE {
+        "[heap]".to_owned()
+    } else if start == LINUX_MMAP_BASE {
+        "[carrick-mmap]".to_owned()
+    } else if start == LINUX_STACK_TOP.saturating_sub(LINUX_STACK_SIZE) {
+        "[stack]".to_owned()
+    } else if start == LINUX_EL0_TRAMPOLINE_BASE {
+        "[carrick-trampoline]".to_owned()
+    } else if start == LINUX_EL1_VECTORS_BASE {
+        "[carrick-vectors]".to_owned()
+    } else if start == LINUX_PAGE_TABLES_BASE {
+        "[carrick-pagetables]".to_owned()
+    } else if !region.path.is_empty() {
+        region.path.clone()
+    } else if region.execute {
+        // Executable region with no other label and no explicit path
+        // is almost certainly an ELF code segment from the loaded
+        // executable image.
+        executable_path.to_owned()
+    } else {
+        String::new()
+    };
+    (start, end, label)
 }
 
 fn synthetic_proc_cpuinfo() -> &'static [u8] {
