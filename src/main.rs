@@ -107,6 +107,14 @@ enum Commands {
         #[command(subcommand)]
         command: DebugCommand,
     },
+    /// Run a carrick command under DTrace, in-process. Compiles the bundled
+    /// D script via libdtrace, spawns the child carrick under
+    /// `dtrace_proc_create`, and streams live per-syscall events + a
+    /// frequency-sorted aggregation when the child exits. Requires root.
+    Trace {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -415,9 +423,43 @@ async fn main() -> anyhow::Result<()> {
                 println!("{}", serde_json::to_string_pretty(&state)?);
             }
         },
+        Commands::Trace { command } => {
+            #[cfg(target_os = "macos")]
+            {
+                if command.is_empty() {
+                    bail!(
+                        "trace needs a carrick subcommand to forward (e.g. `carrick trace run alpine:latest /bin/busybox echo hi`)"
+                    );
+                }
+                let me = std::env::current_exe()
+                    .context("failed to resolve current carrick binary path")?;
+                if unsafe { libc_geteuid() } != 0 {
+                    eprintln!(
+                        "carrick trace: not running as root; libdtrace will fail to open /dev/dtrace."
+                    );
+                    eprintln!(
+                        "carrick trace: re-invoke as `sudo {} trace ...`",
+                        me.display()
+                    );
+                }
+                carrick::dtrace_consumer::run_child_under_dtrace(&me, &command)
+                    .map_err(|e| anyhow::anyhow!("trace failed: {}", e))?;
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = command;
+                bail!("carrick trace is only available on macOS (libdtrace).");
+            }
+        }
     }
 
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    #[link_name = "geteuid"]
+    fn libc_geteuid() -> u32;
 }
 
 /// Decode an `ESR_EL1` value into a human-readable struct. Mirrors the

@@ -1,5 +1,7 @@
 pub mod compat;
 pub mod dispatch;
+#[cfg(target_os = "macos")]
+pub mod dtrace_consumer;
 pub mod elf;
 pub mod linux_abi;
 pub mod memory;
