@@ -407,6 +407,11 @@ pub struct ProcMapsEntry {
 pub struct SyscallDispatcher {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+    /// When true, writes to fd 1/2 stream directly to host fds 1/2
+    /// instead of buffering into `stdout`/`stderr`. Set by `--raw`/the
+    /// interactive runtime so the user sees the guest's prompt and
+    /// output in real time, instead of after exit.
+    stream_stdio: bool,
     rootfs: Option<RootFs>,
     open_files: HashMap<i32, OpenFile>,
     next_fd: i32,
@@ -580,6 +585,7 @@ impl SyscallDispatcher {
         Self {
             stdout: Vec::new(),
             stderr: Vec::new(),
+            stream_stdio: false,
             rootfs: None,
             open_files: HashMap::new(),
             next_fd: 3,
@@ -630,6 +636,15 @@ impl SyscallDispatcher {
 
     pub fn stdout(&self) -> &[u8] {
         &self.stdout
+    }
+
+    /// Enable live passthrough for fd 1/2. After this, `write`/`writev`
+    /// to the stdio fds go straight to host fd 1/2 via `libc::write`
+    /// instead of accumulating in the in-memory buffers — required for
+    /// interactive prompts (`/ # `, cursor-position queries, etc.) to
+    /// reach the user's terminal before the guest exits.
+    pub fn set_stream_stdio(&mut self, on: bool) {
+        self.stream_stdio = on;
     }
 
     /// Called after `libc::fork(2)` returns into a child: the child
@@ -5300,6 +5315,18 @@ impl SyscallDispatcher {
                 }
                 _ => DispatchOutcome::Errno { errno: LINUX_EBADF },
             };
+        }
+        if self.stream_stdio && (fd == 1 || fd == 2) {
+            let n = unsafe {
+                libc::write(fd, bytes.as_ptr() as *const _, bytes.len())
+            };
+            if n < 0 {
+                let errno = unsafe { *libc::__error() };
+                return DispatchOutcome::Errno {
+                    errno: errno as i32,
+                };
+            }
+            return DispatchOutcome::Returned { value: n as i64 };
         }
         match fd {
             1 => self.stdout.extend_from_slice(bytes),
