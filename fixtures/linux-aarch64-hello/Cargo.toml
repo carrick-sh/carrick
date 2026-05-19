@@ -18,3 +18,11 @@ path = "src/main.rs"
 [[bin]]
 name = "carrick-linux-aarch64-clone-exit"
 path = "src/clone_exit.rs"
+
+[[bin]]
+name = "carrick-linux-aarch64-signal-basic"
+path = "src/signal_basic.rs"
+
+[[bin]]
+name = "carrick-linux-aarch64-signal-default"
+path = "src/signal_default.rs"

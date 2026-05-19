@@ -240,6 +240,36 @@ impl SyscallTrap for ScriptedTrap {
         self.return_values.push(return_value);
         Ok(())
     }
+
+    fn fork(&mut self) -> Result<carrick::trap::ForkOutcome, TrapError> {
+        Err(TrapError::Hypervisor(
+            "scripted trap does not implement fork".to_owned(),
+        ))
+    }
+
+    fn execve_into(&mut self, _: &carrick::memory::AddressSpace) -> Result<(), TrapError> {
+        Err(TrapError::Hypervisor(
+            "scripted trap does not implement execve".to_owned(),
+        ))
+    }
+
+    fn inject_signal(
+        &mut self,
+        _signum: i32,
+        _handler: u64,
+        _sa_restorer: u64,
+        _pending_syscall_retval: Option<i64>,
+    ) -> Result<(), TrapError> {
+        Err(TrapError::Hypervisor(
+            "scripted trap does not implement inject_signal".to_owned(),
+        ))
+    }
+
+    fn restore_from_sigframe(&mut self) -> Result<(), TrapError> {
+        Err(TrapError::Hypervisor(
+            "scripted trap does not implement restore_from_sigframe".to_owned(),
+        ))
+    }
 }
 
 fn build_linux_fixture() {

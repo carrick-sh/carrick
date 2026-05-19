@@ -101,6 +101,33 @@ pub trait SyscallTrap {
     fn is_forked_child(&self) -> bool {
         false
     }
+    /// Inject a guest signal frame for `signum`. Writes a
+    /// `CarrickSigframe` to SP_EL0, points the guest's x30 at
+    /// `sa_restorer`, sets x0 to `signum`, and redirects the vCPU's
+    /// next resumed PC (`ELR_EL1`) to the user handler. The pre-signal
+    /// register state is preserved in the frame and recovered by
+    /// `restore_from_sigframe` on `rt_sigreturn`.
+    ///
+    /// `pending_syscall_retval` is the retval the dispatcher computed
+    /// for the syscall that was just trapped, since signals are
+    /// delivered between `complete_syscall` and the next vCPU run we
+    /// already wrote it into x0; the frame snapshots the post-retval
+    /// state so the handler-return path picks up where the caller left
+    /// off. Pass `None` when injecting outside a syscall completion
+    /// (e.g. when raising at the top of the trap loop before the first
+    /// syscall has run).
+    fn inject_signal(
+        &mut self,
+        signum: i32,
+        handler: u64,
+        sa_restorer: u64,
+        pending_syscall_retval: Option<i64>,
+    ) -> Result<(), TrapError>;
+    /// Restore vCPU state from the `CarrickSigframe` at SP_EL0. Called
+    /// when the guest invokes `rt_sigreturn(2)`. Does NOT advance PC
+    /// past the syscall the way `complete_syscall` does — the restored
+    /// PC IS the next PC.
+    fn restore_from_sigframe(&mut self) -> Result<(), TrapError>;
 }
 
 #[derive(Debug, Error)]
@@ -353,6 +380,7 @@ where
     R: GuestMemory + SyscallTrap,
 {
     let mut reporter = CompatReporter::default();
+    crate::host_signal::install_default_handlers();
 
     for traps in 1..=max_traps {
         let frame = runtime.next_syscall()?;
@@ -371,6 +399,9 @@ where
             &mut reporter,
         )?;
 
+        let mut last_syscall_retval: Option<i64> = None;
+        let mut suppress_signal_check = false;
+
         match outcome {
             DispatchOutcome::Exit { code } => {
                 if runtime.is_forked_child() {
@@ -385,8 +416,15 @@ where
                     trap_limit_hit: false,
                 });
             }
-            DispatchOutcome::Returned { value } => runtime.complete_syscall(value)?,
-            DispatchOutcome::Errno { errno } => runtime.complete_syscall(-(errno as i64))?,
+            DispatchOutcome::Returned { value } => {
+                runtime.complete_syscall(value)?;
+                last_syscall_retval = Some(value);
+            }
+            DispatchOutcome::Errno { errno } => {
+                let value = -(errno as i64);
+                runtime.complete_syscall(value)?;
+                last_syscall_retval = Some(value);
+            }
             DispatchOutcome::Fork => {
                 let outcome = runtime.fork()?;
                 let retval: i64 = match outcome {
@@ -397,6 +435,7 @@ where
                     }
                 };
                 runtime.complete_syscall(retval)?;
+                last_syscall_retval = Some(retval);
             }
             DispatchOutcome::Execve { path, argv, env } => {
                 match load_execve_image(&dispatcher, &path, argv, env) {
@@ -410,8 +449,37 @@ where
                         runtime.execve_into(&new_image)?;
                     }
                     Err(errno) => {
-                        runtime.complete_syscall(-(errno as i64))?;
+                        let value = -(errno as i64);
+                        runtime.complete_syscall(value)?;
+                        last_syscall_retval = Some(value);
                     }
+                }
+            }
+            DispatchOutcome::SigReturn => {
+                // Pop the Carrick sigframe at SP_EL0 and restore the
+                // pre-signal register state. No `complete_syscall` —
+                // the restored x0 IS the syscall return value the
+                // pre-empted caller observes.
+                runtime.restore_from_sigframe()?;
+                // Don't immediately re-deliver another pending signal
+                // until the handler-return path has completed unwinding.
+                suppress_signal_check = true;
+            }
+        }
+
+        if !suppress_signal_check {
+            if let Some(action) =
+                deliver_pending_signal(runtime, &dispatcher, last_syscall_retval)?
+            {
+                if let Some(exit) = action.exit_code {
+                    return Ok(RunResult {
+                        exit_code: exit,
+                        stdout: dispatcher.stdout().to_vec(),
+                        stderr: dispatcher.stderr().to_vec(),
+                        traps,
+                        report: reporter.finish(),
+                        trap_limit_hit: false,
+                    });
                 }
             }
         }
@@ -425,6 +493,57 @@ where
         report: reporter.finish(),
         trap_limit_hit: true,
     })
+}
+
+/// Outcome of `deliver_pending_signal`. The `exit_code` field is
+/// `Some` when the pending signal had no installed handler and the
+/// default action (terminate) applies.
+struct PendingSignalAction {
+    exit_code: Option<i32>,
+}
+
+/// Drain whatever signal is sitting in the host pending slot and
+/// dispatch it to the guest. Returns `Ok(None)` when nothing was
+/// pending. Returns `Ok(Some(...))` with `exit_code: Some(code)` when
+/// a default-action signal fires (the runtime should treat this like
+/// an `exit_group(code)`). Returns `Ok(Some(...))` with
+/// `exit_code: None` when the handler was injected (or the signal was
+/// SIG_IGN'd) and the vCPU should resume.
+fn deliver_pending_signal<T>(
+    trap: &mut T,
+    dispatcher: &SyscallDispatcher,
+    last_syscall_retval: Option<i64>,
+) -> Result<Option<PendingSignalAction>, RuntimeError>
+where
+    T: SyscallTrap,
+{
+    let pending = crate::host_signal::take_pending();
+    if pending == 0 {
+        return Ok(None);
+    }
+    if dispatcher.signal_is_ignored(pending) {
+        return Ok(Some(PendingSignalAction { exit_code: None }));
+    }
+    match dispatcher.registered_signal_handler(pending) {
+        Some(action) => {
+            let handler = action.sa_handler;
+            let restorer = action.sa_restorer;
+            if restorer == 0 {
+                tracing::warn!(
+                    signum = pending,
+                    "guest handler for signal has no sa_restorer; falling back to default terminate"
+                );
+                return Ok(Some(PendingSignalAction {
+                    exit_code: Some(128 + pending),
+                }));
+            }
+            trap.inject_signal(pending, handler, restorer, last_syscall_retval)?;
+            Ok(Some(PendingSignalAction { exit_code: None }))
+        }
+        None => Ok(Some(PendingSignalAction {
+            exit_code: Some(128 + pending),
+        })),
+    }
 }
 
 /// Build a new AddressSpace for an execve target. Resolves the path
@@ -482,6 +601,7 @@ where
     T: SyscallTrap,
 {
     let mut reporter = CompatReporter::default();
+    crate::host_signal::install_default_handlers();
 
     for traps in 1..=max_traps {
         let frame = trap.next_syscall()?;
@@ -490,6 +610,9 @@ where
             memory,
             &mut reporter,
         )?;
+
+        let mut last_syscall_retval: Option<i64> = None;
+        let mut suppress_signal_check = false;
 
         match outcome {
             DispatchOutcome::Exit { code } => {
@@ -505,8 +628,15 @@ where
                     trap_limit_hit: false,
                 });
             }
-            DispatchOutcome::Returned { value } => trap.complete_syscall(value)?,
-            DispatchOutcome::Errno { errno } => trap.complete_syscall(-(errno as i64))?,
+            DispatchOutcome::Returned { value } => {
+                trap.complete_syscall(value)?;
+                last_syscall_retval = Some(value);
+            }
+            DispatchOutcome::Errno { errno } => {
+                let value = -(errno as i64);
+                trap.complete_syscall(value)?;
+                last_syscall_retval = Some(value);
+            }
             DispatchOutcome::Fork => {
                 let outcome = trap.fork()?;
                 let retval: i64 = match outcome {
@@ -517,6 +647,7 @@ where
                     }
                 };
                 trap.complete_syscall(retval)?;
+                last_syscall_retval = Some(retval);
             }
             DispatchOutcome::Execve { path, argv, env } => {
                 match load_execve_image(&dispatcher, &path, argv, env) {
@@ -529,7 +660,32 @@ where
                         );
                         trap.execve_into(&new_image)?;
                     }
-                    Err(errno) => trap.complete_syscall(-(errno as i64))?,
+                    Err(errno) => {
+                        let value = -(errno as i64);
+                        trap.complete_syscall(value)?;
+                        last_syscall_retval = Some(value);
+                    }
+                }
+            }
+            DispatchOutcome::SigReturn => {
+                trap.restore_from_sigframe()?;
+                suppress_signal_check = true;
+            }
+        }
+
+        if !suppress_signal_check {
+            if let Some(action) =
+                deliver_pending_signal(trap, &dispatcher, last_syscall_retval)?
+            {
+                if let Some(exit) = action.exit_code {
+                    return Ok(RunResult {
+                        exit_code: exit,
+                        stdout: dispatcher.stdout().to_vec(),
+                        stderr: dispatcher.stderr().to_vec(),
+                        traps,
+                        report: reporter.finish(),
+                        trap_limit_hit: false,
+                    });
                 }
             }
         }
@@ -564,5 +720,19 @@ impl SyscallTrap for HvfTrapEngine {
 
     fn complete_syscall(&mut self, return_value: i64) -> Result<(), TrapError> {
         self.complete_syscall(return_value)
+    }
+
+    fn inject_signal(
+        &mut self,
+        signum: i32,
+        handler: u64,
+        sa_restorer: u64,
+        pending_syscall_retval: Option<i64>,
+    ) -> Result<(), TrapError> {
+        HvfTrapEngine::inject_signal(self, signum, handler, sa_restorer, pending_syscall_retval)
+    }
+
+    fn restore_from_sigframe(&mut self) -> Result<(), TrapError> {
+        HvfTrapEngine::restore_from_sigframe(self)
     }
 }
