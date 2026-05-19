@@ -8343,6 +8343,24 @@ fn synthetic_proc_file(path: &str, ctx: &SyntheticProcContext<'_>) -> Option<Vec
         "/proc/sys/kernel/random/boot_id" => {
             Some(synthetic_proc_boot_id().to_vec())
         }
+        // glibc's `__check_pf` (called from getaddrinfo with
+        // AI_ADDRCONFIG) queries the kernel via NETLINK_ROUTE for
+        // interface families. macOS has no AF_NETLINK, so the socket
+        // call fails and glibc falls back to reading
+        // `/proc/net/if_inet6`. Without this file, glibc's fallback
+        // path treats IPv6 as "available" by default, then apt's
+        // resolver issues AAAA queries that never get answered and
+        // returns EAI_AGAIN. Synthesise the file with only the
+        // loopback `::1` entry so the kernel-PF check concludes "no
+        // non-loopback IPv6" — AI_ADDRCONFIG then short-circuits to
+        // IPv4 and apt's http method resolves on the first try.
+        //
+        // Format (per kernel docs):
+        //   <16-byte hex IPv6 addr> <iface idx hex> <prefix len hex>
+        //   <scope hex> <flags hex> <devname>
+        "/proc/net/if_inet6" => Some(
+            b"00000000000000000000000000000001 01 80 10 80       lo\n".to_vec(),
+        ),
         _ => None,
     }
 }
