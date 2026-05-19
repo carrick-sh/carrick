@@ -1800,10 +1800,31 @@ impl SyscallDispatcher {
                 errno: LINUX_EINVAL,
             };
         }
-        let Some(open_file) = self.open_files.get(&old_fd) else {
-            return DispatchOutcome::Errno { errno: LINUX_EBADF };
+        let description = match self.open_files.get(&old_fd) {
+            Some(open_file) => Rc::clone(&open_file.description),
+            None if is_stdio_fd(old_fd) => {
+                // Shell `2>&1` style redirects: the source fd is the
+                // process's real host fd 0/1/2 (no OpenDescription was
+                // ever created for them — writes go straight through
+                // stream_stdio). dup3 onto a different fd needs to
+                // capture that host fd so future writes/reads also
+                // reach the same host endpoint. Duplicate the host fd
+                // and wrap it as a HostPipe so the write path picks it
+                // up before the bare-stdio fallback.
+                let duped = unsafe { libc::dup(old_fd) };
+                if duped < 0 {
+                    return DispatchOutcome::Errno {
+                        errno: host_errno(),
+                    };
+                }
+                Rc::new(RefCell::new(OpenDescription::HostPipe {
+                    host_fd: duped,
+                    is_read_end: old_fd == 0,
+                    status_flags: 0,
+                }))
+            }
+            None => return DispatchOutcome::Errno { errno: LINUX_EBADF },
         };
-        let description = Rc::clone(&open_file.description);
         if let Some(replaced) = self.open_files.remove(&new_fd) {
             close_open_file(&replaced);
         }
