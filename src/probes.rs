@@ -30,7 +30,7 @@ mod carrick_usdt {
     /// syscall number from x8, and x0 (first arg / clone retval).
     /// Lower overhead than `syscall-entry` for cases where you only
     /// want to spot loops.
-    fn vcpu__trap(_: u64, _: u64, _: u64) {}
+    fn vcpu__trap(_: u64, _: u64, _: u64, _: u64) {}
     /// Fires when `execve_into` has finished swapping the engine to
     /// the new image. `path`, `entry`, `initial_sp`, `mapping_count`
     /// let dtrace operators verify the new process layout.
@@ -50,8 +50,8 @@ pub fn fork_post(pid: i32, pc: u64, elr: u64) {
     carrick_usdt::fork__post!(|| (pid, pc, elr));
 }
 
-pub fn vcpu_trap(guest_pc: u64, x8: u64, x0: u64) {
-    carrick_usdt::vcpu__trap!(|| (guest_pc, x8, x0));
+pub fn vcpu_trap(guest_pc: u64, x8: u64, x0: u64, x30: u64) {
+    carrick_usdt::vcpu__trap!(|| (guest_pc, x8, x0, x30));
 }
 
 pub fn execve_loaded(path: &str, entry: u64, initial_sp: u64, mapping_count: u64) {

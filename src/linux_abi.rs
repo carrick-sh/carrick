@@ -18,7 +18,15 @@ pub const LINUX_AT_BASE: u64 = 7;
 pub const LINUX_AT_ENTRY: u64 = 9;
 pub const LINUX_PAGE_SIZE: u64 = 4096;
 pub const LINUX_UTSNAME_FIELD_SIZE: usize = 65;
-pub const LINUX_SIGSET_WORDS: usize = 16;
+/// Number of u64s in the kernel ABI sigset_t. Linux uapi defines
+/// `_NSIG=64` and `_NSIG_WORDS = _NSIG / _NSIG_BPW = 1`, so the
+/// kernel's `sigset_t` is a single 8-byte word and the kernel-level
+/// `struct sigaction` (what `rt_sigaction` reads/writes) is therefore
+/// 24 (handler+flags+restorer) + 8 (mask) = 32 bytes total. Writing
+/// past those 32 bytes back into the caller's stack frame clobbers
+/// the caller's saved `x30` and crashes the guest with PC=0.
+pub const LINUX_SIGSET_WORDS: usize = 1;
+pub const LINUX_KERNEL_SIGSET_SIZE: u64 = 8;
 
 // Linux SIGxxx numbers (POSIX). Only the handful we actively translate to
 // from host signals or accept from kill(2) are listed here.

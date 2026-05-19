@@ -45,6 +45,16 @@ pub enum TrapError {
         size: usize,
         code: u32,
     },
+    /// An EL0 sync exception other than `svc #0` reached the EL1 vector
+    /// trampoline (e.g. instruction abort at PC=0, data abort, undef).
+    /// Surfaces the original syndrome/ELR/FAR so the runtime can map it
+    /// to a Linux signal (typically SIGSEGV/SIGBUS/SIGILL).
+    #[error("EL0 fault not handled by trap path: esr=0x{syndrome:x} elr=0x{elr:x} far=0x{far:x}")]
+    EL0Fault {
+        syndrome: u64,
+        elr: u64,
+        far: u64,
+    },
 }
 
 /// Outcome of `HvfTrapEngine::fork`. The parent learns the child's PID;
@@ -619,6 +629,33 @@ impl HvfInner {
                 physical_address: exception.physical_address,
             });
         }
+        // EC=0x16 (HVC) only means our EL1 vector trampoline fired — it
+        // catches ALL lower-EL synchronous exceptions, not just SVCs.
+        // Look at ESR_EL1 to see what actually trapped to EL1; if it's
+        // not an SVC, surface it as an unexpected-EL0-fault so the
+        // runtime can deliver the right Linux signal instead of pretending
+        // x8 is a syscall number.
+        if is_aarch64_hvc_exception(exception.syndrome) {
+            let underlying = self
+                .vcpu
+                .get_sys_reg(SysReg::ESR_EL1)
+                .map_err(hvf_error)?;
+            if !is_aarch64_svc_exception(underlying) {
+                let elr = self
+                    .vcpu
+                    .get_sys_reg(SysReg::ELR_EL1)
+                    .unwrap_or(0);
+                let far = self
+                    .vcpu
+                    .get_sys_reg(SysReg::FAR_EL1)
+                    .unwrap_or(0);
+                return Err(TrapError::EL0Fault {
+                    syndrome: underlying,
+                    elr,
+                    far,
+                });
+            }
+        }
         self.last_exit_class = aarch64_exception_class(exception.syndrome);
 
         if std::env::var_os("CARRICK_TRACE_REGS").is_some() {
@@ -674,7 +711,8 @@ impl HvfInner {
             .vcpu
             .get_sys_reg(SysReg::ELR_EL1)
             .unwrap_or(0);
-        crate::probes::vcpu_trap(guest_pc, frame.x8, frame.x0);
+        let lr = self.vcpu.get_reg(Reg::LR).unwrap_or(0);
+        crate::probes::vcpu_trap(guest_pc, frame.x8, frame.x0, lr);
         Ok(frame)
     }
 
@@ -943,7 +981,7 @@ impl HvfInner {
         // this trap. Nothing to write here; SPSR_EL1 is already
         // correct for "return to EL0t".
 
-        crate::probes::vcpu_trap(handler, 0xffff_ffff_ffff_ffff, signum as u64);
+        crate::probes::vcpu_trap(handler, 0xffff_ffff_ffff_ffff, signum as u64, 0);
         Ok(())
     }
 
