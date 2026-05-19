@@ -158,6 +158,15 @@ enum RootfsCommand {
 /// current-thread runtime that drops before the trap loop even begins,
 /// so by the time fork can fire there is no tokio state to break.
 fn main() -> anyhow::Result<()> {
+    // Ignore SIGPIPE in the host so a guest writing to a closed
+    // pipe end (eg `ls | head` after head exits) gets EPIPE from
+    // libc::write instead of having the host carrick process killed
+    // by SIGPIPE. The dispatcher then translates EPIPE into the
+    // guest's errno; the guest sees Linux's standard EPIPE behavior.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
