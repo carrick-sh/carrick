@@ -9538,7 +9538,7 @@ pub mod linux_errno {
 /// through unchanged. Sources:
 /// - macOS: <sys/errno.h>
 /// - Linux: asm-generic/errno-base.h + asm-generic/errno.h
-fn macos_to_linux_errno(macos: i32) -> i32 {
+pub fn macos_to_linux_errno(macos: i32) -> i32 {
     use linux_errno::*;
     #[cfg(target_os = "macos")]
     {

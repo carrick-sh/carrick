@@ -29,12 +29,15 @@
 //!    overlay split; every dispatcher fs syscall flows through the
 //!    Vfs after this lands.
 //!
-//! For step 1, only the path-level operations are on the trait. The
-//! `open` method that produces an `OpenDescription` is deferred to
-//! step 2, where `DevVfs` is the first concrete user.
+//! Step 1 landed the path-level trait + mount table. Step 2 (this
+//! revision) adds the `open` method and a [`VfsHandle`] discriminated
+//! union that the dispatcher converts to its own `OpenDescription`
+//! enum. `DevVfs` is the first concrete user of `open`.
 
+pub mod dev;
 pub mod mount;
 
+pub use dev::DevVfs;
 pub use mount::VfsMounts;
 
 use std::path::PathBuf;
@@ -75,6 +78,50 @@ pub struct DirEnt {
     pub kind: EntryKind,
 }
 
+/// Open flags normalised away from Linux's bit layout. Mounts that
+/// only care about read/write distinctions don't have to decode the
+/// raw Linux O_* bits themselves; the dispatcher does that once
+/// before handing flags to the Vfs.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OpenFlags {
+    pub read: bool,
+    pub write: bool,
+    pub create: bool,
+    pub excl: bool,
+    pub trunc: bool,
+    pub append: bool,
+    pub directory: bool,
+    pub nofollow: bool,
+    pub nonblock: bool,
+    pub cloexec: bool,
+    /// Mode bits for `O_CREAT`. Ignored otherwise.
+    pub mode: u32,
+}
+
+/// What a successful [`Vfs::open`] returns. Each variant carries
+/// just enough information for the dispatcher to construct its own
+/// `OpenDescription` without the Vfs needing to know about that
+/// private enum. New variants are added per migration step:
+///
+/// * Step 2 (DevVfs): [`HostFd`](VfsHandle::HostFd) — a real macOS fd
+///   that the dispatcher will wrap as a `HostPipe` description.
+/// * Step 3 (ProcVfs/SysVfs): a `Bytes` variant for synthetic files.
+/// * Step 4 (RootFsVfs): variants for overlay-backed regular files
+///   and directories.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VfsHandle {
+    /// A host fd that the dispatcher should route I/O through via the
+    /// `HostPipe` `OpenDescription` variant. `is_read_end` controls
+    /// which direction the dispatcher treats as live; for chardevs
+    /// like `/dev/null` that are effectively bidirectional, set it to
+    /// `!write_requested`.
+    HostFd {
+        host_fd: i32,
+        is_read_end: bool,
+        status_flags: u32,
+    },
+}
+
 /// The path-and-metadata surface of a single mount point. Open-side
 /// operations (returning per-fd state) land in step 2 of the
 /// migration plan — for now the dispatcher continues to drive its
@@ -94,6 +141,18 @@ pub trait Vfs: Send {
 
     fn readdir(&self, _path: &str) -> Result<Vec<DirEnt>, VfsError> {
         Err(crate::dispatch::LINUX_ENOTDIR)
+    }
+
+    /// Open `path`. Returns a [`VfsHandle`] variant that the
+    /// dispatcher converts into its own per-fd state. Default impl
+    /// returns ENOSYS so mounts that don't support `open` don't have
+    /// to implement it explicitly.
+    fn open(
+        &mut self,
+        _path: &str,
+        _flags: OpenFlags,
+    ) -> Result<VfsHandle, VfsError> {
+        Err(crate::dispatch::LINUX_ENOSYS)
     }
 
     fn mkdir(&mut self, _path: &str, _mode: u32) -> Result<(), VfsError> {
