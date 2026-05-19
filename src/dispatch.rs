@@ -557,6 +557,16 @@ impl SyscallDispatcher {
         &self.stdout
     }
 
+    /// Called after `libc::fork(2)` returns into a child: the child
+    /// inherited the parent's buffered stdout/stderr, but we don't
+    /// want to re-print those bytes when the child eventually exits
+    /// via the `forked_child_exit` path. The parent's full buffer
+    /// goes out through its own JSON report.
+    pub fn clear_output_buffers(&mut self) {
+        self.stdout.clear();
+        self.stderr.clear();
+    }
+
     pub fn stderr(&self) -> &[u8] {
         &self.stderr
     }
