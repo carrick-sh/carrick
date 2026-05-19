@@ -50,6 +50,12 @@ enum Commands {
         /// back to image / segment / file context.
         #[arg(long = "debug-state-path")]
         debug_state_path: Option<PathBuf>,
+        /// Suppress the JSON compat-report envelope. The guest's stdout
+        /// goes to the carrick process's stdout, stderr to stderr, and
+        /// the host exit code matches the guest's exit_group code.
+        /// Makes carrick feel like a normal command runner.
+        #[arg(long)]
+        raw: bool,
         #[arg(last = true)]
         args: Vec<String>,
     },
@@ -63,6 +69,9 @@ enum Commands {
         /// See `run-elf --debug-state-path`.
         #[arg(long = "debug-state-path")]
         debug_state_path: Option<PathBuf>,
+        /// Suppress the JSON compat-report envelope.
+        #[arg(long)]
+        raw: bool,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
@@ -213,6 +222,7 @@ fn main() -> anyhow::Result<()> {
             rootfs_layers,
             max_traps,
             debug_state_path,
+            raw,
             args,
         } => {
             let dispatcher = if rootfs_layers.is_empty() {
@@ -234,6 +244,14 @@ fn main() -> anyhow::Result<()> {
                 debug_state_path.as_ref(),
             )
             .with_context(|| format!("failed to run static ELF {}", path.display()))?;
+            if raw {
+                emit_raw(&result);
+                std::process::exit(if result.trap_limit_hit {
+                    1
+                } else {
+                    result.exit_code
+                });
+            }
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
@@ -263,6 +281,7 @@ fn main() -> anyhow::Result<()> {
             image,
             max_traps,
             debug_state_path,
+            raw,
             command,
         } => {
             let image = ImageReference::parse(&image)?;
@@ -297,6 +316,14 @@ fn main() -> anyhow::Result<()> {
                     image.canonical()
                 )
             })?;
+            if raw {
+                emit_raw(&result);
+                std::process::exit(if result.trap_limit_hit {
+                    1
+                } else {
+                    result.exit_code
+                });
+            }
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
@@ -479,6 +506,18 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+
+/// When `--raw` is set, emit the guest's buffered stdout/stderr to the
+/// carrick host process's fd 1 / fd 2 instead of wrapping them in JSON.
+/// This makes carrick feel like a normal command runner: `carrick run
+/// alpine /bin/busybox echo hi --raw` prints just `hi`.
+fn emit_raw(result: &carrick::runtime::RunResult) {
+    use std::io::Write;
+    let _ = std::io::stdout().write_all(&result.stdout);
+    let _ = std::io::stderr().write_all(&result.stderr);
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+}
 
 /// Run a single OCI-related future on a short-lived current-thread tokio
 /// runtime. The runtime is dropped before returning, so by the time the
