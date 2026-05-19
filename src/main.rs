@@ -446,7 +446,7 @@ fn main() -> anyhow::Result<()> {
                 }
                 let me = std::env::current_exe()
                     .context("failed to resolve current carrick binary path")?;
-                if unsafe { libc_geteuid() } != 0 {
+                if unsafe { libc::geteuid() } != 0 {
                     eprintln!(
                         "carrick trace: not running as root; libdtrace will fail to open /dev/dtrace."
                     );
@@ -470,11 +470,6 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
-unsafe extern "C" {
-    #[link_name = "geteuid"]
-    fn libc_geteuid() -> u32;
-}
 
 /// Run a single OCI-related future on a short-lived current-thread tokio
 /// runtime. The runtime is dropped before returning, so by the time the

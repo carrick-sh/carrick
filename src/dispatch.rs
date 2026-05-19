@@ -429,6 +429,15 @@ enum OpenDescription {
         pipe: Rc<RefCell<PipeState>>,
         status_flags: u64,
     },
+    /// Host kernel pipe end backed by a real macOS file descriptor.
+    /// Survives `libc::fork(2)` natively — both parent and child see
+    /// the same kernel pipe object, so the post-fork sh-pipe demo
+    /// can actually carry data across the carrick process boundary.
+    HostPipe {
+        host_fd: i32,
+        is_read_end: bool,
+        status_flags: u64,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -477,7 +486,8 @@ impl OpenDescription {
             | OpenDescription::TimerFd { status_flags, .. }
             | OpenDescription::Epoll { status_flags, .. }
             | OpenDescription::PipeReader { status_flags, .. }
-            | OpenDescription::PipeWriter { status_flags, .. } => *status_flags,
+            | OpenDescription::PipeWriter { status_flags, .. }
+            | OpenDescription::HostPipe { status_flags, .. } => *status_flags,
         }
     }
 
@@ -490,7 +500,8 @@ impl OpenDescription {
             | OpenDescription::TimerFd { status_flags, .. }
             | OpenDescription::Epoll { status_flags, .. }
             | OpenDescription::PipeReader { status_flags, .. }
-            | OpenDescription::PipeWriter { status_flags, .. } => *status_flags = next,
+            | OpenDescription::PipeWriter { status_flags, .. }
+            | OpenDescription::HostPipe { status_flags, .. } => *status_flags = next,
         }
     }
 }
@@ -861,7 +872,8 @@ impl SyscallDispatcher {
             | OpenDescription::TimerFd { .. }
             | OpenDescription::Epoll { .. }
             | OpenDescription::PipeReader { .. }
-            | OpenDescription::PipeWriter { .. } => synthetic_readonly_access(mode),
+            | OpenDescription::PipeWriter { .. }
+            | OpenDescription::HostPipe { .. } => synthetic_readonly_access(mode),
         }
     }
 
@@ -918,7 +930,8 @@ impl SyscallDispatcher {
             | OpenDescription::TimerFd { .. }
             | OpenDescription::Epoll { .. }
             | OpenDescription::PipeReader { .. }
-            | OpenDescription::PipeWriter { .. } => DispatchOutcome::Errno {
+            | OpenDescription::PipeWriter { .. }
+            | OpenDescription::HostPipe { .. } => DispatchOutcome::Errno {
                 errno: LINUX_ENOTDIR,
             },
         }
@@ -1426,6 +1439,11 @@ impl SyscallDispatcher {
                     ready |= LINUX_POLLOUT;
                 }
             }
+            OpenDescription::HostPipe { .. } => {
+                // Polling host pipes correctly requires poll(2) on the
+                // host fd. For now report nothing ready and let the
+                // guest block in a real read/write.
+            }
         }
         ready
     }
@@ -1439,31 +1457,55 @@ impl SyscallDispatcher {
             };
         }
 
+        // Allocate a real host pipe so the two ends share state via the
+        // kernel and survive `libc::fork(2)` natively. macOS's `pipe(2)`
+        // returns two fds: [0] read end, [1] write end.
+        let mut host_fds = [0i32; 2];
+        let r = unsafe { libc::pipe(host_fds.as_mut_ptr()) };
+        if r != 0 {
+            return DispatchOutcome::Errno { errno: host_errno() };
+        }
+
+        let host_read = host_fds[0];
+        let host_write = host_fds[1];
+
         let Some(read_fd) = self.allocate_fd(3) else {
+            unsafe {
+                libc::close(host_read);
+                libc::close(host_write);
+            }
             return DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
             };
         };
         let Some(write_fd) = self.allocate_fd(read_fd.saturating_add(1)) else {
+            unsafe {
+                libc::close(host_read);
+                libc::close(host_write);
+            }
             return DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
             };
         };
         let pair = LinuxFdPair { read_fd, write_fd };
         if memory.write_bytes(address, pair.as_bytes()).is_err() {
+            unsafe {
+                libc::close(host_read);
+                libc::close(host_write);
+            }
             return DispatchOutcome::Errno {
                 errno: LINUX_EFAULT,
             };
         }
 
-        let pipe = Rc::new(RefCell::new(PipeState::default()));
         let status_flags = flags & LINUX_O_NONBLOCK;
         let fd_flags = linux_fd_flags_from_open_flags(flags);
         self.insert_open_file(
             read_fd,
             OpenFile {
-                description: Rc::new(RefCell::new(OpenDescription::PipeReader {
-                    pipe: Rc::clone(&pipe),
+                description: Rc::new(RefCell::new(OpenDescription::HostPipe {
+                    host_fd: host_read,
+                    is_read_end: true,
                     status_flags,
                 })),
                 fd_flags,
@@ -1472,8 +1514,9 @@ impl SyscallDispatcher {
         self.insert_open_file(
             write_fd,
             OpenFile {
-                description: Rc::new(RefCell::new(OpenDescription::PipeWriter {
-                    pipe,
+                description: Rc::new(RefCell::new(OpenDescription::HostPipe {
+                    host_fd: host_write,
+                    is_read_end: false,
                     status_flags,
                 })),
                 fd_flags,
@@ -1492,7 +1535,10 @@ impl SyscallDispatcher {
         let old_fd = request.arg(0) as i32;
         let new_fd = request.arg(1) as i32;
         let flags = request.arg(2);
-        if old_fd == new_fd || flags & !LINUX_O_CLOEXEC != 0 || new_fd < 3 {
+        // Linux dup3 requires old_fd != new_fd and only honours
+        // O_CLOEXEC in `flags`. It explicitly allows new_fd to be 0/1/2
+        // — that's how shells redirect stdin/stdout/stderr.
+        if old_fd == new_fd || flags & !LINUX_O_CLOEXEC != 0 || new_fd < 0 {
             return DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
             };
@@ -1535,7 +1581,8 @@ impl SyscallDispatcher {
                     return DispatchOutcome::Errno { errno: LINUX_EBADF };
                 };
                 match &*open_file.description.borrow() {
-                    OpenDescription::PipeReader { .. } | OpenDescription::PipeWriter { .. } => {
+                    OpenDescription::PipeReader { .. } | OpenDescription::PipeWriter { .. }
+            | OpenDescription::HostPipe { .. } => {
                         DispatchOutcome::Returned {
                             value: LINUX_PIPE_BUF_SIZE,
                         }
@@ -1854,6 +1901,7 @@ impl SyscallDispatcher {
             | OpenDescription::PipeWriter { .. }
             | OpenDescription::EventFd { .. }
             | OpenDescription::TimerFd { .. }
+            | OpenDescription::HostPipe { .. }
             | OpenDescription::Epoll { .. } => LINUX_ESPIPE,
         };
         DispatchOutcome::Errno { errno }
@@ -1883,6 +1931,7 @@ impl SyscallDispatcher {
             | OpenDescription::PipeWriter { .. }
             | OpenDescription::EventFd { .. }
             | OpenDescription::TimerFd { .. }
+            | OpenDescription::HostPipe { .. }
             | OpenDescription::Epoll { .. } => LINUX_EINVAL,
         };
         DispatchOutcome::Errno { errno }
@@ -2845,17 +2894,11 @@ impl SyscallDispatcher {
             return DispatchOutcome::Errno { errno: LINUX_EINVAL };
         }
         // Linux WNOHANG = 1; macOS WNOHANG = 1. Same bit, pass through.
-        unsafe extern "C" {
-            fn waitpid(pid: i32, wstatus: *mut i32, options: i32) -> i32;
-            #[link_name = "__error"]
-            fn errno_loc() -> *mut i32;
-        }
         let mut host_status: i32 = 0;
-        let result = unsafe { waitpid(pid, &mut host_status, options as i32) };
+        let result = unsafe { libc::waitpid(pid, &mut host_status, options as i32) };
         if result < 0 {
-            let host_errno = unsafe { *errno_loc() };
             // ECHILD on macOS == ECHILD on Linux (10).
-            return DispatchOutcome::Errno { errno: host_errno };
+            return DispatchOutcome::Errno { errno: host_errno() };
         }
         if result == 0 {
             // WNOHANG and no child ready.
@@ -3164,7 +3207,8 @@ impl SyscallDispatcher {
             | OpenDescription::TimerFd { .. }
             | OpenDescription::Epoll { .. }
             | OpenDescription::PipeReader { .. }
-            | OpenDescription::PipeWriter { .. } => {
+            | OpenDescription::PipeWriter { .. }
+            | OpenDescription::HostPipe { .. } => {
                 return DispatchOutcome::Errno {
                     errno: LINUX_EINVAL,
                 };
@@ -3194,7 +3238,8 @@ impl SyscallDispatcher {
             | OpenDescription::TimerFd { .. }
             | OpenDescription::Epoll { .. }
             | OpenDescription::PipeReader { .. }
-            | OpenDescription::PipeWriter { .. } => {}
+            | OpenDescription::PipeWriter { .. }
+            | OpenDescription::HostPipe { .. } => {}
         }
         DispatchOutcome::Returned { value: next }
     }
@@ -3333,7 +3378,8 @@ impl SyscallDispatcher {
                 | OpenDescription::TimerFd { .. }
                 | OpenDescription::Epoll { .. }
                 | OpenDescription::PipeReader { .. }
-                | OpenDescription::PipeWriter { .. } => {
+                | OpenDescription::PipeWriter { .. }
+            | OpenDescription::HostPipe { .. } => {
                     return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
                 }
             };
@@ -3662,12 +3708,23 @@ impl SyscallDispatcher {
             OpenDescription::PipeReader { pipe, status_flags } => {
                 return Ok(read_pipe(memory, address, length, pipe, *status_flags));
             }
+            OpenDescription::HostPipe {
+                host_fd,
+                is_read_end,
+                ..
+            } => {
+                if !*is_read_end {
+                    return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+                }
+                return Ok(read_host_pipe(memory, address, length, *host_fd));
+            }
             OpenDescription::Directory { .. } => {
                 return Ok(DispatchOutcome::Errno {
                     errno: LINUX_EISDIR,
                 });
             }
-            OpenDescription::Epoll { .. } | OpenDescription::PipeWriter { .. } => {
+            OpenDescription::Epoll { .. } | OpenDescription::PipeWriter { .. }
+            | OpenDescription::HostPipe { .. } => {
                 return Ok(DispatchOutcome::Errno {
                     errno: LINUX_EINVAL,
                 });
@@ -3716,7 +3773,8 @@ impl SyscallDispatcher {
             | OpenDescription::TimerFd { .. }
             | OpenDescription::Epoll { .. }
             | OpenDescription::PipeReader { .. }
-            | OpenDescription::PipeWriter { .. } => {
+            | OpenDescription::PipeWriter { .. }
+            | OpenDescription::HostPipe { .. } => {
                 return Ok(DispatchOutcome::Errno {
                     errno: LINUX_EINVAL,
                 });
@@ -3752,7 +3810,8 @@ impl SyscallDispatcher {
             | OpenDescription::TimerFd { .. }
             | OpenDescription::Epoll { .. }
             | OpenDescription::PipeReader { .. }
-            | OpenDescription::PipeWriter { .. } => {
+            | OpenDescription::PipeWriter { .. }
+            | OpenDescription::HostPipe { .. } => {
                 return Ok(DispatchOutcome::Errno {
                     errno: LINUX_EINVAL,
                 });
@@ -3802,7 +3861,8 @@ impl SyscallDispatcher {
             | OpenDescription::TimerFd { .. }
             | OpenDescription::Epoll { .. }
             | OpenDescription::PipeReader { .. }
-            | OpenDescription::PipeWriter { .. } => {
+            | OpenDescription::PipeWriter { .. }
+            | OpenDescription::HostPipe { .. } => {
                 return Ok(DispatchOutcome::Errno {
                     errno: LINUX_EINVAL,
                 });
@@ -3850,6 +3910,7 @@ impl SyscallDispatcher {
             | OpenDescription::PipeWriter { .. }
             | OpenDescription::EventFd { .. }
             | OpenDescription::TimerFd { .. }
+            | OpenDescription::HostPipe { .. }
             | OpenDescription::Epoll { .. } => LINUX_ESPIPE,
         };
         Ok(DispatchOutcome::Errno { errno })
@@ -3899,6 +3960,7 @@ impl SyscallDispatcher {
             | OpenDescription::PipeWriter { .. }
             | OpenDescription::EventFd { .. }
             | OpenDescription::TimerFd { .. }
+            | OpenDescription::HostPipe { .. }
             | OpenDescription::Epoll { .. } => LINUX_ESPIPE,
         };
         Ok(DispatchOutcome::Errno { errno })
@@ -3984,7 +4046,8 @@ impl SyscallDispatcher {
             | OpenDescription::TimerFd { .. }
             | OpenDescription::Epoll { .. }
             | OpenDescription::PipeReader { .. }
-            | OpenDescription::PipeWriter { .. } => Ok(Err(LINUX_EINVAL)),
+            | OpenDescription::PipeWriter { .. }
+            | OpenDescription::HostPipe { .. } => Ok(Err(LINUX_EINVAL)),
         }
     }
 
@@ -4001,7 +4064,8 @@ impl SyscallDispatcher {
             | OpenDescription::TimerFd { .. }
             | OpenDescription::Epoll { .. }
             | OpenDescription::PipeReader { .. }
-            | OpenDescription::PipeWriter { .. } => return Err(LINUX_EINVAL),
+            | OpenDescription::PipeWriter { .. }
+            | OpenDescription::HostPipe { .. } => return Err(LINUX_EINVAL),
         };
         let available = contents.get(offset..).unwrap_or_default();
         let write_len = available.len().min(count);
@@ -4191,24 +4255,36 @@ impl SyscallDispatcher {
             }
         };
 
+        // Check open_files FIRST: dup3 may have redirected fd 1/2 to
+        // a pipe, an eventfd, or some other resource. Only after we've
+        // confirmed there's no open description do we fall back to the
+        // dispatcher's built-in stdout/stderr buffers.
+        if let Some(open_file) = self.open_files.get(&(fd as i32)) {
+            let mut open = open_file.description.borrow_mut();
+            match &mut *open {
+                OpenDescription::EventFd { counter, .. } => {
+                    return Ok(write_eventfd(&bytes, counter));
+                }
+                OpenDescription::PipeWriter { pipe, .. } => {
+                    return Ok(write_pipe(&bytes, pipe));
+                }
+                OpenDescription::HostPipe {
+                    host_fd,
+                    is_read_end,
+                    ..
+                } => {
+                    if *is_read_end {
+                        return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+                    }
+                    return Ok(write_host_pipe(&bytes, *host_fd));
+                }
+                _ => return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF }),
+            }
+        }
         match fd {
             1 => self.stdout.extend_from_slice(&bytes),
             2 => self.stderr.extend_from_slice(&bytes),
-            _ => {
-                let Some(open_file) = self.open_files.get(&(fd as i32)) else {
-                    return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
-                };
-                let mut open = open_file.description.borrow_mut();
-                match &mut *open {
-                    OpenDescription::EventFd { counter, .. } => {
-                        return Ok(write_eventfd(&bytes, counter));
-                    }
-                    OpenDescription::PipeWriter { pipe, .. } => {
-                        return Ok(write_pipe(&bytes, pipe));
-                    }
-                    _ => return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF }),
-                }
-            }
+            _ => return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF }),
         }
 
         Ok(DispatchOutcome::Returned {
@@ -5010,7 +5086,8 @@ impl SyscallDispatcher {
             OpenDescription::Epoll { .. } => {
                 return write_synthetic_stat(memory, statbuf, "anon_inode:[eventpoll]", 0);
             }
-            OpenDescription::PipeReader { .. } | OpenDescription::PipeWriter { .. } => {
+            OpenDescription::PipeReader { .. } | OpenDescription::PipeWriter { .. }
+            | OpenDescription::HostPipe { .. } => {
                 return write_synthetic_stat(memory, statbuf, "pipe:[carrick]", 0);
             }
         };
@@ -5042,7 +5119,8 @@ impl SyscallDispatcher {
             OpenDescription::Epoll { .. } => {
                 return write_synthetic_statx(memory, statxbuf, "anon_inode:[eventpoll]", 0);
             }
-            OpenDescription::PipeReader { .. } | OpenDescription::PipeWriter { .. } => {
+            OpenDescription::PipeReader { .. } | OpenDescription::PipeWriter { .. }
+            | OpenDescription::HostPipe { .. } => {
                 return write_synthetic_statx(memory, statxbuf, "pipe:[carrick]", 0);
             }
         };
@@ -5072,7 +5150,8 @@ impl SyscallDispatcher {
                 | OpenDescription::TimerFd { .. }
                 | OpenDescription::Epoll { .. }
                 | OpenDescription::PipeReader { .. }
-                | OpenDescription::PipeWriter { .. } => Err(LINUX_ENOTDIR),
+                | OpenDescription::PipeWriter { .. }
+            | OpenDescription::HostPipe { .. } => Err(LINUX_ENOTDIR),
             },
             None => Err(LINUX_EBADF),
         }
@@ -5181,6 +5260,22 @@ fn close_open_file(open_file: &OpenFile) {
         OpenDescription::PipeWriter { pipe, .. } => {
             let mut pipe = pipe.borrow_mut();
             pipe.writers = pipe.writers.saturating_sub(1);
+        }
+        OpenDescription::HostPipe { host_fd, .. } => {
+            // Close the host fd only when the LAST guest fd that
+            // references this OpenDescription is being closed. Because
+            // dup3/dup2 wraps a new Linux fd around the SAME Rc<...>,
+            // we let the Rc go out of scope naturally and rely on the
+            // wrapper around `OpenDescription::HostPipe` having no
+            // shared owners. The simplest correct close here is to
+            // count: if `strong_count == 1` we're the last one.
+            // (The Rc is held by the OpenFile in `open_files`; if no
+            // dup'd entry remains, strong_count is 1.)
+            if std::rc::Rc::strong_count(&open_file.description) == 1 {
+                unsafe {
+                    libc::close(*host_fd);
+                }
+            }
         }
         _ => {}
     }
@@ -6427,6 +6522,43 @@ fn read_guest_string_array(
         out.push(read_guest_c_string(memory, ptr)?);
     }
     Err(LINUX_E2BIG)
+}
+
+fn host_errno() -> i32 {
+    // SAFETY: `__errno_location` (Linux) and `__error` (macOS) both
+    // return a thread-local int pointer.
+    unsafe { *libc::__error() }
+}
+
+fn read_host_pipe(
+    memory: &mut impl GuestMemory,
+    guest_addr: u64,
+    length: usize,
+    host_fd: i32,
+) -> DispatchOutcome {
+    if length == 0 {
+        return DispatchOutcome::Returned { value: 0 };
+    }
+    let mut buf = vec![0u8; length];
+    let n = unsafe { libc::read(host_fd, buf.as_mut_ptr() as *mut _, length) };
+    if n < 0 {
+        return DispatchOutcome::Errno { errno: host_errno() };
+    }
+    let n_usize = n as usize;
+    if n_usize > 0 {
+        if memory.write_bytes(guest_addr, &buf[..n_usize]).is_err() {
+            return DispatchOutcome::Errno { errno: LINUX_EFAULT };
+        }
+    }
+    DispatchOutcome::Returned { value: n as i64 }
+}
+
+fn write_host_pipe(bytes: &[u8], host_fd: i32) -> DispatchOutcome {
+    let n = unsafe { libc::write(host_fd, bytes.as_ptr() as *const _, bytes.len()) };
+    if n < 0 {
+        return DispatchOutcome::Errno { errno: host_errno() };
+    }
+    DispatchOutcome::Returned { value: n as i64 }
 }
 
 fn read_guest_c_string(memory: &impl GuestMemory, address: u64) -> Result<String, i32> {
