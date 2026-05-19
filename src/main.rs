@@ -176,6 +176,20 @@ fn main() -> anyhow::Result<()> {
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
 
+    // Disable Apple's os_log activity tracing for this process tree.
+    // Hypervisor.framework's `hv_vcpu_create` initializes an os_log
+    // handle internally, and that handle is NOT fork-safe — a forked
+    // child calling `hv_vcpu_create` crashes inside `_os_log_find`
+    // with EXC_BAD_ACCESS ~14% of the time (verified via macOS
+    // DiagnosticReports). Setting OS_ACTIVITY_MODE=disable before any
+    // HVF call drops os_log out of the path entirely and makes
+    // repeated fork() + hv_vcpu_create cycles deterministic.
+    unsafe {
+        let key = std::ffi::CString::new("OS_ACTIVITY_MODE").unwrap();
+        let val = std::ffi::CString::new("disable").unwrap();
+        libc::setenv(key.as_ptr(), val.as_ptr(), 1);
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
