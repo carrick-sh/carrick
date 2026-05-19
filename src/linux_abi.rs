@@ -179,6 +179,17 @@ impl LinuxWinsize {
     }
 }
 
+/// Size of the Linux kernel-ABI `struct termios` for TCGETS/TCSETS on
+/// aarch64. It's `c_iflag/c_oflag/c_cflag/c_lflag` (4 u32s = 16 bytes)
+/// + `c_line` (1 byte) + `c_cc[19]` (19 bytes) = **36 bytes**. The
+/// `c_ispeed`/`c_ospeed` fields belong to `struct termios2` (TCGETS2),
+/// a separate ioctl. Writing 44 bytes for TCGETS overflows the
+/// caller's stack-allocated buffer by 8, corrupts the stack canary,
+/// and trips `__stack_chk_fail` later in any glibc program that calls
+/// `isatty()` (which goes through tcgetattr → TCGETS) — i.e. ls, dpkg,
+/// etc. Use [`LINUX_TERMIOS_KERNEL_SIZE`] explicitly for those ioctls.
+pub const LINUX_TERMIOS_KERNEL_SIZE: usize = 36;
+
 #[repr(C, packed)]
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
