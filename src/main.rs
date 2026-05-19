@@ -685,7 +685,33 @@ fn install_fs_backend(
     let mut backend: Box<dyn FsBackend> = match kind {
         FsBackendKind::Memory => Box::new(MemoryBackend::new()),
         FsBackendKind::Host => match HostFsBackend::new() {
-            Ok(host) => Box::new(host),
+            Ok(mut host) => {
+                // SEED THE BACKEND WITH THE FULL ROOTFS.
+                //
+                // This is the "rootfs as APFS, throw away when done"
+                // architecture: instead of layering the writable
+                // overlay on top of the in-memory tar, materialise
+                // every rootfs file/dir/symlink onto the cap-std-
+                // sandboxed scratch directory. After this point, all
+                // fs syscalls flow through real host syscalls
+                // (openat/renameat/symlinkat/...) against a real
+                // filesystem — which fixes apt's downstream chain
+                // (symlinkat EROFS, SplitClearSignedFile, atomic
+                // rename) by giving it real Linux fs semantics.
+                if let Some(rootfs) = dispatcher.rootfs() {
+                    if let Err(err) = host.seed_from_rootfs(rootfs) {
+                        eprintln!(
+                            "carrick: --fs host seed-from-rootfs failed ({err}); falling back to in-memory backend"
+                        );
+                        let mut mem: Box<dyn FsBackend> =
+                            Box::new(MemoryBackend::new());
+                        seed_known_hosts(&mut *mem);
+                        let _ = dispatcher.set_fs_backend(mem);
+                        return Ok(());
+                    }
+                }
+                Box::new(host)
+            }
             Err(err) => {
                 eprintln!(
                     "carrick: --fs host failed ({err}); falling back to in-memory backend"

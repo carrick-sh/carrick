@@ -447,6 +447,38 @@ impl HostFsBackend {
         })
     }
 
+    /// Walk a `RootFs` and write every file/dir/symlink into the
+    /// scratch root, then register every path as "known" so the
+    /// backend's lookup returns it. After this call, the backend
+    /// IS the rootfs — the dispatcher's read-side fallback to the
+    /// in-memory `RootFs` becomes redundant (every path the rootfs
+    /// would have served is now on disk under the cap-std `Dir`).
+    ///
+    /// This is the architectural shift from "overlay on top of read-
+    /// only rootfs" to "host APFS owns everything, throw away on
+    /// exit." cap-std's rooted `Dir` keeps the sandbox guarantee:
+    /// guest paths are still confined to the scratch root.
+    pub fn seed_from_rootfs(&mut self, rootfs: &crate::rootfs::RootFs) -> std::io::Result<()> {
+        let scratch_path = match &self._scratch {
+            Some(td) => td.path().to_path_buf(),
+            None => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "HostFsBackend has no owned scratch dir to seed",
+                ));
+            }
+        };
+        rootfs
+            .extract_to_disk(&scratch_path)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        // Mark everything as "known" so MemoryBackend-style lookups
+        // hit the backend directly without falling back to the rootfs.
+        for path in rootfs.all_paths() {
+            self.known_files.insert(path);
+        }
+        Ok(())
+    }
+
     /// Construct against an already-allocated scratch dir without
     /// taking ownership of its lifetime. Used by tests.
     pub fn from_existing_dir(dir: cap_std::fs::Dir) -> Self {
