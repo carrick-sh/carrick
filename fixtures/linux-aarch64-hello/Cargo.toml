@@ -28,6 +28,14 @@ name = "carrick-linux-aarch64-pipe-bidi"
 path = "src/pipe_bidi.rs"
 
 [[bin]]
+name = "carrick-linux-aarch64-pipe-dup3"
+path = "src/pipe_dup3.rs"
+
+[[bin]]
+name = "carrick-linux-aarch64-inet-connect"
+path = "src/inet_connect.rs"
+
+[[bin]]
 name = "carrick-linux-aarch64-signal-basic"
 path = "src/signal_basic.rs"
 
