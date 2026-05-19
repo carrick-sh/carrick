@@ -118,6 +118,8 @@ build_fixture "truncate_motd.rs" "carrick-linux-aarch64-truncate-motd"
 build_fixture "symlinkat_motd.rs" "carrick-linux-aarch64-symlinkat-motd"
 build_fixture "linkat_motd.rs" "carrick-linux-aarch64-linkat-motd"
 build_fixture "errno_matrix.rs" "carrick-linux-aarch64-errno-matrix"
+build_fixture "signal_basic.rs" "carrick-linux-aarch64-signal-basic"
+build_fixture "signal_default.rs" "carrick-linux-aarch64-signal-default"
 build_pie_fixture "pie_hello.rs" "carrick-linux-aarch64-pie-hello"
 
 cargo metadata \

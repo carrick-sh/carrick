@@ -20,6 +20,17 @@ pub const LINUX_PAGE_SIZE: u64 = 4096;
 pub const LINUX_UTSNAME_FIELD_SIZE: usize = 65;
 pub const LINUX_SIGSET_WORDS: usize = 16;
 
+// Linux SIGxxx numbers (POSIX). Only the handful we actively translate to
+// from host signals or accept from kill(2) are listed here.
+pub const LINUX_SIGHUP: i32 = 1;
+pub const LINUX_SIGINT: i32 = 2;
+pub const LINUX_SIGQUIT: i32 = 3;
+pub const LINUX_SIGTERM: i32 = 15;
+
+/// `SIG_DFL` / `SIG_IGN` handler sentinel values stored in `sa_handler`.
+pub const LINUX_SIG_DFL: u64 = 0;
+pub const LINUX_SIG_IGN: u64 = 1;
+
 pub const LINUX_DIRENT64_HEADER_SIZE: usize = core::mem::size_of::<LinuxDirent64Header>();
 
 #[repr(C, packed)]
@@ -578,6 +589,46 @@ impl LinuxSigaction {
             sa_flags: 0,
             sa_restorer: 0,
             sa_mask: [0; LINUX_SIGSET_WORDS],
+        }
+    }
+}
+
+/// Magic value placed in `CarrickSigframe::magic` so `rt_sigreturn` can
+/// detect a misaligned / corrupt frame and refuse to restore garbage.
+pub const CARRICK_SIGFRAME_MAGIC: u64 = 0x4361_7272_6963_6b53; // 'CarrickS'
+
+/// Carrick's private signal frame layout. The Linux kernel's real
+/// `struct rt_sigframe` carries a full `siginfo_t` + `ucontext_t`; we
+/// only need enough state to round-trip a handler invocation through
+/// `rt_sigreturn`, so we use a packed format we authored ourselves.
+/// Userspace never inspects this — it just passes the pointer back to
+/// `rt_sigreturn` via its registered restorer thunk.
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct CarrickSigframe {
+    pub magic: u64,
+    pub signum: u32,
+    pub _pad0: u32,
+    pub saved_x: [u64; 31],
+    pub saved_pc: u64,
+    pub saved_sp: u64,
+    pub saved_spsr: u64,
+    pub _reserved: [u64; 6],
+}
+
+impl CarrickSigframe {
+    pub const fn empty() -> Self {
+        Self {
+            magic: CARRICK_SIGFRAME_MAGIC,
+            signum: 0,
+            _pad0: 0,
+            saved_x: [0; 31],
+            saved_pc: 0,
+            saved_sp: 0,
+            saved_spsr: 0,
+            _reserved: [0; 6],
         }
     }
 }

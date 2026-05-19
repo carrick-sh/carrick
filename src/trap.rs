@@ -330,6 +330,45 @@ impl HvfTrapEngine {
         Err(TrapError::UnsupportedPlatform)
     }
 
+    /// Push a Carrick signal frame onto SP_EL0 and redirect the next
+    /// vCPU resume to `handler(signum)`. Returns the address of the
+    /// frame so a future debugger can correlate. See
+    /// `SyscallTrap::inject_signal` for the semantics.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn inject_signal(
+        &mut self,
+        signum: i32,
+        handler: u64,
+        sa_restorer: u64,
+        pending_syscall_retval: Option<i64>,
+    ) -> Result<(), TrapError> {
+        self.inner
+            .inject_signal(signum, handler, sa_restorer, pending_syscall_retval)
+    }
+
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    pub fn inject_signal(
+        &mut self,
+        _signum: i32,
+        _handler: u64,
+        _sa_restorer: u64,
+        _pending_syscall_retval: Option<i64>,
+    ) -> Result<(), TrapError> {
+        Err(TrapError::UnsupportedPlatform)
+    }
+
+    /// Pop the Carrick signal frame at SP_EL0 and restore the pre-
+    /// signal register state. Used by `rt_sigreturn(2)`.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn restore_from_sigframe(&mut self) -> Result<(), TrapError> {
+        self.inner.restore_from_sigframe()
+    }
+
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    pub fn restore_from_sigframe(&mut self) -> Result<(), TrapError> {
+        Err(TrapError::UnsupportedPlatform)
+    }
+
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn new_platform() -> Result<Self, TrapError> {
         use applevisor::prelude::*;
@@ -790,6 +829,170 @@ impl HvfInner {
             .set_sys_reg(SysReg::SCTLR_EL1, snap.sctlr_el1)
             .map_err(hvf_error)?;
         self.last_exit_class = snap.last_exit_class;
+        Ok(())
+    }
+
+    /// Synthesise a Linux signal delivery: push a Carrick sigframe onto
+    /// SP_EL0, set x0 = signum, x30 = sa_restorer, and point ELR_EL1 at
+    /// the user handler so the next `eret` from EL1 lands on the
+    /// handler in EL0t. Returns Ok(()) on success; the runtime then
+    /// resumes the vCPU.
+    ///
+    /// `pending_syscall_retval` is the value the dispatcher computed
+    /// for the syscall that just trapped. If it's `Some`, x0 in the
+    /// snapshotted frame is replaced by this retval so the handler-
+    /// return path resumes the caller as if the syscall completed
+    /// normally; if it's `None`, the current x0 is preserved (used for
+    /// the rare case where a signal is delivered before the first
+    /// syscall has run).
+    fn inject_signal(
+        &mut self,
+        signum: i32,
+        handler: u64,
+        sa_restorer: u64,
+        pending_syscall_retval: Option<i64>,
+    ) -> Result<(), TrapError> {
+        use applevisor::prelude::*;
+        use zerocopy::IntoBytes;
+
+        const GPR_TABLE: [Reg; 31] = [
+            Reg::X0, Reg::X1, Reg::X2, Reg::X3, Reg::X4, Reg::X5, Reg::X6,
+            Reg::X7, Reg::X8, Reg::X9, Reg::X10, Reg::X11, Reg::X12,
+            Reg::X13, Reg::X14, Reg::X15, Reg::X16, Reg::X17, Reg::X18,
+            Reg::X19, Reg::X20, Reg::X21, Reg::X22, Reg::X23, Reg::X24,
+            Reg::X25, Reg::X26, Reg::X27, Reg::X28, Reg::X29, Reg::X30,
+        ];
+
+        let mut frame = crate::linux_abi::CarrickSigframe::empty();
+        frame.signum = signum as u32;
+        for (i, reg) in GPR_TABLE.iter().enumerate() {
+            frame.saved_x[i] = self.vcpu.get_reg(*reg).map_err(hvf_error)?;
+        }
+        // x0 was just overwritten by `complete_syscall` with the
+        // syscall's retval. Snapshot that value (not the pre-syscall
+        // arg0) so the handler-return path resumes with the right
+        // retval visible.
+        if let Some(retval) = pending_syscall_retval {
+            frame.saved_x[0] = retval as u64;
+        }
+        frame.saved_pc = self.vcpu.get_sys_reg(SysReg::ELR_EL1).map_err(hvf_error)?;
+        frame.saved_sp = self.vcpu.get_sys_reg(SysReg::SP_EL0).map_err(hvf_error)?;
+        frame.saved_spsr = self
+            .vcpu
+            .get_sys_reg(SysReg::SPSR_EL1)
+            .map_err(hvf_error)?;
+
+        // Reserve space on SP_EL0, rounded down to 16-byte alignment
+        // (AArch64 stack alignment requirement at function-call boundaries).
+        let frame_bytes = frame.as_bytes();
+        let frame_len = frame_bytes.len() as u64;
+        let aligned_len = (frame_len + 15) & !15u64;
+        let new_sp = frame
+            .saved_sp
+            .checked_sub(aligned_len)
+            .ok_or_else(|| TrapError::Hypervisor("sigframe push underflowed SP_EL0".to_string()))?;
+        let new_sp = new_sp & !15u64;
+
+        // Write the frame into guest memory at the new SP.
+        self.write_guest_bytes(new_sp, frame_bytes)
+            .map_err(|e| TrapError::Hypervisor(format!("sigframe write failed: {e}")))?;
+
+        // Adjust SP_EL0 to point past the freshly-written frame.
+        self.vcpu
+            .set_sys_reg(SysReg::SP_EL0, new_sp)
+            .map_err(hvf_error)?;
+
+        // First handler argument is the signum.
+        self.vcpu
+            .set_reg(Reg::X0, signum as u64)
+            .map_err(hvf_error)?;
+        // x1/x2 carry siginfo* / ucontext* on SA_SIGINFO. We don't
+        // construct those (handler should not assume it was registered
+        // with SA_SIGINFO since musl maps 1-arg handlers to non-
+        // SA_SIGINFO entries by default), but zero them so a curious
+        // handler doesn't dereference whatever was in those registers.
+        self.vcpu.set_reg(Reg::X1, 0).map_err(hvf_error)?;
+        self.vcpu.set_reg(Reg::X2, 0).map_err(hvf_error)?;
+
+        // LR = sa_restorer. When the handler executes `ret`, control
+        // lands at the restorer which is responsible for invoking
+        // `rt_sigreturn(2)`. If sa_restorer is zero we fall back to
+        // putting the rt_sigreturn syscall directly inline at the
+        // frame's start of unused reserved area — but musl always
+        // provides one, so we surface an error in the zero case for
+        // now to keep the impl honest.
+        if sa_restorer == 0 {
+            return Err(TrapError::Hypervisor(
+                "signal handler registered without sa_restorer; no vDSO trampoline available"
+                    .to_string(),
+            ));
+        }
+        self.vcpu.set_reg(Reg::X30, sa_restorer).map_err(hvf_error)?;
+
+        // Redirect post-eret PC to the handler. ELR_EL1 was previously
+        // "instruction after the SVC that just trapped"; we steal it
+        // for the handler entry, and the saved value lives in
+        // frame.saved_pc until rt_sigreturn restores it.
+        self.vcpu
+            .set_sys_reg(SysReg::ELR_EL1, handler)
+            .map_err(hvf_error)?;
+
+        // Preserve the SPSR_EL1 we snapshotted — we want to return to
+        // EL0t with the same DAIF state, and the EL1 vector path
+        // already set SPSR_EL1 to "EL0t, DAIF masked" when entering
+        // this trap. Nothing to write here; SPSR_EL1 is already
+        // correct for "return to EL0t".
+
+        crate::probes::vcpu_trap(handler, 0xffff_ffff_ffff_ffff, signum as u64);
+        Ok(())
+    }
+
+    /// Pop the Carrick sigframe at SP_EL0 (placed there by
+    /// `inject_signal`) and restore the pre-signal register state.
+    fn restore_from_sigframe(&mut self) -> Result<(), TrapError> {
+        use applevisor::prelude::*;
+        use zerocopy::FromBytes;
+
+        const GPR_TABLE: [Reg; 31] = [
+            Reg::X0, Reg::X1, Reg::X2, Reg::X3, Reg::X4, Reg::X5, Reg::X6,
+            Reg::X7, Reg::X8, Reg::X9, Reg::X10, Reg::X11, Reg::X12,
+            Reg::X13, Reg::X14, Reg::X15, Reg::X16, Reg::X17, Reg::X18,
+            Reg::X19, Reg::X20, Reg::X21, Reg::X22, Reg::X23, Reg::X24,
+            Reg::X25, Reg::X26, Reg::X27, Reg::X28, Reg::X29, Reg::X30,
+        ];
+
+        let sp = self.vcpu.get_sys_reg(SysReg::SP_EL0).map_err(hvf_error)?;
+        let frame_size = core::mem::size_of::<crate::linux_abi::CarrickSigframe>();
+        let bytes = self
+            .read_guest_bytes(sp, frame_size)
+            .map_err(|e| TrapError::Hypervisor(format!("sigframe read failed: {e}")))?;
+        let frame = crate::linux_abi::CarrickSigframe::read_from_bytes(&bytes)
+            .map_err(|_| TrapError::Hypervisor("sigframe decode failed".to_string()))?;
+        let magic = frame.magic;
+        if magic != crate::linux_abi::CARRICK_SIGFRAME_MAGIC {
+            return Err(TrapError::Hypervisor(format!(
+                "rt_sigreturn: bad sigframe magic at SP_EL0=0x{sp:x}: 0x{magic:x}"
+            )));
+        }
+
+        // `frame` is `#[repr(C, packed)]` so we cannot borrow individual
+        // fields. Copy out the whole register array first.
+        let saved_x = frame.saved_x;
+        for (reg, value) in GPR_TABLE.iter().zip(saved_x.iter()) {
+            self.vcpu.set_reg(*reg, *value).map_err(hvf_error)?;
+        }
+        let saved_pc = frame.saved_pc;
+        let saved_sp = frame.saved_sp;
+        let saved_spsr = frame.saved_spsr;
+        self.vcpu
+            .set_sys_reg(SysReg::ELR_EL1, saved_pc)
+            .map_err(hvf_error)?;
+        self.vcpu
+            .set_sys_reg(SysReg::SP_EL0, saved_sp)
+            .map_err(hvf_error)?;
+        self.vcpu
+            .set_sys_reg(SysReg::SPSR_EL1, saved_spsr)
+            .map_err(hvf_error)?;
         Ok(())
     }
 

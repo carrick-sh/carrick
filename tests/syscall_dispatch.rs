@@ -4931,7 +4931,9 @@ fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
         }
     );
 
-    // rt_sigreturn (no args meaningful) -> ENOSYS.
+    // rt_sigreturn now surfaces a `SigReturn` outcome the runtime
+    // handles by calling `trap.restore_from_sigframe()`. The dispatcher
+    // itself can't perform the restore; the outcome is the only signal.
     assert_eq!(
         dispatcher
             .dispatch(
@@ -4940,10 +4942,10 @@ fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
                 &mut reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno {
-            errno: LINUX_ENOSYS
-        }
+        DispatchOutcome::SigReturn
     );
+    // Silence unused-const warnings now that the ENOSYS branch is gone.
+    let _ = LINUX_ENOSYS;
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
@@ -4952,7 +4954,9 @@ fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
 fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
     const LINUX_EINVAL: i32 = 22;
     const LINUX_ESRCH: i32 = 3;
-    const LINUX_ENOSYS: i32 = 38;
+    // Signal delivery is now real: kill / tkill / tgkill with a valid
+    // self-target signum no longer return ENOSYS; they queue the
+    // signal for the runtime's between-trap delivery pass.
 
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
     let mut reporter = CompatReporter::default();
@@ -5004,7 +5008,8 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
             .unwrap(),
         DispatchOutcome::Errno { errno: LINUX_ESRCH }
     );
-    // kill(1, SIGTERM=15) -> ENOSYS (no signal delivery machinery).
+    // kill(1, SIGTERM=15) -> success; the signal is queued in the
+    // host pending slot for the runtime to deliver on the next pass.
     assert_eq!(
         dispatcher
             .dispatch(
@@ -5013,10 +5018,11 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
                 &mut reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno {
-            errno: LINUX_ENOSYS
-        }
+        DispatchOutcome::Returned { value: 0 }
     );
+    // Drain the pending slot so subsequent tests aren't surprised by
+    // a leftover SIGTERM.
+    let _ = carrick::host_signal::take_pending();
 
     // tkill(1, 0) -> success; tkill(0, 0) -> ESRCH (tid 0 isn't us).
     assert_eq!(
@@ -5062,6 +5068,7 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
             .unwrap(),
         DispatchOutcome::Errno { errno: LINUX_ESRCH }
     );
+    // tkill(1, 1) -> success (SIGHUP queued for self-delivery).
     assert_eq!(
         dispatcher
             .dispatch(
@@ -5070,10 +5077,9 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
                 &mut reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno {
-            errno: LINUX_ENOSYS
-        }
+        DispatchOutcome::Returned { value: 0 }
     );
+    let _ = carrick::host_signal::take_pending();
 
     // tgkill(1, 1, 0) -> success.
     assert_eq!(
@@ -5120,7 +5126,7 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
             .unwrap(),
         DispatchOutcome::Errno { errno: LINUX_ESRCH }
     );
-    // tgkill(1, 1, 1) -> ENOSYS.
+    // tgkill(1, 1, 1) -> success; SIGHUP queued for self-delivery.
     assert_eq!(
         dispatcher
             .dispatch(
@@ -5129,10 +5135,9 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
                 &mut reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno {
-            errno: LINUX_ENOSYS
-        }
+        DispatchOutcome::Returned { value: 0 }
     );
+    let _ = carrick::host_signal::take_pending();
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }

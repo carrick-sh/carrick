@@ -291,6 +291,12 @@ pub enum DispatchOutcome {
         argv: Vec<String>,
         env: Vec<String>,
     },
+    /// Guest invoked `rt_sigreturn(2)` (syscall 139). The runtime must
+    /// pop the Carrick sigframe at SP_EL0, restore the saved register
+    /// state, and resume — without advancing PC the way a normal SVC
+    /// completion would. There is no retval to write into x0; the
+    /// restored x0 IS the return value.
+    SigReturn,
 }
 
 impl DispatchOutcome {
@@ -301,6 +307,7 @@ impl DispatchOutcome {
             DispatchOutcome::Exit { code } => (code as i64, None),
             DispatchOutcome::Fork => (0, None),
             DispatchOutcome::Execve { .. } => (0, None),
+            DispatchOutcome::SigReturn => (0, None),
         }
     }
 }
@@ -605,6 +612,32 @@ impl SyscallDispatcher {
 
     pub fn cwd(&self) -> &str {
         &self.cwd
+    }
+
+    /// Look up the currently-installed handler for `signum`. Returns
+    /// `None` when no handler has been recorded via `rt_sigaction`, or
+    /// when the recorded handler is `SIG_DFL` / `SIG_IGN`. The runtime
+    /// uses this to decide whether to inject a guest frame (handler is
+    /// `Some`) or apply the host-side default (handler is `None`).
+    pub fn registered_signal_handler(&self, signum: i32) -> Option<LinuxSigaction> {
+        let action = self.signal_handlers.get(&signum).copied()?;
+        let handler = action.sa_handler;
+        if handler == crate::linux_abi::LINUX_SIG_DFL
+            || handler == crate::linux_abi::LINUX_SIG_IGN
+        {
+            None
+        } else {
+            Some(action)
+        }
+    }
+
+    /// True iff the guest installed `SIG_IGN` for `signum`. Lets the
+    /// runtime drop a pending signal without injecting it.
+    pub fn signal_is_ignored(&self, signum: i32) -> bool {
+        self.signal_handlers
+            .get(&signum)
+            .map(|a| a.sa_handler == crate::linux_abi::LINUX_SIG_IGN)
+            .unwrap_or(false)
     }
 
     pub fn dispatch(
@@ -2513,9 +2546,8 @@ impl SyscallDispatcher {
         if signum == 0 {
             return DispatchOutcome::Returned { value: 0 };
         }
-        DispatchOutcome::Errno {
-            errno: LINUX_ENOSYS,
-        }
+        crate::host_signal::raise_for_self(signum as i32);
+        DispatchOutcome::Returned { value: 0 }
     }
 
     fn sigaltstack(
@@ -2733,12 +2765,12 @@ impl SyscallDispatcher {
 
     fn rt_sigreturn(&self) -> DispatchOutcome {
         // rt_sigreturn is invoked from a signal trampoline to restore the
-        // pre-signal context; a real kernel never returns from it. We never
-        // deliver a signal, so this is unreachable in practice. Surface
-        // ENOSYS if it is somehow invoked directly.
-        DispatchOutcome::Errno {
-            errno: LINUX_ENOSYS,
-        }
+        // pre-signal context. The dispatcher can't perform the restore
+        // itself — only the trap engine has access to the vCPU register
+        // file — so we signal `SigReturn` and let the runtime drive
+        // `HvfTrapEngine::rt_sigreturn`. There is no x0 retval to write;
+        // the restored x0 IS the value the guest sees.
+        DispatchOutcome::SigReturn
     }
 
     fn uname(&self, request: SyscallRequest, memory: &mut impl GuestMemory) -> DispatchOutcome {
@@ -6099,11 +6131,14 @@ fn bootstrap_signal_send(target: i64, tid_required: bool, signum: u64) -> Dispat
         return DispatchOutcome::Errno { errno: LINUX_ESRCH };
     }
     if signum == 0 {
+        // POSIX: signum 0 is the null-signal "is this pid alive" probe.
         return DispatchOutcome::Returned { value: 0 };
     }
-    DispatchOutcome::Errno {
-        errno: LINUX_ENOSYS,
-    }
+    // Queue the signal for self-delivery. The runtime drains the pending
+    // slot between vCPU iterations and either injects a handler frame or
+    // applies the default action (terminate with 128 + signum).
+    crate::host_signal::raise_for_self(signum as i32);
+    DispatchOutcome::Returned { value: 0 }
 }
 
 fn write_packed(memory: &mut impl GuestMemory, address: u64, bytes: &[u8]) -> DispatchOutcome {
