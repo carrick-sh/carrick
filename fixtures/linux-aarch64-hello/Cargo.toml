@@ -56,6 +56,10 @@ name = "carrick-linux-aarch64-udp-dns"
 path = "src/udp_dns.rs"
 
 [[bin]]
+name = "carrick-linux-aarch64-udp-dns-debian"
+path = "src/udp_dns_debian.rs"
+
+[[bin]]
 name = "carrick-linux-aarch64-signal-basic"
 path = "src/signal_basic.rs"
 
