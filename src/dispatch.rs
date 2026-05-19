@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::compat::{CompatEvent, CompatReporter, SyscallArgs};
 use crate::linux_abi::{
     LINUX_DIRENT64_HEADER_SIZE, LINUX_DT_DIR, LINUX_DT_LNK, LINUX_DT_REG, LINUX_PAGE_SIZE,
-    LINUX_S_IFDIR, LINUX_S_IFLNK, LINUX_S_IFREG, LinuxCapabilityData, LinuxCapabilityHeader,
+    LINUX_S_IFDIR, LINUX_S_IFLNK, LINUX_S_IFREG, LINUX_TERMIOS_KERNEL_SIZE, LinuxCapabilityData, LinuxCapabilityHeader,
     LinuxDirent64Header, LinuxEpollEvent, LinuxEventfdValue, LinuxFdPair, LinuxIovec,
     LinuxItimerspec, LinuxItimerval, LinuxOpenHow, LinuxPollFd, LinuxRlimit, LinuxRusage, LinuxSigaction, LinuxSysinfo,
     LinuxSigaltstack, LinuxStat, LinuxStatfs, LinuxStatx, LinuxStatxTimestamp,
@@ -1967,21 +1967,28 @@ impl SyscallDispatcher {
                 } else {
                     LinuxTermios::default_cooked()
                 };
-                write_packed(memory, arg, termios.as_bytes())
+                // TCGETS expects the 36-byte kernel struct, NOT our
+                // 44-byte LinuxTermios (which includes the termios2-only
+                // c_ispeed/c_ospeed tail). Write past that and glibc's
+                // tcgetattr blows its on-stack buffer's canary.
+                write_packed(memory, arg, &termios.as_bytes()[..LINUX_TERMIOS_KERNEL_SIZE])
             }
             LINUX_TCGETS => DispatchOutcome::Errno {
                 errno: LINUX_ENOTTY,
             },
             LINUX_TCSETS | LINUX_TCSETSW | LINUX_TCSETSF if fd_is_tty(&self.open_files, fd) => {
-                // Validate the guest pointer first (preserves prior EFAULT
-                // semantics), then push the bytes to the host fd if it is
-                // a real terminal. tcsetattr failure is intentionally
-                // swallowed; the guest already considered the call
-                // successful pre-host-forwarding.
-                match memory.read_bytes(arg, core::mem::size_of::<LinuxTermios>()) {
+                // Read 36 bytes (kernel termios), then pad to the
+                // 44-byte zerocopy struct so we can parse it. The guest
+                // only provided a 36-byte buffer; reading 44 would
+                // EFAULT at the boundary of a stack-page allocation.
+                match memory.read_bytes(arg, LINUX_TERMIOS_KERNEL_SIZE) {
                     Ok(bytes) => {
                         if crate::host_tty::host_isatty(fd) {
-                            if let Ok(t) = LinuxTermios::read_from_bytes(bytes.as_ref()) {
+                            let mut padded =
+                                [0u8; core::mem::size_of::<LinuxTermios>()];
+                            padded[..LINUX_TERMIOS_KERNEL_SIZE]
+                                .copy_from_slice(&bytes);
+                            if let Ok(t) = LinuxTermios::read_from_bytes(&padded) {
                                 let _ = crate::host_tty::set_host_termios_tracking(fd, &t);
                             }
                         }
