@@ -2052,6 +2052,33 @@ impl SyscallDispatcher {
                     .set_status_flags(arg & !LINUX_O_CLOEXEC);
                 DispatchOutcome::Returned { value: 0 }
             }
+            // Advisory record locks: apt uses fcntl(F_SETLK) on
+            // /var/lib/apt/lists/lock as its inter-process lock. Carrick
+            // runs the guest as a single-tenant VM (no real concurrent
+            // apt invocations against the same overlay), so we treat the
+            // whole F_*LK family as no-op success. Without this apt
+            // reports "Could not get lock ... open (22: Invalid argument)"
+            // because the F_SETLK that follows the openat is what
+            // actually fails — apt's error message just blames open.
+            LINUX_F_SETLK
+            | LINUX_F_SETLKW
+            | LINUX_F_OFD_SETLK
+            | LINUX_F_OFD_SETLKW => {
+                if !self.fd_is_valid(fd) {
+                    return DispatchOutcome::Errno { errno: LINUX_EBADF };
+                }
+                DispatchOutcome::Returned { value: 0 }
+            }
+            LINUX_F_GETLK | LINUX_F_OFD_GETLK => {
+                // Indicate "no lock present" by leaving the caller's
+                // struct flock untouched and returning 0. apt only ever
+                // probes after a successful SETLK so it doesn't
+                // re-inspect the buffer.
+                if !self.fd_is_valid(fd) {
+                    return DispatchOutcome::Errno { errno: LINUX_EBADF };
+                }
+                DispatchOutcome::Returned { value: 0 }
+            }
             _ => DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
             },
