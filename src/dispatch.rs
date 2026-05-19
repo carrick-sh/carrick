@@ -1519,49 +1519,97 @@ impl SyscallDispatcher {
             }
         };
 
-        let mut ready = 0i64;
+        // Read all the pollfds up front so we can route them. Fast path:
+        // every fd in the set maps to a host fd (stdio bare, HostPipe, or
+        // HostSocket) → call libc::poll once with the requested timeout
+        // and let the kernel block efficiently instead of pseudo-polling
+        // in a 10 ms-slice loop.
         let pollfd_size = core::mem::size_of::<LinuxPollFd>();
-        let mut deadline_attempts = 0u32;
-        loop {
-            ready = 0;
-            for index in 0..nfds {
-                let offset = index
-                    .checked_mul(pollfd_size)
-                    .and_then(|offset| u64::try_from(offset).ok())
-                    .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
-                let address = match pollfds_address.checked_add(offset) {
-                    Some(address) => address,
-                    None => {
-                        return Ok(DispatchOutcome::Errno {
-                            errno: LINUX_EFAULT,
-                        });
-                    }
-                };
-                let mut pollfd = match read_pollfd(memory, address) {
-                    Ok(pollfd) => pollfd,
-                    Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
-                };
-                pollfd.revents = self.poll_ready_events(pollfd.fd, pollfd.events);
+        let mut fds: Vec<LinuxPollFd> = Vec::with_capacity(nfds);
+        let mut addresses: Vec<u64> = Vec::with_capacity(nfds);
+        for index in 0..nfds {
+            let offset = index
+                .checked_mul(pollfd_size)
+                .and_then(|offset| u64::try_from(offset).ok())
+                .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
+            let address = pollfds_address
+                .checked_add(offset)
+                .ok_or(LINUX_EFAULT);
+            let address = match address {
+                Ok(a) => a,
+                Err(_) => return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT }),
+            };
+            let pollfd = match read_pollfd(memory, address) {
+                Ok(p) => p,
+                Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            };
+            fds.push(pollfd);
+            addresses.push(address);
+        }
+        // Map guest fds → host fds where possible. Fast path requires
+        // every fd be host-backed (stdio bare, HostPipe, HostSocket).
+        let host_fds: Option<Vec<i32>> = fds
+            .iter()
+            .map(|p| self.host_fd_for_poll(p.fd))
+            .collect();
+        if let Some(host_fds) = host_fds {
+            let mut sys_pollfds: Vec<libc::pollfd> = fds
+                .iter()
+                .zip(host_fds.iter())
+                .map(|(p, hf)| libc::pollfd {
+                    fd: *hf,
+                    events: p.events as i16,
+                    revents: 0,
+                })
+                .collect();
+            let n = unsafe {
+                libc::poll(
+                    sys_pollfds.as_mut_ptr(),
+                    sys_pollfds.len() as libc::nfds_t,
+                    timeout_ms,
+                )
+            };
+            if n < 0 {
+                return Ok(DispatchOutcome::Errno {
+                    errno: host_errno(),
+                });
+            }
+            let mut ready = 0i64;
+            for (i, p) in sys_pollfds.iter().enumerate() {
+                let mut pollfd = fds[i];
+                pollfd.revents = p.revents as i16;
                 if pollfd.revents != 0 {
                     ready += 1;
                 }
-                if write_kernel_struct_raw(memory, address, &pollfd).is_err() {
+                if write_kernel_struct_raw(memory, addresses[i], &pollfd).is_err() {
                     return Ok(DispatchOutcome::Errno {
                         errno: LINUX_EFAULT,
                     });
                 }
             }
-            // If anyone is ready, or timeout=0 (non-blocking) was requested,
-            // return immediately. Otherwise sleep briefly and re-check —
-            // a coarse but correct emulation of a blocking ppoll across
-            // our mix of host-backed and synthetic fds.
+            return Ok(DispatchOutcome::Returned { value: ready });
+        }
+
+        // Mixed / synthetic fds: fall back to the per-fd readiness check
+        // loop. Slow because of nanosleep slicing but correct.
+        let mut ready = 0i64;
+        let mut deadline_attempts = 0u32;
+        loop {
+            ready = 0;
+            for (index, pollfd) in fds.iter_mut().enumerate() {
+                pollfd.revents = self.poll_ready_events(pollfd.fd, pollfd.events);
+                if pollfd.revents != 0 {
+                    ready += 1;
+                }
+                if write_kernel_struct_raw(memory, addresses[index], pollfd).is_err() {
+                    return Ok(DispatchOutcome::Errno {
+                        errno: LINUX_EFAULT,
+                    });
+                }
+            }
             if ready > 0 || timeout_ms == 0 {
                 break;
             }
-            // Cap blocking polls so a buggy guest can't pin a CPU forever.
-            // For "block forever" callers we still cap and let them re-issue
-            // ppoll; that's what real signal-interruption semantics would
-            // also produce.
             const SLICE_MS: u32 = 10;
             unsafe {
                 let ts = libc::timespec {
@@ -1583,6 +1631,32 @@ impl SyscallDispatcher {
         }
 
         Ok(DispatchOutcome::Returned { value: ready })
+    }
+
+    /// Return the host fd backing a guest fd for ppoll's fast path.
+    /// `Some(host_fd)` means we can hand this off to libc::poll.
+    /// `None` means it's synthetic (epoll/eventfd/timerfd/in-memory pipe)
+    /// and ppoll has to fall back to the per-fd readiness loop.
+    fn host_fd_for_poll(&self, fd: i32) -> Option<i32> {
+        if fd < 0 {
+            // Negative fd in a pollfd entry: libc::poll ignores it
+            // (revents=0), which is the right semantic. Pass it through.
+            return Some(fd);
+        }
+        if let Some(open_file) = self.open_files.get(&fd) {
+            let open = open_file.description.borrow();
+            return match &*open {
+                OpenDescription::HostPipe { host_fd, .. }
+                | OpenDescription::HostSocket { host_fd, .. } => Some(*host_fd),
+                _ => None,
+            };
+        }
+        if is_stdio_fd(fd) {
+            return Some(fd);
+        }
+        // Unknown fd. poll() will revents=POLLNVAL — same as our
+        // synthetic fallback, but cheaper. Pass through as a host fd.
+        Some(fd)
     }
 
     fn poll_ready_events(&self, fd: i32, requested_events: i16) -> i16 {

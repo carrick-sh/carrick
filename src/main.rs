@@ -339,6 +339,7 @@ fn main() -> anyhow::Result<()> {
                 "LANG=C.UTF-8".to_owned(),
                 "LC_ALL=C.UTF-8".to_owned(),
                 "DEBIAN_FRONTEND=noninteractive".to_owned(),
+                "PAGER=cat".to_owned(),
             ];
             let result = run_rootfs_elf_with_hvf_args_and_dispatcher_debug(
                 executable_path.as_str(),
