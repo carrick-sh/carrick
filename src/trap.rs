@@ -936,16 +936,21 @@ impl HvfInner {
         let new_vm = VirtualMachine::with_config(config).map_err(hvf_error)?;
         let new_vcpu = new_vm.vcpu_create().map_err(hvf_error)?;
 
+        // Preserve `is_forked_child` across execve. A process that
+        // descended from the original `carrick run` invocation should
+        // keep using the `_exit`-without-JSON shutdown path even after
+        // it execve's into a different image; otherwise every forked +
+        // execve'd descendant prints its own JSON report to stdout
+        // (interleaved with the parent's), making the user-visible
+        // output unreadable.
+        let was_forked_child = self.is_forked_child;
         // Replace inner in place WITHOUT Drop on the old.
         let new_inner = HvfInner {
             _vm: new_vm,
             vcpu: new_vcpu,
             mappings: Vec::new(),
             last_exit_class: 0,
-            // The post-execve process is no longer a forked child: it
-            // has a fresh address space and should clean up normally
-            // on exit.
-            is_forked_child: false,
+            is_forked_child: was_forked_child,
         };
         unsafe {
             std::ptr::write(self as *mut HvfInner, new_inner);

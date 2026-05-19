@@ -391,7 +391,10 @@ where
                 let outcome = runtime.fork()?;
                 let retval: i64 = match outcome {
                     crate::trap::ForkOutcome::Parent { child_pid } => i64::from(child_pid),
-                    crate::trap::ForkOutcome::Child => 0,
+                    crate::trap::ForkOutcome::Child => {
+                        dispatcher.clear_output_buffers();
+                        0
+                    }
                 };
                 runtime.complete_syscall(retval)?;
             }
@@ -508,7 +511,10 @@ where
                 let outcome = trap.fork()?;
                 let retval: i64 = match outcome {
                     crate::trap::ForkOutcome::Parent { child_pid } => i64::from(child_pid),
-                    crate::trap::ForkOutcome::Child => 0,
+                    crate::trap::ForkOutcome::Child => {
+                        dispatcher.clear_output_buffers();
+                        0
+                    }
                 };
                 trap.complete_syscall(retval)?;
             }
