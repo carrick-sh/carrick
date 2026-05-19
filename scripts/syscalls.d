@@ -121,6 +121,20 @@ carrick*:::fork-post
     @forks["parent"] = count();
 }
 
+carrick*:::execve-loaded
+/pid == $target || progenyof($target)/
+{
+    printf("[%d execve-loaded] path=%s entry=%#x sp=%#x regions=%d\n",
+        pid, copyinstr(arg0), arg1, arg2, (int)arg3);
+}
+
+carrick*:::execve-sysregs
+/pid == $target || progenyof($target)/
+{
+    printf("[%d execve-sysregs] sctlr=%#x ttbr0=%#x mair=%#x\n",
+        pid, arg0, arg1, arg2);
+}
+
 dtrace:::END
 {
     printf("\n=================== aggregations ===================\n");

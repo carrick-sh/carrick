@@ -313,6 +313,23 @@ impl HvfTrapEngine {
         Err(TrapError::UnsupportedPlatform)
     }
 
+    /// Linux `execve(2)`: tear down the current HVF VM, build a fresh
+    /// one, install the new address space, and reset the vCPU as if
+    /// this engine had just been created with `map_address_space(new)`.
+    ///
+    /// On success there is no return value to write into x0 — execve
+    /// does not return to the caller; the next `run_until_syscall`
+    /// resumes at the new image's entry point.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn execve_into(&mut self, address_space: &AddressSpace) -> Result<(), TrapError> {
+        self.inner.execve_into(address_space)
+    }
+
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    pub fn execve_into(&mut self, _: &AddressSpace) -> Result<(), TrapError> {
+        Err(TrapError::UnsupportedPlatform)
+    }
+
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn new_platform() -> Result<Self, TrapError> {
         use applevisor::prelude::*;
@@ -892,6 +909,180 @@ impl HvfInner {
         } else {
             Ok(ForkOutcome::Parent { child_pid: pid })
         }
+    }
+
+    /// Replace the engine's HVF state with a fresh VM that runs
+    /// `address_space` from its entry point. Used for `execve(2)`.
+    ///
+    /// Sequence mirrors `fork()`'s rebuild path but takes a brand-new
+    /// AddressSpace rather than a snapshot, and resets the vCPU to
+    /// "initial process startup" (trampoline + new entry) rather than
+    /// "resume mid-syscall".
+    fn execve_into(&mut self, address_space: &AddressSpace) -> Result<(), TrapError> {
+        use applevisor::prelude::*;
+
+        // Build the mapping plan up front so any image errors surface
+        // before we destroy the current HVF state.
+        let plan = GuestMappingPlan::from_address_space(address_space)?;
+
+        // Tear down the current HVF VM. Same dance as fork(): destroy
+        // vCPU then VM via raw API (applevisor's Drop is bypassed by
+        // the `ManuallyDrop` wrapper around `HvfInner`).
+        let inherited_vcpu_id = self.vcpu.id();
+        let _ = unsafe { applevisor_sys::hv_vcpu_destroy(inherited_vcpu_id) };
+        let _ = unsafe { applevisor_sys::hv_vm_destroy() };
+
+        // Create a fresh VM + vCPU.
+        let max_ipa = VirtualMachineConfig::get_max_ipa_size().map_err(hvf_error)?;
+        let mut config = VirtualMachineConfig::new();
+        config.set_ipa_size(max_ipa).map_err(hvf_error)?;
+        let new_vm = VirtualMachine::with_config(config).map_err(hvf_error)?;
+        let new_vcpu = new_vm.vcpu_create().map_err(hvf_error)?;
+
+        // Replace inner in place WITHOUT Drop on the old.
+        let new_inner = HvfInner {
+            _vm: new_vm,
+            vcpu: new_vcpu,
+            mappings: Vec::new(),
+            last_exit_class: 0,
+            // The post-execve process is no longer a forked child: it
+            // has a fresh address space and should clean up normally
+            // on exit.
+            is_forked_child: false,
+        };
+        unsafe {
+            std::ptr::write(self as *mut HvfInner, new_inner);
+        }
+
+        // Apply the new mapping plan + initial vCPU state. We replicate
+        // the body of HvfTrapEngine::map_address_space's HVF setup
+        // sequence inline; refactoring out a shared function is the
+        // next iteration once we have a third caller.
+        for mapping in &plan.mappings {
+            let mut memory = self
+                ._vm
+                .memory_create(
+                    usize::try_from(mapping.mapped_size)
+                        .map_err(|_| TrapError::MappingTooLarge(mapping.mapped_size))?,
+                )
+                .map_err(hvf_error)?;
+            memory
+                .map(mapping.guest_start, hvf_perms(mapping.perms))
+                .map_err(hvf_error)?;
+            memory
+                .write(mapping.guest_start, &mapping.image)
+                .map_err(hvf_error)?;
+            let host_addr = memory.host_addr();
+            let size = usize::try_from(mapping.mapped_size)
+                .map_err(|_| TrapError::MappingTooLarge(mapping.mapped_size))?;
+            let perms = hvf_perms(mapping.perms);
+            self.mappings.push(HvfMappedRegion {
+                start: mapping.guest_start,
+                end: mapping.guest_start.checked_add(mapping.mapped_size).ok_or(
+                    TrapError::MappingOverflow {
+                        guest_start: mapping.guest_start,
+                        mapped_size: mapping.mapped_size,
+                    },
+                )?,
+                host_addr,
+                size,
+                perms,
+                memory: Some(memory),
+            });
+        }
+
+        // Initial vCPU state — same sequence as `map_address_space`.
+        // Zero the GPRs first: Linux's execve contract says the new
+        // program starts with all registers clear (x29/x30 are part
+        // of the ABI calling convention but the kernel zeros them too)
+        // except for SP and PC. Without this, musl's _start in the new
+        // image inherits the previous process's x8 which can decode
+        // as a bogus syscall number on the first svc.
+        const GPRS: [Reg; 31] = [
+            Reg::X0, Reg::X1, Reg::X2, Reg::X3, Reg::X4, Reg::X5, Reg::X6,
+            Reg::X7, Reg::X8, Reg::X9, Reg::X10, Reg::X11, Reg::X12,
+            Reg::X13, Reg::X14, Reg::X15, Reg::X16, Reg::X17, Reg::X18,
+            Reg::X19, Reg::X20, Reg::X21, Reg::X22, Reg::X23, Reg::X24,
+            Reg::X25, Reg::X26, Reg::X27, Reg::X28, Reg::X29, Reg::X30,
+        ];
+        for reg in GPRS {
+            self.vcpu.set_reg(reg, 0).map_err(hvf_error)?;
+        }
+
+        let initial_pc = plan.el0_trampoline_entry.unwrap_or(plan.entry);
+        self.vcpu.set_reg(Reg::PC, initial_pc).map_err(hvf_error)?;
+        const AARCH64_PSTATE_EL1H_DAIF_MASKED: u64 = 0x3c5;
+        self.vcpu
+            .set_reg(Reg::CPSR, AARCH64_PSTATE_EL1H_DAIF_MASKED)
+            .map_err(hvf_error)?;
+        if let Some(_trampoline) = plan.el0_trampoline_entry {
+            const AARCH64_PSTATE_EL0T_DAIF_MASKED: u64 = 0x3c0;
+            self.vcpu
+                .set_sys_reg(SysReg::SPSR_EL1, AARCH64_PSTATE_EL0T_DAIF_MASKED)
+                .map_err(hvf_error)?;
+            self.vcpu
+                .set_sys_reg(SysReg::ELR_EL1, plan.entry)
+                .map_err(hvf_error)?;
+        }
+        let mut sctlr_el1: u64 = (1 << 2) | (1 << 12);
+        if let Some(pt_base) = plan.stage1_page_tables_base {
+            self.vcpu
+                .set_sys_reg(SysReg::MAIR_EL1, 0xFF)
+                .map_err(hvf_error)?;
+            const T0SZ: u64 = 24;
+            const TCR_EL1_BOOTSTRAP: u64 =
+                T0SZ | (0b11 << 8) | (0b11 << 10) | (0b11 << 12) | (1 << 23) | (0b010 << 32);
+            self.vcpu
+                .set_sys_reg(SysReg::TCR_EL1, TCR_EL1_BOOTSTRAP)
+                .map_err(hvf_error)?;
+            self.vcpu
+                .set_sys_reg(SysReg::TTBR0_EL1, pt_base)
+                .map_err(hvf_error)?;
+            sctlr_el1 |= 1;
+        }
+        self.vcpu
+            .set_sys_reg(SysReg::SCTLR_EL1, sctlr_el1)
+            .map_err(hvf_error)?;
+        const CPACR_EL1_FPEN_NO_TRAP: u64 = 0x3 << 20;
+        self.vcpu
+            .set_sys_reg(SysReg::CPACR_EL1, CPACR_EL1_FPEN_NO_TRAP)
+            .map_err(hvf_error)?;
+        if let Some(vectors_base) = plan.el1_vectors_base {
+            self.vcpu
+                .set_sys_reg(SysReg::VBAR_EL1, vectors_base)
+                .map_err(hvf_error)?;
+        }
+        if let Some(stack_pointer) = plan.initial_stack_pointer {
+            self.vcpu
+                .set_sys_reg(SysReg::SP_EL1, stack_pointer)
+                .map_err(hvf_error)?;
+            self.vcpu
+                .set_sys_reg(SysReg::SP_EL0, stack_pointer)
+                .map_err(hvf_error)?;
+        }
+        // execve resets TPIDR_EL0 — the new image's musl init will
+        // call set_thread_area to initialise it.
+        self.vcpu
+            .set_sys_reg(SysReg::TPIDR_EL0, 0)
+            .map_err(hvf_error)?;
+
+        // Verify post-execve sysreg state through dtrace. If stage-1
+        // isn't on or TTBR0 doesn't point at the new tables, the new
+        // process will fault on the first LDAXR.
+        let actual_sctlr = self
+            .vcpu
+            .get_sys_reg(SysReg::SCTLR_EL1)
+            .unwrap_or(0);
+        let actual_ttbr0 = self
+            .vcpu
+            .get_sys_reg(SysReg::TTBR0_EL1)
+            .unwrap_or(0);
+        let actual_mair = self
+            .vcpu
+            .get_sys_reg(SysReg::MAIR_EL1)
+            .unwrap_or(0);
+        crate::probes::execve_sysregs(actual_sctlr, actual_ttbr0, actual_mair);
+        Ok(())
     }
 }
 
