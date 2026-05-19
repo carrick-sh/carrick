@@ -72,9 +72,9 @@ const AARCH64_VECTOR_SLOT_SIZE: usize = 0x80;
 const AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET: usize = 0x400;
 
 pub const LINUX_HEAP_BASE: u64 = 0x40_0000_0000; // 256 GiB
-pub const LINUX_HEAP_SIZE: u64 = 16 * 1024 * 1024; // 16 MiB
+pub const LINUX_HEAP_SIZE: u64 = 128 * 1024 * 1024; // 128 MiB
 pub const LINUX_MMAP_BASE: u64 = 0x60_0000_0000; // 384 GiB
-pub const LINUX_MMAP_SIZE: u64 = 32 * 1024 * 1024; // 32 MiB
+pub const LINUX_MMAP_SIZE: u64 = 512 * 1024 * 1024; // 512 MiB — apt's pkgcache alone wants 24 MiB
 pub const LINUX_INTERPRETER_BASE: u64 = 0x80_0000_0000; // 512 GiB
 pub const LINUX_STACK_TOP: u64 = 0xff_ffff_0000; // just under 1 TiB
 pub const LINUX_STACK_SIZE: u64 = 2 * 1024 * 1024; // 2 MiB

@@ -859,6 +859,7 @@ impl SyscallDispatcher {
             283 => self.membarrier(request),
             291 => self.statx(request, memory)?,
             293 => self.rseq(),
+            436 => self.close_range(request),
             437 => self.openat2(request, memory, reporter)?,
             439 => self.faccessat2(request, memory)?,
             _ => {
@@ -3448,6 +3449,44 @@ impl SyscallDispatcher {
         }
     }
 
+    /// `close_range(first, last, flags)` — close every fd in `[first, last]`
+    /// (inclusive). Used by glibc's posix_spawn / apt's pre-fork cleanup
+    /// to drop inherited fds in O(1) syscalls instead of an O(N) fcntl
+    /// or close loop. Without this, apt walks fd 3..NR_OPEN issuing a
+    /// fcntl per fd and burns 100k+ traps before exec.
+    fn close_range(&mut self, request: SyscallRequest) -> DispatchOutcome {
+        let first = request.arg(0);
+        let last = request.arg(1);
+        let flags = request.arg(2);
+        // CLOSE_RANGE_UNSHARE=2 is a no-op for us (single fd table);
+        // CLOSE_RANGE_CLOEXEC=4 would mark fds CLOEXEC instead of
+        // closing — accept the bit and apply CLOEXEC.
+        const CLOSE_RANGE_UNSHARE: u64 = 2;
+        const CLOSE_RANGE_CLOEXEC: u64 = 4;
+        if flags & !(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC) != 0 || first > last {
+            return DispatchOutcome::Errno { errno: LINUX_EINVAL };
+        }
+        let cloexec_only = flags & CLOSE_RANGE_CLOEXEC != 0;
+        // Drain matching fds out of the table so we don't iterate a
+        // gigantic [first, last] (callers commonly pass last=u32::MAX).
+        let fds: Vec<i32> = self
+            .open_files
+            .keys()
+            .copied()
+            .filter(|fd| (*fd as u64) >= first && (*fd as u64) <= last)
+            .collect();
+        for fd in fds {
+            if cloexec_only {
+                if let Some(open_file) = self.open_files.get_mut(&fd) {
+                    open_file.fd_flags |= LINUX_FD_CLOEXEC;
+                }
+            } else if let Some(open_file) = self.open_files.remove(&fd) {
+                close_open_file(&open_file);
+            }
+        }
+        DispatchOutcome::Returned { value: 0 }
+    }
+
     // ------------------------------------------------------------------
     // BSD sockets.
     //
@@ -4729,6 +4768,7 @@ impl SyscallDispatcher {
     }
 
     fn prlimit64(&self, request: SyscallRequest, memory: &mut impl GuestMemory) -> DispatchOutcome {
+        let resource = request.arg(1);
         let new_limit = request.arg(2);
         let old_limit = request.arg(3);
         if new_limit != 0 {
@@ -4737,7 +4777,29 @@ impl SyscallDispatcher {
             };
         }
         if old_limit != 0 {
-            let limit = LinuxRlimit::new(LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY);
+            // Per-resource values matched to a sensible Linux default.
+            // Returning RLIM_INFINITY for ALL resources crashes apt:
+            // its pre-fork "set CLOEXEC on every fd" loop iterates
+            // 3..rlim_cur and so spins for u64::MAX cycles. RLIMIT_NOFILE
+            // in particular needs a real bound.
+            // Resource numbers from include/uapi/asm-generic/resource.h.
+            const LINUX_RLIMIT_NOFILE: u64 = 7;
+            const LINUX_RLIMIT_NPROC: u64 = 6;
+            const LINUX_RLIMIT_STACK: u64 = 3;
+            const LINUX_RLIMIT_AS: u64 = 9;
+            const LINUX_RLIMIT_DATA: u64 = 2;
+            let limit = match resource {
+                LINUX_RLIMIT_NOFILE => LinuxRlimit::new(1024, 1024 * 1024),
+                LINUX_RLIMIT_NPROC => LinuxRlimit::new(8192, 8192),
+                LINUX_RLIMIT_STACK => LinuxRlimit::new(
+                    crate::memory::LINUX_STACK_SIZE,
+                    LINUX_RLIM_INFINITY,
+                ),
+                LINUX_RLIMIT_AS | LINUX_RLIMIT_DATA => {
+                    LinuxRlimit::new(LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY)
+                }
+                _ => LinuxRlimit::new(LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY),
+            };
             if write_kernel_struct_raw(memory, old_limit, &limit).is_err() {
                 return DispatchOutcome::Errno {
                     errno: LINUX_EFAULT,
@@ -5608,6 +5670,20 @@ impl SyscallDispatcher {
             };
             match rootfs.read_link(&path) {
                 Ok(target) => target,
+                Err(RootFsError::NotFound(_)) => {
+                    // Linux readlink(2) returns EINVAL when the path
+                    // exists but isn't a symlink, and ENOENT only when
+                    // the path doesn't exist at all. apt's realpath()
+                    // implementation relies on this distinction — an
+                    // ENOENT for an existing regular file makes apt
+                    // give up with "flAbsPath on /var/lib/dpkg/status
+                    // failed - realpath (2: No such file or directory)".
+                    let errno = match rootfs.symlink_metadata(&path) {
+                        Ok(_) => LINUX_EINVAL,
+                        Err(_) => LINUX_ENOENT,
+                    };
+                    return Ok(DispatchOutcome::Errno { errno });
+                }
                 Err(errno) => {
                     return Ok(DispatchOutcome::Errno {
                         errno: rootfs_errno(errno),

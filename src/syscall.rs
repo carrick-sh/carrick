@@ -226,6 +226,7 @@ const AARCH64_SYSCALLS: &[Syscall] = &[
     syscall(291, "statx", "fs", SupportLevel::BringUp),
     syscall(293, "rseq", "process", SupportLevel::BringUp),
     syscall(435, "clone3", "process", SupportLevel::Planned),
+    syscall(436, "close_range", "fs", SupportLevel::BringUp),
     syscall(437, "openat2", "fs", SupportLevel::BringUp),
     syscall(439, "faccessat2", "fs", SupportLevel::BringUp),
 ];
