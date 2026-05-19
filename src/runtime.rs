@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 
 use crate::compat::{CompatReport, CompatReporter};
 use crate::dispatch::{
-    Aarch64SyscallFrame, DispatchError, DispatchOutcome, GuestMemory, SyscallDispatcher,
-    SyscallRequest,
+    Aarch64SyscallFrame, DispatchError, DispatchOutcome, GuestMemory, ProcMapsEntry,
+    SyscallDispatcher, SyscallRequest,
 };
 use crate::memory::{AddressSpace, AddressSpaceError};
 use crate::rootfs::RootFs;
@@ -328,12 +328,37 @@ where
 
 fn run_address_space_with_hvf_and_dispatcher(
     image: AddressSpace,
-    dispatcher: SyscallDispatcher,
+    mut dispatcher: SyscallDispatcher,
     max_traps: usize,
 ) -> Result<RunResult, RuntimeError> {
     let mut trap = HvfTrapEngine::new()?;
     trap.map_address_space(&image)?;
+    // Hand the dispatcher the real region list so `/proc/self/maps`
+    // reflects the loaded ELF, runtime regions, bootstrap pages, and
+    // stack instead of the legacy hard-coded summary. Go's runtime
+    // and glibc's malloc introspection both parse this file.
+    dispatcher.set_address_space_regions(proc_maps_from_address_space(&image));
     run_combined_syscall_loop_with_dispatcher(&mut trap, dispatcher, max_traps)
+}
+
+/// Convert the engine's `AddressSpace` regions into the dispatcher's
+/// `ProcMapsEntry` view. Region paths are left empty here — the
+/// `/proc/self/maps` renderer applies labels based on each region's
+/// start address (matching the well-known runtime bases in
+/// `crate::memory`).
+fn proc_maps_from_address_space(image: &AddressSpace) -> Vec<ProcMapsEntry> {
+    image
+        .regions()
+        .iter()
+        .map(|region| ProcMapsEntry {
+            start: region.start,
+            end: region.end,
+            read: region.perms.read,
+            write: region.perms.write,
+            execute: region.perms.execute,
+            path: String::new(),
+        })
+        .collect()
 }
 
 pub fn run_syscall_loop<M, T>(
@@ -381,6 +406,11 @@ where
 {
     let mut reporter = CompatReporter::default();
     crate::host_signal::install_default_handlers();
+    // Snapshot the host stdin termios so a guest crash mid-`stty raw`
+    // doesn't leave the user's terminal wedged. The guard drops at the
+    // end of this function and restores the saved state if we touched
+    // it.
+    let _termios_guard = crate::host_tty::TermiosRestoreGuard::new();
 
     for traps in 1..=max_traps {
         let frame = runtime.next_syscall()?;
@@ -602,6 +632,11 @@ where
 {
     let mut reporter = CompatReporter::default();
     crate::host_signal::install_default_handlers();
+    // Snapshot the host stdin termios so a guest crash mid-`stty raw`
+    // doesn't leave the user's terminal wedged. The guard drops at the
+    // end of this function and restores the saved state if we touched
+    // it.
+    let _termios_guard = crate::host_tty::TermiosRestoreGuard::new();
 
     for traps in 1..=max_traps {
         let frame = trap.next_syscall()?;
