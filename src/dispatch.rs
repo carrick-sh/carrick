@@ -381,6 +381,13 @@ pub struct SyscallDispatcher {
     dumpable: i64,
     task_name: [u8; LINUX_TASK_COMM_LEN],
     umask: u32,
+    /// Installed signal handlers per signum (1..=64). When the guest
+    /// calls `rt_sigaction(signum, new, old, 8)` we record `new` here
+    /// and return whatever was previously stored via `old`. Real
+    /// signal delivery isn't wired yet, but tracking the handler
+    /// state is what makes interactive `busybox sh`'s "is this signal
+    /// owned?" introspection produce consistent answers.
+    signal_handlers: HashMap<i32, LinuxSigaction>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -528,6 +535,7 @@ impl SyscallDispatcher {
             dumpable: 1,
             task_name: linux_task_name_from_bytes(b"carrick"),
             umask: LINUX_DEFAULT_UMASK,
+            signal_handlers: HashMap::new(),
         }
     }
 
@@ -2523,37 +2531,39 @@ impl SyscallDispatcher {
     }
 
     fn rt_sigaction(
-        &self,
+        &mut self,
         request: SyscallRequest,
         memory: &mut impl GuestMemory,
     ) -> DispatchOutcome {
-        // Treat signum as a 32-bit signed integer first (Linux ABI),
-        // then promote to u64 for range checks. Linux returns EINVAL
-        // for signum <= 0, > _NSIG, or == SIGKILL/SIGSTOP.
         let signum = request.arg(0) as i32;
+        let new_action = request.arg(1);
         let old_action = request.arg(2);
-        let sigset_size = request.arg(3);
-        // Be lenient on the sigset_size and on signum=0 too. Busybox sh
-        // in interactive mode walks `for sig in 0..NSIG` setting up
-        // handlers; returning EINVAL anywhere in that walk poisons
-        // x0 and the next iteration calls with signum = previous
-        // -errno, producing a tight loop. Accept-and-ignore is the
-        // safe stub for now.
-        if !(0..=64).contains(&signum) {
+        let _sigset_size = request.arg(3);
+        // Linux returns EINVAL for signum <= 0 or > _NSIG (64 on
+        // most arches). Reject these.
+        if signum < 1 || signum > 64 {
             return DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
             };
         }
-        // Be lenient on the old_action write: if the pointer is bogus
-        // we still report success rather than EFAULT. Returning EFAULT
-        // here trips up busybox sh in interactive mode — sh's startup
-        // loops over signals and feeds the previous syscall's errno
-        // (-14) back into x0 as the next signum, producing a tight
-        // unrecoverable retry loop. The handler isn't supposed to
-        // populate old_action when there was no previous handler
-        // anyway, so skipping the write is benign.
+        // Write back the previously-installed handler (or zero if none).
         if old_action != 0 {
-            let _ = memory.write_bytes(old_action, LinuxSigaction::empty().as_bytes());
+            let prev = self
+                .signal_handlers
+                .get(&signum)
+                .copied()
+                .unwrap_or_else(LinuxSigaction::empty);
+            let _ = memory.write_bytes(old_action, prev.as_bytes());
+        }
+        // Read and store the new handler. The kernel rejects attempts
+        // to install handlers for SIGKILL (9) and SIGSTOP (19); leave
+        // signum=0 in the lenient bucket for the interactive sh probe.
+        if new_action != 0 && signum != 9 && signum != 19 {
+            if let Ok(bytes) = memory.read_bytes(new_action, core::mem::size_of::<LinuxSigaction>()) {
+                if let Ok(sa) = LinuxSigaction::ref_from_bytes(&bytes) {
+                    self.signal_handlers.insert(signum, *sa);
+                }
+            }
         }
         DispatchOutcome::Returned { value: 0 }
     }
