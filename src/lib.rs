@@ -1,3 +1,5 @@
+#[cfg(target_os = "macos")]
+pub mod apfs;
 pub mod compat;
 pub mod dispatch;
 #[cfg(target_os = "macos")]

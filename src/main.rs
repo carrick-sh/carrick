@@ -151,6 +151,41 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
+    /// Manage the dedicated APFS subvolume Carrick uses for its
+    /// writable scratch space. The volume is case-sensitive (which
+    /// Linux paths require) and lives at /Volumes/carrick. Internally
+    /// this shells out to `diskutil(8)` — no Apple private framework
+    /// dependency, no FFI surface.
+    #[cfg(target_os = "macos")]
+    Volume {
+        #[command(subcommand)]
+        command: VolumeCommand,
+    },
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Subcommand)]
+enum VolumeCommand {
+    /// Create the carrick scratch volume if it doesn't exist. Adds a
+    /// case-sensitive APFS subvolume (APFSX) to the boot container so
+    /// it shares the boot disk's free space. Idempotent.
+    Create {
+        /// Optional quota in bytes. Without one the volume grows up
+        /// to the container's free space.
+        #[arg(long)]
+        quota: Option<u64>,
+    },
+    /// Print the carrick scratch volume's device, mount point, and
+    /// case-sensitivity flag. Nonzero exit if no volume exists yet.
+    Info,
+    /// Delete the carrick scratch volume. Destructive — anything on
+    /// the volume is lost. Idempotent.
+    Delete {
+        /// Required confirmation; without `--yes` this is a no-op
+        /// that prints the volume info and exits 0.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -568,6 +603,65 @@ fn main() -> anyhow::Result<()> {
                 bail!("carrick trace is only available on macOS (libdtrace).");
             }
         }
+        #[cfg(target_os = "macos")]
+        Commands::Volume { command } => match command {
+            VolumeCommand::Create { quota } => {
+                let v = carrick::apfs::create_carrick_volume(quota)
+                    .context("failed to create carrick scratch volume")?;
+                println!(
+                    "{} {} {} case-sensitive={}",
+                    v.device,
+                    v.name,
+                    v.mount_point
+                        .as_deref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "Not Mounted".to_owned()),
+                    v.case_sensitive,
+                );
+            }
+            VolumeCommand::Info => {
+                match carrick::apfs::find_carrick_volume()
+                    .context("failed to query carrick scratch volume")?
+                {
+                    Some(v) => {
+                        println!(
+                            "{} {} {} case-sensitive={}",
+                            v.device,
+                            v.name,
+                            v.mount_point
+                                .as_deref()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|| "Not Mounted".to_owned()),
+                            v.case_sensitive,
+                        );
+                    }
+                    None => {
+                        bail!(
+                            "no carrick scratch volume found; run `carrick volume create` to lay one down"
+                        );
+                    }
+                }
+            }
+            VolumeCommand::Delete { yes } => {
+                let Some(v) = carrick::apfs::find_carrick_volume()
+                    .context("failed to query carrick scratch volume")?
+                else {
+                    println!("no carrick scratch volume to delete");
+                    return Ok(());
+                };
+                if !yes {
+                    println!(
+                        "would delete {} ({}); pass --yes to confirm",
+                        v.device,
+                        v.name,
+                    );
+                    return Ok(());
+                }
+                carrick::apfs::delete_carrick_volume()
+                    .context("failed to delete carrick scratch volume")?;
+                println!("deleted {} ({})", v.device, v.name);
+            }
+        },
     }
 
     Ok(())
