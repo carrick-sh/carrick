@@ -19,7 +19,8 @@ use crate::memory::{
     LINUX_EL0_TRAMPOLINE_BASE, LINUX_EL1_VECTORS_BASE, LINUX_HEAP_BASE, LINUX_HEAP_SIZE,
     LINUX_MMAP_BASE, LINUX_MMAP_SIZE, LINUX_PAGE_TABLES_BASE, LINUX_STACK_SIZE, LINUX_STACK_TOP,
 };
-use crate::overlay::{OverlayEntry, WritableOverlay, layered_directory_entries};
+use crate::fs_backend::{FsBackend, MemoryBackend};
+use crate::overlay::{OverlayEntry, layered_directory_entries};
 use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsError, RootFsMetadata};
 use crate::syscall::lookup_aarch64;
 use serde::Serialize;
@@ -446,13 +447,17 @@ pub struct SyscallDispatcher {
     /// end tracking `brk_current` and the mmap arena end tracking
     /// `mmap_next`) instead of the hard-coded four-line summary.
     address_space_regions: Option<Vec<ProcMapsEntry>>,
-    /// In-memory tmpfs-style writable overlay layered on top of
-    /// `rootfs`. Writes (mkdirat / openat O_CREAT / write / unlinkat
-    /// / renameat) land here; reads consult this first and fall
-    /// through to the rootfs when nothing is found. The overlay's
-    /// `deletions` set tombstones rootfs-backed paths so unlink-then-
-    /// stat behaves correctly.
-    overlay: WritableOverlay,
+    /// Swappable writable layer that sits on top of the read-only
+    /// rootfs. Writes (mkdirat / openat O_CREAT / write / unlinkat /
+    /// renameat) land here; reads consult this first and fall through
+    /// to the rootfs when nothing is found. The backend's tombstones
+    /// shadow rootfs-backed paths so unlink-then-stat behaves correctly.
+    ///
+    /// Two backends exist (see `src/fs_backend.rs`):
+    ///   * [`MemoryBackend`]    — in-memory tmpfs, fast and ephemeral.
+    ///   * [`HostFsBackend`]    — cap-std-sandboxed APFS scratch dir,
+    ///                            durable, reflink-seeded.
+    overlay: Box<dyn FsBackend>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -619,7 +624,7 @@ impl SyscallDispatcher {
             umask: LINUX_DEFAULT_UMASK,
             signal_handlers: HashMap::new(),
             address_space_regions: None,
-            overlay: WritableOverlay::new(),
+            overlay: Box::new(MemoryBackend::new()),
         }
     }
 
@@ -3548,7 +3553,7 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::Errno { errno: LINUX_EISDIR });
             }
             let entries =
-                match layered_directory_entries(&self.overlay, self.rootfs.as_ref(), &path) {
+                match layered_directory_entries(self.overlay.as_ref(), self.rootfs.as_ref(), &path) {
                     Ok(entries) => entries,
                     Err(errno) => return Ok(DispatchOutcome::Errno { errno: rootfs_errno(errno) }),
                 };
@@ -3635,7 +3640,7 @@ impl SyscallDispatcher {
                     }
                     RootFsEntryKind::Directory => {
                         let entries = match layered_directory_entries(
-                            &self.overlay,
+                            self.overlay.as_ref(),
                             self.rootfs.as_ref(),
                             &path,
                         ) {
@@ -6248,7 +6253,10 @@ impl SyscallDispatcher {
         if !self.fd_is_valid(fd) {
             return DispatchOutcome::Errno { errno: LINUX_EBADF };
         }
-        DispatchOutcome::Errno { errno: LINUX_EROFS }
+        // The overlay is a tmpfs that doesn't track owner/mode; accept
+        // the call as a no-op so apt's chmod-the-directory-I-just-made
+        // helpers don't fail with EROFS.
+        DispatchOutcome::Returned { value: 0 }
     }
 
     fn fchown(&self, request: SyscallRequest) -> DispatchOutcome {
@@ -6256,7 +6264,8 @@ impl SyscallDispatcher {
         if !self.fd_is_valid(fd) {
             return DispatchOutcome::Errno { errno: LINUX_EBADF };
         }
-        DispatchOutcome::Errno { errno: LINUX_EROFS }
+        // See `fchmod` above: tmpfs semantics, no-op success.
+        DispatchOutcome::Returned { value: 0 }
     }
 
     fn fchownat(
@@ -6283,30 +6292,29 @@ impl SyscallDispatcher {
                 });
             }
             if dirfd == LINUX_AT_FDCWD {
-                return Ok(DispatchOutcome::Errno { errno: LINUX_EROFS });
+                return Ok(DispatchOutcome::Returned { value: 0 });
             }
             if !self.fd_is_valid(dirfd as i32) {
                 return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
             }
-            return Ok(DispatchOutcome::Errno { errno: LINUX_EROFS });
+            return Ok(DispatchOutcome::Returned { value: 0 });
         }
         let resolved = match self.resolve_at_path(dirfd, &path) {
             Ok(resolved) => resolved,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        if is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context()) {
-            return Ok(DispatchOutcome::Errno { errno: LINUX_EROFS });
-        }
-        let Some(rootfs) = &self.rootfs else {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_ENOENT,
-            });
-        };
-        match rootfs.symlink_metadata(&resolved) {
-            Ok(_) => Ok(DispatchOutcome::Errno { errno: LINUX_EROFS }),
-            Err(errno) => Ok(DispatchOutcome::Errno {
-                errno: rootfs_errno(errno),
-            }),
+        // Layered presence check: overlay first (tombstones become ENOENT),
+        // synthetic /proc and /sys are no-op success, rootfs is no-op
+        // success (tmpfs semantics).
+        match self.layered_metadata(&resolved) {
+            Ok(_) => Ok(DispatchOutcome::Returned { value: 0 }),
+            Err(errno) => {
+                if is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context()) {
+                    Ok(DispatchOutcome::Returned { value: 0 })
+                } else {
+                    Ok(DispatchOutcome::Errno { errno })
+                }
+            }
         }
     }
 
@@ -6336,19 +6344,17 @@ impl SyscallDispatcher {
             Ok(resolved) => resolved,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        if is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context()) {
-            return Ok(DispatchOutcome::Errno { errno: LINUX_EROFS });
-        }
-        let Some(rootfs) = &self.rootfs else {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_ENOENT,
-            });
-        };
-        match rootfs.symlink_metadata(&resolved) {
-            Ok(_) => Ok(DispatchOutcome::Errno { errno: LINUX_EROFS }),
-            Err(errno) => Ok(DispatchOutcome::Errno {
-                errno: rootfs_errno(errno),
-            }),
+        // Same tmpfs-style story as fchownat: as long as the path exists
+        // in the layered view we accept the mode change as a no-op.
+        match self.layered_metadata(&resolved) {
+            Ok(_) => Ok(DispatchOutcome::Returned { value: 0 }),
+            Err(errno) => {
+                if is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context()) {
+                    Ok(DispatchOutcome::Returned { value: 0 })
+                } else {
+                    Ok(DispatchOutcome::Errno { errno })
+                }
+            }
         }
     }
 
@@ -6814,7 +6820,7 @@ impl SyscallDispatcher {
             if !self.fd_is_valid(dirfd as i32) {
                 return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
             }
-            return Ok(DispatchOutcome::Errno { errno: LINUX_EROFS });
+            return Ok(DispatchOutcome::Returned { value: 0 });
         }
 
         let path = match read_guest_c_string(memory, pathname) {
@@ -6830,19 +6836,18 @@ impl SyscallDispatcher {
             Ok(path) => path,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        if is_synthetic_virtual_file(&path, &self.synthetic_proc_context()) {
-            return Ok(DispatchOutcome::Errno { errno: LINUX_EROFS });
-        }
-        let Some(rootfs) = &self.rootfs else {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_ENOENT,
-            });
-        };
-        match rootfs.metadata(&path) {
-            Ok(_) => Ok(DispatchOutcome::Errno { errno: LINUX_EROFS }),
-            Err(errno) => Ok(DispatchOutcome::Errno {
-                errno: rootfs_errno(errno),
-            }),
+        // The overlay doesn't track atime/mtime separately from the
+        // underlying file. Accept the call as long as the path exists in
+        // the layered view; mirror the rootfs view's NotFound otherwise.
+        match self.layered_metadata(&path) {
+            Ok(_) => Ok(DispatchOutcome::Returned { value: 0 }),
+            Err(errno) => {
+                if is_synthetic_virtual_file(&path, &self.synthetic_proc_context()) {
+                    Ok(DispatchOutcome::Returned { value: 0 })
+                } else {
+                    Ok(DispatchOutcome::Errno { errno })
+                }
+            }
         }
     }
 
