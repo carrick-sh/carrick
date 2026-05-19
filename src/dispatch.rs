@@ -442,6 +442,20 @@ pub struct SyscallDispatcher {
     dumpable: i64,
     task_name: [u8; LINUX_TASK_COMM_LEN],
     umask: u32,
+    /// Tracked (real, effective, saved) uid and gid. Carrick runs the
+    /// guest as a single host identity, but tools like apt's _apt
+    /// privsep drop to a non-root user via setresuid/setresgid and
+    /// then VERIFY the new identity via getuid/geteuid/getresuid (and
+    /// likewise for gid). Returning the host's identity unconditionally
+    /// breaks the verification with "Could not switch group". We
+    /// accept any setres*() the guest requests, record the values, and
+    /// echo them back to the corresponding get*() calls.
+    cred_ruid: u32,
+    cred_euid: u32,
+    cred_suid: u32,
+    cred_rgid: u32,
+    cred_egid: u32,
+    cred_sgid: u32,
     /// Installed signal handlers per signum (1..=64). When the guest
     /// calls `rt_sigaction(signum, new, old, 8)` we record `new` here
     /// and return whatever was previously stored via `old`. Real
@@ -630,6 +644,14 @@ impl SyscallDispatcher {
             dumpable: 1,
             task_name: linux_task_name_from_bytes(b"carrick"),
             umask: LINUX_DEFAULT_UMASK,
+            // Default identity is root (uid 0, gid 0) — what `id` shows
+            // in a typical container.
+            cred_ruid: 0,
+            cred_euid: 0,
+            cred_suid: 0,
+            cred_rgid: 0,
+            cred_egid: 0,
+            cred_sgid: 0,
             signal_handlers: HashMap::new(),
             address_space_regions: None,
             overlay: Box::new(MemoryBackend::new()),
@@ -845,17 +867,23 @@ impl SyscallDispatcher {
             140 => self.setpriority(request),
             141 => self.getpriority(request),
             142 => self.reboot(),
-            // setregid/setgid/setreuid/setuid/setresuid/setresgid/setfsuid/setfsgid:
-            // carrick is single-user, runs as the host user (effectively root
-            // inside the guest). Any "drop privileges" request from a Linux
-            // tool (apt's _apt-user privsep, busybox's su, etc.) is a no-op
-            // for us — we already are who the caller wants to become. Return
-            // success regardless of the target uid/gid. Without these, apt
-            // update fails its sandbox setup and refuses to fetch.
-            143..=147 | 149 | 151 | 152 => DispatchOutcome::Returned { value: 0 },
-            // getresuid / getresgid: write 0/0/0 to the three pointers.
-            148 => self.getres_uid_gid(request, memory),
-            150 => self.getres_uid_gid(request, memory),
+            143 => self.setregid(request),
+            144 => self.setgid(request),
+            145 => self.setreuid(request),
+            146 => self.setuid(request),
+            147 => self.setresuid(request),
+            148 => self.getresuid(request, memory),
+            149 => self.setresgid(request),
+            150 => self.getresgid(request, memory),
+            // setfsuid / setfsgid: Linux convention is to return the
+            // PREVIOUS fsuid/fsgid (not 0/error). We treat fsuid as the
+            // effective uid for tracking purposes.
+            151 => DispatchOutcome::Returned {
+                value: i64::from(self.cred_euid),
+            },
+            152 => DispatchOutcome::Returned {
+                value: i64::from(self.cred_egid),
+            },
             153 => self.times(request, memory),
             154 => self.setpgid(request),
             155 => self.getpgid(request),
@@ -878,7 +906,10 @@ impl SyscallDispatcher {
             171 => self.adjtimex(request, memory),
             172 => self.getpid(),
             173 => DispatchOutcome::Returned { value: 1 },
-            174..=177 => DispatchOutcome::Returned { value: 0 },
+            174 => DispatchOutcome::Returned { value: i64::from(self.cred_ruid) },
+            175 => DispatchOutcome::Returned { value: i64::from(self.cred_euid) },
+            176 => DispatchOutcome::Returned { value: i64::from(self.cred_rgid) },
+            177 => DispatchOutcome::Returned { value: i64::from(self.cred_egid) },
             178 => self.getpid(),
             179 => self.sysinfo(request, memory),
             198 => self.socket(request),
@@ -3543,22 +3574,109 @@ impl SyscallDispatcher {
         DispatchOutcome::Returned { value: 0 }
     }
 
-    /// `getresuid(*ruid, *euid, *suid)` / `getresgid(*rgid, *egid, *sgid)`.
-    /// We report 0/0/0 for both — carrick runs every guest as a single
-    /// effective identity, and apt's privsep code reads these to decide
-    /// whether it's already running as root.
-    fn getres_uid_gid(
+    /// `setresuid(ruid, euid, suid)`. -1 means "don't change". We record
+    /// the new values; the guest gets to see them via getuid/geteuid/
+    /// getresuid. Always succeeds — we're single-identity and tools
+    /// can pretend to drop privileges as they like.
+    fn setresuid(&mut self, request: SyscallRequest) -> DispatchOutcome {
+        let r = request.arg(0);
+        let e = request.arg(1);
+        let s = request.arg(2);
+        if r as i64 != -1 { self.cred_ruid = r as u32; }
+        if e as i64 != -1 { self.cred_euid = e as u32; }
+        if s as i64 != -1 { self.cred_suid = s as u32; }
+        DispatchOutcome::Returned { value: 0 }
+    }
+
+    fn setresgid(&mut self, request: SyscallRequest) -> DispatchOutcome {
+        let r = request.arg(0);
+        let e = request.arg(1);
+        let s = request.arg(2);
+        if r as i64 != -1 { self.cred_rgid = r as u32; }
+        if e as i64 != -1 { self.cred_egid = e as u32; }
+        if s as i64 != -1 { self.cred_sgid = s as u32; }
+        DispatchOutcome::Returned { value: 0 }
+    }
+
+    /// `setreuid(ruid, euid)`: same as setresuid with suid=-1.
+    fn setreuid(&mut self, request: SyscallRequest) -> DispatchOutcome {
+        let r = request.arg(0);
+        let e = request.arg(1);
+        if r as i64 != -1 {
+            self.cred_ruid = r as u32;
+        }
+        if e as i64 != -1 {
+            self.cred_euid = e as u32;
+        }
+        DispatchOutcome::Returned { value: 0 }
+    }
+
+    fn setregid(&mut self, request: SyscallRequest) -> DispatchOutcome {
+        let r = request.arg(0);
+        let e = request.arg(1);
+        if r as i64 != -1 {
+            self.cred_rgid = r as u32;
+        }
+        if e as i64 != -1 {
+            self.cred_egid = e as u32;
+        }
+        DispatchOutcome::Returned { value: 0 }
+    }
+
+    /// `setuid(uid)`: set effective uid and (if currently privileged)
+    /// real + saved too. We always treat the caller as privileged so
+    /// all three move together — matches what apt expects.
+    fn setuid(&mut self, request: SyscallRequest) -> DispatchOutcome {
+        let u = request.arg(0) as u32;
+        self.cred_ruid = u;
+        self.cred_euid = u;
+        self.cred_suid = u;
+        DispatchOutcome::Returned { value: 0 }
+    }
+
+    fn setgid(&mut self, request: SyscallRequest) -> DispatchOutcome {
+        let g = request.arg(0) as u32;
+        self.cred_rgid = g;
+        self.cred_egid = g;
+        self.cred_sgid = g;
+        DispatchOutcome::Returned { value: 0 }
+    }
+
+    /// `getresuid(*ruid, *euid, *suid)` — write our tracked tuple.
+    fn getresuid(
         &self,
         request: SyscallRequest,
         memory: &mut impl GuestMemory,
     ) -> DispatchOutcome {
-        let zero = 0u32.to_le_bytes();
-        for index in 0..3 {
-            let ptr = request.arg(index);
+        for (i, value) in [self.cred_ruid, self.cred_euid, self.cred_suid]
+            .iter()
+            .enumerate()
+        {
+            let ptr = request.arg(i);
             if ptr == 0 {
                 continue;
             }
-            if memory.write_bytes(ptr, &zero).is_err() {
+            if memory.write_bytes(ptr, &value.to_le_bytes()).is_err() {
+                return DispatchOutcome::Errno { errno: LINUX_EFAULT };
+            }
+        }
+        DispatchOutcome::Returned { value: 0 }
+    }
+
+    fn getresgid(
+        &self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+    ) -> DispatchOutcome {
+        for (i, value) in [self.cred_rgid, self.cred_egid, self.cred_sgid]
+            .iter()
+            .enumerate()
+        {
+            let ptr = request.arg(i);
+            if ptr == 0 {
+                continue;
+            }
+            if memory.write_bytes(ptr, &value.to_le_bytes()).is_err() {
                 return DispatchOutcome::Errno { errno: LINUX_EFAULT };
             }
         }
