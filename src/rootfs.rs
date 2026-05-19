@@ -315,15 +315,34 @@ impl RootFs {
         self.ensure_directories(path);
     }
 
+    /// Resolve symlinks along EVERY component of `path`, not just the
+    /// leaf — Debian's `/lib -> usr/lib` makes the parent component a
+    /// symlink, and the dynamic linker request for
+    /// `/lib/ld-linux-aarch64.so.1` has to walk it before the final
+    /// `ld-linux-aarch64.so.1` lookup succeeds. Cap recursion at 40
+    /// (Linux's SYMLOOP_MAX) to bound pathological chains.
     fn resolve_symlink(&self, path: &Path, depth: usize) -> Result<PathBuf, RootFsError> {
-        if depth > 16 {
+        if depth > 40 {
             return Err(RootFsError::TooManySymlinks(display_rootfs_path(path)));
         }
-
-        match self.symlinks.get(path) {
-            Some(target) => self.resolve_symlink(&target.target, depth + 1),
-            None => Ok(path.to_path_buf()),
+        let mut acc = PathBuf::new();
+        let components: Vec<_> = path.components().collect();
+        for (i, component) in components.iter().enumerate() {
+            acc.push(component.as_os_str());
+            if let Some(entry) = self.symlinks.get(&acc) {
+                let target_resolved =
+                    self.resolve_symlink(&entry.target, depth + 1)?;
+                // The remaining components after the symlink we just
+                // resolved get re-appended; they may themselves contain
+                // further symlinks, hence the recursive call below.
+                let mut rebuilt = target_resolved;
+                for tail in &components[i + 1..] {
+                    rebuilt.push(tail.as_os_str());
+                }
+                return self.resolve_symlink(&rebuilt, depth + 1);
+            }
         }
+        Ok(path.to_path_buf())
     }
 
     fn metadata_for_normalized(&self, path: &Path) -> Result<RootFsMetadata, RootFsError> {
@@ -503,5 +522,73 @@ mod tests {
         // "/../safe.txt" — / then .. on empty stack escapes.
         let err = normalize_rootfs_path(Path::new("/../safe.txt")).unwrap_err();
         assert!(matches!(err, RootFsError::UnsafePath(_)));
+    }
+
+    /// Build a tar in memory and load it as a RootFs. Mirrors what the
+    /// OCI loader does, so the assertions exercise the same resolution
+    /// path as `carrick run`.
+    fn make_rootfs(
+        files: &[(&str, &[u8])],
+        dirs: &[&str],
+        symlinks: &[(&str, &str)],
+    ) -> RootFs {
+        use tar::{Builder, EntryType, Header};
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut builder = Builder::new(&mut buf);
+            for path in dirs {
+                let mut h = Header::new_gnu();
+                h.set_path(format!("{}/", path)).unwrap();
+                h.set_entry_type(EntryType::Directory);
+                h.set_size(0);
+                h.set_mode(0o755);
+                h.set_cksum();
+                builder.append(&h, std::io::empty()).unwrap();
+            }
+            for (path, bytes) in files {
+                let mut h = Header::new_gnu();
+                h.set_path(path).unwrap();
+                h.set_size(bytes.len() as u64);
+                h.set_mode(0o644);
+                h.set_cksum();
+                builder.append(&h, *bytes).unwrap();
+            }
+            for (link, target) in symlinks {
+                let mut h = Header::new_gnu();
+                h.set_path(link).unwrap();
+                h.set_entry_type(EntryType::Symlink);
+                h.set_size(0);
+                h.set_mode(0o777);
+                h.set_link_name(target).unwrap();
+                h.set_cksum();
+                builder.append(&h, std::io::empty()).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        RootFs::from_layers(std::iter::once(LayerSource::Tar(buf))).unwrap()
+    }
+
+    #[test]
+    fn resolve_walks_through_directory_symlinks() {
+        // Debian usrmerge: /lib -> usr/lib, then
+        // /usr/lib/ld-linux-aarch64.so.1 -> aarch64-linux-gnu/ld-linux-aarch64.so.1
+        let fs = make_rootfs(
+            &[(
+                "usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1",
+                b"FAKE-LD",
+            )],
+            &["usr", "usr/lib", "usr/lib/aarch64-linux-gnu"],
+            &[
+                ("lib", "usr/lib"),
+                (
+                    "usr/lib/ld-linux-aarch64.so.1",
+                    "aarch64-linux-gnu/ld-linux-aarch64.so.1",
+                ),
+            ],
+        );
+        let bytes = fs
+            .read("/lib/ld-linux-aarch64.so.1")
+            .expect("walk parent symlink");
+        assert_eq!(bytes, b"FAKE-LD");
     }
 }
