@@ -1488,34 +1488,93 @@ impl SyscallDispatcher {
         let pollfds_address = request.arg(0);
         let nfds = usize::try_from(request.arg(1))
             .map_err(|_| DispatchError::LengthTooLarge(request.arg(1)))?;
+        let timeout_address = request.arg(2);
+
+        // Decode timeout. NULL pointer means block forever; non-NULL points
+        // to a `struct timespec { i64 tv_sec; i64 tv_nsec; }`. We translate
+        // to milliseconds for libc::poll (-1 = forever, 0 = immediate).
+        let timeout_ms: i32 = if timeout_address == 0 {
+            -1
+        } else {
+            match memory.read_bytes(timeout_address, 16) {
+                Ok(b) if b.len() == 16 => {
+                    let sec = i64::from_le_bytes(b[0..8].try_into().unwrap_or([0; 8]));
+                    let nsec = i64::from_le_bytes(b[8..16].try_into().unwrap_or([0; 8]));
+                    let ms = sec
+                        .saturating_mul(1000)
+                        .saturating_add(nsec / 1_000_000);
+                    if ms <= 0 {
+                        0
+                    } else if ms > i32::MAX as i64 {
+                        i32::MAX
+                    } else {
+                        ms as i32
+                    }
+                }
+                _ => 0,
+            }
+        };
 
         let mut ready = 0i64;
         let pollfd_size = core::mem::size_of::<LinuxPollFd>();
-        for index in 0..nfds {
-            let offset = index
-                .checked_mul(pollfd_size)
-                .and_then(|offset| u64::try_from(offset).ok())
-                .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
-            let address = match pollfds_address.checked_add(offset) {
-                Some(address) => address,
-                None => {
+        let mut deadline_attempts = 0u32;
+        loop {
+            ready = 0;
+            for index in 0..nfds {
+                let offset = index
+                    .checked_mul(pollfd_size)
+                    .and_then(|offset| u64::try_from(offset).ok())
+                    .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
+                let address = match pollfds_address.checked_add(offset) {
+                    Some(address) => address,
+                    None => {
+                        return Ok(DispatchOutcome::Errno {
+                            errno: LINUX_EFAULT,
+                        });
+                    }
+                };
+                let mut pollfd = match read_pollfd(memory, address) {
+                    Ok(pollfd) => pollfd,
+                    Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                };
+                pollfd.revents = self.poll_ready_events(pollfd.fd, pollfd.events);
+                if pollfd.revents != 0 {
+                    ready += 1;
+                }
+                if memory.write_bytes(address, pollfd.as_bytes()).is_err() {
                     return Ok(DispatchOutcome::Errno {
                         errno: LINUX_EFAULT,
                     });
                 }
-            };
-            let mut pollfd = match read_pollfd(memory, address) {
-                Ok(pollfd) => pollfd,
-                Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
-            };
-            pollfd.revents = self.poll_ready_events(pollfd.fd, pollfd.events);
-            if pollfd.revents != 0 {
-                ready += 1;
             }
-            if memory.write_bytes(address, pollfd.as_bytes()).is_err() {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_EFAULT,
-                });
+            // If anyone is ready, or timeout=0 (non-blocking) was requested,
+            // return immediately. Otherwise sleep briefly and re-check —
+            // a coarse but correct emulation of a blocking ppoll across
+            // our mix of host-backed and synthetic fds.
+            if ready > 0 || timeout_ms == 0 {
+                break;
+            }
+            // Cap blocking polls so a buggy guest can't pin a CPU forever.
+            // For "block forever" callers we still cap and let them re-issue
+            // ppoll; that's what real signal-interruption semantics would
+            // also produce.
+            const SLICE_MS: u32 = 10;
+            unsafe {
+                let ts = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: (SLICE_MS as i64) * 1_000_000,
+                };
+                libc::nanosleep(&ts, std::ptr::null_mut());
+            }
+            deadline_attempts += 1;
+            if timeout_ms > 0 {
+                let elapsed_ms = deadline_attempts.saturating_mul(SLICE_MS);
+                if elapsed_ms as i32 >= timeout_ms {
+                    break;
+                }
+            } else if deadline_attempts > 6000 {
+                // ~60 s ceiling for "block forever" callers.
+                break;
             }
         }
 
@@ -1528,7 +1587,31 @@ impl SyscallDispatcher {
         }
         let Some(open_file) = self.open_files.get(&fd) else {
             return if is_stdio_fd(fd) {
-                requested_events & LINUX_POLLOUT
+                // fd 1/2 are always writable (we either buffer or stream
+                // straight to host write). For fd 0 we have to actually
+                // poll the host because the guest's read(0,...) ultimately
+                // calls libc::read(0,...); without a real readiness check,
+                // ppoll would always return POLLOUT only and never POLLIN,
+                // breaking interactive shells that ppoll(stdin) before
+                // each prompt.
+                let mut revents = requested_events & LINUX_POLLOUT;
+                if fd == 0 && (requested_events & LINUX_POLLIN) != 0 {
+                    let mut pfd = libc::pollfd {
+                        fd: 0,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    let n = unsafe { libc::poll(&mut pfd as *mut _, 1, 0) };
+                    if n > 0 {
+                        if pfd.revents & libc::POLLIN != 0 {
+                            revents |= LINUX_POLLIN;
+                        }
+                        if pfd.revents & libc::POLLHUP != 0 {
+                            revents |= LINUX_POLLHUP;
+                        }
+                    }
+                }
+                revents
             } else {
                 LINUX_POLLNVAL
             };
