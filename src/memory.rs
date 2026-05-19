@@ -762,68 +762,110 @@ fn regions_from_load_plan(
 /// Build the byte image of the EL0 entry trampoline page. Offset 0 is a
 /// single `eret`; the rest of the page is filled with `nop` so a stray fetch
 /// beyond the entry instruction doesn't immediately fault.
-/// Build a stage-1 identity-mapping page table for the EL0/EL1 guest. Layout:
+/// Build a stage-1 identity-mapping page table for the EL0/EL1 guest with
+/// per-region AP so it survives Apple Silicon's FEAT_PAN3 check.
 ///
-/// * Page 0 of the buffer (offset 0..0x1000) is the L0 table, with two
-///   valid table descriptors pointing at the two L1 sub-tables.
-/// * Page 1 (offset 0x1000..0x2000) is the first L1 table — block
-///   descriptors identity-mapping VA 0..0x80_0000_0000 (0..512 GiB) in
-///   1 GiB blocks.
-/// * Page 2 (offset 0x2000..0x3000) is the second L1 table — block
-///   descriptors identity-mapping VA 0x80_0000_0000..0x100_0000_0000
-///   (512 GiB..1 TiB) in 1 GiB blocks.
+/// On Apple Silicon HVF the vCPU starts with PSTATE.PAN=1 regardless of
+/// what the host writes to CPSR via `set_reg`. With FEAT_PAN3 (mandatory
+/// on ARMv8.3+), any EL1 instruction fetch from a page whose descriptor
+/// has AP[1]=1 (i.e. AP=01, user-accessible) raises a permission fault.
+/// To work around that we split the identity map so:
 ///
-/// Total 12 KiB of page-table data, padded to LINUX_PAGE_TABLES_SIZE
-/// (16 KiB) so the allocation is a single HVF page.
+/// * Pages EL1 fetches from (trampoline 0x10000, vectors 0x20000, this
+///   page-table region at 0x30000) live in the first 2 MiB block of
+///   L1A[0] and use AP=00 (RW at EL1 only, no EL0 access). UXN=1 so
+///   user code can never accidentally jump into kernel pages.
+/// * Pages EL0 fetches from (user PIE/static text, interpreter, heap,
+///   mmap arena, stack) live in every other block at any level and use
+///   AP=01 + PXN=1 + UXN=0 (RW at both ELs, no EL1 instruction fetch).
+///   PXN=1 is what bypasses FEAT_PAN3 — EL1 isn't allowed to fetch from
+///   these pages, so the PAN check never fires.
 ///
-/// Each L1 block descriptor uses AttrIndex 0 of MAIR_EL1 (which the trap
-/// engine writes as 0xFF — Normal Inner Shareable WB cacheable), AP=RW
-/// for EL0+EL1, SH=Inner Shareable, AF=1, nG=0, NS=0. The output PA
-/// equals the input VA: every byte in the 1 TiB identity window goes
-/// straight to the same IPA.
+/// Buffer layout (16 KiB total, four 4 KiB pages):
+///
+/// * Page 0 (0x000–0xFFF): L0 table — two table descriptors.
+/// * Page 1 (0x1000–0x1FFF): L1A — L1A[0] is a table descriptor pointing
+///   at the L2 sub-table; L1A[1..511] are user 1 GiB block descriptors.
+/// * Page 2 (0x2000–0x2FFF): L1B — all 512 entries are user 1 GiB block
+///   descriptors covering 512 GiB..1 TiB.
+/// * Page 3 (0x3000–0x3FFF): L2 sub-table for the first 1 GiB — L2[0] is
+///   the kernel-only 2 MiB block covering 0..2 MiB; L2[1..511] are user
+///   2 MiB block descriptors covering 2 MiB..1 GiB.
 pub fn stage1_identity_page_tables() -> Vec<u8> {
     let size = LINUX_PAGE_TABLES_SIZE as usize;
     let mut bytes = vec![0_u8; size];
 
     let l1_a_pa = LINUX_PAGE_TABLES_BASE + 0x1000;
     let l1_b_pa = LINUX_PAGE_TABLES_BASE + 0x2000;
+    let l2_a_pa = LINUX_PAGE_TABLES_BASE + 0x3000;
 
-    // L0 table descriptors are *table* descriptors (bit 1 = 1) that point
-    // at the L1 sub-tables. Bits [47:12] hold the PA of the next-level
-    // table; lower bits are the type + flags. AP/AttrIndex are deferred
-    // to the L1 block descriptors.
-    let l0_table_entry =
+    // Table descriptors point at the next-level table. Bits 47:12 hold the
+    // PA of the next-level table; bits 1:0 = 11 (valid table). AP/PXN/UXN
+    // restrictions could go in the upper attributes (bits 59..63) but we
+    // leave them clear and rely on the leaf block descriptors.
+    let table_descriptor =
         |next_pa: u64| -> u64 { (next_pa & 0x0000_FFFF_FFFF_F000) | 0b11 };
-    let l0 = l0_table_entry(l1_a_pa);
-    bytes[0..8].copy_from_slice(&l0.to_le_bytes());
-    let l0_b = l0_table_entry(l1_b_pa);
-    bytes[8..16].copy_from_slice(&l0_b.to_le_bytes());
 
-    // L1 block descriptor flags (1 GiB block at this level):
-    //   bit  0 = 1  (valid)
-    //   bit  1 = 0  (block, not table)
-    //   bits 2..4 = AttrIndex (0)
-    //   bit  5 = NS (0)
-    //   bits 6..7 = AP  (01 = RW EL0+EL1)
-    //   bits 8..9 = SH  (11 = Inner Shareable)
-    //   bit 10 = AF (1)
-    //   bit 11 = nG (0)
-    //   bit 50 = PXN (0)
-    //   bit 51 = XN (0)
-    const L1_BLOCK_FLAGS: u64 = (1 << 10) | (0b11 << 8) | (0b01 << 6) | 0b01;
+    // Kernel-only leaf flags (used by L2[0] — covers trampoline/vectors/PT):
+    //   bit  0 = 1   (valid)
+    //   bit  1 = 0   (block)
+    //   bits 4..2 = 0   (AttrIndex — MAIR slot 0, Normal WB)
+    //   bit  5 = 0   (NS)
+    //   bits 7..6 = 0b00  (AP[2:1] = RW EL1, no EL0 — avoids FEAT_PAN3)
+    //   bits 9..8 = 0b11  (SH = Inner Shareable)
+    //   bit 10 = 1   (AF)
+    //   bit 11 = 0   (nG)
+    //   bit 53 = 0   (PXN — EL1 must be able to fetch trampoline/vectors)
+    //   bit 54 = 1   (UXN — EL0 must NOT be able to fetch kernel pages)
+    const KERNEL_BLOCK_FLAGS: u64 =
+        (1u64 << 54) | (1 << 10) | (0b11 << 8) | (0b00 << 6) | 0b01;
 
-    // First L1 table covers VA 0..512 GiB. Each entry is a 1 GiB block.
-    for index in 0..512_u64 {
-        let pa = index << 30; // 1 GiB
-        let descriptor = (pa & 0x0000_FFFF_C000_0000) | L1_BLOCK_FLAGS;
+    // User leaf flags (everywhere else):
+    //   AP[2:1] = 0b01 (RW EL1 + EL0)
+    //   PXN = 1  (no EL1 fetch — required because AP[1]=1 would otherwise
+    //             trip FEAT_PAN3 on PSTATE.PAN=1)
+    //   UXN = 0  (EL0 can fetch user code)
+    //   AF, SH, AttrIndex same as kernel block.
+    const USER_BLOCK_FLAGS: u64 =
+        (1u64 << 53) | (1 << 10) | (0b11 << 8) | (0b01 << 6) | 0b01;
+
+    // PA masks for block descriptors at each level.
+    const PA_MASK_1GIB: u64 = 0x0000_FFFF_C000_0000; // bits 47..30
+    const PA_MASK_2MIB: u64 = 0x0000_FFFF_FFE0_0000; // bits 47..21
+
+    // ----- L0 -----
+    bytes[0..8].copy_from_slice(&table_descriptor(l1_a_pa).to_le_bytes());
+    bytes[8..16].copy_from_slice(&table_descriptor(l1_b_pa).to_le_bytes());
+
+    // ----- L1A: covers 0..512 GiB -----
+    // L1A[0] is a table descriptor pointing at L2_A so the first 1 GiB gets
+    // fine-grained AP via 2 MiB blocks.
+    bytes[0x1000..0x1008].copy_from_slice(&table_descriptor(l2_a_pa).to_le_bytes());
+    // L1A[1..511] are 1 GiB user blocks.
+    for index in 1..512_u64 {
+        let pa = index << 30;
+        let descriptor = (pa & PA_MASK_1GIB) | USER_BLOCK_FLAGS;
         let off = 0x1000 + (index as usize) * 8;
         bytes[off..off + 8].copy_from_slice(&descriptor.to_le_bytes());
     }
-    // Second L1 table covers VA 512 GiB..1 TiB.
+
+    // ----- L1B: covers 512 GiB..1 TiB -----
     for index in 0..512_u64 {
         let pa = (index + 512) << 30;
-        let descriptor = (pa & 0x0000_FFFF_C000_0000) | L1_BLOCK_FLAGS;
+        let descriptor = (pa & PA_MASK_1GIB) | USER_BLOCK_FLAGS;
         let off = 0x2000 + (index as usize) * 8;
+        bytes[off..off + 8].copy_from_slice(&descriptor.to_le_bytes());
+    }
+
+    // ----- L2_A: covers the first 1 GiB in 2 MiB blocks -----
+    // L2[0] covers VA 0..2 MiB — kernel-only.
+    let l2_0 = (0u64 & PA_MASK_2MIB) | KERNEL_BLOCK_FLAGS;
+    bytes[0x3000..0x3008].copy_from_slice(&l2_0.to_le_bytes());
+    // L2[1..511] are 2 MiB user blocks.
+    for index in 1..512_u64 {
+        let pa = index << 21;
+        let descriptor = (pa & PA_MASK_2MIB) | USER_BLOCK_FLAGS;
+        let off = 0x3000 + (index as usize) * 8;
         bytes[off..off + 8].copy_from_slice(&descriptor.to_le_bytes());
     }
 
@@ -1012,86 +1054,113 @@ mod stage1_tests {
         u64::from_le_bytes(arr)
     }
 
+    fn ap(desc: u64) -> u64 {
+        (desc >> 6) & 0x3
+    }
+    fn pxn(desc: u64) -> u64 {
+        (desc >> 53) & 0x1
+    }
+    fn uxn(desc: u64) -> u64 {
+        (desc >> 54) & 0x1
+    }
+    fn valid_block(desc: u64) -> bool {
+        (desc & 0x1) == 1 && ((desc >> 1) & 0x1) == 0
+    }
+    fn valid_table(desc: u64) -> bool {
+        (desc & 0x3) == 0b11
+    }
+
     #[test]
     fn stage1_identity_tables_layout() {
         let bytes = stage1_identity_page_tables();
         assert_eq!(bytes.len(), LINUX_PAGE_TABLES_SIZE as usize);
 
-        // L0[0] -> L1_a at base+0x1000 as a TABLE descriptor (bits 1:0 = 11)
+        // L0[0] -> L1A table descriptor at base+0x1000
         let l0_0 = read_u64_le(&bytes, 0);
-        assert_eq!(
-            l0_0 & 0x3,
-            0b11,
-            "L0[0] must be a table descriptor (got {:#x})",
-            l0_0
-        );
+        assert!(valid_table(l0_0), "L0[0] must be a table descriptor");
         assert_eq!(
             l0_0 & 0x0000_FFFF_FFFF_F000,
-            LINUX_PAGE_TABLES_BASE + 0x1000,
-            "L0[0] PA mismatch"
+            LINUX_PAGE_TABLES_BASE + 0x1000
         );
-
-        // L0[1] -> L1_b at base+0x2000
+        // L0[1] -> L1B table descriptor at base+0x2000
         let l0_1 = read_u64_le(&bytes, 8);
-        assert_eq!(l0_1 & 0x3, 0b11);
+        assert!(valid_table(l0_1));
         assert_eq!(
             l0_1 & 0x0000_FFFF_FFFF_F000,
             LINUX_PAGE_TABLES_BASE + 0x2000
         );
 
-        // L1_a[0] block descriptor for VA 0..1 GiB -> PA 0
+        // L1A[0] must be a TABLE descriptor pointing at the L2 sub-table.
         let l1a_0 = read_u64_le(&bytes, 0x1000);
-        let valid = l1a_0 & 0x1;
-        let kind = (l1a_0 >> 1) & 0x1;
-        let attr_index = (l1a_0 >> 2) & 0x7;
-        let ns = (l1a_0 >> 5) & 0x1;
-        let ap = (l1a_0 >> 6) & 0x3;
-        let sh = (l1a_0 >> 8) & 0x3;
-        let af = (l1a_0 >> 10) & 0x1;
-        let ng = (l1a_0 >> 11) & 0x1;
-        let pa = l1a_0 & 0x0000_FFFF_C000_0000;
-        let pxn = (l1a_0 >> 53) & 0x1;
-        let uxn = (l1a_0 >> 54) & 0x1;
-        assert_eq!(valid, 1, "L1A[0] must be valid");
-        assert_eq!(kind, 0, "L1A[0] must be a BLOCK descriptor at L1");
-        assert_eq!(attr_index, 0, "L1A[0] AttrIndex must be 0 (Normal WB)");
-        assert_eq!(ns, 0, "L1A[0] NS must be 0");
-        assert_eq!(ap, 0b01, "L1A[0] AP must be 01 (RW EL1+EL0)");
-        assert_eq!(sh, 0b11, "L1A[0] SH must be 11 (Inner Shareable)");
-        assert_eq!(af, 1, "L1A[0] AF must be 1");
-        assert_eq!(ng, 0, "L1A[0] nG must be 0");
-        assert_eq!(pa, 0, "L1A[0] PA must be 0");
-        assert_eq!(pxn, 0, "L1A[0] PXN must be 0 (execute allowed at EL1)");
-        assert_eq!(uxn, 0, "L1A[0] UXN must be 0 (execute allowed at EL0)");
-
-        // L1_a[1] block descriptor for VA 1..2 GiB -> PA 0x4000_0000
-        let l1a_1 = read_u64_le(&bytes, 0x1008);
+        assert!(valid_table(l1a_0), "L1A[0] must be a table descriptor");
         assert_eq!(
-            l1a_1 & 0x0000_FFFF_C000_0000,
-            0x4000_0000,
-            "L1A[1] PA mismatch"
+            l1a_0 & 0x0000_FFFF_FFFF_F000,
+            LINUX_PAGE_TABLES_BASE + 0x3000,
+            "L1A[0] must point at the L2 sub-table"
         );
 
-        // L1_b[511] (last entry) block descriptor for VA ~1 TiB - 1 GiB
-        let l1b_511 = read_u64_le(&bytes, 0x2000 + 511 * 8);
-        let expected_pa = (511u64 + 512) << 30;
-        assert_eq!(
-            l1b_511 & 0x0000_FFFF_C000_0000,
-            expected_pa & 0x0000_FFFF_C000_0000,
-            "L1B[511] PA mismatch"
-        );
-        assert_eq!(l1b_511 & 0x1, 1, "L1B[511] must be valid");
+        // L1A[1..511] must be USER 1 GiB BLOCK descriptors:
+        //   AP=01, PXN=1, UXN=0 (FEAT_PAN3-safe user mapping).
+        for index in 1..512usize {
+            let d = read_u64_le(&bytes, 0x1000 + index * 8);
+            assert!(valid_block(d), "L1A[{}] must be a block", index);
+            assert_eq!(ap(d), 0b01, "L1A[{}] AP must be 01", index);
+            assert_eq!(pxn(d), 1, "L1A[{}] PXN must be 1", index);
+            assert_eq!(uxn(d), 0, "L1A[{}] UXN must be 0", index);
+            let expected_pa = (index as u64) << 30;
+            assert_eq!(
+                d & 0x0000_FFFF_C000_0000,
+                expected_pa & 0x0000_FFFF_C000_0000,
+                "L1A[{}] PA mismatch",
+                index
+            );
+        }
 
-        // ALL non-zero descriptors must NOT have RES0 bits 12..29 set,
-        // which would corrupt the block PA interpretation.
-        for offset_base in [0x1000usize, 0x2000usize] {
-            for i in 0..512 {
-                let d = read_u64_le(&bytes, offset_base + i * 8);
+        // L1B[0..511] all user 1 GiB blocks.
+        for index in 0..512usize {
+            let d = read_u64_le(&bytes, 0x2000 + index * 8);
+            assert!(valid_block(d), "L1B[{}] must be a block", index);
+            assert_eq!(ap(d), 0b01);
+            assert_eq!(pxn(d), 1);
+            assert_eq!(uxn(d), 0);
+            let expected_pa = ((index as u64) + 512) << 30;
+            assert_eq!(d & 0x0000_FFFF_C000_0000, expected_pa & 0x0000_FFFF_C000_0000);
+        }
+
+        // L2[0] is the KERNEL 2 MiB block (AP=00, PXN=0, UXN=1) covering 0..2 MiB.
+        let l2_0 = read_u64_le(&bytes, 0x3000);
+        assert!(valid_block(l2_0), "L2[0] must be a block");
+        assert_eq!(ap(l2_0), 0b00, "L2[0] kernel block must use AP=00");
+        assert_eq!(pxn(l2_0), 0, "L2[0] PXN must be 0 (EL1 fetches trampoline)");
+        assert_eq!(uxn(l2_0), 1, "L2[0] UXN must be 1 (EL0 cannot fetch kernel)");
+        assert_eq!(l2_0 & 0x0000_FFFF_FFE0_0000, 0);
+
+        // L2[1..511] user 2 MiB blocks covering 2 MiB..1 GiB.
+        for index in 1..512usize {
+            let d = read_u64_le(&bytes, 0x3000 + index * 8);
+            assert!(valid_block(d), "L2[{}] must be a block", index);
+            assert_eq!(ap(d), 0b01);
+            assert_eq!(pxn(d), 1);
+            assert_eq!(uxn(d), 0);
+            let expected_pa = (index as u64) << 21;
+            assert_eq!(d & 0x0000_FFFF_FFE0_0000, expected_pa & 0x0000_FFFF_FFE0_0000);
+        }
+
+        // No block descriptor may have RES0 bits set in the block's PA gap.
+        for (offset_base, shift) in
+            [(0x1000usize, 30u64), (0x2000usize, 30u64), (0x3000usize, 21u64)]
+        {
+            for index in 0..512usize {
+                let d = read_u64_le(&bytes, offset_base + index * 8);
+                if !valid_block(d) {
+                    continue;
+                }
+                let res0_mask = ((1u64 << shift) - 1) & !0xFFFu64;
                 assert_eq!(
-                    d & ((1 << 30) - (1 << 12)),
+                    d & res0_mask,
                     0,
-                    "block descriptor @ {:#x} has RES0 bits 12..29 set: {:#x}",
-                    offset_base + i * 8,
+                    "block @ {:#x} has RES0 bits set: {:#x}",
+                    offset_base + index * 8,
                     d
                 );
             }
