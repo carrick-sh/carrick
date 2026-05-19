@@ -10,3 +10,11 @@ panic = "abort"
 strip = true
 lto = false
 codegen-units = 1
+
+[[bin]]
+name = "carrick-linux-aarch64-hello"
+path = "src/main.rs"
+
+[[bin]]
+name = "carrick-linux-aarch64-clone-exit"
+path = "src/clone_exit.rs"

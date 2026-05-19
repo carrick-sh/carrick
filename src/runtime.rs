@@ -87,6 +87,12 @@ pub const DEFAULT_MAX_TRAPS: usize = 1_000_000;
 pub trait SyscallTrap {
     fn next_syscall(&mut self) -> Result<Aarch64SyscallFrame, TrapError>;
     fn complete_syscall(&mut self, return_value: i64) -> Result<(), TrapError>;
+    /// Real macOS fork. Returns the child pid in the parent, 0 in the
+    /// child. After this returns, the trap engine in the child holds a
+    /// freshly rebuilt HVF context pointing at the same COW'd guest
+    /// memory; the runtime then writes the appropriate retval into the
+    /// guest's x0 via `complete_syscall`.
+    fn fork(&mut self) -> Result<crate::trap::ForkOutcome, TrapError>;
 }
 
 #[derive(Debug, Error)]
@@ -370,6 +376,14 @@ where
             }
             DispatchOutcome::Returned { value } => runtime.complete_syscall(value)?,
             DispatchOutcome::Errno { errno } => runtime.complete_syscall(-(errno as i64))?,
+            DispatchOutcome::Fork => {
+                let outcome = runtime.fork()?;
+                let retval: i64 = match outcome {
+                    crate::trap::ForkOutcome::Parent { child_pid } => i64::from(child_pid),
+                    crate::trap::ForkOutcome::Child => 0,
+                };
+                runtime.complete_syscall(retval)?;
+            }
         }
     }
 
@@ -416,6 +430,14 @@ where
             }
             DispatchOutcome::Returned { value } => trap.complete_syscall(value)?,
             DispatchOutcome::Errno { errno } => trap.complete_syscall(-(errno as i64))?,
+            DispatchOutcome::Fork => {
+                let outcome = trap.fork()?;
+                let retval: i64 = match outcome {
+                    crate::trap::ForkOutcome::Parent { child_pid } => i64::from(child_pid),
+                    crate::trap::ForkOutcome::Child => 0,
+                };
+                trap.complete_syscall(retval)?;
+            }
         }
     }
 
@@ -430,6 +452,10 @@ where
 }
 
 impl SyscallTrap for HvfTrapEngine {
+    fn fork(&mut self) -> Result<crate::trap::ForkOutcome, TrapError> {
+        self.fork()
+    }
+
     fn next_syscall(&mut self) -> Result<Aarch64SyscallFrame, TrapError> {
         self.run_until_syscall()
     }
