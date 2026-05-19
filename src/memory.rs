@@ -4,8 +4,10 @@ use std::path::Path;
 use crate::dispatch::{GuestMemory, MemoryError};
 use crate::elf::{ElfInspectError, LoadPlan, SegmentPerms, plan_elf_load, plan_elf_load_bytes};
 use crate::linux_abi::{
-    LINUX_AT_BASE, LINUX_AT_ENTRY, LINUX_AT_NULL, LINUX_AT_PAGESZ, LINUX_AT_PHDR, LINUX_AT_PHENT,
-    LINUX_AT_PHNUM, LINUX_PAGE_SIZE, LinuxAuxvEntry,
+    LINUX_AT_BASE, LINUX_AT_CLKTCK, LINUX_AT_EGID, LINUX_AT_ENTRY, LINUX_AT_EUID, LINUX_AT_EXECFN,
+    LINUX_AT_FLAGS, LINUX_AT_GID, LINUX_AT_HWCAP, LINUX_AT_HWCAP2, LINUX_AT_NULL, LINUX_AT_PAGESZ,
+    LINUX_AT_PHDR, LINUX_AT_PHENT, LINUX_AT_PHNUM, LINUX_AT_PLATFORM, LINUX_AT_RANDOM,
+    LINUX_AT_SECURE, LINUX_AT_UID, LINUX_PAGE_SIZE, LinuxAuxvEntry,
 };
 use crate::rootfs::{RootFs, RootFsError};
 use serde::Serialize;
@@ -534,6 +536,48 @@ fn build_linux_initial_stack(
 
     let argv_addrs = write_stack_strings(&mut bytes, stack_start, &mut cursor, &argv, stack_size)?;
     let env_addrs = write_stack_strings(&mut bytes, stack_start, &mut cursor, &env, stack_size)?;
+
+    // AT_EXECFN, AT_PLATFORM bytes (NUL-terminated strings on the stack).
+    let execfn_addr = if let Some(first) = argv.first() {
+        let s = first.as_bytes();
+        if cursor < s.len() + 1 {
+            return Err(AddressSpaceError::InitialStackTooLarge { stack_size });
+        }
+        cursor -= s.len() + 1;
+        bytes[cursor..cursor + s.len()].copy_from_slice(s);
+        bytes[cursor + s.len()] = 0;
+        Some(stack_start + cursor as u64)
+    } else {
+        None
+    };
+    let platform = b"aarch64";
+    if cursor < platform.len() + 1 {
+        return Err(AddressSpaceError::InitialStackTooLarge { stack_size });
+    }
+    cursor -= platform.len() + 1;
+    bytes[cursor..cursor + platform.len()].copy_from_slice(platform);
+    bytes[cursor + platform.len()] = 0;
+    let platform_addr = stack_start + cursor as u64;
+
+    // AT_RANDOM — 16 bytes glibc copies into __stack_chk_guard, pointer_guard,
+    // and dl_random. Source from the host's CSPRNG via libc::getentropy so
+    // each process gets fresh canaries; ZSTC/OpenSSL boot also checks it
+    // before deciding it can use vectorized routines.
+    cursor = align_down_usize(cursor, 16);
+    if cursor < 16 {
+        return Err(AddressSpaceError::InitialStackTooLarge { stack_size });
+    }
+    cursor -= 16;
+    let mut random_bytes = [0u8; 16];
+    unsafe {
+        let _ = libc::getentropy(
+            random_bytes.as_mut_ptr() as *mut _,
+            random_bytes.len(),
+        );
+    }
+    bytes[cursor..cursor + 16].copy_from_slice(&random_bytes);
+    let random_addr = stack_start + cursor as u64;
+
     cursor = align_down_usize(cursor, 16);
 
     let mut entries = Vec::with_capacity(1 + argv_addrs.len() + 1 + env_addrs.len() + 1);
@@ -564,8 +608,17 @@ fn build_linux_initial_stack(
     }
     let mut auxv_offset = stack_pointer_offset + entries_words * 8;
     for entry in auxv.iter().copied() {
+        let patched = match entry.a_type {
+            LINUX_AT_RANDOM => LinuxAuxvEntry::new(LINUX_AT_RANDOM, random_addr),
+            LINUX_AT_PLATFORM => LinuxAuxvEntry::new(LINUX_AT_PLATFORM, platform_addr),
+            LINUX_AT_EXECFN => match execfn_addr {
+                Some(addr) => LinuxAuxvEntry::new(LINUX_AT_EXECFN, addr),
+                None => continue,
+            },
+            _ => entry,
+        };
         bytes[auxv_offset..auxv_offset + core::mem::size_of::<LinuxAuxvEntry>()]
-            .copy_from_slice(entry.as_bytes());
+            .copy_from_slice(patched.as_bytes());
         auxv_offset += core::mem::size_of::<LinuxAuxvEntry>();
     }
     bytes[auxv_offset..auxv_offset + core::mem::size_of::<LinuxAuxvEntry>()]
@@ -1016,7 +1069,31 @@ fn linux_auxv_from_load_plan(
     if let Some(base) = interpreter_base {
         auxv.push(LinuxAuxvEntry::new(LINUX_AT_BASE, base));
     }
+    auxv.push(LinuxAuxvEntry::new(LINUX_AT_FLAGS, 0));
     auxv.push(LinuxAuxvEntry::new(LINUX_AT_ENTRY, plan.entry));
+    // Identity ids — bootstrap runs as the host user, not real Linux
+    // root semantics. Returning 0/0 keeps glibc's __nss_database_lookup
+    // and friends from deciding the process is "secure" (AT_SECURE=1)
+    // and dropping LD_LIBRARY_PATH lookups.
+    auxv.push(LinuxAuxvEntry::new(LINUX_AT_UID, 0));
+    auxv.push(LinuxAuxvEntry::new(LINUX_AT_EUID, 0));
+    auxv.push(LinuxAuxvEntry::new(LINUX_AT_GID, 0));
+    auxv.push(LinuxAuxvEntry::new(LINUX_AT_EGID, 0));
+    auxv.push(LinuxAuxvEntry::new(LINUX_AT_SECURE, 0));
+    auxv.push(LinuxAuxvEntry::new(LINUX_AT_CLKTCK, 100));
+    // Minimal AArch64 HWCAP — enough for glibc to decide it can use the
+    // "modern" optimized routines. Bits picked from /usr/include/asm/hwcap.h
+    // (FP, ASIMD, AES, PMULL, SHA1, SHA2, CRC32, ATOMICS).
+    auxv.push(LinuxAuxvEntry::new(LINUX_AT_HWCAP, 0x1fb));
+    auxv.push(LinuxAuxvEntry::new(LINUX_AT_HWCAP2, 0));
+    // Sentinel addresses for AT_RANDOM, AT_PLATFORM, AT_EXECFN — the
+    // actual stack offsets get patched in by `build_linux_initial_stack`
+    // once it has placed the backing bytes on the stack. Using 0 here
+    // would be visible to glibc as "no random / no platform" and break
+    // stack canary init.
+    auxv.push(LinuxAuxvEntry::new(LINUX_AT_RANDOM, 0));
+    auxv.push(LinuxAuxvEntry::new(LINUX_AT_PLATFORM, 0));
+    auxv.push(LinuxAuxvEntry::new(LINUX_AT_EXECFN, 0));
     auxv
 }
 
