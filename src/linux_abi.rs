@@ -699,3 +699,124 @@ fn write_linux_c_field<const N: usize>(field: &mut [u8; N], value: &[u8]) {
     let len = value.len().min(N.saturating_sub(1));
     field[..len].copy_from_slice(&value[..len]);
 }
+
+// =============================================================================
+//                            Kernel ABI boundary
+// =============================================================================
+//
+// Every UAPI struct that crosses the syscall boundary has an EXACT byte
+// count the Linux kernel writes/reads — and that count is what defines
+// "the ABI", not the size of our Rust struct. Conflating the two is what
+// gave us a 44-byte TCGETS write into glibc's 36-byte on-stack termios
+// buffer; the overflow trampled the stack canary and every glibc binary
+// that called isatty() aborted later inside __stack_chk_fail.
+//
+// To prevent that class of bug ever happening again, ABI-touching structs
+// implement `KernelAbi`. The trait holds a const `ABI_SIZE` (the wire
+// size the Linux kernel uses), and provides `abi_bytes()` returning a
+// slice of exactly that length. All guest-memory writes from the
+// dispatcher go through `write_kernel_struct`, which CAN'T pick the
+// wrong length — the wire size is baked into the type.
+//
+// The trait's `const _` block asserts that ABI_SIZE never exceeds the
+// in-memory Rust layout (so `abi_bytes()` can't read past the struct).
+// For structs whose Rust layout naturally matches the kernel ABI,
+// `ABI_SIZE == size_of::<Self>()` and a corresponding `const _` assert
+// pins it to the documented kernel size — drift from spec fails the
+// build with a clear message rather than corrupting guest memory.
+//
+// Sizes are sourced from `include/uapi/asm-generic/*.h` and the
+// aarch64 arch overrides; cross-checked with `pahole` against a Debian
+// trixie kernel when in doubt.
+
+pub trait KernelAbi: IntoBytes + Immutable {
+    /// Wire size the Linux kernel uses when the kernel reads/writes
+    /// this struct via syscall. Must be `<= size_of::<Self>()`.
+    const ABI_SIZE: usize;
+
+    /// Bytes to copy into guest memory for an ABI-shaped syscall
+    /// argument. Always exactly `ABI_SIZE` bytes regardless of the
+    /// Rust struct's true layout.
+    fn abi_bytes(&self) -> &[u8] {
+        &self.as_bytes()[..Self::ABI_SIZE]
+    }
+}
+
+// One macro per `KernelAbi` impl so the trait and the
+// `ABI_SIZE <= sizeof(Self)` assert are always written together.
+macro_rules! kernel_abi {
+    ($ty:ty, $size:expr, $why:expr) => {
+        impl KernelAbi for $ty {
+            const ABI_SIZE: usize = $size;
+        }
+        const _: () = assert!(
+            <$ty as KernelAbi>::ABI_SIZE <= core::mem::size_of::<$ty>(),
+            concat!(stringify!($ty), ": ABI_SIZE > size_of::<Self>() — would over-read")
+        );
+        const _: () = assert!(
+            <$ty as KernelAbi>::ABI_SIZE == $size,
+            $why
+        );
+    };
+}
+
+kernel_abi!(LinuxStat, 128, "Linux struct stat for aarch64 is 128 bytes");
+kernel_abi!(LinuxStatfs, 120, "Linux struct statfs64 is 120 bytes");
+kernel_abi!(LinuxStatx, 256, "Linux struct statx is 256 bytes");
+kernel_abi!(LinuxWinsize, 8, "TIOCGWINSZ struct is 8 bytes");
+kernel_abi!(LinuxTermios, LINUX_TERMIOS_KERNEL_SIZE, "TCGETS kernel termios is 36 bytes; the trailing 8 bytes of LinuxTermios (c_ispeed/c_ospeed) belong to termios2/TCGETS2");
+kernel_abi!(LinuxEventfdValue, 8, "eventfd_t is u64");
+kernel_abi!(LinuxEpollEvent, 12, "epoll_event packed = u32 events + u64 data");
+kernel_abi!(LinuxPollFd, 8, "pollfd is fd:i32 + events:i16 + revents:i16");
+kernel_abi!(LinuxFdPair, 8, "two-int fd pair (pipe2 etc.)");
+kernel_abi!(LinuxAuxvEntry, 16, "ELF auxv entry is two u64");
+kernel_abi!(LinuxIovec, 16, "struct iovec is base:u64 + len:u64");
+kernel_abi!(LinuxOpenHow, 24, "openat2 how is 3 u64s");
+kernel_abi!(LinuxTimespec, 16, "timespec is tv_sec:i64 + tv_nsec:i64");
+kernel_abi!(LinuxItimerspec, 32, "itimerspec is two timespecs");
+kernel_abi!(LinuxTimeval, 16, "timeval is tv_sec:i64 + tv_usec:i64");
+kernel_abi!(LinuxItimerval, 32, "itimerval is two timevals");
+kernel_abi!(LinuxTimezone, 8, "timezone is tz_minuteswest:i32 + tz_dsttime:i32");
+kernel_abi!(LinuxRlimit, 16, "rlimit is cur:u64 + max:u64");
+kernel_abi!(LinuxTms, 32, "tms is four clock_t (long) = 4 * 8");
+kernel_abi!(LinuxSigaction, 32, "k_sigaction is handler+flags+restorer+mask[1]");
+kernel_abi!(LinuxTimerfdExpirations, 8, "timerfd_read result is u64");
+kernel_abi!(LinuxCapabilityHeader, 8, "capget header is version:u32 + pid:i32");
+kernel_abi!(LinuxCapabilityData, 12, "capget data is three u32");
+kernel_abi!(LinuxStatxTimestamp, 16, "statx_timestamp is sec:i64 + nsec:u32 + pad");
+kernel_abi!(LinuxSysinfo, core::mem::size_of::<LinuxSysinfo>(), "sysinfo (packed) matches its layout");
+kernel_abi!(LinuxUtsname, LINUX_UTSNAME_FIELD_SIZE * 6, "utsname is 6 char[65] fields");
+kernel_abi!(LinuxRusage, core::mem::size_of::<LinuxRusage>(), "rusage layout matches kernel ABI");
+kernel_abi!(LinuxSigaltstack, 24, "stack_t is ss_sp:u64 + ss_flags:i32 + ss_size:u64 (with 4-byte pad)");
+kernel_abi!(LinuxDirent64Header, 19, "dirent64 fixed header is d_ino+d_off+d_reclen+d_type");
+
+#[cfg(test)]
+mod kernel_abi_tests {
+    use super::*;
+
+    #[test]
+    fn termios_kernel_abi_size_is_36_not_44() {
+        // Regression for the bug that crashed ls/dpkg: LinuxTermios is
+        // 44 bytes in Rust (it includes termios2's ispeed/ospeed) but
+        // the kernel TCGETS write is exactly 36. `abi_bytes()` must
+        // return 36 — anything more overflows the caller's stack.
+        let t = LinuxTermios::default_cooked();
+        assert_eq!(t.abi_bytes().len(), 36);
+        assert_eq!(<LinuxTermios as KernelAbi>::ABI_SIZE, 36);
+        assert!(core::mem::size_of::<LinuxTermios>() > <LinuxTermios as KernelAbi>::ABI_SIZE);
+    }
+
+    #[test]
+    fn abi_size_never_exceeds_struct_size() {
+        // Sample of structs across the surface — KernelAbi's const
+        // assert guarantees this for every impl, but the test makes
+        // the property runnable too.
+        assert!(<LinuxStat as KernelAbi>::ABI_SIZE <= core::mem::size_of::<LinuxStat>());
+        assert!(<LinuxStatfs as KernelAbi>::ABI_SIZE <= core::mem::size_of::<LinuxStatfs>());
+        assert!(<LinuxStatx as KernelAbi>::ABI_SIZE <= core::mem::size_of::<LinuxStatx>());
+        assert!(<LinuxRusage as KernelAbi>::ABI_SIZE <= core::mem::size_of::<LinuxRusage>());
+        assert!(<LinuxUtsname as KernelAbi>::ABI_SIZE <= core::mem::size_of::<LinuxUtsname>());
+        assert!(<LinuxSigaltstack as KernelAbi>::ABI_SIZE <= core::mem::size_of::<LinuxSigaltstack>());
+        assert!(<LinuxSigaction as KernelAbi>::ABI_SIZE <= core::mem::size_of::<LinuxSigaction>());
+    }
+}

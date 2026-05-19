@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::compat::{CompatEvent, CompatReporter, SyscallArgs};
 use crate::linux_abi::{
-    LINUX_DIRENT64_HEADER_SIZE, LINUX_DT_DIR, LINUX_DT_LNK, LINUX_DT_REG, LINUX_PAGE_SIZE,
+    KernelAbi, LINUX_DIRENT64_HEADER_SIZE, LINUX_DT_DIR, LINUX_DT_LNK, LINUX_DT_REG, LINUX_PAGE_SIZE,
     LINUX_S_IFDIR, LINUX_S_IFLNK, LINUX_S_IFREG, LINUX_TERMIOS_KERNEL_SIZE, LinuxCapabilityData, LinuxCapabilityHeader,
     LinuxDirent64Header, LinuxEpollEvent, LinuxEventfdValue, LinuxFdPair, LinuxIovec,
     LinuxItimerspec, LinuxItimerval, LinuxOpenHow, LinuxPollFd, LinuxRlimit, LinuxRusage, LinuxSigaction, LinuxSysinfo,
@@ -1192,7 +1192,7 @@ impl SyscallDispatcher {
 
         if old_value != 0 {
             let previous = timerfd_itimerspec(*clock_id, *interval, *deadline);
-            if memory.write_bytes(old_value, previous.as_bytes()).is_err() {
+            if write_kernel_struct_raw(memory, old_value, &previous).is_err() {
                 return DispatchOutcome::Errno {
                     errno: LINUX_EFAULT,
                 };
@@ -1235,7 +1235,7 @@ impl SyscallDispatcher {
             };
         };
         let current = timerfd_itimerspec(*clock_id, *interval, *deadline);
-        write_packed(memory, current_value, current.as_bytes())
+        write_kernel_struct(memory, current_value, &current)
     }
 
     fn epoll_create1(&mut self, request: SyscallRequest) -> DispatchOutcome {
@@ -1375,7 +1375,7 @@ impl SyscallDispatcher {
                     errno: LINUX_EFAULT,
                 });
             };
-            if memory.write_bytes(address, event.as_bytes()).is_err() {
+            if write_kernel_struct_raw(memory, address, event).is_err() {
                 return Ok(DispatchOutcome::Errno {
                     errno: LINUX_EFAULT,
                 });
@@ -1544,7 +1544,7 @@ impl SyscallDispatcher {
                 if pollfd.revents != 0 {
                     ready += 1;
                 }
-                if memory.write_bytes(address, pollfd.as_bytes()).is_err() {
+                if write_kernel_struct_raw(memory, address, &pollfd).is_err() {
                     return Ok(DispatchOutcome::Errno {
                         errno: LINUX_EFAULT,
                     });
@@ -1748,7 +1748,7 @@ impl SyscallDispatcher {
             };
         };
         let pair = LinuxFdPair { read_fd, write_fd };
-        if memory.write_bytes(address, pair.as_bytes()).is_err() {
+        if write_kernel_struct_raw(memory, address, &pair).is_err() {
             unsafe {
                 libc::close(host_read);
                 libc::close(host_write);
@@ -1952,7 +1952,7 @@ impl SyscallDispatcher {
                 } else {
                     LinuxWinsize::terminal_80x24()
                 };
-                write_packed(memory, arg, winsize.as_bytes())
+                write_kernel_struct(memory, arg, &winsize)
             }
             LINUX_TIOCGWINSZ => DispatchOutcome::Errno {
                 errno: LINUX_ENOTTY,
@@ -1967,11 +1967,12 @@ impl SyscallDispatcher {
                 } else {
                     LinuxTermios::default_cooked()
                 };
-                // TCGETS expects the 36-byte kernel struct, NOT our
-                // 44-byte LinuxTermios (which includes the termios2-only
-                // c_ispeed/c_ospeed tail). Write past that and glibc's
-                // tcgetattr blows its on-stack buffer's canary.
-                write_packed(memory, arg, &termios.as_bytes()[..LINUX_TERMIOS_KERNEL_SIZE])
+                // KernelAbi for LinuxTermios pins this at 36 bytes —
+                // the kernel-ABI termios size, NOT our 44-byte Rust
+                // struct (which includes the termios2-only ispeed/ospeed
+                // tail). Going past 36 here is what blew glibc's
+                // tcgetattr canary and crashed ls/dpkg.
+                write_kernel_struct(memory, arg, &termios)
             }
             LINUX_TCGETS => DispatchOutcome::Errno {
                 errno: LINUX_ENOTTY,
@@ -2575,7 +2576,7 @@ impl SyscallDispatcher {
             };
         };
         let timespec = linux_timespec_from_duration(duration);
-        write_packed(memory, address, timespec.as_bytes())
+        write_kernel_struct(memory, address, &timespec)
     }
 
     fn clock_getres(
@@ -2658,7 +2659,7 @@ impl SyscallDispatcher {
         }
         // No timer is ever armed, so the truthful answer is a zeroed
         // itimerval (interval and value both zero == "disarmed").
-        write_packed(memory, address, LinuxItimerval::zeroed().as_bytes())
+        write_kernel_struct(memory, address, &LinuxItimerval::zeroed())
     }
 
     fn setitimer(
@@ -2689,7 +2690,7 @@ impl SyscallDispatcher {
             }
         }
         if old_address != 0 {
-            let outcome = write_packed(memory, old_address, LinuxItimerval::zeroed().as_bytes());
+            let outcome = write_kernel_struct(memory, old_address, &LinuxItimerval::zeroed());
             if !matches!(outcome, DispatchOutcome::Returned { .. }) {
                 return outcome;
             }
@@ -2777,7 +2778,7 @@ impl SyscallDispatcher {
 
         if old_ss != 0
             && memory
-                .write_bytes(old_ss, LinuxSigaltstack::disabled().as_bytes())
+                .write_bytes(old_ss, LinuxSigaltstack::disabled().abi_bytes())
                 .is_err()
         {
             return DispatchOutcome::Errno {
@@ -2879,7 +2880,7 @@ impl SyscallDispatcher {
                 .get(&signum)
                 .copied()
                 .unwrap_or_else(LinuxSigaction::empty);
-            let _ = memory.write_bytes(old_action, prev.as_bytes());
+            let _ = write_kernel_struct_raw(memory, old_action, &prev);
         }
         // Read and store the new handler. The kernel rejects attempts
         // to install handlers for SIGKILL (9) and SIGSTOP (19); leave
@@ -2993,7 +2994,7 @@ impl SyscallDispatcher {
     fn uname(&self, request: SyscallRequest, memory: &mut impl GuestMemory) -> DispatchOutcome {
         let address = request.arg(0);
         if memory
-            .write_bytes(address, LinuxUtsname::carrick_aarch64().as_bytes())
+            .write_bytes(address, LinuxUtsname::carrick_aarch64().abi_bytes())
             .is_err()
         {
             return DispatchOutcome::Errno {
@@ -3024,7 +3025,7 @@ impl SyscallDispatcher {
         }
         if timezone != 0
             && memory
-                .write_bytes(timezone, LinuxTimezone::utc().as_bytes())
+                .write_bytes(timezone, LinuxTimezone::utc().abi_bytes())
                 .is_err()
         {
             return DispatchOutcome::Errno {
@@ -3125,7 +3126,7 @@ impl SyscallDispatcher {
             mem_unit: 1,
             _padding: [0; 8],
         };
-        if memory.write_bytes(request.arg(0), info.as_bytes()).is_err() {
+        if write_kernel_struct_raw(memory, request.arg(0), &info).is_err() {
             return DispatchOutcome::Errno {
                 errno: LINUX_EFAULT,
             };
@@ -3142,7 +3143,7 @@ impl SyscallDispatcher {
             .unwrap_or(i64::MAX);
         if buf != 0
             && memory
-                .write_bytes(buf, LinuxTms::zeroed().as_bytes())
+                .write_bytes(buf, LinuxTms::zeroed().abi_bytes())
                 .is_err()
         {
             return DispatchOutcome::Errno {
@@ -3169,7 +3170,7 @@ impl SyscallDispatcher {
             };
         }
         if memory
-            .write_bytes(usage, LinuxRusage::zeroed().as_bytes())
+            .write_bytes(usage, LinuxRusage::zeroed().abi_bytes())
             .is_err()
         {
             return DispatchOutcome::Errno {
@@ -3560,7 +3561,7 @@ impl SyscallDispatcher {
             return DispatchOutcome::Errno { errno: LINUX_EINVAL };
         };
         let pair = LinuxFdPair { read_fd, write_fd };
-        if memory.write_bytes(sv_addr, pair.as_bytes()).is_err() {
+        if write_kernel_struct_raw(memory, sv_addr, &pair).is_err() {
             unsafe { libc::close(host_fds[0]); libc::close(host_fds[1]); }
             return DispatchOutcome::Errno { errno: LINUX_EFAULT };
         }
@@ -4737,7 +4738,7 @@ impl SyscallDispatcher {
         }
         if old_limit != 0 {
             let limit = LinuxRlimit::new(LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY);
-            if memory.write_bytes(old_limit, limit.as_bytes()).is_err() {
+            if write_kernel_struct_raw(memory, old_limit, &limit).is_err() {
                 return DispatchOutcome::Errno {
                     errno: LINUX_EFAULT,
                 };
@@ -6417,6 +6418,10 @@ fn bootstrap_signal_send(target: i64, tid_required: bool, signum: u64) -> Dispat
     DispatchOutcome::Returned { value: 0 }
 }
 
+/// Untyped guest-memory write. Prefer [`write_kernel_struct`] over this
+/// whenever the payload is a Linux UAPI struct: that path is bound to
+/// `KernelAbi::ABI_SIZE` so it CAN'T accidentally over-write a caller's
+/// stack buffer the way an ad-hoc `&[u8]` from `as_bytes()` can.
 fn write_packed(memory: &mut impl GuestMemory, address: u64, bytes: &[u8]) -> DispatchOutcome {
     if memory.write_bytes(address, bytes).is_err() {
         DispatchOutcome::Errno {
@@ -6425,6 +6430,32 @@ fn write_packed(memory: &mut impl GuestMemory, address: u64, bytes: &[u8]) -> Di
     } else {
         DispatchOutcome::Returned { value: 0 }
     }
+}
+
+/// Type-safe write for any Linux UAPI struct that implements
+/// [`KernelAbi`]. Writes EXACTLY `T::ABI_SIZE` bytes — the size the
+/// Linux kernel itself uses on the wire. The compiler refuses to pass
+/// `T` here unless the trait is implemented, which forces every new
+/// ABI struct to declare its kernel size up front and have a paired
+/// const assert validating ABI_SIZE <= size_of::<T>().
+fn write_kernel_struct<T: KernelAbi>(
+    memory: &mut impl GuestMemory,
+    address: u64,
+    value: &T,
+) -> DispatchOutcome {
+    write_packed(memory, address, value.abi_bytes())
+}
+
+/// Lower-level form of [`write_kernel_struct`] for sites that already
+/// handle `Result<(), MemoryError>` directly (typically because they
+/// have post-write bookkeeping that the `DispatchOutcome::Errno` shape
+/// would short-circuit). Same wire-size guarantee.
+fn write_kernel_struct_raw<T: KernelAbi>(
+    memory: &mut impl GuestMemory,
+    address: u64,
+    value: &T,
+) -> Result<(), crate::dispatch::MemoryError> {
+    memory.write_bytes(address, value.abi_bytes())
 }
 
 fn write_statfs(memory: &mut impl GuestMemory, statfsbuf: u64) -> DispatchOutcome {
@@ -6443,7 +6474,7 @@ fn write_statfs(memory: &mut impl GuestMemory, statfsbuf: u64) -> DispatchOutcom
         f_flags: 0,
         f_spare: [0; 4],
     };
-    write_packed(memory, statfsbuf, statfs.as_bytes())
+    write_kernel_struct(memory, statfsbuf, &statfs)
 }
 
 fn linux_fd_flags_from_open_flags(flags: u64) -> u64 {
@@ -6685,7 +6716,7 @@ fn write_stat(
         __unused5: 0,
     };
 
-    if memory.write_bytes(statbuf, stat.as_bytes()).is_err() {
+    if write_kernel_struct_raw(memory, statbuf, &stat).is_err() {
         DispatchOutcome::Errno {
             errno: LINUX_EFAULT,
         }
@@ -6737,7 +6768,7 @@ fn write_statx(
         __spare2: [0; 1],
         __spare3: [0; 8],
     };
-    write_packed(memory, statxbuf, statx.as_bytes())
+    write_kernel_struct(memory, statxbuf, &statx)
 }
 
 fn write_synthetic_stat(
@@ -6768,7 +6799,7 @@ fn write_synthetic_stat(
         __unused4: 0,
         __unused5: 0,
     };
-    write_packed(memory, statbuf, stat.as_bytes())
+    write_kernel_struct(memory, statbuf, &stat)
 }
 
 fn write_synthetic_statx(
@@ -7351,7 +7382,7 @@ fn read_timerfd(
     let value = LinuxTimerfdExpirations {
         expirations: *expirations,
     };
-    if memory.write_bytes(address, value.as_bytes()).is_err() {
+    if write_kernel_struct_raw(memory, address, &value).is_err() {
         return DispatchOutcome::Errno {
             errno: LINUX_EFAULT,
         };
