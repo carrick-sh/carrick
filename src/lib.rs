@@ -8,6 +8,7 @@ pub mod host_tty;
 pub mod linux_abi;
 pub mod memory;
 pub mod oci;
+pub mod overlay;
 pub mod probes;
 pub mod rootfs;
 pub mod runtime;
