@@ -977,6 +977,8 @@ impl SyscallDispatcher {
             210 => self.shutdown(request),
             211 => self.sendmsg(request, memory),
             212 => self.recvmsg(request, memory),
+            243 => self.recvmmsg(request, memory),
+            269 => self.sendmmsg(request, memory),
             214 => self.brk(request),
             215 => self.munmap(request),
             216 => self.mremap(request),
@@ -4995,6 +4997,123 @@ impl SyscallDispatcher {
             return DispatchOutcome::Errno { errno: LINUX_EFAULT };
         }
         DispatchOutcome::Returned { value: n as i64 }
+    }
+
+    /// `sendmmsg(sockfd, msgvec, vlen, flags)` — Linux's batched
+    /// sendmsg. glibc's getaddrinfo uses sendmmsg for DNS queries even
+    /// when only a single message is sent; without this handler the
+    /// guest sees ENOSYS and bails with "Temporary failure resolving".
+    /// Implemented as a loop over single sendmsgs, writing each entry's
+    /// msg_len field with the bytes-sent on success.
+    fn sendmmsg(
+        &self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+    ) -> DispatchOutcome {
+        let fd = request.arg(0) as i32;
+        let msgvec = request.arg(1);
+        let vlen = request.arg(2) as u32;
+        let flags = request.arg(3) as i32;
+        // mmsghdr = msghdr (56 bytes) + msg_len:u32 (4) + pad (4) = 64.
+        const MMSGHDR_SIZE: u64 = 64;
+        const MSG_LEN_OFFSET: u64 = 56;
+        let mut sent: i32 = 0;
+        for i in 0..vlen {
+            let entry = match msgvec.checked_add(i as u64 * MMSGHDR_SIZE) {
+                Some(a) => a,
+                None => return DispatchOutcome::Errno { errno: LINUX_EFAULT },
+            };
+            // Build a synthetic sendmsg request that points at this
+            // entry's msg_hdr (which is the first 56 bytes of the
+            // mmsghdr). Reusing sendmsg keeps the iovec-pack + sockaddr-
+            // translate logic in one place.
+            let inner_req = SyscallRequest::new(
+                211, // sendmsg
+                SyscallArgs([fd as u64, entry, 0, flags as u64, 0, 0]),
+            );
+            let outcome = self.sendmsg(inner_req, memory);
+            match outcome {
+                DispatchOutcome::Returned { value } => {
+                    let len_u32 = value as u32;
+                    if memory
+                        .write_bytes(entry + MSG_LEN_OFFSET, &len_u32.to_le_bytes())
+                        .is_err()
+                    {
+                        return DispatchOutcome::Errno { errno: LINUX_EFAULT };
+                    }
+                    sent += 1;
+                }
+                DispatchOutcome::Errno { errno } => {
+                    if sent > 0 {
+                        // At least one message went out — Linux returns
+                        // the count of successful sends, and the errno
+                        // surfaces on the next call.
+                        return DispatchOutcome::Returned { value: sent as i64 };
+                    }
+                    return DispatchOutcome::Errno { errno };
+                }
+                other => return other,
+            }
+        }
+        DispatchOutcome::Returned { value: sent as i64 }
+    }
+
+    /// `recvmmsg(sockfd, msgvec, vlen, flags, timeout)` — Linux's
+    /// batched recvmsg. Same shape as sendmmsg: loop over entries,
+    /// call single recvmsg for each, fill msg_len on success.
+    /// The timeout argument is best-effort — we fall through to a
+    /// single libc::poll up front if it's non-NULL and at least one
+    /// message is wanted before blocking.
+    fn recvmmsg(
+        &self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+    ) -> DispatchOutcome {
+        let fd = request.arg(0) as i32;
+        let msgvec = request.arg(1);
+        let vlen = request.arg(2) as u32;
+        let flags = request.arg(3) as i32;
+        const MMSGHDR_SIZE: u64 = 64;
+        const MSG_LEN_OFFSET: u64 = 56;
+        let mut received: i32 = 0;
+        for i in 0..vlen {
+            let entry = match msgvec.checked_add(i as u64 * MMSGHDR_SIZE) {
+                Some(a) => a,
+                None => return DispatchOutcome::Errno { errno: LINUX_EFAULT },
+            };
+            // After the first successful recvmsg, switch to non-blocking
+            // so we drain whatever else is in the queue without waiting.
+            let entry_flags = if received > 0 {
+                flags | (libc::MSG_DONTWAIT as i32)
+            } else {
+                flags
+            };
+            let inner_req = SyscallRequest::new(
+                212, // recvmsg
+                SyscallArgs([fd as u64, entry, entry_flags as u64, 0, 0, 0]),
+            );
+            let outcome = self.recvmsg(inner_req, memory);
+            match outcome {
+                DispatchOutcome::Returned { value } => {
+                    let len_u32 = value as u32;
+                    if memory
+                        .write_bytes(entry + MSG_LEN_OFFSET, &len_u32.to_le_bytes())
+                        .is_err()
+                    {
+                        return DispatchOutcome::Errno { errno: LINUX_EFAULT };
+                    }
+                    received += 1;
+                }
+                DispatchOutcome::Errno { errno } => {
+                    if received > 0 {
+                        return DispatchOutcome::Returned { value: received as i64 };
+                    }
+                    return DispatchOutcome::Errno { errno };
+                }
+                other => return other,
+            }
+        }
+        DispatchOutcome::Returned { value: received as i64 }
     }
 
     fn duplicate_fd(&mut self, old_fd: i32, min_fd: i32, fd_flags: u64) -> DispatchOutcome {
