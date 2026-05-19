@@ -129,6 +129,7 @@ build_fixture "pipe_dup3_exec.rs" "carrick-linux-aarch64-pipe-dup3-exec"
 build_fixture "read_then_write_via_stdio.rs" "carrick-linux-aarch64-read-then-write-via-stdio"
 build_fixture "two_pipes_dup3_exec.rs" "carrick-linux-aarch64-two-pipes-dup3-exec"
 build_fixture "udp_dns.rs" "carrick-linux-aarch64-udp-dns"
+build_fixture "udp_dns_debian.rs" "carrick-linux-aarch64-udp-dns-debian"
 build_pie_fixture "pie_hello.rs" "carrick-linux-aarch64-pie-hello"
 
 cargo metadata \
