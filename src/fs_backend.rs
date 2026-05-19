@@ -513,20 +513,18 @@ impl FsBackend for HostFsBackend {
         }
         let rel = Self::rel_path(&normalized)?;
         let meta = self.dir.symlink_metadata(rel).ok()?;
+        // After seed_from_rootfs the whole rootfs lives on disk under
+        // the cap-std root, so we no longer gate by `known_files` /
+        // `dirs_created`. Every file/dir present in the sandbox is
+        // authoritative — that's the "rootfs on host APFS" architecture.
         if meta.is_dir() {
-            // Only report as overlay-owned if the guest created it.
-            if self.dirs_created.contains(&normalized) {
-                return Some(OverlayEntry::Dir);
-            }
-            return None;
+            return Some(OverlayEntry::Dir);
         }
         if meta.is_file() {
-            if self.known_files.contains(&normalized) {
-                let mut buf = Vec::with_capacity(meta.len() as usize);
-                let mut file = self.dir.open(rel).ok()?;
-                file.read_to_end(&mut buf).ok()?;
-                return Some(OverlayEntry::File(buf));
-            }
+            let mut buf = Vec::with_capacity(meta.len() as usize);
+            let mut file = self.dir.open(rel).ok()?;
+            file.read_to_end(&mut buf).ok()?;
+            return Some(OverlayEntry::File(buf));
         }
         None
     }
@@ -538,10 +536,10 @@ impl FsBackend for HostFsBackend {
         }
         let rel = Self::rel_path(&normalized)?;
         let meta = self.dir.symlink_metadata(rel).ok()?;
-        if meta.is_dir() && self.dirs_created.contains(&normalized) {
+        if meta.is_dir() {
             return Some(OverlayEntryKind::Dir);
         }
-        if meta.is_file() && self.known_files.contains(&normalized) {
+        if meta.is_file() {
             return Some(OverlayEntryKind::File);
         }
         None
@@ -551,19 +549,23 @@ impl FsBackend for HostFsBackend {
         let normalized = normalize(path)?;
         let rel = Self::rel_path(&normalized)?;
         let meta = self.dir.symlink_metadata(rel).ok()?;
-        if meta.is_dir() && self.dirs_created.contains(&normalized) {
+        let mode = {
+            use cap_std::fs::MetadataExt;
+            meta.mode() & 0o7777
+        };
+        if meta.is_dir() {
             return Some(RootFsMetadata {
                 path: normalized,
                 kind: RootFsEntryKind::Directory,
-                mode: 0o755,
+                mode: if mode == 0 { 0o755 } else { mode },
                 size: 0,
             });
         }
-        if meta.is_file() && self.known_files.contains(&normalized) {
+        if meta.is_file() {
             return Some(RootFsMetadata {
                 path: normalized,
                 kind: RootFsEntryKind::File,
-                mode: 0o644,
+                mode: if mode == 0 { 0o644 } else { mode },
                 size: meta.len() as usize,
             });
         }
@@ -572,9 +574,6 @@ impl FsBackend for HostFsBackend {
 
     fn file_contents(&self, path: &str) -> Option<Vec<u8>> {
         let normalized = normalize(path)?;
-        if !self.known_files.contains(&normalized) {
-            return None;
-        }
         let rel = Self::rel_path(&normalized)?;
         let mut buf = Vec::new();
         let mut file = self.dir.open(rel).ok()?;
