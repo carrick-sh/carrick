@@ -17,3 +17,4 @@ pub mod rootfs;
 pub mod runtime;
 pub mod syscall;
 pub mod trap;
+pub mod vfs;
