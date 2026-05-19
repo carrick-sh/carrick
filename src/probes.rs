@@ -24,6 +24,13 @@ mod carrick_usdt {
     /// restored the snapshot. `pid` is the libc::fork return value
     /// (0 in the child, child pid in the parent).
     fn fork__post(_: i32, _: u64, _: u64) {}
+    /// Fires every time the trap engine returns from `vcpu.run` with
+    /// a syscall exit. Args are the guest's EL0 PC at the trap (taken
+    /// from ELR_EL1, which HVF sets to instruction-after-svc), the
+    /// syscall number from x8, and x0 (first arg / clone retval).
+    /// Lower overhead than `syscall-entry` for cases where you only
+    /// want to spot loops.
+    fn vcpu__trap(_: u64, _: u64, _: u64) {}
 }
 
 pub fn fork_pre(pc: u64, elr: u64, cpsr: u64) {
@@ -32,6 +39,10 @@ pub fn fork_pre(pc: u64, elr: u64, cpsr: u64) {
 
 pub fn fork_post(pid: i32, pc: u64, elr: u64) {
     carrick_usdt::fork__post!(|| (pid, pc, elr));
+}
+
+pub fn vcpu_trap(guest_pc: u64, x8: u64, x0: u64) {
+    carrick_usdt::vcpu__trap!(|| (guest_pc, x8, x0));
 }
 
 pub fn register_dtrace_probes() -> Result<(), usdt::Error> {
