@@ -126,6 +126,69 @@ impl RootFs {
         }
     }
 
+    /// Materialise the in-memory rootfs onto a real on-disk directory.
+    /// This is what gets carrick out of "overlay on top of read-only
+    /// in-memory tar" and onto "real filesystem owns everything" — the
+    /// architectural shift the project moved to when apt's downstream
+    /// fs ops (symlinkat, atomic rename, gpgv subprocess, ...) needed
+    /// real kernel semantics instead of bespoke overlay logic.
+    ///
+    /// Directories are created first (sorted by depth so parents land
+    /// before children), then regular files, then symlinks. The
+    /// destination dir must exist and be empty (caller's job).
+    ///
+    /// Files are written with their stored permission bits. Symlinks
+    /// use the as-stored target text (preserving relative vs absolute
+    /// shape) — `clonefile(2)`-style identity would be ideal but works
+    /// transparently here since we're laying down fresh inodes.
+    pub fn extract_to_disk(&self, dest: &Path) -> Result<(), RootFsError> {
+        use std::os::unix::fs::PermissionsExt;
+        // Directories: process shallowest first.
+        let mut dirs: Vec<&PathBuf> = self.directories.iter().collect();
+        dirs.sort_by_key(|p| p.components().count());
+        for d in dirs {
+            let host = dest.join(d);
+            std::fs::create_dir_all(&host)?;
+        }
+        // Files.
+        for (path, entry) in &self.files {
+            let host = dest.join(path);
+            if let Some(parent) = host.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&host, &entry.contents)?;
+            let _ = std::fs::set_permissions(
+                &host,
+                std::fs::Permissions::from_mode(entry.mode),
+            );
+        }
+        // Symlinks last (target paths might point at files we just wrote).
+        for (link_path, entry) in &self.symlinks {
+            let host = dest.join(link_path);
+            if let Some(parent) = host.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            // If the link path already exists (e.g. parent created it as a dir),
+            // remove first.
+            let _ = std::fs::remove_file(&host);
+            std::os::unix::fs::symlink(&entry.target_text, &host)?;
+        }
+        Ok(())
+    }
+
+    /// Every path the rootfs holds, regardless of kind. Used by
+    /// HostFsBackend's seed step to register the materialised view so
+    /// dispatcher lookups stop falling through to the in-memory RootFs.
+    pub fn all_paths(&self) -> Vec<PathBuf> {
+        let mut out = Vec::with_capacity(
+            self.files.len() + self.directories.len() + self.symlinks.len(),
+        );
+        out.extend(self.files.keys().cloned());
+        out.extend(self.directories.iter().cloned());
+        out.extend(self.symlinks.keys().cloned());
+        out
+    }
+
     pub fn read(&self, path: impl AsRef<Path>) -> Result<Vec<u8>, RootFsError> {
         let path = normalize_rootfs_path(path.as_ref())?;
         let path = self.resolve_symlink(&path, 0)?;
