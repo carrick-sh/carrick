@@ -37,6 +37,17 @@ pub const LINUX_EPIPE: i32 = 32;
 pub const LINUX_ESPIPE: i32 = 29;
 pub const LINUX_EROFS: i32 = 30;
 pub const LINUX_ENOTSUP: i32 = 95;
+pub const LINUX_ENOTSOCK: i32 = 88;
+pub const LINUX_ENOPROTOOPT: i32 = 92;
+// Linux's `type & SOCK_NONBLOCK` and `& SOCK_CLOEXEC` bits sit in the
+// type argument to socket(2)/socketpair(2)/accept4(2). macOS doesn't
+// have these; we strip them before calling libc and apply the effect
+// (O_NONBLOCK, FD_CLOEXEC) by hand.
+pub const LINUX_SOCK_NONBLOCK: i32 = 0o4000;
+pub const LINUX_SOCK_CLOEXEC: i32 = 0o2000000;
+// Linux `sockaddr_storage` is 128 bytes. We use the same upper bound
+// when round-tripping addresses through host syscalls.
+pub const LINUX_SOCKADDR_STORAGE_SIZE: usize = 128;
 pub const LINUX_FALLOC_FL_KEEP_SIZE: u64 = 0x01;
 pub const LINUX_FALLOC_FL_PUNCH_HOLE: u64 = 0x02;
 pub const LINUX_FALLOC_FL_COLLAPSE_RANGE: u64 = 0x08;
@@ -445,6 +456,17 @@ enum OpenDescription {
         is_read_end: bool,
         status_flags: u64,
     },
+    /// Host BSD socket backed by a real macOS file descriptor.
+    /// Survives `libc::fork(2)`; the `family`/`type_` fields capture
+    /// the *Linux* AF_* / SOCK_* values the guest asked for so that
+    /// subsequent socket syscalls (sockaddr translation, getsockopt
+    /// SO_TYPE, etc.) can answer in Linux terms.
+    HostSocket {
+        host_fd: i32,
+        family: i32,
+        type_: i32,
+        status_flags: u64,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -494,7 +516,8 @@ impl OpenDescription {
             | OpenDescription::Epoll { status_flags, .. }
             | OpenDescription::PipeReader { status_flags, .. }
             | OpenDescription::PipeWriter { status_flags, .. }
-            | OpenDescription::HostPipe { status_flags, .. } => *status_flags,
+            | OpenDescription::HostPipe { status_flags, .. }
+            | OpenDescription::HostSocket { status_flags, .. } => *status_flags,
         }
     }
 
@@ -508,7 +531,8 @@ impl OpenDescription {
             | OpenDescription::Epoll { status_flags, .. }
             | OpenDescription::PipeReader { status_flags, .. }
             | OpenDescription::PipeWriter { status_flags, .. }
-            | OpenDescription::HostPipe { status_flags, .. } => *status_flags = next,
+            | OpenDescription::HostPipe { status_flags, .. }
+            | OpenDescription::HostSocket { status_flags, .. } => *status_flags = next,
         }
     }
 }
@@ -710,6 +734,21 @@ impl SyscallDispatcher {
             174..=177 => DispatchOutcome::Returned { value: 0 },
             178 => self.getpid(),
             179 => self.sysinfo(request, memory),
+            198 => self.socket(request),
+            199 => self.socketpair(request, memory),
+            200 => self.bind(request, memory),
+            201 => self.listen(request),
+            202 => self.accept(request, memory),
+            203 => self.connect(request, memory),
+            204 => self.getsockname(request, memory),
+            205 => self.getpeername(request, memory),
+            206 => self.sendto(request, memory),
+            207 => self.recvfrom(request, memory),
+            208 => self.setsockopt(request, memory),
+            209 => self.getsockopt(request, memory),
+            210 => self.shutdown(request),
+            211 => self.sendmsg(request, memory),
+            212 => self.recvmsg(request, memory),
             214 => self.brk(request),
             215 => self.munmap(request),
             216 => self.mremap(request),
@@ -724,6 +763,7 @@ impl SyscallDispatcher {
             231 => self.munlockall(),
             232 => self.mincore(request, memory),
             233 => self.madvise(request, memory),
+            242 => self.accept4(request, memory),
             260 => self.wait4(request, memory),
             261 => self.prlimit64(request, memory),
             266 => self.clock_adjtime(request, memory),
@@ -891,7 +931,8 @@ impl SyscallDispatcher {
             | OpenDescription::Epoll { .. }
             | OpenDescription::PipeReader { .. }
             | OpenDescription::PipeWriter { .. }
-            | OpenDescription::HostPipe { .. } => synthetic_readonly_access(mode),
+            | OpenDescription::HostPipe { .. }
+            | OpenDescription::HostSocket { .. } => synthetic_readonly_access(mode),
         }
     }
 
@@ -949,7 +990,8 @@ impl SyscallDispatcher {
             | OpenDescription::Epoll { .. }
             | OpenDescription::PipeReader { .. }
             | OpenDescription::PipeWriter { .. }
-            | OpenDescription::HostPipe { .. } => DispatchOutcome::Errno {
+            | OpenDescription::HostPipe { .. }
+            | OpenDescription::HostSocket { .. } => DispatchOutcome::Errno {
                 errno: LINUX_ENOTDIR,
             },
         }
@@ -1462,6 +1504,36 @@ impl SyscallDispatcher {
                 // host fd. For now report nothing ready and let the
                 // guest block in a real read/write.
             }
+            OpenDescription::HostSocket { host_fd, .. } => {
+                // Poll the real host fd so the guest's poll loop reflects
+                // actual kernel readiness for the socket.
+                let mut pfd = libc::pollfd {
+                    fd: *host_fd,
+                    events: 0,
+                    revents: 0,
+                };
+                if requested_events & LINUX_POLLIN != 0 {
+                    pfd.events |= libc::POLLIN;
+                }
+                if requested_events & LINUX_POLLOUT != 0 {
+                    pfd.events |= libc::POLLOUT;
+                }
+                let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+                if rc > 0 {
+                    if pfd.revents & libc::POLLIN != 0 {
+                        ready |= LINUX_POLLIN;
+                    }
+                    if pfd.revents & libc::POLLOUT != 0 {
+                        ready |= LINUX_POLLOUT;
+                    }
+                    if pfd.revents & libc::POLLERR != 0 {
+                        ready |= LINUX_POLLERR;
+                    }
+                    if pfd.revents & libc::POLLHUP != 0 {
+                        ready |= LINUX_POLLHUP;
+                    }
+                }
+            }
         }
         ready
     }
@@ -1604,6 +1676,9 @@ impl SyscallDispatcher {
                         DispatchOutcome::Returned {
                             value: LINUX_PIPE_BUF_SIZE,
                         }
+                    }
+                    OpenDescription::HostSocket { .. } => {
+                        DispatchOutcome::Errno { errno: LINUX_EBADF }
                     }
                     _ => DispatchOutcome::Errno { errno: LINUX_EBADF },
                 }
@@ -1920,6 +1995,7 @@ impl SyscallDispatcher {
             | OpenDescription::EventFd { .. }
             | OpenDescription::TimerFd { .. }
             | OpenDescription::HostPipe { .. }
+            | OpenDescription::HostSocket { .. }
             | OpenDescription::Epoll { .. } => LINUX_ESPIPE,
         };
         DispatchOutcome::Errno { errno }
@@ -1950,6 +2026,7 @@ impl SyscallDispatcher {
             | OpenDescription::EventFd { .. }
             | OpenDescription::TimerFd { .. }
             | OpenDescription::HostPipe { .. }
+            | OpenDescription::HostSocket { .. }
             | OpenDescription::Epoll { .. } => LINUX_EINVAL,
         };
         DispatchOutcome::Errno { errno }
@@ -3114,6 +3191,752 @@ impl SyscallDispatcher {
         }
     }
 
+    // ------------------------------------------------------------------
+    // BSD sockets.
+    //
+    // The host kernel does the heavy lifting: we allocate a real macOS
+    // socket via `libc::socket(2)` and stash the host fd inside
+    // `OpenDescription::HostSocket`. Subsequent socket syscalls translate
+    // their Linux-flavoured arguments (sockaddr layouts, flag bits) into
+    // BSD shape, dispatch to libc, and translate replies back. Files
+    // mostly stay 1:1 — Linux and macOS BSD socket constants align for
+    // AF_INET, AF_INET6, AF_UNIX and the common SOCK_* / MSG_* values.
+    // The notable mismatches are:
+    //   - SOCK_NONBLOCK / SOCK_CLOEXEC bits in `type`         (Linux-only)
+    //   - sockaddr_in / sockaddr_un layout (BSD has sin_len)  (BSD-only)
+    //   - many Linux-specific `SOL_*` levels                  (we ENOPROTOOPT)
+    // ------------------------------------------------------------------
+
+    fn socket(&mut self, request: SyscallRequest) -> DispatchOutcome {
+        let family = request.arg(0) as i32;
+        let type_ = request.arg(1) as i32;
+        let protocol = request.arg(2) as i32;
+        self.host_socket_install(family, type_, protocol)
+    }
+
+    fn host_socket_install(
+        &mut self,
+        family: i32,
+        type_: i32,
+        protocol: i32,
+    ) -> DispatchOutcome {
+        // Strip the Linux-only SOCK_NONBLOCK / SOCK_CLOEXEC bits before
+        // we hand the type to macOS, then set them on the resulting fd
+        // by hand.
+        let nonblock = type_ & LINUX_SOCK_NONBLOCK != 0;
+        let cloexec = type_ & LINUX_SOCK_CLOEXEC != 0;
+        let base_type = type_ & !(LINUX_SOCK_NONBLOCK | LINUX_SOCK_CLOEXEC);
+        let host_family = linux_to_host_af(family);
+        let host_type = linux_to_host_socktype(base_type);
+        let host_fd = unsafe { libc::socket(host_family, host_type, protocol) };
+        if host_fd < 0 {
+            return DispatchOutcome::Errno { errno: host_errno() };
+        }
+        if nonblock {
+            unsafe {
+                let flags = libc::fcntl(host_fd, libc::F_GETFL);
+                if flags >= 0 {
+                    libc::fcntl(host_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                }
+            }
+        }
+        let status_flags = if nonblock { LINUX_O_NONBLOCK } else { 0 };
+        let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };
+        let Some(linux_fd) = self.allocate_fd(3) else {
+            unsafe { libc::close(host_fd); }
+            return DispatchOutcome::Errno { errno: LINUX_EINVAL };
+        };
+        self.insert_open_file(
+            linux_fd,
+            OpenFile {
+                description: Rc::new(RefCell::new(OpenDescription::HostSocket {
+                    host_fd,
+                    family,
+                    type_: base_type,
+                    status_flags,
+                })),
+                fd_flags,
+            },
+        );
+        DispatchOutcome::Returned { value: linux_fd as i64 }
+    }
+
+    fn socketpair(
+        &mut self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+    ) -> DispatchOutcome {
+        let family = request.arg(0) as i32;
+        let type_ = request.arg(1) as i32;
+        let protocol = request.arg(2) as i32;
+        let sv_addr = request.arg(3);
+        let nonblock = type_ & LINUX_SOCK_NONBLOCK != 0;
+        let cloexec = type_ & LINUX_SOCK_CLOEXEC != 0;
+        let base_type = type_ & !(LINUX_SOCK_NONBLOCK | LINUX_SOCK_CLOEXEC);
+        let host_family = linux_to_host_af(family);
+        let host_type = linux_to_host_socktype(base_type);
+
+        let mut host_fds: [i32; 2] = [-1, -1];
+        let rc = unsafe {
+            libc::socketpair(host_family, host_type, protocol, host_fds.as_mut_ptr())
+        };
+        if rc != 0 {
+            return DispatchOutcome::Errno { errno: host_errno() };
+        }
+        if nonblock {
+            for fd in &host_fds {
+                unsafe {
+                    let flags = libc::fcntl(*fd, libc::F_GETFL);
+                    if flags >= 0 {
+                        libc::fcntl(*fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                    }
+                }
+            }
+        }
+        let status_flags = if nonblock { LINUX_O_NONBLOCK } else { 0 };
+        let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };
+        let Some(read_fd) = self.allocate_fd(3) else {
+            unsafe { libc::close(host_fds[0]); libc::close(host_fds[1]); }
+            return DispatchOutcome::Errno { errno: LINUX_EINVAL };
+        };
+        let Some(write_fd) = self.allocate_fd(read_fd.saturating_add(1)) else {
+            unsafe { libc::close(host_fds[0]); libc::close(host_fds[1]); }
+            return DispatchOutcome::Errno { errno: LINUX_EINVAL };
+        };
+        let pair = LinuxFdPair { read_fd, write_fd };
+        if memory.write_bytes(sv_addr, pair.as_bytes()).is_err() {
+            unsafe { libc::close(host_fds[0]); libc::close(host_fds[1]); }
+            return DispatchOutcome::Errno { errno: LINUX_EFAULT };
+        }
+        self.insert_open_file(
+            read_fd,
+            OpenFile {
+                description: Rc::new(RefCell::new(OpenDescription::HostSocket {
+                    host_fd: host_fds[0],
+                    family,
+                    type_: base_type,
+                    status_flags,
+                })),
+                fd_flags,
+            },
+        );
+        self.insert_open_file(
+            write_fd,
+            OpenFile {
+                description: Rc::new(RefCell::new(OpenDescription::HostSocket {
+                    host_fd: host_fds[1],
+                    family,
+                    type_: base_type,
+                    status_flags,
+                })),
+                fd_flags,
+            },
+        );
+        DispatchOutcome::Returned { value: 0 }
+    }
+
+    /// Pull a (host_fd, family) pair out of the dispatcher's fd table.
+    fn host_socket_lookup(&self, fd: i32) -> Result<(i32, i32), i32> {
+        let Some(open_file) = self.open_files.get(&fd) else {
+            return Err(LINUX_EBADF);
+        };
+        let open = open_file.description.borrow();
+        match &*open {
+            OpenDescription::HostSocket { host_fd, family, .. } => Ok((*host_fd, *family)),
+            _ => Err(LINUX_ENOTSOCK),
+        }
+    }
+
+    fn bind(&self, request: SyscallRequest, memory: &impl GuestMemory) -> DispatchOutcome {
+        let fd = request.arg(0) as i32;
+        let addr_addr = request.arg(1);
+        let addrlen = request.arg(2) as u32;
+        let (host_fd, family) = match self.host_socket_lookup(fd) {
+            Ok(t) => t,
+            Err(errno) => return DispatchOutcome::Errno { errno },
+        };
+        let host_addr = match read_linux_sockaddr(memory, addr_addr, addrlen, family) {
+            Ok(bytes) => bytes,
+            Err(errno) => return DispatchOutcome::Errno { errno },
+        };
+        let rc = unsafe {
+            libc::bind(host_fd, host_addr.as_ptr() as *const _, host_addr.len() as u32)
+        };
+        if rc < 0 {
+            DispatchOutcome::Errno { errno: host_errno() }
+        } else {
+            DispatchOutcome::Returned { value: 0 }
+        }
+    }
+
+    fn listen(&self, request: SyscallRequest) -> DispatchOutcome {
+        let fd = request.arg(0) as i32;
+        let backlog = request.arg(1) as i32;
+        let (host_fd, _family) = match self.host_socket_lookup(fd) {
+            Ok(t) => t,
+            Err(errno) => return DispatchOutcome::Errno { errno },
+        };
+        let rc = unsafe { libc::listen(host_fd, backlog) };
+        if rc < 0 {
+            DispatchOutcome::Errno { errno: host_errno() }
+        } else {
+            DispatchOutcome::Returned { value: 0 }
+        }
+    }
+
+    fn accept(
+        &mut self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+    ) -> DispatchOutcome {
+        self.accept_common(request, memory, 0)
+    }
+
+    fn accept4(
+        &mut self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+    ) -> DispatchOutcome {
+        let flags = request.arg(3) as i32;
+        self.accept_common(request, memory, flags)
+    }
+
+    fn accept_common(
+        &mut self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+        accept4_flags: i32,
+    ) -> DispatchOutcome {
+        let fd = request.arg(0) as i32;
+        let addr_addr = request.arg(1);
+        let addrlen_addr = request.arg(2);
+        let (host_fd, family, type_) = {
+            let Some(open_file) = self.open_files.get(&fd) else {
+                return DispatchOutcome::Errno { errno: LINUX_EBADF };
+            };
+            match &*open_file.description.borrow() {
+                OpenDescription::HostSocket { host_fd, family, type_, .. } => {
+                    (*host_fd, *family, *type_)
+                }
+                _ => return DispatchOutcome::Errno { errno: LINUX_ENOTSOCK },
+            }
+        };
+        let mut sa_storage = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
+        let mut sa_len: libc::socklen_t = sa_storage.len() as libc::socklen_t;
+        let new_host = unsafe {
+            libc::accept(
+                host_fd,
+                sa_storage.as_mut_ptr() as *mut _,
+                &mut sa_len as *mut _,
+            )
+        };
+        if new_host < 0 {
+            return DispatchOutcome::Errno { errno: host_errno() };
+        }
+        let nonblock = accept4_flags & LINUX_SOCK_NONBLOCK as i32 != 0;
+        let cloexec = accept4_flags & LINUX_SOCK_CLOEXEC as i32 != 0;
+        if nonblock {
+            unsafe {
+                let flags = libc::fcntl(new_host, libc::F_GETFL);
+                if flags >= 0 {
+                    libc::fcntl(new_host, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                }
+            }
+        }
+        if addr_addr != 0 && addrlen_addr != 0 {
+            let used = (sa_len as usize).min(sa_storage.len());
+            let linux_bytes = host_to_linux_sockaddr(&sa_storage[..used], family);
+            if write_linux_sockaddr(memory, addr_addr, addrlen_addr, &linux_bytes).is_err() {
+                unsafe { libc::close(new_host); }
+                return DispatchOutcome::Errno { errno: LINUX_EFAULT };
+            }
+        }
+        let status_flags = if nonblock { LINUX_O_NONBLOCK } else { 0 };
+        let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };
+        let Some(linux_fd) = self.allocate_fd(3) else {
+            unsafe { libc::close(new_host); }
+            return DispatchOutcome::Errno { errno: LINUX_EINVAL };
+        };
+        self.insert_open_file(
+            linux_fd,
+            OpenFile {
+                description: Rc::new(RefCell::new(OpenDescription::HostSocket {
+                    host_fd: new_host,
+                    family,
+                    type_,
+                    status_flags,
+                })),
+                fd_flags,
+            },
+        );
+        DispatchOutcome::Returned { value: linux_fd as i64 }
+    }
+
+    fn connect(&self, request: SyscallRequest, memory: &impl GuestMemory) -> DispatchOutcome {
+        let fd = request.arg(0) as i32;
+        let addr_addr = request.arg(1);
+        let addrlen = request.arg(2) as u32;
+        let (host_fd, family) = match self.host_socket_lookup(fd) {
+            Ok(t) => t,
+            Err(errno) => return DispatchOutcome::Errno { errno },
+        };
+        let host_addr = match read_linux_sockaddr(memory, addr_addr, addrlen, family) {
+            Ok(bytes) => bytes,
+            Err(errno) => return DispatchOutcome::Errno { errno },
+        };
+        let rc = unsafe {
+            libc::connect(host_fd, host_addr.as_ptr() as *const _, host_addr.len() as u32)
+        };
+        if rc < 0 {
+            DispatchOutcome::Errno { errno: host_errno() }
+        } else {
+            DispatchOutcome::Returned { value: 0 }
+        }
+    }
+
+    fn getsockname(
+        &self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+    ) -> DispatchOutcome {
+        let fd = request.arg(0) as i32;
+        let addr_addr = request.arg(1);
+        let addrlen_addr = request.arg(2);
+        let (host_fd, family) = match self.host_socket_lookup(fd) {
+            Ok(t) => t,
+            Err(errno) => return DispatchOutcome::Errno { errno },
+        };
+        let mut sa = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
+        let mut sa_len: libc::socklen_t = sa.len() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockname(host_fd, sa.as_mut_ptr() as *mut _, &mut sa_len as *mut _)
+        };
+        if rc < 0 {
+            return DispatchOutcome::Errno { errno: host_errno() };
+        }
+        let used = (sa_len as usize).min(sa.len());
+        let linux_bytes = host_to_linux_sockaddr(&sa[..used], family);
+        if write_linux_sockaddr(memory, addr_addr, addrlen_addr, &linux_bytes).is_err() {
+            return DispatchOutcome::Errno { errno: LINUX_EFAULT };
+        }
+        DispatchOutcome::Returned { value: 0 }
+    }
+
+    fn getpeername(
+        &self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+    ) -> DispatchOutcome {
+        let fd = request.arg(0) as i32;
+        let addr_addr = request.arg(1);
+        let addrlen_addr = request.arg(2);
+        let (host_fd, family) = match self.host_socket_lookup(fd) {
+            Ok(t) => t,
+            Err(errno) => return DispatchOutcome::Errno { errno },
+        };
+        let mut sa = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
+        let mut sa_len: libc::socklen_t = sa.len() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getpeername(host_fd, sa.as_mut_ptr() as *mut _, &mut sa_len as *mut _)
+        };
+        if rc < 0 {
+            return DispatchOutcome::Errno { errno: host_errno() };
+        }
+        let used = (sa_len as usize).min(sa.len());
+        let linux_bytes = host_to_linux_sockaddr(&sa[..used], family);
+        if write_linux_sockaddr(memory, addr_addr, addrlen_addr, &linux_bytes).is_err() {
+            return DispatchOutcome::Errno { errno: LINUX_EFAULT };
+        }
+        DispatchOutcome::Returned { value: 0 }
+    }
+
+    fn sendto(
+        &self,
+        request: SyscallRequest,
+        memory: &impl GuestMemory,
+    ) -> DispatchOutcome {
+        let fd = request.arg(0) as i32;
+        let buf_addr = request.arg(1);
+        let len = request.arg(2) as usize;
+        let flags = request.arg(3) as i32;
+        let dest_addr = request.arg(4);
+        let dest_len = request.arg(5) as u32;
+        let (host_fd, family) = match self.host_socket_lookup(fd) {
+            Ok(t) => t,
+            Err(errno) => return DispatchOutcome::Errno { errno },
+        };
+        let bytes = match memory.read_bytes(buf_addr, len) {
+            Ok(bytes) => bytes,
+            Err(_) => return DispatchOutcome::Errno { errno: LINUX_EFAULT },
+        };
+        let host_flags = linux_to_host_msg_flags(flags);
+        let n = if dest_addr == 0 {
+            unsafe {
+                libc::sendto(
+                    host_fd,
+                    bytes.as_ptr() as *const _,
+                    bytes.len(),
+                    host_flags,
+                    std::ptr::null(),
+                    0,
+                )
+            }
+        } else {
+            let host_addr = match read_linux_sockaddr(memory, dest_addr, dest_len, family) {
+                Ok(b) => b,
+                Err(errno) => return DispatchOutcome::Errno { errno },
+            };
+            unsafe {
+                libc::sendto(
+                    host_fd,
+                    bytes.as_ptr() as *const _,
+                    bytes.len(),
+                    host_flags,
+                    host_addr.as_ptr() as *const _,
+                    host_addr.len() as u32,
+                )
+            }
+        };
+        if n < 0 {
+            DispatchOutcome::Errno { errno: host_errno() }
+        } else {
+            DispatchOutcome::Returned { value: n as i64 }
+        }
+    }
+
+    fn recvfrom(
+        &self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+    ) -> DispatchOutcome {
+        let fd = request.arg(0) as i32;
+        let buf_addr = request.arg(1);
+        let len = request.arg(2) as usize;
+        let flags = request.arg(3) as i32;
+        let src_addr = request.arg(4);
+        let src_len_addr = request.arg(5);
+        let (host_fd, family) = match self.host_socket_lookup(fd) {
+            Ok(t) => t,
+            Err(errno) => return DispatchOutcome::Errno { errno },
+        };
+        let host_flags = linux_to_host_msg_flags(flags);
+        let mut buf = vec![0u8; len];
+        let mut sa = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
+        let mut sa_len: libc::socklen_t = sa.len() as libc::socklen_t;
+        let (n, used_addr) = if src_addr == 0 {
+            let n = unsafe {
+                libc::recvfrom(
+                    host_fd,
+                    buf.as_mut_ptr() as *mut _,
+                    buf.len(),
+                    host_flags,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            (n, false)
+        } else {
+            let n = unsafe {
+                libc::recvfrom(
+                    host_fd,
+                    buf.as_mut_ptr() as *mut _,
+                    buf.len(),
+                    host_flags,
+                    sa.as_mut_ptr() as *mut _,
+                    &mut sa_len as *mut _,
+                )
+            };
+            (n, true)
+        };
+        if n < 0 {
+            return DispatchOutcome::Errno { errno: host_errno() };
+        }
+        if n > 0 {
+            let bytes = &buf[..n as usize];
+            if memory.write_bytes(buf_addr, bytes).is_err() {
+                return DispatchOutcome::Errno { errno: LINUX_EFAULT };
+            }
+        }
+        if used_addr && src_addr != 0 && src_len_addr != 0 {
+            let used = (sa_len as usize).min(sa.len());
+            let linux_bytes = host_to_linux_sockaddr(&sa[..used], family);
+            if write_linux_sockaddr(memory, src_addr, src_len_addr, &linux_bytes).is_err() {
+                return DispatchOutcome::Errno { errno: LINUX_EFAULT };
+            }
+        }
+        DispatchOutcome::Returned { value: n as i64 }
+    }
+
+    fn setsockopt(
+        &self,
+        request: SyscallRequest,
+        memory: &impl GuestMemory,
+    ) -> DispatchOutcome {
+        let fd = request.arg(0) as i32;
+        let level = request.arg(1) as i32;
+        let optname = request.arg(2) as i32;
+        let optval_addr = request.arg(3);
+        let optlen = request.arg(4) as u32;
+        let (host_fd, _family) = match self.host_socket_lookup(fd) {
+            Ok(t) => t,
+            Err(errno) => return DispatchOutcome::Errno { errno },
+        };
+        let (host_level, host_opt) = match linux_to_host_sockopt(level, optname) {
+            Some(t) => t,
+            None => return DispatchOutcome::Errno { errno: LINUX_ENOPROTOOPT },
+        };
+        let bytes = if optval_addr == 0 || optlen == 0 {
+            Vec::new()
+        } else {
+            match memory.read_bytes(optval_addr, optlen as usize) {
+                Ok(b) => b,
+                Err(_) => return DispatchOutcome::Errno { errno: LINUX_EFAULT },
+            }
+        };
+        let rc = unsafe {
+            libc::setsockopt(
+                host_fd,
+                host_level,
+                host_opt,
+                if bytes.is_empty() {
+                    std::ptr::null()
+                } else {
+                    bytes.as_ptr() as *const _
+                },
+                bytes.len() as u32,
+            )
+        };
+        if rc < 0 {
+            // Linux apps frequently set options that aren't supported on
+            // macOS (eg IP_MTU_DISCOVER); swallow ENOPROTOOPT silently
+            // when the equivalent option simply doesn't exist on macOS.
+            DispatchOutcome::Errno { errno: host_errno() }
+        } else {
+            DispatchOutcome::Returned { value: 0 }
+        }
+    }
+
+    fn getsockopt(
+        &self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+    ) -> DispatchOutcome {
+        let fd = request.arg(0) as i32;
+        let level = request.arg(1) as i32;
+        let optname = request.arg(2) as i32;
+        let optval_addr = request.arg(3);
+        let optlen_addr = request.arg(4);
+        let (host_fd, _family) = match self.host_socket_lookup(fd) {
+            Ok(t) => t,
+            Err(errno) => return DispatchOutcome::Errno { errno },
+        };
+        let (host_level, host_opt) = match linux_to_host_sockopt(level, optname) {
+            Some(t) => t,
+            None => return DispatchOutcome::Errno { errno: LINUX_ENOPROTOOPT },
+        };
+        // Read the guest's reported optlen so we don't overflow.
+        let optlen_bytes = match memory.read_bytes(optlen_addr, 4) {
+            Ok(b) => b,
+            Err(_) => return DispatchOutcome::Errno { errno: LINUX_EFAULT },
+        };
+        let mut optlen = u32::from_ne_bytes([
+            optlen_bytes[0], optlen_bytes[1], optlen_bytes[2], optlen_bytes[3],
+        ]);
+        let cap = optlen.min(256) as usize;
+        let mut buf = vec![0u8; cap];
+        let rc = unsafe {
+            libc::getsockopt(
+                host_fd,
+                host_level,
+                host_opt,
+                buf.as_mut_ptr() as *mut _,
+                &mut optlen as *mut _,
+            )
+        };
+        if rc < 0 {
+            return DispatchOutcome::Errno { errno: host_errno() };
+        }
+        let used = (optlen as usize).min(buf.len());
+        if optval_addr != 0 && used > 0 {
+            if memory.write_bytes(optval_addr, &buf[..used]).is_err() {
+                return DispatchOutcome::Errno { errno: LINUX_EFAULT };
+            }
+        }
+        if memory.write_bytes(optlen_addr, &optlen.to_ne_bytes()).is_err() {
+            return DispatchOutcome::Errno { errno: LINUX_EFAULT };
+        }
+        DispatchOutcome::Returned { value: 0 }
+    }
+
+    fn shutdown(&self, request: SyscallRequest) -> DispatchOutcome {
+        let fd = request.arg(0) as i32;
+        let how = request.arg(1) as i32;
+        let (host_fd, _family) = match self.host_socket_lookup(fd) {
+            Ok(t) => t,
+            Err(errno) => return DispatchOutcome::Errno { errno },
+        };
+        let rc = unsafe { libc::shutdown(host_fd, how) };
+        if rc < 0 {
+            DispatchOutcome::Errno { errno: host_errno() }
+        } else {
+            DispatchOutcome::Returned { value: 0 }
+        }
+    }
+
+    fn sendmsg(
+        &self,
+        request: SyscallRequest,
+        memory: &impl GuestMemory,
+    ) -> DispatchOutcome {
+        let fd = request.arg(0) as i32;
+        let msg_addr = request.arg(1);
+        let flags = request.arg(3) as i32;
+        let (host_fd, family) = match self.host_socket_lookup(fd) {
+            Ok(t) => t,
+            Err(errno) => return DispatchOutcome::Errno { errno },
+        };
+        let msg = match read_linux_msghdr(memory, msg_addr) {
+            Ok(m) => m,
+            Err(errno) => return DispatchOutcome::Errno { errno },
+        };
+        let iovecs = match read_iovecs(memory, msg.iov, msg.iovlen as usize) {
+            Ok(v) => v,
+            Err(errno) => return DispatchOutcome::Errno { errno },
+        };
+        // Pack iovecs into a single contiguous send. Simple and avoids
+        // having to keep guest pointers alive across the FFI call.
+        let mut data = Vec::new();
+        for iov in iovecs {
+            let chunk = match memory.read_bytes(iov.iov_base, iov.iov_len as usize) {
+                Ok(b) => b,
+                Err(_) => return DispatchOutcome::Errno { errno: LINUX_EFAULT },
+            };
+            data.extend_from_slice(&chunk);
+        }
+        let host_flags = linux_to_host_msg_flags(flags);
+        let n = if msg.name == 0 || msg.namelen == 0 {
+            unsafe {
+                libc::sendto(
+                    host_fd,
+                    data.as_ptr() as *const _,
+                    data.len(),
+                    host_flags,
+                    std::ptr::null(),
+                    0,
+                )
+            }
+        } else {
+            let host_addr = match read_linux_sockaddr(memory, msg.name, msg.namelen, family) {
+                Ok(b) => b,
+                Err(errno) => return DispatchOutcome::Errno { errno },
+            };
+            unsafe {
+                libc::sendto(
+                    host_fd,
+                    data.as_ptr() as *const _,
+                    data.len(),
+                    host_flags,
+                    host_addr.as_ptr() as *const _,
+                    host_addr.len() as u32,
+                )
+            }
+        };
+        if n < 0 {
+            DispatchOutcome::Errno { errno: host_errno() }
+        } else {
+            DispatchOutcome::Returned { value: n as i64 }
+        }
+    }
+
+    fn recvmsg(
+        &self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+    ) -> DispatchOutcome {
+        let fd = request.arg(0) as i32;
+        let msg_addr = request.arg(1);
+        let flags = request.arg(2) as i32;
+        let (host_fd, family) = match self.host_socket_lookup(fd) {
+            Ok(t) => t,
+            Err(errno) => return DispatchOutcome::Errno { errno },
+        };
+        let msg = match read_linux_msghdr(memory, msg_addr) {
+            Ok(m) => m,
+            Err(errno) => return DispatchOutcome::Errno { errno },
+        };
+        let iovecs = match read_iovecs(memory, msg.iov, msg.iovlen as usize) {
+            Ok(v) => v,
+            Err(errno) => return DispatchOutcome::Errno { errno },
+        };
+        let total: usize = iovecs.iter().map(|iov| iov.iov_len as usize).sum();
+        let mut buf = vec![0u8; total];
+        let mut sa = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
+        let mut sa_len: libc::socklen_t = sa.len() as libc::socklen_t;
+        let n = unsafe {
+            libc::recvfrom(
+                host_fd,
+                buf.as_mut_ptr() as *mut _,
+                buf.len(),
+                linux_to_host_msg_flags(flags),
+                if msg.name == 0 { std::ptr::null_mut() } else { sa.as_mut_ptr() as *mut _ },
+                if msg.name == 0 { std::ptr::null_mut() } else { &mut sa_len as *mut _ },
+            )
+        };
+        if n < 0 {
+            return DispatchOutcome::Errno { errno: host_errno() };
+        }
+        // Scatter the received bytes back into the guest's iovecs.
+        let mut remaining = n as usize;
+        let mut cursor = 0usize;
+        for iov in iovecs {
+            if remaining == 0 {
+                break;
+            }
+            let chunk = remaining.min(iov.iov_len as usize);
+            if chunk > 0 {
+                if memory.write_bytes(iov.iov_base, &buf[cursor..cursor + chunk]).is_err() {
+                    return DispatchOutcome::Errno { errno: LINUX_EFAULT };
+                }
+                cursor += chunk;
+                remaining -= chunk;
+            }
+        }
+        if msg.name != 0 && msg.namelen != 0 {
+            let used = (sa_len as usize).min(sa.len());
+            let linux_bytes = host_to_linux_sockaddr(&sa[..used], family);
+            // Write up to msg.namelen, then update the namelen field
+            // inside the msghdr.
+            let write_len = (linux_bytes.len() as u32).min(msg.namelen);
+            if write_len > 0 {
+                if memory.write_bytes(msg.name, &linux_bytes[..write_len as usize]).is_err() {
+                    return DispatchOutcome::Errno { errno: LINUX_EFAULT };
+                }
+            }
+            // namelen lives at offset 8 (after the 8-byte name pointer).
+            if memory
+                .write_bytes(msg_addr + 8, &(linux_bytes.len() as u32).to_ne_bytes())
+                .is_err()
+            {
+                return DispatchOutcome::Errno { errno: LINUX_EFAULT };
+            }
+        }
+        // We don't translate ancillary data; report controllen=0.
+        if memory
+            .write_bytes(msg_addr + 40, &0u64.to_ne_bytes())
+            .is_err()
+        {
+            return DispatchOutcome::Errno { errno: LINUX_EFAULT };
+        }
+        // msg_flags lives at offset 48 (just after controllen).
+        if memory
+            .write_bytes(msg_addr + 48, &0i32.to_ne_bytes())
+            .is_err()
+        {
+            return DispatchOutcome::Errno { errno: LINUX_EFAULT };
+        }
+        DispatchOutcome::Returned { value: n as i64 }
+    }
+
     fn duplicate_fd(&mut self, old_fd: i32, min_fd: i32, fd_flags: u64) -> DispatchOutcome {
         let Some(open_file) = self.open_files.get(&old_fd) else {
             return DispatchOutcome::Errno { errno: LINUX_EBADF };
@@ -3239,7 +4062,8 @@ impl SyscallDispatcher {
             | OpenDescription::Epoll { .. }
             | OpenDescription::PipeReader { .. }
             | OpenDescription::PipeWriter { .. }
-            | OpenDescription::HostPipe { .. } => {
+            | OpenDescription::HostPipe { .. }
+            | OpenDescription::HostSocket { .. } => {
                 return DispatchOutcome::Errno {
                     errno: LINUX_EINVAL,
                 };
@@ -3270,7 +4094,8 @@ impl SyscallDispatcher {
             | OpenDescription::Epoll { .. }
             | OpenDescription::PipeReader { .. }
             | OpenDescription::PipeWriter { .. }
-            | OpenDescription::HostPipe { .. } => {}
+            | OpenDescription::HostPipe { .. }
+            | OpenDescription::HostSocket { .. } => {}
         }
         DispatchOutcome::Returned { value: next }
     }
@@ -3410,7 +4235,8 @@ impl SyscallDispatcher {
                 | OpenDescription::Epoll { .. }
                 | OpenDescription::PipeReader { .. }
                 | OpenDescription::PipeWriter { .. }
-            | OpenDescription::HostPipe { .. } => {
+            | OpenDescription::HostPipe { .. }
+            | OpenDescription::HostSocket { .. } => {
                     return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
                 }
             };
@@ -3767,6 +4593,9 @@ impl SyscallDispatcher {
                     errno: LINUX_EINVAL,
                 });
             }
+            OpenDescription::HostSocket { host_fd, .. } => {
+                return Ok(read_host_pipe(memory, address, length, *host_fd));
+            }
         };
         let remaining = &contents[*offset..];
         let read_len = remaining.len().min(length);
@@ -3812,7 +4641,8 @@ impl SyscallDispatcher {
             | OpenDescription::Epoll { .. }
             | OpenDescription::PipeReader { .. }
             | OpenDescription::PipeWriter { .. }
-            | OpenDescription::HostPipe { .. } => {
+            | OpenDescription::HostPipe { .. }
+            | OpenDescription::HostSocket { .. } => {
                 return Ok(DispatchOutcome::Errno {
                     errno: LINUX_EINVAL,
                 });
@@ -3849,7 +4679,8 @@ impl SyscallDispatcher {
             | OpenDescription::Epoll { .. }
             | OpenDescription::PipeReader { .. }
             | OpenDescription::PipeWriter { .. }
-            | OpenDescription::HostPipe { .. } => {
+            | OpenDescription::HostPipe { .. }
+            | OpenDescription::HostSocket { .. } => {
                 return Ok(DispatchOutcome::Errno {
                     errno: LINUX_EINVAL,
                 });
@@ -3900,7 +4731,8 @@ impl SyscallDispatcher {
             | OpenDescription::Epoll { .. }
             | OpenDescription::PipeReader { .. }
             | OpenDescription::PipeWriter { .. }
-            | OpenDescription::HostPipe { .. } => {
+            | OpenDescription::HostPipe { .. }
+            | OpenDescription::HostSocket { .. } => {
                 return Ok(DispatchOutcome::Errno {
                     errno: LINUX_EINVAL,
                 });
@@ -3949,6 +4781,7 @@ impl SyscallDispatcher {
             | OpenDescription::EventFd { .. }
             | OpenDescription::TimerFd { .. }
             | OpenDescription::HostPipe { .. }
+            | OpenDescription::HostSocket { .. }
             | OpenDescription::Epoll { .. } => LINUX_ESPIPE,
         };
         Ok(DispatchOutcome::Errno { errno })
@@ -3999,6 +4832,7 @@ impl SyscallDispatcher {
             | OpenDescription::EventFd { .. }
             | OpenDescription::TimerFd { .. }
             | OpenDescription::HostPipe { .. }
+            | OpenDescription::HostSocket { .. }
             | OpenDescription::Epoll { .. } => LINUX_ESPIPE,
         };
         Ok(DispatchOutcome::Errno { errno })
@@ -4085,7 +4919,8 @@ impl SyscallDispatcher {
             | OpenDescription::Epoll { .. }
             | OpenDescription::PipeReader { .. }
             | OpenDescription::PipeWriter { .. }
-            | OpenDescription::HostPipe { .. } => Ok(Err(LINUX_EINVAL)),
+            | OpenDescription::HostPipe { .. }
+            | OpenDescription::HostSocket { .. } => Ok(Err(LINUX_EINVAL)),
         }
     }
 
@@ -4103,7 +4938,8 @@ impl SyscallDispatcher {
             | OpenDescription::Epoll { .. }
             | OpenDescription::PipeReader { .. }
             | OpenDescription::PipeWriter { .. }
-            | OpenDescription::HostPipe { .. } => return Err(LINUX_EINVAL),
+            | OpenDescription::HostPipe { .. }
+            | OpenDescription::HostSocket { .. } => return Err(LINUX_EINVAL),
         };
         let available = contents.get(offset..).unwrap_or_default();
         let write_len = available.len().min(count);
@@ -4316,6 +5152,12 @@ impl SyscallDispatcher {
                     }
                     return Ok(write_host_pipe(&bytes, *host_fd));
                 }
+                OpenDescription::HostSocket { host_fd, .. } => {
+                    // write(2) on a connected socket maps directly to a
+                    // host write(2). Unconnected sockets will surface
+                    // their own ENOTCONN via the host.
+                    return Ok(write_host_pipe(&bytes, *host_fd));
+                }
                 _ => return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF }),
             }
         }
@@ -4350,6 +5192,9 @@ impl SyscallDispatcher {
                     } else {
                         write_host_pipe(bytes, *host_fd)
                     }
+                }
+                OpenDescription::HostSocket { host_fd, .. } => {
+                    write_host_pipe(bytes, *host_fd)
                 }
                 _ => DispatchOutcome::Errno { errno: LINUX_EBADF },
             };
@@ -4407,6 +5252,9 @@ impl SyscallDispatcher {
                         if *is_read_end {
                             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
                         }
+                        write_host_pipe(&bytes, *host_fd)
+                    }
+                    OpenDescription::HostSocket { host_fd, .. } => {
                         write_host_pipe(&bytes, *host_fd)
                     }
                     _ => return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF }),
@@ -5154,6 +6002,9 @@ impl SyscallDispatcher {
             | OpenDescription::HostPipe { .. } => {
                 return write_synthetic_stat(memory, statbuf, "pipe:[carrick]", 0);
             }
+            OpenDescription::HostSocket { .. } => {
+                return write_synthetic_stat(memory, statbuf, "socket:[carrick]", 0);
+            }
         };
         write_stat(memory, statbuf, metadata)
     }
@@ -5187,6 +6038,9 @@ impl SyscallDispatcher {
             | OpenDescription::HostPipe { .. } => {
                 return write_synthetic_statx(memory, statxbuf, "pipe:[carrick]", 0);
             }
+            OpenDescription::HostSocket { .. } => {
+                return write_synthetic_statx(memory, statxbuf, "socket:[carrick]", 0);
+            }
         };
         write_statx(memory, statxbuf, metadata)
     }
@@ -5215,7 +6069,8 @@ impl SyscallDispatcher {
                 | OpenDescription::Epoll { .. }
                 | OpenDescription::PipeReader { .. }
                 | OpenDescription::PipeWriter { .. }
-            | OpenDescription::HostPipe { .. } => Err(LINUX_ENOTDIR),
+            | OpenDescription::HostPipe { .. }
+            | OpenDescription::HostSocket { .. } => Err(LINUX_ENOTDIR),
             },
             None => Err(LINUX_EBADF),
         }
@@ -5347,6 +6202,16 @@ fn close_open_file(open_file: &OpenFile) {
             // count: if `strong_count == 1` we're the last one.
             // (The Rc is held by the OpenFile in `open_files`; if no
             // dup'd entry remains, strong_count is 1.)
+            if std::rc::Rc::strong_count(&open_file.description) == 1 {
+                unsafe {
+                    libc::close(*host_fd);
+                }
+            }
+        }
+        OpenDescription::HostSocket { host_fd, .. } => {
+            // Same last-reference rule as HostPipe: only close the real
+            // macOS fd when no other Linux fd still aliases the same
+            // OpenDescription via dup3/dup2.
             if std::rc::Rc::strong_count(&open_file.description) == 1 {
                 unsafe {
                     libc::close(*host_fd);
@@ -6605,6 +7470,304 @@ fn host_errno() -> i32 {
     // return a thread-local int pointer.
     unsafe { *libc::__error() }
 }
+
+// ----- BSD socket translation helpers ------------------------------------
+
+/// Linux AF_* values for the families we support. Linux constants happen
+/// to overlap with macOS's only for AF_UNSPEC / AF_UNIX / AF_INET — the
+/// AF_INET6 numeric value differs (Linux: 10, macOS: 30).
+const LINUX_AF_UNSPEC: i32 = 0;
+const LINUX_AF_UNIX: i32 = 1;
+const LINUX_AF_INET: i32 = 2;
+const LINUX_AF_INET6: i32 = 10;
+#[allow(dead_code)]
+const LINUX_AF_NETLINK: i32 = 16;
+#[allow(dead_code)]
+const LINUX_AF_PACKET: i32 = 17;
+
+const LINUX_SOCK_STREAM: i32 = 1;
+const LINUX_SOCK_DGRAM: i32 = 2;
+const LINUX_SOCK_RAW: i32 = 3;
+const LINUX_SOCK_SEQPACKET: i32 = 5;
+
+fn linux_to_host_af(family: i32) -> i32 {
+    match family {
+        LINUX_AF_UNSPEC => libc::AF_UNSPEC,
+        LINUX_AF_UNIX => libc::AF_UNIX,
+        LINUX_AF_INET => libc::AF_INET,
+        LINUX_AF_INET6 => libc::AF_INET6,
+        // Linux-only families. macOS doesn't have AF_NETLINK / AF_PACKET;
+        // pass through whatever number was given so the host socket()
+        // call returns EAFNOSUPPORT naturally.
+        _ => family,
+    }
+}
+
+fn host_to_linux_af(host_family: u16) -> u16 {
+    match host_family as i32 {
+        libc::AF_UNSPEC => LINUX_AF_UNSPEC as u16,
+        libc::AF_UNIX => LINUX_AF_UNIX as u16,
+        libc::AF_INET => LINUX_AF_INET as u16,
+        libc::AF_INET6 => LINUX_AF_INET6 as u16,
+        _ => host_family,
+    }
+}
+
+fn linux_to_host_socktype(t: i32) -> i32 {
+    // Linux and macOS agree on the numeric values for the BSD socket
+    // types we care about (1=STREAM, 2=DGRAM, 3=RAW, 5=SEQPACKET).
+    match t {
+        LINUX_SOCK_STREAM => libc::SOCK_STREAM,
+        LINUX_SOCK_DGRAM => libc::SOCK_DGRAM,
+        LINUX_SOCK_RAW => libc::SOCK_RAW,
+        LINUX_SOCK_SEQPACKET => libc::SOCK_SEQPACKET,
+        _ => t,
+    }
+}
+
+const LINUX_MSG_OOB: i32 = 0x0001;
+const LINUX_MSG_PEEK: i32 = 0x0002;
+const LINUX_MSG_DONTROUTE: i32 = 0x0004;
+const LINUX_MSG_TRUNC: i32 = 0x0020;
+const LINUX_MSG_DONTWAIT: i32 = 0x0040;
+const LINUX_MSG_EOR: i32 = 0x0080;
+const LINUX_MSG_WAITALL: i32 = 0x0100;
+const LINUX_MSG_NOSIGNAL: i32 = 0x4000;
+const LINUX_MSG_CMSG_CLOEXEC: i32 = 0x4000_0000_u32 as i32;
+
+fn linux_to_host_msg_flags(flags: i32) -> i32 {
+    let mut out = 0;
+    if flags & LINUX_MSG_OOB != 0 { out |= libc::MSG_OOB; }
+    if flags & LINUX_MSG_PEEK != 0 { out |= libc::MSG_PEEK; }
+    if flags & LINUX_MSG_DONTROUTE != 0 { out |= libc::MSG_DONTROUTE; }
+    if flags & LINUX_MSG_TRUNC != 0 { out |= libc::MSG_TRUNC; }
+    if flags & LINUX_MSG_DONTWAIT != 0 { out |= libc::MSG_DONTWAIT; }
+    if flags & LINUX_MSG_EOR != 0 { out |= libc::MSG_EOR; }
+    if flags & LINUX_MSG_WAITALL != 0 { out |= libc::MSG_WAITALL; }
+    // MSG_NOSIGNAL is Linux-only. macOS expresses the equivalent via
+    // SO_NOSIGPIPE on the socket; ignoring the flag is the best we can
+    // do here. Likewise MSG_CMSG_CLOEXEC has no macOS equivalent.
+    let _ = (LINUX_MSG_NOSIGNAL, LINUX_MSG_CMSG_CLOEXEC);
+    out
+}
+
+// Linux socket option levels and names. Linux numbers them as small
+// integers (SOL_SOCKET=1) while macOS reuses the IPPROTO/SO scheme
+// (SOL_SOCKET=0xffff). We translate explicitly for the most common
+// options the guest will throw at us. Anything we don't recognise
+// returns `None` and the caller surfaces ENOPROTOOPT.
+const LINUX_SOL_SOCKET: i32 = 1;
+const LINUX_SOL_IP: i32 = 0; // IPPROTO_IP
+const LINUX_SOL_TCP: i32 = 6; // IPPROTO_TCP
+const LINUX_SOL_UDP: i32 = 17; // IPPROTO_UDP
+const LINUX_SOL_IPV6: i32 = 41; // IPPROTO_IPV6
+
+const LINUX_SO_DEBUG: i32 = 1;
+const LINUX_SO_REUSEADDR: i32 = 2;
+const LINUX_SO_TYPE: i32 = 3;
+const LINUX_SO_ERROR: i32 = 4;
+const LINUX_SO_DONTROUTE: i32 = 5;
+const LINUX_SO_BROADCAST: i32 = 6;
+const LINUX_SO_SNDBUF: i32 = 7;
+const LINUX_SO_RCVBUF: i32 = 8;
+const LINUX_SO_KEEPALIVE: i32 = 9;
+const LINUX_SO_OOBINLINE: i32 = 10;
+const LINUX_SO_LINGER: i32 = 13;
+const LINUX_SO_REUSEPORT: i32 = 15;
+const LINUX_SO_RCVTIMEO: i32 = 20;
+const LINUX_SO_SNDTIMEO: i32 = 21;
+const LINUX_SO_ACCEPTCONN: i32 = 30;
+
+fn linux_to_host_sockopt(level: i32, optname: i32) -> Option<(i32, i32)> {
+    match level {
+        LINUX_SOL_SOCKET => {
+            let host_opt = match optname {
+                LINUX_SO_DEBUG => libc::SO_DEBUG,
+                LINUX_SO_REUSEADDR => libc::SO_REUSEADDR,
+                LINUX_SO_TYPE => libc::SO_TYPE,
+                LINUX_SO_ERROR => libc::SO_ERROR,
+                LINUX_SO_DONTROUTE => libc::SO_DONTROUTE,
+                LINUX_SO_BROADCAST => libc::SO_BROADCAST,
+                LINUX_SO_SNDBUF => libc::SO_SNDBUF,
+                LINUX_SO_RCVBUF => libc::SO_RCVBUF,
+                LINUX_SO_KEEPALIVE => libc::SO_KEEPALIVE,
+                LINUX_SO_OOBINLINE => libc::SO_OOBINLINE,
+                LINUX_SO_LINGER => libc::SO_LINGER,
+                LINUX_SO_REUSEPORT => libc::SO_REUSEPORT,
+                LINUX_SO_RCVTIMEO => libc::SO_RCVTIMEO,
+                LINUX_SO_SNDTIMEO => libc::SO_SNDTIMEO,
+                LINUX_SO_ACCEPTCONN => libc::SO_ACCEPTCONN,
+                _ => return None,
+            };
+            Some((libc::SOL_SOCKET, host_opt))
+        }
+        LINUX_SOL_IP => Some((libc::IPPROTO_IP, optname)),
+        LINUX_SOL_TCP => Some((libc::IPPROTO_TCP, optname)),
+        LINUX_SOL_UDP => Some((libc::IPPROTO_UDP, optname)),
+        LINUX_SOL_IPV6 => Some((libc::IPPROTO_IPV6, optname)),
+        _ => None,
+    }
+}
+
+/// Translate a Linux-formatted sockaddr (read from guest memory) into the
+/// macOS BSD form. Returns the host-formatted bytes ready to hand to
+/// libc::bind/connect/sendto.
+fn read_linux_sockaddr(
+    memory: &impl GuestMemory,
+    addr: u64,
+    addrlen: u32,
+    _family_hint: i32,
+) -> Result<Vec<u8>, i32> {
+    if addr == 0 || addrlen < 2 {
+        return Err(LINUX_EINVAL);
+    }
+    let len = addrlen as usize;
+    let bytes = memory.read_bytes(addr, len).map_err(|_| LINUX_EFAULT)?;
+    let family = u16::from_ne_bytes([bytes[0], bytes[1]]) as i32;
+    match family {
+        LINUX_AF_INET => {
+            // sockaddr_in: family(2) port(2) addr(4) zero(8) = 16 bytes
+            if len < 8 {
+                return Err(LINUX_EINVAL);
+            }
+            let mut out = vec![0u8; 16];
+            out[0] = 16; // sin_len
+            out[1] = libc::AF_INET as u8; // sin_family
+            out[2..4].copy_from_slice(&bytes[2..4]); // sin_port (network)
+            out[4..8].copy_from_slice(&bytes[4..8]); // sin_addr
+            Ok(out)
+        }
+        LINUX_AF_INET6 => {
+            // sockaddr_in6: family(2) port(2) flowinfo(4) addr(16) scope(4) = 28
+            if len < 24 {
+                return Err(LINUX_EINVAL);
+            }
+            let mut out = vec![0u8; 28];
+            out[0] = 28;
+            out[1] = libc::AF_INET6 as u8;
+            out[2..4].copy_from_slice(&bytes[2..4]); // port
+            out[4..8].copy_from_slice(&bytes[4..8]); // flowinfo
+            out[8..24].copy_from_slice(&bytes[8..24]); // addr
+            if len >= 28 {
+                out[24..28].copy_from_slice(&bytes[24..28]); // scope_id
+            }
+            Ok(out)
+        }
+        LINUX_AF_UNIX => {
+            // sockaddr_un: family(2) path[108]
+            if len < 2 {
+                return Err(LINUX_EINVAL);
+            }
+            let path_len = len.saturating_sub(2);
+            // macOS sockaddr_un is sun_len(1) sun_family(1) sun_path[104].
+            let mut out = vec![0u8; 2 + path_len];
+            out[0] = (2 + path_len).min(255) as u8;
+            out[1] = libc::AF_UNIX as u8;
+            out[2..].copy_from_slice(&bytes[2..2 + path_len]);
+            Ok(out)
+        }
+        _ => Err(LINUX_EAFNOSUPPORT),
+    }
+}
+
+/// Translate a macOS BSD sockaddr (as returned by accept/getsockname/...
+/// into Linux-formatted bytes suitable for the guest to consume.
+fn host_to_linux_sockaddr(bytes: &[u8], _family_hint: i32) -> Vec<u8> {
+    if bytes.len() < 2 {
+        return Vec::new();
+    }
+    // macOS layout: sa_len(1) sa_family(1) ...
+    let host_family = bytes[1] as u16;
+    let linux_family = host_to_linux_af(host_family);
+    match host_family as i32 {
+        libc::AF_INET => {
+            // Linux sockaddr_in: family(2) port(2) addr(4) zero(8) = 16
+            let mut out = vec![0u8; 16];
+            out[0..2].copy_from_slice(&linux_family.to_ne_bytes());
+            if bytes.len() >= 8 {
+                out[2..4].copy_from_slice(&bytes[2..4]); // port
+                out[4..8].copy_from_slice(&bytes[4..8]); // addr
+            }
+            out
+        }
+        libc::AF_INET6 => {
+            let mut out = vec![0u8; 28];
+            out[0..2].copy_from_slice(&linux_family.to_ne_bytes());
+            let take = bytes.len().min(28);
+            if take > 2 {
+                out[2..take].copy_from_slice(&bytes[2..take]);
+            }
+            out
+        }
+        libc::AF_UNIX => {
+            // Linux sockaddr_un is family(2) path[108]. macOS path starts
+            // at offset 2; skip the host's sun_len byte at offset 0.
+            let path_len = bytes.len().saturating_sub(2);
+            let mut out = vec![0u8; 2 + path_len];
+            out[0..2].copy_from_slice(&linux_family.to_ne_bytes());
+            if path_len > 0 {
+                out[2..].copy_from_slice(&bytes[2..2 + path_len]);
+            }
+            out
+        }
+        _ => {
+            let mut out = bytes.to_vec();
+            if out.len() >= 2 {
+                out[0..2].copy_from_slice(&linux_family.to_ne_bytes());
+            }
+            out
+        }
+    }
+}
+
+/// Write a Linux-formatted sockaddr back into guest memory, respecting
+/// the caller's `addrlen` (Linux truncates when the buffer is too small
+/// and writes the full required length into `*addrlen_addr`).
+fn write_linux_sockaddr(
+    memory: &mut impl GuestMemory,
+    addr: u64,
+    addrlen_addr: u64,
+    bytes: &[u8],
+) -> Result<(), ()> {
+    if addrlen_addr == 0 {
+        return Err(());
+    }
+    let cur_bytes = memory.read_bytes(addrlen_addr, 4).map_err(|_| ())?;
+    let cur = u32::from_ne_bytes([
+        cur_bytes[0], cur_bytes[1], cur_bytes[2], cur_bytes[3],
+    ]) as usize;
+    let write_len = cur.min(bytes.len());
+    if addr != 0 && write_len > 0 {
+        memory.write_bytes(addr, &bytes[..write_len]).map_err(|_| ())?;
+    }
+    memory
+        .write_bytes(addrlen_addr, &(bytes.len() as u32).to_ne_bytes())
+        .map_err(|_| ())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LinuxMsghdr {
+    name: u64,
+    namelen: u32,
+    iov: u64,
+    iovlen: u64,
+}
+
+fn read_linux_msghdr(memory: &impl GuestMemory, addr: u64) -> Result<LinuxMsghdr, i32> {
+    if addr == 0 {
+        return Err(LINUX_EFAULT);
+    }
+    // Linux msghdr (LP64): name(8) namelen(4) pad(4) iov(8) iovlen(8)
+    //                      control(8) controllen(8) flags(4)
+    let bytes = memory.read_bytes(addr, 56).map_err(|_| LINUX_EFAULT)?;
+    let name = u64::from_ne_bytes(bytes[0..8].try_into().unwrap());
+    let namelen = u32::from_ne_bytes(bytes[8..12].try_into().unwrap());
+    let iov = u64::from_ne_bytes(bytes[16..24].try_into().unwrap());
+    let iovlen = u64::from_ne_bytes(bytes[24..32].try_into().unwrap());
+    Ok(LinuxMsghdr { name, namelen, iov, iovlen })
+}
+
+pub const LINUX_EAFNOSUPPORT: i32 = 97;
 
 fn read_host_pipe(
     memory: &mut impl GuestMemory,
