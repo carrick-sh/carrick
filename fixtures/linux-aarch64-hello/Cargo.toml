@@ -36,6 +36,14 @@ name = "carrick-linux-aarch64-inet-connect"
 path = "src/inet_connect.rs"
 
 [[bin]]
+name = "carrick-linux-aarch64-write-hi-to-fd1"
+path = "src/write_hi_to_fd1.rs"
+
+[[bin]]
+name = "carrick-linux-aarch64-pipe-dup3-exec"
+path = "src/pipe_dup3_exec.rs"
+
+[[bin]]
 name = "carrick-linux-aarch64-signal-basic"
 path = "src/signal_basic.rs"
 

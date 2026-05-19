@@ -124,6 +124,8 @@ build_fixture "pipe_fork_poll.rs" "carrick-linux-aarch64-pipe-fork-poll"
 build_fixture "pipe_bidi.rs" "carrick-linux-aarch64-pipe-bidi"
 build_fixture "pipe_dup3.rs" "carrick-linux-aarch64-pipe-dup3"
 build_fixture "inet_connect.rs" "carrick-linux-aarch64-inet-connect"
+build_fixture "write_hi_to_fd1.rs" "carrick-linux-aarch64-write-hi-to-fd1"
+build_fixture "pipe_dup3_exec.rs" "carrick-linux-aarch64-pipe-dup3-exec"
 build_pie_fixture "pie_hello.rs" "carrick-linux-aarch64-pie-hello"
 
 cargo metadata \
