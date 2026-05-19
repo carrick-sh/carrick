@@ -19,6 +19,7 @@ use crate::memory::{
     LINUX_EL0_TRAMPOLINE_BASE, LINUX_EL1_VECTORS_BASE, LINUX_HEAP_BASE, LINUX_HEAP_SIZE,
     LINUX_MMAP_BASE, LINUX_MMAP_SIZE, LINUX_PAGE_TABLES_BASE, LINUX_STACK_SIZE, LINUX_STACK_TOP,
 };
+use crate::overlay::{OverlayEntry, WritableOverlay, layered_directory_entries};
 use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsError, RootFsMetadata};
 use crate::syscall::lookup_aarch64;
 use serde::Serialize;
@@ -103,6 +104,11 @@ pub const LINUX_O_WRONLY: u64 = 1;
 pub const LINUX_O_RDWR: u64 = 2;
 pub const LINUX_O_NONBLOCK: u64 = 0o4000;
 pub const LINUX_O_CLOEXEC: u64 = 0o2000000;
+pub const LINUX_O_CREAT: u64 = 0o100;
+pub const LINUX_O_EXCL: u64 = 0o200;
+pub const LINUX_O_TRUNC: u64 = 0o1000;
+pub const LINUX_O_APPEND: u64 = 0o2000;
+pub const LINUX_O_DIRECTORY: u64 = 0o200000;
 pub const LINUX_PROT_READ: u64 = 0x1;
 pub const LINUX_PROT_WRITE: u64 = 0x2;
 pub const LINUX_PROT_EXEC: u64 = 0x4;
@@ -440,6 +446,13 @@ pub struct SyscallDispatcher {
     /// end tracking `brk_current` and the mmap arena end tracking
     /// `mmap_next`) instead of the hard-coded four-line summary.
     address_space_regions: Option<Vec<ProcMapsEntry>>,
+    /// In-memory tmpfs-style writable overlay layered on top of
+    /// `rootfs`. Writes (mkdirat / openat O_CREAT / write / unlinkat
+    /// / renameat) land here; reads consult this first and fall
+    /// through to the rootfs when nothing is found. The overlay's
+    /// `deletions` set tombstones rootfs-backed paths so unlink-then-
+    /// stat behaves correctly.
+    overlay: WritableOverlay,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -450,6 +463,9 @@ enum OpenDescription {
         contents: Vec<u8>,
         offset: usize,
         status_flags: u64,
+        /// True iff this fd targets the writable overlay. Writes
+        /// to a writable=false File are still RO (return EROFS).
+        writable: bool,
     },
     Directory {
         path: String,
@@ -603,6 +619,7 @@ impl SyscallDispatcher {
             umask: LINUX_DEFAULT_UMASK,
             signal_handlers: HashMap::new(),
             address_space_regions: None,
+            overlay: WritableOverlay::new(),
         }
     }
 
@@ -855,6 +872,7 @@ impl SyscallDispatcher {
             260 => self.wait4(request, memory),
             261 => self.prlimit64(request, memory),
             266 => self.clock_adjtime(request, memory),
+            276 => self.renameat2(request, memory)?,
             278 => self.getrandom(request, memory)?,
             283 => self.membarrier(request),
             291 => self.statx(request, memory)?,
@@ -977,6 +995,18 @@ impl SyscallDispatcher {
     }
 
     fn access_resolved_path(&self, path: &str, mode: u64, flags: u64) -> DispatchOutcome {
+        // Layered: overlay first.
+        match self.overlay.lookup(path) {
+            Some(OverlayEntry::Deleted) => {
+                return DispatchOutcome::Errno { errno: LINUX_ENOENT };
+            }
+            Some(OverlayEntry::Dir) | Some(OverlayEntry::File(_)) => {
+                if let Some(metadata) = self.overlay.metadata(path) {
+                    return access_metadata(&metadata, mode);
+                }
+            }
+            None => {}
+        }
         if let Some(outcome) = self.synthetic_access(&path, mode) {
             return outcome;
         }
@@ -2322,7 +2352,7 @@ impl SyscallDispatcher {
         DispatchOutcome::Errno { errno }
     }
 
-    fn ftruncate(&self, request: SyscallRequest) -> DispatchOutcome {
+    fn ftruncate(&mut self, request: SyscallRequest) -> DispatchOutcome {
         let fd = request.arg(0) as i32;
         let length = i64::from_ne_bytes(request.arg(1).to_ne_bytes());
         if length < 0 {
@@ -2335,22 +2365,53 @@ impl SyscallDispatcher {
                 errno: LINUX_EINVAL,
             };
         }
-        let Some(open_file) = self.open_files.get(&fd) else {
+        let Some(open_file) = self.open_files.get(&fd).cloned() else {
             return DispatchOutcome::Errno { errno: LINUX_EBADF };
         };
-        let open = open_file.description.borrow();
-        let errno = match &*open {
-            OpenDescription::File { .. } | OpenDescription::SyntheticFile { .. } => LINUX_EBADF,
-            OpenDescription::Directory { .. } => LINUX_EISDIR,
-            OpenDescription::PipeReader { .. }
-            | OpenDescription::PipeWriter { .. }
-            | OpenDescription::EventFd { .. }
-            | OpenDescription::TimerFd { .. }
-            | OpenDescription::HostPipe { .. }
-            | OpenDescription::HostSocket { .. }
-            | OpenDescription::Epoll { .. } => LINUX_EINVAL,
-        };
-        DispatchOutcome::Errno { errno }
+        // Snapshot the path + new contents in a scope so the borrow drops
+        // before we touch self.overlay.
+        let writeback: Option<(String, Vec<u8>)>;
+        let outcome: DispatchOutcome;
+        {
+            let mut open = open_file.description.borrow_mut();
+            match &mut *open {
+                OpenDescription::File {
+                    path,
+                    contents,
+                    offset,
+                    writable,
+                    metadata,
+                    ..
+                } => {
+                    if !*writable {
+                        return DispatchOutcome::Errno { errno: LINUX_EBADF };
+                    }
+                    let new_len = length as usize;
+                    if new_len > contents.len() {
+                        contents.resize(new_len, 0);
+                    } else {
+                        contents.truncate(new_len);
+                        if *offset > new_len {
+                            *offset = new_len;
+                        }
+                    }
+                    metadata.size = contents.len();
+                    writeback = Some((path.clone(), contents.clone()));
+                    outcome = DispatchOutcome::Returned { value: 0 };
+                }
+                OpenDescription::SyntheticFile { .. } => {
+                    return DispatchOutcome::Errno { errno: LINUX_EBADF };
+                }
+                OpenDescription::Directory { .. } => {
+                    return DispatchOutcome::Errno { errno: LINUX_EISDIR };
+                }
+                _ => return DispatchOutcome::Errno { errno: LINUX_EINVAL },
+            }
+        }
+        if let Some((path, contents)) = writeback {
+            let _ = self.overlay.set_file_contents(&path, contents);
+        }
+        outcome
     }
 
     fn capget(&self, request: SyscallRequest, memory: &mut impl GuestMemory) -> DispatchOutcome {
@@ -3400,11 +3461,16 @@ impl SyscallDispatcher {
         memory: &impl GuestMemory,
         reporter: &mut CompatReporter,
     ) -> Result<DispatchOutcome, DispatchError> {
-        if flags & LINUX_O_ACCMODE != 0 {
+        let access = flags & LINUX_O_ACCMODE;
+        if access != LINUX_O_RDONLY && access != LINUX_O_WRONLY && access != LINUX_O_RDWR {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
             });
         }
+        let writable_request = access == LINUX_O_WRONLY || access == LINUX_O_RDWR;
+        let want_create = flags & LINUX_O_CREAT != 0;
+        let want_excl = flags & LINUX_O_EXCL != 0;
+        let want_trunc = flags & LINUX_O_TRUNC != 0;
 
         let path = match read_guest_c_string(memory, pathname) {
             Ok(path) => path,
@@ -3415,8 +3481,21 @@ impl SyscallDispatcher {
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
 
+        // Overlay-first lookup for normal rootfs paths. Synthetic
+        // /proc and /sys files are not overridable.
+        let overlay_entry = self.overlay.lookup(&path);
+        let overlay_deleted = matches!(overlay_entry, Some(OverlayEntry::Deleted));
+        let overlay_dir = matches!(overlay_entry, Some(OverlayEntry::Dir));
+        let overlay_file_bytes: Option<Vec<u8>> = match &overlay_entry {
+            Some(OverlayEntry::File(bytes)) => Some(bytes.to_vec()),
+            _ => None,
+        };
+
         let description = if let Some(contents) = synthetic_proc_file(&path, &self.synthetic_proc_context())
         {
+            if writable_request {
+                return Ok(DispatchOutcome::Errno { errno: LINUX_EACCES });
+            }
             OpenDescription::SyntheticFile {
                 path,
                 contents,
@@ -3424,9 +3503,65 @@ impl SyscallDispatcher {
                 status_flags: flags & !LINUX_O_CLOEXEC,
             }
         } else if let Some(contents) = synthetic_sys_file(&path) {
+            if writable_request {
+                return Ok(DispatchOutcome::Errno { errno: LINUX_EACCES });
+            }
             OpenDescription::SyntheticFile {
                 path,
                 contents,
+                offset: 0,
+                status_flags: flags & !LINUX_O_CLOEXEC,
+            }
+        } else if let Some(mut contents) = overlay_file_bytes {
+            // Overlay-backed regular file. The local cache mirrors
+            // what's currently in the overlay; subsequent writes
+            // push back into it.
+            if want_create && want_excl {
+                return Ok(DispatchOutcome::Errno { errno: LINUX_EEXIST });
+            }
+            if want_trunc {
+                contents.clear();
+                if let Err(_) = self.overlay.set_file_contents(&path, contents.clone()) {
+                    return Ok(DispatchOutcome::Errno { errno: LINUX_EINVAL });
+                }
+            }
+            let size = contents.len();
+            let path_buf = Path::new(&path).to_path_buf();
+            let metadata = RootFsMetadata {
+                path: path_buf,
+                kind: RootFsEntryKind::File,
+                mode: 0o644,
+                size,
+            };
+            OpenDescription::File {
+                path,
+                metadata,
+                contents,
+                offset: 0,
+                status_flags: flags & !LINUX_O_CLOEXEC,
+                writable: writable_request,
+            }
+        } else if overlay_dir {
+            // Overlay-only directory. No rootfs entries to merge in
+            // beyond what `layered_directory_entries` finds.
+            if writable_request {
+                return Ok(DispatchOutcome::Errno { errno: LINUX_EISDIR });
+            }
+            let entries =
+                match layered_directory_entries(&self.overlay, self.rootfs.as_ref(), &path) {
+                    Ok(entries) => entries,
+                    Err(errno) => return Ok(DispatchOutcome::Errno { errno: rootfs_errno(errno) }),
+                };
+            let metadata = RootFsMetadata {
+                path: Path::new(&path).to_path_buf(),
+                kind: RootFsEntryKind::Directory,
+                mode: 0o755,
+                size: 0,
+            };
+            OpenDescription::Directory {
+                path,
+                metadata,
+                entries,
                 offset: 0,
                 status_flags: flags & !LINUX_O_CLOEXEC,
             }
@@ -3434,59 +3569,131 @@ impl SyscallDispatcher {
             if let Some(outcome) = Self::record_unimplemented_virtual_file(reporter, &path) {
                 return Ok(outcome);
             }
-            let Some(rootfs) = &self.rootfs else {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_ENOENT,
-                });
-            };
-            let metadata = match rootfs.metadata(&path) {
-                Ok(metadata) => metadata,
-                Err(errno) => {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: rootfs_errno(errno),
-                    });
+            // The rootfs lookup is a NotFound iff (a) the rootfs
+            // doesn't have it OR (b) the overlay tombstoned it.
+            let rootfs_metadata = if overlay_deleted {
+                None
+            } else if let Some(rootfs) = &self.rootfs {
+                match rootfs.metadata(&path) {
+                    Ok(metadata) => Some(metadata),
+                    Err(RootFsError::NotFound(_)) => None,
+                    Err(errno) => {
+                        return Ok(DispatchOutcome::Errno {
+                            errno: rootfs_errno(errno),
+                        });
+                    }
                 }
+            } else {
+                None
             };
 
-            match metadata.kind {
-                RootFsEntryKind::File => {
-                    let contents = match rootfs.read(&path) {
-                        Ok(contents) => contents,
-                        Err(errno) => {
+            match rootfs_metadata {
+                Some(metadata) => match metadata.kind {
+                    RootFsEntryKind::File => {
+                        if want_create && want_excl {
+                            return Ok(DispatchOutcome::Errno { errno: LINUX_EEXIST });
+                        }
+                        let mut contents = match self
+                            .rootfs
+                            .as_ref()
+                            .expect("rootfs metadata implies rootfs")
+                            .read(&path)
+                        {
+                            Ok(contents) => contents,
+                            Err(errno) => {
+                                return Ok(DispatchOutcome::Errno {
+                                    errno: rootfs_errno(errno),
+                                });
+                            }
+                        };
+                        // If the caller wants to write, promote the
+                        // file into the overlay so subsequent writes
+                        // land in mutable storage.
+                        let writable = if writable_request {
+                            if want_trunc {
+                                contents.clear();
+                            }
+                            if let Err(_) =
+                                self.overlay.set_file_contents(&path, contents.clone())
+                            {
+                                return Ok(DispatchOutcome::Errno {
+                                    errno: LINUX_EINVAL,
+                                });
+                            }
+                            true
+                        } else {
+                            false
+                        };
+                        OpenDescription::File {
+                            path,
+                            metadata,
+                            contents,
+                            offset: 0,
+                            status_flags: flags & !LINUX_O_CLOEXEC,
+                            writable,
+                        }
+                    }
+                    RootFsEntryKind::Directory => {
+                        let entries = match layered_directory_entries(
+                            &self.overlay,
+                            self.rootfs.as_ref(),
+                            &path,
+                        ) {
+                            Ok(entries) => entries,
+                            Err(errno) => {
+                                return Ok(DispatchOutcome::Errno {
+                                    errno: rootfs_errno(errno),
+                                });
+                            }
+                        };
+                        OpenDescription::Directory {
+                            path,
+                            metadata,
+                            entries,
+                            offset: 0,
+                            status_flags: flags & !LINUX_O_CLOEXEC,
+                        }
+                    }
+                    RootFsEntryKind::Symlink => {
+                        return Ok(DispatchOutcome::Errno {
+                            errno: LINUX_EINVAL,
+                        });
+                    }
+                },
+                None => {
+                    if !want_create {
+                        return Ok(DispatchOutcome::Errno {
+                            errno: LINUX_ENOENT,
+                        });
+                    }
+                    // O_CREAT path: materialise a new empty file in
+                    // the overlay. The caller's parent directory
+                    // must exist (in overlay or rootfs).
+                    if let Some(parent) = Path::new(&path).parent() {
+                        let parent_str = display_rootfs_path(parent);
+                        if !self.path_is_directory(&parent_str) {
                             return Ok(DispatchOutcome::Errno {
-                                errno: rootfs_errno(errno),
+                                errno: LINUX_ENOENT,
                             });
                         }
+                    }
+                    if let Err(_) = self.overlay.create_file(&path) {
+                        return Ok(DispatchOutcome::Errno { errno: LINUX_EINVAL });
+                    }
+                    let metadata = RootFsMetadata {
+                        path: Path::new(&path).to_path_buf(),
+                        kind: RootFsEntryKind::File,
+                        mode: 0o644,
+                        size: 0,
                     };
                     OpenDescription::File {
                         path,
                         metadata,
-                        contents,
+                        contents: Vec::new(),
                         offset: 0,
                         status_flags: flags & !LINUX_O_CLOEXEC,
+                        writable: writable_request || want_create,
                     }
-                }
-                RootFsEntryKind::Directory => {
-                    let entries = match rootfs.directory_entries(&path) {
-                        Ok(entries) => entries,
-                        Err(errno) => {
-                            return Ok(DispatchOutcome::Errno {
-                                errno: rootfs_errno(errno),
-                            });
-                        }
-                    };
-                    OpenDescription::Directory {
-                        path,
-                        metadata,
-                        entries,
-                        offset: 0,
-                        status_flags: flags & !LINUX_O_CLOEXEC,
-                    }
-                }
-                RootFsEntryKind::Symlink => {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: LINUX_EINVAL,
-                    });
                 }
             }
         };
@@ -3504,6 +3711,45 @@ impl SyscallDispatcher {
             },
         );
         Ok(DispatchOutcome::Returned { value: fd as i64 })
+    }
+
+    /// Layered "is this a directory?" probe used by mkdirat / openat
+    /// (O_CREAT) parent-existence checks. The synthetic /proc and
+    /// /sys roots count as directories so that
+    /// `mkdir("/proc/.tmp-XYZ")` can be detected as EEXIST rather
+    /// than the wrong errno.
+    fn path_is_directory(&self, path: &str) -> bool {
+        if path == "/" || path.is_empty() {
+            return true;
+        }
+        match self.overlay.lookup(path) {
+            Some(OverlayEntry::Dir) => return true,
+            Some(OverlayEntry::Deleted) | Some(OverlayEntry::File(_)) => return false,
+            None => {}
+        }
+        if let Some(rootfs) = &self.rootfs {
+            if let Ok(metadata) = rootfs.metadata(path) {
+                return metadata.kind == RootFsEntryKind::Directory;
+            }
+        }
+        false
+    }
+
+    /// Layered metadata probe. Mirrors the rootfs-or-synthetic chain
+    /// used by stat / faccessat sites, but consults the overlay first
+    /// and respects deletions.
+    fn layered_metadata(&self, path: &str) -> Result<RootFsMetadata, i32> {
+        match self.overlay.lookup(path) {
+            Some(OverlayEntry::Deleted) => return Err(LINUX_ENOENT),
+            Some(OverlayEntry::File(_)) | Some(OverlayEntry::Dir) => {
+                return self.overlay.metadata(path).ok_or(LINUX_ENOENT);
+            }
+            None => {}
+        }
+        let Some(rootfs) = &self.rootfs else {
+            return Err(LINUX_ENOENT);
+        };
+        rootfs.metadata(path).map_err(rootfs_errno)
     }
 
     fn close(&mut self, request: SyscallRequest) -> DispatchOutcome {
@@ -5563,33 +5809,69 @@ impl SyscallDispatcher {
         // a pipe, an eventfd, or some other resource. Only after we've
         // confirmed there's no open description do we fall back to the
         // dispatcher's built-in stdout/stderr buffers.
-        if let Some(open_file) = self.open_files.get(&(fd as i32)) {
-            let mut open = open_file.description.borrow_mut();
-            match &mut *open {
-                OpenDescription::EventFd { counter, .. } => {
-                    return Ok(write_eventfd(&bytes, counter));
-                }
-                OpenDescription::PipeWriter { pipe, .. } => {
-                    return Ok(write_pipe(&bytes, pipe));
-                }
-                OpenDescription::HostPipe {
-                    host_fd,
-                    is_read_end,
-                    ..
-                } => {
-                    if *is_read_end {
-                        return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
-                    }
-                    return Ok(write_host_pipe(&bytes, *host_fd));
-                }
-                OpenDescription::HostSocket { host_fd, .. } => {
-                    // write(2) on a connected socket maps directly to a
-                    // host write(2). Unconnected sockets will surface
-                    // their own ENOTCONN via the host.
-                    return Ok(write_host_pipe(&bytes, *host_fd));
-                }
-                _ => return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF }),
+        if let Some(open_file) = self.open_files.get(&(fd as i32)).cloned() {
+            // Take an inner scope so the borrow on the description ends
+            // before we touch self.overlay (writable File path below).
+            #[allow(dead_code)]
+            enum FileWriteback {
+                None,
+                Update { path: String, contents: Vec<u8> },
             }
+            let outcome: DispatchOutcome;
+            let writeback: FileWriteback;
+            {
+                let mut open = open_file.description.borrow_mut();
+                match &mut *open {
+                    OpenDescription::EventFd { counter, .. } => {
+                        return Ok(write_eventfd(&bytes, counter));
+                    }
+                    OpenDescription::PipeWriter { pipe, .. } => {
+                        return Ok(write_pipe(&bytes, pipe));
+                    }
+                    OpenDescription::HostPipe {
+                        host_fd,
+                        is_read_end,
+                        ..
+                    } => {
+                        if *is_read_end {
+                            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+                        }
+                        return Ok(write_host_pipe(&bytes, *host_fd));
+                    }
+                    OpenDescription::HostSocket { host_fd, .. } => {
+                        // write(2) on a connected socket maps directly to a
+                        // host write(2). Unconnected sockets will surface
+                        // their own ENOTCONN via the host.
+                        return Ok(write_host_pipe(&bytes, *host_fd));
+                    }
+                    OpenDescription::File {
+                        path,
+                        contents,
+                        offset,
+                        writable,
+                        metadata,
+                        ..
+                    } => {
+                        if !*writable {
+                            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+                        }
+                        write_into_file_contents(contents, offset, &bytes);
+                        metadata.size = contents.len();
+                        outcome = DispatchOutcome::Returned {
+                            value: bytes.len() as i64,
+                        };
+                        writeback = FileWriteback::Update {
+                            path: path.clone(),
+                            contents: contents.clone(),
+                        };
+                    }
+                    _ => return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF }),
+                }
+            }
+            if let FileWriteback::Update { path, contents } = writeback {
+                let _ = self.overlay.set_file_contents(&path, contents);
+            }
+            return Ok(outcome);
         }
         match fd {
             1 => self.stdout.extend_from_slice(&bytes),
@@ -5682,25 +5964,62 @@ impl SyscallDispatcher {
             // redirects (eg `dup3(pipe_write, 1)`) actually plumb
             // through the redirected description rather than the
             // built-in stdout buffer.
-            if let Some(open_file) = self.open_files.get(&(fd as i32)) {
-                let mut open = open_file.description.borrow_mut();
-                let outcome = match &mut *open {
-                    OpenDescription::PipeWriter { pipe, .. } => write_pipe(&bytes, pipe),
-                    OpenDescription::HostPipe {
-                        host_fd,
-                        is_read_end,
-                        ..
-                    } => {
-                        if *is_read_end {
-                            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+            if let Some(open_file) = self.open_files.get(&(fd as i32)).cloned() {
+                enum FileWriteback {
+                    None,
+                    Update { path: String, contents: Vec<u8> },
+                }
+                let outcome: DispatchOutcome;
+                let writeback: FileWriteback;
+                {
+                    let mut open = open_file.description.borrow_mut();
+                    match &mut *open {
+                        OpenDescription::PipeWriter { pipe, .. } => {
+                            outcome = write_pipe(&bytes, pipe);
+                            writeback = FileWriteback::None;
                         }
-                        write_host_pipe(&bytes, *host_fd)
+                        OpenDescription::HostPipe {
+                            host_fd,
+                            is_read_end,
+                            ..
+                        } => {
+                            if *is_read_end {
+                                return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+                            }
+                            outcome = write_host_pipe(&bytes, *host_fd);
+                            writeback = FileWriteback::None;
+                        }
+                        OpenDescription::HostSocket { host_fd, .. } => {
+                            outcome = write_host_pipe(&bytes, *host_fd);
+                            writeback = FileWriteback::None;
+                        }
+                        OpenDescription::File {
+                            path,
+                            contents,
+                            offset,
+                            writable,
+                            metadata,
+                            ..
+                        } => {
+                            if !*writable {
+                                return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+                            }
+                            write_into_file_contents(contents, offset, &bytes);
+                            metadata.size = contents.len();
+                            outcome = DispatchOutcome::Returned {
+                                value: bytes.len() as i64,
+                            };
+                            writeback = FileWriteback::Update {
+                                path: path.clone(),
+                                contents: contents.clone(),
+                            };
+                        }
+                        _ => return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF }),
                     }
-                    OpenDescription::HostSocket { host_fd, .. } => {
-                        write_host_pipe(&bytes, *host_fd)
-                    }
-                    _ => return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF }),
-                };
+                }
+                if let FileWriteback::Update { path, contents } = writeback {
+                    let _ = self.overlay.set_file_contents(&path, contents);
+                }
                 let DispatchOutcome::Returned { value } = outcome else {
                     return Ok(outcome);
                 };
@@ -5851,7 +6170,7 @@ impl SyscallDispatcher {
     }
 
     fn mkdirat(
-        &self,
+        &mut self,
         request: SyscallRequest,
         memory: &impl GuestMemory,
     ) -> Result<DispatchOutcome, DispatchError> {
@@ -5875,22 +6194,53 @@ impl SyscallDispatcher {
                 errno: LINUX_EEXIST,
             });
         }
-        if let Some(rootfs) = &self.rootfs {
-            match rootfs.metadata(&resolved) {
-                Ok(_) => {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: LINUX_EEXIST,
-                    });
-                }
-                Err(RootFsError::NotFound(_)) => {}
-                Err(other) => {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: rootfs_errno(other),
-                    });
+        // Layered existence check: overlay takes precedence (a directory
+        // the guest created at this path makes mkdirat fail with EEXIST
+        // even if the rootfs doesn't have it); a tombstone clears the
+        // rootfs view so a re-create is allowed.
+        match self.overlay.lookup(&resolved) {
+            Some(OverlayEntry::Dir) | Some(OverlayEntry::File(_)) => {
+                return Ok(DispatchOutcome::Errno {
+                    errno: LINUX_EEXIST,
+                });
+            }
+            Some(OverlayEntry::Deleted) => {
+                // Rootfs view is shadowed: skip the rootfs existence check
+                // below and fall through to the create path.
+            }
+            None => {
+                if let Some(rootfs) = &self.rootfs {
+                    match rootfs.metadata(&resolved) {
+                        Ok(_) => {
+                            return Ok(DispatchOutcome::Errno {
+                                errno: LINUX_EEXIST,
+                            });
+                        }
+                        Err(RootFsError::NotFound(_)) => {}
+                        Err(other) => {
+                            return Ok(DispatchOutcome::Errno {
+                                errno: rootfs_errno(other),
+                            });
+                        }
+                    }
                 }
             }
         }
-        Ok(DispatchOutcome::Errno { errno: LINUX_EROFS })
+        // Parent directory must exist (layered view).
+        if let Some(parent) = Path::new(&resolved).parent() {
+            let parent_str = display_rootfs_path(parent);
+            if !self.path_is_directory(&parent_str) {
+                return Ok(DispatchOutcome::Errno {
+                    errno: LINUX_ENOENT,
+                });
+            }
+        }
+        if self.overlay.make_dir(&resolved).is_err() {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            });
+        }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
     fn fchmod(&self, request: SyscallRequest) -> DispatchOutcome {
@@ -6148,14 +6498,62 @@ impl SyscallDispatcher {
     }
 
     fn renameat(
-        &self,
+        &mut self,
         request: SyscallRequest,
         memory: &impl GuestMemory,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let olddirfd = request.arg(0);
-        let oldpath = request.arg(1);
-        let newdirfd = request.arg(2);
-        let newpath = request.arg(3);
+        self.do_renameat(
+            request.arg(0),
+            request.arg(1),
+            request.arg(2),
+            request.arg(3),
+            0,
+            memory,
+        )
+    }
+
+    fn renameat2(
+        &mut self,
+        request: SyscallRequest,
+        memory: &impl GuestMemory,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        // RENAME_NOREPLACE=1, RENAME_EXCHANGE=2, RENAME_WHITEOUT=4. We
+        // implement the common subset (no flags or NOREPLACE). EXCHANGE
+        // and WHITEOUT are not supported by overlayfs in our limited
+        // mode either, so reject them.
+        const RENAME_NOREPLACE: u64 = 1;
+        const RENAME_EXCHANGE: u64 = 2;
+        let flags = request.arg(4);
+        if flags & !RENAME_NOREPLACE != 0 {
+            if flags & RENAME_EXCHANGE != 0 {
+                return Ok(DispatchOutcome::Errno {
+                    errno: LINUX_EINVAL,
+                });
+            }
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            });
+        }
+        self.do_renameat(
+            request.arg(0),
+            request.arg(1),
+            request.arg(2),
+            request.arg(3),
+            flags,
+            memory,
+        )
+    }
+
+    fn do_renameat(
+        &mut self,
+        olddirfd: u64,
+        oldpath: u64,
+        newdirfd: u64,
+        newpath: u64,
+        flags: u64,
+        memory: &impl GuestMemory,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        const RENAME_NOREPLACE: u64 = 1;
         let old = match read_guest_c_string(memory, oldpath) {
             Ok(path) => path,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
@@ -6177,26 +6575,109 @@ impl SyscallDispatcher {
             Ok(path) => path,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        let _ = resolved_new;
-        let synthetic = is_synthetic_virtual_file(&resolved_old, &self.synthetic_proc_context());
-        if synthetic {
+        if is_synthetic_virtual_file(&resolved_old, &self.synthetic_proc_context())
+            || is_synthetic_virtual_file(&resolved_new, &self.synthetic_proc_context())
+        {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EROFS });
         }
-        let Some(rootfs) = &self.rootfs else {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_ENOENT,
-            });
+        // Layered lookup for the source.
+        let (src_kind, src_contents, src_in_overlay): (RootFsEntryKind, Option<Vec<u8>>, bool) =
+            match self.overlay.lookup(&resolved_old) {
+                Some(OverlayEntry::Deleted) => {
+                    return Ok(DispatchOutcome::Errno {
+                        errno: LINUX_ENOENT,
+                    });
+                }
+                Some(OverlayEntry::Dir) => (RootFsEntryKind::Directory, None, true),
+                Some(OverlayEntry::File(bytes)) => {
+                    (RootFsEntryKind::File, Some(bytes.to_vec()), true)
+                }
+                None => {
+                    let Some(rootfs) = &self.rootfs else {
+                        return Ok(DispatchOutcome::Errno {
+                            errno: LINUX_ENOENT,
+                        });
+                    };
+                    match rootfs.symlink_metadata(&resolved_old) {
+                        Ok(metadata) => match metadata.kind {
+                            RootFsEntryKind::File | RootFsEntryKind::Symlink => {
+                                let contents = match rootfs.read(&resolved_old) {
+                                    Ok(bytes) => bytes,
+                                    Err(errno) => {
+                                        return Ok(DispatchOutcome::Errno {
+                                            errno: rootfs_errno(errno),
+                                        });
+                                    }
+                                };
+                                (RootFsEntryKind::File, Some(contents), false)
+                            }
+                            RootFsEntryKind::Directory => {
+                                (RootFsEntryKind::Directory, None, false)
+                            }
+                        },
+                        Err(errno) => {
+                            return Ok(DispatchOutcome::Errno {
+                                errno: rootfs_errno(errno),
+                            });
+                        }
+                    }
+                }
+            };
+        // Layered lookup for the destination.
+        let dst_exists = match self.overlay.lookup(&resolved_new) {
+            Some(OverlayEntry::Deleted) => false,
+            Some(OverlayEntry::Dir) | Some(OverlayEntry::File(_)) => true,
+            None => self
+                .rootfs
+                .as_ref()
+                .map(|rootfs| rootfs.symlink_metadata(&resolved_new).is_ok())
+                .unwrap_or(false),
         };
-        match rootfs.symlink_metadata(&resolved_old) {
-            Ok(_) => Ok(DispatchOutcome::Errno { errno: LINUX_EROFS }),
-            Err(errno) => Ok(DispatchOutcome::Errno {
-                errno: rootfs_errno(errno),
-            }),
+        if dst_exists && flags & RENAME_NOREPLACE != 0 {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EEXIST,
+            });
         }
+        // Materialise the destination in the overlay.
+        match src_kind {
+            RootFsEntryKind::File | RootFsEntryKind::Symlink => {
+                let bytes = src_contents.unwrap_or_default();
+                if self
+                    .overlay
+                    .set_file_contents(&resolved_new, bytes)
+                    .is_err()
+                {
+                    return Ok(DispatchOutcome::Errno {
+                        errno: LINUX_EINVAL,
+                    });
+                }
+            }
+            RootFsEntryKind::Directory => {
+                if self.overlay.make_dir(&resolved_new).is_err() {
+                    return Ok(DispatchOutcome::Errno {
+                        errno: LINUX_EINVAL,
+                    });
+                }
+            }
+        }
+        // Remove the source: drop overlay entry (if any) and tombstone
+        // it iff the rootfs still has it underneath.
+        if src_in_overlay {
+            self.overlay.remove_entry(&resolved_old);
+        }
+        let rootfs_has_src = self
+            .rootfs
+            .as_ref()
+            .map(|rootfs| rootfs.symlink_metadata(&resolved_old).is_ok())
+            .unwrap_or(false);
+        if rootfs_has_src {
+            let _ = self.overlay.mark_deleted(&resolved_old);
+        }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
     fn unlinkat(
-        &self,
+        &mut self,
         request: SyscallRequest,
         memory: &impl GuestMemory,
     ) -> Result<DispatchOutcome, DispatchError> {
@@ -6221,30 +6702,72 @@ impl SyscallDispatcher {
             Ok(resolved) => resolved,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        let kind = if is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context()) {
-            RootFsEntryKind::File
-        } else {
-            let Some(rootfs) = &self.rootfs else {
+        let remove_dir = flags & LINUX_AT_REMOVEDIR != 0;
+        // Layered lookup: overlay first (including the tombstone case),
+        // then synthetic /proc files (still EROFS — can't unlink them),
+        // then fall through to the rootfs.
+        let (kind, in_overlay, in_rootfs) = match self.overlay.lookup(&resolved) {
+            Some(OverlayEntry::Deleted) => {
                 return Ok(DispatchOutcome::Errno {
                     errno: LINUX_ENOENT,
                 });
-            };
-            match rootfs.symlink_metadata(&resolved) {
-                Ok(metadata) => metadata.kind,
-                Err(errno) => {
+            }
+            Some(OverlayEntry::Dir) => (RootFsEntryKind::Directory, true, false),
+            Some(OverlayEntry::File(_)) => (RootFsEntryKind::File, true, false),
+            None => {
+                if is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context()) {
+                    return Ok(DispatchOutcome::Errno { errno: LINUX_EROFS });
+                }
+                let Some(rootfs) = &self.rootfs else {
                     return Ok(DispatchOutcome::Errno {
-                        errno: rootfs_errno(errno),
+                        errno: LINUX_ENOENT,
                     });
+                };
+                match rootfs.symlink_metadata(&resolved) {
+                    Ok(metadata) => (metadata.kind, false, true),
+                    Err(errno) => {
+                        return Ok(DispatchOutcome::Errno {
+                            errno: rootfs_errno(errno),
+                        });
+                    }
                 }
             }
         };
-        let remove_dir = flags & LINUX_AT_REMOVEDIR != 0;
-        let errno = match (kind, remove_dir) {
-            (RootFsEntryKind::Directory, false) => LINUX_EISDIR,
-            (RootFsEntryKind::File | RootFsEntryKind::Symlink, true) => LINUX_ENOTDIR,
-            _ => LINUX_EROFS,
-        };
-        Ok(DispatchOutcome::Errno { errno })
+        match (kind, remove_dir) {
+            (RootFsEntryKind::Directory, false) => {
+                return Ok(DispatchOutcome::Errno {
+                    errno: LINUX_EISDIR,
+                });
+            }
+            (RootFsEntryKind::File | RootFsEntryKind::Symlink, true) => {
+                return Ok(DispatchOutcome::Errno {
+                    errno: LINUX_ENOTDIR,
+                });
+            }
+            _ => {}
+        }
+        if in_overlay {
+            // Drop the overlay's entry. If the same path also lives in
+            // the rootfs we must tombstone so the layered view shows it
+            // as gone.
+            self.overlay.remove_entry(&resolved);
+            let rootfs_has_it = self
+                .rootfs
+                .as_ref()
+                .map(|rootfs| rootfs.symlink_metadata(&resolved).is_ok())
+                .unwrap_or(false);
+            if rootfs_has_it {
+                let _ = self.overlay.mark_deleted(&resolved);
+            }
+        } else if in_rootfs {
+            // Tombstone the rootfs-backed path.
+            if self.overlay.mark_deleted(&resolved).is_err() {
+                return Ok(DispatchOutcome::Errno {
+                    errno: LINUX_EINVAL,
+                });
+            }
+        }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
     fn utimensat(
@@ -6345,6 +6868,19 @@ impl SyscallDispatcher {
             Ok(path) => path,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
+        // Layered: overlay first (including tombstones), then synthetic
+        // /proc and /sys, then rootfs.
+        match self.overlay.lookup(&path) {
+            Some(OverlayEntry::Deleted) => {
+                return Ok(DispatchOutcome::Errno { errno: LINUX_ENOENT });
+            }
+            Some(OverlayEntry::Dir) | Some(OverlayEntry::File(_)) => {
+                if let Some(metadata) = self.overlay.metadata(&path) {
+                    return Ok(write_stat(memory, statbuf, &metadata));
+                }
+            }
+            None => {}
+        }
         if let Some(contents) = synthetic_proc_file(&path, &self.synthetic_proc_context()) {
             return Ok(write_synthetic_stat(memory, statbuf, &path, contents.len()));
         }
@@ -6402,6 +6938,18 @@ impl SyscallDispatcher {
             Ok(path) => path,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
+        // Layered: overlay first.
+        match self.overlay.lookup(&path) {
+            Some(OverlayEntry::Deleted) => {
+                return Ok(DispatchOutcome::Errno { errno: LINUX_ENOENT });
+            }
+            Some(OverlayEntry::Dir) | Some(OverlayEntry::File(_)) => {
+                if let Some(metadata) = self.overlay.metadata(&path) {
+                    return Ok(write_statx(memory, statxbuf, &metadata));
+                }
+            }
+            None => {}
+        }
         if let Some(contents) = synthetic_proc_file(&path, &self.synthetic_proc_context()) {
             return Ok(write_synthetic_statx(
                 memory,
@@ -6601,6 +7149,19 @@ fn bootstrap_signal_send(target: i64, tid_required: bool, signum: u64) -> Dispat
 /// whenever the payload is a Linux UAPI struct: that path is bound to
 /// `KernelAbi::ABI_SIZE` so it CAN'T accidentally over-write a caller's
 /// stack buffer the way an ad-hoc `&[u8]` from `as_bytes()` can.
+/// Apply `bytes` to a `Vec<u8>` file backing at `*offset`, growing the
+/// vector (zero-filled if there's a gap) and advancing the cursor. This
+/// is the in-memory mirror of `vfs_write`: it makes a writable
+/// overlay-backed File behave like a real tmpfs.
+fn write_into_file_contents(contents: &mut Vec<u8>, offset: &mut usize, bytes: &[u8]) {
+    let end = *offset + bytes.len();
+    if end > contents.len() {
+        contents.resize(end, 0);
+    }
+    contents[*offset..end].copy_from_slice(bytes);
+    *offset = end;
+}
+
 fn write_packed(memory: &mut impl GuestMemory, address: u64, bytes: &[u8]) -> DispatchOutcome {
     if memory.write_bytes(address, bytes).is_err() {
         DispatchOutcome::Errno {
@@ -8443,4 +9004,234 @@ fn read_guest_c_string(memory: &impl GuestMemory, address: u64) -> Result<String
         bytes.push(byte);
     }
     Err(LINUX_ENAMETOOLONG)
+}
+
+#[cfg(test)]
+mod overlay_dispatch_tests {
+    //! End-to-end overlay tests that drive the public `dispatch` entry
+    //! point. The fixture builds a tiny tar-backed RootFs holding one
+    //! directory and one file, then exercises the syscall path the same
+    //! way the runtime does (SyscallRequest + LinearMemory + compat
+    //! reporter). The assertions are what `apt update` needs to keep
+    //! working: writable mkdirat, openat O_CREAT + write + read,
+    //! unlink-then-ENOENT, rename-moves-overlay-content.
+    //!
+    //! Keep these tests minimal — there's no need to exercise every
+    //! flag combination here, just the four scenarios called out in the
+    //! task spec.
+    use super::*;
+    use crate::compat::CompatReporter;
+    use crate::rootfs::LayerSource;
+    use tar::{Builder, EntryType, Header};
+    const SYS_OPENAT: u64 = 56;
+    const SYS_CLOSE: u64 = 57;
+    const SYS_READ: u64 = 63;
+    const SYS_WRITE: u64 = 64;
+    const SYS_NEWFSTATAT: u64 = 79;
+    const SYS_MKDIRAT: u64 = 34;
+    const SYS_UNLINKAT: u64 = 35;
+    const SYS_RENAMEAT: u64 = 38;
+    const O_CREAT: u64 = 0o100;
+    const O_WRONLY: u64 = 1;
+    const O_RDONLY: u64 = 0;
+
+    /// 16 KiB scratch buffer at virtual base 0x4000_0000. Tests pack
+    /// pathnames + read/write buffers into this. The dispatcher itself
+    /// only needs valid byte addresses for the syscalls under test —
+    /// stat/statx writes a small fixed-size struct into the buffer.
+    const MEM_BASE: u64 = 0x4000_0000;
+    const MEM_LEN: usize = 16 * 1024;
+
+    fn empty_rootfs() -> RootFs {
+        // Bake a single layer containing /etc/motd and the directories
+        // it lives under, so we can exercise both the rootfs-backed and
+        // overlay-backed lookup paths.
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut builder = Builder::new(&mut buf);
+            for dir in ["etc", "var", "var/lib", "var/lib/apt"] {
+                let mut h = Header::new_gnu();
+                h.set_path(format!("{}/", dir)).unwrap();
+                h.set_entry_type(EntryType::Directory);
+                h.set_size(0);
+                h.set_mode(0o755);
+                h.set_cksum();
+                builder.append(&h, std::io::empty()).unwrap();
+            }
+            let body: &[u8] = b"hello, world\n";
+            let mut h = Header::new_gnu();
+            h.set_path("etc/motd").unwrap();
+            h.set_size(body.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            builder.append(&h, body).unwrap();
+            builder.finish().unwrap();
+        }
+        RootFs::from_layers(std::iter::once(LayerSource::Tar(buf))).unwrap()
+    }
+
+    struct Harness {
+        dispatcher: SyscallDispatcher,
+        memory: LinearMemory,
+        reporter: CompatReporter,
+        cursor: u64,
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            Self {
+                dispatcher: SyscallDispatcher::with_rootfs(empty_rootfs()),
+                memory: LinearMemory::new(MEM_BASE, vec![0u8; MEM_LEN]),
+                reporter: CompatReporter::default(),
+                cursor: MEM_BASE + 4096, // leave the first page for stat bufs etc
+            }
+        }
+
+        /// Copy `s` (NUL-terminated) into the guest scratch region and
+        /// return its address.
+        fn put_str(&mut self, s: &str) -> u64 {
+            let addr = self.cursor;
+            let mut bytes = s.as_bytes().to_vec();
+            bytes.push(0);
+            self.memory.write_bytes(addr, &bytes).unwrap();
+            self.cursor += bytes.len() as u64;
+            // 8-byte align for the next allocation.
+            self.cursor = (self.cursor + 7) & !7;
+            addr
+        }
+
+        fn put_bytes(&mut self, b: &[u8]) -> u64 {
+            let addr = self.cursor;
+            self.memory.write_bytes(addr, b).unwrap();
+            self.cursor += b.len() as u64;
+            self.cursor = (self.cursor + 7) & !7;
+            addr
+        }
+
+        fn reserve(&mut self, n: usize) -> u64 {
+            let addr = self.cursor;
+            self.cursor += n as u64;
+            self.cursor = (self.cursor + 7) & !7;
+            addr
+        }
+
+        fn call(&mut self, number: u64, args: [u64; 6]) -> DispatchOutcome {
+            let request = SyscallRequest::new(number, SyscallArgs(args));
+            self.dispatcher
+                .dispatch(request, &mut self.memory, &mut self.reporter)
+                .expect("dispatch must not surface a fatal error")
+        }
+    }
+
+    fn returned(outcome: DispatchOutcome) -> i64 {
+        match outcome {
+            DispatchOutcome::Returned { value } => value,
+            other => panic!("expected Returned, got {other:?}"),
+        }
+    }
+
+    fn errno(outcome: DispatchOutcome) -> i32 {
+        match outcome {
+            DispatchOutcome::Errno { errno } => errno,
+            other => panic!("expected Errno, got {other:?}"),
+        }
+    }
+
+    const AT_FDCWD: u64 = (-100i64) as u64;
+
+    #[test]
+    fn mkdirat_creates_overlay_dir_and_fstatat_sees_it() {
+        let mut h = Harness::new();
+        let path = h.put_str("/var/lib/apt/lists");
+        let outcome = h.call(SYS_MKDIRAT, [AT_FDCWD, path, 0o755, 0, 0, 0]);
+        assert_eq!(returned(outcome), 0);
+
+        // fstatat must succeed and report a directory. The Linux stat
+        // layout puts st_mode at bytes 16..20; bit S_IFDIR=0o040000.
+        let statbuf = h.reserve(160);
+        let path2 = h.put_str("/var/lib/apt/lists");
+        let outcome = h.call(SYS_NEWFSTATAT, [AT_FDCWD, path2, statbuf, 0, 0, 0]);
+        assert_eq!(returned(outcome), 0);
+        let mode_bytes = h.memory.read_bytes(statbuf + 16, 4).unwrap();
+        let mode = u32::from_le_bytes(mode_bytes.try_into().unwrap());
+        assert_eq!(mode & 0o170000, 0o040000, "S_IFDIR not set in stat mode");
+    }
+
+    #[test]
+    fn openat_o_creat_then_write_then_read_round_trips() {
+        let mut h = Harness::new();
+        // O_CREAT|O_WRONLY: writable, brand-new file inside an existing
+        // rootfs directory.
+        let path = h.put_str("/var/lib/apt/lock");
+        let outcome = h.call(
+            SYS_OPENAT,
+            [AT_FDCWD, path, O_CREAT | O_WRONLY, 0o644, 0, 0],
+        );
+        let fd = returned(outcome) as u64;
+        assert!(fd >= 3, "expected real fd, got {fd}");
+
+        // Write four bytes.
+        let payload = h.put_bytes(b"OKAY");
+        let outcome = h.call(SYS_WRITE, [fd, payload, 4, 0, 0, 0]);
+        assert_eq!(returned(outcome), 4);
+        let outcome = h.call(SYS_CLOSE, [fd, 0, 0, 0, 0, 0]);
+        assert_eq!(returned(outcome), 0);
+
+        // Re-open O_RDONLY and read back.
+        let path = h.put_str("/var/lib/apt/lock");
+        let outcome = h.call(SYS_OPENAT, [AT_FDCWD, path, O_RDONLY, 0, 0, 0]);
+        let fd = returned(outcome) as u64;
+        let dest = h.reserve(16);
+        let outcome = h.call(SYS_READ, [fd, dest, 16, 0, 0, 0]);
+        assert_eq!(returned(outcome), 4);
+        let bytes = h.memory.read_bytes(dest, 4).unwrap();
+        assert_eq!(&bytes, b"OKAY");
+    }
+
+    #[test]
+    fn unlinkat_on_rootfs_file_then_openat_returns_enoent() {
+        let mut h = Harness::new();
+        // /etc/motd lives in the rootfs.
+        let path = h.put_str("/etc/motd");
+        let outcome = h.call(SYS_UNLINKAT, [AT_FDCWD, path, 0, 0, 0, 0]);
+        assert_eq!(returned(outcome), 0);
+
+        let path = h.put_str("/etc/motd");
+        let outcome = h.call(SYS_OPENAT, [AT_FDCWD, path, O_RDONLY, 0, 0, 0]);
+        assert_eq!(errno(outcome), LINUX_ENOENT);
+    }
+
+    #[test]
+    fn renameat_moves_overlay_backed_file() {
+        let mut h = Harness::new();
+        // Create a file in the overlay first.
+        let path = h.put_str("/var/lib/apt/lock");
+        let outcome = h.call(
+            SYS_OPENAT,
+            [AT_FDCWD, path, O_CREAT | O_WRONLY, 0o644, 0, 0],
+        );
+        let fd = returned(outcome) as u64;
+        let payload = h.put_bytes(b"DATA");
+        let _ = h.call(SYS_WRITE, [fd, payload, 4, 0, 0, 0]);
+        let _ = h.call(SYS_CLOSE, [fd, 0, 0, 0, 0, 0]);
+
+        let from = h.put_str("/var/lib/apt/lock");
+        let to = h.put_str("/var/lib/apt/lock.new");
+        let outcome = h.call(SYS_RENAMEAT, [AT_FDCWD, from, AT_FDCWD, to, 0, 0]);
+        assert_eq!(returned(outcome), 0);
+
+        // Source must now ENOENT, destination must read back the data.
+        let path = h.put_str("/var/lib/apt/lock");
+        let outcome = h.call(SYS_OPENAT, [AT_FDCWD, path, O_RDONLY, 0, 0, 0]);
+        assert_eq!(errno(outcome), LINUX_ENOENT);
+
+        let path = h.put_str("/var/lib/apt/lock.new");
+        let outcome = h.call(SYS_OPENAT, [AT_FDCWD, path, O_RDONLY, 0, 0, 0]);
+        let fd = returned(outcome) as u64;
+        let dest = h.reserve(16);
+        let outcome = h.call(SYS_READ, [fd, dest, 16, 0, 0, 0]);
+        assert_eq!(returned(outcome), 4);
+        let bytes = h.memory.read_bytes(dest, 4).unwrap();
+        assert_eq!(&bytes, b"DATA");
+    }
 }
