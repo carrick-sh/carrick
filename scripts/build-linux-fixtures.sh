@@ -122,6 +122,8 @@ build_fixture "signal_basic.rs" "carrick-linux-aarch64-signal-basic"
 build_fixture "signal_default.rs" "carrick-linux-aarch64-signal-default"
 build_fixture "pipe_fork_poll.rs" "carrick-linux-aarch64-pipe-fork-poll"
 build_fixture "pipe_bidi.rs" "carrick-linux-aarch64-pipe-bidi"
+build_fixture "pipe_dup3.rs" "carrick-linux-aarch64-pipe-dup3"
+build_fixture "inet_connect.rs" "carrick-linux-aarch64-inet-connect"
 build_pie_fixture "pie_hello.rs" "carrick-linux-aarch64-pie-hello"
 
 cargo metadata \
