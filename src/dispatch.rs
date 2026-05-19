@@ -1644,21 +1644,21 @@ impl SyscallDispatcher {
         }
 
         match ioctl_request {
-            LINUX_TIOCGWINSZ if is_stdio_fd(fd) => {
+            LINUX_TIOCGWINSZ if fd_is_tty(&self.open_files, fd) => {
                 let winsize = LinuxWinsize::terminal_80x24();
                 write_packed(memory, arg, winsize.as_bytes())
             }
             LINUX_TIOCGWINSZ => DispatchOutcome::Errno {
                 errno: LINUX_ENOTTY,
             },
-            LINUX_TCGETS if is_stdio_fd(fd) => {
+            LINUX_TCGETS if fd_is_tty(&self.open_files, fd) => {
                 let termios = LinuxTermios::default_cooked();
                 write_packed(memory, arg, termios.as_bytes())
             }
             LINUX_TCGETS => DispatchOutcome::Errno {
                 errno: LINUX_ENOTTY,
             },
-            LINUX_TCSETS | LINUX_TCSETSW | LINUX_TCSETSF if is_stdio_fd(fd) => {
+            LINUX_TCSETS | LINUX_TCSETSW | LINUX_TCSETSF if fd_is_tty(&self.open_files, fd) => {
                 validate_termios_buffer(memory, arg)
             }
             LINUX_TCSETS | LINUX_TCSETSW | LINUX_TCSETSF => DispatchOutcome::Errno {
@@ -5247,6 +5247,18 @@ fn linux_fd_flags_from_open_flags(flags: u64) -> u64 {
 
 fn is_stdio_fd(fd: i32) -> bool {
     matches!(fd, 0..=2)
+}
+
+/// Re-evaluate "is this fd a TTY" against the dispatcher's open-file
+/// table. fd 0/1/2 are TTYs only when nothing has been dup3'd over
+/// them (no `open_files` entry); the moment a pipe / file / eventfd
+/// occupies that slot we owe the guest `ENOTTY` so callers like
+/// `busybox ls` don't emit ANSI colour escapes into the pipe.
+fn fd_is_tty(open_files: &HashMap<i32, OpenFile>, fd: i32) -> bool {
+    if !is_stdio_fd(fd) {
+        return false;
+    }
+    !open_files.contains_key(&fd)
 }
 
 fn retain_open_file(description: &Rc<RefCell<OpenDescription>>) {
