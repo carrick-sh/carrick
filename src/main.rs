@@ -682,7 +682,7 @@ fn install_fs_backend(
     fs: Option<FsBackendKind>,
 ) -> anyhow::Result<()> {
     let kind = fs.unwrap_or_else(default_fs_backend_kind);
-    let backend: Box<dyn FsBackend> = match kind {
+    let mut backend: Box<dyn FsBackend> = match kind {
         FsBackendKind::Memory => Box::new(MemoryBackend::new()),
         FsBackendKind::Host => match HostFsBackend::new() {
             Ok(host) => Box::new(host),
@@ -694,8 +694,50 @@ fn install_fs_backend(
             }
         },
     };
+    seed_known_hosts(&mut *backend);
     let _ = dispatcher.set_fs_backend(backend);
     Ok(())
+}
+
+/// Pre-populate the overlay's `/etc/hosts` with macOS-resolved IPs
+/// for the apt repos. glibc's NSS reads `hosts: files dns` from
+/// `/etc/nsswitch.conf`, so a hit in `/etc/hosts` short-circuits the
+/// DNS round-trip — which sidesteps the recvfrom timing that
+/// otherwise leaves apt's resolver stuck waiting for an AAAA-companion
+/// response. The resolution happens on the host in a single
+/// `ToSocketAddrs` call before the guest even starts, so no extra
+/// syscalls or guest-side waits.
+fn seed_known_hosts(backend: &mut dyn carrick::fs_backend::FsBackend) {
+    use std::net::ToSocketAddrs;
+    const HOSTNAMES: &[&str] = &[
+        "deb.debian.org",
+        "security.debian.org",
+        "ftp.debian.org",
+        "archive.ubuntu.com",
+        "security.ubuntu.com",
+        "ports.ubuntu.com",
+    ];
+    let mut hosts_content = String::from(
+        "127.0.0.1\tlocalhost\n\
+         ::1\tlocalhost ip6-localhost ip6-loopback\n\
+         ff02::1\tip6-allnodes\n\
+         ff02::2\tip6-allrouters\n",
+    );
+    for hostname in HOSTNAMES {
+        if let Ok(addrs) = (*hostname, 80u16).to_socket_addrs() {
+            for addr in addrs {
+                match addr.ip() {
+                    std::net::IpAddr::V4(v4) => {
+                        hosts_content.push_str(&format!("{}\t{}\n", v4, hostname));
+                        break; // one A record is enough; saves /etc/hosts noise
+                    }
+                    std::net::IpAddr::V6(_) => {}
+                }
+            }
+        }
+    }
+    let _ = backend.make_dir("/etc");
+    let _ = backend.set_file_contents("/etc/hosts", hosts_content.into_bytes());
 }
 
 /// Default backend choice: prefer `host` because that's the secure-
