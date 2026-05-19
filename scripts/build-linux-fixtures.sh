@@ -120,6 +120,8 @@ build_fixture "linkat_motd.rs" "carrick-linux-aarch64-linkat-motd"
 build_fixture "errno_matrix.rs" "carrick-linux-aarch64-errno-matrix"
 build_fixture "signal_basic.rs" "carrick-linux-aarch64-signal-basic"
 build_fixture "signal_default.rs" "carrick-linux-aarch64-signal-default"
+build_fixture "pipe_fork_poll.rs" "carrick-linux-aarch64-pipe-fork-poll"
+build_fixture "pipe_bidi.rs" "carrick-linux-aarch64-pipe-bidi"
 build_pie_fixture "pie_hello.rs" "carrick-linux-aarch64-pie-hello"
 
 cargo metadata \

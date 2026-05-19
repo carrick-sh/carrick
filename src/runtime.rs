@@ -476,6 +476,7 @@ where
                             new_image.initial_stack_pointer().unwrap_or(0),
                             new_image.regions().len() as u64,
                         );
+                        dispatcher.close_cloexec_fds();
                         runtime.execve_into(&new_image)?;
                     }
                     Err(errno) => {
@@ -693,6 +694,13 @@ where
                             new_image.initial_stack_pointer().unwrap_or(0),
                             new_image.regions().len() as u64,
                         );
+                        // Linux semantics: drop every fd marked FD_CLOEXEC.
+                        // Without this, a forked-then-exec'd child keeps
+                        // its parent's pipe ends open, which leaves the
+                        // host kernel pipe in a state where the parent's
+                        // POLLIN can't fire — the cause of the apt update
+                        // deadlock between apt-main and its http method.
+                        dispatcher.close_cloexec_fds();
                         trap.execve_into(&new_image)?;
                     }
                     Err(errno) => {

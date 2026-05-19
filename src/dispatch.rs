@@ -726,6 +726,37 @@ impl SyscallDispatcher {
         self.stderr.clear();
     }
 
+    /// Linux execve(2) closes every fd that had FD_CLOEXEC set. Our
+    /// dispatcher previously preserved every fd across execve, which
+    /// meant a forked-then-exec'd child kept holding read-end references
+    /// to all of its parent's pipes — even ones it had marked CLOEXEC.
+    /// apt's http method sets CLOEXEC on fd 3..1023, un-sets it on
+    /// 0/1/2, then execve's, expecting the kernel to drop the inherited
+    /// pipe ends. Without that drop, the host kernel pipe stays in a
+    /// state where the parent's POLLIN never fires reliably.
+    ///
+    /// Walk open_files; for each fd whose fd_flags include FD_CLOEXEC,
+    /// remove it and run close_open_file (which honours the Rc-count
+    /// guard, so we don't close a host fd a sibling fd still aliases).
+    pub fn close_cloexec_fds(&mut self) {
+        let cloexec_fds: Vec<i32> = self
+            .open_files
+            .iter()
+            .filter_map(|(fd, of)| {
+                if of.fd_flags & LINUX_FD_CLOEXEC != 0 {
+                    Some(*fd)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for fd in cloexec_fds {
+            if let Some(open_file) = self.open_files.remove(&fd) {
+                close_open_file(&open_file);
+            }
+        }
+    }
+
     pub fn stderr(&self) -> &[u8] {
         &self.stderr
     }
