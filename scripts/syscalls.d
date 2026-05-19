@@ -92,6 +92,13 @@ carrick*:::signal-unsupported
         (int)arg0, copyinstr(arg1));
 }
 
+carrick*:::vcpu-trap
+/pid == $target || progenyof($target)/
+{
+    /* Aggregate by guest PC so we can spot tight loops. */
+    @vcpu_pcs[arg0, arg1] = count();
+}
+
 carrick*:::fork-pre
 /pid == $target || progenyof($target)/
 {
@@ -141,4 +148,7 @@ dtrace:::END
 
     printf("\n--- unsupported signals ---\n");
     printa("  signum=%-2d reason=%-24s %@d\n", @unsupported_signals);
+
+    printf("\n--- guest PC × syscall hot spots ---\n");
+    printa("  pc=%#-12x x8=%-4d %@d\n", @vcpu_pcs);
 }

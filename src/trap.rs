@@ -231,6 +231,13 @@ struct VcpuSnapshot {
     cpacr_el1: u64,
     spsr_el1: u64,
     elr_el1: u64,
+    /// EL0 thread pointer. Set by musl during thread init via the asm
+    /// `msr tpidr_el0, x?` and read back via `mrs x?, TPIDR_EL0`. If
+    /// we don't restore it post-fork, the child's musl post-clone
+    /// path computes thread-struct offsets relative to bogus zero
+    /// and either writes to unmapped memory or loops indefinitely
+    /// because the thread's tid never lands at the expected slot.
+    tpidr_el0: u64,
     last_exit_class: u64,
 }
 
@@ -594,7 +601,7 @@ impl HvfInner {
             let _ = (spsr, x2, x3, x4, x5);
         }
 
-        Ok(Aarch64SyscallFrame {
+        let frame = Aarch64SyscallFrame {
             x0: self.vcpu.get_reg(Reg::X0).map_err(hvf_error)?,
             x1: self.vcpu.get_reg(Reg::X1).map_err(hvf_error)?,
             x2: self.vcpu.get_reg(Reg::X2).map_err(hvf_error)?,
@@ -602,7 +609,17 @@ impl HvfInner {
             x4: self.vcpu.get_reg(Reg::X4).map_err(hvf_error)?,
             x5: self.vcpu.get_reg(Reg::X5).map_err(hvf_error)?,
             x8: self.vcpu.get_reg(Reg::X8).map_err(hvf_error)?,
-        })
+        };
+        // Guest EL0 PC at the trap. HVF sets ELR_EL1 to the
+        // instruction-after-svc when it dispatches the synchronous
+        // exception, so this is the address the guest will resume at
+        // after `complete_syscall`.
+        let guest_pc = self
+            .vcpu
+            .get_sys_reg(SysReg::ELR_EL1)
+            .unwrap_or(0);
+        crate::probes::vcpu_trap(guest_pc, frame.x8, frame.x0);
+        Ok(frame)
     }
 
     fn complete_syscall(&mut self, return_value: i64) -> Result<(), TrapError> {
@@ -704,6 +721,7 @@ impl HvfInner {
             cpacr_el1: self.vcpu.get_sys_reg(SysReg::CPACR_EL1).map_err(hvf_error)?,
             spsr_el1: self.vcpu.get_sys_reg(SysReg::SPSR_EL1).map_err(hvf_error)?,
             elr_el1: self.vcpu.get_sys_reg(SysReg::ELR_EL1).map_err(hvf_error)?,
+            tpidr_el0: self.vcpu.get_sys_reg(SysReg::TPIDR_EL0).map_err(hvf_error)?,
             last_exit_class: self.last_exit_class,
         })
     }
@@ -746,6 +764,9 @@ impl HvfInner {
             .map_err(hvf_error)?;
         self.vcpu
             .set_sys_reg(SysReg::ELR_EL1, snap.elr_el1)
+            .map_err(hvf_error)?;
+        self.vcpu
+            .set_sys_reg(SysReg::TPIDR_EL0, snap.tpidr_el0)
             .map_err(hvf_error)?;
         // Apply SCTLR last so the MMU enable lands with the new tables.
         self.vcpu
