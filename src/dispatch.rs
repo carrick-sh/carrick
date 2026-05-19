@@ -262,6 +262,10 @@ pub enum DispatchOutcome {
     Returned { value: i64 },
     Errno { errno: i32 },
     Exit { code: i32 },
+    /// `clone(2)` with process-creation flags. The runtime must perform
+    /// a real macOS fork against the trap engine, then write the child
+    /// pid (parent) or 0 (child) into x0 to complete the syscall.
+    Fork,
 }
 
 impl DispatchOutcome {
@@ -270,6 +274,7 @@ impl DispatchOutcome {
             DispatchOutcome::Returned { value } => (value, None),
             DispatchOutcome::Errno { errno } => (-(errno as i64), Some(errno)),
             DispatchOutcome::Exit { code } => (code as i64, None),
+            DispatchOutcome::Fork => (0, None),
         }
     }
 }
@@ -657,6 +662,7 @@ impl SyscallDispatcher {
             214 => self.brk(request),
             215 => self.munmap(request),
             216 => self.mremap(request),
+            220 => self.clone(request),
             222 => self.mmap(request, memory)?,
             226 => self.mprotect(request, memory),
             227 => self.msync(request, memory),
@@ -3140,6 +3146,39 @@ impl SyscallDispatcher {
             | OpenDescription::PipeWriter { .. } => {}
         }
         DispatchOutcome::Returned { value: next }
+    }
+
+    /// Linux `clone(2)` (aarch64 syscall 220). Real fork delegation:
+    /// the dispatcher recognises clone, returns `DispatchOutcome::Fork`,
+    /// and the runtime asks the trap engine to do a real macOS fork
+    /// against the live HVF state.
+    ///
+    /// Currently only the simple SIGCHLD case (musl/glibc `fork()` wrapper
+    /// → `clone(SIGCHLD, 0, ...)`) is wired. Thread-create flags
+    /// (CLONE_VM | CLONE_THREAD) and namespace/process-share variants
+    /// fall through to ENOSYS until the next iteration.
+    fn clone(&mut self, request: SyscallRequest) -> DispatchOutcome {
+        const CLONE_VM: u64 = 0x00000100;
+        const CLONE_FS: u64 = 0x00000200;
+        const CLONE_FILES: u64 = 0x00000400;
+        const CLONE_SIGHAND: u64 = 0x00000800;
+        const CLONE_THREAD: u64 = 0x00010000;
+
+        let flags = request.arg(0);
+        // Thread creation needs pthread_create semantics, not fork.
+        // Surface as ENOSYS for now so callers see "function not
+        // implemented" rather than spuriously cloning the whole address
+        // space when they wanted a thread.
+        let thread_mask =
+            CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
+        if (flags & thread_mask) == thread_mask {
+            return DispatchOutcome::Errno {
+                errno: LINUX_ENOSYS,
+            };
+        }
+
+        // Anything else (including the SIGCHLD-only fork case) → real fork.
+        DispatchOutcome::Fork
     }
 
     fn brk(&mut self, request: SyscallRequest) -> DispatchOutcome {

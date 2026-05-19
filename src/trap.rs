@@ -36,6 +36,24 @@ pub enum TrapError {
         virtual_address: u64,
         physical_address: u64,
     },
+    #[error("fork(2) failed: {0}")]
+    ForkFailed(String),
+    #[error("hv_vm_map(host=0x{host_addr:x}, guest=0x{guest_start:x}, size={size}) failed in child: 0x{code:x}")]
+    ChildMapFailed {
+        host_addr: u64,
+        guest_start: u64,
+        size: usize,
+        code: u32,
+    },
+}
+
+/// Outcome of `HvfTrapEngine::fork`. The parent learns the child's PID;
+/// the child returns and continues executing with a freshly-rebuilt HVF
+/// VM that points at the same host buffers (Mach VM gives us COW for free).
+#[derive(Debug)]
+pub enum ForkOutcome {
+    Parent { child_pid: i32 },
+    Child,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -151,7 +169,45 @@ struct HvfInner {
 struct HvfMappedRegion {
     start: u64,
     end: u64,
-    memory: applevisor::memory::Memory,
+    /// Host VA of the buffer backing this guest-physical mapping. We
+    /// record this explicitly so the fork(2) path can re-issue
+    /// `hv_vm_map` in the child against the same (COW'd) host pages
+    /// without going through `applevisor::Memory::new` (which would
+    /// allocate a fresh buffer).
+    host_addr: *mut u8,
+    /// Size of the mapping in bytes (matches the size HVF was given).
+    size: usize,
+    /// Stage-2 permissions used to map the region. Same value that
+    /// `hvf_perms` returned; the child rebuilds the mapping with these
+    /// exact permissions.
+    perms: applevisor::memory::MemPerms,
+    /// `Memory` owns the host allocation and the hv_vm_unmap that
+    /// fires on Drop. In a freshly-forked CHILD we replace this with
+    /// `None` (after `mem::forget` on the inherited inner) — the host
+    /// pages stay alive via COW; the unmap would target the parent's
+    /// HVF context which no longer exists in the child.
+    memory: Option<applevisor::memory::Memory>,
+}
+
+/// Snapshot of vCPU register state captured before fork(2). The child
+/// restores from this after rebuilding the HVF context so it resumes
+/// exactly where the parent left off (post-clone syscall).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Clone)]
+struct VcpuSnapshot {
+    gprs: [u64; 31], // X0..X30
+    pc: u64,
+    cpsr: u64,
+    sp_el0: u64,
+    sctlr_el1: u64,
+    tcr_el1: u64,
+    ttbr0_el1: u64,
+    mair_el1: u64,
+    vbar_el1: u64,
+    cpacr_el1: u64,
+    spsr_el1: u64,
+    elr_el1: u64,
+    last_exit_class: u64,
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -192,6 +248,23 @@ impl HvfTrapEngine {
 
     pub fn complete_syscall(&mut self, return_value: i64) -> Result<(), TrapError> {
         self.inner.complete_syscall(return_value)
+    }
+
+    /// Real macOS fork(2). The parent continues running its existing HVF
+    /// context unchanged; the child returns with a freshly-rebuilt VM
+    /// pointing at the same host buffers (COW via Mach VM), all sysregs
+    /// and GPRs restored from a pre-fork snapshot, and `complete_syscall`
+    /// not yet called for the clone — so the caller writes 0 (child) or
+    /// the child's pid (parent) into x0 to satisfy the guest's
+    /// expectations.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn fork(&mut self) -> Result<ForkOutcome, TrapError> {
+        self.inner.fork()
+    }
+
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    pub fn fork(&mut self) -> Result<ForkOutcome, TrapError> {
+        Err(TrapError::UnsupportedPlatform)
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -248,6 +321,10 @@ impl HvfTrapEngine {
                     if mapping.perms.execute { '+' } else { '-' },
                 );
             }
+            let host_addr = memory.host_addr();
+            let size = usize::try_from(mapping.mapped_size)
+                .map_err(|_| TrapError::MappingTooLarge(mapping.mapped_size))?;
+            let perms = hvf_perms(mapping.perms);
             self.inner.mappings.push(HvfMappedRegion {
                 start: mapping.guest_start,
                 end: mapping.guest_start.checked_add(mapping.mapped_size).ok_or(
@@ -256,7 +333,10 @@ impl HvfTrapEngine {
                         mapped_size: mapping.mapped_size,
                     },
                 )?,
-                memory,
+                host_addr,
+                size,
+                perms,
+                memory: Some(memory),
             });
         }
 
@@ -509,11 +589,18 @@ impl HvfInner {
         let Some(mapping) = self.mapping_for_range(address, length) else {
             return Err(MemoryError::OutOfBounds { address, length });
         };
-        let mut bytes = vec![0; length];
-        mapping
-            .memory
-            .read(address, &mut bytes)
-            .map_err(|_| MemoryError::OutOfBounds { address, length })?;
+        // Read directly out of the host buffer. Works for both
+        // applevisor-owned mappings (the parent case) and raw mappings
+        // we re-created in a forked child via hv_vm_map.
+        let offset = (address - mapping.start) as usize;
+        let mut bytes = vec![0u8; length];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                mapping.host_addr.add(offset),
+                bytes.as_mut_ptr(),
+                length,
+            );
+        }
         Ok(bytes)
     }
 
@@ -522,10 +609,15 @@ impl HvfInner {
         let Some(mapping) = self.mapping_for_range_mut(address, length) else {
             return Err(MemoryError::OutOfBounds { address, length });
         };
-        mapping
-            .memory
-            .write(address, bytes)
-            .map_err(|_| MemoryError::OutOfBounds { address, length })
+        let offset = (address - mapping.start) as usize;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                mapping.host_addr.add(offset),
+                length,
+            );
+        }
+        Ok(())
     }
 
     fn mapping_for_range(&self, address: u64, length: usize) -> Option<&HvfMappedRegion> {
@@ -542,6 +634,182 @@ impl HvfInner {
         self.mappings
             .iter_mut()
             .find(|mapping| mapping.contains_range(address, length))
+    }
+
+    /// Snapshot every register the trap engine ever writes. We restore
+    /// from this in the forked child after the new vCPU is created.
+    fn snapshot_vcpu(&self) -> Result<VcpuSnapshot, TrapError> {
+        use applevisor::prelude::*;
+        const GPR_TABLE: [Reg; 31] = [
+            Reg::X0, Reg::X1, Reg::X2, Reg::X3, Reg::X4, Reg::X5, Reg::X6,
+            Reg::X7, Reg::X8, Reg::X9, Reg::X10, Reg::X11, Reg::X12,
+            Reg::X13, Reg::X14, Reg::X15, Reg::X16, Reg::X17, Reg::X18,
+            Reg::X19, Reg::X20, Reg::X21, Reg::X22, Reg::X23, Reg::X24,
+            Reg::X25, Reg::X26, Reg::X27, Reg::X28, Reg::X29, Reg::X30,
+        ];
+        let mut gprs = [0u64; 31];
+        for (i, reg) in GPR_TABLE.iter().enumerate() {
+            gprs[i] = self.vcpu.get_reg(*reg).map_err(hvf_error)?;
+        }
+        Ok(VcpuSnapshot {
+            gprs,
+            pc: self.vcpu.get_reg(Reg::PC).map_err(hvf_error)?,
+            cpsr: self.vcpu.get_reg(Reg::CPSR).map_err(hvf_error)?,
+            sp_el0: self.vcpu.get_sys_reg(SysReg::SP_EL0).map_err(hvf_error)?,
+            sctlr_el1: self.vcpu.get_sys_reg(SysReg::SCTLR_EL1).map_err(hvf_error)?,
+            tcr_el1: self.vcpu.get_sys_reg(SysReg::TCR_EL1).map_err(hvf_error)?,
+            ttbr0_el1: self.vcpu.get_sys_reg(SysReg::TTBR0_EL1).map_err(hvf_error)?,
+            mair_el1: self.vcpu.get_sys_reg(SysReg::MAIR_EL1).map_err(hvf_error)?,
+            vbar_el1: self.vcpu.get_sys_reg(SysReg::VBAR_EL1).map_err(hvf_error)?,
+            cpacr_el1: self.vcpu.get_sys_reg(SysReg::CPACR_EL1).map_err(hvf_error)?,
+            spsr_el1: self.vcpu.get_sys_reg(SysReg::SPSR_EL1).map_err(hvf_error)?,
+            elr_el1: self.vcpu.get_sys_reg(SysReg::ELR_EL1).map_err(hvf_error)?,
+            last_exit_class: self.last_exit_class,
+        })
+    }
+
+    fn restore_vcpu(&mut self, snap: &VcpuSnapshot) -> Result<(), TrapError> {
+        use applevisor::prelude::*;
+        const GPR_TABLE: [Reg; 31] = [
+            Reg::X0, Reg::X1, Reg::X2, Reg::X3, Reg::X4, Reg::X5, Reg::X6,
+            Reg::X7, Reg::X8, Reg::X9, Reg::X10, Reg::X11, Reg::X12,
+            Reg::X13, Reg::X14, Reg::X15, Reg::X16, Reg::X17, Reg::X18,
+            Reg::X19, Reg::X20, Reg::X21, Reg::X22, Reg::X23, Reg::X24,
+            Reg::X25, Reg::X26, Reg::X27, Reg::X28, Reg::X29, Reg::X30,
+        ];
+        for (reg, value) in GPR_TABLE.iter().zip(snap.gprs.iter()) {
+            self.vcpu.set_reg(*reg, *value).map_err(hvf_error)?;
+        }
+        self.vcpu.set_reg(Reg::PC, snap.pc).map_err(hvf_error)?;
+        self.vcpu.set_reg(Reg::CPSR, snap.cpsr).map_err(hvf_error)?;
+        self.vcpu
+            .set_sys_reg(SysReg::SP_EL0, snap.sp_el0)
+            .map_err(hvf_error)?;
+        // Order matters: program TCR/MAIR/TTBR0 before flipping SCTLR.M.
+        self.vcpu
+            .set_sys_reg(SysReg::MAIR_EL1, snap.mair_el1)
+            .map_err(hvf_error)?;
+        self.vcpu
+            .set_sys_reg(SysReg::TCR_EL1, snap.tcr_el1)
+            .map_err(hvf_error)?;
+        self.vcpu
+            .set_sys_reg(SysReg::TTBR0_EL1, snap.ttbr0_el1)
+            .map_err(hvf_error)?;
+        self.vcpu
+            .set_sys_reg(SysReg::CPACR_EL1, snap.cpacr_el1)
+            .map_err(hvf_error)?;
+        self.vcpu
+            .set_sys_reg(SysReg::VBAR_EL1, snap.vbar_el1)
+            .map_err(hvf_error)?;
+        self.vcpu
+            .set_sys_reg(SysReg::SPSR_EL1, snap.spsr_el1)
+            .map_err(hvf_error)?;
+        self.vcpu
+            .set_sys_reg(SysReg::ELR_EL1, snap.elr_el1)
+            .map_err(hvf_error)?;
+        // Apply SCTLR last so the MMU enable lands with the new tables.
+        self.vcpu
+            .set_sys_reg(SysReg::SCTLR_EL1, snap.sctlr_el1)
+            .map_err(hvf_error)?;
+        self.last_exit_class = snap.last_exit_class;
+        Ok(())
+    }
+
+    fn fork(&mut self) -> Result<ForkOutcome, TrapError> {
+        use applevisor::prelude::*;
+
+        // Pre-fork: snapshot vCPU state and capture mapping descriptors.
+        let snapshot = self.snapshot_vcpu()?;
+        let mapping_descs: Vec<(u64, u64, *mut u8, usize, MemPerms)> = self
+            .mappings
+            .iter()
+            .map(|m| (m.start, m.end, m.host_addr, m.size, m.perms))
+            .collect();
+
+        // Real fork. Caller is expected to have flushed any host-side
+        // stdio buffers; for our JSON-at-end report flow this is fine.
+        unsafe extern "C" {
+            fn fork() -> i32;
+        }
+        let pid = unsafe { fork() };
+        if pid < 0 {
+            return Err(TrapError::ForkFailed(
+                std::io::Error::last_os_error().to_string(),
+            ));
+        }
+        if pid > 0 {
+            // Parent: nothing to do. We keep the existing VM, vCPU, and
+            // mappings — the macOS process-level fork didn't touch HVF.
+            return Ok(ForkOutcome::Parent { child_pid: pid });
+        }
+
+        // ----- Child path -----
+        //
+        // The child's view of HVF state is invalid: the kernel resources
+        // (VM handle, vCPU handle, stage-2 mappings) belong to the parent
+        // process. We mem::forget the old inner so Drop doesn't call
+        // hv_vm_unmap / hv_vcpu_destroy / hv_vm_destroy on stale state
+        // (which would either no-op or error). The host buffers backing
+        // the mappings stay valid via Mach VM COW; we re-issue
+        // `hv_vm_map` in the fresh VM to register them at the same IPAs.
+
+        // Build a fresh dummy that we can swap in while we forget the old.
+        let max_ipa = VirtualMachineConfig::get_max_ipa_size().map_err(hvf_error)?;
+        let mut config = VirtualMachineConfig::new();
+        config.set_ipa_size(max_ipa).map_err(hvf_error)?;
+        let new_vm = VirtualMachine::with_config(config).map_err(hvf_error)?;
+        let new_vcpu = new_vm.vcpu_create().map_err(hvf_error)?;
+
+        // Replace inner: hand-construct a new HvfInner and FORGET the old.
+        let new_inner = HvfInner {
+            _vm: new_vm,
+            vcpu: new_vcpu,
+            mappings: Vec::with_capacity(mapping_descs.len()),
+            last_exit_class: snapshot.last_exit_class,
+        };
+        let old_inner = std::mem::replace(self, new_inner);
+        std::mem::forget(old_inner);
+
+        // Re-map each region using raw hv_vm_map. The host buffer is
+        // already valid in the child (COW); the new VM owns the new
+        // stage-2 entries.
+        for (start, end, host_addr, size, perms) in mapping_descs {
+            let perms_raw: u64 = u64::from(perms);
+            let r = unsafe {
+                applevisor_sys::hv_vm_map(
+                    host_addr as *mut std::ffi::c_void,
+                    start,
+                    size,
+                    perms_raw,
+                )
+            };
+            if r != 0 {
+                return Err(TrapError::ChildMapFailed {
+                    host_addr: host_addr as u64,
+                    guest_start: start,
+                    size,
+                    code: r as u32,
+                });
+            }
+            self.mappings.push(HvfMappedRegion {
+                start,
+                end,
+                host_addr,
+                size,
+                perms,
+                // No Memory object — the host buffer was inherited via
+                // COW from the parent. Drop runs no HVF call for this
+                // mapping; the child's VM tear-down on engine drop will
+                // tear all stage-2 mappings down in one shot.
+                memory: None,
+            });
+        }
+
+        // Restore vCPU register state from the pre-fork snapshot. The
+        // child resumes inside the same `clone` syscall site; the
+        // dispatcher will then write 0 (child's clone retval) into X0.
+        self.restore_vcpu(&snapshot)?;
+        Ok(ForkOutcome::Child)
     }
 }
 
