@@ -49,6 +49,20 @@ const AARCH64_CLREX_OPCODE: u32 = 0xd5033f5f;
 const AARCH64_HVC0_OPCODE: u32 = 0xd400_0002;
 // AArch64 `nop` opcode, used as trampoline page padding.
 const AARCH64_NOP_OPCODE: u32 = 0xd503_201f;
+// AArch64 `tlbi vmalle1` — invalidate all stage-1 TLB entries for the
+// current EL & inner-shareable domain. Required after the host flips
+// SCTLR_EL1.M from 0 to 1 via `set_sys_reg` because the guest never
+// executed the MSR itself, so the TLB may contain stale identity
+// translations from the pre-MMU bootstrap.
+const AARCH64_TLBI_VMALLE1_OPCODE: u32 = 0xd508_871f;
+// AArch64 `ic ialluis` — invalidate instruction cache, all entries,
+// inner-shareable. Same reason: instruction fetches after enabling
+// stage-1 must see fresh translations, not pre-MMU cached lines.
+const AARCH64_IC_IALLUIS_OPCODE: u32 = 0xd508_711f;
+// AArch64 `dsb sy` — data synchronization barrier, full system domain.
+const AARCH64_DSB_SY_OPCODE: u32 = 0xd503_3f9f;
+// AArch64 `isb` — instruction synchronization barrier.
+const AARCH64_ISB_OPCODE: u32 = 0xd503_3fdf;
 // Size of one AArch64 exception vector slot (16 slots in the 2 KiB table).
 const AARCH64_VECTOR_SLOT_SIZE: usize = 0x80;
 // Offset of the "Lower EL using AArch64, synchronous" slot in the vector
@@ -819,17 +833,33 @@ pub fn stage1_identity_page_tables() -> Vec<u8> {
 pub fn el0_trampoline_bytes() -> Vec<u8> {
     let size = LINUX_EL0_TRAMPOLINE_SIZE as usize;
     let mut bytes = vec![0_u8; size];
-    // Clear the local exclusives monitor before dropping to EL0. Musl's
-    // pthread_mutex_lock fast path executes `ldaxr` on its first lock,
-    // which on Apple Silicon HVF takes an external abort if the
-    // exclusives monitor is in an unexpected reset state. `clrex` puts
-    // it into a known-empty state before user code runs.
-    let clrex = AARCH64_CLREX_OPCODE.to_le_bytes();
-    bytes[..clrex.len()].copy_from_slice(&clrex);
-    let eret = AARCH64_ERET_OPCODE.to_le_bytes();
-    bytes[clrex.len()..clrex.len() + eret.len()].copy_from_slice(&eret);
+    // The host flips SCTLR_EL1.M from 0 to 1 via `set_sys_reg` before the
+    // vCPU runs. ARMv8-A requires the guest to issue cache + TLB
+    // maintenance after such a transition or fetches/data accesses may
+    // hit stale pre-MMU translations and abort. The trampoline therefore
+    // executes (in order):
+    //   tlbi vmalle1is  — drop stage-1 TLB entries inner-shareable
+    //   dsb sy          — make the invalidation observable
+    //   ic ialluis      — drop instruction cache entries inner-shareable
+    //   dsb sy          — make the I-cache invalidation observable
+    //   isb             — synchronise instruction fetch with the new mapping
+    //   clrex           — clear the local Exclusives monitor (musl LDAXR)
+    //   eret            — drop to EL0 at the user entry
+    let mut offset = 0;
+    for opcode in [
+        AARCH64_TLBI_VMALLE1_OPCODE,
+        AARCH64_DSB_SY_OPCODE,
+        AARCH64_IC_IALLUIS_OPCODE,
+        AARCH64_DSB_SY_OPCODE,
+        AARCH64_ISB_OPCODE,
+        AARCH64_CLREX_OPCODE,
+        AARCH64_ERET_OPCODE,
+    ] {
+        let bytes_le = opcode.to_le_bytes();
+        bytes[offset..offset + bytes_le.len()].copy_from_slice(&bytes_le);
+        offset += bytes_le.len();
+    }
     let nop = AARCH64_NOP_OPCODE.to_le_bytes();
-    let mut offset = clrex.len() + eret.len();
     while offset + nop.len() <= size {
         bytes[offset..offset + nop.len()].copy_from_slice(&nop);
         offset += nop.len();
@@ -971,3 +1001,101 @@ impl GuestMemory for AddressSpace {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod stage1_tests {
+    use super::*;
+
+    fn read_u64_le(buf: &[u8], offset: usize) -> u64 {
+        let mut arr = [0u8; 8];
+        arr.copy_from_slice(&buf[offset..offset + 8]);
+        u64::from_le_bytes(arr)
+    }
+
+    #[test]
+    fn stage1_identity_tables_layout() {
+        let bytes = stage1_identity_page_tables();
+        assert_eq!(bytes.len(), LINUX_PAGE_TABLES_SIZE as usize);
+
+        // L0[0] -> L1_a at base+0x1000 as a TABLE descriptor (bits 1:0 = 11)
+        let l0_0 = read_u64_le(&bytes, 0);
+        assert_eq!(
+            l0_0 & 0x3,
+            0b11,
+            "L0[0] must be a table descriptor (got {:#x})",
+            l0_0
+        );
+        assert_eq!(
+            l0_0 & 0x0000_FFFF_FFFF_F000,
+            LINUX_PAGE_TABLES_BASE + 0x1000,
+            "L0[0] PA mismatch"
+        );
+
+        // L0[1] -> L1_b at base+0x2000
+        let l0_1 = read_u64_le(&bytes, 8);
+        assert_eq!(l0_1 & 0x3, 0b11);
+        assert_eq!(
+            l0_1 & 0x0000_FFFF_FFFF_F000,
+            LINUX_PAGE_TABLES_BASE + 0x2000
+        );
+
+        // L1_a[0] block descriptor for VA 0..1 GiB -> PA 0
+        let l1a_0 = read_u64_le(&bytes, 0x1000);
+        let valid = l1a_0 & 0x1;
+        let kind = (l1a_0 >> 1) & 0x1;
+        let attr_index = (l1a_0 >> 2) & 0x7;
+        let ns = (l1a_0 >> 5) & 0x1;
+        let ap = (l1a_0 >> 6) & 0x3;
+        let sh = (l1a_0 >> 8) & 0x3;
+        let af = (l1a_0 >> 10) & 0x1;
+        let ng = (l1a_0 >> 11) & 0x1;
+        let pa = l1a_0 & 0x0000_FFFF_C000_0000;
+        let pxn = (l1a_0 >> 53) & 0x1;
+        let uxn = (l1a_0 >> 54) & 0x1;
+        assert_eq!(valid, 1, "L1A[0] must be valid");
+        assert_eq!(kind, 0, "L1A[0] must be a BLOCK descriptor at L1");
+        assert_eq!(attr_index, 0, "L1A[0] AttrIndex must be 0 (Normal WB)");
+        assert_eq!(ns, 0, "L1A[0] NS must be 0");
+        assert_eq!(ap, 0b01, "L1A[0] AP must be 01 (RW EL1+EL0)");
+        assert_eq!(sh, 0b11, "L1A[0] SH must be 11 (Inner Shareable)");
+        assert_eq!(af, 1, "L1A[0] AF must be 1");
+        assert_eq!(ng, 0, "L1A[0] nG must be 0");
+        assert_eq!(pa, 0, "L1A[0] PA must be 0");
+        assert_eq!(pxn, 0, "L1A[0] PXN must be 0 (execute allowed at EL1)");
+        assert_eq!(uxn, 0, "L1A[0] UXN must be 0 (execute allowed at EL0)");
+
+        // L1_a[1] block descriptor for VA 1..2 GiB -> PA 0x4000_0000
+        let l1a_1 = read_u64_le(&bytes, 0x1008);
+        assert_eq!(
+            l1a_1 & 0x0000_FFFF_C000_0000,
+            0x4000_0000,
+            "L1A[1] PA mismatch"
+        );
+
+        // L1_b[511] (last entry) block descriptor for VA ~1 TiB - 1 GiB
+        let l1b_511 = read_u64_le(&bytes, 0x2000 + 511 * 8);
+        let expected_pa = (511u64 + 512) << 30;
+        assert_eq!(
+            l1b_511 & 0x0000_FFFF_C000_0000,
+            expected_pa & 0x0000_FFFF_C000_0000,
+            "L1B[511] PA mismatch"
+        );
+        assert_eq!(l1b_511 & 0x1, 1, "L1B[511] must be valid");
+
+        // ALL non-zero descriptors must NOT have RES0 bits 12..29 set,
+        // which would corrupt the block PA interpretation.
+        for offset_base in [0x1000usize, 0x2000usize] {
+            for i in 0..512 {
+                let d = read_u64_le(&bytes, offset_base + i * 8);
+                assert_eq!(
+                    d & ((1 << 30) - (1 << 12)),
+                    0,
+                    "block descriptor @ {:#x} has RES0 bits 12..29 set: {:#x}",
+                    offset_base + i * 8,
+                    d
+                );
+            }
+        }
+    }
+}
+
