@@ -52,6 +52,19 @@ pub enum CompatEvent {
         signum: i32,
         reason: String,
     },
+    /// The guest passed flag bits we don't recognise to a syscall.
+    /// Surfaced systematically by the `check_syscall_flags` helper so
+    /// that every syscall-flag drift from the Linux ABI shows up as a
+    /// loud, aggregated entry in the compat report instead of being
+    /// silently ignored (or, worse, silently dropping behaviour the
+    /// guest expected). The `unknown_bits` field is the raw set bits
+    /// not covered by `supported_mask`.
+    UnknownSyscallFlags {
+        number: u64,
+        name: String,
+        argument: u32,
+        unknown_bits: u64,
+    },
 }
 
 impl CompatEvent {
@@ -88,6 +101,20 @@ impl CompatEvent {
     pub fn sys_read_unimplemented(path: impl Into<String>) -> Self {
         Self::SysReadUnimplemented { path: path.into() }
     }
+
+    pub fn unknown_syscall_flags(
+        number: u64,
+        name: impl Into<String>,
+        argument: u32,
+        unknown_bits: u64,
+    ) -> Self {
+        Self::UnknownSyscallFlags {
+            number,
+            name: name.into(),
+            argument,
+            unknown_bits,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -117,6 +144,7 @@ impl CompatReporter {
         let mut proc_read_unimplemented = HashMap::<String, u64>::new();
         let mut sys_read_unimplemented = HashMap::<String, u64>::new();
         let mut unsupported_signals = HashMap::<(i32, String), u64>::new();
+        let mut unknown_syscall_flags = HashMap::<(u64, String, u32, u64), u64>::new();
 
         let mut syscall_entries = 0_u64;
         let mut syscall_returns_ok = 0_u64;
@@ -157,6 +185,16 @@ impl CompatReporter {
                 CompatEvent::SignalUnsupported { signum, reason } => {
                     *unsupported_signals.entry((signum, reason)).or_default() += 1;
                 }
+                CompatEvent::UnknownSyscallFlags {
+                    number,
+                    name,
+                    argument,
+                    unknown_bits,
+                } => {
+                    *unknown_syscall_flags
+                        .entry((number, name, argument, unknown_bits))
+                        .or_default() += 1;
+                }
             }
         }
 
@@ -169,6 +207,8 @@ impl CompatReporter {
         let proc_read_unimplemented = sorted_paths(proc_read_unimplemented);
         let sys_read_unimplemented = sorted_paths(sys_read_unimplemented);
         let unsupported_signals = sorted_signals(unsupported_signals);
+        let unknown_flag_invocations = unknown_syscall_flags.values().sum::<u64>();
+        let unknown_syscall_flags = sorted_unknown_flags(unknown_syscall_flags);
 
         let summary = CompatSummary {
             syscall_invocations: syscall_entries,
@@ -183,6 +223,8 @@ impl CompatReporter {
             distinct_proc_read_unimplemented: proc_read_unimplemented.len() as u64,
             distinct_sys_read_unimplemented: sys_read_unimplemented.len() as u64,
             distinct_unsupported_signals: unsupported_signals.len() as u64,
+            distinct_unknown_syscall_flags: unknown_syscall_flags.len() as u64,
+            unknown_syscall_flag_invocations: unknown_flag_invocations,
         };
 
         CompatReport {
@@ -193,6 +235,7 @@ impl CompatReporter {
             proc_read_unimplemented,
             sys_read_unimplemented,
             unsupported_signals,
+            unknown_syscall_flags,
         }
     }
 }
@@ -206,6 +249,44 @@ pub struct CompatReport {
     pub proc_read_unimplemented: Vec<PathCount>,
     pub sys_read_unimplemented: Vec<PathCount>,
     pub unsupported_signals: Vec<SignalCount>,
+    pub unknown_syscall_flags: Vec<UnknownFlagsCount>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnknownFlagsCount {
+    pub number: u64,
+    pub name: String,
+    /// Which argument index carried the unknown bits (0-based; the
+    /// kernel mostly uses arg 3 for openat's `flags`, arg 1 for pipe2,
+    /// etc., so the index makes the report self-documenting).
+    pub argument: u32,
+    /// Hex string for human readability — these are commonly things
+    /// like `0x40000` (O_NOATIME) or `0x4000` (O_DIRECTORY) and you
+    /// want them in the same shape as the Linux header.
+    pub unknown_bits: String,
+    pub count: u64,
+}
+
+fn sorted_unknown_flags(
+    src: HashMap<(u64, String, u32, u64), u64>,
+) -> Vec<UnknownFlagsCount> {
+    let mut entries: Vec<UnknownFlagsCount> = src
+        .into_iter()
+        .map(|((number, name, argument, unknown_bits), count)| UnknownFlagsCount {
+            number,
+            name,
+            argument,
+            unknown_bits: format!("{:#x}", unknown_bits),
+            count,
+        })
+        .collect();
+    entries.sort_by(|a, b| {
+        b.count
+            .cmp(&a.count)
+            .then_with(|| a.number.cmp(&b.number))
+            .then_with(|| a.argument.cmp(&b.argument))
+    });
+    entries
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -222,6 +303,8 @@ pub struct CompatSummary {
     pub distinct_proc_read_unimplemented: u64,
     pub distinct_sys_read_unimplemented: u64,
     pub distinct_unsupported_signals: u64,
+    pub distinct_unknown_syscall_flags: u64,
+    pub unknown_syscall_flag_invocations: u64,
 }
 
 impl CompatReport {
