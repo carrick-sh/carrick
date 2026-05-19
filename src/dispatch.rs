@@ -92,8 +92,16 @@ pub const LINUX_F_GETFD: u64 = 1;
 pub const LINUX_F_SETFD: u64 = 2;
 pub const LINUX_F_GETFL: u64 = 3;
 pub const LINUX_F_SETFL: u64 = 4;
+pub const LINUX_F_GETLK: u64 = 5;
+pub const LINUX_F_SETLK: u64 = 6;
+pub const LINUX_F_SETLKW: u64 = 7;
+pub const LINUX_F_OFD_GETLK: u64 = 36;
+pub const LINUX_F_OFD_SETLK: u64 = 37;
+pub const LINUX_F_OFD_SETLKW: u64 = 38;
 pub const LINUX_F_DUPFD_CLOEXEC: u64 = 1030;
 pub const LINUX_F_GETPIPE_SZ: u64 = 1032;
+pub const LINUX_F_ADD_SEALS: u64 = 1033;
+pub const LINUX_F_GET_SEALS: u64 = 1034;
 pub const LINUX_FD_CLOEXEC: u64 = 1;
 pub const LINUX_SEEK_SET: u64 = 0;
 pub const LINUX_SEEK_CUR: u64 = 1;
@@ -651,6 +659,19 @@ impl SyscallDispatcher {
             executable_path: executable_path.into(),
             ..Self::new()
         }
+    }
+
+    /// Swap the in-memory default for any other [`FsBackend`]. Used by
+    /// the CLI's `--fs host` to switch to a cap-std-sandboxed scratch
+    /// directory. Returns the previously-installed backend so the
+    /// caller can decide what to do with it (normally just drop).
+    pub fn set_fs_backend(&mut self, backend: Box<dyn FsBackend>) -> Box<dyn FsBackend> {
+        std::mem::replace(&mut self.overlay, backend)
+    }
+
+    /// Name of the currently-installed backend (for logging / debug).
+    pub fn fs_backend_name(&self) -> &'static str {
+        self.overlay.name()
     }
 
     /// Borrow the dispatcher's rootfs. Used by the runtime when the

@@ -1,9 +1,10 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use carrick::compat::{CompatReportFormat, CompatReporter, SyscallArgs};
 use carrick::dispatch::{LinearMemory, SyscallDispatcher, SyscallRequest};
 use carrick::elf::{inspect_elf, plan_elf_load};
+use carrick::fs_backend::{FsBackend, HostFsBackend, MemoryBackend};
 use carrick::memory::AddressSpace;
 use carrick::oci::{ImageReference, ImageStore, pull_image};
 use carrick::rootfs::RootFs;
@@ -14,6 +15,17 @@ use carrick::runtime::{
 use carrick::syscall::{aarch64_table, lookup_aarch64};
 use carrick::trap::hvf_capabilities;
 use clap::{Parser, Subcommand};
+
+/// Which writable-layer backend to install on the SyscallDispatcher.
+/// See `src/fs_backend.rs` for the trait and both implementations.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum FsBackendKind {
+    /// In-memory tmpfs. Fast, ephemeral, ideal for CI/tests/one-shots.
+    Memory,
+    /// Host APFS scratch directory, sandboxed via cap-std. Durable,
+    /// reflink-seeded, the secure-by-default production option.
+    Host,
+}
 
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
@@ -56,6 +68,11 @@ enum Commands {
         /// Makes carrick feel like a normal command runner.
         #[arg(long)]
         raw: bool,
+        /// Which writable-layer backend to use. Defaults to `host` on
+        /// case-sensitive volumes (APFS scratch dir + cap-std sandbox)
+        /// and `memory` elsewhere (in-memory tmpfs).
+        #[arg(long, value_enum)]
+        fs: Option<FsBackendKind>,
         #[arg(last = true)]
         args: Vec<String>,
     },
@@ -72,6 +89,11 @@ enum Commands {
         /// Suppress the JSON compat-report envelope.
         #[arg(long)]
         raw: bool,
+        /// Which writable-layer backend to use. Defaults to `host` on
+        /// case-sensitive volumes (APFS scratch dir + cap-std sandbox)
+        /// and `memory` elsewhere (in-memory tmpfs).
+        #[arg(long, value_enum)]
+        fs: Option<FsBackendKind>,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
@@ -237,6 +259,7 @@ fn main() -> anyhow::Result<()> {
             max_traps,
             debug_state_path,
             raw,
+            fs,
             args,
         } => {
             let mut dispatcher = if rootfs_layers.is_empty() {
@@ -247,6 +270,7 @@ fn main() -> anyhow::Result<()> {
                         .context("failed to compose rootfs layers")?,
                 )
             };
+            install_fs_backend(&mut dispatcher, fs)?;
             if raw {
                 dispatcher.set_stream_stdio(true);
             }
@@ -299,6 +323,7 @@ fn main() -> anyhow::Result<()> {
             max_traps,
             debug_state_path,
             raw,
+            fs,
             command,
         } => {
             let image = ImageReference::parse(&image)?;
@@ -322,6 +347,7 @@ fn main() -> anyhow::Result<()> {
                 rootfs.clone(),
                 executable_path.clone(),
             );
+            install_fs_backend(&mut dispatcher, fs)?;
             if raw {
                 // Stream guest fd 1/2 straight to host fds 1/2 so
                 // interactive prompts (`/ # `, ANSI cursor queries) reach
@@ -547,6 +573,80 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+
+/// Resolve `--fs <memory|host>` into a concrete `Box<dyn FsBackend>`
+/// and install it on the dispatcher. When the user did not pass an
+/// explicit `--fs`, the default is `host` iff the scratch root sits
+/// on a case-sensitive volume (the only place Linux semantics survive
+/// intact) and `memory` otherwise, with a stderr warning.
+///
+/// If `--fs host` is requested but the cap-std scratch directory
+/// cannot be constructed (e.g. `HOME` is unwritable) we fall back to
+/// the in-memory backend with a warning rather than failing the run.
+fn install_fs_backend(
+    dispatcher: &mut SyscallDispatcher,
+    fs: Option<FsBackendKind>,
+) -> anyhow::Result<()> {
+    let kind = fs.unwrap_or_else(default_fs_backend_kind);
+    let backend: Box<dyn FsBackend> = match kind {
+        FsBackendKind::Memory => Box::new(MemoryBackend::new()),
+        FsBackendKind::Host => match HostFsBackend::new() {
+            Ok(host) => Box::new(host),
+            Err(err) => {
+                eprintln!(
+                    "carrick: --fs host failed ({err}); falling back to in-memory backend"
+                );
+                Box::new(MemoryBackend::new())
+            }
+        },
+    };
+    let _ = dispatcher.set_fs_backend(backend);
+    Ok(())
+}
+
+/// Default backend choice: prefer `host` because that's the secure-
+/// by-default option, but quietly fall back to `memory` when the
+/// scratch root sits on a case-insensitive filesystem (a common
+/// macOS default that breaks anything assuming Linux semantics).
+fn default_fs_backend_kind() -> FsBackendKind {
+    let probe = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|h| h.join(".carrick").join("scratch"))
+        .unwrap_or_else(|| std::env::temp_dir().join("carrick-scratch"));
+    if std::fs::create_dir_all(&probe).is_err() {
+        return FsBackendKind::Memory;
+    }
+    if probe_case_sensitive(&probe).unwrap_or(false) {
+        FsBackendKind::Host
+    } else {
+        eprintln!(
+            "carrick: {} is case-insensitive; defaulting --fs to memory. \
+             Pass `--fs host` to force the cap-std backend (some Linux tools may misbehave).",
+            probe.display()
+        );
+        FsBackendKind::Memory
+    }
+}
+
+/// Detect whether `path` lives on a case-sensitive volume by creating
+/// a sentinel file and trying to canonicalise the same path with the
+/// case flipped. We do NOT trust statfs flags here because APFS
+/// volumes routinely return MNT_NOATIME-style flags that say nothing
+/// about case-sensitivity.
+fn probe_case_sensitive(path: &Path) -> std::io::Result<bool> {
+    let lower = path.join(".carrick-case-probe");
+    let upper = path.join(".CARRICK-CASE-PROBE");
+    std::fs::write(&lower, b"")?;
+    let sensitive = if upper.exists() {
+        // If the kernel can see the upper-case spelling, it's a
+        // case-insensitive volume.
+        std::fs::canonicalize(&upper).ok() != std::fs::canonicalize(&lower).ok()
+    } else {
+        true
+    };
+    let _ = std::fs::remove_file(&lower);
+    Ok(sensitive)
+}
 
 /// When `--raw` is set, emit the guest's buffered stdout/stderr to the
 /// carrick host process's fd 1 / fd 2 instead of wrapping them in JSON.
