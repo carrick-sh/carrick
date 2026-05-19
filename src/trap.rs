@@ -816,10 +816,7 @@ impl HvfInner {
 
         // Real fork. Caller is expected to have flushed any host-side
         // stdio buffers; for our JSON-at-end report flow this is fine.
-        unsafe extern "C" {
-            fn fork() -> i32;
-        }
-        let pid = unsafe { fork() };
+        let pid = unsafe { libc::fork() };
         if pid < 0 {
             return Err(TrapError::ForkFailed(
                 std::io::Error::last_os_error().to_string(),

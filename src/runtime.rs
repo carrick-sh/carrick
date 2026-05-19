@@ -459,13 +459,13 @@ fn load_execve_image(
 /// rebuilt HVF context in the child would trigger an `applevisor::Vcpu`
 /// Drop panic ("no VM or vCPU available") during shutdown.
 fn forked_child_exit(code: i32, stdout_buf: &[u8], stderr_buf: &[u8]) -> ! {
-    unsafe extern "C" {
-        fn write(fd: i32, buf: *const u8, count: usize) -> isize;
-        fn _exit(code: i32) -> !;
-    }
-    let _ = unsafe { write(1, stdout_buf.as_ptr(), stdout_buf.len()) };
-    let _ = unsafe { write(2, stderr_buf.as_ptr(), stderr_buf.len()) };
-    unsafe { _exit(code) };
+    let _ = unsafe {
+        libc::write(1, stdout_buf.as_ptr() as *const _, stdout_buf.len())
+    };
+    let _ = unsafe {
+        libc::write(2, stderr_buf.as_ptr() as *const _, stderr_buf.len())
+    };
+    unsafe { libc::_exit(code) };
 }
 
 fn run_split_loop<M, T>(
