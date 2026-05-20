@@ -4128,16 +4128,42 @@ impl SyscallDispatcher {
     }
 
     /// `getgroups(size, *list)`. Linux returns the number of
-    /// supplementary groups; in carrick the guest is a single user
-    /// with no supplementary groups, so the answer is always 0 (and
-    /// we leave `list` untouched, per the size=0 fast path).
+    /// supplementary groups; the carrick guest runs as root (uid/gid 0)
+    /// and belongs to the single supplementary group gid 0, matching a
+    /// fresh root shell in the container. With `size == 0` we report the
+    /// count (1) without touching `list`; otherwise we write the one
+    /// gid_t to the guest buffer and return the number written.
     fn getgroups<M: GuestMemory>(
         &mut self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let _size = ctx.arg(0);
-        let _list = ctx.arg(1);
-        Ok(DispatchOutcome::Returned { value: 0 })
+        // `size` is a Linux `int`; a negative value is invalid.
+        let size = ctx.arg(0) as i32;
+        if size < 0 {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            });
+        }
+        // Query mode: report the count without writing.
+        if size == 0 {
+            return Ok(DispatchOutcome::Returned { value: 1 });
+        }
+        // The buffer is too small to hold the supplementary group list.
+        if size < 1 {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            });
+        }
+        // Write the single supplementary group (gid 0) as a little-endian
+        // gid_t (u32, 4 bytes).
+        let list = ctx.arg(1);
+        let gid: u32 = 0;
+        if ctx.memory.write_bytes(list, &gid.to_le_bytes()).is_err() {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EFAULT,
+            });
+        }
+        Ok(DispatchOutcome::Returned { value: 1 })
     }
 
     fn getpgid<M: GuestMemory>(
