@@ -143,6 +143,30 @@ carrick*:::execve-sysregs
         pid, arg0, arg1, arg2);
 }
 
+/*
+ * Heartbeat: dump the live aggregations once a second. A deadlocked guest
+ * never reaches END, so without this its aggregations would never print.
+ * Watching successive ticks shows which counts stop advancing = where every
+ * process is wedged. The trailing fork/open/errno tallies pinpoint the
+ * blocking syscall.
+ */
+tick-1s
+{
+    printf("\n========= tick %Y =========\n", walltimestamp);
+
+    printf("--- syscalls by frequency ---\n");
+    printa("  %-32s %@d\n", @entries);
+
+    printf("--- errno returns (syscall, errno -> count) ---\n");
+    printa("  %-24s errno=%-4d %@d\n", @errno_returns);
+
+    printf("--- forks (role -> count) ---\n");
+    printa("  %-8s %@d\n", @forks);
+
+    printf("--- unhandled syscalls ---\n");
+    printa("  %-32s %@d\n", @unhandled);
+}
+
 dtrace:::END
 {
     printf("\n=================== aggregations ===================\n");

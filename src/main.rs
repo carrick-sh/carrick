@@ -595,13 +595,24 @@ fn main() -> anyhow::Result<()> {
                 let me = std::env::current_exe()
                     .context("failed to resolve current carrick binary path")?;
                 if unsafe { libc::geteuid() } != 0 {
-                    eprintln!(
-                        "carrick trace: not running as root; libdtrace will fail to open /dev/dtrace."
-                    );
-                    eprintln!(
-                        "carrick trace: re-invoke as `sudo {} trace ...`",
-                        me.display()
-                    );
+                    // libdtrace needs root to open /dev/dtrace. Re-exec the
+                    // whole `carrick trace ...` invocation under sudo so the
+                    // caller doesn't have to remember the prefix.
+                    use std::os::unix::process::CommandExt;
+                    eprintln!("carrick trace: not root; re-executing under sudo…");
+                    let mut forwarded = vec![
+                        me.as_os_str().to_owned(),
+                        std::ffi::OsString::from("trace"),
+                    ];
+                    if flowindent {
+                        forwarded.push(std::ffi::OsString::from("--flowindent"));
+                    }
+                    forwarded.push(std::ffi::OsString::from("--"));
+                    forwarded.extend(command.iter().map(std::ffi::OsString::from));
+                    let err = std::process::Command::new("sudo")
+                        .args(&forwarded)
+                        .exec();
+                    bail!("carrick trace: failed to re-exec under sudo: {}", err);
                 }
                 let opts = carrick::dtrace_consumer::TraceOptions { flowindent };
                 carrick::dtrace_consumer::run_child_under_dtrace(&me, &command, &opts)
