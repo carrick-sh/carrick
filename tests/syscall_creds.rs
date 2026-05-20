@@ -623,7 +623,10 @@ fn prlimit64_writes_packed_rlimit() {
     let rlimit = read_rlimit(&memory, 0x4000);
     let current = rlimit.rlim_cur;
     let maximum = rlimit.rlim_max;
-    assert_eq!(current, maximum);
+    // RLIMIT_STACK (resource 3) has a finite soft limit and an unlimited
+    // (RLIM_INFINITY) hard limit on real Linux, so soft and hard differ.
+    // The kernel invariant is rlim_cur <= rlim_max, not equality.
+    assert!(current <= maximum);
     assert!(current > 0);
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
