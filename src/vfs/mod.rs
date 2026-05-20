@@ -37,11 +37,13 @@
 pub mod dev;
 pub mod mount;
 pub mod proc;
+pub mod rootfs;
 pub mod sys;
 
 pub use dev::DevVfs;
 pub use mount::VfsMounts;
 pub use proc::ProcVfs;
+pub use rootfs::RootFsVfs;
 pub use sys::SysVfs;
 
 use std::path::PathBuf;

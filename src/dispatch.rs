@@ -439,7 +439,6 @@ pub struct SyscallDispatcher {
     /// interactive runtime so the user sees the guest's prompt and
     /// output in real time, instead of after exit.
     stream_stdio: bool,
-    rootfs: Option<RootFs>,
     open_files: HashMap<i32, OpenFile>,
     next_fd: i32,
     cwd: String,
@@ -487,14 +486,24 @@ pub struct SyscallDispatcher {
     ///   * [`MemoryBackend`]    — in-memory tmpfs, fast and ephemeral.
     ///   * [`HostFsBackend`]    — cap-std-sandboxed APFS scratch dir,
     ///                            durable, reflink-seeded.
-    overlay: Box<dyn FsBackend>,
-
-    /// Unified VFS mount table. As of step 2 of the VFS migration this
-    /// only holds [`DevVfs`] at `/dev`; the dispatcher consults it
-    /// before falling through to the legacy synthetic-proc / synthetic-
-    /// sys / overlay / rootfs chain. Future steps move the rest of
-    /// those surfaces behind this table too.
+    /// Unified VFS mount table. Holds DevVfs at /dev, ProcVfs at
+    /// /proc, SysVfs at /sys. The dispatcher consults it first; any
+    /// path no mount claims (or that a mount returns ENOSYS for)
+    /// falls through to the legacy code path below, which reads the
+    /// rootfs + overlay from [`Self::rootfs_vfs`].
     vfs_mounts: crate::vfs::VfsMounts,
+
+    /// The `/` mount: immutable OCI rootfs + writable overlay
+    /// ([`FsBackend`]). Held as a typed field rather than mounted in
+    /// `vfs_mounts` because the dispatcher's existing fs syscalls
+    /// reach into the overlay/rootfs state through ~50 call sites
+    /// today. Routing those through `Vfs::method` calls is the
+    /// follow-up mechanical migration; for step 4 of the plan we
+    /// land the architectural ownership move (the state lives in
+    /// `RootFsVfs`, exposed to callers via accessors) and the full
+    /// Vfs trait impl (`RootFsVfs::open`, `unlink`, etc.) is
+    /// independently tested.
+    rootfs_vfs: crate::vfs::RootFsVfs,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -648,7 +657,6 @@ impl SyscallDispatcher {
             stdout: Vec::new(),
             stderr: Vec::new(),
             stream_stdio: false,
-            rootfs: None,
             open_files: HashMap::new(),
             next_fd: 3,
             cwd: "/".to_owned(),
@@ -669,7 +677,6 @@ impl SyscallDispatcher {
             cred_sgid: 0,
             signal_handlers: HashMap::new(),
             address_space_regions: None,
-            overlay: Box::new(MemoryBackend::new()),
             vfs_mounts: {
                 let mut m = crate::vfs::VfsMounts::new();
                 m.mount("/dev", Box::new(crate::vfs::DevVfs::new()));
@@ -677,6 +684,7 @@ impl SyscallDispatcher {
                 m.mount("/sys", Box::new(crate::vfs::SysVfs::new()));
                 m
             },
+            rootfs_vfs: crate::vfs::RootFsVfs::new(),
         }
     }
 
@@ -691,18 +699,16 @@ impl SyscallDispatcher {
     }
 
     pub fn with_rootfs(rootfs: RootFs) -> Self {
-        Self {
-            rootfs: Some(rootfs),
-            ..Self::new()
-        }
+        let mut s = Self::new();
+        s.rootfs_vfs.rootfs = Some(rootfs);
+        s
     }
 
     pub fn with_rootfs_and_executable(rootfs: RootFs, executable_path: impl Into<String>) -> Self {
-        Self {
-            rootfs: Some(rootfs),
-            executable_path: executable_path.into(),
-            ..Self::new()
-        }
+        let mut s = Self::new();
+        s.rootfs_vfs.rootfs = Some(rootfs);
+        s.executable_path = executable_path.into();
+        s
     }
 
     /// Swap the in-memory default for any other [`FsBackend`]. Used by
@@ -710,19 +716,19 @@ impl SyscallDispatcher {
     /// directory. Returns the previously-installed backend so the
     /// caller can decide what to do with it (normally just drop).
     pub fn set_fs_backend(&mut self, backend: Box<dyn FsBackend>) -> Box<dyn FsBackend> {
-        std::mem::replace(&mut self.overlay, backend)
+        self.rootfs_vfs.set_overlay(backend)
     }
 
     /// Name of the currently-installed backend (for logging / debug).
     pub fn fs_backend_name(&self) -> &'static str {
-        self.overlay.name()
+        self.rootfs_vfs.overlay.name()
     }
 
     /// Borrow the dispatcher's rootfs. Used by the runtime when the
     /// dispatcher returns `DispatchOutcome::Execve` and the new image
     /// has to be loaded from the same image layers.
     pub fn rootfs(&self) -> Option<&RootFs> {
-        self.rootfs.as_ref()
+        self.rootfs_vfs.rootfs.as_ref()
     }
 
     pub fn stdout(&self) -> &[u8] {
@@ -1143,12 +1149,12 @@ impl SyscallDispatcher {
 
     fn access_resolved_path(&self, path: &str, mode: u64, flags: u64) -> DispatchOutcome {
         // Layered: overlay first.
-        match self.overlay.lookup(path) {
+        match self.rootfs_vfs.overlay.lookup(path) {
             Some(OverlayEntry::Deleted) => {
                 return DispatchOutcome::Errno { errno: LINUX_ENOENT };
             }
             Some(OverlayEntry::Dir) | Some(OverlayEntry::File(_)) => {
-                if let Some(metadata) = self.overlay.metadata(path) {
+                if let Some(metadata) = self.rootfs_vfs.overlay.metadata(path) {
                     return access_metadata(&metadata, mode);
                 }
             }
@@ -1157,7 +1163,7 @@ impl SyscallDispatcher {
         if let Some(outcome) = self.synthetic_access(&path, mode) {
             return outcome;
         }
-        let Some(rootfs) = &self.rootfs else {
+        let Some(rootfs) = &self.rootfs_vfs.rootfs else {
             return DispatchOutcome::Errno {
                 errno: LINUX_ENOENT,
             };
@@ -1215,7 +1221,7 @@ impl SyscallDispatcher {
             Ok(path) => path,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        let Some(rootfs) = &self.rootfs else {
+        let Some(rootfs) = &self.rootfs_vfs.rootfs else {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_ENOENT,
             });
@@ -2589,7 +2595,7 @@ impl SyscallDispatcher {
             Ok(path) => path,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        let Some(rootfs) = &self.rootfs else {
+        let Some(rootfs) = &self.rootfs_vfs.rootfs else {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_ENOENT,
             });
@@ -2638,7 +2644,7 @@ impl SyscallDispatcher {
         let kind = if is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context()) {
             RootFsEntryKind::File
         } else {
-            let Some(rootfs) = &self.rootfs else {
+            let Some(rootfs) = &self.rootfs_vfs.rootfs else {
                 return Ok(DispatchOutcome::Errno {
                     errno: LINUX_ENOENT,
                 });
@@ -2714,7 +2720,7 @@ impl SyscallDispatcher {
             return DispatchOutcome::Errno { errno: LINUX_EBADF };
         };
         // Snapshot the path + new contents in a scope so the borrow drops
-        // before we touch self.overlay.
+        // before we touch self.rootfs_vfs.overlay.
         let writeback: Option<(String, Vec<u8>)>;
         let outcome: DispatchOutcome;
         {
@@ -2754,7 +2760,7 @@ impl SyscallDispatcher {
             }
         }
         if let Some((path, contents)) = writeback {
-            let _ = self.overlay.set_file_contents(&path, contents);
+            let _ = self.rootfs_vfs.overlay.set_file_contents(&path, contents);
         }
         outcome
     }
@@ -3951,7 +3957,7 @@ impl SyscallDispatcher {
 
         // Overlay-first lookup for normal rootfs paths. Synthetic
         // /proc and /sys files are not overridable.
-        let overlay_entry = self.overlay.lookup(&path);
+        let overlay_entry = self.rootfs_vfs.overlay.lookup(&path);
         let overlay_deleted = matches!(overlay_entry, Some(OverlayEntry::Deleted));
         let overlay_dir = matches!(overlay_entry, Some(OverlayEntry::Dir));
         let overlay_file_bytes: Option<Vec<u8>> = match &overlay_entry {
@@ -3991,7 +3997,7 @@ impl SyscallDispatcher {
             }
             if want_trunc {
                 contents.clear();
-                if let Err(_) = self.overlay.set_file_contents(&path, contents.clone()) {
+                if let Err(_) = self.rootfs_vfs.overlay.set_file_contents(&path, contents.clone()) {
                     return Ok(DispatchOutcome::Errno { errno: LINUX_EINVAL });
                 }
             }
@@ -4018,7 +4024,7 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::Errno { errno: LINUX_EISDIR });
             }
             let entries =
-                match layered_directory_entries(self.overlay.as_ref(), self.rootfs.as_ref(), &path) {
+                match layered_directory_entries(self.rootfs_vfs.overlay.as_ref(), self.rootfs_vfs.rootfs.as_ref(), &path) {
                     Ok(entries) => entries,
                     Err(errno) => return Ok(DispatchOutcome::Errno { errno: rootfs_errno(errno) }),
                 };
@@ -4043,7 +4049,7 @@ impl SyscallDispatcher {
             // doesn't have it OR (b) the overlay tombstoned it.
             let rootfs_metadata = if overlay_deleted {
                 None
-            } else if let Some(rootfs) = &self.rootfs {
+            } else if let Some(rootfs) = &self.rootfs_vfs.rootfs {
                 match rootfs.metadata(&path) {
                     Ok(metadata) => Some(metadata),
                     Err(RootFsError::NotFound(_)) => None,
@@ -4063,7 +4069,7 @@ impl SyscallDispatcher {
                         if want_create && want_excl {
                             return Ok(DispatchOutcome::Errno { errno: LINUX_EEXIST });
                         }
-                        let mut contents = match self
+                        let mut contents = match self.rootfs_vfs
                             .rootfs
                             .as_ref()
                             .expect("rootfs metadata implies rootfs")
@@ -4084,7 +4090,7 @@ impl SyscallDispatcher {
                                 contents.clear();
                             }
                             if let Err(_) =
-                                self.overlay.set_file_contents(&path, contents.clone())
+                                self.rootfs_vfs.overlay.set_file_contents(&path, contents.clone())
                             {
                                 return Ok(DispatchOutcome::Errno {
                                     errno: LINUX_EINVAL,
@@ -4105,8 +4111,8 @@ impl SyscallDispatcher {
                     }
                     RootFsEntryKind::Directory => {
                         let entries = match layered_directory_entries(
-                            self.overlay.as_ref(),
-                            self.rootfs.as_ref(),
+                            self.rootfs_vfs.overlay.as_ref(),
+                            self.rootfs_vfs.rootfs.as_ref(),
                             &path,
                         ) {
                             Ok(entries) => entries,
@@ -4147,7 +4153,7 @@ impl SyscallDispatcher {
                             });
                         }
                     }
-                    if let Err(_) = self.overlay.create_file(&path) {
+                    if let Err(_) = self.rootfs_vfs.overlay.create_file(&path) {
                         return Ok(DispatchOutcome::Errno { errno: LINUX_EINVAL });
                     }
                     let metadata = RootFsMetadata {
@@ -4192,12 +4198,12 @@ impl SyscallDispatcher {
         if path == "/" || path.is_empty() {
             return true;
         }
-        match self.overlay.lookup(path) {
+        match self.rootfs_vfs.overlay.lookup(path) {
             Some(OverlayEntry::Dir) => return true,
             Some(OverlayEntry::Deleted) | Some(OverlayEntry::File(_)) => return false,
             None => {}
         }
-        if let Some(rootfs) = &self.rootfs {
+        if let Some(rootfs) = &self.rootfs_vfs.rootfs {
             if let Ok(metadata) = rootfs.metadata(path) {
                 return metadata.kind == RootFsEntryKind::Directory;
             }
@@ -4209,14 +4215,14 @@ impl SyscallDispatcher {
     /// used by stat / faccessat sites, but consults the overlay first
     /// and respects deletions.
     fn layered_metadata(&self, path: &str) -> Result<RootFsMetadata, i32> {
-        match self.overlay.lookup(path) {
+        match self.rootfs_vfs.overlay.lookup(path) {
             Some(OverlayEntry::Deleted) => return Err(LINUX_ENOENT),
             Some(OverlayEntry::File(_)) | Some(OverlayEntry::Dir) => {
-                return self.overlay.metadata(path).ok_or(LINUX_ENOENT);
+                return self.rootfs_vfs.overlay.metadata(path).ok_or(LINUX_ENOENT);
             }
             None => {}
         }
-        let Some(rootfs) = &self.rootfs else {
+        let Some(rootfs) = &self.rootfs_vfs.rootfs else {
             return Err(LINUX_ENOENT);
         };
         rootfs.metadata(path).map_err(rootfs_errno)
@@ -6496,7 +6502,7 @@ impl SyscallDispatcher {
         // dispatcher's built-in stdout/stderr buffers.
         if let Some(open_file) = self.open_files.get(&(fd as i32)).cloned() {
             // Take an inner scope so the borrow on the description ends
-            // before we touch self.overlay (writable File path below).
+            // before we touch self.rootfs_vfs.overlay (writable File path below).
             #[allow(dead_code)]
             enum FileWriteback {
                 None,
@@ -6554,7 +6560,7 @@ impl SyscallDispatcher {
                 }
             }
             if let FileWriteback::Update { path, contents } = writeback {
-                let _ = self.overlay.set_file_contents(&path, contents);
+                let _ = self.rootfs_vfs.overlay.set_file_contents(&path, contents);
             }
             return Ok(outcome);
         }
@@ -6703,7 +6709,7 @@ impl SyscallDispatcher {
                     }
                 }
                 if let FileWriteback::Update { path, contents } = writeback {
-                    let _ = self.overlay.set_file_contents(&path, contents);
+                    let _ = self.rootfs_vfs.overlay.set_file_contents(&path, contents);
                 }
                 let DispatchOutcome::Returned { value } = outcome else {
                     return Ok(outcome);
@@ -6770,7 +6776,7 @@ impl SyscallDispatcher {
         let target = if path == "/proc/self/exe" || path == "/proc/curproc/exe" {
             self.executable_path.clone()
         } else {
-            let Some(rootfs) = &self.rootfs else {
+            let Some(rootfs) = &self.rootfs_vfs.rootfs else {
                 return Ok(DispatchOutcome::Errno {
                     errno: LINUX_ENOENT,
                 });
@@ -6836,7 +6842,7 @@ impl SyscallDispatcher {
                 errno: LINUX_EEXIST,
             });
         }
-        if let Some(rootfs) = &self.rootfs {
+        if let Some(rootfs) = &self.rootfs_vfs.rootfs {
             match rootfs.symlink_metadata(&resolved) {
                 Ok(_) => {
                     return Ok(DispatchOutcome::Errno {
@@ -6883,7 +6889,7 @@ impl SyscallDispatcher {
         // the guest created at this path makes mkdirat fail with EEXIST
         // even if the rootfs doesn't have it); a tombstone clears the
         // rootfs view so a re-create is allowed.
-        match self.overlay.lookup(&resolved) {
+        match self.rootfs_vfs.overlay.lookup(&resolved) {
             Some(OverlayEntry::Dir) | Some(OverlayEntry::File(_)) => {
                 return Ok(DispatchOutcome::Errno {
                     errno: LINUX_EEXIST,
@@ -6894,7 +6900,7 @@ impl SyscallDispatcher {
                 // below and fall through to the create path.
             }
             None => {
-                if let Some(rootfs) = &self.rootfs {
+                if let Some(rootfs) = &self.rootfs_vfs.rootfs {
                     match rootfs.metadata(&resolved) {
                         Ok(_) => {
                             return Ok(DispatchOutcome::Errno {
@@ -6920,7 +6926,7 @@ impl SyscallDispatcher {
                 });
             }
         }
-        if self.overlay.make_dir(&resolved).is_err() {
+        if self.rootfs_vfs.overlay.make_dir(&resolved).is_err() {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
             });
@@ -7080,7 +7086,7 @@ impl SyscallDispatcher {
             };
             if is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context()) {
                 true
-            } else if let Some(rootfs) = &self.rootfs {
+            } else if let Some(rootfs) = &self.rootfs_vfs.rootfs {
                 match rootfs.symlink_metadata(&resolved) {
                     Ok(_) => true,
                     Err(RootFsError::NotFound(_)) => false,
@@ -7112,7 +7118,7 @@ impl SyscallDispatcher {
                 errno: LINUX_EEXIST,
             });
         }
-        if let Some(rootfs) = &self.rootfs {
+        if let Some(rootfs) = &self.rootfs_vfs.rootfs {
             match rootfs.symlink_metadata(&resolved_new) {
                 Ok(_) => {
                     return Ok(DispatchOutcome::Errno {
@@ -7165,7 +7171,7 @@ impl SyscallDispatcher {
                 errno: LINUX_EEXIST,
             });
         }
-        if let Some(rootfs) = &self.rootfs {
+        if let Some(rootfs) = &self.rootfs_vfs.rootfs {
             match rootfs.symlink_metadata(&resolved_link) {
                 Ok(_) => {
                     return Ok(DispatchOutcome::Errno {
@@ -7268,7 +7274,7 @@ impl SyscallDispatcher {
         }
         // Layered lookup for the source.
         let (src_kind, src_contents, src_in_overlay): (RootFsEntryKind, Option<Vec<u8>>, bool) =
-            match self.overlay.lookup(&resolved_old) {
+            match self.rootfs_vfs.overlay.lookup(&resolved_old) {
                 Some(OverlayEntry::Deleted) => {
                     return Ok(DispatchOutcome::Errno {
                         errno: LINUX_ENOENT,
@@ -7279,7 +7285,7 @@ impl SyscallDispatcher {
                     (RootFsEntryKind::File, Some(bytes.to_vec()), true)
                 }
                 None => {
-                    let Some(rootfs) = &self.rootfs else {
+                    let Some(rootfs) = &self.rootfs_vfs.rootfs else {
                         return Ok(DispatchOutcome::Errno {
                             errno: LINUX_ENOENT,
                         });
@@ -7310,10 +7316,10 @@ impl SyscallDispatcher {
                 }
             };
         // Layered lookup for the destination.
-        let dst_exists = match self.overlay.lookup(&resolved_new) {
+        let dst_exists = match self.rootfs_vfs.overlay.lookup(&resolved_new) {
             Some(OverlayEntry::Deleted) => false,
             Some(OverlayEntry::Dir) | Some(OverlayEntry::File(_)) => true,
-            None => self
+            None => self.rootfs_vfs
                 .rootfs
                 .as_ref()
                 .map(|rootfs| rootfs.symlink_metadata(&resolved_new).is_ok())
@@ -7328,7 +7334,7 @@ impl SyscallDispatcher {
         match src_kind {
             RootFsEntryKind::File | RootFsEntryKind::Symlink => {
                 let bytes = src_contents.unwrap_or_default();
-                if self
+                if self.rootfs_vfs
                     .overlay
                     .set_file_contents(&resolved_new, bytes)
                     .is_err()
@@ -7339,7 +7345,7 @@ impl SyscallDispatcher {
                 }
             }
             RootFsEntryKind::Directory => {
-                if self.overlay.make_dir(&resolved_new).is_err() {
+                if self.rootfs_vfs.overlay.make_dir(&resolved_new).is_err() {
                     return Ok(DispatchOutcome::Errno {
                         errno: LINUX_EINVAL,
                     });
@@ -7349,15 +7355,15 @@ impl SyscallDispatcher {
         // Remove the source: drop overlay entry (if any) and tombstone
         // it iff the rootfs still has it underneath.
         if src_in_overlay {
-            self.overlay.remove_entry(&resolved_old);
+            self.rootfs_vfs.overlay.remove_entry(&resolved_old);
         }
-        let rootfs_has_src = self
+        let rootfs_has_src = self.rootfs_vfs
             .rootfs
             .as_ref()
             .map(|rootfs| rootfs.symlink_metadata(&resolved_old).is_ok())
             .unwrap_or(false);
         if rootfs_has_src {
-            let _ = self.overlay.mark_deleted(&resolved_old);
+            let _ = self.rootfs_vfs.overlay.mark_deleted(&resolved_old);
         }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
@@ -7392,7 +7398,7 @@ impl SyscallDispatcher {
         // Layered lookup: overlay first (including the tombstone case),
         // then synthetic /proc files (still EROFS — can't unlink them),
         // then fall through to the rootfs.
-        let (kind, in_overlay, in_rootfs) = match self.overlay.lookup(&resolved) {
+        let (kind, in_overlay, in_rootfs) = match self.rootfs_vfs.overlay.lookup(&resolved) {
             Some(OverlayEntry::Deleted) => {
                 return Ok(DispatchOutcome::Errno {
                     errno: LINUX_ENOENT,
@@ -7404,7 +7410,7 @@ impl SyscallDispatcher {
                 if is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context()) {
                     return Ok(DispatchOutcome::Errno { errno: LINUX_EROFS });
                 }
-                let Some(rootfs) = &self.rootfs else {
+                let Some(rootfs) = &self.rootfs_vfs.rootfs else {
                     return Ok(DispatchOutcome::Errno {
                         errno: LINUX_ENOENT,
                     });
@@ -7436,18 +7442,18 @@ impl SyscallDispatcher {
             // Drop the overlay's entry. If the same path also lives in
             // the rootfs we must tombstone so the layered view shows it
             // as gone.
-            self.overlay.remove_entry(&resolved);
-            let rootfs_has_it = self
+            self.rootfs_vfs.overlay.remove_entry(&resolved);
+            let rootfs_has_it = self.rootfs_vfs
                 .rootfs
                 .as_ref()
                 .map(|rootfs| rootfs.symlink_metadata(&resolved).is_ok())
                 .unwrap_or(false);
             if rootfs_has_it {
-                let _ = self.overlay.mark_deleted(&resolved);
+                let _ = self.rootfs_vfs.overlay.mark_deleted(&resolved);
             }
         } else if in_rootfs {
             // Tombstone the rootfs-backed path.
-            if self.overlay.mark_deleted(&resolved).is_err() {
+            if self.rootfs_vfs.overlay.mark_deleted(&resolved).is_err() {
                 return Ok(DispatchOutcome::Errno {
                     errno: LINUX_EINVAL,
                 });
@@ -7555,12 +7561,12 @@ impl SyscallDispatcher {
         };
         // Layered: overlay first (including tombstones), then synthetic
         // /proc and /sys, then rootfs.
-        match self.overlay.lookup(&path) {
+        match self.rootfs_vfs.overlay.lookup(&path) {
             Some(OverlayEntry::Deleted) => {
                 return Ok(DispatchOutcome::Errno { errno: LINUX_ENOENT });
             }
             Some(OverlayEntry::Dir) | Some(OverlayEntry::File(_)) => {
-                if let Some(metadata) = self.overlay.metadata(&path) {
+                if let Some(metadata) = self.rootfs_vfs.overlay.metadata(&path) {
                     return Ok(write_stat(memory, statbuf, &metadata));
                 }
             }
@@ -7572,7 +7578,7 @@ impl SyscallDispatcher {
         if let Some(contents) = synthetic_sys_file(&path) {
             return Ok(write_synthetic_stat(memory, statbuf, &path, contents.len()));
         }
-        let Some(rootfs) = &self.rootfs else {
+        let Some(rootfs) = &self.rootfs_vfs.rootfs else {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_ENOENT,
             });
@@ -7624,12 +7630,12 @@ impl SyscallDispatcher {
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
         // Layered: overlay first.
-        match self.overlay.lookup(&path) {
+        match self.rootfs_vfs.overlay.lookup(&path) {
             Some(OverlayEntry::Deleted) => {
                 return Ok(DispatchOutcome::Errno { errno: LINUX_ENOENT });
             }
             Some(OverlayEntry::Dir) | Some(OverlayEntry::File(_)) => {
-                if let Some(metadata) = self.overlay.metadata(&path) {
+                if let Some(metadata) = self.rootfs_vfs.overlay.metadata(&path) {
                     return Ok(write_statx(memory, statxbuf, &metadata));
                 }
             }
@@ -7651,7 +7657,7 @@ impl SyscallDispatcher {
                 contents.len(),
             ));
         }
-        let Some(rootfs) = &self.rootfs else {
+        let Some(rootfs) = &self.rootfs_vfs.rootfs else {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_ENOENT,
             });
