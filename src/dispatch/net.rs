@@ -792,10 +792,39 @@ impl SyscallDispatcher {
                     ready |= LINUX_POLLOUT;
                 }
             }
-            OpenDescription::HostPipe { .. } => {
-                // Polling host pipes correctly requires poll(2) on the
-                // host fd. For now report nothing ready and let the
-                // guest block in a real read/write.
+            OpenDescription::HostPipe { host_fd, .. } => {
+                // Poll the real host pipe fd so the guest's poll loop reflects
+                // actual kernel readiness: a read end with buffered data is
+                // POLLIN-ready, a write end with buffer space is POLLOUT-ready,
+                // and a hung-up peer surfaces POLLHUP/POLLERR. Reporting
+                // nothing here made poll/ppoll/pselect6 undercount ready fds
+                // for pipe ends.
+                let mut pfd = libc::pollfd {
+                    fd: *host_fd,
+                    events: 0,
+                    revents: 0,
+                };
+                if requested_events & LINUX_POLLIN != 0 {
+                    pfd.events |= libc::POLLIN;
+                }
+                if requested_events & LINUX_POLLOUT != 0 {
+                    pfd.events |= libc::POLLOUT;
+                }
+                let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+                if rc > 0 {
+                    if pfd.revents & libc::POLLIN != 0 {
+                        ready |= LINUX_POLLIN;
+                    }
+                    if pfd.revents & libc::POLLOUT != 0 {
+                        ready |= LINUX_POLLOUT;
+                    }
+                    if pfd.revents & libc::POLLERR != 0 {
+                        ready |= LINUX_POLLERR;
+                    }
+                    if pfd.revents & libc::POLLHUP != 0 {
+                        ready |= LINUX_POLLHUP;
+                    }
+                }
             }
             OpenDescription::HostSocket { host_fd, .. } => {
                 // Poll the real host fd so the guest's poll loop reflects
