@@ -271,12 +271,34 @@ fn mremap_bootstrap_accepts_shrinking_and_rejects_growth_with_enomem() {
             value: LINUX_MMAP_BASE as i64,
         }
     );
+    // Growing a mapping that cannot extend in place: with MREMAP_MAYMOVE,
+    // Linux relocates the mapping to a fresh region rather than failing.
+    // The bump allocator hands out the start of the mmap arena (which is
+    // still at LINUX_MMAP_BASE in this fixture) and copies the old bytes
+    // across. (Without MREMAP_MAYMOVE this would be ENOMEM — see below.)
     assert_eq!(
         dispatcher
             .dispatch(
                 SyscallRequest::new(
                     216,
                     SyscallArgs::from([LINUX_MMAP_BASE, 0x1000, 0x8000, MREMAP_MAYMOVE, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned {
+            value: LINUX_MMAP_BASE as i64,
+        }
+    );
+    // Growing WITHOUT MREMAP_MAYMOVE when the mapping cannot extend in
+    // place must fail with ENOMEM, matching Linux mremap(2).
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    216,
+                    SyscallArgs::from([LINUX_MMAP_BASE, 0x1000, 0x8000, 0, 0, 0]),
                 ),
                 &mut memory,
                 &mut reporter,
