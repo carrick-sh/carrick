@@ -232,43 +232,38 @@ fn job_control_bootstrap_returns_single_session_values() {
 
 
 #[test]
-fn planned_process_syscalls_surface_by_name_in_compat_report() {
+fn unhandled_named_syscall_surfaces_by_name_in_compat_report() {
+    // A syscall that IS known in the aarch64 name table but has no handler in
+    // the normalized dispatch table returns ENOSYS and surfaces in the compat
+    // report under its REAL name (not "unknown" — that path is covered by
+    // `unknown_syscall_returns_enosys_and_records_report_entry`).
+    //
+    // execveat(281) is such a syscall today. The original version of this test
+    // also listed clone(220)/execve(221)/clone3(435), but those now have real
+    // handlers (clone→Fork, execve→Execve, clone3), so they no longer report
+    // ENOSYS. If a real execveat handler lands, point this at the next
+    // still-unimplemented named syscall.
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x80]);
     let mut reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
-    let expected: &[(u64, &str)] = &[
-        (220, "clone"),
-        (221, "execve"),
-        (281, "execveat"),
-        (435, "clone3"),
-    ];
-
-    for (number, _name) in expected {
-        let outcome = dispatcher
-            .dispatch(
-                SyscallRequest::new(*number, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
-                &mut memory,
-                &mut reporter,
-            )
-            .unwrap();
-        assert_eq!(
-            outcome,
-            DispatchOutcome::Errno { errno: 38 },
-            "syscall {number} should report ENOSYS until a real handler lands"
-        );
-    }
+    let outcome = dispatcher
+        .dispatch(
+            SyscallRequest::new(281, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+            &mut memory,
+            &mut reporter,
+        )
+        .unwrap();
+    assert_eq!(outcome, DispatchOutcome::Errno { errno: 38 });
 
     let report = reporter.finish();
-    for (number, name) in expected {
-        let entry = report
-            .unhandled_syscalls
-            .iter()
-            .find(|entry| entry.number == *number)
-            .unwrap_or_else(|| panic!("missing compat entry for {name}"));
-        assert_eq!(entry.name, *name);
-        assert_eq!(entry.count, 1);
-    }
+    let entry = report
+        .unhandled_syscalls
+        .iter()
+        .find(|entry| entry.number == 281)
+        .expect("execveat should surface in the compat report");
+    assert_eq!(entry.name, "execveat");
+    assert_eq!(entry.count, 1);
 }
 
 
