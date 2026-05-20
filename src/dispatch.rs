@@ -1290,70 +1290,18 @@ impl SyscallDispatcher {
             return Ok(outcome);
         }
 
-        let outcome = match request.number {
-            // xattr family. set/get/list have path, lpath, and fd variants.
-            // The l-variants differ only in symlink semantics, which the
-            // host backend collapses (cap-std resolves the materialised
-            // file); for the conformance namespace (`user.*` on a regular
-            // file) the behaviour is identical.
-            5 | 6 => self.setxattr(request, memory, XattrTarget::Path)?,
-            7 => self.setxattr(request, memory, XattrTarget::Fd)?,
-            8 | 9 => self.getxattr(request, memory, XattrTarget::Path)?,
-            10 => self.getxattr(request, memory, XattrTarget::Fd)?,
-            11 | 12 => self.listxattr(request, memory, XattrTarget::Path)?,
-            13 => self.listxattr(request, memory, XattrTarget::Fd)?,
-            14..=16 => self.xattr_unsupported(),
-            43 => self.statfs(request, memory)?,
-            44 => self.fstatfs(request, memory),
-            45 => self.truncate(request, memory)?,
-            74 => self.bootstrap_enosys(),
-            75 => self.bootstrap_enosys(),
-            77 => self.bootstrap_enosys(),
-            93 => self.exit(request),
-            94 => self.exit(request),
-            // setfsuid / setfsgid: Linux convention is to return the
-            // PREVIOUS fsuid/fsgid (not 0/error). We treat fsuid as the
-            // effective uid for tracking purposes.
-            151 => DispatchOutcome::Returned {
-                value: i64::from(self.cred_euid),
-            },
-            152 => DispatchOutcome::Returned {
-                value: i64::from(self.cred_egid),
-            },
-            // getgroups(size, list): we belong to no supplementary groups.
-            // size=0 means "tell me how many" — return 0. Otherwise write
-            // nothing and return 0. setgroups: accept and ignore.
-            159 => DispatchOutcome::Returned { value: 0 },
-            172 => self.getpid(),
-            173 => DispatchOutcome::Returned { value: 1 },
-            174 => DispatchOutcome::Returned { value: i64::from(self.cred_ruid) },
-            175 => DispatchOutcome::Returned { value: i64::from(self.cred_euid) },
-            176 => DispatchOutcome::Returned { value: i64::from(self.cred_rgid) },
-            177 => DispatchOutcome::Returned { value: i64::from(self.cred_egid) },
-            178 => self.getpid(),
-            243 => self.recvmmsg(request, memory),
-            269 => self.sendmmsg(request, memory),
-            435 => self.clone3(request, memory),
-            283 => self.membarrier(request),
-            293 => self.rseq(),
-            _ => {
-                reporter.record(CompatEvent::unhandled_syscall(
-                    request.number,
-                    name,
-                    request.args,
-                ));
-                panic!(
-                    "unimplemented syscall {} ({}) args=[{:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}]",
-                    request.number,
-                    name,
-                    request.arg(0),
-                    request.arg(1),
-                    request.arg(2),
-                    request.arg(3),
-                    request.arg(4),
-                    request.arg(5),
-                );
-            }
+        // The normalized macro table is the single authoritative syscall
+        // registry. Any number it does not claim is genuinely unimplemented:
+        // record a structured compat event and return ENOSYS. The supervisor
+        // must never panic on guest input — an unknown syscall is the guest's
+        // problem to handle (it gets -ENOSYS), not ours to crash on.
+        reporter.record(CompatEvent::unhandled_syscall(
+            request.number,
+            name,
+            request.args,
+        ));
+        let outcome = DispatchOutcome::Errno {
+            errno: LINUX_ENOSYS,
         };
 
         let (retval, errno) = outcome.retval_errno();
