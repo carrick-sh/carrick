@@ -405,6 +405,31 @@ pub struct HostFsBackend {
     /// scratch-disk file came from the guest (overlay-owned) vs from
     /// a leftover reflink seed we should ignore here.
     known_files: HashSet<PathBuf>,
+    /// PID of the process that created this backend (and thus owns the
+    /// `TempDir` lifetime). carrick forks real processes for guest
+    /// `clone(2)`; every forked child inherits this struct via COW and
+    /// shares the SAME on-disk scratch directory. If a forked child's
+    /// `HostFsBackend` ran `TempDir::drop` it would `remove_dir_all`
+    /// the scratch out from under its still-running siblings (the cause
+    /// of the `--fs host` apt-resolver regression: a worker exiting
+    /// deleted /etc/hosts mid-resolution). The Drop impl leaks the
+    /// `TempDir` in any process other than the creator, so only the
+    /// original `carrick run` process reaps the scratch.
+    owner_pid: u32,
+}
+
+impl Drop for HostFsBackend {
+    fn drop(&mut self) {
+        let current = unsafe { libc::getpid() as u32 };
+        if current != self.owner_pid {
+            // Forked descendant: leak the TempDir so its Drop does NOT
+            // delete the shared scratch directory. `into_path` consumes
+            // the TempDir without scheduling removal.
+            if let Some(scratch) = self._scratch.take() {
+                let _ = scratch.into_path();
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for HostFsBackend {
@@ -444,6 +469,7 @@ impl HostFsBackend {
             dirs_created: HashSet::new(),
             tombstones: HashSet::new(),
             known_files: HashSet::new(),
+            owner_pid: unsafe { libc::getpid() as u32 },
         })
     }
 
@@ -489,6 +515,7 @@ impl HostFsBackend {
             dirs_created: HashSet::new(),
             tombstones: HashSet::new(),
             known_files: HashSet::new(),
+            owner_pid: unsafe { libc::getpid() as u32 },
         }
     }
 
@@ -1128,5 +1155,66 @@ mod tests {
         );
         // The victim file must be untouched.
         assert_eq!(std::fs::read(&victim).unwrap(), b"secret");
+    }
+
+    /// HostFsBackend must survive `libc::fork(2)`: the apt-resolver
+    /// regression under `--fs host` had the symptom of a forked
+    /// child carrick process reading /etc/hosts via the inherited
+    /// cap-std Dir fd and somehow not seeing the seeded content.
+    /// This test reproduces the exact pattern (seed in parent, read
+    /// in `libc::fork` child) to nail down whether cap-std's openat
+    /// against an inherited dir fd returns the right bytes.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_backend_survives_libc_fork_for_etc_hosts() {
+        let (mut b, scratch) = host_backend();
+        b.make_dir("/etc").unwrap();
+        b.set_file_contents("/etc/hosts", b"151.101.194.132\tdeb.debian.org\n".to_vec())
+            .unwrap();
+
+        // Pipe the child carrick's read result back to the parent
+        // so we can assert on it. The child must see the SAME bytes
+        // the parent wrote.
+        let mut pipefd: [i32; 2] = [0, 0];
+        assert_eq!(unsafe { libc::pipe(pipefd.as_mut_ptr()) }, 0);
+        let (read_end, write_end) = (pipefd[0], pipefd[1]);
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            // Child: read /etc/hosts via the inherited backend, write
+            // the result to the pipe, then _exit so we bypass Rust
+            // destructors that might race with the parent's view.
+            unsafe { libc::close(read_end) };
+            let buf = b.file_contents("/etc/hosts").unwrap_or_default();
+            unsafe {
+                libc::write(write_end, buf.as_ptr() as *const _, buf.len());
+                libc::close(write_end);
+                libc::_exit(0);
+            }
+        }
+        // Parent: read what the child saw.
+        unsafe { libc::close(write_end) };
+        let mut got = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = unsafe {
+                libc::read(read_end, chunk.as_mut_ptr() as *mut _, chunk.len())
+            };
+            if n <= 0 {
+                break;
+            }
+            got.extend_from_slice(&chunk[..n as usize]);
+        }
+        unsafe { libc::close(read_end) };
+        let mut status = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+
+        assert_eq!(
+            String::from_utf8_lossy(&got),
+            "151.101.194.132\tdeb.debian.org\n",
+            "forked child read different bytes from /etc/hosts than the parent wrote"
+        );
+        drop(scratch);
     }
 }

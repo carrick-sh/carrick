@@ -3964,13 +3964,33 @@ impl SyscallDispatcher {
         // Layered overlay+rootfs lookup with full openat semantics
         // (O_CREAT/O_EXCL/O_TRUNC, write-promotion of rootfs-only
         // files) lives in RootFsVfs::open_for_dispatch.
-        let description = match self.rootfs_vfs.open_for_dispatch(
+        let dispatch_result = self.rootfs_vfs.open_for_dispatch(
             &path,
             want_create,
             want_excl,
             want_trunc,
             writable_request,
-        ) {
+        );
+        // USDT probe: every guest path-level open, with the resolved
+        // path string and resulting size/errno. Lets dtrace operators
+        // see exactly what bytes each forked carrick process is
+        // serving for paths like /etc/hosts during the apt-resolver
+        // run.
+        match &dispatch_result {
+            Ok(crate::vfs::rootfs::OpenDispatchResult::File { contents, .. }) => {
+                crate::probes::path_open(&path, contents.len() as u64, 0);
+            }
+            Ok(crate::vfs::rootfs::OpenDispatchResult::Directory { .. }) => {
+                crate::probes::path_open(&path, 0, 0);
+            }
+            Ok(crate::vfs::rootfs::OpenDispatchResult::NotFoundCreate) => {
+                crate::probes::path_open(&path, 0, 0);
+            }
+            Err(errno) => {
+                crate::probes::path_open(&path, 0, *errno);
+            }
+        }
+        let description = match dispatch_result {
             Ok(crate::vfs::rootfs::OpenDispatchResult::File {
                 metadata,
                 contents,
