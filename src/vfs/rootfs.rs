@@ -46,6 +46,15 @@ pub enum OpenDispatchResult {
         contents: Vec<u8>,
         writable: bool,
     },
+    /// A regular file backed by a REAL host fd (disk-backed overlay,
+    /// i.e. `--fs host`). The dispatcher wraps this as
+    /// `OpenDescription::HostFile`, so reads/writes go to the shared
+    /// kernel file and survive `libc::fork`.
+    HostFile {
+        host_fd: i32,
+        metadata: RootFsMetadata,
+        writable: bool,
+    },
     Directory {
         metadata: RootFsMetadata,
         entries: Vec<RootFsDirEntry>,
@@ -105,13 +114,32 @@ impl RootFsVfs {
                 if want_create && want_excl {
                     return Err(LINUX_EEXIST);
                 }
+                let mode = self.overlay.metadata(path).map(|m| m.mode).unwrap_or(0o644);
+                // Disk-backed overlay (--fs host): hand back a REAL host
+                // fd so reads/writes share the kernel file across fork.
+                if let Some(host_fd) =
+                    self.overlay.open_raw_fd(path, writable_request, false, want_trunc)
+                {
+                    let size = self.overlay.metadata(path).map(|m| m.size).unwrap_or(0);
+                    let metadata = RootFsMetadata {
+                        path: std::path::Path::new(path).to_path_buf(),
+                        kind: RootFsEntryKind::File,
+                        mode,
+                        size,
+                    };
+                    return Ok(OpenDispatchResult::HostFile {
+                        host_fd,
+                        metadata,
+                        writable: writable_request,
+                    });
+                }
+                // In-memory overlay (MemoryBackend): cached-bytes File.
                 if want_trunc {
                     contents.clear();
                     self.overlay
                         .set_file_contents(path, contents.clone())
                         .map_err(|_| LINUX_EINVAL)?;
                 }
-                let mode = self.overlay.metadata(path).map(|m| m.mode).unwrap_or(0o644);
                 let metadata = RootFsMetadata {
                     path: std::path::Path::new(path).to_path_buf(),
                     kind: RootFsEntryKind::File,
