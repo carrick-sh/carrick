@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::compat::{CompatEvent, CompatReporter, SyscallArgs};
 use crate::linux_abi::{
     KernelAbi, LINUX_DIRENT64_HEADER_SIZE, LINUX_DT_DIR, LINUX_DT_LNK, LINUX_DT_REG, LINUX_PAGE_SIZE,
-    LINUX_S_IFDIR, LINUX_S_IFLNK, LINUX_S_IFMT, LINUX_S_IFREG, LINUX_TERMIOS_KERNEL_SIZE, LinuxCapabilityData, LinuxCapabilityHeader,
+    LINUX_S_IFCHR, LINUX_S_IFDIR, LINUX_S_IFIFO, LINUX_S_IFLNK, LINUX_S_IFMT, LINUX_S_IFREG, LINUX_S_IFSOCK, LINUX_TERMIOS_KERNEL_SIZE, LinuxCapabilityData, LinuxCapabilityHeader,
     LinuxDirent64Header, LinuxEpollEvent, LinuxEventfdValue, LinuxFdPair, LinuxIfAddrMsg,
     LinuxIfInfoMsg, LinuxIovec, LinuxNlMsgHdr, LinuxRtAttr,
     LINUX_ARPHRD_LOOPBACK, LINUX_IFA_ADDRESS, LINUX_IFA_LABEL, LINUX_IFA_LOCAL, LINUX_IFF_LOOPBACK,
@@ -9033,10 +9033,22 @@ impl SyscallDispatcher {
         };
         // Synthetic /proc /sys paths first.
         if let Some(contents) = synthetic_proc_file(&path, &self.synthetic_proc_context()) {
-            return Ok(write_synthetic_stat(memory, statbuf, &path, contents.len()));
+            return Ok(write_synthetic_stat(
+                memory,
+                statbuf,
+                &path,
+                contents.len(),
+                LINUX_S_IFREG | 0o444,
+            ));
         }
         if let Some(contents) = synthetic_sys_file(&path) {
-            return Ok(write_synthetic_stat(memory, statbuf, &path, contents.len()));
+            return Ok(write_synthetic_stat(
+                memory,
+                statbuf,
+                &path,
+                contents.len(),
+                LINUX_S_IFREG | 0o444,
+            ));
         }
         // Disk-backed overlay (--fs host): prefer the REAL on-disk stat
         // so the type bits (S_IFLNK for a symlink) and st_nlink (a true
@@ -9137,7 +9149,11 @@ impl SyscallDispatcher {
                     1 => "/dev/stdout",
                     _ => "/dev/stderr",
                 };
-                return write_synthetic_stat(memory, statbuf, label, 0);
+                // Character device (tty/pipe-like), NOT a regular file —
+                // so tools take the cooked/line path instead of the
+                // seek-based regular-file fast path (which made `head`
+                // emit "Illegal seek" and confused same-file checks).
+                return write_synthetic_stat(memory, statbuf, label, 0, LINUX_S_IFCHR | 0o620);
             }
             return DispatchOutcome::Errno { errno: LINUX_EBADF };
         };
@@ -9156,23 +9172,64 @@ impl SyscallDispatcher {
                 return write_stat(memory, statbuf, &md);
             }
             OpenDescription::SyntheticFile { path, contents, .. } => {
-                return write_synthetic_stat(memory, statbuf, path, contents.len());
+                return write_synthetic_stat(
+                    memory,
+                    statbuf,
+                    path,
+                    contents.len(),
+                    LINUX_S_IFREG | 0o444,
+                );
             }
             OpenDescription::EventFd { .. } => {
-                return write_synthetic_stat(memory, statbuf, "anon_inode:[eventfd]", 0);
+                return write_synthetic_stat(
+                    memory,
+                    statbuf,
+                    "anon_inode:[eventfd]",
+                    0,
+                    LINUX_S_IFREG | 0o444,
+                );
             }
             OpenDescription::TimerFd { .. } => {
-                return write_synthetic_stat(memory, statbuf, "anon_inode:[timerfd]", 0);
+                return write_synthetic_stat(
+                    memory,
+                    statbuf,
+                    "anon_inode:[timerfd]",
+                    0,
+                    LINUX_S_IFREG | 0o444,
+                );
             }
             OpenDescription::Epoll { .. } => {
-                return write_synthetic_stat(memory, statbuf, "anon_inode:[eventpoll]", 0);
+                return write_synthetic_stat(
+                    memory,
+                    statbuf,
+                    "anon_inode:[eventpoll]",
+                    0,
+                    LINUX_S_IFREG | 0o444,
+                );
             }
-            OpenDescription::PipeReader { .. } | OpenDescription::PipeWriter { .. }
+            // Pipes are FIFOs and sockets are sockets — NOT regular files.
+            // Reporting S_IFREG made every pipe share one inode + look like
+            // a regular file, so `grep` in a pipeline aborted with "input
+            // file is also the output". The distinct type bits fix that.
+            OpenDescription::PipeReader { .. }
+            | OpenDescription::PipeWriter { .. }
             | OpenDescription::HostPipe { .. } => {
-                return write_synthetic_stat(memory, statbuf, "pipe:[carrick]", 0);
+                return write_synthetic_stat(
+                    memory,
+                    statbuf,
+                    "pipe:[carrick]",
+                    0,
+                    LINUX_S_IFIFO | 0o600,
+                );
             }
             OpenDescription::HostSocket { .. } | OpenDescription::Netlink { .. } => {
-                return write_synthetic_stat(memory, statbuf, "socket:[carrick]", 0);
+                return write_synthetic_stat(
+                    memory,
+                    statbuf,
+                    "socket:[carrick]",
+                    0,
+                    LINUX_S_IFSOCK | 0o600,
+                );
             }
         };
         write_stat(memory, statbuf, metadata)
@@ -10029,11 +10086,12 @@ fn write_synthetic_stat(
     statbuf: u64,
     path: &str,
     size: usize,
+    mode: u32,
 ) -> DispatchOutcome {
     let stat = LinuxStat {
         st_dev: 1,
         st_ino: inode_for_path(Path::new(path)),
-        st_mode: LINUX_S_IFREG | 0o444,
+        st_mode: mode,
         st_nlink: 1,
         st_uid: 0,
         st_gid: 0,
