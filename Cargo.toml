@@ -42,3 +42,7 @@ applevisor-sys = { version = "1.0.0", default-features = false, features = ["mac
 assert_cmd = "2.1.1"
 predicates = "3.1.3"
 tempfile = "3.23.0"
+# First-class Docker client for the differential conformance harness
+# (real-Linux reference side). MIT-licensed, async/tokio-native.
+bollard = "0.18"
+futures-util = "0.3"
