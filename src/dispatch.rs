@@ -775,6 +775,37 @@ impl SyscallDispatcher {
         96 => set_tid_address,
         98 => futex,
         99 => set_robust_list,
+        101 => nanosleep,
+        102 => getitimer,
+        103 => setitimer,
+        112 => clock_settime,
+        113 => clock_gettime,
+        114 => clock_getres,
+        115 => clock_nanosleep,
+        117 => ptrace,
+        123 => sched_getaffinity,
+        124 => sched_yield,
+        129 => kill,
+        130 => tkill,
+        131 => tgkill,
+        132 => sigaltstack,
+        133 => rt_sigsuspend,
+        134 => rt_sigaction,
+        135 => rt_sigprocmask,
+        137 => rt_sigtimedwait,
+        138 => rt_sigqueueinfo,
+        139 => rt_sigreturn,
+        140 => setpriority,
+        141 => getpriority,
+        142 => reboot,
+        143 => setregid,
+        144 => setgid,
+        145 => setreuid,
+        146 => setuid,
+        147 => setresuid,
+        148 => getresuid,
+        149 => setresgid,
+        150 => getresgid,
     }
 
     pub fn new() -> Self {
@@ -1016,37 +1047,6 @@ impl SyscallDispatcher {
             77 => self.bootstrap_enosys(),
             93 => self.exit(request),
             94 => self.exit(request),
-            101 => self.nanosleep(request, memory),
-            102 => self.getitimer(request, memory),
-            103 => self.setitimer(request, memory, reporter),
-            112 => self.clock_settime(request, memory),
-            113 => self.clock_gettime(request, memory),
-            114 => self.clock_getres(request, memory),
-            115 => self.clock_nanosleep(request, memory),
-            117 => self.ptrace(),
-            123 => self.sched_getaffinity(request, memory),
-            124 => self.sched_yield(),
-            129 => self.kill(request),
-            130 => self.tkill(request),
-            131 => self.tgkill(request),
-            132 => self.sigaltstack(request, memory),
-            133 => self.rt_sigsuspend(request, memory),
-            134 => self.rt_sigaction(request, memory),
-            135 => self.rt_sigprocmask(request, memory)?,
-            137 => self.rt_sigtimedwait(request, memory),
-            138 => self.rt_sigqueueinfo(request),
-            139 => self.rt_sigreturn(),
-            140 => self.setpriority(request),
-            141 => self.getpriority(request),
-            142 => self.reboot(),
-            143 => self.setregid(request),
-            144 => self.setgid(request),
-            145 => self.setreuid(request),
-            146 => self.setuid(request),
-            147 => self.setresuid(request),
-            148 => self.getresuid(request, memory),
-            149 => self.setresgid(request),
-            150 => self.getresgid(request, memory),
             // setfsuid / setfsgid: Linux convention is to return the
             // PREVIOUS fsuid/fsgid (not 0/error). We treat fsuid as the
             // effective uid for tracking purposes.
@@ -3153,39 +3153,42 @@ impl SyscallDispatcher {
         Ok(DispatchOutcome::Returned { value: 0 })
     }
 
-    fn sched_yield(&self) -> DispatchOutcome {
+    fn sched_yield<M: GuestMemory>(
+        &mut self,
+        _ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
         std::thread::yield_now();
-        DispatchOutcome::Returned { value: 0 }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
-    fn sched_getaffinity(
-        &self,
-        request: SyscallRequest,
-        memory: &mut impl GuestMemory,
-    ) -> DispatchOutcome {
-        let pid = request.arg(0);
-        let size = request.arg(1);
-        let address = request.arg(2);
+    fn sched_getaffinity<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let pid = ctx.arg(0);
+        let size = ctx.arg(1);
+        let address = ctx.arg(2);
+        let memory = &mut *ctx.memory;
         let current_pid = std::process::id() as u64;
 
         if pid != 0 && pid != current_pid {
-            return DispatchOutcome::Errno { errno: LINUX_ESRCH };
+            return Ok(DispatchOutcome::Errno { errno: LINUX_ESRCH });
         }
         if size < LINUX_BOOTSTRAP_AFFINITY_BYTES as u64 {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
-            };
+            });
         }
         let mut mask = [0_u8; LINUX_BOOTSTRAP_AFFINITY_BYTES];
         mask[0] = 1;
         if memory.write_bytes(address, &mask).is_err() {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EFAULT,
-            };
+            });
         }
-        DispatchOutcome::Returned {
+        Ok(DispatchOutcome::Returned {
             value: LINUX_BOOTSTRAP_AFFINITY_BYTES as i64,
-        }
+        })
     }
 
     fn futex<M: GuestMemory>(
@@ -3248,47 +3251,51 @@ impl SyscallDispatcher {
         })
     }
 
-    fn nanosleep(&self, request: SyscallRequest, memory: &impl GuestMemory) -> DispatchOutcome {
-        let request_address = request.arg(0);
+    fn nanosleep<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let request_address = ctx.arg(0);
+        let memory = &*ctx.memory;
         let timespec = match read_timespec(memory, request_address) {
             Ok(timespec) => timespec,
-            Err(errno) => return DispatchOutcome::Errno { errno },
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
         let duration = match duration_from_linux_timespec(timespec) {
             Ok(duration) => duration,
-            Err(errno) => return DispatchOutcome::Errno { errno },
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
         if let Some(duration) = duration {
             std::thread::sleep(duration);
         }
-        DispatchOutcome::Returned { value: 0 }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
-    fn clock_nanosleep(
-        &self,
-        request: SyscallRequest,
-        memory: &impl GuestMemory,
-    ) -> DispatchOutcome {
-        let clock_id = request.arg(0);
-        let flags = request.arg(1);
-        let request_address = request.arg(2);
+    fn clock_nanosleep<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let clock_id = ctx.arg(0);
+        let flags = ctx.arg(1);
+        let request_address = ctx.arg(2);
+        let memory = &*ctx.memory;
         if flags & !LINUX_TIMER_ABSTIME != 0 {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
-            };
+            });
         }
         let Some(now) = linux_clock_duration(clock_id) else {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
-            };
+            });
         };
         let timespec = match read_timespec(memory, request_address) {
             Ok(timespec) => timespec,
-            Err(errno) => return DispatchOutcome::Errno { errno },
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
         let requested = match duration_from_linux_timespec(timespec) {
             Ok(duration) => duration.unwrap_or(Duration::ZERO),
-            Err(errno) => return DispatchOutcome::Errno { errno },
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
         let sleep_duration = if flags & LINUX_TIMER_ABSTIME != 0 {
             requested.saturating_sub(now)
@@ -3298,58 +3305,58 @@ impl SyscallDispatcher {
         if !sleep_duration.is_zero() {
             std::thread::sleep(sleep_duration);
         }
-        DispatchOutcome::Returned { value: 0 }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
-    fn clock_gettime(
-        &self,
-        request: SyscallRequest,
-        memory: &mut impl GuestMemory,
-    ) -> DispatchOutcome {
-        let clock_id = request.arg(0);
-        let address = request.arg(1);
+    fn clock_gettime<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let clock_id = ctx.arg(0);
+        let address = ctx.arg(1);
+        let memory = &mut *ctx.memory;
         let Some(duration) = linux_clock_duration(clock_id) else {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
-            };
+            });
         };
         let timespec = linux_timespec_from_duration(duration);
-        write_kernel_struct(memory, address, &timespec)
+        Ok(write_kernel_struct(memory, address, &timespec))
     }
 
-    fn clock_getres(
-        &self,
-        request: SyscallRequest,
-        memory: &mut impl GuestMemory,
-    ) -> DispatchOutcome {
-        let clock_id = request.arg(0);
-        let address = request.arg(1);
+    fn clock_getres<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let clock_id = ctx.arg(0);
+        let address = ctx.arg(1);
+        let memory = &mut *ctx.memory;
         if linux_clock_duration(clock_id).is_none() {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
-            };
+            });
         }
         if address == 0 {
-            return DispatchOutcome::Returned { value: 0 };
+            return Ok(DispatchOutcome::Returned { value: 0 });
         }
-        write_packed(
+        Ok(write_packed(
             memory,
             address,
             LinuxTimespec::new(0, LINUX_CLOCK_RESOLUTION_NSEC).as_bytes(),
-        )
+        ))
     }
 
-    fn clock_settime(
-        &self,
-        request: SyscallRequest,
-        memory: &impl GuestMemory,
-    ) -> DispatchOutcome {
-        let clock_id = request.arg(0);
-        let address = request.arg(1);
+    fn clock_settime<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let clock_id = ctx.arg(0);
+        let address = ctx.arg(1);
+        let memory = &*ctx.memory;
         if !linux_clock_is_known(clock_id) {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
-            };
+            });
         }
         // Reading the timespec lets us surface EFAULT for bad pointers and
         // EINVAL for invalid tv_nsec, matching the order real Linux performs
@@ -3357,89 +3364,88 @@ impl SyscallDispatcher {
         // clocks.
         let timespec = match read_timespec(memory, address) {
             Ok(timespec) => timespec,
-            Err(errno) => return DispatchOutcome::Errno { errno },
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
         let tv_nsec = timespec.tv_nsec;
         if !(0..1_000_000_000).contains(&tv_nsec) {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
-            };
+            });
         }
         // Monotonic-family clocks can never be set; report EINVAL like the
         // real kernel.
         if !linux_clock_is_settable(clock_id) {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
-            };
+            });
         }
         // For settable clocks (CLOCK_REALTIME, CLOCK_REALTIME_ALARM, CLOCK_TAI)
         // we still refuse: we are not root and we do not actually mutate the
         // host clock.
-        DispatchOutcome::Errno { errno: LINUX_EPERM }
+        Ok(DispatchOutcome::Errno { errno: LINUX_EPERM })
     }
 
-    fn getitimer(
-        &self,
-        request: SyscallRequest,
-        memory: &mut impl GuestMemory,
-    ) -> DispatchOutcome {
-        let which = request.arg(0);
-        let address = request.arg(1);
+    fn getitimer<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let which = ctx.arg(0);
+        let address = ctx.arg(1);
+        let memory = &mut *ctx.memory;
         if !linux_itimer_which_is_valid(which) {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
-            };
+            });
         }
         if address == 0 {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EFAULT,
-            };
+            });
         }
         // No timer is ever armed, so the truthful answer is a zeroed
         // itimerval (interval and value both zero == "disarmed").
-        write_kernel_struct(memory, address, &LinuxItimerval::zeroed())
+        Ok(write_kernel_struct(memory, address, &LinuxItimerval::zeroed()))
     }
 
-    fn setitimer(
-        &self,
-        request: SyscallRequest,
-        memory: &mut impl GuestMemory,
-        reporter: &mut CompatReporter,
-    ) -> DispatchOutcome {
-        let which = request.arg(0);
-        let new_address = request.arg(1);
-        let old_address = request.arg(2);
+    fn setitimer<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let which = ctx.arg(0);
+        let new_address = ctx.arg(1);
+        let old_address = ctx.arg(2);
+        let memory = &mut *ctx.memory;
         if !linux_itimer_which_is_valid(which) {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
-            };
+            });
         }
         if new_address != 0 {
             let new_value = match read_itimerval(memory, new_address) {
                 Ok(value) => value,
-                Err(errno) => return DispatchOutcome::Errno { errno },
+                Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
             };
             if !linux_timeval_usec_is_valid(new_value.it_interval)
                 || !linux_timeval_usec_is_valid(new_value.it_value)
             {
-                return DispatchOutcome::Errno {
+                return Ok(DispatchOutcome::Errno {
                     errno: LINUX_EINVAL,
-                };
+                });
             }
         }
         if old_address != 0 {
             let outcome = write_kernel_struct(memory, old_address, &LinuxItimerval::zeroed());
             if !matches!(outcome, DispatchOutcome::Returned { .. }) {
-                return outcome;
+                return Ok(outcome);
             }
         }
-        reporter.record(CompatEvent::partial_syscall(
-            request.number,
+        ctx.reporter.record(CompatEvent::partial_syscall(
+            ctx.request.number,
             "setitimer",
-            request.args,
+            ctx.request.args,
             "bootstrap: no SIGALRM delivery yet",
         ));
-        DispatchOutcome::Returned { value: 0 }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
     fn adjtimex(
@@ -3469,27 +3475,36 @@ impl SyscallDispatcher {
         adjtimex_bootstrap(memory, address)
     }
 
-    fn kill(&self, request: SyscallRequest) -> DispatchOutcome {
-        let pid = request.arg(0) as i64;
-        let signum = request.arg(1);
-        bootstrap_signal_send(pid, /*tid_required=*/ false, signum)
+    fn kill<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let pid = ctx.arg(0) as i64;
+        let signum = ctx.arg(1);
+        Ok(bootstrap_signal_send(pid, /*tid_required=*/ false, signum))
     }
 
-    fn tkill(&self, request: SyscallRequest) -> DispatchOutcome {
-        let tid = request.arg(0) as i64;
-        let signum = request.arg(1);
+    fn tkill<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let tid = ctx.arg(0) as i64;
+        let signum = ctx.arg(1);
         // tkill's target is a thread id, not a "0 means self" pid form.
-        bootstrap_signal_send(tid, /*tid_required=*/ true, signum)
+        Ok(bootstrap_signal_send(tid, /*tid_required=*/ true, signum))
     }
 
-    fn tgkill(&self, request: SyscallRequest) -> DispatchOutcome {
-        let tgid = request.arg(0) as i64;
-        let tid = request.arg(1) as i64;
-        let signum = request.arg(2);
+    fn tgkill<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let tgid = ctx.arg(0) as i64;
+        let tid = ctx.arg(1) as i64;
+        let signum = ctx.arg(2);
         if !is_valid_signum(signum) {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
-            };
+            });
         }
         let host_pid = std::process::id() as i64;
         let bootstrap_pid = LINUX_BOOTSTRAP_PID as i64;
@@ -3497,64 +3512,64 @@ impl SyscallDispatcher {
             (tgid == host_pid || tgid == bootstrap_pid)
                 && (tid == host_pid || tid == bootstrap_pid);
         if !valid_self {
-            return DispatchOutcome::Errno { errno: LINUX_ESRCH };
+            return Ok(DispatchOutcome::Errno { errno: LINUX_ESRCH });
         }
         if signum == 0 {
-            return DispatchOutcome::Returned { value: 0 };
+            return Ok(DispatchOutcome::Returned { value: 0 });
         }
         crate::host_signal::raise_for_self(signum as i32);
-        DispatchOutcome::Returned { value: 0 }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
-    fn sigaltstack(
-        &self,
-        request: SyscallRequest,
-        memory: &mut impl GuestMemory,
-    ) -> DispatchOutcome {
-        let ss = request.arg(0);
-        let old_ss = request.arg(1);
+    fn sigaltstack<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let ss = ctx.arg(0);
+        let old_ss = ctx.arg(1);
+        let memory = &mut *ctx.memory;
 
         if old_ss != 0
             && memory
                 .write_bytes(old_ss, LinuxSigaltstack::disabled().abi_bytes())
                 .is_err()
         {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EFAULT,
-            };
+            });
         }
 
         if ss != 0 {
             let bytes = match memory.read_bytes(ss, core::mem::size_of::<LinuxSigaltstack>()) {
                 Ok(bytes) => bytes,
                 Err(_) => {
-                    return DispatchOutcome::Errno {
+                    return Ok(DispatchOutcome::Errno {
                         errno: LINUX_EFAULT,
-                    };
+                    });
                 }
             };
             let new_stack = match LinuxSigaltstack::read_from_bytes(&bytes) {
                 Ok(stack) => stack,
                 Err(_) => {
-                    return DispatchOutcome::Errno {
+                    return Ok(DispatchOutcome::Errno {
                         errno: LINUX_EFAULT,
-                    };
+                    });
                 }
             };
             let flags = new_stack.ss_flags as u32 as u64;
             // SS_ONSTACK is a query-only flag; reject it along with anything
             // unrecognized. Only SS_DISABLE is accepted from userspace.
             if flags & !LINUX_SS_DISABLE != 0 {
-                return DispatchOutcome::Errno {
+                return Ok(DispatchOutcome::Errno {
                     errno: LINUX_EINVAL,
-                };
+                });
             }
             if flags == 0 {
                 let size = new_stack.ss_size;
                 if size < LINUX_MINSIGSTKSZ {
-                    return DispatchOutcome::Errno {
+                    return Ok(DispatchOutcome::Errno {
                         errno: LINUX_ENOMEM,
-                    };
+                    });
                 }
             }
             // SS_DISABLE or a request with a sufficiently large stack is
@@ -3562,20 +3577,20 @@ impl SyscallDispatcher {
             // yet, so there's nothing to install.
         }
 
-        DispatchOutcome::Returned { value: 0 }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
-    fn rt_sigsuspend(
-        &self,
-        request: SyscallRequest,
-        memory: &impl GuestMemory,
-    ) -> DispatchOutcome {
-        let mask_ptr = request.arg(0);
-        let sigset_size = request.arg(1);
+    fn rt_sigsuspend<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let mask_ptr = ctx.arg(0);
+        let sigset_size = ctx.arg(1);
+        let memory = &*ctx.memory;
         if sigset_size != LINUX_RT_SIGSET_SIZE {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
-            };
+            });
         }
         // Validate readability of the mask. The bootstrap has no signal
         // delivery, so we don't need to honour the mask — but we do owe the
@@ -3586,30 +3601,30 @@ impl SyscallDispatcher {
             .read_bytes(mask_ptr, LINUX_RT_SIGSET_SIZE as usize)
             .is_err()
         {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EFAULT,
-            };
+            });
         }
-        DispatchOutcome::Errno {
+        Ok(DispatchOutcome::Errno {
             errno: LINUX_EINTR,
-        }
+        })
     }
 
-    fn rt_sigaction(
+    fn rt_sigaction<M: GuestMemory>(
         &mut self,
-        request: SyscallRequest,
-        memory: &mut impl GuestMemory,
-    ) -> DispatchOutcome {
-        let signum = request.arg(0) as i32;
-        let new_action = request.arg(1);
-        let old_action = request.arg(2);
-        let _sigset_size = request.arg(3);
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let signum = ctx.arg(0) as i32;
+        let new_action = ctx.arg(1);
+        let old_action = ctx.arg(2);
+        let _sigset_size = ctx.arg(3);
+        let memory = &mut *ctx.memory;
         // Linux returns EINVAL for signum <= 0 or > _NSIG (64 on
         // most arches). Reject these.
         if signum < 1 || signum > 64 {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
-            };
+            });
         }
         // Write back the previously-installed handler (or zero if none).
         if old_action != 0 {
@@ -3630,16 +3645,16 @@ impl SyscallDispatcher {
                 }
             }
         }
-        DispatchOutcome::Returned { value: 0 }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
-    fn rt_sigprocmask(
-        &self,
-        request: SyscallRequest,
-        memory: &mut impl GuestMemory,
+    fn rt_sigprocmask<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let old_set = request.arg(2);
-        let sigset_size = request.arg(3);
+        let old_set = ctx.arg(2);
+        let sigset_size = ctx.arg(3);
+        let memory = &mut *ctx.memory;
         if sigset_size == 0 || sigset_size > 128 {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
@@ -3657,38 +3672,38 @@ impl SyscallDispatcher {
         Ok(DispatchOutcome::Returned { value: 0 })
     }
 
-    fn rt_sigtimedwait(
-        &self,
-        request: SyscallRequest,
-        memory: &impl GuestMemory,
-    ) -> DispatchOutcome {
-        let set_ptr = request.arg(0);
-        let timeout_ptr = request.arg(2);
-        let sigset_size = request.arg(3);
+    fn rt_sigtimedwait<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let set_ptr = ctx.arg(0);
+        let timeout_ptr = ctx.arg(2);
+        let sigset_size = ctx.arg(3);
+        let memory = &*ctx.memory;
         if sigset_size != LINUX_RT_SIGSET_SIZE {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
-            };
+            });
         }
         if memory
             .read_bytes(set_ptr, LINUX_RT_SIGSET_SIZE as usize)
             .is_err()
         {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EFAULT,
-            };
+            });
         }
         if timeout_ptr != 0 {
             let timeout = match read_timespec(memory, timeout_ptr) {
                 Ok(timeout) => timeout,
-                Err(errno) => return DispatchOutcome::Errno { errno },
+                Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
             };
             let tv_sec = timeout.tv_sec;
             let tv_nsec = timeout.tv_nsec;
             if tv_sec < 0 || !(0..1_000_000_000).contains(&tv_nsec) {
-                return DispatchOutcome::Errno {
+                return Ok(DispatchOutcome::Errno {
                     errno: LINUX_EINVAL,
-                };
+                });
             }
             // A zero timeout is a polling check that must return immediately.
             // We have no signal queue, so the answer is always "timed out".
@@ -3696,37 +3711,43 @@ impl SyscallDispatcher {
         // Non-zero timeout: a real implementation would block. With no signal
         // source we'd block forever, so report the timeout. info is only
         // written on success, and we never succeed.
-        DispatchOutcome::Errno {
+        Ok(DispatchOutcome::Errno {
             errno: LINUX_EAGAIN,
-        }
+        })
     }
 
-    fn rt_sigqueueinfo(&self, request: SyscallRequest) -> DispatchOutcome {
-        let tgid = request.arg(0) as i64;
-        let signum = request.arg(1);
+    fn rt_sigqueueinfo<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let tgid = ctx.arg(0) as i64;
+        let signum = ctx.arg(1);
         if !is_valid_signum(signum) {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
-            };
+            });
         }
         if tgid != LINUX_BOOTSTRAP_PID as i64 {
-            return DispatchOutcome::Errno { errno: LINUX_ESRCH };
+            return Ok(DispatchOutcome::Errno { errno: LINUX_ESRCH });
         }
         // No signal delivery; surface the gap explicitly rather than silently
         // swallowing the queued siginfo.
-        DispatchOutcome::Errno {
+        Ok(DispatchOutcome::Errno {
             errno: LINUX_ENOSYS,
-        }
+        })
     }
 
-    fn rt_sigreturn(&self) -> DispatchOutcome {
+    fn rt_sigreturn<M: GuestMemory>(
+        &mut self,
+        _ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
         // rt_sigreturn is invoked from a signal trampoline to restore the
         // pre-signal context. The dispatcher can't perform the restore
         // itself — only the trap engine has access to the vCPU register
         // file — so we signal `SigReturn` and let the runtime drive
         // `HvfTrapEngine::rt_sigreturn`. There is no x0 retval to write;
         // the restored x0 IS the value the guest sees.
-        DispatchOutcome::SigReturn
+        Ok(DispatchOutcome::SigReturn)
     }
 
     fn uname(&self, request: SyscallRequest, memory: &mut impl GuestMemory) -> DispatchOutcome {
@@ -3779,18 +3800,24 @@ impl SyscallDispatcher {
         }
     }
 
-    fn ptrace(&self) -> DispatchOutcome {
+    fn ptrace<M: GuestMemory>(
+        &mut self,
+        _ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
         // Bootstrap: no debugger surface yet. Linux returns ENOSYS when ptrace
         // is built out of the kernel; we surface the same answer so glibc /
         // gdb fall back cleanly.
-        DispatchOutcome::Errno {
+        Ok(DispatchOutcome::Errno {
             errno: LINUX_ENOSYS,
-        }
+        })
     }
 
-    fn reboot(&self) -> DispatchOutcome {
+    fn reboot<M: GuestMemory>(
+        &mut self,
+        _ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
         // We're not root and we wouldn't honour the request anyway.
-        DispatchOutcome::Errno { errno: LINUX_EPERM }
+        Ok(DispatchOutcome::Errno { errno: LINUX_EPERM })
     }
 
     fn sethostname(&self) -> DispatchOutcome {
@@ -3814,35 +3841,41 @@ impl SyscallDispatcher {
         }
     }
 
-    fn setpriority(&self, request: SyscallRequest) -> DispatchOutcome {
-        let which = request.arg(0);
-        let who = request.arg(1) as i32;
-        let prio = request.arg(2) as i32;
+    fn setpriority<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let which = ctx.arg(0);
+        let who = ctx.arg(1) as i32;
+        let prio = ctx.arg(2) as i32;
         if which > LINUX_PRIO_USER || prio < -20 || prio > 19 {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
-            };
+            });
         }
         if which == LINUX_PRIO_PROCESS && who != 0 && who != LINUX_BOOTSTRAP_PID as i32 {
-            return DispatchOutcome::Errno { errno: LINUX_ESRCH };
+            return Ok(DispatchOutcome::Errno { errno: LINUX_ESRCH });
         }
-        DispatchOutcome::Returned { value: 0 }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
-    fn getpriority(&self, request: SyscallRequest) -> DispatchOutcome {
-        let which = request.arg(0);
-        let who = request.arg(1) as i32;
+    fn getpriority<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let which = ctx.arg(0);
+        let who = ctx.arg(1) as i32;
         if which > LINUX_PRIO_USER {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
-            };
+            });
         }
         if which == LINUX_PRIO_PROCESS && who != 0 && who != LINUX_BOOTSTRAP_PID as i32 {
-            return DispatchOutcome::Errno { errno: LINUX_ESRCH };
+            return Ok(DispatchOutcome::Errno { errno: LINUX_ESRCH });
         }
         // Linux returns 20 - nice. Default nice is 0 → return 20. This is a
         // bootstrap value; we don't model per-process priority.
-        DispatchOutcome::Returned { value: 20 }
+        Ok(DispatchOutcome::Returned { value: 20 })
     }
 
     fn sysinfo(&self, request: SyscallRequest, memory: &mut impl GuestMemory) -> DispatchOutcome {
@@ -3936,109 +3969,125 @@ impl SyscallDispatcher {
     /// the new values; the guest gets to see them via getuid/geteuid/
     /// getresuid. Always succeeds — we're single-identity and tools
     /// can pretend to drop privileges as they like.
-    fn setresuid(&mut self, request: SyscallRequest) -> DispatchOutcome {
-        let r = request.arg(0);
-        let e = request.arg(1);
-        let s = request.arg(2);
+    fn setresuid<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let r = ctx.arg(0);
+        let e = ctx.arg(1);
+        let s = ctx.arg(2);
         if r as i64 != -1 { self.cred_ruid = r as u32; }
         if e as i64 != -1 { self.cred_euid = e as u32; }
         if s as i64 != -1 { self.cred_suid = s as u32; }
-        DispatchOutcome::Returned { value: 0 }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
-    fn setresgid(&mut self, request: SyscallRequest) -> DispatchOutcome {
-        let r = request.arg(0);
-        let e = request.arg(1);
-        let s = request.arg(2);
+    fn setresgid<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let r = ctx.arg(0);
+        let e = ctx.arg(1);
+        let s = ctx.arg(2);
         if r as i64 != -1 { self.cred_rgid = r as u32; }
         if e as i64 != -1 { self.cred_egid = e as u32; }
         if s as i64 != -1 { self.cred_sgid = s as u32; }
-        DispatchOutcome::Returned { value: 0 }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
     /// `setreuid(ruid, euid)`: same as setresuid with suid=-1.
-    fn setreuid(&mut self, request: SyscallRequest) -> DispatchOutcome {
-        let r = request.arg(0);
-        let e = request.arg(1);
+    fn setreuid<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let r = ctx.arg(0);
+        let e = ctx.arg(1);
         if r as i64 != -1 {
             self.cred_ruid = r as u32;
         }
         if e as i64 != -1 {
             self.cred_euid = e as u32;
         }
-        DispatchOutcome::Returned { value: 0 }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
-    fn setregid(&mut self, request: SyscallRequest) -> DispatchOutcome {
-        let r = request.arg(0);
-        let e = request.arg(1);
+    fn setregid<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let r = ctx.arg(0);
+        let e = ctx.arg(1);
         if r as i64 != -1 {
             self.cred_rgid = r as u32;
         }
         if e as i64 != -1 {
             self.cred_egid = e as u32;
         }
-        DispatchOutcome::Returned { value: 0 }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
     /// `setuid(uid)`: set effective uid and (if currently privileged)
     /// real + saved too. We always treat the caller as privileged so
     /// all three move together — matches what apt expects.
-    fn setuid(&mut self, request: SyscallRequest) -> DispatchOutcome {
-        let u = request.arg(0) as u32;
+    fn setuid<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let u = ctx.arg(0) as u32;
         self.cred_ruid = u;
         self.cred_euid = u;
         self.cred_suid = u;
-        DispatchOutcome::Returned { value: 0 }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
-    fn setgid(&mut self, request: SyscallRequest) -> DispatchOutcome {
-        let g = request.arg(0) as u32;
+    fn setgid<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let g = ctx.arg(0) as u32;
         self.cred_rgid = g;
         self.cred_egid = g;
         self.cred_sgid = g;
-        DispatchOutcome::Returned { value: 0 }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
     /// `getresuid(*ruid, *euid, *suid)` — write our tracked tuple.
-    fn getresuid(
-        &self,
-        request: SyscallRequest,
-        memory: &mut impl GuestMemory,
-    ) -> DispatchOutcome {
+    fn getresuid<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
         for (i, value) in [self.cred_ruid, self.cred_euid, self.cred_suid]
             .iter()
             .enumerate()
         {
-            let ptr = request.arg(i);
+            let ptr = ctx.arg(i);
             if ptr == 0 {
                 continue;
             }
-            if memory.write_bytes(ptr, &value.to_le_bytes()).is_err() {
-                return DispatchOutcome::Errno { errno: LINUX_EFAULT };
+            if ctx.memory.write_bytes(ptr, &value.to_le_bytes()).is_err() {
+                return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
             }
         }
-        DispatchOutcome::Returned { value: 0 }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
-    fn getresgid(
-        &self,
-        request: SyscallRequest,
-        memory: &mut impl GuestMemory,
-    ) -> DispatchOutcome {
+    fn getresgid<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
         for (i, value) in [self.cred_rgid, self.cred_egid, self.cred_sgid]
             .iter()
             .enumerate()
         {
-            let ptr = request.arg(i);
+            let ptr = ctx.arg(i);
             if ptr == 0 {
                 continue;
             }
-            if memory.write_bytes(ptr, &value.to_le_bytes()).is_err() {
-                return DispatchOutcome::Errno { errno: LINUX_EFAULT };
+            if ctx.memory.write_bytes(ptr, &value.to_le_bytes()).is_err() {
+                return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
             }
         }
-        DispatchOutcome::Returned { value: 0 }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
     /// `getgroups(size, *list)`. Linux returns the number of
