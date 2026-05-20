@@ -209,6 +209,75 @@ impl RootFsVfs {
         }
     }
 
+    /// Layered rename with optional `RENAME_NOREPLACE` semantics.
+    /// Walks the overlay-then-rootfs view to find the source,
+    /// materialises the destination in the overlay (copying bytes
+    /// from the rootfs if needed), then tombstones the source so the
+    /// layered view shows it as gone.
+    pub fn rename_with_flags(
+        &mut self,
+        from: &str,
+        to: &str,
+        no_replace: bool,
+    ) -> Result<(), VfsError> {
+        let (src_kind, src_contents, src_in_overlay) = match self.overlay.lookup(from) {
+            Some(OverlayEntry::Deleted) => return Err(LINUX_ENOENT),
+            Some(OverlayEntry::Dir) => (RootFsEntryKind::Directory, None, true),
+            Some(OverlayEntry::File(b)) => (RootFsEntryKind::File, Some(b), true),
+            None => match self.rootfs.as_ref().and_then(|r| r.symlink_metadata(from).ok()) {
+                Some(md) => match md.kind {
+                    RootFsEntryKind::File | RootFsEntryKind::Symlink => {
+                        let bytes = self
+                            .rootfs
+                            .as_ref()
+                            .expect("rootfs metadata implies rootfs")
+                            .read(from)
+                            .map_err(|e| crate::dispatch::rootfs_errno(e))?;
+                        (RootFsEntryKind::File, Some(bytes), false)
+                    }
+                    RootFsEntryKind::Directory => (RootFsEntryKind::Directory, None, false),
+                },
+                None => return Err(LINUX_ENOENT),
+            },
+        };
+        let dst_exists = match self.overlay.lookup(to) {
+            Some(OverlayEntry::Deleted) => false,
+            Some(OverlayEntry::Dir) | Some(OverlayEntry::File(_)) => true,
+            None => self
+                .rootfs
+                .as_ref()
+                .map(|r| r.symlink_metadata(to).is_ok())
+                .unwrap_or(false),
+        };
+        if dst_exists && no_replace {
+            return Err(LINUX_EEXIST);
+        }
+        match src_kind {
+            RootFsEntryKind::File | RootFsEntryKind::Symlink => {
+                self.overlay
+                    .set_file_contents(to, src_contents.unwrap_or_default())
+                    .map_err(|_| LINUX_EINVAL)?;
+            }
+            RootFsEntryKind::Directory => {
+                self.overlay.make_dir(to).map_err(|_| LINUX_EINVAL)?;
+            }
+        }
+        if src_in_overlay {
+            self.overlay.remove_entry(from);
+        }
+        let rootfs_has_src = self
+            .rootfs
+            .as_ref()
+            .map(|r| r.symlink_metadata(from).is_ok())
+            .unwrap_or(false);
+        if rootfs_has_src {
+            self.overlay
+                .mark_deleted(from)
+                .map_err(|_| LINUX_EINVAL)?;
+        }
+        Ok(())
+    }
+
     /// Layered "is this path a directory" check. Used by the
     /// dispatcher to validate mkdir/rename parent paths.
     pub fn is_directory(&self, path: &str) -> bool {
@@ -473,6 +542,10 @@ impl Vfs for RootFsVfs {
         Ok(())
     }
 
+    fn rename(&mut self, from: &str, to: &str) -> Result<(), VfsError> {
+        self.rename_with_flags(from, to, false)
+    }
+
     fn truncate(&mut self, path: &str, len: u64) -> Result<(), VfsError> {
         // Materialise the file into the overlay (if it's only in
         // rootfs), then truncate.
@@ -661,6 +734,141 @@ mod tests {
             entries.iter().map(|e| e.name.clone()).collect();
         assert!(names.contains("hosts"));
         assert!(names.contains("extras"));
+    }
+
+    #[test]
+    fn rename_overlay_file_to_new_path() {
+        let mut v = RootFsVfs::with_rootfs(rootfs_with_files());
+        v.overlay
+            .set_file_contents("/etc/source", b"hello\n".to_vec())
+            .unwrap();
+        v.rename_with_flags("/etc/source", "/etc/dest", false).unwrap();
+        assert_eq!(v.lookup("/etc/source"), Err(LINUX_ENOENT));
+        let md = v.lookup("/etc/dest").unwrap();
+        assert_eq!(md.kind, EntryKind::File);
+        assert_eq!(md.size, 6);
+    }
+
+    #[test]
+    fn rename_rootfs_file_promotes_into_overlay() {
+        let mut v = RootFsVfs::with_rootfs(rootfs_with_files());
+        v.rename_with_flags("/etc/hosts", "/etc/renamed_hosts", false)
+            .unwrap();
+        // Source tombstoned in overlay.
+        assert_eq!(v.lookup("/etc/hosts"), Err(LINUX_ENOENT));
+        // Destination has the same content as the original rootfs file.
+        let md = v.lookup("/etc/renamed_hosts").unwrap();
+        assert_eq!(md.kind, EntryKind::File);
+        assert!(md.size > 0);
+    }
+
+    #[test]
+    fn rename_with_no_replace_rejects_existing() {
+        let mut v = RootFsVfs::with_rootfs(rootfs_with_files());
+        v.overlay
+            .set_file_contents("/etc/source", b"x".to_vec())
+            .unwrap();
+        // /etc/hosts already exists in the rootfs.
+        let result = v.rename_with_flags("/etc/source", "/etc/hosts", true);
+        assert_eq!(result, Err(LINUX_EEXIST));
+    }
+
+    #[test]
+    fn rename_missing_source_is_enoent() {
+        let mut v = RootFsVfs::with_rootfs(rootfs_with_files());
+        let result = v.rename_with_flags("/etc/no-such", "/etc/dest", false);
+        assert_eq!(result, Err(LINUX_ENOENT));
+    }
+
+    #[test]
+    fn open_for_dispatch_overlay_file() {
+        let mut v = RootFsVfs::with_rootfs(rootfs_with_files());
+        v.overlay
+            .set_file_contents("/etc/scratch", b"overlay\n".to_vec())
+            .unwrap();
+        let result = v
+            .open_for_dispatch("/etc/scratch", false, false, false, true)
+            .unwrap();
+        match result {
+            OpenDispatchResult::File { contents, writable, .. } => {
+                assert_eq!(String::from_utf8_lossy(&contents), "overlay\n");
+                assert!(writable);
+            }
+            _ => panic!("expected File"),
+        }
+    }
+
+    #[test]
+    fn open_for_dispatch_rootfs_file_with_writable_promotes() {
+        let mut v = RootFsVfs::with_rootfs(rootfs_with_files());
+        let result = v
+            .open_for_dispatch("/etc/hosts", false, false, false, true)
+            .unwrap();
+        match result {
+            OpenDispatchResult::File { writable, .. } => assert!(writable),
+            _ => panic!("expected File"),
+        }
+        // Promotion happened: the overlay now has /etc/hosts.
+        assert!(matches!(
+            v.overlay.lookup("/etc/hosts"),
+            Some(OverlayEntry::File(_))
+        ));
+    }
+
+    #[test]
+    fn open_for_dispatch_directory_returns_layered_entries() {
+        let mut v = RootFsVfs::with_rootfs(rootfs_with_files());
+        v.mkdir("/etc/extras", 0o755).unwrap();
+        let result = v
+            .open_for_dispatch("/etc", false, false, false, false)
+            .unwrap();
+        match result {
+            OpenDispatchResult::Directory { entries, .. } => {
+                let names: std::collections::BTreeSet<_> =
+                    entries.iter().map(|e| e.name.clone()).collect();
+                assert!(names.contains("hosts"));
+                assert!(names.contains("extras"));
+            }
+            _ => panic!("expected Directory"),
+        }
+    }
+
+    #[test]
+    fn open_for_dispatch_not_found_create_signals_caller() {
+        let mut v = RootFsVfs::with_rootfs(rootfs_with_files());
+        let result = v
+            .open_for_dispatch("/etc/new", true, false, false, true)
+            .unwrap();
+        assert!(matches!(result, OpenDispatchResult::NotFoundCreate));
+    }
+
+    #[test]
+    fn open_for_dispatch_excl_on_existing_is_eexist() {
+        let mut v = RootFsVfs::with_rootfs(rootfs_with_files());
+        let result = v.open_for_dispatch("/etc/hosts", true, true, false, true);
+        assert_eq!(result.err(), Some(LINUX_EEXIST));
+    }
+
+    #[test]
+    fn mkdir_layered_eexist() {
+        let mut v = RootFsVfs::with_rootfs(rootfs_with_files());
+        // Rootfs has /etc; mkdir of an existing path is EEXIST.
+        assert_eq!(v.mkdir("/etc", 0o755), Err(LINUX_EEXIST));
+    }
+
+    #[test]
+    fn mkdir_no_parent_is_enoent() {
+        let mut v = RootFsVfs::with_rootfs(rootfs_with_files());
+        assert_eq!(v.mkdir("/no-such-parent/sub", 0o755), Err(LINUX_ENOENT));
+    }
+
+    #[test]
+    fn is_directory_layered() {
+        let mut v = RootFsVfs::with_rootfs(rootfs_with_files());
+        assert!(v.is_directory("/etc"));
+        assert!(!v.is_directory("/etc/hosts"));
+        assert!(!v.is_directory("/no-such"));
+        v.mkdir("/var/tmp", 0o755).unwrap_or_default();
     }
 
     #[test]

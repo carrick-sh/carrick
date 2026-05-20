@@ -19,8 +19,8 @@ use crate::memory::{
     LINUX_EL0_TRAMPOLINE_BASE, LINUX_EL1_VECTORS_BASE, LINUX_HEAP_BASE, LINUX_HEAP_SIZE,
     LINUX_MMAP_BASE, LINUX_MMAP_SIZE, LINUX_PAGE_TABLES_BASE, LINUX_STACK_SIZE, LINUX_STACK_TOP,
 };
-use crate::fs_backend::{FsBackend, MemoryBackend};
-use crate::overlay::{OverlayEntry, layered_directory_entries};
+use crate::fs_backend::FsBackend;
+use crate::overlay::OverlayEntry;
 use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsError, RootFsMetadata};
 use crate::syscall::lookup_aarch64;
 use serde::Serialize;
@@ -4067,17 +4067,10 @@ impl SyscallDispatcher {
     /// used by stat / faccessat sites, but consults the overlay first
     /// and respects deletions.
     fn layered_metadata(&self, path: &str) -> Result<RootFsMetadata, i32> {
-        match self.rootfs_vfs.overlay.lookup(path) {
-            Some(OverlayEntry::Deleted) => return Err(LINUX_ENOENT),
-            Some(OverlayEntry::File(_)) | Some(OverlayEntry::Dir) => {
-                return self.rootfs_vfs.overlay.metadata(path).ok_or(LINUX_ENOENT);
-            }
-            None => {}
-        }
-        let Some(rootfs) = &self.rootfs_vfs.rootfs else {
-            return Err(LINUX_ENOENT);
-        };
-        rootfs.metadata(path).map_err(rootfs_errno)
+        use crate::vfs::Vfs as _;
+        self.rootfs_vfs
+            .lookup(path)
+            .map(|md| vfs_md_to_rootfs_md(path, &md))
     }
 
     fn close(&mut self, request: SyscallRequest) -> DispatchOutcome {
@@ -6875,21 +6868,8 @@ impl SyscallDispatcher {
                 Ok(resolved) => resolved,
                 Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
             };
-            if is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context()) {
-                true
-            } else if let Some(rootfs) = &self.rootfs_vfs.rootfs {
-                match rootfs.symlink_metadata(&resolved) {
-                    Ok(_) => true,
-                    Err(RootFsError::NotFound(_)) => false,
-                    Err(other) => {
-                        return Ok(DispatchOutcome::Errno {
-                            errno: rootfs_errno(other),
-                        });
-                    }
-                }
-            } else {
-                false
-            }
+            is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context())
+                || self.layered_metadata(&resolved).is_ok()
         };
         if !source_exists {
             return Ok(DispatchOutcome::Errno {
@@ -6904,26 +6884,14 @@ impl SyscallDispatcher {
             Ok(resolved) => resolved,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        if is_synthetic_virtual_file(&resolved_new, &self.synthetic_proc_context()) {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EEXIST,
-            });
+        if is_synthetic_virtual_file(&resolved_new, &self.synthetic_proc_context())
+            || self.layered_metadata(&resolved_new).is_ok()
+        {
+            return Ok(DispatchOutcome::Errno { errno: LINUX_EEXIST });
         }
-        if let Some(rootfs) = &self.rootfs_vfs.rootfs {
-            match rootfs.symlink_metadata(&resolved_new) {
-                Ok(_) => {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: LINUX_EEXIST,
-                    });
-                }
-                Err(RootFsError::NotFound(_)) => {}
-                Err(other) => {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: rootfs_errno(other),
-                    });
-                }
-            }
-        }
+        // Overlay can't materialise hardlinks today; the layered
+        // view's existence checks have rejected the no-op cases, so
+        // an unsupported-write is the only remaining outcome.
         Ok(DispatchOutcome::Errno { errno: LINUX_EROFS })
     }
 
@@ -6962,21 +6930,13 @@ impl SyscallDispatcher {
                 errno: LINUX_EEXIST,
             });
         }
-        if let Some(rootfs) = &self.rootfs_vfs.rootfs {
-            match rootfs.symlink_metadata(&resolved_link) {
-                Ok(_) => {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: LINUX_EEXIST,
-                    });
-                }
-                Err(RootFsError::NotFound(_)) => {}
-                Err(other) => {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: rootfs_errno(other),
-                    });
-                }
-            }
+        // If the link path already exists (anywhere in the layered
+        // view), report EEXIST. Otherwise the overlay can't create
+        // symlinks today, so we return EROFS.
+        if self.layered_metadata(&resolved_link).is_ok() {
+            return Ok(DispatchOutcome::Errno { errno: LINUX_EEXIST });
         }
+        let _ = target_path;
         Ok(DispatchOutcome::Errno { errno: LINUX_EROFS })
     }
 
@@ -7063,100 +7023,14 @@ impl SyscallDispatcher {
         {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EROFS });
         }
-        // Layered lookup for the source.
-        let (src_kind, src_contents, src_in_overlay): (RootFsEntryKind, Option<Vec<u8>>, bool) =
-            match self.rootfs_vfs.overlay.lookup(&resolved_old) {
-                Some(OverlayEntry::Deleted) => {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: LINUX_ENOENT,
-                    });
-                }
-                Some(OverlayEntry::Dir) => (RootFsEntryKind::Directory, None, true),
-                Some(OverlayEntry::File(bytes)) => {
-                    (RootFsEntryKind::File, Some(bytes.to_vec()), true)
-                }
-                None => {
-                    let Some(rootfs) = &self.rootfs_vfs.rootfs else {
-                        return Ok(DispatchOutcome::Errno {
-                            errno: LINUX_ENOENT,
-                        });
-                    };
-                    match rootfs.symlink_metadata(&resolved_old) {
-                        Ok(metadata) => match metadata.kind {
-                            RootFsEntryKind::File | RootFsEntryKind::Symlink => {
-                                let contents = match rootfs.read(&resolved_old) {
-                                    Ok(bytes) => bytes,
-                                    Err(errno) => {
-                                        return Ok(DispatchOutcome::Errno {
-                                            errno: rootfs_errno(errno),
-                                        });
-                                    }
-                                };
-                                (RootFsEntryKind::File, Some(contents), false)
-                            }
-                            RootFsEntryKind::Directory => {
-                                (RootFsEntryKind::Directory, None, false)
-                            }
-                        },
-                        Err(errno) => {
-                            return Ok(DispatchOutcome::Errno {
-                                errno: rootfs_errno(errno),
-                            });
-                        }
-                    }
-                }
-            };
-        // Layered lookup for the destination.
-        let dst_exists = match self.rootfs_vfs.overlay.lookup(&resolved_new) {
-            Some(OverlayEntry::Deleted) => false,
-            Some(OverlayEntry::Dir) | Some(OverlayEntry::File(_)) => true,
-            None => self.rootfs_vfs
-                .rootfs
-                .as_ref()
-                .map(|rootfs| rootfs.symlink_metadata(&resolved_new).is_ok())
-                .unwrap_or(false),
-        };
-        if dst_exists && flags & RENAME_NOREPLACE != 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EEXIST,
-            });
+        let no_replace = flags & RENAME_NOREPLACE != 0;
+        match self
+            .rootfs_vfs
+            .rename_with_flags(&resolved_old, &resolved_new, no_replace)
+        {
+            Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
+            Err(errno) => Ok(DispatchOutcome::Errno { errno }),
         }
-        // Materialise the destination in the overlay.
-        match src_kind {
-            RootFsEntryKind::File | RootFsEntryKind::Symlink => {
-                let bytes = src_contents.unwrap_or_default();
-                if self.rootfs_vfs
-                    .overlay
-                    .set_file_contents(&resolved_new, bytes)
-                    .is_err()
-                {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: LINUX_EINVAL,
-                    });
-                }
-            }
-            RootFsEntryKind::Directory => {
-                if self.rootfs_vfs.overlay.make_dir(&resolved_new).is_err() {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: LINUX_EINVAL,
-                    });
-                }
-            }
-        }
-        // Remove the source: drop overlay entry (if any) and tombstone
-        // it iff the rootfs still has it underneath.
-        if src_in_overlay {
-            self.rootfs_vfs.overlay.remove_entry(&resolved_old);
-        }
-        let rootfs_has_src = self.rootfs_vfs
-            .rootfs
-            .as_ref()
-            .map(|rootfs| rootfs.symlink_metadata(&resolved_old).is_ok())
-            .unwrap_or(false);
-        if rootfs_has_src {
-            let _ = self.rootfs_vfs.overlay.mark_deleted(&resolved_old);
-        }
-        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
     fn unlinkat(
