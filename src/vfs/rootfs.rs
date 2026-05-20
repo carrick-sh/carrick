@@ -17,9 +17,9 @@
 //! through the trait the result is byte-identical to what it
 //! produced via direct access.
 
-use crate::dispatch::{LINUX_EACCES, LINUX_EEXIST, LINUX_EISDIR, LINUX_ENOENT, LINUX_ENOTDIR, LINUX_EROFS};
+use crate::dispatch::{LINUX_EACCES, LINUX_EEXIST, LINUX_EINVAL, LINUX_EISDIR, LINUX_ENOENT, LINUX_ENOTDIR, LINUX_EROFS};
 use crate::fs_backend::{FsBackend, MemoryBackend, OverlayEntry};
-use crate::rootfs::{RootFs, RootFsEntryKind};
+use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsError, RootFsMetadata};
 
 use super::{
     DirEnt, EntryKind, Metadata, OpenContext, OpenFlags, Vfs, VfsError, VfsHandle,
@@ -34,6 +34,26 @@ use super::{
 pub struct RootFsVfs {
     pub rootfs: Option<RootFs>,
     pub overlay: Box<dyn FsBackend>,
+}
+
+/// Richer result from [`RootFsVfs::open_for_dispatch`]. Carries the
+/// rootfs-shaped types the dispatcher's existing `OpenDescription`
+/// variants consume, plus a `NotFoundCreate` variant signalling that
+/// the caller should perform the O_CREAT path.
+pub enum OpenDispatchResult {
+    File {
+        metadata: RootFsMetadata,
+        contents: Vec<u8>,
+        writable: bool,
+    },
+    Directory {
+        metadata: RootFsMetadata,
+        entries: Vec<RootFsDirEntry>,
+    },
+    /// Returned only when `want_create` was true and the path
+    /// doesn't exist. The dispatcher creates the entry in the
+    /// overlay itself (it knows the right initial contents / mode).
+    NotFoundCreate,
 }
 
 impl RootFsVfs {
@@ -55,6 +75,138 @@ impl RootFsVfs {
     /// backend so the caller can decide what to do with it.
     pub fn set_overlay(&mut self, backend: Box<dyn FsBackend>) -> Box<dyn FsBackend> {
         std::mem::replace(&mut self.overlay, backend)
+    }
+
+    /// Richer open variant the dispatcher uses for the openat
+    /// fallback after VFS-mount routing (/dev /proc /sys). Returns
+    /// the full rootfs-shaped metadata + entries / contents that the
+    /// dispatcher's `OpenDescription::File` / `Directory` variants
+    /// need, including the writable-overlay-promotion semantics for
+    /// rootfs files opened with O_WRONLY/O_RDWR.
+    ///
+    /// The Vfs-trait `open` method returns `VfsHandle::Bytes` for
+    /// reads only; this method covers the writable + directory
+    /// cases that don't fit neatly into the trait surface yet.
+    pub fn open_for_dispatch(
+        &mut self,
+        path: &str,
+        want_create: bool,
+        want_excl: bool,
+        want_trunc: bool,
+        writable_request: bool,
+    ) -> Result<OpenDispatchResult, i32> {
+        // Overlay-first: tombstone short-circuits to ENOENT for the
+        // non-create case (with O_CREAT we treat it as "no file in
+        // the way" and let the caller create).
+        let overlay_view = self.overlay.lookup(path);
+        let overlay_deleted = matches!(overlay_view, Some(OverlayEntry::Deleted));
+        match overlay_view {
+            Some(OverlayEntry::File(mut contents)) => {
+                if want_create && want_excl {
+                    return Err(LINUX_EEXIST);
+                }
+                if want_trunc {
+                    contents.clear();
+                    self.overlay
+                        .set_file_contents(path, contents.clone())
+                        .map_err(|_| LINUX_EINVAL)?;
+                }
+                let metadata = RootFsMetadata {
+                    path: std::path::Path::new(path).to_path_buf(),
+                    kind: RootFsEntryKind::File,
+                    mode: 0o644,
+                    size: contents.len(),
+                };
+                return Ok(OpenDispatchResult::File {
+                    metadata,
+                    contents,
+                    writable: writable_request,
+                });
+            }
+            Some(OverlayEntry::Dir) => {
+                if writable_request {
+                    return Err(LINUX_EISDIR);
+                }
+                let entries = crate::overlay::layered_directory_entries(
+                    self.overlay.as_ref(),
+                    self.rootfs.as_ref(),
+                    path,
+                )
+                .map_err(|e| crate::dispatch::rootfs_errno(e))?;
+                let metadata = RootFsMetadata {
+                    path: std::path::Path::new(path).to_path_buf(),
+                    kind: RootFsEntryKind::Directory,
+                    mode: 0o755,
+                    size: 0,
+                };
+                return Ok(OpenDispatchResult::Directory { metadata, entries });
+            }
+            _ => {}
+        }
+        // Rootfs lookup. Tombstoned paths are treated as not-found
+        // so O_CREAT can fall through cleanly.
+        let rootfs_metadata: Option<RootFsMetadata> = if overlay_deleted {
+            None
+        } else if let Some(rootfs) = self.rootfs.as_ref() {
+            match rootfs.metadata(path) {
+                Ok(metadata) => Some(metadata),
+                Err(RootFsError::NotFound(_)) => None,
+                Err(e) => return Err(crate::dispatch::rootfs_errno(e)),
+            }
+        } else {
+            None
+        };
+        match rootfs_metadata {
+            Some(metadata) => match metadata.kind {
+                RootFsEntryKind::File => {
+                    if want_create && want_excl {
+                        return Err(LINUX_EEXIST);
+                    }
+                    let mut contents = self
+                        .rootfs
+                        .as_ref()
+                        .expect("rootfs metadata implies rootfs")
+                        .read(path)
+                        .map_err(|e| crate::dispatch::rootfs_errno(e))?;
+                    // Write-promotion: if the caller asked for write
+                    // access, copy the rootfs file into the overlay so
+                    // subsequent writes land in mutable storage.
+                    let writable = if writable_request {
+                        if want_trunc {
+                            contents.clear();
+                        }
+                        self.overlay
+                            .set_file_contents(path, contents.clone())
+                            .map_err(|_| LINUX_EINVAL)?;
+                        true
+                    } else {
+                        false
+                    };
+                    Ok(OpenDispatchResult::File {
+                        metadata,
+                        contents,
+                        writable,
+                    })
+                }
+                RootFsEntryKind::Directory => {
+                    let entries = crate::overlay::layered_directory_entries(
+                        self.overlay.as_ref(),
+                        self.rootfs.as_ref(),
+                        path,
+                    )
+                    .map_err(|e| crate::dispatch::rootfs_errno(e))?;
+                    Ok(OpenDispatchResult::Directory { metadata, entries })
+                }
+                RootFsEntryKind::Symlink => Err(LINUX_EINVAL),
+            },
+            None => {
+                if want_create {
+                    Ok(OpenDispatchResult::NotFoundCreate)
+                } else {
+                    Err(LINUX_ENOENT)
+                }
+            }
+        }
     }
 
     /// Layered "is this path a directory" check. Used by the

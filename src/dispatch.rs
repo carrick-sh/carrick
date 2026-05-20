@@ -3935,16 +3935,6 @@ impl SyscallDispatcher {
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
 
-        // Overlay-first lookup for normal rootfs paths. Synthetic
-        // /proc and /sys files are not overridable.
-        let overlay_entry = self.rootfs_vfs.overlay.lookup(&path);
-        let overlay_deleted = matches!(overlay_entry, Some(OverlayEntry::Deleted));
-        let overlay_dir = matches!(overlay_entry, Some(OverlayEntry::Dir));
-        let overlay_file_bytes: Option<Vec<u8>> = match &overlay_entry {
-            Some(OverlayEntry::File(bytes)) => Some(bytes.to_vec()),
-            _ => None,
-        };
-
         // VFS-mount routing. DevVfs serves /dev/*, ProcVfs serves
         // /proc/*, SysVfs serves /sys/*. The dispatcher converts each
         // VfsHandle variant into the matching OpenDescription, then
@@ -3968,190 +3958,72 @@ impl SyscallDispatcher {
         // and falls through to the overlay+rootfs lookup below, which
         // handles directory entries like /proc itself.
 
-        let description = if let Some(mut contents) = overlay_file_bytes {
-            // Overlay-backed regular file. The local cache mirrors
-            // what's currently in the overlay; subsequent writes
-            // push back into it.
-            if want_create && want_excl {
-                return Ok(DispatchOutcome::Errno { errno: LINUX_EEXIST });
-            }
-            if want_trunc {
-                contents.clear();
-                if let Err(_) = self.rootfs_vfs.overlay.set_file_contents(&path, contents.clone()) {
-                    return Ok(DispatchOutcome::Errno { errno: LINUX_EINVAL });
-                }
-            }
-            let size = contents.len();
-            let path_buf = Path::new(&path).to_path_buf();
-            let metadata = RootFsMetadata {
-                path: path_buf,
-                kind: RootFsEntryKind::File,
-                mode: 0o644,
-                size,
-            };
-            OpenDescription::File {
+        if let Some(outcome) = Self::record_unimplemented_virtual_file(reporter, &path) {
+            return Ok(outcome);
+        }
+        // Layered overlay+rootfs lookup with full openat semantics
+        // (O_CREAT/O_EXCL/O_TRUNC, write-promotion of rootfs-only
+        // files) lives in RootFsVfs::open_for_dispatch.
+        let description = match self.rootfs_vfs.open_for_dispatch(
+            &path,
+            want_create,
+            want_excl,
+            want_trunc,
+            writable_request,
+        ) {
+            Ok(crate::vfs::rootfs::OpenDispatchResult::File {
+                metadata,
+                contents,
+                writable,
+            }) => OpenDescription::File {
                 path,
                 metadata,
                 contents,
                 offset: 0,
                 status_flags: flags & !LINUX_O_CLOEXEC,
-                writable: writable_request,
+                writable,
+            },
+            Ok(crate::vfs::rootfs::OpenDispatchResult::Directory { metadata, entries }) => {
+                if writable_request {
+                    return Ok(DispatchOutcome::Errno { errno: LINUX_EISDIR });
+                }
+                OpenDescription::Directory {
+                    path,
+                    metadata,
+                    entries,
+                    offset: 0,
+                    status_flags: flags & !LINUX_O_CLOEXEC,
+                }
             }
-        } else if overlay_dir {
-            // Overlay-only directory. No rootfs entries to merge in
-            // beyond what `layered_directory_entries` finds.
-            if writable_request {
-                return Ok(DispatchOutcome::Errno { errno: LINUX_EISDIR });
-            }
-            let entries =
-                match layered_directory_entries(self.rootfs_vfs.overlay.as_ref(), self.rootfs_vfs.rootfs.as_ref(), &path) {
-                    Ok(entries) => entries,
-                    Err(errno) => return Ok(DispatchOutcome::Errno { errno: rootfs_errno(errno) }),
+            Ok(crate::vfs::rootfs::OpenDispatchResult::NotFoundCreate) => {
+                // O_CREAT path: validate the parent directory exists,
+                // create the empty overlay entry, return a writable
+                // File description.
+                if let Some(parent) = Path::new(&path).parent() {
+                    let parent_str = display_rootfs_path(parent);
+                    if !self.path_is_directory(&parent_str) {
+                        return Ok(DispatchOutcome::Errno { errno: LINUX_ENOENT });
+                    }
+                }
+                if self.rootfs_vfs.overlay.create_file(&path).is_err() {
+                    return Ok(DispatchOutcome::Errno { errno: LINUX_EINVAL });
+                }
+                let metadata = RootFsMetadata {
+                    path: Path::new(&path).to_path_buf(),
+                    kind: RootFsEntryKind::File,
+                    mode: 0o644,
+                    size: 0,
                 };
-            let metadata = RootFsMetadata {
-                path: Path::new(&path).to_path_buf(),
-                kind: RootFsEntryKind::Directory,
-                mode: 0o755,
-                size: 0,
-            };
-            OpenDescription::Directory {
-                path,
-                metadata,
-                entries,
-                offset: 0,
-                status_flags: flags & !LINUX_O_CLOEXEC,
-            }
-        } else {
-            if let Some(outcome) = Self::record_unimplemented_virtual_file(reporter, &path) {
-                return Ok(outcome);
-            }
-            // The rootfs lookup is a NotFound iff (a) the rootfs
-            // doesn't have it OR (b) the overlay tombstoned it.
-            let rootfs_metadata = if overlay_deleted {
-                None
-            } else if let Some(rootfs) = &self.rootfs_vfs.rootfs {
-                match rootfs.metadata(&path) {
-                    Ok(metadata) => Some(metadata),
-                    Err(RootFsError::NotFound(_)) => None,
-                    Err(errno) => {
-                        return Ok(DispatchOutcome::Errno {
-                            errno: rootfs_errno(errno),
-                        });
-                    }
-                }
-            } else {
-                None
-            };
-
-            match rootfs_metadata {
-                Some(metadata) => match metadata.kind {
-                    RootFsEntryKind::File => {
-                        if want_create && want_excl {
-                            return Ok(DispatchOutcome::Errno { errno: LINUX_EEXIST });
-                        }
-                        let mut contents = match self.rootfs_vfs
-                            .rootfs
-                            .as_ref()
-                            .expect("rootfs metadata implies rootfs")
-                            .read(&path)
-                        {
-                            Ok(contents) => contents,
-                            Err(errno) => {
-                                return Ok(DispatchOutcome::Errno {
-                                    errno: rootfs_errno(errno),
-                                });
-                            }
-                        };
-                        // If the caller wants to write, promote the
-                        // file into the overlay so subsequent writes
-                        // land in mutable storage.
-                        let writable = if writable_request {
-                            if want_trunc {
-                                contents.clear();
-                            }
-                            if let Err(_) =
-                                self.rootfs_vfs.overlay.set_file_contents(&path, contents.clone())
-                            {
-                                return Ok(DispatchOutcome::Errno {
-                                    errno: LINUX_EINVAL,
-                                });
-                            }
-                            true
-                        } else {
-                            false
-                        };
-                        OpenDescription::File {
-                            path,
-                            metadata,
-                            contents,
-                            offset: 0,
-                            status_flags: flags & !LINUX_O_CLOEXEC,
-                            writable,
-                        }
-                    }
-                    RootFsEntryKind::Directory => {
-                        let entries = match layered_directory_entries(
-                            self.rootfs_vfs.overlay.as_ref(),
-                            self.rootfs_vfs.rootfs.as_ref(),
-                            &path,
-                        ) {
-                            Ok(entries) => entries,
-                            Err(errno) => {
-                                return Ok(DispatchOutcome::Errno {
-                                    errno: rootfs_errno(errno),
-                                });
-                            }
-                        };
-                        OpenDescription::Directory {
-                            path,
-                            metadata,
-                            entries,
-                            offset: 0,
-                            status_flags: flags & !LINUX_O_CLOEXEC,
-                        }
-                    }
-                    RootFsEntryKind::Symlink => {
-                        return Ok(DispatchOutcome::Errno {
-                            errno: LINUX_EINVAL,
-                        });
-                    }
-                },
-                None => {
-                    if !want_create {
-                        return Ok(DispatchOutcome::Errno {
-                            errno: LINUX_ENOENT,
-                        });
-                    }
-                    // O_CREAT path: materialise a new empty file in
-                    // the overlay. The caller's parent directory
-                    // must exist (in overlay or rootfs).
-                    if let Some(parent) = Path::new(&path).parent() {
-                        let parent_str = display_rootfs_path(parent);
-                        if !self.path_is_directory(&parent_str) {
-                            return Ok(DispatchOutcome::Errno {
-                                errno: LINUX_ENOENT,
-                            });
-                        }
-                    }
-                    if let Err(_) = self.rootfs_vfs.overlay.create_file(&path) {
-                        return Ok(DispatchOutcome::Errno { errno: LINUX_EINVAL });
-                    }
-                    let metadata = RootFsMetadata {
-                        path: Path::new(&path).to_path_buf(),
-                        kind: RootFsEntryKind::File,
-                        mode: 0o644,
-                        size: 0,
-                    };
-                    OpenDescription::File {
-                        path,
-                        metadata,
-                        contents: Vec::new(),
-                        offset: 0,
-                        status_flags: flags & !LINUX_O_CLOEXEC,
-                        writable: writable_request || want_create,
-                    }
+                OpenDescription::File {
+                    path,
+                    metadata,
+                    contents: Vec::new(),
+                    offset: 0,
+                    status_flags: flags & !LINUX_O_CLOEXEC,
+                    writable: writable_request || want_create,
                 }
             }
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
 
         let Some(fd) = self.allocate_fd(3) else {
@@ -9262,7 +9134,7 @@ fn display_rootfs_path(path: &Path) -> String {
     }
 }
 
-fn rootfs_errno(error: RootFsError) -> i32 {
+pub fn rootfs_errno(error: RootFsError) -> i32 {
     match error {
         RootFsError::NotFound(_) => LINUX_ENOENT,
         RootFsError::UnsafePath(_) | RootFsError::Utf8(_) | RootFsError::TooManySymlinks(_) => {
