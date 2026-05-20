@@ -748,6 +748,10 @@ fn install_fs_backend(
     fs: Option<FsBackendKind>,
 ) -> anyhow::Result<()> {
     let kind = fs.unwrap_or_else(default_fs_backend_kind);
+    // Set once the host backend has materialised the COMPLETE rootfs onto
+    // disk — after which the in-memory rootfs layer is redundant and gets
+    // dropped (the disk overlay is authoritative for every read).
+    let mut host_seeded = false;
     let mut backend: Box<dyn FsBackend> = match kind {
         FsBackendKind::Memory => Box::new(MemoryBackend::new()),
         FsBackendKind::Host => match HostFsBackend::new() {
@@ -775,6 +779,7 @@ fn install_fs_backend(
                         let _ = dispatcher.set_fs_backend(mem);
                         return Ok(());
                     }
+                    host_seeded = true;
                 }
                 Box::new(host)
             }
@@ -788,6 +793,12 @@ fn install_fs_backend(
     };
     seed_known_hosts(&mut *backend);
     let _ = dispatcher.set_fs_backend(backend);
+    // The disk overlay now holds the entire filesystem; drop the redundant
+    // in-memory rootfs layer so reads, execve and the ELF interpreter
+    // loader all flow through the materialised host disk.
+    if host_seeded {
+        dispatcher.drop_rootfs_layer();
+    }
     Ok(())
 }
 
