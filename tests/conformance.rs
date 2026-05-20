@@ -64,6 +64,19 @@ fn carrick_bin() -> Option<PathBuf> {
     p.exists().then_some(p)
 }
 
+/// Re-sign the carrick binary with the hypervisor entitlement. `cargo build`
+/// strips the codesignature on macOS, which makes EVERY guest run fail with
+/// HV_DENIED (0xfae94007) — the dominant source of conformance "flakiness".
+/// Signing in setup guarantees the harness never tests an unsigned build.
+fn ensure_signed(bin: &PathBuf) {
+    let plist = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/entitlements.plist");
+    let _ = Command::new("codesign")
+        .args(["--force", "--sign", "-", "--entitlements"])
+        .arg(&plist)
+        .arg(bin)
+        .output();
+}
+
 /// Drop carrick's scratch warning so output lines up with Docker's.
 fn normalize(s: &str) -> String {
     s.lines()
@@ -195,6 +208,7 @@ fn conformance() {
         eprintln!("SKIP conformance: target/release/carrick not built");
         return;
     };
+    ensure_signed(&bin);
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async {
         let docker = match Docker::connect_with_local_defaults() {
