@@ -29,6 +29,11 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt"] }
 usdt = "0.6.0"
 zerocopy = { version = "0.8.48", features = ["derive"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# CoreFoundation bindings for the Activity-Monitor process-title dance
+# (private LaunchServices APIs are looked up via CFBundle at runtime).
+core-foundation-sys = "0.8"
+
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 applevisor = { version = "1.0.0", default-features = false, features = ["macos-13-0"] }
 applevisor-sys = { version = "1.0.0", default-features = false, features = ["macos-13-0"] }
