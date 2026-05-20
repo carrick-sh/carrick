@@ -923,6 +923,7 @@ pub const LINUX_ENOTTY: i32 = 25;
 pub const LINUX_ERANGE: i32 = 34;
 pub const LINUX_ENAMETOOLONG: i32 = 36;
 pub const LINUX_ENOSYS: i32 = 38;
+pub const LINUX_ENOTEMPTY: i32 = 39;
 pub const LINUX_ENODATA: i32 = 61;
 pub const LINUX_E2BIG: i32 = 7;
 // Linux setxattr(2) flags. Same semantics as the macOS XATTR_CREATE/
