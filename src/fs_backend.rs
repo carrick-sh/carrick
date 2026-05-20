@@ -55,6 +55,7 @@ pub enum OverlayEntry {
 pub enum BackendError {
     Invalid,
     Io,
+    Unsupported,
 }
 
 /// Trait every writable-layer backend implements. Methods are layer-
@@ -156,6 +157,28 @@ pub trait FsBackend: Send {
         create: bool,
         trunc: bool,
     ) -> Option<i32>;
+
+    /// Create a symlink at `linkpath` pointing at `target` (the target is
+    /// stored verbatim, not resolved). Default: unsupported.
+    fn symlink(&mut self, _target: &str, _linkpath: &str) -> Result<(), BackendError> {
+        Err(BackendError::Unsupported)
+    }
+
+    /// Create a hard link `linkpath` referring to the same data as `src`.
+    /// Default: unsupported.
+    fn hard_link(&mut self, _src: &str, _linkpath: &str) -> Result<(), BackendError> {
+        Err(BackendError::Unsupported)
+    }
+
+    /// Set the permission bits (low 0o7777) of `path`. Default: unsupported.
+    fn set_mode(&mut self, _path: &str, _mode: u32) -> Result<(), BackendError> {
+        Err(BackendError::Unsupported)
+    }
+
+    /// Read the target of a symlink at `path`. Default: not a symlink.
+    fn read_link(&self, _path: &str) -> Option<String> {
+        None
+    }
 
     /// Human-readable backend name for `--fs` reporting. Default is
     /// the impl's `type_name`-style identifier.
@@ -869,6 +892,55 @@ impl FsBackend for HostFsBackend {
         // cap-std File without closing it, so the dispatcher owns the
         // fd lifetime (it closes it on guest close()).
         Some(file.into_std().into_raw_fd())
+    }
+
+    fn symlink(&mut self, target: &str, linkpath: &str) -> Result<(), BackendError> {
+        let normalized = normalize(linkpath).ok_or(BackendError::Invalid)?;
+        let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
+        if let Some(parent) = rel.parent() {
+            if !parent.as_os_str().is_empty() {
+                self.dir.create_dir_all(parent).map_err(|_| BackendError::Io)?;
+            }
+        }
+        self.tombstones.remove(&normalized);
+        // symlink_contents stores `target` verbatim (it may be absolute or
+        // dangling), which is the Linux symlinkat(2) semantic.
+        self.dir
+            .symlink_contents(target, rel)
+            .map_err(|_| BackendError::Io)
+    }
+
+    fn hard_link(&mut self, src: &str, linkpath: &str) -> Result<(), BackendError> {
+        let src_norm = normalize(src).ok_or(BackendError::Invalid)?;
+        let dst_norm = normalize(linkpath).ok_or(BackendError::Invalid)?;
+        let src_rel = Self::rel_path(&src_norm).ok_or(BackendError::Invalid)?.to_path_buf();
+        let dst_rel = Self::rel_path(&dst_norm).ok_or(BackendError::Invalid)?.to_path_buf();
+        if let Some(parent) = dst_rel.parent() {
+            if !parent.as_os_str().is_empty() {
+                self.dir.create_dir_all(parent).map_err(|_| BackendError::Io)?;
+            }
+        }
+        self.tombstones.remove(&dst_norm);
+        self.dir
+            .hard_link(&src_rel, &self.dir, &dst_rel)
+            .map_err(|_| BackendError::Io)
+    }
+
+    fn set_mode(&mut self, path: &str, mode: u32) -> Result<(), BackendError> {
+        use cap_std::fs::Permissions;
+        use cap_std::fs::PermissionsExt;
+        let normalized = normalize(path).ok_or(BackendError::Invalid)?;
+        let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
+        self.dir
+            .set_permissions(rel, Permissions::from_mode(mode & 0o7777))
+            .map_err(|_| BackendError::Io)
+    }
+
+    fn read_link(&self, path: &str) -> Option<String> {
+        let normalized = normalize(path)?;
+        let rel = Self::rel_path(&normalized)?;
+        let target = self.dir.read_link_contents(rel).ok()?;
+        Some(target.to_string_lossy().into_owned())
     }
 
     fn name(&self) -> &'static str {

@@ -14,6 +14,14 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+/// Per-case wall-clock deadline. A single wedged guest process (e.g. a
+/// forked `rm`/`http` stuck on an HVF vCPU) must not stall the whole run —
+/// the case is killed, marked FAIL(timeout), and the harness moves on.
+const CASE_DEADLINE: Duration = Duration::from_secs(45);
 
 use bollard::container::{
     Config, CreateContainerOptions, LogsOptions, RemoveContainerOptions,
@@ -71,10 +79,42 @@ fn normalize(s: &str) -> String {
 }
 
 fn run_carrick(bin: &PathBuf, snippet: &str) -> String {
-    let out = Command::new(bin)
+    use std::os::unix::process::CommandExt;
+    let mut child = Command::new(bin)
         .args(["run", IMAGE, "--raw", "--fs", "host", "/bin/sh", "-c", snippet])
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        // New process group so we can signal the whole guest tree on timeout.
+        .process_group(0)
+        .spawn()
         .expect("spawn carrick");
+    let pid = child.id() as i32;
+    let done = Arc::new(AtomicBool::new(false));
+    let watcher = {
+        let done = Arc::clone(&done);
+        std::thread::spawn(move || {
+            let start = Instant::now();
+            while !done.load(Ordering::Relaxed) {
+                if start.elapsed() > CASE_DEADLINE {
+                    // Kill the process group, then sweep any reparented wedged
+                    // guest procs so the next case starts clean.
+                    unsafe { libc::kill(-pid, libc::SIGKILL) };
+                    let _ = Command::new("sudo")
+                        .args(["-n", concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/sudo/kill.sh")])
+                        .output();
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            false
+        })
+    };
+    let out = child.wait_with_output().expect("wait carrick");
+    done.store(true, Ordering::Relaxed);
+    let timed_out = watcher.join().unwrap_or(false);
+    if timed_out {
+        return format!("<TIMEOUT after {}s>", CASE_DEADLINE.as_secs());
+    }
     let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
     combined.push_str(&String::from_utf8_lossy(&out.stderr));
     normalize(&combined)
@@ -167,10 +207,16 @@ fn conformance() {
         let mut failures = Vec::new();
         for case in CASES {
             let carrick_out = run_carrick(&bin, case.snippet);
-            let docker_out = match run_docker(&docker, case.snippet).await {
-                Ok(o) => o,
-                Err(e) => {
+            let docker_fut = run_docker(&docker, case.snippet);
+            let docker_out = match tokio::time::timeout(CASE_DEADLINE, docker_fut).await {
+                Ok(Ok(o)) => o,
+                Ok(Err(e)) => {
                     eprintln!("FAIL  {} (docker error: {e})", case.name);
+                    failures.push(case.name);
+                    continue;
+                }
+                Err(_) => {
+                    eprintln!("FAIL  {} (docker timeout)", case.name);
                     failures.push(case.name);
                     continue;
                 }
