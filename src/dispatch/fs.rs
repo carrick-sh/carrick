@@ -2,6 +2,40 @@
 //! `super` for the dispatcher struct and the normalized dispatch table.
 use super::*;
 
+/// Owned filesystem-subsystem state. Split out of `SyscallDispatcher` so
+/// the fs handlers borrow only the VFS state they touch instead of the
+/// whole dispatcher. Field semantics are unchanged from the former loose
+/// fields (`vfs_mounts`/`rootfs_vfs`).
+pub(super) struct FsState {
+    /// Unified VFS mount table. Holds DevVfs at /dev, ProcVfs at
+    /// /proc, SysVfs at /sys. The dispatcher consults it first; any
+    /// path no mount claims (or that a mount returns ENOSYS for)
+    /// falls through to the legacy code path, which reads the rootfs +
+    /// overlay from [`Self::rootfs_vfs`].
+    pub vfs_mounts: crate::vfs::VfsMounts,
+
+    /// The `/` mount: immutable OCI rootfs + writable overlay
+    /// ([`FsBackend`]). Held as a typed field rather than mounted in
+    /// `vfs_mounts` because the dispatcher's existing fs syscalls reach
+    /// into the overlay/rootfs state through ~50 call sites today.
+    pub rootfs_vfs: crate::vfs::RootFsVfs,
+}
+
+impl FsState {
+    pub(super) fn new() -> Self {
+        Self {
+            vfs_mounts: {
+                let mut m = crate::vfs::VfsMounts::new();
+                m.mount("/dev", Box::new(crate::vfs::DevVfs::new()));
+                m.mount("/proc", Box::new(crate::vfs::ProcVfs::new()));
+                m.mount("/sys", Box::new(crate::vfs::SysVfs::new()));
+                m
+            },
+            rootfs_vfs: crate::vfs::RootFsVfs::new(),
+        }
+    }
+}
+
 impl SyscallDispatcher {
     pub(super) fn getcwd<M: GuestMemory>(
         &mut self,
@@ -106,7 +140,7 @@ impl SyscallDispatcher {
         // exposed in our compat layer), so we use the default lookup.
         let _ = flags; // AT_SYMLINK_NOFOLLOW is currently a no-op here
         use crate::vfs::Vfs as _;
-        match self.rootfs_vfs.lookup(path) {
+        match self.fs.rootfs_vfs.lookup(path) {
             Ok(md) => access_metadata(&vfs_md_to_rootfs_md(path, &md), mode),
             Err(errno) => DispatchOutcome::Errno { errno },
         }
@@ -822,7 +856,7 @@ impl SyscallDispatcher {
         // is materialised on the cap-std scratch under --fs host, so this
         // works for both rootfs and guest-created files. MemoryBackend has no
         // raw fd → EROFS (path-based truncate stays unsupported in-memory).
-        match self.rootfs_vfs.overlay.open_raw_fd(&resolved, true, false, false) {
+        match self.fs.rootfs_vfs.overlay.open_raw_fd(&resolved, true, false, false) {
             Some(host_fd) => {
                 let rc = unsafe { libc::ftruncate(host_fd, length as libc::off_t) };
                 let err = if rc < 0 { host_errno() } else { 0 };
@@ -869,7 +903,7 @@ impl SyscallDispatcher {
         let grow = mode & LINUX_FALLOC_FL_KEEP_SIZE == 0;
         let new_size = (offset as u64).saturating_add(length as u64);
         // Snapshot the writeback path/contents in a scope so the borrow
-        // drops before we touch self.rootfs_vfs.overlay (mirrors ftruncate).
+        // drops before we touch self.fs.rootfs_vfs.overlay (mirrors ftruncate).
         let writeback: Option<(String, Vec<u8>)>;
         let outcome: DispatchOutcome;
         {
@@ -920,7 +954,7 @@ impl SyscallDispatcher {
             }
         }
         if let Some((path, contents)) = writeback {
-            let _ = self.rootfs_vfs.overlay.set_file_contents(&path, contents);
+            let _ = self.fs.rootfs_vfs.overlay.set_file_contents(&path, contents);
         }
         Ok(outcome)
     }
@@ -945,7 +979,7 @@ impl SyscallDispatcher {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         };
         // Snapshot the path + new contents in a scope so the borrow drops
-        // before we touch self.rootfs_vfs.overlay.
+        // before we touch self.fs.rootfs_vfs.overlay.
         let writeback: Option<(String, Vec<u8>)>;
         let outcome: DispatchOutcome;
         {
@@ -999,7 +1033,7 @@ impl SyscallDispatcher {
             }
         }
         if let Some((path, contents)) = writeback {
-            let _ = self.rootfs_vfs.overlay.set_file_contents(&path, contents);
+            let _ = self.fs.rootfs_vfs.overlay.set_file_contents(&path, contents);
         }
         Ok(outcome)
     }
@@ -1099,7 +1133,7 @@ impl SyscallDispatcher {
         // Layered overlay+rootfs lookup with full openat semantics
         // (O_CREAT/O_EXCL/O_TRUNC, write-promotion of rootfs-only
         // files) lives in RootFsVfs::open_for_dispatch.
-        let dispatch_result = self.rootfs_vfs.open_for_dispatch(
+        let dispatch_result = self.fs.rootfs_vfs.open_for_dispatch(
             &path,
             want_create,
             want_excl,
@@ -1183,7 +1217,7 @@ impl SyscallDispatcher {
                 // host fd so the new file is fork-shareable. Falls back
                 // to the in-memory File for MemoryBackend.
                 if let Some(host_fd) =
-                    self.rootfs_vfs.overlay.open_raw_fd(&path, true, true, want_trunc)
+                    self.fs.rootfs_vfs.overlay.open_raw_fd(&path, true, true, want_trunc)
                 {
                     OpenDescription::HostFile {
                         host_fd,
@@ -1192,7 +1226,7 @@ impl SyscallDispatcher {
                         writable: true,
                     }
                 } else {
-                    if self.rootfs_vfs.overlay.create_file(&path).is_err() {
+                    if self.fs.rootfs_vfs.overlay.create_file(&path).is_err() {
                         return Ok(DispatchOutcome::Errno { errno: LINUX_EINVAL });
                     }
                     OpenDescription::File {
@@ -1232,12 +1266,12 @@ impl SyscallDispatcher {
         if path == "/" || path.is_empty() {
             return true;
         }
-        match self.rootfs_vfs.overlay.lookup(path) {
+        match self.fs.rootfs_vfs.overlay.lookup(path) {
             Some(OverlayEntry::Dir) => return true,
             Some(OverlayEntry::Deleted) | Some(OverlayEntry::File(_)) => return false,
             None => {}
         }
-        if let Some(rootfs) = &self.rootfs_vfs.rootfs {
+        if let Some(rootfs) = &self.fs.rootfs_vfs.rootfs {
             if let Ok(metadata) = rootfs.metadata(path) {
                 return metadata.kind == RootFsEntryKind::Directory;
             }
@@ -1250,7 +1284,7 @@ impl SyscallDispatcher {
     /// and respects deletions.
     fn layered_metadata(&self, path: &str) -> Result<RootFsMetadata, i32> {
         use crate::vfs::Vfs as _;
-        self.rootfs_vfs
+        self.fs.rootfs_vfs
             .lookup(path)
             .map(|md| vfs_md_to_rootfs_md(path, &md))
     }
@@ -1391,7 +1425,7 @@ impl SyscallDispatcher {
             mode: 0,
         };
         let handle = {
-            let Some(m) = self.vfs_mounts.resolve_mut(path) else {
+            let Some(m) = self.fs.vfs_mounts.resolve_mut(path) else {
                 return VfsOpenAttempt::FallThrough;
             };
             match m.vfs.open(&m.full_path, vfs_flags, &ctx) {
@@ -2598,7 +2632,7 @@ impl SyscallDispatcher {
                 })
             }
         };
-        match self
+        match self.fs
             .rootfs_vfs
             .overlay
             .set_xattr(&resolved, &name, &value, flags)
@@ -2625,7 +2659,7 @@ impl SyscallDispatcher {
         };
         let buf_addr = request.arg(2);
         let size = request.arg(3) as usize;
-        let value = match self.rootfs_vfs.overlay.get_xattr(&resolved, &name) {
+        let value = match self.fs.rootfs_vfs.overlay.get_xattr(&resolved, &name) {
             Ok(value) => value,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
@@ -2664,7 +2698,7 @@ impl SyscallDispatcher {
         };
         let buf_addr = request.arg(1);
         let size = request.arg(2) as usize;
-        let names = match self.rootfs_vfs.overlay.list_xattr(&resolved) {
+        let names = match self.fs.rootfs_vfs.overlay.list_xattr(&resolved) {
             Ok(names) => names,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
@@ -2796,7 +2830,7 @@ impl SyscallDispatcher {
         // dispatcher's built-in stdout/stderr buffers.
         if let Some(open_file) = self.open_files.get(&(fd as i32)).cloned() {
             // Take an inner scope so the borrow on the description ends
-            // before we touch self.rootfs_vfs.overlay (writable File path below).
+            // before we touch self.fs.rootfs_vfs.overlay (writable File path below).
             #[allow(dead_code)]
             enum FileWriteback {
                 None,
@@ -2875,7 +2909,7 @@ impl SyscallDispatcher {
                 }
             }
             if let FileWriteback::Update { path, contents } = writeback {
-                let _ = self.rootfs_vfs.overlay.set_file_contents(&path, contents);
+                let _ = self.fs.rootfs_vfs.overlay.set_file_contents(&path, contents);
             }
             return Ok(outcome);
         }
@@ -3043,7 +3077,7 @@ impl SyscallDispatcher {
                     }
                 }
                 if let FileWriteback::Update { path, contents } = writeback {
-                    let _ = self.rootfs_vfs.overlay.set_file_contents(&path, contents);
+                    let _ = self.fs.rootfs_vfs.overlay.set_file_contents(&path, contents);
                 }
                 let DispatchOutcome::Returned { value } = outcome else {
                     return Ok(outcome);
@@ -3108,12 +3142,12 @@ impl SyscallDispatcher {
 
         let target = if path == "/proc/self/exe" || path == "/proc/curproc/exe" {
             self.proc.executable_path.clone()
-        } else if let Some(t) = self.rootfs_vfs.overlay.read_link(&path) {
+        } else if let Some(t) = self.fs.rootfs_vfs.overlay.read_link(&path) {
             // Symlink created in the writable backend (cap-std on --fs host).
             t
         } else {
             use crate::vfs::Vfs as _;
-            match self.rootfs_vfs.readlink(&path) {
+            match self.fs.rootfs_vfs.readlink(&path) {
                 Ok(p) => p.to_string_lossy().into_owned(),
                 Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
             }
@@ -3176,10 +3210,10 @@ impl SyscallDispatcher {
         // Create an empty regular file in the writable backend (cap-std).
         // MemoryBackend's create_file works in-memory too. After this the
         // path exists in the layered view.
-        match self.rootfs_vfs.overlay.create_file(&resolved) {
+        match self.fs.rootfs_vfs.overlay.create_file(&resolved) {
             Ok(()) => {
                 if mode & 0o7777 != 0 {
-                    let _ = self.rootfs_vfs.overlay.set_mode(&resolved, mode & 0o7777);
+                    let _ = self.fs.rootfs_vfs.overlay.set_mode(&resolved, mode & 0o7777);
                 }
                 Ok(DispatchOutcome::Returned { value: 0 })
             }
@@ -3218,7 +3252,7 @@ impl SyscallDispatcher {
         // RootFsVfs::mkdir; the dispatcher only handles synthetic
         // path shadowing.
         use crate::vfs::Vfs as _;
-        match self.rootfs_vfs.mkdir(&resolved, 0) {
+        match self.fs.rootfs_vfs.mkdir(&resolved, 0) {
             Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
             Err(errno) => Ok(DispatchOutcome::Errno { errno }),
         }
@@ -3334,7 +3368,7 @@ impl SyscallDispatcher {
             return Ok(DispatchOutcome::Errno { errno });
         }
         let mode = (ctx.arg(2) & 0o7777) as u32;
-        match self.rootfs_vfs.overlay.set_mode(&resolved, mode) {
+        match self.fs.rootfs_vfs.overlay.set_mode(&resolved, mode) {
             Ok(()) | Err(crate::fs_backend::BackendError::Unsupported) => {
                 Ok(DispatchOutcome::Returned { value: 0 })
             }
@@ -3407,18 +3441,18 @@ impl SyscallDispatcher {
         let Some(src) = resolved_old else {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EROFS });
         };
-        match self.rootfs_vfs.overlay.hard_link(&src, &resolved_new) {
+        match self.fs.rootfs_vfs.overlay.hard_link(&src, &resolved_new) {
             Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
             Err(crate::fs_backend::BackendError::Unsupported) => {
                 // In-memory backend: emulate with a content copy (callers
                 // like dpkg only need the data, not shared inodes).
-                let contents = self
+                let contents = self.fs
                     .rootfs_vfs
                     .overlay
                     .file_contents(&src)
-                    .or_else(|| self.rootfs_vfs.rootfs.as_ref().and_then(|r| r.read(&src).ok()))
+                    .or_else(|| self.fs.rootfs_vfs.rootfs.as_ref().and_then(|r| r.read(&src).ok()))
                     .unwrap_or_default();
-                match self.rootfs_vfs.overlay.set_file_contents(&resolved_new, contents) {
+                match self.fs.rootfs_vfs.overlay.set_file_contents(&resolved_new, contents) {
                     Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
                     Err(_) => Ok(DispatchOutcome::Errno { errno: LINUX_EROFS }),
                 }
@@ -3470,7 +3504,7 @@ impl SyscallDispatcher {
         // Create a real symlink in the writable backend (cap-std). The
         // target is stored verbatim, matching symlinkat(2). MemoryBackend
         // returns Unsupported → EROFS.
-        match self.rootfs_vfs.overlay.symlink(&target_path, &resolved_link) {
+        match self.fs.rootfs_vfs.overlay.symlink(&target_path, &resolved_link) {
             Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
             Err(crate::fs_backend::BackendError::Unsupported) => {
                 Ok(DispatchOutcome::Errno { errno: LINUX_EROFS })
@@ -3561,7 +3595,7 @@ impl SyscallDispatcher {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EROFS });
         }
         let no_replace = flags & RENAME_NOREPLACE != 0;
-        match self
+        match self.fs
             .rootfs_vfs
             .rename_with_flags(&resolved_old, &resolved_new, no_replace)
         {
@@ -3602,9 +3636,9 @@ impl SyscallDispatcher {
         }
         use crate::vfs::Vfs as _;
         let result = if remove_dir {
-            self.rootfs_vfs.rmdir(&resolved)
+            self.fs.rootfs_vfs.rmdir(&resolved)
         } else {
-            self.rootfs_vfs.unlink(&resolved)
+            self.fs.rootfs_vfs.unlink(&resolved)
         };
         match result {
             Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
@@ -3703,7 +3737,7 @@ impl SyscallDispatcher {
         // overlay). A subsequent stat reads real disk metadata via
         // real_stat and will report the set mtime. MemoryBackend returns
         // Unsupported; accept as a no-op so in-memory guests don't fail.
-        match self.rootfs_vfs.overlay.set_times(&path, atime_set, mtime_set) {
+        match self.fs.rootfs_vfs.overlay.set_times(&path, atime_set, mtime_set) {
             Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
             Err(crate::fs_backend::BackendError::Unsupported) => {
                 Ok(DispatchOutcome::Returned { value: 0 })
@@ -3761,16 +3795,16 @@ impl SyscallDispatcher {
         // `AT_SYMLINK_NOFOLLOW` selects lstat (report the link) vs stat
         // (report the target) semantics.
         let follow = flags & LINUX_AT_SYMLINK_NOFOLLOW == 0;
-        if let Some(real) = self.rootfs_vfs.overlay.real_stat(&path, follow) {
+        if let Some(real) = self.fs.rootfs_vfs.overlay.real_stat(&path, follow) {
             return Ok(write_stat_real(memory, statbuf, &path, &real));
         }
         // Layered overlay+rootfs lookup via RootFsVfs. Honour
         // AT_SYMLINK_NOFOLLOW (lstat) on backends without real_stat.
         use crate::vfs::Vfs as _;
         let lookup = if follow {
-            self.rootfs_vfs.lookup(&path)
+            self.fs.rootfs_vfs.lookup(&path)
         } else {
-            self.rootfs_vfs.lookup_nofollow(&path)
+            self.fs.rootfs_vfs.lookup_nofollow(&path)
         };
         match lookup {
             Ok(md) => Ok(write_stat(memory, statbuf, &vfs_md_to_rootfs_md(&path, &md))),
@@ -3823,7 +3857,7 @@ impl SyscallDispatcher {
         // (S_IFLNK + true st_nlink). `AT_SYMLINK_NOFOLLOW` selects lstat
         // (the link) vs stat (the target).
         let follow = flags & LINUX_AT_SYMLINK_NOFOLLOW == 0;
-        if let Some(real) = self.rootfs_vfs.overlay.real_stat(&path, follow) {
+        if let Some(real) = self.fs.rootfs_vfs.overlay.real_stat(&path, follow) {
             return Ok(write_statx_real(memory, statxbuf, &path, &real));
         }
         // Fallback for backends without real_stat (e.g. the in-memory
@@ -3831,9 +3865,9 @@ impl SyscallDispatcher {
         // rather than its target.
         use crate::vfs::Vfs as _;
         let lookup = if follow {
-            self.rootfs_vfs.lookup(&path)
+            self.fs.rootfs_vfs.lookup(&path)
         } else {
-            self.rootfs_vfs.lookup_nofollow(&path)
+            self.fs.rootfs_vfs.lookup_nofollow(&path)
         };
         match lookup {
             Ok(md) => Ok(write_statx(memory, statxbuf, &vfs_md_to_rootfs_md(&path, &md))),

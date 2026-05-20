@@ -348,34 +348,10 @@ pub struct SyscallDispatcher {
     /// stack). See [`signal::SignalState`]. Handlers that touch only
     /// signal state borrow `self.signal` narrowly.
     signal: signal::SignalState,
-    /// Swappable writable layer that sits on top of the read-only
-    /// rootfs. Writes (mkdirat / openat O_CREAT / write / unlinkat /
-    /// renameat) land here; reads consult this first and fall through
-    /// to the rootfs when nothing is found. The backend's tombstones
-    /// shadow rootfs-backed paths so unlink-then-stat behaves correctly.
-    ///
-    /// Two backends exist (see `src/fs_backend.rs`):
-    ///   * [`MemoryBackend`]    — in-memory tmpfs, fast and ephemeral.
-    ///   * [`HostFsBackend`]    — cap-std-sandboxed APFS scratch dir,
-    ///                            durable, reflink-seeded.
-    /// Unified VFS mount table. Holds DevVfs at /dev, ProcVfs at
-    /// /proc, SysVfs at /sys. The dispatcher consults it first; any
-    /// path no mount claims (or that a mount returns ENOSYS for)
-    /// falls through to the legacy code path below, which reads the
-    /// rootfs + overlay from [`Self::rootfs_vfs`].
-    vfs_mounts: crate::vfs::VfsMounts,
-
-    /// The `/` mount: immutable OCI rootfs + writable overlay
-    /// ([`FsBackend`]). Held as a typed field rather than mounted in
-    /// `vfs_mounts` because the dispatcher's existing fs syscalls
-    /// reach into the overlay/rootfs state through ~50 call sites
-    /// today. Routing those through `Vfs::method` calls is the
-    /// follow-up mechanical migration; for step 4 of the plan we
-    /// land the architectural ownership move (the state lives in
-    /// `RootFsVfs`, exposed to callers via accessors) and the full
-    /// Vfs trait impl (`RootFsVfs::open`, `unlink`, etc.) is
-    /// independently tested.
-    rootfs_vfs: crate::vfs::RootFsVfs,
+    /// Owned filesystem subsystem state (unified VFS mount table plus
+    /// the `/` rootfs + writable overlay). See [`fs::FsState`]. Handlers
+    /// that touch only fs state borrow `self.fs` narrowly.
+    fs: fs::FsState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -777,14 +753,7 @@ impl SyscallDispatcher {
             proc: proc::ProcState::new(),
             creds: creds::CredState::new(),
             signal: signal::SignalState::new(),
-            vfs_mounts: {
-                let mut m = crate::vfs::VfsMounts::new();
-                m.mount("/dev", Box::new(crate::vfs::DevVfs::new()));
-                m.mount("/proc", Box::new(crate::vfs::ProcVfs::new()));
-                m.mount("/sys", Box::new(crate::vfs::SysVfs::new()));
-                m
-            },
-            rootfs_vfs: crate::vfs::RootFsVfs::new(),
+            fs: fs::FsState::new(),
         }
     }
 
@@ -800,13 +769,13 @@ impl SyscallDispatcher {
 
     pub fn with_rootfs(rootfs: RootFs) -> Self {
         let mut s = Self::new();
-        s.rootfs_vfs.rootfs = Some(rootfs);
+        s.fs.rootfs_vfs.rootfs = Some(rootfs);
         s
     }
 
     pub fn with_rootfs_and_executable(rootfs: RootFs, executable_path: impl Into<String>) -> Self {
         let mut s = Self::new();
-        s.rootfs_vfs.rootfs = Some(rootfs);
+        s.fs.rootfs_vfs.rootfs = Some(rootfs);
         s.proc.executable_path = executable_path.into();
         s
     }
@@ -816,7 +785,7 @@ impl SyscallDispatcher {
     /// directory. Returns the previously-installed backend so the
     /// caller can decide what to do with it (normally just drop).
     pub fn set_fs_backend(&mut self, backend: Box<dyn FsBackend>) -> Box<dyn FsBackend> {
-        self.rootfs_vfs.set_overlay(backend)
+        self.fs.rootfs_vfs.set_overlay(backend)
     }
 
     /// Drop the immutable in-memory rootfs layer. Valid ONLY once the
@@ -828,19 +797,19 @@ impl SyscallDispatcher {
     /// only" when the rootfs is `None`. Never call this for `--fs memory`,
     /// whose overlay starts empty and relies on the rootfs for reads.
     pub fn drop_rootfs_layer(&mut self) {
-        self.rootfs_vfs.rootfs = None;
+        self.fs.rootfs_vfs.rootfs = None;
     }
 
     /// Name of the currently-installed backend (for logging / debug).
     pub fn fs_backend_name(&self) -> &'static str {
-        self.rootfs_vfs.overlay.name()
+        self.fs.rootfs_vfs.overlay.name()
     }
 
     /// Borrow the dispatcher's rootfs. Used by the runtime when the
     /// dispatcher returns `DispatchOutcome::Execve` and the new image
     /// has to be loaded from the same image layers.
     pub fn rootfs(&self) -> Option<&RootFs> {
-        self.rootfs_vfs.rootfs.as_ref()
+        self.fs.rootfs_vfs.rootfs.as_ref()
     }
 
     /// Read a regular file's bytes through the layered view (overlay
@@ -850,10 +819,10 @@ impl SyscallDispatcher {
     /// alone would miss). Returns None if the path isn't a readable
     /// file in either layer.
     pub fn read_exec_file(&self, path: &str) -> Option<Vec<u8>> {
-        if let Some(bytes) = self.rootfs_vfs.overlay.file_contents(path) {
+        if let Some(bytes) = self.fs.rootfs_vfs.overlay.file_contents(path) {
             return Some(bytes);
         }
-        self.rootfs_vfs.rootfs.as_ref()?.read(path).ok()
+        self.fs.rootfs_vfs.rootfs.as_ref()?.read(path).ok()
     }
 
     pub fn stdout(&self) -> &[u8] {
