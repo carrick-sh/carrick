@@ -575,6 +575,19 @@ enum OpenDescription {
         type_: i32,
         status_flags: u64,
     },
+    /// A regular file backed by a REAL macOS file descriptor into the
+    /// `--fs host` overlay scratch. Unlike `File` (which caches bytes
+    /// in memory and so diverges across `libc::fork`), the kernel fd
+    /// is shared by fork, so a forked child's writes are visible to
+    /// the parent — which is what makes apt's verify-via-temp-file
+    /// patterns work. read/write/lseek/fstat/mmap operate directly on
+    /// `host_fd`; the kernel owns the offset.
+    HostFile {
+        host_fd: i32,
+        metadata: RootFsMetadata,
+        status_flags: u64,
+        writable: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -625,6 +638,7 @@ impl OpenDescription {
             | OpenDescription::PipeReader { status_flags, .. }
             | OpenDescription::PipeWriter { status_flags, .. }
             | OpenDescription::HostPipe { status_flags, .. }
+            | OpenDescription::HostFile { status_flags, .. }
             | OpenDescription::HostSocket { status_flags, .. } => *status_flags,
         }
     }
@@ -640,6 +654,7 @@ impl OpenDescription {
             | OpenDescription::PipeReader { status_flags, .. }
             | OpenDescription::PipeWriter { status_flags, .. }
             | OpenDescription::HostPipe { status_flags, .. }
+            | OpenDescription::HostFile { status_flags, .. }
             | OpenDescription::HostSocket { status_flags, .. } => *status_flags = next,
         }
     }
@@ -1184,6 +1199,7 @@ impl SyscallDispatcher {
         let open = open_file.description.borrow();
         match &*open {
             OpenDescription::File { metadata, .. }
+            | OpenDescription::HostFile { metadata, .. }
             | OpenDescription::Directory { metadata, .. } => access_metadata(metadata, mode),
             OpenDescription::SyntheticFile { path, .. } => self
                 .synthetic_access(path, mode)
@@ -1248,6 +1264,7 @@ impl SyscallDispatcher {
                 DispatchOutcome::Returned { value: 0 }
             }
             OpenDescription::File { .. }
+            | OpenDescription::HostFile { .. }
             | OpenDescription::SyntheticFile { .. }
             | OpenDescription::EventFd { .. }
             | OpenDescription::TimerFd { .. }
@@ -2007,6 +2024,15 @@ impl SyscallDispatcher {
                     ready |= LINUX_POLLIN;
                 }
             }
+            // Regular files are always ready for read and write.
+            OpenDescription::HostFile { .. } => {
+                if requested_events & LINUX_POLLIN != 0 {
+                    ready |= LINUX_POLLIN;
+                }
+                if requested_events & LINUX_POLLOUT != 0 {
+                    ready |= LINUX_POLLOUT;
+                }
+            }
             OpenDescription::Directory { .. } => {}
             OpenDescription::EventFd { counter, .. } => {
                 if requested_events & LINUX_POLLIN != 0 && *counter > 0 {
@@ -2683,7 +2709,9 @@ impl SyscallDispatcher {
         };
         let open = open_file.description.borrow();
         let errno = match &*open {
-            OpenDescription::File { .. } | OpenDescription::SyntheticFile { .. } => LINUX_EROFS,
+            OpenDescription::File { .. }
+            | OpenDescription::HostFile { .. }
+            | OpenDescription::SyntheticFile { .. } => LINUX_EROFS,
             OpenDescription::Directory { .. } => LINUX_EISDIR,
             OpenDescription::PipeReader { .. }
             | OpenDescription::PipeWriter { .. }
@@ -2742,6 +2770,20 @@ impl SyscallDispatcher {
                     metadata.size = contents.len();
                     writeback = Some((path.clone(), contents.clone()));
                     outcome = DispatchOutcome::Returned { value: 0 };
+                }
+                OpenDescription::HostFile {
+                    host_fd, writable, ..
+                } => {
+                    if !*writable {
+                        return DispatchOutcome::Errno { errno: LINUX_EBADF };
+                    }
+                    // Real fd: ftruncate the kernel file directly (the
+                    // change is visible across fork).
+                    let r = unsafe { libc::ftruncate(*host_fd, length as libc::off_t) };
+                    if r < 0 {
+                        return DispatchOutcome::Errno { errno: host_errno() };
+                    }
+                    return DispatchOutcome::Returned { value: 0 };
                 }
                 OpenDescription::SyntheticFile { .. } => {
                     return DispatchOutcome::Errno { errno: LINUX_EBADF };
@@ -3998,6 +4040,9 @@ impl SyscallDispatcher {
             Ok(crate::vfs::rootfs::OpenDispatchResult::File { contents, .. }) => {
                 crate::probes::path_open(&path, contents.len() as u64, 0);
             }
+            Ok(crate::vfs::rootfs::OpenDispatchResult::HostFile { metadata, .. }) => {
+                crate::probes::path_open(&path, metadata.size as u64, 0);
+            }
             Ok(crate::vfs::rootfs::OpenDispatchResult::Directory { .. }) => {
                 crate::probes::path_open(&path, 0, 0);
             }
@@ -4018,6 +4063,16 @@ impl SyscallDispatcher {
                 metadata,
                 contents,
                 offset: 0,
+                status_flags: flags & !LINUX_O_CLOEXEC,
+                writable,
+            },
+            Ok(crate::vfs::rootfs::OpenDispatchResult::HostFile {
+                host_fd,
+                metadata,
+                writable,
+            }) => OpenDescription::HostFile {
+                host_fd,
+                metadata,
                 status_flags: flags & !LINUX_O_CLOEXEC,
                 writable,
             },
@@ -4043,22 +4098,36 @@ impl SyscallDispatcher {
                         return Ok(DispatchOutcome::Errno { errno: LINUX_ENOENT });
                     }
                 }
-                if self.rootfs_vfs.overlay.create_file(&path).is_err() {
-                    return Ok(DispatchOutcome::Errno { errno: LINUX_EINVAL });
-                }
                 let metadata = RootFsMetadata {
                     path: Path::new(&path).to_path_buf(),
                     kind: RootFsEntryKind::File,
                     mode: 0o644,
                     size: 0,
                 };
-                OpenDescription::File {
-                    path,
-                    metadata,
-                    contents: Vec::new(),
-                    offset: 0,
-                    status_flags: flags & !LINUX_O_CLOEXEC,
-                    writable: writable_request || want_create,
+                // Disk-backed overlay (--fs host): create + open a real
+                // host fd so the new file is fork-shareable. Falls back
+                // to the in-memory File for MemoryBackend.
+                if let Some(host_fd) =
+                    self.rootfs_vfs.overlay.open_raw_fd(&path, true, true, want_trunc)
+                {
+                    OpenDescription::HostFile {
+                        host_fd,
+                        metadata,
+                        status_flags: flags & !LINUX_O_CLOEXEC,
+                        writable: true,
+                    }
+                } else {
+                    if self.rootfs_vfs.overlay.create_file(&path).is_err() {
+                        return Ok(DispatchOutcome::Errno { errno: LINUX_EINVAL });
+                    }
+                    OpenDescription::File {
+                        path,
+                        metadata,
+                        contents: Vec::new(),
+                        offset: 0,
+                        status_flags: flags & !LINUX_O_CLOEXEC,
+                        writable: writable_request || want_create,
+                    }
                 }
             }
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
@@ -5264,6 +5333,22 @@ impl SyscallDispatcher {
         };
         let mut open = open_file.description.borrow_mut();
 
+        // HostFile: the kernel owns the offset — delegate straight to
+        // libc::lseek on the real fd.
+        if let OpenDescription::HostFile { host_fd, .. } = &*open {
+            let host_whence = match whence {
+                LINUX_SEEK_SET => libc::SEEK_SET,
+                LINUX_SEEK_CUR => libc::SEEK_CUR,
+                LINUX_SEEK_END => libc::SEEK_END,
+                _ => return DispatchOutcome::Errno { errno: LINUX_EINVAL },
+            };
+            let r = unsafe { libc::lseek(*host_fd, offset as libc::off_t, host_whence) };
+            if r < 0 {
+                return DispatchOutcome::Errno { errno: host_errno() };
+            }
+            return DispatchOutcome::Returned { value: r as i64 };
+        }
+
         let (current, end) = match &*open {
             OpenDescription::File {
                 contents, offset, ..
@@ -5288,6 +5373,8 @@ impl SyscallDispatcher {
                     errno: LINUX_ESPIPE,
                 };
             }
+            // HostFile is handled by the early libc::lseek above.
+            OpenDescription::HostFile { .. } => unreachable!("HostFile lseek handled above"),
             OpenDescription::EventFd { .. }
             | OpenDescription::TimerFd { .. }
             | OpenDescription::Epoll { .. } => {
@@ -5316,6 +5403,7 @@ impl SyscallDispatcher {
             OpenDescription::File { offset, .. }
             | OpenDescription::Directory { offset, .. }
             | OpenDescription::SyntheticFile { offset, .. } => *offset = next as usize,
+            OpenDescription::HostFile { .. } => unreachable!("HostFile lseek handled above"),
             OpenDescription::EventFd { .. }
             | OpenDescription::TimerFd { .. }
             | OpenDescription::Epoll { .. }
@@ -5453,26 +5541,46 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
             };
             let open = open_file.description.borrow();
-            let contents = match &*open {
+            let offset_usize =
+                usize::try_from(offset).map_err(|_| DispatchError::LengthTooLarge(offset))?;
+            match &*open {
                 OpenDescription::File { contents, .. }
-                | OpenDescription::SyntheticFile { contents, .. } => contents,
+                | OpenDescription::SyntheticFile { contents, .. } => {
+                    if offset_usize < contents.len() {
+                        let available = &contents[offset_usize..];
+                        let copy_len = available.len().min(length_usize);
+                        bytes[..copy_len].copy_from_slice(&available[..copy_len]);
+                    }
+                }
+                // Real host file: pread the requested region directly.
+                // MAP_PRIVATE snapshot semantics — we copy the bytes
+                // into the guest mapping (we don't model live
+                // MAP_SHARED file mappings).
+                OpenDescription::HostFile { host_fd, .. } => {
+                    let n = unsafe {
+                        libc::pread(
+                            *host_fd,
+                            bytes.as_mut_ptr() as *mut _,
+                            length_usize,
+                            offset as libc::off_t,
+                        )
+                    };
+                    // Short/zero reads just leave the tail zero-filled,
+                    // matching mmap-past-EOF semantics. Negative = error
+                    // but we still return the (zeroed) mapping rather
+                    // than fail, mirroring the File path's leniency.
+                    let _ = n;
+                }
                 OpenDescription::Directory { .. }
                 | OpenDescription::EventFd { .. }
                 | OpenDescription::TimerFd { .. }
                 | OpenDescription::Epoll { .. }
                 | OpenDescription::PipeReader { .. }
                 | OpenDescription::PipeWriter { .. }
-            | OpenDescription::HostPipe { .. }
-            | OpenDescription::HostSocket { .. } => {
+                | OpenDescription::HostPipe { .. }
+                | OpenDescription::HostSocket { .. } => {
                     return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
                 }
-            };
-            let offset =
-                usize::try_from(offset).map_err(|_| DispatchError::LengthTooLarge(offset))?;
-            if offset < contents.len() {
-                let available = &contents[offset..];
-                let copy_len = available.len().min(length_usize);
-                bytes[..copy_len].copy_from_slice(&available[..copy_len]);
             }
         }
 
@@ -5846,6 +5954,12 @@ impl SyscallDispatcher {
             OpenDescription::HostSocket { host_fd, .. } => {
                 return Ok(read_host_pipe(memory, address, length, *host_fd));
             }
+            // Real host file: libc::read advances the kernel offset
+            // (shared across fork). read_host_pipe is just a
+            // memory-into-guest read(2) wrapper.
+            OpenDescription::HostFile { host_fd, .. } => {
+                return Ok(read_host_pipe(memory, address, length, *host_fd));
+            }
         };
         let remaining = &contents[*offset..];
         let read_len = remaining.len().min(length);
@@ -5878,6 +5992,29 @@ impl SyscallDispatcher {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         };
         let mut open = open_file.description.borrow_mut();
+        // Real host file: readv via the kernel fd (advances the shared
+        // offset). Fill each iovec sequentially.
+        if let OpenDescription::HostFile { host_fd, .. } = &*open {
+            let hfd = *host_fd;
+            let mut total = 0i64;
+            for iov in &iovecs {
+                let len = usize::try_from(iov.iov_len)
+                    .map_err(|_| DispatchError::LengthTooLarge(iov.iov_len))?;
+                if len == 0 {
+                    continue;
+                }
+                match read_host_pipe(memory, iov.iov_base, len, hfd) {
+                    DispatchOutcome::Returned { value } => {
+                        total += value;
+                        if (value as usize) < len {
+                            break;
+                        }
+                    }
+                    other => return Ok(other),
+                }
+            }
+            return Ok(DispatchOutcome::Returned { value: total });
+        }
         let (contents, offset) = match &mut *open {
             OpenDescription::File {
                 contents, offset, ..
@@ -5885,6 +6022,7 @@ impl SyscallDispatcher {
             | OpenDescription::SyntheticFile {
                 contents, offset, ..
             } => (contents, offset),
+            OpenDescription::HostFile { .. } => unreachable!("HostFile readv handled above"),
             OpenDescription::Directory { .. }
             | OpenDescription::EventFd { .. }
             | OpenDescription::TimerFd { .. }
@@ -5920,9 +6058,26 @@ impl SyscallDispatcher {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         };
         let open = open_file.description.borrow();
+        // Real host file: positional read via libc::pread (doesn't
+        // disturb the shared kernel offset).
+        if let OpenDescription::HostFile { host_fd, .. } = &*open {
+            let mut buf = vec![0u8; length];
+            let n = unsafe {
+                libc::pread(*host_fd, buf.as_mut_ptr() as *mut _, length, offset as libc::off_t)
+            };
+            if n < 0 {
+                return Ok(DispatchOutcome::Errno { errno: host_errno() });
+            }
+            let n = n as usize;
+            if n > 0 && memory.write_bytes(buffer, &buf[..n]).is_err() {
+                return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
+            }
+            return Ok(DispatchOutcome::Returned { value: n as i64 });
+        }
         let contents = match &*open {
             OpenDescription::File { contents, .. }
             | OpenDescription::SyntheticFile { contents, .. } => contents,
+            OpenDescription::HostFile { .. } => unreachable!("HostFile pread handled above"),
             OpenDescription::Directory { .. }
             | OpenDescription::EventFd { .. }
             | OpenDescription::TimerFd { .. }
@@ -5972,9 +6127,41 @@ impl SyscallDispatcher {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         };
         let open = open_file.description.borrow();
+        // Real host file: positional readv via libc::pread per iovec
+        // (kernel offset untouched).
+        if let OpenDescription::HostFile { host_fd, .. } = &*open {
+            let hfd = *host_fd;
+            let mut total = 0i64;
+            let mut cur = offset;
+            for iov in &iovecs {
+                let len = usize::try_from(iov.iov_len)
+                    .map_err(|_| DispatchError::LengthTooLarge(iov.iov_len))?;
+                if len == 0 {
+                    continue;
+                }
+                let mut buf = vec![0u8; len];
+                let n = unsafe {
+                    libc::pread(hfd, buf.as_mut_ptr() as *mut _, len, cur as libc::off_t)
+                };
+                if n < 0 {
+                    return Ok(DispatchOutcome::Errno { errno: host_errno() });
+                }
+                let n = n as usize;
+                if n > 0 && memory.write_bytes(iov.iov_base, &buf[..n]).is_err() {
+                    return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
+                }
+                total += n as i64;
+                cur += n;
+                if n < len {
+                    break;
+                }
+            }
+            return Ok(DispatchOutcome::Returned { value: total });
+        }
         let contents = match &*open {
             OpenDescription::File { contents, .. }
             | OpenDescription::SyntheticFile { contents, .. } => contents,
+            OpenDescription::HostFile { .. } => unreachable!("HostFile preadv handled above"),
             OpenDescription::Directory { .. }
             | OpenDescription::EventFd { .. }
             | OpenDescription::TimerFd { .. }
@@ -6009,11 +6196,10 @@ impl SyscallDispatcher {
                 errno: LINUX_EINVAL,
             });
         }
-        if memory.read_bytes(address, length).is_err() {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EFAULT,
-            });
-        }
+        let bytes = match memory.read_bytes(address, length) {
+            Ok(b) => b,
+            Err(_) => return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT }),
+        };
         if is_stdio_fd(fd) {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_ESPIPE,
@@ -6023,8 +6209,23 @@ impl SyscallDispatcher {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         };
         let open = open_file.description.borrow();
+        // Real host file: positional write via libc::pwrite (visible
+        // across fork; kernel offset untouched).
+        if let OpenDescription::HostFile { host_fd, writable, .. } = &*open {
+            if !*writable {
+                return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+            }
+            let n = unsafe {
+                libc::pwrite(*host_fd, bytes.as_ptr() as *const _, length, offset as libc::off_t)
+            };
+            if n < 0 {
+                return Ok(DispatchOutcome::Errno { errno: host_errno() });
+            }
+            return Ok(DispatchOutcome::Returned { value: n as i64 });
+        }
         let errno = match &*open {
             OpenDescription::File { .. } | OpenDescription::SyntheticFile { .. } => LINUX_EBADF,
+            OpenDescription::HostFile { .. } => unreachable!("handled above"),
             OpenDescription::Directory { .. } => LINUX_EISDIR,
             OpenDescription::PipeReader { .. }
             | OpenDescription::PipeWriter { .. }
@@ -6074,8 +6275,41 @@ impl SyscallDispatcher {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         };
         let open = open_file.description.borrow();
+        // Real host file: positional writev via libc::pwrite per iovec.
+        if let OpenDescription::HostFile { host_fd, writable, .. } = &*open {
+            if !*writable {
+                return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+            }
+            let hfd = *host_fd;
+            let mut total = 0i64;
+            let mut cur = offset;
+            for iov in &iovecs {
+                let len = usize::try_from(iov.iov_len)
+                    .map_err(|_| DispatchError::LengthTooLarge(iov.iov_len))?;
+                if len == 0 {
+                    continue;
+                }
+                let buf = match memory.read_bytes(iov.iov_base, len) {
+                    Ok(b) => b,
+                    Err(_) => return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT }),
+                };
+                let n = unsafe {
+                    libc::pwrite(hfd, buf.as_ptr() as *const _, len, cur as libc::off_t)
+                };
+                if n < 0 {
+                    return Ok(DispatchOutcome::Errno { errno: host_errno() });
+                }
+                total += n as i64;
+                cur += n as i64;
+                if (n as usize) < len {
+                    break;
+                }
+            }
+            return Ok(DispatchOutcome::Returned { value: total });
+        }
         let errno = match &*open {
             OpenDescription::File { .. } | OpenDescription::SyntheticFile { .. } => LINUX_EBADF,
+            OpenDescription::HostFile { .. } => unreachable!("handled above"),
             OpenDescription::Directory { .. } => LINUX_EISDIR,
             OpenDescription::PipeReader { .. }
             | OpenDescription::PipeWriter { .. }
@@ -6163,6 +6397,15 @@ impl SyscallDispatcher {
         match &*open {
             OpenDescription::File { offset, .. }
             | OpenDescription::SyntheticFile { offset, .. } => Ok(Ok(*offset)),
+            // HostFile: current offset is the kernel's; query via lseek.
+            OpenDescription::HostFile { host_fd, .. } => {
+                let cur = unsafe { libc::lseek(*host_fd, 0, libc::SEEK_CUR) };
+                if cur < 0 {
+                    Ok(Err(host_errno()))
+                } else {
+                    Ok(Ok(cur as usize))
+                }
+            }
             OpenDescription::Directory { .. }
             | OpenDescription::EventFd { .. }
             | OpenDescription::TimerFd { .. }
@@ -6179,9 +6422,22 @@ impl SyscallDispatcher {
             return Err(LINUX_EBADF);
         };
         let open = in_file.description.borrow();
+        // HostFile: pread the requested window from the real fd.
+        if let OpenDescription::HostFile { host_fd, .. } = &*open {
+            let mut buf = vec![0u8; count];
+            let n = unsafe {
+                libc::pread(*host_fd, buf.as_mut_ptr() as *mut _, count, offset as libc::off_t)
+            };
+            if n < 0 {
+                return Err(host_errno());
+            }
+            buf.truncate(n as usize);
+            return Ok(buf);
+        }
         let contents = match &*open {
             OpenDescription::File { contents, .. }
             | OpenDescription::SyntheticFile { contents, .. } => contents,
+            OpenDescription::HostFile { .. } => unreachable!("HostFile sendfile handled above"),
             OpenDescription::Directory { .. }
             | OpenDescription::EventFd { .. }
             | OpenDescription::TimerFd { .. }
@@ -6416,6 +6672,16 @@ impl SyscallDispatcher {
                         // write(2) on a connected socket maps directly to a
                         // host write(2). Unconnected sockets will surface
                         // their own ENOTCONN via the host.
+                        return Ok(write_host_pipe(&bytes, *host_fd));
+                    }
+                    OpenDescription::HostFile {
+                        host_fd, writable, ..
+                    } => {
+                        if !*writable {
+                            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+                        }
+                        // libc::write to the real fd: advances the
+                        // kernel offset and is visible across fork.
                         return Ok(write_host_pipe(&bytes, *host_fd));
                     }
                     OpenDescription::File {
@@ -7305,6 +7571,16 @@ impl SyscallDispatcher {
         let metadata = match &*open {
             OpenDescription::File { metadata, .. }
             | OpenDescription::Directory { metadata, .. } => metadata,
+            // Real host file: fstat the fd for the LIVE size (it may
+            // have grown since open, incl. from a forked child).
+            OpenDescription::HostFile { host_fd, metadata, .. } => {
+                let mut md = metadata.clone();
+                let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                if unsafe { libc::fstat(*host_fd, &mut st) } == 0 {
+                    md.size = st.st_size as usize;
+                }
+                return write_stat(memory, statbuf, &md);
+            }
             OpenDescription::SyntheticFile { path, contents, .. } => {
                 return write_synthetic_stat(memory, statbuf, path, contents.len());
             }
@@ -7341,6 +7617,14 @@ impl SyscallDispatcher {
         let metadata = match &*open {
             OpenDescription::File { metadata, .. }
             | OpenDescription::Directory { metadata, .. } => metadata,
+            OpenDescription::HostFile { host_fd, metadata, .. } => {
+                let mut md = metadata.clone();
+                let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                if unsafe { libc::fstat(*host_fd, &mut st) } == 0 {
+                    md.size = st.st_size as usize;
+                }
+                return write_statx(memory, statxbuf, &md);
+            }
             OpenDescription::SyntheticFile { path, contents, .. } => {
                 return write_synthetic_statx(memory, statxbuf, path, contents.len());
             }
@@ -7382,6 +7666,7 @@ impl SyscallDispatcher {
             Some(open_file) => match &*open_file.description.borrow() {
                 OpenDescription::Directory { path: dir, .. } => Ok(join_rootfs_path(dir, path)),
                 OpenDescription::File { .. }
+                | OpenDescription::HostFile { .. }
                 | OpenDescription::SyntheticFile { .. }
                 | OpenDescription::EventFd { .. }
                 | OpenDescription::TimerFd { .. }
@@ -7699,7 +7984,8 @@ fn close_open_file(open_file: &OpenFile) {
                 }
             }
         }
-        OpenDescription::HostSocket { host_fd, .. } => {
+        OpenDescription::HostSocket { host_fd, .. }
+        | OpenDescription::HostFile { host_fd, .. } => {
             // Same last-reference rule as HostPipe: only close the real
             // macOS fd when no other Linux fd still aliases the same
             // OpenDescription via dup3/dup2.

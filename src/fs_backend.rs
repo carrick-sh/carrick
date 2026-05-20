@@ -137,6 +137,26 @@ pub trait FsBackend: Send {
         to: &str,
     ) -> Result<bool, BackendError>;
 
+    /// Open a REAL host file descriptor for `path`. For a disk-backed
+    /// backend this is a normal kernel file: shared offset, and —
+    /// crucially — it survives `libc::fork(2)`, so a forked child's
+    /// writes are visible to the parent and vice versa. This is what
+    /// makes apt's "child writes a temp file / pipe, parent reads it"
+    /// verification patterns work under `--fs host`.
+    ///
+    /// `write` -> O_RDWR (else O_RDONLY); `create` -> +O_CREAT;
+    /// `trunc` -> +O_TRUNC. Returns the raw fd (caller owns it, must
+    /// close it). `MemoryBackend` returns None: an in-memory HashMap
+    /// has no kernel fd and cannot be shared across a real fork, so
+    /// the dispatcher keeps its in-memory File model there.
+    fn open_raw_fd(
+        &self,
+        path: &str,
+        write: bool,
+        create: bool,
+        trunc: bool,
+    ) -> Option<i32>;
+
     /// Human-readable backend name for `--fs` reporting. Default is
     /// the impl's `type_name`-style identifier.
     fn name(&self) -> &'static str {
@@ -352,6 +372,19 @@ impl FsBackend for MemoryBackend {
             return Ok(true);
         }
         Ok(false)
+    }
+
+    fn open_raw_fd(
+        &self,
+        _path: &str,
+        _write: bool,
+        _create: bool,
+        _trunc: bool,
+    ) -> Option<i32> {
+        // No kernel fd backs an in-memory HashMap, and a real
+        // libc::fork can't share it. The dispatcher uses its in-memory
+        // File model for this backend.
+        None
     }
 
     fn name(&self) -> &'static str {
@@ -789,6 +822,42 @@ impl FsBackend for HostFsBackend {
             return Ok(true);
         }
         Ok(false)
+    }
+
+    fn open_raw_fd(
+        &self,
+        path: &str,
+        write: bool,
+        create: bool,
+        trunc: bool,
+    ) -> Option<i32> {
+        use std::os::fd::IntoRawFd;
+        let normalized = normalize(path)?;
+        // A tombstoned path is "deleted" in the layered view; don't
+        // resurrect it via a raw open.
+        if self.tombstones.contains(&normalized) {
+            return None;
+        }
+        let rel = Self::rel_path(&normalized)?;
+        if create {
+            if let Some(parent) = rel.parent() {
+                if !parent.as_os_str().is_empty() {
+                    self.dir.create_dir_all(parent).ok()?;
+                }
+            }
+        }
+        let mut opts = cap_std::fs::OpenOptions::new();
+        if write {
+            opts.read(true).write(true);
+        } else {
+            opts.read(true);
+        }
+        opts.create(create).truncate(trunc);
+        let file = self.dir.open_with(rel, &opts).ok()?;
+        // Hand the kernel fd to the caller. `into_raw_fd` consumes the
+        // cap-std File without closing it, so the dispatcher owns the
+        // fd lifetime (it closes it on guest close()).
+        Some(file.into_std().into_raw_fd())
     }
 
     fn name(&self) -> &'static str {
