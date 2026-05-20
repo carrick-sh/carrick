@@ -17,7 +17,7 @@
 //! through the trait the result is byte-identical to what it
 //! produced via direct access.
 
-use crate::dispatch::{LINUX_EACCES, LINUX_EEXIST, LINUX_EINVAL, LINUX_EISDIR, LINUX_ENOENT, LINUX_ENOTDIR, LINUX_EROFS};
+use crate::linux_abi::{LINUX_EACCES, LINUX_EEXIST, LINUX_EINVAL, LINUX_EISDIR, LINUX_ENOENT, LINUX_ENOTDIR, LINUX_EROFS};
 use crate::fs_backend::{FsBackend, MemoryBackend, OverlayEntry};
 use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsError, RootFsMetadata};
 
@@ -477,7 +477,7 @@ impl Vfs for RootFsVfs {
         // the layered view so an existing regular file/dir on the disk
         // overlay yields EINVAL even with the rootfs layer dropped.
         if self.lookup(path).is_ok() {
-            Err(crate::dispatch::LINUX_EINVAL)
+            Err(crate::linux_abi::LINUX_EINVAL)
         } else {
             Err(LINUX_ENOENT)
         }
@@ -506,7 +506,7 @@ impl Vfs for RootFsVfs {
                             .set_file_contents(path, contents.clone())
                             .is_err()
                         {
-                            return Err(crate::dispatch::LINUX_EINVAL);
+                            return Err(crate::linux_abi::LINUX_EINVAL);
                         }
                     }
                     return Ok(VfsHandle::Bytes {
@@ -584,7 +584,7 @@ impl Vfs for RootFsVfs {
         }
         self.overlay
             .make_dir(path)
-            .map_err(|_| crate::dispatch::LINUX_EINVAL)
+            .map_err(|_| crate::linux_abi::LINUX_EINVAL)
     }
 
     fn unlink(&mut self, path: &str) -> Result<(), VfsError> {
@@ -615,12 +615,12 @@ impl Vfs for RootFsVfs {
             if rootfs_has_it {
                 self.overlay
                     .mark_deleted(path)
-                    .map_err(|_| crate::dispatch::LINUX_EINVAL)?;
+                    .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
             }
         } else if in_rootfs {
             self.overlay
                 .mark_deleted(path)
-                .map_err(|_| crate::dispatch::LINUX_EINVAL)?;
+                .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
         }
         Ok(())
     }
@@ -648,12 +648,12 @@ impl Vfs for RootFsVfs {
             if rootfs_has_it {
                 self.overlay
                     .mark_deleted(path)
-                    .map_err(|_| crate::dispatch::LINUX_EINVAL)?;
+                    .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
             }
         } else if in_rootfs {
             self.overlay
                 .mark_deleted(path)
-                .map_err(|_| crate::dispatch::LINUX_EINVAL)?;
+                .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
         }
         Ok(())
     }
