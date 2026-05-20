@@ -73,6 +73,12 @@ pub struct RealStat {
     /// from `kind`.
     pub mode: u32,
     pub size: u64,
+    /// Last-access time `(sec, nsec)` from the real on-disk inode.
+    pub atime: (i64, i64),
+    /// Last-modification time `(sec, nsec)` from the real on-disk inode.
+    pub mtime: (i64, i64),
+    /// Inode-change time `(sec, nsec)` from the real on-disk inode.
+    pub ctime: (i64, i64),
 }
 
 /// Trait every writable-layer backend implements. Methods are layer-
@@ -192,9 +198,56 @@ pub trait FsBackend: Send {
         Err(BackendError::Unsupported)
     }
 
+    /// Set the access/modification times of `path`. Each component is
+    /// `Some((sec, nsec))` to set an explicit time, or `None` to leave it
+    /// unchanged (UTIME_OMIT). The caller is responsible for resolving
+    /// UTIME_NOW to a concrete timestamp before calling. Default:
+    /// unsupported (the in-memory backend has no persistent timestamps).
+    fn set_times(
+        &mut self,
+        _path: &str,
+        _atime: Option<(i64, i64)>,
+        _mtime: Option<(i64, i64)>,
+    ) -> Result<(), BackendError> {
+        Err(BackendError::Unsupported)
+    }
+
+    /// Grow `path` so its size is at least `size` bytes (mode-0 fallocate /
+    /// posix_fallocate semantics: never shrinks). Default: unsupported.
+    fn allocate(&mut self, _path: &str, _size: u64) -> Result<(), BackendError> {
+        Err(BackendError::Unsupported)
+    }
+
     /// Read the target of a symlink at `path`. Default: not a symlink.
     fn read_link(&self, _path: &str) -> Option<String> {
         None
+    }
+
+    /// Set an extended attribute `name` to `value` on `path`. `flags` is the
+    /// Linux XATTR_CREATE/XATTR_REPLACE mask. Only the `user.*` namespace is
+    /// supported (the conformance-relevant namespace); other namespaces and
+    /// the in-memory backend return `Err(LINUX_ENOTSUP)` via the default.
+    fn set_xattr(
+        &mut self,
+        _path: &str,
+        _name: &str,
+        _value: &[u8],
+        _flags: i32,
+    ) -> Result<(), i32> {
+        Err(crate::dispatch::LINUX_ENOTSUP)
+    }
+
+    /// Read the extended attribute `name` on `path`. Returns the raw value
+    /// bytes. `Err(LINUX_ENODATA)` if absent. Default: unsupported.
+    fn get_xattr(&self, _path: &str, _name: &str) -> Result<Vec<u8>, i32> {
+        Err(crate::dispatch::LINUX_ENOTSUP)
+    }
+
+    /// List the `user.*` extended attribute names on `path` (names only, no
+    /// trailing NUL — the caller assembles the NUL-separated list). Default:
+    /// unsupported.
+    fn list_xattr(&self, _path: &str) -> Result<Vec<String>, i32> {
+        Err(crate::dispatch::LINUX_ENOTSUP)
     }
 
     /// Read the REAL on-disk stat for `path` (type + hard-link count +
@@ -940,6 +993,71 @@ impl FsBackend for HostFsBackend {
             .map_err(|_| BackendError::Io)
     }
 
+    fn set_times(
+        &mut self,
+        path: &str,
+        atime: Option<(i64, i64)>,
+        mtime: Option<(i64, i64)>,
+    ) -> Result<(), BackendError> {
+        let normalized = normalize(path).ok_or(BackendError::Invalid)?;
+        if self.tombstones.contains(&normalized) {
+            return Err(BackendError::Invalid);
+        }
+        // Open a real kernel fd for the materialised file and drive
+        // `futimens(2)` directly. cap-std has no set-times API, but the
+        // whole rootfs lives on the cap-std scratch, so a raw fd lets us
+        // persist atime/mtime where a later stat (which reads real disk
+        // metadata via real_stat) will see them.
+        let host_fd = self.open_raw_fd(path, false, false, false).ok_or(BackendError::Io)?;
+        // `None` (UTIME_OMIT) leaves the component untouched.
+        let to_ts = |t: Option<(i64, i64)>| match t {
+            Some((sec, nsec)) => libc::timespec {
+                tv_sec: sec as libc::time_t,
+                tv_nsec: nsec as libc::c_long,
+            },
+            None => libc::timespec {
+                tv_sec: 0,
+                tv_nsec: libc::UTIME_OMIT,
+            },
+        };
+        let times = [to_ts(atime), to_ts(mtime)];
+        let rc = unsafe { libc::futimens(host_fd, times.as_ptr()) };
+        let err = if rc < 0 { Err(BackendError::Io) } else { Ok(()) };
+        unsafe { libc::close(host_fd) };
+        err
+    }
+
+    fn allocate(&mut self, path: &str, size: u64) -> Result<(), BackendError> {
+        let normalized = normalize(path).ok_or(BackendError::Invalid)?;
+        if self.tombstones.contains(&normalized) {
+            return Err(BackendError::Invalid);
+        }
+        // mode-0 fallocate only ever grows the file. Open the real fd and
+        // `ftruncate` up to `size` if the file is currently smaller; never
+        // shrink (posix_fallocate semantics).
+        let host_fd = self.open_raw_fd(path, true, false, false).ok_or(BackendError::Io)?;
+        let cur = {
+            let mut st: libc::stat = unsafe { core::mem::zeroed() };
+            if unsafe { libc::fstat(host_fd, &mut st) } < 0 {
+                unsafe { libc::close(host_fd) };
+                return Err(BackendError::Io);
+            }
+            st.st_size as u64
+        };
+        let err = if size > cur {
+            let rc = unsafe { libc::ftruncate(host_fd, size as libc::off_t) };
+            if rc < 0 {
+                Err(BackendError::Io)
+            } else {
+                Ok(())
+            }
+        } else {
+            Ok(())
+        };
+        unsafe { libc::close(host_fd) };
+        err
+    }
+
     fn read_link(&self, path: &str) -> Option<String> {
         let normalized = normalize(path)?;
         let rel = Self::rel_path(&normalized)?;
@@ -947,19 +1065,190 @@ impl FsBackend for HostFsBackend {
         Some(target.to_string_lossy().into_owned())
     }
 
+    fn set_xattr(
+        &mut self,
+        path: &str,
+        name: &str,
+        value: &[u8],
+        flags: i32,
+    ) -> Result<(), i32> {
+        // Only the Linux `user.*` namespace is modelled. Anything else
+        // (security.*, trusted.*, system.*) reports unsupported, matching
+        // what an unprivileged guest typically sees and keeping the host's
+        // own attribute namespaces out of the picture.
+        if !name.starts_with("user.") {
+            return Err(crate::dispatch::LINUX_ENOTSUP);
+        }
+        // Open a real kernel fd for the materialised file (same approach as
+        // `set_times`/`allocate`) and drive macOS `fsetxattr(2)` on it. The
+        // attribute name is stored verbatim ("user.foo"), so a later
+        // list/get round-trips the exact Linux name.
+        let host_fd = self
+            .open_raw_fd(path, true, false, false)
+            .ok_or(crate::dispatch::LINUX_ENODATA)?;
+        let cname = match std::ffi::CString::new(name) {
+            Ok(c) => c,
+            Err(_) => {
+                unsafe { libc::close(host_fd) };
+                return Err(crate::dispatch::LINUX_EINVAL);
+            }
+        };
+        // Translate Linux XATTR_CREATE/XATTR_REPLACE to the macOS options
+        // (same semantics, different numeric values).
+        let mut opts: libc::c_int = 0;
+        if flags & crate::dispatch::LINUX_XATTR_CREATE != 0 {
+            opts |= libc::XATTR_CREATE;
+        }
+        if flags & crate::dispatch::LINUX_XATTR_REPLACE != 0 {
+            opts |= libc::XATTR_REPLACE;
+        }
+        let rc = unsafe {
+            libc::fsetxattr(
+                host_fd,
+                cname.as_ptr(),
+                value.as_ptr() as *const libc::c_void,
+                value.len() as libc::size_t,
+                0,
+                opts,
+            )
+        };
+        let err = if rc < 0 {
+            Err(crate::dispatch::host_errno())
+        } else {
+            Ok(())
+        };
+        unsafe { libc::close(host_fd) };
+        err
+    }
+
+    fn get_xattr(&self, path: &str, name: &str) -> Result<Vec<u8>, i32> {
+        if !name.starts_with("user.") {
+            return Err(crate::dispatch::LINUX_ENODATA);
+        }
+        let host_fd = self
+            .open_raw_fd(path, false, false, false)
+            .ok_or(crate::dispatch::LINUX_ENODATA)?;
+        let cname = match std::ffi::CString::new(name) {
+            Ok(c) => c,
+            Err(_) => {
+                unsafe { libc::close(host_fd) };
+                return Err(crate::dispatch::LINUX_EINVAL);
+            }
+        };
+        // First call with size 0 to learn the value length.
+        let needed = unsafe {
+            libc::fgetxattr(
+                host_fd,
+                cname.as_ptr(),
+                std::ptr::null_mut(),
+                0,
+                0,
+                0,
+            )
+        };
+        if needed < 0 {
+            let err = crate::dispatch::host_errno();
+            unsafe { libc::close(host_fd) };
+            return Err(err);
+        }
+        let mut buf = vec![0u8; needed as usize];
+        let n = unsafe {
+            libc::fgetxattr(
+                host_fd,
+                cname.as_ptr(),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len() as libc::size_t,
+                0,
+                0,
+            )
+        };
+        let result = if n < 0 {
+            Err(crate::dispatch::host_errno())
+        } else {
+            buf.truncate(n as usize);
+            Ok(buf)
+        };
+        unsafe { libc::close(host_fd) };
+        result
+    }
+
+    fn list_xattr(&self, path: &str) -> Result<Vec<String>, i32> {
+        let host_fd = self
+            .open_raw_fd(path, false, false, false)
+            .ok_or(crate::dispatch::LINUX_ENODATA)?;
+        // macOS may surface its own attribute names (e.g. resource forks);
+        // we read the full NUL-separated list then filter to `user.*` so the
+        // result is exactly the Linux-conformant namespace the guest set.
+        let needed = unsafe { libc::flistxattr(host_fd, std::ptr::null_mut(), 0, 0) };
+        if needed < 0 {
+            let err = crate::dispatch::host_errno();
+            unsafe { libc::close(host_fd) };
+            return Err(err);
+        }
+        let mut buf = vec![0u8; needed as usize];
+        let n = unsafe {
+            libc::flistxattr(
+                host_fd,
+                buf.as_mut_ptr() as *mut libc::c_char,
+                buf.len() as libc::size_t,
+                0,
+            )
+        };
+        unsafe { libc::close(host_fd) };
+        if n < 0 {
+            return Err(crate::dispatch::host_errno());
+        }
+        buf.truncate(n as usize);
+        let names = buf
+            .split(|&b| b == 0)
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| std::str::from_utf8(s).ok())
+            .filter(|s| s.starts_with("user."))
+            .map(|s| s.to_owned())
+            .collect();
+        Ok(names)
+    }
+
     fn real_stat(&self, path: &str, follow: bool) -> Option<RealStat> {
         use cap_std::fs::MetadataExt;
-        let normalized = normalize(path)?;
+        let mut normalized = normalize(path)?;
         if self.tombstones.contains(&normalized) {
             return None;
         }
-        let rel = Self::rel_path(&normalized)?;
         // lstat (`follow == false`) reports the link itself; stat
-        // (`follow == true`) reports the target. cap-std's `metadata`
-        // follows symlinks, `symlink_metadata` does not.
+        // (`follow == true`) reports the target. We follow symlinks
+        // MANUALLY rather than via cap-std's `metadata`, because cap-std
+        // refuses to traverse an ABSOLUTE symlink target (it treats it as
+        // a sandbox escape). Resolving by hand lets an absolute target
+        // like `/tmp/dd` be interpreted relative to the guest root.
         let meta = if follow {
-            self.dir.metadata(rel).ok()?
+            let mut hops = 0u32;
+            loop {
+                let rel = Self::rel_path(&normalized)?;
+                let m = self.dir.symlink_metadata(rel).ok()?;
+                if !m.is_symlink() {
+                    break m;
+                }
+                if hops >= 40 {
+                    // ELOOP guard.
+                    return None;
+                }
+                hops += 1;
+                let target = self.dir.read_link_contents(rel).ok()?;
+                normalized = if target.is_absolute() {
+                    // Absolute target → relative to the guest root.
+                    normalize(&target.to_string_lossy())?
+                } else {
+                    // Relative target → relative to the link's parent dir.
+                    let parent = normalized.parent().unwrap_or_else(|| Path::new(""));
+                    normalize(&parent.join(&target).to_string_lossy())?
+                };
+                if self.tombstones.contains(&normalized) {
+                    return None;
+                }
+            }
         } else {
+            let rel = Self::rel_path(&normalized)?;
             self.dir.symlink_metadata(rel).ok()?
         };
         let kind = if meta.is_dir() {
@@ -980,6 +1269,9 @@ impl FsBackend for HostFsBackend {
             nlink: meta.nlink() as u32,
             mode: if mode == 0 { default_mode } else { mode },
             size: meta.len(),
+            atime: (meta.atime(), meta.atime_nsec()),
+            mtime: (meta.mtime(), meta.mtime_nsec()),
+            ctime: (meta.ctime(), meta.ctime_nsec()),
         })
     }
 
