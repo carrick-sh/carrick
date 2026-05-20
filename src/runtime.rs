@@ -600,7 +600,7 @@ fn load_execve_image(
     argv: Vec<String>,
     env: Vec<String>,
 ) -> Result<AddressSpace, i32> {
-    use crate::dispatch::LINUX_ENOENT;
+    use crate::linux_abi::LINUX_ENOENT;
     let mut argv = if argv.is_empty() {
         vec![path.to_string()]
     } else {

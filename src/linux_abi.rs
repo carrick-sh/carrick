@@ -875,6 +875,302 @@ kernel_abi!(LinuxRusage, core::mem::size_of::<LinuxRusage>(), "rusage layout mat
 kernel_abi!(LinuxSigaltstack, 24, "stack_t is ss_sp:u64 + ss_flags:i32 + ss_size:u64 (with 4-byte pad)");
 kernel_abi!(LinuxDirent64Header, 19, "dirent64 fixed header is d_ino+d_off+d_reclen+d_type");
 
+
+// ===== ABI constants moved from dispatch.rs (Goal #3, pub set) =====
+pub const LINUX_EPERM: i32 = 1;
+pub const LINUX_ENOENT: i32 = 2;
+pub const LINUX_ESRCH: i32 = 3;
+pub const LINUX_EBADF: i32 = 9;
+pub const LINUX_ECHILD: i32 = 10;
+pub const LINUX_EAGAIN: i32 = 11;
+pub const LINUX_EINTR: i32 = 4;
+pub const LINUX_ENOMEM: i32 = 12;
+pub const LINUX_EACCES: i32 = 13;
+pub const LINUX_EFAULT: i32 = 14;
+pub const LINUX_EEXIST: i32 = 17;
+pub const LINUX_EPIPE: i32 = 32;
+pub const LINUX_ESPIPE: i32 = 29;
+pub const LINUX_EROFS: i32 = 30;
+pub const LINUX_ENOTSUP: i32 = 95;
+pub const LINUX_ENOTSOCK: i32 = 88;
+pub const LINUX_ENOPROTOOPT: i32 = 92;
+pub const LINUX_ESOCKTNOSUPPORT: i32 = 94;
+// Linux's `type & SOCK_NONBLOCK` and `& SOCK_CLOEXEC` bits sit in the
+// type argument to socket(2)/socketpair(2)/accept4(2). macOS doesn't
+// have these; we strip them before calling libc and apply the effect
+// (O_NONBLOCK, FD_CLOEXEC) by hand.
+pub const LINUX_SOCK_NONBLOCK: i32 = 0o4000;
+pub const LINUX_SOCK_CLOEXEC: i32 = 0o2000000;
+// Linux `sockaddr_storage` is 128 bytes. We use the same upper bound
+// when round-tripping addresses through host syscalls.
+pub const LINUX_SOCKADDR_STORAGE_SIZE: usize = 128;
+pub const LINUX_FALLOC_FL_KEEP_SIZE: u64 = 0x01;
+pub const LINUX_FALLOC_FL_PUNCH_HOLE: u64 = 0x02;
+pub const LINUX_FALLOC_FL_COLLAPSE_RANGE: u64 = 0x08;
+pub const LINUX_FALLOC_FL_ZERO_RANGE: u64 = 0x10;
+pub const LINUX_FALLOC_FL_INSERT_RANGE: u64 = 0x20;
+pub const LINUX_FALLOC_FL_UNSHARE_RANGE: u64 = 0x40;
+pub const LINUX_FALLOC_FL_SUPPORTED: u64 = LINUX_FALLOC_FL_KEEP_SIZE
+    | LINUX_FALLOC_FL_PUNCH_HOLE
+    | LINUX_FALLOC_FL_COLLAPSE_RANGE
+    | LINUX_FALLOC_FL_ZERO_RANGE
+    | LINUX_FALLOC_FL_INSERT_RANGE
+    | LINUX_FALLOC_FL_UNSHARE_RANGE;
+pub const LINUX_ENOTDIR: i32 = 20;
+pub const LINUX_EISDIR: i32 = 21;
+pub const LINUX_EINVAL: i32 = 22;
+pub const LINUX_ENOTTY: i32 = 25;
+pub const LINUX_ERANGE: i32 = 34;
+pub const LINUX_ENAMETOOLONG: i32 = 36;
+pub const LINUX_ENOSYS: i32 = 38;
+pub const LINUX_ENODATA: i32 = 61;
+pub const LINUX_E2BIG: i32 = 7;
+// Linux setxattr(2) flags. Same semantics as the macOS XATTR_CREATE/
+// XATTR_REPLACE options (which carry different numeric values).
+pub const LINUX_XATTR_CREATE: i32 = 0x1;
+pub const LINUX_XATTR_REPLACE: i32 = 0x2;
+pub const LINUX_ETIMEDOUT: i32 = 110;
+pub const LINUX_AT_FDCWD: u64 = (-100_i64) as u64;
+pub const LINUX_AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+pub const LINUX_AT_EACCESS: u64 = 0x200;
+pub const LINUX_AT_EMPTY_PATH: u64 = 0x1000;
+pub const LINUX_AT_REMOVEDIR: u64 = 0x200;
+pub const LINUX_AT_NO_AUTOMOUNT: u64 = 0x800;
+pub const LINUX_AT_STATX_FORCE_SYNC: u64 = 0x2000;
+pub const LINUX_AT_STATX_DONT_SYNC: u64 = 0x4000;
+pub const LINUX_UTIME_NOW: i64 = (1 << 30) - 1;
+pub const LINUX_UTIME_OMIT: i64 = (1 << 30) - 2;
+pub const LINUX_R_OK: u64 = 4;
+pub const LINUX_W_OK: u64 = 2;
+pub const LINUX_X_OK: u64 = 1;
+pub const LINUX_F_DUPFD: u64 = 0;
+pub const LINUX_F_GETFD: u64 = 1;
+pub const LINUX_F_SETFD: u64 = 2;
+pub const LINUX_F_GETFL: u64 = 3;
+pub const LINUX_F_SETFL: u64 = 4;
+pub const LINUX_F_GETLK: u64 = 5;
+pub const LINUX_F_SETLK: u64 = 6;
+pub const LINUX_F_SETLKW: u64 = 7;
+pub const LINUX_F_OFD_GETLK: u64 = 36;
+pub const LINUX_F_OFD_SETLK: u64 = 37;
+pub const LINUX_F_OFD_SETLKW: u64 = 38;
+pub const LINUX_F_DUPFD_CLOEXEC: u64 = 1030;
+pub const LINUX_F_GETPIPE_SZ: u64 = 1032;
+pub const LINUX_F_ADD_SEALS: u64 = 1033;
+pub const LINUX_F_GET_SEALS: u64 = 1034;
+pub const LINUX_FD_CLOEXEC: u64 = 1;
+pub const LINUX_SEEK_SET: u64 = 0;
+pub const LINUX_SEEK_CUR: u64 = 1;
+pub const LINUX_SEEK_END: u64 = 2;
+pub const LINUX_O_ACCMODE: u64 = 0b11;
+pub const LINUX_O_RDONLY: u64 = 0;
+pub const LINUX_O_WRONLY: u64 = 1;
+pub const LINUX_O_RDWR: u64 = 2;
+pub const LINUX_O_NONBLOCK: u64 = 0o4000;
+pub const LINUX_O_CLOEXEC: u64 = 0o2000000;
+pub const LINUX_O_CREAT: u64 = 0o100;
+pub const LINUX_O_EXCL: u64 = 0o200;
+pub const LINUX_O_TRUNC: u64 = 0o1000;
+pub const LINUX_O_APPEND: u64 = 0o2000;
+pub const LINUX_O_DIRECTORY: u64 = 0o200000;
+pub const LINUX_PROT_READ: u64 = 0x1;
+pub const LINUX_PROT_WRITE: u64 = 0x2;
+pub const LINUX_PROT_EXEC: u64 = 0x4;
+pub const LINUX_MAP_SHARED: u64 = 0x01;
+pub const LINUX_MAP_PRIVATE: u64 = 0x02;
+pub const LINUX_MAP_FIXED: u64 = 0x10;
+pub const LINUX_MAP_ANONYMOUS: u64 = 0x20;
+pub const LINUX_MADV_NORMAL: u64 = 0;
+pub const LINUX_MADV_RANDOM: u64 = 1;
+pub const LINUX_MADV_SEQUENTIAL: u64 = 2;
+pub const LINUX_MADV_WILLNEED: u64 = 3;
+pub const LINUX_MADV_DONTNEED: u64 = 4;
+pub const LINUX_MADV_FREE: u64 = 8;
+pub const LINUX_MREMAP_MAYMOVE: u64 = 0x01;
+pub const LINUX_MREMAP_FIXED: u64 = 0x02;
+pub const LINUX_MREMAP_DONTUNMAP: u64 = 0x04;
+pub const LINUX_MS_ASYNC: u64 = 0x01;
+pub const LINUX_MS_INVALIDATE: u64 = 0x02;
+pub const LINUX_MS_SYNC: u64 = 0x04;
+pub const LINUX_MCL_CURRENT: u64 = 0x01;
+pub const LINUX_MCL_FUTURE: u64 = 0x02;
+pub const LINUX_MCL_ONFAULT: u64 = 0x04;
+pub const LINUX_PRIO_PROCESS: u64 = 0;
+pub const LINUX_PRIO_PGRP: u64 = 1;
+pub const LINUX_PRIO_USER: u64 = 2;
+pub const LINUX_DEFAULT_UMASK: u32 = 0o022;
+pub const LINUX_RLIM_INFINITY: u64 = u64::MAX;
+pub const LINUX_RUSAGE_SELF: i32 = 0;
+pub const LINUX_RUSAGE_CHILDREN: i32 = -1;
+pub const LINUX_RUSAGE_THREAD: i32 = 1;
+pub const LINUX_CLK_TCK: i64 = 100;
+pub const LINUX_OVERLAYFS_SUPER_MAGIC: i64 = 0x794c7630;
+pub const LINUX_EAFNOSUPPORT: i32 = 97;
+
+
+// ===== ABI constants moved from dispatch.rs (Goal #3, private set, now pub) =====
+pub const LINUX_EFD_SEMAPHORE: u64 = 0x1;
+pub const LINUX_EFD_NONBLOCK: u64 = LINUX_O_NONBLOCK;
+pub const LINUX_EFD_CLOEXEC: u64 = LINUX_O_CLOEXEC;
+pub const LINUX_EPOLL_CLOEXEC: u64 = LINUX_O_CLOEXEC;
+pub const LINUX_EPOLL_CTL_ADD: u64 = 1;
+pub const LINUX_EPOLL_CTL_DEL: u64 = 2;
+pub const LINUX_EPOLL_CTL_MOD: u64 = 3;
+pub const LINUX_EPOLLIN: u32 = 0x001;
+pub const LINUX_EPOLLPRI: u32 = 0x002;
+pub const LINUX_EPOLLOUT: u32 = 0x004;
+pub const LINUX_EPOLLERR: u32 = 0x008;
+pub const LINUX_EPOLLHUP: u32 = 0x010;
+pub const LINUX_LOCK_SH: u64 = 1;
+pub const LINUX_LOCK_EX: u64 = 2;
+pub const LINUX_LOCK_NB: u64 = 4;
+pub const LINUX_LOCK_UN: u64 = 8;
+pub const LINUX_POLLIN: i16 = 0x0001;
+pub const LINUX_POLLOUT: i16 = 0x0004;
+pub const LINUX_POLLERR: i16 = 0x0008;
+pub const LINUX_POLLHUP: i16 = 0x0010;
+pub const LINUX_POLLNVAL: i16 = 0x0020;
+pub const LINUX_TFD_NONBLOCK: u64 = LINUX_O_NONBLOCK;
+pub const LINUX_TFD_CLOEXEC: u64 = LINUX_O_CLOEXEC;
+pub const LINUX_TIMER_ABSTIME: u64 = 0x1;
+pub const LINUX_SPLICE_F_MOVE: u64 = 0x1;
+pub const LINUX_SPLICE_F_NONBLOCK: u64 = 0x2;
+pub const LINUX_SPLICE_F_MORE: u64 = 0x4;
+pub const LINUX_SPLICE_F_GIFT: u64 = 0x8;
+pub const LINUX_SPLICE_SUPPORTED_FLAGS: u64 =
+    LINUX_SPLICE_F_MOVE | LINUX_SPLICE_F_NONBLOCK | LINUX_SPLICE_F_MORE | LINUX_SPLICE_F_GIFT;
+pub const LINUX_FUTEX_WAIT: u64 = 0;
+pub const LINUX_FUTEX_WAKE: u64 = 1;
+pub const LINUX_FUTEX_CMD_MASK: u64 = 0x7f;
+pub const LINUX_FUTEX_PRIVATE_FLAG: u64 = 128;
+pub const LINUX_FUTEX_CLOCK_REALTIME: u64 = 256;
+pub const LINUX_MEMBARRIER_CMD_QUERY: u64 = 0;
+pub const LINUX_TCGETS: u64 = 0x5401;
+pub const LINUX_TCSETS: u64 = 0x5402;
+pub const LINUX_TCSETSW: u64 = 0x5403;
+pub const LINUX_TCSETSF: u64 = 0x5404;
+pub const LINUX_TIOCSCTTY: u64 = 0x540E;
+pub const LINUX_TIOCGPGRP: u64 = 0x540F;
+pub const LINUX_TIOCSPGRP: u64 = 0x5410;
+pub const LINUX_TIOCGWINSZ: u64 = 0x5413;
+pub const LINUX_FIONREAD: u64 = 0x541B;
+pub const LINUX_FIONBIO: u64 = 0x5421;
+pub const LINUX_TIOCNOTTY: u64 = 0x5422;
+pub const LINUX_TIOCGSID: u64 = 0x5429;
+pub const LINUX_BOOTSTRAP_PGID: i32 = 1;
+pub const LINUX_BOOTSTRAP_SID: i32 = 1;
+pub const LINUX_PIPE_BUF_SIZE: i64 = 65_536;
+pub const LINUX_RT_SIGSET_SIZE: u64 = 8;
+pub const LINUX_MAX_SIGNUM: u64 = 64;
+pub const LINUX_SIGKILL: i32 = 9;
+pub const LINUX_SIGSTOP: i32 = 19;
+/// `how` argument values for `rt_sigprocmask`.
+pub const LINUX_SIG_BLOCK: u64 = 0;
+pub const LINUX_SIG_UNBLOCK: u64 = 1;
+pub const LINUX_SIG_SETMASK: u64 = 2;
+pub const LINUX_BOOTSTRAP_PID: u64 = 1;
+pub const LINUX_SS_ONSTACK: u64 = 1;
+pub const LINUX_SS_DISABLE: u64 = 2;
+pub const LINUX_MINSIGSTKSZ: u64 = 2048;
+pub const LINUX_BOOTSTRAP_AFFINITY_BYTES: usize = 8;
+pub const LINUX_CLOCK_REALTIME: u64 = 0;
+pub const LINUX_CLOCK_MONOTONIC: u64 = 1;
+pub const LINUX_CLOCK_PROCESS_CPUTIME_ID: u64 = 2;
+pub const LINUX_CLOCK_THREAD_CPUTIME_ID: u64 = 3;
+pub const LINUX_CLOCK_MONOTONIC_RAW: u64 = 4;
+pub const LINUX_CLOCK_REALTIME_COARSE: u64 = 5;
+pub const LINUX_CLOCK_MONOTONIC_COARSE: u64 = 6;
+pub const LINUX_CLOCK_BOOTTIME: u64 = 7;
+pub const LINUX_CLOCK_REALTIME_ALARM: u64 = 8;
+pub const LINUX_CLOCK_BOOTTIME_ALARM: u64 = 9;
+pub const LINUX_CLOCK_TAI: u64 = 11;
+pub const LINUX_CLOCK_RESOLUTION_NSEC: i64 = 1_000_000;
+pub const LINUX_ITIMER_REAL: u64 = 0;
+pub const LINUX_ITIMER_VIRTUAL: u64 = 1;
+pub const LINUX_ITIMER_PROF: u64 = 2;
+pub const LINUX_TASK_COMM_LEN: usize = 16;
+pub const LINUX_CAPABILITY_VERSION_1: u32 = 0x1998_0330;
+pub const LINUX_CAPABILITY_VERSION_2: u32 = 0x2007_1026;
+pub const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+pub const LINUX_PERSONALITY_QUERY: u64 = 0xffff_ffff;
+pub const LINUX_PR_GET_DUMPABLE: u64 = 3;
+pub const LINUX_PR_SET_DUMPABLE: u64 = 4;
+pub const LINUX_PR_SET_NAME: u64 = 15;
+pub const LINUX_PR_GET_NAME: u64 = 16;
+pub const LINUX_P_ALL: u64 = 0;
+pub const LINUX_P_PID: u64 = 1;
+pub const LINUX_P_PGID: u64 = 2;
+pub const LINUX_P_PIDFD: u64 = 3;
+pub const LINUX_WNOHANG: u64 = 1;
+pub const LINUX_WUNTRACED: u64 = 2;
+pub const LINUX_WSTOPPED: u64 = 2;
+pub const LINUX_WEXITED: u64 = 4;
+pub const LINUX_WCONTINUED: u64 = 8;
+pub const LINUX_WNOWAIT: u64 = 0x0100_0000;
+pub const LINUX_WAITID_STATE_MASK: u64 = LINUX_WEXITED | LINUX_WSTOPPED | LINUX_WCONTINUED;
+pub const LINUX_WAITID_SUPPORTED_FLAGS: u64 = LINUX_WAITID_STATE_MASK | LINUX_WNOHANG | LINUX_WNOWAIT;
+pub const LINUX_WCLONE: u64 = 0x8000_0000;
+pub const LINUX_WALL: u64 = 0x4000_0000;
+pub const LINUX_WNOTHREAD: u64 = 0x2000_0000;
+pub const LINUX_WAIT4_SUPPORTED_FLAGS: u64 = LINUX_WNOHANG
+    | LINUX_WUNTRACED
+    | LINUX_WCONTINUED
+    | LINUX_WCLONE
+    | LINUX_WALL
+    | LINUX_WNOTHREAD;
+pub const LINUX_STATX_BASIC_STATS: u32 = 0x7ff;
+pub const LINUX_STATX_RESERVED: u64 = 0x8000_0000;
+pub const LINUX_IOV_MAX: usize = 1024;
+pub const LINUX_OPEN_HOW_SIZE: u64 = core::mem::size_of::<LinuxOpenHow>() as u64;
+/// Linux AF_* values for the families we support. Linux constants happen
+/// to overlap with macOS's only for AF_UNSPEC / AF_UNIX / AF_INET — the
+/// AF_INET6 numeric value differs (Linux: 10, macOS: 30).
+pub const LINUX_AF_UNSPEC: i32 = 0;
+pub const LINUX_AF_UNIX: i32 = 1;
+pub const LINUX_AF_INET: i32 = 2;
+pub const LINUX_AF_INET6: i32 = 10;
+pub const LINUX_AF_NETLINK: i32 = 16;
+pub const LINUX_AF_PACKET: i32 = 17;
+pub const LINUX_SOCK_STREAM: i32 = 1;
+pub const LINUX_SOCK_DGRAM: i32 = 2;
+pub const LINUX_SOCK_RAW: i32 = 3;
+pub const LINUX_SOCK_SEQPACKET: i32 = 5;
+pub const LINUX_MSG_OOB: i32 = 0x0001;
+pub const LINUX_MSG_PEEK: i32 = 0x0002;
+pub const LINUX_MSG_DONTROUTE: i32 = 0x0004;
+pub const LINUX_MSG_TRUNC: i32 = 0x0020;
+pub const LINUX_MSG_DONTWAIT: i32 = 0x0040;
+pub const LINUX_MSG_EOR: i32 = 0x0080;
+pub const LINUX_MSG_WAITALL: i32 = 0x0100;
+pub const LINUX_MSG_NOSIGNAL: i32 = 0x4000;
+pub const LINUX_MSG_CMSG_CLOEXEC: i32 = 0x4000_0000_u32 as i32;
+// Linux socket option levels and names. Linux numbers them as small
+// integers (SOL_SOCKET=1) while macOS reuses the IPPROTO/SO scheme
+// (SOL_SOCKET=0xffff). We translate explicitly for the most common
+// options the guest will throw at us. Anything we don't recognise
+// returns `None` and the caller surfaces ENOPROTOOPT.
+pub const LINUX_SOL_SOCKET: i32 = 1;
+pub const LINUX_SOL_IP: i32 = 0; // IPPROTO_IP
+pub const LINUX_SOL_TCP: i32 = 6; // IPPROTO_TCP
+pub const LINUX_SOL_UDP: i32 = 17; // IPPROTO_UDP
+pub const LINUX_SOL_IPV6: i32 = 41; // IPPROTO_IPV6
+
+pub const LINUX_SO_DEBUG: i32 = 1;
+pub const LINUX_SO_REUSEADDR: i32 = 2;
+pub const LINUX_SO_TYPE: i32 = 3;
+pub const LINUX_SO_ERROR: i32 = 4;
+pub const LINUX_SO_DONTROUTE: i32 = 5;
+pub const LINUX_SO_BROADCAST: i32 = 6;
+pub const LINUX_SO_SNDBUF: i32 = 7;
+pub const LINUX_SO_RCVBUF: i32 = 8;
+pub const LINUX_SO_KEEPALIVE: i32 = 9;
+pub const LINUX_SO_OOBINLINE: i32 = 10;
+pub const LINUX_SO_LINGER: i32 = 13;
+pub const LINUX_SO_REUSEPORT: i32 = 15;
+pub const LINUX_SO_RCVTIMEO: i32 = 20;
+pub const LINUX_SO_SNDTIMEO: i32 = 21;
+pub const LINUX_SO_ACCEPTCONN: i32 = 30;
+
 #[cfg(test)]
 mod kernel_abi_tests {
     use super::*;
