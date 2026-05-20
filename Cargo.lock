@@ -294,7 +294,6 @@ dependencies = [
  "camino",
  "cap-std",
  "clap",
- "core-foundation-sys",
  "fd-lock",
  "flate2",
  "futures-util",
