@@ -212,16 +212,28 @@ fn unknown_syscalls_are_explicit() {
 
 #[test]
 fn dispatch_declares_no_abi_constants() {
-    let src = include_str!("../src/dispatch.rs");
-    // dispatch.rs must import top-level ABI constants from linux_abi.rs,
-    // never declare them. We check module-level (column-0) items only;
-    // function-body `const` locals (e.g. ad-hoc SYS_* inside a probe fn)
+    // The dispatcher now lives in a `src/dispatch/` module directory split
+    // by subsystem. Every file in it must import top-level ABI constants from
+    // linux_abi.rs, never declare them. We check module-level (column-0) items
+    // only; function-body `const` locals (e.g. ad-hoc SYS_* inside a probe fn)
     // are not module ABI and are intentionally allowed.
-    for line in src.lines() {
-        assert!(
-            !(line.starts_with("pub const LINUX_") || line.starts_with("const LINUX_")
-              || line.starts_with("pub const SYS_") || line.starts_with("const SYS_")),
-            "top-level ABI constant declared in dispatch.rs — move it to linux_abi.rs: {line}",
-        );
+    let sources = [
+        include_str!("../src/dispatch/mod.rs"),
+        include_str!("../src/dispatch/fs.rs"),
+        include_str!("../src/dispatch/mem.rs"),
+        include_str!("../src/dispatch/signal.rs"),
+        include_str!("../src/dispatch/creds.rs"),
+        include_str!("../src/dispatch/net.rs"),
+        include_str!("../src/dispatch/time.rs"),
+        include_str!("../src/dispatch/proc.rs"),
+    ];
+    for src in sources {
+        for line in src.lines() {
+            assert!(
+                !(line.starts_with("pub const LINUX_") || line.starts_with("const LINUX_")
+                  || line.starts_with("pub const SYS_") || line.starts_with("const SYS_")),
+                "top-level ABI constant declared in dispatch module — move it to linux_abi.rs: {line}",
+            );
+        }
     }
 }
