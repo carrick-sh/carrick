@@ -14,6 +14,8 @@ fn main() {
     select_probe();
     timerfd_probe();
     poll_invalid_probe();
+    pipe2_nonblock_probe();
+    poll_multi_probe();
 }
 
 /// eventfd: create with initial value 0, write 5, read it back (read returns 5
@@ -256,6 +258,94 @@ fn poll_invalid_probe() {
         println!("poll_invalid=ERR:{}", errno());
     } else {
         println!("poll_invalid_nval={}", (pfd.revents & libc::POLLNVAL) != 0);
+    }
+}
+
+/// pipe2 with O_NONBLOCK: read on an empty pipe → EAGAIN; write then read →
+/// the data; closing the write-end then reading → 0 (EOF). Confirms the
+/// O_NONBLOCK flag propagated to the read-end (F_GETFL shows it).
+fn pipe2_nonblock_probe() {
+    let mut fds = [0i32; 2];
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK) } != 0 {
+        println!("pipe2_nb=ERR:{}", errno());
+        return;
+    }
+    let (rd, wr) = (fds[0], fds[1]);
+
+    // O_NONBLOCK is visible via F_GETFL on the read-end.
+    let fl = unsafe { libc::fcntl(rd, libc::F_GETFL) };
+    println!("pipe2_nb_flag={}", (fl & libc::O_NONBLOCK) != 0);
+
+    // Empty non-blocking read → EAGAIN.
+    let mut buf = [0u8; 16];
+    let r0 = unsafe { libc::read(rd, buf.as_mut_ptr() as *mut _, buf.len()) };
+    println!(
+        "pipe2_nb_empty_eagain={}",
+        r0 == -1 && errno() == libc::EAGAIN
+    );
+
+    // Write then read returns the data.
+    let msg = b"nbdata";
+    unsafe { libc::write(wr, msg.as_ptr() as *const _, msg.len()) };
+    let r1 = unsafe { libc::read(rd, buf.as_mut_ptr() as *mut _, buf.len()) };
+    let got = &buf[..r1.max(0) as usize];
+    println!("pipe2_nb_read_match={}", got == msg);
+
+    // Close write-end → read returns 0 (EOF), not EAGAIN.
+    unsafe { libc::close(wr) };
+    let r2 = unsafe { libc::read(rd, buf.as_mut_ptr() as *mut _, buf.len()) };
+    println!("pipe2_nb_eof={}", r2 == 0);
+
+    unsafe { libc::close(rd) };
+}
+
+/// poll over three fds at once: a pipe read-end that HAS data (POLLIN ready), a
+/// pipe write-end that HAS space (POLLOUT ready), and an invalid fd (POLLNVAL).
+/// Assert the ready COUNT (3 — one revent set per fd) and each fd's revents.
+fn poll_multi_probe() {
+    // Pipe 1: make the read-end readable.
+    let mut p1 = [0i32; 2];
+    if unsafe { libc::pipe2(p1.as_mut_ptr(), 0) } != 0 {
+        println!("poll_multi_pipe1=ERR:{}", errno());
+        return;
+    }
+    let (rd1, wr1) = (p1[0], p1[1]);
+    let msg = b"d";
+    unsafe { libc::write(wr1, msg.as_ptr() as *const _, msg.len()) };
+
+    // Pipe 2: a fresh, empty pipe — its write-end has space (POLLOUT ready).
+    let mut p2 = [0i32; 2];
+    if unsafe { libc::pipe2(p2.as_mut_ptr(), 0) } != 0 {
+        println!("poll_multi_pipe2=ERR:{}", errno());
+        unsafe { libc::close(rd1); libc::close(wr1) };
+        return;
+    }
+    let (rd2, wr2) = (p2[0], p2[1]);
+
+    let mut pfds = [
+        libc::pollfd { fd: rd1, events: libc::POLLIN, revents: 0 },
+        libc::pollfd { fd: wr2, events: libc::POLLOUT, revents: 0 },
+        libc::pollfd { fd: 9999, events: libc::POLLIN, revents: 0 },
+    ];
+    let rc = unsafe { libc::poll(pfds.as_mut_ptr(), 3, 50) };
+    if rc < 0 {
+        println!("poll_multi=ERR:{}", errno());
+    } else {
+        // All three fds report a revent → poll counts 3.
+        println!("poll_multi_ready_count={}", rc);
+        println!("poll_multi_rd_in={}", (pfds[0].revents & libc::POLLIN) != 0);
+        println!("poll_multi_wr_out={}", (pfds[1].revents & libc::POLLOUT) != 0);
+        println!(
+            "poll_multi_bad_nval={}",
+            (pfds[2].revents & libc::POLLNVAL) != 0
+        );
+    }
+
+    unsafe {
+        libc::close(rd1);
+        libc::close(wr1);
+        libc::close(rd2);
+        libc::close(wr2);
     }
 }
 
