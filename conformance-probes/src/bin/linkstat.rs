@@ -184,6 +184,65 @@ fn main() {
         }
     }
 
+    // -- PART C: fstatat/statx follow vs AT_SYMLINK_NOFOLLOW ----------------
+    //
+    // Symlink -> a REAL regular file. fstatat/statx WITHOUT nofollow resolve
+    // the target (S_IFREG); WITH AT_SYMLINK_NOFOLLOW report the link itself
+    // (S_IFLNK). This pins the recently-fixed nofollow type-bit handling.
+    {
+        // Create /tmp/lc_target (regular file) and /tmp/lc_link -> it.
+        let tpath = "/tmp/lc_target";
+        let tc = CString::new(tpath).unwrap();
+        let lpath = "/tmp/lc_link";
+        let lc = CString::new(lpath).unwrap();
+        unsafe { libc::unlink(lc.as_ptr()) };
+        {
+            let fd = open(tpath, libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC, 0o644);
+            if fd >= 0 {
+                let d = b"target-bytes";
+                unsafe { libc::write(fd, d.as_ptr() as *const _, d.len()) };
+                unsafe { libc::close(fd) };
+            }
+        }
+        let sl = unsafe { libc::symlinkat(tc.as_ptr(), libc::AT_FDCWD, lc.as_ptr()) };
+        if sl != 0 {
+            println!("c_symlink_setup=ERR:{}", errno());
+        }
+
+        // fstatat WITHOUT nofollow → follows to the regular-file target.
+        {
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            let rc = unsafe { libc::fstatat(libc::AT_FDCWD, lc.as_ptr(), &mut st, 0) };
+            if rc != 0 {
+                println!("c_fstatat_follow=ERR:{}", errno());
+            } else {
+                println!("c_fstatat_follow={}", type_token(st.st_mode));
+            }
+        }
+
+        // fstatat WITH AT_SYMLINK_NOFOLLOW → the link itself.
+        {
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            let rc = unsafe {
+                libc::fstatat(libc::AT_FDCWD, lc.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW)
+            };
+            if rc != 0 {
+                println!("c_fstatat_nofollow=ERR:{}", errno());
+            } else {
+                println!("c_fstatat_nofollow={}", type_token(st.st_mode));
+            }
+        }
+
+        // statx WITHOUT nofollow → the regular-file target.
+        println!("c_statx_follow={}", statx_type(lpath, 0));
+
+        // statx WITH AT_SYMLINK_NOFOLLOW → the link itself.
+        println!(
+            "c_statx_nofollow={}",
+            statx_type(lpath, libc::AT_SYMLINK_NOFOLLOW)
+        );
+    }
+
     // stdin (fd 0): DOCUMENTATION line — under the harness stdin is a pipe and
     // under `docker run -i` it is also a pipe ("fifo"); the token may differ
     // from a TTY/regular-file environment. Documented via the diff.
@@ -206,6 +265,52 @@ fn fstat_type(fd: i32) -> String {
         format!("ERR:{}", errno())
     } else {
         type_token(st.st_mode).to_string()
+    }
+}
+
+// musl's libc crate binding doesn't expose `statx`/`STATX_TYPE`, so issue the
+// raw syscall (aarch64 nr 291) against a locally-declared struct. Only the
+// fields up to stx_mode are read; the buffer is sized to the full 256-byte
+// kernel statx struct so the kernel never writes past it.
+const SYS_STATX: libc::c_long = 291;
+const STATX_TYPE: u32 = 0x0001;
+
+#[repr(C)]
+struct Statx {
+    stx_mask: u32,
+    stx_blksize: u32,
+    stx_attributes: u64,
+    stx_nlink: u32,
+    stx_uid: u32,
+    stx_gid: u32,
+    stx_mode: u16,
+    _spare0: u16,
+    // Remaining kernel fields (ino, size, blocks, timestamps, dev, ...) are
+    // unused here; pad to the full 256-byte statx struct. The header through
+    // _spare0 is 32 bytes (4+4+8+4+4+4+2+2).
+    _rest: [u8; 256 - 32],
+}
+
+/// statx a path with the given AT_* flags; return the S_IFMT type token from
+/// stx_mode, or "ERR:<errno>". Uses STATX_TYPE so only the type bits are
+/// required to be filled.
+fn statx_type(path: &str, flags: i32) -> String {
+    let c = CString::new(path).unwrap();
+    let mut stx: Statx = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::syscall(
+            SYS_STATX,
+            libc::AT_FDCWD,
+            c.as_ptr(),
+            flags,
+            STATX_TYPE,
+            &mut stx as *mut Statx,
+        )
+    };
+    if rc != 0 {
+        format!("ERR:{}", errno())
+    } else {
+        type_token(stx.stx_mode as libc::mode_t).to_string()
     }
 }
 

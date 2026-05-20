@@ -24,8 +24,56 @@ fn main() {
     }
 
     section_a_mremap_grow();
+    section_a2_mremap_nomaymove();
     section_b_shared_coherence();
     section_c_edges();
+}
+
+// ---------------------------------------------------------------------------
+// A2 — mremap grow WITHOUT MREMAP_MAYMOVE that cannot extend in place.
+//
+// One mmap of 3 contiguous pages gives us a region where the page directly
+// above page 0 is already mapped (page 1). Asking to grow JUST page 0 to two
+// pages WITHOUT MREMAP_MAYMOVE cannot extend in place (page 1 is occupied) and
+// must fail with ENOMEM — no MAP_FIXED needed, so this is portable & robust.
+// Then growing page 0 WITH MREMAP_MAYMOVE succeeds, preserving its byte.
+// ---------------------------------------------------------------------------
+fn section_a2_mremap_nomaymove() {
+    let base = mmap_anon(PAGE * 3);
+    if base.is_null() {
+        println!("a2_mmap_base=ERR:{}", errno());
+        return;
+    }
+    fill_page(base, 0, 0xC1);
+
+    // Grow page 0 (1 page) to 2 pages WITHOUT MAYMOVE → blocked by page 1 → ENOMEM.
+    let r = unsafe { libc::mremap(base, PAGE, PAGE * 2, 0) };
+    println!(
+        "a2_grow_nomaymove_enomem={}",
+        r == libc::MAP_FAILED && errno() == libc::ENOMEM
+    );
+
+    // Grow page 0 WITH MAYMOVE → succeeds and preserves the original byte. The
+    // kernel may relocate, so use the returned pointer for the read-back.
+    let np = unsafe { libc::mremap(base, PAGE, PAGE * 2, libc::MREMAP_MAYMOVE) };
+    if np == libc::MAP_FAILED {
+        println!("a2_grow_maymove=ERR:{}", errno());
+        // base+page1,page2 still mapped; release them.
+        unsafe {
+            libc::munmap((base as *mut u8).add(PAGE) as *mut _, PAGE * 2);
+        }
+    } else {
+        println!("a2_grow_maymove_success={}", true);
+        println!(
+            "a2_grow_maymove_preserved={}",
+            page_first_last_eq(np, 0, 0xC1)
+        );
+        unsafe {
+            libc::munmap(np, PAGE * 2);
+            // page1 & page2 of the original region are untouched by the move.
+            libc::munmap((base as *mut u8).add(PAGE) as *mut _, PAGE * 2);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
