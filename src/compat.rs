@@ -12,14 +12,22 @@ impl From<[u64; 6]> for SyscallArgs {
     }
 }
 
-/// Snapshot of the guest's key aarch64 registers at a trap, passed to
-/// the `vcpu__trap` USDT probe by reference. usdt JSON-encodes any
-/// `&T: Serialize`, so bundling registers into one struct sidesteps
-/// the 6-argument-per-probe ceiling (we'd otherwise have to choose
-/// between PC, SP, FP, LR, x8 and the arg registers). DTrace consumers
-/// `copyinstr(arg)` the JSON: `{"pc":..,"sp":..,"fp":..,"lr":..,
-/// "x8":..,"x0":..}`. `fp` (x29) is what `guest_stack.d` follows to
-/// walk the guest call chain on frame-pointer builds.
+/// Snapshot of the guest's key aarch64 registers at a trap. Passed to
+/// the `vcpu__trap` USDT probe AS A RAW POINTER (the probe arg is the
+/// struct's address as a u64); DTrace does `copyin(arg0,
+/// sizeof(gregs_t))` and reads fields by offset as native u64s. We do
+/// NOT use usdt's `Serialize`→JSON path here: this probe fires on
+/// every syscall, so JSON-encoding to a string on each fire would be
+/// far too expensive, and `json()`+`strtoll` in D can't even round-
+/// trip a full u64 (it parses signed, overflowing past i63). A
+/// `#[repr(C)]` struct read directly is both faster and exact.
+///
+/// `fp` (x29) is the head of the AAPCS64 frame-pointer chain;
+/// `stack_guest_base`/`stack_host_base` let a consumer translate stack
+/// VAs to host addresses and `copyin` frames. Field ORDER and `repr(C)`
+/// are load-bearing — the matching `gregs_t` in `guest_stack.d` mirrors
+/// this layout. Keep all fields u64 so offsets are a clean 8*index.
+#[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GuestRegs {
     pub pc: u64,
@@ -28,14 +36,24 @@ pub struct GuestRegs {
     pub lr: u64,
     pub x8: u64,
     pub x0: u64,
-    /// Wrapping offset that maps a guest virtual address in the
-    /// stack's region to the host virtual address carrick mapped it
-    /// at: `host_va = guest_va.wrapping_add(stack_xlate)`. carrick
-    /// computes it at trap time from the region containing `sp`, so
-    /// `guest_stack.d` can `copyin` the frame-pointer chain directly
-    /// without a separate mapping table. 0 if `sp` isn't in any known
-    /// region (stack walk not possible).
-    pub stack_xlate: u64,
+    /// Base of the guest stack's mapped region (guest VA) and the host
+    /// VA carrick mapped it at. A DTrace consumer translates any stack
+    /// guest VA to its host address with
+    ///   `host = stack_host_base + (guest_va - stack_guest_base)`
+    /// then `copyin`s it. We expose the two bases SEPARATELY rather
+    /// than a single offset because the offset (`host_base -
+    /// guest_base`) wraps past i64::MAX when the stack sits high and
+    /// the host mapping sits low — and DTrace's `json()`+`strtoll`
+    /// parse signed, so a wrapping offset decodes to garbage. Both
+    /// bases individually fit in i64, so the subtraction-then-add in D
+    /// stays in range. Both 0 if `sp` isn't in any known region.
+    pub stack_guest_base: u64,
+    pub stack_host_base: u64,
+    /// Exclusive guest-VA end of the stack region, so a consumer can
+    /// bound-check a frame address before `copyin` (a frame-pointer
+    /// chain that walks off the end / into garbage otherwise produces
+    /// spurious copyin errors). 0 if no region.
+    pub stack_guest_end: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

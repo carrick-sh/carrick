@@ -1,111 +1,124 @@
 /*
  * guest_stack.d — walk the GUEST's aarch64 call stack at each syscall
- * trap, from the host side, using carrick's USDT probes.
+ * trap, entirely from DTrace, via carrick's `vcpu-trap` USDT probe.
  *
- * macOS DTrace has no `ustack()` helper for the guest (the guest isn't
- * a host process — it's code running inside an HVF vCPU whose memory
- * carrick maps into its own address space). So we reconstruct the
- * guest call chain ourselves from the `carrick*:::vcpu-trap` probe.
+ * macOS DTrace has no `ustack()` for the guest (it runs inside an HVF
+ * vCPU, not as a host process). But carrick maps the guest's RAM into
+ * its own address space, so DTrace `copyin` CAN read it — provided we
+ * hand it the correct host address.
  *
- * The probe carries a `GuestRegs` JSON snapshot:
- *   {"pc":..,"sp":..,"fp":..,"lr":..,"x8":..,"x0":..,"stack_xlate":..}
+ * The `vcpu-trap` probe passes `arg0` = the address of a
+ * `compat::GuestRegs` (`#[repr(C)]`, all u64 fields). We copyin that
+ * struct, then follow the AAPCS64 frame-pointer chain: at [fp] sits
+ * the caller's saved fp, at [fp+8] the saved lr (return address).
  *
- * `fp` (x29) is the head of the AAPCS64 frame-pointer chain: at [fp]
- * sits the caller's saved fp, at [fp+8] the saved lr (return address).
- * `stack_xlate` is the wrapping guest->host offset for the stack's
- * mapping, so `host_va = guest_va + stack_xlate` lets us `copyin` each
- * frame directly — no separate mapping table needed (carrick computes
- * the offset per-trap from the region containing sp).
+ * ADDRESS TRANSLATION (the part that's easy to get wrong): a guest
+ * stack VA is translated to its host address with
+ *   host = stack_host_base + (guest_va - stack_guest_base)
+ * We pass the two BASES separately (not a single offset) because the
+ * stack lives high (0xffffff..) and the host mapping low (0x60..), so
+ * a single `host_base - guest_base` offset wraps past i63 and DTrace's
+ * signed arithmetic mangles it. With separate bases every intermediate
+ * value stays in range.
  *
  * REQUIREMENTS:
- *   - Guest binaries built WITH frame pointers. THIS MATTERS for the
- *     distro you trace:
- *       * Ubuntu 24.04 LTS and later: frame pointers ON by default
- *         (64-bit) — this walker works out of the box.
- *       * Fedora 38+: ON by default — works.
- *       * Debian (incl. 13/trixie): frame pointers OFF by default.
- *         dpkg-buildflags has opt-in `qa=+framepointer`, but stock
- *         Debian binaries (glibc, coreutils, apt, sqv...) are built
- *         `-fomit-frame-pointer`, so x29 is NOT the AAPCS frame
- *         pointer and this walk yields garbage / `copyin` errors.
- *     To trace a Debian guest meaningfully, either use an Ubuntu
- *     image, or rebuild the target with frame pointers, or fall back
- *     to PC-only single-frame tracing (the `pc` field alone is always
- *     valid; only the unwound chain needs frame pointers).
+ *   - Frame-pointer-built guest binaries. Ubuntu 24.04+/Fedora 38+
+ *     enable FP by default; stock Debian (incl. 13/trixie) does NOT
+ *     (opt-in via dpkg-buildflags qa=+framepointer), so Debian guests
+ *     yield short/garbage chains. Use an Ubuntu image.
  *   - Run as root (libdtrace needs /dev/dtrace).
  *
  * USAGE:
  *   sudo dtrace -s scripts/guest_stack.d -c \
- *       '/path/to/carrick run <image> --raw /usr/bin/whatever'
+ *     '/path/to/carrick run docker.io/library/ubuntu:24.04 --raw /usr/bin/true'
  *
- * Output is one block per syscall trap: guest PC + syscall number,
- * then the unwound return addresses (guest VAs). Feed those to
+ * Output: one block per trap — guest PC + syscall number, then the
+ * unwound return addresses (guest VAs). Feed those to
  * addr2line/llvm-symbolizer against the guest binary for names.
  */
 
 #pragma D option quiet
-#pragma D option strsize=256
-#pragma D option dynvarsize=4m
+#pragma D option dynvarsize=8m
+
+typedef struct {
+	uint64_t pc;
+	uint64_t sp;
+	uint64_t fp;
+	uint64_t lr;
+	uint64_t x8;
+	uint64_t x0;
+	uint64_t sgb;	/* stack_guest_base */
+	uint64_t shb;	/* stack_host_base  */
+	uint64_t sge;	/* stack_guest_end (exclusive) */
+} gregs_t;
+
+/* guest stack VA -> host VA, using the two bases (no wrapping). */
+#define XL(gva)  (this->shb + ((gva) - this->sgb))
+/* true iff [gva, gva+16) is inside the stack region (so the frame's
+ * saved fp at [gva] and saved lr at [gva+8] are both safe to copyin). */
+#define INREG(gva)  ((this->sgb != 0) && (gva) >= this->sgb && (gva) + 16 <= this->sge)
 
 dtrace:::BEGIN
 {
-	printf("guest_stack.d: walking guest frame-pointer chains\n");
+	printf("guest_stack.d: copyin-walking guest frame pointers\n");
 }
 
 carrick*:::vcpu-trap
 {
-	this->j = copyinstr(arg0);
-	this->fp = (uint64_t) strtoll(json(this->j, "fp"));
-	this->pc = (uint64_t) strtoll(json(this->j, "pc"));
-	this->x8 = (uint64_t) strtoll(json(this->j, "x8"));
-	this->xl = (uint64_t) strtoll(json(this->j, "stack_xlate"));
+	this->r   = (gregs_t *) copyin(arg0, sizeof(gregs_t));
+	this->pc  = this->r->pc;
+	this->x8  = this->r->x8;
+	this->fp  = this->r->fp;
+	this->sgb = this->r->sgb;
+	this->shb = this->r->shb;
+	this->sge = this->r->sge;
 
 	printf("\n== trap pc=0x%x syscall=%d fp=0x%x ==\n",
 	    this->pc, this->x8, this->fp);
 }
 
-/* Frame 0: return address at [fp+8], next fp at [fp]. */
+/* Frame 0: ra at [fp+8], next fp at [fp]. */
 carrick*:::vcpu-trap
-/this->fp != 0 && this->xl != 0/
+/INREG(this->fp)/
 {
-	this->lr0 = *(uint64_t *) copyin(this->fp + this->xl + 8, 8);
-	this->nextfp = *(uint64_t *) copyin(this->fp + this->xl, 8);
-	printf("  #0  0x%x\n", this->lr0);
+	this->ra = *(uint64_t *) copyin(XL(this->fp + 8), 8);
+	this->nf = *(uint64_t *) copyin(XL(this->fp), 8);
+	printf("  #0  0x%x\n", this->ra);
 }
 
 /* Frame 1. */
 carrick*:::vcpu-trap
-/this->nextfp != 0 && this->xl != 0/
+/INREG(this->nf)/
 {
-	this->lr1 = *(uint64_t *) copyin(this->nextfp + this->xl + 8, 8);
-	this->nextfp = *(uint64_t *) copyin(this->nextfp + this->xl, 8);
-	printf("  #1  0x%x\n", this->lr1);
+	this->ra = *(uint64_t *) copyin(XL(this->nf + 8), 8);
+	this->nf = *(uint64_t *) copyin(XL(this->nf), 8);
+	printf("  #1  0x%x\n", this->ra);
 }
 
 /* Frame 2. */
 carrick*:::vcpu-trap
-/this->nextfp != 0 && this->xl != 0/
+/INREG(this->nf)/
 {
-	this->lr2 = *(uint64_t *) copyin(this->nextfp + this->xl + 8, 8);
-	this->nextfp = *(uint64_t *) copyin(this->nextfp + this->xl, 8);
-	printf("  #2  0x%x\n", this->lr2);
+	this->ra = *(uint64_t *) copyin(XL(this->nf + 8), 8);
+	this->nf = *(uint64_t *) copyin(XL(this->nf), 8);
+	printf("  #2  0x%x\n", this->ra);
 }
 
 /* Frame 3. */
 carrick*:::vcpu-trap
-/this->nextfp != 0 && this->xl != 0/
+/INREG(this->nf)/
 {
-	this->lr3 = *(uint64_t *) copyin(this->nextfp + this->xl + 8, 8);
-	this->nextfp = *(uint64_t *) copyin(this->nextfp + this->xl, 8);
-	printf("  #3  0x%x\n", this->lr3);
+	this->ra = *(uint64_t *) copyin(XL(this->nf + 8), 8);
+	this->nf = *(uint64_t *) copyin(XL(this->nf), 8);
+	printf("  #3  0x%x\n", this->ra);
 }
 
 /* Frame 4. */
 carrick*:::vcpu-trap
-/this->nextfp != 0 && this->xl != 0/
+/INREG(this->nf)/
 {
-	this->lr4 = *(uint64_t *) copyin(this->nextfp + this->xl + 8, 8);
-	printf("  #4  0x%x\n", this->lr4);
+	this->ra = *(uint64_t *) copyin(XL(this->nf + 8), 8);
+	printf("  #4  0x%x\n", this->ra);
 }
 
 dtrace:::END

@@ -715,14 +715,15 @@ impl HvfInner {
         // FP (x29) + SP let guest_stack.d walk the guest call chain.
         let fp = self.vcpu.get_reg(Reg::X29).unwrap_or(0);
         let sp = self.vcpu.get_sys_reg(SysReg::SP_EL0).unwrap_or(0);
-        // Wrapping guest->host offset for the region containing `sp`,
-        // so the stack walker can translate frame addresses directly.
-        let stack_xlate = self
+        // Guest+host bases of the region containing `sp`, so a DTrace
+        // consumer can translate stack VAs and copyin frames (the two
+        // bases individually fit in i64; a single offset would wrap).
+        let (stack_guest_base, stack_host_base, stack_guest_end) = self
             .mappings
             .iter()
             .find(|m| sp >= m.start && sp < m.end)
-            .map(|m| (m.host_addr as u64).wrapping_sub(m.start))
-            .unwrap_or(0);
+            .map(|m| (m.start, m.host_addr as u64, m.end))
+            .unwrap_or((0, 0, 0));
         crate::probes::vcpu_trap(&crate::compat::GuestRegs {
             pc: guest_pc,
             sp,
@@ -730,7 +731,9 @@ impl HvfInner {
             lr,
             x8: frame.x8,
             x0: frame.x0,
-            stack_xlate,
+            stack_guest_base,
+            stack_host_base,
+            stack_guest_end,
         });
         Ok(frame)
     }
@@ -1010,7 +1013,9 @@ impl HvfInner {
             lr: 0,
             x8: 0xffff_ffff_ffff_ffff,
             x0: signum as u64,
-            stack_xlate: 0,
+            stack_guest_base: 0,
+            stack_host_base: 0,
+            stack_guest_end: 0,
         });
         Ok(())
     }
