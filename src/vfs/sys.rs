@@ -4,7 +4,7 @@
 //! [`super::proc::ProcVfs`] but with no context dependency — the
 //! `/sys` entries are all static bytes.
 
-use crate::dispatch::{LINUX_EACCES, LINUX_ENOENT, LINUX_ENOTDIR};
+use crate::linux_abi::{LINUX_EACCES, LINUX_ENOENT, LINUX_ENOTDIR};
 
 use super::{
     EntryKind, Metadata, OpenContext, OpenFlags, Vfs, VfsError, VfsHandle,
@@ -65,7 +65,7 @@ impl Vfs for SysVfs {
         _ctx: &OpenContext<'_>,
     ) -> Result<VfsHandle, VfsError> {
         let Some(contents) = crate::dispatch::synthetic_sys_file(path) else {
-            return Err(crate::dispatch::LINUX_ENOSYS);
+            return Err(crate::linux_abi::LINUX_ENOSYS);
         };
         if flags.write {
             return Err(LINUX_EACCES);
