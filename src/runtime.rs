@@ -507,7 +507,7 @@ where
 
         if !suppress_signal_check {
             if let Some(action) =
-                deliver_pending_signal(runtime, &dispatcher, last_syscall_retval)?
+                deliver_pending_signal(runtime, &mut dispatcher, last_syscall_retval)?
             {
                 if let Some(exit) = action.exit_code {
                     return Ok(RunResult {
@@ -549,7 +549,7 @@ struct PendingSignalAction {
 /// SIG_IGN'd) and the vCPU should resume.
 fn deliver_pending_signal<T>(
     trap: &mut T,
-    dispatcher: &SyscallDispatcher,
+    dispatcher: &mut SyscallDispatcher,
     last_syscall_retval: Option<i64>,
 ) -> Result<Option<PendingSignalAction>, RuntimeError>
 where
@@ -558,6 +558,12 @@ where
     let pending = crate::host_signal::take_pending();
     if pending == 0 {
         return Ok(None);
+    }
+    // A blocked signal must not be delivered — hold it pending until the
+    // guest unblocks it (rt_sigprocmask) or waits for it (rt_sigtimedwait).
+    if dispatcher.signal_blocked(pending) {
+        dispatcher.mark_signal_pending(pending);
+        return Ok(Some(PendingSignalAction { exit_code: None }));
     }
     if dispatcher.signal_is_ignored(pending) {
         return Ok(Some(PendingSignalAction { exit_code: None }));
@@ -790,7 +796,7 @@ where
 
         if !suppress_signal_check {
             if let Some(action) =
-                deliver_pending_signal(trap, &dispatcher, last_syscall_retval)?
+                deliver_pending_signal(trap, &mut dispatcher, last_syscall_retval)?
             {
                 if let Some(exit) = action.exit_code {
                     return Ok(RunResult {
