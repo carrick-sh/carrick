@@ -28,13 +28,12 @@ mod carrick_usdt {
     /// restored the snapshot. `pid` is the libc::fork return value
     /// (0 in the child, child pid in the parent).
     fn fork__post(_: i32, _: u64, _: u64) {}
-    /// Fires every time the trap engine returns from `vcpu.run` with
-    /// a syscall exit. Carries a `&GuestRegs` snapshot (PC, SP, FP,
-    /// LR, x8, x0) JSON-encoded by usdt — one struct instead of six
-    /// scalars, sidestepping the per-probe arg ceiling. The `fp` field
-    /// lets `guest_stack.d` walk the guest's call chain on frame-
-    /// pointer builds without host help.
-    fn vcpu__trap(_: &crate::compat::GuestRegs) {}
+    /// Fires every syscall trap. `arg0` is the ADDRESS of a
+    /// `compat::GuestRegs` (`#[repr(C)]`); DTrace does
+    /// `copyin(arg0, sizeof(gregs_t))` and reads fields by offset. A
+    /// raw pointer (not JSON) keeps this hot probe cheap and lets D
+    /// read full u64 register values exactly.
+    fn vcpu__trap(_: u64) {}
     /// Fires when `execve_into` has finished swapping the engine to
     /// the new image. `path`, `entry`, `initial_sp`, `mapping_count`
     /// let dtrace operators verify the new process layout.
@@ -121,8 +120,14 @@ pub fn fork_post(pid: i32, pc: u64, elr: u64) {
 // function to one body keeps it a single, stable probe site.
 #[inline(never)]
 pub fn vcpu_trap(regs: &crate::compat::GuestRegs) {
-    carrick_usdt::vcpu__trap!(|| regs);
+    // Pass the struct's address; DTrace copyin's it. The reference is
+    // live for the duration of this (inline(never)) function, which is
+    // where usdt's synchronous probe fire happens, so the pointer is
+    // valid when DTrace reads it.
+    let ptr = regs as *const crate::compat::GuestRegs as u64;
+    carrick_usdt::vcpu__trap!(|| ptr);
 }
+
 
 pub fn execve_loaded(path: &str, entry: u64, initial_sp: u64, mapping_count: u64) {
     carrick_usdt::execve__loaded!(|| (path, entry, initial_sp, mapping_count));
