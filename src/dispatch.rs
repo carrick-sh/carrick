@@ -925,8 +925,8 @@ impl SyscallDispatcher {
             69 => self.preadv(request, memory)?,
             70 => self.pwritev(request, memory)?,
             71 => self.sendfile(request, memory)?,
-            72 => self.pselect6(request, memory)?,
-            73 => self.ppoll(request, memory)?,
+            72 => self.pselect6(request, memory, reporter)?,
+            73 => self.ppoll(request, memory, reporter)?,
             74 => self.bootstrap_enosys(),
             75 => self.bootstrap_enosys(),
             76 => self.splice(request, memory)?,
@@ -1628,6 +1628,7 @@ impl SyscallDispatcher {
         &self,
         request: SyscallRequest,
         memory: &mut impl GuestMemory,
+        reporter: &mut CompatReporter,
     ) -> Result<DispatchOutcome, DispatchError> {
         let nfds = usize::try_from(request.arg(0))
             .map_err(|_| DispatchError::LengthTooLarge(request.arg(0)))?;
@@ -1766,6 +1767,15 @@ impl SyscallDispatcher {
                         break;
                     }
                 } else if deadline_attempts > 6000 {
+                    // Blocked ~60 s with no fd ever ready: almost certainly a
+                    // missing readiness signal, not a real idle wait. Make it
+                    // loud in `carrick trace` instead of silently returning 0.
+                    reporter.record(CompatEvent::partial_syscall(
+                        request.number,
+                        "pselect6",
+                        request.args,
+                        "blocked ~60s with no fd ready (possible poll deadlock)",
+                    ));
                     break;
                 }
             }
@@ -1871,6 +1881,7 @@ impl SyscallDispatcher {
         &self,
         request: SyscallRequest,
         memory: &mut impl GuestMemory,
+        reporter: &mut CompatReporter,
     ) -> Result<DispatchOutcome, DispatchError> {
         let pollfds_address = request.arg(0);
         let nfds = usize::try_from(request.arg(1))
@@ -2008,7 +2019,15 @@ impl SyscallDispatcher {
                     break;
                 }
             } else if deadline_attempts > 6000 {
-                // ~60 s ceiling for "block forever" callers.
+                // ~60 s ceiling for "block forever" callers. Reaching it means
+                // no fd ever became ready — surface it loudly in carrick trace
+                // rather than silently returning 0 (a likely poll deadlock).
+                reporter.record(CompatEvent::partial_syscall(
+                    request.number,
+                    "ppoll",
+                    request.args,
+                    "blocked ~60s with no fd ready (possible poll deadlock)",
+                ));
                 break;
             }
         }
