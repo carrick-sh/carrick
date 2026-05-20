@@ -806,6 +806,41 @@ impl SyscallDispatcher {
         148 => getresuid,
         149 => setresgid,
         150 => getresgid,
+        153 => times,
+        154 => setpgid,
+        155 => getpgid,
+        156 => getsid,
+        157 => setsid,
+        158 => getgroups,
+        160 => uname,
+        161 => sethostname,
+        162 => setdomainname,
+        165 => getrusage,
+        166 => umask,
+        167 => prctl,
+        168 => getcpu,
+        169 => gettimeofday,
+        170 => settimeofday,
+        171 => adjtimex,
+        179 => sysinfo,
+        198 => socket,
+        199 => socketpair,
+        200 => bind,
+        201 => listen,
+        202 => accept,
+        203 => connect,
+        204 => getsockname,
+        205 => getpeername,
+        206 => sendto,
+        207 => recvfrom,
+        208 => setsockopt,
+        209 => getsockopt,
+        210 => shutdown,
+        211 => sendmsg,
+        212 => recvmsg,
+        214 => brk,
+        215 => munmap,
+        216 => mremap,
     }
 
     pub fn new() -> Self {
@@ -1056,26 +1091,10 @@ impl SyscallDispatcher {
             152 => DispatchOutcome::Returned {
                 value: i64::from(self.cred_egid),
             },
-            153 => self.times(request, memory),
-            154 => self.setpgid(request),
-            155 => self.getpgid(request),
-            156 => self.getsid(request),
-            157 => self.setsid(),
             // getgroups(size, list): we belong to no supplementary groups.
             // size=0 means "tell me how many" — return 0. Otherwise write
             // nothing and return 0. setgroups: accept and ignore.
-            158 => self.getgroups(request, memory),
             159 => DispatchOutcome::Returned { value: 0 },
-            160 => self.uname(request, memory),
-            161 => self.sethostname(),
-            162 => self.setdomainname(),
-            165 => self.getrusage(request, memory),
-            166 => self.umask(request),
-            167 => self.prctl(request, memory),
-            168 => self.getcpu(request, memory),
-            169 => self.gettimeofday(request, memory),
-            170 => self.settimeofday(),
-            171 => self.adjtimex(request, memory),
             172 => self.getpid(),
             173 => DispatchOutcome::Returned { value: 1 },
             174 => DispatchOutcome::Returned { value: i64::from(self.cred_ruid) },
@@ -1083,27 +1102,8 @@ impl SyscallDispatcher {
             176 => DispatchOutcome::Returned { value: i64::from(self.cred_rgid) },
             177 => DispatchOutcome::Returned { value: i64::from(self.cred_egid) },
             178 => self.getpid(),
-            179 => self.sysinfo(request, memory),
-            198 => self.socket(request),
-            199 => self.socketpair(request, memory),
-            200 => self.bind(request, memory),
-            201 => self.listen(request),
-            202 => self.accept(request, memory),
-            203 => self.connect(request, memory),
-            204 => self.getsockname(request, memory),
-            205 => self.getpeername(request, memory),
-            206 => self.sendto(request, memory),
-            207 => self.recvfrom(request, memory),
-            208 => self.setsockopt(request, memory),
-            209 => self.getsockopt(request, memory),
-            210 => self.shutdown(request),
-            211 => self.sendmsg(request, memory),
-            212 => self.recvmsg(request, memory),
             243 => self.recvmmsg(request, memory),
             269 => self.sendmmsg(request, memory),
-            214 => self.brk(request),
-            215 => self.munmap(request),
-            216 => self.mremap(request, memory),
             220 => self.clone(request),
             435 => self.clone3(request, memory),
             221 => self.execve(request, memory),
@@ -3069,28 +3069,32 @@ impl SyscallDispatcher {
         })
     }
 
-    fn prctl(&mut self, request: SyscallRequest, memory: &mut impl GuestMemory) -> DispatchOutcome {
-        let option = request.arg(0);
-        match option {
+    fn prctl<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let memory = &mut *ctx.memory;
+        let option = ctx.request.arg(0);
+        Ok(match option {
             LINUX_PR_GET_DUMPABLE => DispatchOutcome::Returned {
                 value: self.dumpable,
             },
             LINUX_PR_SET_DUMPABLE => {
-                let value = request.arg(1);
+                let value = ctx.request.arg(1);
                 if value > 1 {
-                    return DispatchOutcome::Errno {
+                    return Ok(DispatchOutcome::Errno {
                         errno: LINUX_EINVAL,
-                    };
+                    });
                 }
                 self.dumpable = value as i64;
                 DispatchOutcome::Returned { value: 0 }
             }
             LINUX_PR_SET_NAME => {
-                let address = request.arg(1);
+                let address = ctx.request.arg(1);
                 let Ok(bytes) = memory.read_bytes(address, LINUX_TASK_COMM_LEN) else {
-                    return DispatchOutcome::Errno {
+                    return Ok(DispatchOutcome::Errno {
                         errno: LINUX_EFAULT,
-                    };
+                    });
                 };
                 self.task_name = linux_task_name_from_bytes(&bytes);
                 // Reflect the guest's chosen name into the host
@@ -3101,36 +3105,40 @@ impl SyscallDispatcher {
                 DispatchOutcome::Returned { value: 0 }
             }
             LINUX_PR_GET_NAME => {
-                let address = request.arg(1);
+                let address = ctx.request.arg(1);
                 if memory.write_bytes(address, &self.task_name).is_err() {
-                    return DispatchOutcome::Errno {
+                    return Ok(DispatchOutcome::Errno {
                         errno: LINUX_EFAULT,
-                    };
+                    });
                 }
                 DispatchOutcome::Returned { value: 0 }
             }
             _ => DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
             },
-        }
+        })
     }
 
-    fn getcpu(&self, request: SyscallRequest, memory: &mut impl GuestMemory) -> DispatchOutcome {
-        let cpu_address = request.arg(0);
-        let node_address = request.arg(1);
+    fn getcpu<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let memory = &mut *ctx.memory;
+        let cpu_address = ctx.request.arg(0);
+        let node_address = ctx.request.arg(1);
         let bootstrap_value = 0u32.to_ne_bytes();
 
         if cpu_address != 0 && memory.write_bytes(cpu_address, &bootstrap_value).is_err() {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EFAULT,
-            };
+            });
         }
         if node_address != 0 && memory.write_bytes(node_address, &bootstrap_value).is_err() {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EFAULT,
-            };
+            });
         }
-        DispatchOutcome::Returned { value: 0 }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
     fn set_tid_address<M: GuestMemory>(
@@ -3448,13 +3456,12 @@ impl SyscallDispatcher {
         Ok(DispatchOutcome::Returned { value: 0 })
     }
 
-    fn adjtimex(
-        &self,
-        request: SyscallRequest,
-        memory: &impl GuestMemory,
-    ) -> DispatchOutcome {
-        let address = request.arg(0);
-        adjtimex_bootstrap(memory, address)
+    fn adjtimex<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let address = ctx.arg(0);
+        Ok(adjtimex_bootstrap(&*ctx.memory, address))
     }
 
     fn clock_adjtime(
@@ -3750,36 +3757,40 @@ impl SyscallDispatcher {
         Ok(DispatchOutcome::SigReturn)
     }
 
-    fn uname(&self, request: SyscallRequest, memory: &mut impl GuestMemory) -> DispatchOutcome {
-        let address = request.arg(0);
+    fn uname<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let memory = &mut *ctx.memory;
+        let address = ctx.request.arg(0);
         if memory
             .write_bytes(address, LinuxUtsname::carrick_aarch64().abi_bytes())
             .is_err()
         {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EFAULT,
-            };
+            });
         }
-        DispatchOutcome::Returned { value: 0 }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
-    fn gettimeofday(
-        &self,
-        request: SyscallRequest,
-        memory: &mut impl GuestMemory,
-    ) -> DispatchOutcome {
-        let timeval = request.arg(0);
-        let timezone = request.arg(1);
+    fn gettimeofday<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let memory = &mut *ctx.memory;
+        let timeval = ctx.request.arg(0);
+        let timezone = ctx.request.arg(1);
         let now = realtime_duration();
         if timeval != 0 {
             let timeval = linux_timeval_from_duration(now);
             if memory
-                .write_bytes(request.arg(0), timeval.as_bytes())
+                .write_bytes(ctx.request.arg(0), timeval.as_bytes())
                 .is_err()
             {
-                return DispatchOutcome::Errno {
+                return Ok(DispatchOutcome::Errno {
                     errno: LINUX_EFAULT,
-                };
+                });
             }
         }
         if timezone != 0
@@ -3787,11 +3798,11 @@ impl SyscallDispatcher {
                 .write_bytes(timezone, LinuxTimezone::utc().abi_bytes())
                 .is_err()
         {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EFAULT,
-            };
+            });
         }
-        DispatchOutcome::Returned { value: 0 }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
     fn getpid(&self) -> DispatchOutcome {
@@ -3820,25 +3831,37 @@ impl SyscallDispatcher {
         Ok(DispatchOutcome::Errno { errno: LINUX_EPERM })
     }
 
-    fn sethostname(&self) -> DispatchOutcome {
-        DispatchOutcome::Errno { errno: LINUX_EPERM }
+    fn sethostname<M: GuestMemory>(
+        &mut self,
+        _ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        Ok(DispatchOutcome::Errno { errno: LINUX_EPERM })
     }
 
-    fn setdomainname(&self) -> DispatchOutcome {
-        DispatchOutcome::Errno { errno: LINUX_EPERM }
+    fn setdomainname<M: GuestMemory>(
+        &mut self,
+        _ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        Ok(DispatchOutcome::Errno { errno: LINUX_EPERM })
     }
 
-    fn settimeofday(&self) -> DispatchOutcome {
-        DispatchOutcome::Errno { errno: LINUX_EPERM }
+    fn settimeofday<M: GuestMemory>(
+        &mut self,
+        _ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        Ok(DispatchOutcome::Errno { errno: LINUX_EPERM })
     }
 
-    fn umask(&mut self, request: SyscallRequest) -> DispatchOutcome {
-        let new = request.arg(0) as u32 & 0o777;
+    fn umask<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let new = ctx.arg(0) as u32 & 0o777;
         let previous = self.umask;
         self.umask = new;
-        DispatchOutcome::Returned {
+        Ok(DispatchOutcome::Returned {
             value: previous as i64,
-        }
+        })
     }
 
     fn setpriority<M: GuestMemory>(
@@ -3878,7 +3901,11 @@ impl SyscallDispatcher {
         Ok(DispatchOutcome::Returned { value: 20 })
     }
 
-    fn sysinfo(&self, request: SyscallRequest, memory: &mut impl GuestMemory) -> DispatchOutcome {
+    fn sysinfo<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let memory = &mut *ctx.memory;
         let info = LinuxSysinfo {
             uptime: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -3897,16 +3924,20 @@ impl SyscallDispatcher {
             mem_unit: 1,
             _padding: [0; 8],
         };
-        if write_kernel_struct_raw(memory, request.arg(0), &info).is_err() {
-            return DispatchOutcome::Errno {
+        if write_kernel_struct_raw(memory, ctx.request.arg(0), &info).is_err() {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EFAULT,
-            };
+            });
         }
-        DispatchOutcome::Returned { value: 0 }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
-    fn times(&self, request: SyscallRequest, memory: &mut impl GuestMemory) -> DispatchOutcome {
-        let buf = request.arg(0);
+    fn times<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let memory = &mut *ctx.memory;
+        let buf = ctx.request.arg(0);
         let secs = realtime_duration().as_secs();
         let clock = i64::try_from(secs)
             .ok()
@@ -3917,52 +3948,59 @@ impl SyscallDispatcher {
                 .write_bytes(buf, LinuxTms::zeroed().abi_bytes())
                 .is_err()
         {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EFAULT,
-            };
+            });
         }
-        DispatchOutcome::Returned { value: clock }
+        Ok(DispatchOutcome::Returned { value: clock })
     }
 
-    fn getrusage(&self, request: SyscallRequest, memory: &mut impl GuestMemory) -> DispatchOutcome {
-        let who = request.arg(0) as i32;
-        let usage = request.arg(1);
+    fn getrusage<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let memory = &mut *ctx.memory;
+        let who = ctx.request.arg(0) as i32;
+        let usage = ctx.request.arg(1);
         match who {
             LINUX_RUSAGE_SELF | LINUX_RUSAGE_CHILDREN | LINUX_RUSAGE_THREAD => {}
             _ => {
-                return DispatchOutcome::Errno {
+                return Ok(DispatchOutcome::Errno {
                     errno: LINUX_EINVAL,
-                };
+                });
             }
         }
         if usage == 0 {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EFAULT,
-            };
+            });
         }
         if memory
             .write_bytes(usage, LinuxRusage::zeroed().abi_bytes())
             .is_err()
         {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EFAULT,
-            };
+            });
         }
-        DispatchOutcome::Returned { value: 0 }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
-    fn setpgid(&self, request: SyscallRequest) -> DispatchOutcome {
-        let pid = request.arg(0) as i32;
-        let pgid = i32::from_ne_bytes((request.arg(1) as u32).to_ne_bytes());
+    fn setpgid<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let pid = ctx.arg(0) as i32;
+        let pgid = i32::from_ne_bytes((ctx.arg(1) as u32).to_ne_bytes());
         if pgid < 0 {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
-            };
+            });
         }
         if pid != 0 && pid != 1 {
-            return DispatchOutcome::Errno { errno: LINUX_ESRCH };
+            return Ok(DispatchOutcome::Errno { errno: LINUX_ESRCH });
         }
-        DispatchOutcome::Returned { value: 0 }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
     /// `setresuid(ruid, euid, suid)`. -1 means "don't change". We record
@@ -4094,34 +4132,42 @@ impl SyscallDispatcher {
     /// supplementary groups; in carrick the guest is a single user
     /// with no supplementary groups, so the answer is always 0 (and
     /// we leave `list` untouched, per the size=0 fast path).
-    fn getgroups(
-        &self,
-        request: SyscallRequest,
-        _memory: &mut impl GuestMemory,
-    ) -> DispatchOutcome {
-        let _size = request.arg(0);
-        let _list = request.arg(1);
-        DispatchOutcome::Returned { value: 0 }
+    fn getgroups<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let _size = ctx.arg(0);
+        let _list = ctx.arg(1);
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
-    fn getpgid(&self, request: SyscallRequest) -> DispatchOutcome {
-        let pid = request.arg(0) as i32;
+    fn getpgid<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let pid = ctx.arg(0) as i32;
         if pid != 0 && pid != 1 {
-            return DispatchOutcome::Errno { errno: LINUX_ESRCH };
+            return Ok(DispatchOutcome::Errno { errno: LINUX_ESRCH });
         }
-        DispatchOutcome::Returned { value: 1 }
+        Ok(DispatchOutcome::Returned { value: 1 })
     }
 
-    fn getsid(&self, request: SyscallRequest) -> DispatchOutcome {
-        let pid = request.arg(0) as i32;
+    fn getsid<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let pid = ctx.arg(0) as i32;
         if pid != 0 && pid != 1 {
-            return DispatchOutcome::Errno { errno: LINUX_ESRCH };
+            return Ok(DispatchOutcome::Errno { errno: LINUX_ESRCH });
         }
-        DispatchOutcome::Returned { value: 1 }
+        Ok(DispatchOutcome::Returned { value: 1 })
     }
 
-    fn setsid(&self) -> DispatchOutcome {
-        DispatchOutcome::Returned { value: 1 }
+    fn setsid<M: GuestMemory>(
+        &mut self,
+        _ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        Ok(DispatchOutcome::Returned { value: 1 })
     }
 
     fn waitid<M: GuestMemory>(
@@ -4512,11 +4558,14 @@ impl SyscallDispatcher {
     //   - many Linux-specific `SOL_*` levels                  (we ENOPROTOOPT)
     // ------------------------------------------------------------------
 
-    fn socket(&mut self, request: SyscallRequest) -> DispatchOutcome {
-        let family = request.arg(0) as i32;
-        let type_ = request.arg(1) as i32;
-        let protocol = request.arg(2) as i32;
-        self.host_socket_install(family, type_, protocol)
+    fn socket<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let family = ctx.arg(0) as i32;
+        let type_ = ctx.arg(1) as i32;
+        let protocol = ctx.arg(2) as i32;
+        Ok(self.host_socket_install(family, type_, protocol))
     }
 
     fn host_socket_install(
@@ -4566,15 +4615,15 @@ impl SyscallDispatcher {
         DispatchOutcome::Returned { value: linux_fd as i64 }
     }
 
-    fn socketpair(
+    fn socketpair<M: GuestMemory>(
         &mut self,
-        request: SyscallRequest,
-        memory: &mut impl GuestMemory,
-    ) -> DispatchOutcome {
-        let family = request.arg(0) as i32;
-        let type_ = request.arg(1) as i32;
-        let protocol = request.arg(2) as i32;
-        let sv_addr = request.arg(3);
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let memory = &mut *ctx.memory;
+        let family = ctx.request.arg(0) as i32;
+        let type_ = ctx.request.arg(1) as i32;
+        let protocol = ctx.request.arg(2) as i32;
+        let sv_addr = ctx.request.arg(3);
         let nonblock = type_ & LINUX_SOCK_NONBLOCK != 0;
         let cloexec = type_ & LINUX_SOCK_CLOEXEC != 0;
         let base_type = type_ & !(LINUX_SOCK_NONBLOCK | LINUX_SOCK_CLOEXEC);
@@ -4586,7 +4635,7 @@ impl SyscallDispatcher {
             libc::socketpair(host_family, host_type, protocol, host_fds.as_mut_ptr())
         };
         if rc != 0 {
-            return DispatchOutcome::Errno { errno: host_errno() };
+            return Ok(DispatchOutcome::Errno { errno: host_errno() });
         }
         if nonblock {
             for fd in &host_fds {
@@ -4602,16 +4651,16 @@ impl SyscallDispatcher {
         let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };
         let Some(read_fd) = self.allocate_fd(3) else {
             unsafe { libc::close(host_fds[0]); libc::close(host_fds[1]); }
-            return DispatchOutcome::Errno { errno: LINUX_EINVAL };
+            return Ok(DispatchOutcome::Errno { errno: LINUX_EINVAL });
         };
         let Some(write_fd) = self.allocate_fd(read_fd.saturating_add(1)) else {
             unsafe { libc::close(host_fds[0]); libc::close(host_fds[1]); }
-            return DispatchOutcome::Errno { errno: LINUX_EINVAL };
+            return Ok(DispatchOutcome::Errno { errno: LINUX_EINVAL });
         };
         let pair = LinuxFdPair { read_fd, write_fd };
         if write_kernel_struct_raw(memory, sv_addr, &pair).is_err() {
             unsafe { libc::close(host_fds[0]); libc::close(host_fds[1]); }
-            return DispatchOutcome::Errno { errno: LINUX_EFAULT };
+            return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
         }
         self.insert_open_file(
             read_fd,
@@ -4637,7 +4686,7 @@ impl SyscallDispatcher {
                 fd_flags,
             },
         );
-        DispatchOutcome::Returned { value: 0 }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
     /// Pull a (host_fd, family) pair out of the dispatcher's fd table.
@@ -4652,49 +4701,56 @@ impl SyscallDispatcher {
         }
     }
 
-    fn bind(&self, request: SyscallRequest, memory: &impl GuestMemory) -> DispatchOutcome {
-        let fd = request.arg(0) as i32;
-        let addr_addr = request.arg(1);
-        let addrlen = request.arg(2) as u32;
+    fn bind<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let memory = &*ctx.memory;
+        let fd = ctx.request.arg(0) as i32;
+        let addr_addr = ctx.request.arg(1);
+        let addrlen = ctx.request.arg(2) as u32;
         let (host_fd, family) = match self.host_socket_lookup(fd) {
             Ok(t) => t,
-            Err(errno) => return DispatchOutcome::Errno { errno },
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
         let host_addr = match read_linux_sockaddr(memory, addr_addr, addrlen, family) {
             Ok(bytes) => bytes,
-            Err(errno) => return DispatchOutcome::Errno { errno },
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
         let rc = unsafe {
             libc::bind(host_fd, host_addr.as_ptr() as *const _, host_addr.len() as u32)
         };
-        if rc < 0 {
+        Ok(if rc < 0 {
             DispatchOutcome::Errno { errno: host_errno() }
         } else {
             DispatchOutcome::Returned { value: 0 }
-        }
+        })
     }
 
-    fn listen(&self, request: SyscallRequest) -> DispatchOutcome {
-        let fd = request.arg(0) as i32;
-        let backlog = request.arg(1) as i32;
+    fn listen<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let fd = ctx.arg(0) as i32;
+        let backlog = ctx.arg(1) as i32;
         let (host_fd, _family) = match self.host_socket_lookup(fd) {
             Ok(t) => t,
-            Err(errno) => return DispatchOutcome::Errno { errno },
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
         let rc = unsafe { libc::listen(host_fd, backlog) };
-        if rc < 0 {
+        Ok(if rc < 0 {
             DispatchOutcome::Errno { errno: host_errno() }
         } else {
             DispatchOutcome::Returned { value: 0 }
-        }
+        })
     }
 
-    fn accept(
+    fn accept<M: GuestMemory>(
         &mut self,
-        request: SyscallRequest,
-        memory: &mut impl GuestMemory,
-    ) -> DispatchOutcome {
-        self.accept_common(request, memory, 0)
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let request = ctx.request;
+        Ok(self.accept_common(request, &mut *ctx.memory, 0))
     }
 
     fn accept4(
@@ -4777,39 +4833,43 @@ impl SyscallDispatcher {
         DispatchOutcome::Returned { value: linux_fd as i64 }
     }
 
-    fn connect(&self, request: SyscallRequest, memory: &impl GuestMemory) -> DispatchOutcome {
-        let fd = request.arg(0) as i32;
-        let addr_addr = request.arg(1);
-        let addrlen = request.arg(2) as u32;
+    fn connect<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let memory = &*ctx.memory;
+        let fd = ctx.request.arg(0) as i32;
+        let addr_addr = ctx.request.arg(1);
+        let addrlen = ctx.request.arg(2) as u32;
         let (host_fd, family) = match self.host_socket_lookup(fd) {
             Ok(t) => t,
-            Err(errno) => return DispatchOutcome::Errno { errno },
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
         let host_addr = match read_linux_sockaddr(memory, addr_addr, addrlen, family) {
             Ok(bytes) => bytes,
-            Err(errno) => return DispatchOutcome::Errno { errno },
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
         let rc = unsafe {
             libc::connect(host_fd, host_addr.as_ptr() as *const _, host_addr.len() as u32)
         };
-        if rc < 0 {
+        Ok(if rc < 0 {
             DispatchOutcome::Errno { errno: host_errno() }
         } else {
             DispatchOutcome::Returned { value: 0 }
-        }
+        })
     }
 
-    fn getsockname(
-        &self,
-        request: SyscallRequest,
-        memory: &mut impl GuestMemory,
-    ) -> DispatchOutcome {
-        let fd = request.arg(0) as i32;
-        let addr_addr = request.arg(1);
-        let addrlen_addr = request.arg(2);
+    fn getsockname<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let memory = &mut *ctx.memory;
+        let fd = ctx.request.arg(0) as i32;
+        let addr_addr = ctx.request.arg(1);
+        let addrlen_addr = ctx.request.arg(2);
         let (host_fd, family) = match self.host_socket_lookup(fd) {
             Ok(t) => t,
-            Err(errno) => return DispatchOutcome::Errno { errno },
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
         let mut sa = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
         let mut sa_len: libc::socklen_t = sa.len() as libc::socklen_t;
@@ -4817,27 +4877,27 @@ impl SyscallDispatcher {
             libc::getsockname(host_fd, sa.as_mut_ptr() as *mut _, &mut sa_len as *mut _)
         };
         if rc < 0 {
-            return DispatchOutcome::Errno { errno: host_errno() };
+            return Ok(DispatchOutcome::Errno { errno: host_errno() });
         }
         let used = (sa_len as usize).min(sa.len());
         let linux_bytes = host_to_linux_sockaddr(&sa[..used], family);
         if write_linux_sockaddr(memory, addr_addr, addrlen_addr, &linux_bytes).is_err() {
-            return DispatchOutcome::Errno { errno: LINUX_EFAULT };
+            return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
         }
-        DispatchOutcome::Returned { value: 0 }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
-    fn getpeername(
-        &self,
-        request: SyscallRequest,
-        memory: &mut impl GuestMemory,
-    ) -> DispatchOutcome {
-        let fd = request.arg(0) as i32;
-        let addr_addr = request.arg(1);
-        let addrlen_addr = request.arg(2);
+    fn getpeername<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let memory = &mut *ctx.memory;
+        let fd = ctx.request.arg(0) as i32;
+        let addr_addr = ctx.request.arg(1);
+        let addrlen_addr = ctx.request.arg(2);
         let (host_fd, family) = match self.host_socket_lookup(fd) {
             Ok(t) => t,
-            Err(errno) => return DispatchOutcome::Errno { errno },
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
         let mut sa = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
         let mut sa_len: libc::socklen_t = sa.len() as libc::socklen_t;
@@ -4845,34 +4905,34 @@ impl SyscallDispatcher {
             libc::getpeername(host_fd, sa.as_mut_ptr() as *mut _, &mut sa_len as *mut _)
         };
         if rc < 0 {
-            return DispatchOutcome::Errno { errno: host_errno() };
+            return Ok(DispatchOutcome::Errno { errno: host_errno() });
         }
         let used = (sa_len as usize).min(sa.len());
         let linux_bytes = host_to_linux_sockaddr(&sa[..used], family);
         if write_linux_sockaddr(memory, addr_addr, addrlen_addr, &linux_bytes).is_err() {
-            return DispatchOutcome::Errno { errno: LINUX_EFAULT };
+            return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
         }
-        DispatchOutcome::Returned { value: 0 }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
-    fn sendto(
-        &self,
-        request: SyscallRequest,
-        memory: &impl GuestMemory,
-    ) -> DispatchOutcome {
-        let fd = request.arg(0) as i32;
-        let buf_addr = request.arg(1);
-        let len = request.arg(2) as usize;
-        let flags = request.arg(3) as i32;
-        let dest_addr = request.arg(4);
-        let dest_len = request.arg(5) as u32;
+    fn sendto<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let memory = &*ctx.memory;
+        let fd = ctx.request.arg(0) as i32;
+        let buf_addr = ctx.request.arg(1);
+        let len = ctx.request.arg(2) as usize;
+        let flags = ctx.request.arg(3) as i32;
+        let dest_addr = ctx.request.arg(4);
+        let dest_len = ctx.request.arg(5) as u32;
         let (host_fd, family) = match self.host_socket_lookup(fd) {
             Ok(t) => t,
-            Err(errno) => return DispatchOutcome::Errno { errno },
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
         let bytes = match memory.read_bytes(buf_addr, len) {
             Ok(bytes) => bytes,
-            Err(_) => return DispatchOutcome::Errno { errno: LINUX_EFAULT },
+            Err(_) => return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT }),
         };
         let host_flags = linux_to_host_msg_flags(flags);
         let n = if dest_addr == 0 {
@@ -4889,7 +4949,7 @@ impl SyscallDispatcher {
         } else {
             let host_addr = match read_linux_sockaddr(memory, dest_addr, dest_len, family) {
                 Ok(b) => b,
-                Err(errno) => return DispatchOutcome::Errno { errno },
+                Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
             };
             unsafe {
                 libc::sendto(
@@ -4902,27 +4962,27 @@ impl SyscallDispatcher {
                 )
             }
         };
-        if n < 0 {
+        Ok(if n < 0 {
             DispatchOutcome::Errno { errno: host_errno() }
         } else {
             DispatchOutcome::Returned { value: n as i64 }
-        }
+        })
     }
 
-    fn recvfrom(
-        &self,
-        request: SyscallRequest,
-        memory: &mut impl GuestMemory,
-    ) -> DispatchOutcome {
-        let fd = request.arg(0) as i32;
-        let buf_addr = request.arg(1);
-        let len = request.arg(2) as usize;
-        let flags = request.arg(3) as i32;
-        let src_addr = request.arg(4);
-        let src_len_addr = request.arg(5);
+    fn recvfrom<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let memory = &mut *ctx.memory;
+        let fd = ctx.request.arg(0) as i32;
+        let buf_addr = ctx.request.arg(1);
+        let len = ctx.request.arg(2) as usize;
+        let flags = ctx.request.arg(3) as i32;
+        let src_addr = ctx.request.arg(4);
+        let src_len_addr = ctx.request.arg(5);
         let (host_fd, family) = match self.host_socket_lookup(fd) {
             Ok(t) => t,
-            Err(errno) => return DispatchOutcome::Errno { errno },
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
         let host_flags = linux_to_host_msg_flags(flags);
         let mut buf = vec![0u8; len];
@@ -4954,48 +5014,48 @@ impl SyscallDispatcher {
             (n, true)
         };
         if n < 0 {
-            return DispatchOutcome::Errno { errno: host_errno() };
+            return Ok(DispatchOutcome::Errno { errno: host_errno() });
         }
         if n > 0 {
             let bytes = &buf[..n as usize];
             if memory.write_bytes(buf_addr, bytes).is_err() {
-                return DispatchOutcome::Errno { errno: LINUX_EFAULT };
+                return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
             }
         }
         if used_addr && src_addr != 0 && src_len_addr != 0 {
             let used = (sa_len as usize).min(sa.len());
             let linux_bytes = host_to_linux_sockaddr(&sa[..used], family);
             if write_linux_sockaddr(memory, src_addr, src_len_addr, &linux_bytes).is_err() {
-                return DispatchOutcome::Errno { errno: LINUX_EFAULT };
+                return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
             }
         }
-        DispatchOutcome::Returned { value: n as i64 }
+        Ok(DispatchOutcome::Returned { value: n as i64 })
     }
 
-    fn setsockopt(
-        &self,
-        request: SyscallRequest,
-        memory: &impl GuestMemory,
-    ) -> DispatchOutcome {
-        let fd = request.arg(0) as i32;
-        let level = request.arg(1) as i32;
-        let optname = request.arg(2) as i32;
-        let optval_addr = request.arg(3);
-        let optlen = request.arg(4) as u32;
+    fn setsockopt<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let memory = &*ctx.memory;
+        let fd = ctx.request.arg(0) as i32;
+        let level = ctx.request.arg(1) as i32;
+        let optname = ctx.request.arg(2) as i32;
+        let optval_addr = ctx.request.arg(3);
+        let optlen = ctx.request.arg(4) as u32;
         let (host_fd, _family) = match self.host_socket_lookup(fd) {
             Ok(t) => t,
-            Err(errno) => return DispatchOutcome::Errno { errno },
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
         let (host_level, host_opt) = match linux_to_host_sockopt(level, optname) {
             Some(t) => t,
-            None => return DispatchOutcome::Errno { errno: LINUX_ENOPROTOOPT },
+            None => return Ok(DispatchOutcome::Errno { errno: LINUX_ENOPROTOOPT }),
         };
         let bytes = if optval_addr == 0 || optlen == 0 {
             Vec::new()
         } else {
             match memory.read_bytes(optval_addr, optlen as usize) {
                 Ok(b) => b,
-                Err(_) => return DispatchOutcome::Errno { errno: LINUX_EFAULT },
+                Err(_) => return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT }),
             }
         };
         let rc = unsafe {
@@ -5011,38 +5071,38 @@ impl SyscallDispatcher {
                 bytes.len() as u32,
             )
         };
-        if rc < 0 {
+        Ok(if rc < 0 {
             // Linux apps frequently set options that aren't supported on
             // macOS (eg IP_MTU_DISCOVER); swallow ENOPROTOOPT silently
             // when the equivalent option simply doesn't exist on macOS.
             DispatchOutcome::Errno { errno: host_errno() }
         } else {
             DispatchOutcome::Returned { value: 0 }
-        }
+        })
     }
 
-    fn getsockopt(
-        &self,
-        request: SyscallRequest,
-        memory: &mut impl GuestMemory,
-    ) -> DispatchOutcome {
-        let fd = request.arg(0) as i32;
-        let level = request.arg(1) as i32;
-        let optname = request.arg(2) as i32;
-        let optval_addr = request.arg(3);
-        let optlen_addr = request.arg(4);
+    fn getsockopt<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let memory = &mut *ctx.memory;
+        let fd = ctx.request.arg(0) as i32;
+        let level = ctx.request.arg(1) as i32;
+        let optname = ctx.request.arg(2) as i32;
+        let optval_addr = ctx.request.arg(3);
+        let optlen_addr = ctx.request.arg(4);
         let (host_fd, _family) = match self.host_socket_lookup(fd) {
             Ok(t) => t,
-            Err(errno) => return DispatchOutcome::Errno { errno },
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
         let (host_level, host_opt) = match linux_to_host_sockopt(level, optname) {
             Some(t) => t,
-            None => return DispatchOutcome::Errno { errno: LINUX_ENOPROTOOPT },
+            None => return Ok(DispatchOutcome::Errno { errno: LINUX_ENOPROTOOPT }),
         };
         // Read the guest's reported optlen so we don't overflow.
         let optlen_bytes = match memory.read_bytes(optlen_addr, 4) {
             Ok(b) => b,
-            Err(_) => return DispatchOutcome::Errno { errno: LINUX_EFAULT },
+            Err(_) => return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT }),
         };
         let mut optlen = u32::from_ne_bytes([
             optlen_bytes[0], optlen_bytes[1], optlen_bytes[2], optlen_bytes[3],
@@ -5059,54 +5119,57 @@ impl SyscallDispatcher {
             )
         };
         if rc < 0 {
-            return DispatchOutcome::Errno { errno: host_errno() };
+            return Ok(DispatchOutcome::Errno { errno: host_errno() });
         }
         let used = (optlen as usize).min(buf.len());
         if optval_addr != 0 && used > 0 {
             if memory.write_bytes(optval_addr, &buf[..used]).is_err() {
-                return DispatchOutcome::Errno { errno: LINUX_EFAULT };
+                return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
             }
         }
         if memory.write_bytes(optlen_addr, &optlen.to_ne_bytes()).is_err() {
-            return DispatchOutcome::Errno { errno: LINUX_EFAULT };
+            return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
         }
-        DispatchOutcome::Returned { value: 0 }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
-    fn shutdown(&self, request: SyscallRequest) -> DispatchOutcome {
-        let fd = request.arg(0) as i32;
-        let how = request.arg(1) as i32;
+    fn shutdown<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let fd = ctx.arg(0) as i32;
+        let how = ctx.arg(1) as i32;
         let (host_fd, _family) = match self.host_socket_lookup(fd) {
             Ok(t) => t,
-            Err(errno) => return DispatchOutcome::Errno { errno },
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
         let rc = unsafe { libc::shutdown(host_fd, how) };
-        if rc < 0 {
+        Ok(if rc < 0 {
             DispatchOutcome::Errno { errno: host_errno() }
         } else {
             DispatchOutcome::Returned { value: 0 }
-        }
+        })
     }
 
-    fn sendmsg(
-        &self,
-        request: SyscallRequest,
-        memory: &impl GuestMemory,
-    ) -> DispatchOutcome {
-        let fd = request.arg(0) as i32;
-        let msg_addr = request.arg(1);
-        let flags = request.arg(3) as i32;
+    fn sendmsg<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let memory = &*ctx.memory;
+        let fd = ctx.request.arg(0) as i32;
+        let msg_addr = ctx.request.arg(1);
+        let flags = ctx.request.arg(3) as i32;
         let (host_fd, family) = match self.host_socket_lookup(fd) {
             Ok(t) => t,
-            Err(errno) => return DispatchOutcome::Errno { errno },
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
         let msg = match read_linux_msghdr(memory, msg_addr) {
             Ok(m) => m,
-            Err(errno) => return DispatchOutcome::Errno { errno },
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
         let iovecs = match read_iovecs(memory, msg.iov, msg.iovlen as usize) {
             Ok(v) => v,
-            Err(errno) => return DispatchOutcome::Errno { errno },
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
         // Pack iovecs into a single contiguous send. Simple and avoids
         // having to keep guest pointers alive across the FFI call.
@@ -5114,7 +5177,7 @@ impl SyscallDispatcher {
         for iov in iovecs {
             let chunk = match memory.read_bytes(iov.iov_base, iov.iov_len as usize) {
                 Ok(b) => b,
-                Err(_) => return DispatchOutcome::Errno { errno: LINUX_EFAULT },
+                Err(_) => return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT }),
             };
             data.extend_from_slice(&chunk);
         }
@@ -5133,7 +5196,7 @@ impl SyscallDispatcher {
         } else {
             let host_addr = match read_linux_sockaddr(memory, msg.name, msg.namelen, family) {
                 Ok(b) => b,
-                Err(errno) => return DispatchOutcome::Errno { errno },
+                Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
             };
             unsafe {
                 libc::sendto(
@@ -5146,32 +5209,32 @@ impl SyscallDispatcher {
                 )
             }
         };
-        if n < 0 {
+        Ok(if n < 0 {
             DispatchOutcome::Errno { errno: host_errno() }
         } else {
             DispatchOutcome::Returned { value: n as i64 }
-        }
+        })
     }
 
-    fn recvmsg(
-        &self,
-        request: SyscallRequest,
-        memory: &mut impl GuestMemory,
-    ) -> DispatchOutcome {
-        let fd = request.arg(0) as i32;
-        let msg_addr = request.arg(1);
-        let flags = request.arg(2) as i32;
+    fn recvmsg<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let memory = &mut *ctx.memory;
+        let fd = ctx.request.arg(0) as i32;
+        let msg_addr = ctx.request.arg(1);
+        let flags = ctx.request.arg(2) as i32;
         let (host_fd, family) = match self.host_socket_lookup(fd) {
             Ok(t) => t,
-            Err(errno) => return DispatchOutcome::Errno { errno },
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
         let msg = match read_linux_msghdr(memory, msg_addr) {
             Ok(m) => m,
-            Err(errno) => return DispatchOutcome::Errno { errno },
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
         let iovecs = match read_iovecs(memory, msg.iov, msg.iovlen as usize) {
             Ok(v) => v,
-            Err(errno) => return DispatchOutcome::Errno { errno },
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
         let total: usize = iovecs.iter().map(|iov| iov.iov_len as usize).sum();
         let mut buf = vec![0u8; total];
@@ -5188,7 +5251,7 @@ impl SyscallDispatcher {
             )
         };
         if n < 0 {
-            return DispatchOutcome::Errno { errno: host_errno() };
+            return Ok(DispatchOutcome::Errno { errno: host_errno() });
         }
         // Scatter the received bytes back into the guest's iovecs.
         let mut remaining = n as usize;
@@ -5200,7 +5263,7 @@ impl SyscallDispatcher {
             let chunk = remaining.min(iov.iov_len as usize);
             if chunk > 0 {
                 if memory.write_bytes(iov.iov_base, &buf[cursor..cursor + chunk]).is_err() {
-                    return DispatchOutcome::Errno { errno: LINUX_EFAULT };
+                    return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
                 }
                 cursor += chunk;
                 remaining -= chunk;
@@ -5214,7 +5277,7 @@ impl SyscallDispatcher {
             let write_len = (linux_bytes.len() as u32).min(msg.namelen);
             if write_len > 0 {
                 if memory.write_bytes(msg.name, &linux_bytes[..write_len as usize]).is_err() {
-                    return DispatchOutcome::Errno { errno: LINUX_EFAULT };
+                    return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
                 }
             }
             // namelen lives at offset 8 (after the 8-byte name pointer).
@@ -5222,7 +5285,7 @@ impl SyscallDispatcher {
                 .write_bytes(msg_addr + 8, &(linux_bytes.len() as u32).to_ne_bytes())
                 .is_err()
             {
-                return DispatchOutcome::Errno { errno: LINUX_EFAULT };
+                return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
             }
         }
         // We don't translate ancillary data; report controllen=0.
@@ -5230,16 +5293,16 @@ impl SyscallDispatcher {
             .write_bytes(msg_addr + 40, &0u64.to_ne_bytes())
             .is_err()
         {
-            return DispatchOutcome::Errno { errno: LINUX_EFAULT };
+            return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
         }
         // msg_flags lives at offset 48 (just after controllen).
         if memory
             .write_bytes(msg_addr + 48, &0i32.to_ne_bytes())
             .is_err()
         {
-            return DispatchOutcome::Errno { errno: LINUX_EFAULT };
+            return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
         }
-        DispatchOutcome::Returned { value: n as i64 }
+        Ok(DispatchOutcome::Returned { value: n as i64 })
     }
 
     /// `sendmmsg(sockfd, msgvec, vlen, flags)` — Linux's batched
@@ -5249,7 +5312,7 @@ impl SyscallDispatcher {
     /// Implemented as a loop over single sendmsgs, writing each entry's
     /// msg_len field with the bytes-sent on success.
     fn sendmmsg(
-        &self,
+        &mut self,
         request: SyscallRequest,
         memory: &mut impl GuestMemory,
     ) -> DispatchOutcome {
@@ -5274,7 +5337,20 @@ impl SyscallDispatcher {
                 211, // sendmsg
                 SyscallArgs([fd as u64, entry, 0, flags as u64, 0, 0]),
             );
-            let outcome = self.sendmsg(inner_req, memory);
+            let mut inner_reporter = CompatReporter::default();
+            let outcome = {
+                let mut inner_ctx = SyscallCtx {
+                    request: inner_req,
+                    memory: &mut *memory,
+                    reporter: &mut inner_reporter,
+                };
+                match self.sendmsg(&mut inner_ctx) {
+                    Ok(o) => o,
+                    // sendmsg never produces a DispatchError; surface it
+                    // as EFAULT to keep this helper's bare-outcome contract.
+                    Err(_) => return DispatchOutcome::Errno { errno: LINUX_EFAULT },
+                }
+            };
             match outcome {
                 DispatchOutcome::Returned { value } => {
                     let len_u32 = value as u32;
@@ -5308,7 +5384,7 @@ impl SyscallDispatcher {
     /// single libc::poll up front if it's non-NULL and at least one
     /// message is wanted before blocking.
     fn recvmmsg(
-        &self,
+        &mut self,
         request: SyscallRequest,
         memory: &mut impl GuestMemory,
     ) -> DispatchOutcome {
@@ -5335,7 +5411,20 @@ impl SyscallDispatcher {
                 212, // recvmsg
                 SyscallArgs([fd as u64, entry, entry_flags as u64, 0, 0, 0]),
             );
-            let outcome = self.recvmsg(inner_req, memory);
+            let mut inner_reporter = CompatReporter::default();
+            let outcome = {
+                let mut inner_ctx = SyscallCtx {
+                    request: inner_req,
+                    memory: &mut *memory,
+                    reporter: &mut inner_reporter,
+                };
+                match self.recvmsg(&mut inner_ctx) {
+                    Ok(o) => o,
+                    // recvmsg never produces a DispatchError; surface it
+                    // as EFAULT to keep this helper's bare-outcome contract.
+                    Err(_) => return DispatchOutcome::Errno { errno: LINUX_EFAULT },
+                }
+            };
             match outcome {
                 DispatchOutcome::Returned { value } => {
                     let len_u32 = value as u32;
@@ -5802,20 +5891,23 @@ impl SyscallDispatcher {
         DispatchOutcome::Returned { value: 0 }
     }
 
-    fn brk(&mut self, request: SyscallRequest) -> DispatchOutcome {
-        let requested = request.arg(0);
+    fn brk<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let requested = ctx.arg(0);
         if requested == 0 {
-            return DispatchOutcome::Returned {
+            return Ok(DispatchOutcome::Returned {
                 value: self.brk_current as i64,
-            };
+            });
         }
 
         if range_within(requested, 0, LINUX_HEAP_BASE, LINUX_HEAP_SIZE) {
             self.brk_current = requested;
         }
-        DispatchOutcome::Returned {
+        Ok(DispatchOutcome::Returned {
             value: self.brk_current as i64,
-        }
+        })
     }
 
     fn mmap(
@@ -5941,15 +6033,18 @@ impl SyscallDispatcher {
         Some(address)
     }
 
-    fn munmap(&self, request: SyscallRequest) -> DispatchOutcome {
-        let address = request.arg(0);
-        let length = request.arg(1);
+    fn munmap<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let address = ctx.arg(0);
+        let length = ctx.arg(1);
         if length == 0 || !range_within(address, length, LINUX_MMAP_BASE, LINUX_MMAP_SIZE) {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
-            };
+            });
         }
-        DispatchOutcome::Returned { value: 0 }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
     fn msync(&self, request: SyscallRequest, memory: &impl GuestMemory) -> DispatchOutcome {
@@ -6033,35 +6128,39 @@ impl SyscallDispatcher {
         DispatchOutcome::Returned { value: 0 }
     }
 
-    fn mremap(&mut self, request: SyscallRequest, memory: &mut impl GuestMemory) -> DispatchOutcome {
-        let old_address = request.arg(0);
-        let old_size = request.arg(1);
-        let new_size_req = request.arg(2);
-        let flags = request.arg(3);
+    fn mremap<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let memory = &mut *ctx.memory;
+        let old_address = ctx.request.arg(0);
+        let old_size = ctx.request.arg(1);
+        let new_size_req = ctx.request.arg(2);
+        let flags = ctx.request.arg(3);
         if new_size_req == 0 {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
-            };
+            });
         }
         if flags & !(LINUX_MREMAP_MAYMOVE | LINUX_MREMAP_FIXED | LINUX_MREMAP_DONTUNMAP) != 0 {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
-            };
+            });
         }
         if !range_within(old_address, old_size, LINUX_MMAP_BASE, LINUX_MMAP_SIZE) {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
-            };
+            });
         }
         let Some(new_size) = align_up_u64(new_size_req, LINUX_PAGE_SIZE) else {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_ENOMEM,
-            };
+            });
         };
         if new_size <= old_size {
-            return DispatchOutcome::Returned {
+            return Ok(DispatchOutcome::Returned {
                 value: old_address as i64,
-            };
+            });
         }
 
         // Grow in place when this mapping sits at the top of the bump
@@ -6069,36 +6168,36 @@ impl SyscallDispatcher {
         // the stage-2 mapping, so no copy is needed.
         if old_address.checked_add(old_size) == Some(self.mmap_next) {
             let Some(new_end) = old_address.checked_add(new_size) else {
-                return DispatchOutcome::Errno {
+                return Ok(DispatchOutcome::Errno {
                     errno: LINUX_ENOMEM,
-                };
+                });
             };
             if range_within(old_address, new_size, LINUX_MMAP_BASE, LINUX_MMAP_SIZE) {
                 self.mmap_next = new_end;
-                return DispatchOutcome::Returned {
+                return Ok(DispatchOutcome::Returned {
                     value: old_address as i64,
-                };
+                });
             }
         }
 
         // Otherwise the mapping can only grow by moving. Linux requires
         // MREMAP_MAYMOVE for that; without it the call fails.
         if flags & LINUX_MREMAP_MAYMOVE == 0 {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_ENOMEM,
-            };
+            });
         }
         let Some(new_address) = self.next_mmap_address(0, new_size, 0) else {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_ENOMEM,
-            };
+            });
         };
         let copy_len = match usize::try_from(old_size) {
             Ok(len) => len,
             Err(_) => {
-                return DispatchOutcome::Errno {
+                return Ok(DispatchOutcome::Errno {
                     errno: LINUX_ENOMEM,
-                };
+                });
             }
         };
         if copy_len > 0 {
@@ -6107,15 +6206,15 @@ impl SyscallDispatcher {
                     let _ = memory.write_bytes(new_address, &bytes);
                 }
                 Err(_) => {
-                    return DispatchOutcome::Errno {
+                    return Ok(DispatchOutcome::Errno {
                         errno: LINUX_EFAULT,
-                    };
+                    });
                 }
             }
         }
-        DispatchOutcome::Returned {
+        Ok(DispatchOutcome::Returned {
             value: new_address as i64,
-        }
+        })
     }
 
     fn mprotect(&self, request: SyscallRequest, _memory: &impl GuestMemory) -> DispatchOutcome {
