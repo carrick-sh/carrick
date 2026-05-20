@@ -6,6 +6,10 @@
 //! so each test file can `use support::*;`. Not every file uses every helper, hence
 //! the broad allow below.
 #![allow(dead_code, unused_imports)]
+// This is test-support code: helpers are plain `pub fn`s (not `#[test]`/`#[cfg(test)]`),
+// so clippy's `allow-unwrap-in-tests`/`allow-expect-in-tests` heuristic does not exempt
+// them. Allow unwrap/expect here explicitly — the no-panic gate targets production code.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 pub use carrick::compat::{CompatReporter, SyscallArgs};
 pub use carrick::dispatch::{

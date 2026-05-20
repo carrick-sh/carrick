@@ -82,6 +82,9 @@ impl Vfs for DevVfs {
         Ok(PASSTHROUGHS
             .iter()
             .map(|(guest, _)| DirEnt {
+                // INVARIANT: every PASSTHROUGHS guest path is a "/dev/*" literal
+                // by construction, so strip_prefix("/dev/") is always Some.
+                #[allow(clippy::expect_used)]
                 name: guest
                     .strip_prefix("/dev/")
                     .expect("PASSTHROUGHS entries are /dev/* by construction")

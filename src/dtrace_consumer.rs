@@ -206,7 +206,11 @@ pub fn run_child_under_dtrace(
         all_opts.push(("flowindent", ""));
     }
     for (k, v) in &all_opts {
+        // INVARIANT: every (k, v) in all_opts is a static string literal with no
+        // interior NUL byte, so CString::new cannot fail.
+        #[allow(clippy::unwrap_used)]
         let kc = CString::new(*k).unwrap();
+        #[allow(clippy::unwrap_used)]
         let vc = CString::new(*v).unwrap();
         if unsafe { dtrace_setopt(hdl, kc.as_ptr(), vc.as_ptr()) } != 0 {
             let msg = unsafe { errmsg(hdl) };
