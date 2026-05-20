@@ -739,6 +739,12 @@ impl SyscallDispatcher {
         50 => fchdir,
         52 => fchmod,
         53 => fchmodat,
+        54 => fchownat,
+        55 => fchown,
+        56 => openat,
+        57 => close,
+        59 => pipe2,
+        61 => getdents64,
         62 => lseek,
         63 => read,
         64 => write,
@@ -746,9 +752,29 @@ impl SyscallDispatcher {
         66 => writev,
         67 => pread64,
         68 => pwrite64,
+        69 => preadv,
+        70 => pwritev,
+        71 => sendfile,
+        72 => pselect6,
+        73 => ppoll,
+        76 => splice,
         78 => readlinkat,
         79 => newfstatat,
         80 => fstat,
+        81 => sync,
+        82 => fsync,
+        83 => fdatasync,
+        85 => timerfd_create,
+        86 => timerfd_settime,
+        87 => timerfd_gettime,
+        88 => utimensat,
+        90 => capget,
+        91 => capset,
+        92 => personality,
+        95 => waitid,
+        96 => set_tid_address,
+        98 => futex,
+        99 => set_robust_list,
     }
 
     pub fn new() -> Self {
@@ -985,37 +1011,11 @@ impl SyscallDispatcher {
             43 => self.statfs(request, memory)?,
             44 => self.fstatfs(request, memory),
             45 => self.truncate(request, memory)?,
-            54 => self.fchownat(request, memory)?,
-            55 => self.fchown(request),
-            56 => self.openat(request, memory, reporter)?,
-            57 => self.close(request),
-            59 => self.pipe2(request, memory),
-            61 => self.getdents64(request, memory)?,
-            69 => self.preadv(request, memory)?,
-            70 => self.pwritev(request, memory)?,
-            71 => self.sendfile(request, memory)?,
-            72 => self.pselect6(request, memory, reporter)?,
-            73 => self.ppoll(request, memory, reporter)?,
             74 => self.bootstrap_enosys(),
             75 => self.bootstrap_enosys(),
-            76 => self.splice(request, memory)?,
             77 => self.bootstrap_enosys(),
-            81 => self.sync(),
-            82 => self.fsync(request),
-            83 => self.fdatasync(request),
-            85 => self.timerfd_create(request),
-            86 => self.timerfd_settime(request, memory),
-            87 => self.timerfd_gettime(request, memory),
-            88 => self.utimensat(request, memory)?,
-            90 => self.capget(request, memory),
-            91 => self.capset(request, memory),
-            92 => self.personality(request),
             93 => self.exit(request),
             94 => self.exit(request),
-            95 => self.waitid(request),
-            96 => self.set_tid_address(),
-            98 => self.futex(request, memory),
-            99 => self.set_robust_list(request),
             101 => self.nanosleep(request, memory),
             102 => self.getitimer(request, memory),
             103 => self.setitimer(request, memory, reporter),
@@ -1404,15 +1404,18 @@ impl SyscallDispatcher {
         Ok(self.install_fd(description, linux_fd_flags_from_open_flags(flags)))
     }
 
-    fn timerfd_create(&mut self, request: SyscallRequest) -> DispatchOutcome {
-        let clock_id = request.arg(0);
-        let flags = request.arg(1);
+    fn timerfd_create<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let clock_id = ctx.arg(0);
+        let flags = ctx.arg(1);
         if linux_clock_duration(clock_id).is_none()
             || flags & !(LINUX_TFD_NONBLOCK | LINUX_TFD_CLOEXEC) != 0
         {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
-            };
+            });
         }
         let description = OpenDescription::TimerFd {
             clock_id,
@@ -1421,33 +1424,33 @@ impl SyscallDispatcher {
             expirations: 0,
             status_flags: flags & LINUX_TFD_NONBLOCK,
         };
-        self.install_fd(description, linux_fd_flags_from_open_flags(flags))
+        Ok(self.install_fd(description, linux_fd_flags_from_open_flags(flags)))
     }
 
-    fn timerfd_settime(
+    fn timerfd_settime<M: GuestMemory>(
         &mut self,
-        request: SyscallRequest,
-        memory: &mut impl GuestMemory,
-    ) -> DispatchOutcome {
-        let fd = request.arg(0) as i32;
-        let flags = request.arg(1);
-        let new_value = request.arg(2);
-        let old_value = request.arg(3);
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let fd = ctx.arg(0) as i32;
+        let flags = ctx.arg(1);
+        let new_value = ctx.arg(2);
+        let old_value = ctx.arg(3);
+        let memory = &mut *ctx.memory;
         if flags & !LINUX_TIMER_ABSTIME != 0 {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
-            };
+            });
         }
         let spec = match read_itimerspec(memory, new_value) {
             Ok(spec) => spec,
-            Err(errno) => return DispatchOutcome::Errno { errno },
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
         let (next_interval, next_value) = match itimerspec_durations(spec) {
             Ok(value) => value,
-            Err(errno) => return DispatchOutcome::Errno { errno },
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
         let Some(open_file) = self.open_files.get(&fd) else {
-            return DispatchOutcome::Errno { errno: LINUX_EBADF };
+            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         };
         let mut open = open_file.description.borrow_mut();
         let OpenDescription::TimerFd {
@@ -1458,17 +1461,17 @@ impl SyscallDispatcher {
             ..
         } = &mut *open
         else {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
-            };
+            });
         };
 
         if old_value != 0 {
             let previous = timerfd_itimerspec(*clock_id, *interval, *deadline);
             if write_kernel_struct_raw(memory, old_value, &previous).is_err() {
-                return DispatchOutcome::Errno {
+                return Ok(DispatchOutcome::Errno {
                     errno: LINUX_EFAULT,
-                };
+                });
             }
         }
 
@@ -1482,18 +1485,18 @@ impl SyscallDispatcher {
             }
         });
         *expirations = 0;
-        DispatchOutcome::Returned { value: 0 }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
-    fn timerfd_gettime(
-        &self,
-        request: SyscallRequest,
-        memory: &mut impl GuestMemory,
-    ) -> DispatchOutcome {
-        let fd = request.arg(0) as i32;
-        let current_value = request.arg(1);
+    fn timerfd_gettime<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let fd = ctx.arg(0) as i32;
+        let current_value = ctx.arg(1);
+        let memory = &mut *ctx.memory;
         let Some(open_file) = self.open_files.get(&fd) else {
-            return DispatchOutcome::Errno { errno: LINUX_EBADF };
+            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         };
         let open = open_file.description.borrow();
         let OpenDescription::TimerFd {
@@ -1503,12 +1506,12 @@ impl SyscallDispatcher {
             ..
         } = &*open
         else {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
-            };
+            });
         };
         let current = timerfd_itimerspec(*clock_id, *interval, *deadline);
-        write_kernel_struct(memory, current_value, &current)
+        Ok(write_kernel_struct(memory, current_value, &current))
     }
 
     fn epoll_create1<M: GuestMemory>(
@@ -1697,18 +1700,19 @@ impl SyscallDispatcher {
         }
     }
 
-    fn pselect6(
-        &self,
-        request: SyscallRequest,
-        memory: &mut impl GuestMemory,
-        reporter: &mut CompatReporter,
+    fn pselect6<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let nfds = usize::try_from(request.arg(0))
-            .map_err(|_| DispatchError::LengthTooLarge(request.arg(0)))?;
-        let readfds_addr = request.arg(1);
-        let writefds_addr = request.arg(2);
-        let exceptfds_addr = request.arg(3);
-        let timeout_addr = request.arg(4);
+        let nfds = usize::try_from(ctx.arg(0))
+            .map_err(|_| DispatchError::LengthTooLarge(ctx.arg(0)))?;
+        let readfds_addr = ctx.arg(1);
+        let writefds_addr = ctx.arg(2);
+        let exceptfds_addr = ctx.arg(3);
+        let timeout_addr = ctx.arg(4);
+        let request = &ctx.request;
+        let memory = &mut *ctx.memory;
+        let reporter = &mut *ctx.reporter;
 
         // Decode timespec → millis for libc::poll. NULL = block forever (-1).
         let timeout_ms: i32 = if timeout_addr == 0 {
@@ -1950,16 +1954,17 @@ impl SyscallDispatcher {
         Ok(Ok(ready_count))
     }
 
-    fn ppoll(
-        &self,
-        request: SyscallRequest,
-        memory: &mut impl GuestMemory,
-        reporter: &mut CompatReporter,
+    fn ppoll<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let pollfds_address = request.arg(0);
-        let nfds = usize::try_from(request.arg(1))
-            .map_err(|_| DispatchError::LengthTooLarge(request.arg(1)))?;
-        let timeout_address = request.arg(2);
+        let pollfds_address = ctx.arg(0);
+        let nfds = usize::try_from(ctx.arg(1))
+            .map_err(|_| DispatchError::LengthTooLarge(ctx.arg(1)))?;
+        let timeout_address = ctx.arg(2);
+        let request = &ctx.request;
+        let memory = &mut *ctx.memory;
+        let reporter = &mut *ctx.reporter;
 
         // Decode timeout. NULL pointer means block forever; non-NULL points
         // to a `struct timespec { i64 tv_sec; i64 tv_nsec; }`. We translate
@@ -2270,13 +2275,17 @@ impl SyscallDispatcher {
         ready
     }
 
-    fn pipe2(&mut self, request: SyscallRequest, memory: &mut impl GuestMemory) -> DispatchOutcome {
-        let address = request.arg(0);
-        let flags = request.arg(1);
+    fn pipe2<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let address = ctx.arg(0);
+        let flags = ctx.arg(1);
+        let memory = &mut *ctx.memory;
         if flags & !(LINUX_O_CLOEXEC | LINUX_O_NONBLOCK) != 0 {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
-            };
+            });
         }
 
         // Allocate a real host pipe so the two ends share state via the
@@ -2285,7 +2294,7 @@ impl SyscallDispatcher {
         let mut host_fds = [0i32; 2];
         let r = unsafe { libc::pipe(host_fds.as_mut_ptr()) };
         if r != 0 {
-            return DispatchOutcome::Errno { errno: host_errno() };
+            return Ok(DispatchOutcome::Errno { errno: host_errno() });
         }
 
         let host_read = host_fds[0];
@@ -2296,18 +2305,18 @@ impl SyscallDispatcher {
                 libc::close(host_read);
                 libc::close(host_write);
             }
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
-            };
+            });
         };
         let Some(write_fd) = self.allocate_fd(read_fd.saturating_add(1)) else {
             unsafe {
                 libc::close(host_read);
                 libc::close(host_write);
             }
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
-            };
+            });
         };
         let pair = LinuxFdPair { read_fd, write_fd };
         if write_kernel_struct_raw(memory, address, &pair).is_err() {
@@ -2315,9 +2324,9 @@ impl SyscallDispatcher {
                 libc::close(host_read);
                 libc::close(host_write);
             }
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EFAULT,
-            };
+            });
         }
 
         // The access mode must be encoded per end so fcntl(F_GETFL) reports
@@ -2350,7 +2359,7 @@ impl SyscallDispatcher {
             },
         );
 
-        DispatchOutcome::Returned { value: 0 }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
     fn dup<M: GuestMemory>(
@@ -2981,23 +2990,27 @@ impl SyscallDispatcher {
         Ok(outcome)
     }
 
-    fn capget(&self, request: SyscallRequest, memory: &mut impl GuestMemory) -> DispatchOutcome {
-        let header_address = request.arg(0);
-        let data_address = request.arg(1);
+    fn capget<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let header_address = ctx.arg(0);
+        let data_address = ctx.arg(1);
+        let memory = &mut *ctx.memory;
         let header = match read_capability_header(memory, header_address) {
             Ok(header) => header,
-            Err(errno) => return DispatchOutcome::Errno { errno },
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
         if !linux_capability_version_is_supported(header.version) {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
-            };
+            });
         }
         if header.pid < 0 {
-            return DispatchOutcome::Errno { errno: LINUX_ESRCH };
+            return Ok(DispatchOutcome::Errno { errno: LINUX_ESRCH });
         }
         if data_address == 0 {
-            return DispatchOutcome::Returned { value: 0 };
+            return Ok(DispatchOutcome::Returned { value: 0 });
         }
         let words = linux_capability_data_words(header.version);
         let empty = vec![LinuxCapabilityData::empty(); words];
@@ -3005,48 +3018,55 @@ impl SyscallDispatcher {
             .write_bytes(data_address, capability_data_bytes(&empty).as_slice())
             .is_err()
         {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EFAULT,
-            };
+            });
         }
-        DispatchOutcome::Returned { value: 0 }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
-    fn capset(&self, request: SyscallRequest, memory: &impl GuestMemory) -> DispatchOutcome {
-        let header_address = request.arg(0);
-        let data_address = request.arg(1);
+    fn capset<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let header_address = ctx.arg(0);
+        let data_address = ctx.arg(1);
+        let memory = &*ctx.memory;
         let header = match read_capability_header(memory, header_address) {
             Ok(header) => header,
-            Err(errno) => return DispatchOutcome::Errno { errno },
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
         if !linux_capability_version_is_supported(header.version) {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
-            };
+            });
         }
         if header.pid < 0 {
-            return DispatchOutcome::Errno { errno: LINUX_ESRCH };
+            return Ok(DispatchOutcome::Errno { errno: LINUX_ESRCH });
         }
         let words = linux_capability_data_words(header.version);
         let data = match read_capability_data(memory, data_address, words) {
             Ok(data) => data,
-            Err(errno) => return DispatchOutcome::Errno { errno },
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
         if data.iter().any(|word| !word.is_empty()) {
-            return DispatchOutcome::Errno { errno: LINUX_EPERM };
+            return Ok(DispatchOutcome::Errno { errno: LINUX_EPERM });
         }
-        DispatchOutcome::Returned { value: 0 }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
-    fn personality(&mut self, request: SyscallRequest) -> DispatchOutcome {
-        let requested = request.arg(0);
+    fn personality<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let requested = ctx.arg(0);
         let previous = self.personality;
         if requested != LINUX_PERSONALITY_QUERY {
             self.personality = requested;
         }
-        DispatchOutcome::Returned {
+        Ok(DispatchOutcome::Returned {
             value: previous as i64,
-        }
+        })
     }
 
     fn prctl(&mut self, request: SyscallRequest, memory: &mut impl GuestMemory) -> DispatchOutcome {
@@ -3113,18 +3133,24 @@ impl SyscallDispatcher {
         DispatchOutcome::Returned { value: 0 }
     }
 
-    fn set_tid_address(&self) -> DispatchOutcome {
-        self.getpid()
+    fn set_tid_address<M: GuestMemory>(
+        &mut self,
+        _ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        Ok(self.getpid())
     }
 
-    fn set_robust_list(&self, request: SyscallRequest) -> DispatchOutcome {
-        let len = request.arg(1);
+    fn set_robust_list<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let len = ctx.arg(1);
         if len == 0 {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
-            };
+            });
         }
-        DispatchOutcome::Returned { value: 0 }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
     fn sched_yield(&self) -> DispatchOutcome {
@@ -3162,48 +3188,52 @@ impl SyscallDispatcher {
         }
     }
 
-    fn futex(&self, request: SyscallRequest, memory: &impl GuestMemory) -> DispatchOutcome {
-        let address = request.arg(0);
-        let operation = request.arg(1);
-        let value = request.arg(2) as u32;
-        let timeout_address = request.arg(3);
+    fn futex<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let address = ctx.arg(0);
+        let operation = ctx.arg(1);
+        let value = ctx.arg(2) as u32;
+        let timeout_address = ctx.arg(3);
+        let memory = &*ctx.memory;
         let command = operation & LINUX_FUTEX_CMD_MASK;
         let flags = operation & !LINUX_FUTEX_CMD_MASK;
         if flags & !(LINUX_FUTEX_PRIVATE_FLAG | LINUX_FUTEX_CLOCK_REALTIME) != 0 {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
-            };
+            });
         }
         if flags & LINUX_FUTEX_CLOCK_REALTIME != 0 {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
-            };
+            });
         }
         let word = match read_u32(memory, address) {
             Ok(word) => word,
-            Err(errno) => return DispatchOutcome::Errno { errno },
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
 
-        match command {
+        Ok(match command {
             LINUX_FUTEX_WAKE => DispatchOutcome::Returned { value: 0 },
             LINUX_FUTEX_WAIT => {
                 if word != value {
-                    return DispatchOutcome::Errno {
+                    return Ok(DispatchOutcome::Errno {
                         errno: LINUX_EAGAIN,
-                    };
+                    });
                 }
                 if timeout_address == 0 {
-                    return DispatchOutcome::Errno {
+                    return Ok(DispatchOutcome::Errno {
                         errno: LINUX_EAGAIN,
-                    };
+                    });
                 }
                 let timespec = match read_timespec(memory, timeout_address) {
                     Ok(timespec) => timespec,
-                    Err(errno) => return DispatchOutcome::Errno { errno },
+                    Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
                 };
                 let timeout = match duration_from_linux_timespec(timespec) {
                     Ok(timeout) => timeout,
-                    Err(errno) => return DispatchOutcome::Errno { errno },
+                    Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
                 };
                 if let Some(timeout) = timeout {
                     std::thread::sleep(timeout);
@@ -3215,7 +3245,7 @@ impl SyscallDispatcher {
             _ => DispatchOutcome::Errno {
                 errno: LINUX_ENOSYS,
             },
-        }
+        })
     }
 
     fn nanosleep(&self, request: SyscallRequest, memory: &impl GuestMemory) -> DispatchOutcome {
@@ -4045,30 +4075,33 @@ impl SyscallDispatcher {
         DispatchOutcome::Returned { value: 1 }
     }
 
-    fn waitid(&self, request: SyscallRequest) -> DispatchOutcome {
-        let idtype = request.arg(0);
-        let options = request.arg(3);
+    fn waitid<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let idtype = ctx.arg(0);
+        let options = ctx.arg(3);
         match idtype {
             LINUX_P_ALL | LINUX_P_PID | LINUX_P_PGID | LINUX_P_PIDFD => {}
             _ => {
-                return DispatchOutcome::Errno {
+                return Ok(DispatchOutcome::Errno {
                     errno: LINUX_EINVAL,
-                };
+                });
             }
         }
         if options & !LINUX_WAITID_SUPPORTED_FLAGS != 0 {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
-            };
+            });
         }
         if options & LINUX_WAITID_STATE_MASK == 0 {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
-            };
+            });
         }
-        DispatchOutcome::Errno {
+        Ok(DispatchOutcome::Errno {
             errno: LINUX_ECHILD,
-        }
+        })
     }
 
     fn wait4(
@@ -4105,19 +4138,14 @@ impl SyscallDispatcher {
         DispatchOutcome::Returned { value: i64::from(result) }
     }
 
-    fn openat(
+    fn openat<M: GuestMemory>(
         &mut self,
-        request: SyscallRequest,
-        memory: &impl GuestMemory,
-        reporter: &mut CompatReporter,
+        ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        self.open_at_path(
-            request.arg(0),
-            request.arg(1),
-            request.arg(2),
-            memory,
-            reporter,
-        )
+        let dirfd = ctx.arg(0);
+        let pathname = ctx.arg(1);
+        let flags = ctx.arg(2);
+        self.open_at_path(dirfd, pathname, flags, &*ctx.memory, ctx.reporter)
     }
 
     fn openat2(
@@ -4361,9 +4389,12 @@ impl SyscallDispatcher {
             .map(|md| vfs_md_to_rootfs_md(path, &md))
     }
 
-    fn close(&mut self, request: SyscallRequest) -> DispatchOutcome {
-        let fd = request.arg(0) as i32;
-        if let Some(open_file) = self.open_files.remove(&fd) {
+    fn close<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let fd = ctx.arg(0) as i32;
+        Ok(if let Some(open_file) = self.open_files.remove(&fd) {
             close_open_file(&open_file);
             DispatchOutcome::Returned { value: 0 }
         } else if is_stdio_fd(fd) {
@@ -4375,7 +4406,7 @@ impl SyscallDispatcher {
             DispatchOutcome::Returned { value: 0 }
         } else {
             DispatchOutcome::Errno { errno: LINUX_EBADF }
-        }
+        })
     }
 
     /// `close_range(first, last, flags)` — close every fd in `[first, last]`
@@ -5451,15 +5482,15 @@ impl SyscallDispatcher {
         DispatchOutcome::Returned { value: fd as i64 }
     }
 
-    fn getdents64(
+    fn getdents64<M: GuestMemory>(
         &mut self,
-        request: SyscallRequest,
-        memory: &mut impl GuestMemory,
+        ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let fd = request.arg(0) as i32;
-        let address = request.arg(1);
-        let length = usize::try_from(request.arg(2))
-            .map_err(|_| DispatchError::LengthTooLarge(request.arg(2)))?;
+        let fd = ctx.arg(0) as i32;
+        let address = ctx.arg(1);
+        let length = usize::try_from(ctx.arg(2))
+            .map_err(|_| DispatchError::LengthTooLarge(ctx.arg(2)))?;
+        let memory = &mut *ctx.memory;
         let Some(open_file) = self.open_files.get(&fd) else {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         };
@@ -6407,17 +6438,17 @@ impl SyscallDispatcher {
         })
     }
 
-    fn preadv(
+    fn preadv<M: GuestMemory>(
         &mut self,
-        request: SyscallRequest,
-        memory: &mut impl GuestMemory,
+        ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let fd = request.arg(0) as i32;
-        let iov = request.arg(1);
-        let iovcnt = usize::try_from(request.arg(2))
-            .map_err(|_| DispatchError::LengthTooLarge(request.arg(2)))?;
-        let offset = usize::try_from(request.arg(3))
-            .map_err(|_| DispatchError::LengthTooLarge(request.arg(3)))?;
+        let fd = ctx.arg(0) as i32;
+        let iov = ctx.arg(1);
+        let iovcnt = usize::try_from(ctx.arg(2))
+            .map_err(|_| DispatchError::LengthTooLarge(ctx.arg(2)))?;
+        let offset = usize::try_from(ctx.arg(3))
+            .map_err(|_| DispatchError::LengthTooLarge(ctx.arg(3)))?;
+        let memory = &mut *ctx.memory;
         let iovecs = match read_iovecs(memory, iov, iovcnt) {
             Ok(iovecs) => iovecs,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
@@ -6536,16 +6567,16 @@ impl SyscallDispatcher {
         Ok(DispatchOutcome::Errno { errno })
     }
 
-    fn pwritev(
+    fn pwritev<M: GuestMemory>(
         &mut self,
-        request: SyscallRequest,
-        memory: &impl GuestMemory,
+        ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let fd = request.arg(0) as i32;
-        let iov = request.arg(1);
-        let iovcnt = usize::try_from(request.arg(2))
-            .map_err(|_| DispatchError::LengthTooLarge(request.arg(2)))?;
-        let offset = i64::from_ne_bytes(request.arg(3).to_ne_bytes());
+        let fd = ctx.arg(0) as i32;
+        let iov = ctx.arg(1);
+        let iovcnt = usize::try_from(ctx.arg(2))
+            .map_err(|_| DispatchError::LengthTooLarge(ctx.arg(2)))?;
+        let offset = i64::from_ne_bytes(ctx.arg(3).to_ne_bytes());
+        let memory = &*ctx.memory;
         let iovecs = match read_iovecs(memory, iov, iovcnt) {
             Ok(iovecs) => iovecs,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
@@ -6620,16 +6651,16 @@ impl SyscallDispatcher {
         Ok(DispatchOutcome::Errno { errno })
     }
 
-    fn sendfile(
+    fn sendfile<M: GuestMemory>(
         &mut self,
-        request: SyscallRequest,
-        memory: &mut impl GuestMemory,
+        ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let out_fd = request.arg(0) as i32;
-        let in_fd = request.arg(1) as i32;
-        let offset_address = request.arg(2);
-        let count = usize::try_from(request.arg(3))
-            .map_err(|_| DispatchError::LengthTooLarge(request.arg(3)))?;
+        let out_fd = ctx.arg(0) as i32;
+        let in_fd = ctx.arg(1) as i32;
+        let offset_address = ctx.arg(2);
+        let count = usize::try_from(ctx.arg(3))
+            .map_err(|_| DispatchError::LengthTooLarge(ctx.arg(3)))?;
+        let memory = &mut *ctx.memory;
         if count == 0 {
             return Ok(DispatchOutcome::Returned { value: 0 });
         }
@@ -6856,18 +6887,18 @@ impl SyscallDispatcher {
         Ok(available[..write_len].to_vec())
     }
 
-    fn splice(
+    fn splice<M: GuestMemory>(
         &mut self,
-        request: SyscallRequest,
-        memory: &mut impl GuestMemory,
+        ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let in_fd = request.arg(0) as i32;
-        let off_in_address = request.arg(1);
-        let out_fd = request.arg(2) as i32;
-        let off_out_address = request.arg(3);
-        let count = usize::try_from(request.arg(4))
-            .map_err(|_| DispatchError::LengthTooLarge(request.arg(4)))?;
-        let flags = request.arg(5);
+        let in_fd = ctx.arg(0) as i32;
+        let off_in_address = ctx.arg(1);
+        let out_fd = ctx.arg(2) as i32;
+        let off_out_address = ctx.arg(3);
+        let count = usize::try_from(ctx.arg(4))
+            .map_err(|_| DispatchError::LengthTooLarge(ctx.arg(4)))?;
+        let flags = ctx.arg(5);
+        let memory = &mut *ctx.memory;
         if flags & !LINUX_SPLICE_SUPPORTED_FLAGS != 0 {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
@@ -6989,8 +7020,11 @@ impl SyscallDispatcher {
         }
     }
 
-    fn sync(&self) -> DispatchOutcome {
-        DispatchOutcome::Returned { value: 0 }
+    fn sync<M: GuestMemory>(
+        &mut self,
+        _ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
     fn xattr_unsupported(&self) -> DispatchOutcome {
@@ -7005,20 +7039,26 @@ impl SyscallDispatcher {
         }
     }
 
-    fn fsync(&self, request: SyscallRequest) -> DispatchOutcome {
-        let fd = request.arg(0) as i32;
+    fn fsync<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let fd = ctx.arg(0) as i32;
         if !self.fd_is_valid(fd) {
-            return DispatchOutcome::Errno { errno: LINUX_EBADF };
+            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         }
-        DispatchOutcome::Returned { value: 0 }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
-    fn fdatasync(&self, request: SyscallRequest) -> DispatchOutcome {
-        let fd = request.arg(0) as i32;
+    fn fdatasync<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let fd = ctx.arg(0) as i32;
         if !self.fd_is_valid(fd) {
-            return DispatchOutcome::Errno { errno: LINUX_EBADF };
+            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         }
-        DispatchOutcome::Returned { value: 0 }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
     fn write<M: GuestMemory>(
@@ -7444,29 +7484,31 @@ impl SyscallDispatcher {
         Ok(DispatchOutcome::Returned { value: 0 })
     }
 
-    fn fchown(&self, request: SyscallRequest) -> DispatchOutcome {
-        let fd = request.arg(0) as i32;
+    fn fchown<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let fd = ctx.arg(0) as i32;
         if !self.fd_is_valid(fd) {
-            return DispatchOutcome::Errno { errno: LINUX_EBADF };
+            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         }
         // See `fchmod` above: tmpfs semantics, no-op success.
-        DispatchOutcome::Returned { value: 0 }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
-    fn fchownat(
-        &self,
-        request: SyscallRequest,
-        memory: &impl GuestMemory,
+    fn fchownat<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let dirfd = request.arg(0);
-        let pathname = request.arg(1);
-        let flags = request.arg(4);
+        let dirfd = ctx.arg(0);
+        let pathname = ctx.arg(1);
+        let flags = ctx.arg(4);
         if flags & !(LINUX_AT_SYMLINK_NOFOLLOW | LINUX_AT_EMPTY_PATH) != 0 {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
             });
         }
-        let path = match read_guest_c_string(memory, pathname) {
+        let path = match read_guest_c_string(&*ctx.memory, pathname) {
             Ok(path) => path,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
@@ -7817,15 +7859,15 @@ impl SyscallDispatcher {
         }
     }
 
-    fn utimensat(
-        &self,
-        request: SyscallRequest,
-        memory: &impl GuestMemory,
+    fn utimensat<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let dirfd = request.arg(0);
-        let pathname = request.arg(1);
-        let times = request.arg(2);
-        let flags = request.arg(3);
+        let dirfd = ctx.arg(0);
+        let pathname = ctx.arg(1);
+        let times = ctx.arg(2);
+        let flags = ctx.arg(3);
+        let memory = &*ctx.memory;
         if flags & !LINUX_AT_SYMLINK_NOFOLLOW != 0 {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
