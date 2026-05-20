@@ -12,6 +12,32 @@ impl From<[u64; 6]> for SyscallArgs {
     }
 }
 
+/// Snapshot of the guest's key aarch64 registers at a trap, passed to
+/// the `vcpu__trap` USDT probe by reference. usdt JSON-encodes any
+/// `&T: Serialize`, so bundling registers into one struct sidesteps
+/// the 6-argument-per-probe ceiling (we'd otherwise have to choose
+/// between PC, SP, FP, LR, x8 and the arg registers). DTrace consumers
+/// `copyinstr(arg)` the JSON: `{"pc":..,"sp":..,"fp":..,"lr":..,
+/// "x8":..,"x0":..}`. `fp` (x29) is what `guest_stack.d` follows to
+/// walk the guest call chain on frame-pointer builds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuestRegs {
+    pub pc: u64,
+    pub sp: u64,
+    pub fp: u64,
+    pub lr: u64,
+    pub x8: u64,
+    pub x0: u64,
+    /// Wrapping offset that maps a guest virtual address in the
+    /// stack's region to the host virtual address carrick mapped it
+    /// at: `host_va = guest_va.wrapping_add(stack_xlate)`. carrick
+    /// computes it at trap time from the region containing `sp`, so
+    /// `guest_stack.d` can `copyin` the frame-pointer chain directly
+    /// without a separate mapping table. 0 if `sp` isn't in any known
+    /// region (stack walk not possible).
+    pub stack_xlate: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CompatEvent {
@@ -117,86 +143,118 @@ impl CompatEvent {
     }
 }
 
-#[derive(Debug, Default)]
+/// Aggregates compatibility events as they happen rather than buffering
+/// every syscall. Storing one `CompatEvent` per syscall (the old
+/// design) grew an unbounded `Vec` and allocated a `String` name on the
+/// hot path even when nobody consumed it. Now `record` bumps counters /
+/// rare-event maps directly, so a syscall-heavy run costs a few integer
+/// increments instead of a heap push. The detailed report stays
+/// always-on (the aggregate maps are cheap); only the verbose
+/// per-event stderr trace is opt-in via `CARRICK_TRACE_SYSCALLS`.
+#[derive(Debug)]
 pub struct CompatReporter {
-    events: Vec<CompatEvent>,
+    syscall_entries: u64,
+    syscall_returns_ok: u64,
+    syscall_returns_errno: u64,
+    unhandled_syscalls: HashMap<(u64, String), u64>,
+    partial_syscalls: HashMap<(u64, String, String), u64>,
+    unhandled_ioctls: HashMap<u64, u64>,
+    proc_read_unimplemented: HashMap<String, u64>,
+    sys_read_unimplemented: HashMap<String, u64>,
+    unsupported_signals: HashMap<(i32, String), u64>,
+    unknown_syscall_flags: HashMap<(u64, String, u32, u64), u64>,
+    /// Cached once at construction so we don't `getenv` per syscall.
+    trace_syscalls: bool,
+}
+
+impl Default for CompatReporter {
+    fn default() -> Self {
+        Self {
+            syscall_entries: 0,
+            syscall_returns_ok: 0,
+            syscall_returns_errno: 0,
+            unhandled_syscalls: HashMap::new(),
+            partial_syscalls: HashMap::new(),
+            unhandled_ioctls: HashMap::new(),
+            proc_read_unimplemented: HashMap::new(),
+            sys_read_unimplemented: HashMap::new(),
+            unsupported_signals: HashMap::new(),
+            unknown_syscall_flags: HashMap::new(),
+            trace_syscalls: std::env::var_os("CARRICK_TRACE_SYSCALLS").is_some(),
+        }
+    }
 }
 
 impl CompatReporter {
     pub fn record(&mut self, event: CompatEvent) {
+        // USDT probe first — usdt gates the closure on is_enabled, so
+        // this is near-free when no DTrace consumer is attached.
         crate::probes::fire(&event);
-        // Opt-in syscall trace. Off by default; set
-        // `CARRICK_TRACE_SYSCALLS=1` to get one-line-per-event output on
-        // stderr. Useful when chasing "where does this EINVAL come
-        // from?" without standing up the full libdtrace consumer.
-        if std::env::var_os("CARRICK_TRACE_SYSCALLS").is_some() {
+        // Opt-in verbose stderr trace (cached env check, not per-call).
+        if self.trace_syscalls {
             if let Ok(line) = serde_json::to_string(&event) {
                 eprintln!("[carrick-syscall] {line}");
             }
         }
-        self.events.push(event);
+        // Aggregate inline. Common events (entry/return) are pure
+        // counter bumps; rare events land in their dedup maps.
+        match event {
+            CompatEvent::SyscallEntry { .. } => self.syscall_entries += 1,
+            CompatEvent::SyscallReturn { errno, .. } => {
+                if errno.is_some() {
+                    self.syscall_returns_errno += 1;
+                } else {
+                    self.syscall_returns_ok += 1;
+                }
+            }
+            CompatEvent::UnhandledSyscall { number, name, .. } => {
+                *self.unhandled_syscalls.entry((number, name)).or_default() += 1;
+            }
+            CompatEvent::PartialSyscall {
+                number,
+                name,
+                reason,
+                ..
+            } => {
+                *self.partial_syscalls.entry((number, name, reason)).or_default() += 1;
+            }
+            CompatEvent::UnhandledIoctl { request, .. } => {
+                *self.unhandled_ioctls.entry(request).or_default() += 1;
+            }
+            CompatEvent::ProcReadUnimplemented { path } => {
+                *self.proc_read_unimplemented.entry(path).or_default() += 1;
+            }
+            CompatEvent::SysReadUnimplemented { path } => {
+                *self.sys_read_unimplemented.entry(path).or_default() += 1;
+            }
+            CompatEvent::SignalUnsupported { signum, reason } => {
+                *self.unsupported_signals.entry((signum, reason)).or_default() += 1;
+            }
+            CompatEvent::UnknownSyscallFlags {
+                number,
+                name,
+                argument,
+                unknown_bits,
+            } => {
+                *self
+                    .unknown_syscall_flags
+                    .entry((number, name, argument, unknown_bits))
+                    .or_default() += 1;
+            }
+        }
     }
 
     pub fn finish(self) -> CompatReport {
-        let mut unhandled_syscalls = HashMap::<(u64, String), u64>::new();
-        let mut partial_syscalls = HashMap::<(u64, String, String), u64>::new();
-        let mut unhandled_ioctls = HashMap::<u64, u64>::new();
-        let mut proc_read_unimplemented = HashMap::<String, u64>::new();
-        let mut sys_read_unimplemented = HashMap::<String, u64>::new();
-        let mut unsupported_signals = HashMap::<(i32, String), u64>::new();
-        let mut unknown_syscall_flags = HashMap::<(u64, String, u32, u64), u64>::new();
-
-        let mut syscall_entries = 0_u64;
-        let mut syscall_returns_ok = 0_u64;
-        let mut syscall_returns_errno = 0_u64;
-
-        for event in self.events {
-            match event {
-                CompatEvent::SyscallEntry { .. } => {
-                    syscall_entries += 1;
-                }
-                CompatEvent::SyscallReturn { errno, .. } => {
-                    if errno.is_some() {
-                        syscall_returns_errno += 1;
-                    } else {
-                        syscall_returns_ok += 1;
-                    }
-                }
-                CompatEvent::UnhandledSyscall { number, name, .. } => {
-                    *unhandled_syscalls.entry((number, name)).or_default() += 1;
-                }
-                CompatEvent::PartialSyscall {
-                    number,
-                    name,
-                    reason,
-                    ..
-                } => {
-                    *partial_syscalls.entry((number, name, reason)).or_default() += 1;
-                }
-                CompatEvent::UnhandledIoctl { request, .. } => {
-                    *unhandled_ioctls.entry(request).or_default() += 1;
-                }
-                CompatEvent::ProcReadUnimplemented { path } => {
-                    *proc_read_unimplemented.entry(path).or_default() += 1;
-                }
-                CompatEvent::SysReadUnimplemented { path } => {
-                    *sys_read_unimplemented.entry(path).or_default() += 1;
-                }
-                CompatEvent::SignalUnsupported { signum, reason } => {
-                    *unsupported_signals.entry((signum, reason)).or_default() += 1;
-                }
-                CompatEvent::UnknownSyscallFlags {
-                    number,
-                    name,
-                    argument,
-                    unknown_bits,
-                } => {
-                    *unknown_syscall_flags
-                        .entry((number, name, argument, unknown_bits))
-                        .or_default() += 1;
-                }
-            }
-        }
+        let syscall_entries = self.syscall_entries;
+        let syscall_returns_ok = self.syscall_returns_ok;
+        let syscall_returns_errno = self.syscall_returns_errno;
+        let unhandled_syscalls = self.unhandled_syscalls;
+        let partial_syscalls = self.partial_syscalls;
+        let unhandled_ioctls = self.unhandled_ioctls;
+        let proc_read_unimplemented = self.proc_read_unimplemented;
+        let sys_read_unimplemented = self.sys_read_unimplemented;
+        let unsupported_signals = self.unsupported_signals;
+        let unknown_syscall_flags = self.unknown_syscall_flags;
 
         let unhandled_syscall_invocations = unhandled_syscalls.values().sum::<u64>();
         let unhandled_syscalls = sorted_syscalls(unhandled_syscalls);

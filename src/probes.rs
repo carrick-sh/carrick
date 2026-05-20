@@ -29,12 +29,12 @@ mod carrick_usdt {
     /// (0 in the child, child pid in the parent).
     fn fork__post(_: i32, _: u64, _: u64) {}
     /// Fires every time the trap engine returns from `vcpu.run` with
-    /// a syscall exit. Args are the guest's EL0 PC at the trap (taken
-    /// from ELR_EL1, which HVF sets to instruction-after-svc), the
-    /// syscall number from x8, and x0 (first arg / clone retval).
-    /// Lower overhead than `syscall-entry` for cases where you only
-    /// want to spot loops.
-    fn vcpu__trap(_: u64, _: u64, _: u64, _: u64) {}
+    /// a syscall exit. Carries a `&GuestRegs` snapshot (PC, SP, FP,
+    /// LR, x8, x0) JSON-encoded by usdt — one struct instead of six
+    /// scalars, sidestepping the per-probe arg ceiling. The `fp` field
+    /// lets `guest_stack.d` walk the guest's call chain on frame-
+    /// pointer builds without host help.
+    fn vcpu__trap(_: &crate::compat::GuestRegs) {}
     /// Fires when `execve_into` has finished swapping the engine to
     /// the new image. `path`, `entry`, `initial_sp`, `mapping_count`
     /// let dtrace operators verify the new process layout.
@@ -58,35 +58,70 @@ mod carrick_usdt {
     /// dtrace operators can see exactly how the guest invokes a
     /// child (e.g. apt's sqv method calling /usr/bin/sqv).
     fn execve__argv(_: u32, _: &str, _: &str) {}
+    /// Host-pipe I/O: `dir` is 0 for read, 1 for write; `n` is the
+    /// byte count (negative on error). Used to trace whether a forked
+    /// child's stdout actually reaches the parent's pipe read.
+    fn host__pipe__io(_: u32, _: i32, _: i32, _: i64) {}
 }
 
 pub fn fork_pre(pc: u64, elr: u64, cpsr: u64) {
     carrick_usdt::fork__pre!(|| (pc, elr, cpsr));
 }
 
+// For these helpers the PID read happens INSIDE the closure. usdt's
+// `probe!` macro only invokes the closure when the probe is enabled
+// (it gates on `is_enabled()` in asm before calling), so `getpid()`
+// is genuinely zero-cost when no DTrace consumer is attached.
 pub fn path_open(path: &str, result_size: u64, errno: i32) {
-    let pid = unsafe { libc::getpid() as u32 };
-    carrick_usdt::path__open!(|| (pid, path, result_size, errno));
+    carrick_usdt::path__open!(|| (
+        unsafe { libc::getpid() as u32 },
+        path,
+        result_size,
+        errno
+    ));
 }
 
 pub fn guest_exit(code: i32) {
-    let pid = unsafe { libc::getpid() as u32 };
-    carrick_usdt::guest__exit!(|| (pid, code));
+    carrick_usdt::guest__exit!(|| (unsafe { libc::getpid() as u32 }, code));
 }
 
 pub fn execve_argv(path: &str, argv: &[String]) {
-    let pid = unsafe { libc::getpid() as u32 };
+    // `argv.join` allocates, so it can't move inside the closure (the
+    // returned `&str` would dangle once the closure's local String
+    // drops, before usdt serialises it). execve is rare, so the
+    // unconditional join is acceptable; the hot paths above are the
+    // ones that matter for zero-cost-when-disabled.
     let joined = argv.join(" ");
-    carrick_usdt::execve__argv!(|| (pid, path, joined.as_str()));
+    carrick_usdt::execve__argv!(|| (
+        unsafe { libc::getpid() as u32 },
+        path,
+        joined.as_str()
+    ));
 }
+
+pub fn host_pipe_io(host_fd: i32, dir: i32, n: i64) {
+    carrick_usdt::host__pipe__io!(|| (
+        unsafe { libc::getpid() as u32 },
+        host_fd,
+        dir,
+        n
+    ));
+}
+
 
 
 pub fn fork_post(pid: i32, pc: u64, elr: u64) {
     carrick_usdt::fork__post!(|| (pid, pc, elr));
 }
 
-pub fn vcpu_trap(guest_pc: u64, x8: u64, x0: u64, x30: u64) {
-    carrick_usdt::vcpu__trap!(|| (guest_pc, x8, x0, x30));
+// `#[inline(never)]`: usdt embeds the probe site (an asm! anchor) in
+// the function body. If this gets inlined into multiple callers, each
+// copy becomes a SEPARATE DTrace probe site that fires independently
+// — so a single logical trap would fire `vcpu-trap` twice. Pinning the
+// function to one body keeps it a single, stable probe site.
+#[inline(never)]
+pub fn vcpu_trap(regs: &crate::compat::GuestRegs) {
+    carrick_usdt::vcpu__trap!(|| regs);
 }
 
 pub fn execve_loaded(path: &str, entry: u64, initial_sp: u64, mapping_count: u64) {
