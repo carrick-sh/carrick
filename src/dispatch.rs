@@ -1159,20 +1159,7 @@ impl SyscallDispatcher {
         let _ = flags; // AT_SYMLINK_NOFOLLOW is currently a no-op here
         use crate::vfs::Vfs as _;
         match self.rootfs_vfs.lookup(path) {
-            Ok(md) => {
-                let rootfs_md = crate::rootfs::RootFsMetadata {
-                    path: Path::new(path).to_path_buf(),
-                    kind: match md.kind {
-                        crate::vfs::EntryKind::File => RootFsEntryKind::File,
-                        crate::vfs::EntryKind::Directory => RootFsEntryKind::Directory,
-                        crate::vfs::EntryKind::Symlink => RootFsEntryKind::Symlink,
-                        crate::vfs::EntryKind::CharDevice => RootFsEntryKind::File,
-                    },
-                    mode: md.mode,
-                    size: md.size as usize,
-                };
-                access_metadata(&rootfs_md, mode)
-            }
+            Ok(md) => access_metadata(&vfs_md_to_rootfs_md(path, &md), mode),
             Err(errno) => DispatchOutcome::Errno { errno },
         }
     }
@@ -7440,39 +7427,19 @@ impl SyscallDispatcher {
             Ok(path) => path,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        // Layered: overlay first (including tombstones), then synthetic
-        // /proc and /sys, then rootfs.
-        match self.rootfs_vfs.overlay.lookup(&path) {
-            Some(OverlayEntry::Deleted) => {
-                return Ok(DispatchOutcome::Errno { errno: LINUX_ENOENT });
-            }
-            Some(OverlayEntry::Dir) | Some(OverlayEntry::File(_)) => {
-                if let Some(metadata) = self.rootfs_vfs.overlay.metadata(&path) {
-                    return Ok(write_stat(memory, statbuf, &metadata));
-                }
-            }
-            None => {}
-        }
+        // Synthetic /proc /sys paths first.
         if let Some(contents) = synthetic_proc_file(&path, &self.synthetic_proc_context()) {
             return Ok(write_synthetic_stat(memory, statbuf, &path, contents.len()));
         }
         if let Some(contents) = synthetic_sys_file(&path) {
             return Ok(write_synthetic_stat(memory, statbuf, &path, contents.len()));
         }
-        let Some(rootfs) = &self.rootfs_vfs.rootfs else {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_ENOENT,
-            });
-        };
-        let metadata = match rootfs.metadata(path) {
-            Ok(metadata) => metadata,
-            Err(errno) => {
-                return Ok(DispatchOutcome::Errno {
-                    errno: rootfs_errno(errno),
-                });
-            }
-        };
-        Ok(write_stat(memory, statbuf, &metadata))
+        // Layered overlay+rootfs lookup via RootFsVfs.
+        use crate::vfs::Vfs as _;
+        match self.rootfs_vfs.lookup(&path) {
+            Ok(md) => Ok(write_stat(memory, statbuf, &vfs_md_to_rootfs_md(&path, &md))),
+            Err(errno) => Ok(DispatchOutcome::Errno { errno }),
+        }
     }
 
     fn statx(
@@ -7510,53 +7477,18 @@ impl SyscallDispatcher {
             Ok(path) => path,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        // Layered: overlay first.
-        match self.rootfs_vfs.overlay.lookup(&path) {
-            Some(OverlayEntry::Deleted) => {
-                return Ok(DispatchOutcome::Errno { errno: LINUX_ENOENT });
-            }
-            Some(OverlayEntry::Dir) | Some(OverlayEntry::File(_)) => {
-                if let Some(metadata) = self.rootfs_vfs.overlay.metadata(&path) {
-                    return Ok(write_statx(memory, statxbuf, &metadata));
-                }
-            }
-            None => {}
-        }
         if let Some(contents) = synthetic_proc_file(&path, &self.synthetic_proc_context()) {
-            return Ok(write_synthetic_statx(
-                memory,
-                statxbuf,
-                &path,
-                contents.len(),
-            ));
+            return Ok(write_synthetic_statx(memory, statxbuf, &path, contents.len()));
         }
         if let Some(contents) = synthetic_sys_file(&path) {
-            return Ok(write_synthetic_statx(
-                memory,
-                statxbuf,
-                &path,
-                contents.len(),
-            ));
+            return Ok(write_synthetic_statx(memory, statxbuf, &path, contents.len()));
         }
-        let Some(rootfs) = &self.rootfs_vfs.rootfs else {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_ENOENT,
-            });
-        };
-        let metadata = if flags & LINUX_AT_SYMLINK_NOFOLLOW != 0 {
-            rootfs.symlink_metadata(path)
-        } else {
-            rootfs.metadata(path)
-        };
-        let metadata = match metadata {
-            Ok(metadata) => metadata,
-            Err(errno) => {
-                return Ok(DispatchOutcome::Errno {
-                    errno: rootfs_errno(errno),
-                });
-            }
-        };
-        Ok(write_statx(memory, statxbuf, &metadata))
+        let _ = flags; // AT_SYMLINK_NOFOLLOW handled by rootfs.read_link path; lookup is the resolved view
+        use crate::vfs::Vfs as _;
+        match self.rootfs_vfs.lookup(&path) {
+            Ok(md) => Ok(write_statx(memory, statxbuf, &vfs_md_to_rootfs_md(&path, &md))),
+            Err(errno) => Ok(DispatchOutcome::Errno { errno }),
+        }
     }
 
     fn fstat(&self, request: SyscallRequest, memory: &mut impl GuestMemory) -> DispatchOutcome {
@@ -9375,6 +9307,25 @@ fn read_guest_string_array(
         out.push(read_guest_c_string(memory, ptr)?);
     }
     Err(LINUX_E2BIG)
+}
+
+/// Adapter from the VFS-trait [`vfs::Metadata`] back to
+/// [`RootFsMetadata`] for the dispatcher's existing stat/statx
+/// writers, which still take the rootfs-shaped struct. Used by every
+/// dispatcher fs syscall that's been migrated to consult
+/// `RootFsVfs::lookup`.
+fn vfs_md_to_rootfs_md(path: &str, md: &crate::vfs::Metadata) -> RootFsMetadata {
+    RootFsMetadata {
+        path: Path::new(path).to_path_buf(),
+        kind: match md.kind {
+            crate::vfs::EntryKind::File => RootFsEntryKind::File,
+            crate::vfs::EntryKind::Directory => RootFsEntryKind::Directory,
+            crate::vfs::EntryKind::Symlink => RootFsEntryKind::Symlink,
+            crate::vfs::EntryKind::CharDevice => RootFsEntryKind::File,
+        },
+        mode: md.mode,
+        size: md.size as usize,
+    }
 }
 
 fn host_errno() -> i32 {
