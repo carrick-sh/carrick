@@ -48,7 +48,7 @@ impl SyscallDispatcher {
             Ok(value) => value,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        let Some(open_file) = self.open_files.get(&fd) else {
+        let Some(open_file) = self.io.open_files.get(&fd) else {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         };
         let mut open = open_file.description.borrow_mut();
@@ -94,7 +94,7 @@ impl SyscallDispatcher {
         let fd = ctx.arg(0) as i32;
         let current_value = ctx.arg(1);
         let memory = &mut *ctx.memory;
-        let Some(open_file) = self.open_files.get(&fd) else {
+        let Some(open_file) = self.io.open_files.get(&fd) else {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         };
         let open = open_file.description.borrow();

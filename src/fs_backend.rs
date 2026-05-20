@@ -555,7 +555,7 @@ impl Drop for HostFsBackend {
             // delete the shared scratch directory. `into_path` consumes
             // the TempDir without scheduling removal.
             if let Some(scratch) = self._scratch.take() {
-                let _ = scratch.into_path();
+                let _ = scratch.keep();
             }
         }
     }
