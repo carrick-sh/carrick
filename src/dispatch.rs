@@ -717,7 +717,9 @@ macro_rules! normalized_dispatch {
 impl SyscallDispatcher {
     normalized_dispatch! {
         17 => getcwd,
+        23 => dup,
         49 => chdir,
+        50 => fchdir,
     }
 
     pub fn new() -> Self {
@@ -955,7 +957,6 @@ impl SyscallDispatcher {
             20 => self.epoll_create1(request),
             21 => self.epoll_ctl(request, memory)?,
             22 => self.epoll_pwait(request, memory)?,
-            23 => self.dup(request),
             24 => self.dup3(request),
             25 => self.fcntl(request),
             29 => self.ioctl(request, memory, reporter),
@@ -972,7 +973,6 @@ impl SyscallDispatcher {
             46 => self.ftruncate(request),
             47 => self.fallocate(request),
             48 => self.faccessat(request, memory)?,
-            50 => self.fchdir(request),
             52 => self.fchmod(request),
             53 => self.fchmodat(request, memory)?,
             54 => self.fchownat(request, memory)?,
@@ -1326,13 +1326,16 @@ impl SyscallDispatcher {
         Ok(DispatchOutcome::Returned { value: 0 })
     }
 
-    fn fchdir(&mut self, request: SyscallRequest) -> DispatchOutcome {
-        let fd = request.arg(0) as i32;
+    fn fchdir<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let fd = ctx.arg(0) as i32;
         let Some(open_file) = self.open_files.get(&fd) else {
-            return DispatchOutcome::Errno { errno: LINUX_EBADF };
+            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         };
         let open = open_file.description.borrow();
-        match &*open {
+        Ok(match &*open {
             OpenDescription::Directory { metadata, .. } => {
                 self.cwd = display_rootfs_path(&metadata.path);
                 DispatchOutcome::Returned { value: 0 }
@@ -1349,7 +1352,7 @@ impl SyscallDispatcher {
             | OpenDescription::HostSocket { .. } => DispatchOutcome::Errno {
                 errno: LINUX_ENOTDIR,
             },
-        }
+        })
     }
 
     fn synthetic_access(&self, path: &str, mode: u64) -> Option<DispatchOutcome> {
@@ -2345,9 +2348,12 @@ impl SyscallDispatcher {
         DispatchOutcome::Returned { value: 0 }
     }
 
-    fn dup(&mut self, request: SyscallRequest) -> DispatchOutcome {
-        let old_fd = request.arg(0) as i32;
-        self.duplicate_fd(old_fd, 3, 0)
+    fn dup<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let old_fd = ctx.arg(0) as i32;
+        Ok(self.duplicate_fd(old_fd, 3, 0))
     }
 
     fn dup3(&mut self, request: SyscallRequest) -> DispatchOutcome {
