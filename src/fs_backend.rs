@@ -724,16 +724,13 @@ impl FsBackend for HostFsBackend {
         let Some(rel) = Self::rel_path(&normalized) else {
             return false;
         };
-        let mut removed = false;
-        if self.known_files.remove(&normalized) {
-            let _ = self.dir.remove_file(rel);
-            removed = true;
-        }
-        if self.dirs_created.remove(&normalized) {
-            let _ = self.dir.remove_dir(rel);
-            removed = true;
-        }
-        removed
+        self.known_files.remove(&normalized);
+        self.dirs_created.remove(&normalized);
+        // The cap-std scratch is the source of truth (readdir/lookup hit it),
+        // and files created via open_raw_fd never enter known_files — so
+        // remove from disk unconditionally, not just for tracked entries.
+        // Otherwise a renamed-away source lingered in readdir.
+        self.dir.remove_file(rel).is_ok() || self.dir.remove_dir(rel).is_ok()
     }
 
     fn mark_deleted(&mut self, path: &str) -> Result<(), BackendError> {

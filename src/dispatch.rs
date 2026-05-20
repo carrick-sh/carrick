@@ -6985,10 +6985,21 @@ impl SyscallDispatcher {
                         return Ok(write_host_pipe(&bytes, *host_fd));
                     }
                     OpenDescription::HostFile {
-                        host_fd, writable, ..
+                        host_fd,
+                        writable,
+                        status_flags,
+                        ..
                     } => {
                         if !*writable {
                             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+                        }
+                        // O_APPEND: seek to EOF before writing so `>>` and
+                        // log appends don't overwrite from offset 0. (The
+                        // host fd isn't opened O_APPEND, so we emulate the
+                        // seek-then-write; single-writer, which covers the
+                        // shell/dpkg append cases.)
+                        if *status_flags & LINUX_O_APPEND != 0 {
+                            unsafe { libc::lseek(*host_fd, 0, libc::SEEK_END) };
                         }
                         // libc::write to the real fd: advances the
                         // kernel offset and is visible across fork.
