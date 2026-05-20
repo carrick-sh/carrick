@@ -46,3 +46,6 @@ tempfile = "3.23.0"
 # (real-Linux reference side). MIT-licensed, async/tokio-native.
 bollard = "0.18"
 futures-util = "0.3"
+# Base64-encode probe binaries to feed them over the guest's stdin (an
+# argv vector can't carry ~600KB — exceeds ARG_MAX).
+base64 = "0.22"

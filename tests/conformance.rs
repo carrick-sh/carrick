@@ -265,3 +265,232 @@ fn conformance() {
 fn indent(s: &str) -> String {
     s.lines().map(|l| format!("    {l}")).collect::<Vec<_>>().join("\n")
 }
+
+// ---------------------------------------------------------------------------
+// Probe binaries: compiled static aarch64-linux-musl ELFs (built by
+// scripts/build-probes.sh) run UNDER carrick and UNDER Docker, byte-identical.
+// Each probe prints deterministic, one-line-per-observation output. We ship
+// the binary into the guest by base64-encoding it and feeding the encoded
+// bytes to `base64 -d` on the child's STDIN (it's ~600KB — too big for argv).
+// ---------------------------------------------------------------------------
+
+/// `base64 -d > /tmp/p && chmod +x /tmp/p && /tmp/p` — the binary arrives on
+/// stdin, so the same snippet works under carrick and Docker.
+const PROBE_SNIPPET: &str = "base64 -d > /tmp/p && chmod +x /tmp/p && /tmp/p";
+
+/// Directory holding the compiled probe executables, if built.
+fn probes_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("conformance-probes/target/aarch64-unknown-linux-musl/release")
+}
+
+/// Enumerate probe executables in `probes_dir()`: top-level files only, no
+/// extensions (skip anything with a '.'), skipping cargo's bookkeeping dirs.
+fn probe_binaries() -> Vec<PathBuf> {
+    let dir = probes_dir();
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(ft) = entry.file_type() else { continue };
+        if !ft.is_file() {
+            continue; // skips build/ deps/ examples/ incremental/
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name.contains('.') {
+            continue; // skips *.d, *.rlib, .fingerprint files, etc.
+        }
+        out.push(path);
+    }
+    out.sort();
+    out
+}
+
+/// Run the probe-injection snippet under carrick, feeding `stdin_bytes` (the
+/// base64 of the probe) to the child's STDIN. Mirrors `run_carrick`'s
+/// deadline + process-group-kill + sweep pattern, but pipes stdin.
+fn run_carrick_probe(bin: &PathBuf, stdin_bytes: &[u8]) -> String {
+    use std::io::Write;
+    use std::os::unix::process::CommandExt;
+    sweep_wedged_guests();
+    let mut child = Command::new(bin)
+        .args(["run", IMAGE, "--raw", "--fs", "host", "/bin/sh", "-c", PROBE_SNIPPET])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .expect("spawn carrick probe");
+    let pid = child.id() as i32;
+    // Hand the base64 to the child on its own thread so a full stdout pipe
+    // can't deadlock the write.
+    {
+        let mut stdin = child.stdin.take().expect("carrick stdin");
+        let bytes = stdin_bytes.to_vec();
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&bytes);
+            // dropping stdin closes it, signalling EOF to `base64 -d`
+        });
+    }
+    let done = Arc::new(AtomicBool::new(false));
+    let watcher = {
+        let done = Arc::clone(&done);
+        std::thread::spawn(move || {
+            let start = Instant::now();
+            while !done.load(Ordering::Relaxed) {
+                if start.elapsed() > CASE_DEADLINE {
+                    unsafe { libc::kill(-pid, libc::SIGKILL) };
+                    let _ = Command::new("sudo")
+                        .args(["-n", concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/sudo/kill.sh")])
+                        .output();
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            false
+        })
+    };
+    let out = child.wait_with_output().expect("wait carrick probe");
+    done.store(true, Ordering::Relaxed);
+    let timed_out = watcher.join().unwrap_or(false);
+    if timed_out {
+        return format!("<TIMEOUT after {}s>", CASE_DEADLINE.as_secs());
+    }
+    let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
+    combined.push_str(&String::from_utf8_lossy(&out.stderr));
+    normalize(&combined)
+}
+
+/// Run the probe-injection snippet under real Linux via `docker run -i`,
+/// feeding `stdin_bytes` to the container's STDIN. Uses std::process rather
+/// than bollard because bollard stdin-attach is awkward; the shell-case path
+/// keeps using `run_docker` (bollard) unchanged.
+fn run_docker_probe(stdin_bytes: &[u8]) -> std::io::Result<String> {
+    use std::io::Write;
+    let mut child = Command::new("docker")
+        .args([
+            "run", "-i", "--rm", "--platform", PLATFORM, IMAGE, "/bin/sh", "-c", PROBE_SNIPPET,
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    {
+        let mut stdin = child.stdin.take().expect("docker stdin");
+        let bytes = stdin_bytes.to_vec();
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&bytes);
+        });
+    }
+    let out = child.wait_with_output()?;
+    let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
+    combined.push_str(&String::from_utf8_lossy(&out.stderr));
+    Ok(normalize(&combined))
+}
+
+/// Line-by-line diff: returns `None` if identical, else a unified-ish dump of
+/// the differing lines (carrick vs linux) so the divergence pinpoints the
+/// offending syscall.
+fn diff_lines(carrick: &str, linux: &str) -> Option<String> {
+    if carrick == linux {
+        return None;
+    }
+    let c: Vec<&str> = carrick.lines().collect();
+    let l: Vec<&str> = linux.lines().collect();
+    let mut buf = String::new();
+    for i in 0..c.len().max(l.len()) {
+        let cl = c.get(i).copied();
+        let ll = l.get(i).copied();
+        if cl == ll {
+            continue;
+        }
+        buf.push_str(&format!("  line {}:\n", i + 1));
+        match cl {
+            Some(s) => buf.push_str(&format!("    - carrick: {s}\n")),
+            None => buf.push_str("    - carrick: <missing>\n"),
+        }
+        match ll {
+            Some(s) => buf.push_str(&format!("    + linux:   {s}\n")),
+            None => buf.push_str("    + linux:   <missing>\n"),
+        }
+    }
+    Some(buf)
+}
+
+#[test]
+fn conformance_probes() {
+    use base64::Engine as _;
+
+    let Some(bin) = carrick_bin() else {
+        eprintln!("SKIP conformance_probes: target/release/carrick not built");
+        return;
+    };
+    let dir = probes_dir();
+    if !dir.exists() {
+        eprintln!("SKIP conformance_probes: probes not built ({})", dir.display());
+        return;
+    }
+    // Docker reachability check (std::process side, so no bollard ping here):
+    // a trivial `docker version` must succeed.
+    let docker_ok = Command::new("docker")
+        .arg("version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !docker_ok {
+        eprintln!("SKIP conformance_probes: Docker not reachable");
+        return;
+    }
+
+    ensure_signed(&bin);
+
+    let probes = probe_binaries();
+    if probes.is_empty() {
+        eprintln!("SKIP conformance_probes: no probe binaries in {}", dir.display());
+        return;
+    }
+
+    let engine = base64::engine::general_purpose::STANDARD;
+    let mut failures = Vec::new();
+    for probe in &probes {
+        let name = probe
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("<unknown>")
+            .to_string();
+        let raw = match std::fs::read(probe) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("FAIL {name} (read probe: {e})");
+                failures.push(name);
+                continue;
+            }
+        };
+        let encoded = engine.encode(&raw).into_bytes();
+
+        let carrick_out = run_carrick_probe(&bin, &encoded);
+        let docker_out = match run_docker_probe(&encoded) {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("FAIL {name} (docker error: {e})");
+                failures.push(name);
+                continue;
+            }
+        };
+
+        match diff_lines(&carrick_out, &docker_out) {
+            None => eprintln!("PASS {name}"),
+            Some(diff) => {
+                eprintln!("FAIL {name}\n{diff}");
+                failures.push(name);
+            }
+        }
+    }
+    assert!(failures.is_empty(), "probe conformance gaps: {failures:?}");
+}
