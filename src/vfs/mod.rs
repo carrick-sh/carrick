@@ -162,11 +162,11 @@ pub trait Vfs: Send {
     fn lookup(&self, path: &str) -> Result<Metadata, VfsError>;
 
     fn readlink(&self, _path: &str) -> Result<PathBuf, VfsError> {
-        Err(crate::dispatch::LINUX_EINVAL)
+        Err(crate::linux_abi::LINUX_EINVAL)
     }
 
     fn readdir(&self, _path: &str) -> Result<Vec<DirEnt>, VfsError> {
-        Err(crate::dispatch::LINUX_ENOTDIR)
+        Err(crate::linux_abi::LINUX_ENOTDIR)
     }
 
     /// Open `path`. Returns a [`VfsHandle`] variant that the
@@ -179,39 +179,39 @@ pub trait Vfs: Send {
         _flags: OpenFlags,
         _ctx: &OpenContext<'_>,
     ) -> Result<VfsHandle, VfsError> {
-        Err(crate::dispatch::LINUX_ENOSYS)
+        Err(crate::linux_abi::LINUX_ENOSYS)
     }
 
     fn mkdir(&mut self, _path: &str, _mode: u32) -> Result<(), VfsError> {
-        Err(crate::dispatch::LINUX_EROFS)
+        Err(crate::linux_abi::LINUX_EROFS)
     }
 
     fn unlink(&mut self, _path: &str) -> Result<(), VfsError> {
-        Err(crate::dispatch::LINUX_EROFS)
+        Err(crate::linux_abi::LINUX_EROFS)
     }
 
     fn rmdir(&mut self, _path: &str) -> Result<(), VfsError> {
-        Err(crate::dispatch::LINUX_EROFS)
+        Err(crate::linux_abi::LINUX_EROFS)
     }
 
     fn rename(&mut self, _from: &str, _to: &str) -> Result<(), VfsError> {
-        Err(crate::dispatch::LINUX_EROFS)
+        Err(crate::linux_abi::LINUX_EROFS)
     }
 
     fn symlink(&mut self, _target: &str, _link: &str) -> Result<(), VfsError> {
-        Err(crate::dispatch::LINUX_EROFS)
+        Err(crate::linux_abi::LINUX_EROFS)
     }
 
     fn link(&mut self, _from: &str, _to: &str) -> Result<(), VfsError> {
-        Err(crate::dispatch::LINUX_EROFS)
+        Err(crate::linux_abi::LINUX_EROFS)
     }
 
     fn chmod(&mut self, _path: &str, _mode: u32) -> Result<(), VfsError> {
-        Err(crate::dispatch::LINUX_EROFS)
+        Err(crate::linux_abi::LINUX_EROFS)
     }
 
     fn truncate(&mut self, _path: &str, _len: u64) -> Result<(), VfsError> {
-        Err(crate::dispatch::LINUX_EROFS)
+        Err(crate::linux_abi::LINUX_EROFS)
     }
 
     /// Human-readable name for diagnostics / `--fs` reporting.
