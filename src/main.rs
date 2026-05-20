@@ -148,6 +148,12 @@ enum Commands {
         /// depth, making it easier to follow nested syscall paths.
         #[arg(short = 'F', long = "flowindent")]
         flowindent: bool,
+        /// Path to a custom D script to run instead of the bundled
+        /// syscall tracer. Lets you write a targeted probe (e.g. fire
+        /// only on a specific errno) without paying the full per-syscall
+        /// stream cost. The script sees the same carrick USDT providers.
+        #[arg(short = 's', long = "script")]
+        script: Option<std::path::PathBuf>,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
@@ -584,7 +590,7 @@ fn main() -> anyhow::Result<()> {
                 println!("{}", serde_json::to_string_pretty(&state)?);
             }
         },
-        Commands::Trace { flowindent, command } => {
+        Commands::Trace { flowindent, script, command } => {
             #[cfg(target_os = "macos")]
             {
                 if command.is_empty() {
@@ -607,6 +613,10 @@ fn main() -> anyhow::Result<()> {
                     if flowindent {
                         forwarded.push(std::ffi::OsString::from("--flowindent"));
                     }
+                    if let Some(ref s) = script {
+                        forwarded.push(std::ffi::OsString::from("--script"));
+                        forwarded.push(s.as_os_str().to_owned());
+                    }
                     forwarded.push(std::ffi::OsString::from("--"));
                     forwarded.extend(command.iter().map(std::ffi::OsString::from));
                     let err = std::process::Command::new("sudo")
@@ -614,13 +624,23 @@ fn main() -> anyhow::Result<()> {
                         .exec();
                     bail!("carrick trace: failed to re-exec under sudo: {}", err);
                 }
-                let opts = carrick::dtrace_consumer::TraceOptions { flowindent };
+                let script_src = match &script {
+                    Some(path) => Some(
+                        std::fs::read_to_string(path)
+                            .with_context(|| format!("failed to read D script {}", path.display()))?,
+                    ),
+                    None => None,
+                };
+                let opts = carrick::dtrace_consumer::TraceOptions {
+                    flowindent,
+                    script: script_src,
+                };
                 carrick::dtrace_consumer::run_child_under_dtrace(&me, &command, &opts)
                     .map_err(|e| anyhow::anyhow!("trace failed: {}", e))?;
             }
             #[cfg(not(target_os = "macos"))]
             {
-                let _ = (flowindent, command);
+                let _ = (flowindent, script, command);
                 bail!("carrick trace is only available on macOS (libdtrace).");
             }
         }
