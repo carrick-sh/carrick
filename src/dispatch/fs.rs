@@ -1391,7 +1391,7 @@ impl SyscallDispatcher {
             mode: 0,
         };
         let handle = {
-            let Some(mut m) = self.vfs_mounts.resolve_mut(path) else {
+            let Some(m) = self.vfs_mounts.resolve_mut(path) else {
                 return VfsOpenAttempt::FallThrough;
             };
             match m.vfs.open(&m.full_path, vfs_flags, &ctx) {
@@ -1705,8 +1705,7 @@ impl SyscallDispatcher {
                     errno: LINUX_EISDIR,
                 });
             }
-            OpenDescription::Epoll { .. } | OpenDescription::PipeWriter { .. }
-            | OpenDescription::HostPipe { .. } => {
+            OpenDescription::Epoll { .. } | OpenDescription::PipeWriter { .. } => {
                 return Ok(DispatchOutcome::Errno {
                     errno: LINUX_EINVAL,
                 });
