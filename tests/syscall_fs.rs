@@ -619,7 +619,9 @@ fn cwd_and_access_syscalls_use_rootfs_state() {
                 &mut reporter,
             )
             .unwrap(),
-        DispatchOutcome::Returned { value: 0x4100 }
+        // Linux getcwd(2) returns the length of the filled buffer including the
+        // terminating NUL ("/\0" -> 2), not the buffer address.
+        DispatchOutcome::Returned { value: 2 }
     );
     assert_eq!(memory.read_bytes(0x4100, 2).unwrap(), b"/\0");
 
@@ -643,7 +645,8 @@ fn cwd_and_access_syscalls_use_rootfs_state() {
                 &mut reporter,
             )
             .unwrap(),
-        DispatchOutcome::Returned { value: 0x4100 }
+        // "/etc\0" -> 5 bytes filled (length, not address).
+        DispatchOutcome::Returned { value: 5 }
     );
     assert_eq!(memory.read_bytes(0x4100, 5).unwrap(), b"/etc\0");
 
@@ -671,7 +674,10 @@ fn cwd_and_access_syscalls_use_rootfs_state() {
                 &mut reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 13 }
+        // W_OK on an existing file: the overlay is writable and the guest is
+        // root, so this succeeds (it used to report EACCES under the obsolete
+        // read-only rootfs model).
+        DispatchOutcome::Returned { value: 0 }
     );
 
     assert_eq!(
@@ -794,7 +800,10 @@ fn faccessat2_supports_bootstrap_access_flags_and_fd_checks() {
                 &mut reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 13 }
+        // The rootfs is backed by a writable overlay and the guest runs as root
+        // (root bypasses DAC write checks), so W_OK on an existing file succeeds
+        // just as it does on a real overlayfs mounted by root.
+        DispatchOutcome::Returned { value: 0 }
     );
     assert_eq!(
         dispatcher
@@ -814,7 +823,10 @@ fn faccessat2_supports_bootstrap_access_flags_and_fd_checks() {
                 &mut reporter,
             )
             .unwrap(),
-        DispatchOutcome::Returned { value: 0 }
+        // motd-link points at the 0o644 regular file "motd": even as root,
+        // X_OK on a regular file with no execute bit set returns EACCES, which
+        // is exactly what real Linux does.
+        DispatchOutcome::Errno { errno: 13 }
     );
     assert_eq!(
         dispatcher
@@ -2438,7 +2450,7 @@ fn getdents64_lists_rootfs_directory_entries() {
 
 
 #[test]
-fn fchown_and_fchownat_bootstrap_report_read_only_rootfs() {
+fn fchown_and_fchownat_succeed_on_writable_overlay_and_validate_args() {
     const AT_EMPTY_PATH: u64 = 0x1000;
     let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
         "etc/motd",
@@ -2460,7 +2472,10 @@ fn fchown_and_fchownat_bootstrap_report_read_only_rootfs() {
                 &mut reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 30 }
+        // The rootfs is backed by a writable overlay (tmpfs-like; owner/mode are
+        // not tracked) and the guest runs as root, so fchown is accepted as a
+        // no-op success rather than the obsolete read-only-rootfs EROFS.
+        DispatchOutcome::Returned { value: 0 }
     );
     assert_eq!(
         dispatcher
@@ -2484,7 +2499,8 @@ fn fchown_and_fchownat_bootstrap_report_read_only_rootfs() {
                 &mut reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 30 }
+        // fchownat on an existing path: no-op success on the writable overlay.
+        DispatchOutcome::Returned { value: 0 }
     );
     assert_eq!(
         dispatcher
@@ -2537,7 +2553,8 @@ fn fchown_and_fchownat_bootstrap_report_read_only_rootfs() {
                 &mut reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 30 }
+        // fchownat(AT_EMPTY_PATH) on an open fd: no-op success on the overlay.
+        DispatchOutcome::Returned { value: 0 }
     );
     assert_eq!(
         dispatcher
@@ -2558,7 +2575,7 @@ fn fchown_and_fchownat_bootstrap_report_read_only_rootfs() {
 
 
 #[test]
-fn fchmod_and_fchmodat_bootstrap_report_read_only_rootfs() {
+fn fchmod_and_fchmodat_succeed_on_writable_overlay_and_validate_args() {
     let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
         "etc/motd",
         b"fchmod fixture\n".as_slice(),
@@ -2579,7 +2596,9 @@ fn fchmod_and_fchmodat_bootstrap_report_read_only_rootfs() {
                 &mut reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 30 }
+        // Writable overlay + root guest: fchmod succeeds (no-op on the
+        // tmpfs-like backend) instead of the obsolete read-only EROFS.
+        DispatchOutcome::Returned { value: 0 }
     );
     assert_eq!(
         dispatcher
@@ -2603,7 +2622,9 @@ fn fchmod_and_fchmodat_bootstrap_report_read_only_rootfs() {
                 &mut reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 30 }
+        // fchmodat on an existing path applies to the writable overlay backend
+        // and succeeds.
+        DispatchOutcome::Returned { value: 0 }
     );
     assert_eq!(
         dispatcher
@@ -2650,7 +2671,7 @@ fn fchmod_and_fchmodat_bootstrap_report_read_only_rootfs() {
 
 
 #[test]
-fn linkat_bootstrap_reports_enoent_eexist_and_erofs_branches() {
+fn linkat_reports_eexist_enoent_and_links_into_writable_overlay() {
     let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
         "etc/motd",
         b"linkat fixture\n".as_slice(),
@@ -2702,7 +2723,10 @@ fn linkat_bootstrap_reports_enoent_eexist_and_erofs_branches() {
                 &mut reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 30 }
+        // Hard-linking an existing file to a new name lands in the writable
+        // overlay (the backend's hard_link), so it succeeds rather than
+        // reporting the obsolete read-only EROFS.
+        DispatchOutcome::Returned { value: 0 }
     );
     assert_eq!(
         dispatcher
@@ -2842,7 +2866,7 @@ fn symlinkat_bootstrap_reports_eexist_for_known_links_and_erofs_for_new_paths() 
 
 
 #[test]
-fn renameat_bootstrap_reports_erofs_for_known_sources_and_enoent_otherwise() {
+fn renameat_renames_known_sources_into_overlay_and_enoent_otherwise() {
     let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
         "etc/motd",
         b"renameat fixture\n".as_slice(),
@@ -2874,7 +2898,10 @@ fn renameat_bootstrap_reports_erofs_for_known_sources_and_enoent_otherwise() {
                 &mut reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 30 }
+        // Renaming an existing rootfs file copies it up into the writable
+        // overlay and renames there, so it succeeds rather than the obsolete
+        // read-only EROFS.
+        DispatchOutcome::Returned { value: 0 }
     );
     assert_eq!(
         dispatcher
@@ -2942,7 +2969,7 @@ fn renameat_bootstrap_reports_erofs_for_known_sources_and_enoent_otherwise() {
 
 
 #[test]
-fn unlinkat_bootstrap_reports_directory_kind_and_read_only_rootfs() {
+fn unlinkat_removes_files_on_overlay_and_validates_directory_kind() {
     const AT_REMOVEDIR: u64 = 0x200;
     let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar_with_links(
         [
@@ -2960,16 +2987,8 @@ fn unlinkat_bootstrap_reports_directory_kind_and_read_only_rootfs() {
     let mut reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
 
-    assert_eq!(
-        dispatcher
-            .dispatch(
-                SyscallRequest::new(35, SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0])),
-                &mut memory,
-                &mut reporter,
-            )
-            .unwrap(),
-        DispatchOutcome::Errno { errno: 30 }
-    );
+    // unlinkat(AT_REMOVEDIR) on a regular file is ENOTDIR (checked while motd
+    // still exists, before the destructive unlink below).
     assert_eq!(
         dispatcher
             .dispatch(
@@ -2986,6 +3005,20 @@ fn unlinkat_bootstrap_reports_directory_kind_and_read_only_rootfs() {
     assert_eq!(
         dispatcher
             .dispatch(
+                SyscallRequest::new(35, SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0])),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        // Unlinking an existing file records a whiteout/tombstone in the
+        // writable overlay and succeeds, instead of the obsolete read-only
+        // EROFS.
+        DispatchOutcome::Returned { value: 0 }
+    );
+    // unlinkat without AT_REMOVEDIR on a directory is EISDIR.
+    assert_eq!(
+        dispatcher
+            .dispatch(
                 SyscallRequest::new(35, SyscallArgs::from([(-100_i64) as u64, 0x4020, 0, 0, 0, 0])),
                 &mut memory,
                 &mut reporter,
@@ -2993,6 +3026,8 @@ fn unlinkat_bootstrap_reports_directory_kind_and_read_only_rootfs() {
             .unwrap(),
         DispatchOutcome::Errno { errno: 21 }
     );
+    // rmdir of a non-empty directory (/etc/conf.d holds .gitkeep) is ENOTEMPTY,
+    // matching real Linux on the writable overlay (no longer read-only EROFS).
     assert_eq!(
         dispatcher
             .dispatch(
@@ -3004,7 +3039,7 @@ fn unlinkat_bootstrap_reports_directory_kind_and_read_only_rootfs() {
                 &mut reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 30 }
+        DispatchOutcome::Errno { errno: 39 }
     );
     assert_eq!(
         dispatcher
@@ -3045,7 +3080,7 @@ fn unlinkat_bootstrap_reports_directory_kind_and_read_only_rootfs() {
 
 
 #[test]
-fn mknodat_bootstrap_returns_eexist_for_known_paths_and_erofs_otherwise() {
+fn mknodat_returns_eexist_for_known_paths_and_creates_in_overlay_otherwise() {
     let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
         "etc/motd",
         b"mknodat fixture\n".as_slice(),
@@ -3082,7 +3117,10 @@ fn mknodat_bootstrap_returns_eexist_for_known_paths_and_erofs_otherwise() {
                 &mut reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 30 }
+        // mknod with an S_IFREG (regular-file) mode on a new path materialises
+        // an empty file in the writable overlay and succeeds, rather than the
+        // obsolete read-only EROFS.
+        DispatchOutcome::Returned { value: 0 }
     );
     assert_eq!(
         dispatcher
@@ -3103,7 +3141,7 @@ fn mknodat_bootstrap_returns_eexist_for_known_paths_and_erofs_otherwise() {
 
 
 #[test]
-fn mkdirat_bootstrap_returns_eexist_for_known_paths_and_erofs_otherwise() {
+fn mkdirat_returns_eexist_for_known_paths_and_creates_in_overlay_otherwise() {
     let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
         "etc/motd",
         b"mkdirat fixture\n".as_slice(),
@@ -3155,7 +3193,9 @@ fn mkdirat_bootstrap_returns_eexist_for_known_paths_and_erofs_otherwise() {
                 &mut reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 30 }
+        // mkdir on a new path under an existing parent creates the directory in
+        // the writable overlay and succeeds, rather than the obsolete EROFS.
+        DispatchOutcome::Returned { value: 0 }
     );
     assert_eq!(
         dispatcher
@@ -3186,7 +3226,7 @@ fn mkdirat_bootstrap_returns_eexist_for_known_paths_and_erofs_otherwise() {
 
 
 #[test]
-fn utimensat_bootstrap_reports_read_only_rootfs_and_validates_timestamps() {
+fn utimensat_sets_times_on_writable_overlay_and_validates_timestamps() {
     const UTIME_NOW: i64 = (1 << 30) - 1;
     const UTIME_OMIT: i64 = (1 << 30) - 2;
 
@@ -3222,7 +3262,10 @@ fn utimensat_bootstrap_reports_read_only_rootfs_and_validates_timestamps() {
                 &mut reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 30 }
+        // Setting explicit atime/mtime on an existing file persists to the
+        // writable overlay backend (no-op on the in-memory backend) and
+        // succeeds, instead of the obsolete read-only EROFS.
+        DispatchOutcome::Returned { value: 0 }
     );
     assert_eq!(
         dispatcher
@@ -3235,7 +3278,8 @@ fn utimensat_bootstrap_reports_read_only_rootfs_and_validates_timestamps() {
                 &mut reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 30 }
+        // UTIME_NOW on an existing file: success on the writable overlay.
+        DispatchOutcome::Returned { value: 0 }
     );
     assert_eq!(
         dispatcher
@@ -3248,7 +3292,8 @@ fn utimensat_bootstrap_reports_read_only_rootfs_and_validates_timestamps() {
                 &mut reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 30 }
+        // NULL times (set both to now) on an existing file: success.
+        DispatchOutcome::Returned { value: 0 }
     );
     assert_eq!(
         dispatcher
@@ -3321,7 +3366,9 @@ fn utimensat_bootstrap_reports_read_only_rootfs_and_validates_timestamps() {
                 &mut reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 30 }
+        // futimens form (pathname == NULL with a valid open fd): success on the
+        // writable overlay rather than the obsolete read-only EROFS.
+        DispatchOutcome::Returned { value: 0 }
     );
     assert_eq!(
         dispatcher
@@ -3409,24 +3456,58 @@ fn truncate_bootstrap_returns_erofs_for_known_paths_and_enoent_for_missing() {
 
 
 #[test]
-fn xattr_family_bootstrap_returns_enotsup_for_every_call() {
+fn xattr_family_dispatches_per_target_on_in_memory_backend() {
+    // The xattr family is fully wired (no longer a blanket ENOTSUP stub):
+    // path/fd targets are resolved and arguments validated before the backend
+    // is consulted. On the default in-memory overlay backend the actual
+    // attribute store is not modelled, so the path-variant set/get/list and
+    // every remove*xattr report ENOTSUP, while the fd-variants validate the fd
+    // first and report EBADF for an unopened descriptor. The real `user.*`
+    // round-trip is exercised against the host backend by the conformance
+    // suite; here we pin the in-memory dispatch behaviour.
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
     memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();
     memory.write_bytes(0x4020, b"user.test\0").unwrap();
+    memory.write_bytes(0x4040, b"data").unwrap();
     let mut reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
-    for number in 5..=16 {
+    // Path-variant set/get/list (5,6 set; 8,9 get; 11,12 list) and the
+    // remove*xattr family (14,15,16) all reach the backend and report ENOTSUP
+    // on the in-memory overlay. Args: (path, name, value, size).
+    for number in [5, 6, 8, 9, 11, 12, 14, 15, 16] {
         assert_eq!(
             dispatcher
                 .dispatch(
-                    SyscallRequest::new(number, SyscallArgs::from([0x4000, 0x4020, 0, 0, 0, 0])),
+                    SyscallRequest::new(
+                        number,
+                        SyscallArgs::from([0x4000, 0x4020, 0x4040, 4, 0, 0]),
+                    ),
                     &mut memory,
                     &mut reporter,
                 )
                 .unwrap(),
             DispatchOutcome::Errno { errno: 95 },
-            "syscall {number} should return ENOTSUP"
+            "syscall {number} should return ENOTSUP on the in-memory backend"
+        );
+    }
+
+    // Fd-variants (7 fsetxattr, 10 fgetxattr, 13 flistxattr) validate the fd
+    // before anything else: an unopened fd is EBADF.
+    for number in [7, 10, 13] {
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    SyscallRequest::new(
+                        number,
+                        SyscallArgs::from([0x4000, 0x4020, 0x4040, 4, 0, 0]),
+                    ),
+                    &mut memory,
+                    &mut reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::Errno { errno: 9 },
+            "fd-variant syscall {number} should return EBADF for an unopened fd"
         );
     }
 
@@ -3435,7 +3516,7 @@ fn xattr_family_bootstrap_returns_enotsup_for_every_call() {
 
 
 #[test]
-fn fallocate_bootstrap_reports_read_only_rootfs_and_validates_arguments() {
+fn fallocate_grows_open_files_on_writable_overlay_and_validates_arguments() {
     let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
         "etc/motd",
         b"fallocate fixture\n".as_slice(),
@@ -3518,7 +3599,10 @@ fn fallocate_bootstrap_reports_read_only_rootfs_and_validates_arguments() {
                 &mut reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 30 }
+        // fallocate on an open regular file grows it in the writable overlay
+        // (in-memory backend resizes the cached bytes) and succeeds, instead of
+        // the obsolete read-only EROFS.
+        DispatchOutcome::Returned { value: 0 }
     );
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
