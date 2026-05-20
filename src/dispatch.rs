@@ -720,6 +720,15 @@ impl SyscallDispatcher {
         23 => dup,
         49 => chdir,
         50 => fchdir,
+        62 => lseek,
+        63 => read,
+        64 => write,
+        65 => readv,
+        66 => writev,
+        67 => pread64,
+        68 => pwrite64,
+        79 => newfstatat,
+        80 => fstat,
     }
 
     pub fn new() -> Self {
@@ -981,13 +990,6 @@ impl SyscallDispatcher {
             57 => self.close(request),
             59 => self.pipe2(request, memory),
             61 => self.getdents64(request, memory)?,
-            62 => self.lseek(request),
-            63 => self.read(request, memory)?,
-            64 => self.write(request, memory)?,
-            65 => self.readv(request, memory)?,
-            66 => self.writev(request, memory)?,
-            67 => self.pread64(request, memory)?,
-            68 => self.pwrite64(request, memory)?,
             69 => self.preadv(request, memory)?,
             70 => self.pwritev(request, memory)?,
             71 => self.sendfile(request, memory)?,
@@ -998,8 +1000,6 @@ impl SyscallDispatcher {
             76 => self.splice(request, memory)?,
             77 => self.bootstrap_enosys(),
             78 => self.readlinkat(request, memory)?,
-            79 => self.newfstatat(request, memory)?,
-            80 => self.fstat(request, memory),
             81 => self.sync(),
             82 => self.fsync(request),
             83 => self.fdatasync(request),
@@ -5482,10 +5482,13 @@ impl SyscallDispatcher {
         })
     }
 
-    fn lseek(&mut self, request: SyscallRequest) -> DispatchOutcome {
-        let fd = request.arg(0) as i32;
-        let offset = request.arg(1) as i64;
-        let whence = request.arg(2);
+    fn lseek<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let fd = ctx.arg(0) as i32;
+        let offset = ctx.arg(1) as i64;
+        let whence = ctx.arg(2);
         let Some(open_file) = self.open_files.get(&fd) else {
             // lseek on stdio with no OpenDescription is, on Linux, a
             // valid call on an unseekable pipe/tty — kernel returns
@@ -5493,9 +5496,9 @@ impl SyscallDispatcher {
             // ftell/fclose path into reporting "write error: Bad
             // file descriptor" after every successful write.
             if is_stdio_fd(fd) {
-                return DispatchOutcome::Errno { errno: LINUX_ESPIPE };
+                return Ok(DispatchOutcome::Errno { errno: LINUX_ESPIPE });
             }
-            return DispatchOutcome::Errno { errno: LINUX_EBADF };
+            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         };
         let mut open = open_file.description.borrow_mut();
 
@@ -5506,13 +5509,13 @@ impl SyscallDispatcher {
                 LINUX_SEEK_SET => libc::SEEK_SET,
                 LINUX_SEEK_CUR => libc::SEEK_CUR,
                 LINUX_SEEK_END => libc::SEEK_END,
-                _ => return DispatchOutcome::Errno { errno: LINUX_EINVAL },
+                _ => return Ok(DispatchOutcome::Errno { errno: LINUX_EINVAL }),
             };
             let r = unsafe { libc::lseek(*host_fd, offset as libc::off_t, host_whence) };
             if r < 0 {
-                return DispatchOutcome::Errno { errno: host_errno() };
+                return Ok(DispatchOutcome::Errno { errno: host_errno() });
             }
-            return DispatchOutcome::Returned { value: r as i64 };
+            return Ok(DispatchOutcome::Returned { value: r as i64 });
         }
 
         let (current, end) = match &*open {
@@ -5535,18 +5538,18 @@ impl SyscallDispatcher {
             | OpenDescription::PipeWriter { .. }
             | OpenDescription::HostPipe { .. }
             | OpenDescription::HostSocket { .. } => {
-                return DispatchOutcome::Errno {
+                return Ok(DispatchOutcome::Errno {
                     errno: LINUX_ESPIPE,
-                };
+                });
             }
             // HostFile is handled by the early libc::lseek above.
             OpenDescription::HostFile { .. } => unreachable!("HostFile lseek handled above"),
             OpenDescription::EventFd { .. }
             | OpenDescription::TimerFd { .. }
             | OpenDescription::Epoll { .. } => {
-                return DispatchOutcome::Errno {
+                return Ok(DispatchOutcome::Errno {
                     errno: LINUX_EINVAL,
-                };
+                });
             }
         };
         let next = match whence {
@@ -5554,15 +5557,15 @@ impl SyscallDispatcher {
             LINUX_SEEK_CUR => current.saturating_add(offset),
             LINUX_SEEK_END => end.saturating_add(offset),
             _ => {
-                return DispatchOutcome::Errno {
+                return Ok(DispatchOutcome::Errno {
                     errno: LINUX_EINVAL,
-                };
+                });
             }
         };
         if next < 0 {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
-            };
+            });
         }
 
         match &mut *open {
@@ -5578,7 +5581,7 @@ impl SyscallDispatcher {
             | OpenDescription::HostPipe { .. }
             | OpenDescription::HostSocket { .. } => {}
         }
-        DispatchOutcome::Returned { value: next }
+        Ok(DispatchOutcome::Returned { value: next })
     }
 
     /// Linux `execve(2)` (aarch64 syscall 221). Reads pathname, argv,
@@ -6161,15 +6164,15 @@ impl SyscallDispatcher {
         }
     }
 
-    fn read(
+    fn read<M: GuestMemory>(
         &mut self,
-        request: SyscallRequest,
-        memory: &mut impl GuestMemory,
+        ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let fd = request.arg(0) as i32;
-        let address = request.arg(1);
-        let length = usize::try_from(request.arg(2))
-            .map_err(|_| DispatchError::LengthTooLarge(request.arg(2)))?;
+        let fd = ctx.arg(0) as i32;
+        let address = ctx.arg(1);
+        let length = usize::try_from(ctx.arg(2))
+            .map_err(|_| DispatchError::LengthTooLarge(ctx.arg(2)))?;
+        let memory = &mut *ctx.memory;
         // fd 0 with no explicit OpenDescription: read from host stdin.
         // This is what makes `read` against the guest's stdin pick up
         // input from the user's terminal (or whatever the carrick host
@@ -6256,15 +6259,15 @@ impl SyscallDispatcher {
         })
     }
 
-    fn readv(
+    fn readv<M: GuestMemory>(
         &mut self,
-        request: SyscallRequest,
-        memory: &mut impl GuestMemory,
+        ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let fd = request.arg(0) as i32;
-        let iov = request.arg(1);
-        let iovcnt = usize::try_from(request.arg(2))
-            .map_err(|_| DispatchError::LengthTooLarge(request.arg(2)))?;
+        let fd = ctx.arg(0) as i32;
+        let iov = ctx.arg(1);
+        let iovcnt = usize::try_from(ctx.arg(2))
+            .map_err(|_| DispatchError::LengthTooLarge(ctx.arg(2)))?;
+        let memory = &mut *ctx.memory;
         let iovecs = match read_iovecs(memory, iov, iovcnt) {
             Ok(iovecs) => iovecs,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
@@ -6324,17 +6327,17 @@ impl SyscallDispatcher {
         })
     }
 
-    fn pread64(
+    fn pread64<M: GuestMemory>(
         &mut self,
-        request: SyscallRequest,
-        memory: &mut impl GuestMemory,
+        ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let fd = request.arg(0) as i32;
-        let buffer = request.arg(1);
-        let length = usize::try_from(request.arg(2))
-            .map_err(|_| DispatchError::LengthTooLarge(request.arg(2)))?;
-        let offset = usize::try_from(request.arg(3))
-            .map_err(|_| DispatchError::LengthTooLarge(request.arg(3)))?;
+        let fd = ctx.arg(0) as i32;
+        let buffer = ctx.arg(1);
+        let length = usize::try_from(ctx.arg(2))
+            .map_err(|_| DispatchError::LengthTooLarge(ctx.arg(2)))?;
+        let offset = usize::try_from(ctx.arg(3))
+            .map_err(|_| DispatchError::LengthTooLarge(ctx.arg(3)))?;
+        let memory = &mut *ctx.memory;
         let Some(open_file) = self.open_files.get(&fd) else {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         };
@@ -6462,22 +6465,21 @@ impl SyscallDispatcher {
         })
     }
 
-    fn pwrite64(
+    fn pwrite64<M: GuestMemory>(
         &mut self,
-        request: SyscallRequest,
-        memory: &impl GuestMemory,
+        ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let fd = request.arg(0) as i32;
-        let address = request.arg(1);
-        let length = usize::try_from(request.arg(2))
-            .map_err(|_| DispatchError::LengthTooLarge(request.arg(2)))?;
-        let offset = i64::from_ne_bytes(request.arg(3).to_ne_bytes());
+        let fd = ctx.arg(0) as i32;
+        let address = ctx.arg(1);
+        let length = usize::try_from(ctx.arg(2))
+            .map_err(|_| DispatchError::LengthTooLarge(ctx.arg(2)))?;
+        let offset = i64::from_ne_bytes(ctx.arg(3).to_ne_bytes());
         if offset < 0 {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
             });
         }
-        let bytes = match memory.read_bytes(address, length) {
+        let bytes = match (&*ctx.memory).read_bytes(address, length) {
             Ok(b) => b,
             Err(_) => return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT }),
         };
@@ -7004,16 +7006,15 @@ impl SyscallDispatcher {
         DispatchOutcome::Returned { value: 0 }
     }
 
-    fn write(
+    fn write<M: GuestMemory>(
         &mut self,
-        request: SyscallRequest,
-        memory: &impl GuestMemory,
+        ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let fd = request.arg(0);
-        let address = request.arg(1);
-        let length = usize::try_from(request.arg(2))
-            .map_err(|_| DispatchError::LengthTooLarge(request.arg(2)))?;
-        let bytes = match memory.read_bytes(address, length) {
+        let fd = ctx.arg(0);
+        let address = ctx.arg(1);
+        let length = usize::try_from(ctx.arg(2))
+            .map_err(|_| DispatchError::LengthTooLarge(ctx.arg(2)))?;
+        let bytes = match (&*ctx.memory).read_bytes(address, length) {
             Ok(bytes) => bytes,
             Err(_) => {
                 return Ok(DispatchOutcome::Errno {
@@ -7171,15 +7172,15 @@ impl SyscallDispatcher {
         }
     }
 
-    fn writev(
+    fn writev<M: GuestMemory>(
         &mut self,
-        request: SyscallRequest,
-        memory: &impl GuestMemory,
+        ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let fd = request.arg(0);
-        let iov = request.arg(1);
-        let iovcnt = usize::try_from(request.arg(2))
-            .map_err(|_| DispatchError::LengthTooLarge(request.arg(2)))?;
+        let fd = ctx.arg(0);
+        let iov = ctx.arg(1);
+        let iovcnt = usize::try_from(ctx.arg(2))
+            .map_err(|_| DispatchError::LengthTooLarge(ctx.arg(2)))?;
+        let memory = &*ctx.memory;
         let iovecs = match read_iovecs(memory, iov, iovcnt) {
             Ok(iovecs) => iovecs,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
@@ -7887,15 +7888,15 @@ impl SyscallDispatcher {
         }
     }
 
-    fn newfstatat(
-        &self,
-        request: SyscallRequest,
-        memory: &mut impl GuestMemory,
+    fn newfstatat<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let dirfd = request.arg(0);
-        let pathname = request.arg(1);
-        let statbuf = request.arg(2);
-        let flags = request.arg(3);
+        let dirfd = ctx.arg(0);
+        let pathname = ctx.arg(1);
+        let statbuf = ctx.arg(2);
+        let flags = ctx.arg(3);
+        let memory = &mut *ctx.memory;
         let path = match read_guest_c_string(memory, pathname) {
             Ok(path) => path,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
@@ -7973,8 +7974,13 @@ impl SyscallDispatcher {
         }
     }
 
-    fn fstat(&self, request: SyscallRequest, memory: &mut impl GuestMemory) -> DispatchOutcome {
-        self.write_fd_stat(request.arg(0) as i32, request.arg(1), memory)
+    fn fstat<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let fd = ctx.arg(0) as i32;
+        let statbuf = ctx.arg(1);
+        Ok(self.write_fd_stat(fd, statbuf, &mut *ctx.memory))
     }
 
     fn write_fd_stat(
