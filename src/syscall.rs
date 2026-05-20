@@ -239,6 +239,7 @@ const AARCH64_SYSCALLS: &[Syscall] = &[
     syscall(278, "getrandom", "random", SupportLevel::BringUp),
     syscall(281, "execveat", "process", SupportLevel::Planned),
     syscall(283, "membarrier", "process", SupportLevel::BringUp),
+    syscall(285, "copy_file_range", "fs", SupportLevel::BringUp),
     syscall(291, "statx", "fs", SupportLevel::BringUp),
     syscall(293, "rseq", "process", SupportLevel::BringUp),
     syscall(435, "clone3", "process", SupportLevel::Planned),

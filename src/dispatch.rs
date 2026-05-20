@@ -1058,6 +1058,7 @@ impl SyscallDispatcher {
             276 => self.renameat2(request, memory)?,
             278 => self.getrandom(request, memory)?,
             283 => self.membarrier(request),
+            285 => self.copy_file_range(request, memory)?,
             291 => self.statx(request, memory)?,
             293 => self.rseq(),
             436 => self.close_range(request),
@@ -6577,6 +6578,112 @@ impl SyscallDispatcher {
         }
 
         Ok(DispatchOutcome::Returned { value })
+    }
+
+    /// copy_file_range(2): like sendfile but file-to-file with independent
+    /// in/out offset pointers. coreutils `cat`/`cp` and apt/dpkg use it for
+    /// efficient copies; it was unimplemented and the panic-on-unknown guard
+    /// turned that into a hard abort. We read from in_fd at its (pointer or
+    /// current) offset and write to out_fd, reusing the sendfile machinery.
+    fn copy_file_range(
+        &mut self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let in_fd = request.arg(0) as i32;
+        let off_in_addr = request.arg(1);
+        let out_fd = request.arg(2) as i32;
+        let off_out_addr = request.arg(3);
+        // Callers (coreutils `cat`) pass len = SSIZE_MAX and loop until EOF,
+        // so cap each call to a bounded chunk rather than trying to allocate
+        // a multi-exabyte buffer. A short return is legal for copy_file_range.
+        let requested = usize::try_from(request.arg(4)).unwrap_or(usize::MAX);
+        let count = requested.min(8 * 1024 * 1024);
+        if count == 0 {
+            return Ok(DispatchOutcome::Returned { value: 0 });
+        }
+
+        let in_offset = match self.sendfile_offset(in_fd, off_in_addr, memory)? {
+            Ok(o) => o,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        let bytes = match self.sendfile_bytes(in_fd, in_offset, count) {
+            Ok(b) => b,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        if bytes.is_empty() {
+            return Ok(DispatchOutcome::Returned { value: 0 });
+        }
+
+        // Write side. off_out == NULL → write at out_fd's current position
+        // (the common case: cat to a pipe/stdout). Non-NULL → pwrite at the
+        // given offset on a real host fd and advance *off_out.
+        let written = if off_out_addr == 0 {
+            let outcome = self.write_output_fd(out_fd, &bytes);
+            let DispatchOutcome::Returned { value } = outcome else {
+                return Ok(outcome);
+            };
+            usize::try_from(value).unwrap_or(0)
+        } else {
+            let out_off = match read_u64(memory, off_out_addr) {
+                Ok(v) => v,
+                Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            };
+            let host_fd = match self.open_files.get(&out_fd) {
+                Some(of) => match &*of.description.borrow() {
+                    OpenDescription::HostFile { host_fd, writable: true, .. } => *host_fd,
+                    OpenDescription::HostFile { .. } => {
+                        return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF })
+                    }
+                    _ => return Ok(DispatchOutcome::Errno { errno: LINUX_EINVAL }),
+                },
+                None => return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF }),
+            };
+            let n = unsafe {
+                libc::pwrite(
+                    host_fd,
+                    bytes.as_ptr() as *const _,
+                    bytes.len(),
+                    out_off as libc::off_t,
+                )
+            };
+            if n < 0 {
+                return Ok(DispatchOutcome::Errno { errno: host_errno() });
+            }
+            let n = n as usize;
+            if memory
+                .write_bytes(off_out_addr, &(out_off + n as u64).to_ne_bytes())
+                .is_err()
+            {
+                return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
+            }
+            n
+        };
+
+        // Advance the input offset (pointer or the fd's own position).
+        let new_in = in_offset.saturating_add(written);
+        if off_in_addr == 0 {
+            if let Some(of) = self.open_files.get(&in_fd) {
+                let mut open = of.description.borrow_mut();
+                match &mut *open {
+                    OpenDescription::File { offset, .. }
+                    | OpenDescription::SyntheticFile { offset, .. } => *offset = new_in,
+                    OpenDescription::HostFile { host_fd, .. } => {
+                        unsafe { libc::lseek(*host_fd, new_in as libc::off_t, libc::SEEK_SET) };
+                    }
+                    _ => {}
+                }
+            }
+        } else if memory
+            .write_bytes(off_in_addr, &(new_in as u64).to_ne_bytes())
+            .is_err()
+        {
+            return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
+        }
+
+        Ok(DispatchOutcome::Returned {
+            value: written as i64,
+        })
     }
 
     fn sendfile_offset(
