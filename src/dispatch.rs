@@ -7848,6 +7848,10 @@ pub fn set_host_process_name(comm: &[u8]) {
             }
         }
     }
+
+    // (3) Activity Monitor display name via private LaunchServices.
+    // Best-effort; no-op on a non-GUI session.
+    crate::host_proctitle::set_activity_monitor_name(&label);
 }
 
 #[cfg(not(target_os = "macos"))]

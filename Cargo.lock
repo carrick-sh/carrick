@@ -239,6 +239,7 @@ dependencies = [
  "camino",
  "cap-std",
  "clap",
+ "core-foundation-sys",
  "fd-lock",
  "flate2",
  "getrandom 0.3.4",
