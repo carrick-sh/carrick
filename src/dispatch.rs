@@ -8150,6 +8150,15 @@ impl SyscallDispatcher {
         if let Some(contents) = synthetic_sys_file(&path) {
             return Ok(write_synthetic_stat(memory, statbuf, &path, contents.len()));
         }
+        // Disk-backed overlay (--fs host): prefer the REAL on-disk stat
+        // so the type bits (S_IFLNK for a symlink) and st_nlink (a true
+        // hard link reports >1) reflect what the kernel would report.
+        // `AT_SYMLINK_NOFOLLOW` selects lstat (report the link) vs stat
+        // (report the target) semantics.
+        let follow = flags & LINUX_AT_SYMLINK_NOFOLLOW == 0;
+        if let Some(real) = self.rootfs_vfs.overlay.real_stat(&path, follow) {
+            return Ok(write_stat_real(memory, statbuf, &path, &real));
+        }
         // Layered overlay+rootfs lookup via RootFsVfs.
         use crate::vfs::Vfs as _;
         match self.rootfs_vfs.lookup(&path) {
@@ -8199,7 +8208,13 @@ impl SyscallDispatcher {
         if let Some(contents) = synthetic_sys_file(&path) {
             return Ok(write_synthetic_statx(memory, statxbuf, &path, contents.len()));
         }
-        let _ = flags; // AT_SYMLINK_NOFOLLOW handled by rootfs.read_link path; lookup is the resolved view
+        // Disk-backed overlay (--fs host): prefer the REAL on-disk stat
+        // (S_IFLNK + true st_nlink). `AT_SYMLINK_NOFOLLOW` selects lstat
+        // (the link) vs stat (the target).
+        let follow = flags & LINUX_AT_SYMLINK_NOFOLLOW == 0;
+        if let Some(real) = self.rootfs_vfs.overlay.real_stat(&path, follow) {
+            return Ok(write_statx_real(memory, statxbuf, &path, &real));
+        }
         use crate::vfs::Vfs as _;
         match self.rootfs_vfs.lookup(&path) {
             Ok(md) => Ok(write_statx(memory, statxbuf, &vfs_md_to_rootfs_md(&path, &md))),
@@ -8898,6 +8913,104 @@ fn write_stat(
     } else {
         DispatchOutcome::Returned { value: 0 }
     }
+}
+
+/// Build and write a `stat` from REAL on-disk values ([`RealStat`]):
+/// the true file type (so a symlink stat'd with `AT_SYMLINK_NOFOLLOW`
+/// reports S_IFLNK) and the real `st_nlink` (a true hard link reports
+/// >1). Type/mode bits come from a [`RootFsMetadata`] carrying the
+/// real `kind`; `st_nlink` is overridden with the disk value.
+fn write_stat_real(
+    memory: &mut impl GuestMemory,
+    statbuf: u64,
+    path: &str,
+    real: &crate::fs_backend::RealStat,
+) -> DispatchOutcome {
+    let metadata = RootFsMetadata {
+        path: Path::new(path).to_path_buf(),
+        kind: real.kind,
+        mode: real.mode,
+        size: real.size as usize,
+    };
+    let stat = LinuxStat {
+        st_dev: 1,
+        st_ino: inode_for_path(&metadata.path),
+        st_mode: linux_mode(&metadata),
+        st_nlink: real.nlink,
+        st_uid: 0,
+        st_gid: 0,
+        st_rdev: 0,
+        __pad1: 0,
+        st_size: metadata.size as i64,
+        st_blksize: 4096,
+        __pad2: 0,
+        st_blocks: blocks_512(metadata.size),
+        st_atime: 0,
+        st_atime_nsec: 0,
+        st_mtime: 0,
+        st_mtime_nsec: 0,
+        st_ctime: 0,
+        st_ctime_nsec: 0,
+        __unused4: 0,
+        __unused5: 0,
+    };
+    if write_kernel_struct_raw(memory, statbuf, &stat).is_err() {
+        DispatchOutcome::Errno {
+            errno: LINUX_EFAULT,
+        }
+    } else {
+        DispatchOutcome::Returned { value: 0 }
+    }
+}
+
+/// `statx` counterpart of [`write_stat_real`].
+fn write_statx_real(
+    memory: &mut impl GuestMemory,
+    statxbuf: u64,
+    path: &str,
+    real: &crate::fs_backend::RealStat,
+) -> DispatchOutcome {
+    let metadata = RootFsMetadata {
+        path: Path::new(path).to_path_buf(),
+        kind: real.kind,
+        mode: real.mode,
+        size: real.size as usize,
+    };
+    let zero_time = LinuxStatxTimestamp::zero();
+    let statx = LinuxStatx {
+        stx_mask: LINUX_STATX_BASIC_STATS,
+        stx_blksize: LINUX_PAGE_SIZE as u32,
+        stx_attributes: 0,
+        stx_nlink: real.nlink,
+        stx_uid: 0,
+        stx_gid: 0,
+        stx_mode: linux_mode(&metadata) as u16,
+        __spare0: [0; 1],
+        stx_ino: inode_for_path(&metadata.path),
+        stx_size: metadata.size as u64,
+        stx_blocks: blocks_512(metadata.size) as u64,
+        stx_attributes_mask: 0,
+        stx_atime: zero_time,
+        stx_btime: zero_time,
+        stx_ctime: zero_time,
+        stx_mtime: zero_time,
+        stx_rdev_major: 0,
+        stx_rdev_minor: 0,
+        stx_dev_major: 0,
+        stx_dev_minor: 1,
+        stx_mnt_id: 1,
+        stx_dio_mem_align: 0,
+        stx_dio_offset_align: 0,
+        stx_subvol: 0,
+        stx_atomic_write_unit_min: 0,
+        stx_atomic_write_unit_max: 0,
+        stx_atomic_write_segments_max: 0,
+        stx_dio_read_offset_align: 0,
+        stx_atomic_write_unit_max_opt: 0,
+        __spare2: [0; 1],
+        __spare3: [0; 8],
+    };
+    write_kernel_struct(memory, statxbuf, &statx)
 }
 
 fn write_statx(
