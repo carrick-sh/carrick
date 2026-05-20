@@ -78,6 +78,14 @@ use serde::Serialize;
 use thiserror::Error;
 use zerocopy::{FromBytes, IntoBytes};
 
+mod creds;
+mod fs;
+mod mem;
+mod net;
+mod proc;
+mod signal;
+mod time;
+
 #[allow(dead_code)]
 #[allow(dead_code)]
 const MAX_GUEST_PATH: usize = 4096;
