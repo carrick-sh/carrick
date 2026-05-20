@@ -1037,7 +1037,7 @@ impl SyscallDispatcher {
             269 => self.sendmmsg(request, memory),
             214 => self.brk(request),
             215 => self.munmap(request),
-            216 => self.mremap(request),
+            216 => self.mremap(request, memory),
             220 => self.clone(request),
             221 => self.execve(request, memory),
             222 => self.mmap(request, memory)?,
@@ -5709,12 +5709,12 @@ impl SyscallDispatcher {
         DispatchOutcome::Returned { value: 0 }
     }
 
-    fn mremap(&self, request: SyscallRequest) -> DispatchOutcome {
+    fn mremap(&mut self, request: SyscallRequest, memory: &mut impl GuestMemory) -> DispatchOutcome {
         let old_address = request.arg(0);
         let old_size = request.arg(1);
-        let new_size = request.arg(2);
+        let new_size_req = request.arg(2);
         let flags = request.arg(3);
-        if new_size == 0 {
+        if new_size_req == 0 {
             return DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
             };
@@ -5729,13 +5729,68 @@ impl SyscallDispatcher {
                 errno: LINUX_EINVAL,
             };
         }
+        let Some(new_size) = align_up_u64(new_size_req, LINUX_PAGE_SIZE) else {
+            return DispatchOutcome::Errno {
+                errno: LINUX_ENOMEM,
+            };
+        };
         if new_size <= old_size {
             return DispatchOutcome::Returned {
                 value: old_address as i64,
             };
         }
-        DispatchOutcome::Errno {
-            errno: LINUX_ENOMEM,
+
+        // Grow in place when this mapping sits at the top of the bump
+        // allocator: the tail bytes are fresh guest memory already backed by
+        // the stage-2 mapping, so no copy is needed.
+        if old_address.checked_add(old_size) == Some(self.mmap_next) {
+            let Some(new_end) = old_address.checked_add(new_size) else {
+                return DispatchOutcome::Errno {
+                    errno: LINUX_ENOMEM,
+                };
+            };
+            if range_within(old_address, new_size, LINUX_MMAP_BASE, LINUX_MMAP_SIZE) {
+                self.mmap_next = new_end;
+                return DispatchOutcome::Returned {
+                    value: old_address as i64,
+                };
+            }
+        }
+
+        // Otherwise the mapping can only grow by moving. Linux requires
+        // MREMAP_MAYMOVE for that; without it the call fails.
+        if flags & LINUX_MREMAP_MAYMOVE == 0 {
+            return DispatchOutcome::Errno {
+                errno: LINUX_ENOMEM,
+            };
+        }
+        let Some(new_address) = self.next_mmap_address(0, new_size, 0) else {
+            return DispatchOutcome::Errno {
+                errno: LINUX_ENOMEM,
+            };
+        };
+        let copy_len = match usize::try_from(old_size) {
+            Ok(len) => len,
+            Err(_) => {
+                return DispatchOutcome::Errno {
+                    errno: LINUX_ENOMEM,
+                };
+            }
+        };
+        if copy_len > 0 {
+            match memory.read_bytes(old_address, copy_len) {
+                Ok(bytes) => {
+                    let _ = memory.write_bytes(new_address, &bytes);
+                }
+                Err(_) => {
+                    return DispatchOutcome::Errno {
+                        errno: LINUX_EFAULT,
+                    };
+                }
+            }
+        }
+        DispatchOutcome::Returned {
+            value: new_address as i64,
         }
     }
 
