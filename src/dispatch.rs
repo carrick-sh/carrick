@@ -12558,6 +12558,34 @@ mod overlay_dispatch_tests {
         assert_eq!(macos_to_linux_errno(libc::ECANCELED), linux_errno::ECANCELED);
     }
 
+    #[test]
+    fn every_migrated_syscall_is_claimed_by_the_normalized_table() {
+        let mut d = SyscallDispatcher::new();
+        let mut mem = LinearMemory::new(0, vec![0u8; 4096]);
+        let mut reporter = CompatReporter::default();
+        // Numbers that used to live in the deleted legacy match. Each must now
+        // be claimed by the normalized table (Some), never None.
+        for nr in [5u64, 7, 8, 10, 11, 13, 14, 43, 44, 45, 74, 93, 151, 152,
+                   159, 172, 173, 174, 175, 176, 177, 178, 243, 269, 283, 293, 435] {
+            let req = SyscallRequest::new(nr, SyscallArgs::from([0, 0, 0, 0, 0, 0]));
+            assert!(
+                d.dispatch_normalized(req, &mut mem, &mut reporter).is_some(),
+                "syscall {nr} fell through the normalized table",
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_syscall_returns_enosys_without_panicking() {
+        let mut d = SyscallDispatcher::new();
+        let mut mem = LinearMemory::new(0, vec![0u8; 4096]);
+        let mut reporter = CompatReporter::default();
+        // 999 is not a real aarch64 syscall and is not in the table.
+        let req = SyscallRequest::new(999, SyscallArgs::from([0, 0, 0, 0, 0, 0]));
+        let outcome = d.dispatch(req, &mut mem, &mut reporter).expect("must not error");
+        assert_eq!(outcome, DispatchOutcome::Errno { errno: LINUX_ENOSYS });
+    }
+
     /// The Linux errno constants we publish must match the
     /// asm-generic kernel headers. Pinned values from
     /// linux/include/uapi/asm-generic/errno{,-base}.h.
