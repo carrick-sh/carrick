@@ -323,16 +323,10 @@ pub struct ProcMapsEntry {
 }
 
 pub struct SyscallDispatcher {
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-    /// When true, writes to fd 1/2 stream directly to host fds 1/2
-    /// instead of buffering into `stdout`/`stderr`. Set by `--raw`/the
-    /// interactive runtime so the user sees the guest's prompt and
-    /// output in real time, instead of after exit.
-    stream_stdio: bool,
-    open_files: HashMap<i32, OpenFile>,
-    next_fd: i32,
-    cwd: String,
+    /// Owned I/O subsystem state (buffered stdout/stderr, stream toggle,
+    /// the open-fd table, next-fd cursor, and cwd). See [`fs::IoState`].
+    /// Handlers that touch only I/O state borrow `self.io` narrowly.
+    io: fs::IoState,
     /// Owned memory subsystem state (brk, mmap arena, shared-file IPA
     /// window + live maps, and the captured address-space regions for
     /// `/proc/self/maps`). See [`mem::MemState`].
@@ -348,34 +342,10 @@ pub struct SyscallDispatcher {
     /// stack). See [`signal::SignalState`]. Handlers that touch only
     /// signal state borrow `self.signal` narrowly.
     signal: signal::SignalState,
-    /// Swappable writable layer that sits on top of the read-only
-    /// rootfs. Writes (mkdirat / openat O_CREAT / write / unlinkat /
-    /// renameat) land here; reads consult this first and fall through
-    /// to the rootfs when nothing is found. The backend's tombstones
-    /// shadow rootfs-backed paths so unlink-then-stat behaves correctly.
-    ///
-    /// Two backends exist (see `src/fs_backend.rs`):
-    ///   * [`MemoryBackend`]    — in-memory tmpfs, fast and ephemeral.
-    ///   * [`HostFsBackend`]    — cap-std-sandboxed APFS scratch dir,
-    ///                            durable, reflink-seeded.
-    /// Unified VFS mount table. Holds DevVfs at /dev, ProcVfs at
-    /// /proc, SysVfs at /sys. The dispatcher consults it first; any
-    /// path no mount claims (or that a mount returns ENOSYS for)
-    /// falls through to the legacy code path below, which reads the
-    /// rootfs + overlay from [`Self::rootfs_vfs`].
-    vfs_mounts: crate::vfs::VfsMounts,
-
-    /// The `/` mount: immutable OCI rootfs + writable overlay
-    /// ([`FsBackend`]). Held as a typed field rather than mounted in
-    /// `vfs_mounts` because the dispatcher's existing fs syscalls
-    /// reach into the overlay/rootfs state through ~50 call sites
-    /// today. Routing those through `Vfs::method` calls is the
-    /// follow-up mechanical migration; for step 4 of the plan we
-    /// land the architectural ownership move (the state lives in
-    /// `RootFsVfs`, exposed to callers via accessors) and the full
-    /// Vfs trait impl (`RootFsVfs::open`, `unlink`, etc.) is
-    /// independently tested.
-    rootfs_vfs: crate::vfs::RootFsVfs,
+    /// Owned filesystem subsystem state (unified VFS mount table plus
+    /// the `/` rootfs + writable overlay). See [`fs::FsState`]. Handlers
+    /// that touch only fs state borrow `self.fs` narrowly.
+    fs: fs::FsState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -419,10 +389,17 @@ enum OpenDescription {
         interest: HashMap<i32, LinuxEpollEvent>,
         status_flags: u64,
     },
+    // In-memory pipe ends. Currently `pipe2(2)` routes through `HostPipe`
+    // (real macOS kernel pipe) so these are not constructed today, but the
+    // full read/write/poll machinery (`PipeState`, `read_pipe`, `write_pipe`)
+    // is kept wired as the portable, host-fd-free pipe model and is matched
+    // throughout the fd handlers. Retained as deliberate API surface.
+    #[allow(dead_code)]
     PipeReader {
         pipe: Rc<RefCell<PipeState>>,
         status_flags: u64,
     },
+    #[allow(dead_code)]
     PipeWriter {
         pipe: Rc<RefCell<PipeState>>,
         status_flags: u64,
@@ -505,23 +482,6 @@ enum TtyFdKind {
 enum XattrTarget {
     Path,
     Fd,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PollInterest {
-    Read,
-    Write,
-    Except,
-}
-
-impl PollInterest {
-    fn poll_events(self) -> i16 {
-        match self {
-            Self::Read => LINUX_POLLIN,
-            Self::Write => LINUX_POLLOUT,
-            Self::Except => LINUX_POLLERR,
-        }
-    }
 }
 
 impl OpenDescription {
@@ -777,24 +737,12 @@ impl SyscallDispatcher {
 
     pub fn new() -> Self {
         Self {
-            stdout: Vec::new(),
-            stderr: Vec::new(),
-            stream_stdio: false,
-            open_files: HashMap::new(),
-            next_fd: 3,
-            cwd: "/".to_owned(),
+            io: fs::IoState::new(),
             mem: mem::MemState::new(),
             proc: proc::ProcState::new(),
             creds: creds::CredState::new(),
             signal: signal::SignalState::new(),
-            vfs_mounts: {
-                let mut m = crate::vfs::VfsMounts::new();
-                m.mount("/dev", Box::new(crate::vfs::DevVfs::new()));
-                m.mount("/proc", Box::new(crate::vfs::ProcVfs::new()));
-                m.mount("/sys", Box::new(crate::vfs::SysVfs::new()));
-                m
-            },
-            rootfs_vfs: crate::vfs::RootFsVfs::new(),
+            fs: fs::FsState::new(),
         }
     }
 
@@ -810,13 +758,13 @@ impl SyscallDispatcher {
 
     pub fn with_rootfs(rootfs: RootFs) -> Self {
         let mut s = Self::new();
-        s.rootfs_vfs.rootfs = Some(rootfs);
+        s.fs.rootfs_vfs.rootfs = Some(rootfs);
         s
     }
 
     pub fn with_rootfs_and_executable(rootfs: RootFs, executable_path: impl Into<String>) -> Self {
         let mut s = Self::new();
-        s.rootfs_vfs.rootfs = Some(rootfs);
+        s.fs.rootfs_vfs.rootfs = Some(rootfs);
         s.proc.executable_path = executable_path.into();
         s
     }
@@ -826,7 +774,7 @@ impl SyscallDispatcher {
     /// directory. Returns the previously-installed backend so the
     /// caller can decide what to do with it (normally just drop).
     pub fn set_fs_backend(&mut self, backend: Box<dyn FsBackend>) -> Box<dyn FsBackend> {
-        self.rootfs_vfs.set_overlay(backend)
+        self.fs.rootfs_vfs.set_overlay(backend)
     }
 
     /// Drop the immutable in-memory rootfs layer. Valid ONLY once the
@@ -838,19 +786,19 @@ impl SyscallDispatcher {
     /// only" when the rootfs is `None`. Never call this for `--fs memory`,
     /// whose overlay starts empty and relies on the rootfs for reads.
     pub fn drop_rootfs_layer(&mut self) {
-        self.rootfs_vfs.rootfs = None;
+        self.fs.rootfs_vfs.rootfs = None;
     }
 
     /// Name of the currently-installed backend (for logging / debug).
     pub fn fs_backend_name(&self) -> &'static str {
-        self.rootfs_vfs.overlay.name()
+        self.fs.rootfs_vfs.overlay.name()
     }
 
     /// Borrow the dispatcher's rootfs. Used by the runtime when the
     /// dispatcher returns `DispatchOutcome::Execve` and the new image
     /// has to be loaded from the same image layers.
     pub fn rootfs(&self) -> Option<&RootFs> {
-        self.rootfs_vfs.rootfs.as_ref()
+        self.fs.rootfs_vfs.rootfs.as_ref()
     }
 
     /// Read a regular file's bytes through the layered view (overlay
@@ -860,14 +808,14 @@ impl SyscallDispatcher {
     /// alone would miss). Returns None if the path isn't a readable
     /// file in either layer.
     pub fn read_exec_file(&self, path: &str) -> Option<Vec<u8>> {
-        if let Some(bytes) = self.rootfs_vfs.overlay.file_contents(path) {
+        if let Some(bytes) = self.fs.rootfs_vfs.overlay.file_contents(path) {
             return Some(bytes);
         }
-        self.rootfs_vfs.rootfs.as_ref()?.read(path).ok()
+        self.fs.rootfs_vfs.rootfs.as_ref()?.read(path).ok()
     }
 
     pub fn stdout(&self) -> &[u8] {
-        &self.stdout
+        &self.io.stdout
     }
 
     /// Enable live passthrough for fd 1/2. After this, `write`/`writev`
@@ -876,7 +824,7 @@ impl SyscallDispatcher {
     /// interactive prompts (`/ # `, cursor-position queries, etc.) to
     /// reach the user's terminal before the guest exits.
     pub fn set_stream_stdio(&mut self, on: bool) {
-        self.stream_stdio = on;
+        self.io.stream_stdio = on;
     }
 
     /// Called after `libc::fork(2)` returns into a child: the child
@@ -885,8 +833,8 @@ impl SyscallDispatcher {
     /// via the `forked_child_exit` path. The parent's full buffer
     /// goes out through its own JSON report.
     pub fn clear_output_buffers(&mut self) {
-        self.stdout.clear();
-        self.stderr.clear();
+        self.io.stdout.clear();
+        self.io.stderr.clear();
     }
 
     /// Linux execve(2) closes every fd that had FD_CLOEXEC set. Our
@@ -902,7 +850,7 @@ impl SyscallDispatcher {
     /// remove it and run close_open_file (which honours the Rc-count
     /// guard, so we don't close a host fd a sibling fd still aliases).
     pub fn close_cloexec_fds(&mut self) {
-        let cloexec_fds: Vec<i32> = self
+        let cloexec_fds: Vec<i32> = self.io
             .open_files
             .iter()
             .filter_map(|(fd, of)| {
@@ -914,18 +862,18 @@ impl SyscallDispatcher {
             })
             .collect();
         for fd in cloexec_fds {
-            if let Some(open_file) = self.open_files.remove(&fd) {
+            if let Some(open_file) = self.io.open_files.remove(&fd) {
                 close_open_file(&open_file);
             }
         }
     }
 
     pub fn stderr(&self) -> &[u8] {
-        &self.stderr
+        &self.io.stderr
     }
 
     pub fn cwd(&self) -> &str {
-        &self.cwd
+        &self.io.cwd
     }
 
 
