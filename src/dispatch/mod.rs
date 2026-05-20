@@ -333,13 +333,10 @@ pub struct SyscallDispatcher {
     open_files: HashMap<i32, OpenFile>,
     next_fd: i32,
     cwd: String,
-    brk_current: u64,
-    mmap_next: u64,
-    /// Bump allocator for the MAP_SHARED file-mapping IPA window, and the
-    /// list of live file mappings (guest_addr, len) so munmap/msync can
-    /// route to them. See [`SyscallDispatcher::mmap`].
-    shared_file_next: u64,
-    shared_file_maps: Vec<(u64, usize)>,
+    /// Owned memory subsystem state (brk, mmap arena, shared-file IPA
+    /// window + live maps, and the captured address-space regions for
+    /// `/proc/self/maps`). See [`mem::MemState`].
+    mem: mem::MemState,
     executable_path: String,
     personality: u64,
     dumpable: i64,
@@ -352,12 +349,6 @@ pub struct SyscallDispatcher {
     /// stack). See [`signal::SignalState`]. Handlers that touch only
     /// signal state borrow `self.signal` narrowly.
     signal: signal::SignalState,
-    /// Snapshot of the guest's `AddressSpace` regions, captured at
-    /// boot via [`set_address_space_regions`]. When present,
-    /// `/proc/self/maps` is rendered from this list (with the heap
-    /// end tracking `brk_current` and the mmap arena end tracking
-    /// `mmap_next`) instead of the hard-coded four-line summary.
-    address_space_regions: Option<Vec<ProcMapsEntry>>,
     /// Swappable writable layer that sits on top of the read-only
     /// rootfs. Writes (mkdirat / openat O_CREAT / write / unlinkat /
     /// renameat) land here; reads consult this first and fall through
@@ -793,17 +784,13 @@ impl SyscallDispatcher {
             open_files: HashMap::new(),
             next_fd: 3,
             cwd: "/".to_owned(),
-            brk_current: LINUX_HEAP_BASE,
-            mmap_next: LINUX_MMAP_BASE,
-            shared_file_next: crate::memory::LINUX_SHARED_FILE_BASE,
-            shared_file_maps: Vec::new(),
+            mem: mem::MemState::new(),
             executable_path: "/proc/self/exe".to_owned(),
             personality: 0,
             dumpable: 1,
             task_name: linux_task_name_from_bytes(b"carrick"),
             creds: creds::CredState::new(),
             signal: signal::SignalState::new(),
-            address_space_regions: None,
             vfs_mounts: {
                 let mut m = crate::vfs::VfsMounts::new();
                 m.mount("/dev", Box::new(crate::vfs::DevVfs::new()));
@@ -822,7 +809,7 @@ impl SyscallDispatcher {
     /// summary. Called once after `HvfTrapEngine::map_address_space`
     /// succeeds.
     pub fn set_address_space_regions(&mut self, regions: Vec<ProcMapsEntry>) {
-        self.address_space_regions = Some(regions);
+        self.mem.address_space_regions = Some(regions);
     }
 
     pub fn with_rootfs(rootfs: RootFs) -> Self {
@@ -1974,9 +1961,9 @@ impl SyscallDispatcher {
     fn synthetic_proc_context(&self) -> SyntheticProcContext<'_> {
         SyntheticProcContext {
             executable_path: &self.executable_path,
-            address_space_regions: self.address_space_regions.as_deref(),
-            brk_current: self.brk_current,
-            mmap_next: self.mmap_next,
+            address_space_regions: self.mem.address_space_regions.as_deref(),
+            brk_current: self.mem.brk_current,
+            mmap_next: self.mem.mmap_next,
         }
     }
 }

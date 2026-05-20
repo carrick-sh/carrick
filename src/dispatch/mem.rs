@@ -2,6 +2,37 @@
 //! `super` for the dispatcher struct and the normalized dispatch table.
 use super::*;
 
+/// Owned memory-subsystem state. Split out of `SyscallDispatcher`.
+pub(super) struct MemState {
+    /// Current program break (`brk`/`sbrk`).
+    pub brk_current: u64,
+    /// Bump cursor for the anonymous mmap arena.
+    pub mmap_next: u64,
+    /// Bump allocator for the MAP_SHARED file-mapping IPA window.
+    pub shared_file_next: u64,
+    /// List of live MAP_SHARED file mappings (guest_addr, len) so
+    /// munmap/msync can route to them. See [`SyscallDispatcher::mmap`].
+    pub shared_file_maps: Vec<(u64, usize)>,
+    /// Snapshot of the guest's `AddressSpace` regions, captured at boot
+    /// via [`SyscallDispatcher::set_address_space_regions`]. When present,
+    /// `/proc/self/maps` is rendered from this list (with the heap end
+    /// tracking `brk_current` and the mmap arena end tracking `mmap_next`)
+    /// instead of the hard-coded four-line summary.
+    pub address_space_regions: Option<Vec<ProcMapsEntry>>,
+}
+
+impl MemState {
+    pub(super) fn new() -> Self {
+        Self {
+            brk_current: LINUX_HEAP_BASE,
+            mmap_next: LINUX_MMAP_BASE,
+            shared_file_next: crate::memory::LINUX_SHARED_FILE_BASE,
+            shared_file_maps: Vec::new(),
+            address_space_regions: None,
+        }
+    }
+}
+
 impl SyscallDispatcher {
     /// posix_fadvise(2): purely an advisory hint to the page cache. We have
     /// no readahead model, so honour it as a no-op — but validate the fd so a
@@ -25,15 +56,15 @@ impl SyscallDispatcher {
         let requested = ctx.arg(0);
         if requested == 0 {
             return Ok(DispatchOutcome::Returned {
-                value: self.brk_current as i64,
+                value: self.mem.brk_current as i64,
             });
         }
 
         if range_within(requested, 0, LINUX_HEAP_BASE, LINUX_HEAP_SIZE) {
-            self.brk_current = requested;
+            self.mem.brk_current = requested;
         }
         Ok(DispatchOutcome::Returned {
-            value: self.brk_current as i64,
+            value: self.mem.brk_current as i64,
         })
     }
 
@@ -115,7 +146,7 @@ impl SyscallDispatcher {
                         // map_shared_file takes ownership of dup_fd (closes it).
                         match memory.map_shared_file(addr, map_len, dup_fd, offset) {
                             Ok(()) => {
-                                self.shared_file_maps.push((addr, map_len));
+                                self.mem.shared_file_maps.push((addr, map_len));
                                 return Ok(DispatchOutcome::Returned { value: addr as i64 });
                             }
                             Err(_) => { /* fall through to snapshot path */ }
@@ -212,11 +243,11 @@ impl SyscallDispatcher {
             return Some(requested);
         }
 
-        let address = align_up_u64(self.mmap_next, LINUX_PAGE_SIZE)?;
+        let address = align_up_u64(self.mem.mmap_next, LINUX_PAGE_SIZE)?;
         if !range_within(address, length, LINUX_MMAP_BASE, LINUX_MMAP_SIZE) {
             return None;
         }
-        self.mmap_next = address.checked_add(length)?;
+        self.mem.mmap_next = address.checked_add(length)?;
         Some(address)
     }
 
@@ -225,11 +256,11 @@ impl SyscallDispatcher {
     fn next_shared_file_address(&mut self, length: u64) -> Option<u64> {
         use crate::memory::{LINUX_SHARED_FILE_BASE, LINUX_SHARED_FILE_SIZE};
         // HVF-page (16 KiB) aligned so each hv_vm_map gets a valid base.
-        let address = align_up_u64(self.shared_file_next, crate::trap::HVF_PAGE_SIZE)?;
+        let address = align_up_u64(self.mem.shared_file_next, crate::trap::HVF_PAGE_SIZE)?;
         if !range_within(address, length, LINUX_SHARED_FILE_BASE, LINUX_SHARED_FILE_SIZE) {
             return None;
         }
-        self.shared_file_next = address.checked_add(length)?;
+        self.mem.shared_file_next = address.checked_add(length)?;
         Some(address)
     }
 
@@ -245,8 +276,8 @@ impl SyscallDispatcher {
             });
         }
         // A real MAP_SHARED file mapping → tear down the host mmap + stage-2.
-        if let Some(pos) = self.shared_file_maps.iter().position(|(a, _)| *a == address) {
-            let (addr, len) = self.shared_file_maps.remove(pos);
+        if let Some(pos) = self.mem.shared_file_maps.iter().position(|(a, _)| *a == address) {
+            let (addr, len) = self.mem.shared_file_maps.remove(pos);
             let _ = ctx.memory.unmap_shared_file(addr, len);
             return Ok(DispatchOutcome::Returned { value: 0 });
         }
@@ -281,7 +312,7 @@ impl SyscallDispatcher {
         // Flush a real MAP_SHARED file mapping to disk (host msync). With a
         // file-backed mapping the guest's stores already hit the file's page
         // cache, but msync makes the durability explicit.
-        if let Some(&(addr, len)) = self.shared_file_maps.iter().find(|(a, _)| *a == address) {
+        if let Some(&(addr, len)) = self.mem.shared_file_maps.iter().find(|(a, _)| *a == address) {
             let _ = ctx.memory.msync_shared_file(addr, len);
             return Ok(DispatchOutcome::Returned { value: 0 });
         }
@@ -404,14 +435,14 @@ impl SyscallDispatcher {
         // Grow in place when this mapping sits at the top of the bump
         // allocator: the tail bytes are fresh guest memory already backed by
         // the stage-2 mapping, so no copy is needed.
-        if old_address.checked_add(old_size) == Some(self.mmap_next) {
+        if old_address.checked_add(old_size) == Some(self.mem.mmap_next) {
             let Some(new_end) = old_address.checked_add(new_size) else {
                 return Ok(DispatchOutcome::Errno {
                     errno: LINUX_ENOMEM,
                 });
             };
             if range_within(old_address, new_size, LINUX_MMAP_BASE, LINUX_MMAP_SIZE) {
-                self.mmap_next = new_end;
+                self.mem.mmap_next = new_end;
                 return Ok(DispatchOutcome::Returned {
                     value: old_address as i64,
                 });
