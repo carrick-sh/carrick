@@ -7245,6 +7245,9 @@ impl SyscallDispatcher {
 
         let target = if path == "/proc/self/exe" || path == "/proc/curproc/exe" {
             self.executable_path.clone()
+        } else if let Some(t) = self.rootfs_vfs.overlay.read_link(&path) {
+            // Symlink created in the writable backend (cap-std on --fs host).
+            t
         } else {
             use crate::vfs::Vfs as _;
             match self.rootfs_vfs.readlink(&path) {
@@ -7414,7 +7417,7 @@ impl SyscallDispatcher {
     }
 
     fn fchmodat(
-        &self,
+        &mut self,
         request: SyscallRequest,
         memory: &impl GuestMemory,
     ) -> Result<DispatchOutcome, DispatchError> {
@@ -7439,17 +7442,21 @@ impl SyscallDispatcher {
             Ok(resolved) => resolved,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        // Same tmpfs-style story as fchownat: as long as the path exists
-        // in the layered view we accept the mode change as a no-op.
-        match self.layered_metadata(&resolved) {
-            Ok(_) => Ok(DispatchOutcome::Returned { value: 0 }),
-            Err(errno) => {
-                if is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context()) {
-                    Ok(DispatchOutcome::Returned { value: 0 })
-                } else {
-                    Ok(DispatchOutcome::Errno { errno })
-                }
+        // Apply the mode to the writable backend (cap-std set_permissions on
+        // --fs host). Synthetic /proc /sys paths and the in-memory backend
+        // (Unsupported) accept it as a no-op as long as the path exists.
+        if is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context()) {
+            return Ok(DispatchOutcome::Returned { value: 0 });
+        }
+        if let Err(errno) = self.layered_metadata(&resolved) {
+            return Ok(DispatchOutcome::Errno { errno });
+        }
+        let mode = (request.arg(2) & 0o7777) as u32;
+        match self.rootfs_vfs.overlay.set_mode(&resolved, mode) {
+            Ok(()) | Err(crate::fs_backend::BackendError::Unsupported) => {
+                Ok(DispatchOutcome::Returned { value: 0 })
             }
+            Err(_) => Ok(DispatchOutcome::Returned { value: 0 }),
         }
     }
 
@@ -7512,35 +7519,35 @@ impl SyscallDispatcher {
         {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EEXIST });
         }
-        // We don't model shared-inode hardlinks, but dpkg (and friends) use
-        // link() to make a backup copy (e.g. /var/lib/dpkg/status-old) and
-        // never rely on shared-inode semantics for those. Materialise the
-        // link as a copy in the writable backend so it lands on disk
-        // (HostFsBackend) and survives fork. Returning EROFS here broke dpkg
-        // --unpack ("error creating new backup file ... Read-only file
-        // system"). AT_EMPTY_PATH (link by fd) isn't supported.
+        // Create a real hard link in the writable backend (cap-std
+        // hard_link). dpkg link()s e.g. /var/lib/dpkg/status -> status-old.
+        // AT_EMPTY_PATH (link by fd) isn't supported. MemoryBackend can't
+        // hard-link an in-memory file, so it falls back to a content copy.
         let Some(src) = resolved_old else {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EROFS });
         };
-        let contents = self
-            .rootfs_vfs
-            .overlay
-            .file_contents(&src)
-            .or_else(|| {
-                self.rootfs_vfs
-                    .rootfs
-                    .as_ref()
-                    .and_then(|r| r.read(&src).ok())
-            })
-            .unwrap_or_default();
-        match self.rootfs_vfs.overlay.set_file_contents(&resolved_new, contents) {
+        match self.rootfs_vfs.overlay.hard_link(&src, &resolved_new) {
             Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
+            Err(crate::fs_backend::BackendError::Unsupported) => {
+                // In-memory backend: emulate with a content copy (callers
+                // like dpkg only need the data, not shared inodes).
+                let contents = self
+                    .rootfs_vfs
+                    .overlay
+                    .file_contents(&src)
+                    .or_else(|| self.rootfs_vfs.rootfs.as_ref().and_then(|r| r.read(&src).ok()))
+                    .unwrap_or_default();
+                match self.rootfs_vfs.overlay.set_file_contents(&resolved_new, contents) {
+                    Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
+                    Err(_) => Ok(DispatchOutcome::Errno { errno: LINUX_EROFS }),
+                }
+            }
             Err(_) => Ok(DispatchOutcome::Errno { errno: LINUX_EROFS }),
         }
     }
 
     fn symlinkat(
-        &self,
+        &mut self,
         request: SyscallRequest,
         memory: &impl GuestMemory,
     ) -> Result<DispatchOutcome, DispatchError> {
@@ -7580,8 +7587,16 @@ impl SyscallDispatcher {
         if self.layered_metadata(&resolved_link).is_ok() {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EEXIST });
         }
-        let _ = target_path;
-        Ok(DispatchOutcome::Errno { errno: LINUX_EROFS })
+        // Create a real symlink in the writable backend (cap-std). The
+        // target is stored verbatim, matching symlinkat(2). MemoryBackend
+        // returns Unsupported → EROFS.
+        match self.rootfs_vfs.overlay.symlink(&target_path, &resolved_link) {
+            Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
+            Err(crate::fs_backend::BackendError::Unsupported) => {
+                Ok(DispatchOutcome::Errno { errno: LINUX_EROFS })
+            }
+            Err(_) => Ok(DispatchOutcome::Errno { errno: LINUX_EROFS }),
+        }
     }
 
     fn renameat(
@@ -7995,6 +8010,13 @@ impl SyscallDispatcher {
     }
 
     fn resolve_at_path(&self, dirfd: u64, path: &str) -> Result<String, i32> {
+        // dirfd is an `int` in the kernel ABI: only the low 32 bits are
+        // meaningful, and AT_FDCWD (-100) may arrive zero-extended (0xFFFFFF9C)
+        // or sign-extended (0xFFFF..FF9C) depending on how the guest libc
+        // widened it. Canonicalise via i32 so AT_FDCWD is recognised either
+        // way (coreutils `ln` passed the zero-extended form → symlinkat/linkat
+        // wrongly treated it as a real fd → EBADF).
+        let dirfd = (dirfd as i32) as i64 as u64;
         if path.is_empty() || Path::new(path).is_absolute() {
             return Ok(path.to_owned());
         }
