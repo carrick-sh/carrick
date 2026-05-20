@@ -9751,9 +9751,15 @@ pub fn set_host_process_name(comm: &[u8]) {
         }
     }
 
-    // (3) Activity Monitor display name via private LaunchServices.
-    // Best-effort; no-op on a non-GUI session.
-    crate::host_proctitle::set_activity_monitor_name(&label);
+    // NOTE: we deliberately do NOT set the Activity Monitor display name
+    // via LaunchServices/CoreFoundation here. Carrick runs guests by
+    // forking WITHOUT a subsequent exec (the guest executes in-process on
+    // the HVF vCPU), and CoreFoundation/LaunchServices are not fork-safe:
+    // a forked child calling into them deadlocks intermittently when a CF
+    // lock was held at fork time (it blocks talking to launchservicesd
+    // over Mach), which wedged the guest's vCPU and hung the parent in
+    // wait4. The argv[0] overwrite above already gives `ps`/tooling the
+    // visible `carrick: <name>` title, which is all we rely on.
 }
 
 #[cfg(not(target_os = "macos"))]
