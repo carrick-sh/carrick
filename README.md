@@ -172,3 +172,19 @@ cargo fmt --all
 cargo test
 cargo build
 ```
+
+### No-panic gate
+
+The supervisor must never crash on guest input, so `unwrap`/`expect`/`panic!`/
+`todo!`/`unimplemented!` are denied crate-wide via `[lints.clippy]` in
+`Cargo.toml` (test code is exempt via `clippy.toml`). A handful of audited,
+provably-infallible sites carry a targeted `#[allow(...)]` with an
+`// INVARIANT:` comment. Run the gate with:
+
+```sh
+cargo clippy --all-targets
+```
+
+This exits non-zero on any *new* unguarded panic/unwrap. (Do **not** add
+`-D warnings`: that promotes unrelated pre-existing style lints to errors;
+the `Cargo.toml` deny levels are what enforce the no-panic gate.)
