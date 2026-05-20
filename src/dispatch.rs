@@ -376,6 +376,35 @@ impl DispatchOutcome {
 pub trait GuestMemory {
     fn read_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError>;
     fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError>;
+
+    /// Back the guest range `[guest_addr, guest_addr+len)` with a real
+    /// `MAP_SHARED` mapping of the host file `host_fd` at `offset`, so the
+    /// guest CPU AND the dispatcher's accessor both operate on the file's
+    /// page cache (full coherence + persistence). `host_fd` ownership is
+    /// transferred — the impl must `close` it once mapped. Default: the
+    /// backend doesn't support real shared mappings → caller falls back to
+    /// a private snapshot copy.
+    fn map_shared_file(
+        &mut self,
+        _guest_addr: u64,
+        _len: usize,
+        _host_fd: i32,
+        _offset: u64,
+    ) -> Result<(), MemoryError> {
+        Err(MemoryError::Unsupported)
+    }
+
+    /// Tear down a shared file mapping previously created by
+    /// `map_shared_file`. Default no-op.
+    fn unmap_shared_file(&mut self, _guest_addr: u64, _len: usize) -> Result<(), MemoryError> {
+        Ok(())
+    }
+
+    /// Flush a shared file mapping to the backing file (`msync`). Default
+    /// no-op (the snapshot path has nothing to flush).
+    fn msync_shared_file(&mut self, _guest_addr: u64, _len: usize) -> Result<(), MemoryError> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -438,6 +467,14 @@ impl GuestMemory for LinearMemory {
 pub enum MemoryError {
     #[error("guest memory read is out of bounds at 0x{address:x} for {length} bytes")]
     OutOfBounds { address: u64, length: usize },
+    /// The backend can't service a real shared file-backed mapping (e.g.
+    /// the non-HVF AddressSpace/LinearMemory used in unit tests). Callers
+    /// fall back to the private-snapshot mmap path.
+    #[error("operation unsupported by this guest-memory backend")]
+    Unsupported,
+    /// A host-side mapping operation (mmap/hv_vm_map/...) failed.
+    #[error("host mapping operation failed: {0}")]
+    HostMap(String),
 }
 
 #[derive(Debug, Error)]
@@ -483,6 +520,11 @@ pub struct SyscallDispatcher {
     cwd: String,
     brk_current: u64,
     mmap_next: u64,
+    /// Bump allocator for the MAP_SHARED file-mapping IPA window, and the
+    /// list of live file mappings (guest_addr, len) so munmap/msync can
+    /// route to them. See [`SyscallDispatcher::mmap`].
+    shared_file_next: u64,
+    shared_file_maps: Vec<(u64, usize)>,
     executable_path: String,
     personality: u64,
     dumpable: i64,
@@ -937,6 +979,8 @@ impl SyscallDispatcher {
             cwd: "/".to_owned(),
             brk_current: LINUX_HEAP_BASE,
             mmap_next: LINUX_MMAP_BASE,
+            shared_file_next: crate::memory::LINUX_SHARED_FILE_BASE,
+            shared_file_maps: Vec::new(),
             executable_path: "/proc/self/exe".to_owned(),
             personality: 0,
             dumpable: 1,
@@ -6559,10 +6603,10 @@ impl SyscallDispatcher {
         let offset = ctx.arg(5);
         let memory = &mut *ctx.memory;
 
-        // Linux requires exactly one of MAP_SHARED / MAP_PRIVATE. We model
-        // both as a private snapshot copy of the file contents (we don't
-        // implement live MAP_SHARED writeback / cross-process coherence),
-        // which is sufficient for callers that mmap+msync a file.
+        // Linux requires exactly one of MAP_SHARED / MAP_PRIVATE. MAP_PRIVATE
+        // is a private snapshot copy of the file contents. MAP_SHARED of a
+        // real host file is backed by a true shared mapping (see below) so
+        // writes are coherent across mappings and persist to the file.
         let map_type = flags & (LINUX_MAP_SHARED | LINUX_MAP_PRIVATE);
         if length == 0
             || prot & !(LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC) != 0
@@ -6582,6 +6626,62 @@ impl SyscallDispatcher {
                 });
             }
         };
+        let length_usize =
+            usize::try_from(length).map_err(|_| DispatchError::LengthTooLarge(length))?;
+
+        // Coherent MAP_SHARED of a real host file: back the guest pages with
+        // a libc MAP_SHARED mmap of the host file, stage-2 mapped into a
+        // dedicated guest window. The guest CPU and the dispatcher accessor
+        // then share the file's page cache, so writes are visible across
+        // mappings and persist to disk — what apt's mmap-backed cache needs.
+        // Falls through to the private-snapshot path if the fd isn't a real
+        // host file or the backend can't do shared mappings (--fs memory,
+        // unit tests). MAP_FIXED shared mappings keep the snapshot path.
+        // hv_vm_map requires HVF-page (16 KiB) aligned addr/len/offset. The
+        // guest runs with the stage-1 MMU off (VA==IPA), so we map at the IPA
+        // directly; we only need to round the mapping up to the HVF page and
+        // require an HVF-aligned file offset (else fall back to snapshot).
+        let hvf_page = crate::trap::HVF_PAGE_SIZE;
+        if flags & LINUX_MAP_ANONYMOUS == 0
+            && map_type == LINUX_MAP_SHARED
+            && flags & LINUX_MAP_FIXED == 0
+            && offset % hvf_page == 0
+        {
+            let dup_fd = {
+                let Some(open_file) = self.open_files.get(&fd) else {
+                    return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+                };
+                let open = open_file.description.borrow();
+                match &*open {
+                    OpenDescription::HostFile { host_fd, .. } => {
+                        let d = unsafe { libc::dup(*host_fd) };
+                        if d < 0 { None } else { Some(d) }
+                    }
+                    _ => None,
+                }
+            };
+            if let Some(dup_fd) = dup_fd {
+                let map_len = align_up_u64(length, hvf_page)
+                    .and_then(|l| usize::try_from(l).ok())
+                    .unwrap_or(length_usize);
+                match self.next_shared_file_address(map_len as u64) {
+                    Some(addr) => {
+                        // map_shared_file takes ownership of dup_fd (closes it).
+                        match memory.map_shared_file(addr, map_len, dup_fd, offset) {
+                            Ok(()) => {
+                                self.shared_file_maps.push((addr, map_len));
+                                return Ok(DispatchOutcome::Returned { value: addr as i64 });
+                            }
+                            Err(_) => { /* fall through to snapshot path */ }
+                        }
+                    }
+                    None => unsafe {
+                        libc::close(dup_fd);
+                    },
+                }
+            }
+        }
+
         let address = match self.next_mmap_address(requested, length, flags) {
             Some(address) => address,
             None => {
@@ -6591,8 +6691,6 @@ impl SyscallDispatcher {
             }
         };
 
-        let length_usize =
-            usize::try_from(length).map_err(|_| DispatchError::LengthTooLarge(length))?;
         let mut bytes = vec![0; length_usize];
         if flags & LINUX_MAP_ANONYMOUS == 0 {
             let Some(open_file) = self.open_files.get(&fd) else {
@@ -6676,13 +6774,37 @@ impl SyscallDispatcher {
         Some(address)
     }
 
+    /// Bump-allocate a page-aligned guest address in the dedicated
+    /// MAP_SHARED file-mapping window. Returns None if the window is full.
+    fn next_shared_file_address(&mut self, length: u64) -> Option<u64> {
+        use crate::memory::{LINUX_SHARED_FILE_BASE, LINUX_SHARED_FILE_SIZE};
+        // HVF-page (16 KiB) aligned so each hv_vm_map gets a valid base.
+        let address = align_up_u64(self.shared_file_next, crate::trap::HVF_PAGE_SIZE)?;
+        if !range_within(address, length, LINUX_SHARED_FILE_BASE, LINUX_SHARED_FILE_SIZE) {
+            return None;
+        }
+        self.shared_file_next = address.checked_add(length)?;
+        Some(address)
+    }
+
     fn munmap<M: GuestMemory>(
         &mut self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let address = ctx.arg(0);
         let length = ctx.arg(1);
-        if length == 0 || !range_within(address, length, LINUX_MMAP_BASE, LINUX_MMAP_SIZE) {
+        if length == 0 {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            });
+        }
+        // A real MAP_SHARED file mapping → tear down the host mmap + stage-2.
+        if let Some(pos) = self.shared_file_maps.iter().position(|(a, _)| *a == address) {
+            let (addr, len) = self.shared_file_maps.remove(pos);
+            let _ = ctx.memory.unmap_shared_file(addr, len);
+            return Ok(DispatchOutcome::Returned { value: 0 });
+        }
+        if !range_within(address, length, LINUX_MMAP_BASE, LINUX_MMAP_SIZE) {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
             });
@@ -6697,7 +6819,6 @@ impl SyscallDispatcher {
         let address = ctx.arg(0);
         let length = ctx.arg(1);
         let flags = ctx.arg(2);
-        let memory = &*ctx.memory;
         if flags & !(LINUX_MS_ASYNC | LINUX_MS_INVALIDATE | LINUX_MS_SYNC) != 0 {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
@@ -6711,7 +6832,14 @@ impl SyscallDispatcher {
         if length == 0 {
             return Ok(DispatchOutcome::Returned { value: 0 });
         }
-        if memory.read_bytes(address, 1).is_err() {
+        // Flush a real MAP_SHARED file mapping to disk (host msync). With a
+        // file-backed mapping the guest's stores already hit the file's page
+        // cache, but msync makes the durability explicit.
+        if let Some(&(addr, len)) = self.shared_file_maps.iter().find(|(a, _)| *a == address) {
+            let _ = ctx.memory.msync_shared_file(addr, len);
+            return Ok(DispatchOutcome::Returned { value: 0 });
+        }
+        if ctx.memory.read_bytes(address, 1).is_err() {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_ENOMEM,
             });
