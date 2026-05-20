@@ -234,20 +234,20 @@ pub trait FsBackend: Send {
         _value: &[u8],
         _flags: i32,
     ) -> Result<(), i32> {
-        Err(crate::dispatch::LINUX_ENOTSUP)
+        Err(crate::linux_abi::LINUX_ENOTSUP)
     }
 
     /// Read the extended attribute `name` on `path`. Returns the raw value
     /// bytes. `Err(LINUX_ENODATA)` if absent. Default: unsupported.
     fn get_xattr(&self, _path: &str, _name: &str) -> Result<Vec<u8>, i32> {
-        Err(crate::dispatch::LINUX_ENOTSUP)
+        Err(crate::linux_abi::LINUX_ENOTSUP)
     }
 
     /// List the `user.*` extended attribute names on `path` (names only, no
     /// trailing NUL — the caller assembles the NUL-separated list). Default:
     /// unsupported.
     fn list_xattr(&self, _path: &str) -> Result<Vec<String>, i32> {
-        Err(crate::dispatch::LINUX_ENOTSUP)
+        Err(crate::linux_abi::LINUX_ENOTSUP)
     }
 
     /// Read the REAL on-disk stat for `path` (type + hard-link count +
@@ -1096,7 +1096,7 @@ impl FsBackend for HostFsBackend {
         // what an unprivileged guest typically sees and keeping the host's
         // own attribute namespaces out of the picture.
         if !name.starts_with("user.") {
-            return Err(crate::dispatch::LINUX_ENOTSUP);
+            return Err(crate::linux_abi::LINUX_ENOTSUP);
         }
         // Open a real kernel fd for the materialised file (same approach as
         // `set_times`/`allocate`) and drive macOS `fsetxattr(2)` on it. The
@@ -1104,21 +1104,21 @@ impl FsBackend for HostFsBackend {
         // list/get round-trips the exact Linux name.
         let host_fd = self
             .open_raw_fd(path, true, false, false)
-            .ok_or(crate::dispatch::LINUX_ENODATA)?;
+            .ok_or(crate::linux_abi::LINUX_ENODATA)?;
         let cname = match std::ffi::CString::new(name) {
             Ok(c) => c,
             Err(_) => {
                 unsafe { libc::close(host_fd) };
-                return Err(crate::dispatch::LINUX_EINVAL);
+                return Err(crate::linux_abi::LINUX_EINVAL);
             }
         };
         // Translate Linux XATTR_CREATE/XATTR_REPLACE to the macOS options
         // (same semantics, different numeric values).
         let mut opts: libc::c_int = 0;
-        if flags & crate::dispatch::LINUX_XATTR_CREATE != 0 {
+        if flags & crate::linux_abi::LINUX_XATTR_CREATE != 0 {
             opts |= libc::XATTR_CREATE;
         }
-        if flags & crate::dispatch::LINUX_XATTR_REPLACE != 0 {
+        if flags & crate::linux_abi::LINUX_XATTR_REPLACE != 0 {
             opts |= libc::XATTR_REPLACE;
         }
         let rc = unsafe {
@@ -1142,16 +1142,16 @@ impl FsBackend for HostFsBackend {
 
     fn get_xattr(&self, path: &str, name: &str) -> Result<Vec<u8>, i32> {
         if !name.starts_with("user.") {
-            return Err(crate::dispatch::LINUX_ENODATA);
+            return Err(crate::linux_abi::LINUX_ENODATA);
         }
         let host_fd = self
             .open_raw_fd(path, false, false, false)
-            .ok_or(crate::dispatch::LINUX_ENODATA)?;
+            .ok_or(crate::linux_abi::LINUX_ENODATA)?;
         let cname = match std::ffi::CString::new(name) {
             Ok(c) => c,
             Err(_) => {
                 unsafe { libc::close(host_fd) };
-                return Err(crate::dispatch::LINUX_EINVAL);
+                return Err(crate::linux_abi::LINUX_EINVAL);
             }
         };
         // First call with size 0 to learn the value length.
@@ -1194,7 +1194,7 @@ impl FsBackend for HostFsBackend {
     fn list_xattr(&self, path: &str) -> Result<Vec<String>, i32> {
         let host_fd = self
             .open_raw_fd(path, false, false, false)
-            .ok_or(crate::dispatch::LINUX_ENODATA)?;
+            .ok_or(crate::linux_abi::LINUX_ENODATA)?;
         // macOS may surface its own attribute names (e.g. resource forks);
         // we read the full NUL-separated list then filter to `user.*` so the
         // result is exactly the Linux-conformant namespace the guest set.

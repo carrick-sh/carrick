@@ -6,7 +6,8 @@
 //! risk of accidentally diverging the byte output is zero. Future
 //! cleanup can lift the generators into this module.
 
-use crate::dispatch::{LINUX_EACCES, LINUX_ENOENT, LINUX_ENOTDIR, SyntheticProcContext};
+use crate::dispatch::SyntheticProcContext;
+use crate::linux_abi::{LINUX_EACCES, LINUX_ENOENT, LINUX_ENOTDIR};
 
 use super::{
     EntryKind, Metadata, OpenContext, OpenFlags, Vfs, VfsError, VfsHandle,
@@ -95,7 +96,7 @@ impl Vfs for ProcVfs {
             // openat fallthrough (rootfs-backed directory entries
             // like /proc itself and /proc/self/). Returning ENOSYS
             // signals "I don't handle this".
-            return Err(crate::dispatch::LINUX_ENOSYS);
+            return Err(crate::linux_abi::LINUX_ENOSYS);
         };
         if flags.write {
             return Err(LINUX_EACCES);

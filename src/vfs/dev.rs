@@ -7,7 +7,8 @@
 
 use std::ffi::CString;
 
-use crate::dispatch::{linux_errno, LINUX_ENOENT, LINUX_ENOTDIR};
+use crate::dispatch::linux_errno;
+use crate::linux_abi::{LINUX_ENOENT, LINUX_ENOTDIR};
 
 use super::{DirEnt, EntryKind, Metadata, OpenContext, OpenFlags, Vfs, VfsError, VfsHandle};
 
@@ -113,7 +114,7 @@ impl Vfs for DevVfs {
         }
 
         let cpath = CString::new(host_path)
-            .map_err(|_| crate::dispatch::LINUX_EINVAL)?;
+            .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
         // SAFETY: cpath is a valid NUL-terminated C string.
         let host_fd = unsafe { libc::open(cpath.as_ptr(), host_flags) };
         if host_fd < 0 {
@@ -126,7 +127,7 @@ impl Vfs for DevVfs {
         // syscall regardless of how the guest opened the fd.
         let is_read_end = !flags.write;
         let status_flags = if flags.nonblock {
-            crate::dispatch::LINUX_O_NONBLOCK as u32
+            crate::linux_abi::LINUX_O_NONBLOCK as u32
         } else {
             0
         };
@@ -149,7 +150,7 @@ fn host_open_errno() -> i32 {
     if raw == libc::ENOENT {
         LINUX_ENOENT
     } else if raw == libc::EACCES {
-        crate::dispatch::LINUX_EACCES
+        crate::linux_abi::LINUX_EACCES
     } else if raw == libc::EMFILE {
         linux_errno::EMFILE
     } else {
@@ -315,7 +316,7 @@ mod tests {
                 ..
             } => {
                 assert!(host_fd >= 0);
-                assert_ne!(status_flags & (crate::dispatch::LINUX_O_NONBLOCK as u32), 0);
+                assert_ne!(status_flags & (crate::linux_abi::LINUX_O_NONBLOCK as u32), 0);
                 unsafe { libc::close(host_fd) };
             }
             other => panic!("expected HostFd, got {:?}", other),
