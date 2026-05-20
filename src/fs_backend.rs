@@ -427,19 +427,16 @@ impl FsBackend for MemoryBackend {
 /// pre-existing symlinks pointing outside the scratch root all fail
 /// at the open(2)/openat(2) layer, not as a Rust-level check.
 ///
-/// We *also* keep a small in-memory bookkeeping table mirroring the
-/// in-memory backend:
+/// The backend is purely disk-backed: the cap-std `dir` handle is the
+/// single source of truth for what exists. Reads (`lookup`, `metadata`,
+/// `file_contents`, `child_names`, ...) go straight to the live scratch
+/// tree, and writes land directly there (cap-std `dir.create_dir`/
+/// `dir.open_with` + std `Write`).
 ///
-///   * `dirs_created`: directories the guest created via mkdirat. Used
-///     so `lookup` can tell "guest-created dir" from "happens to exist
-///     in the scratch root from a prior reflink seed".
-///   * `tombstones`: paths the guest deleted that still exist in the
-///     read-only rootfs underneath. The dispatcher's layered lookup
-///     consults this just like for the memory backend.
-///
-/// Plain file mutations land directly in the scratch tree (cap-std
-/// `dir.create`/`dir.open_with` + std `Write`). Reads go back through
-/// the same handle.
+/// The one piece of in-memory state we keep is `tombstones`: paths the
+/// guest deleted that still exist in the read-only rootfs layer
+/// underneath. The dispatcher's layered lookup consults this to shadow
+/// the rootfs, just like for the memory backend.
 pub struct HostFsBackend {
     /// The kernel-rooted sandbox handle. ALL fs operations on the
     /// scratch dir go through this. Holding it directly (rather than
@@ -454,13 +451,7 @@ pub struct HostFsBackend {
     /// orphaned scratch directories left behind by crashed runs.
     /// Held for the lifetime of the backend.
     _lock: Option<fd_lock::RwLock<std::fs::File>>,
-    dirs_created: HashSet<PathBuf>,
     tombstones: HashSet<PathBuf>,
-    /// Paths the backend "knows about" — i.e. anything ever created,
-    /// touched or recorded. Used by `lookup` so we can tell whether a
-    /// scratch-disk file came from the guest (overlay-owned) vs from
-    /// a leftover reflink seed we should ignore here.
-    known_files: HashSet<PathBuf>,
     /// PID of the process that created this backend (and thus owns the
     /// `TempDir` lifetime). carrick forks real processes for guest
     /// `clone(2)`; every forked child inherits this struct via COW and
@@ -491,9 +482,7 @@ impl Drop for HostFsBackend {
 impl std::fmt::Debug for HostFsBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HostFsBackend")
-            .field("dirs_created", &self.dirs_created.len())
             .field("tombstones", &self.tombstones.len())
-            .field("known_files", &self.known_files.len())
             .finish()
     }
 }
@@ -522,9 +511,7 @@ impl HostFsBackend {
             dir,
             _scratch: Some(scratch),
             _lock: Some(lock),
-            dirs_created: HashSet::new(),
             tombstones: HashSet::new(),
-            known_files: HashSet::new(),
             owner_pid: unsafe { libc::getpid() as u32 },
         })
     }
@@ -553,11 +540,8 @@ impl HostFsBackend {
         rootfs
             .extract_to_disk(&scratch_path)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-        // Mark everything as "known" so MemoryBackend-style lookups
-        // hit the backend directly without falling back to the rootfs.
-        for path in rootfs.all_paths() {
-            self.known_files.insert(path);
-        }
+        // Everything is on the cap-std disk now, which is the single
+        // source of truth for lookups — no bookkeeping to record.
         Ok(())
     }
 
@@ -568,9 +552,7 @@ impl HostFsBackend {
             dir,
             _scratch: None,
             _lock: None,
-            dirs_created: HashSet::new(),
             tombstones: HashSet::new(),
-            known_files: HashSet::new(),
             owner_pid: unsafe { libc::getpid() as u32 },
         }
     }
@@ -597,8 +579,7 @@ impl FsBackend for HostFsBackend {
         let rel = Self::rel_path(&normalized)?;
         let meta = self.dir.symlink_metadata(rel).ok()?;
         // After seed_from_rootfs the whole rootfs lives on disk under
-        // the cap-std root, so we no longer gate by `known_files` /
-        // `dirs_created`. Every file/dir present in the sandbox is
+        // the cap-std root. Every file/dir present in the sandbox is
         // authoritative — that's the "rootfs on host APFS" architecture.
         if meta.is_dir() {
             return Some(OverlayEntry::Dir);
@@ -683,13 +664,6 @@ impl FsBackend for HostFsBackend {
             Err(_) => return Err(BackendError::Io),
         }
         self.tombstones.remove(&normalized);
-        // Record every ancestor so /var, /var/lib, /var/lib/apt all
-        // show up as overlay-dirs after a deep mkdir.
-        let mut ancestor = PathBuf::new();
-        for component in normalized.components() {
-            ancestor.push(component);
-            self.dirs_created.insert(ancestor.clone());
-        }
         Ok(())
     }
 
@@ -709,7 +683,6 @@ impl FsBackend for HostFsBackend {
             .open_with(rel, &opts)
             .map_err(|_| BackendError::Io)?;
         self.tombstones.remove(&normalized);
-        self.known_files.insert(normalized);
         Ok(())
     }
 
@@ -736,7 +709,6 @@ impl FsBackend for HostFsBackend {
         file.seek(SeekFrom::Start(0)).map_err(|_| BackendError::Io)?;
         file.write_all(&contents).map_err(|_| BackendError::Io)?;
         self.tombstones.remove(&normalized);
-        self.known_files.insert(normalized);
         Ok(())
     }
 
@@ -747,12 +719,8 @@ impl FsBackend for HostFsBackend {
         let Some(rel) = Self::rel_path(&normalized) else {
             return false;
         };
-        self.known_files.remove(&normalized);
-        self.dirs_created.remove(&normalized);
-        // The cap-std scratch is the source of truth (readdir/lookup hit it),
-        // and files created via open_raw_fd never enter known_files — so
-        // remove from disk unconditionally, not just for tracked entries.
-        // Otherwise a renamed-away source lingered in readdir.
+        // The cap-std scratch is the source of truth (readdir/lookup hit
+        // it), so remove from disk unconditionally.
         self.dir.remove_file(rel).is_ok() || self.dir.remove_dir(rel).is_ok()
     }
 
@@ -764,8 +732,6 @@ impl FsBackend for HostFsBackend {
             let _ = self.dir.remove_file(rel);
             let _ = self.dir.remove_dir(rel);
         }
-        self.known_files.remove(&normalized);
-        self.dirs_created.remove(&normalized);
         self.tombstones.insert(normalized);
         Ok(())
     }
@@ -775,13 +741,11 @@ impl FsBackend for HostFsBackend {
             return Vec::new();
         };
         // Read the LIVE cap-std directory. Files created via open_raw_fd
-        // (which hands back a raw fd and never touches the in-memory
-        // known_files set) and directories created via mkdir both land on
-        // the scratch disk, and the whole rootfs is materialised there too.
-        // The old known_files/dirs_created enumeration missed raw-fd
-        // creations entirely, so apt's downloaded .deb existed on disk and
-        // was readable by path but invisible to readdir/glob — dpkg then
-        // couldn't find it.
+        // (which hands back a raw fd) and directories created via mkdir
+        // both land on the scratch disk, and the whole rootfs is
+        // materialised there too. The disk is the single source of truth,
+        // so readdir/glob see everything that exists by path — including
+        // apt's downloaded .deb that dpkg later needs to find.
         let read = match Self::rel_path(&normalized) {
             Some(rel) => self.dir.read_dir(rel),
             None => self.dir.entries(), // scratch root == guest "/"
@@ -821,41 +785,25 @@ impl FsBackend for HostFsBackend {
         let dst = normalize(to).ok_or(BackendError::Invalid)?;
         let src_rel = Self::rel_path(&src).ok_or(BackendError::Invalid)?.to_path_buf();
         let dst_rel = Self::rel_path(&dst).ok_or(BackendError::Invalid)?.to_path_buf();
-        if self.known_files.contains(&src) {
-            if let Some(parent) = dst_rel.parent() {
-                if !parent.as_os_str().is_empty() {
-                    self.dir
-                        .create_dir_all(parent)
-                        .map_err(|_| BackendError::Io)?;
-                }
-            }
-            self.dir
-                .rename(&src_rel, &self.dir, &dst_rel)
-                .map_err(|_| BackendError::Io)?;
-            self.known_files.remove(&src);
-            self.known_files.insert(dst.clone());
-            self.tombstones.remove(&dst);
-            self.tombstones.insert(src);
-            return Ok(true);
+        // The cap-std scratch is the source of truth: an entry is
+        // renameable iff it actually exists on disk. (open_raw_fd
+        // creations and seeded rootfs entries are all on disk.)
+        if self.dir.symlink_metadata(&src_rel).is_err() {
+            return Ok(false);
         }
-        if self.dirs_created.contains(&src) {
-            if let Some(parent) = dst_rel.parent() {
-                if !parent.as_os_str().is_empty() {
-                    self.dir
-                        .create_dir_all(parent)
-                        .map_err(|_| BackendError::Io)?;
-                }
+        if let Some(parent) = dst_rel.parent() {
+            if !parent.as_os_str().is_empty() {
+                self.dir
+                    .create_dir_all(parent)
+                    .map_err(|_| BackendError::Io)?;
             }
-            self.dir
-                .rename(&src_rel, &self.dir, &dst_rel)
-                .map_err(|_| BackendError::Io)?;
-            self.dirs_created.remove(&src);
-            self.dirs_created.insert(dst.clone());
-            self.tombstones.remove(&dst);
-            self.tombstones.insert(src);
-            return Ok(true);
         }
-        Ok(false)
+        self.dir
+            .rename(&src_rel, &self.dir, &dst_rel)
+            .map_err(|_| BackendError::Io)?;
+        self.tombstones.remove(&dst);
+        self.tombstones.insert(src);
+        Ok(true)
     }
 
     fn open_raw_fd(
