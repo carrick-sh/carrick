@@ -52,7 +52,7 @@ impl SyscallDispatcher {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         }
 
-        let Some(open_file) = self.open_files.get(&epfd) else {
+        let Some(open_file) = self.io.open_files.get(&epfd) else {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         };
         let mut open = open_file.description.borrow_mut();
@@ -119,7 +119,7 @@ impl SyscallDispatcher {
             });
         }
 
-        let Some(open_file) = self.open_files.get(&epfd) else {
+        let Some(open_file) = self.io.open_files.get(&epfd) else {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         };
         let interests = {
@@ -175,7 +175,7 @@ impl SyscallDispatcher {
     }
 
     fn epoll_ready_events(&self, fd: i32, requested_events: u32) -> u32 {
-        let Some(open_file) = self.open_files.get(&fd) else {
+        let Some(open_file) = self.io.open_files.get(&fd) else {
             return 0;
         };
         let open = open_file.description.borrow();
@@ -644,7 +644,7 @@ impl SyscallDispatcher {
             // (revents=0), which is the right semantic. Pass it through.
             return Some(fd);
         }
-        if let Some(open_file) = self.open_files.get(&fd) {
+        if let Some(open_file) = self.io.open_files.get(&fd) {
             let open = open_file.description.borrow();
             return match &*open {
                 OpenDescription::HostPipe { host_fd, .. }
@@ -667,7 +667,7 @@ impl SyscallDispatcher {
         if fd < 0 {
             return 0;
         }
-        let Some(open_file) = self.open_files.get(&fd) else {
+        let Some(open_file) = self.io.open_files.get(&fd) else {
             return if is_stdio_fd(fd) {
                 // fd 1/2 are always writable (we either buffer or stream
                 // straight to host write). For fd 0 we have to actually
@@ -1003,7 +1003,7 @@ impl SyscallDispatcher {
 
     /// Pull a (host_fd, family) pair out of the dispatcher's fd table.
     fn host_socket_lookup(&self, fd: i32) -> Result<(i32, i32), i32> {
-        let Some(open_file) = self.open_files.get(&fd) else {
+        let Some(open_file) = self.io.open_files.get(&fd) else {
             return Err(LINUX_EBADF);
         };
         let open = open_file.description.borrow();
@@ -1015,7 +1015,7 @@ impl SyscallDispatcher {
 
     /// True iff `fd` refers to a synthetic AF_NETLINK socket.
     fn fd_is_netlink(&self, fd: i32) -> bool {
-        self.open_files.get(&fd).is_some_and(|of| {
+        self.io.open_files.get(&fd).is_some_and(|of| {
             matches!(&*of.description.borrow(), OpenDescription::Netlink { .. })
         })
     }
@@ -1024,7 +1024,7 @@ impl SyscallDispatcher {
     /// rtnetlink dump reply (or a bare NLMSG_DONE for requests we don't
     /// specifically model). Returns the number of bytes "sent".
     fn netlink_send(&mut self, fd: i32, request: &[u8]) -> DispatchOutcome {
-        let Some(open_file) = self.open_files.get(&fd) else {
+        let Some(open_file) = self.io.open_files.get(&fd) else {
             return DispatchOutcome::Errno { errno: LINUX_EBADF };
         };
         let reply = {
@@ -1066,7 +1066,7 @@ impl SyscallDispatcher {
     /// reply is built as one contiguous dump, so a single drain that fits
     /// the caller's buffer returns the whole thing.
     fn netlink_drain(&mut self, fd: i32, max: usize) -> Vec<u8> {
-        let Some(open_file) = self.open_files.get(&fd) else {
+        let Some(open_file) = self.io.open_files.get(&fd) else {
             return Vec::new();
         };
         let mut open = open_file.description.borrow_mut();
@@ -1088,7 +1088,7 @@ impl SyscallDispatcher {
         // AF_NETLINK bind: read the (optional) sockaddr_nl to pick up the
         // requested pid/groups, then assign a pid (the guest's own pid
         // when the caller passed 0, i.e. "let the kernel choose").
-        if let Some(open_file) = self.open_files.get(&fd) {
+        if let Some(open_file) = self.io.open_files.get(&fd) {
             if let OpenDescription::Netlink {
                 pid: nl_pid,
                 groups: nl_groups,
@@ -1190,7 +1190,7 @@ impl SyscallDispatcher {
         let addr_addr = request.arg(1);
         let addrlen_addr = request.arg(2);
         let (host_fd, family, type_) = {
-            let Some(open_file) = self.open_files.get(&fd) else {
+            let Some(open_file) = self.io.open_files.get(&fd) else {
                 return DispatchOutcome::Errno { errno: LINUX_EBADF };
             };
             match &*open_file.description.borrow() {
@@ -1287,7 +1287,7 @@ impl SyscallDispatcher {
         let addrlen_addr = ctx.request.arg(2);
         // AF_NETLINK getsockname: hand back a sockaddr_nl carrying the
         // bound pid/groups (or pid=0 if the socket was never bound).
-        if let Some(open_file) = self.open_files.get(&fd) {
+        if let Some(open_file) = self.io.open_files.get(&fd) {
             if let OpenDescription::Netlink { pid, groups, .. } =
                 &*open_file.description.borrow()
             {
