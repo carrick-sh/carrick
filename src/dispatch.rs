@@ -737,6 +737,29 @@ impl SyscallDispatcher {
         78 => readlinkat,
         79 => newfstatat,
         80 => fstat,
+        220 => clone,
+        221 => execve,
+        222 => mmap,
+        223 => fadvise64,
+        226 => mprotect,
+        227 => msync,
+        228 => mlock,
+        229 => munlock,
+        230 => mlockall,
+        231 => munlockall,
+        232 => mincore,
+        233 => madvise,
+        242 => accept4,
+        260 => wait4,
+        261 => prlimit64,
+        266 => clock_adjtime,
+        276 => renameat2,
+        278 => getrandom,
+        285 => copy_file_range,
+        291 => statx,
+        436 => close_range,
+        437 => openat2,
+        439 => faccessat2,
     }
 
     pub fn new() -> Self {
@@ -1104,32 +1127,9 @@ impl SyscallDispatcher {
             214 => self.brk(request),
             215 => self.munmap(request),
             216 => self.mremap(request, memory),
-            220 => self.clone(request),
             435 => self.clone3(request, memory),
-            221 => self.execve(request, memory),
-            222 => self.mmap(request, memory)?,
-            223 => self.fadvise64(request),
-            226 => self.mprotect(request, memory),
-            227 => self.msync(request, memory),
-            228 => self.mlock(request, memory),
-            229 => self.munlock(request, memory),
-            230 => self.mlockall(request),
-            231 => self.munlockall(),
-            232 => self.mincore(request, memory),
-            233 => self.madvise(request, memory),
-            242 => self.accept4(request, memory),
-            260 => self.wait4(request, memory),
-            261 => self.prlimit64(request, memory),
-            266 => self.clock_adjtime(request, memory),
-            276 => self.renameat2(request, memory)?,
-            278 => self.getrandom(request, memory)?,
             283 => self.membarrier(request),
-            285 => self.copy_file_range(request, memory)?,
-            291 => self.statx(request, memory)?,
             293 => self.rseq(),
-            436 => self.close_range(request),
-            437 => self.openat2(request, memory, reporter)?,
-            439 => self.faccessat2(request, memory)?,
             _ => {
                 reporter.record(CompatEvent::unhandled_syscall(
                     request.number,
@@ -1202,17 +1202,16 @@ impl SyscallDispatcher {
         self.access_at(request.arg(0), request.arg(1), request.arg(2), 0, memory)
     }
 
-    fn faccessat2(
-        &self,
-        request: SyscallRequest,
-        memory: &impl GuestMemory,
+    fn faccessat2<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         self.access_at(
-            request.arg(0),
-            request.arg(1),
-            request.arg(2),
-            request.arg(3),
-            memory,
+            ctx.arg(0),
+            ctx.arg(1),
+            ctx.arg(2),
+            ctx.arg(3),
+            &*ctx.memory,
         )
     }
 
@@ -3406,22 +3405,22 @@ impl SyscallDispatcher {
         adjtimex_bootstrap(memory, address)
     }
 
-    fn clock_adjtime(
-        &self,
-        request: SyscallRequest,
-        memory: &impl GuestMemory,
-    ) -> DispatchOutcome {
-        let clock_id = request.arg(0);
-        let address = request.arg(1);
+    fn clock_adjtime<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let clock_id = ctx.arg(0);
+        let address = ctx.arg(1);
+        let memory = &*ctx.memory;
         // Linux only accepts CLOCK_REALTIME for unprivileged callers (and
         // generally only CLOCK_REALTIME at all for adjtime semantics); anything
         // else is EINVAL.
         if clock_id != LINUX_CLOCK_REALTIME {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
-            };
+            });
         }
-        adjtimex_bootstrap(memory, address)
+        Ok(adjtimex_bootstrap(memory, address))
     }
 
     fn kill(&self, request: SyscallRequest) -> DispatchOutcome {
@@ -4056,27 +4055,27 @@ impl SyscallDispatcher {
         }
     }
 
-    fn wait4(
-        &self,
-        request: SyscallRequest,
-        memory: &mut impl GuestMemory,
-    ) -> DispatchOutcome {
-        let pid = request.arg(0) as i32;
-        let wstatus_addr = request.arg(1);
-        let options = request.arg(2);
+    fn wait4<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let pid = ctx.arg(0) as i32;
+        let wstatus_addr = ctx.arg(1);
+        let options = ctx.arg(2);
+        let memory = &mut *ctx.memory;
         if options & !LINUX_WAIT4_SUPPORTED_FLAGS != 0 {
-            return DispatchOutcome::Errno { errno: LINUX_EINVAL };
+            return Ok(DispatchOutcome::Errno { errno: LINUX_EINVAL });
         }
         // Linux WNOHANG = 1; macOS WNOHANG = 1. Same bit, pass through.
         let mut host_status: i32 = 0;
         let result = unsafe { libc::waitpid(pid, &mut host_status, options as i32) };
         if result < 0 {
             // ECHILD on macOS == ECHILD on Linux (10).
-            return DispatchOutcome::Errno { errno: host_errno() };
+            return Ok(DispatchOutcome::Errno { errno: host_errno() });
         }
         if result == 0 {
             // WNOHANG and no child ready.
-            return DispatchOutcome::Returned { value: 0 };
+            return Ok(DispatchOutcome::Returned { value: 0 });
         }
         // Linux and Darwin agree on the wstatus encoding for exited /
         // signaled children: low 7 bits = signal, bit 7 = core flag,
@@ -4084,10 +4083,10 @@ impl SyscallDispatcher {
         if wstatus_addr != 0 {
             let bytes = host_status.to_ne_bytes();
             if memory.write_bytes(wstatus_addr, &bytes).is_err() {
-                return DispatchOutcome::Errno { errno: LINUX_EFAULT };
+                return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
             }
         }
-        DispatchOutcome::Returned { value: i64::from(result) }
+        Ok(DispatchOutcome::Returned { value: i64::from(result) })
     }
 
     fn openat(
@@ -4105,20 +4104,20 @@ impl SyscallDispatcher {
         )
     }
 
-    fn openat2(
+    fn openat2<M: GuestMemory>(
         &mut self,
-        request: SyscallRequest,
-        memory: &impl GuestMemory,
-        reporter: &mut CompatReporter,
+        ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let how_address = request.arg(2);
-        let size = request.arg(3);
+        let how_address = ctx.arg(2);
+        let size = ctx.arg(3);
+        let arg0 = ctx.arg(0);
+        let arg1 = ctx.arg(1);
         if size != LINUX_OPEN_HOW_SIZE {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
             });
         }
-        let how = match read_open_how(memory, how_address) {
+        let how = match read_open_how(&*ctx.memory, how_address) {
             Ok(how) => how,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
@@ -4130,7 +4129,7 @@ impl SyscallDispatcher {
                 errno: LINUX_EINVAL,
             });
         }
-        self.open_at_path(request.arg(0), request.arg(1), how.flags, memory, reporter)
+        self.open_at_path(arg0, arg1, how.flags, &*ctx.memory, ctx.reporter)
     }
 
     fn open_at_path(
@@ -4368,17 +4367,20 @@ impl SyscallDispatcher {
     /// to drop inherited fds in O(1) syscalls instead of an O(N) fcntl
     /// or close loop. Without this, apt walks fd 3..NR_OPEN issuing a
     /// fcntl per fd and burns 100k+ traps before exec.
-    fn close_range(&mut self, request: SyscallRequest) -> DispatchOutcome {
-        let first = request.arg(0);
-        let last = request.arg(1);
-        let flags = request.arg(2);
+    fn close_range<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let first = ctx.arg(0);
+        let last = ctx.arg(1);
+        let flags = ctx.arg(2);
         // CLOSE_RANGE_UNSHARE=2 is a no-op for us (single fd table);
         // CLOSE_RANGE_CLOEXEC=4 would mark fds CLOEXEC instead of
         // closing — accept the bit and apply CLOEXEC.
         const CLOSE_RANGE_UNSHARE: u64 = 2;
         const CLOSE_RANGE_CLOEXEC: u64 = 4;
         if flags & !(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC) != 0 || first > last {
-            return DispatchOutcome::Errno { errno: LINUX_EINVAL };
+            return Ok(DispatchOutcome::Errno { errno: LINUX_EINVAL });
         }
         let cloexec_only = flags & CLOSE_RANGE_CLOEXEC != 0;
         // Drain matching fds out of the table so we don't iterate a
@@ -4398,7 +4400,7 @@ impl SyscallDispatcher {
                 close_open_file(&open_file);
             }
         }
-        DispatchOutcome::Returned { value: 0 }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
     // ------------------------------------------------------------------
@@ -4602,13 +4604,13 @@ impl SyscallDispatcher {
         self.accept_common(request, memory, 0)
     }
 
-    fn accept4(
+    fn accept4<M: GuestMemory>(
         &mut self,
-        request: SyscallRequest,
-        memory: &mut impl GuestMemory,
-    ) -> DispatchOutcome {
-        let flags = request.arg(3) as i32;
-        self.accept_common(request, memory, flags)
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let flags = ctx.arg(3) as i32;
+        let request = ctx.request;
+        Ok(self.accept_common(request, &mut *ctx.memory, flags))
     }
 
     fn accept_common(
@@ -5589,29 +5591,29 @@ impl SyscallDispatcher {
     /// so the runtime can tear down the guest address space and load
     /// the new image. Returns the usual errno on the failure paths
     /// (EFAULT on bad pointers, ENAMETOOLONG on oversized strings).
-    fn execve(
-        &self,
-        request: SyscallRequest,
-        memory: &impl GuestMemory,
-    ) -> DispatchOutcome {
-        let pathname_addr = request.arg(0);
-        let argv_addr = request.arg(1);
-        let envp_addr = request.arg(2);
+    fn execve<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let pathname_addr = ctx.arg(0);
+        let argv_addr = ctx.arg(1);
+        let envp_addr = ctx.arg(2);
+        let memory = &*ctx.memory;
 
         let path = match read_guest_c_string(memory, pathname_addr) {
             Ok(p) => p,
-            Err(errno) => return DispatchOutcome::Errno { errno },
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
         let argv = match read_guest_string_array(memory, argv_addr) {
             Ok(v) => v,
-            Err(errno) => return DispatchOutcome::Errno { errno },
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
         let env = match read_guest_string_array(memory, envp_addr) {
             Ok(v) => v,
-            Err(errno) => return DispatchOutcome::Errno { errno },
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
 
-        DispatchOutcome::Execve { path, argv, env }
+        Ok(DispatchOutcome::Execve { path, argv, env })
     }
 
     /// Linux `clone(2)` (aarch64 syscall 220). Real fork delegation:
@@ -5623,14 +5625,17 @@ impl SyscallDispatcher {
     /// → `clone(SIGCHLD, 0, ...)`) is wired. Thread-create flags
     /// (CLONE_VM | CLONE_THREAD) and namespace/process-share variants
     /// fall through to ENOSYS until the next iteration.
-    fn clone(&mut self, request: SyscallRequest) -> DispatchOutcome {
+    fn clone<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
         const CLONE_VM: u64 = 0x00000100;
         const CLONE_FS: u64 = 0x00000200;
         const CLONE_FILES: u64 = 0x00000400;
         const CLONE_SIGHAND: u64 = 0x00000800;
         const CLONE_THREAD: u64 = 0x00010000;
 
-        let flags = request.arg(0);
+        let flags = ctx.arg(0);
         // Thread creation needs pthread_create semantics, not fork.
         // Surface as ENOSYS for now so callers see "function not
         // implemented" rather than spuriously cloning the whole address
@@ -5638,13 +5643,13 @@ impl SyscallDispatcher {
         let thread_mask =
             CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
         if (flags & thread_mask) == thread_mask {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_ENOSYS,
-            };
+            });
         }
 
         // Anything else (including the SIGCHLD-only fork case) → real fork.
-        DispatchOutcome::Fork
+        Ok(DispatchOutcome::Fork)
     }
 
     /// clone3(2): like clone, but flags and the rest of the parameters live in
@@ -5699,12 +5704,15 @@ impl SyscallDispatcher {
     /// no readahead model, so honour it as a no-op — but validate the fd so a
     /// genuinely bad descriptor still reports EBADF. dpkg/apt/coreutils call
     /// this routinely; without it the unimplemented-syscall panic killed them.
-    fn fadvise64(&self, request: SyscallRequest) -> DispatchOutcome {
-        let fd = request.arg(0) as i32;
+    fn fadvise64<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let fd = ctx.arg(0) as i32;
         if !self.fd_is_valid(fd) && !is_stdio_fd(fd) {
-            return DispatchOutcome::Errno { errno: LINUX_EBADF };
+            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         }
-        DispatchOutcome::Returned { value: 0 }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
     fn brk(&mut self, request: SyscallRequest) -> DispatchOutcome {
@@ -5723,17 +5731,17 @@ impl SyscallDispatcher {
         }
     }
 
-    fn mmap(
+    fn mmap<M: GuestMemory>(
         &mut self,
-        request: SyscallRequest,
-        memory: &mut impl GuestMemory,
+        ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let requested = request.arg(0);
-        let length = request.arg(1);
-        let prot = request.arg(2);
-        let flags = request.arg(3);
-        let fd = request.arg(4) as i32;
-        let offset = request.arg(5);
+        let requested = ctx.arg(0);
+        let length = ctx.arg(1);
+        let prot = ctx.arg(2);
+        let flags = ctx.arg(3);
+        let fd = ctx.arg(4) as i32;
+        let offset = ctx.arg(5);
+        let memory = &mut *ctx.memory;
 
         if length == 0
             || prot & !(LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC) != 0
@@ -5857,85 +5865,106 @@ impl SyscallDispatcher {
         DispatchOutcome::Returned { value: 0 }
     }
 
-    fn msync(&self, request: SyscallRequest, memory: &impl GuestMemory) -> DispatchOutcome {
-        let address = request.arg(0);
-        let length = request.arg(1);
-        let flags = request.arg(2);
+    fn msync<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let address = ctx.arg(0);
+        let length = ctx.arg(1);
+        let flags = ctx.arg(2);
+        let memory = &*ctx.memory;
         if flags & !(LINUX_MS_ASYNC | LINUX_MS_INVALIDATE | LINUX_MS_SYNC) != 0 {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
-            };
+            });
         }
         if flags & LINUX_MS_ASYNC != 0 && flags & LINUX_MS_SYNC != 0 {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
-            };
+            });
         }
         if length == 0 {
-            return DispatchOutcome::Returned { value: 0 };
+            return Ok(DispatchOutcome::Returned { value: 0 });
         }
         if memory.read_bytes(address, 1).is_err() {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_ENOMEM,
-            };
+            });
         }
-        DispatchOutcome::Returned { value: 0 }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
-    fn mlock(&self, request: SyscallRequest, memory: &impl GuestMemory) -> DispatchOutcome {
-        let address = request.arg(0);
-        let length = request.arg(1);
+    fn mlock<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let address = ctx.arg(0);
+        let length = ctx.arg(1);
+        let memory = &*ctx.memory;
         if length == 0 {
-            return DispatchOutcome::Returned { value: 0 };
+            return Ok(DispatchOutcome::Returned { value: 0 });
         }
         if memory.read_bytes(address, 1).is_err() {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_ENOMEM,
-            };
+            });
         }
-        DispatchOutcome::Returned { value: 0 }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
-    fn munlock(&self, request: SyscallRequest, memory: &impl GuestMemory) -> DispatchOutcome {
-        self.mlock(request, memory)
+    fn munlock<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        self.mlock(ctx)
     }
 
-    fn mlockall(&self, request: SyscallRequest) -> DispatchOutcome {
-        let flags = request.arg(0);
+    fn mlockall<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let flags = ctx.arg(0);
         if flags == 0
             || flags & !(LINUX_MCL_CURRENT | LINUX_MCL_FUTURE | LINUX_MCL_ONFAULT) != 0
         {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
-            };
+            });
         }
-        DispatchOutcome::Returned { value: 0 }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
-    fn munlockall(&self) -> DispatchOutcome {
-        DispatchOutcome::Returned { value: 0 }
+    fn munlockall<M: GuestMemory>(
+        &mut self,
+        _ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
-    fn mincore(&self, request: SyscallRequest, memory: &mut impl GuestMemory) -> DispatchOutcome {
-        let address = request.arg(0);
-        let length = request.arg(1);
-        let vec = request.arg(2);
+    fn mincore<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let address = ctx.arg(0);
+        let length = ctx.arg(1);
+        let vec = ctx.arg(2);
+        let memory = &mut *ctx.memory;
         if length == 0 {
-            return DispatchOutcome::Returned { value: 0 };
+            return Ok(DispatchOutcome::Returned { value: 0 });
         }
         if memory.read_bytes(address, 1).is_err() {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_ENOMEM,
-            };
+            });
         }
         let pages = (length + LINUX_PAGE_SIZE as u64 - 1) / LINUX_PAGE_SIZE as u64;
         let bytes = vec![1u8; pages as usize];
         if memory.write_bytes(vec, &bytes).is_err() {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EFAULT,
-            };
+            });
         }
-        DispatchOutcome::Returned { value: 0 }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
     fn mremap(&mut self, request: SyscallRequest, memory: &mut impl GuestMemory) -> DispatchOutcome {
@@ -6023,17 +6052,20 @@ impl SyscallDispatcher {
         }
     }
 
-    fn mprotect(&self, request: SyscallRequest, _memory: &impl GuestMemory) -> DispatchOutcome {
-        let address = request.arg(0);
-        let length = request.arg(1);
-        let prot = request.arg(2);
+    fn mprotect<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let address = ctx.arg(0);
+        let length = ctx.arg(1);
+        let prot = ctx.arg(2);
         if prot & !(LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC) != 0 {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
-            };
+            });
         }
         if length == 0 {
-            return DispatchOutcome::Returned { value: 0 };
+            return Ok(DispatchOutcome::Returned { value: 0 });
         }
         // Page-alignment check on the address — Linux requires that. Our
         // stage-2 mappings are already r-w-x for the bootstrap, so changing
@@ -6043,53 +6075,61 @@ impl SyscallDispatcher {
         // don't currently model, and gating those calls produces an
         // ENOMEM-retry loop that prevents dynamic startup from finishing.
         if address % LINUX_PAGE_SIZE as u64 != 0 {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
-            };
+            });
         }
-        DispatchOutcome::Returned { value: 0 }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
-    fn madvise(&self, request: SyscallRequest, memory: &impl GuestMemory) -> DispatchOutcome {
-        let address = request.arg(0);
-        let length = request.arg(1);
-        let advice = request.arg(2);
+    fn madvise<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let address = ctx.arg(0);
+        let length = ctx.arg(1);
+        let advice = ctx.arg(2);
+        let memory = &*ctx.memory;
 
         if address % LINUX_PAGE_SIZE != 0 || !linux_madvise_advice_is_supported(advice) {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
-            };
+            });
         }
         if length == 0 {
-            return DispatchOutcome::Returned { value: 0 };
+            return Ok(DispatchOutcome::Returned { value: 0 });
         }
 
         let Ok(length) = usize::try_from(length) else {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_ENOMEM,
-            };
+            });
         };
         let Some(last_address) = address.checked_add(length as u64 - 1) else {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_ENOMEM,
-            };
+            });
         };
         if memory.read_bytes(address, 1).is_err() || memory.read_bytes(last_address, 1).is_err() {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_ENOMEM,
-            };
+            });
         }
-        DispatchOutcome::Returned { value: 0 }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
-    fn prlimit64(&self, request: SyscallRequest, memory: &mut impl GuestMemory) -> DispatchOutcome {
-        let resource = request.arg(1);
-        let new_limit = request.arg(2);
-        let old_limit = request.arg(3);
+    fn prlimit64<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let resource = ctx.arg(1);
+        let new_limit = ctx.arg(2);
+        let old_limit = ctx.arg(3);
+        let memory = &mut *ctx.memory;
         if new_limit != 0 {
-            return DispatchOutcome::Errno {
+            return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
-            };
+            });
         }
         if old_limit != 0 {
             // Per-resource values matched to a sensible Linux default.
@@ -6116,22 +6156,22 @@ impl SyscallDispatcher {
                 _ => LinuxRlimit::new(LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY),
             };
             if write_kernel_struct_raw(memory, old_limit, &limit).is_err() {
-                return DispatchOutcome::Errno {
+                return Ok(DispatchOutcome::Errno {
                     errno: LINUX_EFAULT,
-                };
+                });
             }
         }
-        DispatchOutcome::Returned { value: 0 }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
-    fn getrandom(
-        &self,
-        request: SyscallRequest,
-        memory: &mut impl GuestMemory,
+    fn getrandom<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let address = request.arg(0);
-        let length = usize::try_from(request.arg(1))
-            .map_err(|_| DispatchError::LengthTooLarge(request.arg(1)))?;
+        let address = ctx.arg(0);
+        let length = usize::try_from(ctx.arg(1))
+            .map_err(|_| DispatchError::LengthTooLarge(ctx.arg(1)))?;
+        let memory = &mut *ctx.memory;
         let mut bytes = vec![0; length];
         if getrandom::fill(&mut bytes).is_err() {
             fill_deterministic_bootstrap_random(&mut bytes);
@@ -6663,19 +6703,19 @@ impl SyscallDispatcher {
     /// efficient copies; it was unimplemented and the panic-on-unknown guard
     /// turned that into a hard abort. We read from in_fd at its (pointer or
     /// current) offset and write to out_fd, reusing the sendfile machinery.
-    fn copy_file_range(
+    fn copy_file_range<M: GuestMemory>(
         &mut self,
-        request: SyscallRequest,
-        memory: &mut impl GuestMemory,
+        ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let in_fd = request.arg(0) as i32;
-        let off_in_addr = request.arg(1);
-        let out_fd = request.arg(2) as i32;
-        let off_out_addr = request.arg(3);
+        let in_fd = ctx.arg(0) as i32;
+        let off_in_addr = ctx.arg(1);
+        let out_fd = ctx.arg(2) as i32;
+        let off_out_addr = ctx.arg(3);
         // Callers (coreutils `cat`) pass len = SSIZE_MAX and loop until EOF,
         // so cap each call to a bounded chunk rather than trying to allocate
         // a multi-exabyte buffer. A short return is legal for copy_file_range.
-        let requested = usize::try_from(request.arg(4)).unwrap_or(usize::MAX);
+        let requested = usize::try_from(ctx.arg(4)).unwrap_or(usize::MAX);
+        let memory = &mut *ctx.memory;
         let count = requested.min(8 * 1024 * 1024);
         if count == 0 {
             return Ok(DispatchOutcome::Returned { value: 0 });
@@ -7689,10 +7729,9 @@ impl SyscallDispatcher {
         )
     }
 
-    fn renameat2(
+    fn renameat2<M: GuestMemory>(
         &mut self,
-        request: SyscallRequest,
-        memory: &impl GuestMemory,
+        ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         // RENAME_NOREPLACE=1, RENAME_EXCHANGE=2, RENAME_WHITEOUT=4. We
         // implement the common subset (no flags or NOREPLACE). EXCHANGE
@@ -7700,7 +7739,7 @@ impl SyscallDispatcher {
         // mode either, so reject them.
         const RENAME_NOREPLACE: u64 = 1;
         const RENAME_EXCHANGE: u64 = 2;
-        let flags = request.arg(4);
+        let flags = ctx.arg(4);
         if flags & !RENAME_NOREPLACE != 0 {
             if flags & RENAME_EXCHANGE != 0 {
                 return Ok(DispatchOutcome::Errno {
@@ -7712,12 +7751,12 @@ impl SyscallDispatcher {
             });
         }
         self.do_renameat(
-            request.arg(0),
-            request.arg(1),
-            request.arg(2),
-            request.arg(3),
+            ctx.arg(0),
+            ctx.arg(1),
+            ctx.arg(2),
+            ctx.arg(3),
             flags,
-            memory,
+            &*ctx.memory,
         )
     }
 
@@ -7921,16 +7960,16 @@ impl SyscallDispatcher {
         }
     }
 
-    fn statx(
-        &self,
-        request: SyscallRequest,
-        memory: &mut impl GuestMemory,
+    fn statx<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let dirfd = request.arg(0);
-        let pathname = request.arg(1);
-        let flags = request.arg(2);
-        let mask = request.arg(3);
-        let statxbuf = request.arg(4);
+        let dirfd = ctx.arg(0);
+        let pathname = ctx.arg(1);
+        let flags = ctx.arg(2);
+        let mask = ctx.arg(3);
+        let statxbuf = ctx.arg(4);
+        let memory = &mut *ctx.memory;
 
         if !linux_statx_flags_are_supported(flags) || mask & LINUX_STATX_RESERVED != 0 {
             return Ok(DispatchOutcome::Errno {
