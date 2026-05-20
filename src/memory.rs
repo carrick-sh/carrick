@@ -191,21 +191,23 @@ impl AddressSpace {
     ) -> Result<Self, AddressSpaceError> {
         let file = rootfs.read(path)?;
         let plan = plan_elf_load_bytes(&file)?;
-        Self::load_elf_segments_with_interpreter(&file, plan, rootfs)
+        Self::load_elf_segments_with_interpreter(&file, plan, &|p| rootfs.read(p).ok())
     }
 
-    /// Load a main-binary image from already-read bytes (e.g. fetched
-    /// overlay-first via the dispatcher), resolving its PT_INTERP — if any —
-    /// from the rootfs. This is what lets `execve` run a binary that the
-    /// guest created in the writable overlay (a downloaded/extracted binary,
-    /// `/tmp/p`, a dpkg-unpacked ELF), not just immutable rootfs binaries.
-    /// A static binary (no PT_INTERP) loads directly.
-    pub fn load_elf_bytes_from_rootfs(
+    /// Load a main-binary image from already-read bytes, resolving its
+    /// PT_INTERP — if any — through `read_interp` (the dispatcher's
+    /// overlay-first reader). This lets `execve` run a binary the guest
+    /// created in the writable overlay (a downloaded/extracted binary,
+    /// `/tmp/p`, a dpkg-unpacked ELF) AND load its interpreter from the
+    /// materialised host disk, with no dependence on the in-memory rootfs
+    /// layer (which `--fs host` drops after seeding). A static binary (no
+    /// PT_INTERP) loads directly.
+    pub fn load_elf_bytes_with_reader(
         file: &[u8],
-        rootfs: &RootFs,
+        read_interp: &dyn Fn(&str) -> Option<Vec<u8>>,
     ) -> Result<Self, AddressSpaceError> {
         let plan = plan_elf_load_bytes(file)?;
-        Self::load_elf_segments_with_interpreter(file, plan, rootfs)
+        Self::load_elf_segments_with_interpreter(file, plan, read_interp)
     }
 
     fn load_elf_segments(file: &[u8], plan: LoadPlan) -> Result<Self, AddressSpaceError> {
@@ -221,14 +223,15 @@ impl AddressSpace {
     fn load_elf_segments_with_interpreter(
         file: &[u8],
         plan: LoadPlan,
-        rootfs: &RootFs,
+        read_interp: &dyn Fn(&str) -> Option<Vec<u8>>,
     ) -> Result<Self, AddressSpaceError> {
         let mut regions = regions_from_load_plan(file, &plan)?;
         let mut entry = plan.entry;
         let mut interpreter_base = None;
 
         if let Some(interpreter_path) = plan.interpreter.as_deref() {
-            let interpreter = rootfs.read(interpreter_path)?;
+            let interpreter = read_interp(interpreter_path)
+                .ok_or_else(|| AddressSpaceError::Io(std::io::ErrorKind::NotFound.into()))?;
             let interpreter_plan =
                 plan_elf_load_bytes(&interpreter)?.with_load_bias(LINUX_INTERPRETER_BASE);
             regions.extend(regions_from_load_plan(&interpreter, &interpreter_plan)?);

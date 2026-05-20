@@ -391,6 +391,23 @@ impl Vfs for RootFsVfs {
     /// rootfs for tombstoned paths and overlay-owned entries; if
     /// neither layer has the path, return ENOENT.
     fn lookup(&self, path: &str) -> Result<Metadata, VfsError> {
+        // The filesystem root always exists as a directory. Resolve it
+        // here so root-relative metadata (statfs("/"), open("/"),
+        // mkdir parent checks) works regardless of whether the rootfs
+        // layer is present — under `--fs host` it is dropped after the
+        // disk is seeded, and the host backend deliberately refuses to
+        // treat its sandbox root as a lookupable entry.
+        if path.is_empty() || path == "/" {
+            return Ok(Metadata {
+                kind: EntryKind::Directory,
+                mode: 0o755,
+                size: 0,
+                uid: 0,
+                gid: 0,
+                mtime_secs: 0,
+                mtime_nanos: 0,
+            });
+        }
         if let Some(entry) = self.overlay.lookup(path) {
             // Prefer the backend's own metadata (the host backend
             // reads real on-disk mode bits, so executables keep their
