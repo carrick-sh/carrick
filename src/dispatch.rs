@@ -1245,18 +1245,13 @@ impl SyscallDispatcher {
             Ok(path) => path,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        let Some(rootfs) = &self.rootfs_vfs.rootfs else {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_ENOENT,
-            });
-        };
-        let metadata = match rootfs.metadata(path) {
+        // Use the LAYERED lookup (overlay/host backend first, then rootfs),
+        // not just the immutable rootfs — otherwise a freshly mkdir'd
+        // directory is invisible and chdir into it fails ENOENT (dpkg-deb
+        // mkdir's its extraction dir then chdir's there).
+        let metadata = match self.layered_metadata(&path) {
             Ok(metadata) => metadata,
-            Err(errno) => {
-                return Ok(DispatchOutcome::Errno {
-                    errno: rootfs_errno(errno),
-                });
-            }
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
         if metadata.kind != RootFsEntryKind::Directory {
             return Ok(DispatchOutcome::Errno {
