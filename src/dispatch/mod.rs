@@ -337,10 +337,9 @@ pub struct SyscallDispatcher {
     /// window + live maps, and the captured address-space regions for
     /// `/proc/self/maps`). See [`mem::MemState`].
     mem: mem::MemState,
-    executable_path: String,
-    personality: u64,
-    dumpable: i64,
-    task_name: [u8; LINUX_TASK_COMM_LEN],
+    /// Owned process subsystem state (executable path, personality,
+    /// dumpable flag, task comm name). See [`proc::ProcState`].
+    proc: proc::ProcState,
     /// Owned credentials subsystem state (uids/gids + umask). See
     /// [`creds::CredState`]. Handlers that touch only credential state
     /// borrow `self.creds` narrowly.
@@ -785,10 +784,7 @@ impl SyscallDispatcher {
             next_fd: 3,
             cwd: "/".to_owned(),
             mem: mem::MemState::new(),
-            executable_path: "/proc/self/exe".to_owned(),
-            personality: 0,
-            dumpable: 1,
-            task_name: linux_task_name_from_bytes(b"carrick"),
+            proc: proc::ProcState::new(),
             creds: creds::CredState::new(),
             signal: signal::SignalState::new(),
             vfs_mounts: {
@@ -821,7 +817,7 @@ impl SyscallDispatcher {
     pub fn with_rootfs_and_executable(rootfs: RootFs, executable_path: impl Into<String>) -> Self {
         let mut s = Self::new();
         s.rootfs_vfs.rootfs = Some(rootfs);
-        s.executable_path = executable_path.into();
+        s.proc.executable_path = executable_path.into();
         s
     }
 
@@ -1960,7 +1956,7 @@ pub struct SyntheticProcContext<'a> {
 impl SyscallDispatcher {
     fn synthetic_proc_context(&self) -> SyntheticProcContext<'_> {
         SyntheticProcContext {
-            executable_path: &self.executable_path,
+            executable_path: &self.proc.executable_path,
             address_space_regions: self.mem.address_space_regions.as_deref(),
             brk_current: self.mem.brk_current,
             mmap_next: self.mem.mmap_next,
