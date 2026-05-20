@@ -8,6 +8,7 @@
 //! Deterministic only: no timestamps, pids, addresses, or inode numbers.
 //! Directory listings are sorted and comma-joined so ordering never matters.
 
+use std::ffi::CString;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 
@@ -80,10 +81,32 @@ fn main() {
     fs::remove_file("/tmp/u1").ok();
     println!("unlink_u1 exists={}", fs::metadata("/tmp/u1").is_ok());
 
+    // rmdir on a NON-EMPTY directory → ENOTEMPTY(39); after removing the file
+    // it succeeds (rc 0) and the directory is gone.
+    {
+        fs::create_dir_all("/tmp/ne").ok();
+        fs::write("/tmp/ne/f", b"x").ok();
+        let dir = CString::new("/tmp/ne").unwrap();
+        let r0 = unsafe { libc::rmdir(dir.as_ptr()) };
+        println!(
+            "rmdir_notempty_errno={}",
+            if r0 == 0 { 0 } else { errno() }
+        );
+        fs::remove_file("/tmp/ne/f").ok();
+        let r1 = unsafe { libc::rmdir(dir.as_ptr()) };
+        println!("rmdir_emptied_rc={}", r1);
+        println!("rmdir_emptied_gone={}", fs::metadata("/tmp/ne").is_err());
+    }
+
     // getdents on "." after chdir into /tmp/dd.
     std::env::set_current_dir("/tmp/dd").ok();
     let dot = sorted_names(".");
     println!("getdents_dot count={}", dot.len());
+}
+
+/// Current errno value.
+fn errno() -> i32 {
+    std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
 }
 
 fn is_dir(path: &str) -> bool {
