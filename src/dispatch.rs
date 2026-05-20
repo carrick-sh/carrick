@@ -2773,15 +2773,11 @@ impl SyscallDispatcher {
             Ok(path) => path,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        let Some(rootfs) = &self.rootfs_vfs.rootfs else {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_ENOENT,
-            });
-        };
-        if let Err(errno) = rootfs.metadata(path) {
-            return Ok(DispatchOutcome::Errno {
-                errno: rootfs_errno(errno),
-            });
+        // Consult the layered view (overlay/disk first, then rootfs) so
+        // that files the guest created in the overlay are visible here
+        // too — a rootfs-direct lookup would miss them.
+        if let Err(errno) = self.layered_metadata(&path) {
+            return Ok(DispatchOutcome::Errno { errno });
         }
         Ok(write_statfs(memory, buffer))
     }
@@ -7370,20 +7366,14 @@ impl SyscallDispatcher {
                 errno: LINUX_EEXIST,
             });
         }
-        if let Some(rootfs) = &self.rootfs_vfs.rootfs {
-            match rootfs.symlink_metadata(&resolved) {
-                Ok(_) => {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: LINUX_EEXIST,
-                    });
-                }
-                Err(RootFsError::NotFound(_)) => {}
-                Err(other) => {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: rootfs_errno(other),
-                    });
-                }
-            }
+        // Existence check must consult the layered view (overlay/disk
+        // first, then rootfs) — a rootfs-direct lookup would miss a file
+        // the guest already created in the overlay and wrongly report
+        // EROFS instead of EEXIST. Mirrors the linkat EEXIST check.
+        if self.layered_metadata(&resolved).is_ok() {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EEXIST,
+            });
         }
         Ok(DispatchOutcome::Errno { errno: LINUX_EROFS })
     }
