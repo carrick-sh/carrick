@@ -78,8 +78,19 @@ fn normalize(s: &str) -> String {
         .to_string()
 }
 
+/// Sweep leftover wedged `carrick:` guest procs (an HVF vCPU can wedge a
+/// forked child past its parent's exit). Done before each case so one
+/// case's leak can't make the next flaky. Best-effort (needs the project's
+/// NOPASSWD sudo path); ignored if unavailable.
+fn sweep_wedged_guests() {
+    let _ = Command::new("sudo")
+        .args(["-n", concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/sudo/kill.sh")])
+        .output();
+}
+
 fn run_carrick(bin: &PathBuf, snippet: &str) -> String {
     use std::os::unix::process::CommandExt;
+    sweep_wedged_guests();
     let mut child = Command::new(bin)
         .args(["run", IMAGE, "--raw", "--fs", "host", "/bin/sh", "-c", snippet])
         .stdout(std::process::Stdio::piped())
