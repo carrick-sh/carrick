@@ -967,6 +967,32 @@ impl SyscallDispatcher {
         436 => close_range,
         437 => openat2,
         439 => faccessat2,
+        5 | 6 => sys_setxattr_path,
+        7 => sys_setxattr_fd,
+        8 | 9 => sys_getxattr_path,
+        10 => sys_getxattr_fd,
+        11 | 12 => sys_listxattr_path,
+        13 => sys_listxattr_fd,
+        14..=16 => sys_xattr_unsupported,
+        43 => sys_statfs,
+        44 => sys_fstatfs,
+        45 => sys_truncate,
+        74 | 75 | 77 => sys_bootstrap_enosys,
+        93 | 94 => sys_exit,
+        151 => sys_setfsuid,
+        152 => sys_setfsgid,
+        159 => sys_setgroups,
+        172 | 178 => sys_getpid,
+        173 => sys_getppid,
+        174 => sys_getuid,
+        175 => sys_geteuid,
+        176 => sys_getgid,
+        177 => sys_getegid,
+        243 => sys_recvmmsg,
+        269 => sys_sendmmsg,
+        435 => sys_clone3,
+        283 => sys_membarrier,
+        293 => sys_rseq,
     }
 
     pub fn new() -> Self {
@@ -1264,70 +1290,18 @@ impl SyscallDispatcher {
             return Ok(outcome);
         }
 
-        let outcome = match request.number {
-            // xattr family. set/get/list have path, lpath, and fd variants.
-            // The l-variants differ only in symlink semantics, which the
-            // host backend collapses (cap-std resolves the materialised
-            // file); for the conformance namespace (`user.*` on a regular
-            // file) the behaviour is identical.
-            5 | 6 => self.setxattr(request, memory, XattrTarget::Path)?,
-            7 => self.setxattr(request, memory, XattrTarget::Fd)?,
-            8 | 9 => self.getxattr(request, memory, XattrTarget::Path)?,
-            10 => self.getxattr(request, memory, XattrTarget::Fd)?,
-            11 | 12 => self.listxattr(request, memory, XattrTarget::Path)?,
-            13 => self.listxattr(request, memory, XattrTarget::Fd)?,
-            14..=16 => self.xattr_unsupported(),
-            43 => self.statfs(request, memory)?,
-            44 => self.fstatfs(request, memory),
-            45 => self.truncate(request, memory)?,
-            74 => self.bootstrap_enosys(),
-            75 => self.bootstrap_enosys(),
-            77 => self.bootstrap_enosys(),
-            93 => self.exit(request),
-            94 => self.exit(request),
-            // setfsuid / setfsgid: Linux convention is to return the
-            // PREVIOUS fsuid/fsgid (not 0/error). We treat fsuid as the
-            // effective uid for tracking purposes.
-            151 => DispatchOutcome::Returned {
-                value: i64::from(self.cred_euid),
-            },
-            152 => DispatchOutcome::Returned {
-                value: i64::from(self.cred_egid),
-            },
-            // getgroups(size, list): we belong to no supplementary groups.
-            // size=0 means "tell me how many" — return 0. Otherwise write
-            // nothing and return 0. setgroups: accept and ignore.
-            159 => DispatchOutcome::Returned { value: 0 },
-            172 => self.getpid(),
-            173 => DispatchOutcome::Returned { value: 1 },
-            174 => DispatchOutcome::Returned { value: i64::from(self.cred_ruid) },
-            175 => DispatchOutcome::Returned { value: i64::from(self.cred_euid) },
-            176 => DispatchOutcome::Returned { value: i64::from(self.cred_rgid) },
-            177 => DispatchOutcome::Returned { value: i64::from(self.cred_egid) },
-            178 => self.getpid(),
-            243 => self.recvmmsg(request, memory),
-            269 => self.sendmmsg(request, memory),
-            435 => self.clone3(request, memory),
-            283 => self.membarrier(request),
-            293 => self.rseq(),
-            _ => {
-                reporter.record(CompatEvent::unhandled_syscall(
-                    request.number,
-                    name,
-                    request.args,
-                ));
-                panic!(
-                    "unimplemented syscall {} ({}) args=[{:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}]",
-                    request.number,
-                    name,
-                    request.arg(0),
-                    request.arg(1),
-                    request.arg(2),
-                    request.arg(3),
-                    request.arg(4),
-                    request.arg(5),
-                );
-            }
+        // The normalized macro table is the single authoritative syscall
+        // registry. Any number it does not claim is genuinely unimplemented:
+        // record a structured compat event and return ENOSYS. The supervisor
+        // must never panic on guest input — an unknown syscall is the guest's
+        // problem to handle (it gets -ENOSYS), not ours to crash on.
+        reporter.record(CompatEvent::unhandled_syscall(
+            request.number,
+            name,
+            request.args,
+        ));
+        let outcome = DispatchOutcome::Errno {
+            errno: LINUX_ENOSYS,
         };
 
         let (retval, errno) = outcome.retval_errno();
@@ -8174,6 +8148,92 @@ impl SyscallDispatcher {
         }
     }
 
+    // === Normalized shim-wrappers ===
+    // Thin adapters giving each remaining legacy handler the uniform
+    // SyscallCtx<M> contract so it can live in the `normalized_dispatch!`
+    // table. The inner fns are unchanged (already tested); these forward
+    // `ctx.request` (Copy) and `ctx.memory`. Once every syscall has a
+    // wrapper the legacy match in `dispatch()` is deleted and the macro
+    // table becomes the single authoritative syscall registry.
+    fn sys_setxattr_path<M: GuestMemory>(&mut self, ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        self.setxattr(ctx.request, ctx.memory, XattrTarget::Path)
+    }
+    fn sys_setxattr_fd<M: GuestMemory>(&mut self, ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        self.setxattr(ctx.request, ctx.memory, XattrTarget::Fd)
+    }
+    fn sys_getxattr_path<M: GuestMemory>(&mut self, ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        self.getxattr(ctx.request, ctx.memory, XattrTarget::Path)
+    }
+    fn sys_getxattr_fd<M: GuestMemory>(&mut self, ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        self.getxattr(ctx.request, ctx.memory, XattrTarget::Fd)
+    }
+    fn sys_listxattr_path<M: GuestMemory>(&mut self, ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        self.listxattr(ctx.request, ctx.memory, XattrTarget::Path)
+    }
+    fn sys_listxattr_fd<M: GuestMemory>(&mut self, ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        self.listxattr(ctx.request, ctx.memory, XattrTarget::Fd)
+    }
+    fn sys_xattr_unsupported<M: GuestMemory>(&mut self, _ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        Ok(self.xattr_unsupported())
+    }
+    fn sys_statfs<M: GuestMemory>(&mut self, ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        self.statfs(ctx.request, ctx.memory)
+    }
+    fn sys_fstatfs<M: GuestMemory>(&mut self, ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        Ok(self.fstatfs(ctx.request, ctx.memory))
+    }
+    fn sys_truncate<M: GuestMemory>(&mut self, ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        self.truncate(ctx.request, &*ctx.memory)
+    }
+    fn sys_bootstrap_enosys<M: GuestMemory>(&mut self, _ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        Ok(self.bootstrap_enosys())
+    }
+    fn sys_exit<M: GuestMemory>(&mut self, ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        Ok(self.exit(ctx.request))
+    }
+    fn sys_setfsuid<M: GuestMemory>(&mut self, _ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        Ok(DispatchOutcome::Returned { value: i64::from(self.cred_euid) })
+    }
+    fn sys_setfsgid<M: GuestMemory>(&mut self, _ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        Ok(DispatchOutcome::Returned { value: i64::from(self.cred_egid) })
+    }
+    fn sys_setgroups<M: GuestMemory>(&mut self, _ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        Ok(DispatchOutcome::Returned { value: 0 })
+    }
+    fn sys_getpid<M: GuestMemory>(&mut self, _ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        Ok(self.getpid())
+    }
+    fn sys_getppid<M: GuestMemory>(&mut self, _ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        Ok(DispatchOutcome::Returned { value: 1 })
+    }
+    fn sys_getuid<M: GuestMemory>(&mut self, _ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        Ok(DispatchOutcome::Returned { value: i64::from(self.cred_ruid) })
+    }
+    fn sys_geteuid<M: GuestMemory>(&mut self, _ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        Ok(DispatchOutcome::Returned { value: i64::from(self.cred_euid) })
+    }
+    fn sys_getgid<M: GuestMemory>(&mut self, _ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        Ok(DispatchOutcome::Returned { value: i64::from(self.cred_rgid) })
+    }
+    fn sys_getegid<M: GuestMemory>(&mut self, _ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        Ok(DispatchOutcome::Returned { value: i64::from(self.cred_egid) })
+    }
+    fn sys_recvmmsg<M: GuestMemory>(&mut self, ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        Ok(self.recvmmsg(ctx.request, ctx.memory))
+    }
+    fn sys_sendmmsg<M: GuestMemory>(&mut self, ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        Ok(self.sendmmsg(ctx.request, ctx.memory))
+    }
+    fn sys_clone3<M: GuestMemory>(&mut self, ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        Ok(self.clone3(ctx.request, &*ctx.memory))
+    }
+    fn sys_membarrier<M: GuestMemory>(&mut self, ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        Ok(self.membarrier(ctx.request))
+    }
+    fn sys_rseq<M: GuestMemory>(&mut self, _ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        Ok(self.rseq())
+    }
+
     fn fsync<M: GuestMemory>(
         &mut self,
         ctx: &mut SyscallCtx<M>,
@@ -12496,6 +12556,34 @@ mod overlay_dispatch_tests {
         assert_eq!(macos_to_linux_errno(libc::EIDRM), linux_errno::EIDRM);
         assert_eq!(macos_to_linux_errno(libc::EILSEQ), linux_errno::EILSEQ);
         assert_eq!(macos_to_linux_errno(libc::ECANCELED), linux_errno::ECANCELED);
+    }
+
+    #[test]
+    fn every_migrated_syscall_is_claimed_by_the_normalized_table() {
+        let mut d = SyscallDispatcher::new();
+        let mut mem = LinearMemory::new(0, vec![0u8; 4096]);
+        let mut reporter = CompatReporter::default();
+        // Numbers that used to live in the deleted legacy match. Each must now
+        // be claimed by the normalized table (Some), never None.
+        for nr in [5u64, 7, 8, 10, 11, 13, 14, 43, 44, 45, 74, 93, 151, 152,
+                   159, 172, 173, 174, 175, 176, 177, 178, 243, 269, 283, 293, 435] {
+            let req = SyscallRequest::new(nr, SyscallArgs::from([0, 0, 0, 0, 0, 0]));
+            assert!(
+                d.dispatch_normalized(req, &mut mem, &mut reporter).is_some(),
+                "syscall {nr} fell through the normalized table",
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_syscall_returns_enosys_without_panicking() {
+        let mut d = SyscallDispatcher::new();
+        let mut mem = LinearMemory::new(0, vec![0u8; 4096]);
+        let mut reporter = CompatReporter::default();
+        // 999 is not a real aarch64 syscall and is not in the table.
+        let req = SyscallRequest::new(999, SyscallArgs::from([0, 0, 0, 0, 0, 0]));
+        let outcome = d.dispatch(req, &mut mem, &mut reporter).expect("must not error");
+        assert_eq!(outcome, DispatchOutcome::Errno { errno: LINUX_ENOSYS });
     }
 
     /// The Linux errno constants we publish must match the
