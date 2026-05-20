@@ -29,14 +29,10 @@ static CONFORMANCE_LOCK: Mutex<()> = Mutex::new(());
 /// A divergence in one of these is treated as an expected-fail (the suite
 /// stays green), but if a known-gap probe unexpectedly PASSES, the test
 /// FAILS so we remove it from this list — that's the signal the gap was
-/// fixed. Each entry must cite the gap.
-///
-/// - "memmap": carrick models MAP_SHARED file mappings as private snapshots
-///   (no live writeback / cross-mapping coherence). This is the root cause
-///   of apt's "Cache is out of sync, can't x-ref a package file" — apt's
-///   DynamicMMap-backed cache needs real shared mappings. Fixing it needs
-///   stage-2 mapping of the host file's mmap into the guest IPA.
-const KNOWN_PROBE_GAPS: &[&str] = &["memmap"];
+/// fixed. Each entry must cite the gap. (Empty: the former "memmap" gap —
+/// MAP_SHARED file coherence — is now fixed via real host-file-backed
+/// stage-2 mappings.)
+const KNOWN_PROBE_GAPS: &[&str] = &[];
 use std::time::{Duration, Instant};
 
 /// Per-case wall-clock deadline. A single wedged guest process (e.g. a

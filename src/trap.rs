@@ -798,6 +798,96 @@ impl HvfInner {
         Ok(())
     }
 
+    /// Back `[guest_addr, guest_addr+len)` with a real `MAP_SHARED` mmap of
+    /// the host file `host_fd`, mapped into the guest IPA via `hv_vm_map`.
+    /// Both the guest CPU (stage-2) and the dispatcher accessor
+    /// (`read_guest_bytes`, via `host_addr`) then share the file's page
+    /// cache → full MAP_SHARED coherence + persistence. Takes ownership of
+    /// `host_fd` (closes it once mapped — the mapping outlives the fd).
+    fn map_shared_file(
+        &mut self,
+        guest_addr: u64,
+        len: usize,
+        host_fd: i32,
+        offset: u64,
+    ) -> Result<(), MemoryError> {
+        let host = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                host_fd,
+                offset as libc::off_t,
+            )
+        };
+        // The mmap holds its own reference to the file; the fd is ours to close.
+        unsafe { libc::close(host_fd) };
+        if host == libc::MAP_FAILED {
+            return Err(MemoryError::HostMap(format!(
+                "mmap(MAP_SHARED) failed: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        let perms = hvf_perms(SegmentPerms {
+            read: true,
+            write: true,
+            execute: false,
+        });
+        let perms_raw: u64 = u64::from(perms);
+        let r = unsafe {
+            applevisor_sys::hv_vm_map(host as *mut std::ffi::c_void, guest_addr, len, perms_raw)
+        };
+        if r != 0 {
+            unsafe { libc::munmap(host, len) };
+            return Err(MemoryError::HostMap(format!("hv_vm_map failed: 0x{r:x}")));
+        }
+        self.mappings.push(HvfMappedRegion {
+            start: guest_addr,
+            end: guest_addr + len as u64,
+            host_addr: host as *mut u8,
+            size: len,
+            perms,
+            // We own the libc mmap (not an applevisor Memory). Torn down by
+            // `unmap_shared_file`; on engine drop the VM tear-down releases
+            // the stage-2 entries and the host pages leak only at exit.
+            memory: None,
+        });
+        Ok(())
+    }
+
+    fn unmap_shared_file(&mut self, guest_addr: u64, len: usize) -> Result<(), MemoryError> {
+        if let Some(pos) = self
+            .mappings
+            .iter()
+            .position(|m| m.start == guest_addr && m.memory.is_none() && m.size == len)
+        {
+            let m = self.mappings.remove(pos);
+            unsafe {
+                applevisor_sys::hv_vm_unmap(guest_addr, len);
+                libc::munmap(m.host_addr as *mut std::ffi::c_void, len);
+            }
+        }
+        Ok(())
+    }
+
+    fn msync_shared_file(&mut self, guest_addr: u64, len: usize) -> Result<(), MemoryError> {
+        if let Some(m) = self
+            .mappings
+            .iter()
+            .find(|m| m.start == guest_addr && m.memory.is_none())
+        {
+            unsafe {
+                libc::msync(
+                    m.host_addr as *mut std::ffi::c_void,
+                    len.min(m.size),
+                    libc::MS_SYNC,
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn mapping_for_range(&self, address: u64, length: usize) -> Option<&HvfMappedRegion> {
         self.mappings
             .iter()
@@ -1430,6 +1520,24 @@ impl GuestMemory for HvfTrapEngine {
 
     fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
         self.inner.write_guest_bytes(address, bytes)
+    }
+
+    fn map_shared_file(
+        &mut self,
+        guest_addr: u64,
+        len: usize,
+        host_fd: i32,
+        offset: u64,
+    ) -> Result<(), MemoryError> {
+        self.inner.map_shared_file(guest_addr, len, host_fd, offset)
+    }
+
+    fn unmap_shared_file(&mut self, guest_addr: u64, len: usize) -> Result<(), MemoryError> {
+        self.inner.unmap_shared_file(guest_addr, len)
+    }
+
+    fn msync_shared_file(&mut self, guest_addr: u64, len: usize) -> Result<(), MemoryError> {
+        self.inner.msync_shared_file(guest_addr, len)
     }
 }
 
