@@ -111,10 +111,11 @@ impl RootFsVfs {
                         .set_file_contents(path, contents.clone())
                         .map_err(|_| LINUX_EINVAL)?;
                 }
+                let mode = self.overlay.metadata(path).map(|m| m.mode).unwrap_or(0o644);
                 let metadata = RootFsMetadata {
                     path: std::path::Path::new(path).to_path_buf(),
                     kind: RootFsEntryKind::File,
-                    mode: 0o644,
+                    mode,
                     size: contents.len(),
                 };
                 return Ok(OpenDispatchResult::File {
@@ -307,12 +308,17 @@ impl Vfs for RootFsVfs {
     /// neither layer has the path, return ENOENT.
     fn lookup(&self, path: &str) -> Result<Metadata, VfsError> {
         if let Some(entry) = self.overlay.lookup(path) {
+            // Prefer the backend's own metadata (the host backend
+            // reads real on-disk mode bits, so executables keep their
+            // 0o111). Fall back to defaults only if the backend can't
+            // produce metadata for an entry it just reported.
+            let backend_md = self.overlay.metadata(path);
             match entry {
                 OverlayEntry::Deleted => return Err(LINUX_ENOENT),
                 OverlayEntry::Dir => {
                     return Ok(Metadata {
                         kind: EntryKind::Directory,
-                        mode: 0o755,
+                        mode: backend_md.map(|m| m.mode).unwrap_or(0o755),
                         size: 0,
                         uid: 0,
                         gid: 0,
@@ -323,7 +329,7 @@ impl Vfs for RootFsVfs {
                 OverlayEntry::File(bytes) => {
                     return Ok(Metadata {
                         kind: EntryKind::File,
-                        mode: 0o644,
+                        mode: backend_md.map(|m| m.mode).unwrap_or(0o644),
                         size: bytes.len() as u64,
                         uid: 0,
                         gid: 0,
