@@ -1103,6 +1103,15 @@ impl HvfInner {
                 std::io::Error::last_os_error().to_string(),
             ));
         }
+        if pid == 0 {
+            // The child has a new pid, but its inherited USDT DOF is
+            // registered with the kernel under the PARENT's pid. Re-register
+            // so DTrace's `carrick*` provider matches this child too —
+            // otherwise forked guest processes (apt's http method, dpkg-deb's
+            // tar subprocess) are invisible to `carrick trace`, which made
+            // tracing forked failures unreliable.
+            let _ = crate::probes::register_dtrace_probes();
+        }
         // Both parent and child fall through to the rebuild path below.
         // The discriminator at the end of the function returns the
         // appropriate `ForkOutcome` based on `pid`.
