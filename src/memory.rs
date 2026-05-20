@@ -716,12 +716,16 @@ fn regions_from_load_plan(
         return Ok(Vec::new());
     }
 
+    // INVARIANT: the `is_empty` early-return above guarantees segments is
+    // non-empty here, so min()/max() over the iterator always yield Some.
+    #[allow(clippy::expect_used)]
     let min_start = plan
         .segments
         .iter()
         .map(|seg| seg.virtual_address)
         .min()
         .expect("non-empty segments");
+    #[allow(clippy::expect_used)]
     let max_end = plan
         .segments
         .iter()
@@ -937,6 +941,10 @@ pub fn stage1_identity_page_tables() -> Vec<u8> {
 
     // ----- L2_A: covers the first 1 GiB in 2 MiB blocks -----
     // L2[0] covers VA 0..2 MiB — kernel-only.
+    // INVARIANT: this entry maps physical address 0; the `0u64 & PA_MASK_2MIB`
+    // is written out (rather than just KERNEL_BLOCK_FLAGS) to keep the parallel
+    // `pa & PA_MASK_2MIB` structure of the surrounding L2 entries explicit.
+    #[allow(clippy::erasing_op)]
     let l2_0 = (0u64 & PA_MASK_2MIB) | KERNEL_BLOCK_FLAGS;
     bytes[0x3000..0x3008].copy_from_slice(&l2_0.to_le_bytes());
     // L2[1..511] are 2 MiB user blocks.

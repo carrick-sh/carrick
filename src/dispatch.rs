@@ -3785,7 +3785,10 @@ impl SyscallDispatcher {
                 }
             };
             // SIGKILL and SIGSTOP can never be masked.
-            mask &= !(sigmask_bit(LINUX_SIGKILL).unwrap() | sigmask_bit(LINUX_SIGSTOP).unwrap());
+            // INVARIANT: SIGKILL/SIGSTOP are valid signal numbers (< 64), so sigmask_bit is Some.
+            #[allow(clippy::unwrap_used)]
+            let unmaskable = sigmask_bit(LINUX_SIGKILL).unwrap() | sigmask_bit(LINUX_SIGSTOP).unwrap();
+            mask &= !unmaskable;
             self.signal_mask = mask;
             // Any pending signal that just became unblocked is eligible for
             // delivery now. Hand one to the runtime's pending slot.
@@ -6316,6 +6319,9 @@ impl SyscallDispatcher {
             };
         }
         let flags = match memory.read_bytes(args_ptr, 8) {
+            // INVARIANT: read_bytes(_, 8) returns exactly 8 bytes on Ok, so the
+            // 8-byte slice always converts into [u8; 8].
+            #[allow(clippy::unwrap_used)]
             Ok(bytes) => u64::from_le_bytes(bytes[..8].try_into().unwrap()),
             Err(_) => {
                 return DispatchOutcome::Errno {
@@ -11935,9 +11941,15 @@ fn read_linux_msghdr(memory: &impl GuestMemory, addr: u64) -> Result<LinuxMsghdr
     // Linux msghdr (LP64): name(8) namelen(4) pad(4) iov(8) iovlen(8)
     //                      control(8) controllen(8) flags(4)
     let bytes = memory.read_bytes(addr, 56).map_err(|_| LINUX_EFAULT)?;
+    // INVARIANT: read_bytes(_, 56) returns exactly 56 bytes on Ok, so every
+    // fixed-offset sub-slice below (max end 32) always converts into its array.
+    #[allow(clippy::unwrap_used)]
     let name = u64::from_ne_bytes(bytes[0..8].try_into().unwrap());
+    #[allow(clippy::unwrap_used)]
     let namelen = u32::from_ne_bytes(bytes[8..12].try_into().unwrap());
+    #[allow(clippy::unwrap_used)]
     let iov = u64::from_ne_bytes(bytes[16..24].try_into().unwrap());
+    #[allow(clippy::unwrap_used)]
     let iovlen = u64::from_ne_bytes(bytes[24..32].try_into().unwrap());
     Ok(LinuxMsghdr { name, namelen, iov, iovlen })
 }

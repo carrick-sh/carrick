@@ -29,6 +29,13 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt"] }
 usdt = "0.6.0"
 zerocopy = { version = "0.8.48", features = ["derive"] }
 
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 applevisor = { version = "1.0.0", default-features = false, features = ["macos-13-0"] }
 applevisor-sys = { version = "1.0.0", default-features = false, features = ["macos-13-0"] }

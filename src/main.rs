@@ -247,6 +247,9 @@ fn main() -> anyhow::Result<()> {
     // DiagnosticReports). Setting OS_ACTIVITY_MODE=disable before any
     // HVF call drops os_log out of the path entirely and makes
     // repeated fork() + hv_vcpu_create cycles deterministic.
+    // INVARIANT: both are static string literals with no interior NUL byte, so
+    // CString::new cannot fail.
+    #[allow(clippy::unwrap_used)]
     unsafe {
         let key = std::ffi::CString::new("OS_ACTIVITY_MODE").unwrap();
         let val = std::ffi::CString::new("disable").unwrap();
@@ -904,6 +907,10 @@ fn emit_raw(result: &carrick::runtime::RunResult) {
 /// guest issues `clone(2)` and we fork the host process there is no
 /// async runtime alive in the parent to corrupt the child.
 fn block_on_oci<F: std::future::Future>(fut: F) -> F::Output {
+    // INVARIANT: fatal at startup — if the host cannot even build a
+    // current-thread tokio runtime there is nothing to recover to; aborting
+    // here (before any guest forks) is the correct, safe failure mode.
+    #[allow(clippy::expect_used)]
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

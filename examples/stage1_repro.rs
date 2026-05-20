@@ -9,6 +9,12 @@
 //!     hv_vcpu_get_sys_reg.
 //!
 //! No logging by design: state inspection is the debugger's job.
+//!
+//! This is a developer-only lldb repro harness, not supervisor code that hosts a
+//! guest, so the no-panic gate does not apply: unwrap/expect on missing knobs is
+//! the intended fail-fast, and the explicit `0u64 & MASK` documents a PA-0 mapping
+//! in parallel with the surrounding page-table entries.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::erasing_op)]
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
