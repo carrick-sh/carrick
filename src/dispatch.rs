@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::compat::{CompatEvent, CompatReporter, SyscallArgs};
 use crate::linux_abi::{
     KernelAbi, LINUX_DIRENT64_HEADER_SIZE, LINUX_DT_DIR, LINUX_DT_LNK, LINUX_DT_REG, LINUX_PAGE_SIZE,
-    LINUX_S_IFDIR, LINUX_S_IFLNK, LINUX_S_IFREG, LINUX_TERMIOS_KERNEL_SIZE, LinuxCapabilityData, LinuxCapabilityHeader,
+    LINUX_S_IFDIR, LINUX_S_IFLNK, LINUX_S_IFMT, LINUX_S_IFREG, LINUX_TERMIOS_KERNEL_SIZE, LinuxCapabilityData, LinuxCapabilityHeader,
     LinuxDirent64Header, LinuxEpollEvent, LinuxEventfdValue, LinuxFdPair, LinuxIfAddrMsg,
     LinuxIfInfoMsg, LinuxIovec, LinuxNlMsgHdr, LinuxRtAttr,
     LINUX_ARPHRD_LOOPBACK, LINUX_IFA_ADDRESS, LINUX_IFA_LABEL, LINUX_IFA_LOCAL, LINUX_IFF_LOOPBACK,
@@ -76,7 +76,12 @@ pub const LINUX_ENOTTY: i32 = 25;
 pub const LINUX_ERANGE: i32 = 34;
 pub const LINUX_ENAMETOOLONG: i32 = 36;
 pub const LINUX_ENOSYS: i32 = 38;
+pub const LINUX_ENODATA: i32 = 61;
 pub const LINUX_E2BIG: i32 = 7;
+// Linux setxattr(2) flags. Same semantics as the macOS XATTR_CREATE/
+// XATTR_REPLACE options (which carry different numeric values).
+pub const LINUX_XATTR_CREATE: i32 = 0x1;
+pub const LINUX_XATTR_REPLACE: i32 = 0x2;
 pub const LINUX_ETIMEDOUT: i32 = 110;
 pub const LINUX_AT_FDCWD: u64 = (-100_i64) as u64;
 pub const LINUX_AT_SYMLINK_NOFOLLOW: u64 = 0x100;
@@ -672,6 +677,14 @@ enum TtyFdKind {
     Other,
 }
 
+/// Which form of an xattr syscall is being dispatched: the path/lpath
+/// variants name a file by path; the f-variant names it by open fd.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum XattrTarget {
+    Path,
+    Fd,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PollInterest {
     Read,
@@ -1196,7 +1209,18 @@ impl SyscallDispatcher {
         }
 
         let outcome = match request.number {
-            5..=16 => self.xattr_unsupported(),
+            // xattr family. set/get/list have path, lpath, and fd variants.
+            // The l-variants differ only in symlink semantics, which the
+            // host backend collapses (cap-std resolves the materialised
+            // file); for the conformance namespace (`user.*` on a regular
+            // file) the behaviour is identical.
+            5 | 6 => self.setxattr(request, memory, XattrTarget::Path)?,
+            7 => self.setxattr(request, memory, XattrTarget::Fd)?,
+            8 | 9 => self.getxattr(request, memory, XattrTarget::Path)?,
+            10 => self.getxattr(request, memory, XattrTarget::Fd)?,
+            11 | 12 => self.listxattr(request, memory, XattrTarget::Path)?,
+            13 => self.listxattr(request, memory, XattrTarget::Fd)?,
+            14..=16 => self.xattr_unsupported(),
             43 => self.statfs(request, memory)?,
             44 => self.fstatfs(request, memory),
             45 => self.truncate(request, memory)?,
@@ -3051,25 +3075,69 @@ impl SyscallDispatcher {
                 errno: LINUX_ESPIPE,
             });
         }
-        let Some(open_file) = self.open_files.get(&fd) else {
+        let Some(open_file) = self.open_files.get(&fd).cloned() else {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         };
-        let open = open_file.description.borrow();
-        let errno = match &*open {
-            OpenDescription::File { .. }
-            | OpenDescription::HostFile { .. }
-            | OpenDescription::SyntheticFile { .. } => LINUX_EROFS,
-            OpenDescription::Directory { .. } => LINUX_EISDIR,
-            OpenDescription::PipeReader { .. }
-            | OpenDescription::PipeWriter { .. }
-            | OpenDescription::EventFd { .. }
-            | OpenDescription::TimerFd { .. }
-            | OpenDescription::HostPipe { .. }
-            | OpenDescription::HostSocket { .. }
-            | OpenDescription::Netlink { .. }
-            | OpenDescription::Epoll { .. } => LINUX_ESPIPE,
-        };
-        Ok(DispatchOutcome::Errno { errno })
+        // Only mode-0 (default allocation) is implemented as a real grow;
+        // FALLOC_FL_KEEP_SIZE preallocates without changing the apparent
+        // size, which on a tmpfs/host-backed file is a no-op success.
+        let grow = mode & LINUX_FALLOC_FL_KEEP_SIZE == 0;
+        let new_size = (offset as u64).saturating_add(length as u64);
+        // Snapshot the writeback path/contents in a scope so the borrow
+        // drops before we touch self.rootfs_vfs.overlay (mirrors ftruncate).
+        let writeback: Option<(String, Vec<u8>)>;
+        let outcome: DispatchOutcome;
+        {
+            let mut open = open_file.description.borrow_mut();
+            match &mut *open {
+                OpenDescription::File {
+                    contents, metadata, ..
+                } if grow => {
+                    // In-memory model (--fs memory): grow the cached bytes.
+                    if new_size as usize > contents.len() {
+                        contents.resize(new_size as usize, 0);
+                        metadata.size = contents.len();
+                    }
+                    writeback = None;
+                    outcome = DispatchOutcome::Returned { value: 0 };
+                }
+                OpenDescription::File { .. } => {
+                    // KEEP_SIZE: don't change apparent size.
+                    writeback = None;
+                    outcome = DispatchOutcome::Returned { value: 0 };
+                }
+                OpenDescription::HostFile { host_fd, .. } => {
+                    // Real fd into the cap-std scratch: grow with ftruncate
+                    // (the change is visible across fork). KEEP_SIZE → no-op.
+                    if grow {
+                        let mut st: libc::stat = unsafe { core::mem::zeroed() };
+                        if unsafe { libc::fstat(*host_fd, &mut st) } < 0 {
+                            return Ok(DispatchOutcome::Errno { errno: host_errno() });
+                        }
+                        if new_size > st.st_size as u64 {
+                            let r =
+                                unsafe { libc::ftruncate(*host_fd, new_size as libc::off_t) };
+                            if r < 0 {
+                                return Ok(DispatchOutcome::Errno { errno: host_errno() });
+                            }
+                        }
+                    }
+                    writeback = None;
+                    outcome = DispatchOutcome::Returned { value: 0 };
+                }
+                OpenDescription::SyntheticFile { .. } => {
+                    return Ok(DispatchOutcome::Errno { errno: LINUX_EROFS });
+                }
+                OpenDescription::Directory { .. } => {
+                    return Ok(DispatchOutcome::Errno { errno: LINUX_EISDIR });
+                }
+                _ => return Ok(DispatchOutcome::Errno { errno: LINUX_ESPIPE }),
+            }
+        }
+        if let Some((path, contents)) = writeback {
+            let _ = self.rootfs_vfs.overlay.set_file_contents(&path, contents);
+        }
+        Ok(outcome)
     }
 
     fn ftruncate<M: GuestMemory>(
@@ -5136,6 +5204,28 @@ impl SyscallDispatcher {
             Ok(bytes) => bytes,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
+        // AF_UNIX pathname sockets are bound at a stable host path (see
+        // unix_socket_host_path). The guest's unlink only tombstones a VFS
+        // overlay entry, so it can't clear a real host socket left by a
+        // prior run — which would make bind() fail with EADDRINUSE. Mirror
+        // Linux's unlink-then-bind by removing a stale *socket* node here
+        // before binding (only if it is actually a socket, never a regular
+        // file or directory, to stay safe).
+        if family == libc::AF_UNIX && host_addr.len() > 2 && host_addr[2] != 0 {
+            let path_end = host_addr[2..]
+                .iter()
+                .position(|&b| b == 0)
+                .map(|p| 2 + p)
+                .unwrap_or(host_addr.len());
+            if let Ok(path) = std::str::from_utf8(&host_addr[2..path_end]) {
+                if let Ok(md) = std::fs::symlink_metadata(path) {
+                    use std::os::unix::fs::FileTypeExt;
+                    if md.file_type().is_socket() {
+                        let _ = std::fs::remove_file(path);
+                    }
+                }
+            }
+        }
         let rc = unsafe {
             libc::bind(host_fd, host_addr.as_ptr() as *const _, host_addr.len() as u32)
         };
@@ -7783,6 +7873,161 @@ impl SyscallDispatcher {
         }
     }
 
+    /// Resolve the first argument of an xattr syscall to the rootfs path it
+    /// names: a path string (path/lpath variants) or the path of the file an
+    /// fd refers to (f-variant). Returns `Err(errno)` on a bad path or an fd
+    /// that has no backing host file (e.g. the in-memory backend).
+    fn xattr_target_path(
+        &self,
+        request: &SyscallRequest,
+        memory: &impl GuestMemory,
+        target: XattrTarget,
+    ) -> Result<String, i32> {
+        match target {
+            XattrTarget::Path => {
+                let path = read_guest_c_string(memory, request.arg(0))?;
+                if path.is_empty() {
+                    return Err(LINUX_ENOENT);
+                }
+                self.resolve_at_path(LINUX_AT_FDCWD, &path)
+            }
+            XattrTarget::Fd => {
+                let fd = request.arg(0) as i32;
+                let open_file = self.open_files.get(&fd).ok_or(LINUX_EBADF)?;
+                let open = open_file.description.borrow();
+                match &*open {
+                    OpenDescription::File { path, .. }
+                    | OpenDescription::Directory { path, .. } => Ok(path.clone()),
+                    // HostFile caches no path; xattr on a raw host fd that has
+                    // no recoverable rootfs path is unsupported. The probe and
+                    // the common case use the path variants.
+                    _ => Err(LINUX_ENOTSUP),
+                }
+            }
+        }
+    }
+
+    fn setxattr(
+        &mut self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+        target: XattrTarget,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        // setxattr(path/fd, name, value, size, flags)
+        let resolved = match self.xattr_target_path(&request, memory, target) {
+            Ok(p) => p,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        let name = match read_guest_c_string(memory, request.arg(1)) {
+            Ok(name) => name,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        let size = request.arg(3) as usize;
+        let flags = request.arg(4) as i32;
+        let value = match memory.read_bytes(request.arg(2), size) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return Ok(DispatchOutcome::Errno {
+                    errno: LINUX_EFAULT,
+                })
+            }
+        };
+        match self
+            .rootfs_vfs
+            .overlay
+            .set_xattr(&resolved, &name, &value, flags)
+        {
+            Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
+            Err(errno) => Ok(DispatchOutcome::Errno { errno }),
+        }
+    }
+
+    fn getxattr(
+        &mut self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+        target: XattrTarget,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        // getxattr(path/fd, name, value, size)
+        let resolved = match self.xattr_target_path(&request, memory, target) {
+            Ok(p) => p,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        let name = match read_guest_c_string(memory, request.arg(1)) {
+            Ok(name) => name,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        let buf_addr = request.arg(2);
+        let size = request.arg(3) as usize;
+        let value = match self.rootfs_vfs.overlay.get_xattr(&resolved, &name) {
+            Ok(value) => value,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        // size == 0 is the "tell me how big" probe: return the length without
+        // copying anything.
+        if size == 0 {
+            return Ok(DispatchOutcome::Returned {
+                value: value.len() as i64,
+            });
+        }
+        if value.len() > size {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_ERANGE,
+            });
+        }
+        if memory.write_bytes(buf_addr, &value).is_err() {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EFAULT,
+            });
+        }
+        Ok(DispatchOutcome::Returned {
+            value: value.len() as i64,
+        })
+    }
+
+    fn listxattr(
+        &mut self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+        target: XattrTarget,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        // listxattr(path/fd, list, size)
+        let resolved = match self.xattr_target_path(&request, memory, target) {
+            Ok(p) => p,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        let buf_addr = request.arg(1);
+        let size = request.arg(2) as usize;
+        let names = match self.rootfs_vfs.overlay.list_xattr(&resolved) {
+            Ok(names) => names,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        // Assemble the NUL-separated, NUL-terminated name list Linux returns.
+        let mut list = Vec::new();
+        for n in &names {
+            list.extend_from_slice(n.as_bytes());
+            list.push(0);
+        }
+        if size == 0 {
+            return Ok(DispatchOutcome::Returned {
+                value: list.len() as i64,
+            });
+        }
+        if list.len() > size {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_ERANGE,
+            });
+        }
+        if memory.write_bytes(buf_addr, &list).is_err() {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EFAULT,
+            });
+        }
+        Ok(DispatchOutcome::Returned {
+            value: list.len() as i64,
+        })
+    }
+
     fn bootstrap_enosys(&self) -> DispatchOutcome {
         DispatchOutcome::Errno {
             errno: LINUX_ENOSYS,
@@ -8175,6 +8420,7 @@ impl SyscallDispatcher {
     ) -> Result<DispatchOutcome, DispatchError> {
         let dirfd = ctx.arg(0);
         let pathname = ctx.arg(1);
+        let mode = ctx.arg(2) as u32;
         let path = match read_guest_c_string(&*ctx.memory, pathname) {
             Ok(path) => path,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
@@ -8202,7 +8448,29 @@ impl SyscallDispatcher {
                 errno: LINUX_EEXIST,
             });
         }
-        Ok(DispatchOutcome::Errno { errno: LINUX_EROFS })
+        // Linux mknod(2): a zero type field means S_IFREG. Only regular
+        // files are materialised on the host backend (like open O_CREAT);
+        // device/fifo/socket nodes can't be backed by the cap-std scratch,
+        // so they report EPERM (matching the unprivileged-mknod errno).
+        let type_bits = mode & LINUX_S_IFMT;
+        if type_bits != 0 && type_bits != LINUX_S_IFREG {
+            return Ok(DispatchOutcome::Errno { errno: LINUX_EPERM });
+        }
+        // Create an empty regular file in the writable backend (cap-std).
+        // MemoryBackend's create_file works in-memory too. After this the
+        // path exists in the layered view.
+        match self.rootfs_vfs.overlay.create_file(&resolved) {
+            Ok(()) => {
+                if mode & 0o7777 != 0 {
+                    let _ = self.rootfs_vfs.overlay.set_mode(&resolved, mode & 0o7777);
+                }
+                Ok(DispatchOutcome::Returned { value: 0 })
+            }
+            Err(crate::fs_backend::BackendError::Unsupported) => {
+                Ok(DispatchOutcome::Errno { errno: LINUX_EROFS })
+            }
+            Err(_) => Ok(DispatchOutcome::Errno { errno: LINUX_EROFS }),
+        }
     }
 
     fn mkdirat<M: GuestMemory>(
@@ -8641,6 +8909,10 @@ impl SyscallDispatcher {
                 errno: LINUX_EINVAL,
             });
         }
+        // `times == NULL` means "set both to now"; otherwise read the two
+        // timespecs and resolve UTIME_NOW/UTIME_OMIT into concrete
+        // (sec, nsec) pairs or `None` (omit) for the backend.
+        let (atime_set, mtime_set): (Option<(i64, i64)>, Option<(i64, i64)>);
         if times != 0 {
             let atime = match read_timespec(memory, times) {
                 Ok(timespec) => timespec,
@@ -8660,6 +8932,13 @@ impl SyscallDispatcher {
                     errno: LINUX_EINVAL,
                 });
             }
+            atime_set = resolve_utimensat_timespec(atime);
+            mtime_set = resolve_utimensat_timespec(mtime);
+        } else {
+            // NULL → set both to the current wall-clock time.
+            let now = now_realtime_timespec();
+            atime_set = Some(now);
+            mtime_set = Some(now);
         }
 
         if pathname == 0 {
@@ -8687,18 +8966,34 @@ impl SyscallDispatcher {
             Ok(path) => path,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        // The overlay doesn't track atime/mtime separately from the
-        // underlying file. Accept the call as long as the path exists in
-        // the layered view; mirror the rootfs view's NotFound otherwise.
+        // The path must exist in the layered view, else NotFound (or a
+        // no-op success for synthetic /proc paths whose times we can't
+        // back).
         match self.layered_metadata(&path) {
-            Ok(_) => Ok(DispatchOutcome::Returned { value: 0 }),
+            Ok(_) => {}
             Err(errno) => {
                 if is_synthetic_virtual_file(&path, &self.synthetic_proc_context()) {
-                    Ok(DispatchOutcome::Returned { value: 0 })
-                } else {
-                    Ok(DispatchOutcome::Errno { errno })
+                    return Ok(DispatchOutcome::Returned { value: 0 });
                 }
+                return Ok(DispatchOutcome::Errno { errno });
             }
+        }
+        if atime_set.is_none() && mtime_set.is_none() {
+            // Both UTIME_OMIT: nothing to persist.
+            return Ok(DispatchOutcome::Returned { value: 0 });
+        }
+        // Persist atime/mtime to the materialised host file (disk-backed
+        // overlay). A subsequent stat reads real disk metadata via
+        // real_stat and will report the set mtime. MemoryBackend returns
+        // Unsupported; accept as a no-op so in-memory guests don't fail.
+        match self.rootfs_vfs.overlay.set_times(&path, atime_set, mtime_set) {
+            Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
+            Err(crate::fs_backend::BackendError::Unsupported) => {
+                Ok(DispatchOutcome::Returned { value: 0 })
+            }
+            Err(_) => Ok(DispatchOutcome::Errno {
+                errno: LINUX_EROFS,
+            }),
         }
     }
 
@@ -9592,12 +9887,12 @@ fn write_stat_real(
         st_blksize: 4096,
         __pad2: 0,
         st_blocks: blocks_512(metadata.size),
-        st_atime: 0,
-        st_atime_nsec: 0,
-        st_mtime: 0,
-        st_mtime_nsec: 0,
-        st_ctime: 0,
-        st_ctime_nsec: 0,
+        st_atime: real.atime.0,
+        st_atime_nsec: real.atime.1 as u64,
+        st_mtime: real.mtime.0,
+        st_mtime_nsec: real.mtime.1 as u64,
+        st_ctime: real.ctime.0,
+        st_ctime_nsec: real.ctime.1 as u64,
         __unused4: 0,
         __unused5: 0,
     };
@@ -9624,6 +9919,11 @@ fn write_statx_real(
         size: real.size as usize,
     };
     let zero_time = LinuxStatxTimestamp::zero();
+    let stx_ts = |t: (i64, i64)| LinuxStatxTimestamp {
+        tv_sec: t.0,
+        tv_nsec: t.1 as u32,
+        __reserved: 0,
+    };
     let statx = LinuxStatx {
         stx_mask: LINUX_STATX_BASIC_STATS,
         stx_blksize: LINUX_PAGE_SIZE as u32,
@@ -9637,10 +9937,10 @@ fn write_statx_real(
         stx_size: metadata.size as u64,
         stx_blocks: blocks_512(metadata.size) as u64,
         stx_attributes_mask: 0,
-        stx_atime: zero_time,
+        stx_atime: stx_ts(real.atime),
         stx_btime: zero_time,
-        stx_ctime: zero_time,
-        stx_mtime: zero_time,
+        stx_ctime: stx_ts(real.ctime),
+        stx_mtime: stx_ts(real.mtime),
         stx_rdev_major: 0,
         stx_rdev_minor: 0,
         stx_dev_major: 0,
@@ -10860,6 +11160,30 @@ fn linux_utimensat_timespec_is_valid(timespec: LinuxTimespec) -> bool {
     (0..1_000_000_000).contains(&nsec)
 }
 
+/// Resolve a validated utimensat timespec into the (sec, nsec) the backend
+/// should write, or `None` to leave the time untouched (UTIME_OMIT).
+/// UTIME_NOW resolves to the current wall-clock time.
+fn resolve_utimensat_timespec(timespec: LinuxTimespec) -> Option<(i64, i64)> {
+    // Copy out of the packed struct before matching (taking a reference to
+    // a packed field is UB).
+    let nsec = timespec.tv_nsec;
+    let sec = timespec.tv_sec;
+    if nsec == LINUX_UTIME_OMIT {
+        None
+    } else if nsec == LINUX_UTIME_NOW {
+        Some(now_realtime_timespec())
+    } else {
+        Some((sec, nsec))
+    }
+}
+
+/// Current CLOCK_REALTIME as a (sec, nsec) pair, for UTIME_NOW / NULL times.
+fn now_realtime_timespec() -> (i64, i64) {
+    let mut ts: libc::timespec = unsafe { core::mem::zeroed() };
+    unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) };
+    (ts.tv_sec as i64, ts.tv_nsec as i64)
+}
+
 /// Read a NULL-terminated array of guest VA pointers, dereferencing
 /// each to a C string. Used for `argv` / `envp` in `execve(2)`.
 fn read_guest_string_array(
@@ -10908,7 +11232,7 @@ fn vfs_md_to_rootfs_md(path: &str, md: &crate::vfs::Metadata) -> RootFsMetadata 
     }
 }
 
-fn host_errno() -> i32 {
+pub(crate) fn host_errno() -> i32 {
     // SAFETY: `__errno_location` (Linux) and `__error` (macOS) both
     // return a thread-local int pointer.
     let raw = unsafe { *libc::__error() };
@@ -11364,6 +11688,60 @@ fn linux_to_host_sockopt(level: i32, optname: i32) -> Option<(i32, i32)> {
     }
 }
 
+/// Map a guest AF_UNIX *pathname* socket path to a stable host path.
+///
+/// Under `--fs host` the guest's view of the filesystem is a cap-std
+/// sandboxed scratch dir; a guest path like `/tmp/net_bind.sock` is NOT a
+/// real host path, and the guest's `unlink` only tombstones a VFS overlay
+/// entry — it never touches a real host socket file. If `bind` handed the
+/// raw guest path to `libc::bind` the macOS kernel would create the socket
+/// at that literal host location, decoupled from the guest's unlink, so a
+/// stale socket from a prior run yields EADDRINUSE.
+///
+/// To keep bind/connect/getsockname consistent (and let the probe's
+/// unlink-then-bind work like Linux, with bind clearing any stale node),
+/// every pathname socket is deterministically mapped into a single
+/// per-run host directory. The mapping is a pure function of the guest
+/// path, so a `connect` to the same guest path resolves to the same host
+/// socket a prior `bind` created — including across forked children, which
+/// inherit the same derivation. macOS `sun_path` is only 104 bytes, so the
+/// host name is a short hash rather than the (possibly long) guest path.
+///
+/// Abstract-namespace sockets (Linux: leading NUL in sun_path) are NOT
+/// pathname sockets and are returned unchanged.
+fn unix_socket_host_dir() -> std::path::PathBuf {
+    // One directory per host boot/run, shared by all forked guest
+    // processes. TMPDIR keeps the absolute path short enough for sun_path.
+    let base = std::env::temp_dir();
+    base.join("carrick-unix-sockets")
+}
+
+/// Given the raw guest `sun_path` bytes (everything after the 2-byte
+/// family), return the host pathname to bind/connect on, or `None` for an
+/// abstract-namespace / autobind address (which we pass through verbatim).
+fn unix_socket_host_path(sun_path: &[u8]) -> Option<std::path::PathBuf> {
+    // Empty (autobind) or abstract (leading NUL): not a filesystem path.
+    if sun_path.is_empty() || sun_path[0] == 0 {
+        return None;
+    }
+    // Pathname socket: bytes up to the first NUL.
+    let nul = sun_path.iter().position(|&b| b == 0).unwrap_or(sun_path.len());
+    let guest_path = &sun_path[..nul];
+    if guest_path.is_empty() {
+        return None;
+    }
+    let dir = unix_socket_host_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    // Short, collision-resistant, deterministic name derived from the guest
+    // path so bind and connect agree and the result fits macOS sun_path.
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &b in guest_path {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    Some(dir.join(format!("{hash:016x}.sock")))
+}
+
 /// Translate a Linux-formatted sockaddr (read from guest memory) into the
 /// macOS BSD form. Returns the host-formatted bytes ready to hand to
 /// libc::bind/connect/sendto.
@@ -11409,17 +11787,40 @@ fn read_linux_sockaddr(
             Ok(out)
         }
         LINUX_AF_UNIX => {
-            // sockaddr_un: family(2) path[108]
+            // Linux sockaddr_un: family(2) sun_path[108]. macOS sockaddr_un
+            // is sun_len(1) sun_family(1) sun_path[104].
             if len < 2 {
                 return Err(LINUX_EINVAL);
             }
-            let path_len = len.saturating_sub(2);
-            // macOS sockaddr_un is sun_len(1) sun_family(1) sun_path[104].
-            let mut out = vec![0u8; 2 + path_len];
-            out[0] = (2 + path_len).min(255) as u8;
-            out[1] = libc::AF_UNIX as u8;
-            out[2..].copy_from_slice(&bytes[2..2 + path_len]);
-            Ok(out)
+            let sun_path = &bytes[2..];
+            match unix_socket_host_path(sun_path) {
+                // Pathname socket: bind/connect on a stable host path so the
+                // guest's filesystem view (and its unlink) doesn't have to
+                // own the real socket node. See unix_socket_host_path.
+                Some(host_path) => {
+                    let p = host_path.to_string_lossy();
+                    let pbytes = p.as_bytes();
+                    // sun_path is fixed-size; macOS allows up to 104 bytes
+                    // including the trailing NUL.
+                    if pbytes.len() >= 104 {
+                        return Err(LINUX_ENAMETOOLONG);
+                    }
+                    let mut out = vec![0u8; 2 + pbytes.len() + 1];
+                    out[0] = out.len().min(255) as u8;
+                    out[1] = libc::AF_UNIX as u8;
+                    out[2..2 + pbytes.len()].copy_from_slice(pbytes);
+                    Ok(out)
+                }
+                // Abstract / autobind: pass the raw bytes through unchanged.
+                None => {
+                    let path_len = len.saturating_sub(2);
+                    let mut out = vec![0u8; 2 + path_len];
+                    out[0] = (2 + path_len).min(255) as u8;
+                    out[1] = libc::AF_UNIX as u8;
+                    out[2..].copy_from_slice(&bytes[2..2 + path_len]);
+                    Ok(out)
+                }
+            }
         }
         _ => Err(LINUX_EAFNOSUPPORT),
     }
