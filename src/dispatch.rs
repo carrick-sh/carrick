@@ -2,14 +2,17 @@ use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::rc::Rc;
-use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::compat::{CompatEvent, CompatReporter, SyscallArgs};
 use crate::linux_abi::{
     KernelAbi, LINUX_DIRENT64_HEADER_SIZE, LINUX_DT_DIR, LINUX_DT_LNK, LINUX_DT_REG, LINUX_PAGE_SIZE,
     LINUX_S_IFDIR, LINUX_S_IFLNK, LINUX_S_IFREG, LINUX_TERMIOS_KERNEL_SIZE, LinuxCapabilityData, LinuxCapabilityHeader,
-    LinuxDirent64Header, LinuxEpollEvent, LinuxEventfdValue, LinuxFdPair, LinuxIovec,
+    LinuxDirent64Header, LinuxEpollEvent, LinuxEventfdValue, LinuxFdPair, LinuxIfAddrMsg,
+    LinuxIfInfoMsg, LinuxIovec, LinuxNlMsgHdr, LinuxRtAttr,
+    LINUX_ARPHRD_LOOPBACK, LINUX_IFA_ADDRESS, LINUX_IFA_LABEL, LINUX_IFA_LOCAL, LINUX_IFF_LOOPBACK,
+    LINUX_IFF_RUNNING, LINUX_IFF_UP, LINUX_IFLA_ADDRESS, LINUX_IFLA_IFNAME, LINUX_NLMSG_DONE,
+    LINUX_NLM_F_MULTI, LINUX_RTM_GETADDR, LINUX_RTM_GETLINK, LINUX_RTM_NEWADDR, LINUX_RTM_NEWLINK,
     LinuxItimerspec, LinuxItimerval, LinuxOpenHow, LinuxPollFd, LinuxRlimit, LinuxRusage, LinuxSigaction, LinuxSysinfo,
     LinuxSigaltstack, LinuxStat, LinuxStatfs, LinuxStatx, LinuxStatxTimestamp,
     LinuxTimerfdExpirations, LinuxTimespec, LinuxTimeval, LinuxTimezone, LinuxTms,
@@ -44,6 +47,7 @@ pub const LINUX_EROFS: i32 = 30;
 pub const LINUX_ENOTSUP: i32 = 95;
 pub const LINUX_ENOTSOCK: i32 = 88;
 pub const LINUX_ENOPROTOOPT: i32 = 92;
+pub const LINUX_ESOCKTNOSUPPORT: i32 = 94;
 // Linux's `type & SOCK_NONBLOCK` and `& SOCK_CLOEXEC` bits sit in the
 // type argument to socket(2)/socketpair(2)/accept4(2). macOS doesn't
 // have these; we strip them before calling libc and apply the effect
@@ -121,6 +125,7 @@ pub const LINUX_O_DIRECTORY: u64 = 0o200000;
 pub const LINUX_PROT_READ: u64 = 0x1;
 pub const LINUX_PROT_WRITE: u64 = 0x2;
 pub const LINUX_PROT_EXEC: u64 = 0x4;
+pub const LINUX_MAP_SHARED: u64 = 0x01;
 pub const LINUX_MAP_PRIVATE: u64 = 0x02;
 pub const LINUX_MAP_FIXED: u64 = 0x10;
 pub const LINUX_MAP_ANONYMOUS: u64 = 0x20;
@@ -157,6 +162,10 @@ const LINUX_EPOLL_CTL_ADD: u64 = 1;
 const LINUX_EPOLL_CTL_DEL: u64 = 2;
 const LINUX_EPOLL_CTL_MOD: u64 = 3;
 const LINUX_EPOLLIN: u32 = 0x001;
+const LINUX_EPOLLPRI: u32 = 0x002;
+const LINUX_EPOLLOUT: u32 = 0x004;
+const LINUX_EPOLLERR: u32 = 0x008;
+const LINUX_EPOLLHUP: u32 = 0x010;
 const LINUX_LOCK_SH: u64 = 1;
 const LINUX_LOCK_EX: u64 = 2;
 const LINUX_LOCK_NB: u64 = 4;
@@ -198,6 +207,12 @@ const LINUX_BOOTSTRAP_SID: i32 = 1;
 const LINUX_PIPE_BUF_SIZE: i64 = 65_536;
 const LINUX_RT_SIGSET_SIZE: u64 = 8;
 const LINUX_MAX_SIGNUM: u64 = 64;
+const LINUX_SIGKILL: i32 = 9;
+const LINUX_SIGSTOP: i32 = 19;
+/// `how` argument values for `rt_sigprocmask`.
+const LINUX_SIG_BLOCK: u64 = 0;
+const LINUX_SIG_UNBLOCK: u64 = 1;
+const LINUX_SIG_SETMASK: u64 = 2;
 const LINUX_BOOTSTRAP_PID: u64 = 1;
 #[allow(dead_code)]
 const LINUX_SS_ONSTACK: u64 = 1;
@@ -206,6 +221,8 @@ const LINUX_MINSIGSTKSZ: u64 = 2048;
 const LINUX_BOOTSTRAP_AFFINITY_BYTES: usize = 8;
 const LINUX_CLOCK_REALTIME: u64 = 0;
 const LINUX_CLOCK_MONOTONIC: u64 = 1;
+const LINUX_CLOCK_PROCESS_CPUTIME_ID: u64 = 2;
+const LINUX_CLOCK_THREAD_CPUTIME_ID: u64 = 3;
 const LINUX_CLOCK_MONOTONIC_RAW: u64 = 4;
 const LINUX_CLOCK_REALTIME_COARSE: u64 = 5;
 const LINUX_CLOCK_MONOTONIC_COARSE: u64 = 6;
@@ -252,8 +269,6 @@ const LINUX_STATX_RESERVED: u64 = 0x8000_0000;
 const MAX_GUEST_PATH: usize = 4096;
 const LINUX_IOV_MAX: usize = 1024;
 const LINUX_OPEN_HOW_SIZE: u64 = core::mem::size_of::<LinuxOpenHow>() as u64;
-
-static MONOTONIC_START: OnceLock<Instant> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct SyscallRequest {
@@ -489,6 +504,17 @@ pub struct SyscallDispatcher {
     /// state is what makes interactive `busybox sh`'s "is this signal
     /// owned?" introspection produce consistent answers.
     signal_handlers: HashMap<i32, LinuxSigaction>,
+    /// Guest's blocked-signal mask (bit `signum-1`). Updated by
+    /// `rt_sigprocmask`. A blocked signal that is raised is held in
+    /// `pending_signals` instead of being delivered, and surfaces via
+    /// `rt_sigpending` / `rt_sigtimedwait` or when later unblocked.
+    signal_mask: u64,
+    /// Signals raised while blocked, awaiting unblock or a synchronous
+    /// wait (`rt_sigtimedwait`). Bit `signum-1`.
+    pending_signals: u64,
+    /// Installed alternate signal stack (`sigaltstack`). `None` means no
+    /// alt stack is installed; queried back via the `old_ss` out-param.
+    sig_altstack: Option<LinuxSigaltstack>,
     /// Snapshot of the guest's `AddressSpace` regions, captured at
     /// boot via [`set_address_space_regions`]. When present,
     /// `/proc/self/maps` is rendered from this list (with the heap
@@ -607,6 +633,24 @@ enum OpenDescription {
         status_flags: u64,
         writable: bool,
     },
+    /// Synthetic AF_NETLINK socket. macOS has no AF_NETLINK, so we can't
+    /// back this with a host fd; instead we model just enough of the
+    /// rtnetlink (NETLINK_ROUTE) protocol for glibc's `__check_pf`,
+    /// getaddrinfo and `ip`/`ss` tooling to enumerate a loopback
+    /// interface and then stop. `bind`/`getsockname` report the socket's
+    /// pid/groups; a RTM_GETLINK/RTM_GETADDR dump request queues a
+    /// synthetic response into `recv_queue` that the next recvmsg/recvfrom
+    /// drains, terminated by NLMSG_DONE.
+    Netlink {
+        protocol: i32,
+        /// Netlink "port id" the socket is bound to (0 until bind picks one).
+        pid: u32,
+        /// Multicast group mask from bind (nl_groups).
+        groups: u32,
+        /// Bytes queued by a dump request, drained by recvmsg/recvfrom.
+        recv_queue: VecDeque<u8>,
+        status_flags: u64,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -658,7 +702,8 @@ impl OpenDescription {
             | OpenDescription::PipeWriter { status_flags, .. }
             | OpenDescription::HostPipe { status_flags, .. }
             | OpenDescription::HostFile { status_flags, .. }
-            | OpenDescription::HostSocket { status_flags, .. } => *status_flags,
+            | OpenDescription::HostSocket { status_flags, .. }
+            | OpenDescription::Netlink { status_flags, .. } => *status_flags,
         }
     }
 
@@ -674,7 +719,8 @@ impl OpenDescription {
             | OpenDescription::PipeWriter { status_flags, .. }
             | OpenDescription::HostPipe { status_flags, .. }
             | OpenDescription::HostFile { status_flags, .. }
-            | OpenDescription::HostSocket { status_flags, .. } => *status_flags = next,
+            | OpenDescription::HostSocket { status_flags, .. }
+            | OpenDescription::Netlink { status_flags, .. } => *status_flags = next,
         }
     }
 }
@@ -792,6 +838,7 @@ impl SyscallDispatcher {
         133 => rt_sigsuspend,
         134 => rt_sigaction,
         135 => rt_sigprocmask,
+        136 => rt_sigpending,
         137 => rt_sigtimedwait,
         138 => rt_sigqueueinfo,
         139 => rt_sigreturn,
@@ -857,6 +904,7 @@ impl SyscallDispatcher {
         260 => wait4,
         261 => prlimit64,
         266 => clock_adjtime,
+        267 => syncfs,
         276 => renameat2,
         278 => getrandom,
         285 => copy_file_range,
@@ -890,6 +938,9 @@ impl SyscallDispatcher {
             cred_egid: 0,
             cred_sgid: 0,
             signal_handlers: HashMap::new(),
+            signal_mask: 0,
+            pending_signals: 0,
+            sig_altstack: None,
             address_space_regions: None,
             vfs_mounts: {
                 let mut m = crate::vfs::VfsMounts::new();
@@ -1044,6 +1095,55 @@ impl SyscallDispatcher {
             .get(&signum)
             .map(|a| a.sa_handler == crate::linux_abi::LINUX_SIG_IGN)
             .unwrap_or(false)
+    }
+
+    /// True iff `signum` is currently blocked by the guest's signal mask.
+    /// SIGKILL/SIGSTOP can never be blocked, matching the kernel.
+    pub fn signal_blocked(&self, signum: i32) -> bool {
+        if signum == LINUX_SIGKILL || signum == LINUX_SIGSTOP {
+            return false;
+        }
+        match sigmask_bit(signum) {
+            Some(bit) => self.signal_mask & bit != 0,
+            None => false,
+        }
+    }
+
+    /// Record a (blocked) signal as pending. It stays queued until the
+    /// guest unblocks it or dequeues it via `rt_sigtimedwait`.
+    pub fn mark_signal_pending(&mut self, signum: i32) {
+        if let Some(bit) = sigmask_bit(signum) {
+            self.pending_signals |= bit;
+        }
+    }
+
+    /// Lowest-numbered pending signal that intersects `set`, cleared from
+    /// the pending set. Used by `rt_sigtimedwait`.
+    fn take_pending_in(&mut self, set: u64) -> Option<i32> {
+        let candidates = self.pending_signals & set;
+        if candidates == 0 {
+            return None;
+        }
+        let signum = candidates.trailing_zeros() as i32 + 1;
+        self.pending_signals &= !(1u64 << (signum - 1));
+        Some(signum)
+    }
+
+    /// Raise `signum` against the guest itself (kill/tkill/tgkill self
+    /// target). If the signal is blocked it is held pending; otherwise it
+    /// is handed to the runtime's delivery slot. signum 0 is the null
+    /// probe and a no-op success.
+    fn raise_self(&mut self, signum: u64) -> DispatchOutcome {
+        if signum == 0 {
+            return DispatchOutcome::Returned { value: 0 };
+        }
+        let s = signum as i32;
+        if self.signal_blocked(s) {
+            self.mark_signal_pending(s);
+        } else {
+            crate::host_signal::raise_for_self(s);
+        }
+        DispatchOutcome::Returned { value: 0 }
     }
 
     pub fn dispatch(
@@ -1290,7 +1390,8 @@ impl SyscallDispatcher {
             | OpenDescription::PipeReader { .. }
             | OpenDescription::PipeWriter { .. }
             | OpenDescription::HostPipe { .. }
-            | OpenDescription::HostSocket { .. } => synthetic_readonly_access(mode),
+            | OpenDescription::HostSocket { .. }
+            | OpenDescription::Netlink { .. } => synthetic_readonly_access(mode),
         }
     }
 
@@ -1347,7 +1448,8 @@ impl SyscallDispatcher {
             | OpenDescription::PipeReader { .. }
             | OpenDescription::PipeWriter { .. }
             | OpenDescription::HostPipe { .. }
-            | OpenDescription::HostSocket { .. } => DispatchOutcome::Errno {
+            | OpenDescription::HostSocket { .. }
+            | OpenDescription::Netlink { .. } => DispatchOutcome::Errno {
                 errno: LINUX_ENOTDIR,
             },
         })
@@ -1695,7 +1797,55 @@ impl SyscallDispatcher {
             {
                 LINUX_EPOLLIN
             }
-            _ => 0,
+            _ => {
+                // For host-backed descriptions (HostPipe/HostSocket/HostFile/
+                // stdio) the in-memory arms above don't apply: readiness lives
+                // in the real kernel object. Mirror what poll()/ppoll() do —
+                // map the guest fd to its host fd and do a non-blocking
+                // libc::poll(timeout 0), then translate revents → epoll events.
+                drop(open);
+                let Some(host_fd) = self.host_fd_for_poll(fd) else {
+                    return 0;
+                };
+                let mut interest: i16 = 0;
+                if requested_events & LINUX_EPOLLIN != 0 {
+                    interest |= libc::POLLIN;
+                }
+                if requested_events & LINUX_EPOLLOUT != 0 {
+                    interest |= libc::POLLOUT;
+                }
+                if requested_events & LINUX_EPOLLPRI != 0 {
+                    interest |= libc::POLLPRI;
+                }
+                let mut pfd = libc::pollfd {
+                    fd: host_fd,
+                    events: interest,
+                    revents: 0,
+                };
+                let rc = unsafe { libc::poll(&mut pfd as *mut _, 1, 0) };
+                if rc <= 0 {
+                    return 0;
+                }
+                let mut ready = 0u32;
+                if pfd.revents & libc::POLLIN != 0 {
+                    ready |= LINUX_EPOLLIN;
+                }
+                if pfd.revents & libc::POLLOUT != 0 {
+                    ready |= LINUX_EPOLLOUT;
+                }
+                if pfd.revents & libc::POLLPRI != 0 {
+                    ready |= LINUX_EPOLLPRI;
+                }
+                if pfd.revents & libc::POLLHUP != 0 {
+                    ready |= LINUX_EPOLLHUP;
+                }
+                if pfd.revents & libc::POLLERR != 0 {
+                    ready |= LINUX_EPOLLERR;
+                }
+                // Only report events the caller is watching, plus the
+                // always-reported HUP/ERR conditions Linux delivers regardless.
+                ready & (requested_events | LINUX_EPOLLHUP | LINUX_EPOLLERR)
+            }
         }
     }
 
@@ -2268,6 +2418,17 @@ impl SyscallDispatcher {
                     if pfd.revents & libc::POLLHUP != 0 {
                         ready |= LINUX_POLLHUP;
                     }
+                }
+            }
+            OpenDescription::Netlink { recv_queue, .. } => {
+                // A netlink socket is "readable" once a dump response has
+                // been queued (by a prior sendto/sendmsg), and always
+                // writable (the kernel never blocks rtnetlink requests).
+                if requested_events & LINUX_POLLIN != 0 && !recv_queue.is_empty() {
+                    ready |= LINUX_POLLIN;
+                }
+                if requested_events & LINUX_POLLOUT != 0 {
+                    ready |= LINUX_POLLOUT;
                 }
             }
         }
@@ -2905,6 +3066,7 @@ impl SyscallDispatcher {
             | OpenDescription::TimerFd { .. }
             | OpenDescription::HostPipe { .. }
             | OpenDescription::HostSocket { .. }
+            | OpenDescription::Netlink { .. }
             | OpenDescription::Epoll { .. } => LINUX_ESPIPE,
         };
         Ok(DispatchOutcome::Errno { errno })
@@ -3487,6 +3649,14 @@ impl SyscallDispatcher {
     ) -> Result<DispatchOutcome, DispatchError> {
         let pid = ctx.arg(0) as i64;
         let signum = ctx.arg(1);
+        if !is_valid_signum(signum) {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            });
+        }
+        if signal_is_self_target(pid, /*tid_required=*/ false) {
+            return Ok(self.raise_self(signum));
+        }
         Ok(bootstrap_signal_send(pid, /*tid_required=*/ false, signum))
     }
 
@@ -3496,7 +3666,15 @@ impl SyscallDispatcher {
     ) -> Result<DispatchOutcome, DispatchError> {
         let tid = ctx.arg(0) as i64;
         let signum = ctx.arg(1);
+        if !is_valid_signum(signum) {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            });
+        }
         // tkill's target is a thread id, not a "0 means self" pid form.
+        if signal_is_self_target(tid, /*tid_required=*/ true) {
+            return Ok(self.raise_self(signum));
+        }
         Ok(bootstrap_signal_send(tid, /*tid_required=*/ true, signum))
     }
 
@@ -3520,11 +3698,7 @@ impl SyscallDispatcher {
         if !valid_self {
             return Ok(DispatchOutcome::Errno { errno: LINUX_ESRCH });
         }
-        if signum == 0 {
-            return Ok(DispatchOutcome::Returned { value: 0 });
-        }
-        crate::host_signal::raise_for_self(signum as i32);
-        Ok(DispatchOutcome::Returned { value: 0 })
+        Ok(self.raise_self(signum))
     }
 
     fn sigaltstack<M: GuestMemory>(
@@ -3535,14 +3709,15 @@ impl SyscallDispatcher {
         let old_ss = ctx.arg(1);
         let memory = &mut *ctx.memory;
 
-        if old_ss != 0
-            && memory
-                .write_bytes(old_ss, LinuxSigaltstack::disabled().abi_bytes())
-                .is_err()
-        {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EFAULT,
-            });
+        // Report the currently-installed alt stack (or a disabled stack
+        // when none is set) into the old_ss out-param.
+        if old_ss != 0 {
+            let current = self.sig_altstack.unwrap_or_else(LinuxSigaltstack::disabled);
+            if memory.write_bytes(old_ss, current.abi_bytes()).is_err() {
+                return Ok(DispatchOutcome::Errno {
+                    errno: LINUX_EFAULT,
+                });
+            }
         }
 
         if ss != 0 {
@@ -3570,17 +3745,21 @@ impl SyscallDispatcher {
                     errno: LINUX_EINVAL,
                 });
             }
-            if flags == 0 {
+            if flags & LINUX_SS_DISABLE != 0 {
+                // SS_DISABLE removes any installed alt stack.
+                self.sig_altstack = None;
+            } else {
                 let size = new_stack.ss_size;
                 if size < LINUX_MINSIGSTKSZ {
                     return Ok(DispatchOutcome::Errno {
                         errno: LINUX_ENOMEM,
                     });
                 }
+                // Record the alt stack so a subsequent query returns it.
+                // (We don't yet switch to it during delivery, but glibc and
+                // sigaltstack(2) callers rely on the get/set round-trip.)
+                self.sig_altstack = Some(new_stack);
             }
-            // SS_DISABLE or a request with a sufficiently large stack is
-            // silently dropped: we have no alternate signal stack machinery
-            // yet, so there's nothing to install.
         }
 
         Ok(DispatchOutcome::Returned { value: 0 })
@@ -3658,22 +3837,83 @@ impl SyscallDispatcher {
         &mut self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
+        let how = ctx.arg(0);
+        let new_set = ctx.arg(1);
         let old_set = ctx.arg(2);
         let sigset_size = ctx.arg(3);
         let memory = &mut *ctx.memory;
-        if sigset_size == 0 || sigset_size > 128 {
+        if sigset_size != LINUX_RT_SIGSET_SIZE {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
             });
         }
-        if old_set != 0 {
-            let len = usize::try_from(sigset_size)
-                .map_err(|_| DispatchError::LengthTooLarge(sigset_size))?;
-            if memory.write_bytes(old_set, &vec![0; len]).is_err() {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_EFAULT,
-                });
+        let previous_mask = self.signal_mask;
+        // Write back the *previous* mask before applying changes (the
+        // caller may pass the same buffer for new_set and old_set).
+        if old_set != 0
+            && memory
+                .write_bytes(old_set, &previous_mask.to_le_bytes())
+                .is_err()
+        {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EFAULT,
+            });
+        }
+        if new_set != 0 {
+            let bytes = match memory.read_bytes(new_set, LINUX_RT_SIGSET_SIZE as usize) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    return Ok(DispatchOutcome::Errno {
+                        errno: LINUX_EFAULT,
+                    });
+                }
+            };
+            let set = u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8]));
+            let mut mask = match how {
+                LINUX_SIG_BLOCK => previous_mask | set,
+                LINUX_SIG_UNBLOCK => previous_mask & !set,
+                LINUX_SIG_SETMASK => set,
+                _ => {
+                    return Ok(DispatchOutcome::Errno {
+                        errno: LINUX_EINVAL,
+                    });
+                }
+            };
+            // SIGKILL and SIGSTOP can never be masked.
+            mask &= !(sigmask_bit(LINUX_SIGKILL).unwrap() | sigmask_bit(LINUX_SIGSTOP).unwrap());
+            self.signal_mask = mask;
+            // Any pending signal that just became unblocked is eligible for
+            // delivery now. Hand one to the runtime's pending slot.
+            let deliverable = self.pending_signals & !mask;
+            if deliverable != 0 {
+                let signum = deliverable.trailing_zeros() as i32 + 1;
+                self.pending_signals &= !(1u64 << (signum - 1));
+                crate::host_signal::raise_for_self(signum);
             }
+        }
+        Ok(DispatchOutcome::Returned { value: 0 })
+    }
+
+    fn rt_sigpending<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let set_ptr = ctx.arg(0);
+        let sigset_size = ctx.arg(1);
+        let memory = &mut *ctx.memory;
+        if sigset_size != LINUX_RT_SIGSET_SIZE {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            });
+        }
+        if set_ptr != 0
+            && memory
+                .write_bytes(set_ptr, &self.pending_signals.to_le_bytes())
+                .is_err()
+        {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EFAULT,
+            });
         }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
@@ -3683,6 +3923,7 @@ impl SyscallDispatcher {
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let set_ptr = ctx.arg(0);
+        let info_ptr = ctx.arg(1);
         let timeout_ptr = ctx.arg(2);
         let sigset_size = ctx.arg(3);
         let memory = &*ctx.memory;
@@ -3691,35 +3932,67 @@ impl SyscallDispatcher {
                 errno: LINUX_EINVAL,
             });
         }
-        if memory
-            .read_bytes(set_ptr, LINUX_RT_SIGSET_SIZE as usize)
-            .is_err()
-        {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EFAULT,
-            });
-        }
+        let set_bytes = match memory.read_bytes(set_ptr, LINUX_RT_SIGSET_SIZE as usize) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return Ok(DispatchOutcome::Errno {
+                    errno: LINUX_EFAULT,
+                });
+            }
+        };
+        let wait_set = u64::from_le_bytes(set_bytes.try_into().unwrap_or([0; 8]));
+        let mut timeout: Option<Duration> = None;
         if timeout_ptr != 0 {
-            let timeout = match read_timespec(memory, timeout_ptr) {
-                Ok(timeout) => timeout,
+            let ts = match read_timespec(memory, timeout_ptr) {
+                Ok(ts) => ts,
                 Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
             };
-            let tv_sec = timeout.tv_sec;
-            let tv_nsec = timeout.tv_nsec;
+            // Copy out of the packed struct before use (taking a reference
+            // to a packed field is UB / a hard error).
+            let tv_sec = ts.tv_sec;
+            let tv_nsec = ts.tv_nsec;
             if tv_sec < 0 || !(0..1_000_000_000).contains(&tv_nsec) {
                 return Ok(DispatchOutcome::Errno {
                     errno: LINUX_EINVAL,
                 });
             }
-            // A zero timeout is a polling check that must return immediately.
-            // We have no signal queue, so the answer is always "timed out".
+            timeout = Some(Duration::new(tv_sec as u64, tv_nsec as u32));
         }
-        // Non-zero timeout: a real implementation would block. With no signal
-        // source we'd block forever, so report the timeout. info is only
-        // written on success, and we never succeed.
-        Ok(DispatchOutcome::Errno {
-            errno: LINUX_EAGAIN,
-        })
+
+        let memory = &mut *ctx.memory;
+        // A signal already pending (e.g. raised while blocked) is dequeued
+        // immediately and its number returned.
+        if let Some(signum) = self.take_pending_in(wait_set) {
+            return Ok(rt_sigtimedwait_deliver(memory, info_ptr, signum));
+        }
+        // Nothing pending. A zero (or absent) timeout is a non-blocking poll.
+        match timeout {
+            Some(d) if !d.is_zero() => {
+                // Bounded wait: the only async source that can arrive is the
+                // host slot (e.g. SIGINT). Sleep up to the timeout (capped so
+                // the conformance harness can't wedge) re-checking it.
+                let deadline = Instant::now() + d.min(Duration::from_secs(5));
+                while Instant::now() < deadline {
+                    let pending = crate::host_signal::take_pending();
+                    if pending != 0 {
+                        let in_set = sigmask_bit(pending).is_some_and(|b| wait_set & b != 0);
+                        if in_set {
+                            return Ok(rt_sigtimedwait_deliver(memory, info_ptr, pending));
+                        }
+                        // Not awaited: re-queue for normal delivery and stop.
+                        crate::host_signal::raise_for_self(pending);
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Ok(DispatchOutcome::Errno {
+                    errno: LINUX_EAGAIN,
+                })
+            }
+            _ => Ok(DispatchOutcome::Errno {
+                errno: LINUX_EAGAIN,
+            }),
+        }
     }
 
     fn rt_sigqueueinfo<M: GuestMemory>(
@@ -4593,7 +4866,41 @@ impl SyscallDispatcher {
         let family = ctx.arg(0) as i32;
         let type_ = ctx.arg(1) as i32;
         let protocol = ctx.arg(2) as i32;
+        // AF_NETLINK has no macOS equivalent, so we can't back it with a
+        // host socket. Model a synthetic netlink fd instead (see the
+        // `OpenDescription::Netlink` docs) so glibc's __check_pf /
+        // getaddrinfo and `ip`/`ss` get a valid fd rather than
+        // EAFNOSUPPORT.
+        if family == LINUX_AF_NETLINK {
+            return Ok(self.netlink_socket(type_, protocol));
+        }
         Ok(self.host_socket_install(family, type_, protocol))
+    }
+
+    /// Create a synthetic AF_NETLINK socket. Linux accepts SOCK_RAW and
+    /// SOCK_DGRAM for netlink (they're equivalent there); other socket
+    /// types are rejected with ESOCKTNOSUPPORT, matching the kernel.
+    fn netlink_socket(&mut self, type_: i32, protocol: i32) -> DispatchOutcome {
+        let nonblock = type_ & LINUX_SOCK_NONBLOCK != 0;
+        let cloexec = type_ & LINUX_SOCK_CLOEXEC != 0;
+        let base_type = type_ & !(LINUX_SOCK_NONBLOCK | LINUX_SOCK_CLOEXEC);
+        if base_type != LINUX_SOCK_RAW && base_type != LINUX_SOCK_DGRAM {
+            return DispatchOutcome::Errno {
+                errno: LINUX_ESOCKTNOSUPPORT,
+            };
+        }
+        let status_flags = if nonblock { LINUX_O_NONBLOCK } else { 0 };
+        let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };
+        self.install_fd(
+            OpenDescription::Netlink {
+                protocol,
+                pid: 0,
+                groups: 0,
+                recv_queue: VecDeque::new(),
+                status_flags,
+            },
+            fd_flags,
+        )
     }
 
     fn host_socket_install(
@@ -4729,6 +5036,70 @@ impl SyscallDispatcher {
         }
     }
 
+    /// True iff `fd` refers to a synthetic AF_NETLINK socket.
+    fn fd_is_netlink(&self, fd: i32) -> bool {
+        self.open_files.get(&fd).is_some_and(|of| {
+            matches!(&*of.description.borrow(), OpenDescription::Netlink { .. })
+        })
+    }
+
+    /// Handle a netlink "send": parse the request and queue a synthetic
+    /// rtnetlink dump reply (or a bare NLMSG_DONE for requests we don't
+    /// specifically model). Returns the number of bytes "sent".
+    fn netlink_send(&mut self, fd: i32, request: &[u8]) -> DispatchOutcome {
+        let Some(open_file) = self.open_files.get(&fd) else {
+            return DispatchOutcome::Errno { errno: LINUX_EBADF };
+        };
+        let reply = {
+            let open = open_file.description.borrow();
+            let OpenDescription::Netlink { pid, .. } = &*open else {
+                return DispatchOutcome::Errno { errno: LINUX_ENOTSOCK };
+            };
+            let dest_pid = if *pid != 0 { *pid } else { std::process::id() };
+            build_netlink_reply(request, dest_pid)
+        };
+        if let OpenDescription::Netlink { recv_queue, .. } =
+            &mut *open_file.description.borrow_mut()
+        {
+            recv_queue.extend(reply);
+        }
+        DispatchOutcome::Returned {
+            value: request.len() as i64,
+        }
+    }
+
+    /// recvfrom path for netlink: drain queued reply bytes into guest memory.
+    fn netlink_recv(
+        &mut self,
+        fd: i32,
+        buf_addr: u64,
+        len: usize,
+        memory: &mut impl GuestMemory,
+    ) -> DispatchOutcome {
+        let chunk = self.netlink_drain(fd, len);
+        if !chunk.is_empty() && memory.write_bytes(buf_addr, &chunk).is_err() {
+            return DispatchOutcome::Errno { errno: LINUX_EFAULT };
+        }
+        DispatchOutcome::Returned {
+            value: chunk.len() as i64,
+        }
+    }
+
+    /// Pop up to `max` bytes from the netlink recv queue. Our synthetic
+    /// reply is built as one contiguous dump, so a single drain that fits
+    /// the caller's buffer returns the whole thing.
+    fn netlink_drain(&mut self, fd: i32, max: usize) -> Vec<u8> {
+        let Some(open_file) = self.open_files.get(&fd) else {
+            return Vec::new();
+        };
+        let mut open = open_file.description.borrow_mut();
+        let OpenDescription::Netlink { recv_queue, .. } = &mut *open else {
+            return Vec::new();
+        };
+        let take = recv_queue.len().min(max);
+        recv_queue.drain(..take).collect()
+    }
+
     fn bind<M: GuestMemory>(
         &mut self,
         ctx: &mut SyscallCtx<M>,
@@ -4737,6 +5108,26 @@ impl SyscallDispatcher {
         let fd = ctx.request.arg(0) as i32;
         let addr_addr = ctx.request.arg(1);
         let addrlen = ctx.request.arg(2) as u32;
+        // AF_NETLINK bind: read the (optional) sockaddr_nl to pick up the
+        // requested pid/groups, then assign a pid (the guest's own pid
+        // when the caller passed 0, i.e. "let the kernel choose").
+        if let Some(open_file) = self.open_files.get(&fd) {
+            if let OpenDescription::Netlink {
+                pid: nl_pid,
+                groups: nl_groups,
+                ..
+            } = &mut *open_file.description.borrow_mut()
+            {
+                let (req_pid, req_groups) = read_sockaddr_nl(memory, addr_addr, addrlen);
+                *nl_pid = if req_pid != 0 {
+                    req_pid
+                } else {
+                    std::process::id()
+                };
+                *nl_groups = req_groups;
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            }
+        }
         let (host_fd, family) = match self.host_socket_lookup(fd) {
             Ok(t) => t,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
@@ -4895,6 +5286,19 @@ impl SyscallDispatcher {
         let fd = ctx.request.arg(0) as i32;
         let addr_addr = ctx.request.arg(1);
         let addrlen_addr = ctx.request.arg(2);
+        // AF_NETLINK getsockname: hand back a sockaddr_nl carrying the
+        // bound pid/groups (or pid=0 if the socket was never bound).
+        if let Some(open_file) = self.open_files.get(&fd) {
+            if let OpenDescription::Netlink { pid, groups, .. } =
+                &*open_file.description.borrow()
+            {
+                let nl = sockaddr_nl_bytes(*pid, *groups);
+                if write_linux_sockaddr(memory, addr_addr, addrlen_addr, &nl).is_err() {
+                    return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
+                }
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            }
+        }
         let (host_fd, family) = match self.host_socket_lookup(fd) {
             Ok(t) => t,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
@@ -4954,6 +5358,15 @@ impl SyscallDispatcher {
         let flags = ctx.request.arg(3) as i32;
         let dest_addr = ctx.request.arg(4);
         let dest_len = ctx.request.arg(5) as u32;
+        // AF_NETLINK send: treat the payload as an rtnetlink request and
+        // queue a synthetic dump reply for the next recv.
+        if self.fd_is_netlink(fd) {
+            let bytes = match memory.read_bytes(buf_addr, len) {
+                Ok(b) => b,
+                Err(_) => return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT }),
+            };
+            return Ok(self.netlink_send(fd, &bytes));
+        }
         let (host_fd, family) = match self.host_socket_lookup(fd) {
             Ok(t) => t,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
@@ -5008,6 +5421,18 @@ impl SyscallDispatcher {
         let flags = ctx.request.arg(3) as i32;
         let src_addr = ctx.request.arg(4);
         let src_len_addr = ctx.request.arg(5);
+        // AF_NETLINK recv: drain the queued dump reply. The source address
+        // (if requested) is the kernel: sockaddr_nl with pid=0.
+        if self.fd_is_netlink(fd) {
+            let drained = self.netlink_recv(fd, buf_addr, len, memory);
+            if let DispatchOutcome::Returned { .. } = drained {
+                if src_addr != 0 && src_len_addr != 0 {
+                    let nl = sockaddr_nl_bytes(0, 0);
+                    let _ = write_linux_sockaddr(memory, src_addr, src_len_addr, &nl);
+                }
+            }
+            return Ok(drained);
+        }
         let (host_fd, family) = match self.host_socket_lookup(fd) {
             Ok(t) => t,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
@@ -5070,6 +5495,13 @@ impl SyscallDispatcher {
         let optname = ctx.request.arg(2) as i32;
         let optval_addr = ctx.request.arg(3);
         let optlen = ctx.request.arg(4) as u32;
+        // AF_NETLINK setsockopt: glibc/`ip` set SO_RCVBUF / SO_SNDBUF and
+        // netlink-specific options (NETLINK_*). We don't model buffer
+        // pressure, so just accept them.
+        if self.fd_is_netlink(fd) {
+            let _ = (level, optname, optval_addr, optlen);
+            return Ok(DispatchOutcome::Returned { value: 0 });
+        }
         let (host_fd, _family) = match self.host_socket_lookup(fd) {
             Ok(t) => t,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
@@ -5119,6 +5551,18 @@ impl SyscallDispatcher {
         let optname = ctx.request.arg(2) as i32;
         let optval_addr = ctx.request.arg(3);
         let optlen_addr = ctx.request.arg(4);
+        // AF_NETLINK getsockopt: answer the common SO_TYPE query (callers
+        // verify the socket is SOCK_RAW); everything else returns 0.
+        if self.fd_is_netlink(fd) {
+            let val: i32 = if level == LINUX_SOL_SOCKET && optname == LINUX_SO_TYPE {
+                LINUX_SOCK_RAW
+            } else {
+                0
+            };
+            let _ = memory.write_bytes(optval_addr, &val.to_ne_bytes());
+            let _ = memory.write_bytes(optlen_addr, &4u32.to_ne_bytes());
+            return Ok(DispatchOutcome::Returned { value: 0 });
+        }
         let (host_fd, _family) = match self.host_socket_lookup(fd) {
             Ok(t) => t,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
@@ -5187,9 +5631,14 @@ impl SyscallDispatcher {
         let fd = ctx.request.arg(0) as i32;
         let msg_addr = ctx.request.arg(1);
         let flags = ctx.request.arg(3) as i32;
-        let (host_fd, family) = match self.host_socket_lookup(fd) {
-            Ok(t) => t,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        let is_netlink = self.fd_is_netlink(fd);
+        let (host_fd, family) = if is_netlink {
+            (-1, LINUX_AF_NETLINK)
+        } else {
+            match self.host_socket_lookup(fd) {
+                Ok(t) => t,
+                Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            }
         };
         let msg = match read_linux_msghdr(memory, msg_addr) {
             Ok(m) => m,
@@ -5208,6 +5657,11 @@ impl SyscallDispatcher {
                 Err(_) => return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT }),
             };
             data.extend_from_slice(&chunk);
+        }
+        // AF_NETLINK: parse the assembled request and queue a synthetic
+        // dump reply, ignoring the destination sockaddr (always the kernel).
+        if is_netlink {
+            return Ok(self.netlink_send(fd, &data));
         }
         let host_flags = linux_to_host_msg_flags(flags);
         let n = if msg.name == 0 || msg.namelen == 0 {
@@ -5252,9 +5706,14 @@ impl SyscallDispatcher {
         let fd = ctx.request.arg(0) as i32;
         let msg_addr = ctx.request.arg(1);
         let flags = ctx.request.arg(2) as i32;
-        let (host_fd, family) = match self.host_socket_lookup(fd) {
-            Ok(t) => t,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        let is_netlink = self.fd_is_netlink(fd);
+        let (host_fd, family) = if is_netlink {
+            (-1, LINUX_AF_NETLINK)
+        } else {
+            match self.host_socket_lookup(fd) {
+                Ok(t) => t,
+                Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            }
         };
         let msg = match read_linux_msghdr(memory, msg_addr) {
             Ok(m) => m,
@@ -5264,6 +5723,46 @@ impl SyscallDispatcher {
             Ok(v) => v,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
+        // AF_NETLINK: drain the queued dump reply into the iovecs, fill in
+        // the source sockaddr_nl (kernel; pid=0), and zero controllen/flags.
+        if is_netlink {
+            let total: usize = iovecs.iter().map(|iov| iov.iov_len as usize).sum();
+            let chunk = self.netlink_drain(fd, total);
+            let n = chunk.len();
+            let mut remaining = n;
+            let mut cursor = 0usize;
+            for iov in &iovecs {
+                if remaining == 0 {
+                    break;
+                }
+                let take = remaining.min(iov.iov_len as usize);
+                if take > 0 {
+                    if memory
+                        .write_bytes(iov.iov_base, &chunk[cursor..cursor + take])
+                        .is_err()
+                    {
+                        return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
+                    }
+                    cursor += take;
+                    remaining -= take;
+                }
+            }
+            if msg.name != 0 && msg.namelen != 0 {
+                let nl = sockaddr_nl_bytes(0, 0);
+                let write_len = (nl.len() as u32).min(msg.namelen);
+                if write_len > 0
+                    && memory
+                        .write_bytes(msg.name, &nl[..write_len as usize])
+                        .is_err()
+                {
+                    return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
+                }
+                let _ = memory.write_bytes(msg_addr + 8, &(nl.len() as u32).to_ne_bytes());
+            }
+            let _ = memory.write_bytes(msg_addr + 40, &0u64.to_ne_bytes());
+            let _ = memory.write_bytes(msg_addr + 48, &0i32.to_ne_bytes());
+            return Ok(DispatchOutcome::Returned { value: n as i64 });
+        }
         let total: usize = iovecs.iter().map(|iov| iov.iov_len as usize).sum();
         let mut buf = vec![0u8; total];
         let mut sa = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
@@ -5749,7 +6248,8 @@ impl SyscallDispatcher {
             OpenDescription::PipeReader { .. }
             | OpenDescription::PipeWriter { .. }
             | OpenDescription::HostPipe { .. }
-            | OpenDescription::HostSocket { .. } => {
+            | OpenDescription::HostSocket { .. }
+            | OpenDescription::Netlink { .. } => {
                 return Ok(DispatchOutcome::Errno {
                     errno: LINUX_ESPIPE,
                 });
@@ -5791,7 +6291,8 @@ impl SyscallDispatcher {
             | OpenDescription::PipeReader { .. }
             | OpenDescription::PipeWriter { .. }
             | OpenDescription::HostPipe { .. }
-            | OpenDescription::HostSocket { .. } => {}
+            | OpenDescription::HostSocket { .. }
+            | OpenDescription::Netlink { .. } => {}
         }
         Ok(DispatchOutcome::Returned { value: next })
     }
@@ -5956,9 +6457,14 @@ impl SyscallDispatcher {
         let offset = ctx.arg(5);
         let memory = &mut *ctx.memory;
 
+        // Linux requires exactly one of MAP_SHARED / MAP_PRIVATE. We model
+        // both as a private snapshot copy of the file contents (we don't
+        // implement live MAP_SHARED writeback / cross-process coherence),
+        // which is sufficient for callers that mmap+msync a file.
+        let map_type = flags & (LINUX_MAP_SHARED | LINUX_MAP_PRIVATE);
         if length == 0
             || prot & !(LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC) != 0
-            || flags & LINUX_MAP_PRIVATE == 0
+            || (map_type != LINUX_MAP_SHARED && map_type != LINUX_MAP_PRIVATE)
             || (flags & LINUX_MAP_ANONYMOUS == 0 && offset % LINUX_PAGE_SIZE != 0)
             || (flags & LINUX_MAP_FIXED != 0 && requested % LINUX_PAGE_SIZE != 0)
         {
@@ -6028,7 +6534,8 @@ impl SyscallDispatcher {
                 | OpenDescription::PipeReader { .. }
                 | OpenDescription::PipeWriter { .. }
                 | OpenDescription::HostPipe { .. }
-                | OpenDescription::HostSocket { .. } => {
+                | OpenDescription::HostSocket { .. }
+                | OpenDescription::Netlink { .. } => {
                     return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
                 }
             }
@@ -6459,8 +6966,9 @@ impl SyscallDispatcher {
                 interval,
                 deadline,
                 expirations,
-                ..
+                status_flags,
             } => {
+                let nonblocking = *status_flags & LINUX_TFD_NONBLOCK != 0;
                 return Ok(read_timerfd(
                     memory,
                     address,
@@ -6469,6 +6977,7 @@ impl SyscallDispatcher {
                     interval,
                     deadline,
                     expirations,
+                    nonblocking,
                 ));
             }
             OpenDescription::PipeReader { pipe, status_flags } => {
@@ -6497,6 +7006,13 @@ impl SyscallDispatcher {
             }
             OpenDescription::HostSocket { host_fd, .. } => {
                 return Ok(read_host_pipe(memory, address, length, *host_fd));
+            }
+            // Netlink: drain whatever a prior dump request queued. A bare
+            // read(2) is rare on netlink sockets (recvmsg is the norm), but
+            // model it as draining the synthetic response so it doesn't
+            // wedge a caller.
+            OpenDescription::Netlink { recv_queue, .. } => {
+                return Ok(drain_netlink_queue(memory, address, length, recv_queue));
             }
             // Real host file: libc::read advances the kernel offset
             // (shared across fork). read_host_pipe is just a
@@ -6574,7 +7090,8 @@ impl SyscallDispatcher {
             | OpenDescription::PipeReader { .. }
             | OpenDescription::PipeWriter { .. }
             | OpenDescription::HostPipe { .. }
-            | OpenDescription::HostSocket { .. } => {
+            | OpenDescription::HostSocket { .. }
+            | OpenDescription::Netlink { .. } => {
                 return Ok(DispatchOutcome::Errno {
                     errno: LINUX_EINVAL,
                 });
@@ -6629,7 +7146,8 @@ impl SyscallDispatcher {
             | OpenDescription::PipeReader { .. }
             | OpenDescription::PipeWriter { .. }
             | OpenDescription::HostPipe { .. }
-            | OpenDescription::HostSocket { .. } => {
+            | OpenDescription::HostSocket { .. }
+            | OpenDescription::Netlink { .. } => {
                 return Ok(DispatchOutcome::Errno {
                     errno: LINUX_EINVAL,
                 });
@@ -6713,7 +7231,8 @@ impl SyscallDispatcher {
             | OpenDescription::PipeReader { .. }
             | OpenDescription::PipeWriter { .. }
             | OpenDescription::HostPipe { .. }
-            | OpenDescription::HostSocket { .. } => {
+            | OpenDescription::HostSocket { .. }
+            | OpenDescription::Netlink { .. } => {
                 return Ok(DispatchOutcome::Errno {
                     errno: LINUX_EINVAL,
                 });
@@ -6776,6 +7295,7 @@ impl SyscallDispatcher {
             | OpenDescription::TimerFd { .. }
             | OpenDescription::HostPipe { .. }
             | OpenDescription::HostSocket { .. }
+            | OpenDescription::Netlink { .. }
             | OpenDescription::Epoll { .. } => LINUX_ESPIPE,
         };
         Ok(DispatchOutcome::Errno { errno })
@@ -6860,6 +7380,7 @@ impl SyscallDispatcher {
             | OpenDescription::TimerFd { .. }
             | OpenDescription::HostPipe { .. }
             | OpenDescription::HostSocket { .. }
+            | OpenDescription::Netlink { .. }
             | OpenDescription::Epoll { .. } => LINUX_ESPIPE,
         };
         Ok(DispatchOutcome::Errno { errno })
@@ -7062,7 +7583,8 @@ impl SyscallDispatcher {
             | OpenDescription::PipeReader { .. }
             | OpenDescription::PipeWriter { .. }
             | OpenDescription::HostPipe { .. }
-            | OpenDescription::HostSocket { .. } => Ok(Err(LINUX_EINVAL)),
+            | OpenDescription::HostSocket { .. }
+            | OpenDescription::Netlink { .. } => Ok(Err(LINUX_EINVAL)),
         }
     }
 
@@ -7094,7 +7616,8 @@ impl SyscallDispatcher {
             | OpenDescription::PipeReader { .. }
             | OpenDescription::PipeWriter { .. }
             | OpenDescription::HostPipe { .. }
-            | OpenDescription::HostSocket { .. } => return Err(LINUX_EINVAL),
+            | OpenDescription::HostSocket { .. }
+            | OpenDescription::Netlink { .. } => return Err(LINUX_EINVAL),
         };
         let available = contents.get(offset..).unwrap_or_default();
         let write_len = available.len().min(count);
@@ -7238,6 +7761,19 @@ impl SyscallDispatcher {
         &mut self,
         _ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
+        Ok(DispatchOutcome::Returned { value: 0 })
+    }
+
+    fn syncfs<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let fd = ctx.arg(0) as i32;
+        if !self.fd_is_valid(fd) {
+            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+        }
+        // Like sync/fdatasync: we don't model durable disk state, so a
+        // successful flush is a no-op that returns 0.
         Ok(DispatchOutcome::Returned { value: 0 })
     }
 
@@ -8328,7 +8864,7 @@ impl SyscallDispatcher {
             | OpenDescription::HostPipe { .. } => {
                 return write_synthetic_stat(memory, statbuf, "pipe:[carrick]", 0);
             }
-            OpenDescription::HostSocket { .. } => {
+            OpenDescription::HostSocket { .. } | OpenDescription::Netlink { .. } => {
                 return write_synthetic_stat(memory, statbuf, "socket:[carrick]", 0);
             }
         };
@@ -8372,7 +8908,7 @@ impl SyscallDispatcher {
             | OpenDescription::HostPipe { .. } => {
                 return write_synthetic_statx(memory, statxbuf, "pipe:[carrick]", 0);
             }
-            OpenDescription::HostSocket { .. } => {
+            OpenDescription::HostSocket { .. } | OpenDescription::Netlink { .. } => {
                 return write_synthetic_statx(memory, statxbuf, "socket:[carrick]", 0);
             }
         };
@@ -8412,7 +8948,8 @@ impl SyscallDispatcher {
                 | OpenDescription::PipeReader { .. }
                 | OpenDescription::PipeWriter { .. }
             | OpenDescription::HostPipe { .. }
-            | OpenDescription::HostSocket { .. } => Err(LINUX_ENOTDIR),
+            | OpenDescription::HostSocket { .. }
+            | OpenDescription::Netlink { .. } => Err(LINUX_ENOTDIR),
             },
             None => Err(LINUX_EBADF),
         }
@@ -8421,6 +8958,46 @@ impl SyscallDispatcher {
 
 fn is_valid_signum(signum: u64) -> bool {
     signum <= LINUX_MAX_SIGNUM
+}
+
+/// Bit mask for `signum` (1..=64) within a Linux `sigset_t` word, or
+/// `None` if out of range.
+fn sigmask_bit(signum: i32) -> Option<u64> {
+    if (1..=64).contains(&signum) {
+        Some(1u64 << (signum - 1))
+    } else {
+        None
+    }
+}
+
+/// Complete a successful `rt_sigtimedwait`: write a minimal `siginfo_t`
+/// (just `si_signo`) to `info_ptr` if non-NULL and return the signal
+/// number, matching the kernel's success contract.
+fn rt_sigtimedwait_deliver(
+    memory: &mut impl GuestMemory,
+    info_ptr: u64,
+    signum: i32,
+) -> DispatchOutcome {
+    if info_ptr != 0 {
+        let _ = memory.write_bytes(info_ptr, &signum.to_le_bytes());
+    }
+    DispatchOutcome::Returned {
+        value: signum as i64,
+    }
+}
+
+/// True iff a kill/tkill/tgkill `target` refers to the guest itself.
+/// getpid() exposes the host pid, so glibc uses that as the self-id;
+/// accept it, LINUX_BOOTSTRAP_PID (1), and — for the pid form — 0
+/// (process-group, which is just us in the single-process bootstrap).
+fn signal_is_self_target(target: i64, tid_required: bool) -> bool {
+    let host_pid = std::process::id() as i64;
+    let bootstrap_pid = LINUX_BOOTSTRAP_PID as i64;
+    if tid_required {
+        target == host_pid || target == bootstrap_pid
+    } else {
+        target == host_pid || target == bootstrap_pid || target == 0
+    }
 }
 
 fn bootstrap_signal_send(target: i64, tid_required: bool, signum: u64) -> DispatchOutcome {
@@ -8748,6 +9325,10 @@ fn linux_clock_duration(clock_id: u64) -> Option<Duration> {
         | LINUX_CLOCK_MONOTONIC_RAW
         | LINUX_CLOCK_MONOTONIC_COARSE
         | LINUX_CLOCK_BOOTTIME => Some(monotonic_duration()),
+        // Linux↔macOS clock-id numbering DIFFERS, so map the Linux ids to
+        // the host's symbolic libc constants rather than passing through.
+        LINUX_CLOCK_PROCESS_CPUTIME_ID => host_clock_duration(libc::CLOCK_PROCESS_CPUTIME_ID),
+        LINUX_CLOCK_THREAD_CPUTIME_ID => host_clock_duration(libc::CLOCK_THREAD_CPUTIME_ID),
         _ => None,
     }
 }
@@ -8757,6 +9338,8 @@ fn linux_clock_is_known(clock_id: u64) -> bool {
         clock_id,
         LINUX_CLOCK_REALTIME
             | LINUX_CLOCK_MONOTONIC
+            | LINUX_CLOCK_PROCESS_CPUTIME_ID
+            | LINUX_CLOCK_THREAD_CPUTIME_ID
             | LINUX_CLOCK_MONOTONIC_RAW
             | LINUX_CLOCK_REALTIME_COARSE
             | LINUX_CLOCK_MONOTONIC_COARSE
@@ -8901,8 +9484,27 @@ fn realtime_duration() -> Duration {
         .unwrap_or(Duration::ZERO)
 }
 
+/// Read a host (macOS) POSIX clock via `libc::clock_gettime`. `clock_id`
+/// MUST be a host symbolic `libc::CLOCK_*` constant (Linux numbering
+/// differs and is mapped by callers). Returns `None` only on failure.
+fn host_clock_duration(clock_id: libc::clockid_t) -> Option<Duration> {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid, properly-aligned timespec we own.
+    let rc = unsafe { libc::clock_gettime(clock_id, &mut ts) };
+    if rc != 0 {
+        return None;
+    }
+    Some(Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32))
+}
+
 fn monotonic_duration() -> Duration {
-    MONOTONIC_START.get_or_init(Instant::now).elapsed()
+    // On real Linux CLOCK_MONOTONIC/CLOCK_BOOTTIME report system uptime (a
+    // large, monotonic value). Use the host's real monotonic clock so tv_sec
+    // is large rather than seconds-since-carrick-start (sub-second).
+    host_clock_duration(libc::CLOCK_MONOTONIC).unwrap_or(Duration::ZERO)
 }
 
 fn linux_timespec_from_duration(duration: Duration) -> LinuxTimespec {
@@ -9716,13 +10318,33 @@ fn read_timerfd(
     interval: &Option<Duration>,
     deadline: &mut Option<Duration>,
     expirations: &mut u64,
+    nonblocking: bool,
 ) -> DispatchOutcome {
     if length < core::mem::size_of::<LinuxTimerfdExpirations>() {
         return DispatchOutcome::Errno {
             errno: LINUX_EINVAL,
         };
     }
-    let (ready, next_deadline) = timerfd_expirations(clock_id, *interval, *deadline, *expirations);
+    let (mut ready, mut next_deadline) =
+        timerfd_expirations(clock_id, *interval, *deadline, *expirations);
+    // A blocking timerfd read must wait until the timer fires rather than
+    // returning EAGAIN. If the timer hasn't expired yet but there IS an armed
+    // deadline, sleep until that deadline (real wall-clock) and recompute. If
+    // there's no deadline (no timer armed) we can't know when to wake, so we
+    // fall through to EAGAIN to avoid wedging the conformance harness.
+    if ready == 0 && !nonblocking {
+        if let Some(target) = next_deadline {
+            if let Some(now) = linux_clock_duration(clock_id) {
+                let wait = target.saturating_sub(now);
+                if !wait.is_zero() {
+                    std::thread::sleep(wait);
+                }
+            }
+            let recomputed = timerfd_expirations(clock_id, *interval, Some(target), *expirations);
+            ready = recomputed.0;
+            next_deadline = recomputed.1;
+        }
+    }
     *deadline = next_deadline;
     *expirations = ready;
     if *expirations == 0 {
@@ -10458,7 +11080,6 @@ const LINUX_AF_UNSPEC: i32 = 0;
 const LINUX_AF_UNIX: i32 = 1;
 const LINUX_AF_INET: i32 = 2;
 const LINUX_AF_INET6: i32 = 10;
-#[allow(dead_code)]
 const LINUX_AF_NETLINK: i32 = 16;
 #[allow(dead_code)]
 const LINUX_AF_PACKET: i32 = 17;
@@ -10501,6 +11122,162 @@ fn linux_to_host_socktype(t: i32) -> i32 {
         LINUX_SOCK_SEQPACKET => libc::SOCK_SEQPACKET,
         _ => t,
     }
+}
+
+// ----- AF_NETLINK (rtnetlink) synthesis -----------------------------------
+
+/// Linux `NLMSG_ALIGNTO` — netlink messages and attributes are 4-byte aligned.
+const NLMSG_ALIGNTO: usize = 4;
+
+/// Parse a Linux `sockaddr_nl` (family(2) pad(2) pid(4) groups(4) = 12 bytes)
+/// from guest memory, returning `(nl_pid, nl_groups)`. Missing / short
+/// addresses yield zeros (kernel treats pid=0 as "auto-assign").
+fn read_sockaddr_nl(memory: &impl GuestMemory, addr: u64, addrlen: u32) -> (u32, u32) {
+    if addr == 0 || addrlen < 12 {
+        return (0, 0);
+    }
+    match memory.read_bytes(addr, 12) {
+        Ok(b) => {
+            let pid = u32::from_ne_bytes([b[4], b[5], b[6], b[7]]);
+            let groups = u32::from_ne_bytes([b[8], b[9], b[10], b[11]]);
+            (pid, groups)
+        }
+        Err(_) => (0, 0),
+    }
+}
+
+/// Build a Linux `sockaddr_nl` byte buffer for getsockname / recv source.
+fn sockaddr_nl_bytes(pid: u32, groups: u32) -> Vec<u8> {
+    let mut out = vec![0u8; 12];
+    out[0..2].copy_from_slice(&(LINUX_AF_NETLINK as u16).to_ne_bytes());
+    // bytes 2..4 are nl_pad (zero)
+    out[4..8].copy_from_slice(&pid.to_ne_bytes());
+    out[8..12].copy_from_slice(&groups.to_ne_bytes());
+    out
+}
+
+/// Generic read(2)-style drain of a netlink recv queue into guest memory.
+fn drain_netlink_queue(
+    memory: &mut impl GuestMemory,
+    address: u64,
+    length: usize,
+    queue: &mut VecDeque<u8>,
+) -> DispatchOutcome {
+    let take = queue.len().min(length);
+    if take == 0 {
+        return DispatchOutcome::Returned { value: 0 };
+    }
+    let chunk: Vec<u8> = queue.drain(..take).collect();
+    if memory.write_bytes(address, &chunk).is_err() {
+        return DispatchOutcome::Errno {
+            errno: LINUX_EFAULT,
+        };
+    }
+    DispatchOutcome::Returned {
+        value: chunk.len() as i64,
+    }
+}
+
+/// Append a 4-byte-aligned rtattr (TLV) to `buf`.
+fn push_rtattr(buf: &mut Vec<u8>, rta_type: u16, payload: &[u8]) {
+    let rta_len = (std::mem::size_of::<LinuxRtAttr>() + payload.len()) as u16;
+    let hdr = LinuxRtAttr { rta_len, rta_type };
+    buf.extend_from_slice(hdr.as_bytes());
+    buf.extend_from_slice(payload);
+    while buf.len() % NLMSG_ALIGNTO != 0 {
+        buf.push(0);
+    }
+}
+
+/// Wrap an already-built payload (header struct + attributes) in an
+/// `nlmsghdr` and append it to `out`, 4-byte aligned. `nlmsg_len` covers
+/// the header plus payload (unaligned, per the kernel).
+fn push_nlmsg(out: &mut Vec<u8>, nlmsg_type: u16, seq: u32, pid: u32, payload: &[u8]) {
+    let hdr_size = std::mem::size_of::<LinuxNlMsgHdr>();
+    let nlmsg_len = (hdr_size + payload.len()) as u32;
+    let hdr = LinuxNlMsgHdr {
+        nlmsg_len,
+        nlmsg_type,
+        nlmsg_flags: LINUX_NLM_F_MULTI,
+        nlmsg_seq: seq,
+        nlmsg_pid: pid,
+    };
+    out.extend_from_slice(hdr.as_bytes());
+    out.extend_from_slice(payload);
+    while out.len() % NLMSG_ALIGNTO != 0 {
+        out.push(0);
+    }
+}
+
+/// Append a terminating NLMSG_DONE to `out`.
+fn push_nlmsg_done(out: &mut Vec<u8>, seq: u32, pid: u32) {
+    // NLMSG_DONE carries a 4-byte error/return code payload (0 = success).
+    push_nlmsg(out, LINUX_NLMSG_DONE, seq, pid, &0i32.to_ne_bytes());
+}
+
+/// Build the synthetic rtnetlink reply for a guest's request. We inspect
+/// the leading nlmsghdr's `nlmsg_type`:
+///   - RTM_GETLINK  -> one RTM_NEWLINK for `lo`, then NLMSG_DONE
+///   - RTM_GETADDR  -> one RTM_NEWADDR for `lo` (127.0.0.1/8), then NLMSG_DONE
+///   - anything else -> a bare NLMSG_DONE (the dump is "empty")
+/// All replies are NLM_F_MULTI dumps terminated by NLMSG_DONE, which is
+/// what glibc's __check_pf and `ip` expect.
+fn build_netlink_reply(request: &[u8], pid: u32) -> Vec<u8> {
+    let hdr_size = std::mem::size_of::<LinuxNlMsgHdr>();
+    let (req_type, seq) = if request.len() >= hdr_size {
+        match LinuxNlMsgHdr::read_from_prefix(request) {
+            Ok((h, _)) => (h.nlmsg_type, h.nlmsg_seq),
+            Err(_) => (0u16, 0u32),
+        }
+    } else {
+        (0, 0)
+    };
+
+    let mut out = Vec::new();
+    match req_type {
+        LINUX_RTM_GETLINK => {
+            let mut payload = Vec::new();
+            let ifi = LinuxIfInfoMsg {
+                ifi_family: 0, // AF_UNSPEC
+                ifi_pad: 0,
+                ifi_type: LINUX_ARPHRD_LOOPBACK,
+                ifi_index: 1,
+                ifi_flags: LINUX_IFF_UP | LINUX_IFF_LOOPBACK | LINUX_IFF_RUNNING,
+                ifi_change: 0,
+            };
+            payload.extend_from_slice(ifi.as_bytes());
+            // IFLA_IFNAME is a NUL-terminated string.
+            push_rtattr(&mut payload, LINUX_IFLA_IFNAME, b"lo\0");
+            // IFLA_ADDRESS: loopback hardware address (6 zero bytes).
+            push_rtattr(&mut payload, LINUX_IFLA_ADDRESS, &[0u8; 6]);
+            push_nlmsg(&mut out, LINUX_RTM_NEWLINK, seq, pid, &payload);
+            push_nlmsg_done(&mut out, seq, pid);
+        }
+        LINUX_RTM_GETADDR => {
+            let mut payload = Vec::new();
+            let ifa = LinuxIfAddrMsg {
+                ifa_family: LINUX_AF_INET as u8,
+                ifa_prefixlen: 8,
+                ifa_flags: 0,
+                ifa_scope: 254, // RT_SCOPE_HOST
+                ifa_index: 1,
+            };
+            payload.extend_from_slice(ifa.as_bytes());
+            let loopback = [127u8, 0, 0, 1];
+            push_rtattr(&mut payload, LINUX_IFA_ADDRESS, &loopback);
+            push_rtattr(&mut payload, LINUX_IFA_LOCAL, &loopback);
+            push_rtattr(&mut payload, LINUX_IFA_LABEL, b"lo\0");
+            push_nlmsg(&mut out, LINUX_RTM_NEWADDR, seq, pid, &payload);
+            push_nlmsg_done(&mut out, seq, pid);
+        }
+        _ => {
+            // Unmodelled request (e.g. RTM_GETROUTE, RTM_GETNEIGH): return
+            // an empty dump so the caller's enumeration loop terminates
+            // cleanly rather than blocking.
+            push_nlmsg_done(&mut out, seq, pid);
+        }
+    }
+    out
 }
 
 const LINUX_MSG_OOB: i32 = 0x0001;
