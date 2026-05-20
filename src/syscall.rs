@@ -220,6 +220,7 @@ const AARCH64_SYSCALLS: &[Syscall] = &[
     syscall(220, "clone", "process", SupportLevel::BringUp),
     syscall(221, "execve", "process", SupportLevel::BringUp),
     syscall(222, "mmap", "mm", SupportLevel::BringUp),
+    syscall(223, "fadvise64", "mm", SupportLevel::BringUp),
     syscall(226, "mprotect", "mm", SupportLevel::BringUp),
     syscall(227, "msync", "mm", SupportLevel::BringUp),
     syscall(228, "mlock", "mm", SupportLevel::BringUp),
