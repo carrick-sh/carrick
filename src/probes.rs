@@ -82,7 +82,7 @@ pub fn fork_pre(pc: u64, elr: u64, cpsr: u64) {
 // is genuinely zero-cost when no DTrace consumer is attached.
 pub fn path_open(path: &str, result_size: u64, errno: i32) {
     carrick_usdt::path__open!(|| (
-        unsafe { libc::getpid() as u32 },
+        libc::getpid() as u32,
         path,
         result_size,
         errno
@@ -90,7 +90,7 @@ pub fn path_open(path: &str, result_size: u64, errno: i32) {
 }
 
 pub fn guest_exit(code: i32) {
-    carrick_usdt::guest__exit!(|| (unsafe { libc::getpid() as u32 }, code));
+    carrick_usdt::guest__exit!(|| (libc::getpid() as u32, code));
 }
 
 pub fn execve_argv(path: &str, argv: &[String]) {
@@ -101,7 +101,7 @@ pub fn execve_argv(path: &str, argv: &[String]) {
     // ones that matter for zero-cost-when-disabled.
     let joined = argv.join(" ");
     carrick_usdt::execve__argv!(|| (
-        unsafe { libc::getpid() as u32 },
+        libc::getpid() as u32,
         path,
         joined.as_str()
     ));
@@ -109,7 +109,7 @@ pub fn execve_argv(path: &str, argv: &[String]) {
 
 pub fn host_pipe_io(host_fd: i32, dir: i32, n: i64) {
     carrick_usdt::host__pipe__io!(|| (
-        unsafe { libc::getpid() as u32 },
+        libc::getpid() as u32,
         host_fd,
         dir,
         n
