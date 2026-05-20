@@ -33,6 +33,31 @@ const DTRACE_WORKSTATUS_DONE: c_int = 1;
 const PS_DEAD: c_int = 5;
 const PS_UNDEAD: c_int = 4;
 
+// libdtrace consume callbacks. dtrace_work hands each fired probe to `probe`
+// and each data record to `rec`. Returning DTRACE_CONSUME_THIS (0) tells
+// libdtrace to format the record (printf/printa) to `fp` itself; passing NULL
+// callbacks instead makes it skip all formatting, which is why our live
+// stream was silent. Mirrors dtrace(1)'s chew/chewrec.
+const DTRACE_CONSUME_THIS: c_int = 0;
+const DTRACE_CONSUME_NEXT: c_int = 1;
+
+type ConsumeProbeFn = extern "C" fn(data: *const c_void, arg: *mut c_void) -> c_int;
+type ConsumeRecFn =
+    extern "C" fn(data: *const c_void, rec: *const c_void, arg: *mut c_void) -> c_int;
+
+extern "C" fn chew(_data: *const c_void, _arg: *mut c_void) -> c_int {
+    DTRACE_CONSUME_THIS
+}
+
+extern "C" fn chewrec(_data: *const c_void, rec: *const c_void, _arg: *mut c_void) -> c_int {
+    // NULL rec marks the end of this probe's records — advance to the next.
+    if rec.is_null() {
+        DTRACE_CONSUME_NEXT
+    } else {
+        DTRACE_CONSUME_THIS
+    }
+}
+
 #[repr(C)]
 struct DtraceHdl(c_void);
 #[repr(C)]
@@ -74,8 +99,8 @@ unsafe extern "C" {
     fn dtrace_work(
         hdl: *mut DtraceHdl,
         fp: *mut libc_file,
-        probe: *mut c_void,
-        rec: *mut c_void,
+        probe: ConsumeProbeFn,
+        rec: ConsumeRecFn,
         arg: *mut c_void,
     ) -> c_int;
     fn dtrace_aggregate_snap(hdl: *mut DtraceHdl) -> c_int;
@@ -94,6 +119,7 @@ struct libc_file(c_void);
 unsafe extern "C" {
     #[link_name = "__stdoutp"]
     static STDOUT_FP: *mut libc_file;
+    fn fflush(stream: *mut libc_file) -> c_int;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -237,11 +263,16 @@ pub fn run_child_under_dtrace(
             dtrace_work(
                 hdl,
                 STDOUT_FP,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
+                chew,
+                chewrec,
                 std::ptr::null_mut(),
             )
         };
+        // dtrace_work writes events into the C stdio buffer, which is
+        // block-buffered when stdout is a pipe/file. Flush every cycle so the
+        // live stream stays live even when the traced child never exits (e.g.
+        // a deadlock we're trying to diagnose).
+        unsafe { fflush(STDOUT_FP) };
         let proc_state = unsafe { dtrace_proc_state(hdl, proc_h) };
         let child_terminal = proc_state == PS_DEAD || proc_state == PS_UNDEAD;
         match status {

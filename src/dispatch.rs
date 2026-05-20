@@ -1039,6 +1039,7 @@ impl SyscallDispatcher {
             215 => self.munmap(request),
             216 => self.mremap(request, memory),
             220 => self.clone(request),
+            435 => self.clone3(request, memory),
             221 => self.execve(request, memory),
             222 => self.mmap(request, memory)?,
             226 => self.mprotect(request, memory),
@@ -1067,9 +1068,17 @@ impl SyscallDispatcher {
                     name,
                     request.args,
                 ));
-                DispatchOutcome::Errno {
-                    errno: LINUX_ENOSYS,
-                }
+                panic!(
+                    "unimplemented syscall {} ({}) args=[{:#x}, {:#x}, {:#x}, {:#x}, {:#x}, {:#x}]",
+                    request.number,
+                    name,
+                    request.arg(0),
+                    request.arg(1),
+                    request.arg(2),
+                    request.arg(3),
+                    request.arg(4),
+                    request.arg(5),
+                );
             }
         };
 
@@ -1664,11 +1673,17 @@ impl SyscallDispatcher {
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
 
-        // Build a pollfd array from the union of the three sets. Each fd
-        // gets the union of POLLIN/POLLOUT/POLLPRI flags. Then hand to
-        // libc::poll for kernel-blocking with the requested timeout.
-        let mut pollfds: Vec<libc::pollfd> = Vec::new();
+        // Collect the union of the three sets into per-fd entries, and try to
+        // map each guest fd to a real host fd. Then route exactly like ppoll:
+        //   - all fds host-backed → one libc::poll (kernel blocks efficiently);
+        //   - any fd synthetic (eventfd/timerfd/epoll/in-memory pipe) → the
+        //     poll_ready_events readiness loop, which is correct for those.
+        // The old code unwrap_or'd synthetic fds into the guest fd *number* and
+        // polled that as a host fd — which blocks on carrick's own fds and
+        // deadlocks. Each fd gets POLLIN/POLLOUT/POLLPRI per its set membership.
         let mut owners: Vec<(i32, i16)> = Vec::new(); // (fd, requested_mask)
+        let mut events_list: Vec<i16> = Vec::new();
+        let mut host_map: Vec<Option<i32>> = Vec::new();
         for fd in 0..nfds {
             let r = read_set.as_ref().map_or(false, |s| fd_set_contains(s, fd));
             let w = write_set.as_ref().map_or(false, |s| fd_set_contains(s, fd));
@@ -1680,42 +1695,88 @@ impl SyscallDispatcher {
             if !self.fd_is_valid(fd_i32) {
                 return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
             }
-            let host_fd = self
-                .host_fd_for_poll(fd_i32)
-                .unwrap_or(fd_i32);
             let mut events: i16 = 0;
             if r { events |= libc::POLLIN; }
             if w { events |= libc::POLLOUT; }
             if e { events |= libc::POLLPRI; }
-            pollfds.push(libc::pollfd { fd: host_fd, events, revents: 0 });
             let mut req_mask: i16 = 0;
             if r { req_mask |= 0x01; }
             if w { req_mask |= 0x02; }
             if e { req_mask |= 0x04; }
             owners.push((fd_i32, req_mask));
+            events_list.push(events);
+            host_map.push(self.host_fd_for_poll(fd_i32));
         }
 
-        if !pollfds.is_empty() {
+        // revents per entry, filled by whichever path runs.
+        let mut revents: Vec<i16> = vec![0; owners.len()];
+        let all_host: Option<Vec<i32>> = host_map.iter().copied().collect();
+
+        if owners.is_empty() {
+            if timeout_ms > 0 {
+                unsafe {
+                    let ts = libc::timespec {
+                        tv_sec: (timeout_ms / 1000) as libc::time_t,
+                        tv_nsec: ((timeout_ms % 1000) as i64 * 1_000_000) as libc::c_long,
+                    };
+                    libc::nanosleep(&ts, std::ptr::null_mut());
+                }
+            }
+        } else if let Some(host_fds) = all_host {
+            let mut pollfds: Vec<libc::pollfd> = host_fds
+                .iter()
+                .zip(events_list.iter())
+                .map(|(hf, ev)| libc::pollfd { fd: *hf, events: *ev, revents: 0 })
+                .collect();
             let n = unsafe {
-                libc::poll(
-                    pollfds.as_mut_ptr(),
-                    pollfds.len() as libc::nfds_t,
-                    timeout_ms,
-                )
+                libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, timeout_ms)
             };
             if n < 0 {
                 return Ok(DispatchOutcome::Errno { errno: host_errno() });
             }
-        } else if timeout_ms > 0 {
-            // No fds and a real timeout: just sleep.
-            unsafe {
-                let ts = libc::timespec {
-                    tv_sec: (timeout_ms / 1000) as libc::time_t,
-                    tv_nsec: ((timeout_ms % 1000) as i64 * 1_000_000) as libc::c_long,
-                };
-                libc::nanosleep(&ts, std::ptr::null_mut());
+            for (slot, p) in revents.iter_mut().zip(pollfds.iter()) {
+                *slot = p.revents;
+            }
+        } else {
+            // Mixed/synthetic: per-fd readiness with nanosleep slicing.
+            let mut deadline_attempts = 0u32;
+            loop {
+                let mut any = false;
+                for (i, (fd, _)) in owners.iter().enumerate() {
+                    let rev = self.poll_ready_events(*fd, events_list[i]);
+                    revents[i] = rev;
+                    if rev != 0 {
+                        any = true;
+                    }
+                }
+                if any || timeout_ms == 0 {
+                    break;
+                }
+                const SLICE_MS: u32 = 10;
+                unsafe {
+                    let ts = libc::timespec {
+                        tv_sec: 0,
+                        tv_nsec: (SLICE_MS as i64) * 1_000_000,
+                    };
+                    libc::nanosleep(&ts, std::ptr::null_mut());
+                }
+                deadline_attempts += 1;
+                if timeout_ms > 0 {
+                    if deadline_attempts.saturating_mul(SLICE_MS) as i32 >= timeout_ms {
+                        break;
+                    }
+                } else if deadline_attempts > 6000 {
+                    break;
+                }
             }
         }
+
+        // Adapter so the writeback below reads `p.revents` uniformly.
+        let pollfds: Vec<libc::pollfd> = owners
+            .iter()
+            .zip(revents.iter())
+            .map(|((fd, _), rev)| libc::pollfd { fd: *fd, events: 0, revents: *rev })
+            .collect();
 
         // Write back ready bits. Start with fully-cleared sets and only
         // set bits for fds that fired.
@@ -1969,16 +2030,19 @@ impl SyscallDispatcher {
             let open = open_file.description.borrow();
             return match &*open {
                 OpenDescription::HostPipe { host_fd, .. }
-                | OpenDescription::HostSocket { host_fd, .. } => Some(*host_fd),
+                | OpenDescription::HostSocket { host_fd, .. }
+                | OpenDescription::HostFile { host_fd, .. } => Some(*host_fd),
                 _ => None,
             };
         }
         if is_stdio_fd(fd) {
             return Some(fd);
         }
-        // Unknown fd. poll() will revents=POLLNVAL — same as our
-        // synthetic fallback, but cheaper. Pass through as a host fd.
-        Some(fd)
+        // Unknown fd: do NOT pass the guest fd number through as a host fd
+        // (host fds 3,4,5… belong to carrick itself — the cap-std rootfs dir,
+        // the HVF device, etc., so polling them blocks on the wrong object).
+        // Route to the synthetic readiness path instead.
+        None
     }
 
     fn poll_ready_events(&self, fd: i32, requested_events: i16) -> i16 {
@@ -5475,6 +5539,54 @@ impl SyscallDispatcher {
         }
 
         // Anything else (including the SIGCHLD-only fork case) → real fork.
+        DispatchOutcome::Fork
+    }
+
+    /// clone3(2): like clone, but flags and the rest of the parameters live in
+    /// a `struct clone_args` pointed to by arg0 (arg1 is its size). glibc's
+    /// posix_spawn/fork now prefer clone3; without it apt-get's worker spawn
+    /// silently failed and the parent deadlocked waiting on a child that never
+    /// came up. We only need `flags` (the first u64) to decide thread-vs-fork.
+    fn clone3(
+        &mut self,
+        request: SyscallRequest,
+        memory: &impl GuestMemory,
+    ) -> DispatchOutcome {
+        const CLONE_VM: u64 = 0x00000100;
+        const CLONE_FS: u64 = 0x00000200;
+        const CLONE_FILES: u64 = 0x00000400;
+        const CLONE_SIGHAND: u64 = 0x00000800;
+        const CLONE_THREAD: u64 = 0x00010000;
+
+        let args_ptr = request.arg(0);
+        let args_size = request.arg(1);
+        // clone_args is at least flags(8)+pidfd(8)+child_tid(8)+parent_tid(8)
+        // +exit_signal(8) = 40 bytes; flags is the first field.
+        if args_size < 8 {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        }
+        let flags = match memory.read_bytes(args_ptr, 8) {
+            Ok(bytes) => u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+            Err(_) => {
+                return DispatchOutcome::Errno {
+                    errno: LINUX_EFAULT,
+                };
+            }
+        };
+
+        let thread_mask =
+            CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
+        if (flags & thread_mask) == thread_mask {
+            return DispatchOutcome::Errno {
+                errno: LINUX_ENOSYS,
+            };
+        }
+
+        // posix_spawn's CLONE_VM|CLONE_VFORK|SIGCHLD and plain SIGCHLD forks
+        // both land here. A real fork is a valid implementation of vfork (the
+        // child execs or _exits immediately), so route to the same path.
         DispatchOutcome::Fork
     }
 
