@@ -694,7 +694,7 @@ impl Default for SyscallDispatcher {
 /// legacy arm can still use them. As subsystems migrate this list grows
 /// and the legacy match shrinks. See [[plan-syscall-macro-split]].
 macro_rules! normalized_dispatch {
-    ( $( $num:literal => $handler:ident ),* $(,)? ) => {
+    ( $( $num:pat => $handler:ident ),* $(,)? ) => {
         fn dispatch_normalized(
             &mut self,
             request: SyscallRequest,
