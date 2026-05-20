@@ -1148,40 +1148,33 @@ impl SyscallDispatcher {
     }
 
     fn access_resolved_path(&self, path: &str, mode: u64, flags: u64) -> DispatchOutcome {
-        // Layered: overlay first.
-        match self.rootfs_vfs.overlay.lookup(path) {
-            Some(OverlayEntry::Deleted) => {
-                return DispatchOutcome::Errno { errno: LINUX_ENOENT };
-            }
-            Some(OverlayEntry::Dir) | Some(OverlayEntry::File(_)) => {
-                if let Some(metadata) = self.rootfs_vfs.overlay.metadata(path) {
-                    return access_metadata(&metadata, mode);
-                }
-            }
-            None => {}
-        }
-        if let Some(outcome) = self.synthetic_access(&path, mode) {
+        // Synthetic /proc /sys paths bypass the rootfs/overlay
+        // layered view: they have their own permission model.
+        if let Some(outcome) = self.synthetic_access(path, mode) {
             return outcome;
         }
-        let Some(rootfs) = &self.rootfs_vfs.rootfs else {
-            return DispatchOutcome::Errno {
-                errno: LINUX_ENOENT,
-            };
-        };
-        let metadata = if flags & LINUX_AT_SYMLINK_NOFOLLOW != 0 {
-            rootfs.symlink_metadata(path)
-        } else {
-            rootfs.metadata(path)
-        };
-        let metadata = match metadata {
-            Ok(metadata) => metadata,
-            Err(errno) => {
-                return DispatchOutcome::Errno {
-                    errno: rootfs_errno(errno),
+        // Layered overlay+rootfs lookup via RootFsVfs. AT_SYMLINK_NOFOLLOW
+        // doesn't change the access mask (no chmod-on-link semantics
+        // exposed in our compat layer), so we use the default lookup.
+        let _ = flags; // AT_SYMLINK_NOFOLLOW is currently a no-op here
+        use crate::vfs::Vfs as _;
+        match self.rootfs_vfs.lookup(path) {
+            Ok(md) => {
+                let rootfs_md = crate::rootfs::RootFsMetadata {
+                    path: Path::new(path).to_path_buf(),
+                    kind: match md.kind {
+                        crate::vfs::EntryKind::File => RootFsEntryKind::File,
+                        crate::vfs::EntryKind::Directory => RootFsEntryKind::Directory,
+                        crate::vfs::EntryKind::Symlink => RootFsEntryKind::Symlink,
+                        crate::vfs::EntryKind::CharDevice => RootFsEntryKind::File,
+                    },
+                    mode: md.mode,
+                    size: md.size as usize,
                 };
+                access_metadata(&rootfs_md, mode)
             }
-        };
-        access_metadata(&metadata, mode)
+            Err(errno) => DispatchOutcome::Errno { errno },
+        }
     }
 
     fn fd_access(&self, fd: i32, mode: u64) -> DispatchOutcome {
@@ -6776,32 +6769,10 @@ impl SyscallDispatcher {
         let target = if path == "/proc/self/exe" || path == "/proc/curproc/exe" {
             self.executable_path.clone()
         } else {
-            let Some(rootfs) = &self.rootfs_vfs.rootfs else {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_ENOENT,
-                });
-            };
-            match rootfs.read_link(&path) {
-                Ok(target) => target,
-                Err(RootFsError::NotFound(_)) => {
-                    // Linux readlink(2) returns EINVAL when the path
-                    // exists but isn't a symlink, and ENOENT only when
-                    // the path doesn't exist at all. apt's realpath()
-                    // implementation relies on this distinction — an
-                    // ENOENT for an existing regular file makes apt
-                    // give up with "flAbsPath on /var/lib/dpkg/status
-                    // failed - realpath (2: No such file or directory)".
-                    let errno = match rootfs.symlink_metadata(&path) {
-                        Ok(_) => LINUX_EINVAL,
-                        Err(_) => LINUX_ENOENT,
-                    };
-                    return Ok(DispatchOutcome::Errno { errno });
-                }
-                Err(errno) => {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: rootfs_errno(errno),
-                    });
-                }
+            use crate::vfs::Vfs as _;
+            match self.rootfs_vfs.readlink(&path) {
+                Ok(p) => p.to_string_lossy().into_owned(),
+                Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
             }
         };
 
@@ -6885,53 +6856,14 @@ impl SyscallDispatcher {
                 errno: LINUX_EEXIST,
             });
         }
-        // Layered existence check: overlay takes precedence (a directory
-        // the guest created at this path makes mkdirat fail with EEXIST
-        // even if the rootfs doesn't have it); a tombstone clears the
-        // rootfs view so a re-create is allowed.
-        match self.rootfs_vfs.overlay.lookup(&resolved) {
-            Some(OverlayEntry::Dir) | Some(OverlayEntry::File(_)) => {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_EEXIST,
-                });
-            }
-            Some(OverlayEntry::Deleted) => {
-                // Rootfs view is shadowed: skip the rootfs existence check
-                // below and fall through to the create path.
-            }
-            None => {
-                if let Some(rootfs) = &self.rootfs_vfs.rootfs {
-                    match rootfs.metadata(&resolved) {
-                        Ok(_) => {
-                            return Ok(DispatchOutcome::Errno {
-                                errno: LINUX_EEXIST,
-                            });
-                        }
-                        Err(RootFsError::NotFound(_)) => {}
-                        Err(other) => {
-                            return Ok(DispatchOutcome::Errno {
-                                errno: rootfs_errno(other),
-                            });
-                        }
-                    }
-                }
-            }
+        // Layered existence + parent-exists checks live inside
+        // RootFsVfs::mkdir; the dispatcher only handles synthetic
+        // path shadowing.
+        use crate::vfs::Vfs as _;
+        match self.rootfs_vfs.mkdir(&resolved, 0) {
+            Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
+            Err(errno) => Ok(DispatchOutcome::Errno { errno }),
         }
-        // Parent directory must exist (layered view).
-        if let Some(parent) = Path::new(&resolved).parent() {
-            let parent_str = display_rootfs_path(parent);
-            if !self.path_is_directory(&parent_str) {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_ENOENT,
-                });
-            }
-        }
-        if self.rootfs_vfs.overlay.make_dir(&resolved).is_err() {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
-        }
-        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
     fn fchmod(&self, request: SyscallRequest) -> DispatchOutcome {
@@ -7395,71 +7327,20 @@ impl SyscallDispatcher {
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
         let remove_dir = flags & LINUX_AT_REMOVEDIR != 0;
-        // Layered lookup: overlay first (including the tombstone case),
-        // then synthetic /proc files (still EROFS — can't unlink them),
-        // then fall through to the rootfs.
-        let (kind, in_overlay, in_rootfs) = match self.rootfs_vfs.overlay.lookup(&resolved) {
-            Some(OverlayEntry::Deleted) => {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_ENOENT,
-                });
-            }
-            Some(OverlayEntry::Dir) => (RootFsEntryKind::Directory, true, false),
-            Some(OverlayEntry::File(_)) => (RootFsEntryKind::File, true, false),
-            None => {
-                if is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context()) {
-                    return Ok(DispatchOutcome::Errno { errno: LINUX_EROFS });
-                }
-                let Some(rootfs) = &self.rootfs_vfs.rootfs else {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: LINUX_ENOENT,
-                    });
-                };
-                match rootfs.symlink_metadata(&resolved) {
-                    Ok(metadata) => (metadata.kind, false, true),
-                    Err(errno) => {
-                        return Ok(DispatchOutcome::Errno {
-                            errno: rootfs_errno(errno),
-                        });
-                    }
-                }
-            }
+        // Synthetic /proc /sys paths can't be unlinked.
+        if is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context()) {
+            return Ok(DispatchOutcome::Errno { errno: LINUX_EROFS });
+        }
+        use crate::vfs::Vfs as _;
+        let result = if remove_dir {
+            self.rootfs_vfs.rmdir(&resolved)
+        } else {
+            self.rootfs_vfs.unlink(&resolved)
         };
-        match (kind, remove_dir) {
-            (RootFsEntryKind::Directory, false) => {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_EISDIR,
-                });
-            }
-            (RootFsEntryKind::File | RootFsEntryKind::Symlink, true) => {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_ENOTDIR,
-                });
-            }
-            _ => {}
+        match result {
+            Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
+            Err(errno) => Ok(DispatchOutcome::Errno { errno }),
         }
-        if in_overlay {
-            // Drop the overlay's entry. If the same path also lives in
-            // the rootfs we must tombstone so the layered view shows it
-            // as gone.
-            self.rootfs_vfs.overlay.remove_entry(&resolved);
-            let rootfs_has_it = self.rootfs_vfs
-                .rootfs
-                .as_ref()
-                .map(|rootfs| rootfs.symlink_metadata(&resolved).is_ok())
-                .unwrap_or(false);
-            if rootfs_has_it {
-                let _ = self.rootfs_vfs.overlay.mark_deleted(&resolved);
-            }
-        } else if in_rootfs {
-            // Tombstone the rootfs-backed path.
-            if self.rootfs_vfs.overlay.mark_deleted(&resolved).is_err() {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_EINVAL,
-                });
-            }
-        }
-        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
     fn utimensat(

@@ -56,6 +56,22 @@ impl RootFsVfs {
     pub fn set_overlay(&mut self, backend: Box<dyn FsBackend>) -> Box<dyn FsBackend> {
         std::mem::replace(&mut self.overlay, backend)
     }
+
+    /// Layered "is this path a directory" check. Used by the
+    /// dispatcher to validate mkdir/rename parent paths.
+    pub fn is_directory(&self, path: &str) -> bool {
+        match self.overlay.lookup(path) {
+            Some(OverlayEntry::Dir) => return true,
+            Some(OverlayEntry::File(_)) => return false,
+            Some(OverlayEntry::Deleted) => return false,
+            None => {}
+        }
+        self.rootfs
+            .as_ref()
+            .and_then(|r| r.metadata(path).ok())
+            .map(|m| m.kind == RootFsEntryKind::Directory)
+            .unwrap_or(false)
+    }
 }
 
 impl Default for RootFsVfs {
@@ -115,10 +131,19 @@ impl Vfs for RootFsVfs {
 
     fn readlink(&self, path: &str) -> Result<std::path::PathBuf, VfsError> {
         let rootfs = self.rootfs.as_ref().ok_or(LINUX_ENOENT)?;
-        rootfs
-            .read_link(path)
-            .map(std::path::PathBuf::from)
-            .map_err(|_| LINUX_ENOENT)
+        match rootfs.read_link(path) {
+            Ok(target) => Ok(std::path::PathBuf::from(target)),
+            Err(crate::rootfs::RootFsError::NotFound(_)) => {
+                // Linux readlink(2): EINVAL when the path exists but
+                // isn't a symlink, ENOENT only when it doesn't exist.
+                // apt's realpath() relies on this distinction.
+                match rootfs.symlink_metadata(path) {
+                    Ok(_) => Err(crate::dispatch::LINUX_EINVAL),
+                    Err(_) => Err(LINUX_ENOENT),
+                }
+            }
+            Err(_) => Err(LINUX_ENOENT),
+        }
     }
 
     fn open(
@@ -192,36 +217,108 @@ impl Vfs for RootFsVfs {
     }
 
     fn mkdir(&mut self, path: &str, _mode: u32) -> Result<(), VfsError> {
+        // Layered EEXIST: an existing overlay or rootfs entry (file
+        // or dir) at `path` blocks mkdir. A tombstone clears the
+        // rootfs view so a re-create is allowed.
+        match self.overlay.lookup(path) {
+            Some(OverlayEntry::Dir) | Some(OverlayEntry::File(_)) => {
+                return Err(LINUX_EEXIST);
+            }
+            Some(OverlayEntry::Deleted) => {}
+            None => {
+                if let Some(rootfs) = self.rootfs.as_ref() {
+                    if rootfs.metadata(path).is_ok() {
+                        return Err(LINUX_EEXIST);
+                    }
+                }
+            }
+        }
+        // Parent must exist as a directory in the layered view.
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            let parent_str = parent.to_string_lossy();
+            let parent_str: &str = if parent_str.is_empty() {
+                "/"
+            } else {
+                parent_str.as_ref()
+            };
+            if !self.is_directory(parent_str) {
+                return Err(LINUX_ENOENT);
+            }
+        }
         self.overlay
             .make_dir(path)
             .map_err(|_| crate::dispatch::LINUX_EINVAL)
     }
 
     fn unlink(&mut self, path: &str) -> Result<(), VfsError> {
-        // Tombstone in overlay; if rootfs had the path it's now
-        // shadow-deleted. Returns ENOENT only if neither layer ever
-        // had the path.
-        match self.lookup(path) {
-            Ok(md) if md.kind == EntryKind::Directory => return Err(LINUX_EISDIR),
-            Ok(_) => {}
-            Err(_) => return Err(LINUX_ENOENT),
+        // Layered: overlay first (a tombstone short-circuits to
+        // ENOENT). Then rootfs via symlink_metadata so symlinks are
+        // identified as such (not followed).
+        let (kind, in_overlay, in_rootfs) = match self.overlay.lookup(path) {
+            Some(OverlayEntry::Deleted) => return Err(LINUX_ENOENT),
+            Some(OverlayEntry::Dir) => (RootFsEntryKind::Directory, true, false),
+            Some(OverlayEntry::File(_)) => (RootFsEntryKind::File, true, false),
+            None => match self.rootfs.as_ref().and_then(|r| r.symlink_metadata(path).ok()) {
+                Some(md) => (md.kind, false, true),
+                None => return Err(LINUX_ENOENT),
+            },
+        };
+        if matches!(kind, RootFsEntryKind::Directory) {
+            return Err(LINUX_EISDIR);
         }
-        self.overlay.remove_entry(path);
-        self.overlay
-            .mark_deleted(path)
-            .map_err(|_| crate::dispatch::LINUX_EINVAL)
+        if in_overlay {
+            self.overlay.remove_entry(path);
+            // Tombstone only if the rootfs also has this path, so a
+            // re-create still works.
+            let rootfs_has_it = self
+                .rootfs
+                .as_ref()
+                .map(|r| r.symlink_metadata(path).is_ok())
+                .unwrap_or(false);
+            if rootfs_has_it {
+                self.overlay
+                    .mark_deleted(path)
+                    .map_err(|_| crate::dispatch::LINUX_EINVAL)?;
+            }
+        } else if in_rootfs {
+            self.overlay
+                .mark_deleted(path)
+                .map_err(|_| crate::dispatch::LINUX_EINVAL)?;
+        }
+        Ok(())
     }
 
     fn rmdir(&mut self, path: &str) -> Result<(), VfsError> {
-        match self.lookup(path) {
-            Ok(md) if md.kind != EntryKind::Directory => return Err(LINUX_ENOTDIR),
-            Ok(_) => {}
-            Err(_) => return Err(LINUX_ENOENT),
+        let (kind, in_overlay, in_rootfs) = match self.overlay.lookup(path) {
+            Some(OverlayEntry::Deleted) => return Err(LINUX_ENOENT),
+            Some(OverlayEntry::Dir) => (RootFsEntryKind::Directory, true, false),
+            Some(OverlayEntry::File(_)) => (RootFsEntryKind::File, true, false),
+            None => match self.rootfs.as_ref().and_then(|r| r.symlink_metadata(path).ok()) {
+                Some(md) => (md.kind, false, true),
+                None => return Err(LINUX_ENOENT),
+            },
+        };
+        if !matches!(kind, RootFsEntryKind::Directory) {
+            return Err(LINUX_ENOTDIR);
         }
-        self.overlay.remove_entry(path);
-        self.overlay
-            .mark_deleted(path)
-            .map_err(|_| crate::dispatch::LINUX_EINVAL)
+        if in_overlay {
+            self.overlay.remove_entry(path);
+            let rootfs_has_it = self
+                .rootfs
+                .as_ref()
+                .map(|r| r.symlink_metadata(path).is_ok())
+                .unwrap_or(false);
+            if rootfs_has_it {
+                self.overlay
+                    .mark_deleted(path)
+                    .map_err(|_| crate::dispatch::LINUX_EINVAL)?;
+            }
+        } else if in_rootfs {
+            self.overlay
+                .mark_deleted(path)
+                .map_err(|_| crate::dispatch::LINUX_EINVAL)?;
+        }
+        Ok(())
     }
 
     fn truncate(&mut self, path: &str, len: u64) -> Result<(), VfsError> {
