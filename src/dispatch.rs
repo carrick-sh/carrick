@@ -7475,6 +7475,25 @@ impl SyscallDispatcher {
                             outcome = write_host_pipe(&bytes, *host_fd);
                             writeback = FileWriteback::None;
                         }
+                        OpenDescription::HostFile {
+                            host_fd,
+                            writable,
+                            status_flags,
+                            ..
+                        } => {
+                            if !*writable {
+                                return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+                            }
+                            // Mirror `write`(64): O_APPEND seeks to EOF, then
+                            // libc::write to the real fd advances the shared
+                            // kernel offset (visible across fork and to the
+                            // readv that follows).
+                            if *status_flags & LINUX_O_APPEND != 0 {
+                                unsafe { libc::lseek(*host_fd, 0, libc::SEEK_END) };
+                            }
+                            outcome = write_host_pipe(&bytes, *host_fd);
+                            writeback = FileWriteback::None;
+                        }
                         OpenDescription::File {
                             path,
                             contents,
