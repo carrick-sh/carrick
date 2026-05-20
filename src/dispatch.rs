@@ -1115,8 +1115,12 @@ impl SyscallDispatcher {
                 errno: LINUX_EFAULT,
             });
         }
+        // Linux getcwd(2) returns the LENGTH of the buffer filled (including
+        // the terminating NUL), not the buffer address. glibc tolerates a
+        // positive non-length, but tools that use the return value as a
+        // length (and the kernel ABI) require the real count.
         Ok(DispatchOutcome::Returned {
-            value: address as i64,
+            value: bytes.len() as i64,
         })
     }
 
