@@ -7443,7 +7443,7 @@ impl SyscallDispatcher {
     }
 
     fn linkat(
-        &self,
+        &mut self,
         request: SyscallRequest,
         memory: &impl GuestMemory,
     ) -> Result<DispatchOutcome, DispatchError> {
@@ -7475,25 +7475,23 @@ impl SyscallDispatcher {
                 errno: LINUX_ENOENT,
             });
         }
-        let source_exists = if old.is_empty() {
-            self.fd_is_valid(olddirfd as i32)
+        let resolved_old = if old.is_empty() {
+            if !self.fd_is_valid(olddirfd as i32) {
+                return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+            }
+            None
         } else {
             let resolved = match self.resolve_at_path(olddirfd, &old) {
                 Ok(resolved) => resolved,
                 Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
             };
-            is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context())
-                || self.layered_metadata(&resolved).is_ok()
+            let exists = is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context())
+                || self.layered_metadata(&resolved).is_ok();
+            if !exists {
+                return Ok(DispatchOutcome::Errno { errno: LINUX_ENOENT });
+            }
+            Some(resolved)
         };
-        if !source_exists {
-            return Ok(DispatchOutcome::Errno {
-                errno: if old.is_empty() {
-                    LINUX_EBADF
-                } else {
-                    LINUX_ENOENT
-                },
-            });
-        }
         let resolved_new = match self.resolve_at_path(newdirfd, &new_path) {
             Ok(resolved) => resolved,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
@@ -7503,10 +7501,31 @@ impl SyscallDispatcher {
         {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EEXIST });
         }
-        // Overlay can't materialise hardlinks today; the layered
-        // view's existence checks have rejected the no-op cases, so
-        // an unsupported-write is the only remaining outcome.
-        Ok(DispatchOutcome::Errno { errno: LINUX_EROFS })
+        // We don't model shared-inode hardlinks, but dpkg (and friends) use
+        // link() to make a backup copy (e.g. /var/lib/dpkg/status-old) and
+        // never rely on shared-inode semantics for those. Materialise the
+        // link as a copy in the writable backend so it lands on disk
+        // (HostFsBackend) and survives fork. Returning EROFS here broke dpkg
+        // --unpack ("error creating new backup file ... Read-only file
+        // system"). AT_EMPTY_PATH (link by fd) isn't supported.
+        let Some(src) = resolved_old else {
+            return Ok(DispatchOutcome::Errno { errno: LINUX_EROFS });
+        };
+        let contents = self
+            .rootfs_vfs
+            .overlay
+            .file_contents(&src)
+            .or_else(|| {
+                self.rootfs_vfs
+                    .rootfs
+                    .as_ref()
+                    .and_then(|r| r.read(&src).ok())
+            })
+            .unwrap_or_default();
+        match self.rootfs_vfs.overlay.set_file_contents(&resolved_new, contents) {
+            Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
+            Err(_) => Ok(DispatchOutcome::Errno { errno: LINUX_EROFS }),
+        }
     }
 
     fn symlinkat(
