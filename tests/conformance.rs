@@ -15,7 +15,15 @@
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+/// Serializes the two conformance test functions. They both spawn carrick
+/// guests AND call `sweep_wedged_guests()` (a global `kill.sh` that SIGKILLs
+/// every `carrick:` process on the box). If the two `#[test]` fns run on
+/// parallel threads (cargo's default), each one's per-case sweep kills the
+/// OTHER's in-flight guest, producing spurious empty-output failures. A
+/// shared lock makes them run one-at-a-time regardless of `--test-threads`.
+static CONFORMANCE_LOCK: Mutex<()> = Mutex::new(());
 use std::time::{Duration, Instant};
 
 /// Per-case wall-clock deadline. A single wedged guest process (e.g. a
@@ -204,6 +212,7 @@ async fn run_docker(docker: &Docker, snippet: &str) -> anyhow::Result<String> {
 
 #[test]
 fn conformance() {
+    let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let Some(bin) = carrick_bin() else {
         eprintln!("SKIP conformance: target/release/carrick not built");
         return;
@@ -423,6 +432,7 @@ fn diff_lines(carrick: &str, linux: &str) -> Option<String> {
 
 #[test]
 fn conformance_probes() {
+    let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     use base64::Engine as _;
 
     let Some(bin) = carrick_bin() else {
