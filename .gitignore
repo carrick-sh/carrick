@@ -2,4 +2,5 @@
 /.carrick/
 /.serena/
 /fixtures/*/target/
+/conformance-probes/target/
 .claude/
