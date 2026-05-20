@@ -261,6 +261,25 @@ pub struct SyscallRequest {
     pub args: SyscallArgs,
 }
 
+/// Uniform context handed to every *normalized* syscall handler, so all
+/// handlers share one signature and the dispatch arm is macro-generated.
+/// Built transiently per dispatched syscall (a scoped borrow of guest memory
+/// + the compat reporter), which lets migrated and legacy handlers coexist
+/// while the macro migration proceeds subsystem by subsystem. See
+/// [[plan-syscall-macro-split]].
+pub struct SyscallCtx<'a, M: GuestMemory> {
+    pub request: SyscallRequest,
+    pub memory: &'a mut M,
+    pub reporter: &'a mut CompatReporter,
+}
+
+impl<M: GuestMemory> SyscallCtx<'_, M> {
+    #[inline]
+    pub fn arg(&self, index: usize) -> u64 {
+        self.request.arg(index)
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Aarch64SyscallFrame {
@@ -666,7 +685,41 @@ impl Default for SyscallDispatcher {
     }
 }
 
+/// Generate `dispatch_normalized`, the single match over syscalls migrated
+/// to the normalized `SyscallCtx` handler contract. Each entry maps a
+/// syscall number to a handler method `fn(&mut self, &mut SyscallCtx<M>)
+/// -> Result<DispatchOutcome, DispatchError>`. `dispatch()` tries this
+/// first and falls through to the legacy match for not-yet-migrated
+/// syscalls; the borrow of memory/reporter is scoped to the call so the
+/// legacy arm can still use them. As subsystems migrate this list grows
+/// and the legacy match shrinks. See [[plan-syscall-macro-split]].
+macro_rules! normalized_dispatch {
+    ( $( $num:literal => $handler:ident ),* $(,)? ) => {
+        fn dispatch_normalized(
+            &mut self,
+            request: SyscallRequest,
+            memory: &mut impl GuestMemory,
+            reporter: &mut CompatReporter,
+        ) -> Option<Result<DispatchOutcome, DispatchError>> {
+            match request.number {
+                $(
+                    $num => {
+                        let mut ctx = SyscallCtx { request, memory, reporter };
+                        Some(self.$handler(&mut ctx))
+                    }
+                )*
+                _ => None,
+            }
+        }
+    };
+}
+
 impl SyscallDispatcher {
+    normalized_dispatch! {
+        17 => getcwd,
+        49 => chdir,
+    }
+
     pub fn new() -> Self {
         Self {
             stdout: Vec::new(),
@@ -881,9 +934,23 @@ impl SyscallDispatcher {
             }
         }
 
+        // Syscalls migrated to the normalized SyscallCtx handler contract are
+        // dispatched here first; the borrow of memory/reporter is scoped to
+        // the call, so the legacy match below can still use them for the rest.
+        if let Some(result) = self.dispatch_normalized(request, memory, reporter) {
+            let outcome = result?;
+            let (retval, errno) = outcome.retval_errno();
+            reporter.record(CompatEvent::SyscallReturn {
+                number: request.number,
+                name: name.to_owned(),
+                retval,
+                errno,
+            });
+            return Ok(outcome);
+        }
+
         let outcome = match request.number {
             5..=16 => self.xattr_unsupported(),
-            17 => self.getcwd(request, memory)?,
             19 => self.eventfd2(request),
             20 => self.epoll_create1(request),
             21 => self.epoll_ctl(request, memory)?,
@@ -905,7 +972,6 @@ impl SyscallDispatcher {
             46 => self.ftruncate(request),
             47 => self.fallocate(request),
             48 => self.faccessat(request, memory)?,
-            49 => self.chdir(request, memory)?,
             50 => self.fchdir(request),
             52 => self.fchmod(request),
             53 => self.fchmodat(request, memory)?,
@@ -1095,14 +1161,13 @@ impl SyscallDispatcher {
         Ok(outcome)
     }
 
-    fn getcwd(
-        &self,
-        request: SyscallRequest,
-        memory: &mut impl GuestMemory,
+    fn getcwd<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let address = request.arg(0);
-        let size = usize::try_from(request.arg(1))
-            .map_err(|_| DispatchError::LengthTooLarge(request.arg(1)))?;
+        let address = ctx.arg(0);
+        let size = usize::try_from(ctx.arg(1))
+            .map_err(|_| DispatchError::LengthTooLarge(ctx.arg(1)))?;
         let mut bytes = self.cwd.as_bytes().to_vec();
         bytes.push(0);
         if bytes.len() > size {
@@ -1110,7 +1175,7 @@ impl SyscallDispatcher {
                 errno: LINUX_ERANGE,
             });
         }
-        if memory.write_bytes(address, &bytes).is_err() {
+        if ctx.memory.write_bytes(address, &bytes).is_err() {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EFAULT,
             });
@@ -1231,13 +1296,12 @@ impl SyscallDispatcher {
         }
     }
 
-    fn chdir(
+    fn chdir<M: GuestMemory>(
         &mut self,
-        request: SyscallRequest,
-        memory: &impl GuestMemory,
+        ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let pathname = request.arg(0);
-        let path = match read_guest_c_string(memory, pathname) {
+        let pathname = ctx.arg(0);
+        let path = match read_guest_c_string(&*ctx.memory, pathname) {
             Ok(path) => path,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
