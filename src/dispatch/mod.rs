@@ -323,16 +323,10 @@ pub struct ProcMapsEntry {
 }
 
 pub struct SyscallDispatcher {
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-    /// When true, writes to fd 1/2 stream directly to host fds 1/2
-    /// instead of buffering into `stdout`/`stderr`. Set by `--raw`/the
-    /// interactive runtime so the user sees the guest's prompt and
-    /// output in real time, instead of after exit.
-    stream_stdio: bool,
-    open_files: HashMap<i32, OpenFile>,
-    next_fd: i32,
-    cwd: String,
+    /// Owned I/O subsystem state (buffered stdout/stderr, stream toggle,
+    /// the open-fd table, next-fd cursor, and cwd). See [`fs::IoState`].
+    /// Handlers that touch only I/O state borrow `self.io` narrowly.
+    io: fs::IoState,
     /// Owned memory subsystem state (brk, mmap arena, shared-file IPA
     /// window + live maps, and the captured address-space regions for
     /// `/proc/self/maps`). See [`mem::MemState`].
@@ -743,12 +737,7 @@ impl SyscallDispatcher {
 
     pub fn new() -> Self {
         Self {
-            stdout: Vec::new(),
-            stderr: Vec::new(),
-            stream_stdio: false,
-            open_files: HashMap::new(),
-            next_fd: 3,
-            cwd: "/".to_owned(),
+            io: fs::IoState::new(),
             mem: mem::MemState::new(),
             proc: proc::ProcState::new(),
             creds: creds::CredState::new(),
@@ -826,7 +815,7 @@ impl SyscallDispatcher {
     }
 
     pub fn stdout(&self) -> &[u8] {
-        &self.stdout
+        &self.io.stdout
     }
 
     /// Enable live passthrough for fd 1/2. After this, `write`/`writev`
@@ -835,7 +824,7 @@ impl SyscallDispatcher {
     /// interactive prompts (`/ # `, cursor-position queries, etc.) to
     /// reach the user's terminal before the guest exits.
     pub fn set_stream_stdio(&mut self, on: bool) {
-        self.stream_stdio = on;
+        self.io.stream_stdio = on;
     }
 
     /// Called after `libc::fork(2)` returns into a child: the child
@@ -844,8 +833,8 @@ impl SyscallDispatcher {
     /// via the `forked_child_exit` path. The parent's full buffer
     /// goes out through its own JSON report.
     pub fn clear_output_buffers(&mut self) {
-        self.stdout.clear();
-        self.stderr.clear();
+        self.io.stdout.clear();
+        self.io.stderr.clear();
     }
 
     /// Linux execve(2) closes every fd that had FD_CLOEXEC set. Our
@@ -861,7 +850,7 @@ impl SyscallDispatcher {
     /// remove it and run close_open_file (which honours the Rc-count
     /// guard, so we don't close a host fd a sibling fd still aliases).
     pub fn close_cloexec_fds(&mut self) {
-        let cloexec_fds: Vec<i32> = self
+        let cloexec_fds: Vec<i32> = self.io
             .open_files
             .iter()
             .filter_map(|(fd, of)| {
@@ -873,18 +862,18 @@ impl SyscallDispatcher {
             })
             .collect();
         for fd in cloexec_fds {
-            if let Some(open_file) = self.open_files.remove(&fd) {
+            if let Some(open_file) = self.io.open_files.remove(&fd) {
                 close_open_file(&open_file);
             }
         }
     }
 
     pub fn stderr(&self) -> &[u8] {
-        &self.stderr
+        &self.io.stderr
     }
 
     pub fn cwd(&self) -> &str {
-        &self.cwd
+        &self.io.cwd
     }
 
 

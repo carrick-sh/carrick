@@ -21,6 +21,36 @@ pub(super) struct FsState {
     pub rootfs_vfs: crate::vfs::RootFsVfs,
 }
 
+/// Owned I/O-subsystem state. Split out of `SyscallDispatcher` so the I/O
+/// handlers borrow only the fd/stdio state they touch. Field semantics are
+/// unchanged from the former loose fields (`stdout`/`stderr`/`stream_stdio`/
+/// `open_files`/`next_fd`/`cwd`).
+pub(super) struct IoState {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    /// When true, writes to fd 1/2 stream directly to host fds 1/2
+    /// instead of buffering into `stdout`/`stderr`. Set by `--raw`/the
+    /// interactive runtime so the user sees the guest's prompt and
+    /// output in real time, instead of after exit.
+    pub stream_stdio: bool,
+    pub open_files: HashMap<i32, OpenFile>,
+    pub next_fd: i32,
+    pub cwd: String,
+}
+
+impl IoState {
+    pub(super) fn new() -> Self {
+        Self {
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            stream_stdio: false,
+            open_files: HashMap::new(),
+            next_fd: 3,
+            cwd: "/".to_owned(),
+        }
+    }
+}
+
 impl FsState {
     pub(super) fn new() -> Self {
         Self {
@@ -44,7 +74,7 @@ impl SyscallDispatcher {
         let address = ctx.arg(0);
         let size = usize::try_from(ctx.arg(1))
             .map_err(|_| DispatchError::LengthTooLarge(ctx.arg(1)))?;
-        let mut bytes = self.cwd.as_bytes().to_vec();
+        let mut bytes = self.io.cwd.as_bytes().to_vec();
         bytes.push(0);
         if bytes.len() > size {
             return Ok(DispatchOutcome::Errno {
@@ -117,7 +147,7 @@ impl SyscallDispatcher {
                 });
             }
             if dirfd == LINUX_AT_FDCWD {
-                return Ok(self.access_resolved_path(&self.cwd, mode, flags));
+                return Ok(self.access_resolved_path(&self.io.cwd, mode, flags));
             }
             return Ok(self.fd_access(dirfd as i32, mode));
         }
@@ -147,7 +177,7 @@ impl SyscallDispatcher {
     }
 
     fn fd_access(&self, fd: i32, mode: u64) -> DispatchOutcome {
-        let Some(open_file) = self.open_files.get(&fd) else {
+        let Some(open_file) = self.io.open_files.get(&fd) else {
             return DispatchOutcome::Errno { errno: LINUX_EBADF };
         };
         let open = open_file.description.borrow();
@@ -197,7 +227,7 @@ impl SyscallDispatcher {
                 errno: LINUX_ENOTDIR,
             });
         }
-        self.cwd = display_rootfs_path(&metadata.path);
+        self.io.cwd = display_rootfs_path(&metadata.path);
         Ok(DispatchOutcome::Returned { value: 0 })
     }
 
@@ -206,13 +236,13 @@ impl SyscallDispatcher {
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let fd = ctx.arg(0) as i32;
-        let Some(open_file) = self.open_files.get(&fd) else {
+        let Some(open_file) = self.io.open_files.get(&fd) else {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         };
         let open = open_file.description.borrow();
         Ok(match &*open {
             OpenDescription::Directory { metadata, .. } => {
-                self.cwd = display_rootfs_path(&metadata.path);
+                self.io.cwd = display_rootfs_path(&metadata.path);
                 DispatchOutcome::Returned { value: 0 }
             }
             OpenDescription::File { .. }
@@ -388,7 +418,7 @@ impl SyscallDispatcher {
                 errno: LINUX_EINVAL,
             });
         }
-        let description = match self.open_files.get(&old_fd) {
+        let description = match self.io.open_files.get(&old_fd) {
             Some(open_file) => Rc::clone(&open_file.description),
             None if is_stdio_fd(old_fd) => {
                 // Shell `2>&1` style redirects: the source fd is the
@@ -413,11 +443,11 @@ impl SyscallDispatcher {
             }
             None => return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF }),
         };
-        if let Some(replaced) = self.open_files.remove(&new_fd) {
+        if let Some(replaced) = self.io.open_files.remove(&new_fd) {
             close_open_file(&replaced);
         }
         retain_open_file(&description);
-        self.open_files.insert(
+        self.io.open_files.insert(
             new_fd,
             OpenFile {
                 description,
@@ -446,7 +476,7 @@ impl SyscallDispatcher {
                 Err(errno) => DispatchOutcome::Errno { errno },
             },
             LINUX_F_GETPIPE_SZ => {
-                let Some(open_file) = self.open_files.get(&fd) else {
+                let Some(open_file) = self.io.open_files.get(&fd) else {
                     return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
                 };
                 match &*open_file.description.borrow() {
@@ -463,7 +493,7 @@ impl SyscallDispatcher {
                 }
             }
             LINUX_F_GETFD => {
-                if let Some(open_file) = self.open_files.get(&fd) {
+                if let Some(open_file) = self.io.open_files.get(&fd) {
                     return Ok(DispatchOutcome::Returned {
                         value: open_file.fd_flags as i64,
                     });
@@ -476,7 +506,7 @@ impl SyscallDispatcher {
                 DispatchOutcome::Errno { errno: LINUX_EBADF }
             }
             LINUX_F_SETFD => {
-                if let Some(open_file) = self.open_files.get_mut(&fd) {
+                if let Some(open_file) = self.io.open_files.get_mut(&fd) {
                     open_file.fd_flags = arg & LINUX_FD_CLOEXEC;
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 }
@@ -493,7 +523,7 @@ impl SyscallDispatcher {
                 DispatchOutcome::Errno { errno: LINUX_EBADF }
             }
             LINUX_F_GETFL => {
-                if let Some(open_file) = self.open_files.get(&fd) {
+                if let Some(open_file) = self.io.open_files.get(&fd) {
                     let open = open_file.description.borrow();
                     return Ok(DispatchOutcome::Returned {
                         value: open.status_flags() as i64,
@@ -515,7 +545,7 @@ impl SyscallDispatcher {
                 DispatchOutcome::Errno { errno: LINUX_EBADF }
             }
             LINUX_F_SETFL => {
-                let Some(open_file) = self.open_files.get(&fd) else {
+                let Some(open_file) = self.io.open_files.get(&fd) else {
                     return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
                 };
                 let next_flags = arg & !LINUX_O_CLOEXEC;
@@ -596,7 +626,7 @@ impl SyscallDispatcher {
         }
 
         Ok(match ioctl_request {
-            LINUX_TIOCGWINSZ if fd_is_tty(&self.open_files, fd) => {
+            LINUX_TIOCGWINSZ if fd_is_tty(&self.io.open_files, fd) => {
                 // Prefer the live host window size when stdin/stdout/stderr
                 // is a real macOS terminal; fall back to the 80x24 stub so
                 // headless invocations (CI, redirected pipes that we still
@@ -612,7 +642,7 @@ impl SyscallDispatcher {
             LINUX_TIOCGWINSZ => DispatchOutcome::Errno {
                 errno: LINUX_ENOTTY,
             },
-            LINUX_TCGETS if fd_is_tty(&self.open_files, fd) => {
+            LINUX_TCGETS if fd_is_tty(&self.io.open_files, fd) => {
                 // Mirror the live host terminal modes when available so
                 // `less`, `vi`, and an interactive shell see the actual
                 // ICANON/ECHO state the user has configured.
@@ -632,7 +662,7 @@ impl SyscallDispatcher {
             LINUX_TCGETS => DispatchOutcome::Errno {
                 errno: LINUX_ENOTTY,
             },
-            LINUX_TCSETS | LINUX_TCSETSW | LINUX_TCSETSF if fd_is_tty(&self.open_files, fd) => {
+            LINUX_TCSETS | LINUX_TCSETSW | LINUX_TCSETSF if fd_is_tty(&self.io.open_files, fd) => {
                 // Read 36 bytes (kernel termios), then pad to the
                 // 44-byte zerocopy struct so we can parse it. The guest
                 // only provided a 36-byte buffer; reading 44 would
@@ -701,7 +731,7 @@ impl SyscallDispatcher {
                 // Stdio, eventfd, timerfd, epoll, pipe writer, directory, regular file,
                 // synthetic file: writing 0 ("nothing pending") is benign. Pipe reader
                 // gets the actual buffered byte count.
-                let available: i32 = match self.open_files.get(&fd) {
+                let available: i32 = match self.io.open_files.get(&fd) {
                     Some(open_file) => match &*open_file.description.borrow() {
                         OpenDescription::PipeReader { pipe, .. } => {
                             let len = pipe.borrow().buffer.len();
@@ -753,7 +783,7 @@ impl SyscallDispatcher {
     fn tty_ioctl_fd_kind(&self, fd: i32) -> Result<TtyFdKind, i32> {
         if is_stdio_fd(fd) {
             Ok(TtyFdKind::Stdio)
-        } else if self.open_files.contains_key(&fd) {
+        } else if self.io.open_files.contains_key(&fd) {
             Ok(TtyFdKind::Other)
         } else {
             Err(LINUX_EBADF)
@@ -761,7 +791,7 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn fd_is_valid(&self, fd: i32) -> bool {
-        is_stdio_fd(fd) || self.open_files.contains_key(&fd)
+        is_stdio_fd(fd) || self.io.open_files.contains_key(&fd)
     }
 
     pub(super) fn flock<M: GuestMemory>(
@@ -809,7 +839,7 @@ impl SyscallDispatcher {
 
     fn fstatfs(&self, request: SyscallRequest, memory: &mut impl GuestMemory) -> DispatchOutcome {
         let fd = request.arg(0) as i32;
-        if !self.open_files.contains_key(&fd) {
+        if !self.io.open_files.contains_key(&fd) {
             return DispatchOutcome::Errno { errno: LINUX_EBADF };
         }
         write_statfs(memory, request.arg(1))
@@ -894,7 +924,7 @@ impl SyscallDispatcher {
                 errno: LINUX_ESPIPE,
             });
         }
-        let Some(open_file) = self.open_files.get(&fd).cloned() else {
+        let Some(open_file) = self.io.open_files.get(&fd).cloned() else {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         };
         // Only mode-0 (default allocation) is implemented as a real grow;
@@ -975,7 +1005,7 @@ impl SyscallDispatcher {
                 errno: LINUX_EINVAL,
             });
         }
-        let Some(open_file) = self.open_files.get(&fd).cloned() else {
+        let Some(open_file) = self.io.open_files.get(&fd).cloned() else {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         };
         // Snapshot the path + new contents in a scope so the borrow drops
@@ -1294,7 +1324,7 @@ impl SyscallDispatcher {
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let fd = ctx.arg(0) as i32;
-        Ok(if let Some(open_file) = self.open_files.remove(&fd) {
+        Ok(if let Some(open_file) = self.io.open_files.remove(&fd) {
             close_open_file(&open_file);
             DispatchOutcome::Returned { value: 0 }
         } else if is_stdio_fd(fd) {
@@ -1332,7 +1362,7 @@ impl SyscallDispatcher {
         let cloexec_only = flags & CLOSE_RANGE_CLOEXEC != 0;
         // Drain matching fds out of the table so we don't iterate a
         // gigantic [first, last] (callers commonly pass last=u32::MAX).
-        let fds: Vec<i32> = self
+        let fds: Vec<i32> = self.io
             .open_files
             .keys()
             .copied()
@@ -1340,10 +1370,10 @@ impl SyscallDispatcher {
             .collect();
         for fd in fds {
             if cloexec_only {
-                if let Some(open_file) = self.open_files.get_mut(&fd) {
+                if let Some(open_file) = self.io.open_files.get_mut(&fd) {
                     open_file.fd_flags |= LINUX_FD_CLOEXEC;
                 }
-            } else if let Some(open_file) = self.open_files.remove(&fd) {
+            } else if let Some(open_file) = self.io.open_files.remove(&fd) {
                 close_open_file(&open_file);
             }
         }
@@ -1351,7 +1381,7 @@ impl SyscallDispatcher {
     }
 
     fn duplicate_fd(&mut self, old_fd: i32, min_fd: i32, fd_flags: u64) -> DispatchOutcome {
-        let description = match self.open_files.get(&old_fd) {
+        let description = match self.io.open_files.get(&old_fd) {
             Some(open_file) => Rc::clone(&open_file.description),
             None if is_stdio_fd(old_fd) => {
                 // dup/fcntl(F_DUPFD) of the process's bare stdio fds:
@@ -1380,7 +1410,7 @@ impl SyscallDispatcher {
             };
         };
         retain_open_file(&description);
-        self.open_files.insert(
+        self.io.open_files.insert(
             new_fd,
             OpenFile {
                 description,
@@ -1492,16 +1522,16 @@ impl SyscallDispatcher {
 
     pub(super) fn allocate_fd(&mut self, min_fd: i32) -> Option<i32> {
         let mut fd = min_fd.max(3);
-        while self.open_files.contains_key(&fd) {
+        while self.io.open_files.contains_key(&fd) {
             fd = fd.checked_add(1)?;
         }
-        self.next_fd = self.next_fd.max(fd.saturating_add(1));
+        self.io.next_fd = self.io.next_fd.max(fd.saturating_add(1));
         Some(fd)
     }
 
     pub(super) fn insert_open_file(&mut self, fd: i32, open_file: OpenFile) {
         retain_open_file(&open_file.description);
-        if let Some(replaced) = self.open_files.insert(fd, open_file) {
+        if let Some(replaced) = self.io.open_files.insert(fd, open_file) {
             close_open_file(&replaced);
         }
     }
@@ -1531,7 +1561,7 @@ impl SyscallDispatcher {
         let length = usize::try_from(ctx.arg(2))
             .map_err(|_| DispatchError::LengthTooLarge(ctx.arg(2)))?;
         let memory = &mut *ctx.memory;
-        let Some(open_file) = self.open_files.get(&fd) else {
+        let Some(open_file) = self.io.open_files.get(&fd) else {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         };
         let mut open = open_file.description.borrow_mut();
@@ -1575,7 +1605,7 @@ impl SyscallDispatcher {
         let fd = ctx.arg(0) as i32;
         let offset = ctx.arg(1) as i64;
         let whence = ctx.arg(2);
-        let Some(open_file) = self.open_files.get(&fd) else {
+        let Some(open_file) = self.io.open_files.get(&fd) else {
             // lseek on stdio with no OpenDescription is, on Linux, a
             // valid call on an unseekable pipe/tty — kernel returns
             // ESPIPE, not EBADF. Returning EBADF confuses glibc's
@@ -1685,10 +1715,10 @@ impl SyscallDispatcher {
         // This is what makes `read` against the guest's stdin pick up
         // input from the user's terminal (or whatever the carrick host
         // process's stdin is — file, pipe, or terminal).
-        if fd == 0 && !self.open_files.contains_key(&0) {
+        if fd == 0 && !self.io.open_files.contains_key(&0) {
             return Ok(read_host_pipe(memory, address, length, 0));
         }
-        let Some(open_file) = self.open_files.get(&fd) else {
+        let Some(open_file) = self.io.open_files.get(&fd) else {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         };
         let mut open = open_file.description.borrow_mut();
@@ -1788,7 +1818,7 @@ impl SyscallDispatcher {
             Ok(iovecs) => iovecs,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        let Some(open_file) = self.open_files.get(&fd) else {
+        let Some(open_file) = self.io.open_files.get(&fd) else {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         };
         let mut open = open_file.description.borrow_mut();
@@ -1855,7 +1885,7 @@ impl SyscallDispatcher {
         let offset = usize::try_from(ctx.arg(3))
             .map_err(|_| DispatchError::LengthTooLarge(ctx.arg(3)))?;
         let memory = &mut *ctx.memory;
-        let Some(open_file) = self.open_files.get(&fd) else {
+        let Some(open_file) = self.io.open_files.get(&fd) else {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         };
         let open = open_file.description.borrow();
@@ -1925,7 +1955,7 @@ impl SyscallDispatcher {
             Ok(iovecs) => iovecs,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        let Some(open_file) = self.open_files.get(&fd) else {
+        let Some(open_file) = self.io.open_files.get(&fd) else {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         };
         let open = open_file.description.borrow();
@@ -2007,7 +2037,7 @@ impl SyscallDispatcher {
                 errno: LINUX_ESPIPE,
             });
         }
-        let Some(open_file) = self.open_files.get(&fd) else {
+        let Some(open_file) = self.io.open_files.get(&fd) else {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         };
         let open = open_file.description.borrow();
@@ -2074,7 +2104,7 @@ impl SyscallDispatcher {
                 errno: LINUX_ESPIPE,
             });
         }
-        let Some(open_file) = self.open_files.get(&fd) else {
+        let Some(open_file) = self.io.open_files.get(&fd) else {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         };
         let open = open_file.description.borrow();
@@ -2155,7 +2185,7 @@ impl SyscallDispatcher {
         let written = usize::try_from(value).unwrap_or(0);
         offset = offset.saturating_add(written);
         if offset_address == 0 {
-            if let Some(open_file) = self.open_files.get(&in_fd) {
+            if let Some(open_file) = self.io.open_files.get(&in_fd) {
                 let mut open = open_file.description.borrow_mut();
                 match &mut *open {
                     OpenDescription::File {
@@ -2228,7 +2258,7 @@ impl SyscallDispatcher {
                 Ok(v) => v,
                 Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
             };
-            let host_fd = match self.open_files.get(&out_fd) {
+            let host_fd = match self.io.open_files.get(&out_fd) {
                 Some(of) => match &*of.description.borrow() {
                     OpenDescription::HostFile { host_fd, writable: true, .. } => *host_fd,
                     OpenDescription::HostFile { .. } => {
@@ -2262,7 +2292,7 @@ impl SyscallDispatcher {
         // Advance the input offset (pointer or the fd's own position).
         let new_in = in_offset.saturating_add(written);
         if off_in_addr == 0 {
-            if let Some(of) = self.open_files.get(&in_fd) {
+            if let Some(of) = self.io.open_files.get(&in_fd) {
                 let mut open = of.description.borrow_mut();
                 match &mut *open {
                     OpenDescription::File { offset, .. }
@@ -2300,7 +2330,7 @@ impl SyscallDispatcher {
                 Err(errno) => Ok(Err(errno)),
             };
         }
-        let Some(in_file) = self.open_files.get(&in_fd) else {
+        let Some(in_file) = self.io.open_files.get(&in_fd) else {
             return Ok(Err(LINUX_EBADF));
         };
         let open = in_file.description.borrow();
@@ -2329,7 +2359,7 @@ impl SyscallDispatcher {
     }
 
     fn sendfile_bytes(&self, in_fd: i32, offset: usize, count: usize) -> Result<Vec<u8>, i32> {
-        let Some(in_file) = self.open_files.get(&in_fd) else {
+        let Some(in_file) = self.io.open_files.get(&in_fd) else {
             return Err(LINUX_EBADF);
         };
         let open = in_file.description.borrow();
@@ -2454,7 +2484,7 @@ impl SyscallDispatcher {
         let written = usize::try_from(value).unwrap_or(0);
         offset = offset.saturating_add(written);
         if off_in_address == 0 {
-            if let Some(open_file) = self.open_files.get(&in_fd) {
+            if let Some(open_file) = self.io.open_files.get(&in_fd) {
                 let mut open = open_file.description.borrow_mut();
                 match &mut *open {
                     OpenDescription::File {
@@ -2479,7 +2509,7 @@ impl SyscallDispatcher {
     }
 
     fn pipe_reader(&self, fd: i32) -> Option<(Rc<RefCell<PipeState>>, u64)> {
-        let open_file = self.open_files.get(&fd)?;
+        let open_file = self.io.open_files.get(&fd)?;
         let open = open_file.description.borrow();
         match &*open {
             OpenDescription::PipeReader { pipe, status_flags } => {
@@ -2490,7 +2520,7 @@ impl SyscallDispatcher {
     }
 
     fn fd_is_pipe_writer(&self, fd: i32) -> Result<bool, i32> {
-        let Some(open_file) = self.open_files.get(&fd) else {
+        let Some(open_file) = self.io.open_files.get(&fd) else {
             return if is_stdio_fd(fd) {
                 Ok(false)
             } else {
@@ -2509,7 +2539,7 @@ impl SyscallDispatcher {
     /// The raw host fd backing `fd` if it is a [`OpenDescription::HostPipe`]
     /// read end, else `None`. Lets `splice` drain a real host pipe.
     fn host_pipe_read_fd(&self, fd: i32) -> Option<i32> {
-        let open_file = self.open_files.get(&fd)?;
+        let open_file = self.io.open_files.get(&fd)?;
         let open = open_file.description.borrow();
         match &*open {
             OpenDescription::HostPipe {
@@ -2525,7 +2555,7 @@ impl SyscallDispatcher {
         if is_stdio_fd(fd) {
             return None;
         }
-        let Some(open_file) = self.open_files.get(&fd) else {
+        let Some(open_file) = self.io.open_files.get(&fd) else {
             return Some(LINUX_EBADF);
         };
         let open = open_file.description.borrow();
@@ -2593,7 +2623,7 @@ impl SyscallDispatcher {
             }
             XattrTarget::Fd => {
                 let fd = request.arg(0) as i32;
-                let open_file = self.open_files.get(&fd).ok_or(LINUX_EBADF)?;
+                let open_file = self.io.open_files.get(&fd).ok_or(LINUX_EBADF)?;
                 let open = open_file.description.borrow();
                 match &*open {
                     OpenDescription::File { path, .. }
@@ -2828,7 +2858,7 @@ impl SyscallDispatcher {
         // a pipe, an eventfd, or some other resource. Only after we've
         // confirmed there's no open description do we fall back to the
         // dispatcher's built-in stdout/stderr buffers.
-        if let Some(open_file) = self.open_files.get(&(fd as i32)).cloned() {
+        if let Some(open_file) = self.io.open_files.get(&(fd as i32)).cloned() {
             // Take an inner scope so the borrow on the description ends
             // before we touch self.fs.rootfs_vfs.overlay (writable File path below).
             #[allow(dead_code)]
@@ -2914,8 +2944,8 @@ impl SyscallDispatcher {
             return Ok(outcome);
         }
         match fd {
-            1 => self.stdout.extend_from_slice(&bytes),
-            2 => self.stderr.extend_from_slice(&bytes),
+            1 => self.io.stdout.extend_from_slice(&bytes),
+            2 => self.io.stderr.extend_from_slice(&bytes),
             _ => return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF }),
         }
 
@@ -2930,7 +2960,7 @@ impl SyscallDispatcher {
         // stdout/stderr buffers. Without this, `busybox cat`'s
         // `sendfile(1, infile, ...)` writes the file contents to the
         // dispatcher's internal stdout instead of the pipe write end.
-        if let Some(open_file) = self.open_files.get(&fd) {
+        if let Some(open_file) = self.io.open_files.get(&fd) {
             let mut open = open_file.description.borrow_mut();
             return match &mut *open {
                 OpenDescription::PipeWriter { pipe, .. } => write_pipe(bytes, pipe),
@@ -2951,7 +2981,7 @@ impl SyscallDispatcher {
                 _ => DispatchOutcome::Errno { errno: LINUX_EBADF },
             };
         }
-        if self.stream_stdio && (fd == 1 || fd == 2) {
+        if self.io.stream_stdio && (fd == 1 || fd == 2) {
             let n = unsafe {
                 libc::write(fd, bytes.as_ptr() as *const _, bytes.len())
             };
@@ -2964,8 +2994,8 @@ impl SyscallDispatcher {
             return DispatchOutcome::Returned { value: n as i64 };
         }
         match fd {
-            1 => self.stdout.extend_from_slice(bytes),
-            2 => self.stderr.extend_from_slice(bytes),
+            1 => self.io.stdout.extend_from_slice(bytes),
+            2 => self.io.stderr.extend_from_slice(bytes),
             _ => return DispatchOutcome::Errno { errno: LINUX_EBADF },
         }
         DispatchOutcome::Returned {
@@ -3004,7 +3034,7 @@ impl SyscallDispatcher {
             // redirects (eg `dup3(pipe_write, 1)`) actually plumb
             // through the redirected description rather than the
             // built-in stdout buffer.
-            if let Some(open_file) = self.open_files.get(&(fd as i32)).cloned() {
+            if let Some(open_file) = self.io.open_files.get(&(fd as i32)).cloned() {
                 enum FileWriteback {
                     None,
                     Update { path: String, contents: Vec<u8> },
@@ -3087,7 +3117,7 @@ impl SyscallDispatcher {
                     .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
                 continue;
             }
-            if self.stream_stdio && (fd == 1 || fd == 2) {
+            if self.io.stream_stdio && (fd == 1 || fd == 2) {
                 let n = unsafe {
                     libc::write(fd as i32, bytes.as_ptr() as *const _, bytes.len())
                 };
@@ -3102,8 +3132,8 @@ impl SyscallDispatcher {
                 continue;
             }
             match fd {
-                1 => self.stdout.extend_from_slice(&bytes),
-                2 => self.stderr.extend_from_slice(&bytes),
+                1 => self.io.stdout.extend_from_slice(&bytes),
+                2 => self.io.stderr.extend_from_slice(&bytes),
                 _ => return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF }),
             }
             total = total
@@ -3890,7 +3920,7 @@ impl SyscallDispatcher {
         statbuf: u64,
         memory: &mut impl GuestMemory,
     ) -> DispatchOutcome {
-        let Some(open_file) = self.open_files.get(&fd) else {
+        let Some(open_file) = self.io.open_files.get(&fd) else {
             if is_stdio_fd(fd) {
                 // Glibc cat/head/etc fstat stdout on startup to decide
                 // whether they're talking to a regular file (use POSIX
@@ -3990,7 +4020,7 @@ impl SyscallDispatcher {
         statxbuf: u64,
         memory: &mut impl GuestMemory,
     ) -> DispatchOutcome {
-        let Some(open_file) = self.open_files.get(&fd) else {
+        let Some(open_file) = self.io.open_files.get(&fd) else {
             return DispatchOutcome::Errno { errno: LINUX_EBADF };
         };
         let open = open_file.description.borrow();
@@ -4040,10 +4070,10 @@ impl SyscallDispatcher {
             return Ok(path.to_owned());
         }
         if dirfd == LINUX_AT_FDCWD {
-            return Ok(join_rootfs_path(&self.cwd, path));
+            return Ok(join_rootfs_path(&self.io.cwd, path));
         }
 
-        match self.open_files.get(&(dirfd as i32)) {
+        match self.io.open_files.get(&(dirfd as i32)) {
             Some(open_file) => match &*open_file.description.borrow() {
                 OpenDescription::Directory { path: dir, .. } => Ok(join_rootfs_path(dir, path)),
                 OpenDescription::File { .. }
