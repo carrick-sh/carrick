@@ -10050,10 +10050,15 @@ fn join_rootfs_path(base: &str, path: &str) -> String {
 }
 
 fn display_rootfs_path(path: &Path) -> String {
-    if path.as_os_str().is_empty() {
+    // Idempotent: callers pass either a relative (normalised) path or an
+    // already-absolute one. Strip leading slashes and prepend exactly one so
+    // we never produce a double leading slash (getcwd returned "//tmp/...").
+    let s = path.to_string_lossy();
+    let trimmed = s.trim_start_matches('/');
+    if trimmed.is_empty() {
         "/".to_owned()
     } else {
-        format!("/{}", path.display())
+        format!("/{trimmed}")
     }
 }
 
