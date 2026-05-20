@@ -12,6 +12,11 @@
 //! deliberately with Docker running and the signed release binary present:
 //!   cargo test --test conformance -- --nocapture
 
+// Test code: helpers are plain `fn`s (not `#[test]`/`#[cfg(test)]`), so clippy's
+// allow-expect-in-tests heuristic does not exempt them. The no-panic gate targets
+// production code, so allow unwrap/expect across this integration test file.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
