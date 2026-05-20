@@ -7815,12 +7815,37 @@ fn linux_task_name_from_bytes(bytes: &[u8]) -> [u8; LINUX_TASK_COMM_LEN] {
 pub fn set_host_process_name(comm: &[u8]) {
     let end = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
     let name = String::from_utf8_lossy(&comm[..end]);
-    // "carrick: " is 9 bytes; keep the whole thing under 64.
     let label = format!("carrick: {}", name.trim());
-    let truncated: String = label.chars().take(63).collect();
-    if let Ok(cstr) = std::ffi::CString::new(truncated) {
+
+    // (1) Thread name — shows in lldb / Instruments / sample / crash
+    // reports. Capped at MAXTHREADNAMESIZE (64).
+    let thread_label: String = label.chars().take(63).collect();
+    if let Ok(cstr) = std::ffi::CString::new(thread_label) {
         unsafe {
             libc::pthread_setname_np(cstr.as_ptr());
+        }
+    }
+
+    // (2) argv[0] in-place overwrite — what `ps` reads. macOS's `ps`
+    // shows the argument vector; overwriting argv[0]'s bytes (bounded
+    // by its original length so we never run past the contiguous
+    // argv/env block) changes the visible command. This is the same
+    // technique libuv/Node use for `process.title`. NUL-pad the
+    // remainder so a shortened name doesn't leave stale trailing text.
+    unsafe {
+        let argv = libc::_NSGetArgv();
+        if !argv.is_null() && !(*argv).is_null() {
+            let arg0 = *(*argv);
+            if !arg0.is_null() {
+                let orig_len = libc::strlen(arg0);
+                let bytes = label.as_bytes();
+                let n = bytes.len().min(orig_len);
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), arg0 as *mut u8, n);
+                // Pad the rest of the original arg0 with NULs.
+                for i in n..orig_len {
+                    *arg0.add(i) = 0;
+                }
+            }
         }
     }
 }
