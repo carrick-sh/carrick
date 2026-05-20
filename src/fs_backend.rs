@@ -751,19 +751,33 @@ impl FsBackend for HostFsBackend {
     }
 
     fn child_names(&self, dir: &str) -> Vec<(String, RootFsEntryKind)> {
-        let Some(prefix) = normalize(dir) else {
+        let Some(normalized) = normalize(dir) else {
+            return Vec::new();
+        };
+        // Read the LIVE cap-std directory. Files created via open_raw_fd
+        // (which hands back a raw fd and never touches the in-memory
+        // known_files set) and directories created via mkdir both land on
+        // the scratch disk, and the whole rootfs is materialised there too.
+        // The old known_files/dirs_created enumeration missed raw-fd
+        // creations entirely, so apt's downloaded .deb existed on disk and
+        // was readable by path but invisible to readdir/glob — dpkg then
+        // couldn't find it.
+        let read = match Self::rel_path(&normalized) {
+            Some(rel) => self.dir.read_dir(rel),
+            None => self.dir.entries(), // scratch root == guest "/"
+        };
+        let Ok(read) = read else {
             return Vec::new();
         };
         let mut out = Vec::new();
-        for path in self.known_files.iter() {
-            if let Some(name) = child_name(&prefix, path) {
-                out.push((name, RootFsEntryKind::File));
-            }
-        }
-        for path in self.dirs_created.iter() {
-            if let Some(name) = child_name(&prefix, path) {
-                out.push((name, RootFsEntryKind::Directory));
-            }
+        for entry in read.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let kind = match entry.file_type() {
+                Ok(ft) if ft.is_dir() => RootFsEntryKind::Directory,
+                Ok(ft) if ft.is_symlink() => RootFsEntryKind::Symlink,
+                _ => RootFsEntryKind::File,
+            };
+            out.push((name, kind));
         }
         out
     }
