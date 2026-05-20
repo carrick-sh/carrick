@@ -50,6 +50,14 @@ mod carrick_usdt {
     /// is the bytes returned (for File) or `0` (for Directory /
     /// errno). `errno` is `0` on success.
     fn path__open(_: u32, _: &str, _: u64, _: i32) {}
+    /// Fires when a guest process exits via exit_group. `pid` is the
+    /// carrick-host pid; correlate with `execve__loaded` (same pid) to
+    /// see which binary exited with which code.
+    fn guest__exit(_: u32, _: i32) {}
+    /// Fires on execve with the joined argv (space-separated), so
+    /// dtrace operators can see exactly how the guest invokes a
+    /// child (e.g. apt's sqv method calling /usr/bin/sqv).
+    fn execve__argv(_: u32, _: &str, _: &str) {}
 }
 
 pub fn fork_pre(pc: u64, elr: u64, cpsr: u64) {
@@ -59,6 +67,17 @@ pub fn fork_pre(pc: u64, elr: u64, cpsr: u64) {
 pub fn path_open(path: &str, result_size: u64, errno: i32) {
     let pid = unsafe { libc::getpid() as u32 };
     carrick_usdt::path__open!(|| (pid, path, result_size, errno));
+}
+
+pub fn guest_exit(code: i32) {
+    let pid = unsafe { libc::getpid() as u32 };
+    carrick_usdt::guest__exit!(|| (pid, code));
+}
+
+pub fn execve_argv(path: &str, argv: &[String]) {
+    let pid = unsafe { libc::getpid() as u32 };
+    let joined = argv.join(" ");
+    carrick_usdt::execve__argv!(|| (pid, path, joined.as_str()));
 }
 
 

@@ -434,6 +434,7 @@ where
 
         match outcome {
             DispatchOutcome::Exit { code } => {
+                crate::probes::guest_exit(code);
                 if runtime.is_forked_child() {
                     forked_child_exit(code, dispatcher.stdout(), dispatcher.stderr());
                 }
@@ -468,6 +469,7 @@ where
                 last_syscall_retval = Some(retval);
             }
             DispatchOutcome::Execve { path, argv, env } => {
+                crate::probes::execve_argv(&path, &argv);
                 match load_execve_image(&dispatcher, &path, argv, env) {
                     Ok(new_image) => {
                         crate::probes::execve_loaded(
@@ -686,6 +688,7 @@ where
                 last_syscall_retval = Some(retval);
             }
             DispatchOutcome::Execve { path, argv, env } => {
+                crate::probes::execve_argv(&path, &argv);
                 match load_execve_image(&dispatcher, &path, argv, env) {
                     Ok(new_image) => {
                         crate::probes::execve_loaded(
