@@ -1037,15 +1037,20 @@ fn zeroed_region(
     size: u64,
     perms: SegmentPerms,
 ) -> Result<MemoryRegion, AddressSpaceError> {
-    let bytes_len = usize::try_from(size).map_err(|_| AddressSpaceError::RegionTooLarge(size))?;
     let end = start
         .checked_add(size)
         .ok_or(AddressSpaceError::RegionOverflow { start, size })?;
+    // A zeroed region (heap, mmap arena) carries NO payload bytes: the extent
+    // is end-start, but the initial contents are entirely zero. We let HVF's
+    // lazily zero-filled guest memory provide that, instead of materialising a
+    // 512 MiB zero Vec (which, copied into the HVF buffer, pinned ~2 GiB
+    // resident per guest process). `MemoryRegion::bytes` is only the
+    // initialised prefix; everything past it reads as zero.
     Ok(MemoryRegion {
         start,
         end,
         perms,
-        bytes: vec![0; bytes_len],
+        bytes: Vec::new(),
     })
 }
 

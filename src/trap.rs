@@ -130,12 +130,15 @@ impl GuestMappingPlan {
             let mapped_len = usize::try_from(mapped_size)
                 .map_err(|_| TrapError::MappingTooLarge(mapped_size))?;
             let offset_in_mapping = region.start - guest_start;
-            let payload_offset = usize::try_from(offset_in_mapping)
-                .map_err(|_| TrapError::MappingTooLarge(offset_in_mapping))?;
 
-            let mut image = vec![0; mapped_len];
-            image[payload_offset..payload_offset + region.bytes().len()]
-                .copy_from_slice(region.bytes());
+            // Keep only the payload bytes, not a full zero-padded copy of the
+            // (potentially 512 MiB) mapping. hv_vm_allocate hands back lazily
+            // zero-filled, HVF-managed memory, so we write just the payload at
+            // its offset and let untouched pages fault in on demand. Building
+            // and writing the whole region here is what pinned ~2 GiB resident
+            // per guest process for mappings the guest never touches.
+            let _ = mapped_len;
+            let image = region.bytes().to_vec();
 
             mappings.push(GuestMapping {
                 guest_start,
@@ -420,9 +423,11 @@ impl HvfTrapEngine {
             memory
                 .map(mapping.guest_start, hvf_perms(mapping.perms))
                 .map_err(hvf_error)?;
-            memory
-                .write(mapping.guest_start, &mapping.image)
-                .map_err(hvf_error)?;
+            if !mapping.image.is_empty() {
+                memory
+                    .write(mapping.guest_start + mapping.offset_in_mapping, &mapping.image)
+                    .map_err(hvf_error)?;
+            }
             if std::env::var_os("CARRICK_TRACE_MAPS").is_some() {
                 eprintln!(
                     "MAP guest_start=0x{:x} mapped_size=0x{:x} payload_size=0x{:x} perms=r{}w{}x{}",
@@ -1247,9 +1252,11 @@ impl HvfInner {
             memory
                 .map(mapping.guest_start, hvf_perms(mapping.perms))
                 .map_err(hvf_error)?;
-            memory
-                .write(mapping.guest_start, &mapping.image)
-                .map_err(hvf_error)?;
+            if !mapping.image.is_empty() {
+                memory
+                    .write(mapping.guest_start + mapping.offset_in_mapping, &mapping.image)
+                    .map_err(hvf_error)?;
+            }
             let host_addr = memory.host_addr();
             let size = usize::try_from(mapping.mapped_size)
                 .map_err(|_| TrapError::MappingTooLarge(mapping.mapped_size))?;
