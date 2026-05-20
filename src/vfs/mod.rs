@@ -36,9 +36,13 @@
 
 pub mod dev;
 pub mod mount;
+pub mod proc;
+pub mod sys;
 
 pub use dev::DevVfs;
 pub use mount::VfsMounts;
+pub use proc::ProcVfs;
+pub use sys::SysVfs;
 
 use std::path::PathBuf;
 
@@ -108,7 +112,7 @@ pub struct OpenFlags {
 /// * Step 3 (ProcVfs/SysVfs): a `Bytes` variant for synthetic files.
 /// * Step 4 (RootFsVfs): variants for overlay-backed regular files
 ///   and directories.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VfsHandle {
     /// A host fd that the dispatcher should route I/O through via the
     /// `HostPipe` `OpenDescription` variant. `is_read_end` controls
@@ -120,6 +124,26 @@ pub enum VfsHandle {
         is_read_end: bool,
         status_flags: u32,
     },
+    /// In-memory bytes. Used by ProcVfs/SysVfs for the synthetic
+    /// `/proc/*` and `/sys/*` files; the dispatcher converts this to
+    /// an `OpenDescription::SyntheticFile`.
+    Bytes {
+        path: String,
+        contents: Vec<u8>,
+        status_flags: u32,
+    },
+}
+
+/// Live dispatcher state that some VFS mounts need at `open` time
+/// (e.g. `/proc/self/maps` reflecting the loaded address space).
+/// Threading this through `Vfs::open` keeps the trait independent of
+/// the dispatcher's internal struct.
+#[derive(Default)]
+pub struct OpenContext<'a> {
+    pub executable_path: Option<&'a str>,
+    pub address_space_regions: Option<&'a [crate::dispatch::ProcMapsEntry]>,
+    pub brk_current: u64,
+    pub mmap_next: u64,
 }
 
 /// The path-and-metadata surface of a single mount point. Open-side
@@ -151,6 +175,7 @@ pub trait Vfs: Send {
         &mut self,
         _path: &str,
         _flags: OpenFlags,
+        _ctx: &OpenContext<'_>,
     ) -> Result<VfsHandle, VfsError> {
         Err(crate::dispatch::LINUX_ENOSYS)
     }

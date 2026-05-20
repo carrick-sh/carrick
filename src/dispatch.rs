@@ -414,6 +414,14 @@ pub enum DispatchError {
 /// stack, and bootstrap pages — not the hard-coded four-line summary
 /// we shipped before.
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Outcome of [`SyscallDispatcher::try_vfs_open`].
+enum VfsOpenAttempt {
+    Installed(i32),
+    Errno(i32),
+    FallThrough,
+}
+
+#[derive(Debug, Clone)]
 pub struct ProcMapsEntry {
     pub start: u64,
     pub end: u64,
@@ -665,6 +673,8 @@ impl SyscallDispatcher {
             vfs_mounts: {
                 let mut m = crate::vfs::VfsMounts::new();
                 m.mount("/dev", Box::new(crate::vfs::DevVfs::new()));
+                m.mount("/proc", Box::new(crate::vfs::ProcVfs::new()));
+                m.mount("/sys", Box::new(crate::vfs::SysVfs::new()));
                 m
             },
         }
@@ -3949,91 +3959,30 @@ impl SyscallDispatcher {
             _ => None,
         };
 
-        // /dev character devices: pass through to the host's same-named
-        // devices. macOS has /dev/null /dev/zero /dev/random /dev/urandom
-        // /dev/tty /dev/full with identical semantics, so a real
-        // libc::open on the host returns a working fd; we wrap it as a
-        // HostPipe so subsequent read/write/poll route through the host
-        // syscall. Without this, every Debian shell script that
-        // redirects stdout to /dev/null fails with ENOENT.
-        // /dev/* passthrough now goes through DevVfs (mounted at /dev
-        // in `SyscallDispatcher::new`). The dispatcher converts the
-        // returned `VfsHandle::HostFd` into an `OpenDescription::HostPipe`
-        // and inserts it into the open-files table.
-        if let Some(mut m) = self.vfs_mounts.resolve_mut(&path) {
-            let vfs_flags = crate::vfs::OpenFlags {
-                read: matches!(access, LINUX_O_RDONLY | LINUX_O_RDWR),
-                write: matches!(access, LINUX_O_WRONLY | LINUX_O_RDWR),
-                nonblock: flags & LINUX_O_NONBLOCK != 0,
-                cloexec: flags & LINUX_O_CLOEXEC != 0,
-                append: flags & LINUX_O_APPEND != 0,
-                trunc: flags & LINUX_O_TRUNC != 0,
-                create: flags & LINUX_O_CREAT != 0,
-                excl: flags & LINUX_O_EXCL != 0,
-                directory: flags & LINUX_O_DIRECTORY != 0,
-                nofollow: flags & 0o400000 != 0,
-                mode: 0,
-            };
-            match m.vfs.open(&m.full_path, vfs_flags) {
-                Ok(crate::vfs::VfsHandle::HostFd {
-                    host_fd,
-                    is_read_end,
-                    status_flags,
-                }) => {
-                    let new_fd = match self.allocate_fd(3) {
-                        Some(fd) => fd,
-                        None => {
-                            unsafe { libc::close(host_fd) };
-                            return Ok(DispatchOutcome::Errno {
-                                errno: linux_errno::EMFILE,
-                            });
-                        }
-                    };
-                    self.insert_open_file(
-                        new_fd,
-                        OpenFile {
-                            description: Rc::new(RefCell::new(OpenDescription::HostPipe {
-                                host_fd,
-                                is_read_end,
-                                status_flags: status_flags as u64,
-                            })),
-                            fd_flags: linux_fd_flags_from_open_flags(flags),
-                        },
-                    );
-                    return Ok(DispatchOutcome::Returned { value: new_fd as i64 });
-                }
-                Err(errno) if errno == LINUX_ENOSYS => {
-                    // The mount doesn't implement open — fall through
-                    // to the legacy code path below.
-                }
-                Err(errno) => {
-                    return Ok(DispatchOutcome::Errno { errno });
-                }
+        // VFS-mount routing. DevVfs serves /dev/*, ProcVfs serves
+        // /proc/*, SysVfs serves /sys/*. The dispatcher converts each
+        // VfsHandle variant into the matching OpenDescription, then
+        // falls back to the legacy synthetic-then-overlay-then-rootfs
+        // chain for any path no mount claims (or that the mount
+        // returns ENOSYS for).
+        let vfs_outcome = self.try_vfs_open(&path, access, flags);
+        match vfs_outcome {
+            VfsOpenAttempt::Installed(fd) => {
+                return Ok(DispatchOutcome::Returned { value: fd as i64 });
             }
+            VfsOpenAttempt::Errno(errno) => {
+                return Ok(DispatchOutcome::Errno { errno });
+            }
+            VfsOpenAttempt::FallThrough => {}
         }
 
-        let description = if let Some(contents) = synthetic_proc_file(&path, &self.synthetic_proc_context())
-        {
-            if writable_request {
-                return Ok(DispatchOutcome::Errno { errno: LINUX_EACCES });
-            }
-            OpenDescription::SyntheticFile {
-                path,
-                contents,
-                offset: 0,
-                status_flags: flags & !LINUX_O_CLOEXEC,
-            }
-        } else if let Some(contents) = synthetic_sys_file(&path) {
-            if writable_request {
-                return Ok(DispatchOutcome::Errno { errno: LINUX_EACCES });
-            }
-            OpenDescription::SyntheticFile {
-                path,
-                contents,
-                offset: 0,
-                status_flags: flags & !LINUX_O_CLOEXEC,
-            }
-        } else if let Some(mut contents) = overlay_file_bytes {
+        // /proc/* and /sys/* synthetic file opens now flow through
+        // ProcVfs / SysVfs (mounted in `SyscallDispatcher::new`). Any
+        // unknown /proc or /sys path returns ENOSYS from the mount
+        // and falls through to the overlay+rootfs lookup below, which
+        // handles directory entries like /proc itself.
+
+        let description = if let Some(mut contents) = overlay_file_bytes {
             // Overlay-backed regular file. The local cache mirrors
             // what's currently in the overlay; subsequent writes
             // push back into it.
@@ -5230,6 +5179,104 @@ impl SyscallDispatcher {
         );
         DispatchOutcome::Returned {
             value: new_fd as i64,
+        }
+    }
+
+    /// Try to satisfy an open via the VFS mount table. Returns
+    /// `Installed(fd)` when a mount handled it, `Errno(e)` when a
+    /// mount explicitly failed, and `FallThrough` when no mount
+    /// claimed the path (or the claiming mount returned ENOSYS). The
+    /// caller wraps the legacy lookup chain inside `FallThrough`.
+    fn try_vfs_open(&mut self, path: &str, access: u64, flags: u64) -> VfsOpenAttempt {
+        // Build the OpenContext from owned/copy data so the mut
+        // borrow of `vfs_mounts` doesn't conflict with reads from
+        // sibling fields.
+        let exec_path = self.executable_path.clone();
+        let addr_regions = self.address_space_regions.clone();
+        let brk = self.brk_current;
+        let mmap = self.mmap_next;
+        let ctx = crate::vfs::OpenContext {
+            executable_path: Some(exec_path.as_str()),
+            address_space_regions: addr_regions.as_deref(),
+            brk_current: brk,
+            mmap_next: mmap,
+        };
+        let vfs_flags = crate::vfs::OpenFlags {
+            read: matches!(access, LINUX_O_RDONLY | LINUX_O_RDWR),
+            write: matches!(access, LINUX_O_WRONLY | LINUX_O_RDWR),
+            nonblock: flags & LINUX_O_NONBLOCK != 0,
+            cloexec: flags & LINUX_O_CLOEXEC != 0,
+            append: flags & LINUX_O_APPEND != 0,
+            trunc: flags & LINUX_O_TRUNC != 0,
+            create: flags & LINUX_O_CREAT != 0,
+            excl: flags & LINUX_O_EXCL != 0,
+            directory: flags & LINUX_O_DIRECTORY != 0,
+            nofollow: flags & 0o400000 != 0,
+            mode: 0,
+        };
+        let handle = {
+            let Some(mut m) = self.vfs_mounts.resolve_mut(path) else {
+                return VfsOpenAttempt::FallThrough;
+            };
+            match m.vfs.open(&m.full_path, vfs_flags, &ctx) {
+                Ok(h) => h,
+                Err(errno) if errno == LINUX_ENOSYS => {
+                    return VfsOpenAttempt::FallThrough;
+                }
+                Err(errno) => {
+                    return VfsOpenAttempt::Errno(errno);
+                }
+            }
+        };
+        match handle {
+            crate::vfs::VfsHandle::HostFd {
+                host_fd,
+                is_read_end,
+                status_flags,
+            } => {
+                let new_fd = match self.allocate_fd(3) {
+                    Some(fd) => fd,
+                    None => {
+                        unsafe { libc::close(host_fd) };
+                        return VfsOpenAttempt::Errno(linux_errno::EMFILE);
+                    }
+                };
+                self.insert_open_file(
+                    new_fd,
+                    OpenFile {
+                        description: Rc::new(RefCell::new(OpenDescription::HostPipe {
+                            host_fd,
+                            is_read_end,
+                            status_flags: status_flags as u64,
+                        })),
+                        fd_flags: linux_fd_flags_from_open_flags(flags),
+                    },
+                );
+                VfsOpenAttempt::Installed(new_fd)
+            }
+            crate::vfs::VfsHandle::Bytes {
+                path,
+                contents,
+                status_flags,
+            } => {
+                let new_fd = match self.allocate_fd(3) {
+                    Some(fd) => fd,
+                    None => return VfsOpenAttempt::Errno(linux_errno::EMFILE),
+                };
+                self.insert_open_file(
+                    new_fd,
+                    OpenFile {
+                        description: Rc::new(RefCell::new(OpenDescription::SyntheticFile {
+                            path,
+                            contents,
+                            offset: 0,
+                            status_flags: ((status_flags as u64) | flags) & !LINUX_O_CLOEXEC,
+                        })),
+                        fd_flags: linux_fd_flags_from_open_flags(flags),
+                    },
+                );
+                VfsOpenAttempt::Installed(new_fd)
+            }
         }
     }
 
@@ -8329,11 +8376,11 @@ fn write_synthetic_statx(
 /// renderers. Keeps the synthetic helpers as free functions while
 /// letting them see live state (executable path, address-space
 /// regions, current brk, next mmap address) without taking `&self`.
-struct SyntheticProcContext<'a> {
-    executable_path: &'a str,
-    address_space_regions: Option<&'a [ProcMapsEntry]>,
-    brk_current: u64,
-    mmap_next: u64,
+pub struct SyntheticProcContext<'a> {
+    pub executable_path: &'a str,
+    pub address_space_regions: Option<&'a [ProcMapsEntry]>,
+    pub brk_current: u64,
+    pub mmap_next: u64,
 }
 
 impl SyscallDispatcher {
@@ -8347,7 +8394,7 @@ impl SyscallDispatcher {
     }
 }
 
-fn synthetic_proc_file(path: &str, ctx: &SyntheticProcContext<'_>) -> Option<Vec<u8>> {
+pub fn synthetic_proc_file(path: &str, ctx: &SyntheticProcContext<'_>) -> Option<Vec<u8>> {
     match path {
         "/proc/cmdline" => Some(synthetic_proc_cmdline().to_vec()),
         "/proc/cpuinfo" => Some(synthetic_proc_cpuinfo().to_vec()),
@@ -8394,7 +8441,7 @@ fn synthetic_proc_file(path: &str, ctx: &SyntheticProcContext<'_>) -> Option<Vec
     }
 }
 
-fn synthetic_sys_file(path: &str) -> Option<Vec<u8>> {
+pub fn synthetic_sys_file(path: &str) -> Option<Vec<u8>> {
     match path {
         "/sys/devices/system/cpu/online" => Some(synthetic_sys_cpu_online().to_vec()),
         "/sys/devices/system/cpu/possible" => Some(synthetic_sys_cpu_possible().to_vec()),

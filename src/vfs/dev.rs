@@ -9,7 +9,7 @@ use std::ffi::CString;
 
 use crate::dispatch::{linux_errno, LINUX_ENOENT, LINUX_ENOTDIR};
 
-use super::{DirEnt, EntryKind, Metadata, OpenFlags, Vfs, VfsError, VfsHandle};
+use super::{DirEnt, EntryKind, Metadata, OpenContext, OpenFlags, Vfs, VfsError, VfsHandle};
 
 /// macOS character devices that have the same name and semantics as
 /// their Linux counterparts. `/dev/full` is mapped to `/dev/null`
@@ -94,6 +94,7 @@ impl Vfs for DevVfs {
         &mut self,
         path: &str,
         flags: OpenFlags,
+        _ctx: &OpenContext<'_>,
     ) -> Result<VfsHandle, VfsError> {
         let host_path = Self::host_path_for(path).ok_or(LINUX_ENOENT)?;
 
@@ -216,6 +217,7 @@ mod tests {
                     read: true,
                     ..Default::default()
                 },
+                &OpenContext::default(),
             )
             .unwrap();
         match h {
@@ -225,6 +227,7 @@ mod tests {
                 // Close to avoid leaking the fd.
                 unsafe { libc::close(host_fd) };
             }
+            other => panic!("expected HostFd, got {:?}", other),
         }
     }
 
@@ -238,6 +241,7 @@ mod tests {
                     write: true,
                     ..Default::default()
                 },
+                &OpenContext::default(),
             )
             .unwrap();
         match h {
@@ -246,6 +250,7 @@ mod tests {
                 assert!(!is_read_end);
                 unsafe { libc::close(host_fd) };
             }
+            other => panic!("expected HostFd, got {:?}", other),
         }
     }
 
@@ -261,6 +266,7 @@ mod tests {
                     write: true,
                     ..Default::default()
                 },
+                &OpenContext::default(),
             )
             .unwrap();
         match h {
@@ -268,6 +274,7 @@ mod tests {
                 assert!(host_fd >= 0);
                 unsafe { libc::close(host_fd) };
             }
+            other => panic!("expected HostFd, got {:?}", other),
         }
     }
 
@@ -280,7 +287,8 @@ mod tests {
                 OpenFlags {
                     read: true,
                     ..Default::default()
-                }
+                },
+                &OpenContext::default(),
             ),
             Err(LINUX_ENOENT)
         );
@@ -297,6 +305,7 @@ mod tests {
                     nonblock: true,
                     ..Default::default()
                 },
+                &OpenContext::default(),
             )
             .unwrap();
         match h {
@@ -309,6 +318,7 @@ mod tests {
                 assert_ne!(status_flags & (crate::dispatch::LINUX_O_NONBLOCK as u32), 0);
                 unsafe { libc::close(host_fd) };
             }
+            other => panic!("expected HostFd, got {:?}", other),
         }
     }
 }
