@@ -344,21 +344,10 @@ pub struct SyscallDispatcher {
     personality: u64,
     dumpable: i64,
     task_name: [u8; LINUX_TASK_COMM_LEN],
-    umask: u32,
-    /// Tracked (real, effective, saved) uid and gid. Carrick runs the
-    /// guest as a single host identity, but tools like apt's _apt
-    /// privsep drop to a non-root user via setresuid/setresgid and
-    /// then VERIFY the new identity via getuid/geteuid/getresuid (and
-    /// likewise for gid). Returning the host's identity unconditionally
-    /// breaks the verification with "Could not switch group". We
-    /// accept any setres*() the guest requests, record the values, and
-    /// echo them back to the corresponding get*() calls.
-    cred_ruid: u32,
-    cred_euid: u32,
-    cred_suid: u32,
-    cred_rgid: u32,
-    cred_egid: u32,
-    cred_sgid: u32,
+    /// Owned credentials subsystem state (uids/gids + umask). See
+    /// [`creds::CredState`]. Handlers that touch only credential state
+    /// borrow `self.creds` narrowly.
+    creds: creds::CredState,
     /// Owned signal subsystem state (handlers, mask, pending set, alt
     /// stack). See [`signal::SignalState`]. Handlers that touch only
     /// signal state borrow `self.signal` narrowly.
@@ -812,15 +801,7 @@ impl SyscallDispatcher {
             personality: 0,
             dumpable: 1,
             task_name: linux_task_name_from_bytes(b"carrick"),
-            umask: LINUX_DEFAULT_UMASK,
-            // Default identity is root (uid 0, gid 0) — what `id` shows
-            // in a typical container.
-            cred_ruid: 0,
-            cred_euid: 0,
-            cred_suid: 0,
-            cred_rgid: 0,
-            cred_egid: 0,
-            cred_sgid: 0,
+            creds: creds::CredState::new(),
             signal: signal::SignalState::new(),
             address_space_regions: None,
             vfs_mounts: {
