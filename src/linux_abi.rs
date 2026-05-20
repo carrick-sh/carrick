@@ -308,6 +308,88 @@ pub struct LinuxFdPair {
     pub write_fd: i32,
 }
 
+// ----- Netlink (AF_NETLINK / NETLINK_ROUTE) ABI ---------------------------
+//
+// macOS has no AF_NETLINK, so carrick synthesises just enough of the
+// rtnetlink wire format for glibc's __check_pf / getaddrinfo and the
+// `ip`/`ss` tools to enumerate a loopback interface and stop. These are
+// the kernel uapi layouts (all little-endian on aarch64).
+
+/// `struct nlmsghdr` — header on every netlink message.
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct LinuxNlMsgHdr {
+    pub nlmsg_len: u32,
+    pub nlmsg_type: u16,
+    pub nlmsg_flags: u16,
+    pub nlmsg_seq: u32,
+    pub nlmsg_pid: u32,
+}
+
+/// `struct ifinfomsg` — payload of an RTM_NEWLINK message.
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct LinuxIfInfoMsg {
+    pub ifi_family: u8,
+    pub ifi_pad: u8,
+    pub ifi_type: u16,
+    pub ifi_index: i32,
+    pub ifi_flags: u32,
+    pub ifi_change: u32,
+}
+
+/// `struct ifaddrmsg` — payload of an RTM_NEWADDR message.
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct LinuxIfAddrMsg {
+    pub ifa_family: u8,
+    pub ifa_prefixlen: u8,
+    pub ifa_flags: u8,
+    pub ifa_scope: u8,
+    pub ifa_index: u32,
+}
+
+/// `struct rtattr` — TLV attribute header used inside rtnetlink payloads.
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct LinuxRtAttr {
+    pub rta_len: u16,
+    pub rta_type: u16,
+}
+
+// nlmsg_type values.
+pub const LINUX_NLMSG_NOOP: u16 = 1;
+pub const LINUX_NLMSG_ERROR: u16 = 2;
+pub const LINUX_NLMSG_DONE: u16 = 3;
+pub const LINUX_RTM_GETLINK: u16 = 18;
+pub const LINUX_RTM_NEWLINK: u16 = 16;
+pub const LINUX_RTM_GETADDR: u16 = 22;
+pub const LINUX_RTM_NEWADDR: u16 = 20;
+
+// nlmsg_flags.
+pub const LINUX_NLM_F_MULTI: u16 = 0x2;
+
+// Interface flags / types we report for `lo`.
+pub const LINUX_IFF_UP: u32 = 0x1;
+pub const LINUX_IFF_LOOPBACK: u32 = 0x8;
+pub const LINUX_IFF_RUNNING: u32 = 0x40;
+pub const LINUX_ARPHRD_LOOPBACK: u16 = 772;
+
+// rtattr types.
+pub const LINUX_IFLA_ADDRESS: u16 = 1;
+pub const LINUX_IFLA_IFNAME: u16 = 3;
+pub const LINUX_IFA_ADDRESS: u16 = 1;
+pub const LINUX_IFA_LOCAL: u16 = 2;
+pub const LINUX_IFA_LABEL: u16 = 3;
+
 #[repr(C, packed)]
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
