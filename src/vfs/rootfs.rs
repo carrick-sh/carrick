@@ -458,19 +458,28 @@ impl Vfs for RootFsVfs {
     }
 
     fn readlink(&self, path: &str) -> Result<std::path::PathBuf, VfsError> {
-        let rootfs = self.rootfs.as_ref().ok_or(LINUX_ENOENT)?;
-        match rootfs.read_link(path) {
-            Ok(target) => Ok(std::path::PathBuf::from(target)),
-            Err(crate::rootfs::RootFsError::NotFound(_)) => {
-                // Linux readlink(2): EINVAL when the path exists but
-                // isn't a symlink, ENOENT only when it doesn't exist.
-                // apt's realpath() relies on this distinction.
-                match rootfs.symlink_metadata(path) {
-                    Ok(_) => Err(crate::dispatch::LINUX_EINVAL),
-                    Err(_) => Err(LINUX_ENOENT),
-                }
+        // A symlink materialised in the writable overlay (cap-std on
+        // --fs host, where the rootfs layer is dropped after seeding).
+        if let Some(target) = self.overlay.read_link(path) {
+            return Ok(std::path::PathBuf::from(target));
+        }
+        // A symlink in the immutable rootfs layer (present for --fs memory).
+        if let Some(rootfs) = self.rootfs.as_ref() {
+            match rootfs.read_link(path) {
+                Ok(target) => return Ok(std::path::PathBuf::from(target)),
+                Err(crate::rootfs::RootFsError::NotFound(_)) => {}
+                Err(_) => return Err(LINUX_ENOENT),
             }
-            Err(_) => Err(LINUX_ENOENT),
+        }
+        // Not a symlink in either layer. Linux readlink(2) distinguishes
+        // EINVAL (the path EXISTS but isn't a symlink) from ENOENT (no
+        // such path) — apt's realpath()/flAbsPath relies on this. Consult
+        // the layered view so an existing regular file/dir on the disk
+        // overlay yields EINVAL even with the rootfs layer dropped.
+        if self.lookup(path).is_ok() {
+            Err(crate::dispatch::LINUX_EINVAL)
+        } else {
+            Err(LINUX_ENOENT)
         }
     }
 
