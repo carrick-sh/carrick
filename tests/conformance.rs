@@ -24,6 +24,19 @@ use std::sync::{Arc, Mutex};
 /// OTHER's in-flight guest, producing spurious empty-output failures. A
 /// shared lock makes them run one-at-a-time regardless of `--test-threads`.
 static CONFORMANCE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Probes that currently diverge from Linux due to a KNOWN, tracked gap.
+/// A divergence in one of these is treated as an expected-fail (the suite
+/// stays green), but if a known-gap probe unexpectedly PASSES, the test
+/// FAILS so we remove it from this list — that's the signal the gap was
+/// fixed. Each entry must cite the gap.
+///
+/// - "memmap": carrick models MAP_SHARED file mappings as private snapshots
+///   (no live writeback / cross-mapping coherence). This is the root cause
+///   of apt's "Cache is out of sync, can't x-ref a package file" — apt's
+///   DynamicMMap-backed cache needs real shared mappings. Fixing it needs
+///   stage-2 mapping of the host file's mmap into the guest IPA.
+const KNOWN_PROBE_GAPS: &[&str] = &["memmap"];
 use std::time::{Duration, Instant};
 
 /// Per-case wall-clock deadline. A single wedged guest process (e.g. a
@@ -468,6 +481,7 @@ fn conformance_probes() {
 
     let engine = base64::engine::general_purpose::STANDARD;
     let mut failures = Vec::new();
+    let mut fixed_gaps = Vec::new();
     for probe in &probes {
         let name = probe
             .file_name()
@@ -494,13 +508,27 @@ fn conformance_probes() {
             }
         };
 
-        match diff_lines(&carrick_out, &docker_out) {
-            None => eprintln!("PASS {name}"),
-            Some(diff) => {
+        let known_gap = KNOWN_PROBE_GAPS.contains(&name.as_str());
+        match (diff_lines(&carrick_out, &docker_out), known_gap) {
+            (None, false) => eprintln!("PASS {name}"),
+            (None, true) => {
+                // A known-gap probe started passing → the gap is fixed.
+                // Fail loudly so the entry gets removed from KNOWN_PROBE_GAPS.
+                eprintln!("UNEXPECTED PASS {name} (remove from KNOWN_PROBE_GAPS)");
+                fixed_gaps.push(name);
+            }
+            (Some(diff), false) => {
                 eprintln!("FAIL {name}\n{diff}");
                 failures.push(name);
             }
+            (Some(diff), true) => {
+                eprintln!("XFAIL {name} (known gap)\n{diff}");
+            }
         }
     }
+    assert!(
+        fixed_gaps.is_empty(),
+        "known-gap probes now PASS — remove from KNOWN_PROBE_GAPS: {fixed_gaps:?}"
+    );
     assert!(failures.is_empty(), "probe conformance gaps: {failures:?}");
 }
