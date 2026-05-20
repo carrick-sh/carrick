@@ -9149,11 +9149,22 @@ impl SyscallDispatcher {
                     1 => "/dev/stdout",
                     _ => "/dev/stderr",
                 };
-                // Character device (tty/pipe-like), NOT a regular file —
-                // so tools take the cooked/line path instead of the
-                // seek-based regular-file fast path (which made `head`
-                // emit "Illegal seek" and confused same-file checks).
-                return write_synthetic_stat(memory, statbuf, label, 0, LINUX_S_IFCHR | 0o620);
+                // Report the REAL type of whatever is wired to the guest's
+                // stdio. Under `--fs host`/`--raw` (stream_stdio) the guest's
+                // 0/1/2 are carrick's own host fds, so fstat the host fd and
+                // carry its type bits: a pipe → S_IFIFO, a tty → S_IFCHR, a
+                // file redirect → S_IFREG. The S_IF* type values are identical
+                // on macOS and Linux, so they transfer directly. This matches
+                // real Linux (e.g. a piped stdin reports FIFO, not CHR) and
+                // keeps tools off the regular-file seek fast path for pipes.
+                let mut host_st: libc::stat = unsafe { std::mem::zeroed() };
+                let mode = if unsafe { libc::fstat(fd, &mut host_st) } == 0 {
+                    (host_st.st_mode as u32 & LINUX_S_IFMT) | 0o620
+                } else {
+                    // Fall back to a character device if the host fstat fails.
+                    LINUX_S_IFCHR | 0o620
+                };
+                return write_synthetic_stat(memory, statbuf, label, 0, mode);
             }
             return DispatchOutcome::Errno { errno: LINUX_EBADF };
         };
@@ -9180,32 +9191,17 @@ impl SyscallDispatcher {
                     LINUX_S_IFREG | 0o444,
                 );
             }
+            // anon_inode fds (eventfd/timerfd/epoll) carry NO S_IFMT type
+            // bits on Linux — fstat reports st_mode with the type field 0,
+            // not S_IFREG. Match that so type-introspecting tools agree.
             OpenDescription::EventFd { .. } => {
-                return write_synthetic_stat(
-                    memory,
-                    statbuf,
-                    "anon_inode:[eventfd]",
-                    0,
-                    LINUX_S_IFREG | 0o444,
-                );
+                return write_synthetic_stat(memory, statbuf, "anon_inode:[eventfd]", 0, 0o600);
             }
             OpenDescription::TimerFd { .. } => {
-                return write_synthetic_stat(
-                    memory,
-                    statbuf,
-                    "anon_inode:[timerfd]",
-                    0,
-                    LINUX_S_IFREG | 0o444,
-                );
+                return write_synthetic_stat(memory, statbuf, "anon_inode:[timerfd]", 0, 0o600);
             }
             OpenDescription::Epoll { .. } => {
-                return write_synthetic_stat(
-                    memory,
-                    statbuf,
-                    "anon_inode:[eventpoll]",
-                    0,
-                    LINUX_S_IFREG | 0o444,
-                );
+                return write_synthetic_stat(memory, statbuf, "anon_inode:[eventpoll]", 0, 0o600);
             }
             // Pipes are FIFOs and sockets are sockets — NOT regular files.
             // Reporting S_IFREG made every pipe share one inode + look like
