@@ -44,11 +44,23 @@ mod carrick_usdt {
     /// process's stage-1 MMU state matches what the fresh-from-cli
     /// case sets up.
     fn execve__sysregs(_: u64, _: u64, _: u64) {}
+    /// Fires every time the dispatcher's `open_at_path` resolves a
+    /// guest path. `pid` is the carrick-host pid (so the parent vs
+    /// forked-children streams are demultiplexable). `result_size`
+    /// is the bytes returned (for File) or `0` (for Directory /
+    /// errno). `errno` is `0` on success.
+    fn path__open(_: u32, _: &str, _: u64, _: i32) {}
 }
 
 pub fn fork_pre(pc: u64, elr: u64, cpsr: u64) {
     carrick_usdt::fork__pre!(|| (pc, elr, cpsr));
 }
+
+pub fn path_open(path: &str, result_size: u64, errno: i32) {
+    let pid = unsafe { libc::getpid() as u32 };
+    carrick_usdt::path__open!(|| (pid, path, result_size, errno));
+}
+
 
 pub fn fork_post(pid: i32, pc: u64, elr: u64) {
     carrick_usdt::fork__post!(|| (pid, pc, elr));

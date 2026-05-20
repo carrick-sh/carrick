@@ -66,6 +66,14 @@ carrick*:::partial-syscall
         copyinstr(arg1), arg0, copyinstr(arg3));
 }
 
+carrick*:::path-open
+/pid == $target || progenyof($target)/
+{
+    @path_opens[copyinstr(arg1), (int)arg3] = count();
+    printf("[%d open ] path=%-40s size=%-10d errno=%d\n",
+        (int)arg0, copyinstr(arg1), (int)arg2, (int)arg3);
+}
+
 carrick*:::unhandled-ioctl
 {
     @unhandled_ioctls[(int)arg0, arg1] = count();
