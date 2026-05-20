@@ -125,7 +125,7 @@ impl SyscallDispatcher {
             && offset % hvf_page == 0
         {
             let dup_fd = {
-                let Some(open_file) = self.open_files.get(&fd) else {
+                let Some(open_file) = self.io.open_files.get(&fd) else {
                     return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
                 };
                 let open = open_file.description.borrow();
@@ -170,7 +170,7 @@ impl SyscallDispatcher {
 
         let mut bytes = vec![0; length_usize];
         if flags & LINUX_MAP_ANONYMOUS == 0 {
-            let Some(open_file) = self.open_files.get(&fd) else {
+            let Some(open_file) = self.io.open_files.get(&fd) else {
                 return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
             };
             let open = open_file.description.borrow();
