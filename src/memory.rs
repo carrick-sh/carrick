@@ -1142,7 +1142,20 @@ impl GuestMemory for AddressSpace {
             .ok_or(MemoryError::OutOfBounds { address, length })?;
         let offset = usize::try_from(address - region.start)
             .map_err(|_| MemoryError::OutOfBounds { address, length })?;
-        Ok(region.bytes[offset..offset + length].to_vec())
+        let end = offset
+            .checked_add(length)
+            .ok_or(MemoryError::OutOfBounds { address, length })?;
+        // `region.bytes` is only the initialised prefix of the region; every
+        // byte past it reads as zero (heap / mmap-arena pages are lazily
+        // zero-filled and never materialise a backing Vec). Copy the part
+        // that overlaps the prefix and leave the rest as the zeroes the
+        // freshly-allocated buffer already holds.
+        let mut out = vec![0_u8; length];
+        let init_end = end.min(region.bytes.len());
+        if init_end > offset {
+            out[..init_end - offset].copy_from_slice(&region.bytes[offset..init_end]);
+        }
+        Ok(out)
     }
 
     fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
@@ -1154,7 +1167,16 @@ impl GuestMemory for AddressSpace {
             .ok_or(MemoryError::OutOfBounds { address, length })?;
         let offset = usize::try_from(address - region.start)
             .map_err(|_| MemoryError::OutOfBounds { address, length })?;
-        region.bytes[offset..offset + length].copy_from_slice(bytes);
+        let end = offset
+            .checked_add(length)
+            .ok_or(MemoryError::OutOfBounds { address, length })?;
+        // Grow the initialised prefix with zeroes so a write into the
+        // lazily-zeroed tail of a region (heap / mmap arena) materialises the
+        // bytes it lands in rather than slicing past the end of the Vec.
+        if end > region.bytes.len() {
+            region.bytes.resize(end, 0);
+        }
+        region.bytes[offset..end].copy_from_slice(bytes);
         Ok(())
     }
 }
