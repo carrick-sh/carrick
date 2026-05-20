@@ -419,10 +419,17 @@ enum OpenDescription {
         interest: HashMap<i32, LinuxEpollEvent>,
         status_flags: u64,
     },
+    // In-memory pipe ends. Currently `pipe2(2)` routes through `HostPipe`
+    // (real macOS kernel pipe) so these are not constructed today, but the
+    // full read/write/poll machinery (`PipeState`, `read_pipe`, `write_pipe`)
+    // is kept wired as the portable, host-fd-free pipe model and is matched
+    // throughout the fd handlers. Retained as deliberate API surface.
+    #[allow(dead_code)]
     PipeReader {
         pipe: Rc<RefCell<PipeState>>,
         status_flags: u64,
     },
+    #[allow(dead_code)]
     PipeWriter {
         pipe: Rc<RefCell<PipeState>>,
         status_flags: u64,
@@ -505,23 +512,6 @@ enum TtyFdKind {
 enum XattrTarget {
     Path,
     Fd,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PollInterest {
-    Read,
-    Write,
-    Except,
-}
-
-impl PollInterest {
-    fn poll_events(self) -> i16 {
-        match self {
-            Self::Read => LINUX_POLLIN,
-            Self::Write => LINUX_POLLOUT,
-            Self::Except => LINUX_POLLERR,
-        }
-    }
 }
 
 impl OpenDescription {

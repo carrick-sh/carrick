@@ -475,41 +475,6 @@ impl SyscallDispatcher {
         }
     }
 
-    fn filter_fd_set(
-        &self,
-        memory: &mut impl GuestMemory,
-        address: u64,
-        nfds: usize,
-        interest: PollInterest,
-    ) -> Result<Result<usize, i32>, DispatchError> {
-        if address == 0 {
-            return Ok(Ok(0));
-        }
-        let mut fd_set = match read_fd_set(memory, address, nfds) {
-            Ok(fd_set) => fd_set,
-            Err(errno) => return Ok(Err(errno)),
-        };
-        let mut ready_count = 0usize;
-        for fd in 0..nfds {
-            if !fd_set_contains(&fd_set, fd) {
-                continue;
-            }
-            let fd = i32::try_from(fd).map_err(|_| DispatchError::LengthTooLarge(u64::MAX))?;
-            if !self.fd_is_valid(fd) {
-                return Ok(Err(LINUX_EBADF));
-            }
-            if self.poll_ready_events(fd, interest.poll_events()) & interest.poll_events() == 0 {
-                fd_set_clear(&mut fd_set, fd as usize);
-            } else {
-                ready_count += 1;
-            }
-        }
-        if memory.write_bytes(address, &fd_set).is_err() {
-            return Ok(Err(LINUX_EFAULT));
-        }
-        Ok(Ok(ready_count))
-    }
-
     pub(super) fn ppoll<M: GuestMemory>(
         &mut self,
         ctx: &mut SyscallCtx<M>,
@@ -620,7 +585,7 @@ impl SyscallDispatcher {
 
         // Mixed / synthetic fds: fall back to the per-fd readiness check
         // loop. Slow because of nanosleep slicing but correct.
-        let mut ready = 0i64;
+        let mut ready: i64;
         let mut deadline_attempts = 0u32;
         loop {
             ready = 0;
@@ -2041,12 +2006,6 @@ fn fd_set_contains(fd_set: &[u8], fd: usize) -> bool {
     fd_set
         .get(fd / 8)
         .is_some_and(|byte| byte & (1 << (fd % 8)) != 0)
-}
-
-fn fd_set_clear(fd_set: &mut [u8], fd: usize) {
-    if let Some(byte) = fd_set.get_mut(fd / 8) {
-        *byte &= !(1 << (fd % 8));
-    }
 }
 
 fn fd_set_set(fd_set: &mut [u8], fd: usize) {
