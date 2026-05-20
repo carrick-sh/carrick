@@ -2369,6 +2369,28 @@ impl SyscallDispatcher {
             return Ok(outcome);
         }
 
+        // Splice OUT of a real host pipe's read end (the fork-safe pipe model;
+        // `pipe2`/`fcntl` now hand back HostPipe descriptions, so splice must
+        // recognise them just like the legacy in-memory PipeReader above).
+        if let Some(host_fd) = self.host_pipe_read_fd(in_fd) {
+            if off_in_address != 0 || off_out_address != 0 {
+                return Ok(DispatchOutcome::Errno {
+                    errno: LINUX_EINVAL,
+                });
+            }
+            if let Some(errno) = self.splice_output_errno(out_fd) {
+                return Ok(DispatchOutcome::Errno { errno });
+            }
+            let mut buf = vec![0u8; count];
+            let n = unsafe { libc::read(host_fd, buf.as_mut_ptr() as *mut _, count) };
+            if n < 0 {
+                return Ok(DispatchOutcome::Errno { errno: host_errno() });
+            }
+            buf.truncate(n as usize);
+            let outcome = self.write_output_fd(out_fd, &buf);
+            return Ok(outcome);
+        }
+
         if off_out_address != 0 {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
@@ -2443,7 +2465,27 @@ impl SyscallDispatcher {
             };
         };
         let open = open_file.description.borrow();
-        Ok(matches!(&*open, OpenDescription::PipeWriter { .. }))
+        Ok(match &*open {
+            OpenDescription::PipeWriter { .. } => true,
+            // Real host pipe write end (fork-safe pipe model).
+            OpenDescription::HostPipe { is_read_end, .. } => !*is_read_end,
+            _ => false,
+        })
+    }
+
+    /// The raw host fd backing `fd` if it is a [`OpenDescription::HostPipe`]
+    /// read end, else `None`. Lets `splice` drain a real host pipe.
+    fn host_pipe_read_fd(&self, fd: i32) -> Option<i32> {
+        let open_file = self.open_files.get(&fd)?;
+        let open = open_file.description.borrow();
+        match &*open {
+            OpenDescription::HostPipe {
+                host_fd,
+                is_read_end: true,
+                ..
+            } => Some(*host_fd),
+            _ => None,
+        }
     }
 
     fn splice_output_errno(&self, fd: i32) -> Option<i32> {
@@ -2454,13 +2496,21 @@ impl SyscallDispatcher {
             return Some(LINUX_EBADF);
         };
         let open = open_file.description.borrow();
-        let OpenDescription::PipeWriter { pipe, .. } = &*open else {
-            return Some(LINUX_EINVAL);
-        };
-        if pipe.borrow().readers == 0 {
-            Some(LINUX_EPIPE)
-        } else {
-            None
+        match &*open {
+            OpenDescription::PipeWriter { pipe, .. } => {
+                if pipe.borrow().readers == 0 {
+                    Some(LINUX_EPIPE)
+                } else {
+                    None
+                }
+            }
+            // Real host pipe write end: the kernel enforces EPIPE itself on
+            // write, so we just accept the destination here.
+            OpenDescription::HostPipe {
+                is_read_end: false,
+                ..
+            } => None,
+            _ => Some(LINUX_EINVAL),
         }
     }
 
@@ -3715,9 +3765,15 @@ impl SyscallDispatcher {
         if let Some(real) = self.rootfs_vfs.overlay.real_stat(&path, follow) {
             return Ok(write_stat_real(memory, statbuf, &path, &real));
         }
-        // Layered overlay+rootfs lookup via RootFsVfs.
+        // Layered overlay+rootfs lookup via RootFsVfs. Honour
+        // AT_SYMLINK_NOFOLLOW (lstat) on backends without real_stat.
         use crate::vfs::Vfs as _;
-        match self.rootfs_vfs.lookup(&path) {
+        let lookup = if follow {
+            self.rootfs_vfs.lookup(&path)
+        } else {
+            self.rootfs_vfs.lookup_nofollow(&path)
+        };
+        match lookup {
             Ok(md) => Ok(write_stat(memory, statbuf, &vfs_md_to_rootfs_md(&path, &md))),
             Err(errno) => Ok(DispatchOutcome::Errno { errno }),
         }
@@ -3771,8 +3827,16 @@ impl SyscallDispatcher {
         if let Some(real) = self.rootfs_vfs.overlay.real_stat(&path, follow) {
             return Ok(write_statx_real(memory, statxbuf, &path, &real));
         }
+        // Fallback for backends without real_stat (e.g. the in-memory
+        // overlay): honour AT_SYMLINK_NOFOLLOW by reporting the link itself
+        // rather than its target.
         use crate::vfs::Vfs as _;
-        match self.rootfs_vfs.lookup(&path) {
+        let lookup = if follow {
+            self.rootfs_vfs.lookup(&path)
+        } else {
+            self.rootfs_vfs.lookup_nofollow(&path)
+        };
+        match lookup {
             Ok(md) => Ok(write_statx(memory, statxbuf, &vfs_md_to_rootfs_md(&path, &md))),
             Err(errno) => Ok(DispatchOutcome::Errno { errno }),
         }
