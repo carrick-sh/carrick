@@ -194,6 +194,20 @@ impl AddressSpace {
         Self::load_elf_segments_with_interpreter(&file, plan, rootfs)
     }
 
+    /// Load a main-binary image from already-read bytes (e.g. fetched
+    /// overlay-first via the dispatcher), resolving its PT_INTERP — if any —
+    /// from the rootfs. This is what lets `execve` run a binary that the
+    /// guest created in the writable overlay (a downloaded/extracted binary,
+    /// `/tmp/p`, a dpkg-unpacked ELF), not just immutable rootfs binaries.
+    /// A static binary (no PT_INTERP) loads directly.
+    pub fn load_elf_bytes_from_rootfs(
+        file: &[u8],
+        rootfs: &RootFs,
+    ) -> Result<Self, AddressSpaceError> {
+        let plan = plan_elf_load_bytes(file)?;
+        Self::load_elf_segments_with_interpreter(file, plan, rootfs)
+    }
+
     fn load_elf_segments(file: &[u8], plan: LoadPlan) -> Result<Self, AddressSpaceError> {
         let linux_auxv = linux_auxv_from_load_plan(&plan, None);
         let mut regions = regions_from_load_plan(file, &plan)?;

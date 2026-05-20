@@ -1,0 +1,23 @@
+[package]
+name = "conformance-probes"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone syscall-probe binaries. Built as static aarch64 musl ELFs
+# INSIDE an arm64 rust:alpine container (scripts/build-probes.sh) so no host
+# cross-linker is needed. Each binary in src/bin/ is one probe: it exercises
+# syscalls and prints deterministic, line-per-observation output. The
+# conformance harness runs the SAME binary under carrick and real Linux and
+# diffs line by line, so a divergence pinpoints the exact syscall (reducer).
+[[bin]]
+name = "fsmeta"
+path = "src/bin/fsmeta.rs"
+
+[profile.release]
+opt-level = "z"
+strip = true
+panic = "abort"
+
+[dependencies]
+libc = "0.2"
