@@ -1,3 +1,8 @@
+// Test code: gzip/tar helpers are plain `fn`s (not `#[test]`/`#[cfg(test)]`), so
+// clippy's allow-unwrap-in-tests heuristic does not exempt them. The no-panic gate
+// targets production code, so allow unwrap/expect across this integration test file.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use assert_cmd::Command;
 use carrick::oci::{ImageReference, ImageStore, LayerSummary, PullSummary};
 use flate2::Compression;

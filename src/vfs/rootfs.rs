@@ -214,6 +214,9 @@ impl RootFsVfs {
                             writable: writable_request,
                         });
                     }
+                    // INVARIANT: reaching this branch required reading metadata
+                    // from self.rootfs above, so it is necessarily Some here.
+                    #[allow(clippy::expect_used)]
                     let mut contents = self
                         .rootfs
                         .as_ref()
@@ -279,6 +282,10 @@ impl RootFsVfs {
             None => match self.rootfs.as_ref().and_then(|r| r.symlink_metadata(from).ok()) {
                 Some(md) => match md.kind {
                     RootFsEntryKind::File | RootFsEntryKind::Symlink => {
+                        // INVARIANT: this arm is reached only via the
+                        // `self.rootfs.as_ref().and_then(..symlink_metadata..)`
+                        // match above, which already proved rootfs is Some.
+                        #[allow(clippy::expect_used)]
                         let bytes = self
                             .rootfs
                             .as_ref()
