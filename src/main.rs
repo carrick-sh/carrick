@@ -378,6 +378,16 @@ fn main() -> anyhow::Result<()> {
             let rootfs = RootFs::from_layer_paths(&rootfs_layers)
                 .context("failed to compose image rootfs layers")?;
             let executable_path = &command[0];
+            // Name the host process `carrick: <basename>` up front so
+            // it's identifiable in ps/Activity Monitor even before the
+            // guest sets its own comm via prctl.
+            {
+                let base = executable_path
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(executable_path);
+                carrick::dispatch::set_host_process_name(base.as_bytes());
+            }
             let mut dispatcher = SyscallDispatcher::with_rootfs_and_executable(
                 rootfs.clone(),
                 executable_path.clone(),

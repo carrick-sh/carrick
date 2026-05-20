@@ -731,6 +731,19 @@ impl SyscallDispatcher {
         self.rootfs_vfs.rootfs.as_ref()
     }
 
+    /// Read a regular file's bytes through the layered view (overlay
+    /// first, then rootfs). Used by the runtime's execve path to
+    /// detect `#!` shebang scripts and to load executables that the
+    /// guest wrote into the overlay (which `load_elf_from_rootfs`
+    /// alone would miss). Returns None if the path isn't a readable
+    /// file in either layer.
+    pub fn read_exec_file(&self, path: &str) -> Option<Vec<u8>> {
+        if let Some(bytes) = self.rootfs_vfs.overlay.file_contents(path) {
+            return Some(bytes);
+        }
+        self.rootfs_vfs.rootfs.as_ref()?.read(path).ok()
+    }
+
     pub fn stdout(&self) -> &[u8] {
         &self.stdout
     }
@@ -2837,6 +2850,11 @@ impl SyscallDispatcher {
                     };
                 };
                 self.task_name = linux_task_name_from_bytes(&bytes);
+                // Reflect the guest's chosen name into the host
+                // process/thread name as `carrick: <name>`, so `ps -M`
+                // / Activity Monitor / lldb show which guest each
+                // carrick host process is running.
+                set_host_process_name(&self.task_name);
                 DispatchOutcome::Returned { value: 0 }
             }
             LINUX_PR_GET_NAME => {
@@ -7785,6 +7803,30 @@ fn linux_task_name_from_bytes(bytes: &[u8]) -> [u8; LINUX_TASK_COMM_LEN] {
     name[..length].copy_from_slice(&bytes[..length]);
     name
 }
+
+/// Set the host thread/process name to `carrick: <comm>` so external
+/// tools (Activity Monitor, `ps -M`, `sample`, lldb) can tell which
+/// guest a carrick host process is running — invaluable when a forked
+/// child hangs. `comm` is the guest's NUL-padded task name. macOS's
+/// `pthread_setname_np` sets the calling thread's name (capped at
+/// MAXTHREADNAMESIZE=64), which for our single-vCPU-thread model is
+/// the process's visible name.
+#[cfg(target_os = "macos")]
+pub fn set_host_process_name(comm: &[u8]) {
+    let end = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
+    let name = String::from_utf8_lossy(&comm[..end]);
+    // "carrick: " is 9 bytes; keep the whole thing under 64.
+    let label = format!("carrick: {}", name.trim());
+    let truncated: String = label.chars().take(63).collect();
+    if let Ok(cstr) = std::ffi::CString::new(truncated) {
+        unsafe {
+            libc::pthread_setname_np(cstr.as_ptr());
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn set_host_process_name(_comm: &[u8]) {}
 
 fn linux_statx_flags_are_supported(flags: u64) -> bool {
     const SUPPORTED: u64 = LINUX_AT_SYMLINK_NOFOLLOW

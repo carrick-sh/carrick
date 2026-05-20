@@ -470,6 +470,11 @@ where
             }
             DispatchOutcome::Execve { path, argv, env } => {
                 crate::probes::execve_argv(&path, &argv);
+                // Reflect the new program into the host process name
+                // (`carrick: <basename>`), so a hung forked-exec'd
+                // child is identifiable in `ps -M` / Activity Monitor.
+                let base = path.rsplit('/').next().unwrap_or(&path);
+                crate::dispatch::set_host_process_name(base.as_bytes());
                 match load_execve_image(&dispatcher, &path, argv, env) {
                     Ok(new_image) => {
                         crate::probes::execve_loaded(
@@ -590,21 +595,75 @@ fn load_execve_image(
     env: Vec<String>,
 ) -> Result<AddressSpace, i32> {
     use crate::dispatch::LINUX_ENOENT;
-    let argv = if argv.is_empty() {
+    let mut argv = if argv.is_empty() {
         vec![path.to_string()]
     } else {
         argv
     };
+
+    // Resolve `#!` shebang scripts the way the Linux kernel does: read
+    // the file, and if it begins with `#!`, re-target exec at the
+    // interpreter with the script path spliced into argv. Bounded to 4
+    // levels (Linux's BINPRM_MAX_RECURSION) to stop interpreter loops.
+    let mut path = path.to_string();
+    for _ in 0..4 {
+        let Some(head) = dispatcher.read_exec_file(&path) else {
+            break;
+        };
+        if !head.starts_with(b"#!") {
+            break;
+        }
+        let Some((interp, optarg)) = parse_shebang(&head) else {
+            return Err(LINUX_ENOENT);
+        };
+        // Linux: execve("/script", ["script", a, b]) on `#!/i x` ->
+        // execve("/i", ["/i", "x", "/script", a, b]). The script path
+        // takes argv[1] (or [2] with an interpreter arg); the original
+        // argv[1..] follow.
+        let mut new_argv = Vec::with_capacity(argv.len() + 3);
+        new_argv.push(interp.clone());
+        if let Some(arg) = optarg {
+            new_argv.push(arg);
+        }
+        new_argv.push(path.clone());
+        new_argv.extend(argv.into_iter().skip(1));
+        argv = new_argv;
+        path = interp;
+    }
+
     let raw = if let Some(rootfs) = dispatcher.rootfs() {
-        AddressSpace::load_elf_from_rootfs(path, rootfs).map_err(|_| LINUX_ENOENT)?
+        AddressSpace::load_elf_from_rootfs(&path, rootfs).map_err(|_| LINUX_ENOENT)?
     } else {
-        AddressSpace::load_elf(path).map_err(|_| LINUX_ENOENT)?
+        AddressSpace::load_elf(&path).map_err(|_| LINUX_ENOENT)?
     };
     raw.with_el0_trampoline()
         .and_then(|a| a.with_el1_vectors())
         .and_then(|a| a.with_stage1_page_tables())
         .and_then(|a| a.with_linux_initial_stack(argv, env))
         .map_err(|_| LINUX_ENOENT)
+}
+
+/// Parse a `#!` shebang line into (interpreter, optional single arg),
+/// matching Linux semantics: skip blanks after `#!`, take the
+/// interpreter up to the next whitespace, then the remainder of the
+/// line (trimmed) as ONE argument. Only the first line is consulted.
+fn parse_shebang(head: &[u8]) -> Option<(String, Option<String>)> {
+    let line_end = head.iter().position(|&b| b == b'\n').unwrap_or(head.len());
+    // Linux caps the shebang line at BINPRM_BUF_SIZE (256); honour it.
+    let line = &head[2..line_end.min(256)];
+    let line = std::str::from_utf8(line).ok()?;
+    let line = line.trim_start_matches([' ', '\t']);
+    let mut parts = line.splitn(2, |c| c == ' ' || c == '\t');
+    let interp = parts.next()?.to_string();
+    if interp.is_empty() {
+        return None;
+    }
+    let optarg = parts
+        .next()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    Some((interp, optarg))
 }
 
 /// Called from a forked child when the guest hits `exit_group`. Flushes
@@ -689,6 +748,11 @@ where
             }
             DispatchOutcome::Execve { path, argv, env } => {
                 crate::probes::execve_argv(&path, &argv);
+                // Reflect the new program into the host process name
+                // (`carrick: <basename>`), so a hung forked-exec'd
+                // child is identifiable in `ps -M` / Activity Monitor.
+                let base = path.rsplit('/').next().unwrap_or(&path);
+                crate::dispatch::set_host_process_name(base.as_bytes());
                 match load_execve_image(&dispatcher, &path, argv, env) {
                     Ok(new_image) => {
                         crate::probes::execve_loaded(
