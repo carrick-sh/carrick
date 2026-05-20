@@ -288,6 +288,22 @@ impl SyscallDispatcher {
         // fails with EINVAL ("Failed to open new FD - fdopen") — apt's dpkg
         // status pipe hit exactly that.
         let nonblock = flags & LINUX_O_NONBLOCK;
+        // pipe2(2)'s O_NONBLOCK must take effect on the actual pipe ends.
+        // The read/write path does a raw libc::read/write on the host fd and
+        // relies on its blocking mode — `status_flags` is only bookkeeping
+        // for F_GETFL. Without applying it here a nonblocking read on an
+        // empty pipe blocks the supervisor forever (matches what
+        // fcntl(F_SETFL) already does for the apt http-method path).
+        if nonblock != 0 {
+            for hfd in [host_read, host_write] {
+                unsafe {
+                    let cur = libc::fcntl(hfd, libc::F_GETFL, 0);
+                    if cur >= 0 {
+                        libc::fcntl(hfd, libc::F_SETFL, cur | libc::O_NONBLOCK);
+                    }
+                }
+            }
+        }
         let fd_flags = linux_fd_flags_from_open_flags(flags);
         self.insert_open_file(
             read_fd,
