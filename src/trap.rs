@@ -712,7 +712,26 @@ impl HvfInner {
             .get_sys_reg(SysReg::ELR_EL1)
             .unwrap_or(0);
         let lr = self.vcpu.get_reg(Reg::LR).unwrap_or(0);
-        crate::probes::vcpu_trap(guest_pc, frame.x8, frame.x0, lr);
+        // FP (x29) + SP let guest_stack.d walk the guest call chain.
+        let fp = self.vcpu.get_reg(Reg::X29).unwrap_or(0);
+        let sp = self.vcpu.get_sys_reg(SysReg::SP_EL0).unwrap_or(0);
+        // Wrapping guest->host offset for the region containing `sp`,
+        // so the stack walker can translate frame addresses directly.
+        let stack_xlate = self
+            .mappings
+            .iter()
+            .find(|m| sp >= m.start && sp < m.end)
+            .map(|m| (m.host_addr as u64).wrapping_sub(m.start))
+            .unwrap_or(0);
+        crate::probes::vcpu_trap(&crate::compat::GuestRegs {
+            pc: guest_pc,
+            sp,
+            fp,
+            lr,
+            x8: frame.x8,
+            x0: frame.x0,
+            stack_xlate,
+        });
         Ok(frame)
     }
 
@@ -981,7 +1000,18 @@ impl HvfInner {
         // this trap. Nothing to write here; SPSR_EL1 is already
         // correct for "return to EL0t".
 
-        crate::probes::vcpu_trap(handler, 0xffff_ffff_ffff_ffff, signum as u64, 0);
+        // Signal-injection trap: x8 sentinel marks "not a syscall",
+        // x0 carries the signum. PC is the handler entry; FP/SP aren't
+        // meaningful mid-injection so leave them 0.
+        crate::probes::vcpu_trap(&crate::compat::GuestRegs {
+            pc: handler,
+            sp: 0,
+            fp: 0,
+            lr: 0,
+            x8: 0xffff_ffff_ffff_ffff,
+            x0: signum as u64,
+            stack_xlate: 0,
+        });
         Ok(())
     }
 

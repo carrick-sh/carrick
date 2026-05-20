@@ -9566,6 +9566,8 @@ fn read_host_pipe(
     }
     let mut buf = vec![0u8; length];
     let n = unsafe { libc::read(host_fd, buf.as_mut_ptr() as *mut _, length) };
+    #[cfg(target_os = "macos")]
+    crate::probes::host_pipe_io(host_fd, 0, n as i64);
     if n < 0 {
         return DispatchOutcome::Errno { errno: host_errno() };
     }
@@ -9580,6 +9582,8 @@ fn read_host_pipe(
 
 fn write_host_pipe(bytes: &[u8], host_fd: i32) -> DispatchOutcome {
     let n = unsafe { libc::write(host_fd, bytes.as_ptr() as *const _, bytes.len()) };
+    #[cfg(target_os = "macos")]
+    crate::probes::host_pipe_io(host_fd, 1, n as i64);
     if n < 0 {
         return DispatchOutcome::Errno { errno: host_errno() };
     }
