@@ -304,6 +304,39 @@ impl RootFsVfs {
         if dst_exists && no_replace {
             return Err(LINUX_EEXIST);
         }
+        // Prefer the backend's real rename first. For a writable
+        // backend (host: cap-std `dir.rename`; memory: in-place map
+        // move) this atomically relocates the WHOLE entry — including a
+        // directory's entire subtree/contents — and reports Ok(true)
+        // when the source actually lived in the backend. A real
+        // directory rename on disk also removes the source, which is
+        // exactly the Linux semantics the conformance probe checks
+        // (source gone, contents moved). Only fall back to the
+        // copy/materialise + tombstone path when the source was NOT in
+        // the writable backend (Ok(false)) — e.g. a pure-rootfs entry
+        // under --fs memory.
+        match self.overlay.rename_overlay_entry(from, to) {
+            Ok(true) => {
+                // Backend moved the entry (contents included). If the
+                // rootfs ALSO has the source path, leave a tombstone so
+                // the layered view doesn't resurrect the rootfs copy.
+                let rootfs_has_src = self
+                    .rootfs
+                    .as_ref()
+                    .map(|r| r.symlink_metadata(from).is_ok())
+                    .unwrap_or(false);
+                if rootfs_has_src {
+                    self.overlay.mark_deleted(from).map_err(|_| LINUX_EINVAL)?;
+                }
+                return Ok(());
+            }
+            Ok(false) => {}
+            Err(_) => return Err(LINUX_EINVAL),
+        }
+
+        // Fallback: source is not owned by the writable backend
+        // (rootfs-only entry). Materialise the destination, then
+        // tombstone the rootfs source.
         match src_kind {
             RootFsEntryKind::File | RootFsEntryKind::Symlink => {
                 self.overlay
