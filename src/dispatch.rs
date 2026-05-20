@@ -2749,28 +2749,35 @@ impl SyscallDispatcher {
             Ok(resolved) => resolved,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        let kind = if is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context()) {
-            RootFsEntryKind::File
-        } else {
-            let Some(rootfs) = &self.rootfs_vfs.rootfs else {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_ENOENT,
-                });
-            };
-            match rootfs.metadata(&resolved) {
-                Ok(metadata) => metadata.kind,
-                Err(errno) => {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: rootfs_errno(errno),
-                    });
+        if is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context()) {
+            return Ok(DispatchOutcome::Errno { errno: LINUX_EROFS });
+        }
+        // Layered metadata (overlay/disk first, then rootfs) — not rootfs-only,
+        // so guest-created files are seen too.
+        let kind = match self.layered_metadata(&resolved) {
+            Ok(md) => md.kind,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        if kind == RootFsEntryKind::Directory {
+            return Ok(DispatchOutcome::Errno { errno: LINUX_EISDIR });
+        }
+        // Disk-backed: open the real file and ftruncate it. The whole rootfs
+        // is materialised on the cap-std scratch under --fs host, so this
+        // works for both rootfs and guest-created files. MemoryBackend has no
+        // raw fd → EROFS (path-based truncate stays unsupported in-memory).
+        match self.rootfs_vfs.overlay.open_raw_fd(&resolved, true, false, false) {
+            Some(host_fd) => {
+                let rc = unsafe { libc::ftruncate(host_fd, length as libc::off_t) };
+                let err = if rc < 0 { host_errno() } else { 0 };
+                unsafe { libc::close(host_fd) };
+                if err != 0 {
+                    Ok(DispatchOutcome::Errno { errno: err })
+                } else {
+                    Ok(DispatchOutcome::Returned { value: 0 })
                 }
             }
-        };
-        let errno = match kind {
-            RootFsEntryKind::Directory => LINUX_EISDIR,
-            RootFsEntryKind::File | RootFsEntryKind::Symlink => LINUX_EROFS,
-        };
-        Ok(DispatchOutcome::Errno { errno })
+            None => Ok(DispatchOutcome::Errno { errno: LINUX_EROFS }),
+        }
     }
 
     fn fallocate(&self, request: SyscallRequest) -> DispatchOutcome {
