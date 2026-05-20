@@ -480,6 +480,13 @@ pub struct SyscallDispatcher {
     ///   * [`HostFsBackend`]    — cap-std-sandboxed APFS scratch dir,
     ///                            durable, reflink-seeded.
     overlay: Box<dyn FsBackend>,
+
+    /// Unified VFS mount table. As of step 2 of the VFS migration this
+    /// only holds [`DevVfs`] at `/dev`; the dispatcher consults it
+    /// before falling through to the legacy synthetic-proc / synthetic-
+    /// sys / overlay / rootfs chain. Future steps move the rest of
+    /// those surfaces behind this table too.
+    vfs_mounts: crate::vfs::VfsMounts,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -655,6 +662,11 @@ impl SyscallDispatcher {
             signal_handlers: HashMap::new(),
             address_space_regions: None,
             overlay: Box::new(MemoryBackend::new()),
+            vfs_mounts: {
+                let mut m = crate::vfs::VfsMounts::new();
+                m.mount("/dev", Box::new(crate::vfs::DevVfs::new()));
+                m
+            },
         }
     }
 
@@ -3944,43 +3956,60 @@ impl SyscallDispatcher {
         // HostPipe so subsequent read/write/poll route through the host
         // syscall. Without this, every Debian shell script that
         // redirects stdout to /dev/null fails with ENOENT.
-        if let Some(host_path) = host_dev_passthrough(&path) {
-            let mut host_flags = 0;
-            match access {
-                LINUX_O_RDONLY => host_flags |= libc::O_RDONLY,
-                LINUX_O_WRONLY => host_flags |= libc::O_WRONLY,
-                LINUX_O_RDWR => host_flags |= libc::O_RDWR,
-                _ => {}
-            }
-            let cpath = std::ffi::CString::new(host_path).unwrap();
-            let host_fd = unsafe { libc::open(cpath.as_ptr(), host_flags) };
-            if host_fd < 0 {
-                return Ok(DispatchOutcome::Errno { errno: host_errno() });
-            }
-            let new_fd = match self.allocate_fd(3) {
-                Some(fd) => fd,
-                None => {
-                    unsafe { libc::close(host_fd); }
-                    return Ok(DispatchOutcome::Errno { errno: linux_errno::EMFILE });
-                }
+        // /dev/* passthrough now goes through DevVfs (mounted at /dev
+        // in `SyscallDispatcher::new`). The dispatcher converts the
+        // returned `VfsHandle::HostFd` into an `OpenDescription::HostPipe`
+        // and inserts it into the open-files table.
+        if let Some(mut m) = self.vfs_mounts.resolve_mut(&path) {
+            let vfs_flags = crate::vfs::OpenFlags {
+                read: matches!(access, LINUX_O_RDONLY | LINUX_O_RDWR),
+                write: matches!(access, LINUX_O_WRONLY | LINUX_O_RDWR),
+                nonblock: flags & LINUX_O_NONBLOCK != 0,
+                cloexec: flags & LINUX_O_CLOEXEC != 0,
+                append: flags & LINUX_O_APPEND != 0,
+                trunc: flags & LINUX_O_TRUNC != 0,
+                create: flags & LINUX_O_CREAT != 0,
+                excl: flags & LINUX_O_EXCL != 0,
+                directory: flags & LINUX_O_DIRECTORY != 0,
+                nofollow: flags & 0o400000 != 0,
+                mode: 0,
             };
-            self.insert_open_file(
-                new_fd,
-                OpenFile {
-                    description: Rc::new(RefCell::new(OpenDescription::HostPipe {
-                        host_fd,
-                        // /dev/null + /dev/zero + /dev/urandom etc are
-                        // bidirectional from the dispatcher's POV (write
-                        // discards or generates), so we use is_read_end
-                        // = (access == O_RDONLY) and let the HostPipe
-                        // read/write paths route accordingly.
-                        is_read_end: access == LINUX_O_RDONLY,
-                        status_flags: flags & LINUX_O_NONBLOCK,
-                    })),
-                    fd_flags: linux_fd_flags_from_open_flags(flags),
-                },
-            );
-            return Ok(DispatchOutcome::Returned { value: new_fd as i64 });
+            match m.vfs.open(&m.full_path, vfs_flags) {
+                Ok(crate::vfs::VfsHandle::HostFd {
+                    host_fd,
+                    is_read_end,
+                    status_flags,
+                }) => {
+                    let new_fd = match self.allocate_fd(3) {
+                        Some(fd) => fd,
+                        None => {
+                            unsafe { libc::close(host_fd) };
+                            return Ok(DispatchOutcome::Errno {
+                                errno: linux_errno::EMFILE,
+                            });
+                        }
+                    };
+                    self.insert_open_file(
+                        new_fd,
+                        OpenFile {
+                            description: Rc::new(RefCell::new(OpenDescription::HostPipe {
+                                host_fd,
+                                is_read_end,
+                                status_flags: status_flags as u64,
+                            })),
+                            fd_flags: linux_fd_flags_from_open_flags(flags),
+                        },
+                    );
+                    return Ok(DispatchOutcome::Returned { value: new_fd as i64 });
+                }
+                Err(errno) if errno == LINUX_ENOSYS => {
+                    // The mount doesn't implement open — fall through
+                    // to the legacy code path below.
+                }
+                Err(errno) => {
+                    return Ok(DispatchOutcome::Errno { errno });
+                }
+            }
         }
 
         let description = if let Some(contents) = synthetic_proc_file(&path, &self.synthetic_proc_context())
@@ -9412,25 +9441,6 @@ fn read_guest_string_array(
         out.push(read_guest_c_string(memory, ptr)?);
     }
     Err(LINUX_E2BIG)
-}
-
-/// Map a guest `/dev/*` path to the corresponding host path that
-/// implements the same character-device semantics. macOS has
-/// identical-semantics counterparts for the standard set, so we just
-/// libc::open the host path and wrap as a HostPipe — read/write/poll
-/// pass straight through. Returns None for paths that aren't passthrough
-/// candidates (e.g. /dev/sda, /dev/loop*); those fall through to the
-/// rootfs / overlay lookup and ENOENT if not present.
-fn host_dev_passthrough(guest_path: &str) -> Option<&'static str> {
-    match guest_path {
-        "/dev/null" => Some("/dev/null"),
-        "/dev/zero" => Some("/dev/zero"),
-        "/dev/random" => Some("/dev/random"),
-        "/dev/urandom" => Some("/dev/urandom"),
-        "/dev/full" => Some("/dev/null"),  // macOS has no /dev/full; closest equivalent
-        "/dev/tty" => Some("/dev/tty"),
-        _ => None,
-    }
 }
 
 fn host_errno() -> i32 {
