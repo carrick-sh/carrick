@@ -2,15 +2,39 @@
 //! `super` for the dispatcher struct and the normalized dispatch table.
 use super::*;
 
+/// Owned process-subsystem state. Split out of `SyscallDispatcher`.
+pub(super) struct ProcState {
+    /// Path of the currently-running executable, surfaced via
+    /// `/proc/self/exe`, `/proc/self/cmdline`, `/proc/self/comm`, etc.
+    pub executable_path: String,
+    /// `personality(2)` execution-domain flags, recorded and echoed back.
+    pub personality: u64,
+    /// `prctl(PR_SET_DUMPABLE)` flag (default 1).
+    pub dumpable: i64,
+    /// `prctl(PR_SET_NAME)` task comm name (16 bytes, NUL-padded).
+    pub task_name: [u8; LINUX_TASK_COMM_LEN],
+}
+
+impl ProcState {
+    pub(super) fn new() -> Self {
+        Self {
+            executable_path: "/proc/self/exe".to_owned(),
+            personality: 0,
+            dumpable: 1,
+            task_name: linux_task_name_from_bytes(b"carrick"),
+        }
+    }
+}
+
 impl SyscallDispatcher {
     pub(super) fn personality<M: GuestMemory>(
         &mut self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let requested = ctx.arg(0);
-        let previous = self.personality;
+        let previous = self.proc.personality;
         if requested != LINUX_PERSONALITY_QUERY {
-            self.personality = requested;
+            self.proc.personality = requested;
         }
         Ok(DispatchOutcome::Returned {
             value: previous as i64,
@@ -25,7 +49,7 @@ impl SyscallDispatcher {
         let option = ctx.request.arg(0);
         Ok(match option {
             LINUX_PR_GET_DUMPABLE => DispatchOutcome::Returned {
-                value: self.dumpable,
+                value: self.proc.dumpable,
             },
             LINUX_PR_SET_DUMPABLE => {
                 let value = ctx.request.arg(1);
@@ -34,7 +58,7 @@ impl SyscallDispatcher {
                         errno: LINUX_EINVAL,
                     });
                 }
-                self.dumpable = value as i64;
+                self.proc.dumpable = value as i64;
                 DispatchOutcome::Returned { value: 0 }
             }
             LINUX_PR_SET_NAME => {
@@ -44,17 +68,17 @@ impl SyscallDispatcher {
                         errno: LINUX_EFAULT,
                     });
                 };
-                self.task_name = linux_task_name_from_bytes(&bytes);
+                self.proc.task_name = linux_task_name_from_bytes(&bytes);
                 // Reflect the guest's chosen name into the host
                 // process/thread name as `carrick: <name>`, so `ps -M`
                 // / Activity Monitor / lldb show which guest each
                 // carrick host process is running.
-                set_host_process_name(&self.task_name);
+                set_host_process_name(&self.proc.task_name);
                 DispatchOutcome::Returned { value: 0 }
             }
             LINUX_PR_GET_NAME => {
                 let address = ctx.request.arg(1);
-                if memory.write_bytes(address, &self.task_name).is_err() {
+                if memory.write_bytes(address, &self.proc.task_name).is_err() {
                     return Ok(DispatchOutcome::Errno {
                         errno: LINUX_EFAULT,
                     });

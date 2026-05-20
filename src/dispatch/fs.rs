@@ -1351,7 +1351,7 @@ impl SyscallDispatcher {
         // Build the OpenContext from owned/copy data so the mut
         // borrow of `vfs_mounts` doesn't conflict with reads from
         // sibling fields.
-        let exec_path = self.executable_path.clone();
+        let exec_path = self.proc.executable_path.clone();
         let addr_regions = self.mem.address_space_regions.clone();
         let brk = self.mem.brk_current;
         let mmap = self.mem.mmap_next;
@@ -3042,7 +3042,7 @@ impl SyscallDispatcher {
         };
 
         let target = if path == "/proc/self/exe" || path == "/proc/curproc/exe" {
-            self.executable_path.clone()
+            self.proc.executable_path.clone()
         } else if let Some(t) = self.rootfs_vfs.overlay.read_link(&path) {
             // Symlink created in the writable backend (cap-std on --fs host).
             t
