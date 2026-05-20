@@ -17,7 +17,10 @@
 //! through the trait the result is byte-identical to what it
 //! produced via direct access.
 
-use crate::linux_abi::{LINUX_EACCES, LINUX_EEXIST, LINUX_EINVAL, LINUX_EISDIR, LINUX_ENOENT, LINUX_ENOTDIR, LINUX_EROFS};
+use crate::linux_abi::{
+    LINUX_EACCES, LINUX_EEXIST, LINUX_EINVAL, LINUX_EISDIR, LINUX_ENOENT, LINUX_ENOTDIR,
+    LINUX_ENOTEMPTY, LINUX_EROFS,
+};
 use crate::fs_backend::{FsBackend, MemoryBackend, OverlayEntry};
 use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsError, RootFsMetadata};
 
@@ -84,6 +87,47 @@ impl RootFsVfs {
     /// backend so the caller can decide what to do with it.
     pub fn set_overlay(&mut self, backend: Box<dyn FsBackend>) -> Box<dyn FsBackend> {
         std::mem::replace(&mut self.overlay, backend)
+    }
+
+    /// Non-following metadata lookup (the `lstat`/`AT_SYMLINK_NOFOLLOW`
+    /// counterpart to the symlink-following [`Vfs::lookup`]). If the final
+    /// path component is a symlink, this reports the link itself
+    /// (`EntryKind::Symlink`, size = byte length of the target string) rather
+    /// than resolving it. Used by `statx`/`newfstatat` when the guest passes
+    /// `AT_SYMLINK_NOFOLLOW` and the writable backend can't answer a
+    /// `real_stat` (e.g. the in-memory backend).
+    pub fn lookup_nofollow(&self, path: &str) -> Result<Metadata, VfsError> {
+        // A symlink materialised in the writable overlay.
+        if let Some(target) = self.overlay.read_link(path) {
+            return Ok(Metadata {
+                kind: EntryKind::Symlink,
+                mode: 0o777,
+                size: target.len() as u64,
+                uid: 0,
+                gid: 0,
+                mtime_secs: 0,
+                mtime_nanos: 0,
+            });
+        }
+        // A symlink in the immutable rootfs layer: report the link, not its
+        // target. Non-symlink entries fall through to the regular (following)
+        // lookup, which is identical for them.
+        if let Some(rootfs) = self.rootfs.as_ref() {
+            if let Ok(md) = rootfs.symlink_metadata(path) {
+                if matches!(md.kind, RootFsEntryKind::Symlink) {
+                    return Ok(Metadata {
+                        kind: EntryKind::Symlink,
+                        mode: md.mode,
+                        size: md.size as u64,
+                        uid: 0,
+                        gid: 0,
+                        mtime_secs: 0,
+                        mtime_nanos: 0,
+                    });
+                }
+            }
+        }
+        self.lookup(path)
     }
 
     /// Richer open variant the dispatcher uses for the openat
@@ -644,6 +688,18 @@ impl Vfs for RootFsVfs {
         };
         if !matches!(kind, RootFsEntryKind::Directory) {
             return Err(LINUX_ENOTDIR);
+        }
+        // Linux rmdir(2) requires the directory to be empty (ENOTEMPTY
+        // otherwise). The layered view must show no surviving children:
+        // overlay-owned entries plus rootfs entries that aren't tombstoned.
+        if let Ok(entries) = crate::overlay::layered_directory_entries(
+            self.overlay.as_ref(),
+            self.rootfs.as_ref(),
+            path,
+        ) {
+            if !entries.is_empty() {
+                return Err(LINUX_ENOTEMPTY);
+            }
         }
         if in_overlay {
             self.overlay.remove_entry(path);
