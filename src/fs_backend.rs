@@ -58,6 +58,23 @@ pub enum BackendError {
     Unsupported,
 }
 
+/// Real on-disk stat values for a path, read straight from the backing
+/// filesystem. Carries the bits a synthesized [`RootFsMetadata`] can't
+/// represent faithfully: the true file *type* (so a symlink reports as
+/// a symlink, not whatever it points at) and the real hard-link count.
+/// Only disk-backed backends can produce this; the in-memory backend
+/// returns `None` and the dispatcher falls back to its synthesized stat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RealStat {
+    pub kind: RootFsEntryKind,
+    /// Hard-link count (`st_nlink`).
+    pub nlink: u32,
+    /// Permission bits only (low 0o7777); the type bits are derived
+    /// from `kind`.
+    pub mode: u32,
+    pub size: u64,
+}
+
 /// Trait every writable-layer backend implements. Methods are layer-
 /// aware (see module docs); the dispatcher does its own overlay-first
 /// merging with the read-only rootfs underneath.
@@ -177,6 +194,18 @@ pub trait FsBackend: Send {
 
     /// Read the target of a symlink at `path`. Default: not a symlink.
     fn read_link(&self, _path: &str) -> Option<String> {
+        None
+    }
+
+    /// Read the REAL on-disk stat for `path` (type + hard-link count +
+    /// mode + size), the way a kernel `newfstatat`/`statx` would see it.
+    ///
+    /// `follow` selects symlink semantics: `false` is lstat (report the
+    /// link itself — `RootFsEntryKind::Symlink`), `true` is stat (report
+    /// the link target). Only disk-backed backends can answer this; the
+    /// default returns `None` so the dispatcher falls back to its
+    /// synthesized [`RootFsMetadata`]-based stat.
+    fn real_stat(&self, _path: &str, _follow: bool) -> Option<RealStat> {
         None
     }
 
@@ -590,6 +619,17 @@ impl FsBackend for HostFsBackend {
             file.read_to_end(&mut buf).ok()?;
             return Some(OverlayEntry::File(buf));
         }
+        // A symlink: `OverlayEntry` has no Symlink variant, but the path
+        // DOES exist, so report it as present rather than `None` (which
+        // would make the layered lookup fall through and lose the entry).
+        // Hand back the link target bytes so a content read is sensible;
+        // `metadata`/`real_stat` carry the true `Symlink` kind for stat.
+        if meta.is_symlink() {
+            let target = self.dir.read_link_contents(rel).ok()?;
+            return Some(OverlayEntry::File(
+                target.to_string_lossy().into_owned().into_bytes(),
+            ));
+        }
         None
     }
 
@@ -604,6 +644,11 @@ impl FsBackend for HostFsBackend {
             return Some(OverlayEntryKind::Dir);
         }
         if meta.is_file() {
+            return Some(OverlayEntryKind::File);
+        }
+        // Symlink: present (treated as a File-shaped entry in the
+        // `OverlayEntryKind` vocabulary, which has no Symlink variant).
+        if meta.is_symlink() {
             return Some(OverlayEntryKind::File);
         }
         None
@@ -630,6 +675,17 @@ impl FsBackend for HostFsBackend {
                 path: normalized,
                 kind: RootFsEntryKind::File,
                 mode: if mode == 0 { 0o644 } else { mode },
+                size: meta.len() as usize,
+            });
+        }
+        // Symlink: report `kind: Symlink` so callers that build a stat
+        // from this metadata emit S_IFLNK. `symlink_metadata` did NOT
+        // follow the link, so this is the link's own metadata.
+        if meta.is_symlink() {
+            return Some(RootFsMetadata {
+                path: normalized,
+                kind: RootFsEntryKind::Symlink,
+                mode: if mode == 0 { 0o777 } else { mode },
                 size: meta.len() as usize,
             });
         }
@@ -889,6 +945,42 @@ impl FsBackend for HostFsBackend {
         let rel = Self::rel_path(&normalized)?;
         let target = self.dir.read_link_contents(rel).ok()?;
         Some(target.to_string_lossy().into_owned())
+    }
+
+    fn real_stat(&self, path: &str, follow: bool) -> Option<RealStat> {
+        use cap_std::fs::MetadataExt;
+        let normalized = normalize(path)?;
+        if self.tombstones.contains(&normalized) {
+            return None;
+        }
+        let rel = Self::rel_path(&normalized)?;
+        // lstat (`follow == false`) reports the link itself; stat
+        // (`follow == true`) reports the target. cap-std's `metadata`
+        // follows symlinks, `symlink_metadata` does not.
+        let meta = if follow {
+            self.dir.metadata(rel).ok()?
+        } else {
+            self.dir.symlink_metadata(rel).ok()?
+        };
+        let kind = if meta.is_dir() {
+            RootFsEntryKind::Directory
+        } else if meta.is_symlink() {
+            RootFsEntryKind::Symlink
+        } else {
+            RootFsEntryKind::File
+        };
+        let mode = meta.mode() & 0o7777;
+        let default_mode = match kind {
+            RootFsEntryKind::Directory => 0o755,
+            RootFsEntryKind::Symlink => 0o777,
+            RootFsEntryKind::File => 0o644,
+        };
+        Some(RealStat {
+            kind,
+            nlink: meta.nlink() as u32,
+            mode: if mode == 0 { default_mode } else { mode },
+            size: meta.len(),
+        })
     }
 
     fn name(&self) -> &'static str {
