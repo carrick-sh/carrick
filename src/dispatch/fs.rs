@@ -1352,9 +1352,9 @@ impl SyscallDispatcher {
         // borrow of `vfs_mounts` doesn't conflict with reads from
         // sibling fields.
         let exec_path = self.executable_path.clone();
-        let addr_regions = self.address_space_regions.clone();
-        let brk = self.brk_current;
-        let mmap = self.mmap_next;
+        let addr_regions = self.mem.address_space_regions.clone();
+        let brk = self.mem.brk_current;
+        let mmap = self.mem.mmap_next;
         let ctx = crate::vfs::OpenContext {
             executable_path: Some(exec_path.as_str()),
             address_space_regions: addr_regions.as_deref(),
