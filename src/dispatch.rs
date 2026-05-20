@@ -8174,6 +8174,92 @@ impl SyscallDispatcher {
         }
     }
 
+    // === Normalized shim-wrappers ===
+    // Thin adapters giving each remaining legacy handler the uniform
+    // SyscallCtx<M> contract so it can live in the `normalized_dispatch!`
+    // table. The inner fns are unchanged (already tested); these forward
+    // `ctx.request` (Copy) and `ctx.memory`. Once every syscall has a
+    // wrapper the legacy match in `dispatch()` is deleted and the macro
+    // table becomes the single authoritative syscall registry.
+    fn sys_setxattr_path<M: GuestMemory>(&mut self, ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        self.setxattr(ctx.request, ctx.memory, XattrTarget::Path)
+    }
+    fn sys_setxattr_fd<M: GuestMemory>(&mut self, ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        self.setxattr(ctx.request, ctx.memory, XattrTarget::Fd)
+    }
+    fn sys_getxattr_path<M: GuestMemory>(&mut self, ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        self.getxattr(ctx.request, ctx.memory, XattrTarget::Path)
+    }
+    fn sys_getxattr_fd<M: GuestMemory>(&mut self, ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        self.getxattr(ctx.request, ctx.memory, XattrTarget::Fd)
+    }
+    fn sys_listxattr_path<M: GuestMemory>(&mut self, ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        self.listxattr(ctx.request, ctx.memory, XattrTarget::Path)
+    }
+    fn sys_listxattr_fd<M: GuestMemory>(&mut self, ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        self.listxattr(ctx.request, ctx.memory, XattrTarget::Fd)
+    }
+    fn sys_xattr_unsupported<M: GuestMemory>(&mut self, _ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        Ok(self.xattr_unsupported())
+    }
+    fn sys_statfs<M: GuestMemory>(&mut self, ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        self.statfs(ctx.request, ctx.memory)
+    }
+    fn sys_fstatfs<M: GuestMemory>(&mut self, ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        Ok(self.fstatfs(ctx.request, ctx.memory))
+    }
+    fn sys_truncate<M: GuestMemory>(&mut self, ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        self.truncate(ctx.request, &*ctx.memory)
+    }
+    fn sys_bootstrap_enosys<M: GuestMemory>(&mut self, _ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        Ok(self.bootstrap_enosys())
+    }
+    fn sys_exit<M: GuestMemory>(&mut self, ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        Ok(self.exit(ctx.request))
+    }
+    fn sys_setfsuid<M: GuestMemory>(&mut self, _ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        Ok(DispatchOutcome::Returned { value: i64::from(self.cred_euid) })
+    }
+    fn sys_setfsgid<M: GuestMemory>(&mut self, _ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        Ok(DispatchOutcome::Returned { value: i64::from(self.cred_egid) })
+    }
+    fn sys_setgroups<M: GuestMemory>(&mut self, _ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        Ok(DispatchOutcome::Returned { value: 0 })
+    }
+    fn sys_getpid<M: GuestMemory>(&mut self, _ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        Ok(self.getpid())
+    }
+    fn sys_getppid<M: GuestMemory>(&mut self, _ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        Ok(DispatchOutcome::Returned { value: 1 })
+    }
+    fn sys_getuid<M: GuestMemory>(&mut self, _ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        Ok(DispatchOutcome::Returned { value: i64::from(self.cred_ruid) })
+    }
+    fn sys_geteuid<M: GuestMemory>(&mut self, _ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        Ok(DispatchOutcome::Returned { value: i64::from(self.cred_euid) })
+    }
+    fn sys_getgid<M: GuestMemory>(&mut self, _ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        Ok(DispatchOutcome::Returned { value: i64::from(self.cred_rgid) })
+    }
+    fn sys_getegid<M: GuestMemory>(&mut self, _ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        Ok(DispatchOutcome::Returned { value: i64::from(self.cred_egid) })
+    }
+    fn sys_recvmmsg<M: GuestMemory>(&mut self, ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        Ok(self.recvmmsg(ctx.request, ctx.memory))
+    }
+    fn sys_sendmmsg<M: GuestMemory>(&mut self, ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        Ok(self.sendmmsg(ctx.request, ctx.memory))
+    }
+    fn sys_clone3<M: GuestMemory>(&mut self, ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        Ok(self.clone3(ctx.request, &*ctx.memory))
+    }
+    fn sys_membarrier<M: GuestMemory>(&mut self, ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        Ok(self.membarrier(ctx.request))
+    }
+    fn sys_rseq<M: GuestMemory>(&mut self, _ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+        Ok(self.rseq())
+    }
+
     fn fsync<M: GuestMemory>(
         &mut self,
         ctx: &mut SyscallCtx<M>,
