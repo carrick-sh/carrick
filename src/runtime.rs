@@ -637,15 +637,18 @@ fn load_execve_image(
         path = interp;
     }
 
-    let raw = if let Some(rootfs) = dispatcher.rootfs() {
-        // Read the main binary OVERLAY-FIRST (read_exec_file), so execve of a
-        // guest-created/overlay binary works (downloaded/extracted ELF,
-        // /tmp/p, dpkg-unpacked binary), not just immutable rootfs binaries.
-        // The interpreter (if any) is still resolved from the rootfs.
-        let bytes = dispatcher.read_exec_file(&path).ok_or(LINUX_ENOENT)?;
-        AddressSpace::load_elf_bytes_from_rootfs(&bytes, rootfs).map_err(|_| LINUX_ENOENT)?
-    } else {
-        AddressSpace::load_elf(&path).map_err(|_| LINUX_ENOENT)?
+    // Read the main binary AND resolve its interpreter OVERLAY-FIRST via
+    // `read_exec_file`, so execve works for guest-created/overlay binaries
+    // (downloaded/extracted ELF, /tmp/p, dpkg-unpacked binary) and needs no
+    // in-memory rootfs layer (which `--fs host` drops after seeding). When
+    // there's no overlay/rootfs at all (e.g. a bare RunElf test), fall back
+    // to reading the main binary straight off the host filesystem.
+    let raw = match dispatcher.read_exec_file(&path) {
+        Some(bytes) => {
+            AddressSpace::load_elf_bytes_with_reader(&bytes, &|p| dispatcher.read_exec_file(p))
+                .map_err(|_| LINUX_ENOENT)?
+        }
+        None => AddressSpace::load_elf(&path).map_err(|_| LINUX_ENOENT)?,
     };
     raw.with_el0_trampoline()
         .and_then(|a| a.with_el1_vectors())

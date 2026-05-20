@@ -655,6 +655,10 @@ impl HostFsBackend {
 impl FsBackend for HostFsBackend {
     fn lookup(&self, path: &str) -> Option<OverlayEntry> {
         let normalized = normalize(path)?;
+        if normalized.as_os_str().is_empty() {
+            // The sandbox root is always a directory.
+            return Some(OverlayEntry::Dir);
+        }
         if self.tombstones.contains(&normalized) {
             return Some(OverlayEntry::Deleted);
         }
@@ -688,6 +692,9 @@ impl FsBackend for HostFsBackend {
 
     fn lookup_kind(&self, path: &str) -> Option<OverlayEntryKind> {
         let normalized = normalize(path)?;
+        if normalized.as_os_str().is_empty() {
+            return Some(OverlayEntryKind::Dir);
+        }
         if self.tombstones.contains(&normalized) {
             return Some(OverlayEntryKind::Deleted);
         }
@@ -709,6 +716,18 @@ impl FsBackend for HostFsBackend {
 
     fn metadata(&self, path: &str) -> Option<RootFsMetadata> {
         let normalized = normalize(path)?;
+        // The sandbox root ("/") is always a directory. rel_path refuses
+        // to yield a relative path for it, so report it directly — once
+        // the rootfs layer is dropped (--fs host) this is the only source
+        // of truth for root metadata (statfs/open/mkdir-parent checks).
+        if normalized.as_os_str().is_empty() {
+            return Some(RootFsMetadata {
+                path: std::path::Path::new("/").to_path_buf(),
+                kind: RootFsEntryKind::Directory,
+                mode: 0o755,
+                size: 0,
+            });
+        }
         let rel = Self::rel_path(&normalized)?;
         let meta = self.dir.symlink_metadata(rel).ok()?;
         let mode = {

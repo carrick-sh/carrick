@@ -997,6 +997,18 @@ impl SyscallDispatcher {
         self.rootfs_vfs.set_overlay(backend)
     }
 
+    /// Drop the immutable in-memory rootfs layer. Valid ONLY once the
+    /// overlay backend holds the complete materialised filesystem (i.e.
+    /// after `HostFsBackend::seed_from_rootfs` for `--fs host`): from then
+    /// on the disk overlay is authoritative for every read, so the
+    /// in-memory rootfs is redundant and just wastes RAM. All layered VFS
+    /// reads and `read_exec_file` already fall back gracefully to "overlay
+    /// only" when the rootfs is `None`. Never call this for `--fs memory`,
+    /// whose overlay starts empty and relies on the rootfs for reads.
+    pub fn drop_rootfs_layer(&mut self) {
+        self.rootfs_vfs.rootfs = None;
+    }
+
     /// Name of the currently-installed backend (for logging / debug).
     pub fn fs_backend_name(&self) -> &'static str {
         self.rootfs_vfs.overlay.name()
