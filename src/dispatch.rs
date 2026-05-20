@@ -718,8 +718,16 @@ impl SyscallDispatcher {
     normalized_dispatch! {
         17 => getcwd,
         23 => dup,
+        34 => mkdirat,
+        35 => unlinkat,
+        36 => symlinkat,
+        37 => linkat,
+        38 => renameat,
         49 => chdir,
         50 => fchdir,
+        52 => fchmod,
+        53 => fchmodat,
+        78 => readlinkat,
     }
 
     pub fn new() -> Self {
@@ -962,19 +970,12 @@ impl SyscallDispatcher {
             29 => self.ioctl(request, memory, reporter),
             32 => self.flock(request),
             33 => self.mknodat(request, memory)?,
-            34 => self.mkdirat(request, memory)?,
-            35 => self.unlinkat(request, memory)?,
-            36 => self.symlinkat(request, memory)?,
-            37 => self.linkat(request, memory)?,
-            38 => self.renameat(request, memory)?,
             43 => self.statfs(request, memory)?,
             44 => self.fstatfs(request, memory),
             45 => self.truncate(request, memory)?,
             46 => self.ftruncate(request),
             47 => self.fallocate(request),
             48 => self.faccessat(request, memory)?,
-            52 => self.fchmod(request),
-            53 => self.fchmodat(request, memory)?,
             54 => self.fchownat(request, memory)?,
             55 => self.fchown(request),
             56 => self.openat(request, memory, reporter)?,
@@ -997,7 +998,6 @@ impl SyscallDispatcher {
             75 => self.bootstrap_enosys(),
             76 => self.splice(request, memory)?,
             77 => self.bootstrap_enosys(),
-            78 => self.readlinkat(request, memory)?,
             79 => self.newfstatat(request, memory)?,
             80 => self.fstat(request, memory),
             81 => self.sync(),
@@ -7295,23 +7295,22 @@ impl SyscallDispatcher {
         })
     }
 
-    fn readlinkat(
-        &self,
-        request: SyscallRequest,
-        memory: &mut impl GuestMemory,
+    fn readlinkat<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let dirfd = request.arg(0);
-        let pathname = request.arg(1);
-        let buffer = request.arg(2);
-        let buffer_size = usize::try_from(request.arg(3))
-            .map_err(|_| DispatchError::LengthTooLarge(request.arg(3)))?;
+        let dirfd = ctx.arg(0);
+        let pathname = ctx.arg(1);
+        let buffer = ctx.arg(2);
+        let buffer_size = usize::try_from(ctx.arg(3))
+            .map_err(|_| DispatchError::LengthTooLarge(ctx.arg(3)))?;
         if buffer_size == 0 {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
             });
         }
 
-        let path = match read_guest_c_string(memory, pathname) {
+        let path = match read_guest_c_string(&*ctx.memory, pathname) {
             Ok(path) => path,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
@@ -7335,7 +7334,7 @@ impl SyscallDispatcher {
 
         let bytes = target.as_bytes();
         let written = bytes.len().min(buffer_size);
-        if memory.write_bytes(buffer, &bytes[..written]).is_err() {
+        if ctx.memory.write_bytes(buffer, &bytes[..written]).is_err() {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EFAULT,
             });
@@ -7388,14 +7387,13 @@ impl SyscallDispatcher {
         Ok(DispatchOutcome::Errno { errno: LINUX_EROFS })
     }
 
-    fn mkdirat(
+    fn mkdirat<M: GuestMemory>(
         &mut self,
-        request: SyscallRequest,
-        memory: &impl GuestMemory,
+        ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let dirfd = request.arg(0);
-        let pathname = request.arg(1);
-        let path = match read_guest_c_string(memory, pathname) {
+        let dirfd = ctx.arg(0);
+        let pathname = ctx.arg(1);
+        let path = match read_guest_c_string(&*ctx.memory, pathname) {
             Ok(path) => path,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
@@ -7423,15 +7421,18 @@ impl SyscallDispatcher {
         }
     }
 
-    fn fchmod(&self, request: SyscallRequest) -> DispatchOutcome {
-        let fd = request.arg(0) as i32;
+    fn fchmod<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let fd = ctx.arg(0) as i32;
         if !self.fd_is_valid(fd) {
-            return DispatchOutcome::Errno { errno: LINUX_EBADF };
+            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         }
         // The overlay is a tmpfs that doesn't track owner/mode; accept
         // the call as a no-op so apt's chmod-the-directory-I-just-made
         // helpers don't fail with EROFS.
-        DispatchOutcome::Returned { value: 0 }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
     fn fchown(&self, request: SyscallRequest) -> DispatchOutcome {
@@ -7493,20 +7494,19 @@ impl SyscallDispatcher {
         }
     }
 
-    fn fchmodat(
+    fn fchmodat<M: GuestMemory>(
         &mut self,
-        request: SyscallRequest,
-        memory: &impl GuestMemory,
+        ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let dirfd = request.arg(0);
-        let pathname = request.arg(1);
-        let flags = request.arg(3);
+        let dirfd = ctx.arg(0);
+        let pathname = ctx.arg(1);
+        let flags = ctx.arg(3);
         if flags & !LINUX_AT_SYMLINK_NOFOLLOW != 0 {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
             });
         }
-        let path = match read_guest_c_string(memory, pathname) {
+        let path = match read_guest_c_string(&*ctx.memory, pathname) {
             Ok(path) => path,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
@@ -7528,7 +7528,7 @@ impl SyscallDispatcher {
         if let Err(errno) = self.layered_metadata(&resolved) {
             return Ok(DispatchOutcome::Errno { errno });
         }
-        let mode = (request.arg(2) & 0o7777) as u32;
+        let mode = (ctx.arg(2) & 0o7777) as u32;
         match self.rootfs_vfs.overlay.set_mode(&resolved, mode) {
             Ok(()) | Err(crate::fs_backend::BackendError::Unsupported) => {
                 Ok(DispatchOutcome::Returned { value: 0 })
@@ -7537,26 +7537,25 @@ impl SyscallDispatcher {
         }
     }
 
-    fn linkat(
+    fn linkat<M: GuestMemory>(
         &mut self,
-        request: SyscallRequest,
-        memory: &impl GuestMemory,
+        ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let olddirfd = request.arg(0);
-        let oldpath = request.arg(1);
-        let newdirfd = request.arg(2);
-        let newpath = request.arg(3);
-        let flags = request.arg(4);
+        let olddirfd = ctx.arg(0);
+        let oldpath = ctx.arg(1);
+        let newdirfd = ctx.arg(2);
+        let newpath = ctx.arg(3);
+        let flags = ctx.arg(4);
         if flags & !(LINUX_AT_SYMLINK_NOFOLLOW | LINUX_AT_EMPTY_PATH) != 0 {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
             });
         }
-        let old = match read_guest_c_string(memory, oldpath) {
+        let old = match read_guest_c_string(&*ctx.memory, oldpath) {
             Ok(path) => path,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        let new_path = match read_guest_c_string(memory, newpath) {
+        let new_path = match read_guest_c_string(&*ctx.memory, newpath) {
             Ok(path) => path,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
@@ -7623,15 +7622,14 @@ impl SyscallDispatcher {
         }
     }
 
-    fn symlinkat(
+    fn symlinkat<M: GuestMemory>(
         &mut self,
-        request: SyscallRequest,
-        memory: &impl GuestMemory,
+        ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let target = request.arg(0);
-        let newdirfd = request.arg(1);
-        let linkpath = request.arg(2);
-        let target_path = match read_guest_c_string(memory, target) {
+        let target = ctx.arg(0);
+        let newdirfd = ctx.arg(1);
+        let linkpath = ctx.arg(2);
+        let target_path = match read_guest_c_string(&*ctx.memory, target) {
             Ok(target) => target,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
@@ -7640,7 +7638,7 @@ impl SyscallDispatcher {
                 errno: LINUX_ENOENT,
             });
         }
-        let link = match read_guest_c_string(memory, linkpath) {
+        let link = match read_guest_c_string(&*ctx.memory, linkpath) {
             Ok(link) => link,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
@@ -7676,18 +7674,17 @@ impl SyscallDispatcher {
         }
     }
 
-    fn renameat(
+    fn renameat<M: GuestMemory>(
         &mut self,
-        request: SyscallRequest,
-        memory: &impl GuestMemory,
+        ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         self.do_renameat(
-            request.arg(0),
-            request.arg(1),
-            request.arg(2),
-            request.arg(3),
+            ctx.arg(0),
+            ctx.arg(1),
+            ctx.arg(2),
+            ctx.arg(3),
             0,
-            memory,
+            &*ctx.memory,
         )
     }
 
@@ -7769,20 +7766,19 @@ impl SyscallDispatcher {
         }
     }
 
-    fn unlinkat(
+    fn unlinkat<M: GuestMemory>(
         &mut self,
-        request: SyscallRequest,
-        memory: &impl GuestMemory,
+        ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let dirfd = request.arg(0);
-        let pathname = request.arg(1);
-        let flags = request.arg(2);
+        let dirfd = ctx.arg(0);
+        let pathname = ctx.arg(1);
+        let flags = ctx.arg(2);
         if flags & !LINUX_AT_REMOVEDIR != 0 {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
             });
         }
-        let path = match read_guest_c_string(memory, pathname) {
+        let path = match read_guest_c_string(&*ctx.memory, pathname) {
             Ok(path) => path,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
