@@ -359,24 +359,10 @@ pub struct SyscallDispatcher {
     cred_rgid: u32,
     cred_egid: u32,
     cred_sgid: u32,
-    /// Installed signal handlers per signum (1..=64). When the guest
-    /// calls `rt_sigaction(signum, new, old, 8)` we record `new` here
-    /// and return whatever was previously stored via `old`. Real
-    /// signal delivery isn't wired yet, but tracking the handler
-    /// state is what makes interactive `busybox sh`'s "is this signal
-    /// owned?" introspection produce consistent answers.
-    signal_handlers: HashMap<i32, LinuxSigaction>,
-    /// Guest's blocked-signal mask (bit `signum-1`). Updated by
-    /// `rt_sigprocmask`. A blocked signal that is raised is held in
-    /// `pending_signals` instead of being delivered, and surfaces via
-    /// `rt_sigpending` / `rt_sigtimedwait` or when later unblocked.
-    signal_mask: u64,
-    /// Signals raised while blocked, awaiting unblock or a synchronous
-    /// wait (`rt_sigtimedwait`). Bit `signum-1`.
-    pending_signals: u64,
-    /// Installed alternate signal stack (`sigaltstack`). `None` means no
-    /// alt stack is installed; queried back via the `old_ss` out-param.
-    sig_altstack: Option<LinuxSigaltstack>,
+    /// Owned signal subsystem state (handlers, mask, pending set, alt
+    /// stack). See [`signal::SignalState`]. Handlers that touch only
+    /// signal state borrow `self.signal` narrowly.
+    signal: signal::SignalState,
     /// Snapshot of the guest's `AddressSpace` regions, captured at
     /// boot via [`set_address_space_regions`]. When present,
     /// `/proc/self/maps` is rendered from this list (with the heap
@@ -835,10 +821,7 @@ impl SyscallDispatcher {
             cred_rgid: 0,
             cred_egid: 0,
             cred_sgid: 0,
-            signal_handlers: HashMap::new(),
-            signal_mask: 0,
-            pending_signals: 0,
-            sig_altstack: None,
+            signal: signal::SignalState::new(),
             address_space_regions: None,
             vfs_mounts: {
                 let mut m = crate::vfs::VfsMounts::new();

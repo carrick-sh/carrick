@@ -2,6 +2,38 @@
 //! `super` for the dispatcher struct and the normalized dispatch table.
 use super::*;
 
+/// Owned signal-subsystem state. Split out of `SyscallDispatcher` so the
+/// signal handlers borrow only what they touch instead of the whole
+/// dispatcher. Field semantics are unchanged from the former loose
+/// fields (`signal_handlers`/`signal_mask`/`pending_signals`/`sig_altstack`).
+pub(super) struct SignalState {
+    /// Installed signal handlers per signum (1..=64). When the guest
+    /// calls `rt_sigaction(signum, new, old, 8)` we record `new` here
+    /// and return whatever was previously stored via `old`.
+    pub handlers: HashMap<i32, LinuxSigaction>,
+    /// Guest's blocked-signal mask (bit `signum-1`). Updated by
+    /// `rt_sigprocmask`. A blocked signal that is raised is held in
+    /// `pending` instead of being delivered.
+    pub mask: u64,
+    /// Signals raised while blocked, awaiting unblock or a synchronous
+    /// wait (`rt_sigtimedwait`). Bit `signum-1`.
+    pub pending: u64,
+    /// Installed alternate signal stack (`sigaltstack`). `None` means no
+    /// alt stack is installed; queried back via the `old_ss` out-param.
+    pub altstack: Option<LinuxSigaltstack>,
+}
+
+impl SignalState {
+    pub(super) fn new() -> Self {
+        Self {
+            handlers: HashMap::new(),
+            mask: 0,
+            pending: 0,
+            altstack: None,
+        }
+    }
+}
+
 impl SyscallDispatcher {
     /// Look up the currently-installed handler for `signum`. Returns
     /// `None` when no handler has been recorded via `rt_sigaction`, or
@@ -9,7 +41,7 @@ impl SyscallDispatcher {
     /// uses this to decide whether to inject a guest frame (handler is
     /// `Some`) or apply the host-side default (handler is `None`).
     pub fn registered_signal_handler(&self, signum: i32) -> Option<LinuxSigaction> {
-        let action = self.signal_handlers.get(&signum).copied()?;
+        let action = self.signal.handlers.get(&signum).copied()?;
         let handler = action.sa_handler;
         if handler == crate::linux_abi::LINUX_SIG_DFL
             || handler == crate::linux_abi::LINUX_SIG_IGN
@@ -23,7 +55,7 @@ impl SyscallDispatcher {
     /// True iff the guest installed `SIG_IGN` for `signum`. Lets the
     /// runtime drop a pending signal without injecting it.
     pub fn signal_is_ignored(&self, signum: i32) -> bool {
-        self.signal_handlers
+        self.signal.handlers
             .get(&signum)
             .map(|a| a.sa_handler == crate::linux_abi::LINUX_SIG_IGN)
             .unwrap_or(false)
@@ -36,7 +68,7 @@ impl SyscallDispatcher {
             return false;
         }
         match sigmask_bit(signum) {
-            Some(bit) => self.signal_mask & bit != 0,
+            Some(bit) => self.signal.mask & bit != 0,
             None => false,
         }
     }
@@ -45,19 +77,19 @@ impl SyscallDispatcher {
     /// guest unblocks it or dequeues it via `rt_sigtimedwait`.
     pub fn mark_signal_pending(&mut self, signum: i32) {
         if let Some(bit) = sigmask_bit(signum) {
-            self.pending_signals |= bit;
+            self.signal.pending |= bit;
         }
     }
 
     /// Lowest-numbered pending signal that intersects `set`, cleared from
     /// the pending set. Used by `rt_sigtimedwait`.
     fn take_pending_in(&mut self, set: u64) -> Option<i32> {
-        let candidates = self.pending_signals & set;
+        let candidates = self.signal.pending & set;
         if candidates == 0 {
             return None;
         }
         let signum = candidates.trailing_zeros() as i32 + 1;
-        self.pending_signals &= !(1u64 << (signum - 1));
+        self.signal.pending &= !(1u64 << (signum - 1));
         Some(signum)
     }
 
@@ -147,7 +179,7 @@ impl SyscallDispatcher {
         // Report the currently-installed alt stack (or a disabled stack
         // when none is set) into the old_ss out-param.
         if old_ss != 0 {
-            let current = self.sig_altstack.unwrap_or_else(LinuxSigaltstack::disabled);
+            let current = self.signal.altstack.unwrap_or_else(LinuxSigaltstack::disabled);
             if memory.write_bytes(old_ss, current.abi_bytes()).is_err() {
                 return Ok(DispatchOutcome::Errno {
                     errno: LINUX_EFAULT,
@@ -182,7 +214,7 @@ impl SyscallDispatcher {
             }
             if flags & LINUX_SS_DISABLE != 0 {
                 // SS_DISABLE removes any installed alt stack.
-                self.sig_altstack = None;
+                self.signal.altstack = None;
             } else {
                 let size = new_stack.ss_size;
                 if size < LINUX_MINSIGSTKSZ {
@@ -193,7 +225,7 @@ impl SyscallDispatcher {
                 // Record the alt stack so a subsequent query returns it.
                 // (We don't yet switch to it during delivery, but glibc and
                 // sigaltstack(2) callers rely on the get/set round-trip.)
-                self.sig_altstack = Some(new_stack);
+                self.signal.altstack = Some(new_stack);
             }
         }
 
@@ -249,7 +281,8 @@ impl SyscallDispatcher {
         // Write back the previously-installed handler (or zero if none).
         if old_action != 0 {
             let prev = self
-                .signal_handlers
+                .signal
+                .handlers
                 .get(&signum)
                 .copied()
                 .unwrap_or_else(LinuxSigaction::empty);
@@ -261,7 +294,7 @@ impl SyscallDispatcher {
         if new_action != 0 && signum != 9 && signum != 19 {
             if let Ok(bytes) = memory.read_bytes(new_action, core::mem::size_of::<LinuxSigaction>()) {
                 if let Ok(sa) = LinuxSigaction::ref_from_bytes(&bytes) {
-                    self.signal_handlers.insert(signum, *sa);
+                    self.signal.handlers.insert(signum, *sa);
                 }
             }
         }
@@ -282,7 +315,7 @@ impl SyscallDispatcher {
                 errno: LINUX_EINVAL,
             });
         }
-        let previous_mask = self.signal_mask;
+        let previous_mask = self.signal.mask;
         // Write back the *previous* mask before applying changes (the
         // caller may pass the same buffer for new_set and old_set).
         if old_set != 0
@@ -319,13 +352,13 @@ impl SyscallDispatcher {
             #[allow(clippy::unwrap_used)]
             let unmaskable = sigmask_bit(LINUX_SIGKILL).unwrap() | sigmask_bit(LINUX_SIGSTOP).unwrap();
             mask &= !unmaskable;
-            self.signal_mask = mask;
+            self.signal.mask = mask;
             // Any pending signal that just became unblocked is eligible for
             // delivery now. Hand one to the runtime's pending slot.
-            let deliverable = self.pending_signals & !mask;
+            let deliverable = self.signal.pending & !mask;
             if deliverable != 0 {
                 let signum = deliverable.trailing_zeros() as i32 + 1;
-                self.pending_signals &= !(1u64 << (signum - 1));
+                self.signal.pending &= !(1u64 << (signum - 1));
                 crate::host_signal::raise_for_self(signum);
             }
         }
@@ -346,7 +379,7 @@ impl SyscallDispatcher {
         }
         if set_ptr != 0
             && memory
-                .write_bytes(set_ptr, &self.pending_signals.to_le_bytes())
+                .write_bytes(set_ptr, &self.signal.pending.to_le_bytes())
                 .is_err()
         {
             return Ok(DispatchOutcome::Errno {
