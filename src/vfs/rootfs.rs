@@ -191,6 +191,29 @@ impl RootFsVfs {
                     if want_create && want_excl {
                         return Err(LINUX_EEXIST);
                     }
+                    // Disk-backed overlay (--fs host): the whole rootfs is
+                    // materialised on the cap-std scratch, so a writable open
+                    // of a rootfs file gets a REAL host fd — writes land on
+                    // disk and share across fork. Without this, writes went to
+                    // an in-memory copy (invisible to forked children and
+                    // never persisted), and renames of rootfs files hit EROFS
+                    // (dpkg's status/status-old rewrite failed).
+                    if let Some(host_fd) =
+                        self.overlay.open_raw_fd(path, writable_request, false, want_trunc)
+                    {
+                        let size = if want_trunc { 0 } else { metadata.size };
+                        let md = RootFsMetadata {
+                            path: std::path::Path::new(path).to_path_buf(),
+                            kind: RootFsEntryKind::File,
+                            mode: metadata.mode,
+                            size,
+                        };
+                        return Ok(OpenDispatchResult::HostFile {
+                            host_fd,
+                            metadata: md,
+                            writable: writable_request,
+                        });
+                    }
                     let mut contents = self
                         .rootfs
                         .as_ref()
