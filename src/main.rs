@@ -253,6 +253,31 @@ fn main() -> anyhow::Result<()> {
         libc::setenv(key.as_ptr(), val.as_ptr(), 1);
     }
 
+    // A guest process is one carrick (host) process; an unimplemented
+    // syscall or invariant violation panics it. When that process is a
+    // forked child (apt's http method, dpkg, gpgv…), the panic text
+    // otherwise scrolls past buried in the guest program's own output and
+    // the user only sees a downstream "dpkg returned 100". Print a loud,
+    // attributed, greppable banner so the ROOT cause is unmissable.
+    std::panic::set_hook(Box::new(|info| {
+        let pid = unsafe { libc::getpid() };
+        let msg = info
+            .payload()
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("<non-string panic payload>");
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "<unknown>".to_owned());
+        eprintln!(
+            "\n\x1b[1;31m======== CARRICK GUEST ABORT [pid {pid}] ========\x1b[0m\n\
+             {msg}\n  at {loc}\n\
+             \x1b[1;31m=================================================\x1b[0m\n"
+        );
+    }));
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

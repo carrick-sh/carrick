@@ -1042,6 +1042,7 @@ impl SyscallDispatcher {
             435 => self.clone3(request, memory),
             221 => self.execve(request, memory),
             222 => self.mmap(request, memory)?,
+            223 => self.fadvise64(request),
             226 => self.mprotect(request, memory),
             227 => self.msync(request, memory),
             228 => self.mlock(request, memory),
@@ -2247,7 +2248,12 @@ impl SyscallDispatcher {
             };
         }
 
-        let status_flags = flags & LINUX_O_NONBLOCK;
+        // The access mode must be encoded per end so fcntl(F_GETFL) reports
+        // it: the read end is O_RDONLY (0), the write end O_WRONLY. Without
+        // this, glibc's fdopen(write_end, "w") sees O_RDONLY via F_GETFL and
+        // fails with EINVAL ("Failed to open new FD - fdopen") — apt's dpkg
+        // status pipe hit exactly that.
+        let nonblock = flags & LINUX_O_NONBLOCK;
         let fd_flags = linux_fd_flags_from_open_flags(flags);
         self.insert_open_file(
             read_fd,
@@ -2255,7 +2261,7 @@ impl SyscallDispatcher {
                 description: Rc::new(RefCell::new(OpenDescription::HostPipe {
                     host_fd: host_read,
                     is_read_end: true,
-                    status_flags,
+                    status_flags: LINUX_O_RDONLY | nonblock,
                 })),
                 fd_flags,
             },
@@ -2266,7 +2272,7 @@ impl SyscallDispatcher {
                 description: Rc::new(RefCell::new(OpenDescription::HostPipe {
                     host_fd: host_write,
                     is_read_end: false,
-                    status_flags,
+                    status_flags: LINUX_O_WRONLY | nonblock,
                 })),
                 fd_flags,
             },
@@ -5607,6 +5613,18 @@ impl SyscallDispatcher {
         // both land here. A real fork is a valid implementation of vfork (the
         // child execs or _exits immediately), so route to the same path.
         DispatchOutcome::Fork
+    }
+
+    /// posix_fadvise(2): purely an advisory hint to the page cache. We have
+    /// no readahead model, so honour it as a no-op — but validate the fd so a
+    /// genuinely bad descriptor still reports EBADF. dpkg/apt/coreutils call
+    /// this routinely; without it the unimplemented-syscall panic killed them.
+    fn fadvise64(&self, request: SyscallRequest) -> DispatchOutcome {
+        let fd = request.arg(0) as i32;
+        if !self.fd_is_valid(fd) && !is_stdio_fd(fd) {
+            return DispatchOutcome::Errno { errno: LINUX_EBADF };
+        }
+        DispatchOutcome::Returned { value: 0 }
     }
 
     fn brk(&mut self, request: SyscallRequest) -> DispatchOutcome {
@@ -9452,19 +9470,13 @@ fn linux_mode(metadata: &RootFsMetadata) -> u32 {
 }
 
 fn access_metadata(metadata: &RootFsMetadata, mode: u64) -> DispatchOutcome {
-    if mode & LINUX_W_OK != 0 {
-        return DispatchOutcome::Errno {
-            errno: LINUX_EACCES,
-        };
-    }
-    if mode & LINUX_R_OK != 0
-        && metadata.kind == RootFsEntryKind::File
-        && metadata.mode & 0o444 == 0
-    {
-        return DispatchOutcome::Errno {
-            errno: LINUX_EACCES,
-        };
-    }
+    // carrick runs the guest as uid 0 (root), and the overlay/host backend is
+    // writable (read-only rootfs files copy up on write). Root bypasses DAC
+    // read/write checks entirely, so R_OK and W_OK always succeed for an
+    // existing path — previously W_OK returned EACCES unconditionally, which
+    // made dpkg refuse /var/lib/dpkg ("required read/write access") even
+    // though writes actually work. For execute, root still requires at least
+    // one x bit on a regular file.
     if mode & LINUX_X_OK != 0
         && metadata.kind == RootFsEntryKind::File
         && metadata.mode & 0o111 == 0
