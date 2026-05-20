@@ -31,11 +31,14 @@ carrick*:::syscall-entry
 {
     @entries[copyinstr(arg1)] = count();
     /*
-     * arg2 is a pointer to the JSON-serialised SyscallArgs:
-     *   {"ok":[v0,v1,v2,v3,v4,v5]} — values are decimal u64s.
+     * arg2 is the ADDRESS of a SyscallArgs ([u64; 6], contiguous). copyin
+     * the 48 bytes and read the six args natively — no JSON string-build
+     * on the carrick side (this probe fires on every syscall).
      */
-    printf("[%d entry] %-24s nr=%-3d args=%s\n",
-        pid, copyinstr(arg1), arg0, copyinstr(arg2));
+    this->sa = (uint64_t *)copyin(arg2, 48);
+    printf("[%d entry] %-24s nr=%-3d args=[%#x, %#x, %#x, %#x, %#x, %#x]\n",
+        pid, copyinstr(arg1), arg0,
+        this->sa[0], this->sa[1], this->sa[2], this->sa[3], this->sa[4], this->sa[5]);
 }
 
 carrick*:::syscall-return
@@ -55,15 +58,20 @@ carrick*:::unhandled-syscall
 /pid == $target || progenyof($target)/
 {
     @unhandled[copyinstr(arg1)] = count();
-    printf("[%d unh  ] %-24s nr=%-3d args=%s\n",
-        pid, copyinstr(arg1), arg0, copyinstr(arg2));
+    this->ua = (uint64_t *)copyin(arg2, 48);
+    printf("[%d unh  ] %-24s nr=%-3d args=[%#x, %#x, %#x, %#x, %#x, %#x]\n",
+        pid, copyinstr(arg1), arg0,
+        this->ua[0], this->ua[1], this->ua[2], this->ua[3], this->ua[4], this->ua[5]);
 }
 
 carrick*:::partial-syscall
 {
     @partial[copyinstr(arg1), copyinstr(arg3)] = count();
-    printf("[part ] %-24s nr=%d reason=%s\n",
-        copyinstr(arg1), arg0, copyinstr(arg3));
+    this->pa = (uint64_t *)copyin(arg2, 48);
+    printf("[part ] %-24s nr=%d args=[%#x, %#x, %#x, %#x, %#x, %#x] reason=%s\n",
+        copyinstr(arg1), arg0,
+        this->pa[0], this->pa[1], this->pa[2], this->pa[3], this->pa[4], this->pa[5],
+        copyinstr(arg3));
 }
 
 carrick*:::path-open

@@ -159,6 +159,9 @@ pub struct TraceOptions {
     /// running `dtrace -F`. Indents each entry/return event by call
     /// depth.
     pub flowindent: bool,
+    /// Custom D program to compile instead of the bundled syscall tracer.
+    /// `None` uses `BUNDLED_D_SCRIPT`.
+    pub script: Option<String>,
 }
 
 /// Spawn `child_path` with `child_argv` under DTrace, with our bundled
@@ -216,7 +219,9 @@ pub fn run_child_under_dtrace(
         }
     }
 
-    let program_c = CString::new(BUNDLED_D_SCRIPT).expect("D script has nul bytes?");
+    let program_src: &str = opts.script.as_deref().unwrap_or(BUNDLED_D_SCRIPT);
+    let program_c = CString::new(program_src)
+        .map_err(|_| DTraceError::Compile("D script contains a nul byte".to_owned()))?;
     let prog = unsafe {
         dtrace_program_strcompile(
             hdl,

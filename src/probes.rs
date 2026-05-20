@@ -9,10 +9,19 @@ use crate::compat::{CompatEvent, SyscallArgs};
 mod carrick_usdt {
     use crate::compat::SyscallArgs;
 
-    fn syscall__entry(_: u64, _: &str, _: &SyscallArgs) {}
+    // arg2 is the ADDRESS of a `SyscallArgs` ([u64; 6], contiguous); DTrace
+    // does `copyin(arg2, 48)` and reads the six args by offset. This probe
+    // fires on EVERY guest syscall, so we must NOT JSON-encode here — that
+    // string-builds on every fire even for a script that only wants one
+    // syscall, which is what made `carrick trace` slow (DTrace itself is
+    // production-safe; the cost was ours). Same raw-pointer trick as
+    // `vcpu__trap`.
+    fn syscall__entry(_: u64, _: &str, _: u64) {}
     fn syscall__return(_: u64, _: &str, _: i64, _: i32) {}
-    fn unhandled__syscall(_: u64, _: &str, _: &SyscallArgs) {}
-    fn partial__syscall(_: u64, _: &str, _: &SyscallArgs, _: &str) {}
+    // arg2 is the ADDRESS of a `SyscallArgs` ([u64; 6]); DTrace copyin's 48
+    // bytes — same raw-pointer convention as `syscall__entry`, no JSON.
+    fn unhandled__syscall(_: u64, _: &str, _: u64) {}
+    fn partial__syscall(_: u64, _: &str, _: u64, _: &str) {}
     fn unhandled__ioctl(_: i32, _: u64, _: u64) {}
     fn proc__read__unimplemented(_: &str) {}
     fn sys__read__unimplemented(_: &str) {}
@@ -148,7 +157,10 @@ pub fn fire(event: &CompatEvent) {
 fn fire_usdt(event: &CompatEvent) {
     match event {
         CompatEvent::SyscallEntry { number, name, args } => {
-            carrick_usdt::syscall__entry!(|| (*number, name.as_str(), args));
+            // `args` lives in `event` for the duration of this synchronous
+            // probe fire, so its address is valid when DTrace copyin's it.
+            let args_ptr = args as *const SyscallArgs as u64;
+            carrick_usdt::syscall__entry!(|| (*number, name.as_str(), args_ptr));
         }
         CompatEvent::SyscallReturn {
             number,
@@ -161,7 +173,8 @@ fn fire_usdt(event: &CompatEvent) {
             });
         }
         CompatEvent::UnhandledSyscall { number, name, args } => {
-            carrick_usdt::unhandled__syscall!(|| (*number, name.as_str(), args));
+            let args_ptr = args as *const SyscallArgs as u64;
+            carrick_usdt::unhandled__syscall!(|| (*number, name.as_str(), args_ptr));
         }
         CompatEvent::PartialSyscall {
             number,
@@ -169,7 +182,8 @@ fn fire_usdt(event: &CompatEvent) {
             args,
             reason,
         } => {
-            carrick_usdt::partial__syscall!(|| (*number, name.as_str(), args, reason.as_str()));
+            let args_ptr = args as *const SyscallArgs as u64;
+            carrick_usdt::partial__syscall!(|| (*number, name.as_str(), args_ptr, reason.as_str()));
         }
         CompatEvent::UnhandledIoctl { fd, request, arg } => {
             carrick_usdt::unhandled__ioctl!(|| (*fd, *request, *arg));
