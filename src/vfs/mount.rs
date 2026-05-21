@@ -172,9 +172,7 @@ fn canonicalise_path(path: &str) -> Option<String> {
             Component::RootDir => {}
             Component::CurDir => {}
             Component::ParentDir => {
-                if out.pop().is_none() {
-                    return None;
-                }
+                out.pop()?;
             }
             Component::Normal(n) => out.push(n.to_str()?),
             Component::Prefix(_) => return None,

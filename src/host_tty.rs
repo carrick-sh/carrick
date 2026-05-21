@@ -187,17 +187,17 @@ fn darwin_to_linux_termios(d: &libc::termios) -> LinuxTermios {
     let iflag = (d.c_iflag as u32) & COMMON_IFLAG_MASK;
 
     let mut oflag = (d.c_oflag as u32) & COMMON_OFLAG_MASK;
-    if (d.c_oflag as u64) & DARWIN_ONLCR != 0 {
+    if d.c_oflag & DARWIN_ONLCR != 0 {
         oflag |= LINUX_ONLCR;
     }
-    if (d.c_oflag as u64) & DARWIN_OCRNL != 0 {
+    if d.c_oflag & DARWIN_OCRNL != 0 {
         oflag |= LINUX_OCRNL;
     }
 
     let cflag = (d.c_cflag as u32) & COMMON_CFLAG_MASK;
 
     let mut lflag = 0u32;
-    let dl = d.c_lflag as u64;
+    let dl = d.c_lflag;
     if dl & DARWIN_LFLAG_ISIG != 0 {
         lflag |= LINUX_LFLAG_ISIG;
     }
@@ -230,11 +230,10 @@ fn darwin_to_linux_termios(d: &libc::termios) -> LinuxTermios {
 
     let mut c_cc = [0u8; 19];
     for (linux_idx, darwin_idx) in LINUX_TO_DARWIN_CC.iter().enumerate() {
-        if let Some(di) = darwin_idx {
-            if *di < d.c_cc.len() {
+        if let Some(di) = darwin_idx
+            && *di < d.c_cc.len() {
                 c_cc[linux_idx] = d.c_cc[*di];
             }
-        }
     }
 
     LinuxTermios {
@@ -251,10 +250,10 @@ fn darwin_to_linux_termios(d: &libc::termios) -> LinuxTermios {
 
 fn linux_to_darwin_termios(l: &LinuxTermios, d: &mut libc::termios) {
     // Preserve any host-specific bits outside the masks we translate.
-    let preserved_iflag = (d.c_iflag as u64) & !(COMMON_IFLAG_MASK as u64);
-    let preserved_oflag = (d.c_oflag as u64) & !((COMMON_OFLAG_MASK as u64) | DARWIN_ONLCR | DARWIN_OCRNL);
-    let preserved_cflag = (d.c_cflag as u64) & !(COMMON_CFLAG_MASK as u64);
-    let preserved_lflag = (d.c_lflag as u64)
+    let preserved_iflag = d.c_iflag & !(COMMON_IFLAG_MASK as u64);
+    let preserved_oflag = d.c_oflag & !((COMMON_OFLAG_MASK as u64) | DARWIN_ONLCR | DARWIN_OCRNL);
+    let preserved_cflag = d.c_cflag & !(COMMON_CFLAG_MASK as u64);
+    let preserved_lflag = d.c_lflag
         & !(DARWIN_LFLAG_ISIG
             | DARWIN_LFLAG_ICANON
             | DARWIN_LFLAG_ECHO
@@ -312,11 +311,10 @@ fn linux_to_darwin_termios(l: &LinuxTermios, d: &mut libc::termios) {
     d.c_lflag = lflag as libc::tcflag_t;
 
     for (linux_idx, darwin_idx) in LINUX_TO_DARWIN_CC.iter().enumerate() {
-        if let Some(di) = darwin_idx {
-            if *di < d.c_cc.len() && linux_idx < l.c_cc.len() {
+        if let Some(di) = darwin_idx
+            && *di < d.c_cc.len() && linux_idx < l.c_cc.len() {
                 d.c_cc[*di] = l.c_cc[linux_idx];
             }
-        }
     }
 
     d.c_ispeed = l.c_ispeed as libc::speed_t;

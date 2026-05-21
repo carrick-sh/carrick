@@ -690,13 +690,11 @@ impl SyscallDispatcher {
         // exit_group(94) always tears down the whole process. exit(93) ends
         // just this thread IF siblings are still live; with only one live
         // thread (or no ThreadCtx) it's equivalent to whole-process exit.
-        if ctx.request.number == 93 {
-            if let Some(t) = ctx.thread {
-                if t.registry.live_count() > 1 {
+        if ctx.request.number == 93
+            && let Some(t) = ctx.thread
+                && t.registry.live_count() > 1 {
                     return Ok(DispatchOutcome::ThreadExit { code });
                 }
-            }
-        }
         Ok(DispatchOutcome::Exit { code })
     }
 

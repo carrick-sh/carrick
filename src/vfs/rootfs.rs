@@ -112,9 +112,9 @@ impl RootFsVfs {
         // A symlink in the immutable rootfs layer: report the link, not its
         // target. Non-symlink entries fall through to the regular (following)
         // lookup, which is identical for them.
-        if let Some(rootfs) = self.rootfs.as_ref() {
-            if let Ok(md) = rootfs.symlink_metadata(path) {
-                if matches!(md.kind, RootFsEntryKind::Symlink) {
+        if let Some(rootfs) = self.rootfs.as_ref()
+            && let Ok(md) = rootfs.symlink_metadata(path)
+                && matches!(md.kind, RootFsEntryKind::Symlink) {
                     return Ok(Metadata {
                         kind: EntryKind::Symlink,
                         mode: md.mode,
@@ -125,8 +125,6 @@ impl RootFsVfs {
                         mtime_nanos: 0,
                     });
                 }
-            }
-        }
         self.lookup(path)
     }
 
@@ -205,7 +203,7 @@ impl RootFsVfs {
                     self.rootfs.as_ref(),
                     path,
                 )
-                .map_err(|e| crate::dispatch::rootfs_errno(e))?;
+                .map_err(crate::dispatch::rootfs_errno)?;
                 let metadata = RootFsMetadata {
                     path: std::path::Path::new(path).to_path_buf(),
                     kind: RootFsEntryKind::Directory,
@@ -266,7 +264,7 @@ impl RootFsVfs {
                         .as_ref()
                         .expect("rootfs metadata implies rootfs")
                         .read(path)
-                        .map_err(|e| crate::dispatch::rootfs_errno(e))?;
+                        .map_err(crate::dispatch::rootfs_errno)?;
                     // Write-promotion: if the caller asked for write
                     // access, copy the rootfs file into the overlay so
                     // subsequent writes land in mutable storage.
@@ -293,7 +291,7 @@ impl RootFsVfs {
                         self.rootfs.as_ref(),
                         path,
                     )
-                    .map_err(|e| crate::dispatch::rootfs_errno(e))?;
+                    .map_err(crate::dispatch::rootfs_errno)?;
                     Ok(OpenDispatchResult::Directory { metadata, entries })
                 }
                 RootFsEntryKind::Symlink => Err(LINUX_EINVAL),
@@ -335,7 +333,7 @@ impl RootFsVfs {
                             .as_ref()
                             .expect("rootfs metadata implies rootfs")
                             .read(from)
-                            .map_err(|e| crate::dispatch::rootfs_errno(e))?;
+                            .map_err(crate::dispatch::rootfs_errno)?;
                         (RootFsEntryKind::File, Some(bytes), false)
                     }
                     RootFsEntryKind::Directory => (RootFsEntryKind::Directory, None, false),
@@ -614,11 +612,10 @@ impl Vfs for RootFsVfs {
             }
             Some(OverlayEntry::Deleted) => {}
             None => {
-                if let Some(rootfs) = self.rootfs.as_ref() {
-                    if rootfs.metadata(path).is_ok() {
+                if let Some(rootfs) = self.rootfs.as_ref()
+                    && rootfs.metadata(path).is_ok() {
                         return Err(LINUX_EEXIST);
                     }
-                }
             }
         }
         // Parent must exist as a directory in the layered view.
@@ -696,11 +693,10 @@ impl Vfs for RootFsVfs {
             self.overlay.as_ref(),
             self.rootfs.as_ref(),
             path,
-        ) {
-            if !entries.is_empty() {
+        )
+            && !entries.is_empty() {
                 return Err(LINUX_ENOTEMPTY);
             }
-        }
         if in_overlay {
             self.overlay.remove_entry(path);
             let rootfs_has_it = self
