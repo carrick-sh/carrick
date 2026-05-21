@@ -1,6 +1,6 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
-use std::io::{Cursor, Read};
+use std::io::{BufRead, BufReader, Cursor, Read};
 use std::path::{Component, Path, PathBuf};
 
 use flate2::read::GzDecoder;
@@ -86,6 +86,155 @@ pub enum RootFsError {
     Utf8(#[from] std::string::FromUtf8Error),
     #[error("too many symlinks while resolving rootfs path: {0}")]
     TooManySymlinks(String),
+}
+
+/// Statistics returned by [`extract_layer_paths_to_dir`].
+#[derive(Debug, Clone, Default)]
+pub struct ExtractStats {
+    pub files: u64,
+    pub dirs: u64,
+    pub symlinks: u64,
+    pub skipped_special: u64,
+}
+
+/// Stream OCI layer blobs (gzip or raw tar) directly into `dir`, applying
+/// overlay + whiteout semantics. Never materializes the file tree in memory.
+///
+/// Layers are applied in order (first to last). Each layer can add, replace,
+/// or delete entries from prior layers using standard OCI whiteout conventions.
+pub fn extract_layer_paths_to_dir(
+    paths: &[PathBuf],
+    dir: &cap_std::fs::Dir,
+) -> Result<ExtractStats, RootFsError> {
+    let mut stats = ExtractStats::default();
+    for path in paths {
+        let file = fs::File::open(path)?;
+        let mut buf = BufReader::new(file);
+        // Sniff first 2 bytes for gzip magic without consuming the stream.
+        let magic = buf.fill_buf()?;
+        let is_gz = magic.len() >= 2 && magic[0] == 0x1f && magic[1] == 0x8b;
+        if is_gz {
+            let decoder = GzDecoder::new(buf);
+            let mut archive = tar::Archive::new(decoder);
+            apply_tar_to_dir(&mut archive, dir, &mut stats)?;
+        } else {
+            let mut archive = tar::Archive::new(buf);
+            apply_tar_to_dir(&mut archive, dir, &mut stats)?;
+        }
+    }
+    Ok(stats)
+}
+
+fn apply_tar_to_dir<R: Read>(
+    archive: &mut tar::Archive<R>,
+    dir: &cap_std::fs::Dir,
+    stats: &mut ExtractStats,
+) -> Result<(), RootFsError> {
+    use cap_std::fs::PermissionsExt as _;
+    use std::io::ErrorKind;
+
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let raw_path = entry.path()?.into_owned();
+        let path = normalize_layer_path(&raw_path)?;
+
+        // Whiteout detection — replicates apply_layer exactly.
+        if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+            if file_name == OPAQUE_WHITEOUT {
+                // Opaque whiteout: clear the parent directory then recreate it.
+                if let Some(parent) = path.parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    match dir.remove_dir_all(parent) {
+                        Ok(()) | Err(_) => {}
+                    }
+                    dir.create_dir_all(parent)?;
+                }
+                continue;
+            }
+
+            if let Some(hidden_name) = file_name.strip_prefix(WHITEOUT_PREFIX) {
+                if let Some(parent) = path.parent() {
+                    let target = if parent.as_os_str().is_empty() {
+                        PathBuf::from(hidden_name)
+                    } else {
+                        parent.join(hidden_name)
+                    };
+                    // Try removing as a file first, then as a directory tree.
+                    match dir.remove_file(&target) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == ErrorKind::NotFound => {}
+                        Err(_) => {
+                            match dir.remove_dir_all(&target) {
+                                Ok(()) | Err(_) => {}
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+        }
+
+        let entry_type = entry.header().entry_type();
+        let mode = entry.header().mode().unwrap_or(0o644);
+
+        // Ensure parent directory exists for all non-root entries.
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            dir.create_dir_all(parent)?;
+        }
+
+        if entry_type.is_dir() {
+            dir.create_dir_all(&path)?;
+            let _ = dir.set_permissions(
+                &path,
+                cap_std::fs::Permissions::from_mode(mode),
+            );
+            stats.dirs += 1;
+        } else if entry_type.is_symlink() {
+            let link_name = entry
+                .link_name()?
+                .ok_or_else(|| RootFsError::UnsafePath(path.display().to_string()))?
+                .into_owned();
+            // Remove any existing entry at path before creating the symlink.
+            let _ = dir.remove_file(&path);
+            let _ = dir.remove_dir_all(&path);
+            // Store the raw link target verbatim (Linux symlinkat(2) semantics).
+            dir.symlink_contents(link_name.to_string_lossy().as_ref(), &path)?;
+            stats.symlinks += 1;
+        } else if entry_type.is_file() {
+            // Streaming copy — never buffers the whole file.
+            let mut f = dir.create(&path)?;
+            std::io::copy(&mut entry, &mut f)?;
+            drop(f);
+            let _ = dir.set_permissions(
+                &path,
+                cap_std::fs::Permissions::from_mode(mode),
+            );
+            stats.files += 1;
+        } else if entry_type.is_hard_link() {
+            let link_name = entry
+                .link_name()?
+                .ok_or_else(|| RootFsError::UnsafePath(path.display().to_string()))?
+                .into_owned();
+            let target = normalize_layer_path(&link_name)?;
+            match dir.hard_link(&target, dir, &path) {
+                Ok(()) => {}
+                Err(_) => {
+                    // Fall back to copying target's bytes if hard_link fails.
+                    let mut src = dir.open(&target)?;
+                    let mut dst = dir.create(&path)?;
+                    std::io::copy(&mut src, &mut dst)?;
+                }
+            }
+            stats.files += 1;
+        } else {
+            // char/block/fifo/other special — skip.
+            stats.skipped_special += 1;
+        }
+    }
+    Ok(())
 }
 
 impl RootFs {
