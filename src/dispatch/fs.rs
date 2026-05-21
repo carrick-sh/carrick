@@ -546,6 +546,34 @@ impl SyscallDispatcher {
             }
             LINUX_F_SETFL => {
                 let Some(open_file) = self.io.open_files.get(&fd) else {
+                    // Bare stdio (0/1/2) has no OpenDescription, but real Linux
+                    // lets you fcntl(F_SETFL) on stdin/stdout/stderr. apt's dpkg
+                    // child sets stdin non-blocking via fcntl(0, F_SETFL,
+                    // O_NONBLOCK) before exec and treats EBADF as fatal — it
+                    // _exit(100)'d, failing `apt install` ("Sub-process dpkg
+                    // returned an error code (100)"). Accept it, propagating
+                    // O_NONBLOCK to the real host stdio fd when the guest's
+                    // stdio is wired to our host fds (stream_stdio / --raw),
+                    // mirroring the F_GETFD/F_SETFD/F_GETFL stdio special-cases.
+                    if is_stdio_fd(fd) {
+                        if self.io.stream_stdio {
+                            let want_nonblock = arg & LINUX_O_NONBLOCK != 0;
+                            unsafe {
+                                let cur = libc::fcntl(fd, libc::F_GETFL, 0);
+                                if cur >= 0 {
+                                    let next = if want_nonblock {
+                                        cur | libc::O_NONBLOCK
+                                    } else {
+                                        cur & !libc::O_NONBLOCK
+                                    };
+                                    if next != cur {
+                                        libc::fcntl(fd, libc::F_SETFL, next);
+                                    }
+                                }
+                            }
+                        }
+                        return Ok(DispatchOutcome::Returned { value: 0 });
+                    }
                     return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
                 };
                 let next_flags = arg & !LINUX_O_CLOEXEC;
