@@ -49,11 +49,22 @@ pub enum TrapError {
     /// trampoline (e.g. instruction abort at PC=0, data abort, undef).
     /// Surfaces the original syndrome/ELR/FAR so the runtime can map it
     /// to a Linux signal (typically SIGSEGV/SIGBUS/SIGILL).
-    #[error("EL0 fault not handled by trap path: esr=0x{syndrome:x} elr=0x{elr:x} far=0x{far:x}")]
+    #[error("EL0 fault not handled by trap path: esr=0x{syndrome:x} elr=0x{elr:x} far=0x{far:x} x16=0x{x16:x} x17=0x{x17:x} x29=0x{x29:x} x30=0x{x30:x} sp=0x{sp:x}")]
     EL0Fault {
         syndrome: u64,
         elr: u64,
         far: u64,
+        /// x16/x17 at the fault. For the PLT `ldr x17,[x16,#off]; br x17`
+        /// "PROT_REA" wild-PC crash, x16 is the GOT address the guest computed
+        /// (compare against the slot carrick's read sees) and x17 the value it
+        /// loaded — distinguishes a wrong-address fault from wrong page content.
+        x16: u64,
+        x17: u64,
+        /// x29(FP)/x30(LR)/SP_EL0 at the fault — a corrupt x30 with the PC
+        /// faulting at that address means a `ret` to a clobbered return slot.
+        x29: u64,
+        x30: u64,
+        sp: u64,
     },
 }
 
@@ -707,10 +718,20 @@ impl HvfInner {
                     .vcpu
                     .get_sys_reg(SysReg::FAR_EL1)
                     .unwrap_or(0);
+                let x16 = self.vcpu.get_reg(Reg::X16).unwrap_or(0);
+                let x17 = self.vcpu.get_reg(Reg::X17).unwrap_or(0);
+                let x29 = self.vcpu.get_reg(Reg::X29).unwrap_or(0);
+                let x30 = self.vcpu.get_reg(Reg::LR).unwrap_or(0);
+                let sp = self.vcpu.get_sys_reg(SysReg::SP_EL0).unwrap_or(0);
                 return Err(TrapError::EL0Fault {
                     syndrome: underlying,
                     elr,
                     far,
+                    x16,
+                    x17,
+                    x29,
+                    x30,
+                    sp,
                 });
             }
         }

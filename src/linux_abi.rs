@@ -54,6 +54,12 @@ pub const LINUX_SIGTERM: i32 = 15;
 pub const LINUX_SIG_DFL: u64 = 0;
 pub const LINUX_SIG_IGN: u64 = 1;
 
+/// `sa_flags` bit: the `sa_restorer` field is valid. When CLEAR the kernel
+/// IGNORES `sa_restorer` (whatever garbage it holds) and returns from the
+/// handler via the VDSO sigreturn trampoline. glibc on aarch64 never sets this
+/// — so carrick must synthesise its own trampoline unless this bit is present.
+pub const LINUX_SA_RESTORER: u64 = 0x0400_0000;
+
 pub const LINUX_DIRENT64_HEADER_SIZE: usize = core::mem::size_of::<LinuxDirent64Header>();
 
 #[repr(C, packed)]
