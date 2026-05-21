@@ -2573,6 +2573,14 @@ impl SyscallDispatcher {
                 is_read_end: false,
                 ..
             } => None,
+            // Splicing FROM a pipe INTO a regular file is valid on Linux (only
+            // ONE end must be a pipe). The write + offset advance is handled by
+            // write_output_fd. A read-only fd is EBADF.
+            OpenDescription::HostFile { writable: true, .. }
+            | OpenDescription::File { writable: true, .. } => None,
+            OpenDescription::HostFile { .. } | OpenDescription::File { .. } => {
+                Some(LINUX_EBADF)
+            }
             _ => Some(LINUX_EINVAL),
         }
     }
@@ -2960,26 +2968,72 @@ impl SyscallDispatcher {
         // stdout/stderr buffers. Without this, `busybox cat`'s
         // `sendfile(1, infile, ...)` writes the file contents to the
         // dispatcher's internal stdout instead of the pipe write end.
-        if let Some(open_file) = self.io.open_files.get(&fd) {
-            let mut open = open_file.description.borrow_mut();
-            return match &mut *open {
-                OpenDescription::PipeWriter { pipe, .. } => write_pipe(bytes, pipe),
-                OpenDescription::HostPipe {
-                    host_fd,
-                    is_read_end,
-                    ..
-                } => {
-                    if *is_read_end {
-                        DispatchOutcome::Errno { errno: LINUX_EBADF }
-                    } else {
-                        write_host_pipe(bytes, *host_fd)
+        if let Some(open_file) = self.io.open_files.get(&fd).cloned() {
+            // Regular-file destinations need the overlay writeback to happen
+            // AFTER the description borrow is dropped, so use the same
+            // collect-then-write pattern as `write`. Non-file arms return
+            // directly. This is what makes splice/copy_file_range/sendfile to a
+            // regular file (off_out at the fd's current position) work, matching
+            // real Linux (splice pipe->file).
+            let outcome: DispatchOutcome;
+            let writeback: Option<(String, Vec<u8>)>;
+            {
+                let mut open = open_file.description.borrow_mut();
+                match &mut *open {
+                    OpenDescription::PipeWriter { pipe, .. } => return write_pipe(bytes, pipe),
+                    OpenDescription::HostPipe {
+                        host_fd,
+                        is_read_end,
+                        ..
+                    } => {
+                        return if *is_read_end {
+                            DispatchOutcome::Errno { errno: LINUX_EBADF }
+                        } else {
+                            write_host_pipe(bytes, *host_fd)
+                        };
                     }
+                    OpenDescription::HostSocket { host_fd, .. } => {
+                        return write_host_pipe(bytes, *host_fd);
+                    }
+                    OpenDescription::HostFile {
+                        host_fd,
+                        writable,
+                        status_flags,
+                        ..
+                    } => {
+                        if !*writable {
+                            return DispatchOutcome::Errno { errno: LINUX_EBADF };
+                        }
+                        if *status_flags & LINUX_O_APPEND != 0 {
+                            unsafe { libc::lseek(*host_fd, 0, libc::SEEK_END) };
+                        }
+                        return write_host_pipe(bytes, *host_fd);
+                    }
+                    OpenDescription::File {
+                        path,
+                        contents,
+                        offset,
+                        writable,
+                        metadata,
+                        ..
+                    } => {
+                        if !*writable {
+                            return DispatchOutcome::Errno { errno: LINUX_EBADF };
+                        }
+                        write_into_file_contents(contents, offset, bytes);
+                        metadata.size = contents.len();
+                        outcome = DispatchOutcome::Returned {
+                            value: bytes.len() as i64,
+                        };
+                        writeback = Some((path.clone(), contents.clone()));
+                    }
+                    _ => return DispatchOutcome::Errno { errno: LINUX_EBADF },
                 }
-                OpenDescription::HostSocket { host_fd, .. } => {
-                    write_host_pipe(bytes, *host_fd)
-                }
-                _ => DispatchOutcome::Errno { errno: LINUX_EBADF },
-            };
+            }
+            if let Some((path, contents)) = writeback {
+                let _ = self.fs.rootfs_vfs.overlay.set_file_contents(&path, contents);
+            }
+            return outcome;
         }
         if self.io.stream_stdio && (fd == 1 || fd == 2) {
             let n = unsafe {
