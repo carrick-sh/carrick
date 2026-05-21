@@ -25,6 +25,23 @@ pub(super) struct ProcState {
     /// forked child reports its real host parent — which, because the trees
     /// mirror, IS its parent guest process. See `sys_getppid`.
     pub bootstrap_host_pid: u32,
+    /// `ITIMER_REAL` state, anchored to the monotonic clock so
+    /// setitimer/getitimer report the time remaining. `None` = disarmed.
+    /// glibc's `alarm()` is `setitimer(ITIMER_REAL, …)` and returns the
+    /// previous timer's remaining seconds — without this state every
+    /// `alarm()` wrongly returned 0 (LTP alarm02/alarm03). carrick does not
+    /// yet DELIVER SIGALRM on expiry; only the remaining-time accounting.
+    pub itimer_real: Option<ItimerReal>,
+}
+
+/// Armed `ITIMER_REAL` timer. `value`/`interval` are the configured initial
+/// expiration and reload period; `set_at` anchors `value` to the monotonic
+/// clock so the remaining time is `value - set_at.elapsed()` (saturating).
+#[derive(Clone, Copy)]
+pub(super) struct ItimerReal {
+    pub set_at: std::time::Instant,
+    pub value: std::time::Duration,
+    pub interval: std::time::Duration,
 }
 
 impl ProcState {
@@ -36,6 +53,7 @@ impl ProcState {
             task_name: linux_task_name_from_bytes(b"carrick"),
             pdeathsig: 0,
             bootstrap_host_pid: std::process::id(),
+            itimer_real: None,
         }
     }
 }

@@ -893,6 +893,12 @@ impl SyscallDispatcher {
     pub fn clear_output_buffers(&mut self) {
         self.io.stdout.clear();
         self.io.stderr.clear();
+        // Interval timers are NOT inherited across fork(2) (setitimer(2)). The
+        // child inherited the parent's armed ITIMER_REAL through the copied
+        // address space; clear it so the child's alarm()/getitimer() see a
+        // disarmed timer (LTP runs each test in a forked child whose alarm()
+        // must return 0, not the framework's residual watchdog timeout).
+        self.proc.itimer_real = None;
     }
 
     /// Linux execve(2) closes every fd that had FD_CLOEXEC set. Our
