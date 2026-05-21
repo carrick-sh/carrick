@@ -4022,3 +4022,62 @@ fn sync_and_fsync_family_return_zero_for_valid_fds_and_ebadf_otherwise() {
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
+
+#[test]
+fn fcntl_on_bare_stdio_succeeds_not_ebadf() {
+    // Regression: F_SETFL on bare stdio (fd 0/1/2, which have no
+    // OpenDescription in open_files) used to return EBADF, while
+    // F_GETFD/F_SETFD/F_GETFL all special-cased stdio. apt's dpkg child sets
+    // stdin non-blocking via fcntl(0, F_SETFL, O_NONBLOCK) before exec and
+    // treated the EBADF as fatal (_exit(100)) — it broke `apt install`.
+    const LINUX_F_SETFL: u64 = 4;
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x40]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    for fd in [0u64, 1, 2] {
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    SyscallRequest::new(
+                        25,
+                        SyscallArgs::from([fd, LINUX_F_SETFL, LINUX_O_NONBLOCK, 0, 0, 0]),
+                    ),
+                    &mut memory,
+                    &mut reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: 0 },
+            "fcntl(F_SETFL, O_NONBLOCK) on stdio fd {fd} must succeed, not EBADF",
+        );
+        for cmd in [LINUX_F_GETFD, LINUX_F_GETFL] {
+            let outcome = dispatcher
+                .dispatch(
+                    SyscallRequest::new(25, SyscallArgs::from([fd, cmd, 0, 0, 0, 0])),
+                    &mut memory,
+                    &mut reporter,
+                )
+                .unwrap();
+            assert!(
+                matches!(outcome, DispatchOutcome::Returned { .. }),
+                "fcntl(cmd {cmd}) on stdio fd {fd} must not error: {outcome:?}",
+            );
+        }
+    }
+
+    // A genuinely invalid fd still returns EBADF (we didn't blanket-accept).
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    25,
+                    SyscallArgs::from([999, LINUX_F_SETFL, LINUX_O_NONBLOCK, 0, 0, 0]),
+                ),
+                &mut memory,
+                &mut reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 9 },
+        "fcntl(F_SETFL) on an invalid fd must still be EBADF",
+    );
+}
