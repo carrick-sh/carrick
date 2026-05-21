@@ -113,10 +113,31 @@ impl SyscallDispatcher {
         Ok(DispatchOutcome::Returned { value: 0 })
     }
 
+    /// gettid(2). In the multi-threaded runtime each guest thread has its
+    /// own tid (allocated by the ThreadRegistry); fall back to the pid for
+    /// the single-threaded path.
+    pub(super) fn gettid<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        if let Some(t) = ctx.thread {
+            return Ok(DispatchOutcome::Returned { value: t.tid as i64 });
+        }
+        Ok(self.getpid())
+    }
+
+    /// set_tid_address(addr). Records `addr` as this thread's
+    /// CLONE_CHILD_CLEARTID word (zeroed + FUTEX_WAKE'd on thread exit) and
+    /// returns the caller's tid. Single-threaded path just returns pid.
     pub(super) fn set_tid_address<M: GuestMemory>(
         &mut self,
-        _ctx: &mut SyscallCtx<M>,
+        ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
+        let addr = ctx.arg(0);
+        if let Some(t) = ctx.thread {
+            t.registry.set_clear_child_tid(t.tid, addr);
+            return Ok(DispatchOutcome::Returned { value: t.tid as i64 });
+        }
         Ok(self.getpid())
     }
 
@@ -179,6 +200,8 @@ impl SyscallDispatcher {
         let operation = ctx.arg(1);
         let value = ctx.arg(2) as u32;
         let timeout_address = ctx.arg(3);
+        let args = ctx.request.args;
+        let thread = ctx.thread;
         let memory = &*ctx.memory;
         let command = operation & LINUX_FUTEX_CMD_MASK;
         let flags = operation & !LINUX_FUTEX_CMD_MASK;
@@ -197,32 +220,75 @@ impl SyscallDispatcher {
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
 
+        // Single-threaded path (no ThreadCtx): keep the prior best-effort
+        // behaviour — WAKE is a no-op success, WAIT either EAGAINs (value
+        // mismatch / no timeout) or sleeps then ETIMEDOUTs. apt's update
+        // stage runs single-threaded and tolerates this.
+        let Some(thread) = thread else {
+            return Ok(match command {
+                LINUX_FUTEX_WAKE => DispatchOutcome::Returned { value: 0 },
+                LINUX_FUTEX_WAIT => {
+                    if word != value || timeout_address == 0 {
+                        return Ok(DispatchOutcome::Errno { errno: LINUX_EAGAIN });
+                    }
+                    let timespec = match read_timespec(memory, timeout_address) {
+                        Ok(t) => t,
+                        Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                    };
+                    let timeout = match duration_from_linux_timespec(timespec) {
+                        Ok(t) => t,
+                        Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                    };
+                    if let Some(timeout) = timeout {
+                        std::thread::sleep(timeout);
+                    }
+                    DispatchOutcome::Errno { errno: LINUX_ETIMEDOUT }
+                }
+                _ => DispatchOutcome::Errno { errno: LINUX_ENOSYS },
+            });
+        };
+
+        // Multi-threaded path: real cross-thread WAIT/WAKE via the shared
+        // FutexTable. We support private futexes; shared-flag futexes use the
+        // same table here (the address space is shared within the process,
+        // so the keying is identical) — note it via a partial-syscall probe.
+        if flags & LINUX_FUTEX_PRIVATE_FLAG == 0 {
+            ctx.reporter.record(crate::compat::CompatEvent::partial_syscall(
+                98,
+                "futex",
+                args,
+                "non-private futex treated as private (shared address space)",
+            ));
+        }
+
         Ok(match command {
-            LINUX_FUTEX_WAKE => DispatchOutcome::Returned { value: 0 },
+            LINUX_FUTEX_WAKE => {
+                let n = thread.futex.wake(address, value);
+                DispatchOutcome::Returned { value: i64::from(n) }
+            }
             LINUX_FUTEX_WAIT => {
+                // Re-check *uaddr under the kernel lock. If it changed since
+                // the guest's last read, don't block (EAGAIN). Otherwise the
+                // runtime must block with the lock RELEASED, so surface a
+                // FutexWait outcome instead of sleeping here.
                 if word != value {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: LINUX_EAGAIN,
-                    });
+                    return Ok(DispatchOutcome::Errno { errno: LINUX_EAGAIN });
                 }
-                if timeout_address == 0 {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: LINUX_EAGAIN,
-                    });
-                }
-                let timespec = match read_timespec(memory, timeout_address) {
-                    Ok(timespec) => timespec,
-                    Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                let timeout = if timeout_address == 0 {
+                    None
+                } else {
+                    let timespec = match read_timespec(memory, timeout_address) {
+                        Ok(t) => t,
+                        Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                    };
+                    match duration_from_linux_timespec(timespec) {
+                        Ok(t) => t,
+                        Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                    }
                 };
-                let timeout = match duration_from_linux_timespec(timespec) {
-                    Ok(timeout) => timeout,
-                    Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
-                };
-                if let Some(timeout) = timeout {
-                    std::thread::sleep(timeout);
-                }
-                DispatchOutcome::Errno {
-                    errno: LINUX_ETIMEDOUT,
+                DispatchOutcome::FutexWait {
+                    addr: address,
+                    timeout,
                 }
             }
             _ => DispatchOutcome::Errno {

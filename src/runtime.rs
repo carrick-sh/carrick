@@ -503,8 +503,14 @@ where
                 // until the handler-return path has completed unwinding.
                 suppress_signal_check = true;
             }
-            DispatchOutcome::CloneThread { .. } | DispatchOutcome::ThreadExit { .. } => {
-                unreachable!("CloneThread/ThreadExit wired in a later task")
+            DispatchOutcome::CloneThread { .. }
+            | DispatchOutcome::ThreadExit { .. }
+            | DispatchOutcome::FutexWait { .. } => {
+                // These are emitted only on the multi-threaded
+                // `dispatch_threaded` path (run_vcpu_until_exit). The
+                // single-threaded loops here always pass `thread: None`, so
+                // the dispatcher never produces them.
+                unreachable!("thread-clone outcomes only arise on the threaded runtime path")
             }
         }
 
@@ -798,8 +804,14 @@ where
                 trap.restore_from_sigframe()?;
                 suppress_signal_check = true;
             }
-            DispatchOutcome::CloneThread { .. } | DispatchOutcome::ThreadExit { .. } => {
-                unreachable!("CloneThread/ThreadExit wired in a later task")
+            DispatchOutcome::CloneThread { .. }
+            | DispatchOutcome::ThreadExit { .. }
+            | DispatchOutcome::FutexWait { .. } => {
+                // These are emitted only on the multi-threaded
+                // `dispatch_threaded` path (run_vcpu_until_exit). The
+                // single-threaded loops here always pass `thread: None`, so
+                // the dispatcher never produces them.
+                unreachable!("thread-clone outcomes only arise on the threaded runtime path")
             }
         }
 

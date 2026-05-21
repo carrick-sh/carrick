@@ -1869,6 +1869,7 @@ impl SyscallDispatcher {
                     request: inner_req,
                     memory: &mut *memory,
                     reporter: &mut inner_reporter,
+                    thread: None,
                 };
                 match self.sendmsg(&mut inner_ctx) {
                     Ok(o) => o,
@@ -1943,6 +1944,7 @@ impl SyscallDispatcher {
                     request: inner_req,
                     memory: &mut *memory,
                     reporter: &mut inner_reporter,
+                    thread: None,
                 };
                 match self.recvmsg(&mut inner_ctx) {
                     Ok(o) => o,
