@@ -224,6 +224,15 @@ struct HvfMappedRegion {
     /// pages stay alive via COW; the unmap would target the parent's
     /// HVF context which no longer exists in the child.
     memory: Option<applevisor::memory::Memory>,
+    /// True for a genuine guest `MAP_SHARED` file mapping (`map_shared_file`).
+    /// Guest memory is host-`MAP_SHARED` for HVF coherence, so fork(2) does
+    /// NOT COW-isolate it; the `fork` path takes an explicit private snapshot
+    /// of every region EXCEPT these — a guest `MAP_SHARED` file mapping must
+    /// stay shared across guest fork (POSIX), so parent and child keep mapping
+    /// the SAME host buffer. (LTP's test framework relies on this: the test
+    /// runs in a forked child that writes pass/fail counts to a `MAP_SHARED`
+    /// results file the parent then reads.)
+    guest_shared: bool,
 }
 
 /// Snapshot of vCPU register state captured before fork(2). The child
@@ -896,6 +905,9 @@ impl HvfInner {
             // `unmap_shared_file`; on engine drop the VM tear-down releases
             // the stage-2 entries and the host pages leak only at exit.
             memory: None,
+            // A genuine guest MAP_SHARED file mapping: must stay shared across
+            // fork (no private snapshot).
+            guest_shared: true,
         });
         Ok(())
     }
@@ -1226,11 +1238,31 @@ impl HvfInner {
         // Pre-fork: snapshot vCPU state and capture mapping descriptors.
         let snapshot = self.snapshot_vcpu()?;
         crate::probes::fork_pre(snapshot.pc, snapshot.elr_el1, snapshot.cpsr);
-        let mapping_descs: Vec<(u64, u64, *mut u8, usize, MemPerms)> = self
+        let mapping_descs: Vec<(u64, u64, *mut u8, usize, MemPerms, bool)> = self
             .mappings
             .iter()
-            .map(|m| (m.start, m.end, m.host_addr, m.size, m.perms))
+            .map(|m| (m.start, m.end, m.host_addr, m.size, m.perms, m.guest_shared))
             .collect();
+
+        // Guest RAM is host-MAP_SHARED (HVF coherence), so fork(2) does NOT
+        // COW-isolate it. Take a private snapshot of each PRIVATE region HERE,
+        // pre-fork, while the guest vCPU is suspended (atomic, race-free); the
+        // child re-maps these copies, the parent keeps its originals. Genuine
+        // guest MAP_SHARED file mappings (`guest_shared`) are NOT snapshotted —
+        // they must stay shared across fork (POSIX), so both sides keep mapping
+        // the same host buffer. (Built unconditionally because we don't yet know
+        // which side we are; the parent's unused copies leak with its engine,
+        // matching the existing ManuallyDrop discipline.)
+        let mut child_descs: Vec<(u64, u64, *mut u8, usize, MemPerms, bool)> =
+            Vec::with_capacity(mapping_descs.len());
+        for &(start, end, host_addr, size, perms, guest_shared) in &mapping_descs {
+            let child_host = if guest_shared {
+                host_addr // shared mapping: child maps the SAME buffer
+            } else {
+                clone_region_for_child(host_addr, size)?
+            };
+            child_descs.push((start, end, child_host, size, perms, guest_shared));
+        }
 
         // Tear down the parent's HVF context BEFORE forking. macOS's
         // HVF kernel state is not fork-safe: if a VM exists in the
@@ -1296,10 +1328,13 @@ impl HvfInner {
             std::ptr::write(self as *mut HvfInner, new_inner);
         }
 
-        // Re-map each region using raw hv_vm_map. The host buffer is
-        // already valid in the child (COW); the new VM owns the new
-        // stage-2 entries.
-        for (start, end, host_addr, size, perms) in mapping_descs {
+        // Re-map each region using raw hv_vm_map. The PARENT re-maps its
+        // original buffers; the CHILD maps the pre-fork private snapshots for
+        // PRIVATE regions and the shared originals for guest-MAP_SHARED ones.
+        // The unused set (the child's snapshot copies in the parent) leaks with
+        // the engine, matching the existing ManuallyDrop discipline.
+        let descs = if pid == 0 { child_descs } else { mapping_descs };
+        for (start, end, host_addr, size, perms, guest_shared) in descs {
             let perms_raw: u64 = u64::from(perms);
             let r = unsafe {
                 applevisor_sys::hv_vm_map(
@@ -1323,11 +1358,12 @@ impl HvfInner {
                 host_addr,
                 size,
                 perms,
-                // No Memory object — the host buffer was inherited via
-                // COW from the parent. Drop runs no HVF call for this
-                // mapping; the child's VM tear-down on engine drop will
-                // tear all stage-2 mappings down in one shot.
+                // No Memory object — the host buffer is either an inherited
+                // shared mapping or a snapshot copy. Drop runs no HVF call for
+                // this mapping; the engine's VM tear-down releases all stage-2
+                // entries in one shot.
                 memory: None,
+                guest_shared,
             });
         }
 
@@ -1417,6 +1453,9 @@ impl HvfInner {
                 size,
                 perms,
                 memory: None,
+                // Thread siblings share the parent's address space verbatim and
+                // never take a fork snapshot; the flag is immaterial here.
+                guest_shared: false,
             });
         }
 
@@ -1767,6 +1806,60 @@ fn align_up(value: u64, alignment: u64) -> Result<u64, TrapError> {
 /// `examples/fork_alloc_bench.rs`. The host pages leak only at process exit,
 /// matching the existing `ManuallyDrop<HvfInner>` discipline (applevisor
 /// `Memory` Drop never ran either) and the `map_shared_file` raw path.
+/// Allocate a fresh `MAP_SHARED` anon buffer and copy `src`'s RESIDENT pages
+/// into it. Used by `HvfInner::fork` to take a private snapshot of guest-
+/// PRIVATE memory: guest RAM is host-`MAP_SHARED` for HVF coherence (see
+/// `map_region_raw`), so `fork(2)` does NOT COW-isolate it — without an
+/// explicit copy a forked child and its parent would share, and corrupt, the
+/// same pages. Called pre-fork while the guest vCPU is suspended (atomic, no
+/// race). Only resident pages are copied (mincore-gated) so the snapshot is
+/// sparse; on mincore failure we fall back to a full copy (correct, slower).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn clone_region_for_child(src: *mut u8, size: usize) -> Result<*mut u8, TrapError> {
+    let dst = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_ANON | libc::MAP_SHARED,
+            -1,
+            0,
+        )
+    };
+    if dst == libc::MAP_FAILED {
+        return Err(TrapError::Hypervisor(format!(
+            "fork child-snapshot mmap (size={size}) failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let dst = dst as *mut u8;
+    let page = {
+        let p = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if p <= 0 { 16 * 1024 } else { p as usize }
+    };
+    let n_pages = size.div_ceil(page);
+    let mut resident = vec![0u8; n_pages];
+    let rc = unsafe {
+        libc::mincore(
+            src as *mut libc::c_void,
+            size,
+            resident.as_mut_ptr() as *mut libc::c_char,
+        )
+    };
+    if rc != 0 {
+        unsafe { std::ptr::copy_nonoverlapping(src, dst, size) };
+        return Ok(dst);
+    }
+    for (i, &flag) in resident.iter().enumerate() {
+        if flag & 1 != 0 {
+            let off = i * page;
+            let len = page.min(size - off);
+            unsafe { std::ptr::copy_nonoverlapping(src.add(off), dst.add(off), len) };
+        }
+    }
+    Ok(dst)
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn map_region_raw(mapping: &GuestMapping) -> Result<HvfMappedRegion, TrapError> {
     let size = usize::try_from(mapping.mapped_size)
@@ -1776,7 +1869,15 @@ fn map_region_raw(mapping: &GuestMapping) -> Result<HvfMappedRegion, TrapError> 
             std::ptr::null_mut(),
             size,
             libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_ANON | libc::MAP_PRIVATE,
+            // MAP_SHARED, not MAP_PRIVATE: a MAP_PRIVATE anon page mapped into
+            // the guest via hv_vm_map desyncs from the host buffer — the guest's
+            // own store and a later guest load observe different memory (the
+            // "PROT_REA" wild-PC crash: a dynamic binary's GOT slot that ld.so
+            // resolved reads back stale). MAP_SHARED anon is HVF-coherent (same
+            // as `map_shared_file`). The cost: fork(2) no longer COW-isolates
+            // these pages, so `HvfInner::fork` takes an explicit private
+            // snapshot for the child (see `clone_region_for_child`).
+            libc::MAP_ANON | libc::MAP_SHARED,
             -1,
             0,
         )
@@ -1825,6 +1926,8 @@ fn map_region_raw(mapping: &GuestMapping) -> Result<HvfMappedRegion, TrapError> 
         size,
         perms,
         memory: None,
+        // Private guest RAM (data/bss/heap/stack/MAP_PRIVATE): fork snapshots it.
+        guest_shared: false,
     })
 }
 
