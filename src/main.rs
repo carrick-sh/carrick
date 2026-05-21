@@ -408,9 +408,20 @@ fn main() -> anyhow::Result<()> {
             } else {
                 command
             };
-            let summary = block_on_oci(store.load_pull_summary(&image)).with_context(|| {
-                format!("image {} is not pulled into the store", image.canonical())
-            })?;
+            // docker-run semantics: use the locally-stored image if present,
+            // otherwise pull it on demand. A bare name like `python:3.12-slim`
+            // is already canonicalised to `docker.io/library/python:3.12-slim`
+            // by the reference parser, so the pull and the store lookup agree.
+            let summary = block_on_oci(async {
+                match store.load_pull_summary(&image).await {
+                    Ok(summary) => Ok(summary),
+                    Err(_) => {
+                        eprintln!("carrick: image {} not in store; pulling…", image.canonical());
+                        pull_image(&image, &store).await
+                    }
+                }
+            })
+            .with_context(|| format!("failed to obtain image {}", image.canonical()))?;
             let rootfs_layers: Vec<PathBuf> = summary
                 .layers
                 .iter()
