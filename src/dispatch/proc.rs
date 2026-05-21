@@ -13,6 +13,9 @@ pub(super) struct ProcState {
     pub dumpable: i64,
     /// `prctl(PR_SET_NAME)` task comm name (16 bytes, NUL-padded).
     pub task_name: [u8; LINUX_TASK_COMM_LEN],
+    /// `prctl(PR_SET_PDEATHSIG)` parent-death signal (0 = none). Recorded and
+    /// echoed back via PR_GET_PDEATHSIG; not yet delivered on parent exit.
+    pub pdeathsig: i64,
     /// Host pid of the ROOT guest process, captured at construction — before
     /// any guest `fork(2)`. Carrick forks each guest process as a real host
     /// child, so the host process tree mirrors the guest tree. A forked child
@@ -31,6 +34,7 @@ impl ProcState {
             personality: 0,
             dumpable: 1,
             task_name: linux_task_name_from_bytes(b"carrick"),
+            pdeathsig: 0,
             bootstrap_host_pid: std::process::id(),
         }
     }
@@ -89,6 +93,30 @@ impl SyscallDispatcher {
             LINUX_PR_GET_NAME => {
                 let address = ctx.request.arg(1);
                 if memory.write_bytes(address, &self.proc.task_name).is_err() {
+                    return Ok(DispatchOutcome::Errno {
+                        errno: LINUX_EFAULT,
+                    });
+                }
+                DispatchOutcome::Returned { value: 0 }
+            }
+            LINUX_PR_SET_PDEATHSIG => {
+                // arg1 is a signal number: 0 clears, 1..=64 is valid, anything
+                // else is EINVAL (what the kernel returns).
+                let sig = ctx.request.arg(1);
+                if sig > 64 {
+                    return Ok(DispatchOutcome::Errno {
+                        errno: LINUX_EINVAL,
+                    });
+                }
+                self.proc.pdeathsig = sig as i64;
+                DispatchOutcome::Returned { value: 0 }
+            }
+            LINUX_PR_GET_PDEATHSIG => {
+                let address = ctx.request.arg(1);
+                if memory
+                    .write_bytes(address, &(self.proc.pdeathsig as i32).to_ne_bytes())
+                    .is_err()
+                {
                     return Ok(DispatchOutcome::Errno {
                         errno: LINUX_EFAULT,
                     });
