@@ -426,10 +426,12 @@ impl SyscallDispatcher {
     /// and the runtime asks the trap engine to do a real macOS fork
     /// against the live HVF state.
     ///
-    /// Currently only the simple SIGCHLD case (musl/glibc `fork()` wrapper
-    /// → `clone(SIGCHLD, 0, ...)`) is wired. Thread-create flags
-    /// (CLONE_VM | CLONE_THREAD) and namespace/process-share variants
-    /// fall through to ENOSYS until the next iteration.
+    /// Thread-create flags (CLONE_VM | CLONE_THREAD etc.) now emit
+    /// `DispatchOutcome::CloneThread` so the runtime can spin up a new
+    /// vCPU sharing the same address space.  All other flags (including
+    /// the SIGCHLD-only fork case) still return `DispatchOutcome::Fork`.
+    ///
+    /// aarch64 clone ABI: clone(flags, stack, parent_tid, tls, child_tid)
     pub(super) fn clone<M: GuestMemory>(
         &mut self,
         ctx: &mut SyscallCtx<M>,
@@ -439,17 +441,30 @@ impl SyscallDispatcher {
         const CLONE_FILES: u64 = 0x00000400;
         const CLONE_SIGHAND: u64 = 0x00000800;
         const CLONE_THREAD: u64 = 0x00010000;
+        const CLONE_SETTLS: u64 = 0x00080000;
+        const CLONE_PARENT_SETTID: u64 = 0x00100000;
+        const CLONE_CHILD_SETTID: u64 = 0x01000000;
+        const CLONE_CHILD_CLEARTID: u64 = 0x00200000;
 
         let flags = ctx.arg(0);
-        // Thread creation needs pthread_create semantics, not fork.
-        // Surface as ENOSYS for now so callers see "function not
-        // implemented" rather than spuriously cloning the whole address
-        // space when they wanted a thread.
         let thread_mask =
             CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
         if (flags & thread_mask) == thread_mask {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_ENOSYS,
+            // aarch64 ABI: clone(flags, stack, parent_tid, tls, child_tid)
+            let stack = ctx.arg(1);
+            let parent_tid_addr = if flags & CLONE_PARENT_SETTID != 0 { ctx.arg(2) } else { 0 };
+            let tls = if flags & CLONE_SETTLS != 0 { ctx.arg(3) } else { 0 };
+            let child_tid_addr = if flags & (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID) != 0 {
+                ctx.arg(4)
+            } else {
+                0
+            };
+            return Ok(DispatchOutcome::CloneThread {
+                stack,
+                tls,
+                flags,
+                parent_tid_addr,
+                child_tid_addr,
             });
         }
 
@@ -461,7 +476,14 @@ impl SyscallDispatcher {
     /// a `struct clone_args` pointed to by arg0 (arg1 is its size). glibc's
     /// posix_spawn/fork now prefer clone3; without it apt-get's worker spawn
     /// silently failed and the parent deadlocked waiting on a child that never
-    /// came up. We only need `flags` (the first u64) to decide thread-vs-fork.
+    /// came up.
+    ///
+    /// clone_args layout (little-endian u64s):
+    ///   flags@0, pidfd@8, child_tid@16, parent_tid@24, exit_signal@32,
+    ///   stack@40, stack_size@48, tls@56
+    ///
+    /// Thread-create flags now emit `DispatchOutcome::CloneThread`.
+    /// Fork-like flags still return `DispatchOutcome::Fork`.
     fn clone3(
         &mut self,
         request: SyscallRequest,
@@ -472,6 +494,10 @@ impl SyscallDispatcher {
         const CLONE_FILES: u64 = 0x00000400;
         const CLONE_SIGHAND: u64 = 0x00000800;
         const CLONE_THREAD: u64 = 0x00010000;
+        const CLONE_SETTLS: u64 = 0x00080000;
+        const CLONE_PARENT_SETTID: u64 = 0x00100000;
+        const CLONE_CHILD_SETTID: u64 = 0x01000000;
+        const CLONE_CHILD_CLEARTID: u64 = 0x00200000;
 
         let args_ptr = request.arg(0);
         let args_size = request.arg(1);
@@ -482,11 +508,13 @@ impl SyscallDispatcher {
                 errno: LINUX_EINVAL,
             };
         }
-        let flags = match memory.read_bytes(args_ptr, 8) {
-            // INVARIANT: read_bytes(_, 8) returns exactly 8 bytes on Ok, so the
-            // 8-byte slice always converts into [u8; 8].
-            #[allow(clippy::unwrap_used)]
-            Ok(bytes) => u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+
+        // Read up to the full struct (64 bytes through tls@56). glibc always
+        // passes the complete struct; if the caller passes a truncated struct
+        // with thread flags set we fall back to ENOSYS with a note below.
+        let read_len = args_size.min(64) as usize;
+        let bytes = match memory.read_bytes(args_ptr, read_len) {
+            Ok(b) => b,
             Err(_) => {
                 return DispatchOutcome::Errno {
                     errno: LINUX_EFAULT,
@@ -494,11 +522,51 @@ impl SyscallDispatcher {
             }
         };
 
+        // INVARIANT: read_len >= 8 (guarded above) so slice [0..8] is valid.
+        #[allow(clippy::unwrap_used)]
+        let flags = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+
         let thread_mask =
             CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
         if (flags & thread_mask) == thread_mask {
-            return DispatchOutcome::Errno {
-                errno: LINUX_ENOSYS,
+            // glibc always passes the full struct (64 bytes); if for some reason
+            // the caller passes a short struct with thread flags, return ENOSYS
+            // rather than misreading uninitialised fields.
+            if args_size < 64 {
+                return DispatchOutcome::Errno {
+                    errno: LINUX_ENOSYS,
+                };
+            }
+
+            // All fields are little-endian u64; offsets from the layout above.
+            #[allow(clippy::unwrap_used)]
+            let read_u64_at = |off: usize| -> u64 {
+                u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap())
+            };
+            let child_tid_ptr = read_u64_at(16);  // child_tid@16
+            let parent_tid_ptr = read_u64_at(24); // parent_tid@24
+            let stack = read_u64_at(40);           // stack@40
+            let stack_size = read_u64_at(48);      // stack_size@48
+            let tls_val = read_u64_at(56);         // tls@56
+
+            // child SP = stack base + stack_size (stack grows down on aarch64)
+            let child_sp = stack + stack_size;
+            let tls = if flags & CLONE_SETTLS != 0 { tls_val } else { 0 };
+            let parent_tid_addr =
+                if flags & CLONE_PARENT_SETTID != 0 { parent_tid_ptr } else { 0 };
+            let child_tid_addr =
+                if flags & (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID) != 0 {
+                    child_tid_ptr
+                } else {
+                    0
+                };
+
+            return DispatchOutcome::CloneThread {
+                stack: child_sp,
+                tls,
+                flags,
+                parent_tid_addr,
+                child_tid_addr,
             };
         }
 
