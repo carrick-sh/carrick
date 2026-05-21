@@ -36,6 +36,12 @@ pub(super) struct IoState {
     pub open_files: HashMap<i32, OpenFile>,
     pub next_fd: i32,
     pub cwd: String,
+    /// FD_CLOEXEC state for bare stdio fds (0/1/2) that have no
+    /// `OpenDescription` in `open_files`. Linux lets `fcntl(F_SETFD,
+    /// FD_CLOEXEC)` on stdio and a subsequent `F_GETFD` reflects the bit;
+    /// without persisting it here, F_GETFD always read back 0 (diverging
+    /// from real Linux on the fcntlstdio conformance probe).
+    pub stdio_cloexec: [bool; 3],
 }
 
 impl IoState {
@@ -47,6 +53,7 @@ impl IoState {
             open_files: HashMap::new(),
             next_fd: 3,
             cwd: "/".to_owned(),
+            stdio_cloexec: [false; 3],
         }
     }
 }
@@ -498,10 +505,17 @@ impl SyscallDispatcher {
                         value: open_file.fd_flags as i64,
                     });
                 }
-                // stdio without an OpenDescription: not CLOEXEC by default
-                // (Linux semantics: stdio survives exec). Return 0.
+                // stdio without an OpenDescription: stdio is not CLOEXEC by
+                // default (Linux: stdio survives exec), but a prior
+                // F_SETFD FD_CLOEXEC must be reflected back. Read the
+                // remembered per-stdio-fd bit.
                 if is_stdio_fd(fd) {
-                    return Ok(DispatchOutcome::Returned { value: 0 });
+                    let bit = if self.io.stdio_cloexec[fd as usize] {
+                        LINUX_FD_CLOEXEC as i64
+                    } else {
+                        0
+                    };
+                    return Ok(DispatchOutcome::Returned { value: bit });
                 }
                 DispatchOutcome::Errno { errno: LINUX_EBADF }
             }
@@ -514,10 +528,13 @@ impl SyscallDispatcher {
                 // inherited stdio fds on startup. Returning EBADF here
                 // makes apt abort with "Could not set close on exec".
                 // Carrick's exec inherits stdio via the host fd directly;
-                // CLOEXEC is meaningless for our model (we don't exec
+                // CLOEXEC is largely cosmetic for our model (we don't exec
                 // anything host-side after the syscall returns) but we
-                // accept the call so the guest's bookkeeping succeeds.
+                // remember the bit so a subsequent F_GETFD reflects it,
+                // matching real Linux.
                 if is_stdio_fd(fd) {
+                    self.io.stdio_cloexec[fd as usize] =
+                        arg & LINUX_FD_CLOEXEC != 0;
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 }
                 DispatchOutcome::Errno { errno: LINUX_EBADF }
