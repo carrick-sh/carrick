@@ -172,15 +172,69 @@ impl SyscallDispatcher {
         if let Some(outcome) = self.synthetic_access(path, mode) {
             return outcome;
         }
-        // Layered overlay+rootfs lookup via RootFsVfs. AT_SYMLINK_NOFOLLOW
-        // doesn't change the access mask (no chmod-on-link semantics
-        // exposed in our compat layer), so we use the default lookup.
-        let _ = flags; // AT_SYMLINK_NOFOLLOW is currently a no-op here
+        // Real DAC check when the backend exposes owner+mode (--fs host):
+        // access(2) tests the REAL ids, faccessat(AT_EACCESS) the effective.
+        if let Some(outcome) = self.dac_access(path, mode, flags & LINUX_AT_EACCESS != 0) {
+            return outcome;
+        }
+        // Fallback (no real owner/mode, e.g. --fs memory): legacy root model.
+        // AT_SYMLINK_NOFOLLOW doesn't change the access mask in our compat
+        // layer, so we use the default lookup.
         use crate::vfs::Vfs as _;
         match self.fs.rootfs_vfs.lookup(path) {
             Ok(md) => access_metadata(&vfs_md_to_rootfs_md(path, &md), mode),
             Err(errno) => DispatchOutcome::Errno { errno },
         }
+    }
+
+    /// DAC check for `path` using the backend's real owner+mode (`--fs host`).
+    /// Returns `None` when the backend can't supply owner/mode (so the caller
+    /// falls back to the legacy root model). `use_effective` selects effective
+    /// vs real caller ids.
+    fn dac_access(&self, path: &str, mask: u64, use_effective: bool) -> Option<DispatchOutcome> {
+        let real = self.fs.rootfs_vfs.overlay.real_stat(path, true)?;
+        let (uid, gid) = if use_effective {
+            (self.creds.euid, self.creds.egid)
+        } else {
+            (self.creds.ruid, self.creds.rgid)
+        };
+        // Pathname resolution requires search (execute) permission on EVERY
+        // ancestor directory; a single non-searchable parent denies access to
+        // anything beneath it regardless of the leaf's own mode.
+        if let Some(errno) = self.dac_ancestors_searchable(path, uid, gid) {
+            return Some(DispatchOutcome::Errno { errno });
+        }
+        let is_dir = matches!(real.kind, RootFsEntryKind::Directory);
+        Some(
+            match crate::dispatch::dac_check(uid, gid, real.uid, real.gid, real.mode, is_dir, mask) {
+                Ok(()) => DispatchOutcome::Returned { value: 0 },
+                Err(errno) => DispatchOutcome::Errno { errno },
+            },
+        )
+    }
+
+    /// Verify the caller has search (X) permission on every ancestor directory
+    /// of `path`. Returns `Some(EACCES)` on the first non-searchable parent.
+    fn dac_ancestors_searchable(&self, path: &str, uid: u32, gid: u32) -> Option<i32> {
+        let p = std::path::Path::new(path);
+        // ancestors() yields the path itself first; skip it — we only gate the
+        // parent directories.
+        for anc in p.ancestors().skip(1) {
+            let s = anc.to_string_lossy();
+            if s.is_empty() || s == "/" {
+                continue;
+            }
+            if let Some(real) = self.fs.rootfs_vfs.overlay.real_stat(&s, true)
+                && matches!(real.kind, RootFsEntryKind::Directory)
+                && crate::dispatch::dac_check(
+                    uid, gid, real.uid, real.gid, real.mode, true, LINUX_X_OK,
+                )
+                .is_err()
+            {
+                return Some(LINUX_EACCES);
+            }
+        }
+        None
     }
 
     fn fd_access(&self, fd: i32, mode: u64) -> DispatchOutcome {
@@ -3383,6 +3437,7 @@ impl SyscallDispatcher {
     ) -> Result<DispatchOutcome, DispatchError> {
         let dirfd = ctx.arg(0);
         let pathname = ctx.arg(1);
+        let mode = ctx.arg(2);
         let path = match read_guest_c_string(&*ctx.memory, pathname) {
             Ok(path) => path,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
@@ -3406,7 +3461,21 @@ impl SyscallDispatcher {
         // path shadowing.
         use crate::vfs::Vfs as _;
         match self.fs.rootfs_vfs.mkdir(&resolved, 0) {
-            Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
+            Ok(()) => {
+                // Apply the requested mode (umask-masked, like the kernel) and
+                // stamp the creating process's owner — mkdir previously dropped
+                // both, so DAC checks against the new dir were wrong.
+                let create_mode = (mode as u32 & 0o7777) & !(self.creds.umask & 0o777);
+                let _ = self.fs.rootfs_vfs.overlay.set_mode(&resolved, create_mode);
+                if self.creds.euid != 0 || self.creds.egid != 0 {
+                    let _ = self
+                        .fs
+                        .rootfs_vfs
+                        .overlay
+                        .set_owner(&resolved, self.creds.euid, self.creds.egid);
+                }
+                Ok(DispatchOutcome::Returned { value: 0 })
+            }
             Err(errno) => Ok(DispatchOutcome::Errno { errno }),
         }
     }
