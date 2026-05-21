@@ -739,9 +739,17 @@ fn run_vcpu_until_exit(
             }
             DispatchOutcome::FutexWait { addr, timeout } => {
                 // Block with the kernel lock RELEASED so a sibling FUTEX_WAKE
-                // can run. Re-lock only to complete the syscall.
-                let woken = futex.wait(addr, timeout);
-                let retval: i64 = if woken { 0 } else { -(crate::linux_abi::LINUX_ETIMEDOUT as i64) };
+                // can run. The wait is interrupted if a signal becomes pending
+                // so even an all-threads-parked process delivers it; the
+                // ungated signal check below then runs. Re-lock only to
+                // complete the syscall.
+                use crate::thread::FutexWaitOutcome;
+                let retval: i64 = match futex.wait(addr, timeout, &crate::host_signal::has_pending)
+                {
+                    FutexWaitOutcome::Woken => 0,
+                    FutexWaitOutcome::TimedOut => -(crate::linux_abi::LINUX_ETIMEDOUT as i64),
+                    FutexWaitOutcome::Interrupted => -(crate::linux_abi::LINUX_EINTR as i64),
+                };
                 engine.complete_syscall(retval)?;
                 last_syscall_retval = Some(retval);
             }
@@ -920,14 +928,16 @@ fn run_vcpu_until_exit(
             }
         }
 
-        // Signal delivery. host_signal is process-global. We service pending
-        // signals on the sole vCPU of a single-threaded process — which
-        // covers BOTH the main thread and any forked child (a fresh
-        // single-threaded process). With sibling threads live we skip it here
-        // to avoid two vCPUs racing the shared host_signal slot; a
-        // multi-threaded guest's signal routing is a follow-up. Run under the
-        // kernel lock since it mutates dispatcher signal state.
-        if !suppress_signal_check && registry.live_count() == 1 {
+        // Signal delivery. host_signal is process-global with an atomic
+        // pending slot, so `take_pending` (inside deliver_pending_signal,
+        // under the kernel lock) drains it exactly once: whichever thread
+        // grabs it delivers the process-directed signal to ITS vCPU, which is
+        // valid Linux semantics (an arbitrary unblocking thread handles it).
+        // Threads parked in FUTEX_WAIT interrupt on a pending signal (see the
+        // FutexWait arm) and reach here too. No live_count gate — multi-
+        // threaded guests deliver while running. Per-thread signal masks /
+        // tgkill targeting remain a follow-up.
+        if !suppress_signal_check {
             #[allow(clippy::expect_used)]
             let mut k = kernel.0.lock().expect("kernel lock poisoned");
             if let Some(action) =
