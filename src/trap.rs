@@ -911,7 +911,7 @@ impl HvfInner {
         });
         let perms_raw: u64 = u64::from(perms);
         let r = unsafe {
-            applevisor_sys::hv_vm_map(host as *mut std::ffi::c_void, guest_addr, len, perms_raw)
+            applevisor_sys::hv_vm_map(host, guest_addr, len, perms_raw)
         };
         if r != 0 {
             unsafe { libc::munmap(host, len) };

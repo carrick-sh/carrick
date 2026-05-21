@@ -1841,8 +1841,7 @@ fn synthetic_proc_surface_serves_common_process_and_system_files() {
     let path_address = 0x4000_u64;
     let read_buffer = 0x4400_u64;
     let read_len_max = 0xC00_u64;
-    let mut next_fd = 3_i64;
-    for (path, expected_substr) in paths {
+    for (next_fd, (path, expected_substr)) in (3_i64..).zip(paths) {
         let path_bytes: Vec<u8> = path.bytes().chain([0]).collect();
         memory.write_bytes(path_address, &path_bytes).unwrap();
         let open = dispatcher
@@ -1890,7 +1889,6 @@ fn synthetic_proc_surface_serves_common_process_and_system_files() {
                 "{path} did not contain {expected_substr:?}: {bytes:?}"
             );
         }
-        next_fd += 1;
     }
 
     let report = reporter.finish();
@@ -2044,8 +2042,7 @@ fn synthetic_sys_surface_serves_common_cpu_and_mm_files() {
     let path_address = 0x4000_u64;
     let read_buffer = 0x4400_u64;
     let read_len_max = 0xC00_u64;
-    let mut next_fd = 3_i64;
-    for (path, expected) in paths {
+    for (next_fd, (path, expected)) in (3_i64..).zip(paths) {
         let path_bytes: Vec<u8> = path.bytes().chain([0]).collect();
         memory.write_bytes(path_address, &path_bytes).unwrap();
         let open = dispatcher
@@ -2082,7 +2079,6 @@ fn synthetic_sys_surface_serves_common_cpu_and_mm_files() {
             expected,
             "{path} content mismatch: got {bytes:?}"
         );
-        next_fd += 1;
     }
 
     let report = reporter.finish();

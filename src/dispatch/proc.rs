@@ -709,7 +709,7 @@ impl SyscallDispatcher {
 }
 
 fn fill_deterministic_bootstrap_random(bytes: &mut [u8]) {
-    let mut state = 0xca22_1c_u64;
+    let mut state = 0x00ca_221c_u64;
     for byte in bytes {
         state ^= state << 7;
         state ^= state >> 9;
