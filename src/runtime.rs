@@ -1064,10 +1064,22 @@ where
     }
     match dispatcher.registered_signal_handler(pending) {
         Some(action) => {
-            // sa_restorer may be 0 (glibc on aarch64 relies on the kernel's
-            // VDSO sigreturn trampoline). inject_signal synthesises one in that
-            // case, so we no longer bail to default-terminate here.
-            trap.inject_signal(pending, action.sa_handler, action.sa_restorer, last_syscall_retval)?;
+            // Block the signal (+ its sa_mask) for the duration of the handler,
+            // as the kernel does — restored by rt_sigreturn. Prevents the same
+            // signal re-entering its own handler and a nested injected sigframe
+            // clobbering the live handler's stack frame (saved LR -> wild `ret`).
+            // sa_restorer is only valid when SA_RESTORER is set in sa_flags;
+            // otherwise the kernel ignores the field (it may hold uninitialised
+            // garbage) and returns via the VDSO trampoline. glibc on aarch64
+            // never sets SA_RESTORER, so pass 0 and let inject_signal synthesise
+            // a trampoline. (Using the garbage restorer made the handler `ret`
+            // to a wild PC — the "PROT_REA" crash.)
+            let restorer = if action.sa_flags & crate::linux_abi::LINUX_SA_RESTORER != 0 {
+                action.sa_restorer
+            } else {
+                0
+            };
+            trap.inject_signal(pending, action.sa_handler, restorer, last_syscall_retval)?;
             Ok(Some(PendingSignalAction { term_signal: None }))
         }
         None => Ok(Some(PendingSignalAction {

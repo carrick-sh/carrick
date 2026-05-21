@@ -294,6 +294,13 @@ impl SyscallDispatcher {
         if new_action != 0 && signum != 9 && signum != 19
             && let Ok(bytes) = memory.read_bytes(new_action, core::mem::size_of::<LinuxSigaction>())
                 && let Ok(sa) = LinuxSigaction::ref_from_bytes(&bytes) {
+                    let w = |o: usize| {
+                        bytes.get(o..o + 8)
+                            .and_then(|s| s.try_into().ok())
+                            .map(u64::from_le_bytes)
+                            .unwrap_or(0)
+                    };
+                    crate::probes::sigaction_read(signum, w(0), w(8), w(16), w(24));
                     self.signal.handlers.insert(signum, *sa);
                     // If the guest installed a real handler (not SIG_DFL/IGN),
                     // install a matching host handler so a cross-process kill
