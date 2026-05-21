@@ -2923,6 +2923,52 @@ fn access_metadata(metadata: &RootFsMetadata, mode: u64) -> DispatchOutcome {
     DispatchOutcome::Returned { value: 0 }
 }
 
+/// POSIX discretionary access control (DAC) check. `uid`/`gid` are the
+/// CALLER's ids to test against (real ids for `access(2)`, effective for
+/// `faccessat(AT_EACCESS)` / `open(2)`); `file_*` describe the target.
+/// `mask` is `R_OK|W_OK|X_OK` (`F_OK`=0 always passes — existence is the
+/// caller's concern). Returns `Ok(())` if permitted, `Err(EACCES)` otherwise.
+///
+/// Root (uid 0) bypasses read/write; for execute it still requires at least
+/// one execute bit on a regular file (dirs are always searchable for root).
+/// Non-root selects exactly ONE triplet — owner if `uid` matches the file
+/// owner, else group if `gid` matches, else other — matching the kernel
+/// (owner perms apply even when more restrictive than group/other).
+pub(super) fn dac_check(
+    uid: u32,
+    gid: u32,
+    file_uid: u32,
+    file_gid: u32,
+    file_mode: u32,
+    is_dir: bool,
+    mask: u64,
+) -> Result<(), i32> {
+    let need = (if mask & LINUX_R_OK != 0 { 4 } else { 0 })
+        | (if mask & LINUX_W_OK != 0 { 2 } else { 0 })
+        | (if mask & LINUX_X_OK != 0 { 1 } else { 0 });
+    if need == 0 {
+        return Ok(());
+    }
+    if uid == 0 {
+        if need & 1 != 0 && !is_dir && file_mode & 0o111 == 0 {
+            return Err(LINUX_EACCES);
+        }
+        return Ok(());
+    }
+    let triplet = if uid == file_uid {
+        (file_mode >> 6) & 7
+    } else if gid == file_gid {
+        (file_mode >> 3) & 7
+    } else {
+        file_mode & 7
+    };
+    if triplet & need == need {
+        Ok(())
+    } else {
+        Err(LINUX_EACCES)
+    }
+}
+
 fn synthetic_readonly_access(mode: u64) -> DispatchOutcome {
     if mode & LINUX_W_OK != 0 {
         DispatchOutcome::Errno {
