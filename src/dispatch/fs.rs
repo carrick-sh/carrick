@@ -3489,21 +3489,21 @@ impl SyscallDispatcher {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         }
         let mode = (ctx.arg(1) & 0o7777) as u32;
-        // Host-backed files live on the cap-std scratch, so apply the mode for
-        // real (ldconfig, dpkg maintainer scripts inspect it). Best-effort: a
-        // failure is NOT fatal (the in-memory overlay can't track mode). Other
-        // fd kinds (pipes/sockets/dirs) stay a no-op success.
-        if let Some(open_file) = self.io.open_files.get(&fd)
-            && let OpenDescription::HostFile { host_fd, .. } = &*open_file.description.borrow()
-        {
-            let rc = unsafe { libc::fchmod(*host_fd, mode as libc::mode_t) };
-            if rc < 0 {
-                crate::probes::fs_op(
-                    "fchmod:besteffort_err",
-                    &format!("fd={fd}"),
-                    std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
-                );
+        // Resolve the fd to its path and route through the backend's set_mode,
+        // so the guest-visible mode lands in the carrick mode xattr (what
+        // fstat reports) — not just the real fd's mode, which could be the
+        // forced-owner-accessible value. Previously this called libc::fchmod
+        // directly, so fstat kept reporting the stale creation-time mode.
+        let path = self.io.open_files.get(&fd).and_then(|of| match &*of.description.borrow() {
+            OpenDescription::HostFile { metadata, .. }
+            | OpenDescription::File { metadata, .. }
+            | OpenDescription::Directory { metadata, .. } => {
+                Some(metadata.path.to_string_lossy().into_owned())
             }
+            _ => None,
+        });
+        if let Some(path) = path {
+            let _ = self.fs.rootfs_vfs.overlay.set_mode(&path, mode);
         }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
