@@ -13,6 +13,15 @@ pub(super) struct ProcState {
     pub dumpable: i64,
     /// `prctl(PR_SET_NAME)` task comm name (16 bytes, NUL-padded).
     pub task_name: [u8; LINUX_TASK_COMM_LEN],
+    /// Host pid of the ROOT guest process, captured at construction — before
+    /// any guest `fork(2)`. Carrick forks each guest process as a real host
+    /// child, so the host process tree mirrors the guest tree. A forked child
+    /// inherits this value through the copied address space and can tell it is
+    /// NOT the root by comparing it to its own (now-different) pid. Used by
+    /// `getppid`: the root reports the stable bootstrap parent (init), while a
+    /// forked child reports its real host parent — which, because the trees
+    /// mirror, IS its parent guest process. See `sys_getppid`.
+    pub bootstrap_host_pid: u32,
 }
 
 impl ProcState {
@@ -22,6 +31,7 @@ impl ProcState {
             personality: 0,
             dumpable: 1,
             task_name: linux_task_name_from_bytes(b"carrick"),
+            bootstrap_host_pid: std::process::id(),
         }
     }
 }
@@ -363,19 +373,23 @@ impl SyscallDispatcher {
         Ok(DispatchOutcome::Errno { errno: LINUX_EPERM })
     }
 
+    // Process-group / session calls delegate to the host. Guest pids equal
+    // host pids (getpid mirrors std::process::id), and carrick forks each
+    // guest process as a real host child, so the host process tree mirrors the
+    // guest tree — host pgid/sid state is therefore consistent across
+    // getpgid/getsid/setsid for the whole guest process group. The previous
+    // stubs assumed "the guest is always pid 1" and returned a constant 1,
+    // which broke getpgid(0)==getpid() (getpid now returns the real host pid)
+    // and let setsid() spuriously succeed for a group leader.
     pub(super) fn setpgid<M: GuestMemory>(
         &mut self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let pid = ctx.arg(0) as i32;
-        let pgid = i32::from_ne_bytes((ctx.arg(1) as u32).to_ne_bytes());
-        if pgid < 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
-        }
-        if pid != 0 && pid != 1 {
-            return Ok(DispatchOutcome::Errno { errno: LINUX_ESRCH });
+        let pid = ctx.arg(0) as libc::pid_t;
+        let pgid = ctx.arg(1) as libc::pid_t;
+        // SAFETY: setpgid has no memory side effects; errors surface via errno.
+        if unsafe { libc::setpgid(pid, pgid) } < 0 {
+            return Ok(DispatchOutcome::Errno { errno: host_errno() });
         }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
@@ -384,29 +398,35 @@ impl SyscallDispatcher {
         &mut self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let pid = ctx.arg(0) as i32;
-        if pid != 0 && pid != 1 {
-            return Ok(DispatchOutcome::Errno { errno: LINUX_ESRCH });
+        let pid = ctx.arg(0) as libc::pid_t;
+        let r = unsafe { libc::getpgid(pid) };
+        if r < 0 {
+            return Ok(DispatchOutcome::Errno { errno: host_errno() });
         }
-        Ok(DispatchOutcome::Returned { value: 1 })
+        Ok(DispatchOutcome::Returned { value: i64::from(r) })
     }
 
     pub(super) fn getsid<M: GuestMemory>(
         &mut self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let pid = ctx.arg(0) as i32;
-        if pid != 0 && pid != 1 {
-            return Ok(DispatchOutcome::Errno { errno: LINUX_ESRCH });
+        let pid = ctx.arg(0) as libc::pid_t;
+        let r = unsafe { libc::getsid(pid) };
+        if r < 0 {
+            return Ok(DispatchOutcome::Errno { errno: host_errno() });
         }
-        Ok(DispatchOutcome::Returned { value: 1 })
+        Ok(DispatchOutcome::Returned { value: i64::from(r) })
     }
 
     pub(super) fn setsid<M: GuestMemory>(
         &mut self,
         _ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        Ok(DispatchOutcome::Returned { value: 1 })
+        let r = unsafe { libc::setsid() };
+        if r < 0 {
+            return Ok(DispatchOutcome::Errno { errno: host_errno() });
+        }
+        Ok(DispatchOutcome::Returned { value: i64::from(r) })
     }
 
     pub(super) fn waitid<M: GuestMemory>(
@@ -460,9 +480,12 @@ impl SyscallDispatcher {
             // WNOHANG and no child ready.
             return Ok(DispatchOutcome::Returned { value: 0 });
         }
-        // Linux and Darwin agree on the wstatus encoding for exited /
-        // signaled children: low 7 bits = signal, bit 7 = core flag,
-        // bits 8..15 = exit code. Pass through as-is.
+        // Linux and Darwin agree on the wstatus LAYOUT (low 7 bits = signal,
+        // bit 7 = core flag, bits 8..15 = exit code) but NOT on signal
+        // NUMBERS, so a signal-death's termsig must be translated host->Linux
+        // (e.g. a child killed by SIGUSR1 dies as host signal 30; the guest
+        // must read WTERMSIG == 10). The exit-status byte is untouched.
+        let host_status = translate_wait_status(host_status);
         if wstatus_addr != 0 {
             let bytes = host_status.to_ne_bytes();
             if memory.write_bytes(wstatus_addr, &bytes).is_err() {
@@ -715,5 +738,21 @@ fn fill_deterministic_bootstrap_random(bytes: &mut [u8]) {
         state ^= state >> 9;
         state ^= state << 8;
         *byte = state as u8;
+    }
+}
+
+/// Translate a host `waitpid` status so a signal-death's termsig uses Linux
+/// numbering. The wstatus layout is shared (low 7 bits = signal, bit 7 = core
+/// dump flag, bits 8..15 = exit code); only the signal NUMBER differs between
+/// macOS and Linux. Exited children (low 7 bits == 0) and stopped children
+/// (low byte == 0x7f) are returned unchanged.
+fn translate_wait_status(status: i32) -> i32 {
+    let low = status & 0x7f;
+    if low != 0 && low != 0x7f {
+        let core = status & 0x80;
+        let linux_sig = crate::host_signal::host_to_linux_signum(low);
+        (linux_sig & 0x7f) | core
+    } else {
+        status
     }
 }
