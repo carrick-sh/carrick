@@ -338,7 +338,7 @@ fn run_address_space_with_hvf_and_dispatcher(
     // stack instead of the legacy hard-coded summary. Go's runtime
     // and glibc's malloc introspection both parse this file.
     dispatcher.set_address_space_regions(proc_maps_from_address_space(&image));
-    run_combined_syscall_loop_with_dispatcher(&mut trap, dispatcher, max_traps)
+    run_threaded_hvf_loop(trap, dispatcher, max_traps)
 }
 
 /// Convert the engine's `AddressSpace` regions into the dispatcher's
@@ -503,6 +503,15 @@ where
                 // until the handler-return path has completed unwinding.
                 suppress_signal_check = true;
             }
+            DispatchOutcome::CloneThread { .. }
+            | DispatchOutcome::ThreadExit { .. }
+            | DispatchOutcome::FutexWait { .. } => {
+                // These are emitted only on the multi-threaded
+                // `dispatch_threaded` path (run_vcpu_until_exit). The
+                // single-threaded loops here always pass `thread: None`, so
+                // the dispatcher never produces them.
+                unreachable!("thread-clone outcomes only arise on the threaded runtime path")
+            }
         }
 
         if !suppress_signal_check {
@@ -531,6 +540,432 @@ where
         report: reporter.finish(),
         trap_limit_hit: true,
     })
+}
+
+// ===================================================================
+// Multi-threaded HVF runtime: one host thread + one HVF vCPU per guest
+// thread, sharing ONE process VM (stage-2 mappings are visible to every
+// vCPU). All syscall servicing serialises through ONE big kernel lock
+// (`Arc<Mutex<KernelState>>`); guest user-mode runs truly concurrently,
+// handlers run one at a time. See [[plan-syscall-macro-split]] /
+// thread-creating-clone plan Task 5+6.
+// ===================================================================
+
+use crate::thread::{FutexTable, ThreadId, ThreadRegistry};
+use std::sync::{Arc, Mutex};
+
+/// All shared kernel state behind the big lock: the syscall dispatcher
+/// (open-fd table, fs/mem/proc/etc.) and the compat reporter. Wrapped so a
+/// single mutex serialises every handler across all guest-thread vCPUs.
+struct KernelState {
+    dispatcher: SyscallDispatcher,
+    reporter: CompatReporter,
+}
+
+/// `SyscallDispatcher` holds `Rc<RefCell<OpenDescription>>` (non-atomic
+/// refcounts), so it is `!Send` by default. The big `Mutex<KernelState>`
+/// guarantees only ONE host thread ever touches the dispatcher at a time —
+/// the `Rc` refcounts are therefore never updated concurrently — so moving
+/// the `Arc<Mutex<KernelState>>` across threads and locking it per syscall
+/// is sound. We assert that with this wrapper.
+struct SendKernel(Arc<Mutex<KernelState>>);
+// SAFETY: see the type doc — the Mutex serialises all access to the
+// non-atomic-refcounted Rc state, so concurrent refcount mutation (the only
+// reason SyscallDispatcher is !Send) cannot occur.
+unsafe impl Send for SendKernel {}
+
+impl SendKernel {
+    fn clone_handle(&self) -> SendKernel {
+        SendKernel(Arc::clone(&self.0))
+    }
+}
+
+/// What a single vCPU loop did when it stopped.
+enum VcpuLoopOutcome {
+    /// Whole-process exit (last thread, exit_group, or fatal signal). Carries
+    /// the assembled RunResult so the main thread can return it.
+    ProcessExit(Box<RunResult>),
+    /// Just this thread finished (`exit(2)` with siblings still alive). The
+    /// host thread returns; its vCPU is left to the kernel at process exit.
+    ThreadDone,
+    /// Trap limit hit without exit (used for the main thread's RunResult).
+    TrapLimit(Box<RunResult>),
+}
+
+/// Top-level multi-threaded HVF entry. Builds the shared kernel lock + the
+/// thread registry + futex table, then runs the MAIN guest thread's vCPU
+/// through `run_vcpu_until_exit`. Thread-creating clones spawn sibling host
+/// threads that run the same function on their own vCPU.
+fn run_threaded_hvf_loop(
+    trap: HvfTrapEngine,
+    dispatcher: SyscallDispatcher,
+    max_traps: usize,
+) -> Result<RunResult, RuntimeError> {
+    crate::host_signal::install_default_handlers();
+    let _termios_guard = crate::host_tty::TermiosRestoreGuard::new();
+
+    let main_tid: ThreadId = std::process::id() as ThreadId;
+    let registry = Arc::new(ThreadRegistry::new(main_tid));
+    let futex = Arc::new(FutexTable::new());
+    let kernel = SendKernel(Arc::new(Mutex::new(KernelState {
+        dispatcher,
+        reporter: CompatReporter::default(),
+    })));
+    // Track spawned sibling threads so the process doesn't tear down while a
+    // worker is mid-flight. We join them after the main thread finishes.
+    let threads: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>> =
+        Arc::new(Mutex::new(Vec::new()));
+
+    let outcome = run_vcpu_until_exit(
+        kernel.clone_handle(),
+        trap,
+        Arc::clone(&registry),
+        Arc::clone(&futex),
+        main_tid,
+        Arc::clone(&threads),
+        max_traps,
+    )?;
+
+    let result = match outcome {
+        VcpuLoopOutcome::ProcessExit(r) | VcpuLoopOutcome::TrapLimit(r) => *r,
+        VcpuLoopOutcome::ThreadDone => {
+            // The main thread ran exit(2) while siblings were alive. Assemble
+            // a result from the shared kernel buffers; siblings keep running
+            // until the process exits, but for the run-to-completion CLI we
+            // collect output now.
+            #[allow(clippy::expect_used)]
+            let mut k = kernel.0.lock().expect("kernel lock poisoned");
+            let report = std::mem::take(&mut k.reporter).finish();
+            RunResult {
+                exit_code: 0,
+                stdout: k.dispatcher.stdout().to_vec(),
+                stderr: k.dispatcher.stderr().to_vec(),
+                traps: 0,
+                report,
+                trap_limit_hit: false,
+            }
+        }
+    };
+
+    Ok(result)
+}
+
+/// Run one vCPU (one guest thread) until it exits the process, finishes its
+/// own thread, or hits the trap limit. Holds NO lock during the vCPU run;
+/// takes the big kernel lock only to dispatch + complete each syscall.
+#[allow(clippy::too_many_arguments)]
+fn run_vcpu_until_exit(
+    kernel: SendKernel,
+    mut engine: HvfTrapEngine,
+    mut registry: Arc<ThreadRegistry>,
+    futex: Arc<FutexTable>,
+    mut this_tid: ThreadId,
+    threads: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
+    max_traps: usize,
+) -> Result<VcpuLoopOutcome, RuntimeError> {
+    let trace = std::env::var_os("CARRICK_TRACE_TRAPS").is_some();
+    for traps in 1..=max_traps {
+        // ---- vCPU run: NO kernel lock held ----
+        let frame = engine.next_syscall()?;
+        if trace {
+            let name = crate::syscall::lookup_aarch64(frame.x8)
+                .map(|s| s.name)
+                .unwrap_or("<unknown>");
+            eprintln!(
+                "tid#{this_tid} trap#{traps}: x8={} ({name}) x0={:#x} x1={:#x} x2={:#x} x3={:#x} x4={:#x}",
+                frame.x8, frame.x0, frame.x1, frame.x2, frame.x3, frame.x4
+            );
+        }
+
+        // ---- syscall service: kernel lock held ----
+        let outcome = {
+            #[allow(clippy::expect_used)]
+            let mut k = kernel.0.lock().expect("kernel lock poisoned");
+            let KernelState { dispatcher, reporter } = &mut *k;
+            dispatcher.dispatch_threaded(
+                SyscallRequest::from_aarch64_frame(frame),
+                &mut engine,
+                reporter,
+                this_tid,
+                &registry,
+                &futex,
+            )?
+        };
+
+        let mut last_syscall_retval: Option<i64> = None;
+        let mut suppress_signal_check = false;
+
+        match outcome {
+            DispatchOutcome::Exit { code } => {
+                // A forked child process (real macOS fork) exits via _exit so
+                // the rebuilt HVF context doesn't run the panicky Drops, and
+                // its buffered stdio is flushed to the inherited host fds.
+                if engine.is_forked_child() {
+                    crate::probes::guest_exit(code);
+                    #[allow(clippy::expect_used)]
+                    let k = kernel.0.lock().expect("kernel lock poisoned");
+                    forked_child_exit(code, k.dispatcher.stdout(), k.dispatcher.stderr());
+                }
+                // exit_group, or exit(2) as the last live thread. Tear the
+                // whole process down. For the main thread we return a
+                // RunResult; siblings just terminate the process.
+                let last = registry.exit(this_tid);
+                if !last && this_tid != (std::process::id() as ThreadId) {
+                    // A sibling ran exit_group(94): flush shared buffers and
+                    // terminate the entire process (other threads share it).
+                    #[allow(clippy::expect_used)]
+                    let k = kernel.0.lock().expect("kernel lock poisoned");
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                    let _ = std::io::Write::flush(&mut std::io::stderr());
+                    let out = k.dispatcher.stdout().to_vec();
+                    let err = k.dispatcher.stderr().to_vec();
+                    drop(k);
+                    let _ = unsafe { libc::write(1, out.as_ptr() as *const _, out.len()) };
+                    let _ = unsafe { libc::write(2, err.as_ptr() as *const _, err.len()) };
+                    unsafe { libc::_exit(code) };
+                }
+                let result = assemble_run_result(&kernel, code, traps, false);
+                return Ok(VcpuLoopOutcome::ProcessExit(Box::new(result)));
+            }
+            DispatchOutcome::Returned { value } => {
+                engine.complete_syscall(value)?;
+                last_syscall_retval = Some(value);
+            }
+            DispatchOutcome::Errno { errno } => {
+                let v = -(errno as i64);
+                engine.complete_syscall(v)?;
+                last_syscall_retval = Some(v);
+            }
+            DispatchOutcome::FutexWait { addr, timeout } => {
+                // Block with the kernel lock RELEASED so a sibling FUTEX_WAKE
+                // can run. Re-lock only to complete the syscall.
+                let woken = futex.wait(addr, timeout);
+                let retval: i64 = if woken { 0 } else { -(crate::linux_abi::LINUX_ETIMEDOUT as i64) };
+                engine.complete_syscall(retval)?;
+                last_syscall_retval = Some(retval);
+            }
+            DispatchOutcome::CloneThread {
+                stack,
+                tls,
+                flags: _,
+                parent_tid_addr,
+                child_tid_addr,
+            } => {
+                const CLONE_CHILD_CLEARTID: u64 = 0x00200000;
+                const CLONE_CHILD_SETTID: u64 = 0x01000000;
+                // The flags were already validated by the dispatcher; recover
+                // the clear/settid intents from the addrs it passed (it only
+                // sets child_tid_addr when one of those flags is present).
+                let clear_addr = if child_tid_addr != 0 { child_tid_addr } else { 0 };
+
+                // Allocate the child tid + register it (under the kernel lock
+                // for ordering with live_count/exit, though the registry has
+                // its own lock).
+                let tid = registry.register_child(clear_addr);
+
+                // Write parent_tid / child_tid (i32 LE) into guest memory as
+                // requested by CLONE_PARENT_SETTID / CLONE_CHILD_SETTID. The
+                // dispatcher passes the addrs only when the flag is set.
+                let tid_bytes = (tid as i32).to_le_bytes();
+                if parent_tid_addr != 0 {
+                    let _ = engine.write_bytes(parent_tid_addr, &tid_bytes);
+                }
+                let _ = CLONE_CHILD_SETTID;
+                let _ = CLONE_CHILD_CLEARTID;
+                if child_tid_addr != 0 {
+                    // CLONE_CHILD_SETTID writes the tid; CLONE_CHILD_CLEARTID
+                    // wants it cleared on exit (recorded above). Writing the
+                    // tid here is correct for SETTID and harmless for a pure
+                    // CLEARTID word the child will overwrite. glibc passes the
+                    // same address for both.
+                    let _ = engine.write_bytes(child_tid_addr, &tid_bytes);
+                }
+
+                // Build the child spec (snapshot parent regs + share VM +
+                // mapping descriptors) BEFORE the parent resumes.
+                let spec = engine.build_thread_spec(stack, tls)?;
+
+                // Spawn the sibling host thread.
+                let child_kernel = kernel.clone_handle();
+                let child_registry = Arc::clone(&registry);
+                let child_futex = Arc::clone(&futex);
+                let child_threads = Arc::clone(&threads);
+                let handle = std::thread::Builder::new()
+                    .name(format!("guest-tid-{tid}"))
+                    .spawn(move || {
+                        if std::env::var_os("CARRICK_TRACE_TRAPS").is_some() {
+                            eprintln!("[sibling tid#{tid}] thread started, building vCPU");
+                        }
+                        match HvfTrapEngine::from_thread_spec(spec) {
+                            Ok(child_engine) => {
+                                if std::env::var_os("CARRICK_TRACE_TRAPS").is_some() {
+                                    let pc = child_engine.program_counter().unwrap_or(0);
+                                    eprintln!("[sibling tid#{tid}] vCPU built, pc={pc:#x}, entering loop");
+                                }
+                                let r = run_vcpu_until_exit(
+                                    child_kernel,
+                                    child_engine,
+                                    child_registry,
+                                    child_futex,
+                                    tid,
+                                    child_threads,
+                                    max_traps,
+                                );
+                                if let Err(e) = r {
+                                    tracing::error!(tid, error = %e, "thread sibling vCPU loop failed");
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(tid, error = %e, "thread sibling vCPU failed to start");
+                                // Remove the failed thread so live_count stays
+                                // accurate (parent already saw tid via clone).
+                                child_registry.exit(tid);
+                            }
+                        }
+                    })
+                    .map_err(|e| RuntimeError::Trap(TrapError::Hypervisor(format!(
+                        "spawn guest thread failed: {e}"
+                    ))))?;
+                #[allow(clippy::expect_used)]
+                threads.lock().expect("threads lock poisoned").push(handle);
+
+                // Parent's clone(2) returns the child tid.
+                engine.complete_syscall(tid as i64)?;
+            }
+            DispatchOutcome::ThreadExit { code } => {
+                // CLONE_CHILD_CLEARTID: zero the word + wake one waiter.
+                if let Some(addr) = registry.clear_child_tid(this_tid) {
+                    if addr != 0 {
+                        let _ = engine.write_bytes(addr, &0i32.to_le_bytes());
+                        futex.wake(addr, 1);
+                    }
+                }
+                let last = registry.exit(this_tid);
+                if last {
+                    let result = assemble_run_result(&kernel, code, traps, false);
+                    return Ok(VcpuLoopOutcome::ProcessExit(Box::new(result)));
+                }
+                // Not last: this host thread is done. Its vCPU + VM-clone Arc
+                // leak to process exit (the forked-child Drop discipline).
+                return Ok(VcpuLoopOutcome::ThreadDone);
+            }
+            DispatchOutcome::Execve { path, argv, env } => {
+                crate::probes::execve_argv(&path, &argv);
+                let base = path.rsplit('/').next().unwrap_or(&path).to_owned();
+                crate::dispatch::set_host_process_name(base.as_bytes());
+                #[allow(clippy::expect_used)]
+                let image = {
+                    let mut k = kernel.0.lock().expect("kernel lock poisoned");
+                    let res = load_execve_image(&k.dispatcher, &path, argv, env);
+                    match res {
+                        Ok(img) => {
+                            crate::probes::execve_loaded(
+                                &path,
+                                img.entry(),
+                                img.initial_stack_pointer().unwrap_or(0),
+                                img.regions().len() as u64,
+                            );
+                            k.dispatcher.close_cloexec_fds();
+                            Some(img)
+                        }
+                        Err(errno) => {
+                            drop(k);
+                            engine.complete_syscall(-(errno as i64))?;
+                            None
+                        }
+                    }
+                };
+                if let Some(img) = image {
+                    engine.execve_into(&img)?;
+                }
+            }
+            DispatchOutcome::SigReturn => {
+                engine.restore_from_sigframe()?;
+                suppress_signal_check = true;
+            }
+            DispatchOutcome::Fork => {
+                // Process-creating fork. Real macOS fork of a MULTI-vCPU HVF
+                // process is unsafe (other vCPUs/threads would be left in an
+                // inconsistent HVF state), so only allow it when this is the
+                // sole live guest thread — which is the overwhelmingly common
+                // case (apt's http method, dpkg's tar subprocess, etc. fork
+                // before any pthread_create). With siblings alive, surface
+                // ENOSYS so glibc falls back rather than wedging the VM.
+                if registry.live_count() > 1 {
+                    engine.complete_syscall(-(crate::linux_abi::LINUX_ENOSYS as i64))?;
+                } else {
+                    let fork_outcome = engine.fork()?;
+                    let retval: i64 = match fork_outcome {
+                        crate::trap::ForkOutcome::Parent { child_pid } => i64::from(child_pid),
+                        crate::trap::ForkOutcome::Child => {
+                            #[allow(clippy::expect_used)]
+                            let mut k = kernel.0.lock().expect("kernel lock poisoned");
+                            k.dispatcher.clear_output_buffers();
+                            // A forked process is single-threaded by definition
+                            // (fork copies only the calling thread). Reset to a
+                            // fresh registry keyed by the child's host pid so
+                            // gettid/getpid/kill-self all agree (the inherited
+                            // registry could carry stale sibling tids from the
+                            // parent, breaking self-signal targeting). live_count
+                            // becomes 1, restoring single-threaded signal
+                            // delivery + real fork in the child.
+                            this_tid = std::process::id() as ThreadId;
+                            registry = Arc::new(ThreadRegistry::new(this_tid));
+                            0
+                        }
+                    };
+                    engine.complete_syscall(retval)?;
+                    last_syscall_retval = Some(retval);
+                }
+            }
+        }
+
+        // Signal delivery. host_signal is process-global. We service pending
+        // signals on the sole vCPU of a single-threaded process — which
+        // covers BOTH the main thread and any forked child (a fresh
+        // single-threaded process). With sibling threads live we skip it here
+        // to avoid two vCPUs racing the shared host_signal slot; a
+        // multi-threaded guest's signal routing is a follow-up. Run under the
+        // kernel lock since it mutates dispatcher signal state.
+        if !suppress_signal_check && registry.live_count() == 1 {
+            #[allow(clippy::expect_used)]
+            let mut k = kernel.0.lock().expect("kernel lock poisoned");
+            if let Some(action) =
+                deliver_pending_signal(&mut engine, &mut k.dispatcher, last_syscall_retval)?
+            {
+                if let Some(exit) = action.exit_code {
+                    drop(k);
+                    let result = assemble_run_result(&kernel, exit, traps, false);
+                    return Ok(VcpuLoopOutcome::ProcessExit(Box::new(result)));
+                }
+            }
+        }
+    }
+
+    let result = assemble_run_result(&kernel, -1, max_traps, true);
+    Ok(VcpuLoopOutcome::TrapLimit(Box::new(result)))
+}
+
+/// Snapshot the shared kernel buffers + reporter into a RunResult. Called on
+/// whole-process exit / trap limit.
+fn assemble_run_result(
+    kernel: &SendKernel,
+    exit_code: i32,
+    traps: usize,
+    trap_limit_hit: bool,
+) -> RunResult {
+    crate::probes::guest_exit(exit_code);
+    #[allow(clippy::expect_used)]
+    let mut k = kernel.0.lock().expect("kernel lock poisoned");
+    let report = std::mem::take(&mut k.reporter).finish();
+    RunResult {
+        exit_code,
+        stdout: k.dispatcher.stdout().to_vec(),
+        stderr: k.dispatcher.stderr().to_vec(),
+        traps,
+        report,
+        trap_limit_hit,
+    }
 }
 
 /// Outcome of `deliver_pending_signal`. The `exit_code` field is
@@ -794,6 +1229,15 @@ where
             DispatchOutcome::SigReturn => {
                 trap.restore_from_sigframe()?;
                 suppress_signal_check = true;
+            }
+            DispatchOutcome::CloneThread { .. }
+            | DispatchOutcome::ThreadExit { .. }
+            | DispatchOutcome::FutexWait { .. } => {
+                // These are emitted only on the multi-threaded
+                // `dispatch_threaded` path (run_vcpu_until_exit). The
+                // single-threaded loops here always pass `thread: None`, so
+                // the dispatcher never produces them.
+                unreachable!("thread-clone outcomes only arise on the threaded runtime path")
             }
         }
 
