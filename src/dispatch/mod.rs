@@ -106,6 +106,21 @@ pub struct SyscallCtx<'a, M: GuestMemory> {
     pub request: SyscallRequest,
     pub memory: &'a mut M,
     pub reporter: &'a mut CompatReporter,
+    /// Present only when the syscall is dispatched on behalf of a specific
+    /// guest thread (the multi-threaded runtime path). Carries this thread's
+    /// tid and the shared thread/futex coordination tables. `None` for the
+    /// single-threaded `dispatch` path (legacy callers + unit tests), where
+    /// tid-aware handlers fall back to pid-based answers.
+    pub thread: Option<ThreadCtx<'a>>,
+}
+
+/// Per-thread coordination handles handed to tid-aware syscall handlers
+/// (`gettid`, `set_tid_address`, `futex`).
+#[derive(Clone, Copy)]
+pub struct ThreadCtx<'a> {
+    pub tid: crate::thread::ThreadId,
+    pub registry: &'a crate::thread::ThreadRegistry,
+    pub futex: &'a crate::thread::FutexTable,
 }
 
 impl<M: GuestMemory> SyscallCtx<'_, M> {
@@ -173,17 +188,46 @@ pub enum DispatchOutcome {
     /// completion would. There is no retval to write into x0; the
     /// restored x0 IS the return value.
     SigReturn,
+    /// Thread-creating `clone(2)`/`clone3(2)` (CLONE_VM|CLONE_THREAD|...).
+    /// The runtime spawns a new host thread + vCPU sharing this process's VM.
+    CloneThread {
+        stack: u64,           // child SP (clone arg)
+        tls: u64,             // CLONE_SETTLS value -> TPIDR_EL0 (0 = none)
+        flags: u64,
+        parent_tid_addr: u64, // CLONE_PARENT_SETTID target (0 = none)
+        child_tid_addr: u64,  // CLONE_CHILD_SETTID/CLEARTID target (0 = none)
+    },
+    /// A single thread exited via `exit(2)` (NOT exit_group): the runtime
+    /// performs the CLONE_CHILD_CLEARTID futex wake and ends just this host
+    /// thread. If it was the last live thread the process exits.
+    ThreadExit { code: i32 },
+    /// `FUTEX_WAIT` whose value-check passed under the kernel lock: the
+    /// guest word equals the expected value, so this thread must block.
+    /// The handler CANNOT block while holding the kernel lock (a sibling's
+    /// `FUTEX_WAKE` would deadlock), so it returns this outcome and the
+    /// runtime drops the lock, calls `FutexTable::wait`, then completes the
+    /// syscall with 0 (woken) or -ETIMEDOUT (timed out).
+    FutexWait {
+        addr: u64,
+        timeout: Option<Duration>,
+    },
 }
 
 impl DispatchOutcome {
     fn retval_errno(&self) -> (i64, Option<i32>) {
-        match *self {
-            DispatchOutcome::Returned { value } => (value, None),
-            DispatchOutcome::Errno { errno } => (-(errno as i64), Some(errno)),
-            DispatchOutcome::Exit { code } => (code as i64, None),
+        match self {
+            DispatchOutcome::Returned { value } => (*value, None),
+            DispatchOutcome::Errno { errno } => (-(*errno as i64), Some(*errno)),
+            DispatchOutcome::Exit { code } => (*code as i64, None),
             DispatchOutcome::Fork => (0, None),
             DispatchOutcome::Execve { .. } => (0, None),
             DispatchOutcome::SigReturn => (0, None),
+            // CloneThread/ThreadExit/FutexWait are handled specially by the
+            // runtime and never flow through retval_errno — the runtime acts
+            // on them directly before any x0 write.
+            DispatchOutcome::CloneThread { .. } => (0, None),
+            DispatchOutcome::ThreadExit { .. } => (0, None),
+            DispatchOutcome::FutexWait { .. } => (0, None),
         }
     }
 }
@@ -541,11 +585,12 @@ macro_rules! normalized_dispatch {
             request: SyscallRequest,
             memory: &mut impl GuestMemory,
             reporter: &mut CompatReporter,
+            thread: Option<ThreadCtx>,
         ) -> Option<Result<DispatchOutcome, DispatchError>> {
             match request.number {
                 $(
                     $num => {
-                        let mut ctx = SyscallCtx { request, memory, reporter };
+                        let mut ctx = SyscallCtx { request, memory, reporter, thread };
                         Some(self.$handler(&mut ctx))
                     }
                 )*
@@ -722,7 +767,8 @@ impl SyscallDispatcher {
         151 => sys_setfsuid,
         152 => sys_setfsgid,
         159 => sys_setgroups,
-        172 | 178 => sys_getpid,
+        172 => sys_getpid,
+        178 => gettid,
         173 => sys_getppid,
         174 => sys_getuid,
         175 => sys_geteuid,
@@ -882,11 +928,45 @@ impl SyscallDispatcher {
 
 
 
+    /// Single-threaded dispatch (legacy + unit tests + the fork-based
+    /// runtime path). Tid-aware handlers see `thread: None`.
     pub fn dispatch(
         &mut self,
         request: SyscallRequest,
         memory: &mut impl GuestMemory,
         reporter: &mut CompatReporter,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        self.dispatch_inner(request, memory, reporter, None)
+    }
+
+    /// Multi-threaded dispatch: the caller (the per-vCPU runtime loop)
+    /// holds the big kernel lock and supplies THIS thread's tid plus the
+    /// shared registry/futex tables, so `gettid`/`set_tid_address`/`futex`
+    /// answer per-thread.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_threaded(
+        &mut self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+        reporter: &mut CompatReporter,
+        tid: crate::thread::ThreadId,
+        registry: &crate::thread::ThreadRegistry,
+        futex: &crate::thread::FutexTable,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let thread = Some(ThreadCtx {
+            tid,
+            registry,
+            futex,
+        });
+        self.dispatch_inner(request, memory, reporter, thread)
+    }
+
+    fn dispatch_inner(
+        &mut self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+        reporter: &mut CompatReporter,
+        thread: Option<ThreadCtx>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let syscall = lookup_aarch64(request.number);
         let name = syscall.map_or("unknown", |syscall| syscall.name);
@@ -919,7 +999,7 @@ impl SyscallDispatcher {
         // Syscalls migrated to the normalized SyscallCtx handler contract are
         // dispatched here first; the borrow of memory/reporter is scoped to
         // the call, so the legacy match below can still use them for the rest.
-        if let Some(result) = self.dispatch_normalized(request, memory, reporter) {
+        if let Some(result) = self.dispatch_normalized(request, memory, reporter, thread) {
             let outcome = result?;
             let (retval, errno) = outcome.retval_errno();
             reporter.record(CompatEvent::SyscallReturn {
@@ -3579,7 +3659,7 @@ mod overlay_dispatch_tests {
                    159, 172, 173, 174, 175, 176, 177, 178, 243, 269, 283, 293, 435] {
             let req = SyscallRequest::new(nr, SyscallArgs::from([0, 0, 0, 0, 0, 0]));
             assert!(
-                d.dispatch_normalized(req, &mut mem, &mut reporter).is_some(),
+                d.dispatch_normalized(req, &mut mem, &mut reporter, None).is_some(),
                 "syscall {nr} fell through the normalized table",
             );
         }

@@ -113,10 +113,40 @@ impl SyscallDispatcher {
         Ok(DispatchOutcome::Returned { value: 0 })
     }
 
+    /// gettid(2). In the multi-threaded runtime each guest thread has its
+    /// own tid (allocated by the ThreadRegistry); fall back to the pid for
+    /// the single-threaded path.
+    pub(super) fn gettid<M: GuestMemory>(
+        &mut self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        if let Some(t) = ctx.thread {
+            // Linux: in a single-threaded process gettid()==getpid(). Our
+            // main thread's tid is seeded from getpid AT PROCESS START, but a
+            // forked child gets a fresh host pid while keeping the inherited
+            // main_tid — so returning the stale tid would break the
+            // gettid==getpid invariant. While this is the sole live thread,
+            // answer with the live getpid; only once siblings exist do we
+            // hand out the distinct per-thread tid.
+            if t.registry.live_count() > 1 {
+                return Ok(DispatchOutcome::Returned { value: t.tid as i64 });
+            }
+        }
+        Ok(self.getpid())
+    }
+
+    /// set_tid_address(addr). Records `addr` as this thread's
+    /// CLONE_CHILD_CLEARTID word (zeroed + FUTEX_WAKE'd on thread exit) and
+    /// returns the caller's tid. Single-threaded path just returns pid.
     pub(super) fn set_tid_address<M: GuestMemory>(
         &mut self,
-        _ctx: &mut SyscallCtx<M>,
+        ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
+        let addr = ctx.arg(0);
+        if let Some(t) = ctx.thread {
+            t.registry.set_clear_child_tid(t.tid, addr);
+            return Ok(DispatchOutcome::Returned { value: t.tid as i64 });
+        }
         Ok(self.getpid())
     }
 
@@ -179,15 +209,23 @@ impl SyscallDispatcher {
         let operation = ctx.arg(1);
         let value = ctx.arg(2) as u32;
         let timeout_address = ctx.arg(3);
+        let args = ctx.request.args;
+        let thread = ctx.thread;
         let memory = &*ctx.memory;
-        let command = operation & LINUX_FUTEX_CMD_MASK;
+        // FUTEX_*_BITSET (9/10) are the bitset variants glibc uses for
+        // pthread join/condvar; we treat them as their plain WAIT/WAKE
+        // counterparts (match-all bitset). CLOCK_REALTIME is accepted (we
+        // service the wait with a relative timeout regardless).
+        const LINUX_FUTEX_WAIT_BITSET: u64 = 9;
+        const LINUX_FUTEX_WAKE_BITSET: u64 = 10;
+        let raw_command = operation & LINUX_FUTEX_CMD_MASK;
+        let command = match raw_command {
+            LINUX_FUTEX_WAIT_BITSET => LINUX_FUTEX_WAIT,
+            LINUX_FUTEX_WAKE_BITSET => LINUX_FUTEX_WAKE,
+            other => other,
+        };
         let flags = operation & !LINUX_FUTEX_CMD_MASK;
         if flags & !(LINUX_FUTEX_PRIVATE_FLAG | LINUX_FUTEX_CLOCK_REALTIME) != 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
-        }
-        if flags & LINUX_FUTEX_CLOCK_REALTIME != 0 {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
             });
@@ -197,32 +235,75 @@ impl SyscallDispatcher {
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
 
+        // Single-threaded path (no ThreadCtx): keep the prior best-effort
+        // behaviour — WAKE is a no-op success, WAIT either EAGAINs (value
+        // mismatch / no timeout) or sleeps then ETIMEDOUTs. apt's update
+        // stage runs single-threaded and tolerates this.
+        let Some(thread) = thread else {
+            return Ok(match command {
+                LINUX_FUTEX_WAKE => DispatchOutcome::Returned { value: 0 },
+                LINUX_FUTEX_WAIT => {
+                    if word != value || timeout_address == 0 {
+                        return Ok(DispatchOutcome::Errno { errno: LINUX_EAGAIN });
+                    }
+                    let timespec = match read_timespec(memory, timeout_address) {
+                        Ok(t) => t,
+                        Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                    };
+                    let timeout = match duration_from_linux_timespec(timespec) {
+                        Ok(t) => t,
+                        Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                    };
+                    if let Some(timeout) = timeout {
+                        std::thread::sleep(timeout);
+                    }
+                    DispatchOutcome::Errno { errno: LINUX_ETIMEDOUT }
+                }
+                _ => DispatchOutcome::Errno { errno: LINUX_ENOSYS },
+            });
+        };
+
+        // Multi-threaded path: real cross-thread WAIT/WAKE via the shared
+        // FutexTable. We support private futexes; shared-flag futexes use the
+        // same table here (the address space is shared within the process,
+        // so the keying is identical) — note it via a partial-syscall probe.
+        if flags & LINUX_FUTEX_PRIVATE_FLAG == 0 {
+            ctx.reporter.record(crate::compat::CompatEvent::partial_syscall(
+                98,
+                "futex",
+                args,
+                "non-private futex treated as private (shared address space)",
+            ));
+        }
+
         Ok(match command {
-            LINUX_FUTEX_WAKE => DispatchOutcome::Returned { value: 0 },
+            LINUX_FUTEX_WAKE => {
+                let n = thread.futex.wake(address, value);
+                DispatchOutcome::Returned { value: i64::from(n) }
+            }
             LINUX_FUTEX_WAIT => {
+                // Re-check *uaddr under the kernel lock. If it changed since
+                // the guest's last read, don't block (EAGAIN). Otherwise the
+                // runtime must block with the lock RELEASED, so surface a
+                // FutexWait outcome instead of sleeping here.
                 if word != value {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: LINUX_EAGAIN,
-                    });
+                    return Ok(DispatchOutcome::Errno { errno: LINUX_EAGAIN });
                 }
-                if timeout_address == 0 {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: LINUX_EAGAIN,
-                    });
-                }
-                let timespec = match read_timespec(memory, timeout_address) {
-                    Ok(timespec) => timespec,
-                    Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                let timeout = if timeout_address == 0 {
+                    None
+                } else {
+                    let timespec = match read_timespec(memory, timeout_address) {
+                        Ok(t) => t,
+                        Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                    };
+                    match duration_from_linux_timespec(timespec) {
+                        Ok(t) => t,
+                        Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                    }
                 };
-                let timeout = match duration_from_linux_timespec(timespec) {
-                    Ok(timeout) => timeout,
-                    Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
-                };
-                if let Some(timeout) = timeout {
-                    std::thread::sleep(timeout);
-                }
-                DispatchOutcome::Errno {
-                    errno: LINUX_ETIMEDOUT,
+                DispatchOutcome::FutexWait {
+                    addr: address,
+                    timeout,
                 }
             }
             _ => DispatchOutcome::Errno {
@@ -426,10 +507,12 @@ impl SyscallDispatcher {
     /// and the runtime asks the trap engine to do a real macOS fork
     /// against the live HVF state.
     ///
-    /// Currently only the simple SIGCHLD case (musl/glibc `fork()` wrapper
-    /// → `clone(SIGCHLD, 0, ...)`) is wired. Thread-create flags
-    /// (CLONE_VM | CLONE_THREAD) and namespace/process-share variants
-    /// fall through to ENOSYS until the next iteration.
+    /// Thread-create flags (CLONE_VM | CLONE_THREAD etc.) now emit
+    /// `DispatchOutcome::CloneThread` so the runtime can spin up a new
+    /// vCPU sharing the same address space.  All other flags (including
+    /// the SIGCHLD-only fork case) still return `DispatchOutcome::Fork`.
+    ///
+    /// aarch64 clone ABI: clone(flags, stack, parent_tid, tls, child_tid)
     pub(super) fn clone<M: GuestMemory>(
         &mut self,
         ctx: &mut SyscallCtx<M>,
@@ -439,17 +522,30 @@ impl SyscallDispatcher {
         const CLONE_FILES: u64 = 0x00000400;
         const CLONE_SIGHAND: u64 = 0x00000800;
         const CLONE_THREAD: u64 = 0x00010000;
+        const CLONE_SETTLS: u64 = 0x00080000;
+        const CLONE_PARENT_SETTID: u64 = 0x00100000;
+        const CLONE_CHILD_SETTID: u64 = 0x01000000;
+        const CLONE_CHILD_CLEARTID: u64 = 0x00200000;
 
         let flags = ctx.arg(0);
-        // Thread creation needs pthread_create semantics, not fork.
-        // Surface as ENOSYS for now so callers see "function not
-        // implemented" rather than spuriously cloning the whole address
-        // space when they wanted a thread.
         let thread_mask =
             CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
         if (flags & thread_mask) == thread_mask {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_ENOSYS,
+            // aarch64 ABI: clone(flags, stack, parent_tid, tls, child_tid)
+            let stack = ctx.arg(1);
+            let parent_tid_addr = if flags & CLONE_PARENT_SETTID != 0 { ctx.arg(2) } else { 0 };
+            let tls = if flags & CLONE_SETTLS != 0 { ctx.arg(3) } else { 0 };
+            let child_tid_addr = if flags & (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID) != 0 {
+                ctx.arg(4)
+            } else {
+                0
+            };
+            return Ok(DispatchOutcome::CloneThread {
+                stack,
+                tls,
+                flags,
+                parent_tid_addr,
+                child_tid_addr,
             });
         }
 
@@ -461,7 +557,14 @@ impl SyscallDispatcher {
     /// a `struct clone_args` pointed to by arg0 (arg1 is its size). glibc's
     /// posix_spawn/fork now prefer clone3; without it apt-get's worker spawn
     /// silently failed and the parent deadlocked waiting on a child that never
-    /// came up. We only need `flags` (the first u64) to decide thread-vs-fork.
+    /// came up.
+    ///
+    /// clone_args layout (little-endian u64s):
+    ///   flags@0, pidfd@8, child_tid@16, parent_tid@24, exit_signal@32,
+    ///   stack@40, stack_size@48, tls@56
+    ///
+    /// Thread-create flags now emit `DispatchOutcome::CloneThread`.
+    /// Fork-like flags still return `DispatchOutcome::Fork`.
     fn clone3(
         &mut self,
         request: SyscallRequest,
@@ -472,6 +575,10 @@ impl SyscallDispatcher {
         const CLONE_FILES: u64 = 0x00000400;
         const CLONE_SIGHAND: u64 = 0x00000800;
         const CLONE_THREAD: u64 = 0x00010000;
+        const CLONE_SETTLS: u64 = 0x00080000;
+        const CLONE_PARENT_SETTID: u64 = 0x00100000;
+        const CLONE_CHILD_SETTID: u64 = 0x01000000;
+        const CLONE_CHILD_CLEARTID: u64 = 0x00200000;
 
         let args_ptr = request.arg(0);
         let args_size = request.arg(1);
@@ -482,11 +589,13 @@ impl SyscallDispatcher {
                 errno: LINUX_EINVAL,
             };
         }
-        let flags = match memory.read_bytes(args_ptr, 8) {
-            // INVARIANT: read_bytes(_, 8) returns exactly 8 bytes on Ok, so the
-            // 8-byte slice always converts into [u8; 8].
-            #[allow(clippy::unwrap_used)]
-            Ok(bytes) => u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+
+        // Read up to the full struct (64 bytes through tls@56). glibc always
+        // passes the complete struct; if the caller passes a truncated struct
+        // with thread flags set we fall back to ENOSYS with a note below.
+        let read_len = args_size.min(64) as usize;
+        let bytes = match memory.read_bytes(args_ptr, read_len) {
+            Ok(b) => b,
             Err(_) => {
                 return DispatchOutcome::Errno {
                     errno: LINUX_EFAULT,
@@ -494,11 +603,51 @@ impl SyscallDispatcher {
             }
         };
 
+        // INVARIANT: read_len >= 8 (guarded above) so slice [0..8] is valid.
+        #[allow(clippy::unwrap_used)]
+        let flags = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+
         let thread_mask =
             CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
         if (flags & thread_mask) == thread_mask {
-            return DispatchOutcome::Errno {
-                errno: LINUX_ENOSYS,
+            // glibc always passes the full struct (64 bytes); if for some reason
+            // the caller passes a short struct with thread flags, return ENOSYS
+            // rather than misreading uninitialised fields.
+            if args_size < 64 {
+                return DispatchOutcome::Errno {
+                    errno: LINUX_ENOSYS,
+                };
+            }
+
+            // All fields are little-endian u64; offsets from the layout above.
+            #[allow(clippy::unwrap_used)]
+            let read_u64_at = |off: usize| -> u64 {
+                u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap())
+            };
+            let child_tid_ptr = read_u64_at(16);  // child_tid@16
+            let parent_tid_ptr = read_u64_at(24); // parent_tid@24
+            let stack = read_u64_at(40);           // stack@40
+            let stack_size = read_u64_at(48);      // stack_size@48
+            let tls_val = read_u64_at(56);         // tls@56
+
+            // child SP = stack base + stack_size (stack grows down on aarch64)
+            let child_sp = stack + stack_size;
+            let tls = if flags & CLONE_SETTLS != 0 { tls_val } else { 0 };
+            let parent_tid_addr =
+                if flags & CLONE_PARENT_SETTID != 0 { parent_tid_ptr } else { 0 };
+            let child_tid_addr =
+                if flags & (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID) != 0 {
+                    child_tid_ptr
+                } else {
+                    0
+                };
+
+            return DispatchOutcome::CloneThread {
+                stack: child_sp,
+                tls,
+                flags,
+                parent_tid_addr,
+                child_tid_addr,
             };
         }
 
@@ -537,7 +686,18 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn sys_exit<M: GuestMemory>(&mut self, ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
-        Ok(self.exit(ctx.request))
+        let code = ctx.request.arg(0) as i32;
+        // exit_group(94) always tears down the whole process. exit(93) ends
+        // just this thread IF siblings are still live; with only one live
+        // thread (or no ThreadCtx) it's equivalent to whole-process exit.
+        if ctx.request.number == 93 {
+            if let Some(t) = ctx.thread {
+                if t.registry.live_count() > 1 {
+                    return Ok(DispatchOutcome::ThreadExit { code });
+                }
+            }
+        }
+        Ok(DispatchOutcome::Exit { code })
     }
 
     pub(super) fn sys_clone3<M: GuestMemory>(&mut self, ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
@@ -548,11 +708,6 @@ impl SyscallDispatcher {
         Ok(self.rseq())
     }
 
-    fn exit(&self, request: SyscallRequest) -> DispatchOutcome {
-        DispatchOutcome::Exit {
-            code: request.arg(0) as i32,
-        }
-    }
 }
 
 fn fill_deterministic_bootstrap_random(bytes: &mut [u8]) {

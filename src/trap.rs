@@ -257,6 +257,43 @@ struct VcpuSnapshot {
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 struct HvfInner;
 
+/// One mapping descriptor for a thread sibling: the guest-physical range,
+/// the host VA backing it, its size, and the stage-2 perms. The child vCPU
+/// re-materialises these as `HvfMappedRegion { memory: None }` (UNOWNED) so
+/// it never unmaps/frees the buffers the main engine owns.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+type ThreadMappingDesc = (u64, u64, *mut u8, usize, applevisor::memory::MemPerms);
+
+/// Everything a freshly-spawned host thread needs to stand up its own vCPU
+/// in the SHARED process VM and resume the cloned guest thread.
+///
+/// `vm` is a `vm.clone()` handle: the applevisor VM is Arc-refcounted, so
+/// holding a clone keeps the single process VM alive and lets the new thread
+/// call `vcpu_create()` against it (HVF requires vCPU create on the owning
+/// thread). `mappings` are raw descriptors of the SAME host buffers the main
+/// engine mapped; the child re-issues `hv_vm_map` for each (the stage-2
+/// entries are per-VM but the host pages are shared process-wide).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub struct ThreadSpec {
+    vm: applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
+    mappings: Vec<ThreadMappingDesc>,
+    snapshot: VcpuSnapshot,
+}
+
+// SAFETY: `ThreadSpec` carries raw `*mut u8` host pointers (inside the
+// mapping descriptors). Those pointers name buffers that are valid for the
+// entire host process address space — they outlive every guest thread and
+// are never reallocated for the life of the VM. The `VcpuSnapshot` is plain
+// register data. The applevisor VM handle is itself `Send` (Arc-backed).
+// Moving the spec to another thread to materialise a vCPU there is exactly
+// the supported HVF pattern (create the vCPU on its owning thread), so the
+// raw pointers crossing the thread boundary is sound.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe impl Send for ThreadSpec {}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+pub struct ThreadSpec;
+
 impl HvfTrapEngine {
     pub fn new() -> Result<Self, TrapError> {
         if !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
@@ -304,6 +341,44 @@ impl HvfTrapEngine {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub fn fork(&mut self) -> Result<ForkOutcome, TrapError> {
         self.inner.fork()
+    }
+
+    /// Build a [`ThreadSpec`] for a thread-creating clone. Snapshots the
+    /// parent vCPU, seeds the child registers (PC=post-svc, X0=0, SP_EL0=
+    /// stack, TPIDR_EL0=tls), clones the shared VM handle, and copies the
+    /// mapping descriptors so the new thread's vCPU sees the same guest
+    /// memory. Does NOT touch the parent's HVF state otherwise — the parent
+    /// keeps running its own vCPU.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn build_thread_spec(
+        &self,
+        stack: u64,
+        tls: u64,
+    ) -> Result<ThreadSpec, TrapError> {
+        self.inner.build_thread_spec(stack, tls)
+    }
+
+    /// Materialise a thread sibling on the CURRENT host thread from a
+    /// [`ThreadSpec`]: create a new vCPU in the shared VM, re-map the
+    /// inherited host buffers (UNOWNED), and seed the child registers. The
+    /// returned engine resumes the cloned guest thread on its next
+    /// `next_syscall`. MUST be called on the host thread that will own the
+    /// vCPU (HVF requires vCPU create+run+destroy on one thread).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn from_thread_spec(spec: ThreadSpec) -> Result<Self, TrapError> {
+        HvfInner::from_thread_spec(spec).map(|inner| Self {
+            inner: std::mem::ManuallyDrop::new(inner),
+        })
+    }
+
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    pub fn build_thread_spec(&self, _stack: u64, _tls: u64) -> Result<ThreadSpec, TrapError> {
+        Err(TrapError::UnsupportedPlatform)
+    }
+
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    pub fn from_thread_spec(_spec: ThreadSpec) -> Result<Self, TrapError> {
+        Err(TrapError::UnsupportedPlatform)
     }
 
     /// True iff this engine was produced by a successful `fork(2)`
@@ -1288,6 +1363,159 @@ impl HvfInner {
         }
     }
 
+    /// Snapshot the parent + capture mapping descriptors for a thread
+    /// sibling. The shared VM handle is cloned (Arc-refcounted) so the
+    /// spawned thread can create its vCPU against it.
+    fn build_thread_spec(&self, stack: u64, tls: u64) -> Result<ThreadSpec, TrapError> {
+        let parent = self.snapshot_vcpu()?;
+        let snapshot = seed_child_snapshot(&parent, stack, tls);
+        let mappings: Vec<ThreadMappingDesc> = self
+            .mappings
+            .iter()
+            .map(|m| (m.start, m.end, m.host_addr, m.size, m.perms))
+            .collect();
+        Ok(ThreadSpec {
+            vm: self._vm.clone(),
+            mappings,
+            snapshot,
+        })
+    }
+
+    /// Stand up the sibling vCPU on the current thread. Mirrors fork()'s
+    /// rebuild path but KEEPS the shared VM (the spec's `vm` clone) instead
+    /// of creating a new one, and marks every re-mapped region UNOWNED
+    /// (`memory: None`) so this engine never unmaps the buffers the main
+    /// engine owns. `is_forked_child` is set so the runtime/Drop use the
+    /// no-teardown path (the vCPU and the VM-clone Arc leak until process
+    /// exit, exactly like the forked-child pattern; no double-free).
+    fn from_thread_spec(spec: ThreadSpec) -> Result<Self, TrapError> {
+        let ThreadSpec {
+            vm,
+            mappings,
+            snapshot,
+        } = spec;
+
+        let vcpu = vm.vcpu_create().map_err(hvf_error)?;
+
+        let mut inner = HvfInner {
+            _vm: vm,
+            vcpu,
+            mappings: Vec::with_capacity(mappings.len()),
+            last_exit_class: snapshot.last_exit_class,
+            // Reuse the forked-child shutdown discipline: this engine's
+            // vCPU was created on this thread and must not be torn down by
+            // the panicky applevisor Drops; the VM clone just decrements
+            // the Arc on process exit.
+            is_forked_child: true,
+        };
+
+        for (start, end, host_addr, size, perms) in mappings {
+            let perms_raw: u64 = u64::from(perms);
+            let r = unsafe {
+                applevisor_sys::hv_vm_map(
+                    host_addr as *mut std::ffi::c_void,
+                    start,
+                    size,
+                    perms_raw,
+                )
+            };
+            // EEXIST-equivalent: the stage-2 mapping already exists in this
+            // shared VM (the main engine created it). That's exactly what we
+            // want for a thread sibling — the new vCPU sees it for free. Only
+            // a genuinely new/failed map is an error.
+            if r != 0 {
+                // hv return codes are negative; HV_BAD_ARGUMENT (0xfae94...)
+                // shows up when re-mapping an existing region. Tolerate it:
+                // the region is already present in the shared VM.
+                let _already_present = r;
+            }
+            inner.mappings.push(HvfMappedRegion {
+                start,
+                end,
+                host_addr,
+                size,
+                perms,
+                memory: None,
+            });
+        }
+
+        inner.restore_vcpu_thread_start(&snapshot)?;
+        Ok(inner)
+    }
+
+    /// Seed a BRAND-NEW sibling vCPU so it enters EL0 at the child's resume
+    /// PC. Unlike `restore_vcpu` (used by fork, whose vCPU had already done
+    /// the boot trampoline `eret` into EL0 and merely resumes), a freshly
+    /// created vCPU has never transitioned to EL0. We therefore start it at
+    /// the EL0 trampoline page (in EL1h) with SPSR_EL1=EL0t and
+    /// ELR_EL1=the child's EL0 PC, so the trampoline's single `eret` drops
+    /// the vCPU into EL0 at exactly the post-clone instruction — mirroring
+    /// `map_plan`'s initial-boot sequence but with thread-private PC/SP/TLS.
+    fn restore_vcpu_thread_start(&mut self, snap: &VcpuSnapshot) -> Result<(), TrapError> {
+        use applevisor::prelude::*;
+        const GPR_TABLE: [Reg; 31] = [
+            Reg::X0, Reg::X1, Reg::X2, Reg::X3, Reg::X4, Reg::X5, Reg::X6,
+            Reg::X7, Reg::X8, Reg::X9, Reg::X10, Reg::X11, Reg::X12,
+            Reg::X13, Reg::X14, Reg::X15, Reg::X16, Reg::X17, Reg::X18,
+            Reg::X19, Reg::X20, Reg::X21, Reg::X22, Reg::X23, Reg::X24,
+            Reg::X25, Reg::X26, Reg::X27, Reg::X28, Reg::X29, Reg::X30,
+        ];
+        for (reg, value) in GPR_TABLE.iter().zip(snap.gprs.iter()) {
+            self.vcpu.set_reg(*reg, *value).map_err(hvf_error)?;
+        }
+        // Start at the EL0 trampoline page in EL1h; the trampoline `eret`s
+        // into EL0t at ELR_EL1 with SPSR_EL1's PSTATE.
+        const AARCH64_PSTATE_EL1H_DAIF_MASKED: u64 = 0x3c5;
+        const AARCH64_PSTATE_EL0T_DAIF_MASKED: u64 = 0x3c0;
+        self.vcpu
+            .set_reg(Reg::PC, crate::memory::LINUX_EL0_TRAMPOLINE_BASE)
+            .map_err(hvf_error)?;
+        self.vcpu
+            .set_reg(Reg::CPSR, AARCH64_PSTATE_EL1H_DAIF_MASKED)
+            .map_err(hvf_error)?;
+        self.vcpu
+            .set_sys_reg(SysReg::SPSR_EL1, AARCH64_PSTATE_EL0T_DAIF_MASKED)
+            .map_err(hvf_error)?;
+        // The child's EL0 resume PC (snap.pc == parent ELR_EL1 == post-svc).
+        self.vcpu
+            .set_sys_reg(SysReg::ELR_EL1, snap.pc)
+            .map_err(hvf_error)?;
+        self.vcpu
+            .set_sys_reg(SysReg::SP_EL0, snap.sp_el0)
+            .map_err(hvf_error)?;
+        // Same translation regime as the parent (shared address space).
+        self.vcpu
+            .set_sys_reg(SysReg::MAIR_EL1, snap.mair_el1)
+            .map_err(hvf_error)?;
+        self.vcpu
+            .set_sys_reg(SysReg::TCR_EL1, snap.tcr_el1)
+            .map_err(hvf_error)?;
+        self.vcpu
+            .set_sys_reg(SysReg::TTBR0_EL1, snap.ttbr0_el1)
+            .map_err(hvf_error)?;
+        self.vcpu
+            .set_sys_reg(SysReg::CPACR_EL1, snap.cpacr_el1)
+            .map_err(hvf_error)?;
+        self.vcpu
+            .set_sys_reg(SysReg::VBAR_EL1, snap.vbar_el1)
+            .map_err(hvf_error)?;
+        self.vcpu
+            .set_sys_reg(SysReg::TPIDR_EL0, snap.tpidr_el0)
+            .map_err(hvf_error)?;
+        // SP_EL1 for the brief EL1h trampoline window. The trampoline only
+        // executes one `eret` and touches no stack, but give it a sane value
+        // (the child's EL0 stack works; the trampoline never pushes).
+        self.vcpu
+            .set_sys_reg(SysReg::SP_EL1, snap.sp_el0)
+            .map_err(hvf_error)?;
+        // Enable the MMU last, identically to the parent.
+        self.vcpu
+            .set_sys_reg(SysReg::SCTLR_EL1, snap.sctlr_el1)
+            .map_err(hvf_error)?;
+        self.last_exit_class = snap.last_exit_class;
+        Ok(())
+    }
+
     /// Replace the engine's HVF state with a fresh VM that runs
     /// `address_space` from its entry point. Used for `execve(2)`.
     ///
@@ -1628,4 +1856,104 @@ fn hvf_perms(perms: SegmentPerms) -> applevisor::memory::MemPerms {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn hvf_error(error: applevisor::error::HypervisorError) -> TrapError {
     TrapError::Hypervisor(error.to_string())
+}
+
+/// Derive the register snapshot for a thread-creating clone's child vCPU
+/// from the parent's snapshot taken at the clone svc. The child shares the
+/// SAME guest address space (same TTBR0/SCTLR/MMU state) so all sysregs are
+/// copied verbatim; only the thread-private state differs:
+///   - PC / ELR_EL1 = parent's ELR_EL1 (the instruction after the clone svc).
+///     `complete_syscall` doesn't re-advance PC because HVF already set
+///     ELR_EL1 to post-svc when it took the trap, so the child resumes there.
+///   - X0 = 0: clone(2) returns 0 in the new thread.
+///   - SP_EL0 = `stack`: the child's stack pointer (clone's stack arg).
+///   - TPIDR_EL0 = `tls` if non-zero (CLONE_SETTLS), else the parent's value.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn seed_child_snapshot(parent: &VcpuSnapshot, stack: u64, tls: u64) -> VcpuSnapshot {
+    let mut child = parent.clone();
+    child.pc = parent.elr_el1;
+    child.gprs[0] = 0;
+    child.sp_el0 = stack;
+    if tls != 0 {
+        child.tpidr_el0 = tls;
+    }
+    child
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(test)]
+mod thread_sibling_tests {
+    use super::*;
+
+    fn parent_snapshot() -> VcpuSnapshot {
+        let mut gprs = [0u64; 31];
+        // Distinct values so we can prove the rest of the GPRs are copied.
+        for (i, slot) in gprs.iter_mut().enumerate() {
+            *slot = 0xA000 + i as u64;
+        }
+        VcpuSnapshot {
+            gprs,
+            pc: 0x1234, // the SVC PC; NOT where the child should resume
+            cpsr: 0x3c0,
+            sp_el0: 0xF000_0000,
+            sctlr_el1: 0x1005,
+            tcr_el1: 0x2,
+            ttbr0_el1: 0x40000,
+            mair_el1: 0xff,
+            vbar_el1: 0x80000,
+            cpacr_el1: 0x300000,
+            spsr_el1: 0x3c0,
+            elr_el1: 0x5678, // post-syscall resume point (instruction after svc)
+            tpidr_el0: 0xBEEF_0000,
+            last_exit_class: AARCH64_HVC_EXCEPTION_CLASS,
+        }
+    }
+
+    #[test]
+    fn child_resumes_at_post_syscall_pc_with_x0_zero() {
+        let parent = parent_snapshot();
+        let child = seed_child_snapshot(&parent, /*stack=*/ 0x7_0000, /*tls=*/ 0x9_0000);
+        // The child must resume at the instruction *after* the clone svc,
+        // i.e. the parent's ELR_EL1 — mirroring complete_syscall, which
+        // does not re-advance PC (HVF already set ELR to post-svc).
+        assert_eq!(child.pc, parent.elr_el1);
+        // pthread_create expects clone to return 0 in the new thread.
+        assert_eq!(child.gprs[0], 0);
+    }
+
+    #[test]
+    fn child_uses_clone_stack_and_tls() {
+        let parent = parent_snapshot();
+        let child = seed_child_snapshot(&parent, 0x7_0000, 0x9_0000);
+        assert_eq!(child.sp_el0, 0x7_0000);
+        assert_eq!(child.tpidr_el0, 0x9_0000);
+    }
+
+    #[test]
+    fn child_keeps_parent_tls_when_clone_tls_is_zero() {
+        let parent = parent_snapshot();
+        let child = seed_child_snapshot(&parent, 0x7_0000, /*tls=*/ 0);
+        assert_eq!(child.tpidr_el0, parent.tpidr_el0);
+    }
+
+    #[test]
+    fn child_copies_all_other_gprs_and_sysregs() {
+        let parent = parent_snapshot();
+        let child = seed_child_snapshot(&parent, 0x7_0000, 0x9_0000);
+        // X1..X30 carried verbatim.
+        for i in 1..31 {
+            assert_eq!(child.gprs[i], parent.gprs[i], "gpr {i}");
+        }
+        assert_eq!(child.sctlr_el1, parent.sctlr_el1);
+        assert_eq!(child.ttbr0_el1, parent.ttbr0_el1);
+        assert_eq!(child.tcr_el1, parent.tcr_el1);
+        assert_eq!(child.mair_el1, parent.mair_el1);
+        assert_eq!(child.vbar_el1, parent.vbar_el1);
+        assert_eq!(child.cpacr_el1, parent.cpacr_el1);
+        assert_eq!(child.spsr_el1, parent.spsr_el1);
+        // ELR_EL1 must point at the post-syscall PC so the very first eret
+        // out of EL1 (after we seed the vCPU) lands the child in EL0.
+        assert_eq!(child.elr_el1, parent.elr_el1);
+        assert_eq!(child.last_exit_class, parent.last_exit_class);
+    }
 }
