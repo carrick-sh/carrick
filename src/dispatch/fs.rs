@@ -3481,12 +3481,14 @@ impl SyscallDispatcher {
     ) -> Result<DispatchOutcome, DispatchError> {
         let dirfd = ctx.arg(0);
         let pathname = ctx.arg(1);
-        let flags = ctx.arg(3);
-        if flags & !LINUX_AT_SYMLINK_NOFOLLOW != 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
-        }
+        // Shared by fchmodat (53) and fchmodat2 (452): same ABI. We accept
+        // AT_SYMLINK_NOFOLLOW + AT_EMPTY_PATH and IGNORE any other flag bits
+        // rather than EINVAL — mode-setting on the disk-authoritative host
+        // backend is best-effort, and rejecting flags glibc legitimately
+        // passes (e.g. via the fchmodat2 path that ldconfig uses) breaks
+        // `ldconfig` and dpkg maintainer scripts ("Changing access rights …
+        // Invalid argument"). The `flags` are otherwise advisory here.
+        let _flags = ctx.arg(3);
         let path = match read_guest_c_string(&*ctx.memory, pathname) {
             Ok(path) => path,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
