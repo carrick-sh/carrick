@@ -1000,6 +1000,21 @@ fn decode_esr_el1(value: u64) -> serde_json::Value {
     })
 }
 
+fn register_dtrace_probes() {
+    match carrick::probes::register_dtrace_probes() {
+        Ok(()) => {
+            if std::env::var_os("CARRICK_DTRACE_DEBUG").is_some() {
+                eprintln!("carrick: dtrace probes registered (pid={})", std::process::id());
+            }
+        }
+        Err(err) => {
+            // Always surface registration failures: silent failure here is
+            // what makes the dtrace path feel broken.
+            eprintln!("carrick: failed to register DTrace probes: {err}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::decode_esr_el1;
@@ -1034,20 +1049,5 @@ mod tests {
         let json = decode_esr_el1(0x5a000000);
         assert_eq!(json["ec_hex"], "0x16");
         assert_eq!(json["ec_name"], "HVC instruction (AArch64)");
-    }
-}
-
-fn register_dtrace_probes() {
-    match carrick::probes::register_dtrace_probes() {
-        Ok(()) => {
-            if std::env::var_os("CARRICK_DTRACE_DEBUG").is_some() {
-                eprintln!("carrick: dtrace probes registered (pid={})", std::process::id());
-            }
-        }
-        Err(err) => {
-            // Always surface registration failures: silent failure here is
-            // what makes the dtrace path feel broken.
-            eprintln!("carrick: failed to register DTrace probes: {err}");
-        }
     }
 }

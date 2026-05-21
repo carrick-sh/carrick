@@ -900,7 +900,7 @@ pub fn stage1_identity_page_tables() -> Vec<u8> {
     //   bit 53 = 0   (PXN — EL1 must be able to fetch trampoline/vectors)
     //   bit 54 = 1   (UXN — EL0 must NOT be able to fetch kernel pages)
     const KERNEL_BLOCK_FLAGS: u64 =
-        (1u64 << 54) | (1 << 10) | (0b11 << 8) | (0b00 << 6) | 0b01;
+        ((1u64 << 54) | (1 << 10) | (0b11 << 8)) | 0b01;
 
     // User leaf flags (everywhere else):
     //   AP[2:1] = 0b01 (RW EL1 + EL0)

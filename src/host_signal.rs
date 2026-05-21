@@ -83,6 +83,14 @@ pub fn take_pending() -> i32 {
     PENDING.swap(NO_PENDING_SIGNAL, Ordering::SeqCst)
 }
 
+/// Non-draining peek: is a signal currently pending? Used by a thread parked
+/// in `futex` to decide whether to interrupt its wait so the trap loop can
+/// deliver the signal. Does NOT consume it — `take_pending` (under the kernel
+/// lock) is still the single point of delivery.
+pub fn has_pending() -> bool {
+    PENDING.load(Ordering::SeqCst) != NO_PENDING_SIGNAL
+}
+
 /// Set a pending guest signum from inside the guest itself (e.g. from
 /// `kill(self, SIGINT)`). Lets the runtime's signal-injection path
 /// service synthetic raises the same way it services host SIGINT.

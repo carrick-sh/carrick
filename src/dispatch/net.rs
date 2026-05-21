@@ -319,9 +319,9 @@ impl SyscallDispatcher {
         let mut events_list: Vec<i16> = Vec::new();
         let mut host_map: Vec<Option<i32>> = Vec::new();
         for fd in 0..nfds {
-            let r = read_set.as_ref().map_or(false, |s| fd_set_contains(s, fd));
-            let w = write_set.as_ref().map_or(false, |s| fd_set_contains(s, fd));
-            let e = except_set.as_ref().map_or(false, |s| fd_set_contains(s, fd));
+            let r = read_set.as_ref().is_some_and(|s| fd_set_contains(s, fd));
+            let w = write_set.as_ref().is_some_and(|s| fd_set_contains(s, fd));
+            let e = except_set.as_ref().is_some_and(|s| fd_set_contains(s, fd));
             if !(r || w || e) {
                 continue;
             }
@@ -423,40 +423,34 @@ impl SyscallDispatcher {
 
         // Write back ready bits. Start with fully-cleared sets and only
         // set bits for fds that fired.
-        let mut new_read = read_set.clone().map(|mut s| { for b in &mut s { *b = 0 } s });
-        let mut new_write = write_set.clone().map(|mut s| { for b in &mut s { *b = 0 } s });
-        let mut new_except = except_set.clone().map(|mut s| { for b in &mut s { *b = 0 } s });
+        let mut new_read = read_set.clone().map(|mut s| { s.fill(0); s });
+        let mut new_write = write_set.clone().map(|mut s| { s.fill(0); s });
+        let mut new_except = except_set.clone().map(|mut s| { s.fill(0); s });
         let mut ready = 0i64;
         for ((fd, req_mask), p) in owners.iter().zip(pollfds.iter()) {
             let fd_usize = *fd as usize;
             let revs = p.revents;
             let mut fired = false;
-            if (req_mask & 0x01) != 0 && (revs & (libc::POLLIN | libc::POLLHUP)) != 0 {
-                if let Some(ref mut set) = new_read { fd_set_set(set, fd_usize); fired = true; }
-            }
-            if (req_mask & 0x02) != 0 && (revs & libc::POLLOUT) != 0 {
-                if let Some(ref mut set) = new_write { fd_set_set(set, fd_usize); fired = true; }
-            }
-            if (req_mask & 0x04) != 0 && (revs & (libc::POLLPRI | libc::POLLERR)) != 0 {
-                if let Some(ref mut set) = new_except { fd_set_set(set, fd_usize); fired = true; }
-            }
+            if (req_mask & 0x01) != 0 && (revs & (libc::POLLIN | libc::POLLHUP)) != 0
+                && let Some(ref mut set) = new_read { fd_set_set(set, fd_usize); fired = true; }
+            if (req_mask & 0x02) != 0 && (revs & libc::POLLOUT) != 0
+                && let Some(ref mut set) = new_write { fd_set_set(set, fd_usize); fired = true; }
+            if (req_mask & 0x04) != 0 && (revs & (libc::POLLPRI | libc::POLLERR)) != 0
+                && let Some(ref mut set) = new_except { fd_set_set(set, fd_usize); fired = true; }
             if fired { ready += 1; }
         }
-        if let Some(s) = &new_read {
-            if memory.write_bytes(readfds_addr, s).is_err() {
+        if let Some(s) = &new_read
+            && memory.write_bytes(readfds_addr, s).is_err() {
                 return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
             }
-        }
-        if let Some(s) = &new_write {
-            if memory.write_bytes(writefds_addr, s).is_err() {
+        if let Some(s) = &new_write
+            && memory.write_bytes(writefds_addr, s).is_err() {
                 return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
             }
-        }
-        if let Some(s) = &new_except {
-            if memory.write_bytes(exceptfds_addr, s).is_err() {
+        if let Some(s) = &new_except
+            && memory.write_bytes(exceptfds_addr, s).is_err() {
                 return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
             }
-        }
         Ok(DispatchOutcome::Returned { value: ready })
     }
 
@@ -551,7 +545,7 @@ impl SyscallDispatcher {
                 .zip(host_fds.iter())
                 .map(|(p, hf)| libc::pollfd {
                     fd: *hf,
-                    events: p.events as i16,
+                    events: p.events,
                     revents: 0,
                 })
                 .collect();
@@ -570,7 +564,7 @@ impl SyscallDispatcher {
             let mut ready = 0i64;
             for (i, p) in sys_pollfds.iter().enumerate() {
                 let mut pollfd = fds[i];
-                pollfd.revents = p.revents as i16;
+                pollfd.revents = p.revents;
                 if pollfd.revents != 0 {
                     ready += 1;
                 }
@@ -1088,8 +1082,8 @@ impl SyscallDispatcher {
         // AF_NETLINK bind: read the (optional) sockaddr_nl to pick up the
         // requested pid/groups, then assign a pid (the guest's own pid
         // when the caller passed 0, i.e. "let the kernel choose").
-        if let Some(open_file) = self.io.open_files.get(&fd) {
-            if let OpenDescription::Netlink {
+        if let Some(open_file) = self.io.open_files.get(&fd)
+            && let OpenDescription::Netlink {
                 pid: nl_pid,
                 groups: nl_groups,
                 ..
@@ -1104,7 +1098,6 @@ impl SyscallDispatcher {
                 *nl_groups = req_groups;
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
-        }
         let (host_fd, family) = match self.host_socket_lookup(fd) {
             Ok(t) => t,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
@@ -1126,14 +1119,13 @@ impl SyscallDispatcher {
                 .position(|&b| b == 0)
                 .map(|p| 2 + p)
                 .unwrap_or(host_addr.len());
-            if let Ok(path) = std::str::from_utf8(&host_addr[2..path_end]) {
-                if let Ok(md) = std::fs::symlink_metadata(path) {
+            if let Ok(path) = std::str::from_utf8(&host_addr[2..path_end])
+                && let Ok(md) = std::fs::symlink_metadata(path) {
                     use std::os::unix::fs::FileTypeExt;
                     if md.file_type().is_socket() {
                         let _ = std::fs::remove_file(path);
                     }
                 }
-            }
         }
         let rc = unsafe {
             libc::bind(host_fd, host_addr.as_ptr() as *const _, host_addr.len() as u32)
@@ -1212,8 +1204,8 @@ impl SyscallDispatcher {
         if new_host < 0 {
             return DispatchOutcome::Errno { errno: host_errno() };
         }
-        let nonblock = accept4_flags & LINUX_SOCK_NONBLOCK as i32 != 0;
-        let cloexec = accept4_flags & LINUX_SOCK_CLOEXEC as i32 != 0;
+        let nonblock = accept4_flags & LINUX_SOCK_NONBLOCK != 0;
+        let cloexec = accept4_flags & LINUX_SOCK_CLOEXEC != 0;
         if nonblock {
             unsafe {
                 let flags = libc::fcntl(new_host, libc::F_GETFL);
@@ -1287,8 +1279,8 @@ impl SyscallDispatcher {
         let addrlen_addr = ctx.request.arg(2);
         // AF_NETLINK getsockname: hand back a sockaddr_nl carrying the
         // bound pid/groups (or pid=0 if the socket was never bound).
-        if let Some(open_file) = self.io.open_files.get(&fd) {
-            if let OpenDescription::Netlink { pid, groups, .. } =
+        if let Some(open_file) = self.io.open_files.get(&fd)
+            && let OpenDescription::Netlink { pid, groups, .. } =
                 &*open_file.description.borrow()
             {
                 let nl = sockaddr_nl_bytes(*pid, *groups);
@@ -1297,7 +1289,6 @@ impl SyscallDispatcher {
                 }
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
-        }
         let (host_fd, family) = match self.host_socket_lookup(fd) {
             Ok(t) => t,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
@@ -1424,12 +1415,11 @@ impl SyscallDispatcher {
         // (if requested) is the kernel: sockaddr_nl with pid=0.
         if self.fd_is_netlink(fd) {
             let drained = self.netlink_recv(fd, buf_addr, len, memory);
-            if let DispatchOutcome::Returned { .. } = drained {
-                if src_addr != 0 && src_len_addr != 0 {
+            if let DispatchOutcome::Returned { .. } = drained
+                && src_addr != 0 && src_len_addr != 0 {
                     let nl = sockaddr_nl_bytes(0, 0);
                     let _ = write_linux_sockaddr(memory, src_addr, src_len_addr, &nl);
                 }
-            }
             return Ok(drained);
         }
         let (host_fd, family) = match self.host_socket_lookup(fd) {
@@ -1593,11 +1583,10 @@ impl SyscallDispatcher {
             return Ok(DispatchOutcome::Errno { errno: host_errno() });
         }
         let used = (optlen as usize).min(buf.len());
-        if optval_addr != 0 && used > 0 {
-            if memory.write_bytes(optval_addr, &buf[..used]).is_err() {
+        if optval_addr != 0 && used > 0
+            && memory.write_bytes(optval_addr, &buf[..used]).is_err() {
                 return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
             }
-        }
         if memory.write_bytes(optlen_addr, &optlen.to_ne_bytes()).is_err() {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
         }
@@ -1801,11 +1790,10 @@ impl SyscallDispatcher {
             // Write up to msg.namelen, then update the namelen field
             // inside the msghdr.
             let write_len = (linux_bytes.len() as u32).min(msg.namelen);
-            if write_len > 0 {
-                if memory.write_bytes(msg.name, &linux_bytes[..write_len as usize]).is_err() {
+            if write_len > 0
+                && memory.write_bytes(msg.name, &linux_bytes[..write_len as usize]).is_err() {
                     return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
                 }
-            }
             // namelen lives at offset 8 (after the 8-byte name pointer).
             if memory
                 .write_bytes(msg_addr + 8, &(linux_bytes.len() as u32).to_ne_bytes())
@@ -1930,7 +1918,7 @@ impl SyscallDispatcher {
             // After the first successful recvmsg, switch to non-blocking
             // so we drain whatever else is in the queue without waiting.
             let entry_flags = if received > 0 {
-                flags | (libc::MSG_DONTWAIT as i32)
+                flags | libc::MSG_DONTWAIT
             } else {
                 flags
             };
@@ -2110,7 +2098,7 @@ fn push_rtattr(buf: &mut Vec<u8>, rta_type: u16, payload: &[u8]) {
     let hdr = LinuxRtAttr { rta_len, rta_type };
     buf.extend_from_slice(hdr.as_bytes());
     buf.extend_from_slice(payload);
-    while buf.len() % NLMSG_ALIGNTO != 0 {
+    while !buf.len().is_multiple_of(NLMSG_ALIGNTO) {
         buf.push(0);
     }
 }
@@ -2130,7 +2118,7 @@ fn push_nlmsg(out: &mut Vec<u8>, nlmsg_type: u16, seq: u32, pid: u32, payload: &
     };
     out.extend_from_slice(hdr.as_bytes());
     out.extend_from_slice(payload);
-    while out.len() % NLMSG_ALIGNTO != 0 {
+    while !out.len().is_multiple_of(NLMSG_ALIGNTO) {
         out.push(0);
     }
 }
@@ -2146,6 +2134,7 @@ fn push_nlmsg_done(out: &mut Vec<u8>, seq: u32, pid: u32) {
 ///   - RTM_GETLINK  -> one RTM_NEWLINK for `lo`, then NLMSG_DONE
 ///   - RTM_GETADDR  -> one RTM_NEWADDR for `lo` (127.0.0.1/8), then NLMSG_DONE
 ///   - anything else -> a bare NLMSG_DONE (the dump is "empty")
+///
 /// All replies are NLM_F_MULTI dumps terminated by NLMSG_DONE, which is
 /// what glibc's __check_pf and `ip` expect.
 fn build_netlink_reply(request: &[u8], pid: u32) -> Vec<u8> {

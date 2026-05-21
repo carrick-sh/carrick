@@ -129,7 +129,7 @@ impl SyscallDispatcher {
         let which = ctx.arg(0);
         let who = ctx.arg(1) as i32;
         let prio = ctx.arg(2) as i32;
-        if which > LINUX_PRIO_USER || prio < -20 || prio > 19 {
+        if which > LINUX_PRIO_USER || !(-20..=19).contains(&prio) {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
             });
@@ -387,7 +387,7 @@ fn read_capability_data(
 }
 
 fn capability_data_bytes(data: &[LinuxCapabilityData]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(data.len() * core::mem::size_of::<LinuxCapabilityData>());
+    let mut bytes = Vec::with_capacity(std::mem::size_of_val(data));
     for word in data {
         bytes.extend_from_slice(word.as_bytes());
     }

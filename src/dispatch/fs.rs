@@ -1346,11 +1346,10 @@ impl SyscallDispatcher {
             Some(OverlayEntry::Deleted) | Some(OverlayEntry::File(_)) => return false,
             None => {}
         }
-        if let Some(rootfs) = &self.fs.rootfs_vfs.rootfs {
-            if let Ok(metadata) = rootfs.metadata(path) {
+        if let Some(rootfs) = &self.fs.rootfs_vfs.rootfs
+            && let Ok(metadata) = rootfs.metadata(path) {
                 return metadata.kind == RootFsEntryKind::Directory;
             }
-        }
         false
     }
 
@@ -2073,7 +2072,7 @@ impl SyscallDispatcher {
                 errno: LINUX_EINVAL,
             });
         }
-        let bytes = match (&*ctx.memory).read_bytes(address, length) {
+        let bytes = match (*ctx.memory).read_bytes(address, length) {
             Ok(b) => b,
             Err(_) => return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT }),
         };
@@ -2898,7 +2897,7 @@ impl SyscallDispatcher {
         let address = ctx.arg(1);
         let length = usize::try_from(ctx.arg(2))
             .map_err(|_| DispatchError::LengthTooLarge(ctx.arg(2)))?;
-        let bytes = match (&*ctx.memory).read_bytes(address, length) {
+        let bytes = match (*ctx.memory).read_bytes(address, length) {
             Ok(bytes) => bytes,
             Err(_) => {
                 return Ok(DispatchOutcome::Errno {
@@ -3792,6 +3791,7 @@ impl SyscallDispatcher {
         // `times == NULL` means "set both to now"; otherwise read the two
         // timespecs and resolve UTIME_NOW/UTIME_OMIT into concrete
         // (sec, nsec) pairs or `None` (omit) for the backend.
+        #[allow(clippy::type_complexity)]
         let (atime_set, mtime_set): (Option<(i64, i64)>, Option<(i64, i64)>);
         if times != 0 {
             let atime = match read_timespec(memory, times) {
