@@ -836,6 +836,15 @@ impl SyscallDispatcher {
         self.fs.rootfs_vfs.rootfs = None;
     }
 
+    /// Set the executable path recorded in `/proc/self/cmdline`,
+    /// `/proc/self/comm`, and `/proc/self/status`. Used when a
+    /// dispatcher is constructed via `SyscallDispatcher::new()` without
+    /// a rootfs (the `--fs host` streaming path) so that `/proc` reads
+    /// reflect the correct binary name.
+    pub fn set_executable_path(&mut self, path: impl Into<String>) {
+        self.proc.executable_path = path.into();
+    }
+
     /// Name of the currently-installed backend (for logging / debug).
     pub fn fs_backend_name(&self) -> &'static str {
         self.fs.rootfs_vfs.overlay.name()

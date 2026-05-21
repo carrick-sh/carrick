@@ -9,7 +9,8 @@ use carrick::memory::AddressSpace;
 use carrick::oci::{ImageReference, ImageStore, pull_image};
 use carrick::rootfs::RootFs;
 use carrick::runtime::{
-    DEFAULT_MAX_TRAPS, DebugStateSnapshot, run_rootfs_elf_with_hvf_args_and_dispatcher_debug,
+    DEFAULT_MAX_TRAPS, DebugStateSnapshot, run_elf_from_dispatcher_debug,
+    run_rootfs_elf_with_hvf_args_and_dispatcher_debug,
     run_static_elf_with_hvf_args_and_dispatcher_debug,
 };
 use carrick::syscall::{aarch64_table, lookup_aarch64};
@@ -409,8 +410,6 @@ fn main() -> anyhow::Result<()> {
                 .iter()
                 .map(|layer| layer.path.clone())
                 .collect();
-            let rootfs = RootFs::from_layer_paths(&rootfs_layers)
-                .context("failed to compose image rootfs layers")?;
             let executable_path = &command[0];
             // Name the host process `carrick: <basename>` up front so
             // it's identifiable in ps/Activity Monitor even before the
@@ -422,21 +421,17 @@ fn main() -> anyhow::Result<()> {
                     .unwrap_or(executable_path);
                 carrick::dispatch::set_host_process_name(base.as_bytes());
             }
-            let mut dispatcher = SyscallDispatcher::with_rootfs_and_executable(
-                rootfs.clone(),
-                executable_path.clone(),
-            );
-            install_fs_backend(&mut dispatcher, fs)?;
-            if raw {
-                // Stream guest fd 1/2 straight to host fds 1/2 so
-                // interactive prompts (`/ # `, ANSI cursor queries) reach
-                // the user's terminal before the guest exits.
-                dispatcher.set_stream_stdio(true);
-            }
-            // Provide a sane default Linux env. Without PATH glibc-based
-            // tools like dpkg-query bail with "PATH is not set" and apt's
-            // pre-fork helpers (apt-config, dpkg-query) can't locate their
-            // siblings.
+
+            // Resolve --fs (or the default) early so we can branch before
+            // touching the in-memory rootfs. For --fs host we stream layers
+            // straight onto the cap-std scratch Dir; for --fs memory we keep
+            // the original in-memory RootFs path.
+            let fs_kind = fs.unwrap_or_else(default_fs_backend_kind);
+
+            // Standard Linux environment provided to every guest run.
+            // Without PATH glibc-based tools like dpkg-query bail with
+            // "PATH is not set" and apt's pre-fork helpers can't locate
+            // their siblings.
             let env: Vec<String> = vec![
                 "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_owned(),
                 "HOME=/root".to_owned(),
@@ -446,22 +441,71 @@ fn main() -> anyhow::Result<()> {
                 "DEBIAN_FRONTEND=noninteractive".to_owned(),
                 "PAGER=cat".to_owned(),
             ];
-            let result = run_rootfs_elf_with_hvf_args_and_dispatcher_debug(
-                executable_path.as_str(),
-                &rootfs,
-                dispatcher,
-                command.clone(),
-                env,
-                max_traps,
-                debug_state_path.as_ref(),
-            )
-            .with_context(|| {
-                format!(
-                    "failed to run ELF {} from image {}",
-                    executable_path,
-                    image.canonical()
-                )
-            })?;
+
+            let result = match fs_kind {
+                FsBackendKind::Host => {
+                    // Stream every OCI layer straight onto the cap-std scratch
+                    // Dir.  No in-memory RootFs is built: the disk overlay is
+                    // immediately authoritative for all fs syscalls AND for the
+                    // initial ELF load (via read_exec_file / overlay-first).
+                    let mut host = HostFsBackend::new()
+                        .context("--fs host: failed to create scratch directory")?;
+                    host.extract_layers(&rootfs_layers)
+                        .context("--fs host: failed to stream OCI layers to scratch Dir")?;
+                    let mut dispatcher = SyscallDispatcher::new();
+                    dispatcher.set_executable_path(executable_path.clone());
+                    seed_known_hosts(&mut host);
+                    let _ = dispatcher.set_fs_backend(Box::new(host));
+                    if raw {
+                        dispatcher.set_stream_stdio(true);
+                    }
+                    run_elf_from_dispatcher_debug(
+                        executable_path.as_str(),
+                        dispatcher,
+                        command.clone(),
+                        env,
+                        max_traps,
+                        debug_state_path.as_ref(),
+                    )
+                    .with_context(|| {
+                        format!(
+                            "failed to run ELF {} from image {} (--fs host)",
+                            executable_path,
+                            image.canonical()
+                        )
+                    })?
+                }
+                FsBackendKind::Memory => {
+                    // Classic in-memory path: unchanged behaviour.
+                    let rootfs = RootFs::from_layer_paths(&rootfs_layers)
+                        .context("failed to compose image rootfs layers")?;
+                    let mut dispatcher = SyscallDispatcher::with_rootfs_and_executable(
+                        rootfs.clone(),
+                        executable_path.clone(),
+                    );
+                    install_fs_backend(&mut dispatcher, Some(FsBackendKind::Memory))?;
+                    if raw {
+                        dispatcher.set_stream_stdio(true);
+                    }
+                    run_rootfs_elf_with_hvf_args_and_dispatcher_debug(
+                        executable_path.as_str(),
+                        &rootfs,
+                        dispatcher,
+                        command.clone(),
+                        env,
+                        max_traps,
+                        debug_state_path.as_ref(),
+                    )
+                    .with_context(|| {
+                        format!(
+                            "failed to run ELF {} from image {} (--fs memory)",
+                            executable_path,
+                            image.canonical()
+                        )
+                    })?
+                }
+            };
+
             if raw {
                 emit_raw(&result);
                 std::process::exit(if result.trap_limit_hit {
