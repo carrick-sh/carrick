@@ -77,6 +77,17 @@ mod carrick_usdt {
     /// (0 on success). Lets `carrick trace` see WHY a host-backed fs
     /// syscall returned an errno — the internal reason invisible to the guest.
     fn fs__op(_: u32, _: &str, _: &str, _: i32) {}
+    /// Fires when a guest signal handler frame is injected. `signum` is the
+    /// Linux signal, `saved_pc` the pre-signal PC stored in the sigframe (the
+    /// PC the eventual rt_sigreturn must restore), `new_sp` the SP_EL0 the
+    /// frame was written at, `handler` the guest handler entry. Lets a trace
+    /// see exactly what state is captured for later restore.
+    fn signal__inject(_: i32, _: u64, _: u64, _: u64) {}
+    /// Fires inside rt_sigreturn/restore. `saved_pc` is the PC about to be
+    /// restored into ELR_EL1, `sp` the SP_EL0 the frame was read from,
+    /// `magic` the frame magic read back. A corrupted `saved_pc` or `magic`
+    /// here pinpoints sigframe corruption (the "PROT_REA" wild-PC crash).
+    fn signal__restore(_: u64, _: u64, _: u64) {}
 }
 
 pub fn fork_pre(pc: u64, elr: u64, cpsr: u64) {
@@ -131,6 +142,14 @@ pub fn host_pipe_io(host_fd: i32, dir: i32, n: i64) {
 
 pub fn fork_post(pid: i32, pc: u64, elr: u64) {
     carrick_usdt::fork__post!(|| (pid, pc, elr));
+}
+
+pub fn signal_inject(signum: i32, saved_pc: u64, new_sp: u64, handler: u64) {
+    carrick_usdt::signal__inject!(|| (signum, saved_pc, new_sp, handler));
+}
+
+pub fn signal_restore(saved_pc: u64, sp: u64, magic: u64) {
+    carrick_usdt::signal__restore!(|| (saved_pc, sp, magic));
 }
 
 // `#[inline(never)]`: usdt embeds the probe site (an asm! anchor) in
