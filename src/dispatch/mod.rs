@@ -173,17 +173,35 @@ pub enum DispatchOutcome {
     /// completion would. There is no retval to write into x0; the
     /// restored x0 IS the return value.
     SigReturn,
+    /// Thread-creating `clone(2)`/`clone3(2)` (CLONE_VM|CLONE_THREAD|...).
+    /// The runtime spawns a new host thread + vCPU sharing this process's VM.
+    CloneThread {
+        stack: u64,           // child SP (clone arg)
+        tls: u64,             // CLONE_SETTLS value -> TPIDR_EL0 (0 = none)
+        flags: u64,
+        parent_tid_addr: u64, // CLONE_PARENT_SETTID target (0 = none)
+        child_tid_addr: u64,  // CLONE_CHILD_SETTID/CLEARTID target (0 = none)
+    },
+    /// A single thread exited via `exit(2)` (NOT exit_group): the runtime
+    /// performs the CLONE_CHILD_CLEARTID futex wake and ends just this host
+    /// thread. If it was the last live thread the process exits.
+    ThreadExit { code: i32 },
 }
 
 impl DispatchOutcome {
     fn retval_errno(&self) -> (i64, Option<i32>) {
-        match *self {
-            DispatchOutcome::Returned { value } => (value, None),
-            DispatchOutcome::Errno { errno } => (-(errno as i64), Some(errno)),
-            DispatchOutcome::Exit { code } => (code as i64, None),
+        match self {
+            DispatchOutcome::Returned { value } => (*value, None),
+            DispatchOutcome::Errno { errno } => (-(*errno as i64), Some(*errno)),
+            DispatchOutcome::Exit { code } => (*code as i64, None),
             DispatchOutcome::Fork => (0, None),
             DispatchOutcome::Execve { .. } => (0, None),
             DispatchOutcome::SigReturn => (0, None),
+            // CloneThread and ThreadExit are handled specially by the runtime
+            // and never flow through retval_errno — the runtime acts on them
+            // directly before any x0 write.
+            DispatchOutcome::CloneThread { .. } => (0, None),
+            DispatchOutcome::ThreadExit { .. } => (0, None),
         }
     }
 }
