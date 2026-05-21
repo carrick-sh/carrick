@@ -3791,6 +3791,7 @@ impl SyscallDispatcher {
         // `times == NULL` means "set both to now"; otherwise read the two
         // timespecs and resolve UTIME_NOW/UTIME_OMIT into concrete
         // (sec, nsec) pairs or `None` (omit) for the backend.
+        #[allow(clippy::type_complexity)]
         let (atime_set, mtime_set): (Option<(i64, i64)>, Option<(i64, i64)>);
         if times != 0 {
             let atime = match read_timespec(memory, times) {
