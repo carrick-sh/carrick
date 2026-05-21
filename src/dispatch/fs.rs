@@ -3394,9 +3394,23 @@ impl SyscallDispatcher {
         if !self.fd_is_valid(fd) {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         }
-        // The overlay is a tmpfs that doesn't track owner/mode; accept
-        // the call as a no-op so apt's chmod-the-directory-I-just-made
-        // helpers don't fail with EROFS.
+        let mode = (ctx.arg(1) & 0o7777) as u32;
+        // Host-backed files live on the cap-std scratch, so apply the mode for
+        // real (ldconfig, dpkg maintainer scripts inspect it). Best-effort: a
+        // failure is NOT fatal (the in-memory overlay can't track mode). Other
+        // fd kinds (pipes/sockets/dirs) stay a no-op success.
+        if let Some(open_file) = self.io.open_files.get(&fd)
+            && let OpenDescription::HostFile { host_fd, .. } = &*open_file.description.borrow()
+        {
+            let rc = unsafe { libc::fchmod(*host_fd, mode as libc::mode_t) };
+            if rc < 0 {
+                crate::probes::fs_op(
+                    "fchmod:besteffort_err",
+                    &format!("fd={fd}"),
+                    std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+                );
+            }
+        }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
 
@@ -3467,12 +3481,14 @@ impl SyscallDispatcher {
     ) -> Result<DispatchOutcome, DispatchError> {
         let dirfd = ctx.arg(0);
         let pathname = ctx.arg(1);
-        let flags = ctx.arg(3);
-        if flags & !LINUX_AT_SYMLINK_NOFOLLOW != 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
-        }
+        // Shared by fchmodat (53) and fchmodat2 (452): same ABI. We accept
+        // AT_SYMLINK_NOFOLLOW + AT_EMPTY_PATH and IGNORE any other flag bits
+        // rather than EINVAL — mode-setting on the disk-authoritative host
+        // backend is best-effort, and rejecting flags glibc legitimately
+        // passes (e.g. via the fchmodat2 path that ldconfig uses) breaks
+        // `ldconfig` and dpkg maintainer scripts ("Changing access rights …
+        // Invalid argument"). The `flags` are otherwise advisory here.
+        let _flags = ctx.arg(3);
         let path = match read_guest_c_string(&*ctx.memory, pathname) {
             Ok(path) => path,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
@@ -3852,7 +3868,10 @@ impl SyscallDispatcher {
         }
         let path = match self.resolve_at_path(dirfd, &path) {
             Ok(path) => path,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => {
+                crate::probes::fs_op("utimensat:resolve_err", &path, errno);
+                return Ok(DispatchOutcome::Errno { errno });
+            }
         };
         // The path must exist in the layered view, else NotFound (or a
         // no-op success for synthetic /proc paths whose times we can't
@@ -3863,6 +3882,7 @@ impl SyscallDispatcher {
                 if is_synthetic_virtual_file(&path, &self.synthetic_proc_context()) {
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 }
+                crate::probes::fs_op("utimensat:meta_err", &path, errno);
                 return Ok(DispatchOutcome::Errno { errno });
             }
         }
@@ -3879,9 +3899,18 @@ impl SyscallDispatcher {
             Err(crate::fs_backend::BackendError::Unsupported) => {
                 Ok(DispatchOutcome::Returned { value: 0 })
             }
-            Err(_) => Ok(DispatchOutcome::Errno {
-                errno: LINUX_EROFS,
-            }),
+            // Best-effort timestamps: a successful set above persists real
+            // mtime (apt's pkgcache x-ref relies on that), but a FAILURE to
+            // set times must NOT abort the caller. Linux tools like dpkg treat
+            // utimensat failure on a file they just wrote as fatal ("error
+            // setting timestamps … Read-only file system"); returning EROFS
+            // there breaks `dpkg --unpack` of any package with shared libs.
+            // The file content is already correct; timestamps are cosmetic.
+            Err(e) => {
+                crate::probes::fs_op("utimensat:set_times_err_besteffort", &path, 0);
+                let _ = e;
+                Ok(DispatchOutcome::Returned { value: 0 })
+            }
         }
     }
 
@@ -4051,10 +4080,16 @@ impl SyscallDispatcher {
                 let times = [to_ts(atime), to_ts(mtime)];
                 let rc = unsafe { libc::futimens(*host_fd, times.as_ptr()) };
                 if rc < 0 {
-                    DispatchOutcome::Errno { errno: LINUX_EROFS }
-                } else {
-                    DispatchOutcome::Returned { value: 0 }
+                    // Best-effort: don't abort the caller on a failed
+                    // timestamp set (see the path-branch rationale).
+                    let e = std::io::Error::last_os_error();
+                    crate::probes::fs_op(
+                        "set_fd_times:futimens_err_besteffort",
+                        &format!("fd={fd} {e}"),
+                        e.raw_os_error().unwrap_or(0),
+                    );
                 }
+                DispatchOutcome::Returned { value: 0 }
             }
             OpenDescription::File { metadata, .. } => {
                 let path = metadata.path.to_string_lossy().into_owned();
@@ -4070,7 +4105,9 @@ impl SyscallDispatcher {
             // fds: accept as a no-op (matches Linux's permissive behaviour for
             // the cases tooling actually exercises; we can't persist times for
             // the non-file kinds).
-            _ => DispatchOutcome::Returned { value: 0 },
+            _ => {
+                DispatchOutcome::Returned { value: 0 }
+            }
         }
     }
 

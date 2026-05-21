@@ -533,7 +533,6 @@ pub struct HostFsBackend {
     /// orphaned scratch directories left behind by crashed runs.
     /// Held for the lifetime of the backend.
     _lock: Option<fd_lock::RwLock<std::fs::File>>,
-    tombstones: HashSet<PathBuf>,
     /// PID of the process that created this backend (and thus owns the
     /// `TempDir` lifetime). carrick forks real processes for guest
     /// `clone(2)`; every forked child inherits this struct via COW and
@@ -564,7 +563,6 @@ impl Drop for HostFsBackend {
 impl std::fmt::Debug for HostFsBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HostFsBackend")
-            .field("tombstones", &self.tombstones.len())
             .finish()
     }
 }
@@ -593,7 +591,6 @@ impl HostFsBackend {
             dir,
             _scratch: Some(scratch),
             _lock: Some(lock),
-            tombstones: HashSet::new(),
             owner_pid: unsafe { libc::getpid() as u32 },
         })
     }
@@ -633,7 +630,6 @@ impl HostFsBackend {
             dir,
             _scratch: None,
             _lock: None,
-            tombstones: HashSet::new(),
             owner_pid: unsafe { libc::getpid() as u32 },
         }
     }
@@ -669,9 +665,6 @@ impl FsBackend for HostFsBackend {
             // The sandbox root is always a directory.
             return Some(OverlayEntry::Dir);
         }
-        if self.tombstones.contains(&normalized) {
-            return Some(OverlayEntry::Deleted);
-        }
         let rel = Self::rel_path(&normalized)?;
         let meta = self.dir.symlink_metadata(rel).ok()?;
         // After seed_from_rootfs the whole rootfs lives on disk under
@@ -704,9 +697,6 @@ impl FsBackend for HostFsBackend {
         let normalized = normalize(path)?;
         if normalized.as_os_str().is_empty() {
             return Some(OverlayEntryKind::Dir);
-        }
-        if self.tombstones.contains(&normalized) {
-            return Some(OverlayEntryKind::Deleted);
         }
         let rel = Self::rel_path(&normalized)?;
         let meta = self.dir.symlink_metadata(rel).ok()?;
@@ -800,7 +790,6 @@ impl FsBackend for HostFsBackend {
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(_) => return Err(BackendError::Io),
         }
-        self.tombstones.remove(&normalized);
         Ok(())
     }
 
@@ -818,7 +807,6 @@ impl FsBackend for HostFsBackend {
         self.dir
             .open_with(rel, &opts)
             .map_err(|_| BackendError::Io)?;
-        self.tombstones.remove(&normalized);
         Ok(())
     }
 
@@ -843,7 +831,6 @@ impl FsBackend for HostFsBackend {
             .map_err(|_| BackendError::Io)?;
         file.seek(SeekFrom::Start(0)).map_err(|_| BackendError::Io)?;
         file.write_all(&contents).map_err(|_| BackendError::Io)?;
-        self.tombstones.remove(&normalized);
         Ok(())
     }
 
@@ -867,7 +854,6 @@ impl FsBackend for HostFsBackend {
             let _ = self.dir.remove_file(rel);
             let _ = self.dir.remove_dir(rel);
         }
-        self.tombstones.insert(normalized);
         Ok(())
     }
 
@@ -902,13 +888,10 @@ impl FsBackend for HostFsBackend {
     }
 
     fn deleted_child_names(&self, dir: &str) -> Vec<String> {
-        let Some(prefix) = normalize(dir) else {
-            return Vec::new();
-        };
-        self.tombstones
-            .iter()
-            .filter_map(|path| child_name(&prefix, path))
-            .collect()
+        let _ = dir;
+        // Host backend is disk-authoritative: deletions are real unlinks,
+        // so there are no tombstoned children to surface.
+        Vec::new()
     }
 
     fn rename_overlay_entry(
@@ -935,8 +918,6 @@ impl FsBackend for HostFsBackend {
         self.dir
             .rename(&src_rel, &self.dir, &dst_rel)
             .map_err(|_| BackendError::Io)?;
-        self.tombstones.remove(&dst);
-        self.tombstones.insert(src);
         Ok(true)
     }
 
@@ -951,9 +932,6 @@ impl FsBackend for HostFsBackend {
         let normalized = normalize(path)?;
         // A tombstoned path is "deleted" in the layered view; don't
         // resurrect it via a raw open.
-        if self.tombstones.contains(&normalized) {
-            return None;
-        }
         let rel = Self::rel_path(&normalized)?;
         if create
             && let Some(parent) = rel.parent()
@@ -981,7 +959,6 @@ impl FsBackend for HostFsBackend {
             && !parent.as_os_str().is_empty() {
                 self.dir.create_dir_all(parent).map_err(|_| BackendError::Io)?;
             }
-        self.tombstones.remove(&normalized);
         // symlink_contents stores `target` verbatim (it may be absolute or
         // dangling), which is the Linux symlinkat(2) semantic.
         self.dir
@@ -998,7 +975,6 @@ impl FsBackend for HostFsBackend {
             && !parent.as_os_str().is_empty() {
                 self.dir.create_dir_all(parent).map_err(|_| BackendError::Io)?;
             }
-        self.tombstones.remove(&dst_norm);
         self.dir
             .hard_link(&src_rel, &self.dir, &dst_rel)
             .map_err(|_| BackendError::Io)
@@ -1020,16 +996,19 @@ impl FsBackend for HostFsBackend {
         atime: Option<(i64, i64)>,
         mtime: Option<(i64, i64)>,
     ) -> Result<(), BackendError> {
-        let normalized = normalize(path).ok_or(BackendError::Invalid)?;
-        if self.tombstones.contains(&normalized) {
-            return Err(BackendError::Invalid);
-        }
+        let _normalized = normalize(path).ok_or(BackendError::Invalid)?;
         // Open a real kernel fd for the materialised file and drive
         // `futimens(2)` directly. cap-std has no set-times API, but the
         // whole rootfs lives on the cap-std scratch, so a raw fd lets us
         // persist atime/mtime where a later stat (which reads real disk
         // metadata via real_stat) will see them.
-        let host_fd = self.open_raw_fd(path, false, false, false).ok_or(BackendError::Io)?;
+        let host_fd = match self.open_raw_fd(path, true, false, false) {
+            Some(fd) => fd,
+            None => {
+                crate::probes::fs_op("set_times:open_none", path, 30);
+                return Err(BackendError::Io);
+            }
+        };
         // `None` (UTIME_OMIT) leaves the component untouched.
         let to_ts = |t: Option<(i64, i64)>| match t {
             Some((sec, nsec)) => libc::timespec {
@@ -1043,16 +1022,18 @@ impl FsBackend for HostFsBackend {
         };
         let times = [to_ts(atime), to_ts(mtime)];
         let rc = unsafe { libc::futimens(host_fd, times.as_ptr()) };
-        let err = if rc < 0 { Err(BackendError::Io) } else { Ok(()) };
+        let err = if rc < 0 {
+            crate::probes::fs_op("set_times:futimens_err", path, 30);
+            Err(BackendError::Io)
+        } else {
+            Ok(())
+        };
         unsafe { libc::close(host_fd) };
         err
     }
 
     fn allocate(&mut self, path: &str, size: u64) -> Result<(), BackendError> {
-        let normalized = normalize(path).ok_or(BackendError::Invalid)?;
-        if self.tombstones.contains(&normalized) {
-            return Err(BackendError::Invalid);
-        }
+        let _normalized = normalize(path).ok_or(BackendError::Invalid)?;
         // mode-0 fallocate only ever grows the file. Open the real fd and
         // `ftruncate` up to `size` if the file is currently smaller; never
         // shrink (posix_fallocate semantics).
@@ -1233,9 +1214,6 @@ impl FsBackend for HostFsBackend {
     fn real_stat(&self, path: &str, follow: bool) -> Option<RealStat> {
         use cap_std::fs::MetadataExt;
         let mut normalized = normalize(path)?;
-        if self.tombstones.contains(&normalized) {
-            return None;
-        }
         // lstat (`follow == false`) reports the link itself; stat
         // (`follow == true`) reports the target. We follow symlinks
         // MANUALLY rather than via cap-std's `metadata`, because cap-std
@@ -1264,9 +1242,6 @@ impl FsBackend for HostFsBackend {
                     let parent = normalized.parent().unwrap_or_else(|| Path::new(""));
                     normalize(&parent.join(&target).to_string_lossy())?
                 };
-                if self.tombstones.contains(&normalized) {
-                    return None;
-                }
             }
         } else {
             let rel = Self::rel_path(&normalized)?;
@@ -1496,9 +1471,11 @@ mod tests {
         // dispatcher does this in `unlinkat` for files that live in
         // the rootfs.
         b.mark_deleted("/etc/motd").unwrap();
-        assert!(b.is_deleted("/etc/motd"));
-        let entry = b.lookup("/etc/motd");
-        assert!(matches!(entry, Some(OverlayEntry::Deleted)));
+        // Backend-agnostic observable: the path is no longer a readable file.
+        // MemoryBackend records a tombstone (lookup -> Deleted); the
+        // disk-authoritative HostFsBackend really removes it (lookup -> None).
+        assert!(b.file_contents("/etc/motd").is_none());
+        assert!(!matches!(b.lookup("/etc/motd"), Some(OverlayEntry::File(_))));
     }
 
     fn scenario_rename_overlay_file<B: FsBackend>(b: &mut B) {
@@ -1510,8 +1487,9 @@ mod tests {
             b.file_contents("/tmp/dst").as_deref(),
             Some(&b"hello"[..])
         );
-        // Source is tombstoned now.
-        assert!(b.is_deleted("/tmp/src"));
+        // Source no longer readable: MemoryBackend tombstones it, the
+        // disk-authoritative HostFsBackend really renamed it away.
+        assert!(b.file_contents("/tmp/src").is_none());
     }
 
     fn scenario_child_names_only_immediate<B: FsBackend>(b: &mut B) {

@@ -70,6 +70,13 @@ mod carrick_usdt {
     /// byte count (negative on error). Used to trace whether a forked
     /// child's stdout actually reaches the parent's pipe read.
     fn host__pipe__io(_: u32, _: i32, _: i32, _: i64) {}
+    /// Fires on a filesystem-backend decision/outcome. `op` names the
+    /// operation + result (e.g. "set_times:ok", "set_times:open_none",
+    /// "set_times:futimens_err", "unlink", "rename"), `path` is the
+    /// resolved guest path, `errno` is the Linux errno carrick returns
+    /// (0 on success). Lets `carrick trace` see WHY a host-backed fs
+    /// syscall returned an errno — the internal reason invisible to the guest.
+    fn fs__op(_: u32, _: &str, _: &str, _: i32) {}
 }
 
 pub fn fork_pre(pc: u64, elr: u64, cpsr: u64) {
@@ -105,6 +112,10 @@ pub fn execve_argv(path: &str, argv: &[String]) {
         path,
         joined.as_str()
     ));
+}
+
+pub fn fs_op(op: &str, path: &str, errno: i32) {
+    carrick_usdt::fs__op!(|| (libc::getpid() as u32, op, path, errno));
 }
 
 pub fn host_pipe_io(host_fd: i32, dir: i32, n: i64) {
