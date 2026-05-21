@@ -432,7 +432,7 @@ impl SyscallDispatcher {
                 libc::close(host_write);
             }
             return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
+                errno: linux_errno::EMFILE,
             });
         };
         let Some(write_fd) = self.allocate_fd(read_fd.saturating_add(1)) else {
@@ -441,7 +441,7 @@ impl SyscallDispatcher {
                 libc::close(host_write);
             }
             return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
+                errno: linux_errno::EMFILE,
             });
         };
         let pair = LinuxFdPair { read_fd, write_fd };
@@ -1467,7 +1467,7 @@ impl SyscallDispatcher {
 
         let Some(fd) = self.allocate_fd(3) else {
             return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
+                errno: linux_errno::EMFILE,
             });
         };
         self.insert_open_file(
@@ -1598,7 +1598,7 @@ impl SyscallDispatcher {
         };
         let Some(new_fd) = self.allocate_fd(min_fd) else {
             return DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
+                errno: linux_errno::EMFILE,
             };
         };
         retain_open_file(&description);
@@ -1713,9 +1713,17 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn allocate_fd(&mut self, min_fd: i32) -> Option<i32> {
+        // Cap at the soft RLIMIT_NOFILE (1024, matching getrlimit/prlimit and
+        // /proc/self/limits): descriptors run 0..1024, so the first free slot
+        // at or above the limit means the table is full. `None` => the caller
+        // returns EMFILE, matching Linux fd exhaustion.
+        const RLIMIT_NOFILE_CUR: i32 = 1024;
         let mut fd = min_fd.max(3);
         while self.io.open_files.contains_key(&fd) {
             fd = fd.checked_add(1)?;
+        }
+        if fd >= RLIMIT_NOFILE_CUR {
+            return None;
         }
         self.io.next_fd = self.io.next_fd.max(fd.saturating_add(1));
         Some(fd)
@@ -1731,7 +1739,7 @@ impl SyscallDispatcher {
     pub(super) fn install_fd(&mut self, description: OpenDescription, fd_flags: u64) -> DispatchOutcome {
         let Some(fd) = self.allocate_fd(3) else {
             return DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
+                errno: linux_errno::EMFILE,
             };
         };
         self.insert_open_file(
