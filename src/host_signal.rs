@@ -22,9 +22,53 @@
 //! command", not "perfectly faithful POSIX signal queueing". One slot
 //! is enough for that.
 
-use std::sync::atomic::{AtomicI32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU64, Ordering};
 
 use crate::linux_abi::LINUX_SIGINT;
+
+/// `(linux_signum, host_signum)` pairs that DIFFER between Linux and macOS.
+/// Signals not listed (HUP/INT/QUIT/ILL/TRAP/ABRT/FPE/KILL/SEGV/PIPE/ALRM/
+/// TERM/TTIN/TTOU/XCPU/XFSZ/VTALRM/PROF/WINCH) share the same number on both
+/// and translate as identity. Cross-process signals must be translated on the
+/// send side (`libc::kill`), the receive side (host handler -> guest), and in
+/// the `wait4` status, or e.g. a guest SIGUSR1 (10) would be sent to macOS as
+/// signal 10 (SIGBUS).
+const SIGNUM_XLATE: &[(i32, i32)] = &[
+    (7, 10),  // SIGBUS
+    (10, 30), // SIGUSR1
+    (12, 31), // SIGUSR2
+    (17, 20), // SIGCHLD
+    (18, 19), // SIGCONT
+    (19, 17), // SIGSTOP
+    (20, 18), // SIGTSTP
+    (23, 16), // SIGURG
+    (29, 23), // SIGIO / SIGPOLL
+    (31, 12), // SIGSYS
+];
+
+/// Translate a Linux signal number to the macOS host number. Identity for
+/// signals that share a number.
+pub fn linux_to_host_signum(linux: i32) -> i32 {
+    SIGNUM_XLATE
+        .iter()
+        .find(|(l, _)| *l == linux)
+        .map(|(_, h)| *h)
+        .unwrap_or(linux)
+}
+
+/// Translate a macOS host signal number to the Linux number. Identity for
+/// signals that share a number.
+pub fn host_to_linux_signum(host: i32) -> i32 {
+    SIGNUM_XLATE
+        .iter()
+        .find(|(_, h)| *h == host)
+        .map(|(l, _)| *l)
+        .unwrap_or(host)
+}
+
+/// Bitmask of Linux signums for which we've installed a host handler, so
+/// `ensure_host_handler` is idempotent per signal. Bit `n` = signum `n`.
+static INSTALLED_MASK: AtomicU64 = AtomicU64::new(0);
 
 /// "No signal pending" sentinel. Chosen as `0` because Linux's
 /// `kill(pid, 0)` is documented as the null-signal probe; no real
@@ -46,6 +90,42 @@ extern "C" fn handle_sigint(_signum: libc::c_int) {
     // through the Linux numbering on the guest side so the dispatcher's
     // signal_handlers table lookup matches.
     PENDING.store(LINUX_SIGINT, Ordering::SeqCst);
+}
+
+/// Generic host handler for a cross-process signal the guest registered a
+/// handler for. Receives the HOST signum, translates it to the Linux
+/// numbering, and publishes it for the runtime to deliver to the guest's
+/// handler. Async-signal-safe (only an atomic store + a const-table lookup).
+extern "C" fn handle_routed(host_signum: libc::c_int) {
+    PENDING.store(host_to_linux_signum(host_signum), Ordering::SeqCst);
+}
+
+/// Install a host handler for `linux_signum` so a cross-process `kill` from
+/// another guest process is routed to this guest's registered handler rather
+/// than taking the host's default action (which would terminate the carrick
+/// process). Idempotent per signal. Skips signals carrick must not hook:
+/// SIGKILL (9) / SIGSTOP (19) can't be caught, and SIGCHLD (17) must keep its
+/// default disposition or `wait4`'s host-`waitpid` passthrough breaks.
+pub fn ensure_host_handler(linux_signum: i32) {
+    if !(1..=63).contains(&linux_signum) || matches!(linux_signum, 9 | 17 | 19) {
+        return;
+    }
+    let bit = 1u64 << linux_signum;
+    if INSTALLED_MASK.fetch_or(bit, Ordering::SeqCst) & bit != 0 {
+        return;
+    }
+    let host = linux_to_host_signum(linux_signum);
+    // SAFETY: zero-initialised sigaction is the documented "no flags, empty
+    // mask" form; we fill sa_sigaction before calling libc. SA_RESTART keeps
+    // applevisor's vcpu.run from breaking on delivery (the EINTR-while-blocked-
+    // in-a-host-syscall case is a tracked follow-up).
+    unsafe {
+        let mut action: libc::sigaction = core::mem::zeroed();
+        action.sa_sigaction = handle_routed as *const () as usize;
+        libc::sigemptyset(&mut action.sa_mask);
+        action.sa_flags = libc::SA_RESTART;
+        libc::sigaction(host, &action, std::ptr::null_mut());
+    }
 }
 
 /// Install the host SIGINT handler. Subsequent calls are no-ops. Safe

@@ -157,6 +157,13 @@ impl ImageStore {
 /// architecture Carrick's HVF backend executes).
 pub const PLATFORM_OVERRIDE_ENV: &str = "CARRICK_PULL_PLATFORM";
 
+/// Comma-separated registry hosts (`host` or `host:port`) to contact over
+/// plain HTTP instead of HTTPS. Used to pull from a local, throwaway
+/// `registry:2` (e.g. the LTP conformance image) without standing up TLS.
+/// `localhost` and `127.0.0.1` are always treated as insecure; this env var
+/// extends the set. Never affects real registries like docker.io.
+pub const INSECURE_REGISTRIES_ENV: &str = "CARRICK_INSECURE_REGISTRIES";
+
 /// A parsed `os/arch[/variant]` platform target used to pick a manifest
 /// from an OCI image index.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -255,9 +262,35 @@ pub fn select_manifest_digest(
     })
 }
 
+/// Build the list of registry hosts to contact over plain HTTP: the
+/// always-insecure loopback hosts plus any from [`INSECURE_REGISTRIES_ENV`].
+fn insecure_registries() -> Vec<String> {
+    // oci-distribution matches the FULL `host:port` string, so we enumerate
+    // both bare and the conventional registry:2 port (5000). Extra forms come
+    // from the env var.
+    let mut hosts = vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+        "localhost:5000".to_string(),
+        "127.0.0.1:5000".to_string(),
+    ];
+    if let Ok(extra) = env::var(INSECURE_REGISTRIES_ENV) {
+        hosts.extend(
+            extra
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+        );
+    }
+    hosts
+}
+
 fn build_oci_client() -> Client {
+    use oci_distribution::client::ClientProtocol;
     let target = platform_target_from_env();
     let config = ClientConfig {
+        protocol: ClientProtocol::HttpsExcept(insecure_registries()),
         platform_resolver: Some(Box::new(move |entries: &[ImageIndexEntry]| {
             select_manifest_digest(entries, &target)
         })),

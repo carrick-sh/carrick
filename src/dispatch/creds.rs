@@ -340,7 +340,21 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn sys_getppid<M: GuestMemory>(&mut self, _ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
-        Ok(DispatchOutcome::Returned { value: 1 })
+        // getpid() reports the real host pid, and carrick forks each guest
+        // process as a real host child, so the host process tree mirrors the
+        // guest tree. The root guest process reports the stable bootstrap
+        // parent (init) rather than leaking carrick's non-deterministic host
+        // launcher pid; a forked child reports its real host parent, which IS
+        // its parent guest process. Returning a hardcoded 1 here made every
+        // forked child look reparented-to-init — tripping LTP's tst_test
+        // heartbeat ("Main test process might have exit!").
+        let value = if std::process::id() == self.proc.bootstrap_host_pid {
+            LINUX_BOOTSTRAP_PID as i64
+        } else {
+            // SAFETY: getppid(2) is always successful and has no side effects.
+            unsafe { libc::getppid() as i64 }
+        };
+        Ok(DispatchOutcome::Returned { value })
     }
 
     pub(super) fn sys_getuid<M: GuestMemory>(&mut self, _ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {

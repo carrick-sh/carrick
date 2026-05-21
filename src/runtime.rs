@@ -553,9 +553,16 @@ where
         if !suppress_signal_check
             && let Some(action) =
                 deliver_pending_signal(runtime, &mut dispatcher, last_syscall_retval)?
-                && let Some(exit) = action.exit_code {
+                && let Some(signum) = action.term_signal {
+                    if runtime.is_forked_child() {
+                        forked_child_die_by_signal(
+                            signum,
+                            dispatcher.stdout(),
+                            dispatcher.stderr(),
+                        );
+                    }
                     return Ok(RunResult {
-                        exit_code: exit,
+                        exit_code: 128 + signum,
                         stdout: dispatcher.stdout().to_vec(),
                         stderr: dispatcher.stderr().to_vec(),
                         traps,
@@ -978,9 +985,15 @@ fn run_vcpu_until_exit(
             let mut k = kernel.0.lock().expect("kernel lock poisoned");
             if let Some(action) =
                 deliver_pending_signal(&mut engine, &mut k.dispatcher, last_syscall_retval)?
-                && let Some(exit) = action.exit_code {
+                && let Some(signum) = action.term_signal {
+                    if engine.is_forked_child() {
+                        let out = k.dispatcher.stdout().to_vec();
+                        let err = k.dispatcher.stderr().to_vec();
+                        drop(k);
+                        forked_child_die_by_signal(signum, &out, &err);
+                    }
                     drop(k);
-                    let result = assemble_run_result(&kernel, exit, traps, false);
+                    let result = assemble_run_result(&kernel, 128 + signum, traps, false);
                     return Ok(VcpuLoopOutcome::ProcessExit(Box::new(result)));
                 }
         }
@@ -1012,11 +1025,13 @@ fn assemble_run_result(
     }
 }
 
-/// Outcome of `deliver_pending_signal`. The `exit_code` field is
-/// `Some` when the pending signal had no installed handler and the
-/// default action (terminate) applies.
+/// Outcome of `deliver_pending_signal`. `term_signal` is `Some(signum)` when
+/// the pending signal had no installed handler and the default action
+/// (terminate) applies. The conventional process exit code is `128 + signum`,
+/// but a forked child instead dies BY this signal (see
+/// `forked_child_die_by_signal`) so the parent's `wait4` reports WIFSIGNALED.
 struct PendingSignalAction {
-    exit_code: Option<i32>,
+    term_signal: Option<i32>,
 }
 
 /// Drain whatever signal is sitting in the host pending slot and
@@ -1042,29 +1057,21 @@ where
     // guest unblocks it (rt_sigprocmask) or waits for it (rt_sigtimedwait).
     if dispatcher.signal_blocked(pending) {
         dispatcher.mark_signal_pending(pending);
-        return Ok(Some(PendingSignalAction { exit_code: None }));
+        return Ok(Some(PendingSignalAction { term_signal: None }));
     }
     if dispatcher.signal_is_ignored(pending) {
-        return Ok(Some(PendingSignalAction { exit_code: None }));
+        return Ok(Some(PendingSignalAction { term_signal: None }));
     }
     match dispatcher.registered_signal_handler(pending) {
         Some(action) => {
-            let handler = action.sa_handler;
-            let restorer = action.sa_restorer;
-            if restorer == 0 {
-                tracing::warn!(
-                    signum = pending,
-                    "guest handler for signal has no sa_restorer; falling back to default terminate"
-                );
-                return Ok(Some(PendingSignalAction {
-                    exit_code: Some(128 + pending),
-                }));
-            }
-            trap.inject_signal(pending, handler, restorer, last_syscall_retval)?;
-            Ok(Some(PendingSignalAction { exit_code: None }))
+            // sa_restorer may be 0 (glibc on aarch64 relies on the kernel's
+            // VDSO sigreturn trampoline). inject_signal synthesises one in that
+            // case, so we no longer bail to default-terminate here.
+            trap.inject_signal(pending, action.sa_handler, action.sa_restorer, last_syscall_retval)?;
+            Ok(Some(PendingSignalAction { term_signal: None }))
         }
         None => Ok(Some(PendingSignalAction {
-            exit_code: Some(128 + pending),
+            term_signal: Some(pending),
         })),
     }
 }
@@ -1173,6 +1180,37 @@ fn forked_child_exit(code: i32, stdout_buf: &[u8], stderr_buf: &[u8]) -> ! {
         libc::write(2, stderr_buf.as_ptr() as *const _, stderr_buf.len())
     };
     unsafe { libc::_exit(code) };
+}
+
+/// Called from a forked child when a default-action signal (no installed
+/// handler) must terminate it. Flushes buffered stdio to the inherited host
+/// fds, then makes THIS host process die *by* `signum` — resetting the
+/// disposition to default and unblocking it first — so the parent's `wait4`
+/// (a passthrough of host `waitpid`) reports WIFSIGNALED(signum) instead of a
+/// normal exit with code `128 + signum`. The raw signal number round-trips:
+/// the host status's low 7 bits carry whatever number we die by, and the
+/// guest reads them back as a Linux signal number. Falls back to `_exit` if
+/// the signal somehow doesn't terminate the host process (a few Linux signal
+/// numbers map to default-ignore dispositions on macOS).
+fn forked_child_die_by_signal(signum: i32, stdout_buf: &[u8], stderr_buf: &[u8]) -> ! {
+    let _ = unsafe { libc::write(1, stdout_buf.as_ptr() as *const _, stdout_buf.len()) };
+    let _ = unsafe { libc::write(2, stderr_buf.as_ptr() as *const _, stderr_buf.len()) };
+    // `signum` is a Linux number; die by the corresponding HOST signal so the
+    // host wait status carries the right value. `wait4` translates it back to
+    // Linux for the parent guest, so the round-trip preserves WTERMSIG.
+    let host_signum = crate::host_signal::linux_to_host_signum(signum);
+    unsafe {
+        libc::signal(host_signum, libc::SIG_DFL);
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, host_signum);
+        libc::sigprocmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+        libc::raise(host_signum);
+        // Only reached if the signal didn't terminate us (e.g. a Linux signal
+        // number that is default-ignore on macOS). Preserve the conventional
+        // shell exit code so behaviour degrades gracefully.
+        libc::_exit(128 + signum)
+    }
 }
 
 fn run_split_loop<M, T>(
@@ -1288,9 +1326,16 @@ where
         if !suppress_signal_check
             && let Some(action) =
                 deliver_pending_signal(trap, &mut dispatcher, last_syscall_retval)?
-                && let Some(exit) = action.exit_code {
+                && let Some(signum) = action.term_signal {
+                    if trap.is_forked_child() {
+                        forked_child_die_by_signal(
+                            signum,
+                            dispatcher.stdout(),
+                            dispatcher.stderr(),
+                        );
+                    }
                     return Ok(RunResult {
-                        exit_code: exit,
+                        exit_code: 128 + signum,
                         stdout: dispatcher.stdout().to_vec(),
                         stderr: dispatcher.stderr().to_vec(),
                         traps,
