@@ -213,6 +213,54 @@ impl SyscallDispatcher {
         )
     }
 
+    /// DAC for `open(2)` on `--fs host`. `access` is the O_ACCMODE bits;
+    /// `want_create` is set for O_CREAT. Returns `Some(errno)` to deny.
+    /// Root bypasses (so we short-circuit when euid==0).
+    fn dac_open_check(&self, path: &str, access: u64, want_create: bool) -> Option<i32> {
+        if self.creds.euid == 0 {
+            return None;
+        }
+        let (uid, gid) = (self.creds.euid, self.creds.egid);
+        match self.fs.rootfs_vfs.overlay.real_stat(path, true) {
+            Some(real) => {
+                // Existing file: ancestor search + the requested access.
+                if let Some(e) = self.dac_ancestors_searchable(path, uid, gid) {
+                    return Some(e);
+                }
+                let mut mask = 0u64;
+                if access != LINUX_O_WRONLY {
+                    mask |= LINUX_R_OK;
+                }
+                if access == LINUX_O_WRONLY || access == LINUX_O_RDWR {
+                    mask |= LINUX_W_OK;
+                }
+                let is_dir = matches!(real.kind, RootFsEntryKind::Directory);
+                crate::dispatch::dac_check(uid, gid, real.uid, real.gid, real.mode, is_dir, mask)
+                    .err()
+            }
+            None if want_create => {
+                // Creating: need search down to, and write on, the parent dir.
+                let parent = std::path::Path::new(path)
+                    .parent()
+                    .map(|p| {
+                        let s = p.to_string_lossy().into_owned();
+                        if s.is_empty() { "/".to_string() } else { s }
+                    })
+                    .unwrap_or_else(|| "/".to_string());
+                if let Some(e) = self.dac_ancestors_searchable(&parent, uid, gid) {
+                    return Some(e);
+                }
+                self.fs.rootfs_vfs.overlay.real_stat(&parent, true).and_then(|p| {
+                    crate::dispatch::dac_check(
+                        uid, gid, p.uid, p.gid, p.mode, true, LINUX_W_OK | LINUX_X_OK,
+                    )
+                    .err()
+                })
+            }
+            None => None,
+        }
+    }
+
     /// Verify the caller has search (X) permission on every ancestor directory
     /// of `path`. Returns `Some(EACCES)` on the first non-searchable parent.
     fn dac_ancestors_searchable(&self, path: &str, uid: u32, gid: u32) -> Option<i32> {
@@ -1250,6 +1298,14 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::Errno { errno });
             }
             VfsOpenAttempt::FallThrough => {}
+        }
+
+        // DAC on open (--fs host, non-root): an existing file needs the
+        // requested access (read unless O_WRONLY, write for O_WRONLY/O_RDWR)
+        // plus search on every ancestor; creating a new file needs write+search
+        // on the parent dir. Root bypasses (handled in dac_check).
+        if let Some(errno) = self.dac_open_check(&path, access, want_create) {
+            return Ok(DispatchOutcome::Errno { errno });
         }
 
         // /proc/* and /sys/* synthetic file opens now flow through
