@@ -88,6 +88,12 @@ mod carrick_usdt {
     /// `magic` the frame magic read back. A corrupted `saved_pc` or `magic`
     /// here pinpoints sigframe corruption (the "PROT_REA" wild-PC crash).
     fn signal__restore(_: u64, _: u64, _: u64) {}
+    /// Reusable guest-memory watchpoint. When `CARRICK_WATCH_ADDR=<hex>` is
+    /// set, fires before EVERY syscall with (`syscall_nr`, `addr`, the current
+    /// little-endian u64 at `addr`). Lets a trace bracket exactly which
+    /// syscall a guest address changes across — e.g. which operation corrupts
+    /// a GOT slot. Zero-cost (and not even read) when the env var is unset.
+    fn mem__watch(_: u64, _: u64, _: u64) {}
 }
 
 pub fn fork_pre(pc: u64, elr: u64, cpsr: u64) {
@@ -150,6 +156,10 @@ pub fn signal_inject(signum: i32, saved_pc: u64, new_sp: u64, handler: u64) {
 
 pub fn signal_restore(saved_pc: u64, sp: u64, magic: u64) {
     carrick_usdt::signal__restore!(|| (saved_pc, sp, magic));
+}
+
+pub fn mem_watch(syscall_nr: u64, addr: u64, value: u64) {
+    carrick_usdt::mem__watch!(|| (syscall_nr, addr, value));
 }
 
 // `#[inline(never)]`: usdt embeds the probe site (an asm! anchor) in

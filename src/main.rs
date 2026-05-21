@@ -155,6 +155,12 @@ enum Commands {
         /// stream cost. The script sees the same carrick USDT providers.
         #[arg(short = 's', long = "script")]
         script: Option<std::path::PathBuf>,
+        /// Internal: `KEY=VAL` env vars to set in the traced child. Used by
+        /// the sudo re-exec to carry CARRICK_* vars across `sudo`'s env_reset
+        /// (which would otherwise strip them) without needing SETENV in
+        /// sudoers — CLI args survive sudo where env vars don't.
+        #[arg(long = "forward-env", value_name = "KEY=VAL")]
+        forward_env: Vec<String>,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
@@ -662,9 +668,16 @@ fn main() -> anyhow::Result<()> {
                 println!("{}", serde_json::to_string_pretty(&state)?);
             }
         },
-        Commands::Trace { flowindent, script, command } => {
+        Commands::Trace { flowindent, script, command, forward_env } => {
             #[cfg(target_os = "macos")]
             {
+                // Apply env vars carried across the sudo re-exec as CLI args.
+                for kv in &forward_env {
+                    if let Some((k, v)) = kv.split_once('=') {
+                        // SAFETY: single-threaded at this point (pre-runtime).
+                        unsafe { std::env::set_var(k, v) };
+                    }
+                }
                 if command.is_empty() {
                     bail!(
                         "trace needs a carrick subcommand to forward (e.g. `carrick trace run alpine:latest /bin/busybox echo hi`)"
@@ -678,16 +691,30 @@ fn main() -> anyhow::Result<()> {
                     // caller doesn't have to remember the prefix.
                     use std::os::unix::process::CommandExt;
                     eprintln!("carrick trace: not root; re-executing under sudo…");
-                    let mut forwarded = vec![
-                        me.as_os_str().to_owned(),
-                        std::ffi::OsString::from("trace"),
-                    ];
+                    // Plain `sudo` resets the environment (env_reset), which
+                    // would drop the CARRICK_* knobs the trace'd run needs
+                    // (CARRICK_INSECURE_REGISTRIES, CARRICK_WATCH_ADDR,
+                    // CARRICK_PULL_PLATFORM, CARRICK_HOME, …). Carry them across
+                    // as `--forward-env KEY=VAL` CLI args (which survive sudo,
+                    // unlike env vars, and don't need SETENV in sudoers); the
+                    // re-exec'd carrick sets them before spawning the child.
+                    let mut forwarded: Vec<std::ffi::OsString> =
+                        vec![me.as_os_str().to_owned(), std::ffi::OsString::from("trace")];
                     if flowindent {
                         forwarded.push(std::ffi::OsString::from("--flowindent"));
                     }
                     if let Some(ref s) = script {
                         forwarded.push(std::ffi::OsString::from("--script"));
                         forwarded.push(s.as_os_str().to_owned());
+                    }
+                    for (k, v) in std::env::vars_os() {
+                        if k.to_string_lossy().starts_with("CARRICK_") {
+                            forwarded.push(std::ffi::OsString::from("--forward-env"));
+                            let mut kv = k;
+                            kv.push("=");
+                            kv.push(v);
+                            forwarded.push(kv);
+                        }
                     }
                     forwarded.push(std::ffi::OsString::from("--"));
                     forwarded.extend(command.iter().map(std::ffi::OsString::from));
