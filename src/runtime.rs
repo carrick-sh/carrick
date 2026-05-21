@@ -466,7 +466,6 @@ where
         )?;
 
         let mut last_syscall_retval: Option<i64> = None;
-        let mut suppress_signal_check = false;
 
         match outcome {
             DispatchOutcome::Exit { code } => {
@@ -535,9 +534,13 @@ where
                 // the restored x0 IS the syscall return value the
                 // pre-empted caller observes.
                 runtime.restore_from_sigframe()?;
-                // Don't immediately re-deliver another pending signal
-                // until the handler-return path has completed unwinding.
-                suppress_signal_check = true;
+                // Deliver the NEXT pending signal (if any) before resuming the
+                // restored context — the kernel delivers all deliverable pending
+                // signals back-to-back before returning to userspace. The just-
+                // handled signal was already cleared from the pending set when
+                // delivered, so this can't re-deliver it. `last_syscall_retval`
+                // is None on this path, so the next inject preserves the
+                // restored x0.
             }
             DispatchOutcome::CloneThread { .. }
             | DispatchOutcome::ThreadExit { .. }
@@ -550,8 +553,7 @@ where
             }
         }
 
-        if !suppress_signal_check
-            && let Some(action) =
+        if let Some(action) =
                 deliver_pending_signal(runtime, &mut dispatcher, last_syscall_retval)?
                 && let Some(signum) = action.term_signal {
                     if runtime.is_forked_child() {
@@ -737,7 +739,6 @@ fn run_vcpu_until_exit(
         };
 
         let mut last_syscall_retval: Option<i64> = None;
-        let mut suppress_signal_check = false;
 
         match outcome {
             DispatchOutcome::Exit { code } => {
@@ -932,7 +933,10 @@ fn run_vcpu_until_exit(
             }
             DispatchOutcome::SigReturn => {
                 engine.restore_from_sigframe()?;
-                suppress_signal_check = true;
+                // Deliver the next pending signal (if any) before resuming —
+                // the kernel delivers all deliverable pending signals before
+                // returning to userspace. The just-handled signal was cleared
+                // when delivered, so this can't re-deliver it.
             }
             DispatchOutcome::Fork => {
                 // Process-creating fork. Real macOS fork of a MULTI-vCPU HVF
@@ -980,7 +984,7 @@ fn run_vcpu_until_exit(
         // FutexWait arm) and reach here too. No live_count gate — multi-
         // threaded guests deliver while running. Per-thread signal masks /
         // tgkill targeting remain a follow-up.
-        if !suppress_signal_check {
+        {
             #[allow(clippy::expect_used)]
             let mut k = kernel.0.lock().expect("kernel lock poisoned");
             if let Some(action) =
@@ -1050,9 +1054,19 @@ where
     T: SyscallTrap,
 {
     let pending = crate::host_signal::take_pending();
-    if pending == 0 {
-        return Ok(None);
-    }
+    let pending = if pending == 0 {
+        // Nothing newly arrived in the host slot. Deliver the next signal that
+        // was raised while blocked and has since been unblocked (held in the
+        // dispatcher's pending set) — one per cycle, so each handler runs and
+        // returns via rt_sigreturn before the next is injected (matching the
+        // kernel delivering all pending signals before returning to userspace).
+        match dispatcher.take_deliverable_pending() {
+            Some(s) => s,
+            None => return Ok(None),
+        }
+    } else {
+        pending
+    };
     // A blocked signal must not be delivered — hold it pending until the
     // guest unblocks it (rt_sigprocmask) or waits for it (rt_sigtimedwait).
     if dispatcher.signal_blocked(pending) {
@@ -1252,7 +1266,6 @@ where
         )?;
 
         let mut last_syscall_retval: Option<i64> = None;
-        let mut suppress_signal_check = false;
 
         match outcome {
             DispatchOutcome::Exit { code } => {
@@ -1322,7 +1335,10 @@ where
             }
             DispatchOutcome::SigReturn => {
                 trap.restore_from_sigframe()?;
-                suppress_signal_check = true;
+                // Deliver the next pending signal (if any) before resuming —
+                // the kernel delivers all deliverable pending signals before
+                // returning to userspace. The just-handled signal was cleared
+                // when delivered, so this can't re-deliver it.
             }
             DispatchOutcome::CloneThread { .. }
             | DispatchOutcome::ThreadExit { .. }
@@ -1335,8 +1351,7 @@ where
             }
         }
 
-        if !suppress_signal_check
-            && let Some(action) =
+        if let Some(action) =
                 deliver_pending_signal(trap, &mut dispatcher, last_syscall_retval)?
                 && let Some(signum) = action.term_signal {
                     if trap.is_forked_child() {
