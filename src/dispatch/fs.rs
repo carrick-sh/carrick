@@ -1120,7 +1120,8 @@ impl SyscallDispatcher {
         let dirfd = ctx.arg(0);
         let pathname = ctx.arg(1);
         let flags = ctx.arg(2);
-        self.open_at_path(dirfd, pathname, flags, &*ctx.memory, ctx.reporter)
+        let mode = ctx.arg(3);
+        self.open_at_path(dirfd, pathname, flags, mode, &*ctx.memory, ctx.reporter)
     }
 
     pub(super) fn openat2<M: GuestMemory>(
@@ -1148,7 +1149,7 @@ impl SyscallDispatcher {
                 errno: LINUX_EINVAL,
             });
         }
-        self.open_at_path(arg0, arg1, how.flags, &*ctx.memory, ctx.reporter)
+        self.open_at_path(arg0, arg1, how.flags, how.mode, &*ctx.memory, ctx.reporter)
     }
 
     fn open_at_path(
@@ -1156,6 +1157,7 @@ impl SyscallDispatcher {
         dirfd: u64,
         pathname: u64,
         flags: u64,
+        mode: u64,
         memory: &impl GuestMemory,
         reporter: &mut CompatReporter,
     ) -> Result<DispatchOutcome, DispatchError> {
@@ -1282,10 +1284,16 @@ impl SyscallDispatcher {
                         return Ok(DispatchOutcome::Errno { errno: LINUX_ENOENT });
                     }
                 }
+                // O_CREAT mode: the requested mode masked by the guest umask,
+                // exactly like the kernel (`mode & ~umask`). Only applies to a
+                // freshly-created file (this branch only runs when no file
+                // existed). Previously hardcoded to 0o644, so creat(f, 0777)
+                // always yielded 644 and umask had no effect.
+                let create_mode = (mode as u32 & 0o7777) & !(self.creds.umask & 0o777);
                 let metadata = RootFsMetadata {
                     path: Path::new(&path).to_path_buf(),
                     kind: RootFsEntryKind::File,
-                    mode: 0o644,
+                    mode: create_mode,
                     size: 0,
                 };
                 // Disk-backed overlay (--fs host): create + open a real
@@ -1294,6 +1302,9 @@ impl SyscallDispatcher {
                 if let Some(host_fd) =
                     self.fs.rootfs_vfs.overlay.open_raw_fd(&path, true, true, want_trunc)
                 {
+                    // The host create used the host process umask; force the
+                    // guest-requested mode onto the new file.
+                    let _ = self.fs.rootfs_vfs.overlay.set_mode(&path, create_mode);
                     OpenDescription::HostFile {
                         host_fd,
                         metadata,
@@ -1304,6 +1315,7 @@ impl SyscallDispatcher {
                     if self.fs.rootfs_vfs.overlay.create_file(&path).is_err() {
                         return Ok(DispatchOutcome::Errno { errno: LINUX_EINVAL });
                     }
+                    let _ = self.fs.rootfs_vfs.overlay.set_mode(&path, create_mode);
                     OpenDescription::File {
                         path,
                         metadata,
@@ -4163,7 +4175,12 @@ impl SyscallDispatcher {
                 let path = metadata.path.to_string_lossy().into_owned();
                 let mut st: libc::stat = unsafe { std::mem::zeroed() };
                 if unsafe { libc::fstat(*host_fd, &mut st) } == 0 {
-                    let real = super::real_stat_from_libc(&st);
+                    let mut real = super::real_stat_from_libc(&st);
+                    // The real file's mode was forced owner-accessible; the
+                    // guest-visible mode lives in the xattr on the same fd.
+                    if let Some(m) = crate::fs_backend::fget_mode_xattr(*host_fd) {
+                        real.mode = m;
+                    }
                     return write_stat_real(memory, statbuf, &path, &real);
                 }
                 // fstat failed: fall back to the stored metadata (size only).
@@ -4240,7 +4257,10 @@ impl SyscallDispatcher {
                 let path = metadata.path.to_string_lossy().into_owned();
                 let mut st: libc::stat = unsafe { std::mem::zeroed() };
                 if unsafe { libc::fstat(*host_fd, &mut st) } == 0 {
-                    let real = super::real_stat_from_libc(&st);
+                    let mut real = super::real_stat_from_libc(&st);
+                    if let Some(m) = crate::fs_backend::fget_mode_xattr(*host_fd) {
+                        real.mode = m;
+                    }
                     return write_statx_real(memory, statxbuf, &path, &real);
                 }
                 // fstat failed: fall back to the stored metadata (size only).
