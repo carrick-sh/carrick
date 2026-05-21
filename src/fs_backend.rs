@@ -638,6 +638,17 @@ impl HostFsBackend {
         }
     }
 
+    /// Stream OCI layer blobs directly into the scratch Dir (the on-demand
+    /// rootfs path for `--fs host`). Replaces build-RootFs-then-seed: never
+    /// materializes the in-memory tree. The Dir is authoritative afterward.
+    pub fn extract_layers(
+        &mut self,
+        paths: &[std::path::PathBuf],
+    ) -> std::io::Result<crate::rootfs::ExtractStats> {
+        crate::rootfs::extract_layer_paths_to_dir(paths, &self.dir)
+            .map_err(|e| std::io::Error::other(e.to_string()))
+    }
+
     fn rel_path(normalized: &Path) -> Option<&Path> {
         if normalized.as_os_str().is_empty() {
             // cap-std doesn't have an "open this dir itself" path; the
@@ -1710,5 +1721,72 @@ mod tests {
             "forked child read different bytes from /etc/hosts than the parent wrote"
         );
         drop(scratch);
+    }
+
+    /// Build a minimal tar layer on disk and verify that
+    /// `HostFsBackend::extract_layers` streams it into the scratch Dir
+    /// so that subsequent `lookup` / `metadata` calls return correct
+    /// results — without ever seeding via `RootFs`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_extract_layers_streams_into_scratch() {
+        use std::io::Write as _;
+
+        // Helper: write a tar archive to disk and return its path.
+        fn write_layer(dir: &std::path::Path, name: &str, build: impl FnOnce(&mut tar::Builder<Vec<u8>>)) -> std::path::PathBuf {
+            let mut b = tar::Builder::new(Vec::new());
+            build(&mut b);
+            let bytes = b.into_inner().unwrap();
+            let p = dir.join(name);
+            std::fs::File::create(&p).unwrap().write_all(&bytes).unwrap();
+            p
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let layer = write_layer(tmp.path(), "layer0.tar", |b| {
+            // etc/ directory
+            let mut h_dir = tar::Header::new_gnu();
+            h_dir.set_entry_type(tar::EntryType::Directory);
+            h_dir.set_mode(0o755);
+            h_dir.set_size(0);
+            b.append_data(&mut h_dir, "etc/", std::io::empty()).unwrap();
+            // etc/motd file
+            let data = b"hi\n";
+            let mut h_file = tar::Header::new_gnu();
+            h_file.set_entry_type(tar::EntryType::Regular);
+            h_file.set_mode(0o644);
+            h_file.set_size(data.len() as u64);
+            b.append_data(&mut h_file, "etc/motd", &data[..]).unwrap();
+        });
+
+        let (mut backend, _scratch) = host_backend();
+        let stats = backend.extract_layers(&[layer]).unwrap();
+
+        // Stats sanity
+        assert_eq!(stats.dirs, 1, "expected 1 directory");
+        assert_eq!(stats.files, 1, "expected 1 file");
+
+        // /etc must be a Dir
+        assert!(
+            matches!(backend.lookup("/etc"), Some(OverlayEntry::Dir)),
+            "lookup('/etc') should be Dir, got {:?}",
+            backend.lookup("/etc")
+        );
+
+        // /etc/motd must be a File with the right bytes
+        assert!(
+            matches!(backend.lookup("/etc/motd"), Some(OverlayEntry::File(ref b)) if b == b"hi\n"),
+            "lookup('/etc/motd') should be File(b\"hi\\n\"), got {:?}",
+            backend.lookup("/etc/motd")
+        );
+
+        // metadata must report File kind
+        let meta = backend.metadata("/etc/motd").expect("metadata('/etc/motd') must be Some");
+        assert_eq!(
+            meta.kind,
+            RootFsEntryKind::File,
+            "metadata kind should be File, got {:?}",
+            meta.kind
+        );
     }
 }

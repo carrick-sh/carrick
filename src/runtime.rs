@@ -285,6 +285,42 @@ where
     run_address_space_with_hvf_and_dispatcher(image, dispatcher, max_traps)
 }
 
+/// Run an ELF whose filesystem is entirely in the dispatcher's overlay
+/// (i.e. `--fs host` after `extract_layers`). The initial binary AND its
+/// PT_INTERP are loaded via `dispatcher.read_exec_file` — the same
+/// overlay-first reader used by the guest-runtime execve path — so no
+/// in-memory `RootFs` is required.
+pub fn run_elf_from_dispatcher_debug<A, E>(
+    path: &str,
+    dispatcher: SyscallDispatcher,
+    argv: A,
+    env: E,
+    max_traps: usize,
+    debug_state_path: Option<&PathBuf>,
+) -> Result<RunResult, RuntimeError>
+where
+    A: IntoIterator<Item = String>,
+    E: IntoIterator<Item = String>,
+{
+    let bytes = dispatcher
+        .read_exec_file(path)
+        .ok_or_else(|| RuntimeError::AddressSpace(AddressSpaceError::Io(
+            std::io::Error::new(std::io::ErrorKind::NotFound, path.to_owned()),
+        )))?;
+    let image = AddressSpace::load_elf_bytes_with_reader(
+        &bytes,
+        &|p| dispatcher.read_exec_file(p),
+    )?
+    .with_linux_initial_stack(argv, env)?
+    .with_el0_trampoline()?
+    .with_el1_vectors()?
+    .with_stage1_page_tables()?;
+    if let Some(p) = maybe_dump_debug_state(&image, debug_state_path) {
+        eprintln!("debug state written: {}", p.display());
+    }
+    run_address_space_with_hvf_and_dispatcher(image, dispatcher, max_traps)
+}
+
 pub fn run_rootfs_elf_with_hvf_args<A, E>(
     path: impl AsRef<Path>,
     rootfs: &RootFs,
