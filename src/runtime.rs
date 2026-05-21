@@ -663,9 +663,19 @@ fn run_vcpu_until_exit(
     threads: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
     max_traps: usize,
 ) -> Result<VcpuLoopOutcome, RuntimeError> {
+    let trace = std::env::var_os("CARRICK_TRACE_TRAPS").is_some();
     for traps in 1..=max_traps {
         // ---- vCPU run: NO kernel lock held ----
         let frame = engine.next_syscall()?;
+        if trace {
+            let name = crate::syscall::lookup_aarch64(frame.x8)
+                .map(|s| s.name)
+                .unwrap_or("<unknown>");
+            eprintln!(
+                "tid#{this_tid} trap#{traps}: x8={} ({name}) x0={:#x} x1={:#x} x2={:#x} x3={:#x} x4={:#x}",
+                frame.x8, frame.x0, frame.x1, frame.x2, frame.x3, frame.x4
+            );
+        }
 
         // ---- syscall service: kernel lock held ----
         let outcome = {
@@ -684,6 +694,15 @@ fn run_vcpu_until_exit(
 
         match outcome {
             DispatchOutcome::Exit { code } => {
+                // A forked child process (real macOS fork) exits via _exit so
+                // the rebuilt HVF context doesn't run the panicky Drops, and
+                // its buffered stdio is flushed to the inherited host fds.
+                if engine.is_forked_child() {
+                    crate::probes::guest_exit(code);
+                    #[allow(clippy::expect_used)]
+                    let k = kernel.0.lock().expect("kernel lock poisoned");
+                    forked_child_exit(code, k.dispatcher.stdout(), k.dispatcher.stderr());
+                }
                 // exit_group, or exit(2) as the last live thread. Tear the
                 // whole process down. For the main thread we return a
                 // RunResult; siblings just terminate the process.
@@ -767,9 +786,16 @@ fn run_vcpu_until_exit(
                 let handle = std::thread::Builder::new()
                     .name(format!("guest-tid-{tid}"))
                     .spawn(move || {
+                        if std::env::var_os("CARRICK_TRACE_TRAPS").is_some() {
+                            eprintln!("[sibling tid#{tid}] thread started, building vCPU");
+                        }
                         match HvfTrapEngine::from_thread_spec(spec) {
                             Ok(child_engine) => {
-                                let _ = run_vcpu_until_exit(
+                                if std::env::var_os("CARRICK_TRACE_TRAPS").is_some() {
+                                    let pc = child_engine.program_counter().unwrap_or(0);
+                                    eprintln!("[sibling tid#{tid}] vCPU built, pc={pc:#x}, entering loop");
+                                }
+                                let r = run_vcpu_until_exit(
                                     child_kernel,
                                     child_engine,
                                     child_registry,
@@ -778,6 +804,9 @@ fn run_vcpu_until_exit(
                                     child_threads,
                                     max_traps,
                                 );
+                                if let Err(e) = r {
+                                    tracing::error!(tid, error = %e, "thread sibling vCPU loop failed");
+                                }
                             }
                             Err(e) => {
                                 tracing::error!(tid, error = %e, "thread sibling vCPU failed to start");
@@ -847,11 +876,28 @@ fn run_vcpu_until_exit(
                 engine.restore_from_sigframe()?;
             }
             DispatchOutcome::Fork => {
-                // A process-creating clone/fork from a multi-threaded guest is
-                // not supported by this runtime path (real macOS fork of a
-                // multi-vCPU HVF process is unsafe). Surface ENOSYS so glibc
-                // falls back rather than wedging the vCPU.
-                engine.complete_syscall(-(crate::linux_abi::LINUX_ENOSYS as i64))?;
+                // Process-creating fork. Real macOS fork of a MULTI-vCPU HVF
+                // process is unsafe (other vCPUs/threads would be left in an
+                // inconsistent HVF state), so only allow it when this is the
+                // sole live guest thread — which is the overwhelmingly common
+                // case (apt's http method, dpkg's tar subprocess, etc. fork
+                // before any pthread_create). With siblings alive, surface
+                // ENOSYS so glibc falls back rather than wedging the VM.
+                if registry.live_count() > 1 {
+                    engine.complete_syscall(-(crate::linux_abi::LINUX_ENOSYS as i64))?;
+                } else {
+                    let fork_outcome = engine.fork()?;
+                    let retval: i64 = match fork_outcome {
+                        crate::trap::ForkOutcome::Parent { child_pid } => i64::from(child_pid),
+                        crate::trap::ForkOutcome::Child => {
+                            #[allow(clippy::expect_used)]
+                            let mut k = kernel.0.lock().expect("kernel lock poisoned");
+                            k.dispatcher.clear_output_buffers();
+                            0
+                        }
+                    };
+                    engine.complete_syscall(retval)?;
+                }
             }
         }
     }
