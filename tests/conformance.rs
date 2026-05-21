@@ -126,7 +126,7 @@ fn sweep_wedged_guests() {
 fn run_carrick(bin: &PathBuf, snippet: &str) -> String {
     use std::os::unix::process::CommandExt;
     sweep_wedged_guests();
-    let mut child = Command::new(bin)
+    let child = Command::new(bin)
         .args(["run", IMAGE, "--raw", "--fs", "host", "/bin/sh", "-c", snippet])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

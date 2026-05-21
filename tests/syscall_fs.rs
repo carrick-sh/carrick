@@ -2420,7 +2420,7 @@ fn getdents64_lists_rootfs_directory_entries() {
     let DispatchOutcome::Returned { value } = outcome else {
         panic!("expected getdents64 success, got {outcome:?}");
     };
-    assert!(value as usize >= LINUX_DIRENT64_HEADER_SIZE + "motd".len() + 1);
+    assert!(value as usize > LINUX_DIRENT64_HEADER_SIZE + "motd".len());
 
     let dirent = memory.read_bytes(0x4100, value as usize).unwrap();
     let (header, _) = LinuxDirent64Header::read_from_prefix(&dirent).unwrap();

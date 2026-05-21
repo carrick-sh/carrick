@@ -273,7 +273,7 @@ impl SyscallDispatcher {
         let memory = &mut *ctx.memory;
         // Linux returns EINVAL for signum <= 0 or > _NSIG (64 on
         // most arches). Reject these.
-        if signum < 1 || signum > 64 {
+        if !(1..=64).contains(&signum) {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
             });
@@ -291,13 +291,11 @@ impl SyscallDispatcher {
         // Read and store the new handler. The kernel rejects attempts
         // to install handlers for SIGKILL (9) and SIGSTOP (19); leave
         // signum=0 in the lenient bucket for the interactive sh probe.
-        if new_action != 0 && signum != 9 && signum != 19 {
-            if let Ok(bytes) = memory.read_bytes(new_action, core::mem::size_of::<LinuxSigaction>()) {
-                if let Ok(sa) = LinuxSigaction::ref_from_bytes(&bytes) {
+        if new_action != 0 && signum != 9 && signum != 19
+            && let Ok(bytes) = memory.read_bytes(new_action, core::mem::size_of::<LinuxSigaction>())
+                && let Ok(sa) = LinuxSigaction::ref_from_bytes(&bytes) {
                     self.signal.handlers.insert(signum, *sa);
                 }
-            }
-        }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
 
