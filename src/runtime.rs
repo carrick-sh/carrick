@@ -657,9 +657,9 @@ fn run_threaded_hvf_loop(
 fn run_vcpu_until_exit(
     kernel: SendKernel,
     mut engine: HvfTrapEngine,
-    registry: Arc<ThreadRegistry>,
+    mut registry: Arc<ThreadRegistry>,
     futex: Arc<FutexTable>,
-    this_tid: ThreadId,
+    mut this_tid: ThreadId,
     threads: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
     max_traps: usize,
 ) -> Result<VcpuLoopOutcome, RuntimeError> {
@@ -691,6 +691,9 @@ fn run_vcpu_until_exit(
                 &futex,
             )?
         };
+
+        let mut last_syscall_retval: Option<i64> = None;
+        let mut suppress_signal_check = false;
 
         match outcome {
             DispatchOutcome::Exit { code } => {
@@ -726,9 +729,12 @@ fn run_vcpu_until_exit(
             }
             DispatchOutcome::Returned { value } => {
                 engine.complete_syscall(value)?;
+                last_syscall_retval = Some(value);
             }
             DispatchOutcome::Errno { errno } => {
-                engine.complete_syscall(-(errno as i64))?;
+                let v = -(errno as i64);
+                engine.complete_syscall(v)?;
+                last_syscall_retval = Some(v);
             }
             DispatchOutcome::FutexWait { addr, timeout } => {
                 // Block with the kernel lock RELEASED so a sibling FUTEX_WAKE
@@ -736,6 +742,7 @@ fn run_vcpu_until_exit(
                 let woken = futex.wait(addr, timeout);
                 let retval: i64 = if woken { 0 } else { -(crate::linux_abi::LINUX_ETIMEDOUT as i64) };
                 engine.complete_syscall(retval)?;
+                last_syscall_retval = Some(retval);
             }
             DispatchOutcome::CloneThread {
                 stack,
@@ -874,6 +881,7 @@ fn run_vcpu_until_exit(
             }
             DispatchOutcome::SigReturn => {
                 engine.restore_from_sigframe()?;
+                suppress_signal_check = true;
             }
             DispatchOutcome::Fork => {
                 // Process-creating fork. Real macOS fork of a MULTI-vCPU HVF
@@ -893,10 +901,42 @@ fn run_vcpu_until_exit(
                             #[allow(clippy::expect_used)]
                             let mut k = kernel.0.lock().expect("kernel lock poisoned");
                             k.dispatcher.clear_output_buffers();
+                            // A forked process is single-threaded by definition
+                            // (fork copies only the calling thread). Reset to a
+                            // fresh registry keyed by the child's host pid so
+                            // gettid/getpid/kill-self all agree (the inherited
+                            // registry could carry stale sibling tids from the
+                            // parent, breaking self-signal targeting). live_count
+                            // becomes 1, restoring single-threaded signal
+                            // delivery + real fork in the child.
+                            this_tid = std::process::id() as ThreadId;
+                            registry = Arc::new(ThreadRegistry::new(this_tid));
                             0
                         }
                     };
                     engine.complete_syscall(retval)?;
+                    last_syscall_retval = Some(retval);
+                }
+            }
+        }
+
+        // Signal delivery. host_signal is process-global. We service pending
+        // signals on the sole vCPU of a single-threaded process — which
+        // covers BOTH the main thread and any forked child (a fresh
+        // single-threaded process). With sibling threads live we skip it here
+        // to avoid two vCPUs racing the shared host_signal slot; a
+        // multi-threaded guest's signal routing is a follow-up. Run under the
+        // kernel lock since it mutates dispatcher signal state.
+        if !suppress_signal_check && registry.live_count() == 1 {
+            #[allow(clippy::expect_used)]
+            let mut k = kernel.0.lock().expect("kernel lock poisoned");
+            if let Some(action) =
+                deliver_pending_signal(&mut engine, &mut k.dispatcher, last_syscall_retval)?
+            {
+                if let Some(exit) = action.exit_code {
+                    drop(k);
+                    let result = assemble_run_result(&kernel, exit, traps, false);
+                    return Ok(VcpuLoopOutcome::ProcessExit(Box::new(result)));
                 }
             }
         }
