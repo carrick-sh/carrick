@@ -16,5 +16,6 @@ pub mod probes;
 pub mod rootfs;
 pub mod runtime;
 pub mod syscall;
+pub mod thread;
 pub mod trap;
 pub mod vfs;
