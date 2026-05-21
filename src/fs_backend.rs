@@ -72,6 +72,11 @@ pub struct RealStat {
     /// Permission bits only (low 0o7777); the type bits are derived
     /// from `kind`.
     pub mode: u32,
+    /// Guest-visible owner uid/gid (`st_uid`/`st_gid`). Tracked in xattrs
+    /// because carrick can't really chown the scratch as a non-root macOS
+    /// process; defaults to 0 (root) when unset.
+    pub uid: u32,
+    pub gid: u32,
     pub size: u64,
     /// Last-access time `(sec, nsec)` from the real on-disk inode.
     pub atime: (i64, i64),
@@ -196,6 +201,13 @@ pub trait FsBackend: Send {
     /// Set the permission bits (low 0o7777) of `path`. Default: unsupported.
     fn set_mode(&mut self, _path: &str, _mode: u32) -> Result<(), BackendError> {
         Err(BackendError::Unsupported)
+    }
+
+    /// Set the guest-visible owner of `path` (`u32::MAX` = leave unchanged, the
+    /// `chown(-1)` sentinel). Default: no-op success (tmpfs-like). The host
+    /// backend records it durably in xattrs since it can't really chown.
+    fn set_owner(&mut self, _path: &str, _uid: u32, _gid: u32) -> Result<(), BackendError> {
+        Ok(())
     }
 
     /// Set the access/modification times of `path`. Each component is
@@ -675,14 +687,24 @@ const CARRICK_MODE_XATTR: &[u8] = b"user.carrick.mode\0";
 /// explicitly hide it — otherwise it leaks into the guest's `listxattr`.
 pub(crate) const CARRICK_MODE_XATTR_NAME: &str = "user.carrick.mode";
 
+/// Guest owner uid/gid xattrs. carrick runs the guest as root but as a
+/// non-root macOS process it can't `chown` the scratch file to an arbitrary
+/// uid, so the guest-visible owner is tracked here (same durable, fork-coherent
+/// scheme as the mode). Hidden from the guest's get/set/listxattr like the
+/// mode (they live in `user.*` for Linux validity).
+const CARRICK_UID_XATTR: &[u8] = b"user.carrick.uid\0";
+const CARRICK_GID_XATTR: &[u8] = b"user.carrick.gid\0";
+pub(crate) const CARRICK_UID_XATTR_NAME: &str = "user.carrick.uid";
+pub(crate) const CARRICK_GID_XATTR_NAME: &str = "user.carrick.gid";
+
 #[cfg(target_os = "macos")]
-fn fset_mode_xattr(fd: std::os::fd::RawFd, mode: u32) {
-    let v = mode.to_le_bytes();
+fn fset_u32_xattr(fd: std::os::fd::RawFd, name: &[u8], val: u32) {
+    let v = val.to_le_bytes();
     // macOS: fsetxattr(fd, name, value, size, position, options)
     unsafe {
         libc::fsetxattr(
             fd,
-            CARRICK_MODE_XATTR.as_ptr() as *const libc::c_char,
+            name.as_ptr() as *const libc::c_char,
             v.as_ptr() as *const libc::c_void,
             v.len(),
             0,
@@ -692,12 +714,12 @@ fn fset_mode_xattr(fd: std::os::fd::RawFd, mode: u32) {
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) fn fget_mode_xattr(fd: std::os::fd::RawFd) -> Option<u32> {
+fn fget_u32_xattr(fd: std::os::fd::RawFd, name: &[u8]) -> Option<u32> {
     let mut v = [0u8; 4];
     let n = unsafe {
         libc::fgetxattr(
             fd,
-            CARRICK_MODE_XATTR.as_ptr() as *const libc::c_char,
+            name.as_ptr() as *const libc::c_char,
             v.as_mut_ptr() as *mut libc::c_void,
             v.len(),
             0,
@@ -708,13 +730,13 @@ pub(crate) fn fget_mode_xattr(fd: std::os::fd::RawFd) -> Option<u32> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn fset_mode_xattr(fd: std::os::fd::RawFd, mode: u32) {
-    let v = mode.to_le_bytes();
+fn fset_u32_xattr(fd: std::os::fd::RawFd, name: &[u8], val: u32) {
+    let v = val.to_le_bytes();
     // Linux: fsetxattr(fd, name, value, size, flags)
     unsafe {
         libc::fsetxattr(
             fd,
-            CARRICK_MODE_XATTR.as_ptr() as *const libc::c_char,
+            name.as_ptr() as *const libc::c_char,
             v.as_ptr() as *const libc::c_void,
             v.len(),
             0,
@@ -723,12 +745,12 @@ fn fset_mode_xattr(fd: std::os::fd::RawFd, mode: u32) {
 }
 
 #[cfg(not(target_os = "macos"))]
-pub(crate) fn fget_mode_xattr(fd: std::os::fd::RawFd) -> Option<u32> {
+fn fget_u32_xattr(fd: std::os::fd::RawFd, name: &[u8]) -> Option<u32> {
     let mut v = [0u8; 4];
     let n = unsafe {
         libc::fgetxattr(
             fd,
-            CARRICK_MODE_XATTR.as_ptr() as *const libc::c_char,
+            name.as_ptr() as *const libc::c_char,
             v.as_mut_ptr() as *mut libc::c_void,
             v.len(),
         )
@@ -736,29 +758,82 @@ pub(crate) fn fget_mode_xattr(fd: std::os::fd::RawFd) -> Option<u32> {
     (n == 4).then(|| u32::from_le_bytes(v))
 }
 
-/// Read the guest-mode xattr for `rel` under `dir` (opening a short-lived fd).
-/// `None` if absent or unreadable, so callers fall back to the real mode.
-fn read_mode_xattr(dir: &cap_std::fs::Dir, rel: &Path, is_dir: bool) -> Option<u32> {
+pub(crate) fn fget_mode_xattr(fd: std::os::fd::RawFd) -> Option<u32> {
+    fget_u32_xattr(fd, CARRICK_MODE_XATTR)
+}
+
+/// Read the (uid, gid) owner xattrs from a fd. `None` for either if unset.
+pub(crate) fn fget_owner_xattr(fd: std::os::fd::RawFd) -> (Option<u32>, Option<u32>) {
+    (
+        fget_u32_xattr(fd, CARRICK_UID_XATTR),
+        fget_u32_xattr(fd, CARRICK_GID_XATTR),
+    )
+}
+
+/// Open a short-lived fd for `rel` (file or dir) and run `f` on it.
+fn with_entry_fd<R>(
+    dir: &cap_std::fs::Dir,
+    rel: &Path,
+    is_dir: bool,
+    writable: bool,
+    f: impl FnOnce(std::os::fd::RawFd) -> R,
+) -> Option<R> {
     use std::os::fd::AsRawFd;
     if is_dir {
         let d = dir.open_dir(rel).ok()?;
-        fget_mode_xattr(d.as_raw_fd())
+        Some(f(d.as_raw_fd()))
+    } else if writable {
+        let file = dir
+            .open_with(rel, cap_std::fs::OpenOptions::new().read(true).write(true))
+            .ok()?;
+        Some(f(file.as_raw_fd()))
     } else {
-        let f = dir.open(rel).ok()?;
-        fget_mode_xattr(f.as_raw_fd())
+        let file = dir.open(rel).ok()?;
+        Some(f(file.as_raw_fd()))
     }
+}
+
+/// Read the guest-mode xattr for `rel` under `dir`. `None` => fall back to the
+/// real mode.
+fn read_mode_xattr(dir: &cap_std::fs::Dir, rel: &Path, is_dir: bool) -> Option<u32> {
+    with_entry_fd(dir, rel, is_dir, false, |fd| fget_u32_xattr(fd, CARRICK_MODE_XATTR)).flatten()
 }
 
 /// Write the guest-mode xattr for `rel` under `dir`. Best-effort.
 pub(crate) fn write_mode_xattr(dir: &cap_std::fs::Dir, rel: &Path, is_dir: bool, mode: u32) {
-    use std::os::fd::AsRawFd;
-    if is_dir {
-        if let Ok(d) = dir.open_dir(rel) {
-            fset_mode_xattr(d.as_raw_fd(), mode);
+    let _ = with_entry_fd(dir, rel, is_dir, true, |fd| {
+        fset_u32_xattr(fd, CARRICK_MODE_XATTR, mode)
+    });
+}
+
+/// Read the guest owner (uid, gid) xattrs for `rel`. Either may be `None`.
+fn read_owner_xattr(dir: &cap_std::fs::Dir, rel: &Path, is_dir: bool) -> (Option<u32>, Option<u32>) {
+    with_entry_fd(dir, rel, is_dir, false, |fd| {
+        (
+            fget_u32_xattr(fd, CARRICK_UID_XATTR),
+            fget_u32_xattr(fd, CARRICK_GID_XATTR),
+        )
+    })
+    .unwrap_or((None, None))
+}
+
+/// Write the guest owner uid/gid xattrs for `rel`. A value of `u32::MAX`
+/// (the `chown(-1)` sentinel) leaves that field unchanged. Best-effort.
+pub(crate) fn write_owner_xattr(
+    dir: &cap_std::fs::Dir,
+    rel: &Path,
+    is_dir: bool,
+    uid: u32,
+    gid: u32,
+) {
+    let _ = with_entry_fd(dir, rel, is_dir, !is_dir, |fd| {
+        if uid != u32::MAX {
+            fset_u32_xattr(fd, CARRICK_UID_XATTR, uid);
         }
-    } else if let Ok(f) = dir.open_with(rel, cap_std::fs::OpenOptions::new().read(true).write(true)) {
-        fset_mode_xattr(f.as_raw_fd(), mode);
-    }
+        if gid != u32::MAX {
+            fset_u32_xattr(fd, CARRICK_GID_XATTR, gid);
+        }
+    });
 }
 
 impl FsBackend for HostFsBackend {
@@ -1108,6 +1183,17 @@ impl FsBackend for HostFsBackend {
         Ok(())
     }
 
+    fn set_owner(&mut self, path: &str, uid: u32, gid: u32) -> Result<(), BackendError> {
+        let normalized = normalize(path).ok_or(BackendError::Invalid)?;
+        let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
+        // carrick is not root on macOS, so it can't chown(2) the scratch file
+        // to an arbitrary uid — record the guest-visible owner in xattrs ON the
+        // file (durable, fork-coherent) and report it from stat.
+        let is_dir = self.dir.symlink_metadata(rel).map(|m| m.is_dir()).unwrap_or(false);
+        write_owner_xattr(&self.dir, rel, is_dir, uid, gid);
+        Ok(())
+    }
+
     fn set_times(
         &mut self,
         path: &str,
@@ -1386,17 +1472,26 @@ impl FsBackend for HostFsBackend {
         // The real file's mode was forced owner-accessible; the guest-visible
         // mode lives in an xattr on the (symlink-resolved) target. Symlinks
         // always report 0777, so skip the link-following xattr read for them.
-        let override_mode = if matches!(kind, RootFsEntryKind::Symlink) {
-            None
+        let (override_mode, owner) = if matches!(kind, RootFsEntryKind::Symlink) {
+            (None, (None, None))
         } else {
-            Self::rel_path(&normalized).and_then(|rel| {
-                read_mode_xattr(&self.dir, rel, matches!(kind, RootFsEntryKind::Directory))
-            })
+            match Self::rel_path(&normalized) {
+                Some(rel) => {
+                    let is_dir = matches!(kind, RootFsEntryKind::Directory);
+                    (
+                        read_mode_xattr(&self.dir, rel, is_dir),
+                        read_owner_xattr(&self.dir, rel, is_dir),
+                    )
+                }
+                None => (None, (None, None)),
+            }
         };
         Some(RealStat {
             kind,
             nlink: meta.nlink() as u32,
             mode: override_mode.unwrap_or(if mode == 0 { default_mode } else { mode }),
+            uid: owner.0.unwrap_or(0),
+            gid: owner.1.unwrap_or(0),
             size: meta.len(),
             atime: (meta.atime(), meta.atime_nsec()),
             mtime: (meta.mtime(), meta.mtime_nsec()),
