@@ -264,9 +264,13 @@ impl SyscallDispatcher {
                 errno: LINUX_EFAULT,
             });
         }
-        // No timer is ever armed, so the truthful answer is a zeroed
-        // itimerval (interval and value both zero == "disarmed").
-        Ok(write_kernel_struct(memory, address, &LinuxItimerval::zeroed()))
+        // Only ITIMER_REAL is tracked; VIRTUAL/PROF report disarmed.
+        let current = if which == LINUX_ITIMER_REAL {
+            itimerval_from_real(self.proc.itimer_real)
+        } else {
+            LinuxItimerval::zeroed()
+        };
+        Ok(write_kernel_struct(memory, address, &current))
     }
 
     pub(super) fn setitimer<M: GuestMemory>(
@@ -282,31 +286,59 @@ impl SyscallDispatcher {
                 errno: LINUX_EINVAL,
             });
         }
-        if new_address != 0 {
-            let new_value = match read_itimerval(memory, new_address) {
+        // Read+validate the new value first (so an EINVAL/EFAULT doesn't
+        // disturb the currently-armed timer or the old_value out-param).
+        let new_value = if new_address != 0 {
+            let v = match read_itimerval(memory, new_address) {
                 Ok(value) => value,
                 Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
             };
-            if !linux_timeval_usec_is_valid(new_value.it_interval)
-                || !linux_timeval_usec_is_valid(new_value.it_value)
+            if !linux_timeval_usec_is_valid(v.it_interval)
+                || !linux_timeval_usec_is_valid(v.it_value)
             {
                 return Ok(DispatchOutcome::Errno {
                     errno: LINUX_EINVAL,
                 });
             }
-        }
+            Some(v)
+        } else {
+            None
+        };
+
+        // ITIMER_REAL is tracked so glibc's alarm() can read back the previous
+        // timer's remaining seconds; VIRTUAL/PROF stay disarmed (zeroed).
+        let is_real = which == LINUX_ITIMER_REAL;
         if old_address != 0 {
-            let outcome = write_kernel_struct(memory, old_address, &LinuxItimerval::zeroed());
+            let prev = if is_real {
+                itimerval_from_real(self.proc.itimer_real)
+            } else {
+                LinuxItimerval::zeroed()
+            };
+            let outcome = write_kernel_struct(memory, old_address, &prev);
             if !matches!(outcome, DispatchOutcome::Returned { .. }) {
                 return Ok(outcome);
             }
         }
-        ctx.reporter.record(CompatEvent::partial_syscall(
-            ctx.request.number,
-            "setitimer",
-            ctx.request.args,
-            "bootstrap: no SIGALRM delivery yet",
-        ));
+        if is_real && let Some(v) = new_value {
+            let value = duration_from_timeval(v.it_value);
+            let interval = duration_from_timeval(v.it_interval);
+            // A zero it_value disarms the timer (matching the kernel).
+            self.proc.itimer_real = if value.is_zero() {
+                None
+            } else {
+                Some(crate::dispatch::proc::ItimerReal {
+                    set_at: std::time::Instant::now(),
+                    value,
+                    interval,
+                })
+            };
+            ctx.reporter.record(CompatEvent::partial_syscall(
+                ctx.request.number,
+                "setitimer",
+                ctx.request.args,
+                "ITIMER_REAL tracked for alarm() accounting; no SIGALRM delivery yet",
+            ));
+        }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
 
@@ -503,5 +535,39 @@ impl SyscallDispatcher {
             }
         }
         Ok(DispatchOutcome::Returned { value: 0 })
+    }
+}
+
+/// Convert a Linux `timeval` to a `Duration` (saturating; negative components,
+/// already rejected by `linux_timeval_usec_is_valid`, clamp to zero).
+fn duration_from_timeval(tv: crate::linux_abi::LinuxTimeval) -> std::time::Duration {
+    let secs = tv.tv_sec.max(0) as u64;
+    let usecs = tv.tv_usec.clamp(0, 999_999) as u32;
+    std::time::Duration::new(secs, usecs * 1000)
+}
+
+/// Build a `timeval` from a `Duration`.
+fn timeval_from_duration(d: std::time::Duration) -> crate::linux_abi::LinuxTimeval {
+    crate::linux_abi::LinuxTimeval {
+        tv_sec: d.as_secs() as i64,
+        tv_usec: i64::from(d.subsec_micros()),
+    }
+}
+
+/// Render the current ITIMER_REAL state as an `itimerval`, computing the time
+/// remaining (`value - elapsed`, saturating to zero on/after expiry). A
+/// disarmed timer (`None`) is the zeroed struct.
+fn itimerval_from_real(
+    state: Option<crate::dispatch::proc::ItimerReal>,
+) -> crate::linux_abi::LinuxItimerval {
+    match state {
+        Some(t) => {
+            let remaining = t.value.saturating_sub(t.set_at.elapsed());
+            crate::linux_abi::LinuxItimerval {
+                it_interval: timeval_from_duration(t.interval),
+                it_value: timeval_from_duration(remaining),
+            }
+        }
+        None => crate::linux_abi::LinuxItimerval::zeroed(),
     }
 }
