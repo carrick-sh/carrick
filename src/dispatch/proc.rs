@@ -203,14 +203,20 @@ impl SyscallDispatcher {
         let args = ctx.request.args;
         let thread = ctx.thread;
         let memory = &*ctx.memory;
-        let command = operation & LINUX_FUTEX_CMD_MASK;
+        // FUTEX_*_BITSET (9/10) are the bitset variants glibc uses for
+        // pthread join/condvar; we treat them as their plain WAIT/WAKE
+        // counterparts (match-all bitset). CLOCK_REALTIME is accepted (we
+        // service the wait with a relative timeout regardless).
+        const LINUX_FUTEX_WAIT_BITSET: u64 = 9;
+        const LINUX_FUTEX_WAKE_BITSET: u64 = 10;
+        let raw_command = operation & LINUX_FUTEX_CMD_MASK;
+        let command = match raw_command {
+            LINUX_FUTEX_WAIT_BITSET => LINUX_FUTEX_WAIT,
+            LINUX_FUTEX_WAKE_BITSET => LINUX_FUTEX_WAKE,
+            other => other,
+        };
         let flags = operation & !LINUX_FUTEX_CMD_MASK;
         if flags & !(LINUX_FUTEX_PRIVATE_FLAG | LINUX_FUTEX_CLOCK_REALTIME) != 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
-        }
-        if flags & LINUX_FUTEX_CLOCK_REALTIME != 0 {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
             });

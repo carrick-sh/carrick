@@ -1439,8 +1439,81 @@ impl HvfInner {
             });
         }
 
-        inner.restore_vcpu(&snapshot)?;
+        inner.restore_vcpu_thread_start(&snapshot)?;
         Ok(inner)
+    }
+
+    /// Seed a BRAND-NEW sibling vCPU so it enters EL0 at the child's resume
+    /// PC. Unlike `restore_vcpu` (used by fork, whose vCPU had already done
+    /// the boot trampoline `eret` into EL0 and merely resumes), a freshly
+    /// created vCPU has never transitioned to EL0. We therefore start it at
+    /// the EL0 trampoline page (in EL1h) with SPSR_EL1=EL0t and
+    /// ELR_EL1=the child's EL0 PC, so the trampoline's single `eret` drops
+    /// the vCPU into EL0 at exactly the post-clone instruction — mirroring
+    /// `map_plan`'s initial-boot sequence but with thread-private PC/SP/TLS.
+    fn restore_vcpu_thread_start(&mut self, snap: &VcpuSnapshot) -> Result<(), TrapError> {
+        use applevisor::prelude::*;
+        const GPR_TABLE: [Reg; 31] = [
+            Reg::X0, Reg::X1, Reg::X2, Reg::X3, Reg::X4, Reg::X5, Reg::X6,
+            Reg::X7, Reg::X8, Reg::X9, Reg::X10, Reg::X11, Reg::X12,
+            Reg::X13, Reg::X14, Reg::X15, Reg::X16, Reg::X17, Reg::X18,
+            Reg::X19, Reg::X20, Reg::X21, Reg::X22, Reg::X23, Reg::X24,
+            Reg::X25, Reg::X26, Reg::X27, Reg::X28, Reg::X29, Reg::X30,
+        ];
+        for (reg, value) in GPR_TABLE.iter().zip(snap.gprs.iter()) {
+            self.vcpu.set_reg(*reg, *value).map_err(hvf_error)?;
+        }
+        // Start at the EL0 trampoline page in EL1h; the trampoline `eret`s
+        // into EL0t at ELR_EL1 with SPSR_EL1's PSTATE.
+        const AARCH64_PSTATE_EL1H_DAIF_MASKED: u64 = 0x3c5;
+        const AARCH64_PSTATE_EL0T_DAIF_MASKED: u64 = 0x3c0;
+        self.vcpu
+            .set_reg(Reg::PC, crate::memory::LINUX_EL0_TRAMPOLINE_BASE)
+            .map_err(hvf_error)?;
+        self.vcpu
+            .set_reg(Reg::CPSR, AARCH64_PSTATE_EL1H_DAIF_MASKED)
+            .map_err(hvf_error)?;
+        self.vcpu
+            .set_sys_reg(SysReg::SPSR_EL1, AARCH64_PSTATE_EL0T_DAIF_MASKED)
+            .map_err(hvf_error)?;
+        // The child's EL0 resume PC (snap.pc == parent ELR_EL1 == post-svc).
+        self.vcpu
+            .set_sys_reg(SysReg::ELR_EL1, snap.pc)
+            .map_err(hvf_error)?;
+        self.vcpu
+            .set_sys_reg(SysReg::SP_EL0, snap.sp_el0)
+            .map_err(hvf_error)?;
+        // Same translation regime as the parent (shared address space).
+        self.vcpu
+            .set_sys_reg(SysReg::MAIR_EL1, snap.mair_el1)
+            .map_err(hvf_error)?;
+        self.vcpu
+            .set_sys_reg(SysReg::TCR_EL1, snap.tcr_el1)
+            .map_err(hvf_error)?;
+        self.vcpu
+            .set_sys_reg(SysReg::TTBR0_EL1, snap.ttbr0_el1)
+            .map_err(hvf_error)?;
+        self.vcpu
+            .set_sys_reg(SysReg::CPACR_EL1, snap.cpacr_el1)
+            .map_err(hvf_error)?;
+        self.vcpu
+            .set_sys_reg(SysReg::VBAR_EL1, snap.vbar_el1)
+            .map_err(hvf_error)?;
+        self.vcpu
+            .set_sys_reg(SysReg::TPIDR_EL0, snap.tpidr_el0)
+            .map_err(hvf_error)?;
+        // SP_EL1 for the brief EL1h trampoline window. The trampoline only
+        // executes one `eret` and touches no stack, but give it a sane value
+        // (the child's EL0 stack works; the trampoline never pushes).
+        self.vcpu
+            .set_sys_reg(SysReg::SP_EL1, snap.sp_el0)
+            .map_err(hvf_error)?;
+        // Enable the MMU last, identically to the parent.
+        self.vcpu
+            .set_sys_reg(SysReg::SCTLR_EL1, snap.sctlr_el1)
+            .map_err(hvf_error)?;
+        self.last_exit_class = snap.last_exit_class;
+        Ok(())
     }
 
     /// Replace the engine's HVF state with a fresh VM that runs
