@@ -2052,6 +2052,7 @@ pub fn synthetic_proc_file(path: &str, ctx: &SyntheticProcContext<'_>) -> Option
         "/proc/self/comm" => Some(synthetic_proc_self_comm(ctx.executable_path).into_bytes()),
         "/proc/self/limits" => Some(synthetic_proc_self_limits().to_vec()),
         "/proc/self/maps" => Some(synthetic_proc_maps(ctx).into_bytes()),
+        "/proc/self/stat" => Some(synthetic_proc_self_stat(ctx.executable_path).into_bytes()),
         "/proc/self/statm" => Some(synthetic_proc_self_statm().to_vec()),
         "/proc/self/status" => Some(synthetic_proc_self_status(ctx.executable_path).into_bytes()),
         "/proc/sys/kernel/osrelease" => Some(synthetic_proc_osrelease().to_vec()),
@@ -2369,6 +2370,28 @@ fn synthetic_proc_self_comm(executable_path: &str) -> String {
     let mut comm = process_short_name(executable_path);
     comm.push('\n');
     comm
+}
+
+/// `/proc/self/stat`: the 52-field single-line process status many tools and
+/// LTP tests parse (ps, getsid validators, clock_gettime starttime checks).
+/// Field 1 (pid) uses the real host pid so it matches getpid(); field 4
+/// (ppid) uses the host parent (matches getppid for forked children). The
+/// remaining fields are plausible constants — tests read a handful (comm,
+/// ppid, pgrp, session, starttime) and check relationships, not exact values.
+fn synthetic_proc_self_stat(executable_path: &str) -> String {
+    let comm = process_short_name(executable_path);
+    let pid = std::process::id();
+    // SAFETY: getppid(2) is always successful with no side effects.
+    let ppid = unsafe { libc::getppid() } as u32;
+    // pid (comm) state ppid pgrp session tty tpgid flags minflt cminflt majflt
+    // cmajflt utime stime cutime cstime priority nice num_threads itrealvalue
+    // starttime vsize rss rsslim ... (remaining device/addr/signal fields 0;
+    // field 38 exit_signal = 17 = SIGCHLD).
+    format!(
+        "{pid} ({comm}) R {ppid} {pid} {pid} 0 -1 4194560 0 0 0 0 0 0 0 0 \
+20 0 1 0 1 10485760 256 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 0 \
+17 0 0 0 0 0 0 0 0 0 0 0 0\n"
+    )
 }
 
 fn synthetic_proc_self_statm() -> &'static [u8] {
