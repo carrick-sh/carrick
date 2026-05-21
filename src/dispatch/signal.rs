@@ -295,6 +295,16 @@ impl SyscallDispatcher {
             && let Ok(bytes) = memory.read_bytes(new_action, core::mem::size_of::<LinuxSigaction>())
                 && let Ok(sa) = LinuxSigaction::ref_from_bytes(&bytes) {
                     self.signal.handlers.insert(signum, *sa);
+                    // If the guest installed a real handler (not SIG_DFL/IGN),
+                    // install a matching host handler so a cross-process kill
+                    // from another guest process is routed here instead of
+                    // taking the host's default action (process termination).
+                    let h = sa.sa_handler;
+                    if h != crate::linux_abi::LINUX_SIG_DFL
+                        && h != crate::linux_abi::LINUX_SIG_IGN
+                    {
+                        crate::host_signal::ensure_host_handler(signum);
+                    }
                 }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
@@ -584,7 +594,11 @@ fn bootstrap_signal_send(target: i64, tid_required: bool, signum: u64) -> Dispat
     if target == 0 || target < i32::MIN as i64 || target > i32::MAX as i64 {
         return DispatchOutcome::Errno { errno: LINUX_ESRCH };
     }
-    let rc = unsafe { libc::kill(target as i32, signum as i32) };
+    // Translate the Linux signum to the host's numbering: the target is a real
+    // host process, and Linux/macOS disagree on several numbers (e.g. SIGUSR1
+    // 10 vs 30). `wait4` translates the resulting status back to Linux.
+    let host_signum = crate::host_signal::linux_to_host_signum(signum as i32);
+    let rc = unsafe { libc::kill(target as i32, host_signum) };
     if rc < 0 {
         return DispatchOutcome::Errno { errno: host_errno() };
     }
