@@ -14,7 +14,7 @@
 //!   target/release/examples/hvf_thread_spike
 //!
 //! Exits 0 on success, non-zero (with a message) on failure.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn main() {

@@ -2134,6 +2134,7 @@ fn push_nlmsg_done(out: &mut Vec<u8>, seq: u32, pid: u32) {
 ///   - RTM_GETLINK  -> one RTM_NEWLINK for `lo`, then NLMSG_DONE
 ///   - RTM_GETADDR  -> one RTM_NEWADDR for `lo` (127.0.0.1/8), then NLMSG_DONE
 ///   - anything else -> a bare NLMSG_DONE (the dump is "empty")
+///
 /// All replies are NLM_F_MULTI dumps terminated by NLMSG_DONE, which is
 /// what glibc's __check_pf and `ip` expect.
 fn build_netlink_reply(request: &[u8], pid: u32) -> Vec<u8> {

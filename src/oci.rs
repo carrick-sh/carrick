@@ -257,10 +257,12 @@ pub fn select_manifest_digest(
 
 fn build_oci_client() -> Client {
     let target = platform_target_from_env();
-    let mut config = ClientConfig::default();
-    config.platform_resolver = Some(Box::new(move |entries: &[ImageIndexEntry]| {
-        select_manifest_digest(entries, &target)
-    }));
+    let config = ClientConfig {
+        platform_resolver: Some(Box::new(move |entries: &[ImageIndexEntry]| {
+            select_manifest_digest(entries, &target)
+        })),
+        ..ClientConfig::default()
+    };
     Client::new(config)
 }
 

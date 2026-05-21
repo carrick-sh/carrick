@@ -565,6 +565,8 @@ struct KernelState {
 /// the `Rc` refcounts are therefore never updated concurrently — so moving
 /// the `Arc<Mutex<KernelState>>` across threads and locking it per syscall
 /// is sound. We assert that with this wrapper.
+// SAFETY invariant documented on SendKernel: the Mutex serialises all access to the !Send dispatcher.
+#[allow(clippy::arc_with_non_send_sync)]
 struct SendKernel(Arc<Mutex<KernelState>>);
 // SAFETY: see the type doc — the Mutex serialises all access to the
 // non-atomic-refcounted Rc state, so concurrent refcount mutation (the only
@@ -604,6 +606,8 @@ fn run_threaded_hvf_loop(
     let main_tid: ThreadId = std::process::id() as ThreadId;
     let registry = Arc::new(ThreadRegistry::new(main_tid));
     let futex = Arc::new(FutexTable::new());
+    // SAFETY invariant documented on SendKernel: the Mutex serialises all access to the !Send dispatcher.
+    #[allow(clippy::arc_with_non_send_sync)]
     let kernel = SendKernel(Arc::new(Mutex::new(KernelState {
         dispatcher,
         reporter: CompatReporter::default(),

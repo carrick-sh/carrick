@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used)]
 #[path = "common/syscall_support.rs"]
 mod support;
 use support::*;

@@ -87,7 +87,6 @@ mod signal;
 mod time;
 
 #[allow(dead_code)]
-#[allow(dead_code)]
 const MAX_GUEST_PATH: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -99,9 +98,10 @@ pub struct SyscallRequest {
 /// Uniform context handed to every *normalized* syscall handler, so all
 /// handlers share one signature and the dispatch arm is macro-generated.
 /// Built transiently per dispatched syscall (a scoped borrow of guest memory
-/// + the compat reporter), which lets migrated and legacy handlers coexist
-/// while the macro migration proceeds subsystem by subsystem. See
-/// [[plan-syscall-macro-split]].
+/// and the compat reporter), which lets migrated and legacy handlers coexist
+/// while the macro migration proceeds subsystem by subsystem.
+///
+/// See [[plan-syscall-macro-split]].
 pub struct SyscallCtx<'a, M: GuestMemory> {
     pub request: SyscallRequest,
     pub memory: &'a mut M,
@@ -174,6 +174,7 @@ pub enum DispatchOutcome {
     ///   1. Tear down the current guest address space.
     ///   2. Load the new ELF (handling the interpreter chain).
     ///   3. Rebuild the trap engine's mappings and vCPU state.
+    ///
     /// Because `execve` does not return on success, the syscall has
     /// no retval to write into x0 — the runtime simply resumes the
     /// loop with the new entry point.
@@ -2553,6 +2554,8 @@ fn write_eventfd(bytes: &[u8], counter: &mut u64) -> DispatchOutcome {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+// big-kernel-lock loop needs all of: memory, address, length, clock, interval, deadline, expirations, nonblocking
 fn read_timerfd(
     memory: &mut impl GuestMemory,
     address: u64,
@@ -3240,14 +3243,9 @@ pub fn macos_to_linux_errno(macos: i32) -> i32 {
 
 // ----- BSD socket translation helpers ------------------------------------
 
-#[allow(dead_code)]
-
-
-
-
-
 // ----- AF_NETLINK (rtnetlink) synthesis -----------------------------------
 
+#[allow(dead_code)]
 /// Linux `NLMSG_ALIGNTO` — netlink messages and attributes are 4-byte aligned.
 const NLMSG_ALIGNTO: usize = 4;
 
