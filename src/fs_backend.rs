@@ -397,7 +397,7 @@ impl FsBackend for MemoryBackend {
     fn create_file(&mut self, path: &str) -> Result<(), BackendError> {
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         self.deletions.remove(&normalized);
-        self.files.entry(normalized).or_insert_with(Vec::new);
+        self.files.entry(normalized).or_default();
         Ok(())
     }
 
@@ -613,15 +613,14 @@ impl HostFsBackend {
         let scratch_path = match &self._scratch {
             Some(td) => td.path().to_path_buf(),
             None => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                return Err(std::io::Error::other(
                     "HostFsBackend has no owned scratch dir to seed",
                 ));
             }
         };
         rootfs
             .extract_to_disk(&scratch_path)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
         // Everything is on the cap-std disk now, which is the single
         // source of truth for lookups — no bookkeeping to record.
         Ok(())
@@ -779,13 +778,12 @@ impl FsBackend for HostFsBackend {
         // Create all parent dirs in the scratch tree so the guest's
         // mkdir-deep paths "just work" (apt does
         // mkdir(/var/lib/apt/lists/partial) without checking parents).
-        if let Some(parent) = rel.parent() {
-            if !parent.as_os_str().is_empty() {
+        if let Some(parent) = rel.parent()
+            && !parent.as_os_str().is_empty() {
                 self.dir
                     .create_dir_all(parent)
                     .map_err(|_| BackendError::Io)?;
             }
-        }
         match self.dir.create_dir(rel) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -798,13 +796,12 @@ impl FsBackend for HostFsBackend {
     fn create_file(&mut self, path: &str) -> Result<(), BackendError> {
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
-        if let Some(parent) = rel.parent() {
-            if !parent.as_os_str().is_empty() {
+        if let Some(parent) = rel.parent()
+            && !parent.as_os_str().is_empty() {
                 self.dir
                     .create_dir_all(parent)
                     .map_err(|_| BackendError::Io)?;
             }
-        }
         let mut opts = cap_std::fs::OpenOptions::new();
         opts.create(true).write(true).truncate(false);
         self.dir
@@ -821,13 +818,12 @@ impl FsBackend for HostFsBackend {
     ) -> Result<(), BackendError> {
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
-        if let Some(parent) = rel.parent() {
-            if !parent.as_os_str().is_empty() {
+        if let Some(parent) = rel.parent()
+            && !parent.as_os_str().is_empty() {
                 self.dir
                     .create_dir_all(parent)
                     .map_err(|_| BackendError::Io)?;
             }
-        }
         let mut opts = cap_std::fs::OpenOptions::new();
         opts.create(true).write(true).truncate(true);
         let mut file = self
@@ -919,13 +915,12 @@ impl FsBackend for HostFsBackend {
         if self.dir.symlink_metadata(&src_rel).is_err() {
             return Ok(false);
         }
-        if let Some(parent) = dst_rel.parent() {
-            if !parent.as_os_str().is_empty() {
+        if let Some(parent) = dst_rel.parent()
+            && !parent.as_os_str().is_empty() {
                 self.dir
                     .create_dir_all(parent)
                     .map_err(|_| BackendError::Io)?;
             }
-        }
         self.dir
             .rename(&src_rel, &self.dir, &dst_rel)
             .map_err(|_| BackendError::Io)?;
@@ -949,13 +944,11 @@ impl FsBackend for HostFsBackend {
             return None;
         }
         let rel = Self::rel_path(&normalized)?;
-        if create {
-            if let Some(parent) = rel.parent() {
-                if !parent.as_os_str().is_empty() {
+        if create
+            && let Some(parent) = rel.parent()
+                && !parent.as_os_str().is_empty() {
                     self.dir.create_dir_all(parent).ok()?;
                 }
-            }
-        }
         let mut opts = cap_std::fs::OpenOptions::new();
         if write {
             opts.read(true).write(true);
@@ -973,11 +966,10 @@ impl FsBackend for HostFsBackend {
     fn symlink(&mut self, target: &str, linkpath: &str) -> Result<(), BackendError> {
         let normalized = normalize(linkpath).ok_or(BackendError::Invalid)?;
         let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
-        if let Some(parent) = rel.parent() {
-            if !parent.as_os_str().is_empty() {
+        if let Some(parent) = rel.parent()
+            && !parent.as_os_str().is_empty() {
                 self.dir.create_dir_all(parent).map_err(|_| BackendError::Io)?;
             }
-        }
         self.tombstones.remove(&normalized);
         // symlink_contents stores `target` verbatim (it may be absolute or
         // dangling), which is the Linux symlinkat(2) semantic.
@@ -991,11 +983,10 @@ impl FsBackend for HostFsBackend {
         let dst_norm = normalize(linkpath).ok_or(BackendError::Invalid)?;
         let src_rel = Self::rel_path(&src_norm).ok_or(BackendError::Invalid)?.to_path_buf();
         let dst_rel = Self::rel_path(&dst_norm).ok_or(BackendError::Invalid)?.to_path_buf();
-        if let Some(parent) = dst_rel.parent() {
-            if !parent.as_os_str().is_empty() {
+        if let Some(parent) = dst_rel.parent()
+            && !parent.as_os_str().is_empty() {
                 self.dir.create_dir_all(parent).map_err(|_| BackendError::Io)?;
             }
-        }
         self.tombstones.remove(&dst_norm);
         self.dir
             .hard_link(&src_rel, &self.dir, &dst_rel)
