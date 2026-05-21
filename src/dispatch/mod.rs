@@ -266,6 +266,17 @@ pub trait GuestMemory {
     fn msync_shared_file(&mut self, _guest_addr: u64, _len: usize) -> Result<(), MemoryError> {
         Ok(())
     }
+
+    /// Mark a guest range `PROT_NONE` (`no_access=true`) or accessible again
+    /// (`false`). carrick backs the whole mmap arena with one accessible host
+    /// region, so a `PROT_NONE` mmap is otherwise readable/writable on the
+    /// syscall path — a guest passing such a buffer to a syscall must instead
+    /// see EFAULT (LTP's `tst_get_bad_addr` mmaps a `PROT_NONE` page as a
+    /// guaranteed-faulting address). The backend records these ranges and makes
+    /// `read_bytes`/`write_bytes` fault on overlap, so every handler that maps a
+    /// memory error to EFAULT gets it for free. Default: no-op (the in-memory
+    /// backend and unit tests don't model protections).
+    fn set_no_access(&mut self, _address: u64, _len: usize, _no_access: bool) {}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

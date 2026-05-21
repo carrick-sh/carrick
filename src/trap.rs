@@ -210,6 +210,12 @@ struct HvfInner {
     /// child got swapped in by `fork()`; ordering of `_vm` vs `vcpu`
     /// Drop trips a "no VM or vCPU available" assertion).
     is_forked_child: bool,
+    /// Guest ranges currently mapped `PROT_NONE` (as `[start, end)` pairs).
+    /// `read_guest_bytes`/`write_guest_bytes` fault when an access overlaps one,
+    /// so the syscall path returns EFAULT for a `PROT_NONE` buffer even though
+    /// carrick backs the whole arena with one accessible host region. Set by
+    /// `set_no_access` (from guest mmap/mprotect); preserved across `fork`.
+    no_access: Vec<(u64, u64)>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -493,6 +499,7 @@ impl HvfTrapEngine {
                 mappings: Vec::new(),
                 last_exit_class: 0,
                 is_forked_child: false,
+                no_access: Vec::new(),
             }),
         })
     }
@@ -837,7 +844,19 @@ impl HvfInner {
         Ok(())
     }
 
+    /// True if `[address, address+length)` overlaps any PROT_NONE range. Used
+    /// to fault syscall-path accesses to a guest PROT_NONE buffer (EFAULT).
+    fn range_no_access(&self, address: u64, length: usize) -> bool {
+        let end = address.saturating_add(length as u64);
+        self.no_access
+            .iter()
+            .any(|&(s, e)| address < e && s < end)
+    }
+
     fn read_guest_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+        if self.range_no_access(address, length) {
+            return Err(MemoryError::OutOfBounds { address, length });
+        }
         let Some(mapping) = self.mapping_for_range(address, length) else {
             return Err(MemoryError::OutOfBounds { address, length });
         };
@@ -858,6 +877,9 @@ impl HvfInner {
 
     fn write_guest_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
         let length = bytes.len();
+        if self.range_no_access(address, length) {
+            return Err(MemoryError::OutOfBounds { address, length });
+        }
         let Some(mapping) = self.mapping_for_range_mut(address, length) else {
             return Err(MemoryError::OutOfBounds { address, length });
         };
@@ -870,6 +892,38 @@ impl HvfInner {
             );
         }
         Ok(())
+    }
+
+    /// Mark `[address, address+len)` PROT_NONE (`no_access=true`) or clear it.
+    /// Clearing performs interval subtraction so an mprotect/mmap that re-enables
+    /// part of a PROT_NONE region leaves only the still-protected remainder.
+    fn set_no_access(&mut self, address: u64, len: usize, no_access: bool) {
+        let end = address.saturating_add(len as u64);
+        if end <= address {
+            return;
+        }
+        if no_access {
+            self.no_access.push((address, end));
+            return;
+        }
+        // Subtract [address, end) from every stored range.
+        let mut next = Vec::with_capacity(self.no_access.len());
+        for (s, e) in std::mem::take(&mut self.no_access) {
+            if address <= s && end >= e {
+                continue; // fully cleared
+            }
+            if end <= s || address >= e {
+                next.push((s, e)); // disjoint
+                continue;
+            }
+            if s < address {
+                next.push((s, address)); // left remainder
+            }
+            if end < e {
+                next.push((end, e)); // right remainder
+            }
+        }
+        self.no_access = next;
     }
 
     /// Back `[guest_addr, guest_addr+len)` with a real `MAP_SHARED` mmap of
@@ -1338,12 +1392,17 @@ impl HvfInner {
         // fork cleanup still uses the normal path (which now also goes
         // through ManuallyDrop, so neither side runs the panicky
         // destructors).
+        // Guest PROT_NONE ranges are part of the address space fork copies;
+        // carry them into the rebuilt engine so the child keeps faulting on
+        // them (it inherited the parent's mappings, perms and all).
+        let inherited_no_access = std::mem::take(&mut self.no_access);
         let new_inner = HvfInner {
             _vm: new_vm,
             vcpu: new_vcpu,
             mappings: Vec::with_capacity(mapping_descs.len()),
             last_exit_class: snapshot.last_exit_class,
             is_forked_child: pid == 0,
+            no_access: inherited_no_access,
         };
         unsafe {
             std::ptr::write(self as *mut HvfInner, new_inner);
@@ -1445,6 +1504,9 @@ impl HvfInner {
             // the panicky applevisor Drops; the VM clone just decrements
             // the Arc on process exit.
             is_forked_child: true,
+            // Sibling threads share the parent's address space; per-thread
+            // PROT_NONE tracking isn't modelled yet (limited thread support).
+            no_access: Vec::new(),
         };
 
         for (start, end, host_addr, size, perms) in mappings {
@@ -1600,6 +1662,9 @@ impl HvfInner {
             mappings: Vec::new(),
             last_exit_class: 0,
             is_forked_child: was_forked_child,
+            // execve replaces the address space; any prior PROT_NONE ranges are
+            // gone. The new image starts with none until it mmaps them.
+            no_access: Vec::new(),
         };
         unsafe {
             std::ptr::write(self as *mut HvfInner, new_inner);
@@ -1775,6 +1840,10 @@ impl GuestMemory for HvfTrapEngine {
 
     fn msync_shared_file(&mut self, guest_addr: u64, len: usize) -> Result<(), MemoryError> {
         self.inner.msync_shared_file(guest_addr, len)
+    }
+
+    fn set_no_access(&mut self, address: u64, len: usize, no_access: bool) {
+        self.inner.set_no_access(address, len, no_access);
     }
 }
 

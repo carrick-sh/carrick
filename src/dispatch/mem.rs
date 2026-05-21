@@ -223,7 +223,18 @@ impl SyscallDispatcher {
         // a small window today), skip the fill and return the address. The
         // underlying stage-2 page is still backed by the host mapping for
         // that region, so the write would land in real memory.
+        // Clear any prior PROT_NONE over this range BEFORE loading content, so
+        // the zero-fill/file-load write below isn't rejected by our own
+        // no-access check (ld.so reserves a region PROT_NONE, then MAP_FIXED-maps
+        // the library's segments over it — those loads must land).
+        memory.set_no_access(address, length_usize, false);
         let _ = memory.write_bytes(address, &bytes);
+        // A PROT_NONE mapping must fault on the syscall path afterwards (a guest
+        // passing it as a buffer gets EFAULT — LTP's tst_get_bad_addr).
+        let prot_none = prot & (LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC) == 0;
+        if prot_none {
+            memory.set_no_access(address, length_usize, true);
+        }
         Ok(DispatchOutcome::Returned {
             value: address as i64,
         })
@@ -512,6 +523,13 @@ impl SyscallDispatcher {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
             });
+        }
+        // Track PROT_NONE so the syscall path faults on the range (EFAULT for a
+        // buffer arg); re-enabling access clears it. This is the only part of
+        // mprotect carrick models — stage-2 stays r-w-x for the guest CPU.
+        if let Ok(len) = usize::try_from(length) {
+            let prot_none = prot & (LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC) == 0;
+            ctx.memory.set_no_access(address, len, prot_none);
         }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
