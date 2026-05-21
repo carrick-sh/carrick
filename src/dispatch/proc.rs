@@ -121,7 +121,16 @@ impl SyscallDispatcher {
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         if let Some(t) = ctx.thread {
-            return Ok(DispatchOutcome::Returned { value: t.tid as i64 });
+            // Linux: in a single-threaded process gettid()==getpid(). Our
+            // main thread's tid is seeded from getpid AT PROCESS START, but a
+            // forked child gets a fresh host pid while keeping the inherited
+            // main_tid — so returning the stale tid would break the
+            // gettid==getpid invariant. While this is the sole live thread,
+            // answer with the live getpid; only once siblings exist do we
+            // hand out the distinct per-thread tid.
+            if t.registry.live_count() > 1 {
+                return Ok(DispatchOutcome::Returned { value: t.tid as i64 });
+            }
         }
         Ok(self.getpid())
     }
