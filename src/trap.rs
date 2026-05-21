@@ -487,22 +487,6 @@ impl HvfTrapEngine {
         use applevisor::prelude::*;
 
         for mapping in &plan.mappings {
-            let mut memory = self
-                .inner
-                ._vm
-                .memory_create(
-                    usize::try_from(mapping.mapped_size)
-                        .map_err(|_| TrapError::MappingTooLarge(mapping.mapped_size))?,
-                )
-                .map_err(hvf_error)?;
-            memory
-                .map(mapping.guest_start, hvf_perms(mapping.perms))
-                .map_err(hvf_error)?;
-            if !mapping.image.is_empty() {
-                memory
-                    .write(mapping.guest_start + mapping.offset_in_mapping, &mapping.image)
-                    .map_err(hvf_error)?;
-            }
             if std::env::var_os("CARRICK_TRACE_MAPS").is_some() {
                 eprintln!(
                     "MAP guest_start=0x{:x} mapped_size=0x{:x} payload_size=0x{:x} perms=r{}w{}x{}",
@@ -514,23 +498,8 @@ impl HvfTrapEngine {
                     if mapping.perms.execute { '+' } else { '-' },
                 );
             }
-            let host_addr = memory.host_addr();
-            let size = usize::try_from(mapping.mapped_size)
-                .map_err(|_| TrapError::MappingTooLarge(mapping.mapped_size))?;
-            let perms = hvf_perms(mapping.perms);
-            self.inner.mappings.push(HvfMappedRegion {
-                start: mapping.guest_start,
-                end: mapping.guest_start.checked_add(mapping.mapped_size).ok_or(
-                    TrapError::MappingOverflow {
-                        guest_start: mapping.guest_start,
-                        mapped_size: mapping.mapped_size,
-                    },
-                )?,
-                host_addr,
-                size,
-                perms,
-                memory: Some(memory),
-            });
+            let region = map_region_raw(mapping)?;
+            self.inner.mappings.push(region);
         }
 
         // Start PC: if an EL0 entry trampoline is installed, the vCPU begins
@@ -1564,43 +1533,11 @@ impl HvfInner {
             std::ptr::write(self as *mut HvfInner, new_inner);
         }
 
-        // Apply the new mapping plan + initial vCPU state. We replicate
-        // the body of HvfTrapEngine::map_address_space's HVF setup
-        // sequence inline; refactoring out a shared function is the
-        // next iteration once we have a third caller.
+        // Apply the new mapping plan via the shared raw-mmap helper (same
+        // backing as map_plan — see `map_region_raw` for why we avoid
+        // applevisor `Memory`/`alloc_zeroed`).
         for mapping in &plan.mappings {
-            let mut memory = self
-                ._vm
-                .memory_create(
-                    usize::try_from(mapping.mapped_size)
-                        .map_err(|_| TrapError::MappingTooLarge(mapping.mapped_size))?,
-                )
-                .map_err(hvf_error)?;
-            memory
-                .map(mapping.guest_start, hvf_perms(mapping.perms))
-                .map_err(hvf_error)?;
-            if !mapping.image.is_empty() {
-                memory
-                    .write(mapping.guest_start + mapping.offset_in_mapping, &mapping.image)
-                    .map_err(hvf_error)?;
-            }
-            let host_addr = memory.host_addr();
-            let size = usize::try_from(mapping.mapped_size)
-                .map_err(|_| TrapError::MappingTooLarge(mapping.mapped_size))?;
-            let perms = hvf_perms(mapping.perms);
-            self.mappings.push(HvfMappedRegion {
-                start: mapping.guest_start,
-                end: mapping.guest_start.checked_add(mapping.mapped_size).ok_or(
-                    TrapError::MappingOverflow {
-                        guest_start: mapping.guest_start,
-                        mapped_size: mapping.mapped_size,
-                    },
-                )?,
-                host_addr,
-                size,
-                perms,
-                memory: Some(memory),
-            });
+            self.mappings.push(map_region_raw(mapping)?);
         }
 
         // Initial vCPU state — same sequence as `map_address_space`.
@@ -1804,6 +1741,79 @@ fn align_up(value: u64, alignment: u64) -> Result<u64, TrapError> {
                 mapped_size: alignment,
             })
     }
+}
+
+/// Back one guest region with a raw `mmap(MAP_ANON)` buffer + `hv_vm_map`,
+/// returning an UNOWNED [`HvfMappedRegion`] (`memory: None`).
+///
+/// We deliberately do NOT use applevisor's `Memory` (`vm.memory_create`), whose
+/// `alloc_zeroed(Layout::from_size_align(size, 16 KiB))` produces a VM mapping
+/// that macOS `fork(2)` is ~8x more expensive to COW than a clean anonymous
+/// `mmap` — even though neither is resident (both ~6 MiB RSS). For carrick's
+/// ~640 MiB of guest windows this was the dominant per-fork cost: 640 MiB
+/// fork+wait measured 9.6 ms (applevisor) vs 1.1 ms (raw mmap). See
+/// `examples/fork_alloc_bench.rs`. The host pages leak only at process exit,
+/// matching the existing `ManuallyDrop<HvfInner>` discipline (applevisor
+/// `Memory` Drop never ran either) and the `map_shared_file` raw path.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn map_region_raw(mapping: &GuestMapping) -> Result<HvfMappedRegion, TrapError> {
+    let size = usize::try_from(mapping.mapped_size)
+        .map_err(|_| TrapError::MappingTooLarge(mapping.mapped_size))?;
+    let host = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_ANON | libc::MAP_PRIVATE,
+            -1,
+            0,
+        )
+    };
+    if host == libc::MAP_FAILED {
+        return Err(TrapError::Hypervisor(format!(
+            "mmap guest region (size={size}) failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    // Copy the payload prefix into the freshly-zeroed region; the rest stays
+    // zero (lazy). offset_in_mapping + image.len() <= mapped_size is guaranteed
+    // by GuestMappingPlan::from_address_space.
+    if !mapping.image.is_empty() {
+        let off = usize::try_from(mapping.offset_in_mapping)
+            .map_err(|_| TrapError::MappingTooLarge(mapping.offset_in_mapping))?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                mapping.image.as_ptr(),
+                (host as *mut u8).add(off),
+                mapping.image.len(),
+            );
+        }
+    }
+    let perms = hvf_perms(mapping.perms);
+    let perms_raw: u64 = u64::from(perms);
+    let r = unsafe { applevisor_sys::hv_vm_map(host, mapping.guest_start, size, perms_raw) };
+    if r != 0 {
+        unsafe { libc::munmap(host, size) };
+        return Err(TrapError::Hypervisor(format!(
+            "hv_vm_map(guest=0x{:x}, size={size}) failed: 0x{r:x}",
+            mapping.guest_start
+        )));
+    }
+    let end = mapping
+        .guest_start
+        .checked_add(mapping.mapped_size)
+        .ok_or(TrapError::MappingOverflow {
+            guest_start: mapping.guest_start,
+            mapped_size: mapping.mapped_size,
+        })?;
+    Ok(HvfMappedRegion {
+        start: mapping.guest_start,
+        end,
+        host_addr: host as *mut u8,
+        size,
+        perms,
+        memory: None,
+    })
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

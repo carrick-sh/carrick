@@ -136,3 +136,5 @@ cargo metadata \
   --manifest-path "$fixture_dir/Cargo.toml" \
   --format-version 1 \
   >/dev/null
+
+build_fixture "fork_bench.rs" "carrick-linux-aarch64-fork-bench"
