@@ -1299,12 +1299,22 @@ impl SyscallDispatcher {
                 // Disk-backed overlay (--fs host): create + open a real
                 // host fd so the new file is fork-shareable. Falls back
                 // to the in-memory File for MemoryBackend.
+                // A new file is owned by the creating process's effective
+                // uid/gid (Linux semantics). carrick stamps it so a guest that
+                // setuid()'d to e.g. "nobody" before creating sees the right
+                // owner. Root (0,0) is the default, so only stamp non-root.
+                let create_uid = self.creds.euid;
+                let create_gid = self.creds.egid;
+                let stamp_owner = create_uid != 0 || create_gid != 0;
                 if let Some(host_fd) =
                     self.fs.rootfs_vfs.overlay.open_raw_fd(&path, true, true, want_trunc)
                 {
                     // The host create used the host process umask; force the
                     // guest-requested mode onto the new file.
                     let _ = self.fs.rootfs_vfs.overlay.set_mode(&path, create_mode);
+                    if stamp_owner {
+                        let _ = self.fs.rootfs_vfs.overlay.set_owner(&path, create_uid, create_gid);
+                    }
                     OpenDescription::HostFile {
                         host_fd,
                         metadata,
@@ -1316,6 +1326,9 @@ impl SyscallDispatcher {
                         return Ok(DispatchOutcome::Errno { errno: LINUX_EINVAL });
                     }
                     let _ = self.fs.rootfs_vfs.overlay.set_mode(&path, create_mode);
+                    if stamp_owner {
+                        let _ = self.fs.rootfs_vfs.overlay.set_owner(&path, create_uid, create_gid);
+                    }
                     OpenDescription::File {
                         path,
                         metadata,
@@ -3434,7 +3447,21 @@ impl SyscallDispatcher {
         if !self.fd_is_valid(fd) {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         }
-        // See `fchmod` above: tmpfs semantics, no-op success.
+        let uid = ctx.arg(1) as u32;
+        let gid = ctx.arg(2) as u32;
+        // Resolve the fd's path so we can record the guest-visible owner on the
+        // backend (durably via xattr on --fs host), mirroring fchownat.
+        let path = self.io.open_files.get(&fd).and_then(|of| match &*of.description.borrow() {
+            OpenDescription::HostFile { metadata, .. }
+            | OpenDescription::File { metadata, .. }
+            | OpenDescription::Directory { metadata, .. } => {
+                Some(metadata.path.to_string_lossy().into_owned())
+            }
+            _ => None,
+        });
+        if let Some(path) = path {
+            let _ = self.fs.rootfs_vfs.overlay.set_owner(&path, uid, gid);
+        }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
 
@@ -3468,15 +3495,21 @@ impl SyscallDispatcher {
             }
             return Ok(DispatchOutcome::Returned { value: 0 });
         }
+        let uid = ctx.arg(2) as u32;
+        let gid = ctx.arg(3) as u32;
         let resolved = match self.resolve_at_path(dirfd, &path) {
             Ok(resolved) => resolved,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
         // Layered presence check: overlay first (tombstones become ENOENT),
         // synthetic /proc and /sys are no-op success, rootfs is no-op
-        // success (tmpfs semantics).
+        // success (tmpfs semantics). Record the guest-visible owner on the
+        // backend (durably, via xattr on --fs host) so a later stat reports it.
         match self.layered_metadata(&resolved) {
-            Ok(_) => Ok(DispatchOutcome::Returned { value: 0 }),
+            Ok(_) => {
+                let _ = self.fs.rootfs_vfs.overlay.set_owner(&resolved, uid, gid);
+                Ok(DispatchOutcome::Returned { value: 0 })
+            }
             Err(errno) => {
                 if is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context()) {
                     Ok(DispatchOutcome::Returned { value: 0 })
@@ -4177,10 +4210,13 @@ impl SyscallDispatcher {
                 if unsafe { libc::fstat(*host_fd, &mut st) } == 0 {
                     let mut real = super::real_stat_from_libc(&st);
                     // The real file's mode was forced owner-accessible; the
-                    // guest-visible mode lives in the xattr on the same fd.
+                    // guest-visible mode + owner live in xattrs on the same fd.
                     if let Some(m) = crate::fs_backend::fget_mode_xattr(*host_fd) {
                         real.mode = m;
                     }
+                    let (uid, gid) = crate::fs_backend::fget_owner_xattr(*host_fd);
+                    real.uid = uid.unwrap_or(0);
+                    real.gid = gid.unwrap_or(0);
                     return write_stat_real(memory, statbuf, &path, &real);
                 }
                 // fstat failed: fall back to the stored metadata (size only).
@@ -4261,6 +4297,9 @@ impl SyscallDispatcher {
                     if let Some(m) = crate::fs_backend::fget_mode_xattr(*host_fd) {
                         real.mode = m;
                     }
+                    let (uid, gid) = crate::fs_backend::fget_owner_xattr(*host_fd);
+                    real.uid = uid.unwrap_or(0);
+                    real.gid = gid.unwrap_or(0);
                     return write_statx_real(memory, statxbuf, &path, &real);
                 }
                 // fstat failed: fall back to the stored metadata (size only).
