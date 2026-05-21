@@ -2056,6 +2056,9 @@ pub fn synthetic_proc_file(path: &str, ctx: &SyntheticProcContext<'_>) -> Option
         "/proc/self/status" => Some(synthetic_proc_self_status(ctx.executable_path).into_bytes()),
         "/proc/sys/kernel/osrelease" => Some(synthetic_proc_osrelease().to_vec()),
         "/proc/sys/kernel/hostname" => Some(synthetic_proc_hostname().to_vec()),
+        // The default 64-bit Linux pid ceiling. LTP (e.g. setpgid02) reads
+        // this to bound pid scans; without it tst_test aborts with ENOENT.
+        "/proc/sys/kernel/pid_max" => Some(b"4194304\n".to_vec()),
         "/proc/sys/kernel/random/boot_id" => {
             Some(synthetic_proc_boot_id().to_vec())
         }
