@@ -503,6 +503,9 @@ where
                 // until the handler-return path has completed unwinding.
                 suppress_signal_check = true;
             }
+            DispatchOutcome::CloneThread { .. } | DispatchOutcome::ThreadExit { .. } => {
+                unreachable!("CloneThread/ThreadExit wired in a later task")
+            }
         }
 
         if !suppress_signal_check {
@@ -794,6 +797,9 @@ where
             DispatchOutcome::SigReturn => {
                 trap.restore_from_sigframe()?;
                 suppress_signal_check = true;
+            }
+            DispatchOutcome::CloneThread { .. } | DispatchOutcome::ThreadExit { .. } => {
+                unreachable!("CloneThread/ThreadExit wired in a later task")
             }
         }
 
