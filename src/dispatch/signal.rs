@@ -81,6 +81,16 @@ impl SyscallDispatcher {
         }
     }
 
+    /// Lowest-numbered pending signal that is NOT currently blocked, cleared
+    /// from the pending set. The runtime drains this each delivery cycle to
+    /// deliver signals raised while blocked and since unblocked (rt_sigprocmask)
+    /// — one per cycle so each handler runs (and returns via rt_sigreturn)
+    /// before the next is injected, matching the kernel's deliver-all-pending-
+    /// before-returning-to-userspace behaviour. None when none remain.
+    pub fn take_deliverable_pending(&mut self) -> Option<i32> {
+        self.take_pending_in(!self.signal.mask)
+    }
+
     /// Lowest-numbered pending signal that intersects `set`, cleared from
     /// the pending set. Used by `rt_sigtimedwait`.
     fn take_pending_in(&mut self, set: u64) -> Option<i32> {
@@ -368,14 +378,11 @@ impl SyscallDispatcher {
             let unmaskable = sigmask_bit(LINUX_SIGKILL).unwrap() | sigmask_bit(LINUX_SIGSTOP).unwrap();
             mask &= !unmaskable;
             self.signal.mask = mask;
-            // Any pending signal that just became unblocked is eligible for
-            // delivery now. Hand one to the runtime's pending slot.
-            let deliverable = self.signal.pending & !mask;
-            if deliverable != 0 {
-                let signum = deliverable.trailing_zeros() as i32 + 1;
-                self.signal.pending &= !(1u64 << (signum - 1));
-                crate::host_signal::raise_for_self(signum);
-            }
+            // Signals that just became unblocked stay in `pending`; the runtime
+            // drains them via `take_deliverable_pending` after this syscall,
+            // delivering each handler in turn. (The previous code raised only
+            // the lowest into the single host-signal slot, losing the rest when
+            // several signals were raised while blocked — LTP sigpending02.)
         }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
