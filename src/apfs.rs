@@ -238,15 +238,14 @@ fn find_mount_point_for(stdout: &str, device: &str) -> Option<PathBuf> {
         if in_section && trimmed.starts_with("+-> Volume ") {
             break;
         }
-        if in_section {
-            if let Some(rest) = trimmed.strip_prefix("Mount Point:") {
+        if in_section
+            && let Some(rest) = trimmed.strip_prefix("Mount Point:") {
                 let rest = rest.trim();
                 if rest == "Not Mounted" {
                     return None;
                 }
                 return Some(PathBuf::from(rest));
             }
-        }
     }
     None
 }
@@ -267,11 +266,10 @@ fn split_at_last_paren(s: &str) -> (&str, &str) {
 /// throw-away-able). Fall back to `~/.carrick/scratch` for hosts where
 /// the volume hasn't been laid down yet.
 pub fn preferred_scratch_root() -> std::io::Result<PathBuf> {
-    if let Ok(Some(volume)) = find_carrick_volume() {
-        if let Some(mp) = volume.mount_point {
+    if let Ok(Some(volume)) = find_carrick_volume()
+        && let Some(mp) = volume.mount_point {
             return Ok(mp);
         }
-    }
     // Fallback: honour the user's $CARRICK_HOME, else $HOME/.carrick.
     let home = std::env::var_os("CARRICK_HOME")
         .map(PathBuf::from)

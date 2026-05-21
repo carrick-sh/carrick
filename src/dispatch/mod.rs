@@ -87,7 +87,6 @@ mod signal;
 mod time;
 
 #[allow(dead_code)]
-#[allow(dead_code)]
 const MAX_GUEST_PATH: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -99,9 +98,10 @@ pub struct SyscallRequest {
 /// Uniform context handed to every *normalized* syscall handler, so all
 /// handlers share one signature and the dispatch arm is macro-generated.
 /// Built transiently per dispatched syscall (a scoped borrow of guest memory
-/// + the compat reporter), which lets migrated and legacy handlers coexist
-/// while the macro migration proceeds subsystem by subsystem. See
-/// [[plan-syscall-macro-split]].
+/// and the compat reporter), which lets migrated and legacy handlers coexist
+/// while the macro migration proceeds subsystem by subsystem.
+///
+/// See [[plan-syscall-macro-split]].
 pub struct SyscallCtx<'a, M: GuestMemory> {
     pub request: SyscallRequest,
     pub memory: &'a mut M,
@@ -174,6 +174,7 @@ pub enum DispatchOutcome {
     ///   1. Tear down the current guest address space.
     ///   2. Load the new ELF (handling the interpreter chain).
     ///   3. Rebuild the trap engine's mappings and vCPU state.
+    ///
     /// Because `execve` does not return on success, the syscall has
     /// no retval to write into x0 — the runtime simply resumes the
     /// loop with the new entry point.
@@ -1500,7 +1501,7 @@ fn close_open_file(open_file: &OpenFile) {
             let mut pipe = pipe.borrow_mut();
             pipe.writers = pipe.writers.saturating_sub(1);
         }
-        OpenDescription::HostPipe { host_fd, .. } => {
+        OpenDescription::HostPipe { host_fd, .. }
             // Close the host fd only when the LAST guest fd that
             // references this OpenDescription is being closed. Because
             // dup3/dup2 wraps a new Linux fd around the SAME Rc<...>,
@@ -1510,23 +1511,21 @@ fn close_open_file(open_file: &OpenFile) {
             // count: if `strong_count == 1` we're the last one.
             // (The Rc is held by the OpenFile in `open_files`; if no
             // dup'd entry remains, strong_count is 1.)
-            if std::rc::Rc::strong_count(&open_file.description) == 1 {
+            if std::rc::Rc::strong_count(&open_file.description) == 1 => {
                 unsafe {
                     libc::close(*host_fd);
                 }
             }
-        }
         OpenDescription::HostSocket { host_fd, .. }
-        | OpenDescription::HostFile { host_fd, .. } => {
+        | OpenDescription::HostFile { host_fd, .. }
             // Same last-reference rule as HostPipe: only close the real
             // macOS fd when no other Linux fd still aliases the same
             // OpenDescription via dup3/dup2.
-            if std::rc::Rc::strong_count(&open_file.description) == 1 {
+            if std::rc::Rc::strong_count(&open_file.description) == 1 => {
                 unsafe {
                     libc::close(*host_fd);
                 }
             }
-        }
         _ => {}
     }
 }
@@ -1778,10 +1777,10 @@ fn write_stat(
 /// the true file type (so a symlink stat'd with `AT_SYMLINK_NOFOLLOW`
 /// reports S_IFLNK) and the real `st_nlink` (a true hard link reports
 /// >1). Type/mode bits come from a [`RootFsMetadata`] carrying the
-/// real `kind`; `st_nlink` is overridden with the disk value.
-/// Build a [`RealStat`](crate::fs_backend::RealStat) from a live `libc::stat`
-/// (e.g. an `fstat` of a host fd), so an fd-based stat reports the SAME real
-/// size/kind/times as the path-based `real_stat` that statx/newfstatat use.
+/// > real `kind`; `st_nlink` is overridden with the disk value.
+/// > Build a [`RealStat`](crate::fs_backend::RealStat) from a live `libc::stat`
+/// > (e.g. an `fstat` of a host fd), so an fd-based stat reports the SAME real
+/// > size/kind/times as the path-based `real_stat` that statx/newfstatat use.
 ///
 /// Without this, `fstat` returned `st_mtime = 0` (the zeroed open-time
 /// metadata) while statx/newfstatat returned the real mtime. apt records each
@@ -1802,9 +1801,9 @@ pub(super) fn real_stat_from_libc(st: &libc::stat) -> crate::fs_backend::RealSta
         nlink: st.st_nlink as u32,
         mode: st.st_mode as u32 & 0o7777,
         size: st.st_size as u64,
-        atime: (st.st_atime as i64, st.st_atime_nsec as i64),
-        mtime: (st.st_mtime as i64, st.st_mtime_nsec as i64),
-        ctime: (st.st_ctime as i64, st.st_ctime_nsec as i64),
+        atime: (st.st_atime, st.st_atime_nsec),
+        mtime: (st.st_mtime, st.st_mtime_nsec),
+        ctime: (st.st_ctime, st.st_ctime_nsec),
     }
 }
 
@@ -2162,16 +2161,14 @@ fn render_proc_maps_from_regions(
         // Track live end pointers for heap and mmap so the guest sees
         // its own growth (brk(2) / mmap(2)) reflected in the map.
         match label.as_str() {
-            "[heap]" => {
-                if brk_current > start && brk_current <= region.end {
+            "[heap]"
+                if brk_current > start && brk_current <= region.end => {
                     end = brk_current;
                 }
-            }
-            "[carrick-mmap]" => {
-                if mmap_next > start && mmap_next <= region.end {
+            "[carrick-mmap]"
+                if mmap_next > start && mmap_next <= region.end => {
                     end = mmap_next;
                 }
-            }
             _ => {}
         }
         let r = if region.read { 'r' } else { '-' };
@@ -2557,6 +2554,8 @@ fn write_eventfd(bytes: &[u8], counter: &mut u64) -> DispatchOutcome {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+// big-kernel-lock loop needs all of: memory, address, length, clock, interval, deadline, expirations, nonblocking
 fn read_timerfd(
     memory: &mut impl GuestMemory,
     address: u64,
@@ -2579,8 +2578,8 @@ fn read_timerfd(
     // deadline, sleep until that deadline (real wall-clock) and recompute. If
     // there's no deadline (no timer armed) we can't know when to wake, so we
     // fall through to EAGAIN to avoid wedging the conformance harness.
-    if ready == 0 && !nonblocking {
-        if let Some(target) = next_deadline {
+    if ready == 0 && !nonblocking
+        && let Some(target) = next_deadline {
             if let Some(now) = linux_clock_duration(clock_id) {
                 let wait = target.saturating_sub(now);
                 if !wait.is_zero() {
@@ -2591,7 +2590,6 @@ fn read_timerfd(
             ready = recomputed.0;
             next_deadline = recomputed.1;
         }
-    }
     *deadline = next_deadline;
     *expirations = ready;
     if *expirations == 0 {
@@ -3245,14 +3243,9 @@ pub fn macos_to_linux_errno(macos: i32) -> i32 {
 
 // ----- BSD socket translation helpers ------------------------------------
 
-#[allow(dead_code)]
-
-
-
-
-
 // ----- AF_NETLINK (rtnetlink) synthesis -----------------------------------
 
+#[allow(dead_code)]
 /// Linux `NLMSG_ALIGNTO` — netlink messages and attributes are 4-byte aligned.
 const NLMSG_ALIGNTO: usize = 4;
 
@@ -3292,11 +3285,10 @@ fn read_host_pipe(
         return DispatchOutcome::Errno { errno: host_errno() };
     }
     let n_usize = n as usize;
-    if n_usize > 0 {
-        if memory.write_bytes(guest_addr, &buf[..n_usize]).is_err() {
+    if n_usize > 0
+        && memory.write_bytes(guest_addr, &buf[..n_usize]).is_err() {
             return DispatchOutcome::Errno { errno: LINUX_EFAULT };
         }
-    }
     DispatchOutcome::Returned { value: n as i64 }
 }
 

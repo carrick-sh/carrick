@@ -58,7 +58,7 @@ impl DebugStateSnapshot {
 
     pub fn write_to(&self, path: &Path) -> std::io::Result<()> {
         let bytes = serde_json::to_vec_pretty(self).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, format!("serialize: {e}"))
+            std::io::Error::other(format!("serialize: {e}"))
         })?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -514,11 +514,10 @@ where
             }
         }
 
-        if !suppress_signal_check {
-            if let Some(action) =
+        if !suppress_signal_check
+            && let Some(action) =
                 deliver_pending_signal(runtime, &mut dispatcher, last_syscall_retval)?
-            {
-                if let Some(exit) = action.exit_code {
+                && let Some(exit) = action.exit_code {
                     return Ok(RunResult {
                         exit_code: exit,
                         stdout: dispatcher.stdout().to_vec(),
@@ -528,8 +527,6 @@ where
                         trap_limit_hit: false,
                     });
                 }
-            }
-        }
     }
 
     Ok(RunResult {
@@ -568,6 +565,8 @@ struct KernelState {
 /// the `Rc` refcounts are therefore never updated concurrently — so moving
 /// the `Arc<Mutex<KernelState>>` across threads and locking it per syscall
 /// is sound. We assert that with this wrapper.
+// SAFETY invariant documented on SendKernel: the Mutex serialises all access to the !Send dispatcher.
+#[allow(clippy::arc_with_non_send_sync)]
 struct SendKernel(Arc<Mutex<KernelState>>);
 // SAFETY: see the type doc — the Mutex serialises all access to the
 // non-atomic-refcounted Rc state, so concurrent refcount mutation (the only
@@ -607,6 +606,8 @@ fn run_threaded_hvf_loop(
     let main_tid: ThreadId = std::process::id() as ThreadId;
     let registry = Arc::new(ThreadRegistry::new(main_tid));
     let futex = Arc::new(FutexTable::new());
+    // SAFETY invariant documented on SendKernel: the Mutex serialises all access to the !Send dispatcher.
+    #[allow(clippy::arc_with_non_send_sync)]
     let kernel = SendKernel(Arc::new(Mutex::new(KernelState {
         dispatcher,
         reporter: CompatReporter::default(),
@@ -738,9 +739,17 @@ fn run_vcpu_until_exit(
             }
             DispatchOutcome::FutexWait { addr, timeout } => {
                 // Block with the kernel lock RELEASED so a sibling FUTEX_WAKE
-                // can run. Re-lock only to complete the syscall.
-                let woken = futex.wait(addr, timeout);
-                let retval: i64 = if woken { 0 } else { -(crate::linux_abi::LINUX_ETIMEDOUT as i64) };
+                // can run. The wait is interrupted if a signal becomes pending
+                // so even an all-threads-parked process delivers it; the
+                // ungated signal check below then runs. Re-lock only to
+                // complete the syscall.
+                use crate::thread::FutexWaitOutcome;
+                let retval: i64 = match futex.wait(addr, timeout, &crate::host_signal::has_pending)
+                {
+                    FutexWaitOutcome::Woken => 0,
+                    FutexWaitOutcome::TimedOut => -(crate::linux_abi::LINUX_ETIMEDOUT as i64),
+                    FutexWaitOutcome::Interrupted => -(crate::linux_abi::LINUX_EINTR as i64),
+                };
                 engine.complete_syscall(retval)?;
                 last_syscall_retval = Some(retval);
             }
@@ -766,7 +775,7 @@ fn run_vcpu_until_exit(
                 // Write parent_tid / child_tid (i32 LE) into guest memory as
                 // requested by CLONE_PARENT_SETTID / CLONE_CHILD_SETTID. The
                 // dispatcher passes the addrs only when the flag is set.
-                let tid_bytes = (tid as i32).to_le_bytes();
+                let tid_bytes = tid.to_le_bytes();
                 if parent_tid_addr != 0 {
                     let _ = engine.write_bytes(parent_tid_addr, &tid_bytes);
                 }
@@ -834,12 +843,11 @@ fn run_vcpu_until_exit(
             }
             DispatchOutcome::ThreadExit { code } => {
                 // CLONE_CHILD_CLEARTID: zero the word + wake one waiter.
-                if let Some(addr) = registry.clear_child_tid(this_tid) {
-                    if addr != 0 {
+                if let Some(addr) = registry.clear_child_tid(this_tid)
+                    && addr != 0 {
                         let _ = engine.write_bytes(addr, &0i32.to_le_bytes());
                         futex.wake(addr, 1);
                     }
-                }
                 let last = registry.exit(this_tid);
                 if last {
                     let result = assemble_run_result(&kernel, code, traps, false);
@@ -920,25 +928,25 @@ fn run_vcpu_until_exit(
             }
         }
 
-        // Signal delivery. host_signal is process-global. We service pending
-        // signals on the sole vCPU of a single-threaded process — which
-        // covers BOTH the main thread and any forked child (a fresh
-        // single-threaded process). With sibling threads live we skip it here
-        // to avoid two vCPUs racing the shared host_signal slot; a
-        // multi-threaded guest's signal routing is a follow-up. Run under the
-        // kernel lock since it mutates dispatcher signal state.
-        if !suppress_signal_check && registry.live_count() == 1 {
+        // Signal delivery. host_signal is process-global with an atomic
+        // pending slot, so `take_pending` (inside deliver_pending_signal,
+        // under the kernel lock) drains it exactly once: whichever thread
+        // grabs it delivers the process-directed signal to ITS vCPU, which is
+        // valid Linux semantics (an arbitrary unblocking thread handles it).
+        // Threads parked in FUTEX_WAIT interrupt on a pending signal (see the
+        // FutexWait arm) and reach here too. No live_count gate — multi-
+        // threaded guests deliver while running. Per-thread signal masks /
+        // tgkill targeting remain a follow-up.
+        if !suppress_signal_check {
             #[allow(clippy::expect_used)]
             let mut k = kernel.0.lock().expect("kernel lock poisoned");
             if let Some(action) =
                 deliver_pending_signal(&mut engine, &mut k.dispatcher, last_syscall_retval)?
-            {
-                if let Some(exit) = action.exit_code {
+                && let Some(exit) = action.exit_code {
                     drop(k);
                     let result = assemble_run_result(&kernel, exit, traps, false);
                     return Ok(VcpuLoopOutcome::ProcessExit(Box::new(result)));
                 }
-            }
         }
     }
 
@@ -1102,7 +1110,7 @@ fn parse_shebang(head: &[u8]) -> Option<(String, Option<String>)> {
     let line = &head[2..line_end.min(256)];
     let line = std::str::from_utf8(line).ok()?;
     let line = line.trim_start_matches([' ', '\t']);
-    let mut parts = line.splitn(2, |c| c == ' ' || c == '\t');
+    let mut parts = line.splitn(2, [' ', '\t']);
     let interp = parts.next()?.to_string();
     if interp.is_empty() {
         return None;
@@ -1241,11 +1249,10 @@ where
             }
         }
 
-        if !suppress_signal_check {
-            if let Some(action) =
+        if !suppress_signal_check
+            && let Some(action) =
                 deliver_pending_signal(trap, &mut dispatcher, last_syscall_retval)?
-            {
-                if let Some(exit) = action.exit_code {
+                && let Some(exit) = action.exit_code {
                     return Ok(RunResult {
                         exit_code: exit,
                         stdout: dispatcher.stdout().to_vec(),
@@ -1255,8 +1262,6 @@ where
                         trap_limit_hit: false,
                     });
                 }
-            }
-        }
     }
 
     Ok(RunResult {

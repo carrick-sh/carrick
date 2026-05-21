@@ -88,8 +88,8 @@ impl SyscallDispatcher {
         if length == 0
             || prot & !(LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC) != 0
             || (map_type != LINUX_MAP_SHARED && map_type != LINUX_MAP_PRIVATE)
-            || (flags & LINUX_MAP_ANONYMOUS == 0 && offset % LINUX_PAGE_SIZE != 0)
-            || (flags & LINUX_MAP_FIXED != 0 && requested % LINUX_PAGE_SIZE != 0)
+            || (flags & LINUX_MAP_ANONYMOUS == 0 && !offset.is_multiple_of(LINUX_PAGE_SIZE))
+            || (flags & LINUX_MAP_FIXED != 0 && !requested.is_multiple_of(LINUX_PAGE_SIZE))
         {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
@@ -122,7 +122,7 @@ impl SyscallDispatcher {
         if flags & LINUX_MAP_ANONYMOUS == 0
             && map_type == LINUX_MAP_SHARED
             && flags & LINUX_MAP_FIXED == 0
-            && offset % hvf_page == 0
+            && offset.is_multiple_of(hvf_page)
         {
             let dup_fd = {
                 let Some(open_file) = self.io.open_files.get(&fd) else {
@@ -237,7 +237,7 @@ impl SyscallDispatcher {
             // expects the address back, and writes/reads will either hit a
             // pre-existing mapping or fault. musl's malloc relies on this to
             // place PROT_NONE guard pages at the heap edge.
-            if requested == 0 || requested % LINUX_PAGE_SIZE != 0 {
+            if requested == 0 || !requested.is_multiple_of(LINUX_PAGE_SIZE) {
                 return None;
             }
             return Some(requested);
@@ -387,7 +387,7 @@ impl SyscallDispatcher {
                 errno: LINUX_ENOMEM,
             });
         }
-        let pages = (length + LINUX_PAGE_SIZE as u64 - 1) / LINUX_PAGE_SIZE as u64;
+        let pages = length.div_ceil(LINUX_PAGE_SIZE);
         let bytes = vec![1u8; pages as usize];
         if memory.write_bytes(vec, &bytes).is_err() {
             return Ok(DispatchOutcome::Errno {
@@ -508,7 +508,7 @@ impl SyscallDispatcher {
         // addresses inside the dynamically-allocated mmap arenas that we
         // don't currently model, and gating those calls produces an
         // ENOMEM-retry loop that prevents dynamic startup from finishing.
-        if address % LINUX_PAGE_SIZE as u64 != 0 {
+        if !address.is_multiple_of(LINUX_PAGE_SIZE) {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
             });
@@ -525,7 +525,7 @@ impl SyscallDispatcher {
         let advice = ctx.arg(2);
         let memory = &*ctx.memory;
 
-        if address % LINUX_PAGE_SIZE != 0 || !linux_madvise_advice_is_supported(advice) {
+        if !address.is_multiple_of(LINUX_PAGE_SIZE) || !linux_madvise_advice_is_supported(advice) {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
             });
@@ -582,7 +582,7 @@ fn linux_madvise_advice_is_supported(advice: u64) -> bool {
 }
 
 fn align_up_u64(value: u64, alignment: u64) -> Option<u64> {
-    Some(value.div_ceil(alignment).checked_mul(alignment)?)
+    value.div_ceil(alignment).checked_mul(alignment)
 }
 
 fn range_within(address: u64, length: u64, base: u64, size: u64) -> bool {
