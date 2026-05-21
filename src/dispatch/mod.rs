@@ -1699,6 +1699,35 @@ fn write_stat(
 /// reports S_IFLNK) and the real `st_nlink` (a true hard link reports
 /// >1). Type/mode bits come from a [`RootFsMetadata`] carrying the
 /// real `kind`; `st_nlink` is overridden with the disk value.
+/// Build a [`RealStat`](crate::fs_backend::RealStat) from a live `libc::stat`
+/// (e.g. an `fstat` of a host fd), so an fd-based stat reports the SAME real
+/// size/kind/times as the path-based `real_stat` that statx/newfstatat use.
+///
+/// Without this, `fstat` returned `st_mtime = 0` (the zeroed open-time
+/// metadata) while statx/newfstatat returned the real mtime. apt records each
+/// Packages index's mtime at pkgcache GENERATION (via the opened fd) and
+/// re-checks it at VALIDATION (via stat-by-path); the 0-vs-real mismatch made
+/// apt decide every index had changed and abort `apt install` with
+/// "Cache is out of sync, can't x-ref a package file". The macOS and Linux
+/// `S_IF*` type bits and epoch-second time values transfer directly.
+pub(super) fn real_stat_from_libc(st: &libc::stat) -> crate::fs_backend::RealStat {
+    use crate::rootfs::RootFsEntryKind;
+    let kind = match st.st_mode as u32 & LINUX_S_IFMT {
+        m if m == LINUX_S_IFDIR => RootFsEntryKind::Directory,
+        m if m == LINUX_S_IFLNK => RootFsEntryKind::Symlink,
+        _ => RootFsEntryKind::File,
+    };
+    crate::fs_backend::RealStat {
+        kind,
+        nlink: st.st_nlink as u32,
+        mode: st.st_mode as u32 & 0o7777,
+        size: st.st_size as u64,
+        atime: (st.st_atime as i64, st.st_atime_nsec as i64),
+        mtime: (st.st_mtime as i64, st.st_mtime_nsec as i64),
+        ctime: (st.st_ctime as i64, st.st_ctime_nsec as i64),
+    }
+}
+
 fn write_stat_real(
     memory: &mut impl GuestMemory,
     statbuf: u64,

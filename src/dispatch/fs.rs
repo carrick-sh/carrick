@@ -4009,15 +4009,22 @@ impl SyscallDispatcher {
         let metadata = match &*open {
             OpenDescription::File { metadata, .. }
             | OpenDescription::Directory { metadata, .. } => metadata,
-            // Real host file: fstat the fd for the LIVE size (it may
-            // have grown since open, incl. from a forked child).
+            // Real host file: fstat the live fd for the REAL size AND times
+            // (atime/mtime/ctime). Using the live inode keeps fstat-by-fd
+            // consistent with statx/newfstatat-by-path (both go through real
+            // on-disk times) — required so apt's pkgcache mtime cross-check
+            // passes. Falling back to the stored metadata (which carries
+            // mtime=0) made `apt install` abort with "Cache is out of sync,
+            // can't x-ref a package file". See `real_stat_from_libc`.
             OpenDescription::HostFile { host_fd, metadata, .. } => {
-                let mut md = metadata.clone();
+                let path = metadata.path.to_string_lossy().into_owned();
                 let mut st: libc::stat = unsafe { std::mem::zeroed() };
                 if unsafe { libc::fstat(*host_fd, &mut st) } == 0 {
-                    md.size = st.st_size as usize;
+                    let real = super::real_stat_from_libc(&st);
+                    return write_stat_real(memory, statbuf, &path, &real);
                 }
-                return write_stat(memory, statbuf, &md);
+                // fstat failed: fall back to the stored metadata (size only).
+                return write_stat(memory, statbuf, metadata);
             }
             OpenDescription::SyntheticFile { path, contents, .. } => {
                 return write_synthetic_stat(
