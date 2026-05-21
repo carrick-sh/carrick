@@ -519,10 +519,23 @@ impl SyscallDispatcher {
         let old_fd = ctx.arg(0) as i32;
         let new_fd = ctx.arg(1) as i32;
         let flags = ctx.arg(2);
-        // Linux dup3 requires old_fd != new_fd and only honours
-        // O_CLOEXEC in `flags`. It explicitly allows new_fd to be 0/1/2
-        // — that's how shells redirect stdin/stdout/stderr.
-        if old_fd == new_fd || flags & !LINUX_O_CLOEXEC != 0 || new_fd < 0 {
+        // Linux dup3 only honours O_CLOEXEC in `flags` (else EINVAL), and
+        // new_fd must be a valid descriptor number: out of range (negative or
+        // >= RLIMIT_NOFILE soft limit) is EBADF, NOT EINVAL. old_fd == new_fd
+        // is EINVAL (dup2 handles that case in glibc without reaching here).
+        // new_fd 0/1/2 is allowed — that's how shells redirect std streams.
+        const RLIMIT_NOFILE_CUR: i32 = 1024;
+        if flags & !LINUX_O_CLOEXEC != 0 {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            });
+        }
+        if new_fd < 0 || new_fd >= RLIMIT_NOFILE_CUR {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EBADF,
+            });
+        }
+        if old_fd == new_fd {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
             });
