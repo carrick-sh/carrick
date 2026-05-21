@@ -951,6 +951,8 @@ impl SyscallDispatcher {
         self.dispatch_inner(request, memory, reporter, None)
     }
 
+    // (see `watch_addr` below)
+
     /// Multi-threaded dispatch: the caller (the per-vCPU runtime loop)
     /// holds the big kernel lock and supplies THIS thread's tid plus the
     /// shared registry/futex tables, so `gettid`/`set_tid_address`/`futex`
@@ -988,6 +990,17 @@ impl SyscallDispatcher {
             name: name.to_owned(),
             args: request.args,
         });
+
+        // Reusable guest-memory watchpoint (CARRICK_WATCH_ADDR=<hex>): fire a
+        // probe with the current u64 at the watched address before each
+        // syscall, so a trace can bracket which syscall changes it.
+        if let Some(addr) = watch_addr()
+            && let Ok(bytes) = memory.read_bytes(addr, 8)
+        {
+            let mut le = [0u8; 8];
+            le.copy_from_slice(&bytes[..8]);
+            crate::probes::mem_watch(request.number, addr, u64::from_le_bytes(le));
+        }
 
         // Systematic unknown-flag check. For each syscall whose flag
         // argument has a well-defined supported mask, validate the
@@ -2929,6 +2942,19 @@ fn linux_mode(metadata: &RootFsMetadata) -> u32 {
         RootFsEntryKind::Symlink => LINUX_S_IFLNK,
     };
     kind | (metadata.mode & 0o7777)
+}
+
+/// Parse `CARRICK_WATCH_ADDR` (hex, optional `0x`) once. `None` disables the
+/// guest-memory watchpoint (the common, zero-cost case).
+fn watch_addr() -> Option<u64> {
+    static WATCH_ADDR: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *WATCH_ADDR.get_or_init(|| {
+        std::env::var("CARRICK_WATCH_ADDR").ok().and_then(|s| {
+            let s = s.trim();
+            let s = s.strip_prefix("0x").unwrap_or(s);
+            u64::from_str_radix(s, 16).ok()
+        })
+    })
 }
 
 fn access_metadata(metadata: &RootFsMetadata, mode: u64) -> DispatchOutcome {
