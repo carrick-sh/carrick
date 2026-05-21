@@ -1137,6 +1137,7 @@ impl HvfInner {
             tramp_addr
         };
         self.vcpu.set_reg(Reg::X30, restorer).map_err(hvf_error)?;
+        crate::probes::signal_inject(signum, frame.saved_pc, new_sp, handler);
 
         // Redirect post-eret PC to the handler. ELR_EL1 was previously
         // "instruction after the SVC that just trapped"; we steal it
@@ -1206,6 +1207,7 @@ impl HvfInner {
         let saved_pc = frame.saved_pc;
         let saved_sp = frame.saved_sp;
         let saved_spsr = frame.saved_spsr;
+        crate::probes::signal_restore(saved_pc, sp, magic);
         self.vcpu
             .set_sys_reg(SysReg::ELR_EL1, saved_pc)
             .map_err(hvf_error)?;
