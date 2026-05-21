@@ -3777,15 +3777,23 @@ impl SyscallDispatcher {
         }
 
         if pathname == 0 {
+            // `futimens(fd, times)` lowers to `utimensat(fd, NULL, times, 0)`
+            // in musl/glibc: set the times of the *open fd itself*. (This is
+            // distinct from the AT_EMPTY_PATH form, which carries an empty —
+            // not NULL — path.)
             if dirfd == LINUX_AT_FDCWD {
                 return Ok(DispatchOutcome::Errno {
                     errno: LINUX_EFAULT,
                 });
             }
-            if !self.fd_is_valid(dirfd as i32) {
-                return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+            if atime_set.is_none() && mtime_set.is_none() {
+                // Both UTIME_OMIT: nothing to persist; just validate the fd.
+                if !self.fd_is_valid(dirfd as i32) {
+                    return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+                }
+                return Ok(DispatchOutcome::Returned { value: 0 });
             }
-            return Ok(DispatchOutcome::Returned { value: 0 });
+            return Ok(self.set_fd_times(dirfd as i32, atime_set, mtime_set));
         }
 
         let path = match read_guest_c_string(memory, pathname) {
@@ -3968,6 +3976,59 @@ impl SyscallDispatcher {
         Ok(self.write_fd_stat(fd, statbuf, &mut *ctx.memory))
     }
 
+    /// Apply atime/mtime to an *open fd* — the `futimens(fd, …)` path.
+    /// For a host-backed file we drive `futimens(2)` on the live host fd so a
+    /// subsequent fstat/statx (which both read live on-disk times) observes
+    /// the set value. For an in-memory `File`, we route through the overlay by
+    /// path. `None` entries are UTIME_OMIT (left untouched).
+    fn set_fd_times(
+        &mut self,
+        fd: i32,
+        atime: Option<(i64, i64)>,
+        mtime: Option<(i64, i64)>,
+    ) -> DispatchOutcome {
+        let Some(open_file) = self.io.open_files.get(&fd) else {
+            return DispatchOutcome::Errno { errno: LINUX_EBADF };
+        };
+        let open = open_file.description.borrow();
+        match &*open {
+            OpenDescription::HostFile { host_fd, .. } => {
+                let to_ts = |t: Option<(i64, i64)>| match t {
+                    Some((sec, nsec)) => libc::timespec {
+                        tv_sec: sec as libc::time_t,
+                        tv_nsec: nsec as libc::c_long,
+                    },
+                    None => libc::timespec {
+                        tv_sec: 0,
+                        tv_nsec: libc::UTIME_OMIT,
+                    },
+                };
+                let times = [to_ts(atime), to_ts(mtime)];
+                let rc = unsafe { libc::futimens(*host_fd, times.as_ptr()) };
+                if rc < 0 {
+                    DispatchOutcome::Errno { errno: LINUX_EROFS }
+                } else {
+                    DispatchOutcome::Returned { value: 0 }
+                }
+            }
+            OpenDescription::File { metadata, .. } => {
+                let path = metadata.path.to_string_lossy().into_owned();
+                drop(open);
+                match self.fs.rootfs_vfs.overlay.set_times(&path, atime, mtime) {
+                    Ok(()) | Err(crate::fs_backend::BackendError::Unsupported) => {
+                        DispatchOutcome::Returned { value: 0 }
+                    }
+                    Err(_) => DispatchOutcome::Errno { errno: LINUX_EROFS },
+                }
+            }
+            // Directories, synthetic /proc files, pipes, sockets, anon_inode
+            // fds: accept as a no-op (matches Linux's permissive behaviour for
+            // the cases tooling actually exercises; we can't persist times for
+            // the non-file kinds).
+            _ => DispatchOutcome::Returned { value: 0 },
+        }
+    }
+
     fn write_fd_stat(
         &self,
         fd: i32,
@@ -4088,13 +4149,20 @@ impl SyscallDispatcher {
         let metadata = match &*open {
             OpenDescription::File { metadata, .. }
             | OpenDescription::Directory { metadata, .. } => metadata,
+            // Real host file: fstat the live fd for the REAL size AND times,
+            // matching `write_fd_stat`. Statx-by-fd MUST report the same
+            // mtime as fstat-by-fd (apt's pkgcache cross-check compares them);
+            // cloning the stored metadata carried a stale/zero mtime and made
+            // statx(AT_EMPTY_PATH) disagree with fstat. See `write_fd_stat`.
             OpenDescription::HostFile { host_fd, metadata, .. } => {
-                let mut md = metadata.clone();
+                let path = metadata.path.to_string_lossy().into_owned();
                 let mut st: libc::stat = unsafe { std::mem::zeroed() };
                 if unsafe { libc::fstat(*host_fd, &mut st) } == 0 {
-                    md.size = st.st_size as usize;
+                    let real = super::real_stat_from_libc(&st);
+                    return write_statx_real(memory, statxbuf, &path, &real);
                 }
-                return write_statx(memory, statxbuf, &md);
+                // fstat failed: fall back to the stored metadata (size only).
+                return write_statx(memory, statxbuf, metadata);
             }
             OpenDescription::SyntheticFile { path, contents, .. } => {
                 return write_synthetic_statx(memory, statxbuf, path, contents.len());
