@@ -668,6 +668,43 @@ impl HostFsBackend {
             Some(normalized)
         }
     }
+
+    /// Resolve `path` to its final non-symlink target, following symlinks
+    /// MANUALLY (40-hop ELOOP guard). cap-std follows a *relative* symlink
+    /// target within the sandbox but refuses an *absolute* one as an escape —
+    /// so `cat /a` where `/a -> /b` (absolute) would otherwise read the link's
+    /// own target string instead of `/b`'s contents. Resolving by hand
+    /// interprets an absolute target relative to the guest root. Returns the
+    /// normalized (scratch-root-relative) path; if the final component doesn't
+    /// exist (e.g. open-for-create) the path is returned unchanged so the
+    /// caller can create it.
+    fn resolve_following(&self, path: &str) -> Option<PathBuf> {
+        let mut normalized = normalize(path)?;
+        let mut hops = 0u32;
+        loop {
+            let Some(rel) = Self::rel_path(&normalized) else {
+                return Some(normalized);
+            };
+            let Ok(meta) = self.dir.symlink_metadata(rel) else {
+                // Doesn't exist (or unreadable) — hand back the path as-is.
+                return Some(normalized);
+            };
+            if !meta.is_symlink() {
+                return Some(normalized);
+            }
+            if hops >= 40 {
+                return None; // ELOOP
+            }
+            hops += 1;
+            let target = self.dir.read_link_contents(rel).ok()?;
+            normalized = if target.is_absolute() {
+                normalize(&target.to_string_lossy())?
+            } else {
+                let parent = normalized.parent().unwrap_or_else(|| Path::new(""));
+                normalize(&parent.join(&target).to_string_lossy())?
+            };
+        }
+    }
 }
 
 /// Extended attribute that carries the guest-intended file mode. carrick runs
@@ -951,7 +988,9 @@ impl FsBackend for HostFsBackend {
     }
 
     fn file_contents(&self, path: &str) -> Option<Vec<u8>> {
-        let normalized = normalize(path)?;
+        // Follow symlinks by hand so an absolute target resolves under the
+        // guest root (cap-std won't traverse it). See `resolve_following`.
+        let normalized = self.resolve_following(path)?;
         let rel = Self::rel_path(&normalized)?;
         let mut buf = Vec::new();
         let mut file = self.dir.open(rel).ok()?;
@@ -1115,7 +1154,10 @@ impl FsBackend for HostFsBackend {
         trunc: bool,
     ) -> Option<i32> {
         use std::os::fd::IntoRawFd;
-        let normalized = normalize(path)?;
+        // Follow symlinks by hand first so an absolute symlink target (which
+        // cap-std refuses to traverse) resolves to the file under the guest
+        // root rather than opening the link itself.
+        let normalized = self.resolve_following(path)?;
         // A tombstoned path is "deleted" in the layered view; don't
         // resurrect it via a raw open.
         let rel = Self::rel_path(&normalized)?;
