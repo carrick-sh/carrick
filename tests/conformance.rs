@@ -37,15 +37,7 @@ static CONFORMANCE_LOCK: Mutex<()> = Mutex::new(());
 /// fixed. Each entry must cite the gap. (Empty: the former "memmap" gap —
 /// MAP_SHARED file coherence — is now fixed via real host-file-backed
 /// stage-2 mappings.)
-const KNOWN_PROBE_GAPS: &[&str] = &[
-    // splice(2) from a pipe into a REGULAR FILE is unsupported: carrick's
-    // `splice_output_errno` (src/dispatch/fs.rs) only accepts a pipe-writer
-    // (or stdio) destination and returns EINVAL for a regular-file out_fd,
-    // whereas real Linux moves the bytes and returns the count. The
-    // pipe->pipe path in this probe DOES match Linux; the gap is solely the
-    // pipe->regular-file destination (splice_pipe_to_file_count/_match lines).
-    "splicepipe",
-];
+const KNOWN_PROBE_GAPS: &[&str] = &[];
 use std::time::{Duration, Instant};
 
 /// Per-case wall-clock deadline. A single wedged guest process (e.g. a
