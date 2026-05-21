@@ -626,6 +626,7 @@ impl SyscallDispatcher {
         50 => fchdir,
         52 => fchmod,
         53 => fchmodat,
+        452 => fchmodat, // fchmodat2: same ABI; handler ignores the extra flags
         54 => fchownat,
         55 => fchown,
         56 => openat,
