@@ -187,10 +187,17 @@ fn apply_tar_to_dir<R: Read>(
 
         if entry_type.is_dir() {
             dir.create_dir_all(&path)?;
-            let _ = dir.set_permissions(
-                &path,
-                cap_std::fs::Permissions::from_mode(mode),
-            );
+            // A directory the owner can't read+search (r-x) would lock carrick
+            // (a non-root macOS process) out of its own scratch. Preserve the
+            // true mode in the carrick xattr and force owner r-x on the real
+            // dir; otherwise apply the image mode directly. (See HostFsBackend
+            // / CARRICK_MODE_XATTR.)
+            if mode & 0o500 != 0o500 {
+                let _ = dir.set_permissions(&path, cap_std::fs::Permissions::from_mode(mode | 0o700));
+                crate::fs_backend::write_mode_xattr(dir, &path, true, mode);
+            } else {
+                let _ = dir.set_permissions(&path, cap_std::fs::Permissions::from_mode(mode));
+            }
             stats.dirs += 1;
         } else if entry_type.is_symlink() {
             let link_name = entry
@@ -208,10 +215,16 @@ fn apply_tar_to_dir<R: Read>(
             let mut f = dir.create(&path)?;
             std::io::copy(&mut entry, &mut f)?;
             drop(f);
-            let _ = dir.set_permissions(
-                &path,
-                cap_std::fs::Permissions::from_mode(mode),
-            );
+            // A file the owner can't read would lock carrick (non-root) out of
+            // serving its content. Preserve the true mode in the carrick xattr
+            // and force owner rw on the real file; otherwise apply the image
+            // mode directly (real_stat reports it faithfully).
+            if mode & 0o400 == 0 {
+                let _ = dir.set_permissions(&path, cap_std::fs::Permissions::from_mode(mode | 0o600));
+                crate::fs_backend::write_mode_xattr(dir, &path, false, mode);
+            } else {
+                let _ = dir.set_permissions(&path, cap_std::fs::Permissions::from_mode(mode));
+            }
             stats.files += 1;
         } else if entry_type.is_hard_link() {
             let link_name = entry

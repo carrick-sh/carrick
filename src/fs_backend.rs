@@ -658,6 +658,109 @@ impl HostFsBackend {
     }
 }
 
+/// Extended attribute that carries the guest-intended file mode. carrick runs
+/// as a non-root macOS user but presents the guest as root, so it must not
+/// chmod a scratch file to a mode that locks itself out (e.g. `creat(f, 0)`
+/// under umask 0777). The real file is kept owner-accessible; the true
+/// guest mode lives in this xattr ON the file. Storing it on the file (rather
+/// than in process memory) makes it coherent across carrick's real `fork`s
+/// and frees us from lifecycle bookkeeping — it moves with rename and dies
+/// with unlink. `user.`-prefixed so it's valid on Linux too (macOS accepts
+/// any name). Reported by `metadata`/`fstat`; root semantics mean carrick
+/// never enforces these bits against the guest, so the real mode can differ.
+const CARRICK_MODE_XATTR: &[u8] = b"user.carrick.mode\0";
+
+/// Same name as a `&str` (no trailing NUL). It lives in the `user.*` namespace
+/// for Linux validity, so the guest-facing xattr syscalls (get/set/list) must
+/// explicitly hide it — otherwise it leaks into the guest's `listxattr`.
+pub(crate) const CARRICK_MODE_XATTR_NAME: &str = "user.carrick.mode";
+
+#[cfg(target_os = "macos")]
+fn fset_mode_xattr(fd: std::os::fd::RawFd, mode: u32) {
+    let v = mode.to_le_bytes();
+    // macOS: fsetxattr(fd, name, value, size, position, options)
+    unsafe {
+        libc::fsetxattr(
+            fd,
+            CARRICK_MODE_XATTR.as_ptr() as *const libc::c_char,
+            v.as_ptr() as *const libc::c_void,
+            v.len(),
+            0,
+            0,
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn fget_mode_xattr(fd: std::os::fd::RawFd) -> Option<u32> {
+    let mut v = [0u8; 4];
+    let n = unsafe {
+        libc::fgetxattr(
+            fd,
+            CARRICK_MODE_XATTR.as_ptr() as *const libc::c_char,
+            v.as_mut_ptr() as *mut libc::c_void,
+            v.len(),
+            0,
+            0,
+        )
+    };
+    (n == 4).then(|| u32::from_le_bytes(v))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn fset_mode_xattr(fd: std::os::fd::RawFd, mode: u32) {
+    let v = mode.to_le_bytes();
+    // Linux: fsetxattr(fd, name, value, size, flags)
+    unsafe {
+        libc::fsetxattr(
+            fd,
+            CARRICK_MODE_XATTR.as_ptr() as *const libc::c_char,
+            v.as_ptr() as *const libc::c_void,
+            v.len(),
+            0,
+        );
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn fget_mode_xattr(fd: std::os::fd::RawFd) -> Option<u32> {
+    let mut v = [0u8; 4];
+    let n = unsafe {
+        libc::fgetxattr(
+            fd,
+            CARRICK_MODE_XATTR.as_ptr() as *const libc::c_char,
+            v.as_mut_ptr() as *mut libc::c_void,
+            v.len(),
+        )
+    };
+    (n == 4).then(|| u32::from_le_bytes(v))
+}
+
+/// Read the guest-mode xattr for `rel` under `dir` (opening a short-lived fd).
+/// `None` if absent or unreadable, so callers fall back to the real mode.
+fn read_mode_xattr(dir: &cap_std::fs::Dir, rel: &Path, is_dir: bool) -> Option<u32> {
+    use std::os::fd::AsRawFd;
+    if is_dir {
+        let d = dir.open_dir(rel).ok()?;
+        fget_mode_xattr(d.as_raw_fd())
+    } else {
+        let f = dir.open(rel).ok()?;
+        fget_mode_xattr(f.as_raw_fd())
+    }
+}
+
+/// Write the guest-mode xattr for `rel` under `dir`. Best-effort.
+pub(crate) fn write_mode_xattr(dir: &cap_std::fs::Dir, rel: &Path, is_dir: bool, mode: u32) {
+    use std::os::fd::AsRawFd;
+    if is_dir {
+        if let Ok(d) = dir.open_dir(rel) {
+            fset_mode_xattr(d.as_raw_fd(), mode);
+        }
+    } else if let Ok(f) = dir.open_with(rel, cap_std::fs::OpenOptions::new().read(true).write(true)) {
+        fset_mode_xattr(f.as_raw_fd(), mode);
+    }
+}
+
 impl FsBackend for HostFsBackend {
     fn lookup(&self, path: &str) -> Option<OverlayEntry> {
         let normalized = normalize(path)?;
@@ -730,15 +833,23 @@ impl FsBackend for HostFsBackend {
         }
         let rel = Self::rel_path(&normalized)?;
         let meta = self.dir.symlink_metadata(rel).ok()?;
-        let mode = {
+        // A guest-mode xattr is the guest-visible mode (see CARRICK_MODE_XATTR);
+        // the real file's mode was forced owner-accessible and isn't faithful.
+        // Symlinks always report 0777, so skip the (link-following) xattr read.
+        let override_mode = if meta.is_symlink() {
+            None
+        } else {
+            read_mode_xattr(&self.dir, rel, meta.is_dir())
+        };
+        let mode = override_mode.unwrap_or_else(|| {
             use cap_std::fs::MetadataExt;
             meta.mode() & 0o7777
-        };
+        });
         if meta.is_dir() {
             return Some(RootFsMetadata {
                 path: normalized,
                 kind: RootFsEntryKind::Directory,
-                mode: if mode == 0 { 0o755 } else { mode },
+                mode: if override_mode.is_none() && mode == 0 { 0o755 } else { mode },
                 size: 0,
             });
         }
@@ -746,7 +857,7 @@ impl FsBackend for HostFsBackend {
             return Some(RootFsMetadata {
                 path: normalized,
                 kind: RootFsEntryKind::File,
-                mode: if mode == 0 { 0o644 } else { mode },
+                mode: if override_mode.is_none() && mode == 0 { 0o644 } else { mode },
                 size: meta.len() as usize,
             });
         }
@@ -985,9 +1096,16 @@ impl FsBackend for HostFsBackend {
         use cap_std::fs::PermissionsExt;
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
-        self.dir
-            .set_permissions(rel, Permissions::from_mode(mode & 0o7777))
-            .map_err(|_| BackendError::Io)
+        let mode = mode & 0o7777;
+        // Force owner rwx on the REAL file so carrick (a non-root macOS
+        // process) can always still open/stat/unlink it, then record the
+        // guest-visible mode in an xattr ON the file (see CARRICK_MODE_XATTR).
+        let is_dir = self.dir.symlink_metadata(rel).map(|m| m.is_dir()).unwrap_or(false);
+        let _ = self
+            .dir
+            .set_permissions(rel, Permissions::from_mode(mode | 0o700));
+        write_mode_xattr(&self.dir, rel, is_dir, mode);
+        Ok(())
     }
 
     fn set_times(
@@ -1081,6 +1199,11 @@ impl FsBackend for HostFsBackend {
         if !name.starts_with("user.") {
             return Err(crate::linux_abi::LINUX_ENOTSUP);
         }
+        // Hide carrick's internal mode xattr: a guest must not be able to read
+        // or clobber it (it lives in user.* only for Linux validity).
+        if name == CARRICK_MODE_XATTR_NAME {
+            return Err(crate::linux_abi::LINUX_ENOTSUP);
+        }
         // Open a real kernel fd for the materialised file (same approach as
         // `set_times`/`allocate`) and drive macOS `fsetxattr(2)` on it. The
         // attribute name is stored verbatim ("user.foo"), so a later
@@ -1124,7 +1247,7 @@ impl FsBackend for HostFsBackend {
     }
 
     fn get_xattr(&self, path: &str, name: &str) -> Result<Vec<u8>, i32> {
-        if !name.starts_with("user.") {
+        if !name.starts_with("user.") || name == CARRICK_MODE_XATTR_NAME {
             return Err(crate::linux_abi::LINUX_ENODATA);
         }
         let host_fd = self
@@ -1205,7 +1328,7 @@ impl FsBackend for HostFsBackend {
             .split(|&b| b == 0)
             .filter(|s| !s.is_empty())
             .filter_map(|s| std::str::from_utf8(s).ok())
-            .filter(|s| s.starts_with("user."))
+            .filter(|s| s.starts_with("user.") && *s != CARRICK_MODE_XATTR_NAME)
             .map(|s| s.to_owned())
             .collect();
         Ok(names)
@@ -1260,10 +1383,20 @@ impl FsBackend for HostFsBackend {
             RootFsEntryKind::Symlink => 0o777,
             RootFsEntryKind::File => 0o644,
         };
+        // The real file's mode was forced owner-accessible; the guest-visible
+        // mode lives in an xattr on the (symlink-resolved) target. Symlinks
+        // always report 0777, so skip the link-following xattr read for them.
+        let override_mode = if matches!(kind, RootFsEntryKind::Symlink) {
+            None
+        } else {
+            Self::rel_path(&normalized).and_then(|rel| {
+                read_mode_xattr(&self.dir, rel, matches!(kind, RootFsEntryKind::Directory))
+            })
+        };
         Some(RealStat {
             kind,
             nlink: meta.nlink() as u32,
-            mode: if mode == 0 { default_mode } else { mode },
+            mode: override_mode.unwrap_or(if mode == 0 { default_mode } else { mode }),
             size: meta.len(),
             atime: (meta.atime(), meta.atime_nsec()),
             mtime: (meta.mtime(), meta.mtime_nsec()),
@@ -1592,6 +1725,33 @@ mod tests {
     fn host_child_names_only_immediate() {
         let (mut b, _scratch) = host_backend();
         scenario_child_names_only_immediate(&mut b);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_open_raw_fd_then_set_mode_visible_via_fget_xattr() {
+        // Mirrors the openat(O_CREAT)+fstat path: create+open a real fd, set
+        // the guest mode, then read it back from THAT fd (what fstat does).
+        let (mut b, _scratch) = host_backend();
+        let fd = b.open_raw_fd("/g", true, true, true).expect("open_raw_fd");
+        b.set_mode("/g", 0o041).unwrap();
+        assert_eq!(fget_mode_xattr(fd), Some(0o041), "fstat-side xattr read");
+        unsafe { libc::close(fd) };
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_set_mode_roundtrips_via_xattr_even_when_inaccessible() {
+        let (mut b, _scratch) = host_backend();
+        b.create_file("/f").unwrap();
+        // A mode with no owner-read would lock carrick out if applied
+        // literally; the xattr must still report it faithfully.
+        b.set_mode("/f", 0o041).unwrap();
+        assert_eq!(b.metadata("/f").unwrap().mode, 0o041);
+        b.set_mode("/f", 0).unwrap();
+        assert_eq!(b.metadata("/f").unwrap().mode, 0);
+        b.set_mode("/f", 0o755).unwrap();
+        assert_eq!(b.metadata("/f").unwrap().mode, 0o755);
     }
 
     /// Cap-std enforces sandboxing at the syscall layer: trying to
