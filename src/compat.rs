@@ -209,11 +209,10 @@ impl CompatReporter {
         // this is near-free when no DTrace consumer is attached.
         crate::probes::fire(&event);
         // Opt-in verbose stderr trace (cached env check, not per-call).
-        if self.trace_syscalls {
-            if let Ok(line) = serde_json::to_string(&event) {
+        if self.trace_syscalls
+            && let Ok(line) = serde_json::to_string(&event) {
                 eprintln!("[carrick-syscall] {line}");
             }
-        }
         // Aggregate inline. Common events (entry/return) are pure
         // counter bumps; rare events land in their dedup maps.
         match event {

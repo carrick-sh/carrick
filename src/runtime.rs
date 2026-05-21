@@ -58,7 +58,7 @@ impl DebugStateSnapshot {
 
     pub fn write_to(&self, path: &Path) -> std::io::Result<()> {
         let bytes = serde_json::to_vec_pretty(self).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, format!("serialize: {e}"))
+            std::io::Error::other(format!("serialize: {e}"))
         })?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -514,11 +514,10 @@ where
             }
         }
 
-        if !suppress_signal_check {
-            if let Some(action) =
+        if !suppress_signal_check
+            && let Some(action) =
                 deliver_pending_signal(runtime, &mut dispatcher, last_syscall_retval)?
-            {
-                if let Some(exit) = action.exit_code {
+                && let Some(exit) = action.exit_code {
                     return Ok(RunResult {
                         exit_code: exit,
                         stdout: dispatcher.stdout().to_vec(),
@@ -528,8 +527,6 @@ where
                         trap_limit_hit: false,
                     });
                 }
-            }
-        }
     }
 
     Ok(RunResult {
@@ -766,7 +763,7 @@ fn run_vcpu_until_exit(
                 // Write parent_tid / child_tid (i32 LE) into guest memory as
                 // requested by CLONE_PARENT_SETTID / CLONE_CHILD_SETTID. The
                 // dispatcher passes the addrs only when the flag is set.
-                let tid_bytes = (tid as i32).to_le_bytes();
+                let tid_bytes = tid.to_le_bytes();
                 if parent_tid_addr != 0 {
                     let _ = engine.write_bytes(parent_tid_addr, &tid_bytes);
                 }
@@ -834,12 +831,11 @@ fn run_vcpu_until_exit(
             }
             DispatchOutcome::ThreadExit { code } => {
                 // CLONE_CHILD_CLEARTID: zero the word + wake one waiter.
-                if let Some(addr) = registry.clear_child_tid(this_tid) {
-                    if addr != 0 {
+                if let Some(addr) = registry.clear_child_tid(this_tid)
+                    && addr != 0 {
                         let _ = engine.write_bytes(addr, &0i32.to_le_bytes());
                         futex.wake(addr, 1);
                     }
-                }
                 let last = registry.exit(this_tid);
                 if last {
                     let result = assemble_run_result(&kernel, code, traps, false);
@@ -932,13 +928,11 @@ fn run_vcpu_until_exit(
             let mut k = kernel.0.lock().expect("kernel lock poisoned");
             if let Some(action) =
                 deliver_pending_signal(&mut engine, &mut k.dispatcher, last_syscall_retval)?
-            {
-                if let Some(exit) = action.exit_code {
+                && let Some(exit) = action.exit_code {
                     drop(k);
                     let result = assemble_run_result(&kernel, exit, traps, false);
                     return Ok(VcpuLoopOutcome::ProcessExit(Box::new(result)));
                 }
-            }
         }
     }
 
@@ -1102,7 +1096,7 @@ fn parse_shebang(head: &[u8]) -> Option<(String, Option<String>)> {
     let line = &head[2..line_end.min(256)];
     let line = std::str::from_utf8(line).ok()?;
     let line = line.trim_start_matches([' ', '\t']);
-    let mut parts = line.splitn(2, |c| c == ' ' || c == '\t');
+    let mut parts = line.splitn(2, [' ', '\t']);
     let interp = parts.next()?.to_string();
     if interp.is_empty() {
         return None;
@@ -1241,11 +1235,10 @@ where
             }
         }
 
-        if !suppress_signal_check {
-            if let Some(action) =
+        if !suppress_signal_check
+            && let Some(action) =
                 deliver_pending_signal(trap, &mut dispatcher, last_syscall_retval)?
-            {
-                if let Some(exit) = action.exit_code {
+                && let Some(exit) = action.exit_code {
                     return Ok(RunResult {
                         exit_code: exit,
                         stdout: dispatcher.stdout().to_vec(),
@@ -1255,8 +1248,6 @@ where
                         trap_limit_hit: false,
                     });
                 }
-            }
-        }
     }
 
     Ok(RunResult {

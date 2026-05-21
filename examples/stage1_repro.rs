@@ -84,7 +84,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut pt_mem = vm.memory_create(PT_SIZE)?;
     pt_mem.map(PT_BASE, MemPerms::ReadWriteExec)?;
     let mut pt = vec![0u8; PT_SIZE];
-    let l1_0: u64 = (0u64 & 0x0000_FFFF_C000_0000) | l1_flags;
+    let l1_0: u64 = l1_flags;
     pt[0..8].copy_from_slice(&l1_0.to_le_bytes());
     let l1_1: u64 = (0x4000_0000u64 & 0x0000_FFFF_C000_0000) | l1_flags;
     pt[8..16].copy_from_slice(&l1_1.to_le_bytes());
