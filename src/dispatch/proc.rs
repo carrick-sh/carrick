@@ -671,7 +671,18 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn sys_exit<M: GuestMemory>(&mut self, ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
-        Ok(self.exit(ctx.request))
+        let code = ctx.request.arg(0) as i32;
+        // exit_group(94) always tears down the whole process. exit(93) ends
+        // just this thread IF siblings are still live; with only one live
+        // thread (or no ThreadCtx) it's equivalent to whole-process exit.
+        if ctx.request.number == 93 {
+            if let Some(t) = ctx.thread {
+                if t.registry.live_count() > 1 {
+                    return Ok(DispatchOutcome::ThreadExit { code });
+                }
+            }
+        }
+        Ok(DispatchOutcome::Exit { code })
     }
 
     pub(super) fn sys_clone3<M: GuestMemory>(&mut self, ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
@@ -682,11 +693,6 @@ impl SyscallDispatcher {
         Ok(self.rseq())
     }
 
-    fn exit(&self, request: SyscallRequest) -> DispatchOutcome {
-        DispatchOutcome::Exit {
-            code: request.arg(0) as i32,
-        }
-    }
 }
 
 fn fill_deterministic_bootstrap_random(bytes: &mut [u8]) {
