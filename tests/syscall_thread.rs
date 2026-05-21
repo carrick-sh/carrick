@@ -62,3 +62,137 @@ fn clone_fork_flags_still_fork() {
         .unwrap();
     assert_eq!(outcome, DispatchOutcome::Fork);
 }
+
+// --- Sub-task B: per-thread tid + real futex via dispatch_threaded ---
+
+use carrick::thread::{FutexTable, ThreadRegistry};
+use std::sync::Arc;
+
+const LINUX_EAGAIN: i32 = 11;
+
+fn write_u32_le(memory: &mut LinearMemory, addr: u64, value: u32) {
+    memory.write_bytes(addr, &value.to_le_bytes()).unwrap();
+}
+
+#[test]
+fn gettid_returns_per_thread_tid_not_pid() {
+    let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    let registry = Arc::new(ThreadRegistry::new(1000));
+    let futex = Arc::new(FutexTable::new());
+    let tid = registry.register_child(0);
+    // gettid is syscall 178.
+    let outcome = dispatcher
+        .dispatch_threaded(
+            SyscallRequest::new(178, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+            &mut memory,
+            &mut reporter,
+            tid,
+            &registry,
+            &futex,
+        )
+        .unwrap();
+    assert_eq!(outcome, DispatchOutcome::Returned { value: tid as i64 });
+}
+
+#[test]
+fn set_tid_address_records_clear_child_tid_and_returns_tid() {
+    let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    let registry = Arc::new(ThreadRegistry::new(1000));
+    let futex = Arc::new(FutexTable::new());
+    let tid = registry.register_child(0);
+    // set_tid_address(addr) is syscall 96.
+    let outcome = dispatcher
+        .dispatch_threaded(
+            SyscallRequest::new(96, SyscallArgs::from([0x10500, 0, 0, 0, 0, 0])),
+            &mut memory,
+            &mut reporter,
+            tid,
+            &registry,
+            &futex,
+        )
+        .unwrap();
+    assert_eq!(outcome, DispatchOutcome::Returned { value: tid as i64 });
+    assert_eq!(registry.clear_child_tid(tid), Some(0x10500));
+}
+
+#[test]
+fn futex_wait_value_mismatch_returns_eagain() {
+    let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    let registry = Arc::new(ThreadRegistry::new(1000));
+    let futex = Arc::new(FutexTable::new());
+    // *uaddr = 5, but FUTEX_WAIT expects 7 -> EAGAIN immediately.
+    write_u32_le(&mut memory, 0x10800, 5);
+    // futex(uaddr, FUTEX_WAIT|PRIVATE, val=7, timeout=0)
+    let op = LINUX_FUTEX_WAIT | LINUX_FUTEX_PRIVATE_FLAG;
+    let outcome = dispatcher
+        .dispatch_threaded(
+            SyscallRequest::new(98, SyscallArgs::from([0x10800, op, 7, 0, 0, 0])),
+            &mut memory,
+            &mut reporter,
+            1001,
+            &registry,
+            &futex,
+        )
+        .unwrap();
+    assert_eq!(outcome, DispatchOutcome::Errno { errno: LINUX_EAGAIN });
+}
+
+#[test]
+fn futex_wake_returns_count_and_advances_table() {
+    let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    let registry = Arc::new(ThreadRegistry::new(1000));
+    let futex = Arc::new(FutexTable::new());
+    write_u32_le(&mut memory, 0x10800, 0);
+    let op = LINUX_FUTEX_WAKE | LINUX_FUTEX_PRIVATE_FLAG;
+    // FUTEX_WAKE with count=1 should report 1 woken (best-effort upper bound)
+    // and bump the generation so a concurrent waiter would re-check.
+    let outcome = dispatcher
+        .dispatch_threaded(
+            SyscallRequest::new(98, SyscallArgs::from([0x10800, op, 1, 0, 0, 0])),
+            &mut memory,
+            &mut reporter,
+            1001,
+            &registry,
+            &futex,
+        )
+        .unwrap();
+    assert_eq!(outcome, DispatchOutcome::Returned { value: 1 });
+}
+
+#[test]
+fn futex_wait_matching_value_blocks_via_outcome() {
+    let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    let registry = Arc::new(ThreadRegistry::new(1000));
+    let futex = Arc::new(FutexTable::new());
+    // *uaddr == val -> the handler must NOT block under the kernel lock; it
+    // surfaces a FutexWait outcome the runtime services with the lock dropped.
+    write_u32_le(&mut memory, 0x10800, 42);
+    let op = LINUX_FUTEX_WAIT | LINUX_FUTEX_PRIVATE_FLAG;
+    let outcome = dispatcher
+        .dispatch_threaded(
+            SyscallRequest::new(98, SyscallArgs::from([0x10800, op, 42, 0, 0, 0])),
+            &mut memory,
+            &mut reporter,
+            1001,
+            &registry,
+            &futex,
+        )
+        .unwrap();
+    assert_eq!(
+        outcome,
+        DispatchOutcome::FutexWait {
+            addr: 0x10800,
+            timeout: None,
+        }
+    );
+}
