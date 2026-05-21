@@ -3530,8 +3530,35 @@ impl SyscallDispatcher {
         });
         if let Some(path) = path {
             let _ = self.fs.rootfs_vfs.overlay.set_owner(&path, uid, gid);
+            self.clear_setid_on_chown(&path);
         }
         Ok(DispatchOutcome::Returned { value: 0 })
+    }
+
+    /// Linux clears a regular file's set-user-ID (and set-group-ID, when the
+    /// file is group-executable) bits on chown — a security measure so a
+    /// chowned setuid binary can't grant the new owner's privileges. setgid
+    /// without group-exec is a mandatory-locking marker and is left alone.
+    fn clear_setid_on_chown(&mut self, path: &str) {
+        let Some(real) = self.fs.rootfs_vfs.overlay.real_stat(path, false) else {
+            return;
+        };
+        if !matches!(real.kind, RootFsEntryKind::File) {
+            return;
+        }
+        let mut mode = real.mode;
+        let mut changed = false;
+        if mode & 0o4000 != 0 {
+            mode &= !0o4000;
+            changed = true;
+        }
+        if mode & 0o2000 != 0 && mode & 0o0010 != 0 {
+            mode &= !0o2000;
+            changed = true;
+        }
+        if changed {
+            let _ = self.fs.rootfs_vfs.overlay.set_mode(path, mode);
+        }
     }
 
     pub(super) fn fchownat<M: GuestMemory>(
@@ -3577,6 +3604,7 @@ impl SyscallDispatcher {
         match self.layered_metadata(&resolved) {
             Ok(_) => {
                 let _ = self.fs.rootfs_vfs.overlay.set_owner(&resolved, uid, gid);
+                self.clear_setid_on_chown(&resolved);
                 Ok(DispatchOutcome::Returned { value: 0 })
             }
             Err(errno) => {
