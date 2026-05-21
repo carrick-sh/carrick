@@ -94,6 +94,11 @@ mod carrick_usdt {
     /// syscall a guest address changes across — e.g. which operation corrupts
     /// a GOT slot. Zero-cost (and not even read) when the env var is unset.
     fn mem__watch(_: u64, _: u64, _: u64) {}
+    /// Fires in rt_sigaction with the first four u64 words the guest passed in
+    /// its `struct sigaction` (offsets 0/8/16/24). Lets a trace see the exact
+    /// on-the-wire layout — sa_handler, sa_flags, and whether offset 16 is
+    /// sa_restorer (glibc-style) or sa_mask (aarch64 kernel ABI, no restorer).
+    fn sigaction__read(_: i32, _: u64, _: u64, _: u64, _: u64) {}
 }
 
 pub fn fork_pre(pc: u64, elr: u64, cpsr: u64) {
@@ -160,6 +165,10 @@ pub fn signal_restore(saved_pc: u64, sp: u64, magic: u64) {
 
 pub fn mem_watch(syscall_nr: u64, addr: u64, value: u64) {
     carrick_usdt::mem__watch!(|| (syscall_nr, addr, value));
+}
+
+pub fn sigaction_read(signum: i32, w0: u64, w1: u64, w2: u64, w3: u64) {
+    carrick_usdt::sigaction__read!(|| (signum, w0, w1, w2, w3));
 }
 
 // `#[inline(never)]`: usdt embeds the probe site (an asm! anchor) in
