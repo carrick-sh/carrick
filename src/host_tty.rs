@@ -27,8 +27,8 @@
 //! in a `OnceLock`-owned static plus a `host_signal`-style cleanup
 //! call from `runtime::run_combined_syscall_loop_with_dispatcher`.
 
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 use crate::linux_abi::{LinuxTermios, LinuxWinsize};
 
@@ -328,53 +328,71 @@ fn linux_to_darwin_termios(l: &LinuxTermios, d: &mut libc::termios) {
     d.c_ospeed = l.c_ospeed as libc::speed_t;
 }
 
-/// Snapshot of the host's fd-0 termios captured before the guest
-/// ever runs. Used by `TermiosRestoreGuard` to put the terminal
-/// back the way we found it on exit.
-static SAVED_STDIN_TERMIOS: OnceLock<Option<libc::termios>> = OnceLock::new();
-static TERMIOS_DIRTIED: AtomicBool = AtomicBool::new(false);
+/// Per-fd snapshot of termios captured before the guest (or `make_raw`)
+/// mutates a terminal.  The key is the host fd number; the value is the
+/// termios at the moment the fd was first recorded.  `restore_stdin_termios`
+/// drains this map and restores every fd it contains.
+///
+/// `libc::termios` does not implement `Send` on all platforms because it can
+/// contain pointer-width fields, but in practice it is just a bag of integers
+/// and we never move the underlying fd.  The `Mutex` provides the required
+/// exclusive-access guarantee.
+static SAVED_TERMIOS: Mutex<Option<HashMap<i32, libc::termios>>> =
+    Mutex::new(None);
 
-/// Capture the current host stdin termios so it can be restored on
-/// shutdown. Idempotent; subsequent calls are no-ops. Must be called
+/// Snapshot `fd`'s current termios into `SAVED_TERMIOS` if it is a TTY and
+/// not already recorded.  Returns `true` if a snapshot was taken or already
+/// existed, `false` if the fd is not a TTY or `tcgetattr` failed.
+///
+/// This is "first write wins": calling it again after the terminal has been
+/// put into raw mode does **not** overwrite the original cooked snapshot.
+fn snapshot_fd(fd: i32) -> bool {
+    if !host_isatty(fd) {
+        return false;
+    }
+    // SAFETY: zero-initialised termios, then filled by tcgetattr.
+    let mut t: libc::termios = unsafe { core::mem::zeroed() };
+    if unsafe { libc::tcgetattr(fd, &mut t) } != 0 {
+        return false;
+    }
+    let mut guard = SAVED_TERMIOS.lock().unwrap();
+    let map = guard.get_or_insert_with(HashMap::new);
+    map.entry(fd).or_insert(t);
+    true
+}
+
+/// Capture the current host stdin (fd 0) termios so it can be restored on
+/// shutdown. Idempotent; subsequent calls for fd 0 are no-ops. Must be called
 /// *before* the guest has a chance to invoke `tcsetattr` against us.
 pub fn arm_stdin_restore() {
-    SAVED_STDIN_TERMIOS.get_or_init(|| {
-        if !host_isatty(0) {
-            return None;
-        }
-        // SAFETY: zero-initialised termios, then filled by tcgetattr.
-        unsafe {
-            let mut t: libc::termios = core::mem::zeroed();
-            if libc::tcgetattr(0, &mut t) == 0 {
-                Some(t)
-            } else {
-                None
-            }
-        }
-    });
+    snapshot_fd(0);
 }
 
-/// Mark that we've potentially mutated the host's stdin termios.
-/// Called from `set_host_termios` so `restore_stdin_termios` knows
-/// whether work is actually needed.
+/// Mark that `fd`'s termios has been (or is about to be) mutated.  Snapshots
+/// the *current* (pre-mutation) termios so `restore_stdin_termios` can undo
+/// the change.  For fd 0 this preserves the same "arm-then-mark" semantics as
+/// before; for other fds it provides per-fd restoration used by `make_raw`.
 fn mark_dirty(fd: i32) {
-    if fd == 0 {
-        TERMIOS_DIRTIED.store(true, Ordering::SeqCst);
-    }
+    // Snapshot first (no-op if already recorded); the caller must invoke this
+    // before applying any mutation so the original state is preserved.
+    snapshot_fd(fd);
 }
 
-/// Restore the previously-captured host stdin termios, if any. Safe
-/// to call multiple times; only the first call after a dirty mutation
-/// does work.
+/// Restore every previously-captured termios snapshot and clear the store.
+/// Safe to call multiple times; subsequent calls after the store is empty are
+/// cheap no-ops.
 pub fn restore_stdin_termios() {
-    if !TERMIOS_DIRTIED.swap(false, Ordering::SeqCst) {
-        return;
-    }
-    if let Some(Some(saved)) = SAVED_STDIN_TERMIOS.get() {
-        // SAFETY: `saved` is a fully-initialised termios captured via
-        // tcgetattr at arm time. tcsetattr on fd 0 is well-defined.
-        unsafe {
-            libc::tcsetattr(0, libc::TCSANOW, saved);
+    let snapshots = {
+        let mut guard = SAVED_TERMIOS.lock().unwrap();
+        guard.take()
+    };
+    if let Some(map) = snapshots {
+        for (fd, saved) in map {
+            // SAFETY: `saved` is a fully-initialised termios captured via
+            // tcgetattr. tcsetattr on a valid fd is well-defined.
+            unsafe {
+                libc::tcsetattr(fd, libc::TCSANOW, &saved);
+            }
         }
     }
 }
@@ -408,11 +426,32 @@ impl Drop for TermiosRestoreGuard {
 /// Public wrapper that both pushes the new termios to the host and
 /// records the dirty bit so the restore guard knows it has work.
 pub fn set_host_termios_tracking(fd: i32, linux: &LinuxTermios) -> bool {
-    let ok = set_host_termios(fd, linux);
-    if ok {
-        mark_dirty(fd);
+    // Snapshot before mutation so restore_stdin_termios can undo it.
+    mark_dirty(fd);
+    set_host_termios(fd, linux)
+}
+
+/// Put `fd` into raw mode (cfmakeraw semantics) after recording its current
+/// termios for restoration via the existing dirty-tracking guard.  Errors if
+/// `fd` is not a tty.
+///
+/// A later call to `restore_stdin_termios()` (e.g. from `TermiosRestoreGuard`
+/// on shutdown) will put the terminal back to its original cooked state.
+pub fn make_raw(fd: i32) -> std::io::Result<()> {
+    // SAFETY: fd is validated by tcgetattr; termios is a valid out-param.
+    let mut t: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(fd, &mut t) } != 0 {
+        return Err(std::io::Error::last_os_error());
     }
-    ok
+    // Snapshot the original (cooked) state BEFORE applying cfmakeraw so that
+    // restore_stdin_termios has the pre-raw termios to restore.
+    mark_dirty(fd);
+    // SAFETY: cfmakeraw mutates termios in place; the struct is valid.
+    unsafe { libc::cfmakeraw(&mut t) };
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &t) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -490,5 +529,109 @@ mod tests {
         assert_eq!(d.c_cc[8], 0x42);
         let l2 = darwin_to_linux_termios(&d);
         assert_eq!(l2.c_cc[0], 0x42);
+    }
+
+    // ---- helpers for make_raw tests ----
+
+    fn open_test_pty_for_raw() -> (i32, i32) {
+        let m = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
+        assert!(m >= 0, "posix_openpt failed");
+        unsafe {
+            libc::grantpt(m);
+            libc::unlockpt(m);
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr(libc::ptsname(m)) }.to_owned();
+        let s = unsafe { libc::open(name.as_ptr(), libc::O_RDWR | libc::O_NOCTTY) };
+        assert!(s >= 0, "open slave pty failed");
+        (m, s)
+    }
+
+    #[test]
+    fn make_raw_clears_icanon_and_echo() {
+        let (master, slave) = open_test_pty_for_raw();
+        let before = unsafe {
+            let mut t: libc::termios = std::mem::zeroed();
+            libc::tcgetattr(slave, &mut t);
+            t
+        };
+        assert!(
+            before.c_lflag as u64 & (DARWIN_LFLAG_ICANON | DARWIN_LFLAG_ECHO) != 0,
+            "slave starts cooked (ICANON|ECHO must be set)"
+        );
+        make_raw(slave).unwrap();
+        let raw = unsafe {
+            let mut t: libc::termios = std::mem::zeroed();
+            libc::tcgetattr(slave, &mut t);
+            t
+        };
+        assert_eq!(
+            raw.c_lflag as u64 & (DARWIN_LFLAG_ICANON | DARWIN_LFLAG_ECHO),
+            0,
+            "raw clears ICANON|ECHO"
+        );
+        unsafe {
+            libc::close(master);
+            libc::close(slave);
+        }
+    }
+
+    #[test]
+    fn make_raw_snapshot_survives_restore() {
+        // Open a fresh pty slave so we don't interfere with fd-0 restore state.
+        let (master, slave) = open_test_pty_for_raw();
+
+        // Capture original cooked state.
+        let cooked = unsafe {
+            let mut t: libc::termios = std::mem::zeroed();
+            assert_eq!(libc::tcgetattr(slave, &mut t), 0);
+            t
+        };
+
+        // make_raw should snapshot the cooked state, then apply raw mode.
+        make_raw(slave).unwrap();
+
+        // Verify raw is active.
+        let raw = unsafe {
+            let mut t: libc::termios = std::mem::zeroed();
+            libc::tcgetattr(slave, &mut t);
+            t
+        };
+        assert_eq!(
+            raw.c_lflag as u64 & DARWIN_LFLAG_ICANON,
+            0,
+            "raw clears ICANON"
+        );
+
+        // Now restore and verify it goes back to cooked.
+        restore_stdin_termios();
+
+        let restored = unsafe {
+            let mut t: libc::termios = std::mem::zeroed();
+            assert_eq!(libc::tcgetattr(slave, &mut t), 0);
+            t
+        };
+        assert_eq!(
+            restored.c_lflag as u64 & DARWIN_LFLAG_ICANON,
+            cooked.c_lflag as u64 & DARWIN_LFLAG_ICANON,
+            "ICANON is restored to original value"
+        );
+
+        unsafe {
+            libc::close(master);
+            libc::close(slave);
+        }
+    }
+
+    #[test]
+    fn make_raw_non_tty_returns_error() {
+        let mut fds = [0i32; 2];
+        let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(rc, 0);
+        let result = make_raw(fds[0]);
+        assert!(result.is_err(), "make_raw on a pipe should return Err");
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
     }
 }
