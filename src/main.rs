@@ -500,7 +500,9 @@ fn main() -> anyhow::Result<()> {
                         dispatcher.set_stream_stdio(true);
                         Some(relay)
                     } else {
-                        if raw { dispatcher.set_stream_stdio(true); }
+                        if raw {
+                            dispatcher.set_stream_stdio(true);
+                        }
                         None
                     };
                     // Capture the run result WITHOUT `?` so that relay.stop()
@@ -554,7 +556,9 @@ fn main() -> anyhow::Result<()> {
                         dispatcher.set_stream_stdio(true);
                         Some(relay)
                     } else {
-                        if raw { dispatcher.set_stream_stdio(true); }
+                        if raw {
+                            dispatcher.set_stream_stdio(true);
+                        }
                         None
                     };
                     // Capture the run result WITHOUT `?` so that relay.stop()

@@ -1834,7 +1834,10 @@ fn run_accepts_tty_flag() {
         .output()
         .unwrap();
     let help = String::from_utf8_lossy(&out.stdout);
-    assert!(help.contains("--tty"), "run --help should mention --tty:\n{help}");
+    assert!(
+        help.contains("--tty"),
+        "run --help should mention --tty:\n{help}"
+    );
 }
 
 fn minimal_aarch64_elf() -> Vec<u8> {

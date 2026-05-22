@@ -386,7 +386,10 @@ fn tiocgpgrp_on_real_tty_uses_host_value_not_bootstrap() {
     let via_helper = carrick::host_tty::host_tty_tcgetpgrp(slave);
     match via_helper {
         Ok(pgrp) => {
-            assert_eq!(pgrp, direct, "host_tty_tcgetpgrp must match direct tcgetpgrp");
+            assert_eq!(
+                pgrp, direct,
+                "host_tty_tcgetpgrp must match direct tcgetpgrp"
+            );
             // Must never be the synthesised bootstrap constant on a real tty.
             assert_ne!(
                 pgrp,
@@ -445,8 +448,16 @@ fn tiocspgrp_on_real_tty_calls_host_not_fake() {
     // SAFETY: same fd, same call.
     let direct_r = unsafe { libc::tcsetpgrp(slave, our_pgrp) };
     match result_helper {
-        Ok(()) => assert_eq!(direct_r, 0, "helper Ok but direct call returned {}", direct_r),
-        Err(_) => assert!(direct_r < 0, "helper Err but direct call returned {}", direct_r),
+        Ok(()) => assert_eq!(
+            direct_r, 0,
+            "helper Ok but direct call returned {}",
+            direct_r
+        ),
+        Err(_) => assert!(
+            direct_r < 0,
+            "helper Err but direct call returned {}",
+            direct_r
+        ),
     }
 
     // SAFETY: closing fds we opened above.
