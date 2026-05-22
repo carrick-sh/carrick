@@ -131,6 +131,15 @@ impl PtyRelay {
                 libc::fcntl(winch_w, libc::F_SETFL, fl | libc::O_NONBLOCK);
             }
         }
+        // Make the read end non-blocking so the drain loop in relay_loop exits
+        // with EAGAIN (read returns -1 → r <= 0 → break) once all pending bytes
+        // are consumed, instead of blocking forever on an empty pipe.
+        unsafe {
+            let fl = libc::fcntl(winch_r, libc::F_GETFL);
+            if fl >= 0 {
+                libc::fcntl(winch_r, libc::F_SETFL, fl | libc::O_NONBLOCK);
+            }
+        }
         // Publish write end to global so the handler can reach it.
         WINCH_PIPE_WRITE.store(winch_w, Ordering::SeqCst);
 
