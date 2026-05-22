@@ -17,6 +17,7 @@ pub struct PtyRole {
 struct PtyEntry {
     host_slave_name: String,
     locked: bool,
+    owner_pid: u32,
 }
 
 /// Maps a guest pts index to the macOS master fd + slave device name.
@@ -35,9 +36,9 @@ impl PtyTable {
         }
     }
 
-    /// Record a freshly-opened pty's slave device name; returns the
-    /// allocated index N.
-    pub fn insert(&mut self, host_slave_name: String) -> u32 {
+    /// Record a freshly-opened pty's slave name and the pid that opened the
+    /// master; returns the allocated index N.
+    pub fn insert(&mut self, host_slave_name: String, owner_pid: u32) -> u32 {
         let n = self.next_index;
         self.next_index += 1;
         self.entries.insert(
@@ -45,6 +46,7 @@ impl PtyTable {
             PtyEntry {
                 host_slave_name,
                 locked: true,
+                owner_pid,
             },
         );
         n
@@ -73,6 +75,15 @@ impl PtyTable {
     /// dispatcher owns fd closing; this only updates the directory view.
     pub fn free(&mut self, n: u32) {
         self.entries.remove(&n);
+    }
+
+    /// Remove entry `n` only if `pid` opened it. A forked child that closes
+    /// its inherited master must NOT remove the parent's entry (the per-process
+    /// table is a fork copy); only the owning process's close frees it.
+    pub fn free_if_owner(&mut self, n: u32, pid: u32) {
+        if self.entries.get(&n).map(|e| e.owner_pid) == Some(pid) {
+            self.entries.remove(&n);
+        }
     }
 }
 
@@ -213,7 +224,7 @@ impl Vfs for DevptsVfs {
             let mut table = self.pty_table.lock();
             let (master_fd, slave_name) =
                 open_master(flags.nonblock).map_err(crate::dispatch::macos_to_linux_errno)?;
-            let index = table.insert(slave_name);
+            let index = table.insert(slave_name, std::process::id());
             let status_flags = if flags.nonblock {
                 crate::linux_abi::LINUX_O_NONBLOCK as u32
             } else {
@@ -279,8 +290,8 @@ mod tests {
     #[test]
     fn alloc_lookup_free_roundtrip() {
         let mut t = PtyTable::new();
-        let n0 = t.insert("/dev/ttys000".into());
-        let n1 = t.insert("/dev/ttys001".into());
+        let n0 = t.insert("/dev/ttys000".into(), 1234);
+        let n1 = t.insert("/dev/ttys001".into(), 1234);
         assert_eq!(n0, 0);
         assert_eq!(n1, 1);
         assert_eq!(t.slave_name(0).as_deref(), Some("/dev/ttys000"));
@@ -293,7 +304,17 @@ mod tests {
         t.free(0);
         assert_eq!(t.slave_name(0), None);
         assert_eq!(t.live_indices(), vec![1]);
-        assert_eq!(t.insert("/dev/ttys002".into()), 2);
+        assert_eq!(t.insert("/dev/ttys002".into(), 1234), 2);
+    }
+
+    #[test]
+    fn free_if_owner_only_frees_for_owning_pid() {
+        let mut t = PtyTable::new();
+        let n = t.insert("/dev/ttysX".into(), 100);
+        t.free_if_owner(n, 999); // non-owner: no-op
+        assert!(t.slave_name(n).is_some());
+        t.free_if_owner(n, 100); // owner: frees
+        assert!(t.slave_name(n).is_none());
     }
 
     #[test]
@@ -312,7 +333,7 @@ mod tests {
         assert!(dev.lookup("/dev/pts/0").is_err());
 
         // Allocate a slave name out-of-band; use /dev/null as an openable stand-in.
-        let n = table.lock().insert("/dev/null".into());
+        let n = table.lock().insert("/dev/null".into(), 1234);
         assert_eq!(n, 0);
         assert_eq!(
             dev.lookup("/dev/pts/0").unwrap().kind,

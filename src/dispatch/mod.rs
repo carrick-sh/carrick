@@ -4616,7 +4616,7 @@ mod overlay_dispatch_tests {
         let index = dispatcher
             .pty_table()
             .lock()
-            .insert("dummy-slave".to_string());
+            .insert("dummy-slave".to_string(), 1234);
         assert_eq!(
             dispatcher.pty_table().lock().live_indices(),
             vec![index],
