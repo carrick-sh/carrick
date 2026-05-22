@@ -93,6 +93,9 @@ impl PtyTable {
     /// dispatcher owns fd closing; this only updates the directory view.
     pub fn free(&mut self, n: u32) {
         self.entries.remove(&n);
+        if self.controlling_index == Some(n) {
+            self.controlling_index = None;
+        }
     }
 
     /// Remove entry `n` only if `pid` opened it. A forked child that closes
@@ -101,6 +104,9 @@ impl PtyTable {
     pub fn free_if_owner(&mut self, n: u32, pid: u32) {
         if self.entries.get(&n).map(|e| e.owner_pid) == Some(pid) {
             self.entries.remove(&n);
+            if self.controlling_index == Some(n) {
+                self.controlling_index = None;
+            }
         }
     }
 }

@@ -304,7 +304,10 @@ impl PtyRelay {
 ///
 /// `winch_r` is the read end of the SIGWINCH self-pipe, or `-1` (test path).
 /// When `-1` the winch pollfd is given `events = 0` so `poll(2)` never fires
-/// it. When readable, the loop drains it and calls `propagate_winsize`.
+/// it. Window-size changes are handled by re-reading the terminal size on
+/// every poll wakeup (timeout or signal) and propagating on change — the
+/// SIGWINCH self-pipe is only a low-latency nudge (its handler is unreliable
+/// under HVF).
 fn relay_loop(real_in: RawFd, real_out: RawFd, master: RawFd, shutdown_r: RawFd, winch_r: RawFd) {
     // Ensure SIGWINCH is deliverable on THIS thread so the handler can wake the
     // relay. carrick's process signal mask (set up by HVF/runtime init) may
