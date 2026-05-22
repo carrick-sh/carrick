@@ -14,7 +14,6 @@ pub struct PtyRole {
 }
 
 struct PtyEntry {
-    host_master_fd: i32,
     host_slave_name: String,
     locked: bool,
 }
@@ -32,14 +31,12 @@ impl PtyTable {
         Self { next_index: 0, entries: BTreeMap::new() }
     }
 
-    /// Record a freshly-opened master; returns the allocated index N.
-    pub fn insert(&mut self, host_master_fd: i32, host_slave_name: String) -> u32 {
+    /// Record a freshly-opened pty's slave device name; returns the
+    /// allocated index N.
+    pub fn insert(&mut self, host_slave_name: String) -> u32 {
         let n = self.next_index;
         self.next_index += 1;
-        self.entries.insert(
-            n,
-            PtyEntry { host_master_fd, host_slave_name, locked: true },
-        );
+        self.entries.insert(n, PtyEntry { host_slave_name, locked: true });
         n
     }
 
@@ -82,8 +79,8 @@ mod tests {
     #[test]
     fn alloc_lookup_free_roundtrip() {
         let mut t = PtyTable::new();
-        let n0 = t.insert(10, "/dev/ttys000".into());
-        let n1 = t.insert(11, "/dev/ttys001".into());
+        let n0 = t.insert("/dev/ttys000".into());
+        let n1 = t.insert("/dev/ttys001".into());
         assert_eq!(n0, 0);
         assert_eq!(n1, 1);
         assert_eq!(t.slave_name(0).as_deref(), Some("/dev/ttys000"));
@@ -96,6 +93,6 @@ mod tests {
         t.free(0);
         assert_eq!(t.slave_name(0), None);
         assert_eq!(t.live_indices(), vec![1]);
-        assert_eq!(t.insert(12, "/dev/ttys002".into()), 2);
+        assert_eq!(t.insert("/dev/ttys002".into()), 2);
     }
 }
