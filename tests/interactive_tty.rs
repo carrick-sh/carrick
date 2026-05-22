@@ -1,79 +1,71 @@
 //! End-to-end smoke test for `carrick run -t` (interactive pty). Drives the
-//! built binary over a real pty. #[ignore] by default: needs a signed release
+//! built binary over a real pty and proves the guest gets a working tty with
+//! live line discipline (typed input is echoed by the pty AND by `cat`, so a
+//! unique marker appears twice). #[ignore] by default: needs a signed release
 //! binary + the debian image + Docker, and is timing-based. Run explicitly:
 //!   ./scripts/build-signed.sh
 //!   cargo test --test interactive_tty -- --ignored --nocapture
-use std::io::Read;
 use std::os::unix::io::FromRawFd;
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[test]
 #[ignore]
-fn interactive_run_sees_a_tty() {
+fn interactive_run_provides_a_working_pty() {
     // Allocate a pty; the child's stdio = the slave.
     let master = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
     assert!(master >= 0, "posix_openpt");
-    unsafe {
-        libc::grantpt(master);
-        libc::unlockpt(master);
-    }
+    unsafe { libc::grantpt(master); libc::unlockpt(master); }
     let name = unsafe { std::ffi::CStr::from_ptr(libc::ptsname(master)) }.to_owned();
     let slave = unsafe { libc::open(name.as_ptr(), libc::O_RDWR) };
     assert!(slave >= 0, "open slave");
 
+    // /bin/cat: the pty line discipline echoes typed input; cat echoes it
+    // again. A real tty under -t => the marker appears at least twice.
+    let dup_slave = unsafe { libc::dup(slave) };
     let mut child = Command::new(env!("CARGO_BIN_EXE_carrick"))
-        .args([
-            "run",
-            "-t",
-            "--fs",
-            "host",
-            "docker.io/library/debian:stable",
-            "/bin/sh",
-            "-c",
-            "test -t 0 && echo IS_A_TTY; tty; exit 0",
-        ])
+        .args(["run", "-t", "--fs", "host", "docker.io/library/debian:stable", "/bin/cat"])
         .stdin(unsafe { Stdio::from_raw_fd(slave) })
-        .stdout(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
-        .stderr(unsafe { Stdio::from_raw_fd(libc::dup(slave)) })
+        .stdout(unsafe { Stdio::from_raw_fd(dup_slave) })
+        .stderr(Stdio::null())
         .spawn()
         .expect("spawn carrick");
 
-    // Read from the master in a background thread with an overall timeout so a
-    // hang can't wedge the test. Collect whatever the guest emitted.
-    let mut mf = unsafe { std::fs::File::from_raw_fd(master) };
-    let reader = std::thread::spawn(move || {
-        let mut out = Vec::new();
-        let mut buf = [0u8; 1024];
-        loop {
-            match mf.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    out.extend_from_slice(&buf[..n]);
-                    if out.windows(8).any(|w| w == b"IS_A_TTY")
-                        && out.windows(9).any(|w| w == b"/dev/pts/")
-                    {
-                        break;
-                    }
-                }
-                Err(_) => break, // EIO when all slaves close = guest exited
-            }
-        }
-        String::from_utf8_lossy(&out).into_owned()
-    });
+    // make the master non-blocking for bounded reads
+    unsafe {
+        let fl = libc::fcntl(master, libc::F_GETFL);
+        libc::fcntl(master, libc::F_SETFL, fl | libc::O_NONBLOCK);
+    }
 
-    // Bound the whole thing.
-    std::thread::sleep(Duration::from_secs(45)); // image pull + boot + run
+    // Give the guest time to boot (image pull + HVF boot), then "type" a marker.
+    std::thread::sleep(Duration::from_secs(20));
+    let marker = b"carricktty7\n";
+    unsafe { libc::write(master, marker.as_ptr().cast(), marker.len()); }
+
+    // Read for up to ~10s looking for the marker twice.
+    let mut out = Vec::new();
+    let mut buf = [0u8; 4096];
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let n = unsafe { libc::read(master, buf.as_mut_ptr().cast(), buf.len()) };
+        if n > 0 {
+            out.extend_from_slice(&buf[..n as usize]);
+            let hits = out.windows(b"carricktty7".len()).filter(|w| *w == b"carricktty7").count();
+            if hits >= 2 { break; }
+        } else {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    // Ctrl-D so cat exits; then tear down.
+    unsafe { libc::write(master, b"\x04".as_ptr().cast(), 1); }
+    std::thread::sleep(Duration::from_millis(500));
     let _ = child.kill();
     let _ = child.wait();
-    let out = reader.join().unwrap_or_default();
+    unsafe { libc::close(master); }
 
-    assert!(
-        out.contains("IS_A_TTY"),
-        "guest stdin should be a tty under -t. Output:\n{out}"
-    );
-    assert!(
-        out.contains("/dev/pts/"),
-        "tty(1) should report /dev/pts/N. Output:\n{out}"
-    );
+    let text = String::from_utf8_lossy(&out);
+    let hits = text.matches("carricktty7").count();
+    assert!(hits >= 2,
+        "expected the typed marker echoed by the pty line discipline AND by cat (>=2 occurrences), \
+         got {hits}. A real tty under -t echoes input. Output:\n{text}");
 }
