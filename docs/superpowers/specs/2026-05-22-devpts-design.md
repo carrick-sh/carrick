@@ -1,8 +1,48 @@
 # devpts / PTY support for carrick
 
 **Date:** 2026-05-22
-**Status:** Approved design (pre-implementation)
+**Status:** Phase A COMPLETE (merged to main). Phase B COMPLETE (`feat/devpts-phase-b`) with documented limitations — see "Phase B status" below.
 **Approach:** Host-PTY-backed devpts with ioctl passthrough (Approach 1)
+
+## Phase B status (2026-05-22)
+
+`carrick run -t <image> <cmd>` allocates a host pty, hands the guest the slave
+as fds 0/1/2, and relays bytes between the user's terminal and the pty master
+(raw mode + relay thread + SIGWINCH wiring). Implemented per
+`docs/superpowers/plans/2026-05-22-devpts-phase-b.md` (PB1–PB9).
+
+**Verified working (automated):**
+- Real pty with live line discipline — the e2e test (`tests/interactive_tty.rs`,
+  `#[ignore]`, run against the SIGNED release binary) types a marker and sees it
+  echoed by the pty line discipline AND by `cat` (appears twice). This is the
+  definitive proof of a functional interactive tty.
+- `isatty(0/1/2)` is true under `-t`; the guest shell runs interactively.
+- Bidirectional relay (guest output → terminal, typed input → guest), EINTR-safe.
+- Initial window size propagates at start (guest `stty size` reflects the pty
+  size).
+- Gates green: 148 lib tests (incl. `pty_relay`), 59 `syscall_fs`, 46 `cli`,
+  38/38 conformance (no devpts regression), clippy unwrap-gate clean, fmt clean.
+
+**Known limitations (follow-ups, not blockers for the interactive-shell goal):**
+- **`ttyname()` / `tty(1)` / `/dev/tty`** do not resolve: the guest's fd 0 is a
+  bare host pty slave (the `dup2`-onto-0/1/2 strategy, design decision #2), so it
+  has no guest `/dev/pts/N` name and `/dev/tty` isn't wired. `isatty` works;
+  name-resolution doesn't. Fixing requires backing fds 0/1/2 with real
+  `PtySlave` `OpenDescription`s (+ a `/dev/tty` node) instead of bare `dup2`.
+- **Live `SIGWINCH` resize unconfirmed.** Initial size propagates; a live resize
+  was not observed to propagate in the test harness (which sends `os.kill(pid,
+  SIGWINCH)` rather than a real terminal's process-group resize). carrick's
+  `host_signal` installs only a SIGINT handler (does NOT clobber the relay's
+  SIGWINCH handler), so the cause is likely a thread signal-mask interaction or a
+  harness artifact. Needs confirmation at a real terminal, or a follow-up to
+  ensure SIGWINCH reaches the relay thread.
+- **Job control (Ctrl-C):** the stdio pgrp ioctls passthrough to the host tty
+  (PB7), and guest pgrps are real macOS pgrps, so the mechanism is in place;
+  full Ctrl-C-in-`bash` behavior is a manual check (the plan's PB9 step 1) not
+  yet confirmed via automation.
+- `-t` is `run`-only; `shell`/`exec` are follow-ups.
+
+The original design and Phase A content follow.
 
 ## Problem
 
