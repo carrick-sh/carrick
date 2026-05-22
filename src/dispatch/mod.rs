@@ -4021,6 +4021,20 @@ fn vfs_md_to_rootfs_md(path: &str, md: &crate::vfs::Metadata) -> RootFsMetadata 
     }
 }
 
+/// Build a `st_mode` from a VFS-mount `EntryKind` + permission bits. Used by
+/// stat-by-path so VFS-mount nodes report the right `S_IF*` type — notably
+/// `S_IFCHR` for `/dev/ptmx`, `/dev/pts/N`, `/dev/tty` so `ttyname(3)`'s
+/// "is this a character device?" check passes.
+pub(super) fn vfs_entry_kind_mode(kind: crate::vfs::EntryKind, mode: u32) -> u32 {
+    let ifmt = match kind {
+        crate::vfs::EntryKind::File => LINUX_S_IFREG,
+        crate::vfs::EntryKind::Directory => LINUX_S_IFDIR,
+        crate::vfs::EntryKind::Symlink => LINUX_S_IFLNK,
+        crate::vfs::EntryKind::CharDevice => LINUX_S_IFCHR,
+    };
+    ifmt | (mode & 0o7777)
+}
+
 pub(crate) fn host_errno() -> i32 {
     // SAFETY: `__errno_location` (Linux) and `__error` (macOS) both
     // return a thread-local int pointer.
