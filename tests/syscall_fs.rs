@@ -4291,3 +4291,157 @@ fn pty_master_slave_data_roundtrip() {
         "master read must yield the bytes written to the slave"
     );
 }
+
+// ── close_range frees pty master entry ────────────────────────────────────────
+
+#[test]
+fn close_range_frees_pty_master_entry() {
+    // Regression test: close_range(first, last, 0) must drop the PtyTable
+    // entry for any pty master in the range, just like close(2) does.
+    // Without the fix, close_range called the bare close_open_file() helper
+    // which freed the host fd but left the /dev/pts/N entry alive.
+    let mut dispatcher = SyscallDispatcher::new();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
+    memory.write_bytes(0x4000, b"/dev/ptmx\0").unwrap();
+    memory.write_bytes(0x4040, b"/dev/pts/0\0").unwrap();
+    let reporter = CompatReporter::default();
+
+    // openat(AT_FDCWD, "/dev/ptmx", O_RDWR=2) → master fd; allocates pts index 0.
+    let master = match dispatcher
+        .dispatch(
+            SyscallRequest::new(
+                56,
+                SyscallArgs::from([(-100_i64) as u64, 0x4000, 2, 0, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap()
+    {
+        DispatchOutcome::Returned { value } => value as u64,
+        o => panic!("open /dev/ptmx failed: {:?}", o),
+    };
+
+    // Unlock the slave so we can verify it is reachable before the master closes.
+    let lockarg = 0x4100u64;
+    memory.write_bytes(lockarg, &0i32.to_le_bytes()).unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    29,
+                    SyscallArgs::from([master, LINUX_TIOCSPTLCK, lockarg, 0, 0, 0])
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 },
+        "TIOCSPTLCK unlock must succeed"
+    );
+
+    // /dev/pts/0 must be openable before the master is closed.
+    assert!(
+        matches!(
+            dispatcher
+                .dispatch(
+                    SyscallRequest::new(
+                        56,
+                        SyscallArgs::from([(-100_i64) as u64, 0x4040, 2, 0, 0, 0])
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { .. }
+        ),
+        "slave should be openable before master is closed"
+    );
+
+    // close_range(master, master, 0) — syscall 436.
+    // This must remove the pts index from the PtyTable.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(436, SyscallArgs::from([master, master, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 },
+        "close_range(master, master, 0) must succeed"
+    );
+
+    // /dev/pts/0 must now be ENOENT (errno 2): the table entry was removed.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    56,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4040, 2, 0, 0, 0])
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 2 },
+        "/dev/pts/0 must be ENOENT after close_range frees the master"
+    );
+}
+
+// ── fstat on a pty fd reports S_IFCHR ─────────────────────────────────────────
+
+#[test]
+fn fstat_pty_reports_char_device() {
+    // A pty master is a character device (S_IFCHR = 0o020000), not a pipe
+    // (S_IFIFO). fstat(2) on the master fd must report the S_IFCHR type bits.
+    //
+    // LinuxStat layout (aarch64):
+    //   offset 0  : st_dev  (u64, 8 bytes)
+    //   offset 8  : st_ino  (u64, 8 bytes)
+    //   offset 16 : st_mode (u32, 4 bytes)  ← we check this
+    let mut dispatcher = SyscallDispatcher::new();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
+    memory.write_bytes(0x4000, b"/dev/ptmx\0").unwrap();
+    let reporter = CompatReporter::default();
+
+    // openat(AT_FDCWD, "/dev/ptmx", O_RDWR=2) → master fd.
+    let master = match dispatcher
+        .dispatch(
+            SyscallRequest::new(
+                56,
+                SyscallArgs::from([(-100_i64) as u64, 0x4000, 2, 0, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap()
+    {
+        DispatchOutcome::Returned { value } => value as u64,
+        o => panic!("open /dev/ptmx failed: {:?}", o),
+    };
+
+    // fstat(master, statbuf) — syscall 80.
+    let statbuf = 0x4100u64;
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(80, SyscallArgs::from([master, statbuf, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 },
+        "fstat on pty master must succeed"
+    );
+
+    // st_mode is at offset 16; read 4 bytes and check the S_IFMT bits.
+    let mode_bytes = memory.read_bytes(statbuf + 16, 4).unwrap();
+    let mode = u32::from_le_bytes([mode_bytes[0], mode_bytes[1], mode_bytes[2], mode_bytes[3]]);
+    assert_eq!(
+        mode & LINUX_S_IFMT,
+        LINUX_S_IFCHR,
+        "fstat on pty master must report S_IFCHR, got mode {:o}",
+        mode
+    );
+}
