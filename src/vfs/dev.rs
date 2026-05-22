@@ -13,7 +13,7 @@ use parking_lot::Mutex;
 use crate::dispatch::linux_errno;
 use crate::linux_abi::{LINUX_ENOENT, LINUX_ENOTDIR};
 
-use super::devpts::{open_master, PtyTable};
+use super::devpts::{PtyTable, open_master};
 use super::{DirEnt, EntryKind, Metadata, OpenContext, OpenFlags, Vfs, VfsError, VfsHandle};
 
 /// macOS character devices that have the same name and semantics as
@@ -107,6 +107,10 @@ impl Vfs for DevVfs {
             name: "ptmx".to_string(),
             kind: EntryKind::CharDevice,
         });
+        entries.push(DirEnt {
+            name: "pts".to_string(),
+            kind: EntryKind::Directory,
+        });
         Ok(entries)
     }
 
@@ -116,6 +120,17 @@ impl Vfs for DevVfs {
         flags: OpenFlags,
         _ctx: &OpenContext<'_>,
     ) -> Result<VfsHandle, VfsError> {
+        // Opening the /dev directory itself: return a synthetic directory
+        // listing so `getdents64` / `ls /dev` shows the device entries.
+        if path == "/dev" {
+            let entries = self.readdir("/dev").unwrap_or_default();
+            return Ok(VfsHandle::Directory {
+                path: "/dev".to_string(),
+                entries,
+                status_flags: 0,
+            });
+        }
+
         if path == "/dev/ptmx" {
             // Hold the table lock across open_master (ptsname isn't thread-safe).
             let mut table = self.pty_table.lock();
@@ -238,14 +253,25 @@ mod tests {
         let v = make_dev();
         let entries = v.readdir("/dev").unwrap();
         let names: std::collections::BTreeSet<_> = entries.iter().map(|e| e.name.clone()).collect();
-        let expected: std::collections::BTreeSet<_> =
-            ["null", "zero", "random", "urandom", "full", "tty", "ptmx"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
+        let expected: std::collections::BTreeSet<_> = [
+            "null", "zero", "random", "urandom", "full", "tty", "ptmx", "pts",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
         assert_eq!(names, expected);
+        // "pts" is a directory; all others are character devices.
         for e in &entries {
-            assert_eq!(e.kind, EntryKind::CharDevice);
+            if e.name == "pts" {
+                assert_eq!(e.kind, EntryKind::Directory, "pts should be a directory");
+            } else {
+                assert_eq!(
+                    e.kind,
+                    EntryKind::CharDevice,
+                    "{} should be CharDevice",
+                    e.name
+                );
+            }
         }
     }
 

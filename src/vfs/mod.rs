@@ -116,6 +116,10 @@ pub struct OpenFlags {
 /// * Step 3 (ProcVfs/SysVfs): a `Bytes` variant for synthetic files.
 /// * Step 4 (RootFsVfs): variants for overlay-backed regular files
 ///   and directories.
+/// * devpts Phase A: [`Directory`](VfsHandle::Directory) — a synthetic
+///   directory listing served entirely from `Vec<DirEnt>` in memory,
+///   for mounts like `/dev` that own their own listing rather than
+///   delegating to the rootfs layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VfsHandle {
     /// A host fd that the dispatcher should route I/O through via the
@@ -143,6 +147,16 @@ pub enum VfsHandle {
         host_fd: i32,
         pts_index: u32,
         is_master: bool,
+        status_flags: u32,
+    },
+    /// A synthetic directory backed by a `Vec<DirEnt>`. The dispatcher
+    /// converts this to an `OpenDescription::Directory` so `getdents64`
+    /// can serve the listing. Used by `DevVfs` for `/dev` so that
+    /// `ls /dev` shows the synthetic device entries rather than the
+    /// (typically empty) `/dev` in the OCI image layer.
+    Directory {
+        path: String,
+        entries: Vec<DirEnt>,
         status_flags: u32,
     },
 }

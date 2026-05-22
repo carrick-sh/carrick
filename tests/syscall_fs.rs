@@ -4025,7 +4025,10 @@ fn ptmx_tiocgptn_returns_index_and_tcgets_succeeds() {
     // openat(AT_FDCWD, "/dev/ptmx", O_RDWR=2)
     let fd = match dispatcher
         .dispatch(
-            SyscallRequest::new(56, SyscallArgs::from([(-100_i64) as u64, 0x4000, 2, 0, 0, 0])),
+            SyscallRequest::new(
+                56,
+                SyscallArgs::from([(-100_i64) as u64, 0x4000, 2, 0, 0, 0]),
+            ),
             &mut memory,
             &reporter,
         )
@@ -4040,7 +4043,10 @@ fn ptmx_tiocgptn_returns_index_and_tcgets_succeeds() {
     assert_eq!(
         dispatcher
             .dispatch(
-                SyscallRequest::new(29, SyscallArgs::from([fd, LINUX_TIOCGPTN, out_ptr, 0, 0, 0])),
+                SyscallRequest::new(
+                    29,
+                    SyscallArgs::from([fd, LINUX_TIOCGPTN, out_ptr, 0, 0, 0])
+                ),
                 &mut memory,
                 &reporter,
             )
@@ -4060,7 +4066,10 @@ fn ptmx_tiocgptn_returns_index_and_tcgets_succeeds() {
     assert_eq!(
         dispatcher
             .dispatch(
-                SyscallRequest::new(29, SyscallArgs::from([fd, LINUX_TIOCSPTLCK, lockarg, 0, 0, 0])),
+                SyscallRequest::new(
+                    29,
+                    SyscallArgs::from([fd, LINUX_TIOCSPTLCK, lockarg, 0, 0, 0])
+                ),
                 &mut memory,
                 &reporter,
             )
@@ -4098,7 +4107,10 @@ fn closing_ptmx_master_removes_pts_entry() {
     // open /dev/ptmx (O_RDWR=2) -> master fd; allocates pts index 0.
     let master = match dispatcher
         .dispatch(
-            SyscallRequest::new(56, SyscallArgs::from([(-100_i64) as u64, 0x4000, 2, 0, 0, 0])),
+            SyscallRequest::new(
+                56,
+                SyscallArgs::from([(-100_i64) as u64, 0x4000, 2, 0, 0, 0]),
+            ),
             &mut memory,
             &reporter,
         )
@@ -4114,7 +4126,10 @@ fn closing_ptmx_master_removes_pts_entry() {
     assert_eq!(
         dispatcher
             .dispatch(
-                SyscallRequest::new(29, SyscallArgs::from([master, LINUX_TIOCSPTLCK, lockarg, 0, 0, 0])),
+                SyscallRequest::new(
+                    29,
+                    SyscallArgs::from([master, LINUX_TIOCSPTLCK, lockarg, 0, 0, 0])
+                ),
                 &mut memory,
                 &reporter,
             )
@@ -4158,7 +4173,10 @@ fn closing_ptmx_master_removes_pts_entry() {
     assert_eq!(
         dispatcher
             .dispatch(
-                SyscallRequest::new(56, SyscallArgs::from([(-100_i64) as u64, 0x4040, 2, 0, 0, 0])),
+                SyscallRequest::new(
+                    56,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4040, 2, 0, 0, 0])
+                ),
                 &mut memory,
                 &reporter,
             )
@@ -4193,7 +4211,10 @@ fn pty_master_slave_data_roundtrip() {
     // openat(AT_FDCWD, "/dev/ptmx", O_RDWR=2) → master fd
     let master = match dispatcher
         .dispatch(
-            SyscallRequest::new(56, SyscallArgs::from([(-100_i64) as u64, 0x4000, 2, 0, 0, 0])),
+            SyscallRequest::new(
+                56,
+                SyscallArgs::from([(-100_i64) as u64, 0x4000, 2, 0, 0, 0]),
+            ),
             &mut memory,
             &reporter,
         )
@@ -4208,7 +4229,10 @@ fn pty_master_slave_data_roundtrip() {
     assert_eq!(
         dispatcher
             .dispatch(
-                SyscallRequest::new(29, SyscallArgs::from([master, LINUX_TIOCSPTLCK, 0x4100, 0, 0, 0])),
+                SyscallRequest::new(
+                    29,
+                    SyscallArgs::from([master, LINUX_TIOCSPTLCK, 0x4100, 0, 0, 0])
+                ),
                 &mut memory,
                 &reporter,
             )
@@ -4220,7 +4244,10 @@ fn pty_master_slave_data_roundtrip() {
     // openat(AT_FDCWD, "/dev/pts/0", O_RDWR=2) → slave fd
     let slave = match dispatcher
         .dispatch(
-            SyscallRequest::new(56, SyscallArgs::from([(-100_i64) as u64, 0x4040, 2, 0, 0, 0])),
+            SyscallRequest::new(
+                56,
+                SyscallArgs::from([(-100_i64) as u64, 0x4040, 2, 0, 0, 0]),
+            ),
             &mut memory,
             &reporter,
         )

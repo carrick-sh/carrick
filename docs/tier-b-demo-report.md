@@ -535,3 +535,14 @@ syscall from `_dlstart` — almost certainly one of
 `mprotect` (#226), `mmap` (#222), `openat` (#56), or `getrandom`
 (#278). At that point the compat report becomes the right diagnostic
 surface and Tier B has reached "running musl, missing syscall X."
+
+## devpts Phase A complete (2026-05-22)
+
+`/dev/ptmx` and `/dev/pts` are fully implemented. Conformance probes
+(including `ptypair`) pass vs Docker. `ls /dev` now lists `ptmx`, `pts`,
+and all passthrough devices via a synthetic `VfsHandle::Directory`.
+`/dev/pts/ptmx` is also handled as a clone device. `apt-get install hello`
+prints `Hello, world!`. Two residual `E: Can not write log (Is /dev/pts mounted?)`
+lines remain from apt's `Dpkg::Use-Pty` pty-based dpkg communication
+channel (pre-existing in the branch; `Dpkg::Use-Pty=0` suppresses them);
+this is the next gap to close, not a devpts Phase A blocker.
