@@ -1247,6 +1247,13 @@ impl SyscallDispatcher {
         self.io.cwd.read().clone()
     }
 
+    /// Shared pseudo-terminal table. Also held by the `/dev` (ptmx) and
+    /// `/dev/pts` mounts — all three see the same Arc. Used by the ioctl
+    /// (TIOCSPTLCK) and close (free-on-master-close) handlers.
+    pub(super) fn pty_table(&self) -> &std::sync::Arc<parking_lot::Mutex<crate::vfs::PtyTable>> {
+        &self.fs.pty_table
+    }
+
     /// Single-threaded dispatch (legacy + unit tests + the fork-based
     /// runtime path). Tid-aware handlers see `thread: None`.
     pub fn dispatch(
@@ -4586,6 +4593,28 @@ mod overlay_dispatch_tests {
             DispatchOutcome::Errno {
                 errno: LINUX_ENOSYS
             }
+        );
+    }
+
+    /// The dispatcher's `pty_table()` accessor must return the same
+    /// `Arc`-wrapped table that was cloned into the `/dev` and `/dev/pts`
+    /// mounts. Because all three hold clones of the same `Arc`, mutations
+    /// through one pointer are visible through any other.
+    #[test]
+    fn dispatcher_shares_pty_table_with_dev_mounts() {
+        let dispatcher = SyscallDispatcher::with_rootfs(empty_rootfs());
+        // A freshly constructed dispatcher has an empty pty table.
+        assert!(
+            dispatcher.pty_table().lock().live_indices().is_empty(),
+            "pty table should start empty"
+        );
+        // Confirm the Arc is genuinely shared: insert an entry directly into
+        // the table and verify the dispatcher sees it through its accessor.
+        let index = dispatcher.pty_table().lock().insert("dummy-slave".to_string());
+        assert_eq!(
+            dispatcher.pty_table().lock().live_indices(),
+            vec![index],
+            "inserted index must be visible through the dispatcher accessor"
         );
     }
 

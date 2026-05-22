@@ -19,6 +19,11 @@ pub(super) struct FsState {
     /// `vfs_mounts` because the dispatcher's existing fs syscalls reach
     /// into the overlay/rootfs state through ~50 call sites today.
     pub rootfs_vfs: crate::vfs::RootFsVfs,
+
+    /// Shared pseudo-terminal table, also cloned into the /dev (ptmx) and
+    /// /dev/pts mounts. The ioctl (TIOCSPTLCK) and close (free-on-master-
+    /// close) paths reach it through the dispatcher.
+    pub(super) pty_table: std::sync::Arc<parking_lot::Mutex<crate::vfs::PtyTable>>,
 }
 
 /// Owned I/O-subsystem state. Split out of `SyscallDispatcher` so the I/O
@@ -60,10 +65,6 @@ impl IoState {
 
 impl FsState {
     pub(super) fn new() -> Self {
-        // NOTE(Task 5): each FsState currently owns a fresh PtyTable. Task 5
-        // will thread a single shared Arc<Mutex<PtyTable>> from the top-level
-        // dispatcher into both DevVfs and the forthcoming DevptsVfs so that
-        // /dev/ptmx and /dev/pts/* share the same index space.
         let pty_table = std::sync::Arc::new(parking_lot::Mutex::new(
             crate::vfs::PtyTable::new(),
         ));
@@ -77,6 +78,7 @@ impl FsState {
                 m
             },
             rootfs_vfs: crate::vfs::RootFsVfs::new(),
+            pty_table,
         }
     }
 }
