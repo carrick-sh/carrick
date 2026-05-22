@@ -4,3 +4,4 @@
 /fixtures/*/target/
 /conformance-probes/target/
 .claude/
+/rust_out
