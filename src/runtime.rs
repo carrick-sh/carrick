@@ -736,8 +736,9 @@ fn run_threaded_hvf_loop(
     let kicker = Arc::new(crate::vcpu_kick::VcpuKicker::new());
     // Daemon that kicks in-guest vCPUs when a process-directed signal arrives
     // (host SIGINT etc.), so a thread spinning in guest userspace delivers it
-    // promptly rather than only at its next syscall.
-    crate::vcpu_kick::spawn_signal_pump(Arc::clone(&kicker));
+    // promptly rather than only at its next syscall — and wakes futex-parked
+    // threads so they too deliver promptly (no 50ms poll latency).
+    crate::vcpu_kick::spawn_signal_pump(Arc::clone(&kicker), Arc::clone(&futex));
 
     let outcome = run_vcpu_until_exit(
         kernel.clone_handle(),
