@@ -119,13 +119,8 @@ impl Vfs for DevVfs {
         if path == "/dev/ptmx" {
             // Hold the table lock across open_master (ptsname isn't thread-safe).
             let mut table = self.pty_table.lock();
-            let (master_fd, slave_name) = open_master(flags.nonblock).map_err(|raw| {
-                // Map the raw macOS errno to Linux via the same path as host opens.
-                // host_open_errno reads errno; set it so the mapping matches.
-                // SAFETY: writing the thread-local errno before mapping.
-                unsafe { *libc::__error() = raw };
-                host_open_errno()
-            })?;
+            let (master_fd, slave_name) =
+                open_master(flags.nonblock).map_err(crate::dispatch::macos_to_linux_errno)?;
             let index = table.insert(slave_name);
             let status_flags = if flags.nonblock {
                 crate::linux_abi::LINUX_O_NONBLOCK as u32
