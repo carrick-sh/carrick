@@ -1151,9 +1151,7 @@ impl SyscallDispatcher {
                     // Guest pgrps are real macOS pgrps in carrick.
                     if crate::host_tty::host_isatty(fd) {
                         match crate::host_tty::host_tty_tcgetpgrp(fd) {
-                            Ok(pgrp) => {
-                                write_packed(&mut *ctx.memory, arg, &pgrp.to_le_bytes())
-                            }
+                            Ok(pgrp) => write_packed(&mut *ctx.memory, arg, &pgrp.to_le_bytes()),
                             Err(raw_errno) => DispatchOutcome::Errno {
                                 errno: crate::dispatch::macos_to_linux_errno(raw_errno),
                             },

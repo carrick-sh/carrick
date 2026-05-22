@@ -61,10 +61,10 @@ impl PtyPair {
     /// Allocate via posix_openpt + open the slave. Reuses Phase A's
     /// `open_master` (posix_openpt/grantpt/unlockpt/ptsname).
     pub fn allocate() -> io::Result<Self> {
-        let (master_fd, slave_name) = crate::vfs::devpts::open_master(false)
-            .map_err(io::Error::from_raw_os_error)?;
-        let cname = CString::new(slave_name)
-            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let (master_fd, slave_name) =
+            crate::vfs::devpts::open_master(false).map_err(io::Error::from_raw_os_error)?;
+        let cname =
+            CString::new(slave_name).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
         // SAFETY: cname is a valid NUL-terminated slave device path.
         let slave_fd = unsafe { libc::open(cname.as_ptr(), libc::O_RDWR | libc::O_NOCTTY) };
         if slave_fd < 0 {
@@ -72,7 +72,10 @@ impl PtyPair {
             unsafe { libc::close(master_fd) };
             return Err(e);
         }
-        Ok(Self { master_fd, slave_fd })
+        Ok(Self {
+            master_fd,
+            slave_fd,
+        })
     }
 }
 
@@ -178,7 +181,12 @@ impl PtyRelay {
     /// Common inner setup: shutdown pipe + relay thread. `winch_r` is passed to
     /// the thread; pass `-1` for the test path (poll ignores fds with events=0,
     /// and we special-case -1 in relay_loop to skip adding it to the poll set).
-    fn start_inner(pair: PtyPair, real_in: RawFd, real_out: RawFd, winch_r: RawFd) -> io::Result<Self> {
+    fn start_inner(
+        pair: PtyPair,
+        real_in: RawFd,
+        real_out: RawFd,
+        winch_r: RawFd,
+    ) -> io::Result<Self> {
         let mut sp = [0i32; 2];
         // SAFETY: sp is a 2-int array for pipe(2).
         if unsafe { libc::pipe(sp.as_mut_ptr()) } != 0 {
@@ -268,18 +276,34 @@ impl PtyRelay {
 /// it. When readable, the loop drains it and calls `propagate_winsize`.
 fn relay_loop(real_in: RawFd, real_out: RawFd, master: RawFd, shutdown_r: RawFd, winch_r: RawFd) {
     // Index constants for the pollfd array.
-    const IDX_REAL_IN:    usize = 0;
-    const IDX_MASTER:     usize = 1;
-    const IDX_SHUTDOWN:   usize = 2;
-    const IDX_WINCH:      usize = 3;
+    const IDX_REAL_IN: usize = 0;
+    const IDX_MASTER: usize = 1;
+    const IDX_SHUTDOWN: usize = 2;
+    const IDX_WINCH: usize = 3;
 
     // If winch_r == -1, set events = 0 so poll never wakes for it.
     let winch_events = if winch_r >= 0 { libc::POLLIN } else { 0 };
     let mut fds = [
-        libc::pollfd { fd: real_in,    events: libc::POLLIN, revents: 0 },
-        libc::pollfd { fd: master,     events: libc::POLLIN, revents: 0 },
-        libc::pollfd { fd: shutdown_r, events: libc::POLLIN, revents: 0 },
-        libc::pollfd { fd: winch_r,    events: winch_events, revents: 0 },
+        libc::pollfd {
+            fd: real_in,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: master,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: shutdown_r,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: winch_r,
+            events: winch_events,
+            revents: 0,
+        },
     ];
     let mut buf = [0u8; 4096];
     loop {
@@ -302,9 +326,8 @@ fn relay_loop(real_in: RawFd, real_out: RawFd, master: RawFd, shutdown_r: RawFd,
             // Drain all pending bytes so the level-triggered poll doesn't spin.
             let mut drain_buf = [0u8; 64];
             loop {
-                let r = unsafe {
-                    libc::read(winch_r, drain_buf.as_mut_ptr().cast(), drain_buf.len())
-                };
+                let r =
+                    unsafe { libc::read(winch_r, drain_buf.as_mut_ptr().cast(), drain_buf.len()) };
                 if r <= 0 {
                     break;
                 }
@@ -391,7 +414,10 @@ mod tests {
         assert!(pty.slave_fd >= 0);
         assert_eq!(unsafe { libc::isatty(pty.slave_fd) }, 1);
         assert_ne!(pty.master_fd, pty.slave_fd);
-        unsafe { libc::close(pty.master_fd); libc::close(pty.slave_fd); }
+        unsafe {
+            libc::close(pty.master_fd);
+            libc::close(pty.slave_fd);
+        }
     }
 
     /// Verify that the relay copies bytes in both directions and that stop()
@@ -434,8 +460,7 @@ mod tests {
         let real_app_dup = unsafe { libc::dup(real_app) };
         assert!(real_app_dup >= 0, "dup(real_app) failed");
 
-        let relay = PtyRelay::start_for_test(real_term, real_term)
-            .expect("start_for_test");
+        let relay = PtyRelay::start_for_test(real_term, real_term).expect("start_for_test");
         let slave = relay.slave_fd();
 
         // Disable echo on the slave's line discipline so the pty does not echo
@@ -447,7 +472,11 @@ mod tests {
             let mut t: libc::termios = std::mem::zeroed();
             assert_eq!(libc::tcgetattr(slave, &mut t), 0, "tcgetattr slave");
             libc::cfmakeraw(&mut t);
-            assert_eq!(libc::tcsetattr(slave, libc::TCSANOW, &t), 0, "tcsetattr slave raw");
+            assert_eq!(
+                libc::tcsetattr(slave, libc::TCSANOW, &t),
+                0,
+                "tcsetattr slave raw"
+            );
         }
 
         // Wrap real_app in a File for convenient I/O; we'll forget it later.
@@ -491,9 +520,7 @@ mod tests {
     fn socketpair() -> (RawFd, RawFd) {
         let mut sv = [0i32; 2];
         // SAFETY: sv is a 2-int array for socketpair(2).
-        let rc = unsafe {
-            libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr())
-        };
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) };
         assert_eq!(rc, 0, "socketpair(2) failed");
         (sv[0], sv[1])
     }
@@ -502,7 +529,10 @@ mod tests {
     fn open_test_pty_pr() -> (i32, i32) {
         let m = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
         assert!(m >= 0, "posix_openpt failed");
-        unsafe { libc::grantpt(m); libc::unlockpt(m); }
+        unsafe {
+            libc::grantpt(m);
+            libc::unlockpt(m);
+        }
         let name = unsafe { std::ffi::CStr::from_ptr(libc::ptsname(m)) }.to_owned();
         let s = unsafe { libc::open(name.as_ptr(), libc::O_RDWR | libc::O_NOCTTY) };
         assert!(s >= 0, "open slave failed");
@@ -515,9 +545,14 @@ mod tests {
     fn propagate_winsize_copies_rows_cols_to_master() {
         // Use two ptys: set winsize on the slave of `from`, propagate from
         // from.slave → to.master, read it back from to.master.
-        let from = open_test_pty_pr();  // (master, slave)
+        let from = open_test_pty_pr(); // (master, slave)
         let to = open_test_pty_pr();
-        let ws = libc::winsize { ws_row: 40, ws_col: 100, ws_xpixel: 0, ws_ypixel: 0 };
+        let ws = libc::winsize {
+            ws_row: 40,
+            ws_col: 100,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
         // SAFETY: from.1 is a live tty fd; ws is a valid winsize buffer.
         unsafe { libc::ioctl(from.1, libc::TIOCSWINSZ, &ws) };
         // Propagate: read from the slave (from.1), write to the master (to.0).
@@ -528,8 +563,10 @@ mod tests {
         assert_eq!((got.ws_row, got.ws_col), (40, 100));
         // SAFETY: all four fds are still open.
         unsafe {
-            libc::close(from.0); libc::close(from.1);
-            libc::close(to.0); libc::close(to.1);
+            libc::close(from.0);
+            libc::close(from.1);
+            libc::close(to.0);
+            libc::close(to.1);
         }
     }
 }

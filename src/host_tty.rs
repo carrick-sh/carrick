@@ -338,8 +338,7 @@ fn linux_to_darwin_termios(l: &LinuxTermios, d: &mut libc::termios) {
 /// contain pointer-width fields, but in practice it is just a bag of integers
 /// and we never move the underlying fd.  The `Mutex` provides the required
 /// exclusive-access guarantee.
-static SAVED_TERMIOS: Mutex<Option<HashMap<i32, libc::termios>>> =
-    Mutex::new(None);
+static SAVED_TERMIOS: Mutex<Option<HashMap<i32, libc::termios>>> = Mutex::new(None);
 
 /// Snapshot `fd`'s current termios into `SAVED_TERMIOS` if it is a TTY and
 /// not already recorded.  Returns `true` if a snapshot was taken or already
