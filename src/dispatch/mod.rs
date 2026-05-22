@@ -229,6 +229,11 @@ pub enum DispatchOutcome {
         fds: Vec<(i32, i16)>,
         /// `None` = wait forever (signal-interruptible).
         timeout: Option<Duration>,
+        /// Value to complete the syscall with if the wait times out: `0` for
+        /// poll/select (a timeout means "no fds ready"), `-EAGAIN` for a
+        /// blocking recv/accept with a finite SO_RCVTIMEO (a timeout means
+        /// "would have blocked"). Only consulted when `timeout` is `Some`.
+        on_timeout: i64,
     },
 }
 

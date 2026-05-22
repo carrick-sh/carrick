@@ -8,6 +8,7 @@ pub mod elf;
 pub mod fs_backend;
 pub mod host_signal;
 pub mod host_tty;
+pub mod io_wait;
 pub mod linux_abi;
 pub mod memory;
 pub mod oci;
