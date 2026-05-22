@@ -34,11 +34,16 @@ pub struct ThreadWaiter {
     kq: RawFd,
     /// The self-pipe read fd this waiter registered, or `-1` if unavailable.
     pipe_read: RawFd,
+    /// The guest tid this waiter runs for, so a pending signal targeted at a
+    /// *sibling* thread doesn't spuriously interrupt this thread's blocking
+    /// syscall (which would surface a wrong EINTR). Process-directed signals
+    /// still interrupt any thread.
+    tid: crate::thread::ThreadId,
 }
 
 impl ThreadWaiter {
     #[cfg(target_os = "macos")]
-    pub fn new() -> Self {
+    pub fn new(tid: crate::thread::ThreadId) -> Self {
         let kq = unsafe { libc::kqueue() };
         let pipe_read = crate::host_signal::pending_pipe_read_fd();
         if kq >= 0 && pipe_read >= 0 {
@@ -49,12 +54,12 @@ impl ThreadWaiter {
                 libc::kevent(kq, &change, 1, std::ptr::null_mut(), 0, std::ptr::null());
             }
         }
-        Self { kq, pipe_read }
+        Self { kq, pipe_read, tid }
     }
 
     #[cfg(not(target_os = "macos"))]
-    pub fn new() -> Self {
-        Self { kq: -1, pipe_read: -1 }
+    pub fn new(tid: crate::thread::ThreadId) -> Self {
+        Self { kq: -1, pipe_read: -1, tid }
     }
 
     /// Block until one of `fds` (host fds, with `libc::POLL*` event masks) is
@@ -62,7 +67,7 @@ impl ThreadWaiter {
     /// MUST NOT be held by the caller. `fds` may be empty (a pure sleep).
     pub fn wait(&self, fds: &[(i32, i16)], timeout: Option<Duration>) -> WaitResult {
         // A signal that arrived just before we parked must not be missed.
-        if crate::host_signal::has_pending() {
+        if crate::host_signal::has_pending_for(self.tid) {
             return WaitResult::Interrupted;
         }
         #[cfg(target_os = "macos")]
@@ -118,7 +123,7 @@ impl ThreadWaiter {
 
             if n < 0 {
                 // EINTR (a signal raced in) — re-check the pending flag.
-                if crate::host_signal::has_pending() {
+                if crate::host_signal::has_pending_for(self.tid) {
                     break WaitResult::Interrupted;
                 }
                 continue;
@@ -140,7 +145,7 @@ impl ThreadWaiter {
             if pipe_woke {
                 crate::host_signal::drain_pending_pipe();
             }
-            if crate::host_signal::has_pending() {
+            if crate::host_signal::has_pending_for(self.tid) {
                 break WaitResult::Interrupted;
             }
             // Spurious wake or fallback slice elapsed — re-park (the deadline
@@ -191,7 +196,7 @@ impl ThreadWaiter {
             .map(|&(fd, events)| libc::pollfd { fd, events, revents: 0 })
             .collect();
         loop {
-            if crate::host_signal::has_pending() {
+            if crate::host_signal::has_pending_for(self.tid) {
                 return WaitResult::Interrupted;
             }
             let slice_ms = match deadline {

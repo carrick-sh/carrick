@@ -204,6 +204,12 @@ pub enum DispatchOutcome {
     /// performs the CLONE_CHILD_CLEARTID futex wake and ends just this host
     /// thread. If it was the last live thread the process exits.
     ThreadExit { code: i32 },
+    /// Guest `tgkill`/`tkill` targeting a *sibling* thread (not self). The
+    /// handler can't reach the target's vCPU, so the runtime publishes the
+    /// signal for `tid` and forces that vCPU out of the guest (vcpu_kick) so it
+    /// delivers promptly. Completes the calling syscall with 0, or -ESRCH if
+    /// the target raced to exit. Only emitted on the multi-threaded path.
+    SignalThread { tid: i32, signum: i32 },
     /// `FUTEX_WAIT` whose value-check passed under the kernel lock: the
     /// guest word equals the expected value, so this thread must block.
     /// The handler CANNOT block while holding the kernel lock (a sibling's
@@ -252,6 +258,7 @@ impl DispatchOutcome {
             // on them directly before any x0 write.
             DispatchOutcome::CloneThread { .. } => (0, None),
             DispatchOutcome::ThreadExit { .. } => (0, None),
+            DispatchOutcome::SignalThread { .. } => (0, None),
             DispatchOutcome::FutexWait { .. } => (0, None),
             DispatchOutcome::WaitOnFds { .. } => (0, None),
         }
