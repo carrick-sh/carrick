@@ -1911,12 +1911,17 @@ impl SyscallDispatcher {
         let length = usize::try_from(ctx.arg(2))
             .map_err(|_| DispatchError::LengthTooLarge(ctx.arg(2)))?;
         let memory = &mut *ctx.memory;
+        // Guest's intended blocking mode for this fd; passed to the host-fd
+        // read helper so a blocking-mode fd hands off to the lockless kqueue
+        // wait on EAGAIN instead of blocking under the kernel lock. (read has no
+        // per-call non-blocking flag.) Computed before the open_files borrow.
+        let nonblocking = self.io_is_nonblocking(fd, 0);
         // fd 0 with no explicit OpenDescription: read from host stdin.
         // This is what makes `read` against the guest's stdin pick up
         // input from the user's terminal (or whatever the carrick host
         // process's stdin is — file, pipe, or terminal).
         if fd == 0 && !self.io.open_files.contains_key(&0) {
-            return Ok(read_host_pipe(memory, address, length, 0));
+            return Ok(read_host_pipe(memory, address, length, 0, nonblocking));
         }
         let Some(open_file) = self.io.open_files.get(&fd) else {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
@@ -1962,7 +1967,7 @@ impl SyscallDispatcher {
                 if !*is_read_end {
                     return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
                 }
-                return Ok(read_host_pipe(memory, address, length, *host_fd));
+                return Ok(read_host_pipe(memory, address, length, *host_fd, nonblocking));
             }
             OpenDescription::Directory { .. } => {
                 return Ok(DispatchOutcome::Errno {
@@ -1975,7 +1980,7 @@ impl SyscallDispatcher {
                 });
             }
             OpenDescription::HostSocket { host_fd, .. } => {
-                return Ok(read_host_pipe(memory, address, length, *host_fd));
+                return Ok(read_host_pipe(memory, address, length, *host_fd, nonblocking));
             }
             // Netlink: drain whatever a prior dump request queued. A bare
             // read(2) is rare on netlink sockets (recvmsg is the norm), but
@@ -1988,7 +1993,7 @@ impl SyscallDispatcher {
             // (shared across fork). read_host_pipe is just a
             // memory-into-guest read(2) wrapper.
             OpenDescription::HostFile { host_fd, .. } => {
-                return Ok(read_host_pipe(memory, address, length, *host_fd));
+                return Ok(read_host_pipe(memory, address, length, *host_fd, nonblocking));
             }
         };
         let remaining = &contents[*offset..];
@@ -2033,7 +2038,7 @@ impl SyscallDispatcher {
                 if len == 0 {
                     continue;
                 }
-                match read_host_pipe(memory, iov.iov_base, len, hfd) {
+                match read_host_pipe(memory, iov.iov_base, len, hfd, /*nonblocking=*/ false) {
                     DispatchOutcome::Returned { value } => {
                         total += value;
                         if (value as usize) < len {
@@ -3062,6 +3067,8 @@ impl SyscallDispatcher {
             }
         };
 
+        let nonblocking = self.io_is_nonblocking(fd as i32, 0);
+
         // Check open_files FIRST: dup3 may have redirected fd 1/2 to
         // a pipe, an eventfd, or some other resource. Only after we've
         // confirmed there's no open description do we fall back to the
@@ -3093,13 +3100,13 @@ impl SyscallDispatcher {
                         if *is_read_end {
                             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
                         }
-                        return Ok(write_host_pipe(&bytes, *host_fd));
+                        return Ok(write_host_pipe(&bytes, *host_fd, nonblocking));
                     }
                     OpenDescription::HostSocket { host_fd, .. } => {
                         // write(2) on a connected socket maps directly to a
                         // host write(2). Unconnected sockets will surface
                         // their own ENOTCONN via the host.
-                        return Ok(write_host_pipe(&bytes, *host_fd));
+                        return Ok(write_host_pipe(&bytes, *host_fd, nonblocking));
                     }
                     OpenDescription::HostFile {
                         host_fd,
@@ -3120,7 +3127,7 @@ impl SyscallDispatcher {
                         }
                         // libc::write to the real fd: advances the
                         // kernel offset and is visible across fork.
-                        return Ok(write_host_pipe(&bytes, *host_fd));
+                        return Ok(write_host_pipe(&bytes, *host_fd, nonblocking));
                     }
                     OpenDescription::File {
                         path,
@@ -3163,6 +3170,7 @@ impl SyscallDispatcher {
     }
 
     fn write_output_fd(&mut self, fd: i32, bytes: &[u8]) -> DispatchOutcome {
+        let nonblocking = self.io_is_nonblocking(fd, 0);
         // Mirror `write`/`writev`: any fd present in `open_files` (e.g.
         // after a dup3 over stdio) takes precedence over the built-in
         // stdout/stderr buffers. Without this, `busybox cat`'s
@@ -3189,11 +3197,11 @@ impl SyscallDispatcher {
                         return if *is_read_end {
                             DispatchOutcome::Errno { errno: LINUX_EBADF }
                         } else {
-                            write_host_pipe(bytes, *host_fd)
+                            write_host_pipe(bytes, *host_fd, nonblocking)
                         };
                     }
                     OpenDescription::HostSocket { host_fd, .. } => {
-                        return write_host_pipe(bytes, *host_fd);
+                        return write_host_pipe(bytes, *host_fd, nonblocking);
                     }
                     OpenDescription::HostFile {
                         host_fd,
@@ -3207,7 +3215,7 @@ impl SyscallDispatcher {
                         if *status_flags & LINUX_O_APPEND != 0 {
                             unsafe { libc::lseek(*host_fd, 0, libc::SEEK_END) };
                         }
-                        return write_host_pipe(bytes, *host_fd);
+                        return write_host_pipe(bytes, *host_fd, nonblocking);
                     }
                     OpenDescription::File {
                         path,
@@ -3270,6 +3278,7 @@ impl SyscallDispatcher {
             Ok(iovecs) => iovecs,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
+        let nonblocking = self.io_is_nonblocking(fd as i32, 0);
 
         let mut total = 0usize;
         for iovec in iovecs {
@@ -3310,11 +3319,11 @@ impl SyscallDispatcher {
                             if *is_read_end {
                                 return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
                             }
-                            outcome = write_host_pipe(&bytes, *host_fd);
+                            outcome = write_host_pipe(&bytes, *host_fd, nonblocking);
                             writeback = FileWriteback::None;
                         }
                         OpenDescription::HostSocket { host_fd, .. } => {
-                            outcome = write_host_pipe(&bytes, *host_fd);
+                            outcome = write_host_pipe(&bytes, *host_fd, nonblocking);
                             writeback = FileWriteback::None;
                         }
                         OpenDescription::HostFile {
@@ -3333,7 +3342,7 @@ impl SyscallDispatcher {
                             if *status_flags & LINUX_O_APPEND != 0 {
                                 unsafe { libc::lseek(*host_fd, 0, libc::SEEK_END) };
                             }
-                            outcome = write_host_pipe(&bytes, *host_fd);
+                            outcome = write_host_pipe(&bytes, *host_fd, nonblocking);
                             writeback = FileWriteback::None;
                         }
                         OpenDescription::File {

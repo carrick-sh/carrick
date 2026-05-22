@@ -681,7 +681,7 @@ impl SyscallDispatcher {
     /// HOST fd non-blocking always and tracks the guest's intended blocking
     /// mode here; `blocking_io` consults this to decide EAGAIN vs a lockless
     /// wait. Bare stdio / unknown fds report 0 (blocking), the safe default.
-    fn fd_status_flags(&self, fd: i32) -> u64 {
+    pub(super) fn fd_status_flags(&self, fd: i32) -> u64 {
         let Some(open_file) = self.io.open_files.get(&fd) else {
             return 0;
         };
@@ -714,29 +714,25 @@ impl SyscallDispatcher {
     /// loudly in debug/test builds and self-heal (force non-blocking) in
     /// release so a missed creation site can never silently reintroduce the
     /// starvation.
-    fn blocking_io<F>(&self, guest_fd: i32, host_fd: i32, dir: IoDir, op: F) -> DispatchOutcome
+    fn blocking_io<F>(&self, host_fd: i32, dir: IoDir, nonblocking: bool, op: F) -> DispatchOutcome
     where
         F: FnOnce() -> Result<i64, i32>,
     {
-        if !host_fd_is_nonblocking(host_fd) {
-            debug_assert!(
-                false,
-                "blocking_io: host fd {host_fd} (guest fd {guest_fd}) is NOT O_NONBLOCK — \
-                 a blocking libc call under the kernel lock would starve sibling threads"
-            );
-            set_host_nonblocking(host_fd);
-        }
         match op() {
             Ok(n) => DispatchOutcome::Returned { value: n },
             Err(e) if e == LINUX_EAGAIN => {
-                if self.fd_status_flags(guest_fd) & LINUX_O_NONBLOCK != 0 {
+                if nonblocking {
+                    // Guest wants non-blocking (fd O_NONBLOCK or per-call
+                    // MSG_DONTWAIT): report EAGAIN, don't wait.
                     DispatchOutcome::Errno { errno: LINUX_EAGAIN }
                 } else {
+                    // Blocking-mode: hand off to the runtime to wait on host-fd
+                    // readiness with the kernel lock RELEASED (per-thread
+                    // kqueue), then re-dispatch. SO_RCVTIMEO/SO_SNDTIMEO not yet
+                    // modelled → block forever (signal-interruptible); when
+                    // added, pass the deadline + on_timeout=-EAGAIN.
                     DispatchOutcome::WaitOnFds {
                         fds: vec![(host_fd, dir.events())],
-                        // SO_RCVTIMEO/SO_SNDTIMEO not yet modelled → block forever
-                        // (signal-interruptible). When added, pass the deadline +
-                        // on_timeout = -EAGAIN so a finite timeout reports EAGAIN.
                         timeout: None,
                         on_timeout: -(LINUX_EAGAIN as i64),
                     }
@@ -744,6 +740,14 @@ impl SyscallDispatcher {
             }
             Err(e) => DispatchOutcome::Errno { errno: e },
         }
+    }
+
+    /// Whether a host-I/O op on `fd` with these guest `msg_flags` should report
+    /// EAGAIN (true) rather than block: the guest fd is O_NONBLOCK, or the call
+    /// carries MSG_DONTWAIT.
+    pub(super) fn io_is_nonblocking(&self, fd: i32, msg_flags: i32) -> bool {
+        self.fd_status_flags(fd) & LINUX_O_NONBLOCK != 0
+            || (msg_flags & LINUX_MSG_DONTWAIT as i32) != 0
     }
 
     fn poll_ready_events(&self, fd: i32, requested_events: i16) -> i16 {
@@ -1230,11 +1234,16 @@ impl SyscallDispatcher {
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
         let rc = unsafe { libc::listen(host_fd, backlog) };
-        Ok(if rc < 0 {
-            DispatchOutcome::Errno { errno: host_errno() }
-        } else {
-            DispatchOutcome::Returned { value: 0 }
-        })
+        if rc < 0 {
+            return Ok(DispatchOutcome::Errno { errno: host_errno() });
+        }
+        // A listen socket exists only to accept(2); make the HOST socket
+        // non-blocking so accept never blocks under the kernel lock — the
+        // guest's blocking intent is emulated by blocking_io's WaitOnFds
+        // hand-off (the one idiomatic, targeted non-blocking exception; data
+        // sockets keep their native mode + per-call MSG_DONTWAIT).
+        set_host_nonblocking(host_fd);
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
     pub(super) fn accept<M: GuestMemory>(
@@ -1274,34 +1283,48 @@ impl SyscallDispatcher {
                 _ => return DispatchOutcome::Errno { errno: LINUX_ENOTSOCK },
             }
         };
-        let mut sa_storage = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
-        let mut sa_len: libc::socklen_t = sa_storage.len() as libc::socklen_t;
-        let new_host = unsafe {
-            libc::accept(
-                host_fd,
-                sa_storage.as_mut_ptr() as *mut _,
-                &mut sa_len as *mut _,
-            )
-        };
-        if new_host < 0 {
-            return DispatchOutcome::Errno { errno: host_errno() };
-        }
-        let nonblock = accept4_flags & LINUX_SOCK_NONBLOCK != 0;
-        let cloexec = accept4_flags & LINUX_SOCK_CLOEXEC != 0;
-        if nonblock {
-            unsafe {
-                let flags = libc::fcntl(new_host, libc::F_GETFL);
-                if flags >= 0 {
-                    libc::fcntl(new_host, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        // accept(2) has no per-call non-blocking flag, but listen() already put
+        // the host listen socket in non-blocking mode, so this never blocks.
+        // Whether EAGAIN becomes a wait or an EAGAIN to the guest is decided by
+        // the guest's listen-fd blocking intent. The accept + sockaddr writeback
+        // run in the closure (no &mut self); the fd is installed AFTER (the
+        // install needs &mut self, which blocking_io's &self closure can't hold).
+        let nonblocking = self.io_is_nonblocking(fd, 0);
+        let outcome = self.blocking_io(host_fd, IoDir::Read, nonblocking, || {
+            let mut sa_storage = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
+            let mut sa_len: libc::socklen_t = sa_storage.len() as libc::socklen_t;
+            let new_host = unsafe {
+                libc::accept(host_fd, sa_storage.as_mut_ptr() as *mut _, &mut sa_len as *mut _)
+            };
+            if new_host < 0 {
+                return Err(host_errno());
+            }
+            if addr_addr != 0 && addrlen_addr != 0 {
+                let used = (sa_len as usize).min(sa_storage.len());
+                let linux_bytes = host_to_linux_sockaddr(&sa_storage[..used], family);
+                if write_linux_sockaddr(memory, addr_addr, addrlen_addr, &linux_bytes).is_err() {
+                    unsafe { libc::close(new_host) };
+                    return Err(LINUX_EFAULT);
                 }
             }
-        }
-        if addr_addr != 0 && addrlen_addr != 0 {
-            let used = (sa_len as usize).min(sa_storage.len());
-            let linux_bytes = host_to_linux_sockaddr(&sa_storage[..used], family);
-            if write_linux_sockaddr(memory, addr_addr, addrlen_addr, &linux_bytes).is_err() {
-                unsafe { libc::close(new_host); }
-                return DispatchOutcome::Errno { errno: LINUX_EFAULT };
+            Ok(new_host as i64)
+        });
+        let new_host = match outcome {
+            DispatchOutcome::Returned { value } => value as i32,
+            // WaitOnFds (block) or Errno — propagate; the runtime re-dispatches
+            // accept on readiness.
+            other => return other,
+        };
+        let nonblock = accept4_flags & LINUX_SOCK_NONBLOCK != 0;
+        let cloexec = accept4_flags & LINUX_SOCK_CLOEXEC != 0;
+        // The accepted socket inherits the listen socket's non-blocking mode on
+        // macOS; set it to match the guest's intent (recv/send use MSG_DONTWAIT
+        // regardless, so this is for fidelity).
+        unsafe {
+            let fl = libc::fcntl(new_host, libc::F_GETFL);
+            if fl >= 0 {
+                let next = if nonblock { fl | libc::O_NONBLOCK } else { fl & !libc::O_NONBLOCK };
+                libc::fcntl(new_host, libc::F_SETFL, next);
             }
         }
         let status_flags = if nonblock { LINUX_O_NONBLOCK } else { 0 };
@@ -1341,14 +1364,39 @@ impl SyscallDispatcher {
             Ok(bytes) => bytes,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
+        // connect(2) has no per-call non-blocking flag, so put the host socket
+        // non-blocking — it then returns EINPROGRESS instead of blocking under
+        // the kernel lock. recv/send use MSG_DONTWAIT + the guest's intended
+        // mode (status_flags), so the host fd's real mode is immaterial.
+        let nonblocking = self.io_is_nonblocking(fd, 0);
+        set_host_nonblocking(host_fd);
         let rc = unsafe {
             libc::connect(host_fd, host_addr.as_ptr() as *const _, host_addr.len() as u32)
         };
-        Ok(if rc < 0 {
-            DispatchOutcome::Errno { errno: host_errno() }
-        } else {
-            DispatchOutcome::Returned { value: 0 }
-        })
+        if rc == 0 {
+            return Ok(DispatchOutcome::Returned { value: 0 });
+        }
+        let e = host_errno();
+        // EISCONN: the connection completed (we're back here via the POLLOUT
+        // re-dispatch). Success.
+        if e == LINUX_EISCONN {
+            return Ok(DispatchOutcome::Returned { value: 0 });
+        }
+        if e == LINUX_EINPROGRESS || e == LINUX_EALREADY || e == LINUX_EAGAIN {
+            if nonblocking {
+                // Non-blocking guest: hand EINPROGRESS/EALREADY straight back.
+                return Ok(DispatchOutcome::Errno { errno: e });
+            }
+            // Blocking guest: wait (lock released) for the socket to become
+            // writable, then re-dispatch — connect then returns EISCONN or the
+            // real connect error.
+            return Ok(DispatchOutcome::WaitOnFds {
+                fds: vec![(host_fd, libc::POLLOUT)],
+                timeout: None,
+                on_timeout: -(LINUX_EINPROGRESS as i64),
+            });
+        }
+        Ok(DispatchOutcome::Errno { errno: e })
     }
 
     pub(super) fn getsockname<M: GuestMemory>(
@@ -1447,39 +1495,45 @@ impl SyscallDispatcher {
             Ok(bytes) => bytes,
             Err(_) => return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT }),
         };
-        let host_flags = linux_to_host_msg_flags(flags);
-        let n = if dest_addr == 0 {
-            unsafe {
-                libc::sendto(
-                    host_fd,
-                    bytes.as_ptr() as *const _,
-                    bytes.len(),
-                    host_flags,
-                    std::ptr::null(),
-                    0,
-                )
-            }
+        // Read the destination sockaddr (if any) from guest memory up front,
+        // then send with MSG_DONTWAIT through blocking_io: a full socket buffer
+        // (EAGAIN) on a blocking fd waits for POLLOUT losslessly.
+        let host_addr = if dest_addr == 0 {
+            None
         } else {
-            let host_addr = match read_linux_sockaddr(memory, dest_addr, dest_len, family) {
-                Ok(b) => b,
+            match read_linux_sockaddr(memory, dest_addr, dest_len, family) {
+                Ok(b) => Some(b),
                 Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
-            };
-            unsafe {
-                libc::sendto(
-                    host_fd,
-                    bytes.as_ptr() as *const _,
-                    bytes.len(),
-                    host_flags,
-                    host_addr.as_ptr() as *const _,
-                    host_addr.len() as u32,
-                )
             }
         };
-        Ok(if n < 0 {
-            DispatchOutcome::Errno { errno: host_errno() }
-        } else {
-            DispatchOutcome::Returned { value: n as i64 }
-        })
+        let nonblocking = self.io_is_nonblocking(fd, flags);
+        let host_flags = linux_to_host_msg_flags(flags) | libc::MSG_DONTWAIT;
+        let outcome = self.blocking_io(host_fd, IoDir::Write, nonblocking, || {
+            let n = match &host_addr {
+                None => unsafe {
+                    libc::sendto(
+                        host_fd,
+                        bytes.as_ptr() as *const _,
+                        bytes.len(),
+                        host_flags,
+                        std::ptr::null(),
+                        0,
+                    )
+                },
+                Some(a) => unsafe {
+                    libc::sendto(
+                        host_fd,
+                        bytes.as_ptr() as *const _,
+                        bytes.len(),
+                        host_flags,
+                        a.as_ptr() as *const _,
+                        a.len() as u32,
+                    )
+                },
+            };
+            if n < 0 { Err(host_errno()) } else { Ok(n as i64) }
+        });
+        Ok(outcome)
     }
 
     pub(super) fn recvfrom<M: GuestMemory>(
@@ -1508,52 +1562,61 @@ impl SyscallDispatcher {
             Ok(t) => t,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        let host_flags = linux_to_host_msg_flags(flags);
+        // Native fd mode preserved; force this CALL non-blocking with
+        // MSG_DONTWAIT and route through blocking_io: on EAGAIN a blocking-mode
+        // guest fd waits losslessly (kqueue, lock released), a non-blocking one
+        // gets EAGAIN. Never blocks under the kernel lock.
+        let nonblocking = self.io_is_nonblocking(fd, flags);
+        let host_flags = linux_to_host_msg_flags(flags) | libc::MSG_DONTWAIT;
         let mut buf = vec![0u8; len];
-        let mut sa = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
-        let mut sa_len: libc::socklen_t = sa.len() as libc::socklen_t;
-        let (n, used_addr) = if src_addr == 0 {
-            let n = unsafe {
-                libc::recvfrom(
-                    host_fd,
-                    buf.as_mut_ptr() as *mut _,
-                    buf.len(),
-                    host_flags,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
+        let outcome = self.blocking_io(host_fd, IoDir::Read, nonblocking, || {
+            let mut sa = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
+            let mut sa_len: libc::socklen_t = sa.len() as libc::socklen_t;
+            let (n, used_addr) = if src_addr == 0 {
+                (
+                    unsafe {
+                        libc::recvfrom(
+                            host_fd,
+                            buf.as_mut_ptr() as *mut _,
+                            buf.len(),
+                            host_flags,
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                        )
+                    },
+                    false,
+                )
+            } else {
+                (
+                    unsafe {
+                        libc::recvfrom(
+                            host_fd,
+                            buf.as_mut_ptr() as *mut _,
+                            buf.len(),
+                            host_flags,
+                            sa.as_mut_ptr() as *mut _,
+                            &mut sa_len as *mut _,
+                        )
+                    },
+                    true,
                 )
             };
-            (n, false)
-        } else {
-            let n = unsafe {
-                libc::recvfrom(
-                    host_fd,
-                    buf.as_mut_ptr() as *mut _,
-                    buf.len(),
-                    host_flags,
-                    sa.as_mut_ptr() as *mut _,
-                    &mut sa_len as *mut _,
-                )
-            };
-            (n, true)
-        };
-        if n < 0 {
-            return Ok(DispatchOutcome::Errno { errno: host_errno() });
-        }
-        if n > 0 {
-            let bytes = &buf[..n as usize];
-            if memory.write_bytes(buf_addr, bytes).is_err() {
-                return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
+            if n < 0 {
+                return Err(host_errno());
             }
-        }
-        if used_addr && src_addr != 0 && src_len_addr != 0 {
-            let used = (sa_len as usize).min(sa.len());
-            let linux_bytes = host_to_linux_sockaddr(&sa[..used], family);
-            if write_linux_sockaddr(memory, src_addr, src_len_addr, &linux_bytes).is_err() {
-                return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
+            if n > 0 && memory.write_bytes(buf_addr, &buf[..n as usize]).is_err() {
+                return Err(LINUX_EFAULT);
             }
-        }
-        Ok(DispatchOutcome::Returned { value: n as i64 })
+            if used_addr && src_addr != 0 && src_len_addr != 0 {
+                let used = (sa_len as usize).min(sa.len());
+                let linux_bytes = host_to_linux_sockaddr(&sa[..used], family);
+                if write_linux_sockaddr(memory, src_addr, src_len_addr, &linux_bytes).is_err() {
+                    return Err(LINUX_EFAULT);
+                }
+            }
+            Ok(n as i64)
+        });
+        Ok(outcome)
     }
 
     pub(super) fn setsockopt<M: GuestMemory>(
@@ -1733,39 +1796,42 @@ impl SyscallDispatcher {
         if is_netlink {
             return Ok(self.netlink_send(fd, &data));
         }
-        let host_flags = linux_to_host_msg_flags(flags);
-        let n = if msg.name == 0 || msg.namelen == 0 {
-            unsafe {
-                libc::sendto(
-                    host_fd,
-                    data.as_ptr() as *const _,
-                    data.len(),
-                    host_flags,
-                    std::ptr::null(),
-                    0,
-                )
-            }
+        let host_addr = if msg.name == 0 || msg.namelen == 0 {
+            None
         } else {
-            let host_addr = match read_linux_sockaddr(memory, msg.name, msg.namelen, family) {
-                Ok(b) => b,
+            match read_linux_sockaddr(memory, msg.name, msg.namelen, family) {
+                Ok(b) => Some(b),
                 Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
-            };
-            unsafe {
-                libc::sendto(
-                    host_fd,
-                    data.as_ptr() as *const _,
-                    data.len(),
-                    host_flags,
-                    host_addr.as_ptr() as *const _,
-                    host_addr.len() as u32,
-                )
             }
         };
-        Ok(if n < 0 {
-            DispatchOutcome::Errno { errno: host_errno() }
-        } else {
-            DispatchOutcome::Returned { value: n as i64 }
-        })
+        let nonblocking = self.io_is_nonblocking(fd, flags);
+        let host_flags = linux_to_host_msg_flags(flags) | libc::MSG_DONTWAIT;
+        let outcome = self.blocking_io(host_fd, IoDir::Write, nonblocking, || {
+            let n = match &host_addr {
+                None => unsafe {
+                    libc::sendto(
+                        host_fd,
+                        data.as_ptr() as *const _,
+                        data.len(),
+                        host_flags,
+                        std::ptr::null(),
+                        0,
+                    )
+                },
+                Some(a) => unsafe {
+                    libc::sendto(
+                        host_fd,
+                        data.as_ptr() as *const _,
+                        data.len(),
+                        host_flags,
+                        a.as_ptr() as *const _,
+                        a.len() as u32,
+                    )
+                },
+            };
+            if n < 0 { Err(host_errno()) } else { Ok(n as i64) }
+        });
+        Ok(outcome)
     }
 
     pub(super) fn recvmsg<M: GuestMemory>(
@@ -1834,71 +1900,68 @@ impl SyscallDispatcher {
             return Ok(DispatchOutcome::Returned { value: n as i64 });
         }
         let total: usize = iovecs.iter().map(|iov| iov.iov_len as usize).sum();
-        let mut buf = vec![0u8; total];
-        let mut sa = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
-        let mut sa_len: libc::socklen_t = sa.len() as libc::socklen_t;
-        let n = unsafe {
-            libc::recvfrom(
-                host_fd,
-                buf.as_mut_ptr() as *mut _,
-                buf.len(),
-                linux_to_host_msg_flags(flags),
-                if msg.name == 0 { std::ptr::null_mut() } else { sa.as_mut_ptr() as *mut _ },
-                if msg.name == 0 { std::ptr::null_mut() } else { &mut sa_len as *mut _ },
-            )
-        };
-        if n < 0 {
-            return Ok(DispatchOutcome::Errno { errno: host_errno() });
-        }
-        // Scatter the received bytes back into the guest's iovecs.
-        let mut remaining = n as usize;
-        let mut cursor = 0usize;
-        for iov in iovecs {
-            if remaining == 0 {
-                break;
+        let nonblocking = self.io_is_nonblocking(fd, flags);
+        let host_flags = linux_to_host_msg_flags(flags) | libc::MSG_DONTWAIT;
+        let outcome = self.blocking_io(host_fd, IoDir::Read, nonblocking, || {
+            let mut buf = vec![0u8; total];
+            let mut sa = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
+            let mut sa_len: libc::socklen_t = sa.len() as libc::socklen_t;
+            let n = unsafe {
+                libc::recvfrom(
+                    host_fd,
+                    buf.as_mut_ptr() as *mut _,
+                    buf.len(),
+                    host_flags,
+                    if msg.name == 0 { std::ptr::null_mut() } else { sa.as_mut_ptr() as *mut _ },
+                    if msg.name == 0 { std::ptr::null_mut() } else { &mut sa_len as *mut _ },
+                )
+            };
+            if n < 0 {
+                return Err(host_errno());
             }
-            let chunk = remaining.min(iov.iov_len as usize);
-            if chunk > 0 {
-                if memory.write_bytes(iov.iov_base, &buf[cursor..cursor + chunk]).is_err() {
-                    return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
+            // Scatter the received bytes back into the guest's iovecs.
+            let mut remaining = n as usize;
+            let mut cursor = 0usize;
+            for iov in &iovecs {
+                if remaining == 0 {
+                    break;
                 }
-                cursor += chunk;
-                remaining -= chunk;
-            }
-        }
-        if msg.name != 0 && msg.namelen != 0 {
-            let used = (sa_len as usize).min(sa.len());
-            let linux_bytes = host_to_linux_sockaddr(&sa[..used], family);
-            // Write up to msg.namelen, then update the namelen field
-            // inside the msghdr.
-            let write_len = (linux_bytes.len() as u32).min(msg.namelen);
-            if write_len > 0
-                && memory.write_bytes(msg.name, &linux_bytes[..write_len as usize]).is_err() {
-                    return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
+                let chunk = remaining.min(iov.iov_len as usize);
+                if chunk > 0 {
+                    if memory.write_bytes(iov.iov_base, &buf[cursor..cursor + chunk]).is_err() {
+                        return Err(LINUX_EFAULT);
+                    }
+                    cursor += chunk;
+                    remaining -= chunk;
                 }
-            // namelen lives at offset 8 (after the 8-byte name pointer).
-            if memory
-                .write_bytes(msg_addr + 8, &(linux_bytes.len() as u32).to_ne_bytes())
-                .is_err()
-            {
-                return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
             }
-        }
-        // We don't translate ancillary data; report controllen=0.
-        if memory
-            .write_bytes(msg_addr + 40, &0u64.to_ne_bytes())
-            .is_err()
-        {
-            return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
-        }
-        // msg_flags lives at offset 48 (just after controllen).
-        if memory
-            .write_bytes(msg_addr + 48, &0i32.to_ne_bytes())
-            .is_err()
-        {
-            return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
-        }
-        Ok(DispatchOutcome::Returned { value: n as i64 })
+            if msg.name != 0 && msg.namelen != 0 {
+                let used = (sa_len as usize).min(sa.len());
+                let linux_bytes = host_to_linux_sockaddr(&sa[..used], family);
+                let write_len = (linux_bytes.len() as u32).min(msg.namelen);
+                if write_len > 0
+                    && memory.write_bytes(msg.name, &linux_bytes[..write_len as usize]).is_err()
+                {
+                    return Err(LINUX_EFAULT);
+                }
+                // namelen lives at offset 8 (after the 8-byte name pointer).
+                if memory
+                    .write_bytes(msg_addr + 8, &(linux_bytes.len() as u32).to_ne_bytes())
+                    .is_err()
+                {
+                    return Err(LINUX_EFAULT);
+                }
+            }
+            // No ancillary-data translation; report controllen=0, msg_flags=0.
+            if memory.write_bytes(msg_addr + 40, &0u64.to_ne_bytes()).is_err() {
+                return Err(LINUX_EFAULT);
+            }
+            if memory.write_bytes(msg_addr + 48, &0i32.to_ne_bytes()).is_err() {
+                return Err(LINUX_EFAULT);
+            }
+            Ok(n as i64)
+        });
+        Ok(outcome)
     }
 
     /// `sendmmsg(sockfd, msgvec, vlen, flags)` — Linux's batched
@@ -2598,6 +2661,8 @@ pub(super) fn set_host_nonblocking(fd: i32) {
 }
 
 /// INVARIANT predicate: a host fd carrick performs I/O on must be `O_NONBLOCK`.
+/// Used by the P5 debug_assert invariant (wired in by the enforcement step).
+#[allow(dead_code)]
 pub(super) fn host_fd_is_nonblocking(fd: i32) -> bool {
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     flags >= 0 && (flags & libc::O_NONBLOCK != 0)
