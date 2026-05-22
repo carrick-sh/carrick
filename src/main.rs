@@ -305,7 +305,28 @@ fn main() -> anyhow::Result<()> {
         .map(ImageStore::new)
         .unwrap_or_else(ImageStore::default_for_user);
 
-    match cli.command {
+    // `carrick shell [image]` is a convenience for an interactive run of
+    // /bin/sh: normalise it to `Run` with a pty when stdin is a terminal (raw
+    // streaming otherwise, so piped input still works). This reuses the entire
+    // run path (image pull, fs backend, pty relay) with zero duplication.
+    let command = match cli.command {
+        Commands::Shell { image } => {
+            // SAFETY: isatty on fd 0 is a simple syscall returning 0/1.
+            let interactive = unsafe { libc::isatty(0) } == 1;
+            Commands::Run {
+                image,
+                max_traps: DEFAULT_MAX_TRAPS,
+                debug_state_path: None,
+                raw: !interactive,
+                tty: interactive,
+                fs: None,
+                command: vec!["/bin/sh".to_owned()],
+            }
+        }
+        other => other,
+    };
+
+    match command {
         Commands::InspectElf { path } => {
             let metadata = inspect_elf(&path)
                 .with_context(|| format!("failed to inspect {}", path.display()))?;
@@ -631,19 +652,9 @@ fn main() -> anyhow::Result<()> {
                 );
             }
         }
-        Commands::Shell { image } => {
-            let image = ImageReference::parse(&image)?;
-            println!(
-                "{}",
-                serde_json::json!({
-                    "image": image.canonical(),
-                    "command": ["/bin/sh"],
-                    "store": store.root(),
-                    "trap": hvf_capabilities(),
-                })
-            );
-            bail!("interactive Linux shell execution is not implemented in this bootstrap yet");
-        }
+        // `Shell` is normalised to `Run` (interactive /bin/sh) before this
+        // match, so it is never reached here.
+        Commands::Shell { .. } => unreachable!("Shell is normalised to Run above"),
         Commands::Exec { context, command } => {
             println!(
                 "{}",
