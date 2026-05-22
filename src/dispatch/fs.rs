@@ -1889,7 +1889,9 @@ impl SyscallDispatcher {
                 };
                 close_open_file(&open_file);
                 if let Some(index) = pty_master_index {
-                    self.pty_table().lock().free_if_owner(index, std::process::id());
+                    self.pty_table()
+                        .lock()
+                        .free_if_owner(index, std::process::id());
                 }
                 DispatchOutcome::Returned { value: 0 }
             } else if is_stdio_fd(fd) {
