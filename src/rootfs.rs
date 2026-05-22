@@ -58,6 +58,9 @@ pub enum RootFsEntryKind {
     File,
     Directory,
     Symlink,
+    /// Character device (e.g. the `/dev/*` and `/dev/pts/N` nodes served by the
+    /// VFS mounts). Reports `S_IFCHR` from stat and `DT_CHR` from getdents.
+    CharDevice,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
