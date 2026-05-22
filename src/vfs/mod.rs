@@ -136,6 +136,15 @@ pub enum VfsHandle {
         contents: Vec<u8>,
         status_flags: u32,
     },
+    /// A pty end backed by a host fd. The dispatcher converts this to a
+    /// `HostPipe` open-description tagged with `PtyRole` so the ioctl
+    /// handler treats it as a tty.
+    Pty {
+        host_fd: i32,
+        pts_index: u32,
+        is_master: bool,
+        status_flags: u32,
+    },
 }
 
 /// Live dispatcher state that some VFS mounts need at `open` time

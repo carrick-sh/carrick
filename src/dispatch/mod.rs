@@ -749,6 +749,11 @@ enum OpenDescription {
         host_fd: i32,
         is_read_end: bool,
         status_flags: u64,
+        /// `Some` iff this fd is a pty master/slave end. Data I/O is
+        /// identical to a plain host pipe; this only changes ioctl
+        /// handling and close cleanup. `None` for ordinary host pipes,
+        /// sockets-as-pipes, and `/dev/*` chardevs.
+        pty: Option<crate::vfs::PtyRole>,
     },
     /// Host BSD socket backed by a real macOS file descriptor.
     /// Survives `libc::fork(2)`; the `family`/`type_` fields capture
