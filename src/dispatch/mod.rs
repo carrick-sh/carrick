@@ -1293,6 +1293,18 @@ impl SyscallDispatcher {
         &self.fs.pty_table
     }
 
+    /// Register the host pty slave (e.g. `/dev/ttys003`) allocated by
+    /// `carrick run -t` as the guest's controlling terminal. The slave is also
+    /// the guest's fds 0/1/2. This makes `/dev/pts/N` exist, `/dev/tty` resolve
+    /// to the controlling terminal, and `/proc/self/fd/{0,1,2}` readlink to
+    /// `/dev/pts/N` so `ttyname(3)` works. Returns the allocated pts index N.
+    pub fn register_controlling_pty(&self, host_slave_name: String) -> u32 {
+        self.fs
+            .pty_table
+            .lock()
+            .set_controlling(host_slave_name, std::process::id())
+    }
+
     /// Single-threaded dispatch (legacy + unit tests + the fork-based
     /// runtime path). Tid-aware handlers see `thread: None`.
     pub fn dispatch(

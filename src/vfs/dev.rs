@@ -28,8 +28,10 @@ const PASSTHROUGHS: &[(&str, &str)] = &[
     ("/dev/random", "/dev/random"),
     ("/dev/urandom", "/dev/urandom"),
     ("/dev/full", "/dev/null"),
-    ("/dev/tty", "/dev/tty"),
 ];
+// NOTE: `/dev/tty` is handled specially (not a host passthrough): it must
+// resolve to the GUEST's controlling terminal — the `carrick run -t` pty
+// slave — not carrick's own host /dev/tty. See `open`.
 
 pub struct DevVfs {
     pty_table: Arc<Mutex<PtyTable>>,
@@ -61,7 +63,7 @@ impl Vfs for DevVfs {
                 mtime_nanos: 0,
             });
         }
-        if path == "/dev/ptmx" {
+        if path == "/dev/ptmx" || path == "/dev/tty" {
             return Ok(Metadata {
                 kind: EntryKind::CharDevice,
                 mode: 0o666,
@@ -146,6 +148,48 @@ impl Vfs for DevVfs {
                 host_fd: master_fd,
                 pts_index: index,
                 is_master: true,
+                status_flags,
+            });
+        }
+
+        if path == "/dev/tty" {
+            // The guest's controlling terminal is the `carrick run -t` pty
+            // slave (registered as a pts in the table). Open a fresh fd to it
+            // and present it as a pty so termios/winsize/pgrp ioctls work.
+            // With no controlling terminal (non-interactive), Linux returns
+            // ENXIO.
+            let table = self.pty_table.lock();
+            let index = table.controlling().ok_or(crate::linux_abi::LINUX_ENXIO)?;
+            let slave_name = table
+                .slave_name(index)
+                .ok_or(crate::linux_abi::LINUX_ENXIO)?;
+            drop(table);
+            let mut oflag = if flags.read && flags.write {
+                libc::O_RDWR
+            } else if flags.write {
+                libc::O_WRONLY
+            } else {
+                libc::O_RDONLY
+            };
+            oflag |= libc::O_NOCTTY;
+            if flags.nonblock {
+                oflag |= libc::O_NONBLOCK;
+            }
+            let cpath = CString::new(slave_name).map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
+            // SAFETY: cpath is a valid NUL-terminated path to the host slave pty.
+            let host_fd = unsafe { libc::open(cpath.as_ptr(), oflag) };
+            if host_fd < 0 {
+                return Err(host_open_errno());
+            }
+            let status_flags = if flags.nonblock {
+                crate::linux_abi::LINUX_O_NONBLOCK as u32
+            } else {
+                0
+            };
+            return Ok(VfsHandle::Pty {
+                host_fd,
+                pts_index: index,
+                is_master: false,
                 status_flags,
             });
         }
