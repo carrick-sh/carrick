@@ -1827,6 +1827,16 @@ fn run_elf_command_drives_pie_hello_static_fixture() {
     }
 }
 
+#[test]
+fn run_accepts_tty_flag() {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_carrick"))
+        .args(["run", "--help"])
+        .output()
+        .unwrap();
+    let help = String::from_utf8_lossy(&out.stdout);
+    assert!(help.contains("--tty"), "run --help should mention --tty:\n{help}");
+}
+
 fn minimal_aarch64_elf() -> Vec<u8> {
     let mut elf = vec![0_u8; 64];
     elf[0..4].copy_from_slice(b"\x7fELF");

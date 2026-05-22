@@ -90,6 +90,11 @@ enum Commands {
         /// Suppress the JSON compat-report envelope.
         #[arg(long)]
         raw: bool,
+        /// Allocate a pseudo-terminal and run interactively, bridging the
+        /// guest's stdin/stdout to this terminal (like `docker run -it`).
+        /// Implies raw stdio.
+        #[arg(short = 't', long = "tty")]
+        tty: bool,
         /// Which writable-layer backend to use. Defaults to `host` on
         /// case-sensitive volumes (APFS scratch dir + cap-std sandbox)
         /// and `memory` elsewhere (in-memory tmpfs).
@@ -397,9 +402,11 @@ fn main() -> anyhow::Result<()> {
             max_traps,
             debug_state_path,
             raw,
+            tty,
             fs,
             command,
         } => {
+            let _ = tty; // wired in Phase B Task 6
             let image = ImageReference::parse(&image)?;
             let command = if command.is_empty() {
                 vec!["/bin/sh".to_owned()]
