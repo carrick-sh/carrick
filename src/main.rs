@@ -160,6 +160,12 @@ enum Commands {
         /// stream cost. The script sees the same carrick USDT providers.
         #[arg(short = 's', long = "script")]
         script: Option<std::path::PathBuf>,
+        /// Write DTrace events + aggregations to this file instead of stdout.
+        /// Essential when tracing an interactive (`-t`) guest: without it the
+        /// probe output intermixes with the guest's own terminal stream. The
+        /// traced command's stdio is left untouched.
+        #[arg(short = 'o', long = "trace-out", value_name = "FILE")]
+        trace_out: Option<std::path::PathBuf>,
         /// Internal: `KEY=VAL` env vars to set in the traced child. Used by
         /// the sudo re-exec to carry CARRICK_* vars across `sudo`'s env_reset
         /// (which would otherwise strip them) without needing SETENV in
@@ -241,24 +247,19 @@ enum RootfsCommand {
 /// so by the time fork can fire there is no tokio state to break.
 /// Wire up guest stdio for a run.
 ///
-/// For an interactive `-t` run this allocates a host pty, hands the slave to
-/// the guest as fds 0/1/2, and starts the relay between the pty master and the
-/// user's real terminal. For a non-interactive `--raw` run it just enables
-/// streaming.
+/// For a non-interactive `--raw` run this just enables stdio streaming. For an
+/// interactive `-t` run it allocates a host pty, hands the slave to the guest as
+/// fds 0/1/2, adopts the pty as the controlling terminal (`setsid`+`TIOCSCTTY`)
+/// so the host line discipline delivers Ctrl-C to the guest's foreground job,
+/// and starts the relay between the pty master and the user's real terminal.
 ///
-/// Returns the relay guard, which must be kept alive for the duration of the
-/// run and `stop()`ped afterwards so the terminal leaves raw mode.
-///
-/// Job control: we `setsid()` + `TIOCSCTTY` so the pty becomes our session's
-/// controlling terminal. This is what lets the host pty line discipline deliver
-/// SIGINT/SIGQUIT (Ctrl-C / Ctrl-\) to the guest's foreground process group at
-/// all, and lets the guest shell's `tcsetpgrp()` succeed (bg/fg job control).
-/// setsid() fails harmlessly if we are already a session leader; the relay
-/// reads the user's real terminal through the dup'd fds below, which are
-/// independent of controlling-terminal status, so detaching from the launching
-/// terminal is safe under -t. (Signal delivery into a sleeping guest is handled
-/// by `host_sleep_interruptible` in dispatch::time, which returns EINTR rather
-/// than the std::thread::sleep that used to panic forked children on Ctrl-C.)
+/// NOTE: this gives an interactive shell with line editing, ttyname/`/dev/tty`,
+/// resize, and Ctrl-C interruption of the foreground command — but NOT full
+/// bg/fg job control (Ctrl-Z + `fg`). Full job control needs the shell to run
+/// in a non-orphaned process group under a session-leader supervisor; that
+/// restructure is tracked separately (it bottoms out in carrick's guest-fork
+/// IO/signal machinery not surviving a supervisor fork — see
+/// docs/superpowers/specs and the project memory).
 fn setup_interactive_stdio(
     dispatcher: &mut SyscallDispatcher,
     tty: bool,
@@ -279,7 +280,7 @@ fn setup_interactive_stdio(
         .context("failed to allocate interactive pty")?;
     let slave = relay.slave_fd();
     // SAFETY: redirect guest stdio to the pty slave, then adopt that pty as the
-    // controlling terminal of a fresh session (see the fn doc comment).
+    // controlling terminal of a fresh session.
     unsafe {
         libc::dup2(slave, 0);
         libc::dup2(slave, 1);
@@ -779,6 +780,7 @@ fn main() -> anyhow::Result<()> {
         Commands::Trace {
             flowindent,
             script,
+            trace_out,
             command,
             forward_env,
         } => {
@@ -820,6 +822,10 @@ fn main() -> anyhow::Result<()> {
                         forwarded.push(std::ffi::OsString::from("--script"));
                         forwarded.push(s.as_os_str().to_owned());
                     }
+                    if let Some(ref o) = trace_out {
+                        forwarded.push(std::ffi::OsString::from("--trace-out"));
+                        forwarded.push(o.as_os_str().to_owned());
+                    }
                     for (k, v) in std::env::vars_os() {
                         if k.to_string_lossy().starts_with("CARRICK_") {
                             forwarded.push(std::ffi::OsString::from("--forward-env"));
@@ -844,13 +850,14 @@ fn main() -> anyhow::Result<()> {
                 let opts = carrick::dtrace_consumer::TraceOptions {
                     flowindent,
                     script: script_src,
+                    out_path: trace_out.as_ref().map(|p| p.to_string_lossy().into_owned()),
                 };
                 carrick::dtrace_consumer::run_child_under_dtrace(&me, &command, &opts)
                     .map_err(|e| anyhow::anyhow!("trace failed: {}", e))?;
             }
             #[cfg(not(target_os = "macos"))]
             {
-                let _ = (flowindent, script, command);
+                let _ = (flowindent, script, trace_out, command);
                 bail!("carrick trace is only available on macOS (libdtrace).");
             }
         }
