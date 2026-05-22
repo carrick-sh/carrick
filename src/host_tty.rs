@@ -432,6 +432,40 @@ pub fn set_host_termios_tracking(fd: i32, linux: &LinuxTermios) -> bool {
     set_host_termios(fd, linux)
 }
 
+/// Return the foreground process-group ID of the terminal `fd`, or `None` if
+/// `fd` is not a real tty or the call fails.  On failure the raw `errno` from
+/// `tcgetpgrp(3)` is returned as the `Err` variant so callers can translate it.
+///
+/// This is the get-half used by the stdio TIOCGPGRP passthrough.
+pub fn host_tty_tcgetpgrp(fd: i32) -> Result<i32, i32> {
+    if !host_isatty(fd) {
+        return Err(unsafe { *libc::__error() });
+    }
+    // SAFETY: fd has been confirmed to be a tty; tcgetpgrp returns a pid_t
+    // (i32 on macOS) or -1 on error.
+    let pgrp = unsafe { libc::tcgetpgrp(fd) };
+    if pgrp < 0 {
+        Err(unsafe { *libc::__error() })
+    } else {
+        Ok(pgrp)
+    }
+}
+
+/// Set the foreground process-group of terminal `fd` to `pgrp`.  Returns `Ok(())`
+/// on success or `Err(errno)` on failure (raw macOS errno, not translated).
+///
+/// This is the set-half used by the stdio TIOCSPGRP passthrough.
+pub fn host_tty_tcsetpgrp(fd: i32, pgrp: i32) -> Result<(), i32> {
+    // SAFETY: fd is a raw file descriptor; pgrp is a plain integer.
+    // tcsetpgrp validates both; we propagate any error.
+    let r = unsafe { libc::tcsetpgrp(fd, pgrp) };
+    if r < 0 {
+        Err(unsafe { *libc::__error() })
+    } else {
+        Ok(())
+    }
+}
+
 /// Put `fd` into raw mode (cfmakeraw semantics) after recording its current
 /// termios for restoration via the existing dirty-tracking guard.  Errors if
 /// `fd` is not a tty.
