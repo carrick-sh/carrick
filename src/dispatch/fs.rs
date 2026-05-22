@@ -2650,6 +2650,10 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::Errno { errno });
             }
             let mut buf = vec![0u8; count];
+            // BLOCKING-IO-OK: splice/sendfile source read. The in fd is a
+            // regular file or an already-readable pipe end; converting this
+            // niche path to the lockless wait is a tracked follow-up, not a
+            // server hot path.
             let n = unsafe { libc::read(host_fd, buf.as_mut_ptr() as *mut _, count) };
             if n < 0 {
                 return Ok(DispatchOutcome::Errno { errno: host_errno() });
@@ -3244,6 +3248,9 @@ impl SyscallDispatcher {
             return outcome;
         }
         if self.io.stream_stdio && (fd == 1 || fd == 2) {
+            // BLOCKING-IO-OK: streamed write to the inherited stdout/stderr
+            // (the user's tty/pipe). Blocking here is the correct backpressure
+            // and isn't a guest socket on the server path.
             let n = unsafe {
                 libc::write(fd, bytes.as_ptr() as *const _, bytes.len())
             };
@@ -3381,6 +3388,8 @@ impl SyscallDispatcher {
                 continue;
             }
             if self.io.stream_stdio && (fd == 1 || fd == 2) {
+                // BLOCKING-IO-OK: streamed writev to the inherited stdout/
+                // stderr (the user's tty/pipe); blocking is correct backpressure.
                 let n = unsafe {
                     libc::write(fd as i32, bytes.as_ptr() as *const _, bytes.len())
                 };
