@@ -4613,7 +4613,10 @@ mod overlay_dispatch_tests {
         );
         // Confirm the Arc is genuinely shared: insert an entry directly into
         // the table and verify the dispatcher sees it through its accessor.
-        let index = dispatcher.pty_table().lock().insert("dummy-slave".to_string());
+        let index = dispatcher
+            .pty_table()
+            .lock()
+            .insert("dummy-slave".to_string());
         assert_eq!(
             dispatcher.pty_table().lock().live_indices(),
             vec![index],

@@ -65,14 +65,20 @@ impl IoState {
 
 impl FsState {
     pub(super) fn new() -> Self {
-        let pty_table = std::sync::Arc::new(parking_lot::Mutex::new(
-            crate::vfs::PtyTable::new(),
-        ));
+        let pty_table = std::sync::Arc::new(parking_lot::Mutex::new(crate::vfs::PtyTable::new()));
         Self {
             vfs_mounts: {
                 let mut m = crate::vfs::VfsMounts::new();
-                m.mount("/dev", Box::new(crate::vfs::DevVfs::new(std::sync::Arc::clone(&pty_table))));
-                m.mount("/dev/pts", Box::new(crate::vfs::DevptsVfs::new(std::sync::Arc::clone(&pty_table))));
+                m.mount(
+                    "/dev",
+                    Box::new(crate::vfs::DevVfs::new(std::sync::Arc::clone(&pty_table))),
+                );
+                m.mount(
+                    "/dev/pts",
+                    Box::new(crate::vfs::DevptsVfs::new(std::sync::Arc::clone(
+                        &pty_table,
+                    ))),
+                );
                 m.mount("/proc", Box::new(crate::vfs::ProcVfs::new()));
                 m.mount("/sys", Box::new(crate::vfs::SysVfs::new()));
                 m
@@ -945,15 +951,15 @@ impl SyscallDispatcher {
         // stdio-gated arms below never run for pty fds.
         if let Some((role, host_fd)) = self.pty_info(fd) {
             return Ok(match ioctl_request {
-                LINUX_TIOCGPTN => {
-                    write_packed(&mut *ctx.memory, arg, &role.index.to_le_bytes())
-                }
+                LINUX_TIOCGPTN => write_packed(&mut *ctx.memory, arg, &role.index.to_le_bytes()),
                 LINUX_TIOCSPTLCK => {
                     let mut buf = [0u8; 4];
                     match ctx.memory.read_bytes(arg, 4) {
                         Ok(b) => buf.copy_from_slice(&b),
                         Err(_) => {
-                            return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT })
+                            return Ok(DispatchOutcome::Errno {
+                                errno: LINUX_EFAULT,
+                            });
                         }
                     }
                     let lock = i32::from_le_bytes(buf) != 0;
@@ -975,10 +981,14 @@ impl SyscallDispatcher {
                                     let _ = crate::host_tty::set_host_termios(host_fd, &t);
                                     DispatchOutcome::Returned { value: 0 }
                                 }
-                                Err(_) => DispatchOutcome::Errno { errno: LINUX_EINVAL },
+                                Err(_) => DispatchOutcome::Errno {
+                                    errno: LINUX_EINVAL,
+                                },
                             }
                         }
-                        Err(_) => DispatchOutcome::Errno { errno: LINUX_EFAULT },
+                        Err(_) => DispatchOutcome::Errno {
+                            errno: LINUX_EFAULT,
+                        },
                     }
                 }
                 LINUX_TIOCGWINSZ => {
@@ -995,18 +1005,22 @@ impl SyscallDispatcher {
                             ws.ws_xpixel = u16::from_le_bytes([b[4], b[5]]);
                             ws.ws_ypixel = u16::from_le_bytes([b[6], b[7]]);
                             // SAFETY: host_fd is our live pty fd; &ws is valid.
-                            let r = unsafe { libc::ioctl(host_fd, libc::TIOCSWINSZ as libc::c_ulong, &ws) };
+                            let r = unsafe {
+                                libc::ioctl(host_fd, libc::TIOCSWINSZ as libc::c_ulong, &ws)
+                            };
                             if r < 0 {
                                 DispatchOutcome::Errno {
-                                    errno: crate::dispatch::macos_to_linux_errno(
-                                        unsafe { *libc::__error() },
-                                    ),
+                                    errno: crate::dispatch::macos_to_linux_errno(unsafe {
+                                        *libc::__error()
+                                    }),
                                 }
                             } else {
                                 DispatchOutcome::Returned { value: 0 }
                             }
                         }
-                        Err(_) => DispatchOutcome::Errno { errno: LINUX_EFAULT },
+                        Err(_) => DispatchOutcome::Errno {
+                            errno: LINUX_EFAULT,
+                        },
                     }
                 }
                 LINUX_TIOCGPGRP => {
@@ -1014,9 +1028,9 @@ impl SyscallDispatcher {
                     let pgrp = unsafe { libc::tcgetpgrp(host_fd) };
                     if pgrp < 0 {
                         DispatchOutcome::Errno {
-                            errno: crate::dispatch::macos_to_linux_errno(
-                                unsafe { *libc::__error() },
-                            ),
+                            errno: crate::dispatch::macos_to_linux_errno(unsafe {
+                                *libc::__error()
+                            }),
                         }
                     } else {
                         write_packed(&mut *ctx.memory, arg, &(pgrp as i32).to_le_bytes())
@@ -1027,7 +1041,9 @@ impl SyscallDispatcher {
                     match ctx.memory.read_bytes(arg, 4) {
                         Ok(b) => buf.copy_from_slice(&b),
                         Err(_) => {
-                            return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT })
+                            return Ok(DispatchOutcome::Errno {
+                                errno: LINUX_EFAULT,
+                            });
                         }
                     }
                     let pgrp = i32::from_le_bytes(buf);
@@ -1035,9 +1051,9 @@ impl SyscallDispatcher {
                     let r = unsafe { libc::tcsetpgrp(host_fd, pgrp) };
                     if r < 0 {
                         DispatchOutcome::Errno {
-                            errno: crate::dispatch::macos_to_linux_errno(
-                                unsafe { *libc::__error() },
-                            ),
+                            errno: crate::dispatch::macos_to_linux_errno(unsafe {
+                                *libc::__error()
+                            }),
                         }
                     } else {
                         DispatchOutcome::Returned { value: 0 }
@@ -1045,15 +1061,15 @@ impl SyscallDispatcher {
                 }
                 LINUX_TIOCSCTTY => {
                     // SAFETY: host_fd is our live pty fd. Best-effort.
-                    unsafe {
-                        libc::ioctl(host_fd, libc::TIOCSCTTY as libc::c_ulong, 0i32)
-                    };
+                    unsafe { libc::ioctl(host_fd, libc::TIOCSCTTY as libc::c_ulong, 0i32) };
                     DispatchOutcome::Returned { value: 0 }
                 }
                 _ => {
                     ctx.reporter
                         .record(CompatEvent::unhandled_ioctl(fd, ioctl_request, arg));
-                    DispatchOutcome::Errno { errno: LINUX_ENOTTY }
+                    DispatchOutcome::Errno {
+                        errno: LINUX_ENOTTY,
+                    }
                 }
             });
         }
@@ -1226,10 +1242,15 @@ impl SyscallDispatcher {
     /// If `fd` is a pty master/slave end, return its role and the backing
     /// host fd in one fd-table lookup.
     fn pty_info(&self, fd: i32) -> Option<(crate::vfs::PtyRole, i32)> {
-        self.open_file(fd).and_then(|of| match &*of.description.read() {
-            OpenDescription::HostPipe { host_fd, pty: Some(role), .. } => Some((*role, *host_fd)),
-            _ => None,
-        })
+        self.open_file(fd)
+            .and_then(|of| match &*of.description.read() {
+                OpenDescription::HostPipe {
+                    host_fd,
+                    pty: Some(role),
+                    ..
+                } => Some((*role, *host_fd)),
+                _ => None,
+            })
     }
 
     pub(super) fn fd_is_valid(&self, fd: i32) -> bool {
@@ -2088,7 +2109,61 @@ impl SyscallDispatcher {
                             // writes through the host fd like /dev/null.
                             is_read_end: true,
                             status_flags: status_flags as u64,
-                            pty: Some(crate::vfs::PtyRole { index: pts_index, is_master }),
+                            pty: Some(crate::vfs::PtyRole {
+                                index: pts_index,
+                                is_master,
+                            }),
+                        })),
+                        fd_flags: linux_fd_flags_from_open_flags(flags),
+                    },
+                );
+                VfsOpenAttempt::Installed(new_fd)
+            }
+            crate::vfs::VfsHandle::Directory {
+                path,
+                entries,
+                status_flags,
+            } => {
+                // Convert synthetic VFS DirEnt entries into the RootFsDirEntry
+                // shape that OpenDescription::Directory + getdents64 expects.
+                let rootfs_entries: Vec<RootFsDirEntry> = entries
+                    .into_iter()
+                    .map(|e| {
+                        let kind = match e.kind {
+                            crate::vfs::EntryKind::Directory => RootFsEntryKind::Directory,
+                            crate::vfs::EntryKind::Symlink => RootFsEntryKind::Symlink,
+                            _ => RootFsEntryKind::File,
+                        };
+                        RootFsDirEntry {
+                            name: e.name.clone(),
+                            metadata: RootFsMetadata {
+                                path: std::path::Path::new(&path).join(&e.name).to_path_buf(),
+                                kind,
+                                mode: 0o666,
+                                size: 0,
+                            },
+                        }
+                    })
+                    .collect();
+                let metadata = RootFsMetadata {
+                    path: std::path::Path::new(&path).to_path_buf(),
+                    kind: RootFsEntryKind::Directory,
+                    mode: 0o755,
+                    size: 0,
+                };
+                let new_fd = match self.allocate_fd(3) {
+                    Some(fd) => fd,
+                    None => return VfsOpenAttempt::Errno(linux_errno::EMFILE),
+                };
+                self.insert_open_file(
+                    new_fd,
+                    OpenFile {
+                        description: Arc::new(RwLock::new(OpenDescription::Directory {
+                            path,
+                            metadata,
+                            entries: rootfs_entries,
+                            offset: 0,
+                            status_flags: status_flags as u64,
                         })),
                         fd_flags: linux_fd_flags_from_open_flags(flags),
                     },
