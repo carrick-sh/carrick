@@ -106,6 +106,117 @@ pub fn open_master(nonblock: bool) -> Result<(i32, String), i32> {
     Ok((master, slave_name))
 }
 
+// ── DevptsVfs ─────────────────────────────────────────────────────────────────
+
+use std::ffi::CString;
+use std::sync::Arc;
+use parking_lot::Mutex;
+use crate::linux_abi::{LINUX_ENOENT, LINUX_ENOTDIR};
+use super::{DirEnt, EntryKind, Metadata, OpenContext, OpenFlags, Vfs, VfsError, VfsHandle};
+
+/// VFS mount for `/dev/pts`. Serves directory metadata for `/dev/pts` itself
+/// and `CharDevice` metadata + open for each live `/dev/pts/N` slave.
+/// Shares its [`PtyTable`] with the `/dev` (DevVfs) mount so that a slave
+/// opened here is the counterpart of a master opened via `/dev/ptmx`.
+pub struct DevptsVfs {
+    pty_table: Arc<Mutex<PtyTable>>,
+}
+
+impl DevptsVfs {
+    pub fn new(pty_table: Arc<Mutex<PtyTable>>) -> Self {
+        Self { pty_table }
+    }
+
+    fn parse_index(path: &str) -> Option<u32> {
+        path.strip_prefix("/dev/pts/")?.parse().ok()
+    }
+}
+
+impl Vfs for DevptsVfs {
+    fn lookup(&self, path: &str) -> Result<Metadata, VfsError> {
+        if path == "/dev/pts" {
+            return Ok(Metadata {
+                kind: EntryKind::Directory,
+                mode: 0o755,
+                size: 0,
+                uid: 0,
+                gid: 0,
+                mtime_secs: 0,
+                mtime_nanos: 0,
+            });
+        }
+        if let Some(n) = Self::parse_index(path) {
+            if self.pty_table.lock().slave_name(n).is_some() {
+                return Ok(Metadata {
+                    kind: EntryKind::CharDevice,
+                    mode: 0o620,
+                    size: 0,
+                    uid: 0,
+                    gid: 0,
+                    mtime_secs: 0,
+                    mtime_nanos: 0,
+                });
+            }
+        }
+        Err(LINUX_ENOENT)
+    }
+
+    fn readdir(&self, path: &str) -> Result<Vec<DirEnt>, VfsError> {
+        if path != "/dev/pts" {
+            return Err(LINUX_ENOTDIR);
+        }
+        Ok(self
+            .pty_table
+            .lock()
+            .live_indices()
+            .into_iter()
+            .map(|n| DirEnt { name: n.to_string(), kind: EntryKind::CharDevice })
+            .collect())
+    }
+
+    fn open(
+        &self,
+        path: &str,
+        flags: OpenFlags,
+        _ctx: &OpenContext<'_>,
+    ) -> Result<VfsHandle, VfsError> {
+        let n = Self::parse_index(path).ok_or(LINUX_ENOENT)?;
+        let slave_name = self.pty_table.lock().slave_name(n).ok_or(LINUX_ENOENT)?;
+        let mut oflag = if flags.read && flags.write {
+            libc::O_RDWR
+        } else if flags.write {
+            libc::O_WRONLY
+        } else {
+            libc::O_RDONLY
+        };
+        oflag |= libc::O_NOCTTY;
+        if flags.nonblock {
+            oflag |= libc::O_NONBLOCK;
+        }
+        let cpath = CString::new(slave_name).map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
+        // SAFETY: cpath is a valid NUL-terminated path to a host slave pty device.
+        let host_fd = unsafe { libc::open(cpath.as_ptr(), oflag) };
+        if host_fd < 0 {
+            return Err(super::dev::host_open_errno());
+        }
+        let status_flags = if flags.nonblock {
+            crate::linux_abi::LINUX_O_NONBLOCK as u32
+        } else {
+            0
+        };
+        Ok(VfsHandle::Pty {
+            host_fd,
+            pts_index: n,
+            is_master: false,
+            status_flags,
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "devpts"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -136,5 +247,35 @@ mod tests {
         assert_eq!(t.slave_name(0), None);
         assert_eq!(t.live_indices(), vec![1]);
         assert_eq!(t.insert("/dev/ttys002".into()), 2);
+    }
+
+    #[test]
+    fn devpts_lookup_and_readdir_track_live_ptys() {
+        use crate::vfs::{Vfs, OpenFlags, OpenContext};
+        use std::sync::Arc;
+        use parking_lot::Mutex;
+
+        let table = Arc::new(Mutex::new(PtyTable::new()));
+        let dev = DevptsVfs::new(Arc::clone(&table));
+
+        assert_eq!(dev.lookup("/dev/pts").unwrap().kind, crate::vfs::EntryKind::Directory);
+        assert!(dev.lookup("/dev/pts/0").is_err());
+
+        // Allocate a slave name out-of-band; use /dev/null as an openable stand-in.
+        let n = table.lock().insert("/dev/null".into());
+        assert_eq!(n, 0);
+        assert_eq!(dev.lookup("/dev/pts/0").unwrap().kind, crate::vfs::EntryKind::CharDevice);
+        let names: Vec<String> = dev.readdir("/dev/pts").unwrap().into_iter().map(|e| e.name).collect();
+        assert!(names.contains(&"0".to_string()));
+
+        let h = dev.open("/dev/pts/0", OpenFlags { read: true, write: true, ..Default::default() }, &OpenContext::default()).unwrap();
+        match h {
+            crate::vfs::VfsHandle::Pty { is_master, pts_index, host_fd, .. } => {
+                assert!(!is_master);
+                assert_eq!(pts_index, 0);
+                unsafe { libc::close(host_fd) };
+            }
+            other => panic!("expected Pty handle, got {other:?}"),
+        }
     }
 }

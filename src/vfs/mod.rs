@@ -42,7 +42,7 @@ pub mod rootfs;
 pub mod sys;
 
 pub use dev::DevVfs;
-pub use devpts::{PtyRole, PtyTable};
+pub use devpts::{DevptsVfs, PtyRole, PtyTable};
 pub use mount::VfsMounts;
 pub use proc::ProcVfs;
 pub use rootfs::RootFsVfs;
