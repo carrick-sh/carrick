@@ -4167,3 +4167,100 @@ fn closing_ptmx_master_removes_pts_entry() {
         "/dev/pts/0 must be ENOENT after master close"
     );
 }
+
+#[test]
+fn pty_master_slave_data_roundtrip() {
+    // Prove that pty fds are bidirectional: a write(slave, …) is
+    // readable on the master.  Direction chosen: slave→master avoids
+    // the canonical-mode line-discipline requirement (a newline would
+    // be needed before data is visible to a slave reader in cooked
+    // mode).  We exercise the write handler on the slave fd (was
+    // incorrectly gated by is_read_end) and the read handler on the
+    // master fd (already worked but re-confirmed here).
+    //
+    // Memory layout:
+    //   0x4000  "/dev/ptmx\0"
+    //   0x4040  "/dev/pts/0\0"
+    //   0x4100  lockarg (i32, value 0)
+    //   0x4200  write buffer ("ping")
+    //   0x4300  read buffer (4 bytes, cleared to 0)
+    let mut dispatcher = SyscallDispatcher::new();
+    let mut memory = LinearMemory::new(0x4000, vec![0u8; 0x400]);
+    memory.write_bytes(0x4000, b"/dev/ptmx\0").unwrap();
+    memory.write_bytes(0x4040, b"/dev/pts/0\0").unwrap();
+    let reporter = CompatReporter::default();
+
+    // openat(AT_FDCWD, "/dev/ptmx", O_RDWR=2) → master fd
+    let master = match dispatcher
+        .dispatch(
+            SyscallRequest::new(56, SyscallArgs::from([(-100_i64) as u64, 0x4000, 2, 0, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap()
+    {
+        DispatchOutcome::Returned { value } => value as u64,
+        o => panic!("open /dev/ptmx failed: {:?}", o),
+    };
+
+    // unlockpt: ioctl(master, TIOCSPTLCK, &0)
+    memory.write_bytes(0x4100, &0i32.to_le_bytes()).unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(29, SyscallArgs::from([master, LINUX_TIOCSPTLCK, 0x4100, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 },
+        "TIOCSPTLCK unlock must succeed"
+    );
+
+    // openat(AT_FDCWD, "/dev/pts/0", O_RDWR=2) → slave fd
+    let slave = match dispatcher
+        .dispatch(
+            SyscallRequest::new(56, SyscallArgs::from([(-100_i64) as u64, 0x4040, 2, 0, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap()
+    {
+        DispatchOutcome::Returned { value } => value as u64,
+        o => panic!("open /dev/pts/0 failed: {:?}", o),
+    };
+
+    // write(slave, "ping", 4) — this was EBADF before the fix
+    memory.write_bytes(0x4200, b"ping").unwrap();
+    let w = dispatcher
+        .dispatch(
+            SyscallRequest::new(64, SyscallArgs::from([slave, 0x4200, 4, 0, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    assert!(
+        matches!(w, DispatchOutcome::Returned { value } if value == 4),
+        "write(slave, \"ping\") must return 4, got: {:?}",
+        w
+    );
+
+    // read(master, buf, 4) — slave output goes to master read buffer
+    let r = dispatcher
+        .dispatch(
+            SyscallRequest::new(63, SyscallArgs::from([master, 0x4300, 4, 0, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    assert!(
+        matches!(r, DispatchOutcome::Returned { value } if value == 4),
+        "read(master) must return 4, got: {:?}",
+        r
+    );
+    assert_eq!(
+        memory.read_bytes(0x4300, 4).unwrap(),
+        b"ping",
+        "master read must yield the bytes written to the slave"
+    );
+}
