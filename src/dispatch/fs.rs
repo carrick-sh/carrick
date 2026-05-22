@@ -5177,6 +5177,37 @@ impl SyscallDispatcher {
         }
     }
 
+    /// The synthetic `(label, st_mode)` for a bare stdio fd (0/1/2) with no
+    /// OpenDescription. Glibc fstat()s stdio on startup to pick its tty/file/
+    /// pipe code path, so report the REAL host type (a pty → S_IFCHR, a pipe →
+    /// S_IFIFO, a redirect → S_IFREG; the S_IF* values match Linux). When the
+    /// fd is the `carrick run -t` controlling tty, label it `/dev/pts/N` so the
+    /// synthetic st_ino matches `stat("/dev/pts/N")` — the equality `ttyname(3)`
+    /// checks between `fstat(fd)` and the `/proc/self/fd/N` readlink target.
+    /// Shared by `write_fd_stat` (fstat) and `write_fd_statx` (statx).
+    fn stdio_synthetic_label_mode(&self, fd: i32) -> (String, u32) {
+        let label = if crate::host_tty::host_isatty(fd)
+            && let Some(n) = self.pty_table().lock().controlling()
+        {
+            format!("/dev/pts/{n}")
+        } else {
+            match fd {
+                0 => "/dev/stdin",
+                1 => "/dev/stdout",
+                _ => "/dev/stderr",
+            }
+            .to_string()
+        };
+        let mut host_st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: fd is a stdio fd; &host_st is a valid stat out-param.
+        let mode = if unsafe { libc::fstat(fd, &mut host_st) } == 0 {
+            (host_st.st_mode as u32 & LINUX_S_IFMT) | 0o620
+        } else {
+            LINUX_S_IFCHR | 0o620
+        };
+        (label, mode)
+    }
+
     fn write_fd_stat(
         &self,
         fd: i32,
@@ -5185,44 +5216,8 @@ impl SyscallDispatcher {
     ) -> DispatchOutcome {
         let Some(open_file) = self.open_file(fd) else {
             if is_stdio_fd(fd) {
-                // Glibc cat/head/etc fstat stdout on startup to decide
-                // whether they're talking to a regular file (use POSIX
-                // sendfile fast path) or a TTY/pipe (default cooked
-                // path). Synthesize a character-device stat so they
-                // pick the right branch instead of bailing EBADF.
-                // When this stdio fd is the `carrick run -t` controlling tty,
-                // label it `/dev/pts/N` so its synthetic st_ino matches
-                // `stat("/dev/pts/N")` — the equality `ttyname(3)` checks
-                // between fstat(fd) and stat(readlink-target).
-                let label: String = if crate::host_tty::host_isatty(fd)
-                    && let Some(n) = self.pty_table().lock().controlling()
-                {
-                    format!("/dev/pts/{n}")
-                } else {
-                    match fd {
-                        0 => "/dev/stdin",
-                        1 => "/dev/stdout",
-                        _ => "/dev/stderr",
-                    }
-                    .to_string()
-                };
-                let label = label.as_str();
-                // Report the REAL type of whatever is wired to the guest's
-                // stdio. Under `--fs host`/`--raw` (stream_stdio) the guest's
-                // 0/1/2 are carrick's own host fds, so fstat the host fd and
-                // carry its type bits: a pipe → S_IFIFO, a tty → S_IFCHR, a
-                // file redirect → S_IFREG. The S_IF* type values are identical
-                // on macOS and Linux, so they transfer directly. This matches
-                // real Linux (e.g. a piped stdin reports FIFO, not CHR) and
-                // keeps tools off the regular-file seek fast path for pipes.
-                let mut host_st: libc::stat = unsafe { std::mem::zeroed() };
-                let mode = if unsafe { libc::fstat(fd, &mut host_st) } == 0 {
-                    (host_st.st_mode as u32 & LINUX_S_IFMT) | 0o620
-                } else {
-                    // Fall back to a character device if the host fstat fails.
-                    LINUX_S_IFCHR | 0o620
-                };
-                return write_synthetic_stat(memory, statbuf, label, 0, mode);
+                let (label, mode) = self.stdio_synthetic_label_mode(fd);
+                return write_synthetic_stat(memory, statbuf, &label, 0, mode);
             }
             return DispatchOutcome::Errno { errno: LINUX_EBADF };
         };
@@ -5323,6 +5318,13 @@ impl SyscallDispatcher {
         memory: &mut impl GuestMemory,
     ) -> DispatchOutcome {
         let Some(open_file) = self.open_file(fd) else {
+            if is_stdio_fd(fd) {
+                // Mirror write_fd_stat: synthesize a stat for bare stdio fds so
+                // statx(fd, AT_EMPTY_PATH) on the -t controlling tty matches
+                // fstat (S_IFCHR + the /dev/pts/N inode) instead of EBADF.
+                let (label, mode) = self.stdio_synthetic_label_mode(fd);
+                return write_synthetic_statx_mode(memory, statxbuf, &label, 0, mode);
+            }
             return DispatchOutcome::Errno { errno: LINUX_EBADF };
         };
         let open = open_file.description.read();
