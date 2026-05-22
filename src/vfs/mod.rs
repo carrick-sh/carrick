@@ -35,12 +35,14 @@
 //! enum. `DevVfs` is the first concrete user of `open`.
 
 pub mod dev;
+pub mod devpts;
 pub mod mount;
 pub mod proc;
 pub mod rootfs;
 pub mod sys;
 
 pub use dev::DevVfs;
+pub use devpts::{PtyRole, PtyTable};
 pub use mount::VfsMounts;
 pub use proc::ProcVfs;
 pub use rootfs::RootFsVfs;
