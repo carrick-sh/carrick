@@ -172,6 +172,18 @@ impl FutexTable {
         }
     }
 
+    /// Wake every futex waiter so it re-evaluates its `interrupted()` predicate
+    /// NOW, rather than at the next `POLL_CAP` slice. Called by the signal pump
+    /// the instant a signal is published, so a thread parked in `FUTEX_WAIT`
+    /// delivers it promptly (no up-to-50ms latency) without a generation bump —
+    /// waiters whose word/gen is unchanged and have no pending signal just
+    /// re-park. This is the portable equivalent of an EINTR-interruptible
+    /// `__ulock_wait`: the wait itself stays a condvar, but a signal wakes it
+    /// immediately.
+    pub fn notify_signal_pending(&self) {
+        self.cv.notify_all();
+    }
+
     /// Wake up to `n` waiters on `addr`. Returns `n` (best-effort upper bound;
     /// glibc only relies on >=1 progress, and waiters re-check `*uaddr`).
     pub fn wake(&self, addr: u64, n: u32) -> u32 {
