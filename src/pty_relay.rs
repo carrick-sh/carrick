@@ -5,7 +5,51 @@
 use std::ffi::CString;
 use std::io;
 use std::os::unix::io::RawFd;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::thread::JoinHandle;
+
+// ---------------------------------------------------------------------------
+// SIGWINCH self-pipe
+// ---------------------------------------------------------------------------
+//
+// Only ONE PtyRelay is active at a time (`carrick run -t` allocates one pty),
+// so a single process-global static for the write end is safe. The handler is
+// an extern "C" fn and cannot reach per-instance state.
+//
+// The write end is set to -1 when no relay is active (handler is a no-op then).
+
+/// Write end of the SIGWINCH self-pipe. `-1` when no relay is active.
+/// Written by the async handler; must be a non-blocking fd (O_NONBLOCK) so the
+/// handler's write can never block.
+static WINCH_PIPE_WRITE: AtomicI32 = AtomicI32::new(-1);
+
+/// Async-signal-safe SIGWINCH handler. Only calls `write(2)` and reads one
+/// atomic — both are async-signal-safe per POSIX. No ioctl, no allocation,
+/// no mutex.
+extern "C" fn handle_sigwinch(_signum: libc::c_int) {
+    let w = WINCH_PIPE_WRITE.load(Ordering::SeqCst);
+    if w >= 0 {
+        // SAFETY: w is a live non-blocking pipe fd; write(1 byte) is
+        // async-signal-safe. EAGAIN (full pipe) is fine — a resize is already
+        // pending.
+        let byte = [0u8; 1];
+        unsafe { libc::write(w, byte.as_ptr() as *const libc::c_void, 1) };
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Window-size propagation
+// ---------------------------------------------------------------------------
+
+/// Read the window size from `tty_fd` and apply it to `master_fd` so the
+/// guest's slave sees the resize.
+pub(crate) fn propagate_winsize(tty_fd: RawFd, master_fd: RawFd) {
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    // SAFETY: both fds are live; ws is a valid winsize buffer.
+    if unsafe { libc::ioctl(tty_fd, libc::TIOCGWINSZ, &mut ws) } == 0 {
+        unsafe { libc::ioctl(master_fd, libc::TIOCSWINSZ, &ws) };
+    }
+}
 
 /// A freshly-allocated host pty (master + already-opened slave).
 pub struct PtyPair {
@@ -37,12 +81,25 @@ impl PtyPair {
 /// The relay runs on a dedicated thread and uses `poll(2)` to multiplex three
 /// fds: `real_in` → master, master → `real_out`, and a shutdown pipe that lets
 /// `stop()` cleanly terminate the thread without any signal or timeout.
+///
+/// In the production path (`start`), a SIGWINCH self-pipe is also added: the
+/// handler writes a byte, the relay thread reads it and calls
+/// `propagate_winsize` so the guest slave tracks terminal resizes.
 pub struct PtyRelay {
     pair: PtyPair,
     shutdown_w: RawFd,
     thread: Option<JoinHandle<()>>,
     raw_active: bool,
     real_in_for_restore: RawFd,
+    /// Read end of the SIGWINCH self-pipe, or `-1` if SIGWINCH is not wired
+    /// (test path). Closed by `stop()`.
+    winch_r: RawFd,
+    /// Write end of the SIGWINCH self-pipe, or `-1`. Cleared from the global
+    /// static and closed by `stop()`.
+    winch_w: RawFd,
+    /// Previous SIGWINCH disposition, saved so `stop()` can restore it.
+    /// `None` when SIGWINCH was not installed (test path).
+    old_sigwinch: Option<libc::sigaction>,
 }
 
 impl PtyRelay {
@@ -51,25 +108,68 @@ impl PtyRelay {
         self.pair.slave_fd
     }
 
-    /// Production entry: allocate a pty, put `real_in` in raw mode, start the
-    /// relay between (real_in, real_out) and the master.
+    /// Production entry: allocate a pty, put `real_in` in raw mode, install
+    /// SIGWINCH propagation, and start the relay between (real_in, real_out)
+    /// and the master.
     pub fn start(real_in: RawFd, real_out: RawFd) -> io::Result<Self> {
         crate::host_tty::make_raw(real_in)?;
-        let mut relay = Self::start_inner(PtyPair::allocate()?, real_in, real_out)?;
+        let pair = PtyPair::allocate()?;
+
+        // ── SIGWINCH self-pipe ───────────────────────────────────────────────
+        // Create a non-blocking pipe: handler writes, relay loop reads.
+        let mut wp = [0i32; 2];
+        // SAFETY: wp is a 2-int array for pipe(2).
+        if unsafe { libc::pipe(wp.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let (winch_r, winch_w) = (wp[0], wp[1]);
+        // Make the write end non-blocking so the handler's write never blocks
+        // if the pipe fills (coalescing: a pending resize is already signalled).
+        unsafe {
+            let fl = libc::fcntl(winch_w, libc::F_GETFL);
+            if fl >= 0 {
+                libc::fcntl(winch_w, libc::F_SETFL, fl | libc::O_NONBLOCK);
+            }
+        }
+        // Publish write end to global so the handler can reach it.
+        WINCH_PIPE_WRITE.store(winch_w, Ordering::SeqCst);
+
+        // Install handler; save old disposition for restore in stop().
+        // SAFETY: zeroed sigaction is the documented "no flags, empty mask" form.
+        let old_sigwinch = unsafe {
+            let mut action: libc::sigaction = core::mem::zeroed();
+            action.sa_sigaction = handle_sigwinch as *const () as usize;
+            libc::sigemptyset(&mut action.sa_mask);
+            action.sa_flags = libc::SA_RESTART;
+            let mut old: libc::sigaction = core::mem::zeroed();
+            libc::sigaction(libc::SIGWINCH, &action, &mut old);
+            old
+        };
+
+        // Propagate initial size before the guest sees any data.
+        propagate_winsize(real_in, pair.master_fd);
+
+        let mut relay = Self::start_inner(pair, real_in, real_out, winch_r)?;
         relay.raw_active = true;
+        relay.winch_r = winch_r;
+        relay.winch_w = winch_w;
+        relay.old_sigwinch = Some(old_sigwinch);
         Ok(relay)
     }
 
-    /// Test entry: same as `start` but skips `make_raw` (the fds are pipes /
-    /// socketpairs in tests, not real ttys).
+    /// Test entry: same as `start` but skips `make_raw` and does NOT install
+    /// the process-global SIGWINCH handler (tests must not disturb signal state).
     #[cfg(test)]
     pub fn start_for_test(real_in: RawFd, real_out: RawFd) -> io::Result<Self> {
-        let mut relay = Self::start_inner(PtyPair::allocate()?, real_in, real_out)?;
+        let mut relay = Self::start_inner(PtyPair::allocate()?, real_in, real_out, -1)?;
         relay.raw_active = false;
         Ok(relay)
     }
 
-    fn start_inner(pair: PtyPair, real_in: RawFd, real_out: RawFd) -> io::Result<Self> {
+    /// Common inner setup: shutdown pipe + relay thread. `winch_r` is passed to
+    /// the thread; pass `-1` for the test path (poll ignores fds with events=0,
+    /// and we special-case -1 in relay_loop to skip adding it to the poll set).
+    fn start_inner(pair: PtyPair, real_in: RawFd, real_out: RawFd, winch_r: RawFd) -> io::Result<Self> {
         let mut sp = [0i32; 2];
         // SAFETY: sp is a 2-int array for pipe(2).
         if unsafe { libc::pipe(sp.as_mut_ptr()) } != 0 {
@@ -79,7 +179,7 @@ impl PtyRelay {
         let master = pair.master_fd;
         let thread = match std::thread::Builder::new()
             .name("pty-relay".into())
-            .spawn(move || relay_loop(real_in, real_out, master, shutdown_r))
+            .spawn(move || relay_loop(real_in, real_out, master, shutdown_r, winch_r))
         {
             Ok(t) => t,
             Err(e) => {
@@ -99,26 +199,48 @@ impl PtyRelay {
             thread: Some(thread),
             raw_active: false,
             real_in_for_restore: real_in,
+            winch_r,
+            winch_w: -1,
+            old_sigwinch: None,
         })
     }
 
-    /// Stop the relay, restore the terminal, close the pty.
+    /// Stop the relay, restore SIGWINCH disposition, restore the terminal,
+    /// and close the pty and winch pipe.
     pub fn stop(mut self) {
+        // Signal the relay thread to shut down.
         // SAFETY: shutdown_w is a live pipe write end.
         let _ = unsafe { libc::write(self.shutdown_w, b"x".as_ptr().cast(), 1) };
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
+
+        // Restore SIGWINCH disposition AFTER the thread has exited so the
+        // handler can't fire concurrently with the restore.
+        if let Some(ref old) = self.old_sigwinch {
+            // Disarm the global write-end pointer first so any late signal
+            // that arrives before sigaction restores becomes a no-op.
+            WINCH_PIPE_WRITE.store(-1, Ordering::SeqCst);
+            // SAFETY: old is a valid sigaction captured at install time.
+            unsafe { libc::sigaction(libc::SIGWINCH, old, std::ptr::null_mut()) };
+        }
+
         if self.raw_active {
             crate::host_tty::restore_stdin_termios();
             let _ = self.real_in_for_restore;
         }
+
         // SAFETY: these fds are owned by this relay and no longer in use after
         // the thread has joined.
         unsafe {
             libc::close(self.shutdown_w);
             libc::close(self.pair.master_fd);
             libc::close(self.pair.slave_fd);
+            // winch_r is closed by relay_loop (same pattern as shutdown_r).
+            // Close winch_w if it was opened (production path).
+            if self.winch_w >= 0 {
+                libc::close(self.winch_w);
+            }
         }
     }
 }
@@ -131,16 +253,29 @@ impl PtyRelay {
 ///
 /// The loop does NOT copy real_in → real_out directly; all traffic
 /// passes through the pty master.
-fn relay_loop(real_in: RawFd, real_out: RawFd, master: RawFd, shutdown_r: RawFd) {
+///
+/// `winch_r` is the read end of the SIGWINCH self-pipe, or `-1` (test path).
+/// When `-1` the winch pollfd is given `events = 0` so `poll(2)` never fires
+/// it. When readable, the loop drains it and calls `propagate_winsize`.
+fn relay_loop(real_in: RawFd, real_out: RawFd, master: RawFd, shutdown_r: RawFd, winch_r: RawFd) {
+    // Index constants for the pollfd array.
+    const IDX_REAL_IN:    usize = 0;
+    const IDX_MASTER:     usize = 1;
+    const IDX_SHUTDOWN:   usize = 2;
+    const IDX_WINCH:      usize = 3;
+
+    // If winch_r == -1, set events = 0 so poll never wakes for it.
+    let winch_events = if winch_r >= 0 { libc::POLLIN } else { 0 };
     let mut fds = [
         libc::pollfd { fd: real_in,    events: libc::POLLIN, revents: 0 },
         libc::pollfd { fd: master,     events: libc::POLLIN, revents: 0 },
         libc::pollfd { fd: shutdown_r, events: libc::POLLIN, revents: 0 },
+        libc::pollfd { fd: winch_r,    events: winch_events, revents: 0 },
     ];
     let mut buf = [0u8; 4096];
     loop {
-        // SAFETY: fds is a valid 3-element pollfd array.
-        let n = unsafe { libc::poll(fds.as_mut_ptr(), 3, -1) };
+        // SAFETY: fds is a valid 4-element pollfd array.
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), 4, -1) };
         if n < 0 {
             let e = io::Error::last_os_error();
             if e.kind() == io::ErrorKind::Interrupted {
@@ -149,11 +284,26 @@ fn relay_loop(real_in: RawFd, real_out: RawFd, master: RawFd, shutdown_r: RawFd)
             break;
         }
         // Shutdown pipe readable → stop.
-        if fds[2].revents & libc::POLLIN != 0 {
+        if fds[IDX_SHUTDOWN].revents & libc::POLLIN != 0 {
             break;
         }
+        // SIGWINCH self-pipe readable → drain it and propagate window size.
+        // The ioctl is done here in the loop (never in the signal handler).
+        if fds[IDX_WINCH].revents & libc::POLLIN != 0 {
+            // Drain all pending bytes so the level-triggered poll doesn't spin.
+            let mut drain_buf = [0u8; 64];
+            loop {
+                let r = unsafe {
+                    libc::read(winch_r, drain_buf.as_mut_ptr().cast(), drain_buf.len())
+                };
+                if r <= 0 {
+                    break;
+                }
+            }
+            propagate_winsize(real_in, master);
+        }
         // real_in readable → copy to master.
-        if fds[0].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+        if fds[IDX_REAL_IN].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
             match read_fd(real_in, &mut buf) {
                 Some(0) | None => break,
                 Some(k) => {
@@ -164,7 +314,7 @@ fn relay_loop(real_in: RawFd, real_out: RawFd, master: RawFd, shutdown_r: RawFd)
             }
         }
         // master readable → copy to real_out.
-        if fds[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+        if fds[IDX_MASTER].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
             match read_fd(master, &mut buf) {
                 Some(0) | None => break,
                 Some(k) => {
@@ -178,6 +328,10 @@ fn relay_loop(real_in: RawFd, real_out: RawFd, master: RawFd, shutdown_r: RawFd)
     // SAFETY: shutdown_r is the relay-local read end of the shutdown pipe;
     // it is not visible to the caller and safe to close here.
     unsafe { libc::close(shutdown_r) };
+    // Close winch_r if one was provided (production path).
+    if winch_r >= 0 {
+        unsafe { libc::close(winch_r) };
+    }
 }
 
 /// Read up to `buf.len()` bytes from `fd`. Returns `None` on error,
@@ -333,5 +487,40 @@ mod tests {
         };
         assert_eq!(rc, 0, "socketpair(2) failed");
         (sv[0], sv[1])
+    }
+
+    /// Open a fresh pty pair (master, slave) for use in tests.
+    fn open_test_pty_pr() -> (i32, i32) {
+        let m = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
+        assert!(m >= 0, "posix_openpt failed");
+        unsafe { libc::grantpt(m); libc::unlockpt(m); }
+        let name = unsafe { std::ffi::CStr::from_ptr(libc::ptsname(m)) }.to_owned();
+        let s = unsafe { libc::open(name.as_ptr(), libc::O_RDWR | libc::O_NOCTTY) };
+        assert!(s >= 0, "open slave failed");
+        (m, s)
+    }
+
+    /// `propagate_winsize` reads the size set on one tty and applies it to
+    /// another pty master.
+    #[test]
+    fn propagate_winsize_copies_rows_cols_to_master() {
+        // Use two ptys: set winsize on the slave of `from`, propagate from
+        // from.slave → to.master, read it back from to.master.
+        let from = open_test_pty_pr();  // (master, slave)
+        let to = open_test_pty_pr();
+        let ws = libc::winsize { ws_row: 40, ws_col: 100, ws_xpixel: 0, ws_ypixel: 0 };
+        // SAFETY: from.1 is a live tty fd; ws is a valid winsize buffer.
+        unsafe { libc::ioctl(from.1, libc::TIOCSWINSZ, &ws) };
+        // Propagate: read from the slave (from.1), write to the master (to.0).
+        propagate_winsize(from.1, to.0);
+        let mut got: libc::winsize = unsafe { std::mem::zeroed() };
+        // SAFETY: to.0 is a live pty master fd.
+        unsafe { libc::ioctl(to.0, libc::TIOCGWINSZ, &mut got) };
+        assert_eq!((got.ws_row, got.ws_col), (40, 100));
+        // SAFETY: all four fds are still open.
+        unsafe {
+            libc::close(from.0); libc::close(from.1);
+            libc::close(to.0); libc::close(to.1);
+        }
     }
 }
