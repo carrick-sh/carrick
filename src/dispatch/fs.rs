@@ -60,10 +60,17 @@ impl IoState {
 
 impl FsState {
     pub(super) fn new() -> Self {
+        // NOTE(Task 5): each FsState currently owns a fresh PtyTable. Task 5
+        // will thread a single shared Arc<Mutex<PtyTable>> from the top-level
+        // dispatcher into both DevVfs and the forthcoming DevptsVfs so that
+        // /dev/ptmx and /dev/pts/* share the same index space.
+        let pty_table = std::sync::Arc::new(parking_lot::Mutex::new(
+            crate::vfs::PtyTable::new(),
+        ));
         Self {
             vfs_mounts: {
                 let mut m = crate::vfs::VfsMounts::new();
-                m.mount("/dev", Box::new(crate::vfs::DevVfs::new()));
+                m.mount("/dev", Box::new(crate::vfs::DevVfs::new(std::sync::Arc::clone(&pty_table))));
                 m.mount("/proc", Box::new(crate::vfs::ProcVfs::new()));
                 m.mount("/sys", Box::new(crate::vfs::SysVfs::new()));
                 m

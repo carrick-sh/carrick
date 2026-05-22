@@ -6,10 +6,14 @@
 //! `HostFd` into its existing `HostPipe` open-description.
 
 use std::ffi::CString;
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 use crate::dispatch::linux_errno;
 use crate::linux_abi::{LINUX_ENOENT, LINUX_ENOTDIR};
 
+use super::devpts::{open_master, PtyTable};
 use super::{DirEnt, EntryKind, Metadata, OpenContext, OpenFlags, Vfs, VfsError, VfsHandle};
 
 /// macOS character devices that have the same name and semantics as
@@ -27,11 +31,13 @@ const PASSTHROUGHS: &[(&str, &str)] = &[
     ("/dev/tty", "/dev/tty"),
 ];
 
-pub struct DevVfs;
+pub struct DevVfs {
+    pty_table: Arc<Mutex<PtyTable>>,
+}
 
 impl DevVfs {
-    pub fn new() -> Self {
-        Self
+    pub fn new(pty_table: Arc<Mutex<PtyTable>>) -> Self {
+        Self { pty_table }
     }
 
     fn host_path_for(guest: &str) -> Option<&'static str> {
@@ -42,18 +48,23 @@ impl DevVfs {
     }
 }
 
-impl Default for DevVfs {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Vfs for DevVfs {
     fn lookup(&self, path: &str) -> Result<Metadata, VfsError> {
         if path == "/dev" {
             return Ok(Metadata {
                 kind: EntryKind::Directory,
                 mode: 0o755,
+                size: 0,
+                uid: 0,
+                gid: 0,
+                mtime_secs: 0,
+                mtime_nanos: 0,
+            });
+        }
+        if path == "/dev/ptmx" {
+            return Ok(Metadata {
+                kind: EntryKind::CharDevice,
+                mode: 0o666,
                 size: 0,
                 uid: 0,
                 gid: 0,
@@ -79,7 +90,7 @@ impl Vfs for DevVfs {
         if path != "/dev" {
             return Err(LINUX_ENOTDIR);
         }
-        Ok(PASSTHROUGHS
+        let mut entries: Vec<DirEnt> = PASSTHROUGHS
             .iter()
             .map(|(guest, _)| DirEnt {
                 // INVARIANT: every PASSTHROUGHS guest path is a "/dev/*" literal
@@ -91,7 +102,12 @@ impl Vfs for DevVfs {
                     .to_string(),
                 kind: EntryKind::CharDevice,
             })
-            .collect())
+            .collect();
+        entries.push(DirEnt {
+            name: "ptmx".to_string(),
+            kind: EntryKind::CharDevice,
+        });
+        Ok(entries)
     }
 
     fn open(
@@ -100,6 +116,30 @@ impl Vfs for DevVfs {
         flags: OpenFlags,
         _ctx: &OpenContext<'_>,
     ) -> Result<VfsHandle, VfsError> {
+        if path == "/dev/ptmx" {
+            // Hold the table lock across open_master (ptsname isn't thread-safe).
+            let mut table = self.pty_table.lock();
+            let (master_fd, slave_name) = open_master(flags.nonblock).map_err(|raw| {
+                // Map the raw macOS errno to Linux via the same path as host opens.
+                // host_open_errno reads errno; set it so the mapping matches.
+                // SAFETY: writing the thread-local errno before mapping.
+                unsafe { *libc::__error() = raw };
+                host_open_errno()
+            })?;
+            let index = table.insert(slave_name);
+            let status_flags = if flags.nonblock {
+                crate::linux_abi::LINUX_O_NONBLOCK as u32
+            } else {
+                0
+            };
+            return Ok(VfsHandle::Pty {
+                host_fd: master_fd,
+                pts_index: index,
+                is_master: true,
+                status_flags,
+            });
+        }
+
         let host_path = Self::host_path_for(path).ok_or(LINUX_ENOENT)?;
 
         let mut host_flags = if flags.read && flags.write {
@@ -146,7 +186,7 @@ impl Vfs for DevVfs {
     }
 }
 
-fn host_open_errno() -> i32 {
+pub(crate) fn host_open_errno() -> i32 {
     // SAFETY: __error returns a valid thread-local int*.
     let raw = unsafe { *libc::__error() };
     if raw == libc::ENOENT {
@@ -166,9 +206,13 @@ fn host_open_errno() -> i32 {
 mod tests {
     use super::*;
 
+    fn make_dev() -> DevVfs {
+        DevVfs::new(Arc::new(Mutex::new(PtyTable::new())))
+    }
+
     #[test]
     fn lookup_known_devs() {
-        let v = DevVfs::new();
+        let v = make_dev();
         for (guest, _) in PASSTHROUGHS {
             let md = v.lookup(guest).expect(guest);
             assert_eq!(md.kind, EntryKind::CharDevice, "{}", guest);
@@ -180,19 +224,27 @@ mod tests {
     }
 
     #[test]
+    fn lookup_ptmx() {
+        let v = make_dev();
+        let md = v.lookup("/dev/ptmx").unwrap();
+        assert_eq!(md.kind, EntryKind::CharDevice);
+        assert_eq!(md.mode, 0o666);
+    }
+
+    #[test]
     fn lookup_unknown_dev_is_enoent() {
-        let v = DevVfs::new();
+        let v = make_dev();
         assert_eq!(v.lookup("/dev/sda1"), Err(LINUX_ENOENT));
         assert_eq!(v.lookup("/dev/loop0"), Err(LINUX_ENOENT));
     }
 
     #[test]
     fn readdir_lists_all_passthroughs() {
-        let v = DevVfs::new();
+        let v = make_dev();
         let entries = v.readdir("/dev").unwrap();
         let names: std::collections::BTreeSet<_> = entries.iter().map(|e| e.name.clone()).collect();
         let expected: std::collections::BTreeSet<_> =
-            ["null", "zero", "random", "urandom", "full", "tty"]
+            ["null", "zero", "random", "urandom", "full", "tty", "ptmx"]
                 .iter()
                 .map(|s| s.to_string())
                 .collect();
@@ -204,14 +256,14 @@ mod tests {
 
     #[test]
     fn readdir_on_non_dev_is_enotdir() {
-        let v = DevVfs::new();
+        let v = make_dev();
         assert_eq!(v.readdir("/dev/null"), Err(LINUX_ENOTDIR));
         assert_eq!(v.readdir("/etc"), Err(LINUX_ENOTDIR));
     }
 
     #[test]
     fn open_null_returns_a_real_host_fd() {
-        let mut v = DevVfs::new();
+        let v = make_dev();
         let h = v
             .open(
                 "/dev/null",
@@ -239,7 +291,7 @@ mod tests {
 
     #[test]
     fn open_zero_for_write_marks_is_read_end_false() {
-        let mut v = DevVfs::new();
+        let v = make_dev();
         let h = v
             .open(
                 "/dev/zero",
@@ -268,7 +320,7 @@ mod tests {
     fn open_full_aliases_to_null() {
         // /dev/full is mapped to /dev/null on macOS; open should
         // succeed regardless.
-        let mut v = DevVfs::new();
+        let v = make_dev();
         let h = v
             .open(
                 "/dev/full",
@@ -290,7 +342,7 @@ mod tests {
 
     #[test]
     fn open_unknown_is_enoent() {
-        let mut v = DevVfs::new();
+        let v = make_dev();
         assert_eq!(
             v.open(
                 "/dev/sda1",
@@ -306,7 +358,7 @@ mod tests {
 
     #[test]
     fn open_nonblock_sets_status_flag() {
-        let mut v = DevVfs::new();
+        let v = make_dev();
         let h = v
             .open(
                 "/dev/null",
@@ -332,6 +384,38 @@ mod tests {
                 unsafe { libc::close(host_fd) };
             }
             other => panic!("expected HostFd, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn dev_ptmx_open_allocates_pty() {
+        let table = Arc::new(Mutex::new(PtyTable::new()));
+        let dev = DevVfs::new(Arc::clone(&table));
+        assert_eq!(dev.lookup("/dev/ptmx").unwrap().kind, EntryKind::CharDevice);
+        let h = dev
+            .open(
+                "/dev/ptmx",
+                OpenFlags {
+                    read: true,
+                    write: true,
+                    ..Default::default()
+                },
+                &OpenContext::default(),
+            )
+            .unwrap();
+        match h {
+            VfsHandle::Pty {
+                is_master,
+                pts_index,
+                host_fd,
+                ..
+            } => {
+                assert!(is_master);
+                assert_eq!(pts_index, 0);
+                assert!(table.lock().slave_name(0).is_some());
+                unsafe { libc::close(host_fd) };
+            }
+            other => panic!("expected Pty, got {:?}", other),
         }
     }
 }
