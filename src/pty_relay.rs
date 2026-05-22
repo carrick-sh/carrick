@@ -76,6 +76,8 @@ fn winsize_changed(a: &libc::winsize, b: &libc::winsize) -> bool {
 pub struct PtyPair {
     pub master_fd: i32,
     pub slave_fd: i32,
+    /// The macOS slave device path (e.g. `/dev/ttys003`), from `ptsname`.
+    pub slave_name: String,
 }
 
 impl PtyPair {
@@ -84,8 +86,8 @@ impl PtyPair {
     pub fn allocate() -> io::Result<Self> {
         let (master_fd, slave_name) =
             crate::vfs::devpts::open_master(false).map_err(io::Error::from_raw_os_error)?;
-        let cname =
-            CString::new(slave_name).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let cname = CString::new(slave_name.clone())
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
         // SAFETY: cname is a valid NUL-terminated slave device path.
         let slave_fd = unsafe { libc::open(cname.as_ptr(), libc::O_RDWR | libc::O_NOCTTY) };
         if slave_fd < 0 {
@@ -96,6 +98,7 @@ impl PtyPair {
         Ok(Self {
             master_fd,
             slave_fd,
+            slave_name,
         })
     }
 }
@@ -130,6 +133,13 @@ impl PtyRelay {
     /// Return the slave fd so the caller can hand it to the guest as fds 0/1/2.
     pub fn slave_fd(&self) -> i32 {
         self.pair.slave_fd
+    }
+
+    /// The macOS slave device path (e.g. `/dev/ttys003`). The caller registers
+    /// this with the dispatcher as the guest's controlling tty so `/dev/tty`
+    /// and `/proc/self/fd/{0,1,2}` resolve to it.
+    pub fn slave_name(&self) -> &str {
+        &self.pair.slave_name
     }
 
     /// Production entry: allocate a pty, put `real_in` in raw mode, install

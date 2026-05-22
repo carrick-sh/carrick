@@ -498,6 +498,9 @@ fn main() -> anyhow::Result<()> {
                             libc::dup2(slave, 2);
                         }
                         dispatcher.set_stream_stdio(true);
+                        // Register the pty as the guest's controlling terminal so
+                        // /dev/tty and /proc/self/fd/{0,1,2} resolve to /dev/pts/N.
+                        dispatcher.register_controlling_pty(relay.slave_name().to_string());
                         Some(relay)
                     } else {
                         if raw {
@@ -554,6 +557,9 @@ fn main() -> anyhow::Result<()> {
                             libc::dup2(slave, 2);
                         }
                         dispatcher.set_stream_stdio(true);
+                        // Register the pty as the guest's controlling terminal so
+                        // /dev/tty and /proc/self/fd/{0,1,2} resolve to /dev/pts/N.
+                        dispatcher.register_controlling_pty(relay.slave_name().to_string());
                         Some(relay)
                     } else {
                         if raw {
