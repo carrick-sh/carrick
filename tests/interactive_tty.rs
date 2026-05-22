@@ -7,6 +7,12 @@
 //! the debian image + Docker, and is timing-based. Run explicitly:
 //!   ./scripts/build-signed.sh
 //!   cargo test --test interactive_tty -- --ignored --nocapture
+//
+// Test code: helpers are plain `fn`s (not `#[test]`), so clippy's
+// allow-unwrap-in-tests heuristic doesn't exempt them. The no-panic gate
+// targets production code, so allow unwrap/expect across this test file.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::os::unix::io::FromRawFd;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
