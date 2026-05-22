@@ -4036,7 +4036,6 @@ fn ptmx_tiocgptn_returns_index_and_tcgets_succeeds() {
     };
 
     // ioctl(fd, TIOCGPTN, &out) → index 0 (first pty allocated)
-    const LINUX_TIOCGPTN: u64 = 0x8004_5430;
     let out_ptr = 0x4100u64;
     assert_eq!(
         dispatcher
@@ -4053,6 +4052,21 @@ fn ptmx_tiocgptn_returns_index_and_tcgets_succeeds() {
         memory.read_bytes(out_ptr, 4).unwrap(),
         0u32.to_le_bytes(),
         "TIOCGPTN must write index 0"
+    );
+
+    // unlockpt: TIOCSPTLCK with *arg == 0 succeeds.
+    let lockarg = 0x4300u64;
+    memory.write_bytes(lockarg, &0i32.to_le_bytes()).unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(29, SyscallArgs::from([fd, LINUX_TIOCSPTLCK, lockarg, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 },
+        "TIOCSPTLCK unlock must succeed"
     );
 
     // ioctl(fd, TCGETS, &buf) must NOT return ENOTTY — it must return 0
