@@ -1873,26 +1873,12 @@ impl SyscallDispatcher {
         let fd = ctx.arg(0) as i32;
         Ok(
             if let Some(open_file) = self.io.open_files.write().remove(&fd) {
-                // Capture the pty master index before closing: when this is the
-                // last reference to the description (no dup'd fds remain),
-                // closing the master should remove the pts entry from the table
-                // so /dev/pts/N becomes ENOENT — mirroring Linux devpts semantics.
-                let pty_master_index = if Arc::strong_count(&open_file.description) == 1 {
-                    match &*open_file.description.read() {
-                        OpenDescription::HostPipe {
-                            pty: Some(role), ..
-                        } if role.is_master => Some(role.index),
-                        _ => None,
-                    }
-                } else {
-                    None
-                };
-                close_open_file(&open_file);
-                if let Some(index) = pty_master_index {
-                    self.pty_table()
-                        .lock()
-                        .free_if_owner(index, std::process::id());
-                }
+                // Centralised close: frees the host fd and, for pty masters,
+                // removes the /dev/pts/N entry from the PtyTable so it becomes
+                // ENOENT — mirroring Linux devpts semantics. The same helper is
+                // used by close_range and close_cloexec_fds so every close path
+                // stays in sync.
+                self.close_open_file_and_free_pty(&open_file);
                 DispatchOutcome::Returned { value: 0 }
             } else if is_stdio_fd(fd) {
                 // Guest closing its own stdio at exit: there's nothing for
@@ -1947,7 +1933,12 @@ impl SyscallDispatcher {
                     open_file.fd_flags |= LINUX_FD_CLOEXEC;
                 }
             } else if let Some(open_file) = table.remove(&fd) {
-                close_open_file(&open_file);
+                // Use the centralised helper so pty masters freed via
+                // close_range also drop their /dev/pts/N table entry.
+                // open_files write lock and pty_table Mutex are independent
+                // locks; nothing acquires pty_table while holding open_files,
+                // so the nesting order is deadlock-free.
+                self.close_open_file_and_free_pty(&open_file);
             }
         }
         Ok(DispatchOutcome::Returned { value: 0 })
@@ -5195,9 +5186,11 @@ impl SyscallDispatcher {
             // Reporting S_IFREG made every pipe share one inode + look like
             // a regular file, so `grep` in a pipeline aborted with "input
             // file is also the output". The distinct type bits fix that.
-            OpenDescription::PipeReader { .. }
-            | OpenDescription::PipeWriter { .. }
-            | OpenDescription::HostPipe { .. } => {
+            //
+            // HostPipe covers both anonymous pipes AND pty fds. A pty is a
+            // CHARACTER DEVICE (S_IFCHR), not a FIFO; report S_IFCHR when the
+            // description carries a PtyRole, S_IFIFO otherwise.
+            OpenDescription::PipeReader { .. } | OpenDescription::PipeWriter { .. } => {
                 return write_synthetic_stat(
                     memory,
                     statbuf,
@@ -5205,6 +5198,14 @@ impl SyscallDispatcher {
                     0,
                     LINUX_S_IFIFO | 0o600,
                 );
+            }
+            OpenDescription::HostPipe { pty, .. } => {
+                let (label, type_bits) = if pty.is_some() {
+                    ("char:[carrick-pty]", LINUX_S_IFCHR)
+                } else {
+                    ("pipe:[carrick]", LINUX_S_IFIFO)
+                };
+                return write_synthetic_stat(memory, statbuf, label, 0, type_bits | 0o600);
             }
             OpenDescription::HostSocket { .. } | OpenDescription::Netlink { .. } => {
                 return write_synthetic_stat(
@@ -5267,10 +5268,19 @@ impl SyscallDispatcher {
             OpenDescription::Epoll { .. } => {
                 return write_synthetic_statx(memory, statxbuf, "anon_inode:[eventpoll]", 0);
             }
-            OpenDescription::PipeReader { .. }
-            | OpenDescription::PipeWriter { .. }
-            | OpenDescription::HostPipe { .. } => {
+            OpenDescription::PipeReader { .. } | OpenDescription::PipeWriter { .. } => {
                 return write_synthetic_statx(memory, statxbuf, "pipe:[carrick]", 0);
+            }
+            // HostPipe covers anonymous pipes AND pty fds. Ptys are character
+            // devices (S_IFCHR); anonymous pipes are FIFOs. Use the statx helper
+            // with an explicit mode so statx agrees with fstat for pty fds.
+            OpenDescription::HostPipe { pty, .. } => {
+                let (label, type_bits) = if pty.is_some() {
+                    ("char:[carrick-pty]", LINUX_S_IFCHR)
+                } else {
+                    ("pipe:[carrick]", LINUX_S_IFIFO)
+                };
+                return write_synthetic_statx_mode(memory, statxbuf, label, 0, type_bits | 0o600);
             }
             OpenDescription::HostSocket { .. } | OpenDescription::Netlink { .. } => {
                 return write_synthetic_statx(memory, statxbuf, "socket:[carrick]", 0);
