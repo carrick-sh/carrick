@@ -230,8 +230,10 @@ fn dispatch_declares_no_abi_constants() {
     for src in sources {
         for line in src.lines() {
             assert!(
-                !(line.starts_with("pub const LINUX_") || line.starts_with("const LINUX_")
-                  || line.starts_with("pub const SYS_") || line.starts_with("const SYS_")),
+                !(line.starts_with("pub const LINUX_")
+                    || line.starts_with("const LINUX_")
+                    || line.starts_with("pub const SYS_")
+                    || line.starts_with("const SYS_")),
                 "top-level ABI constant declared in dispatch module — move it to linux_abi.rs: {line}",
             );
         }

@@ -6,9 +6,7 @@
 
 use crate::linux_abi::{LINUX_EACCES, LINUX_ENOENT, LINUX_ENOTDIR};
 
-use super::{
-    EntryKind, Metadata, OpenContext, OpenFlags, Vfs, VfsError, VfsHandle,
-};
+use super::{EntryKind, Metadata, OpenContext, OpenFlags, Vfs, VfsError, VfsHandle};
 
 pub struct SysVfs;
 
@@ -59,7 +57,7 @@ impl Vfs for SysVfs {
     }
 
     fn open(
-        &mut self,
+        &self,
         path: &str,
         flags: OpenFlags,
         _ctx: &OpenContext<'_>,

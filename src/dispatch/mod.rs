@@ -1,81 +1,323 @@
-use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
-use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::compat::{CompatEvent, CompatReporter, SyscallArgs};
+use crate::fs_backend::FsBackend;
 use crate::linux_abi::{
-    KernelAbi, LINUX_DIRENT64_HEADER_SIZE, LINUX_DT_DIR, LINUX_DT_LNK, LINUX_DT_REG, LINUX_PAGE_SIZE,
-    LINUX_S_IFCHR, LINUX_S_IFDIR, LINUX_S_IFIFO, LINUX_S_IFLNK, LINUX_S_IFMT, LINUX_S_IFREG, LINUX_S_IFSOCK, LINUX_TERMIOS_KERNEL_SIZE, LinuxCapabilityData, LinuxCapabilityHeader,
-    LinuxDirent64Header, LinuxEpollEvent, LinuxEventfdValue, LinuxFdPair, LinuxIfAddrMsg,
-    LinuxIfInfoMsg, LinuxIovec, LinuxNlMsgHdr, LinuxRtAttr,
-    LINUX_ARPHRD_LOOPBACK, LINUX_IFA_ADDRESS, LINUX_IFA_LABEL, LINUX_IFA_LOCAL, LINUX_IFF_LOOPBACK,
-    LINUX_IFF_RUNNING, LINUX_IFF_UP, LINUX_IFLA_ADDRESS, LINUX_IFLA_IFNAME, LINUX_NLMSG_DONE,
-    LINUX_NLM_F_MULTI, LINUX_RTM_GETADDR, LINUX_RTM_GETLINK, LINUX_RTM_NEWADDR, LINUX_RTM_NEWLINK,
-    LinuxItimerspec, LinuxItimerval, LinuxOpenHow, LinuxPollFd, LinuxRlimit, LinuxRusage, LinuxSigaction, LinuxSysinfo,
-    LinuxSigaltstack, LinuxStat, LinuxStatfs, LinuxStatx, LinuxStatxTimestamp,
-    LinuxTimerfdExpirations, LinuxTimespec, LinuxTimeval, LinuxTimezone, LinuxTms,
-    LinuxTermios, LinuxUtsname, LinuxWinsize,
-    // ABI constants moved from dispatch.rs (Goal #3)
-    LINUX_AT_EACCESS, LINUX_AT_EMPTY_PATH, LINUX_AT_FDCWD, LINUX_AT_NO_AUTOMOUNT, LINUX_AT_REMOVEDIR,
-    LINUX_AT_STATX_DONT_SYNC, LINUX_AT_STATX_FORCE_SYNC, LINUX_AT_SYMLINK_NOFOLLOW, LINUX_CLK_TCK,
-    LINUX_DEFAULT_UMASK, LINUX_E2BIG, LINUX_EACCES, LINUX_EAFNOSUPPORT, LINUX_EAGAIN, LINUX_EBADF,
-    LINUX_ECHILD, LINUX_EEXIST, LINUX_EFAULT, LINUX_EINTR, LINUX_EINVAL, LINUX_EISDIR,
-    LINUX_EALREADY, LINUX_EINPROGRESS, LINUX_EISCONN, LINUX_ENAMETOOLONG,
-    LINUX_ENOENT, LINUX_ENOMEM, LINUX_ENOPROTOOPT, LINUX_ENOSYS, LINUX_ENOTDIR, LINUX_ENOTSOCK,
-    LINUX_ENOTSUP, LINUX_ENOTTY, LINUX_EPERM, LINUX_EPIPE, LINUX_ERANGE, LINUX_EROFS, LINUX_ESOCKTNOSUPPORT,
-    LINUX_ESPIPE, LINUX_ESRCH, LINUX_ETIMEDOUT,     LINUX_FALLOC_FL_KEEP_SIZE, LINUX_FALLOC_FL_SUPPORTED,
-    LINUX_FD_CLOEXEC,     LINUX_F_DUPFD, LINUX_F_DUPFD_CLOEXEC, LINUX_F_GETFD, LINUX_F_GETFL, LINUX_F_GETLK, LINUX_F_GETPIPE_SZ,
-    LINUX_F_OFD_GETLK, LINUX_F_OFD_SETLK, LINUX_F_OFD_SETLKW, LINUX_F_SETFD, LINUX_F_SETFL,
-    LINUX_F_SETLK, LINUX_F_SETLKW, LINUX_MADV_DONTNEED, LINUX_MADV_FREE, LINUX_MADV_NORMAL, LINUX_MADV_RANDOM,
-    LINUX_MADV_SEQUENTIAL, LINUX_MADV_WILLNEED, LINUX_MAP_ANONYMOUS, LINUX_MAP_FIXED, LINUX_MAP_PRIVATE,
-    LINUX_MAP_SHARED, LINUX_MCL_CURRENT, LINUX_MCL_FUTURE, LINUX_MCL_ONFAULT, LINUX_MREMAP_DONTUNMAP,
-    LINUX_MREMAP_FIXED, LINUX_MREMAP_MAYMOVE, LINUX_MS_ASYNC, LINUX_MS_INVALIDATE, LINUX_MS_SYNC,
-    LINUX_OVERLAYFS_SUPER_MAGIC, LINUX_O_ACCMODE, LINUX_O_APPEND, LINUX_O_CLOEXEC, LINUX_O_CREAT,
-    LINUX_O_DIRECTORY, LINUX_O_EXCL, LINUX_O_NONBLOCK, LINUX_O_RDONLY, LINUX_O_RDWR, LINUX_O_TRUNC,
-    LINUX_O_WRONLY, LINUX_PRIO_PROCESS, LINUX_PRIO_USER, LINUX_PROT_EXEC, LINUX_PROT_READ,
-    LINUX_PROT_WRITE, LINUX_RLIM_INFINITY, LINUX_RUSAGE_CHILDREN, LINUX_RUSAGE_SELF, LINUX_RUSAGE_THREAD,
-    LINUX_R_OK, LINUX_SEEK_CUR, LINUX_SEEK_END, LINUX_SEEK_SET, LINUX_SOCKADDR_STORAGE_SIZE,
-    LINUX_SOCK_CLOEXEC, LINUX_SOCK_NONBLOCK, LINUX_UTIME_NOW, LINUX_UTIME_OMIT, LINUX_W_OK,
-    LINUX_X_OK,
+    KernelAbi,
     // ABI constants moved from dispatch.rs (Goal #3, private set)
-    LINUX_AF_INET, LINUX_AF_INET6, LINUX_AF_NETLINK, LINUX_AF_UNIX, LINUX_AF_UNSPEC,
-    LINUX_BOOTSTRAP_AFFINITY_BYTES, LINUX_BOOTSTRAP_PGID, LINUX_BOOTSTRAP_PID, LINUX_BOOTSTRAP_SID,
-    LINUX_CAPABILITY_VERSION_1, LINUX_CAPABILITY_VERSION_2, LINUX_CAPABILITY_VERSION_3, LINUX_CLOCK_BOOTTIME,
-    LINUX_CLOCK_BOOTTIME_ALARM, LINUX_CLOCK_MONOTONIC, LINUX_CLOCK_MONOTONIC_COARSE,
-    LINUX_CLOCK_MONOTONIC_RAW, LINUX_CLOCK_PROCESS_CPUTIME_ID, LINUX_CLOCK_REALTIME,
-    LINUX_CLOCK_REALTIME_ALARM, LINUX_CLOCK_REALTIME_COARSE, LINUX_CLOCK_RESOLUTION_NSEC, LINUX_CLOCK_TAI,
-    LINUX_CLOCK_THREAD_CPUTIME_ID, LINUX_EFD_CLOEXEC, LINUX_EFD_NONBLOCK, LINUX_EFD_SEMAPHORE, LINUX_EPOLLERR,
-    LINUX_EPOLLHUP, LINUX_EPOLLIN, LINUX_EPOLLOUT, LINUX_EPOLLPRI, LINUX_EPOLL_CLOEXEC, LINUX_EPOLL_CTL_ADD,
-    LINUX_EPOLL_CTL_DEL, LINUX_EPOLL_CTL_MOD, LINUX_FIONBIO, LINUX_FIONREAD, LINUX_FUTEX_CLOCK_REALTIME,
-    LINUX_FUTEX_CMD_MASK, LINUX_FUTEX_PRIVATE_FLAG, LINUX_FUTEX_WAIT, LINUX_FUTEX_WAKE, LINUX_IOV_MAX,
-    LINUX_ITIMER_PROF, LINUX_ITIMER_REAL, LINUX_ITIMER_VIRTUAL, LINUX_LOCK_EX, LINUX_LOCK_NB, LINUX_LOCK_SH,
-    LINUX_LOCK_UN, LINUX_MAX_SIGNUM, LINUX_MEMBARRIER_CMD_QUERY, LINUX_MINSIGSTKSZ, LINUX_MSG_CMSG_CLOEXEC,
-    LINUX_MSG_DONTROUTE, LINUX_MSG_DONTWAIT, LINUX_MSG_EOR, LINUX_MSG_NOSIGNAL, LINUX_MSG_OOB, LINUX_MSG_PEEK,
-    LINUX_MSG_TRUNC, LINUX_MSG_WAITALL, LINUX_OPEN_HOW_SIZE, LINUX_PERSONALITY_QUERY, LINUX_PIPE_BUF_SIZE,
-    LINUX_POLLERR, LINUX_POLLHUP, LINUX_POLLIN, LINUX_POLLNVAL, LINUX_POLLOUT, LINUX_PR_GET_DUMPABLE,
-    LINUX_PR_GET_NAME, LINUX_PR_GET_PDEATHSIG, LINUX_PR_SET_DUMPABLE, LINUX_PR_SET_NAME,
-    LINUX_PR_SET_PDEATHSIG, LINUX_P_ALL, LINUX_P_PGID, LINUX_P_PID,
-    LINUX_P_PIDFD, LINUX_RT_SIGSET_SIZE, LINUX_SIGKILL, LINUX_SIGSTOP, LINUX_SIG_BLOCK, LINUX_SIG_SETMASK,
-    LINUX_SIG_UNBLOCK, LINUX_SOCK_DGRAM, LINUX_SOCK_RAW, LINUX_SOCK_SEQPACKET, LINUX_SOCK_STREAM,
-    LINUX_SOL_IP, LINUX_SOL_SOCKET, LINUX_SO_ACCEPTCONN, LINUX_SO_BROADCAST, LINUX_SO_DONTROUTE,
-    LINUX_SO_ERROR, LINUX_SO_KEEPALIVE, LINUX_SO_LINGER, LINUX_SO_OOBINLINE, LINUX_SO_RCVBUF,
-    LINUX_SO_RCVTIMEO, LINUX_SO_REUSEADDR, LINUX_SO_REUSEPORT, LINUX_SO_SNDBUF, LINUX_SO_SNDTIMEO,
-    LINUX_SO_TYPE,     LINUX_SPLICE_SUPPORTED_FLAGS, LINUX_SS_DISABLE, LINUX_STATX_BASIC_STATS,
-    LINUX_STATX_RESERVED, LINUX_TASK_COMM_LEN, LINUX_TCGETS, LINUX_TCSETS, LINUX_TCSETSF, LINUX_TCSETSW,
-    LINUX_TFD_CLOEXEC, LINUX_TFD_NONBLOCK, LINUX_TIMER_ABSTIME, LINUX_TIOCGPGRP, LINUX_TIOCGSID,
-    LINUX_TIOCGWINSZ, LINUX_TIOCNOTTY, LINUX_TIOCSCTTY, LINUX_TIOCSPGRP, LINUX_WAIT4_SUPPORTED_FLAGS,
-    LINUX_WAITID_STATE_MASK, LINUX_WAITID_SUPPORTED_FLAGS,         LINUX_SOL_TCP, LINUX_SOL_UDP, LINUX_SOL_IPV6, LINUX_SO_DEBUG,
+    LINUX_AF_INET,
+    LINUX_AF_INET6,
+    LINUX_AF_NETLINK,
+    LINUX_AF_UNIX,
+    LINUX_AF_UNSPEC,
+    LINUX_ARPHRD_LOOPBACK,
+    // ABI constants moved from dispatch.rs (Goal #3)
+    LINUX_AT_EACCESS,
+    LINUX_AT_EMPTY_PATH,
+    LINUX_AT_FDCWD,
+    LINUX_AT_NO_AUTOMOUNT,
+    LINUX_AT_REMOVEDIR,
+    LINUX_AT_STATX_DONT_SYNC,
+    LINUX_AT_STATX_FORCE_SYNC,
+    LINUX_AT_SYMLINK_NOFOLLOW,
+    LINUX_BOOTSTRAP_AFFINITY_BYTES,
+    LINUX_BOOTSTRAP_PGID,
+    LINUX_BOOTSTRAP_PID,
+    LINUX_BOOTSTRAP_SID,
+    LINUX_CAPABILITY_VERSION_1,
+    LINUX_CAPABILITY_VERSION_2,
+    LINUX_CAPABILITY_VERSION_3,
+    LINUX_CLK_TCK,
+    LINUX_CLOCK_BOOTTIME,
+    LINUX_CLOCK_BOOTTIME_ALARM,
+    LINUX_CLOCK_MONOTONIC,
+    LINUX_CLOCK_MONOTONIC_COARSE,
+    LINUX_CLOCK_MONOTONIC_RAW,
+    LINUX_CLOCK_PROCESS_CPUTIME_ID,
+    LINUX_CLOCK_REALTIME,
+    LINUX_CLOCK_REALTIME_ALARM,
+    LINUX_CLOCK_REALTIME_COARSE,
+    LINUX_CLOCK_RESOLUTION_NSEC,
+    LINUX_CLOCK_TAI,
+    LINUX_CLOCK_THREAD_CPUTIME_ID,
+    LINUX_DEFAULT_UMASK,
+    LINUX_DIRENT64_HEADER_SIZE,
+    LINUX_DT_DIR,
+    LINUX_DT_LNK,
+    LINUX_DT_REG,
+    LINUX_E2BIG,
+    LINUX_EACCES,
+    LINUX_EAFNOSUPPORT,
+    LINUX_EAGAIN,
+    LINUX_EALREADY,
+    LINUX_EBADF,
+    LINUX_ECHILD,
+    LINUX_EEXIST,
+    LINUX_EFAULT,
+    LINUX_EFD_CLOEXEC,
+    LINUX_EFD_NONBLOCK,
+    LINUX_EFD_SEMAPHORE,
+    LINUX_EINPROGRESS,
+    LINUX_EINTR,
+    LINUX_EINVAL,
+    LINUX_EISCONN,
+    LINUX_EISDIR,
+    LINUX_ENAMETOOLONG,
+    LINUX_ENOENT,
+    LINUX_ENOMEM,
+    LINUX_ENOPROTOOPT,
+    LINUX_ENOSYS,
+    LINUX_ENOTDIR,
+    LINUX_ENOTSOCK,
+    LINUX_ENOTSUP,
+    LINUX_ENOTTY,
+    LINUX_EPERM,
+    LINUX_EPIPE,
+    LINUX_EPOLL_CLOEXEC,
+    LINUX_EPOLL_CTL_ADD,
+    LINUX_EPOLL_CTL_DEL,
+    LINUX_EPOLL_CTL_MOD,
+    LINUX_EPOLLERR,
+    LINUX_EPOLLHUP,
+    LINUX_EPOLLIN,
+    LINUX_EPOLLOUT,
+    LINUX_EPOLLPRI,
+    LINUX_ERANGE,
+    LINUX_EROFS,
+    LINUX_ESOCKTNOSUPPORT,
+    LINUX_ESPIPE,
+    LINUX_ESRCH,
+    LINUX_ETIMEDOUT,
+    LINUX_F_DUPFD,
+    LINUX_F_DUPFD_CLOEXEC,
+    LINUX_F_GETFD,
+    LINUX_F_GETFL,
+    LINUX_F_GETLK,
+    LINUX_F_GETPIPE_SZ,
+    LINUX_F_OFD_GETLK,
+    LINUX_F_OFD_SETLK,
+    LINUX_F_OFD_SETLKW,
+    LINUX_F_SETFD,
+    LINUX_F_SETFL,
+    LINUX_F_SETLK,
+    LINUX_F_SETLKW,
+    LINUX_FALLOC_FL_KEEP_SIZE,
+    LINUX_FALLOC_FL_SUPPORTED,
+    LINUX_FD_CLOEXEC,
+    LINUX_FIONBIO,
+    LINUX_FIONREAD,
+    LINUX_FUTEX_CLOCK_REALTIME,
+    LINUX_FUTEX_CMD_MASK,
+    LINUX_FUTEX_PRIVATE_FLAG,
+    LINUX_FUTEX_WAIT,
+    LINUX_FUTEX_WAKE,
+    LINUX_IFA_ADDRESS,
+    LINUX_IFA_LABEL,
+    LINUX_IFA_LOCAL,
+    LINUX_IFF_LOOPBACK,
+    LINUX_IFF_RUNNING,
+    LINUX_IFF_UP,
+    LINUX_IFLA_ADDRESS,
+    LINUX_IFLA_IFNAME,
+    LINUX_IOV_MAX,
+    LINUX_ITIMER_PROF,
+    LINUX_ITIMER_REAL,
+    LINUX_ITIMER_VIRTUAL,
+    LINUX_LOCK_EX,
+    LINUX_LOCK_NB,
+    LINUX_LOCK_SH,
+    LINUX_LOCK_UN,
+    LINUX_MADV_DONTNEED,
+    LINUX_MADV_FREE,
+    LINUX_MADV_NORMAL,
+    LINUX_MADV_RANDOM,
+    LINUX_MADV_SEQUENTIAL,
+    LINUX_MADV_WILLNEED,
+    LINUX_MAP_ANONYMOUS,
+    LINUX_MAP_FIXED,
+    LINUX_MAP_PRIVATE,
+    LINUX_MAP_SHARED,
+    LINUX_MAX_SIGNUM,
+    LINUX_MCL_CURRENT,
+    LINUX_MCL_FUTURE,
+    LINUX_MCL_ONFAULT,
+    LINUX_MEMBARRIER_CMD_QUERY,
+    LINUX_MINSIGSTKSZ,
+    LINUX_MREMAP_DONTUNMAP,
+    LINUX_MREMAP_FIXED,
+    LINUX_MREMAP_MAYMOVE,
+    LINUX_MS_ASYNC,
+    LINUX_MS_INVALIDATE,
+    LINUX_MS_SYNC,
+    LINUX_MSG_CMSG_CLOEXEC,
+    LINUX_MSG_DONTROUTE,
+    LINUX_MSG_DONTWAIT,
+    LINUX_MSG_EOR,
+    LINUX_MSG_NOSIGNAL,
+    LINUX_MSG_OOB,
+    LINUX_MSG_PEEK,
+    LINUX_MSG_TRUNC,
+    LINUX_MSG_WAITALL,
+    LINUX_NLM_F_MULTI,
+    LINUX_NLMSG_DONE,
+    LINUX_O_ACCMODE,
+    LINUX_O_APPEND,
+    LINUX_O_CLOEXEC,
+    LINUX_O_CREAT,
+    LINUX_O_DIRECTORY,
+    LINUX_O_EXCL,
+    LINUX_O_NONBLOCK,
+    LINUX_O_RDONLY,
+    LINUX_O_RDWR,
+    LINUX_O_TRUNC,
+    LINUX_O_WRONLY,
+    LINUX_OPEN_HOW_SIZE,
+    LINUX_OVERLAYFS_SUPER_MAGIC,
+    LINUX_P_ALL,
+    LINUX_P_PGID,
+    LINUX_P_PID,
+    LINUX_P_PIDFD,
+    LINUX_PAGE_SIZE,
+    LINUX_PERSONALITY_QUERY,
+    LINUX_PIPE_BUF_SIZE,
+    LINUX_POLLERR,
+    LINUX_POLLHUP,
+    LINUX_POLLIN,
+    LINUX_POLLNVAL,
+    LINUX_POLLOUT,
+    LINUX_PR_GET_DUMPABLE,
+    LINUX_PR_GET_NAME,
+    LINUX_PR_GET_PDEATHSIG,
+    LINUX_PR_SET_DUMPABLE,
+    LINUX_PR_SET_NAME,
+    LINUX_PR_SET_PDEATHSIG,
+    LINUX_PRIO_PROCESS,
+    LINUX_PRIO_USER,
+    LINUX_PROT_EXEC,
+    LINUX_PROT_READ,
+    LINUX_PROT_WRITE,
+    LINUX_R_OK,
+    LINUX_RLIM_INFINITY,
+    LINUX_RT_SIGSET_SIZE,
+    LINUX_RTM_GETADDR,
+    LINUX_RTM_GETLINK,
+    LINUX_RTM_NEWADDR,
+    LINUX_RTM_NEWLINK,
+    LINUX_RUSAGE_CHILDREN,
+    LINUX_RUSAGE_SELF,
+    LINUX_RUSAGE_THREAD,
+    LINUX_S_IFCHR,
+    LINUX_S_IFDIR,
+    LINUX_S_IFIFO,
+    LINUX_S_IFLNK,
+    LINUX_S_IFMT,
+    LINUX_S_IFREG,
+    LINUX_S_IFSOCK,
+    LINUX_SEEK_CUR,
+    LINUX_SEEK_END,
+    LINUX_SEEK_SET,
+    LINUX_SIG_BLOCK,
+    LINUX_SIG_SETMASK,
+    LINUX_SIG_UNBLOCK,
+    LINUX_SIGKILL,
+    LINUX_SIGSTOP,
+    LINUX_SO_ACCEPTCONN,
+    LINUX_SO_BROADCAST,
+    LINUX_SO_DEBUG,
+    LINUX_SO_DONTROUTE,
+    LINUX_SO_ERROR,
+    LINUX_SO_KEEPALIVE,
+    LINUX_SO_LINGER,
+    LINUX_SO_OOBINLINE,
+    LINUX_SO_RCVBUF,
+    LINUX_SO_RCVTIMEO,
+    LINUX_SO_REUSEADDR,
+    LINUX_SO_REUSEPORT,
+    LINUX_SO_SNDBUF,
+    LINUX_SO_SNDTIMEO,
+    LINUX_SO_TYPE,
+    LINUX_SOCK_CLOEXEC,
+    LINUX_SOCK_DGRAM,
+    LINUX_SOCK_NONBLOCK,
+    LINUX_SOCK_RAW,
+    LINUX_SOCK_SEQPACKET,
+    LINUX_SOCK_STREAM,
+    LINUX_SOCKADDR_STORAGE_SIZE,
+    LINUX_SOL_IP,
+    LINUX_SOL_IPV6,
+    LINUX_SOL_SOCKET,
+    LINUX_SOL_TCP,
+    LINUX_SOL_UDP,
+    LINUX_SPLICE_SUPPORTED_FLAGS,
+    LINUX_SS_DISABLE,
+    LINUX_STATX_BASIC_STATS,
+    LINUX_STATX_RESERVED,
+    LINUX_TASK_COMM_LEN,
+    LINUX_TCGETS,
+    LINUX_TCSETS,
+    LINUX_TCSETSF,
+    LINUX_TCSETSW,
+    LINUX_TERMIOS_KERNEL_SIZE,
+    LINUX_TFD_CLOEXEC,
+    LINUX_TFD_NONBLOCK,
+    LINUX_TIMER_ABSTIME,
+    LINUX_TIOCGPGRP,
+    LINUX_TIOCGSID,
+    LINUX_TIOCGWINSZ,
+    LINUX_TIOCNOTTY,
+    LINUX_TIOCSCTTY,
+    LINUX_TIOCSPGRP,
+    LINUX_UTIME_NOW,
+    LINUX_UTIME_OMIT,
+    LINUX_W_OK,
+    LINUX_WAIT4_SUPPORTED_FLAGS,
+    LINUX_WAITID_STATE_MASK,
+    LINUX_WAITID_SUPPORTED_FLAGS,
+    LINUX_X_OK,
+    LinuxCapabilityData,
+    LinuxCapabilityHeader,
+    LinuxDirent64Header,
+    LinuxEpollEvent,
+    LinuxEventfdValue,
+    LinuxFdPair,
+    LinuxIfAddrMsg,
+    LinuxIfInfoMsg,
+    LinuxIovec,
+    LinuxItimerspec,
+    LinuxItimerval,
+    LinuxNlMsgHdr,
+    LinuxOpenHow,
+    LinuxPollFd,
+    LinuxRlimit,
+    LinuxRtAttr,
+    LinuxRusage,
+    LinuxSigaction,
+    LinuxSigaltstack,
+    LinuxStat,
+    LinuxStatfs,
+    LinuxStatx,
+    LinuxStatxTimestamp,
+    LinuxSysinfo,
+    LinuxTermios,
+    LinuxTimerfdExpirations,
+    LinuxTimespec,
+    LinuxTimeval,
+    LinuxTimezone,
+    LinuxTms,
+    LinuxUtsname,
+    LinuxWinsize,
 };
 use crate::memory::{
     LINUX_EL0_TRAMPOLINE_BASE, LINUX_EL1_VECTORS_BASE, LINUX_HEAP_BASE, LINUX_HEAP_SIZE,
     LINUX_MMAP_BASE, LINUX_MMAP_SIZE, LINUX_PAGE_TABLES_BASE, LINUX_STACK_SIZE, LINUX_STACK_TOP,
 };
-use crate::fs_backend::FsBackend;
 use crate::overlay::OverlayEntry;
 use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsError, RootFsMetadata};
 use crate::syscall::lookup_aarch64;
+use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use thiserror::Error;
 use zerocopy::{FromBytes, IntoBytes};
@@ -107,7 +349,7 @@ pub struct SyscallRequest {
 pub struct SyscallCtx<'a, M: GuestMemory> {
     pub request: SyscallRequest,
     pub memory: &'a mut M,
-    pub reporter: &'a mut CompatReporter,
+    pub reporter: &'a CompatReporter,
     /// Present only when the syscall is dispatched on behalf of a specific
     /// guest thread (the multi-threaded runtime path). Carries this thread's
     /// tid and the shared thread/futex coordination tables. `None` for the
@@ -164,9 +406,15 @@ impl SyscallRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DispatchOutcome {
-    Returned { value: i64 },
-    Errno { errno: i32 },
-    Exit { code: i32 },
+    Returned {
+        value: i64,
+    },
+    Errno {
+        errno: i32,
+    },
+    Exit {
+        code: i32,
+    },
     /// `clone(2)` with process-creation flags. The runtime must perform
     /// a real macOS fork against the trap engine, then write the child
     /// pid (parent) or 0 (child) into x0 to complete the syscall.
@@ -194,8 +442,8 @@ pub enum DispatchOutcome {
     /// Thread-creating `clone(2)`/`clone3(2)` (CLONE_VM|CLONE_THREAD|...).
     /// The runtime spawns a new host thread + vCPU sharing this process's VM.
     CloneThread {
-        stack: u64,           // child SP (clone arg)
-        tls: u64,             // CLONE_SETTLS value -> TPIDR_EL0 (0 = none)
+        stack: u64, // child SP (clone arg)
+        tls: u64,   // CLONE_SETTLS value -> TPIDR_EL0 (0 = none)
         flags: u64,
         parent_tid_addr: u64, // CLONE_PARENT_SETTID target (0 = none)
         child_tid_addr: u64,  // CLONE_CHILD_SETTID/CLEARTID target (0 = none)
@@ -203,28 +451,33 @@ pub enum DispatchOutcome {
     /// A single thread exited via `exit(2)` (NOT exit_group): the runtime
     /// performs the CLONE_CHILD_CLEARTID futex wake and ends just this host
     /// thread. If it was the last live thread the process exits.
-    ThreadExit { code: i32 },
+    ThreadExit {
+        code: i32,
+    },
     /// Guest `tgkill`/`tkill` targeting a *sibling* thread (not self). The
     /// handler can't reach the target's vCPU, so the runtime publishes the
     /// signal for `tid` and forces that vCPU out of the guest (vcpu_kick) so it
     /// delivers promptly. Completes the calling syscall with 0, or -ESRCH if
     /// the target raced to exit. Only emitted on the multi-threaded path.
-    SignalThread { tid: i32, signum: i32 },
-    /// `FUTEX_WAIT` whose value-check passed under the kernel lock: the
+    SignalThread {
+        tid: i32,
+        signum: i32,
+    },
+    /// `FUTEX_WAIT` whose value-check passed under the dispatcher lock: the
     /// guest word equals the expected value, so this thread must block.
-    /// The handler CANNOT block while holding the kernel lock (a sibling's
+    /// The handler CANNOT block while holding the dispatcher lock (a sibling's
     /// `FUTEX_WAKE` would deadlock), so it returns this outcome and the
-    /// runtime drops the lock, calls `FutexTable::wait`, then completes the
+    /// runtime drops the lock, parks on the prepared futex token, then completes the
     /// syscall with 0 (woken) or -ETIMEDOUT (timed out).
     FutexWait {
-        addr: u64,
+        wait: crate::thread::FutexWait,
         timeout: Option<Duration>,
     },
     /// A blocking-mode I/O syscall (ppoll/pselect/poll/select with no fd ready,
     /// or — later — recvfrom/accept/read that would block) needs to wait for
     /// host-fd readiness. Like `FutexWait`, the handler MUST NOT block while
-    /// holding the kernel lock — that starves every sibling thread (CPython's
-    /// GIL handoff, a server's worker threads, see the "big kernel lock"). It
+    /// holding the dispatcher lock — that starves every sibling thread (CPython's
+    /// GIL handoff, a server's worker threads, see the "dispatcher lock"). It
     /// returns this outcome; the runtime drops the lock, `libc::poll`s the host
     /// fds (signal-interruptible) up to `timeout`, then either completes the
     /// syscall (timeout → 0, signal → EINTR) or re-dispatches it (a fd became
@@ -418,25 +671,27 @@ pub struct SyscallDispatcher {
     /// Owned memory subsystem state (brk, mmap arena, shared-file IPA
     /// window + live maps, and the captured address-space regions for
     /// `/proc/self/maps`). See [`mem::MemState`].
-    mem: mem::MemState,
+    mem: Mutex<mem::MemState>,
     /// Owned process subsystem state (executable path, personality,
     /// dumpable flag, task comm name). See [`proc::ProcState`].
-    proc: proc::ProcState,
+    proc: Mutex<proc::ProcState>,
     /// Owned credentials subsystem state (uids/gids + umask). See
-    /// [`creds::CredState`]. Handlers that touch only credential state
-    /// borrow `self.creds` narrowly.
-    creds: creds::CredState,
+    /// [`creds::CredState`]. This is internally locked so credential syscalls
+    /// can run through shared threaded dispatch without the legacy dispatcher
+    /// lock.
+    creds: Mutex<creds::CredState>,
     /// Owned signal subsystem state (handlers, mask, pending set, alt
-    /// stack). See [`signal::SignalState`]. Handlers that touch only
-    /// signal state borrow `self.signal` narrowly.
-    signal: signal::SignalState,
+    /// stack). See [`signal::SignalState`]. This is internally locked so
+    /// signal syscalls and runtime delivery can run through shared threaded
+    /// dispatch without the legacy dispatcher lock.
+    signal: Mutex<signal::SignalState>,
     /// Owned filesystem subsystem state (unified VFS mount table plus
     /// the `/` rootfs + writable overlay). See [`fs::FsState`]. Handlers
     /// that touch only fs state borrow `self.fs` narrowly.
     fs: fs::FsState,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 enum OpenDescription {
     File {
         path: String,
@@ -483,15 +738,9 @@ enum OpenDescription {
     // is kept wired as the portable, host-fd-free pipe model and is matched
     // throughout the fd handlers. Retained as deliberate API surface.
     #[allow(dead_code)]
-    PipeReader {
-        pipe: Rc<RefCell<PipeState>>,
-        status_flags: u64,
-    },
+    PipeReader { pipe: PipeRef, status_flags: u64 },
     #[allow(dead_code)]
-    PipeWriter {
-        pipe: Rc<RefCell<PipeState>>,
-        status_flags: u64,
-    },
+    PipeWriter { pipe: PipeRef, status_flags: u64 },
     /// Host kernel pipe end backed by a real macOS file descriptor.
     /// Survives `libc::fork(2)` natively — both parent and child see
     /// the same kernel pipe object, so the post-fork sh-pipe demo
@@ -534,6 +783,7 @@ enum OpenDescription {
     /// synthetic response into `recv_queue` that the next recvmsg/recvfrom
     /// drains, terminated by NLMSG_DONE.
     Netlink {
+        #[allow(dead_code)]
         protocol: i32,
         /// Netlink "port id" the socket is bound to (0 until bind picks one).
         pid: u32,
@@ -547,9 +797,12 @@ enum OpenDescription {
 
 #[derive(Debug, Clone)]
 struct OpenFile {
-    description: Rc<RefCell<OpenDescription>>,
+    description: OpenDescriptionRef,
     fd_flags: u64,
 }
+
+type OpenDescriptionRef = Arc<RwLock<OpenDescription>>;
+type PipeRef = Arc<Mutex<PipeState>>;
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct PipeState {
@@ -628,7 +881,7 @@ macro_rules! normalized_dispatch {
             &mut self,
             request: SyscallRequest,
             memory: &mut impl GuestMemory,
-            reporter: &mut CompatReporter,
+            reporter: &CompatReporter,
             thread: Option<ThreadCtx>,
         ) -> Option<Result<DispatchOutcome, DispatchError>> {
             match request.number {
@@ -640,6 +893,10 @@ macro_rules! normalized_dispatch {
                 )*
                 _ => None,
             }
+        }
+
+        fn dispatch_normalized_known(number: u64) -> bool {
+            matches!(number, $( $num )|*)
         }
     };
 }
@@ -829,10 +1086,10 @@ impl SyscallDispatcher {
     pub fn new() -> Self {
         Self {
             io: fs::IoState::new(),
-            mem: mem::MemState::new(),
-            proc: proc::ProcState::new(),
-            creds: creds::CredState::new(),
-            signal: signal::SignalState::new(),
+            mem: Mutex::new(mem::MemState::new()),
+            proc: Mutex::new(proc::ProcState::new()),
+            creds: Mutex::new(creds::CredState::new()),
+            signal: Mutex::new(signal::SignalState::new()),
             fs: fs::FsState::new(),
         }
     }
@@ -844,7 +1101,7 @@ impl SyscallDispatcher {
     /// summary. Called once after `HvfTrapEngine::map_address_space`
     /// succeeds.
     pub fn set_address_space_regions(&mut self, regions: Vec<ProcMapsEntry>) {
-        self.mem.address_space_regions = Some(regions);
+        self.mem.lock().address_space_regions = Some(regions);
     }
 
     pub fn with_rootfs(rootfs: RootFs) -> Self {
@@ -856,7 +1113,7 @@ impl SyscallDispatcher {
     pub fn with_rootfs_and_executable(rootfs: RootFs, executable_path: impl Into<String>) -> Self {
         let mut s = Self::new();
         s.fs.rootfs_vfs.rootfs = Some(rootfs);
-        s.proc.executable_path = executable_path.into();
+        s.proc.lock().executable_path = executable_path.into();
         s
     }
 
@@ -886,7 +1143,7 @@ impl SyscallDispatcher {
     /// a rootfs (the `--fs host` streaming path) so that `/proc` reads
     /// reflect the correct binary name.
     pub fn set_executable_path(&mut self, path: impl Into<String>) {
-        self.proc.executable_path = path.into();
+        self.proc.lock().executable_path = path.into();
     }
 
     /// Name of the currently-installed backend (for logging / debug).
@@ -914,8 +1171,8 @@ impl SyscallDispatcher {
         self.fs.rootfs_vfs.rootfs.as_ref()?.read(path).ok()
     }
 
-    pub fn stdout(&self) -> &[u8] {
-        &self.io.stdout
+    pub fn stdout(&self) -> Vec<u8> {
+        self.io.stdout.lock().clone()
     }
 
     /// Enable live passthrough for fd 1/2. After this, `write`/`writev`
@@ -923,8 +1180,8 @@ impl SyscallDispatcher {
     /// instead of accumulating in the in-memory buffers — required for
     /// interactive prompts (`/ # `, cursor-position queries, etc.) to
     /// reach the user's terminal before the guest exits.
-    pub fn set_stream_stdio(&mut self, on: bool) {
-        self.io.stream_stdio = on;
+    pub fn set_stream_stdio(&self, on: bool) {
+        *self.io.stream_stdio.lock() = on;
     }
 
     /// Called after `libc::fork(2)` returns into a child: the child
@@ -932,15 +1189,15 @@ impl SyscallDispatcher {
     /// want to re-print those bytes when the child eventually exits
     /// via the `forked_child_exit` path. The parent's full buffer
     /// goes out through its own JSON report.
-    pub fn clear_output_buffers(&mut self) {
-        self.io.stdout.clear();
-        self.io.stderr.clear();
+    pub fn clear_output_buffers(&self) {
+        self.io.stdout.lock().clear();
+        self.io.stderr.lock().clear();
         // Interval timers are NOT inherited across fork(2) (setitimer(2)). The
         // child inherited the parent's armed ITIMER_REAL through the copied
         // address space; clear it so the child's alarm()/getitimer() see a
         // disarmed timer (LTP runs each test in a forked child whose alarm()
         // must return 0, not the framework's residual watchdog timeout).
-        self.proc.itimer_real = None;
+        self.proc.lock().itimer_real = None;
     }
 
     /// Linux execve(2) closes every fd that had FD_CLOEXEC set. Our
@@ -955,9 +1212,11 @@ impl SyscallDispatcher {
     /// Walk open_files; for each fd whose fd_flags include FD_CLOEXEC,
     /// remove it and run close_open_file (which honours the Rc-count
     /// guard, so we don't close a host fd a sibling fd still aliases).
-    pub fn close_cloexec_fds(&mut self) {
-        let cloexec_fds: Vec<i32> = self.io
+    pub fn close_cloexec_fds(&self) {
+        let cloexec_fds: Vec<i32> = self
+            .io
             .open_files
+            .read()
             .iter()
             .filter_map(|(fd, of)| {
                 if of.fd_flags & LINUX_FD_CLOEXEC != 0 {
@@ -967,26 +1226,21 @@ impl SyscallDispatcher {
                 }
             })
             .collect();
+        let mut table = self.io.open_files.write();
         for fd in cloexec_fds {
-            if let Some(open_file) = self.io.open_files.remove(&fd) {
+            if let Some(open_file) = table.remove(&fd) {
                 close_open_file(&open_file);
             }
         }
     }
 
-    pub fn stderr(&self) -> &[u8] {
-        &self.io.stderr
+    pub fn stderr(&self) -> Vec<u8> {
+        self.io.stderr.lock().clone()
     }
 
-    pub fn cwd(&self) -> &str {
-        &self.io.cwd
+    pub fn cwd(&self) -> String {
+        self.io.cwd.read().clone()
     }
-
-
-
-
-
-
 
     /// Single-threaded dispatch (legacy + unit tests + the fork-based
     /// runtime path). Tid-aware handlers see `thread: None`.
@@ -994,40 +1248,506 @@ impl SyscallDispatcher {
         &mut self,
         request: SyscallRequest,
         memory: &mut impl GuestMemory,
-        reporter: &mut CompatReporter,
+        reporter: &CompatReporter,
     ) -> Result<DispatchOutcome, DispatchError> {
         self.dispatch_inner(request, memory, reporter, None)
     }
 
     // (see `watch_addr` below)
 
-    /// Multi-threaded dispatch: the caller (the per-vCPU runtime loop)
-    /// holds the big kernel lock and supplies THIS thread's tid plus the
-    /// shared registry/futex tables, so `gettid`/`set_tid_address`/`futex`
-    /// answer per-thread.
+    /// Multi-threaded dispatch through a shared dispatcher reference. Handlers
+    /// that touch process-wide state must protect that state with subsystem
+    /// locks; there is no dispatcher-wide fallback on this path.
     #[allow(clippy::too_many_arguments)]
     pub fn dispatch_threaded(
-        &mut self,
+        &self,
         request: SyscallRequest,
         memory: &mut impl GuestMemory,
-        reporter: &mut CompatReporter,
+        reporter: &CompatReporter,
         tid: crate::thread::ThreadId,
         registry: &crate::thread::ThreadRegistry,
         futex: &crate::thread::FutexTable,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let thread = Some(ThreadCtx {
-            tid,
-            registry,
-            futex,
+        if let Some(result) =
+            self.dispatch_threaded_shared(request, memory, reporter, tid, registry, futex)
+        {
+            return result;
+        }
+
+        let syscall = lookup_aarch64(request.number);
+        let name = syscall.map_or("unknown", |syscall| syscall.name);
+        reporter.record(CompatEvent::SyscallEntry {
+            number: request.number,
+            name: name.to_owned(),
+            args: request.args,
         });
-        self.dispatch_inner(request, memory, reporter, thread)
+
+        let outcome = {
+            reporter.record(CompatEvent::unhandled_syscall(
+                request.number,
+                name,
+                request.args,
+            ));
+            DispatchOutcome::Errno {
+                errno: LINUX_ENOSYS,
+            }
+        };
+
+        let (retval, errno) = outcome.retval_errno();
+        reporter.record(CompatEvent::SyscallReturn {
+            number: request.number,
+            name: name.to_owned(),
+            retval,
+            errno,
+        });
+
+        Ok(outcome)
+    }
+
+    /// Shared threaded dispatch path for subsystems already moved behind
+    /// interior locks.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dispatch_threaded_shared(
+        &self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+        reporter: &CompatReporter,
+        tid: crate::thread::ThreadId,
+        registry: &crate::thread::ThreadRegistry,
+        futex: &crate::thread::FutexTable,
+    ) -> Option<Result<DispatchOutcome, DispatchError>> {
+        if let Some(result) = self.dispatch_threaded_credentials(request, memory, reporter) {
+            return Some(result);
+        }
+        if let Some(result) = self.dispatch_threaded_process(request, memory, reporter) {
+            return Some(result);
+        }
+        if let Some(result) = self.dispatch_threaded_memory(request, memory, reporter) {
+            return Some(result);
+        }
+        if let Some(result) = self.dispatch_threaded_time(request, memory, reporter) {
+            return Some(result);
+        }
+        if let Some(result) =
+            self.dispatch_threaded_lifecycle(request, memory, reporter, tid, registry, futex)
+        {
+            return Some(result);
+        }
+        if let Some(result) = self.dispatch_threaded_fs(request, memory, reporter) {
+            return Some(result);
+        }
+        if let Some(result) = self.dispatch_threaded_net(request, memory, reporter) {
+            return Some(result);
+        }
+        if let Some(result) =
+            self.dispatch_threaded_signal(request, memory, reporter, tid, registry, futex)
+        {
+            return Some(result);
+        }
+        if let Some(result) =
+            Self::dispatch_threaded_independent(request, memory, reporter, tid, registry, futex)
+        {
+            return Some(result);
+        }
+        if !Self::dispatch_normalized_known(request.number) {
+            return Some(Ok(dispatch_threaded_unhandled(request, reporter)));
+        }
+        None
+    }
+
+    fn dispatch_threaded_process(
+        &self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+        reporter: &CompatReporter,
+    ) -> Option<Result<DispatchOutcome, DispatchError>> {
+        match request.number {
+            92
+            | 95
+            | 117
+            | 123
+            | 142
+            | 154..=157
+            | 160..=162
+            | 167
+            | 168
+            | 172
+            | 173
+            | 278
+            | 293 => {}
+            _ => return None,
+        }
+
+        let syscall = lookup_aarch64(request.number);
+        let name = syscall.map_or("unknown", |syscall| syscall.name);
+        reporter.record(CompatEvent::SyscallEntry {
+            number: request.number,
+            name: name.to_owned(),
+            args: request.args,
+        });
+
+        let mut ctx = SyscallCtx {
+            request,
+            memory,
+            reporter,
+            thread: None,
+        };
+        let outcome = match match request.number {
+            92 => Ok({
+                let requested = request.arg(0);
+                let mut proc = self.proc.lock();
+                let previous = proc.personality;
+                if requested != LINUX_PERSONALITY_QUERY {
+                    proc.personality = requested;
+                }
+                DispatchOutcome::Returned {
+                    value: previous as i64,
+                }
+            }),
+            95 => self.waitid(&mut ctx),
+            117 => self.ptrace(&mut ctx),
+            123 => self.sched_getaffinity(&mut ctx),
+            142 => self.reboot(&mut ctx),
+            154 => self.setpgid(&mut ctx),
+            155 => self.getpgid(&mut ctx),
+            156 => self.getsid(&mut ctx),
+            157 => self.setsid(&mut ctx),
+            160 => self.uname(&mut ctx),
+            161 => self.sethostname(&mut ctx),
+            162 => self.setdomainname(&mut ctx),
+            167 => self.prctl(&mut ctx),
+            168 => self.getcpu(&mut ctx),
+            172 => Ok(self.getpid()),
+            173 => Ok({
+                let bootstrap_host_pid = self.proc.lock().bootstrap_host_pid;
+                let value = if std::process::id() == bootstrap_host_pid {
+                    LINUX_BOOTSTRAP_PID as i64
+                } else {
+                    unsafe { libc::getppid() as i64 }
+                };
+                DispatchOutcome::Returned { value }
+            }),
+            278 => self.getrandom(&mut ctx),
+            293 => self.sys_rseq(&mut ctx),
+            _ => unreachable!("unsupported threaded process syscall"),
+        } {
+            Ok(outcome) => outcome,
+            Err(error) => return Some(Err(error)),
+        };
+
+        let (retval, errno) = outcome.retval_errno();
+        reporter.record(CompatEvent::SyscallReturn {
+            number: request.number,
+            name: name.to_owned(),
+            retval,
+            errno,
+        });
+
+        Some(Ok(outcome))
+    }
+
+    fn dispatch_threaded_credentials(
+        &self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+        reporter: &CompatReporter,
+    ) -> Option<Result<DispatchOutcome, DispatchError>> {
+        match request.number {
+            90 | 91 | 140 | 141 | 143..=152 | 158 | 159 | 166 | 174..=177 => {}
+            _ => return None,
+        }
+
+        let syscall = lookup_aarch64(request.number);
+        let name = syscall.map_or("unknown", |syscall| syscall.name);
+        reporter.record(CompatEvent::SyscallEntry {
+            number: request.number,
+            name: name.to_owned(),
+            args: request.args,
+        });
+
+        let mut ctx = SyscallCtx {
+            request,
+            memory,
+            reporter,
+            thread: None,
+        };
+        let outcome = match match request.number {
+            90 => self.capget(&mut ctx),
+            91 => self.capset(&mut ctx),
+            140 => self.setpriority(&mut ctx),
+            141 => self.getpriority(&mut ctx),
+            143 => Ok(self.dispatch_setregid(request)),
+            144 => Ok(self.dispatch_setgid(request)),
+            145 => Ok(self.dispatch_setreuid(request)),
+            146 => Ok(self.dispatch_setuid(request)),
+            147 => Ok(self.dispatch_setresuid(request)),
+            148 => Ok(self.dispatch_getresuid(request, memory)),
+            149 => Ok(self.dispatch_setresgid(request)),
+            150 => Ok(self.dispatch_getresgid(request, memory)),
+            151 => {
+                let creds = self.cred_snapshot();
+                Ok(DispatchOutcome::Returned {
+                    value: i64::from(creds.euid),
+                })
+            }
+            152 => {
+                let creds = self.cred_snapshot();
+                Ok(DispatchOutcome::Returned {
+                    value: i64::from(creds.egid),
+                })
+            }
+            158 => Ok(dispatch_getgroups(request, memory)),
+            159 => Ok(DispatchOutcome::Returned { value: 0 }),
+            166 => Ok(self.dispatch_umask(request)),
+            174 => {
+                let creds = self.cred_snapshot();
+                Ok(DispatchOutcome::Returned {
+                    value: i64::from(creds.ruid),
+                })
+            }
+            175 => {
+                let creds = self.cred_snapshot();
+                Ok(DispatchOutcome::Returned {
+                    value: i64::from(creds.euid),
+                })
+            }
+            176 => {
+                let creds = self.cred_snapshot();
+                Ok(DispatchOutcome::Returned {
+                    value: i64::from(creds.rgid),
+                })
+            }
+            177 => {
+                let creds = self.cred_snapshot();
+                Ok(DispatchOutcome::Returned {
+                    value: i64::from(creds.egid),
+                })
+            }
+            _ => unreachable!("unsupported threaded credential syscall"),
+        } {
+            Ok(outcome) => outcome,
+            Err(error) => return Some(Err(error)),
+        };
+
+        let (retval, errno) = outcome.retval_errno();
+        reporter.record(CompatEvent::SyscallReturn {
+            number: request.number,
+            name: name.to_owned(),
+            retval,
+            errno,
+        });
+
+        Some(Ok(outcome))
+    }
+
+    fn dispatch_umask(&self, request: SyscallRequest) -> DispatchOutcome {
+        let new = request.arg(0) as u32 & 0o777;
+        let mut creds = self.creds.lock();
+        let previous = creds.umask;
+        creds.umask = new;
+        DispatchOutcome::Returned {
+            value: previous as i64,
+        }
+    }
+
+    fn dispatch_setresuid(&self, request: SyscallRequest) -> DispatchOutcome {
+        let mut creds = self.creds.lock();
+        let r = request.arg(0);
+        let e = request.arg(1);
+        let s = request.arg(2);
+        if r as i64 != -1 {
+            creds.ruid = r as u32;
+        }
+        if e as i64 != -1 {
+            creds.euid = e as u32;
+        }
+        if s as i64 != -1 {
+            creds.suid = s as u32;
+        }
+        DispatchOutcome::Returned { value: 0 }
+    }
+
+    fn dispatch_setresgid(&self, request: SyscallRequest) -> DispatchOutcome {
+        let mut creds = self.creds.lock();
+        let r = request.arg(0);
+        let e = request.arg(1);
+        let s = request.arg(2);
+        if r as i64 != -1 {
+            creds.rgid = r as u32;
+        }
+        if e as i64 != -1 {
+            creds.egid = e as u32;
+        }
+        if s as i64 != -1 {
+            creds.sgid = s as u32;
+        }
+        DispatchOutcome::Returned { value: 0 }
+    }
+
+    fn dispatch_setreuid(&self, request: SyscallRequest) -> DispatchOutcome {
+        let mut creds = self.creds.lock();
+        let r = request.arg(0);
+        let e = request.arg(1);
+        if r as i64 != -1 {
+            creds.ruid = r as u32;
+        }
+        if e as i64 != -1 {
+            creds.euid = e as u32;
+        }
+        DispatchOutcome::Returned { value: 0 }
+    }
+
+    fn dispatch_setregid(&self, request: SyscallRequest) -> DispatchOutcome {
+        let mut creds = self.creds.lock();
+        let r = request.arg(0);
+        let e = request.arg(1);
+        if r as i64 != -1 {
+            creds.rgid = r as u32;
+        }
+        if e as i64 != -1 {
+            creds.egid = e as u32;
+        }
+        DispatchOutcome::Returned { value: 0 }
+    }
+
+    fn dispatch_setuid(&self, request: SyscallRequest) -> DispatchOutcome {
+        let u = request.arg(0) as u32;
+        let mut creds = self.creds.lock();
+        creds.ruid = u;
+        creds.euid = u;
+        creds.suid = u;
+        DispatchOutcome::Returned { value: 0 }
+    }
+
+    fn dispatch_setgid(&self, request: SyscallRequest) -> DispatchOutcome {
+        let g = request.arg(0) as u32;
+        let mut creds = self.creds.lock();
+        creds.rgid = g;
+        creds.egid = g;
+        creds.sgid = g;
+        DispatchOutcome::Returned { value: 0 }
+    }
+
+    fn dispatch_getresuid(
+        &self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+    ) -> DispatchOutcome {
+        let creds = self.cred_snapshot();
+        write_id_tuple(memory, request, [creds.ruid, creds.euid, creds.suid])
+    }
+
+    fn dispatch_getresgid(
+        &self,
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+    ) -> DispatchOutcome {
+        let creds = self.cred_snapshot();
+        write_id_tuple(memory, request, [creds.rgid, creds.egid, creds.sgid])
+    }
+
+    /// Thread-local syscall subset that does not touch mutable dispatcher
+    /// subsystem state. The runtime checks this before taking the serialized
+    /// legacy dispatcher path so futex and tid coordination can proceed without
+    /// the dispatcher-wide lock.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dispatch_threaded_independent(
+        request: SyscallRequest,
+        memory: &mut impl GuestMemory,
+        reporter: &CompatReporter,
+        tid: crate::thread::ThreadId,
+        registry: &crate::thread::ThreadRegistry,
+        futex: &crate::thread::FutexTable,
+    ) -> Option<Result<DispatchOutcome, DispatchError>> {
+        match request.number {
+            96 | 98 | 99 | 124 | 130 | 131 | 178 => {}
+            _ => return None,
+        }
+        match request.number {
+            130 => {
+                let target = request.arg(0) as crate::thread::ThreadId;
+                let signum = request.arg(1);
+                if signum <= LINUX_MAX_SIGNUM && (target == tid || !registry.is_live(target)) {
+                    return None;
+                }
+            }
+            131 => {
+                let target = request.arg(1) as crate::thread::ThreadId;
+                let signum = request.arg(2);
+                if signum <= LINUX_MAX_SIGNUM && (target == tid || !registry.is_live(target)) {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+
+        let syscall = lookup_aarch64(request.number);
+        let name = syscall.map_or("unknown", |syscall| syscall.name);
+        reporter.record(CompatEvent::SyscallEntry {
+            number: request.number,
+            name: name.to_owned(),
+            args: request.args,
+        });
+
+        let outcome = match request.number {
+            96 => {
+                let addr = request.arg(0);
+                registry.set_clear_child_tid(tid, addr);
+                DispatchOutcome::Returned { value: tid as i64 }
+            }
+            98 => dispatch_threaded_futex(request, memory, reporter, futex),
+            99 => {
+                let len = request.arg(1);
+                if len == 0 {
+                    DispatchOutcome::Errno {
+                        errno: LINUX_EINVAL,
+                    }
+                } else {
+                    DispatchOutcome::Returned { value: 0 }
+                }
+            }
+            124 => {
+                std::thread::yield_now();
+                DispatchOutcome::Returned { value: 0 }
+            }
+            130 => {
+                let target = request.arg(0) as crate::thread::ThreadId;
+                let signum = request.arg(1);
+                dispatch_threaded_signal_route(tid, registry, target, signum)?
+            }
+            131 => {
+                let target = request.arg(1) as crate::thread::ThreadId;
+                let signum = request.arg(2);
+                dispatch_threaded_signal_route(tid, registry, target, signum)?
+            }
+            178 => {
+                if registry.live_count() > 1 {
+                    DispatchOutcome::Returned { value: tid as i64 }
+                } else {
+                    DispatchOutcome::Returned {
+                        value: std::process::id() as i64,
+                    }
+                }
+            }
+            _ => unreachable!("unsupported threaded-independent syscall"),
+        };
+
+        let (retval, errno) = outcome.retval_errno();
+        reporter.record(CompatEvent::SyscallReturn {
+            number: request.number,
+            name: name.to_owned(),
+            retval,
+            errno,
+        });
+
+        Some(Ok(outcome))
     }
 
     fn dispatch_inner(
         &mut self,
         request: SyscallRequest,
         memory: &mut impl GuestMemory,
-        reporter: &mut CompatReporter,
+        reporter: &CompatReporter,
         thread: Option<ThreadCtx>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let syscall = lookup_aarch64(request.number);
@@ -1058,14 +1778,7 @@ impl SyscallDispatcher {
         for (nr, arg_index, mask) in SYSCALL_FLAG_VALIDATORS {
             if *nr == request.number {
                 let value = request.arg(*arg_index as usize);
-                check_syscall_flags(
-                    reporter,
-                    request.number,
-                    name,
-                    *arg_index,
-                    value,
-                    *mask,
-                );
+                check_syscall_flags(reporter, request.number, name, *arg_index, value, *mask);
             }
         }
 
@@ -1109,109 +1822,6 @@ impl SyscallDispatcher {
         Ok(outcome)
     }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     // ------------------------------------------------------------------
     // BSD sockets.
     //
@@ -1227,116 +1837,7 @@ impl SyscallDispatcher {
     //   - sockaddr_in / sockaddr_un layout (BSD has sin_len)  (BSD-only)
     //   - many Linux-specific `SOL_*` levels                  (we ENOPROTOOPT)
     // ------------------------------------------------------------------
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 }
-
-
-
-
-
 
 /// Untyped guest-memory write. Prefer [`write_kernel_struct`] over this
 /// whenever the payload is a Linux UAPI struct: that path is bound to
@@ -1365,14 +1866,22 @@ fn write_into_file_contents(contents: &mut Vec<u8>, offset: &mut usize, bytes: &
 /// itself. Add entries here as new flag-bearing syscalls land.
 const SYSCALL_FLAG_VALIDATORS: &[(u64, u32, u64)] = &[
     // eventfd2(initval, flags): EFD_SEMAPHORE | EFD_NONBLOCK | EFD_CLOEXEC
-    (19, 1, LINUX_EFD_SEMAPHORE | LINUX_EFD_NONBLOCK | LINUX_EFD_CLOEXEC),
+    (
+        19,
+        1,
+        LINUX_EFD_SEMAPHORE | LINUX_EFD_NONBLOCK | LINUX_EFD_CLOEXEC,
+    ),
     // epoll_create1(flags): EPOLL_CLOEXEC
     (20, 0, LINUX_EPOLL_CLOEXEC),
     // dup3(oldfd, newfd, flags): O_CLOEXEC
     (24, 2, LINUX_O_CLOEXEC),
     // unlinkat(dirfd, pathname, flags): AT_REMOVEDIR (0x200) plus the
     // AT_EMPTY_PATH/AT_SYMLINK_NOFOLLOW pair we accept elsewhere
-    (35, 2, 0x200 | LINUX_AT_EMPTY_PATH | LINUX_AT_SYMLINK_NOFOLLOW),
+    (
+        35,
+        2,
+        0x200 | LINUX_AT_EMPTY_PATH | LINUX_AT_SYMLINK_NOFOLLOW,
+    ),
     // renameat2(olddirfd, oldpath, newdirfd, newpath, flags):
     // RENAME_NOREPLACE(1)|EXCHANGE(2)|WHITEOUT(4)
     (276, 4, 0x1 | 0x2 | 0x4),
@@ -1401,7 +1910,7 @@ const SYSCALL_FLAG_VALIDATORS: &[(u64, u32, u64)] = &[
         | LINUX_O_CLOEXEC
         | 0o4010000  // O_SYNC
         | 0o010000000 // O_PATH
-        | 0o020000000 // O_TMPFILE
+        | 0o020000000, // O_TMPFILE
     ),
     // pipe2(pipefd, flags): O_CLOEXEC | O_NONBLOCK
     (59, 1, LINUX_O_CLOEXEC | LINUX_O_NONBLOCK),
@@ -1425,7 +1934,11 @@ const SYSCALL_FLAG_VALIDATORS: &[(u64, u32, u64)] = &[
         LINUX_AT_EMPTY_PATH | LINUX_AT_SYMLINK_NOFOLLOW | 0x1000 /* AT_NO_AUTOMOUNT */ | 0x800 /* AT_STATX_SYNC_AS_STAT */ | 0x4000 /* AT_STATX_FORCE_SYNC */ | 0x6000,
     ),
     // faccessat2(dirfd, pathname, mode, flags)
-    (439, 3, LINUX_AT_EMPTY_PATH | LINUX_AT_SYMLINK_NOFOLLOW | 0x200 /* AT_EACCESS */),
+    (
+        439,
+        3,
+        LINUX_AT_EMPTY_PATH | LINUX_AT_SYMLINK_NOFOLLOW | 0x200, /* AT_EACCESS */
+    ),
 ];
 
 /// Systematic unknown-flag detector for syscalls.
@@ -1451,7 +1964,7 @@ const SYSCALL_FLAG_VALIDATORS: &[(u64, u32, u64)] = &[
 /// }
 /// ```
 pub fn check_syscall_flags(
-    reporter: &mut CompatReporter,
+    reporter: &CompatReporter,
     number: u64,
     name: &str,
     argument_index: u32,
@@ -1478,6 +1991,178 @@ fn write_packed(memory: &mut impl GuestMemory, address: u64, bytes: &[u8]) -> Di
     } else {
         DispatchOutcome::Returned { value: 0 }
     }
+}
+
+fn write_id_tuple(
+    memory: &mut impl GuestMemory,
+    request: SyscallRequest,
+    values: [u32; 3],
+) -> DispatchOutcome {
+    for (index, value) in values.iter().enumerate() {
+        let ptr = request.arg(index);
+        if ptr == 0 {
+            continue;
+        }
+        if memory.write_bytes(ptr, &value.to_le_bytes()).is_err() {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EFAULT,
+            };
+        }
+    }
+    DispatchOutcome::Returned { value: 0 }
+}
+
+fn dispatch_getgroups(request: SyscallRequest, memory: &mut impl GuestMemory) -> DispatchOutcome {
+    let size = request.arg(0) as i32;
+    if size < 0 {
+        return DispatchOutcome::Errno {
+            errno: LINUX_EINVAL,
+        };
+    }
+    if size == 0 {
+        return DispatchOutcome::Returned { value: 1 };
+    }
+    if size < 1 {
+        return DispatchOutcome::Errno {
+            errno: LINUX_EINVAL,
+        };
+    }
+    let list = request.arg(1);
+    let gid: u32 = 0;
+    if memory.write_bytes(list, &gid.to_le_bytes()).is_err() {
+        return DispatchOutcome::Errno {
+            errno: LINUX_EFAULT,
+        };
+    }
+    DispatchOutcome::Returned { value: 1 }
+}
+
+fn dispatch_threaded_unhandled(
+    request: SyscallRequest,
+    reporter: &CompatReporter,
+) -> DispatchOutcome {
+    let syscall = lookup_aarch64(request.number);
+    let name = syscall.map_or("unknown", |syscall| syscall.name);
+    reporter.record(CompatEvent::SyscallEntry {
+        number: request.number,
+        name: name.to_owned(),
+        args: request.args,
+    });
+    reporter.record(CompatEvent::unhandled_syscall(
+        request.number,
+        name,
+        request.args,
+    ));
+    let outcome = DispatchOutcome::Errno {
+        errno: LINUX_ENOSYS,
+    };
+    let (retval, errno) = outcome.retval_errno();
+    reporter.record(CompatEvent::SyscallReturn {
+        number: request.number,
+        name: name.to_owned(),
+        retval,
+        errno,
+    });
+    outcome
+}
+
+fn dispatch_threaded_futex(
+    request: SyscallRequest,
+    memory: &impl GuestMemory,
+    reporter: &CompatReporter,
+    futex: &crate::thread::FutexTable,
+) -> DispatchOutcome {
+    let address = request.arg(0);
+    let operation = request.arg(1);
+    let value = request.arg(2) as u32;
+    let timeout_address = request.arg(3);
+
+    const LINUX_FUTEX_WAIT_BITSET: u64 = 9;
+    const LINUX_FUTEX_WAKE_BITSET: u64 = 10;
+    let raw_command = operation & LINUX_FUTEX_CMD_MASK;
+    let command = match raw_command {
+        LINUX_FUTEX_WAIT_BITSET => LINUX_FUTEX_WAIT,
+        LINUX_FUTEX_WAKE_BITSET => LINUX_FUTEX_WAKE,
+        other => other,
+    };
+    let flags = operation & !LINUX_FUTEX_CMD_MASK;
+    if flags & !(LINUX_FUTEX_PRIVATE_FLAG | LINUX_FUTEX_CLOCK_REALTIME) != 0 {
+        return DispatchOutcome::Errno {
+            errno: LINUX_EINVAL,
+        };
+    }
+
+    let word = match read_u32(memory, address) {
+        Ok(word) => word,
+        Err(errno) => return DispatchOutcome::Errno { errno },
+    };
+
+    if flags & LINUX_FUTEX_PRIVATE_FLAG == 0 {
+        reporter.record(crate::compat::CompatEvent::partial_syscall(
+            98,
+            "futex",
+            request.args,
+            "non-private futex treated as private (shared address space)",
+        ));
+    }
+
+    match command {
+        LINUX_FUTEX_WAKE => {
+            let n = futex.wake(address, value);
+            DispatchOutcome::Returned {
+                value: i64::from(n),
+            }
+        }
+        LINUX_FUTEX_WAIT => {
+            if word != value {
+                return DispatchOutcome::Errno {
+                    errno: LINUX_EAGAIN,
+                };
+            }
+            let timeout = if timeout_address == 0 {
+                None
+            } else {
+                let timespec = match read_timespec(memory, timeout_address) {
+                    Ok(t) => t,
+                    Err(errno) => return DispatchOutcome::Errno { errno },
+                };
+                match duration_from_linux_timespec(timespec) {
+                    Ok(t) => t,
+                    Err(errno) => return DispatchOutcome::Errno { errno },
+                }
+            };
+            DispatchOutcome::FutexWait {
+                wait: futex.prepare_wait(address),
+                timeout,
+            }
+        }
+        _ => DispatchOutcome::Errno {
+            errno: LINUX_ENOSYS,
+        },
+    }
+}
+
+fn dispatch_threaded_signal_route(
+    caller: crate::thread::ThreadId,
+    registry: &crate::thread::ThreadRegistry,
+    target: crate::thread::ThreadId,
+    signum: u64,
+) -> Option<DispatchOutcome> {
+    if signum > LINUX_MAX_SIGNUM {
+        return Some(DispatchOutcome::Errno {
+            errno: LINUX_EINVAL,
+        });
+    }
+    if caller == target {
+        return None;
+    }
+    if registry.is_live(target) {
+        return Some(DispatchOutcome::SignalThread {
+            tid: target,
+            signum: signum as i32,
+        });
+    }
+    None
 }
 
 /// Type-safe write for any Linux UAPI struct that implements
@@ -1549,14 +2234,14 @@ fn fd_is_tty(open_files: &HashMap<i32, OpenFile>, fd: i32) -> bool {
     !open_files.contains_key(&fd)
 }
 
-fn retain_open_file(description: &Rc<RefCell<OpenDescription>>) {
-    match &*description.borrow() {
+fn retain_open_file(description: &OpenDescriptionRef) {
+    match &*description.read() {
         OpenDescription::PipeReader { pipe, .. } => {
-            let mut pipe = pipe.borrow_mut();
+            let mut pipe = pipe.lock();
             pipe.readers = pipe.readers.saturating_add(1);
         }
         OpenDescription::PipeWriter { pipe, .. } => {
-            let mut pipe = pipe.borrow_mut();
+            let mut pipe = pipe.lock();
             pipe.writers = pipe.writers.saturating_add(1);
         }
         _ => {}
@@ -1564,26 +2249,26 @@ fn retain_open_file(description: &Rc<RefCell<OpenDescription>>) {
 }
 
 fn close_open_file(open_file: &OpenFile) {
-    match &*open_file.description.borrow() {
+    match &*open_file.description.read() {
         OpenDescription::PipeReader { pipe, .. } => {
-            let mut pipe = pipe.borrow_mut();
+            let mut pipe = pipe.lock();
             pipe.readers = pipe.readers.saturating_sub(1);
         }
         OpenDescription::PipeWriter { pipe, .. } => {
-            let mut pipe = pipe.borrow_mut();
+            let mut pipe = pipe.lock();
             pipe.writers = pipe.writers.saturating_sub(1);
         }
         OpenDescription::HostPipe { host_fd, .. }
             // Close the host fd only when the LAST guest fd that
             // references this OpenDescription is being closed. Because
-            // dup3/dup2 wraps a new Linux fd around the SAME Rc<...>,
-            // we let the Rc go out of scope naturally and rely on the
+            // dup3/dup2 wraps a new Linux fd around the SAME Arc<...>,
+            // we let the Arc go out of scope naturally and rely on the
             // wrapper around `OpenDescription::HostPipe` having no
             // shared owners. The simplest correct close here is to
             // count: if `strong_count == 1` we're the last one.
-            // (The Rc is held by the OpenFile in `open_files`; if no
+            // (The Arc is held by the OpenFile in `open_files`; if no
             // dup'd entry remains, strong_count is 1.)
-            if std::rc::Rc::strong_count(&open_file.description) == 1 => {
+            if Arc::strong_count(&open_file.description) == 1 => {
                 unsafe {
                     libc::close(*host_fd);
                 }
@@ -1593,7 +2278,7 @@ fn close_open_file(open_file: &OpenFile) {
             // Same last-reference rule as HostPipe: only close the real
             // macOS fd when no other Linux fd still aliases the same
             // OpenDescription via dup3/dup2.
-            if std::rc::Rc::strong_count(&open_file.description) == 1 => {
+            if Arc::strong_count(&open_file.description) == 1 => {
                 unsafe {
                     libc::close(*host_fd);
                 }
@@ -1675,7 +2360,6 @@ fn adjtimex_bootstrap(memory: &impl GuestMemory, address: u64) -> DispatchOutcom
     // but for bootstrap we always return EPERM and let glibc fall back.
     DispatchOutcome::Errno { errno: LINUX_EPERM }
 }
-
 
 fn linux_task_name_from_bytes(bytes: &[u8]) -> [u8; LINUX_TASK_COMM_LEN] {
     let mut name = [0; LINUX_TASK_COMM_LEN];
@@ -2078,25 +2762,31 @@ fn write_synthetic_statx(
 /// renderers. Keeps the synthetic helpers as free functions while
 /// letting them see live state (executable path, address-space
 /// regions, current brk, next mmap address) without taking `&self`.
-pub struct SyntheticProcContext<'a> {
-    pub executable_path: &'a str,
-    pub address_space_regions: Option<&'a [ProcMapsEntry]>,
+pub struct SyntheticProcContext {
+    pub executable_path: String,
+    pub address_space_regions: Option<Vec<ProcMapsEntry>>,
     pub brk_current: u64,
     pub mmap_next: u64,
 }
 
 impl SyscallDispatcher {
-    fn synthetic_proc_context(&self) -> SyntheticProcContext<'_> {
+    fn mem_snapshot(&self) -> mem::MemState {
+        self.mem.lock().clone()
+    }
+
+    fn synthetic_proc_context(&self) -> SyntheticProcContext {
+        let proc = self.proc.lock();
+        let mem = self.mem_snapshot();
         SyntheticProcContext {
-            executable_path: &self.proc.executable_path,
-            address_space_regions: self.mem.address_space_regions.as_deref(),
-            brk_current: self.mem.brk_current,
-            mmap_next: self.mem.mmap_next,
+            executable_path: proc.executable_path.clone(),
+            address_space_regions: mem.address_space_regions,
+            brk_current: mem.brk_current,
+            mmap_next: mem.mmap_next,
         }
     }
 }
 
-pub fn synthetic_proc_file(path: &str, ctx: &SyntheticProcContext<'_>) -> Option<Vec<u8>> {
+pub fn synthetic_proc_file(path: &str, ctx: &SyntheticProcContext) -> Option<Vec<u8>> {
     match path {
         "/proc/cmdline" => Some(synthetic_proc_cmdline().to_vec()),
         "/proc/cpuinfo" => Some(synthetic_proc_cpuinfo().to_vec()),
@@ -2110,21 +2800,19 @@ pub fn synthetic_proc_file(path: &str, ctx: &SyntheticProcContext<'_>) -> Option
         "/proc/uptime" => Some(synthetic_proc_uptime().into_bytes()),
         "/proc/version" => Some(synthetic_proc_version().to_vec()),
         "/proc/self/auxv" => Some(synthetic_proc_self_auxv().to_vec()),
-        "/proc/self/cmdline" => Some(synthetic_proc_self_cmdline(ctx.executable_path)),
-        "/proc/self/comm" => Some(synthetic_proc_self_comm(ctx.executable_path).into_bytes()),
+        "/proc/self/cmdline" => Some(synthetic_proc_self_cmdline(&ctx.executable_path)),
+        "/proc/self/comm" => Some(synthetic_proc_self_comm(&ctx.executable_path).into_bytes()),
         "/proc/self/limits" => Some(synthetic_proc_self_limits().to_vec()),
         "/proc/self/maps" => Some(synthetic_proc_maps(ctx).into_bytes()),
-        "/proc/self/stat" => Some(synthetic_proc_self_stat(ctx.executable_path).into_bytes()),
+        "/proc/self/stat" => Some(synthetic_proc_self_stat(&ctx.executable_path).into_bytes()),
         "/proc/self/statm" => Some(synthetic_proc_self_statm().to_vec()),
-        "/proc/self/status" => Some(synthetic_proc_self_status(ctx.executable_path).into_bytes()),
+        "/proc/self/status" => Some(synthetic_proc_self_status(&ctx.executable_path).into_bytes()),
         "/proc/sys/kernel/osrelease" => Some(synthetic_proc_osrelease().to_vec()),
         "/proc/sys/kernel/hostname" => Some(synthetic_proc_hostname().to_vec()),
         // The default 64-bit Linux pid ceiling. LTP (e.g. setpgid02) reads
         // this to bound pid scans; without it tst_test aborts with ENOENT.
         "/proc/sys/kernel/pid_max" => Some(b"4194304\n".to_vec()),
-        "/proc/sys/kernel/random/boot_id" => {
-            Some(synthetic_proc_boot_id().to_vec())
-        }
+        "/proc/sys/kernel/random/boot_id" => Some(synthetic_proc_boot_id().to_vec()),
         // glibc's `__check_pf` (called from getaddrinfo with
         // AI_ADDRCONFIG) queries the kernel via NETLINK_ROUTE for
         // interface families. macOS has no AF_NETLINK, so the socket
@@ -2140,9 +2828,9 @@ pub fn synthetic_proc_file(path: &str, ctx: &SyntheticProcContext<'_>) -> Option
         // Format (per kernel docs):
         //   <16-byte hex IPv6 addr> <iface idx hex> <prefix len hex>
         //   <scope hex> <flags hex> <devname>
-        "/proc/net/if_inet6" => Some(
-            b"00000000000000000000000000000001 01 80 10 80       lo\n".to_vec(),
-        ),
+        "/proc/net/if_inet6" => {
+            Some(b"00000000000000000000000000000001 01 80 10 80       lo\n".to_vec())
+        }
         _ => None,
     }
 }
@@ -2175,30 +2863,24 @@ pub fn synthetic_sys_file(path: &str) -> Option<Vec<u8>> {
         "/sys/devices/system/cpu/cpufreq/policy0/scaling_min_freq" => {
             Some(synthetic_sys_cpufreq_scaling_min_freq().to_vec())
         }
-        "/sys/kernel/mm/transparent_hugepage/enabled" => {
-            Some(synthetic_sys_thp_enabled().to_vec())
-        }
-        "/sys/kernel/mm/transparent_hugepage/defrag" => {
-            Some(synthetic_sys_thp_defrag().to_vec())
-        }
+        "/sys/kernel/mm/transparent_hugepage/enabled" => Some(synthetic_sys_thp_enabled().to_vec()),
+        "/sys/kernel/mm/transparent_hugepage/defrag" => Some(synthetic_sys_thp_defrag().to_vec()),
         "/sys/kernel/random/uuid" => Some(synthetic_sys_random_uuid().to_vec()),
         "/sys/kernel/random/boot_id" => Some(synthetic_sys_random_boot_id().to_vec()),
-        "/sys/fs/cgroup/cgroup.controllers" => {
-            Some(synthetic_sys_cgroup_controllers().to_vec())
-        }
+        "/sys/fs/cgroup/cgroup.controllers" => Some(synthetic_sys_cgroup_controllers().to_vec()),
         _ => None,
     }
 }
 
-fn is_synthetic_virtual_file(path: &str, ctx: &SyntheticProcContext<'_>) -> bool {
+fn is_synthetic_virtual_file(path: &str, ctx: &SyntheticProcContext) -> bool {
     synthetic_proc_file(path, ctx).is_some() || synthetic_sys_file(path).is_some()
 }
 
-fn synthetic_proc_maps(ctx: &SyntheticProcContext<'_>) -> String {
-    if let Some(regions) = ctx.address_space_regions {
+fn synthetic_proc_maps(ctx: &SyntheticProcContext) -> String {
+    if let Some(regions) = ctx.address_space_regions.as_deref() {
         return render_proc_maps_from_regions(
             regions,
-            ctx.executable_path,
+            &ctx.executable_path,
             ctx.brk_current,
             ctx.mmap_next,
         );
@@ -2241,14 +2923,12 @@ fn render_proc_maps_from_regions(
         // Track live end pointers for heap and mmap so the guest sees
         // its own growth (brk(2) / mmap(2)) reflected in the map.
         match label.as_str() {
-            "[heap]"
-                if brk_current > start && brk_current <= region.end => {
-                    end = brk_current;
-                }
-            "[carrick-mmap]"
-                if mmap_next > start && mmap_next <= region.end => {
-                    end = mmap_next;
-                }
+            "[heap]" if brk_current > start && brk_current <= region.end => {
+                end = brk_current;
+            }
+            "[carrick-mmap]" if mmap_next > start && mmap_next <= region.end => {
+                end = mmap_next;
+            }
             _ => {}
         }
         let r = if region.read { 'r' } else { '-' };
@@ -2680,18 +3360,20 @@ fn read_timerfd(
     // deadline, sleep until that deadline (real wall-clock) and recompute. If
     // there's no deadline (no timer armed) we can't know when to wake, so we
     // fall through to EAGAIN to avoid wedging the conformance harness.
-    if ready == 0 && !nonblocking
-        && let Some(target) = next_deadline {
-            if let Some(now) = linux_clock_duration(clock_id) {
-                let wait = target.saturating_sub(now);
-                if !wait.is_zero() {
-                    std::thread::sleep(wait);
-                }
+    if ready == 0
+        && !nonblocking
+        && let Some(target) = next_deadline
+    {
+        if let Some(now) = linux_clock_duration(clock_id) {
+            let wait = target.saturating_sub(now);
+            if !wait.is_zero() {
+                std::thread::sleep(wait);
             }
-            let recomputed = timerfd_expirations(clock_id, *interval, Some(target), *expirations);
-            ready = recomputed.0;
-            next_deadline = recomputed.1;
         }
+        let recomputed = timerfd_expirations(clock_id, *interval, Some(target), *expirations);
+        ready = recomputed.0;
+        next_deadline = recomputed.1;
+    }
     *deadline = next_deadline;
     *expirations = ready;
     if *expirations == 0 {
@@ -2806,13 +3488,13 @@ fn read_pipe(
     memory: &mut impl GuestMemory,
     address: u64,
     length: usize,
-    pipe: &Rc<RefCell<PipeState>>,
+    pipe: &PipeRef,
     _status_flags: u64,
 ) -> DispatchOutcome {
     if length == 0 {
         return DispatchOutcome::Returned { value: 0 };
     }
-    let mut pipe = pipe.borrow_mut();
+    let mut pipe = pipe.lock();
     if pipe.buffer.is_empty() {
         if pipe.writers == 0 {
             return DispatchOutcome::Returned { value: 0 };
@@ -2840,12 +3522,8 @@ fn read_pipe(
     }
 }
 
-fn take_pipe_bytes(
-    pipe: &Rc<RefCell<PipeState>>,
-    length: usize,
-    _status_flags: u64,
-) -> Result<Vec<u8>, i32> {
-    let mut pipe = pipe.borrow_mut();
+fn take_pipe_bytes(pipe: &PipeRef, length: usize, _status_flags: u64) -> Result<Vec<u8>, i32> {
+    let mut pipe = pipe.lock();
     if pipe.buffer.is_empty() {
         if pipe.writers == 0 {
             return Ok(Vec::new());
@@ -2857,8 +3535,8 @@ fn take_pipe_bytes(
     Ok(pipe.buffer.drain(..read_len).collect())
 }
 
-fn write_pipe(bytes: &[u8], pipe: &Rc<RefCell<PipeState>>) -> DispatchOutcome {
-    let mut pipe = pipe.borrow_mut();
+fn write_pipe(bytes: &[u8], pipe: &PipeRef) -> DispatchOutcome {
+    let mut pipe = pipe.lock();
     if pipe.readers == 0 {
         return DispatchOutcome::Errno { errno: LINUX_EPIPE };
     }
@@ -2867,10 +3545,6 @@ fn write_pipe(bytes: &[u8], pipe: &Rc<RefCell<PipeState>>) -> DispatchOutcome {
         value: bytes.len() as i64,
     }
 }
-
-
-
-
 
 pub(super) fn read_u64(memory: &impl GuestMemory, address: u64) -> Result<u64, i32> {
     let bytes = memory.read_bytes(address, 8).map_err(|_| LINUX_EFAULT)?;
@@ -2885,14 +3559,6 @@ pub(super) fn read_u32(memory: &impl GuestMemory, address: u64) -> Result<u32, i
         bytes.as_slice().try_into().map_err(|_| LINUX_EFAULT)?,
     ))
 }
-
-
-
-
-
-
-
-
 
 fn read_itimerspec(memory: &impl GuestMemory, address: u64) -> Result<LinuxItimerspec, i32> {
     let bytes = memory
@@ -3116,9 +3782,6 @@ fn align_to(value: usize, alignment: usize) -> usize {
     value.div_ceil(alignment) * alignment
 }
 
-
-
-
 fn inode_for_path(path: &Path) -> u64 {
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in path.as_os_str().as_encoded_bytes() {
@@ -3193,10 +3856,7 @@ fn now_realtime_timespec() -> (i64, i64) {
 
 /// Read a NULL-terminated array of guest VA pointers, dereferencing
 /// each to a C string. Used for `argv` / `envp` in `execve(2)`.
-fn read_guest_string_array(
-    memory: &impl GuestMemory,
-    array_addr: u64,
-) -> Result<Vec<String>, i32> {
+fn read_guest_string_array(memory: &impl GuestMemory, array_addr: u64) -> Result<Vec<String>, i32> {
     // execve(NULL, ...) is allowed by Linux for argv but treated as
     // "no argv". Same for envp. Return empty Vec.
     if array_addr == 0 {
@@ -3208,9 +3868,7 @@ fn read_guest_string_array(
         let slot_addr = array_addr
             .checked_add((index as u64) * 8)
             .ok_or(LINUX_E2BIG)?;
-        let bytes = memory
-            .read_bytes(slot_addr, 8)
-            .map_err(|_| LINUX_EFAULT)?;
+        let bytes = memory.read_bytes(slot_addr, 8).map_err(|_| LINUX_EFAULT)?;
         let ptr = u64::from_le_bytes(bytes.try_into().map_err(|_| LINUX_EFAULT)?);
         if ptr == 0 {
             return Ok(out);
@@ -3410,30 +4068,11 @@ pub fn macos_to_linux_errno(macos: i32) -> i32 {
 /// Linux `NLMSG_ALIGNTO` — netlink messages and attributes are 4-byte aligned.
 const NLMSG_ALIGNTO: usize = 4;
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 /// read(2) on a host-backed fd (pipe/socket/file). read has no per-call
 /// non-blocking flag, so we put the host fd non-blocking (idempotent; immaterial
 /// for files, which never block) and convert EAGAIN: a blocking-mode guest fd
 /// hands off to the runtime's lockless kqueue wait via WaitOnFds; a non-blocking
-/// guest fd gets EAGAIN. Never blocks under the kernel lock. `nonblocking` is
+/// guest fd gets EAGAIN. Never blocks under the dispatcher lock. `nonblocking` is
 /// the guest's intended mode (status_flags / O_NONBLOCK).
 fn read_host_pipe(
     memory: &mut impl GuestMemory,
@@ -3458,10 +4097,11 @@ fn read_host_pipe(
         return DispatchOutcome::Errno { errno: e };
     }
     let n_usize = n as usize;
-    if n_usize > 0
-        && memory.write_bytes(guest_addr, &buf[..n_usize]).is_err() {
-            return DispatchOutcome::Errno { errno: LINUX_EFAULT };
-        }
+    if n_usize > 0 && memory.write_bytes(guest_addr, &buf[..n_usize]).is_err() {
+        return DispatchOutcome::Errno {
+            errno: LINUX_EFAULT,
+        };
+    }
     DispatchOutcome::Returned { value: n as i64 }
 }
 
@@ -3483,10 +4123,12 @@ fn write_host_pipe(bytes: &[u8], host_fd: i32, nonblocking: bool) -> DispatchOut
 
 /// A host op returned EAGAIN: a non-blocking guest fd gets EAGAIN; a blocking
 /// one gets a WaitOnFds hand-off so the runtime waits on readiness with the
-/// kernel lock RELEASED (per-thread kqueue), then re-dispatches.
+/// dispatcher lock RELEASED (per-thread kqueue), then re-dispatches.
 fn would_block_outcome(host_fd: i32, events: i16, nonblocking: bool) -> DispatchOutcome {
     if nonblocking {
-        DispatchOutcome::Errno { errno: LINUX_EAGAIN }
+        DispatchOutcome::Errno {
+            errno: LINUX_EAGAIN,
+        }
     } else {
         DispatchOutcome::WaitOnFds {
             fds: vec![(host_fd, events)],
@@ -3628,7 +4270,7 @@ mod overlay_dispatch_tests {
         fn call(&mut self, number: u64, args: [u64; 6]) -> DispatchOutcome {
             let request = SyscallRequest::new(number, SyscallArgs(args));
             self.dispatcher
-                .dispatch(request, &mut self.memory, &mut self.reporter)
+                .dispatch(request, &mut self.memory, &self.reporter)
                 .expect("dispatch must not surface a fatal error")
         }
     }
@@ -3780,7 +4422,10 @@ mod overlay_dispatch_tests {
         let mut h = Harness::new();
         let buf = h.reserve(8);
         // O_CLOEXEC | O_NONBLOCK — both are in the supported mask.
-        let _ = h.call(SYS_PIPE2, [buf, LINUX_O_CLOEXEC | LINUX_O_NONBLOCK, 0, 0, 0, 0]);
+        let _ = h.call(
+            SYS_PIPE2,
+            [buf, LINUX_O_CLOEXEC | LINUX_O_NONBLOCK, 0, 0, 0, 0],
+        );
         let report = std::mem::take(&mut h.reporter).finish();
         assert!(
             report.unknown_syscall_flags.is_empty(),
@@ -3811,41 +4456,78 @@ mod overlay_dispatch_tests {
         }
         // The divergence cases that bit us — apt's connect saw macOS
         // EINPROGRESS=36 surface in the guest as ENAMETOOLONG=36.
-        assert_eq!(macos_to_linux_errno(libc::EINPROGRESS), linux_errno::EINPROGRESS);
-        assert_ne!(macos_to_linux_errno(libc::EINPROGRESS), 36, "EINPROGRESS != Linux ENAMETOOLONG");
+        assert_eq!(
+            macos_to_linux_errno(libc::EINPROGRESS),
+            linux_errno::EINPROGRESS
+        );
+        assert_ne!(
+            macos_to_linux_errno(libc::EINPROGRESS),
+            36,
+            "EINPROGRESS != Linux ENAMETOOLONG"
+        );
         // Sample of network errnos that matter for apt's HTTP method.
         assert_eq!(macos_to_linux_errno(libc::EAGAIN), linux_errno::EAGAIN);
-        assert_eq!(macos_to_linux_errno(libc::ECONNREFUSED), linux_errno::ECONNREFUSED);
-        assert_eq!(macos_to_linux_errno(libc::EHOSTUNREACH), linux_errno::EHOSTUNREACH);
-        assert_eq!(macos_to_linux_errno(libc::ETIMEDOUT), linux_errno::ETIMEDOUT);
+        assert_eq!(
+            macos_to_linux_errno(libc::ECONNREFUSED),
+            linux_errno::ECONNREFUSED
+        );
+        assert_eq!(
+            macos_to_linux_errno(libc::EHOSTUNREACH),
+            linux_errno::EHOSTUNREACH
+        );
+        assert_eq!(
+            macos_to_linux_errno(libc::ETIMEDOUT),
+            linux_errno::ETIMEDOUT
+        );
         assert_eq!(macos_to_linux_errno(libc::ENOTCONN), linux_errno::ENOTCONN);
-        assert_eq!(macos_to_linux_errno(libc::ECONNRESET), linux_errno::ECONNRESET);
-        assert_eq!(macos_to_linux_errno(libc::EADDRINUSE), linux_errno::EADDRINUSE);
-        assert_eq!(macos_to_linux_errno(libc::EAFNOSUPPORT), linux_errno::EAFNOSUPPORT);
+        assert_eq!(
+            macos_to_linux_errno(libc::ECONNRESET),
+            linux_errno::ECONNRESET
+        );
+        assert_eq!(
+            macos_to_linux_errno(libc::EADDRINUSE),
+            linux_errno::EADDRINUSE
+        );
+        assert_eq!(
+            macos_to_linux_errno(libc::EAFNOSUPPORT),
+            linux_errno::EAFNOSUPPORT
+        );
         // Filesystem errnos that diverge.
-        assert_eq!(macos_to_linux_errno(libc::ENAMETOOLONG), linux_errno::ENAMETOOLONG);
-        assert_eq!(macos_to_linux_errno(libc::ENOTEMPTY), linux_errno::ENOTEMPTY);
+        assert_eq!(
+            macos_to_linux_errno(libc::ENAMETOOLONG),
+            linux_errno::ENAMETOOLONG
+        );
+        assert_eq!(
+            macos_to_linux_errno(libc::ENOTEMPTY),
+            linux_errno::ENOTEMPTY
+        );
         assert_eq!(macos_to_linux_errno(libc::ELOOP), linux_errno::ELOOP);
         assert_eq!(macos_to_linux_errno(libc::ENOSYS), linux_errno::ENOSYS);
         assert_eq!(macos_to_linux_errno(libc::ENOLCK), linux_errno::ENOLCK);
         // Misc.
         assert_eq!(macos_to_linux_errno(libc::EIDRM), linux_errno::EIDRM);
         assert_eq!(macos_to_linux_errno(libc::EILSEQ), linux_errno::EILSEQ);
-        assert_eq!(macos_to_linux_errno(libc::ECANCELED), linux_errno::ECANCELED);
+        assert_eq!(
+            macos_to_linux_errno(libc::ECANCELED),
+            linux_errno::ECANCELED
+        );
     }
 
     #[test]
     fn every_migrated_syscall_is_claimed_by_the_normalized_table() {
         let mut d = SyscallDispatcher::new();
         let mut mem = LinearMemory::new(0, vec![0u8; 4096]);
-        let mut reporter = CompatReporter::default();
+        let reporter = CompatReporter::default();
         // Numbers that used to live in the deleted legacy match. Each must now
         // be claimed by the normalized table (Some), never None.
-        for nr in [5u64, 7, 8, 10, 11, 13, 14, 43, 44, 45, 74, 93, 151, 152,
-                   159, 172, 173, 174, 175, 176, 177, 178, 243, 269, 283, 293, 435] {
+        for nr in [
+            5u64, 7, 8, 10, 11, 13, 14, 43, 44, 45, 74, 93, 151, 152, 159, 172, 173, 174, 175, 176,
+            177, 178, 243, 269, 283, 293, 435,
+        ] {
             let req = SyscallRequest::new(nr, SyscallArgs::from([0, 0, 0, 0, 0, 0]));
             assert!(
-                d.dispatch_normalized(req, &mut mem, &mut reporter, None).is_some(),
+                d.dispatch_normalized(req, &mut mem, &reporter, None)
+                    .is_some(),
                 "syscall {nr} fell through the normalized table",
             );
         }
@@ -3855,11 +4537,18 @@ mod overlay_dispatch_tests {
     fn unknown_syscall_returns_enosys_without_panicking() {
         let mut d = SyscallDispatcher::new();
         let mut mem = LinearMemory::new(0, vec![0u8; 4096]);
-        let mut reporter = CompatReporter::default();
+        let reporter = CompatReporter::default();
         // 999 is not a real aarch64 syscall and is not in the table.
         let req = SyscallRequest::new(999, SyscallArgs::from([0, 0, 0, 0, 0, 0]));
-        let outcome = d.dispatch(req, &mut mem, &mut reporter).expect("must not error");
-        assert_eq!(outcome, DispatchOutcome::Errno { errno: LINUX_ENOSYS });
+        let outcome = d
+            .dispatch(req, &mut mem, &reporter)
+            .expect("must not error");
+        assert_eq!(
+            outcome,
+            DispatchOutcome::Errno {
+                errno: LINUX_ENOSYS
+            }
+        );
     }
 
     /// The Linux errno constants we publish must match the

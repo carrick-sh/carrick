@@ -279,7 +279,10 @@ mod tests {
         m.mount("/proc/net", mount("procnet"));
         assert_eq!(m.resolve("/etc/hosts").unwrap().vfs.name(), "root");
         assert_eq!(m.resolve("/proc/cpuinfo").unwrap().vfs.name(), "proc");
-        assert_eq!(m.resolve("/proc/net/if_inet6").unwrap().vfs.name(), "procnet");
+        assert_eq!(
+            m.resolve("/proc/net/if_inet6").unwrap().vfs.name(),
+            "procnet"
+        );
         // The mount root itself routes to that mount, not its parent.
         assert_eq!(m.resolve("/proc").unwrap().vfs.name(), "proc");
         assert_eq!(m.resolve("/proc/net").unwrap().vfs.name(), "procnet");
@@ -294,7 +297,10 @@ mod tests {
         m.mount("/", mount("root"));
         assert_eq!(m.resolve("/etc/hosts").unwrap().vfs.name(), "root");
         assert_eq!(m.resolve("/proc/cpuinfo").unwrap().vfs.name(), "proc");
-        assert_eq!(m.resolve("/proc/net/if_inet6").unwrap().vfs.name(), "procnet");
+        assert_eq!(
+            m.resolve("/proc/net/if_inet6").unwrap().vfs.name(),
+            "procnet"
+        );
     }
 
     #[test]
@@ -332,7 +338,10 @@ mod tests {
         m.mount("/proc", mount("proc"));
         m.mount("/", mount("root"));
         assert_eq!(m.resolve("/proc/./cpuinfo").unwrap().vfs.name(), "proc");
-        assert_eq!(m.resolve("/proc/net/../cpuinfo").unwrap().vfs.name(), "proc");
+        assert_eq!(
+            m.resolve("/proc/net/../cpuinfo").unwrap().vfs.name(),
+            "proc"
+        );
         // .. that escapes the root is rejected.
         assert!(m.resolve("/../etc").is_none());
         assert!(m.resolve("/a/../../etc").is_none());

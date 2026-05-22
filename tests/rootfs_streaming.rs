@@ -1,15 +1,26 @@
 // clippy's unwrap_used/expect_used deny applies to integration tests too;
 // allow them here as this is test scaffolding code, not production code.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::cloned_ref_to_slice_refs)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::cloned_ref_to_slice_refs
+)]
 use std::io::Write;
 use std::path::PathBuf;
 
-fn write_tar(dir: &std::path::Path, name: &str, build: impl FnOnce(&mut tar::Builder<Vec<u8>>)) -> PathBuf {
+fn write_tar(
+    dir: &std::path::Path,
+    name: &str,
+    build: impl FnOnce(&mut tar::Builder<Vec<u8>>),
+) -> PathBuf {
     let mut b = tar::Builder::new(Vec::new());
     build(&mut b);
     let bytes = b.into_inner().unwrap();
     let p = dir.join(name);
-    std::fs::File::create(&p).unwrap().write_all(&bytes).unwrap();
+    std::fs::File::create(&p)
+        .unwrap()
+        .write_all(&bytes)
+        .unwrap();
     p
 }
 
@@ -19,27 +30,49 @@ fn extracts_file_dir_symlink_with_mode() {
     let scratch = tempfile::TempDir::new().unwrap();
     let layer = write_tar(tmp.path(), "l0.tar", |b| {
         let mut h = tar::Header::new_gnu();
-        h.set_entry_type(tar::EntryType::Directory); h.set_mode(0o755); h.set_size(0);
+        h.set_entry_type(tar::EntryType::Directory);
+        h.set_mode(0o755);
+        h.set_size(0);
         b.append_data(&mut h, "etc/", std::io::empty()).unwrap();
         let data = b"hello\n";
         let mut h2 = tar::Header::new_gnu();
-        h2.set_entry_type(tar::EntryType::Regular); h2.set_mode(0o600); h2.set_size(data.len() as u64);
+        h2.set_entry_type(tar::EntryType::Regular);
+        h2.set_mode(0o600);
+        h2.set_size(data.len() as u64);
         b.append_data(&mut h2, "etc/motd", &data[..]).unwrap();
         let mut h3 = tar::Header::new_gnu();
-        h3.set_entry_type(tar::EntryType::Symlink); h3.set_size(0);
+        h3.set_entry_type(tar::EntryType::Symlink);
+        h3.set_size(0);
         h3.set_link_name("motd").unwrap();
         b.append_link(&mut h3, "etc/motd.link", "motd").unwrap();
     });
-    let dir = cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority()).unwrap();
+    let dir =
+        cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority()).unwrap();
     let stats = carrick::rootfs::extract_layer_paths_to_dir(&[layer], &dir).unwrap();
     assert_eq!(stats.files, 1);
     assert_eq!(stats.dirs, 1);
     assert_eq!(stats.symlinks, 1);
     assert!(scratch.path().join("etc/motd").is_file());
-    assert_eq!(std::fs::read(scratch.path().join("etc/motd")).unwrap(), b"hello\n");
+    assert_eq!(
+        std::fs::read(scratch.path().join("etc/motd")).unwrap(),
+        b"hello\n"
+    );
     use std::os::unix::fs::PermissionsExt;
-    assert_eq!(std::fs::metadata(scratch.path().join("etc/motd")).unwrap().permissions().mode() & 0o777, 0o600);
-    assert_eq!(std::fs::read_link(scratch.path().join("etc/motd.link")).unwrap().to_str().unwrap(), "motd");
+    assert_eq!(
+        std::fs::metadata(scratch.path().join("etc/motd"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    assert_eq!(
+        std::fs::read_link(scratch.path().join("etc/motd.link"))
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "motd"
+    );
 }
 
 #[test]
@@ -47,22 +80,35 @@ fn later_layer_overrides_and_whiteout_deletes() {
     let tmp = tempfile::TempDir::new().unwrap();
     let scratch = tempfile::TempDir::new().unwrap();
     let l0 = write_tar(tmp.path(), "l0.tar", |b| {
-        let d = b"v0"; let mut h = tar::Header::new_gnu();
-        h.set_entry_type(tar::EntryType::Regular); h.set_mode(0o644); h.set_size(d.len() as u64);
+        let d = b"v0";
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Regular);
+        h.set_mode(0o644);
+        h.set_size(d.len() as u64);
         b.append_data(&mut h, "a.txt", &d[..]).unwrap();
-        let d2 = b"keep"; let mut h2 = tar::Header::new_gnu();
-        h2.set_entry_type(tar::EntryType::Regular); h2.set_mode(0o644); h2.set_size(d2.len() as u64);
+        let d2 = b"keep";
+        let mut h2 = tar::Header::new_gnu();
+        h2.set_entry_type(tar::EntryType::Regular);
+        h2.set_mode(0o644);
+        h2.set_size(d2.len() as u64);
         b.append_data(&mut h2, "b.txt", &d2[..]).unwrap();
     });
     let l1 = write_tar(tmp.path(), "l1.tar", |b| {
-        let d = b"v1"; let mut h = tar::Header::new_gnu();
-        h.set_entry_type(tar::EntryType::Regular); h.set_mode(0o644); h.set_size(d.len() as u64);
-        b.append_data(&mut h, "a.txt", &d[..]).unwrap();        // override
-        let mut hw = tar::Header::new_gnu();                     // whiteout b.txt
-        hw.set_entry_type(tar::EntryType::Regular); hw.set_mode(0o644); hw.set_size(0);
-        b.append_data(&mut hw, ".wh.b.txt", std::io::empty()).unwrap();
+        let d = b"v1";
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Regular);
+        h.set_mode(0o644);
+        h.set_size(d.len() as u64);
+        b.append_data(&mut h, "a.txt", &d[..]).unwrap(); // override
+        let mut hw = tar::Header::new_gnu(); // whiteout b.txt
+        hw.set_entry_type(tar::EntryType::Regular);
+        hw.set_mode(0o644);
+        hw.set_size(0);
+        b.append_data(&mut hw, ".wh.b.txt", std::io::empty())
+            .unwrap();
     });
-    let dir = cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority()).unwrap();
+    let dir =
+        cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority()).unwrap();
     carrick::rootfs::extract_layer_paths_to_dir(&[l0, l1], &dir).unwrap();
     assert_eq!(std::fs::read(scratch.path().join("a.txt")).unwrap(), b"v1");
     assert!(!scratch.path().join("b.txt").exists());
@@ -73,19 +119,29 @@ fn opaque_whiteout_clears_dir() {
     let tmp = tempfile::TempDir::new().unwrap();
     let scratch = tempfile::TempDir::new().unwrap();
     let l0 = write_tar(tmp.path(), "l0.tar", |b| {
-        let d = b"x"; let mut h = tar::Header::new_gnu();
-        h.set_entry_type(tar::EntryType::Regular); h.set_mode(0o644); h.set_size(d.len() as u64);
+        let d = b"x";
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Regular);
+        h.set_mode(0o644);
+        h.set_size(d.len() as u64);
         b.append_data(&mut h, "d/old.txt", &d[..]).unwrap();
     });
     let l1 = write_tar(tmp.path(), "l1.tar", |b| {
         let mut hq = tar::Header::new_gnu();
-        hq.set_entry_type(tar::EntryType::Regular); hq.set_mode(0o644); hq.set_size(0);
-        b.append_data(&mut hq, "d/.wh..wh..opq", std::io::empty()).unwrap();
-        let d = b"new"; let mut h = tar::Header::new_gnu();
-        h.set_entry_type(tar::EntryType::Regular); h.set_mode(0o644); h.set_size(d.len() as u64);
+        hq.set_entry_type(tar::EntryType::Regular);
+        hq.set_mode(0o644);
+        hq.set_size(0);
+        b.append_data(&mut hq, "d/.wh..wh..opq", std::io::empty())
+            .unwrap();
+        let d = b"new";
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Regular);
+        h.set_mode(0o644);
+        h.set_size(d.len() as u64);
         b.append_data(&mut h, "d/new.txt", &d[..]).unwrap();
     });
-    let dir = cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority()).unwrap();
+    let dir =
+        cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority()).unwrap();
     carrick::rootfs::extract_layer_paths_to_dir(&[l0, l1], &dir).unwrap();
     assert!(!scratch.path().join("d/old.txt").exists());
     assert!(scratch.path().join("d/new.txt").is_file());
@@ -106,10 +162,13 @@ fn skips_special_file() {
         // Also add a regular file to confirm processing continues
         let data = b"ok";
         let mut h2 = tar::Header::new_gnu();
-        h2.set_entry_type(tar::EntryType::Regular); h2.set_mode(0o644); h2.set_size(data.len() as u64);
+        h2.set_entry_type(tar::EntryType::Regular);
+        h2.set_mode(0o644);
+        h2.set_size(data.len() as u64);
         b.append_data(&mut h2, "readme.txt", &data[..]).unwrap();
     });
-    let dir = cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority()).unwrap();
+    let dir =
+        cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority()).unwrap();
     let stats = carrick::rootfs::extract_layer_paths_to_dir(&[layer], &dir).unwrap();
     assert_eq!(stats.skipped_special, 1);
     assert_eq!(stats.files, 1);
@@ -144,10 +203,18 @@ fn rejects_path_escape() {
                 // path accepted by builder; the extractor must reject it
                 b.append_data(&mut h, "../evil", &data[..]).unwrap();
                 let bytes = b.into_inner().unwrap();
-                std::fs::File::create(&layer_path).unwrap().write_all(&bytes).unwrap();
-                let dir = cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority()).unwrap();
+                std::fs::File::create(&layer_path)
+                    .unwrap()
+                    .write_all(&bytes)
+                    .unwrap();
+                let dir = cap_std::fs::Dir::open_ambient_dir(
+                    scratch.path(),
+                    cap_std::ambient_authority(),
+                )
+                .unwrap();
                 // Should return an error (UnsafePath from normalize_layer_path)
-                let result = carrick::rootfs::extract_layer_paths_to_dir(&[layer_path.clone()], &dir);
+                let result =
+                    carrick::rootfs::extract_layer_paths_to_dir(&[layer_path.clone()], &dir);
                 assert!(result.is_err(), "expected path escape to be rejected");
                 // Confirm nothing was written outside scratch
                 assert!(!tmp.path().join("evil").exists());

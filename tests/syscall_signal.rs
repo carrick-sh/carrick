@@ -11,7 +11,7 @@ use support::*;
 #[test]
 fn rt_signal_stubs_zero_old_state() {
     let mut memory = LinearMemory::new(0x4000, vec![0xff; 0x200]);
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     assert_eq!(
@@ -19,7 +19,7 @@ fn rt_signal_stubs_zero_old_state() {
             .dispatch(
                 SyscallRequest::new(135, SyscallArgs::from([0, 0, 0x4000, 8, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -30,7 +30,7 @@ fn rt_signal_stubs_zero_old_state() {
             .dispatch(
                 SyscallRequest::new(134, SyscallArgs::from([2, 0, 0x4010, 8, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -45,7 +45,6 @@ fn rt_signal_stubs_zero_old_state() {
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
-
 #[test]
 fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
     const LINUX_EINTR: i32 = 4;
@@ -56,7 +55,7 @@ fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
     const LINUX_ENOSYS: i32 = 38;
 
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     // rt_sigsuspend(mask=0x4000, sigsetsize=8) -> EINTR (no signals to wake us).
@@ -65,12 +64,10 @@ fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
             .dispatch(
                 SyscallRequest::new(133, SyscallArgs::from([0x4000, 8, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno {
-            errno: LINUX_EINTR
-        }
+        DispatchOutcome::Errno { errno: LINUX_EINTR }
     );
     // rt_sigsuspend with wrong sigsetsize -> EINVAL.
     assert_eq!(
@@ -78,7 +75,7 @@ fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
             .dispatch(
                 SyscallRequest::new(133, SyscallArgs::from([0x4000, 9, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno {
@@ -91,7 +88,7 @@ fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
             .dispatch(
                 SyscallRequest::new(133, SyscallArgs::from([0xdead_0000, 8, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno {
@@ -105,7 +102,7 @@ fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
             .dispatch(
                 SyscallRequest::new(137, SyscallArgs::from([0x4000, 0, 0, 8, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno {
@@ -121,7 +118,7 @@ fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
             .dispatch(
                 SyscallRequest::new(137, SyscallArgs::from([0x4000, 0, 0x4040, 8, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno {
@@ -134,7 +131,7 @@ fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
             .dispatch(
                 SyscallRequest::new(137, SyscallArgs::from([0x4000, 0, 0, 9, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno {
@@ -150,7 +147,7 @@ fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
             .dispatch(
                 SyscallRequest::new(137, SyscallArgs::from([0x4000, 0, 0x4040, 8, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno {
@@ -164,7 +161,7 @@ fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
             .dispatch(
                 SyscallRequest::new(138, SyscallArgs::from([1, 65, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno {
@@ -177,7 +174,7 @@ fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
             .dispatch(
                 SyscallRequest::new(138, SyscallArgs::from([99, 1, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: LINUX_ESRCH }
@@ -188,7 +185,7 @@ fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
             .dispatch(
                 SyscallRequest::new(138, SyscallArgs::from([1, 1, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno {
@@ -204,7 +201,7 @@ fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
             .dispatch(
                 SyscallRequest::new(139, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::SigReturn
@@ -215,7 +212,6 @@ fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
-
 #[test]
 fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
     const LINUX_EINVAL: i32 = 22;
@@ -225,7 +221,7 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
     // signal for the runtime's between-trap delivery pass.
 
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     // kill(1, 0) -> existence check, success.
@@ -234,7 +230,7 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
             .dispatch(
                 SyscallRequest::new(129, SyscallArgs::from([1, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -245,7 +241,7 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
             .dispatch(
                 SyscallRequest::new(129, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -256,7 +252,7 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
             .dispatch(
                 SyscallRequest::new(129, SyscallArgs::from([1, 65, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno {
@@ -269,7 +265,7 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
             .dispatch(
                 SyscallRequest::new(129, SyscallArgs::from([99, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: LINUX_ESRCH }
@@ -281,7 +277,7 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
             .dispatch(
                 SyscallRequest::new(129, SyscallArgs::from([1, 15, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -296,7 +292,7 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
             .dispatch(
                 SyscallRequest::new(130, SyscallArgs::from([1, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -306,7 +302,7 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
             .dispatch(
                 SyscallRequest::new(130, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: LINUX_ESRCH }
@@ -317,7 +313,7 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
             .dispatch(
                 SyscallRequest::new(130, SyscallArgs::from([1, 65, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno {
@@ -329,7 +325,7 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
             .dispatch(
                 SyscallRequest::new(130, SyscallArgs::from([99, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: LINUX_ESRCH }
@@ -340,7 +336,7 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
             .dispatch(
                 SyscallRequest::new(130, SyscallArgs::from([1, 1, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -353,7 +349,7 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
             .dispatch(
                 SyscallRequest::new(131, SyscallArgs::from([1, 1, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -364,7 +360,7 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
             .dispatch(
                 SyscallRequest::new(131, SyscallArgs::from([1, 1, 65, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno {
@@ -377,7 +373,7 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
             .dispatch(
                 SyscallRequest::new(131, SyscallArgs::from([99, 1, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: LINUX_ESRCH }
@@ -387,7 +383,7 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
             .dispatch(
                 SyscallRequest::new(131, SyscallArgs::from([1, 99, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: LINUX_ESRCH }
@@ -398,7 +394,7 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
             .dispatch(
                 SyscallRequest::new(131, SyscallArgs::from([1, 1, 1, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -407,7 +403,6 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
-
 
 #[test]
 fn sigaltstack_bootstrap_zeroes_old_stack_and_validates_new() {
@@ -418,7 +413,7 @@ fn sigaltstack_bootstrap_zeroes_old_stack_and_validates_new() {
     const LINUX_MINSIGSTKSZ: u64 = 2048;
 
     let mut memory = LinearMemory::new(0x4000, vec![0xaa; 0x200]);
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     let old_ptr: u64 = 0x4000;
@@ -431,7 +426,7 @@ fn sigaltstack_bootstrap_zeroes_old_stack_and_validates_new() {
             .dispatch(
                 SyscallRequest::new(132, SyscallArgs::from([0, old_ptr, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -455,7 +450,7 @@ fn sigaltstack_bootstrap_zeroes_old_stack_and_validates_new() {
             .dispatch(
                 SyscallRequest::new(132, SyscallArgs::from([new_ptr, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -474,7 +469,7 @@ fn sigaltstack_bootstrap_zeroes_old_stack_and_validates_new() {
             .dispatch(
                 SyscallRequest::new(132, SyscallArgs::from([new_ptr, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno {
@@ -495,7 +490,7 @@ fn sigaltstack_bootstrap_zeroes_old_stack_and_validates_new() {
             .dispatch(
                 SyscallRequest::new(132, SyscallArgs::from([new_ptr, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno {
@@ -516,7 +511,7 @@ fn sigaltstack_bootstrap_zeroes_old_stack_and_validates_new() {
             .dispatch(
                 SyscallRequest::new(132, SyscallArgs::from([new_ptr, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -524,4 +519,3 @@ fn sigaltstack_bootstrap_zeroes_old_stack_and_validates_new() {
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
-

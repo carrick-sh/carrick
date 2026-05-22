@@ -110,12 +110,7 @@ pub fn fork_pre(pc: u64, elr: u64, cpsr: u64) {
 // (it gates on `is_enabled()` in asm before calling), so `getpid()`
 // is genuinely zero-cost when no DTrace consumer is attached.
 pub fn path_open(path: &str, result_size: u64, errno: i32) {
-    carrick_usdt::path__open!(|| (
-        libc::getpid() as u32,
-        path,
-        result_size,
-        errno
-    ));
+    carrick_usdt::path__open!(|| (libc::getpid() as u32, path, result_size, errno));
 }
 
 pub fn guest_exit(code: i32) {
@@ -129,11 +124,7 @@ pub fn execve_argv(path: &str, argv: &[String]) {
     // unconditional join is acceptable; the hot paths above are the
     // ones that matter for zero-cost-when-disabled.
     let joined = argv.join(" ");
-    carrick_usdt::execve__argv!(|| (
-        libc::getpid() as u32,
-        path,
-        joined.as_str()
-    ));
+    carrick_usdt::execve__argv!(|| (libc::getpid() as u32, path, joined.as_str()));
 }
 
 pub fn fs_op(op: &str, path: &str, errno: i32) {
@@ -141,15 +132,8 @@ pub fn fs_op(op: &str, path: &str, errno: i32) {
 }
 
 pub fn host_pipe_io(host_fd: i32, dir: i32, n: i64) {
-    carrick_usdt::host__pipe__io!(|| (
-        libc::getpid() as u32,
-        host_fd,
-        dir,
-        n
-    ));
+    carrick_usdt::host__pipe__io!(|| (libc::getpid() as u32, host_fd, dir, n));
 }
-
-
 
 pub fn fork_post(pid: i32, pc: u64, elr: u64) {
     carrick_usdt::fork__post!(|| (pid, pc, elr));
@@ -185,7 +169,6 @@ pub fn vcpu_trap(regs: &crate::compat::GuestRegs) {
     let ptr = regs as *const crate::compat::GuestRegs as u64;
     carrick_usdt::vcpu__trap!(|| ptr);
 }
-
 
 pub fn execve_loaded(path: &str, entry: u64, initial_sp: u64, mapping_count: u64) {
     carrick_usdt::execve__loaded!(|| (path, entry, initial_sp, mapping_count));

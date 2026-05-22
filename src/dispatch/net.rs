@@ -3,8 +3,75 @@
 use super::*;
 
 impl SyscallDispatcher {
+    pub(super) fn dispatch_threaded_net<M: GuestMemory>(
+        &self,
+        request: SyscallRequest,
+        memory: &mut M,
+        reporter: &CompatReporter,
+    ) -> Option<Result<DispatchOutcome, DispatchError>> {
+        match request.number {
+            19..=22 | 72 | 73 | 198..=212 | 242 | 243 | 269 => {}
+            _ => return None,
+        }
+
+        let syscall = lookup_aarch64(request.number);
+        let name = syscall.map_or("unknown", |syscall| syscall.name);
+        reporter.record(CompatEvent::SyscallEntry {
+            number: request.number,
+            name: name.to_owned(),
+            args: request.args,
+        });
+
+        let mut ctx = SyscallCtx {
+            request,
+            memory,
+            reporter,
+            thread: None,
+        };
+        let outcome = match match request.number {
+            19 => self.eventfd2(&mut ctx),
+            20 => self.epoll_create1(&mut ctx),
+            21 => self.epoll_ctl(&mut ctx),
+            22 => self.epoll_pwait(&mut ctx),
+            72 => self.pselect6(&mut ctx),
+            73 => self.ppoll(&mut ctx),
+            198 => self.socket(&mut ctx),
+            199 => self.socketpair(&mut ctx),
+            200 => self.bind(&mut ctx),
+            201 => self.listen(&mut ctx),
+            202 => self.accept(&mut ctx),
+            203 => self.connect(&mut ctx),
+            204 => self.getsockname(&mut ctx),
+            205 => self.getpeername(&mut ctx),
+            206 => self.sendto(&mut ctx),
+            207 => self.recvfrom(&mut ctx),
+            208 => self.setsockopt(&mut ctx),
+            209 => self.getsockopt(&mut ctx),
+            210 => self.shutdown(&mut ctx),
+            211 => self.sendmsg(&mut ctx),
+            212 => self.recvmsg(&mut ctx),
+            242 => self.accept4(&mut ctx),
+            243 => self.sys_recvmmsg(&mut ctx),
+            269 => self.sys_sendmmsg(&mut ctx),
+            _ => unreachable!("unsupported threaded net syscall"),
+        } {
+            Ok(outcome) => outcome,
+            Err(error) => return Some(Err(error)),
+        };
+
+        let (retval, errno) = outcome.retval_errno();
+        reporter.record(CompatEvent::SyscallReturn {
+            number: request.number,
+            name: name.to_owned(),
+            retval,
+            errno,
+        });
+
+        Some(Ok(outcome))
+    }
+
     pub(super) fn eventfd2<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let initial_value = ctx.arg(0);
@@ -23,7 +90,7 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn epoll_create1<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let flags = ctx.arg(0);
@@ -40,7 +107,7 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn epoll_ctl<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let memory = &*ctx.memory;
@@ -52,10 +119,10 @@ impl SyscallDispatcher {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         }
 
-        let Some(open_file) = self.io.open_files.get(&epfd) else {
+        let Some(open_file) = self.open_file(epfd) else {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         };
-        let mut open = open_file.description.borrow_mut();
+        let mut open = open_file.description.write();
         let OpenDescription::Epoll { interest, .. } = &mut *open else {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
@@ -105,13 +172,13 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn epoll_pwait<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let epfd = ctx.arg(0) as i32;
         let events_address = ctx.arg(1);
-        let max_events = usize::try_from(ctx.arg(2))
-            .map_err(|_| DispatchError::LengthTooLarge(ctx.arg(2)))?;
+        let max_events =
+            usize::try_from(ctx.arg(2)).map_err(|_| DispatchError::LengthTooLarge(ctx.arg(2)))?;
         let memory = &mut *ctx.memory;
         if max_events == 0 {
             return Ok(DispatchOutcome::Errno {
@@ -119,11 +186,11 @@ impl SyscallDispatcher {
             });
         }
 
-        let Some(open_file) = self.io.open_files.get(&epfd) else {
+        let Some(open_file) = self.open_file(epfd) else {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         };
         let interests = {
-            let open = open_file.description.borrow();
+            let open = open_file.description.read();
             let OpenDescription::Epoll { interest, .. } = &*open else {
                 return Ok(DispatchOutcome::Errno {
                     errno: LINUX_EINVAL,
@@ -175,10 +242,10 @@ impl SyscallDispatcher {
     }
 
     fn epoll_ready_events(&self, fd: i32, requested_events: u32) -> u32 {
-        let Some(open_file) = self.io.open_files.get(&fd) else {
+        let Some(open_file) = self.open_file(fd) else {
             return 0;
         };
-        let open = open_file.description.borrow();
+        let open = open_file.description.read();
         match &*open {
             OpenDescription::EventFd { counter, .. }
                 if *counter > 0 && requested_events & LINUX_EPOLLIN != 0 =>
@@ -186,7 +253,7 @@ impl SyscallDispatcher {
                 LINUX_EPOLLIN
             }
             OpenDescription::PipeReader { pipe, .. } if requested_events & LINUX_EPOLLIN != 0 => {
-                let pipe = pipe.borrow();
+                let pipe = pipe.lock();
                 if !pipe.buffer.is_empty() || pipe.writers == 0 {
                     LINUX_EPOLLIN
                 } else {
@@ -257,18 +324,18 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn pselect6<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let nfds = usize::try_from(ctx.arg(0))
-            .map_err(|_| DispatchError::LengthTooLarge(ctx.arg(0)))?;
+        let nfds =
+            usize::try_from(ctx.arg(0)).map_err(|_| DispatchError::LengthTooLarge(ctx.arg(0)))?;
         let readfds_addr = ctx.arg(1);
         let writefds_addr = ctx.arg(2);
         let exceptfds_addr = ctx.arg(3);
         let timeout_addr = ctx.arg(4);
         let request = &ctx.request;
         let memory = &mut *ctx.memory;
-        let reporter = &mut *ctx.reporter;
+        let reporter = ctx.reporter;
 
         // Decode timespec → millis for libc::poll. NULL = block forever (-1).
         let timeout_ms: i32 = if timeout_addr == 0 {
@@ -278,9 +345,7 @@ impl SyscallDispatcher {
                 Ok(b) if b.len() == 16 => {
                     let sec = i64::from_le_bytes(b[0..8].try_into().unwrap_or([0; 8]));
                     let nsec = i64::from_le_bytes(b[8..16].try_into().unwrap_or([0; 8]));
-                    let ms = sec
-                        .saturating_mul(1000)
-                        .saturating_add(nsec / 1_000_000);
+                    let ms = sec.saturating_mul(1000).saturating_add(nsec / 1_000_000);
                     if ms <= 0 {
                         0
                     } else if ms > i32::MAX as i64 {
@@ -330,13 +395,25 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
             }
             let mut events: i16 = 0;
-            if r { events |= libc::POLLIN; }
-            if w { events |= libc::POLLOUT; }
-            if e { events |= libc::POLLPRI; }
+            if r {
+                events |= libc::POLLIN;
+            }
+            if w {
+                events |= libc::POLLOUT;
+            }
+            if e {
+                events |= libc::POLLPRI;
+            }
             let mut req_mask: i16 = 0;
-            if r { req_mask |= 0x01; }
-            if w { req_mask |= 0x02; }
-            if e { req_mask |= 0x04; }
+            if r {
+                req_mask |= 0x01;
+            }
+            if w {
+                req_mask |= 0x02;
+            }
+            if e {
+                req_mask |= 0x04;
+            }
             owners.push((fd_i32, req_mask));
             events_list.push(events);
             host_map.push(self.host_fd_for_poll(fd_i32));
@@ -360,13 +437,23 @@ impl SyscallDispatcher {
             let mut pollfds: Vec<libc::pollfd> = host_fds
                 .iter()
                 .zip(events_list.iter())
-                .map(|(hf, ev)| libc::pollfd { fd: *hf, events: *ev, revents: 0 })
+                .map(|(hf, ev)| libc::pollfd {
+                    fd: *hf,
+                    events: *ev,
+                    revents: 0,
+                })
                 .collect();
             let n = unsafe {
-                libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, timeout_ms)
+                libc::poll(
+                    pollfds.as_mut_ptr(),
+                    pollfds.len() as libc::nfds_t,
+                    timeout_ms,
+                )
             };
             if n < 0 {
-                return Ok(DispatchOutcome::Errno { errno: host_errno() });
+                return Ok(DispatchOutcome::Errno {
+                    errno: host_errno(),
+                });
             }
             for (slot, p) in revents.iter_mut().zip(pollfds.iter()) {
                 *slot = p.revents;
@@ -418,39 +505,78 @@ impl SyscallDispatcher {
         let pollfds: Vec<libc::pollfd> = owners
             .iter()
             .zip(revents.iter())
-            .map(|((fd, _), rev)| libc::pollfd { fd: *fd, events: 0, revents: *rev })
+            .map(|((fd, _), rev)| libc::pollfd {
+                fd: *fd,
+                events: 0,
+                revents: *rev,
+            })
             .collect();
 
         // Write back ready bits. Start with fully-cleared sets and only
         // set bits for fds that fired.
-        let mut new_read = read_set.clone().map(|mut s| { s.fill(0); s });
-        let mut new_write = write_set.clone().map(|mut s| { s.fill(0); s });
-        let mut new_except = except_set.clone().map(|mut s| { s.fill(0); s });
+        let mut new_read = read_set.clone().map(|mut s| {
+            s.fill(0);
+            s
+        });
+        let mut new_write = write_set.clone().map(|mut s| {
+            s.fill(0);
+            s
+        });
+        let mut new_except = except_set.clone().map(|mut s| {
+            s.fill(0);
+            s
+        });
         let mut ready = 0i64;
         for ((fd, req_mask), p) in owners.iter().zip(pollfds.iter()) {
             let fd_usize = *fd as usize;
             let revs = p.revents;
             let mut fired = false;
-            if (req_mask & 0x01) != 0 && (revs & (libc::POLLIN | libc::POLLHUP)) != 0
-                && let Some(ref mut set) = new_read { fd_set_set(set, fd_usize); fired = true; }
-            if (req_mask & 0x02) != 0 && (revs & libc::POLLOUT) != 0
-                && let Some(ref mut set) = new_write { fd_set_set(set, fd_usize); fired = true; }
-            if (req_mask & 0x04) != 0 && (revs & (libc::POLLPRI | libc::POLLERR)) != 0
-                && let Some(ref mut set) = new_except { fd_set_set(set, fd_usize); fired = true; }
-            if fired { ready += 1; }
+            if (req_mask & 0x01) != 0
+                && (revs & (libc::POLLIN | libc::POLLHUP)) != 0
+                && let Some(ref mut set) = new_read
+            {
+                fd_set_set(set, fd_usize);
+                fired = true;
+            }
+            if (req_mask & 0x02) != 0
+                && (revs & libc::POLLOUT) != 0
+                && let Some(ref mut set) = new_write
+            {
+                fd_set_set(set, fd_usize);
+                fired = true;
+            }
+            if (req_mask & 0x04) != 0
+                && (revs & (libc::POLLPRI | libc::POLLERR)) != 0
+                && let Some(ref mut set) = new_except
+            {
+                fd_set_set(set, fd_usize);
+                fired = true;
+            }
+            if fired {
+                ready += 1;
+            }
         }
         if let Some(s) = &new_read
-            && memory.write_bytes(readfds_addr, s).is_err() {
-                return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
-            }
+            && memory.write_bytes(readfds_addr, s).is_err()
+        {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EFAULT,
+            });
+        }
         if let Some(s) = &new_write
-            && memory.write_bytes(writefds_addr, s).is_err() {
-                return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
-            }
+            && memory.write_bytes(writefds_addr, s).is_err()
+        {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EFAULT,
+            });
+        }
         if let Some(s) = &new_except
-            && memory.write_bytes(exceptfds_addr, s).is_err() {
-                return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
-            }
+            && memory.write_bytes(exceptfds_addr, s).is_err()
+        {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EFAULT,
+            });
+        }
         Ok(DispatchOutcome::Returned { value: ready })
     }
 
@@ -470,16 +596,16 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn ppoll<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let pollfds_address = ctx.arg(0);
-        let nfds = usize::try_from(ctx.arg(1))
-            .map_err(|_| DispatchError::LengthTooLarge(ctx.arg(1)))?;
+        let nfds =
+            usize::try_from(ctx.arg(1)).map_err(|_| DispatchError::LengthTooLarge(ctx.arg(1)))?;
         let timeout_address = ctx.arg(2);
         let request = &ctx.request;
         let memory = &mut *ctx.memory;
-        let reporter = &mut *ctx.reporter;
+        let reporter = ctx.reporter;
 
         // Decode timeout. NULL pointer means block forever; non-NULL points
         // to a `struct timespec { i64 tv_sec; i64 tv_nsec; }`. We translate
@@ -491,9 +617,7 @@ impl SyscallDispatcher {
                 Ok(b) if b.len() == 16 => {
                     let sec = i64::from_le_bytes(b[0..8].try_into().unwrap_or([0; 8]));
                     let nsec = i64::from_le_bytes(b[8..16].try_into().unwrap_or([0; 8]));
-                    let ms = sec
-                        .saturating_mul(1000)
-                        .saturating_add(nsec / 1_000_000);
+                    let ms = sec.saturating_mul(1000).saturating_add(nsec / 1_000_000);
                     if ms <= 0 {
                         0
                     } else if ms > i32::MAX as i64 {
@@ -519,12 +643,14 @@ impl SyscallDispatcher {
                 .checked_mul(pollfd_size)
                 .and_then(|offset| u64::try_from(offset).ok())
                 .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
-            let address = pollfds_address
-                .checked_add(offset)
-                .ok_or(LINUX_EFAULT);
+            let address = pollfds_address.checked_add(offset).ok_or(LINUX_EFAULT);
             let address = match address {
                 Ok(a) => a,
-                Err(_) => return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT }),
+                Err(_) => {
+                    return Ok(DispatchOutcome::Errno {
+                        errno: LINUX_EFAULT,
+                    });
+                }
             };
             let pollfd = match read_pollfd(memory, address) {
                 Ok(p) => p,
@@ -535,10 +661,7 @@ impl SyscallDispatcher {
         }
         // Map guest fds → host fds where possible. Fast path requires
         // every fd be host-backed (stdio bare, HostPipe, HostSocket).
-        let host_fds: Option<Vec<i32>> = fds
-            .iter()
-            .map(|p| self.host_fd_for_poll(p.fd))
-            .collect();
+        let host_fds: Option<Vec<i32>> = fds.iter().map(|p| self.host_fd_for_poll(p.fd)).collect();
         if let Some(host_fds) = host_fds {
             let mut sys_pollfds: Vec<libc::pollfd> = fds
                 .iter()
@@ -550,7 +673,7 @@ impl SyscallDispatcher {
                 })
                 .collect();
             // NON-BLOCKING probe (timeout 0): we must NEVER block here — this
-            // runs while holding the big kernel lock, and blocking would starve
+            // runs while holding the dispatcher lock, and blocking would starve
             // every sibling thread (the GIL handoff, a server's workers). If
             // nothing is ready and the guest asked to wait, hand off to the
             // runtime via WaitOnFds, which waits with the lock RELEASED.
@@ -589,12 +712,13 @@ impl SyscallDispatcher {
             } else {
                 Some(std::time::Duration::from_millis(timeout_ms as u64))
             };
-            let wait_fds: Vec<(i32, i16)> = sys_pollfds
-                .iter()
-                .map(|p| (p.fd, p.events))
-                .collect();
+            let wait_fds: Vec<(i32, i16)> = sys_pollfds.iter().map(|p| (p.fd, p.events)).collect();
             // poll/ppoll: a timeout means "no fds ready" → return 0.
-            return Ok(DispatchOutcome::WaitOnFds { fds: wait_fds, timeout, on_timeout: 0 });
+            return Ok(DispatchOutcome::WaitOnFds {
+                fds: wait_fds,
+                timeout,
+                on_timeout: 0,
+            });
         }
 
         // Mixed / synthetic fds: fall back to the per-fd readiness check
@@ -658,8 +782,8 @@ impl SyscallDispatcher {
             // (revents=0), which is the right semantic. Pass it through.
             return Some(fd);
         }
-        if let Some(open_file) = self.io.open_files.get(&fd) {
-            let open = open_file.description.borrow();
+        if let Some(open_file) = self.open_file(fd) {
+            let open = open_file.description.read();
             return match &*open {
                 OpenDescription::HostPipe { host_fd, .. }
                 | OpenDescription::HostSocket { host_fd, .. }
@@ -682,10 +806,10 @@ impl SyscallDispatcher {
     /// mode here; `blocking_io` consults this to decide EAGAIN vs a lockless
     /// wait. Bare stdio / unknown fds report 0 (blocking), the safe default.
     pub(super) fn fd_status_flags(&self, fd: i32) -> u64 {
-        let Some(open_file) = self.io.open_files.get(&fd) else {
+        let Some(open_file) = self.open_file(fd) else {
             return 0;
         };
-        match &*open_file.description.borrow() {
+        match &*open_file.description.read() {
             OpenDescription::HostSocket { status_flags, .. }
             | OpenDescription::HostPipe { status_flags, .. }
             | OpenDescription::HostFile { status_flags, .. }
@@ -704,12 +828,12 @@ impl SyscallDispatcher {
     /// data into guest memory). The classification is uniform:
     ///   * `Ok(n)`            → the syscall returns `n`.
     ///   * `Err(EAGAIN)`      → guest non-blocking fd: EAGAIN; guest blocking
-    ///                          fd: `WaitOnFds` (the runtime waits with the
-    ///                          kernel lock RELEASED, then re-dispatches).
+    ///     fd: `WaitOnFds` (the runtime waits with the dispatcher lock
+    ///     RELEASED, then re-dispatches).
     ///   * `Err(other)`       → that errno.
     ///
     /// INVARIANT: `host_fd` MUST be `O_NONBLOCK`. If it isn't, `op` could block
-    /// inside libc while we hold the big kernel lock and starve every sibling
+    /// inside libc while we hold the dispatcher lock and starve every sibling
     /// thread — the exact bug this design exists to prevent. We assert it
     /// loudly in debug/test builds and self-heal (force non-blocking) in
     /// release so a missed creation site can never silently reintroduce the
@@ -724,10 +848,12 @@ impl SyscallDispatcher {
                 if nonblocking {
                     // Guest wants non-blocking (fd O_NONBLOCK or per-call
                     // MSG_DONTWAIT): report EAGAIN, don't wait.
-                    DispatchOutcome::Errno { errno: LINUX_EAGAIN }
+                    DispatchOutcome::Errno {
+                        errno: LINUX_EAGAIN,
+                    }
                 } else {
                     // Blocking-mode: hand off to the runtime to wait on host-fd
-                    // readiness with the kernel lock RELEASED (per-thread
+                    // readiness with the dispatcher lock RELEASED (per-thread
                     // kqueue), then re-dispatch. SO_RCVTIMEO/SO_SNDTIMEO not yet
                     // modelled → block forever (signal-interruptible); when
                     // added, pass the deadline + on_timeout=-EAGAIN.
@@ -746,15 +872,14 @@ impl SyscallDispatcher {
     /// EAGAIN (true) rather than block: the guest fd is O_NONBLOCK, or the call
     /// carries MSG_DONTWAIT.
     pub(super) fn io_is_nonblocking(&self, fd: i32, msg_flags: i32) -> bool {
-        self.fd_status_flags(fd) & LINUX_O_NONBLOCK != 0
-            || (msg_flags & LINUX_MSG_DONTWAIT as i32) != 0
+        self.fd_status_flags(fd) & LINUX_O_NONBLOCK != 0 || (msg_flags & LINUX_MSG_DONTWAIT) != 0
     }
 
     fn poll_ready_events(&self, fd: i32, requested_events: i16) -> i16 {
         if fd < 0 {
             return 0;
         }
-        let Some(open_file) = self.io.open_files.get(&fd) else {
+        let Some(open_file) = self.open_file(fd) else {
             return if is_stdio_fd(fd) {
                 // fd 1/2 are always writable (we either buffer or stream
                 // straight to host write). For fd 0 we have to actually
@@ -785,7 +910,7 @@ impl SyscallDispatcher {
                 LINUX_POLLNVAL
             };
         };
-        let open = open_file.description.borrow();
+        let open = open_file.description.read();
         let mut ready = 0;
         match &*open {
             OpenDescription::File { .. } | OpenDescription::SyntheticFile { .. } => {
@@ -827,7 +952,7 @@ impl SyscallDispatcher {
             OpenDescription::Epoll { .. } => {}
             OpenDescription::PipeReader { pipe, .. } => {
                 if requested_events & LINUX_POLLIN != 0 {
-                    let pipe = pipe.borrow();
+                    let pipe = pipe.lock();
                     if !pipe.buffer.is_empty() {
                         ready |= LINUX_POLLIN;
                     }
@@ -837,7 +962,7 @@ impl SyscallDispatcher {
                 }
             }
             OpenDescription::PipeWriter { pipe, .. } => {
-                let pipe = pipe.borrow();
+                let pipe = pipe.lock();
                 if pipe.readers == 0 {
                     ready |= LINUX_POLLERR;
                 } else if requested_events & LINUX_POLLOUT != 0 {
@@ -924,7 +1049,7 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn socket<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let family = ctx.arg(0) as i32;
@@ -944,7 +1069,7 @@ impl SyscallDispatcher {
     /// Create a synthetic AF_NETLINK socket. Linux accepts SOCK_RAW and
     /// SOCK_DGRAM for netlink (they're equivalent there); other socket
     /// types are rejected with ESOCKTNOSUPPORT, matching the kernel.
-    fn netlink_socket(&mut self, type_: i32, protocol: i32) -> DispatchOutcome {
+    fn netlink_socket(&self, type_: i32, protocol: i32) -> DispatchOutcome {
         let nonblock = type_ & LINUX_SOCK_NONBLOCK != 0;
         let cloexec = type_ & LINUX_SOCK_CLOEXEC != 0;
         let base_type = type_ & !(LINUX_SOCK_NONBLOCK | LINUX_SOCK_CLOEXEC);
@@ -967,12 +1092,7 @@ impl SyscallDispatcher {
         )
     }
 
-    fn host_socket_install(
-        &mut self,
-        family: i32,
-        type_: i32,
-        protocol: i32,
-    ) -> DispatchOutcome {
+    fn host_socket_install(&self, family: i32, type_: i32, protocol: i32) -> DispatchOutcome {
         // Strip the Linux-only SOCK_NONBLOCK / SOCK_CLOEXEC bits before
         // we hand the type to macOS, then set them on the resulting fd
         // by hand.
@@ -983,7 +1103,9 @@ impl SyscallDispatcher {
         let host_type = linux_to_host_socktype(base_type);
         let host_fd = unsafe { libc::socket(host_family, host_type, protocol) };
         if host_fd < 0 {
-            return DispatchOutcome::Errno { errno: host_errno() };
+            return DispatchOutcome::Errno {
+                errno: host_errno(),
+            };
         }
         // Host fds keep their native blocking mode; carrick emulates the
         // guest's blocking via per-call MSG_DONTWAIT + a lockless kqueue wait
@@ -994,13 +1116,17 @@ impl SyscallDispatcher {
         let status_flags = if nonblock { LINUX_O_NONBLOCK } else { 0 };
         let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };
         let Some(linux_fd) = self.allocate_fd(3) else {
-            unsafe { libc::close(host_fd); }
-            return DispatchOutcome::Errno { errno: LINUX_EINVAL };
+            unsafe {
+                libc::close(host_fd);
+            }
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
         };
         self.insert_open_file(
             linux_fd,
             OpenFile {
-                description: Rc::new(RefCell::new(OpenDescription::HostSocket {
+                description: Arc::new(RwLock::new(OpenDescription::HostSocket {
                     host_fd,
                     family,
                     type_: base_type,
@@ -1009,11 +1135,13 @@ impl SyscallDispatcher {
                 fd_flags,
             },
         );
-        DispatchOutcome::Returned { value: linux_fd as i64 }
+        DispatchOutcome::Returned {
+            value: linux_fd as i64,
+        }
     }
 
     pub(super) fn socketpair<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let memory = &mut *ctx.memory;
@@ -1028,11 +1156,12 @@ impl SyscallDispatcher {
         let host_type = linux_to_host_socktype(base_type);
 
         let mut host_fds: [i32; 2] = [-1, -1];
-        let rc = unsafe {
-            libc::socketpair(host_family, host_type, protocol, host_fds.as_mut_ptr())
-        };
+        let rc =
+            unsafe { libc::socketpair(host_family, host_type, protocol, host_fds.as_mut_ptr()) };
         if rc != 0 {
-            return Ok(DispatchOutcome::Errno { errno: host_errno() });
+            return Ok(DispatchOutcome::Errno {
+                errno: host_errno(),
+            });
         }
         // Native blocking mode unless the guest asked for SOCK_NONBLOCK.
         if nonblock {
@@ -1042,22 +1171,37 @@ impl SyscallDispatcher {
         let status_flags = if nonblock { LINUX_O_NONBLOCK } else { 0 };
         let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };
         let Some(read_fd) = self.allocate_fd(3) else {
-            unsafe { libc::close(host_fds[0]); libc::close(host_fds[1]); }
-            return Ok(DispatchOutcome::Errno { errno: LINUX_EINVAL });
+            unsafe {
+                libc::close(host_fds[0]);
+                libc::close(host_fds[1]);
+            }
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            });
         };
         let Some(write_fd) = self.allocate_fd(read_fd.saturating_add(1)) else {
-            unsafe { libc::close(host_fds[0]); libc::close(host_fds[1]); }
-            return Ok(DispatchOutcome::Errno { errno: LINUX_EINVAL });
+            unsafe {
+                libc::close(host_fds[0]);
+                libc::close(host_fds[1]);
+            }
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            });
         };
         let pair = LinuxFdPair { read_fd, write_fd };
         if write_kernel_struct_raw(memory, sv_addr, &pair).is_err() {
-            unsafe { libc::close(host_fds[0]); libc::close(host_fds[1]); }
-            return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
+            unsafe {
+                libc::close(host_fds[0]);
+                libc::close(host_fds[1]);
+            }
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EFAULT,
+            });
         }
         self.insert_open_file(
             read_fd,
             OpenFile {
-                description: Rc::new(RefCell::new(OpenDescription::HostSocket {
+                description: Arc::new(RwLock::new(OpenDescription::HostSocket {
                     host_fd: host_fds[0],
                     family,
                     type_: base_type,
@@ -1069,7 +1213,7 @@ impl SyscallDispatcher {
         self.insert_open_file(
             write_fd,
             OpenFile {
-                description: Rc::new(RefCell::new(OpenDescription::HostSocket {
+                description: Arc::new(RwLock::new(OpenDescription::HostSocket {
                     host_fd: host_fds[1],
                     family,
                     type_: base_type,
@@ -1083,41 +1227,42 @@ impl SyscallDispatcher {
 
     /// Pull a (host_fd, family) pair out of the dispatcher's fd table.
     fn host_socket_lookup(&self, fd: i32) -> Result<(i32, i32), i32> {
-        let Some(open_file) = self.io.open_files.get(&fd) else {
+        let Some(open_file) = self.open_file(fd) else {
             return Err(LINUX_EBADF);
         };
-        let open = open_file.description.borrow();
+        let open = open_file.description.read();
         match &*open {
-            OpenDescription::HostSocket { host_fd, family, .. } => Ok((*host_fd, *family)),
+            OpenDescription::HostSocket {
+                host_fd, family, ..
+            } => Ok((*host_fd, *family)),
             _ => Err(LINUX_ENOTSOCK),
         }
     }
 
     /// True iff `fd` refers to a synthetic AF_NETLINK socket.
     fn fd_is_netlink(&self, fd: i32) -> bool {
-        self.io.open_files.get(&fd).is_some_and(|of| {
-            matches!(&*of.description.borrow(), OpenDescription::Netlink { .. })
-        })
+        self.open_file(fd)
+            .is_some_and(|of| matches!(&*of.description.read(), OpenDescription::Netlink { .. }))
     }
 
     /// Handle a netlink "send": parse the request and queue a synthetic
     /// rtnetlink dump reply (or a bare NLMSG_DONE for requests we don't
     /// specifically model). Returns the number of bytes "sent".
-    fn netlink_send(&mut self, fd: i32, request: &[u8]) -> DispatchOutcome {
-        let Some(open_file) = self.io.open_files.get(&fd) else {
+    fn netlink_send(&self, fd: i32, request: &[u8]) -> DispatchOutcome {
+        let Some(open_file) = self.open_file(fd) else {
             return DispatchOutcome::Errno { errno: LINUX_EBADF };
         };
         let reply = {
-            let open = open_file.description.borrow();
+            let open = open_file.description.read();
             let OpenDescription::Netlink { pid, .. } = &*open else {
-                return DispatchOutcome::Errno { errno: LINUX_ENOTSOCK };
+                return DispatchOutcome::Errno {
+                    errno: LINUX_ENOTSOCK,
+                };
             };
             let dest_pid = if *pid != 0 { *pid } else { std::process::id() };
             build_netlink_reply(request, dest_pid)
         };
-        if let OpenDescription::Netlink { recv_queue, .. } =
-            &mut *open_file.description.borrow_mut()
-        {
+        if let OpenDescription::Netlink { recv_queue, .. } = &mut *open_file.description.write() {
             recv_queue.extend(reply);
         }
         DispatchOutcome::Returned {
@@ -1127,7 +1272,7 @@ impl SyscallDispatcher {
 
     /// recvfrom path for netlink: drain queued reply bytes into guest memory.
     fn netlink_recv(
-        &mut self,
+        &self,
         fd: i32,
         buf_addr: u64,
         len: usize,
@@ -1135,7 +1280,9 @@ impl SyscallDispatcher {
     ) -> DispatchOutcome {
         let chunk = self.netlink_drain(fd, len);
         if !chunk.is_empty() && memory.write_bytes(buf_addr, &chunk).is_err() {
-            return DispatchOutcome::Errno { errno: LINUX_EFAULT };
+            return DispatchOutcome::Errno {
+                errno: LINUX_EFAULT,
+            };
         }
         DispatchOutcome::Returned {
             value: chunk.len() as i64,
@@ -1145,11 +1292,11 @@ impl SyscallDispatcher {
     /// Pop up to `max` bytes from the netlink recv queue. Our synthetic
     /// reply is built as one contiguous dump, so a single drain that fits
     /// the caller's buffer returns the whole thing.
-    fn netlink_drain(&mut self, fd: i32, max: usize) -> Vec<u8> {
-        let Some(open_file) = self.io.open_files.get(&fd) else {
+    fn netlink_drain(&self, fd: i32, max: usize) -> Vec<u8> {
+        let Some(open_file) = self.open_file(fd) else {
             return Vec::new();
         };
-        let mut open = open_file.description.borrow_mut();
+        let mut open = open_file.description.write();
         let OpenDescription::Netlink { recv_queue, .. } = &mut *open else {
             return Vec::new();
         };
@@ -1158,7 +1305,7 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn bind<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let memory = &*ctx.memory;
@@ -1168,22 +1315,22 @@ impl SyscallDispatcher {
         // AF_NETLINK bind: read the (optional) sockaddr_nl to pick up the
         // requested pid/groups, then assign a pid (the guest's own pid
         // when the caller passed 0, i.e. "let the kernel choose").
-        if let Some(open_file) = self.io.open_files.get(&fd)
+        if let Some(open_file) = self.open_file(fd)
             && let OpenDescription::Netlink {
                 pid: nl_pid,
                 groups: nl_groups,
                 ..
-            } = &mut *open_file.description.borrow_mut()
-            {
-                let (req_pid, req_groups) = read_sockaddr_nl(memory, addr_addr, addrlen);
-                *nl_pid = if req_pid != 0 {
-                    req_pid
-                } else {
-                    std::process::id()
-                };
-                *nl_groups = req_groups;
-                return Ok(DispatchOutcome::Returned { value: 0 });
-            }
+            } = &mut *open_file.description.write()
+        {
+            let (req_pid, req_groups) = read_sockaddr_nl(memory, addr_addr, addrlen);
+            *nl_pid = if req_pid != 0 {
+                req_pid
+            } else {
+                std::process::id()
+            };
+            *nl_groups = req_groups;
+            return Ok(DispatchOutcome::Returned { value: 0 });
+        }
         let (host_fd, family) = match self.host_socket_lookup(fd) {
             Ok(t) => t,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
@@ -1206,25 +1353,32 @@ impl SyscallDispatcher {
                 .map(|p| 2 + p)
                 .unwrap_or(host_addr.len());
             if let Ok(path) = std::str::from_utf8(&host_addr[2..path_end])
-                && let Ok(md) = std::fs::symlink_metadata(path) {
-                    use std::os::unix::fs::FileTypeExt;
-                    if md.file_type().is_socket() {
-                        let _ = std::fs::remove_file(path);
-                    }
+                && let Ok(md) = std::fs::symlink_metadata(path)
+            {
+                use std::os::unix::fs::FileTypeExt;
+                if md.file_type().is_socket() {
+                    let _ = std::fs::remove_file(path);
                 }
+            }
         }
         let rc = unsafe {
-            libc::bind(host_fd, host_addr.as_ptr() as *const _, host_addr.len() as u32)
+            libc::bind(
+                host_fd,
+                host_addr.as_ptr() as *const _,
+                host_addr.len() as u32,
+            )
         };
         Ok(if rc < 0 {
-            DispatchOutcome::Errno { errno: host_errno() }
+            DispatchOutcome::Errno {
+                errno: host_errno(),
+            }
         } else {
             DispatchOutcome::Returned { value: 0 }
         })
     }
 
     pub(super) fn listen<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let fd = ctx.arg(0) as i32;
@@ -1235,10 +1389,12 @@ impl SyscallDispatcher {
         };
         let rc = unsafe { libc::listen(host_fd, backlog) };
         if rc < 0 {
-            return Ok(DispatchOutcome::Errno { errno: host_errno() });
+            return Ok(DispatchOutcome::Errno {
+                errno: host_errno(),
+            });
         }
         // A listen socket exists only to accept(2); make the HOST socket
-        // non-blocking so accept never blocks under the kernel lock — the
+        // non-blocking so accept never blocks under the dispatcher lock — the
         // guest's blocking intent is emulated by blocking_io's WaitOnFds
         // hand-off (the one idiomatic, targeted non-blocking exception; data
         // sockets keep their native mode + per-call MSG_DONTWAIT).
@@ -1247,7 +1403,7 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn accept<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let request = ctx.request;
@@ -1255,7 +1411,7 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn accept4<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let flags = ctx.arg(3) as i32;
@@ -1264,7 +1420,7 @@ impl SyscallDispatcher {
     }
 
     fn accept_common(
-        &mut self,
+        &self,
         request: SyscallRequest,
         memory: &mut impl GuestMemory,
         accept4_flags: i32,
@@ -1273,28 +1429,39 @@ impl SyscallDispatcher {
         let addr_addr = request.arg(1);
         let addrlen_addr = request.arg(2);
         let (host_fd, family, type_) = {
-            let Some(open_file) = self.io.open_files.get(&fd) else {
+            let Some(open_file) = self.open_file(fd) else {
                 return DispatchOutcome::Errno { errno: LINUX_EBADF };
             };
-            match &*open_file.description.borrow() {
-                OpenDescription::HostSocket { host_fd, family, type_, .. } => {
-                    (*host_fd, *family, *type_)
+            match &*open_file.description.read() {
+                OpenDescription::HostSocket {
+                    host_fd,
+                    family,
+                    type_,
+                    ..
+                } => (*host_fd, *family, *type_),
+                _ => {
+                    return DispatchOutcome::Errno {
+                        errno: LINUX_ENOTSOCK,
+                    };
                 }
-                _ => return DispatchOutcome::Errno { errno: LINUX_ENOTSOCK },
             }
         };
         // accept(2) has no per-call non-blocking flag, but listen() already put
         // the host listen socket in non-blocking mode, so this never blocks.
         // Whether EAGAIN becomes a wait or an EAGAIN to the guest is decided by
         // the guest's listen-fd blocking intent. The accept + sockaddr writeback
-        // run in the closure (no &mut self); the fd is installed AFTER (the
-        // install needs &mut self, which blocking_io's &self closure can't hold).
+        // run in the closure (no &self); the fd is installed AFTER (the
+        // install needs &self, which blocking_io's &self closure can't hold).
         let nonblocking = self.io_is_nonblocking(fd, 0);
         let outcome = self.blocking_io(host_fd, IoDir::Read, nonblocking, || {
             let mut sa_storage = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
             let mut sa_len: libc::socklen_t = sa_storage.len() as libc::socklen_t;
             let new_host = unsafe {
-                libc::accept(host_fd, sa_storage.as_mut_ptr() as *mut _, &mut sa_len as *mut _)
+                libc::accept(
+                    host_fd,
+                    sa_storage.as_mut_ptr() as *mut _,
+                    &mut sa_len as *mut _,
+                )
             };
             if new_host < 0 {
                 return Err(host_errno());
@@ -1323,20 +1490,28 @@ impl SyscallDispatcher {
         unsafe {
             let fl = libc::fcntl(new_host, libc::F_GETFL);
             if fl >= 0 {
-                let next = if nonblock { fl | libc::O_NONBLOCK } else { fl & !libc::O_NONBLOCK };
+                let next = if nonblock {
+                    fl | libc::O_NONBLOCK
+                } else {
+                    fl & !libc::O_NONBLOCK
+                };
                 libc::fcntl(new_host, libc::F_SETFL, next);
             }
         }
         let status_flags = if nonblock { LINUX_O_NONBLOCK } else { 0 };
         let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };
         let Some(linux_fd) = self.allocate_fd(3) else {
-            unsafe { libc::close(new_host); }
-            return DispatchOutcome::Errno { errno: LINUX_EINVAL };
+            unsafe {
+                libc::close(new_host);
+            }
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
         };
         self.insert_open_file(
             linux_fd,
             OpenFile {
-                description: Rc::new(RefCell::new(OpenDescription::HostSocket {
+                description: Arc::new(RwLock::new(OpenDescription::HostSocket {
                     host_fd: new_host,
                     family,
                     type_,
@@ -1345,11 +1520,13 @@ impl SyscallDispatcher {
                 fd_flags,
             },
         );
-        DispatchOutcome::Returned { value: linux_fd as i64 }
+        DispatchOutcome::Returned {
+            value: linux_fd as i64,
+        }
     }
 
     pub(super) fn connect<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let memory = &*ctx.memory;
@@ -1366,12 +1543,16 @@ impl SyscallDispatcher {
         };
         // connect(2) has no per-call non-blocking flag, so put the host socket
         // non-blocking — it then returns EINPROGRESS instead of blocking under
-        // the kernel lock. recv/send use MSG_DONTWAIT + the guest's intended
+        // the dispatcher lock. recv/send use MSG_DONTWAIT + the guest's intended
         // mode (status_flags), so the host fd's real mode is immaterial.
         let nonblocking = self.io_is_nonblocking(fd, 0);
         set_host_nonblocking(host_fd);
         let rc = unsafe {
-            libc::connect(host_fd, host_addr.as_ptr() as *const _, host_addr.len() as u32)
+            libc::connect(
+                host_fd,
+                host_addr.as_ptr() as *const _,
+                host_addr.len() as u32,
+            )
         };
         if rc == 0 {
             return Ok(DispatchOutcome::Returned { value: 0 });
@@ -1400,7 +1581,7 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn getsockname<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let memory = &mut *ctx.memory;
@@ -1409,38 +1590,42 @@ impl SyscallDispatcher {
         let addrlen_addr = ctx.request.arg(2);
         // AF_NETLINK getsockname: hand back a sockaddr_nl carrying the
         // bound pid/groups (or pid=0 if the socket was never bound).
-        if let Some(open_file) = self.io.open_files.get(&fd)
-            && let OpenDescription::Netlink { pid, groups, .. } =
-                &*open_file.description.borrow()
-            {
-                let nl = sockaddr_nl_bytes(*pid, *groups);
-                if write_linux_sockaddr(memory, addr_addr, addrlen_addr, &nl).is_err() {
-                    return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
-                }
-                return Ok(DispatchOutcome::Returned { value: 0 });
+        if let Some(open_file) = self.open_file(fd)
+            && let OpenDescription::Netlink { pid, groups, .. } = &*open_file.description.read()
+        {
+            let nl = sockaddr_nl_bytes(*pid, *groups);
+            if write_linux_sockaddr(memory, addr_addr, addrlen_addr, &nl).is_err() {
+                return Ok(DispatchOutcome::Errno {
+                    errno: LINUX_EFAULT,
+                });
             }
+            return Ok(DispatchOutcome::Returned { value: 0 });
+        }
         let (host_fd, family) = match self.host_socket_lookup(fd) {
             Ok(t) => t,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
         let mut sa = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
         let mut sa_len: libc::socklen_t = sa.len() as libc::socklen_t;
-        let rc = unsafe {
-            libc::getsockname(host_fd, sa.as_mut_ptr() as *mut _, &mut sa_len as *mut _)
-        };
+        let rc =
+            unsafe { libc::getsockname(host_fd, sa.as_mut_ptr() as *mut _, &mut sa_len as *mut _) };
         if rc < 0 {
-            return Ok(DispatchOutcome::Errno { errno: host_errno() });
+            return Ok(DispatchOutcome::Errno {
+                errno: host_errno(),
+            });
         }
         let used = (sa_len as usize).min(sa.len());
         let linux_bytes = host_to_linux_sockaddr(&sa[..used], family);
         if write_linux_sockaddr(memory, addr_addr, addrlen_addr, &linux_bytes).is_err() {
-            return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EFAULT,
+            });
         }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
 
     pub(super) fn getpeername<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let memory = &mut *ctx.memory;
@@ -1453,22 +1638,25 @@ impl SyscallDispatcher {
         };
         let mut sa = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
         let mut sa_len: libc::socklen_t = sa.len() as libc::socklen_t;
-        let rc = unsafe {
-            libc::getpeername(host_fd, sa.as_mut_ptr() as *mut _, &mut sa_len as *mut _)
-        };
+        let rc =
+            unsafe { libc::getpeername(host_fd, sa.as_mut_ptr() as *mut _, &mut sa_len as *mut _) };
         if rc < 0 {
-            return Ok(DispatchOutcome::Errno { errno: host_errno() });
+            return Ok(DispatchOutcome::Errno {
+                errno: host_errno(),
+            });
         }
         let used = (sa_len as usize).min(sa.len());
         let linux_bytes = host_to_linux_sockaddr(&sa[..used], family);
         if write_linux_sockaddr(memory, addr_addr, addrlen_addr, &linux_bytes).is_err() {
-            return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EFAULT,
+            });
         }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
 
     pub(super) fn sendto<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let memory = &*ctx.memory;
@@ -1483,7 +1671,11 @@ impl SyscallDispatcher {
         if self.fd_is_netlink(fd) {
             let bytes = match memory.read_bytes(buf_addr, len) {
                 Ok(b) => b,
-                Err(_) => return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT }),
+                Err(_) => {
+                    return Ok(DispatchOutcome::Errno {
+                        errno: LINUX_EFAULT,
+                    });
+                }
             };
             return Ok(self.netlink_send(fd, &bytes));
         }
@@ -1493,7 +1685,11 @@ impl SyscallDispatcher {
         };
         let bytes = match memory.read_bytes(buf_addr, len) {
             Ok(bytes) => bytes,
-            Err(_) => return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT }),
+            Err(_) => {
+                return Ok(DispatchOutcome::Errno {
+                    errno: LINUX_EFAULT,
+                });
+            }
         };
         // Read the destination sockaddr (if any) from guest memory up front,
         // then send with MSG_DONTWAIT through blocking_io: a full socket buffer
@@ -1531,13 +1727,17 @@ impl SyscallDispatcher {
                     )
                 },
             };
-            if n < 0 { Err(host_errno()) } else { Ok(n as i64) }
+            if n < 0 {
+                Err(host_errno())
+            } else {
+                Ok(n as i64)
+            }
         });
         Ok(outcome)
     }
 
     pub(super) fn recvfrom<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let memory = &mut *ctx.memory;
@@ -1552,10 +1752,12 @@ impl SyscallDispatcher {
         if self.fd_is_netlink(fd) {
             let drained = self.netlink_recv(fd, buf_addr, len, memory);
             if let DispatchOutcome::Returned { .. } = drained
-                && src_addr != 0 && src_len_addr != 0 {
-                    let nl = sockaddr_nl_bytes(0, 0);
-                    let _ = write_linux_sockaddr(memory, src_addr, src_len_addr, &nl);
-                }
+                && src_addr != 0
+                && src_len_addr != 0
+            {
+                let nl = sockaddr_nl_bytes(0, 0);
+                let _ = write_linux_sockaddr(memory, src_addr, src_len_addr, &nl);
+            }
             return Ok(drained);
         }
         let (host_fd, family) = match self.host_socket_lookup(fd) {
@@ -1565,7 +1767,7 @@ impl SyscallDispatcher {
         // Native fd mode preserved; force this CALL non-blocking with
         // MSG_DONTWAIT and route through blocking_io: on EAGAIN a blocking-mode
         // guest fd waits losslessly (kqueue, lock released), a non-blocking one
-        // gets EAGAIN. Never blocks under the kernel lock.
+        // gets EAGAIN. Never blocks under the dispatcher lock.
         let nonblocking = self.io_is_nonblocking(fd, flags);
         let host_flags = linux_to_host_msg_flags(flags) | libc::MSG_DONTWAIT;
         let mut buf = vec![0u8; len];
@@ -1620,7 +1822,7 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn setsockopt<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let memory = &*ctx.memory;
@@ -1642,14 +1844,22 @@ impl SyscallDispatcher {
         };
         let (host_level, host_opt) = match linux_to_host_sockopt(level, optname) {
             Some(t) => t,
-            None => return Ok(DispatchOutcome::Errno { errno: LINUX_ENOPROTOOPT }),
+            None => {
+                return Ok(DispatchOutcome::Errno {
+                    errno: LINUX_ENOPROTOOPT,
+                });
+            }
         };
         let bytes = if optval_addr == 0 || optlen == 0 {
             Vec::new()
         } else {
             match memory.read_bytes(optval_addr, optlen as usize) {
                 Ok(b) => b,
-                Err(_) => return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT }),
+                Err(_) => {
+                    return Ok(DispatchOutcome::Errno {
+                        errno: LINUX_EFAULT,
+                    });
+                }
             }
         };
         let rc = unsafe {
@@ -1669,14 +1879,16 @@ impl SyscallDispatcher {
             // Linux apps frequently set options that aren't supported on
             // macOS (eg IP_MTU_DISCOVER); swallow ENOPROTOOPT silently
             // when the equivalent option simply doesn't exist on macOS.
-            DispatchOutcome::Errno { errno: host_errno() }
+            DispatchOutcome::Errno {
+                errno: host_errno(),
+            }
         } else {
             DispatchOutcome::Returned { value: 0 }
         })
     }
 
     pub(super) fn getsockopt<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let memory = &mut *ctx.memory;
@@ -1703,15 +1915,26 @@ impl SyscallDispatcher {
         };
         let (host_level, host_opt) = match linux_to_host_sockopt(level, optname) {
             Some(t) => t,
-            None => return Ok(DispatchOutcome::Errno { errno: LINUX_ENOPROTOOPT }),
+            None => {
+                return Ok(DispatchOutcome::Errno {
+                    errno: LINUX_ENOPROTOOPT,
+                });
+            }
         };
         // Read the guest's reported optlen so we don't overflow.
         let optlen_bytes = match memory.read_bytes(optlen_addr, 4) {
             Ok(b) => b,
-            Err(_) => return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT }),
+            Err(_) => {
+                return Ok(DispatchOutcome::Errno {
+                    errno: LINUX_EFAULT,
+                });
+            }
         };
         let mut optlen = u32::from_ne_bytes([
-            optlen_bytes[0], optlen_bytes[1], optlen_bytes[2], optlen_bytes[3],
+            optlen_bytes[0],
+            optlen_bytes[1],
+            optlen_bytes[2],
+            optlen_bytes[3],
         ]);
         let cap = optlen.min(256) as usize;
         let mut buf = vec![0u8; cap];
@@ -1725,21 +1948,29 @@ impl SyscallDispatcher {
             )
         };
         if rc < 0 {
-            return Ok(DispatchOutcome::Errno { errno: host_errno() });
+            return Ok(DispatchOutcome::Errno {
+                errno: host_errno(),
+            });
         }
         let used = (optlen as usize).min(buf.len());
-        if optval_addr != 0 && used > 0
-            && memory.write_bytes(optval_addr, &buf[..used]).is_err() {
-                return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
-            }
-        if memory.write_bytes(optlen_addr, &optlen.to_ne_bytes()).is_err() {
-            return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
+        if optval_addr != 0 && used > 0 && memory.write_bytes(optval_addr, &buf[..used]).is_err() {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EFAULT,
+            });
+        }
+        if memory
+            .write_bytes(optlen_addr, &optlen.to_ne_bytes())
+            .is_err()
+        {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EFAULT,
+            });
         }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
 
     pub(super) fn shutdown<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let fd = ctx.arg(0) as i32;
@@ -1750,14 +1981,16 @@ impl SyscallDispatcher {
         };
         let rc = unsafe { libc::shutdown(host_fd, how) };
         Ok(if rc < 0 {
-            DispatchOutcome::Errno { errno: host_errno() }
+            DispatchOutcome::Errno {
+                errno: host_errno(),
+            }
         } else {
             DispatchOutcome::Returned { value: 0 }
         })
     }
 
     pub(super) fn sendmsg<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let memory = &*ctx.memory;
@@ -1787,7 +2020,11 @@ impl SyscallDispatcher {
         for iov in iovecs {
             let chunk = match memory.read_bytes(iov.iov_base, iov.iov_len as usize) {
                 Ok(b) => b,
-                Err(_) => return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT }),
+                Err(_) => {
+                    return Ok(DispatchOutcome::Errno {
+                        errno: LINUX_EFAULT,
+                    });
+                }
             };
             data.extend_from_slice(&chunk);
         }
@@ -1829,13 +2066,17 @@ impl SyscallDispatcher {
                     )
                 },
             };
-            if n < 0 { Err(host_errno()) } else { Ok(n as i64) }
+            if n < 0 {
+                Err(host_errno())
+            } else {
+                Ok(n as i64)
+            }
         });
         Ok(outcome)
     }
 
     pub(super) fn recvmsg<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let memory = &mut *ctx.memory;
@@ -1877,7 +2118,9 @@ impl SyscallDispatcher {
                         .write_bytes(iov.iov_base, &chunk[cursor..cursor + take])
                         .is_err()
                     {
-                        return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
+                        return Ok(DispatchOutcome::Errno {
+                            errno: LINUX_EFAULT,
+                        });
                     }
                     cursor += take;
                     remaining -= take;
@@ -1891,7 +2134,9 @@ impl SyscallDispatcher {
                         .write_bytes(msg.name, &nl[..write_len as usize])
                         .is_err()
                 {
-                    return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
+                    return Ok(DispatchOutcome::Errno {
+                        errno: LINUX_EFAULT,
+                    });
                 }
                 let _ = memory.write_bytes(msg_addr + 8, &(nl.len() as u32).to_ne_bytes());
             }
@@ -1912,8 +2157,16 @@ impl SyscallDispatcher {
                     buf.as_mut_ptr() as *mut _,
                     buf.len(),
                     host_flags,
-                    if msg.name == 0 { std::ptr::null_mut() } else { sa.as_mut_ptr() as *mut _ },
-                    if msg.name == 0 { std::ptr::null_mut() } else { &mut sa_len as *mut _ },
+                    if msg.name == 0 {
+                        std::ptr::null_mut()
+                    } else {
+                        sa.as_mut_ptr() as *mut _
+                    },
+                    if msg.name == 0 {
+                        std::ptr::null_mut()
+                    } else {
+                        &mut sa_len as *mut _
+                    },
                 )
             };
             if n < 0 {
@@ -1928,7 +2181,10 @@ impl SyscallDispatcher {
                 }
                 let chunk = remaining.min(iov.iov_len as usize);
                 if chunk > 0 {
-                    if memory.write_bytes(iov.iov_base, &buf[cursor..cursor + chunk]).is_err() {
+                    if memory
+                        .write_bytes(iov.iov_base, &buf[cursor..cursor + chunk])
+                        .is_err()
+                    {
                         return Err(LINUX_EFAULT);
                     }
                     cursor += chunk;
@@ -1940,7 +2196,9 @@ impl SyscallDispatcher {
                 let linux_bytes = host_to_linux_sockaddr(&sa[..used], family);
                 let write_len = (linux_bytes.len() as u32).min(msg.namelen);
                 if write_len > 0
-                    && memory.write_bytes(msg.name, &linux_bytes[..write_len as usize]).is_err()
+                    && memory
+                        .write_bytes(msg.name, &linux_bytes[..write_len as usize])
+                        .is_err()
                 {
                     return Err(LINUX_EFAULT);
                 }
@@ -1953,10 +2211,16 @@ impl SyscallDispatcher {
                 }
             }
             // No ancillary-data translation; report controllen=0, msg_flags=0.
-            if memory.write_bytes(msg_addr + 40, &0u64.to_ne_bytes()).is_err() {
+            if memory
+                .write_bytes(msg_addr + 40, &0u64.to_ne_bytes())
+                .is_err()
+            {
                 return Err(LINUX_EFAULT);
             }
-            if memory.write_bytes(msg_addr + 48, &0i32.to_ne_bytes()).is_err() {
+            if memory
+                .write_bytes(msg_addr + 48, &0i32.to_ne_bytes())
+                .is_err()
+            {
                 return Err(LINUX_EFAULT);
             }
             Ok(n as i64)
@@ -1970,11 +2234,7 @@ impl SyscallDispatcher {
     /// guest sees ENOSYS and bails with "Temporary failure resolving".
     /// Implemented as a loop over single sendmsgs, writing each entry's
     /// msg_len field with the bytes-sent on success.
-    fn sendmmsg(
-        &mut self,
-        request: SyscallRequest,
-        memory: &mut impl GuestMemory,
-    ) -> DispatchOutcome {
+    fn sendmmsg(&self, request: SyscallRequest, memory: &mut impl GuestMemory) -> DispatchOutcome {
         let fd = request.arg(0) as i32;
         let msgvec = request.arg(1);
         let vlen = request.arg(2) as u32;
@@ -1986,7 +2246,11 @@ impl SyscallDispatcher {
         for i in 0..vlen {
             let entry = match msgvec.checked_add(i as u64 * MMSGHDR_SIZE) {
                 Some(a) => a,
-                None => return DispatchOutcome::Errno { errno: LINUX_EFAULT },
+                None => {
+                    return DispatchOutcome::Errno {
+                        errno: LINUX_EFAULT,
+                    };
+                }
             };
             // Build a synthetic sendmsg request that points at this
             // entry's msg_hdr (which is the first 56 bytes of the
@@ -1996,19 +2260,23 @@ impl SyscallDispatcher {
                 211, // sendmsg
                 SyscallArgs([fd as u64, entry, 0, flags as u64, 0, 0]),
             );
-            let mut inner_reporter = CompatReporter::default();
+            let inner_reporter = CompatReporter::default();
             let outcome = {
                 let mut inner_ctx = SyscallCtx {
                     request: inner_req,
                     memory: &mut *memory,
-                    reporter: &mut inner_reporter,
+                    reporter: &inner_reporter,
                     thread: None,
                 };
                 match self.sendmsg(&mut inner_ctx) {
                     Ok(o) => o,
                     // sendmsg never produces a DispatchError; surface it
                     // as EFAULT to keep this helper's bare-outcome contract.
-                    Err(_) => return DispatchOutcome::Errno { errno: LINUX_EFAULT },
+                    Err(_) => {
+                        return DispatchOutcome::Errno {
+                            errno: LINUX_EFAULT,
+                        };
+                    }
                 }
             };
             match outcome {
@@ -2018,7 +2286,9 @@ impl SyscallDispatcher {
                         .write_bytes(entry + MSG_LEN_OFFSET, &len_u32.to_le_bytes())
                         .is_err()
                     {
-                        return DispatchOutcome::Errno { errno: LINUX_EFAULT };
+                        return DispatchOutcome::Errno {
+                            errno: LINUX_EFAULT,
+                        };
                     }
                     sent += 1;
                 }
@@ -2043,11 +2313,7 @@ impl SyscallDispatcher {
     /// The timeout argument is best-effort — we fall through to a
     /// single libc::poll up front if it's non-NULL and at least one
     /// message is wanted before blocking.
-    fn recvmmsg(
-        &mut self,
-        request: SyscallRequest,
-        memory: &mut impl GuestMemory,
-    ) -> DispatchOutcome {
+    fn recvmmsg(&self, request: SyscallRequest, memory: &mut impl GuestMemory) -> DispatchOutcome {
         let fd = request.arg(0) as i32;
         let msgvec = request.arg(1);
         let vlen = request.arg(2) as u32;
@@ -2058,7 +2324,11 @@ impl SyscallDispatcher {
         for i in 0..vlen {
             let entry = match msgvec.checked_add(i as u64 * MMSGHDR_SIZE) {
                 Some(a) => a,
-                None => return DispatchOutcome::Errno { errno: LINUX_EFAULT },
+                None => {
+                    return DispatchOutcome::Errno {
+                        errno: LINUX_EFAULT,
+                    };
+                }
             };
             // After the first successful recvmsg, switch to non-blocking
             // so we drain whatever else is in the queue without waiting.
@@ -2071,19 +2341,23 @@ impl SyscallDispatcher {
                 212, // recvmsg
                 SyscallArgs([fd as u64, entry, entry_flags as u64, 0, 0, 0]),
             );
-            let mut inner_reporter = CompatReporter::default();
+            let inner_reporter = CompatReporter::default();
             let outcome = {
                 let mut inner_ctx = SyscallCtx {
                     request: inner_req,
                     memory: &mut *memory,
-                    reporter: &mut inner_reporter,
+                    reporter: &inner_reporter,
                     thread: None,
                 };
                 match self.recvmsg(&mut inner_ctx) {
                     Ok(o) => o,
                     // recvmsg never produces a DispatchError; surface it
                     // as EFAULT to keep this helper's bare-outcome contract.
-                    Err(_) => return DispatchOutcome::Errno { errno: LINUX_EFAULT },
+                    Err(_) => {
+                        return DispatchOutcome::Errno {
+                            errno: LINUX_EFAULT,
+                        };
+                    }
                 }
             };
             match outcome {
@@ -2093,27 +2367,39 @@ impl SyscallDispatcher {
                         .write_bytes(entry + MSG_LEN_OFFSET, &len_u32.to_le_bytes())
                         .is_err()
                     {
-                        return DispatchOutcome::Errno { errno: LINUX_EFAULT };
+                        return DispatchOutcome::Errno {
+                            errno: LINUX_EFAULT,
+                        };
                     }
                     received += 1;
                 }
                 DispatchOutcome::Errno { errno } => {
                     if received > 0 {
-                        return DispatchOutcome::Returned { value: received as i64 };
+                        return DispatchOutcome::Returned {
+                            value: received as i64,
+                        };
                     }
                     return DispatchOutcome::Errno { errno };
                 }
                 other => return other,
             }
         }
-        DispatchOutcome::Returned { value: received as i64 }
+        DispatchOutcome::Returned {
+            value: received as i64,
+        }
     }
 
-    pub(super) fn sys_recvmmsg<M: GuestMemory>(&mut self, ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+    pub(super) fn sys_recvmmsg<M: GuestMemory>(
+        &self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
         Ok(self.recvmmsg(ctx.request, ctx.memory))
     }
 
-    pub(super) fn sys_sendmmsg<M: GuestMemory>(&mut self, ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+    pub(super) fn sys_sendmmsg<M: GuestMemory>(
+        &self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
         Ok(self.sendmmsg(ctx.request, ctx.memory))
     }
 }
@@ -2342,13 +2628,27 @@ fn build_netlink_reply(request: &[u8], pid: u32) -> Vec<u8> {
 
 fn linux_to_host_msg_flags(flags: i32) -> i32 {
     let mut out = 0;
-    if flags & LINUX_MSG_OOB != 0 { out |= libc::MSG_OOB; }
-    if flags & LINUX_MSG_PEEK != 0 { out |= libc::MSG_PEEK; }
-    if flags & LINUX_MSG_DONTROUTE != 0 { out |= libc::MSG_DONTROUTE; }
-    if flags & LINUX_MSG_TRUNC != 0 { out |= libc::MSG_TRUNC; }
-    if flags & LINUX_MSG_DONTWAIT != 0 { out |= libc::MSG_DONTWAIT; }
-    if flags & LINUX_MSG_EOR != 0 { out |= libc::MSG_EOR; }
-    if flags & LINUX_MSG_WAITALL != 0 { out |= libc::MSG_WAITALL; }
+    if flags & LINUX_MSG_OOB != 0 {
+        out |= libc::MSG_OOB;
+    }
+    if flags & LINUX_MSG_PEEK != 0 {
+        out |= libc::MSG_PEEK;
+    }
+    if flags & LINUX_MSG_DONTROUTE != 0 {
+        out |= libc::MSG_DONTROUTE;
+    }
+    if flags & LINUX_MSG_TRUNC != 0 {
+        out |= libc::MSG_TRUNC;
+    }
+    if flags & LINUX_MSG_DONTWAIT != 0 {
+        out |= libc::MSG_DONTWAIT;
+    }
+    if flags & LINUX_MSG_EOR != 0 {
+        out |= libc::MSG_EOR;
+    }
+    if flags & LINUX_MSG_WAITALL != 0 {
+        out |= libc::MSG_WAITALL;
+    }
     // MSG_NOSIGNAL is Linux-only. macOS expresses the equivalent via
     // SO_NOSIGPIPE on the socket; ignoring the flag is the best we can
     // do here. Likewise MSG_CMSG_CLOEXEC has no macOS equivalent.
@@ -2424,7 +2724,10 @@ fn unix_socket_host_path(sun_path: &[u8]) -> Option<std::path::PathBuf> {
         return None;
     }
     // Pathname socket: bytes up to the first NUL.
-    let nul = sun_path.iter().position(|&b| b == 0).unwrap_or(sun_path.len());
+    let nul = sun_path
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(sun_path.len());
     let guest_path = &sun_path[..nul];
     if guest_path.is_empty() {
         return None;
@@ -2588,12 +2891,12 @@ fn write_linux_sockaddr(
         return Err(());
     }
     let cur_bytes = memory.read_bytes(addrlen_addr, 4).map_err(|_| ())?;
-    let cur = u32::from_ne_bytes([
-        cur_bytes[0], cur_bytes[1], cur_bytes[2], cur_bytes[3],
-    ]) as usize;
+    let cur = u32::from_ne_bytes([cur_bytes[0], cur_bytes[1], cur_bytes[2], cur_bytes[3]]) as usize;
     let write_len = cur.min(bytes.len());
     if addr != 0 && write_len > 0 {
-        memory.write_bytes(addr, &bytes[..write_len]).map_err(|_| ())?;
+        memory
+            .write_bytes(addr, &bytes[..write_len])
+            .map_err(|_| ())?;
     }
     memory
         .write_bytes(addrlen_addr, &(bytes.len() as u32).to_ne_bytes())
@@ -2625,7 +2928,12 @@ fn read_linux_msghdr(memory: &impl GuestMemory, addr: u64) -> Result<LinuxMsghdr
     let iov = u64::from_ne_bytes(bytes[16..24].try_into().unwrap());
     #[allow(clippy::unwrap_used)]
     let iovlen = u64::from_ne_bytes(bytes[24..32].try_into().unwrap());
-    Ok(LinuxMsghdr { name, namelen, iov, iovlen })
+    Ok(LinuxMsghdr {
+        name,
+        namelen,
+        iov,
+        iovlen,
+    })
 }
 
 /// Direction a blocking I/O syscall waits on, in `libc::poll` event terms.
@@ -2649,7 +2957,7 @@ impl IoDir {
 /// Force a host fd into `O_NONBLOCK`. carrick keeps EVERY host-backed fd
 /// non-blocking and emulates the guest's blocking mode itself via
 /// `blocking_io` + the runtime's lockless `WaitOnFds` wait, so a guest blocking
-/// syscall never blocks a vCPU thread inside libc while the big kernel lock is
+/// syscall never blocks a vCPU thread inside libc while the dispatcher lock is
 /// held. Call at every host-fd creation site (socket/socketpair/accept/pipe).
 pub(super) fn set_host_nonblocking(fd: i32) {
     unsafe {

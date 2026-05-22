@@ -55,8 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pxn = env_u64("REPRO_PXN", 0) != 0;
     let vbar_base = env_u64("REPRO_VBAR_BASE", 0);
 
-    let mut l1_flags: u64 =
-        (1 << 10) | (sh << 8) | (ap << 6) | (attr << 2) | 0b01;
+    let mut l1_flags: u64 = (1 << 10) | (sh << 8) | (ap << 6) | (attr << 2) | 0b01;
     if uxn {
         l1_flags |= 1u64 << 54;
     }
@@ -92,12 +91,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     vcpu.set_sys_reg(SysReg::MAIR_EL1, mair)?;
 
-    let tcr: u64 = t0sz
-        | (irgn << 8)
-        | (orgn << 10)
-        | (tcr_sh << 12)
-        | (1u64 << 23)
-        | (0b010u64 << 32);
+    let tcr: u64 =
+        t0sz | (irgn << 8) | (orgn << 10) | (tcr_sh << 12) | (1u64 << 23) | (0b010u64 << 32);
     vcpu.set_sys_reg(SysReg::TCR_EL1, tcr)?;
     vcpu.set_sys_reg(SysReg::TTBR0_EL1, PT_BASE)?;
 

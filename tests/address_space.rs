@@ -154,14 +154,14 @@ fn dispatcher_can_write_from_loaded_guest_memory() {
         )],
     )
     .unwrap();
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     dispatcher
         .dispatch(
             SyscallRequest::new(64, SyscallArgs::from([1, 0x4000, 5, 0, 0, 0])),
             &mut image,
-            &mut reporter,
+            &reporter,
         )
         .unwrap();
 

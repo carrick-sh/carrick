@@ -9,9 +9,7 @@ use std::process::Command;
 use carrick::dispatch::{Aarch64SyscallFrame, GuestMemory, LinearMemory, SyscallDispatcher};
 use carrick::memory::AddressSpace;
 use carrick::rootfs::{LayerSource, RootFs};
-use carrick::runtime::{
-    SyscallTrap, run_syscall_loop, run_syscall_loop_with_dispatcher,
-};
+use carrick::runtime::{SyscallTrap, run_syscall_loop, run_syscall_loop_with_dispatcher};
 use carrick::trap::TrapError;
 use flate2::Compression;
 use flate2::write::GzEncoder;

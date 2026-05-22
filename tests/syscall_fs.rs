@@ -11,14 +11,14 @@ use support::*;
 #[test]
 fn write_syscall_reads_guest_memory_and_writes_stdout() {
     let mut memory = LinearMemory::new(0x4000, b"hello from linux\n".to_vec());
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     let outcome = dispatcher
         .dispatch(
             SyscallRequest::new(64, SyscallArgs::from([1, 0x4000, 17, 0, 0, 0])),
             &mut memory,
-            &mut reporter,
+            &reporter,
         )
         .unwrap();
 
@@ -30,18 +30,17 @@ fn write_syscall_reads_guest_memory_and_writes_stdout() {
     assert!(report.unhandled_syscalls.is_empty());
 }
 
-
 #[test]
 fn write_syscall_rejects_bad_guest_pointer_with_efault() {
     let mut memory = LinearMemory::new(0x4000, b"short".to_vec());
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     let outcome = dispatcher
         .dispatch(
             SyscallRequest::new(64, SyscallArgs::from([1, 0x5000, 5, 0, 0, 0])),
             &mut memory,
-            &mut reporter,
+            &reporter,
         )
         .unwrap();
 
@@ -49,11 +48,10 @@ fn write_syscall_rejects_bad_guest_pointer_with_efault() {
     assert!(dispatcher.stdout().is_empty());
 }
 
-
 #[test]
 fn ioctl_writes_packed_winsize_and_reports_unknown_requests() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     assert_eq!(
@@ -64,7 +62,7 @@ fn ioctl_writes_packed_winsize_and_reports_unknown_requests() {
                     SyscallArgs::from([1, LINUX_TIOCGWINSZ, 0x4000, 0, 0, 0])
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -80,7 +78,7 @@ fn ioctl_writes_packed_winsize_and_reports_unknown_requests() {
             .dispatch(
                 SyscallRequest::new(29, SyscallArgs::from([1, 0xdead_beef, 0x4040, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 25 }
@@ -91,12 +89,11 @@ fn ioctl_writes_packed_winsize_and_reports_unknown_requests() {
     assert_eq!(report.unhandled_ioctls[0].count, 1);
 }
 
-
 #[test]
 fn ioctl_tcgets_writes_default_termios_for_stdio_and_enotty_for_files() {
     // 1. TCGETS on fd 0 → returns 0; struct has cooked-TTY defaults.
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     assert_eq!(
@@ -104,7 +101,7 @@ fn ioctl_tcgets_writes_default_termios_for_stdio_and_enotty_for_files() {
             .dispatch(
                 SyscallRequest::new(29, SyscallArgs::from([0, LINUX_TCGETS, 0x4000, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -124,7 +121,7 @@ fn ioctl_tcgets_writes_default_termios_for_stdio_and_enotty_for_files() {
             .dispatch(
                 SyscallRequest::new(29, SyscallArgs::from([99, LINUX_TCGETS, 0x4080, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 9 }
@@ -138,7 +135,7 @@ fn ioctl_tcgets_writes_default_termios_for_stdio_and_enotty_for_files() {
     .unwrap();
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
     memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
     let opened = dispatcher
         .dispatch(
@@ -147,7 +144,7 @@ fn ioctl_tcgets_writes_default_termios_for_stdio_and_enotty_for_files() {
                 SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
             ),
             &mut memory,
-            &mut reporter,
+            &reporter,
         )
         .unwrap();
     let file_fd = match opened {
@@ -162,7 +159,7 @@ fn ioctl_tcgets_writes_default_termios_for_stdio_and_enotty_for_files() {
                     SyscallArgs::from([file_fd as u64, LINUX_TCGETS, 0x4080, 0, 0, 0])
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 25 }
@@ -170,21 +167,18 @@ fn ioctl_tcgets_writes_default_termios_for_stdio_and_enotty_for_files() {
 
     // 4. TCSETS on fd 0 with a valid termios buffer → 0.
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
     // Seed any plausible bytes — the dispatcher only does a size check.
     memory
-        .write_bytes(
-            0x4000,
-            LinuxTermios::default_cooked().as_bytes(),
-        )
+        .write_bytes(0x4000, LinuxTermios::default_cooked().as_bytes())
         .unwrap();
     assert_eq!(
         dispatcher
             .dispatch(
                 SyscallRequest::new(29, SyscallArgs::from([0, LINUX_TCSETS, 0x4000, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -196,7 +190,7 @@ fn ioctl_tcgets_writes_default_termios_for_stdio_and_enotty_for_files() {
             .dispatch(
                 SyscallRequest::new(29, SyscallArgs::from([0, LINUX_TCSETS, 0x1, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 14 }
@@ -205,11 +199,10 @@ fn ioctl_tcgets_writes_default_termios_for_stdio_and_enotty_for_files() {
     assert!(reporter.finish().unhandled_ioctls.is_empty());
 }
 
-
 #[test]
 fn tty_ioctls_handle_pgrp_sid_and_controlling_terminal_calls() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     // TIOCGPGRP on stdio fd 0 → writes pgid=1.
@@ -218,7 +211,7 @@ fn tty_ioctls_handle_pgrp_sid_and_controlling_terminal_calls() {
             .dispatch(
                 SyscallRequest::new(29, SyscallArgs::from([0, LINUX_TIOCGPGRP, 0x4000, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -231,7 +224,7 @@ fn tty_ioctls_handle_pgrp_sid_and_controlling_terminal_calls() {
             .dispatch(
                 SyscallRequest::new(29, SyscallArgs::from([2, LINUX_TIOCGSID, 0x4010, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -242,9 +235,12 @@ fn tty_ioctls_handle_pgrp_sid_and_controlling_terminal_calls() {
     assert_eq!(
         dispatcher
             .dispatch(
-                SyscallRequest::new(29, SyscallArgs::from([99, LINUX_TIOCGPGRP, 0x4020, 0, 0, 0])),
+                SyscallRequest::new(
+                    29,
+                    SyscallArgs::from([99, LINUX_TIOCGPGRP, 0x4020, 0, 0, 0])
+                ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 9 }
@@ -257,7 +253,7 @@ fn tty_ioctls_handle_pgrp_sid_and_controlling_terminal_calls() {
             .dispatch(
                 SyscallRequest::new(29, SyscallArgs::from([0, LINUX_TIOCSPGRP, 0x4030, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -268,7 +264,7 @@ fn tty_ioctls_handle_pgrp_sid_and_controlling_terminal_calls() {
             .dispatch(
                 SyscallRequest::new(29, SyscallArgs::from([0, LINUX_TIOCSPGRP, 0x4040, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 1 }
@@ -280,7 +276,7 @@ fn tty_ioctls_handle_pgrp_sid_and_controlling_terminal_calls() {
             .dispatch(
                 SyscallRequest::new(29, SyscallArgs::from([1, LINUX_TIOCSCTTY, 1, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -290,7 +286,7 @@ fn tty_ioctls_handle_pgrp_sid_and_controlling_terminal_calls() {
             .dispatch(
                 SyscallRequest::new(29, SyscallArgs::from([0, LINUX_TIOCNOTTY, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -304,7 +300,7 @@ fn tty_ioctls_handle_pgrp_sid_and_controlling_terminal_calls() {
     .unwrap();
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
     memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
     let opened = dispatcher
         .dispatch(
@@ -313,7 +309,7 @@ fn tty_ioctls_handle_pgrp_sid_and_controlling_terminal_calls() {
                 SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
             ),
             &mut memory,
-            &mut reporter,
+            &reporter,
         )
         .unwrap();
     let file_fd = match opened {
@@ -328,7 +324,7 @@ fn tty_ioctls_handle_pgrp_sid_and_controlling_terminal_calls() {
                     SyscallArgs::from([file_fd as u64, LINUX_TIOCGPGRP, 0x4040, 0, 0, 0])
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 25 }
@@ -341,7 +337,7 @@ fn tty_ioctls_handle_pgrp_sid_and_controlling_terminal_calls() {
                     SyscallArgs::from([file_fd as u64, LINUX_TIOCGSID, 0x4048, 0, 0, 0])
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 25 }
@@ -349,7 +345,6 @@ fn tty_ioctls_handle_pgrp_sid_and_controlling_terminal_calls() {
 
     assert!(reporter.finish().unhandled_ioctls.is_empty());
 }
-
 
 #[test]
 fn flock_accepts_bootstrap_advisory_locks_on_open_files() {
@@ -360,7 +355,7 @@ fn flock_accepts_bootstrap_advisory_locks_on_open_files() {
     .unwrap();
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
     memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
 
     assert_eq!(
@@ -371,7 +366,7 @@ fn flock_accepts_bootstrap_advisory_locks_on_open_files() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 3 }
@@ -384,7 +379,7 @@ fn flock_accepts_bootstrap_advisory_locks_on_open_files() {
                     SyscallArgs::from([3, LINUX_LOCK_SH | LINUX_LOCK_NB, 0, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -394,7 +389,7 @@ fn flock_accepts_bootstrap_advisory_locks_on_open_files() {
             .dispatch(
                 SyscallRequest::new(32, SyscallArgs::from([3, LINUX_LOCK_UN, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -404,7 +399,7 @@ fn flock_accepts_bootstrap_advisory_locks_on_open_files() {
             .dispatch(
                 SyscallRequest::new(32, SyscallArgs::from([3, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 22 }
@@ -414,14 +409,13 @@ fn flock_accepts_bootstrap_advisory_locks_on_open_files() {
             .dispatch(
                 SyscallRequest::new(32, SyscallArgs::from([99, LINUX_LOCK_SH, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 9 }
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
-
 
 #[test]
 fn openat_read_close_round_trip_through_rootfs_fd() {
@@ -432,7 +426,7 @@ fn openat_read_close_round_trip_through_rootfs_fd() {
     .unwrap();
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
     memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
 
     let opened = dispatcher
@@ -442,7 +436,7 @@ fn openat_read_close_round_trip_through_rootfs_fd() {
                 SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
             ),
             &mut memory,
-            &mut reporter,
+            &reporter,
         )
         .unwrap();
     assert_eq!(opened, DispatchOutcome::Returned { value: 3 });
@@ -451,7 +445,7 @@ fn openat_read_close_round_trip_through_rootfs_fd() {
         .dispatch(
             SyscallRequest::new(63, SyscallArgs::from([3, 0x4100, 64, 0, 0, 0])),
             &mut memory,
-            &mut reporter,
+            &reporter,
         )
         .unwrap();
     assert_eq!(read, DispatchOutcome::Returned { value: 18 });
@@ -464,13 +458,12 @@ fn openat_read_close_round_trip_through_rootfs_fd() {
         .dispatch(
             SyscallRequest::new(57, SyscallArgs::from([3, 0, 0, 0, 0, 0])),
             &mut memory,
-            &mut reporter,
+            &reporter,
         )
         .unwrap();
     assert_eq!(closed, DispatchOutcome::Returned { value: 0 });
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
-
 
 #[test]
 fn openat_missing_rootfs_file_returns_enoent() {
@@ -480,7 +473,7 @@ fn openat_missing_rootfs_file_returns_enoent() {
     )]))])
     .unwrap();
     let mut memory = LinearMemory::new(0x4000, b"/missing\0".to_vec());
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
 
     let outcome = dispatcher
@@ -490,14 +483,13 @@ fn openat_missing_rootfs_file_returns_enoent() {
                 SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
             ),
             &mut memory,
-            &mut reporter,
+            &reporter,
         )
         .unwrap();
 
     assert_eq!(outcome, DispatchOutcome::Errno { errno: 2 });
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
-
 
 #[test]
 fn openat2_reads_open_how_and_opens_readonly_rootfs_paths() {
@@ -511,7 +503,7 @@ fn openat2_reads_open_how_and_opens_readonly_rootfs_paths() {
     write_open_how(&mut memory, 0x4020, LINUX_O_CLOEXEC, 0, 0);
     write_open_how(&mut memory, 0x4060, LINUX_O_WRONLY, 0, 0);
     write_open_how(&mut memory, 0x40a0, 0, 0, 0x4);
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
 
     assert_eq!(
@@ -522,7 +514,7 @@ fn openat2_reads_open_how_and_opens_readonly_rootfs_paths() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0x4020, 24, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 3 }
@@ -532,7 +524,7 @@ fn openat2_reads_open_how_and_opens_readonly_rootfs_paths() {
             .dispatch(
                 SyscallRequest::new(25, SyscallArgs::from([3, LINUX_F_GETFD, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned {
@@ -544,7 +536,7 @@ fn openat2_reads_open_how_and_opens_readonly_rootfs_paths() {
             .dispatch(
                 SyscallRequest::new(63, SyscallArgs::from([3, 0x4100, 64, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 18 }
@@ -562,7 +554,7 @@ fn openat2_reads_open_how_and_opens_readonly_rootfs_paths() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0x4060, 24, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 22 }
@@ -575,7 +567,7 @@ fn openat2_reads_open_how_and_opens_readonly_rootfs_paths() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0x40a0, 24, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 22 }
@@ -588,14 +580,13 @@ fn openat2_reads_open_how_and_opens_readonly_rootfs_paths() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0x4020, 16, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 22 }
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
-
 
 #[test]
 fn cwd_and_access_syscalls_use_rootfs_state() {
@@ -608,7 +599,7 @@ fn cwd_and_access_syscalls_use_rootfs_state() {
     memory.write_bytes(0x4000, b"/etc\0").unwrap();
     memory.write_bytes(0x4010, b"motd\0").unwrap();
     memory.write_bytes(0x4020, b"/\0").unwrap();
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
 
     assert_eq!(
@@ -616,7 +607,7 @@ fn cwd_and_access_syscalls_use_rootfs_state() {
             .dispatch(
                 SyscallRequest::new(17, SyscallArgs::from([0x4100, 16, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         // Linux getcwd(2) returns the length of the filled buffer including the
@@ -630,7 +621,7 @@ fn cwd_and_access_syscalls_use_rootfs_state() {
             .dispatch(
                 SyscallRequest::new(49, SyscallArgs::from([0x4000, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -642,7 +633,7 @@ fn cwd_and_access_syscalls_use_rootfs_state() {
             .dispatch(
                 SyscallRequest::new(17, SyscallArgs::from([0x4100, 16, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         // "/etc\0" -> 5 bytes filled (length, not address).
@@ -658,7 +649,7 @@ fn cwd_and_access_syscalls_use_rootfs_state() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4010, 4, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -671,7 +662,7 @@ fn cwd_and_access_syscalls_use_rootfs_state() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4010, 2, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         // W_OK on an existing file: the overlay is writable and the guest is
@@ -688,7 +679,7 @@ fn cwd_and_access_syscalls_use_rootfs_state() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4010, 0, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 3 }
@@ -698,7 +689,7 @@ fn cwd_and_access_syscalls_use_rootfs_state() {
             .dispatch(
                 SyscallRequest::new(63, SyscallArgs::from([3, 0x4200, 64, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 18 }
@@ -713,7 +704,7 @@ fn cwd_and_access_syscalls_use_rootfs_state() {
             .dispatch(
                 SyscallRequest::new(49, SyscallArgs::from([0x4020, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -727,7 +718,7 @@ fn cwd_and_access_syscalls_use_rootfs_state() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 4 }
@@ -737,7 +728,7 @@ fn cwd_and_access_syscalls_use_rootfs_state() {
             .dispatch(
                 SyscallRequest::new(50, SyscallArgs::from([4, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -745,7 +736,6 @@ fn cwd_and_access_syscalls_use_rootfs_state() {
     assert_eq!(dispatcher.cwd(), "/etc");
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
-
 
 #[test]
 fn faccessat2_supports_bootstrap_access_flags_and_fd_checks() {
@@ -759,7 +749,7 @@ fn faccessat2_supports_bootstrap_access_flags_and_fd_checks() {
     memory.write_bytes(0x4020, b"/etc/motd-link\0").unwrap();
     memory.write_bytes(0x4040, b"/proc/cpuinfo\0").unwrap();
     memory.write_bytes(0x4060, b"\0").unwrap();
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
 
     assert_eq!(
@@ -777,7 +767,7 @@ fn faccessat2_supports_bootstrap_access_flags_and_fd_checks() {
                     ]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -797,7 +787,7 @@ fn faccessat2_supports_bootstrap_access_flags_and_fd_checks() {
                     ]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         // The rootfs is backed by a writable overlay and the guest runs as root
@@ -820,7 +810,7 @@ fn faccessat2_supports_bootstrap_access_flags_and_fd_checks() {
                     ]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         // motd-link points at the 0o644 regular file "motd": even as root,
@@ -836,7 +826,7 @@ fn faccessat2_supports_bootstrap_access_flags_and_fd_checks() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 3 }
@@ -849,7 +839,7 @@ fn faccessat2_supports_bootstrap_access_flags_and_fd_checks() {
                     SyscallArgs::from([3, 0x4060, LINUX_R_OK, LINUX_AT_EMPTY_PATH, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -869,7 +859,7 @@ fn faccessat2_supports_bootstrap_access_flags_and_fd_checks() {
                     ]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -882,7 +872,7 @@ fn faccessat2_supports_bootstrap_access_flags_and_fd_checks() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 8, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 22 }
@@ -895,14 +885,13 @@ fn faccessat2_supports_bootstrap_access_flags_and_fd_checks() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, LINUX_R_OK, 0x80, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 22 }
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
-
 
 #[test]
 fn statfs_writes_packed_linux_statfs_for_rootfs_path() {
@@ -913,7 +902,7 @@ fn statfs_writes_packed_linux_statfs_for_rootfs_path() {
     .unwrap();
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
     memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
 
     assert_eq!(
@@ -921,7 +910,7 @@ fn statfs_writes_packed_linux_statfs_for_rootfs_path() {
             .dispatch(
                 SyscallRequest::new(43, SyscallArgs::from([0x4000, 0x4100, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -936,7 +925,6 @@ fn statfs_writes_packed_linux_statfs_for_rootfs_path() {
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
-
 #[test]
 fn fstatfs_writes_packed_linux_statfs_for_open_fd() {
     let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
@@ -946,7 +934,7 @@ fn fstatfs_writes_packed_linux_statfs_for_open_fd() {
     .unwrap();
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
     memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
 
     assert_eq!(
@@ -957,7 +945,7 @@ fn fstatfs_writes_packed_linux_statfs_for_open_fd() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 3 }
@@ -967,7 +955,7 @@ fn fstatfs_writes_packed_linux_statfs_for_open_fd() {
             .dispatch(
                 SyscallRequest::new(44, SyscallArgs::from([3, 0x4100, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -980,7 +968,6 @@ fn fstatfs_writes_packed_linux_statfs_for_open_fd() {
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
-
 #[test]
 fn lseek_repositions_rootfs_file_reads() {
     let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
@@ -990,7 +977,7 @@ fn lseek_repositions_rootfs_file_reads() {
     .unwrap();
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x300]);
     memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
 
     assert_eq!(
@@ -1001,7 +988,7 @@ fn lseek_repositions_rootfs_file_reads() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 3 }
@@ -1011,7 +998,7 @@ fn lseek_repositions_rootfs_file_reads() {
             .dispatch(
                 SyscallRequest::new(62, SyscallArgs::from([3, 7, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 7 }
@@ -1021,14 +1008,13 @@ fn lseek_repositions_rootfs_file_reads() {
             .dispatch(
                 SyscallRequest::new(63, SyscallArgs::from([3, 0x4100, 4, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 4 }
     );
     assert_eq!(memory.read_bytes(0x4100, 4).unwrap(), b"says");
 }
-
 
 #[test]
 fn pread64_reads_from_offset_without_changing_file_offset() {
@@ -1039,7 +1025,7 @@ fn pread64_reads_from_offset_without_changing_file_offset() {
     .unwrap();
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
     memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
 
     assert_eq!(
@@ -1050,7 +1036,7 @@ fn pread64_reads_from_offset_without_changing_file_offset() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 3 }
@@ -1060,7 +1046,7 @@ fn pread64_reads_from_offset_without_changing_file_offset() {
             .dispatch(
                 SyscallRequest::new(67, SyscallArgs::from([3, 0x4100, 4, 7, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 4 }
@@ -1071,7 +1057,7 @@ fn pread64_reads_from_offset_without_changing_file_offset() {
             .dispatch(
                 SyscallRequest::new(63, SyscallArgs::from([3, 0x4200, 4, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 4 }
@@ -1079,7 +1065,6 @@ fn pread64_reads_from_offset_without_changing_file_offset() {
     assert_eq!(memory.read_bytes(0x4200, 4).unwrap(), b"root");
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
-
 
 #[test]
 fn preadv_reads_from_offset_across_iovecs_without_changing_file_offset() {
@@ -1095,7 +1080,7 @@ fn preadv_reads_from_offset_across_iovecs_without_changing_file_offset() {
         0x4100,
         [LinuxIovec::new(0x4200, 4), LinuxIovec::new(0x4300, 5)],
     );
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
 
     assert_eq!(
@@ -1106,7 +1091,7 @@ fn preadv_reads_from_offset_across_iovecs_without_changing_file_offset() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 3 }
@@ -1116,7 +1101,7 @@ fn preadv_reads_from_offset_across_iovecs_without_changing_file_offset() {
             .dispatch(
                 SyscallRequest::new(69, SyscallArgs::from([3, 0x4100, 2, 7, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 9 }
@@ -1128,7 +1113,7 @@ fn preadv_reads_from_offset_across_iovecs_without_changing_file_offset() {
             .dispatch(
                 SyscallRequest::new(63, SyscallArgs::from([3, 0x4400, 4, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 4 }
@@ -1136,7 +1121,6 @@ fn preadv_reads_from_offset_across_iovecs_without_changing_file_offset() {
     assert_eq!(memory.read_bytes(0x4400, 4).unwrap(), b"root");
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
-
 
 #[test]
 fn sendfile_copies_rootfs_file_to_stdout_and_updates_offset_pointer() {
@@ -1148,7 +1132,7 @@ fn sendfile_copies_rootfs_file_to_stdout_and_updates_offset_pointer() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x500]);
     memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();
     write_u64(&mut memory, 0x4100, 7);
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
 
     assert_eq!(
@@ -1159,7 +1143,7 @@ fn sendfile_copies_rootfs_file_to_stdout_and_updates_offset_pointer() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 3 }
@@ -1169,7 +1153,7 @@ fn sendfile_copies_rootfs_file_to_stdout_and_updates_offset_pointer() {
             .dispatch(
                 SyscallRequest::new(71, SyscallArgs::from([1, 3, 0x4100, 4, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 4 }
@@ -1181,7 +1165,7 @@ fn sendfile_copies_rootfs_file_to_stdout_and_updates_offset_pointer() {
             .dispatch(
                 SyscallRequest::new(63, SyscallArgs::from([3, 0x4200, 4, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 4 }
@@ -1189,7 +1173,6 @@ fn sendfile_copies_rootfs_file_to_stdout_and_updates_offset_pointer() {
     assert_eq!(memory.read_bytes(0x4200, 4).unwrap(), b"root");
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
-
 
 #[test]
 fn sendfile_without_offset_pointer_advances_file_offset_and_writes_pipe() {
@@ -1200,7 +1183,7 @@ fn sendfile_without_offset_pointer_advances_file_offset_and_writes_pipe() {
     .unwrap();
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x500]);
     memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
 
     assert_eq!(
@@ -1211,7 +1194,7 @@ fn sendfile_without_offset_pointer_advances_file_offset_and_writes_pipe() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 3 }
@@ -1224,7 +1207,7 @@ fn sendfile_without_offset_pointer_advances_file_offset_and_writes_pipe() {
                     SyscallArgs::from([0x4100, LINUX_O_NONBLOCK, 0, 0, 0, 0])
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -1235,7 +1218,7 @@ fn sendfile_without_offset_pointer_advances_file_offset_and_writes_pipe() {
             .dispatch(
                 SyscallRequest::new(71, SyscallArgs::from([pair.write_fd as u64, 3, 0, 6, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 6 }
@@ -1248,7 +1231,7 @@ fn sendfile_without_offset_pointer_advances_file_offset_and_writes_pipe() {
                     SyscallArgs::from([pair.read_fd as u64, 0x4200, 6, 0, 0, 0])
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 6 }
@@ -1259,7 +1242,7 @@ fn sendfile_without_offset_pointer_advances_file_offset_and_writes_pipe() {
             .dispatch(
                 SyscallRequest::new(63, SyscallArgs::from([3, 0x4300, 1, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 1 }
@@ -1267,7 +1250,6 @@ fn sendfile_without_offset_pointer_advances_file_offset_and_writes_pipe() {
     assert_eq!(memory.read_bytes(0x4300, 1).unwrap(), b" ");
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
-
 
 #[test]
 fn splice_moves_bytes_between_rootfs_files_pipes_and_stdout() {
@@ -1279,7 +1261,7 @@ fn splice_moves_bytes_between_rootfs_files_pipes_and_stdout() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x600]);
     memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();
     write_u64(&mut memory, 0x4100, 7);
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
 
     assert_eq!(
@@ -1290,7 +1272,7 @@ fn splice_moves_bytes_between_rootfs_files_pipes_and_stdout() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 3 }
@@ -1303,7 +1285,7 @@ fn splice_moves_bytes_between_rootfs_files_pipes_and_stdout() {
                     SyscallArgs::from([0x4200, LINUX_O_NONBLOCK, 0, 0, 0, 0])
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -1320,7 +1302,7 @@ fn splice_moves_bytes_between_rootfs_files_pipes_and_stdout() {
                     ),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 4 }
@@ -1331,7 +1313,7 @@ fn splice_moves_bytes_between_rootfs_files_pipes_and_stdout() {
             .dispatch(
                 SyscallRequest::new(76, SyscallArgs::from([pair.read_fd as u64, 0, 1, 0, 4, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 4 }
@@ -1342,7 +1324,7 @@ fn splice_moves_bytes_between_rootfs_files_pipes_and_stdout() {
             .dispatch(
                 SyscallRequest::new(63, SyscallArgs::from([3, 0x4300, 4, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 4 }
@@ -1356,14 +1338,13 @@ fn splice_moves_bytes_between_rootfs_files_pipes_and_stdout() {
                     SyscallArgs::from([3, 0, pair.write_fd as u64, 0, 1, 0x10]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 22 }
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
-
 
 #[test]
 fn readv_reads_file_across_packed_iovecs() {
@@ -1379,7 +1360,7 @@ fn readv_reads_file_across_packed_iovecs() {
         0x4100,
         [LinuxIovec::new(0x4200, 6), LinuxIovec::new(0x4300, 4)],
     );
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
 
     assert_eq!(
@@ -1390,7 +1371,7 @@ fn readv_reads_file_across_packed_iovecs() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 3 }
@@ -1400,7 +1381,7 @@ fn readv_reads_file_across_packed_iovecs() {
             .dispatch(
                 SyscallRequest::new(65, SyscallArgs::from([3, 0x4100, 2, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 10 }
@@ -1409,7 +1390,6 @@ fn readv_reads_file_across_packed_iovecs() {
     assert_eq!(memory.read_bytes(0x4300, 4).unwrap(), b" say");
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
-
 
 #[test]
 fn dup_shares_rootfs_file_offset_with_original_fd() {
@@ -1420,7 +1400,7 @@ fn dup_shares_rootfs_file_offset_with_original_fd() {
     .unwrap();
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
     memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
 
     assert_eq!(
@@ -1431,7 +1411,7 @@ fn dup_shares_rootfs_file_offset_with_original_fd() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 3 }
@@ -1441,7 +1421,7 @@ fn dup_shares_rootfs_file_offset_with_original_fd() {
             .dispatch(
                 SyscallRequest::new(23, SyscallArgs::from([3, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 4 }
@@ -1451,7 +1431,7 @@ fn dup_shares_rootfs_file_offset_with_original_fd() {
             .dispatch(
                 SyscallRequest::new(63, SyscallArgs::from([3, 0x4100, 4, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 4 }
@@ -1461,7 +1441,7 @@ fn dup_shares_rootfs_file_offset_with_original_fd() {
             .dispatch(
                 SyscallRequest::new(63, SyscallArgs::from([4, 0x4200, 4, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 4 }
@@ -1470,7 +1450,6 @@ fn dup_shares_rootfs_file_offset_with_original_fd() {
     assert_eq!(memory.read_bytes(0x4200, 4).unwrap(), b"fs s");
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
-
 
 #[test]
 fn dup3_installs_requested_fd_and_cloexec_is_per_descriptor() {
@@ -1481,7 +1460,7 @@ fn dup3_installs_requested_fd_and_cloexec_is_per_descriptor() {
     .unwrap();
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
     memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
 
     assert_eq!(
@@ -1492,7 +1471,7 @@ fn dup3_installs_requested_fd_and_cloexec_is_per_descriptor() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 3 }
@@ -1502,7 +1481,7 @@ fn dup3_installs_requested_fd_and_cloexec_is_per_descriptor() {
             .dispatch(
                 SyscallRequest::new(24, SyscallArgs::from([3, 9, LINUX_O_CLOEXEC, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 9 }
@@ -1512,7 +1491,7 @@ fn dup3_installs_requested_fd_and_cloexec_is_per_descriptor() {
             .dispatch(
                 SyscallRequest::new(25, SyscallArgs::from([3, LINUX_F_GETFD, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -1522,7 +1501,7 @@ fn dup3_installs_requested_fd_and_cloexec_is_per_descriptor() {
             .dispatch(
                 SyscallRequest::new(25, SyscallArgs::from([9, LINUX_F_GETFD, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned {
@@ -1531,7 +1510,6 @@ fn dup3_installs_requested_fd_and_cloexec_is_per_descriptor() {
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
-
 
 #[test]
 fn fcntl_gets_and_sets_descriptor_and_status_flags() {
@@ -1542,7 +1520,7 @@ fn fcntl_gets_and_sets_descriptor_and_status_flags() {
     .unwrap();
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
     memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
 
     assert_eq!(
@@ -1553,7 +1531,7 @@ fn fcntl_gets_and_sets_descriptor_and_status_flags() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, LINUX_O_CLOEXEC, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 3 }
@@ -1563,7 +1541,7 @@ fn fcntl_gets_and_sets_descriptor_and_status_flags() {
             .dispatch(
                 SyscallRequest::new(25, SyscallArgs::from([3, LINUX_F_GETFD, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned {
@@ -1575,7 +1553,7 @@ fn fcntl_gets_and_sets_descriptor_and_status_flags() {
             .dispatch(
                 SyscallRequest::new(25, SyscallArgs::from([3, LINUX_F_SETFD, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -1585,7 +1563,7 @@ fn fcntl_gets_and_sets_descriptor_and_status_flags() {
             .dispatch(
                 SyscallRequest::new(25, SyscallArgs::from([3, LINUX_F_GETFD, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -1595,7 +1573,7 @@ fn fcntl_gets_and_sets_descriptor_and_status_flags() {
             .dispatch(
                 SyscallRequest::new(25, SyscallArgs::from([3, LINUX_F_GETFL, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -1608,7 +1586,7 @@ fn fcntl_gets_and_sets_descriptor_and_status_flags() {
                     SyscallArgs::from([3, LINUX_F_DUPFD_CLOEXEC, 8, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 8 }
@@ -1618,7 +1596,7 @@ fn fcntl_gets_and_sets_descriptor_and_status_flags() {
             .dispatch(
                 SyscallRequest::new(25, SyscallArgs::from([8, LINUX_F_GETFD, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned {
@@ -1630,14 +1608,13 @@ fn fcntl_gets_and_sets_descriptor_and_status_flags() {
             .dispatch(
                 SyscallRequest::new(25, SyscallArgs::from([3, LINUX_F_DUPFD, 8, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 9 }
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
-
 
 #[test]
 fn writev_writes_stdout_from_packed_iovecs() {
@@ -1649,7 +1626,7 @@ fn writev_writes_stdout_from_packed_iovecs() {
         0x4100,
         [LinuxIovec::new(0x4200, 6), LinuxIovec::new(0x4300, 6)],
     );
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     assert_eq!(
@@ -1657,7 +1634,7 @@ fn writev_writes_stdout_from_packed_iovecs() {
             .dispatch(
                 SyscallRequest::new(66, SyscallArgs::from([1, 0x4100, 2, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 12 }
@@ -1665,7 +1642,6 @@ fn writev_writes_stdout_from_packed_iovecs() {
     assert_eq!(dispatcher.stdout(), b"hello linux\n");
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
-
 
 #[test]
 fn readlinkat_reads_rootfs_symlink_target_without_nul() {
@@ -1678,7 +1654,7 @@ fn readlinkat_reads_rootfs_symlink_target_without_nul() {
     memory
         .write_bytes(0x4000, b"/lib/ld-linux-aarch64.so.1\0")
         .unwrap();
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
 
     let outcome = dispatcher
@@ -1688,7 +1664,7 @@ fn readlinkat_reads_rootfs_symlink_target_without_nul() {
                 SyscallArgs::from([(-100_i64) as u64, 0x4000, 0x4100, 64, 0, 0]),
             ),
             &mut memory,
-            &mut reporter,
+            &reporter,
         )
         .unwrap();
 
@@ -1707,7 +1683,6 @@ fn readlinkat_reads_rootfs_symlink_target_without_nul() {
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
-
 #[test]
 fn readlinkat_reports_synthetic_proc_self_exe() {
     let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
@@ -1717,7 +1692,7 @@ fn readlinkat_reports_synthetic_proc_self_exe() {
     .unwrap();
     let mut memory = LinearMemory::new(0x4000, vec![0xff; 0x200]);
     memory.write_bytes(0x4000, b"/proc/self/exe\0").unwrap();
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::with_rootfs_and_executable(rootfs, "/bin/app");
 
     let outcome = dispatcher
@@ -1727,7 +1702,7 @@ fn readlinkat_reports_synthetic_proc_self_exe() {
                 SyscallArgs::from([(-100_i64) as u64, 0x4000, 0x4100, 64, 0, 0]),
             ),
             &mut memory,
-            &mut reporter,
+            &reporter,
         )
         .unwrap();
 
@@ -1737,13 +1712,12 @@ fn readlinkat_reports_synthetic_proc_self_exe() {
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
-
 #[test]
 fn openat_reads_synthetic_proc_maps_and_cpuinfo() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
     memory.write_bytes(0x4000, b"/proc/self/maps\0").unwrap();
     memory.write_bytes(0x4040, b"/proc/cpuinfo\0").unwrap();
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     assert_eq!(
@@ -1754,7 +1728,7 @@ fn openat_reads_synthetic_proc_maps_and_cpuinfo() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 3 }
@@ -1763,7 +1737,7 @@ fn openat_reads_synthetic_proc_maps_and_cpuinfo() {
         .dispatch(
             SyscallRequest::new(63, SyscallArgs::from([3, 0x4100, 0x400, 0, 0, 0])),
             &mut memory,
-            &mut reporter,
+            &reporter,
         )
         .unwrap();
     let DispatchOutcome::Returned { value: maps_len } = maps_read else {
@@ -1783,7 +1757,7 @@ fn openat_reads_synthetic_proc_maps_and_cpuinfo() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4040, 0, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 4 }
@@ -1792,7 +1766,7 @@ fn openat_reads_synthetic_proc_maps_and_cpuinfo() {
         .dispatch(
             SyscallRequest::new(63, SyscallArgs::from([4, 0x4500, 0x200, 0, 0, 0])),
             &mut memory,
-            &mut reporter,
+            &reporter,
         )
         .unwrap();
     let DispatchOutcome::Returned { value: cpuinfo_len } = cpuinfo_read else {
@@ -1808,7 +1782,6 @@ fn openat_reads_synthetic_proc_maps_and_cpuinfo() {
     assert!(report.unhandled_syscalls.is_empty());
     assert!(report.proc_read_unimplemented.is_empty());
 }
-
 
 #[test]
 fn synthetic_proc_surface_serves_common_process_and_system_files() {
@@ -1835,7 +1808,7 @@ fn synthetic_proc_surface_serves_common_process_and_system_files() {
     ];
 
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     let path_address = 0x4000_u64;
@@ -1851,7 +1824,7 @@ fn synthetic_proc_surface_serves_common_process_and_system_files() {
                     SyscallArgs::from([(-100_i64) as u64, path_address, 0, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap();
         assert_eq!(
@@ -1866,7 +1839,7 @@ fn synthetic_proc_surface_serves_common_process_and_system_files() {
                     SyscallArgs::from([next_fd as u64, read_buffer, read_len_max, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap();
         let DispatchOutcome::Returned { value: read_len } = read else {
@@ -1896,12 +1869,11 @@ fn synthetic_proc_surface_serves_common_process_and_system_files() {
     assert!(report.unhandled_syscalls.is_empty());
 }
 
-
 #[test]
 fn synthetic_proc_files_write_regular_packed_stat_records() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
     memory.write_bytes(0x4000, b"/proc/cpuinfo\0").unwrap();
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     assert_eq!(
@@ -1912,7 +1884,7 @@ fn synthetic_proc_files_write_regular_packed_stat_records() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0x4100, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -1932,7 +1904,7 @@ fn synthetic_proc_files_write_regular_packed_stat_records() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 3 }
@@ -1942,7 +1914,7 @@ fn synthetic_proc_files_write_regular_packed_stat_records() {
             .dispatch(
                 SyscallRequest::new(80, SyscallArgs::from([3, 0x4200, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -1957,11 +1929,10 @@ fn synthetic_proc_files_write_regular_packed_stat_records() {
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
-
 #[test]
 fn missing_proc_file_records_compat_report_entry() {
     let mut memory = LinearMemory::new(0x4000, b"/proc/self/io\0".to_vec());
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     let outcome = dispatcher
@@ -1971,7 +1942,7 @@ fn missing_proc_file_records_compat_report_entry() {
                 SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
             ),
             &mut memory,
-            &mut reporter,
+            &reporter,
         )
         .unwrap();
 
@@ -1981,7 +1952,6 @@ fn missing_proc_file_records_compat_report_entry() {
     assert_eq!(report.proc_read_unimplemented[0].path, "/proc/self/io");
     assert_eq!(report.proc_read_unimplemented[0].count, 1);
 }
-
 
 #[test]
 fn synthetic_sys_surface_serves_common_cpu_and_mm_files() {
@@ -2036,7 +2006,7 @@ fn synthetic_sys_surface_serves_common_cpu_and_mm_files() {
     ];
 
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     let path_address = 0x4000_u64;
@@ -2052,7 +2022,7 @@ fn synthetic_sys_surface_serves_common_cpu_and_mm_files() {
                     SyscallArgs::from([(-100_i64) as u64, path_address, 0, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap();
         assert_eq!(
@@ -2067,7 +2037,7 @@ fn synthetic_sys_surface_serves_common_cpu_and_mm_files() {
                     SyscallArgs::from([next_fd as u64, read_buffer, read_len_max, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap();
         let DispatchOutcome::Returned { value: read_len } = read else {
@@ -2087,12 +2057,13 @@ fn synthetic_sys_surface_serves_common_cpu_and_mm_files() {
     assert!(report.unhandled_syscalls.is_empty());
 }
 
-
 #[test]
 fn missing_sys_file_records_compat_report_entry() {
-    let mut memory =
-        LinearMemory::new(0x4000, b"/sys/devices/virtual/dmi/id/product_uuid\0".to_vec());
-    let mut reporter = CompatReporter::default();
+    let mut memory = LinearMemory::new(
+        0x4000,
+        b"/sys/devices/virtual/dmi/id/product_uuid\0".to_vec(),
+    );
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     let outcome = dispatcher
@@ -2102,7 +2073,7 @@ fn missing_sys_file_records_compat_report_entry() {
                 SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
             ),
             &mut memory,
-            &mut reporter,
+            &reporter,
         )
         .unwrap();
 
@@ -2116,7 +2087,6 @@ fn missing_sys_file_records_compat_report_entry() {
     assert_eq!(report.sys_read_unimplemented[0].count, 1);
 }
 
-
 #[test]
 fn newfstatat_and_fstat_write_typed_linux_stat() {
     let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
@@ -2126,7 +2096,7 @@ fn newfstatat_and_fstat_write_typed_linux_stat() {
     .unwrap();
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x500]);
     memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
 
     assert_eq!(
@@ -2137,7 +2107,7 @@ fn newfstatat_and_fstat_write_typed_linux_stat() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0x4100, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -2157,7 +2127,7 @@ fn newfstatat_and_fstat_write_typed_linux_stat() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 3 }
@@ -2167,7 +2137,7 @@ fn newfstatat_and_fstat_write_typed_linux_stat() {
             .dispatch(
                 SyscallRequest::new(80, SyscallArgs::from([3, 0x4200, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -2187,7 +2157,7 @@ fn newfstatat_and_fstat_write_typed_linux_stat() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4300, 0x4400, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -2196,7 +2166,6 @@ fn newfstatat_and_fstat_write_typed_linux_stat() {
     let mode = stat.st_mode;
     assert_eq!(mode & LINUX_S_IFMT, LINUX_S_IFDIR);
 }
-
 
 #[test]
 fn statx_writes_basic_rootfs_fd_and_symlink_metadata() {
@@ -2209,7 +2178,7 @@ fn statx_writes_basic_rootfs_fd_and_symlink_metadata() {
     memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();
     memory.write_bytes(0x4020, b"/etc/motd-link\0").unwrap();
     memory.write_bytes(0x4040, b"\0").unwrap();
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
 
     assert_eq!(
@@ -2227,7 +2196,7 @@ fn statx_writes_basic_rootfs_fd_and_symlink_metadata() {
                     ]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -2259,7 +2228,7 @@ fn statx_writes_basic_rootfs_fd_and_symlink_metadata() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 3 }
@@ -2279,7 +2248,7 @@ fn statx_writes_basic_rootfs_fd_and_symlink_metadata() {
                     ]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -2305,7 +2274,7 @@ fn statx_writes_basic_rootfs_fd_and_symlink_metadata() {
                     ]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -2331,7 +2300,7 @@ fn statx_writes_basic_rootfs_fd_and_symlink_metadata() {
                     ]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 22 }
@@ -2351,7 +2320,7 @@ fn statx_writes_basic_rootfs_fd_and_symlink_metadata() {
                     ]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 22 }
@@ -2371,14 +2340,13 @@ fn statx_writes_basic_rootfs_fd_and_symlink_metadata() {
                     ]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 14 }
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
-
 
 #[test]
 fn getdents64_lists_rootfs_directory_entries() {
@@ -2389,7 +2357,7 @@ fn getdents64_lists_rootfs_directory_entries() {
     .unwrap();
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x500]);
     memory.write_bytes(0x4000, b"/etc\0").unwrap();
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
 
     assert_eq!(
@@ -2400,7 +2368,7 @@ fn getdents64_lists_rootfs_directory_entries() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 3 }
@@ -2410,7 +2378,7 @@ fn getdents64_lists_rootfs_directory_entries() {
         .dispatch(
             SyscallRequest::new(61, SyscallArgs::from([3, 0x4100, 0x100, 0, 0, 0])),
             &mut memory,
-            &mut reporter,
+            &reporter,
         )
         .unwrap();
     let DispatchOutcome::Returned { value } = outcome else {
@@ -2437,13 +2405,12 @@ fn getdents64_lists_rootfs_directory_entries() {
             .dispatch(
                 SyscallRequest::new(61, SyscallArgs::from([3, 0x4100, 0x100, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
     );
 }
-
 
 #[test]
 fn fchown_and_fchownat_succeed_on_writable_overlay_and_validate_args() {
@@ -2457,7 +2424,7 @@ fn fchown_and_fchownat_succeed_on_writable_overlay_and_validate_args() {
     memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();
     memory.write_bytes(0x4020, b"/etc/missing\0").unwrap();
     memory.write_bytes(0x4040, b"\0").unwrap();
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
 
     assert_eq!(
@@ -2465,7 +2432,7 @@ fn fchown_and_fchownat_succeed_on_writable_overlay_and_validate_args() {
             .dispatch(
                 SyscallRequest::new(55, SyscallArgs::from([1, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         // The rootfs is backed by a writable overlay (tmpfs-like; owner/mode are
@@ -2478,7 +2445,7 @@ fn fchown_and_fchownat_succeed_on_writable_overlay_and_validate_args() {
             .dispatch(
                 SyscallRequest::new(55, SyscallArgs::from([99, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 9 }
@@ -2492,7 +2459,7 @@ fn fchown_and_fchownat_succeed_on_writable_overlay_and_validate_args() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         // fchownat on an existing path: no-op success on the writable overlay.
@@ -2506,7 +2473,7 @@ fn fchown_and_fchownat_succeed_on_writable_overlay_and_validate_args() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4020, 0, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 2 }
@@ -2519,7 +2486,7 @@ fn fchown_and_fchownat_succeed_on_writable_overlay_and_validate_args() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4040, 0, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 2 }
@@ -2533,7 +2500,7 @@ fn fchown_and_fchownat_succeed_on_writable_overlay_and_validate_args() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 3 }
@@ -2541,12 +2508,9 @@ fn fchown_and_fchownat_succeed_on_writable_overlay_and_validate_args() {
     assert_eq!(
         dispatcher
             .dispatch(
-                SyscallRequest::new(
-                    54,
-                    SyscallArgs::from([3, 0x4040, 0, 0, AT_EMPTY_PATH, 0]),
-                ),
+                SyscallRequest::new(54, SyscallArgs::from([3, 0x4040, 0, 0, AT_EMPTY_PATH, 0]),),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         // fchownat(AT_EMPTY_PATH) on an open fd: no-op success on the overlay.
@@ -2560,7 +2524,7 @@ fn fchown_and_fchownat_succeed_on_writable_overlay_and_validate_args() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0xdead, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 22 }
@@ -2568,7 +2532,6 @@ fn fchown_and_fchownat_succeed_on_writable_overlay_and_validate_args() {
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
-
 
 #[test]
 fn fchmod_and_fchmodat_succeed_on_writable_overlay_and_validate_args() {
@@ -2581,7 +2544,7 @@ fn fchmod_and_fchmodat_succeed_on_writable_overlay_and_validate_args() {
     memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();
     memory.write_bytes(0x4020, b"/etc/missing\0").unwrap();
     memory.write_bytes(0x4040, b"\0").unwrap();
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
 
     assert_eq!(
@@ -2589,7 +2552,7 @@ fn fchmod_and_fchmodat_succeed_on_writable_overlay_and_validate_args() {
             .dispatch(
                 SyscallRequest::new(52, SyscallArgs::from([1, 0o644, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         // Writable overlay + root guest: fchmod succeeds (no-op on the
@@ -2601,7 +2564,7 @@ fn fchmod_and_fchmodat_succeed_on_writable_overlay_and_validate_args() {
             .dispatch(
                 SyscallRequest::new(52, SyscallArgs::from([99, 0o644, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 9 }
@@ -2615,7 +2578,7 @@ fn fchmod_and_fchmodat_succeed_on_writable_overlay_and_validate_args() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0o644, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         // fchmodat on an existing path applies to the writable overlay backend
@@ -2630,7 +2593,7 @@ fn fchmod_and_fchmodat_succeed_on_writable_overlay_and_validate_args() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4020, 0o644, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 2 }
@@ -2643,7 +2606,7 @@ fn fchmod_and_fchmodat_succeed_on_writable_overlay_and_validate_args() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4040, 0o644, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 2 }
@@ -2656,7 +2619,7 @@ fn fchmod_and_fchmodat_succeed_on_writable_overlay_and_validate_args() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0o644, 0xdead, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 22 }
@@ -2664,7 +2627,6 @@ fn fchmod_and_fchmodat_succeed_on_writable_overlay_and_validate_args() {
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
-
 
 #[test]
 fn linkat_reports_eexist_enoent_and_links_into_writable_overlay() {
@@ -2678,7 +2640,7 @@ fn linkat_reports_eexist_enoent_and_links_into_writable_overlay() {
     memory.write_bytes(0x4020, b"/etc/missing\0").unwrap();
     memory.write_bytes(0x4040, b"/etc/new-link\0").unwrap();
     memory.write_bytes(0x4060, b"\0").unwrap();
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
 
     assert_eq!(
@@ -2686,17 +2648,12 @@ fn linkat_reports_eexist_enoent_and_links_into_writable_overlay() {
             .dispatch(
                 SyscallRequest::new(
                     37,
-                    SyscallArgs::from([
-                        (-100_i64) as u64,
-                        0x4000,
-                        (-100_i64) as u64,
-                        0x4000,
-                        0,
-                        0,
-                    ]),
+                    SyscallArgs::from(
+                        [(-100_i64) as u64, 0x4000, (-100_i64) as u64, 0x4000, 0, 0,]
+                    ),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 17 }
@@ -2706,17 +2663,12 @@ fn linkat_reports_eexist_enoent_and_links_into_writable_overlay() {
             .dispatch(
                 SyscallRequest::new(
                     37,
-                    SyscallArgs::from([
-                        (-100_i64) as u64,
-                        0x4000,
-                        (-100_i64) as u64,
-                        0x4040,
-                        0,
-                        0,
-                    ]),
+                    SyscallArgs::from(
+                        [(-100_i64) as u64, 0x4000, (-100_i64) as u64, 0x4040, 0, 0,]
+                    ),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         // Hard-linking an existing file to a new name lands in the writable
@@ -2729,17 +2681,12 @@ fn linkat_reports_eexist_enoent_and_links_into_writable_overlay() {
             .dispatch(
                 SyscallRequest::new(
                     37,
-                    SyscallArgs::from([
-                        (-100_i64) as u64,
-                        0x4020,
-                        (-100_i64) as u64,
-                        0x4040,
-                        0,
-                        0,
-                    ]),
+                    SyscallArgs::from(
+                        [(-100_i64) as u64, 0x4020, (-100_i64) as u64, 0x4040, 0, 0,]
+                    ),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 2 }
@@ -2749,17 +2696,12 @@ fn linkat_reports_eexist_enoent_and_links_into_writable_overlay() {
             .dispatch(
                 SyscallRequest::new(
                     37,
-                    SyscallArgs::from([
-                        (-100_i64) as u64,
-                        0x4000,
-                        (-100_i64) as u64,
-                        0x4060,
-                        0,
-                        0,
-                    ]),
+                    SyscallArgs::from(
+                        [(-100_i64) as u64, 0x4000, (-100_i64) as u64, 0x4060, 0, 0,]
+                    ),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 2 }
@@ -2779,7 +2721,7 @@ fn linkat_reports_eexist_enoent_and_links_into_writable_overlay() {
                     ]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 22 }
@@ -2787,7 +2729,6 @@ fn linkat_reports_eexist_enoent_and_links_into_writable_overlay() {
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
-
 
 #[test]
 fn symlinkat_bootstrap_reports_eexist_for_known_links_and_erofs_for_new_paths() {
@@ -2801,7 +2742,7 @@ fn symlinkat_bootstrap_reports_eexist_for_known_links_and_erofs_for_new_paths() 
     memory.write_bytes(0x4020, b"/etc/motd\0").unwrap();
     memory.write_bytes(0x4040, b"/etc/new-link\0").unwrap();
     memory.write_bytes(0x4060, b"\0").unwrap();
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
 
     assert_eq!(
@@ -2812,7 +2753,7 @@ fn symlinkat_bootstrap_reports_eexist_for_known_links_and_erofs_for_new_paths() 
                     SyscallArgs::from([0x4000, (-100_i64) as u64, 0x4020, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 17 }
@@ -2825,7 +2766,7 @@ fn symlinkat_bootstrap_reports_eexist_for_known_links_and_erofs_for_new_paths() 
                     SyscallArgs::from([0x4000, (-100_i64) as u64, 0x4040, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 30 }
@@ -2838,7 +2779,7 @@ fn symlinkat_bootstrap_reports_eexist_for_known_links_and_erofs_for_new_paths() 
                     SyscallArgs::from([0x4060, (-100_i64) as u64, 0x4040, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 2 }
@@ -2851,7 +2792,7 @@ fn symlinkat_bootstrap_reports_eexist_for_known_links_and_erofs_for_new_paths() 
                     SyscallArgs::from([0x4000, (-100_i64) as u64, 0x4060, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 2 }
@@ -2859,7 +2800,6 @@ fn symlinkat_bootstrap_reports_eexist_for_known_links_and_erofs_for_new_paths() 
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
-
 
 #[test]
 fn renameat_renames_known_sources_into_overlay_and_enoent_otherwise() {
@@ -2873,7 +2813,7 @@ fn renameat_renames_known_sources_into_overlay_and_enoent_otherwise() {
     memory.write_bytes(0x4020, b"/etc/motd.bak\0").unwrap();
     memory.write_bytes(0x4040, b"/etc/missing\0").unwrap();
     memory.write_bytes(0x4060, b"\0").unwrap();
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
 
     assert_eq!(
@@ -2881,17 +2821,12 @@ fn renameat_renames_known_sources_into_overlay_and_enoent_otherwise() {
             .dispatch(
                 SyscallRequest::new(
                     38,
-                    SyscallArgs::from([
-                        (-100_i64) as u64,
-                        0x4000,
-                        (-100_i64) as u64,
-                        0x4020,
-                        0,
-                        0,
-                    ]),
+                    SyscallArgs::from(
+                        [(-100_i64) as u64, 0x4000, (-100_i64) as u64, 0x4020, 0, 0,]
+                    ),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         // Renaming an existing rootfs file copies it up into the writable
@@ -2904,17 +2839,12 @@ fn renameat_renames_known_sources_into_overlay_and_enoent_otherwise() {
             .dispatch(
                 SyscallRequest::new(
                     38,
-                    SyscallArgs::from([
-                        (-100_i64) as u64,
-                        0x4040,
-                        (-100_i64) as u64,
-                        0x4020,
-                        0,
-                        0,
-                    ]),
+                    SyscallArgs::from(
+                        [(-100_i64) as u64, 0x4040, (-100_i64) as u64, 0x4020, 0, 0,]
+                    ),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 2 }
@@ -2924,17 +2854,12 @@ fn renameat_renames_known_sources_into_overlay_and_enoent_otherwise() {
             .dispatch(
                 SyscallRequest::new(
                     38,
-                    SyscallArgs::from([
-                        (-100_i64) as u64,
-                        0x4060,
-                        (-100_i64) as u64,
-                        0x4020,
-                        0,
-                        0,
-                    ]),
+                    SyscallArgs::from(
+                        [(-100_i64) as u64, 0x4060, (-100_i64) as u64, 0x4020, 0, 0,]
+                    ),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 2 }
@@ -2944,17 +2869,12 @@ fn renameat_renames_known_sources_into_overlay_and_enoent_otherwise() {
             .dispatch(
                 SyscallRequest::new(
                     38,
-                    SyscallArgs::from([
-                        (-100_i64) as u64,
-                        0x4000,
-                        (-100_i64) as u64,
-                        0x4060,
-                        0,
-                        0,
-                    ]),
+                    SyscallArgs::from(
+                        [(-100_i64) as u64, 0x4000, (-100_i64) as u64, 0x4060, 0, 0,]
+                    ),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 2 }
@@ -2962,7 +2882,6 @@ fn renameat_renames_known_sources_into_overlay_and_enoent_otherwise() {
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
-
 
 #[test]
 fn unlinkat_removes_files_on_overlay_and_validates_directory_kind() {
@@ -2980,7 +2899,7 @@ fn unlinkat_removes_files_on_overlay_and_validates_directory_kind() {
     memory.write_bytes(0x4020, b"/etc/conf.d\0").unwrap();
     memory.write_bytes(0x4040, b"/etc/missing\0").unwrap();
     memory.write_bytes(0x4060, b"\0").unwrap();
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
 
     // unlinkat(AT_REMOVEDIR) on a regular file is ENOTDIR (checked while motd
@@ -2993,7 +2912,7 @@ fn unlinkat_removes_files_on_overlay_and_validates_directory_kind() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, AT_REMOVEDIR, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 20 }
@@ -3001,9 +2920,12 @@ fn unlinkat_removes_files_on_overlay_and_validates_directory_kind() {
     assert_eq!(
         dispatcher
             .dispatch(
-                SyscallRequest::new(35, SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0])),
+                SyscallRequest::new(
+                    35,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0])
+                ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         // Unlinking an existing file records a whiteout/tombstone in the
@@ -3015,9 +2937,12 @@ fn unlinkat_removes_files_on_overlay_and_validates_directory_kind() {
     assert_eq!(
         dispatcher
             .dispatch(
-                SyscallRequest::new(35, SyscallArgs::from([(-100_i64) as u64, 0x4020, 0, 0, 0, 0])),
+                SyscallRequest::new(
+                    35,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4020, 0, 0, 0, 0])
+                ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 21 }
@@ -3032,7 +2957,7 @@ fn unlinkat_removes_files_on_overlay_and_validates_directory_kind() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4020, AT_REMOVEDIR, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 39 }
@@ -3040,9 +2965,12 @@ fn unlinkat_removes_files_on_overlay_and_validates_directory_kind() {
     assert_eq!(
         dispatcher
             .dispatch(
-                SyscallRequest::new(35, SyscallArgs::from([(-100_i64) as u64, 0x4040, 0, 0, 0, 0])),
+                SyscallRequest::new(
+                    35,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4040, 0, 0, 0, 0])
+                ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 2 }
@@ -3050,9 +2978,12 @@ fn unlinkat_removes_files_on_overlay_and_validates_directory_kind() {
     assert_eq!(
         dispatcher
             .dispatch(
-                SyscallRequest::new(35, SyscallArgs::from([(-100_i64) as u64, 0x4060, 0, 0, 0, 0])),
+                SyscallRequest::new(
+                    35,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4060, 0, 0, 0, 0])
+                ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 2 }
@@ -3065,7 +2996,7 @@ fn unlinkat_removes_files_on_overlay_and_validates_directory_kind() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0xdead, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 22 }
@@ -3073,7 +3004,6 @@ fn unlinkat_removes_files_on_overlay_and_validates_directory_kind() {
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
-
 
 #[test]
 fn mknodat_returns_eexist_for_known_paths_and_creates_in_overlay_otherwise() {
@@ -3086,7 +3016,7 @@ fn mknodat_returns_eexist_for_known_paths_and_creates_in_overlay_otherwise() {
     memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();
     memory.write_bytes(0x4020, b"/etc/new-node\0").unwrap();
     memory.write_bytes(0x4040, b"\0").unwrap();
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
 
     assert_eq!(
@@ -3097,7 +3027,7 @@ fn mknodat_returns_eexist_for_known_paths_and_creates_in_overlay_otherwise() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0o100644, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 17 }
@@ -3110,7 +3040,7 @@ fn mknodat_returns_eexist_for_known_paths_and_creates_in_overlay_otherwise() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4020, 0o100644, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         // mknod with an S_IFREG (regular-file) mode on a new path materialises
@@ -3126,7 +3056,7 @@ fn mknodat_returns_eexist_for_known_paths_and_creates_in_overlay_otherwise() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4040, 0o100644, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 2 }
@@ -3134,7 +3064,6 @@ fn mknodat_returns_eexist_for_known_paths_and_creates_in_overlay_otherwise() {
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
-
 
 #[test]
 fn mkdirat_returns_eexist_for_known_paths_and_creates_in_overlay_otherwise() {
@@ -3149,7 +3078,7 @@ fn mkdirat_returns_eexist_for_known_paths_and_creates_in_overlay_otherwise() {
     memory.write_bytes(0x4040, b"\0").unwrap();
     memory.write_bytes(0x4060, b"/proc/self/maps\0").unwrap();
     memory.write_bytes(0x4080, b"relative/dir\0").unwrap();
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
 
     assert_eq!(
@@ -3160,7 +3089,7 @@ fn mkdirat_returns_eexist_for_known_paths_and_creates_in_overlay_otherwise() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0o755, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 17 }
@@ -3173,7 +3102,7 @@ fn mkdirat_returns_eexist_for_known_paths_and_creates_in_overlay_otherwise() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4060, 0o755, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 17 }
@@ -3186,7 +3115,7 @@ fn mkdirat_returns_eexist_for_known_paths_and_creates_in_overlay_otherwise() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4020, 0o755, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         // mkdir on a new path under an existing parent creates the directory in
@@ -3201,7 +3130,7 @@ fn mkdirat_returns_eexist_for_known_paths_and_creates_in_overlay_otherwise() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4040, 0o755, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 2 }
@@ -3211,7 +3140,7 @@ fn mkdirat_returns_eexist_for_known_paths_and_creates_in_overlay_otherwise() {
             .dispatch(
                 SyscallRequest::new(34, SyscallArgs::from([99, 0x4080, 0o755, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 9 }
@@ -3219,7 +3148,6 @@ fn mkdirat_returns_eexist_for_known_paths_and_creates_in_overlay_otherwise() {
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
-
 
 #[test]
 fn utimensat_sets_times_on_writable_overlay_and_validates_timestamps() {
@@ -3234,7 +3162,7 @@ fn utimensat_sets_times_on_writable_overlay_and_validates_timestamps() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
     memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();
     memory.write_bytes(0x4020, b"/etc/missing\0").unwrap();
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
 
     let now_pair = 0x4100;
@@ -3255,7 +3183,7 @@ fn utimensat_sets_times_on_writable_overlay_and_validates_timestamps() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, valid_pair, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         // Setting explicit atime/mtime on an existing file persists to the
@@ -3271,7 +3199,7 @@ fn utimensat_sets_times_on_writable_overlay_and_validates_timestamps() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, now_pair, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         // UTIME_NOW on an existing file: success on the writable overlay.
@@ -3285,7 +3213,7 @@ fn utimensat_sets_times_on_writable_overlay_and_validates_timestamps() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         // NULL times (set both to now) on an existing file: success.
@@ -3299,7 +3227,7 @@ fn utimensat_sets_times_on_writable_overlay_and_validates_timestamps() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4020, 0, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 2 }
@@ -3312,7 +3240,7 @@ fn utimensat_sets_times_on_writable_overlay_and_validates_timestamps() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, valid_pair, 0xdead, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 22 }
@@ -3325,7 +3253,7 @@ fn utimensat_sets_times_on_writable_overlay_and_validates_timestamps() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, omit_pair, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 22 }
@@ -3335,7 +3263,7 @@ fn utimensat_sets_times_on_writable_overlay_and_validates_timestamps() {
             .dispatch(
                 SyscallRequest::new(88, SyscallArgs::from([(-100_i64) as u64, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 14 }
@@ -3349,7 +3277,7 @@ fn utimensat_sets_times_on_writable_overlay_and_validates_timestamps() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 3 }
@@ -3359,7 +3287,7 @@ fn utimensat_sets_times_on_writable_overlay_and_validates_timestamps() {
             .dispatch(
                 SyscallRequest::new(88, SyscallArgs::from([3, 0, valid_pair, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         // futimens form (pathname == NULL with a valid open fd): success on the
@@ -3371,7 +3299,7 @@ fn utimensat_sets_times_on_writable_overlay_and_validates_timestamps() {
             .dispatch(
                 SyscallRequest::new(88, SyscallArgs::from([99, 0, valid_pair, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 9 }
@@ -3379,7 +3307,6 @@ fn utimensat_sets_times_on_writable_overlay_and_validates_timestamps() {
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
-
 
 #[test]
 fn truncate_bootstrap_returns_erofs_for_known_paths_and_enoent_for_missing() {
@@ -3393,7 +3320,7 @@ fn truncate_bootstrap_returns_erofs_for_known_paths_and_enoent_for_missing() {
     memory.write_bytes(0x4020, b"/etc/dir\0").unwrap();
     memory.write_bytes(0x4040, b"/etc/missing\0").unwrap();
     memory.write_bytes(0x4060, b"\0").unwrap();
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
 
     assert_eq!(
@@ -3401,7 +3328,7 @@ fn truncate_bootstrap_returns_erofs_for_known_paths_and_enoent_for_missing() {
             .dispatch(
                 SyscallRequest::new(45, SyscallArgs::from([0x4000, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 30 }
@@ -3411,7 +3338,7 @@ fn truncate_bootstrap_returns_erofs_for_known_paths_and_enoent_for_missing() {
             .dispatch(
                 SyscallRequest::new(45, SyscallArgs::from([0x4020, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 21 }
@@ -3421,7 +3348,7 @@ fn truncate_bootstrap_returns_erofs_for_known_paths_and_enoent_for_missing() {
             .dispatch(
                 SyscallRequest::new(45, SyscallArgs::from([0x4040, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 2 }
@@ -3431,7 +3358,7 @@ fn truncate_bootstrap_returns_erofs_for_known_paths_and_enoent_for_missing() {
             .dispatch(
                 SyscallRequest::new(45, SyscallArgs::from([0x4060, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 2 }
@@ -3441,7 +3368,7 @@ fn truncate_bootstrap_returns_erofs_for_known_paths_and_enoent_for_missing() {
             .dispatch(
                 SyscallRequest::new(45, SyscallArgs::from([0x4000, (-1_i64) as u64, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 22 }
@@ -3449,7 +3376,6 @@ fn truncate_bootstrap_returns_erofs_for_known_paths_and_enoent_for_missing() {
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
-
 
 #[test]
 fn xattr_family_dispatches_per_target_on_in_memory_backend() {
@@ -3465,7 +3391,7 @@ fn xattr_family_dispatches_per_target_on_in_memory_backend() {
     memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();
     memory.write_bytes(0x4020, b"user.test\0").unwrap();
     memory.write_bytes(0x4040, b"data").unwrap();
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     // Path-variant set/get/list (5,6 set; 8,9 get; 11,12 list) and the
@@ -3480,7 +3406,7 @@ fn xattr_family_dispatches_per_target_on_in_memory_backend() {
                         SyscallArgs::from([0x4000, 0x4020, 0x4040, 4, 0, 0]),
                     ),
                     &mut memory,
-                    &mut reporter,
+                    &reporter,
                 )
                 .unwrap(),
             DispatchOutcome::Errno { errno: 95 },
@@ -3499,7 +3425,7 @@ fn xattr_family_dispatches_per_target_on_in_memory_backend() {
                         SyscallArgs::from([0x4000, 0x4020, 0x4040, 4, 0, 0]),
                     ),
                     &mut memory,
-                    &mut reporter,
+                    &reporter,
                 )
                 .unwrap(),
             DispatchOutcome::Errno { errno: 9 },
@@ -3510,7 +3436,6 @@ fn xattr_family_dispatches_per_target_on_in_memory_backend() {
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
-
 #[test]
 fn fallocate_grows_open_files_on_writable_overlay_and_validates_arguments() {
     let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
@@ -3520,7 +3445,7 @@ fn fallocate_grows_open_files_on_writable_overlay_and_validates_arguments() {
     .unwrap();
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
     memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
 
     assert_eq!(
@@ -3528,7 +3453,7 @@ fn fallocate_grows_open_files_on_writable_overlay_and_validates_arguments() {
             .dispatch(
                 SyscallRequest::new(47, SyscallArgs::from([1, 0, 0, 4096, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 29 }
@@ -3538,7 +3463,7 @@ fn fallocate_grows_open_files_on_writable_overlay_and_validates_arguments() {
             .dispatch(
                 SyscallRequest::new(47, SyscallArgs::from([999, 0, 0, 4096, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 9 }
@@ -3548,7 +3473,7 @@ fn fallocate_grows_open_files_on_writable_overlay_and_validates_arguments() {
             .dispatch(
                 SyscallRequest::new(47, SyscallArgs::from([1, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 22 }
@@ -3558,7 +3483,7 @@ fn fallocate_grows_open_files_on_writable_overlay_and_validates_arguments() {
             .dispatch(
                 SyscallRequest::new(47, SyscallArgs::from([1, 0xdead, 0, 4096, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 22 }
@@ -3568,7 +3493,7 @@ fn fallocate_grows_open_files_on_writable_overlay_and_validates_arguments() {
             .dispatch(
                 SyscallRequest::new(47, SyscallArgs::from([1, 0, (-1_i64) as u64, 4096, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 22 }
@@ -3582,7 +3507,7 @@ fn fallocate_grows_open_files_on_writable_overlay_and_validates_arguments() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 3 }
@@ -3592,7 +3517,7 @@ fn fallocate_grows_open_files_on_writable_overlay_and_validates_arguments() {
             .dispatch(
                 SyscallRequest::new(47, SyscallArgs::from([3, 0, 0, 4096, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         // fallocate on an open regular file grows it in the writable overlay
@@ -3604,7 +3529,6 @@ fn fallocate_grows_open_files_on_writable_overlay_and_validates_arguments() {
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
-
 #[test]
 fn ftruncate_bootstrap_rejects_streams_and_read_only_rootfs_fds() {
     let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
@@ -3614,7 +3538,7 @@ fn ftruncate_bootstrap_rejects_streams_and_read_only_rootfs_fds() {
     .unwrap();
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
     memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
 
     assert_eq!(
@@ -3622,7 +3546,7 @@ fn ftruncate_bootstrap_rejects_streams_and_read_only_rootfs_fds() {
             .dispatch(
                 SyscallRequest::new(46, SyscallArgs::from([1, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 22 }
@@ -3632,7 +3556,7 @@ fn ftruncate_bootstrap_rejects_streams_and_read_only_rootfs_fds() {
             .dispatch(
                 SyscallRequest::new(46, SyscallArgs::from([2, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 22 }
@@ -3642,7 +3566,7 @@ fn ftruncate_bootstrap_rejects_streams_and_read_only_rootfs_fds() {
             .dispatch(
                 SyscallRequest::new(46, SyscallArgs::from([99, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 9 }
@@ -3652,7 +3576,7 @@ fn ftruncate_bootstrap_rejects_streams_and_read_only_rootfs_fds() {
             .dispatch(
                 SyscallRequest::new(46, SyscallArgs::from([1, (-1_i64) as u64, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 22 }
@@ -3666,7 +3590,7 @@ fn ftruncate_bootstrap_rejects_streams_and_read_only_rootfs_fds() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 3 }
@@ -3676,7 +3600,7 @@ fn ftruncate_bootstrap_rejects_streams_and_read_only_rootfs_fds() {
             .dispatch(
                 SyscallRequest::new(46, SyscallArgs::from([3, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 9 }
@@ -3684,7 +3608,6 @@ fn ftruncate_bootstrap_rejects_streams_and_read_only_rootfs_fds() {
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
-
 
 #[test]
 fn pwritev_bootstrap_validates_iovecs_and_reports_stream_errors() {
@@ -3702,7 +3625,7 @@ fn pwritev_bootstrap_validates_iovecs_and_reports_stream_errors() {
         0x4100,
         [LinuxIovec::new(0x4200, 4), LinuxIovec::new(0x4300, 9)],
     );
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
 
     assert_eq!(
@@ -3710,7 +3633,7 @@ fn pwritev_bootstrap_validates_iovecs_and_reports_stream_errors() {
             .dispatch(
                 SyscallRequest::new(70, SyscallArgs::from([1, 0x4100, 2, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 29 }
@@ -3720,7 +3643,7 @@ fn pwritev_bootstrap_validates_iovecs_and_reports_stream_errors() {
             .dispatch(
                 SyscallRequest::new(70, SyscallArgs::from([2, 0x4100, 2, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 29 }
@@ -3730,7 +3653,7 @@ fn pwritev_bootstrap_validates_iovecs_and_reports_stream_errors() {
             .dispatch(
                 SyscallRequest::new(70, SyscallArgs::from([99, 0x4100, 2, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 9 }
@@ -3738,12 +3661,9 @@ fn pwritev_bootstrap_validates_iovecs_and_reports_stream_errors() {
     assert_eq!(
         dispatcher
             .dispatch(
-                SyscallRequest::new(
-                    70,
-                    SyscallArgs::from([1, 0x4100, 2, (-1_i64) as u64, 0, 0]),
-                ),
+                SyscallRequest::new(70, SyscallArgs::from([1, 0x4100, 2, (-1_i64) as u64, 0, 0]),),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 22 }
@@ -3759,7 +3679,7 @@ fn pwritev_bootstrap_validates_iovecs_and_reports_stream_errors() {
             .dispatch(
                 SyscallRequest::new(70, SyscallArgs::from([1, 0x4150, 2, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 14 }
@@ -3773,7 +3693,7 @@ fn pwritev_bootstrap_validates_iovecs_and_reports_stream_errors() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 3 }
@@ -3783,7 +3703,7 @@ fn pwritev_bootstrap_validates_iovecs_and_reports_stream_errors() {
             .dispatch(
                 SyscallRequest::new(70, SyscallArgs::from([3, 0x4100, 2, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 9 }
@@ -3791,7 +3711,6 @@ fn pwritev_bootstrap_validates_iovecs_and_reports_stream_errors() {
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
-
 
 #[test]
 fn pwrite64_bootstrap_returns_espipe_for_streams_and_ebadf_for_rootfs_fds() {
@@ -3803,7 +3722,7 @@ fn pwrite64_bootstrap_returns_espipe_for_streams_and_ebadf_for_rootfs_fds() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
     memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();
     memory.write_bytes(0x4100, b"payload!").unwrap();
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
 
     assert_eq!(
@@ -3811,7 +3730,7 @@ fn pwrite64_bootstrap_returns_espipe_for_streams_and_ebadf_for_rootfs_fds() {
             .dispatch(
                 SyscallRequest::new(68, SyscallArgs::from([1, 0x4100, 8, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 29 }
@@ -3821,7 +3740,7 @@ fn pwrite64_bootstrap_returns_espipe_for_streams_and_ebadf_for_rootfs_fds() {
             .dispatch(
                 SyscallRequest::new(68, SyscallArgs::from([2, 0x4100, 8, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 29 }
@@ -3831,7 +3750,7 @@ fn pwrite64_bootstrap_returns_espipe_for_streams_and_ebadf_for_rootfs_fds() {
             .dispatch(
                 SyscallRequest::new(68, SyscallArgs::from([99, 0x4100, 8, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 9 }
@@ -3839,12 +3758,9 @@ fn pwrite64_bootstrap_returns_espipe_for_streams_and_ebadf_for_rootfs_fds() {
     assert_eq!(
         dispatcher
             .dispatch(
-                SyscallRequest::new(
-                    68,
-                    SyscallArgs::from([1, 0x4100, 8, (-1_i64) as u64, 0, 0]),
-                ),
+                SyscallRequest::new(68, SyscallArgs::from([1, 0x4100, 8, (-1_i64) as u64, 0, 0]),),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 22 }
@@ -3858,7 +3774,7 @@ fn pwrite64_bootstrap_returns_espipe_for_streams_and_ebadf_for_rootfs_fds() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 3 }
@@ -3868,7 +3784,7 @@ fn pwrite64_bootstrap_returns_espipe_for_streams_and_ebadf_for_rootfs_fds() {
             .dispatch(
                 SyscallRequest::new(68, SyscallArgs::from([3, 0x4100, 8, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 9 }
@@ -3880,7 +3796,7 @@ fn pwrite64_bootstrap_returns_espipe_for_streams_and_ebadf_for_rootfs_fds() {
             .dispatch(
                 SyscallRequest::new(59, SyscallArgs::from([pipe_pair_address, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -3894,7 +3810,7 @@ fn pwrite64_bootstrap_returns_espipe_for_streams_and_ebadf_for_rootfs_fds() {
                     SyscallArgs::from([pair.write_fd as u64, 0x4100, 8, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 29 }
@@ -3907,7 +3823,7 @@ fn pwrite64_bootstrap_returns_espipe_for_streams_and_ebadf_for_rootfs_fds() {
                     SyscallArgs::from([pair.read_fd as u64, 0x4100, 8, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 29 }
@@ -3915,7 +3831,6 @@ fn pwrite64_bootstrap_returns_espipe_for_streams_and_ebadf_for_rootfs_fds() {
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
-
 
 #[test]
 fn sync_and_fsync_family_return_zero_for_valid_fds_and_ebadf_otherwise() {
@@ -3926,7 +3841,7 @@ fn sync_and_fsync_family_return_zero_for_valid_fds_and_ebadf_otherwise() {
     .unwrap();
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
     memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
 
     assert_eq!(
@@ -3934,7 +3849,7 @@ fn sync_and_fsync_family_return_zero_for_valid_fds_and_ebadf_otherwise() {
             .dispatch(
                 SyscallRequest::new(81, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -3944,7 +3859,7 @@ fn sync_and_fsync_family_return_zero_for_valid_fds_and_ebadf_otherwise() {
             .dispatch(
                 SyscallRequest::new(82, SyscallArgs::from([1, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -3954,7 +3869,7 @@ fn sync_and_fsync_family_return_zero_for_valid_fds_and_ebadf_otherwise() {
             .dispatch(
                 SyscallRequest::new(83, SyscallArgs::from([2, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -3968,7 +3883,7 @@ fn sync_and_fsync_family_return_zero_for_valid_fds_and_ebadf_otherwise() {
                     SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 3 }
@@ -3978,7 +3893,7 @@ fn sync_and_fsync_family_return_zero_for_valid_fds_and_ebadf_otherwise() {
             .dispatch(
                 SyscallRequest::new(82, SyscallArgs::from([3, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -3988,7 +3903,7 @@ fn sync_and_fsync_family_return_zero_for_valid_fds_and_ebadf_otherwise() {
             .dispatch(
                 SyscallRequest::new(83, SyscallArgs::from([3, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -3999,7 +3914,7 @@ fn sync_and_fsync_family_return_zero_for_valid_fds_and_ebadf_otherwise() {
             .dispatch(
                 SyscallRequest::new(82, SyscallArgs::from([99, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 9 }
@@ -4009,7 +3924,7 @@ fn sync_and_fsync_family_return_zero_for_valid_fds_and_ebadf_otherwise() {
             .dispatch(
                 SyscallRequest::new(83, SyscallArgs::from([99, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 9 }
@@ -4017,7 +3932,6 @@ fn sync_and_fsync_family_return_zero_for_valid_fds_and_ebadf_otherwise() {
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
-
 
 #[test]
 fn fcntl_on_bare_stdio_succeeds_not_ebadf() {
@@ -4028,7 +3942,7 @@ fn fcntl_on_bare_stdio_succeeds_not_ebadf() {
     // treated the EBADF as fatal (_exit(100)) — it broke `apt install`.
     const LINUX_F_SETFL: u64 = 4;
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x40]);
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     for fd in [0u64, 1, 2] {
@@ -4040,7 +3954,7 @@ fn fcntl_on_bare_stdio_succeeds_not_ebadf() {
                         SyscallArgs::from([fd, LINUX_F_SETFL, LINUX_O_NONBLOCK, 0, 0, 0]),
                     ),
                     &mut memory,
-                    &mut reporter,
+                    &reporter,
                 )
                 .unwrap(),
             DispatchOutcome::Returned { value: 0 },
@@ -4051,7 +3965,7 @@ fn fcntl_on_bare_stdio_succeeds_not_ebadf() {
                 .dispatch(
                     SyscallRequest::new(25, SyscallArgs::from([fd, cmd, 0, 0, 0, 0])),
                     &mut memory,
-                    &mut reporter,
+                    &reporter,
                 )
                 .unwrap();
             assert!(
@@ -4070,7 +3984,7 @@ fn fcntl_on_bare_stdio_succeeds_not_ebadf() {
                     SyscallArgs::from([999, LINUX_F_SETFL, LINUX_O_NONBLOCK, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 9 },

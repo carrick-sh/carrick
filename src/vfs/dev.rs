@@ -95,7 +95,7 @@ impl Vfs for DevVfs {
     }
 
     fn open(
-        &mut self,
+        &self,
         path: &str,
         flags: OpenFlags,
         _ctx: &OpenContext<'_>,
@@ -116,8 +116,7 @@ impl Vfs for DevVfs {
             host_flags |= libc::O_APPEND;
         }
 
-        let cpath = CString::new(host_path)
-            .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
+        let cpath = CString::new(host_path).map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
         // SAFETY: cpath is a valid NUL-terminated C string.
         let host_fd = unsafe { libc::open(cpath.as_ptr(), host_flags) };
         if host_fd < 0 {
@@ -191,8 +190,7 @@ mod tests {
     fn readdir_lists_all_passthroughs() {
         let v = DevVfs::new();
         let entries = v.readdir("/dev").unwrap();
-        let names: std::collections::BTreeSet<_> =
-            entries.iter().map(|e| e.name.clone()).collect();
+        let names: std::collections::BTreeSet<_> = entries.iter().map(|e| e.name.clone()).collect();
         let expected: std::collections::BTreeSet<_> =
             ["null", "zero", "random", "urandom", "full", "tty"]
                 .iter()
@@ -225,7 +223,11 @@ mod tests {
             )
             .unwrap();
         match h {
-            VfsHandle::HostFd { host_fd, is_read_end, .. } => {
+            VfsHandle::HostFd {
+                host_fd,
+                is_read_end,
+                ..
+            } => {
                 assert!(host_fd >= 0);
                 assert!(is_read_end);
                 // Close to avoid leaking the fd.
@@ -249,7 +251,11 @@ mod tests {
             )
             .unwrap();
         match h {
-            VfsHandle::HostFd { host_fd, is_read_end, .. } => {
+            VfsHandle::HostFd {
+                host_fd,
+                is_read_end,
+                ..
+            } => {
                 assert!(host_fd >= 0);
                 assert!(!is_read_end);
                 unsafe { libc::close(host_fd) };
@@ -319,7 +325,10 @@ mod tests {
                 ..
             } => {
                 assert!(host_fd >= 0);
-                assert_ne!(status_flags & (crate::linux_abi::LINUX_O_NONBLOCK as u32), 0);
+                assert_ne!(
+                    status_flags & (crate::linux_abi::LINUX_O_NONBLOCK as u32),
+                    0
+                );
                 unsafe { libc::close(host_fd) };
             }
             other => panic!("expected HostFd, got {:?}", other),

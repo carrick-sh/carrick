@@ -59,14 +59,72 @@ impl ProcState {
 }
 
 impl SyscallDispatcher {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn dispatch_threaded_lifecycle<M: GuestMemory>(
+        &self,
+        request: SyscallRequest,
+        memory: &mut M,
+        reporter: &CompatReporter,
+        tid: crate::thread::ThreadId,
+        registry: &crate::thread::ThreadRegistry,
+        futex: &crate::thread::FutexTable,
+    ) -> Option<Result<DispatchOutcome, DispatchError>> {
+        match request.number {
+            93 | 94 | 220 | 221 | 260 | 435 => {}
+            _ => return None,
+        }
+
+        let syscall = lookup_aarch64(request.number);
+        let name = syscall.map_or("unknown", |syscall| syscall.name);
+        reporter.record(CompatEvent::SyscallEntry {
+            number: request.number,
+            name: name.to_owned(),
+            args: request.args,
+        });
+
+        let thread = Some(ThreadCtx {
+            tid,
+            registry,
+            futex,
+        });
+        let mut ctx = SyscallCtx {
+            request,
+            memory,
+            reporter,
+            thread,
+        };
+        let outcome = match match request.number {
+            93 | 94 => self.sys_exit(&mut ctx),
+            220 => self.clone(&mut ctx),
+            221 => self.execve(&mut ctx),
+            260 => self.wait4(&mut ctx),
+            435 => self.sys_clone3(&mut ctx),
+            _ => unreachable!("unsupported threaded lifecycle syscall"),
+        } {
+            Ok(outcome) => outcome,
+            Err(error) => return Some(Err(error)),
+        };
+
+        let (retval, errno) = outcome.retval_errno();
+        reporter.record(CompatEvent::SyscallReturn {
+            number: request.number,
+            name: name.to_owned(),
+            retval,
+            errno,
+        });
+
+        Some(Ok(outcome))
+    }
+
     pub(super) fn personality<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let requested = ctx.arg(0);
-        let previous = self.proc.personality;
+        let mut proc = self.proc.lock();
+        let previous = proc.personality;
         if requested != LINUX_PERSONALITY_QUERY {
-            self.proc.personality = requested;
+            proc.personality = requested;
         }
         Ok(DispatchOutcome::Returned {
             value: previous as i64,
@@ -74,14 +132,14 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn prctl<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let memory = &mut *ctx.memory;
         let option = ctx.request.arg(0);
         Ok(match option {
             LINUX_PR_GET_DUMPABLE => DispatchOutcome::Returned {
-                value: self.proc.dumpable,
+                value: self.proc.lock().dumpable,
             },
             LINUX_PR_SET_DUMPABLE => {
                 let value = ctx.request.arg(1);
@@ -90,7 +148,7 @@ impl SyscallDispatcher {
                         errno: LINUX_EINVAL,
                     });
                 }
-                self.proc.dumpable = value as i64;
+                self.proc.lock().dumpable = value as i64;
                 DispatchOutcome::Returned { value: 0 }
             }
             LINUX_PR_SET_NAME => {
@@ -100,17 +158,19 @@ impl SyscallDispatcher {
                         errno: LINUX_EFAULT,
                     });
                 };
-                self.proc.task_name = linux_task_name_from_bytes(&bytes);
+                let task_name = linux_task_name_from_bytes(&bytes);
+                self.proc.lock().task_name = task_name;
                 // Reflect the guest's chosen name into the host
                 // process/thread name as `carrick: <name>`, so `ps -M`
                 // / Activity Monitor / lldb show which guest each
                 // carrick host process is running.
-                set_host_process_name(&self.proc.task_name);
+                set_host_process_name(&task_name);
                 DispatchOutcome::Returned { value: 0 }
             }
             LINUX_PR_GET_NAME => {
                 let address = ctx.request.arg(1);
-                if memory.write_bytes(address, &self.proc.task_name).is_err() {
+                let task_name = self.proc.lock().task_name;
+                if memory.write_bytes(address, &task_name).is_err() {
                     return Ok(DispatchOutcome::Errno {
                         errno: LINUX_EFAULT,
                     });
@@ -126,13 +186,14 @@ impl SyscallDispatcher {
                         errno: LINUX_EINVAL,
                     });
                 }
-                self.proc.pdeathsig = sig as i64;
+                self.proc.lock().pdeathsig = sig as i64;
                 DispatchOutcome::Returned { value: 0 }
             }
             LINUX_PR_GET_PDEATHSIG => {
                 let address = ctx.request.arg(1);
+                let pdeathsig = self.proc.lock().pdeathsig;
                 if memory
-                    .write_bytes(address, &(self.proc.pdeathsig as i32).to_ne_bytes())
+                    .write_bytes(address, &(pdeathsig as i32).to_ne_bytes())
                     .is_err()
                 {
                     return Ok(DispatchOutcome::Errno {
@@ -148,7 +209,7 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn getcpu<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let memory = &mut *ctx.memory;
@@ -173,7 +234,7 @@ impl SyscallDispatcher {
     /// own tid (allocated by the ThreadRegistry); fall back to the pid for
     /// the single-threaded path.
     pub(super) fn gettid<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         if let Some(t) = ctx.thread {
@@ -185,7 +246,9 @@ impl SyscallDispatcher {
             // answer with the live getpid; only once siblings exist do we
             // hand out the distinct per-thread tid.
             if t.registry.live_count() > 1 {
-                return Ok(DispatchOutcome::Returned { value: t.tid as i64 });
+                return Ok(DispatchOutcome::Returned {
+                    value: t.tid as i64,
+                });
             }
         }
         Ok(self.getpid())
@@ -195,19 +258,21 @@ impl SyscallDispatcher {
     /// CLONE_CHILD_CLEARTID word (zeroed + FUTEX_WAKE'd on thread exit) and
     /// returns the caller's tid. Single-threaded path just returns pid.
     pub(super) fn set_tid_address<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let addr = ctx.arg(0);
         if let Some(t) = ctx.thread {
             t.registry.set_clear_child_tid(t.tid, addr);
-            return Ok(DispatchOutcome::Returned { value: t.tid as i64 });
+            return Ok(DispatchOutcome::Returned {
+                value: t.tid as i64,
+            });
         }
         Ok(self.getpid())
     }
 
     pub(super) fn set_robust_list<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let len = ctx.arg(1);
@@ -220,7 +285,7 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn sched_yield<M: GuestMemory>(
-        &mut self,
+        &self,
         _ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         std::thread::yield_now();
@@ -228,7 +293,7 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn sched_getaffinity<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let pid = ctx.arg(0);
@@ -258,7 +323,7 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn futex<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let address = ctx.arg(0);
@@ -300,7 +365,9 @@ impl SyscallDispatcher {
                 LINUX_FUTEX_WAKE => DispatchOutcome::Returned { value: 0 },
                 LINUX_FUTEX_WAIT => {
                     if word != value || timeout_address == 0 {
-                        return Ok(DispatchOutcome::Errno { errno: LINUX_EAGAIN });
+                        return Ok(DispatchOutcome::Errno {
+                            errno: LINUX_EAGAIN,
+                        });
                     }
                     let timespec = match read_timespec(memory, timeout_address) {
                         Ok(t) => t,
@@ -313,9 +380,13 @@ impl SyscallDispatcher {
                     if let Some(timeout) = timeout {
                         std::thread::sleep(timeout);
                     }
-                    DispatchOutcome::Errno { errno: LINUX_ETIMEDOUT }
+                    DispatchOutcome::Errno {
+                        errno: LINUX_ETIMEDOUT,
+                    }
                 }
-                _ => DispatchOutcome::Errno { errno: LINUX_ENOSYS },
+                _ => DispatchOutcome::Errno {
+                    errno: LINUX_ENOSYS,
+                },
             });
         };
 
@@ -324,26 +395,31 @@ impl SyscallDispatcher {
         // same table here (the address space is shared within the process,
         // so the keying is identical) — note it via a partial-syscall probe.
         if flags & LINUX_FUTEX_PRIVATE_FLAG == 0 {
-            ctx.reporter.record(crate::compat::CompatEvent::partial_syscall(
-                98,
-                "futex",
-                args,
-                "non-private futex treated as private (shared address space)",
-            ));
+            ctx.reporter
+                .record(crate::compat::CompatEvent::partial_syscall(
+                    98,
+                    "futex",
+                    args,
+                    "non-private futex treated as private (shared address space)",
+                ));
         }
 
         Ok(match command {
             LINUX_FUTEX_WAKE => {
                 let n = thread.futex.wake(address, value);
-                DispatchOutcome::Returned { value: i64::from(n) }
+                DispatchOutcome::Returned {
+                    value: i64::from(n),
+                }
             }
             LINUX_FUTEX_WAIT => {
-                // Re-check *uaddr under the kernel lock. If it changed since
+                // Re-check *uaddr under the dispatcher lock. If it changed since
                 // the guest's last read, don't block (EAGAIN). Otherwise the
                 // runtime must block with the lock RELEASED, so surface a
                 // FutexWait outcome instead of sleeping here.
                 if word != value {
-                    return Ok(DispatchOutcome::Errno { errno: LINUX_EAGAIN });
+                    return Ok(DispatchOutcome::Errno {
+                        errno: LINUX_EAGAIN,
+                    });
                 }
                 let timeout = if timeout_address == 0 {
                     None
@@ -358,7 +434,7 @@ impl SyscallDispatcher {
                     }
                 };
                 DispatchOutcome::FutexWait {
-                    addr: address,
+                    wait: thread.futex.prepare_wait(address),
                     timeout,
                 }
             }
@@ -369,7 +445,7 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn uname<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let memory = &mut *ctx.memory;
@@ -386,7 +462,7 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn ptrace<M: GuestMemory>(
-        &mut self,
+        &self,
         _ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         // Bootstrap: no debugger surface yet. Linux returns ENOSYS when ptrace
@@ -398,7 +474,7 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn reboot<M: GuestMemory>(
-        &mut self,
+        &self,
         _ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         // We're not root and we wouldn't honour the request anyway.
@@ -406,14 +482,14 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn sethostname<M: GuestMemory>(
-        &mut self,
+        &self,
         _ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         Ok(DispatchOutcome::Errno { errno: LINUX_EPERM })
     }
 
     pub(super) fn setdomainname<M: GuestMemory>(
-        &mut self,
+        &self,
         _ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         Ok(DispatchOutcome::Errno { errno: LINUX_EPERM })
@@ -428,55 +504,69 @@ impl SyscallDispatcher {
     // which broke getpgid(0)==getpid() (getpid now returns the real host pid)
     // and let setsid() spuriously succeed for a group leader.
     pub(super) fn setpgid<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let pid = ctx.arg(0) as libc::pid_t;
         let pgid = ctx.arg(1) as libc::pid_t;
         // SAFETY: setpgid has no memory side effects; errors surface via errno.
         if unsafe { libc::setpgid(pid, pgid) } < 0 {
-            return Ok(DispatchOutcome::Errno { errno: host_errno() });
+            return Ok(DispatchOutcome::Errno {
+                errno: host_errno(),
+            });
         }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
 
     pub(super) fn getpgid<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let pid = ctx.arg(0) as libc::pid_t;
         let r = unsafe { libc::getpgid(pid) };
         if r < 0 {
-            return Ok(DispatchOutcome::Errno { errno: host_errno() });
+            return Ok(DispatchOutcome::Errno {
+                errno: host_errno(),
+            });
         }
-        Ok(DispatchOutcome::Returned { value: i64::from(r) })
+        Ok(DispatchOutcome::Returned {
+            value: i64::from(r),
+        })
     }
 
     pub(super) fn getsid<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let pid = ctx.arg(0) as libc::pid_t;
         let r = unsafe { libc::getsid(pid) };
         if r < 0 {
-            return Ok(DispatchOutcome::Errno { errno: host_errno() });
+            return Ok(DispatchOutcome::Errno {
+                errno: host_errno(),
+            });
         }
-        Ok(DispatchOutcome::Returned { value: i64::from(r) })
+        Ok(DispatchOutcome::Returned {
+            value: i64::from(r),
+        })
     }
 
     pub(super) fn setsid<M: GuestMemory>(
-        &mut self,
+        &self,
         _ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let r = unsafe { libc::setsid() };
         if r < 0 {
-            return Ok(DispatchOutcome::Errno { errno: host_errno() });
+            return Ok(DispatchOutcome::Errno {
+                errno: host_errno(),
+            });
         }
-        Ok(DispatchOutcome::Returned { value: i64::from(r) })
+        Ok(DispatchOutcome::Returned {
+            value: i64::from(r),
+        })
     }
 
     pub(super) fn waitid<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let idtype = ctx.arg(0);
@@ -505,7 +595,7 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn wait4<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let pid = ctx.arg(0) as i32;
@@ -513,14 +603,18 @@ impl SyscallDispatcher {
         let options = ctx.arg(2);
         let memory = &mut *ctx.memory;
         if options & !LINUX_WAIT4_SUPPORTED_FLAGS != 0 {
-            return Ok(DispatchOutcome::Errno { errno: LINUX_EINVAL });
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            });
         }
         // Linux WNOHANG = 1; macOS WNOHANG = 1. Same bit, pass through.
         let mut host_status: i32 = 0;
         let result = unsafe { libc::waitpid(pid, &mut host_status, options as i32) };
         if result < 0 {
             // ECHILD on macOS == ECHILD on Linux (10).
-            return Ok(DispatchOutcome::Errno { errno: host_errno() });
+            return Ok(DispatchOutcome::Errno {
+                errno: host_errno(),
+            });
         }
         if result == 0 {
             // WNOHANG and no child ready.
@@ -535,10 +629,14 @@ impl SyscallDispatcher {
         if wstatus_addr != 0 {
             let bytes = host_status.to_ne_bytes();
             if memory.write_bytes(wstatus_addr, &bytes).is_err() {
-                return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
+                return Ok(DispatchOutcome::Errno {
+                    errno: LINUX_EFAULT,
+                });
             }
         }
-        Ok(DispatchOutcome::Returned { value: i64::from(result) })
+        Ok(DispatchOutcome::Returned {
+            value: i64::from(result),
+        })
     }
 
     /// Linux `execve(2)` (aarch64 syscall 221). Reads pathname, argv,
@@ -547,7 +645,7 @@ impl SyscallDispatcher {
     /// the new image. Returns the usual errno on the failure paths
     /// (EFAULT on bad pointers, ENAMETOOLONG on oversized strings).
     pub(super) fn execve<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let pathname_addr = ctx.arg(0);
@@ -583,7 +681,7 @@ impl SyscallDispatcher {
     ///
     /// aarch64 clone ABI: clone(flags, stack, parent_tid, tls, child_tid)
     pub(super) fn clone<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         const CLONE_VM: u64 = 0x00000100;
@@ -597,13 +695,20 @@ impl SyscallDispatcher {
         const CLONE_CHILD_CLEARTID: u64 = 0x00200000;
 
         let flags = ctx.arg(0);
-        let thread_mask =
-            CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
+        let thread_mask = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
         if (flags & thread_mask) == thread_mask {
             // aarch64 ABI: clone(flags, stack, parent_tid, tls, child_tid)
             let stack = ctx.arg(1);
-            let parent_tid_addr = if flags & CLONE_PARENT_SETTID != 0 { ctx.arg(2) } else { 0 };
-            let tls = if flags & CLONE_SETTLS != 0 { ctx.arg(3) } else { 0 };
+            let parent_tid_addr = if flags & CLONE_PARENT_SETTID != 0 {
+                ctx.arg(2)
+            } else {
+                0
+            };
+            let tls = if flags & CLONE_SETTLS != 0 {
+                ctx.arg(3)
+            } else {
+                0
+            };
             let child_tid_addr = if flags & (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID) != 0 {
                 ctx.arg(4)
             } else {
@@ -634,11 +739,7 @@ impl SyscallDispatcher {
     ///
     /// Thread-create flags now emit `DispatchOutcome::CloneThread`.
     /// Fork-like flags still return `DispatchOutcome::Fork`.
-    fn clone3(
-        &mut self,
-        request: SyscallRequest,
-        memory: &impl GuestMemory,
-    ) -> DispatchOutcome {
+    fn clone3(&self, request: SyscallRequest, memory: &impl GuestMemory) -> DispatchOutcome {
         const CLONE_VM: u64 = 0x00000100;
         const CLONE_FS: u64 = 0x00000200;
         const CLONE_FILES: u64 = 0x00000400;
@@ -676,8 +777,7 @@ impl SyscallDispatcher {
         #[allow(clippy::unwrap_used)]
         let flags = u64::from_le_bytes(bytes[..8].try_into().unwrap());
 
-        let thread_mask =
-            CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
+        let thread_mask = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
         if (flags & thread_mask) == thread_mask {
             // glibc always passes the full struct (64 bytes); if for some reason
             // the caller passes a short struct with thread flags, return ENOSYS
@@ -690,26 +790,31 @@ impl SyscallDispatcher {
 
             // All fields are little-endian u64; offsets from the layout above.
             #[allow(clippy::unwrap_used)]
-            let read_u64_at = |off: usize| -> u64 {
-                u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap())
-            };
-            let child_tid_ptr = read_u64_at(16);  // child_tid@16
+            let read_u64_at =
+                |off: usize| -> u64 { u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap()) };
+            let child_tid_ptr = read_u64_at(16); // child_tid@16
             let parent_tid_ptr = read_u64_at(24); // parent_tid@24
-            let stack = read_u64_at(40);           // stack@40
-            let stack_size = read_u64_at(48);      // stack_size@48
-            let tls_val = read_u64_at(56);         // tls@56
+            let stack = read_u64_at(40); // stack@40
+            let stack_size = read_u64_at(48); // stack_size@48
+            let tls_val = read_u64_at(56); // tls@56
 
             // child SP = stack base + stack_size (stack grows down on aarch64)
             let child_sp = stack + stack_size;
-            let tls = if flags & CLONE_SETTLS != 0 { tls_val } else { 0 };
-            let parent_tid_addr =
-                if flags & CLONE_PARENT_SETTID != 0 { parent_tid_ptr } else { 0 };
-            let child_tid_addr =
-                if flags & (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID) != 0 {
-                    child_tid_ptr
-                } else {
-                    0
-                };
+            let tls = if flags & CLONE_SETTLS != 0 {
+                tls_val
+            } else {
+                0
+            };
+            let parent_tid_addr = if flags & CLONE_PARENT_SETTID != 0 {
+                parent_tid_ptr
+            } else {
+                0
+            };
+            let child_tid_addr = if flags & (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID) != 0 {
+                child_tid_ptr
+            } else {
+                0
+            };
 
             return DispatchOutcome::CloneThread {
                 stack: child_sp,
@@ -727,12 +832,12 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn getrandom<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let address = ctx.arg(0);
-        let length = usize::try_from(ctx.arg(1))
-            .map_err(|_| DispatchError::LengthTooLarge(ctx.arg(1)))?;
+        let length =
+            usize::try_from(ctx.arg(1)).map_err(|_| DispatchError::LengthTooLarge(ctx.arg(1)))?;
         let memory = &mut *ctx.memory;
         let mut bytes = vec![0; length];
         if getrandom::fill(&mut bytes).is_err() {
@@ -754,27 +859,36 @@ impl SyscallDispatcher {
         }
     }
 
-    pub(super) fn sys_exit<M: GuestMemory>(&mut self, ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+    pub(super) fn sys_exit<M: GuestMemory>(
+        &self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
         let code = ctx.request.arg(0) as i32;
         // exit_group(94) always tears down the whole process. exit(93) ends
         // just this thread IF siblings are still live; with only one live
         // thread (or no ThreadCtx) it's equivalent to whole-process exit.
         if ctx.request.number == 93
             && let Some(t) = ctx.thread
-                && t.registry.live_count() > 1 {
-                    return Ok(DispatchOutcome::ThreadExit { code });
-                }
+            && t.registry.live_count() > 1
+        {
+            return Ok(DispatchOutcome::ThreadExit { code });
+        }
         Ok(DispatchOutcome::Exit { code })
     }
 
-    pub(super) fn sys_clone3<M: GuestMemory>(&mut self, ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+    pub(super) fn sys_clone3<M: GuestMemory>(
+        &self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
         Ok(self.clone3(ctx.request, &*ctx.memory))
     }
 
-    pub(super) fn sys_rseq<M: GuestMemory>(&mut self, _ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+    pub(super) fn sys_rseq<M: GuestMemory>(
+        &self,
+        _ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
         Ok(self.rseq())
     }
-
 }
 
 fn fill_deterministic_bootstrap_random(bytes: &mut [u8]) {

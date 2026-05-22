@@ -226,14 +226,19 @@ fn darwin_to_linux_termios(d: &libc::termios) -> LinuxTermios {
         lflag |= LINUX_LFLAG_IEXTEN;
     }
     // ECHOKE/ECHOPRT/ECHOCTL are non-POSIX Darwin extras; drop.
-    let _ = (DARWIN_LFLAG_ECHOKE, DARWIN_LFLAG_ECHOPRT, DARWIN_LFLAG_ECHOCTL);
+    let _ = (
+        DARWIN_LFLAG_ECHOKE,
+        DARWIN_LFLAG_ECHOPRT,
+        DARWIN_LFLAG_ECHOCTL,
+    );
 
     let mut c_cc = [0u8; 19];
     for (linux_idx, darwin_idx) in LINUX_TO_DARWIN_CC.iter().enumerate() {
         if let Some(di) = darwin_idx
-            && *di < d.c_cc.len() {
-                c_cc[linux_idx] = d.c_cc[*di];
-            }
+            && *di < d.c_cc.len()
+        {
+            c_cc[linux_idx] = d.c_cc[*di];
+        }
     }
 
     LinuxTermios {
@@ -312,9 +317,11 @@ fn linux_to_darwin_termios(l: &LinuxTermios, d: &mut libc::termios) {
 
     for (linux_idx, darwin_idx) in LINUX_TO_DARWIN_CC.iter().enumerate() {
         if let Some(di) = darwin_idx
-            && *di < d.c_cc.len() && linux_idx < l.c_cc.len() {
-                d.c_cc[*di] = l.c_cc[linux_idx];
-            }
+            && *di < d.c_cc.len()
+            && linux_idx < l.c_cc.len()
+        {
+            d.c_cc[*di] = l.c_cc[linux_idx];
+        }
     }
 
     d.c_ispeed = l.c_ispeed as libc::speed_t;

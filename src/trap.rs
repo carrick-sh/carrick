@@ -38,7 +38,9 @@ pub enum TrapError {
     },
     #[error("fork(2) failed: {0}")]
     ForkFailed(String),
-    #[error("hv_vm_map(host=0x{host_addr:x}, guest=0x{guest_start:x}, size={size}) failed in child: 0x{code:x}")]
+    #[error(
+        "hv_vm_map(host=0x{host_addr:x}, guest=0x{guest_start:x}, size={size}) failed in child: 0x{code:x}"
+    )]
     ChildMapFailed {
         host_addr: u64,
         guest_start: u64,
@@ -49,7 +51,9 @@ pub enum TrapError {
     /// trampoline (e.g. instruction abort at PC=0, data abort, undef).
     /// Surfaces the original syndrome/ELR/FAR so the runtime can map it
     /// to a Linux signal (typically SIGSEGV/SIGBUS/SIGILL).
-    #[error("EL0 fault not handled by trap path: esr=0x{syndrome:x} elr=0x{elr:x} far=0x{far:x} x16=0x{x16:x} x17=0x{x17:x} x29=0x{x29:x} x30=0x{x30:x} sp=0x{sp:x}")]
+    #[error(
+        "EL0 fault not handled by trap path: esr=0x{syndrome:x} elr=0x{elr:x} far=0x{far:x} x16=0x{x16:x} x17=0x{x17:x} x29=0x{x29:x} x30=0x{x30:x} sp=0x{sp:x}"
+    )]
     EL0Fault {
         syndrome: u64,
         elr: u64,
@@ -383,11 +387,7 @@ impl HvfTrapEngine {
     /// memory. Does NOT touch the parent's HVF state otherwise — the parent
     /// keeps running its own vCPU.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    pub fn build_thread_spec(
-        &self,
-        stack: u64,
-        tls: u64,
-    ) -> Result<ThreadSpec, TrapError> {
+    pub fn build_thread_spec(&self, stack: u64, tls: u64) -> Result<ThreadSpec, TrapError> {
         self.inner.build_thread_spec(stack, tls)
     }
 
@@ -738,19 +738,10 @@ impl HvfInner {
         // runtime can deliver the right Linux signal instead of pretending
         // x8 is a syscall number.
         if is_aarch64_hvc_exception(exception.syndrome) {
-            let underlying = self
-                .vcpu
-                .get_sys_reg(SysReg::ESR_EL1)
-                .map_err(hvf_error)?;
+            let underlying = self.vcpu.get_sys_reg(SysReg::ESR_EL1).map_err(hvf_error)?;
             if !is_aarch64_svc_exception(underlying) {
-                let elr = self
-                    .vcpu
-                    .get_sys_reg(SysReg::ELR_EL1)
-                    .unwrap_or(0);
-                let far = self
-                    .vcpu
-                    .get_sys_reg(SysReg::FAR_EL1)
-                    .unwrap_or(0);
+                let elr = self.vcpu.get_sys_reg(SysReg::ELR_EL1).unwrap_or(0);
+                let far = self.vcpu.get_sys_reg(SysReg::FAR_EL1).unwrap_or(0);
                 let x16 = self.vcpu.get_reg(Reg::X16).unwrap_or(0);
                 let x17 = self.vcpu.get_reg(Reg::X17).unwrap_or(0);
                 let x29 = self.vcpu.get_reg(Reg::X29).unwrap_or(0);
@@ -772,22 +763,10 @@ impl HvfInner {
 
         if std::env::var_os("CARRICK_TRACE_REGS").is_some() {
             let pc = self.vcpu.get_reg(Reg::PC).map_err(hvf_error)?;
-            let elr = self
-                .vcpu
-                .get_sys_reg(SysReg::ELR_EL1)
-                .map_err(hvf_error)?;
-            let spsr = self
-                .vcpu
-                .get_sys_reg(SysReg::SPSR_EL1)
-                .map_err(hvf_error)?;
-            let sp_el0 = self
-                .vcpu
-                .get_sys_reg(SysReg::SP_EL0)
-                .map_err(hvf_error)?;
-            let far = self
-                .vcpu
-                .get_sys_reg(SysReg::FAR_EL1)
-                .map_err(hvf_error)?;
+            let elr = self.vcpu.get_sys_reg(SysReg::ELR_EL1).map_err(hvf_error)?;
+            let spsr = self.vcpu.get_sys_reg(SysReg::SPSR_EL1).map_err(hvf_error)?;
+            let sp_el0 = self.vcpu.get_sys_reg(SysReg::SP_EL0).map_err(hvf_error)?;
+            let far = self.vcpu.get_sys_reg(SysReg::FAR_EL1).map_err(hvf_error)?;
             let x0 = self.vcpu.get_reg(Reg::X0).map_err(hvf_error)?;
             let x1 = self.vcpu.get_reg(Reg::X1).map_err(hvf_error)?;
             let x2 = self.vcpu.get_reg(Reg::X2).map_err(hvf_error)?;
@@ -795,13 +774,20 @@ impl HvfInner {
             let x4 = self.vcpu.get_reg(Reg::X4).map_err(hvf_error)?;
             let x5 = self.vcpu.get_reg(Reg::X5).map_err(hvf_error)?;
             let x8 = self.vcpu.get_reg(Reg::X8).map_err(hvf_error)?;
-            let esr = self
-                .vcpu
-                .get_sys_reg(SysReg::ESR_EL1)
-                .map_err(hvf_error)?;
+            let esr = self.vcpu.get_sys_reg(SysReg::ESR_EL1).map_err(hvf_error)?;
             eprintln!(
                 "TRAP exit_va=0x{:x} exit_pa=0x{:x} esr_el1=0x{:x} (ec=0x{:02x}) pc=0x{:x} elr=0x{:x} sp=0x{:x} far=0x{:x} x8={} x0=0x{:x} x1=0x{:x}",
-                exception.virtual_address, exception.physical_address, esr, (esr >> 26) & 0x3f, pc, elr, sp_el0, far, x8, x0, x1
+                exception.virtual_address,
+                exception.physical_address,
+                esr,
+                (esr >> 26) & 0x3f,
+                pc,
+                elr,
+                sp_el0,
+                far,
+                x8,
+                x0,
+                x1
             );
             let _ = (spsr, x2, x3, x4, x5);
         }
@@ -819,10 +805,7 @@ impl HvfInner {
         // instruction-after-svc when it dispatches the synchronous
         // exception, so this is the address the guest will resume at
         // after `complete_syscall`.
-        let guest_pc = self
-            .vcpu
-            .get_sys_reg(SysReg::ELR_EL1)
-            .unwrap_or(0);
+        let guest_pc = self.vcpu.get_sys_reg(SysReg::ELR_EL1).unwrap_or(0);
         let lr = self.vcpu.get_reg(Reg::LR).unwrap_or(0);
         // FP (x29) + SP let guest_stack.d walk the guest call chain.
         let fp = self.vcpu.get_reg(Reg::X29).unwrap_or(0);
@@ -858,10 +841,7 @@ impl HvfInner {
             .map_err(hvf_error)?;
         if std::env::var_os("CARRICK_TRACE_REGS").is_some() {
             let pc = self.vcpu.get_reg(Reg::PC).map_err(hvf_error)?;
-            let elr = self
-                .vcpu
-                .get_sys_reg(SysReg::ELR_EL1)
-                .map_err(hvf_error)?;
+            let elr = self.vcpu.get_sys_reg(SysReg::ELR_EL1).map_err(hvf_error)?;
             eprintln!(
                 "COMPLETE return=0x{:x} pc=0x{:x} elr_el1=0x{:x}",
                 return_value, pc, elr
@@ -874,9 +854,7 @@ impl HvfInner {
     /// to fault syscall-path accesses to a guest PROT_NONE buffer (EFAULT).
     fn range_no_access(&self, address: u64, length: usize) -> bool {
         let end = address.saturating_add(length as u64);
-        self.no_access
-            .iter()
-            .any(|&(s, e)| address < e && s < end)
+        self.no_access.iter().any(|&(s, e)| address < e && s < end)
     }
 
     fn read_guest_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
@@ -911,11 +889,7 @@ impl HvfInner {
         };
         let offset = (address - mapping.start) as usize;
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                mapping.host_addr.add(offset),
-                length,
-            );
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), mapping.host_addr.add(offset), length);
         }
         Ok(())
     }
@@ -989,9 +963,7 @@ impl HvfInner {
             execute: false,
         });
         let perms_raw: u64 = u64::from(perms);
-        let r = unsafe {
-            applevisor_sys::hv_vm_map(host, guest_addr, len, perms_raw)
-        };
+        let r = unsafe { applevisor_sys::hv_vm_map(host, guest_addr, len, perms_raw) };
         if r != 0 {
             unsafe { libc::munmap(host, len) };
             return Err(MemoryError::HostMap(format!("hv_vm_map failed: 0x{r:x}")));
@@ -1066,11 +1038,37 @@ impl HvfInner {
     fn snapshot_vcpu(&self) -> Result<VcpuSnapshot, TrapError> {
         use applevisor::prelude::*;
         const GPR_TABLE: [Reg; 31] = [
-            Reg::X0, Reg::X1, Reg::X2, Reg::X3, Reg::X4, Reg::X5, Reg::X6,
-            Reg::X7, Reg::X8, Reg::X9, Reg::X10, Reg::X11, Reg::X12,
-            Reg::X13, Reg::X14, Reg::X15, Reg::X16, Reg::X17, Reg::X18,
-            Reg::X19, Reg::X20, Reg::X21, Reg::X22, Reg::X23, Reg::X24,
-            Reg::X25, Reg::X26, Reg::X27, Reg::X28, Reg::X29, Reg::X30,
+            Reg::X0,
+            Reg::X1,
+            Reg::X2,
+            Reg::X3,
+            Reg::X4,
+            Reg::X5,
+            Reg::X6,
+            Reg::X7,
+            Reg::X8,
+            Reg::X9,
+            Reg::X10,
+            Reg::X11,
+            Reg::X12,
+            Reg::X13,
+            Reg::X14,
+            Reg::X15,
+            Reg::X16,
+            Reg::X17,
+            Reg::X18,
+            Reg::X19,
+            Reg::X20,
+            Reg::X21,
+            Reg::X22,
+            Reg::X23,
+            Reg::X24,
+            Reg::X25,
+            Reg::X26,
+            Reg::X27,
+            Reg::X28,
+            Reg::X29,
+            Reg::X30,
         ];
         let mut gprs = [0u64; 31];
         for (i, reg) in GPR_TABLE.iter().enumerate() {
@@ -1081,15 +1079,27 @@ impl HvfInner {
             pc: self.vcpu.get_reg(Reg::PC).map_err(hvf_error)?,
             cpsr: self.vcpu.get_reg(Reg::CPSR).map_err(hvf_error)?,
             sp_el0: self.vcpu.get_sys_reg(SysReg::SP_EL0).map_err(hvf_error)?,
-            sctlr_el1: self.vcpu.get_sys_reg(SysReg::SCTLR_EL1).map_err(hvf_error)?,
+            sctlr_el1: self
+                .vcpu
+                .get_sys_reg(SysReg::SCTLR_EL1)
+                .map_err(hvf_error)?,
             tcr_el1: self.vcpu.get_sys_reg(SysReg::TCR_EL1).map_err(hvf_error)?,
-            ttbr0_el1: self.vcpu.get_sys_reg(SysReg::TTBR0_EL1).map_err(hvf_error)?,
+            ttbr0_el1: self
+                .vcpu
+                .get_sys_reg(SysReg::TTBR0_EL1)
+                .map_err(hvf_error)?,
             mair_el1: self.vcpu.get_sys_reg(SysReg::MAIR_EL1).map_err(hvf_error)?,
             vbar_el1: self.vcpu.get_sys_reg(SysReg::VBAR_EL1).map_err(hvf_error)?,
-            cpacr_el1: self.vcpu.get_sys_reg(SysReg::CPACR_EL1).map_err(hvf_error)?,
+            cpacr_el1: self
+                .vcpu
+                .get_sys_reg(SysReg::CPACR_EL1)
+                .map_err(hvf_error)?,
             spsr_el1: self.vcpu.get_sys_reg(SysReg::SPSR_EL1).map_err(hvf_error)?,
             elr_el1: self.vcpu.get_sys_reg(SysReg::ELR_EL1).map_err(hvf_error)?,
-            tpidr_el0: self.vcpu.get_sys_reg(SysReg::TPIDR_EL0).map_err(hvf_error)?,
+            tpidr_el0: self
+                .vcpu
+                .get_sys_reg(SysReg::TPIDR_EL0)
+                .map_err(hvf_error)?,
             last_exit_class: self.last_exit_class,
         })
     }
@@ -1097,11 +1107,37 @@ impl HvfInner {
     fn restore_vcpu(&mut self, snap: &VcpuSnapshot) -> Result<(), TrapError> {
         use applevisor::prelude::*;
         const GPR_TABLE: [Reg; 31] = [
-            Reg::X0, Reg::X1, Reg::X2, Reg::X3, Reg::X4, Reg::X5, Reg::X6,
-            Reg::X7, Reg::X8, Reg::X9, Reg::X10, Reg::X11, Reg::X12,
-            Reg::X13, Reg::X14, Reg::X15, Reg::X16, Reg::X17, Reg::X18,
-            Reg::X19, Reg::X20, Reg::X21, Reg::X22, Reg::X23, Reg::X24,
-            Reg::X25, Reg::X26, Reg::X27, Reg::X28, Reg::X29, Reg::X30,
+            Reg::X0,
+            Reg::X1,
+            Reg::X2,
+            Reg::X3,
+            Reg::X4,
+            Reg::X5,
+            Reg::X6,
+            Reg::X7,
+            Reg::X8,
+            Reg::X9,
+            Reg::X10,
+            Reg::X11,
+            Reg::X12,
+            Reg::X13,
+            Reg::X14,
+            Reg::X15,
+            Reg::X16,
+            Reg::X17,
+            Reg::X18,
+            Reg::X19,
+            Reg::X20,
+            Reg::X21,
+            Reg::X22,
+            Reg::X23,
+            Reg::X24,
+            Reg::X25,
+            Reg::X26,
+            Reg::X27,
+            Reg::X28,
+            Reg::X29,
+            Reg::X30,
         ];
         for (reg, value) in GPR_TABLE.iter().zip(snap.gprs.iter()) {
             self.vcpu.set_reg(*reg, *value).map_err(hvf_error)?;
@@ -1169,11 +1205,37 @@ impl HvfInner {
         use zerocopy::IntoBytes;
 
         const GPR_TABLE: [Reg; 31] = [
-            Reg::X0, Reg::X1, Reg::X2, Reg::X3, Reg::X4, Reg::X5, Reg::X6,
-            Reg::X7, Reg::X8, Reg::X9, Reg::X10, Reg::X11, Reg::X12,
-            Reg::X13, Reg::X14, Reg::X15, Reg::X16, Reg::X17, Reg::X18,
-            Reg::X19, Reg::X20, Reg::X21, Reg::X22, Reg::X23, Reg::X24,
-            Reg::X25, Reg::X26, Reg::X27, Reg::X28, Reg::X29, Reg::X30,
+            Reg::X0,
+            Reg::X1,
+            Reg::X2,
+            Reg::X3,
+            Reg::X4,
+            Reg::X5,
+            Reg::X6,
+            Reg::X7,
+            Reg::X8,
+            Reg::X9,
+            Reg::X10,
+            Reg::X11,
+            Reg::X12,
+            Reg::X13,
+            Reg::X14,
+            Reg::X15,
+            Reg::X16,
+            Reg::X17,
+            Reg::X18,
+            Reg::X19,
+            Reg::X20,
+            Reg::X21,
+            Reg::X22,
+            Reg::X23,
+            Reg::X24,
+            Reg::X25,
+            Reg::X26,
+            Reg::X27,
+            Reg::X28,
+            Reg::X29,
+            Reg::X30,
         ];
 
         let mut frame = crate::linux_abi::CarrickSigframe::empty();
@@ -1197,10 +1259,7 @@ impl HvfInner {
             None => self.vcpu.get_sys_reg(SysReg::ELR_EL1).map_err(hvf_error)?,
         };
         frame.saved_sp = self.vcpu.get_sys_reg(SysReg::SP_EL0).map_err(hvf_error)?;
-        frame.saved_spsr = self
-            .vcpu
-            .get_sys_reg(SysReg::SPSR_EL1)
-            .map_err(hvf_error)?;
+        frame.saved_spsr = self.vcpu.get_sys_reg(SysReg::SPSR_EL1).map_err(hvf_error)?;
 
         // Reserve space on SP_EL0, rounded down to 16-byte alignment
         // (AArch64 stack alignment requirement at function-call boundaries).
@@ -1247,7 +1306,8 @@ impl HvfInner {
         } else {
             // mov x8, #139 (__NR_rt_sigreturn); svc #0
             const TRAMP: [u32; 2] = [0xd280_1168, 0xd400_0001];
-            let tramp_off = core::mem::offset_of!(crate::linux_abi::CarrickSigframe, _reserved) as u64;
+            let tramp_off =
+                core::mem::offset_of!(crate::linux_abi::CarrickSigframe, _reserved) as u64;
             let tramp_addr = new_sp + tramp_off;
             let mut bytes = [0u8; 8];
             bytes[0..4].copy_from_slice(&TRAMP[0].to_le_bytes());
@@ -1306,11 +1366,37 @@ impl HvfInner {
         use zerocopy::FromBytes;
 
         const GPR_TABLE: [Reg; 31] = [
-            Reg::X0, Reg::X1, Reg::X2, Reg::X3, Reg::X4, Reg::X5, Reg::X6,
-            Reg::X7, Reg::X8, Reg::X9, Reg::X10, Reg::X11, Reg::X12,
-            Reg::X13, Reg::X14, Reg::X15, Reg::X16, Reg::X17, Reg::X18,
-            Reg::X19, Reg::X20, Reg::X21, Reg::X22, Reg::X23, Reg::X24,
-            Reg::X25, Reg::X26, Reg::X27, Reg::X28, Reg::X29, Reg::X30,
+            Reg::X0,
+            Reg::X1,
+            Reg::X2,
+            Reg::X3,
+            Reg::X4,
+            Reg::X5,
+            Reg::X6,
+            Reg::X7,
+            Reg::X8,
+            Reg::X9,
+            Reg::X10,
+            Reg::X11,
+            Reg::X12,
+            Reg::X13,
+            Reg::X14,
+            Reg::X15,
+            Reg::X16,
+            Reg::X17,
+            Reg::X18,
+            Reg::X19,
+            Reg::X20,
+            Reg::X21,
+            Reg::X22,
+            Reg::X23,
+            Reg::X24,
+            Reg::X25,
+            Reg::X26,
+            Reg::X27,
+            Reg::X28,
+            Reg::X29,
+            Reg::X30,
         ];
 
         let sp = self.vcpu.get_sys_reg(SysReg::SP_EL0).map_err(hvf_error)?;
@@ -1599,11 +1685,37 @@ impl HvfInner {
     fn restore_vcpu_thread_start(&mut self, snap: &VcpuSnapshot) -> Result<(), TrapError> {
         use applevisor::prelude::*;
         const GPR_TABLE: [Reg; 31] = [
-            Reg::X0, Reg::X1, Reg::X2, Reg::X3, Reg::X4, Reg::X5, Reg::X6,
-            Reg::X7, Reg::X8, Reg::X9, Reg::X10, Reg::X11, Reg::X12,
-            Reg::X13, Reg::X14, Reg::X15, Reg::X16, Reg::X17, Reg::X18,
-            Reg::X19, Reg::X20, Reg::X21, Reg::X22, Reg::X23, Reg::X24,
-            Reg::X25, Reg::X26, Reg::X27, Reg::X28, Reg::X29, Reg::X30,
+            Reg::X0,
+            Reg::X1,
+            Reg::X2,
+            Reg::X3,
+            Reg::X4,
+            Reg::X5,
+            Reg::X6,
+            Reg::X7,
+            Reg::X8,
+            Reg::X9,
+            Reg::X10,
+            Reg::X11,
+            Reg::X12,
+            Reg::X13,
+            Reg::X14,
+            Reg::X15,
+            Reg::X16,
+            Reg::X17,
+            Reg::X18,
+            Reg::X19,
+            Reg::X20,
+            Reg::X21,
+            Reg::X22,
+            Reg::X23,
+            Reg::X24,
+            Reg::X25,
+            Reg::X26,
+            Reg::X27,
+            Reg::X28,
+            Reg::X29,
+            Reg::X30,
         ];
         for (reg, value) in GPR_TABLE.iter().zip(snap.gprs.iter()) {
             self.vcpu.set_reg(*reg, *value).map_err(hvf_error)?;
@@ -1727,11 +1839,37 @@ impl HvfInner {
         // image inherits the previous process's x8 which can decode
         // as a bogus syscall number on the first svc.
         const GPRS: [Reg; 31] = [
-            Reg::X0, Reg::X1, Reg::X2, Reg::X3, Reg::X4, Reg::X5, Reg::X6,
-            Reg::X7, Reg::X8, Reg::X9, Reg::X10, Reg::X11, Reg::X12,
-            Reg::X13, Reg::X14, Reg::X15, Reg::X16, Reg::X17, Reg::X18,
-            Reg::X19, Reg::X20, Reg::X21, Reg::X22, Reg::X23, Reg::X24,
-            Reg::X25, Reg::X26, Reg::X27, Reg::X28, Reg::X29, Reg::X30,
+            Reg::X0,
+            Reg::X1,
+            Reg::X2,
+            Reg::X3,
+            Reg::X4,
+            Reg::X5,
+            Reg::X6,
+            Reg::X7,
+            Reg::X8,
+            Reg::X9,
+            Reg::X10,
+            Reg::X11,
+            Reg::X12,
+            Reg::X13,
+            Reg::X14,
+            Reg::X15,
+            Reg::X16,
+            Reg::X17,
+            Reg::X18,
+            Reg::X19,
+            Reg::X20,
+            Reg::X21,
+            Reg::X22,
+            Reg::X23,
+            Reg::X24,
+            Reg::X25,
+            Reg::X26,
+            Reg::X27,
+            Reg::X28,
+            Reg::X29,
+            Reg::X30,
         ];
         for reg in GPRS {
             self.vcpu.set_reg(reg, 0).map_err(hvf_error)?;
@@ -1797,18 +1935,9 @@ impl HvfInner {
         // Verify post-execve sysreg state through dtrace. If stage-1
         // isn't on or TTBR0 doesn't point at the new tables, the new
         // process will fault on the first LDAXR.
-        let actual_sctlr = self
-            .vcpu
-            .get_sys_reg(SysReg::SCTLR_EL1)
-            .unwrap_or(0);
-        let actual_ttbr0 = self
-            .vcpu
-            .get_sys_reg(SysReg::TTBR0_EL1)
-            .unwrap_or(0);
-        let actual_mair = self
-            .vcpu
-            .get_sys_reg(SysReg::MAIR_EL1)
-            .unwrap_or(0);
+        let actual_sctlr = self.vcpu.get_sys_reg(SysReg::SCTLR_EL1).unwrap_or(0);
+        let actual_ttbr0 = self.vcpu.get_sys_reg(SysReg::TTBR0_EL1).unwrap_or(0);
+        let actual_mair = self.vcpu.get_sys_reg(SysReg::MAIR_EL1).unwrap_or(0);
         crate::probes::execve_sysregs(actual_sctlr, actual_ttbr0, actual_mair);
         Ok(())
     }
@@ -2048,13 +2177,14 @@ fn map_region_raw(mapping: &GuestMapping) -> Result<HvfMappedRegion, TrapError> 
             mapping.guest_start
         )));
     }
-    let end = mapping
-        .guest_start
-        .checked_add(mapping.mapped_size)
-        .ok_or(TrapError::MappingOverflow {
-            guest_start: mapping.guest_start,
-            mapped_size: mapping.mapped_size,
-        })?;
+    let end =
+        mapping
+            .guest_start
+            .checked_add(mapping.mapped_size)
+            .ok_or(TrapError::MappingOverflow {
+                guest_start: mapping.guest_start,
+                mapped_size: mapping.mapped_size,
+            })?;
     Ok(HvfMappedRegion {
         start: mapping.guest_start,
         end,

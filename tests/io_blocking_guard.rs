@@ -2,7 +2,7 @@
 //! off the big-kernel-lock path.
 //!
 //! A guest blocking syscall must never block a vCPU thread inside libc while
-//! the kernel lock is held — that starves every sibling thread (the
+//! the dispatcher lock is held — that starves every sibling thread (the
 //! GIL/server-worker starvation the WaitOnFds + per-thread kqueue design
 //! fixes). So every raw blocking-capable `libc` I/O call in the dispatcher must
 //! be made non-blocking, by one of:
