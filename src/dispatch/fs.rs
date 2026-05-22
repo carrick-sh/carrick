@@ -633,6 +633,7 @@ impl SyscallDispatcher {
                     host_fd: host_read,
                     is_read_end: true,
                     status_flags: LINUX_O_RDONLY | nonblock,
+                    pty: None,
                 })),
                 fd_flags,
             },
@@ -644,6 +645,7 @@ impl SyscallDispatcher {
                     host_fd: host_write,
                     is_read_end: false,
                     status_flags: LINUX_O_WRONLY | nonblock,
+                    pty: None,
                 })),
                 fd_flags,
             },
@@ -707,6 +709,7 @@ impl SyscallDispatcher {
                     host_fd: duped,
                     is_read_end: old_fd == 0,
                     status_flags: 0,
+                    pty: None,
                 }))
             }
             None => return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF }),
@@ -1792,6 +1795,7 @@ impl SyscallDispatcher {
                     host_fd: duped,
                     is_read_end: old_fd == 0,
                     status_flags: 0,
+                    pty: None,
                 }))
             }
             None => return DispatchOutcome::Errno { errno: LINUX_EBADF },
@@ -1877,6 +1881,7 @@ impl SyscallDispatcher {
                             host_fd,
                             is_read_end,
                             status_flags: status_flags as u64,
+                            pty: None,
                         })),
                         fd_flags: linux_fd_flags_from_open_flags(flags),
                     },
@@ -1900,6 +1905,35 @@ impl SyscallDispatcher {
                             contents,
                             offset: 0,
                             status_flags: ((status_flags as u64) | flags) & !LINUX_O_CLOEXEC,
+                        })),
+                        fd_flags: linux_fd_flags_from_open_flags(flags),
+                    },
+                );
+                VfsOpenAttempt::Installed(new_fd)
+            }
+            crate::vfs::VfsHandle::Pty {
+                host_fd,
+                pts_index,
+                is_master,
+                status_flags,
+            } => {
+                let new_fd = match self.allocate_fd(3) {
+                    Some(fd) => fd,
+                    None => {
+                        unsafe { libc::close(host_fd) };
+                        return VfsOpenAttempt::Errno(linux_errno::EMFILE);
+                    }
+                };
+                self.insert_open_file(
+                    new_fd,
+                    OpenFile {
+                        description: Arc::new(RwLock::new(OpenDescription::HostPipe {
+                            host_fd,
+                            // A pty end is bidirectional; route reads and
+                            // writes through the host fd like /dev/null.
+                            is_read_end: true,
+                            status_flags: status_flags as u64,
+                            pty: Some(crate::vfs::PtyRole { index: pts_index, is_master }),
                         })),
                         fd_flags: linux_fd_flags_from_open_flags(flags),
                     },
