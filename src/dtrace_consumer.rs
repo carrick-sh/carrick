@@ -112,6 +112,8 @@ unsafe extern "C" {
     #[link_name = "__stdoutp"]
     static STDOUT_FP: *mut libc_file;
     fn fflush(stream: *mut libc_file) -> c_int;
+    fn fopen(path: *const c_char, mode: *const c_char) -> *mut libc_file;
+    fn fclose(stream: *mut libc_file) -> c_int;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -136,6 +138,8 @@ pub enum DTraceError {
     Work(String),
     #[error("argv contains nul byte: {0:?}")]
     BadArg(String),
+    #[error("failed to open trace output file: {0}")]
+    OutOpen(String),
 }
 
 unsafe fn errmsg(hdl: *mut DtraceHdl) -> String {
@@ -158,6 +162,10 @@ pub struct TraceOptions {
     /// Custom D program to compile instead of the bundled syscall tracer.
     /// `None` uses `BUNDLED_D_SCRIPT`.
     pub script: Option<String>,
+    /// When set, write DTrace events + aggregations to this file instead of
+    /// stdout. Keeps trace output from intermixing with an interactive (`-t`)
+    /// guest's own stdout — the traced command's stdio is untouched.
+    pub out_path: Option<String>,
 }
 
 /// Spawn `child_path` with `child_argv` under DTrace, with our bundled
@@ -180,9 +188,32 @@ pub fn run_child_under_dtrace(
     let mut argv_ptrs: Vec<*const c_char> = argv_c.iter().map(|s| s.as_ptr()).collect();
     argv_ptrs.push(std::ptr::null());
 
+    // Where the consumer writes events + aggregations. Defaults to stdout;
+    // `out_path` redirects to a file so trace output doesn't intermix with an
+    // interactive guest's own stdout. The returned fp must outlive the consume
+    // loop; closed at the end if we opened it.
+    let (out_fp, owns_fp) = match &opts.out_path {
+        Some(path) => {
+            let pc =
+                CString::new(path.as_bytes()).map_err(|_| DTraceError::BadArg(path.clone()))?;
+            let mode = c"w";
+            // SAFETY: pc/mode are valid NUL-terminated C strings.
+            let fp = unsafe { fopen(pc.as_ptr(), mode.as_ptr()) };
+            if fp.is_null() {
+                return Err(DTraceError::OutOpen(path.clone()));
+            }
+            (fp, true)
+        }
+        // SAFETY: STDOUT_FP is the process's libc stdout.
+        None => (unsafe { STDOUT_FP }, false),
+    };
+
     let mut err: c_int = 0;
     let hdl = unsafe { dtrace_open(DTRACE_VERSION, 0, &mut err) };
     if hdl.is_null() {
+        if owns_fp {
+            unsafe { fclose(out_fp) };
+        }
         return Err(DTraceError::Open(err));
     }
 
@@ -260,12 +291,12 @@ pub fn run_child_under_dtrace(
     // child process is dead. dtrace_work prints to stdout for us.
     loop {
         unsafe { dtrace_sleep(hdl) };
-        let status = unsafe { dtrace_work(hdl, STDOUT_FP, chew, chewrec, std::ptr::null_mut()) };
+        let status = unsafe { dtrace_work(hdl, out_fp, chew, chewrec, std::ptr::null_mut()) };
         // dtrace_work writes events into the C stdio buffer, which is
-        // block-buffered when stdout is a pipe/file. Flush every cycle so the
+        // block-buffered when the sink is a pipe/file. Flush every cycle so the
         // live stream stays live even when the traced child never exits (e.g.
         // a deadlock we're trying to diagnose).
-        unsafe { fflush(STDOUT_FP) };
+        unsafe { fflush(out_fp) };
         let proc_state = unsafe { dtrace_proc_state(hdl, proc_h) };
         let child_terminal = proc_state == PS_DEAD || proc_state == PS_UNDEAD;
         match status {
@@ -286,8 +317,15 @@ pub fn run_child_under_dtrace(
 
     unsafe { dtrace_stop(hdl) };
     unsafe { dtrace_aggregate_snap(hdl) };
-    unsafe { dtrace_aggregate_print(hdl, STDOUT_FP, std::ptr::null_mut()) };
+    unsafe { dtrace_aggregate_print(hdl, out_fp, std::ptr::null_mut()) };
     unsafe { dtrace_proc_release(hdl, proc_h) };
     unsafe { dtrace_close(hdl) };
+    if owns_fp {
+        // SAFETY: out_fp was opened by us via fopen and is no longer used.
+        unsafe {
+            fflush(out_fp);
+            fclose(out_fp);
+        }
+    }
     Ok(())
 }
