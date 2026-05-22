@@ -821,8 +821,15 @@ impl SyscallDispatcher {
             LINUX_F_GETFL => {
                 if let Some(open_file) = self.open_file(fd) {
                     let open = open_file.description.read();
+                    let mut flags = open.status_flags();
+                    // A pty end is bidirectional (opened O_RDWR); report the
+                    // O_RDWR access mode rather than the default O_RDONLY (0),
+                    // so libc/readline see a read-write terminal.
+                    if matches!(&*open, OpenDescription::HostPipe { pty: Some(_), .. }) {
+                        flags |= LINUX_O_RDWR;
+                    }
                     return Ok(DispatchOutcome::Returned {
-                        value: open.status_flags() as i64,
+                        value: flags as i64,
                     });
                 }
                 // stdio without an OpenDescription: glibc cat/head/etc
@@ -3334,8 +3341,12 @@ impl SyscallDispatcher {
         let open = open_file.description.read();
         Ok(match &*open {
             OpenDescription::PipeWriter { .. } => true,
-            // Real host pipe write end (fork-safe pipe model).
-            OpenDescription::HostPipe { is_read_end, .. } => !*is_read_end,
+            // Real host pipe write end (fork-safe pipe model). A pty end is
+            // bidirectional, so it's a valid splice target regardless of
+            // is_read_end.
+            OpenDescription::HostPipe {
+                is_read_end, pty, ..
+            } => pty.is_some() || !*is_read_end,
             _ => false,
         })
     }
