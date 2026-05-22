@@ -35,13 +35,14 @@ sprinkling `eprintln!`. (See [[feedback_carrick_trace_tracing]].)
 ## Invocation
 
 ```
-carrick trace [--script <file.d>] [--flowindent] -- <run-args>
+carrick trace [--script <file.d>] [--trace-out <file>] [--flowindent] -- <run-args>
 ```
 
 - Everything after `--` is a normal carrick command, e.g. `run ubuntu:24.04 /usr/bin/sh -c '…'` or `run-elf <static-elf>`.
-- It **auto-sudos** (DTrace needs `/dev/dtrace` / root). Don't prefix `sudo` yourself.
+- It **auto-sudos** (DTrace needs `/dev/dtrace` / root). Don't prefix `sudo` yourself. (NOPASSWD covers the carrick binary path + `/usr/sbin/dtrace`, so `sudo -n true` failing does NOT mean the trace needs a password — the binary path is what's allowlisted.)
 - With no `--script`, it runs the bundled `scripts/syscalls.d` (per-syscall stream + a frequency-sorted aggregation at exit).
 - `-s/--script <file.d>` runs a custom/targeted D program. Writing a focused script is almost always faster than reading the full stream.
+- `-o/--trace-out <file>` writes the probe stream + aggregations to `<file>` instead of stdout. **Essential for tracing an interactive `-t` guest** (or any run whose own stdout you care about): without it the probe output intermixes with the guest's terminal stream and is unreadable. With it, the guest pty stays clean and you read events from `<file>` (it's written as root, so `cat`/`grep` it; `rm` may need sudo). The file is opened with `fopen("w")` (truncates per run).
 
 `$target` inside the script binds to the spawned carrick pid.
 
@@ -81,6 +82,36 @@ carrick trace [--script <file.d>] [--flowindent] -- <run-args>
    `cargo build --release` then
    `codesign --force --sign - --entitlements scripts/entitlements.plist target/release/carrick`.
    (See [[feedback_carrick_trace_and_match_footgun]].)
+
+7. **A D-script compile error silently kills the trace — and looks like the
+   guest dying.** libdtrace fails `dtrace_program_strcompile` BEFORE the child
+   spawns, `carrick trace` exits, and a driver pty sees an immediate EIO with no
+   obvious cause. If a trace produces an empty `--trace-out` file or an instant
+   EIO, suspect the script, not carrick. Constructs that bite:
+   - **`cond ? printf(...) : 1;` as a statement** — not valid D. Use a separate
+     clause with the condition in the predicate instead.
+   - **`copyin(...)` inside a predicate** — flaky/aborts; do the `copyin` in the
+     clause **body**, gate the predicate on `arg0`/`arg2`/`arg3` only.
+   - **`this->x` is clause-local** — it does NOT carry from a `syscall-entry`
+     clause to the matching `syscall-return`. Use **`self->x`** (thread-local)
+     to pair entry args (e.g. the fd) with the return value.
+   - **`args[1]->pr_pid`-style stable-probe fields** — get them wrong and the
+     program won't compile. When unsure, print the raw `arg2`/`argN` ints.
+   Build the script up from the minimal known-good shape and add one clause at a
+   time. Aggregations printed only in `END {}` are lost if the driver kills the
+   child before the script's own `tick`/`exit` fires — let the `tick`-based
+   `exit(0)` fire (size the driver's run > the tick budget) or print per-event
+   and count with `grep | sort | uniq -c`.
+
+8. **Interactive (`-t`) / driven traces: use `--trace-out` + drive over a pty.**
+   To trace a scenario that needs input (Ctrl-C, Ctrl-Z, typed commands), run
+   `carrick trace --trace-out /tmp/ev.out -- run -t … /bin/bash` with its
+   stdin/stdout wired to a pty you drive from a small Python harness
+   (`pty.openpty()` + `select`); send the keystrokes (`b"\x03"` = Ctrl-C,
+   `b"\x1a"` = Ctrl-Z) and read the guest output from the pty master. Probe
+   events go to `/tmp/ev.out` (clean, root-owned). sudo's password prompt (if
+   any) goes to your real `/dev/tty`, not the harness pty, so the harness still
+   works.
 
 ## The three probe families — triangulate guest ↔ host
 
