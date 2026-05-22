@@ -25,7 +25,10 @@ static WINCH_PIPE_WRITE: AtomicI32 = AtomicI32::new(-1);
 
 /// Async-signal-safe SIGWINCH handler. Only calls `write(2)` and reads one
 /// atomic — both are async-signal-safe per POSIX. No ioctl, no allocation,
-/// no mutex.
+/// no mutex. NOTE: in carrick's HVF context SIGWINCH delivery to this handler
+/// is unreliable (HVF/applevisor masks signals on the vCPU threads), so the
+/// relay ALSO polls for size changes on a timeout — see `relay_loop`. This
+/// handler is the low-latency path when delivery does happen.
 extern "C" fn handle_sigwinch(_signum: libc::c_int) {
     let w = WINCH_PIPE_WRITE.load(Ordering::SeqCst);
     if w >= 0 {
@@ -44,11 +47,29 @@ extern "C" fn handle_sigwinch(_signum: libc::c_int) {
 /// Read the window size from `tty_fd` and apply it to `master_fd` so the
 /// guest's slave sees the resize.
 pub(crate) fn propagate_winsize(tty_fd: RawFd, master_fd: RawFd) {
-    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-    // SAFETY: both fds are live; ws is a valid winsize buffer.
-    if unsafe { libc::ioctl(tty_fd, libc::TIOCGWINSZ, &mut ws) } == 0 {
+    if let Some(ws) = read_winsize(tty_fd) {
+        // SAFETY: master_fd is a live pty master; &ws is a valid winsize.
         unsafe { libc::ioctl(master_fd, libc::TIOCSWINSZ, &ws) };
     }
+}
+
+/// Read the current window size of `fd`, or `None` if it isn't a tty.
+fn read_winsize(fd: RawFd) -> Option<libc::winsize> {
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    // SAFETY: fd is a live fd; ws is a valid winsize out-param.
+    if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) } == 0 {
+        Some(ws)
+    } else {
+        None
+    }
+}
+
+/// Whether two winsizes differ in the dimensions we propagate.
+fn winsize_changed(a: &libc::winsize, b: &libc::winsize) -> bool {
+    a.ws_row != b.ws_row
+        || a.ws_col != b.ws_col
+        || a.ws_xpixel != b.ws_xpixel
+        || a.ws_ypixel != b.ws_ypixel
 }
 
 /// A freshly-allocated host pty (master + already-opened slave).
@@ -275,6 +296,17 @@ impl PtyRelay {
 /// When `-1` the winch pollfd is given `events = 0` so `poll(2)` never fires
 /// it. When readable, the loop drains it and calls `propagate_winsize`.
 fn relay_loop(real_in: RawFd, real_out: RawFd, master: RawFd, shutdown_r: RawFd, winch_r: RawFd) {
+    // Ensure SIGWINCH is deliverable on THIS thread so the handler can wake the
+    // relay. carrick's process signal mask (set up by HVF/runtime init) may
+    // block it on threads spawned later; unblock it explicitly here.
+    if winch_r >= 0 {
+        unsafe {
+            let mut set: libc::sigset_t = core::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, libc::SIGWINCH);
+            libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+        }
+    }
     // Index constants for the pollfd array.
     const IDX_REAL_IN: usize = 0;
     const IDX_MASTER: usize = 1;
@@ -306,9 +338,23 @@ fn relay_loop(real_in: RawFd, real_out: RawFd, master: RawFd, shutdown_r: RawFd,
         },
     ];
     let mut buf = [0u8; 4096];
+    // Track the last window size we propagated. SIGWINCH delivery is unreliable
+    // in carrick's HVF context (the handler often never fires — HVF masks
+    // signals on the vCPU threads), so we ALSO poll on a timeout and detect
+    // size changes directly. `read_winsize` is cheap and this is the robust,
+    // signal-independent path; the SIGWINCH self-pipe (when it fires) just
+    // makes a resize take effect a little sooner.
+    let mut last_ws = if winch_r >= 0 {
+        read_winsize(real_in)
+    } else {
+        None
+    };
+    // Poll timeout: when relaying a real terminal (winch_r >= 0) wake every
+    // 250ms to check for resizes; the test path (-1) blocks indefinitely.
+    let poll_timeout = if winch_r >= 0 { 250 } else { -1 };
     loop {
         // SAFETY: fds is a valid 4-element pollfd array.
-        let n = unsafe { libc::poll(fds.as_mut_ptr(), 4, -1) };
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), 4, poll_timeout) };
         if n < 0 {
             let e = io::Error::last_os_error();
             if e.kind() == io::ErrorKind::Interrupted {
@@ -317,13 +363,13 @@ fn relay_loop(real_in: RawFd, real_out: RawFd, master: RawFd, shutdown_r: RawFd,
             break;
         }
         // Shutdown pipe readable → stop.
-        if fds[IDX_SHUTDOWN].revents & libc::POLLIN != 0 {
+        if n > 0 && fds[IDX_SHUTDOWN].revents & libc::POLLIN != 0 {
             break;
         }
-        // SIGWINCH self-pipe readable → drain it and propagate window size.
-        // The ioctl is done here in the loop (never in the signal handler).
-        if fds[IDX_WINCH].revents & libc::POLLIN != 0 {
-            // Drain all pending bytes so the level-triggered poll doesn't spin.
+        // SIGWINCH self-pipe readable → drain it (the size-change check below
+        // does the actual propagation). Draining stops the level-triggered
+        // poll from spinning.
+        if n > 0 && fds[IDX_WINCH].revents & libc::POLLIN != 0 {
             let mut drain_buf = [0u8; 64];
             loop {
                 let r =
@@ -332,7 +378,20 @@ fn relay_loop(real_in: RawFd, real_out: RawFd, master: RawFd, shutdown_r: RawFd,
                     break;
                 }
             }
-            propagate_winsize(real_in, master);
+        }
+        // Robust resize handling: on every wakeup (data, timeout, or SIGWINCH)
+        // re-read the terminal size and propagate if it changed.
+        if winch_r >= 0
+            && let Some(cur) = read_winsize(real_in)
+        {
+            let changed = last_ws
+                .as_ref()
+                .is_none_or(|prev| winsize_changed(prev, &cur));
+            if changed {
+                // SAFETY: master is a live pty master; &cur is a valid winsize.
+                unsafe { libc::ioctl(master, libc::TIOCSWINSZ, &cur) };
+                last_ws = Some(cur);
+            }
         }
         // real_in readable → copy to master.
         if fds[IDX_REAL_IN].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
