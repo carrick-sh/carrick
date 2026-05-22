@@ -4084,3 +4084,86 @@ fn ptmx_tiocgptn_returns_index_and_tcgets_succeeds() {
         r
     );
 }
+
+#[test]
+fn closing_ptmx_master_removes_pts_entry() {
+    // SyscallDispatcher::new() mounts /dev (including /dev/ptmx) and
+    // /dev/pts as part of FsState::new(), so no rootfs is needed.
+    let mut dispatcher = SyscallDispatcher::new();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
+    memory.write_bytes(0x4000, b"/dev/ptmx\0").unwrap();
+    memory.write_bytes(0x4040, b"/dev/pts/0\0").unwrap();
+    let reporter = CompatReporter::default();
+
+    // open /dev/ptmx (O_RDWR=2) -> master fd; allocates pts index 0.
+    let master = match dispatcher
+        .dispatch(
+            SyscallRequest::new(56, SyscallArgs::from([(-100_i64) as u64, 0x4000, 2, 0, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap()
+    {
+        DispatchOutcome::Returned { value } => value as u64,
+        o => panic!("open /dev/ptmx failed: {:?}", o),
+    };
+
+    // Unlock the slave so open succeeds (TIOCSPTLCK with *arg == 0).
+    let lockarg = 0x4100u64;
+    memory.write_bytes(lockarg, &0i32.to_le_bytes()).unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(29, SyscallArgs::from([master, LINUX_TIOCSPTLCK, lockarg, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 },
+        "TIOCSPTLCK unlock must succeed"
+    );
+
+    // /dev/pts/0 should open successfully before the master is closed.
+    assert!(
+        matches!(
+            dispatcher
+                .dispatch(
+                    SyscallRequest::new(
+                        56,
+                        SyscallArgs::from([(-100_i64) as u64, 0x4040, 2, 0, 0, 0])
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { .. }
+        ),
+        "slave should open before master close"
+    );
+
+    // close(master) — this must remove pts index 0 from the PtyTable.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(57, SyscallArgs::from([master, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 },
+        "close(master) must succeed"
+    );
+
+    // Now /dev/pts/0 must be ENOENT (errno 2): the table entry was removed.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(56, SyscallArgs::from([(-100_i64) as u64, 0x4040, 2, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 2 },
+        "/dev/pts/0 must be ENOENT after master close"
+    );
+}

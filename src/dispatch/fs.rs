@@ -1852,7 +1852,24 @@ impl SyscallDispatcher {
         let fd = ctx.arg(0) as i32;
         Ok(
             if let Some(open_file) = self.io.open_files.write().remove(&fd) {
+                // Capture the pty master index before closing: when this is the
+                // last reference to the description (no dup'd fds remain),
+                // closing the master should remove the pts entry from the table
+                // so /dev/pts/N becomes ENOENT — mirroring Linux devpts semantics.
+                let pty_master_index = if Arc::strong_count(&open_file.description) == 1 {
+                    match &*open_file.description.read() {
+                        OpenDescription::HostPipe {
+                            pty: Some(role), ..
+                        } if role.is_master => Some(role.index),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
                 close_open_file(&open_file);
+                if let Some(index) = pty_master_index {
+                    self.pty_table().lock().free(index);
+                }
                 DispatchOutcome::Returned { value: 0 }
             } else if is_stdio_fd(fd) {
                 // Guest closing its own stdio at exit: there's nothing for
