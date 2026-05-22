@@ -17,16 +17,14 @@
 //! through the trait the result is byte-identical to what it
 //! produced via direct access.
 
+use crate::fs_backend::{FsBackend, MemoryBackend, OverlayEntry};
 use crate::linux_abi::{
     LINUX_EACCES, LINUX_EEXIST, LINUX_EINVAL, LINUX_EISDIR, LINUX_ENOENT, LINUX_ENOTDIR,
     LINUX_ENOTEMPTY, LINUX_EROFS,
 };
-use crate::fs_backend::{FsBackend, MemoryBackend, OverlayEntry};
 use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsError, RootFsMetadata};
 
-use super::{
-    DirEnt, EntryKind, Metadata, OpenContext, OpenFlags, Vfs, VfsError, VfsHandle,
-};
+use super::{DirEnt, EntryKind, Metadata, OpenContext, OpenFlags, Vfs, VfsError, VfsHandle};
 
 /// The `/` mount. Owns the immutable OCI rootfs (`rootfs`) and the
 /// writable overlay (`overlay`). Direct field access by the
@@ -114,17 +112,18 @@ impl RootFsVfs {
         // lookup, which is identical for them.
         if let Some(rootfs) = self.rootfs.as_ref()
             && let Ok(md) = rootfs.symlink_metadata(path)
-                && matches!(md.kind, RootFsEntryKind::Symlink) {
-                    return Ok(Metadata {
-                        kind: EntryKind::Symlink,
-                        mode: md.mode,
-                        size: md.size as u64,
-                        uid: 0,
-                        gid: 0,
-                        mtime_secs: 0,
-                        mtime_nanos: 0,
-                    });
-                }
+            && matches!(md.kind, RootFsEntryKind::Symlink)
+        {
+            return Ok(Metadata {
+                kind: EntryKind::Symlink,
+                mode: md.mode,
+                size: md.size as u64,
+                uid: 0,
+                gid: 0,
+                mtime_secs: 0,
+                mtime_nanos: 0,
+            });
+        }
         self.lookup(path)
     }
 
@@ -139,7 +138,7 @@ impl RootFsVfs {
     /// reads only; this method covers the writable + directory
     /// cases that don't fit neatly into the trait surface yet.
     pub fn open_for_dispatch(
-        &mut self,
+        &self,
         path: &str,
         want_create: bool,
         want_excl: bool,
@@ -160,7 +159,8 @@ impl RootFsVfs {
                 // Disk-backed overlay (--fs host): hand back a REAL host
                 // fd so reads/writes share the kernel file across fork.
                 if let Some(host_fd) =
-                    self.overlay.open_raw_fd(path, writable_request, false, want_trunc)
+                    self.overlay
+                        .open_raw_fd(path, writable_request, false, want_trunc)
                 {
                     let size = self.overlay.metadata(path).map(|m| m.size).unwrap_or(0);
                     let metadata = RootFsMetadata {
@@ -241,7 +241,8 @@ impl RootFsVfs {
                     // never persisted), and renames of rootfs files hit EROFS
                     // (dpkg's status/status-old rewrite failed).
                     if let Some(host_fd) =
-                        self.overlay.open_raw_fd(path, writable_request, false, want_trunc)
+                        self.overlay
+                            .open_raw_fd(path, writable_request, false, want_trunc)
                     {
                         let size = if want_trunc { 0 } else { metadata.size };
                         let md = RootFsMetadata {
@@ -312,7 +313,7 @@ impl RootFsVfs {
     /// from the rootfs if needed), then tombstones the source so the
     /// layered view shows it as gone.
     pub fn rename_with_flags(
-        &mut self,
+        &self,
         from: &str,
         to: &str,
         no_replace: bool,
@@ -321,7 +322,11 @@ impl RootFsVfs {
             Some(OverlayEntry::Deleted) => return Err(LINUX_ENOENT),
             Some(OverlayEntry::Dir) => (RootFsEntryKind::Directory, None, true),
             Some(OverlayEntry::File(b)) => (RootFsEntryKind::File, Some(b), true),
-            None => match self.rootfs.as_ref().and_then(|r| r.symlink_metadata(from).ok()) {
+            None => match self
+                .rootfs
+                .as_ref()
+                .and_then(|r| r.symlink_metadata(from).ok())
+            {
                 Some(md) => match md.kind {
                     RootFsEntryKind::File | RootFsEntryKind::Symlink => {
                         // INVARIANT: this arm is reached only via the
@@ -405,9 +410,7 @@ impl RootFsVfs {
             .map(|r| r.symlink_metadata(from).is_ok())
             .unwrap_or(false);
         if rootfs_has_src {
-            self.overlay
-                .mark_deleted(from)
-                .map_err(|_| LINUX_EINVAL)?;
+            self.overlay.mark_deleted(from).map_err(|_| LINUX_EINVAL)?;
         }
         Ok(())
     }
@@ -533,7 +536,7 @@ impl Vfs for RootFsVfs {
     }
 
     fn open(
-        &mut self,
+        &self,
         path: &str,
         flags: OpenFlags,
         _ctx: &OpenContext<'_>,
@@ -602,7 +605,7 @@ impl Vfs for RootFsVfs {
         }
     }
 
-    fn mkdir(&mut self, path: &str, _mode: u32) -> Result<(), VfsError> {
+    fn mkdir(&self, path: &str, _mode: u32) -> Result<(), VfsError> {
         // Layered EEXIST: an existing overlay or rootfs entry (file
         // or dir) at `path` blocks mkdir. A tombstone clears the
         // rootfs view so a re-create is allowed.
@@ -613,9 +616,10 @@ impl Vfs for RootFsVfs {
             Some(OverlayEntry::Deleted) => {}
             None => {
                 if let Some(rootfs) = self.rootfs.as_ref()
-                    && rootfs.metadata(path).is_ok() {
-                        return Err(LINUX_EEXIST);
-                    }
+                    && rootfs.metadata(path).is_ok()
+                {
+                    return Err(LINUX_EEXIST);
+                }
             }
         }
         // Parent must exist as a directory in the layered view.
@@ -635,7 +639,7 @@ impl Vfs for RootFsVfs {
             .map_err(|_| crate::linux_abi::LINUX_EINVAL)
     }
 
-    fn unlink(&mut self, path: &str) -> Result<(), VfsError> {
+    fn unlink(&self, path: &str) -> Result<(), VfsError> {
         // Layered: overlay first (a tombstone short-circuits to
         // ENOENT). Then rootfs via symlink_metadata so symlinks are
         // identified as such (not followed).
@@ -643,7 +647,11 @@ impl Vfs for RootFsVfs {
             Some(OverlayEntry::Deleted) => return Err(LINUX_ENOENT),
             Some(OverlayEntry::Dir) => (RootFsEntryKind::Directory, true, false),
             Some(OverlayEntry::File(_)) => (RootFsEntryKind::File, true, false),
-            None => match self.rootfs.as_ref().and_then(|r| r.symlink_metadata(path).ok()) {
+            None => match self
+                .rootfs
+                .as_ref()
+                .and_then(|r| r.symlink_metadata(path).ok())
+            {
                 Some(md) => (md.kind, false, true),
                 None => return Err(LINUX_ENOENT),
             },
@@ -673,12 +681,16 @@ impl Vfs for RootFsVfs {
         Ok(())
     }
 
-    fn rmdir(&mut self, path: &str) -> Result<(), VfsError> {
+    fn rmdir(&self, path: &str) -> Result<(), VfsError> {
         let (kind, in_overlay, in_rootfs) = match self.overlay.lookup(path) {
             Some(OverlayEntry::Deleted) => return Err(LINUX_ENOENT),
             Some(OverlayEntry::Dir) => (RootFsEntryKind::Directory, true, false),
             Some(OverlayEntry::File(_)) => (RootFsEntryKind::File, true, false),
-            None => match self.rootfs.as_ref().and_then(|r| r.symlink_metadata(path).ok()) {
+            None => match self
+                .rootfs
+                .as_ref()
+                .and_then(|r| r.symlink_metadata(path).ok())
+            {
                 Some(md) => (md.kind, false, true),
                 None => return Err(LINUX_ENOENT),
             },
@@ -693,10 +705,10 @@ impl Vfs for RootFsVfs {
             self.overlay.as_ref(),
             self.rootfs.as_ref(),
             path,
-        )
-            && !entries.is_empty() {
-                return Err(LINUX_ENOTEMPTY);
-            }
+        ) && !entries.is_empty()
+        {
+            return Err(LINUX_ENOTEMPTY);
+        }
         if in_overlay {
             self.overlay.remove_entry(path);
             let rootfs_has_it = self
@@ -717,7 +729,7 @@ impl Vfs for RootFsVfs {
         Ok(())
     }
 
-    fn rename(&mut self, from: &str, to: &str) -> Result<(), VfsError> {
+    fn rename(&self, from: &str, to: &str) -> Result<(), VfsError> {
         self.rename_with_flags(from, to, false)
     }
 
@@ -859,7 +871,11 @@ mod tests {
             VfsHandle::Bytes { contents, .. } => {
                 let s = String::from_utf8_lossy(&contents);
                 assert!(s.contains("myhost"), "got: {:?}", s);
-                assert!(!s.contains("localhost"), "rootfs leaked through overlay: {:?}", s);
+                assert!(
+                    !s.contains("localhost"),
+                    "rootfs leaked through overlay: {:?}",
+                    s
+                );
             }
             other => panic!("expected Bytes, got {:?}", other),
         }
@@ -905,8 +921,7 @@ mod tests {
         // Add an overlay-owned file.
         v.mkdir("/etc/extras", 0o755).unwrap();
         let entries = v.readdir("/etc").unwrap();
-        let names: std::collections::BTreeSet<_> =
-            entries.iter().map(|e| e.name.clone()).collect();
+        let names: std::collections::BTreeSet<_> = entries.iter().map(|e| e.name.clone()).collect();
         assert!(names.contains("hosts"));
         assert!(names.contains("extras"));
     }
@@ -917,7 +932,8 @@ mod tests {
         v.overlay
             .set_file_contents("/etc/source", b"hello\n".to_vec())
             .unwrap();
-        v.rename_with_flags("/etc/source", "/etc/dest", false).unwrap();
+        v.rename_with_flags("/etc/source", "/etc/dest", false)
+            .unwrap();
         assert_eq!(v.lookup("/etc/source"), Err(LINUX_ENOENT));
         let md = v.lookup("/etc/dest").unwrap();
         assert_eq!(md.kind, EntryKind::File);
@@ -965,7 +981,9 @@ mod tests {
             .open_for_dispatch("/etc/scratch", false, false, false, true)
             .unwrap();
         match result {
-            OpenDispatchResult::File { contents, writable, .. } => {
+            OpenDispatchResult::File {
+                contents, writable, ..
+            } => {
                 assert_eq!(String::from_utf8_lossy(&contents), "overlay\n");
                 assert!(writable);
             }

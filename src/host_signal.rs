@@ -28,6 +28,14 @@ use std::sync::{LazyLock, Mutex};
 
 use crate::linux_abi::LINUX_SIGINT;
 
+/// Host fds at or above this value are reserved for Carrick internals. Guest
+/// Linux fds are capped at 1024 by the dispatcher, so putting the signal
+/// self-pipe here prevents fork reinitialization from closing a low host fd
+/// that the guest pipe/socket layer has reused.
+const HOST_INTERNAL_FD_MIN: i32 = 16 * 1024;
+const HOST_INTERNAL_FD_TARGET: libc::rlim_t = (HOST_INTERNAL_FD_MIN as libc::rlim_t) + 16;
+static NOFILE_RAISE_ATTEMPTED: AtomicU8 = AtomicU8::new(0);
+
 /// `(linux_signum, host_signum)` pairs that DIFFER between Linux and macOS.
 /// Signals not listed (HUP/INT/QUIT/ILL/TRAP/ABRT/FPE/KILL/SEGV/PIPE/ALRM/
 /// TERM/TTIN/TTOU/XCPU/XFSZ/VTALRM/PROF/WINCH) share the same number on both
@@ -107,7 +115,7 @@ pub fn publish_pending_for(tid: i32, signum: i32) {
 /// Drain the signal deliverable to `tid`: a thread-directed one for this tid
 /// takes priority, otherwise the process-directed global slot. Returns `0`
 /// (`NO_PENDING_SIGNAL`) if neither is set. This is the single point of
-/// consumption (called under the kernel lock in `deliver_pending_signal`).
+/// consumption (called under the dispatcher lock in `deliver_pending_signal`).
 pub fn take_pending_for(tid: i32) -> i32 {
     #[allow(clippy::expect_used)]
     if let Some(s) = THREAD_PENDING
@@ -133,6 +141,20 @@ pub fn has_pending_for(tid: i32) -> bool {
         .lock()
         .expect("THREAD_PENDING poisoned")
         .contains_key(&tid)
+}
+
+pub fn has_process_pending() -> bool {
+    PENDING.load(Ordering::SeqCst) != NO_PENDING_SIGNAL
+}
+
+pub fn pending_thread_tids() -> Vec<i32> {
+    #[allow(clippy::expect_used)]
+    THREAD_PENDING
+        .lock()
+        .expect("THREAD_PENDING poisoned")
+        .keys()
+        .copied()
+        .collect()
 }
 
 /// Drop any thread-directed pending entry for `tid` (called when a guest thread
@@ -163,12 +185,23 @@ pub fn pending_pipe_read_fd() -> i32 {
 /// Create (or recreate) the self-pipe. If already open the old ends are closed
 /// first (used by `reinit_after_fork`). Both ends are non-blocking + CLOEXEC.
 fn open_pending_pipe() {
-    let mut fds = [0i32; 2];
-    let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    let mut raw_fds = [0i32; 2];
+    let rc = unsafe { libc::pipe(raw_fds.as_mut_ptr()) };
     if rc != 0 {
         return;
     }
-    for fd in fds {
+    let Some(read_fd) = duplicate_internal_fd(raw_fds[0]) else {
+        close_raw_fds(&raw_fds);
+        return;
+    };
+    let Some(write_fd) = duplicate_internal_fd(raw_fds[1]) else {
+        unsafe { libc::close(read_fd) };
+        close_raw_fds(&raw_fds);
+        return;
+    };
+    close_raw_fds(&raw_fds);
+
+    for fd in [read_fd, write_fd] {
         unsafe {
             let fl = libc::fcntl(fd, libc::F_GETFL);
             if fl >= 0 {
@@ -180,13 +213,62 @@ fn open_pending_pipe() {
             }
         }
     }
-    let old_r = PENDING_PIPE_READ.swap(fds[0], Ordering::SeqCst);
-    let old_w = PENDING_PIPE_WRITE.swap(fds[1], Ordering::SeqCst);
-    if old_r >= 0 {
+    let old_r = PENDING_PIPE_READ.swap(read_fd, Ordering::SeqCst);
+    let old_w = PENDING_PIPE_WRITE.swap(write_fd, Ordering::SeqCst);
+    if old_r >= 0 && old_r != read_fd && old_r != write_fd {
         unsafe { libc::close(old_r) };
     }
-    if old_w >= 0 {
+    if old_w >= 0 && old_w != read_fd && old_w != write_fd {
         unsafe { libc::close(old_w) };
+    }
+}
+
+fn close_raw_fds(fds: &[i32; 2]) {
+    for fd in fds {
+        unsafe { libc::close(*fd) };
+    }
+}
+
+fn duplicate_internal_fd(fd: i32) -> Option<i32> {
+    ensure_internal_fd_range();
+    let duped = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, HOST_INTERNAL_FD_MIN) };
+    if duped >= 0 { Some(duped) } else { None }
+}
+
+pub(crate) fn relocate_internal_fd(fd: i32) -> i32 {
+    let Some(duped) = duplicate_internal_fd(fd) else {
+        return fd;
+    };
+    unsafe { libc::close(fd) };
+    duped
+}
+
+fn ensure_internal_fd_range() {
+    if NOFILE_RAISE_ATTEMPTED
+        .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+
+    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } != 0 {
+        return;
+    }
+    let mut limit = unsafe { limit.assume_init() };
+    if limit.rlim_cur >= HOST_INTERNAL_FD_TARGET {
+        return;
+    }
+    let desired = if limit.rlim_max == libc::RLIM_INFINITY {
+        HOST_INTERNAL_FD_TARGET
+    } else {
+        HOST_INTERNAL_FD_TARGET.min(limit.rlim_max)
+    };
+    if desired > limit.rlim_cur {
+        limit.rlim_cur = desired;
+        unsafe {
+            libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
+        }
     }
 }
 

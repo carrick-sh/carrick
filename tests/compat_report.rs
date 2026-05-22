@@ -2,7 +2,7 @@ use carrick::compat::{CompatEvent, CompatReportFormat, CompatReporter, SyscallAr
 
 #[test]
 fn aggregates_unhandled_syscalls_by_name_and_number() {
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
 
     reporter.record(CompatEvent::unhandled_syscall(
         56,
@@ -26,7 +26,7 @@ fn aggregates_unhandled_syscalls_by_name_and_number() {
 
 #[test]
 fn renders_machine_parseable_json() {
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     reporter.record(CompatEvent::proc_read_unimplemented("/proc/self/maps"));
 
     let report = reporter.finish();
@@ -38,7 +38,7 @@ fn renders_machine_parseable_json() {
 
 #[test]
 fn summary_counts_invocations_and_distinct_categories() {
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
 
     let args = SyscallArgs::from([0, 0, 0, 0, 0, 0]);
     reporter.record(CompatEvent::SyscallEntry {

@@ -215,9 +215,7 @@ enum DebugCommand {
     LldbPlugin,
     /// Read the JSON dumped by `run --debug-state-path` and print it as a
     /// human-readable summary. Useful for one-shot inspection without lldb.
-    InspectState {
-        path: PathBuf,
-    },
+    InspectState { path: PathBuf },
 }
 
 #[derive(Debug, Subcommand)]
@@ -416,7 +414,10 @@ fn main() -> anyhow::Result<()> {
                 match store.load_pull_summary(&image).await {
                     Ok(summary) => Ok(summary),
                     Err(_) => {
-                        eprintln!("carrick: image {} not in store; pulling…", image.canonical());
+                        eprintln!(
+                            "carrick: image {} not in store; pulling…",
+                            image.canonical()
+                        );
                         pull_image(&image, &store).await
                     }
                 }
@@ -599,24 +600,25 @@ fn main() -> anyhow::Result<()> {
             }
             let mut memory = LinearMemory::new(memory_base, memory_text.into_bytes());
             let mut dispatcher = SyscallDispatcher::new();
-            let mut reporter = CompatReporter::default();
+            let reporter = CompatReporter::default();
             let outcome = dispatcher.dispatch(
                 SyscallRequest::new(
                     number,
                     SyscallArgs::from([args[0], args[1], args[2], args[3], args[4], args[5]]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )?;
-            println!(
-                "{}",
+            println!("{}", {
+                let stdout = dispatcher.stdout();
+                let stderr = dispatcher.stderr();
                 serde_json::to_string_pretty(&serde_json::json!({
                     "outcome": outcome,
-                    "stdout": String::from_utf8_lossy(dispatcher.stdout()),
-                    "stderr": String::from_utf8_lossy(dispatcher.stderr()),
+                    "stdout": String::from_utf8_lossy(&stdout),
+                    "stderr": String::from_utf8_lossy(&stderr),
                     "report": reporter.finish(),
                 }))?
-            );
+            });
         }
         Commands::Rootfs { layers, command } => {
             let rootfs = RootFs::from_layer_paths(&layers)?;
@@ -651,7 +653,10 @@ fn main() -> anyhow::Result<()> {
         Commands::Debug { command } => match command {
             DebugCommand::DecodeEsr { syndrome } => {
                 let stripped = syndrome.trim();
-                let value = if let Some(hex) = stripped.strip_prefix("0x").or_else(|| stripped.strip_prefix("0X")) {
+                let value = if let Some(hex) = stripped
+                    .strip_prefix("0x")
+                    .or_else(|| stripped.strip_prefix("0X"))
+                {
                     u64::from_str_radix(hex, 16)?
                 } else {
                     stripped.parse::<u64>()?
@@ -679,7 +684,12 @@ fn main() -> anyhow::Result<()> {
                 println!("{}", serde_json::to_string_pretty(&state)?);
             }
         },
-        Commands::Trace { flowindent, script, command, forward_env } => {
+        Commands::Trace {
+            flowindent,
+            script,
+            command,
+            forward_env,
+        } => {
             #[cfg(target_os = "macos")]
             {
                 // Apply env vars carried across the sudo re-exec as CLI args.
@@ -729,18 +739,16 @@ fn main() -> anyhow::Result<()> {
                     }
                     forwarded.push(std::ffi::OsString::from("--"));
                     forwarded.extend(command.iter().map(std::ffi::OsString::from));
-                    let err = std::process::Command::new("sudo")
-                        .args(&forwarded)
-                        .exec();
+                    let err = std::process::Command::new("sudo").args(&forwarded).exec();
                     bail!("carrick trace: failed to re-exec under sudo: {}", err);
                 }
-                let script_src = match &script {
-                    Some(path) => Some(
-                        std::fs::read_to_string(path)
-                            .with_context(|| format!("failed to read D script {}", path.display()))?,
-                    ),
-                    None => None,
-                };
+                let script_src =
+                    match &script {
+                        Some(path) => Some(std::fs::read_to_string(path).with_context(|| {
+                            format!("failed to read D script {}", path.display())
+                        })?),
+                        None => None,
+                    };
                 let opts = carrick::dtrace_consumer::TraceOptions {
                     flowindent,
                     script: script_src,
@@ -803,8 +811,7 @@ fn main() -> anyhow::Result<()> {
                 if !yes {
                     println!(
                         "would delete {} ({}); pass --yes to confirm",
-                        v.device,
-                        v.name,
+                        v.device, v.name,
                     );
                     return Ok(());
                 }
@@ -817,7 +824,6 @@ fn main() -> anyhow::Result<()> {
 
     Ok(())
 }
-
 
 /// Resolve `--fs <memory|host>` into a concrete `Box<dyn FsBackend>`
 /// and install it on the dispatcher. When the user did not pass an
@@ -858,8 +864,7 @@ fn install_fs_backend(
                         eprintln!(
                             "carrick: --fs host seed-from-rootfs failed ({err}); falling back to in-memory backend"
                         );
-                        let mut mem: Box<dyn FsBackend> =
-                            Box::new(MemoryBackend::new());
+                        let mut mem: Box<dyn FsBackend> = Box::new(MemoryBackend::new());
                         seed_known_hosts(&mut *mem);
                         let _ = dispatcher.set_fs_backend(mem);
                         return Ok(());
@@ -869,9 +874,7 @@ fn install_fs_backend(
                 Box::new(host)
             }
             Err(err) => {
-                eprintln!(
-                    "carrick: --fs host failed ({err}); falling back to in-memory backend"
-                );
+                eprintln!("carrick: --fs host failed ({err}); falling back to in-memory backend");
                 Box::new(MemoryBackend::new())
             }
         },
@@ -1090,7 +1093,10 @@ fn register_dtrace_probes() {
     match carrick::probes::register_dtrace_probes() {
         Ok(()) => {
             if std::env::var_os("CARRICK_DTRACE_DEBUG").is_some() {
-                eprintln!("carrick: dtrace probes registered (pid={})", std::process::id());
+                eprintln!(
+                    "carrick: dtrace probes registered (pid={})",
+                    std::process::id()
+                );
             }
         }
         Err(err) => {

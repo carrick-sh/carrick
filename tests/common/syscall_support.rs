@@ -22,8 +22,8 @@ pub use carrick::linux_abi::{
     LINUX_S_IFREG, LinuxCapabilityData, LinuxCapabilityHeader, LinuxDirent64Header,
     LinuxEpollEvent, LinuxEventfdValue, LinuxFdPair, LinuxIovec, LinuxItimerspec, LinuxItimerval,
     LinuxPollFd, LinuxRlimit, LinuxRusage, LinuxSigaltstack, LinuxStat, LinuxStatfs, LinuxStatx,
-    LinuxTimerfdExpirations, LinuxTimespec, LinuxTimeval, LinuxTimezone, LinuxTms,
-    LinuxTermios, LinuxUtsname, LinuxWinsize,
+    LinuxTermios, LinuxTimerfdExpirations, LinuxTimespec, LinuxTimeval, LinuxTimezone, LinuxTms,
+    LinuxUtsname, LinuxWinsize,
 };
 pub use carrick::memory::{AddressSpace, LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE};
 pub use carrick::rootfs::{LayerSource, RootFs};
@@ -157,7 +157,10 @@ pub fn read_itimerval(memory: &impl GuestMemory, address: u64) -> LinuxItimerval
     LinuxItimerval::read_from_bytes(&bytes).unwrap()
 }
 
-pub fn read_timerfd_expirations(memory: &impl GuestMemory, address: u64) -> LinuxTimerfdExpirations {
+pub fn read_timerfd_expirations(
+    memory: &impl GuestMemory,
+    address: u64,
+) -> LinuxTimerfdExpirations {
     let bytes = memory
         .read_bytes(address, std::mem::size_of::<LinuxTimerfdExpirations>())
         .unwrap();
@@ -305,7 +308,12 @@ pub fn linux_fd_set_len(nfds: usize) -> usize {
     nfds.div_ceil(64) * 8
 }
 
-pub fn write_capability_header(memory: &mut impl GuestMemory, address: u64, version: u32, pid: i32) {
+pub fn write_capability_header(
+    memory: &mut impl GuestMemory,
+    address: u64,
+    version: u32,
+    pid: i32,
+) {
     memory
         .write_bytes(address, LinuxCapabilityHeader { version, pid }.as_bytes())
         .unwrap();
@@ -348,7 +356,12 @@ pub fn read_capability_data(
         .collect()
 }
 
-pub fn write_linux_timespec(memory: &mut impl GuestMemory, address: u64, tv_sec: i64, tv_nsec: i64) {
+pub fn write_linux_timespec(
+    memory: &mut impl GuestMemory,
+    address: u64,
+    tv_sec: i64,
+    tv_nsec: i64,
+) {
     let timespec = LinuxTimespec::new(tv_sec, tv_nsec);
     memory.write_bytes(address, timespec.as_bytes()).unwrap();
 }

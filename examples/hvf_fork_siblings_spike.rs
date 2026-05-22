@@ -16,8 +16,8 @@
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn main() {
     use applevisor::prelude::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     let max_ipa = VirtualMachineConfig::get_max_ipa_size().expect("max_ipa");
     let mut config = VirtualMachineConfig::new();
@@ -89,7 +89,11 @@ fn main() {
     // ----- PARENT: VM untouched; sibling should still be alive. -----
     let mut status: libc::c_int = 0;
     unsafe { libc::waitpid(pid, &mut status, 0) };
-    let child_code = if libc::WIFEXITED(status) { libc::WEXITSTATUS(status) } else { -1 };
+    let child_code = if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else {
+        -1
+    };
     println!("[parent] child exit code = {child_code}");
 
     // Prove the parent's VM + sibling vcpu still work: create a 3rd vcpu.

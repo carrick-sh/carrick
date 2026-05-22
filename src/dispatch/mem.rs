@@ -3,6 +3,7 @@
 use super::*;
 
 /// Owned memory-subsystem state. Split out of `SyscallDispatcher`.
+#[derive(Clone)]
 pub(super) struct MemState {
     /// Current program break (`brk`/`sbrk`).
     pub brk_current: u64,
@@ -34,12 +35,85 @@ impl MemState {
 }
 
 impl SyscallDispatcher {
+    pub(super) fn dispatch_threaded_memory<M: GuestMemory>(
+        &self,
+        request: SyscallRequest,
+        memory: &mut M,
+        reporter: &CompatReporter,
+    ) -> Option<Result<DispatchOutcome, DispatchError>> {
+        match request.number {
+            214..=216 | 222 | 223 | 226..=233 | 283 => {}
+            _ => return None,
+        }
+
+        let syscall = lookup_aarch64(request.number);
+        let name = syscall.map_or("unknown", |syscall| syscall.name);
+        reporter.record(CompatEvent::SyscallEntry {
+            number: request.number,
+            name: name.to_owned(),
+            args: request.args,
+        });
+
+        let mut ctx = SyscallCtx {
+            request,
+            memory,
+            reporter,
+            thread: None,
+        };
+        let outcome = match match request.number {
+            214 => self.brk(&mut ctx),
+            215 => self.munmap(&mut ctx),
+            216 => self.mremap(&mut ctx),
+            222 => self.mmap(&mut ctx),
+            223 => self.fadvise64(&mut ctx),
+            226 => self.mprotect(&mut ctx),
+            227 => self.msync(&mut ctx),
+            228 => self.mlock(&mut ctx),
+            229 => self.munlock(&mut ctx),
+            230 => self.mlockall(&mut ctx),
+            231 => self.munlockall(&mut ctx),
+            232 => self.mincore(&mut ctx),
+            233 => self.madvise(&mut ctx),
+            283 => self.sys_membarrier(&mut ctx),
+            _ => unreachable!("unsupported threaded memory syscall"),
+        } {
+            Ok(outcome) => outcome,
+            Err(error) => return Some(Err(error)),
+        };
+
+        let (retval, errno) = outcome.retval_errno();
+        reporter.record(CompatEvent::SyscallReturn {
+            number: request.number,
+            name: name.to_owned(),
+            retval,
+            errno,
+        });
+
+        Some(Ok(outcome))
+    }
+
+    fn dispatch_brk(&self, request: SyscallRequest) -> DispatchOutcome {
+        let requested = request.arg(0);
+        let mut mem = self.mem.lock();
+        if requested == 0 {
+            return DispatchOutcome::Returned {
+                value: mem.brk_current as i64,
+            };
+        }
+        if range_within(requested, 0, LINUX_HEAP_BASE, LINUX_HEAP_SIZE) {
+            mem.brk_current = requested;
+        }
+        DispatchOutcome::Returned {
+            value: mem.brk_current as i64,
+        }
+    }
+
     /// posix_fadvise(2): purely an advisory hint to the page cache. We have
     /// no readahead model, so honour it as a no-op — but validate the fd so a
     /// genuinely bad descriptor still reports EBADF. dpkg/apt/coreutils call
     /// this routinely; without it the unimplemented-syscall panic killed them.
     pub(super) fn fadvise64<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let fd = ctx.arg(0) as i32;
@@ -50,26 +124,14 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn brk<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let requested = ctx.arg(0);
-        if requested == 0 {
-            return Ok(DispatchOutcome::Returned {
-                value: self.mem.brk_current as i64,
-            });
-        }
-
-        if range_within(requested, 0, LINUX_HEAP_BASE, LINUX_HEAP_SIZE) {
-            self.mem.brk_current = requested;
-        }
-        Ok(DispatchOutcome::Returned {
-            value: self.mem.brk_current as i64,
-        })
+        Ok(self.dispatch_brk(ctx.request))
     }
 
     pub(super) fn mmap<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let requested = ctx.arg(0);
@@ -125,10 +187,10 @@ impl SyscallDispatcher {
             && offset.is_multiple_of(hvf_page)
         {
             let dup_fd = {
-                let Some(open_file) = self.io.open_files.get(&fd) else {
+                let Some(open_file) = self.open_file(fd) else {
                     return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
                 };
-                let open = open_file.description.borrow();
+                let open = open_file.description.read();
                 match &*open {
                     OpenDescription::HostFile { host_fd, .. } => {
                         let d = unsafe { libc::dup(*host_fd) };
@@ -146,7 +208,7 @@ impl SyscallDispatcher {
                         // map_shared_file takes ownership of dup_fd (closes it).
                         match memory.map_shared_file(addr, map_len, dup_fd, offset) {
                             Ok(()) => {
-                                self.mem.shared_file_maps.push((addr, map_len));
+                                self.mem.lock().shared_file_maps.push((addr, map_len));
                                 return Ok(DispatchOutcome::Returned { value: addr as i64 });
                             }
                             Err(_) => { /* fall through to snapshot path */ }
@@ -170,10 +232,10 @@ impl SyscallDispatcher {
 
         let mut bytes = vec![0; length_usize];
         if flags & LINUX_MAP_ANONYMOUS == 0 {
-            let Some(open_file) = self.io.open_files.get(&fd) else {
+            let Some(open_file) = self.open_file(fd) else {
                 return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
             };
-            let open = open_file.description.borrow();
+            let open = open_file.description.read();
             let offset_usize =
                 usize::try_from(offset).map_err(|_| DispatchError::LengthTooLarge(offset))?;
             match &*open {
@@ -240,7 +302,7 @@ impl SyscallDispatcher {
         })
     }
 
-    fn next_mmap_address(&mut self, requested: u64, length: u64, flags: u64) -> Option<u64> {
+    fn next_mmap_address(&self, requested: u64, length: u64, flags: u64) -> Option<u64> {
         if flags & LINUX_MAP_FIXED != 0 {
             // Bootstrap policy: accept MAP_FIXED at any page-aligned guest
             // address that fits in the configured IPA window. We do not
@@ -254,29 +316,36 @@ impl SyscallDispatcher {
             return Some(requested);
         }
 
-        let address = align_up_u64(self.mem.mmap_next, LINUX_PAGE_SIZE)?;
+        let mut mem = self.mem.lock();
+        let address = align_up_u64(mem.mmap_next, LINUX_PAGE_SIZE)?;
         if !range_within(address, length, LINUX_MMAP_BASE, LINUX_MMAP_SIZE) {
             return None;
         }
-        self.mem.mmap_next = address.checked_add(length)?;
+        mem.mmap_next = address.checked_add(length)?;
         Some(address)
     }
 
     /// Bump-allocate a page-aligned guest address in the dedicated
     /// MAP_SHARED file-mapping window. Returns None if the window is full.
-    fn next_shared_file_address(&mut self, length: u64) -> Option<u64> {
+    fn next_shared_file_address(&self, length: u64) -> Option<u64> {
         use crate::memory::{LINUX_SHARED_FILE_BASE, LINUX_SHARED_FILE_SIZE};
         // HVF-page (16 KiB) aligned so each hv_vm_map gets a valid base.
-        let address = align_up_u64(self.mem.shared_file_next, crate::trap::HVF_PAGE_SIZE)?;
-        if !range_within(address, length, LINUX_SHARED_FILE_BASE, LINUX_SHARED_FILE_SIZE) {
+        let mut mem = self.mem.lock();
+        let address = align_up_u64(mem.shared_file_next, crate::trap::HVF_PAGE_SIZE)?;
+        if !range_within(
+            address,
+            length,
+            LINUX_SHARED_FILE_BASE,
+            LINUX_SHARED_FILE_SIZE,
+        ) {
             return None;
         }
-        self.mem.shared_file_next = address.checked_add(length)?;
+        mem.shared_file_next = address.checked_add(length)?;
         Some(address)
     }
 
     pub(super) fn munmap<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let address = ctx.arg(0);
@@ -287,8 +356,14 @@ impl SyscallDispatcher {
             });
         }
         // A real MAP_SHARED file mapping → tear down the host mmap + stage-2.
-        if let Some(pos) = self.mem.shared_file_maps.iter().position(|(a, _)| *a == address) {
-            let (addr, len) = self.mem.shared_file_maps.remove(pos);
+        let shared_mapping = {
+            let mut mem = self.mem.lock();
+            mem.shared_file_maps
+                .iter()
+                .position(|(a, _)| *a == address)
+                .map(|pos| mem.shared_file_maps.remove(pos))
+        };
+        if let Some((addr, len)) = shared_mapping {
             let _ = ctx.memory.unmap_shared_file(addr, len);
             return Ok(DispatchOutcome::Returned { value: 0 });
         }
@@ -301,7 +376,7 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn msync<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let address = ctx.arg(0);
@@ -323,7 +398,14 @@ impl SyscallDispatcher {
         // Flush a real MAP_SHARED file mapping to disk (host msync). With a
         // file-backed mapping the guest's stores already hit the file's page
         // cache, but msync makes the durability explicit.
-        if let Some(&(addr, len)) = self.mem.shared_file_maps.iter().find(|(a, _)| *a == address) {
+        let shared_mapping = self
+            .mem
+            .lock()
+            .shared_file_maps
+            .iter()
+            .find(|(a, _)| *a == address)
+            .copied();
+        if let Some((addr, len)) = shared_mapping {
             let _ = ctx.memory.msync_shared_file(addr, len);
             return Ok(DispatchOutcome::Returned { value: 0 });
         }
@@ -336,7 +418,7 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn mlock<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let address = ctx.arg(0);
@@ -354,20 +436,18 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn munlock<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         self.mlock(ctx)
     }
 
     pub(super) fn mlockall<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let flags = ctx.arg(0);
-        if flags == 0
-            || flags & !(LINUX_MCL_CURRENT | LINUX_MCL_FUTURE | LINUX_MCL_ONFAULT) != 0
-        {
+        if flags == 0 || flags & !(LINUX_MCL_CURRENT | LINUX_MCL_FUTURE | LINUX_MCL_ONFAULT) != 0 {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
             });
@@ -376,14 +456,14 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn munlockall<M: GuestMemory>(
-        &mut self,
+        &self,
         _ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         Ok(DispatchOutcome::Returned { value: 0 })
     }
 
     pub(super) fn mincore<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let address = ctx.arg(0);
@@ -409,7 +489,7 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn mremap<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let memory = &mut *ctx.memory;
@@ -446,14 +526,14 @@ impl SyscallDispatcher {
         // Grow in place when this mapping sits at the top of the bump
         // allocator: the tail bytes are fresh guest memory already backed by
         // the stage-2 mapping, so no copy is needed.
-        if old_address.checked_add(old_size) == Some(self.mem.mmap_next) {
+        if old_address.checked_add(old_size) == Some(self.mem.lock().mmap_next) {
             let Some(new_end) = old_address.checked_add(new_size) else {
                 return Ok(DispatchOutcome::Errno {
                     errno: LINUX_ENOMEM,
                 });
             };
             if range_within(old_address, new_size, LINUX_MMAP_BASE, LINUX_MMAP_SIZE) {
-                self.mem.mmap_next = new_end;
+                self.mem.lock().mmap_next = new_end;
                 return Ok(DispatchOutcome::Returned {
                     value: old_address as i64,
                 });
@@ -498,7 +578,7 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn mprotect<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let address = ctx.arg(0);
@@ -535,7 +615,7 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn madvise<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let address = ctx.arg(0);
@@ -582,7 +662,10 @@ impl SyscallDispatcher {
         }
     }
 
-    pub(super) fn sys_membarrier<M: GuestMemory>(&mut self, ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+    pub(super) fn sys_membarrier<M: GuestMemory>(
+        &self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
         Ok(self.membarrier(ctx.request))
     }
 }

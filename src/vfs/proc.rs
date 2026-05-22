@@ -9,9 +9,7 @@
 use crate::dispatch::SyntheticProcContext;
 use crate::linux_abi::{LINUX_EACCES, LINUX_ENOENT, LINUX_ENOTDIR};
 
-use super::{
-    EntryKind, Metadata, OpenContext, OpenFlags, Vfs, VfsError, VfsHandle,
-};
+use super::{EntryKind, Metadata, OpenContext, OpenFlags, Vfs, VfsError, VfsHandle};
 
 pub struct ProcVfs;
 
@@ -45,7 +43,7 @@ impl Vfs for ProcVfs {
         // a regular file. We use a default context to peek (most
         // entries don't actually look at the context fields).
         let dummy_ctx = SyntheticProcContext {
-            executable_path: "",
+            executable_path: String::new(),
             address_space_regions: None,
             brk_current: 0,
             mmap_next: 0,
@@ -78,20 +76,19 @@ impl Vfs for ProcVfs {
     }
 
     fn open(
-        &mut self,
+        &self,
         path: &str,
         flags: OpenFlags,
         ctx: &OpenContext<'_>,
     ) -> Result<VfsHandle, VfsError> {
         // Build a SyntheticProcContext from the OpenContext.
         let synth_ctx = SyntheticProcContext {
-            executable_path: ctx.executable_path.unwrap_or(""),
-            address_space_regions: ctx.address_space_regions,
+            executable_path: ctx.executable_path.unwrap_or("").to_owned(),
+            address_space_regions: ctx.address_space_regions.map(|regions| regions.to_vec()),
             brk_current: ctx.brk_current,
             mmap_next: ctx.mmap_next,
         };
-        let Some(contents) = crate::dispatch::synthetic_proc_file(path, &synth_ctx)
-        else {
+        let Some(contents) = crate::dispatch::synthetic_proc_file(path, &synth_ctx) else {
             // Unknown /proc path: defer to the dispatcher's legacy
             // openat fallthrough (rootfs-backed directory entries
             // like /proc itself and /proc/self/). Returning ENOSYS

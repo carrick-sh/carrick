@@ -24,6 +24,14 @@ name = "carrick-linux-aarch64-pipe-fork-poll"
 path = "src/pipe_fork_poll.rs"
 
 [[bin]]
+name = "carrick-linux-aarch64-nested-pipe"
+path = "src/nested_pipe.rs"
+
+[[bin]]
+name = "carrick-linux-aarch64-thread-stress"
+path = "src/thread_stress.rs"
+
+[[bin]]
 name = "carrick-linux-aarch64-pipe-bidi"
 path = "src/pipe_bidi.rs"
 

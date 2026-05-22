@@ -11,7 +11,7 @@ use support::*;
 #[test]
 fn clock_gettime_writes_packed_linux_timespec() {
     let mut memory = LinearMemory::new(0x4000, vec![0; core::mem::size_of::<LinuxTimespec>()]);
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     assert_eq!(
@@ -19,7 +19,7 @@ fn clock_gettime_writes_packed_linux_timespec() {
             .dispatch(
                 SyscallRequest::new(113, SyscallArgs::from([0, 0x4000, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -32,11 +32,10 @@ fn clock_gettime_writes_packed_linux_timespec() {
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
-
 #[test]
 fn clock_getres_writes_packed_linux_timespec() {
     let mut memory = LinearMemory::new(0x4000, vec![0; core::mem::size_of::<LinuxTimespec>()]);
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     assert_eq!(
@@ -44,7 +43,7 @@ fn clock_getres_writes_packed_linux_timespec() {
             .dispatch(
                 SyscallRequest::new(114, SyscallArgs::from([1, 0x4000, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -58,11 +57,10 @@ fn clock_getres_writes_packed_linux_timespec() {
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
-
 #[test]
 fn nanosleep_accepts_packed_timespec_and_rejects_invalid_inputs() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x80]);
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     memory
@@ -73,7 +71,7 @@ fn nanosleep_accepts_packed_timespec_and_rejects_invalid_inputs() {
             .dispatch(
                 SyscallRequest::new(101, SyscallArgs::from([0x4000, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -84,7 +82,7 @@ fn nanosleep_accepts_packed_timespec_and_rejects_invalid_inputs() {
             .dispatch(
                 SyscallRequest::new(101, SyscallArgs::from([0x5000, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 14 }
@@ -98,7 +96,7 @@ fn nanosleep_accepts_packed_timespec_and_rejects_invalid_inputs() {
             .dispatch(
                 SyscallRequest::new(101, SyscallArgs::from([0x4010, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 22 }
@@ -106,11 +104,10 @@ fn nanosleep_accepts_packed_timespec_and_rejects_invalid_inputs() {
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
-
 #[test]
 fn clock_nanosleep_accepts_relative_and_absolute_timespecs() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x80]);
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     memory
@@ -124,7 +121,7 @@ fn clock_nanosleep_accepts_relative_and_absolute_timespecs() {
                     SyscallArgs::from([LINUX_CLOCK_MONOTONIC, 0, 0x4000, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -145,7 +142,7 @@ fn clock_nanosleep_accepts_relative_and_absolute_timespecs() {
                     ]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -156,7 +153,7 @@ fn clock_nanosleep_accepts_relative_and_absolute_timespecs() {
             .dispatch(
                 SyscallRequest::new(115, SyscallArgs::from([99, 0, 0x4000, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 22 }
@@ -169,7 +166,7 @@ fn clock_nanosleep_accepts_relative_and_absolute_timespecs() {
                     SyscallArgs::from([LINUX_CLOCK_MONOTONIC, 2, 0x4000, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 22 }
@@ -182,14 +179,13 @@ fn clock_nanosleep_accepts_relative_and_absolute_timespecs() {
                     SyscallArgs::from([LINUX_CLOCK_MONOTONIC, 0, 0x5000, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 14 }
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
-
 
 #[test]
 fn clock_settime_bootstrap_returns_eperm_for_realtime_and_einval_for_unknown() {
@@ -200,7 +196,7 @@ fn clock_settime_bootstrap_returns_eperm_for_realtime_and_einval_for_unknown() {
     const LINUX_EINVAL: i32 = 22;
 
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x80]);
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     memory
@@ -216,7 +212,7 @@ fn clock_settime_bootstrap_returns_eperm_for_realtime_and_einval_for_unknown() {
                     SyscallArgs::from([LINUX_CLOCK_REALTIME, 0x4000, 0, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: LINUX_EPERM }
@@ -231,7 +227,7 @@ fn clock_settime_bootstrap_returns_eperm_for_realtime_and_einval_for_unknown() {
                     SyscallArgs::from([LINUX_CLOCK_MONOTONIC, 0x4000, 0, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno {
@@ -245,7 +241,7 @@ fn clock_settime_bootstrap_returns_eperm_for_realtime_and_einval_for_unknown() {
             .dispatch(
                 SyscallRequest::new(112, SyscallArgs::from([99, 0x4000, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno {
@@ -262,7 +258,7 @@ fn clock_settime_bootstrap_returns_eperm_for_realtime_and_einval_for_unknown() {
                     SyscallArgs::from([LINUX_CLOCK_REALTIME, 0x9000, 0, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno {
@@ -282,7 +278,7 @@ fn clock_settime_bootstrap_returns_eperm_for_realtime_and_einval_for_unknown() {
                     SyscallArgs::from([LINUX_CLOCK_REALTIME, 0x4010, 0, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno {
@@ -293,14 +289,13 @@ fn clock_settime_bootstrap_returns_eperm_for_realtime_and_einval_for_unknown() {
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
-
 #[test]
 fn getitimer_setitimer_bootstrap_validate_args_and_zero_output() {
     const LINUX_EFAULT: i32 = 14;
     const LINUX_EINVAL: i32 = 22;
 
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     // Stamp non-zero bytes so we can confirm getitimer zeroes the output.
@@ -310,7 +305,7 @@ fn getitimer_setitimer_bootstrap_validate_args_and_zero_output() {
             .dispatch(
                 SyscallRequest::new(102, SyscallArgs::from([0, 0x4000, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -324,7 +319,7 @@ fn getitimer_setitimer_bootstrap_validate_args_and_zero_output() {
             .dispatch(
                 SyscallRequest::new(102, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno {
@@ -338,7 +333,7 @@ fn getitimer_setitimer_bootstrap_validate_args_and_zero_output() {
             .dispatch(
                 SyscallRequest::new(102, SyscallArgs::from([99, 0x4000, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno {
@@ -347,10 +342,7 @@ fn getitimer_setitimer_bootstrap_validate_args_and_zero_output() {
     );
 
     // setitimer: provide a valid new value, and confirm old_value is zeroed.
-    let new_value = LinuxItimerval::new(
-        LinuxTimeval::new(0, 0),
-        LinuxTimeval::new(1, 500_000),
-    );
+    let new_value = LinuxItimerval::new(LinuxTimeval::new(0, 0), LinuxTimeval::new(1, 500_000));
     memory.write_bytes(0x4040, new_value.as_bytes()).unwrap();
     memory.write_bytes(0x4080, &[0xbb; 32]).unwrap();
     assert_eq!(
@@ -358,7 +350,7 @@ fn getitimer_setitimer_bootstrap_validate_args_and_zero_output() {
             .dispatch(
                 SyscallRequest::new(103, SyscallArgs::from([0, 0x4040, 0x4080, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -372,7 +364,7 @@ fn getitimer_setitimer_bootstrap_validate_args_and_zero_output() {
             .dispatch(
                 SyscallRequest::new(103, SyscallArgs::from([99, 0x4040, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno {
@@ -381,17 +373,14 @@ fn getitimer_setitimer_bootstrap_validate_args_and_zero_output() {
     );
 
     // setitimer with invalid tv_usec → EINVAL.
-    let bad_value = LinuxItimerval::new(
-        LinuxTimeval::new(0, 0),
-        LinuxTimeval::new(0, 1_000_000),
-    );
+    let bad_value = LinuxItimerval::new(LinuxTimeval::new(0, 0), LinuxTimeval::new(0, 1_000_000));
     memory.write_bytes(0x40c0, bad_value.as_bytes()).unwrap();
     assert_eq!(
         dispatcher
             .dispatch(
                 SyscallRequest::new(103, SyscallArgs::from([0, 0x40c0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno {
@@ -405,7 +394,7 @@ fn getitimer_setitimer_bootstrap_validate_args_and_zero_output() {
             .dispatch(
                 SyscallRequest::new(103, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -426,7 +415,6 @@ fn getitimer_setitimer_bootstrap_validate_args_and_zero_output() {
     );
 }
 
-
 #[test]
 fn adjtimex_and_clock_adjtime_return_eperm() {
     const LINUX_CLOCK_REALTIME: u64 = 0;
@@ -436,7 +424,7 @@ fn adjtimex_and_clock_adjtime_return_eperm() {
     const LINUX_EINVAL: i32 = 22;
 
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     // 256 bytes is plenty to cover any plausible timex layout.
@@ -448,7 +436,7 @@ fn adjtimex_and_clock_adjtime_return_eperm() {
             .dispatch(
                 SyscallRequest::new(171, SyscallArgs::from([0x4000, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: LINUX_EPERM }
@@ -460,7 +448,7 @@ fn adjtimex_and_clock_adjtime_return_eperm() {
             .dispatch(
                 SyscallRequest::new(171, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno {
@@ -474,7 +462,7 @@ fn adjtimex_and_clock_adjtime_return_eperm() {
             .dispatch(
                 SyscallRequest::new(171, SyscallArgs::from([0x9000, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno {
@@ -491,7 +479,7 @@ fn adjtimex_and_clock_adjtime_return_eperm() {
                     SyscallArgs::from([LINUX_CLOCK_REALTIME, 0x4000, 0, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: LINUX_EPERM }
@@ -506,7 +494,7 @@ fn adjtimex_and_clock_adjtime_return_eperm() {
                     SyscallArgs::from([LINUX_CLOCK_MONOTONIC, 0x4000, 0, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno {
@@ -523,7 +511,7 @@ fn adjtimex_and_clock_adjtime_return_eperm() {
                     SyscallArgs::from([LINUX_CLOCK_REALTIME, 0x9000, 0, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno {
@@ -534,11 +522,10 @@ fn adjtimex_and_clock_adjtime_return_eperm() {
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
-
 #[test]
 fn gettimeofday_writes_packed_linux_timeval_and_timezone() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x80]);
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     assert_eq!(
@@ -546,7 +533,7 @@ fn gettimeofday_writes_packed_linux_timeval_and_timezone() {
             .dispatch(
                 SyscallRequest::new(169, SyscallArgs::from([0x4000, 0x4020, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -564,11 +551,10 @@ fn gettimeofday_writes_packed_linux_timeval_and_timezone() {
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
-
 #[test]
 fn times_bootstrap_writes_zero_tms_and_returns_monotonic_clock() {
     let mut memory = LinearMemory::new(0x4000, vec![0xff; core::mem::size_of::<LinuxTms>()]);
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     // Valid buffer: write zeroed tms, return positive clock value.
@@ -576,7 +562,7 @@ fn times_bootstrap_writes_zero_tms_and_returns_monotonic_clock() {
         .dispatch(
             SyscallRequest::new(153, SyscallArgs::from([0x4000, 0, 0, 0, 0, 0])),
             &mut memory,
-            &mut reporter,
+            &reporter,
         )
         .unwrap();
     let clock_with_buf = match outcome {
@@ -599,7 +585,7 @@ fn times_bootstrap_writes_zero_tms_and_returns_monotonic_clock() {
         .dispatch(
             SyscallRequest::new(153, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
             &mut memory,
-            &mut reporter,
+            &reporter,
         )
         .unwrap();
     let clock_null = match outcome {
@@ -614,11 +600,10 @@ fn times_bootstrap_writes_zero_tms_and_returns_monotonic_clock() {
             .dispatch(
                 SyscallRequest::new(153, SyscallArgs::from([0xdead_0000, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 14 }
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
-

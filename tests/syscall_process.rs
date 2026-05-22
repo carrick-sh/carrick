@@ -11,14 +11,14 @@ use support::*;
 #[test]
 fn exit_syscall_requests_process_exit() {
     let mut memory = LinearMemory::new(0x4000, Vec::new());
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     let outcome = dispatcher
         .dispatch(
             SyscallRequest::new(93, SyscallArgs::from([42, 0, 0, 0, 0, 0])),
             &mut memory,
-            &mut reporter,
+            &reporter,
         )
         .unwrap();
 
@@ -26,18 +26,17 @@ fn exit_syscall_requests_process_exit() {
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
-
 #[test]
 fn exit_group_syscall_requests_process_exit() {
     let mut memory = LinearMemory::new(0x4000, Vec::new());
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     let outcome = dispatcher
         .dispatch(
             SyscallRequest::new(94, SyscallArgs::from([7, 0, 0, 0, 0, 0])),
             &mut memory,
-            &mut reporter,
+            &reporter,
         )
         .unwrap();
 
@@ -45,18 +44,17 @@ fn exit_group_syscall_requests_process_exit() {
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
-
 #[test]
 fn unknown_syscall_returns_enosys_and_records_report_entry() {
     let mut memory = LinearMemory::new(0x4000, Vec::new());
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     let outcome = dispatcher
         .dispatch(
             SyscallRequest::new(9999, SyscallArgs::from([1, 2, 3, 4, 5, 6])),
             &mut memory,
-            &mut reporter,
+            &reporter,
         )
         .unwrap();
 
@@ -66,7 +64,6 @@ fn unknown_syscall_returns_enosys_and_records_report_entry() {
     assert_eq!(report.unhandled_syscalls[0].name, "unknown");
     assert_eq!(report.unhandled_syscalls[0].count, 1);
 }
-
 
 #[test]
 fn syscall_request_can_be_built_from_aarch64_register_frame() {
@@ -86,11 +83,10 @@ fn syscall_request_can_be_built_from_aarch64_register_frame() {
     );
 }
 
-
 #[test]
 fn getrandom_fills_guest_buffer() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 32]);
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     assert_eq!(
@@ -98,7 +94,7 @@ fn getrandom_fills_guest_buffer() {
             .dispatch(
                 SyscallRequest::new(278, SyscallArgs::from([0x4000, 16, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 16 }
@@ -113,11 +109,10 @@ fn getrandom_fills_guest_buffer() {
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
-
 #[test]
 fn privileged_op_stubs_return_eperm_or_enosys() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     // ptrace → ENOSYS (no debugger surface yet).
@@ -126,7 +121,7 @@ fn privileged_op_stubs_return_eperm_or_enosys() {
             .dispatch(
                 SyscallRequest::new(117, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 38 }
@@ -138,7 +133,7 @@ fn privileged_op_stubs_return_eperm_or_enosys() {
                 .dispatch(
                     SyscallRequest::new(number, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
                     &mut memory,
-                    &mut reporter,
+                    &reporter,
                 )
                 .unwrap(),
             DispatchOutcome::Errno { errno: 1 },
@@ -149,29 +144,22 @@ fn privileged_op_stubs_return_eperm_or_enosys() {
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
-
 #[test]
-fn job_control_bootstrap_returns_single_session_values() {
+fn job_control_queries_match_host_process_group_state() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x80]);
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
+    let host_pgid = unsafe { libc::getpgid(0) };
+    let host_sid = unsafe { libc::getsid(0) };
+    assert!(host_pgid > 0);
+    assert!(host_sid > 0);
 
-    assert_eq!(
-        dispatcher
-            .dispatch(
-                SyscallRequest::new(154, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
-                &mut memory,
-                &mut reporter,
-            )
-            .unwrap(),
-        DispatchOutcome::Returned { value: 0 }
-    );
     assert_eq!(
         dispatcher
             .dispatch(
                 SyscallRequest::new(154, SyscallArgs::from([99, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 3 }
@@ -181,27 +169,32 @@ fn job_control_bootstrap_returns_single_session_values() {
             .dispatch(
                 SyscallRequest::new(154, SyscallArgs::from([0, (-1_i64) as u64, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 22 }
     );
+    // Successful setpgid(0, 0) and setsid() mutate process-global state for the
+    // test harness, so this unit test covers non-mutating host-backed queries
+    // and validation errors only.
     assert_eq!(
         dispatcher
             .dispatch(
                 SyscallRequest::new(155, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Returned { value: 1 }
+        DispatchOutcome::Returned {
+            value: i64::from(host_pgid),
+        }
     );
     assert_eq!(
         dispatcher
             .dispatch(
                 SyscallRequest::new(155, SyscallArgs::from([99, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 3 }
@@ -211,25 +204,26 @@ fn job_control_bootstrap_returns_single_session_values() {
             .dispatch(
                 SyscallRequest::new(156, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Returned { value: 1 }
+        DispatchOutcome::Returned {
+            value: i64::from(host_sid),
+        }
     );
     assert_eq!(
         dispatcher
             .dispatch(
-                SyscallRequest::new(157, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+                SyscallRequest::new(156, SyscallArgs::from([99, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Returned { value: 1 }
+        DispatchOutcome::Errno { errno: 3 }
     );
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
-
 
 #[test]
 fn unhandled_named_syscall_surfaces_by_name_in_compat_report() {
@@ -244,14 +238,14 @@ fn unhandled_named_syscall_surfaces_by_name_in_compat_report() {
     // ENOSYS. If a real execveat handler lands, point this at the next
     // still-unimplemented named syscall.
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x80]);
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     let outcome = dispatcher
         .dispatch(
             SyscallRequest::new(281, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
             &mut memory,
-            &mut reporter,
+            &reporter,
         )
         .unwrap();
     assert_eq!(outcome, DispatchOutcome::Errno { errno: 38 });
@@ -266,7 +260,6 @@ fn unhandled_named_syscall_surfaces_by_name_in_compat_report() {
     assert_eq!(entry.count, 1);
 }
 
-
 #[test]
 fn wait_family_bootstrap_returns_echild() {
     const LINUX_P_ALL: u64 = 0;
@@ -276,7 +269,7 @@ fn wait_family_bootstrap_returns_echild() {
     const LINUX_EINVAL: i32 = 22;
 
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x80]);
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     // waitid with P_ALL and WEXITED -> ECHILD (no children)
@@ -288,7 +281,7 @@ fn wait_family_bootstrap_returns_echild() {
                     SyscallArgs::from([LINUX_P_ALL, 0, 0, LINUX_WEXITED, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno {
@@ -302,7 +295,7 @@ fn wait_family_bootstrap_returns_echild() {
             .dispatch(
                 SyscallRequest::new(95, SyscallArgs::from([99, 0, 0, LINUX_WEXITED, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno {
@@ -316,7 +309,7 @@ fn wait_family_bootstrap_returns_echild() {
             .dispatch(
                 SyscallRequest::new(95, SyscallArgs::from([LINUX_P_ALL, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno {
@@ -330,17 +323,10 @@ fn wait_family_bootstrap_returns_echild() {
             .dispatch(
                 SyscallRequest::new(
                     95,
-                    SyscallArgs::from([
-                        LINUX_P_ALL,
-                        0,
-                        0,
-                        LINUX_WEXITED | 0xdead_0000,
-                        0,
-                        0,
-                    ]),
+                    SyscallArgs::from([LINUX_P_ALL, 0, 0, LINUX_WEXITED | 0xdead_0000, 0, 0,]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno {
@@ -352,12 +338,9 @@ fn wait_family_bootstrap_returns_echild() {
     assert_eq!(
         dispatcher
             .dispatch(
-                SyscallRequest::new(
-                    260,
-                    SyscallArgs::from([(-1_i64) as u64, 0, 0, 0, 0, 0]),
-                ),
+                SyscallRequest::new(260, SyscallArgs::from([(-1_i64) as u64, 0, 0, 0, 0, 0]),),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno {
@@ -374,7 +357,7 @@ fn wait_family_bootstrap_returns_echild() {
                     SyscallArgs::from([(-1_i64) as u64, 0, LINUX_WNOHANG, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno {
@@ -391,7 +374,7 @@ fn wait_family_bootstrap_returns_echild() {
                     SyscallArgs::from([(-1_i64) as u64, 0, 0xdead_0000, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno {
@@ -401,4 +384,3 @@ fn wait_family_bootstrap_returns_echild() {
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
-

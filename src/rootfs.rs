@@ -164,11 +164,9 @@ fn apply_tar_to_dir<R: Read>(
                     match dir.remove_file(&target) {
                         Ok(()) => {}
                         Err(e) if e.kind() == ErrorKind::NotFound => {}
-                        Err(_) => {
-                            match dir.remove_dir_all(&target) {
-                                Ok(()) | Err(_) => {}
-                            }
-                        }
+                        Err(_) => match dir.remove_dir_all(&target) {
+                            Ok(()) | Err(_) => {}
+                        },
                     }
                 }
                 continue;
@@ -193,7 +191,8 @@ fn apply_tar_to_dir<R: Read>(
             // dir; otherwise apply the image mode directly. (See HostFsBackend
             // / CARRICK_MODE_XATTR.)
             if mode & 0o500 != 0o500 {
-                let _ = dir.set_permissions(&path, cap_std::fs::Permissions::from_mode(mode | 0o700));
+                let _ =
+                    dir.set_permissions(&path, cap_std::fs::Permissions::from_mode(mode | 0o700));
                 crate::fs_backend::write_mode_xattr(dir, &path, true, mode);
             } else {
                 let _ = dir.set_permissions(&path, cap_std::fs::Permissions::from_mode(mode));
@@ -220,7 +219,8 @@ fn apply_tar_to_dir<R: Read>(
             // and force owner rw on the real file; otherwise apply the image
             // mode directly (real_stat reports it faithfully).
             if mode & 0o400 == 0 {
-                let _ = dir.set_permissions(&path, cap_std::fs::Permissions::from_mode(mode | 0o600));
+                let _ =
+                    dir.set_permissions(&path, cap_std::fs::Permissions::from_mode(mode | 0o600));
                 crate::fs_backend::write_mode_xattr(dir, &path, false, mode);
             } else {
                 let _ = dir.set_permissions(&path, cap_std::fs::Permissions::from_mode(mode));
@@ -319,10 +319,7 @@ impl RootFs {
                 std::fs::create_dir_all(parent)?;
             }
             std::fs::write(&host, &entry.contents)?;
-            let _ = std::fs::set_permissions(
-                &host,
-                std::fs::Permissions::from_mode(entry.mode),
-            );
+            let _ = std::fs::set_permissions(&host, std::fs::Permissions::from_mode(entry.mode));
         }
         // Symlinks last (target paths might point at files we just wrote).
         for (link_path, entry) in &self.symlinks {
@@ -342,9 +339,8 @@ impl RootFs {
     /// HostFsBackend's seed step to register the materialised view so
     /// dispatcher lookups stop falling through to the in-memory RootFs.
     pub fn all_paths(&self) -> Vec<PathBuf> {
-        let mut out = Vec::with_capacity(
-            self.files.len() + self.directories.len() + self.symlinks.len(),
-        );
+        let mut out =
+            Vec::with_capacity(self.files.len() + self.directories.len() + self.symlinks.len());
         out.extend(self.files.keys().cloned());
         out.extend(self.directories.iter().cloned());
         out.extend(self.symlinks.keys().cloned());
@@ -555,8 +551,7 @@ impl RootFs {
         for (i, component) in components.iter().enumerate() {
             acc.push(component.as_os_str());
             if let Some(entry) = self.symlinks.get(&acc) {
-                let target_resolved =
-                    self.resolve_symlink(&entry.target, depth + 1)?;
+                let target_resolved = self.resolve_symlink(&entry.target, depth + 1)?;
                 // The remaining components after the symlink we just
                 // resolved get re-appended; they may themselves contain
                 // further symlinks, hence the recursive call below.
@@ -691,8 +686,7 @@ mod tests {
     fn symlink_target_with_multiple_parent_dirs_resolves_within_root() {
         // a/b/c -> ../../x: resolution starts in the symlink's parent dir (a/b),
         // .. -> a, .. -> "" (root), then x -> /x.
-        let resolved =
-            normalize_symlink_target(Path::new("a/b/c"), Path::new("../../x")).unwrap();
+        let resolved = normalize_symlink_target(Path::new("a/b/c"), Path::new("../../x")).unwrap();
         assert_eq!(resolved, PathBuf::from("x"));
     }
 
@@ -715,9 +709,8 @@ mod tests {
     fn symlink_target_escaping_root_via_second_parent_dir_is_rejected() {
         // etc/foo -> ../../etc/passwd
         // First .. from /etc lands at /; second .. from / is the escape.
-        let err =
-            normalize_symlink_target(Path::new("etc/foo"), Path::new("../../etc/passwd"))
-                .unwrap_err();
+        let err = normalize_symlink_target(Path::new("etc/foo"), Path::new("../../etc/passwd"))
+            .unwrap_err();
         assert!(matches!(err, RootFsError::UnsafePath(_)));
     }
 
@@ -752,11 +745,7 @@ mod tests {
     /// Build a tar in memory and load it as a RootFs. Mirrors what the
     /// OCI loader does, so the assertions exercise the same resolution
     /// path as `carrick run`.
-    fn make_rootfs(
-        files: &[(&str, &[u8])],
-        dirs: &[&str],
-        symlinks: &[(&str, &str)],
-    ) -> RootFs {
+    fn make_rootfs(files: &[(&str, &[u8])], dirs: &[&str], symlinks: &[(&str, &str)]) -> RootFs {
         use tar::{Builder, EntryType, Header};
         let mut buf: Vec<u8> = Vec::new();
         {
