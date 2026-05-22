@@ -21,7 +21,8 @@ use crate::linux_abi::{
     LINUX_AT_EACCESS, LINUX_AT_EMPTY_PATH, LINUX_AT_FDCWD, LINUX_AT_NO_AUTOMOUNT, LINUX_AT_REMOVEDIR,
     LINUX_AT_STATX_DONT_SYNC, LINUX_AT_STATX_FORCE_SYNC, LINUX_AT_SYMLINK_NOFOLLOW, LINUX_CLK_TCK,
     LINUX_DEFAULT_UMASK, LINUX_E2BIG, LINUX_EACCES, LINUX_EAFNOSUPPORT, LINUX_EAGAIN, LINUX_EBADF,
-    LINUX_ECHILD, LINUX_EEXIST, LINUX_EFAULT, LINUX_EINTR, LINUX_EINVAL, LINUX_EISDIR, LINUX_ENAMETOOLONG,
+    LINUX_ECHILD, LINUX_EEXIST, LINUX_EFAULT, LINUX_EINTR, LINUX_EINVAL, LINUX_EISDIR,
+    LINUX_EALREADY, LINUX_EINPROGRESS, LINUX_EISCONN, LINUX_ENAMETOOLONG,
     LINUX_ENOENT, LINUX_ENOMEM, LINUX_ENOPROTOOPT, LINUX_ENOSYS, LINUX_ENOTDIR, LINUX_ENOTSOCK,
     LINUX_ENOTSUP, LINUX_ENOTTY, LINUX_EPERM, LINUX_EPIPE, LINUX_ERANGE, LINUX_EROFS, LINUX_ESOCKTNOSUPPORT,
     LINUX_ESPIPE, LINUX_ESRCH, LINUX_ETIMEDOUT,     LINUX_FALLOC_FL_KEEP_SIZE, LINUX_FALLOC_FL_SUPPORTED,
@@ -3421,21 +3422,33 @@ const NLMSG_ALIGNTO: usize = 4;
 
 
 
+/// read(2) on a host-backed fd (pipe/socket/file). read has no per-call
+/// non-blocking flag, so we put the host fd non-blocking (idempotent; immaterial
+/// for files, which never block) and convert EAGAIN: a blocking-mode guest fd
+/// hands off to the runtime's lockless kqueue wait via WaitOnFds; a non-blocking
+/// guest fd gets EAGAIN. Never blocks under the kernel lock. `nonblocking` is
+/// the guest's intended mode (status_flags / O_NONBLOCK).
 fn read_host_pipe(
     memory: &mut impl GuestMemory,
     guest_addr: u64,
     length: usize,
     host_fd: i32,
+    nonblocking: bool,
 ) -> DispatchOutcome {
     if length == 0 {
         return DispatchOutcome::Returned { value: 0 };
     }
+    crate::dispatch::net::set_host_nonblocking(host_fd);
     let mut buf = vec![0u8; length];
     let n = unsafe { libc::read(host_fd, buf.as_mut_ptr() as *mut _, length) };
     #[cfg(target_os = "macos")]
     crate::probes::host_pipe_io(host_fd, 0, n as i64);
     if n < 0 {
-        return DispatchOutcome::Errno { errno: host_errno() };
+        let e = host_errno();
+        if e == LINUX_EAGAIN {
+            return would_block_outcome(host_fd, libc::POLLIN, nonblocking);
+        }
+        return DispatchOutcome::Errno { errno: e };
     }
     let n_usize = n as usize;
     if n_usize > 0
@@ -3445,14 +3458,35 @@ fn read_host_pipe(
     DispatchOutcome::Returned { value: n as i64 }
 }
 
-fn write_host_pipe(bytes: &[u8], host_fd: i32) -> DispatchOutcome {
+/// write(2) on a host-backed fd. Same lockless discipline as `read_host_pipe`.
+fn write_host_pipe(bytes: &[u8], host_fd: i32, nonblocking: bool) -> DispatchOutcome {
+    crate::dispatch::net::set_host_nonblocking(host_fd);
     let n = unsafe { libc::write(host_fd, bytes.as_ptr() as *const _, bytes.len()) };
     #[cfg(target_os = "macos")]
     crate::probes::host_pipe_io(host_fd, 1, n as i64);
     if n < 0 {
-        return DispatchOutcome::Errno { errno: host_errno() };
+        let e = host_errno();
+        if e == LINUX_EAGAIN {
+            return would_block_outcome(host_fd, libc::POLLOUT, nonblocking);
+        }
+        return DispatchOutcome::Errno { errno: e };
     }
     DispatchOutcome::Returned { value: n as i64 }
+}
+
+/// A host op returned EAGAIN: a non-blocking guest fd gets EAGAIN; a blocking
+/// one gets a WaitOnFds hand-off so the runtime waits on readiness with the
+/// kernel lock RELEASED (per-thread kqueue), then re-dispatches.
+fn would_block_outcome(host_fd: i32, events: i16, nonblocking: bool) -> DispatchOutcome {
+    if nonblocking {
+        DispatchOutcome::Errno { errno: LINUX_EAGAIN }
+    } else {
+        DispatchOutcome::WaitOnFds {
+            fds: vec![(host_fd, events)],
+            timeout: None,
+            on_timeout: -(LINUX_EAGAIN as i64),
+        }
+    }
 }
 
 fn read_guest_c_string(memory: &impl GuestMemory, address: u64) -> Result<String, i32> {

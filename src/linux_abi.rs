@@ -891,6 +891,10 @@ pub const LINUX_EBADF: i32 = 9;
 pub const LINUX_ECHILD: i32 = 10;
 pub const LINUX_EAGAIN: i32 = 11;
 pub const LINUX_EINTR: i32 = 4;
+/// Non-blocking `connect(2)` in progress / already in progress / completed.
+pub const LINUX_EINPROGRESS: i32 = 115;
+pub const LINUX_EALREADY: i32 = 114;
+pub const LINUX_EISCONN: i32 = 106;
 pub const LINUX_ENOMEM: i32 = 12;
 pub const LINUX_EACCES: i32 = 13;
 pub const LINUX_EFAULT: i32 = 14;
