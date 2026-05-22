@@ -3783,8 +3783,21 @@ fn align_to(value: usize, alignment: usize) -> usize {
 }
 
 fn inode_for_path(path: &Path) -> u64 {
+    // Inode numbers must reflect file *identity*, not the textual path used to
+    // reach the file. stat("/a/b") and stat(".") from inside /a/b must agree,
+    // or TOCTOU identity checks abort — dpkg-preconfigure stats a directory,
+    // chdirs in, re-stats ".", and bails with "directory … changed before
+    // chdir, expected ino=X, actual ino=Y". Normalise the path lexically
+    // (collapse ".", "..", and "//") before hashing so every spelling of one
+    // path maps to one inode. `normalize` returns None for paths that escape
+    // the root ("/.."); fall back to the raw bytes there so we never panic.
+    let normalized = crate::fs_backend::normalize(&path.to_string_lossy());
+    let key = normalized
+        .as_ref()
+        .map(|p| p.to_string_lossy())
+        .unwrap_or_else(|| path.to_string_lossy());
     let mut hash = 0xcbf29ce484222325_u64;
-    for byte in path.as_os_str().as_encoded_bytes() {
+    for byte in key.as_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
@@ -4186,6 +4199,26 @@ mod overlay_dispatch_tests {
     const O_CREAT: u64 = 0o100;
     const O_WRONLY: u64 = 1;
     const O_RDONLY: u64 = 0;
+
+    #[test]
+    fn inode_for_path_reflects_identity_not_textual_spelling() {
+        // The same file reached via different textual spellings must map to
+        // ONE inode, or TOCTOU identity checks abort: dpkg-preconfigure stats
+        // a dir, chdirs in, re-stats ".", and aborts if the inode changed
+        // ("directory /var/cache/debconf/tmp.ci changed before chdir").
+        // "." after chdir resolves to "/dir/.", so that must hash the same as
+        // "/dir".
+        let canonical = inode_for_path(Path::new("/tmp/d"));
+        assert_eq!(canonical, inode_for_path(Path::new("/tmp/d/.")));
+        assert_eq!(canonical, inode_for_path(Path::new("/tmp/d/")));
+        assert_eq!(canonical, inode_for_path(Path::new("/tmp//d")));
+        assert_eq!(canonical, inode_for_path(Path::new("/tmp/d/sub/..")));
+        // Distinct files still get distinct inodes.
+        assert_ne!(canonical, inode_for_path(Path::new("/tmp/e")));
+        // Never zero — some tools treat st_ino == 0 as "no such entry".
+        assert_ne!(inode_for_path(Path::new("/")), 0);
+        assert_ne!(inode_for_path(Path::new("/tmp/d")), 0);
+    }
 
     /// 16 KiB scratch buffer at virtual base 0x4000_0000. Tests pack
     /// pathnames + read/write buffers into this. The dispatcher itself

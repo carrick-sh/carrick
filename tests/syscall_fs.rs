@@ -2611,18 +2611,38 @@ fn fchmod_and_fchmodat_succeed_on_writable_overlay_and_validate_args() {
             .unwrap(),
         DispatchOutcome::Errno { errno: 2 }
     );
+    // The fchmodat syscall (nr 53) is SYSCALL_DEFINE3 in Linux and IGNORES
+    // the 4th register, so a non-zero flags value must NOT fail. glibc leaves
+    // AT_SYMLINK_NOFOLLOW (0x100) there — `apt-get update` issues exactly
+    // fchmodat(AT_FDCWD, path, 0644, 0x100) on every downloaded index, and the
+    // real kernel succeeds. (We previously returned EINVAL here, which made
+    // every apt download chmod fail.)
     assert_eq!(
         dispatcher
             .dispatch(
                 SyscallRequest::new(
                     53,
-                    SyscallArgs::from([(-100_i64) as u64, 0x4000, 0o644, 0xdead, 0, 0]),
+                    SyscallArgs::from([(-100_i64) as u64, 0x4000, 0o644, 0x100, 0, 0]),
                 ),
                 &mut memory,
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Returned { value: 0 }
+    );
+    // fchmodat2 (452) with a real flags argument also applies the mode.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    452,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4000, 0o600, 0x100, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
     );
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());

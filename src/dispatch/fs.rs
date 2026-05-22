@@ -4144,15 +4144,16 @@ impl SyscallDispatcher {
     ) -> Result<DispatchOutcome, DispatchError> {
         let dirfd = ctx.arg(0);
         let pathname = ctx.arg(1);
-        let flags = ctx.arg(3);
-        if ctx.request.number == 53 && flags != 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
-        }
-        // fchmodat2 (452) carries a real flags argument. Mode-setting on the
-        // disk-authoritative host backend is best-effort, so those flags remain
-        // advisory here.
+        // The fchmodat syscall (nr 53) is SYSCALL_DEFINE3 in Linux: it takes
+        // only (dirfd, path, mode) and IGNORES the 4th register. glibc's
+        // AT_SYMLINK_NOFOLLOW path still leaves the flag in that register —
+        // `apt-get update` issues fchmodat(AT_FDCWD, path, 0644, 0x100) on
+        // every downloaded index — and the real kernel silently ignores it.
+        // Rejecting non-zero flags here made every apt download chmod fail
+        // with EINVAL ("chmod 0644 of file … failed - 201::URIDone"). Only
+        // fchmodat2 (452) carries a real flags argument; on the
+        // disk-authoritative host backend its mode-setting is best-effort, so
+        // AT_SYMLINK_NOFOLLOW stays advisory.
         let path = match read_guest_c_string(&*ctx.memory, pathname) {
             Ok(path) => path,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
