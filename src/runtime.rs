@@ -448,6 +448,9 @@ where
     // it.
     let _termios_guard = crate::host_tty::TermiosRestoreGuard::new();
 
+    // Per-thread blocking-I/O waiter (owns this thread's kqueue). Recreated in
+    // a forked child below (kqueue is not inherited across fork).
+    let mut waiter = crate::io_wait::ThreadWaiter::new();
     for traps in 1..=max_traps {
         let frame = runtime.next_syscall()?;
         if std::env::var_os("CARRICK_TRACE_TRAPS").is_some() {
@@ -470,13 +473,17 @@ where
                 &mut reporter,
             )?;
             match oc {
-                DispatchOutcome::WaitOnFds { fds, timeout } => match wait_on_host_fds(&fds, timeout) {
-                    FdWaitResult::Ready => continue,
-                    FdWaitResult::TimedOut => break DispatchOutcome::Returned { value: 0 },
-                    FdWaitResult::Interrupted => {
-                        break DispatchOutcome::Errno { errno: crate::linux_abi::LINUX_EINTR }
+                DispatchOutcome::WaitOnFds { fds, timeout, on_timeout } => {
+                    match waiter.wait(&fds, timeout) {
+                        crate::io_wait::WaitResult::Ready => continue,
+                        crate::io_wait::WaitResult::TimedOut => {
+                            break DispatchOutcome::Returned { value: on_timeout }
+                        }
+                        crate::io_wait::WaitResult::Interrupted => {
+                            break DispatchOutcome::Errno { errno: crate::linux_abi::LINUX_EINTR }
+                        }
                     }
-                },
+                }
                 other => break other,
             }
         };
@@ -514,6 +521,11 @@ where
                     crate::trap::ForkOutcome::Parent { child_pid } => i64::from(child_pid),
                     crate::trap::ForkOutcome::Child => {
                         dispatcher.clear_output_buffers();
+                        // kqueue is NOT inherited across fork, and the inherited
+                        // self-pipe is shared with the parent — give the child
+                        // fresh ones so its parked-thread wakes are its own.
+                        crate::host_signal::reinit_after_fork();
+                        waiter = crate::io_wait::ThreadWaiter::new();
                         0
                     }
                 };
@@ -727,6 +739,9 @@ fn run_vcpu_until_exit(
     max_traps: usize,
 ) -> Result<VcpuLoopOutcome, RuntimeError> {
     let trace = std::env::var_os("CARRICK_TRACE_TRAPS").is_some();
+    // Per-thread blocking-I/O waiter (owns this thread's kqueue). Recreated in
+    // a forked child below (kqueue is not inherited across fork).
+    let mut waiter = crate::io_wait::ThreadWaiter::new();
     for traps in 1..=max_traps {
         // ---- vCPU run: NO kernel lock held ----
         let frame = engine.next_syscall()?;
@@ -761,13 +776,17 @@ fn run_vcpu_until_exit(
                 )?
             };
             match oc {
-                DispatchOutcome::WaitOnFds { fds, timeout } => match wait_on_host_fds(&fds, timeout) {
-                    FdWaitResult::Ready => continue,
-                    FdWaitResult::TimedOut => break DispatchOutcome::Returned { value: 0 },
-                    FdWaitResult::Interrupted => {
-                        break DispatchOutcome::Errno { errno: crate::linux_abi::LINUX_EINTR }
+                DispatchOutcome::WaitOnFds { fds, timeout, on_timeout } => {
+                    match waiter.wait(&fds, timeout) {
+                        crate::io_wait::WaitResult::Ready => continue,
+                        crate::io_wait::WaitResult::TimedOut => {
+                            break DispatchOutcome::Returned { value: on_timeout }
+                        }
+                        crate::io_wait::WaitResult::Interrupted => {
+                            break DispatchOutcome::Errno { errno: crate::linux_abi::LINUX_EINTR }
+                        }
                     }
-                },
+                }
                 other => break other,
             }
         };
@@ -1001,6 +1020,10 @@ fn run_vcpu_until_exit(
                             // delivery + real fork in the child.
                             this_tid = std::process::id() as ThreadId;
                             registry = Arc::new(ThreadRegistry::new(this_tid));
+                            // kqueue isn't inherited across fork; the self-pipe
+                            // is shared with the parent. Fresh ones for the child.
+                            crate::host_signal::reinit_after_fork();
+                            waiter = crate::io_wait::ThreadWaiter::new();
                             0
                         }
                     };
@@ -1080,53 +1103,6 @@ struct PendingSignalAction {
 /// an `exit_group(code)`). Returns `Ok(Some(...))` with
 /// `exit_code: None` when the handler was injected (or the signal was
 /// SIG_IGN'd) and the vCPU should resume.
-/// Result of waiting on host-fd readiness for a blocking I/O syscall.
-enum FdWaitResult {
-    Ready,
-    TimedOut,
-    Interrupted,
-}
-
-/// Block until one of `fds` is ready, `timeout` elapses, or a signal becomes
-/// pending. The CALLER must NOT hold the kernel lock (this is the whole point —
-/// a blocking wait under the BKL starves every sibling thread). Uses real
-/// `libc::poll` so siblings run freely, re-checking the pending-signal flag
-/// each slice so even an indefinite wait stays signal-interruptible. The runtime
-/// re-dispatches the syscall on `Ready`, completes with 0 on `TimedOut`, or with
-/// -EINTR on `Interrupted`.
-fn wait_on_host_fds(fds: &[(i32, i16)], timeout: Option<std::time::Duration>) -> FdWaitResult {
-    use std::time::Instant;
-    const SLICE_MS: i32 = 50;
-    let deadline = timeout.map(|d| Instant::now() + d);
-    let mut pollfds: Vec<libc::pollfd> = fds
-        .iter()
-        .map(|&(fd, events)| libc::pollfd { fd, events, revents: 0 })
-        .collect();
-    loop {
-        if crate::host_signal::has_pending() {
-            return FdWaitResult::Interrupted;
-        }
-        let slice_ms = match deadline {
-            Some(dl) => {
-                let now = Instant::now();
-                if now >= dl {
-                    return FdWaitResult::TimedOut;
-                }
-                (dl - now).as_millis().min(SLICE_MS as u128) as i32
-            }
-            None => SLICE_MS,
-        };
-        let n = unsafe {
-            libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, slice_ms)
-        };
-        if n > 0 {
-            return FdWaitResult::Ready;
-        }
-        // n < 0 (EINTR from a host signal) or n == 0 (slice elapsed): loop and
-        // re-check the pending-signal flag and the deadline.
-    }
-}
-
 fn deliver_pending_signal<T>(
     trap: &mut T,
     dispatcher: &mut SyscallDispatcher,
@@ -1339,6 +1315,9 @@ where
     // it.
     let _termios_guard = crate::host_tty::TermiosRestoreGuard::new();
 
+    // Per-thread blocking-I/O waiter (owns this thread's kqueue). Recreated in
+    // a forked child below (kqueue is not inherited across fork).
+    let mut waiter = crate::io_wait::ThreadWaiter::new();
     for traps in 1..=max_traps {
         let frame = trap.next_syscall()?;
         let outcome = loop {
@@ -1348,13 +1327,17 @@ where
                 &mut reporter,
             )?;
             match oc {
-                DispatchOutcome::WaitOnFds { fds, timeout } => match wait_on_host_fds(&fds, timeout) {
-                    FdWaitResult::Ready => continue,
-                    FdWaitResult::TimedOut => break DispatchOutcome::Returned { value: 0 },
-                    FdWaitResult::Interrupted => {
-                        break DispatchOutcome::Errno { errno: crate::linux_abi::LINUX_EINTR }
+                DispatchOutcome::WaitOnFds { fds, timeout, on_timeout } => {
+                    match waiter.wait(&fds, timeout) {
+                        crate::io_wait::WaitResult::Ready => continue,
+                        crate::io_wait::WaitResult::TimedOut => {
+                            break DispatchOutcome::Returned { value: on_timeout }
+                        }
+                        crate::io_wait::WaitResult::Interrupted => {
+                            break DispatchOutcome::Errno { errno: crate::linux_abi::LINUX_EINTR }
+                        }
                     }
-                },
+                }
                 other => break other,
             }
         };
@@ -1391,6 +1374,11 @@ where
                     crate::trap::ForkOutcome::Parent { child_pid } => i64::from(child_pid),
                     crate::trap::ForkOutcome::Child => {
                         dispatcher.clear_output_buffers();
+                        // kqueue is NOT inherited across fork, and the inherited
+                        // self-pipe is shared with the parent — give the child
+                        // fresh ones so its parked-thread wakes are its own.
+                        crate::host_signal::reinit_after_fork();
+                        waiter = crate::io_wait::ThreadWaiter::new();
                         0
                     }
                 };

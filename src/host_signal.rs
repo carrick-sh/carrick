@@ -77,6 +77,95 @@ pub const NO_PENDING_SIGNAL: i32 = 0;
 
 static PENDING: AtomicI32 = AtomicI32::new(NO_PENDING_SIGNAL);
 
+/// Process-wide self-pipe used to wake threads parked in a blocking-I/O
+/// `kevent()` (see `io_wait`) the instant a signal becomes pending. The signal
+/// handler writes one byte (async-signal-safe); every thread's kqueue watches
+/// `PENDING_PIPE_READ` via `EVFILT_READ`, so all parked waits return promptly —
+/// no 50ms poll, and no reliance on `SA_RESTART`/EINTR. `-1` until initialised.
+static PENDING_PIPE_READ: AtomicI32 = AtomicI32::new(-1);
+static PENDING_PIPE_WRITE: AtomicI32 = AtomicI32::new(-1);
+
+/// Read end of the self-pipe for `io_wait::ThreadWaiter` to watch, or `-1` if
+/// not yet initialised (callers then fall back to a polled wait).
+pub fn pending_pipe_read_fd() -> i32 {
+    PENDING_PIPE_READ.load(Ordering::SeqCst)
+}
+
+/// Create (or recreate) the self-pipe. If already open the old ends are closed
+/// first (used by `reinit_after_fork`). Both ends are non-blocking + CLOEXEC.
+fn open_pending_pipe() {
+    let mut fds = [0i32; 2];
+    let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    if rc != 0 {
+        return;
+    }
+    for fd in fds {
+        unsafe {
+            let fl = libc::fcntl(fd, libc::F_GETFL);
+            if fl >= 0 {
+                libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
+            }
+            let fdfl = libc::fcntl(fd, libc::F_GETFD);
+            if fdfl >= 0 {
+                libc::fcntl(fd, libc::F_SETFD, fdfl | libc::FD_CLOEXEC);
+            }
+        }
+    }
+    let old_r = PENDING_PIPE_READ.swap(fds[0], Ordering::SeqCst);
+    let old_w = PENDING_PIPE_WRITE.swap(fds[1], Ordering::SeqCst);
+    if old_r >= 0 {
+        unsafe { libc::close(old_r) };
+    }
+    if old_w >= 0 {
+        unsafe { libc::close(old_w) };
+    }
+}
+
+/// fork(2) does not inherit a kqueue, and the inherited self-pipe is shared
+/// with the parent (cross-process spurious wakes). Give the child a fresh
+/// self-pipe so its parked-thread wakes are its own.
+pub fn reinit_after_fork() {
+    open_pending_pipe();
+}
+
+/// Wake any thread parked in a blocking-I/O `kevent()` by making the self-pipe
+/// readable. Async-signal-safe (a single non-blocking `write`); a full pipe
+/// already means a wake is pending, so EAGAIN is ignored.
+fn notify_pending() {
+    let w = PENDING_PIPE_WRITE.load(Ordering::SeqCst);
+    if w >= 0 {
+        let byte = [1u8];
+        unsafe {
+            libc::write(w, byte.as_ptr() as *const libc::c_void, 1);
+        }
+    }
+}
+
+/// Drain the self-pipe (non-blocking). Called by a waiter after it observes the
+/// pipe readable so the level-triggered `EVFILT_READ` doesn't spin. Racing
+/// drains across threads are harmless — `has_pending` is the source of truth.
+pub fn drain_pending_pipe() {
+    let r = PENDING_PIPE_READ.load(Ordering::SeqCst);
+    if r < 0 {
+        return;
+    }
+    let mut buf = [0u8; 64];
+    loop {
+        let n = unsafe { libc::read(r, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        if n <= 0 {
+            break;
+        }
+    }
+}
+
+/// Publish a pending guest signum AND wake parked waiters. The single store +
+/// the pipe write are both async-signal-safe, so this is callable from a host
+/// signal handler.
+fn publish_pending(signum: i32) {
+    PENDING.store(signum, Ordering::SeqCst);
+    notify_pending();
+}
+
 /// 0 = handlers not installed yet, 1 = installed. Used to make
 /// `install_default_handlers` idempotent across test setups.
 static INSTALLED: AtomicU8 = AtomicU8::new(0);
@@ -89,7 +178,7 @@ extern "C" fn handle_sigint(_signum: libc::c_int) {
     // SIGINT happens to share the value 2, but we route everything
     // through the Linux numbering on the guest side so the dispatcher's
     // signal_handlers table lookup matches.
-    PENDING.store(LINUX_SIGINT, Ordering::SeqCst);
+    publish_pending(LINUX_SIGINT);
 }
 
 /// Generic host handler for a cross-process signal the guest registered a
@@ -97,7 +186,7 @@ extern "C" fn handle_sigint(_signum: libc::c_int) {
 /// numbering, and publishes it for the runtime to deliver to the guest's
 /// handler. Async-signal-safe (only an atomic store + a const-table lookup).
 extern "C" fn handle_routed(host_signum: libc::c_int) {
-    PENDING.store(host_to_linux_signum(host_signum), Ordering::SeqCst);
+    publish_pending(host_to_linux_signum(host_signum));
 }
 
 /// Install a host handler for `linux_signum` so a cross-process `kill` from
@@ -138,6 +227,9 @@ pub fn install_default_handlers() {
     {
         return;
     }
+    // The self-pipe must exist before any handler can fire (the handler writes
+    // it to wake parked waiters).
+    open_pending_pipe();
     // SAFETY: zero-initialised `sigaction` is the documented Linux/Darwin
     // "no flags, empty mask" form. We immediately fill `sa_sigaction`
     // with our handler before calling into libc.
@@ -175,5 +267,5 @@ pub fn has_pending() -> bool {
 /// `kill(self, SIGINT)`). Lets the runtime's signal-injection path
 /// service synthetic raises the same way it services host SIGINT.
 pub fn raise_for_self(signum: i32) {
-    PENDING.store(signum, Ordering::SeqCst);
+    publish_pending(signum);
 }

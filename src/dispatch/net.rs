@@ -593,7 +593,8 @@ impl SyscallDispatcher {
                 .iter()
                 .map(|p| (p.fd, p.events))
                 .collect();
-            return Ok(DispatchOutcome::WaitOnFds { fds: wait_fds, timeout });
+            // poll/ppoll: a timeout means "no fds ready" → return 0.
+            return Ok(DispatchOutcome::WaitOnFds { fds: wait_fds, timeout, on_timeout: 0 });
         }
 
         // Mixed / synthetic fds: fall back to the per-fd readiness check
@@ -674,6 +675,75 @@ impl SyscallDispatcher {
         // the HVF device, etc., so polling them blocks on the wrong object).
         // Route to the synthetic readiness path instead.
         None
+    }
+
+    /// The guest's status flags (O_NONBLOCK etc.) for `fd`. carrick keeps the
+    /// HOST fd non-blocking always and tracks the guest's intended blocking
+    /// mode here; `blocking_io` consults this to decide EAGAIN vs a lockless
+    /// wait. Bare stdio / unknown fds report 0 (blocking), the safe default.
+    fn fd_status_flags(&self, fd: i32) -> u64 {
+        let Some(open_file) = self.io.open_files.get(&fd) else {
+            return 0;
+        };
+        match &*open_file.description.borrow() {
+            OpenDescription::HostSocket { status_flags, .. }
+            | OpenDescription::HostPipe { status_flags, .. }
+            | OpenDescription::HostFile { status_flags, .. }
+            | OpenDescription::PipeReader { status_flags, .. }
+            | OpenDescription::PipeWriter { status_flags, .. }
+            | OpenDescription::File { status_flags, .. }
+            | OpenDescription::Netlink { status_flags, .. } => *status_flags,
+            _ => 0,
+        }
+    }
+
+    /// THE single chokepoint for blocking-mode host I/O — every recv/send/
+    /// accept/read/write on a host fd routes through here. `op` performs ONE
+    /// NON-BLOCKING libc call (the host fd is always `O_NONBLOCK`) and, on
+    /// success, returns the value to hand the guest (having already copied any
+    /// data into guest memory). The classification is uniform:
+    ///   * `Ok(n)`            → the syscall returns `n`.
+    ///   * `Err(EAGAIN)`      → guest non-blocking fd: EAGAIN; guest blocking
+    ///                          fd: `WaitOnFds` (the runtime waits with the
+    ///                          kernel lock RELEASED, then re-dispatches).
+    ///   * `Err(other)`       → that errno.
+    ///
+    /// INVARIANT: `host_fd` MUST be `O_NONBLOCK`. If it isn't, `op` could block
+    /// inside libc while we hold the big kernel lock and starve every sibling
+    /// thread — the exact bug this design exists to prevent. We assert it
+    /// loudly in debug/test builds and self-heal (force non-blocking) in
+    /// release so a missed creation site can never silently reintroduce the
+    /// starvation.
+    fn blocking_io<F>(&self, guest_fd: i32, host_fd: i32, dir: IoDir, op: F) -> DispatchOutcome
+    where
+        F: FnOnce() -> Result<i64, i32>,
+    {
+        if !host_fd_is_nonblocking(host_fd) {
+            debug_assert!(
+                false,
+                "blocking_io: host fd {host_fd} (guest fd {guest_fd}) is NOT O_NONBLOCK — \
+                 a blocking libc call under the kernel lock would starve sibling threads"
+            );
+            set_host_nonblocking(host_fd);
+        }
+        match op() {
+            Ok(n) => DispatchOutcome::Returned { value: n },
+            Err(e) if e == LINUX_EAGAIN => {
+                if self.fd_status_flags(guest_fd) & LINUX_O_NONBLOCK != 0 {
+                    DispatchOutcome::Errno { errno: LINUX_EAGAIN }
+                } else {
+                    DispatchOutcome::WaitOnFds {
+                        fds: vec![(host_fd, dir.events())],
+                        // SO_RCVTIMEO/SO_SNDTIMEO not yet modelled → block forever
+                        // (signal-interruptible). When added, pass the deadline +
+                        // on_timeout = -EAGAIN so a finite timeout reports EAGAIN.
+                        timeout: None,
+                        on_timeout: -(LINUX_EAGAIN as i64),
+                    }
+                }
+            }
+            Err(e) => DispatchOutcome::Errno { errno: e },
+        }
     }
 
     fn poll_ready_events(&self, fd: i32, requested_events: i16) -> i16 {
@@ -911,13 +981,11 @@ impl SyscallDispatcher {
         if host_fd < 0 {
             return DispatchOutcome::Errno { errno: host_errno() };
         }
+        // Host fds keep their native blocking mode; carrick emulates the
+        // guest's blocking via per-call MSG_DONTWAIT + a lockless kqueue wait
+        // (see P2/blocking_io). Honour a guest-requested SOCK_NONBLOCK.
         if nonblock {
-            unsafe {
-                let flags = libc::fcntl(host_fd, libc::F_GETFL);
-                if flags >= 0 {
-                    libc::fcntl(host_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-                }
-            }
+            set_host_nonblocking(host_fd);
         }
         let status_flags = if nonblock { LINUX_O_NONBLOCK } else { 0 };
         let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };
@@ -962,15 +1030,10 @@ impl SyscallDispatcher {
         if rc != 0 {
             return Ok(DispatchOutcome::Errno { errno: host_errno() });
         }
+        // Native blocking mode unless the guest asked for SOCK_NONBLOCK.
         if nonblock {
-            for fd in &host_fds {
-                unsafe {
-                    let flags = libc::fcntl(*fd, libc::F_GETFL);
-                    if flags >= 0 {
-                        libc::fcntl(*fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-                    }
-                }
-            }
+            set_host_nonblocking(host_fds[0]);
+            set_host_nonblocking(host_fds[1]);
         }
         let status_flags = if nonblock { LINUX_O_NONBLOCK } else { 0 };
         let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };
@@ -2500,4 +2563,42 @@ fn read_linux_msghdr(memory: &impl GuestMemory, addr: u64) -> Result<LinuxMsghdr
     #[allow(clippy::unwrap_used)]
     let iovlen = u64::from_ne_bytes(bytes[24..32].try_into().unwrap());
     Ok(LinuxMsghdr { name, namelen, iov, iovlen })
+}
+
+/// Direction a blocking I/O syscall waits on, in `libc::poll` event terms.
+#[derive(Clone, Copy)]
+pub(super) enum IoDir {
+    /// recv/read/accept — wait for the fd to become readable.
+    Read,
+    /// send/write/connect — wait for the fd to become writable.
+    Write,
+}
+
+impl IoDir {
+    fn events(self) -> i16 {
+        match self {
+            IoDir::Read => libc::POLLIN,
+            IoDir::Write => libc::POLLOUT,
+        }
+    }
+}
+
+/// Force a host fd into `O_NONBLOCK`. carrick keeps EVERY host-backed fd
+/// non-blocking and emulates the guest's blocking mode itself via
+/// `blocking_io` + the runtime's lockless `WaitOnFds` wait, so a guest blocking
+/// syscall never blocks a vCPU thread inside libc while the big kernel lock is
+/// held. Call at every host-fd creation site (socket/socketpair/accept/pipe).
+pub(super) fn set_host_nonblocking(fd: i32) {
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 && flags & libc::O_NONBLOCK == 0 {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+}
+
+/// INVARIANT predicate: a host fd carrick performs I/O on must be `O_NONBLOCK`.
+pub(super) fn host_fd_is_nonblocking(fd: i32) -> bool {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    flags >= 0 && (flags & libc::O_NONBLOCK != 0)
 }
