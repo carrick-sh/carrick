@@ -1,6 +1,23 @@
-# Tier B current wall — `ldaxr` on a stage-2-mapped page
+# Tier B wall — `ldaxr` on a stage-2-mapped page — **RESOLVED**
 
-## Status
+> **RESOLVED 2026-05-22.** This wall is fixed. The chosen fix was
+> Option A from the bottom of this doc: build stage-1 identity-mapping
+> page tables and enable `SCTLR_EL1.M=1` so EL0 data accesses are tagged
+> Normal cacheable and `ldaxr`/`stlxr` work. Landed across
+> `55c5762` (scaffolding, opt-in via `CARRICK_ENABLE_STAGE1`),
+> `79535cd` (PSTATE.PAN vs AP[1] diagnosis), and `abf464e` (stage-1 MMU
+> enabled by default with per-region AP). See `src/memory.rs:840`
+> (`build identity-mapping page table`) and `src/trap.rs:601`
+> (programs `TTBR0_EL1`/`TCR_EL1`/`MAIR_EL1`, sets `SCTLR_EL1.M`).
+>
+> Verified end-to-end on 2026-05-22:
+> `carrick run docker.io/library/alpine:latest /bin/busybox echo hello`
+> → `hello\n`, exit 0, 9 syscalls, 0 unhandled. The whole threaded
+> runtime (which needs working guest atomics) is built on top of this.
+>
+> The historical analysis below is kept for context only.
+
+## Status (historical)
 
 * **Tier A**: working end-to-end. `carrick run-elf ...hello` returns
   `"hello from carrick\n"` exit 0 in 2 traps.
