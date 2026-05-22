@@ -28,7 +28,8 @@
 //! call from `runtime::run_combined_syscall_loop_with_dispatcher`.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+
+use parking_lot::Mutex;
 
 use crate::linux_abi::{LinuxTermios, LinuxWinsize};
 
@@ -355,7 +356,7 @@ fn snapshot_fd(fd: i32) -> bool {
     if unsafe { libc::tcgetattr(fd, &mut t) } != 0 {
         return false;
     }
-    let mut guard = SAVED_TERMIOS.lock().unwrap();
+    let mut guard = SAVED_TERMIOS.lock();
     let map = guard.get_or_insert_with(HashMap::new);
     map.entry(fd).or_insert(t);
     true
@@ -383,7 +384,7 @@ fn mark_dirty(fd: i32) {
 /// cheap no-ops.
 pub fn restore_stdin_termios() {
     let snapshots = {
-        let mut guard = SAVED_TERMIOS.lock().unwrap();
+        let mut guard = SAVED_TERMIOS.lock();
         guard.take()
     };
     if let Some(map) = snapshots {
