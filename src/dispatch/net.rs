@@ -2659,11 +2659,3 @@ pub(super) fn set_host_nonblocking(fd: i32) {
         }
     }
 }
-
-/// INVARIANT predicate: a host fd carrick performs I/O on must be `O_NONBLOCK`.
-/// Used by the P5 debug_assert invariant (wired in by the enforcement step).
-#[allow(dead_code)]
-pub(super) fn host_fd_is_nonblocking(fd: i32) -> bool {
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    flags >= 0 && (flags & libc::O_NONBLOCK != 0)
-}
