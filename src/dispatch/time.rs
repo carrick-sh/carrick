@@ -189,7 +189,18 @@ impl SyscallDispatcher {
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
         if let Some(duration) = duration {
-            std::thread::sleep(duration);
+            if let Some(remaining) = host_sleep_interruptible(duration) {
+                // Interrupted by a pending signal: report the unslept remainder
+                // (if the guest passed a `rem` pointer) and return EINTR so the
+                // trap loop delivers the signal. nanosleep(2)'s `rem` is arg1.
+                let rem_ptr = ctx.arg(1);
+                if rem_ptr != 0 {
+                    let memory = &mut *ctx.memory;
+                    let ts = linux_timespec_from_duration(remaining);
+                    let _ = write_kernel_struct(memory, rem_ptr, &ts);
+                }
+                return Ok(DispatchOutcome::Errno { errno: LINUX_EINTR });
+            }
         }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
@@ -226,7 +237,20 @@ impl SyscallDispatcher {
             requested
         };
         if !sleep_duration.is_zero() {
-            std::thread::sleep(sleep_duration);
+            if let Some(remaining) = host_sleep_interruptible(sleep_duration) {
+                // Relative sleeps report the unslept remainder via arg3;
+                // absolute (TIMER_ABSTIME) sleeps do not. Return EINTR either
+                // way so the trap loop delivers the pending signal.
+                if flags & LINUX_TIMER_ABSTIME == 0 {
+                    let rem_ptr = ctx.arg(3);
+                    if rem_ptr != 0 {
+                        let memory = &mut *ctx.memory;
+                        let ts = linux_timespec_from_duration(remaining);
+                        let _ = write_kernel_struct(memory, rem_ptr, &ts);
+                    }
+                }
+                return Ok(DispatchOutcome::Errno { errno: LINUX_EINTR });
+            }
         }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
@@ -629,5 +653,46 @@ fn itimerval_from_real(
             }
         }
         None => crate::linux_abi::LinuxItimerval::zeroed(),
+    }
+}
+
+/// Sleep on the host for `duration`, interruptible by a pending guest signal.
+///
+/// Unlike `std::thread::sleep` — whose internal `assert_eq!(errno, EINTR)`
+/// panics the whole process when carrick's signal machinery leaves a different
+/// errno on the thread (observed crashing forked guest children on Ctrl-C) —
+/// this issues `nanosleep(2)` directly. On a genuine interruption (a
+/// process-directed guest signal such as SIGINT is pending) it returns the
+/// unslept `Some(remaining)` so the caller can return `EINTR` and let the trap
+/// loop deliver the signal. Spurious wakeups (internal vCPU kicks, SIGCHLD…)
+/// resume sleeping for the remaining time, matching Linux's restart behaviour.
+fn host_sleep_interruptible(duration: Duration) -> Option<Duration> {
+    let mut req = libc::timespec {
+        tv_sec: duration.as_secs().min(libc::time_t::MAX as u64) as libc::time_t,
+        tv_nsec: duration.subsec_nanos() as libc::c_long,
+    };
+    loop {
+        let mut rem = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `req` and `rem` are valid, distinct, fully-initialised
+        // timespecs for the duration of the call.
+        let r = unsafe { libc::nanosleep(&req, &mut rem) };
+        if r == 0 {
+            return None;
+        }
+        // Interrupted. Surface EINTR only if the guest has a signal it can
+        // actually take; otherwise resume sleeping for the remaining time.
+        if crate::host_signal::has_process_pending() {
+            return Some(Duration::new(
+                rem.tv_sec.max(0) as u64,
+                rem.tv_nsec.max(0) as u32,
+            ));
+        }
+        if rem.tv_sec <= 0 && rem.tv_nsec <= 0 {
+            return None;
+        }
+        req = rem;
     }
 }
