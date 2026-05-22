@@ -607,11 +607,43 @@ impl SyscallDispatcher {
                 errno: LINUX_EINVAL,
             });
         }
-        // Linux WNOHANG = 1; macOS WNOHANG = 1. Same bit, pass through.
+        // Translate Linux wait options to macOS: WNOHANG/WUNTRACED share bits
+        // (1/2) but WCONTINUED is 8 on Linux vs 0x10 on macOS — passing the
+        // Linux bit straight through makes macOS waitpid reject it with EINVAL
+        // (breaking bash's WNOHANG|WUNTRACED|WCONTINUED job-control poll). The
+        // Linux-only thread flags (WALL/WCLONE/WNOTHREAD) have no macOS analogue
+        // and are dropped.
+        let mut host_options: i32 = 0;
+        if options & crate::linux_abi::LINUX_WNOHANG != 0 {
+            host_options |= libc::WNOHANG;
+        }
+        if options & crate::linux_abi::LINUX_WUNTRACED != 0 {
+            host_options |= libc::WUNTRACED;
+        }
+        if options & crate::linux_abi::LINUX_WCONTINUED != 0 {
+            host_options |= libc::WCONTINUED;
+        }
         let mut host_status: i32 = 0;
-        let result = unsafe { libc::waitpid(pid, &mut host_status, options as i32) };
+        // Retry the blocking host waitpid across EINTR from carrick-internal
+        // host signals (e.g. the SIGURG vCPU kick). Without this, a shell
+        // blocked waiting on a foreground job spuriously returns from wait,
+        // leaves the wait, and spins. Only surface EINTR to the guest when a
+        // signal it can actually take is pending (so its handler runs / it
+        // dies) — same discipline as host_sleep_interruptible and read_host_pipe.
+        let result = loop {
+            let r = unsafe { libc::waitpid(pid, &mut host_status, host_options) };
+            if r >= 0 {
+                break r;
+            }
+            let e = host_errno();
+            if e == LINUX_EINTR && !crate::host_signal::has_process_pending() {
+                continue;
+            }
+            break -1;
+        };
         if result < 0 {
-            // ECHILD on macOS == ECHILD on Linux (10).
+            // ECHILD on macOS == ECHILD on Linux (10); EINTR surfaces only when
+            // a guest-deliverable signal is pending (see the retry loop).
             return Ok(DispatchOutcome::Errno {
                 errno: host_errno(),
             });
@@ -908,11 +940,26 @@ fn fill_deterministic_bootstrap_random(bytes: &mut [u8]) {
 /// (low byte == 0x7f) are returned unchanged.
 fn translate_wait_status(status: i32) -> i32 {
     let low = status & 0x7f;
-    if low != 0 && low != 0x7f {
+    if low == 0x7f {
+        // WIFSTOPPED (and macOS's WIFCONTINUED, which is a stopped status whose
+        // stop signal is the sentinel 0x13). The stop signal lives in bits 8..15
+        // and is in macOS numbering, so translate it host->Linux (e.g. SIGTSTP
+        // is 18 on macOS, 20 on Linux) — without this, bash's WSTOPSIG check
+        // after Ctrl-Z sees the wrong signal and job control misbehaves.
+        let host_stopsig = (status >> 8) & 0xff;
+        if host_stopsig == 0x13 {
+            // macOS WIFCONTINUED → Linux WIFCONTINUED status (0xffff).
+            return 0xffff;
+        }
+        let linux_stopsig = crate::host_signal::host_to_linux_signum(host_stopsig);
+        (linux_stopsig << 8) | 0x7f
+    } else if low != 0 {
+        // Terminated by signal: translate the termination signal.
         let core = status & 0x80;
         let linux_sig = crate::host_signal::host_to_linux_signum(low);
         (linux_sig & 0x7f) | core
     } else {
+        // Exited normally: high byte is the exit code, left untouched.
         status
     }
 }

@@ -4218,7 +4218,14 @@ fn read_host_pipe(
     crate::probes::host_pipe_io(host_fd, 0, n as i64);
     if n < 0 {
         let e = host_errno();
-        if e == LINUX_EAGAIN {
+        // EINTR: interrupted by a HOST signal. Don't surface it to the guest —
+        // carrick's internal machinery raises frequent host signals (e.g. the
+        // SIGURG vCPU kick), and leaking their EINTR spins the guest's read in
+        // an infinite retry loop. Route through the readiness wait, which
+        // retries transparently and only returns guest-EINTR when a deliverable
+        // guest signal is actually pending (has_pending_for). Same discipline as
+        // host_sleep_interruptible.
+        if e == LINUX_EAGAIN || e == LINUX_EINTR {
             return would_block_outcome(host_fd, libc::POLLIN, nonblocking);
         }
         return DispatchOutcome::Errno { errno: e };
@@ -4240,7 +4247,10 @@ fn write_host_pipe(bytes: &[u8], host_fd: i32, nonblocking: bool) -> DispatchOut
     crate::probes::host_pipe_io(host_fd, 1, n as i64);
     if n < 0 {
         let e = host_errno();
-        if e == LINUX_EAGAIN {
+        // EINTR: interrupted by an internal host signal (e.g. SIGURG vCPU kick).
+        // Route through the readiness wait rather than leaking it to the guest
+        // (see read_host_pipe).
+        if e == LINUX_EAGAIN || e == LINUX_EINTR {
             return would_block_outcome(host_fd, libc::POLLOUT, nonblocking);
         }
         return DispatchOutcome::Errno { errno: e };
