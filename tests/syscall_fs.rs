@@ -4011,3 +4011,62 @@ fn fcntl_on_bare_stdio_succeeds_not_ebadf() {
         "fcntl(F_SETFL) on an invalid fd must still be EBADF",
     );
 }
+
+#[test]
+fn ptmx_tiocgptn_returns_index_and_tcgets_succeeds() {
+    // SyscallDispatcher::new() mounts /dev (including /dev/ptmx) and /dev/pts
+    // as part of FsState::new(), so no rootfs is needed.
+    let mut dispatcher = SyscallDispatcher::new();
+    // Layout: path at 0x4000, output slots above that.
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
+    memory.write_bytes(0x4000, b"/dev/ptmx\0").unwrap();
+    let reporter = CompatReporter::default();
+
+    // openat(AT_FDCWD, "/dev/ptmx", O_RDWR=2)
+    let fd = match dispatcher
+        .dispatch(
+            SyscallRequest::new(56, SyscallArgs::from([(-100_i64) as u64, 0x4000, 2, 0, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap()
+    {
+        DispatchOutcome::Returned { value } => value as u64,
+        o => panic!("open /dev/ptmx failed: {:?}", o),
+    };
+
+    // ioctl(fd, TIOCGPTN, &out) → index 0 (first pty allocated)
+    const LINUX_TIOCGPTN: u64 = 0x8004_5430;
+    let out_ptr = 0x4100u64;
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(29, SyscallArgs::from([fd, LINUX_TIOCGPTN, out_ptr, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 },
+        "TIOCGPTN must succeed"
+    );
+    assert_eq!(
+        memory.read_bytes(out_ptr, 4).unwrap(),
+        0u32.to_le_bytes(),
+        "TIOCGPTN must write index 0"
+    );
+
+    // ioctl(fd, TCGETS, &buf) must NOT return ENOTTY — it must return 0
+    let buf_ptr = 0x4200u64;
+    let r = dispatcher
+        .dispatch(
+            SyscallRequest::new(29, SyscallArgs::from([fd, LINUX_TCGETS, buf_ptr, 0, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    assert!(
+        matches!(r, DispatchOutcome::Returned { .. }),
+        "TCGETS on ptmx must succeed, got: {:?}",
+        r
+    );
+}

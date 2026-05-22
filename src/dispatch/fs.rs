@@ -939,6 +939,121 @@ impl SyscallDispatcher {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         }
 
+        // ── PTY ioctls ────────────────────────────────────────────────────────
+        // If this fd is a pty master or slave, handle all tty ioctls here by
+        // passing through to the host fd (real macOS pty). Return early so the
+        // stdio-gated arms below never run for pty fds.
+        if let Some(role) = self.pty_role(fd) {
+            let host_fd = match self.pty_host_fd(fd) {
+                Some(h) => h,
+                None => return Ok(DispatchOutcome::Errno { errno: LINUX_ENOTTY }),
+            };
+            return Ok(match ioctl_request {
+                LINUX_TIOCGPTN => {
+                    write_packed(&mut *ctx.memory, arg, &role.index.to_le_bytes())
+                }
+                LINUX_TIOCSPTLCK => {
+                    let mut buf = [0u8; 4];
+                    match ctx.memory.read_bytes(arg, 4) {
+                        Ok(b) => buf.copy_from_slice(&b),
+                        Err(_) => {
+                            return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT })
+                        }
+                    }
+                    let lock = i32::from_le_bytes(buf) != 0;
+                    self.pty_table().lock().set_locked(role.index, lock);
+                    DispatchOutcome::Returned { value: 0 }
+                }
+                LINUX_TCGETS => {
+                    let termios = crate::host_tty::get_host_termios(host_fd)
+                        .unwrap_or_else(LinuxTermios::default_cooked);
+                    write_kernel_struct(&mut *ctx.memory, arg, &termios)
+                }
+                LINUX_TCSETS | LINUX_TCSETSW | LINUX_TCSETSF => {
+                    match ctx.memory.read_bytes(arg, LINUX_TERMIOS_KERNEL_SIZE) {
+                        Ok(bytes) => {
+                            let mut padded = [0u8; core::mem::size_of::<LinuxTermios>()];
+                            padded[..LINUX_TERMIOS_KERNEL_SIZE].copy_from_slice(&bytes);
+                            match LinuxTermios::read_from_bytes(&padded) {
+                                Ok(t) => {
+                                    let _ = crate::host_tty::set_host_termios(host_fd, &t);
+                                    DispatchOutcome::Returned { value: 0 }
+                                }
+                                Err(_) => DispatchOutcome::Errno { errno: LINUX_EINVAL },
+                            }
+                        }
+                        Err(_) => DispatchOutcome::Errno { errno: LINUX_EFAULT },
+                    }
+                }
+                LINUX_TIOCGWINSZ => {
+                    let ws = crate::host_tty::get_host_winsize(host_fd)
+                        .unwrap_or_else(LinuxWinsize::terminal_80x24);
+                    write_kernel_struct(&mut *ctx.memory, arg, &ws)
+                }
+                LINUX_TIOCSWINSZ => {
+                    match ctx.memory.read_bytes(arg, 8) {
+                        Ok(b) => {
+                            let mut ws: libc::winsize = unsafe { core::mem::zeroed() };
+                            ws.ws_row = u16::from_le_bytes([b[0], b[1]]);
+                            ws.ws_col = u16::from_le_bytes([b[2], b[3]]);
+                            ws.ws_xpixel = u16::from_le_bytes([b[4], b[5]]);
+                            ws.ws_ypixel = u16::from_le_bytes([b[6], b[7]]);
+                            // SAFETY: host_fd is our live pty fd; &ws is valid.
+                            unsafe { libc::ioctl(host_fd, libc::TIOCSWINSZ as libc::c_ulong, &ws) };
+                            DispatchOutcome::Returned { value: 0 }
+                        }
+                        Err(_) => DispatchOutcome::Errno { errno: LINUX_EFAULT },
+                    }
+                }
+                LINUX_TIOCGPGRP => {
+                    // SAFETY: host_fd is our live pty fd.
+                    let pgrp = unsafe { libc::tcgetpgrp(host_fd) };
+                    if pgrp < 0 {
+                        DispatchOutcome::Errno {
+                            errno: crate::dispatch::macos_to_linux_errno(
+                                unsafe { *libc::__error() },
+                            ),
+                        }
+                    } else {
+                        write_packed(&mut *ctx.memory, arg, &(pgrp as i32).to_le_bytes())
+                    }
+                }
+                LINUX_TIOCSPGRP => {
+                    let mut buf = [0u8; 4];
+                    match ctx.memory.read_bytes(arg, 4) {
+                        Ok(b) => buf.copy_from_slice(&b),
+                        Err(_) => {
+                            return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT })
+                        }
+                    }
+                    let pgrp = i32::from_le_bytes(buf);
+                    // SAFETY: host_fd is our live pty fd.
+                    let r = unsafe { libc::tcsetpgrp(host_fd, pgrp) };
+                    if r < 0 {
+                        DispatchOutcome::Errno {
+                            errno: crate::dispatch::macos_to_linux_errno(
+                                unsafe { *libc::__error() },
+                            ),
+                        }
+                    } else {
+                        DispatchOutcome::Returned { value: 0 }
+                    }
+                }
+                LINUX_TIOCSCTTY => {
+                    // SAFETY: host_fd is our live pty fd. Best-effort.
+                    unsafe {
+                        libc::ioctl(host_fd, libc::TIOCSCTTY as libc::c_ulong, 0i32)
+                    };
+                    DispatchOutcome::Returned { value: 0 }
+                }
+                _ => {
+                    ctx.reporter
+                        .record(CompatEvent::unhandled_ioctl(fd, ioctl_request, arg));
+                    DispatchOutcome::Errno { errno: LINUX_ENOTTY }
+                }
+            });
+        }
+
         Ok(match ioctl_request {
             LINUX_TIOCGWINSZ if fd_is_tty(&self.io.open_files.read(), fd) => {
                 // Prefer the live host window size when stdin/stdout/stderr
@@ -1102,6 +1217,22 @@ impl SyscallDispatcher {
         } else {
             Err(LINUX_EBADF)
         }
+    }
+
+    /// Returns the `PtyRole` for `fd` if it is a pty master or slave fd.
+    fn pty_role(&self, fd: i32) -> Option<crate::vfs::PtyRole> {
+        self.open_file(fd).and_then(|of| match &*of.description.read() {
+            OpenDescription::HostPipe { pty, .. } => *pty,
+            _ => None,
+        })
+    }
+
+    /// Returns the host fd for `fd` if it is a pty master or slave fd.
+    fn pty_host_fd(&self, fd: i32) -> Option<i32> {
+        self.open_file(fd).and_then(|of| match &*of.description.read() {
+            OpenDescription::HostPipe { host_fd, pty: Some(_), .. } => Some(*host_fd),
+            _ => None,
+        })
     }
 
     pub(super) fn fd_is_valid(&self, fd: i32) -> bool {
