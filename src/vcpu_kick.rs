@@ -153,7 +153,10 @@ fn kick_ids(_ids: &[u64]) {}
 /// pipe directly; this only adds the in-guest kick. The thread runs until the
 /// process exits (no join — it holds only an `Arc` clone of the kicker).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub fn spawn_signal_pump(kicker: std::sync::Arc<VcpuKicker>) {
+pub fn spawn_signal_pump(
+    kicker: std::sync::Arc<VcpuKicker>,
+    futex: std::sync::Arc<crate::thread::FutexTable>,
+) {
     let pipe = crate::host_signal::pending_pipe_read_fd();
     if pipe < 0 {
         return;
@@ -204,13 +207,20 @@ pub fn spawn_signal_pump(kicker: std::sync::Arc<VcpuKicker>) {
                 // syscall (kevent) is unaffected (already woken by the pipe);
                 // one spinning in the guest exits with CANCELED and delivers.
                 kicker.kick_all();
+                // Threads parked in FUTEX_WAIT aren't in the guest (no kick) and
+                // don't watch the pipe — wake them so they re-check pending now.
+                futex.notify_signal_pending();
             }
             unsafe { libc::close(kq) };
         });
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-pub fn spawn_signal_pump(_kicker: std::sync::Arc<VcpuKicker>) {}
+pub fn spawn_signal_pump(
+    _kicker: std::sync::Arc<VcpuKicker>,
+    _futex: std::sync::Arc<crate::thread::FutexTable>,
+) {
+}
 
 #[cfg(test)]
 mod tests {
