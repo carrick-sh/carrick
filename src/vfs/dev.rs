@@ -109,6 +109,12 @@ impl Vfs for DevVfs {
             name: "ptmx".to_string(),
             kind: EntryKind::CharDevice,
         });
+        // /dev/tty is a node (the controlling terminal), handled specially in
+        // open() rather than as a host passthrough.
+        entries.push(DirEnt {
+            name: "tty".to_string(),
+            kind: EntryKind::CharDevice,
+        });
         entries.push(DirEnt {
             name: "pts".to_string(),
             kind: EntryKind::Directory,
