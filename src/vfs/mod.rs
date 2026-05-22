@@ -158,7 +158,7 @@ pub struct OpenContext<'a> {
 /// ask for it via [`VfsMounts::resolve_relative`]. This keeps the
 /// `ProcVfs`/`SysVfs` implementations simple — they already know
 /// they live under `/proc` / `/sys`.
-pub trait Vfs: Send {
+pub trait Vfs: Send + Sync {
     fn lookup(&self, path: &str) -> Result<Metadata, VfsError>;
 
     fn readlink(&self, _path: &str) -> Result<PathBuf, VfsError> {
@@ -174,7 +174,7 @@ pub trait Vfs: Send {
     /// returns ENOSYS so mounts that don't support `open` don't have
     /// to implement it explicitly.
     fn open(
-        &mut self,
+        &self,
         _path: &str,
         _flags: OpenFlags,
         _ctx: &OpenContext<'_>,
@@ -182,27 +182,27 @@ pub trait Vfs: Send {
         Err(crate::linux_abi::LINUX_ENOSYS)
     }
 
-    fn mkdir(&mut self, _path: &str, _mode: u32) -> Result<(), VfsError> {
+    fn mkdir(&self, _path: &str, _mode: u32) -> Result<(), VfsError> {
         Err(crate::linux_abi::LINUX_EROFS)
     }
 
-    fn unlink(&mut self, _path: &str) -> Result<(), VfsError> {
+    fn unlink(&self, _path: &str) -> Result<(), VfsError> {
         Err(crate::linux_abi::LINUX_EROFS)
     }
 
-    fn rmdir(&mut self, _path: &str) -> Result<(), VfsError> {
+    fn rmdir(&self, _path: &str) -> Result<(), VfsError> {
         Err(crate::linux_abi::LINUX_EROFS)
     }
 
-    fn rename(&mut self, _from: &str, _to: &str) -> Result<(), VfsError> {
+    fn rename(&self, _from: &str, _to: &str) -> Result<(), VfsError> {
         Err(crate::linux_abi::LINUX_EROFS)
     }
 
-    fn symlink(&mut self, _target: &str, _link: &str) -> Result<(), VfsError> {
+    fn symlink(&self, _target: &str, _link: &str) -> Result<(), VfsError> {
         Err(crate::linux_abi::LINUX_EROFS)
     }
 
-    fn link(&mut self, _from: &str, _to: &str) -> Result<(), VfsError> {
+    fn link(&self, _from: &str, _to: &str) -> Result<(), VfsError> {
         Err(crate::linux_abi::LINUX_EROFS)
     }
 

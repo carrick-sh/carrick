@@ -1,10 +1,13 @@
 //! Thread + futex coordination shared across a guest process's host threads.
 //! No HVF, no syscalls — pure data structures behind their own locks so they
-//! can be held across vCPU runs without entangling the big kernel lock.
+//! can be held across vCPU runs without entangling the dispatcher lock.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
+use parking_lot::Mutex as ParkingMutex;
+use parking_lot_core::{FilterOp, ParkResult, ParkToken, UnparkToken};
 
 pub type ThreadId = i32;
 
@@ -104,98 +107,247 @@ pub enum FutexWaitOutcome {
     Interrupted,
 }
 
-/// Address-keyed futex wait queues. Each guest futex word is identified by its
-/// guest address (private futexes only for v1 — apt/glibc use FUTEX_PRIVATE).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct FutexWait {
+    pub addr: u64,
+    generation: u64,
+}
+
+struct FutexBucket {
+    generation: AtomicU64,
+    waiters: AtomicUsize,
+}
+
+impl FutexBucket {
+    fn new() -> Self {
+        Self {
+            generation: AtomicU64::new(0),
+            waiters: AtomicUsize::new(0),
+        }
+    }
+}
+
+const FUTEX_WAKE_TOKEN: usize = 1;
+const FUTEX_SIGNAL_TOKEN: usize = 2;
+
+/// Address-keyed futex wait queues. Each guest futex word is identified by a
+/// stable Carrick-owned bucket key derived from an `Arc<FutexBucket>`, not by
+/// feeding raw guest addresses to `parking_lot_core`.
 pub struct FutexTable {
-    inner: Mutex<HashMap<u64, u64>>, // addr -> generation counter
-    cv: Condvar,
+    buckets: ParkingMutex<HashMap<u64, Arc<FutexBucket>>>,
 }
 
 impl FutexTable {
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(HashMap::new()),
-            cv: Condvar::new(),
+            buckets: ParkingMutex::new(HashMap::new()),
         }
     }
 
-    /// Wait until the generation for `addr` advances, `timeout` elapses, or
-    /// `interrupted()` reports a pending signal. The caller must have ALREADY
-    /// checked `*uaddr == expected` under the (separate) kernel lock and
-    /// released it.
-    ///
-    /// Even an indefinite wait (`timeout == None`) is polled on a bounded cap
-    /// so a process whose threads are ALL parked in futex still notices a
-    /// pending signal within `POLL_CAP`. A spurious wake from the cap that
-    /// neither advances the generation nor finds a signal just re-parks; futex
-    /// callers always re-check their word, so this is semantically safe.
+    fn bucket(&self, addr: u64) -> Arc<FutexBucket> {
+        let mut buckets = self.buckets.lock();
+        Arc::clone(
+            buckets
+                .entry(addr)
+                .or_insert_with(|| Arc::new(FutexBucket::new())),
+        )
+    }
+
+    fn bucket_key(bucket: &Arc<FutexBucket>) -> usize {
+        Arc::as_ptr(bucket) as usize
+    }
+
+    /// Capture the futex generation immediately after the dispatcher has
+    /// verified the guest word. The runtime later parks against this token
+    /// with syscall locks released; a wake that races in between advances the
+    /// generation and the waiter returns without sleeping.
+    pub fn prepare_wait(&self, addr: u64) -> FutexWait {
+        let bucket = self.bucket(addr);
+        FutexWait {
+            addr,
+            generation: bucket.generation.load(Ordering::Acquire),
+        }
+    }
+
     pub fn wait(
         &self,
         addr: u64,
         timeout: Option<std::time::Duration>,
         interrupted: &dyn Fn() -> bool,
     ) -> FutexWaitOutcome {
-        use std::time::{Duration, Instant};
-        const POLL_CAP: Duration = Duration::from_millis(50);
-        // INVARIANT: mutex/condvar poisoning means another thread panicked while
-        // holding the lock — unrecoverable, panic propagation is correct.
-        #[allow(clippy::expect_used)]
-        let mut map = self.inner.lock().expect("futex table mutex poisoned");
-        let start_gen = *map.get(&addr).unwrap_or(&0);
-        let deadline = timeout.map(|d| Instant::now() + d);
+        let wait = self.prepare_wait(addr);
+        self.wait_prepared(wait, timeout, interrupted)
+    }
+
+    /// Wait until the generation captured by `prepare_wait` advances,
+    /// `timeout` elapses, or `interrupted()` reports a pending signal. The
+    /// caller must have already checked `*uaddr == expected` before creating
+    /// the wait token.
+    pub fn wait_prepared(
+        &self,
+        wait: FutexWait,
+        timeout: Option<std::time::Duration>,
+        interrupted: &dyn Fn() -> bool,
+    ) -> FutexWaitOutcome {
+        self.wait_prepared_with_token(wait, timeout, ParkToken(0), interrupted)
+    }
+
+    pub fn wait_prepared_for_thread(
+        &self,
+        wait: FutexWait,
+        timeout: Option<std::time::Duration>,
+        tid: ThreadId,
+        interrupted: &dyn Fn() -> bool,
+    ) -> FutexWaitOutcome {
+        let token = usize::try_from(tid).unwrap_or(0);
+        self.wait_prepared_with_token(wait, timeout, ParkToken(token), interrupted)
+    }
+
+    fn wait_prepared_with_token(
+        &self,
+        wait: FutexWait,
+        timeout: Option<std::time::Duration>,
+        park_token: ParkToken,
+        interrupted: &dyn Fn() -> bool,
+    ) -> FutexWaitOutcome {
+        use std::cell::Cell;
+        use std::time::Instant;
+
+        let bucket = self.bucket(wait.addr);
+        let key = Self::bucket_key(&bucket);
+        let deadline = timeout.map(|duration| Instant::now() + duration);
+
         loop {
-            if *map.get(&addr).unwrap_or(&0) != start_gen {
+            if bucket.generation.load(Ordering::Acquire) != wait.generation {
                 return FutexWaitOutcome::Woken;
             }
             if interrupted() {
                 return FutexWaitOutcome::Interrupted;
             }
-            let slice = match deadline {
-                Some(dl) => {
-                    let now = Instant::now();
-                    if now >= dl {
-                        return FutexWaitOutcome::TimedOut;
-                    }
-                    (dl - now).min(POLL_CAP)
-                }
-                None => POLL_CAP,
+
+            if let Some(deadline) = deadline
+                && Instant::now() >= deadline
+            {
+                return FutexWaitOutcome::TimedOut;
+            }
+
+            let registered = Cell::new(false);
+            let park_result = unsafe {
+                parking_lot_core::park(
+                    key,
+                    || {
+                        if bucket.generation.load(Ordering::Acquire) != wait.generation {
+                            return false;
+                        }
+                        registered.set(true);
+                        bucket.waiters.fetch_add(1, Ordering::AcqRel);
+                        true
+                    },
+                    || {},
+                    |_, _| {
+                        bucket.waiters.fetch_sub(1, Ordering::AcqRel);
+                    },
+                    park_token,
+                    deadline,
+                )
             };
-            #[allow(clippy::expect_used)]
-            let (m, _res) = self
-                .cv
-                .wait_timeout(map, slice)
-                .expect("futex condvar poisoned");
-            map = m;
-            // Loop: re-check generation / interrupt / deadline. `_res.timed_out()`
-            // only tells us the slice elapsed, which may be the POLL_CAP rather
-            // than the guest deadline — the deadline branch above is authoritative.
+
+            match park_result {
+                ParkResult::Unparked(token) => {
+                    if registered.get() {
+                        bucket.waiters.fetch_sub(1, Ordering::AcqRel);
+                    }
+                    match token.0 {
+                        FUTEX_WAKE_TOKEN => return FutexWaitOutcome::Woken,
+                        FUTEX_SIGNAL_TOKEN if interrupted() => {
+                            return FutexWaitOutcome::Interrupted;
+                        }
+                        _ => {}
+                    }
+                }
+                ParkResult::Invalid => {
+                    if bucket.generation.load(Ordering::Acquire) != wait.generation {
+                        return FutexWaitOutcome::Woken;
+                    }
+                }
+                ParkResult::TimedOut => return FutexWaitOutcome::TimedOut,
+            }
         }
     }
 
-    /// Wake every futex waiter so it re-evaluates its `interrupted()` predicate
-    /// NOW, rather than at the next `POLL_CAP` slice. Called by the signal pump
-    /// the instant a signal is published, so a thread parked in `FUTEX_WAIT`
-    /// delivers it promptly (no up-to-50ms latency) without a generation bump —
-    /// waiters whose word/gen is unchanged and have no pending signal just
-    /// re-park. This is the portable equivalent of an EINTR-interruptible
-    /// `__ulock_wait`: the wait itself stays a condvar, but a signal wakes it
-    /// immediately.
+    /// Wake all futex waiters for a process-directed signal. Any guest thread may
+    /// deliver that signal, so every parked thread must re-evaluate its
+    /// `interrupted()` predicate now rather than waiting for a timeout deadline.
     pub fn notify_signal_pending(&self) {
-        self.cv.notify_all();
+        let buckets = self.buckets.lock().values().cloned().collect::<Vec<_>>();
+        for bucket in buckets {
+            let key = Self::bucket_key(&bucket);
+            unsafe {
+                parking_lot_core::unpark_filter(
+                    key,
+                    |_| FilterOp::Unpark,
+                    |_| UnparkToken(FUTEX_SIGNAL_TOKEN),
+                );
+            }
+        }
     }
 
-    /// Wake up to `n` waiters on `addr`. Returns `n` (best-effort upper bound;
-    /// glibc only relies on >=1 progress, and waiters re-check `*uaddr`).
-    pub fn wake(&self, addr: u64, n: u32) -> u32 {
-        {
-            // INVARIANT: mutex poisoning is unrecoverable; panic propagation is correct.
-            #[allow(clippy::expect_used)]
-            let mut map = self.inner.lock().expect("futex table mutex poisoned");
-            let g = map.entry(addr).or_insert(0);
-            *g = g.wrapping_add(1);
+    /// Wake only futex waiters parked by `tid`, used for thread-directed
+    /// `tgkill`/`tkill` delivery. Waiters for other tids stay parked until a real
+    /// `FUTEX_WAKE`, timeout, or process-directed signal reaches them.
+    pub fn notify_signal_pending_for(&self, tid: ThreadId) {
+        let Ok(token) = usize::try_from(tid) else {
+            return;
+        };
+        let buckets = self.buckets.lock().values().cloned().collect::<Vec<_>>();
+        for bucket in buckets {
+            let key = Self::bucket_key(&bucket);
+            unsafe {
+                parking_lot_core::unpark_filter(
+                    key,
+                    |parked| {
+                        if parked.0 == token {
+                            FilterOp::Unpark
+                        } else {
+                            FilterOp::Skip
+                        }
+                    },
+                    |_| UnparkToken(FUTEX_SIGNAL_TOKEN),
+                );
+            }
         }
-        self.cv.notify_all(); // coarse: all waiters re-check their addr
-        n
+    }
+
+    /// Wake up to `n` waiters on `addr`. Returns the number of waiters that
+    /// `parking_lot_core` actually removed from this bucket.
+    pub fn wake(&self, addr: u64, n: u32) -> u32 {
+        if n == 0 {
+            return 0;
+        }
+        let bucket = self.bucket(addr);
+        bucket.generation.fetch_add(1, Ordering::AcqRel);
+        let key = Self::bucket_key(&bucket);
+        let mut remaining = n as usize;
+        let result = unsafe {
+            parking_lot_core::unpark_filter(
+                key,
+                |_| {
+                    if remaining == 0 {
+                        FilterOp::Stop
+                    } else {
+                        remaining -= 1;
+                        FilterOp::Unpark
+                    }
+                },
+                |_| UnparkToken(FUTEX_WAKE_TOKEN),
+            )
+        };
+        result.unparked_threads as u32
+    }
+
+    #[cfg(test)]
+    pub fn waiter_count(&self, addr: u64) -> usize {
+        self.bucket(addr).waiters.load(Ordering::Acquire)
     }
 }
 
@@ -230,10 +382,27 @@ mod tests {
     }
 
     #[test]
-    fn futex_wake_with_no_waiters_returns_requested_count() {
+    fn futex_wake_with_no_waiters_returns_zero() {
         let table = FutexTable::new();
-        // Implementation returns n (requested count) as best-effort upper bound.
-        assert_eq!(table.wake(0x8000, 1), 1);
+        assert_eq!(table.wake(0x8000, 1), 0);
+    }
+
+    #[test]
+    fn futex_wake_returns_actual_waiter_count() {
+        let table = Arc::new(FutexTable::new());
+        let table2 = Arc::clone(&table);
+        let addr = 0x8000_u64;
+
+        let waiter = std::thread::spawn(move || table2.wait(addr, None, &|| false));
+        while table.waiter_count(addr) == 0 {
+            std::thread::yield_now();
+        }
+
+        assert_eq!(table.wake(addr, 2), 1);
+        match waiter.join() {
+            Ok(outcome) => assert_eq!(outcome, FutexWaitOutcome::Woken),
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
 
     #[test]
@@ -275,18 +444,69 @@ mod tests {
         let addr = 0xfeed_face_u64;
         let pending = Arc::new(AtomicBool::new(false));
         let pending2 = Arc::clone(&pending);
+        let table2 = Arc::clone(&table);
 
         // Raise the "signal pending" flag shortly after the wait begins.
         let raiser = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(20));
             pending2.store(true, Ordering::SeqCst);
+            table2.notify_signal_pending();
         });
 
         // Indefinite wait with no waker, but the predicate eventually fires —
-        // the poll cap (50ms) guarantees we observe it.
+        // the signal notification wakes the parked thread immediately.
         let outcome = table.wait(addr, None, &|| pending.load(Ordering::SeqCst));
         assert_eq!(outcome, FutexWaitOutcome::Interrupted);
 
         raiser.join().unwrap();
+    }
+
+    #[test]
+    fn signal_wake_targets_only_matching_waiter_tid() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let table = Arc::new(FutexTable::new());
+        let addr = 0x5151_0000_u64;
+        let target_tid = 10;
+        let sibling_tid = 11;
+        let target_pending = Arc::new(AtomicBool::new(false));
+        let sibling_pending = Arc::new(AtomicBool::new(false));
+
+        let target_wait = table.prepare_wait(addr);
+        let target_table = Arc::clone(&table);
+        let target_pending2 = Arc::clone(&target_pending);
+        let target = std::thread::spawn(move || {
+            target_table.wait_prepared_for_thread(target_wait, None, target_tid, &|| {
+                target_pending2.load(Ordering::SeqCst)
+            })
+        });
+
+        let sibling_wait = table.prepare_wait(addr);
+        let sibling_table = Arc::clone(&table);
+        let sibling_pending2 = Arc::clone(&sibling_pending);
+        let sibling = std::thread::spawn(move || {
+            sibling_table.wait_prepared_for_thread(sibling_wait, None, sibling_tid, &|| {
+                sibling_pending2.load(Ordering::SeqCst)
+            })
+        });
+
+        while table.waiter_count(addr) < 2 {
+            std::thread::yield_now();
+        }
+
+        target_pending.store(true, Ordering::SeqCst);
+        table.notify_signal_pending_for(target_tid);
+
+        match target.join() {
+            Ok(outcome) => assert_eq!(outcome, FutexWaitOutcome::Interrupted),
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+        assert_eq!(table.waiter_count(addr), 1);
+
+        assert_eq!(table.wake(addr, 1), 1);
+        match sibling.join() {
+            Ok(outcome) => assert_eq!(outcome, FutexWaitOutcome::Woken),
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
 }

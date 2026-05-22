@@ -164,10 +164,11 @@ pub fn spawn_signal_pump(
     let _ = std::thread::Builder::new()
         .name("carrick-signal-pump".to_owned())
         .spawn(move || {
-            let kq = unsafe { libc::kqueue() };
-            if kq < 0 {
+            let raw_kq = unsafe { libc::kqueue() };
+            if raw_kq < 0 {
                 return;
             }
+            let kq = crate::host_signal::relocate_internal_fd(raw_kq);
             // Edge-triggered watch on the self-pipe: fire once per "became
             // readable" transition. We deliberately do NOT drain it — the
             // parked-thread waiters own that (level-triggered), and EV_CLEAR
@@ -193,7 +194,14 @@ pub fn spawn_signal_pump(
             }];
             loop {
                 let n = unsafe {
-                    libc::kevent(kq, std::ptr::null(), 0, out.as_mut_ptr(), 1, std::ptr::null())
+                    libc::kevent(
+                        kq,
+                        std::ptr::null(),
+                        0,
+                        out.as_mut_ptr(),
+                        1,
+                        std::ptr::null(),
+                    )
                 };
                 if n < 0 {
                     let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
@@ -202,14 +210,20 @@ pub fn spawn_signal_pump(
                     }
                     break;
                 }
-                // A signal was published. Kick every in-guest vCPU so it
-                // re-checks pending at its next safe point. A vCPU in a host
-                // syscall (kevent) is unaffected (already woken by the pipe);
-                // one spinning in the guest exits with CANCELED and delivers.
-                kicker.kick_all();
-                // Threads parked in FUTEX_WAIT aren't in the guest (no kick) and
-                // don't watch the pipe — wake them so they re-check pending now.
-                futex.notify_signal_pending();
+                let pending_threads = crate::host_signal::pending_thread_tids();
+                if crate::host_signal::has_process_pending() {
+                    // A process-directed signal can be delivered by any guest
+                    // thread, so every in-guest vCPU and futex waiter must
+                    // re-check pending at its next safe point.
+                    kicker.kick_all();
+                    futex.notify_signal_pending();
+                }
+                for tid in pending_threads {
+                    // A thread-directed signal belongs to one guest tid. Wake
+                    // only that vCPU / futex waiter; siblings stay parked.
+                    kicker.kick(tid);
+                    futex.notify_signal_pending_for(tid);
+                }
             }
             unsafe { libc::close(kq) };
         });

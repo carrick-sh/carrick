@@ -7,5 +7,5 @@
 // host-fs backend (`HostFsBackend`).
 
 pub use crate::fs_backend::{
-    layered_directory_entries, MemoryBackend as WritableOverlay, OverlayEntry,
+    MemoryBackend as WritableOverlay, OverlayEntry, layered_directory_entries,
 };

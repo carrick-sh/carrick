@@ -12,6 +12,7 @@ use super::*;
 /// verification with "Could not switch group". We accept any setres*()
 /// the guest requests, record the values here, and echo them back to the
 /// corresponding get*() calls.
+#[derive(Clone, Copy)]
 pub(super) struct CredState {
     pub ruid: u32,
     pub euid: u32,
@@ -39,8 +40,12 @@ impl CredState {
 }
 
 impl SyscallDispatcher {
+    pub(super) fn cred_snapshot(&self) -> CredState {
+        *self.creds.lock()
+    }
+
     pub(super) fn capget<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let header_address = ctx.arg(0);
@@ -75,7 +80,7 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn capset<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let header_address = ctx.arg(0);
@@ -111,19 +116,20 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn umask<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let new = ctx.arg(0) as u32 & 0o777;
-        let previous = self.creds.umask;
-        self.creds.umask = new;
+        let mut creds = self.creds.lock();
+        let previous = creds.umask;
+        creds.umask = new;
         Ok(DispatchOutcome::Returned {
             value: previous as i64,
         })
     }
 
     pub(super) fn setpriority<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let which = ctx.arg(0);
@@ -141,7 +147,7 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn getpriority<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let which = ctx.arg(0);
@@ -164,58 +170,74 @@ impl SyscallDispatcher {
     /// getresuid. Always succeeds — we're single-identity and tools
     /// can pretend to drop privileges as they like.
     pub(super) fn setresuid<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let r = ctx.arg(0);
         let e = ctx.arg(1);
         let s = ctx.arg(2);
-        if r as i64 != -1 { self.creds.ruid = r as u32; }
-        if e as i64 != -1 { self.creds.euid = e as u32; }
-        if s as i64 != -1 { self.creds.suid = s as u32; }
+        let mut creds = self.creds.lock();
+        if r as i64 != -1 {
+            creds.ruid = r as u32;
+        }
+        if e as i64 != -1 {
+            creds.euid = e as u32;
+        }
+        if s as i64 != -1 {
+            creds.suid = s as u32;
+        }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
 
     pub(super) fn setresgid<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let r = ctx.arg(0);
         let e = ctx.arg(1);
         let s = ctx.arg(2);
-        if r as i64 != -1 { self.creds.rgid = r as u32; }
-        if e as i64 != -1 { self.creds.egid = e as u32; }
-        if s as i64 != -1 { self.creds.sgid = s as u32; }
+        let mut creds = self.creds.lock();
+        if r as i64 != -1 {
+            creds.rgid = r as u32;
+        }
+        if e as i64 != -1 {
+            creds.egid = e as u32;
+        }
+        if s as i64 != -1 {
+            creds.sgid = s as u32;
+        }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
 
     /// `setreuid(ruid, euid)`: same as setresuid with suid=-1.
     pub(super) fn setreuid<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let r = ctx.arg(0);
         let e = ctx.arg(1);
+        let mut creds = self.creds.lock();
         if r as i64 != -1 {
-            self.creds.ruid = r as u32;
+            creds.ruid = r as u32;
         }
         if e as i64 != -1 {
-            self.creds.euid = e as u32;
+            creds.euid = e as u32;
         }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
 
     pub(super) fn setregid<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let r = ctx.arg(0);
         let e = ctx.arg(1);
+        let mut creds = self.creds.lock();
         if r as i64 != -1 {
-            self.creds.rgid = r as u32;
+            creds.rgid = r as u32;
         }
         if e as i64 != -1 {
-            self.creds.egid = e as u32;
+            creds.egid = e as u32;
         }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
@@ -224,61 +246,63 @@ impl SyscallDispatcher {
     /// real + saved too. We always treat the caller as privileged so
     /// all three move together — matches what apt expects.
     pub(super) fn setuid<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let u = ctx.arg(0) as u32;
-        self.creds.ruid = u;
-        self.creds.euid = u;
-        self.creds.suid = u;
+        let mut creds = self.creds.lock();
+        creds.ruid = u;
+        creds.euid = u;
+        creds.suid = u;
         Ok(DispatchOutcome::Returned { value: 0 })
     }
 
     pub(super) fn setgid<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let g = ctx.arg(0) as u32;
-        self.creds.rgid = g;
-        self.creds.egid = g;
-        self.creds.sgid = g;
+        let mut creds = self.creds.lock();
+        creds.rgid = g;
+        creds.egid = g;
+        creds.sgid = g;
         Ok(DispatchOutcome::Returned { value: 0 })
     }
 
     /// `getresuid(*ruid, *euid, *suid)` — write our tracked tuple.
     pub(super) fn getresuid<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        for (i, value) in [self.creds.ruid, self.creds.euid, self.creds.suid]
-            .iter()
-            .enumerate()
-        {
+        let creds = self.cred_snapshot();
+        for (i, value) in [creds.ruid, creds.euid, creds.suid].iter().enumerate() {
             let ptr = ctx.arg(i);
             if ptr == 0 {
                 continue;
             }
             if ctx.memory.write_bytes(ptr, &value.to_le_bytes()).is_err() {
-                return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
+                return Ok(DispatchOutcome::Errno {
+                    errno: LINUX_EFAULT,
+                });
             }
         }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
 
     pub(super) fn getresgid<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        for (i, value) in [self.creds.rgid, self.creds.egid, self.creds.sgid]
-            .iter()
-            .enumerate()
-        {
+        let creds = self.cred_snapshot();
+        for (i, value) in [creds.rgid, creds.egid, creds.sgid].iter().enumerate() {
             let ptr = ctx.arg(i);
             if ptr == 0 {
                 continue;
             }
             if ctx.memory.write_bytes(ptr, &value.to_le_bytes()).is_err() {
-                return Ok(DispatchOutcome::Errno { errno: LINUX_EFAULT });
+                return Ok(DispatchOutcome::Errno {
+                    errno: LINUX_EFAULT,
+                });
             }
         }
         Ok(DispatchOutcome::Returned { value: 0 })
@@ -291,7 +315,7 @@ impl SyscallDispatcher {
     /// count (1) without touching `list`; otherwise we write the one
     /// gid_t to the guest buffer and return the number written.
     pub(super) fn getgroups<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         // `size` is a Linux `int`; a negative value is invalid.
@@ -323,23 +347,44 @@ impl SyscallDispatcher {
         Ok(DispatchOutcome::Returned { value: 1 })
     }
 
-    pub(super) fn sys_setfsuid<M: GuestMemory>(&mut self, _ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
-        Ok(DispatchOutcome::Returned { value: i64::from(self.creds.euid) })
+    pub(super) fn sys_setfsuid<M: GuestMemory>(
+        &self,
+        _ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let creds = self.cred_snapshot();
+        Ok(DispatchOutcome::Returned {
+            value: i64::from(creds.euid),
+        })
     }
 
-    pub(super) fn sys_setfsgid<M: GuestMemory>(&mut self, _ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
-        Ok(DispatchOutcome::Returned { value: i64::from(self.creds.egid) })
+    pub(super) fn sys_setfsgid<M: GuestMemory>(
+        &self,
+        _ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let creds = self.cred_snapshot();
+        Ok(DispatchOutcome::Returned {
+            value: i64::from(creds.egid),
+        })
     }
 
-    pub(super) fn sys_setgroups<M: GuestMemory>(&mut self, _ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+    pub(super) fn sys_setgroups<M: GuestMemory>(
+        &self,
+        _ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
         Ok(DispatchOutcome::Returned { value: 0 })
     }
 
-    pub(super) fn sys_getpid<M: GuestMemory>(&mut self, _ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+    pub(super) fn sys_getpid<M: GuestMemory>(
+        &self,
+        _ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
         Ok(self.getpid())
     }
 
-    pub(super) fn sys_getppid<M: GuestMemory>(&mut self, _ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
+    pub(super) fn sys_getppid<M: GuestMemory>(
+        &self,
+        _ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
         // getpid() reports the real host pid, and carrick forks each guest
         // process as a real host child, so the host process tree mirrors the
         // guest tree. The root guest process reports the stable bootstrap
@@ -348,7 +393,8 @@ impl SyscallDispatcher {
         // its parent guest process. Returning a hardcoded 1 here made every
         // forked child look reparented-to-init — tripping LTP's tst_test
         // heartbeat ("Main test process might have exit!").
-        let value = if std::process::id() == self.proc.bootstrap_host_pid {
+        let bootstrap_host_pid = self.proc.lock().bootstrap_host_pid;
+        let value = if std::process::id() == bootstrap_host_pid {
             LINUX_BOOTSTRAP_PID as i64
         } else {
             // SAFETY: getppid(2) is always successful and has no side effects.
@@ -357,20 +403,44 @@ impl SyscallDispatcher {
         Ok(DispatchOutcome::Returned { value })
     }
 
-    pub(super) fn sys_getuid<M: GuestMemory>(&mut self, _ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
-        Ok(DispatchOutcome::Returned { value: i64::from(self.creds.ruid) })
+    pub(super) fn sys_getuid<M: GuestMemory>(
+        &self,
+        _ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let creds = self.cred_snapshot();
+        Ok(DispatchOutcome::Returned {
+            value: i64::from(creds.ruid),
+        })
     }
 
-    pub(super) fn sys_geteuid<M: GuestMemory>(&mut self, _ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
-        Ok(DispatchOutcome::Returned { value: i64::from(self.creds.euid) })
+    pub(super) fn sys_geteuid<M: GuestMemory>(
+        &self,
+        _ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let creds = self.cred_snapshot();
+        Ok(DispatchOutcome::Returned {
+            value: i64::from(creds.euid),
+        })
     }
 
-    pub(super) fn sys_getgid<M: GuestMemory>(&mut self, _ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
-        Ok(DispatchOutcome::Returned { value: i64::from(self.creds.rgid) })
+    pub(super) fn sys_getgid<M: GuestMemory>(
+        &self,
+        _ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let creds = self.cred_snapshot();
+        Ok(DispatchOutcome::Returned {
+            value: i64::from(creds.rgid),
+        })
     }
 
-    pub(super) fn sys_getegid<M: GuestMemory>(&mut self, _ctx: &mut SyscallCtx<M>) -> Result<DispatchOutcome, DispatchError> {
-        Ok(DispatchOutcome::Returned { value: i64::from(self.creds.egid) })
+    pub(super) fn sys_getegid<M: GuestMemory>(
+        &self,
+        _ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let creds = self.cred_snapshot();
+        Ok(DispatchOutcome::Returned {
+            value: i64::from(creds.egid),
+        })
     }
 }
 

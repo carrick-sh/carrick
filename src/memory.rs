@@ -353,13 +353,12 @@ impl AddressSpace {
     pub fn with_el0_trampoline(self) -> Result<Self, AddressSpaceError> {
         let bytes = el0_trampoline_bytes();
         let start = LINUX_EL0_TRAMPOLINE_BASE;
-        let end =
-            start
-                .checked_add(LINUX_EL0_TRAMPOLINE_SIZE)
-                .ok_or(AddressSpaceError::RegionOverflow {
-                    start,
-                    size: LINUX_EL0_TRAMPOLINE_SIZE,
-                })?;
+        let end = start.checked_add(LINUX_EL0_TRAMPOLINE_SIZE).ok_or(
+            AddressSpaceError::RegionOverflow {
+                start,
+                size: LINUX_EL0_TRAMPOLINE_SIZE,
+            },
+        )?;
         let region = MemoryRegion {
             start,
             end,
@@ -381,8 +380,7 @@ impl AddressSpace {
             stage1_page_tables_base,
             ..
         } = self;
-        let mut image =
-            Self::from_regions(entry, regions.into_iter().chain([region]).collect())?;
+        let mut image = Self::from_regions(entry, regions.into_iter().chain([region]).collect())?;
         image.initial_stack_pointer = initial_stack_pointer;
         image.linux_auxv = linux_auxv;
         image.el0_trampoline_entry = Some(LINUX_EL0_TRAMPOLINE_BASE);
@@ -429,8 +427,7 @@ impl AddressSpace {
             stage1_page_tables_base,
             ..
         } = self;
-        let mut image =
-            Self::from_regions(entry, regions.into_iter().chain([region]).collect())?;
+        let mut image = Self::from_regions(entry, regions.into_iter().chain([region]).collect())?;
         image.initial_stack_pointer = initial_stack_pointer;
         image.linux_auxv = linux_auxv;
         image.el0_trampoline_entry = el0_trampoline_entry;
@@ -472,8 +469,7 @@ impl AddressSpace {
             el1_vectors_base,
             ..
         } = self;
-        let mut image =
-            Self::from_regions(entry, regions.into_iter().chain([region]).collect())?;
+        let mut image = Self::from_regions(entry, regions.into_iter().chain([region]).collect())?;
         image.initial_stack_pointer = initial_stack_pointer;
         image.linux_auxv = linux_auxv;
         image.el0_trampoline_entry = el0_trampoline_entry;
@@ -593,10 +589,7 @@ fn build_linux_initial_stack(
     cursor -= 16;
     let mut random_bytes = [0u8; 16];
     unsafe {
-        let _ = libc::getentropy(
-            random_bytes.as_mut_ptr() as *mut _,
-            random_bytes.len(),
-        );
+        let _ = libc::getentropy(random_bytes.as_mut_ptr() as *mut _, random_bytes.len());
     }
     bytes[cursor..cursor + 16].copy_from_slice(&random_bytes);
     let random_addr = stack_start + cursor as u64;
@@ -733,12 +726,13 @@ fn regions_from_load_plan(
         .max()
         .expect("non-empty segments");
     if max_end.saturating_sub(min_start) <= MERGE_WINDOW {
-        let total_size_u64 = max_end
-            .checked_sub(min_start)
-            .ok_or(AddressSpaceError::RegionOverflow {
-                start: min_start,
-                size: 0,
-            })?;
+        let total_size_u64 =
+            max_end
+                .checked_sub(min_start)
+                .ok_or(AddressSpaceError::RegionOverflow {
+                    start: min_start,
+                    size: 0,
+                })?;
         let total_size = usize::try_from(total_size_u64)
             .map_err(|_| AddressSpaceError::RegionTooLarge(total_size_u64))?;
         let mut bytes = vec![0_u8; total_size];
@@ -757,20 +751,19 @@ fn regions_from_load_plan(
                     virtual_address: segment.virtual_address,
                 }
             })?;
-            let file_end = file_offset.checked_add(file_size).ok_or(
-                AddressSpaceError::SegmentBeyondFile {
-                    virtual_address: segment.virtual_address,
-                },
-            )?;
+            let file_end =
+                file_offset
+                    .checked_add(file_size)
+                    .ok_or(AddressSpaceError::SegmentBeyondFile {
+                        virtual_address: segment.virtual_address,
+                    })?;
             if file_end > file.len() {
                 return Err(AddressSpaceError::SegmentBeyondFile {
                     virtual_address: segment.virtual_address,
                 });
             }
-            let offset_in_region = usize::try_from(
-                segment.virtual_address.wrapping_sub(min_start),
-            )
-            .map_err(|_| AddressSpaceError::RegionTooLarge(total_size_u64))?;
+            let offset_in_region = usize::try_from(segment.virtual_address.wrapping_sub(min_start))
+                .map_err(|_| AddressSpaceError::RegionTooLarge(total_size_u64))?;
             bytes[offset_in_region..offset_in_region + file_size]
                 .copy_from_slice(&file[file_offset..file_end]);
         }
@@ -885,8 +878,7 @@ pub fn stage1_identity_page_tables() -> Vec<u8> {
     // PA of the next-level table; bits 1:0 = 11 (valid table). AP/PXN/UXN
     // restrictions could go in the upper attributes (bits 59..63) but we
     // leave them clear and rely on the leaf block descriptors.
-    let table_descriptor =
-        |next_pa: u64| -> u64 { (next_pa & 0x0000_FFFF_FFFF_F000) | 0b11 };
+    let table_descriptor = |next_pa: u64| -> u64 { (next_pa & 0x0000_FFFF_FFFF_F000) | 0b11 };
 
     // Kernel-only leaf flags (used by L2[0] — covers trampoline/vectors/PT):
     //   bit  0 = 1   (valid)
@@ -899,8 +891,7 @@ pub fn stage1_identity_page_tables() -> Vec<u8> {
     //   bit 11 = 0   (nG)
     //   bit 53 = 0   (PXN — EL1 must be able to fetch trampoline/vectors)
     //   bit 54 = 1   (UXN — EL0 must NOT be able to fetch kernel pages)
-    const KERNEL_BLOCK_FLAGS: u64 =
-        ((1u64 << 54) | (1 << 10) | (0b11 << 8)) | 0b01;
+    const KERNEL_BLOCK_FLAGS: u64 = ((1u64 << 54) | (1 << 10) | (0b11 << 8)) | 0b01;
 
     // User leaf flags (everywhere else):
     //   AP[2:1] = 0b01 (RW EL1 + EL0)
@@ -908,8 +899,7 @@ pub fn stage1_identity_page_tables() -> Vec<u8> {
     //             trip FEAT_PAN3 on PSTATE.PAN=1)
     //   UXN = 0  (EL0 can fetch user code)
     //   AF, SH, AttrIndex same as kernel block.
-    const USER_BLOCK_FLAGS: u64 =
-        (1u64 << 53) | (1 << 10) | (0b11 << 8) | (0b01 << 6) | 0b01;
+    const USER_BLOCK_FLAGS: u64 = (1u64 << 53) | (1 << 10) | (0b11 << 8) | (0b01 << 6) | 0b01;
 
     // PA masks for block descriptors at each level.
     const PA_MASK_1GIB: u64 = 0x0000_FFFF_C000_0000; // bits 47..30
@@ -1261,7 +1251,10 @@ mod stage1_tests {
             assert_eq!(pxn(d), 1);
             assert_eq!(uxn(d), 0);
             let expected_pa = ((index as u64) + 512) << 30;
-            assert_eq!(d & 0x0000_FFFF_C000_0000, expected_pa & 0x0000_FFFF_C000_0000);
+            assert_eq!(
+                d & 0x0000_FFFF_C000_0000,
+                expected_pa & 0x0000_FFFF_C000_0000
+            );
         }
 
         // L2[0] is the KERNEL 2 MiB block (AP=00, PXN=0, UXN=1) covering 0..2 MiB.
@@ -1269,7 +1262,11 @@ mod stage1_tests {
         assert!(valid_block(l2_0), "L2[0] must be a block");
         assert_eq!(ap(l2_0), 0b00, "L2[0] kernel block must use AP=00");
         assert_eq!(pxn(l2_0), 0, "L2[0] PXN must be 0 (EL1 fetches trampoline)");
-        assert_eq!(uxn(l2_0), 1, "L2[0] UXN must be 1 (EL0 cannot fetch kernel)");
+        assert_eq!(
+            uxn(l2_0),
+            1,
+            "L2[0] UXN must be 1 (EL0 cannot fetch kernel)"
+        );
         assert_eq!(l2_0 & 0x0000_FFFF_FFE0_0000, 0);
 
         // L2[1..511] user 2 MiB blocks covering 2 MiB..1 GiB.
@@ -1280,13 +1277,18 @@ mod stage1_tests {
             assert_eq!(pxn(d), 1);
             assert_eq!(uxn(d), 0);
             let expected_pa = (index as u64) << 21;
-            assert_eq!(d & 0x0000_FFFF_FFE0_0000, expected_pa & 0x0000_FFFF_FFE0_0000);
+            assert_eq!(
+                d & 0x0000_FFFF_FFE0_0000,
+                expected_pa & 0x0000_FFFF_FFE0_0000
+            );
         }
 
         // No block descriptor may have RES0 bits set in the block's PA gap.
-        for (offset_base, shift) in
-            [(0x1000usize, 30u64), (0x2000usize, 30u64), (0x3000usize, 21u64)]
-        {
+        for (offset_base, shift) in [
+            (0x1000usize, 30u64),
+            (0x2000usize, 30u64),
+            (0x3000usize, 21u64),
+        ] {
             for index in 0..512usize {
                 let d = read_u64_le(&bytes, offset_base + index * 8);
                 if !valid_block(d) {
@@ -1304,4 +1306,3 @@ mod stage1_tests {
         }
     }
 }
-

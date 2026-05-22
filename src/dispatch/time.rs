@@ -3,8 +3,69 @@
 use super::*;
 
 impl SyscallDispatcher {
+    pub(super) fn dispatch_threaded_time<M: GuestMemory>(
+        &self,
+        request: SyscallRequest,
+        memory: &mut M,
+        reporter: &CompatReporter,
+    ) -> Option<Result<DispatchOutcome, DispatchError>> {
+        match request.number {
+            85..=87 | 101..=103 | 112..=115 | 153 | 165 | 169..=171 | 179 | 261 | 266 => {}
+            _ => return None,
+        }
+
+        let syscall = lookup_aarch64(request.number);
+        let name = syscall.map_or("unknown", |syscall| syscall.name);
+        reporter.record(CompatEvent::SyscallEntry {
+            number: request.number,
+            name: name.to_owned(),
+            args: request.args,
+        });
+
+        let mut ctx = SyscallCtx {
+            request,
+            memory,
+            reporter,
+            thread: None,
+        };
+        let outcome = match match request.number {
+            85 => self.timerfd_create(&mut ctx),
+            86 => self.timerfd_settime(&mut ctx),
+            87 => self.timerfd_gettime(&mut ctx),
+            101 => self.nanosleep(&mut ctx),
+            102 => self.getitimer(&mut ctx),
+            103 => self.setitimer(&mut ctx),
+            112 => self.clock_settime(&mut ctx),
+            113 => self.clock_gettime(&mut ctx),
+            114 => self.clock_getres(&mut ctx),
+            115 => self.clock_nanosleep(&mut ctx),
+            153 => self.times(&mut ctx),
+            165 => self.getrusage(&mut ctx),
+            169 => self.gettimeofday(&mut ctx),
+            170 => self.settimeofday(&mut ctx),
+            171 => self.adjtimex(&mut ctx),
+            179 => self.sysinfo(&mut ctx),
+            261 => self.prlimit64(&mut ctx),
+            266 => self.clock_adjtime(&mut ctx),
+            _ => unreachable!("unsupported threaded time syscall"),
+        } {
+            Ok(outcome) => outcome,
+            Err(error) => return Some(Err(error)),
+        };
+
+        let (retval, errno) = outcome.retval_errno();
+        reporter.record(CompatEvent::SyscallReturn {
+            number: request.number,
+            name: name.to_owned(),
+            retval,
+            errno,
+        });
+
+        Some(Ok(outcome))
+    }
+
     pub(super) fn timerfd_create<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let clock_id = ctx.arg(0);
@@ -27,7 +88,7 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn timerfd_settime<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let fd = ctx.arg(0) as i32;
@@ -48,10 +109,10 @@ impl SyscallDispatcher {
             Ok(value) => value,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        let Some(open_file) = self.io.open_files.get(&fd) else {
+        let Some(open_file) = self.open_file(fd) else {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         };
-        let mut open = open_file.description.borrow_mut();
+        let mut open = open_file.description.write();
         let OpenDescription::TimerFd {
             clock_id,
             interval,
@@ -88,16 +149,16 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn timerfd_gettime<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let fd = ctx.arg(0) as i32;
         let current_value = ctx.arg(1);
         let memory = &mut *ctx.memory;
-        let Some(open_file) = self.io.open_files.get(&fd) else {
+        let Some(open_file) = self.open_file(fd) else {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         };
-        let open = open_file.description.borrow();
+        let open = open_file.description.read();
         let OpenDescription::TimerFd {
             clock_id,
             interval,
@@ -114,7 +175,7 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn nanosleep<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let request_address = ctx.arg(0);
@@ -134,7 +195,7 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn clock_nanosleep<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let clock_id = ctx.arg(0);
@@ -171,7 +232,7 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn clock_gettime<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let clock_id = ctx.arg(0);
@@ -187,7 +248,7 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn clock_getres<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let clock_id = ctx.arg(0);
@@ -209,7 +270,7 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn clock_settime<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let clock_id = ctx.arg(0);
@@ -248,7 +309,7 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn getitimer<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let which = ctx.arg(0);
@@ -266,7 +327,7 @@ impl SyscallDispatcher {
         }
         // Only ITIMER_REAL is tracked; VIRTUAL/PROF report disarmed.
         let current = if which == LINUX_ITIMER_REAL {
-            itimerval_from_real(self.proc.itimer_real)
+            itimerval_from_real(self.proc.lock().itimer_real)
         } else {
             LinuxItimerval::zeroed()
         };
@@ -274,7 +335,7 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn setitimer<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let which = ctx.arg(0);
@@ -310,7 +371,7 @@ impl SyscallDispatcher {
         let is_real = which == LINUX_ITIMER_REAL;
         if old_address != 0 {
             let prev = if is_real {
-                itimerval_from_real(self.proc.itimer_real)
+                itimerval_from_real(self.proc.lock().itimer_real)
             } else {
                 LinuxItimerval::zeroed()
             };
@@ -323,7 +384,7 @@ impl SyscallDispatcher {
             let value = duration_from_timeval(v.it_value);
             let interval = duration_from_timeval(v.it_interval);
             // A zero it_value disarms the timer (matching the kernel).
-            self.proc.itimer_real = if value.is_zero() {
+            self.proc.lock().itimer_real = if value.is_zero() {
                 None
             } else {
                 Some(crate::dispatch::proc::ItimerReal {
@@ -343,7 +404,7 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn adjtimex<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let address = ctx.arg(0);
@@ -351,7 +412,7 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn clock_adjtime<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let clock_id = ctx.arg(0);
@@ -369,7 +430,7 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn gettimeofday<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let memory = &mut *ctx.memory;
@@ -400,14 +461,14 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn settimeofday<M: GuestMemory>(
-        &mut self,
+        &self,
         _ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         Ok(DispatchOutcome::Errno { errno: LINUX_EPERM })
     }
 
     pub(super) fn sysinfo<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let memory = &mut *ctx.memory;
@@ -438,7 +499,7 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn times<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let memory = &mut *ctx.memory;
@@ -461,7 +522,7 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn getrusage<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let memory = &mut *ctx.memory;
@@ -492,7 +553,7 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn prlimit64<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let resource = ctx.arg(1);
@@ -519,10 +580,9 @@ impl SyscallDispatcher {
             let limit = match resource {
                 LINUX_RLIMIT_NOFILE => LinuxRlimit::new(1024, 1024 * 1024),
                 LINUX_RLIMIT_NPROC => LinuxRlimit::new(8192, 8192),
-                LINUX_RLIMIT_STACK => LinuxRlimit::new(
-                    crate::memory::LINUX_STACK_SIZE,
-                    LINUX_RLIM_INFINITY,
-                ),
+                LINUX_RLIMIT_STACK => {
+                    LinuxRlimit::new(crate::memory::LINUX_STACK_SIZE, LINUX_RLIM_INFINITY)
+                }
                 LINUX_RLIMIT_AS | LINUX_RLIMIT_DATA => {
                     LinuxRlimit::new(LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY)
                 }

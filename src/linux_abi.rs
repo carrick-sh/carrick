@@ -843,12 +843,12 @@ macro_rules! kernel_abi {
         }
         const _: () = assert!(
             <$ty as KernelAbi>::ABI_SIZE <= core::mem::size_of::<$ty>(),
-            concat!(stringify!($ty), ": ABI_SIZE > size_of::<Self>() — would over-read")
+            concat!(
+                stringify!($ty),
+                ": ABI_SIZE > size_of::<Self>() — would over-read"
+            )
         );
-        const _: () = assert!(
-            <$ty as KernelAbi>::ABI_SIZE == $size,
-            $why
-        );
+        const _: () = assert!(<$ty as KernelAbi>::ABI_SIZE == $size, $why);
     };
 }
 
@@ -856,10 +856,22 @@ kernel_abi!(LinuxStat, 128, "Linux struct stat for aarch64 is 128 bytes");
 kernel_abi!(LinuxStatfs, 120, "Linux struct statfs64 is 120 bytes");
 kernel_abi!(LinuxStatx, 256, "Linux struct statx is 256 bytes");
 kernel_abi!(LinuxWinsize, 8, "TIOCGWINSZ struct is 8 bytes");
-kernel_abi!(LinuxTermios, LINUX_TERMIOS_KERNEL_SIZE, "TCGETS kernel termios is 36 bytes; the trailing 8 bytes of LinuxTermios (c_ispeed/c_ospeed) belong to termios2/TCGETS2");
+kernel_abi!(
+    LinuxTermios,
+    LINUX_TERMIOS_KERNEL_SIZE,
+    "TCGETS kernel termios is 36 bytes; the trailing 8 bytes of LinuxTermios (c_ispeed/c_ospeed) belong to termios2/TCGETS2"
+);
 kernel_abi!(LinuxEventfdValue, 8, "eventfd_t is u64");
-kernel_abi!(LinuxEpollEvent, 12, "epoll_event packed = u32 events + u64 data");
-kernel_abi!(LinuxPollFd, 8, "pollfd is fd:i32 + events:i16 + revents:i16");
+kernel_abi!(
+    LinuxEpollEvent,
+    12,
+    "epoll_event packed = u32 events + u64 data"
+);
+kernel_abi!(
+    LinuxPollFd,
+    8,
+    "pollfd is fd:i32 + events:i16 + revents:i16"
+);
 kernel_abi!(LinuxFdPair, 8, "two-int fd pair (pipe2 etc.)");
 kernel_abi!(LinuxAuxvEntry, 16, "ELF auxv entry is two u64");
 kernel_abi!(LinuxIovec, 16, "struct iovec is base:u64 + len:u64");
@@ -868,20 +880,55 @@ kernel_abi!(LinuxTimespec, 16, "timespec is tv_sec:i64 + tv_nsec:i64");
 kernel_abi!(LinuxItimerspec, 32, "itimerspec is two timespecs");
 kernel_abi!(LinuxTimeval, 16, "timeval is tv_sec:i64 + tv_usec:i64");
 kernel_abi!(LinuxItimerval, 32, "itimerval is two timevals");
-kernel_abi!(LinuxTimezone, 8, "timezone is tz_minuteswest:i32 + tz_dsttime:i32");
+kernel_abi!(
+    LinuxTimezone,
+    8,
+    "timezone is tz_minuteswest:i32 + tz_dsttime:i32"
+);
 kernel_abi!(LinuxRlimit, 16, "rlimit is cur:u64 + max:u64");
 kernel_abi!(LinuxTms, 32, "tms is four clock_t (long) = 4 * 8");
-kernel_abi!(LinuxSigaction, 32, "k_sigaction is handler+flags+restorer+mask[1]");
+kernel_abi!(
+    LinuxSigaction,
+    32,
+    "k_sigaction is handler+flags+restorer+mask[1]"
+);
 kernel_abi!(LinuxTimerfdExpirations, 8, "timerfd_read result is u64");
-kernel_abi!(LinuxCapabilityHeader, 8, "capget header is version:u32 + pid:i32");
+kernel_abi!(
+    LinuxCapabilityHeader,
+    8,
+    "capget header is version:u32 + pid:i32"
+);
 kernel_abi!(LinuxCapabilityData, 12, "capget data is three u32");
-kernel_abi!(LinuxStatxTimestamp, 16, "statx_timestamp is sec:i64 + nsec:u32 + pad");
-kernel_abi!(LinuxSysinfo, core::mem::size_of::<LinuxSysinfo>(), "sysinfo (packed) matches its layout");
-kernel_abi!(LinuxUtsname, LINUX_UTSNAME_FIELD_SIZE * 6, "utsname is 6 char[65] fields");
-kernel_abi!(LinuxRusage, core::mem::size_of::<LinuxRusage>(), "rusage layout matches kernel ABI");
-kernel_abi!(LinuxSigaltstack, 24, "stack_t is ss_sp:u64 + ss_flags:i32 + ss_size:u64 (with 4-byte pad)");
-kernel_abi!(LinuxDirent64Header, 19, "dirent64 fixed header is d_ino+d_off+d_reclen+d_type");
-
+kernel_abi!(
+    LinuxStatxTimestamp,
+    16,
+    "statx_timestamp is sec:i64 + nsec:u32 + pad"
+);
+kernel_abi!(
+    LinuxSysinfo,
+    core::mem::size_of::<LinuxSysinfo>(),
+    "sysinfo (packed) matches its layout"
+);
+kernel_abi!(
+    LinuxUtsname,
+    LINUX_UTSNAME_FIELD_SIZE * 6,
+    "utsname is 6 char[65] fields"
+);
+kernel_abi!(
+    LinuxRusage,
+    core::mem::size_of::<LinuxRusage>(),
+    "rusage layout matches kernel ABI"
+);
+kernel_abi!(
+    LinuxSigaltstack,
+    24,
+    "stack_t is ss_sp:u64 + ss_flags:i32 + ss_size:u64 (with 4-byte pad)"
+);
+kernel_abi!(
+    LinuxDirent64Header,
+    19,
+    "dirent64 fixed header is d_ino+d_off+d_reclen+d_type"
+);
 
 // ===== ABI constants moved from dispatch.rs (Goal #3, pub set) =====
 pub const LINUX_EPERM: i32 = 1;
@@ -1019,7 +1066,6 @@ pub const LINUX_CLK_TCK: i64 = 100;
 pub const LINUX_OVERLAYFS_SUPER_MAGIC: i64 = 0x794c7630;
 pub const LINUX_EAFNOSUPPORT: i32 = 97;
 
-
 // ===== ABI constants moved from dispatch.rs (Goal #3, private set, now pub) =====
 pub const LINUX_EFD_SEMAPHORE: u64 = 0x1;
 pub const LINUX_EFD_NONBLOCK: u64 = LINUX_O_NONBLOCK;
@@ -1122,7 +1168,8 @@ pub const LINUX_WEXITED: u64 = 4;
 pub const LINUX_WCONTINUED: u64 = 8;
 pub const LINUX_WNOWAIT: u64 = 0x0100_0000;
 pub const LINUX_WAITID_STATE_MASK: u64 = LINUX_WEXITED | LINUX_WSTOPPED | LINUX_WCONTINUED;
-pub const LINUX_WAITID_SUPPORTED_FLAGS: u64 = LINUX_WAITID_STATE_MASK | LINUX_WNOHANG | LINUX_WNOWAIT;
+pub const LINUX_WAITID_SUPPORTED_FLAGS: u64 =
+    LINUX_WAITID_STATE_MASK | LINUX_WNOHANG | LINUX_WNOWAIT;
 pub const LINUX_WCLONE: u64 = 0x8000_0000;
 pub const LINUX_WALL: u64 = 0x4000_0000;
 pub const LINUX_WNOTHREAD: u64 = 0x2000_0000;
@@ -1211,7 +1258,9 @@ mod kernel_abi_tests {
         assert!(<LinuxStatx as KernelAbi>::ABI_SIZE <= core::mem::size_of::<LinuxStatx>());
         assert!(<LinuxRusage as KernelAbi>::ABI_SIZE <= core::mem::size_of::<LinuxRusage>());
         assert!(<LinuxUtsname as KernelAbi>::ABI_SIZE <= core::mem::size_of::<LinuxUtsname>());
-        assert!(<LinuxSigaltstack as KernelAbi>::ABI_SIZE <= core::mem::size_of::<LinuxSigaltstack>());
+        assert!(
+            <LinuxSigaltstack as KernelAbi>::ABI_SIZE <= core::mem::size_of::<LinuxSigaltstack>()
+        );
         assert!(<LinuxSigaction as KernelAbi>::ABI_SIZE <= core::mem::size_of::<LinuxSigaction>());
     }
 }

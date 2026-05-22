@@ -84,7 +84,10 @@ fn symlink_with_parent_dir_in_target_resolves_across_layers() {
     // Alpine ships /etc/mtab -> ../proc/mounts. Layer 1 provides /proc/mounts,
     // layer 2 lays down the /etc/mtab symlink with a `..` in the target.
     let rootfs = RootFs::from_layers([
-        LayerSource::TarGz(gzip_tar([("proc/mounts", b"rootfs / rootfs rw 0 0\n".as_slice())])),
+        LayerSource::TarGz(gzip_tar([(
+            "proc/mounts",
+            b"rootfs / rootfs rw 0 0\n".as_slice(),
+        )])),
         LayerSource::TarGz(gzip_tar_with_links([], [("etc/mtab", "../proc/mounts")])),
     ])
     .unwrap();

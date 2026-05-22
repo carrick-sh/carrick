@@ -80,11 +80,7 @@ unsafe extern "C" {
         argc: c_int,
         argv: *const *const c_char,
     ) -> *mut DtraceProg;
-    fn dtrace_program_exec(
-        hdl: *mut DtraceHdl,
-        prog: *mut DtraceProg,
-        info: *mut c_void,
-    ) -> c_int;
+    fn dtrace_program_exec(hdl: *mut DtraceHdl, prog: *mut DtraceProg, info: *mut c_void) -> c_int;
     fn dtrace_proc_create(
         hdl: *mut DtraceHdl,
         file: *const c_char,
@@ -104,11 +100,7 @@ unsafe extern "C" {
         arg: *mut c_void,
     ) -> c_int;
     fn dtrace_aggregate_snap(hdl: *mut DtraceHdl) -> c_int;
-    fn dtrace_aggregate_print(
-        hdl: *mut DtraceHdl,
-        fp: *mut libc_file,
-        walk: *mut c_void,
-    ) -> c_int;
+    fn dtrace_aggregate_print(hdl: *mut DtraceHdl, fp: *mut libc_file, walk: *mut c_void) -> c_int;
 }
 
 // FILE* opaque type. We pass libc stdout straight through.
@@ -127,7 +119,11 @@ pub enum DTraceError {
     #[error("dtrace_open failed: errno={0}")]
     Open(c_int),
     #[error("dtrace_setopt('{key}'='{val}') failed: {msg}")]
-    SetOpt { key: String, val: String, msg: String },
+    SetOpt {
+        key: String,
+        val: String,
+        msg: String,
+    },
     #[error("dtrace_program_strcompile failed: {0}")]
     Compile(String),
     #[error("dtrace_program_exec failed: {0}")]
@@ -174,15 +170,12 @@ pub fn run_child_under_dtrace(
 ) -> Result<(), DTraceError> {
     // argv[0] convention: pass the child path as argv[0]. dtrace_proc_create
     // takes file + argv, and the argv array must be NULL-terminated.
-    let path_c =
-        CString::new(child_path.as_os_str().to_string_lossy().as_bytes())
-            .map_err(|_| DTraceError::BadArg(child_path.display().to_string()))?;
+    let path_c = CString::new(child_path.as_os_str().to_string_lossy().as_bytes())
+        .map_err(|_| DTraceError::BadArg(child_path.display().to_string()))?;
     let mut argv_c: Vec<CString> = Vec::with_capacity(child_argv.len() + 1);
     argv_c.push(path_c.clone());
     for a in child_argv {
-        argv_c.push(
-            CString::new(a.as_bytes()).map_err(|_| DTraceError::BadArg(a.clone()))?,
-        );
+        argv_c.push(CString::new(a.as_bytes()).map_err(|_| DTraceError::BadArg(a.clone()))?);
     }
     let mut argv_ptrs: Vec<*const c_char> = argv_c.iter().map(|s| s.as_ptr()).collect();
     argv_ptrs.push(std::ptr::null());
@@ -194,14 +187,13 @@ pub fn run_child_under_dtrace(
     }
 
     // Sensible runtime defaults are appended to in `all_opts` below.
-    let mut all_opts: Vec<(&str, &str)> =
-        vec![
-            ("bufsize", "4m"),
-            ("aggsize", "4m"),
-            ("aggrate", "1ms"),
-            ("statusrate", "10ms"),
-            ("strsize", "512"),
-        ];
+    let mut all_opts: Vec<(&str, &str)> = vec![
+        ("bufsize", "4m"),
+        ("aggsize", "4m"),
+        ("aggrate", "1ms"),
+        ("statusrate", "10ms"),
+        ("strsize", "512"),
+    ];
     if opts.flowindent {
         all_opts.push(("flowindent", ""));
     }
@@ -268,15 +260,7 @@ pub fn run_child_under_dtrace(
     // child process is dead. dtrace_work prints to stdout for us.
     loop {
         unsafe { dtrace_sleep(hdl) };
-        let status = unsafe {
-            dtrace_work(
-                hdl,
-                STDOUT_FP,
-                chew,
-                chewrec,
-                std::ptr::null_mut(),
-            )
-        };
+        let status = unsafe { dtrace_work(hdl, STDOUT_FP, chew, chewrec, std::ptr::null_mut()) };
         // dtrace_work writes events into the C stdio buffer, which is
         // block-buffered when stdout is a pipe/file. Flush every cycle so the
         // live stream stays live even when the traced child never exits (e.g.

@@ -34,7 +34,9 @@ pub const DEFAULT_VOLUME_NAME: &str = "carrick";
 
 #[derive(Debug, Error)]
 pub enum ApfsError {
-    #[error("`diskutil` not found on PATH; APFS volume management requires the macOS Disk Utility binary")]
+    #[error(
+        "`diskutil` not found on PATH; APFS volume management requires the macOS Disk Utility binary"
+    )]
     DiskutilMissing,
     #[error("`diskutil {operation}` failed (exit {code}): {stderr}")]
     DiskutilFailed {
@@ -146,10 +148,12 @@ pub fn create_carrick_volume(quota_bytes: Option<u64>) -> Result<VolumeInfo, Apf
     }
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     let _ = run_diskutil(&arg_refs)?;
-    find_carrick_volume()?
-        .ok_or_else(|| ApfsError::BootContainerNotFound(
-            "addVolume reported success but the new volume isn't visible to `diskutil apfs list`".to_owned(),
-        ))
+    find_carrick_volume()?.ok_or_else(|| {
+        ApfsError::BootContainerNotFound(
+            "addVolume reported success but the new volume isn't visible to `diskutil apfs list`"
+                .to_owned(),
+        )
+    })
 }
 
 /// Tear down the carrick-owned APFS subvolume. Idempotent: returns
@@ -175,10 +179,11 @@ pub fn ensure_mounted(volume: &VolumeInfo) -> Result<PathBuf, ApfsError> {
         return Ok(mp.clone());
     }
     let _ = run_diskutil(&["mount", &volume.device])?;
-    let refreshed = find_carrick_volume()?
-        .ok_or_else(|| ApfsError::BootContainerNotFound(
+    let refreshed = find_carrick_volume()?.ok_or_else(|| {
+        ApfsError::BootContainerNotFound(
             "mount apparently succeeded but the volume disappeared".to_owned(),
-        ))?;
+        )
+    })?;
     refreshed.mount_point.ok_or_else(|| {
         ApfsError::BootContainerNotFound(
             "mount apparently succeeded but no mount point is set".to_owned(),
@@ -196,7 +201,9 @@ fn parse_apfs_list_for(stdout: &str, target_name: &str) -> Vec<VolumeInfo> {
     for line in stdout.lines() {
         // diskutil prefixes most lines with `|` tree-drawing chars.
         // Strip both whitespace and pipes so our prefix matches work.
-        let trimmed = line.trim_start_matches(|c: char| c.is_whitespace() || c == '|').trim_start();
+        let trimmed = line
+            .trim_start_matches(|c: char| c.is_whitespace() || c == '|')
+            .trim_start();
         // "+-> Volume disk3s7 5023506F-9534-4243-..."
         if let Some(rest) = trimmed.strip_prefix("+-> Volume ") {
             current_device = rest.split_whitespace().next().map(|s| s.to_owned());
@@ -238,14 +245,13 @@ fn find_mount_point_for(stdout: &str, device: &str) -> Option<PathBuf> {
         if in_section && trimmed.starts_with("+-> Volume ") {
             break;
         }
-        if in_section
-            && let Some(rest) = trimmed.strip_prefix("Mount Point:") {
-                let rest = rest.trim();
-                if rest == "Not Mounted" {
-                    return None;
-                }
-                return Some(PathBuf::from(rest));
+        if in_section && let Some(rest) = trimmed.strip_prefix("Mount Point:") {
+            let rest = rest.trim();
+            if rest == "Not Mounted" {
+                return None;
             }
+            return Some(PathBuf::from(rest));
+        }
     }
     None
 }
@@ -267,17 +273,20 @@ fn split_at_last_paren(s: &str) -> (&str, &str) {
 /// the volume hasn't been laid down yet.
 pub fn preferred_scratch_root() -> std::io::Result<PathBuf> {
     if let Ok(Some(volume)) = find_carrick_volume()
-        && let Some(mp) = volume.mount_point {
-            return Ok(mp);
-        }
+        && let Some(mp) = volume.mount_point
+    {
+        return Ok(mp);
+    }
     // Fallback: honour the user's $CARRICK_HOME, else $HOME/.carrick.
     let home = std::env::var_os("CARRICK_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| {
-            let mut p = PathBuf::from(h);
-            p.push(".carrick");
-            p
-        }))
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| {
+                let mut p = PathBuf::from(h);
+                p.push(".carrick");
+                p
+            })
+        })
         .unwrap_or_else(|| PathBuf::from("/tmp/carrick"));
     let mut path = home;
     path.push("scratch");

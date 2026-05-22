@@ -1,5 +1,7 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -171,16 +173,16 @@ impl CompatEvent {
 /// per-event stderr trace is opt-in via `CARRICK_TRACE_SYSCALLS`.
 #[derive(Debug)]
 pub struct CompatReporter {
-    syscall_entries: u64,
-    syscall_returns_ok: u64,
-    syscall_returns_errno: u64,
-    unhandled_syscalls: HashMap<(u64, String), u64>,
-    partial_syscalls: HashMap<(u64, String, String), u64>,
-    unhandled_ioctls: HashMap<u64, u64>,
-    proc_read_unimplemented: HashMap<String, u64>,
-    sys_read_unimplemented: HashMap<String, u64>,
-    unsupported_signals: HashMap<(i32, String), u64>,
-    unknown_syscall_flags: HashMap<(u64, String, u32, u64), u64>,
+    syscall_entries: AtomicU64,
+    syscall_returns_ok: AtomicU64,
+    syscall_returns_errno: AtomicU64,
+    unhandled_syscalls: Mutex<HashMap<(u64, String), u64>>,
+    partial_syscalls: Mutex<HashMap<(u64, String, String), u64>>,
+    unhandled_ioctls: Mutex<HashMap<u64, u64>>,
+    proc_read_unimplemented: Mutex<HashMap<String, u64>>,
+    sys_read_unimplemented: Mutex<HashMap<String, u64>>,
+    unsupported_signals: Mutex<HashMap<(i32, String), u64>>,
+    unknown_syscall_flags: Mutex<HashMap<(u64, String, u32, u64), u64>>,
     /// Cached once at construction so we don't `getenv` per syscall.
     trace_syscalls: bool,
 }
@@ -188,44 +190,51 @@ pub struct CompatReporter {
 impl Default for CompatReporter {
     fn default() -> Self {
         Self {
-            syscall_entries: 0,
-            syscall_returns_ok: 0,
-            syscall_returns_errno: 0,
-            unhandled_syscalls: HashMap::new(),
-            partial_syscalls: HashMap::new(),
-            unhandled_ioctls: HashMap::new(),
-            proc_read_unimplemented: HashMap::new(),
-            sys_read_unimplemented: HashMap::new(),
-            unsupported_signals: HashMap::new(),
-            unknown_syscall_flags: HashMap::new(),
+            syscall_entries: AtomicU64::new(0),
+            syscall_returns_ok: AtomicU64::new(0),
+            syscall_returns_errno: AtomicU64::new(0),
+            unhandled_syscalls: Mutex::new(HashMap::new()),
+            partial_syscalls: Mutex::new(HashMap::new()),
+            unhandled_ioctls: Mutex::new(HashMap::new()),
+            proc_read_unimplemented: Mutex::new(HashMap::new()),
+            sys_read_unimplemented: Mutex::new(HashMap::new()),
+            unsupported_signals: Mutex::new(HashMap::new()),
+            unknown_syscall_flags: Mutex::new(HashMap::new()),
             trace_syscalls: std::env::var_os("CARRICK_TRACE_SYSCALLS").is_some(),
         }
     }
 }
 
 impl CompatReporter {
-    pub fn record(&mut self, event: CompatEvent) {
+    pub fn record(&self, event: CompatEvent) {
         // USDT probe first — usdt gates the closure on is_enabled, so
         // this is near-free when no DTrace consumer is attached.
         crate::probes::fire(&event);
         // Opt-in verbose stderr trace (cached env check, not per-call).
         if self.trace_syscalls
-            && let Ok(line) = serde_json::to_string(&event) {
-                eprintln!("[carrick-syscall] {line}");
-            }
+            && let Ok(line) = serde_json::to_string(&event)
+        {
+            eprintln!("[carrick-syscall] {line}");
+        }
         // Aggregate inline. Common events (entry/return) are pure
         // counter bumps; rare events land in their dedup maps.
         match event {
-            CompatEvent::SyscallEntry { .. } => self.syscall_entries += 1,
+            CompatEvent::SyscallEntry { .. } => {
+                self.syscall_entries.fetch_add(1, Ordering::Relaxed);
+            }
             CompatEvent::SyscallReturn { errno, .. } => {
                 if errno.is_some() {
-                    self.syscall_returns_errno += 1;
+                    self.syscall_returns_errno.fetch_add(1, Ordering::Relaxed);
                 } else {
-                    self.syscall_returns_ok += 1;
+                    self.syscall_returns_ok.fetch_add(1, Ordering::Relaxed);
                 }
             }
             CompatEvent::UnhandledSyscall { number, name, .. } => {
-                *self.unhandled_syscalls.entry((number, name)).or_default() += 1;
+                *self
+                    .unhandled_syscalls
+                    .lock()
+                    .entry((number, name))
+                    .or_default() += 1;
             }
             CompatEvent::PartialSyscall {
                 number,
@@ -233,19 +242,27 @@ impl CompatReporter {
                 reason,
                 ..
             } => {
-                *self.partial_syscalls.entry((number, name, reason)).or_default() += 1;
+                *self
+                    .partial_syscalls
+                    .lock()
+                    .entry((number, name, reason))
+                    .or_default() += 1;
             }
             CompatEvent::UnhandledIoctl { request, .. } => {
-                *self.unhandled_ioctls.entry(request).or_default() += 1;
+                *self.unhandled_ioctls.lock().entry(request).or_default() += 1;
             }
             CompatEvent::ProcReadUnimplemented { path } => {
-                *self.proc_read_unimplemented.entry(path).or_default() += 1;
+                *self.proc_read_unimplemented.lock().entry(path).or_default() += 1;
             }
             CompatEvent::SysReadUnimplemented { path } => {
-                *self.sys_read_unimplemented.entry(path).or_default() += 1;
+                *self.sys_read_unimplemented.lock().entry(path).or_default() += 1;
             }
             CompatEvent::SignalUnsupported { signum, reason } => {
-                *self.unsupported_signals.entry((signum, reason)).or_default() += 1;
+                *self
+                    .unsupported_signals
+                    .lock()
+                    .entry((signum, reason))
+                    .or_default() += 1;
             }
             CompatEvent::UnknownSyscallFlags {
                 number,
@@ -255,23 +272,24 @@ impl CompatReporter {
             } => {
                 *self
                     .unknown_syscall_flags
+                    .lock()
                     .entry((number, name, argument, unknown_bits))
                     .or_default() += 1;
             }
         }
     }
 
-    pub fn finish(self) -> CompatReport {
-        let syscall_entries = self.syscall_entries;
-        let syscall_returns_ok = self.syscall_returns_ok;
-        let syscall_returns_errno = self.syscall_returns_errno;
-        let unhandled_syscalls = self.unhandled_syscalls;
-        let partial_syscalls = self.partial_syscalls;
-        let unhandled_ioctls = self.unhandled_ioctls;
-        let proc_read_unimplemented = self.proc_read_unimplemented;
-        let sys_read_unimplemented = self.sys_read_unimplemented;
-        let unsupported_signals = self.unsupported_signals;
-        let unknown_syscall_flags = self.unknown_syscall_flags;
+    pub fn snapshot(&self) -> CompatReport {
+        let syscall_entries = self.syscall_entries.load(Ordering::Relaxed);
+        let syscall_returns_ok = self.syscall_returns_ok.load(Ordering::Relaxed);
+        let syscall_returns_errno = self.syscall_returns_errno.load(Ordering::Relaxed);
+        let unhandled_syscalls = self.unhandled_syscalls.lock().clone();
+        let partial_syscalls = self.partial_syscalls.lock().clone();
+        let unhandled_ioctls = self.unhandled_ioctls.lock().clone();
+        let proc_read_unimplemented = self.proc_read_unimplemented.lock().clone();
+        let sys_read_unimplemented = self.sys_read_unimplemented.lock().clone();
+        let unsupported_signals = self.unsupported_signals.lock().clone();
+        let unknown_syscall_flags = self.unknown_syscall_flags.lock().clone();
 
         let unhandled_syscall_invocations = unhandled_syscalls.values().sum::<u64>();
         let unhandled_syscalls = sorted_syscalls(unhandled_syscalls);
@@ -313,6 +331,10 @@ impl CompatReporter {
             unknown_syscall_flags,
         }
     }
+
+    pub fn finish(self) -> CompatReport {
+        self.snapshot()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -342,18 +364,18 @@ pub struct UnknownFlagsCount {
     pub count: u64,
 }
 
-fn sorted_unknown_flags(
-    src: HashMap<(u64, String, u32, u64), u64>,
-) -> Vec<UnknownFlagsCount> {
+fn sorted_unknown_flags(src: HashMap<(u64, String, u32, u64), u64>) -> Vec<UnknownFlagsCount> {
     let mut entries: Vec<UnknownFlagsCount> = src
         .into_iter()
-        .map(|((number, name, argument, unknown_bits), count)| UnknownFlagsCount {
-            number,
-            name,
-            argument,
-            unknown_bits: format!("{:#x}", unknown_bits),
-            count,
-        })
+        .map(
+            |((number, name, argument, unknown_bits), count)| UnknownFlagsCount {
+                number,
+                name,
+                argument,
+                unknown_bits: format!("{:#x}", unknown_bits),
+                count,
+            },
+        )
         .collect();
     entries.sort_by(|a, b| {
         b.count

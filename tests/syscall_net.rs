@@ -11,7 +11,7 @@ use support::*;
 #[test]
 fn fionread_and_fionbio_bootstrap_succeed_for_valid_fds() {
     let mut memory = LinearMemory::new(0x4000, vec![0xee; 0x200]);
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     // FIONREAD on stdio writes 0.
@@ -20,7 +20,7 @@ fn fionread_and_fionbio_bootstrap_succeed_for_valid_fds() {
             .dispatch(
                 SyscallRequest::new(29, SyscallArgs::from([0, LINUX_FIONREAD, 0x4000, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -34,7 +34,7 @@ fn fionread_and_fionbio_bootstrap_succeed_for_valid_fds() {
             .dispatch(
                 SyscallRequest::new(29, SyscallArgs::from([1, LINUX_FIONBIO, 0x4010, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -46,7 +46,7 @@ fn fionread_and_fionbio_bootstrap_succeed_for_valid_fds() {
             .dispatch(
                 SyscallRequest::new(29, SyscallArgs::from([99, LINUX_FIONBIO, 0x4010, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 9 }
@@ -58,7 +58,7 @@ fn fionread_and_fionbio_bootstrap_succeed_for_valid_fds() {
             .dispatch(
                 SyscallRequest::new(29, SyscallArgs::from([99, LINUX_FIONREAD, 0x4020, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 9 }
@@ -67,11 +67,10 @@ fn fionread_and_fionbio_bootstrap_succeed_for_valid_fds() {
     assert!(reporter.finish().unhandled_ioctls.is_empty());
 }
 
-
 #[test]
 fn eventfd2_read_write_round_trip_uses_packed_counter() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     assert_eq!(
@@ -79,7 +78,7 @@ fn eventfd2_read_write_round_trip_uses_packed_counter() {
             .dispatch(
                 SyscallRequest::new(19, SyscallArgs::from([7, LINUX_EFD_NONBLOCK, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 3 }
@@ -89,7 +88,7 @@ fn eventfd2_read_write_round_trip_uses_packed_counter() {
             .dispatch(
                 SyscallRequest::new(63, SyscallArgs::from([3, 0x4000, 8, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 8 }
@@ -101,7 +100,7 @@ fn eventfd2_read_write_round_trip_uses_packed_counter() {
             .dispatch(
                 SyscallRequest::new(63, SyscallArgs::from([3, 0x4000, 8, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 11 }
@@ -115,7 +114,7 @@ fn eventfd2_read_write_round_trip_uses_packed_counter() {
             .dispatch(
                 SyscallRequest::new(64, SyscallArgs::from([3, 0x4010, 8, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 8 }
@@ -125,7 +124,7 @@ fn eventfd2_read_write_round_trip_uses_packed_counter() {
             .dispatch(
                 SyscallRequest::new(63, SyscallArgs::from([3, 0x4020, 8, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 8 }
@@ -135,11 +134,10 @@ fn eventfd2_read_write_round_trip_uses_packed_counter() {
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
-
 #[test]
 fn pipe2_writes_packed_fd_pair_and_round_trips_bytes() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     assert_eq!(
@@ -150,7 +148,7 @@ fn pipe2_writes_packed_fd_pair_and_round_trips_bytes() {
                     SyscallArgs::from([0x4000, LINUX_O_CLOEXEC | LINUX_O_NONBLOCK, 0, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -166,7 +164,7 @@ fn pipe2_writes_packed_fd_pair_and_round_trips_bytes() {
             .dispatch(
                 SyscallRequest::new(25, SyscallArgs::from([read_fd, LINUX_F_GETFD, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned {
@@ -178,7 +176,7 @@ fn pipe2_writes_packed_fd_pair_and_round_trips_bytes() {
             .dispatch(
                 SyscallRequest::new(25, SyscallArgs::from([read_fd, LINUX_F_GETFL, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned {
@@ -191,7 +189,7 @@ fn pipe2_writes_packed_fd_pair_and_round_trips_bytes() {
             .dispatch(
                 SyscallRequest::new(63, SyscallArgs::from([read_fd, 0x4080, 8, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 11 }
@@ -203,7 +201,7 @@ fn pipe2_writes_packed_fd_pair_and_round_trips_bytes() {
             .dispatch(
                 SyscallRequest::new(64, SyscallArgs::from([write_fd, 0x4040, 9, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 9 }
@@ -213,7 +211,7 @@ fn pipe2_writes_packed_fd_pair_and_round_trips_bytes() {
             .dispatch(
                 SyscallRequest::new(63, SyscallArgs::from([read_fd, 0x4080, 32, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 9 }
@@ -222,11 +220,10 @@ fn pipe2_writes_packed_fd_pair_and_round_trips_bytes() {
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
-
 #[test]
 fn pipe2_duplicate_writer_keeps_pipe_open_until_all_writers_close() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     assert_eq!(
@@ -237,7 +234,7 @@ fn pipe2_duplicate_writer_keeps_pipe_open_until_all_writers_close() {
                     SyscallArgs::from([0x4000, LINUX_O_NONBLOCK, 0, 0, 0, 0])
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -250,7 +247,7 @@ fn pipe2_duplicate_writer_keeps_pipe_open_until_all_writers_close() {
             .dispatch(
                 SyscallRequest::new(23, SyscallArgs::from([write_fd, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 5 }
@@ -260,7 +257,7 @@ fn pipe2_duplicate_writer_keeps_pipe_open_until_all_writers_close() {
             .dispatch(
                 SyscallRequest::new(57, SyscallArgs::from([write_fd, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -270,7 +267,7 @@ fn pipe2_duplicate_writer_keeps_pipe_open_until_all_writers_close() {
             .dispatch(
                 SyscallRequest::new(63, SyscallArgs::from([read_fd, 0x4080, 8, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 11 }
@@ -280,7 +277,7 @@ fn pipe2_duplicate_writer_keeps_pipe_open_until_all_writers_close() {
             .dispatch(
                 SyscallRequest::new(57, SyscallArgs::from([5, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -290,7 +287,7 @@ fn pipe2_duplicate_writer_keeps_pipe_open_until_all_writers_close() {
             .dispatch(
                 SyscallRequest::new(63, SyscallArgs::from([read_fd, 0x4080, 8, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -298,11 +295,10 @@ fn pipe2_duplicate_writer_keeps_pipe_open_until_all_writers_close() {
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
-
 #[test]
 fn fcntl_getpipe_size_reports_bootstrap_pipe_capacity() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     assert_eq!(
@@ -310,7 +306,7 @@ fn fcntl_getpipe_size_reports_bootstrap_pipe_capacity() {
             .dispatch(
                 SyscallRequest::new(59, SyscallArgs::from([0x4000, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -324,7 +320,7 @@ fn fcntl_getpipe_size_reports_bootstrap_pipe_capacity() {
                     SyscallArgs::from([pair.read_fd as u64, LINUX_F_GETPIPE_SZ, 0, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 65536 }
@@ -332,11 +328,10 @@ fn fcntl_getpipe_size_reports_bootstrap_pipe_capacity() {
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
-
 #[test]
 fn timerfd_settime_read_round_trip_uses_packed_records() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     assert_eq!(
@@ -344,7 +339,7 @@ fn timerfd_settime_read_round_trip_uses_packed_records() {
             .dispatch(
                 SyscallRequest::new(85, SyscallArgs::from([1, LINUX_TFD_NONBLOCK, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 3 }
@@ -354,7 +349,7 @@ fn timerfd_settime_read_round_trip_uses_packed_records() {
             .dispatch(
                 SyscallRequest::new(25, SyscallArgs::from([3, LINUX_F_GETFL, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned {
@@ -366,7 +361,7 @@ fn timerfd_settime_read_round_trip_uses_packed_records() {
             .dispatch(
                 SyscallRequest::new(63, SyscallArgs::from([3, 0x4100, 8, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 11 }
@@ -382,7 +377,7 @@ fn timerfd_settime_read_round_trip_uses_packed_records() {
             .dispatch(
                 SyscallRequest::new(86, SyscallArgs::from([3, 0, 0x4000, 0x4080, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -398,7 +393,7 @@ fn timerfd_settime_read_round_trip_uses_packed_records() {
             .dispatch(
                 SyscallRequest::new(63, SyscallArgs::from([3, 0x4100, 8, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 8 }
@@ -410,7 +405,7 @@ fn timerfd_settime_read_round_trip_uses_packed_records() {
             .dispatch(
                 SyscallRequest::new(63, SyscallArgs::from([3, 0x4100, 8, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 11 }
@@ -418,11 +413,10 @@ fn timerfd_settime_read_round_trip_uses_packed_records() {
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
-
 #[test]
 fn timerfd_gettime_writes_packed_itimerspec_for_armed_timer() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     assert_eq!(
@@ -430,7 +424,7 @@ fn timerfd_gettime_writes_packed_itimerspec_for_armed_timer() {
             .dispatch(
                 SyscallRequest::new(85, SyscallArgs::from([1, LINUX_TFD_NONBLOCK, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 3 }
@@ -445,7 +439,7 @@ fn timerfd_gettime_writes_packed_itimerspec_for_armed_timer() {
             .dispatch(
                 SyscallRequest::new(86, SyscallArgs::from([3, 0, 0x4000, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -455,7 +449,7 @@ fn timerfd_gettime_writes_packed_itimerspec_for_armed_timer() {
             .dispatch(
                 SyscallRequest::new(87, SyscallArgs::from([3, 0x4080, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -468,11 +462,10 @@ fn timerfd_gettime_writes_packed_itimerspec_for_armed_timer() {
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
-
 #[test]
 fn epoll_reports_timerfd_readiness_with_packed_event() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     assert_eq!(
@@ -480,7 +473,7 @@ fn epoll_reports_timerfd_readiness_with_packed_event() {
             .dispatch(
                 SyscallRequest::new(85, SyscallArgs::from([1, LINUX_TFD_NONBLOCK, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 3 }
@@ -490,7 +483,7 @@ fn epoll_reports_timerfd_readiness_with_packed_event() {
             .dispatch(
                 SyscallRequest::new(20, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 4 }
@@ -508,7 +501,7 @@ fn epoll_reports_timerfd_readiness_with_packed_event() {
                     SyscallArgs::from([4, LINUX_EPOLL_CTL_ADD, 3, 0x4000, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -523,7 +516,7 @@ fn epoll_reports_timerfd_readiness_with_packed_event() {
             .dispatch(
                 SyscallRequest::new(86, SyscallArgs::from([3, 0, 0x4040, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -533,7 +526,7 @@ fn epoll_reports_timerfd_readiness_with_packed_event() {
             .dispatch(
                 SyscallRequest::new(22, SyscallArgs::from([4, 0x4100, 4, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 1 }
@@ -546,7 +539,7 @@ fn epoll_reports_timerfd_readiness_with_packed_event() {
             .dispatch(
                 SyscallRequest::new(63, SyscallArgs::from([3, 0x4200, 8, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 8 }
@@ -556,7 +549,7 @@ fn epoll_reports_timerfd_readiness_with_packed_event() {
             .dispatch(
                 SyscallRequest::new(22, SyscallArgs::from([4, 0x4100, 4, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -564,11 +557,10 @@ fn epoll_reports_timerfd_readiness_with_packed_event() {
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
-
 #[test]
 fn epoll_reports_eventfd_readiness_with_packed_events() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     assert_eq!(
@@ -576,7 +568,7 @@ fn epoll_reports_eventfd_readiness_with_packed_events() {
             .dispatch(
                 SyscallRequest::new(19, SyscallArgs::from([1, LINUX_EFD_NONBLOCK, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 3 }
@@ -586,7 +578,7 @@ fn epoll_reports_eventfd_readiness_with_packed_events() {
             .dispatch(
                 SyscallRequest::new(20, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 4 }
@@ -604,7 +596,7 @@ fn epoll_reports_eventfd_readiness_with_packed_events() {
                     SyscallArgs::from([4, LINUX_EPOLL_CTL_ADD, 3, 0x4000, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -615,7 +607,7 @@ fn epoll_reports_eventfd_readiness_with_packed_events() {
             .dispatch(
                 SyscallRequest::new(22, SyscallArgs::from([4, 0x4100, 4, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 1 }
@@ -631,7 +623,7 @@ fn epoll_reports_eventfd_readiness_with_packed_events() {
             .dispatch(
                 SyscallRequest::new(63, SyscallArgs::from([3, 0x4200, 8, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 8 }
@@ -641,7 +633,7 @@ fn epoll_reports_eventfd_readiness_with_packed_events() {
             .dispatch(
                 SyscallRequest::new(22, SyscallArgs::from([4, 0x4100, 4, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -649,11 +641,10 @@ fn epoll_reports_eventfd_readiness_with_packed_events() {
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
-
 #[test]
 fn ppoll_reports_eventfd_pipe_and_invalid_fd_readiness() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x800]);
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     assert_eq!(
@@ -661,7 +652,7 @@ fn ppoll_reports_eventfd_pipe_and_invalid_fd_readiness() {
             .dispatch(
                 SyscallRequest::new(19, SyscallArgs::from([1, LINUX_EFD_NONBLOCK, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 3 }
@@ -674,7 +665,7 @@ fn ppoll_reports_eventfd_pipe_and_invalid_fd_readiness() {
                     SyscallArgs::from([0x4000, LINUX_O_NONBLOCK, 0, 0, 0, 0])
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -689,7 +680,7 @@ fn ppoll_reports_eventfd_pipe_and_invalid_fd_readiness() {
                     SyscallArgs::from([pair.write_fd as u64, 0x4080, 1, 0, 0, 0])
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 1 }
@@ -726,7 +717,7 @@ fn ppoll_reports_eventfd_pipe_and_invalid_fd_readiness() {
             .dispatch(
                 SyscallRequest::new(73, SyscallArgs::from([0x4100, 4, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 4 }
@@ -740,11 +731,10 @@ fn ppoll_reports_eventfd_pipe_and_invalid_fd_readiness() {
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
-
 #[test]
 fn pselect6_reports_eventfd_pipe_and_write_readiness() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     assert_eq!(
@@ -752,7 +742,7 @@ fn pselect6_reports_eventfd_pipe_and_write_readiness() {
             .dispatch(
                 SyscallRequest::new(19, SyscallArgs::from([1, LINUX_EFD_NONBLOCK, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 3 }
@@ -765,7 +755,7 @@ fn pselect6_reports_eventfd_pipe_and_write_readiness() {
                     SyscallArgs::from([0x4000, LINUX_O_NONBLOCK, 0, 0, 0, 0])
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
@@ -780,7 +770,7 @@ fn pselect6_reports_eventfd_pipe_and_write_readiness() {
                     SyscallArgs::from([pair.write_fd as u64, 0x4080, 1, 0, 0, 0])
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 1 }
@@ -797,7 +787,7 @@ fn pselect6_reports_eventfd_pipe_and_write_readiness() {
                     SyscallArgs::from([nfds as u64, 0x4100, 0x4200, 0, 0, 0]),
                 ),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 3 }
@@ -808,11 +798,10 @@ fn pselect6_reports_eventfd_pipe_and_write_readiness() {
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
-
 #[test]
 fn pselect6_invalid_fd_returns_ebadf() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     write_fd_set(&mut memory, 0x4100, 100, [99]);
@@ -821,14 +810,13 @@ fn pselect6_invalid_fd_returns_ebadf() {
             .dispatch(
                 SyscallRequest::new(72, SyscallArgs::from([100, 0x4100, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 9 }
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
-
 
 #[test]
 fn socket_syscalls_dispatch_to_real_host_handlers() {
@@ -839,17 +827,19 @@ fn socket_syscalls_dispatch_to_real_host_handlers() {
     // falling through to the "unhandled syscall" branch (which would
     // set ENOSYS and record an entry in `unhandled_syscalls`).
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x80]);
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
-    let numbers: &[u64] = &[198, 199, 200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 242];
+    let numbers: &[u64] = &[
+        198, 199, 200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 242,
+    ];
 
     for number in numbers {
         let outcome = dispatcher
             .dispatch(
                 SyscallRequest::new(*number, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
                 &mut memory,
-                &mut reporter,
+                &reporter,
             )
             .unwrap();
         if let DispatchOutcome::Errno { errno } = outcome {
@@ -863,11 +853,10 @@ fn socket_syscalls_dispatch_to_real_host_handlers() {
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
-
 #[test]
 fn signalfd4_vmsplice_tee_bootstrap_return_enosys() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x80]);
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
     for number in [74_u64, 75, 77] {
@@ -876,7 +865,7 @@ fn signalfd4_vmsplice_tee_bootstrap_return_enosys() {
                 .dispatch(
                     SyscallRequest::new(number, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
                     &mut memory,
-                    &mut reporter,
+                    &reporter,
                 )
                 .unwrap(),
             DispatchOutcome::Errno { errno: 38 },
@@ -885,4 +874,3 @@ fn signalfd4_vmsplice_tee_bootstrap_return_enosys() {
     }
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
-

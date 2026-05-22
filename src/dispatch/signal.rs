@@ -35,16 +35,78 @@ impl SignalState {
 }
 
 impl SyscallDispatcher {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn dispatch_threaded_signal<M: GuestMemory>(
+        &self,
+        request: SyscallRequest,
+        memory: &mut M,
+        reporter: &CompatReporter,
+        tid: crate::thread::ThreadId,
+        registry: &crate::thread::ThreadRegistry,
+        futex: &crate::thread::FutexTable,
+    ) -> Option<Result<DispatchOutcome, DispatchError>> {
+        match request.number {
+            129..=139 => {}
+            _ => return None,
+        }
+
+        let syscall = lookup_aarch64(request.number);
+        let name = syscall.map_or("unknown", |syscall| syscall.name);
+        reporter.record(CompatEvent::SyscallEntry {
+            number: request.number,
+            name: name.to_owned(),
+            args: request.args,
+        });
+
+        let thread = Some(ThreadCtx {
+            tid,
+            registry,
+            futex,
+        });
+        let mut ctx = SyscallCtx {
+            request,
+            memory,
+            reporter,
+            thread,
+        };
+        let outcome = match match request.number {
+            129 => self.kill(&mut ctx),
+            130 => self.tkill(&mut ctx),
+            131 => self.tgkill(&mut ctx),
+            132 => self.sigaltstack(&mut ctx),
+            133 => self.rt_sigsuspend(&mut ctx),
+            134 => self.rt_sigaction(&mut ctx),
+            135 => self.rt_sigprocmask(&mut ctx),
+            136 => self.rt_sigpending(&mut ctx),
+            137 => self.rt_sigtimedwait(&mut ctx),
+            138 => self.rt_sigqueueinfo(&mut ctx),
+            139 => self.rt_sigreturn(&mut ctx),
+            _ => unreachable!("unsupported threaded signal syscall"),
+        } {
+            Ok(outcome) => outcome,
+            Err(error) => return Some(Err(error)),
+        };
+
+        let (retval, errno) = outcome.retval_errno();
+        reporter.record(CompatEvent::SyscallReturn {
+            number: request.number,
+            name: name.to_owned(),
+            retval,
+            errno,
+        });
+
+        Some(Ok(outcome))
+    }
+
     /// Look up the currently-installed handler for `signum`. Returns
     /// `None` when no handler has been recorded via `rt_sigaction`, or
     /// when the recorded handler is `SIG_DFL` / `SIG_IGN`. The runtime
     /// uses this to decide whether to inject a guest frame (handler is
     /// `Some`) or apply the host-side default (handler is `None`).
     pub fn registered_signal_handler(&self, signum: i32) -> Option<LinuxSigaction> {
-        let action = self.signal.handlers.get(&signum).copied()?;
+        let action = self.signal.lock().handlers.get(&signum).copied()?;
         let handler = action.sa_handler;
-        if handler == crate::linux_abi::LINUX_SIG_DFL
-            || handler == crate::linux_abi::LINUX_SIG_IGN
+        if handler == crate::linux_abi::LINUX_SIG_DFL || handler == crate::linux_abi::LINUX_SIG_IGN
         {
             None
         } else {
@@ -55,7 +117,9 @@ impl SyscallDispatcher {
     /// True iff the guest installed `SIG_IGN` for `signum`. Lets the
     /// runtime drop a pending signal without injecting it.
     pub fn signal_is_ignored(&self, signum: i32) -> bool {
-        self.signal.handlers
+        self.signal
+            .lock()
+            .handlers
             .get(&signum)
             .map(|a| a.sa_handler == crate::linux_abi::LINUX_SIG_IGN)
             .unwrap_or(false)
@@ -68,16 +132,16 @@ impl SyscallDispatcher {
             return false;
         }
         match sigmask_bit(signum) {
-            Some(bit) => self.signal.mask & bit != 0,
+            Some(bit) => self.signal.lock().mask & bit != 0,
             None => false,
         }
     }
 
     /// Record a (blocked) signal as pending. It stays queued until the
     /// guest unblocks it or dequeues it via `rt_sigtimedwait`.
-    pub fn mark_signal_pending(&mut self, signum: i32) {
+    pub fn mark_signal_pending(&self, signum: i32) {
         if let Some(bit) = sigmask_bit(signum) {
-            self.signal.pending |= bit;
+            self.signal.lock().pending |= bit;
         }
     }
 
@@ -87,19 +151,21 @@ impl SyscallDispatcher {
     /// — one per cycle so each handler runs (and returns via rt_sigreturn)
     /// before the next is injected, matching the kernel's deliver-all-pending-
     /// before-returning-to-userspace behaviour. None when none remain.
-    pub fn take_deliverable_pending(&mut self) -> Option<i32> {
-        self.take_pending_in(!self.signal.mask)
+    pub fn take_deliverable_pending(&self) -> Option<i32> {
+        let mask = self.signal.lock().mask;
+        self.take_pending_in(!mask)
     }
 
     /// Lowest-numbered pending signal that intersects `set`, cleared from
     /// the pending set. Used by `rt_sigtimedwait`.
-    fn take_pending_in(&mut self, set: u64) -> Option<i32> {
-        let candidates = self.signal.pending & set;
+    fn take_pending_in(&self, set: u64) -> Option<i32> {
+        let mut signal = self.signal.lock();
+        let candidates = signal.pending & set;
         if candidates == 0 {
             return None;
         }
         let signum = candidates.trailing_zeros() as i32 + 1;
-        self.signal.pending &= !(1u64 << (signum - 1));
+        signal.pending &= !(1u64 << (signum - 1));
         Some(signum)
     }
 
@@ -107,7 +173,7 @@ impl SyscallDispatcher {
     /// target). If the signal is blocked it is held pending; otherwise it
     /// is handed to the runtime's delivery slot. signum 0 is the null
     /// probe and a no-op success.
-    fn raise_self(&mut self, signum: u64) -> DispatchOutcome {
+    fn raise_self(&self, signum: u64) -> DispatchOutcome {
         if signum == 0 {
             return DispatchOutcome::Returned { value: 0 };
         }
@@ -121,7 +187,7 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn kill<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let pid = ctx.arg(0) as i64;
@@ -134,11 +200,13 @@ impl SyscallDispatcher {
         if signal_is_self_target(pid, /*tid_required=*/ false) {
             return Ok(self.raise_self(signum));
         }
-        Ok(bootstrap_signal_send(pid, /*tid_required=*/ false, signum))
+        Ok(bootstrap_signal_send(
+            pid, /*tid_required=*/ false, signum,
+        ))
     }
 
     pub(super) fn tkill<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let tid = ctx.arg(0) as i64;
@@ -155,11 +223,13 @@ impl SyscallDispatcher {
         if signal_is_self_target(tid, /*tid_required=*/ true) {
             return Ok(self.raise_self(signum));
         }
-        Ok(bootstrap_signal_send(tid, /*tid_required=*/ true, signum))
+        Ok(bootstrap_signal_send(
+            tid, /*tid_required=*/ true, signum,
+        ))
     }
 
     pub(super) fn tgkill<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let tgid = ctx.arg(0) as i64;
@@ -176,9 +246,8 @@ impl SyscallDispatcher {
         }
         let host_pid = std::process::id() as i64;
         let bootstrap_pid = LINUX_BOOTSTRAP_PID as i64;
-        let valid_self =
-            (tgid == host_pid || tgid == bootstrap_pid)
-                && (tid == host_pid || tid == bootstrap_pid);
+        let valid_self = (tgid == host_pid || tgid == bootstrap_pid)
+            && (tid == host_pid || tid == bootstrap_pid);
         if !valid_self {
             return Ok(DispatchOutcome::Errno { errno: LINUX_ESRCH });
         }
@@ -192,7 +261,7 @@ impl SyscallDispatcher {
     /// the pid/bootstrap path) when there's no thread context (single-threaded)
     /// or `tid` isn't a live sibling.
     fn route_thread_signal<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &SyscallCtx<M>,
         tid: i64,
         signum: u64,
@@ -212,7 +281,7 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn sigaltstack<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let ss = ctx.arg(0);
@@ -222,7 +291,11 @@ impl SyscallDispatcher {
         // Report the currently-installed alt stack (or a disabled stack
         // when none is set) into the old_ss out-param.
         if old_ss != 0 {
-            let current = self.signal.altstack.unwrap_or_else(LinuxSigaltstack::disabled);
+            let current = self
+                .signal
+                .lock()
+                .altstack
+                .unwrap_or_else(LinuxSigaltstack::disabled);
             if memory.write_bytes(old_ss, current.abi_bytes()).is_err() {
                 return Ok(DispatchOutcome::Errno {
                     errno: LINUX_EFAULT,
@@ -257,7 +330,7 @@ impl SyscallDispatcher {
             }
             if flags & LINUX_SS_DISABLE != 0 {
                 // SS_DISABLE removes any installed alt stack.
-                self.signal.altstack = None;
+                self.signal.lock().altstack = None;
             } else {
                 let size = new_stack.ss_size;
                 if size < LINUX_MINSIGSTKSZ {
@@ -268,7 +341,7 @@ impl SyscallDispatcher {
                 // Record the alt stack so a subsequent query returns it.
                 // (We don't yet switch to it during delivery, but glibc and
                 // sigaltstack(2) callers rely on the get/set round-trip.)
-                self.signal.altstack = Some(new_stack);
+                self.signal.lock().altstack = Some(new_stack);
             }
         }
 
@@ -276,7 +349,7 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn rt_sigsuspend<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let mask_ptr = ctx.arg(0);
@@ -300,13 +373,11 @@ impl SyscallDispatcher {
                 errno: LINUX_EFAULT,
             });
         }
-        Ok(DispatchOutcome::Errno {
-            errno: LINUX_EINTR,
-        })
+        Ok(DispatchOutcome::Errno { errno: LINUX_EINTR })
     }
 
     pub(super) fn rt_sigaction<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let signum = ctx.arg(0) as i32;
@@ -325,6 +396,7 @@ impl SyscallDispatcher {
         if old_action != 0 {
             let prev = self
                 .signal
+                .lock()
                 .handlers
                 .get(&signum)
                 .copied()
@@ -334,33 +406,35 @@ impl SyscallDispatcher {
         // Read and store the new handler. The kernel rejects attempts
         // to install handlers for SIGKILL (9) and SIGSTOP (19); leave
         // signum=0 in the lenient bucket for the interactive sh probe.
-        if new_action != 0 && signum != 9 && signum != 19
+        if new_action != 0
+            && signum != 9
+            && signum != 19
             && let Ok(bytes) = memory.read_bytes(new_action, core::mem::size_of::<LinuxSigaction>())
-                && let Ok(sa) = LinuxSigaction::ref_from_bytes(&bytes) {
-                    let w = |o: usize| {
-                        bytes.get(o..o + 8)
-                            .and_then(|s| s.try_into().ok())
-                            .map(u64::from_le_bytes)
-                            .unwrap_or(0)
-                    };
-                    crate::probes::sigaction_read(signum, w(0), w(8), w(16), w(24));
-                    self.signal.handlers.insert(signum, *sa);
-                    // If the guest installed a real handler (not SIG_DFL/IGN),
-                    // install a matching host handler so a cross-process kill
-                    // from another guest process is routed here instead of
-                    // taking the host's default action (process termination).
-                    let h = sa.sa_handler;
-                    if h != crate::linux_abi::LINUX_SIG_DFL
-                        && h != crate::linux_abi::LINUX_SIG_IGN
-                    {
-                        crate::host_signal::ensure_host_handler(signum);
-                    }
-                }
+            && let Ok(sa) = LinuxSigaction::ref_from_bytes(&bytes)
+        {
+            let w = |o: usize| {
+                bytes
+                    .get(o..o + 8)
+                    .and_then(|s| s.try_into().ok())
+                    .map(u64::from_le_bytes)
+                    .unwrap_or(0)
+            };
+            crate::probes::sigaction_read(signum, w(0), w(8), w(16), w(24));
+            self.signal.lock().handlers.insert(signum, *sa);
+            // If the guest installed a real handler (not SIG_DFL/IGN),
+            // install a matching host handler so a cross-process kill
+            // from another guest process is routed here instead of
+            // taking the host's default action (process termination).
+            let h = sa.sa_handler;
+            if h != crate::linux_abi::LINUX_SIG_DFL && h != crate::linux_abi::LINUX_SIG_IGN {
+                crate::host_signal::ensure_host_handler(signum);
+            }
+        }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
 
     pub(super) fn rt_sigprocmask<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let how = ctx.arg(0);
@@ -373,7 +447,7 @@ impl SyscallDispatcher {
                 errno: LINUX_EINVAL,
             });
         }
-        let previous_mask = self.signal.mask;
+        let previous_mask = self.signal.lock().mask;
         // Write back the *previous* mask before applying changes (the
         // caller may pass the same buffer for new_set and old_set).
         if old_set != 0
@@ -408,9 +482,10 @@ impl SyscallDispatcher {
             // SIGKILL and SIGSTOP can never be masked.
             // INVARIANT: SIGKILL/SIGSTOP are valid signal numbers (< 64), so sigmask_bit is Some.
             #[allow(clippy::unwrap_used)]
-            let unmaskable = sigmask_bit(LINUX_SIGKILL).unwrap() | sigmask_bit(LINUX_SIGSTOP).unwrap();
+            let unmaskable =
+                sigmask_bit(LINUX_SIGKILL).unwrap() | sigmask_bit(LINUX_SIGSTOP).unwrap();
             mask &= !unmaskable;
-            self.signal.mask = mask;
+            self.signal.lock().mask = mask;
             // Signals that just became unblocked stay in `pending`; the runtime
             // drains them via `take_deliverable_pending` after this syscall,
             // delivering each handler in turn. (The previous code raised only
@@ -421,7 +496,7 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn rt_sigpending<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let set_ptr = ctx.arg(0);
@@ -434,7 +509,7 @@ impl SyscallDispatcher {
         }
         if set_ptr != 0
             && memory
-                .write_bytes(set_ptr, &self.signal.pending.to_le_bytes())
+                .write_bytes(set_ptr, &self.signal.lock().pending.to_le_bytes())
                 .is_err()
         {
             return Ok(DispatchOutcome::Errno {
@@ -445,7 +520,7 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn rt_sigtimedwait<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let set_ptr = ctx.arg(0);
@@ -522,7 +597,7 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn rt_sigqueueinfo<M: GuestMemory>(
-        &mut self,
+        &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let tgid = ctx.arg(0) as i64;
@@ -543,7 +618,7 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn rt_sigreturn<M: GuestMemory>(
-        &mut self,
+        &self,
         _ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         // rt_sigreturn is invoked from a signal trampoline to restore the
@@ -628,7 +703,7 @@ fn bootstrap_signal_send(target: i64, tid_required: bool, signum: u64) -> Dispat
         // slot between vCPU iterations and either injects a handler frame or
         // applies the default action (terminate with 128 + signum).
         crate::host_signal::raise_for_self(signum as i32);
-        return DispatchOutcome::Returned { value: 0 }
+        return DispatchOutcome::Returned { value: 0 };
     }
     // Cross-process kill: target is some other host pid. After clone(),
     // child guests run as separate host processes — apt's parent
@@ -647,7 +722,9 @@ fn bootstrap_signal_send(target: i64, tid_required: bool, signum: u64) -> Dispat
     let host_signum = crate::host_signal::linux_to_host_signum(signum as i32);
     let rc = unsafe { libc::kill(target as i32, host_signum) };
     if rc < 0 {
-        return DispatchOutcome::Errno { errno: host_errno() };
+        return DispatchOutcome::Errno {
+            errno: host_errno(),
+        };
     }
     DispatchOutcome::Returned { value: 0 }
 }

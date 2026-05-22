@@ -196,7 +196,10 @@ impl PlatformTarget {
         if os.is_empty() || arch.is_empty() {
             return None;
         }
-        let variant = parts.next().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+        let variant = parts
+            .next()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
         Some(Self {
             os: os.to_string(),
             arch: arch.to_string(),
@@ -365,9 +368,7 @@ pub async fn pull_image(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oci_distribution::manifest::{
-        IMAGE_MANIFEST_MEDIA_TYPE, ImageIndexEntry, Platform,
-    };
+    use oci_distribution::manifest::{IMAGE_MANIFEST_MEDIA_TYPE, ImageIndexEntry, Platform};
 
     fn entry(os: &str, arch: &str, variant: Option<&str>, digest: &str) -> ImageIndexEntry {
         ImageIndexEntry {

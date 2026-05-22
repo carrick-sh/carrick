@@ -45,11 +45,9 @@ use std::time::{Duration, Instant};
 /// the case is killed, marked FAIL(timeout), and the harness moves on.
 const CASE_DEADLINE: Duration = Duration::from_secs(45);
 
-use bollard::container::{
-    Config, CreateContainerOptions, LogsOptions, RemoveContainerOptions,
-};
-use bollard::image::CreateImageOptions;
 use bollard::Docker;
+use bollard::container::{Config, CreateContainerOptions, LogsOptions, RemoveContainerOptions};
+use bollard::image::CreateImageOptions;
 use futures_util::StreamExt;
 
 const IMAGE: &str = "docker.io/library/ubuntu:24.04";
@@ -62,27 +60,74 @@ struct Case {
 
 /// Snippets must be deterministic: no timestamps, pids, or hashes.
 const CASES: &[Case] = &[
-    Case { name: "getcwd", snippet: "cd /tmp && mkdir -p a/b && cd a/b && pwd" },
-    Case { name: "mkdir_chdir", snippet: "mkdir -p /x/y/z && cd /x/y/z && pwd" },
-    Case { name: "access_root", snippet: "test -w /var/lib/dpkg && echo W || echo noW; test -r /etc/passwd && echo R || echo noR; test -x /bin/sh && echo X || echo noX" },
-    Case { name: "readdir_created", snippet: "cd /tmp && touch zz_newfile && ls zz_newfile && ls | grep -c zz_newfile" },
-    Case { name: "pipe_cat", snippet: "echo hello | cat" },
-    Case { name: "rename", snippet: "cd /tmp && echo content > a.txt && mv a.txt b.txt && cat b.txt && (ls a.txt 2>&1 | sed 's/.*: //')" },
-    Case { name: "symlink", snippet: "cd /tmp && ln -sf /etc/hostname lnk && readlink lnk" },
-    Case { name: "hardlink", snippet: "cd /tmp && echo hl > f1 && ln f1 f2 && cat f2" },
-    Case { name: "stat", snippet: "stat -c '%s %F %a' /etc/passwd" },
-    Case { name: "copy_file_range", snippet: "cp /etc/hostname /tmp/h2 && cat /tmp/h2 >/dev/null && echo cp_ok" },
-    Case { name: "fd_redirect", snippet: "exec 3>/tmp/fd3.txt; echo via3 >&3; exec 3>&-; cat /tmp/fd3.txt" },
-    Case { name: "chmod", snippet: "cd /tmp && touch m && chmod 640 m && stat -c '%a' m" },
-    Case { name: "truncate", snippet: "cd /tmp && printf 'abcdef' > t && truncate -s 3 t && cat t && echo" },
-    Case { name: "append", snippet: "cd /tmp && echo one > ap && echo two >> ap && cat ap" },
-    Case { name: "mkdir_rmdir", snippet: "cd /tmp && mkdir rd && rmdir rd && (ls rd 2>&1 | sed 's/.*: //')" },
-    Case { name: "id_root", snippet: "id -u; id -g" },
+    Case {
+        name: "getcwd",
+        snippet: "cd /tmp && mkdir -p a/b && cd a/b && pwd",
+    },
+    Case {
+        name: "mkdir_chdir",
+        snippet: "mkdir -p /x/y/z && cd /x/y/z && pwd",
+    },
+    Case {
+        name: "access_root",
+        snippet: "test -w /var/lib/dpkg && echo W || echo noW; test -r /etc/passwd && echo R || echo noR; test -x /bin/sh && echo X || echo noX",
+    },
+    Case {
+        name: "readdir_created",
+        snippet: "cd /tmp && touch zz_newfile && ls zz_newfile && ls | grep -c zz_newfile",
+    },
+    Case {
+        name: "pipe_cat",
+        snippet: "echo hello | cat",
+    },
+    Case {
+        name: "rename",
+        snippet: "cd /tmp && echo content > a.txt && mv a.txt b.txt && cat b.txt && (ls a.txt 2>&1 | sed 's/.*: //')",
+    },
+    Case {
+        name: "symlink",
+        snippet: "cd /tmp && ln -sf /etc/hostname lnk && readlink lnk",
+    },
+    Case {
+        name: "hardlink",
+        snippet: "cd /tmp && echo hl > f1 && ln f1 f2 && cat f2",
+    },
+    Case {
+        name: "stat",
+        snippet: "stat -c '%s %F %a' /etc/passwd",
+    },
+    Case {
+        name: "copy_file_range",
+        snippet: "cp /etc/hostname /tmp/h2 && cat /tmp/h2 >/dev/null && echo cp_ok",
+    },
+    Case {
+        name: "fd_redirect",
+        snippet: "exec 3>/tmp/fd3.txt; echo via3 >&3; exec 3>&-; cat /tmp/fd3.txt",
+    },
+    Case {
+        name: "chmod",
+        snippet: "cd /tmp && touch m && chmod 640 m && stat -c '%a' m",
+    },
+    Case {
+        name: "truncate",
+        snippet: "cd /tmp && printf 'abcdef' > t && truncate -s 3 t && cat t && echo",
+    },
+    Case {
+        name: "append",
+        snippet: "cd /tmp && echo one > ap && echo two >> ap && cat ap",
+    },
+    Case {
+        name: "mkdir_rmdir",
+        snippet: "cd /tmp && mkdir rd && rmdir rd && (ls rd 2>&1 | sed 's/.*: //')",
+    },
+    Case {
+        name: "id_root",
+        snippet: "id -u; id -g",
+    },
 ];
 
 fn carrick_bin() -> Option<PathBuf> {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target/release/carrick");
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/release/carrick");
     p.exists().then_some(p)
 }
 
@@ -102,10 +147,7 @@ fn ensure_signed(bin: &PathBuf) {
 /// Drop carrick's scratch warning so output lines up with Docker's.
 fn normalize(s: &str) -> String {
     s.lines()
-        .filter(|l| {
-            !l.contains("case-insensitive; defaulting")
-                && !l.contains("Pass `--fs host`")
-        })
+        .filter(|l| !l.contains("case-insensitive; defaulting") && !l.contains("Pass `--fs host`"))
         .map(|l| l.trim_end())
         .collect::<Vec<_>>()
         .join("\n")
@@ -119,7 +161,10 @@ fn normalize(s: &str) -> String {
 /// NOPASSWD sudo path); ignored if unavailable.
 fn sweep_wedged_guests() {
     let _ = Command::new("sudo")
-        .args(["-n", concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/sudo/kill.sh")])
+        .args([
+            "-n",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/sudo/kill.sh"),
+        ])
         .output();
 }
 
@@ -127,7 +172,9 @@ fn run_carrick(bin: &PathBuf, snippet: &str) -> String {
     use std::os::unix::process::CommandExt;
     sweep_wedged_guests();
     let child = Command::new(bin)
-        .args(["run", IMAGE, "--raw", "--fs", "host", "/bin/sh", "-c", snippet])
+        .args([
+            "run", IMAGE, "--raw", "--fs", "host", "/bin/sh", "-c", snippet,
+        ])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         // New process group so we can signal the whole guest tree on timeout.
@@ -146,7 +193,10 @@ fn run_carrick(bin: &PathBuf, snippet: &str) -> String {
                     // guest procs so the next case starts clean.
                     unsafe { libc::kill(-pid, libc::SIGKILL) };
                     let _ = Command::new("sudo")
-                        .args(["-n", concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/sudo/kill.sh")])
+                        .args([
+                            "-n",
+                            concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/sudo/kill.sh"),
+                        ])
                         .output();
                     return true;
                 }
@@ -171,7 +221,11 @@ async fn ensure_image(docker: &Docker) -> anyhow::Result<()> {
         return Ok(());
     }
     let mut stream = docker.create_image(
-        Some(CreateImageOptions { from_image: IMAGE, platform: PLATFORM, ..Default::default() }),
+        Some(CreateImageOptions {
+            from_image: IMAGE,
+            platform: PLATFORM,
+            ..Default::default()
+        }),
         None,
         None,
     );
@@ -207,7 +261,11 @@ async fn run_docker(docker: &Docker, snippet: &str) -> anyhow::Result<String> {
         }
         let mut logs = docker.logs::<String>(
             &id,
-            Some(LogsOptions { stdout: true, stderr: true, ..Default::default() }),
+            Some(LogsOptions {
+                stdout: true,
+                stderr: true,
+                ..Default::default()
+            }),
         );
         let mut buf = String::new();
         while let Some(item) = logs.next().await {
@@ -219,7 +277,13 @@ async fn run_docker(docker: &Docker, snippet: &str) -> anyhow::Result<String> {
     }
     .await;
     let _ = docker
-        .remove_container(&id, Some(RemoveContainerOptions { force: true, ..Default::default() }))
+        .remove_container(
+            &id,
+            Some(RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
         .await;
     result
 }
@@ -286,7 +350,10 @@ fn conformance() {
 }
 
 fn indent(s: &str) -> String {
-    s.lines().map(|l| format!("    {l}")).collect::<Vec<_>>().join("\n")
+    s.lines()
+        .map(|l| format!("    {l}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 // ---------------------------------------------------------------------------
@@ -341,7 +408,16 @@ fn run_carrick_probe(bin: &PathBuf, stdin_bytes: &[u8]) -> String {
     use std::os::unix::process::CommandExt;
     sweep_wedged_guests();
     let mut child = Command::new(bin)
-        .args(["run", IMAGE, "--raw", "--fs", "host", "/bin/sh", "-c", PROBE_SNIPPET])
+        .args([
+            "run",
+            IMAGE,
+            "--raw",
+            "--fs",
+            "host",
+            "/bin/sh",
+            "-c",
+            PROBE_SNIPPET,
+        ])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -368,7 +444,10 @@ fn run_carrick_probe(bin: &PathBuf, stdin_bytes: &[u8]) -> String {
                 if start.elapsed() > CASE_DEADLINE {
                     unsafe { libc::kill(-pid, libc::SIGKILL) };
                     let _ = Command::new("sudo")
-                        .args(["-n", concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/sudo/kill.sh")])
+                        .args([
+                            "-n",
+                            concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/sudo/kill.sh"),
+                        ])
                         .output();
                     return true;
                 }
@@ -396,7 +475,15 @@ fn run_docker_probe(stdin_bytes: &[u8]) -> std::io::Result<String> {
     use std::io::Write;
     let mut child = Command::new("docker")
         .args([
-            "run", "-i", "--rm", "--platform", PLATFORM, IMAGE, "/bin/sh", "-c", PROBE_SNIPPET,
+            "run",
+            "-i",
+            "--rm",
+            "--platform",
+            PLATFORM,
+            IMAGE,
+            "/bin/sh",
+            "-c",
+            PROBE_SNIPPET,
         ])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -455,7 +542,10 @@ fn conformance_probes() {
     };
     let dir = probes_dir();
     if !dir.exists() {
-        eprintln!("SKIP conformance_probes: probes not built ({})", dir.display());
+        eprintln!(
+            "SKIP conformance_probes: probes not built ({})",
+            dir.display()
+        );
         return;
     }
     // Docker reachability check (std::process side, so no bollard ping here):
@@ -476,7 +566,10 @@ fn conformance_probes() {
 
     let probes = probe_binaries();
     if probes.is_empty() {
-        eprintln!("SKIP conformance_probes: no probe binaries in {}", dir.display());
+        eprintln!(
+            "SKIP conformance_probes: no probe binaries in {}",
+            dir.display()
+        );
         return;
     }
 

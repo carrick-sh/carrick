@@ -34,6 +34,8 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 
+use parking_lot::RwLock;
+
 use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsError, RootFsMetadata};
 
 /// What an [`FsBackend`] knows about a path. `Dir` and `File` are
@@ -89,7 +91,7 @@ pub struct RealStat {
 /// Trait every writable-layer backend implements. Methods are layer-
 /// aware (see module docs); the dispatcher does its own overlay-first
 /// merging with the read-only rootfs underneath.
-pub trait FsBackend: Send {
+pub trait FsBackend: Send + Sync {
     /// Look up `path`. Returns `Some(OverlayEntry::Deleted)` for a
     /// tombstoned path, `Some(File)` / `Some(Dir)` for entries the
     /// backend owns, and `None` when the backend has nothing to say
@@ -127,26 +129,25 @@ pub trait FsBackend: Send {
     }
 
     /// Create a directory at `path`. Idempotent.
-    fn make_dir(&mut self, path: &str) -> Result<(), BackendError>;
+    fn make_dir(&self, path: &str) -> Result<(), BackendError>;
 
     /// Materialise an empty file at `path`. Used by `openat(..., O_CREAT)`
     /// when the file did not previously exist.
-    fn create_file(&mut self, path: &str) -> Result<(), BackendError>;
+    fn create_file(&self, path: &str) -> Result<(), BackendError>;
 
     /// Replace the contents of `path`. Used by write/writev/pwrite/
     /// ftruncate writeback and by rename-into-overlay.
-    fn set_file_contents(&mut self, path: &str, contents: Vec<u8>)
-        -> Result<(), BackendError>;
+    fn set_file_contents(&self, path: &str, contents: Vec<u8>) -> Result<(), BackendError>;
 
     /// Drop the backend's entry for `path` entirely. Returns true iff
     /// the backend was holding something there. Does NOT tombstone —
     /// caller pairs this with `mark_deleted` when the path also lives
     /// in the rootfs.
-    fn remove_entry(&mut self, path: &str) -> bool;
+    fn remove_entry(&self, path: &str) -> bool;
 
     /// Tombstone `path` so that subsequent layered lookups treat it as
     /// absent, even if the rootfs still has it underneath.
-    fn mark_deleted(&mut self, path: &str) -> Result<(), BackendError>;
+    fn mark_deleted(&self, path: &str) -> Result<(), BackendError>;
 
     /// Immediate children of `dir` that the backend owns. Names only
     /// (the dispatcher pairs each with metadata via `metadata`).
@@ -160,11 +161,7 @@ pub trait FsBackend: Send {
     /// source was present in the backend; `Ok(false)` means the
     /// caller has to materialise the rootfs-backed source into the
     /// backend first.
-    fn rename_overlay_entry(
-        &mut self,
-        from: &str,
-        to: &str,
-    ) -> Result<bool, BackendError>;
+    fn rename_overlay_entry(&self, from: &str, to: &str) -> Result<bool, BackendError>;
 
     /// Open a REAL host file descriptor for `path`. For a disk-backed
     /// backend this is a normal kernel file: shared offset, and —
@@ -178,35 +175,29 @@ pub trait FsBackend: Send {
     /// close it). `MemoryBackend` returns None: an in-memory HashMap
     /// has no kernel fd and cannot be shared across a real fork, so
     /// the dispatcher keeps its in-memory File model there.
-    fn open_raw_fd(
-        &self,
-        path: &str,
-        write: bool,
-        create: bool,
-        trunc: bool,
-    ) -> Option<i32>;
+    fn open_raw_fd(&self, path: &str, write: bool, create: bool, trunc: bool) -> Option<i32>;
 
     /// Create a symlink at `linkpath` pointing at `target` (the target is
     /// stored verbatim, not resolved). Default: unsupported.
-    fn symlink(&mut self, _target: &str, _linkpath: &str) -> Result<(), BackendError> {
+    fn symlink(&self, _target: &str, _linkpath: &str) -> Result<(), BackendError> {
         Err(BackendError::Unsupported)
     }
 
     /// Create a hard link `linkpath` referring to the same data as `src`.
     /// Default: unsupported.
-    fn hard_link(&mut self, _src: &str, _linkpath: &str) -> Result<(), BackendError> {
+    fn hard_link(&self, _src: &str, _linkpath: &str) -> Result<(), BackendError> {
         Err(BackendError::Unsupported)
     }
 
     /// Set the permission bits (low 0o7777) of `path`. Default: unsupported.
-    fn set_mode(&mut self, _path: &str, _mode: u32) -> Result<(), BackendError> {
+    fn set_mode(&self, _path: &str, _mode: u32) -> Result<(), BackendError> {
         Err(BackendError::Unsupported)
     }
 
     /// Set the guest-visible owner of `path` (`u32::MAX` = leave unchanged, the
     /// `chown(-1)` sentinel). Default: no-op success (tmpfs-like). The host
     /// backend records it durably in xattrs since it can't really chown.
-    fn set_owner(&mut self, _path: &str, _uid: u32, _gid: u32) -> Result<(), BackendError> {
+    fn set_owner(&self, _path: &str, _uid: u32, _gid: u32) -> Result<(), BackendError> {
         Ok(())
     }
 
@@ -216,7 +207,7 @@ pub trait FsBackend: Send {
     /// UTIME_NOW to a concrete timestamp before calling. Default:
     /// unsupported (the in-memory backend has no persistent timestamps).
     fn set_times(
-        &mut self,
+        &self,
         _path: &str,
         _atime: Option<(i64, i64)>,
         _mtime: Option<(i64, i64)>,
@@ -226,7 +217,7 @@ pub trait FsBackend: Send {
 
     /// Grow `path` so its size is at least `size` bytes (mode-0 fallocate /
     /// posix_fallocate semantics: never shrinks). Default: unsupported.
-    fn allocate(&mut self, _path: &str, _size: u64) -> Result<(), BackendError> {
+    fn allocate(&self, _path: &str, _size: u64) -> Result<(), BackendError> {
         Err(BackendError::Unsupported)
     }
 
@@ -239,13 +230,7 @@ pub trait FsBackend: Send {
     /// Linux XATTR_CREATE/XATTR_REPLACE mask. Only the `user.*` namespace is
     /// supported (the conformance-relevant namespace); other namespaces and
     /// the in-memory backend return `Err(LINUX_ENOTSUP)` via the default.
-    fn set_xattr(
-        &mut self,
-        _path: &str,
-        _name: &str,
-        _value: &[u8],
-        _flags: i32,
-    ) -> Result<(), i32> {
+    fn set_xattr(&self, _path: &str, _name: &str, _value: &[u8], _flags: i32) -> Result<(), i32> {
         Err(crate::linux_abi::LINUX_ENOTSUP)
     }
 
@@ -332,10 +317,18 @@ fn child_name(prefix: &Path, candidate: &Path) -> Option<String> {
 /// deletions are a tombstone set. Cheap, ephemeral, exactly what CI
 /// or `cargo test` wants.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct MemoryBackend {
+struct MemoryBackendState {
     dirs: HashSet<PathBuf>,
     files: HashMap<PathBuf, Vec<u8>>,
     deletions: HashSet<PathBuf>,
+}
+
+/// In-memory FsBackend: directories and file contents live in maps,
+/// deletions are a tombstone set. Cheap, ephemeral, exactly what CI
+/// or `cargo test` wants.
+#[derive(Debug, Default)]
+pub struct MemoryBackend {
+    inner: RwLock<MemoryBackendState>,
 }
 
 impl MemoryBackend {
@@ -344,16 +337,33 @@ impl MemoryBackend {
     }
 }
 
+impl Clone for MemoryBackend {
+    fn clone(&self) -> Self {
+        Self {
+            inner: RwLock::new(self.inner.read().clone()),
+        }
+    }
+}
+
+impl PartialEq for MemoryBackend {
+    fn eq(&self, other: &Self) -> bool {
+        *self.inner.read() == *other.inner.read()
+    }
+}
+
+impl Eq for MemoryBackend {}
+
 impl FsBackend for MemoryBackend {
     fn lookup(&self, path: &str) -> Option<OverlayEntry> {
         let normalized = normalize(path)?;
-        if self.deletions.contains(&normalized) {
+        let inner = self.inner.read();
+        if inner.deletions.contains(&normalized) {
             return Some(OverlayEntry::Deleted);
         }
-        if self.dirs.contains(&normalized) {
+        if inner.dirs.contains(&normalized) {
             return Some(OverlayEntry::Dir);
         }
-        if let Some(bytes) = self.files.get(&normalized) {
+        if let Some(bytes) = inner.files.get(&normalized) {
             return Some(OverlayEntry::File(bytes.clone()));
         }
         None
@@ -361,13 +371,14 @@ impl FsBackend for MemoryBackend {
 
     fn lookup_kind(&self, path: &str) -> Option<OverlayEntryKind> {
         let normalized = normalize(path)?;
-        if self.deletions.contains(&normalized) {
+        let inner = self.inner.read();
+        if inner.deletions.contains(&normalized) {
             return Some(OverlayEntryKind::Deleted);
         }
-        if self.dirs.contains(&normalized) {
+        if inner.dirs.contains(&normalized) {
             return Some(OverlayEntryKind::Dir);
         }
-        if self.files.contains_key(&normalized) {
+        if inner.files.contains_key(&normalized) {
             return Some(OverlayEntryKind::File);
         }
         None
@@ -375,7 +386,8 @@ impl FsBackend for MemoryBackend {
 
     fn metadata(&self, path: &str) -> Option<RootFsMetadata> {
         let normalized = normalize(path)?;
-        if let Some(contents) = self.files.get(&normalized) {
+        let inner = self.inner.read();
+        if let Some(contents) = inner.files.get(&normalized) {
             return Some(RootFsMetadata {
                 path: normalized,
                 kind: RootFsEntryKind::File,
@@ -383,7 +395,7 @@ impl FsBackend for MemoryBackend {
                 size: contents.len(),
             });
         }
-        if self.dirs.contains(&normalized) {
+        if inner.dirs.contains(&normalized) {
             return Some(RootFsMetadata {
                 path: normalized,
                 kind: RootFsEntryKind::Directory,
@@ -396,48 +408,49 @@ impl FsBackend for MemoryBackend {
 
     fn file_contents(&self, path: &str) -> Option<Vec<u8>> {
         let normalized = normalize(path)?;
-        self.files.get(&normalized).cloned()
+        self.inner.read().files.get(&normalized).cloned()
     }
 
-    fn make_dir(&mut self, path: &str) -> Result<(), BackendError> {
+    fn make_dir(&self, path: &str) -> Result<(), BackendError> {
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
-        self.deletions.remove(&normalized);
-        self.dirs.insert(normalized);
+        let mut inner = self.inner.write();
+        inner.deletions.remove(&normalized);
+        inner.dirs.insert(normalized);
         Ok(())
     }
 
-    fn create_file(&mut self, path: &str) -> Result<(), BackendError> {
+    fn create_file(&self, path: &str) -> Result<(), BackendError> {
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
-        self.deletions.remove(&normalized);
-        self.files.entry(normalized).or_default();
+        let mut inner = self.inner.write();
+        inner.deletions.remove(&normalized);
+        inner.files.entry(normalized).or_default();
         Ok(())
     }
 
-    fn set_file_contents(
-        &mut self,
-        path: &str,
-        contents: Vec<u8>,
-    ) -> Result<(), BackendError> {
+    fn set_file_contents(&self, path: &str, contents: Vec<u8>) -> Result<(), BackendError> {
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
-        self.deletions.remove(&normalized);
-        self.files.insert(normalized, contents);
+        let mut inner = self.inner.write();
+        inner.deletions.remove(&normalized);
+        inner.files.insert(normalized, contents);
         Ok(())
     }
 
-    fn remove_entry(&mut self, path: &str) -> bool {
+    fn remove_entry(&self, path: &str) -> bool {
         let Some(normalized) = normalize(path) else {
             return false;
         };
-        let had_file = self.files.remove(&normalized).is_some();
-        let had_dir = self.dirs.remove(&normalized);
+        let mut inner = self.inner.write();
+        let had_file = inner.files.remove(&normalized).is_some();
+        let had_dir = inner.dirs.remove(&normalized);
         had_file || had_dir
     }
 
-    fn mark_deleted(&mut self, path: &str) -> Result<(), BackendError> {
+    fn mark_deleted(&self, path: &str) -> Result<(), BackendError> {
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
-        self.files.remove(&normalized);
-        self.dirs.remove(&normalized);
-        self.deletions.insert(normalized);
+        let mut inner = self.inner.write();
+        inner.files.remove(&normalized);
+        inner.dirs.remove(&normalized);
+        inner.deletions.insert(normalized);
         Ok(())
     }
 
@@ -445,13 +458,14 @@ impl FsBackend for MemoryBackend {
         let Some(prefix) = normalize(dir) else {
             return Vec::new();
         };
+        let inner = self.inner.read();
         let mut out = Vec::new();
-        for path in self.files.keys() {
+        for path in inner.files.keys() {
             if let Some(name) = child_name(&prefix, path) {
                 out.push((name, RootFsEntryKind::File));
             }
         }
-        for path in self.dirs.iter() {
+        for path in inner.dirs.iter() {
             if let Some(name) = child_name(&prefix, path) {
                 out.push((name, RootFsEntryKind::Directory));
             }
@@ -463,41 +477,34 @@ impl FsBackend for MemoryBackend {
         let Some(prefix) = normalize(dir) else {
             return Vec::new();
         };
-        self.deletions
+        self.inner
+            .read()
+            .deletions
             .iter()
             .filter_map(|path| child_name(&prefix, path))
             .collect()
     }
 
-    fn rename_overlay_entry(
-        &mut self,
-        from: &str,
-        to: &str,
-    ) -> Result<bool, BackendError> {
+    fn rename_overlay_entry(&self, from: &str, to: &str) -> Result<bool, BackendError> {
         let src = normalize(from).ok_or(BackendError::Invalid)?;
         let dst = normalize(to).ok_or(BackendError::Invalid)?;
-        if let Some(contents) = self.files.remove(&src) {
-            self.deletions.remove(&dst);
-            self.files.insert(dst.clone(), contents);
-            self.deletions.insert(src);
+        let mut inner = self.inner.write();
+        if let Some(contents) = inner.files.remove(&src) {
+            inner.deletions.remove(&dst);
+            inner.files.insert(dst.clone(), contents);
+            inner.deletions.insert(src);
             return Ok(true);
         }
-        if self.dirs.remove(&src) {
-            self.deletions.remove(&dst);
-            self.dirs.insert(dst);
-            self.deletions.insert(src);
+        if inner.dirs.remove(&src) {
+            inner.deletions.remove(&dst);
+            inner.dirs.insert(dst);
+            inner.deletions.insert(src);
             return Ok(true);
         }
         Ok(false)
     }
 
-    fn open_raw_fd(
-        &self,
-        _path: &str,
-        _write: bool,
-        _create: bool,
-        _trunc: bool,
-    ) -> Option<i32> {
+    fn open_raw_fd(&self, _path: &str, _write: bool, _create: bool, _trunc: bool) -> Option<i32> {
         // No kernel fd backs an in-memory HashMap, and a real
         // libc::fork can't share it. The dispatcher uses its in-memory
         // File model for this backend.
@@ -574,8 +581,7 @@ impl Drop for HostFsBackend {
 
 impl std::fmt::Debug for HostFsBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HostFsBackend")
-            .finish()
+        f.debug_struct("HostFsBackend").finish()
     }
 }
 
@@ -595,10 +601,7 @@ impl HostFsBackend {
 
         let scratch = tempfile::TempDir::new_in(scratch_root)?;
         let lock = acquire_lockfile(scratch.path())?;
-        let dir = cap_std::fs::Dir::open_ambient_dir(
-            scratch.path(),
-            cap_std::ambient_authority(),
-        )?;
+        let dir = cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority())?;
         Ok(Self {
             dir,
             _scratch: Some(scratch),
@@ -731,7 +734,9 @@ pub(crate) const CARRICK_MODE_XATTR_NAME: &str = "user.carrick.mode";
 /// mode (they live in `user.*` for Linux validity).
 const CARRICK_UID_XATTR: &[u8] = b"user.carrick.uid\0";
 const CARRICK_GID_XATTR: &[u8] = b"user.carrick.gid\0";
+#[allow(dead_code)]
 pub(crate) const CARRICK_UID_XATTR_NAME: &str = "user.carrick.uid";
+#[allow(dead_code)]
 pub(crate) const CARRICK_GID_XATTR_NAME: &str = "user.carrick.gid";
 
 #[cfg(target_os = "macos")]
@@ -833,7 +838,10 @@ fn with_entry_fd<R>(
 /// Read the guest-mode xattr for `rel` under `dir`. `None` => fall back to the
 /// real mode.
 fn read_mode_xattr(dir: &cap_std::fs::Dir, rel: &Path, is_dir: bool) -> Option<u32> {
-    with_entry_fd(dir, rel, is_dir, false, |fd| fget_u32_xattr(fd, CARRICK_MODE_XATTR)).flatten()
+    with_entry_fd(dir, rel, is_dir, false, |fd| {
+        fget_u32_xattr(fd, CARRICK_MODE_XATTR)
+    })
+    .flatten()
 }
 
 /// Write the guest-mode xattr for `rel` under `dir`. Best-effort.
@@ -844,7 +852,11 @@ pub(crate) fn write_mode_xattr(dir: &cap_std::fs::Dir, rel: &Path, is_dir: bool,
 }
 
 /// Read the guest owner (uid, gid) xattrs for `rel`. Either may be `None`.
-fn read_owner_xattr(dir: &cap_std::fs::Dir, rel: &Path, is_dir: bool) -> (Option<u32>, Option<u32>) {
+fn read_owner_xattr(
+    dir: &cap_std::fs::Dir,
+    rel: &Path,
+    is_dir: bool,
+) -> (Option<u32>, Option<u32>) {
     with_entry_fd(dir, rel, is_dir, false, |fd| {
         (
             fget_u32_xattr(fd, CARRICK_UID_XATTR),
@@ -961,7 +973,11 @@ impl FsBackend for HostFsBackend {
             return Some(RootFsMetadata {
                 path: normalized,
                 kind: RootFsEntryKind::Directory,
-                mode: if override_mode.is_none() && mode == 0 { 0o755 } else { mode },
+                mode: if override_mode.is_none() && mode == 0 {
+                    0o755
+                } else {
+                    mode
+                },
                 size: 0,
             });
         }
@@ -969,7 +985,11 @@ impl FsBackend for HostFsBackend {
             return Some(RootFsMetadata {
                 path: normalized,
                 kind: RootFsEntryKind::File,
-                mode: if override_mode.is_none() && mode == 0 { 0o644 } else { mode },
+                mode: if override_mode.is_none() && mode == 0 {
+                    0o644
+                } else {
+                    mode
+                },
                 size: meta.len() as usize,
             });
         }
@@ -998,18 +1018,19 @@ impl FsBackend for HostFsBackend {
         Some(buf)
     }
 
-    fn make_dir(&mut self, path: &str) -> Result<(), BackendError> {
+    fn make_dir(&self, path: &str) -> Result<(), BackendError> {
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
         // Create all parent dirs in the scratch tree so the guest's
         // mkdir-deep paths "just work" (apt does
         // mkdir(/var/lib/apt/lists/partial) without checking parents).
         if let Some(parent) = rel.parent()
-            && !parent.as_os_str().is_empty() {
-                self.dir
-                    .create_dir_all(parent)
-                    .map_err(|_| BackendError::Io)?;
-            }
+            && !parent.as_os_str().is_empty()
+        {
+            self.dir
+                .create_dir_all(parent)
+                .map_err(|_| BackendError::Io)?;
+        }
         match self.dir.create_dir(rel) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -1018,15 +1039,16 @@ impl FsBackend for HostFsBackend {
         Ok(())
     }
 
-    fn create_file(&mut self, path: &str) -> Result<(), BackendError> {
+    fn create_file(&self, path: &str) -> Result<(), BackendError> {
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
         if let Some(parent) = rel.parent()
-            && !parent.as_os_str().is_empty() {
-                self.dir
-                    .create_dir_all(parent)
-                    .map_err(|_| BackendError::Io)?;
-            }
+            && !parent.as_os_str().is_empty()
+        {
+            self.dir
+                .create_dir_all(parent)
+                .map_err(|_| BackendError::Io)?;
+        }
         let mut opts = cap_std::fs::OpenOptions::new();
         opts.create(true).write(true).truncate(false);
         self.dir
@@ -1035,31 +1057,29 @@ impl FsBackend for HostFsBackend {
         Ok(())
     }
 
-    fn set_file_contents(
-        &mut self,
-        path: &str,
-        contents: Vec<u8>,
-    ) -> Result<(), BackendError> {
+    fn set_file_contents(&self, path: &str, contents: Vec<u8>) -> Result<(), BackendError> {
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
         if let Some(parent) = rel.parent()
-            && !parent.as_os_str().is_empty() {
-                self.dir
-                    .create_dir_all(parent)
-                    .map_err(|_| BackendError::Io)?;
-            }
+            && !parent.as_os_str().is_empty()
+        {
+            self.dir
+                .create_dir_all(parent)
+                .map_err(|_| BackendError::Io)?;
+        }
         let mut opts = cap_std::fs::OpenOptions::new();
         opts.create(true).write(true).truncate(true);
         let mut file = self
             .dir
             .open_with(rel, &opts)
             .map_err(|_| BackendError::Io)?;
-        file.seek(SeekFrom::Start(0)).map_err(|_| BackendError::Io)?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|_| BackendError::Io)?;
         file.write_all(&contents).map_err(|_| BackendError::Io)?;
         Ok(())
     }
 
-    fn remove_entry(&mut self, path: &str) -> bool {
+    fn remove_entry(&self, path: &str) -> bool {
         let Some(normalized) = normalize(path) else {
             return false;
         };
@@ -1071,7 +1091,7 @@ impl FsBackend for HostFsBackend {
         self.dir.remove_file(rel).is_ok() || self.dir.remove_dir(rel).is_ok()
     }
 
-    fn mark_deleted(&mut self, path: &str) -> Result<(), BackendError> {
+    fn mark_deleted(&self, path: &str) -> Result<(), BackendError> {
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         // Also evict any in-scratch entry so the scratch tree matches
         // the tombstoned view.
@@ -1119,15 +1139,15 @@ impl FsBackend for HostFsBackend {
         Vec::new()
     }
 
-    fn rename_overlay_entry(
-        &mut self,
-        from: &str,
-        to: &str,
-    ) -> Result<bool, BackendError> {
+    fn rename_overlay_entry(&self, from: &str, to: &str) -> Result<bool, BackendError> {
         let src = normalize(from).ok_or(BackendError::Invalid)?;
         let dst = normalize(to).ok_or(BackendError::Invalid)?;
-        let src_rel = Self::rel_path(&src).ok_or(BackendError::Invalid)?.to_path_buf();
-        let dst_rel = Self::rel_path(&dst).ok_or(BackendError::Invalid)?.to_path_buf();
+        let src_rel = Self::rel_path(&src)
+            .ok_or(BackendError::Invalid)?
+            .to_path_buf();
+        let dst_rel = Self::rel_path(&dst)
+            .ok_or(BackendError::Invalid)?
+            .to_path_buf();
         // The cap-std scratch is the source of truth: an entry is
         // renameable iff it actually exists on disk. (open_raw_fd
         // creations and seeded rootfs entries are all on disk.)
@@ -1135,24 +1155,19 @@ impl FsBackend for HostFsBackend {
             return Ok(false);
         }
         if let Some(parent) = dst_rel.parent()
-            && !parent.as_os_str().is_empty() {
-                self.dir
-                    .create_dir_all(parent)
-                    .map_err(|_| BackendError::Io)?;
-            }
+            && !parent.as_os_str().is_empty()
+        {
+            self.dir
+                .create_dir_all(parent)
+                .map_err(|_| BackendError::Io)?;
+        }
         self.dir
             .rename(&src_rel, &self.dir, &dst_rel)
             .map_err(|_| BackendError::Io)?;
         Ok(true)
     }
 
-    fn open_raw_fd(
-        &self,
-        path: &str,
-        write: bool,
-        create: bool,
-        trunc: bool,
-    ) -> Option<i32> {
+    fn open_raw_fd(&self, path: &str, write: bool, create: bool, trunc: bool) -> Option<i32> {
         use std::os::fd::IntoRawFd;
         // Follow symlinks by hand first so an absolute symlink target (which
         // cap-std refuses to traverse) resolves to the file under the guest
@@ -1163,9 +1178,10 @@ impl FsBackend for HostFsBackend {
         let rel = Self::rel_path(&normalized)?;
         if create
             && let Some(parent) = rel.parent()
-                && !parent.as_os_str().is_empty() {
-                    self.dir.create_dir_all(parent).ok()?;
-                }
+            && !parent.as_os_str().is_empty()
+        {
+            self.dir.create_dir_all(parent).ok()?;
+        }
         let mut opts = cap_std::fs::OpenOptions::new();
         if write {
             opts.read(true).write(true);
@@ -1180,13 +1196,16 @@ impl FsBackend for HostFsBackend {
         Some(file.into_std().into_raw_fd())
     }
 
-    fn symlink(&mut self, target: &str, linkpath: &str) -> Result<(), BackendError> {
+    fn symlink(&self, target: &str, linkpath: &str) -> Result<(), BackendError> {
         let normalized = normalize(linkpath).ok_or(BackendError::Invalid)?;
         let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
         if let Some(parent) = rel.parent()
-            && !parent.as_os_str().is_empty() {
-                self.dir.create_dir_all(parent).map_err(|_| BackendError::Io)?;
-            }
+            && !parent.as_os_str().is_empty()
+        {
+            self.dir
+                .create_dir_all(parent)
+                .map_err(|_| BackendError::Io)?;
+        }
         // symlink_contents stores `target` verbatim (it may be absolute or
         // dangling), which is the Linux symlinkat(2) semantic.
         self.dir
@@ -1194,21 +1213,28 @@ impl FsBackend for HostFsBackend {
             .map_err(|_| BackendError::Io)
     }
 
-    fn hard_link(&mut self, src: &str, linkpath: &str) -> Result<(), BackendError> {
+    fn hard_link(&self, src: &str, linkpath: &str) -> Result<(), BackendError> {
         let src_norm = normalize(src).ok_or(BackendError::Invalid)?;
         let dst_norm = normalize(linkpath).ok_or(BackendError::Invalid)?;
-        let src_rel = Self::rel_path(&src_norm).ok_or(BackendError::Invalid)?.to_path_buf();
-        let dst_rel = Self::rel_path(&dst_norm).ok_or(BackendError::Invalid)?.to_path_buf();
+        let src_rel = Self::rel_path(&src_norm)
+            .ok_or(BackendError::Invalid)?
+            .to_path_buf();
+        let dst_rel = Self::rel_path(&dst_norm)
+            .ok_or(BackendError::Invalid)?
+            .to_path_buf();
         if let Some(parent) = dst_rel.parent()
-            && !parent.as_os_str().is_empty() {
-                self.dir.create_dir_all(parent).map_err(|_| BackendError::Io)?;
-            }
+            && !parent.as_os_str().is_empty()
+        {
+            self.dir
+                .create_dir_all(parent)
+                .map_err(|_| BackendError::Io)?;
+        }
         self.dir
             .hard_link(&src_rel, &self.dir, &dst_rel)
             .map_err(|_| BackendError::Io)
     }
 
-    fn set_mode(&mut self, path: &str, mode: u32) -> Result<(), BackendError> {
+    fn set_mode(&self, path: &str, mode: u32) -> Result<(), BackendError> {
         use cap_std::fs::Permissions;
         use cap_std::fs::PermissionsExt;
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
@@ -1217,7 +1243,11 @@ impl FsBackend for HostFsBackend {
         // Force owner rwx on the REAL file so carrick (a non-root macOS
         // process) can always still open/stat/unlink it, then record the
         // guest-visible mode in an xattr ON the file (see CARRICK_MODE_XATTR).
-        let is_dir = self.dir.symlink_metadata(rel).map(|m| m.is_dir()).unwrap_or(false);
+        let is_dir = self
+            .dir
+            .symlink_metadata(rel)
+            .map(|m| m.is_dir())
+            .unwrap_or(false);
         let _ = self
             .dir
             .set_permissions(rel, Permissions::from_mode(mode | 0o700));
@@ -1225,19 +1255,23 @@ impl FsBackend for HostFsBackend {
         Ok(())
     }
 
-    fn set_owner(&mut self, path: &str, uid: u32, gid: u32) -> Result<(), BackendError> {
+    fn set_owner(&self, path: &str, uid: u32, gid: u32) -> Result<(), BackendError> {
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
         // carrick is not root on macOS, so it can't chown(2) the scratch file
         // to an arbitrary uid — record the guest-visible owner in xattrs ON the
         // file (durable, fork-coherent) and report it from stat.
-        let is_dir = self.dir.symlink_metadata(rel).map(|m| m.is_dir()).unwrap_or(false);
+        let is_dir = self
+            .dir
+            .symlink_metadata(rel)
+            .map(|m| m.is_dir())
+            .unwrap_or(false);
         write_owner_xattr(&self.dir, rel, is_dir, uid, gid);
         Ok(())
     }
 
     fn set_times(
-        &mut self,
+        &self,
         path: &str,
         atime: Option<(i64, i64)>,
         mtime: Option<(i64, i64)>,
@@ -1278,12 +1312,14 @@ impl FsBackend for HostFsBackend {
         err
     }
 
-    fn allocate(&mut self, path: &str, size: u64) -> Result<(), BackendError> {
+    fn allocate(&self, path: &str, size: u64) -> Result<(), BackendError> {
         let _normalized = normalize(path).ok_or(BackendError::Invalid)?;
         // mode-0 fallocate only ever grows the file. Open the real fd and
         // `ftruncate` up to `size` if the file is currently smaller; never
         // shrink (posix_fallocate semantics).
-        let host_fd = self.open_raw_fd(path, true, false, false).ok_or(BackendError::Io)?;
+        let host_fd = self
+            .open_raw_fd(path, true, false, false)
+            .ok_or(BackendError::Io)?;
         let cur = {
             let mut st: libc::stat = unsafe { core::mem::zeroed() };
             if unsafe { libc::fstat(host_fd, &mut st) } < 0 {
@@ -1313,13 +1349,7 @@ impl FsBackend for HostFsBackend {
         Some(target.to_string_lossy().into_owned())
     }
 
-    fn set_xattr(
-        &mut self,
-        path: &str,
-        name: &str,
-        value: &[u8],
-        flags: i32,
-    ) -> Result<(), i32> {
+    fn set_xattr(&self, path: &str, name: &str, value: &[u8], flags: i32) -> Result<(), i32> {
         // Only the Linux `user.*` namespace is modelled. Anything else
         // (security.*, trusted.*, system.*) reports unsupported, matching
         // what an unprivileged guest typically sees and keeping the host's
@@ -1389,16 +1419,8 @@ impl FsBackend for HostFsBackend {
             }
         };
         // First call with size 0 to learn the value length.
-        let needed = unsafe {
-            libc::fgetxattr(
-                host_fd,
-                cname.as_ptr(),
-                std::ptr::null_mut(),
-                0,
-                0,
-                0,
-            )
-        };
+        let needed =
+            unsafe { libc::fgetxattr(host_fd, cname.as_ptr(), std::ptr::null_mut(), 0, 0, 0) };
         if needed < 0 {
             let err = crate::dispatch::host_errno();
             unsafe { libc::close(host_fd) };
@@ -1639,10 +1661,7 @@ pub fn layered_directory_entries(
 ) -> Result<Vec<RootFsDirEntry>, RootFsError> {
     let mut out: Vec<RootFsDirEntry> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    let deleted: HashSet<String> = overlay
-        .deleted_child_names(dir)
-        .into_iter()
-        .collect();
+    let deleted: HashSet<String> = overlay.deleted_child_names(dir).into_iter().collect();
 
     if let Some(rootfs) = rootfs {
         match rootfs.directory_entries(dir) {
@@ -1673,10 +1692,7 @@ pub fn layered_directory_entries(
         let normalized = normalize(&path).unwrap_or_default();
         let metadata = match kind {
             RootFsEntryKind::File => {
-                let size = overlay
-                    .file_contents(&path)
-                    .map(|b| b.len())
-                    .unwrap_or(0);
+                let size = overlay.file_contents(&path).map(|b| b.len()).unwrap_or(0);
                 RootFsMetadata {
                     path: normalized,
                     kind,
@@ -1731,7 +1747,8 @@ mod tests {
 
     fn scenario_open_create_write_read<B: FsBackend>(b: &mut B) {
         b.create_file("/tmp/example").unwrap();
-        b.set_file_contents("/tmp/example", b"abcd".to_vec()).unwrap();
+        b.set_file_contents("/tmp/example", b"abcd".to_vec())
+            .unwrap();
         let bytes = b.file_contents("/tmp/example").unwrap();
         assert_eq!(bytes, b"abcd");
     }
@@ -1745,7 +1762,10 @@ mod tests {
         // MemoryBackend records a tombstone (lookup -> Deleted); the
         // disk-authoritative HostFsBackend really removes it (lookup -> None).
         assert!(b.file_contents("/etc/motd").is_none());
-        assert!(!matches!(b.lookup("/etc/motd"), Some(OverlayEntry::File(_))));
+        assert!(!matches!(
+            b.lookup("/etc/motd"),
+            Some(OverlayEntry::File(_))
+        ));
     }
 
     fn scenario_rename_overlay_file<B: FsBackend>(b: &mut B) {
@@ -1753,10 +1773,7 @@ mod tests {
         b.set_file_contents("/tmp/src", b"hello".to_vec()).unwrap();
         let moved = b.rename_overlay_entry("/tmp/src", "/tmp/dst").unwrap();
         assert!(moved);
-        assert_eq!(
-            b.file_contents("/tmp/dst").as_deref(),
-            Some(&b"hello"[..])
-        );
+        assert_eq!(b.file_contents("/tmp/dst").as_deref(), Some(&b"hello"[..]));
         // Source no longer readable: MemoryBackend tombstones it, the
         // disk-authoritative HostFsBackend really renamed it away.
         assert!(b.file_contents("/tmp/src").is_none());
@@ -1821,11 +1838,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn host_backend() -> (HostFsBackend, tempfile::TempDir) {
         let scratch = tempfile::TempDir::new().unwrap();
-        let dir = cap_std::fs::Dir::open_ambient_dir(
-            scratch.path(),
-            cap_std::ambient_authority(),
-        )
-        .unwrap();
+        let dir = cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority())
+            .unwrap();
         (HostFsBackend::from_existing_dir(dir), scratch)
     }
 
@@ -1906,11 +1920,8 @@ mod tests {
 
         let scratch = outer.path().join("scratch");
         std::fs::create_dir(&scratch).unwrap();
-        let dir = cap_std::fs::Dir::open_ambient_dir(
-            &scratch,
-            cap_std::ambient_authority(),
-        )
-        .unwrap();
+        let dir =
+            cap_std::fs::Dir::open_ambient_dir(&scratch, cap_std::ambient_authority()).unwrap();
         let mut b = HostFsBackend::from_existing_dir(dir);
         // Try to escape via `..`. cap-std rejects this at the path-
         // walking layer, not via a Rust-level check, which is exactly
@@ -1926,8 +1937,7 @@ mod tests {
         // it pre-exists in the scratch tree, then try to write through
         // it. cap-std's open(2) must refuse to follow it past the
         // root.
-        std::os::unix::fs::symlink(outer.path().join("victim"), scratch.join("escape"))
-            .unwrap();
+        std::os::unix::fs::symlink(outer.path().join("victim"), scratch.join("escape")).unwrap();
         let result = b.set_file_contents("/escape", b"pwned".to_vec());
         assert!(
             result.is_err(),
@@ -1978,9 +1988,7 @@ mod tests {
         let mut got = Vec::new();
         let mut chunk = [0u8; 4096];
         loop {
-            let n = unsafe {
-                libc::read(read_end, chunk.as_mut_ptr() as *mut _, chunk.len())
-            };
+            let n = unsafe { libc::read(read_end, chunk.as_mut_ptr() as *mut _, chunk.len()) };
             if n <= 0 {
                 break;
             }
@@ -2008,12 +2016,19 @@ mod tests {
         use std::io::Write as _;
 
         // Helper: write a tar archive to disk and return its path.
-        fn write_layer(dir: &std::path::Path, name: &str, build: impl FnOnce(&mut tar::Builder<Vec<u8>>)) -> std::path::PathBuf {
+        fn write_layer(
+            dir: &std::path::Path,
+            name: &str,
+            build: impl FnOnce(&mut tar::Builder<Vec<u8>>),
+        ) -> std::path::PathBuf {
             let mut b = tar::Builder::new(Vec::new());
             build(&mut b);
             let bytes = b.into_inner().unwrap();
             let p = dir.join(name);
-            std::fs::File::create(&p).unwrap().write_all(&bytes).unwrap();
+            std::fs::File::create(&p)
+                .unwrap()
+                .write_all(&bytes)
+                .unwrap();
             p
         }
 
@@ -2056,7 +2071,9 @@ mod tests {
         );
 
         // metadata must report File kind
-        let meta = backend.metadata("/etc/motd").expect("metadata('/etc/motd') must be Some");
+        let meta = backend
+            .metadata("/etc/motd")
+            .expect("metadata('/etc/motd') must be Some");
         assert_eq!(
             meta.kind,
             RootFsEntryKind::File,

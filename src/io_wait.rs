@@ -1,7 +1,7 @@
 //! Per-thread blocking-I/O wait built on macOS `kqueue`.
 //!
 //! A guest thread that issues a blocking syscall (recv/accept/ppoll/…) must
-//! wait WITHOUT holding the big kernel lock — otherwise it starves every
+//! wait WITHOUT holding the dispatcher lock — otherwise it starves every
 //! sibling vCPU thread (the GIL/server-worker starvation). The runtime drops
 //! the lock and parks the vCPU thread here, in `kevent()`, on:
 //!
@@ -44,7 +44,12 @@ pub struct ThreadWaiter {
 impl ThreadWaiter {
     #[cfg(target_os = "macos")]
     pub fn new(tid: crate::thread::ThreadId) -> Self {
-        let kq = unsafe { libc::kqueue() };
+        let raw_kq = unsafe { libc::kqueue() };
+        let kq = if raw_kq >= 0 {
+            crate::host_signal::relocate_internal_fd(raw_kq)
+        } else {
+            raw_kq
+        };
         let pipe_read = crate::host_signal::pending_pipe_read_fd();
         if kq >= 0 && pipe_read >= 0 {
             // Persistent EVFILT_READ on the self-pipe: any byte the signal
@@ -59,11 +64,15 @@ impl ThreadWaiter {
 
     #[cfg(not(target_os = "macos"))]
     pub fn new(tid: crate::thread::ThreadId) -> Self {
-        Self { kq: -1, pipe_read: -1, tid }
+        Self {
+            kq: -1,
+            pipe_read: -1,
+            tid,
+        }
     }
 
     /// Block until one of `fds` (host fds, with `libc::POLL*` event masks) is
-    /// ready, `timeout` elapses, or a signal becomes pending. The kernel lock
+    /// ready, `timeout` elapses, or a signal becomes pending. The dispatcher lock
     /// MUST NOT be held by the caller. `fds` may be empty (a pure sleep).
     pub fn wait(&self, fds: &[(i32, i16)], timeout: Option<Duration>) -> WaitResult {
         // A signal that arrived just before we parked must not be missed.
@@ -106,13 +115,20 @@ impl ThreadWaiter {
                 // No deadline: the self-pipe wakes us on a signal, so block
                 // indefinitely. Without the pipe, cap at 50ms to re-check.
                 None if self.pipe_read >= 0 => None,
-                None => Some(libc::timespec { tv_sec: 0, tv_nsec: 50_000_000 }),
+                None => Some(libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 50_000_000,
+                }),
             };
             let ts_ptr = ts.as_ref().map_or(std::ptr::null(), |t| t as *const _);
             let n = unsafe {
                 libc::kevent(
                     self.kq,
-                    if changes.is_empty() { std::ptr::null() } else { changes.as_ptr() },
+                    if changes.is_empty() {
+                        std::ptr::null()
+                    } else {
+                        changes.as_ptr()
+                    },
                     changes.len() as libc::c_int,
                     events_out.as_mut_ptr(),
                     events_out.len() as libc::c_int,
@@ -172,7 +188,10 @@ impl ThreadWaiter {
                 deletes.push(ev(fd, libc::EVFILT_WRITE, libc::EV_DELETE));
             }
         }
-        let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        let zero = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
         unsafe {
             libc::kevent(
                 self.kq,
@@ -193,7 +212,11 @@ impl ThreadWaiter {
         let deadline = timeout.map(|d| Instant::now() + d);
         let mut pollfds: Vec<libc::pollfd> = fds
             .iter()
-            .map(|&(fd, events)| libc::pollfd { fd, events, revents: 0 })
+            .map(|&(fd, events)| libc::pollfd {
+                fd,
+                events,
+                revents: 0,
+            })
             .collect();
         loop {
             if crate::host_signal::has_pending_for(self.tid) {
@@ -210,7 +233,11 @@ impl ThreadWaiter {
                 None => SLICE_MS,
             };
             let n = unsafe {
-                libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, slice_ms)
+                libc::poll(
+                    pollfds.as_mut_ptr(),
+                    pollfds.len() as libc::nfds_t,
+                    slice_ms,
+                )
             };
             if n > 0 {
                 return WaitResult::Ready;

@@ -57,9 +57,8 @@ impl DebugStateSnapshot {
     }
 
     pub fn write_to(&self, path: &Path) -> std::io::Result<()> {
-        let bytes = serde_json::to_vec_pretty(self).map_err(|e| {
-            std::io::Error::other(format!("serialize: {e}"))
-        })?;
+        let bytes = serde_json::to_vec_pretty(self)
+            .map_err(|e| std::io::Error::other(format!("serialize: {e}")))?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -69,10 +68,7 @@ impl DebugStateSnapshot {
 
 /// Write a debug-state snapshot iff a path was provided. Returns the path
 /// back so the CLI can mention it.
-pub fn maybe_dump_debug_state(
-    image: &AddressSpace,
-    path: Option<&PathBuf>,
-) -> Option<PathBuf> {
+pub fn maybe_dump_debug_state(image: &AddressSpace, path: Option<&PathBuf>) -> Option<PathBuf> {
     let path = path?;
     let snapshot = DebugStateSnapshot::from_address_space(image);
     if let Err(err) = snapshot.write_to(path) {
@@ -199,9 +195,7 @@ where
     A: IntoIterator<Item = String>,
     E: IntoIterator<Item = String>,
 {
-    run_static_elf_with_hvf_args_and_dispatcher_debug(
-        path, dispatcher, argv, env, max_traps, None,
-    )
+    run_static_elf_with_hvf_args_and_dispatcher_debug(path, dispatcher, argv, env, max_traps, None)
 }
 
 pub fn run_static_elf_with_hvf_args_and_dispatcher_debug<A, E>(
@@ -232,7 +226,8 @@ pub fn run_static_elf_bytes_with_hvf_and_dispatcher(
     dispatcher: SyscallDispatcher,
     max_traps: usize,
 ) -> Result<RunResult, RuntimeError> {
-    let image = AddressSpace::load_elf_bytes(bytes)?.with_el0_trampoline()?
+    let image = AddressSpace::load_elf_bytes(bytes)?
+        .with_el0_trampoline()?
         .with_el1_vectors()?
         .with_stage1_page_tables()?;
     run_address_space_with_hvf_and_dispatcher(image, dispatcher, max_traps)
@@ -315,19 +310,18 @@ where
     A: IntoIterator<Item = String>,
     E: IntoIterator<Item = String>,
 {
-    let bytes = dispatcher
-        .read_exec_file(path)
-        .ok_or_else(|| RuntimeError::AddressSpace(AddressSpaceError::Io(
-            std::io::Error::new(std::io::ErrorKind::NotFound, path.to_owned()),
-        )))?;
-    let image = AddressSpace::load_elf_bytes_with_reader(
-        &bytes,
-        &|p| dispatcher.read_exec_file(p),
-    )?
-    .with_linux_initial_stack(argv, env)?
-    .with_el0_trampoline()?
-    .with_el1_vectors()?
-    .with_stage1_page_tables()?;
+    let bytes = dispatcher.read_exec_file(path).ok_or_else(|| {
+        RuntimeError::AddressSpace(AddressSpaceError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            path.to_owned(),
+        )))
+    })?;
+    let image =
+        AddressSpace::load_elf_bytes_with_reader(&bytes, &|p| dispatcher.read_exec_file(p))?
+            .with_linux_initial_stack(argv, env)?
+            .with_el0_trampoline()?
+            .with_el1_vectors()?
+            .with_stage1_page_tables()?;
     if let Some(p) = maybe_dump_debug_state(&image, debug_state_path) {
         eprintln!("debug state written: {}", p.display());
     }
@@ -453,7 +447,7 @@ pub fn run_combined_syscall_loop_with_dispatcher<R>(
 where
     R: GuestMemory + SyscallTrap,
 {
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     crate::host_signal::install_default_handlers();
     // Snapshot the host stdin termios so a guest crash mid-`stty raw`
     // doesn't leave the user's terminal wedged. The guard drops at the
@@ -473,11 +467,15 @@ where
                 // pump). Deliver at the interrupted PC, then resume.
                 let pc = runtime.current_pc()?;
                 if let Some(action) =
-                    deliver_pending_signal(runtime, &mut dispatcher, None, this_tid, Some(pc))?
+                    deliver_pending_signal(runtime, &dispatcher, None, this_tid, Some(pc))?
                     && let Some(signum) = action.term_signal
                 {
                     if runtime.is_forked_child() {
-                        forked_child_die_by_signal(signum, dispatcher.stdout(), dispatcher.stderr());
+                        forked_child_die_by_signal(
+                            signum,
+                            dispatcher.stdout(),
+                            dispatcher.stderr(),
+                        );
                     }
                     return Ok(RunResult {
                         exit_code: 128 + signum,
@@ -508,20 +506,24 @@ where
             let oc = dispatcher.dispatch(
                 SyscallRequest::from_aarch64_frame(frame),
                 runtime,
-                &mut reporter,
+                &reporter,
             )?;
             match oc {
-                DispatchOutcome::WaitOnFds { fds, timeout, on_timeout } => {
-                    match waiter.wait(&fds, timeout) {
-                        crate::io_wait::WaitResult::Ready => continue,
-                        crate::io_wait::WaitResult::TimedOut => {
-                            break DispatchOutcome::Returned { value: on_timeout }
-                        }
-                        crate::io_wait::WaitResult::Interrupted => {
-                            break DispatchOutcome::Errno { errno: crate::linux_abi::LINUX_EINTR }
-                        }
+                DispatchOutcome::WaitOnFds {
+                    fds,
+                    timeout,
+                    on_timeout,
+                } => match waiter.wait(&fds, timeout) {
+                    crate::io_wait::WaitResult::Ready => continue,
+                    crate::io_wait::WaitResult::TimedOut => {
+                        break DispatchOutcome::Returned { value: on_timeout };
                     }
-                }
+                    crate::io_wait::WaitResult::Interrupted => {
+                        break DispatchOutcome::Errno {
+                            errno: crate::linux_abi::LINUX_EINTR,
+                        };
+                    }
+                },
                 other => break other,
             }
         };
@@ -556,7 +558,10 @@ where
             DispatchOutcome::Fork => {
                 let outcome = runtime.fork()?;
                 let retval: i64 = match outcome {
-                    crate::trap::ForkOutcome::Parent { child_pid } => i64::from(child_pid),
+                    crate::trap::ForkOutcome::Parent { child_pid } => {
+                        waiter = crate::io_wait::ThreadWaiter::new(this_tid);
+                        i64::from(child_pid)
+                    }
                     crate::trap::ForkOutcome::Child => {
                         dispatcher.clear_output_buffers();
                         // kqueue is NOT inherited across fork, and the inherited
@@ -624,24 +629,21 @@ where
         }
 
         if let Some(action) =
-                deliver_pending_signal(runtime, &mut dispatcher, last_syscall_retval, this_tid, None)?
-                && let Some(signum) = action.term_signal {
-                    if runtime.is_forked_child() {
-                        forked_child_die_by_signal(
-                            signum,
-                            dispatcher.stdout(),
-                            dispatcher.stderr(),
-                        );
-                    }
-                    return Ok(RunResult {
-                        exit_code: 128 + signum,
-                        stdout: dispatcher.stdout().to_vec(),
-                        stderr: dispatcher.stderr().to_vec(),
-                        traps,
-                        report: reporter.finish(),
-                        trap_limit_hit: false,
-                    });
-                }
+            deliver_pending_signal(runtime, &dispatcher, last_syscall_retval, this_tid, None)?
+            && let Some(signum) = action.term_signal
+        {
+            if runtime.is_forked_child() {
+                forked_child_die_by_signal(signum, dispatcher.stdout(), dispatcher.stderr());
+            }
+            return Ok(RunResult {
+                exit_code: 128 + signum,
+                stdout: dispatcher.stdout().to_vec(),
+                stderr: dispatcher.stderr().to_vec(),
+                traps,
+                report: reporter.finish(),
+                trap_limit_hit: false,
+            });
+        }
     }
 
     Ok(RunResult {
@@ -657,42 +659,30 @@ where
 // ===================================================================
 // Multi-threaded HVF runtime: one host thread + one HVF vCPU per guest
 // thread, sharing ONE process VM (stage-2 mappings are visible to every
-// vCPU). All syscall servicing serialises through ONE big kernel lock
-// (`Arc<Mutex<KernelState>>`); guest user-mode runs truly concurrently,
-// handlers run one at a time. See [[plan-syscall-macro-split]] /
-// thread-creating-clone plan Task 5+6.
+// vCPU). Shared runtime state is explicit: dispatcher subsystems protect
+// their own mutable state, descriptor aliases are thread-safe, and
+// compatibility reporting is internally synchronized.
 // ===================================================================
 
 use crate::thread::{FutexTable, ThreadId, ThreadRegistry};
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 
-/// All shared kernel state behind the big lock: the syscall dispatcher
-/// (open-fd table, fs/mem/proc/etc.) and the compat reporter. Wrapped so a
-/// single mutex serialises every handler across all guest-thread vCPUs.
 struct KernelState {
     dispatcher: SyscallDispatcher,
     reporter: CompatReporter,
 }
 
-/// `SyscallDispatcher` holds `Rc<RefCell<OpenDescription>>` (non-atomic
-/// refcounts), so it is `!Send` by default. The big `Mutex<KernelState>`
-/// guarantees only ONE host thread ever touches the dispatcher at a time —
-/// the `Rc` refcounts are therefore never updated concurrently — so moving
-/// the `Arc<Mutex<KernelState>>` across threads and locking it per syscall
-/// is sound. We assert that with this wrapper.
-// SAFETY invariant documented on SendKernel: the Mutex serialises all access to the !Send dispatcher.
-#[allow(clippy::arc_with_non_send_sync)]
-struct SendKernel(Arc<Mutex<KernelState>>);
-// SAFETY: see the type doc — the Mutex serialises all access to the
-// non-atomic-refcounted Rc state, so concurrent refcount mutation (the only
-// reason SyscallDispatcher is !Send) cannot occur.
-unsafe impl Send for SendKernel {}
-
-impl SendKernel {
-    fn clone_handle(&self) -> SendKernel {
-        SendKernel(Arc::clone(&self.0))
+impl KernelState {
+    fn new(dispatcher: SyscallDispatcher) -> Self {
+        Self {
+            dispatcher,
+            reporter: CompatReporter::default(),
+        }
     }
 }
+
+type Kernel = Arc<KernelState>;
 
 /// What a single vCPU loop did when it stopped.
 enum VcpuLoopOutcome {
@@ -706,7 +696,7 @@ enum VcpuLoopOutcome {
     TrapLimit(Box<RunResult>),
 }
 
-/// Top-level multi-threaded HVF entry. Builds the shared kernel lock + the
+/// Top-level multi-threaded HVF entry. Builds the shared dispatcher lock + the
 /// thread registry + futex table, then runs the MAIN guest thread's vCPU
 /// through `run_vcpu_until_exit`. Thread-creating clones spawn sibling host
 /// threads that run the same function on their own vCPU.
@@ -721,16 +711,10 @@ fn run_threaded_hvf_loop(
     let main_tid: ThreadId = std::process::id() as ThreadId;
     let registry = Arc::new(ThreadRegistry::new(main_tid));
     let futex = Arc::new(FutexTable::new());
-    // SAFETY invariant documented on SendKernel: the Mutex serialises all access to the !Send dispatcher.
-    #[allow(clippy::arc_with_non_send_sync)]
-    let kernel = SendKernel(Arc::new(Mutex::new(KernelState {
-        dispatcher,
-        reporter: CompatReporter::default(),
-    })));
+    let kernel = Arc::new(KernelState::new(dispatcher));
     // Track spawned sibling threads so the process doesn't tear down while a
     // worker is mid-flight. We join them after the main thread finishes.
-    let threads: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>> =
-        Arc::new(Mutex::new(Vec::new()));
+    let threads: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
     // Registry of live vCPUs so a signalling thread (tgkill) or the
     // process-directed signal pump can force a target out of `hv_vcpu_run`.
     let kicker = Arc::new(crate::vcpu_kick::VcpuKicker::new());
@@ -741,7 +725,7 @@ fn run_threaded_hvf_loop(
     crate::vcpu_kick::spawn_signal_pump(Arc::clone(&kicker), Arc::clone(&futex));
 
     let outcome = run_vcpu_until_exit(
-        kernel.clone_handle(),
+        Arc::clone(&kernel),
         trap,
         Arc::clone(&registry),
         Arc::clone(&futex),
@@ -758,13 +742,11 @@ fn run_threaded_hvf_loop(
             // a result from the shared kernel buffers; siblings keep running
             // until the process exits, but for the run-to-completion CLI we
             // collect output now.
-            #[allow(clippy::expect_used)]
-            let mut k = kernel.0.lock().expect("kernel lock poisoned");
-            let report = std::mem::take(&mut k.reporter).finish();
+            let report = kernel.reporter.snapshot();
             RunResult {
                 exit_code: 0,
-                stdout: k.dispatcher.stdout().to_vec(),
-                stderr: k.dispatcher.stderr().to_vec(),
+                stdout: kernel.dispatcher.stdout(),
+                stderr: kernel.dispatcher.stderr(),
                 traps: 0,
                 report,
                 trap_limit_hit: false,
@@ -777,10 +759,10 @@ fn run_threaded_hvf_loop(
 
 /// Run one vCPU (one guest thread) until it exits the process, finishes its
 /// own thread, or hits the trap limit. Holds NO lock during the vCPU run;
-/// takes the big kernel lock only to dispatch + complete each syscall.
+/// takes the dispatcher lock only to dispatch + complete each syscall.
 #[allow(clippy::too_many_arguments)]
 fn run_vcpu_until_exit(
-    kernel: SendKernel,
+    kernel: Kernel,
     mut engine: HvfTrapEngine,
     mut registry: Arc<ThreadRegistry>,
     futex: Arc<FutexTable>,
@@ -796,7 +778,7 @@ fn run_vcpu_until_exit(
     // Publish this thread's vCPU so siblings can kick it out of the guest.
     kicker.register(this_tid, engine.vcpu_kick_handle());
     for traps in 1..=max_traps {
-        // ---- vCPU run: NO kernel lock held ----
+        // ---- vCPU run: NO dispatcher lock held ----
         let frame = match engine.next_syscall()? {
             Some(f) => f,
             None => {
@@ -823,38 +805,37 @@ fn run_vcpu_until_exit(
             );
         }
 
-        // ---- syscall service: kernel lock held ONLY during dispatch ----
+        // ---- syscall service: no dispatcher-wide lock held ----
         // A blocking-mode I/O syscall returns WaitOnFds; we then wait on the
-        // host fds with the lock RELEASED (the block above dropped it) so
-        // sibling threads run — the whole point of fixing the big kernel lock.
-        // On readiness we re-dispatch (re-take the lock briefly); on timeout /
-        // signal we synthesize the terminal outcome.
+        // host fds without holding subsystem locks so sibling threads run.
+        // On readiness we re-dispatch; on timeout / signal we synthesize the
+        // terminal outcome.
         let outcome = loop {
-            let oc = {
-                #[allow(clippy::expect_used)]
-                let mut k = kernel.0.lock().expect("kernel lock poisoned");
-                let KernelState { dispatcher, reporter } = &mut *k;
-                dispatcher.dispatch_threaded(
-                    SyscallRequest::from_aarch64_frame(frame),
-                    &mut engine,
-                    reporter,
-                    this_tid,
-                    &registry,
-                    &futex,
-                )?
-            };
+            let request = SyscallRequest::from_aarch64_frame(frame);
+            let oc = kernel.dispatcher.dispatch_threaded(
+                request,
+                &mut engine,
+                &kernel.reporter,
+                this_tid,
+                &registry,
+                &futex,
+            )?;
             match oc {
-                DispatchOutcome::WaitOnFds { fds, timeout, on_timeout } => {
-                    match waiter.wait(&fds, timeout) {
-                        crate::io_wait::WaitResult::Ready => continue,
-                        crate::io_wait::WaitResult::TimedOut => {
-                            break DispatchOutcome::Returned { value: on_timeout }
-                        }
-                        crate::io_wait::WaitResult::Interrupted => {
-                            break DispatchOutcome::Errno { errno: crate::linux_abi::LINUX_EINTR }
-                        }
+                DispatchOutcome::WaitOnFds {
+                    fds,
+                    timeout,
+                    on_timeout,
+                } => match waiter.wait(&fds, timeout) {
+                    crate::io_wait::WaitResult::Ready => continue,
+                    crate::io_wait::WaitResult::TimedOut => {
+                        break DispatchOutcome::Returned { value: on_timeout };
                     }
-                }
+                    crate::io_wait::WaitResult::Interrupted => {
+                        break DispatchOutcome::Errno {
+                            errno: crate::linux_abi::LINUX_EINTR,
+                        };
+                    }
+                },
                 other => break other,
             }
         };
@@ -869,9 +850,7 @@ fn run_vcpu_until_exit(
                 // its buffered stdio is flushed to the inherited host fds.
                 if engine.is_forked_child() {
                     crate::probes::guest_exit(code);
-                    #[allow(clippy::expect_used)]
-                    let k = kernel.0.lock().expect("kernel lock poisoned");
-                    forked_child_exit(code, k.dispatcher.stdout(), k.dispatcher.stderr());
+                    forked_child_exit(code, kernel.dispatcher.stdout(), kernel.dispatcher.stderr());
                 }
                 // exit_group, or exit(2) as the last live thread. Tear the
                 // whole process down. For the main thread we return a
@@ -880,13 +859,10 @@ fn run_vcpu_until_exit(
                 if !last && this_tid != (std::process::id() as ThreadId) {
                     // A sibling ran exit_group(94): flush shared buffers and
                     // terminate the entire process (other threads share it).
-                    #[allow(clippy::expect_used)]
-                    let k = kernel.0.lock().expect("kernel lock poisoned");
                     let _ = std::io::Write::flush(&mut std::io::stdout());
                     let _ = std::io::Write::flush(&mut std::io::stderr());
-                    let out = k.dispatcher.stdout().to_vec();
-                    let err = k.dispatcher.stderr().to_vec();
-                    drop(k);
+                    let out = kernel.dispatcher.stdout();
+                    let err = kernel.dispatcher.stderr();
                     let _ = unsafe { libc::write(1, out.as_ptr() as *const _, out.len()) };
                     let _ = unsafe { libc::write(2, err.as_ptr() as *const _, err.len()) };
                     unsafe { libc::_exit(code) };
@@ -903,8 +879,8 @@ fn run_vcpu_until_exit(
                 engine.complete_syscall(v)?;
                 last_syscall_retval = Some(v);
             }
-            DispatchOutcome::FutexWait { addr, timeout } => {
-                // Block with the kernel lock RELEASED so a sibling FUTEX_WAKE
+            DispatchOutcome::FutexWait { wait, timeout } => {
+                // Block with the dispatcher lock RELEASED so a sibling FUTEX_WAKE
                 // can run. The wait is interrupted if a signal becomes pending
                 // so even an all-threads-parked process delivers it; the
                 // ungated signal check below then runs. Re-lock only to
@@ -914,12 +890,13 @@ fn run_vcpu_until_exit(
                 // thread (its own tgkill target or a process-directed one) —
                 // not a sibling's, which would surface a spurious EINTR.
                 let retval: i64 =
-                    match futex.wait(addr, timeout, &|| crate::host_signal::has_pending_for(this_tid))
-                {
-                    FutexWaitOutcome::Woken => 0,
-                    FutexWaitOutcome::TimedOut => -(crate::linux_abi::LINUX_ETIMEDOUT as i64),
-                    FutexWaitOutcome::Interrupted => -(crate::linux_abi::LINUX_EINTR as i64),
-                };
+                    match futex.wait_prepared_for_thread(wait, timeout, this_tid, &|| {
+                        crate::host_signal::has_pending_for(this_tid)
+                    }) {
+                        FutexWaitOutcome::Woken => 0,
+                        FutexWaitOutcome::TimedOut => -(crate::linux_abi::LINUX_ETIMEDOUT as i64),
+                        FutexWaitOutcome::Interrupted => -(crate::linux_abi::LINUX_EINTR as i64),
+                    };
                 engine.complete_syscall(retval)?;
                 last_syscall_retval = Some(retval);
             }
@@ -935,9 +912,13 @@ fn run_vcpu_until_exit(
                 // The flags were already validated by the dispatcher; recover
                 // the clear/settid intents from the addrs it passed (it only
                 // sets child_tid_addr when one of those flags is present).
-                let clear_addr = if child_tid_addr != 0 { child_tid_addr } else { 0 };
+                let clear_addr = if child_tid_addr != 0 {
+                    child_tid_addr
+                } else {
+                    0
+                };
 
-                // Allocate the child tid + register it (under the kernel lock
+                // Allocate the child tid + register it (under the dispatcher lock
                 // for ordering with live_count/exit, though the registry has
                 // its own lock).
                 let tid = registry.register_child(clear_addr);
@@ -965,7 +946,7 @@ fn run_vcpu_until_exit(
                 let spec = engine.build_thread_spec(stack, tls)?;
 
                 // Spawn the sibling host thread.
-                let child_kernel = kernel.clone_handle();
+                let child_kernel = Arc::clone(&kernel);
                 let child_registry = Arc::clone(&registry);
                 let child_futex = Arc::clone(&futex);
                 let child_threads = Arc::clone(&threads);
@@ -1007,8 +988,7 @@ fn run_vcpu_until_exit(
                     .map_err(|e| RuntimeError::Trap(TrapError::Hypervisor(format!(
                         "spawn guest thread failed: {e}"
                     ))))?;
-                #[allow(clippy::expect_used)]
-                threads.lock().expect("threads lock poisoned").push(handle);
+                threads.lock().push(handle);
 
                 // Parent's clone(2) returns the child tid.
                 engine.complete_syscall(tid as i64)?;
@@ -1016,10 +996,11 @@ fn run_vcpu_until_exit(
             DispatchOutcome::ThreadExit { code } => {
                 // CLONE_CHILD_CLEARTID: zero the word + wake one waiter.
                 if let Some(addr) = registry.clear_child_tid(this_tid)
-                    && addr != 0 {
-                        let _ = engine.write_bytes(addr, &0i32.to_le_bytes());
-                        futex.wake(addr, 1);
-                    }
+                    && addr != 0
+                {
+                    let _ = engine.write_bytes(addr, &0i32.to_le_bytes());
+                    futex.wake(addr, 1);
+                }
                 let last = registry.exit(this_tid);
                 // No more kicks for a thread that's gone; drop its stale
                 // pending too so a recycled tid starts clean.
@@ -1033,7 +1014,10 @@ fn run_vcpu_until_exit(
                 // leak to process exit (the forked-child Drop discipline).
                 return Ok(VcpuLoopOutcome::ThreadDone);
             }
-            DispatchOutcome::SignalThread { tid: target, signum } => {
+            DispatchOutcome::SignalThread {
+                tid: target,
+                signum,
+            } => {
                 // tgkill/tkill to a sibling: publish the signal for the target
                 // tid and force its vCPU out of the guest so it delivers at its
                 // next safe point. -ESRCH if it raced to exit.
@@ -1053,8 +1037,7 @@ fn run_vcpu_until_exit(
                 crate::dispatch::set_host_process_name(base.as_bytes());
                 #[allow(clippy::expect_used)]
                 let image = {
-                    let mut k = kernel.0.lock().expect("kernel lock poisoned");
-                    let res = load_execve_image(&k.dispatcher, &path, argv, env);
+                    let res = load_execve_image(&kernel.dispatcher, &path, argv, env);
                     match res {
                         Ok(img) => {
                             crate::probes::execve_loaded(
@@ -1063,11 +1046,10 @@ fn run_vcpu_until_exit(
                                 img.initial_stack_pointer().unwrap_or(0),
                                 img.regions().len() as u64,
                             );
-                            k.dispatcher.close_cloexec_fds();
+                            kernel.dispatcher.close_cloexec_fds();
                             Some(img)
                         }
                         Err(errno) => {
-                            drop(k);
                             engine.complete_syscall(-(errno as i64))?;
                             None
                         }
@@ -1097,11 +1079,12 @@ fn run_vcpu_until_exit(
                 } else {
                     let fork_outcome = engine.fork()?;
                     let retval: i64 = match fork_outcome {
-                        crate::trap::ForkOutcome::Parent { child_pid } => i64::from(child_pid),
+                        crate::trap::ForkOutcome::Parent { child_pid } => {
+                            waiter = crate::io_wait::ThreadWaiter::new(this_tid);
+                            i64::from(child_pid)
+                        }
                         crate::trap::ForkOutcome::Child => {
-                            #[allow(clippy::expect_used)]
-                            let mut k = kernel.0.lock().expect("kernel lock poisoned");
-                            k.dispatcher.clear_output_buffers();
+                            kernel.dispatcher.clear_output_buffers();
                             // A forked process is single-threaded by definition
                             // (fork copies only the calling thread). Reset to a
                             // fresh registry keyed by the child's host pid so
@@ -1136,9 +1119,14 @@ fn run_vcpu_until_exit(
         // / blocking I/O interrupt on a pending-for-them signal and reach here
         // too; a thread forced out of the guest by a kick (frame == None) lands
         // here with `interrupted_pc` so the handler resumes at the right PC.
-        if let Some(outcome) =
-            service_signals_threaded(&kernel, &mut engine, this_tid, last_syscall_retval, None, traps)?
-        {
+        if let Some(outcome) = service_signals_threaded(
+            &kernel,
+            &mut engine,
+            this_tid,
+            last_syscall_retval,
+            None,
+            traps,
+        )? {
             return Ok(outcome);
         }
     }
@@ -1150,19 +1138,17 @@ fn run_vcpu_until_exit(
 /// Snapshot the shared kernel buffers + reporter into a RunResult. Called on
 /// whole-process exit / trap limit.
 fn assemble_run_result(
-    kernel: &SendKernel,
+    kernel: &Kernel,
     exit_code: i32,
     traps: usize,
     trap_limit_hit: bool,
 ) -> RunResult {
     crate::probes::guest_exit(exit_code);
-    #[allow(clippy::expect_used)]
-    let mut k = kernel.0.lock().expect("kernel lock poisoned");
-    let report = std::mem::take(&mut k.reporter).finish();
+    let report = kernel.reporter.snapshot();
     RunResult {
         exit_code,
-        stdout: k.dispatcher.stdout().to_vec(),
-        stderr: k.dispatcher.stderr().to_vec(),
+        stdout: kernel.dispatcher.stdout(),
+        stderr: kernel.dispatcher.stderr(),
         traps,
         report,
         trap_limit_hit,
@@ -1187,7 +1173,7 @@ struct PendingSignalAction {
 /// SIG_IGN'd) and the vCPU should resume.
 fn deliver_pending_signal<T>(
     trap: &mut T,
-    dispatcher: &mut SyscallDispatcher,
+    dispatcher: &SyscallDispatcher,
     last_syscall_retval: Option<i64>,
     tid: ThreadId,
     interrupted_pc: Option<u64>,
@@ -1251,35 +1237,31 @@ where
 }
 
 /// Run signal delivery for one iteration of the multi-threaded vCPU loop under
-/// the kernel lock. Returns `Some(outcome)` when a default-action (terminate)
+/// the dispatcher lock. Returns `Some(outcome)` when a default-action (terminate)
 /// signal fires and the process should end; `None` to keep running. Shared by
 /// the post-syscall path (`interrupted_pc = None`) and the kick path
 /// (`interrupted_pc = Some(pc)`, no syscall ran).
 fn service_signals_threaded(
-    kernel: &SendKernel,
+    kernel: &Kernel,
     engine: &mut HvfTrapEngine,
     this_tid: ThreadId,
     last_syscall_retval: Option<i64>,
     interrupted_pc: Option<u64>,
     traps: usize,
 ) -> Result<Option<VcpuLoopOutcome>, RuntimeError> {
-    #[allow(clippy::expect_used)]
-    let mut k = kernel.0.lock().expect("kernel lock poisoned");
     if let Some(action) = deliver_pending_signal(
         engine,
-        &mut k.dispatcher,
+        &kernel.dispatcher,
         last_syscall_retval,
         this_tid,
         interrupted_pc,
     )? && let Some(signum) = action.term_signal
     {
         if engine.is_forked_child() {
-            let out = k.dispatcher.stdout().to_vec();
-            let err = k.dispatcher.stderr().to_vec();
-            drop(k);
+            let out = kernel.dispatcher.stdout();
+            let err = kernel.dispatcher.stderr();
             forked_child_die_by_signal(signum, &out, &err);
         }
-        drop(k);
         let result = assemble_run_result(kernel, 128 + signum, traps, false);
         return Ok(Some(VcpuLoopOutcome::ProcessExit(Box::new(result))));
     }
@@ -1382,13 +1364,11 @@ fn parse_shebang(head: &[u8]) -> Option<(String, Option<String>)> {
 /// `_exit(2)` to bypass Rust's normal Drop chain. Without this, the
 /// rebuilt HVF context in the child would trigger an `applevisor::Vcpu`
 /// Drop panic ("no VM or vCPU available") during shutdown.
-fn forked_child_exit(code: i32, stdout_buf: &[u8], stderr_buf: &[u8]) -> ! {
-    let _ = unsafe {
-        libc::write(1, stdout_buf.as_ptr() as *const _, stdout_buf.len())
-    };
-    let _ = unsafe {
-        libc::write(2, stderr_buf.as_ptr() as *const _, stderr_buf.len())
-    };
+fn forked_child_exit(code: i32, stdout_buf: impl AsRef<[u8]>, stderr_buf: impl AsRef<[u8]>) -> ! {
+    let stdout_buf = stdout_buf.as_ref();
+    let stderr_buf = stderr_buf.as_ref();
+    let _ = unsafe { libc::write(1, stdout_buf.as_ptr() as *const _, stdout_buf.len()) };
+    let _ = unsafe { libc::write(2, stderr_buf.as_ptr() as *const _, stderr_buf.len()) };
     unsafe { libc::_exit(code) };
 }
 
@@ -1402,7 +1382,13 @@ fn forked_child_exit(code: i32, stdout_buf: &[u8], stderr_buf: &[u8]) -> ! {
 /// guest reads them back as a Linux signal number. Falls back to `_exit` if
 /// the signal somehow doesn't terminate the host process (a few Linux signal
 /// numbers map to default-ignore dispositions on macOS).
-fn forked_child_die_by_signal(signum: i32, stdout_buf: &[u8], stderr_buf: &[u8]) -> ! {
+fn forked_child_die_by_signal(
+    signum: i32,
+    stdout_buf: impl AsRef<[u8]>,
+    stderr_buf: impl AsRef<[u8]>,
+) -> ! {
+    let stdout_buf = stdout_buf.as_ref();
+    let stderr_buf = stderr_buf.as_ref();
     let _ = unsafe { libc::write(1, stdout_buf.as_ptr() as *const _, stdout_buf.len()) };
     let _ = unsafe { libc::write(2, stderr_buf.as_ptr() as *const _, stderr_buf.len()) };
     // `signum` is a Linux number; die by the corresponding HOST signal so the
@@ -1433,7 +1419,7 @@ where
     M: GuestMemory,
     T: SyscallTrap,
 {
-    let mut reporter = CompatReporter::default();
+    let reporter = CompatReporter::default();
     crate::host_signal::install_default_handlers();
     // Snapshot the host stdin termios so a guest crash mid-`stty raw`
     // doesn't leave the user's terminal wedged. The guard drops at the
@@ -1453,11 +1439,15 @@ where
                 // pump). Deliver at the interrupted PC, then resume.
                 let pc = trap.current_pc()?;
                 if let Some(action) =
-                    deliver_pending_signal(trap, &mut dispatcher, None, this_tid, Some(pc))?
+                    deliver_pending_signal(trap, &dispatcher, None, this_tid, Some(pc))?
                     && let Some(signum) = action.term_signal
                 {
                     if trap.is_forked_child() {
-                        forked_child_die_by_signal(signum, dispatcher.stdout(), dispatcher.stderr());
+                        forked_child_die_by_signal(
+                            signum,
+                            dispatcher.stdout(),
+                            dispatcher.stderr(),
+                        );
                     }
                     return Ok(RunResult {
                         exit_code: 128 + signum,
@@ -1475,20 +1465,24 @@ where
             let oc = dispatcher.dispatch(
                 SyscallRequest::from_aarch64_frame(frame),
                 memory,
-                &mut reporter,
+                &reporter,
             )?;
             match oc {
-                DispatchOutcome::WaitOnFds { fds, timeout, on_timeout } => {
-                    match waiter.wait(&fds, timeout) {
-                        crate::io_wait::WaitResult::Ready => continue,
-                        crate::io_wait::WaitResult::TimedOut => {
-                            break DispatchOutcome::Returned { value: on_timeout }
-                        }
-                        crate::io_wait::WaitResult::Interrupted => {
-                            break DispatchOutcome::Errno { errno: crate::linux_abi::LINUX_EINTR }
-                        }
+                DispatchOutcome::WaitOnFds {
+                    fds,
+                    timeout,
+                    on_timeout,
+                } => match waiter.wait(&fds, timeout) {
+                    crate::io_wait::WaitResult::Ready => continue,
+                    crate::io_wait::WaitResult::TimedOut => {
+                        break DispatchOutcome::Returned { value: on_timeout };
                     }
-                }
+                    crate::io_wait::WaitResult::Interrupted => {
+                        break DispatchOutcome::Errno {
+                            errno: crate::linux_abi::LINUX_EINTR,
+                        };
+                    }
+                },
                 other => break other,
             }
         };
@@ -1522,7 +1516,10 @@ where
             DispatchOutcome::Fork => {
                 let outcome = trap.fork()?;
                 let retval: i64 = match outcome {
-                    crate::trap::ForkOutcome::Parent { child_pid } => i64::from(child_pid),
+                    crate::trap::ForkOutcome::Parent { child_pid } => {
+                        waiter = crate::io_wait::ThreadWaiter::new(this_tid);
+                        i64::from(child_pid)
+                    }
                     crate::trap::ForkOutcome::Child => {
                         dispatcher.clear_output_buffers();
                         // kqueue is NOT inherited across fork, and the inherited
@@ -1589,24 +1586,21 @@ where
         }
 
         if let Some(action) =
-                deliver_pending_signal(trap, &mut dispatcher, last_syscall_retval, this_tid, None)?
-                && let Some(signum) = action.term_signal {
-                    if trap.is_forked_child() {
-                        forked_child_die_by_signal(
-                            signum,
-                            dispatcher.stdout(),
-                            dispatcher.stderr(),
-                        );
-                    }
-                    return Ok(RunResult {
-                        exit_code: 128 + signum,
-                        stdout: dispatcher.stdout().to_vec(),
-                        stderr: dispatcher.stderr().to_vec(),
-                        traps,
-                        report: reporter.finish(),
-                        trap_limit_hit: false,
-                    });
-                }
+            deliver_pending_signal(trap, &dispatcher, last_syscall_retval, this_tid, None)?
+            && let Some(signum) = action.term_signal
+        {
+            if trap.is_forked_child() {
+                forked_child_die_by_signal(signum, dispatcher.stdout(), dispatcher.stderr());
+            }
+            return Ok(RunResult {
+                exit_code: 128 + signum,
+                stdout: dispatcher.stdout().to_vec(),
+                stderr: dispatcher.stderr().to_vec(),
+                traps,
+                report: reporter.finish(),
+                trap_limit_hit: false,
+            });
+        }
     }
 
     Ok(RunResult {
