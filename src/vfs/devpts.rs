@@ -26,6 +26,10 @@ struct PtyEntry {
 pub struct PtyTable {
     next_index: u32,
     entries: BTreeMap<u32, PtyEntry>,
+    /// pts index of the guest's controlling terminal under `carrick run -t`
+    /// (the pty whose slave is the guest's fds 0/1/2). `None` when not
+    /// interactive. `/dev/tty` and `/proc/self/fd/{0,1,2}` resolve to this.
+    controlling_index: Option<u32>,
 }
 
 impl PtyTable {
@@ -33,7 +37,21 @@ impl PtyTable {
         Self {
             next_index: 0,
             entries: BTreeMap::new(),
+            controlling_index: None,
         }
+    }
+
+    /// Register `host_slave_name` as a live pts AND mark it the controlling
+    /// terminal for `carrick run -t`. Returns the allocated index N.
+    pub fn set_controlling(&mut self, host_slave_name: String, owner_pid: u32) -> u32 {
+        let n = self.insert(host_slave_name, owner_pid);
+        self.controlling_index = Some(n);
+        n
+    }
+
+    /// The controlling-terminal pts index, if interactive (`-t`).
+    pub fn controlling(&self) -> Option<u32> {
+        self.controlling_index
     }
 
     /// Record a freshly-opened pty's slave name and the pid that opened the

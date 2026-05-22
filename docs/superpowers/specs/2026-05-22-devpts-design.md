@@ -29,13 +29,13 @@ as fds 0/1/2, and relays bytes between the user's terminal and the pty master
   has no guest `/dev/pts/N` name and `/dev/tty` isn't wired. `isatty` works;
   name-resolution doesn't. Fixing requires backing fds 0/1/2 with real
   `PtySlave` `OpenDescription`s (+ a `/dev/tty` node) instead of bare `dup2`.
-- **Live `SIGWINCH` resize unconfirmed.** Initial size propagates; a live resize
-  was not observed to propagate in the test harness (which sends `os.kill(pid,
-  SIGWINCH)` rather than a real terminal's process-group resize). carrick's
-  `host_signal` installs only a SIGINT handler (does NOT clobber the relay's
-  SIGWINCH handler), so the cause is likely a thread signal-mask interaction or a
-  harness artifact. Needs confirmation at a real terminal, or a follow-up to
-  ensure SIGWINCH reaches the relay thread.
+- **Live `SIGWINCH` resize — FIXED (db76830).** Root-caused via dtrace: the
+  relay's SIGWINCH handler does NOT fire in carrick's HVF context (the vCPU
+  threads run with signals effectively masked), BUT the kernel keeps the
+  inherited terminal fd's winsize current (`TIOCGWINSZ` returns the live size).
+  So the relay now polls every 250ms and re-reads the terminal size, propagating
+  `TIOCSWINSZ` to the guest pty master on change — signal-independent and robust.
+  Verified end-to-end: resizing updates the guest's `stty size`.
 - **Job control (Ctrl-C):** the stdio pgrp ioctls passthrough to the host tty
   (PB7), and guest pgrps are real macOS pgrps, so the mechanism is in place;
   full Ctrl-C-in-`bash` behavior is a manual check (the plan's PB9 step 1) not

@@ -934,6 +934,8 @@ kernel_abi!(
 pub const LINUX_EPERM: i32 = 1;
 pub const LINUX_ENOENT: i32 = 2;
 pub const LINUX_ESRCH: i32 = 3;
+/// No such device or address — e.g. `open("/dev/tty")` with no controlling tty.
+pub const LINUX_ENXIO: i32 = 6;
 pub const LINUX_EBADF: i32 = 9;
 pub const LINUX_ECHILD: i32 = 10;
 pub const LINUX_EAGAIN: i32 = 11;
