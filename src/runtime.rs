@@ -459,15 +459,32 @@ where
                 frame.x8, frame.x0, frame.x1, frame.x2, frame.x3, frame.x4, frame.x5
             );
         }
-        let outcome = dispatcher.dispatch(
-            SyscallRequest::from_aarch64_frame(frame),
-            runtime,
-            &mut reporter,
-        )?;
+        // Service blocking I/O (WaitOnFds) by waiting WITHOUT re-entering the
+        // dispatcher's blocking path: poll the host fds, then re-dispatch on
+        // readiness (single-threaded, so no lock contention, but the same code
+        // path keeps semantics identical across runtimes).
+        let outcome = loop {
+            let oc = dispatcher.dispatch(
+                SyscallRequest::from_aarch64_frame(frame),
+                runtime,
+                &mut reporter,
+            )?;
+            match oc {
+                DispatchOutcome::WaitOnFds { fds, timeout } => match wait_on_host_fds(&fds, timeout) {
+                    FdWaitResult::Ready => continue,
+                    FdWaitResult::TimedOut => break DispatchOutcome::Returned { value: 0 },
+                    FdWaitResult::Interrupted => {
+                        break DispatchOutcome::Errno { errno: crate::linux_abi::LINUX_EINTR }
+                    }
+                },
+                other => break other,
+            }
+        };
 
         let mut last_syscall_retval: Option<i64> = None;
 
         match outcome {
+            DispatchOutcome::WaitOnFds { .. } => unreachable!("serviced by the wait loop above"),
             DispatchOutcome::Exit { code } => {
                 crate::probes::guest_exit(code);
                 if runtime.is_forked_child() {
@@ -723,24 +740,42 @@ fn run_vcpu_until_exit(
             );
         }
 
-        // ---- syscall service: kernel lock held ----
-        let outcome = {
-            #[allow(clippy::expect_used)]
-            let mut k = kernel.0.lock().expect("kernel lock poisoned");
-            let KernelState { dispatcher, reporter } = &mut *k;
-            dispatcher.dispatch_threaded(
-                SyscallRequest::from_aarch64_frame(frame),
-                &mut engine,
-                reporter,
-                this_tid,
-                &registry,
-                &futex,
-            )?
+        // ---- syscall service: kernel lock held ONLY during dispatch ----
+        // A blocking-mode I/O syscall returns WaitOnFds; we then wait on the
+        // host fds with the lock RELEASED (the block above dropped it) so
+        // sibling threads run — the whole point of fixing the big kernel lock.
+        // On readiness we re-dispatch (re-take the lock briefly); on timeout /
+        // signal we synthesize the terminal outcome.
+        let outcome = loop {
+            let oc = {
+                #[allow(clippy::expect_used)]
+                let mut k = kernel.0.lock().expect("kernel lock poisoned");
+                let KernelState { dispatcher, reporter } = &mut *k;
+                dispatcher.dispatch_threaded(
+                    SyscallRequest::from_aarch64_frame(frame),
+                    &mut engine,
+                    reporter,
+                    this_tid,
+                    &registry,
+                    &futex,
+                )?
+            };
+            match oc {
+                DispatchOutcome::WaitOnFds { fds, timeout } => match wait_on_host_fds(&fds, timeout) {
+                    FdWaitResult::Ready => continue,
+                    FdWaitResult::TimedOut => break DispatchOutcome::Returned { value: 0 },
+                    FdWaitResult::Interrupted => {
+                        break DispatchOutcome::Errno { errno: crate::linux_abi::LINUX_EINTR }
+                    }
+                },
+                other => break other,
+            }
         };
 
         let mut last_syscall_retval: Option<i64> = None;
 
         match outcome {
+            DispatchOutcome::WaitOnFds { .. } => unreachable!("serviced by the wait loop above"),
             DispatchOutcome::Exit { code } => {
                 // A forked child process (real macOS fork) exits via _exit so
                 // the rebuilt HVF context doesn't run the panicky Drops, and
@@ -1045,6 +1080,53 @@ struct PendingSignalAction {
 /// an `exit_group(code)`). Returns `Ok(Some(...))` with
 /// `exit_code: None` when the handler was injected (or the signal was
 /// SIG_IGN'd) and the vCPU should resume.
+/// Result of waiting on host-fd readiness for a blocking I/O syscall.
+enum FdWaitResult {
+    Ready,
+    TimedOut,
+    Interrupted,
+}
+
+/// Block until one of `fds` is ready, `timeout` elapses, or a signal becomes
+/// pending. The CALLER must NOT hold the kernel lock (this is the whole point —
+/// a blocking wait under the BKL starves every sibling thread). Uses real
+/// `libc::poll` so siblings run freely, re-checking the pending-signal flag
+/// each slice so even an indefinite wait stays signal-interruptible. The runtime
+/// re-dispatches the syscall on `Ready`, completes with 0 on `TimedOut`, or with
+/// -EINTR on `Interrupted`.
+fn wait_on_host_fds(fds: &[(i32, i16)], timeout: Option<std::time::Duration>) -> FdWaitResult {
+    use std::time::Instant;
+    const SLICE_MS: i32 = 50;
+    let deadline = timeout.map(|d| Instant::now() + d);
+    let mut pollfds: Vec<libc::pollfd> = fds
+        .iter()
+        .map(|&(fd, events)| libc::pollfd { fd, events, revents: 0 })
+        .collect();
+    loop {
+        if crate::host_signal::has_pending() {
+            return FdWaitResult::Interrupted;
+        }
+        let slice_ms = match deadline {
+            Some(dl) => {
+                let now = Instant::now();
+                if now >= dl {
+                    return FdWaitResult::TimedOut;
+                }
+                (dl - now).as_millis().min(SLICE_MS as u128) as i32
+            }
+            None => SLICE_MS,
+        };
+        let n = unsafe {
+            libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, slice_ms)
+        };
+        if n > 0 {
+            return FdWaitResult::Ready;
+        }
+        // n < 0 (EINTR from a host signal) or n == 0 (slice elapsed): loop and
+        // re-check the pending-signal flag and the deadline.
+    }
+}
+
 fn deliver_pending_signal<T>(
     trap: &mut T,
     dispatcher: &mut SyscallDispatcher,
@@ -1259,15 +1341,28 @@ where
 
     for traps in 1..=max_traps {
         let frame = trap.next_syscall()?;
-        let outcome = dispatcher.dispatch(
-            SyscallRequest::from_aarch64_frame(frame),
-            memory,
-            &mut reporter,
-        )?;
+        let outcome = loop {
+            let oc = dispatcher.dispatch(
+                SyscallRequest::from_aarch64_frame(frame),
+                memory,
+                &mut reporter,
+            )?;
+            match oc {
+                DispatchOutcome::WaitOnFds { fds, timeout } => match wait_on_host_fds(&fds, timeout) {
+                    FdWaitResult::Ready => continue,
+                    FdWaitResult::TimedOut => break DispatchOutcome::Returned { value: 0 },
+                    FdWaitResult::Interrupted => {
+                        break DispatchOutcome::Errno { errno: crate::linux_abi::LINUX_EINTR }
+                    }
+                },
+                other => break other,
+            }
+        };
 
         let mut last_syscall_retval: Option<i64> = None;
 
         match outcome {
+            DispatchOutcome::WaitOnFds { .. } => unreachable!("serviced by the wait loop above"),
             DispatchOutcome::Exit { code } => {
                 if trap.is_forked_child() {
                     forked_child_exit(code, dispatcher.stdout(), dispatcher.stderr());
