@@ -406,7 +406,6 @@ fn main() -> anyhow::Result<()> {
             fs,
             command,
         } => {
-            let _ = tty; // wired in Phase B Task 6
             let image = ImageReference::parse(&image)?;
             let command = if command.is_empty() {
                 vec!["/bin/sh".to_owned()]
@@ -481,18 +480,44 @@ fn main() -> anyhow::Result<()> {
                     dispatcher.set_executable_path(executable_path.clone());
                     seed_known_hosts(&mut host);
                     let _ = dispatcher.set_fs_backend(Box::new(host));
-                    if raw {
+                    // Interactive pty: hand the guest the pty slave as fds 0/1/2 and
+                    // relay the master <-> the user's real terminal.
+                    let _relay_guard = if tty {
+                        // Duplicate the real terminal fds so dup2(slave,0/1/2) doesn't
+                        // clobber the relay's view of the user's terminal.
+                        // SAFETY: dup of standard fds.
+                        let real_in = unsafe { libc::dup(0) };
+                        let real_out = unsafe { libc::dup(1) };
+                        let relay = carrick::pty_relay::PtyRelay::start(real_in, real_out)
+                            .context("failed to allocate interactive pty")?;
+                        let slave = relay.slave_fd();
+                        // SAFETY: redirect guest stdio to the pty slave.
+                        unsafe {
+                            libc::dup2(slave, 0);
+                            libc::dup2(slave, 1);
+                            libc::dup2(slave, 2);
+                        }
                         dispatcher.set_stream_stdio(true);
-                    }
-                    run_elf_from_dispatcher_debug(
+                        Some(relay)
+                    } else {
+                        if raw { dispatcher.set_stream_stdio(true); }
+                        None
+                    };
+                    // Capture the run result WITHOUT `?` so that relay.stop()
+                    // always runs — even if the guest errors — keeping the
+                    // terminal out of raw mode on the error path.
+                    let run_result = run_elf_from_dispatcher_debug(
                         executable_path.as_str(),
                         dispatcher,
                         command.clone(),
                         env,
                         max_traps,
                         debug_state_path.as_ref(),
-                    )
-                    .with_context(|| {
+                    );
+                    if let Some(relay) = _relay_guard {
+                        relay.stop();
+                    }
+                    run_result.with_context(|| {
                         format!(
                             "failed to run ELF {} from image {} (--fs host)",
                             executable_path,
@@ -509,10 +534,33 @@ fn main() -> anyhow::Result<()> {
                         executable_path.clone(),
                     );
                     install_fs_backend(&mut dispatcher, Some(FsBackendKind::Memory))?;
-                    if raw {
+                    // Interactive pty: hand the guest the pty slave as fds 0/1/2 and
+                    // relay the master <-> the user's real terminal.
+                    let _relay_guard = if tty {
+                        // Duplicate the real terminal fds so dup2(slave,0/1/2) doesn't
+                        // clobber the relay's view of the user's terminal.
+                        // SAFETY: dup of standard fds.
+                        let real_in = unsafe { libc::dup(0) };
+                        let real_out = unsafe { libc::dup(1) };
+                        let relay = carrick::pty_relay::PtyRelay::start(real_in, real_out)
+                            .context("failed to allocate interactive pty")?;
+                        let slave = relay.slave_fd();
+                        // SAFETY: redirect guest stdio to the pty slave.
+                        unsafe {
+                            libc::dup2(slave, 0);
+                            libc::dup2(slave, 1);
+                            libc::dup2(slave, 2);
+                        }
                         dispatcher.set_stream_stdio(true);
-                    }
-                    run_rootfs_elf_with_hvf_args_and_dispatcher_debug(
+                        Some(relay)
+                    } else {
+                        if raw { dispatcher.set_stream_stdio(true); }
+                        None
+                    };
+                    // Capture the run result WITHOUT `?` so that relay.stop()
+                    // always runs — even if the guest errors — keeping the
+                    // terminal out of raw mode on the error path.
+                    let run_result = run_rootfs_elf_with_hvf_args_and_dispatcher_debug(
                         executable_path.as_str(),
                         &rootfs,
                         dispatcher,
@@ -520,8 +568,11 @@ fn main() -> anyhow::Result<()> {
                         env,
                         max_traps,
                         debug_state_path.as_ref(),
-                    )
-                    .with_context(|| {
+                    );
+                    if let Some(relay) = _relay_guard {
+                        relay.stop();
+                    }
+                    run_result.with_context(|| {
                         format!(
                             "failed to run ELF {} from image {} (--fs memory)",
                             executable_path,
@@ -531,7 +582,15 @@ fn main() -> anyhow::Result<()> {
                 }
             };
 
-            if raw {
+            if tty {
+                // Guest output already went to the terminal via the relay;
+                // the stdout/stderr buffers are empty under stream_stdio.
+                std::process::exit(if result.trap_limit_hit {
+                    1
+                } else {
+                    result.exit_code
+                });
+            } else if raw {
                 emit_raw(&result);
                 std::process::exit(if result.trap_limit_hit {
                     1
