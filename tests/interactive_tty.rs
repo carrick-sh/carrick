@@ -152,6 +152,48 @@ fn interactive_run_provides_a_working_pty() {
 
 #[test]
 #[ignore]
+fn interactive_ctrl_c_interrupts_foreground_command() {
+    let Some(bin) = signed_bin() else { return };
+    let (master, slave) = open_pty();
+    let mut child = spawn_run_t(bin, slave, &["/bin/sh"]);
+    set_nonblocking(master);
+
+    std::thread::sleep(Duration::from_secs(20)); // boot
+    // Start a long sleep, then send Ctrl-C (0x03). The pty line discipline must
+    // turn it into SIGINT for the foreground process group, killing the sleep.
+    let w = |b: &[u8]| unsafe {
+        libc::write(master, b.as_ptr().cast(), b.len());
+    };
+    w(b"sleep 40\n");
+    std::thread::sleep(Duration::from_secs(1));
+    w(b"\x03"); // Ctrl-C
+    std::thread::sleep(Duration::from_secs(1));
+    // Probe with COMPUTED output: the line discipline echoes the typed bytes
+    // "echo B$((20+22))" but only an executing shell prints "B42". If Ctrl-C
+    // failed, the shell is still blocked in `sleep 40` and B42 never appears
+    // within the deadline.
+    w(b"echo B$((20+22))\n");
+    let mut out = Vec::new();
+    read_until(master, &mut out, 8, |o| o.windows(3).any(|x| x == b"B42"));
+
+    let _ = child.kill();
+    let _ = child.wait();
+    unsafe { libc::close(master) };
+
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        !text.contains("GUEST ABORT") && !text.contains("panicked"),
+        "Ctrl-C must not crash a guest process. Output:\n{text}"
+    );
+    assert!(
+        text.contains("B42"),
+        "Ctrl-C should interrupt `sleep 40` so the shell runs the next command \
+         (expected computed output B42). Output:\n{text}"
+    );
+}
+
+#[test]
+#[ignore]
 fn interactive_run_resolves_ttyname_dev_tty_and_resize() {
     let Some(bin) = signed_bin() else { return };
     let (master, slave) = open_pty();

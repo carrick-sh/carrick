@@ -239,6 +239,61 @@ enum RootfsCommand {
 /// Async work (image pulls, summary reads) runs inside a short-lived
 /// current-thread runtime that drops before the trap loop even begins,
 /// so by the time fork can fire there is no tokio state to break.
+/// Wire up guest stdio for a run.
+///
+/// For an interactive `-t` run this allocates a host pty, hands the slave to
+/// the guest as fds 0/1/2, and starts the relay between the pty master and the
+/// user's real terminal. For a non-interactive `--raw` run it just enables
+/// streaming.
+///
+/// Returns the relay guard, which must be kept alive for the duration of the
+/// run and `stop()`ped afterwards so the terminal leaves raw mode.
+///
+/// Job control: we `setsid()` + `TIOCSCTTY` so the pty becomes our session's
+/// controlling terminal. This is what lets the host pty line discipline deliver
+/// SIGINT/SIGQUIT (Ctrl-C / Ctrl-\) to the guest's foreground process group at
+/// all, and lets the guest shell's `tcsetpgrp()` succeed (bg/fg job control).
+/// setsid() fails harmlessly if we are already a session leader; the relay
+/// reads the user's real terminal through the dup'd fds below, which are
+/// independent of controlling-terminal status, so detaching from the launching
+/// terminal is safe under -t. (Signal delivery into a sleeping guest is handled
+/// by `host_sleep_interruptible` in dispatch::time, which returns EINTR rather
+/// than the std::thread::sleep that used to panic forked children on Ctrl-C.)
+fn setup_interactive_stdio(
+    dispatcher: &mut SyscallDispatcher,
+    tty: bool,
+    raw: bool,
+) -> anyhow::Result<Option<carrick::pty_relay::PtyRelay>> {
+    if !tty {
+        if raw {
+            dispatcher.set_stream_stdio(true);
+        }
+        return Ok(None);
+    }
+    // Duplicate the real terminal fds so dup2(slave,0/1/2) doesn't clobber the
+    // relay's view of the user's terminal.
+    // SAFETY: dup of standard fds.
+    let real_in = unsafe { libc::dup(0) };
+    let real_out = unsafe { libc::dup(1) };
+    let relay = carrick::pty_relay::PtyRelay::start(real_in, real_out)
+        .context("failed to allocate interactive pty")?;
+    let slave = relay.slave_fd();
+    // SAFETY: redirect guest stdio to the pty slave, then adopt that pty as the
+    // controlling terminal of a fresh session (see the fn doc comment).
+    unsafe {
+        libc::dup2(slave, 0);
+        libc::dup2(slave, 1);
+        libc::dup2(slave, 2);
+        libc::setsid();
+        libc::ioctl(slave, libc::TIOCSCTTY as libc::c_ulong, 0);
+    }
+    dispatcher.set_stream_stdio(true);
+    // Register the pty as the guest's controlling terminal so /dev/tty and
+    // /proc/self/fd/{0,1,2} resolve to /dev/pts/N.
+    dispatcher.register_controlling_pty(relay.slave_name().to_string());
+    Ok(Some(relay))
+}
+
 fn main() -> anyhow::Result<()> {
     // Ignore SIGPIPE in the host so a guest writing to a closed
     // pipe end (eg `ls | head` after head exits) gets EPIPE from
@@ -501,34 +556,9 @@ fn main() -> anyhow::Result<()> {
                     dispatcher.set_executable_path(executable_path.clone());
                     seed_known_hosts(&mut host);
                     let _ = dispatcher.set_fs_backend(Box::new(host));
-                    // Interactive pty: hand the guest the pty slave as fds 0/1/2 and
-                    // relay the master <-> the user's real terminal.
-                    let _relay_guard = if tty {
-                        // Duplicate the real terminal fds so dup2(slave,0/1/2) doesn't
-                        // clobber the relay's view of the user's terminal.
-                        // SAFETY: dup of standard fds.
-                        let real_in = unsafe { libc::dup(0) };
-                        let real_out = unsafe { libc::dup(1) };
-                        let relay = carrick::pty_relay::PtyRelay::start(real_in, real_out)
-                            .context("failed to allocate interactive pty")?;
-                        let slave = relay.slave_fd();
-                        // SAFETY: redirect guest stdio to the pty slave.
-                        unsafe {
-                            libc::dup2(slave, 0);
-                            libc::dup2(slave, 1);
-                            libc::dup2(slave, 2);
-                        }
-                        dispatcher.set_stream_stdio(true);
-                        // Register the pty as the guest's controlling terminal so
-                        // /dev/tty and /proc/self/fd/{0,1,2} resolve to /dev/pts/N.
-                        dispatcher.register_controlling_pty(relay.slave_name().to_string());
-                        Some(relay)
-                    } else {
-                        if raw {
-                            dispatcher.set_stream_stdio(true);
-                        }
-                        None
-                    };
+                    // Interactive pty (or --raw stream): hand the guest the pty
+                    // slave as fds 0/1/2 and relay master <-> the user's terminal.
+                    let _relay_guard = setup_interactive_stdio(&mut dispatcher, tty, raw)?;
                     // Capture the run result WITHOUT `?` so that relay.stop()
                     // always runs — even if the guest errors — keeping the
                     // terminal out of raw mode on the error path.
@@ -560,34 +590,9 @@ fn main() -> anyhow::Result<()> {
                         executable_path.clone(),
                     );
                     install_fs_backend(&mut dispatcher, Some(FsBackendKind::Memory))?;
-                    // Interactive pty: hand the guest the pty slave as fds 0/1/2 and
-                    // relay the master <-> the user's real terminal.
-                    let _relay_guard = if tty {
-                        // Duplicate the real terminal fds so dup2(slave,0/1/2) doesn't
-                        // clobber the relay's view of the user's terminal.
-                        // SAFETY: dup of standard fds.
-                        let real_in = unsafe { libc::dup(0) };
-                        let real_out = unsafe { libc::dup(1) };
-                        let relay = carrick::pty_relay::PtyRelay::start(real_in, real_out)
-                            .context("failed to allocate interactive pty")?;
-                        let slave = relay.slave_fd();
-                        // SAFETY: redirect guest stdio to the pty slave.
-                        unsafe {
-                            libc::dup2(slave, 0);
-                            libc::dup2(slave, 1);
-                            libc::dup2(slave, 2);
-                        }
-                        dispatcher.set_stream_stdio(true);
-                        // Register the pty as the guest's controlling terminal so
-                        // /dev/tty and /proc/self/fd/{0,1,2} resolve to /dev/pts/N.
-                        dispatcher.register_controlling_pty(relay.slave_name().to_string());
-                        Some(relay)
-                    } else {
-                        if raw {
-                            dispatcher.set_stream_stdio(true);
-                        }
-                        None
-                    };
+                    // Interactive pty (or --raw stream): hand the guest the pty
+                    // slave as fds 0/1/2 and relay master <-> the user's terminal.
+                    let _relay_guard = setup_interactive_stdio(&mut dispatcher, tty, raw)?;
                     // Capture the run result WITHOUT `?` so that relay.stop()
                     // always runs — even if the guest errors — keeping the
                     // terminal out of raw mode on the error path.
