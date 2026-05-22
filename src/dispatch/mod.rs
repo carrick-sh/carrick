@@ -1237,8 +1237,44 @@ impl SyscallDispatcher {
         let mut table = self.io.open_files.write();
         for fd in cloexec_fds {
             if let Some(open_file) = table.remove(&fd) {
-                close_open_file(&open_file);
+                // Drop the write lock before touching pty_table (a separate
+                // lock) so there is no lock-order issue: open_files write is
+                // released by removing the entry; we free the pty outside the
+                // map iteration. Here we inline the pty-check because the
+                // table write lock is already held and we need to release it
+                // before calling pty_table (different subsystem). We capture
+                // the index while we still have the OpenFile in hand, then
+                // free after the write lock is released below.
+                //
+                // Actually: the write lock is held for the duration of the
+                // loop, not per-iteration, but pty_table is a separate Mutex
+                // with no lock-ordering dependency on open_files, so calling
+                // self.close_open_file_and_free_pty here is safe.
+                self.close_open_file_and_free_pty(&open_file);
             }
+        }
+    }
+
+    /// Close `open_file`'s backing host fd AND, if it was the last reference
+    /// to a pty master this process owns, drop its `/dev/pts` entry. Use this
+    /// on every fd-close path (close, close_range, exec CLOEXEC sweep) so the
+    /// PtyTable never desyncs from the real fd lifetime.
+    pub(self) fn close_open_file_and_free_pty(&self, open_file: &OpenFile) {
+        let pty_master_index = if Arc::strong_count(&open_file.description) == 1 {
+            match &*open_file.description.read() {
+                OpenDescription::HostPipe {
+                    pty: Some(role), ..
+                } if role.is_master => Some(role.index),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        close_open_file(open_file);
+        if let Some(index) = pty_master_index {
+            self.pty_table()
+                .lock()
+                .free_if_owner(index, std::process::id());
         }
     }
 
@@ -2771,6 +2807,54 @@ fn write_synthetic_statx(
         size,
     };
     write_statx(memory, statxbuf, &metadata)
+}
+
+/// Like `write_synthetic_statx` but accepts an explicit `mode` word
+/// (S_IF* type bits | permission bits) instead of deriving it from a
+/// `RootFsEntryKind`. Used for fd types that don't map to a VFS kind,
+/// such as pty character devices (S_IFCHR) and anonymous pipes (S_IFIFO).
+fn write_synthetic_statx_mode(
+    memory: &mut impl GuestMemory,
+    statxbuf: u64,
+    path: &str,
+    size: usize,
+    mode: u32,
+) -> DispatchOutcome {
+    let zero_time = LinuxStatxTimestamp::zero();
+    let statx = LinuxStatx {
+        stx_mask: LINUX_STATX_BASIC_STATS,
+        stx_blksize: LINUX_PAGE_SIZE as u32,
+        stx_attributes: 0,
+        stx_nlink: 1,
+        stx_uid: 0,
+        stx_gid: 0,
+        stx_mode: mode as u16,
+        __spare0: [0; 1],
+        stx_ino: inode_for_path(Path::new(path)),
+        stx_size: size as u64,
+        stx_blocks: blocks_512(size) as u64,
+        stx_attributes_mask: 0,
+        stx_atime: zero_time,
+        stx_btime: zero_time,
+        stx_ctime: zero_time,
+        stx_mtime: zero_time,
+        stx_rdev_major: 0,
+        stx_rdev_minor: 0,
+        stx_dev_major: 0,
+        stx_dev_minor: 1,
+        stx_mnt_id: 1,
+        stx_dio_mem_align: 0,
+        stx_dio_offset_align: 0,
+        stx_subvol: 0,
+        stx_atomic_write_unit_min: 0,
+        stx_atomic_write_unit_max: 0,
+        stx_atomic_write_segments_max: 0,
+        stx_dio_read_offset_align: 0,
+        stx_atomic_write_unit_max_opt: 0,
+        __spare2: [0; 1],
+        __spare3: [0; 8],
+    };
+    write_kernel_struct(memory, statxbuf, &statx)
 }
 
 /// Minimal view of the dispatcher needed by the synthetic /proc
