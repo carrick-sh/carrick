@@ -943,11 +943,7 @@ impl SyscallDispatcher {
         // If this fd is a pty master or slave, handle all tty ioctls here by
         // passing through to the host fd (real macOS pty). Return early so the
         // stdio-gated arms below never run for pty fds.
-        if let Some(role) = self.pty_role(fd) {
-            let host_fd = match self.pty_host_fd(fd) {
-                Some(h) => h,
-                None => return Ok(DispatchOutcome::Errno { errno: LINUX_ENOTTY }),
-            };
+        if let Some((role, host_fd)) = self.pty_info(fd) {
             return Ok(match ioctl_request {
                 LINUX_TIOCGPTN => {
                     write_packed(&mut *ctx.memory, arg, &role.index.to_le_bytes())
@@ -999,8 +995,16 @@ impl SyscallDispatcher {
                             ws.ws_xpixel = u16::from_le_bytes([b[4], b[5]]);
                             ws.ws_ypixel = u16::from_le_bytes([b[6], b[7]]);
                             // SAFETY: host_fd is our live pty fd; &ws is valid.
-                            unsafe { libc::ioctl(host_fd, libc::TIOCSWINSZ as libc::c_ulong, &ws) };
-                            DispatchOutcome::Returned { value: 0 }
+                            let r = unsafe { libc::ioctl(host_fd, libc::TIOCSWINSZ as libc::c_ulong, &ws) };
+                            if r < 0 {
+                                DispatchOutcome::Errno {
+                                    errno: crate::dispatch::macos_to_linux_errno(
+                                        unsafe { *libc::__error() },
+                                    ),
+                                }
+                            } else {
+                                DispatchOutcome::Returned { value: 0 }
+                            }
                         }
                         Err(_) => DispatchOutcome::Errno { errno: LINUX_EFAULT },
                     }
@@ -1219,18 +1223,11 @@ impl SyscallDispatcher {
         }
     }
 
-    /// Returns the `PtyRole` for `fd` if it is a pty master or slave fd.
-    fn pty_role(&self, fd: i32) -> Option<crate::vfs::PtyRole> {
+    /// If `fd` is a pty master/slave end, return its role and the backing
+    /// host fd in one fd-table lookup.
+    fn pty_info(&self, fd: i32) -> Option<(crate::vfs::PtyRole, i32)> {
         self.open_file(fd).and_then(|of| match &*of.description.read() {
-            OpenDescription::HostPipe { pty, .. } => *pty,
-            _ => None,
-        })
-    }
-
-    /// Returns the host fd for `fd` if it is a pty master or slave fd.
-    fn pty_host_fd(&self, fd: i32) -> Option<i32> {
-        self.open_file(fd).and_then(|of| match &*of.description.read() {
-            OpenDescription::HostPipe { host_fd, pty: Some(_), .. } => Some(*host_fd),
+            OpenDescription::HostPipe { host_fd, pty: Some(role), .. } => Some((*role, *host_fd)),
             _ => None,
         })
     }
