@@ -229,7 +229,9 @@ impl RootFsVfs {
         };
         match rootfs_metadata {
             Some(metadata) => match metadata.kind {
-                RootFsEntryKind::File => {
+                // CharDevice never occurs in the / rootfs (only via /dev mounts);
+                // treat like a regular file for the unreachable case.
+                RootFsEntryKind::File | RootFsEntryKind::CharDevice => {
                     if want_create && want_excl {
                         return Err(LINUX_EEXIST);
                     }
@@ -328,7 +330,9 @@ impl RootFsVfs {
                 .and_then(|r| r.symlink_metadata(from).ok())
             {
                 Some(md) => match md.kind {
-                    RootFsEntryKind::File | RootFsEntryKind::Symlink => {
+                    RootFsEntryKind::File
+                    | RootFsEntryKind::Symlink
+                    | RootFsEntryKind::CharDevice => {
                         // INVARIANT: this arm is reached only via the
                         // `self.rootfs.as_ref().and_then(..symlink_metadata..)`
                         // match above, which already proved rootfs is Some.
@@ -392,7 +396,7 @@ impl RootFsVfs {
         // (rootfs-only entry). Materialise the destination, then
         // tombstone the rootfs source.
         match src_kind {
-            RootFsEntryKind::File | RootFsEntryKind::Symlink => {
+            RootFsEntryKind::File | RootFsEntryKind::Symlink | RootFsEntryKind::CharDevice => {
                 self.overlay
                     .set_file_contents(to, src_contents.unwrap_or_default())
                     .map_err(|_| LINUX_EINVAL)?;
@@ -499,6 +503,7 @@ impl Vfs for RootFsVfs {
                 RootFsEntryKind::File => EntryKind::File,
                 RootFsEntryKind::Directory => EntryKind::Directory,
                 RootFsEntryKind::Symlink => EntryKind::Symlink,
+                RootFsEntryKind::CharDevice => EntryKind::CharDevice,
             },
             mode: md.mode,
             size: md.size as u64,
@@ -598,6 +603,7 @@ impl Vfs for RootFsVfs {
                         RootFsEntryKind::File => EntryKind::File,
                         RootFsEntryKind::Directory => EntryKind::Directory,
                         RootFsEntryKind::Symlink => EntryKind::Symlink,
+                        RootFsEntryKind::CharDevice => EntryKind::CharDevice,
                     },
                 })
                 .collect()),

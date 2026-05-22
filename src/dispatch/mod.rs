@@ -45,6 +45,7 @@ use crate::linux_abi::{
     LINUX_CLOCK_THREAD_CPUTIME_ID,
     LINUX_DEFAULT_UMASK,
     LINUX_DIRENT64_HEADER_SIZE,
+    LINUX_DT_CHR,
     LINUX_DT_DIR,
     LINUX_DT_LNK,
     LINUX_DT_REG,
@@ -3765,6 +3766,7 @@ fn linux_mode(metadata: &RootFsMetadata) -> u32 {
         RootFsEntryKind::File => LINUX_S_IFREG,
         RootFsEntryKind::Directory => LINUX_S_IFDIR,
         RootFsEntryKind::Symlink => LINUX_S_IFLNK,
+        RootFsEntryKind::CharDevice => LINUX_S_IFCHR,
     };
     kind | (metadata.mode & 0o7777)
 }
@@ -3886,6 +3888,7 @@ fn linux_dirent_type(kind: RootFsEntryKind) -> u8 {
         RootFsEntryKind::File => LINUX_DT_REG,
         RootFsEntryKind::Directory => LINUX_DT_DIR,
         RootFsEntryKind::Symlink => LINUX_DT_LNK,
+        RootFsEntryKind::CharDevice => LINUX_DT_CHR,
     }
 }
 
@@ -4014,25 +4017,11 @@ fn vfs_md_to_rootfs_md(path: &str, md: &crate::vfs::Metadata) -> RootFsMetadata 
             crate::vfs::EntryKind::File => RootFsEntryKind::File,
             crate::vfs::EntryKind::Directory => RootFsEntryKind::Directory,
             crate::vfs::EntryKind::Symlink => RootFsEntryKind::Symlink,
-            crate::vfs::EntryKind::CharDevice => RootFsEntryKind::File,
+            crate::vfs::EntryKind::CharDevice => RootFsEntryKind::CharDevice,
         },
         mode: md.mode,
         size: md.size as usize,
     }
-}
-
-/// Build a `st_mode` from a VFS-mount `EntryKind` + permission bits. Used by
-/// stat-by-path so VFS-mount nodes report the right `S_IF*` type — notably
-/// `S_IFCHR` for `/dev/ptmx`, `/dev/pts/N`, `/dev/tty` so `ttyname(3)`'s
-/// "is this a character device?" check passes.
-pub(super) fn vfs_entry_kind_mode(kind: crate::vfs::EntryKind, mode: u32) -> u32 {
-    let ifmt = match kind {
-        crate::vfs::EntryKind::File => LINUX_S_IFREG,
-        crate::vfs::EntryKind::Directory => LINUX_S_IFDIR,
-        crate::vfs::EntryKind::Symlink => LINUX_S_IFLNK,
-        crate::vfs::EntryKind::CharDevice => LINUX_S_IFCHR,
-    };
-    ifmt | (mode & 0o7777)
 }
 
 pub(crate) fn host_errno() -> i32 {
