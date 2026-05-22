@@ -71,6 +71,7 @@ impl FsState {
             vfs_mounts: {
                 let mut m = crate::vfs::VfsMounts::new();
                 m.mount("/dev", Box::new(crate::vfs::DevVfs::new(std::sync::Arc::clone(&pty_table))));
+                m.mount("/dev/pts", Box::new(crate::vfs::DevptsVfs::new(std::sync::Arc::clone(&pty_table))));
                 m.mount("/proc", Box::new(crate::vfs::ProcVfs::new()));
                 m.mount("/sys", Box::new(crate::vfs::SysVfs::new()));
                 m
