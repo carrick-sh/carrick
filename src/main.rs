@@ -933,10 +933,14 @@ fn seed_known_hosts(backend: &mut dyn carrick::fs_backend::FsBackend) {
 /// scratch root sits on a case-insensitive filesystem (a common
 /// macOS default that breaks anything assuming Linux semantics).
 fn default_fs_backend_kind() -> FsBackendKind {
-    let probe = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|h| h.join(".carrick").join("scratch"))
-        .unwrap_or_else(|| std::env::temp_dir().join("carrick-scratch"));
+    // Probe the SAME scratch root the host backend will actually use
+    // (`preferred_scratch_root` prefers the dedicated case-sensitive
+    // `/Volumes/carrick` volume), not a hardcoded `~/.carrick/scratch`.
+    // Otherwise the decision and the real scratch location disagree: the
+    // dedicated volume can be case-sensitive while `~/.carrick` is not, and we
+    // would wrongly fall back to the in-memory backend.
+    let probe = carrick::apfs::preferred_scratch_root()
+        .unwrap_or_else(|_| std::env::temp_dir().join("carrick-scratch"));
     if std::fs::create_dir_all(&probe).is_err() {
         return FsBackendKind::Memory;
     }
