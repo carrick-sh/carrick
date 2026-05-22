@@ -549,11 +549,16 @@ impl SyscallDispatcher {
                     revents: 0,
                 })
                 .collect();
+            // NON-BLOCKING probe (timeout 0): we must NEVER block here — this
+            // runs while holding the big kernel lock, and blocking would starve
+            // every sibling thread (the GIL handoff, a server's workers). If
+            // nothing is ready and the guest asked to wait, hand off to the
+            // runtime via WaitOnFds, which waits with the lock RELEASED.
             let n = unsafe {
                 libc::poll(
                     sys_pollfds.as_mut_ptr(),
                     sys_pollfds.len() as libc::nfds_t,
-                    timeout_ms,
+                    0,
                 )
             };
             if n < 0 {
@@ -568,13 +573,27 @@ impl SyscallDispatcher {
                 if pollfd.revents != 0 {
                     ready += 1;
                 }
+                // Always write back (zeroed revents on a not-ready probe) so a
+                // later timeout completion needs no further writes.
                 if write_kernel_struct_raw(memory, addresses[i], &pollfd).is_err() {
                     return Ok(DispatchOutcome::Errno {
                         errno: LINUX_EFAULT,
                     });
                 }
             }
-            return Ok(DispatchOutcome::Returned { value: ready });
+            if ready > 0 || timeout_ms == 0 {
+                return Ok(DispatchOutcome::Returned { value: ready });
+            }
+            let timeout = if timeout_ms < 0 {
+                None
+            } else {
+                Some(std::time::Duration::from_millis(timeout_ms as u64))
+            };
+            let wait_fds: Vec<(i32, i16)> = sys_pollfds
+                .iter()
+                .map(|p| (p.fd, p.events))
+                .collect();
+            return Ok(DispatchOutcome::WaitOnFds { fds: wait_fds, timeout });
         }
 
         // Mixed / synthetic fds: fall back to the per-fd readiness check
