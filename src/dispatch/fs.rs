@@ -4995,10 +4995,14 @@ impl SyscallDispatcher {
         if let Some(m) = self.fs.vfs_mounts.resolve(&path)
             && let Ok(md) = m.vfs.lookup(&m.full_path)
         {
-            return Ok(write_stat(
+            // Map EntryKind to S_IF* — crucially S_IFCHR for char devices so
+            // ttyname(3)'s chardev check on /dev/pts/N passes.
+            return Ok(write_synthetic_stat(
                 memory,
                 statbuf,
-                &vfs_md_to_rootfs_md(&path, &md),
+                &path,
+                md.size as usize,
+                vfs_entry_kind_mode(md.kind, md.mode),
             ));
         }
         // Layered overlay+rootfs lookup via RootFsVfs. Honour
@@ -5082,10 +5086,12 @@ impl SyscallDispatcher {
         if let Some(m) = self.fs.vfs_mounts.resolve(&path)
             && let Ok(md) = m.vfs.lookup(&m.full_path)
         {
-            return Ok(write_statx(
+            return Ok(write_synthetic_statx_mode(
                 memory,
                 statxbuf,
-                &vfs_md_to_rootfs_md(&path, &md),
+                &path,
+                md.size as usize,
+                vfs_entry_kind_mode(md.kind, md.mode),
             ));
         }
         // Fallback for backends without real_stat (e.g. the in-memory
@@ -5187,11 +5193,23 @@ impl SyscallDispatcher {
                 // sendfile fast path) or a TTY/pipe (default cooked
                 // path). Synthesize a character-device stat so they
                 // pick the right branch instead of bailing EBADF.
-                let label = match fd {
-                    0 => "/dev/stdin",
-                    1 => "/dev/stdout",
-                    _ => "/dev/stderr",
+                // When this stdio fd is the `carrick run -t` controlling tty,
+                // label it `/dev/pts/N` so its synthetic st_ino matches
+                // `stat("/dev/pts/N")` — the equality `ttyname(3)` checks
+                // between fstat(fd) and stat(readlink-target).
+                let label: String = if crate::host_tty::host_isatty(fd)
+                    && let Some(n) = self.pty_table().lock().controlling()
+                {
+                    format!("/dev/pts/{n}")
+                } else {
+                    match fd {
+                        0 => "/dev/stdin",
+                        1 => "/dev/stdout",
+                        _ => "/dev/stderr",
+                    }
+                    .to_string()
                 };
+                let label = label.as_str();
                 // Report the REAL type of whatever is wired to the guest's
                 // stdio. Under `--fs host`/`--raw` (stream_stdio) the guest's
                 // 0/1/2 are carrick's own host fds, so fstat the host fd and
