@@ -23,23 +23,32 @@ as fds 0/1/2, and relays bytes between the user's terminal and the pty master
 - Gates green: 148 lib tests (incl. `pty_relay`), 59 `syscall_fs`, 46 `cli`,
   38/38 conformance (no devpts regression), clippy unwrap-gate clean, fmt clean.
 
-**Known limitations (follow-ups, not blockers for the interactive-shell goal):**
-- **`ttyname()` / `tty(1)` / `/dev/tty`** do not resolve: the guest's fd 0 is a
-  bare host pty slave (the `dup2`-onto-0/1/2 strategy, design decision #2), so it
-  has no guest `/dev/pts/N` name and `/dev/tty` isn't wired. `isatty` works;
-  name-resolution doesn't. Fixing requires backing fds 0/1/2 with real
-  `PtySlave` `OpenDescription`s (+ a `/dev/tty` node) instead of bare `dup2`.
-- **Live `SIGWINCH` resize — FIXED (db76830).** Root-caused via dtrace: the
-  relay's SIGWINCH handler does NOT fire in carrick's HVF context (the vCPU
-  threads run with signals effectively masked), BUT the kernel keeps the
-  inherited terminal fd's winsize current (`TIOCGWINSZ` returns the live size).
-  So the relay now polls every 250ms and re-reads the terminal size, propagating
-  `TIOCSWINSZ` to the guest pty master on change — signal-independent and robust.
-  Verified end-to-end: resizing updates the guest's `stty size`.
-- **Job control (Ctrl-C):** the stdio pgrp ioctls passthrough to the host tty
-  (PB7), and guest pgrps are real macOS pgrps, so the mechanism is in place;
-  full Ctrl-C-in-`bash` behavior is a manual check (the plan's PB9 step 1) not
-  yet confirmed via automation.
+**Both original limitations are now FIXED** (verified by the comprehensive
+`#[ignore]` e2e in `tests/interactive_tty.rs`, run against the signed binary):
+
+- **`ttyname()` / `tty(1)` / `/dev/tty` — FIXED.** The `-t` pty is registered as
+  the guest's controlling terminal (`PtyTable::controlling_index` via
+  `SyscallDispatcher::register_controlling_pty`). `/dev/tty` opens that pts slave
+  (DevVfs, ENXIO when non-interactive); `stat`/`statx`/`newfstatat` now route
+  through the VFS mounts so `/dev/ptmx`, `/dev/pts/N`, `/dev/tty` resolve and
+  report **S_IFCHR** (`vfs_entry_kind_mode`); `readlinkat` maps
+  `/proc/self/fd/{0,1,2}` → `/dev/pts/N`; and the controlling-tty stdio `fstat`
+  labels itself `/dev/pts/N` so its `st_ino` matches `stat("/dev/pts/N")` — the
+  equality glibc `ttyname(3)` checks. `tty(1)` now prints `/dev/pts/0`.
+- **Live `SIGWINCH` resize — FIXED.** Root-caused via dtrace: the SIGWINCH
+  handler doesn't fire in carrick's HVF context (vCPU threads run with signals
+  effectively masked), BUT the kernel keeps the inherited terminal fd's winsize
+  current. So the relay polls every 250ms and re-reads the size, propagating
+  `TIOCSWINSZ` on change — signal-independent. Verified: resizing updates the
+  guest's `stty size`.
+
+**Remaining follow-ups (non-blocking):**
+- **Job control (Ctrl-C):** stdio pgrp ioctls passthrough to the host tty (PB7)
+  and guest pgrps are real macOS pgrps, so the mechanism is in place; full
+  Ctrl-C-in-`bash` is a manual check not yet confirmed via automation.
+- `write_fd_statx` lacks the stdio fast-path that `write_fd_stat` has, so
+  `statx(fd, AT_EMPTY_PATH)` on a controlling-tty stdio fd returns EBADF
+  (pre-existing; `ttyname`/`isatty` use `fstat`, which works).
 - `-t` is `run`-only; `shell`/`exec` are follow-ups.
 
 The original design and Phase A content follow.
