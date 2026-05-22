@@ -1146,7 +1146,22 @@ impl SyscallDispatcher {
             },
             LINUX_TIOCGPGRP => match self.tty_ioctl_fd_kind(fd) {
                 Ok(TtyFdKind::Stdio) => {
-                    write_packed(&mut *ctx.memory, arg, &LINUX_BOOTSTRAP_PGID.to_le_bytes())
+                    // Under `-t` fd 0/1/2 is a real pty slave: pass through to
+                    // the host line discipline so job control works correctly.
+                    // Guest pgrps are real macOS pgrps in carrick.
+                    if crate::host_tty::host_isatty(fd) {
+                        match crate::host_tty::host_tty_tcgetpgrp(fd) {
+                            Ok(pgrp) => {
+                                write_packed(&mut *ctx.memory, arg, &pgrp.to_le_bytes())
+                            }
+                            Err(raw_errno) => DispatchOutcome::Errno {
+                                errno: crate::dispatch::macos_to_linux_errno(raw_errno),
+                            },
+                        }
+                    } else {
+                        // Headless / non-tty fallback: synthesise bootstrap pgid.
+                        write_packed(&mut *ctx.memory, arg, &LINUX_BOOTSTRAP_PGID.to_le_bytes())
+                    }
                 }
                 Ok(TtyFdKind::Other) => DispatchOutcome::Errno {
                     errno: LINUX_ENOTTY,
@@ -1165,10 +1180,23 @@ impl SyscallDispatcher {
                         }
                     }
                     let pgid = i32::from_le_bytes(buf);
-                    if pgid == LINUX_BOOTSTRAP_PGID {
-                        DispatchOutcome::Returned { value: 0 }
+                    // Under `-t` fd 0/1/2 is a real pty slave: pass through so
+                    // the host line discipline tracks the foreground pgrp, enabling
+                    // Ctrl-C → SIGINT delivery to the correct guest pgrp.
+                    if crate::host_tty::host_isatty(fd) {
+                        match crate::host_tty::host_tty_tcsetpgrp(fd, pgid) {
+                            Ok(()) => DispatchOutcome::Returned { value: 0 },
+                            Err(raw_errno) => DispatchOutcome::Errno {
+                                errno: crate::dispatch::macos_to_linux_errno(raw_errno),
+                            },
+                        }
                     } else {
-                        DispatchOutcome::Errno { errno: LINUX_EPERM }
+                        // Headless fallback: accept the bootstrap pgid, EPERM others.
+                        if pgid == LINUX_BOOTSTRAP_PGID {
+                            DispatchOutcome::Returned { value: 0 }
+                        } else {
+                            DispatchOutcome::Errno { errno: LINUX_EPERM }
+                        }
                     }
                 }
                 Ok(TtyFdKind::Other) => DispatchOutcome::Errno {
