@@ -213,6 +213,23 @@ pub enum DispatchOutcome {
         addr: u64,
         timeout: Option<Duration>,
     },
+    /// A blocking-mode I/O syscall (ppoll/pselect/poll/select with no fd ready,
+    /// or — later — recvfrom/accept/read that would block) needs to wait for
+    /// host-fd readiness. Like `FutexWait`, the handler MUST NOT block while
+    /// holding the kernel lock — that starves every sibling thread (CPython's
+    /// GIL handoff, a server's worker threads, see the "big kernel lock"). It
+    /// returns this outcome; the runtime drops the lock, `libc::poll`s the host
+    /// fds (signal-interruptible) up to `timeout`, then either completes the
+    /// syscall (timeout → 0, signal → EINTR) or re-dispatches it (a fd became
+    /// ready → the handler now finds it and returns the revents). The handler
+    /// has already written zeroed revents into guest memory, so a timeout
+    /// completion needs no further writes.
+    WaitOnFds {
+        /// (host_fd, poll events) pairs to wait on.
+        fds: Vec<(i32, i16)>,
+        /// `None` = wait forever (signal-interruptible).
+        timeout: Option<Duration>,
+    },
 }
 
 impl DispatchOutcome {
@@ -230,6 +247,7 @@ impl DispatchOutcome {
             DispatchOutcome::CloneThread { .. } => (0, None),
             DispatchOutcome::ThreadExit { .. } => (0, None),
             DispatchOutcome::FutexWait { .. } => (0, None),
+            DispatchOutcome::WaitOnFds { .. } => (0, None),
         }
     }
 }
