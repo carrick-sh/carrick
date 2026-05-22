@@ -346,6 +346,116 @@ fn tty_ioctls_handle_pgrp_sid_and_controlling_terminal_calls() {
     assert!(reporter.finish().unhandled_ioctls.is_empty());
 }
 
+/// Verify that `host_tty_tcgetpgrp` on a real pty slave returns the HOST
+/// `tcgetpgrp` value, never the synthesised `LINUX_BOOTSTRAP_PGID` constant.
+///
+/// We open a fresh pty pair (posix_openpt / grantpt / unlockpt), call
+/// `host_tty_tcgetpgrp` on the slave side, and assert it matches a direct
+/// `libc::tcgetpgrp` call.  We intentionally do NOT check for a specific
+/// numeric value — a freshly-opened slave that has never been made the
+/// controlling tty may return -1 (ENOTTY or ENXIO on some kernels) — but we
+/// DO assert that it never returns the faked bootstrap constant (1).
+#[test]
+fn tiocgpgrp_on_real_tty_uses_host_value_not_bootstrap() {
+    // SAFETY: posix_openpt / grantpt / unlockpt / ptsname / open are standard
+    // POSIX calls; we close the fds in the cleanup block.
+    let (master, slave) = unsafe {
+        let m = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+        assert!(m >= 0, "posix_openpt failed");
+        libc::grantpt(m);
+        libc::unlockpt(m);
+        let name_ptr = libc::ptsname(m);
+        assert!(!name_ptr.is_null(), "ptsname returned NULL");
+        let name = std::ffi::CStr::from_ptr(name_ptr).to_owned();
+        let s = libc::open(name.as_ptr(), libc::O_RDWR | libc::O_NOCTTY);
+        assert!(s >= 0, "open pty slave failed");
+        (m, s)
+    };
+
+    // The slave is a real tty.
+    assert!(
+        carrick::host_tty::host_isatty(slave),
+        "pty slave must be a tty"
+    );
+
+    // Direct libc call — this is the reference value.
+    // SAFETY: slave is a valid open fd.
+    let direct = unsafe { libc::tcgetpgrp(slave) };
+
+    // Our helper must agree with the direct call.
+    let via_helper = carrick::host_tty::host_tty_tcgetpgrp(slave);
+    match via_helper {
+        Ok(pgrp) => {
+            assert_eq!(pgrp, direct, "host_tty_tcgetpgrp must match direct tcgetpgrp");
+            // Must never be the synthesised bootstrap constant on a real tty.
+            assert_ne!(
+                pgrp,
+                carrick::linux_abi::LINUX_BOOTSTRAP_PGID,
+                "host_tty_tcgetpgrp must not return the faked bootstrap pgid on a real tty"
+            );
+        }
+        Err(_raw_errno) => {
+            // tcgetpgrp returned -1: the slave has no controlling process group
+            // (e.g. no session has made it the ctty yet).  The important
+            // invariant is that our helper propagated the failure rather than
+            // silently returning LINUX_BOOTSTRAP_PGID.
+            assert!(
+                direct < 0,
+                "helper returned Err but direct tcgetpgrp returned {}",
+                direct
+            );
+        }
+    }
+
+    // Cleanup.
+    // SAFETY: closing fds we opened above.
+    unsafe {
+        libc::close(master);
+        libc::close(slave);
+    }
+}
+
+/// Verify that `host_tty_tcsetpgrp` on a real pty slave either succeeds or
+/// returns a real errno (not silently EPERM-ing as the headless fallback does).
+///
+/// In a test-harness the slave is not the controlling tty of any session, so
+/// `tcsetpgrp` will typically EPERM/ENOTTY.  The important property is that
+/// `host_tty_tcsetpgrp` does NOT silently succeed on the bootstrap pgid the
+/// way the non-tty fake path does — it actually calls the host.
+#[test]
+fn tiocspgrp_on_real_tty_calls_host_not_fake() {
+    // SAFETY: same pty-open pattern as the get test.
+    let (master, slave) = unsafe {
+        let m = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+        assert!(m >= 0, "posix_openpt failed");
+        libc::grantpt(m);
+        libc::unlockpt(m);
+        let name_ptr = libc::ptsname(m);
+        assert!(!name_ptr.is_null());
+        let name = std::ffi::CStr::from_ptr(name_ptr).to_owned();
+        let s = libc::open(name.as_ptr(), libc::O_RDWR | libc::O_NOCTTY);
+        assert!(s >= 0);
+        (m, s)
+    };
+
+    let our_pgrp = unsafe { libc::getpgrp() };
+    // Call our helper — it may succeed or fail (EPERM/ENOTTY in harness), but
+    // it must not panic.  Verify it returns the same outcome as a direct call.
+    let result_helper = carrick::host_tty::host_tty_tcsetpgrp(slave, our_pgrp);
+    // SAFETY: same fd, same call.
+    let direct_r = unsafe { libc::tcsetpgrp(slave, our_pgrp) };
+    match result_helper {
+        Ok(()) => assert_eq!(direct_r, 0, "helper Ok but direct call returned {}", direct_r),
+        Err(_) => assert!(direct_r < 0, "helper Err but direct call returned {}", direct_r),
+    }
+
+    // SAFETY: closing fds we opened above.
+    unsafe {
+        libc::close(master);
+        libc::close(slave);
+    }
+}
+
 #[test]
 fn flock_accepts_bootstrap_advisory_locks_on_open_files() {
     let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
