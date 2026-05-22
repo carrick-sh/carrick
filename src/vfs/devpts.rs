@@ -4,6 +4,7 @@
 //! module owns the index<->host-fd/slave-name mapping.
 
 use std::collections::BTreeMap;
+use std::ffi::CStr;
 
 /// Tags a `HostPipe` open-description as a pty end so the ioctl handler
 /// can synthesize `TIOCGPTN`/`TIOCSPTLCK` and passthrough termios.
@@ -72,9 +73,50 @@ impl Default for PtyTable {
     }
 }
 
+/// Open a fresh macOS pty master: posix_openpt + grantpt + unlockpt,
+/// then resolve the slave device name. `nonblock` adds O_NONBLOCK to
+/// the master. Returns (master_fd, slave_name) or the raw macOS errno.
+/// NOTE: `ptsname` is not thread-safe; callers serialize by holding the
+/// PtyTable mutex across this call.
+pub fn open_master(nonblock: bool) -> Result<(i32, String), i32> {
+    let mut oflag = libc::O_RDWR | libc::O_NOCTTY;
+    if nonblock {
+        oflag |= libc::O_NONBLOCK;
+    }
+    // SAFETY: posix_openpt takes an int flag and returns an fd or -1.
+    let master = unsafe { libc::posix_openpt(oflag) };
+    if master < 0 {
+        return Err(unsafe { *libc::__error() });
+    }
+    // SAFETY: master is a valid fd from posix_openpt.
+    if unsafe { libc::grantpt(master) } != 0 || unsafe { libc::unlockpt(master) } != 0 {
+        let e = unsafe { *libc::__error() };
+        unsafe { libc::close(master) };
+        return Err(e);
+    }
+    // SAFETY: master is valid; ptsname returns a static C string or null.
+    let name_ptr = unsafe { libc::ptsname(master) };
+    if name_ptr.is_null() {
+        let e = unsafe { *libc::__error() };
+        unsafe { libc::close(master) };
+        return Err(e);
+    }
+    // SAFETY: name_ptr is a valid NUL-terminated C string from ptsname.
+    let slave_name = unsafe { CStr::from_ptr(name_ptr) }.to_string_lossy().into_owned();
+    Ok((master, slave_name))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_master_returns_fd_and_slave_name() {
+        let (master_fd, slave_name) = open_master(false).expect("posix_openpt");
+        assert!(master_fd >= 0);
+        assert!(slave_name.starts_with("/dev/"), "got {slave_name}");
+        unsafe { libc::close(master_fd) };
+    }
 
     #[test]
     fn alloc_lookup_free_roundtrip() {
