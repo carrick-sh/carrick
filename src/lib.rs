@@ -14,6 +14,7 @@ pub mod memory;
 pub mod oci;
 pub mod overlay;
 pub mod probes;
+pub mod pty_relay;
 pub mod rootfs;
 pub mod runtime;
 pub mod syscall;
