@@ -2371,9 +2371,12 @@ impl SyscallDispatcher {
             OpenDescription::HostPipe {
                 host_fd,
                 is_read_end,
+                pty,
                 ..
             } => {
-                if !*is_read_end {
+                // pty ends are bidirectional (O_RDWR); only real one-way
+                // pipe ends are gated by is_read_end.
+                if !*is_read_end && pty.is_none() {
                     return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
                 }
                 return Ok(read_host_pipe(
@@ -3597,9 +3600,12 @@ impl SyscallDispatcher {
                 OpenDescription::HostPipe {
                     host_fd,
                     is_read_end,
+                    pty,
                     ..
                 } => {
-                    if *is_read_end {
+                    // pty ends are bidirectional (O_RDWR); only real one-way
+                    // pipe ends are gated by is_read_end.
+                    if *is_read_end && pty.is_none() {
                         DispatchOutcome::Errno { errno: LINUX_EBADF }
                     } else {
                         write_host_pipe(&bytes, *host_fd, nonblocking)
@@ -3697,9 +3703,12 @@ impl SyscallDispatcher {
                     OpenDescription::HostPipe {
                         host_fd,
                         is_read_end,
+                        pty,
                         ..
                     } => {
-                        if *is_read_end {
+                        // pty ends are bidirectional (O_RDWR); only real one-way
+                        // pipe ends are gated by is_read_end.
+                        if *is_read_end && pty.is_none() {
                             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
                         }
                         return Ok(write_host_pipe(&bytes, *host_fd, nonblocking));
@@ -3798,9 +3807,12 @@ impl SyscallDispatcher {
                     OpenDescription::HostPipe {
                         host_fd,
                         is_read_end,
+                        pty,
                         ..
                     } => {
-                        return if *is_read_end {
+                        // pty ends are bidirectional (O_RDWR); only real one-way
+                        // pipe ends are gated by is_read_end.
+                        return if *is_read_end && pty.is_none() {
                             DispatchOutcome::Errno { errno: LINUX_EBADF }
                         } else {
                             write_host_pipe(bytes, *host_fd, nonblocking)
@@ -3925,9 +3937,12 @@ impl SyscallDispatcher {
                         OpenDescription::HostPipe {
                             host_fd,
                             is_read_end,
+                            pty,
                             ..
                         } => {
-                            if *is_read_end {
+                            // pty ends are bidirectional (O_RDWR); only real one-way
+                            // pipe ends are gated by is_read_end.
+                            if *is_read_end && pty.is_none() {
                                 return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
                             }
                             outcome = write_host_pipe(&bytes, *host_fd, nonblocking);
