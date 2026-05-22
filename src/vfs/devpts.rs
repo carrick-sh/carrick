@@ -180,18 +180,18 @@ impl Vfs for DevptsVfs {
                 mtime_nanos: 0,
             });
         }
-        if let Some(n) = Self::parse_index(path) {
-            if self.pty_table.lock().slave_name(n).is_some() {
-                return Ok(Metadata {
-                    kind: EntryKind::CharDevice,
-                    mode: 0o620,
-                    size: 0,
-                    uid: 0,
-                    gid: 0,
-                    mtime_secs: 0,
-                    mtime_nanos: 0,
-                });
-            }
+        if let Some(n) = Self::parse_index(path)
+            && self.pty_table.lock().slave_name(n).is_some()
+        {
+            return Ok(Metadata {
+                kind: EntryKind::CharDevice,
+                mode: 0o620,
+                size: 0,
+                uid: 0,
+                gid: 0,
+                mtime_secs: 0,
+                mtime_nanos: 0,
+            });
         }
         Err(LINUX_ENOENT)
     }
