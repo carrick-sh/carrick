@@ -1886,6 +1886,18 @@ impl SyscallDispatcher {
     /// and respects deletions.
     fn layered_metadata(&self, path: &str) -> Result<RootFsMetadata, i32> {
         use crate::vfs::Vfs as _;
+        // Consult the VFS mounts (/dev, /dev/pts, /proc, /sys) FIRST so stat of
+        // /dev/ptmx, /dev/pts/N, /dev/tty, and synthetic /proc /sys paths
+        // resolves — mirroring the open path (`try_vfs_open`). Previously stat
+        // only saw the rootfs, so these mount paths returned ENOENT even though
+        // they appeared in readdir and could be opened (which broke e.g.
+        // `ttyname(3)` → `tty(1)`, and `ls -l /dev`). A mount miss falls back to
+        // the rootfs so image-provided entries still resolve.
+        if let Some(m) = self.fs.vfs_mounts.resolve(path)
+            && let Ok(md) = m.vfs.lookup(&m.full_path)
+        {
+            return Ok(vfs_md_to_rootfs_md(path, &md));
+        }
         self.fs
             .rootfs_vfs
             .lookup(path)
@@ -4133,6 +4145,22 @@ impl SyscallDispatcher {
         })
     }
 
+    /// If `path` is `/proc/self/fd/{0,1,2}` (or `/proc/<pid>/fd/...`) and the
+    /// guest's stdio is the `carrick run -t` controlling pty, return its
+    /// `/dev/pts/N` path. This is the symlink glibc `ttyname(3)` reads to name
+    /// the terminal. Only the three stdio fds are mapped (they're the pty
+    /// slave under `-t`).
+    fn proc_self_fd_tty_link(&self, path: &str) -> Option<String> {
+        let fd_part = path
+            .strip_prefix("/proc/self/fd/")
+            .or_else(|| path.strip_prefix("/proc/thread-self/fd/"))?;
+        if !matches!(fd_part, "0" | "1" | "2") {
+            return None;
+        }
+        let n = self.pty_table().lock().controlling()?;
+        Some(format!("/dev/pts/{n}"))
+    }
+
     pub(super) fn readlinkat<M: GuestMemory>(
         &self,
         ctx: &mut SyscallCtx<M>,
@@ -4159,6 +4187,11 @@ impl SyscallDispatcher {
 
         let target = if path == "/proc/self/exe" || path == "/proc/curproc/exe" {
             self.proc.lock().executable_path.clone()
+        } else if let Some(t) = self.proc_self_fd_tty_link(&path) {
+            // /proc/self/fd/{0,1,2} → /dev/pts/N when the guest's stdio is the
+            // `carrick run -t` controlling pty. This is what glibc `ttyname(3)`
+            // reads, so `tty(1)` and tty-name lookups resolve.
+            t
         } else if let Some(t) = self.fs.rootfs_vfs.overlay.read_link(&path) {
             // Symlink created in the writable backend (cap-std on --fs host).
             t
@@ -4956,9 +4989,20 @@ impl SyscallDispatcher {
         if let Some(real) = self.fs.rootfs_vfs.overlay.real_stat(&path, follow) {
             return Ok(write_stat_real(memory, statbuf, &path, &real));
         }
+        use crate::vfs::Vfs as _;
+        // VFS mounts (/dev, /dev/pts, /proc, /sys): stat their nodes so e.g.
+        // /dev/ptmx, /dev/pts/N, /dev/tty resolve (mirrors the open path).
+        if let Some(m) = self.fs.vfs_mounts.resolve(&path)
+            && let Ok(md) = m.vfs.lookup(&m.full_path)
+        {
+            return Ok(write_stat(
+                memory,
+                statbuf,
+                &vfs_md_to_rootfs_md(&path, &md),
+            ));
+        }
         // Layered overlay+rootfs lookup via RootFsVfs. Honour
         // AT_SYMLINK_NOFOLLOW (lstat) on backends without real_stat.
-        use crate::vfs::Vfs as _;
         let lookup = if follow {
             self.fs.rootfs_vfs.lookup(&path)
         } else {
@@ -5032,10 +5076,21 @@ impl SyscallDispatcher {
         if let Some(real) = self.fs.rootfs_vfs.overlay.real_stat(&path, follow) {
             return Ok(write_statx_real(memory, statxbuf, &path, &real));
         }
+        use crate::vfs::Vfs as _;
+        // VFS mounts (/dev, /dev/pts, /proc, /sys): stat their nodes so e.g.
+        // /dev/ptmx, /dev/pts/N, /dev/tty resolve (mirrors the open path).
+        if let Some(m) = self.fs.vfs_mounts.resolve(&path)
+            && let Ok(md) = m.vfs.lookup(&m.full_path)
+        {
+            return Ok(write_statx(
+                memory,
+                statxbuf,
+                &vfs_md_to_rootfs_md(&path, &md),
+            ));
+        }
         // Fallback for backends without real_stat (e.g. the in-memory
         // overlay): honour AT_SYMLINK_NOFOLLOW by reporting the link itself
         // rather than its target.
-        use crate::vfs::Vfs as _;
         let lookup = if follow {
             self.fs.rootfs_vfs.lookup(&path)
         } else {
