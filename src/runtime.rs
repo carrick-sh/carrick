@@ -85,7 +85,15 @@ pub fn maybe_dump_debug_state(
 pub const DEFAULT_MAX_TRAPS: usize = 1_000_000;
 
 pub trait SyscallTrap {
-    fn next_syscall(&mut self) -> Result<Aarch64SyscallFrame, TrapError>;
+    /// Run the vCPU until it traps. `Ok(Some(frame))` is a guest syscall;
+    /// `Ok(None)` means the vCPU was forced out of the guest by a cross-thread
+    /// kick (`hv_vcpus_exit`, [`crate::vcpu_kick`]) with no syscall pending —
+    /// the loop should run signal delivery and resume. `Err` is a real fault.
+    fn next_syscall(&mut self) -> Result<Option<Aarch64SyscallFrame>, TrapError>;
+    /// The guest PC the vCPU is currently parked at. Used as the resume address
+    /// when injecting a signal on a non-syscall (kick) exit, where `ELR_EL1`
+    /// does not hold a meaningful return address.
+    fn current_pc(&self) -> Result<u64, TrapError>;
     fn complete_syscall(&mut self, return_value: i64) -> Result<(), TrapError>;
     /// Real macOS fork. Returns the child pid in the parent, 0 in the
     /// child. After this returns, the trap engine in the child holds a
@@ -116,12 +124,17 @@ pub trait SyscallTrap {
     /// off. Pass `None` when injecting outside a syscall completion
     /// (e.g. when raising at the top of the trap loop before the first
     /// syscall has run).
+    /// `interrupted_pc` is `Some(pc)` when injecting on a non-syscall kick exit
+    /// (the vCPU was mid-userspace; `pc` is where it should resume after the
+    /// handler returns and is redirected via `Reg::PC` rather than `ELR_EL1`).
+    /// `None` is the syscall-boundary case (resume via the post-svc `ELR_EL1`).
     fn inject_signal(
         &mut self,
         signum: i32,
         handler: u64,
         sa_restorer: u64,
         pending_syscall_retval: Option<i64>,
+        interrupted_pc: Option<u64>,
     ) -> Result<(), TrapError>;
     /// Restore vCPU state from the `CarrickSigframe` at SP_EL0. Called
     /// when the guest invokes `rt_sigreturn(2)`. Does NOT advance PC
@@ -448,11 +461,36 @@ where
     // it.
     let _termios_guard = crate::host_tty::TermiosRestoreGuard::new();
 
+    let this_tid = std::process::id() as ThreadId;
     // Per-thread blocking-I/O waiter (owns this thread's kqueue). Recreated in
     // a forked child below (kqueue is not inherited across fork).
-    let mut waiter = crate::io_wait::ThreadWaiter::new();
+    let mut waiter = crate::io_wait::ThreadWaiter::new(this_tid);
     for traps in 1..=max_traps {
-        let frame = runtime.next_syscall()?;
+        let frame = match runtime.next_syscall()? {
+            Some(f) => f,
+            None => {
+                // Forced out of the guest by a kick (process-directed signal
+                // pump). Deliver at the interrupted PC, then resume.
+                let pc = runtime.current_pc()?;
+                if let Some(action) =
+                    deliver_pending_signal(runtime, &mut dispatcher, None, this_tid, Some(pc))?
+                    && let Some(signum) = action.term_signal
+                {
+                    if runtime.is_forked_child() {
+                        forked_child_die_by_signal(signum, dispatcher.stdout(), dispatcher.stderr());
+                    }
+                    return Ok(RunResult {
+                        exit_code: 128 + signum,
+                        stdout: dispatcher.stdout().to_vec(),
+                        stderr: dispatcher.stderr().to_vec(),
+                        traps,
+                        report: reporter.finish(),
+                        trap_limit_hit: false,
+                    });
+                }
+                continue;
+            }
+        };
         if std::env::var_os("CARRICK_TRACE_TRAPS").is_some() {
             let name = crate::syscall::lookup_aarch64(frame.x8)
                 .map(|s| s.name)
@@ -525,7 +563,9 @@ where
                         // self-pipe is shared with the parent — give the child
                         // fresh ones so its parked-thread wakes are its own.
                         crate::host_signal::reinit_after_fork();
-                        waiter = crate::io_wait::ThreadWaiter::new();
+                        // The child's pid changed; its waiter watches for
+                        // signals targeted at the new tid (or process-directed).
+                        waiter = crate::io_wait::ThreadWaiter::new(std::process::id() as ThreadId);
                         0
                     }
                 };
@@ -573,6 +613,7 @@ where
             }
             DispatchOutcome::CloneThread { .. }
             | DispatchOutcome::ThreadExit { .. }
+            | DispatchOutcome::SignalThread { .. }
             | DispatchOutcome::FutexWait { .. } => {
                 // These are emitted only on the multi-threaded
                 // `dispatch_threaded` path (run_vcpu_until_exit). The
@@ -583,7 +624,7 @@ where
         }
 
         if let Some(action) =
-                deliver_pending_signal(runtime, &mut dispatcher, last_syscall_retval)?
+                deliver_pending_signal(runtime, &mut dispatcher, last_syscall_retval, this_tid, None)?
                 && let Some(signum) = action.term_signal {
                     if runtime.is_forked_child() {
                         forked_child_die_by_signal(
@@ -690,6 +731,13 @@ fn run_threaded_hvf_loop(
     // worker is mid-flight. We join them after the main thread finishes.
     let threads: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>> =
         Arc::new(Mutex::new(Vec::new()));
+    // Registry of live vCPUs so a signalling thread (tgkill) or the
+    // process-directed signal pump can force a target out of `hv_vcpu_run`.
+    let kicker = Arc::new(crate::vcpu_kick::VcpuKicker::new());
+    // Daemon that kicks in-guest vCPUs when a process-directed signal arrives
+    // (host SIGINT etc.), so a thread spinning in guest userspace delivers it
+    // promptly rather than only at its next syscall.
+    crate::vcpu_kick::spawn_signal_pump(Arc::clone(&kicker));
 
     let outcome = run_vcpu_until_exit(
         kernel.clone_handle(),
@@ -698,6 +746,7 @@ fn run_threaded_hvf_loop(
         Arc::clone(&futex),
         main_tid,
         Arc::clone(&threads),
+        Arc::clone(&kicker),
         max_traps,
     )?;
 
@@ -736,15 +785,33 @@ fn run_vcpu_until_exit(
     futex: Arc<FutexTable>,
     mut this_tid: ThreadId,
     threads: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
+    kicker: Arc<crate::vcpu_kick::VcpuKicker>,
     max_traps: usize,
 ) -> Result<VcpuLoopOutcome, RuntimeError> {
     let trace = std::env::var_os("CARRICK_TRACE_TRAPS").is_some();
     // Per-thread blocking-I/O waiter (owns this thread's kqueue). Recreated in
     // a forked child below (kqueue is not inherited across fork).
-    let mut waiter = crate::io_wait::ThreadWaiter::new();
+    let mut waiter = crate::io_wait::ThreadWaiter::new(this_tid);
+    // Publish this thread's vCPU so siblings can kick it out of the guest.
+    kicker.register(this_tid, engine.vcpu_kick_handle());
     for traps in 1..=max_traps {
         // ---- vCPU run: NO kernel lock held ----
-        let frame = engine.next_syscall()?;
+        let frame = match engine.next_syscall()? {
+            Some(f) => f,
+            None => {
+                // The vCPU was forced out of the guest by a cross-thread kick
+                // (hv_vcpus_exit) with no syscall pending — deliver a signal at
+                // the interrupted PC, then resume. A spurious kick with nothing
+                // deliverable just costs this one extra iteration.
+                let pc = engine.current_pc()?;
+                if let Some(outcome) =
+                    service_signals_threaded(&kernel, &mut engine, this_tid, None, Some(pc), traps)?
+                {
+                    return Ok(outcome);
+                }
+                continue;
+            }
+        };
         if trace {
             let name = crate::syscall::lookup_aarch64(frame.x8)
                 .map(|s| s.name)
@@ -842,7 +909,11 @@ fn run_vcpu_until_exit(
                 // ungated signal check below then runs. Re-lock only to
                 // complete the syscall.
                 use crate::thread::FutexWaitOutcome;
-                let retval: i64 = match futex.wait(addr, timeout, &crate::host_signal::has_pending)
+                // Interrupt the wait only for a signal deliverable to THIS
+                // thread (its own tgkill target or a process-directed one) —
+                // not a sibling's, which would surface a spurious EINTR.
+                let retval: i64 =
+                    match futex.wait(addr, timeout, &|| crate::host_signal::has_pending_for(this_tid))
                 {
                     FutexWaitOutcome::Woken => 0,
                     FutexWaitOutcome::TimedOut => -(crate::linux_abi::LINUX_ETIMEDOUT as i64),
@@ -897,6 +968,7 @@ fn run_vcpu_until_exit(
                 let child_registry = Arc::clone(&registry);
                 let child_futex = Arc::clone(&futex);
                 let child_threads = Arc::clone(&threads);
+                let child_kicker = Arc::clone(&kicker);
                 let handle = std::thread::Builder::new()
                     .name(format!("guest-tid-{tid}"))
                     .spawn(move || {
@@ -916,6 +988,7 @@ fn run_vcpu_until_exit(
                                     child_futex,
                                     tid,
                                     child_threads,
+                                    child_kicker,
                                     max_traps,
                                 );
                                 if let Err(e) = r {
@@ -947,6 +1020,10 @@ fn run_vcpu_until_exit(
                         futex.wake(addr, 1);
                     }
                 let last = registry.exit(this_tid);
+                // No more kicks for a thread that's gone; drop its stale
+                // pending too so a recycled tid starts clean.
+                kicker.unregister(this_tid);
+                crate::host_signal::forget_thread(this_tid);
                 if last {
                     let result = assemble_run_result(&kernel, code, traps, false);
                     return Ok(VcpuLoopOutcome::ProcessExit(Box::new(result)));
@@ -954,6 +1031,20 @@ fn run_vcpu_until_exit(
                 // Not last: this host thread is done. Its vCPU + VM-clone Arc
                 // leak to process exit (the forked-child Drop discipline).
                 return Ok(VcpuLoopOutcome::ThreadDone);
+            }
+            DispatchOutcome::SignalThread { tid: target, signum } => {
+                // tgkill/tkill to a sibling: publish the signal for the target
+                // tid and force its vCPU out of the guest so it delivers at its
+                // next safe point. -ESRCH if it raced to exit.
+                let retval: i64 = if registry.is_live(target) {
+                    crate::host_signal::publish_pending_for(target, signum);
+                    kicker.kick(target);
+                    0
+                } else {
+                    -(crate::linux_abi::LINUX_ESRCH as i64)
+                };
+                engine.complete_syscall(retval)?;
+                last_syscall_retval = Some(retval);
             }
             DispatchOutcome::Execve { path, argv, env } => {
                 crate::probes::execve_argv(&path, &argv);
@@ -1023,7 +1114,11 @@ fn run_vcpu_until_exit(
                             // kqueue isn't inherited across fork; the self-pipe
                             // is shared with the parent. Fresh ones for the child.
                             crate::host_signal::reinit_after_fork();
-                            waiter = crate::io_wait::ThreadWaiter::new();
+                            waiter = crate::io_wait::ThreadWaiter::new(this_tid);
+                            // The fork rebuilt the vCPU; publish the child's
+                            // handle under its new tid (the inherited map's
+                            // parent entries point at dead vCPUs and are inert).
+                            kicker.register(this_tid, engine.vcpu_kick_handle());
                             0
                         }
                     };
@@ -1033,31 +1128,17 @@ fn run_vcpu_until_exit(
             }
         }
 
-        // Signal delivery. host_signal is process-global with an atomic
-        // pending slot, so `take_pending` (inside deliver_pending_signal,
-        // under the kernel lock) drains it exactly once: whichever thread
-        // grabs it delivers the process-directed signal to ITS vCPU, which is
-        // valid Linux semantics (an arbitrary unblocking thread handles it).
-        // Threads parked in FUTEX_WAIT interrupt on a pending signal (see the
-        // FutexWait arm) and reach here too. No live_count gate — multi-
-        // threaded guests deliver while running. Per-thread signal masks /
-        // tgkill targeting remain a follow-up.
+        // Signal delivery. A signal targeted at THIS tid (guest tgkill/tkill)
+        // takes priority; otherwise a process-directed signal in the global
+        // slot is deliverable by any thread (valid Linux semantics — an
+        // arbitrary unblocking thread handles it). Threads parked in FUTEX_WAIT
+        // / blocking I/O interrupt on a pending-for-them signal and reach here
+        // too; a thread forced out of the guest by a kick (frame == None) lands
+        // here with `interrupted_pc` so the handler resumes at the right PC.
+        if let Some(outcome) =
+            service_signals_threaded(&kernel, &mut engine, this_tid, last_syscall_retval, None, traps)?
         {
-            #[allow(clippy::expect_used)]
-            let mut k = kernel.0.lock().expect("kernel lock poisoned");
-            if let Some(action) =
-                deliver_pending_signal(&mut engine, &mut k.dispatcher, last_syscall_retval)?
-                && let Some(signum) = action.term_signal {
-                    if engine.is_forked_child() {
-                        let out = k.dispatcher.stdout().to_vec();
-                        let err = k.dispatcher.stderr().to_vec();
-                        drop(k);
-                        forked_child_die_by_signal(signum, &out, &err);
-                    }
-                    drop(k);
-                    let result = assemble_run_result(&kernel, 128 + signum, traps, false);
-                    return Ok(VcpuLoopOutcome::ProcessExit(Box::new(result)));
-                }
+            return Ok(outcome);
         }
     }
 
@@ -1107,11 +1188,13 @@ fn deliver_pending_signal<T>(
     trap: &mut T,
     dispatcher: &mut SyscallDispatcher,
     last_syscall_retval: Option<i64>,
+    tid: ThreadId,
+    interrupted_pc: Option<u64>,
 ) -> Result<Option<PendingSignalAction>, RuntimeError>
 where
     T: SyscallTrap,
 {
-    let pending = crate::host_signal::take_pending();
+    let pending = crate::host_signal::take_pending_for(tid);
     let pending = if pending == 0 {
         // Nothing newly arrived in the host slot. Deliver the next signal that
         // was raised while blocked and has since been unblocked (held in the
@@ -1151,13 +1234,55 @@ where
             } else {
                 0
             };
-            trap.inject_signal(pending, action.sa_handler, restorer, last_syscall_retval)?;
+            trap.inject_signal(
+                pending,
+                action.sa_handler,
+                restorer,
+                last_syscall_retval,
+                interrupted_pc,
+            )?;
             Ok(Some(PendingSignalAction { term_signal: None }))
         }
         None => Ok(Some(PendingSignalAction {
             term_signal: Some(pending),
         })),
     }
+}
+
+/// Run signal delivery for one iteration of the multi-threaded vCPU loop under
+/// the kernel lock. Returns `Some(outcome)` when a default-action (terminate)
+/// signal fires and the process should end; `None` to keep running. Shared by
+/// the post-syscall path (`interrupted_pc = None`) and the kick path
+/// (`interrupted_pc = Some(pc)`, no syscall ran).
+fn service_signals_threaded(
+    kernel: &SendKernel,
+    engine: &mut HvfTrapEngine,
+    this_tid: ThreadId,
+    last_syscall_retval: Option<i64>,
+    interrupted_pc: Option<u64>,
+    traps: usize,
+) -> Result<Option<VcpuLoopOutcome>, RuntimeError> {
+    #[allow(clippy::expect_used)]
+    let mut k = kernel.0.lock().expect("kernel lock poisoned");
+    if let Some(action) = deliver_pending_signal(
+        engine,
+        &mut k.dispatcher,
+        last_syscall_retval,
+        this_tid,
+        interrupted_pc,
+    )? && let Some(signum) = action.term_signal
+    {
+        if engine.is_forked_child() {
+            let out = k.dispatcher.stdout().to_vec();
+            let err = k.dispatcher.stderr().to_vec();
+            drop(k);
+            forked_child_die_by_signal(signum, &out, &err);
+        }
+        drop(k);
+        let result = assemble_run_result(kernel, 128 + signum, traps, false);
+        return Ok(Some(VcpuLoopOutcome::ProcessExit(Box::new(result))));
+    }
+    Ok(None)
 }
 
 /// Build a new AddressSpace for an execve target. Resolves the path
@@ -1315,11 +1440,36 @@ where
     // it.
     let _termios_guard = crate::host_tty::TermiosRestoreGuard::new();
 
+    let this_tid = std::process::id() as ThreadId;
     // Per-thread blocking-I/O waiter (owns this thread's kqueue). Recreated in
     // a forked child below (kqueue is not inherited across fork).
-    let mut waiter = crate::io_wait::ThreadWaiter::new();
+    let mut waiter = crate::io_wait::ThreadWaiter::new(this_tid);
     for traps in 1..=max_traps {
-        let frame = trap.next_syscall()?;
+        let frame = match trap.next_syscall()? {
+            Some(f) => f,
+            None => {
+                // Kicked out of the guest for signal delivery (process-directed
+                // pump). Deliver at the interrupted PC, then resume.
+                let pc = trap.current_pc()?;
+                if let Some(action) =
+                    deliver_pending_signal(trap, &mut dispatcher, None, this_tid, Some(pc))?
+                    && let Some(signum) = action.term_signal
+                {
+                    if trap.is_forked_child() {
+                        forked_child_die_by_signal(signum, dispatcher.stdout(), dispatcher.stderr());
+                    }
+                    return Ok(RunResult {
+                        exit_code: 128 + signum,
+                        stdout: dispatcher.stdout().to_vec(),
+                        stderr: dispatcher.stderr().to_vec(),
+                        traps,
+                        report: reporter.finish(),
+                        trap_limit_hit: false,
+                    });
+                }
+                continue;
+            }
+        };
         let outcome = loop {
             let oc = dispatcher.dispatch(
                 SyscallRequest::from_aarch64_frame(frame),
@@ -1378,7 +1528,9 @@ where
                         // self-pipe is shared with the parent — give the child
                         // fresh ones so its parked-thread wakes are its own.
                         crate::host_signal::reinit_after_fork();
-                        waiter = crate::io_wait::ThreadWaiter::new();
+                        // The child's pid changed; its waiter watches for
+                        // signals targeted at the new tid (or process-directed).
+                        waiter = crate::io_wait::ThreadWaiter::new(std::process::id() as ThreadId);
                         0
                     }
                 };
@@ -1425,6 +1577,7 @@ where
             }
             DispatchOutcome::CloneThread { .. }
             | DispatchOutcome::ThreadExit { .. }
+            | DispatchOutcome::SignalThread { .. }
             | DispatchOutcome::FutexWait { .. } => {
                 // These are emitted only on the multi-threaded
                 // `dispatch_threaded` path (run_vcpu_until_exit). The
@@ -1435,7 +1588,7 @@ where
         }
 
         if let Some(action) =
-                deliver_pending_signal(trap, &mut dispatcher, last_syscall_retval)?
+                deliver_pending_signal(trap, &mut dispatcher, last_syscall_retval, this_tid, None)?
                 && let Some(signum) = action.term_signal {
                     if trap.is_forked_child() {
                         forked_child_die_by_signal(
@@ -1478,8 +1631,12 @@ impl SyscallTrap for HvfTrapEngine {
         HvfTrapEngine::is_forked_child(self)
     }
 
-    fn next_syscall(&mut self) -> Result<Aarch64SyscallFrame, TrapError> {
+    fn next_syscall(&mut self) -> Result<Option<Aarch64SyscallFrame>, TrapError> {
         self.run_until_syscall()
+    }
+
+    fn current_pc(&self) -> Result<u64, TrapError> {
+        self.program_counter()
     }
 
     fn complete_syscall(&mut self, return_value: i64) -> Result<(), TrapError> {
@@ -1492,8 +1649,16 @@ impl SyscallTrap for HvfTrapEngine {
         handler: u64,
         sa_restorer: u64,
         pending_syscall_retval: Option<i64>,
+        interrupted_pc: Option<u64>,
     ) -> Result<(), TrapError> {
-        HvfTrapEngine::inject_signal(self, signum, handler, sa_restorer, pending_syscall_retval)
+        HvfTrapEngine::inject_signal(
+            self,
+            signum,
+            handler,
+            sa_restorer,
+            pending_syscall_retval,
+            interrupted_pc,
+        )
     }
 
     fn restore_from_sigframe(&mut self) -> Result<(), TrapError> {

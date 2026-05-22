@@ -19,4 +19,5 @@ pub mod runtime;
 pub mod syscall;
 pub mod thread;
 pub mod trap;
+pub mod vcpu_kick;
 pub mod vfs;

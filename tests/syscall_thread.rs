@@ -197,3 +197,79 @@ fn futex_wait_matching_value_blocks_via_outcome() {
         }
     );
 }
+
+// --- Sub-task B (P3): tgkill/tkill cross-thread routing ---
+
+const LINUX_ESRCH: i32 = 3;
+const SIGUSR1: u64 = 10;
+
+#[test]
+fn tgkill_to_sibling_emits_signalthread() {
+    let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    let registry = Arc::new(ThreadRegistry::new(1000));
+    let futex = Arc::new(FutexTable::new());
+    let sibling = registry.register_child(0);
+    // tgkill(tgid, tid=sibling, SIGUSR1) issued by the main thread (tid 1000).
+    let outcome = dispatcher
+        .dispatch_threaded(
+            SyscallRequest::new(131, SyscallArgs::from([1000, sibling as u64, SIGUSR1, 0, 0, 0])),
+            &mut memory,
+            &mut reporter,
+            1000,
+            &registry,
+            &futex,
+        )
+        .unwrap();
+    assert_eq!(
+        outcome,
+        DispatchOutcome::SignalThread {
+            tid: sibling,
+            signum: SIGUSR1 as i32,
+        }
+    );
+}
+
+#[test]
+fn tgkill_to_self_raises_locally() {
+    let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    let registry = Arc::new(ThreadRegistry::new(1000));
+    let futex = Arc::new(FutexTable::new());
+    // Targeting our own tid is a local raise, not a cross-thread kick.
+    let outcome = dispatcher
+        .dispatch_threaded(
+            SyscallRequest::new(131, SyscallArgs::from([1000, 1000, SIGUSR1, 0, 0, 0])),
+            &mut memory,
+            &mut reporter,
+            1000,
+            &registry,
+            &futex,
+        )
+        .unwrap();
+    assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+}
+
+#[test]
+fn tkill_to_unknown_tid_is_esrch() {
+    let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
+    let mut reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    let registry = Arc::new(ThreadRegistry::new(1000));
+    let futex = Arc::new(FutexTable::new());
+    // tkill(tid=424242, SIGUSR1): not a live sibling, not self (pid), not the
+    // bootstrap pid -> ESRCH.
+    let outcome = dispatcher
+        .dispatch_threaded(
+            SyscallRequest::new(130, SyscallArgs::from([424242, SIGUSR1, 0, 0, 0, 0])),
+            &mut memory,
+            &mut reporter,
+            1000,
+            &registry,
+            &futex,
+        )
+        .unwrap();
+    assert_eq!(outcome, DispatchOutcome::Errno { errno: LINUX_ESRCH });
+}

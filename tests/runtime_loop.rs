@@ -235,10 +235,15 @@ impl ScriptedTrap {
 }
 
 impl SyscallTrap for ScriptedTrap {
-    fn next_syscall(&mut self) -> Result<Aarch64SyscallFrame, TrapError> {
+    fn next_syscall(&mut self) -> Result<Option<Aarch64SyscallFrame>, TrapError> {
         self.frames
             .pop_front()
+            .map(Some)
             .ok_or_else(|| TrapError::Hypervisor("scripted trap stream exhausted".to_owned()))
+    }
+
+    fn current_pc(&self) -> Result<u64, TrapError> {
+        Ok(0)
     }
 
     fn complete_syscall(&mut self, return_value: i64) -> Result<(), TrapError> {
@@ -264,6 +269,7 @@ impl SyscallTrap for ScriptedTrap {
         _handler: u64,
         _sa_restorer: u64,
         _pending_syscall_retval: Option<i64>,
+        _interrupted_pc: Option<u64>,
     ) -> Result<(), TrapError> {
         Err(TrapError::Hypervisor(
             "scripted trap does not implement inject_signal".to_owned(),
