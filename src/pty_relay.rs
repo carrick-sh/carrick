@@ -77,9 +77,22 @@ impl PtyRelay {
         }
         let (shutdown_r, shutdown_w) = (sp[0], sp[1]);
         let master = pair.master_fd;
-        let thread = std::thread::Builder::new()
+        let thread = match std::thread::Builder::new()
             .name("pty-relay".into())
-            .spawn(move || relay_loop(real_in, real_out, master, shutdown_r))?;
+            .spawn(move || relay_loop(real_in, real_out, master, shutdown_r))
+        {
+            Ok(t) => t,
+            Err(e) => {
+                // SAFETY: these fds are owned here and not yet handed off.
+                unsafe {
+                    libc::close(shutdown_r);
+                    libc::close(shutdown_w);
+                    libc::close(pair.master_fd);
+                    libc::close(pair.slave_fd);
+                }
+                return Err(e);
+            }
+        };
         Ok(Self {
             pair,
             shutdown_w,
@@ -168,20 +181,35 @@ fn relay_loop(real_in: RawFd, real_out: RawFd, master: RawFd, shutdown_r: RawFd)
 }
 
 /// Read up to `buf.len()` bytes from `fd`. Returns `None` on error,
-/// `Some(0)` on EOF.
+/// `Some(0)` on EOF. Retries on EINTR (e.g. SIGWINCH arriving mid-read).
 fn read_fd(fd: RawFd, buf: &mut [u8]) -> Option<usize> {
-    // SAFETY: buf is a valid mutable slice of the given length.
-    let r = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
-    if r < 0 { None } else { Some(r as usize) }
+    loop {
+        // SAFETY: buf is a valid mutable slice.
+        let r = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        if r < 0 {
+            // Retry if interrupted by a signal (e.g. SIGWINCH); otherwise fail.
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return None;
+        }
+        return Some(r as usize);
+    }
 }
 
 /// Write all of `data` to `fd`, retrying on short writes. Returns `None` on
-/// any error.
+/// any error. Retries on EINTR without advancing the buffer.
 fn write_all_fd(fd: RawFd, mut data: &[u8]) -> Option<()> {
     while !data.is_empty() {
-        // SAFETY: data is a valid slice of the given length.
+        // SAFETY: data is a valid slice.
         let w = unsafe { libc::write(fd, data.as_ptr().cast(), data.len()) };
-        if w <= 0 {
+        if w < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return None;
+        }
+        if w == 0 {
             return None;
         }
         data = &data[w as usize..];
