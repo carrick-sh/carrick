@@ -2163,7 +2163,8 @@ impl SyscallDispatcher {
                         let kind = match e.kind {
                             crate::vfs::EntryKind::Directory => RootFsEntryKind::Directory,
                             crate::vfs::EntryKind::Symlink => RootFsEntryKind::Symlink,
-                            _ => RootFsEntryKind::File,
+                            crate::vfs::EntryKind::CharDevice => RootFsEntryKind::CharDevice,
+                            crate::vfs::EntryKind::File => RootFsEntryKind::File,
                         };
                         RootFsDirEntry {
                             name: e.name.clone(),
@@ -4995,14 +4996,12 @@ impl SyscallDispatcher {
         if let Some(m) = self.fs.vfs_mounts.resolve(&path)
             && let Ok(md) = m.vfs.lookup(&m.full_path)
         {
-            // Map EntryKind to S_IF* — crucially S_IFCHR for char devices so
-            // ttyname(3)'s chardev check on /dev/pts/N passes.
-            return Ok(write_synthetic_stat(
+            // RootFsEntryKind::CharDevice → S_IFCHR via linux_mode, so e.g.
+            // /dev/pts/N reports a char device (ttyname(3)'s chardev check).
+            return Ok(write_stat(
                 memory,
                 statbuf,
-                &path,
-                md.size as usize,
-                vfs_entry_kind_mode(md.kind, md.mode),
+                &vfs_md_to_rootfs_md(&path, &md),
             ));
         }
         // Layered overlay+rootfs lookup via RootFsVfs. Honour
@@ -5086,12 +5085,10 @@ impl SyscallDispatcher {
         if let Some(m) = self.fs.vfs_mounts.resolve(&path)
             && let Ok(md) = m.vfs.lookup(&m.full_path)
         {
-            return Ok(write_synthetic_statx_mode(
+            return Ok(write_statx(
                 memory,
                 statxbuf,
-                &path,
-                md.size as usize,
-                vfs_entry_kind_mode(md.kind, md.mode),
+                &vfs_md_to_rootfs_md(&path, &md),
             ));
         }
         // Fallback for backends without real_stat (e.g. the in-memory

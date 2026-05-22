@@ -1531,7 +1531,7 @@ impl FsBackend for HostFsBackend {
         let default_mode = match kind {
             RootFsEntryKind::Directory => 0o755,
             RootFsEntryKind::Symlink => 0o777,
-            RootFsEntryKind::File => 0o644,
+            RootFsEntryKind::File | RootFsEntryKind::CharDevice => 0o644,
         };
         // The real file's mode was forced owner-accessible; the guest-visible
         // mode lives in an xattr on the (symlink-resolved) target. Symlinks
@@ -1691,7 +1691,9 @@ pub fn layered_directory_entries(
         let path = joined(dir, &name);
         let normalized = normalize(&path).unwrap_or_default();
         let metadata = match kind {
-            RootFsEntryKind::File => {
+            // CharDevice never appears in the writable overlay (it only comes
+            // from the /dev VFS mounts), but the match must be exhaustive.
+            RootFsEntryKind::File | RootFsEntryKind::CharDevice => {
                 let size = overlay.file_contents(&path).map(|b| b.len()).unwrap_or(0);
                 RootFsMetadata {
                     path: normalized,
