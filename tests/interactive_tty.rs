@@ -20,10 +20,35 @@ fn interactive_run_provides_a_working_pty() {
     let slave = unsafe { libc::open(name.as_ptr(), libc::O_RDWR) };
     assert!(slave >= 0, "open slave");
 
+    // Use the signed release binary: HVF requires the com.apple.security.hypervisor
+    // entitlement which is only present on the binary produced by build-signed.sh.
+    // The unsigned debug binary (CARGO_BIN_EXE_carrick) fails with HV_DENIED.
+    let bin = concat!(env!("CARGO_MANIFEST_DIR"), "/target/release/carrick");
+    if !std::path::Path::new(bin).exists() {
+        eprintln!("SKIP: {bin} not found — run ./scripts/build-signed.sh first");
+        return;
+    }
+    // Verify the hypervisor entitlement is present; skip rather than fail if not.
+    let signed = std::process::Command::new("codesign")
+        .args(["-d", "--entitlements", "-", bin])
+        .output()
+        .map(|o| {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            stdout.contains("hypervisor") || stderr.contains("hypervisor")
+        })
+        .unwrap_or(false);
+    if !signed {
+        eprintln!(
+            "SKIP: {bin} is not signed with the hypervisor entitlement — run ./scripts/build-signed.sh"
+        );
+        return;
+    }
+
     // /bin/cat: the pty line discipline echoes typed input; cat echoes it
     // again. A real tty under -t => the marker appears at least twice.
     let dup_slave = unsafe { libc::dup(slave) };
-    let mut child = Command::new(env!("CARGO_BIN_EXE_carrick"))
+    let mut child = Command::new(bin)
         .args(["run", "-t", "--fs", "host", "docker.io/library/debian:stable", "/bin/cat"])
         .stdin(unsafe { Stdio::from_raw_fd(slave) })
         .stdout(unsafe { Stdio::from_raw_fd(dup_slave) })
