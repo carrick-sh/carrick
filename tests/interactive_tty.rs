@@ -15,7 +15,10 @@ fn interactive_run_provides_a_working_pty() {
     // Allocate a pty; the child's stdio = the slave.
     let master = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
     assert!(master >= 0, "posix_openpt");
-    unsafe { libc::grantpt(master); libc::unlockpt(master); }
+    unsafe {
+        libc::grantpt(master);
+        libc::unlockpt(master);
+    }
     let name = unsafe { std::ffi::CStr::from_ptr(libc::ptsname(master)) }.to_owned();
     let slave = unsafe { libc::open(name.as_ptr(), libc::O_RDWR) };
     assert!(slave >= 0, "open slave");
@@ -49,7 +52,14 @@ fn interactive_run_provides_a_working_pty() {
     // again. A real tty under -t => the marker appears at least twice.
     let dup_slave = unsafe { libc::dup(slave) };
     let mut child = Command::new(bin)
-        .args(["run", "-t", "--fs", "host", "docker.io/library/debian:stable", "/bin/cat"])
+        .args([
+            "run",
+            "-t",
+            "--fs",
+            "host",
+            "docker.io/library/debian:stable",
+            "/bin/cat",
+        ])
         .stdin(unsafe { Stdio::from_raw_fd(slave) })
         .stdout(unsafe { Stdio::from_raw_fd(dup_slave) })
         .stderr(Stdio::null())
@@ -65,7 +75,9 @@ fn interactive_run_provides_a_working_pty() {
     // Give the guest time to boot (image pull + HVF boot), then "type" a marker.
     std::thread::sleep(Duration::from_secs(20));
     let marker = b"carricktty7\n";
-    unsafe { libc::write(master, marker.as_ptr().cast(), marker.len()); }
+    unsafe {
+        libc::write(master, marker.as_ptr().cast(), marker.len());
+    }
 
     // Read for up to ~10s looking for the marker twice.
     let mut out = Vec::new();
@@ -75,22 +87,33 @@ fn interactive_run_provides_a_working_pty() {
         let n = unsafe { libc::read(master, buf.as_mut_ptr().cast(), buf.len()) };
         if n > 0 {
             out.extend_from_slice(&buf[..n as usize]);
-            let hits = out.windows(b"carricktty7".len()).filter(|w| *w == b"carricktty7").count();
-            if hits >= 2 { break; }
+            let hits = out
+                .windows(b"carricktty7".len())
+                .filter(|w| *w == b"carricktty7")
+                .count();
+            if hits >= 2 {
+                break;
+            }
         } else {
             std::thread::sleep(Duration::from_millis(100));
         }
     }
     // Ctrl-D so cat exits; then tear down.
-    unsafe { libc::write(master, b"\x04".as_ptr().cast(), 1); }
+    unsafe {
+        libc::write(master, b"\x04".as_ptr().cast(), 1);
+    }
     std::thread::sleep(Duration::from_millis(500));
     let _ = child.kill();
     let _ = child.wait();
-    unsafe { libc::close(master); }
+    unsafe {
+        libc::close(master);
+    }
 
     let text = String::from_utf8_lossy(&out);
     let hits = text.matches("carricktty7").count();
-    assert!(hits >= 2,
+    assert!(
+        hits >= 2,
         "expected the typed marker echoed by the pty line discipline AND by cat (>=2 occurrences), \
-         got {hits}. A real tty under -t echoes input. Output:\n{text}");
+         got {hits}. A real tty under -t echoes input. Output:\n{text}"
+    );
 }
