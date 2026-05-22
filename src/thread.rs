@@ -80,6 +80,16 @@ impl ThreadRegistry {
             .expect("thread registry mutex poisoned")
             .len()
     }
+
+    /// Is `tid` a live thread of this process? Used to route a guest
+    /// `tgkill`/`tkill` to a sibling vs. reporting ESRCH.
+    pub fn is_live(&self, tid: ThreadId) -> bool {
+        #[allow(clippy::expect_used)]
+        self.inner
+            .lock()
+            .expect("thread registry mutex poisoned")
+            .contains_key(&tid)
+    }
 }
 
 /// How a `FUTEX_WAIT` ended.

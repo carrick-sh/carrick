@@ -340,6 +340,13 @@ impl HvfTrapEngine {
         self.inner.program_counter()
     }
 
+    /// A `Send`/`Sync` handle other threads can use to force this vCPU out of
+    /// `hv_vcpu_run` (see [`crate::vcpu_kick`]). Published into the shared
+    /// `VcpuKicker` when this thread starts running.
+    pub fn vcpu_kick_handle(&self) -> crate::vcpu_kick::VcpuKickHandle {
+        self.inner.vcpu_kick_handle()
+    }
+
     pub fn map_address_space(
         &mut self,
         address_space: &AddressSpace,
@@ -349,7 +356,7 @@ impl HvfTrapEngine {
         Ok(plan)
     }
 
-    pub fn run_until_syscall(&mut self) -> Result<Aarch64SyscallFrame, TrapError> {
+    pub fn run_until_syscall(&mut self) -> Result<Option<Aarch64SyscallFrame>, TrapError> {
         self.inner.run_until_syscall()
     }
 
@@ -455,9 +462,15 @@ impl HvfTrapEngine {
         handler: u64,
         sa_restorer: u64,
         pending_syscall_retval: Option<i64>,
+        interrupted_pc: Option<u64>,
     ) -> Result<(), TrapError> {
-        self.inner
-            .inject_signal(signum, handler, sa_restorer, pending_syscall_retval)
+        self.inner.inject_signal(
+            signum,
+            handler,
+            sa_restorer,
+            pending_syscall_retval,
+            interrupted_pc,
+        )
     }
 
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -467,6 +480,7 @@ impl HvfTrapEngine {
         _handler: u64,
         _sa_restorer: u64,
         _pending_syscall_retval: Option<i64>,
+        _interrupted_pc: Option<u64>,
     ) -> Result<(), TrapError> {
         Err(TrapError::UnsupportedPlatform)
     }
@@ -686,11 +700,23 @@ impl HvfInner {
         self.vcpu.get_reg(Reg::PC).map_err(hvf_error)
     }
 
-    fn run_until_syscall(&mut self) -> Result<Aarch64SyscallFrame, TrapError> {
+    fn vcpu_kick_handle(&self) -> crate::vcpu_kick::VcpuKickHandle {
+        crate::vcpu_kick::VcpuKickHandle::new(self.vcpu.get_handle())
+    }
+
+    fn run_until_syscall(&mut self) -> Result<Option<Aarch64SyscallFrame>, TrapError> {
         use applevisor::prelude::*;
 
         self.vcpu.run().map_err(hvf_error)?;
         let exit = self.vcpu.get_exit_info();
+        if exit.reason == ExitReason::CANCELED {
+            // A cross-thread `hv_vcpus_exit` (crate::vcpu_kick) forced this vCPU
+            // out of the guest so a pending signal can be delivered. There is no
+            // syscall; the loop runs signal delivery, then resumes the guest at
+            // its current PC. A spurious cancel with nothing pending just costs
+            // one extra loop iteration.
+            return Ok(None);
+        }
         if exit.reason != ExitReason::EXCEPTION {
             return Err(TrapError::UnexpectedExit {
                 reason: format!("{:?}", exit.reason),
@@ -821,7 +847,7 @@ impl HvfInner {
             stack_host_base,
             stack_guest_end,
         });
-        Ok(frame)
+        Ok(Some(frame))
     }
 
     fn complete_syscall(&mut self, return_value: i64) -> Result<(), TrapError> {
@@ -1137,6 +1163,7 @@ impl HvfInner {
         handler: u64,
         sa_restorer: u64,
         pending_syscall_retval: Option<i64>,
+        interrupted_pc: Option<u64>,
     ) -> Result<(), TrapError> {
         use applevisor::prelude::*;
         use zerocopy::IntoBytes;
@@ -1161,7 +1188,14 @@ impl HvfInner {
         if let Some(retval) = pending_syscall_retval {
             frame.saved_x[0] = retval as u64;
         }
-        frame.saved_pc = self.vcpu.get_sys_reg(SysReg::ELR_EL1).map_err(hvf_error)?;
+        // Resume address after the handler returns. On a syscall-boundary
+        // injection HVF set ELR_EL1 to the instruction after the `svc`; on a
+        // kick (CANCELED) exit there was no exception, so ELR_EL1 is stale and
+        // the caller passes the live guest PC instead.
+        frame.saved_pc = match interrupted_pc {
+            Some(pc) => pc,
+            None => self.vcpu.get_sys_reg(SysReg::ELR_EL1).map_err(hvf_error)?,
+        };
         frame.saved_sp = self.vcpu.get_sys_reg(SysReg::SP_EL0).map_err(hvf_error)?;
         frame.saved_spsr = self
             .vcpu
@@ -1226,13 +1260,21 @@ impl HvfInner {
         self.vcpu.set_reg(Reg::X30, restorer).map_err(hvf_error)?;
         crate::probes::signal_inject(signum, frame.saved_pc, new_sp, handler);
 
-        // Redirect post-eret PC to the handler. ELR_EL1 was previously
-        // "instruction after the SVC that just trapped"; we steal it
-        // for the handler entry, and the saved value lives in
-        // frame.saved_pc until rt_sigreturn restores it.
-        self.vcpu
-            .set_sys_reg(SysReg::ELR_EL1, handler)
-            .map_err(hvf_error)?;
+        // Redirect to the handler entry. On a syscall-boundary injection the
+        // guest is mid-`eret` from the EL1 vector, so the resume PC is ELR_EL1
+        // (previously "instruction after the SVC"); we steal it for the handler
+        // and frame.saved_pc holds the original until rt_sigreturn. On a kick
+        // (CANCELED) injection there is no pending eret — the vCPU resumes
+        // directly at Reg::PC — so redirect PC instead and leave ELR_EL1 alone.
+        // Either way the handler later returns via the rt_sigreturn `svc`, whose
+        // completion restores ELR_EL1 = saved_pc and erets to it.
+        if interrupted_pc.is_some() {
+            self.vcpu.set_reg(Reg::PC, handler).map_err(hvf_error)?;
+        } else {
+            self.vcpu
+                .set_sys_reg(SysReg::ELR_EL1, handler)
+                .map_err(hvf_error)?;
+        }
 
         // Preserve the SPSR_EL1 we snapshotted — we want to return to
         // EL0t with the same DAIF state, and the EL1 vector path
@@ -1795,7 +1837,11 @@ impl HvfInner {
         Err(TrapError::UnsupportedPlatform)
     }
 
-    fn run_until_syscall(&mut self) -> Result<Aarch64SyscallFrame, TrapError> {
+    fn vcpu_kick_handle(&self) -> crate::vcpu_kick::VcpuKickHandle {
+        crate::vcpu_kick::VcpuKickHandle::placeholder()
+    }
+
+    fn run_until_syscall(&mut self) -> Result<Option<Aarch64SyscallFrame>, TrapError> {
         Err(TrapError::UnsupportedPlatform)
     }
 

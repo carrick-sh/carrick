@@ -22,7 +22,9 @@
 //! command", not "perfectly faithful POSIX signal queueing". One slot
 //! is enough for that.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
 
 use crate::linux_abi::LINUX_SIGINT;
 
@@ -77,6 +79,73 @@ pub const NO_PENDING_SIGNAL: i32 = 0;
 
 static PENDING: AtomicI32 = AtomicI32::new(NO_PENDING_SIGNAL);
 
+/// Thread-directed pending signals, keyed by guest tid. A process-directed
+/// signal (host `SIGINT`, `kill(pid)`) goes into the global `PENDING` slot and
+/// may be serviced by any thread; a *thread*-directed signal (guest
+/// `tgkill(tid, sig)` / `tkill`) targets exactly one guest thread and is parked
+/// here so only that thread delivers it. Set ONLY from guest-dispatch context
+/// (never a host async handler — a host signal can't name a guest tid), so a
+/// plain `Mutex` is safe; it is never locked from a signal handler. One slot
+/// per tid mirrors the single-slot global model (last delivered wins).
+static THREAD_PENDING: LazyLock<Mutex<HashMap<i32, i32>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Publish a signal targeted at a specific guest `tid` and wake parked waiters.
+/// The waking thread (and only it, via `take_pending_for`) will deliver it.
+/// Unlike `publish_pending`, this is NOT async-signal-safe (takes a `Mutex`) —
+/// call it only from normal dispatch context, which is the only place a guest
+/// tid is known.
+pub fn publish_pending_for(tid: i32, signum: i32) {
+    #[allow(clippy::expect_used)]
+    THREAD_PENDING
+        .lock()
+        .expect("THREAD_PENDING poisoned")
+        .insert(tid, signum);
+    notify_pending();
+}
+
+/// Drain the signal deliverable to `tid`: a thread-directed one for this tid
+/// takes priority, otherwise the process-directed global slot. Returns `0`
+/// (`NO_PENDING_SIGNAL`) if neither is set. This is the single point of
+/// consumption (called under the kernel lock in `deliver_pending_signal`).
+pub fn take_pending_for(tid: i32) -> i32 {
+    #[allow(clippy::expect_used)]
+    if let Some(s) = THREAD_PENDING
+        .lock()
+        .expect("THREAD_PENDING poisoned")
+        .remove(&tid)
+    {
+        return s;
+    }
+    PENDING.swap(NO_PENDING_SIGNAL, Ordering::SeqCst)
+}
+
+/// Is a signal deliverable to `tid` pending? True for a thread-directed signal
+/// for this tid OR any process-directed signal. Used by a thread parked in
+/// `kevent`/`futex` to decide whether to break its wait so the trap loop can
+/// run delivery — without waking siblings for a signal that isn't theirs.
+pub fn has_pending_for(tid: i32) -> bool {
+    if PENDING.load(Ordering::SeqCst) != NO_PENDING_SIGNAL {
+        return true;
+    }
+    #[allow(clippy::expect_used)]
+    THREAD_PENDING
+        .lock()
+        .expect("THREAD_PENDING poisoned")
+        .contains_key(&tid)
+}
+
+/// Drop any thread-directed pending entry for `tid` (called when a guest thread
+/// exits so a recycled tid never inherits a stale signal). A forked child also
+/// clears the whole table via `reinit_after_fork`.
+pub fn forget_thread(tid: i32) {
+    #[allow(clippy::expect_used)]
+    THREAD_PENDING
+        .lock()
+        .expect("THREAD_PENDING poisoned")
+        .remove(&tid);
+}
+
 /// Process-wide self-pipe used to wake threads parked in a blocking-I/O
 /// `kevent()` (see `io_wait`) the instant a signal becomes pending. The signal
 /// handler writes one byte (async-signal-safe); every thread's kqueue watches
@@ -126,6 +195,12 @@ fn open_pending_pipe() {
 /// self-pipe so its parked-thread wakes are its own.
 pub fn reinit_after_fork() {
     open_pending_pipe();
+    // The child is single-threaded (fork copies only the calling thread); any
+    // sibling-directed pending entries inherited from the parent are stale.
+    if let Ok(mut map) = THREAD_PENDING.lock() {
+        map.clear();
+    }
+    PENDING.store(NO_PENDING_SIGNAL, Ordering::SeqCst);
 }
 
 /// Wake any thread parked in a blocking-I/O `kevent()` by making the self-pipe
@@ -268,4 +343,51 @@ pub fn has_pending() -> bool {
 /// service synthetic raises the same way it services host SIGINT.
 pub fn raise_for_self(signum: i32) {
     publish_pending(signum);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // These tests touch process-global state (the single `PENDING` slot), so a
+    // shared lock serialises them; each drains `PENDING` on entry. The
+    // THREAD_PENDING map is keyed by disjoint high tids per test.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn thread_directed_takes_priority_for_its_tid() {
+        let _g = TEST_LOCK.lock().unwrap();
+        PENDING.store(NO_PENDING_SIGNAL, Ordering::SeqCst);
+        let tid = 900_001;
+        publish_pending_for(tid, LINUX_SIGINT);
+        assert!(has_pending_for(tid));
+        // A different tid does NOT see another thread's directed signal
+        // (no process-directed signal is pending here).
+        assert!(!has_pending_for(900_002));
+        assert_eq!(take_pending_for(tid), LINUX_SIGINT);
+        // Consumed exactly once.
+        assert_eq!(take_pending_for(tid), NO_PENDING_SIGNAL);
+    }
+
+    #[test]
+    fn forget_thread_drops_pending() {
+        let _g = TEST_LOCK.lock().unwrap();
+        PENDING.store(NO_PENDING_SIGNAL, Ordering::SeqCst);
+        let tid = 900_003;
+        publish_pending_for(tid, 15);
+        forget_thread(tid);
+        assert_eq!(take_pending_for(tid), NO_PENDING_SIGNAL);
+    }
+
+    #[test]
+    fn take_pending_for_falls_back_to_process_directed() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let tid = 900_004;
+        // No thread-directed entry; a process-directed signal is deliverable by
+        // any tid.
+        PENDING.store(7, Ordering::SeqCst);
+        assert!(has_pending_for(tid));
+        assert_eq!(take_pending_for(tid), 7);
+        assert_eq!(PENDING.load(Ordering::SeqCst), NO_PENDING_SIGNAL);
+    }
 }

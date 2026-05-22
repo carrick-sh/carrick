@@ -149,6 +149,9 @@ impl SyscallDispatcher {
             });
         }
         // tkill's target is a thread id, not a "0 means self" pid form.
+        if let Some(routed) = self.route_thread_signal(ctx, tid, signum) {
+            return Ok(routed);
+        }
         if signal_is_self_target(tid, /*tid_required=*/ true) {
             return Ok(self.raise_self(signum));
         }
@@ -167,6 +170,10 @@ impl SyscallDispatcher {
                 errno: LINUX_EINVAL,
             });
         }
+        // A sibling thread of this process: deliver to that tid's vCPU.
+        if let Some(routed) = self.route_thread_signal(ctx, tid, signum) {
+            return Ok(routed);
+        }
         let host_pid = std::process::id() as i64;
         let bootstrap_pid = LINUX_BOOTSTRAP_PID as i64;
         let valid_self =
@@ -176,6 +183,32 @@ impl SyscallDispatcher {
             return Ok(DispatchOutcome::Errno { errno: LINUX_ESRCH });
         }
         Ok(self.raise_self(signum))
+    }
+
+    /// Shared tgkill/tkill routing for the multi-threaded path. Returns
+    /// `Some(outcome)` when `tid` names a live thread of this process:
+    /// `raise_self` if it's the caller, else a `SignalThread` outcome the
+    /// runtime delivers + kicks. Returns `None` (so the caller falls back to
+    /// the pid/bootstrap path) when there's no thread context (single-threaded)
+    /// or `tid` isn't a live sibling.
+    fn route_thread_signal<M: GuestMemory>(
+        &mut self,
+        ctx: &SyscallCtx<M>,
+        tid: i64,
+        signum: u64,
+    ) -> Option<DispatchOutcome> {
+        let t = ctx.thread.as_ref()?;
+        let target = tid as crate::thread::ThreadId;
+        if i64::from(t.tid) == tid {
+            return Some(self.raise_self(signum));
+        }
+        if t.registry.is_live(target) {
+            return Some(DispatchOutcome::SignalThread {
+                tid: target,
+                signum: signum as i32,
+            });
+        }
+        None
     }
 
     pub(super) fn sigaltstack<M: GuestMemory>(
