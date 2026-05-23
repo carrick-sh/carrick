@@ -7,6 +7,7 @@ description = "A Rust bootstrap for Carrick, a Linux binary compatibility layer 
 
 [dependencies]
 anyhow = "1.0.100"
+bitflags = "2.10.0"
 libc = "0.2"
 camino = { version = "1.2.1", features = ["serde1"] }
 cap-std = "4"

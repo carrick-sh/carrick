@@ -504,10 +504,10 @@ impl SyscallDispatcher {
         let timeout_ms: i32 = if timeout_addr == 0 {
             -1
         } else {
-            match memory.read_bytes(timeout_addr, 16) {
-                Ok(b) if b.len() == 16 => {
-                    let sec = i64::from_le_bytes(b[0..8].try_into().unwrap_or([0; 8]));
-                    let nsec = i64::from_le_bytes(b[8..16].try_into().unwrap_or([0; 8]));
+            match read_kernel_struct::<LinuxTimespec>(memory, timeout_addr) {
+                Ok(timespec) => {
+                    let sec = timespec.tv_sec;
+                    let nsec = timespec.tv_nsec;
                     let ms = sec.saturating_mul(1000).saturating_add(nsec / 1_000_000);
                     if ms <= 0 {
                         0
@@ -776,10 +776,10 @@ impl SyscallDispatcher {
         let timeout_ms: i32 = if timeout_address == 0 {
             -1
         } else {
-            match memory.read_bytes(timeout_address, 16) {
-                Ok(b) if b.len() == 16 => {
-                    let sec = i64::from_le_bytes(b[0..8].try_into().unwrap_or([0; 8]));
-                    let nsec = i64::from_le_bytes(b[8..16].try_into().unwrap_or([0; 8]));
+            match read_kernel_struct::<LinuxTimespec>(memory, timeout_address) {
+                Ok(timespec) => {
+                    let sec = timespec.tv_sec;
+                    let nsec = timespec.tv_nsec;
                     let ms = sec.saturating_mul(1000).saturating_add(nsec / 1_000_000);
                     if ms <= 0 {
                         0
@@ -1225,9 +1225,10 @@ impl SyscallDispatcher {
     /// SOCK_DGRAM for netlink (they're equivalent there); other socket
     /// types are rejected with ESOCKTNOSUPPORT, matching the kernel.
     fn netlink_socket(&self, type_: i32, protocol: i32) -> DispatchOutcome {
-        let nonblock = type_ & LINUX_SOCK_NONBLOCK != 0;
-        let cloexec = type_ & LINUX_SOCK_CLOEXEC != 0;
-        let base_type = type_ & !(LINUX_SOCK_NONBLOCK | LINUX_SOCK_CLOEXEC);
+        let socket_flags = LinuxSocketTypeFlags::from_bits_retain(type_);
+        let nonblock = socket_flags.contains(LinuxSocketTypeFlags::NONBLOCK);
+        let cloexec = socket_flags.contains(LinuxSocketTypeFlags::CLOEXEC);
+        let base_type = type_ & !LinuxSocketTypeFlags::SUPPORTED_MASK;
         if base_type != LINUX_SOCK_RAW && base_type != LINUX_SOCK_DGRAM {
             return DispatchOutcome::Errno {
                 errno: LINUX_ESOCKTNOSUPPORT,
@@ -1251,9 +1252,10 @@ impl SyscallDispatcher {
         // Strip the Linux-only SOCK_NONBLOCK / SOCK_CLOEXEC bits before
         // we hand the type to macOS, then set them on the resulting fd
         // by hand.
-        let nonblock = type_ & LINUX_SOCK_NONBLOCK != 0;
-        let cloexec = type_ & LINUX_SOCK_CLOEXEC != 0;
-        let base_type = type_ & !(LINUX_SOCK_NONBLOCK | LINUX_SOCK_CLOEXEC);
+        let socket_flags = LinuxSocketTypeFlags::from_bits_retain(type_);
+        let nonblock = socket_flags.contains(LinuxSocketTypeFlags::NONBLOCK);
+        let cloexec = socket_flags.contains(LinuxSocketTypeFlags::CLOEXEC);
+        let base_type = type_ & !LinuxSocketTypeFlags::SUPPORTED_MASK;
         let host_family = linux_to_host_af(family);
         let host_type = linux_to_host_socktype(base_type);
         let host_fd = unsafe { libc::socket(host_family, host_type, protocol) };
@@ -1302,9 +1304,10 @@ impl SyscallDispatcher {
         let type_ = ctx.request.arg(1) as i32;
         let protocol = ctx.request.arg(2) as i32;
         let sv_addr = ctx.request.arg(3);
-        let nonblock = type_ & LINUX_SOCK_NONBLOCK != 0;
-        let cloexec = type_ & LINUX_SOCK_CLOEXEC != 0;
-        let base_type = type_ & !(LINUX_SOCK_NONBLOCK | LINUX_SOCK_CLOEXEC);
+        let socket_flags = LinuxSocketTypeFlags::from_bits_retain(type_);
+        let nonblock = socket_flags.contains(LinuxSocketTypeFlags::NONBLOCK);
+        let cloexec = socket_flags.contains(LinuxSocketTypeFlags::CLOEXEC);
+        let base_type = type_ & !LinuxSocketTypeFlags::SUPPORTED_MASK;
         let host_family = linux_to_host_af(family);
         let host_type = linux_to_host_socktype(base_type);
 
@@ -1624,8 +1627,9 @@ impl SyscallDispatcher {
             // accept on readiness.
             other => return other,
         };
-        let nonblock = accept4_flags & LINUX_SOCK_NONBLOCK != 0;
-        let cloexec = accept4_flags & LINUX_SOCK_CLOEXEC != 0;
+        let socket_flags = LinuxSocketTypeFlags::from_bits_retain(accept4_flags);
+        let nonblock = socket_flags.contains(LinuxSocketTypeFlags::NONBLOCK);
+        let cloexec = socket_flags.contains(LinuxSocketTypeFlags::CLOEXEC);
         // The accepted socket inherits the listen socket's non-blocking mode on
         // macOS; set it to match the guest's intent (recv/send use MSG_DONTWAIT
         // regardless, so this is for fidelity).
@@ -2379,9 +2383,8 @@ impl SyscallDispatcher {
         let msgvec = request.arg(1);
         let vlen = request.arg(2) as u32;
         let flags = request.arg(3) as i32;
-        // mmsghdr = msghdr (56 bytes) + msg_len:u32 (4) + pad (4) = 64.
-        const MMSGHDR_SIZE: u64 = 64;
-        const MSG_LEN_OFFSET: u64 = 56;
+        const MMSGHDR_SIZE: u64 = <LinuxMmsghdr as KernelAbi>::ABI_SIZE as u64;
+        const MSG_LEN_OFFSET: u64 = <LinuxMsghdr as KernelAbi>::ABI_SIZE as u64;
         let mut sent: i32 = 0;
         for i in 0..vlen {
             let entry = match msgvec.checked_add(i as u64 * MMSGHDR_SIZE) {
@@ -2458,8 +2461,8 @@ impl SyscallDispatcher {
         let msgvec = request.arg(1);
         let vlen = request.arg(2) as u32;
         let flags = request.arg(3) as i32;
-        const MMSGHDR_SIZE: u64 = 64;
-        const MSG_LEN_OFFSET: u64 = 56;
+        const MMSGHDR_SIZE: u64 = <LinuxMmsghdr as KernelAbi>::ABI_SIZE as u64;
+        const MSG_LEN_OFFSET: u64 = <LinuxMsghdr as KernelAbi>::ABI_SIZE as u64;
         let mut received: i32 = 0;
         for i in 0..vlen {
             let entry = match msgvec.checked_add(i as u64 * MMSGHDR_SIZE) {
@@ -2545,17 +2548,11 @@ impl SyscallDispatcher {
 }
 
 fn read_epoll_event(memory: &impl GuestMemory, address: u64) -> Result<LinuxEpollEvent, i32> {
-    let bytes = memory
-        .read_bytes(address, core::mem::size_of::<LinuxEpollEvent>())
-        .map_err(|_| LINUX_EFAULT)?;
-    LinuxEpollEvent::read_from_bytes(&bytes).map_err(|_| LINUX_EFAULT)
+    read_kernel_struct(memory, address)
 }
 
 fn read_pollfd(memory: &impl GuestMemory, address: u64) -> Result<LinuxPollFd, i32> {
-    let bytes = memory
-        .read_bytes(address, core::mem::size_of::<LinuxPollFd>())
-        .map_err(|_| LINUX_EFAULT)?;
-    LinuxPollFd::read_from_bytes(&bytes).map_err(|_| LINUX_EFAULT)
+    read_kernel_struct(memory, address)
 }
 
 fn read_fd_set(memory: &impl GuestMemory, address: u64, nfds: usize) -> Result<Vec<u8>, i32> {
@@ -3054,37 +3051,8 @@ fn write_linux_sockaddr(
         .map_err(|_| ())
 }
 
-#[derive(Debug, Clone, Copy)]
-struct LinuxMsghdr {
-    name: u64,
-    namelen: u32,
-    iov: u64,
-    iovlen: u64,
-}
-
 fn read_linux_msghdr(memory: &impl GuestMemory, addr: u64) -> Result<LinuxMsghdr, i32> {
-    if addr == 0 {
-        return Err(LINUX_EFAULT);
-    }
-    // Linux msghdr (LP64): name(8) namelen(4) pad(4) iov(8) iovlen(8)
-    //                      control(8) controllen(8) flags(4)
-    let bytes = memory.read_bytes(addr, 56).map_err(|_| LINUX_EFAULT)?;
-    // INVARIANT: read_bytes(_, 56) returns exactly 56 bytes on Ok, so every
-    // fixed-offset sub-slice below (max end 32) always converts into its array.
-    #[allow(clippy::unwrap_used)]
-    let name = u64::from_ne_bytes(bytes[0..8].try_into().unwrap());
-    #[allow(clippy::unwrap_used)]
-    let namelen = u32::from_ne_bytes(bytes[8..12].try_into().unwrap());
-    #[allow(clippy::unwrap_used)]
-    let iov = u64::from_ne_bytes(bytes[16..24].try_into().unwrap());
-    #[allow(clippy::unwrap_used)]
-    let iovlen = u64::from_ne_bytes(bytes[24..32].try_into().unwrap());
-    Ok(LinuxMsghdr {
-        name,
-        namelen,
-        iov,
-        iovlen,
-    })
+    read_kernel_struct(memory, addr)
 }
 
 /// Direction a blocking I/O syscall waits on, in `libc::poll` event terms.

@@ -149,6 +149,7 @@ impl SyscallDispatcher {
         let map_type = flags & (LINUX_MAP_SHARED | LINUX_MAP_PRIVATE);
         if length == 0
             || prot & !(LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC) != 0
+            || flags & !LinuxMmapFlags::SUPPORTED_MASK != 0
             || (map_type != LINUX_MAP_SHARED && map_type != LINUX_MAP_PRIVATE)
             || (flags & LINUX_MAP_ANONYMOUS == 0 && !offset.is_multiple_of(LINUX_PAGE_SIZE))
             || (flags & LINUX_MAP_FIXED != 0 && !requested.is_multiple_of(LINUX_PAGE_SIZE))

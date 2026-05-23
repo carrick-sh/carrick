@@ -39,7 +39,11 @@ Work package progress:
   - Completed: `FIONBIO` now updates Linux-visible status flags and host nonblocking mode for host-backed fds.
   - Completed: blocking `eventfd` reads now wait and wake from writer updates while nonblocking reads still return `EAGAIN`.
   - Completed: `timerfd` reads now wait on timer state without holding the fd description lock, and `timerfd_settime` wakes blocked readers so re-arming changes their deadline.
-- [ ] Package 4. ABI and Flag Types
+- [x] Package 4. ABI and Flag Types
+  - Completed: added a direct `bitflags` dependency and typed Linux flag families for open, at/statx, mmap, futex, clone, socket type, and fd descriptor flags.
+  - Completed: added read-side `KernelAbi` helpers, including prefix reads for variable-sized structs, and migrated timespec, iovec, pollfd, epoll_event, msghdr, and clone_args reads away from manual byte slicing.
+  - Completed: added zerocopy ABI structs for `msghdr`, `mmsghdr`, and `clone_args`; mmsg entry sizing now comes from the ABI types.
+  - Verified accepted/rejected flag masks, unaligned/null/truncated/overlarge ABI reads, unknown mmap flag `EINVAL`, socket/thread regressions, and fcntl fd flag behavior.
 - [x] Package 5. Darwin Filesystem Leverage
   - Completed: `sync` now invokes the host sync primitive, and host-backed `fsync`/`fdatasync`/`syncfs` flush the real host fd with optional `CARRICK_STRICT_DURABILITY=1` `F_FULLFSYNC` on macOS.
   - Completed: `HostFsBackend::seed_from_rootfs` now materializes through its cap-std rooted `Dir` instead of re-entering through an ambient path.

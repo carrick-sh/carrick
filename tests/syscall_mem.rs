@@ -157,6 +157,43 @@ fn mmap_anonymous_reservations_fit_in_runtime_arena() {
 }
 
 #[test]
+fn mmap_rejects_unknown_map_flag_bits() {
+    const LINUX_EINVAL: i32 = 22;
+    let mut memory = AddressSpace::from_segments(
+        0,
+        [(LINUX_MMAP_BASE, rwx_perms(), Vec::new(), LINUX_MMAP_SIZE)],
+    )
+    .unwrap();
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    let map_private_anonymous = 0x02 | 0x20;
+    let unknown_flag = 1u64 << 47;
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    222,
+                    SyscallArgs::from([
+                        0,
+                        0x1000,
+                        0,
+                        map_private_anonymous | unknown_flag,
+                        (-1_i64) as u64,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno {
+            errno: LINUX_EINVAL
+        }
+    );
+}
+
+#[test]
 fn mmap_unsupported_prot_none_hint_does_not_consume_bump_space() {
     let mut memory = AddressSpace::from_segments(
         0,

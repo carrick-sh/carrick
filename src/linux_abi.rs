@@ -1,3 +1,4 @@
+use bitflags::bitflags;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 pub const LINUX_S_IFMT: u32 = 0o170000;
@@ -287,6 +288,32 @@ pub struct LinuxPollFd {
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
 )]
+pub struct LinuxMsghdr {
+    pub name: u64,
+    pub namelen: u32,
+    pub _pad0: u32,
+    pub iov: u64,
+    pub iovlen: u64,
+    pub control: u64,
+    pub controllen: u64,
+    pub flags: u32,
+    pub _pad1: u32,
+}
+
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct LinuxMmsghdr {
+    pub msg_hdr: LinuxMsghdr,
+    pub msg_len: u32,
+    pub _pad: u32,
+}
+
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
 pub struct LinuxCapabilityHeader {
     pub version: u32,
     pub pid: i32,
@@ -464,6 +491,24 @@ pub struct LinuxOpenHow {
     pub flags: u64,
     pub mode: u64,
     pub resolve: u64,
+}
+
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct LinuxCloneArgs {
+    pub flags: u64,
+    pub pidfd: u64,
+    pub child_tid: u64,
+    pub parent_tid: u64,
+    pub exit_signal: u64,
+    pub stack: u64,
+    pub stack_size: u64,
+    pub tls: u64,
+    pub set_tid: u64,
+    pub set_tid_size: u64,
+    pub cgroup: u64,
 }
 
 #[repr(C, packed)]
@@ -991,10 +1036,21 @@ kernel_abi!(
     8,
     "pollfd is fd:i32 + events:i16 + revents:i16"
 );
+kernel_abi!(
+    LinuxMsghdr,
+    56,
+    "msghdr is name+namelen+pad+iov+iovlen+control+controllen+flags+pad"
+);
+kernel_abi!(
+    LinuxMmsghdr,
+    64,
+    "mmsghdr is msghdr plus msg_len:u32 plus pad:u32"
+);
 kernel_abi!(LinuxFdPair, 8, "two-int fd pair (pipe2 etc.)");
 kernel_abi!(LinuxAuxvEntry, 16, "ELF auxv entry is two u64");
 kernel_abi!(LinuxIovec, 16, "struct iovec is base:u64 + len:u64");
 kernel_abi!(LinuxOpenHow, 24, "openat2 how is 3 u64s");
+kernel_abi!(LinuxCloneArgs, 88, "clone_args has eleven u64 fields");
 kernel_abi!(LinuxTimespec, 16, "timespec is tv_sec:i64 + tv_nsec:i64");
 kernel_abi!(LinuxItimerspec, 32, "itimerspec is two timespecs");
 kernel_abi!(LinuxTimeval, 16, "timeval is tv_sec:i64 + tv_usec:i64");
@@ -1328,6 +1384,125 @@ pub const LINUX_SOCK_STREAM: i32 = 1;
 pub const LINUX_SOCK_DGRAM: i32 = 2;
 pub const LINUX_SOCK_RAW: i32 = 3;
 pub const LINUX_SOCK_SEQPACKET: i32 = 5;
+
+pub const LINUX_CLONE_VM: u64 = 0x0000_0100;
+pub const LINUX_CLONE_FS: u64 = 0x0000_0200;
+pub const LINUX_CLONE_FILES: u64 = 0x0000_0400;
+pub const LINUX_CLONE_SIGHAND: u64 = 0x0000_0800;
+pub const LINUX_CLONE_THREAD: u64 = 0x0001_0000;
+pub const LINUX_CLONE_SETTLS: u64 = 0x0008_0000;
+pub const LINUX_CLONE_PARENT_SETTID: u64 = 0x0010_0000;
+pub const LINUX_CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
+pub const LINUX_CLONE_CHILD_SETTID: u64 = 0x0100_0000;
+
+bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LinuxOpenFlags: u64 {
+        const CREAT = LINUX_O_CREAT;
+        const EXCL = LINUX_O_EXCL;
+        const NOCTTY = 0o400;
+        const TRUNC = LINUX_O_TRUNC;
+        const APPEND = LINUX_O_APPEND;
+        const NONBLOCK = LINUX_O_NONBLOCK;
+        const DSYNC = 0o10000;
+        const ASYNC = 0o20000;
+        const DIRECT = 0o40000;
+        const LARGEFILE = 0o100000;
+        const DIRECTORY = LINUX_O_DIRECTORY;
+        const NOFOLLOW = 0o400000;
+        const NOATIME = 0o1000000;
+        const CLOEXEC = LINUX_O_CLOEXEC;
+        const SYNC = 0o4010000;
+        const PATH = 0o010000000;
+        const TMPFILE = 0o020000000;
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LinuxAtFlags: u64 {
+        const SYMLINK_NOFOLLOW = LINUX_AT_SYMLINK_NOFOLLOW;
+        const EACCESS = LINUX_AT_EACCESS;
+        const REMOVEDIR = LINUX_AT_REMOVEDIR;
+        const NO_AUTOMOUNT = LINUX_AT_NO_AUTOMOUNT;
+        const EMPTY_PATH = LINUX_AT_EMPTY_PATH;
+        const STATX_FORCE_SYNC = LINUX_AT_STATX_FORCE_SYNC;
+        const STATX_DONT_SYNC = LINUX_AT_STATX_DONT_SYNC;
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LinuxMmapFlags: u64 {
+        const SHARED = LINUX_MAP_SHARED;
+        const PRIVATE = LINUX_MAP_PRIVATE;
+        const FIXED = LINUX_MAP_FIXED;
+        const ANONYMOUS = LINUX_MAP_ANONYMOUS;
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LinuxFutexFlags: u64 {
+        const PRIVATE = LINUX_FUTEX_PRIVATE_FLAG;
+        const CLOCK_REALTIME = LINUX_FUTEX_CLOCK_REALTIME;
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LinuxCloneFlags: u64 {
+        const VM = LINUX_CLONE_VM;
+        const FS = LINUX_CLONE_FS;
+        const FILES = LINUX_CLONE_FILES;
+        const SIGHAND = LINUX_CLONE_SIGHAND;
+        const THREAD = LINUX_CLONE_THREAD;
+        const SETTLS = LINUX_CLONE_SETTLS;
+        const PARENT_SETTID = LINUX_CLONE_PARENT_SETTID;
+        const CHILD_CLEARTID = LINUX_CLONE_CHILD_CLEARTID;
+        const CHILD_SETTID = LINUX_CLONE_CHILD_SETTID;
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LinuxSocketTypeFlags: i32 {
+        const NONBLOCK = LINUX_SOCK_NONBLOCK;
+        const CLOEXEC = LINUX_SOCK_CLOEXEC;
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LinuxFdFlags: u64 {
+        const CLOEXEC = LINUX_FD_CLOEXEC;
+    }
+}
+
+impl LinuxOpenFlags {
+    pub const SUPPORTED_MASK: u64 = LINUX_O_ACCMODE | Self::all().bits();
+}
+
+impl LinuxAtFlags {
+    pub const STATX_SYNC_AS_STAT: u64 = 0x800;
+    pub const STATX_SUPPORTED_MASK: u64 = Self::EMPTY_PATH.bits()
+        | Self::SYMLINK_NOFOLLOW.bits()
+        | Self::NO_AUTOMOUNT.bits()
+        | Self::STATX_SYNC_AS_STAT
+        | Self::STATX_FORCE_SYNC.bits()
+        | Self::STATX_DONT_SYNC.bits()
+        | 0x6000;
+}
+
+impl LinuxMmapFlags {
+    pub const SUPPORTED_MASK: u64 =
+        Self::SHARED.bits() | Self::PRIVATE.bits() | Self::FIXED.bits() | Self::ANONYMOUS.bits();
+}
+
+impl LinuxFutexFlags {
+    pub const SUPPORTED_MASK: u64 = Self::PRIVATE.bits() | Self::CLOCK_REALTIME.bits();
+}
+
+impl LinuxCloneFlags {
+    pub const THREAD_MASK: u64 = Self::VM.bits()
+        | Self::FS.bits()
+        | Self::FILES.bits()
+        | Self::SIGHAND.bits()
+        | Self::THREAD.bits();
+}
+
+impl LinuxSocketTypeFlags {
+    pub const SUPPORTED_MASK: i32 = Self::NONBLOCK.bits() | Self::CLOEXEC.bits();
+}
+
 pub const LINUX_MSG_OOB: i32 = 0x0001;
 pub const LINUX_MSG_PEEK: i32 = 0x0002;
 pub const LINUX_MSG_DONTROUTE: i32 = 0x0004;
@@ -1401,6 +1576,67 @@ mod kernel_abi_tests {
             <LinuxSigaltstack as KernelAbi>::ABI_SIZE <= core::mem::size_of::<LinuxSigaltstack>()
         );
         assert!(<LinuxSigaction as KernelAbi>::ABI_SIZE <= core::mem::size_of::<LinuxSigaction>());
+    }
+
+    #[test]
+    fn message_and_clone_abi_structs_match_aarch64_layouts() {
+        assert_eq!(core::mem::size_of::<LinuxMsghdr>(), 56);
+        assert_eq!(<LinuxMsghdr as KernelAbi>::ABI_SIZE, 56);
+        assert_eq!(core::mem::offset_of!(LinuxMsghdr, name), 0);
+        assert_eq!(core::mem::offset_of!(LinuxMsghdr, namelen), 8);
+        assert_eq!(core::mem::offset_of!(LinuxMsghdr, iov), 16);
+        assert_eq!(core::mem::offset_of!(LinuxMsghdr, iovlen), 24);
+        assert_eq!(core::mem::offset_of!(LinuxMsghdr, control), 32);
+        assert_eq!(core::mem::offset_of!(LinuxMsghdr, controllen), 40);
+        assert_eq!(core::mem::offset_of!(LinuxMsghdr, flags), 48);
+
+        assert_eq!(core::mem::size_of::<LinuxMmsghdr>(), 64);
+        assert_eq!(<LinuxMmsghdr as KernelAbi>::ABI_SIZE, 64);
+        assert_eq!(core::mem::offset_of!(LinuxMmsghdr, msg_hdr), 0);
+        assert_eq!(core::mem::offset_of!(LinuxMmsghdr, msg_len), 56);
+
+        assert_eq!(core::mem::size_of::<LinuxCloneArgs>(), 88);
+        assert_eq!(<LinuxCloneArgs as KernelAbi>::ABI_SIZE, 88);
+        assert_eq!(core::mem::offset_of!(LinuxCloneArgs, flags), 0);
+        assert_eq!(core::mem::offset_of!(LinuxCloneArgs, child_tid), 16);
+        assert_eq!(core::mem::offset_of!(LinuxCloneArgs, parent_tid), 24);
+        assert_eq!(core::mem::offset_of!(LinuxCloneArgs, stack), 40);
+        assert_eq!(core::mem::offset_of!(LinuxCloneArgs, stack_size), 48);
+        assert_eq!(core::mem::offset_of!(LinuxCloneArgs, tls), 56);
+    }
+
+    #[test]
+    fn linux_flag_groups_pin_supported_and_rejected_masks() {
+        assert_ne!(LinuxOpenFlags::SUPPORTED_MASK & LINUX_O_CREAT, 0);
+        assert_ne!(LinuxOpenFlags::SUPPORTED_MASK & LINUX_O_NONBLOCK, 0);
+        assert_eq!(LinuxOpenFlags::SUPPORTED_MASK & (1u64 << 63), 0);
+
+        assert_ne!(LinuxAtFlags::STATX_SUPPORTED_MASK & LINUX_AT_EMPTY_PATH, 0);
+        assert_ne!(
+            LinuxAtFlags::STATX_SUPPORTED_MASK & LinuxAtFlags::STATX_SYNC_AS_STAT,
+            0
+        );
+        assert_eq!(LinuxAtFlags::STATX_SUPPORTED_MASK & (1u64 << 63), 0);
+
+        assert_ne!(LinuxMmapFlags::SUPPORTED_MASK & LINUX_MAP_PRIVATE, 0);
+        assert_eq!(LinuxMmapFlags::SUPPORTED_MASK & 0x8000_0000, 0);
+
+        assert_ne!(
+            LinuxFutexFlags::SUPPORTED_MASK & LINUX_FUTEX_PRIVATE_FLAG,
+            0
+        );
+        assert_eq!(LinuxFutexFlags::SUPPORTED_MASK & 0x8000_0000, 0);
+
+        assert_ne!(LinuxCloneFlags::THREAD_MASK & LINUX_CLONE_THREAD, 0);
+        assert_eq!(LinuxCloneFlags::THREAD_MASK & (1u64 << 63), 0);
+
+        assert_ne!(
+            LinuxSocketTypeFlags::SUPPORTED_MASK & LINUX_SOCK_NONBLOCK,
+            0
+        );
+        assert_eq!(LinuxSocketTypeFlags::SUPPORTED_MASK & (1_i32 << 30), 0);
+
+        assert_eq!(LinuxFdFlags::CLOEXEC.bits(), LINUX_FD_CLOEXEC);
     }
 
     #[test]
