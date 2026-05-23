@@ -1266,6 +1266,42 @@ pub const LINUX_MAP_SHARED: u64 = 0x01;
 pub const LINUX_MAP_PRIVATE: u64 = 0x02;
 pub const LINUX_MAP_FIXED: u64 = 0x10;
 pub const LINUX_MAP_ANONYMOUS: u64 = 0x20;
+// Advisory mmap flags. On Linux these are placement/swap/perf hints that the
+// kernel honours best-effort and that do not change the observable *contents*
+// of an anonymous or file mapping; software relies on the kernel accepting
+// them rather than failing. carrick accepts them and treats them as no-ops
+// (see `LINUX_MAP_HINT_MASK`).
+pub const LINUX_MAP_GROWSDOWN: u64 = 0x0100;
+pub const LINUX_MAP_DENYWRITE: u64 = 0x0800;
+pub const LINUX_MAP_EXECUTABLE: u64 = 0x1000;
+pub const LINUX_MAP_LOCKED: u64 = 0x2000;
+pub const LINUX_MAP_NORESERVE: u64 = 0x4000;
+pub const LINUX_MAP_POPULATE: u64 = 0x8000;
+pub const LINUX_MAP_NONBLOCK: u64 = 0x1_0000;
+pub const LINUX_MAP_STACK: u64 = 0x2_0000;
+pub const LINUX_MAP_HUGETLB: u64 = 0x4_0000;
+/// `MAP_FIXED_NOREPLACE`: like `MAP_FIXED` but the kernel refuses (EEXIST) to
+/// clobber an existing mapping. carrick honours the requested address exactly
+/// as it does for `MAP_FIXED` (the bootstrap FIXED path never clobbers an
+/// existing stage-2 mapping — it returns the address and relies on a
+/// pre-existing mapping or an on-access fault), so it is normalised to
+/// `MAP_FIXED` at dispatch.
+pub const LINUX_MAP_FIXED_NOREPLACE: u64 = 0x10_0000;
+/// Advisory hint flags carrick accepts and ignores (no observable effect on
+/// the mapping's contents): stack/grows-down placement, swap reservation,
+/// prefault, page-locking and huge-page hints. Rust std's stack-overflow
+/// guard maps `MAP_STACK`, the Go runtime maps `MAP_STACK|MAP_NORESERVE`, and
+/// glibc uses `MAP_DENYWRITE|MAP_EXECUTABLE` — all previously rejected with a
+/// spurious EINVAL.
+pub const LINUX_MAP_HINT_MASK: u64 = LINUX_MAP_GROWSDOWN
+    | LINUX_MAP_DENYWRITE
+    | LINUX_MAP_EXECUTABLE
+    | LINUX_MAP_LOCKED
+    | LINUX_MAP_NORESERVE
+    | LINUX_MAP_POPULATE
+    | LINUX_MAP_NONBLOCK
+    | LINUX_MAP_STACK
+    | LINUX_MAP_HUGETLB;
 pub const LINUX_MADV_NORMAL: u64 = 0;
 pub const LINUX_MADV_RANDOM: u64 = 1;
 pub const LINUX_MADV_SEQUENTIAL: u64 = 2;
@@ -1368,7 +1404,6 @@ pub const LINUX_BOOTSTRAP_PID: u64 = 1;
 pub const LINUX_SS_ONSTACK: u64 = 1;
 pub const LINUX_SS_DISABLE: u64 = 2;
 pub const LINUX_MINSIGSTKSZ: u64 = 2048;
-pub const LINUX_BOOTSTRAP_AFFINITY_BYTES: usize = 8;
 pub const LINUX_CLOCK_REALTIME: u64 = 0;
 pub const LINUX_CLOCK_MONOTONIC: u64 = 1;
 pub const LINUX_CLOCK_PROCESS_CPUTIME_ID: u64 = 2;
@@ -1533,8 +1568,12 @@ impl LinuxAtFlags {
 }
 
 impl LinuxMmapFlags {
-    pub const SUPPORTED_MASK: u64 =
-        Self::SHARED.bits() | Self::PRIVATE.bits() | Self::FIXED.bits() | Self::ANONYMOUS.bits();
+    pub const SUPPORTED_MASK: u64 = Self::SHARED.bits()
+        | Self::PRIVATE.bits()
+        | Self::FIXED.bits()
+        | Self::ANONYMOUS.bits()
+        | LINUX_MAP_HINT_MASK
+        | LINUX_MAP_FIXED_NOREPLACE;
 }
 
 impl LinuxFutexFlags {
@@ -1676,6 +1715,26 @@ mod kernel_abi_tests {
 
         assert_ne!(LinuxMmapFlags::SUPPORTED_MASK & LINUX_MAP_PRIVATE, 0);
         assert_eq!(LinuxMmapFlags::SUPPORTED_MASK & 0x8000_0000, 0);
+        // Advisory hint flags must be accepted (Rust std maps MAP_STACK, Go
+        // maps MAP_STACK|MAP_NORESERVE) — rejecting them is a spurious EINVAL.
+        for hint in [
+            LINUX_MAP_STACK,
+            LINUX_MAP_NORESERVE,
+            LINUX_MAP_POPULATE,
+            LINUX_MAP_DENYWRITE,
+            LINUX_MAP_EXECUTABLE,
+            LINUX_MAP_GROWSDOWN,
+            LINUX_MAP_LOCKED,
+            LINUX_MAP_NONBLOCK,
+            LINUX_MAP_HUGETLB,
+            LINUX_MAP_FIXED_NOREPLACE,
+        ] {
+            assert_ne!(
+                LinuxMmapFlags::SUPPORTED_MASK & hint,
+                0,
+                "mmap hint flag {hint:#x} must be accepted"
+            );
+        }
 
         assert_ne!(
             LinuxFutexFlags::SUPPORTED_MASK & LINUX_FUTEX_PRIVATE_FLAG,

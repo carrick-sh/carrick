@@ -8,10 +8,10 @@ use super::{EntryKind, Metadata, OpenContext, OpenFlags, Vfs, VfsError, VfsHandl
 
 pub(crate) fn synthetic_file(path: &str) -> Option<Vec<u8>> {
     match path {
-        "/sys/devices/system/cpu/online" => Some(synthetic_sys_cpu_online().to_vec()),
-        "/sys/devices/system/cpu/possible" => Some(synthetic_sys_cpu_possible().to_vec()),
-        "/sys/devices/system/cpu/present" => Some(synthetic_sys_cpu_present().to_vec()),
-        "/sys/devices/system/cpu/kernel_max" => Some(synthetic_sys_cpu_kernel_max().to_vec()),
+        "/sys/devices/system/cpu/online" => Some(synthetic_sys_cpu_online()),
+        "/sys/devices/system/cpu/possible" => Some(synthetic_sys_cpu_possible()),
+        "/sys/devices/system/cpu/present" => Some(synthetic_sys_cpu_present()),
+        "/sys/devices/system/cpu/kernel_max" => Some(synthetic_sys_cpu_kernel_max()),
         "/sys/devices/system/cpu/cpu0/online" => Some(synthetic_sys_cpu0_online().to_vec()),
         "/sys/devices/system/cpu/cpu0/topology/physical_package_id" => {
             Some(synthetic_sys_cpu0_physical_package_id().to_vec())
@@ -115,20 +115,34 @@ impl Vfs for SysVfs {
     }
 }
 
-fn synthetic_sys_cpu_online() -> &'static [u8] {
-    b"0\n"
+/// CPU range list for `online`/`possible`/`present`: `"0-9\n"` for 10 CPUs,
+/// `"0\n"` for a uniprocessor — the format the kernel uses and that `nproc`,
+/// `lscpu`, and `sysconf(_SC_NPROCESSORS_*)` parse. Derived from the real host
+/// core count so it agrees with `sched_getaffinity`/`/proc/cpuinfo`.
+fn cpu_range_list() -> Vec<u8> {
+    let ncpu = crate::host_facts::logical_cpu_count();
+    if ncpu <= 1 {
+        b"0\n".to_vec()
+    } else {
+        format!("0-{}\n", ncpu - 1).into_bytes()
+    }
 }
 
-fn synthetic_sys_cpu_possible() -> &'static [u8] {
-    b"0\n"
+fn synthetic_sys_cpu_online() -> Vec<u8> {
+    cpu_range_list()
 }
 
-fn synthetic_sys_cpu_present() -> &'static [u8] {
-    b"0\n"
+fn synthetic_sys_cpu_possible() -> Vec<u8> {
+    cpu_range_list()
 }
 
-fn synthetic_sys_cpu_kernel_max() -> &'static [u8] {
-    b"0\n"
+fn synthetic_sys_cpu_present() -> Vec<u8> {
+    cpu_range_list()
+}
+
+fn synthetic_sys_cpu_kernel_max() -> Vec<u8> {
+    // Highest CPU index the kernel could ever support (CONFIG_NR_CPUS-1).
+    format!("{}\n", crate::host_facts::logical_cpu_count().max(1) - 1).into_bytes()
 }
 
 fn synthetic_sys_cpu0_online() -> &'static [u8] {
