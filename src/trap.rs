@@ -882,6 +882,18 @@ impl HvfInner {
         Ok(bytes)
     }
 
+    /// Host VA of `address` iff it lives in a genuine `MAP_SHARED` file
+    /// mapping (shared across carrick processes via a host MAP_SHARED of the
+    /// real file). Used to back a cross-process futex with `__ulock`.
+    fn shared_futex_host_addr(&self, address: u64) -> Option<usize> {
+        let mapping = self.mapping_for_range(address, 4)?;
+        if !mapping.guest_shared {
+            return None;
+        }
+        let offset = (address - mapping.start) as usize;
+        Some(unsafe { mapping.host_addr.add(offset) } as usize)
+    }
+
     fn write_guest_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
         let length = bytes.len();
         if self.range_no_access(address, length) {
@@ -2064,6 +2076,10 @@ impl GuestMemory for HvfTrapEngine {
 
     fn set_no_access(&mut self, address: u64, len: usize, no_access: bool) {
         self.inner.set_no_access(address, len, no_access);
+    }
+
+    fn shared_futex_host_addr(&self, address: u64) -> Option<usize> {
+        self.inner.shared_futex_host_addr(address)
     }
 }
 

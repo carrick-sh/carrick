@@ -484,6 +484,18 @@ pub enum DispatchOutcome {
         wait: crate::thread::FutexWait,
         timeout: Option<Duration>,
     },
+    /// A `FUTEX_WAIT` on a genuine `MAP_SHARED` file mapping — an inter-PROCESS
+    /// rendezvous (LTP `tst_checkpoint`). The in-process parking-lot table can't
+    /// reach a waker in another carrick process, so the runtime blocks on the
+    /// host `__ulock` keyed by the SHARED physical page (`host_addr` is the host
+    /// VA of the futex word). Like `FutexWait` it must not block under the
+    /// dispatcher lock; the runtime waits interruptibly and completes the
+    /// syscall. `value` is the expected futex word (the kernel re-compares).
+    SharedFutexWait {
+        host_addr: usize,
+        value: u32,
+        timeout: Option<Duration>,
+    },
     /// A blocking-mode I/O syscall (ppoll/pselect/poll/select with no fd ready,
     /// or — later — recvfrom/accept/read that would block) needs to wait for
     /// host-fd readiness. Like `FutexWait`, the handler MUST NOT block while
@@ -524,6 +536,7 @@ impl DispatchOutcome {
             DispatchOutcome::ThreadExit { .. } => (0, None),
             DispatchOutcome::SignalThread { .. } => (0, None),
             DispatchOutcome::FutexWait { .. } => (0, None),
+            DispatchOutcome::SharedFutexWait { .. } => (0, None),
             DispatchOutcome::WaitOnFds { .. } => (0, None),
         }
     }
@@ -572,6 +585,18 @@ pub trait GuestMemory {
     /// memory error to EFAULT gets it for free. Default: no-op (the in-memory
     /// backend and unit tests don't model protections).
     fn set_no_access(&mut self, _address: u64, _len: usize, _no_access: bool) {}
+
+    /// Host virtual address of the byte at `guest_addr`, but ONLY when it lies
+    /// in a genuine `MAP_SHARED` file mapping (`map_shared_file`). Such a region
+    /// is backed by a host `MAP_SHARED` mapping of the real file, so the same
+    /// physical page is visible to every carrick process that mapped the file —
+    /// which makes it a valid target for a cross-process futex via the host's
+    /// `__ulock` (`UL_COMPARE_AND_WAIT_SHARED`, keyed on the physical page).
+    /// Returns `None` for private/anon guest memory (those futexes stay
+    /// in-process via the parking-lot table). Default: `None`.
+    fn shared_futex_host_addr(&self, _guest_addr: u64) -> Option<usize> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2185,8 +2210,27 @@ fn dispatch_threaded_futex(
         ));
     }
 
+    // A futex word that lives in a genuine MAP_SHARED file mapping is an
+    // inter-process rendezvous: route it through the host __ulock keyed on the
+    // shared physical page so a waker in another carrick process is reached.
+    // Private/anon futexes stay in the in-process parking-lot table.
+    let shared_host_addr = memory.shared_futex_host_addr(address);
+
     match command {
         LINUX_FUTEX_WAKE => {
+            if let Some(host_addr) = shared_host_addr {
+                // __ulock has no "count woken" return; report the requested
+                // count on success (0 if no waiter). tst_checkpoint wakes one.
+                let r = crate::ulock::wake(host_addr, value > 1);
+                let woke = if r < 0 {
+                    0
+                } else if value <= 1 {
+                    1
+                } else {
+                    i64::from(value)
+                };
+                return DispatchOutcome::Returned { value: woke };
+            }
             let n = futex.wake(address, value);
             DispatchOutcome::Returned {
                 value: i64::from(n),
@@ -2210,6 +2254,13 @@ fn dispatch_threaded_futex(
                     Err(errno) => return DispatchOutcome::Errno { errno },
                 }
             };
+            if let Some(host_addr) = shared_host_addr {
+                return DispatchOutcome::SharedFutexWait {
+                    host_addr,
+                    value,
+                    timeout,
+                };
+            }
             DispatchOutcome::FutexWait {
                 wait: futex.prepare_wait(address),
                 timeout,
