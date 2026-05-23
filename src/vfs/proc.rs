@@ -9,7 +9,30 @@
 use crate::dispatch::SyntheticProcContext;
 use crate::linux_abi::{LINUX_EACCES, LINUX_ENOENT, LINUX_ENOTDIR};
 
-use super::{EntryKind, Metadata, OpenContext, OpenFlags, Vfs, VfsError, VfsHandle};
+use super::{DirEnt, EntryKind, Metadata, OpenContext, OpenFlags, Vfs, VfsError, VfsHandle};
+
+/// `(., .., <tid>...)` entries for a `/proc/<pid>/task/` (optionally
+/// trailing-slashed) path, or `None` if the path isn't a task dir we serve.
+fn proc_task_dir_entries(path: &str) -> Option<Vec<DirEnt>> {
+    let p = path.strip_suffix('/').unwrap_or(path);
+    let pid: u32 = p.strip_prefix("/proc/")?.strip_suffix("/task")?.parse().ok()?;
+    let tids = crate::dispatch::synthetic_proc_task_dir(pid)?;
+    let mut entries = vec![
+        DirEnt {
+            name: ".".to_string(),
+            kind: EntryKind::Directory,
+        },
+        DirEnt {
+            name: "..".to_string(),
+            kind: EntryKind::Directory,
+        },
+    ];
+    entries.extend(tids.into_iter().map(|t| DirEnt {
+        name: t,
+        kind: EntryKind::Directory,
+    }));
+    Some(entries)
+}
 
 pub struct ProcVfs;
 
@@ -27,7 +50,7 @@ impl Default for ProcVfs {
 
 impl Vfs for ProcVfs {
     fn lookup(&self, path: &str) -> Result<Metadata, VfsError> {
-        if path == "/proc" {
+        if path == "/proc" || proc_task_dir_entries(path).is_some() {
             return Ok(Metadata {
                 kind: EntryKind::Directory,
                 mode: 0o555,
@@ -81,6 +104,14 @@ impl Vfs for ProcVfs {
         flags: OpenFlags,
         ctx: &OpenContext<'_>,
     ) -> Result<VfsHandle, VfsError> {
+        // `/proc/<pid>/task/` directory: list the process's thread tids.
+        if let Some(entries) = proc_task_dir_entries(path) {
+            return Ok(VfsHandle::Directory {
+                path: path.to_string(),
+                entries,
+                status_flags: 0,
+            });
+        }
         // Build a SyntheticProcContext from the OpenContext.
         let synth_ctx = SyntheticProcContext {
             executable_path: ctx.executable_path.unwrap_or("").to_owned(),
