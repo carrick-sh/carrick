@@ -258,14 +258,10 @@ impl SyscallDispatcher {
         let mut bytes = self.io.cwd.read().as_bytes().to_vec();
         bytes.push(0);
         if bytes.len() > size {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_ERANGE,
-            });
+            return Ok(LINUX_ERANGE.into());
         }
         if ctx.memory.write_bytes(address, &bytes).is_err() {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EFAULT,
-            });
+            return Ok(LINUX_EFAULT.into());
         }
         // Linux getcwd(2) returns the LENGTH of the buffer filled (including
         // the terminating NUL), not the buffer address. glibc tolerates a
@@ -306,20 +302,16 @@ impl SyscallDispatcher {
         if mode & !(LINUX_R_OK | LINUX_W_OK | LINUX_X_OK) != 0
             || !linux_access_flags_are_supported(flags)
         {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
 
         let path = match read_guest_c_string(memory, pathname) {
             Ok(path) => path,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         if path.is_empty() {
             if flags & LINUX_AT_EMPTY_PATH == 0 {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_ENOENT,
-                });
+                return Ok(LINUX_ENOENT.into());
             }
             if dirfd == LINUX_AT_FDCWD {
                 let cwd = self.io.cwd.read().clone();
@@ -330,7 +322,7 @@ impl SyscallDispatcher {
 
         let path = match self.resolve_at_path(dirfd, &path) {
             Ok(path) => path,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         Ok(self.access_resolved_path(&path, mode, flags))
     }
@@ -352,7 +344,7 @@ impl SyscallDispatcher {
         use crate::vfs::Vfs as _;
         match self.fs.rootfs_vfs.lookup(path) {
             Ok(md) => access_metadata(&vfs_md_to_rootfs_md(path, &md), mode),
-            Err(errno) => DispatchOutcome::Errno { errno },
+            Err(errno) => DispatchOutcome::errno(errno),
         }
     }
 
@@ -372,14 +364,14 @@ impl SyscallDispatcher {
         // ancestor directory; a single non-searchable parent denies access to
         // anything beneath it regardless of the leaf's own mode.
         if let Some(errno) = self.dac_ancestors_searchable(path, uid, gid) {
-            return Some(DispatchOutcome::Errno { errno });
+            return Some(DispatchOutcome::errno(errno));
         }
         let is_dir = matches!(real.kind, RootFsEntryKind::Directory);
         Some(
             match crate::dispatch::dac_check(uid, gid, real.uid, real.gid, real.mode, is_dir, mask)
             {
                 Ok(()) => DispatchOutcome::Returned { value: 0 },
-                Err(errno) => DispatchOutcome::Errno { errno },
+                Err(errno) => DispatchOutcome::errno(errno),
             },
         )
     }
@@ -469,7 +461,7 @@ impl SyscallDispatcher {
 
     fn fd_access(&self, fd: i32, mode: u64) -> DispatchOutcome {
         let Some(open_file) = self.open_file(fd) else {
-            return DispatchOutcome::Errno { errno: LINUX_EBADF };
+            return DispatchOutcome::errno(LINUX_EBADF);
         };
         let open = open_file.description.read();
         match &*open {
@@ -478,9 +470,7 @@ impl SyscallDispatcher {
             | OpenDescription::Directory { metadata, .. } => access_metadata(metadata, mode),
             OpenDescription::SyntheticFile { path, .. } => self
                 .synthetic_access(path, mode)
-                .unwrap_or(DispatchOutcome::Errno {
-                    errno: LINUX_ENOENT,
-                }),
+                .unwrap_or(DispatchOutcome::errno(LINUX_ENOENT)),
             OpenDescription::EventFd { .. }
             | OpenDescription::TimerFd { .. }
             | OpenDescription::Epoll { .. }
@@ -499,11 +489,11 @@ impl SyscallDispatcher {
         let pathname = ctx.arg(0);
         let path = match read_guest_c_string(&*ctx.memory, pathname) {
             Ok(path) => path,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         let path = match self.resolve_at_path(LINUX_AT_FDCWD, &path) {
             Ok(path) => path,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         // Use the LAYERED lookup (overlay/host backend first, then rootfs),
         // not just the immutable rootfs — otherwise a freshly mkdir'd
@@ -511,12 +501,10 @@ impl SyscallDispatcher {
         // mkdir's its extraction dir then chdir's there).
         let metadata = match self.layered_metadata(&path) {
             Ok(metadata) => metadata,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         if metadata.kind != RootFsEntryKind::Directory {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_ENOTDIR,
-            });
+            return Ok(LINUX_ENOTDIR.into());
         }
         *self.io.cwd.write() = display_rootfs_path(&metadata.path);
         Ok(DispatchOutcome::Returned { value: 0 })
@@ -526,9 +514,9 @@ impl SyscallDispatcher {
         &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let fd = ctx.arg(0) as i32;
-        let Some(open_file) = self.open_file(fd) else {
-            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+        let fd: Fd = ctx.typed_arg(0);
+        let Some(open_file) = self.open_file(fd.0) else {
+            return Ok(LINUX_EBADF.into());
         };
         let open = open_file.description.read();
         Ok(match &*open {
@@ -546,9 +534,7 @@ impl SyscallDispatcher {
             | OpenDescription::PipeWriter { .. }
             | OpenDescription::HostPipe { .. }
             | OpenDescription::HostSocket { .. }
-            | OpenDescription::Netlink { .. } => DispatchOutcome::Errno {
-                errno: LINUX_ENOTDIR,
-            },
+            | OpenDescription::Netlink { .. } => DispatchOutcome::errno(LINUX_ENOTDIR),
         })
     }
 
@@ -565,9 +551,7 @@ impl SyscallDispatcher {
     ) -> Option<DispatchOutcome> {
         if path.starts_with("/proc/") {
             reporter.record(CompatEvent::proc_read_unimplemented(path.to_owned()));
-            Some(DispatchOutcome::Errno {
-                errno: LINUX_ENOENT,
-            })
+            Some(DispatchOutcome::errno(LINUX_ENOENT))
         } else if path.starts_with("/sys/") {
             // /sys paths that are synthesized must not be recorded as unimplemented;
             // they are handled by the synthetic open path before reaching ENOENT.
@@ -575,9 +559,7 @@ impl SyscallDispatcher {
                 return None;
             }
             reporter.record(CompatEvent::sys_read_unimplemented(path.to_owned()));
-            Some(DispatchOutcome::Errno {
-                errno: LINUX_ENOENT,
-            })
+            Some(DispatchOutcome::errno(LINUX_ENOENT))
         } else {
             None
         }
@@ -591,9 +573,7 @@ impl SyscallDispatcher {
         let flags = ctx.arg(1);
         let memory = &mut *ctx.memory;
         if flags & !(LINUX_O_CLOEXEC | LINUX_O_NONBLOCK) != 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
 
         // Allocate a real host pipe so the two ends share state via the
@@ -601,7 +581,7 @@ impl SyscallDispatcher {
         // returns two fds: [0] read end, [1] write end.
         let mut host_fds = [0i32; 2];
         if let Err(errno) = (unsafe { libc::pipe(host_fds.as_mut_ptr()) }).host_syscall_errno() {
-            return Ok(DispatchOutcome::Errno { errno });
+            return Ok(errno.into());
         }
 
         let host_read = host_fds[0];
@@ -652,9 +632,7 @@ impl SyscallDispatcher {
         );
         let Ok((read_fd, write_fd)) = self.install_fd_pair_at_or_above(3, read_open, write_open)
         else {
-            return Ok(DispatchOutcome::Errno {
-                errno: linux_errno::EMFILE,
-            });
+            return Ok(linux_errno::EMFILE.into());
         };
         let pair = LinuxFdPair { read_fd, write_fd };
         if write_kernel_struct_raw(memory, address, &pair).is_err() {
@@ -665,9 +643,7 @@ impl SyscallDispatcher {
             for open_file in removed.into_iter().flatten() {
                 self.close_open_file_and_free_pty(&open_file);
             }
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EFAULT,
-            });
+            return Ok(LINUX_EFAULT.into());
         }
 
         Ok(DispatchOutcome::Returned { value: 0 })
@@ -677,16 +653,16 @@ impl SyscallDispatcher {
         &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let old_fd = ctx.arg(0) as i32;
-        Ok(self.duplicate_fd(old_fd, 3, 0))
+        let old_fd: Fd = ctx.typed_arg(0);
+        Ok(self.duplicate_fd(old_fd.0, 3, 0))
     }
 
     pub(super) fn dup3<M: GuestMemory>(
         &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let old_fd = ctx.arg(0) as i32;
-        let new_fd = ctx.arg(1) as i32;
+        let old_fd: Fd = ctx.typed_arg(0);
+        let new_fd: Fd = ctx.typed_arg(1);
         let flags = ctx.arg(2);
         // Linux dup3 only honours O_CLOEXEC in `flags` (else EINVAL), and
         // new_fd must be a valid descriptor number: out of range (negative or
@@ -695,24 +671,20 @@ impl SyscallDispatcher {
         // new_fd 0/1/2 is allowed — that's how shells redirect std streams.
         const RLIMIT_NOFILE_CUR: i32 = 1024;
         if flags & !LINUX_O_CLOEXEC != 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
-        if !(0..RLIMIT_NOFILE_CUR).contains(&new_fd) {
-            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+        if !(0..RLIMIT_NOFILE_CUR).contains(&new_fd.0) {
+            return Ok(LINUX_EBADF.into());
         }
-        if old_fd == new_fd {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+        if old_fd.0 == new_fd.0 {
+            return Ok(LINUX_EINVAL.into());
         }
-        let (description, host_fd_owner) = match self.open_file(old_fd).as_ref() {
+        let (description, host_fd_owner) = match self.open_file(old_fd.0).as_ref() {
             Some(open_file) => (
                 Arc::clone(&open_file.description),
                 open_file.host_fd_owner.clone(),
             ),
-            None if is_stdio_fd(old_fd) => {
+            None if is_stdio_fd(old_fd.0) => {
                 // Shell `2>&1` style redirects: the source fd is the
                 // process's real host fd 0/1/2 (no OpenDescription was
                 // ever created for them — writes go straight through
@@ -721,29 +693,29 @@ impl SyscallDispatcher {
                 // reach the same host endpoint. Duplicate the host fd
                 // and wrap it as a HostPipe so the write path picks it
                 // up before the bare-stdio fallback.
-                let duped = match (unsafe { libc::dup(old_fd) }).host_syscall_errno() {
+                let duped = match (unsafe { libc::dup(old_fd.0) }).host_syscall_errno() {
                     Ok(duped) => duped,
-                    Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                    Err(errno) => return Ok(errno.into()),
                 };
                 (
                     Arc::new(RwLock::new(OpenDescription::HostPipe {
                         host_fd: duped,
-                        is_read_end: old_fd == 0,
+                        is_read_end: old_fd.0 == 0,
                         status_flags: 0,
                         pty: None,
                     })),
                     Some(HostFdRef::new(duped)),
                 )
             }
-            None => return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF }),
+            None => return Ok(LINUX_EBADF.into()),
         };
         let mut table = self.io.open_files.write();
-        if let Some(replaced) = table.remove(&new_fd) {
+        if let Some(replaced) = table.remove(&new_fd.0) {
             close_open_file(&replaced);
         }
         retain_open_file(&description);
         table.insert(
-            new_fd,
+            new_fd.0,
             OpenFile {
                 description,
                 fd_flags: linux_fd_flags_from_open_flags(flags),
@@ -751,7 +723,7 @@ impl SyscallDispatcher {
             },
         );
         Ok(DispatchOutcome::Returned {
-            value: new_fd as i64,
+            value: new_fd.0 as i64,
         })
     }
 
@@ -759,21 +731,21 @@ impl SyscallDispatcher {
         &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let fd = ctx.arg(0) as i32;
+        let fd: Fd = ctx.typed_arg(0);
         let command = ctx.arg(1);
         let arg = ctx.arg(2);
         Ok(match command {
             LINUX_F_DUPFD => match linux_min_fd(arg) {
-                Ok(min_fd) => self.duplicate_fd(fd, min_fd, 0),
-                Err(errno) => DispatchOutcome::Errno { errno },
+                Ok(min_fd) => self.duplicate_fd(fd.0, min_fd, 0),
+                Err(errno) => DispatchOutcome::errno(errno),
             },
             LINUX_F_DUPFD_CLOEXEC => match linux_min_fd(arg) {
-                Ok(min_fd) => self.duplicate_fd(fd, min_fd, LINUX_FD_CLOEXEC),
-                Err(errno) => DispatchOutcome::Errno { errno },
+                Ok(min_fd) => self.duplicate_fd(fd.0, min_fd, LINUX_FD_CLOEXEC),
+                Err(errno) => DispatchOutcome::errno(errno),
             },
             LINUX_F_GETPIPE_SZ => {
-                let Some(open_file) = self.open_file(fd) else {
-                    return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+                let Some(open_file) = self.open_file(fd.0) else {
+                    return Ok(LINUX_EBADF.into());
                 };
                 match &*open_file.description.read() {
                     OpenDescription::PipeReader { .. }
@@ -781,14 +753,12 @@ impl SyscallDispatcher {
                     | OpenDescription::HostPipe { .. } => DispatchOutcome::Returned {
                         value: LINUX_PIPE_BUF_SIZE,
                     },
-                    OpenDescription::HostSocket { .. } => {
-                        DispatchOutcome::Errno { errno: LINUX_EBADF }
-                    }
-                    _ => DispatchOutcome::Errno { errno: LINUX_EBADF },
+                    OpenDescription::HostSocket { .. } => DispatchOutcome::errno(LINUX_EBADF),
+                    _ => DispatchOutcome::errno(LINUX_EBADF),
                 }
             }
             LINUX_F_GETFD => {
-                if let Some(open_file) = self.open_file(fd) {
+                if let Some(open_file) = self.open_file(fd.0) {
                     return Ok(DispatchOutcome::Returned {
                         value: open_file.fd_flags as i64,
                     });
@@ -797,19 +767,19 @@ impl SyscallDispatcher {
                 // default (Linux: stdio survives exec), but a prior
                 // F_SETFD FD_CLOEXEC must be reflected back. Read the
                 // remembered per-stdio-fd bit.
-                if is_stdio_fd(fd) {
-                    let bit = if self.io.stdio_cloexec.lock()[fd as usize] {
+                if is_stdio_fd(fd.0) {
+                    let bit = if self.io.stdio_cloexec.lock()[fd.0 as usize] {
                         LINUX_FD_CLOEXEC as i64
                     } else {
                         0
                     };
                     return Ok(DispatchOutcome::Returned { value: bit });
                 }
-                DispatchOutcome::Errno { errno: LINUX_EBADF }
+                DispatchOutcome::errno(LINUX_EBADF)
             }
             LINUX_F_SETFD => {
                 let fd_flags = LinuxFdFlags::from_bits_truncate(arg);
-                if let Some(open_file) = self.io.open_files.write().get_mut(&fd) {
+                if let Some(open_file) = self.io.open_files.write().get_mut(&fd.0) {
                     open_file.fd_flags = fd_flags.bits();
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 }
@@ -821,15 +791,15 @@ impl SyscallDispatcher {
                 // anything host-side after the syscall returns) but we
                 // remember the bit so a subsequent F_GETFD reflects it,
                 // matching real Linux.
-                if is_stdio_fd(fd) {
-                    self.io.stdio_cloexec.lock()[fd as usize] =
+                if is_stdio_fd(fd.0) {
+                    self.io.stdio_cloexec.lock()[fd.0 as usize] =
                         fd_flags.contains(LinuxFdFlags::CLOEXEC);
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 }
-                DispatchOutcome::Errno { errno: LINUX_EBADF }
+                DispatchOutcome::errno(LINUX_EBADF)
             }
             LINUX_F_GETFL => {
-                if let Some(open_file) = self.open_file(fd) {
+                if let Some(open_file) = self.open_file(fd.0) {
                     let open = open_file.description.read();
                     let mut flags = open.status_flags();
                     // A pty end is bidirectional (opened O_RDWR); report the
@@ -847,8 +817,8 @@ impl SyscallDispatcher {
                 // stdout is append-only. Returning O_RDWR (with the
                 // appropriate direction for fd 0 vs 1/2) keeps them happy
                 // instead of bailing with "Bad file descriptor".
-                if is_stdio_fd(fd) {
-                    let flags: u64 = if fd == 0 {
+                if is_stdio_fd(fd.0) {
+                    let flags: u64 = if fd.0 == 0 {
                         LINUX_O_RDONLY
                     } else {
                         LINUX_O_WRONLY
@@ -857,10 +827,10 @@ impl SyscallDispatcher {
                         value: flags as i64,
                     });
                 }
-                DispatchOutcome::Errno { errno: LINUX_EBADF }
+                DispatchOutcome::errno(LINUX_EBADF)
             }
             LINUX_F_SETFL => {
-                let Some(open_file) = self.open_file(fd) else {
+                let Some(open_file) = self.open_file(fd.0) else {
                     // Bare stdio (0/1/2) has no OpenDescription, but real Linux
                     // lets you fcntl(F_SETFL) on stdin/stdout/stderr. apt's dpkg
                     // child sets stdin non-blocking via fcntl(0, F_SETFL,
@@ -870,11 +840,11 @@ impl SyscallDispatcher {
                     // O_NONBLOCK to the real host stdio fd when the guest's
                     // stdio is wired to our host fds (stream_stdio / --raw),
                     // mirroring the F_GETFD/F_SETFD/F_GETFL stdio special-cases.
-                    if is_stdio_fd(fd) {
+                    if is_stdio_fd(fd.0) {
                         if *self.io.stream_stdio.lock() {
                             let want_nonblock = arg & LINUX_O_NONBLOCK != 0;
                             unsafe {
-                                let cur = libc::fcntl(fd, libc::F_GETFL, 0);
+                                let cur = libc::fcntl(fd.0, libc::F_GETFL, 0);
                                 if cur >= 0 {
                                     let next = if want_nonblock {
                                         cur | libc::O_NONBLOCK
@@ -882,14 +852,14 @@ impl SyscallDispatcher {
                                         cur & !libc::O_NONBLOCK
                                     };
                                     if next != cur {
-                                        libc::fcntl(fd, libc::F_SETFL, next);
+                                        libc::fcntl(fd.0, libc::F_SETFL, next);
                                     }
                                 }
                             }
                         }
                         return Ok(DispatchOutcome::Returned { value: 0 });
                     }
-                    return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+                    return Ok(LINUX_EBADF.into());
                 };
                 let next_flags = arg & !LINUX_O_CLOEXEC;
                 // Propagate O_NONBLOCK to the underlying host fd when one
@@ -930,8 +900,8 @@ impl SyscallDispatcher {
             // because the F_SETLK that follows the openat is what
             // actually fails — apt's error message just blames open.
             LINUX_F_SETLK | LINUX_F_SETLKW | LINUX_F_OFD_SETLK | LINUX_F_OFD_SETLKW => {
-                if !self.fd_is_valid(fd) {
-                    return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+                if !self.fd_is_valid(fd.0) {
+                    return Ok(LINUX_EBADF.into());
                 }
                 DispatchOutcome::Returned { value: 0 }
             }
@@ -940,14 +910,12 @@ impl SyscallDispatcher {
                 // struct flock untouched and returning 0. apt only ever
                 // probes after a successful SETLK so it doesn't
                 // re-inspect the buffer.
-                if !self.fd_is_valid(fd) {
-                    return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+                if !self.fd_is_valid(fd.0) {
+                    return Ok(LINUX_EBADF.into());
                 }
                 DispatchOutcome::Returned { value: 0 }
             }
-            _ => DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            },
+            _ => DispatchOutcome::errno(LINUX_EINVAL),
         })
     }
 
@@ -955,18 +923,18 @@ impl SyscallDispatcher {
         &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let fd = ctx.arg(0) as i32;
+        let fd: Fd = ctx.typed_arg(0);
         let ioctl_request = ctx.arg(1);
         let arg = ctx.arg(2);
-        if !self.fd_is_valid(fd) {
-            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+        if !self.fd_is_valid(fd.0) {
+            return Ok(LINUX_EBADF.into());
         }
 
         // ── PTY ioctls ────────────────────────────────────────────────────────
         // If this fd is a pty master or slave, handle all tty ioctls here by
         // passing through to the host fd (real macOS pty). Return early so the
         // stdio-gated arms below never run for pty fds.
-        if let Some((role, host_fd)) = self.pty_info(fd) {
+        if let Some((role, host_fd)) = self.pty_info(fd.0) {
             return Ok(match ioctl_request {
                 LINUX_TIOCGPTN => write_packed(&mut *ctx.memory, arg, &role.index.to_le_bytes()),
                 LINUX_TIOCSPTLCK => {
@@ -974,9 +942,7 @@ impl SyscallDispatcher {
                     match ctx.memory.read_bytes(arg, 4) {
                         Ok(b) => buf.copy_from_slice(&b),
                         Err(_) => {
-                            return Ok(DispatchOutcome::Errno {
-                                errno: LINUX_EFAULT,
-                            });
+                            return Ok(LINUX_EFAULT.into());
                         }
                     }
                     let lock = i32::from_le_bytes(buf) != 0;
@@ -998,14 +964,10 @@ impl SyscallDispatcher {
                                     let _ = crate::host_tty::set_host_termios(host_fd, &t);
                                     DispatchOutcome::Returned { value: 0 }
                                 }
-                                Err(_) => DispatchOutcome::Errno {
-                                    errno: LINUX_EINVAL,
-                                },
+                                Err(_) => DispatchOutcome::errno(LINUX_EINVAL),
                             }
                         }
-                        Err(_) => DispatchOutcome::Errno {
-                            errno: LINUX_EFAULT,
-                        },
+                        Err(_) => DispatchOutcome::errno(LINUX_EFAULT),
                     }
                 }
                 LINUX_TIOCGWINSZ => {
@@ -1026,29 +988,23 @@ impl SyscallDispatcher {
                                 libc::ioctl(host_fd, libc::TIOCSWINSZ as libc::c_ulong, &ws)
                             };
                             if r < 0 {
-                                DispatchOutcome::Errno {
-                                    errno: crate::dispatch::macos_to_linux_errno(unsafe {
-                                        *libc::__error()
-                                    }),
-                                }
+                                DispatchOutcome::errno(crate::dispatch::macos_to_linux_errno(
+                                    unsafe { *libc::__error() },
+                                ))
                             } else {
                                 DispatchOutcome::Returned { value: 0 }
                             }
                         }
-                        Err(_) => DispatchOutcome::Errno {
-                            errno: LINUX_EFAULT,
-                        },
+                        Err(_) => DispatchOutcome::errno(LINUX_EFAULT),
                     }
                 }
                 LINUX_TIOCGPGRP => {
                     // SAFETY: host_fd is our live pty fd.
                     let pgrp = unsafe { libc::tcgetpgrp(host_fd) };
                     if pgrp < 0 {
-                        DispatchOutcome::Errno {
-                            errno: crate::dispatch::macos_to_linux_errno(unsafe {
-                                *libc::__error()
-                            }),
-                        }
+                        DispatchOutcome::errno(crate::dispatch::macos_to_linux_errno(unsafe {
+                            *libc::__error()
+                        }))
                     } else {
                         write_packed(&mut *ctx.memory, arg, &(pgrp as i32).to_le_bytes())
                     }
@@ -1058,20 +1014,16 @@ impl SyscallDispatcher {
                     match ctx.memory.read_bytes(arg, 4) {
                         Ok(b) => buf.copy_from_slice(&b),
                         Err(_) => {
-                            return Ok(DispatchOutcome::Errno {
-                                errno: LINUX_EFAULT,
-                            });
+                            return Ok(LINUX_EFAULT.into());
                         }
                     }
                     let pgrp = i32::from_le_bytes(buf);
                     // SAFETY: host_fd is our live pty fd.
                     let r = unsafe { libc::tcsetpgrp(host_fd, pgrp) };
                     if r < 0 {
-                        DispatchOutcome::Errno {
-                            errno: crate::dispatch::macos_to_linux_errno(unsafe {
-                                *libc::__error()
-                            }),
-                        }
+                        DispatchOutcome::errno(crate::dispatch::macos_to_linux_errno(unsafe {
+                            *libc::__error()
+                        }))
                     } else {
                         DispatchOutcome::Returned { value: 0 }
                     }
@@ -1083,37 +1035,33 @@ impl SyscallDispatcher {
                 }
                 _ => {
                     ctx.reporter
-                        .record(CompatEvent::unhandled_ioctl(fd, ioctl_request, arg));
-                    DispatchOutcome::Errno {
-                        errno: LINUX_ENOTTY,
-                    }
+                        .record(CompatEvent::unhandled_ioctl(fd.0, ioctl_request, arg));
+                    DispatchOutcome::errno(LINUX_ENOTTY)
                 }
             });
         }
 
         Ok(match ioctl_request {
-            LINUX_TIOCGWINSZ if fd_is_tty(&self.io.open_files.read(), fd) => {
+            LINUX_TIOCGWINSZ if fd_is_tty(&self.io.open_files.read(), fd.0) => {
                 // Prefer the live host window size when stdin/stdout/stderr
                 // is a real macOS terminal; fall back to the 80x24 stub so
                 // headless invocations (CI, redirected pipes that we still
                 // synthesize a TTY for in tests) keep prior behaviour.
-                let winsize = if crate::host_tty::host_isatty(fd) {
-                    crate::host_tty::get_host_winsize(fd)
+                let winsize = if crate::host_tty::host_isatty(fd.0) {
+                    crate::host_tty::get_host_winsize(fd.0)
                         .unwrap_or_else(LinuxWinsize::terminal_80x24)
                 } else {
                     LinuxWinsize::terminal_80x24()
                 };
                 write_kernel_struct(&mut *ctx.memory, arg, &winsize)
             }
-            LINUX_TIOCGWINSZ => DispatchOutcome::Errno {
-                errno: LINUX_ENOTTY,
-            },
-            LINUX_TCGETS if fd_is_tty(&self.io.open_files.read(), fd) => {
+            LINUX_TIOCGWINSZ => DispatchOutcome::errno(LINUX_ENOTTY),
+            LINUX_TCGETS if fd_is_tty(&self.io.open_files.read(), fd.0) => {
                 // Mirror the live host terminal modes when available so
                 // `less`, `vi`, and an interactive shell see the actual
                 // ICANON/ECHO state the user has configured.
-                let termios = if crate::host_tty::host_isatty(fd) {
-                    crate::host_tty::get_host_termios(fd)
+                let termios = if crate::host_tty::host_isatty(fd.0) {
+                    crate::host_tty::get_host_termios(fd.0)
                         .unwrap_or_else(LinuxTermios::default_cooked)
                 } else {
                     LinuxTermios::default_cooked()
@@ -1125,11 +1073,9 @@ impl SyscallDispatcher {
                 // tcgetattr canary and crashed ls/dpkg.
                 write_kernel_struct(&mut *ctx.memory, arg, &termios)
             }
-            LINUX_TCGETS => DispatchOutcome::Errno {
-                errno: LINUX_ENOTTY,
-            },
+            LINUX_TCGETS => DispatchOutcome::errno(LINUX_ENOTTY),
             LINUX_TCSETS | LINUX_TCSETSW | LINUX_TCSETSF
-                if fd_is_tty(&self.io.open_files.read(), fd) =>
+                if fd_is_tty(&self.io.open_files.read(), fd.0) =>
             {
                 // Read 36 bytes (kernel termios), then pad to the
                 // 44-byte zerocopy struct so we can parse it. The guest
@@ -1137,93 +1083,81 @@ impl SyscallDispatcher {
                 // EFAULT at the boundary of a stack-page allocation.
                 match ctx.memory.read_bytes(arg, LINUX_TERMIOS_KERNEL_SIZE) {
                     Ok(bytes) => {
-                        if crate::host_tty::host_isatty(fd) {
+                        if crate::host_tty::host_isatty(fd.0) {
                             let mut padded = [0u8; core::mem::size_of::<LinuxTermios>()];
                             padded[..LINUX_TERMIOS_KERNEL_SIZE].copy_from_slice(&bytes);
                             if let Ok(t) = LinuxTermios::read_from_bytes(&padded) {
-                                let _ = crate::host_tty::set_host_termios_tracking(fd, &t);
+                                let _ = crate::host_tty::set_host_termios_tracking(fd.0, &t);
                             }
                         }
                         DispatchOutcome::Returned { value: 0 }
                     }
-                    Err(_) => DispatchOutcome::Errno {
-                        errno: LINUX_EFAULT,
-                    },
+                    Err(_) => DispatchOutcome::errno(LINUX_EFAULT),
                 }
             }
-            LINUX_TCSETS | LINUX_TCSETSW | LINUX_TCSETSF => DispatchOutcome::Errno {
-                errno: LINUX_ENOTTY,
-            },
-            LINUX_TIOCSCTTY => match self.tty_ioctl_fd_kind(fd) {
+            LINUX_TCSETS | LINUX_TCSETSW | LINUX_TCSETSF => DispatchOutcome::errno(LINUX_ENOTTY),
+            LINUX_TIOCSCTTY => match self.tty_ioctl_fd_kind(fd.0) {
                 Ok(TtyFdKind::Stdio) => DispatchOutcome::Returned { value: 0 },
-                Ok(TtyFdKind::Other) => DispatchOutcome::Errno {
-                    errno: LINUX_ENOTTY,
-                },
-                Err(errno) => DispatchOutcome::Errno { errno },
+                Ok(TtyFdKind::Other) => DispatchOutcome::errno(LINUX_ENOTTY),
+                Err(errno) => DispatchOutcome::errno(errno),
             },
-            LINUX_TIOCGPGRP => match self.tty_ioctl_fd_kind(fd) {
+            LINUX_TIOCGPGRP => match self.tty_ioctl_fd_kind(fd.0) {
                 Ok(TtyFdKind::Stdio) => {
                     // Under `-t` fd 0/1/2 is a real pty slave: pass through to
                     // the host line discipline so job control works correctly.
                     // Guest pgrps are real macOS pgrps in carrick.
-                    if crate::host_tty::host_isatty(fd) {
-                        match crate::host_tty::host_tty_tcgetpgrp(fd) {
+                    if crate::host_tty::host_isatty(fd.0) {
+                        match crate::host_tty::host_tty_tcgetpgrp(fd.0) {
                             Ok(pgrp) => write_packed(&mut *ctx.memory, arg, &pgrp.to_le_bytes()),
-                            Err(raw_errno) => DispatchOutcome::Errno {
-                                errno: crate::dispatch::macos_to_linux_errno(raw_errno),
-                            },
+                            Err(raw_errno) => DispatchOutcome::errno(
+                                crate::dispatch::macos_to_linux_errno(raw_errno),
+                            ),
                         }
                     } else {
                         // Headless / non-tty fallback: synthesise bootstrap pgid.
                         write_packed(&mut *ctx.memory, arg, &LINUX_BOOTSTRAP_PGID.to_le_bytes())
                     }
                 }
-                Ok(TtyFdKind::Other) => DispatchOutcome::Errno {
-                    errno: LINUX_ENOTTY,
-                },
-                Err(errno) => DispatchOutcome::Errno { errno },
+                Ok(TtyFdKind::Other) => DispatchOutcome::errno(LINUX_ENOTTY),
+                Err(errno) => DispatchOutcome::errno(errno),
             },
-            LINUX_TIOCSPGRP => match self.tty_ioctl_fd_kind(fd) {
+            LINUX_TIOCSPGRP => match self.tty_ioctl_fd_kind(fd.0) {
                 Ok(TtyFdKind::Stdio) => {
                     let mut buf = [0u8; 4];
                     match ctx.memory.read_bytes(arg, 4) {
                         Ok(bytes) => buf.copy_from_slice(&bytes),
                         Err(_) => {
-                            return Ok(DispatchOutcome::Errno {
-                                errno: LINUX_EFAULT,
-                            });
+                            return Ok(LINUX_EFAULT.into());
                         }
                     }
                     let pgid = i32::from_le_bytes(buf);
                     // Under `-t` fd 0/1/2 is a real pty slave: pass through so
                     // the host line discipline tracks the foreground pgrp, enabling
                     // Ctrl-C → SIGINT delivery to the correct guest pgrp.
-                    if crate::host_tty::host_isatty(fd) {
-                        match crate::host_tty::host_tty_tcsetpgrp(fd, pgid) {
+                    if crate::host_tty::host_isatty(fd.0) {
+                        match crate::host_tty::host_tty_tcsetpgrp(fd.0, pgid) {
                             Ok(()) => DispatchOutcome::Returned { value: 0 },
-                            Err(raw_errno) => DispatchOutcome::Errno {
-                                errno: crate::dispatch::macos_to_linux_errno(raw_errno),
-                            },
+                            Err(raw_errno) => DispatchOutcome::errno(
+                                crate::dispatch::macos_to_linux_errno(raw_errno),
+                            ),
                         }
                     } else {
                         // Headless fallback: accept the bootstrap pgid, EPERM others.
                         if pgid == LINUX_BOOTSTRAP_PGID {
                             DispatchOutcome::Returned { value: 0 }
                         } else {
-                            DispatchOutcome::Errno { errno: LINUX_EPERM }
+                            DispatchOutcome::errno(LINUX_EPERM)
                         }
                     }
                 }
-                Ok(TtyFdKind::Other) => DispatchOutcome::Errno {
-                    errno: LINUX_ENOTTY,
-                },
-                Err(errno) => DispatchOutcome::Errno { errno },
+                Ok(TtyFdKind::Other) => DispatchOutcome::errno(LINUX_ENOTTY),
+                Err(errno) => DispatchOutcome::errno(errno),
             },
             LINUX_FIONREAD => {
                 // Stdio, eventfd, timerfd, epoll, pipe writer, directory, regular file,
                 // synthetic file: writing 0 ("nothing pending") is benign. Pipe reader
                 // gets the actual buffered byte count.
-                let available: i32 = match self.open_file(fd).as_ref() {
+                let available: i32 = match self.open_file(fd.0).as_ref() {
                     Some(open_file) => match &*open_file.description.read() {
                         OpenDescription::PipeReader { pipe, .. } => {
                             let len = pipe.lock().buffer.len();
@@ -1238,12 +1172,10 @@ impl SyscallDispatcher {
             }
             LINUX_FIONBIO => {
                 let Ok(bytes) = ctx.memory.read_bytes(arg, 4) else {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: LINUX_EFAULT,
-                    });
+                    return Ok(LINUX_EFAULT.into());
                 };
                 let enable = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) != 0;
-                if let Some(open_file) = self.open_file(fd) {
+                if let Some(open_file) = self.open_file(fd.0) {
                     let mut open = open_file.description.write();
                     let mut status_flags = open.status_flags();
                     if enable {
@@ -1274,41 +1206,35 @@ impl SyscallDispatcher {
                 }
                 DispatchOutcome::Returned { value: 0 }
             }
-            LINUX_TIOCNOTTY => match self.tty_ioctl_fd_kind(fd) {
+            LINUX_TIOCNOTTY => match self.tty_ioctl_fd_kind(fd.0) {
                 Ok(TtyFdKind::Stdio) => DispatchOutcome::Returned { value: 0 },
-                Ok(TtyFdKind::Other) => DispatchOutcome::Errno {
-                    errno: LINUX_ENOTTY,
-                },
-                Err(errno) => DispatchOutcome::Errno { errno },
+                Ok(TtyFdKind::Other) => DispatchOutcome::errno(LINUX_ENOTTY),
+                Err(errno) => DispatchOutcome::errno(errno),
             },
-            LINUX_TIOCGSID => match self.tty_ioctl_fd_kind(fd) {
+            LINUX_TIOCGSID => match self.tty_ioctl_fd_kind(fd.0) {
                 Ok(TtyFdKind::Stdio) => {
                     // Under `-t` stdio is a real pty slave. Ask Darwin for
                     // the controlling session instead of returning Carrick's
                     // bootstrap fallback, so interactive job-control probes
                     // see the host pty state when it exists.
-                    if crate::host_tty::host_isatty(fd) {
-                        match crate::host_tty::host_tty_tcgetsid(fd) {
+                    if crate::host_tty::host_isatty(fd.0) {
+                        match crate::host_tty::host_tty_tcgetsid(fd.0) {
                             Ok(sid) => write_packed(&mut *ctx.memory, arg, &sid.to_le_bytes()),
-                            Err(raw_errno) => DispatchOutcome::Errno {
-                                errno: crate::dispatch::macos_to_linux_errno(raw_errno),
-                            },
+                            Err(raw_errno) => DispatchOutcome::errno(
+                                crate::dispatch::macos_to_linux_errno(raw_errno),
+                            ),
                         }
                     } else {
                         write_packed(&mut *ctx.memory, arg, &LINUX_BOOTSTRAP_SID.to_le_bytes())
                     }
                 }
-                Ok(TtyFdKind::Other) => DispatchOutcome::Errno {
-                    errno: LINUX_ENOTTY,
-                },
-                Err(errno) => DispatchOutcome::Errno { errno },
+                Ok(TtyFdKind::Other) => DispatchOutcome::errno(LINUX_ENOTTY),
+                Err(errno) => DispatchOutcome::errno(errno),
             },
             _ => {
                 ctx.reporter
-                    .record(CompatEvent::unhandled_ioctl(fd, ioctl_request, arg));
-                DispatchOutcome::Errno {
-                    errno: LINUX_ENOTTY,
-                }
+                    .record(CompatEvent::unhandled_ioctl(fd.0, ioctl_request, arg));
+                DispatchOutcome::errno(LINUX_ENOTTY)
             }
         })
     }
@@ -1345,18 +1271,16 @@ impl SyscallDispatcher {
         &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let fd = ctx.arg(0) as i32;
+        let fd: Fd = ctx.typed_arg(0);
         let operation = ctx.arg(1);
-        if !self.fd_is_valid(fd) {
-            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+        if !self.fd_is_valid(fd.0) {
+            return Ok(LINUX_EBADF.into());
         }
 
         let lock_operation = operation & !LINUX_LOCK_NB;
         Ok(match lock_operation {
             LINUX_LOCK_SH | LINUX_LOCK_EX | LINUX_LOCK_UN => DispatchOutcome::Returned { value: 0 },
-            _ => DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            },
+            _ => DispatchOutcome::errno(LINUX_EINVAL),
         })
     }
 
@@ -1369,17 +1293,17 @@ impl SyscallDispatcher {
         let buffer = request.arg(1);
         let path = match read_guest_c_string(memory, pathname) {
             Ok(path) => path,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         let path = match self.resolve_at_path(LINUX_AT_FDCWD, &path) {
             Ok(path) => path,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         // Consult the layered view (overlay/disk first, then rootfs) so
         // that files the guest created in the overlay are visible here
         // too — a rootfs-direct lookup would miss them.
         if let Err(errno) = self.layered_metadata(&path) {
-            return Ok(DispatchOutcome::Errno { errno });
+            return Ok(errno.into());
         }
         Ok(write_statfs(memory, buffer))
     }
@@ -1387,7 +1311,7 @@ impl SyscallDispatcher {
     fn fstatfs(&self, request: SyscallRequest, memory: &mut impl GuestMemory) -> DispatchOutcome {
         let fd = request.arg(0) as i32;
         if !self.fd_table_contains(fd) {
-            return DispatchOutcome::Errno { errno: LINUX_EBADF };
+            return DispatchOutcome::errno(LINUX_EBADF);
         }
         write_statfs(memory, request.arg(1))
     }
@@ -1400,36 +1324,30 @@ impl SyscallDispatcher {
         let pathname = request.arg(0);
         let length = i64::from_ne_bytes(request.arg(1).to_ne_bytes());
         if length < 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         let path = match read_guest_c_string(memory, pathname) {
             Ok(path) => path,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         if path.is_empty() {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_ENOENT,
-            });
+            return Ok(LINUX_ENOENT.into());
         }
         let resolved = match self.resolve_at_path(LINUX_AT_FDCWD, &path) {
             Ok(resolved) => resolved,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         if crate::vfs::is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context()) {
-            return Ok(DispatchOutcome::Errno { errno: LINUX_EROFS });
+            return Ok(LINUX_EROFS.into());
         }
         // Layered metadata (overlay/disk first, then rootfs) — not rootfs-only,
         // so guest-created files are seen too.
         let kind = match self.layered_metadata(&resolved) {
             Ok(md) => md.kind,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         if kind == RootFsEntryKind::Directory {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EISDIR,
-            });
+            return Ok(LINUX_EISDIR.into());
         }
         // Disk-backed: open the real file and ftruncate it. The whole rootfs
         // is materialised on the cap-std scratch under --fs host, so this
@@ -1448,12 +1366,12 @@ impl SyscallDispatcher {
                     .unwrap_or(0);
                 unsafe { libc::close(host_fd) };
                 if err != 0 {
-                    Ok(DispatchOutcome::Errno { errno: err })
+                    Ok(err.into())
                 } else {
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
             }
-            None => Ok(DispatchOutcome::Errno { errno: LINUX_EROFS }),
+            None => Ok(LINUX_EROFS.into()),
         }
     }
 
@@ -1461,27 +1379,21 @@ impl SyscallDispatcher {
         &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let fd = ctx.arg(0) as i32;
+        let fd: Fd = ctx.typed_arg(0);
         let mode = ctx.arg(1);
         let offset = i64::from_ne_bytes(ctx.arg(2).to_ne_bytes());
         let length = i64::from_ne_bytes(ctx.arg(3).to_ne_bytes());
         if mode & !LINUX_FALLOC_FL_SUPPORTED != 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         if length <= 0 || offset < 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
-        if is_stdio_fd(fd) {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_ESPIPE,
-            });
+        if is_stdio_fd(fd.0) {
+            return Ok(LINUX_ESPIPE.into());
         }
-        let Some(open_file) = self.open_file(fd) else {
-            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+        let Some(open_file) = self.open_file(fd.0) else {
+            return Ok(LINUX_EBADF.into());
         };
         // Only mode-0 (default allocation) is implemented as a real grow;
         // FALLOC_FL_KEEP_SIZE preallocates without changing the apparent
@@ -1500,7 +1412,7 @@ impl SyscallDispatcher {
                 } if grow => {
                     // In-memory model (--fs memory): grow the cached bytes.
                     if new_size > crate::vfs::MAX_IN_MEMORY_FILE_SIZE {
-                        return Ok(DispatchOutcome::Errno { errno: LINUX_EFBIG });
+                        return Ok(LINUX_EFBIG.into());
                     }
                     if new_size as usize > contents.len() {
                         contents.resize(new_size as usize, 0);
@@ -1522,14 +1434,14 @@ impl SyscallDispatcher {
                         if let Err(errno) =
                             (unsafe { libc::fstat(*host_fd, &mut st) }).host_syscall_errno()
                         {
-                            return Ok(DispatchOutcome::Errno { errno });
+                            return Ok(errno.into());
                         }
                         if new_size > st.st_size as u64 {
                             if let Err(errno) =
                                 (unsafe { libc::ftruncate(*host_fd, new_size as libc::off_t) })
                                     .host_syscall_errno()
                             {
-                                return Ok(DispatchOutcome::Errno { errno });
+                                return Ok(errno.into());
                             }
                         }
                     }
@@ -1537,17 +1449,13 @@ impl SyscallDispatcher {
                     outcome = DispatchOutcome::Returned { value: 0 };
                 }
                 OpenDescription::SyntheticFile { .. } => {
-                    return Ok(DispatchOutcome::Errno { errno: LINUX_EROFS });
+                    return Ok(LINUX_EROFS.into());
                 }
                 OpenDescription::Directory { .. } => {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: LINUX_EISDIR,
-                    });
+                    return Ok(LINUX_EISDIR.into());
                 }
                 _ => {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: LINUX_ESPIPE,
-                    });
+                    return Ok(LINUX_ESPIPE.into());
                 }
             }
         }
@@ -1565,20 +1473,16 @@ impl SyscallDispatcher {
         &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let fd = ctx.arg(0) as i32;
+        let fd: Fd = ctx.typed_arg(0);
         let length = i64::from_ne_bytes(ctx.arg(1).to_ne_bytes());
         if length < 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
-        if is_stdio_fd(fd) {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+        if is_stdio_fd(fd.0) {
+            return Ok(LINUX_EINVAL.into());
         }
-        let Some(open_file) = self.open_file(fd) else {
-            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+        let Some(open_file) = self.open_file(fd.0) else {
+            return Ok(LINUX_EBADF.into());
         };
         // Snapshot the path + new contents in a scope so the borrow drops
         // before we touch self.fs.rootfs_vfs.overlay.
@@ -1596,10 +1500,10 @@ impl SyscallDispatcher {
                     ..
                 } => {
                     if !*writable {
-                        return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+                        return Ok(LINUX_EBADF.into());
                     }
                     if length as u64 > crate::vfs::MAX_IN_MEMORY_FILE_SIZE {
-                        return Ok(DispatchOutcome::Errno { errno: LINUX_EFBIG });
+                        return Ok(LINUX_EFBIG.into());
                     }
                     let new_len = length as usize;
                     if new_len > contents.len() {
@@ -1618,7 +1522,7 @@ impl SyscallDispatcher {
                     host_fd, writable, ..
                 } => {
                     if !*writable {
-                        return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+                        return Ok(LINUX_EBADF.into());
                     }
                     // Real fd: ftruncate the kernel file directly (the
                     // change is visible across fork).
@@ -1626,22 +1530,18 @@ impl SyscallDispatcher {
                         (unsafe { libc::ftruncate(*host_fd, length as libc::off_t) })
                             .host_syscall_errno()
                     {
-                        return Ok(DispatchOutcome::Errno { errno });
+                        return Ok(errno.into());
                     }
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 }
                 OpenDescription::SyntheticFile { .. } => {
-                    return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+                    return Ok(LINUX_EBADF.into());
                 }
                 OpenDescription::Directory { .. } => {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: LINUX_EISDIR,
-                    });
+                    return Ok(LINUX_EISDIR.into());
                 }
                 _ => {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: LINUX_EINVAL,
-                    });
+                    return Ok(LINUX_EINVAL.into());
                 }
             }
         }
@@ -1675,21 +1575,17 @@ impl SyscallDispatcher {
         let arg0 = ctx.arg(0);
         let arg1 = ctx.arg(1);
         if size != LINUX_OPEN_HOW_SIZE {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         let how = match read_open_how(&*ctx.memory, how_address) {
             Ok(how) => how,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         if how.mode != 0
             || how.resolve != 0
             || how.flags & !(LINUX_O_CLOEXEC | LINUX_O_NONBLOCK) != 0
         {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         self.open_at_path(arg0, arg1, how.flags, how.mode, &*ctx.memory, ctx.reporter)
     }
@@ -1705,9 +1601,7 @@ impl SyscallDispatcher {
     ) -> Result<DispatchOutcome, DispatchError> {
         let access = flags & LINUX_O_ACCMODE;
         if access != LINUX_O_RDONLY && access != LINUX_O_WRONLY && access != LINUX_O_RDWR {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         let writable_request = access == LINUX_O_WRONLY || access == LINUX_O_RDWR;
         let want_create = flags & LINUX_O_CREAT != 0;
@@ -1716,11 +1610,11 @@ impl SyscallDispatcher {
 
         let path = match read_guest_c_string(memory, pathname) {
             Ok(path) => path,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         let path = match self.resolve_at_path(dirfd, &path) {
             Ok(path) => path,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
 
         // VFS-mount routing. DevVfs serves /dev/*, ProcVfs serves
@@ -1735,7 +1629,7 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::Returned { value: fd as i64 });
             }
             VfsOpenAttempt::Errno(errno) => {
-                return Ok(DispatchOutcome::Errno { errno });
+                return Ok(errno.into());
             }
             VfsOpenAttempt::FallThrough => {}
         }
@@ -1745,7 +1639,7 @@ impl SyscallDispatcher {
         // plus search on every ancestor; creating a new file needs write+search
         // on the parent dir. Root bypasses (handled in dac_check).
         if let Some(errno) = self.dac_open_check(&path, access, want_create) {
-            return Ok(DispatchOutcome::Errno { errno });
+            return Ok(errno.into());
         }
 
         // /proc/* and /sys/* synthetic file opens now flow through
@@ -1820,9 +1714,7 @@ impl SyscallDispatcher {
             ),
             Ok(crate::vfs::rootfs::OpenDispatchResult::Directory { metadata, entries }) => {
                 if writable_request {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: LINUX_EISDIR,
-                    });
+                    return Ok(LINUX_EISDIR.into());
                 }
                 (
                     OpenDescription::Directory {
@@ -1842,9 +1734,7 @@ impl SyscallDispatcher {
                 if let Some(parent) = Path::new(&path).parent() {
                     let parent_str = display_rootfs_path(parent);
                     if !self.path_is_directory(&parent_str) {
-                        return Ok(DispatchOutcome::Errno {
-                            errno: LINUX_ENOENT,
-                        });
+                        return Ok(LINUX_ENOENT.into());
                     }
                 }
                 // O_CREAT mode: the requested mode masked by the guest umask,
@@ -1897,9 +1787,7 @@ impl SyscallDispatcher {
                     )
                 } else {
                     if self.fs.rootfs_vfs.overlay.create_file(&path).is_err() {
-                        return Ok(DispatchOutcome::Errno {
-                            errno: LINUX_EINVAL,
-                        });
+                        return Ok(LINUX_EINVAL.into());
                     }
                     let _ = self.fs.rootfs_vfs.overlay.set_mode(&path, create_mode);
                     if stamp_owner {
@@ -1922,7 +1810,7 @@ impl SyscallDispatcher {
                     )
                 }
             }
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
 
         let open_file = OpenFile {
@@ -1931,9 +1819,7 @@ impl SyscallDispatcher {
             host_fd_owner,
         };
         let Ok(fd) = self.install_fd_at_or_above(3, open_file) else {
-            return Ok(DispatchOutcome::Errno {
-                errno: linux_errno::EMFILE,
-            });
+            return Ok(linux_errno::EMFILE.into());
         };
         Ok(DispatchOutcome::Returned { value: fd as i64 })
     }
@@ -1987,9 +1873,9 @@ impl SyscallDispatcher {
         &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let fd = ctx.arg(0) as i32;
+        let fd: Fd = ctx.typed_arg(0);
         Ok(
-            if let Some(open_file) = self.io.open_files.write().remove(&fd) {
+            if let Some(open_file) = self.io.open_files.write().remove(&fd.0) {
                 // Centralised close: frees the host fd and, for pty masters,
                 // removes the /dev/pts/N entry from the PtyTable so it becomes
                 // ENOENT — mirroring Linux devpts semantics. The same helper is
@@ -1997,7 +1883,7 @@ impl SyscallDispatcher {
                 // stays in sync.
                 self.close_open_file_and_free_pty(&open_file);
                 DispatchOutcome::Returned { value: 0 }
-            } else if is_stdio_fd(fd) {
+            } else if is_stdio_fd(fd.0) {
                 // Guest closing its own stdio at exit: there's nothing for
                 // us to do (host fd stays open under stream_stdio so
                 // sibling processes keep working), but reporting EBADF
@@ -2005,7 +1891,7 @@ impl SyscallDispatcher {
                 // after the program's real output. Return success.
                 DispatchOutcome::Returned { value: 0 }
             } else {
-                DispatchOutcome::Errno { errno: LINUX_EBADF }
+                DispatchOutcome::errno(LINUX_EBADF)
             },
         )
     }
@@ -2028,9 +1914,7 @@ impl SyscallDispatcher {
         const CLOSE_RANGE_UNSHARE: u64 = 2;
         const CLOSE_RANGE_CLOEXEC: u64 = 4;
         if flags & !(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC) != 0 || first > last {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         let cloexec_only = flags & CLOSE_RANGE_CLOEXEC != 0;
         // Drain matching fds out of the table so we don't iterate a
@@ -2076,7 +1960,7 @@ impl SyscallDispatcher {
                 // glibc fork+exec helpers expect to succeed).
                 let duped = match (unsafe { libc::dup(old_fd) }).host_syscall_errno() {
                     Ok(duped) => duped,
-                    Err(errno) => return DispatchOutcome::Errno { errno },
+                    Err(errno) => return DispatchOutcome::errno(errno),
                 };
                 (
                     Arc::new(RwLock::new(OpenDescription::HostPipe {
@@ -2088,7 +1972,7 @@ impl SyscallDispatcher {
                     Some(HostFdRef::new(duped)),
                 )
             }
-            None => return DispatchOutcome::Errno { errno: LINUX_EBADF },
+            None => return DispatchOutcome::errno(LINUX_EBADF),
         };
         let open_file = OpenFile {
             description,
@@ -2098,9 +1982,7 @@ impl SyscallDispatcher {
         let new_fd = match self.install_fd_at_or_above(min_fd, open_file) {
             Ok(fd) => fd,
             Err(_) => {
-                return DispatchOutcome::Errno {
-                    errno: linux_errno::EMFILE,
-                };
+                return DispatchOutcome::errno(linux_errno::EMFILE);
             }
         };
         DispatchOutcome::Returned {
@@ -2345,9 +2227,7 @@ impl SyscallDispatcher {
     ) -> DispatchOutcome {
         let open_file = OpenFile::new(Arc::new(RwLock::new(description)), fd_flags);
         let Ok(fd) = self.install_fd_at_or_above(3, open_file) else {
-            return DispatchOutcome::Errno {
-                errno: linux_errno::EMFILE,
-            };
+            return DispatchOutcome::errno(linux_errno::EMFILE);
         };
         DispatchOutcome::Returned { value: fd as i64 }
     }
@@ -2364,29 +2244,27 @@ impl SyscallDispatcher {
         &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let fd = ctx.arg(0) as i32;
+        let fd: Fd = ctx.typed_arg(0);
         let address = ctx.arg(1);
         let length =
             usize::try_from(ctx.arg(2)).map_err(|_| DispatchError::LengthTooLarge(ctx.arg(2)))?;
         let memory = &mut *ctx.memory;
-        let Some(open_file) = self.open_file(fd) else {
-            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+        let Some(open_file) = self.open_file(fd.0) else {
+            return Ok(LINUX_EBADF.into());
         };
         let mut open = open_file.description.write();
         let OpenDescription::Directory {
             entries, offset, ..
         } = &mut *open
         else {
-            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+            return Ok(LINUX_EBADF.into());
         };
 
         let mut out = Vec::new();
         while *offset < entries.len() {
             let record = dirent64_record(&entries[*offset], *offset + 1);
             if record.len() > length {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_EINVAL,
-                });
+                return Ok(LINUX_EINVAL.into());
             }
             if out.len() + record.len() > length {
                 break;
@@ -2396,9 +2274,7 @@ impl SyscallDispatcher {
         }
 
         if memory.write_bytes(address, &out).is_err() {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EFAULT,
-            });
+            return Ok(LINUX_EFAULT.into());
         }
 
         Ok(DispatchOutcome::Returned {
@@ -2410,21 +2286,19 @@ impl SyscallDispatcher {
         &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let fd = ctx.arg(0) as i32;
+        let fd: Fd = ctx.typed_arg(0);
         let offset = ctx.arg(1) as i64;
         let whence = ctx.arg(2);
-        let Some(open_file) = self.open_file(fd) else {
+        let Some(open_file) = self.open_file(fd.0) else {
             // lseek on stdio with no OpenDescription is, on Linux, a
             // valid call on an unseekable pipe/tty — kernel returns
             // ESPIPE, not EBADF. Returning EBADF confuses glibc's
             // ftell/fclose path into reporting "write error: Bad
             // file descriptor" after every successful write.
-            if is_stdio_fd(fd) {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_ESPIPE,
-                });
+            if is_stdio_fd(fd.0) {
+                return Ok(LINUX_ESPIPE.into());
             }
-            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+            return Ok(LINUX_EBADF.into());
         };
         let mut open = open_file.description.write();
 
@@ -2436,16 +2310,14 @@ impl SyscallDispatcher {
                 LINUX_SEEK_CUR => libc::SEEK_CUR,
                 LINUX_SEEK_END => libc::SEEK_END,
                 _ => {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: LINUX_EINVAL,
-                    });
+                    return Ok(LINUX_EINVAL.into());
                 }
             };
             let r = match (unsafe { libc::lseek(*host_fd, offset as libc::off_t, host_whence) })
                 .host_syscall_errno()
             {
                 Ok(value) => value,
-                Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                Err(errno) => return Ok(errno.into()),
             };
             return Ok(DispatchOutcome::Returned { value: r as i64 });
         }
@@ -2471,18 +2343,14 @@ impl SyscallDispatcher {
             | OpenDescription::HostPipe { .. }
             | OpenDescription::HostSocket { .. }
             | OpenDescription::Netlink { .. } => {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_ESPIPE,
-                });
+                return Ok(LINUX_ESPIPE.into());
             }
             // HostFile is handled by the early libc::lseek above.
             OpenDescription::HostFile { .. } => unreachable!("HostFile lseek handled above"),
             OpenDescription::EventFd { .. }
             | OpenDescription::TimerFd { .. }
             | OpenDescription::Epoll { .. } => {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_EINVAL,
-                });
+                return Ok(LINUX_EINVAL.into());
             }
         };
         let next = match whence {
@@ -2490,15 +2358,11 @@ impl SyscallDispatcher {
             LINUX_SEEK_CUR => current.saturating_add(offset),
             LINUX_SEEK_END => end.saturating_add(offset),
             _ => {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_EINVAL,
-                });
+                return Ok(LINUX_EINVAL.into());
             }
         };
         if next < 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
 
         match &mut *open {
@@ -2522,7 +2386,7 @@ impl SyscallDispatcher {
         &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let fd = ctx.arg(0) as i32;
+        let fd: Fd = ctx.typed_arg(0);
         let address = ctx.arg(1);
         let length =
             usize::try_from(ctx.arg(2)).map_err(|_| DispatchError::LengthTooLarge(ctx.arg(2)))?;
@@ -2531,16 +2395,16 @@ impl SyscallDispatcher {
         // read helper so a blocking-mode fd hands off to the lockless kqueue
         // wait on EAGAIN instead of blocking under the dispatcher lock. (read has no
         // per-call non-blocking flag.) Computed before the open_files borrow.
-        let nonblocking = self.io_is_nonblocking(fd, 0);
+        let nonblocking = self.io_is_nonblocking(fd.0, 0);
         // fd 0 with no explicit OpenDescription: read from host stdin.
         // This is what makes `read` against the guest's stdin pick up
         // input from the user's terminal (or whatever the carrick host
         // process's stdin is — file, pipe, or terminal).
-        if fd == 0 && !self.fd_table_contains(0) {
+        if fd.0 == 0 && !self.fd_table_contains(0) {
             return Ok(read_host_pipe(memory, address, length, 0, nonblocking));
         }
-        let Some(open_file) = self.open_file(fd) else {
-            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+        let Some(open_file) = self.open_file(fd.0) else {
+            return Ok(LINUX_EBADF.into());
         };
         let mut open = open_file.description.write();
         let (contents, offset) = match &mut *open {
@@ -2589,7 +2453,7 @@ impl SyscallDispatcher {
                 // pty ends are bidirectional (O_RDWR); only real one-way
                 // pipe ends are gated by is_read_end.
                 if !*is_read_end && pty.is_none() {
-                    return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+                    return Ok(LINUX_EBADF.into());
                 }
                 return Ok(read_host_pipe(
                     memory,
@@ -2600,14 +2464,10 @@ impl SyscallDispatcher {
                 ));
             }
             OpenDescription::Directory { .. } => {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_EISDIR,
-                });
+                return Ok(LINUX_EISDIR.into());
             }
             OpenDescription::Epoll { .. } | OpenDescription::PipeWriter { .. } => {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_EINVAL,
-                });
+                return Ok(LINUX_EINVAL.into());
             }
             OpenDescription::HostSocket { host_fd, .. } => {
                 return Ok(read_host_pipe(
@@ -2644,9 +2504,7 @@ impl SyscallDispatcher {
         let read_len = remaining.len().min(length);
         let bytes = &remaining[..read_len];
         if memory.write_bytes(address, bytes).is_err() {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EFAULT,
-            });
+            return Ok(LINUX_EFAULT.into());
         }
         *offset += read_len;
         Ok(DispatchOutcome::Returned {
@@ -2658,17 +2516,17 @@ impl SyscallDispatcher {
         &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let fd = ctx.arg(0) as i32;
+        let fd: Fd = ctx.typed_arg(0);
         let iov = ctx.arg(1);
         let iovcnt =
             usize::try_from(ctx.arg(2)).map_err(|_| DispatchError::LengthTooLarge(ctx.arg(2)))?;
         let memory = &mut *ctx.memory;
         let iovecs = match read_iovecs(memory, iov, iovcnt) {
             Ok(iovecs) => iovecs,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
-        let Some(open_file) = self.open_file(fd) else {
-            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+        let Some(open_file) = self.open_file(fd.0) else {
+            return Ok(LINUX_EBADF.into());
         };
         let mut open = open_file.description.write();
         // Real host file: readv via the kernel fd (advances the shared
@@ -2711,9 +2569,7 @@ impl SyscallDispatcher {
             | OpenDescription::HostPipe { .. }
             | OpenDescription::HostSocket { .. }
             | OpenDescription::Netlink { .. } => {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_EINVAL,
-                });
+                return Ok(LINUX_EINVAL.into());
             }
         };
         let read_len = read_from_contents_at(memory, contents, *offset, &iovecs)?;
@@ -2727,15 +2583,15 @@ impl SyscallDispatcher {
         &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let fd = ctx.arg(0) as i32;
+        let fd: Fd = ctx.typed_arg(0);
         let buffer = ctx.arg(1);
         let length =
             usize::try_from(ctx.arg(2)).map_err(|_| DispatchError::LengthTooLarge(ctx.arg(2)))?;
         let offset =
             usize::try_from(ctx.arg(3)).map_err(|_| DispatchError::LengthTooLarge(ctx.arg(3)))?;
         let memory = &mut *ctx.memory;
-        let Some(open_file) = self.open_file(fd) else {
-            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+        let Some(open_file) = self.open_file(fd.0) else {
+            return Ok(LINUX_EBADF.into());
         };
         let open = open_file.description.read();
         // Real host file: positional read via libc::pread (doesn't
@@ -2752,12 +2608,10 @@ impl SyscallDispatcher {
             };
             let n = match n.host_syscall_errno() {
                 Ok(value) => value as usize,
-                Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                Err(errno) => return Ok(errno.into()),
             };
             if n > 0 && memory.write_bytes(buffer, &buf[..n]).is_err() {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_EFAULT,
-                });
+                return Ok(LINUX_EFAULT.into());
             }
             return Ok(DispatchOutcome::Returned { value: n as i64 });
         }
@@ -2774,18 +2628,14 @@ impl SyscallDispatcher {
             | OpenDescription::HostPipe { .. }
             | OpenDescription::HostSocket { .. }
             | OpenDescription::Netlink { .. } => {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_EINVAL,
-                });
+                return Ok(LINUX_EINVAL.into());
             }
         };
 
         let read_len = if offset < contents.len() {
             let bytes = &contents[offset..][..contents[offset..].len().min(length)];
             if memory.write_bytes(buffer, bytes).is_err() {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_EFAULT,
-                });
+                return Ok(LINUX_EFAULT.into());
             }
             bytes.len()
         } else {
@@ -2800,7 +2650,7 @@ impl SyscallDispatcher {
         &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let fd = ctx.arg(0) as i32;
+        let fd: Fd = ctx.typed_arg(0);
         let iov = ctx.arg(1);
         let iovcnt =
             usize::try_from(ctx.arg(2)).map_err(|_| DispatchError::LengthTooLarge(ctx.arg(2)))?;
@@ -2809,10 +2659,10 @@ impl SyscallDispatcher {
         let memory = &mut *ctx.memory;
         let iovecs = match read_iovecs(memory, iov, iovcnt) {
             Ok(iovecs) => iovecs,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
-        let Some(open_file) = self.open_file(fd) else {
-            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+        let Some(open_file) = self.open_file(fd.0) else {
+            return Ok(LINUX_EBADF.into());
         };
         let open = open_file.description.read();
         // Real host file: positional readv via libc::pread per iovec
@@ -2833,12 +2683,10 @@ impl SyscallDispatcher {
                 };
                 let n = match n.host_syscall_errno() {
                     Ok(value) => value as usize,
-                    Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                    Err(errno) => return Ok(errno.into()),
                 };
                 if n > 0 && memory.write_bytes(iov.iov_base, &buf[..n]).is_err() {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: LINUX_EFAULT,
-                    });
+                    return Ok(LINUX_EFAULT.into());
                 }
                 total += n as i64;
                 cur += n;
@@ -2861,9 +2709,7 @@ impl SyscallDispatcher {
             | OpenDescription::HostPipe { .. }
             | OpenDescription::HostSocket { .. }
             | OpenDescription::Netlink { .. } => {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_EINVAL,
-                });
+                return Ok(LINUX_EINVAL.into());
             }
         };
         let read_len = read_from_contents_at(memory, contents, offset, &iovecs)?;
@@ -2876,31 +2722,25 @@ impl SyscallDispatcher {
         &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let fd = ctx.arg(0) as i32;
+        let fd: Fd = ctx.typed_arg(0);
         let address = ctx.arg(1);
         let length =
             usize::try_from(ctx.arg(2)).map_err(|_| DispatchError::LengthTooLarge(ctx.arg(2)))?;
         let offset = i64::from_ne_bytes(ctx.arg(3).to_ne_bytes());
         if offset < 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         let bytes = match (*ctx.memory).read_bytes(address, length) {
             Ok(b) => b,
             Err(_) => {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_EFAULT,
-                });
+                return Ok(LINUX_EFAULT.into());
             }
         };
-        if is_stdio_fd(fd) {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_ESPIPE,
-            });
+        if is_stdio_fd(fd.0) {
+            return Ok(LINUX_ESPIPE.into());
         }
-        let Some(open_file) = self.open_file(fd) else {
-            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+        let Some(open_file) = self.open_file(fd.0) else {
+            return Ok(LINUX_EBADF.into());
         };
         let open = open_file.description.read();
         // Real host file: positional write via libc::pwrite (visible
@@ -2910,7 +2750,7 @@ impl SyscallDispatcher {
         } = &*open
         {
             if !*writable {
-                return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+                return Ok(LINUX_EBADF.into());
             }
             let n = unsafe {
                 libc::pwrite(
@@ -2922,7 +2762,7 @@ impl SyscallDispatcher {
             };
             let n = match n.host_syscall_errno() {
                 Ok(value) => value,
-                Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                Err(errno) => return Ok(errno.into()),
             };
             return Ok(DispatchOutcome::Returned { value: n as i64 });
         }
@@ -2939,14 +2779,14 @@ impl SyscallDispatcher {
             | OpenDescription::Netlink { .. }
             | OpenDescription::Epoll { .. } => LINUX_ESPIPE,
         };
-        Ok(DispatchOutcome::Errno { errno })
+        Ok(errno.into())
     }
 
     pub(super) fn pwritev<M: GuestMemory>(
         &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let fd = ctx.arg(0) as i32;
+        let fd: Fd = ctx.typed_arg(0);
         let iov = ctx.arg(1);
         let iovcnt =
             usize::try_from(ctx.arg(2)).map_err(|_| DispatchError::LengthTooLarge(ctx.arg(2)))?;
@@ -2954,29 +2794,23 @@ impl SyscallDispatcher {
         let memory = &*ctx.memory;
         let iovecs = match read_iovecs(memory, iov, iovcnt) {
             Ok(iovecs) => iovecs,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         if offset < 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         for iovec in &iovecs {
             let iov_len = usize::try_from(iovec.iov_len)
                 .map_err(|_| DispatchError::LengthTooLarge(iovec.iov_len))?;
             if memory.read_bytes(iovec.iov_base, iov_len).is_err() {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_EFAULT,
-                });
+                return Ok(LINUX_EFAULT.into());
             }
         }
-        if is_stdio_fd(fd) {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_ESPIPE,
-            });
+        if is_stdio_fd(fd.0) {
+            return Ok(LINUX_ESPIPE.into());
         }
-        let Some(open_file) = self.open_file(fd) else {
-            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+        let Some(open_file) = self.open_file(fd.0) else {
+            return Ok(LINUX_EBADF.into());
         };
         let open = open_file.description.read();
         // Real host file: positional writev via libc::pwrite per iovec.
@@ -2985,7 +2819,7 @@ impl SyscallDispatcher {
         } = &*open
         {
             if !*writable {
-                return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+                return Ok(LINUX_EBADF.into());
             }
             let hfd = *host_fd;
             let mut total = 0i64;
@@ -2999,16 +2833,14 @@ impl SyscallDispatcher {
                 let buf = match memory.read_bytes(iov.iov_base, len) {
                     Ok(b) => b,
                     Err(_) => {
-                        return Ok(DispatchOutcome::Errno {
-                            errno: LINUX_EFAULT,
-                        });
+                        return Ok(LINUX_EFAULT.into());
                     }
                 };
                 let n =
                     unsafe { libc::pwrite(hfd, buf.as_ptr() as *const _, len, cur as libc::off_t) };
                 let n = match n.host_syscall_errno() {
                     Ok(value) => value,
-                    Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                    Err(errno) => return Ok(errno.into()),
                 };
                 total += n as i64;
                 cur += n as i64;
@@ -3031,15 +2863,15 @@ impl SyscallDispatcher {
             | OpenDescription::Netlink { .. }
             | OpenDescription::Epoll { .. } => LINUX_ESPIPE,
         };
-        Ok(DispatchOutcome::Errno { errno })
+        Ok(errno.into())
     }
 
     pub(super) fn sendfile<M: GuestMemory>(
         &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let out_fd = ctx.arg(0) as i32;
-        let in_fd = ctx.arg(1) as i32;
+        let out_fd: Fd = ctx.typed_arg(0);
+        let in_fd: Fd = ctx.typed_arg(1);
         let offset_address = ctx.arg(2);
         let count =
             usize::try_from(ctx.arg(3)).map_err(|_| DispatchError::LengthTooLarge(ctx.arg(3)))?;
@@ -3048,22 +2880,22 @@ impl SyscallDispatcher {
             return Ok(DispatchOutcome::Returned { value: 0 });
         }
 
-        let mut offset = match self.sendfile_offset(in_fd, offset_address, memory)? {
+        let mut offset = match self.sendfile_offset(in_fd.0, offset_address, memory)? {
             Ok(offset) => offset,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
-        let bytes = match self.sendfile_bytes(in_fd, offset, count) {
+        let bytes = match self.sendfile_bytes(in_fd.0, offset, count) {
             Ok(bytes) => bytes,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
-        let outcome = self.write_output_fd(out_fd, &bytes);
+        let outcome = self.write_output_fd(out_fd.0, &bytes);
         let DispatchOutcome::Returned { value } = outcome else {
             return Ok(outcome);
         };
         let written = usize::try_from(value).unwrap_or(0);
         offset = offset.saturating_add(written);
         if offset_address == 0 {
-            if let Some(open_file) = self.open_file(in_fd) {
+            if let Some(open_file) = self.open_file(in_fd.0) {
                 let mut open = open_file.description.write();
                 match &mut *open {
                     OpenDescription::File {
@@ -3079,9 +2911,7 @@ impl SyscallDispatcher {
             .write_bytes(offset_address, &(offset as u64).to_ne_bytes())
             .is_err()
         {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EFAULT,
-            });
+            return Ok(LINUX_EFAULT.into());
         }
 
         Ok(DispatchOutcome::Returned { value })
@@ -3096,9 +2926,9 @@ impl SyscallDispatcher {
         &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let in_fd = ctx.arg(0) as i32;
+        let in_fd: Fd = ctx.typed_arg(0);
         let off_in_addr = ctx.arg(1);
-        let out_fd = ctx.arg(2) as i32;
+        let out_fd: Fd = ctx.typed_arg(2);
         let off_out_addr = ctx.arg(3);
         // Callers (coreutils `cat`) pass len = SSIZE_MAX and loop until EOF,
         // so cap each call to a bounded chunk rather than trying to allocate
@@ -3110,24 +2940,24 @@ impl SyscallDispatcher {
             return Ok(DispatchOutcome::Returned { value: 0 });
         }
 
-        let in_offset = match self.sendfile_offset(in_fd, off_in_addr, memory)? {
+        let in_offset = match self.sendfile_offset(in_fd.0, off_in_addr, memory)? {
             Ok(o) => o,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         #[cfg(target_os = "macos")]
         if let Some(outcome) = self.try_darwin_copyfile_range_fast_path(
-            in_fd,
+            in_fd.0,
             in_offset,
             off_in_addr,
-            out_fd,
+            out_fd.0,
             off_out_addr,
             count,
         )? {
             return Ok(outcome);
         }
-        let bytes = match self.sendfile_bytes(in_fd, in_offset, count) {
+        let bytes = match self.sendfile_bytes(in_fd.0, in_offset, count) {
             Ok(b) => b,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         if bytes.is_empty() {
             return Ok(DispatchOutcome::Returned { value: 0 });
@@ -3137,7 +2967,7 @@ impl SyscallDispatcher {
         // (the common case: cat to a pipe/stdout). Non-NULL → pwrite at the
         // given offset on a real host fd and advance *off_out.
         let written = if off_out_addr == 0 {
-            let outcome = self.write_output_fd(out_fd, &bytes);
+            let outcome = self.write_output_fd(out_fd.0, &bytes);
             let DispatchOutcome::Returned { value } = outcome else {
                 return Ok(outcome);
             };
@@ -3145,9 +2975,9 @@ impl SyscallDispatcher {
         } else {
             let out_off = match read_u64(memory, off_out_addr) {
                 Ok(v) => v,
-                Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                Err(errno) => return Ok(errno.into()),
             };
-            let host_fd = match self.open_file(out_fd).as_ref() {
+            let host_fd = match self.open_file(out_fd.0).as_ref() {
                 Some(of) => match &*of.description.read() {
                     OpenDescription::HostFile {
                         host_fd,
@@ -3155,15 +2985,13 @@ impl SyscallDispatcher {
                         ..
                     } => *host_fd,
                     OpenDescription::HostFile { .. } => {
-                        return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+                        return Ok(LINUX_EBADF.into());
                     }
                     _ => {
-                        return Ok(DispatchOutcome::Errno {
-                            errno: LINUX_EINVAL,
-                        });
+                        return Ok(LINUX_EINVAL.into());
                     }
                 },
-                None => return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF }),
+                None => return Ok(LINUX_EBADF.into()),
             };
             let n = unsafe {
                 libc::pwrite(
@@ -3175,15 +3003,13 @@ impl SyscallDispatcher {
             };
             let n = match n.host_syscall_errno() {
                 Ok(value) => value as usize,
-                Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                Err(errno) => return Ok(errno.into()),
             };
             if memory
                 .write_bytes(off_out_addr, &(out_off + n as u64).to_ne_bytes())
                 .is_err()
             {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_EFAULT,
-                });
+                return Ok(LINUX_EFAULT.into());
             }
             n
         };
@@ -3191,7 +3017,7 @@ impl SyscallDispatcher {
         // Advance the input offset (pointer or the fd's own position).
         let new_in = in_offset.saturating_add(written);
         if off_in_addr == 0 {
-            if let Some(of) = self.open_file(in_fd).as_ref() {
+            if let Some(of) = self.open_file(in_fd.0).as_ref() {
                 let mut open = of.description.write();
                 match &mut *open {
                     OpenDescription::File { offset, .. }
@@ -3206,9 +3032,7 @@ impl SyscallDispatcher {
             .write_bytes(off_in_addr, &(new_in as u64).to_ne_bytes())
             .is_err()
         {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EFAULT,
-            });
+            return Ok(LINUX_EFAULT.into());
         }
 
         Ok(DispatchOutcome::Returned {
@@ -3237,7 +3061,7 @@ impl SyscallDispatcher {
             return Ok(None);
         };
         if !output.writable {
-            return Ok(Some(DispatchOutcome::Errno { errno: LINUX_EBADF }));
+            return Ok(Some(DispatchOutcome::errno(LINUX_EBADF)));
         }
         if input.size == 0
             || output.size != 0
@@ -3271,7 +3095,7 @@ impl SyscallDispatcher {
                 }))
             }
             Ok(None) => Ok(None),
-            Err(errno) => Ok(Some(DispatchOutcome::Errno { errno })),
+            Err(errno) => Ok(Some(DispatchOutcome::errno(errno))),
         }
     }
 
@@ -3384,51 +3208,45 @@ impl SyscallDispatcher {
         &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let in_fd = ctx.arg(0) as i32;
+        let in_fd: Fd = ctx.typed_arg(0);
         let off_in_address = ctx.arg(1);
-        let out_fd = ctx.arg(2) as i32;
+        let out_fd: Fd = ctx.typed_arg(2);
         let off_out_address = ctx.arg(3);
         let count =
             usize::try_from(ctx.arg(4)).map_err(|_| DispatchError::LengthTooLarge(ctx.arg(4)))?;
         let flags = ctx.arg(5);
         let memory = &mut *ctx.memory;
         if flags & !LINUX_SPLICE_SUPPORTED_FLAGS != 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         if count == 0 {
             return Ok(DispatchOutcome::Returned { value: 0 });
         }
 
-        if let Some((pipe, status_flags)) = self.pipe_reader(in_fd) {
+        if let Some((pipe, status_flags)) = self.pipe_reader(in_fd.0) {
             if off_in_address != 0 || off_out_address != 0 {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_EINVAL,
-                });
+                return Ok(LINUX_EINVAL.into());
             }
-            if let Some(errno) = self.splice_output_errno(out_fd) {
-                return Ok(DispatchOutcome::Errno { errno });
+            if let Some(errno) = self.splice_output_errno(out_fd.0) {
+                return Ok(errno.into());
             }
             let bytes = match take_pipe_bytes(&pipe, count, status_flags) {
                 Ok(bytes) => bytes,
-                Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                Err(errno) => return Ok(errno.into()),
             };
-            let outcome = self.write_output_fd(out_fd, &bytes);
+            let outcome = self.write_output_fd(out_fd.0, &bytes);
             return Ok(outcome);
         }
 
         // Splice OUT of a real host pipe's read end (the fork-safe pipe model;
         // `pipe2`/`fcntl` now hand back HostPipe descriptions, so splice must
         // recognise them just like the legacy in-memory PipeReader above).
-        if let Some(host_fd) = self.host_pipe_read_fd(in_fd) {
+        if let Some(host_fd) = self.host_pipe_read_fd(in_fd.0) {
             if off_in_address != 0 || off_out_address != 0 {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_EINVAL,
-                });
+                return Ok(LINUX_EINVAL.into());
             }
-            if let Some(errno) = self.splice_output_errno(out_fd) {
-                return Ok(DispatchOutcome::Errno { errno });
+            if let Some(errno) = self.splice_output_errno(out_fd.0) {
+                return Ok(errno.into());
             }
             let mut buf = vec![0u8; count];
             // BLOCKING-IO-OK: splice/sendfile source read. The in fd is a
@@ -3438,44 +3256,40 @@ impl SyscallDispatcher {
             let n = unsafe { libc::read(host_fd, buf.as_mut_ptr() as *mut _, count) };
             let n = match n.host_syscall_errno() {
                 Ok(value) => value,
-                Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                Err(errno) => return Ok(errno.into()),
             };
             buf.truncate(n as usize);
-            let outcome = self.write_output_fd(out_fd, &buf);
+            let outcome = self.write_output_fd(out_fd.0, &buf);
             return Ok(outcome);
         }
 
         if off_out_address != 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
-        match self.fd_is_pipe_writer(out_fd) {
+        match self.fd_is_pipe_writer(out_fd.0) {
             Ok(true) => {}
             Ok(false) => {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_EINVAL,
-                });
+                return Ok(LINUX_EINVAL.into());
             }
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         }
 
-        let mut offset = match self.sendfile_offset(in_fd, off_in_address, memory)? {
+        let mut offset = match self.sendfile_offset(in_fd.0, off_in_address, memory)? {
             Ok(offset) => offset,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
-        let bytes = match self.sendfile_bytes(in_fd, offset, count) {
+        let bytes = match self.sendfile_bytes(in_fd.0, offset, count) {
             Ok(bytes) => bytes,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
-        let outcome = self.write_output_fd(out_fd, &bytes);
+        let outcome = self.write_output_fd(out_fd.0, &bytes);
         let DispatchOutcome::Returned { value } = outcome else {
             return Ok(outcome);
         };
         let written = usize::try_from(value).unwrap_or(0);
         offset = offset.saturating_add(written);
         if off_in_address == 0 {
-            if let Some(open_file) = self.open_file(in_fd) {
+            if let Some(open_file) = self.open_file(in_fd.0) {
                 let mut open = open_file.description.write();
                 match &mut *open {
                     OpenDescription::File {
@@ -3491,9 +3305,7 @@ impl SyscallDispatcher {
             .write_bytes(off_in_address, &(offset as u64).to_ne_bytes())
             .is_err()
         {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EFAULT,
-            });
+            return Ok(LINUX_EFAULT.into());
         }
 
         Ok(DispatchOutcome::Returned { value })
@@ -3591,26 +3403,24 @@ impl SyscallDispatcher {
         &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let fd = ctx.arg(0) as i32;
-        if !self.fd_is_valid(fd) {
-            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+        let fd: Fd = ctx.typed_arg(0);
+        if !self.fd_is_valid(fd.0) {
+            return Ok(LINUX_EBADF.into());
         }
-        let host_fd = match self.host_file_fd_for_flush(fd) {
+        let host_fd = match self.host_file_fd_for_flush(fd.0) {
             Ok(host_fd) => host_fd,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         if let Some(host_fd) = host_fd {
             if let Err(errno) = flush_host_fd(host_fd) {
-                return Ok(DispatchOutcome::Errno { errno });
+                return Ok(errno.into());
             }
         }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
 
     fn xattr_unsupported(&self) -> DispatchOutcome {
-        DispatchOutcome::Errno {
-            errno: LINUX_ENOTSUP,
-        }
+        DispatchOutcome::errno(LINUX_ENOTSUP)
     }
 
     /// Resolve the first argument of an xattr syscall to the rootfs path it
@@ -3656,20 +3466,18 @@ impl SyscallDispatcher {
         // setxattr(path/fd, name, value, size, flags)
         let resolved = match self.xattr_target_path(&request, memory, target) {
             Ok(p) => p,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         let name = match read_guest_c_string(memory, request.arg(1)) {
             Ok(name) => name,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         let size = request.arg(3) as usize;
         let flags = request.arg(4) as i32;
         let value = match memory.read_bytes(request.arg(2), size) {
             Ok(bytes) => bytes,
             Err(_) => {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_EFAULT,
-                });
+                return Ok(LINUX_EFAULT.into());
             }
         };
         match self
@@ -3679,7 +3487,7 @@ impl SyscallDispatcher {
             .set_xattr(&resolved, &name, &value, flags)
         {
             Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
-            Err(errno) => Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => Ok(errno.into()),
         }
     }
 
@@ -3692,17 +3500,17 @@ impl SyscallDispatcher {
         // getxattr(path/fd, name, value, size)
         let resolved = match self.xattr_target_path(&request, memory, target) {
             Ok(p) => p,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         let name = match read_guest_c_string(memory, request.arg(1)) {
             Ok(name) => name,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         let buf_addr = request.arg(2);
         let size = request.arg(3) as usize;
         let value = match self.fs.rootfs_vfs.overlay.get_xattr(&resolved, &name) {
             Ok(value) => value,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         // size == 0 is the "tell me how big" probe: return the length without
         // copying anything.
@@ -3712,14 +3520,10 @@ impl SyscallDispatcher {
             });
         }
         if value.len() > size {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_ERANGE,
-            });
+            return Ok(LINUX_ERANGE.into());
         }
         if memory.write_bytes(buf_addr, &value).is_err() {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EFAULT,
-            });
+            return Ok(LINUX_EFAULT.into());
         }
         Ok(DispatchOutcome::Returned {
             value: value.len() as i64,
@@ -3735,13 +3539,13 @@ impl SyscallDispatcher {
         // listxattr(path/fd, list, size)
         let resolved = match self.xattr_target_path(&request, memory, target) {
             Ok(p) => p,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         let buf_addr = request.arg(1);
         let size = request.arg(2) as usize;
         let names = match self.fs.rootfs_vfs.overlay.list_xattr(&resolved) {
             Ok(names) => names,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         // Assemble the NUL-separated, NUL-terminated name list Linux returns.
         let mut list = Vec::new();
@@ -3755,14 +3559,10 @@ impl SyscallDispatcher {
             });
         }
         if list.len() > size {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_ERANGE,
-            });
+            return Ok(LINUX_ERANGE.into());
         }
         if memory.write_bytes(buf_addr, &list).is_err() {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EFAULT,
-            });
+            return Ok(LINUX_EFAULT.into());
         }
         Ok(DispatchOutcome::Returned {
             value: list.len() as i64,
@@ -3770,9 +3570,7 @@ impl SyscallDispatcher {
     }
 
     fn bootstrap_enosys(&self) -> DispatchOutcome {
-        DispatchOutcome::Errno {
-            errno: LINUX_ENOSYS,
-        }
+        DispatchOutcome::errno(LINUX_ENOSYS)
     }
 
     // === Normalized shim-wrappers ===
@@ -3863,14 +3661,14 @@ impl SyscallDispatcher {
         &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let fd = ctx.arg(0) as i32;
-        let host_fd = match self.host_file_fd_for_flush(fd) {
+        let fd: Fd = ctx.typed_arg(0);
+        let host_fd = match self.host_file_fd_for_flush(fd.0) {
             Ok(host_fd) => host_fd,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         if let Some(host_fd) = host_fd {
             if let Err(errno) = flush_host_fd(host_fd) {
-                return Ok(DispatchOutcome::Errno { errno });
+                return Ok(errno.into());
             }
         }
         Ok(DispatchOutcome::Returned { value: 0 })
@@ -3880,14 +3678,14 @@ impl SyscallDispatcher {
         &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let fd = ctx.arg(0) as i32;
-        let host_fd = match self.host_file_fd_for_flush(fd) {
+        let fd: Fd = ctx.typed_arg(0);
+        let host_fd = match self.host_file_fd_for_flush(fd.0) {
             Ok(host_fd) => host_fd,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         if let Some(host_fd) = host_fd {
             if let Err(errno) = flush_host_fd(host_fd) {
-                return Ok(DispatchOutcome::Errno { errno });
+                return Ok(errno.into());
             }
         }
         Ok(DispatchOutcome::Returned { value: 0 })
@@ -3919,9 +3717,7 @@ impl SyscallDispatcher {
         let bytes = match (*ctx.memory).read_bytes(address, length) {
             Ok(bytes) => bytes,
             Err(_) => {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_EFAULT,
-                });
+                return Ok(LINUX_EFAULT.into());
             }
         };
 
@@ -3941,7 +3737,7 @@ impl SyscallDispatcher {
                     // pty ends are bidirectional (O_RDWR); only real one-way
                     // pipe ends are gated by is_read_end.
                     if *is_read_end && pty.is_none() {
-                        DispatchOutcome::Errno { errno: LINUX_EBADF }
+                        DispatchOutcome::errno(LINUX_EBADF)
                     } else {
                         write_host_pipe(&bytes, *host_fd, nonblocking)
                     }
@@ -3956,7 +3752,7 @@ impl SyscallDispatcher {
                     ..
                 } => {
                     if !*writable {
-                        DispatchOutcome::Errno { errno: LINUX_EBADF }
+                        DispatchOutcome::errno(LINUX_EBADF)
                     } else {
                         if *status_flags & LINUX_O_APPEND != 0 {
                             unsafe { libc::lseek(*host_fd, 0, libc::SEEK_END) };
@@ -3964,9 +3760,7 @@ impl SyscallDispatcher {
                         write_host_pipe(&bytes, *host_fd, nonblocking)
                     }
                 }
-                _ => DispatchOutcome::Errno {
-                    errno: LINUX_ENOSYS,
-                },
+                _ => DispatchOutcome::errno(LINUX_ENOSYS),
             });
         }
         if *self.io.stream_stdio.lock() && (fd == 1 || fd == 2) {
@@ -3978,13 +3772,13 @@ impl SyscallDispatcher {
                 Ok(value) => Ok(DispatchOutcome::Returned {
                     value: value as i64,
                 }),
-                Err(errno) => Ok(DispatchOutcome::Errno { errno }),
+                Err(errno) => Ok(errno.into()),
             };
         }
         match fd {
             1 => self.io.stdout.lock().extend_from_slice(&bytes),
             2 => self.io.stderr.lock().extend_from_slice(&bytes),
-            _ => return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF }),
+            _ => return Ok(LINUX_EBADF.into()),
         }
 
         Ok(DispatchOutcome::Returned {
@@ -4003,9 +3797,7 @@ impl SyscallDispatcher {
         let bytes = match (*ctx.memory).read_bytes(address, length) {
             Ok(bytes) => bytes,
             Err(_) => {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_EFAULT,
-                });
+                return Ok(LINUX_EFAULT.into());
             }
         };
 
@@ -4043,7 +3835,7 @@ impl SyscallDispatcher {
                         // pty ends are bidirectional (O_RDWR); only real one-way
                         // pipe ends are gated by is_read_end.
                         if *is_read_end && pty.is_none() {
-                            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+                            return Ok(LINUX_EBADF.into());
                         }
                         return Ok(write_host_pipe(&bytes, *host_fd, nonblocking));
                     }
@@ -4060,7 +3852,7 @@ impl SyscallDispatcher {
                         ..
                     } => {
                         if !*writable {
-                            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+                            return Ok(LINUX_EBADF.into());
                         }
                         // O_APPEND: seek to EOF before writing so `>>` and
                         // log appends don't overwrite from offset 0. (The
@@ -4083,10 +3875,10 @@ impl SyscallDispatcher {
                         ..
                     } => {
                         if !*writable {
-                            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+                            return Ok(LINUX_EBADF.into());
                         }
                         if let Err(errno) = write_into_file_contents(contents, offset, &bytes) {
-                            return Ok(DispatchOutcome::Errno { errno });
+                            return Ok(errno.into());
                         }
                         metadata.size = contents.len();
                         outcome = DispatchOutcome::Returned {
@@ -4097,7 +3889,7 @@ impl SyscallDispatcher {
                             contents: contents.clone(),
                         };
                     }
-                    _ => return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF }),
+                    _ => return Ok(LINUX_EBADF.into()),
                 }
             }
             if let FileWriteback::Update { path, contents } = writeback {
@@ -4112,7 +3904,7 @@ impl SyscallDispatcher {
         match fd {
             1 => self.io.stdout.lock().extend_from_slice(&bytes),
             2 => self.io.stderr.lock().extend_from_slice(&bytes),
-            _ => return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF }),
+            _ => return Ok(LINUX_EBADF.into()),
         }
 
         Ok(DispatchOutcome::Returned {
@@ -4149,7 +3941,7 @@ impl SyscallDispatcher {
                         // pty ends are bidirectional (O_RDWR); only real one-way
                         // pipe ends are gated by is_read_end.
                         return if *is_read_end && pty.is_none() {
-                            DispatchOutcome::Errno { errno: LINUX_EBADF }
+                            DispatchOutcome::errno(LINUX_EBADF)
                         } else {
                             write_host_pipe(bytes, *host_fd, nonblocking)
                         };
@@ -4164,7 +3956,7 @@ impl SyscallDispatcher {
                         ..
                     } => {
                         if !*writable {
-                            return DispatchOutcome::Errno { errno: LINUX_EBADF };
+                            return DispatchOutcome::errno(LINUX_EBADF);
                         }
                         if *status_flags & LINUX_O_APPEND != 0 {
                             unsafe { libc::lseek(*host_fd, 0, libc::SEEK_END) };
@@ -4180,10 +3972,10 @@ impl SyscallDispatcher {
                         ..
                     } => {
                         if !*writable {
-                            return DispatchOutcome::Errno { errno: LINUX_EBADF };
+                            return DispatchOutcome::errno(LINUX_EBADF);
                         }
                         if let Err(errno) = write_into_file_contents(contents, offset, bytes) {
-                            return DispatchOutcome::Errno { errno };
+                            return DispatchOutcome::errno(errno);
                         }
                         metadata.size = contents.len();
                         outcome = DispatchOutcome::Returned {
@@ -4191,7 +3983,7 @@ impl SyscallDispatcher {
                         };
                         writeback = Some((path.clone(), contents.clone()));
                     }
-                    _ => return DispatchOutcome::Errno { errno: LINUX_EBADF },
+                    _ => return DispatchOutcome::errno(LINUX_EBADF),
                 }
             }
             if let Some((path, contents)) = writeback {
@@ -4212,13 +4004,13 @@ impl SyscallDispatcher {
                 Ok(value) => DispatchOutcome::Returned {
                     value: value as i64,
                 },
-                Err(errno) => DispatchOutcome::Errno { errno },
+                Err(errno) => DispatchOutcome::errno(errno),
             };
         }
         match fd {
             1 => self.io.stdout.lock().extend_from_slice(bytes),
             2 => self.io.stderr.lock().extend_from_slice(bytes),
-            _ => return DispatchOutcome::Errno { errno: LINUX_EBADF },
+            _ => return DispatchOutcome::errno(LINUX_EBADF),
         }
         DispatchOutcome::Returned {
             value: bytes.len() as i64,
@@ -4236,7 +4028,7 @@ impl SyscallDispatcher {
         let memory = &*ctx.memory;
         let iovecs = match read_iovecs(memory, iov, iovcnt) {
             Ok(iovecs) => iovecs,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         let nonblocking = self.io_is_nonblocking(fd as i32, 0);
 
@@ -4248,9 +4040,7 @@ impl SyscallDispatcher {
             let bytes = match memory.read_bytes(iov_base, iov_len) {
                 Ok(bytes) => bytes,
                 Err(_) => {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: LINUX_EFAULT,
-                    });
+                    return Ok(LINUX_EFAULT.into());
                 }
             };
             // Mirror `write`: check open_files FIRST so post-dup3
@@ -4280,7 +4070,7 @@ impl SyscallDispatcher {
                             // pty ends are bidirectional (O_RDWR); only real one-way
                             // pipe ends are gated by is_read_end.
                             if *is_read_end && pty.is_none() {
-                                return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+                                return Ok(LINUX_EBADF.into());
                             }
                             outcome = write_host_pipe(&bytes, *host_fd, nonblocking);
                             writeback = FileWriteback::None;
@@ -4296,7 +4086,7 @@ impl SyscallDispatcher {
                             ..
                         } => {
                             if !*writable {
-                                return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+                                return Ok(LINUX_EBADF.into());
                             }
                             // Mirror `write`(64): O_APPEND seeks to EOF, then
                             // libc::write to the real fd advances the shared
@@ -4317,10 +4107,10 @@ impl SyscallDispatcher {
                             ..
                         } => {
                             if !*writable {
-                                return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+                                return Ok(LINUX_EBADF.into());
                             }
                             if let Err(errno) = write_into_file_contents(contents, offset, &bytes) {
-                                return Ok(DispatchOutcome::Errno { errno });
+                                return Ok(errno.into());
                             }
                             metadata.size = contents.len();
                             outcome = DispatchOutcome::Returned {
@@ -4331,7 +4121,7 @@ impl SyscallDispatcher {
                                 contents: contents.clone(),
                             };
                         }
-                        _ => return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF }),
+                        _ => return Ok(LINUX_EBADF.into()),
                     }
                 }
                 if let FileWriteback::Update { path, contents } = writeback {
@@ -4355,7 +4145,7 @@ impl SyscallDispatcher {
                 let n = unsafe { libc::write(fd as i32, bytes.as_ptr() as *const _, bytes.len()) };
                 let n = match n.host_syscall_errno() {
                     Ok(value) => value as usize,
-                    Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                    Err(errno) => return Ok(errno.into()),
                 };
                 total = total
                     .checked_add(n)
@@ -4365,7 +4155,7 @@ impl SyscallDispatcher {
             match fd {
                 1 => self.io.stdout.lock().extend_from_slice(&bytes),
                 2 => self.io.stderr.lock().extend_from_slice(&bytes),
-                _ => return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF }),
+                _ => return Ok(LINUX_EBADF.into()),
             }
             total = total
                 .checked_add(bytes.len())
@@ -4403,18 +4193,16 @@ impl SyscallDispatcher {
         let buffer_size =
             usize::try_from(ctx.arg(3)).map_err(|_| DispatchError::LengthTooLarge(ctx.arg(3)))?;
         if buffer_size == 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
 
         let path = match read_guest_c_string(&*ctx.memory, pathname) {
             Ok(path) => path,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         let path = match self.resolve_at_path(dirfd, &path) {
             Ok(path) => path,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
 
         let target = if path == "/proc/self/exe" || path == "/proc/curproc/exe" {
@@ -4431,16 +4219,14 @@ impl SyscallDispatcher {
             use crate::vfs::Vfs as _;
             match self.fs.rootfs_vfs.readlink(&path) {
                 Ok(p) => p.to_string_lossy().into_owned(),
-                Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                Err(errno) => return Ok(errno.into()),
             }
         };
 
         let bytes = target.as_bytes();
         let written = bytes.len().min(buffer_size);
         if ctx.memory.write_bytes(buffer, &bytes[..written]).is_err() {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EFAULT,
-            });
+            return Ok(LINUX_EFAULT.into());
         }
         Ok(DispatchOutcome::Returned {
             value: written as i64,
@@ -4456,30 +4242,24 @@ impl SyscallDispatcher {
         let mode = ctx.arg(2) as u32;
         let path = match read_guest_c_string(&*ctx.memory, pathname) {
             Ok(path) => path,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         if path.is_empty() {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_ENOENT,
-            });
+            return Ok(LINUX_ENOENT.into());
         }
         let resolved = match self.resolve_at_path(dirfd, &path) {
             Ok(resolved) => resolved,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         if crate::vfs::is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context()) {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EEXIST,
-            });
+            return Ok(LINUX_EEXIST.into());
         }
         // Existence check must consult the layered view (overlay/disk
         // first, then rootfs) — a rootfs-direct lookup would miss a file
         // the guest already created in the overlay and wrongly report
         // EROFS instead of EEXIST. Mirrors the linkat EEXIST check.
         if self.layered_metadata(&resolved).is_ok() {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EEXIST,
-            });
+            return Ok(LINUX_EEXIST.into());
         }
         // Linux mknod(2): a zero type field means S_IFREG. Only regular
         // files are materialised on the host backend (like open O_CREAT);
@@ -4487,7 +4267,7 @@ impl SyscallDispatcher {
         // so they report EPERM (matching the unprivileged-mknod errno).
         let type_bits = mode & LINUX_S_IFMT;
         if type_bits != 0 && type_bits != LINUX_S_IFREG {
-            return Ok(DispatchOutcome::Errno { errno: LINUX_EPERM });
+            return Ok(LINUX_EPERM.into());
         }
         // Create an empty regular file in the writable backend (cap-std).
         // MemoryBackend's create_file works in-memory too. After this the
@@ -4503,10 +4283,8 @@ impl SyscallDispatcher {
                 }
                 Ok(DispatchOutcome::Returned { value: 0 })
             }
-            Err(crate::fs_backend::BackendError::Unsupported) => {
-                Ok(DispatchOutcome::Errno { errno: LINUX_EROFS })
-            }
-            Err(_) => Ok(DispatchOutcome::Errno { errno: LINUX_EROFS }),
+            Err(crate::fs_backend::BackendError::Unsupported) => Ok(LINUX_EROFS.into()),
+            Err(_) => Ok(LINUX_EROFS.into()),
         }
     }
 
@@ -4519,21 +4297,17 @@ impl SyscallDispatcher {
         let mode = ctx.arg(2);
         let path = match read_guest_c_string(&*ctx.memory, pathname) {
             Ok(path) => path,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         if path.is_empty() {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_ENOENT,
-            });
+            return Ok(LINUX_ENOENT.into());
         }
         let resolved = match self.resolve_at_path(dirfd, &path) {
             Ok(resolved) => resolved,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         if crate::vfs::is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context()) {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EEXIST,
-            });
+            return Ok(LINUX_EEXIST.into());
         }
         // Layered existence + parent-exists checks live inside
         // RootFsVfs::mkdir; the dispatcher only handles synthetic
@@ -4556,7 +4330,7 @@ impl SyscallDispatcher {
                 }
                 Ok(DispatchOutcome::Returned { value: 0 })
             }
-            Err(errno) => Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => Ok(errno.into()),
         }
     }
 
@@ -4564,9 +4338,9 @@ impl SyscallDispatcher {
         &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let fd = ctx.arg(0) as i32;
-        if !self.fd_is_valid(fd) {
-            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+        let fd: Fd = ctx.typed_arg(0);
+        if !self.fd_is_valid(fd.0) {
+            return Ok(LINUX_EBADF.into());
         }
         let mode = (ctx.arg(1) & 0o7777) as u32;
         // Resolve the fd to its path and route through the backend's set_mode,
@@ -4575,7 +4349,7 @@ impl SyscallDispatcher {
         // forced-owner-accessible value. Previously this called libc::fchmod
         // directly, so fstat kept reporting the stale creation-time mode.
         let path = self
-            .open_file(fd)
+            .open_file(fd.0)
             .and_then(|of| match &*of.description.read() {
                 OpenDescription::HostFile { metadata, .. }
                 | OpenDescription::File { metadata, .. }
@@ -4594,16 +4368,16 @@ impl SyscallDispatcher {
         &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let fd = ctx.arg(0) as i32;
-        if !self.fd_is_valid(fd) {
-            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+        let fd: Fd = ctx.typed_arg(0);
+        if !self.fd_is_valid(fd.0) {
+            return Ok(LINUX_EBADF.into());
         }
         let uid = ctx.arg(1) as u32;
         let gid = ctx.arg(2) as u32;
         // Resolve the fd's path so we can record the guest-visible owner on the
         // backend (durably via xattr on --fs host), mirroring fchownat.
         let path = self
-            .open_file(fd)
+            .open_file(fd.0)
             .and_then(|of| match &*of.description.read() {
                 OpenDescription::HostFile { metadata, .. }
                 | OpenDescription::File { metadata, .. }
@@ -4653,25 +4427,21 @@ impl SyscallDispatcher {
         let pathname = ctx.arg(1);
         let flags = ctx.arg(4);
         if flags & !(LINUX_AT_SYMLINK_NOFOLLOW | LINUX_AT_EMPTY_PATH) != 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         let path = match read_guest_c_string(&*ctx.memory, pathname) {
             Ok(path) => path,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         if path.is_empty() {
             if flags & LINUX_AT_EMPTY_PATH == 0 {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_ENOENT,
-                });
+                return Ok(LINUX_ENOENT.into());
             }
             if dirfd == LINUX_AT_FDCWD {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
             if !self.fd_is_valid(dirfd as i32) {
-                return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+                return Ok(LINUX_EBADF.into());
             }
             return Ok(DispatchOutcome::Returned { value: 0 });
         }
@@ -4679,7 +4449,7 @@ impl SyscallDispatcher {
         let gid = ctx.arg(3) as u32;
         let resolved = match self.resolve_at_path(dirfd, &path) {
             Ok(resolved) => resolved,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         // Layered presence check: overlay first (tombstones become ENOENT),
         // synthetic /proc and /sys are no-op success, rootfs is no-op
@@ -4696,7 +4466,7 @@ impl SyscallDispatcher {
                 {
                     Ok(DispatchOutcome::Returned { value: 0 })
                 } else {
-                    Ok(DispatchOutcome::Errno { errno })
+                    Ok(errno.into())
                 }
             }
         }
@@ -4720,16 +4490,14 @@ impl SyscallDispatcher {
         // AT_SYMLINK_NOFOLLOW stays advisory.
         let path = match read_guest_c_string(&*ctx.memory, pathname) {
             Ok(path) => path,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         if path.is_empty() {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_ENOENT,
-            });
+            return Ok(LINUX_ENOENT.into());
         }
         let resolved = match self.resolve_at_path(dirfd, &path) {
             Ok(resolved) => resolved,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         // Apply the mode to the writable backend (cap-std set_permissions on
         // --fs host). Synthetic /proc /sys paths and the in-memory backend
@@ -4738,7 +4506,7 @@ impl SyscallDispatcher {
             return Ok(DispatchOutcome::Returned { value: 0 });
         }
         if let Err(errno) = self.layered_metadata(&resolved) {
-            return Ok(DispatchOutcome::Errno { errno });
+            return Ok(errno.into());
         }
         let mode = (ctx.arg(2) & 0o7777) as u32;
         match self.fs.rootfs_vfs.overlay.set_mode(&resolved, mode) {
@@ -4759,65 +4527,55 @@ impl SyscallDispatcher {
         let newpath = ctx.arg(3);
         let flags = ctx.arg(4);
         if flags & !(LINUX_AT_SYMLINK_NOFOLLOW | LINUX_AT_EMPTY_PATH) != 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         let old = match read_guest_c_string(&*ctx.memory, oldpath) {
             Ok(path) => path,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         let new_path = match read_guest_c_string(&*ctx.memory, newpath) {
             Ok(path) => path,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         if new_path.is_empty() {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_ENOENT,
-            });
+            return Ok(LINUX_ENOENT.into());
         }
         if old.is_empty() && flags & LINUX_AT_EMPTY_PATH == 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_ENOENT,
-            });
+            return Ok(LINUX_ENOENT.into());
         }
         let resolved_old = if old.is_empty() {
             if !self.fd_is_valid(olddirfd as i32) {
-                return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+                return Ok(LINUX_EBADF.into());
             }
             None
         } else {
             let resolved = match self.resolve_at_path(olddirfd, &old) {
                 Ok(resolved) => resolved,
-                Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                Err(errno) => return Ok(errno.into()),
             };
             let exists =
                 crate::vfs::is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context())
                     || self.layered_metadata(&resolved).is_ok();
             if !exists {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_ENOENT,
-                });
+                return Ok(LINUX_ENOENT.into());
             }
             Some(resolved)
         };
         let resolved_new = match self.resolve_at_path(newdirfd, &new_path) {
             Ok(resolved) => resolved,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         if crate::vfs::is_synthetic_virtual_file(&resolved_new, &self.synthetic_proc_context())
             || self.layered_metadata(&resolved_new).is_ok()
         {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EEXIST,
-            });
+            return Ok(LINUX_EEXIST.into());
         }
         // Create a real hard link in the writable backend (cap-std
         // hard_link). dpkg link()s e.g. /var/lib/dpkg/status -> status-old.
         // AT_EMPTY_PATH (link by fd) isn't supported. MemoryBackend can't
         // hard-link an in-memory file, so it falls back to a content copy.
         let Some(src) = resolved_old else {
-            return Ok(DispatchOutcome::Errno { errno: LINUX_EROFS });
+            return Ok(LINUX_EROFS.into());
         };
         match self.fs.rootfs_vfs.overlay.hard_link(&src, &resolved_new) {
             Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
@@ -4844,10 +4602,10 @@ impl SyscallDispatcher {
                     .set_file_contents(&resolved_new, contents)
                 {
                     Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
-                    Err(_) => Ok(DispatchOutcome::Errno { errno: LINUX_EROFS }),
+                    Err(_) => Ok(LINUX_EROFS.into()),
                 }
             }
-            Err(_) => Ok(DispatchOutcome::Errno { errno: LINUX_EROFS }),
+            Err(_) => Ok(LINUX_EROFS.into()),
         }
     }
 
@@ -4860,38 +4618,30 @@ impl SyscallDispatcher {
         let linkpath = ctx.arg(2);
         let target_path = match read_guest_c_string(&*ctx.memory, target) {
             Ok(target) => target,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         if target_path.is_empty() {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_ENOENT,
-            });
+            return Ok(LINUX_ENOENT.into());
         }
         let link = match read_guest_c_string(&*ctx.memory, linkpath) {
             Ok(link) => link,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         if link.is_empty() {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_ENOENT,
-            });
+            return Ok(LINUX_ENOENT.into());
         }
         let resolved_link = match self.resolve_at_path(newdirfd, &link) {
             Ok(resolved) => resolved,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         if crate::vfs::is_synthetic_virtual_file(&resolved_link, &self.synthetic_proc_context()) {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EEXIST,
-            });
+            return Ok(LINUX_EEXIST.into());
         }
         // If the link path already exists (anywhere in the layered
         // view), report EEXIST. Otherwise the overlay can't create
         // symlinks today, so we return EROFS.
         if self.layered_metadata(&resolved_link).is_ok() {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EEXIST,
-            });
+            return Ok(LINUX_EEXIST.into());
         }
         // Create a real symlink in the writable backend (cap-std). The
         // target is stored verbatim, matching symlinkat(2). MemoryBackend
@@ -4903,10 +4653,8 @@ impl SyscallDispatcher {
             .symlink(&target_path, &resolved_link)
         {
             Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
-            Err(crate::fs_backend::BackendError::Unsupported) => {
-                Ok(DispatchOutcome::Errno { errno: LINUX_EROFS })
-            }
-            Err(_) => Ok(DispatchOutcome::Errno { errno: LINUX_EROFS }),
+            Err(crate::fs_backend::BackendError::Unsupported) => Ok(LINUX_EROFS.into()),
+            Err(_) => Ok(LINUX_EROFS.into()),
         }
     }
 
@@ -4937,13 +4685,9 @@ impl SyscallDispatcher {
         let flags = ctx.arg(4);
         if flags & !RENAME_NOREPLACE != 0 {
             if flags & RENAME_EXCHANGE != 0 {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_EINVAL,
-                });
+                return Ok(LINUX_EINVAL.into());
             }
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         self.do_renameat(
             ctx.arg(0),
@@ -4967,29 +4711,27 @@ impl SyscallDispatcher {
         const RENAME_NOREPLACE: u64 = 1;
         let old = match read_guest_c_string(memory, oldpath) {
             Ok(path) => path,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         let new_path = match read_guest_c_string(memory, newpath) {
             Ok(path) => path,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         if old.is_empty() || new_path.is_empty() {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_ENOENT,
-            });
+            return Ok(LINUX_ENOENT.into());
         }
         let resolved_old = match self.resolve_at_path(olddirfd, &old) {
             Ok(path) => path,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         let resolved_new = match self.resolve_at_path(newdirfd, &new_path) {
             Ok(path) => path,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         if crate::vfs::is_synthetic_virtual_file(&resolved_old, &self.synthetic_proc_context())
             || crate::vfs::is_synthetic_virtual_file(&resolved_new, &self.synthetic_proc_context())
         {
-            return Ok(DispatchOutcome::Errno { errno: LINUX_EROFS });
+            return Ok(LINUX_EROFS.into());
         }
         let no_replace = flags & RENAME_NOREPLACE != 0;
         match self
@@ -4998,7 +4740,7 @@ impl SyscallDispatcher {
             .rename_with_flags(&resolved_old, &resolved_new, no_replace)
         {
             Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
-            Err(errno) => Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => Ok(errno.into()),
         }
     }
 
@@ -5010,27 +4752,23 @@ impl SyscallDispatcher {
         let pathname = ctx.arg(1);
         let flags = ctx.arg(2);
         if flags & !LINUX_AT_REMOVEDIR != 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         let path = match read_guest_c_string(&*ctx.memory, pathname) {
             Ok(path) => path,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         if path.is_empty() {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_ENOENT,
-            });
+            return Ok(LINUX_ENOENT.into());
         }
         let resolved = match self.resolve_at_path(dirfd, &path) {
             Ok(resolved) => resolved,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         let remove_dir = flags & LINUX_AT_REMOVEDIR != 0;
         // Synthetic /proc /sys paths can't be unlinked.
         if crate::vfs::is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context()) {
-            return Ok(DispatchOutcome::Errno { errno: LINUX_EROFS });
+            return Ok(LINUX_EROFS.into());
         }
         use crate::vfs::Vfs as _;
         let result = if remove_dir {
@@ -5040,7 +4778,7 @@ impl SyscallDispatcher {
         };
         match result {
             Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
-            Err(errno) => Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => Ok(errno.into()),
         }
     }
 
@@ -5054,9 +4792,7 @@ impl SyscallDispatcher {
         let flags = ctx.arg(3);
         let memory = &*ctx.memory;
         if flags & !LINUX_AT_SYMLINK_NOFOLLOW != 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         // `times == NULL` means "set both to now"; otherwise read the two
         // timespecs and resolve UTIME_NOW/UTIME_OMIT into concrete
@@ -5066,21 +4802,19 @@ impl SyscallDispatcher {
         if times != 0 {
             let atime = match read_timespec(memory, times) {
                 Ok(timespec) => timespec,
-                Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                Err(errno) => return Ok(errno.into()),
             };
             let mtime_address = times
                 .checked_add(core::mem::size_of::<LinuxTimespec>() as u64)
                 .ok_or(DispatchError::LengthTooLarge(times))?;
             let mtime = match read_timespec(memory, mtime_address) {
                 Ok(timespec) => timespec,
-                Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                Err(errno) => return Ok(errno.into()),
             };
             if !linux_utimensat_timespec_is_valid(atime)
                 || !linux_utimensat_timespec_is_valid(mtime)
             {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_EINVAL,
-                });
+                return Ok(LINUX_EINVAL.into());
             }
             atime_set = resolve_utimensat_timespec(atime);
             mtime_set = resolve_utimensat_timespec(mtime);
@@ -5097,14 +4831,12 @@ impl SyscallDispatcher {
             // distinct from the AT_EMPTY_PATH form, which carries an empty —
             // not NULL — path.)
             if dirfd == LINUX_AT_FDCWD {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_EFAULT,
-                });
+                return Ok(LINUX_EFAULT.into());
             }
             if atime_set.is_none() && mtime_set.is_none() {
                 // Both UTIME_OMIT: nothing to persist; just validate the fd.
                 if !self.fd_is_valid(dirfd as i32) {
-                    return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+                    return Ok(LINUX_EBADF.into());
                 }
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
@@ -5113,18 +4845,16 @@ impl SyscallDispatcher {
 
         let path = match read_guest_c_string(memory, pathname) {
             Ok(path) => path,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         if path.is_empty() {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_ENOENT,
-            });
+            return Ok(LINUX_ENOENT.into());
         }
         let path = match self.resolve_at_path(dirfd, &path) {
             Ok(path) => path,
             Err(errno) => {
                 crate::probes::fs_op("utimensat:resolve_err", &path, errno);
-                return Ok(DispatchOutcome::Errno { errno });
+                return Ok(errno.into());
             }
         };
         // The path must exist in the layered view, else NotFound (or a
@@ -5137,7 +4867,7 @@ impl SyscallDispatcher {
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 }
                 crate::probes::fs_op("utimensat:meta_err", &path, errno);
-                return Ok(DispatchOutcome::Errno { errno });
+                return Ok(errno.into());
             }
         }
         if atime_set.is_none() && mtime_set.is_none() {
@@ -5184,7 +4914,7 @@ impl SyscallDispatcher {
         let memory = &mut *ctx.memory;
         let path = match read_guest_c_string(memory, pathname) {
             Ok(path) => path,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
 
         if path.is_empty() && flags & LINUX_AT_EMPTY_PATH != 0 {
@@ -5193,7 +4923,7 @@ impl SyscallDispatcher {
 
         let path = match self.resolve_at_path(dirfd, &path) {
             Ok(path) => path,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         // Synthetic /proc /sys paths first.
         if let Some(contents) =
@@ -5252,7 +4982,7 @@ impl SyscallDispatcher {
                 statbuf,
                 &vfs_md_to_rootfs_md(&path, &md),
             )),
-            Err(errno) => Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => Ok(errno.into()),
         }
     }
 
@@ -5268,28 +4998,24 @@ impl SyscallDispatcher {
         let memory = &mut *ctx.memory;
 
         if !linux_statx_flags_are_supported(flags) || mask & LINUX_STATX_RESERVED != 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
 
         let path = match read_guest_c_string(memory, pathname) {
             Ok(path) => path,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
 
         if path.is_empty() {
             if flags & LINUX_AT_EMPTY_PATH == 0 {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_ENOENT,
-                });
+                return Ok(LINUX_ENOENT.into());
             }
             return Ok(self.write_fd_statx(dirfd as i32, statxbuf, memory));
         }
 
         let path = match self.resolve_at_path(dirfd, &path) {
             Ok(path) => path,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         if let Some(contents) =
             crate::vfs::proc::synthetic_file(&path, &self.synthetic_proc_context())
@@ -5342,7 +5068,7 @@ impl SyscallDispatcher {
                 statxbuf,
                 &vfs_md_to_rootfs_md(&path, &md),
             )),
-            Err(errno) => Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => Ok(errno.into()),
         }
     }
 
@@ -5350,9 +5076,9 @@ impl SyscallDispatcher {
         &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let fd = ctx.arg(0) as i32;
+        let fd: Fd = ctx.typed_arg(0);
         let statbuf = ctx.arg(1);
-        Ok(self.write_fd_stat(fd, statbuf, &mut *ctx.memory))
+        Ok(self.write_fd_stat(fd.0, statbuf, &mut *ctx.memory))
     }
 
     /// Apply atime/mtime to an *open fd* — the `futimens(fd, …)` path.
@@ -5367,7 +5093,7 @@ impl SyscallDispatcher {
         mtime: Option<(i64, i64)>,
     ) -> DispatchOutcome {
         let Some(open_file) = self.open_file(fd) else {
-            return DispatchOutcome::Errno { errno: LINUX_EBADF };
+            return DispatchOutcome::errno(LINUX_EBADF);
         };
         let open = open_file.description.read();
         match &*open {
@@ -5403,7 +5129,7 @@ impl SyscallDispatcher {
                     Ok(()) | Err(crate::fs_backend::BackendError::Unsupported) => {
                         DispatchOutcome::Returned { value: 0 }
                     }
-                    Err(_) => DispatchOutcome::Errno { errno: LINUX_EROFS },
+                    Err(_) => DispatchOutcome::errno(LINUX_EROFS),
                 }
             }
             // Directories, synthetic /proc files, pipes, sockets, anon_inode
@@ -5453,7 +5179,7 @@ impl SyscallDispatcher {
     ) -> DispatchOutcome {
         match self.fd_stat_record(fd) {
             Ok(record) => write_stat_record(memory, statbuf, &record),
-            Err(errno) => DispatchOutcome::Errno { errno },
+            Err(errno) => DispatchOutcome::errno(errno),
         }
     }
 
@@ -5465,7 +5191,7 @@ impl SyscallDispatcher {
     ) -> DispatchOutcome {
         match self.fd_stat_record(fd) {
             Ok(record) => write_statx_record(memory, statxbuf, &record),
-            Err(errno) => DispatchOutcome::Errno { errno },
+            Err(errno) => DispatchOutcome::errno(errno),
         }
     }
 
