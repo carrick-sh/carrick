@@ -175,6 +175,45 @@ pub fn forget_thread(tid: i32) {
 /// no 50ms poll, and no reliance on `SA_RESTART`/EINTR. `-1` until initialised.
 static PENDING_PIPE_READ: AtomicI32 = AtomicI32::new(-1);
 static PENDING_PIPE_WRITE: AtomicI32 = AtomicI32::new(-1);
+/// kqueue fd of this process's signal pump, holding an `EVFILT_USER` (ident 0)
+/// the pump blocks on. `notify_pump` triggers it (`NOTE_TRIGGER`) to wake the
+/// pump from a NORMAL thread (e.g. an interval-timer thread) without the
+/// self-pipe's edge-coalescing quirk and without a poll. -1 until the pump
+/// registers it; reset on fork (the child re-spawns its pump).
+static PUMP_KQUEUE: AtomicI32 = AtomicI32::new(-1);
+
+/// Record the signal pump's kqueue fd (called by the pump after it registers
+/// its `EVFILT_USER`). See `notify_pump`.
+pub fn set_pump_kqueue(kq: i32) {
+    PUMP_KQUEUE.store(kq, Ordering::SeqCst);
+}
+
+/// Wake the signal pump via its `EVFILT_USER` (`NOTE_TRIGGER`). NOT
+/// async-signal-safe (`kevent` isn't) — call only from normal thread context;
+/// host signal handlers use the self-pipe (`notify_pending`) instead.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn notify_pump() {
+    let kq = PUMP_KQUEUE.load(Ordering::SeqCst);
+    if kq < 0 {
+        return;
+    }
+    let trigger = libc::kevent {
+        ident: 0,
+        filter: libc::EVFILT_USER,
+        flags: 0,
+        fflags: libc::NOTE_TRIGGER,
+        data: 0,
+        udata: std::ptr::null_mut(),
+    };
+    // SAFETY: kevent with a single change and no event buffer; kq is a live
+    // kqueue fd owned by the pump for the process's lifetime.
+    unsafe {
+        libc::kevent(kq, &trigger, 1, std::ptr::null_mut(), 0, std::ptr::null());
+    }
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+fn notify_pump() {}
 
 /// Read end of the self-pipe for `io_wait::ThreadWaiter` to watch, or `-1` if
 /// not yet initialised (callers then fall back to a polled wait).
@@ -277,6 +316,10 @@ fn ensure_internal_fd_range() {
 /// self-pipe so its parked-thread wakes are its own.
 pub fn reinit_after_fork() {
     open_pending_pipe();
+    // The parent's pump kqueue fd is meaningless in the child; the child
+    // re-spawns its own pump (which calls set_pump_kqueue). Until then, no
+    // EVFILT_USER target — publish_process_signal still wakes via the pipe.
+    PUMP_KQUEUE.store(-1, Ordering::SeqCst);
     // The child is single-threaded (fork copies only the calling thread); any
     // sibling-directed pending entries inherited from the parent are stale.
     if let Ok(mut map) = THREAD_PENDING.lock() {
@@ -343,6 +386,10 @@ fn publish_pending(signum: i32) {
 /// daemon forces any in-guest vCPU out so the runtime delivers it promptly.
 pub fn publish_process_signal(signum: i32) {
     publish_pending(signum);
+    // Wake the pump via EVFILT_USER too: a busy-waiting guest (no parked
+    // waiter draining the self-pipe) wouldn't be re-kicked off the pipe edge
+    // alone. Safe here — this is called from a normal thread, not a handler.
+    notify_pump();
 }
 
 /// 0 = handlers not installed yet, 1 = installed. Used to make

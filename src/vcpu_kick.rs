@@ -169,21 +169,43 @@ pub fn spawn_signal_pump(
                 return;
             }
             let kq = crate::host_signal::relocate_internal_fd(raw_kq);
-            // Edge-triggered watch on the self-pipe: fire once per "became
-            // readable" transition. We deliberately do NOT drain it — the
-            // parked-thread waiters own that (level-triggered), and EV_CLEAR
-            // re-arms on the next write.
-            let change = libc::kevent {
-                ident: pipe as usize,
-                filter: libc::EVFILT_READ,
-                flags: libc::EV_ADD | libc::EV_CLEAR,
-                fflags: 0,
-                data: 0,
-                udata: std::ptr::null_mut(),
-            };
+            // Two wake sources, both edge-triggered (EV_CLEAR), and we block
+            // with NO timeout so the process genuinely sleeps when idle (a
+            // poll would keep it SRUN and confound /proc/<pid>/stat):
+            //
+            //  * EVFILT_READ on the self-pipe — woken by a signal published
+            //    from a HOST signal handler (async-signal-safe pipe write),
+            //    e.g. SIGINT or a cross-process kill. Sparse, so the
+            //    "EV_CLEAR doesn't re-fire an undrained pipe" quirk is benign.
+            //  * EVFILT_USER (ident 0) — woken by `notify_pump` (NOTE_TRIGGER)
+            //    from a normal thread, e.g. an interval-timer firing SIGALRM
+            //    thousands of times into a guest busy-waiting in userspace.
+            //    NOTE_TRIGGER re-fires reliably with EV_CLEAR, so this needs no
+            //    pipe drain and no poll. (kevent isn't async-signal-safe, which
+            //    is why the handler path uses the pipe instead.)
+            let changes = [
+                libc::kevent {
+                    ident: pipe as usize,
+                    filter: libc::EVFILT_READ,
+                    flags: libc::EV_ADD | libc::EV_CLEAR,
+                    fflags: 0,
+                    data: 0,
+                    udata: std::ptr::null_mut(),
+                },
+                libc::kevent {
+                    ident: 0,
+                    filter: libc::EVFILT_USER,
+                    flags: libc::EV_ADD | libc::EV_CLEAR,
+                    fflags: 0,
+                    data: 0,
+                    udata: std::ptr::null_mut(),
+                },
+            ];
             unsafe {
-                libc::kevent(kq, &change, 1, std::ptr::null_mut(), 0, std::ptr::null());
+                libc::kevent(kq, changes.as_ptr(), 2, std::ptr::null_mut(), 0, std::ptr::null());
             }
+            // Publish the kq so `notify_pump` can NOTE_TRIGGER our EVFILT_USER.
+            crate::host_signal::set_pump_kqueue(kq);
             let mut out = [libc::kevent {
                 ident: 0,
                 filter: 0,
@@ -192,21 +214,9 @@ pub fn spawn_signal_pump(
                 data: 0,
                 udata: std::ptr::null_mut(),
             }];
-            // A modest poll timeout backstops the edge-triggered pipe watch.
-            // The pipe is only drained by *parked* waiters (blocking syscalls);
-            // a process that is spinning in guest userspace — e.g. a forked
-            // child busy-waiting for an interval-timer signal — has no parked
-            // waiter, so after the first edge the undrained pipe stops
-            // re-triggering EV_CLEAR and published signals would never be
-            // kicked in. Re-checking `has_process_pending` every few ms
-            // guarantees such a guest is forced out of hv_vcpu_run promptly.
-            let poll = libc::timespec {
-                tv_sec: 0,
-                tv_nsec: 5_000_000,
-            };
             loop {
                 let n = unsafe {
-                    libc::kevent(kq, std::ptr::null(), 0, out.as_mut_ptr(), 1, &poll)
+                    libc::kevent(kq, std::ptr::null(), 0, out.as_mut_ptr(), 1, std::ptr::null())
                 };
                 if n < 0 {
                     let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
