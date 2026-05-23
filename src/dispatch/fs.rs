@@ -590,35 +590,6 @@ impl SyscallDispatcher {
         let host_read = host_fds[0];
         let host_write = host_fds[1];
 
-        let Some(read_fd) = self.allocate_fd(3) else {
-            unsafe {
-                libc::close(host_read);
-                libc::close(host_write);
-            }
-            return Ok(DispatchOutcome::Errno {
-                errno: linux_errno::EMFILE,
-            });
-        };
-        let Some(write_fd) = self.allocate_fd(read_fd.saturating_add(1)) else {
-            unsafe {
-                libc::close(host_read);
-                libc::close(host_write);
-            }
-            return Ok(DispatchOutcome::Errno {
-                errno: linux_errno::EMFILE,
-            });
-        };
-        let pair = LinuxFdPair { read_fd, write_fd };
-        if write_kernel_struct_raw(memory, address, &pair).is_err() {
-            unsafe {
-                libc::close(host_read);
-                libc::close(host_write);
-            }
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EFAULT,
-            });
-        }
-
         // The access mode must be encoded per end so fcntl(F_GETFL) reports
         // it: the read end is O_RDONLY (0), the write end O_WRONLY. Without
         // this, glibc's fdopen(write_end, "w") sees O_RDONLY via F_GETFL and
@@ -642,30 +613,45 @@ impl SyscallDispatcher {
             }
         }
         let fd_flags = linux_fd_flags_from_open_flags(flags);
-        self.insert_open_file(
-            read_fd,
-            OpenFile {
-                description: Arc::new(RwLock::new(OpenDescription::HostPipe {
-                    host_fd: host_read,
-                    is_read_end: true,
-                    status_flags: LINUX_O_RDONLY | nonblock,
-                    pty: None,
-                })),
-                fd_flags,
-            },
+        let read_open = OpenFile::with_host_fd(
+            Arc::new(RwLock::new(OpenDescription::HostPipe {
+                host_fd: host_read,
+                is_read_end: true,
+                status_flags: LINUX_O_RDONLY | nonblock,
+                pty: None,
+            })),
+            fd_flags,
+            host_read,
         );
-        self.insert_open_file(
-            write_fd,
-            OpenFile {
-                description: Arc::new(RwLock::new(OpenDescription::HostPipe {
-                    host_fd: host_write,
-                    is_read_end: false,
-                    status_flags: LINUX_O_WRONLY | nonblock,
-                    pty: None,
-                })),
-                fd_flags,
-            },
+        let write_open = OpenFile::with_host_fd(
+            Arc::new(RwLock::new(OpenDescription::HostPipe {
+                host_fd: host_write,
+                is_read_end: false,
+                status_flags: LINUX_O_WRONLY | nonblock,
+                pty: None,
+            })),
+            fd_flags,
+            host_write,
         );
+        let Ok((read_fd, write_fd)) = self.install_fd_pair_at_or_above(3, read_open, write_open)
+        else {
+            return Ok(DispatchOutcome::Errno {
+                errno: linux_errno::EMFILE,
+            });
+        };
+        let pair = LinuxFdPair { read_fd, write_fd };
+        if write_kernel_struct_raw(memory, address, &pair).is_err() {
+            let removed = {
+                let mut table = self.io.open_files.write();
+                [table.remove(&read_fd), table.remove(&write_fd)]
+            };
+            for open_file in removed.into_iter().flatten() {
+                self.close_open_file_and_free_pty(&open_file);
+            }
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EFAULT,
+            });
+        }
 
         Ok(DispatchOutcome::Returned { value: 0 })
     }
@@ -704,8 +690,11 @@ impl SyscallDispatcher {
                 errno: LINUX_EINVAL,
             });
         }
-        let description = match self.open_file(old_fd).as_ref() {
-            Some(open_file) => Arc::clone(&open_file.description),
+        let (description, host_fd_owner) = match self.open_file(old_fd).as_ref() {
+            Some(open_file) => (
+                Arc::clone(&open_file.description),
+                open_file.host_fd_owner.clone(),
+            ),
             None if is_stdio_fd(old_fd) => {
                 // Shell `2>&1` style redirects: the source fd is the
                 // process's real host fd 0/1/2 (no OpenDescription was
@@ -721,12 +710,15 @@ impl SyscallDispatcher {
                         errno: host_errno(),
                     });
                 }
-                Arc::new(RwLock::new(OpenDescription::HostPipe {
-                    host_fd: duped,
-                    is_read_end: old_fd == 0,
-                    status_flags: 0,
-                    pty: None,
-                }))
+                (
+                    Arc::new(RwLock::new(OpenDescription::HostPipe {
+                        host_fd: duped,
+                        is_read_end: old_fd == 0,
+                        status_flags: 0,
+                        pty: None,
+                    })),
+                    Some(HostFdRef::new(duped)),
+                )
             }
             None => return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF }),
         };
@@ -740,6 +732,7 @@ impl SyscallDispatcher {
             OpenFile {
                 description,
                 fd_flags: linux_fd_flags_from_open_flags(flags),
+                host_fd_owner,
             },
         );
         Ok(DispatchOutcome::Returned {
@@ -1227,13 +1220,41 @@ impl SyscallDispatcher {
                 write_packed(&mut *ctx.memory, arg, &available.to_le_bytes())
             }
             LINUX_FIONBIO => {
-                if ctx.memory.read_bytes(arg, 4).is_err() {
+                let Ok(bytes) = ctx.memory.read_bytes(arg, 4) else {
                     return Ok(DispatchOutcome::Errno {
                         errno: LINUX_EFAULT,
                     });
+                };
+                let enable = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) != 0;
+                if let Some(open_file) = self.open_file(fd) {
+                    let mut open = open_file.description.write();
+                    let mut status_flags = open.status_flags();
+                    if enable {
+                        status_flags |= LINUX_O_NONBLOCK;
+                    } else {
+                        status_flags &= !LINUX_O_NONBLOCK;
+                    }
+                    open.set_status_flags(status_flags);
+                    let host_fd = match &*open {
+                        OpenDescription::HostPipe { host_fd, .. }
+                        | OpenDescription::HostSocket { host_fd, .. }
+                        | OpenDescription::HostFile { host_fd, .. } => Some(*host_fd),
+                        _ => None,
+                    };
+                    if let Some(host_fd) = host_fd {
+                        unsafe {
+                            let cur = libc::fcntl(host_fd, libc::F_GETFL, 0);
+                            if cur >= 0 {
+                                let next = if enable {
+                                    cur | libc::O_NONBLOCK
+                                } else {
+                                    cur & !libc::O_NONBLOCK
+                                };
+                                libc::fcntl(host_fd, libc::F_SETFL, next);
+                            }
+                        }
+                    }
                 }
-                // Bootstrap: accept and ignore — we don't persist nonblocking
-                // state for most fd kinds. Real fcntl(F_SETFL) is the durable path.
                 DispatchOutcome::Returned { value: 0 }
             }
             LINUX_TIOCNOTTY => match self.tty_ioctl_fd_kind(fd) {
@@ -1730,42 +1751,51 @@ impl SyscallDispatcher {
                 crate::probes::path_open(&path, 0, *errno);
             }
         }
-        let description = match dispatch_result {
+        let (description, host_fd_owner) = match dispatch_result {
             Ok(crate::vfs::rootfs::OpenDispatchResult::File {
                 metadata,
                 contents,
                 writable,
-            }) => OpenDescription::File {
-                path,
-                metadata,
-                contents,
-                offset: 0,
-                status_flags: flags & !LINUX_O_CLOEXEC,
-                writable,
-            },
+            }) => (
+                OpenDescription::File {
+                    path,
+                    metadata,
+                    contents,
+                    offset: 0,
+                    status_flags: flags & !LINUX_O_CLOEXEC,
+                    writable,
+                },
+                None,
+            ),
             Ok(crate::vfs::rootfs::OpenDispatchResult::HostFile {
                 host_fd,
                 metadata,
                 writable,
-            }) => OpenDescription::HostFile {
-                host_fd,
-                metadata,
-                status_flags: flags & !LINUX_O_CLOEXEC,
-                writable,
-            },
+            }) => (
+                OpenDescription::HostFile {
+                    host_fd,
+                    metadata,
+                    status_flags: flags & !LINUX_O_CLOEXEC,
+                    writable,
+                },
+                Some(HostFdRef::new(host_fd)),
+            ),
             Ok(crate::vfs::rootfs::OpenDispatchResult::Directory { metadata, entries }) => {
                 if writable_request {
                     return Ok(DispatchOutcome::Errno {
                         errno: LINUX_EISDIR,
                     });
                 }
-                OpenDescription::Directory {
-                    path,
-                    metadata,
-                    entries,
-                    offset: 0,
-                    status_flags: flags & !LINUX_O_CLOEXEC,
-                }
+                (
+                    OpenDescription::Directory {
+                        path,
+                        metadata,
+                        entries,
+                        offset: 0,
+                        status_flags: flags & !LINUX_O_CLOEXEC,
+                    },
+                    None,
+                )
             }
             Ok(crate::vfs::rootfs::OpenDispatchResult::NotFoundCreate) => {
                 // O_CREAT path: validate the parent directory exists,
@@ -1818,12 +1848,15 @@ impl SyscallDispatcher {
                             .overlay
                             .set_owner(&path, create_uid, create_gid);
                     }
-                    OpenDescription::HostFile {
-                        host_fd,
-                        metadata,
-                        status_flags: flags & !LINUX_O_CLOEXEC,
-                        writable: true,
-                    }
+                    (
+                        OpenDescription::HostFile {
+                            host_fd,
+                            metadata,
+                            status_flags: flags & !LINUX_O_CLOEXEC,
+                            writable: true,
+                        },
+                        Some(HostFdRef::new(host_fd)),
+                    )
                 } else {
                     if self.fs.rootfs_vfs.overlay.create_file(&path).is_err() {
                         return Ok(DispatchOutcome::Errno {
@@ -1838,31 +1871,32 @@ impl SyscallDispatcher {
                             .overlay
                             .set_owner(&path, create_uid, create_gid);
                     }
-                    OpenDescription::File {
-                        path,
-                        metadata,
-                        contents: Vec::new(),
-                        offset: 0,
-                        status_flags: flags & !LINUX_O_CLOEXEC,
-                        writable: writable_request || want_create,
-                    }
+                    (
+                        OpenDescription::File {
+                            path,
+                            metadata,
+                            contents: Vec::new(),
+                            offset: 0,
+                            status_flags: flags & !LINUX_O_CLOEXEC,
+                            writable: writable_request || want_create,
+                        },
+                        None,
+                    )
                 }
             }
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
 
-        let Some(fd) = self.allocate_fd(3) else {
+        let open_file = OpenFile {
+            description: Arc::new(RwLock::new(description)),
+            fd_flags: linux_fd_flags_from_open_flags(flags),
+            host_fd_owner,
+        };
+        let Ok(fd) = self.install_fd_at_or_above(3, open_file) else {
             return Ok(DispatchOutcome::Errno {
                 errno: linux_errno::EMFILE,
             });
         };
-        self.insert_open_file(
-            fd,
-            OpenFile {
-                description: Arc::new(RwLock::new(description)),
-                fd_flags: linux_fd_flags_from_open_flags(flags),
-            },
-        );
         Ok(DispatchOutcome::Returned { value: fd as i64 })
     }
 
@@ -1990,8 +2024,11 @@ impl SyscallDispatcher {
     }
 
     fn duplicate_fd(&self, old_fd: i32, min_fd: i32, fd_flags: u64) -> DispatchOutcome {
-        let description = match self.open_file(old_fd).as_ref() {
-            Some(open_file) => Arc::clone(&open_file.description),
+        let (description, host_fd_owner) = match self.open_file(old_fd).as_ref() {
+            Some(open_file) => (
+                Arc::clone(&open_file.description),
+                open_file.host_fd_owner.clone(),
+            ),
             None if is_stdio_fd(old_fd) => {
                 // dup/fcntl(F_DUPFD) of the process's bare stdio fds:
                 // mirror what dup3 does and grab the host fd into a
@@ -2005,27 +2042,31 @@ impl SyscallDispatcher {
                         errno: host_errno(),
                     };
                 }
-                Arc::new(RwLock::new(OpenDescription::HostPipe {
-                    host_fd: duped,
-                    is_read_end: old_fd == 0,
-                    status_flags: 0,
-                    pty: None,
-                }))
+                (
+                    Arc::new(RwLock::new(OpenDescription::HostPipe {
+                        host_fd: duped,
+                        is_read_end: old_fd == 0,
+                        status_flags: 0,
+                        pty: None,
+                    })),
+                    Some(HostFdRef::new(duped)),
+                )
             }
             None => return DispatchOutcome::Errno { errno: LINUX_EBADF },
         };
-        let Some(new_fd) = self.allocate_fd(min_fd) else {
-            return DispatchOutcome::Errno {
-                errno: linux_errno::EMFILE,
-            };
+        let open_file = OpenFile {
+            description,
+            fd_flags,
+            host_fd_owner,
         };
-        self.insert_open_file(
-            new_fd,
-            OpenFile {
-                description,
-                fd_flags,
-            },
-        );
+        let new_fd = match self.install_fd_at_or_above(min_fd, open_file) {
+            Ok(fd) => fd,
+            Err(_) => {
+                return DispatchOutcome::Errno {
+                    errno: linux_errno::EMFILE,
+                };
+            }
+        };
         DispatchOutcome::Returned {
             value: new_fd as i64,
         }
@@ -2081,25 +2122,20 @@ impl SyscallDispatcher {
                 is_read_end,
                 status_flags,
             } => {
-                let new_fd = match self.allocate_fd(3) {
-                    Some(fd) => fd,
-                    None => {
-                        unsafe { libc::close(host_fd) };
-                        return VfsOpenAttempt::Errno(linux_errno::EMFILE);
-                    }
-                };
-                self.insert_open_file(
-                    new_fd,
-                    OpenFile {
-                        description: Arc::new(RwLock::new(OpenDescription::HostPipe {
-                            host_fd,
-                            is_read_end,
-                            status_flags: status_flags as u64,
-                            pty: None,
-                        })),
-                        fd_flags: linux_fd_flags_from_open_flags(flags),
-                    },
+                let open_file = OpenFile::with_host_fd(
+                    Arc::new(RwLock::new(OpenDescription::HostPipe {
+                        host_fd,
+                        is_read_end,
+                        status_flags: status_flags as u64,
+                        pty: None,
+                    })),
+                    linux_fd_flags_from_open_flags(flags),
+                    host_fd,
                 );
+                let new_fd = match self.install_fd_at_or_above(3, open_file) {
+                    Ok(fd) => fd,
+                    Err(_) => return VfsOpenAttempt::Errno(linux_errno::EMFILE),
+                };
                 VfsOpenAttempt::Installed(new_fd)
             }
             crate::vfs::VfsHandle::Bytes {
@@ -2107,22 +2143,19 @@ impl SyscallDispatcher {
                 contents,
                 status_flags,
             } => {
-                let new_fd = match self.allocate_fd(3) {
-                    Some(fd) => fd,
-                    None => return VfsOpenAttempt::Errno(linux_errno::EMFILE),
-                };
-                self.insert_open_file(
-                    new_fd,
-                    OpenFile {
-                        description: Arc::new(RwLock::new(OpenDescription::SyntheticFile {
-                            path,
-                            contents,
-                            offset: 0,
-                            status_flags: ((status_flags as u64) | flags) & !LINUX_O_CLOEXEC,
-                        })),
-                        fd_flags: linux_fd_flags_from_open_flags(flags),
-                    },
+                let open_file = OpenFile::new(
+                    Arc::new(RwLock::new(OpenDescription::SyntheticFile {
+                        path,
+                        contents,
+                        offset: 0,
+                        status_flags: ((status_flags as u64) | flags) & !LINUX_O_CLOEXEC,
+                    })),
+                    linux_fd_flags_from_open_flags(flags),
                 );
+                let new_fd = match self.install_fd_at_or_above(3, open_file) {
+                    Ok(fd) => fd,
+                    Err(_) => return VfsOpenAttempt::Errno(linux_errno::EMFILE),
+                };
                 VfsOpenAttempt::Installed(new_fd)
             }
             crate::vfs::VfsHandle::Pty {
@@ -2131,30 +2164,25 @@ impl SyscallDispatcher {
                 is_master,
                 status_flags,
             } => {
-                let new_fd = match self.allocate_fd(3) {
-                    Some(fd) => fd,
-                    None => {
-                        unsafe { libc::close(host_fd) };
-                        return VfsOpenAttempt::Errno(linux_errno::EMFILE);
-                    }
-                };
-                self.insert_open_file(
-                    new_fd,
-                    OpenFile {
-                        description: Arc::new(RwLock::new(OpenDescription::HostPipe {
-                            host_fd,
-                            // A pty end is bidirectional; route reads and
-                            // writes through the host fd like /dev/null.
-                            is_read_end: true,
-                            status_flags: status_flags as u64,
-                            pty: Some(crate::vfs::PtyRole {
-                                index: pts_index,
-                                is_master,
-                            }),
-                        })),
-                        fd_flags: linux_fd_flags_from_open_flags(flags),
-                    },
+                let open_file = OpenFile::with_host_fd(
+                    Arc::new(RwLock::new(OpenDescription::HostPipe {
+                        host_fd,
+                        // A pty end is bidirectional; route reads and
+                        // writes through the host fd like /dev/null.
+                        is_read_end: true,
+                        status_flags: status_flags as u64,
+                        pty: Some(crate::vfs::PtyRole {
+                            index: pts_index,
+                            is_master,
+                        }),
+                    })),
+                    linux_fd_flags_from_open_flags(flags),
+                    host_fd,
                 );
+                let new_fd = match self.install_fd_at_or_above(3, open_file) {
+                    Ok(fd) => fd,
+                    Err(_) => return VfsOpenAttempt::Errno(linux_errno::EMFILE),
+                };
                 VfsOpenAttempt::Installed(new_fd)
             }
             crate::vfs::VfsHandle::Directory {
@@ -2190,53 +2218,84 @@ impl SyscallDispatcher {
                     mode: 0o755,
                     size: 0,
                 };
-                let new_fd = match self.allocate_fd(3) {
-                    Some(fd) => fd,
-                    None => return VfsOpenAttempt::Errno(linux_errno::EMFILE),
-                };
-                self.insert_open_file(
-                    new_fd,
-                    OpenFile {
-                        description: Arc::new(RwLock::new(OpenDescription::Directory {
-                            path,
-                            metadata,
-                            entries: rootfs_entries,
-                            offset: 0,
-                            status_flags: status_flags as u64,
-                        })),
-                        fd_flags: linux_fd_flags_from_open_flags(flags),
-                    },
+                let open_file = OpenFile::new(
+                    Arc::new(RwLock::new(OpenDescription::Directory {
+                        path,
+                        metadata,
+                        entries: rootfs_entries,
+                        offset: 0,
+                        status_flags: status_flags as u64,
+                    })),
+                    linux_fd_flags_from_open_flags(flags),
                 );
+                let new_fd = match self.install_fd_at_or_above(3, open_file) {
+                    Ok(fd) => fd,
+                    Err(_) => return VfsOpenAttempt::Errno(linux_errno::EMFILE),
+                };
                 VfsOpenAttempt::Installed(new_fd)
             }
         }
     }
 
-    pub(super) fn allocate_fd(&self, min_fd: i32) -> Option<i32> {
+    fn first_free_fd(
+        table: &HashMap<i32, OpenFile>,
+        min_fd: i32,
+        reserved: Option<i32>,
+    ) -> Option<i32> {
         // Cap at the soft RLIMIT_NOFILE (1024, matching getrlimit/prlimit and
         // /proc/self/limits): descriptors run 0..1024, so the first free slot
         // at or above the limit means the table is full. `None` => the caller
         // returns EMFILE, matching Linux fd exhaustion.
         const RLIMIT_NOFILE_CUR: i32 = 1024;
         let mut fd = min_fd.max(3);
-        let table = self.io.open_files.read();
-        while table.contains_key(&fd) {
+        while Some(fd) == reserved || table.contains_key(&fd) {
             fd = fd.checked_add(1)?;
         }
         if fd >= RLIMIT_NOFILE_CUR {
-            return None;
+            None
+        } else {
+            Some(fd)
         }
-        drop(table);
-        let mut next_fd = self.io.next_fd.lock();
-        *next_fd = (*next_fd).max(fd.saturating_add(1));
-        Some(fd)
     }
 
-    pub(super) fn insert_open_file(&self, fd: i32, open_file: OpenFile) {
+    pub(super) fn install_fd_at_or_above(
+        &self,
+        min_fd: i32,
+        open_file: OpenFile,
+    ) -> Result<i32, OpenFile> {
+        let mut table = self.io.open_files.write();
+        let Some(fd) = Self::first_free_fd(&table, min_fd, None) else {
+            return Err(open_file);
+        };
         retain_open_file(&open_file.description);
-        if let Some(replaced) = self.io.open_files.write().insert(fd, open_file) {
-            close_open_file(&replaced);
-        }
+        table.insert(fd, open_file);
+        let mut next_fd = self.io.next_fd.lock();
+        *next_fd = (*next_fd).max(fd.saturating_add(1));
+        Ok(fd)
+    }
+
+    pub(super) fn install_fd_pair_at_or_above(
+        &self,
+        min_fd: i32,
+        first: OpenFile,
+        second: OpenFile,
+    ) -> Result<(i32, i32), (OpenFile, OpenFile)> {
+        let mut table = self.io.open_files.write();
+        let Some(first_fd) = Self::first_free_fd(&table, min_fd, None) else {
+            return Err((first, second));
+        };
+        let Some(second_fd) =
+            Self::first_free_fd(&table, first_fd.saturating_add(1), Some(first_fd))
+        else {
+            return Err((first, second));
+        };
+        retain_open_file(&first.description);
+        retain_open_file(&second.description);
+        table.insert(first_fd, first);
+        table.insert(second_fd, second);
+        let mut next_fd = self.io.next_fd.lock();
+        *next_fd = (*next_fd).max(second_fd.saturating_add(1));
+        Ok((first_fd, second_fd))
     }
 
     pub(super) fn install_fd(
@@ -2244,18 +2303,12 @@ impl SyscallDispatcher {
         description: OpenDescription,
         fd_flags: u64,
     ) -> DispatchOutcome {
-        let Some(fd) = self.allocate_fd(3) else {
+        let open_file = OpenFile::new(Arc::new(RwLock::new(description)), fd_flags);
+        let Ok(fd) = self.install_fd_at_or_above(3, open_file) else {
             return DispatchOutcome::Errno {
                 errno: linux_errno::EMFILE,
             };
         };
-        self.insert_open_file(
-            fd,
-            OpenFile {
-                description: Arc::new(RwLock::new(description)),
-                fd_flags,
-            },
-        );
         DispatchOutcome::Returned { value: fd as i64 }
     }
 
@@ -2458,8 +2511,23 @@ impl SyscallDispatcher {
                 contents, offset, ..
             } => (contents, offset),
             OpenDescription::EventFd {
-                counter, semaphore, ..
-            } => return Ok(read_eventfd(memory, address, length, counter, *semaphore)),
+                state,
+                semaphore,
+                status_flags,
+            } => {
+                let state = Arc::clone(state);
+                let semaphore = *semaphore;
+                let nonblocking = *status_flags & LINUX_O_NONBLOCK != 0;
+                drop(open);
+                return Ok(read_eventfd(
+                    memory,
+                    address,
+                    length,
+                    &state,
+                    semaphore,
+                    nonblocking,
+                ));
+            }
             OpenDescription::TimerFd {
                 clock_id,
                 interval,
@@ -3713,7 +3781,7 @@ impl SyscallDispatcher {
         if let Some(open_file) = self.open_file(fd as i32) {
             let mut open = open_file.description.write();
             return Ok(match &mut *open {
-                OpenDescription::EventFd { counter, .. } => write_eventfd(&bytes, counter),
+                OpenDescription::EventFd { state, .. } => write_eventfd(&bytes, state),
                 OpenDescription::PipeWriter { pipe, .. } => write_pipe(&bytes, pipe),
                 OpenDescription::HostPipe {
                     host_fd,
@@ -3812,8 +3880,8 @@ impl SyscallDispatcher {
             {
                 let mut open = open_file.description.write();
                 match &mut *open {
-                    OpenDescription::EventFd { counter, .. } => {
-                        return Ok(write_eventfd(&bytes, counter));
+                    OpenDescription::EventFd { state, .. } => {
+                        return Ok(write_eventfd(&bytes, state));
                     }
                     OpenDescription::PipeWriter { pipe, .. } => {
                         return Ok(write_pipe(&bytes, pipe));

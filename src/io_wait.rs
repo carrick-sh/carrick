@@ -30,6 +30,51 @@ pub enum WaitResult {
     Interrupted,
 }
 
+struct PinnedWaitFd {
+    fd: RawFd,
+    owned: bool,
+}
+
+impl Drop for PinnedWaitFd {
+    fn drop(&mut self) {
+        if self.owned {
+            unsafe {
+                libc::close(self.fd);
+            }
+        }
+    }
+}
+
+struct PinnedWaitFds {
+    wait_fds: Vec<(RawFd, i16)>,
+    _pinned: Vec<PinnedWaitFd>,
+}
+
+impl PinnedWaitFds {
+    fn new(fds: &[(RawFd, i16)]) -> Self {
+        let mut wait_fds = Vec::with_capacity(fds.len());
+        let mut pinned = Vec::with_capacity(fds.len());
+        for &(fd, events) in fds {
+            let duped = unsafe { libc::dup(fd) };
+            let (wait_fd, owned) = if duped >= 0 {
+                (duped, true)
+            } else {
+                (fd, false)
+            };
+            wait_fds.push((wait_fd, events));
+            pinned.push(PinnedWaitFd { fd: wait_fd, owned });
+        }
+        Self {
+            wait_fds,
+            _pinned: pinned,
+        }
+    }
+
+    fn as_wait_fds(&self) -> &[(RawFd, i16)] {
+        &self.wait_fds
+    }
+}
+
 /// A per-thread kqueue + its registration of the self-pipe wake channel.
 pub struct ThreadWaiter {
     kq: RawFd,
@@ -101,11 +146,13 @@ impl ThreadWaiter {
             );
             return WaitResult::Interrupted;
         }
+        let pinned_fds = PinnedWaitFds::new(fds);
+        let wait_fds = pinned_fds.as_wait_fds();
         let result;
         #[cfg(target_os = "macos")]
         {
             if self.kq >= 0 {
-                result = self.wait_kqueue(fds, timeout);
+                result = self.wait_kqueue(wait_fds, timeout);
                 crate::probes::io_wait_end(
                     self.tid,
                     wait_result_code(result),
@@ -117,7 +164,7 @@ impl ThreadWaiter {
                 return result;
             }
         }
-        result = self.fallback_poll(fds, timeout);
+        result = self.fallback_poll(wait_fds, timeout);
         crate::probes::io_wait_end(
             self.tid,
             wait_result_code(result),
@@ -332,5 +379,26 @@ fn duration_to_timespec(d: Duration) -> libc::timespec {
     libc::timespec {
         tv_sec: d.as_secs() as libc::time_t,
         tv_nsec: d.subsec_nanos() as libc::c_long,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn pinned_wait_fd_survives_original_close() {
+        let mut fds = [-1, -1];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let pinned = super::PinnedWaitFds::new(&[(fds[0], libc::POLLIN)]);
+        assert_eq!(unsafe { libc::close(fds[0]) }, 0);
+        assert_eq!(unsafe { libc::write(fds[1], b"x".as_ptr().cast(), 1) }, 1);
+
+        let mut pollfd = libc::pollfd {
+            fd: pinned.as_wait_fds()[0].0,
+            events: pinned.as_wait_fds()[0].1,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut pollfd, 1, 0) }, 1);
+        assert_ne!(pollfd.revents & libc::POLLIN, 0);
+        assert_eq!(unsafe { libc::close(fds[1]) }, 0);
     }
 }

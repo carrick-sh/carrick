@@ -330,7 +330,7 @@ use crate::memory::{
 use crate::overlay::OverlayEntry;
 use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsError, RootFsMetadata};
 use crate::syscall::lookup_aarch64;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Condvar, Mutex, RwLock};
 use serde::Serialize;
 use thiserror::Error;
 use zerocopy::{FromBytes, IntoBytes};
@@ -747,6 +747,21 @@ struct EpollInterest {
     last_ready: u32,
 }
 
+#[derive(Debug)]
+struct EventFdState {
+    counter: Mutex<u64>,
+    readable: Condvar,
+}
+
+impl EventFdState {
+    fn new(counter: u64) -> Self {
+        Self {
+            counter: Mutex::new(counter),
+            readable: Condvar::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 enum OpenDescription {
     File {
@@ -773,7 +788,7 @@ enum OpenDescription {
         status_flags: u64,
     },
     EventFd {
-        counter: u64,
+        state: Arc<EventFdState>,
         semaphore: bool,
         status_flags: u64,
     },
@@ -856,10 +871,51 @@ enum OpenDescription {
     },
 }
 
+#[derive(Debug)]
+struct HostFdOwner {
+    fd: i32,
+}
+
+impl Drop for HostFdOwner {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.fd);
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct HostFdRef(#[allow(dead_code)] Arc<HostFdOwner>);
+
+impl HostFdRef {
+    fn new(fd: i32) -> Self {
+        Self(Arc::new(HostFdOwner { fd }))
+    }
+}
+
 #[derive(Debug, Clone)]
 struct OpenFile {
     description: OpenDescriptionRef,
     fd_flags: u64,
+    host_fd_owner: Option<HostFdRef>,
+}
+
+impl OpenFile {
+    fn new(description: OpenDescriptionRef, fd_flags: u64) -> Self {
+        Self {
+            description,
+            fd_flags,
+            host_fd_owner: None,
+        }
+    }
+
+    fn with_host_fd(description: OpenDescriptionRef, fd_flags: u64, host_fd: i32) -> Self {
+        Self {
+            description,
+            fd_flags,
+            host_fd_owner: Some(HostFdRef::new(host_fd)),
+        }
+    }
 }
 
 type OpenDescriptionRef = Arc<RwLock<OpenDescription>>;
@@ -2456,31 +2512,6 @@ fn close_open_file(open_file: &OpenFile) {
             let mut pipe = pipe.lock();
             pipe.writers = pipe.writers.saturating_sub(1);
         }
-        OpenDescription::HostPipe { host_fd, .. }
-            // Close the host fd only when the LAST guest fd that
-            // references this OpenDescription is being closed. Because
-            // dup3/dup2 wraps a new Linux fd around the SAME Arc<...>,
-            // we let the Arc go out of scope naturally and rely on the
-            // wrapper around `OpenDescription::HostPipe` having no
-            // shared owners. The simplest correct close here is to
-            // count: if `strong_count == 1` we're the last one.
-            // (The Arc is held by the OpenFile in `open_files`; if no
-            // dup'd entry remains, strong_count is 1.)
-            if Arc::strong_count(&open_file.description) == 1 => {
-                unsafe {
-                    libc::close(*host_fd);
-                }
-            }
-        OpenDescription::HostSocket { host_fd, .. }
-        | OpenDescription::HostFile { host_fd, .. }
-            // Same last-reference rule as HostPipe: only close the real
-            // macOS fd when no other Linux fd still aliases the same
-            // OpenDescription via dup3/dup2.
-            if Arc::strong_count(&open_file.description) == 1 => {
-                unsafe {
-                    libc::close(*host_fd);
-                }
-            }
         _ => {}
     }
 }
@@ -3461,9 +3492,9 @@ Pid:\t{pid}\nPPid:\t{ppid}\nThreads:\t{n}\n",
         info.comm.clone()
     };
     match rest {
-        "stat" => {
-            Some(proc_stat_line(pid, &comm, info.state, info.ppid, info.pgid, info.pgid).into_bytes())
-        }
+        "stat" => Some(
+            proc_stat_line(pid, &comm, info.state, info.ppid, info.pgid, info.pgid).into_bytes(),
+        ),
         "comm" => Some(format!("{comm}\n").into_bytes()),
         "cmdline" => {
             let mut b = comm.clone().into_bytes();
@@ -3723,18 +3754,23 @@ fn read_eventfd(
     memory: &mut impl GuestMemory,
     address: u64,
     length: usize,
-    counter: &mut u64,
+    state: &EventFdState,
     semaphore: bool,
+    nonblocking: bool,
 ) -> DispatchOutcome {
     if length < core::mem::size_of::<LinuxEventfdValue>() {
         return DispatchOutcome::Errno {
             errno: LINUX_EINVAL,
         };
     }
-    if *counter == 0 {
-        return DispatchOutcome::Errno {
-            errno: LINUX_EAGAIN,
-        };
+    let mut counter = state.counter.lock();
+    while *counter == 0 {
+        if nonblocking {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EAGAIN,
+            };
+        }
+        state.readable.wait(&mut counter);
     }
     let value = if semaphore { 1 } else { *counter };
     let eventfd_value = LinuxEventfdValue { value };
@@ -3756,7 +3792,7 @@ fn read_eventfd(
     }
 }
 
-fn write_eventfd(bytes: &[u8], counter: &mut u64) -> DispatchOutcome {
+fn write_eventfd(bytes: &[u8], state: &EventFdState) -> DispatchOutcome {
     if bytes.len() != core::mem::size_of::<LinuxEventfdValue>() {
         return DispatchOutcome::Errno {
             errno: LINUX_EINVAL,
@@ -3773,12 +3809,17 @@ fn write_eventfd(bytes: &[u8], counter: &mut u64) -> DispatchOutcome {
             errno: LINUX_EINVAL,
         };
     }
-    let Some(next) = counter.checked_add(increment) else {
+    let mut counter = state.counter.lock();
+    let Some(next) = (*counter).checked_add(increment) else {
         return DispatchOutcome::Errno {
             errno: LINUX_EAGAIN,
         };
     };
+    let was_zero = *counter == 0;
     *counter = next;
+    if was_zero && next > 0 {
+        state.readable.notify_all();
+    }
     DispatchOutcome::Returned {
         value: core::mem::size_of::<LinuxEventfdValue>() as i64,
     }
@@ -4659,6 +4700,44 @@ mod overlay_dispatch_tests {
     const O_CREAT: u64 = 0o100;
     const O_WRONLY: u64 = 1;
     const O_RDONLY: u64 = 0;
+
+    fn eventfd_open_file(counter: u64) -> OpenFile {
+        OpenFile::new(
+            Arc::new(RwLock::new(OpenDescription::EventFd {
+                state: Arc::new(EventFdState::new(counter)),
+                semaphore: false,
+                status_flags: 0,
+            })),
+            0,
+        )
+    }
+
+    #[test]
+    fn fd_install_helpers_reserve_single_and_pair_slots_atomically() {
+        let dispatcher = SyscallDispatcher::new();
+
+        let first = match dispatcher.install_fd_at_or_above(3, eventfd_open_file(1)) {
+            Ok(fd) => fd,
+            Err(_) => panic!("expected first fd install to succeed"),
+        };
+        assert_eq!(first, 3);
+
+        let pair = match dispatcher.install_fd_pair_at_or_above(
+            3,
+            eventfd_open_file(2),
+            eventfd_open_file(3),
+        ) {
+            Ok(pair) => pair,
+            Err(_) => panic!("expected pair install to succeed"),
+        };
+        assert_eq!(pair, (4, 5));
+
+        let next = match dispatcher.install_fd_at_or_above(3, eventfd_open_file(4)) {
+            Ok(fd) => fd,
+            Err(_) => panic!("expected next fd install to succeed"),
+        };
+        assert_eq!(next, 6);
+    }
 
     #[test]
     fn inode_for_path_reflects_identity_not_textual_spelling() {
