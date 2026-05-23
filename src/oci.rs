@@ -1,13 +1,13 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
-use oci_distribution::client::ClientConfig;
-use oci_distribution::manifest::{
+use oci_client::client::ClientConfig;
+use oci_client::manifest::{
     IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE, IMAGE_DOCKER_LAYER_TAR_MEDIA_TYPE,
     IMAGE_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_MEDIA_TYPE, ImageIndexEntry,
 };
-use oci_distribution::secrets::RegistryAuth;
-use oci_distribution::{Client, Reference};
+use oci_client::secrets::RegistryAuth;
+use oci_client::{Client, Reference};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::fs;
@@ -125,11 +125,11 @@ pub struct LayerSummary {
 #[derive(Debug, Error)]
 pub enum OciBootstrapError {
     #[error("invalid OCI image reference: {0}")]
-    ParseReference(#[from] oci_distribution::ParseError),
+    ParseReference(#[from] oci_client::ParseError),
     #[error("invalid OCI content digest: {0}")]
     InvalidDigest(String),
     #[error("OCI registry operation failed: {0}")]
-    Registry(#[from] oci_distribution::errors::OciDistributionError),
+    Registry(#[from] oci_client::errors::OciDistributionError),
     #[error("failed to write image store: {0}")]
     Io(#[from] std::io::Error),
     #[error("failed to serialize OCI metadata: {0}")]
@@ -290,7 +290,7 @@ fn insecure_registries() -> Vec<String> {
 }
 
 fn build_oci_client() -> Client {
-    use oci_distribution::client::ClientProtocol;
+    use oci_client::client::ClientProtocol;
     let target = platform_target_from_env();
     let config = ClientConfig {
         protocol: ClientProtocol::HttpsExcept(insecure_registries()),
@@ -368,7 +368,7 @@ pub async fn pull_image(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oci_distribution::manifest::{IMAGE_MANIFEST_MEDIA_TYPE, ImageIndexEntry, Platform};
+    use oci_client::manifest::{IMAGE_MANIFEST_MEDIA_TYPE, ImageIndexEntry, Platform};
 
     fn entry(os: &str, arch: &str, variant: Option<&str>, digest: &str) -> ImageIndexEntry {
         ImageIndexEntry {
