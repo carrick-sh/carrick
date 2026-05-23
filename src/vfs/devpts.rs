@@ -117,11 +117,31 @@ impl Default for PtyTable {
     }
 }
 
+unsafe extern "C" {
+    fn ptsname_r(fd: libc::c_int, buf: *mut libc::c_char, buflen: libc::size_t) -> libc::c_int;
+}
+
+fn ptsname_r_owned(master: i32) -> Result<String, i32> {
+    let mut buf = [0 as libc::c_char; 128];
+    let rc = unsafe { ptsname_r(master, buf.as_mut_ptr(), buf.len()) };
+    if rc != 0 {
+        let errno = if rc > 0 {
+            rc
+        } else {
+            unsafe { *libc::__error() }
+        };
+        return Err(errno);
+    }
+    let slave_name = unsafe { CStr::from_ptr(buf.as_ptr()) }
+        .to_string_lossy()
+        .into_owned();
+    Ok(slave_name)
+}
+
 /// Open a fresh macOS pty master: posix_openpt + grantpt + unlockpt,
-/// then resolve the slave device name. `nonblock` adds O_NONBLOCK to
-/// the master. Returns (master_fd, slave_name) or the raw macOS errno.
-/// NOTE: `ptsname` is not thread-safe; callers serialize by holding the
-/// PtyTable mutex across this call.
+/// then resolve the slave device name with `ptsname_r`. `nonblock` adds
+/// O_NONBLOCK to the master. Returns (master_fd, slave_name) or the raw
+/// macOS errno.
 pub fn open_master(nonblock: bool) -> Result<(i32, String), i32> {
     let mut oflag = libc::O_RDWR | libc::O_NOCTTY;
     if nonblock {
@@ -138,17 +158,13 @@ pub fn open_master(nonblock: bool) -> Result<(i32, String), i32> {
         unsafe { libc::close(master) };
         return Err(e);
     }
-    // SAFETY: master is valid; ptsname returns a static C string or null.
-    let name_ptr = unsafe { libc::ptsname(master) };
-    if name_ptr.is_null() {
-        let e = unsafe { *libc::__error() };
-        unsafe { libc::close(master) };
-        return Err(e);
-    }
-    // SAFETY: name_ptr is a valid NUL-terminated C string from ptsname.
-    let slave_name = unsafe { CStr::from_ptr(name_ptr) }
-        .to_string_lossy()
-        .into_owned();
+    let slave_name = match ptsname_r_owned(master) {
+        Ok(name) => name,
+        Err(errno) => {
+            unsafe { libc::close(master) };
+            return Err(errno);
+        }
+    };
     Ok((master, slave_name))
 }
 

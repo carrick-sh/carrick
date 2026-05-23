@@ -1,6 +1,18 @@
 use carrick::syscall::{SupportLevel, SyscallHandler, aarch64_table, lookup_aarch64};
 
 #[test]
+fn aarch64_syscall_table_is_sorted_for_binary_search() {
+    for pair in aarch64_table().windows(2) {
+        assert!(
+            pair[0].number < pair[1].number,
+            "syscall table must remain strictly sorted: {} then {}",
+            pair[0].number,
+            pair[1].number
+        );
+    }
+}
+
+#[test]
 fn names_linux_aarch64_bringup_syscalls() {
     let getcwd = lookup_aarch64(17).unwrap();
     let faccessat = lookup_aarch64(48).unwrap();
