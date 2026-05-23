@@ -11,11 +11,11 @@ This document consolidates the four research lanes run against the current check
 - Safety, correctness, and performance
 - Legibility, complexity, and internal patterns
 
-It is a research artifact only. It does not include implementation changes.
+The research sections below preserve the original findings; the implementation ledger records the follow-up changes made on `codex/address-gap-research`.
 
 ## Implementation Ledger
 
-Status: in progress on branch `codex/address-gap-research`.
+Status: complete on branch `codex/address-gap-research`.
 
 Baseline captured 2026-05-23:
 
@@ -61,7 +61,7 @@ Work package progress:
 - [x] S6. FUTEX_REQUEUE Compatibility Coverage
   - Completed: added syscall-thread regression coverage for both `FUTEX_REQUEUE` and `FUTEX_CMP_REQUEUE`.
   - Verified both commands keep returning `ENOSYS` and emit the stable `FUTEX_(CMP_)REQUEUE unsupported` compatibility event.
-- [ ] Package 6. VFS and Stat Ownership
+- [x] Package 6. VFS and Stat Ownership
   - Completed L1: moved synthetic `/proc` and `/sys` file registration/rendering ownership into `vfs::proc` and `vfs::sys`; dispatcher now supplies live context only.
   - Verified VFS proc/sys unit tests plus existing synthetic `/proc` and `/sys` syscall-surface tests.
   - Completed L2/L3: added an `OpenDescription::stat_source` helper and shared `StatRecord` writer path for `stat`, `fstat`, and `statx`.
@@ -72,7 +72,12 @@ Work package progress:
   - Verified macOS-to-Linux errno capture for divergent `EINPROGRESS`, `EAGAIN`, and `ECONNREFUSED` values.
   - Completed L6: split multi-threaded vCPU loop state into `ThreadRuntimeState` with named helpers for blocking dispatch waits, futex waits, sibling signal routing, clone-thread spawn, thread exit, exec, and fork transitions.
   - Verified runtime-loop, syscall-thread, syscall-signal, syscall-net, and concurrency-contract regression suites after the extraction.
-- [ ] Hygiene gates and final verification sweep
+- [x] Hygiene gates and final verification sweep
+  - Completed: restored the documented no-panic clippy gate by explicitly exempting integration-test helper code in `tests/syscall_fs.rs` and `tests/syscall_net.rs`; production unwrap/expect/panic denies remain active.
+  - Final verification on 2026-05-23:
+    - `cargo fmt --all -- --check`: passed.
+    - `cargo clippy --all-targets`: passed with warning-level style suggestions only.
+    - `cargo test`: passed, including conformance; interactive TTY tests remain intentionally ignored by the test suite.
 
 ## Executive Summary
 
