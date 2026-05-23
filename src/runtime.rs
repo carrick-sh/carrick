@@ -1036,6 +1036,9 @@ impl ThreadRuntimeState {
             }
             crate::trap::ForkOutcome::Child => {
                 kernel.dispatcher.clear_output_buffers();
+                // Don't inherit the parent's accumulated guest CPU time: the
+                // child's new vCPU starts the hypervisor exec clock at zero.
+                crate::guest_cpu::reset();
                 self.this_tid = std::process::id() as ThreadId;
                 self.registry = Arc::new(ThreadRegistry::new(self.this_tid));
                 crate::thread::set_current_registry(Arc::clone(&self.registry));
@@ -1074,6 +1077,10 @@ fn run_threaded_hvf_loop(
     // Record the root guest pid (before any fork) so /proc/<pid>/ can tell a
     // guest process (any descendant of the root) from a host process.
     crate::host_proc::set_root_guest_pid(std::process::id());
+    // Create the shared reaped-child CPU table before any fork so every guest
+    // descendant inherits the same MAP_SHARED region (child CPU → parent
+    // cutime/cstime + RUSAGE_CHILDREN).
+    crate::guest_cpu::init_child_table();
     let futex = Arc::new(FutexTable::new());
     let kernel = Arc::new(KernelState::new(dispatcher));
     // Track spawned sibling threads so the process doesn't tear down while a
@@ -1585,6 +1592,11 @@ fn parse_shebang(head: &[u8]) -> Option<(String, Option<String>)> {
 /// rebuilt HVF context in the child would trigger an `applevisor::Vcpu`
 /// Drop panic ("no VM or vCPU available") during shutdown.
 fn forked_child_exit(code: i32, stdout_buf: impl AsRef<[u8]>, stderr_buf: impl AsRef<[u8]>) -> ! {
+    // Publish our total guest CPU so our parent's wait4 can roll it into its
+    // child-time totals (cutime/cstime, RUSAGE_CHILDREN) — Linux does this for
+    // reaped children, and the child's guest CPU isn't visible in the host
+    // rusage the parent's wait4 collects.
+    crate::guest_cpu::record_child_exit(std::process::id(), crate::guest_cpu::total_ns());
     let stdout_buf = stdout_buf.as_ref();
     let stderr_buf = stderr_buf.as_ref();
     let _ = unsafe { libc::write(1, stdout_buf.as_ptr() as *const _, stdout_buf.len()) };
@@ -1607,6 +1619,9 @@ fn forked_child_die_by_signal(
     stdout_buf: impl AsRef<[u8]>,
     stderr_buf: impl AsRef<[u8]>,
 ) -> ! {
+    // Publish guest CPU for the parent's wait4 child-time accounting (as in
+    // forked_child_exit) before dying by the signal.
+    crate::guest_cpu::record_child_exit(std::process::id(), crate::guest_cpu::total_ns());
     let stdout_buf = stdout_buf.as_ref();
     let stderr_buf = stderr_buf.as_ref();
     let _ = unsafe { libc::write(1, stdout_buf.as_ptr() as *const _, stdout_buf.len()) };
