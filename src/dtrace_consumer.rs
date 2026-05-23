@@ -166,6 +166,23 @@ pub struct TraceOptions {
     /// stdout. Keeps trace output from intermixing with an interactive (`-t`)
     /// guest's own stdout — the traced command's stdio is untouched.
     pub out_path: Option<String>,
+    /// Credentials the traced carrick child should drop to before it dispatches
+    /// the requested command. The libdtrace parent still runs as root.
+    pub drop_credentials: Option<TraceDropCredentials>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TraceDropCredentials {
+    pub uid: u32,
+    pub gid: u32,
+    pub groups: Vec<u32>,
+}
+
+pub const TRACE_CHILD_COMMAND: &str = "__trace-child";
+
+struct TraceExecArgv {
+    exec_path: CString,
+    argv: Vec<CString>,
 }
 
 /// Spawn `child_path` with `child_argv` under DTrace, with our bundled
@@ -176,16 +193,8 @@ pub fn run_child_under_dtrace(
     child_argv: &[String],
     opts: &TraceOptions,
 ) -> Result<(), DTraceError> {
-    // argv[0] convention: pass the child path as argv[0]. dtrace_proc_create
-    // takes file + argv, and the argv array must be NULL-terminated.
-    let path_c = CString::new(child_path.as_os_str().to_string_lossy().as_bytes())
-        .map_err(|_| DTraceError::BadArg(child_path.display().to_string()))?;
-    let mut argv_c: Vec<CString> = Vec::with_capacity(child_argv.len() + 1);
-    argv_c.push(path_c.clone());
-    for a in child_argv {
-        argv_c.push(CString::new(a.as_bytes()).map_err(|_| DTraceError::BadArg(a.clone()))?);
-    }
-    let mut argv_ptrs: Vec<*const c_char> = argv_c.iter().map(|s| s.as_ptr()).collect();
+    let trace_argv = trace_exec_argv(child_path, child_argv, opts.drop_credentials.as_ref())?;
+    let mut argv_ptrs: Vec<*const c_char> = trace_argv.argv.iter().map(|s| s.as_ptr()).collect();
     argv_ptrs.push(std::ptr::null());
 
     // Where the consumer writes events + aggregations. Defaults to stdout;
@@ -246,9 +255,25 @@ pub fn run_child_under_dtrace(
         }
     }
 
+    let proc_h =
+        unsafe { dtrace_proc_create(hdl, trace_argv.exec_path.as_ptr(), argv_ptrs.as_ptr()) };
+    if proc_h.is_null() {
+        let msg = unsafe { errmsg(hdl) };
+        unsafe { dtrace_close(hdl) };
+        return Err(DTraceError::ProcCreate(msg));
+    }
+
     let program_src: &str = opts.script.as_deref().unwrap_or(BUNDLED_D_SCRIPT);
-    let program_c = CString::new(program_src)
-        .map_err(|_| DTraceError::Compile("D script contains a nul byte".to_owned()))?;
+    let program_c = match CString::new(program_src) {
+        Ok(program_c) => program_c,
+        Err(_) => {
+            unsafe { dtrace_proc_release(hdl, proc_h) };
+            unsafe { dtrace_close(hdl) };
+            return Err(DTraceError::Compile(
+                "D script contains a nul byte".to_owned(),
+            ));
+        }
+    };
     let prog = unsafe {
         dtrace_program_strcompile(
             hdl,
@@ -261,21 +286,16 @@ pub fn run_child_under_dtrace(
     };
     if prog.is_null() {
         let msg = unsafe { errmsg(hdl) };
+        unsafe { dtrace_proc_release(hdl, proc_h) };
         unsafe { dtrace_close(hdl) };
         return Err(DTraceError::Compile(msg));
     }
 
     if unsafe { dtrace_program_exec(hdl, prog, std::ptr::null_mut()) } != 0 {
         let msg = unsafe { errmsg(hdl) };
+        unsafe { dtrace_proc_release(hdl, proc_h) };
         unsafe { dtrace_close(hdl) };
         return Err(DTraceError::Exec(msg));
-    }
-
-    let proc_h = unsafe { dtrace_proc_create(hdl, path_c.as_ptr(), argv_ptrs.as_ptr()) };
-    if proc_h.is_null() {
-        let msg = unsafe { errmsg(hdl) };
-        unsafe { dtrace_close(hdl) };
-        return Err(DTraceError::ProcCreate(msg));
     }
 
     if unsafe { dtrace_go(hdl) } != 0 {
@@ -287,8 +307,8 @@ pub fn run_child_under_dtrace(
 
     unsafe { dtrace_proc_continue(hdl, proc_h) };
 
-    // Consume loop: sleep + work until both work reports DONE and the
-    // child process is dead. dtrace_work prints to stdout for us.
+    // Consume loop: sleep + work until tracing reports DONE or the child
+    // process is dead. dtrace_work prints to stdout for us.
     loop {
         unsafe { dtrace_sleep(hdl) };
         let status = unsafe { dtrace_work(hdl, out_fp, chew, chewrec, std::ptr::null_mut()) };
@@ -328,4 +348,103 @@ pub fn run_child_under_dtrace(
         }
     }
     Ok(())
+}
+
+fn trace_exec_argv(
+    child_path: &Path,
+    child_argv: &[String],
+    drop_credentials: Option<&TraceDropCredentials>,
+) -> Result<TraceExecArgv, DTraceError> {
+    let child_path_string = child_path.as_os_str().to_string_lossy().into_owned();
+    let exec_path = cstring_arg(&child_path_string)?;
+    let mut argv = Vec::with_capacity(child_argv.len() + 8);
+    argv.push(exec_path.clone());
+
+    if let Some(creds) = drop_credentials {
+        argv.push(cstring_arg(TRACE_CHILD_COMMAND)?);
+        argv.push(cstring_arg("--trace-uid")?);
+        argv.push(cstring_arg(&creds.uid.to_string())?);
+        argv.push(cstring_arg("--trace-gid")?);
+        argv.push(cstring_arg(&creds.gid.to_string())?);
+        if !creds.groups.is_empty() {
+            argv.push(cstring_arg("--trace-groups")?);
+            argv.push(cstring_arg(&join_ids(&creds.groups))?);
+        }
+        argv.push(cstring_arg("--")?);
+    }
+
+    for a in child_argv {
+        argv.push(cstring_arg(a)?);
+    }
+
+    Ok(TraceExecArgv { exec_path, argv })
+}
+
+fn cstring_arg(arg: &str) -> Result<CString, DTraceError> {
+    CString::new(arg.as_bytes()).map_err(|_| DTraceError::BadArg(arg.to_owned()))
+}
+
+fn join_ids(ids: &[u32]) -> String {
+    ids.iter().map(u32::to_string).collect::<Vec<_>>().join(",")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TRACE_CHILD_COMMAND, TraceDropCredentials, trace_exec_argv};
+    use std::ffi::CString;
+    use std::path::Path;
+
+    fn argv_strings(argv: &[CString]) -> Vec<String> {
+        argv.iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn trace_exec_argv_without_credentials_runs_child_directly() {
+        let argv = trace_exec_argv(
+            Path::new("/tmp/carrick"),
+            &["run".to_owned(), "alpine".to_owned()],
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(argv.exec_path.to_string_lossy(), "/tmp/carrick");
+        assert_eq!(
+            argv_strings(&argv.argv),
+            vec!["/tmp/carrick", "run", "alpine"]
+        );
+    }
+
+    #[test]
+    fn trace_exec_argv_with_credentials_uses_self_demoting_child() {
+        let argv = trace_exec_argv(
+            Path::new("/tmp/carrick"),
+            &["run".to_owned(), "alpine".to_owned()],
+            Some(&TraceDropCredentials {
+                uid: 501,
+                gid: 20,
+                groups: vec![20, 12],
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(argv.exec_path.to_string_lossy(), "/tmp/carrick");
+        assert_eq!(
+            argv_strings(&argv.argv),
+            vec![
+                "/tmp/carrick",
+                TRACE_CHILD_COMMAND,
+                "--trace-uid",
+                "501",
+                "--trace-gid",
+                "20",
+                "--trace-groups",
+                "20,12",
+                "--",
+                "run",
+                "alpine",
+            ]
+        );
+    }
 }
