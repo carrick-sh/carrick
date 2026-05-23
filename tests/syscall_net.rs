@@ -102,6 +102,81 @@ fn fionread_and_fionbio_bootstrap_succeed_for_valid_fds() {
 }
 
 #[test]
+fn fionbio_updates_pipe_status_flags_and_host_nonblocking_mode() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(59, SyscallArgs::from([0x4000, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let pair = read_fd_pair(&memory, 0x4000);
+    memory.write_bytes(0x4020, &1_i32.to_le_bytes()).unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    29,
+                    SyscallArgs::from([pair.read_fd as u64, LINUX_FIONBIO, 0x4020, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    63,
+                    SyscallArgs::from([pair.read_fd as u64, 0x4040, 1, 0, 0, 0])
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 11 }
+    );
+
+    memory.write_bytes(0x4020, &0_i32.to_le_bytes()).unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    29,
+                    SyscallArgs::from([pair.read_fd as u64, LINUX_FIONBIO, 0x4020, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    match dispatcher
+        .dispatch(
+            SyscallRequest::new(
+                63,
+                SyscallArgs::from([pair.read_fd as u64, 0x4040, 1, 0, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap()
+    {
+        DispatchOutcome::WaitOnFds { .. } => {}
+        other => panic!("expected blocking read handoff after FIONBIO(0), got {other:?}"),
+    }
+}
+
+#[test]
 fn eventfd2_read_write_round_trip_uses_packed_counter() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
     let reporter = CompatReporter::default();
@@ -590,6 +665,83 @@ fn epoll_reports_timerfd_readiness_with_packed_event() {
         DispatchOutcome::Returned { value: 0 }
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn blocking_eventfd_read_waits_until_writer_updates_counter() {
+    let dispatcher = Arc::new(SyscallDispatcher::new());
+    let reporter = Arc::new(CompatReporter::default());
+    let registry = Arc::new(ThreadRegistry::new(10));
+    let futex = Arc::new(FutexTable::new());
+    assert_eq!(registry.register_child(10), 11);
+
+    let mut setup_memory = LinearMemory::new(0x4000, vec![0; 0x100]);
+    let eventfd = dispatcher
+        .dispatch_threaded(
+            SyscallRequest::new(19, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+            &mut setup_memory,
+            &reporter,
+            10,
+            &registry,
+            &futex,
+        )
+        .unwrap();
+    let DispatchOutcome::Returned { value: fd } = eventfd else {
+        panic!("expected eventfd2 success, got {eventfd:?}");
+    };
+
+    let (tx, rx) = mpsc::channel();
+    let read_dispatcher = Arc::clone(&dispatcher);
+    let read_reporter = Arc::clone(&reporter);
+    let read_registry = Arc::clone(&registry);
+    let read_futex = Arc::clone(&futex);
+    let reader = std::thread::spawn(move || {
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
+        let outcome = read_dispatcher
+            .dispatch_threaded(
+                SyscallRequest::new(63, SyscallArgs::from([fd as u64, 0x4000, 8, 0, 0, 0])),
+                &mut memory,
+                &read_reporter,
+                10,
+                &read_registry,
+                &read_futex,
+            )
+            .unwrap();
+        let value = read_eventfd_value(&memory, 0x4000).value;
+        tx.send((outcome, value)).unwrap();
+    });
+
+    std::thread::sleep(Duration::from_millis(25));
+    assert!(
+        rx.try_recv().is_err(),
+        "blocking read returned before writer"
+    );
+
+    let mut write_memory = LinearMemory::new(0x4000, vec![0; 0x100]);
+    write_memory
+        .write_bytes(0x4000, &5_u64.to_le_bytes())
+        .unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch_threaded(
+                SyscallRequest::new(64, SyscallArgs::from([fd as u64, 0x4000, 8, 0, 0, 0])),
+                &mut write_memory,
+                &reporter,
+                11,
+                &registry,
+                &futex,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 8 }
+    );
+
+    let (outcome, value) = rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("blocking eventfd reader should wake");
+    assert_eq!(outcome, DispatchOutcome::Returned { value: 8 });
+    assert_eq!(value, 5);
+    reader.join().expect("reader thread panicked");
 }
 
 #[test]
@@ -1307,7 +1459,6 @@ fn threaded_epoll_wait_wakes_when_peer_thread_writes_to_accepted_socket() {
         other => panic!("unexpected epoll outcome: {:?}", other),
     };
     assert!(initial_count >= 1);
-
 
     let (wait_tx, wait_rx) = mpsc::channel();
     let wait_threaded = threaded.clone();
