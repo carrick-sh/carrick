@@ -54,6 +54,10 @@ Work package progress:
   - Completed: added a `darwin_kqueue` boundary that owns kqueue fds with RAII, centralizes `kevent` construction, wraps `EVFILT_USER` triggering, and exposes typed event inspection.
   - Completed: moved `ThreadWaiter`, signal-pump registration/draining, and `host_signal::notify_pump` off hand-built raw `libc::kevent` values.
   - Verified kqueue fd closure, user-trigger wake behavior, signal-pump tests, host-signal split-pipe tests, and existing kqueue waiter integration tests.
+- [x] R5/S4. Host Mapping and Process-wide Protection Ownership
+  - Completed: added an `OwnedHostMapping` RAII boundary for host `mmap` lifetimes while keeping HVF `hv_vm_map`/`hv_vm_unmap` calls explicit in the trap layer.
+  - Completed: moved guest `PROT_NONE` intervals into shared process-wide protection metadata and carried that metadata through thread sibling specs.
+  - Verified host mapping drop cleanup, shared protection updates across cloned thread metadata, `syscall_mem`, `syscall_thread`, and the memory concurrency contract.
 - [ ] Package 6. VFS and Stat Ownership
 - [ ] Hygiene gates and final verification sweep
 
