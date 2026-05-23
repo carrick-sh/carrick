@@ -61,6 +61,11 @@ pub const LINUX_SIG_IGN: u64 = 1;
 /// — so carrick must synthesise its own trampoline unless this bit is present.
 pub const LINUX_SA_RESTORER: u64 = 0x0400_0000;
 
+/// `SA_ONSTACK`: deliver this signal on the alternate signal stack installed
+/// via `sigaltstack(2)`, if one is present. Go installs its runtime signal
+/// handlers with this flag.
+pub const LINUX_SA_ONSTACK: u64 = 0x0800_0000;
+
 pub const LINUX_DIRENT64_HEADER_SIZE: usize = core::mem::size_of::<LinuxDirent64Header>();
 
 #[repr(C, packed)]

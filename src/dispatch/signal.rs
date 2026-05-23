@@ -114,6 +114,13 @@ impl SyscallDispatcher {
         }
     }
 
+    /// The currently-installed alternate signal stack as `(ss_sp, ss_size)`,
+    /// or `None` when no alt stack is set. The runtime uses this to place the
+    /// signal frame on the alt stack when a handler is registered `SA_ONSTACK`.
+    pub fn signal_altstack(&self) -> Option<(u64, u64)> {
+        self.signal.lock().altstack.map(|a| (a.ss_sp, a.ss_size))
+    }
+
     /// True iff the guest installed `SIG_IGN` for `signum`. Lets the
     /// runtime drop a pending signal without injecting it.
     pub fn signal_is_ignored(&self, signum: i32) -> bool {
