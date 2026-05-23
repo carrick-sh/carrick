@@ -677,4 +677,3 @@ fn conformance_go_fixture() {
         println!("PASS conformance_go_fixture");
     }
 }
-
