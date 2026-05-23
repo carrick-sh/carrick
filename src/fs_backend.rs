@@ -12,8 +12,8 @@
 //     fast, ephemeral, ideal for CI / tests / one-shot runs.
 //   * `HostFsBackend`: a real APFS scratch directory, sandboxed via
 //     `cap_std::fs::Dir` (kernel-rooted, syscall-level escape-proof),
-//     reflink-seeded from the unpacked rootfs (clonefile is O(1) on
-//     APFS). This is the production / durable option.
+//     byte-copied from the unpacked rootfs (a future clonefile(2) seed
+//     would be O(1) on APFS). This is the production / durable option.
 //
 // Both implement the same [`FsBackend`] trait. The dispatcher holds
 // a `Box<dyn FsBackend>` and is otherwise agnostic to which one is

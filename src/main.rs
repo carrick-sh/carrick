@@ -24,7 +24,8 @@ enum FsBackendKind {
     /// In-memory tmpfs. Fast, ephemeral, ideal for CI/tests/one-shots.
     Memory,
     /// Host APFS scratch directory, sandboxed via cap-std. Durable,
-    /// reflink-seeded, the secure-by-default production option.
+    /// byte-copied from the unpacked rootfs, the secure-by-default
+    /// production option.
     Host,
 }
 
