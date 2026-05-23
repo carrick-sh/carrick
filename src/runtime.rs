@@ -1108,6 +1108,18 @@ fn run_vcpu_until_exit(
                             // handle under its new tid (the inherited map's
                             // parent entries point at dead vCPUs and are inert).
                             kicker.register(this_tid, engine.vcpu_kick_handle());
+                            // The signal-pump daemon (which forces a vCPU out of
+                            // hv_vcpu_run on a process-directed signal) does not
+                            // survive fork — only the calling thread does. Without
+                            // it, an async signal (a timer's SIGALRM, a
+                            // cross-process kill) can't preempt a child spinning
+                            // in guest userspace. Re-spawn it on the child's fresh
+                            // self-pipe. (LTP setitimer01's child busy-waits for
+                            // its ITIMER signal.)
+                            crate::vcpu_kick::spawn_signal_pump(
+                                Arc::clone(&kicker),
+                                Arc::clone(&futex),
+                            );
                             0
                         }
                     };

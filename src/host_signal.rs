@@ -337,6 +337,14 @@ fn publish_pending(signum: i32) {
     notify_pending();
 }
 
+/// Publish a process-directed guest signal from a non-vCPU host thread (e.g.
+/// the interval-timer thread delivering SIGALRM/SIGVTALRM/SIGPROF on expiry).
+/// Sets the process-directed pending slot and wakes parked waiters; the kick
+/// daemon forces any in-guest vCPU out so the runtime delivers it promptly.
+pub fn publish_process_signal(signum: i32) {
+    publish_pending(signum);
+}
+
 /// 0 = handlers not installed yet, 1 = installed. Used to make
 /// `install_default_handlers` idempotent across test setups.
 static INSTALLED: AtomicU8 = AtomicU8::new(0);
