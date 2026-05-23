@@ -409,6 +409,20 @@ impl SyscallDispatcher {
                     LINUX_ITIMER_PROF => crate::linux_abi::LINUX_SIGPROF,
                     _ => crate::linux_abi::LINUX_SIGALRM,
                 };
+                let signal_name = match signum {
+                    crate::linux_abi::LINUX_SIGVTALRM => "SIGVTALRM",
+                    crate::linux_abi::LINUX_SIGPROF => "SIGPROF",
+                    _ => "SIGALRM",
+                };
+                ctx.reporter
+                    .record(crate::compat::CompatEvent::partial_syscall(
+                        103,
+                        "setitimer",
+                        ctx.request.args,
+                        format!(
+                            "setitimer delivery is emulated with host timer thread and {signal_name}"
+                        ),
+                    ));
                 spawn_itimer_thread(gen_arc, idx, my_gen, value, interval, signum);
             }
         }
