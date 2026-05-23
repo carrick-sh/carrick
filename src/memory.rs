@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 
 use crate::dispatch::{GuestMemory, MemoryError};
@@ -590,9 +591,7 @@ fn build_linux_initial_stack(
     }
     cursor -= 16;
     let mut random_bytes = [0u8; 16];
-    unsafe {
-        let _ = libc::getentropy(random_bytes.as_mut_ptr() as *mut _, random_bytes.len());
-    }
+    fill_random_bytes(&mut random_bytes)?;
     bytes[cursor..cursor + 16].copy_from_slice(&random_bytes);
     let random_addr = stack_start + cursor as u64;
 
@@ -705,6 +704,18 @@ fn align_up_u64(value: u64, alignment: u64) -> Option<u64> {
     }
 }
 
+fn fill_random_bytes(bytes: &mut [u8]) -> std::io::Result<()> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let rc = unsafe { libc::getentropy(bytes.as_mut_ptr().cast(), bytes.len()) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let mut file = fs::File::open("/dev/urandom")?;
+    file.read_exact(bytes)
+}
+
 fn regions_from_load_plan(
     file: &[u8],
     plan: &LoadPlan,
@@ -734,13 +745,17 @@ fn regions_from_load_plan(
         .map(|seg| seg.virtual_address)
         .min()
         .expect("non-empty segments");
-    #[allow(clippy::expect_used)]
-    let max_end = plan
-        .segments
-        .iter()
-        .map(|seg| seg.virtual_address.wrapping_add(seg.memory_size))
-        .max()
-        .expect("non-empty segments");
+    let mut max_end = min_start;
+    for segment in &plan.segments {
+        let segment_end = segment
+            .virtual_address
+            .checked_add(segment.memory_size)
+            .ok_or(AddressSpaceError::RegionOverflow {
+                start: segment.virtual_address,
+                size: segment.memory_size,
+            })?;
+        max_end = max_end.max(segment_end);
+    }
     if max_end.saturating_sub(min_start) <= MERGE_WINDOW {
         let segments = plan.segments.iter().collect::<Vec<_>>();
         return Ok(vec![region_from_load_segments(file, &segments)?]);
@@ -799,12 +814,17 @@ fn region_from_load_segments(
         .map(|segment| segment.virtual_address)
         .min()
         .expect("non-empty load segment group");
-    #[allow(clippy::expect_used)]
-    let end = segments
-        .iter()
-        .map(|segment| segment.virtual_address.wrapping_add(segment.memory_size))
-        .max()
-        .expect("non-empty load segment group");
+    let mut end = start;
+    for segment in segments {
+        let segment_end = segment
+            .virtual_address
+            .checked_add(segment.memory_size)
+            .ok_or(AddressSpaceError::RegionOverflow {
+                start: segment.virtual_address,
+                size: segment.memory_size,
+            })?;
+        end = end.max(segment_end);
+    }
     let total_size_u64 = end
         .checked_sub(start)
         .ok_or(AddressSpaceError::RegionOverflow { start, size: 0 })?;
@@ -1268,6 +1288,45 @@ mod loader_tests {
         assert!(!regions[0].perms.write);
         assert_eq!(regions[1].start, 0x2000_0000);
         assert_eq!(regions[1].bytes()[0], 0x33);
+    }
+
+    #[test]
+    fn rejects_load_segment_end_overflow_before_region_merge() {
+        let plan = LoadPlan {
+            entry: 0,
+            interpreter: None,
+            program_header_address: None,
+            program_header_entry_size: 56,
+            program_header_count: 1,
+            load_bias: 0,
+            e_type: ElfType::Exec,
+            segments: vec![LoadSegment {
+                file_offset: 0,
+                virtual_address: u64::MAX - 0xff,
+                file_size: 0,
+                memory_size: 0x1000,
+                alignment: 0x1000,
+                perms: SegmentPerms {
+                    read: true,
+                    write: false,
+                    execute: false,
+                },
+            }],
+        };
+
+        let err = regions_from_load_plan(&[], &plan).unwrap_err();
+        assert!(
+            matches!(err, AddressSpaceError::RegionOverflow { .. }),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[test]
+    fn fill_random_bytes_produces_nonzero_entropy() {
+        let mut bytes = [0u8; 16];
+        fill_random_bytes(&mut bytes).unwrap();
+
+        assert_ne!(bytes, [0u8; 16]);
     }
 }
 

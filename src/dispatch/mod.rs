@@ -3,6 +3,12 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+// LOCK ORDERING: dispatch handlers must not hold subsystem locks while entering
+// guest-memory callbacks or blocking host waits. When multiple dispatcher
+// locks are unavoidable, acquire fd/open-description state before filesystem
+// overlay state, then proc/signal/thread registries. Futex waits are prepared
+// under dispatcher state and parked only after those locks have been released.
+
 use crate::compat::{CompatEvent, CompatReporter, SyscallArgs};
 use crate::fs_backend::FsBackend;
 use crate::linux_abi::{
@@ -58,6 +64,7 @@ use crate::linux_abi::{
     LINUX_ECHILD,
     LINUX_EEXIST,
     LINUX_EFAULT,
+    LINUX_EFBIG,
     LINUX_EFD_CLOEXEC,
     LINUX_EFD_NONBLOCK,
     LINUX_EFD_SEMAPHORE,
@@ -562,16 +569,19 @@ pub trait GuestMemory {
     /// `MAP_SHARED` mapping of the host file `host_fd` at `offset`, so the
     /// guest CPU AND the dispatcher's accessor both operate on the file's
     /// page cache (full coherence + persistence). `host_fd` ownership is
-    /// transferred — the impl must `close` it once mapped. Default: the
-    /// backend doesn't support real shared mappings → caller falls back to
-    /// a private snapshot copy.
+    /// transferred even on failure — the impl must close it before returning.
+    /// Default: the backend doesn't support real shared mappings, so it closes
+    /// the duplicate and lets the caller fall back to a private snapshot copy.
     fn map_shared_file(
         &mut self,
         _guest_addr: u64,
         _len: usize,
-        _host_fd: i32,
+        host_fd: i32,
         _offset: u64,
     ) -> Result<(), MemoryError> {
+        unsafe {
+            libc::close(host_fd);
+        }
         Err(MemoryError::Unsupported)
     }
 
@@ -1379,7 +1389,7 @@ impl SyscallDispatcher {
     pub fn with_rootfs_and_executable(rootfs: RootFs, executable_path: impl Into<String>) -> Self {
         let mut s = Self::new();
         s.fs.rootfs_vfs.rootfs = Some(rootfs);
-        s.proc.lock().executable_path = executable_path.into();
+        s.set_executable_path(executable_path);
         s
     }
 
@@ -1408,8 +1418,18 @@ impl SyscallDispatcher {
     /// dispatcher is constructed via `SyscallDispatcher::new()` without
     /// a rootfs (the `--fs host` streaming path) so that `/proc` reads
     /// reflect the correct binary name.
-    pub fn set_executable_path(&mut self, path: impl Into<String>) {
-        self.proc.lock().executable_path = path.into();
+    pub fn set_executable_path(&self, path: impl Into<String>) {
+        let path = path.into();
+        let mut proc = self.proc.lock();
+        proc.executable_path = path.clone();
+        proc.argv = vec![path];
+    }
+
+    pub fn set_executable_identity(&self, path: impl Into<String>, argv: Vec<String>) {
+        let path = path.into();
+        let mut proc = self.proc.lock();
+        proc.executable_path = path.clone();
+        proc.argv = if argv.is_empty() { vec![path] } else { argv };
     }
 
     /// Name of the currently-installed backend (for logging / debug).
@@ -2155,13 +2175,21 @@ impl SyscallDispatcher {
 /// vector (zero-filled if there's a gap) and advancing the cursor. This
 /// is the in-memory mirror of `vfs_write`: it makes a writable
 /// overlay-backed File behave like a real tmpfs.
-fn write_into_file_contents(contents: &mut Vec<u8>, offset: &mut usize, bytes: &[u8]) {
-    let end = *offset + bytes.len();
+fn write_into_file_contents(
+    contents: &mut Vec<u8>,
+    offset: &mut usize,
+    bytes: &[u8],
+) -> Result<(), i32> {
+    let end = (*offset).checked_add(bytes.len()).ok_or(LINUX_EFBIG)?;
+    if end as u64 > crate::vfs::MAX_IN_MEMORY_FILE_SIZE {
+        return Err(LINUX_EFBIG);
+    }
     if end > contents.len() {
         contents.resize(end, 0);
     }
     contents[*offset..end].copy_from_slice(bytes);
     *offset = end;
+    Ok(())
 }
 
 /// (syscall_number, arg_index, supported_mask) for every syscall that
@@ -2482,6 +2510,10 @@ fn dispatch_threaded_futex(
         }
         LINUX_FUTEX_REQUEUE | LINUX_FUTEX_CMP_REQUEUE => {
             // FUTEX_(CMP_)REQUEUE moves parked waiters between futex queues.
+            // Carrick deliberately does not acquire two futex bucket locks for
+            // this operation: returning ENOSYS avoids the source/destination
+            // lock-ordering hazard while preserving an explicit compatibility
+            // signal for the unsupported primitive.
             // Neither host primitive can do that: __ulock has no requeue, and a
             // parking_lot/__ulock waiter is a guest thread blocked in the
             // FUTEX_WAIT syscall — "requeueing" it would mean it re-waits on
@@ -3059,6 +3091,7 @@ impl SyscallDispatcher {
         let mem = self.mem_snapshot();
         crate::vfs::SyntheticProcContext {
             executable_path: proc.executable_path.clone(),
+            argv: proc.argv.clone(),
             address_space_regions: mem.address_space_regions,
             brk_current: mem.brk_current,
             mmap_next: mem.mmap_next,

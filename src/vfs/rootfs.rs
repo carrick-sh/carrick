@@ -19,12 +19,15 @@
 
 use crate::fs_backend::{FsBackend, MemoryBackend, OverlayEntry};
 use crate::linux_abi::{
-    LINUX_EACCES, LINUX_EEXIST, LINUX_EINVAL, LINUX_EISDIR, LINUX_ENOENT, LINUX_ENOTDIR,
-    LINUX_ENOTEMPTY, LINUX_EROFS,
+    LINUX_EACCES, LINUX_EEXIST, LINUX_EFBIG, LINUX_EINVAL, LINUX_EISDIR, LINUX_ENOENT,
+    LINUX_ENOTDIR, LINUX_ENOTEMPTY, LINUX_EROFS,
 };
 use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsError, RootFsMetadata};
 
-use super::{DirEnt, EntryKind, Metadata, OpenContext, OpenFlags, Vfs, VfsError, VfsHandle};
+use super::{
+    DirEnt, EntryKind, MAX_IN_MEMORY_FILE_SIZE, Metadata, OpenContext, OpenFlags, Vfs, VfsError,
+    VfsHandle,
+};
 
 /// The `/` mount. Owns the immutable OCI rootfs (`rootfs`) and the
 /// writable overlay (`overlay`). Direct field access by the
@@ -740,6 +743,9 @@ impl Vfs for RootFsVfs {
     }
 
     fn truncate(&mut self, path: &str, len: u64) -> Result<(), VfsError> {
+        if len > MAX_IN_MEMORY_FILE_SIZE {
+            return Err(LINUX_EFBIG);
+        }
         // Materialise the file into the overlay (if it's only in
         // rootfs), then truncate.
         let mut contents = match self.overlay.lookup(path) {
@@ -753,8 +759,9 @@ impl Vfs for RootFsVfs {
                 .read(path)
                 .map_err(|_| LINUX_ENOENT)?,
         };
-        contents.truncate(len as usize);
-        contents.resize(len as usize, 0);
+        let len = len as usize;
+        contents.truncate(len);
+        contents.resize(len, 0);
         self.overlay
             .set_file_contents(path, contents)
             .map_err(|_| LINUX_EACCES)
@@ -820,6 +827,16 @@ mod tests {
     fn lookup_missing_is_enoent() {
         let v = RootFsVfs::with_rootfs(rootfs_with_files());
         assert_eq!(v.lookup("/no-such"), Err(LINUX_ENOENT));
+    }
+
+    #[test]
+    fn truncate_rejects_unbounded_in_memory_file_growth() {
+        let mut v = RootFsVfs::with_rootfs(rootfs_with_files());
+
+        assert_eq!(
+            v.truncate("/etc/hosts", crate::vfs::MAX_IN_MEMORY_FILE_SIZE + 1),
+            Err(LINUX_EFBIG)
+        );
     }
 
     #[test]

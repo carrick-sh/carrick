@@ -29,6 +29,7 @@ pub struct ProcMapsEntry {
 #[derive(Debug, Clone, Default)]
 pub struct SyntheticProcContext {
     pub executable_path: String,
+    pub argv: Vec<String>,
     pub address_space_regions: Option<Vec<ProcMapsEntry>>,
     pub brk_current: u64,
     pub mmap_next: u64,
@@ -49,7 +50,7 @@ pub(crate) fn synthetic_file(path: &str, ctx: &SyntheticProcContext) -> Option<V
         "/proc/uptime" => Some(synthetic_proc_uptime().into_bytes()),
         "/proc/version" => Some(synthetic_proc_version().to_vec()),
         "/proc/self/auxv" => Some(synthetic_proc_self_auxv().to_vec()),
-        "/proc/self/cmdline" => Some(synthetic_proc_self_cmdline(&ctx.executable_path)),
+        "/proc/self/cmdline" => Some(synthetic_proc_self_cmdline(&ctx.argv, &ctx.executable_path)),
         "/proc/self/comm" => Some(synthetic_proc_self_comm(&ctx.executable_path).into_bytes()),
         "/proc/self/limits" => Some(synthetic_proc_self_limits().to_vec()),
         "/proc/self/maps" => Some(synthetic_proc_maps(ctx).into_bytes()),
@@ -176,6 +177,7 @@ impl Vfs for ProcVfs {
         }
         let synth_ctx = SyntheticProcContext {
             executable_path: ctx.executable_path.unwrap_or("").to_owned(),
+            argv: ctx.argv.unwrap_or(&[]).to_vec(),
             address_space_regions: ctx.address_space_regions.map(|regions| regions.to_vec()),
             brk_current: ctx.brk_current,
             mmap_next: ctx.mmap_next,
@@ -401,9 +403,17 @@ nonvoluntary_ctxt_switches:\t0\n"
     )
 }
 
-fn synthetic_proc_self_cmdline(executable_path: &str) -> Vec<u8> {
-    let mut bytes = executable_path.as_bytes().to_vec();
-    bytes.push(0);
+fn synthetic_proc_self_cmdline(argv: &[String], executable_path: &str) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let args: Vec<&str> = if argv.is_empty() {
+        vec![executable_path]
+    } else {
+        argv.iter().map(String::as_str).collect()
+    };
+    for arg in args {
+        bytes.extend_from_slice(arg.as_bytes());
+        bytes.push(0);
+    }
     bytes
 }
 
@@ -702,6 +712,11 @@ mod tests {
     #[test]
     fn open_self_cmdline_uses_executable_path() {
         let v = ProcVfs::new();
+        let argv = vec![
+            "/usr/bin/test-exe".to_owned(),
+            "--flag".to_owned(),
+            "value".to_owned(),
+        ];
         let h = v
             .open(
                 "/proc/self/cmdline",
@@ -711,14 +726,14 @@ mod tests {
                 },
                 &OpenContext {
                     executable_path: Some("/usr/bin/test-exe"),
+                    argv: Some(&argv),
                     ..Default::default()
                 },
             )
             .unwrap();
         match h {
             VfsHandle::Bytes { contents, .. } => {
-                let s = String::from_utf8_lossy(&contents);
-                assert!(s.contains("test-exe"), "cmdline = {:?}", s);
+                assert_eq!(contents, b"/usr/bin/test-exe\0--flag\0value\0");
             }
             _ => panic!("expected Bytes variant"),
         }
@@ -728,6 +743,7 @@ mod tests {
     fn proc_maps_uses_vfs_owned_context() {
         let ctx = SyntheticProcContext {
             executable_path: "/bin/demo".to_owned(),
+            argv: vec!["/bin/demo".to_owned()],
             address_space_regions: Some(vec![ProcMapsEntry {
                 start: LINUX_HEAP_BASE,
                 end: LINUX_HEAP_BASE + 0x4000,

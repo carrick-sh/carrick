@@ -1499,6 +1499,9 @@ impl SyscallDispatcher {
                     contents, metadata, ..
                 } if grow => {
                     // In-memory model (--fs memory): grow the cached bytes.
+                    if new_size > crate::vfs::MAX_IN_MEMORY_FILE_SIZE {
+                        return Ok(DispatchOutcome::Errno { errno: LINUX_EFBIG });
+                    }
                     if new_size as usize > contents.len() {
                         contents.resize(new_size as usize, 0);
                         metadata.size = contents.len();
@@ -1594,6 +1597,9 @@ impl SyscallDispatcher {
                 } => {
                     if !*writable {
                         return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+                    }
+                    if length as u64 > crate::vfs::MAX_IN_MEMORY_FILE_SIZE {
+                        return Ok(DispatchOutcome::Errno { errno: LINUX_EFBIG });
                     }
                     let new_len = length as usize;
                     if new_len > contents.len() {
@@ -2111,10 +2117,14 @@ impl SyscallDispatcher {
         // Build the OpenContext from owned/copy data so the mut
         // borrow of `vfs_mounts` doesn't conflict with reads from
         // sibling fields.
-        let exec_path = self.proc.lock().executable_path.clone();
+        let proc = self.proc.lock();
+        let exec_path = proc.executable_path.clone();
+        let argv = proc.argv.clone();
+        drop(proc);
         let mem = self.mem_snapshot();
         let ctx = crate::vfs::OpenContext {
             executable_path: Some(exec_path.as_str()),
+            argv: Some(argv.as_slice()),
             address_space_regions: mem.address_space_regions.as_deref(),
             brk_current: mem.brk_current,
             mmap_next: mem.mmap_next,
@@ -3964,13 +3974,12 @@ impl SyscallDispatcher {
             // (the user's tty/pipe). Blocking here is the correct backpressure
             // and isn't a guest socket on the server path.
             let n = unsafe { libc::write(fd as i32, bytes.as_ptr() as *const _, bytes.len()) };
-            if n < 0 {
-                let errno = unsafe { *libc::__error() };
-                return Ok(DispatchOutcome::Errno {
-                    errno: errno as i32,
-                });
-            }
-            return Ok(DispatchOutcome::Returned { value: n as i64 });
+            return match n.host_syscall_errno() {
+                Ok(value) => Ok(DispatchOutcome::Returned {
+                    value: value as i64,
+                }),
+                Err(errno) => Ok(DispatchOutcome::Errno { errno }),
+            };
         }
         match fd {
             1 => self.io.stdout.lock().extend_from_slice(&bytes),
@@ -4076,7 +4085,9 @@ impl SyscallDispatcher {
                         if !*writable {
                             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
                         }
-                        write_into_file_contents(contents, offset, &bytes);
+                        if let Err(errno) = write_into_file_contents(contents, offset, &bytes) {
+                            return Ok(DispatchOutcome::Errno { errno });
+                        }
                         metadata.size = contents.len();
                         outcome = DispatchOutcome::Returned {
                             value: bytes.len() as i64,
@@ -4171,7 +4182,9 @@ impl SyscallDispatcher {
                         if !*writable {
                             return DispatchOutcome::Errno { errno: LINUX_EBADF };
                         }
-                        write_into_file_contents(contents, offset, bytes);
+                        if let Err(errno) = write_into_file_contents(contents, offset, bytes) {
+                            return DispatchOutcome::Errno { errno };
+                        }
                         metadata.size = contents.len();
                         outcome = DispatchOutcome::Returned {
                             value: bytes.len() as i64,
@@ -4195,13 +4208,12 @@ impl SyscallDispatcher {
             // (the user's tty/pipe). Blocking here is the correct backpressure
             // and isn't a guest socket on the server path.
             let n = unsafe { libc::write(fd, bytes.as_ptr() as *const _, bytes.len()) };
-            if n < 0 {
-                let errno = unsafe { *libc::__error() };
-                return DispatchOutcome::Errno {
-                    errno: errno as i32,
-                };
-            }
-            return DispatchOutcome::Returned { value: n as i64 };
+            return match n.host_syscall_errno() {
+                Ok(value) => DispatchOutcome::Returned {
+                    value: value as i64,
+                },
+                Err(errno) => DispatchOutcome::Errno { errno },
+            };
         }
         match fd {
             1 => self.io.stdout.lock().extend_from_slice(bytes),
@@ -4307,7 +4319,9 @@ impl SyscallDispatcher {
                             if !*writable {
                                 return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
                             }
-                            write_into_file_contents(contents, offset, &bytes);
+                            if let Err(errno) = write_into_file_contents(contents, offset, &bytes) {
+                                return Ok(DispatchOutcome::Errno { errno });
+                            }
                             metadata.size = contents.len();
                             outcome = DispatchOutcome::Returned {
                                 value: bytes.len() as i64,

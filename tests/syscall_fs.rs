@@ -10,6 +10,8 @@
 #[path = "common/syscall_support.rs"]
 mod support;
 
+use carrick::linux_abi::{LINUX_EFBIG, LINUX_O_CREAT, LINUX_O_RDWR};
+use carrick::vfs::MAX_IN_MEMORY_FILE_SIZE;
 use support::*;
 
 #[test]
@@ -3967,6 +3969,51 @@ fn ftruncate_bootstrap_rejects_streams_and_read_only_rootfs_fds() {
             )
             .unwrap(),
         DispatchOutcome::Errno { errno: 9 }
+    );
+
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn ftruncate_rejects_unbounded_in_memory_file_growth() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
+    memory.write_bytes(0x4000, b"/big\0").unwrap();
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    56,
+                    SyscallArgs::from([
+                        (-100_i64) as u64,
+                        0x4000,
+                        LINUX_O_CREAT | LINUX_O_RDWR,
+                        0o644,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 3 }
+    );
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    46,
+                    SyscallArgs::from([3, MAX_IN_MEMORY_FILE_SIZE + 1, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: LINUX_EFBIG }
     );
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());

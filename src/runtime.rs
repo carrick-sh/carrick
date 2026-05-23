@@ -216,6 +216,10 @@ where
     A: IntoIterator<Item = String>,
     E: IntoIterator<Item = String>,
 {
+    let path = path.as_ref();
+    let argv: Vec<String> = argv.into_iter().collect();
+    let env: Vec<String> = env.into_iter().collect();
+    dispatcher.set_executable_identity(path.to_string_lossy().into_owned(), argv.clone());
     let image = AddressSpace::load_elf(path)?
         .with_linux_initial_stack(argv, env)?
         .with_el0_trampoline()?
@@ -250,6 +254,11 @@ where
     A: IntoIterator<Item = String>,
     E: IntoIterator<Item = String>,
 {
+    let argv: Vec<String> = argv.into_iter().collect();
+    let env: Vec<String> = env.into_iter().collect();
+    if let Some(first) = argv.first() {
+        dispatcher.set_executable_identity(first.clone(), argv.clone());
+    }
     let image = AddressSpace::load_elf_bytes(bytes)?
         .with_linux_initial_stack(argv, env)?
         .with_el0_trampoline()?
@@ -288,6 +297,10 @@ where
     A: IntoIterator<Item = String>,
     E: IntoIterator<Item = String>,
 {
+    let path = path.as_ref();
+    let argv: Vec<String> = argv.into_iter().collect();
+    let env: Vec<String> = env.into_iter().collect();
+    dispatcher.set_executable_identity(path.to_string_lossy().into_owned(), argv.clone());
     let image = AddressSpace::load_elf_from_rootfs(path, rootfs)?
         .with_linux_initial_stack(argv, env)?
         .with_el0_trampoline()?
@@ -316,6 +329,9 @@ where
     A: IntoIterator<Item = String>,
     E: IntoIterator<Item = String>,
 {
+    let argv: Vec<String> = argv.into_iter().collect();
+    let env: Vec<String> = env.into_iter().collect();
+    dispatcher.set_executable_identity(path.to_owned(), argv.clone());
     let bytes = dispatcher.read_exec_file(path).ok_or_else(|| {
         RuntimeError::AddressSpace(AddressSpaceError::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -465,6 +481,7 @@ where
     // Per-thread blocking-I/O waiter (owns this thread's kqueue). Recreated in
     // a forked child below (kqueue is not inherited across fork).
     let mut waiter = crate::io_wait::ThreadWaiter::new(this_tid);
+    let trace_traps = std::env::var_os("CARRICK_TRACE_TRAPS").is_some();
     for traps in 1..=max_traps {
         let frame = match runtime.next_syscall()? {
             Some(f) => f,
@@ -495,7 +512,7 @@ where
                 continue;
             }
         };
-        if std::env::var_os("CARRICK_TRACE_TRAPS").is_some() {
+        if trace_traps {
             let name = crate::syscall::lookup_aarch64(frame.x8)
                 .map(|s| s.name)
                 .unwrap_or("<unknown>");
@@ -585,6 +602,7 @@ where
             }
             DispatchOutcome::Execve { path, argv, env } => {
                 crate::probes::execve_argv(&path, &argv);
+                let proc_argv = argv.clone();
                 // Reflect the new program into the host process name
                 // (`carrick: <basename>`), so a hung forked-exec'd
                 // child is identifiable in `ps -M` / Activity Monitor.
@@ -598,6 +616,7 @@ where
                             new_image.initial_stack_pointer().unwrap_or(0),
                             new_image.regions().len() as u64,
                         );
+                        dispatcher.set_executable_identity(path.clone(), proc_argv);
                         dispatcher.close_cloexec_fds();
                         runtime.execve_into(&new_image)?;
                     }
@@ -869,15 +888,16 @@ impl ThreadRuntimeState {
         let child_threads = Arc::clone(&self.threads);
         let child_kicker = Arc::clone(&self.kicker);
         let max_traps = self.max_traps;
+        let trace = self.trace;
         let handle = std::thread::Builder::new()
             .name(format!("guest-tid-{tid}"))
             .spawn(move || {
-                if std::env::var_os("CARRICK_TRACE_TRAPS").is_some() {
+                if trace {
                     eprintln!("[sibling tid#{tid}] thread started, building vCPU");
                 }
                 match HvfTrapEngine::from_thread_spec(spec) {
                     Ok(child_engine) => {
-                        if std::env::var_os("CARRICK_TRACE_TRAPS").is_some() {
+                        if trace {
                             let pc = child_engine.program_counter().unwrap_or(0);
                             eprintln!("[sibling tid#{tid}] vCPU built, pc={pc:#x}, entering loop");
                         }
@@ -959,6 +979,7 @@ impl ThreadRuntimeState {
         env: Vec<String>,
     ) -> Result<(), RuntimeError> {
         crate::probes::execve_argv(&path, &argv);
+        let proc_argv = argv.clone();
         let base = path.rsplit('/').next().unwrap_or(&path).to_owned();
         crate::dispatch::set_host_process_name(base.as_bytes());
         match load_execve_image(&kernel.dispatcher, &path, argv, env) {
@@ -969,6 +990,9 @@ impl ThreadRuntimeState {
                     img.initial_stack_pointer().unwrap_or(0),
                     img.regions().len() as u64,
                 );
+                kernel
+                    .dispatcher
+                    .set_executable_identity(path.clone(), proc_argv);
                 kernel.dispatcher.close_cloexec_fds();
                 engine.execve_into(&img)?;
                 Ok(())
@@ -1733,6 +1757,7 @@ where
             }
             DispatchOutcome::Execve { path, argv, env } => {
                 crate::probes::execve_argv(&path, &argv);
+                let proc_argv = argv.clone();
                 // Reflect the new program into the host process name
                 // (`carrick: <basename>`), so a hung forked-exec'd
                 // child is identifiable in `ps -M` / Activity Monitor.
@@ -1752,6 +1777,7 @@ where
                         // host kernel pipe in a state where the parent's
                         // POLLIN can't fire — the cause of the apt update
                         // deadlock between apt-main and its http method.
+                        dispatcher.set_executable_identity(path.clone(), proc_argv);
                         dispatcher.close_cloexec_fds();
                         trap.execve_into(&new_image)?;
                     }

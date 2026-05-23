@@ -2019,6 +2019,19 @@ mod tests {
         assert_eq!(std::fs::read(&victim).unwrap(), b"secret");
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_resolve_following_enforces_symlink_hop_limit() {
+        let scratch = tempfile::TempDir::new().unwrap();
+        std::os::unix::fs::symlink("b", scratch.path().join("a")).unwrap();
+        std::os::unix::fs::symlink("a", scratch.path().join("b")).unwrap();
+        let dir = cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority())
+            .unwrap();
+        let b = HostFsBackend::from_existing_dir(dir);
+
+        assert_eq!(b.file_contents("/a"), None);
+    }
+
     /// HostFsBackend must survive `libc::fork(2)`: the apt-resolver
     /// regression under `--fs host` had the symptom of a forked
     /// child carrick process reading /etc/hosts via the inherited
