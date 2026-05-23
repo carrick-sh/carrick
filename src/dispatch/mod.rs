@@ -4022,21 +4022,25 @@ fn would_block_outcome(host_fd: i32, events: i16, nonblocking: bool) -> Dispatch
 }
 
 fn read_guest_c_string(memory: &impl GuestMemory, address: u64) -> Result<String, i32> {
+    const CHUNK: usize = 256;
     let mut bytes = Vec::new();
-    for offset in 0..MAX_GUEST_PATH {
+    let mut offset = 0usize;
+    while offset < MAX_GUEST_PATH {
         let address = address
             .checked_add(offset as u64)
             .ok_or(LINUX_ENAMETOOLONG)?;
-        let byte = memory
-            .read_bytes(address, 1)
-            .map_err(|_| LINUX_EFAULT)?
-            .into_iter()
-            .next()
-            .ok_or(LINUX_EFAULT)?;
-        if byte == 0 {
+        let to_read = CHUNK.min(MAX_GUEST_PATH - offset);
+        let chunk = match memory.read_bytes(address, to_read) {
+            Ok(chunk) => chunk,
+            Err(_) if to_read > 1 => memory.read_bytes(address, 1).map_err(|_| LINUX_EFAULT)?,
+            Err(_) => return Err(LINUX_EFAULT),
+        };
+        if let Some(nul) = chunk.iter().position(|&byte| byte == 0) {
+            bytes.extend_from_slice(&chunk[..nul]);
             return String::from_utf8(bytes).map_err(|_| LINUX_EINVAL);
         }
-        bytes.push(byte);
+        offset += chunk.len();
+        bytes.extend_from_slice(&chunk);
     }
     Err(LINUX_ENAMETOOLONG)
 }
@@ -4529,6 +4533,84 @@ mod overlay_dispatch_tests {
         );
 
         assert_eq!(0i32.host_syscall_result().unwrap(), 0);
+    }
+
+    struct CountingMemory {
+        base: u64,
+        bytes: Vec<u8>,
+        reads: std::cell::Cell<usize>,
+    }
+
+    impl CountingMemory {
+        fn new(base: u64, bytes: Vec<u8>) -> Self {
+            Self {
+                base,
+                bytes,
+                reads: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    impl GuestMemory for CountingMemory {
+        fn read_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            self.reads.set(self.reads.get() + 1);
+            let offset = address
+                .checked_sub(self.base)
+                .ok_or(MemoryError::OutOfBounds { address, length })?;
+            let offset = usize::try_from(offset)
+                .map_err(|_| MemoryError::OutOfBounds { address, length })?;
+            let end = offset
+                .checked_add(length)
+                .ok_or(MemoryError::OutOfBounds { address, length })?;
+            if end > self.bytes.len() {
+                return Err(MemoryError::OutOfBounds { address, length });
+            }
+            Ok(self.bytes[offset..end].to_vec())
+        }
+
+        fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+            let offset = address
+                .checked_sub(self.base)
+                .ok_or(MemoryError::OutOfBounds {
+                    address,
+                    length: bytes.len(),
+                })?;
+            let offset = usize::try_from(offset).map_err(|_| MemoryError::OutOfBounds {
+                address,
+                length: bytes.len(),
+            })?;
+            let end = offset
+                .checked_add(bytes.len())
+                .ok_or(MemoryError::OutOfBounds {
+                    address,
+                    length: bytes.len(),
+                })?;
+            if end > self.bytes.len() {
+                return Err(MemoryError::OutOfBounds {
+                    address,
+                    length: bytes.len(),
+                });
+            }
+            self.bytes[offset..end].copy_from_slice(bytes);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn read_guest_c_string_reads_in_chunks_not_one_byte_at_a_time() {
+        let mut bytes = vec![b'a'; 300];
+        bytes.push(0);
+        bytes.resize(512, 0);
+        let memory = CountingMemory::new(0x4000, bytes);
+
+        let value = read_guest_c_string(&memory, 0x4000).unwrap();
+
+        assert_eq!(value.len(), 300);
+        assert!(
+            memory.reads.get() <= 3,
+            "read_guest_c_string should chunk reads, not issue {} byte reads",
+            memory.reads.get(),
+        );
     }
 
     #[test]

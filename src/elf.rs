@@ -123,6 +123,8 @@ pub enum ElfInspectError {
     NotElf,
     #[error("failed to parse ELF binary: {0}")]
     Parse(#[from] goblin::error::Error),
+    #[error("unsupported ELF machine: {0}")]
+    UnsupportedMachine(u16),
 }
 
 pub fn inspect_elf(path: impl AsRef<Path>) -> Result<ElfMetadata, ElfInspectError> {
@@ -142,6 +144,9 @@ pub fn plan_elf_load(path: impl AsRef<Path>) -> Result<LoadPlan, ElfInspectError
 
 pub fn plan_elf_load_bytes(bytes: &[u8]) -> Result<LoadPlan, ElfInspectError> {
     let elf = parse_elf_bytes(bytes)?;
+    if elf.header.e_machine != EM_AARCH64 {
+        return Err(ElfInspectError::UnsupportedMachine(elf.header.e_machine));
+    }
     Ok(load_plan_from_elf(&elf))
 }
 
@@ -302,6 +307,19 @@ mod tests {
         assert_eq!(plan.entry, 0x400000);
         assert_eq!(plan.segments.len(), 1);
         assert_eq!(plan.segments[0].virtual_address, 0x400000);
+    }
+
+    #[test]
+    fn load_plan_rejects_non_aarch64_machine() {
+        let mut bytes = synthetic_aarch64_elf(ET_EXEC_TYPE, 0x400000, 0x400000);
+        bytes[18..20].copy_from_slice(&EM_X86_64.to_le_bytes());
+
+        let err = plan_elf_load_bytes(&bytes).unwrap_err();
+
+        assert!(
+            err.to_string().contains("unsupported ELF machine"),
+            "unexpected error: {err}",
+        );
     }
 
     #[test]
