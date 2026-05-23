@@ -70,6 +70,8 @@ Work package progress:
   - Verified manifest drift coverage for group-vs-handler cases such as `pselect6`/`ppoll`, bootstrap `ENOSYS` stubs, planned `execveat`, and partial `clone3`.
   - Completed L5: replaced the ad hoc `host_errno()` propagation boundary with `HostSyscallResult`/`HostSyscallError`, migrated host syscall failure paths through that boundary, and removed the legacy helper.
   - Verified macOS-to-Linux errno capture for divergent `EINPROGRESS`, `EAGAIN`, and `ECONNREFUSED` values.
+  - Completed L6: split multi-threaded vCPU loop state into `ThreadRuntimeState` with named helpers for blocking dispatch waits, futex waits, sibling signal routing, clone-thread spawn, thread exit, exec, and fork transitions.
+  - Verified runtime-loop, syscall-thread, syscall-signal, syscall-net, and concurrency-contract regression suites after the extraction.
 - [ ] Hygiene gates and final verification sweep
 
 ## Executive Summary
@@ -593,6 +595,8 @@ Recommendation:
 Validation target:
 
 - Fork, clone, exec, and signal tests can target transition helpers or at least trace their compatibility events cleanly.
+
+Completed by extracting `ThreadRuntimeState` around the multi-threaded HVF loop. The loop now orchestrates vCPU entry, dispatch, and signal delivery while named helpers own blocking waits, futex completion, sibling signal delivery, clone-thread spawn, thread exit, exec, and fork restart/reinitialization.
 
 ## Cross-Cutting Implementation Priorities
 

@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::compat::{CompatReport, CompatReporter};
 use crate::dispatch::{
@@ -704,6 +705,332 @@ enum VcpuLoopOutcome {
     TrapLimit(Box<RunResult>),
 }
 
+struct ThreadRuntimeState {
+    registry: Arc<ThreadRegistry>,
+    futex: Arc<FutexTable>,
+    this_tid: ThreadId,
+    threads: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
+    kicker: Arc<crate::vcpu_kick::VcpuKicker>,
+    waiter: crate::io_wait::ThreadWaiter,
+    max_traps: usize,
+    trace: bool,
+}
+
+impl ThreadRuntimeState {
+    fn new(
+        registry: Arc<ThreadRegistry>,
+        futex: Arc<FutexTable>,
+        this_tid: ThreadId,
+        threads: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
+        kicker: Arc<crate::vcpu_kick::VcpuKicker>,
+        max_traps: usize,
+    ) -> Self {
+        Self {
+            registry,
+            futex,
+            this_tid,
+            threads,
+            kicker,
+            waiter: crate::io_wait::ThreadWaiter::new(this_tid),
+            max_traps,
+            trace: std::env::var_os("CARRICK_TRACE_TRAPS").is_some(),
+        }
+    }
+
+    fn register_vcpu(&self, engine: &HvfTrapEngine) {
+        self.kicker
+            .register(self.this_tid, engine.vcpu_kick_handle());
+        self.registry
+            .record_thread_port(self.this_tid, crate::host_proc::current_thread_port());
+    }
+
+    fn trace_syscall(&self, traps: usize, frame: Aarch64SyscallFrame) {
+        if !self.trace {
+            return;
+        }
+        let name = crate::syscall::lookup_aarch64(frame.x8)
+            .map(|s| s.name)
+            .unwrap_or("<unknown>");
+        eprintln!(
+            "tid#{} trap#{}: x8={} ({name}) x0={:#x} x1={:#x} x2={:#x} x3={:#x} x4={:#x}",
+            self.this_tid, traps, frame.x8, frame.x0, frame.x1, frame.x2, frame.x3, frame.x4
+        );
+    }
+
+    fn service_threaded_syscall(
+        &mut self,
+        kernel: &Kernel,
+        engine: &mut HvfTrapEngine,
+        frame: Aarch64SyscallFrame,
+    ) -> Result<DispatchOutcome, RuntimeError> {
+        loop {
+            let request = SyscallRequest::from_aarch64_frame(frame);
+            let outcome = kernel.dispatcher.dispatch_threaded(
+                request,
+                engine,
+                &kernel.reporter,
+                self.this_tid,
+                &self.registry,
+                &self.futex,
+            )?;
+            match outcome {
+                DispatchOutcome::WaitOnFds {
+                    fds,
+                    timeout,
+                    on_timeout,
+                } => match self.waiter.wait(&fds, timeout) {
+                    crate::io_wait::WaitResult::Ready => continue,
+                    crate::io_wait::WaitResult::TimedOut => {
+                        break Ok(DispatchOutcome::Returned { value: on_timeout });
+                    }
+                    crate::io_wait::WaitResult::Interrupted => {
+                        break Ok(DispatchOutcome::Errno {
+                            errno: crate::linux_abi::LINUX_EINTR,
+                        });
+                    }
+                },
+                other => break Ok(other),
+            }
+        }
+    }
+
+    fn complete_returned(
+        &self,
+        engine: &mut HvfTrapEngine,
+        value: i64,
+    ) -> Result<i64, RuntimeError> {
+        engine.complete_syscall(value)?;
+        Ok(value)
+    }
+
+    fn complete_errno(&self, engine: &mut HvfTrapEngine, errno: i32) -> Result<i64, RuntimeError> {
+        self.complete_returned(engine, -(errno as i64))
+    }
+
+    fn complete_futex_wait(
+        &self,
+        engine: &mut HvfTrapEngine,
+        wait: crate::thread::FutexWait,
+        timeout: Option<Duration>,
+    ) -> Result<i64, RuntimeError> {
+        use crate::thread::FutexWaitOutcome;
+
+        let retval: i64 =
+            match self
+                .futex
+                .wait_prepared_for_thread(wait, timeout, self.this_tid, &|| {
+                    crate::host_signal::has_pending_for(self.this_tid)
+                }) {
+                FutexWaitOutcome::Woken => 0,
+                FutexWaitOutcome::TimedOut => -(crate::linux_abi::LINUX_ETIMEDOUT as i64),
+                FutexWaitOutcome::Interrupted => -(crate::linux_abi::LINUX_EINTR as i64),
+            };
+        self.complete_returned(engine, retval)
+    }
+
+    fn complete_shared_futex_wait(
+        &self,
+        engine: &mut HvfTrapEngine,
+        host_addr: usize,
+        value: u32,
+        timeout: Option<Duration>,
+    ) -> Result<i64, RuntimeError> {
+        let retval = shared_futex_wait(host_addr, value, timeout, self.this_tid);
+        self.complete_returned(engine, retval)
+    }
+
+    fn spawn_clone_thread(
+        &self,
+        kernel: &Kernel,
+        engine: &mut HvfTrapEngine,
+        stack: u64,
+        tls: u64,
+        parent_tid_addr: u64,
+        child_tid_addr: u64,
+    ) -> Result<ThreadId, RuntimeError> {
+        let clear_addr = if child_tid_addr != 0 {
+            child_tid_addr
+        } else {
+            0
+        };
+        let tid = self.registry.register_child(clear_addr);
+        let tid_bytes = tid.to_le_bytes();
+        if parent_tid_addr != 0 {
+            let _ = engine.write_bytes(parent_tid_addr, &tid_bytes);
+        }
+        if child_tid_addr != 0 {
+            let _ = engine.write_bytes(child_tid_addr, &tid_bytes);
+        }
+
+        let spec = engine.build_thread_spec(stack, tls)?;
+        let child_kernel = Arc::clone(kernel);
+        let child_registry = Arc::clone(&self.registry);
+        let child_futex = Arc::clone(&self.futex);
+        let child_threads = Arc::clone(&self.threads);
+        let child_kicker = Arc::clone(&self.kicker);
+        let max_traps = self.max_traps;
+        let handle = std::thread::Builder::new()
+            .name(format!("guest-tid-{tid}"))
+            .spawn(move || {
+                if std::env::var_os("CARRICK_TRACE_TRAPS").is_some() {
+                    eprintln!("[sibling tid#{tid}] thread started, building vCPU");
+                }
+                match HvfTrapEngine::from_thread_spec(spec) {
+                    Ok(child_engine) => {
+                        if std::env::var_os("CARRICK_TRACE_TRAPS").is_some() {
+                            let pc = child_engine.program_counter().unwrap_or(0);
+                            eprintln!("[sibling tid#{tid}] vCPU built, pc={pc:#x}, entering loop");
+                        }
+                        let r = run_vcpu_until_exit(
+                            child_kernel,
+                            child_engine,
+                            child_registry,
+                            child_futex,
+                            tid,
+                            child_threads,
+                            child_kicker,
+                            max_traps,
+                        );
+                        if let Err(e) = r {
+                            tracing::error!(tid, error = %e, "thread sibling vCPU loop failed");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(tid, error = %e, "thread sibling vCPU failed to start");
+                        child_registry.exit(tid);
+                    }
+                }
+            })
+            .map_err(|e| {
+                RuntimeError::Trap(TrapError::Hypervisor(format!(
+                    "spawn guest thread failed: {e}"
+                )))
+            })?;
+        self.threads.lock().push(handle);
+        Ok(tid)
+    }
+
+    fn complete_signal_thread(
+        &self,
+        engine: &mut HvfTrapEngine,
+        target: ThreadId,
+        signum: i32,
+    ) -> Result<i64, RuntimeError> {
+        let retval: i64 = if self.registry.is_live(target) {
+            crate::host_signal::publish_pending_for(target, signum);
+            self.kicker.kick(target);
+            0
+        } else {
+            -(crate::linux_abi::LINUX_ESRCH as i64)
+        };
+        self.complete_returned(engine, retval)
+    }
+
+    fn handle_thread_exit(
+        &self,
+        kernel: &Kernel,
+        engine: &mut HvfTrapEngine,
+        code: i32,
+        traps: usize,
+    ) -> VcpuLoopOutcome {
+        if let Some(addr) = self.registry.clear_child_tid(self.this_tid)
+            && addr != 0
+        {
+            let _ = engine.write_bytes(addr, &0i32.to_le_bytes());
+            self.futex.wake(addr, 1);
+        }
+        let last = self.registry.exit(self.this_tid);
+        self.kicker.unregister(self.this_tid);
+        crate::host_signal::forget_thread(self.this_tid);
+        if last {
+            let result = assemble_run_result(kernel, code, traps, false);
+            VcpuLoopOutcome::ProcessExit(Box::new(result))
+        } else {
+            VcpuLoopOutcome::ThreadDone
+        }
+    }
+
+    fn handle_execve(
+        &self,
+        kernel: &Kernel,
+        engine: &mut HvfTrapEngine,
+        path: String,
+        argv: Vec<String>,
+        env: Vec<String>,
+    ) -> Result<(), RuntimeError> {
+        crate::probes::execve_argv(&path, &argv);
+        let base = path.rsplit('/').next().unwrap_or(&path).to_owned();
+        crate::dispatch::set_host_process_name(base.as_bytes());
+        match load_execve_image(&kernel.dispatcher, &path, argv, env) {
+            Ok(img) => {
+                crate::probes::execve_loaded(
+                    &path,
+                    img.entry(),
+                    img.initial_stack_pointer().unwrap_or(0),
+                    img.regions().len() as u64,
+                );
+                kernel.dispatcher.close_cloexec_fds();
+                engine.execve_into(&img)?;
+                Ok(())
+            }
+            Err(errno) => {
+                let retval = -(errno as i64);
+                engine.complete_syscall(retval)?;
+                Ok(())
+            }
+        }
+    }
+
+    fn handle_fork(
+        &mut self,
+        kernel: &Kernel,
+        engine: &mut HvfTrapEngine,
+    ) -> Result<Option<i64>, RuntimeError> {
+        if self.registry.live_count() > 1 {
+            engine.complete_syscall(-(crate::linux_abi::LINUX_ENOSYS as i64))?;
+            return Ok(None);
+        }
+
+        let prepared_fork = kernel.fork.prepare_host_fork();
+        let fork_outcome = match engine.fork() {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                kernel
+                    .fork
+                    .restart_after_fork_error(prepared_fork, &self.kicker, &self.futex);
+                return Err(RuntimeError::Trap(error));
+            }
+        };
+
+        let retval = match fork_outcome {
+            crate::trap::ForkOutcome::Parent { child_pid } => {
+                kernel
+                    .fork
+                    .restart_after_parent_fork(prepared_fork, &self.kicker, &self.futex);
+                self.waiter = crate::io_wait::ThreadWaiter::new(self.this_tid);
+                i64::from(child_pid)
+            }
+            crate::trap::ForkOutcome::Child => {
+                kernel.dispatcher.clear_output_buffers();
+                self.this_tid = std::process::id() as ThreadId;
+                self.registry = Arc::new(ThreadRegistry::new(self.this_tid));
+                crate::thread::set_current_registry(Arc::clone(&self.registry));
+                crate::host_signal::reinit_after_fork();
+                self.waiter = crate::io_wait::ThreadWaiter::new(self.this_tid);
+                self.kicker
+                    .register(self.this_tid, engine.vcpu_kick_handle());
+                self.registry
+                    .record_thread_port(self.this_tid, crate::host_proc::current_thread_port());
+                kernel
+                    .fork
+                    .restart_after_child_fork(prepared_fork, &self.kicker, &self.futex);
+                0
+            }
+        };
+        Ok(Some(retval))
+    }
+}
+
 /// Top-level multi-threaded HVF entry. Builds the shared dispatcher lock + the
 /// thread registry + futex table, then runs the MAIN guest thread's vCPU
 /// through `run_vcpu_until_exit`. Thread-creating clones spawn sibling host
@@ -777,23 +1104,16 @@ fn run_threaded_hvf_loop(
 fn run_vcpu_until_exit(
     kernel: Kernel,
     mut engine: HvfTrapEngine,
-    mut registry: Arc<ThreadRegistry>,
+    registry: Arc<ThreadRegistry>,
     futex: Arc<FutexTable>,
-    mut this_tid: ThreadId,
+    this_tid: ThreadId,
     threads: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
     kicker: Arc<crate::vcpu_kick::VcpuKicker>,
     max_traps: usize,
 ) -> Result<VcpuLoopOutcome, RuntimeError> {
-    let trace = std::env::var_os("CARRICK_TRACE_TRAPS").is_some();
-    // Per-thread blocking-I/O waiter (owns this thread's kqueue). Recreated in
-    // a forked child below (kqueue is not inherited across fork).
-    let mut waiter = crate::io_wait::ThreadWaiter::new(this_tid);
-    // Publish this thread's vCPU so siblings can kick it out of the guest.
-    kicker.register(this_tid, engine.vcpu_kick_handle());
-    // Record this host thread's mach port so /proc/<tid>/stat can read the
-    // run/sleep state straight from the kernel (no hand-tracked flag).
-    registry.record_thread_port(this_tid, crate::host_proc::current_thread_port());
-    for traps in 1..=max_traps {
+    let mut state = ThreadRuntimeState::new(registry, futex, this_tid, threads, kicker, max_traps);
+    state.register_vcpu(&engine);
+    for traps in 1..=state.max_traps {
         // ---- vCPU run: NO dispatcher lock held ----
         let frame = match engine.next_syscall()? {
             Some(f) => f,
@@ -803,58 +1123,27 @@ fn run_vcpu_until_exit(
                 // the interrupted PC, then resume. A spurious kick with nothing
                 // deliverable just costs this one extra iteration.
                 let pc = engine.current_pc()?;
-                if let Some(outcome) =
-                    service_signals_threaded(&kernel, &mut engine, this_tid, None, Some(pc), traps)?
-                {
+                if let Some(outcome) = service_signals_threaded(
+                    &kernel,
+                    &mut engine,
+                    state.this_tid,
+                    None,
+                    Some(pc),
+                    traps,
+                )? {
                     return Ok(outcome);
                 }
                 continue;
             }
         };
-        if trace {
-            let name = crate::syscall::lookup_aarch64(frame.x8)
-                .map(|s| s.name)
-                .unwrap_or("<unknown>");
-            eprintln!(
-                "tid#{this_tid} trap#{traps}: x8={} ({name}) x0={:#x} x1={:#x} x2={:#x} x3={:#x} x4={:#x}",
-                frame.x8, frame.x0, frame.x1, frame.x2, frame.x3, frame.x4
-            );
-        }
+        state.trace_syscall(traps, frame);
 
         // ---- syscall service: no dispatcher-wide lock held ----
         // A blocking-mode I/O syscall returns WaitOnFds; we then wait on the
         // host fds without holding subsystem locks so sibling threads run.
         // On readiness we re-dispatch; on timeout / signal we synthesize the
         // terminal outcome.
-        let outcome = loop {
-            let request = SyscallRequest::from_aarch64_frame(frame);
-            let oc = kernel.dispatcher.dispatch_threaded(
-                request,
-                &mut engine,
-                &kernel.reporter,
-                this_tid,
-                &registry,
-                &futex,
-            )?;
-            match oc {
-                DispatchOutcome::WaitOnFds {
-                    fds,
-                    timeout,
-                    on_timeout,
-                } => match waiter.wait(&fds, timeout) {
-                    crate::io_wait::WaitResult::Ready => continue,
-                    crate::io_wait::WaitResult::TimedOut => {
-                        break DispatchOutcome::Returned { value: on_timeout };
-                    }
-                    crate::io_wait::WaitResult::Interrupted => {
-                        break DispatchOutcome::Errno {
-                            errno: crate::linux_abi::LINUX_EINTR,
-                        };
-                    }
-                },
-                other => break other,
-            }
-        };
+        let outcome = state.service_threaded_syscall(&kernel, &mut engine, frame)?;
 
         let mut last_syscall_retval: Option<i64> = None;
 
@@ -871,8 +1160,8 @@ fn run_vcpu_until_exit(
                 // exit_group, or exit(2) as the last live thread. Tear the
                 // whole process down. For the main thread we return a
                 // RunResult; siblings just terminate the process.
-                let last = registry.exit(this_tid);
-                if !last && this_tid != (std::process::id() as ThreadId) {
+                let last = state.registry.exit(state.this_tid);
+                if !last && state.this_tid != (std::process::id() as ThreadId) {
                     // A sibling ran exit_group(94): flush shared buffers and
                     // terminate the entire process (other threads share it).
                     let _ = std::io::Write::flush(&mut std::io::stdout());
@@ -887,13 +1176,10 @@ fn run_vcpu_until_exit(
                 return Ok(VcpuLoopOutcome::ProcessExit(Box::new(result)));
             }
             DispatchOutcome::Returned { value } => {
-                engine.complete_syscall(value)?;
-                last_syscall_retval = Some(value);
+                last_syscall_retval = Some(state.complete_returned(&mut engine, value)?);
             }
             DispatchOutcome::Errno { errno } => {
-                let v = -(errno as i64);
-                engine.complete_syscall(v)?;
-                last_syscall_retval = Some(v);
+                last_syscall_retval = Some(state.complete_errno(&mut engine, errno)?);
             }
             DispatchOutcome::FutexWait { wait, timeout } => {
                 // Block with the dispatcher lock RELEASED so a sibling FUTEX_WAKE
@@ -901,20 +1187,8 @@ fn run_vcpu_until_exit(
                 // so even an all-threads-parked process delivers it; the
                 // ungated signal check below then runs. Re-lock only to
                 // complete the syscall.
-                use crate::thread::FutexWaitOutcome;
-                // Interrupt the wait only for a signal deliverable to THIS
-                // thread (its own tgkill target or a process-directed one) —
-                // not a sibling's, which would surface a spurious EINTR.
-                let retval: i64 =
-                    match futex.wait_prepared_for_thread(wait, timeout, this_tid, &|| {
-                        crate::host_signal::has_pending_for(this_tid)
-                    }) {
-                        FutexWaitOutcome::Woken => 0,
-                        FutexWaitOutcome::TimedOut => -(crate::linux_abi::LINUX_ETIMEDOUT as i64),
-                        FutexWaitOutcome::Interrupted => -(crate::linux_abi::LINUX_EINTR as i64),
-                    };
-                engine.complete_syscall(retval)?;
-                last_syscall_retval = Some(retval);
+                last_syscall_retval =
+                    Some(state.complete_futex_wait(&mut engine, wait, timeout)?);
             }
             DispatchOutcome::SharedFutexWait {
                 host_addr,
@@ -924,9 +1198,12 @@ fn run_vcpu_until_exit(
                 // Cross-process futex (MAP_SHARED): block on the host __ulock
                 // keyed by the shared physical page, with the dispatcher lock
                 // released. Interruptible by a signal deliverable to this thread.
-                let retval = shared_futex_wait(host_addr, value, timeout, this_tid);
-                engine.complete_syscall(retval)?;
-                last_syscall_retval = Some(retval);
+                last_syscall_retval = Some(state.complete_shared_futex_wait(
+                    &mut engine,
+                    host_addr,
+                    value,
+                    timeout,
+                )?);
             }
             DispatchOutcome::CloneThread {
                 stack,
@@ -935,157 +1212,28 @@ fn run_vcpu_until_exit(
                 parent_tid_addr,
                 child_tid_addr,
             } => {
-                const CLONE_CHILD_CLEARTID: u64 = 0x00200000;
-                const CLONE_CHILD_SETTID: u64 = 0x01000000;
-                // The flags were already validated by the dispatcher; recover
-                // the clear/settid intents from the addrs it passed (it only
-                // sets child_tid_addr when one of those flags is present).
-                let clear_addr = if child_tid_addr != 0 {
-                    child_tid_addr
-                } else {
-                    0
-                };
-
-                // Allocate the child tid + register it (under the dispatcher lock
-                // for ordering with live_count/exit, though the registry has
-                // its own lock).
-                let tid = registry.register_child(clear_addr);
-
-                // Write parent_tid / child_tid (i32 LE) into guest memory as
-                // requested by CLONE_PARENT_SETTID / CLONE_CHILD_SETTID. The
-                // dispatcher passes the addrs only when the flag is set.
-                let tid_bytes = tid.to_le_bytes();
-                if parent_tid_addr != 0 {
-                    let _ = engine.write_bytes(parent_tid_addr, &tid_bytes);
-                }
-                let _ = CLONE_CHILD_SETTID;
-                let _ = CLONE_CHILD_CLEARTID;
-                if child_tid_addr != 0 {
-                    // CLONE_CHILD_SETTID writes the tid; CLONE_CHILD_CLEARTID
-                    // wants it cleared on exit (recorded above). Writing the
-                    // tid here is correct for SETTID and harmless for a pure
-                    // CLEARTID word the child will overwrite. glibc passes the
-                    // same address for both.
-                    let _ = engine.write_bytes(child_tid_addr, &tid_bytes);
-                }
-
-                // Build the child spec (snapshot parent regs + share VM +
-                // mapping descriptors) BEFORE the parent resumes.
-                let spec = engine.build_thread_spec(stack, tls)?;
-
-                // Spawn the sibling host thread.
-                let child_kernel = Arc::clone(&kernel);
-                let child_registry = Arc::clone(&registry);
-                let child_futex = Arc::clone(&futex);
-                let child_threads = Arc::clone(&threads);
-                let child_kicker = Arc::clone(&kicker);
-                let handle = std::thread::Builder::new()
-                    .name(format!("guest-tid-{tid}"))
-                    .spawn(move || {
-                        if std::env::var_os("CARRICK_TRACE_TRAPS").is_some() {
-                            eprintln!("[sibling tid#{tid}] thread started, building vCPU");
-                        }
-                        match HvfTrapEngine::from_thread_spec(spec) {
-                            Ok(child_engine) => {
-                                if std::env::var_os("CARRICK_TRACE_TRAPS").is_some() {
-                                    let pc = child_engine.program_counter().unwrap_or(0);
-                                    eprintln!("[sibling tid#{tid}] vCPU built, pc={pc:#x}, entering loop");
-                                }
-                                let r = run_vcpu_until_exit(
-                                    child_kernel,
-                                    child_engine,
-                                    child_registry,
-                                    child_futex,
-                                    tid,
-                                    child_threads,
-                                    child_kicker,
-                                    max_traps,
-                                );
-                                if let Err(e) = r {
-                                    tracing::error!(tid, error = %e, "thread sibling vCPU loop failed");
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!(tid, error = %e, "thread sibling vCPU failed to start");
-                                // Remove the failed thread so live_count stays
-                                // accurate (parent already saw tid via clone).
-                                child_registry.exit(tid);
-                            }
-                        }
-                    })
-                    .map_err(|e| RuntimeError::Trap(TrapError::Hypervisor(format!(
-                        "spawn guest thread failed: {e}"
-                    ))))?;
-                threads.lock().push(handle);
-
-                // Parent's clone(2) returns the child tid.
-                engine.complete_syscall(tid as i64)?;
+                let tid = state.spawn_clone_thread(
+                    &kernel,
+                    &mut engine,
+                    stack,
+                    tls,
+                    parent_tid_addr,
+                    child_tid_addr,
+                )?;
+                state.complete_returned(&mut engine, tid as i64)?;
             }
             DispatchOutcome::ThreadExit { code } => {
-                // CLONE_CHILD_CLEARTID: zero the word + wake one waiter.
-                if let Some(addr) = registry.clear_child_tid(this_tid)
-                    && addr != 0
-                {
-                    let _ = engine.write_bytes(addr, &0i32.to_le_bytes());
-                    futex.wake(addr, 1);
-                }
-                let last = registry.exit(this_tid);
-                // No more kicks for a thread that's gone; drop its stale
-                // pending too so a recycled tid starts clean.
-                kicker.unregister(this_tid);
-                crate::host_signal::forget_thread(this_tid);
-                if last {
-                    let result = assemble_run_result(&kernel, code, traps, false);
-                    return Ok(VcpuLoopOutcome::ProcessExit(Box::new(result)));
-                }
-                // Not last: this host thread is done. Its vCPU + VM-clone Arc
-                // leak to process exit (the forked-child Drop discipline).
-                return Ok(VcpuLoopOutcome::ThreadDone);
+                return Ok(state.handle_thread_exit(&kernel, &mut engine, code, traps));
             }
             DispatchOutcome::SignalThread {
                 tid: target,
                 signum,
             } => {
-                // tgkill/tkill to a sibling: publish the signal for the target
-                // tid and force its vCPU out of the guest so it delivers at its
-                // next safe point. -ESRCH if it raced to exit.
-                let retval: i64 = if registry.is_live(target) {
-                    crate::host_signal::publish_pending_for(target, signum);
-                    kicker.kick(target);
-                    0
-                } else {
-                    -(crate::linux_abi::LINUX_ESRCH as i64)
-                };
-                engine.complete_syscall(retval)?;
-                last_syscall_retval = Some(retval);
+                last_syscall_retval =
+                    Some(state.complete_signal_thread(&mut engine, target, signum)?);
             }
             DispatchOutcome::Execve { path, argv, env } => {
-                crate::probes::execve_argv(&path, &argv);
-                let base = path.rsplit('/').next().unwrap_or(&path).to_owned();
-                crate::dispatch::set_host_process_name(base.as_bytes());
-                #[allow(clippy::expect_used)]
-                let image = {
-                    let res = load_execve_image(&kernel.dispatcher, &path, argv, env);
-                    match res {
-                        Ok(img) => {
-                            crate::probes::execve_loaded(
-                                &path,
-                                img.entry(),
-                                img.initial_stack_pointer().unwrap_or(0),
-                                img.regions().len() as u64,
-                            );
-                            kernel.dispatcher.close_cloexec_fds();
-                            Some(img)
-                        }
-                        Err(errno) => {
-                            engine.complete_syscall(-(errno as i64))?;
-                            None
-                        }
-                    }
-                };
-                if let Some(img) = image {
-                    engine.execve_into(&img)?;
-                }
+                state.handle_execve(&kernel, &mut engine, path, argv, env)?;
             }
             DispatchOutcome::SigReturn => {
                 engine.restore_from_sigframe()?;
@@ -1095,79 +1243,8 @@ fn run_vcpu_until_exit(
                 // when delivered, so this can't re-deliver it.
             }
             DispatchOutcome::Fork => {
-                // Process-creating fork. Real macOS fork of a MULTI-vCPU HVF
-                // process is unsafe (other vCPUs/threads would be left in an
-                // inconsistent HVF state), so only allow it when this is the
-                // sole live guest thread — which is the overwhelmingly common
-                // case (apt's http method, dpkg's tar subprocess, etc. fork
-                // before any pthread_create). With siblings alive, surface
-                // ENOSYS so glibc falls back rather than wedging the VM.
-                if registry.live_count() > 1 {
-                    engine.complete_syscall(-(crate::linux_abi::LINUX_ENOSYS as i64))?;
-                } else {
-                    // The signal pump is an extra Carrick host thread even
-                    // when the guest has only one vCPU. Join it before the
-                    // real macOS fork, then restart fresh pump state on both
-                    // sides after HVF rebuild.
-                    let prepared_fork = kernel.fork.prepare_host_fork();
-                    let fork_outcome = match engine.fork() {
-                        Ok(outcome) => outcome,
-                        Err(error) => {
-                            kernel
-                                .fork
-                                .restart_after_fork_error(prepared_fork, &kicker, &futex);
-                            return Err(RuntimeError::Trap(error));
-                        }
-                    };
-                    let retval: i64 = match fork_outcome {
-                        crate::trap::ForkOutcome::Parent { child_pid } => {
-                            kernel
-                                .fork
-                                .restart_after_parent_fork(prepared_fork, &kicker, &futex);
-                            waiter = crate::io_wait::ThreadWaiter::new(this_tid);
-                            i64::from(child_pid)
-                        }
-                        crate::trap::ForkOutcome::Child => {
-                            kernel.dispatcher.clear_output_buffers();
-                            // A forked process is single-threaded by definition
-                            // (fork copies only the calling thread). Reset to a
-                            // fresh registry keyed by the child's host pid so
-                            // gettid/getpid/kill-self all agree (the inherited
-                            // registry could carry stale sibling tids from the
-                            // parent, breaking self-signal targeting). live_count
-                            // becomes 1, restoring single-threaded signal
-                            // delivery + real fork in the child.
-                            this_tid = std::process::id() as ThreadId;
-                            registry = Arc::new(ThreadRegistry::new(this_tid));
-                            crate::thread::set_current_registry(Arc::clone(&registry));
-                            // kqueue isn't inherited across fork; the self-pipe
-                            // is shared with the parent. Fresh ones for the child.
-                            crate::host_signal::reinit_after_fork();
-                            waiter = crate::io_wait::ThreadWaiter::new(this_tid);
-                            // The fork rebuilt the vCPU; publish the child's
-                            // handle under its new tid (the inherited map's
-                            // parent entries point at dead vCPUs and are inert).
-                            kicker.register(this_tid, engine.vcpu_kick_handle());
-                            registry.record_thread_port(
-                                this_tid,
-                                crate::host_proc::current_thread_port(),
-                            );
-                            // The signal-pump daemon (which forces a vCPU out of
-                            // hv_vcpu_run on a process-directed signal) does not
-                            // survive fork — only the calling thread does. Without
-                            // it, an async signal (a timer's SIGALRM, a
-                            // cross-process kill) can't preempt a child spinning
-                            // in guest userspace. Re-spawn it on the child's fresh
-                            // self-pipe. (LTP setitimer01's child busy-waits for
-                            // its ITIMER signal.)
-                            kernel
-                                .fork
-                                .restart_after_child_fork(prepared_fork, &kicker, &futex);
-                            0
-                        }
-                    };
-                    engine.complete_syscall(retval)?;
-                    last_syscall_retval = Some(retval);
+                if let Some(retval) = state.handle_fork(&kernel, &mut engine)? {
+                    last_syscall_retval = Some(state.complete_returned(&mut engine, retval)?);
                 }
             }
         }
@@ -1182,7 +1259,7 @@ fn run_vcpu_until_exit(
         if let Some(outcome) = service_signals_threaded(
             &kernel,
             &mut engine,
-            this_tid,
+            state.this_tid,
             last_syscall_retval,
             None,
             traps,
@@ -1191,7 +1268,7 @@ fn run_vcpu_until_exit(
         }
     }
 
-    let result = assemble_run_result(&kernel, -1, max_traps, true);
+    let result = assemble_run_result(&kernel, -1, state.max_traps, true);
     Ok(VcpuLoopOutcome::TrapLimit(Box::new(result)))
 }
 
