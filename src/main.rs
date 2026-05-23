@@ -172,6 +172,27 @@ enum Commands {
         /// sudoers — CLI args survive sudo where env vars don't.
         #[arg(long = "forward-env", value_name = "KEY=VAL")]
         forward_env: Vec<String>,
+        /// Internal: original uid before auto-sudo. The trace parent keeps
+        /// root for libdtrace, but the traced child drops to this uid.
+        #[arg(long = "trace-uid", hide = true)]
+        trace_uid: Option<u32>,
+        /// Internal: original gid before auto-sudo.
+        #[arg(long = "trace-gid", hide = true)]
+        trace_gid: Option<u32>,
+        /// Internal: original supplementary groups before auto-sudo.
+        #[arg(long = "trace-groups", hide = true, value_delimiter = ',')]
+        trace_groups: Vec<u32>,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+    #[command(name = "__trace-child", hide = true)]
+    TraceChild {
+        #[arg(long = "trace-uid")]
+        trace_uid: u32,
+        #[arg(long = "trace-gid")]
+        trace_gid: u32,
+        #[arg(long = "trace-groups", value_delimiter = ',')]
+        trace_groups: Vec<u32>,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
@@ -337,9 +358,12 @@ fn main() -> anyhow::Result<()> {
         .init();
     register_dtrace_probes();
 
-    let cli = Cli::parse();
-    let store = cli
-        .store
+    run_cli(Cli::parse())
+}
+
+fn run_cli(cli: Cli) -> anyhow::Result<()> {
+    let Cli { store, command } = cli;
+    let store = store
         .map(ImageStore::new)
         .unwrap_or_else(ImageStore::default_for_user);
 
@@ -347,7 +371,7 @@ fn main() -> anyhow::Result<()> {
     // /bin/sh: normalise it to `Run` with a pty when stdin is a terminal (raw
     // streaming otherwise, so piped input still works). This reuses the entire
     // run path (image pull, fs backend, pty relay) with zero duplication.
-    let command = match cli.command {
+    let command = match command {
         Commands::Shell { image } => {
             // SAFETY: isatty on fd 0 is a simple syscall returning 0/1.
             let interactive = unsafe { libc::isatty(0) } == 1;
@@ -759,12 +783,31 @@ fn main() -> anyhow::Result<()> {
                 println!("{}", serde_json::to_string_pretty(&state)?);
             }
         },
+        Commands::TraceChild {
+            trace_uid,
+            trace_gid,
+            trace_groups,
+            command,
+        } => {
+            #[cfg(target_os = "macos")]
+            {
+                exec_trace_child(trace_uid, trace_gid, &trace_groups, &command)?;
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = (trace_uid, trace_gid, trace_groups, command);
+                bail!("trace child execution is only available on macOS.");
+            }
+        }
         Commands::Trace {
             flowindent,
             script,
             trace_out,
             command,
             forward_env,
+            trace_uid,
+            trace_gid,
+            trace_groups,
         } => {
             #[cfg(target_os = "macos")]
             {
@@ -791,10 +834,11 @@ fn main() -> anyhow::Result<()> {
                     // Plain `sudo` resets the environment (env_reset), which
                     // would drop the CARRICK_* knobs the trace'd run needs
                     // (CARRICK_INSECURE_REGISTRIES, CARRICK_WATCH_ADDR,
-                    // CARRICK_PULL_PLATFORM, CARRICK_HOME, …). Carry them across
-                    // as `--forward-env KEY=VAL` CLI args (which survive sudo,
-                    // unlike env vars, and don't need SETENV in sudoers); the
-                    // re-exec'd carrick sets them before spawning the child.
+                    // CARRICK_PULL_PLATFORM, CARRICK_HOME, …). Carry those and
+                    // the user identity env (`HOME`, `USER`, `LOGNAME`, `SHELL`)
+                    // across as `--forward-env KEY=VAL` CLI args (which survive
+                    // sudo, unlike env vars, and don't need SETENV in sudoers);
+                    // the re-exec'd carrick sets them before spawning the child.
                     let mut forwarded: Vec<std::ffi::OsString> =
                         vec![me.as_os_str().to_owned(), std::ffi::OsString::from("trace")];
                     if flowindent {
@@ -808,8 +852,20 @@ fn main() -> anyhow::Result<()> {
                         forwarded.push(std::ffi::OsString::from("--trace-out"));
                         forwarded.push(o.as_os_str().to_owned());
                     }
+                    forwarded.push(std::ffi::OsString::from("--trace-uid"));
+                    forwarded.push(unsafe { libc::getuid() }.to_string().into());
+                    forwarded.push(std::ffi::OsString::from("--trace-gid"));
+                    forwarded.push(unsafe { libc::getgid() }.to_string().into());
+                    let groups = current_supplementary_groups();
+                    if !groups.is_empty() {
+                        forwarded.push(std::ffi::OsString::from("--trace-groups"));
+                        forwarded.push(join_ids(&groups).into());
+                    }
                     for (k, v) in std::env::vars_os() {
-                        if k.to_string_lossy().starts_with("CARRICK_") {
+                        let key = k.to_string_lossy();
+                        if key.starts_with("CARRICK_")
+                            || matches!(key.as_ref(), "HOME" | "USER" | "LOGNAME" | "SHELL")
+                        {
                             forwarded.push(std::ffi::OsString::from("--forward-env"));
                             let mut kv = k;
                             kv.push("=");
@@ -833,13 +889,23 @@ fn main() -> anyhow::Result<()> {
                     flowindent,
                     script: script_src,
                     out_path: trace_out.as_ref().map(|p| p.to_string_lossy().into_owned()),
+                    drop_credentials: trace_drop_credentials(trace_uid, trace_gid, &trace_groups),
                 };
                 carrick::dtrace_consumer::run_child_under_dtrace(&me, &command, &opts)
                     .map_err(|e| anyhow::anyhow!("trace failed: {}", e))?;
             }
             #[cfg(not(target_os = "macos"))]
             {
-                let _ = (flowindent, script, trace_out, command);
+                let _ = (
+                    flowindent,
+                    script,
+                    trace_out,
+                    command,
+                    forward_env,
+                    trace_uid,
+                    trace_gid,
+                    trace_groups,
+                );
                 bail!("carrick trace is only available on macOS (libdtrace).");
             }
         }
@@ -1058,6 +1124,91 @@ fn probe_case_sensitive(path: &Path) -> std::io::Result<bool> {
     };
     let _ = std::fs::remove_file(&lower);
     Ok(sensitive)
+}
+
+#[cfg(target_os = "macos")]
+fn current_supplementary_groups() -> Vec<u32> {
+    let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    if count <= 0 {
+        return Vec::new();
+    }
+    let mut groups = vec![0 as libc::gid_t; count as usize];
+    let n = unsafe { libc::getgroups(count, groups.as_mut_ptr()) };
+    if n <= 0 {
+        return Vec::new();
+    }
+    groups.truncate(n as usize);
+    groups.into_iter().map(|g| g as u32).collect()
+}
+
+#[cfg(target_os = "macos")]
+fn join_ids(ids: &[u32]) -> String {
+    ids.iter().map(u32::to_string).collect::<Vec<_>>().join(",")
+}
+
+#[cfg(target_os = "macos")]
+fn trace_drop_credentials(
+    trace_uid: Option<u32>,
+    trace_gid: Option<u32>,
+    trace_groups: &[u32],
+) -> Option<carrick::dtrace_consumer::TraceDropCredentials> {
+    let (uid, gid) = match (trace_uid, trace_gid) {
+        (Some(uid), Some(gid)) => (uid, gid),
+        _ => {
+            let uid = std::env::var("SUDO_UID").ok()?.parse().ok()?;
+            let gid = std::env::var("SUDO_GID").ok()?.parse().ok()?;
+            (uid, gid)
+        }
+    };
+
+    Some(carrick::dtrace_consumer::TraceDropCredentials {
+        uid,
+        gid,
+        groups: normalize_trace_groups(gid, trace_groups),
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn normalize_trace_groups(primary_gid: u32, groups: &[u32]) -> Vec<u32> {
+    let mut normalized = if groups.is_empty() {
+        vec![primary_gid]
+    } else {
+        groups.to_vec()
+    };
+    if !normalized.contains(&primary_gid) {
+        normalized.insert(0, primary_gid);
+    }
+    normalized
+}
+
+#[cfg(target_os = "macos")]
+fn exec_trace_child(
+    trace_uid: u32,
+    trace_gid: u32,
+    trace_groups: &[u32],
+    command: &[String],
+) -> anyhow::Result<()> {
+    if command.is_empty() {
+        bail!("trace child needs a carrick subcommand to dispatch");
+    }
+
+    let groups = normalize_trace_groups(trace_gid, trace_groups);
+    let groups: Vec<libc::gid_t> = groups.into_iter().map(|g| g as libc::gid_t).collect();
+    if unsafe { libc::setgroups(groups.len() as libc::c_int, groups.as_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("trace child failed to set supplementary groups");
+    }
+    if unsafe { libc::setgid(trace_gid as libc::gid_t) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("trace child failed to set gid");
+    }
+    if unsafe { libc::setuid(trace_uid as libc::uid_t) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("trace child failed to set uid");
+    }
+
+    let mut argv = Vec::with_capacity(command.len() + 1);
+    argv.push("carrick".to_owned());
+    argv.extend(command.iter().cloned());
+    run_cli(Cli::parse_from(argv))
 }
 
 /// When `--raw` is set, emit the guest's buffered stdout/stderr to the
