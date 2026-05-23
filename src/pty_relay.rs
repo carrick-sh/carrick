@@ -48,8 +48,28 @@ extern "C" fn handle_sigwinch(_signum: libc::c_int) {
 /// guest's slave sees the resize.
 pub(crate) fn propagate_winsize(tty_fd: RawFd, master_fd: RawFd) {
     if let Some(ws) = read_winsize(tty_fd) {
-        // SAFETY: master_fd is a live pty master; &ws is a valid winsize.
-        unsafe { libc::ioctl(master_fd, libc::TIOCSWINSZ, &ws) };
+        apply_winsize(master_fd, &ws);
+    }
+}
+
+pub(crate) fn apply_winsize(tty_fd: RawFd, ws: &libc::winsize) {
+    with_sigttou_blocked(|| unsafe {
+        // SAFETY: tty_fd is a live pty fd; ws is a valid winsize.
+        libc::ioctl(tty_fd, libc::TIOCSWINSZ, ws);
+    });
+}
+
+fn with_sigttou_blocked(f: impl FnOnce()) {
+    unsafe {
+        let mut set: libc::sigset_t = core::mem::zeroed();
+        let mut old: libc::sigset_t = core::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGTTOU);
+        let masked = libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old) == 0;
+        f();
+        if masked {
+            libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
+        }
     }
 }
 
@@ -57,7 +77,10 @@ pub(crate) fn propagate_winsize(tty_fd: RawFd, master_fd: RawFd) {
 fn read_winsize(fd: RawFd) -> Option<libc::winsize> {
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
     // SAFETY: fd is a live fd; ws is a valid winsize out-param.
-    if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) } == 0 {
+    if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) } == 0
+        && ws.ws_row != 0
+        && ws.ws_col != 0
+    {
         Some(ws)
     } else {
         None
@@ -118,6 +141,7 @@ pub struct PtyRelay {
     thread: Option<JoinHandle<()>>,
     raw_active: bool,
     real_in_for_restore: RawFd,
+    real_out_for_close: RawFd,
     /// Read end of the SIGWINCH self-pipe, or `-1` if SIGWINCH is not wired
     /// (test path). Closed by `stop()`.
     winch_r: RawFd,
@@ -146,8 +170,27 @@ impl PtyRelay {
     /// SIGWINCH propagation, and start the relay between (real_in, real_out)
     /// and the master.
     pub fn start(real_in: RawFd, real_out: RawFd) -> io::Result<Self> {
-        crate::host_tty::make_raw(real_in)?;
         let pair = PtyPair::allocate()?;
+        Self::start_with_pair(pair, real_in, real_out)
+    }
+
+    /// Production entry using a pty allocated before the runtime child is
+    /// forked. The interactive supervisor uses this to set the child pgrp as
+    /// foreground before any relay traffic reaches the guest.
+    pub fn start_with_pair(pair: PtyPair, real_in: RawFd, real_out: RawFd) -> io::Result<Self> {
+        Self::start_with_pair_and_winsize(pair, real_in, real_out, -1)
+    }
+
+    /// Same as [`Self::start_with_pair`], but also watches `winsize_r` for
+    /// `libc::winsize` messages from a helper that stayed in the original
+    /// terminal session.
+    pub fn start_with_pair_and_winsize(
+        pair: PtyPair,
+        real_in: RawFd,
+        real_out: RawFd,
+        winsize_r: RawFd,
+    ) -> io::Result<Self> {
+        crate::host_tty::make_raw(real_in)?;
 
         // ── SIGWINCH self-pipe ───────────────────────────────────────────────
         // Create a non-blocking pipe: handler writes, relay loop reads.
@@ -189,10 +232,12 @@ impl PtyRelay {
             old
         };
 
-        // Propagate initial size before the guest sees any data.
-        propagate_winsize(real_in, pair.master_fd);
+        // Propagate initial size before the guest sees any data. In the
+        // supervisor path the slave is the controlling tty, so drive window
+        // changes through that side of the pty.
+        propagate_winsize(real_in, pair.slave_fd);
 
-        let mut relay = Self::start_inner(pair, real_in, real_out, winch_r)?;
+        let mut relay = Self::start_inner(pair, real_in, real_out, winch_r, winsize_r)?;
         relay.raw_active = true;
         relay.winch_r = winch_r;
         relay.winch_w = winch_w;
@@ -204,7 +249,7 @@ impl PtyRelay {
     /// the process-global SIGWINCH handler (tests must not disturb signal state).
     #[cfg(test)]
     pub fn start_for_test(real_in: RawFd, real_out: RawFd) -> io::Result<Self> {
-        let mut relay = Self::start_inner(PtyPair::allocate()?, real_in, real_out, -1)?;
+        let mut relay = Self::start_inner(PtyPair::allocate()?, real_in, real_out, -1, -1)?;
         relay.raw_active = false;
         Ok(relay)
     }
@@ -217,6 +262,7 @@ impl PtyRelay {
         real_in: RawFd,
         real_out: RawFd,
         winch_r: RawFd,
+        winsize_r: RawFd,
     ) -> io::Result<Self> {
         let mut sp = [0i32; 2];
         // SAFETY: sp is a 2-int array for pipe(2).
@@ -225,10 +271,20 @@ impl PtyRelay {
         }
         let (shutdown_r, shutdown_w) = (sp[0], sp[1]);
         let master = pair.master_fd;
+        let winsize_target = pair.slave_fd;
         let thread = match std::thread::Builder::new()
             .name("pty-relay".into())
-            .spawn(move || relay_loop(real_in, real_out, master, shutdown_r, winch_r))
-        {
+            .spawn(move || {
+                relay_loop(
+                    real_in,
+                    real_out,
+                    master,
+                    winsize_target,
+                    shutdown_r,
+                    winch_r,
+                    winsize_r,
+                )
+            }) {
             Ok(t) => t,
             Err(e) => {
                 // SAFETY: these fds are owned here and not yet handed off.
@@ -237,6 +293,9 @@ impl PtyRelay {
                     libc::close(shutdown_w);
                     libc::close(pair.master_fd);
                     libc::close(pair.slave_fd);
+                    if winsize_r >= 0 {
+                        libc::close(winsize_r);
+                    }
                 }
                 return Err(e);
             }
@@ -247,6 +306,7 @@ impl PtyRelay {
             thread: Some(thread),
             raw_active: false,
             real_in_for_restore: real_in,
+            real_out_for_close: real_out,
             winch_r,
             winch_w: -1,
             old_sigwinch: None,
@@ -289,6 +349,12 @@ impl PtyRelay {
             if self.winch_w >= 0 {
                 libc::close(self.winch_w);
             }
+            if self.real_in_for_restore >= 0 {
+                libc::close(self.real_in_for_restore);
+            }
+            if self.real_out_for_close >= 0 && self.real_out_for_close != self.real_in_for_restore {
+                libc::close(self.real_out_for_close);
+            }
         }
     }
 }
@@ -308,7 +374,15 @@ impl PtyRelay {
 /// every poll wakeup (timeout or signal) and propagating on change — the
 /// SIGWINCH self-pipe is only a low-latency nudge (its handler is unreliable
 /// under HVF).
-fn relay_loop(real_in: RawFd, real_out: RawFd, master: RawFd, shutdown_r: RawFd, winch_r: RawFd) {
+fn relay_loop(
+    real_in: RawFd,
+    real_out: RawFd,
+    master: RawFd,
+    winsize_target: RawFd,
+    shutdown_r: RawFd,
+    winch_r: RawFd,
+    winsize_r: RawFd,
+) {
     // Ensure SIGWINCH is deliverable on THIS thread so the handler can wake the
     // relay. carrick's process signal mask (set up by HVF/runtime init) may
     // block it on threads spawned later; unblock it explicitly here.
@@ -325,9 +399,11 @@ fn relay_loop(real_in: RawFd, real_out: RawFd, master: RawFd, shutdown_r: RawFd,
     const IDX_MASTER: usize = 1;
     const IDX_SHUTDOWN: usize = 2;
     const IDX_WINCH: usize = 3;
+    const IDX_WINSIZE: usize = 4;
 
     // If winch_r == -1, set events = 0 so poll never wakes for it.
     let winch_events = if winch_r >= 0 { libc::POLLIN } else { 0 };
+    let winsize_events = if winsize_r >= 0 { libc::POLLIN } else { 0 };
     let mut fds = [
         libc::pollfd {
             fd: real_in,
@@ -349,6 +425,11 @@ fn relay_loop(real_in: RawFd, real_out: RawFd, master: RawFd, shutdown_r: RawFd,
             events: winch_events,
             revents: 0,
         },
+        libc::pollfd {
+            fd: winsize_r,
+            events: winsize_events,
+            revents: 0,
+        },
     ];
     let mut buf = [0u8; 4096];
     // Track the last window size we propagated. SIGWINCH delivery is unreliable
@@ -366,8 +447,8 @@ fn relay_loop(real_in: RawFd, real_out: RawFd, master: RawFd, shutdown_r: RawFd,
     // 250ms to check for resizes; the test path (-1) blocks indefinitely.
     let poll_timeout = if winch_r >= 0 { 250 } else { -1 };
     loop {
-        // SAFETY: fds is a valid 4-element pollfd array.
-        let n = unsafe { libc::poll(fds.as_mut_ptr(), 4, poll_timeout) };
+        // SAFETY: fds is a valid pollfd array.
+        let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, poll_timeout) };
         if n < 0 {
             let e = io::Error::last_os_error();
             if e.kind() == io::ErrorKind::Interrupted {
@@ -392,6 +473,12 @@ fn relay_loop(real_in: RawFd, real_out: RawFd, master: RawFd, shutdown_r: RawFd,
                 }
             }
         }
+        if n > 0 && fds[IDX_WINSIZE].revents & libc::POLLIN != 0 {
+            while let Some(ws) = read_winsize_message(winsize_r) {
+                apply_winsize(winsize_target, &ws);
+                last_ws = Some(ws);
+            }
+        }
         // Robust resize handling: on every wakeup (data, timeout, or SIGWINCH)
         // re-read the terminal size and propagate if it changed.
         if winch_r >= 0
@@ -401,8 +488,7 @@ fn relay_loop(real_in: RawFd, real_out: RawFd, master: RawFd, shutdown_r: RawFd,
                 .as_ref()
                 .is_none_or(|prev| winsize_changed(prev, &cur));
             if changed {
-                // SAFETY: master is a live pty master; &cur is a valid winsize.
-                unsafe { libc::ioctl(master, libc::TIOCSWINSZ, &cur) };
+                apply_winsize(winsize_target, &cur);
                 last_ws = Some(cur);
             }
         }
@@ -435,6 +521,21 @@ fn relay_loop(real_in: RawFd, real_out: RawFd, master: RawFd, shutdown_r: RawFd,
     // Close winch_r if one was provided (production path).
     if winch_r >= 0 {
         unsafe { libc::close(winch_r) };
+    }
+    if winsize_r >= 0 {
+        unsafe { libc::close(winsize_r) };
+    }
+}
+
+fn read_winsize_message(fd: RawFd) -> Option<libc::winsize> {
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    let ptr = &mut ws as *mut libc::winsize as *mut libc::c_void;
+    let len = std::mem::size_of::<libc::winsize>();
+    let n = unsafe { libc::read(fd, ptr, len) };
+    if n == len as isize && ws.ws_row != 0 && ws.ws_col != 0 {
+        Some(ws)
+    } else {
+        None
     }
 }
 

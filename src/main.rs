@@ -248,51 +248,33 @@ enum RootfsCommand {
 /// Wire up guest stdio for a run.
 ///
 /// For a non-interactive `--raw` run this just enables stdio streaming. For an
-/// interactive `-t` run it allocates a host pty, hands the slave to the guest as
-/// fds 0/1/2, adopts the pty as the controlling terminal (`setsid`+`TIOCSCTTY`)
-/// so the host line discipline delivers Ctrl-C to the guest's foreground job,
-/// and starts the relay between the pty master and the user's real terminal.
-///
-/// NOTE: this gives an interactive shell with line editing, ttyname/`/dev/tty`,
-/// resize, and Ctrl-C interruption of the foreground command — but NOT full
-/// bg/fg job control (Ctrl-Z + `fg`). Full job control needs the shell to run
-/// in a non-orphaned process group under a session-leader supervisor; that
-/// restructure is tracked separately (it bottoms out in carrick's guest-fork
-/// IO/signal machinery not surviving a supervisor fork — see
-/// docs/superpowers/specs and the project memory).
+/// interactive `-t` run it forks a session-leader supervisor that owns the pty
+/// and relay; the Carrick runtime continues only in the child process, in a
+/// foreground process group under that supervisor. The parent returns an
+/// `InteractiveParent` and must call `relay_and_wait()` instead of entering the
+/// HVF runtime.
 fn setup_interactive_stdio(
     dispatcher: &mut SyscallDispatcher,
     tty: bool,
     raw: bool,
-) -> anyhow::Result<Option<carrick::pty_relay::PtyRelay>> {
+) -> anyhow::Result<Option<carrick::interactive_supervisor::InteractiveParent>> {
     if !tty {
         if raw {
             dispatcher.set_stream_stdio(true);
         }
         return Ok(None);
     }
-    // Duplicate the real terminal fds so dup2(slave,0/1/2) doesn't clobber the
-    // relay's view of the user's terminal.
-    // SAFETY: dup of standard fds.
-    let real_in = unsafe { libc::dup(0) };
-    let real_out = unsafe { libc::dup(1) };
-    let relay = carrick::pty_relay::PtyRelay::start(real_in, real_out)
-        .context("failed to allocate interactive pty")?;
-    let slave = relay.slave_fd();
-    // SAFETY: redirect guest stdio to the pty slave, then adopt that pty as the
-    // controlling terminal of a fresh session.
-    unsafe {
-        libc::dup2(slave, 0);
-        libc::dup2(slave, 1);
-        libc::dup2(slave, 2);
-        libc::setsid();
-        libc::ioctl(slave, libc::TIOCSCTTY as libc::c_ulong, 0);
+    match carrick::interactive_supervisor::fork_interactive_session()
+        .context("failed to create interactive session supervisor")?
+    {
+        carrick::interactive_supervisor::SupervisorFork::Parent(parent) => Ok(Some(parent)),
+        carrick::interactive_supervisor::SupervisorFork::Child(child) => {
+            child
+                .adopt_stdio(dispatcher)
+                .context("failed to adopt interactive pty in runtime child")?;
+            Ok(None)
+        }
     }
-    dispatcher.set_stream_stdio(true);
-    // Register the pty as the guest's controlling terminal so /dev/tty and
-    // /proc/self/fd/{0,1,2} resolve to /dev/pts/N.
-    dispatcher.register_controlling_pty(relay.slave_name().to_string());
-    Ok(Some(relay))
 }
 
 fn main() -> anyhow::Result<()> {
@@ -559,10 +541,13 @@ fn main() -> anyhow::Result<()> {
                     let _ = dispatcher.set_fs_backend(Box::new(host));
                     // Interactive pty (or --raw stream): hand the guest the pty
                     // slave as fds 0/1/2 and relay master <-> the user's terminal.
-                    let _relay_guard = setup_interactive_stdio(&mut dispatcher, tty, raw)?;
-                    // Capture the run result WITHOUT `?` so that relay.stop()
-                    // always runs — even if the guest errors — keeping the
-                    // terminal out of raw mode on the error path.
+                    let _supervisor_parent = setup_interactive_stdio(&mut dispatcher, tty, raw)?;
+                    if let Some(parent) = _supervisor_parent {
+                        let code = parent.relay_and_wait()?;
+                        std::process::exit(code);
+                    }
+                    // Capture the run result WITHOUT `?` so contextual errors
+                    // still include the selected fs backend and image.
                     let run_result = run_elf_from_dispatcher_debug(
                         executable_path.as_str(),
                         dispatcher,
@@ -571,9 +556,6 @@ fn main() -> anyhow::Result<()> {
                         max_traps,
                         debug_state_path.as_ref(),
                     );
-                    if let Some(relay) = _relay_guard {
-                        relay.stop();
-                    }
                     run_result.with_context(|| {
                         format!(
                             "failed to run ELF {} from image {} (--fs host)",
@@ -593,10 +575,13 @@ fn main() -> anyhow::Result<()> {
                     install_fs_backend(&mut dispatcher, Some(FsBackendKind::Memory))?;
                     // Interactive pty (or --raw stream): hand the guest the pty
                     // slave as fds 0/1/2 and relay master <-> the user's terminal.
-                    let _relay_guard = setup_interactive_stdio(&mut dispatcher, tty, raw)?;
-                    // Capture the run result WITHOUT `?` so that relay.stop()
-                    // always runs — even if the guest errors — keeping the
-                    // terminal out of raw mode on the error path.
+                    let _supervisor_parent = setup_interactive_stdio(&mut dispatcher, tty, raw)?;
+                    if let Some(parent) = _supervisor_parent {
+                        let code = parent.relay_and_wait()?;
+                        std::process::exit(code);
+                    }
+                    // Capture the run result WITHOUT `?` so contextual errors
+                    // still include the selected fs backend and image.
                     let run_result = run_rootfs_elf_with_hvf_args_and_dispatcher_debug(
                         executable_path.as_str(),
                         &rootfs,
@@ -606,9 +591,6 @@ fn main() -> anyhow::Result<()> {
                         max_traps,
                         debug_state_path.as_ref(),
                     );
-                    if let Some(relay) = _relay_guard {
-                        relay.stop();
-                    }
                     run_result.with_context(|| {
                         format!(
                             "failed to run ELF {} from image {} (--fs memory)",
