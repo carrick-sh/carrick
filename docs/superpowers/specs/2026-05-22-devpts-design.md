@@ -1,15 +1,19 @@
 # devpts / PTY support for carrick
 
 **Date:** 2026-05-22
-**Status:** Phase A COMPLETE (merged to main). Phase B COMPLETE (`feat/devpts-phase-b`) with documented limitations — see "Phase B status" below.
+**Status:** Phase A COMPLETE (merged to main). Phase B COMPLETE, including
+interactive job control via the session-leader supervisor — see "Phase B
+status" below.
 **Approach:** Host-PTY-backed devpts with ioctl passthrough (Approach 1)
 
 ## Phase B status (2026-05-22)
 
-`carrick run -t <image> <cmd>` allocates a host pty, hands the guest the slave
-as fds 0/1/2, and relays bytes between the user's terminal and the pty master
-(raw mode + relay thread + SIGWINCH wiring). Implemented per
-`docs/superpowers/plans/2026-05-22-devpts-phase-b.md` (PB1–PB9).
+`carrick run -t <image> <cmd>` and `carrick shell <image>` fork a
+session-leader supervisor that owns the controlling pty and byte relay. The
+Carrick runtime continues in a child process group under that supervisor, with
+the pty slave as fds 0/1/2. Guest shells therefore use normal host
+`setpgid`/`tcsetpgrp`/`wait4` job-control semantics while carrick keeps the
+relay and terminal restoration outside the guest runtime process.
 
 **Verified working (automated):**
 - Real pty with live line discipline — the e2e test (`tests/interactive_tty.rs`,
@@ -18,10 +22,17 @@ as fds 0/1/2, and relays bytes between the user's terminal and the pty master
   definitive proof of a functional interactive tty.
 - `isatty(0/1/2)` is true under `-t`; the guest shell runs interactively.
 - Bidirectional relay (guest output → terminal, typed input → guest), EINTR-safe.
-- Initial window size propagates at start (guest `stty size` reflects the pty
-  size).
-- Gates green: 148 lib tests (incl. `pty_relay`), 59 `syscall_fs`, 46 `cli`,
-  38/38 conformance (no devpts regression), clippy unwrap-gate clean, fmt clean.
+- Initial and live window size propagates (guest `stty size` reflects the pty
+  size after a host-side resize).
+- Interactive job control works inside the guest shell: Ctrl-C interrupts the
+  foreground command; Ctrl-Z stops a foreground job; `jobs` reports it; `fg`
+  resumes it; Ctrl-C can then interrupt the resumed job.
+- Forked foreground-job IO remains alive across guest `fork(2)`/pipe-heavy
+  commands; a reducer such as `(echo hi | cat); ls /bin/sh >/dev/null; echo OK`
+  preserves stdout and does not trip host-side `EPIPE`.
+- Current signed interactive gate: `cargo test --test interactive_tty --
+  --ignored --nocapture` passes all five tests against `target/release/carrick`
+  after `./scripts/build-signed.sh`.
 
 **Both original limitations are now FIXED** (verified by the comprehensive
 `#[ignore]` e2e in `tests/interactive_tty.rs`, run against the signed binary):
@@ -35,21 +46,26 @@ as fds 0/1/2, and relays bytes between the user's terminal and the pty master
   `/proc/self/fd/{0,1,2}` → `/dev/pts/N`; and the controlling-tty stdio `fstat`
   labels itself `/dev/pts/N` so its `st_ino` matches `stat("/dev/pts/N")` — the
   equality glibc `ttyname(3)` checks. `tty(1)` now prints `/dev/pts/0`.
-- **Live `SIGWINCH` resize — FIXED.** Root-caused via dtrace: the SIGWINCH
-  handler doesn't fire in carrick's HVF context (vCPU threads run with signals
-  effectively masked), BUT the kernel keeps the inherited terminal fd's winsize
-  current. So the relay polls every 250ms and re-reads the size, propagating
-  `TIOCSWINSZ` on change — signal-independent. Verified: resizing updates the
-  guest's `stty size`.
+- **Live `SIGWINCH` resize — FIXED.** Root-caused via `carrick trace`: the
+  relay must run outside the Carrick runtime and must keep a helper in the
+  original terminal session to observe host-side size changes. The supervisor
+  applies `TIOCSWINSZ` with `SIGTTOU` temporarily blocked, because once the
+  guest runtime pgrp is foreground the supervisor is a background orphaned pgrp
+  and macOS returns `EIO` for terminal-changing ioctls otherwise. Verified:
+  resizing updates the guest's `stty size`.
+- **Interactive job control — FIXED.** The old in-process
+  `setsid()+TIOCSCTTY` setup has been replaced by `src/interactive_supervisor.rs`.
+  The launcher forks a supervisor; the supervisor creates the session, claims
+  the controlling pty, forks the Carrick runtime into its own process group,
+  sets that pgrp foreground on the slave, starts the relay, and waits. Ctrl-Z,
+  `jobs`, `fg`, and Ctrl-C operate through the host tty line discipline.
 
 **Remaining follow-ups (non-blocking):**
-- **Job control (Ctrl-C):** stdio pgrp ioctls passthrough to the host tty (PB7)
-  and guest pgrps are real macOS pgrps, so the mechanism is in place; full
-  Ctrl-C-in-`bash` is a manual check not yet confirmed via automation.
 - `write_fd_statx` lacks the stdio fast-path that `write_fd_stat` has, so
   `statx(fd, AT_EMPTY_PATH)` on a controlling-tty stdio fd returns EBADF
   (pre-existing; `ttyname`/`isatty` use `fstat`, which works).
-- `-t` is `run`-only; `shell`/`exec` are follow-ups.
+- Docker-style split `-i`, `run-elf -t`, and outer-host-shell suspension of the
+  carrick wrapper are follow-ups.
 
 The original design and Phase A content follow.
 
@@ -75,7 +91,7 @@ Two use-cases, sequenced **A before B**:
   internally (apt/dpkg, `script`, `tmux`, `expect`). Both master and slave
   live inside the guest. This unblocks the apt cosmetic and is fully
   self-testable.
-- **B — interactive host shell.** `carrick run -it bash` / `carrick shell`,
+- **B — interactive host shell.** `carrick run -t ... bash` / `carrick shell`,
   where the guest's controlling tty is wired to carrick's own stdin/stdout on
   the Mac, with working job control (Ctrl-C → SIGINT to the foreground
   process group), window resize, and line editing.
@@ -204,18 +220,24 @@ ABI structs in `src/linux_abi.rs` (`LinuxTermios` = 36 bytes, `LinuxWinsize` =
 - **CLOEXEC:** pty fds honor `O_CLOEXEC`/`FD_CLOEXEC` like every other host-fd
   description; `close_cloexec_fds()` already runs post-fork/exec.
 
-## Case B: `carrick run -it`
+## Case B: `carrick run -t` / `carrick shell`
 
 Built after A, reusing `PtyMaster`/`PtySlave` and the ioctl passthrough:
 
-1. A `-it` / `--tty` CLI flag makes carrick allocate a pty on the host side.
-2. The guest gets the **slave** as fd 0/1/2 (its controlling tty).
-3. carrick runs a relay loop copying bytes between the **master** and its own
-   stdin/stdout, with the Mac terminal put in raw mode for the duration.
-4. `SIGWINCH` on carrick → `TIOCSWINSZ` on the master so the guest sees
-   resizes.
-5. Job control inside the guest rides the host slave's line discipline (real
-   host pgrps), so Ctrl-C delivers SIGINT to the guest's foreground pgrp.
+1. `run -t` / `shell` call `fork_interactive_session()`.
+2. The original carrick launcher forks a dedicated supervisor. The supervisor
+   is the session leader, allocates the host pty, claims the slave with
+   `TIOCSCTTY`, and owns the relay.
+3. The supervisor forks the Carrick runtime child, the child enters its own
+   pgrp, and the supervisor makes that pgrp foreground with `tcsetpgrp(slave)`.
+4. The child only `dup2`s the pty slave onto 0/1/2, registers the controlling
+   pty with `SyscallDispatcher`, resets host-signal state inherited across the
+   pre-runtime fork, and enters the normal HVF runtime.
+5. The supervisor relay copies bytes between the pty master and the user's real
+   terminal, keeps raw-mode restoration out of the runtime child, propagates
+   window-size changes, waits for the runtime child, and exits with its status.
+6. Job control inside the guest rides the host slave's line discipline and real
+   host pgrps: Ctrl-C, Ctrl-Z, `jobs`, and `fg` are shell-native operations.
 
 ## Error handling
 
@@ -234,7 +256,7 @@ Built after A, reusing `PtyMaster`/`PtySlave` and the ioctl passthrough:
    Docker `ubuntu:24.04`.
 3. **End-to-end:** `apt-get install -y hello` shows **zero** `/dev/pts`
    warnings and still prints `Hello, world!`.
-4. **Case B smoke:** `carrick run -it … /bin/sh -c 'tty; test -t 0 && echo
+4. **Case B smoke:** `carrick run -t ... /bin/sh -c 'tty; test -t 0 && echo
    ISATTY'` reports a `/dev/pts/N` path and `ISATTY`.
 
 ## Sequencing
@@ -242,7 +264,8 @@ Built after A, reusing `PtyMaster`/`PtySlave` and the ioctl passthrough:
 - **Phase A (this spec's priority):** devpts module + `PtyTable` + the two
   `OpenDescription` variants + ioctl routing + unit/probe/e2e tests. Closes
   the apt cosmetic and unblocks `script`/`tmux`/`expect`.
-- **Phase B:** the `-it` CLI flag + host-side relay loop + raw-mode + SIGWINCH.
+- **Phase B:** `run -t` / `shell` session-leader supervisor + host-side relay
+  loop + raw-mode + live resize + interactive job control.
 
 ## Risks
 
@@ -253,5 +276,5 @@ Built after A, reusing `PtyMaster`/`PtySlave` and the ioctl passthrough:
   layouts differ; we already carry kernel-ABI structs in `linux_abi.rs` and
   must marshal field-by-field rather than blind-copy where layouts diverge.
 - **Phase B raw-mode/relay** is the higher-risk half (terminal state
-  restoration on exit/panic); isolated from Phase A so the apt fix lands
-  independently.
+  restoration on exit/panic); the session-leader supervisor keeps relay cleanup
+  outside the Carrick runtime child.
