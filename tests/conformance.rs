@@ -296,7 +296,10 @@ fn conformance() {
         return;
     };
     ensure_signed(&bin);
-    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
     rt.block_on(async {
         let docker = match Docker::connect_with_local_defaults() {
             Ok(d) => match d.ping().await {
