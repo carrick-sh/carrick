@@ -63,6 +63,25 @@ impl IoState {
     }
 }
 
+fn flush_host_fd(host_fd: i32) -> Result<(), i32> {
+    let rc = unsafe { libc::fsync(host_fd) };
+    if rc < 0 {
+        return Err(host_errno());
+    }
+    #[cfg(target_os = "macos")]
+    if strict_durability_enabled() {
+        let rc = unsafe { libc::fcntl(host_fd, libc::F_FULLFSYNC) };
+        if rc < 0 {
+            return Err(host_errno());
+        }
+    }
+    Ok(())
+}
+
+fn strict_durability_enabled() -> bool {
+    std::env::var_os("CARRICK_STRICT_DURABILITY").is_some_and(|value| value != "0")
+}
+
 impl FsState {
     pub(super) fn new() -> Self {
         let pty_table = std::sync::Arc::new(parking_lot::Mutex::new(crate::vfs::PtyTable::new()));
@@ -3459,6 +3478,9 @@ impl SyscallDispatcher {
         &self,
         _ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
+        unsafe {
+            libc::sync();
+        }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
 
@@ -3470,8 +3492,15 @@ impl SyscallDispatcher {
         if !self.fd_is_valid(fd) {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         }
-        // Like sync/fdatasync: we don't model durable disk state, so a
-        // successful flush is a no-op that returns 0.
+        let host_fd = match self.host_file_fd_for_flush(fd) {
+            Ok(host_fd) => host_fd,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        if let Some(host_fd) = host_fd {
+            if let Err(errno) = flush_host_fd(host_fd) {
+                return Ok(DispatchOutcome::Errno { errno });
+            }
+        }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
 
@@ -3732,8 +3761,14 @@ impl SyscallDispatcher {
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let fd = ctx.arg(0) as i32;
-        if !self.fd_is_valid(fd) {
-            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+        let host_fd = match self.host_file_fd_for_flush(fd) {
+            Ok(host_fd) => host_fd,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        if let Some(host_fd) = host_fd {
+            if let Err(errno) = flush_host_fd(host_fd) {
+                return Ok(DispatchOutcome::Errno { errno });
+            }
         }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
@@ -3743,10 +3778,31 @@ impl SyscallDispatcher {
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let fd = ctx.arg(0) as i32;
-        if !self.fd_is_valid(fd) {
-            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+        let host_fd = match self.host_file_fd_for_flush(fd) {
+            Ok(host_fd) => host_fd,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
+        if let Some(host_fd) = host_fd {
+            if let Err(errno) = flush_host_fd(host_fd) {
+                return Ok(DispatchOutcome::Errno { errno });
+            }
         }
         Ok(DispatchOutcome::Returned { value: 0 })
+    }
+
+    fn host_file_fd_for_flush(&self, fd: i32) -> Result<Option<i32>, i32> {
+        let Some(open_file) = self.open_file(fd) else {
+            return if is_stdio_fd(fd) {
+                Ok(None)
+            } else {
+                Err(LINUX_EBADF)
+            };
+        };
+        let open = open_file.description.read();
+        Ok(match &*open {
+            OpenDescription::HostFile { host_fd, .. } => Some(*host_fd),
+            _ => None,
+        })
     }
 
     pub(super) fn write_shared<M: GuestMemory>(
