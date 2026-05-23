@@ -53,15 +53,13 @@ impl SyscallDispatcher {
         let memory = &mut *ctx.memory;
         let header = match read_capability_header(memory, header_address) {
             Ok(header) => header,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         if !linux_capability_version_is_supported(header.version) {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         if header.pid < 0 {
-            return Ok(DispatchOutcome::Errno { errno: LINUX_ESRCH });
+            return Ok(LINUX_ESRCH.into());
         }
         if data_address == 0 {
             return Ok(DispatchOutcome::Returned { value: 0 });
@@ -72,9 +70,7 @@ impl SyscallDispatcher {
             .write_bytes(data_address, capability_data_bytes(&empty).as_slice())
             .is_err()
         {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EFAULT,
-            });
+            return Ok(LINUX_EFAULT.into());
         }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
@@ -88,23 +84,21 @@ impl SyscallDispatcher {
         let memory = &*ctx.memory;
         let header = match read_capability_header(memory, header_address) {
             Ok(header) => header,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         if !linux_capability_version_is_supported(header.version) {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         if header.pid < 0 {
-            return Ok(DispatchOutcome::Errno { errno: LINUX_ESRCH });
+            return Ok(LINUX_ESRCH.into());
         }
         let words = linux_capability_data_words(header.version);
         let data = match read_capability_data(memory, data_address, words) {
             Ok(data) => data,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         if data.iter().any(|word| !word.is_empty()) {
-            return Ok(DispatchOutcome::Errno { errno: LINUX_EPERM });
+            return Ok(LINUX_EPERM.into());
         }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
@@ -136,12 +130,10 @@ impl SyscallDispatcher {
         let who = ctx.arg(1) as i32;
         let prio = ctx.arg(2) as i32;
         if which > LINUX_PRIO_USER || !(-20..=19).contains(&prio) {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         if which == LINUX_PRIO_PROCESS && who != 0 && who != LINUX_BOOTSTRAP_PID as i32 {
-            return Ok(DispatchOutcome::Errno { errno: LINUX_ESRCH });
+            return Ok(LINUX_ESRCH.into());
         }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
@@ -153,12 +145,10 @@ impl SyscallDispatcher {
         let which = ctx.arg(0);
         let who = ctx.arg(1) as i32;
         if which > LINUX_PRIO_USER {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         if which == LINUX_PRIO_PROCESS && who != 0 && who != LINUX_BOOTSTRAP_PID as i32 {
-            return Ok(DispatchOutcome::Errno { errno: LINUX_ESRCH });
+            return Ok(LINUX_ESRCH.into());
         }
         // Linux returns 20 - nice. Default nice is 0 → return 20. This is a
         // bootstrap value; we don't model per-process priority.
@@ -281,9 +271,7 @@ impl SyscallDispatcher {
                 continue;
             }
             if ctx.memory.write_bytes(ptr, &value.to_le_bytes()).is_err() {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_EFAULT,
-                });
+                return Ok(LINUX_EFAULT.into());
             }
         }
         Ok(DispatchOutcome::Returned { value: 0 })
@@ -300,9 +288,7 @@ impl SyscallDispatcher {
                 continue;
             }
             if ctx.memory.write_bytes(ptr, &value.to_le_bytes()).is_err() {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_EFAULT,
-                });
+                return Ok(LINUX_EFAULT.into());
             }
         }
         Ok(DispatchOutcome::Returned { value: 0 })
@@ -321,9 +307,7 @@ impl SyscallDispatcher {
         // `size` is a Linux `int`; a negative value is invalid.
         let size = ctx.arg(0) as i32;
         if size < 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         // Query mode: report the count without writing.
         if size == 0 {
@@ -331,18 +315,14 @@ impl SyscallDispatcher {
         }
         // The buffer is too small to hold the supplementary group list.
         if size < 1 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         // Write the single supplementary group (gid 0) as a little-endian
         // gid_t (u32, 4 bytes).
         let list = ctx.arg(1);
         let gid: u32 = 0;
         if ctx.memory.write_bytes(list, &gid.to_le_bytes()).is_err() {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EFAULT,
-            });
+            return Ok(LINUX_EFAULT.into());
         }
         Ok(DispatchOutcome::Returned { value: 1 })
     }
