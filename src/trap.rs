@@ -1261,6 +1261,20 @@ impl HvfInner {
         frame.saved_sp = self.vcpu.get_sys_reg(SysReg::SP_EL0).map_err(hvf_error)?;
         frame.saved_spsr = self.vcpu.get_sys_reg(SysReg::SPSR_EL1).map_err(hvf_error)?;
 
+        let mut siginfo = crate::linux_abi::LinuxSiginfo::empty();
+        siginfo.si_signo = signum;
+        siginfo.si_code = crate::linux_abi::LINUX_SI_USER;
+        frame.siginfo = siginfo;
+
+        let mut mcontext = crate::linux_abi::LinuxSignalContext::empty();
+        mcontext.regs = frame.saved_x;
+        mcontext.sp = frame.saved_sp;
+        mcontext.pc = frame.saved_pc;
+        mcontext.pstate = frame.saved_spsr;
+        let mut ucontext = crate::linux_abi::LinuxUcontext::empty();
+        ucontext.uc_mcontext = mcontext;
+        frame.ucontext = ucontext;
+
         // Reserve space on SP_EL0, rounded down to 16-byte alignment
         // (AArch64 stack alignment requirement at function-call boundaries).
         let frame_bytes = frame.as_bytes();
@@ -1285,13 +1299,19 @@ impl HvfInner {
         self.vcpu
             .set_reg(Reg::X0, signum as u64)
             .map_err(hvf_error)?;
-        // x1/x2 carry siginfo* / ucontext* on SA_SIGINFO. We don't
-        // construct those (handler should not assume it was registered
-        // with SA_SIGINFO since musl maps 1-arg handlers to non-
-        // SA_SIGINFO entries by default), but zero them so a curious
-        // handler doesn't dereference whatever was in those registers.
-        self.vcpu.set_reg(Reg::X1, 0).map_err(hvf_error)?;
-        self.vcpu.set_reg(Reg::X2, 0).map_err(hvf_error)?;
+        // x1/x2 carry siginfo* / ucontext* on SA_SIGINFO. Handlers may inspect
+        // or mutate the saved PC/SP before rt_sigreturn, so keep the embedded
+        // Linux-shaped context authoritative.
+        let siginfo_addr =
+            new_sp + core::mem::offset_of!(crate::linux_abi::CarrickSigframe, siginfo) as u64;
+        let ucontext_addr =
+            new_sp + core::mem::offset_of!(crate::linux_abi::CarrickSigframe, ucontext) as u64;
+        self.vcpu
+            .set_reg(Reg::X1, siginfo_addr)
+            .map_err(hvf_error)?;
+        self.vcpu
+            .set_reg(Reg::X2, ucontext_addr)
+            .map_err(hvf_error)?;
 
         // LR = the restorer the handler `ret`s to, which must invoke
         // `rt_sigreturn(2)`. musl/x86-style libcs pass an explicit
@@ -1414,14 +1434,17 @@ impl HvfInner {
         }
 
         // `frame` is `#[repr(C, packed)]` so we cannot borrow individual
-        // fields. Copy out the whole register array first.
-        let saved_x = frame.saved_x;
+        // fields. Copy out the Linux ucontext first; SA_SIGINFO handlers may
+        // mutate it before invoking rt_sigreturn.
+        let ucontext = frame.ucontext;
+        let mcontext = ucontext.uc_mcontext;
+        let saved_x = mcontext.regs;
         for (reg, value) in GPR_TABLE.iter().zip(saved_x.iter()) {
             self.vcpu.set_reg(*reg, *value).map_err(hvf_error)?;
         }
-        let saved_pc = frame.saved_pc;
-        let saved_sp = frame.saved_sp;
-        let saved_spsr = frame.saved_spsr;
+        let saved_pc = mcontext.pc;
+        let saved_sp = mcontext.sp;
+        let saved_spsr = mcontext.pstate;
         crate::probes::signal_restore(saved_pc, sp, magic);
         self.vcpu
             .set_sys_reg(SysReg::ELR_EL1, saved_pc)
