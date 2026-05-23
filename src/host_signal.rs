@@ -285,6 +285,20 @@ pub fn reinit_after_fork() {
     PENDING.store(NO_PENDING_SIGNAL, Ordering::SeqCst);
 }
 
+/// Reset inherited host-signal state in the runtime child after the
+/// interactive session supervisor forks. This runs before the HVF runtime
+/// installs default handlers, so the child does not inherit stale pending
+/// signals, routed-handler bookkeeping, or the supervisor's self-pipe fds.
+pub fn reset_after_supervisor_fork() {
+    INSTALLED.store(0, Ordering::SeqCst);
+    INSTALLED_MASK.store(0, Ordering::SeqCst);
+    if let Ok(mut map) = THREAD_PENDING.lock() {
+        map.clear();
+    }
+    PENDING.store(NO_PENDING_SIGNAL, Ordering::SeqCst);
+    open_pending_pipe();
+}
+
 /// Wake any thread parked in a blocking-I/O `kevent()` by making the self-pipe
 /// readable. Async-signal-safe (a single non-blocking `write`); a full pipe
 /// already means a wake is pending, so EAGAIN is ignored.

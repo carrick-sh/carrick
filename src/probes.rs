@@ -99,6 +99,18 @@ mod carrick_usdt {
     /// on-the-wire layout — sa_handler, sa_flags, and whether offset 16 is
     /// sa_restorer (glibc-style) or sa_mask (aarch64 kernel ABI, no restorer).
     fn sigaction__read(_: i32, _: u64, _: u64, _: u64, _: u64) {}
+    /// Fires when the interactive session supervisor forks the Carrick runtime
+    /// child. Distinct from guest fork-post; this is the host-side `run -t`
+    /// process boundary.
+    fn supervisor__fork(_: i32) {}
+    /// Fires when the runtime child has moved into its own process group and
+    /// is waiting for the supervisor to make that pgrp foreground.
+    fn supervisor__child__ready(_: i32) {}
+    /// Fires after the supervisor attempts to make the runtime child pgrp the
+    /// pty foreground group. `errno` is 0 on success.
+    fn supervisor__foreground__pgrp(_: i32, _: i32) {}
+    /// Fires when the supervisor reaps the runtime child.
+    fn supervisor__child__exit(_: i32, _: i32) {}
 }
 
 pub fn fork_pre(pc: u64, elr: u64, cpsr: u64) {
@@ -153,6 +165,22 @@ pub fn mem_watch(syscall_nr: u64, addr: u64, value: u64) {
 
 pub fn sigaction_read(signum: i32, w0: u64, w1: u64, w2: u64, w3: u64) {
     carrick_usdt::sigaction__read!(|| (signum, w0, w1, w2, w3));
+}
+
+pub fn supervisor_fork(child_pid: i32) {
+    carrick_usdt::supervisor__fork!(|| child_pid);
+}
+
+pub fn supervisor_child_ready(runtime_pid: i32) {
+    carrick_usdt::supervisor__child__ready!(|| runtime_pid);
+}
+
+pub fn supervisor_foreground_pgrp(pgid: i32, errno: i32) {
+    carrick_usdt::supervisor__foreground__pgrp!(|| (pgid, errno));
+}
+
+pub fn supervisor_child_exit(pid: i32, status: i32) {
+    carrick_usdt::supervisor__child__exit!(|| (pid, status));
 }
 
 // `#[inline(never)]`: usdt embeds the probe site (an asm! anchor) in
