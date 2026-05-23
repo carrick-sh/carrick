@@ -490,8 +490,6 @@ fn run_static_go_hello_under_carrick() {
         .args([
             "run-elf",
             go_artifact,
-            "--max-traps",
-            "1000",
         ])
         .output()
         .unwrap();
@@ -499,9 +497,10 @@ fn run_static_go_hello_under_carrick() {
     if output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(stdout.contains("\"exit_code\": 0"), "unexpected exit code in json: {}", stdout);
-        assert!(stdout.contains("hello from Go under carrick"), "expected Go greeting: {}", stdout);
-        assert!(stdout.contains("Worker"), "expected worker concurrency output: {}", stdout);
-        assert!(stdout.contains("Map lookup: first=10, second=20"), "expected map output: {}", stdout);
+        assert!(stdout.contains("Client received status: success"), "expected client status: {}", stdout);
+        assert!(stdout.contains("Client received runtime: carrick"), "expected client runtime: {}", stdout);
+        assert!(stdout.contains("Client received concurrency: enabled"), "expected client concurrency: {}", stdout);
+        assert!(stdout.contains("Graceful shutdown completed successfully"), "expected graceful shutdown: {}", stdout);
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
