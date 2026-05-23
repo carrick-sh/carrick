@@ -41,6 +41,9 @@ Work package progress:
   - Completed: `timerfd` reads now wait on timer state without holding the fd description lock, and `timerfd_settime` wakes blocked readers so re-arming changes their deadline.
 - [ ] Package 4. ABI and Flag Types
 - [ ] Package 5. Darwin Filesystem Leverage
+  - Completed: `sync` now invokes the host sync primitive, and host-backed `fsync`/`fdatasync`/`syncfs` flush the real host fd with optional `CARRICK_STRICT_DURABILITY=1` `F_FULLFSYNC` on macOS.
+  - Completed: `HostFsBackend::seed_from_rootfs` now materializes through its cap-std rooted `Dir` instead of re-entering through an ambient path.
+  - Remaining: add a bounded APFS `copyfile`/clone fast path for host-backed `copy_file_range`.
 - [ ] Package 6. VFS and Stat Ownership
 - [ ] Hygiene gates and final verification sweep
 
