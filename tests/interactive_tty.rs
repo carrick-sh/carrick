@@ -194,6 +194,94 @@ fn interactive_ctrl_c_interrupts_foreground_command() {
 
 #[test]
 #[ignore]
+fn interactive_ctrl_z_fg_and_ctrl_c_job_control() {
+    let Some(bin) = signed_bin() else { return };
+    let (master, slave) = open_pty();
+    let mut child = spawn_run_t(bin, slave, &["/bin/bash"]);
+    set_nonblocking(master);
+
+    std::thread::sleep(Duration::from_secs(20)); // boot
+    let w = |b: &[u8]| unsafe {
+        libc::write(master, b.as_ptr().cast(), b.len());
+    };
+
+    // Start a foreground job, stop it with Ctrl-Z, and prove the shell regains
+    // control by running a computed marker. The literal command echo is not
+    // enough; only an executing shell prints Z42.
+    w(b"sleep 40\n");
+    std::thread::sleep(Duration::from_secs(1));
+    w(b"\x1a"); // Ctrl-Z
+    std::thread::sleep(Duration::from_secs(1));
+    w(b"jobs\n");
+    w(b"echo Z$((20+22))\n");
+
+    let mut out = Vec::new();
+    read_until(master, &mut out, 10, |o| o.windows(3).any(|x| x == b"Z42"));
+
+    // Resume the stopped job in the foreground, interrupt it with Ctrl-C, and
+    // prove the shell is usable again.
+    w(b"fg\n");
+    std::thread::sleep(Duration::from_secs(1));
+    w(b"\x03"); // Ctrl-C
+    std::thread::sleep(Duration::from_secs(1));
+    w(b"echo F$((30+12))\n");
+    read_until(master, &mut out, 10, |o| o.windows(3).any(|x| x == b"F42"));
+
+    let _ = child.kill();
+    let _ = child.wait();
+    unsafe { libc::close(master) };
+
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        !text.contains("GUEST ABORT") && !text.contains("panicked"),
+        "job control must not crash carrick. Output:\n{text}"
+    );
+    assert!(
+        text.contains("Z42"),
+        "Ctrl-Z should stop `sleep 40` and return control to the shell. Output:\n{text}"
+    );
+    assert!(
+        text.contains("F42"),
+        "`fg` followed by Ctrl-C should return control to the shell. Output:\n{text}"
+    );
+    assert!(
+        text.contains("Stopped") || text.contains("sleep 40"),
+        "`jobs` should report the stopped foreground job. Output:\n{text}"
+    );
+}
+
+#[test]
+#[ignore]
+fn interactive_forked_foreground_job_keeps_stdout_alive() {
+    let Some(bin) = signed_bin() else { return };
+    let (master, slave) = open_pty();
+    let script = "(echo hi | cat); ls /bin/sh >/dev/null; echo OK";
+    let mut child = spawn_run_t(bin, slave, &["/bin/sh", "-c", script]);
+    set_nonblocking(master);
+
+    let mut out = Vec::new();
+    read_until(master, &mut out, 30, |o| o.windows(2).any(|x| x == b"OK"));
+
+    let _ = child.kill();
+    let _ = child.wait();
+    unsafe { libc::close(master) };
+
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        text.contains("hi") && text.contains("OK"),
+        "forked foreground command should preserve stdout through pipes. Output:\n{text}"
+    );
+    assert!(
+        !text.contains("EPIPE")
+            && !text.contains("Broken pipe")
+            && !text.contains("GUEST ABORT")
+            && !text.contains("panicked"),
+        "forked foreground command should not hit pipe/signal failure. Output:\n{text}"
+    );
+}
+
+#[test]
+#[ignore]
 fn interactive_run_resolves_ttyname_dev_tty_and_resize() {
     let Some(bin) = signed_bin() else { return };
     let (master, slave) = open_pty();
