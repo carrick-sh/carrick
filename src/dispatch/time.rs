@@ -584,37 +584,56 @@ impl SyscallDispatcher {
         let new_limit = ctx.arg(2);
         let old_limit = ctx.arg(3);
         let memory = &mut *ctx.memory;
-        if new_limit != 0 {
+        // Per-resource values matched to a sensible Linux default.
+        // Returning RLIM_INFINITY for ALL resources crashes apt:
+        // its pre-fork "set CLOEXEC on every fd" loop iterates
+        // 3..rlim_cur and so spins for u64::MAX cycles. RLIMIT_NOFILE
+        // in particular needs a real bound.
+        // Resource numbers from include/uapi/asm-generic/resource.h.
+        const LINUX_RLIMIT_NOFILE: u64 = 7;
+        const LINUX_RLIMIT_NPROC: u64 = 6;
+        const LINUX_RLIMIT_STACK: u64 = 3;
+        const LINUX_RLIMIT_AS: u64 = 9;
+        const LINUX_RLIMIT_DATA: u64 = 2;
+        let limit = match resource {
+            LINUX_RLIMIT_NOFILE => LinuxRlimit::new(1024, 1024 * 1024),
+            LINUX_RLIMIT_NPROC => LinuxRlimit::new(8192, 8192),
+            LINUX_RLIMIT_STACK => {
+                LinuxRlimit::new(crate::memory::LINUX_STACK_SIZE, LINUX_RLIM_INFINITY)
+            }
+            LINUX_RLIMIT_AS | LINUX_RLIMIT_DATA => {
+                LinuxRlimit::new(LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY)
+            }
+            _ => LinuxRlimit::new(LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY),
+        };
+        // prlimit64 writes the OLD limit before applying the new one, so a
+        // read-modify-write (both pointers set) sees the prior value.
+        if old_limit != 0 && write_kernel_struct_raw(memory, old_limit, &limit).is_err() {
             return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
+                errno: LINUX_EFAULT,
             });
         }
-        if old_limit != 0 {
-            // Per-resource values matched to a sensible Linux default.
-            // Returning RLIM_INFINITY for ALL resources crashes apt:
-            // its pre-fork "set CLOEXEC on every fd" loop iterates
-            // 3..rlim_cur and so spins for u64::MAX cycles. RLIMIT_NOFILE
-            // in particular needs a real bound.
-            // Resource numbers from include/uapi/asm-generic/resource.h.
-            const LINUX_RLIMIT_NOFILE: u64 = 7;
-            const LINUX_RLIMIT_NPROC: u64 = 6;
-            const LINUX_RLIMIT_STACK: u64 = 3;
-            const LINUX_RLIMIT_AS: u64 = 9;
-            const LINUX_RLIMIT_DATA: u64 = 2;
-            let limit = match resource {
-                LINUX_RLIMIT_NOFILE => LinuxRlimit::new(1024, 1024 * 1024),
-                LINUX_RLIMIT_NPROC => LinuxRlimit::new(8192, 8192),
-                LINUX_RLIMIT_STACK => {
-                    LinuxRlimit::new(crate::memory::LINUX_STACK_SIZE, LINUX_RLIM_INFINITY)
+        // Setting a limit: validate and accept. carrick does not enforce most
+        // resource limits (RLIMIT_CORE/CPU/etc. are advisory here), but a
+        // blanket EINVAL broke every caller that legitimately lowers a limit —
+        // notably LTP's tst_coredump, which sets RLIMIT_CORE and TBROKs the
+        // whole test (setitimer01, getitimer01, …) when the set fails.
+        if new_limit != 0 {
+            let bytes = match memory.read_bytes(new_limit, 16) {
+                Ok(b) => b,
+                Err(_) => {
+                    return Ok(DispatchOutcome::Errno {
+                        errno: LINUX_EFAULT,
+                    });
                 }
-                LINUX_RLIMIT_AS | LINUX_RLIMIT_DATA => {
-                    LinuxRlimit::new(LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY)
-                }
-                _ => LinuxRlimit::new(LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY),
             };
-            if write_kernel_struct_raw(memory, old_limit, &limit).is_err() {
+            let rlim_cur = u64::from_le_bytes(bytes[0..8].try_into().unwrap_or([0; 8]));
+            let rlim_max = u64::from_le_bytes(bytes[8..16].try_into().unwrap_or([0; 8]));
+            // RLIM_INFINITY (u64::MAX) is the maximum; a soft limit above the
+            // hard limit is EINVAL.
+            if rlim_cur > rlim_max {
                 return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_EFAULT,
+                    errno: LINUX_EINVAL,
                 });
             }
         }
