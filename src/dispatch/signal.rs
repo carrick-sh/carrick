@@ -398,13 +398,13 @@ impl SyscallDispatcher {
         // bad `new_action` pointer yields EFAULT with no side effects.
         // (LTP rt_sigaction02 passes a deliberately bad pointer.)
         let new_sa = if new_action.0 != 0 {
-            let bytes = match memory.read_bytes(new_action.0, core::mem::size_of::<LinuxSigaction>())
-            {
-                Ok(bytes) => bytes,
-                Err(_) => {
-                    return Ok(LINUX_EFAULT.into());
-                }
-            };
+            let bytes =
+                match memory.read_bytes(new_action.0, core::mem::size_of::<LinuxSigaction>()) {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        return Ok(LINUX_EFAULT.into());
+                    }
+                };
             // Installing a handler for SIGKILL (9) or SIGSTOP (19) is rejected
             // with EINVAL — these signals cannot be caught or ignored. signum 0
             // never reaches here (the 1..=64 check above rejects it).
