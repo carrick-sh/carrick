@@ -192,16 +192,21 @@ pub fn spawn_signal_pump(
                 data: 0,
                 udata: std::ptr::null_mut(),
             }];
+            // A modest poll timeout backstops the edge-triggered pipe watch.
+            // The pipe is only drained by *parked* waiters (blocking syscalls);
+            // a process that is spinning in guest userspace — e.g. a forked
+            // child busy-waiting for an interval-timer signal — has no parked
+            // waiter, so after the first edge the undrained pipe stops
+            // re-triggering EV_CLEAR and published signals would never be
+            // kicked in. Re-checking `has_process_pending` every few ms
+            // guarantees such a guest is forced out of hv_vcpu_run promptly.
+            let poll = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 5_000_000,
+            };
             loop {
                 let n = unsafe {
-                    libc::kevent(
-                        kq,
-                        std::ptr::null(),
-                        0,
-                        out.as_mut_ptr(),
-                        1,
-                        std::ptr::null(),
-                    )
+                    libc::kevent(kq, std::ptr::null(), 0, out.as_mut_ptr(), 1, &poll)
                 };
                 if n < 0 {
                     let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
