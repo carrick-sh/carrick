@@ -35,62 +35,6 @@ impl MemState {
 }
 
 impl SyscallDispatcher {
-    pub(super) fn dispatch_threaded_memory<M: GuestMemory>(
-        &self,
-        request: SyscallRequest,
-        memory: &mut M,
-        reporter: &CompatReporter,
-    ) -> Option<Result<DispatchOutcome, DispatchError>> {
-        if !syscall_handler_is(request.number, SyscallHandler::Memory) {
-            return None;
-        }
-
-        let syscall = lookup_aarch64(request.number);
-        let name = syscall.map_or("unknown", |syscall| syscall.name);
-        reporter.record(CompatEvent::SyscallEntry {
-            number: request.number,
-            name: ::std::borrow::Cow::Borrowed(name),
-            args: request.args,
-        });
-
-        let mut ctx = SyscallCtx {
-            request,
-            memory,
-            reporter,
-            thread: None,
-        };
-        let outcome = match match request.number {
-            214 => self.brk(&mut ctx),
-            215 => self.munmap(&mut ctx),
-            216 => self.mremap(&mut ctx),
-            222 => self.mmap(&mut ctx),
-            223 => self.fadvise64(&mut ctx),
-            226 => self.mprotect(&mut ctx),
-            227 => self.msync(&mut ctx),
-            228 => self.mlock(&mut ctx),
-            229 => self.munlock(&mut ctx),
-            230 => self.mlockall(&mut ctx),
-            231 => self.munlockall(&mut ctx),
-            232 => self.mincore(&mut ctx),
-            233 => self.madvise(&mut ctx),
-            283 => self.sys_membarrier(&mut ctx),
-            _ => unreachable!("unsupported threaded memory syscall"),
-        } {
-            Ok(outcome) => outcome,
-            Err(error) => return Some(Err(error)),
-        };
-
-        let (retval, errno) = outcome.retval_errno();
-        reporter.record(CompatEvent::SyscallReturn {
-            number: request.number,
-            name: ::std::borrow::Cow::Borrowed(name),
-            retval,
-            errno,
-        });
-
-        Some(Ok(outcome))
-    }
-
     fn dispatch_brk(&self, request: SyscallRequest) -> DispatchOutcome {
         let requested = request.arg(0);
         let mut mem = self.mem.lock();

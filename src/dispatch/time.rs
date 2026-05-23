@@ -3,66 +3,6 @@
 use super::*;
 
 impl SyscallDispatcher {
-    pub(super) fn dispatch_threaded_time<M: GuestMemory>(
-        &self,
-        request: SyscallRequest,
-        memory: &mut M,
-        reporter: &CompatReporter,
-    ) -> Option<Result<DispatchOutcome, DispatchError>> {
-        if !syscall_handler_is(request.number, SyscallHandler::Time) {
-            return None;
-        }
-
-        let syscall = lookup_aarch64(request.number);
-        let name = syscall.map_or("unknown", |syscall| syscall.name);
-        reporter.record(CompatEvent::SyscallEntry {
-            number: request.number,
-            name: ::std::borrow::Cow::Borrowed(name),
-            args: request.args,
-        });
-
-        let mut ctx = SyscallCtx {
-            request,
-            memory,
-            reporter,
-            thread: None,
-        };
-        let outcome = match match request.number {
-            85 => self.timerfd_create(&mut ctx),
-            86 => self.timerfd_settime(&mut ctx),
-            87 => self.timerfd_gettime(&mut ctx),
-            101 => self.nanosleep(&mut ctx),
-            102 => self.getitimer(&mut ctx),
-            103 => self.setitimer(&mut ctx),
-            112 => self.clock_settime(&mut ctx),
-            113 => self.clock_gettime(&mut ctx),
-            114 => self.clock_getres(&mut ctx),
-            115 => self.clock_nanosleep(&mut ctx),
-            153 => self.times(&mut ctx),
-            165 => self.getrusage(&mut ctx),
-            169 => self.gettimeofday(&mut ctx),
-            170 => self.settimeofday(&mut ctx),
-            171 => self.adjtimex(&mut ctx),
-            179 => self.sysinfo(&mut ctx),
-            261 => self.prlimit64(&mut ctx),
-            266 => self.clock_adjtime(&mut ctx),
-            _ => unreachable!("unsupported threaded time syscall"),
-        } {
-            Ok(outcome) => outcome,
-            Err(error) => return Some(Err(error)),
-        };
-
-        let (retval, errno) = outcome.retval_errno();
-        reporter.record(CompatEvent::SyscallReturn {
-            number: request.number,
-            name: ::std::borrow::Cow::Borrowed(name),
-            retval,
-            errno,
-        });
-
-        Some(Ok(outcome))
-    }
-
     pub(super) fn timerfd_create<M: GuestMemory>(
         &self,
         ctx: &mut SyscallCtx<M>,
