@@ -2,6 +2,42 @@
 //! `super` for the dispatcher struct and the normalized dispatch table.
 use super::*;
 
+/// Generate a syscall handler whose arguments are declared with their ABI
+/// types, so the type is carried in the handler's definition and the args are
+/// bound at the correct width — `Pid`/`Signal` are `int`/`pid_t` and truncate
+/// to 32 bits, matching the kernel's syscall entry. This prevents the bug
+/// class where a 32-bit arg is read from the full 64-bit register (a guest
+/// `-1`, passed as `0xFFFFFFFF`, would otherwise look like a large positive
+/// value — see tkill02/tgkill03). The body receives the typed locals plus
+/// `self` and `ctx` (for guest memory + thread context). Register the
+/// generated method in `normalized_dispatch!` as usual.
+macro_rules! define_syscall {
+    ( $(
+        $(#[$meta:meta])*
+        fn $name:ident ( $this:ident, $cx:ident $(, $arg:ident : $argty:ty )* $(,)? ) $body:block
+    )* ) => {
+        $(
+            $(#[$meta])*
+            pub(super) fn $name<M: GuestMemory>(
+                &self,
+                ctx: &mut SyscallCtx<M>,
+            ) -> Result<DispatchOutcome, DispatchError> {
+                // Alias the receiver and context to caller-named idents (macro
+                // hygiene means a bare `self`/`ctx` in the body wouldn't bind).
+                let $this = self;
+                let $cx = ctx;
+                let mut __arg_index = 0usize;
+                $(
+                    let $arg: $argty = $cx.typed_arg(__arg_index);
+                    __arg_index += 1;
+                )*
+                let _ = __arg_index;
+                $body
+            }
+        )*
+    };
+}
+
 /// Owned signal-subsystem state. Split out of `SyscallDispatcher` so the
 /// signal handlers borrow only what they touch instead of the whole
 /// dispatcher. Field semantics are unchanged from the former loose
@@ -209,60 +245,57 @@ impl SyscallDispatcher {
         ))
     }
 
-    pub(super) fn tkill<M: GuestMemory>(
-        &self,
-        ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let tid = ctx.arg(0) as i64;
-        let signum = ctx.arg(1);
-        // The kernel rejects a non-positive tid with EINVAL before anything
-        // else (sys_tkill: `if (pid <= 0) return -EINVAL`). (LTP tkill02.)
-        if tid <= 0 {
-            return Ok(LINUX_EINVAL.into());
+    define_syscall! {
+        /// tkill(tid, sig): send `sig` to thread `tid`. `tid`/`sig` are typed
+        /// (`Pid`/`Signal`) so they're read at the kernel's 32-bit width.
+        fn tkill(this, cx, tid: Pid, sig: Signal) {
+            let tid = i64::from(tid.0);
+            let signum = sig.0 as u64;
+            // The kernel rejects a non-positive tid with EINVAL before anything
+            // else (sys_tkill: `if (pid <= 0) return -EINVAL`). (LTP tkill02.)
+            if tid <= 0 {
+                return Ok(LINUX_EINVAL.into());
+            }
+            if !is_valid_signum(signum) {
+                return Ok(LINUX_EINVAL.into());
+            }
+            // tkill's target is a thread id, not a "0 means self" pid form.
+            if let Some(routed) = this.route_thread_signal(cx, tid, signum) {
+                return Ok(routed);
+            }
+            if signal_is_self_target(tid, /*tid_required=*/ true) {
+                return Ok(this.raise_self(signum));
+            }
+            Ok(bootstrap_signal_send(tid, /*tid_required=*/ true, signum))
         }
-        if !is_valid_signum(signum) {
-            return Ok(LINUX_EINVAL.into());
-        }
-        // tkill's target is a thread id, not a "0 means self" pid form.
-        if let Some(routed) = self.route_thread_signal(ctx, tid, signum) {
-            return Ok(routed);
-        }
-        if signal_is_self_target(tid, /*tid_required=*/ true) {
-            return Ok(self.raise_self(signum));
-        }
-        Ok(bootstrap_signal_send(
-            tid, /*tid_required=*/ true, signum,
-        ))
-    }
 
-    pub(super) fn tgkill<M: GuestMemory>(
-        &self,
-        ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let tgid = ctx.arg(0) as i64;
-        let tid = ctx.arg(1) as i64;
-        let signum = ctx.arg(2);
-        // The kernel rejects a non-positive tgid or tid with EINVAL up front
-        // (sys_tgkill: `if (pid <= 0 || tgid <= 0) return -EINVAL`), before
-        // resolving the target or validating the signal. (LTP tgkill03.)
-        if tgid <= 0 || tid <= 0 {
-            return Ok(LINUX_EINVAL.into());
+        /// tgkill(tgid, tid, sig): send `sig` to thread `tid` in group `tgid`.
+        fn tgkill(this, cx, tgid: Pid, tid: Pid, sig: Signal) {
+            let tgid = i64::from(tgid.0);
+            let tid = i64::from(tid.0);
+            let signum = sig.0 as u64;
+            // The kernel rejects a non-positive tgid or tid with EINVAL up front
+            // (sys_tgkill: `if (pid <= 0 || tgid <= 0) return -EINVAL`), before
+            // resolving the target or validating the signal. (LTP tgkill03.)
+            if tgid <= 0 || tid <= 0 {
+                return Ok(LINUX_EINVAL.into());
+            }
+            if !is_valid_signum(signum) {
+                return Ok(LINUX_EINVAL.into());
+            }
+            // A sibling thread of this process: deliver to that tid's vCPU.
+            if let Some(routed) = this.route_thread_signal(cx, tid, signum) {
+                return Ok(routed);
+            }
+            let host_pid = std::process::id() as i64;
+            let bootstrap_pid = LINUX_BOOTSTRAP_PID as i64;
+            let valid_self = (tgid == host_pid || tgid == bootstrap_pid)
+                && (tid == host_pid || tid == bootstrap_pid);
+            if !valid_self {
+                return Ok(LINUX_ESRCH.into());
+            }
+            Ok(this.raise_self(signum))
         }
-        if !is_valid_signum(signum) {
-            return Ok(LINUX_EINVAL.into());
-        }
-        // A sibling thread of this process: deliver to that tid's vCPU.
-        if let Some(routed) = self.route_thread_signal(ctx, tid, signum) {
-            return Ok(routed);
-        }
-        let host_pid = std::process::id() as i64;
-        let bootstrap_pid = LINUX_BOOTSTRAP_PID as i64;
-        let valid_self = (tgid == host_pid || tgid == bootstrap_pid)
-            && (tid == host_pid || tid == bootstrap_pid);
-        if !valid_self {
-            return Ok(LINUX_ESRCH.into());
-        }
-        Ok(self.raise_self(signum))
     }
 
     /// Shared tgkill/tkill routing for the multi-threaded path. Returns
