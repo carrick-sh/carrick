@@ -1503,6 +1503,12 @@ impl LinuxSocketTypeFlags {
     pub const SUPPORTED_MASK: i32 = Self::NONBLOCK.bits() | Self::CLOEXEC.bits();
 }
 
+pub const LINUX_SOCKET_TYPE_SUPPORTED_MASK: u64 = LinuxSocketTypeFlags::SUPPORTED_MASK as u64
+    | LINUX_SOCK_STREAM as u64
+    | LINUX_SOCK_DGRAM as u64
+    | LINUX_SOCK_RAW as u64
+    | LINUX_SOCK_SEQPACKET as u64;
+
 pub const LINUX_MSG_OOB: i32 = 0x0001;
 pub const LINUX_MSG_PEEK: i32 = 0x0002;
 pub const LINUX_MSG_DONTROUTE: i32 = 0x0004;

@@ -80,9 +80,8 @@ impl SyscallDispatcher {
         registry: &crate::thread::ThreadRegistry,
         futex: &crate::thread::FutexTable,
     ) -> Option<Result<DispatchOutcome, DispatchError>> {
-        match request.number {
-            93 | 94 | 220 | 221 | 260 | 435 => {}
-            _ => return None,
+        if !syscall_handler_is(request.number, SyscallHandler::Lifecycle) {
+            return None;
         }
 
         let syscall = lookup_aarch64(request.number);
@@ -522,10 +521,8 @@ impl SyscallDispatcher {
         let pid = ctx.arg(0) as libc::pid_t;
         let pgid = ctx.arg(1) as libc::pid_t;
         // SAFETY: setpgid has no memory side effects; errors surface via errno.
-        if unsafe { libc::setpgid(pid, pgid) } < 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: host_errno(),
-            });
+        if let Err(errno) = (unsafe { libc::setpgid(pid, pgid) }).host_syscall_errno() {
+            return Ok(DispatchOutcome::Errno { errno });
         }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
@@ -535,12 +532,10 @@ impl SyscallDispatcher {
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let pid = ctx.arg(0) as libc::pid_t;
-        let r = unsafe { libc::getpgid(pid) };
-        if r < 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: host_errno(),
-            });
-        }
+        let r = match (unsafe { libc::getpgid(pid) }).host_syscall_errno() {
+            Ok(value) => value,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
         Ok(DispatchOutcome::Returned {
             value: i64::from(r),
         })
@@ -551,12 +546,10 @@ impl SyscallDispatcher {
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let pid = ctx.arg(0) as libc::pid_t;
-        let r = unsafe { libc::getsid(pid) };
-        if r < 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: host_errno(),
-            });
-        }
+        let r = match (unsafe { libc::getsid(pid) }).host_syscall_errno() {
+            Ok(value) => value,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
         Ok(DispatchOutcome::Returned {
             value: i64::from(r),
         })
@@ -566,12 +559,10 @@ impl SyscallDispatcher {
         &self,
         _ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let r = unsafe { libc::setsid() };
-        if r < 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: host_errno(),
-            });
-        }
+        let r = match (unsafe { libc::setsid() }).host_syscall_errno() {
+            Ok(value) => value,
+            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+        };
         Ok(DispatchOutcome::Returned {
             value: i64::from(r),
         })
@@ -644,22 +635,24 @@ impl SyscallDispatcher {
         // dies) — same discipline as host_sleep_interruptible and read_host_pipe.
         let result = loop {
             let r = unsafe { libc::waitpid(pid, &mut host_status, host_options) };
-            if r >= 0 {
-                break r;
+            match r.host_syscall_errno() {
+                Ok(value) => break Ok(value),
+                Err(errno) => {
+                    if errno == LINUX_EINTR && !crate::host_signal::has_process_pending() {
+                        continue;
+                    }
+                    break Err(errno);
+                }
             }
-            let e = host_errno();
-            if e == LINUX_EINTR && !crate::host_signal::has_process_pending() {
-                continue;
-            }
-            break -1;
         };
-        if result < 0 {
-            // ECHILD on macOS == ECHILD on Linux (10); EINTR surfaces only when
-            // a guest-deliverable signal is pending (see the retry loop).
-            return Ok(DispatchOutcome::Errno {
-                errno: host_errno(),
-            });
-        }
+        let result = match result {
+            Ok(value) => value,
+            Err(errno) => {
+                // ECHILD on macOS == ECHILD on Linux (10); EINTR surfaces only when
+                // a guest-deliverable signal is pending (see the retry loop).
+                return Ok(DispatchOutcome::Errno { errno });
+            }
+        };
         if result == 0 {
             // WNOHANG and no child ready.
             return Ok(DispatchOutcome::Returned { value: 0 });

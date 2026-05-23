@@ -36,6 +36,7 @@ use std::path::{Component, Path, PathBuf};
 
 use parking_lot::RwLock;
 
+use crate::dispatch::HostSyscallResult;
 use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsError, RootFsMetadata};
 
 /// What an [`FsBackend`] knows about a path. `Dir` and `File` are
@@ -1387,11 +1388,7 @@ impl FsBackend for HostFsBackend {
                 opts,
             )
         };
-        let err = if rc < 0 {
-            Err(crate::dispatch::host_errno())
-        } else {
-            Ok(())
-        };
+        let err = rc.host_syscall_errno().map(|_| ());
         unsafe { libc::close(host_fd) };
         err
     }
@@ -1413,11 +1410,13 @@ impl FsBackend for HostFsBackend {
         // First call with size 0 to learn the value length.
         let needed =
             unsafe { libc::fgetxattr(host_fd, cname.as_ptr(), std::ptr::null_mut(), 0, 0, 0) };
-        if needed < 0 {
-            let err = crate::dispatch::host_errno();
-            unsafe { libc::close(host_fd) };
-            return Err(err);
-        }
+        let needed = match needed.host_syscall_errno() {
+            Ok(needed) => needed,
+            Err(err) => {
+                unsafe { libc::close(host_fd) };
+                return Err(err);
+            }
+        };
         let mut buf = vec![0u8; needed as usize];
         let n = unsafe {
             libc::fgetxattr(
@@ -1429,12 +1428,10 @@ impl FsBackend for HostFsBackend {
                 0,
             )
         };
-        let result = if n < 0 {
-            Err(crate::dispatch::host_errno())
-        } else {
+        let result = n.host_syscall_errno().map(|n| {
             buf.truncate(n as usize);
-            Ok(buf)
-        };
+            buf
+        });
         unsafe { libc::close(host_fd) };
         result
     }
@@ -1447,11 +1444,13 @@ impl FsBackend for HostFsBackend {
         // we read the full NUL-separated list then filter to `user.*` so the
         // result is exactly the Linux-conformant namespace the guest set.
         let needed = unsafe { libc::flistxattr(host_fd, std::ptr::null_mut(), 0, 0) };
-        if needed < 0 {
-            let err = crate::dispatch::host_errno();
-            unsafe { libc::close(host_fd) };
-            return Err(err);
-        }
+        let needed = match needed.host_syscall_errno() {
+            Ok(needed) => needed,
+            Err(err) => {
+                unsafe { libc::close(host_fd) };
+                return Err(err);
+            }
+        };
         let mut buf = vec![0u8; needed as usize];
         let n = unsafe {
             libc::flistxattr(
@@ -1462,9 +1461,7 @@ impl FsBackend for HostFsBackend {
             )
         };
         unsafe { libc::close(host_fd) };
-        if n < 0 {
-            return Err(crate::dispatch::host_errno());
-        }
+        let n = n.host_syscall_errno()?;
         buf.truncate(n as usize);
         let names = buf
             .split(|&b| b == 0)

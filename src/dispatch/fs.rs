@@ -64,16 +64,10 @@ impl IoState {
 }
 
 fn flush_host_fd(host_fd: i32) -> Result<(), i32> {
-    let rc = unsafe { libc::fsync(host_fd) };
-    if rc < 0 {
-        return Err(host_errno());
-    }
+    unsafe { libc::fsync(host_fd) }.host_syscall_errno()?;
     #[cfg(target_os = "macos")]
     if strict_durability_enabled() {
-        let rc = unsafe { libc::fcntl(host_fd, libc::F_FULLFSYNC) };
-        if rc < 0 {
-            return Err(host_errno());
-        }
+        unsafe { libc::fcntl(host_fd, libc::F_FULLFSYNC) }.host_syscall_errno()?;
     }
     Ok(())
 }
@@ -143,26 +137,8 @@ impl SyscallDispatcher {
         if request.number == 64 && !self.write_shared_supported(request.args.0[0] as i32) {
             return None;
         }
-        match request.number {
-            5..=18
-            | 23..=25
-            | 29
-            | 32..=38
-            | 43..=57
-            | 59
-            | 61..=71
-            | 76
-            | 78..=83
-            | 88
-            | 267
-            | 276
-            | 285
-            | 291
-            | 436
-            | 437
-            | 439
-            | 452 => {}
-            _ => return None,
+        if !syscall_handler_is(request.number, SyscallHandler::Filesystem) {
+            return None;
         }
 
         let syscall = lookup_aarch64(request.number);
@@ -624,11 +600,8 @@ impl SyscallDispatcher {
         // kernel and survive `libc::fork(2)` natively. macOS's `pipe(2)`
         // returns two fds: [0] read end, [1] write end.
         let mut host_fds = [0i32; 2];
-        let r = unsafe { libc::pipe(host_fds.as_mut_ptr()) };
-        if r != 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: host_errno(),
-            });
+        if let Err(errno) = (unsafe { libc::pipe(host_fds.as_mut_ptr()) }).host_syscall_errno() {
+            return Ok(DispatchOutcome::Errno { errno });
         }
 
         let host_read = host_fds[0];
@@ -748,12 +721,10 @@ impl SyscallDispatcher {
                 // reach the same host endpoint. Duplicate the host fd
                 // and wrap it as a HostPipe so the write path picks it
                 // up before the bare-stdio fallback.
-                let duped = unsafe { libc::dup(old_fd) };
-                if duped < 0 {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: host_errno(),
-                    });
-                }
+                let duped = match (unsafe { libc::dup(old_fd) }).host_syscall_errno() {
+                    Ok(duped) => duped,
+                    Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                };
                 (
                     Arc::new(RwLock::new(OpenDescription::HostPipe {
                         host_fd: duped,
@@ -1471,8 +1442,10 @@ impl SyscallDispatcher {
             .open_raw_fd(&resolved, true, false, false)
         {
             Some(host_fd) => {
-                let rc = unsafe { libc::ftruncate(host_fd, length as libc::off_t) };
-                let err = if rc < 0 { host_errno() } else { 0 };
+                let err = unsafe { libc::ftruncate(host_fd, length as libc::off_t) }
+                    .host_syscall_errno()
+                    .err()
+                    .unwrap_or(0);
                 unsafe { libc::close(host_fd) };
                 if err != 0 {
                     Ok(DispatchOutcome::Errno { errno: err })
@@ -1543,17 +1516,17 @@ impl SyscallDispatcher {
                     // (the change is visible across fork). KEEP_SIZE → no-op.
                     if grow {
                         let mut st: libc::stat = unsafe { core::mem::zeroed() };
-                        if unsafe { libc::fstat(*host_fd, &mut st) } < 0 {
-                            return Ok(DispatchOutcome::Errno {
-                                errno: host_errno(),
-                            });
+                        if let Err(errno) =
+                            (unsafe { libc::fstat(*host_fd, &mut st) }).host_syscall_errno()
+                        {
+                            return Ok(DispatchOutcome::Errno { errno });
                         }
                         if new_size > st.st_size as u64 {
-                            let r = unsafe { libc::ftruncate(*host_fd, new_size as libc::off_t) };
-                            if r < 0 {
-                                return Ok(DispatchOutcome::Errno {
-                                    errno: host_errno(),
-                                });
+                            if let Err(errno) =
+                                (unsafe { libc::ftruncate(*host_fd, new_size as libc::off_t) })
+                                    .host_syscall_errno()
+                            {
+                                return Ok(DispatchOutcome::Errno { errno });
                             }
                         }
                     }
@@ -1643,11 +1616,11 @@ impl SyscallDispatcher {
                     }
                     // Real fd: ftruncate the kernel file directly (the
                     // change is visible across fork).
-                    let r = unsafe { libc::ftruncate(*host_fd, length as libc::off_t) };
-                    if r < 0 {
-                        return Ok(DispatchOutcome::Errno {
-                            errno: host_errno(),
-                        });
+                    if let Err(errno) =
+                        (unsafe { libc::ftruncate(*host_fd, length as libc::off_t) })
+                            .host_syscall_errno()
+                    {
+                        return Ok(DispatchOutcome::Errno { errno });
                     }
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 }
@@ -2095,12 +2068,10 @@ impl SyscallDispatcher {
                 // host endpoint (this is what dpkg-query needs at
                 // startup to redirect its diagnostic fd, and what most
                 // glibc fork+exec helpers expect to succeed).
-                let duped = unsafe { libc::dup(old_fd) };
-                if duped < 0 {
-                    return DispatchOutcome::Errno {
-                        errno: host_errno(),
-                    };
-                }
+                let duped = match (unsafe { libc::dup(old_fd) }).host_syscall_errno() {
+                    Ok(duped) => duped,
+                    Err(errno) => return DispatchOutcome::Errno { errno },
+                };
                 (
                     Arc::new(RwLock::new(OpenDescription::HostPipe {
                         host_fd: duped,
@@ -2460,12 +2431,12 @@ impl SyscallDispatcher {
                     });
                 }
             };
-            let r = unsafe { libc::lseek(*host_fd, offset as libc::off_t, host_whence) };
-            if r < 0 {
-                return Ok(DispatchOutcome::Errno {
-                    errno: host_errno(),
-                });
-            }
+            let r = match (unsafe { libc::lseek(*host_fd, offset as libc::off_t, host_whence) })
+                .host_syscall_errno()
+            {
+                Ok(value) => value,
+                Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            };
             return Ok(DispatchOutcome::Returned { value: r as i64 });
         }
 
@@ -2769,12 +2740,10 @@ impl SyscallDispatcher {
                     offset as libc::off_t,
                 )
             };
-            if n < 0 {
-                return Ok(DispatchOutcome::Errno {
-                    errno: host_errno(),
-                });
-            }
-            let n = n as usize;
+            let n = match n.host_syscall_errno() {
+                Ok(value) => value as usize,
+                Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            };
             if n > 0 && memory.write_bytes(buffer, &buf[..n]).is_err() {
                 return Ok(DispatchOutcome::Errno {
                     errno: LINUX_EFAULT,
@@ -2852,12 +2821,10 @@ impl SyscallDispatcher {
                 let n = unsafe {
                     libc::pread(hfd, buf.as_mut_ptr() as *mut _, len, cur as libc::off_t)
                 };
-                if n < 0 {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: host_errno(),
-                    });
-                }
-                let n = n as usize;
+                let n = match n.host_syscall_errno() {
+                    Ok(value) => value as usize,
+                    Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                };
                 if n > 0 && memory.write_bytes(iov.iov_base, &buf[..n]).is_err() {
                     return Ok(DispatchOutcome::Errno {
                         errno: LINUX_EFAULT,
@@ -2943,11 +2910,10 @@ impl SyscallDispatcher {
                     offset as libc::off_t,
                 )
             };
-            if n < 0 {
-                return Ok(DispatchOutcome::Errno {
-                    errno: host_errno(),
-                });
-            }
+            let n = match n.host_syscall_errno() {
+                Ok(value) => value,
+                Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            };
             return Ok(DispatchOutcome::Returned { value: n as i64 });
         }
         let errno = match &*open {
@@ -3030,11 +2996,10 @@ impl SyscallDispatcher {
                 };
                 let n =
                     unsafe { libc::pwrite(hfd, buf.as_ptr() as *const _, len, cur as libc::off_t) };
-                if n < 0 {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: host_errno(),
-                    });
-                }
+                let n = match n.host_syscall_errno() {
+                    Ok(value) => value,
+                    Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                };
                 total += n as i64;
                 cur += n as i64;
                 if (n as usize) < len {
@@ -3198,12 +3163,10 @@ impl SyscallDispatcher {
                     out_off as libc::off_t,
                 )
             };
-            if n < 0 {
-                return Ok(DispatchOutcome::Errno {
-                    errno: host_errno(),
-                });
-            }
-            let n = n as usize;
+            let n = match n.host_syscall_errno() {
+                Ok(value) => value as usize,
+                Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            };
             if memory
                 .write_bytes(off_out_addr, &(out_off + n as u64).to_ne_bytes())
                 .is_err()
@@ -3351,11 +3314,9 @@ impl SyscallDispatcher {
             | OpenDescription::SyntheticFile { offset, .. } => Ok(Ok(*offset)),
             // HostFile: current offset is the kernel's; query via lseek.
             OpenDescription::HostFile { host_fd, .. } => {
-                let cur = unsafe { libc::lseek(*host_fd, 0, libc::SEEK_CUR) };
-                if cur < 0 {
-                    Ok(Err(host_errno()))
-                } else {
-                    Ok(Ok(cur as usize))
+                match (unsafe { libc::lseek(*host_fd, 0, libc::SEEK_CUR) }).host_syscall_errno() {
+                    Ok(cur) => Ok(Ok(cur as usize)),
+                    Err(errno) => Ok(Err(errno)),
                 }
             }
             OpenDescription::Directory { .. }
@@ -3386,9 +3347,7 @@ impl SyscallDispatcher {
                     offset as libc::off_t,
                 )
             };
-            if n < 0 {
-                return Err(host_errno());
-            }
+            let n = n.host_syscall_errno()?;
             buf.truncate(n as usize);
             return Ok(buf);
         }
@@ -3467,11 +3426,10 @@ impl SyscallDispatcher {
             // niche path to the lockless wait is a tracked follow-up, not a
             // server hot path.
             let n = unsafe { libc::read(host_fd, buf.as_mut_ptr() as *mut _, count) };
-            if n < 0 {
-                return Ok(DispatchOutcome::Errno {
-                    errno: host_errno(),
-                });
-            }
+            let n = match n.host_syscall_errno() {
+                Ok(value) => value,
+                Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            };
             buf.truncate(n as usize);
             let outcome = self.write_output_fd(out_fd, &buf);
             return Ok(outcome);
@@ -4381,13 +4339,12 @@ impl SyscallDispatcher {
                 // BLOCKING-IO-OK: streamed writev to the inherited stdout/
                 // stderr (the user's tty/pipe); blocking is correct backpressure.
                 let n = unsafe { libc::write(fd as i32, bytes.as_ptr() as *const _, bytes.len()) };
-                if n < 0 {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: host_errno(),
-                    });
-                }
+                let n = match n.host_syscall_errno() {
+                    Ok(value) => value as usize,
+                    Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                };
                 total = total
-                    .checked_add(n as usize)
+                    .checked_add(n)
                     .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
                 continue;
             }

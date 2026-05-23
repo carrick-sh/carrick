@@ -41,9 +41,8 @@ impl SyscallDispatcher {
         memory: &mut M,
         reporter: &CompatReporter,
     ) -> Option<Result<DispatchOutcome, DispatchError>> {
-        match request.number {
-            214..=216 | 222 | 223 | 226..=233 | 283 => {}
-            _ => return None,
+        if !syscall_handler_is(request.number, SyscallHandler::Memory) {
+            return None;
         }
 
         let syscall = lookup_aarch64(request.number);

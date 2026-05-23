@@ -9,11 +9,32 @@ pub enum SupportLevel {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyscallHandler {
+    BootstrapStub,
+    Credentials,
+    Filesystem,
+    Lifecycle,
+    Memory,
+    Network,
+    Process,
+    Signal,
+    ThreadLocal,
+    Time,
+    Unimplemented,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Syscall {
     pub number: u64,
     pub name: &'static str,
+    pub group: &'static str,
+    #[serde(skip_serializing)]
     pub subsystem: &'static str,
     pub support: SupportLevel,
+    pub handler: SyscallHandler,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compat_note: Option<&'static str>,
 }
 
 pub fn lookup_aarch64(number: u64) -> Option<&'static Syscall> {
@@ -30,14 +51,69 @@ pub fn aarch64_table() -> &'static [Syscall] {
 const fn syscall(
     number: u64,
     name: &'static str,
-    subsystem: &'static str,
+    group: &'static str,
     support: SupportLevel,
 ) -> Syscall {
     Syscall {
         number,
         name,
-        subsystem,
+        group,
+        subsystem: group,
         support,
+        handler: handler_for_aarch64(number),
+        compat_note: compat_note_for_aarch64(number),
+    }
+}
+
+pub const fn handler_for_aarch64(number: u64) -> SyscallHandler {
+    match number {
+        5..=17
+        | 23..=25
+        | 29
+        | 32..=38
+        | 43..=50
+        | 52..=57
+        | 59
+        | 61..=71
+        | 76
+        | 78..=83
+        | 88
+        | 267
+        | 276
+        | 285
+        | 291
+        | 436
+        | 437
+        | 439
+        | 452 => SyscallHandler::Filesystem,
+        19..=22 | 72 | 73 | 198..=212 | 242 | 243 | 269 => SyscallHandler::Network,
+        85..=87 | 101..=103 | 112..=115 | 153 | 165 | 169..=171 | 179 | 261 | 266 => {
+            SyscallHandler::Time
+        }
+        214..=216 | 222 | 223 | 226..=233 | 283 => SyscallHandler::Memory,
+        90 | 91 | 140 | 141 | 143..=152 | 158 | 159 | 166 | 174..=177 => {
+            SyscallHandler::Credentials
+        }
+        92 | 95 | 117 | 123 | 142 | 154..=157 | 160..=162 | 167 | 168 | 172 | 173 | 278 | 293 => {
+            SyscallHandler::Process
+        }
+        93 | 94 | 220 | 221 | 260 | 435 => SyscallHandler::Lifecycle,
+        129..=139 => SyscallHandler::Signal,
+        96 | 98 | 99 | 124 | 178 => SyscallHandler::ThreadLocal,
+        74 | 75 | 77 => SyscallHandler::BootstrapStub,
+        _ => SyscallHandler::Unimplemented,
+    }
+}
+
+pub const fn compat_note_for_aarch64(number: u64) -> Option<&'static str> {
+    match number {
+        14..=16 => Some("xattr removal is reported as unsupported for bring-up compatibility"),
+        74 => Some("signalfd4 is an explicit bootstrap ENOSYS stub"),
+        75 => Some("vmsplice is an explicit bootstrap ENOSYS stub"),
+        77 => Some("tee is an explicit bootstrap ENOSYS stub"),
+        281 => Some("execveat remains planned and currently routes to unimplemented ENOSYS"),
+        435 => Some("clone3 is partially handled for the clone/fork modes Carrick supports"),
+        _ => None,
     }
 }
 

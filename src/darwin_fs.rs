@@ -1,6 +1,6 @@
 //! Small Darwin filesystem primitives used by Linux syscall emulation.
 
-use crate::dispatch::host_errno;
+use crate::dispatch::HostSyscallError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CopyfileResult {
@@ -57,7 +57,7 @@ impl CopyfileState {
     fn new() -> Result<Self, i32> {
         let raw = unsafe { libc::copyfile_state_alloc() };
         if raw.is_null() {
-            return Err(host_errno());
+            return Err(HostSyscallError::last().linux_errno());
         }
         Ok(Self { raw })
     }
