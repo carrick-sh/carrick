@@ -19,6 +19,9 @@
 use std::os::fd::RawFd;
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "macos")]
+use crate::darwin_kqueue::{Kevent, Kqueue};
+
 /// Result of a blocking-I/O wait.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitResult {
@@ -77,7 +80,8 @@ impl PinnedWaitFds {
 
 /// A per-thread kqueue + its registration of the self-pipe wake channel.
 pub struct ThreadWaiter {
-    kq: RawFd,
+    #[cfg(target_os = "macos")]
+    kq: Option<Kqueue>,
     /// The self-pipe read fd this waiter registered, or `-1` if unavailable.
     pipe_read: RawFd,
     /// The guest tid this waiter runs for, so a pending signal targeted at a
@@ -90,31 +94,21 @@ pub struct ThreadWaiter {
 impl ThreadWaiter {
     #[cfg(target_os = "macos")]
     pub fn new(tid: crate::thread::ThreadId) -> Self {
-        let raw_kq = unsafe { libc::kqueue() };
-        let kq = if raw_kq >= 0 {
-            crate::host_signal::relocate_internal_fd(raw_kq)
-        } else {
-            raw_kq
-        };
+        let kq = Kqueue::new_internal();
         let pipe_read = crate::host_signal::pending_pipe_read_fd();
-        if kq >= 0 && pipe_read >= 0 {
+        if let Some(kq) = kq.as_ref()
+            && pipe_read >= 0
+        {
             // Persistent EVFILT_READ on the self-pipe: any byte the signal
             // handler writes wakes this thread's kevent() immediately.
-            let change = ev(pipe_read, libc::EVFILT_READ, libc::EV_ADD);
-            unsafe {
-                libc::kevent(kq, &change, 1, std::ptr::null_mut(), 0, std::ptr::null());
-            }
+            let _ = kq.apply(&[Kevent::read(pipe_read, libc::EV_ADD)]);
         }
         Self { kq, pipe_read, tid }
     }
 
     #[cfg(not(target_os = "macos"))]
     pub fn new(tid: crate::thread::ThreadId) -> Self {
-        Self {
-            kq: -1,
-            pipe_read: -1,
-            tid,
-        }
+        Self { pipe_read: -1, tid }
     }
 
     /// Block until one of `fds` (host fds, with `libc::POLL*` event masks) is
@@ -151,8 +145,8 @@ impl ThreadWaiter {
         let result;
         #[cfg(target_os = "macos")]
         {
-            if self.kq >= 0 {
-                result = self.wait_kqueue(wait_fds, timeout);
+            if let Some(kq) = self.kq.as_ref() {
+                result = self.wait_kqueue(kq, wait_fds, timeout);
                 crate::probes::io_wait_end(
                     self.tid,
                     wait_result_code(result),
@@ -177,19 +171,24 @@ impl ThreadWaiter {
     }
 
     #[cfg(target_os = "macos")]
-    fn wait_kqueue(&self, fds: &[(i32, i16)], timeout: Option<Duration>) -> WaitResult {
+    fn wait_kqueue(
+        &self,
+        kq: &Kqueue,
+        fds: &[(i32, i16)],
+        timeout: Option<Duration>,
+    ) -> WaitResult {
         let deadline = timeout.map(|d| Instant::now() + d);
-        let mut changes: Vec<libc::kevent> = Vec::with_capacity(fds.len() * 2);
+        let mut changes: Vec<Kevent> = Vec::with_capacity(fds.len() * 2);
         for &(fd, events) in fds {
             if events & libc::POLLIN != 0 {
-                changes.push(ev(fd, libc::EVFILT_READ, libc::EV_ADD));
+                changes.push(Kevent::read(fd, libc::EV_ADD));
             }
             if events & libc::POLLOUT != 0 {
-                changes.push(ev(fd, libc::EVFILT_WRITE, libc::EV_ADD));
+                changes.push(Kevent::write(fd, libc::EV_ADD));
             }
         }
         let cap = (changes.len() + 1).max(1);
-        let mut events_out: Vec<libc::kevent> = vec![zeroed_kevent(); cap];
+        let mut events_out: Vec<Kevent> = vec![Kevent::empty(); cap];
 
         let result = loop {
             let ts = match deadline {
@@ -208,34 +207,23 @@ impl ThreadWaiter {
                     tv_nsec: 50_000_000,
                 }),
             };
-            let ts_ptr = ts.as_ref().map_or(std::ptr::null(), |t| t as *const _);
-            let n = unsafe {
-                libc::kevent(
-                    self.kq,
-                    if changes.is_empty() {
-                        std::ptr::null()
-                    } else {
-                        changes.as_ptr()
-                    },
-                    changes.len() as libc::c_int,
-                    events_out.as_mut_ptr(),
-                    events_out.len() as libc::c_int,
-                    ts_ptr,
-                )
-            };
+            let n = kq.wait(&changes, &mut events_out, ts.as_ref());
             changes.clear(); // registrations persist; only re-add once.
 
-            if n < 0 {
-                // EINTR (a signal raced in) — re-check the pending flag.
-                if crate::host_signal::has_pending_for(self.tid) {
-                    break WaitResult::Interrupted;
+            let n = match n {
+                Ok(n) => n,
+                Err(_) => {
+                    // EINTR (a signal raced in) — re-check the pending flag.
+                    if crate::host_signal::has_pending_for(self.tid) {
+                        break WaitResult::Interrupted;
+                    }
+                    continue;
                 }
-                continue;
-            }
+            };
             let mut fd_ready = false;
             let mut pipe_woke = false;
-            for e in &events_out[..n as usize] {
-                if e.ident as RawFd == self.pipe_read && e.filter == libc::EVFILT_READ {
+            for e in &events_out[..n] {
+                if e.is_read_for_fd(self.pipe_read) {
                     pipe_woke = true;
                 } else {
                     // A real fd event, OR an EV_ERROR on a bad fd: either way,
@@ -256,40 +244,31 @@ impl ThreadWaiter {
             // is re-checked at the top of the loop).
         };
 
-        self.clear_fd_registrations(fds);
+        self.clear_fd_registrations(kq, fds);
         result
     }
 
     /// Remove the per-wait fd filters so they don't accumulate on the long-lived
     /// kqueue. ENOENT (already gone) is fine.
     #[cfg(target_os = "macos")]
-    fn clear_fd_registrations(&self, fds: &[(i32, i16)]) {
+    fn clear_fd_registrations(&self, kq: &Kqueue, fds: &[(i32, i16)]) {
         if fds.is_empty() {
             return;
         }
-        let mut deletes: Vec<libc::kevent> = Vec::with_capacity(fds.len() * 2);
+        let mut deletes: Vec<Kevent> = Vec::with_capacity(fds.len() * 2);
         for &(fd, events) in fds {
             if events & libc::POLLIN != 0 {
-                deletes.push(ev(fd, libc::EVFILT_READ, libc::EV_DELETE));
+                deletes.push(Kevent::read(fd, libc::EV_DELETE));
             }
             if events & libc::POLLOUT != 0 {
-                deletes.push(ev(fd, libc::EVFILT_WRITE, libc::EV_DELETE));
+                deletes.push(Kevent::write(fd, libc::EV_DELETE));
             }
         }
         let zero = libc::timespec {
             tv_sec: 0,
             tv_nsec: 0,
         };
-        unsafe {
-            libc::kevent(
-                self.kq,
-                deletes.as_ptr(),
-                deletes.len() as libc::c_int,
-                std::ptr::null_mut(),
-                0,
-                &zero,
-            );
-        }
+        let _ = kq.wait(&deletes, &mut [], Some(&zero));
     }
 
     /// Bounded poll loop used when kqueue is unavailable (non-macOS stubs, or a
@@ -334,43 +313,11 @@ impl ThreadWaiter {
     }
 }
 
-impl Drop for ThreadWaiter {
-    fn drop(&mut self) {
-        if self.kq >= 0 {
-            unsafe { libc::close(self.kq) };
-        }
-    }
-}
-
 fn wait_result_code(result: WaitResult) -> i32 {
     match result {
         WaitResult::Ready => 0,
         WaitResult::TimedOut => 1,
         WaitResult::Interrupted => 2,
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn ev(fd: i32, filter: i16, flags: u16) -> libc::kevent {
-    libc::kevent {
-        ident: fd as usize,
-        filter,
-        flags,
-        fflags: 0,
-        data: 0,
-        udata: std::ptr::null_mut(),
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn zeroed_kevent() -> libc::kevent {
-    libc::kevent {
-        ident: 0,
-        filter: 0,
-        flags: 0,
-        fflags: 0,
-        data: 0,
-        udata: std::ptr::null_mut(),
     }
 }
 
