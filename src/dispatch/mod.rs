@@ -246,6 +246,7 @@ use crate::linux_abi::{
     LINUX_SOCK_SEQPACKET,
     LINUX_SOCK_STREAM,
     LINUX_SOCKADDR_STORAGE_SIZE,
+    LINUX_SOCKET_TYPE_SUPPORTED_MASK,
     LINUX_SOL_IP,
     LINUX_SOL_IPV6,
     LINUX_SOL_SOCKET,
@@ -332,7 +333,7 @@ use crate::linux_abi::{
 use crate::memory::{LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE, LINUX_MMAP_SIZE};
 use crate::overlay::OverlayEntry;
 use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsError, RootFsMetadata};
-use crate::syscall::lookup_aarch64;
+use crate::syscall::{SyscallHandler, lookup_aarch64};
 use parking_lot::{Condvar, Mutex, RwLock};
 use serde::Serialize;
 use thiserror::Error;
@@ -350,6 +351,10 @@ pub use crate::vfs::ProcMapsEntry;
 
 #[allow(dead_code)]
 const MAX_GUEST_PATH: usize = 4096;
+
+fn syscall_handler_is(number: u64, handler: SyscallHandler) -> bool {
+    lookup_aarch64(number).is_some_and(|syscall| syscall.handler == handler)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct SyscallRequest {
@@ -1679,21 +1684,8 @@ impl SyscallDispatcher {
         memory: &mut impl GuestMemory,
         reporter: &CompatReporter,
     ) -> Option<Result<DispatchOutcome, DispatchError>> {
-        match request.number {
-            92
-            | 95
-            | 117
-            | 123
-            | 142
-            | 154..=157
-            | 160..=162
-            | 167
-            | 168
-            | 172
-            | 173
-            | 278
-            | 293 => {}
-            _ => return None,
+        if !syscall_handler_is(request.number, SyscallHandler::Process) {
+            return None;
         }
 
         let syscall = lookup_aarch64(request.number);
@@ -1770,9 +1762,8 @@ impl SyscallDispatcher {
         memory: &mut impl GuestMemory,
         reporter: &CompatReporter,
     ) -> Option<Result<DispatchOutcome, DispatchError>> {
-        match request.number {
-            90 | 91 | 140 | 141 | 143..=152 | 158 | 159 | 166 | 174..=177 => {}
-            _ => return None,
+        if !syscall_handler_is(request.number, SyscallHandler::Credentials) {
+            return None;
         }
 
         let syscall = lookup_aarch64(request.number);
@@ -1977,9 +1968,8 @@ impl SyscallDispatcher {
         registry: &crate::thread::ThreadRegistry,
         futex: &crate::thread::FutexTable,
     ) -> Option<Result<DispatchOutcome, DispatchError>> {
-        match request.number {
-            96 | 98 | 99 | 124 | 130 | 131 | 178 => {}
-            _ => return None,
+        if !syscall_handler_is(request.number, SyscallHandler::ThreadLocal) {
+            return None;
         }
         match request.number {
             130 => {
@@ -2234,12 +2224,6 @@ const SYSCALL_FLAG_VALIDATORS: &[(u64, u32, u64)] = &[
         LINUX_AT_EMPTY_PATH | LINUX_AT_SYMLINK_NOFOLLOW | 0x200, /* AT_EACCESS */
     ),
 ];
-
-const LINUX_SOCKET_TYPE_SUPPORTED_MASK: u64 = LinuxSocketTypeFlags::SUPPORTED_MASK as u64
-    | LINUX_SOCK_STREAM as u64
-    | LINUX_SOCK_DGRAM as u64
-    | LINUX_SOCK_RAW as u64
-    | LINUX_SOCK_SEQPACKET as u64;
 
 /// Systematic unknown-flag detector for syscalls.
 ///
@@ -3729,11 +3713,70 @@ fn vfs_md_to_rootfs_md(path: &str, md: &crate::vfs::Metadata) -> RootFsMetadata 
     }
 }
 
-pub(crate) fn host_errno() -> i32 {
-    // SAFETY: `__errno_location` (Linux) and `__error` (macOS) both
-    // return a thread-local int pointer.
-    let raw = unsafe { *libc::__error() };
-    macos_to_linux_errno(raw)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HostSyscallError {
+    raw_errno: i32,
+    linux_errno: i32,
+}
+
+impl HostSyscallError {
+    pub(crate) fn last() -> Self {
+        // SAFETY: `__errno_location` (Linux) and `__error` (macOS) both
+        // return a thread-local int pointer.
+        let raw_errno = unsafe { *libc::__error() };
+        Self {
+            raw_errno,
+            linux_errno: macos_to_linux_errno(raw_errno),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn raw_errno(self) -> i32 {
+        self.raw_errno
+    }
+
+    pub(crate) fn linux_errno(self) -> i32 {
+        self.linux_errno
+    }
+}
+
+pub(crate) trait HostSyscallResult: Sized {
+    fn host_syscall_result(self) -> Result<Self, HostSyscallError>;
+
+    fn host_syscall_errno(self) -> Result<Self, i32> {
+        self.host_syscall_result()
+            .map_err(HostSyscallError::linux_errno)
+    }
+}
+
+impl HostSyscallResult for i32 {
+    fn host_syscall_result(self) -> Result<Self, HostSyscallError> {
+        if self < 0 {
+            Err(HostSyscallError::last())
+        } else {
+            Ok(self)
+        }
+    }
+}
+
+impl HostSyscallResult for isize {
+    fn host_syscall_result(self) -> Result<Self, HostSyscallError> {
+        if self < 0 {
+            Err(HostSyscallError::last())
+        } else {
+            Ok(self)
+        }
+    }
+}
+
+impl HostSyscallResult for i64 {
+    fn host_syscall_result(self) -> Result<Self, HostSyscallError> {
+        if self < 0 {
+            Err(HostSyscallError::last())
+        } else {
+            Ok(self)
+        }
+    }
 }
 
 /// Linux UAPI errno values. Sourced from
@@ -3921,8 +3964,7 @@ fn read_host_pipe(
     let n = unsafe { libc::read(host_fd, buf.as_mut_ptr() as *mut _, length) };
     #[cfg(target_os = "macos")]
     crate::probes::host_pipe_io(host_fd, 0, n as i64);
-    if n < 0 {
-        let e = host_errno();
+    if let Err(e) = n.host_syscall_errno() {
         // EINTR: interrupted by a HOST signal. Don't surface it to the guest —
         // carrick's internal machinery raises frequent host signals (e.g. the
         // SIGURG vCPU kick), and leaking their EINTR spins the guest's read in
@@ -3950,8 +3992,7 @@ fn write_host_pipe(bytes: &[u8], host_fd: i32, nonblocking: bool) -> DispatchOut
     let n = unsafe { libc::write(host_fd, bytes.as_ptr() as *const _, bytes.len()) };
     #[cfg(target_os = "macos")]
     crate::probes::host_pipe_io(host_fd, 1, n as i64);
-    if n < 0 {
-        let e = host_errno();
+    if let Err(e) = n.host_syscall_errno() {
         // EINTR: interrupted by an internal host signal (e.g. SIGURG vCPU kick).
         // Route through the readiness wait rather than leaking it to the guest
         // (see read_host_pipe).
@@ -4456,6 +4497,38 @@ mod overlay_dispatch_tests {
             macos_to_linux_errno(libc::ECANCELED),
             linux_errno::ECANCELED
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_syscall_result_translates_captured_host_errno() {
+        use crate::dispatch::{HostSyscallResult, linux_errno};
+
+        unsafe {
+            *libc::__error() = libc::EINPROGRESS;
+        }
+        let err = (-1i32).host_syscall_result().unwrap_err();
+        assert_eq!(err.raw_errno(), libc::EINPROGRESS);
+        assert_eq!(err.linux_errno(), linux_errno::EINPROGRESS);
+        assert_ne!(err.linux_errno(), libc::EINPROGRESS);
+
+        unsafe {
+            *libc::__error() = libc::EAGAIN;
+        }
+        assert_eq!(
+            (-1isize).host_syscall_result().unwrap_err().linux_errno(),
+            linux_errno::EAGAIN
+        );
+
+        unsafe {
+            *libc::__error() = libc::ECONNREFUSED;
+        }
+        assert_eq!(
+            (-1i64).host_syscall_errno().unwrap_err(),
+            linux_errno::ECONNREFUSED
+        );
+
+        assert_eq!(0i32.host_syscall_result().unwrap(), 0);
     }
 
     #[test]

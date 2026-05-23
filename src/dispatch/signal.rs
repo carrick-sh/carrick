@@ -45,9 +45,8 @@ impl SyscallDispatcher {
         registry: &crate::thread::ThreadRegistry,
         futex: &crate::thread::FutexTable,
     ) -> Option<Result<DispatchOutcome, DispatchError>> {
-        match request.number {
-            129..=139 => {}
-            _ => return None,
+        if !syscall_handler_is(request.number, SyscallHandler::Signal) {
+            return None;
         }
 
         let syscall = lookup_aarch64(request.number);
@@ -784,10 +783,8 @@ fn bootstrap_signal_send(target: i64, tid_required: bool, signum: u64) -> Dispat
     // 10 vs 30). `wait4` translates the resulting status back to Linux.
     let host_signum = crate::host_signal::linux_to_host_signum(signum as i32);
     let rc = unsafe { libc::kill(target as i32, host_signum) };
-    if rc < 0 {
-        return DispatchOutcome::Errno {
-            errno: host_errno(),
-        };
+    if let Err(errno) = rc.host_syscall_errno() {
+        return DispatchOutcome::Errno { errno };
     }
     DispatchOutcome::Returned { value: 0 }
 }
