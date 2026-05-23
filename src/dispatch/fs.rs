@@ -577,7 +577,7 @@ impl SyscallDispatcher {
     }
 
     fn synthetic_access(&self, path: &str, mode: u64) -> Option<DispatchOutcome> {
-        if !is_synthetic_virtual_file(path, &self.synthetic_proc_context()) {
+        if !crate::vfs::is_synthetic_virtual_file(path, &self.synthetic_proc_context()) {
             return None;
         }
         Some(synthetic_readonly_access(mode))
@@ -595,7 +595,7 @@ impl SyscallDispatcher {
         } else if path.starts_with("/sys/") {
             // /sys paths that are synthesized must not be recorded as unimplemented;
             // they are handled by the synthetic open path before reaching ENOENT.
-            if synthetic_sys_file(path).is_some() {
+            if crate::vfs::sys::synthetic_file(path).is_some() {
                 return None;
             }
             reporter.record(CompatEvent::sys_read_unimplemented(path.to_owned()));
@@ -1446,7 +1446,7 @@ impl SyscallDispatcher {
             Ok(resolved) => resolved,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        if is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context()) {
+        if crate::vfs::is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context()) {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EROFS });
         }
         // Layered metadata (overlay/disk first, then rootfs) — not rootfs-only,
@@ -4496,7 +4496,7 @@ impl SyscallDispatcher {
             Ok(resolved) => resolved,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        if is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context()) {
+        if crate::vfs::is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context()) {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EEXIST,
             });
@@ -4559,7 +4559,7 @@ impl SyscallDispatcher {
             Ok(resolved) => resolved,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        if is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context()) {
+        if crate::vfs::is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context()) {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EEXIST,
             });
@@ -4721,7 +4721,8 @@ impl SyscallDispatcher {
                 Ok(DispatchOutcome::Returned { value: 0 })
             }
             Err(errno) => {
-                if is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context()) {
+                if crate::vfs::is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context())
+                {
                     Ok(DispatchOutcome::Returned { value: 0 })
                 } else {
                     Ok(DispatchOutcome::Errno { errno })
@@ -4762,7 +4763,7 @@ impl SyscallDispatcher {
         // Apply the mode to the writable backend (cap-std set_permissions on
         // --fs host). Synthetic /proc /sys paths and the in-memory backend
         // (Unsupported) accept it as a no-op as long as the path exists.
-        if is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context()) {
+        if crate::vfs::is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context()) {
             return Ok(DispatchOutcome::Returned { value: 0 });
         }
         if let Err(errno) = self.layered_metadata(&resolved) {
@@ -4819,8 +4820,9 @@ impl SyscallDispatcher {
                 Ok(resolved) => resolved,
                 Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
             };
-            let exists = is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context())
-                || self.layered_metadata(&resolved).is_ok();
+            let exists =
+                crate::vfs::is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context())
+                    || self.layered_metadata(&resolved).is_ok();
             if !exists {
                 return Ok(DispatchOutcome::Errno {
                     errno: LINUX_ENOENT,
@@ -4832,7 +4834,7 @@ impl SyscallDispatcher {
             Ok(resolved) => resolved,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        if is_synthetic_virtual_file(&resolved_new, &self.synthetic_proc_context())
+        if crate::vfs::is_synthetic_virtual_file(&resolved_new, &self.synthetic_proc_context())
             || self.layered_metadata(&resolved_new).is_ok()
         {
             return Ok(DispatchOutcome::Errno {
@@ -4907,7 +4909,7 @@ impl SyscallDispatcher {
             Ok(resolved) => resolved,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        if is_synthetic_virtual_file(&resolved_link, &self.synthetic_proc_context()) {
+        if crate::vfs::is_synthetic_virtual_file(&resolved_link, &self.synthetic_proc_context()) {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EEXIST,
             });
@@ -5013,8 +5015,8 @@ impl SyscallDispatcher {
             Ok(path) => path,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        if is_synthetic_virtual_file(&resolved_old, &self.synthetic_proc_context())
-            || is_synthetic_virtual_file(&resolved_new, &self.synthetic_proc_context())
+        if crate::vfs::is_synthetic_virtual_file(&resolved_old, &self.synthetic_proc_context())
+            || crate::vfs::is_synthetic_virtual_file(&resolved_new, &self.synthetic_proc_context())
         {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EROFS });
         }
@@ -5056,7 +5058,7 @@ impl SyscallDispatcher {
         };
         let remove_dir = flags & LINUX_AT_REMOVEDIR != 0;
         // Synthetic /proc /sys paths can't be unlinked.
-        if is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context()) {
+        if crate::vfs::is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context()) {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EROFS });
         }
         use crate::vfs::Vfs as _;
@@ -5160,7 +5162,7 @@ impl SyscallDispatcher {
         match self.layered_metadata(&path) {
             Ok(_) => {}
             Err(errno) => {
-                if is_synthetic_virtual_file(&path, &self.synthetic_proc_context()) {
+                if crate::vfs::is_synthetic_virtual_file(&path, &self.synthetic_proc_context()) {
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 }
                 crate::probes::fs_op("utimensat:meta_err", &path, errno);
@@ -5223,7 +5225,9 @@ impl SyscallDispatcher {
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
         // Synthetic /proc /sys paths first.
-        if let Some(contents) = synthetic_proc_file(&path, &self.synthetic_proc_context()) {
+        if let Some(contents) =
+            crate::vfs::proc::synthetic_file(&path, &self.synthetic_proc_context())
+        {
             return Ok(write_synthetic_stat(
                 memory,
                 statbuf,
@@ -5232,7 +5236,7 @@ impl SyscallDispatcher {
                 LINUX_S_IFREG | 0o444,
             ));
         }
-        if let Some(contents) = synthetic_sys_file(&path) {
+        if let Some(contents) = crate::vfs::sys::synthetic_file(&path) {
             return Ok(write_synthetic_stat(
                 memory,
                 statbuf,
@@ -5316,7 +5320,9 @@ impl SyscallDispatcher {
             Ok(path) => path,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
-        if let Some(contents) = synthetic_proc_file(&path, &self.synthetic_proc_context()) {
+        if let Some(contents) =
+            crate::vfs::proc::synthetic_file(&path, &self.synthetic_proc_context())
+        {
             return Ok(write_synthetic_statx(
                 memory,
                 statxbuf,
@@ -5324,7 +5330,7 @@ impl SyscallDispatcher {
                 contents.len(),
             ));
         }
-        if let Some(contents) = synthetic_sys_file(&path) {
+        if let Some(contents) = crate::vfs::sys::synthetic_file(&path) {
             return Ok(write_synthetic_statx(
                 memory,
                 statxbuf,

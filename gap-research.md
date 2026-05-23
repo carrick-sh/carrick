@@ -62,6 +62,9 @@ Work package progress:
   - Completed: added syscall-thread regression coverage for both `FUTEX_REQUEUE` and `FUTEX_CMP_REQUEUE`.
   - Verified both commands keep returning `ENOSYS` and emit the stable `FUTEX_(CMP_)REQUEUE unsupported` compatibility event.
 - [ ] Package 6. VFS and Stat Ownership
+  - Completed L1: moved synthetic `/proc` and `/sys` file registration/rendering ownership into `vfs::proc` and `vfs::sys`; dispatcher now supplies live context only.
+  - Verified VFS proc/sys unit tests plus existing synthetic `/proc` and `/sys` syscall-surface tests.
+  - Remaining: L2 fd operation helpers and L3 shared stat/statx record construction.
 - [ ] Hygiene gates and final verification sweep
 
 ## Executive Summary
@@ -496,7 +499,7 @@ Recommendation:
 
 Validation target:
 
-- Adding a new `/proc` file requires a VFS table entry and tests, not edits across dispatcher routing.
+- Adding a new `/proc` file requires a VFS module entry and tests, not edits across dispatcher routing. Completed for the synthetic proc/sys registries.
 
 ### L2. `OpenDescription` has become the fd subsystem boundary
 
