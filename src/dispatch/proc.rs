@@ -158,9 +158,7 @@ impl SyscallDispatcher {
             LINUX_PR_SET_DUMPABLE => {
                 let value = ctx.request.arg(1);
                 if value > 1 {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: LINUX_EINVAL,
-                    });
+                    return Ok(LINUX_EINVAL.into());
                 }
                 self.proc.lock().dumpable = value as i64;
                 DispatchOutcome::Returned { value: 0 }
@@ -168,9 +166,7 @@ impl SyscallDispatcher {
             LINUX_PR_SET_NAME => {
                 let address = ctx.request.arg(1);
                 let Ok(bytes) = memory.read_bytes(address, LINUX_TASK_COMM_LEN) else {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: LINUX_EFAULT,
-                    });
+                    return Ok(LINUX_EFAULT.into());
                 };
                 let task_name = linux_task_name_from_bytes(&bytes);
                 self.proc.lock().task_name = task_name;
@@ -185,9 +181,7 @@ impl SyscallDispatcher {
                 let address = ctx.request.arg(1);
                 let task_name = self.proc.lock().task_name;
                 if memory.write_bytes(address, &task_name).is_err() {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: LINUX_EFAULT,
-                    });
+                    return Ok(LINUX_EFAULT.into());
                 }
                 DispatchOutcome::Returned { value: 0 }
             }
@@ -196,9 +190,7 @@ impl SyscallDispatcher {
                 // else is EINVAL (what the kernel returns).
                 let sig = ctx.request.arg(1);
                 if sig > 64 {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: LINUX_EINVAL,
-                    });
+                    return Ok(LINUX_EINVAL.into());
                 }
                 self.proc.lock().pdeathsig = sig as i64;
                 DispatchOutcome::Returned { value: 0 }
@@ -210,15 +202,11 @@ impl SyscallDispatcher {
                     .write_bytes(address, &(pdeathsig as i32).to_ne_bytes())
                     .is_err()
                 {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: LINUX_EFAULT,
-                    });
+                    return Ok(LINUX_EFAULT.into());
                 }
                 DispatchOutcome::Returned { value: 0 }
             }
-            _ => DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            },
+            _ => DispatchOutcome::errno(LINUX_EINVAL),
         })
     }
 
@@ -232,14 +220,10 @@ impl SyscallDispatcher {
         let bootstrap_value = 0u32.to_ne_bytes();
 
         if cpu_address != 0 && memory.write_bytes(cpu_address, &bootstrap_value).is_err() {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EFAULT,
-            });
+            return Ok(LINUX_EFAULT.into());
         }
         if node_address != 0 && memory.write_bytes(node_address, &bootstrap_value).is_err() {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EFAULT,
-            });
+            return Ok(LINUX_EFAULT.into());
         }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
@@ -291,9 +275,7 @@ impl SyscallDispatcher {
     ) -> Result<DispatchOutcome, DispatchError> {
         let len = ctx.arg(1);
         if len == 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
@@ -317,19 +299,15 @@ impl SyscallDispatcher {
         let current_pid = std::process::id() as u64;
 
         if pid != 0 && pid != current_pid {
-            return Ok(DispatchOutcome::Errno { errno: LINUX_ESRCH });
+            return Ok(LINUX_ESRCH.into());
         }
         if size < LINUX_BOOTSTRAP_AFFINITY_BYTES as u64 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         let mut mask = [0_u8; LINUX_BOOTSTRAP_AFFINITY_BYTES];
         mask[0] = 1;
         if memory.write_bytes(address, &mask).is_err() {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EFAULT,
-            });
+            return Ok(LINUX_EFAULT.into());
         }
         Ok(DispatchOutcome::Returned {
             value: LINUX_BOOTSTRAP_AFFINITY_BYTES as i64,
@@ -362,13 +340,11 @@ impl SyscallDispatcher {
         let flags = operation & !LINUX_FUTEX_CMD_MASK;
         let futex_flags = LinuxFutexFlags::from_bits_retain(flags);
         if flags & !LinuxFutexFlags::SUPPORTED_MASK != 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         let word = match read_u32(memory, address) {
             Ok(word) => word,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
 
         // Single-threaded path (no ThreadCtx): keep the prior best-effort
@@ -380,28 +356,22 @@ impl SyscallDispatcher {
                 LINUX_FUTEX_WAKE => DispatchOutcome::Returned { value: 0 },
                 LINUX_FUTEX_WAIT => {
                     if word != value || timeout_address == 0 {
-                        return Ok(DispatchOutcome::Errno {
-                            errno: LINUX_EAGAIN,
-                        });
+                        return Ok(LINUX_EAGAIN.into());
                     }
                     let timespec = match read_timespec(memory, timeout_address) {
                         Ok(t) => t,
-                        Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                        Err(errno) => return Ok(errno.into()),
                     };
                     let timeout = match duration_from_linux_timespec(timespec) {
                         Ok(t) => t,
-                        Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                        Err(errno) => return Ok(errno.into()),
                     };
                     if let Some(timeout) = timeout {
                         std::thread::sleep(timeout);
                     }
-                    DispatchOutcome::Errno {
-                        errno: LINUX_ETIMEDOUT,
-                    }
+                    DispatchOutcome::errno(LINUX_ETIMEDOUT)
                 }
-                _ => DispatchOutcome::Errno {
-                    errno: LINUX_ENOSYS,
-                },
+                _ => DispatchOutcome::errno(LINUX_ENOSYS),
             });
         };
 
@@ -432,20 +402,18 @@ impl SyscallDispatcher {
                 // runtime must block with the lock RELEASED, so surface a
                 // FutexWait outcome instead of sleeping here.
                 if word != value {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: LINUX_EAGAIN,
-                    });
+                    return Ok(LINUX_EAGAIN.into());
                 }
                 let timeout = if timeout_address == 0 {
                     None
                 } else {
                     let timespec = match read_timespec(memory, timeout_address) {
                         Ok(t) => t,
-                        Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                        Err(errno) => return Ok(errno.into()),
                     };
                     match duration_from_linux_timespec(timespec) {
                         Ok(t) => t,
-                        Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                        Err(errno) => return Ok(errno.into()),
                     }
                 };
                 DispatchOutcome::FutexWait {
@@ -453,9 +421,7 @@ impl SyscallDispatcher {
                     timeout,
                 }
             }
-            _ => DispatchOutcome::Errno {
-                errno: LINUX_ENOSYS,
-            },
+            _ => DispatchOutcome::errno(LINUX_ENOSYS),
         })
     }
 
@@ -469,9 +435,7 @@ impl SyscallDispatcher {
             .write_bytes(address, LinuxUtsname::carrick_aarch64().abi_bytes())
             .is_err()
         {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EFAULT,
-            });
+            return Ok(LINUX_EFAULT.into());
         }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
@@ -483,9 +447,7 @@ impl SyscallDispatcher {
         // Bootstrap: no debugger surface yet. Linux returns ENOSYS when ptrace
         // is built out of the kernel; we surface the same answer so glibc /
         // gdb fall back cleanly.
-        Ok(DispatchOutcome::Errno {
-            errno: LINUX_ENOSYS,
-        })
+        Ok(LINUX_ENOSYS.into())
     }
 
     pub(super) fn reboot<M: GuestMemory>(
@@ -493,21 +455,21 @@ impl SyscallDispatcher {
         _ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         // We're not root and we wouldn't honour the request anyway.
-        Ok(DispatchOutcome::Errno { errno: LINUX_EPERM })
+        Ok(LINUX_EPERM.into())
     }
 
     pub(super) fn sethostname<M: GuestMemory>(
         &self,
         _ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        Ok(DispatchOutcome::Errno { errno: LINUX_EPERM })
+        Ok(LINUX_EPERM.into())
     }
 
     pub(super) fn setdomainname<M: GuestMemory>(
         &self,
         _ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        Ok(DispatchOutcome::Errno { errno: LINUX_EPERM })
+        Ok(LINUX_EPERM.into())
     }
 
     // Process-group / session calls delegate to the host. Guest pids equal
@@ -522,11 +484,11 @@ impl SyscallDispatcher {
         &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let pid = ctx.arg(0) as libc::pid_t;
-        let pgid = ctx.arg(1) as libc::pid_t;
+        let pid: Pid = ctx.typed_arg(0);
+        let pgid: Pid = ctx.typed_arg(1);
         // SAFETY: setpgid has no memory side effects; errors surface via errno.
-        if let Err(errno) = (unsafe { libc::setpgid(pid, pgid) }).host_syscall_errno() {
-            return Ok(DispatchOutcome::Errno { errno });
+        if let Err(errno) = (unsafe { libc::setpgid(pid.0, pgid.0) }).host_syscall_errno() {
+            return Ok(errno.into());
         }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
@@ -538,7 +500,7 @@ impl SyscallDispatcher {
         let pid = ctx.arg(0) as libc::pid_t;
         let r = match (unsafe { libc::getpgid(pid) }).host_syscall_errno() {
             Ok(value) => value,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         Ok(DispatchOutcome::Returned {
             value: i64::from(r),
@@ -552,7 +514,7 @@ impl SyscallDispatcher {
         let pid = ctx.arg(0) as libc::pid_t;
         let r = match (unsafe { libc::getsid(pid) }).host_syscall_errno() {
             Ok(value) => value,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         Ok(DispatchOutcome::Returned {
             value: i64::from(r),
@@ -565,7 +527,7 @@ impl SyscallDispatcher {
     ) -> Result<DispatchOutcome, DispatchError> {
         let r = match (unsafe { libc::setsid() }).host_syscall_errno() {
             Ok(value) => value,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         Ok(DispatchOutcome::Returned {
             value: i64::from(r),
@@ -581,24 +543,16 @@ impl SyscallDispatcher {
         match idtype {
             LINUX_P_ALL | LINUX_P_PID | LINUX_P_PGID | LINUX_P_PIDFD => {}
             _ => {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_EINVAL,
-                });
+                return Ok(LINUX_EINVAL.into());
             }
         }
         if options & !LINUX_WAITID_SUPPORTED_FLAGS != 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         if options & LINUX_WAITID_STATE_MASK == 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
-        Ok(DispatchOutcome::Errno {
-            errno: LINUX_ECHILD,
-        })
+        Ok(LINUX_ECHILD.into())
     }
 
     pub(super) fn wait4<M: GuestMemory>(
@@ -610,9 +564,7 @@ impl SyscallDispatcher {
         let options = ctx.arg(2);
         let memory = &mut *ctx.memory;
         if options & !LINUX_WAIT4_SUPPORTED_FLAGS != 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         // Translate Linux wait options to macOS: WNOHANG/WUNTRACED share bits
         // (1/2) but WCONTINUED is 8 on Linux vs 0x10 on macOS — passing the
@@ -654,7 +606,7 @@ impl SyscallDispatcher {
             Err(errno) => {
                 // ECHILD on macOS == ECHILD on Linux (10); EINTR surfaces only when
                 // a guest-deliverable signal is pending (see the retry loop).
-                return Ok(DispatchOutcome::Errno { errno });
+                return Ok(errno.into());
             }
         };
         if result == 0 {
@@ -670,9 +622,7 @@ impl SyscallDispatcher {
         if wstatus_addr != 0 {
             let bytes = host_status.to_ne_bytes();
             if memory.write_bytes(wstatus_addr, &bytes).is_err() {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_EFAULT,
-                });
+                return Ok(LINUX_EFAULT.into());
             }
         }
         Ok(DispatchOutcome::Returned {
@@ -696,15 +646,15 @@ impl SyscallDispatcher {
 
         let path = match read_guest_c_string(memory, pathname_addr) {
             Ok(p) => p,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         let argv = match read_guest_string_array(memory, argv_addr) {
             Ok(v) => v,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         let env = match read_guest_string_array(memory, envp_addr) {
             Ok(v) => v,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
 
         Ok(DispatchOutcome::Execve { path, argv, env })
@@ -779,9 +729,7 @@ impl SyscallDispatcher {
         // clone_args is at least flags(8)+pidfd(8)+child_tid(8)+parent_tid(8)
         // +exit_signal(8) = 40 bytes; flags is the first field.
         if args_size < 8 {
-            return DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            };
+            return DispatchOutcome::errno(LINUX_EINVAL);
         }
 
         // Read up to the full struct (64 bytes through tls@56). glibc always
@@ -791,9 +739,7 @@ impl SyscallDispatcher {
         let args = match read_kernel_prefix::<LinuxCloneArgs>(memory, args_ptr, read_len) {
             Ok(args) => args,
             Err(_) => {
-                return DispatchOutcome::Errno {
-                    errno: LINUX_EFAULT,
-                };
+                return DispatchOutcome::errno(LINUX_EFAULT);
             }
         };
 
@@ -804,9 +750,7 @@ impl SyscallDispatcher {
             // the caller passes a short struct with thread flags, return ENOSYS
             // rather than misreading uninitialised fields.
             if args_size < 64 {
-                return DispatchOutcome::Errno {
-                    errno: LINUX_ENOSYS,
-                };
+                return DispatchOutcome::errno(LINUX_ENOSYS);
             }
 
             let child_tid_ptr = args.child_tid;
@@ -864,9 +808,7 @@ impl SyscallDispatcher {
             fill_deterministic_bootstrap_random(&mut bytes);
         }
         if memory.write_bytes(address, &bytes).is_err() {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EFAULT,
-            });
+            return Ok(LINUX_EFAULT.into());
         }
         Ok(DispatchOutcome::Returned {
             value: length as i64,
@@ -874,9 +816,7 @@ impl SyscallDispatcher {
     }
 
     fn rseq(&self) -> DispatchOutcome {
-        DispatchOutcome::Errno {
-            errno: LINUX_ENOSYS,
-        }
+        DispatchOutcome::errno(LINUX_ENOSYS)
     }
 
     pub(super) fn sys_exit<M: GuestMemory>(
