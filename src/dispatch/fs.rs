@@ -2529,23 +2529,13 @@ impl SyscallDispatcher {
                 ));
             }
             OpenDescription::TimerFd {
-                clock_id,
-                interval,
-                deadline,
-                expirations,
+                state,
                 status_flags,
             } => {
+                let state = Arc::clone(state);
                 let nonblocking = *status_flags & LINUX_TFD_NONBLOCK != 0;
-                return Ok(read_timerfd(
-                    memory,
-                    address,
-                    length,
-                    *clock_id,
-                    interval,
-                    deadline,
-                    expirations,
-                    nonblocking,
-                ));
+                drop(open);
+                return Ok(read_timerfd(memory, address, length, &state, nonblocking));
             }
             OpenDescription::PipeReader { pipe, status_flags } => {
                 return Ok(read_pipe(memory, address, length, pipe, *status_flags));

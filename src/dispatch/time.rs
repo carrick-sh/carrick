@@ -78,10 +78,7 @@ impl SyscallDispatcher {
             });
         }
         let description = OpenDescription::TimerFd {
-            clock_id,
-            interval: None,
-            deadline: None,
-            expirations: 0,
+            state: Arc::new(TimerFdState::new(clock_id)),
             status_flags: flags & LINUX_TFD_NONBLOCK,
         };
         Ok(self.install_fd(description, linux_fd_flags_from_open_flags(flags)))
@@ -112,22 +109,18 @@ impl SyscallDispatcher {
         let Some(open_file) = self.open_file(fd) else {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         };
-        let mut open = open_file.description.write();
-        let OpenDescription::TimerFd {
-            clock_id,
-            interval,
-            deadline,
-            expirations,
-            ..
-        } = &mut *open
-        else {
+        let open = open_file.description.read();
+        let OpenDescription::TimerFd { state, .. } = &*open else {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
             });
         };
+        let state = Arc::clone(state);
+        drop(open);
+        let mut timer = state.inner.lock();
 
         if old_value != 0 {
-            let previous = timerfd_itimerspec(*clock_id, *interval, *deadline);
+            let previous = timerfd_itimerspec(timer.clock_id, timer.interval, timer.deadline);
             if write_kernel_struct_raw(memory, old_value, &previous).is_err() {
                 return Ok(DispatchOutcome::Errno {
                     errno: LINUX_EFAULT,
@@ -135,16 +128,17 @@ impl SyscallDispatcher {
             }
         }
 
-        let now = linux_clock_duration(*clock_id).unwrap_or(Duration::ZERO);
-        *interval = next_interval;
-        *deadline = next_value.map(|value| {
+        let now = linux_clock_duration(timer.clock_id).unwrap_or(Duration::ZERO);
+        timer.interval = next_interval;
+        timer.deadline = next_value.map(|value| {
             if flags & LINUX_TIMER_ABSTIME != 0 {
                 value
             } else {
                 now.saturating_add(value)
             }
         });
-        *expirations = 0;
+        timer.expirations = 0;
+        state.changed.notify_all();
         Ok(DispatchOutcome::Returned { value: 0 })
     }
 
@@ -159,18 +153,14 @@ impl SyscallDispatcher {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
         };
         let open = open_file.description.read();
-        let OpenDescription::TimerFd {
-            clock_id,
-            interval,
-            deadline,
-            ..
-        } = &*open
-        else {
+        let OpenDescription::TimerFd { state, .. } = &*open else {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
             });
         };
-        let current = timerfd_itimerspec(*clock_id, *interval, *deadline);
+        let mut timer = state.inner.lock();
+        refresh_timerfd_locked(&mut timer);
+        let current = timerfd_itimerspec(timer.clock_id, timer.interval, timer.deadline);
         Ok(write_kernel_struct(memory, current_value, &current))
     }
 
