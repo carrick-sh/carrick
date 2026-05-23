@@ -113,7 +113,9 @@ use crate::linux_abi::{
     LINUX_FIONREAD,
     LINUX_FUTEX_CLOCK_REALTIME,
     LINUX_FUTEX_CMD_MASK,
+    LINUX_FUTEX_CMP_REQUEUE,
     LINUX_FUTEX_PRIVATE_FLAG,
+    LINUX_FUTEX_REQUEUE,
     LINUX_FUTEX_WAIT,
     LINUX_FUTEX_WAKE,
     LINUX_IFA_ADDRESS,
@@ -2309,6 +2311,27 @@ fn dispatch_threaded_futex(
             DispatchOutcome::FutexWait {
                 wait: futex.prepare_wait(address),
                 timeout,
+            }
+        }
+        LINUX_FUTEX_REQUEUE | LINUX_FUTEX_CMP_REQUEUE => {
+            // FUTEX_(CMP_)REQUEUE moves parked waiters between futex queues.
+            // Neither host primitive can do that: __ulock has no requeue, and a
+            // parking_lot/__ulock waiter is a guest thread blocked in the
+            // FUTEX_WAIT syscall — "requeueing" it would mean it re-waits on
+            // uaddr2 without the guest asking, which we can't synthesise.
+            // Waking-instead-of-requeueing was tried and is worse: it fails the
+            // exact-count semantics AND can hang (LTP futex_cmp_requeue01).
+            // Modern glibc (>=2.34) and musl no longer use CMP_REQUEUE for
+            // condvars, so ENOSYS here has little real-program impact. Surface
+            // the gap explicitly rather than silently mis-waking.
+            reporter.record(crate::compat::CompatEvent::partial_syscall(
+                98,
+                "futex",
+                request.args,
+                "FUTEX_(CMP_)REQUEUE unsupported: host has no futex-requeue primitive",
+            ));
+            DispatchOutcome::Errno {
+                errno: LINUX_ENOSYS,
             }
         }
         _ => DispatchOutcome::Errno {
