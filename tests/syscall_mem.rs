@@ -661,6 +661,11 @@ fn madvise_accepts_common_advice_for_mapped_ranges() {
         DispatchOutcome::Returned { value: 0 }
     );
     assert_eq!(
+        memory.read_bytes(LINUX_MMAP_BASE, 5).unwrap(),
+        vec![0, 0, 0, 0, 0],
+        "MADV_DONTNEED must discard dirty bytes and read back as zero"
+    );
+    assert_eq!(
         dispatcher
             .dispatch(
                 SyscallRequest::new(

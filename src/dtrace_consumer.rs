@@ -142,6 +142,110 @@ pub enum DTraceError {
     OutOpen(String),
 }
 
+struct TraceOutput {
+    fp: *mut libc_file,
+    owned: bool,
+}
+
+impl TraceOutput {
+    fn open(path: Option<&str>) -> Result<Self, DTraceError> {
+        match path {
+            Some(path) => {
+                let pc =
+                    CString::new(path.as_bytes()).map_err(|_| DTraceError::BadArg(path.into()))?;
+                let mode = c"w";
+                let fp = unsafe { fopen(pc.as_ptr(), mode.as_ptr()) };
+                if fp.is_null() {
+                    return Err(DTraceError::OutOpen(path.into()));
+                }
+                Ok(Self { fp, owned: true })
+            }
+            None => Ok(Self {
+                fp: unsafe { STDOUT_FP },
+                owned: false,
+            }),
+        }
+    }
+
+    fn fp(&self) -> *mut libc_file {
+        self.fp
+    }
+}
+
+impl Drop for TraceOutput {
+    fn drop(&mut self) {
+        if self.owned {
+            unsafe {
+                fflush(self.fp);
+                fclose(self.fp);
+            }
+        }
+    }
+}
+
+struct DtraceHandle {
+    hdl: *mut DtraceHdl,
+}
+
+impl DtraceHandle {
+    fn open() -> Result<Self, DTraceError> {
+        let mut err: c_int = 0;
+        let hdl = unsafe { dtrace_open(DTRACE_VERSION, 0, &mut err) };
+        if hdl.is_null() {
+            Err(DTraceError::Open(err))
+        } else {
+            Ok(Self { hdl })
+        }
+    }
+
+    fn as_ptr(&self) -> *mut DtraceHdl {
+        self.hdl
+    }
+
+    fn errmsg(&self) -> String {
+        unsafe { errmsg(self.hdl) }
+    }
+}
+
+impl Drop for DtraceHandle {
+    fn drop(&mut self) {
+        unsafe { dtrace_close(self.hdl) };
+    }
+}
+
+struct DtraceProcess {
+    hdl: *mut DtraceHdl,
+    proc_h: *mut PsProchandle,
+}
+
+impl DtraceProcess {
+    fn create(
+        hdl: &DtraceHandle,
+        file: *const c_char,
+        argv: *const *const c_char,
+    ) -> Result<Self, DTraceError> {
+        let proc_h = unsafe { dtrace_proc_create(hdl.as_ptr(), file, argv) };
+        if proc_h.is_null() {
+            Err(DTraceError::ProcCreate(hdl.errmsg()))
+        } else {
+            Ok(Self {
+                hdl: hdl.as_ptr(),
+                proc_h,
+            })
+        }
+    }
+
+    fn as_ptr(&self) -> *mut PsProchandle {
+        self.proc_h
+    }
+}
+
+impl Drop for DtraceProcess {
+    fn drop(&mut self) {
+        unsafe { dtrace_proc_release(self.hdl, self.proc_h) };
+    }
+}
+
 unsafe fn errmsg(hdl: *mut DtraceHdl) -> String {
     let e = unsafe { dtrace_errno(hdl) };
     let p = unsafe { dtrace_errmsg(hdl, e) };
@@ -201,30 +305,8 @@ pub fn run_child_under_dtrace(
     // `out_path` redirects to a file so trace output doesn't intermix with an
     // interactive guest's own stdout. The returned fp must outlive the consume
     // loop; closed at the end if we opened it.
-    let (out_fp, owns_fp) = match &opts.out_path {
-        Some(path) => {
-            let pc =
-                CString::new(path.as_bytes()).map_err(|_| DTraceError::BadArg(path.clone()))?;
-            let mode = c"w";
-            // SAFETY: pc/mode are valid NUL-terminated C strings.
-            let fp = unsafe { fopen(pc.as_ptr(), mode.as_ptr()) };
-            if fp.is_null() {
-                return Err(DTraceError::OutOpen(path.clone()));
-            }
-            (fp, true)
-        }
-        // SAFETY: STDOUT_FP is the process's libc stdout.
-        None => (unsafe { STDOUT_FP }, false),
-    };
-
-    let mut err: c_int = 0;
-    let hdl = unsafe { dtrace_open(DTRACE_VERSION, 0, &mut err) };
-    if hdl.is_null() {
-        if owns_fp {
-            unsafe { fclose(out_fp) };
-        }
-        return Err(DTraceError::Open(err));
-    }
+    let out = TraceOutput::open(opts.out_path.as_deref())?;
+    let hdl = DtraceHandle::open()?;
 
     // Sensible runtime defaults are appended to in `all_opts` below.
     let mut all_opts: Vec<(&str, &str)> = vec![
@@ -244,9 +326,8 @@ pub fn run_child_under_dtrace(
         let kc = CString::new(*k).unwrap();
         #[allow(clippy::unwrap_used)]
         let vc = CString::new(*v).unwrap();
-        if unsafe { dtrace_setopt(hdl, kc.as_ptr(), vc.as_ptr()) } != 0 {
-            let msg = unsafe { errmsg(hdl) };
-            unsafe { dtrace_close(hdl) };
+        if unsafe { dtrace_setopt(hdl.as_ptr(), kc.as_ptr(), vc.as_ptr()) } != 0 {
+            let msg = hdl.errmsg();
             return Err(DTraceError::SetOpt {
                 key: (*k).into(),
                 val: (*v).into(),
@@ -255,20 +336,12 @@ pub fn run_child_under_dtrace(
         }
     }
 
-    let proc_h =
-        unsafe { dtrace_proc_create(hdl, trace_argv.exec_path.as_ptr(), argv_ptrs.as_ptr()) };
-    if proc_h.is_null() {
-        let msg = unsafe { errmsg(hdl) };
-        unsafe { dtrace_close(hdl) };
-        return Err(DTraceError::ProcCreate(msg));
-    }
+    let proc_h = DtraceProcess::create(&hdl, trace_argv.exec_path.as_ptr(), argv_ptrs.as_ptr())?;
 
     let program_src: &str = opts.script.as_deref().unwrap_or(BUNDLED_D_SCRIPT);
     let program_c = match CString::new(program_src) {
         Ok(program_c) => program_c,
         Err(_) => {
-            unsafe { dtrace_proc_release(hdl, proc_h) };
-            unsafe { dtrace_close(hdl) };
             return Err(DTraceError::Compile(
                 "D script contains a nul byte".to_owned(),
             ));
@@ -276,7 +349,7 @@ pub fn run_child_under_dtrace(
     };
     let prog = unsafe {
         dtrace_program_strcompile(
-            hdl,
+            hdl.as_ptr(),
             program_c.as_ptr(),
             DTRACE_PROBESPEC_NAME,
             DTRACE_C_ZDEFS | DTRACE_C_PSPEC,
@@ -285,39 +358,34 @@ pub fn run_child_under_dtrace(
         )
     };
     if prog.is_null() {
-        let msg = unsafe { errmsg(hdl) };
-        unsafe { dtrace_proc_release(hdl, proc_h) };
-        unsafe { dtrace_close(hdl) };
+        let msg = hdl.errmsg();
         return Err(DTraceError::Compile(msg));
     }
 
-    if unsafe { dtrace_program_exec(hdl, prog, std::ptr::null_mut()) } != 0 {
-        let msg = unsafe { errmsg(hdl) };
-        unsafe { dtrace_proc_release(hdl, proc_h) };
-        unsafe { dtrace_close(hdl) };
+    if unsafe { dtrace_program_exec(hdl.as_ptr(), prog, std::ptr::null_mut()) } != 0 {
+        let msg = hdl.errmsg();
         return Err(DTraceError::Exec(msg));
     }
 
-    if unsafe { dtrace_go(hdl) } != 0 {
-        let msg = unsafe { errmsg(hdl) };
-        unsafe { dtrace_proc_release(hdl, proc_h) };
-        unsafe { dtrace_close(hdl) };
+    if unsafe { dtrace_go(hdl.as_ptr()) } != 0 {
+        let msg = hdl.errmsg();
         return Err(DTraceError::Go(msg));
     }
 
-    unsafe { dtrace_proc_continue(hdl, proc_h) };
+    unsafe { dtrace_proc_continue(hdl.as_ptr(), proc_h.as_ptr()) };
 
     // Consume loop: sleep + work until tracing reports DONE or the child
     // process is dead. dtrace_work prints to stdout for us.
     loop {
-        unsafe { dtrace_sleep(hdl) };
-        let status = unsafe { dtrace_work(hdl, out_fp, chew, chewrec, std::ptr::null_mut()) };
+        unsafe { dtrace_sleep(hdl.as_ptr()) };
+        let status =
+            unsafe { dtrace_work(hdl.as_ptr(), out.fp(), chew, chewrec, std::ptr::null_mut()) };
         // dtrace_work writes events into the C stdio buffer, which is
         // block-buffered when the sink is a pipe/file. Flush every cycle so the
         // live stream stays live even when the traced child never exits (e.g.
         // a deadlock we're trying to diagnose).
-        unsafe { fflush(out_fp) };
-        let proc_state = unsafe { dtrace_proc_state(hdl, proc_h) };
+        unsafe { fflush(out.fp()) };
+        let proc_state = unsafe { dtrace_proc_state(hdl.as_ptr(), proc_h.as_ptr()) };
         let child_terminal = proc_state == PS_DEAD || proc_state == PS_UNDEAD;
         match status {
             DTRACE_WORKSTATUS_DONE => break,
@@ -327,26 +395,15 @@ pub fn run_child_under_dtrace(
                 }
             }
             _ => {
-                let msg = unsafe { errmsg(hdl) };
-                unsafe { dtrace_proc_release(hdl, proc_h) };
-                unsafe { dtrace_close(hdl) };
+                let msg = hdl.errmsg();
                 return Err(DTraceError::Work(msg));
             }
         }
     }
 
-    unsafe { dtrace_stop(hdl) };
-    unsafe { dtrace_aggregate_snap(hdl) };
-    unsafe { dtrace_aggregate_print(hdl, out_fp, std::ptr::null_mut()) };
-    unsafe { dtrace_proc_release(hdl, proc_h) };
-    unsafe { dtrace_close(hdl) };
-    if owns_fp {
-        // SAFETY: out_fp was opened by us via fopen and is no longer used.
-        unsafe {
-            fflush(out_fp);
-            fclose(out_fp);
-        }
-    }
+    unsafe { dtrace_stop(hdl.as_ptr()) };
+    unsafe { dtrace_aggregate_snap(hdl.as_ptr()) };
+    unsafe { dtrace_aggregate_print(hdl.as_ptr(), out.fp(), std::ptr::null_mut()) };
     Ok(())
 }
 

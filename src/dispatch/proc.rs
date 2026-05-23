@@ -7,6 +7,9 @@ pub(super) struct ProcState {
     /// Path of the currently-running executable, surfaced via
     /// `/proc/self/exe`, `/proc/self/cmdline`, `/proc/self/comm`, etc.
     pub executable_path: String,
+    /// Current guest argv, surfaced as NUL-separated bytes through
+    /// `/proc/self/cmdline`.
+    pub argv: Vec<String>,
     /// `personality(2)` execution-domain flags, recorded and echoed back.
     pub personality: u64,
     /// `prctl(PR_SET_DUMPABLE)` flag (default 1).
@@ -54,6 +57,7 @@ impl ProcState {
         use std::sync::atomic::AtomicU64;
         Self {
             executable_path: "/proc/self/exe".to_owned(),
+            argv: vec!["/proc/self/exe".to_owned()],
             personality: 0,
             dumpable: 1,
             task_name: linux_task_name_from_bytes(b"carrick"),

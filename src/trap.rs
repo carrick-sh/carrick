@@ -197,6 +197,41 @@ impl Drop for HvfTrapEngine {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const GPR_TABLE: [applevisor::vcpu::Reg; 31] = [
+    applevisor::vcpu::Reg::X0,
+    applevisor::vcpu::Reg::X1,
+    applevisor::vcpu::Reg::X2,
+    applevisor::vcpu::Reg::X3,
+    applevisor::vcpu::Reg::X4,
+    applevisor::vcpu::Reg::X5,
+    applevisor::vcpu::Reg::X6,
+    applevisor::vcpu::Reg::X7,
+    applevisor::vcpu::Reg::X8,
+    applevisor::vcpu::Reg::X9,
+    applevisor::vcpu::Reg::X10,
+    applevisor::vcpu::Reg::X11,
+    applevisor::vcpu::Reg::X12,
+    applevisor::vcpu::Reg::X13,
+    applevisor::vcpu::Reg::X14,
+    applevisor::vcpu::Reg::X15,
+    applevisor::vcpu::Reg::X16,
+    applevisor::vcpu::Reg::X17,
+    applevisor::vcpu::Reg::X18,
+    applevisor::vcpu::Reg::X19,
+    applevisor::vcpu::Reg::X20,
+    applevisor::vcpu::Reg::X21,
+    applevisor::vcpu::Reg::X22,
+    applevisor::vcpu::Reg::X23,
+    applevisor::vcpu::Reg::X24,
+    applevisor::vcpu::Reg::X25,
+    applevisor::vcpu::Reg::X26,
+    applevisor::vcpu::Reg::X27,
+    applevisor::vcpu::Reg::X28,
+    applevisor::vcpu::Reg::X29,
+    applevisor::vcpu::Reg::X30,
+];
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Default)]
 struct MemoryProtections {
     no_access: parking_lot::RwLock<Vec<(u64, u64)>>,
@@ -216,10 +251,14 @@ impl MemoryProtections {
 
     fn range_no_access(&self, address: u64, length: usize) -> bool {
         let end = address.saturating_add(length as u64);
-        self.no_access
-            .read()
-            .iter()
-            .any(|&(s, e)| address < e && s < end)
+        if end <= address {
+            return false;
+        }
+        let ranges = self.no_access.read();
+        let idx = ranges.partition_point(|&(_, e)| e <= address);
+        ranges
+            .get(idx)
+            .is_some_and(|&(s, e)| address < e && s < end)
     }
 
     fn set_no_access(&self, address: u64, len: usize, no_access: bool) {
@@ -230,6 +269,18 @@ impl MemoryProtections {
         let mut ranges = self.no_access.write();
         if no_access {
             ranges.push((address, end));
+            ranges.sort_by_key(|&(start, _)| start);
+            let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+            for (start, end) in std::mem::take(&mut *ranges) {
+                if let Some((_, last_end)) = merged.last_mut()
+                    && start <= *last_end
+                {
+                    *last_end = (*last_end).max(end);
+                    continue;
+                }
+                merged.push((start, end));
+            }
+            *ranges = merged;
             return;
         }
         let mut next = Vec::with_capacity(ranges.len());
@@ -248,6 +299,7 @@ impl MemoryProtections {
                 next.push((end, e));
             }
         }
+        next.sort_by_key(|&(start, _)| start);
         *ranges = next;
     }
 }
@@ -274,6 +326,16 @@ struct HvfInner {
     /// Thread siblings share this metadata so syscall-path memory access checks
     /// observe `mprotect(PROT_NONE)` changes made by any guest thread.
     protections: std::sync::Arc<MemoryProtections>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn replace_destroyed_hvf_inner(slot: &mut HvfInner, new_inner: HvfInner) {
+    // The caller has already destroyed the raw HVF vCPU/VM handles behind
+    // `slot`. Assigning normally would run applevisor destructors for those
+    // stale wrappers; `ptr::write` is the single no-drop replacement point.
+    unsafe {
+        std::ptr::write(slot as *mut HvfInner, new_inner);
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1147,43 +1209,14 @@ impl HvfInner {
             .find(|mapping| mapping.contains_range(address, length))
     }
 
+    fn guest_range_is_writable(&self, address: u64, length: usize) -> bool {
+        self.mapping_for_range(address, length).is_some() && !self.range_no_access(address, length)
+    }
+
     /// Snapshot every register the trap engine ever writes. We restore
     /// from this in the forked child after the new vCPU is created.
     fn snapshot_vcpu(&self) -> Result<VcpuSnapshot, TrapError> {
         use applevisor::prelude::*;
-        const GPR_TABLE: [Reg; 31] = [
-            Reg::X0,
-            Reg::X1,
-            Reg::X2,
-            Reg::X3,
-            Reg::X4,
-            Reg::X5,
-            Reg::X6,
-            Reg::X7,
-            Reg::X8,
-            Reg::X9,
-            Reg::X10,
-            Reg::X11,
-            Reg::X12,
-            Reg::X13,
-            Reg::X14,
-            Reg::X15,
-            Reg::X16,
-            Reg::X17,
-            Reg::X18,
-            Reg::X19,
-            Reg::X20,
-            Reg::X21,
-            Reg::X22,
-            Reg::X23,
-            Reg::X24,
-            Reg::X25,
-            Reg::X26,
-            Reg::X27,
-            Reg::X28,
-            Reg::X29,
-            Reg::X30,
-        ];
         let mut gprs = [0u64; 31];
         for (i, reg) in GPR_TABLE.iter().enumerate() {
             gprs[i] = self.vcpu.get_reg(*reg).map_err(hvf_error)?;
@@ -1220,39 +1253,6 @@ impl HvfInner {
 
     fn restore_vcpu(&mut self, snap: &VcpuSnapshot) -> Result<(), TrapError> {
         use applevisor::prelude::*;
-        const GPR_TABLE: [Reg; 31] = [
-            Reg::X0,
-            Reg::X1,
-            Reg::X2,
-            Reg::X3,
-            Reg::X4,
-            Reg::X5,
-            Reg::X6,
-            Reg::X7,
-            Reg::X8,
-            Reg::X9,
-            Reg::X10,
-            Reg::X11,
-            Reg::X12,
-            Reg::X13,
-            Reg::X14,
-            Reg::X15,
-            Reg::X16,
-            Reg::X17,
-            Reg::X18,
-            Reg::X19,
-            Reg::X20,
-            Reg::X21,
-            Reg::X22,
-            Reg::X23,
-            Reg::X24,
-            Reg::X25,
-            Reg::X26,
-            Reg::X27,
-            Reg::X28,
-            Reg::X29,
-            Reg::X30,
-        ];
         for (reg, value) in GPR_TABLE.iter().zip(snap.gprs.iter()) {
             self.vcpu.set_reg(*reg, *value).map_err(hvf_error)?;
         }
@@ -1319,40 +1319,6 @@ impl HvfInner {
         use applevisor::prelude::*;
         use zerocopy::IntoBytes;
 
-        const GPR_TABLE: [Reg; 31] = [
-            Reg::X0,
-            Reg::X1,
-            Reg::X2,
-            Reg::X3,
-            Reg::X4,
-            Reg::X5,
-            Reg::X6,
-            Reg::X7,
-            Reg::X8,
-            Reg::X9,
-            Reg::X10,
-            Reg::X11,
-            Reg::X12,
-            Reg::X13,
-            Reg::X14,
-            Reg::X15,
-            Reg::X16,
-            Reg::X17,
-            Reg::X18,
-            Reg::X19,
-            Reg::X20,
-            Reg::X21,
-            Reg::X22,
-            Reg::X23,
-            Reg::X24,
-            Reg::X25,
-            Reg::X26,
-            Reg::X27,
-            Reg::X28,
-            Reg::X29,
-            Reg::X30,
-        ];
-
         let mut frame = crate::linux_abi::CarrickSigframe::empty();
         frame.signum = signum as u32;
         for (i, reg) in GPR_TABLE.iter().enumerate() {
@@ -1408,16 +1374,13 @@ impl HvfInner {
         // stack is what lets a handler run when the main stack is unusable
         // (LTP sigaltstack01 deliberately exercises that).
         let frame_bytes = frame.as_bytes();
-        let frame_len = frame_bytes.len() as u64;
-        let aligned_len = (frame_len + 15) & !15u64;
-        let stack_base = match altstack {
-            Some((ss_sp, ss_size)) => ss_sp.saturating_add(ss_size),
-            None => frame.saved_sp,
-        };
-        let new_sp = stack_base
-            .checked_sub(aligned_len)
-            .ok_or_else(|| TrapError::Hypervisor("sigframe push underflowed stack".to_string()))?;
-        let new_sp = new_sp & !15u64;
+        let new_sp = signal_frame_stack_pointer(frame.saved_sp, altstack, frame_bytes.len())?;
+        if altstack.is_some() && !self.guest_range_is_writable(new_sp, frame_bytes.len()) {
+            return Err(TrapError::Hypervisor(format!(
+                "signal alt stack frame range is not mapped/writable: 0x{new_sp:x}+{}",
+                frame_bytes.len()
+            )));
+        }
 
         // Write the frame into guest memory at the new SP.
         self.write_guest_bytes(new_sp, frame_bytes)
@@ -1518,40 +1481,6 @@ impl HvfInner {
         use applevisor::prelude::*;
         use zerocopy::FromBytes;
 
-        const GPR_TABLE: [Reg; 31] = [
-            Reg::X0,
-            Reg::X1,
-            Reg::X2,
-            Reg::X3,
-            Reg::X4,
-            Reg::X5,
-            Reg::X6,
-            Reg::X7,
-            Reg::X8,
-            Reg::X9,
-            Reg::X10,
-            Reg::X11,
-            Reg::X12,
-            Reg::X13,
-            Reg::X14,
-            Reg::X15,
-            Reg::X16,
-            Reg::X17,
-            Reg::X18,
-            Reg::X19,
-            Reg::X20,
-            Reg::X21,
-            Reg::X22,
-            Reg::X23,
-            Reg::X24,
-            Reg::X25,
-            Reg::X26,
-            Reg::X27,
-            Reg::X28,
-            Reg::X29,
-            Reg::X30,
-        ];
-
         let sp = self.vcpu.get_sys_reg(SysReg::SP_EL0).map_err(hvf_error)?;
         let frame_size = core::mem::size_of::<crate::linux_abi::CarrickSigframe>();
         let bytes = self
@@ -1616,9 +1545,9 @@ impl HvfInner {
         // child re-maps these copies, the parent keeps its originals. Genuine
         // guest MAP_SHARED file mappings (`guest_shared`) are NOT snapshotted —
         // they must stay shared across fork (POSIX), so both sides keep mapping
-        // the same host buffer. (Built unconditionally because we don't yet know
-        // which side we are; the parent's unused copies leak with its engine,
-        // matching the existing ManuallyDrop discipline.)
+        // the same host buffer. Built unconditionally because we don't yet know
+        // which side we are; the parent drops its unused owned snapshots after
+        // choosing `mapping_descs` below.
         let mut child_descs: Vec<ForkMappingDesc> = Vec::with_capacity(mapping_descs.len());
         for desc in &mapping_descs {
             let child_host = if desc.guest_shared {
@@ -1702,15 +1631,14 @@ impl HvfInner {
             is_forked_child: pid == 0,
             protections: inherited_protections,
         };
-        unsafe {
-            std::ptr::write(self as *mut HvfInner, new_inner);
-        }
+        replace_destroyed_hvf_inner(self, new_inner);
 
         // Re-map each region using raw hv_vm_map. The PARENT re-maps its
         // original buffers; the CHILD maps the pre-fork private snapshots for
         // PRIVATE regions and the shared originals for guest-MAP_SHARED ones.
-        // The unused set (the child's snapshot copies in the parent) leaks with
-        // the engine, matching the existing ManuallyDrop discipline.
+        // The unused set (the child's snapshot copies in the parent) drops here
+        // when the parent chooses `mapping_descs`; the child moves its owned
+        // snapshots into the rebuilt engine.
         let descs = if pid == 0 { child_descs } else { mapping_descs };
         for desc in descs {
             let host_addr = desc.host.ptr();
@@ -1819,15 +1747,15 @@ impl HvfInner {
                     perms_raw,
                 )
             };
-            // EEXIST-equivalent: the stage-2 mapping already exists in this
-            // shared VM (the main engine created it). That's exactly what we
-            // want for a thread sibling — the new vCPU sees it for free. Only
-            // a genuinely new/failed map is an error.
-            if r != 0 {
-                // hv return codes are negative; HV_BAD_ARGUMENT (0xfae94...)
-                // shows up when re-mapping an existing region. Tolerate it:
-                // the region is already present in the shared VM.
-                let _already_present = r;
+            // HV_BAD_ARGUMENT is the only expected "already mapped" result
+            // when the main thread's shared VM already owns this stage-2
+            // region. Surface every other HVF failure instead of silently
+            // running a sibling with missing memory.
+            if r != 0 && r != applevisor_sys::hv_error_t::HV_BAD_ARGUMENT as i32 {
+                return Err(TrapError::Hypervisor(format!(
+                    "hv_vm_map(host=0x{:x}, guest=0x{start:x}, size={size}) failed for thread sibling: 0x{r:x}",
+                    host_addr as u64
+                )));
             }
             inner.mappings.push(HvfMappedRegion {
                 start,
@@ -1857,39 +1785,6 @@ impl HvfInner {
     /// `map_plan`'s initial-boot sequence but with thread-private PC/SP/TLS.
     fn restore_vcpu_thread_start(&mut self, snap: &VcpuSnapshot) -> Result<(), TrapError> {
         use applevisor::prelude::*;
-        const GPR_TABLE: [Reg; 31] = [
-            Reg::X0,
-            Reg::X1,
-            Reg::X2,
-            Reg::X3,
-            Reg::X4,
-            Reg::X5,
-            Reg::X6,
-            Reg::X7,
-            Reg::X8,
-            Reg::X9,
-            Reg::X10,
-            Reg::X11,
-            Reg::X12,
-            Reg::X13,
-            Reg::X14,
-            Reg::X15,
-            Reg::X16,
-            Reg::X17,
-            Reg::X18,
-            Reg::X19,
-            Reg::X20,
-            Reg::X21,
-            Reg::X22,
-            Reg::X23,
-            Reg::X24,
-            Reg::X25,
-            Reg::X26,
-            Reg::X27,
-            Reg::X28,
-            Reg::X29,
-            Reg::X30,
-        ];
         for (reg, value) in GPR_TABLE.iter().zip(snap.gprs.iter()) {
             self.vcpu.set_reg(*reg, *value).map_err(hvf_error)?;
         }
@@ -1993,9 +1888,7 @@ impl HvfInner {
             // gone. The new image starts with none until it mmaps them.
             protections: std::sync::Arc::new(MemoryProtections::default()),
         };
-        unsafe {
-            std::ptr::write(self as *mut HvfInner, new_inner);
-        }
+        replace_destroyed_hvf_inner(self, new_inner);
 
         // Apply the new mapping plan via the shared raw-mmap helper (same
         // backing as map_plan — see `map_region_raw` for why we avoid
@@ -2011,40 +1904,7 @@ impl HvfInner {
         // except for SP and PC. Without this, musl's _start in the new
         // image inherits the previous process's x8 which can decode
         // as a bogus syscall number on the first svc.
-        const GPRS: [Reg; 31] = [
-            Reg::X0,
-            Reg::X1,
-            Reg::X2,
-            Reg::X3,
-            Reg::X4,
-            Reg::X5,
-            Reg::X6,
-            Reg::X7,
-            Reg::X8,
-            Reg::X9,
-            Reg::X10,
-            Reg::X11,
-            Reg::X12,
-            Reg::X13,
-            Reg::X14,
-            Reg::X15,
-            Reg::X16,
-            Reg::X17,
-            Reg::X18,
-            Reg::X19,
-            Reg::X20,
-            Reg::X21,
-            Reg::X22,
-            Reg::X23,
-            Reg::X24,
-            Reg::X25,
-            Reg::X26,
-            Reg::X27,
-            Reg::X28,
-            Reg::X29,
-            Reg::X30,
-        ];
-        for reg in GPRS {
+        for reg in GPR_TABLE {
             self.vcpu.set_reg(reg, 0).map_err(hvf_error)?;
         }
 
@@ -2449,6 +2309,30 @@ fn seed_child_snapshot(parent: &VcpuSnapshot, stack: u64, tls: u64) -> VcpuSnaps
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn signal_frame_stack_pointer(
+    saved_sp: u64,
+    altstack: Option<(u64, u64)>,
+    frame_len: usize,
+) -> Result<u64, TrapError> {
+    let frame_len = u64::try_from(frame_len)
+        .map_err(|_| TrapError::Hypervisor("sigframe length does not fit u64".to_string()))?;
+    let aligned_len = frame_len
+        .checked_add(15)
+        .map(|len| len & !15u64)
+        .ok_or_else(|| TrapError::Hypervisor("sigframe length overflowed".to_string()))?;
+    let stack_base = match altstack {
+        Some((ss_sp, ss_size)) => ss_sp
+            .checked_add(ss_size)
+            .ok_or_else(|| TrapError::Hypervisor("signal alt stack top overflowed".to_string()))?,
+        None => saved_sp,
+    };
+    stack_base
+        .checked_sub(aligned_len)
+        .map(|sp| sp & !15u64)
+        .ok_or_else(|| TrapError::Hypervisor("sigframe push underflowed stack".to_string()))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[cfg(test)]
 mod memory_protection_tests {
     use super::*;
@@ -2466,6 +2350,43 @@ mod memory_protection_tests {
         assert!(protections.range_no_access(0x4fff, 1));
         assert!(!protections.range_no_access(0x5000, 1));
         assert!(!protections.range_no_access(0x6000 - 1, 1));
+    }
+
+    #[test]
+    fn protection_ranges_are_sorted_coalesced_and_split_on_clear() {
+        let protections = MemoryProtections::default();
+
+        protections.set_no_access(0x3000, 0x1000, true);
+        protections.set_no_access(0x1000, 0x1000, true);
+        protections.set_no_access(0x2000, 0x1000, true);
+
+        assert_eq!(protections.snapshot(), vec![(0x1000, 0x4000)]);
+        assert!(protections.range_no_access(0x1800, 1));
+        assert!(protections.range_no_access(0x3fff, 1));
+        assert!(!protections.range_no_access(0x4000, 1));
+
+        protections.set_no_access(0x2000, 0x800, false);
+
+        assert_eq!(
+            protections.snapshot(),
+            vec![(0x1000, 0x2000), (0x2800, 0x4000)]
+        );
+        assert!(!protections.range_no_access(0x2000, 0x800));
+        assert!(protections.range_no_access(0x2800, 1));
+    }
+
+    #[test]
+    fn signal_frame_stack_pointer_uses_checked_altstack_bounds() {
+        let sp = signal_frame_stack_pointer(0x8000, Some((0x4000, 0x2000)), 0x123).unwrap();
+        assert_eq!(sp & 15, 0);
+        assert!(sp >= 0x4000);
+        assert!(sp < 0x6000);
+
+        let err = signal_frame_stack_pointer(0x8000, Some((u64::MAX - 8, 16)), 0x100).unwrap_err();
+        assert!(
+            err.to_string().contains("alt stack top overflowed"),
+            "unexpected error: {err}"
+        );
     }
 }
 

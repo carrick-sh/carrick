@@ -1155,6 +1155,7 @@ pub const LINUX_ENOTDIR: i32 = 20;
 pub const LINUX_EISDIR: i32 = 21;
 pub const LINUX_EINVAL: i32 = 22;
 pub const LINUX_ENOTTY: i32 = 25;
+pub const LINUX_EFBIG: i32 = 27;
 pub const LINUX_ERANGE: i32 = 34;
 pub const LINUX_ENAMETOOLONG: i32 = 36;
 pub const LINUX_ENOSYS: i32 = 38;

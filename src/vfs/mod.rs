@@ -46,6 +46,10 @@ pub use proc::{ProcMapsEntry, ProcVfs, SyntheticProcContext};
 pub use rootfs::RootFsVfs;
 pub use sys::SysVfs;
 
+/// Maximum size Carrick will materialize as a `Vec<u8>` for memory-backed
+/// regular files. Larger files need a host-backed fd so growth remains sparse.
+pub const MAX_IN_MEMORY_FILE_SIZE: u64 = 512 * 1024 * 1024;
+
 pub(crate) fn is_synthetic_virtual_file(path: &str, ctx: &SyntheticProcContext) -> bool {
     proc::synthetic_file(path, ctx).is_some() || sys::synthetic_file(path).is_some()
 }
@@ -170,6 +174,7 @@ pub enum VfsHandle {
 #[derive(Default)]
 pub struct OpenContext<'a> {
     pub executable_path: Option<&'a str>,
+    pub argv: Option<&'a [String]>,
     pub address_space_regions: Option<&'a [ProcMapsEntry]>,
     pub brk_current: u64,
     pub mmap_next: u64,

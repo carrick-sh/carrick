@@ -172,7 +172,6 @@ const AARCH64_SYSCALLS: &[Syscall] = &[
     syscall(51, "chroot", "fs", SupportLevel::Deferred),
     syscall(52, "fchmod", "fs", SupportLevel::BringUp),
     syscall(53, "fchmodat", "fs", SupportLevel::BringUp),
-    syscall(452, "fchmodat2", "fs", SupportLevel::BringUp),
     syscall(54, "fchownat", "fs", SupportLevel::BringUp),
     syscall(55, "fchown", "fs", SupportLevel::BringUp),
     syscall(56, "openat", "fs", SupportLevel::BringUp),
@@ -325,4 +324,5 @@ const AARCH64_SYSCALLS: &[Syscall] = &[
     syscall(436, "close_range", "fs", SupportLevel::BringUp),
     syscall(437, "openat2", "fs", SupportLevel::BringUp),
     syscall(439, "faccessat2", "fs", SupportLevel::BringUp),
+    syscall(452, "fchmodat2", "fs", SupportLevel::BringUp),
 ];

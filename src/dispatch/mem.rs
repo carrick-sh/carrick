@@ -470,7 +470,7 @@ impl SyscallDispatcher {
     ) -> Result<DispatchOutcome, DispatchError> {
         let address = ctx.arg(0);
         let length = ctx.arg(1);
-        let memory = &*ctx.memory;
+        let memory = &mut *ctx.memory;
         if length == 0 {
             return Ok(DispatchOutcome::Returned { value: 0 });
         }
@@ -670,7 +670,7 @@ impl SyscallDispatcher {
         let address = ctx.arg(0);
         let length = ctx.arg(1);
         let advice = ctx.arg(2);
-        let memory = &*ctx.memory;
+        let memory = &mut *ctx.memory;
 
         if !address.is_multiple_of(LINUX_PAGE_SIZE) || !linux_madvise_advice_is_supported(advice) {
             return Ok(DispatchOutcome::Errno {
@@ -695,6 +695,21 @@ impl SyscallDispatcher {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_ENOMEM,
             });
+        }
+        if advice == LINUX_MADV_DONTNEED {
+            const ZERO_CHUNK: [u8; 4096] = [0; 4096];
+            let mut remaining = length;
+            let mut cursor = address;
+            while remaining > 0 {
+                let chunk = remaining.min(ZERO_CHUNK.len());
+                if memory.write_bytes(cursor, &ZERO_CHUNK[..chunk]).is_err() {
+                    return Ok(DispatchOutcome::Errno {
+                        errno: LINUX_ENOMEM,
+                    });
+                }
+                remaining -= chunk;
+                cursor += chunk as u64;
+            }
         }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
