@@ -27,7 +27,13 @@ impl OwnedHostMapping {
                 std::ptr::null_mut(),
                 len,
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_ANON | libc::MAP_SHARED,
+                // MAP_NORESERVE: the guest arena (2 GiB) + heap (128 MiB) are
+                // demand-zero; the guest can't exceed the arena, so the
+                // overcommit-SIGSEGV caveat doesn't apply. Without this, macOS
+                // reserves swap backing for the full extent — re-paid per forked
+                // guest. RSS is already lazy regardless. (On Darwin MAP_NORESERVE may
+                // be accepted-but-ignored; harmless either way.)
+                libc::MAP_ANON | libc::MAP_SHARED | libc::MAP_NORESERVE,
                 -1,
                 0,
             )
