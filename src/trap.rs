@@ -463,6 +463,7 @@ impl HvfTrapEngine {
         sa_restorer: u64,
         pending_syscall_retval: Option<i64>,
         interrupted_pc: Option<u64>,
+        altstack: Option<(u64, u64)>,
     ) -> Result<(), TrapError> {
         self.inner.inject_signal(
             signum,
@@ -470,6 +471,7 @@ impl HvfTrapEngine {
             sa_restorer,
             pending_syscall_retval,
             interrupted_pc,
+            altstack,
         )
     }
 
@@ -481,6 +483,7 @@ impl HvfTrapEngine {
         _sa_restorer: u64,
         _pending_syscall_retval: Option<i64>,
         _interrupted_pc: Option<u64>,
+        _altstack: Option<(u64, u64)>,
     ) -> Result<(), TrapError> {
         Err(TrapError::UnsupportedPlatform)
     }
@@ -1200,6 +1203,7 @@ impl HvfInner {
         sa_restorer: u64,
         pending_syscall_retval: Option<i64>,
         interrupted_pc: Option<u64>,
+        altstack: Option<(u64, u64)>,
     ) -> Result<(), TrapError> {
         use applevisor::prelude::*;
         use zerocopy::IntoBytes;
@@ -1273,17 +1277,35 @@ impl HvfInner {
         mcontext.pstate = frame.saved_spsr;
         let mut ucontext = crate::linux_abi::LinuxUcontext::empty();
         ucontext.uc_mcontext = mcontext;
+        // When delivering on the alternate signal stack (SA_ONSTACK), the
+        // ucontext's uc_stack describes that stack with SS_ONSTACK set, so a
+        // handler querying sigaltstack(NULL, &old) sees it's running on it.
+        if let Some((ss_sp, ss_size)) = altstack {
+            ucontext.uc_stack = crate::linux_abi::LinuxSignalStack {
+                ss_sp,
+                ss_flags: crate::linux_abi::LINUX_SS_ONSTACK as i32,
+                _pad0: 0,
+                ss_size,
+            };
+        }
         frame.ucontext = ucontext;
 
-        // Reserve space on SP_EL0, rounded down to 16-byte alignment
+        // Reserve space on the target stack, rounded down to 16-byte alignment
         // (AArch64 stack alignment requirement at function-call boundaries).
+        // For SA_ONSTACK the frame is pushed from the TOP of the alt stack
+        // (ss_sp + ss_size); otherwise from the interrupted SP_EL0. The alt
+        // stack is what lets a handler run when the main stack is unusable
+        // (LTP sigaltstack01 deliberately exercises that).
         let frame_bytes = frame.as_bytes();
         let frame_len = frame_bytes.len() as u64;
         let aligned_len = (frame_len + 15) & !15u64;
-        let new_sp = frame
-            .saved_sp
+        let stack_base = match altstack {
+            Some((ss_sp, ss_size)) => ss_sp.saturating_add(ss_size),
+            None => frame.saved_sp,
+        };
+        let new_sp = stack_base
             .checked_sub(aligned_len)
-            .ok_or_else(|| TrapError::Hypervisor("sigframe push underflowed SP_EL0".to_string()))?;
+            .ok_or_else(|| TrapError::Hypervisor("sigframe push underflowed stack".to_string()))?;
         let new_sp = new_sp & !15u64;
 
         // Write the frame into guest memory at the new SP.

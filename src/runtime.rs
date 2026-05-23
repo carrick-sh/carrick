@@ -124,6 +124,10 @@ pub trait SyscallTrap {
     /// (the vCPU was mid-userspace; `pc` is where it should resume after the
     /// handler returns and is redirected via `Reg::PC` rather than `ELR_EL1`).
     /// `None` is the syscall-boundary case (resume via the post-svc `ELR_EL1`).
+    /// `altstack` is `Some((ss_sp, ss_size))` when the handler was registered
+    /// `SA_ONSTACK` and an alternate signal stack is installed — the frame is
+    /// pushed onto that stack instead of the interrupted SP_EL0. `None` keeps
+    /// the frame on the current stack.
     fn inject_signal(
         &mut self,
         signum: i32,
@@ -131,6 +135,7 @@ pub trait SyscallTrap {
         sa_restorer: u64,
         pending_syscall_retval: Option<i64>,
         interrupted_pc: Option<u64>,
+        altstack: Option<(u64, u64)>,
     ) -> Result<(), TrapError>;
     /// Restore vCPU state from the `CarrickSigframe` at SP_EL0. Called
     /// when the guest invokes `rt_sigreturn(2)`. Does NOT advance PC
@@ -1221,12 +1226,23 @@ where
             } else {
                 0
             };
+            // SA_ONSTACK: run the handler on the alternate signal stack if one
+            // is installed. The kernel pushes the sigframe at the top of the
+            // alt stack instead of the interrupted SP. Go installs its handlers
+            // this way, and LTP sigaltstack01 deliberately makes the main stack
+            // unusable so the handler MUST land on the alt stack.
+            let altstack = if action.sa_flags & crate::linux_abi::LINUX_SA_ONSTACK != 0 {
+                dispatcher.signal_altstack()
+            } else {
+                None
+            };
             trap.inject_signal(
                 pending,
                 action.sa_handler,
                 restorer,
                 last_syscall_retval,
                 interrupted_pc,
+                altstack,
             )?;
             Ok(Some(PendingSignalAction { term_signal: None }))
         }
@@ -1645,6 +1661,7 @@ impl SyscallTrap for HvfTrapEngine {
         sa_restorer: u64,
         pending_syscall_retval: Option<i64>,
         interrupted_pc: Option<u64>,
+        altstack: Option<(u64, u64)>,
     ) -> Result<(), TrapError> {
         HvfTrapEngine::inject_signal(
             self,
@@ -1653,6 +1670,7 @@ impl SyscallTrap for HvfTrapEngine {
             sa_restorer,
             pending_syscall_retval,
             interrupted_pc,
+            altstack,
         )
     }
 
