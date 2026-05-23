@@ -1,6 +1,6 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
-use std::io::{BufRead, BufReader, Cursor, Read};
+use std::io::{BufRead, BufReader, Cursor, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 use flate2::read::GzDecoder;
@@ -298,44 +298,53 @@ impl RootFs {
     /// fs ops (symlinkat, atomic rename, gpgv subprocess, ...) needed
     /// real kernel semantics instead of bespoke overlay logic.
     ///
-    /// Directories are created first (sorted by depth so parents land
-    /// before children), then regular files, then symlinks. The
-    /// destination dir must exist and be empty (caller's job).
-    ///
-    /// Files are written with their stored permission bits. Symlinks
-    /// use the as-stored target text (preserving relative vs absolute
-    /// shape) — `clonefile(2)`-style identity would be ideal but works
-    /// transparently here since we're laying down fresh inodes.
-    pub fn extract_to_disk(&self, dest: &Path) -> Result<(), RootFsError> {
-        use std::os::unix::fs::PermissionsExt;
+    /// Directories are created first (sorted by depth so parents land before
+    /// children), then regular files, then symlinks. The destination dir must
+    /// exist and be empty (caller's job). This is the capability-rooted
+    /// materializer used by HostFsBackend so rootfs seeding stays inside the
+    /// already-open scratch dir.
+    pub fn extract_to_dir(&self, dir: &cap_std::fs::Dir) -> Result<(), RootFsError> {
+        use cap_std::fs::PermissionsExt as _;
+
         // Directories: process shallowest first.
         let mut dirs: Vec<&PathBuf> = self.directories.iter().collect();
         dirs.sort_by_key(|p| p.components().count());
         for d in dirs {
-            let host = dest.join(d);
-            std::fs::create_dir_all(&host)?;
+            dir.create_dir_all(d)?;
         }
         // Files.
         for (path, entry) in &self.files {
-            let host = dest.join(path);
-            if let Some(parent) = host.parent() {
-                std::fs::create_dir_all(parent)?;
+            if let Some(parent) = path.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                dir.create_dir_all(parent)?;
             }
-            std::fs::write(&host, &entry.contents)?;
-            let _ = std::fs::set_permissions(&host, std::fs::Permissions::from_mode(entry.mode));
+            let mut file = dir.create(path)?;
+            file.write_all(&entry.contents)?;
+            drop(file);
+            let _ = dir.set_permissions(path, cap_std::fs::Permissions::from_mode(entry.mode));
         }
         // Symlinks last (target paths might point at files we just wrote).
         for (link_path, entry) in &self.symlinks {
-            let host = dest.join(link_path);
-            if let Some(parent) = host.parent() {
-                std::fs::create_dir_all(parent)?;
+            if let Some(parent) = link_path.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                dir.create_dir_all(parent)?;
             }
             // If the link path already exists (e.g. parent created it as a dir),
             // remove first.
-            let _ = std::fs::remove_file(&host);
-            std::os::unix::fs::symlink(&entry.target_text, &host)?;
+            let _ = dir.remove_file(link_path);
+            let _ = dir.remove_dir_all(link_path);
+            dir.symlink_contents(&entry.target_text, link_path)?;
         }
         Ok(())
+    }
+
+    /// Path-based compatibility wrapper for callers that do not already hold a
+    /// capability-rooted directory.
+    pub fn extract_to_disk(&self, dest: &Path) -> Result<(), RootFsError> {
+        let dir = cap_std::fs::Dir::open_ambient_dir(dest, cap_std::ambient_authority())?;
+        self.extract_to_dir(&dir)
     }
 
     /// Every path the rootfs holds, regardless of kind. Used by

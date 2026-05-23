@@ -622,16 +622,8 @@ impl HostFsBackend {
     /// exit." cap-std's rooted `Dir` keeps the sandbox guarantee:
     /// guest paths are still confined to the scratch root.
     pub fn seed_from_rootfs(&mut self, rootfs: &crate::rootfs::RootFs) -> std::io::Result<()> {
-        let scratch_path = match &self._scratch {
-            Some(td) => td.path().to_path_buf(),
-            None => {
-                return Err(std::io::Error::other(
-                    "HostFsBackend has no owned scratch dir to seed",
-                ));
-            }
-        };
         rootfs
-            .extract_to_disk(&scratch_path)
+            .extract_to_dir(&self.dir)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         // Everything is on the cap-std disk now, which is the single
         // source of truth for lookups — no bookkeeping to record.
@@ -1857,6 +1849,51 @@ mod tests {
     fn host_open_create_write_read() {
         let (mut b, _scratch) = host_backend();
         scenario_open_create_write_read(&mut b);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_seed_from_rootfs_materializes_through_cap_dir() {
+        let mut tar = tar::Builder::new(Vec::new());
+        let mut dir_header = tar::Header::new_gnu();
+        dir_header.set_entry_type(tar::EntryType::Directory);
+        dir_header.set_mode(0o755);
+        dir_header.set_size(0);
+        tar.append_data(&mut dir_header, "etc/", std::io::empty())
+            .unwrap();
+
+        let data = b"seeded\n";
+        let mut file_header = tar::Header::new_gnu();
+        file_header.set_entry_type(tar::EntryType::Regular);
+        file_header.set_mode(0o640);
+        file_header.set_size(data.len() as u64);
+        tar.append_data(&mut file_header, "etc/motd", &data[..])
+            .unwrap();
+
+        let mut link_header = tar::Header::new_gnu();
+        link_header.set_entry_type(tar::EntryType::Symlink);
+        link_header.set_mode(0o777);
+        link_header.set_size(0);
+        link_header.set_link_name("motd").unwrap();
+        tar.append_data(&mut link_header, "etc/current", std::io::empty())
+            .unwrap();
+
+        let rootfs =
+            RootFs::from_layers([crate::rootfs::LayerSource::Tar(tar.into_inner().unwrap())])
+                .unwrap();
+        let (mut backend, _scratch) = host_backend();
+        backend.seed_from_rootfs(&rootfs).unwrap();
+
+        assert!(matches!(backend.lookup("/etc"), Some(OverlayEntry::Dir)));
+        assert!(
+            matches!(backend.lookup("/etc/motd"), Some(OverlayEntry::File(ref b)) if b == b"seeded\n")
+        );
+        let link = backend.read_link("/etc/current").unwrap();
+        assert_eq!(link, "motd");
+        assert_eq!(
+            backend.metadata("/etc/current").unwrap().kind,
+            RootFsEntryKind::Symlink
+        );
     }
 
     #[cfg(target_os = "macos")]
