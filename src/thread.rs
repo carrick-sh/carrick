@@ -14,6 +14,10 @@ pub type ThreadId = i32;
 struct ThreadEntry {
     /// Guest address to zero + FUTEX_WAKE on thread exit (CLONE_CHILD_CLEARTID).
     clear_child_tid: u64,
+    /// True while this thread is parked in a blocking syscall (futex/poll/wait).
+    /// Surfaced as the `/proc/<tid>/stat` state char ('S' vs 'R') so a peer
+    /// thread polling it (LTP futex_wait03/wake02) sees this thread sleeping.
+    sleeping: bool,
 }
 
 pub struct ThreadRegistry {
@@ -21,10 +25,41 @@ pub struct ThreadRegistry {
     inner: Mutex<HashMap<ThreadId, ThreadEntry>>,
 }
 
+/// Process-global handle to THIS process's live thread registry, so the
+/// `/proc/<tid>/stat` and `/proc/<pid>/task/` synthesis (which runs on the
+/// fs/open path, where the per-syscall registry isn't threaded through) can
+/// read this process's thread tids + states. Set when the vCPU loop creates
+/// its registry and re-set in a forked child (which builds a fresh one).
+static CURRENT_REGISTRY: std::sync::Mutex<Option<std::sync::Arc<ThreadRegistry>>> =
+    std::sync::Mutex::new(None);
+
+/// Publish `registry` as this process's current registry. Called by the run
+/// loop at startup and after fork (the child has its own registry).
+pub fn set_current_registry(registry: std::sync::Arc<ThreadRegistry>) {
+    if let Ok(mut g) = CURRENT_REGISTRY.lock() {
+        *g = Some(registry);
+    }
+}
+
+/// This process's live `(tid, state_char)` threads, or empty if unset.
+pub fn current_thread_states() -> Vec<(ThreadId, char)> {
+    CURRENT_REGISTRY
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|r| r.thread_states()))
+        .unwrap_or_default()
+}
+
 impl ThreadRegistry {
     pub fn new(main_tid: ThreadId) -> Self {
         let mut map = HashMap::new();
-        map.insert(main_tid, ThreadEntry { clear_child_tid: 0 });
+        map.insert(
+            main_tid,
+            ThreadEntry {
+                clear_child_tid: 0,
+                sleeping: false,
+            },
+        );
         Self {
             next_tid: AtomicI32::new(main_tid + 1),
             inner: Mutex::new(map),
@@ -39,7 +74,13 @@ impl ThreadRegistry {
         self.inner
             .lock()
             .expect("thread registry mutex poisoned")
-            .insert(tid, ThreadEntry { clear_child_tid });
+            .insert(
+                tid,
+                ThreadEntry {
+                    clear_child_tid,
+                    sleeping: false,
+                },
+            );
         tid
     }
 
@@ -92,6 +133,34 @@ impl ThreadRegistry {
             .lock()
             .expect("thread registry mutex poisoned")
             .contains_key(&tid)
+    }
+
+    /// Mark `tid` as parked in a blocking syscall (or running again). The run
+    /// loop calls this around each blocking wait so `/proc/<tid>/stat` reports
+    /// the right state to a polling peer thread.
+    pub fn set_sleeping(&self, tid: ThreadId, sleeping: bool) {
+        #[allow(clippy::expect_used)]
+        if let Some(e) = self
+            .inner
+            .lock()
+            .expect("thread registry mutex poisoned")
+            .get_mut(&tid)
+        {
+            e.sleeping = sleeping;
+        }
+    }
+
+    /// Live `(tid, state_char)` for every thread of this process — the data
+    /// behind `/proc/<pid>/task/` and `/proc/<tid>/stat`. `'S'` = parked in a
+    /// blocking syscall, `'R'` = running.
+    pub fn thread_states(&self) -> Vec<(ThreadId, char)> {
+        #[allow(clippy::expect_used)]
+        self.inner
+            .lock()
+            .expect("thread registry mutex poisoned")
+            .iter()
+            .map(|(&tid, e)| (tid, if e.sleeping { 'S' } else { 'R' }))
+            .collect()
     }
 }
 
