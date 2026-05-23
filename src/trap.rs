@@ -1000,6 +1000,51 @@ impl HvfInner {
         Ok(())
     }
 
+    /// Like `map_shared_file` but anonymous: a host `MAP_SHARED|MAP_ANON`
+    /// region mapped into the guest IPA, kept shared across fork. Used for a
+    /// guest `MAP_SHARED|MAP_ANONYMOUS` mmap (cross-process futex / shared IPC).
+    fn map_shared_anon(&mut self, guest_addr: u64, len: usize) -> Result<(), MemoryError> {
+        let host = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        if host == libc::MAP_FAILED {
+            return Err(MemoryError::HostMap(format!(
+                "mmap(MAP_SHARED|MAP_ANON) failed: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        let perms = hvf_perms(SegmentPerms {
+            read: true,
+            write: true,
+            execute: false,
+        });
+        let perms_raw: u64 = u64::from(perms);
+        let r = unsafe { applevisor_sys::hv_vm_map(host, guest_addr, len, perms_raw) };
+        if r != 0 {
+            unsafe { libc::munmap(host, len) };
+            return Err(MemoryError::HostMap(format!("hv_vm_map failed: 0x{r:x}")));
+        }
+        self.mappings.push(HvfMappedRegion {
+            start: guest_addr,
+            end: guest_addr + len as u64,
+            host_addr: host as *mut u8,
+            size: len,
+            perms,
+            memory: None,
+            // Genuine guest MAP_SHARED mapping — shared across fork, never
+            // snapshotted, and a valid cross-process futex target.
+            guest_shared: true,
+        });
+        Ok(())
+    }
+
     fn unmap_shared_file(&mut self, guest_addr: u64, len: usize) -> Result<(), MemoryError> {
         if let Some(pos) = self
             .mappings
@@ -2064,6 +2109,10 @@ impl GuestMemory for HvfTrapEngine {
         offset: u64,
     ) -> Result<(), MemoryError> {
         self.inner.map_shared_file(guest_addr, len, host_fd, offset)
+    }
+
+    fn map_shared_anon(&mut self, guest_addr: u64, len: usize) -> Result<(), MemoryError> {
+        self.inner.map_shared_anon(guest_addr, len)
     }
 
     fn unmap_shared_file(&mut self, guest_addr: u64, len: usize) -> Result<(), MemoryError> {
