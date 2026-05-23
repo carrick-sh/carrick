@@ -762,6 +762,34 @@ impl EventFdState {
     }
 }
 
+#[derive(Debug)]
+struct TimerFdState {
+    inner: Mutex<TimerFdInner>,
+    changed: Condvar,
+}
+
+impl TimerFdState {
+    fn new(clock_id: u64) -> Self {
+        Self {
+            inner: Mutex::new(TimerFdInner {
+                clock_id,
+                interval: None,
+                deadline: None,
+                expirations: 0,
+            }),
+            changed: Condvar::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TimerFdInner {
+    clock_id: u64,
+    interval: Option<Duration>,
+    deadline: Option<Duration>,
+    expirations: u64,
+}
+
 #[derive(Debug, Clone)]
 enum OpenDescription {
     File {
@@ -793,10 +821,7 @@ enum OpenDescription {
         status_flags: u64,
     },
     TimerFd {
-        clock_id: u64,
-        interval: Option<Duration>,
-        deadline: Option<Duration>,
-        expirations: u64,
+        state: Arc<TimerFdState>,
         status_flags: u64,
     },
     Epoll {
@@ -3825,16 +3850,11 @@ fn write_eventfd(bytes: &[u8], state: &EventFdState) -> DispatchOutcome {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-// big-kernel-lock loop needs all of: memory, address, length, clock, interval, deadline, expirations, nonblocking
 fn read_timerfd(
     memory: &mut impl GuestMemory,
     address: u64,
     length: usize,
-    clock_id: u64,
-    interval: &Option<Duration>,
-    deadline: &mut Option<Duration>,
-    expirations: &mut u64,
+    state: &TimerFdState,
     nonblocking: bool,
 ) -> DispatchOutcome {
     if length < core::mem::size_of::<LinuxTimerfdExpirations>() {
@@ -3842,46 +3862,62 @@ fn read_timerfd(
             errno: LINUX_EINVAL,
         };
     }
-    let (mut ready, mut next_deadline) =
-        timerfd_expirations(clock_id, *interval, *deadline, *expirations);
-    // A blocking timerfd read must wait until the timer fires rather than
-    // returning EAGAIN. If the timer hasn't expired yet but there IS an armed
-    // deadline, sleep until that deadline (real wall-clock) and recompute. If
-    // there's no deadline (no timer armed) we can't know when to wake, so we
-    // fall through to EAGAIN to avoid wedging the conformance harness.
-    if ready == 0
-        && !nonblocking
-        && let Some(target) = next_deadline
-    {
-        if let Some(now) = linux_clock_duration(clock_id) {
-            let wait = target.saturating_sub(now);
-            if !wait.is_zero() {
-                std::thread::sleep(wait);
+
+    let mut timer = state.inner.lock();
+    loop {
+        let ready = refresh_timerfd_locked(&mut timer);
+        if ready > 0 {
+            let value = LinuxTimerfdExpirations {
+                expirations: timer.expirations,
+            };
+            if write_kernel_struct_raw(memory, address, &value).is_err() {
+                return DispatchOutcome::Errno {
+                    errno: LINUX_EFAULT,
+                };
             }
+            timer.expirations = 0;
+            return DispatchOutcome::Returned {
+                value: core::mem::size_of::<LinuxTimerfdExpirations>() as i64,
+            };
         }
-        let recomputed = timerfd_expirations(clock_id, *interval, Some(target), *expirations);
-        ready = recomputed.0;
-        next_deadline = recomputed.1;
-    }
-    *deadline = next_deadline;
-    *expirations = ready;
-    if *expirations == 0 {
-        return DispatchOutcome::Errno {
-            errno: LINUX_EAGAIN,
+
+        if nonblocking {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EAGAIN,
+            };
+        }
+
+        let Some(deadline) = timer.deadline else {
+            state.changed.wait(&mut timer);
+            continue;
         };
-    }
-    let value = LinuxTimerfdExpirations {
-        expirations: *expirations,
-    };
-    if write_kernel_struct_raw(memory, address, &value).is_err() {
-        return DispatchOutcome::Errno {
-            errno: LINUX_EFAULT,
+        let Some(now) = linux_clock_duration(timer.clock_id) else {
+            state.changed.wait(&mut timer);
+            continue;
         };
+        let wait = deadline.saturating_sub(now);
+        if wait.is_zero() {
+            continue;
+        }
+        state.changed.wait_for(&mut timer, wait);
     }
-    *expirations = 0;
-    DispatchOutcome::Returned {
-        value: core::mem::size_of::<LinuxTimerfdExpirations>() as i64,
-    }
+}
+
+fn refresh_timerfd_locked(timer: &mut TimerFdInner) -> u64 {
+    let (ready, next_deadline) = timerfd_expirations(
+        timer.clock_id,
+        timer.interval,
+        timer.deadline,
+        timer.expirations,
+    );
+    timer.expirations = ready;
+    timer.deadline = next_deadline;
+    ready
+}
+
+fn timerfd_ready_count(state: &TimerFdState) -> u64 {
+    let mut timer = state.inner.lock();
+    refresh_timerfd_locked(&mut timer)
 }
 
 fn timerfd_itimerspec(

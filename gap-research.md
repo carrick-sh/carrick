@@ -35,10 +35,10 @@ Work package progress:
   - Completed: split the async signal pump wake pipe from the blocking-I/O waiter self-pipe and made the pump drain only its dedicated pipe.
   - Verified that waiter-pipe drains cannot consume pump wake bytes.
   - Remaining: fork safety still needs a host-thread-aware coordinator and stress coverage.
-- [ ] Package 3. Linux Blocking Object Semantics
+- [x] Package 3. Linux Blocking Object Semantics
   - Completed: `FIONBIO` now updates Linux-visible status flags and host nonblocking mode for host-backed fds.
   - Completed: blocking `eventfd` reads now wait and wake from writer updates while nonblocking reads still return `EAGAIN`.
-  - Remaining: timerfd blocking reads must stop sleeping while holding the fd description lock.
+  - Completed: `timerfd` reads now wait on timer state without holding the fd description lock, and `timerfd_settime` wakes blocked readers so re-arming changes their deadline.
 - [ ] Package 4. ABI and Flag Types
 - [ ] Package 5. Darwin Filesystem Leverage
 - [ ] Package 6. VFS and Stat Ownership
