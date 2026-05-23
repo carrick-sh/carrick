@@ -487,20 +487,37 @@ fn run_static_go_hello_under_carrick() {
 
     let output = assert_cmd::Command::cargo_bin("carrick")
         .unwrap()
-        .args([
-            "run-elf",
-            go_artifact,
-        ])
+        .args(["run-elf", go_artifact])
         .output()
         .unwrap();
 
     if output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("\"exit_code\": 0"), "unexpected exit code in json: {}", stdout);
-        assert!(stdout.contains("Client received status: success"), "expected client status: {}", stdout);
-        assert!(stdout.contains("Client received runtime: carrick"), "expected client runtime: {}", stdout);
-        assert!(stdout.contains("Client received concurrency: enabled"), "expected client concurrency: {}", stdout);
-        assert!(stdout.contains("Graceful shutdown completed successfully"), "expected graceful shutdown: {}", stdout);
+        assert!(
+            stdout.contains("\"exit_code\": 0"),
+            "unexpected exit code in json: {}",
+            stdout
+        );
+        assert!(
+            stdout.contains("Client received status: success"),
+            "expected client status: {}",
+            stdout
+        );
+        assert!(
+            stdout.contains("Client received runtime: carrick"),
+            "expected client runtime: {}",
+            stdout
+        );
+        assert!(
+            stdout.contains("Client received concurrency: enabled"),
+            "expected client concurrency: {}",
+            stdout
+        );
+        assert!(
+            stdout.contains("Graceful shutdown completed successfully"),
+            "expected graceful shutdown: {}",
+            stdout
+        );
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
@@ -509,4 +526,3 @@ fn run_static_go_hello_under_carrick() {
         );
     }
 }
-
