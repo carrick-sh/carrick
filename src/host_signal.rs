@@ -193,6 +193,12 @@ pub fn set_pump_kqueue(kq: i32) {
     PUMP_KQUEUE.store(kq, Ordering::SeqCst);
 }
 
+/// Clear the pump kqueue slot if it still names `kq`. Used when a stoppable
+/// signal pump exits so a later pump is not accidentally hidden.
+pub fn clear_pump_kqueue(kq: i32) {
+    let _ = PUMP_KQUEUE.compare_exchange(kq, -1, Ordering::SeqCst, Ordering::SeqCst);
+}
+
 /// Wake the signal pump via its `EVFILT_USER` (`NOTE_TRIGGER`). NOT
 /// async-signal-safe (`kevent` isn't) — call only from normal thread context;
 /// host signal handlers use the self-pipe (`notify_pending`) instead.
@@ -229,6 +235,17 @@ pub fn pending_pipe_read_fd() -> i32 {
 /// Read end of the signal pump's dedicated wake pipe.
 pub fn pump_pipe_read_fd() -> i32 {
     PUMP_PIPE_READ.load(Ordering::SeqCst)
+}
+
+/// Wake the signal pump's dedicated pipe from normal thread context.
+pub fn wake_signal_pump_pipe() {
+    let pump = PUMP_PIPE_WRITE.load(Ordering::SeqCst);
+    if pump >= 0 {
+        let byte = [1u8];
+        unsafe {
+            libc::write(pump, byte.as_ptr() as *const libc::c_void, 1);
+        }
+    }
 }
 
 /// Create (or recreate) the self-pipe. If already open the old ends are closed
@@ -378,13 +395,7 @@ fn notify_pending() {
             libc::write(w, byte.as_ptr() as *const libc::c_void, 1);
         }
     }
-    let pump = PUMP_PIPE_WRITE.load(Ordering::SeqCst);
-    if pump >= 0 {
-        let byte = [1u8];
-        unsafe {
-            libc::write(pump, byte.as_ptr() as *const libc::c_void, 1);
-        }
-    }
+    wake_signal_pump_pipe();
 }
 
 /// Drain the self-pipe (non-blocking). Called by a waiter after it observes the

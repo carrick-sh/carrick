@@ -418,6 +418,58 @@ fn tiocgpgrp_on_real_tty_uses_host_value_not_bootstrap() {
     }
 }
 
+/// Verify that `host_tty_tcgetsid` on a real pty slave follows the host
+/// `tcgetsid` result, instead of silently returning Carrick's synthetic
+/// bootstrap SID fallback.
+#[test]
+fn tiocgsid_on_real_tty_uses_host_value_not_bootstrap() {
+    // SAFETY: same pty-open pattern as the pgrp test.
+    let (master, slave) = unsafe {
+        let m = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+        assert!(m >= 0, "posix_openpt failed");
+        libc::grantpt(m);
+        libc::unlockpt(m);
+        let name_ptr = libc::ptsname(m);
+        assert!(!name_ptr.is_null(), "ptsname returned NULL");
+        let name = std::ffi::CStr::from_ptr(name_ptr).to_owned();
+        let s = libc::open(name.as_ptr(), libc::O_RDWR | libc::O_NOCTTY);
+        assert!(s >= 0, "open pty slave failed");
+        (m, s)
+    };
+
+    assert!(
+        carrick::host_tty::host_isatty(slave),
+        "pty slave must be a tty"
+    );
+
+    // SAFETY: slave is a valid open fd.
+    let direct = unsafe { libc::tcgetsid(slave) };
+    let via_helper = carrick::host_tty::host_tty_tcgetsid(slave);
+    match via_helper {
+        Ok(sid) => {
+            assert_eq!(sid, direct, "host_tty_tcgetsid must match tcgetsid");
+            assert_ne!(
+                sid,
+                carrick::linux_abi::LINUX_BOOTSTRAP_SID,
+                "host_tty_tcgetsid must not return the faked bootstrap sid on a real tty"
+            );
+        }
+        Err(_) => {
+            assert!(
+                direct < 0,
+                "helper returned Err but direct tcgetsid returned {}",
+                direct
+            );
+        }
+    }
+
+    // SAFETY: closing fds we opened above.
+    unsafe {
+        libc::close(master);
+        libc::close(slave);
+    }
+}
+
 /// Verify that `host_tty_tcsetpgrp` on a real pty slave either succeeds or
 /// returns a real errno (not silently EPERM-ing as the headless fallback does).
 ///

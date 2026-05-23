@@ -7,6 +7,7 @@ pub mod dispatch;
 #[cfg(target_os = "macos")]
 pub mod dtrace_consumer;
 pub mod elf;
+pub(crate) mod fork_coord;
 pub mod fs_backend;
 pub mod host_proc;
 pub mod host_signal;
