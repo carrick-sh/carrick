@@ -498,10 +498,7 @@ impl SyscallDispatcher {
     ) -> Result<DispatchOutcome, DispatchError> {
         let memory = &mut *ctx.memory;
         let info = LinuxSysinfo {
-            uptime: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0),
+            uptime: host_uptime_secs(),
             loads: [0; 3],
             totalram: 16 * 1024 * 1024 * 1024,
             freeram: 16 * 1024 * 1024 * 1024,
@@ -640,6 +637,35 @@ impl SyscallDispatcher {
         }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
+}
+
+fn host_uptime_secs() -> i64 {
+    #[cfg(target_os = "macos")]
+    {
+        let mut boot = libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        };
+        let mut mib = [libc::CTL_KERN, libc::KERN_BOOTTIME];
+        let mut len = core::mem::size_of::<libc::timeval>();
+        let rc = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                mib.len() as libc::c_uint,
+                &mut boot as *mut _ as *mut libc::c_void,
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc == 0
+            && boot.tv_sec > 0
+            && let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH)
+        {
+            return now.as_secs().saturating_sub(boot.tv_sec as u64) as i64;
+        }
+    }
+    0
 }
 
 /// Convert a Linux `timeval` to a `Duration` (saturating; negative components,

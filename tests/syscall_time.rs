@@ -6,6 +6,7 @@
 #[path = "common/syscall_support.rs"]
 mod support;
 
+use carrick::linux_abi::LinuxSysinfo;
 use support::*;
 
 #[test]
@@ -29,6 +30,34 @@ fn clock_gettime_writes_packed_linux_timespec() {
     let nsec = timespec.tv_nsec;
     assert!(sec > 0);
     assert!((0..1_000_000_000).contains(&nsec));
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn sysinfo_reports_uptime_not_epoch_time() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; core::mem::size_of::<LinuxSysinfo>()]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(179, SyscallArgs::from([0x4000, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let bytes = memory
+        .read_bytes(0x4000, core::mem::size_of::<LinuxSysinfo>())
+        .unwrap();
+    let (info, _) = LinuxSysinfo::read_from_prefix(&bytes).unwrap();
+    let uptime = info.uptime;
+    assert!(
+        (0..20 * 365 * 24 * 60 * 60).contains(&uptime),
+        "sysinfo.uptime must be seconds since boot, not Unix epoch seconds: {uptime}",
+    );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
