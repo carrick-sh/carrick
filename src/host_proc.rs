@@ -71,10 +71,74 @@ mod imp {
         (n == size).then_some(info)
     }
 
+    /// Aggregate Linux state char from the process's THREAD run states. macOS
+    /// `pbi_status` is process-level and stays `SRUN` for any live process
+    /// (sleeping is a per-thread concept), so it can't tell whether the guest
+    /// is blocked. Instead enumerate threads (PROC_PIDLISTTHREADS) and read
+    /// each thread's `pth_run_state` (PROC_PIDTHREADINFO): if any thread is
+    /// RUNNING the process is `'R'`; if all are WAITING/HALTED it's `'S'`
+    /// (a guest blocked in a syscall parks every carrick thread — the vCPU in
+    /// kevent and the signal pump in its own kevent). Falls back to the
+    /// process status if thread enumeration fails.
+    fn aggregate_thread_state(pid: u32, fallback_status: u32) -> char {
+        // PROC_PIDLISTTHREADS isn't exported by the libc crate (sys/proc_info.h
+        // value 6); the array it fills is u64 thread handles.
+        const PROC_PIDLISTTHREADS: libc::c_int = 6;
+        let mut handles = [0u64; 64];
+        let cap = std::mem::size_of_val(&handles) as libc::c_int;
+        // SAFETY: PROC_PIDLISTTHREADS writes an array of u64 thread handles.
+        let n = unsafe {
+            libc::proc_pidinfo(
+                pid as libc::c_int,
+                PROC_PIDLISTTHREADS,
+                0,
+                handles.as_mut_ptr() as *mut libc::c_void,
+                cap,
+            )
+        };
+        if n <= 0 {
+            return state_char(fallback_status);
+        }
+        let count = (n as usize / 8).min(handles.len());
+        let mut any_running = false;
+        let mut saw_thread = false;
+        for &h in handles.iter().take(count) {
+            let mut ti: libc::proc_threadinfo = unsafe { std::mem::zeroed() };
+            let size = std::mem::size_of::<libc::proc_threadinfo>() as libc::c_int;
+            // SAFETY: PROC_PIDTHREADINFO fills proc_threadinfo for thread `h`.
+            let r = unsafe {
+                libc::proc_pidinfo(
+                    pid as libc::c_int,
+                    libc::PROC_PIDTHREADINFO,
+                    h,
+                    &mut ti as *mut _ as *mut libc::c_void,
+                    size,
+                )
+            };
+            if r as usize != std::mem::size_of::<libc::proc_threadinfo>() {
+                continue;
+            }
+            saw_thread = true;
+            if ti.pth_run_state == libc::TH_STATE_RUNNING
+                || ti.pth_run_state == libc::TH_STATE_UNINTERRUPTIBLE
+            {
+                any_running = true;
+                break;
+            }
+        }
+        if !saw_thread {
+            state_char(fallback_status)
+        } else if any_running {
+            'R'
+        } else {
+            'S'
+        }
+    }
+
     pub fn pid_info(pid: u32) -> Option<GuestProcInfo> {
         let info = bsdinfo(pid)?;
         Some(GuestProcInfo {
-            state: state_char(info.pbi_status),
+            state: aggregate_thread_state(pid, info.pbi_status),
             ppid: info.pbi_ppid,
             pgid: info.pbi_pgid,
             uid: info.pbi_uid,
