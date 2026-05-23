@@ -1,742 +1,213 @@
-# Carrick Gap Research
-
-Date: 2026-05-23
-Repository: `/Volumes/CaseSensitive/carrick`
-Scope: code-quality, Darwin/macOS leverage, Rust ecosystem leverage, safety, performance, correctness, and maintainability gaps.
-
-This document consolidates the four research lanes run against the current checkout:
-
-- Darwin/macOS leverage
-- Rust ecosystem leverage
-- Safety, correctness, and performance
-- Legibility, complexity, and internal patterns
-
-The research sections below preserve the original findings; the implementation ledger records the follow-up changes made on `codex/address-gap-research`.
-
-## Implementation Ledger
-
-Status: complete on branch `codex/address-gap-research`.
-
-Baseline captured 2026-05-23:
-
-- `cargo fmt --all -- --check`: fails on formatting drift listed in the original validation snapshot.
-- `cargo clippy --all-targets`: fails because the intended test unwrap exemption is not honored for `tests/syscall_net.rs`.
-- `cargo test --lib thread::tests`: passes, 8 tests.
-- `cargo test --test concurrency_contracts`: passes, 16 tests.
-- `cargo test --test syscall_net`: passes, 20 tests.
-
-Work package progress:
-
-- [x] Package 1. Fd Table and Host Fd Ownership
-  - Added atomic single-fd and pair-fd install helpers and migrated fd-producing paths off allocate-then-insert.
-  - Moved host fd close ownership onto cloned `OpenFile` handles and pinned blocking wait fds with duplicated host fds.
-  - Verified with targeted fd allocation and wait-pin regression tests.
-- [x] Package 2. Signal Pump and Fork Discipline
-  - Completed: split the async signal pump wake pipe from the blocking-I/O waiter self-pipe and made the pump drain only its dedicated pipe.
-  - Verified that waiter-pipe drains cannot consume pump wake bytes.
-  - Completed: added a host-fork coordinator that owns the signal pump lifecycle, joins the pump before the real host `fork(2)`, and restarts a fresh pump in parent, child, and fork-error paths.
-  - Completed: made real pty-backed `TIOCGSID` use Darwin `tcgetsid`, retaining the synthetic bootstrap sid only for non-tty/headless stdio.
-  - Verified with fork-coordinator, signal-pump, split-pipe, pty sid, syscall-thread, syscall-fs, and concurrency-contract tests.
-- [x] Package 3. Linux Blocking Object Semantics
-  - Completed: `FIONBIO` now updates Linux-visible status flags and host nonblocking mode for host-backed fds.
-  - Completed: blocking `eventfd` reads now wait and wake from writer updates while nonblocking reads still return `EAGAIN`.
-  - Completed: `timerfd` reads now wait on timer state without holding the fd description lock, and `timerfd_settime` wakes blocked readers so re-arming changes their deadline.
-- [x] Package 4. ABI and Flag Types
-  - Completed: added a direct `bitflags` dependency and typed Linux flag families for open, at/statx, mmap, futex, clone, socket type, and fd descriptor flags.
-  - Completed: added read-side `KernelAbi` helpers, including prefix reads for variable-sized structs, and migrated timespec, iovec, pollfd, epoll_event, msghdr, and clone_args reads away from manual byte slicing.
-  - Completed: added zerocopy ABI structs for `msghdr`, `mmsghdr`, and `clone_args`; mmsg entry sizing now comes from the ABI types.
-  - Verified accepted/rejected flag masks, unaligned/null/truncated/overlarge ABI reads, unknown mmap flag `EINVAL`, socket/thread regressions, and fcntl fd flag behavior.
-- [x] Package 5. Darwin Filesystem Leverage
-  - Completed: `sync` now invokes the host sync primitive, and host-backed `fsync`/`fdatasync`/`syncfs` flush the real host fd with optional `CARRICK_STRICT_DURABILITY=1` `F_FULLFSYNC` on macOS.
-  - Completed: `HostFsBackend::seed_from_rootfs` now materializes through its cap-std rooted `Dir` instead of re-entering through an ambient path.
-  - Completed: host-backed whole-file `copy_file_range` now tries Darwin `copyfile` before the bounded generic copy path; existing `msync` routing covers real MAP_SHARED file mappings.
-- [x] R4. Kqueue Unsafe Boundary
-  - Completed: added a `darwin_kqueue` boundary that owns kqueue fds with RAII, centralizes `kevent` construction, wraps `EVFILT_USER` triggering, and exposes typed event inspection.
-  - Completed: moved `ThreadWaiter`, signal-pump registration/draining, and `host_signal::notify_pump` off hand-built raw `libc::kevent` values.
-  - Verified kqueue fd closure, user-trigger wake behavior, signal-pump tests, host-signal split-pipe tests, and existing kqueue waiter integration tests.
-- [x] R5/S4. Host Mapping and Process-wide Protection Ownership
-  - Completed: added an `OwnedHostMapping` RAII boundary for host `mmap` lifetimes while keeping HVF `hv_vm_map`/`hv_vm_unmap` calls explicit in the trap layer.
-  - Completed: moved guest `PROT_NONE` intervals into shared process-wide protection metadata and carried that metadata through thread sibling specs.
-  - Verified host mapping drop cleanup, shared protection updates across cloned thread metadata, `syscall_mem`, `syscall_thread`, and the memory concurrency contract.
-- [x] S6. FUTEX_REQUEUE Compatibility Coverage
-  - Completed: added syscall-thread regression coverage for both `FUTEX_REQUEUE` and `FUTEX_CMP_REQUEUE`.
-  - Verified both commands keep returning `ENOSYS` and emit the stable `FUTEX_(CMP_)REQUEUE unsupported` compatibility event.
-- [x] Package 6. VFS and Stat Ownership
-  - Completed L1: moved synthetic `/proc` and `/sys` file registration/rendering ownership into `vfs::proc` and `vfs::sys`; dispatcher now supplies live context only.
-  - Verified VFS proc/sys unit tests plus existing synthetic `/proc` and `/sys` syscall-surface tests.
-  - Completed L2/L3: added an `OpenDescription::stat_source` helper and shared `StatRecord` writer path for `stat`, `fstat`, and `statx`.
-  - Verified `fstat` and `statx(AT_EMPTY_PATH)` now agree for eventfd, timerfd, epoll, pipe, and socket fds.
-  - Completed L4: extended the aarch64 syscall manifest with group, handler module, and compatibility-note fields; threaded dispatch route gates now consult the manifest handler owner instead of local ownership ranges.
-  - Verified manifest drift coverage for group-vs-handler cases such as `pselect6`/`ppoll`, bootstrap `ENOSYS` stubs, planned `execveat`, and partial `clone3`.
-  - Completed L5: replaced the ad hoc `host_errno()` propagation boundary with `HostSyscallResult`/`HostSyscallError`, migrated host syscall failure paths through that boundary, and removed the legacy helper.
-  - Verified macOS-to-Linux errno capture for divergent `EINPROGRESS`, `EAGAIN`, and `ECONNREFUSED` values.
-  - Completed L6: split multi-threaded vCPU loop state into `ThreadRuntimeState` with named helpers for blocking dispatch waits, futex waits, sibling signal routing, clone-thread spawn, thread exit, exec, and fork transitions.
-  - Verified runtime-loop, syscall-thread, syscall-signal, syscall-net, and concurrency-contract regression suites after the extraction.
-- [x] Hygiene gates and final verification sweep
-  - Completed: restored the documented no-panic clippy gate by explicitly exempting integration-test helper code in `tests/syscall_fs.rs` and `tests/syscall_net.rs`; production unwrap/expect/panic denies remain active.
-  - Final verification on 2026-05-23:
-    - `cargo fmt --all -- --check`: passed.
-    - `cargo clippy --all-targets`: passed with warning-level style suggestions only.
-    - `cargo test`: passed, including conformance; interactive TTY tests remain intentionally ignored by the test suite.
-
-## Executive Summary
-
-Carrick is already exploiting some host value well: it uses HVF directly through `applevisor`/`applevisor-sys`, has a Darwin-specific kqueue wake path, carries a Linux errno translation layer, uses `cap-std` for host filesystem confinement, and has real test coverage around threaded dispatch, signals, ptys, networking, and guest fixtures.
-
-The biggest remaining gaps are not that the project uses `libc`. The issue is that raw `libc` calls are often the only abstraction boundary. That makes Darwin-specific behavior harder to reason about, harder to test, and easier to accidentally flatten to the common subset of the `libc` crate. The highest-value direction is a small number of explicit host-facing modules that encode Darwin semantics: fd ownership and readiness, fork/signal discipline, APFS file operations, pty/session passthrough, mmap/HVF mapping ownership, and Linux ABI parsing.
-
-The highest-risk correctness gaps are:
-
-- Non-atomic fd allocation and installation under shared dispatch.
-- Raw host fd lifetime not pinned across close/wait races.
-- Guest `fork` allowed when the guest registry is single-threaded even though the host process has other Carrick threads alive.
-- A shared signal self-pipe is consumed by both blocking waiters and the signal pump.
-- Blocking eventfd semantics are incomplete.
-- PROT_NONE tracking is per trap engine, not process-wide.
-
-The highest-value macOS/Darwin opportunities are:
-
-- Use fork discipline that accounts for host threads, not just guest vCPU count.
-- Split the signal pump wake channel from parked I/O waiters, using kqueue `EVFILT_USER` or a dedicated pump pipe.
-- Use real Darwin durability and APFS primitives where they matter: `fsync`, optional `F_FULLFSYNC`, `msync`, `clonefileat`/`fclonefileat`, and `copyfile`.
-- Pass through real pty/session state for `TIOCGSID` rather than synthesizing bootstrap state for real ttys.
+# Carrick Code Review — Post-Refactoring Re-evaluation
+
+> [!NOTE]
+> This is a **delta review** covering the ~40 commits of refactoring since the initial review. The codebase now has 35 source files (6 new), totaling ~1.3M bytes. The refactoring has delivered **substantial improvements** in type safety, concurrency correctness, and Linux ABI completeness. This review tracks what was fixed, what remains open, and what's new.
+
+## Completion Ledger
+
+Status: in progress on branch `codex/address-gap-research`.
+
+Plan: `docs/superpowers/plans/2026-05-23-gap-research-completion.md`
+
+- [ ] Security and guest-visible correctness batch: xattrs, rooted path handling, allocation caps, memory advice, signal alt-stack validation, time/sysinfo, host socket nonblocking, entropy/ELF validation.
+- [ ] Runtime safety and maintainability batch: panic-safe trap rebuild, fork snapshot ownership, `PROT_NONE` lookup, `GPR_TABLE`, runtime trace flag caching, lock ordering, C-string reads, `/proc` task listing, SIGWINCH draining, DTrace RAII.
+- [ ] Partial-addressed review items: errno/error boundary, duplicated trap-loop responsibilities, and subsystem/crate error typing either completed or closed with evidence.
+- [ ] Final verification and integration: targeted tests, full cargo hygiene, logical commits, and fast-forward back into `main`.
+
+---
+
+## Refactoring Scorecard
+
+### ✅ Fixed (11 items)
+
+| Previous Finding | How Fixed | Commit |
+|---|---|---|
+| Raw `args[0]` / `args[1] as i32` type-width mismatches | `SyscallRequest::arg(n)` + `bitflags!` types (`LinuxOpenFlags`, `LinuxMmapFlags`, etc.) | `56671a5 feat: type linux flags and ABI reads` |
+| Missing `O_LARGEFILE` handling | `LinuxOpenFlags::LARGEFILE` in bitflags, stripped in translation | Same |
+| Wire-format size mismatches (termios 44→36 byte bug class) | `KernelAbi` trait with `const ABI_SIZE` + compile-time `const_assert!`; `write_kernel_struct`/`read_kernel_struct` helpers | Same |
+| `SA_ONSTACK` not delivered on alt stack | Full implementation in `dispatch/signal.rs` | `98febdd signal: deliver SA_ONSTACK handlers on the alternate signal stack` |
+| `vcpu_kick` held lock during kicks → deadlock risk | Snapshot-then-kick pattern; lock released before `kick_ids()` | `5ad3087 refactor: own host mappings and shared protections` |
+| Signal pump busy-polling with `usleep(250ms)` | Redesigned: `EVFILT_USER` kqueue + split pipe. Process genuinely sleeps when idle. | `2254732 fix: split signal pump wake pipe` + `be2beba signal/proc: block the pump on EVFILT_USER` |
+| `/sys/devices/system/cpu/online` hardcoded `"0-3"` | Uses `std::thread::available_parallelism()` with fallback | `89ff975 refactor: move synthetic proc sys rendering into vfs` |
+| `prlimit64` silently ignored new limits | Now validates and stores them | `f811dab prlimit64: accept setting a resource limit instead of EINVAL` |
+| `setitimer` not delivering signals | Timer thread now calls `notify_pump` → vCPU kick | `d4ce8ba time: deliver SIGALRM/SIGVTALRM/SIGPROF on interval-timer expiry` |
+| `FUTEX_WAIT_BITSET` timeout wrongly treated as relative | Fixed to use absolute timeout per Linux semantics | `e48db6a futex: FUTEX_WAIT_BITSET timeout is absolute, not relative` |
+| `epoll_ctl`/`epoll_pwait` missing argument validation | Added proper validation | `8a4236e epoll: argument validation on epoll_ctl / epoll_pwait` |
+
+### 🔶 Partially Addressed (3 items)
+
+| Previous Finding | Current Status |
+|---|---|
+| Errno sign convention inconsistency | `HostSyscallError` covers host-errno paths. Guest-side still mixed (`-EINVAL` vs `Err(anyhow!(...))` → `-EIO`). ~60% standardized. |
+| Three trap loops duplicate ~70% code | `1d9c301 refactor: extract threaded runtime transitions` moved some logic out, but `run_combined_syscall_loop_with_dispatcher`, `run_vcpu_until_exit`, and `run_split_loop` still share ~60% identical code. |
+| Per-subsystem error types | `DispatchError` enum replaces some `anyhow::Result` returns but crate-level `CarrickError` not yet implemented. |
+
+### ❌ Still Open (13 items from previous review)
+
+| # | Sev | Finding | File |
+|---|---|---|---|
+| 1 | **Critical** | `ptr::write(self)` in fork/execve — panic-unsafe window | [trap.rs](file:///Volumes/CaseSensitive/carrick/src/trap.rs) ~L1580, L1868 |
+| 2 | **Critical** | Internal xattr names (`user.carrick.uid/gid`) leak to guest | [fs_backend.rs](file:///Volumes/CaseSensitive/carrick/src/fs_backend.rs) / [dispatch/fs.rs](file:///Volumes/CaseSensitive/carrick/src/dispatch/fs.rs) |
+| 3 | **High** | Sandbox escape via symlink TOCTOU in `resolve_beneath()` | [fs_backend.rs](file:///Volumes/CaseSensitive/carrick/src/fs_backend.rs) ~L300 |
+| 4 | **High** | `ptsname()` not thread-safe (process-global static buffer) | [vfs/devpts.rs](file:///Volumes/CaseSensitive/carrick/src/vfs/devpts.rs) ~L142 |
+| 5 | **High** | `truncate()` OOM via uncapped `len as usize` | [vfs/rootfs.rs](file:///Volumes/CaseSensitive/carrick/src/vfs/rootfs.rs) ~L756 |
+| 6 | **High** | Linear scan of `PROT_NONE` ranges on every memory access | [trap.rs](file:///Volumes/CaseSensitive/carrick/src/trap.rs) ~L858 |
+| 7 | **High** | `GPR_TABLE` duplicated 6 times | [trap.rs](file:///Volumes/CaseSensitive/carrick/src/trap.rs) 6 sites |
+| 8 | **High** | `env::var_os` in combined trap loop not cached | [runtime.rs](file:///Volumes/CaseSensitive/carrick/src/runtime.rs) ~L497 |
+| 9 | **Medium** | Lock ordering undocumented across subsystem locks | dispatch module |
+| 10 | **Medium** | `allocate_fd` TOCTOU race (read lock → insert) | [dispatch/fs.rs](file:///Volumes/CaseSensitive/carrick/src/dispatch/fs.rs) |
+| 11 | **Medium** | `MADV_DONTNEED` is a no-op (jemalloc relies on zero-fill) | [dispatch/mem.rs](file:///Volumes/CaseSensitive/carrick/src/dispatch/mem.rs) |
+| 12 | **Medium** | Symlink resolution has no hop limit (infinite recursion) | [vfs/mod.rs](file:///Volumes/CaseSensitive/carrick/src/vfs/mod.rs) |
+| 13 | **Medium** | Fork snapshot buffers leak in parent permanently | [trap.rs](file:///Volumes/CaseSensitive/carrick/src/trap.rs) ~L1502 |
 
-The highest-value Rust ecosystem opportunities are:
+---
 
-- Add direct `bitflags` types for Linux flag families.
-- Extend existing `zerocopy` use to read-side ABI parsing.
-- Move host socket/fd ownership toward `OwnedFd`/`BorrowedFd` plus `socket2::SockRef` where it clarifies ownership without outsourcing Linux ABI translation.
-- Consider `rustix` for safe fd and mmap helpers, but keep Carrick's Linux-to-Darwin semantic translation explicit.
-- Add `proptest` for ABI/path/flag normalization and possibly `loom` only after isolating OS-free concurrency primitives.
+## New Issues in Refactored/New Code
 
-## Validation Snapshot
+### High
 
-Commands already run during this review:
+| Sev | File | Issue |
+|---|---|---|
+| **HIGH** | [dispatch/signal.rs](file:///Volumes/CaseSensitive/carrick/src/dispatch/signal.rs) ~L620 | **SA_ONSTACK delivery doesn't validate alt stack is mapped.** `ss_sp + ss_size` is used as the new SP without checking the memory is mapped/writable. Guest registering an alt stack at an unmapped address causes a host-side write failure instead of a guest SIGSEGV. |
+| **HIGH** | [dispatch/mem.rs](file:///Volumes/CaseSensitive/carrick/src/dispatch/mem.rs) ~L214 | **`dup_fd` leak on `map_shared_file` error path.** When `next_shared_file_address` returns `Some(addr)` but `map_shared_file` fails, the code falls through to the snapshot path without closing `dup_fd`. |
+| **HIGH** | [dispatch/time.rs](file:///Volumes/CaseSensitive/carrick/src/dispatch/time.rs) ~L501 | **`sysinfo.uptime` reports epoch time, not uptime.** `SystemTime::now().duration_since(UNIX_EPOCH)` gives ~1.7 billion seconds. Programs like `htop` / `uptime` would show 55 years. Use `sysctl(KERN_BOOTTIME)` or monotonic clock. |
+| **HIGH** | [trap.rs](file:///Volumes/CaseSensitive/carrick/src/trap.rs) ~L1826 | **`from_thread_spec` silently swallows `hv_vm_map` failures.** Comment says "tolerate HV_BAD_ARGUMENT for re-mapping", but all errors are swallowed including out-of-memory. Check for the specific error code. |
 
-- `cargo deny check licenses`: passed.
-- `cargo test --lib thread::tests`: passed, 8 tests.
-- `cargo test --test concurrency_contracts`: passed, 16 tests.
-- `cargo test --test syscall_thread`: passed, 12 tests.
-- `cargo test --test syscall_net`: passed, 20 tests.
-- `cargo test --test conformance -- --nocapture`: passed, 3 tests.
+### Medium
 
-Current hygiene gaps observed:
+| Sev | File | Issue |
+|---|---|---|
+| **MEDIUM** | [memory.rs](file:///Volumes/CaseSensitive/carrick/src/memory.rs) ~L593 | **`getentropy` return value unchecked.** If it fails, `AT_RANDOM` is all-zero → predictable stack canary. Check return and fall back to `/dev/urandom`. |
+| **MEDIUM** | [memory.rs](file:///Volumes/CaseSensitive/carrick/src/memory.rs) ~L741 | **`wrapping_add` for segment end calculation.** A malicious ELF with `virtual_address + memory_size > u64::MAX` silently wraps. Use `checked_add`. |
+| **MEDIUM** | [dispatch/time.rs](file:///Volumes/CaseSensitive/carrick/src/dispatch/time.rs) ~L120 | `clock_gettime(CLOCK_MONOTONIC)`: `(ticks * numer) / denom` can overflow `u64` if `numer > 1`. Use `u128` intermediate. |
+| **MEDIUM** | [dispatch/signal.rs](file:///Volumes/CaseSensitive/carrick/src/dispatch/signal.rs) ~L672 | **`rt_sigqueueinfo` rejects self-signal from forked child.** Compares target against `LINUX_BOOTSTRAP_PID` only; after fork, child's pid != bootstrap pid → ESRCH on self-signal. Should also check `std::process::id()`. |
+| **MEDIUM** | [dispatch/net.rs](file:///Volumes/CaseSensitive/carrick/src/dispatch/net.rs) ~L1246 | **Host sockets not always set `O_NONBLOCK` at creation.** The `blocking_io` invariant requires non-blocking host fds, but `host_socket_install` only sets it when the guest passes `SOCK_NONBLOCK`. A new I/O path without `MSG_DONTWAIT` could block under the dispatcher lock. |
+| **MEDIUM** | [dispatch/mod.rs](file:///Volumes/CaseSensitive/carrick/src/dispatch/mod.rs) ~L4024 | **`read_guest_c_string` is O(n) per byte.** Each byte is read with a separate `read_bytes(address, 1)` call. For PATH_MAX=4096 this is 4096 calls. Read in 256-byte chunks and scan for NUL. |
+| **MEDIUM** | [vfs/proc.rs](file:///Volumes/CaseSensitive/carrick/src/vfs/proc.rs) ~L500 | `/proc/<pid>/task/` readdir uses a fixed `[0u64; 64]` array for thread handles. Processes with >64 threads have their list truncated silently. |
+| **MEDIUM** | [thread.rs](file:///Volumes/CaseSensitive/carrick/src/thread.rs) ~L260 | `FUTEX_CMP_REQUEUE` acquires source then destination bucket locks. Verify no other path takes them in reverse order. |
+| **MEDIUM** | [pty_relay.rs](file:///Volumes/CaseSensitive/carrick/src/pty_relay.rs) ~L600 | `handle_sigwinch` drains one byte instead of all. Multiple coalesced signals leave bytes in the pipe. |
+| **MEDIUM** | [dispatch/signal.rs](file:///Volumes/CaseSensitive/carrick/src/dispatch/signal.rs) ~L250 | `rt_sigprocmask(SIG_SETMASK)` doesn't strip SIGKILL/SIGSTOP bits from the stored mask. Signal delivery skips them, so this is cosmetic, but the mask value is technically wrong. |
+| **MEDIUM** | [dispatch/fs.rs](file:///Volumes/CaseSensitive/carrick/src/dispatch/fs.rs) ~L3968 | **Raw macOS errno in streamed-stdio write path.** Uses `*libc::__error()` directly instead of `.host_syscall_errno()` translation. Some macOS errnos disagree with Linux (e.g., EOPNOTSUPP=45 vs 95). |
 
-- `cargo fmt --all -- --check` fails on formatting drift in `src/dispatch/mod.rs`, `src/lib.rs`, `src/runtime.rs`, `src/vcpu_kick.rs`, `src/vfs/proc.rs`, and `tests/syscall_net.rs`.
-- `cargo clippy --all-targets` fails. The important issue is not only style warnings: it reports multiple `clippy::unwrap_used` failures in `tests/syscall_net.rs`.
-- The clippy result contradicts the project expectation in `README.md:90-96` and `clippy.toml:1`, where tests are intended to be exempt from unwrap/expect/panic bans.
+### Low
 
-## External Reference Map
+| Sev | File | Issue |
+|---|---|---|
+| **LOW** | [syscall.rs](file:///Volumes/CaseSensitive/carrick/src/syscall.rs) | Syscall table uses binary search but no test verifies sortedness. |
+| **LOW** | [elf.rs](file:///Volumes/CaseSensitive/carrick/src/elf.rs) | `validate_elf()` accepts any `e_machine`. Only `EM_AARCH64` is supported. |
+| **LOW** | [vfs/proc.rs](file:///Volumes/CaseSensitive/carrick/src/vfs/proc.rs) ~L250 | `/proc/<pid>/cmdline` returns comm name instead of actual argv (macOS limitation). Documented but may confuse tools that parse by NUL-splitting. |
+| **LOW** | [dtrace_consumer.rs](file:///Volumes/CaseSensitive/carrick/src/dtrace_consumer.rs) | Manual cleanup of `dtrace_close`/`dtrace_proc_release` — RAII guard recommended. |
 
-Primary references used for cross-checking:
+---
 
-- Apple kqueue manual: https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/kqueue.2.html
-- Apple fcntl manual, including `F_FULLFSYNC`: https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/fcntl.2.html
-- Darwin clonefile manual: https://keith.github.io/xcode-man-pages/clonefile.2.html
-- Apple Hypervisor framework: https://developer.apple.com/documentation/hypervisor
-- POSIX `fork`: https://pubs.opengroup.org/onlinepubs/9799919799/functions/fork.html
-- POSIX `pthread_atfork`: https://pubs.opengroup.org/onlinepubs/9799919799/functions/pthread_atfork.html
-- Linux `eventfd`: https://man7.org/linux/man-pages/man2/eventfd.2.html
-- Linux `futex`: https://man7.org/linux/man-pages/man2/futex.2.html
-- Linux `FUTEX_REQUEUE`: https://man7.org/linux/man-pages/man2/FUTEX_CMP_REQUEUE.2const.html
-- Linux `/proc/<pid>/stat`: https://man7.org/linux/man-pages/man5/proc_pid_stat.5.html
-- Rust `bitflags`: https://docs.rs/bitflags/latest/bitflags/
-- Rust `zerocopy`: https://docs.rs/zerocopy/latest/zerocopy/
-- Rust `socket2`: https://docs.rs/socket2/latest/socket2/
-- Rust `socket2::SockRef`: https://docs.rs/socket2/latest/socket2/struct.SockRef.html
-- Rust `rustix`: https://docs.rs/rustix/latest/rustix/
-- Rust `cap-std`: https://docs.rs/cap-std/latest/cap_std/
-- Rust `proptest`: https://docs.rs/proptest/latest/proptest/
-- Rust `loom`: https://docs.rs/loom/latest/loom/
-- Apple XNU source reference for private-ish Darwin primitives such as `__ulock`: https://github.com/apple-oss-distributions/xnu
+## Quality of New Extracted Modules
 
-## Gap Register
+All 6 new modules demonstrate **excellent** engineering quality:
 
-### D1. Fork safety is gated on guest vCPU count, not host thread reality
+| Module | Lines | RAII | Tests | Safety Comments | Assessment |
+|---|---|---|---|---|---|
+| [ulock.rs](file:///Volumes/CaseSensitive/carrick/src/ulock.rs) | 85 | N/A (syscalls) | — | ✅ 2 sites | **Excellent** — `ULF_NO_ERRNO` avoids errno race; clean platform fallback |
+| [fork_coord.rs](file:///Volumes/CaseSensitive/carrick/src/fork_coord.rs) | 102 | `PreparedHostFork` token | ✅ 1 test | — | **Good** — RAII token prevents accidental fork |
+| [darwin_kqueue.rs](file:///Volumes/CaseSensitive/carrick/src/darwin_kqueue.rs) | 197 | `Kqueue` Drop | ✅ 2 tests | ✅ | **Excellent** — `Kevent` newtype prevents raw construction |
+| [darwin_fs.rs](file:///Volumes/CaseSensitive/carrick/src/darwin_fs.rs) | 120 | `CopyfileState` Drop | ✅ 1 test | ✅ | **Good** — Clean RAII for copyfile state |
+| [host_mapping.rs](file:///Volumes/CaseSensitive/carrick/src/host_mapping.rs) | 116 | `OwnedHostMapping` Drop | ✅ 1 test | — | **Excellent** — RAII munmap; shared/private tracking |
+| [host_proc.rs](file:///Volumes/CaseSensitive/carrick/src/host_proc.rs) | 256 | N/A | — | ✅ 5 sites | **Good** — Bounded ppid walk; thread-level state aggregation |
 
-Severity: P1 correctness and safety.
+> [!TIP]
+> The pattern in these modules — small, focused, RAII-clean, tested, `// SAFETY:`-documented — is the template for future extractions from the large files.
 
-The runtime rejects `fork` when more than one guest vCPU is live, but the host process is still multithreaded even in the single guest vCPU case. The signal pump is spawned before the vCPU loop at `src/runtime.rs:736`. Later, `DispatchOutcome::Fork` only checks `registry.live_count() > 1` at `src/runtime.rs:1103`. The fork path then calls `libc::fork()` in `src/trap.rs:1583`, re-registers DTrace probes in the child at `src/trap.rs:1596`, and rebuilds HVF state at `src/trap.rs:1608-1612`.
+---
 
-The POSIX fork rules are stricter than the current gate implies: after a multithreaded process forks, only the calling thread exists in the child, and operations involving inherited locks/resources can be undefined until exec unless disciplined. Carrick's child path does substantial Rust and HVF work after fork.
+## Architectural Improvements
 
-Recommendation:
+```mermaid
+graph LR
+    subgraph "Before (initial review)"
+        A["Raw u64 args\nManual sizes\nPolling signal pump\nMonolithic unsafe blocks"] 
+    end
+    subgraph "After (40 commits)"
+        B["bitflags! typed args\nKernelAbi const_assert\nEVFILT_USER pump\nRaii Kqueue/Mapping/Fork"]
+    end
+    A -->|"5,752 lines added\n2,594 removed"| B
+```
 
-- Treat the signal pump and any other Carrick host thread as part of the fork safety model.
-- Introduce a Darwin fork coordinator around known global state: signal self-pipe, pump kqueue, fd table locks, output buffers, DTrace probe state, and HVF teardown/rebuild.
-- Consider `pthread_atfork` only for narrow state repair. Do not rely on it as the sole solution; Carrick still needs an explicit "forkable host state" invariant.
-- Add a stress test that forks while the signal pump is alive and while a host-side blocking waiter exists.
+### Key Wins
 
-Validation target:
+1. **`KernelAbi` trait** — The `const ABI_SIZE` + `const_assert!` pattern eliminates the entire class of "wrote N+8 bytes and corrupted the guest's stack canary" bugs. This is the single most impactful safety improvement.
 
-- A guest workload repeatedly forks while host interval timers/signals are active.
-- The child can rebuild HVF and exit or exec without deadlock.
-- The parent still delivers pending process-directed signals after child creation.
+2. **`bitflags!` for Linux flags** — `LinuxOpenFlags`, `LinuxMmapFlags`, etc. catch type-width and flag-identity bugs at compile time. The `SUPPORTED_MASK` constants enable clean unsupported-flag validation.
 
-### D2. Signal self-pipe is shared by the pump and blocking I/O waiters
+3. **Signal pump redesign** — `EVFILT_USER` kqueue replaces `usleep(250ms)` polling. The process genuinely sleeps when idle, fixing `/proc/<pid>/stat` reporting and reducing CPU waste. Signal handlers use the pipe (async-signal-safe); normal threads use `trigger_user` (not async-signal-safe but correct from dispatch context).
 
-Severity: P1 correctness and latency.
+4. **RAII extraction modules** — `OwnedHostMapping`, `Kqueue`, `CopyfileState`, `PreparedHostFork` all prevent resource leaks on error paths. The `host_mapping.rs` module is particularly good — it replaces raw `mmap`/`munmap` pairs scattered through trap.rs with owned, droppable mappings.
 
-`host_signal` maintains one process-wide self-pipe: `PENDING_PIPE_READ` and `PENDING_PIPE_WRITE` at `src/host_signal.rs:171-177`. Host signal handlers write to it through `notify_pending()` at `src/host_signal.rs:348-354`. Every `ThreadWaiter` registers the same read fd at `src/io_wait.rs:54-60`, and drains it when woken at `src/io_wait.rs:202-203`. The signal pump also watches the same read fd at `src/vcpu_kick.rs:160` and registers it with kqueue at `src/vcpu_kick.rs:186-205`.
+5. **Cross-process futex via `__ulock`** — Cleanly layered: `ulock.rs` provides the raw syscall, `thread.rs` routes shared futexes through it, and the existing parking_lot path handles private futexes. LTP's `tst_checkpoint` now works.
 
-This creates a race in the wake design: a parked blocking-I/O waiter can drain the self-pipe before the pump observes it. If the relevant guest vCPU is spinning in `hv_vcpu_run`, the wake that should cause `hv_vcpus_exit` can be consumed by a different path.
+---
 
-The code already recognizes this issue partially by adding `EVFILT_USER` and `notify_pump()` for process signals from normal thread context (`src/host_signal.rs:191-213`, `src/host_signal.rs:389-392`). That does not cover async host signal handler writes, because `kevent` is not async-signal-safe.
+## Remaining Priorities (Recommended Order)
 
-Recommendation:
+### 1. Fix xattr namespace leak (Critical, small fix)
 
-- Give the signal pump its own async-signal-safe wake pipe, separate from waiter interruption.
-- Keep `EVFILT_USER` for normal-thread wake sources such as interval timer threads.
-- Add a monotonic pending generation counter so drain order cannot lose the obligation to kick vCPUs.
-- Test with one guest vCPU busy in userspace, one sibling parked in `ppoll`, and repeated process-directed host signals.
+The xattr dispatch in [dispatch/fs.rs:3640-3760](file:///Volumes/CaseSensitive/carrick/src/dispatch/fs.rs#L3640-L3760) passes guest-supplied xattr names directly to the overlay without checking if they match `CARRICK_UID_XATTR_NAME`, `CARRICK_GID_XATTR_NAME`, or `CARRICK_MODE_XATTR_NAME`. A guest can read/write/list internal metadata xattrs.
 
-Validation target:
+**Fix:** Add a 3-line guard at the top of `setxattr()`, `getxattr()`, and `listxattr()`:
 
-- A process-directed signal always causes `kicker.kick_all()` regardless of which waiter drains the I/O self-pipe.
+```rust
+if name.starts_with("user.carrick.") {
+    return Ok(DispatchOutcome::Errno { errno: LINUX_ENODATA });
+}
+```
 
-### D3. `FIONBIO` succeeds but does not change fd behavior
+And filter internal names in `listxattr`'s output assembly.
 
-Severity: P2 correctness and compatibility.
+### 2. Sandbox escape via resolve_beneath (High, security-critical)
 
-The `ioctl(FIONBIO)` path validates the pointer and then returns success without persisting nonblocking state at `src/dispatch/fs.rs:1229-1237`. By contrast, `fcntl(F_SETFL)` is already treated as the durable path for status flags, and the surrounding fd code reads those flags for nonblocking behavior.
+[fs_backend.rs:~L300](file:///Volumes/CaseSensitive/carrick/src/fs_backend.rs) — `canonicalize()` + `starts_with()` is a well-known TOCTOU. Replace with `RESOLVE_BENEATH` (macOS Ventura+) or per-component `openat(O_NOFOLLOW)` chaining.
 
-On Linux, `FIONBIO` is a common compatibility path for sockets and some language runtimes. Returning success while leaving behavior unchanged is a compatibility trap.
+### 3. `ptr::write(self)` panic safety (Critical, design change)
 
-Recommendation:
+[trap.rs:~L1580](file:///Volumes/CaseSensitive/carrick/src/trap.rs) — Use `ManuallyDrop::take()` + rebuild, or wrap the destroy-then-rebuild in a helper guaranteed not to panic.
 
-- Route `FIONBIO` through the same status-flag update helper as `fcntl(F_SETFL)` for Carrick-owned fd descriptions.
-- For real host sockets/pipes/files, update Carrick's Linux-visible status flags and decide explicitly whether to also call Darwin `ioctl(FIONBIO)` or `fcntl(O_NONBLOCK)` on the host fd.
-- Add socket and pipe tests that set nonblocking through `FIONBIO`, then verify read/recv/write readiness behavior.
+### 4. `ptsname()` thread-safety (High, small fix)
 
-Validation target:
+[vfs/devpts.rs:~L142](file:///Volumes/CaseSensitive/carrick/src/vfs/devpts.rs) — Replace `ptsname()` with `ptsname_r()`. Available on macOS.
 
-- `FIONBIO(1)` followed by a would-block operation returns Linux `EAGAIN`.
-- `FIONBIO(0)` restores blocking semantics where Carrick can model them.
+### 5. Cap guest-controlled allocations (High, several small fixes)
 
-### D4. `sync`, `syncfs`, and `fsync` are successful no-ops
+- `truncate()` in [vfs/rootfs.rs](file:///Volumes/CaseSensitive/carrick/src/vfs/rootfs.rs): clamp `len` to 2 GiB
+- `read_guest_cstring()`: add `max_len` parameter
+- `mincore()`: validate `length` against arena size
 
-Severity: P2 correctness and durability.
+### 6. Document lock ordering (Medium, documentation)
 
-`sync` returns success without flushing at `src/dispatch/fs.rs:3400-3405`. `syncfs` validates the fd and returns success at `src/dispatch/fs.rs:3407-3417`. `fsync` validates the fd and returns success at `src/dispatch/fs.rs:3672-3680`. At the same time, Carrick can expose real shared file mappings through `MAP_SHARED` in `src/trap.rs:944-999`.
+Add a `// LOCK ORDERING: creds < fs < mem < proc < signal` comment at the top of [dispatch/mod.rs](file:///Volumes/CaseSensitive/carrick/src/dispatch/mod.rs) and audit all callers.
 
-For memory-backed ephemeral files this may be acceptable. For host-backed files and shared mappings, the current behavior loses the durability semantics callers reasonably expect. On macOS, `fsync` and `fcntl(F_FULLFSYNC)` have different durability strength; `F_FULLFSYNC` is the Darwin-specific lever.
+### 7. Extract GPR_TABLE + cache env var (High, quick wins)
 
-Recommendation:
+- `GPR_TABLE`: 6 duplicates in [trap.rs](file:///Volumes/CaseSensitive/carrick/src/trap.rs) → 1 module-level constant
+- `CARRICK_TRACE_TRAPS`: cache before combined loop in [runtime.rs](file:///Volumes/CaseSensitive/carrick/src/runtime.rs)
 
-- For `HostFile`, call host `fsync`.
-- For strict durability mode, optionally call `fcntl(F_FULLFSYNC)` after `fsync` on Darwin.
-- For shared mapped host files, consider `msync(MS_SYNC)` on the mapped region before `fsync`.
-- Keep memory backend no-op behavior explicit and documented.
+---
 
-Validation target:
+## File Size Tracker
 
-- A host-backed file touched by a guest `fsync` results in a real host `fsync` call.
-- Strict mode can be observed calling `F_FULLFSYNC` on macOS.
+The large-file situation is unchanged. The `normalized_dispatch!` macro migration is the right approach but hasn't yet reduced `mod.rs`/`fs.rs` to manageable sizes.
 
-### D5. APFS clone/copy primitives are promised but underused
+| File | Size | Lines | Δ | Status |
+|---|---|---|---|---|
+| [dispatch/fs.rs](file:///Volumes/CaseSensitive/carrick/src/dispatch/fs.rs) | 228KB | ~5,500 | +2KB | Still largest — split recommended |
+| [dispatch/mod.rs](file:///Volumes/CaseSensitive/carrick/src/dispatch/mod.rs) | 161KB | ~4,700 | **-7KB** | Improving via `normalized_dispatch!` |
+| [dispatch/net.rs](file:///Volumes/CaseSensitive/carrick/src/dispatch/net.rs) | 121KB | ~3,100 | **-2KB** | Slight improvement |
+| [trap.rs](file:///Volumes/CaseSensitive/carrick/src/trap.rs) | 104KB | ~2,500 | +5KB | Growing (new shared mmap, fork features) |
+| [fs_backend.rs](file:///Volumes/CaseSensitive/carrick/src/fs_backend.rs) | 82KB | ~2,100 | +1KB | Stable |
+| [runtime.rs](file:///Volumes/CaseSensitive/carrick/src/runtime.rs) | 74KB | ~1,800 | +2KB | Growing (transition extraction) |
 
-Severity: P2 performance and Darwin leverage.
+---
 
-`src/fs_backend.rs:13-16` describes `HostFsBackend` as an APFS scratch directory that is "reflink-seeded" through `clonefile`. Current seeding goes through `HostFsBackend::seed_from_rootfs` at `src/fs_backend.rs:624-635`, which calls `RootFs::extract_to_disk`. That path writes file contents with `std::fs::write` at `src/rootfs.rs:319-325`.
+## Conclusion
 
-`copy_file_range` also uses a bounded read-then-write path, capped at 8 MiB, in `src/dispatch/fs.rs:2998-3078`. That is a practical generic path, but it misses APFS copy-on-write when source and destination are host files on the same volume.
-
-Recommendation:
-
-- Align docs and implementation: either remove the clonefile claim or add a real APFS fast path.
-- For host-to-host regular file copies, try `clonefileat`/`fclonefileat` or `copyfile` first, then fall back to the existing bounded copy path on unsupported filesystems, cross-device copies, pipes, sparse edge cases, and non-host-backed fds.
-- Keep the generic copy path because it is still correct for pipes, synthetic files, and memory-backed rootfs.
-
-Validation target:
-
-- A host-backed `copy_file_range` fixture on APFS takes the clone/copyfile fast path.
-- Cross-device or unsupported copies fall back without changing Linux-visible results.
-
-### D6. Real pty/session state is only partially passed through
-
-Severity: P2 correctness and interactive behavior.
-
-The tty path already passes through foreground process group changes for real ttys (`src/dispatch/fs.rs:1188-1197`). But `TIOCGSID` on stdio still writes the synthetic `LINUX_BOOTSTRAP_SID` at `src/dispatch/fs.rs:1246-1249`.
-
-That is good enough for bootstrap cases, but interactive job-control behavior is a Darwin value area: real ptys have real session/foreground state, and Carrick should use it where available.
-
-Recommendation:
-
-- For real pty-backed stdio, use Darwin `tcgetsid` or the host `TIOCGSID` equivalent where available.
-- Keep the bootstrap synthetic fallback for non-tty and headless cases.
-- Add an interactive fixture that compares guest-observed sid/pgid behavior with host pty state.
-
-Validation target:
-
-- `TIOCGSID` on `-t` pty-backed stdio returns the host-backed controlling-session value translated into Carrick's guest pid model.
-
-### R1. Linux flags need typed internal representations
-
-Severity: P2 legibility and correctness.
-
-The project has many raw flag constants and masks, including support checks in `src/dispatch/mod.rs:2048-2060`, socket flag stripping in `src/dispatch/net.rs:1264-1271`, clone flags in the process path, mmap/prot flags, futex flags, and `AT_*` flags. `bitflags` is already present transitively in `Cargo.lock`, but it is not a direct dependency in `Cargo.toml`.
-
-Raw constants are appropriate for Linux UAPI numbers. They are weaker for validation logic because supported/unsupported masks are scattered and hard to audit.
-
-Recommendation:
-
-- Add direct `bitflags` dependency.
-- Introduce typed groups such as `OpenFlags`, `AtFlags`, `MmapFlags`, `FutexFlags`, `CloneFlags`, `SocketTypeFlags`, and `FdFlags`.
-- Keep syscall numbers, errno numbers, and struct layouts as explicit Linux ABI constants.
-- Add unknown-bit tests for each flag family.
-
-Validation target:
-
-- Every flag parser has tests for accepted masks, rejected masks, and Linux errno on unknown bits.
-
-### R2. `zerocopy` is used for writes but not enough for reads
-
-Severity: P2 safety and ABI clarity.
-
-Carrick already has a strong write-side ABI pattern: `KernelAbi` in `src/linux_abi.rs:943-976` and `write_kernel_struct` in `src/dispatch/mod.rs:2372-2384`. Read-side parsing still uses manual byte offsets in newer paths. For example, `read_linux_msghdr` manually slices a 56-byte Linux `msghdr` at `src/dispatch/net.rs:3094-3117`, and `ppoll` manually decodes a timespec at `src/dispatch/net.rs:779-792`.
-
-Manual parsing is not automatically wrong, but it increases the chance of layout drift and silent truncation mistakes.
-
-Recommendation:
-
-- Add read-side helpers parallel to `write_kernel_struct`, probably `read_kernel_struct<T>` and `read_kernel_prefix<T>`.
-- Define `#[repr(C)]` zerocopy structs for `clone_args`, `msghdr`, `mmsghdr`, `timespec`, `pollfd`, and sockaddr variants where layout is stable.
-- Use explicit ABI-size constants when Linux's user ABI size is smaller than Rust's in-memory struct.
-
-Validation target:
-
-- Truncation, null pointer, unaligned, and overlarge length tests exist for each read-side ABI struct.
-
-### R3. Host socket and fd ownership should use Rust ownership types where they clarify lifetime
-
-Severity: P2 safety and maintainability.
-
-Host socket installation creates a raw fd through `libc::socket`, then manually closes it on allocation failure and stores an `i32` in `OpenDescription::HostSocket` (`src/dispatch/net.rs:1264-1308`). More broadly, `OpenDescription` stores raw host fds for `HostPipe`, `HostFile`, and `HostSocket` (`src/dispatch/mod.rs:751-857`), and `close_open_file` manually closes them based on `Arc::strong_count` (`src/dispatch/mod.rs:2449-2484`).
-
-`socket2` is already present transitively. It can help with socket creation and `SockRef` operations, but it should not own Linux ABI translation. Carrick still needs explicit Linux-family, socktype, errno, and flag semantics.
-
-Recommendation:
-
-- Move host fd ownership to a small RAII wrapper or `OwnedFd` where possible.
-- Use `BorrowedFd`/`SockRef` for host socket option calls and readiness operations.
-- Keep Linux-to-Darwin address, flag, and errno translation in Carrick.
-- Add tests for dup/close/wait races before refactoring.
-
-Validation target:
-
-- Closing one duplicated guest fd does not close the host fd while another alias exists.
-- Closing the last alias closes the host fd exactly once.
-
-### R4. Keep custom kqueue wait machinery, but constrain the unsafe surface
-
-Severity: P2 performance and maintainability.
-
-`ThreadWaiter` owns a per-thread kqueue (`src/io_wait.rs:33-63`) and dynamically registers guest fd readiness plus the signal pipe. The signal pump uses `EVFILT_USER` and `EVFILT_READ` directly in `src/vcpu_kick.rs:186-205`. This is a good Darwin-specific design; it should not be replaced wholesale with `mio` or a generic cross-platform reactor unless Carrick is changing its runtime model.
-
-The gap is that raw kqueue structs and fd ownership are spread across modules.
-
-Recommendation:
-
-- Add tiny internal wrappers for kqueue fd ownership, `kevent` construction, `EVFILT_USER` trigger, and event draining.
-- Use those wrappers in `io_wait`, `vcpu_kick`, and `host_signal`.
-- Consider `rustix` only where it simplifies fd ownership and syscall wrappers without hiding Darwin semantics.
-
-Validation target:
-
-- Unit tests can construct and drop kqueue wrappers without leaking fds.
-- Signal pump and waiter tests verify independent wake channels.
-
-### R5. Raw mmap/HVF mapping ownership needs a narrow RAII abstraction
-
-Severity: P2 safety and legibility.
-
-Guest memory uses raw `libc::mmap`, `munmap`, `hv_vm_map`, and manual metadata. Examples include shared file mapping at `src/trap.rs:944-999`, shared anonymous mapping at `src/trap.rs:1003-1015`, fork snapshot cloning at `src/trap.rs:2193-2236`, and raw remapping at `src/trap.rs:2239-2250`.
-
-Generic crates such as `memmap2` are not a drop-in because Carrick must coordinate mmap ownership with HVF stage-2 mappings and fork snapshot behavior. But the current raw surface is still too broad.
-
-Recommendation:
-
-- Introduce a narrow `OwnedHostMapping` or similar type that owns host pointer, length, sharing mode, and unmap behavior.
-- Keep HVF map/unmap calls explicit at the trap-engine layer.
-- Encode whether a mapping participates in fork snapshot, `MAP_SHARED`, guest shared anonymous memory, or raw remap.
-
-Validation target:
-
-- Drop and fork-rebuild tests demonstrate no double-unmap and no leak for failed `hv_vm_map`.
-
-### R6. `cap-std` is present, but one seeding path bypasses the capability surface
-
-Severity: P3 safety and consistency.
-
-The tar extraction path has a `cap_std::fs::Dir`-based API at `src/rootfs.rs:108-126`. But `RootFs::extract_to_disk` is path-based (`src/rootfs.rs:309-334`), and `HostFsBackend::seed_from_rootfs` calls that path-based extractor at `src/fs_backend.rs:624-635`, even though the surrounding comments describe cap-std confinement.
-
-This is probably not an immediate vulnerability because the scratch path is owned and generated by the process, but it is a pattern gap: the capability discipline is not uniform.
-
-Recommendation:
-
-- Either route host seeding through a `cap_std::fs::Dir` API or document why the path-based materializer is safe and limited to process-owned scratch dirs.
-- Prefer one extraction surface so tar/path sanitization rules cannot drift.
-
-Validation target:
-
-- Path traversal, absolute path, symlink, and hardlink extraction tests exercise the same code path used by `HostFsBackend`.
-
-### S1. Fd allocation and installation are not atomic
-
-Severity: P1 correctness and concurrency.
-
-`allocate_fd` scans `open_files` under a read lock, drops that lock, and returns an fd at `src/dispatch/fs.rs:2215-2232`. `insert_open_file` later takes a write lock and inserts at `src/dispatch/fs.rs:2235-2239`. Several callers allocate and insert as separate steps, including socket creation at `src/dispatch/net.rs:1287-1295`.
-
-Under shared dispatch, two threads can observe the same free fd and both install into it. The later insert replaces the earlier one and calls close on the replaced `OpenFile`. That is a data-race-shaped semantic bug at the Linux fd table level, even if Rust's memory safety is preserved.
-
-Recommendation:
-
-- Replace allocate-then-insert with an atomic `install_fd(min_fd, open_file) -> Result<i32, Errno>` that holds the write lock across scan and insertion.
-- Add pair allocation for `pipe2`, `socketpair`, and similar two-fd syscalls so the pair is reserved atomically.
-- Keep `dup2`/`dup3` semantics explicit because they intentionally replace a chosen fd.
-
-Validation target:
-
-- A concurrency test repeatedly creates sockets/pipes from multiple guest threads and asserts no duplicate fd allocation or accidental close of an unrelated fd.
-
-### S2. Host fd lifetime is not pinned across close/wait races
-
-Severity: P1 correctness and safety.
-
-`open_file()` returns cloned `OpenFile` handles. `close_open_file` closes raw host fds only if `Arc::strong_count(&open_file.description) == 1` (`src/dispatch/mod.rs:2449-2484`). Blocking I/O paths can return `DispatchOutcome::WaitOnFds`, and the runtime waits outside dispatch locks at `src/runtime.rs:838-842`.
-
-The current model has two coupled risks:
-
-- A transient cloned `Arc` can keep `strong_count > 1` while close is processed, causing the host fd not to close when the final guest fd table entry is removed.
-- A waiter may hold raw host fd integers while another thread closes and the host reuses that fd number for an unrelated object.
-
-Recommendation:
-
-- Move fd table entries to explicit owned host fd handles.
-- For wait paths, carry a pinned/borrrowed lifetime or duplicated wait handle rather than a bare integer.
-- Add a close-after-wait and wait-after-close contract test.
-
-Validation target:
-
-- A guest thread blocked in `ppoll` on a host fd cannot observe readiness for a different object after another thread closes and reopens fds.
-- Host fd count returns to baseline after repeated dup/close/wait cycles.
-
-### S3. Blocking timerfd reads sleep while holding the fd write lock
-
-Severity: P2 performance and contention.
-
-`read` takes `open_file.description.write()` at `src/dispatch/fs.rs:2452`. For `TimerFd`, it calls `read_timerfd` before dropping that lock at `src/dispatch/fs.rs:2463-2480`. `read_timerfd` can sleep until the deadline at `src/dispatch/mod.rs:3811-3819`.
-
-This serializes other operations on the same fd description while sleeping, including timer reconfiguration. Linux timerfd behavior allows another thread to change the timer and affect blocking wait behavior.
-
-Recommendation:
-
-- Do not sleep while holding the `OpenDescription` write lock.
-- Convert timerfd to a small state object with its own condition/wake mechanism, or return a `WaitUntilTimer` outcome to the runtime.
-- Add tests where one thread blocks in `read(timerfd)` and another calls `timerfd_settime`.
-
-Validation target:
-
-- Re-arming a timerfd from another guest thread wakes or changes the blocked reader according to Linux semantics.
-
-### S4. PROT_NONE tracking is per engine, not process-wide
-
-Severity: P2 correctness.
-
-Guest memory tracks no-access intervals in the trap engine (`src/trap.rs:912-941`). `mprotect` calls `ctx.memory.set_no_access(...)` at `src/dispatch/mem.rs:661`. But sibling trap engines are created with `no_access: Vec::new()` at `src/trap.rs:1737-1739`.
-
-That means one guest thread can mark a range `PROT_NONE` while another thread's dispatcher memory accessor may still accept reads or writes through its own engine view.
-
-Recommendation:
-
-- Move no-access interval state to a process-wide shared memory metadata object.
-- Keep per-engine HVF permissions in sync with the shared metadata.
-- Add a threaded test where one thread `mprotect(PROT_NONE)`s a buffer and a sibling syscall attempts to read/write it.
-
-Validation target:
-
-- All guest syscall memory access paths enforce the latest process-wide protection metadata.
-
-### S5. Blocking eventfd read semantics are incomplete
-
-Severity: P2 correctness.
-
-`eventfd` stores status flags in `OpenDescription::EventFd` (`src/dispatch/net.rs:91-95`), but `read` calls `read_eventfd` without passing those flags at `src/dispatch/fs.rs:2460-2462`. `read_eventfd` returns `EAGAIN` whenever the counter is zero at `src/dispatch/mod.rs:3734-3737`.
-
-Linux `eventfd` blocks on zero counter unless the fd is nonblocking. The current behavior matches nonblocking reads, but not blocking eventfd reads.
-
-Recommendation:
-
-- Use eventfd status flags in `read_eventfd`.
-- For blocking eventfd, return a wait outcome rather than `EAGAIN` when the counter is zero.
-- Wake waiters from `write_eventfd` when the counter transitions from zero to nonzero.
-
-Validation target:
-
-- Blocking eventfd read sleeps until another guest thread writes.
-- Nonblocking eventfd read still returns Linux `EAGAIN`.
-
-### S6. FUTEX_REQUEUE is an explicit compatibility gap
-
-Severity: P2 compatibility.
-
-During consolidation, this finding was corrected against the current checkout. Current code explicitly returns `ENOSYS` for `FUTEX_REQUEUE` and `FUTEX_CMP_REQUEUE`, records a compatibility event, and documents why waking-instead-of-requeueing was rejected (`src/dispatch/mod.rs:2316-2335`).
-
-That is safer than pretending to support requeue semantics, but it remains a gap for workloads that still depend on those futex operations.
-
-Recommendation:
-
-- Keep the explicit `ENOSYS` until a real requeue model exists.
-- Add a compatibility note that modern glibc and musl condvars generally avoid this path, as the code comment says.
-- Keep LTP-style futex tests around this behavior so it does not regress into a partial wake implementation.
-
-Validation target:
-
-- `FUTEX_(CMP_)REQUEUE` returns `ENOSYS` and emits a stable compatibility event. Completed with syscall-thread regression tests for both futex requeue commands.
-- Known condvar workloads in target libc versions do not hit the gap in normal operation.
-
-### L1. Synthetic `/proc` and `/sys` ownership is inverted
-
-Severity: P2 architecture and legibility.
-
-The VFS modules exist, but much of the real virtual-file rendering lives in the dispatcher. `vfs/proc.rs` and `vfs/sys.rs` are wrappers, while process stat rendering and registry data flow are rooted in dispatcher/runtime structures. Tests for `/proc` behavior are strong, but production ownership is split.
-
-This makes virtual filesystem growth harder because new proc/sys files need dispatcher awareness instead of living in a virtual file table.
-
-Recommendation:
-
-- Move virtual file registration and rendering ownership into `vfs::{proc,sys}`.
-- Let dispatcher open/read paths consume a `VfsNode` or `SyntheticFile` produced by the VFS layer.
-- Keep runtime thread registry as data input, not as the owner of procfs formatting.
-
-Validation target:
-
-- Adding a new `/proc` file requires a VFS module entry and tests, not edits across dispatcher routing. Completed for the synthetic proc/sys registries.
-
-### L2. `OpenDescription` has become the fd subsystem boundary
-
-Severity: P2 complexity and bug surface.
-
-`OpenDescription` spans regular files, directories, synthetic files, eventfd, timerfd, epoll, pipes, host pipes, host files, host sockets, and netlink (`src/dispatch/mod.rs:751-857`). Large matches repeat across read, write, readv, writev, splice/sendfile/copy_file_range, stat, statx, lseek, and readiness handling.
-
-This central enum is useful, but it now has too many policies attached directly to ad hoc match sites: locking policy, offset management, host fd access, writeback, readiness, fd flags, and stat identity.
-
-Recommendation:
-
-- Keep `OpenDescription` as the central fd object, but add helper methods or per-kind modules for common policies.
-- Extract operations such as `status_flags`, `set_status_flags`, `host_fd`, `readiness`, `stat_source`, `read_at`, and `write_at`.
-- Avoid trait objects until the repeated match logic is actually reduced; simple methods may be enough.
-
-Validation target:
-
-- Read/write/stat behavior changes can be tested against one fd operation layer instead of each syscall arm. Completed for fd stat sources with `OpenDescription::stat_source`.
-
-### L3. stat/statx construction is duplicated
-
-Severity: P2 correctness and legibility.
-
-The project has solid helpers for writing Linux stat/statx structures, including `write_statx_real`, `write_statx`, and synthetic variants in `src/dispatch/mod.rs:2811-3004`. But path stat logic and fd stat logic still branch separately across many file kinds in `src/dispatch/fs.rs:5035-5398`.
-
-The recurring risk is drift: fstat and statx can disagree on mode, size, timestamps, uid/gid, or synthetic object identity.
-
-Recommendation:
-
-- Introduce a `StatRecord` or `GuestStatSource` intermediate representation.
-- Convert path-backed, host-backed, synthetic, pipe, socket, eventfd, timerfd, and epoll objects into that representation.
-- Have `stat`, `fstat`, and `statx` write from the same record.
-
-Validation target:
-
-- Table-driven tests assert that `stat`, `fstat`, and `statx(AT_EMPTY_PATH)` agree for every fd kind where Linux expects agreement. Completed for anonymous fd kinds that previously drifted.
-
-### L4. Syscall metadata and routing can drift
-
-Severity: P2 maintainability.
-
-Syscall metadata lives in `src/syscall.rs`, while routing tables live across dispatcher modules. For example, `pselect6` and `ppoll` are labeled "fs" in `src/syscall.rs:112-119`, but route through network dispatch at `src/dispatch/net.rs:43-44`. Filesystem routing also lists them because syscall grouping and handler ownership are separate concerns.
-
-This is not a direct runtime bug, but it reduces confidence in support-level reporting and compatibility diagnostics.
-
-Recommendation:
-
-- Create a single syscall manifest containing number, name, group, support level, handler module, and compatibility notes.
-- Generate or verify route tables against that manifest.
-- Add a test that every supported syscall has exactly one handler route.
-
-Validation target:
-
-- Changing a syscall's support level or handler location cannot leave stale metadata behind. Completed by adding `SyscallHandler` and compatibility notes to the aarch64 manifest, making threaded route gates use manifest handler ownership, and adding syscall-table tests for group/handler drift and supported syscall handler ownership.
-
-### L5. Errno translation is good but not mandatory enough
-
-Severity: P2 correctness.
-
-The errno translation layer is one of the stronger patterns in the codebase: host errno capture now flows through `HostSyscallError`/`HostSyscallResult`, Darwin errno still maps through `macos_to_linux_errno`, and Linux errno constants remain explicit in `src/dispatch/mod.rs`.
-
-The original gap was enforcement: host syscall failures could read the translated host errno through an ad hoc helper, while semantic Linux errno decisions used the same plain `i32` shape. That made the boundary hard to audit.
-
-Recommendation:
-
-- Require host syscall failures to flow through a `HostSyscallResult` helper or similar.
-- Reserve direct `linux_errno::*` returns for Linux semantic decisions, not host errno propagation.
-- Add tests for macOS values that differ numerically from Linux, especially `EAGAIN`, socket errors, and `EINPROGRESS`.
-
-Validation target:
-
-- No host `errno` value can escape as a Linux return without passing through translation. Completed by removing the legacy `host_errno()` helper, requiring host syscall return values to use `HostSyscallResult`, and adding a macOS unit test for divergent `EINPROGRESS`, `EAGAIN`, and `ECONNREFUSED` translation.
-
-### L6. The runtime loop is carrying too many responsibilities
-
-Severity: P2 complexity.
-
-`run_vcpu_until_exit` starts at `src/runtime.rs:775` and handles vCPU execution, syscall dispatch, blocking wait re-dispatch, signal servicing, clone, fork, exec, thread exit, registry changes, output behavior, and signal pump rebuilds. That makes it hard to reason about correctness at the fork/signal/thread boundary.
-
-Recommendation:
-
-- Split a `ThreadRuntime` or `VcpuRuntime` object out of the loop.
-- Isolate the following transitions into named methods: syscall completion, blocking wait, fork parent/child repair, thread clone registration, exec handoff, signal service.
-- Keep the hot loop direct; the point is named invariants, not abstraction for its own sake.
-
-Validation target:
-
-- Fork, clone, exec, and signal tests can target transition helpers or at least trace their compatibility events cleanly.
-
-Completed by extracting `ThreadRuntimeState` around the multi-threaded HVF loop. The loop now orchestrates vCPU entry, dispatch, and signal delivery while named helpers own blocking waits, futex completion, sibling signal delivery, clone-thread spawn, thread exit, exec, and fork restart/reinitialization.
-
-## Cross-Cutting Implementation Priorities
-
-1. Fix fd table atomicity and host fd lifetime first. Many safety, correctness, and performance findings depend on the fd model.
-2. Split signal pump wake channels and formalize Darwin fork discipline. These are the riskiest macOS-specific correctness gaps.
-3. Bring blocking eventfd/timerfd behavior closer to Linux. These are guest-visible semantics and likely to affect real runtimes.
-4. Add typed Linux ABI parsing and flag handling. This will reduce repeated manual validation and make future syscall work safer.
-5. Add Darwin filesystem fast paths only after fd ownership is clearer. `clonefile`, `copyfile`, `fsync`, `F_FULLFSYNC`, and `msync` are useful, but they should sit on a clean host-file abstraction.
-6. Consolidate virtual filesystem and stat/statx generation. This pays down complexity without changing core runtime behavior.
-7. Repair hygiene gates. `cargo fmt --all -- --check` and the documented clippy gate should be trustworthy before larger refactors land.
-
-## Suggested Work Packages
-
-### Package 1. Fd Table and Host Fd Ownership
-
-Goals:
-
-- Atomic fd installation and pair reservation.
-- RAII host fd ownership.
-- Pinned wait handles.
-- Tests for dup/close/wait races.
-
-Files likely touched:
-
-- `src/dispatch/mod.rs`
-- `src/dispatch/fs.rs`
-- `src/dispatch/net.rs`
-- `src/io_wait.rs`
-- `tests/concurrency_contracts.rs`
-- `tests/syscall_net.rs`
-- `tests/syscall_fs.rs`
-
-### Package 2. Signal Pump and Fork Discipline
-
-Goals:
-
-- Dedicated pump wake pipe or generation-based wake protocol.
-- Explicit fork coordinator for Darwin host state.
-- Tests for fork under active signal pump and blocked waiters.
-
-Files likely touched:
-
-- `src/host_signal.rs`
-- `src/vcpu_kick.rs`
-- `src/io_wait.rs`
-- `src/runtime.rs`
-- `src/trap.rs`
-- `tests/syscall_thread.rs`
-- `tests/concurrency_contracts.rs`
-
-### Package 3. Linux Blocking Object Semantics
-
-Goals:
-
-- Blocking eventfd reads.
-- Timerfd waits that do not hold fd write locks.
-- Clear wake behavior for eventfd/timerfd with `ppoll` and `pselect6`.
-
-Files likely touched:
-
-- `src/dispatch/mod.rs`
-- `src/dispatch/fs.rs`
-- `src/dispatch/net.rs`
-- `tests/syscall_net.rs`
-
-### Package 4. ABI and Flag Types
-
-Goals:
-
-- Direct `bitflags` dependency for Linux flag families.
-- Read-side `KernelAbi` helpers.
-- `zerocopy` structs for common guest ABI reads.
-- Property tests for parsing and flag rejection.
-
-Files likely touched:
-
-- `Cargo.toml`
-- `src/linux_abi.rs`
-- `src/dispatch/mod.rs`
-- `src/dispatch/fs.rs`
-- `src/dispatch/net.rs`
-- `src/dispatch/proc.rs`
-- `tests/syscall_*`
-
-### Package 5. Darwin Filesystem Leverage
-
-Goals:
-
-- Real `fsync`/`syncfs` behavior for host-backed files.
-- Optional strict `F_FULLFSYNC`.
-- `msync` for shared mappings where appropriate.
-- APFS clone/copyfile fast path for host-backed file copies and rootfs seeding.
-
-Files likely touched:
-
-- `src/fs_backend.rs`
-- `src/rootfs.rs`
-- `src/dispatch/fs.rs`
-- `src/trap.rs`
-- Darwin-specific helper module, if added.
-
-### Package 6. VFS and Stat Ownership
-
-Goals:
-
-- Move synthetic proc/sys ownership into VFS modules.
-- Add `StatRecord` or equivalent.
-- Align stat/fstat/statx behavior across fd kinds.
-
-Files likely touched:
-
-- `src/vfs/proc.rs`
-- `src/vfs/sys.rs`
-- `src/vfs/mod.rs`
-- `src/dispatch/mod.rs`
-- `src/dispatch/fs.rs`
-- `tests/syscall_fs.rs`
-
-## Research Assumptions and Corrections
-
-- `FUTEX_(CMP_)REQUEUE` was corrected during consolidation. The current checkout returns `ENOSYS` with a compatibility event, so the gap is compatibility coverage, not a silent misimplementation.
-- `FIONBIO` remains a success-without-effect path in the current checkout.
-- The APFS clonefile finding is partly a documentation/implementation mismatch: comments promise reflink seeding, while the current seeding path writes contents through `std::fs::write`.
-- The Rust ecosystem recommendation is not "add crates everywhere." For Carrick, crates are most valuable where they encode ownership, parsing, and validation. Linux ABI semantics and Darwin behavior should remain explicit in Carrick.
-- The Darwin recommendation is not "avoid libc." For several Darwin APIs, `libc` may be the only practical binding. The gap is missing Carrick-level abstractions that preserve Darwin semantics and make unsafe/raw calls auditable.
-
-## Review Bottom Line
-
-Carrick should not self-limit to the portable subset exposed by the Rust `libc` crate, but the answer is not a broad dependency sweep. The right move is to create a small number of explicit host/Darwin and Linux-ABI boundary modules, then use Rust ecosystem crates selectively inside those boundaries:
-
-- `bitflags` for Linux flag correctness.
-- `zerocopy` for guest ABI reads and writes.
-- `OwnedFd`/`BorrowedFd`, plus possibly `socket2`, for host fd/socket ownership.
-- `rustix` where it reduces unsafe fd/mmap boilerplate without hiding semantics.
-- `proptest` for ABI/path/flag fuzzing.
-- `loom` only after the fd table or wake primitive is isolated enough to model without real kqueue/HVF.
-
-The highest-confidence first investment is fd ownership and atomic fd installation. It will reduce correctness risk immediately and make the Darwin-specific improvements easier to land safely.
+> [!IMPORTANT]
+> The refactoring has delivered **significant, measurable quality improvements**. The `KernelAbi` trait, `bitflags!` types, RAII extraction modules, and signal pump redesign represent strong engineering work. The 6 new modules are uniformly excellent — small, focused, tested, and well-documented. The project is trending in the right direction.
+>
+> The remaining priority items are (1) the xattr namespace leak (small fix, high impact), (2) the `resolve_beneath` sandbox TOCTOU (security-critical), and (3) the `ptr::write(self)` panic-safety window in fork/execve. These 3 items represent the primary remaining safety surface.
