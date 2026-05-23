@@ -677,6 +677,7 @@ use std::sync::Arc;
 struct KernelState {
     dispatcher: SyscallDispatcher,
     reporter: CompatReporter,
+    fork: crate::fork_coord::ForkCoordinator,
 }
 
 impl KernelState {
@@ -684,6 +685,7 @@ impl KernelState {
         Self {
             dispatcher,
             reporter: CompatReporter::default(),
+            fork: crate::fork_coord::ForkCoordinator::new(),
         }
     }
 }
@@ -733,7 +735,7 @@ fn run_threaded_hvf_loop(
     // (host SIGINT etc.), so a thread spinning in guest userspace delivers it
     // promptly rather than only at its next syscall — and wakes futex-parked
     // threads so they too deliver promptly (no 50ms poll latency).
-    crate::vcpu_kick::spawn_signal_pump(Arc::clone(&kicker), Arc::clone(&futex));
+    kernel.fork.start_signal_pump(&kicker, &futex);
 
     let outcome = run_vcpu_until_exit(
         Arc::clone(&kernel),
@@ -1103,9 +1105,25 @@ fn run_vcpu_until_exit(
                 if registry.live_count() > 1 {
                     engine.complete_syscall(-(crate::linux_abi::LINUX_ENOSYS as i64))?;
                 } else {
-                    let fork_outcome = engine.fork()?;
+                    // The signal pump is an extra Carrick host thread even
+                    // when the guest has only one vCPU. Join it before the
+                    // real macOS fork, then restart fresh pump state on both
+                    // sides after HVF rebuild.
+                    let prepared_fork = kernel.fork.prepare_host_fork();
+                    let fork_outcome = match engine.fork() {
+                        Ok(outcome) => outcome,
+                        Err(error) => {
+                            kernel
+                                .fork
+                                .restart_after_fork_error(prepared_fork, &kicker, &futex);
+                            return Err(RuntimeError::Trap(error));
+                        }
+                    };
                     let retval: i64 = match fork_outcome {
                         crate::trap::ForkOutcome::Parent { child_pid } => {
+                            kernel
+                                .fork
+                                .restart_after_parent_fork(prepared_fork, &kicker, &futex);
                             waiter = crate::io_wait::ThreadWaiter::new(this_tid);
                             i64::from(child_pid)
                         }
@@ -1142,10 +1160,9 @@ fn run_vcpu_until_exit(
                             // in guest userspace. Re-spawn it on the child's fresh
                             // self-pipe. (LTP setitimer01's child busy-waits for
                             // its ITIMER signal.)
-                            crate::vcpu_kick::spawn_signal_pump(
-                                Arc::clone(&kicker),
-                                Arc::clone(&futex),
-                            );
+                            kernel
+                                .fork
+                                .restart_after_child_fork(prepared_fork, &kicker, &futex);
                             0
                         }
                     };

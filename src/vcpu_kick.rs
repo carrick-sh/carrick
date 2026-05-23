@@ -144,6 +144,41 @@ fn kick_ids(ids: &[u64]) {
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 fn kick_ids(_ids: &[u64]) {}
 
+/// Handle for the process-directed signal pump thread. Dropping or stopping it
+/// asks the pump to exit and joins the host thread, which gives the runtime a
+/// fork point with no pump thread alive.
+pub struct SignalPump {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SignalPump {
+    pub fn stop(mut self) {
+        self.stop_inner();
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn stop_inner(&mut self) {
+        self.running
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        crate::host_signal::wake_signal_pump_pipe();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    fn stop_inner(&mut self) {}
+}
+
+impl Drop for SignalPump {
+    fn drop(&mut self) {
+        self.stop_inner();
+    }
+}
+
 /// Spawn a daemon thread that, whenever a signal is published, forces every
 /// registered vCPU out of `hv_vcpu_run`. This delivers a *process-directed*
 /// signal (host SIGINT, a cross-process kill) promptly to threads spinning in
@@ -156,12 +191,17 @@ fn kick_ids(_ids: &[u64]) {}
 pub fn spawn_signal_pump(
     kicker: std::sync::Arc<VcpuKicker>,
     futex: std::sync::Arc<crate::thread::FutexTable>,
-) {
+) -> SignalPump {
     let pipe = crate::host_signal::pump_pipe_read_fd();
     if pipe < 0 {
-        return;
+        return SignalPump {
+            running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            handle: None,
+        };
     }
-    let _ = std::thread::Builder::new()
+    let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let thread_running = std::sync::Arc::clone(&running);
+    let handle = std::thread::Builder::new()
         .name("carrick-signal-pump".to_owned())
         .spawn(move || {
             let raw_kq = unsafe { libc::kqueue() };
@@ -221,7 +261,7 @@ pub fn spawn_signal_pump(
                 data: 0,
                 udata: std::ptr::null_mut(),
             }];
-            loop {
+            while thread_running.load(std::sync::atomic::Ordering::SeqCst) {
                 let n = unsafe {
                     libc::kevent(
                         kq,
@@ -244,6 +284,9 @@ pub fn spawn_signal_pump(
                         crate::host_signal::drain_pump_pipe();
                     }
                 }
+                if !thread_running.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
                 let pending_threads = crate::host_signal::pending_thread_tids();
                 if crate::host_signal::has_process_pending() {
                     // A process-directed signal can be delivered by any guest
@@ -259,15 +302,19 @@ pub fn spawn_signal_pump(
                     futex.notify_signal_pending_for(tid);
                 }
             }
+            crate::host_signal::clear_pump_kqueue(kq);
             unsafe { libc::close(kq) };
-        });
+        })
+        .ok();
+    SignalPump { running, handle }
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 pub fn spawn_signal_pump(
     _kicker: std::sync::Arc<VcpuKicker>,
     _futex: std::sync::Arc<crate::thread::FutexTable>,
-) {
+) -> SignalPump {
+    SignalPump {}
 }
 
 #[cfg(test)]
@@ -286,5 +333,15 @@ mod tests {
         // kick_all on an empty registry does nothing.
         kicker.kick_all();
         kicker.kick_all_except(1);
+    }
+
+    #[test]
+    fn signal_pump_handle_stops_without_live_vcpus() {
+        crate::host_signal::install_default_handlers();
+        let pump = spawn_signal_pump(
+            std::sync::Arc::new(VcpuKicker::new()),
+            std::sync::Arc::new(crate::thread::FutexTable::new()),
+        );
+        pump.stop();
     }
 }
