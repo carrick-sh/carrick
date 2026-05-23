@@ -3,10 +3,8 @@
 //! Today carrick reaches into four separate code paths for filesystem
 //! syscalls:
 //!
-//! 1. **`/proc/*`** — hardcoded `match` arms in
-//!    `synthetic_proc_file()` (`dispatch.rs:8321`).
-//! 2. **`/sys/*`** — hardcoded `match` arms in
-//!    `synthetic_sys_file()`.
+//! 1. **`/proc/*`** — synthetic files owned by [`proc::ProcVfs`].
+//! 2. **`/sys/*`** — synthetic files owned by [`sys::SysVfs`].
 //! 3. **`/dev/*`** — `host_dev_passthrough()` returns a macOS path
 //!    that the dispatcher opens via raw `libc::open` and wraps as a
 //!    `HostPipe`.
@@ -44,9 +42,13 @@ pub mod sys;
 pub use dev::DevVfs;
 pub use devpts::{DevptsVfs, PtyRole, PtyTable};
 pub use mount::VfsMounts;
-pub use proc::ProcVfs;
+pub use proc::{ProcMapsEntry, ProcVfs, SyntheticProcContext};
 pub use rootfs::RootFsVfs;
 pub use sys::SysVfs;
+
+pub(crate) fn is_synthetic_virtual_file(path: &str, ctx: &SyntheticProcContext) -> bool {
+    proc::synthetic_file(path, ctx).is_some() || sys::synthetic_file(path).is_some()
+}
 
 use std::path::PathBuf;
 
@@ -168,7 +170,7 @@ pub enum VfsHandle {
 #[derive(Default)]
 pub struct OpenContext<'a> {
     pub executable_path: Option<&'a str>,
-    pub address_space_regions: Option<&'a [crate::dispatch::ProcMapsEntry]>,
+    pub address_space_regions: Option<&'a [ProcMapsEntry]>,
     pub brk_current: u64,
     pub mmap_next: u64,
 }
