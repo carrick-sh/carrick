@@ -290,6 +290,7 @@ dependencies = [
  "applevisor-sys",
  "assert_cmd",
  "base64 0.22.1",
+ "bitflags",
  "bollard",
  "camino",
  "cap-std",

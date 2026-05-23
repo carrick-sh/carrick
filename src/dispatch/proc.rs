@@ -357,7 +357,8 @@ impl SyscallDispatcher {
             other => other,
         };
         let flags = operation & !LINUX_FUTEX_CMD_MASK;
-        if flags & !(LINUX_FUTEX_PRIVATE_FLAG | LINUX_FUTEX_CLOCK_REALTIME) != 0 {
+        let futex_flags = LinuxFutexFlags::from_bits_retain(flags);
+        if flags & !LinuxFutexFlags::SUPPORTED_MASK != 0 {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
             });
@@ -405,7 +406,7 @@ impl SyscallDispatcher {
         // FutexTable. We support private futexes; shared-flag futexes use the
         // same table here (the address space is shared within the process,
         // so the keying is identical) — note it via a partial-syscall probe.
-        if flags & LINUX_FUTEX_PRIVATE_FLAG == 0 {
+        if !futex_flags.contains(LinuxFutexFlags::PRIVATE) {
             ctx.reporter
                 .record(crate::compat::CompatEvent::partial_syscall(
                     98,
@@ -727,32 +728,25 @@ impl SyscallDispatcher {
         &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        const CLONE_VM: u64 = 0x00000100;
-        const CLONE_FS: u64 = 0x00000200;
-        const CLONE_FILES: u64 = 0x00000400;
-        const CLONE_SIGHAND: u64 = 0x00000800;
-        const CLONE_THREAD: u64 = 0x00010000;
-        const CLONE_SETTLS: u64 = 0x00080000;
-        const CLONE_PARENT_SETTID: u64 = 0x00100000;
-        const CLONE_CHILD_SETTID: u64 = 0x01000000;
-        const CLONE_CHILD_CLEARTID: u64 = 0x00200000;
-
         let flags = ctx.arg(0);
-        let thread_mask = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
+        let thread_mask = LinuxCloneFlags::THREAD_MASK;
         if (flags & thread_mask) == thread_mask {
             // aarch64 ABI: clone(flags, stack, parent_tid, tls, child_tid)
             let stack = ctx.arg(1);
-            let parent_tid_addr = if flags & CLONE_PARENT_SETTID != 0 {
+            let parent_tid_addr = if flags & LinuxCloneFlags::PARENT_SETTID.bits() != 0 {
                 ctx.arg(2)
             } else {
                 0
             };
-            let tls = if flags & CLONE_SETTLS != 0 {
+            let tls = if flags & LinuxCloneFlags::SETTLS.bits() != 0 {
                 ctx.arg(3)
             } else {
                 0
             };
-            let child_tid_addr = if flags & (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID) != 0 {
+            let child_tid_addr = if flags
+                & (LinuxCloneFlags::CHILD_SETTID | LinuxCloneFlags::CHILD_CLEARTID).bits()
+                != 0
+            {
                 ctx.arg(4)
             } else {
                 0
@@ -783,16 +777,6 @@ impl SyscallDispatcher {
     /// Thread-create flags now emit `DispatchOutcome::CloneThread`.
     /// Fork-like flags still return `DispatchOutcome::Fork`.
     fn clone3(&self, request: SyscallRequest, memory: &impl GuestMemory) -> DispatchOutcome {
-        const CLONE_VM: u64 = 0x00000100;
-        const CLONE_FS: u64 = 0x00000200;
-        const CLONE_FILES: u64 = 0x00000400;
-        const CLONE_SIGHAND: u64 = 0x00000800;
-        const CLONE_THREAD: u64 = 0x00010000;
-        const CLONE_SETTLS: u64 = 0x00080000;
-        const CLONE_PARENT_SETTID: u64 = 0x00100000;
-        const CLONE_CHILD_SETTID: u64 = 0x01000000;
-        const CLONE_CHILD_CLEARTID: u64 = 0x00200000;
-
         let args_ptr = request.arg(0);
         let args_size = request.arg(1);
         // clone_args is at least flags(8)+pidfd(8)+child_tid(8)+parent_tid(8)
@@ -806,9 +790,9 @@ impl SyscallDispatcher {
         // Read up to the full struct (64 bytes through tls@56). glibc always
         // passes the complete struct; if the caller passes a truncated struct
         // with thread flags set we fall back to ENOSYS with a note below.
-        let read_len = args_size.min(64) as usize;
-        let bytes = match memory.read_bytes(args_ptr, read_len) {
-            Ok(b) => b,
+        let read_len = args_size.min(<LinuxCloneArgs as KernelAbi>::ABI_SIZE as u64) as usize;
+        let args = match read_kernel_prefix::<LinuxCloneArgs>(memory, args_ptr, read_len) {
+            Ok(args) => args,
             Err(_) => {
                 return DispatchOutcome::Errno {
                     errno: LINUX_EFAULT,
@@ -816,11 +800,8 @@ impl SyscallDispatcher {
             }
         };
 
-        // INVARIANT: read_len >= 8 (guarded above) so slice [0..8] is valid.
-        #[allow(clippy::unwrap_used)]
-        let flags = u64::from_le_bytes(bytes[..8].try_into().unwrap());
-
-        let thread_mask = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
+        let flags = args.flags;
+        let thread_mask = LinuxCloneFlags::THREAD_MASK;
         if (flags & thread_mask) == thread_mask {
             // glibc always passes the full struct (64 bytes); if for some reason
             // the caller passes a short struct with thread flags, return ENOSYS
@@ -831,29 +812,28 @@ impl SyscallDispatcher {
                 };
             }
 
-            // All fields are little-endian u64; offsets from the layout above.
-            #[allow(clippy::unwrap_used)]
-            let read_u64_at =
-                |off: usize| -> u64 { u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap()) };
-            let child_tid_ptr = read_u64_at(16); // child_tid@16
-            let parent_tid_ptr = read_u64_at(24); // parent_tid@24
-            let stack = read_u64_at(40); // stack@40
-            let stack_size = read_u64_at(48); // stack_size@48
-            let tls_val = read_u64_at(56); // tls@56
+            let child_tid_ptr = args.child_tid;
+            let parent_tid_ptr = args.parent_tid;
+            let stack = args.stack;
+            let stack_size = args.stack_size;
+            let tls_val = args.tls;
 
             // child SP = stack base + stack_size (stack grows down on aarch64)
             let child_sp = stack + stack_size;
-            let tls = if flags & CLONE_SETTLS != 0 {
+            let tls = if flags & LinuxCloneFlags::SETTLS.bits() != 0 {
                 tls_val
             } else {
                 0
             };
-            let parent_tid_addr = if flags & CLONE_PARENT_SETTID != 0 {
+            let parent_tid_addr = if flags & LinuxCloneFlags::PARENT_SETTID.bits() != 0 {
                 parent_tid_ptr
             } else {
                 0
             };
-            let child_tid_addr = if flags & (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID) != 0 {
+            let child_tid_addr = if flags
+                & (LinuxCloneFlags::CHILD_SETTID | LinuxCloneFlags::CHILD_CLEARTID).bits()
+                != 0
+            {
                 child_tid_ptr
             } else {
                 0

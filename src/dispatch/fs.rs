@@ -837,8 +837,9 @@ impl SyscallDispatcher {
                 DispatchOutcome::Errno { errno: LINUX_EBADF }
             }
             LINUX_F_SETFD => {
+                let fd_flags = LinuxFdFlags::from_bits_truncate(arg);
                 if let Some(open_file) = self.io.open_files.write().get_mut(&fd) {
-                    open_file.fd_flags = arg & LINUX_FD_CLOEXEC;
+                    open_file.fd_flags = fd_flags.bits();
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 }
                 // apt's http method fcntl(fd, F_SETFD, FD_CLOEXEC)s its
@@ -850,7 +851,8 @@ impl SyscallDispatcher {
                 // remember the bit so a subsequent F_GETFD reflects it,
                 // matching real Linux.
                 if is_stdio_fd(fd) {
-                    self.io.stdio_cloexec.lock()[fd as usize] = arg & LINUX_FD_CLOEXEC != 0;
+                    self.io.stdio_cloexec.lock()[fd as usize] =
+                        fd_flags.contains(LinuxFdFlags::CLOEXEC);
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 }
                 DispatchOutcome::Errno { errno: LINUX_EBADF }

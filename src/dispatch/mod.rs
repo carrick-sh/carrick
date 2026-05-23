@@ -111,10 +111,8 @@ use crate::linux_abi::{
     LINUX_FD_CLOEXEC,
     LINUX_FIONBIO,
     LINUX_FIONREAD,
-    LINUX_FUTEX_CLOCK_REALTIME,
     LINUX_FUTEX_CMD_MASK,
     LINUX_FUTEX_CMP_REQUEUE,
-    LINUX_FUTEX_PRIVATE_FLAG,
     LINUX_FUTEX_REQUEUE,
     LINUX_FUTEX_WAIT,
     LINUX_FUTEX_WAKE,
@@ -243,9 +241,7 @@ use crate::linux_abi::{
     LINUX_SO_SNDBUF,
     LINUX_SO_SNDTIMEO,
     LINUX_SO_TYPE,
-    LINUX_SOCK_CLOEXEC,
     LINUX_SOCK_DGRAM,
-    LINUX_SOCK_NONBLOCK,
     LINUX_SOCK_RAW,
     LINUX_SOCK_SEQPACKET,
     LINUX_SOCK_STREAM,
@@ -290,18 +286,27 @@ use crate::linux_abi::{
     LINUX_WAITID_STATE_MASK,
     LINUX_WAITID_SUPPORTED_FLAGS,
     LINUX_X_OK,
+    LinuxAtFlags,
     LinuxCapabilityData,
     LinuxCapabilityHeader,
+    LinuxCloneArgs,
+    LinuxCloneFlags,
     LinuxDirent64Header,
     LinuxEpollEvent,
     LinuxEventfdValue,
+    LinuxFdFlags,
     LinuxFdPair,
+    LinuxFutexFlags,
     LinuxIfAddrMsg,
     LinuxIfInfoMsg,
     LinuxIovec,
     LinuxItimerspec,
     LinuxItimerval,
+    LinuxMmapFlags,
+    LinuxMmsghdr,
+    LinuxMsghdr,
     LinuxNlMsgHdr,
+    LinuxOpenFlags,
     LinuxOpenHow,
     LinuxPollFd,
     LinuxRlimit,
@@ -309,6 +314,7 @@ use crate::linux_abi::{
     LinuxRusage,
     LinuxSigaction,
     LinuxSigaltstack,
+    LinuxSocketTypeFlags,
     LinuxStat,
     LinuxStatfs,
     LinuxStatx,
@@ -2087,30 +2093,7 @@ const SYSCALL_FLAG_VALIDATORS: &[(u64, u32, u64)] = &[
     // openat(dirfd, pathname, flags, mode): the open flags we recognise
     // — a superset that covers RDONLY/WRONLY/RDWR + the standard mods.
     // Bits are kept liberal because openat is the most-touched syscall.
-    (
-        56,
-        2,
-        // access mode bits 0..1 = O_RDONLY/O_WRONLY/O_RDWR
-        0o3
-        // common bit flags
-        | 0o100      // O_CREAT
-        | 0o200      // O_EXCL
-        | 0o400      // O_NOCTTY
-        | 0o1000     // O_TRUNC
-        | 0o2000     // O_APPEND
-        | LINUX_O_NONBLOCK
-        | 0o10000    // O_DSYNC
-        | 0o20000    // FASYNC
-        | 0o40000    // O_DIRECT
-        | 0o100000   // O_LARGEFILE
-        | 0o200000   // O_DIRECTORY
-        | 0o400000   // O_NOFOLLOW
-        | 0o1000000  // O_NOATIME
-        | LINUX_O_CLOEXEC
-        | 0o4010000  // O_SYNC
-        | 0o010000000 // O_PATH
-        | 0o020000000, // O_TMPFILE
-    ),
+    (56, 2, LinuxOpenFlags::SUPPORTED_MASK),
     // pipe2(pipefd, flags): O_CLOEXEC | O_NONBLOCK
     (59, 1, LINUX_O_CLOEXEC | LINUX_O_NONBLOCK),
     // signalfd4(fd, mask, sizemask, flags): SFD_NONBLOCK | SFD_CLOEXEC
@@ -2121,17 +2104,16 @@ const SYSCALL_FLAG_VALIDATORS: &[(u64, u32, u64)] = &[
     (86, 1, 0x1 | 0x2),
     // utimensat(dirfd, pathname, times, flags): AT_SYMLINK_NOFOLLOW (0x100)
     (88, 3, LINUX_AT_SYMLINK_NOFOLLOW),
+    // socket/socketpair type: low bits are a socket-kind enum, high bits are SOCK_* flags.
+    (198, 1, LINUX_SOCKET_TYPE_SUPPORTED_MASK),
+    (199, 1, LINUX_SOCKET_TYPE_SUPPORTED_MASK),
     // accept4(sockfd, addr, addrlen, flags): SOCK_NONBLOCK | SOCK_CLOEXEC
-    (242, 3, LINUX_O_NONBLOCK | LINUX_O_CLOEXEC),
+    (242, 3, LinuxSocketTypeFlags::SUPPORTED_MASK as u64),
     // close_range(first, last, flags): CLOSE_RANGE_UNSHARE(2) | CLOEXEC(4)
     (436, 2, 0x2 | 0x4),
     // openat2 — checked inside open_how, but the syscall flag arg is unused
     // statx(dirfd, pathname, flags, mask, statxbuf): AT_* flags
-    (
-        291,
-        2,
-        LINUX_AT_EMPTY_PATH | LINUX_AT_SYMLINK_NOFOLLOW | 0x1000 /* AT_NO_AUTOMOUNT */ | 0x800 /* AT_STATX_SYNC_AS_STAT */ | 0x4000 /* AT_STATX_FORCE_SYNC */ | 0x6000,
-    ),
+    (291, 2, LinuxAtFlags::STATX_SUPPORTED_MASK),
     // faccessat2(dirfd, pathname, mode, flags)
     (
         439,
@@ -2139,6 +2121,12 @@ const SYSCALL_FLAG_VALIDATORS: &[(u64, u32, u64)] = &[
         LINUX_AT_EMPTY_PATH | LINUX_AT_SYMLINK_NOFOLLOW | 0x200, /* AT_EACCESS */
     ),
 ];
+
+const LINUX_SOCKET_TYPE_SUPPORTED_MASK: u64 = LinuxSocketTypeFlags::SUPPORTED_MASK as u64
+    | LINUX_SOCK_STREAM as u64
+    | LINUX_SOCK_DGRAM as u64
+    | LINUX_SOCK_RAW as u64
+    | LINUX_SOCK_SEQPACKET as u64;
 
 /// Systematic unknown-flag detector for syscalls.
 ///
@@ -2304,7 +2292,8 @@ fn dispatch_threaded_futex(
         other => other,
     };
     let flags = operation & !LINUX_FUTEX_CMD_MASK;
-    if flags & !(LINUX_FUTEX_PRIVATE_FLAG | LINUX_FUTEX_CLOCK_REALTIME) != 0 {
+    let futex_flags = LinuxFutexFlags::from_bits_retain(flags);
+    if flags & !LinuxFutexFlags::SUPPORTED_MASK != 0 {
         return DispatchOutcome::Errno {
             errno: LINUX_EINVAL,
         };
@@ -2315,7 +2304,7 @@ fn dispatch_threaded_futex(
         Err(errno) => return DispatchOutcome::Errno { errno },
     };
 
-    if flags & LINUX_FUTEX_PRIVATE_FLAG == 0 {
+    if !futex_flags.contains(LinuxFutexFlags::PRIVATE) {
         reporter.record(crate::compat::CompatEvent::partial_syscall(
             98,
             "futex",
@@ -2373,7 +2362,7 @@ fn dispatch_threaded_futex(
                     Some(relative_from_absolute_timespec(
                         timespec.tv_sec,
                         timespec.tv_nsec,
-                        flags & LINUX_FUTEX_CLOCK_REALTIME != 0,
+                        futex_flags.contains(LinuxFutexFlags::CLOCK_REALTIME),
                     ))
                 } else {
                     match duration_from_linux_timespec(timespec) {
@@ -2470,6 +2459,34 @@ fn write_kernel_struct_raw<T: KernelAbi>(
     memory.write_bytes(address, value.abi_bytes())
 }
 
+/// Type-safe read for Linux UAPI structs that implement [`KernelAbi`].
+/// Reads exactly the Linux wire size, then zero-fills any Rust-only tail
+/// bytes before returning the typed value.
+fn read_kernel_struct<T>(memory: &impl GuestMemory, address: u64) -> Result<T, i32>
+where
+    T: KernelAbi + FromBytes,
+{
+    read_kernel_prefix(memory, address, T::ABI_SIZE)
+}
+
+/// Lower-level ABI read for variable-length structs such as clone_args.
+/// `length` is the guest-provided prefix length and must fit inside the
+/// Linux ABI size carried by the type.
+fn read_kernel_prefix<T>(memory: &impl GuestMemory, address: u64, length: usize) -> Result<T, i32>
+where
+    T: KernelAbi + FromBytes,
+{
+    if address == 0 || length > T::ABI_SIZE {
+        return Err(LINUX_EFAULT);
+    }
+    let bytes = memory
+        .read_bytes(address, length)
+        .map_err(|_| LINUX_EFAULT)?;
+    let mut value = <T as zerocopy::FromZeros>::new_zeroed();
+    value.as_mut_bytes()[..length].copy_from_slice(&bytes);
+    Ok(value)
+}
+
 fn write_statfs(memory: &mut impl GuestMemory, statfsbuf: u64) -> DispatchOutcome {
     let blocks = 1_048_576;
     let statfs = LinuxStatfs {
@@ -2490,8 +2507,9 @@ fn write_statfs(memory: &mut impl GuestMemory, statfsbuf: u64) -> DispatchOutcom
 }
 
 fn linux_fd_flags_from_open_flags(flags: u64) -> u64 {
-    if flags & LINUX_O_CLOEXEC != 0 {
-        LINUX_FD_CLOEXEC
+    let open_flags = LinuxOpenFlags::from_bits_retain(flags);
+    if open_flags.contains(LinuxOpenFlags::CLOEXEC) {
+        LinuxFdFlags::CLOEXEC.bits()
     } else {
         0
     }
@@ -4086,31 +4104,19 @@ pub(super) fn read_u32(memory: &impl GuestMemory, address: u64) -> Result<u32, i
 }
 
 fn read_itimerspec(memory: &impl GuestMemory, address: u64) -> Result<LinuxItimerspec, i32> {
-    let bytes = memory
-        .read_bytes(address, core::mem::size_of::<LinuxItimerspec>())
-        .map_err(|_| LINUX_EFAULT)?;
-    LinuxItimerspec::read_from_bytes(&bytes).map_err(|_| LINUX_EFAULT)
+    read_kernel_struct(memory, address)
 }
 
 fn read_itimerval(memory: &impl GuestMemory, address: u64) -> Result<LinuxItimerval, i32> {
-    let bytes = memory
-        .read_bytes(address, core::mem::size_of::<LinuxItimerval>())
-        .map_err(|_| LINUX_EFAULT)?;
-    LinuxItimerval::read_from_bytes(&bytes).map_err(|_| LINUX_EFAULT)
+    read_kernel_struct(memory, address)
 }
 
 fn read_timespec(memory: &impl GuestMemory, address: u64) -> Result<LinuxTimespec, i32> {
-    let bytes = memory
-        .read_bytes(address, core::mem::size_of::<LinuxTimespec>())
-        .map_err(|_| LINUX_EFAULT)?;
-    LinuxTimespec::read_from_bytes(&bytes).map_err(|_| LINUX_EFAULT)
+    read_kernel_struct(memory, address)
 }
 
 fn read_open_how(memory: &impl GuestMemory, address: u64) -> Result<LinuxOpenHow, i32> {
-    let bytes = memory
-        .read_bytes(address, core::mem::size_of::<LinuxOpenHow>())
-        .map_err(|_| LINUX_EFAULT)?;
-    LinuxOpenHow::read_from_bytes(&bytes).map_err(|_| LINUX_EFAULT)
+    read_kernel_struct(memory, address)
 }
 
 fn read_iovecs(
@@ -4130,10 +4136,7 @@ fn read_iovecs(
             .and_then(|offset| u64::try_from(offset).ok())
             .ok_or(LINUX_EINVAL)?;
         let iovec_address = address.checked_add(offset).ok_or(LINUX_EFAULT)?;
-        let bytes = memory
-            .read_bytes(iovec_address, size)
-            .map_err(|_| LINUX_EFAULT)?;
-        iovecs.push(LinuxIovec::read_from_bytes(&bytes).map_err(|_| LINUX_EFAULT)?);
+        iovecs.push(read_kernel_struct(memory, iovec_address)?);
     }
     Ok(iovecs)
 }
@@ -4895,6 +4898,51 @@ mod overlay_dispatch_tests {
             DispatchOutcome::Errno { errno } => errno,
             other => panic!("expected Errno, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn read_kernel_struct_accepts_unaligned_abi_reads_and_rejects_bad_pointers() {
+        let mut memory = LinearMemory::new(MEM_BASE, vec![0u8; MEM_LEN]);
+        let address = MEM_BASE + 3;
+        let expected = LinuxTimespec::new(12, 34);
+        memory.write_bytes(address, expected.abi_bytes()).unwrap();
+
+        let actual: LinuxTimespec = read_kernel_struct(&memory, address).unwrap();
+        let tv_sec = actual.tv_sec;
+        let tv_nsec = actual.tv_nsec;
+        assert_eq!((tv_sec, tv_nsec), (12, 34));
+
+        assert_eq!(
+            read_kernel_struct::<LinuxTimespec>(&memory, 0),
+            Err(LINUX_EFAULT)
+        );
+        assert_eq!(
+            read_kernel_struct::<LinuxTimespec>(&memory, MEM_BASE + MEM_LEN as u64 - 1),
+            Err(LINUX_EFAULT)
+        );
+    }
+
+    #[test]
+    fn read_kernel_prefix_zero_fills_truncated_clone_args_and_rejects_overlarge_reads() {
+        let mut memory = LinearMemory::new(MEM_BASE, vec![0u8; MEM_LEN]);
+        let address = MEM_BASE + 5;
+        let flags = LinuxCloneFlags::THREAD_MASK | LinuxCloneFlags::SETTLS.bits();
+        memory.write_bytes(address, &flags.to_ne_bytes()).unwrap();
+
+        let args: LinuxCloneArgs = read_kernel_prefix(&memory, address, 8).unwrap();
+        let actual_flags = args.flags;
+        let tls = args.tls;
+        assert_eq!(actual_flags, flags);
+        assert_eq!(tls, 0);
+
+        assert_eq!(
+            read_kernel_prefix::<LinuxCloneArgs>(
+                &memory,
+                address,
+                <LinuxCloneArgs as KernelAbi>::ABI_SIZE + 1,
+            ),
+            Err(LINUX_EFAULT)
+        );
     }
 
     const AT_FDCWD: u64 = (-100i64) as u64;
