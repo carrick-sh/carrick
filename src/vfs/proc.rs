@@ -55,7 +55,7 @@ pub(crate) fn synthetic_file(path: &str, ctx: &SyntheticProcContext) -> Option<V
         "/proc/self/limits" => Some(synthetic_proc_self_limits().to_vec()),
         "/proc/self/maps" => Some(synthetic_proc_maps(ctx).into_bytes()),
         "/proc/self/stat" => Some(synthetic_proc_self_stat(&ctx.executable_path).into_bytes()),
-        "/proc/self/statm" => Some(synthetic_proc_self_statm().to_vec()),
+        "/proc/self/statm" => Some(synthetic_proc_self_statm()),
         "/proc/self/status" => Some(synthetic_proc_self_status(&ctx.executable_path).into_bytes()),
         "/proc/sys/kernel/osrelease" => Some(synthetic_proc_osrelease().to_vec()),
         "/proc/sys/kernel/hostname" => Some(synthetic_proc_hostname().to_vec()),
@@ -412,6 +412,11 @@ fn synthetic_proc_self_status(executable_path: &str) -> String {
     let ncpu = crate::host_facts::logical_cpu_count();
     let cpus_hex = cpus_allowed_hex(ncpu);
     let cpus_list = cpus_allowed_list(ncpu);
+    let host = crate::host_proc::self_resource_usage().unwrap_or_default();
+    let vsize_kb = host.virtual_bytes / 1024;
+    let rss_kb = host.resident_bytes / 1024;
+    let peak_kb = (host.virtual_bytes.max(host.maxrss_bytes)) / 1024;
+    let hwm_kb = host.maxrss_bytes / 1024;
     format!(
         "Name:\t{comm}\n\
 Umask:\t0022\n\
@@ -425,12 +430,12 @@ Uid:\t0\t0\t0\t0\n\
 Gid:\t0\t0\t0\t0\n\
 FDSize:\t256\n\
 Groups:\t\n\
-VmPeak:\t       0 kB\n\
-VmSize:\t       0 kB\n\
+VmPeak:\t{peak_kb:>8} kB\n\
+VmSize:\t{vsize_kb:>8} kB\n\
 VmLck:\t       0 kB\n\
 VmPin:\t       0 kB\n\
-VmHWM:\t       0 kB\n\
-VmRSS:\t       0 kB\n\
+VmHWM:\t{hwm_kb:>8} kB\n\
+VmRSS:\t{rss_kb:>8} kB\n\
 VmData:\t       0 kB\n\
 VmStk:\t       0 kB\n\
 VmExe:\t       0 kB\n\
@@ -591,8 +596,15 @@ fn parse_proc_pid_path(path: &str) -> Option<(u32, &str)> {
     Some((pid, rest))
 }
 
-fn synthetic_proc_self_statm() -> &'static [u8] {
-    b"0 0 0 0 0 0 0\n"
+fn synthetic_proc_self_statm() -> Vec<u8> {
+    // "size resident shared text lib data dt" in pages. size = virtual size,
+    // resident = RSS, both from the host kernel; the rest are zero (we don't
+    // separately account shared/text/data). Page unit is the guest's page size.
+    let host = crate::host_proc::self_resource_usage().unwrap_or_default();
+    let pg = crate::linux_abi::LINUX_PAGE_SIZE;
+    let size = host.virtual_bytes / pg;
+    let resident = host.resident_bytes / pg;
+    format!("{size} {resident} 0 0 0 0 0\n").into_bytes()
 }
 
 fn synthetic_proc_boot_id() -> &'static [u8] {

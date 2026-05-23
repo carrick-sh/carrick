@@ -892,7 +892,19 @@ impl HvfInner {
     fn run_until_syscall(&mut self) -> Result<Option<Aarch64SyscallFrame>, TrapError> {
         use applevisor::prelude::*;
 
-        self.vcpu.run().map_err(hvf_error)?;
+        // Time the vCPU's guest execution: the wall time spent inside
+        // hv_vcpu_run is the time this vCPU thread was on-CPU running guest
+        // code (blocking guest syscalls trap OUT and wait in carrick host code,
+        // so this is execution time, not idle). HVF guest cycles don't accrue
+        // to the host thread's rusage, so getrusage/times/`/proc` source the
+        // guest's user CPU time from this. (hv_vcpu_get_exec_time was measured
+        // to under-report ~40× here, so it isn't used.) Keyed by this vCPU
+        // thread's mach port; summed process-wide by `guest_cpu`.
+        let run_start = std::time::Instant::now();
+        let run_result = self.vcpu.run();
+        let run_ns = run_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        crate::guest_cpu::add(crate::host_proc::current_thread_port() as u64, run_ns);
+        run_result.map_err(hvf_error)?;
         let exit = self.vcpu.get_exit_info();
         if exit.reason == ExitReason::CANCELED {
             // A cross-thread `hv_vcpus_exit` (crate::vcpu_kick) forced this vCPU

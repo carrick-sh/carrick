@@ -30,9 +30,31 @@ pub struct GuestProcInfo {
     pub comm: String,
 }
 
+/// Process resource usage, read from the host kernel — the source of truth for
+/// `getrusage`/`times`/`/proc/<pid>/stat` CPU accounting and `/proc/statm` /
+/// `/proc/<pid>/status` memory accounting. Times are microseconds; sizes bytes.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ResourceUsage {
+    /// CPU time this process spent in user mode (all threads, live + reaped).
+    pub user_us: u64,
+    /// CPU time this process spent in the kernel on its behalf.
+    pub system_us: u64,
+    /// User-mode CPU time of reaped children (for RUSAGE_CHILDREN / tms_cutime).
+    pub child_user_us: u64,
+    pub child_system_us: u64,
+    /// Current resident set size (physical footprint).
+    pub resident_bytes: u64,
+    /// Peak resident set size (Linux `ru_maxrss`, reported in KiB).
+    pub maxrss_bytes: u64,
+    /// Current virtual address space size.
+    pub virtual_bytes: u64,
+    /// Major faults (page-ins from backing store).
+    pub majflt: u64,
+}
+
 #[cfg(target_os = "macos")]
 mod imp {
-    use super::GuestProcInfo;
+    use super::{GuestProcInfo, ResourceUsage};
 
     /// Map a macOS process status (`pbi_status`) to the Linux stat state char.
     /// The tests only distinguish "sleeping in a syscall" (`S`) from "running"
@@ -227,11 +249,111 @@ mod imp {
         }
         false
     }
+
+    /// This process's resource usage, queried from the host kernel:
+    /// `proc_pid_rusage(RUSAGE_INFO_V2)` for CPU time (live + reaped threads),
+    /// child CPU time, resident size, pageins; `task_info(MACH_TASK_BASIC_INFO)`
+    /// for the virtual size and peak RSS. carrick forks each guest as a real
+    /// host process, so the calling guest IS this host process — `getpid()` and
+    /// `mach_task_self()` name exactly the task whose usage Linux would report.
+    // `mach_task_self_` is flagged deprecated by libc only to steer new code to
+    // the `mach2` crate; the static is the canonical self-task port and still
+    // works. carrick already uses libc's mach bindings (thread_info,
+    // pthread_mach_thread_np) directly, so we stay consistent rather than add a
+    // dependency for one constant.
+    #[allow(deprecated)]
+    pub fn self_resource_usage() -> Option<ResourceUsage> {
+        let mut usage = ResourceUsage::default();
+
+        let mut ri: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
+        // SAFETY: proc_pid_rusage fills the rusage_info_v2 the `rusage_info_t*`
+        // points at when given the V2 flavor. `rusage_info_t` is itself `void*`,
+        // so the parameter is `void**`; the struct address cast to that type is
+        // the buffer the kernel writes into. (Passing `&pointer_to_ri` instead
+        // would make it write the struct over an 8-byte stack slot — a crash.)
+        let rc = unsafe {
+            libc::proc_pid_rusage(
+                std::process::id() as libc::c_int,
+                libc::RUSAGE_INFO_V2,
+                &mut ri as *mut libc::rusage_info_v2 as *mut libc::rusage_info_t,
+            )
+        };
+        if rc == 0 {
+            usage.user_us = ri.ri_user_time / 1000;
+            usage.system_us = ri.ri_system_time / 1000;
+            usage.child_user_us = ri.ri_child_user_time / 1000;
+            usage.child_system_us = ri.ri_child_system_time / 1000;
+            usage.resident_bytes = ri.ri_phys_footprint;
+            usage.majflt = ri.ri_pageins;
+        }
+
+        let mut ti: libc::mach_task_basic_info = unsafe { std::mem::zeroed() };
+        let mut count = libc::MACH_TASK_BASIC_INFO_COUNT;
+        // SAFETY: task_info writes a mach_task_basic_info for the matching
+        // flavor + count; `mach_task_self_` is the constant self task port
+        // (read directly to avoid the deprecated `mach_task_self()` wrapper).
+        let kr = unsafe {
+            libc::task_info(
+                libc::mach_task_self_,
+                libc::MACH_TASK_BASIC_INFO,
+                &mut ti as *mut _ as libc::task_info_t,
+                &mut count,
+            )
+        };
+        if kr == libc::KERN_SUCCESS {
+            usage.virtual_bytes = ti.virtual_size;
+            usage.maxrss_bytes = ti.resident_size_max;
+            // If proc_pid_rusage was unavailable, fall back to the basic info's
+            // resident size (current) for RSS.
+            if usage.resident_bytes == 0 {
+                usage.resident_bytes = ti.resident_size;
+            }
+        }
+
+        if rc != 0 && kr != libc::KERN_SUCCESS {
+            return None;
+        }
+
+        // HVF guest execution does not accrue to the host thread's rusage
+        // (proc_pid_rusage above under-counts it ~40×), so the guest's user-mode
+        // CPU time is sourced from the hypervisor's per-vCPU clock instead. We
+        // ADD it to the user time and treat the host-side proc_pid_rusage time
+        // (carrick's syscall handling) as the system component — the natural
+        // Linux split of "guest userspace compute" vs "kernel work on its
+        // behalf". A guest that has run no vCPU (pure host bootstrap) just keeps
+        // the proc_pid_rusage user time.
+        let guest_us = crate::guest_cpu::total_us();
+        if guest_us > 0 {
+            usage.user_us = usage.user_us.saturating_add(guest_us);
+        }
+        Some(usage)
+    }
+
+    /// (user_us, system_us) CPU time for the current thread, from
+    /// `thread_info(THREAD_BASIC_INFO)`. Used by `getrusage(RUSAGE_THREAD)`.
+    pub fn self_thread_cpu_us() -> Option<(u64, u64)> {
+        let mut info: libc::thread_basic_info = unsafe { std::mem::zeroed() };
+        let mut count = libc::THREAD_BASIC_INFO_COUNT;
+        // SAFETY: matching flavor/count and a zeroed buffer of the right type.
+        let kr = unsafe {
+            libc::thread_info(
+                libc::pthread_mach_thread_np(libc::pthread_self()),
+                libc::THREAD_BASIC_INFO as libc::thread_flavor_t,
+                &mut info as *mut _ as libc::thread_info_t,
+                &mut count,
+            )
+        };
+        if kr != libc::KERN_SUCCESS {
+            return None;
+        }
+        let to_us = |t: libc::time_value_t| t.seconds as u64 * 1_000_000 + t.microseconds as u64;
+        Some((to_us(info.user_time), to_us(info.system_time)))
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
 mod imp {
-    use super::GuestProcInfo;
+    use super::{GuestProcInfo, ResourceUsage};
     pub fn pid_info(_pid: u32) -> Option<GuestProcInfo> {
         None
     }
@@ -244,12 +366,40 @@ mod imp {
     pub fn current_thread_port() -> u32 {
         0
     }
+    pub fn self_resource_usage() -> Option<ResourceUsage> {
+        None
+    }
+    pub fn self_thread_cpu_us() -> Option<(u64, u64)> {
+        None
+    }
 }
 
-pub use imp::{current_thread_port, is_guest_process, pid_info, thread_run_state_char};
+pub use imp::{
+    current_thread_port, is_guest_process, pid_info, self_resource_usage, self_thread_cpu_us,
+    thread_run_state_char,
+};
 
 /// Mach port type alias for the registry (real on macOS, u32 elsewhere).
 #[cfg(target_os = "macos")]
 pub type ThreadPort = libc::mach_port_t;
 #[cfg(not(target_os = "macos"))]
 pub type ThreadPort = u32;
+
+#[cfg(test)]
+mod accounting_smoke {
+    #[test]
+    fn self_resource_usage_does_not_crash() {
+        let u = super::self_resource_usage();
+        // On macOS this must succeed and report non-zero virtual size.
+        #[cfg(target_os = "macos")]
+        {
+            let u = u.expect("resource usage available");
+            assert!(u.virtual_bytes > 0, "vsize should be > 0");
+        }
+        let _ = u;
+    }
+    #[test]
+    fn self_thread_cpu_does_not_crash() {
+        let _ = super::self_thread_cpu_us();
+    }
+}
