@@ -669,7 +669,8 @@ impl SyscallDispatcher {
                 errno: LINUX_EINVAL,
             });
         }
-        if tgid != LINUX_BOOTSTRAP_PID as i64 {
+        let self_tgids = [LINUX_BOOTSTRAP_PID as i64, std::process::id() as i64];
+        if !self_tgids.contains(&tgid) {
             return Ok(DispatchOutcome::Errno { errno: LINUX_ESRCH });
         }
         // No signal delivery; surface the gap explicitly rather than silently

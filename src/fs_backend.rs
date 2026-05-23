@@ -718,6 +718,7 @@ const CARRICK_MODE_XATTR: &[u8] = b"user.carrick.mode\0";
 /// Same name as a `&str` (no trailing NUL). It lives in the `user.*` namespace
 /// for Linux validity, so the guest-facing xattr syscalls (get/set/list) must
 /// explicitly hide it — otherwise it leaks into the guest's `listxattr`.
+#[allow(dead_code)]
 pub(crate) const CARRICK_MODE_XATTR_NAME: &str = "user.carrick.mode";
 
 /// Guest owner uid/gid xattrs. carrick runs the guest as root but as a
@@ -731,6 +732,10 @@ const CARRICK_GID_XATTR: &[u8] = b"user.carrick.gid\0";
 pub(crate) const CARRICK_UID_XATTR_NAME: &str = "user.carrick.uid";
 #[allow(dead_code)]
 pub(crate) const CARRICK_GID_XATTR_NAME: &str = "user.carrick.gid";
+
+fn is_internal_carrick_xattr(name: &str) -> bool {
+    name.starts_with("user.carrick.")
+}
 
 #[cfg(target_os = "macos")]
 fn fset_u32_xattr(fd: std::os::fd::RawFd, name: &[u8], val: u32) {
@@ -1350,9 +1355,9 @@ impl FsBackend for HostFsBackend {
         if !name.starts_with("user.") {
             return Err(crate::linux_abi::LINUX_ENOTSUP);
         }
-        // Hide carrick's internal mode xattr: a guest must not be able to read
-        // or clobber it (it lives in user.* only for Linux validity).
-        if name == CARRICK_MODE_XATTR_NAME {
+        // Hide carrick's internal metadata xattrs: a guest must not be able to
+        // read or clobber them (they live in user.* only for Linux validity).
+        if is_internal_carrick_xattr(name) {
             return Err(crate::linux_abi::LINUX_ENOTSUP);
         }
         // Open a real kernel fd for the materialised file (same approach as
@@ -1394,7 +1399,7 @@ impl FsBackend for HostFsBackend {
     }
 
     fn get_xattr(&self, path: &str, name: &str) -> Result<Vec<u8>, i32> {
-        if !name.starts_with("user.") || name == CARRICK_MODE_XATTR_NAME {
+        if !name.starts_with("user.") || is_internal_carrick_xattr(name) {
             return Err(crate::linux_abi::LINUX_ENODATA);
         }
         let host_fd = self
@@ -1467,7 +1472,7 @@ impl FsBackend for HostFsBackend {
             .split(|&b| b == 0)
             .filter(|s| !s.is_empty())
             .filter_map(|s| std::str::from_utf8(s).ok())
-            .filter(|s| s.starts_with("user.") && *s != CARRICK_MODE_XATTR_NAME)
+            .filter(|s| s.starts_with("user.") && !is_internal_carrick_xattr(s))
             .map(|s| s.to_owned())
             .collect();
         Ok(names)
@@ -1939,6 +1944,37 @@ mod tests {
         assert_eq!(b.metadata("/f").unwrap().mode, 0);
         b.set_mode("/f", 0o755).unwrap();
         assert_eq!(b.metadata("/f").unwrap().mode, 0o755);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_guest_xattr_api_hides_all_internal_carrick_names() {
+        let (mut b, _scratch) = host_backend();
+        b.set_file_contents("/f", b"x".to_vec()).unwrap();
+        b.set_mode("/f", 0o600).unwrap();
+        b.set_owner("/f", 123, 456).unwrap();
+
+        for name in [
+            CARRICK_MODE_XATTR_NAME,
+            CARRICK_UID_XATTR_NAME,
+            CARRICK_GID_XATTR_NAME,
+            "user.carrick.future",
+        ] {
+            assert_eq!(
+                b.get_xattr("/f", name),
+                Err(crate::linux_abi::LINUX_ENODATA),
+                "{name} must not be guest-readable",
+            );
+            assert_eq!(
+                b.set_xattr("/f", name, b"guest", 0),
+                Err(crate::linux_abi::LINUX_ENOTSUP),
+                "{name} must not be guest-writable",
+            );
+        }
+
+        b.set_xattr("/f", "user.visible", b"ok", 0).unwrap();
+        let names = b.list_xattr("/f").unwrap();
+        assert_eq!(names, vec!["user.visible".to_string()]);
     }
 
     /// Cap-std enforces sandboxing at the syscall layer: trying to

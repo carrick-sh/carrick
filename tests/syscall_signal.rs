@@ -192,6 +192,23 @@ fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
             errno: LINUX_ENOSYS
         }
     );
+    // A forked child self-signal uses its real host pid as tgid; that must be
+    // accepted as "self" rather than rejected as a nonexistent bootstrap pid.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    138,
+                    SyscallArgs::from([std::process::id() as u64, 1, 0, 0, 0, 0])
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno {
+            errno: LINUX_ENOSYS
+        }
+    );
 
     // rt_sigreturn now surfaces a `SigReturn` outcome the runtime
     // handles by calling `trap.restore_from_sigframe()`. The dispatcher

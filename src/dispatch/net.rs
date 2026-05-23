@@ -1259,12 +1259,10 @@ impl SyscallDispatcher {
             Ok(value) => value,
             Err(errno) => return DispatchOutcome::Errno { errno },
         };
-        // Host fds keep their native blocking mode; carrick emulates the
-        // guest's blocking via per-call MSG_DONTWAIT + a lockless kqueue wait
-        // (see P2/blocking_io). Honour a guest-requested SOCK_NONBLOCK.
-        if nonblock {
-            set_host_nonblocking(host_fd);
-        }
+        // The host fd is always nonblocking; Carrick preserves the guest's
+        // blocking mode in Linux-visible status_flags and waits outside the
+        // dispatcher lock when a blocking operation would block.
+        set_host_nonblocking(host_fd);
         let status_flags = if nonblock { LINUX_O_NONBLOCK } else { 0 };
         let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };
         let open_file = OpenFile::with_host_fd(
@@ -1312,11 +1310,8 @@ impl SyscallDispatcher {
         if let Err(errno) = rc.host_syscall_errno() {
             return Ok(DispatchOutcome::Errno { errno });
         }
-        // Native blocking mode unless the guest asked for SOCK_NONBLOCK.
-        if nonblock {
-            set_host_nonblocking(host_fds[0]);
-            set_host_nonblocking(host_fds[1]);
-        }
+        set_host_nonblocking(host_fds[0]);
+        set_host_nonblocking(host_fds[1]);
         let status_flags = if nonblock { LINUX_O_NONBLOCK } else { 0 };
         let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };
         let first = OpenFile::with_host_fd(
@@ -3049,5 +3044,33 @@ pub(super) fn set_host_nonblocking(fd: i32) {
         if flags >= 0 && flags & libc::O_NONBLOCK == 0 {
             libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_socket_install_forces_host_nonblocking_even_for_blocking_guest_fd() {
+        let dispatcher = SyscallDispatcher::new();
+        let outcome = dispatcher.host_socket_install(LINUX_AF_INET, LINUX_SOCK_STREAM, 0);
+        let linux_fd = match outcome {
+            DispatchOutcome::Returned { value } => value as i32,
+            other => panic!("socket install failed: {other:?}"),
+        };
+
+        assert_eq!(
+            dispatcher.fd_status_flags(linux_fd) & LINUX_O_NONBLOCK,
+            0,
+            "Linux-visible fd status must preserve blocking mode",
+        );
+        let host_fd = dispatcher.host_fd_for_poll(linux_fd).unwrap();
+        let flags = unsafe { libc::fcntl(host_fd, libc::F_GETFL) };
+        assert!(
+            flags >= 0 && flags & libc::O_NONBLOCK != 0,
+            "host fd must be nonblocking for dispatcher wait invariants",
+        );
     }
 }
