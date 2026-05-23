@@ -349,12 +349,7 @@ impl SyscallDispatcher {
                 errno: LINUX_EFAULT,
             });
         }
-        // Only ITIMER_REAL is tracked; VIRTUAL/PROF report disarmed.
-        let current = if which == LINUX_ITIMER_REAL {
-            itimerval_from_real(self.proc.lock().itimer_real)
-        } else {
-            LinuxItimerval::zeroed()
-        };
+        let current = itimerval_from_state(self.proc.lock().itimers[which as usize]);
         Ok(write_kernel_struct(memory, address, &current))
     }
 
@@ -390,39 +385,42 @@ impl SyscallDispatcher {
             None
         };
 
-        // ITIMER_REAL is tracked so glibc's alarm() can read back the previous
-        // timer's remaining seconds; VIRTUAL/PROF stay disarmed (zeroed).
-        let is_real = which == LINUX_ITIMER_REAL;
+        let idx = which as usize;
+        // Write the old value before applying the new one (the kernel does the
+        // same, so a read-modify-write sees the prior timer).
         if old_address != 0 {
-            let prev = if is_real {
-                itimerval_from_real(self.proc.lock().itimer_real)
-            } else {
-                LinuxItimerval::zeroed()
-            };
+            let prev = itimerval_from_state(self.proc.lock().itimers[idx]);
             let outcome = write_kernel_struct(memory, old_address, &prev);
             if !matches!(outcome, DispatchOutcome::Returned { .. }) {
                 return Ok(outcome);
             }
         }
-        if is_real && let Some(v) = new_value {
+        if let Some(v) = new_value {
             let value = duration_from_timeval(v.it_value);
             let interval = duration_from_timeval(v.it_interval);
+            // Bump this timer's generation: any in-flight timer thread for it
+            // now sees a stale generation and exits without firing (this both
+            // disarms a running timer and supersedes it on re-arm).
+            let gen_arc = self.proc.lock().itimer_gen.clone();
+            let my_gen = gen_arc[idx].fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
             // A zero it_value disarms the timer (matching the kernel).
-            self.proc.lock().itimer_real = if value.is_zero() {
+            self.proc.lock().itimers[idx] = if value.is_zero() {
                 None
             } else {
-                Some(crate::dispatch::proc::ItimerReal {
+                Some(crate::dispatch::proc::ItimerState {
                     set_at: std::time::Instant::now(),
                     value,
                     interval,
                 })
             };
-            ctx.reporter.record(CompatEvent::partial_syscall(
-                ctx.request.number,
-                "setitimer",
-                ctx.request.args,
-                "ITIMER_REAL tracked for alarm() accounting; no SIGALRM delivery yet",
-            ));
+            if !value.is_zero() {
+                let signum = match which {
+                    LINUX_ITIMER_VIRTUAL => crate::linux_abi::LINUX_SIGVTALRM,
+                    LINUX_ITIMER_PROF => crate::linux_abi::LINUX_SIGPROF,
+                    _ => crate::linux_abi::LINUX_SIGALRM,
+                };
+                spawn_itimer_thread(gen_arc, idx, my_gen, value, interval, signum);
+            }
         }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
@@ -657,11 +655,45 @@ fn timeval_from_duration(d: std::time::Duration) -> crate::linux_abi::LinuxTimev
     }
 }
 
-/// Render the current ITIMER_REAL state as an `itimerval`, computing the time
+/// Spawn the per-arm interval-timer thread. After the initial `value` delay it
+/// publishes `signum` (SIGALRM/SIGVTALRM/SIGPROF) to the guest and, if an
+/// `interval` is set, keeps re-firing. Before each fire it checks the timer's
+/// generation: if `setitimer` re-armed or disarmed this `which` in the
+/// meantime, `gen[idx]` no longer equals `my_gen` and the thread exits without
+/// firing. The thread holds only an `Arc` to the generation array, so it never
+/// outlives the process (and forked children never inherit it — threads don't
+/// survive fork).
+fn spawn_itimer_thread(
+    gen_arc: std::sync::Arc<[std::sync::atomic::AtomicU64; 3]>,
+    idx: usize,
+    my_gen: u64,
+    value: std::time::Duration,
+    interval: std::time::Duration,
+    signum: i32,
+) {
+    use std::sync::atomic::Ordering;
+    let _ = std::thread::Builder::new()
+        .name("carrick-itimer".to_owned())
+        .spawn(move || {
+            std::thread::sleep(value);
+            loop {
+                if gen_arc[idx].load(Ordering::SeqCst) != my_gen {
+                    return;
+                }
+                crate::host_signal::publish_process_signal(signum);
+                if interval.is_zero() {
+                    return;
+                }
+                std::thread::sleep(interval);
+            }
+        });
+}
+
+/// Render an interval-timer's state as an `itimerval`, computing the time
 /// remaining (`value - elapsed`, saturating to zero on/after expiry). A
 /// disarmed timer (`None`) is the zeroed struct.
-fn itimerval_from_real(
-    state: Option<crate::dispatch::proc::ItimerReal>,
+fn itimerval_from_state(
+    state: Option<crate::dispatch::proc::ItimerState>,
 ) -> crate::linux_abi::LinuxItimerval {
     match state {
         Some(t) => {

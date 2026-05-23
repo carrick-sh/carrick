@@ -25,20 +25,25 @@ pub(super) struct ProcState {
     /// forked child reports its real host parent — which, because the trees
     /// mirror, IS its parent guest process. See `sys_getppid`.
     pub bootstrap_host_pid: u32,
-    /// `ITIMER_REAL` state, anchored to the monotonic clock so
-    /// setitimer/getitimer report the time remaining. `None` = disarmed.
+    /// Interval-timer state for `[ITIMER_REAL, ITIMER_VIRTUAL, ITIMER_PROF]`,
+    /// indexed by the `which` value. Anchored to the monotonic clock so
+    /// setitimer/getitimer report the time remaining; `None` = disarmed.
     /// glibc's `alarm()` is `setitimer(ITIMER_REAL, …)` and returns the
-    /// previous timer's remaining seconds — without this state every
-    /// `alarm()` wrongly returned 0 (LTP alarm02/alarm03). carrick does not
-    /// yet DELIVER SIGALRM on expiry; only the remaining-time accounting.
-    pub itimer_real: Option<ItimerReal>,
+    /// previous timer's remaining seconds. The matching expiry signal
+    /// (SIGALRM/SIGVTALRM/SIGPROF) is delivered by a per-arm timer thread;
+    /// `itimer_gen[which]` is a generation counter that cancels a thread when
+    /// its timer is re-armed or disarmed — a stale thread sees a bumped
+    /// generation and exits without firing. VIRTUAL/PROF are approximated with
+    /// a wall-clock thread (carrick has no per-process CPU-time accounting).
+    pub itimers: [Option<ItimerState>; 3],
+    pub itimer_gen: std::sync::Arc<[std::sync::atomic::AtomicU64; 3]>,
 }
 
-/// Armed `ITIMER_REAL` timer. `value`/`interval` are the configured initial
+/// Armed interval timer. `value`/`interval` are the configured initial
 /// expiration and reload period; `set_at` anchors `value` to the monotonic
 /// clock so the remaining time is `value - set_at.elapsed()` (saturating).
 #[derive(Clone, Copy)]
-pub(super) struct ItimerReal {
+pub(super) struct ItimerState {
     pub set_at: std::time::Instant,
     pub value: std::time::Duration,
     pub interval: std::time::Duration,
@@ -46,6 +51,7 @@ pub(super) struct ItimerReal {
 
 impl ProcState {
     pub(super) fn new() -> Self {
+        use std::sync::atomic::AtomicU64;
         Self {
             executable_path: "/proc/self/exe".to_owned(),
             personality: 0,
@@ -53,7 +59,12 @@ impl ProcState {
             task_name: linux_task_name_from_bytes(b"carrick"),
             pdeathsig: 0,
             bootstrap_host_pid: std::process::id(),
-            itimer_real: None,
+            itimers: [None, None, None],
+            itimer_gen: std::sync::Arc::new([
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+            ]),
         }
     }
 }
