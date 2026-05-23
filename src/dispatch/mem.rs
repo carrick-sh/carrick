@@ -80,10 +80,18 @@ impl SyscallDispatcher {
         let requested = ctx.arg(0);
         let length = ctx.arg(1);
         let prot = ctx.arg(2);
-        let flags = ctx.arg(3);
+        let mut flags = ctx.arg(3);
         let fd: Fd = ctx.typed_arg(4);
         let offset = ctx.arg(5);
         let memory = &mut *ctx.memory;
+
+        // MAP_FIXED_NOREPLACE places at the exact requested address like
+        // MAP_FIXED; carrick's FIXED path never clobbers an existing stage-2
+        // mapping, so normalise it to MAP_FIXED for placement (the EEXIST
+        // collision report is the only behaviour we forgo).
+        if flags & LINUX_MAP_FIXED_NOREPLACE != 0 {
+            flags |= LINUX_MAP_FIXED;
+        }
 
         // Linux requires exactly one of MAP_SHARED / MAP_PRIVATE. MAP_PRIVATE
         // is a private snapshot copy of the file contents. MAP_SHARED of a

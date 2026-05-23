@@ -39,14 +39,14 @@ pub(crate) fn synthetic_file(path: &str, ctx: &SyntheticProcContext) -> Option<V
     match path {
         "/proc/cmdline" => Some(synthetic_proc_cmdline().to_vec()),
         "/proc/config.gz" => Some(synthetic_proc_config_gz()),
-        "/proc/cpuinfo" => Some(synthetic_proc_cpuinfo().to_vec()),
+        "/proc/cpuinfo" => Some(synthetic_proc_cpuinfo()),
         "/proc/diskstats" => Some(synthetic_proc_diskstats().to_vec()),
         "/proc/filesystems" => Some(synthetic_proc_filesystems().to_vec()),
         "/proc/loadavg" => Some(synthetic_proc_loadavg().to_vec()),
         "/proc/meminfo" => Some(synthetic_proc_meminfo().to_vec()),
         "/proc/mounts" => Some(synthetic_proc_mounts().to_vec()),
         "/proc/partitions" => Some(synthetic_proc_partitions().to_vec()),
-        "/proc/stat" => Some(synthetic_proc_stat().to_vec()),
+        "/proc/stat" => Some(synthetic_proc_stat()),
         "/proc/uptime" => Some(synthetic_proc_uptime().into_bytes()),
         "/proc/version" => Some(synthetic_proc_version().to_vec()),
         "/proc/self/auxv" => Some(synthetic_proc_self_auxv().to_vec()),
@@ -277,8 +277,15 @@ fn label_for_region(region: &ProcMapsEntry, executable_path: &str) -> (u64, u64,
     (start, end, label)
 }
 
-fn synthetic_proc_cpuinfo() -> &'static [u8] {
-    b"processor\t: 0\n\
+fn synthetic_proc_cpuinfo() -> Vec<u8> {
+    // One "processor" block per logical CPU so the count agrees with
+    // sched_getaffinity, /proc/stat and /sys/.../cpu/online. Go/nproc count
+    // CPUs via sched_getaffinity, but lscpu and some runtimes parse this.
+    let ncpu = crate::host_facts::logical_cpu_count();
+    let mut out = String::new();
+    for cpu in 0..ncpu {
+        out.push_str(&format!(
+            "processor\t: {cpu}\n\
 BogoMIPS\t: 48.00\n\
 Features\t: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm lrcpc dcpop asimddp\n\
 CPU implementer\t: 0x61\n\
@@ -286,8 +293,11 @@ CPU architecture\t: 8\n\
 CPU variant\t: 0x0\n\
 CPU part\t: 0x000\n\
 CPU revision\t: 0\n\
-\n\
-Hardware\t: Carrick\n"
+\n"
+        ));
+    }
+    out.push_str("Hardware\t: Carrick\n");
+    out.into_bytes()
 }
 
 fn synthetic_proc_version() -> &'static [u8] {
@@ -343,20 +353,65 @@ VmallocUsed:           0 kB\n\
 VmallocChunk:          0 kB\n"
 }
 
-fn synthetic_proc_stat() -> &'static [u8] {
-    b"cpu  0 0 0 0 0 0 0 0 0 0\n\
-cpu0 0 0 0 0 0 0 0 0 0 0\n\
-intr 0\n\
+fn synthetic_proc_stat() -> Vec<u8> {
+    // Aggregate "cpu" line followed by one "cpuN" line per logical CPU, so the
+    // per-CPU count agrees with sched_getaffinity and /proc/cpuinfo. The jiffy
+    // columns are zero (carrick has no global CPU-time accounting yet).
+    let ncpu = crate::host_facts::logical_cpu_count();
+    let mut out = String::from("cpu  0 0 0 0 0 0 0 0 0 0\n");
+    for cpu in 0..ncpu {
+        out.push_str(&format!("cpu{cpu} 0 0 0 0 0 0 0 0 0 0\n"));
+    }
+    out.push_str(
+        "intr 0\n\
 ctxt 0\n\
 btime 0\n\
 processes 1\n\
 procs_running 1\n\
 procs_blocked 0\n\
-softirq 0\n"
+softirq 0\n",
+    );
+    out.into_bytes()
+}
+
+/// Kernel `Cpus_allowed` bitmask format: comma-separated 32-bit groups, most
+/// significant first, the high group unpadded and lower groups zero-padded to
+/// 8 hex digits (e.g. 10 CPUs → "000003ff" is shown as "3ff"; 33 CPUs →
+/// "1,ffffffff"). Built from the online set.
+fn cpus_allowed_hex(ncpu: usize) -> String {
+    let groups = ncpu.div_ceil(32).max(1);
+    let mut parts = Vec::with_capacity(groups);
+    for g in (0..groups).rev() {
+        let lo = g * 32;
+        let mut word: u32 = 0;
+        for bit in 0..32 {
+            if lo + bit < ncpu {
+                word |= 1u32 << bit;
+            }
+        }
+        if g == groups - 1 {
+            parts.push(format!("{word:x}"));
+        } else {
+            parts.push(format!("{word:08x}"));
+        }
+    }
+    parts.join(",")
+}
+
+/// Kernel `Cpus_allowed_list` range list: "0" for a uniprocessor, "0-9" for 10.
+fn cpus_allowed_list(ncpu: usize) -> String {
+    if ncpu <= 1 {
+        "0".to_owned()
+    } else {
+        format!("0-{}", ncpu - 1)
+    }
 }
 
 fn synthetic_proc_self_status(executable_path: &str) -> String {
     let comm = process_short_name(executable_path);
+    let ncpu = crate::host_facts::logical_cpu_count();
+    let cpus_hex = cpus_allowed_hex(ncpu);
+    let cpus_list = cpus_allowed_list(ncpu);
     format!(
         "Name:\t{comm}\n\
 Umask:\t0022\n\
@@ -394,8 +449,8 @@ CapPrm:\t0000000000000000\n\
 CapEff:\t0000000000000000\n\
 CapBnd:\t0000000000000000\n\
 CapAmb:\t0000000000000000\n\
-Cpus_allowed:\t1\n\
-Cpus_allowed_list:\t0\n\
+Cpus_allowed:\t{cpus_hex}\n\
+Cpus_allowed_list:\t{cpus_list}\n\
 Mems_allowed:\t1\n\
 Mems_allowed_list:\t0\n\
 voluntary_ctxt_switches:\t0\n\
