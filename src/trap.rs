@@ -197,6 +197,62 @@ impl Drop for HvfTrapEngine {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Default)]
+struct MemoryProtections {
+    no_access: parking_lot::RwLock<Vec<(u64, u64)>>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl MemoryProtections {
+    fn from_ranges(ranges: Vec<(u64, u64)>) -> Self {
+        Self {
+            no_access: parking_lot::RwLock::new(ranges),
+        }
+    }
+
+    fn snapshot(&self) -> Vec<(u64, u64)> {
+        self.no_access.read().clone()
+    }
+
+    fn range_no_access(&self, address: u64, length: usize) -> bool {
+        let end = address.saturating_add(length as u64);
+        self.no_access
+            .read()
+            .iter()
+            .any(|&(s, e)| address < e && s < end)
+    }
+
+    fn set_no_access(&self, address: u64, len: usize, no_access: bool) {
+        let end = address.saturating_add(len as u64);
+        if end <= address {
+            return;
+        }
+        let mut ranges = self.no_access.write();
+        if no_access {
+            ranges.push((address, end));
+            return;
+        }
+        let mut next = Vec::with_capacity(ranges.len());
+        for (s, e) in std::mem::take(&mut *ranges) {
+            if address <= s && end >= e {
+                continue;
+            }
+            if end <= s || address >= e {
+                next.push((s, e));
+                continue;
+            }
+            if s < address {
+                next.push((s, address));
+            }
+            if end < e {
+                next.push((end, e));
+            }
+        }
+        *ranges = next;
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 struct HvfInner {
     _vm: applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
     vcpu: applevisor::vcpu::Vcpu,
@@ -214,12 +270,10 @@ struct HvfInner {
     /// child got swapped in by `fork()`; ordering of `_vm` vs `vcpu`
     /// Drop trips a "no VM or vCPU available" assertion).
     is_forked_child: bool,
-    /// Guest ranges currently mapped `PROT_NONE` (as `[start, end)` pairs).
-    /// `read_guest_bytes`/`write_guest_bytes` fault when an access overlaps one,
-    /// so the syscall path returns EFAULT for a `PROT_NONE` buffer even though
-    /// carrick backs the whole arena with one accessible host region. Set by
-    /// `set_no_access` (from guest mmap/mprotect); preserved across `fork`.
-    no_access: Vec<(u64, u64)>,
+    /// Process-wide guest ranges currently mapped `PROT_NONE`.
+    /// Thread siblings share this metadata so syscall-path memory access checks
+    /// observe `mprotect(PROT_NONE)` changes made by any guest thread.
+    protections: std::sync::Arc<MemoryProtections>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -245,6 +299,7 @@ struct HvfMappedRegion {
     /// pages stay alive via COW; the unmap would target the parent's
     /// HVF context which no longer exists in the child.
     memory: Option<applevisor::memory::Memory>,
+    host_mapping: Option<crate::host_mapping::OwnedHostMapping>,
     /// True for a genuine guest `MAP_SHARED` file mapping (`map_shared_file`).
     /// Guest memory is host-`MAP_SHARED` for HVF coherence, so fork(2) does
     /// NOT COW-isolate it; the `fork` path takes an explicit private snapshot
@@ -294,6 +349,39 @@ struct HvfInner;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 type ThreadMappingDesc = (u64, u64, *mut u8, usize, applevisor::memory::MemPerms);
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct ForkMappingDesc {
+    start: u64,
+    end: u64,
+    host: ForkMappingHost,
+    size: usize,
+    perms: applevisor::memory::MemPerms,
+    guest_shared: bool,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+enum ForkMappingHost {
+    Borrowed(*mut u8),
+    Owned(crate::host_mapping::OwnedHostMapping),
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl ForkMappingHost {
+    fn ptr(&self) -> *mut u8 {
+        match self {
+            ForkMappingHost::Borrowed(ptr) => *ptr,
+            ForkMappingHost::Owned(mapping) => mapping.as_ptr(),
+        }
+    }
+
+    fn into_owned(self) -> Option<crate::host_mapping::OwnedHostMapping> {
+        match self {
+            ForkMappingHost::Borrowed(_) => None,
+            ForkMappingHost::Owned(mapping) => Some(mapping),
+        }
+    }
+}
+
 /// Everything a freshly-spawned host thread needs to stand up its own vCPU
 /// in the SHARED process VM and resume the cloned guest thread.
 ///
@@ -307,6 +395,7 @@ type ThreadMappingDesc = (u64, u64, *mut u8, usize, applevisor::memory::MemPerms
 pub struct ThreadSpec {
     vm: applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
     mappings: Vec<ThreadMappingDesc>,
+    protections: std::sync::Arc<MemoryProtections>,
     snapshot: VcpuSnapshot,
 }
 
@@ -516,7 +605,7 @@ impl HvfTrapEngine {
                 mappings: Vec::new(),
                 last_exit_class: 0,
                 is_forked_child: false,
-                no_access: Vec::new(),
+                protections: std::sync::Arc::new(MemoryProtections::default()),
             }),
         })
     }
@@ -856,8 +945,7 @@ impl HvfInner {
     /// True if `[address, address+length)` overlaps any PROT_NONE range. Used
     /// to fault syscall-path accesses to a guest PROT_NONE buffer (EFAULT).
     fn range_no_access(&self, address: u64, length: usize) -> bool {
-        let end = address.saturating_add(length as u64);
-        self.no_access.iter().any(|&(s, e)| address < e && s < end)
+        self.protections.range_no_access(address, length)
     }
 
     fn read_guest_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
@@ -913,32 +1001,7 @@ impl HvfInner {
     /// Clearing performs interval subtraction so an mprotect/mmap that re-enables
     /// part of a PROT_NONE region leaves only the still-protected remainder.
     fn set_no_access(&mut self, address: u64, len: usize, no_access: bool) {
-        let end = address.saturating_add(len as u64);
-        if end <= address {
-            return;
-        }
-        if no_access {
-            self.no_access.push((address, end));
-            return;
-        }
-        // Subtract [address, end) from every stored range.
-        let mut next = Vec::with_capacity(self.no_access.len());
-        for (s, e) in std::mem::take(&mut self.no_access) {
-            if address <= s && end >= e {
-                continue; // fully cleared
-            }
-            if end <= s || address >= e {
-                next.push((s, e)); // disjoint
-                continue;
-            }
-            if s < address {
-                next.push((s, address)); // left remainder
-            }
-            if end < e {
-                next.push((end, e)); // right remainder
-            }
-        }
-        self.no_access = next;
+        self.protections.set_no_access(address, len, no_access);
     }
 
     /// Back `[guest_addr, guest_addr+len)` with a real `MAP_SHARED` mmap of
@@ -954,48 +1017,39 @@ impl HvfInner {
         host_fd: i32,
         offset: u64,
     ) -> Result<(), MemoryError> {
-        let host = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                host_fd,
-                offset as libc::off_t,
-            )
-        };
-        // The mmap holds its own reference to the file; the fd is ours to close.
-        unsafe { libc::close(host_fd) };
-        if host == libc::MAP_FAILED {
-            return Err(MemoryError::HostMap(format!(
-                "mmap(MAP_SHARED) failed: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
+        let host_mapping = crate::host_mapping::OwnedHostMapping::map_shared_file(
+            len, host_fd, offset,
+        )
+        .map_err(|error| MemoryError::HostMap(format!("mmap(MAP_SHARED) failed: {error}")))?;
+        let host = host_mapping.as_ptr();
+        let len = host_mapping.len();
         let perms = hvf_perms(SegmentPerms {
             read: true,
             write: true,
             execute: false,
         });
         let perms_raw: u64 = u64::from(perms);
-        let r = unsafe { applevisor_sys::hv_vm_map(host, guest_addr, len, perms_raw) };
+        let r = unsafe {
+            applevisor_sys::hv_vm_map(host.cast::<std::ffi::c_void>(), guest_addr, len, perms_raw)
+        };
         if r != 0 {
-            unsafe { libc::munmap(host, len) };
             return Err(MemoryError::HostMap(format!("hv_vm_map failed: 0x{r:x}")));
         }
+        let guest_shared = host_mapping.guest_shared();
         self.mappings.push(HvfMappedRegion {
             start: guest_addr,
             end: guest_addr + len as u64,
-            host_addr: host as *mut u8,
+            host_addr: host,
             size: len,
             perms,
             // We own the libc mmap (not an applevisor Memory). Torn down by
             // `unmap_shared_file`; on engine drop the VM tear-down releases
             // the stage-2 entries and the host pages leak only at exit.
             memory: None,
+            host_mapping: Some(host_mapping),
             // A genuine guest MAP_SHARED file mapping: must stay shared across
             // fork (no private snapshot).
-            guest_shared: true,
+            guest_shared,
         });
         Ok(())
     }
@@ -1004,43 +1058,39 @@ impl HvfInner {
     /// region mapped into the guest IPA, kept shared across fork. Used for a
     /// guest `MAP_SHARED|MAP_ANONYMOUS` mmap (cross-process futex / shared IPC).
     fn map_shared_anon(&mut self, guest_addr: u64, len: usize) -> Result<(), MemoryError> {
-        let host = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED | libc::MAP_ANON,
-                -1,
-                0,
-            )
-        };
-        if host == libc::MAP_FAILED {
-            return Err(MemoryError::HostMap(format!(
-                "mmap(MAP_SHARED|MAP_ANON) failed: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
+        let host_mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            len,
+            crate::host_mapping::HostMappingKind::SharedAnon,
+        )
+        .map_err(|error| {
+            MemoryError::HostMap(format!("mmap(MAP_SHARED|MAP_ANON) failed: {error}"))
+        })?;
+        let host = host_mapping.as_ptr();
+        let len = host_mapping.len();
         let perms = hvf_perms(SegmentPerms {
             read: true,
             write: true,
             execute: false,
         });
         let perms_raw: u64 = u64::from(perms);
-        let r = unsafe { applevisor_sys::hv_vm_map(host, guest_addr, len, perms_raw) };
+        let r = unsafe {
+            applevisor_sys::hv_vm_map(host.cast::<std::ffi::c_void>(), guest_addr, len, perms_raw)
+        };
         if r != 0 {
-            unsafe { libc::munmap(host, len) };
             return Err(MemoryError::HostMap(format!("hv_vm_map failed: 0x{r:x}")));
         }
+        let guest_shared = host_mapping.guest_shared();
         self.mappings.push(HvfMappedRegion {
             start: guest_addr,
             end: guest_addr + len as u64,
-            host_addr: host as *mut u8,
+            host_addr: host,
             size: len,
             perms,
             memory: None,
+            host_mapping: Some(host_mapping),
             // Genuine guest MAP_SHARED mapping — shared across fork, never
             // snapshotted, and a valid cross-process futex target.
-            guest_shared: true,
+            guest_shared,
         });
         Ok(())
     }
@@ -1052,10 +1102,14 @@ impl HvfInner {
             .position(|m| m.start == guest_addr && m.memory.is_none() && m.size == len)
         {
             let m = self.mappings.remove(pos);
+            let owns_host_mapping = m.host_mapping.is_some();
             unsafe {
                 applevisor_sys::hv_vm_unmap(guest_addr, len);
-                libc::munmap(m.host_addr as *mut std::ffi::c_void, len);
+                if !owns_host_mapping {
+                    libc::munmap(m.host_addr.cast::<std::ffi::c_void>(), len);
+                }
             }
+            drop(m);
         }
         Ok(())
     }
@@ -1543,10 +1597,17 @@ impl HvfInner {
         // Pre-fork: snapshot vCPU state and capture mapping descriptors.
         let snapshot = self.snapshot_vcpu()?;
         crate::probes::fork_pre(snapshot.pc, snapshot.elr_el1, snapshot.cpsr);
-        let mapping_descs: Vec<(u64, u64, *mut u8, usize, MemPerms, bool)> = self
+        let mapping_descs: Vec<ForkMappingDesc> = self
             .mappings
             .iter()
-            .map(|m| (m.start, m.end, m.host_addr, m.size, m.perms, m.guest_shared))
+            .map(|m| ForkMappingDesc {
+                start: m.start,
+                end: m.end,
+                host: ForkMappingHost::Borrowed(m.host_addr),
+                size: m.size,
+                perms: m.perms,
+                guest_shared: m.guest_shared,
+            })
             .collect();
 
         // Guest RAM is host-MAP_SHARED (HVF coherence), so fork(2) does NOT
@@ -1558,15 +1619,21 @@ impl HvfInner {
         // the same host buffer. (Built unconditionally because we don't yet know
         // which side we are; the parent's unused copies leak with its engine,
         // matching the existing ManuallyDrop discipline.)
-        let mut child_descs: Vec<(u64, u64, *mut u8, usize, MemPerms, bool)> =
-            Vec::with_capacity(mapping_descs.len());
-        for &(start, end, host_addr, size, perms, guest_shared) in &mapping_descs {
-            let child_host = if guest_shared {
-                host_addr // shared mapping: child maps the SAME buffer
+        let mut child_descs: Vec<ForkMappingDesc> = Vec::with_capacity(mapping_descs.len());
+        for desc in &mapping_descs {
+            let child_host = if desc.guest_shared {
+                ForkMappingHost::Borrowed(desc.host.ptr()) // shared mapping: child maps the SAME buffer
             } else {
-                clone_region_for_child(host_addr, size)?
+                ForkMappingHost::Owned(clone_region_for_child(desc.host.ptr(), desc.size)?)
             };
-            child_descs.push((start, end, child_host, size, perms, guest_shared));
+            child_descs.push(ForkMappingDesc {
+                start: desc.start,
+                end: desc.end,
+                host: child_host,
+                size: desc.size,
+                perms: desc.perms,
+                guest_shared: desc.guest_shared,
+            });
         }
 
         // Tear down the parent's HVF context BEFORE forking. macOS's
@@ -1625,14 +1692,15 @@ impl HvfInner {
         // Guest PROT_NONE ranges are part of the address space fork copies;
         // carry them into the rebuilt engine so the child keeps faulting on
         // them (it inherited the parent's mappings, perms and all).
-        let inherited_no_access = std::mem::take(&mut self.no_access);
+        let inherited_protections =
+            std::sync::Arc::new(MemoryProtections::from_ranges(self.protections.snapshot()));
         let new_inner = HvfInner {
             _vm: new_vm,
             vcpu: new_vcpu,
             mappings: Vec::with_capacity(mapping_descs.len()),
             last_exit_class: snapshot.last_exit_class,
             is_forked_child: pid == 0,
-            no_access: inherited_no_access,
+            protections: inherited_protections,
         };
         unsafe {
             std::ptr::write(self as *mut HvfInner, new_inner);
@@ -1644,36 +1712,38 @@ impl HvfInner {
         // The unused set (the child's snapshot copies in the parent) leaks with
         // the engine, matching the existing ManuallyDrop discipline.
         let descs = if pid == 0 { child_descs } else { mapping_descs };
-        for (start, end, host_addr, size, perms, guest_shared) in descs {
-            let perms_raw: u64 = u64::from(perms);
+        for desc in descs {
+            let host_addr = desc.host.ptr();
+            let perms_raw: u64 = u64::from(desc.perms);
             let r = unsafe {
                 applevisor_sys::hv_vm_map(
                     host_addr as *mut std::ffi::c_void,
-                    start,
-                    size,
+                    desc.start,
+                    desc.size,
                     perms_raw,
                 )
             };
             if r != 0 {
                 return Err(TrapError::ChildMapFailed {
                     host_addr: host_addr as u64,
-                    guest_start: start,
-                    size,
+                    guest_start: desc.start,
+                    size: desc.size,
                     code: r as u32,
                 });
             }
             self.mappings.push(HvfMappedRegion {
-                start,
-                end,
+                start: desc.start,
+                end: desc.end,
                 host_addr,
-                size,
-                perms,
+                size: desc.size,
+                perms: desc.perms,
                 // No Memory object — the host buffer is either an inherited
                 // shared mapping or a snapshot copy. Drop runs no HVF call for
                 // this mapping; the engine's VM tear-down releases all stage-2
                 // entries in one shot.
                 memory: None,
-                guest_shared,
+                host_mapping: desc.host.into_owned(),
+                guest_shared: desc.guest_shared,
             });
         }
 
@@ -1704,6 +1774,7 @@ impl HvfInner {
         Ok(ThreadSpec {
             vm: self._vm.clone(),
             mappings,
+            protections: std::sync::Arc::clone(&self.protections),
             snapshot,
         })
     }
@@ -1719,6 +1790,7 @@ impl HvfInner {
         let ThreadSpec {
             vm,
             mappings,
+            protections,
             snapshot,
         } = spec;
 
@@ -1734,9 +1806,7 @@ impl HvfInner {
             // the panicky applevisor Drops; the VM clone just decrements
             // the Arc on process exit.
             is_forked_child: true,
-            // Sibling threads share the parent's address space; per-thread
-            // PROT_NONE tracking isn't modelled yet (limited thread support).
-            no_access: Vec::new(),
+            protections,
         };
 
         for (start, end, host_addr, size, perms) in mappings {
@@ -1766,6 +1836,7 @@ impl HvfInner {
                 size,
                 perms,
                 memory: None,
+                host_mapping: None,
                 // Thread siblings share the parent's address space verbatim and
                 // never take a fork snapshot; the flag is immaterial here.
                 guest_shared: false,
@@ -1920,7 +1991,7 @@ impl HvfInner {
             is_forked_child: was_forked_child,
             // execve replaces the address space; any prior PROT_NONE ranges are
             // gone. The new image starts with none until it mmaps them.
-            no_access: Vec::new(),
+            protections: std::sync::Arc::new(MemoryProtections::default()),
         };
         unsafe {
             std::ptr::write(self as *mut HvfInner, new_inner);
@@ -2190,24 +2261,20 @@ fn align_up(value: u64, alignment: u64) -> Result<u64, TrapError> {
 /// race). Only resident pages are copied (mincore-gated) so the snapshot is
 /// sparse; on mincore failure we fall back to a full copy (correct, slower).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn clone_region_for_child(src: *mut u8, size: usize) -> Result<*mut u8, TrapError> {
-    let dst = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            size,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_ANON | libc::MAP_SHARED,
-            -1,
-            0,
-        )
-    };
-    if dst == libc::MAP_FAILED {
-        return Err(TrapError::Hypervisor(format!(
-            "fork child-snapshot mmap (size={size}) failed: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    let dst = dst as *mut u8;
+fn clone_region_for_child(
+    src: *mut u8,
+    size: usize,
+) -> Result<crate::host_mapping::OwnedHostMapping, TrapError> {
+    let dst = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+        size,
+        crate::host_mapping::HostMappingKind::ChildPrivateSnapshot,
+    )
+    .map_err(|error| {
+        TrapError::Hypervisor(format!(
+            "fork child-snapshot mmap (size={size}) failed: {error}"
+        ))
+    })?;
+    let dst_ptr = dst.as_ptr();
     let page = {
         let p = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         if p <= 0 { 16 * 1024 } else { p as usize }
@@ -2222,14 +2289,14 @@ fn clone_region_for_child(src: *mut u8, size: usize) -> Result<*mut u8, TrapErro
         )
     };
     if rc != 0 {
-        unsafe { std::ptr::copy_nonoverlapping(src, dst, size) };
+        unsafe { std::ptr::copy_nonoverlapping(src, dst_ptr, size) };
         return Ok(dst);
     }
     for (i, &flag) in resident.iter().enumerate() {
         if flag & 1 != 0 {
             let off = i * page;
             let len = page.min(size - off);
-            unsafe { std::ptr::copy_nonoverlapping(src.add(off), dst.add(off), len) };
+            unsafe { std::ptr::copy_nonoverlapping(src.add(off), dst_ptr.add(off), len) };
         }
     }
     Ok(dst)
@@ -2239,30 +2306,22 @@ fn clone_region_for_child(src: *mut u8, size: usize) -> Result<*mut u8, TrapErro
 fn map_region_raw(mapping: &GuestMapping) -> Result<HvfMappedRegion, TrapError> {
     let size = usize::try_from(mapping.mapped_size)
         .map_err(|_| TrapError::MappingTooLarge(mapping.mapped_size))?;
-    let host = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            size,
-            libc::PROT_READ | libc::PROT_WRITE,
-            // MAP_SHARED, not MAP_PRIVATE: a MAP_PRIVATE anon page mapped into
-            // the guest via hv_vm_map desyncs from the host buffer — the guest's
-            // own store and a later guest load observe different memory (the
-            // "PROT_REA" wild-PC crash: a dynamic binary's GOT slot that ld.so
-            // resolved reads back stale). MAP_SHARED anon is HVF-coherent (same
-            // as `map_shared_file`). The cost: fork(2) no longer COW-isolates
-            // these pages, so `HvfInner::fork` takes an explicit private
-            // snapshot for the child (see `clone_region_for_child`).
-            libc::MAP_ANON | libc::MAP_SHARED,
-            -1,
-            0,
-        )
-    };
-    if host == libc::MAP_FAILED {
-        return Err(TrapError::Hypervisor(format!(
-            "mmap guest region (size={size}) failed: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
+    // MAP_SHARED, not MAP_PRIVATE: a MAP_PRIVATE anon page mapped into the
+    // guest via hv_vm_map desyncs from the host buffer — the guest's own store
+    // and a later guest load observe different memory (the "PROT_REA" wild-PC
+    // crash: a dynamic binary's GOT slot that ld.so resolved reads back stale).
+    // MAP_SHARED anon is HVF-coherent (same as `map_shared_file`). The cost:
+    // fork(2) no longer COW-isolates these pages, so `HvfInner::fork` takes an
+    // explicit private snapshot for the child (see `clone_region_for_child`).
+    let host_mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+        size,
+        crate::host_mapping::HostMappingKind::PrivateAnon,
+    )
+    .map_err(|error| {
+        TrapError::Hypervisor(format!("mmap guest region (size={size}) failed: {error}"))
+    })?;
+    let host = host_mapping.as_ptr();
+    let size = host_mapping.len();
     // Copy the payload prefix into the freshly-zeroed region; the rest stays
     // zero (lazy). offset_in_mapping + image.len() <= mapped_size is guaranteed
     // by GuestMappingPlan::from_address_space.
@@ -2272,16 +2331,22 @@ fn map_region_raw(mapping: &GuestMapping) -> Result<HvfMappedRegion, TrapError> 
         unsafe {
             std::ptr::copy_nonoverlapping(
                 mapping.image.as_ptr(),
-                (host as *mut u8).add(off),
+                host.add(off),
                 mapping.image.len(),
             );
         }
     }
     let perms = hvf_perms(mapping.perms);
     let perms_raw: u64 = u64::from(perms);
-    let r = unsafe { applevisor_sys::hv_vm_map(host, mapping.guest_start, size, perms_raw) };
+    let r = unsafe {
+        applevisor_sys::hv_vm_map(
+            host.cast::<std::ffi::c_void>(),
+            mapping.guest_start,
+            size,
+            perms_raw,
+        )
+    };
     if r != 0 {
-        unsafe { libc::munmap(host, size) };
         return Err(TrapError::Hypervisor(format!(
             "hv_vm_map(guest=0x{:x}, size={size}) failed: 0x{r:x}",
             mapping.guest_start
@@ -2295,15 +2360,17 @@ fn map_region_raw(mapping: &GuestMapping) -> Result<HvfMappedRegion, TrapError> 
                 guest_start: mapping.guest_start,
                 mapped_size: mapping.mapped_size,
             })?;
+    let guest_shared = host_mapping.guest_shared();
     Ok(HvfMappedRegion {
         start: mapping.guest_start,
         end,
-        host_addr: host as *mut u8,
+        host_addr: host,
         size,
         perms,
         memory: None,
+        host_mapping: Some(host_mapping),
         // Private guest RAM (data/bss/heap/stack/MAP_PRIVATE): fork snapshots it.
-        guest_shared: false,
+        guest_shared,
     })
 }
 
@@ -2379,6 +2446,27 @@ fn seed_child_snapshot(parent: &VcpuSnapshot, stack: u64, tls: u64) -> VcpuSnaps
         child.tpidr_el0 = tls;
     }
     child
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(test)]
+mod memory_protection_tests {
+    use super::*;
+
+    #[test]
+    fn cloned_protection_metadata_shares_updates_across_thread_engines() {
+        let protections = std::sync::Arc::new(MemoryProtections::default());
+        let sibling = std::sync::Arc::clone(&protections);
+
+        protections.set_no_access(0x4000, 0x2000, true);
+        assert!(sibling.range_no_access(0x4fff, 1));
+
+        sibling.set_no_access(0x5000, 0x1000, false);
+        assert!(protections.range_no_access(0x4000, 1));
+        assert!(protections.range_no_access(0x4fff, 1));
+        assert!(!protections.range_no_access(0x5000, 1));
+        assert!(!protections.range_no_access(0x6000 - 1, 1));
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

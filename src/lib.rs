@@ -11,6 +11,8 @@ pub mod dtrace_consumer;
 pub mod elf;
 pub(crate) mod fork_coord;
 pub mod fs_backend;
+#[cfg(target_os = "macos")]
+pub(crate) mod host_mapping;
 pub mod host_proc;
 pub mod host_signal;
 pub mod host_tty;
