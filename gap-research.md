@@ -64,7 +64,8 @@ Work package progress:
 - [ ] Package 6. VFS and Stat Ownership
   - Completed L1: moved synthetic `/proc` and `/sys` file registration/rendering ownership into `vfs::proc` and `vfs::sys`; dispatcher now supplies live context only.
   - Verified VFS proc/sys unit tests plus existing synthetic `/proc` and `/sys` syscall-surface tests.
-  - Remaining: L2 fd operation helpers and L3 shared stat/statx record construction.
+  - Completed L2/L3: added an `OpenDescription::stat_source` helper and shared `StatRecord` writer path for `stat`, `fstat`, and `statx`.
+  - Verified `fstat` and `statx(AT_EMPTY_PATH)` now agree for eventfd, timerfd, epoll, pipe, and socket fds.
 - [ ] Hygiene gates and final verification sweep
 
 ## Executive Summary
@@ -517,7 +518,7 @@ Recommendation:
 
 Validation target:
 
-- Read/write/stat behavior changes can be tested against one fd operation layer instead of each syscall arm.
+- Read/write/stat behavior changes can be tested against one fd operation layer instead of each syscall arm. Completed for fd stat sources with `OpenDescription::stat_source`.
 
 ### L3. stat/statx construction is duplicated
 
@@ -535,7 +536,7 @@ Recommendation:
 
 Validation target:
 
-- Table-driven tests assert that `stat`, `fstat`, and `statx(AT_EMPTY_PATH)` agree for every fd kind where Linux expects agreement.
+- Table-driven tests assert that `stat`, `fstat`, and `statx(AT_EMPTY_PATH)` agree for every fd kind where Linux expects agreement. Completed for anonymous fd kinds that previously drifted.
 
 ### L4. Syscall metadata and routing can drift
 

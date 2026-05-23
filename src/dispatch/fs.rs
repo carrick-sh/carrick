@@ -5480,101 +5480,10 @@ impl SyscallDispatcher {
         statbuf: u64,
         memory: &mut impl GuestMemory,
     ) -> DispatchOutcome {
-        let Some(open_file) = self.open_file(fd) else {
-            if is_stdio_fd(fd) {
-                let (label, mode) = self.stdio_synthetic_label_mode(fd);
-                return write_synthetic_stat(memory, statbuf, &label, 0, mode);
-            }
-            return DispatchOutcome::Errno { errno: LINUX_EBADF };
-        };
-        let open = open_file.description.read();
-        let metadata = match &*open {
-            OpenDescription::File { metadata, .. }
-            | OpenDescription::Directory { metadata, .. } => metadata,
-            // Real host file: fstat the live fd for the REAL size AND times
-            // (atime/mtime/ctime). Using the live inode keeps fstat-by-fd
-            // consistent with statx/newfstatat-by-path (both go through real
-            // on-disk times) — required so apt's pkgcache mtime cross-check
-            // passes. Falling back to the stored metadata (which carries
-            // mtime=0) made `apt install` abort with "Cache is out of sync,
-            // can't x-ref a package file". See `real_stat_from_libc`.
-            OpenDescription::HostFile {
-                host_fd, metadata, ..
-            } => {
-                let path = metadata.path.to_string_lossy().into_owned();
-                let mut st: libc::stat = unsafe { std::mem::zeroed() };
-                if unsafe { libc::fstat(*host_fd, &mut st) } == 0 {
-                    let mut real = super::real_stat_from_libc(&st);
-                    // The real file's mode was forced owner-accessible; the
-                    // guest-visible mode + owner live in xattrs on the same fd.
-                    if let Some(m) = crate::fs_backend::fget_mode_xattr(*host_fd) {
-                        real.mode = m;
-                    }
-                    let (uid, gid) = crate::fs_backend::fget_owner_xattr(*host_fd);
-                    real.uid = uid.unwrap_or(0);
-                    real.gid = gid.unwrap_or(0);
-                    return write_stat_real(memory, statbuf, &path, &real);
-                }
-                // fstat failed: fall back to the stored metadata (size only).
-                return write_stat(memory, statbuf, metadata);
-            }
-            OpenDescription::SyntheticFile { path, contents, .. } => {
-                return write_synthetic_stat(
-                    memory,
-                    statbuf,
-                    path,
-                    contents.len(),
-                    LINUX_S_IFREG | 0o444,
-                );
-            }
-            // anon_inode fds (eventfd/timerfd/epoll) carry NO S_IFMT type
-            // bits on Linux — fstat reports st_mode with the type field 0,
-            // not S_IFREG. Match that so type-introspecting tools agree.
-            OpenDescription::EventFd { .. } => {
-                return write_synthetic_stat(memory, statbuf, "anon_inode:[eventfd]", 0, 0o600);
-            }
-            OpenDescription::TimerFd { .. } => {
-                return write_synthetic_stat(memory, statbuf, "anon_inode:[timerfd]", 0, 0o600);
-            }
-            OpenDescription::Epoll { .. } => {
-                return write_synthetic_stat(memory, statbuf, "anon_inode:[eventpoll]", 0, 0o600);
-            }
-            // Pipes are FIFOs and sockets are sockets — NOT regular files.
-            // Reporting S_IFREG made every pipe share one inode + look like
-            // a regular file, so `grep` in a pipeline aborted with "input
-            // file is also the output". The distinct type bits fix that.
-            //
-            // HostPipe covers both anonymous pipes AND pty fds. A pty is a
-            // CHARACTER DEVICE (S_IFCHR), not a FIFO; report S_IFCHR when the
-            // description carries a PtyRole, S_IFIFO otherwise.
-            OpenDescription::PipeReader { .. } | OpenDescription::PipeWriter { .. } => {
-                return write_synthetic_stat(
-                    memory,
-                    statbuf,
-                    "pipe:[carrick]",
-                    0,
-                    LINUX_S_IFIFO | 0o600,
-                );
-            }
-            OpenDescription::HostPipe { pty, .. } => {
-                let (label, type_bits) = if pty.is_some() {
-                    ("char:[carrick-pty]", LINUX_S_IFCHR)
-                } else {
-                    ("pipe:[carrick]", LINUX_S_IFIFO)
-                };
-                return write_synthetic_stat(memory, statbuf, label, 0, type_bits | 0o600);
-            }
-            OpenDescription::HostSocket { .. } | OpenDescription::Netlink { .. } => {
-                return write_synthetic_stat(
-                    memory,
-                    statbuf,
-                    "socket:[carrick]",
-                    0,
-                    LINUX_S_IFSOCK | 0o600,
-                );
-            }
-        };
-        write_stat(memory, statbuf, metadata)
+        match self.fd_stat_record(fd) {
+            Ok(record) => write_stat_record(memory, statbuf, &record),
+            Err(errno) => DispatchOutcome::Errno { errno },
+        }
     }
 
     fn write_fd_statx(
@@ -5583,74 +5492,43 @@ impl SyscallDispatcher {
         statxbuf: u64,
         memory: &mut impl GuestMemory,
     ) -> DispatchOutcome {
+        match self.fd_stat_record(fd) {
+            Ok(record) => write_statx_record(memory, statxbuf, &record),
+            Err(errno) => DispatchOutcome::Errno { errno },
+        }
+    }
+
+    fn fd_stat_record(&self, fd: i32) -> Result<StatRecord, i32> {
         let Some(open_file) = self.open_file(fd) else {
             if is_stdio_fd(fd) {
-                // Mirror write_fd_stat: synthesize a stat for bare stdio fds so
-                // statx(fd, AT_EMPTY_PATH) on the -t controlling tty matches
-                // fstat (S_IFCHR + the /dev/pts/N inode) instead of EBADF.
                 let (label, mode) = self.stdio_synthetic_label_mode(fd);
-                return write_synthetic_statx_mode(memory, statxbuf, &label, 0, mode);
+                return Ok(StatRecord::synthetic(&label, 0, mode));
             }
-            return DispatchOutcome::Errno { errno: LINUX_EBADF };
+            return Err(LINUX_EBADF);
         };
         let open = open_file.description.read();
-        let metadata = match &*open {
-            OpenDescription::File { metadata, .. }
-            | OpenDescription::Directory { metadata, .. } => metadata,
-            // Real host file: fstat the live fd for the REAL size AND times,
-            // matching `write_fd_stat`. Statx-by-fd MUST report the same
-            // mtime as fstat-by-fd (apt's pkgcache cross-check compares them);
-            // cloning the stored metadata carried a stale/zero mtime and made
-            // statx(AT_EMPTY_PATH) disagree with fstat. See `write_fd_stat`.
-            OpenDescription::HostFile {
-                host_fd, metadata, ..
-            } => {
+        let source = open.stat_source();
+        drop(open);
+        match source {
+            OpenStatSource::Record(record) => Ok(record),
+            OpenStatSource::HostFile { host_fd, metadata } => {
                 let path = metadata.path.to_string_lossy().into_owned();
                 let mut st: libc::stat = unsafe { std::mem::zeroed() };
-                if unsafe { libc::fstat(*host_fd, &mut st) } == 0 {
+                if unsafe { libc::fstat(host_fd, &mut st) } == 0 {
                     let mut real = super::real_stat_from_libc(&st);
-                    if let Some(m) = crate::fs_backend::fget_mode_xattr(*host_fd) {
+                    // The real file's mode was forced owner-accessible; the
+                    // guest-visible mode + owner live in xattrs on the same fd.
+                    if let Some(m) = crate::fs_backend::fget_mode_xattr(host_fd) {
                         real.mode = m;
                     }
-                    let (uid, gid) = crate::fs_backend::fget_owner_xattr(*host_fd);
+                    let (uid, gid) = crate::fs_backend::fget_owner_xattr(host_fd);
                     real.uid = uid.unwrap_or(0);
                     real.gid = gid.unwrap_or(0);
-                    return write_statx_real(memory, statxbuf, &path, &real);
+                    return Ok(StatRecord::from_real(&path, &real));
                 }
-                // fstat failed: fall back to the stored metadata (size only).
-                return write_statx(memory, statxbuf, metadata);
+                Ok(StatRecord::from_metadata(&metadata))
             }
-            OpenDescription::SyntheticFile { path, contents, .. } => {
-                return write_synthetic_statx(memory, statxbuf, path, contents.len());
-            }
-            OpenDescription::EventFd { .. } => {
-                return write_synthetic_statx(memory, statxbuf, "anon_inode:[eventfd]", 0);
-            }
-            OpenDescription::TimerFd { .. } => {
-                return write_synthetic_statx(memory, statxbuf, "anon_inode:[timerfd]", 0);
-            }
-            OpenDescription::Epoll { .. } => {
-                return write_synthetic_statx(memory, statxbuf, "anon_inode:[eventpoll]", 0);
-            }
-            OpenDescription::PipeReader { .. } | OpenDescription::PipeWriter { .. } => {
-                return write_synthetic_statx(memory, statxbuf, "pipe:[carrick]", 0);
-            }
-            // HostPipe covers anonymous pipes AND pty fds. Ptys are character
-            // devices (S_IFCHR); anonymous pipes are FIFOs. Use the statx helper
-            // with an explicit mode so statx agrees with fstat for pty fds.
-            OpenDescription::HostPipe { pty, .. } => {
-                let (label, type_bits) = if pty.is_some() {
-                    ("char:[carrick-pty]", LINUX_S_IFCHR)
-                } else {
-                    ("pipe:[carrick]", LINUX_S_IFIFO)
-                };
-                return write_synthetic_statx_mode(memory, statxbuf, label, 0, type_bits | 0o600);
-            }
-            OpenDescription::HostSocket { .. } | OpenDescription::Netlink { .. } => {
-                return write_synthetic_statx(memory, statxbuf, "socket:[carrick]", 0);
-            }
-        };
-        write_statx(memory, statxbuf, metadata)
+        }
     }
 
     fn resolve_at_path(&self, dirfd: u64, path: &str) -> Result<String, i32> {
