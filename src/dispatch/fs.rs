@@ -82,6 +82,31 @@ fn strict_durability_enabled() -> bool {
     std::env::var_os("CARRICK_STRICT_DURABILITY").is_some_and(|value| value != "0")
 }
 
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy)]
+struct HostFileCopyInfo {
+    host_fd: i32,
+    size: u64,
+    writable: bool,
+}
+
+#[cfg(target_os = "macos")]
+fn host_fd_offset(host_fd: i32) -> Option<u64> {
+    let offset = unsafe { libc::lseek(host_fd, 0, libc::SEEK_CUR) };
+    if offset < 0 {
+        return None;
+    }
+    Some(offset as u64)
+}
+
+#[cfg(target_os = "macos")]
+fn set_host_fd_offset(host_fd: i32, offset: u64) -> bool {
+    let Ok(offset) = libc::off_t::try_from(offset) else {
+        return false;
+    };
+    (unsafe { libc::lseek(host_fd, offset, libc::SEEK_SET) }) >= 0
+}
+
 impl FsState {
     pub(super) fn new() -> Self {
         let pty_table = std::sync::Arc::new(parking_lot::Mutex::new(crate::vfs::PtyTable::new()));
@@ -3099,6 +3124,17 @@ impl SyscallDispatcher {
             Ok(o) => o,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
+        #[cfg(target_os = "macos")]
+        if let Some(outcome) = self.try_darwin_copyfile_range_fast_path(
+            in_fd,
+            in_offset,
+            off_in_addr,
+            out_fd,
+            off_out_addr,
+            count,
+        )? {
+            return Ok(outcome);
+        }
         let bytes = match self.sendfile_bytes(in_fd, in_offset, count) {
             Ok(b) => b,
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
@@ -3189,6 +3225,90 @@ impl SyscallDispatcher {
 
         Ok(DispatchOutcome::Returned {
             value: written as i64,
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn try_darwin_copyfile_range_fast_path(
+        &self,
+        in_fd: i32,
+        in_offset: usize,
+        off_in_addr: u64,
+        out_fd: i32,
+        off_out_addr: u64,
+        count: usize,
+    ) -> Result<Option<DispatchOutcome>, DispatchError> {
+        if off_in_addr != 0 || off_out_addr != 0 || in_offset != 0 {
+            return Ok(None);
+        }
+
+        let Some(input) = self.host_file_copy_info(in_fd) else {
+            return Ok(None);
+        };
+        let Some(output) = self.host_file_copy_info(out_fd) else {
+            return Ok(None);
+        };
+        if !output.writable {
+            return Ok(Some(DispatchOutcome::Errno { errno: LINUX_EBADF }));
+        }
+        if input.size == 0
+            || output.size != 0
+            || count
+                < usize::try_from(input.size)
+                    .map_err(|_| DispatchError::LengthTooLarge(input.size))?
+        {
+            return Ok(None);
+        }
+        let (Some(input_offset), Some(output_offset)) = (
+            host_fd_offset(input.host_fd),
+            host_fd_offset(output.host_fd),
+        ) else {
+            return Ok(None);
+        };
+        if input_offset != 0 || output_offset != 0 {
+            return Ok(None);
+        }
+
+        match crate::darwin_fs::copyfile_clone_or_data(input.host_fd, output.host_fd, input.size) {
+            Ok(Some(result)) => {
+                let copied = result.bytes();
+                if !set_host_fd_offset(input.host_fd, copied)
+                    || !set_host_fd_offset(output.host_fd, copied)
+                {
+                    return Ok(None);
+                }
+                Ok(Some(DispatchOutcome::Returned {
+                    value: i64::try_from(copied)
+                        .map_err(|_| DispatchError::LengthTooLarge(copied))?,
+                }))
+            }
+            Ok(None) => Ok(None),
+            Err(errno) => Ok(Some(DispatchOutcome::Errno { errno })),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn host_file_copy_info(&self, fd: i32) -> Option<HostFileCopyInfo> {
+        let open_file = self.open_file(fd)?;
+        let open = open_file.description.read();
+        let OpenDescription::HostFile {
+            host_fd, writable, ..
+        } = &*open
+        else {
+            return None;
+        };
+        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe { libc::fstat(*host_fd, st.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        let st = unsafe { st.assume_init() };
+        if st.st_size < 0 {
+            return None;
+        }
+        Some(HostFileCopyInfo {
+            host_fd: *host_fd,
+            size: st.st_size as u64,
+            writable: *writable,
         })
     }
 

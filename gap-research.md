@@ -40,10 +40,10 @@ Work package progress:
   - Completed: blocking `eventfd` reads now wait and wake from writer updates while nonblocking reads still return `EAGAIN`.
   - Completed: `timerfd` reads now wait on timer state without holding the fd description lock, and `timerfd_settime` wakes blocked readers so re-arming changes their deadline.
 - [ ] Package 4. ABI and Flag Types
-- [ ] Package 5. Darwin Filesystem Leverage
+- [x] Package 5. Darwin Filesystem Leverage
   - Completed: `sync` now invokes the host sync primitive, and host-backed `fsync`/`fdatasync`/`syncfs` flush the real host fd with optional `CARRICK_STRICT_DURABILITY=1` `F_FULLFSYNC` on macOS.
   - Completed: `HostFsBackend::seed_from_rootfs` now materializes through its cap-std rooted `Dir` instead of re-entering through an ambient path.
-  - Remaining: add a bounded APFS `copyfile`/clone fast path for host-backed `copy_file_range`.
+  - Completed: host-backed whole-file `copy_file_range` now tries Darwin `copyfile` before the bounded generic copy path; existing `msync` routing covers real MAP_SHARED file mappings.
 - [ ] Package 6. VFS and Stat Ownership
 - [ ] Hygiene gates and final verification sweep
 
