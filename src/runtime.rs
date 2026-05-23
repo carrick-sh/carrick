@@ -785,6 +785,9 @@ fn run_vcpu_until_exit(
     let mut waiter = crate::io_wait::ThreadWaiter::new(this_tid);
     // Publish this thread's vCPU so siblings can kick it out of the guest.
     kicker.register(this_tid, engine.vcpu_kick_handle());
+    // Record this host thread's mach port so /proc/<tid>/stat can read the
+    // run/sleep state straight from the kernel (no hand-tracked flag).
+    registry.record_thread_port(this_tid, crate::host_proc::current_thread_port());
     for traps in 1..=max_traps {
         // ---- vCPU run: NO dispatcher lock held ----
         let frame = match engine.next_syscall()? {
@@ -833,23 +836,17 @@ fn run_vcpu_until_exit(
                     fds,
                     timeout,
                     on_timeout,
-                } => {
-                    // Parked on host fds → publish 'S' for /proc/<tid>/stat.
-                    registry.set_sleeping(this_tid, true);
-                    let r = waiter.wait(&fds, timeout);
-                    registry.set_sleeping(this_tid, false);
-                    match r {
-                        crate::io_wait::WaitResult::Ready => continue,
-                        crate::io_wait::WaitResult::TimedOut => {
-                            break DispatchOutcome::Returned { value: on_timeout };
-                        }
-                        crate::io_wait::WaitResult::Interrupted => {
-                            break DispatchOutcome::Errno {
-                                errno: crate::linux_abi::LINUX_EINTR,
-                            };
-                        }
+                } => match waiter.wait(&fds, timeout) {
+                    crate::io_wait::WaitResult::Ready => continue,
+                    crate::io_wait::WaitResult::TimedOut => {
+                        break DispatchOutcome::Returned { value: on_timeout };
                     }
-                }
+                    crate::io_wait::WaitResult::Interrupted => {
+                        break DispatchOutcome::Errno {
+                            errno: crate::linux_abi::LINUX_EINTR,
+                        };
+                    }
+                },
                 other => break other,
             }
         };
@@ -903,9 +900,6 @@ fn run_vcpu_until_exit(
                 // Interrupt the wait only for a signal deliverable to THIS
                 // thread (its own tgkill target or a process-directed one) —
                 // not a sibling's, which would surface a spurious EINTR.
-                // Publish this thread as sleeping so a peer polling
-                // /proc/<tid>/stat sees 'S' (LTP futex_wait03/wake02).
-                registry.set_sleeping(this_tid, true);
                 let retval: i64 =
                     match futex.wait_prepared_for_thread(wait, timeout, this_tid, &|| {
                         crate::host_signal::has_pending_for(this_tid)
@@ -914,7 +908,6 @@ fn run_vcpu_until_exit(
                         FutexWaitOutcome::TimedOut => -(crate::linux_abi::LINUX_ETIMEDOUT as i64),
                         FutexWaitOutcome::Interrupted => -(crate::linux_abi::LINUX_EINTR as i64),
                     };
-                registry.set_sleeping(this_tid, false);
                 engine.complete_syscall(retval)?;
                 last_syscall_retval = Some(retval);
             }
@@ -926,9 +919,7 @@ fn run_vcpu_until_exit(
                 // Cross-process futex (MAP_SHARED): block on the host __ulock
                 // keyed by the shared physical page, with the dispatcher lock
                 // released. Interruptible by a signal deliverable to this thread.
-                registry.set_sleeping(this_tid, true);
                 let retval = shared_futex_wait(host_addr, value, timeout, this_tid);
-                registry.set_sleeping(this_tid, false);
                 engine.complete_syscall(retval)?;
                 last_syscall_retval = Some(retval);
             }
@@ -1136,6 +1127,8 @@ fn run_vcpu_until_exit(
                             // handle under its new tid (the inherited map's
                             // parent entries point at dead vCPUs and are inert).
                             kicker.register(this_tid, engine.vcpu_kick_handle());
+                            registry
+                                .record_thread_port(this_tid, crate::host_proc::current_thread_port());
                             // The signal-pump daemon (which forces a vCPU out of
                             // hv_vcpu_run on a process-directed signal) does not
                             // survive fork — only the calling thread does. Without

@@ -135,6 +135,44 @@ mod imp {
         }
     }
 
+    /// Linux state char for a single host thread, read from the kernel via
+    /// `thread_info(THREAD_BASIC_INFO)` — `run_state` tells us whether the
+    /// thread is RUNNING or WAITING. Used for `/proc/<tid>/stat` of THIS
+    /// process's threads, so we don't track a per-thread "sleeping" flag by
+    /// hand (the kernel is the source of truth and covers every blocking path).
+    /// `port` is the thread's mach port (from `pthread_mach_thread_np`).
+    pub fn thread_run_state_char(port: libc::mach_port_t) -> char {
+        let mut info: libc::thread_basic_info = unsafe { std::mem::zeroed() };
+        let mut count = libc::THREAD_BASIC_INFO_COUNT;
+        // SAFETY: thread_info writes a thread_basic_info; we pass the matching
+        // flavor + count and a correctly-typed zeroed buffer.
+        let kr = unsafe {
+            libc::thread_info(
+                port,
+                libc::THREAD_BASIC_INFO as libc::thread_flavor_t,
+                &mut info as *mut _ as libc::thread_info_t,
+                &mut count,
+            )
+        };
+        if kr != libc::KERN_SUCCESS {
+            return 'R';
+        }
+        match info.run_state {
+            libc::TH_STATE_WAITING | libc::TH_STATE_HALTED => 'S',
+            libc::TH_STATE_STOPPED => 'T',
+            libc::TH_STATE_UNINTERRUPTIBLE => 'D',
+            // TH_STATE_RUNNING and anything unexpected → running.
+            _ => 'R',
+        }
+    }
+
+    /// This thread's mach port (no ownership transfer — safe to store for the
+    /// thread's lifetime without deallocating).
+    pub fn current_thread_port() -> libc::mach_port_t {
+        // SAFETY: pthread_mach_thread_np on the current pthread is always valid.
+        unsafe { libc::pthread_mach_thread_np(libc::pthread_self()) }
+    }
+
     pub fn pid_info(pid: u32) -> Option<GuestProcInfo> {
         let info = bsdinfo(pid)?;
         Some(GuestProcInfo {
@@ -180,6 +218,18 @@ mod imp {
     pub fn is_descendant_of_self(_pid: u32) -> bool {
         false
     }
+    pub fn thread_run_state_char(_port: u32) -> char {
+        'R'
+    }
+    pub fn current_thread_port() -> u32 {
+        0
+    }
 }
 
-pub use imp::{is_descendant_of_self, pid_info};
+pub use imp::{current_thread_port, is_descendant_of_self, pid_info, thread_run_state_char};
+
+/// Mach port type alias for the registry (real on macOS, u32 elsewhere).
+#[cfg(target_os = "macos")]
+pub type ThreadPort = libc::mach_port_t;
+#[cfg(not(target_os = "macos"))]
+pub type ThreadPort = u32;
