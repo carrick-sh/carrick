@@ -2182,6 +2182,25 @@ fn dispatch_threaded_unhandled(
     outcome
 }
 
+/// Convert an ABSOLUTE futex deadline (FUTEX_WAIT_BITSET) to the remaining
+/// duration from now, on the host monotonic clock (or realtime when
+/// FUTEX_CLOCK_REALTIME is set). Clamps to zero if already past — Linux then
+/// returns ETIMEDOUT immediately.
+fn relative_from_absolute_timespec(tv_sec: i64, tv_nsec: i64, realtime: bool) -> Duration {
+    let abs_ns = (tv_sec as i128) * 1_000_000_000 + tv_nsec as i128;
+    let clock = if realtime {
+        libc::CLOCK_REALTIME
+    } else {
+        libc::CLOCK_MONOTONIC
+    };
+    let mut now: libc::timespec = unsafe { std::mem::zeroed() };
+    // SAFETY: clock_gettime writes a timespec for a valid clock id.
+    unsafe { libc::clock_gettime(clock, &mut now) };
+    let now_ns = (now.tv_sec as i128) * 1_000_000_000 + now.tv_nsec as i128;
+    let rel_ns = (abs_ns - now_ns).max(0);
+    Duration::from_nanos(rel_ns.min(u64::MAX as i128) as u64)
+}
+
 fn dispatch_threaded_futex(
     request: SyscallRequest,
     memory: &impl GuestMemory,
@@ -2263,9 +2282,21 @@ fn dispatch_threaded_futex(
                     Ok(t) => t,
                     Err(errno) => return DispatchOutcome::Errno { errno },
                 };
-                match duration_from_linux_timespec(timespec) {
-                    Ok(t) => t,
-                    Err(errno) => return DispatchOutcome::Errno { errno },
+                // FUTEX_WAIT uses a RELATIVE timeout; FUTEX_WAIT_BITSET uses an
+                // ABSOLUTE deadline (CLOCK_MONOTONIC, or CLOCK_REALTIME if
+                // FUTEX_CLOCK_REALTIME) — convert it to the remaining duration,
+                // else the wait would block until now+deadline ≈ forever.
+                if raw_command == LINUX_FUTEX_WAIT_BITSET {
+                    Some(relative_from_absolute_timespec(
+                        timespec.tv_sec,
+                        timespec.tv_nsec,
+                        flags & LINUX_FUTEX_CLOCK_REALTIME != 0,
+                    ))
+                } else {
+                    match duration_from_linux_timespec(timespec) {
+                        Ok(t) => t,
+                        Err(errno) => return DispatchOutcome::Errno { errno },
+                    }
                 }
             };
             if let Some(host_addr) = shared_host_addr {
