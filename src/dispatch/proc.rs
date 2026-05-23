@@ -92,7 +92,7 @@ impl SyscallDispatcher {
         let name = syscall.map_or("unknown", |syscall| syscall.name);
         reporter.record(CompatEvent::SyscallEntry {
             number: request.number,
-            name: name.to_owned(),
+            name: ::std::borrow::Cow::Borrowed(name),
             args: request.args,
         });
 
@@ -122,7 +122,7 @@ impl SyscallDispatcher {
         let (retval, errno) = outcome.retval_errno();
         reporter.record(CompatEvent::SyscallReturn {
             number: request.number,
-            name: name.to_owned(),
+            name: ::std::borrow::Cow::Borrowed(name),
             retval,
             errno,
         });
