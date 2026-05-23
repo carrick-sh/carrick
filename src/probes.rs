@@ -26,6 +26,8 @@ mod carrick_usdt {
     fn proc__read__unimplemented(_: &str) {}
     fn sys__read__unimplemented(_: &str) {}
     fn signal__unsupported(_: i32, _: &str) {}
+    // pid, signum, generation — fires when an interval-timer thread publishes.
+    fn itimer__fire(_: u32, _: i32, _: u64) {}
     /// Fires on every guest syscall that passes flag bits we don't
     /// recognise. Catches Linux ABI drift loudly instead of letting
     /// the dispatcher silently drop behaviour the guest expected.
@@ -142,6 +144,10 @@ pub fn fork_pre(pc: u64, elr: u64, cpsr: u64) {
 // is genuinely zero-cost when no DTrace consumer is attached.
 pub fn path_open(path: &str, result_size: u64, errno: i32) {
     carrick_usdt::path__open!(|| (libc::getpid() as u32, path, result_size, errno));
+}
+
+pub fn itimer_fire(signum: i32, generation: u64) {
+    carrick_usdt::itimer__fire!(|| (libc::getpid() as u32, signum, generation));
 }
 
 pub fn guest_exit(code: i32) {

@@ -680,6 +680,7 @@ fn spawn_itimer_thread(
                 if gen_arc[idx].load(Ordering::SeqCst) != my_gen {
                     return;
                 }
+                crate::probes::itimer_fire(signum, my_gen);
                 crate::host_signal::publish_process_signal(signum);
                 if interval.is_zero() {
                     return;
