@@ -6,6 +6,17 @@
 //! our own descendants (validated by walking the ppid chain up to this
 //! process), so a guest can't probe arbitrary host processes.
 
+/// Host pid of the ROOT guest process, recorded once at startup before any
+/// guest fork. A pid is a "guest process" (and thus exposable via `/proc`) iff
+/// its host ppid chain reaches this. 0 = unset (single-process `run-elf`, where
+/// the per-process self check suffices).
+static ROOT_GUEST_PID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Record the root guest's host pid (called once at carrick startup).
+pub fn set_root_guest_pid(pid: u32) {
+    ROOT_GUEST_PID.store(pid, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Identity + state of a guest process, read from the host kernel.
 #[derive(Debug, Clone)]
 pub struct GuestProcInfo {
@@ -185,25 +196,34 @@ mod imp {
         })
     }
 
-    /// True iff `pid` is a (transitive) child of THIS process — walk the ppid
-    /// chain up. Bounded so a cycle / unexpected tree can't loop forever.
-    pub fn is_descendant_of_self(pid: u32) -> bool {
-        let me = std::process::id();
-        if pid == me || pid == 0 {
+    /// True iff `pid` is a carrick GUEST process: walk its host ppid chain and
+    /// see if it reaches the root guest pid (or this process — covers the
+    /// single-process `run-elf` case where the root isn't recorded). Any guest
+    /// process may read any other guest's `/proc` (LTP futex_wait02 has a child
+    /// read its parent's stat), but a non-guest host process is never exposed.
+    /// Bounded so a cycle / unexpected tree can't loop forever.
+    pub fn is_guest_process(pid: u32) -> bool {
+        if pid == 0 {
             return false;
         }
+        let me = std::process::id();
+        let root = super::ROOT_GUEST_PID.load(std::sync::atomic::Ordering::Relaxed);
+        if pid == root {
+            return true;
+        }
         let mut cur = pid;
-        for _ in 0..64 {
+        for _ in 0..256 {
             let Some(info) = bsdinfo(cur) else {
                 return false;
             };
-            if info.pbi_ppid == me {
+            let pp = info.pbi_ppid;
+            if pp == me || (root != 0 && pp == root) {
                 return true;
             }
-            if info.pbi_ppid == 0 || info.pbi_ppid == cur {
+            if pp == 0 || pp == cur {
                 return false;
             }
-            cur = info.pbi_ppid;
+            cur = pp;
         }
         false
     }
@@ -215,7 +235,7 @@ mod imp {
     pub fn pid_info(_pid: u32) -> Option<GuestProcInfo> {
         None
     }
-    pub fn is_descendant_of_self(_pid: u32) -> bool {
+    pub fn is_guest_process(_pid: u32) -> bool {
         false
     }
     pub fn thread_run_state_char(_port: u32) -> char {
@@ -226,7 +246,7 @@ mod imp {
     }
 }
 
-pub use imp::{current_thread_port, is_descendant_of_self, pid_info, thread_run_state_char};
+pub use imp::{current_thread_port, is_guest_process, pid_info, thread_run_state_char};
 
 /// Mach port type alias for the registry (real on macOS, u32 elsewhere).
 #[cfg(target_os = "macos")]

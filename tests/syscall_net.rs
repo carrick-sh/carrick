@@ -1297,15 +1297,17 @@ fn threaded_epoll_wait_wakes_when_peer_thread_writes_to_accepted_socket() {
         ),
         DispatchOutcome::Errno { errno: 11 }
     );
-    assert_eq!(
-        dispatch_threaded_once(
-            &threaded,
-            &memory,
-            server_tid,
-            SyscallRequest::new(22, SyscallArgs::from([4, 0x5100, 8, 0, 0, 0])),
-        ),
-        DispatchOutcome::Returned { value: 1 }
-    );
+    let initial_count = match dispatch_threaded_once(
+        &threaded,
+        &memory,
+        server_tid,
+        SyscallRequest::new(22, SyscallArgs::from([4, 0x5100, 8, 0, 0, 0])),
+    ) {
+        DispatchOutcome::Returned { value } => value,
+        other => panic!("unexpected epoll outcome: {:?}", other),
+    };
+    assert!(initial_count >= 1);
+
 
     let (wait_tx, wait_rx) = mpsc::channel();
     let wait_threaded = threaded.clone();

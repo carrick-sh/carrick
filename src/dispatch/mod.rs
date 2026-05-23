@@ -3397,7 +3397,7 @@ Pid:\t{pid}\nPPid:\t{ppid}\nThreads:\t{n}\n",
         }
     }
 
-    if !crate::host_proc::is_descendant_of_self(pid) {
+    if !crate::host_proc::is_guest_process(pid) {
         return None;
     }
     let info = crate::host_proc::pid_info(pid)?;
@@ -3449,7 +3449,7 @@ pub fn synthetic_proc_task_dir(pid: u32) -> Option<Vec<String>> {
     if own.iter().any(|(t, _)| *t as u32 == pid) {
         return Some(own.iter().map(|(t, _)| t.to_string()).collect());
     }
-    if crate::host_proc::is_descendant_of_self(pid) {
+    if crate::host_proc::is_guest_process(pid) {
         return Some(vec![pid.to_string()]);
     }
     None
