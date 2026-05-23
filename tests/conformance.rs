@@ -626,3 +626,55 @@ fn conformance_probes() {
     );
     assert!(failures.is_empty(), "probe conformance gaps: {failures:?}");
 }
+
+#[test]
+fn conformance_go_fixture() {
+    let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    use base64::Engine as _;
+
+    let Some(bin) = carrick_bin() else {
+        eprintln!("SKIP conformance_go_fixture: target/release/carrick not built");
+        return;
+    };
+
+    let docker_ok = Command::new("docker")
+        .arg("version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !docker_ok {
+        eprintln!("SKIP conformance_go_fixture: Docker not reachable");
+        return;
+    }
+
+    ensure_signed(&bin);
+
+    let output = std::process::Command::new("scripts/build-go-fixtures.sh")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "Go fixture build failed");
+
+    let go_artifact = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures/go-aarch64-hello/target/release/carrick-linux-aarch64-go-hello");
+
+    let raw = std::fs::read(&go_artifact).expect("read Go binary");
+    let engine = base64::engine::general_purpose::STANDARD;
+    let encoded = engine.encode(&raw).into_bytes();
+
+    let carrick_out = run_carrick_probe(&bin, &encoded);
+    let docker_out = match run_docker_probe(&encoded) {
+        Ok(o) => o,
+        Err(e) => {
+            panic!("Docker run failed: {e}");
+        }
+    };
+
+    if let Some(diff) = diff_lines(&carrick_out, &docker_out) {
+        panic!("Go fixture conformance mismatch:\n{diff}");
+    } else {
+        println!("PASS conformance_go_fixture");
+    }
+}
+

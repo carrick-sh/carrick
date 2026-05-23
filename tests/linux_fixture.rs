@@ -454,3 +454,60 @@ fn builds_static_linux_aarch64_hello_fixture() {
             && plan.entry < segment.virtual_address + segment.memory_size
     }));
 }
+
+#[test]
+fn builds_static_linux_aarch64_go_hello_fixture() {
+    let output = std::process::Command::new("scripts/build-go-fixtures.sh")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "Go fixture build failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let go_artifact = "fixtures/go-aarch64-hello/target/release/carrick-linux-aarch64-go-hello";
+    let metadata = inspect_elf(go_artifact).unwrap();
+    assert_eq!(metadata.machine, Machine::Aarch64);
+    assert_eq!(metadata.e_type, ElfType::Dyn);
+
+    let plan = plan_elf_load(go_artifact).unwrap();
+    assert!(!plan.segments.is_empty());
+}
+
+#[test]
+fn run_static_go_hello_under_carrick() {
+    let output = std::process::Command::new("scripts/build-go-fixtures.sh")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "Go fixture build failed");
+
+    let go_artifact = "fixtures/go-aarch64-hello/target/release/carrick-linux-aarch64-go-hello";
+
+    let output = assert_cmd::Command::cargo_bin("carrick")
+        .unwrap()
+        .args([
+            "run-elf",
+            go_artifact,
+            "--max-traps",
+            "1000",
+        ])
+        .output()
+        .unwrap();
+
+    if output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("\"exit_code\": 0"), "unexpected exit code in json: {}", stdout);
+        assert!(stdout.contains("hello from Go under carrick"), "expected Go greeting: {}", stdout);
+        assert!(stdout.contains("Worker"), "expected worker concurrency output: {}", stdout);
+        assert!(stdout.contains("Map lookup: first=10, second=20"), "expected map output: {}", stdout);
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("Hypervisor.framework"),
+            "unexpected run-elf failure:\n{stderr}"
+        );
+    }
+}
+
