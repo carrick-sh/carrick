@@ -175,6 +175,11 @@ pub fn forget_thread(tid: i32) {
 /// no 50ms poll, and no reliance on `SA_RESTART`/EINTR. `-1` until initialised.
 static PENDING_PIPE_READ: AtomicI32 = AtomicI32::new(-1);
 static PENDING_PIPE_WRITE: AtomicI32 = AtomicI32::new(-1);
+/// Dedicated async-signal-safe wake pipe for the signal pump. This must be
+/// separate from the waiter self-pipe so a blocking I/O waiter cannot drain the
+/// only byte that should kick vCPUs out of guest userspace.
+static PUMP_PIPE_READ: AtomicI32 = AtomicI32::new(-1);
+static PUMP_PIPE_WRITE: AtomicI32 = AtomicI32::new(-1);
 /// kqueue fd of this process's signal pump, holding an `EVFILT_USER` (ident 0)
 /// the pump blocks on. `notify_pump` triggers it (`NOTE_TRIGGER`) to wake the
 /// pump from a NORMAL thread (e.g. an interval-timer thread) without the
@@ -221,22 +226,38 @@ pub fn pending_pipe_read_fd() -> i32 {
     PENDING_PIPE_READ.load(Ordering::SeqCst)
 }
 
+/// Read end of the signal pump's dedicated wake pipe.
+pub fn pump_pipe_read_fd() -> i32 {
+    PUMP_PIPE_READ.load(Ordering::SeqCst)
+}
+
 /// Create (or recreate) the self-pipe. If already open the old ends are closed
 /// first (used by `reinit_after_fork`). Both ends are non-blocking + CLOEXEC.
 fn open_pending_pipe() {
+    let Some((read_fd, write_fd)) = open_internal_pipe() else {
+        return;
+    };
+    replace_pipe(&PENDING_PIPE_READ, &PENDING_PIPE_WRITE, read_fd, write_fd);
+
+    if let Some((pump_read, pump_write)) = open_internal_pipe() {
+        replace_pipe(&PUMP_PIPE_READ, &PUMP_PIPE_WRITE, pump_read, pump_write);
+    }
+}
+
+fn open_internal_pipe() -> Option<(i32, i32)> {
     let mut raw_fds = [0i32; 2];
     let rc = unsafe { libc::pipe(raw_fds.as_mut_ptr()) };
     if rc != 0 {
-        return;
+        return None;
     }
     let Some(read_fd) = duplicate_internal_fd(raw_fds[0]) else {
         close_raw_fds(&raw_fds);
-        return;
+        return None;
     };
     let Some(write_fd) = duplicate_internal_fd(raw_fds[1]) else {
         unsafe { libc::close(read_fd) };
         close_raw_fds(&raw_fds);
-        return;
+        return None;
     };
     close_raw_fds(&raw_fds);
 
@@ -252,8 +273,12 @@ fn open_pending_pipe() {
             }
         }
     }
-    let old_r = PENDING_PIPE_READ.swap(read_fd, Ordering::SeqCst);
-    let old_w = PENDING_PIPE_WRITE.swap(write_fd, Ordering::SeqCst);
+    Some((read_fd, write_fd))
+}
+
+fn replace_pipe(read_slot: &AtomicI32, write_slot: &AtomicI32, read_fd: i32, write_fd: i32) {
+    let old_r = read_slot.swap(read_fd, Ordering::SeqCst);
+    let old_w = write_slot.swap(write_fd, Ordering::SeqCst);
     if old_r >= 0 && old_r != read_fd && old_r != write_fd {
         unsafe { libc::close(old_r) };
     }
@@ -353,6 +378,13 @@ fn notify_pending() {
             libc::write(w, byte.as_ptr() as *const libc::c_void, 1);
         }
     }
+    let pump = PUMP_PIPE_WRITE.load(Ordering::SeqCst);
+    if pump >= 0 {
+        let byte = [1u8];
+        unsafe {
+            libc::write(pump, byte.as_ptr() as *const libc::c_void, 1);
+        }
+    }
 }
 
 /// Drain the self-pipe (non-blocking). Called by a waiter after it observes the
@@ -360,6 +392,21 @@ fn notify_pending() {
 /// drains across threads are harmless — `has_pending` is the source of truth.
 pub fn drain_pending_pipe() {
     let r = PENDING_PIPE_READ.load(Ordering::SeqCst);
+    if r < 0 {
+        return;
+    }
+    let mut buf = [0u8; 64];
+    loop {
+        let n = unsafe { libc::read(r, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        if n <= 0 {
+            break;
+        }
+    }
+}
+
+/// Drain the signal pump's dedicated wake pipe.
+pub fn drain_pump_pipe() {
+    let r = PUMP_PIPE_READ.load(Ordering::SeqCst);
     if r < 0 {
         return;
     }
@@ -512,6 +559,49 @@ mod tests {
     // shared lock serialises them; each drains `PENDING` on entry. The
     // THREAD_PENDING map is keyed by disjoint high tids per test.
     static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn waiter_and_pump_signal_pipes_are_distinct() {
+        let _g = TEST_LOCK.lock().unwrap();
+        reset_after_supervisor_fork();
+        let waiter_read = pending_pipe_read_fd();
+        let pump_read = pump_pipe_read_fd();
+
+        assert!(waiter_read >= 0);
+        assert!(pump_read >= 0);
+        assert_ne!(waiter_read, pump_read);
+    }
+
+    #[test]
+    fn waiter_pipe_drain_does_not_consume_pump_wake() {
+        let _g = TEST_LOCK.lock().unwrap();
+        reset_after_supervisor_fork();
+        PENDING.store(NO_PENDING_SIGNAL, Ordering::SeqCst);
+
+        publish_pending(LINUX_SIGINT);
+        assert!(pipe_is_readable(pending_pipe_read_fd()));
+        assert!(pipe_is_readable(pump_pipe_read_fd()));
+
+        drain_pending_pipe();
+        assert!(!pipe_is_readable(pending_pipe_read_fd()));
+        assert!(pipe_is_readable(pump_pipe_read_fd()));
+
+        drain_pump_pipe();
+        assert!(!pipe_is_readable(pump_pipe_read_fd()));
+        PENDING.store(NO_PENDING_SIGNAL, Ordering::SeqCst);
+    }
+
+    fn pipe_is_readable(fd: i32) -> bool {
+        assert!(fd >= 0);
+        let mut pollfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut pollfd, 1, 0) };
+        assert!(rc >= 0);
+        rc > 0 && (pollfd.revents & libc::POLLIN) != 0
+    }
 
     #[test]
     fn thread_directed_takes_priority_for_its_tid() {

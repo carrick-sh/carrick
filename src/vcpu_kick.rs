@@ -144,20 +144,20 @@ fn kick_ids(ids: &[u64]) {
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 fn kick_ids(_ids: &[u64]) {}
 
-/// Spawn a daemon thread that, whenever a signal is published (the
-/// `host_signal` self-pipe becomes readable), forces every registered vCPU out
-/// of `hv_vcpu_run`. This delivers a *process-directed* signal (host SIGINT, a
-/// cross-process kill) promptly to threads spinning in guest userspace — the
-/// case the self-pipe alone can't cover, since a thread in-guest isn't parked
-/// in `kevent`. Threads parked in a blocking syscall are still woken by the
-/// pipe directly; this only adds the in-guest kick. The thread runs until the
-/// process exits (no join — it holds only an `Arc` clone of the kicker).
+/// Spawn a daemon thread that, whenever a signal is published, forces every
+/// registered vCPU out of `hv_vcpu_run`. This delivers a *process-directed*
+/// signal (host SIGINT, a cross-process kill) promptly to threads spinning in
+/// guest userspace — the case the waiter self-pipe alone can't cover, since a
+/// thread in-guest isn't parked in `kevent`. Threads parked in a blocking
+/// syscall are still woken by their separate waiter pipe directly; this only
+/// adds the in-guest kick. The thread runs until the process exits (no join —
+/// it holds only an `Arc` clone of the kicker).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub fn spawn_signal_pump(
     kicker: std::sync::Arc<VcpuKicker>,
     futex: std::sync::Arc<crate::thread::FutexTable>,
 ) {
-    let pipe = crate::host_signal::pending_pipe_read_fd();
+    let pipe = crate::host_signal::pump_pipe_read_fd();
     if pipe < 0 {
         return;
     }
@@ -173,10 +173,10 @@ pub fn spawn_signal_pump(
             // with NO timeout so the process genuinely sleeps when idle (a
             // poll would keep it SRUN and confound /proc/<pid>/stat):
             //
-            //  * EVFILT_READ on the self-pipe — woken by a signal published
-            //    from a HOST signal handler (async-signal-safe pipe write),
-            //    e.g. SIGINT or a cross-process kill. Sparse, so the
-            //    "EV_CLEAR doesn't re-fire an undrained pipe" quirk is benign.
+            //  * EVFILT_READ on the dedicated pump pipe — woken by a signal
+            //    published from a HOST signal handler (async-signal-safe pipe
+            //    write), e.g. SIGINT or a cross-process kill. This pipe is not
+            //    watched or drained by blocking-I/O waiters.
             //  * EVFILT_USER (ident 0) — woken by `notify_pump` (NOTE_TRIGGER)
             //    from a normal thread, e.g. an interval-timer firing SIGALRM
             //    thousands of times into a guest busy-waiting in userspace.
@@ -238,6 +238,11 @@ pub fn spawn_signal_pump(
                         continue;
                     }
                     break;
+                }
+                for event in out.iter().take(n as usize) {
+                    if event.filter == libc::EVFILT_READ {
+                        crate::host_signal::drain_pump_pipe();
+                    }
                 }
                 let pending_threads = crate::host_signal::pending_thread_tids();
                 if crate::host_signal::has_process_pending() {
