@@ -346,6 +346,7 @@ use serde::Serialize;
 use thiserror::Error;
 use zerocopy::{FromBytes, IntoBytes};
 
+mod abi_args;
 mod creds;
 mod fs;
 mod mem;
@@ -354,6 +355,7 @@ mod proc;
 mod signal;
 mod time;
 
+pub use abi_args::{Fd, GuestLen, GuestPtr, Pid};
 pub use crate::vfs::ProcMapsEntry;
 
 #[allow(dead_code)]
@@ -540,6 +542,12 @@ pub enum DispatchOutcome {
 }
 
 impl DispatchOutcome {
+    /// Construct an errno outcome. The guest receives `-errno`.
+    #[inline]
+    pub fn errno(errno: i32) -> Self {
+        DispatchOutcome::Errno { errno }
+    }
+
     fn retval_errno(&self) -> (i64, Option<i32>) {
         match self {
             DispatchOutcome::Returned { value } => (*value, None),
@@ -558,6 +566,13 @@ impl DispatchOutcome {
             DispatchOutcome::SharedFutexWait { .. } => (0, None),
             DispatchOutcome::WaitOnFds { .. } => (0, None),
         }
+    }
+}
+
+impl From<i32> for DispatchOutcome {
+    #[inline]
+    fn from(errno: i32) -> Self {
+        DispatchOutcome::Errno { errno }
     }
 }
 
