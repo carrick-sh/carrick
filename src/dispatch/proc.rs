@@ -40,6 +40,79 @@ pub(super) struct ProcState {
     /// a wall-clock thread (carrick has no per-process CPU-time accounting).
     pub itimers: [Option<ItimerState>; 3],
     pub itimer_gen: std::sync::Arc<[std::sync::atomic::AtomicU64; 3]>,
+    /// CPU affinity mask, one bit per logical CPU (word 0 holds CPUs 0..64).
+    /// Seeded to "all online CPUs" (`hw.logicalcpu` low bits set) so
+    /// `sched_getaffinity` reports the real core count — the Go runtime sizes
+    /// `GOMAXPROCS` from its population count, and `nproc`/OpenMP read it too.
+    /// `sched_setaffinity` updates it (intersected with the online set) so a
+    /// set→get round-trips; Apple Silicon scheduling is advisory, so we honour
+    /// the observable mask without physically pinning the host thread. Affinity
+    /// is inherited across `fork`, which the address-space copy gives us for
+    /// free. See [[host_facts]].
+    pub affinity: Vec<u64>,
+}
+
+/// Default affinity mask for `ncpu` logical CPUs: the low `ncpu` bits set
+/// across `ceil(ncpu/64)` 64-bit words.
+pub(super) fn default_affinity(ncpu: usize) -> Vec<u64> {
+    let words = ncpu.div_ceil(64).max(1);
+    let mut mask = vec![0u64; words];
+    for cpu in 0..ncpu {
+        mask[cpu / 64] |= 1u64 << (cpu % 64);
+    }
+    mask
+}
+
+/// Serialize an affinity word-mask into exactly `out_len` little-endian bytes
+/// (the kernel's `cpumask_size`), truncating or zero-padding as needed.
+pub(super) fn affinity_to_bytes(mask: &[u64], out_len: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; out_len];
+    for (i, word) in mask.iter().enumerate() {
+        let off = i * 8;
+        if off >= out_len {
+            break;
+        }
+        let wb = word.to_le_bytes();
+        let n = (out_len - off).min(8);
+        buf[off..off + n].copy_from_slice(&wb[..n]);
+    }
+    buf
+}
+
+/// Classification of a sched_*affinity `pid` argument relative to the caller.
+enum AffinityTarget {
+    /// 0 or the caller's own pid.
+    SelfProc,
+    /// Another process/thread in the guest tree.
+    OtherGuest,
+    /// No such guest task — ESRCH.
+    NotFound,
+}
+
+/// Lowest CPU index set in a word-mask, or `None` if empty.
+pub(super) fn lowest_set_cpu(mask: &[u64]) -> Option<u32> {
+    for (i, word) in mask.iter().enumerate() {
+        if *word != 0 {
+            return Some((i as u32) * 64 + word.trailing_zeros());
+        }
+    }
+    None
+}
+
+/// Parse a little-endian CPU bitmask from user bytes into `words` 64-bit words.
+pub(super) fn affinity_from_bytes(bytes: &[u8], words: usize) -> Vec<u64> {
+    let mut mask = vec![0u64; words.max(1)];
+    for (i, w) in mask.iter_mut().enumerate() {
+        let off = i * 8;
+        if off >= bytes.len() {
+            break;
+        }
+        let mut wb = [0u8; 8];
+        let n = (bytes.len() - off).min(8);
+        wb[..n].copy_from_slice(&bytes[off..off + n]);
+        *w = u64::from_le_bytes(wb);
+    }
+    mask
 }
 
 /// Armed interval timer. `value`/`interval` are the configured initial
@@ -69,6 +142,7 @@ impl ProcState {
                 AtomicU64::new(0),
                 AtomicU64::new(0),
             ]),
+            affinity: default_affinity(crate::host_facts::logical_cpu_count()),
         }
     }
 }
@@ -217,12 +291,20 @@ impl SyscallDispatcher {
         let memory = &mut *ctx.memory;
         let cpu_address = ctx.request.arg(0);
         let node_address = ctx.request.arg(1);
-        let bootstrap_value = 0u32.to_ne_bytes();
+        // Report the lowest CPU in this process's affinity mask. macOS has no
+        // portable "which CPU am I on" query, but a task pinned to a single
+        // CPU (sched_setaffinity to one bit) must observe getcpu() returning
+        // that CPU — LTP getcpu01 pins to CPU n-1 then expects it back. The
+        // lowest set bit equals the pinned CPU when restricted, and is always
+        // a valid online CPU otherwise. Single NUMA node (0).
+        let cpu = lowest_set_cpu(&self.proc.lock().affinity).unwrap_or(0);
+        let cpu_value = cpu.to_ne_bytes();
+        let node_value = 0u32.to_ne_bytes();
 
-        if cpu_address != 0 && memory.write_bytes(cpu_address, &bootstrap_value).is_err() {
+        if cpu_address != 0 && memory.write_bytes(cpu_address, &cpu_value).is_err() {
             return Ok(LINUX_EFAULT.into());
         }
-        if node_address != 0 && memory.write_bytes(node_address, &bootstrap_value).is_err() {
+        if node_address != 0 && memory.write_bytes(node_address, &node_value).is_err() {
             return Ok(LINUX_EFAULT.into());
         }
         Ok(DispatchOutcome::Returned { value: 0 })
@@ -293,25 +375,95 @@ impl SyscallDispatcher {
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
         let pid = ctx.arg(0);
-        let size = ctx.arg(1);
+        let size = ctx.arg(1) as usize;
         let address = ctx.arg(2);
         let memory = &mut *ctx.memory;
-        let current_pid = std::process::id() as u64;
 
-        if pid != 0 && pid != current_pid {
+        if matches!(self.resolve_affinity_target(pid), AffinityTarget::NotFound) {
             return Ok(LINUX_ESRCH.into());
         }
-        if size < LINUX_BOOTSTRAP_AFFINITY_BYTES as u64 {
+        // The kernel copies (and returns) `cpumask_size()` bytes — one `long`
+        // per 64 CPUs — and requires the user buffer to be at least that big.
+        let kernel_bytes = crate::host_facts::logical_cpu_count().div_ceil(64) * 8;
+        if size < kernel_bytes {
             return Ok(LINUX_EINVAL.into());
         }
-        let mut mask = [0_u8; LINUX_BOOTSTRAP_AFFINITY_BYTES];
-        mask[0] = 1;
-        if memory.write_bytes(address, &mask).is_err() {
+        let mask = self.proc.lock().affinity.clone();
+        let buf = affinity_to_bytes(&mask, kernel_bytes);
+        if memory.write_bytes(address, &buf).is_err() {
             return Ok(LINUX_EFAULT.into());
         }
         Ok(DispatchOutcome::Returned {
-            value: LINUX_BOOTSTRAP_AFFINITY_BYTES as i64,
+            value: kernel_bytes as i64,
         })
+    }
+
+    /// sched_setaffinity(pid, size, mask). Honours the requested CPU mask
+    /// (intersected with the online set) so a set→get round-trips; macOS
+    /// thread scheduling is advisory so no physical pin is performed. An empty
+    /// effective mask is rejected with EINVAL, matching Linux ("no online CPU
+    /// in the set"). Affinity is per-process and inherited across fork.
+    pub(super) fn sched_setaffinity<M: GuestMemory>(
+        &self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let pid = ctx.arg(0);
+        let size = ctx.arg(1) as usize;
+        let address = ctx.arg(2);
+        let memory = &*ctx.memory;
+
+        // Linux order: copy the mask from user (EFAULT) → find the task
+        // (ESRCH) → permission check (EPERM) → apply (EINVAL on empty set).
+        let read_len = size.min(128);
+        let bytes = match memory.read_bytes(address, read_len) {
+            Ok(bytes) => bytes,
+            Err(_) => return Ok(LINUX_EFAULT.into()),
+        };
+        let target = self.resolve_affinity_target(pid);
+        if matches!(target, AffinityTarget::NotFound) {
+            return Ok(LINUX_ESRCH.into());
+        }
+        // Setting ANOTHER process's affinity requires owning it or CAP_SYS_NICE.
+        // carrick models a single guest credential set and can't read a peer
+        // process's owner across the fork boundary, so it approximates the
+        // kernel's same-owner-or-capable rule: only the (root, euid 0) guest
+        // may target another process; a process that has dropped privileges
+        // gets EPERM. Setting one's OWN affinity is always permitted.
+        if matches!(target, AffinityTarget::OtherGuest) && self.creds.lock().euid != 0 {
+            return Ok(LINUX_EPERM.into());
+        }
+        // Intersect the requested mask with the online set. An empty result is
+        // EINVAL, exactly as Linux rejects a mask naming no usable CPU.
+        let ncpu = crate::host_facts::logical_cpu_count();
+        let online = default_affinity(ncpu);
+        let requested = affinity_from_bytes(&bytes, online.len());
+        let effective: Vec<u64> = online
+            .iter()
+            .zip(requested.iter())
+            .map(|(o, r)| o & r)
+            .collect();
+        if effective.iter().all(|w| *w == 0) {
+            return Ok(LINUX_EINVAL.into());
+        }
+        // We can only mutate our own mask; setting a peer's is a permitted
+        // no-op (macOS scheduling is advisory regardless).
+        if matches!(target, AffinityTarget::SelfProc) {
+            self.proc.lock().affinity = effective;
+        }
+        Ok(DispatchOutcome::Returned { value: 0 })
+    }
+
+    /// Resolve an affinity pid argument. 0 or our own pid is `SelfProc`; any
+    /// other thread/process in the guest tree is `OtherGuest`; anything else
+    /// is `NotFound` (ESRCH).
+    fn resolve_affinity_target(&self, pid: u64) -> AffinityTarget {
+        if pid == 0 || pid == std::process::id() as u64 {
+            AffinityTarget::SelfProc
+        } else if crate::host_proc::is_guest_process(pid as u32) {
+            AffinityTarget::OtherGuest
+        } else {
+            AffinityTarget::NotFound
+        }
     }
 
     pub(super) fn futex<M: GuestMemory>(
@@ -889,5 +1041,47 @@ fn translate_wait_status(status: i32) -> i32 {
     } else {
         // Exited normally: high byte is the exit code, left untouched.
         status
+    }
+}
+
+#[cfg(test)]
+mod affinity_tests {
+    use super::{affinity_from_bytes, affinity_to_bytes, default_affinity, lowest_set_cpu};
+
+    #[test]
+    fn lowest_set_cpu_finds_first_bit() {
+        assert_eq!(lowest_set_cpu(&[0x1]), Some(0));
+        assert_eq!(lowest_set_cpu(&[0x3ff]), Some(0)); // full 10-CPU mask → CPU 0
+        assert_eq!(lowest_set_cpu(&[1 << 9]), Some(9)); // pinned to CPU 9
+        assert_eq!(lowest_set_cpu(&[0, 0x1]), Some(64)); // second word
+        assert_eq!(lowest_set_cpu(&[0, 0]), None);
+    }
+
+    #[test]
+    fn default_affinity_sets_low_ncpu_bits() {
+        assert_eq!(default_affinity(1), vec![0x1]);
+        assert_eq!(default_affinity(10), vec![0x3ff]);
+        assert_eq!(default_affinity(64), vec![u64::MAX]);
+        // 65 CPUs spill into a second word.
+        assert_eq!(default_affinity(65), vec![u64::MAX, 0x1]);
+    }
+
+    #[test]
+    fn affinity_bytes_round_trip() {
+        let mask = default_affinity(10);
+        let bytes = affinity_to_bytes(&mask, 8);
+        assert_eq!(bytes, vec![0xff, 0x03, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(affinity_from_bytes(&bytes, 1), mask);
+    }
+
+    #[test]
+    fn affinity_to_bytes_truncates_and_pads() {
+        // Truncate a two-word mask to 8 bytes.
+        let mask = vec![u64::MAX, 0x1];
+        assert_eq!(affinity_to_bytes(&mask, 8), vec![0xff; 8]);
+        // Pad a one-word mask out to 16 bytes.
+        let padded = affinity_to_bytes(&[0x1], 16);
+        assert_eq!(padded[0], 0x1);
+        assert!(padded[1..].iter().all(|b| *b == 0));
     }
 }
