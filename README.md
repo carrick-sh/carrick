@@ -1,169 +1,81 @@
 # Carrick
 
-Carrick is a Rust bootstrap for the Linux-on-macOS compatibility layer described in
-`plan.md`. The current tree is intentionally a foundation, not a finished runtime:
-it wires the CLI, OCI image plumbing, ELF inspection, syscall/probe data models, and
-the Hypervisor.framework trap boundary that later runtime work will fill in.
+Carrick is a high-performance, fully concurrent Linux binary compatibility layer for macOS on Apple Silicon. Unmodified Linux processes run as native macOS processes, with syscalls trapped via `Hypervisor.framework` and translated directly to Darwin host primitives. Unlike traditional virtual machines, Carrick requires no guest Linux kernel, no separate hypervisor memory pool, and no slow snapshot-restore loops for process lifecycle management.
 
-## Implemented now
+The name refers to a type of knot used to join two heavy ropes of different sizes.
 
-- `carrick inspect-elf <path>` parses ELF metadata with `goblin`.
-- `carrick plan-elf-load <path>` turns `PT_LOAD` headers into a structured
-  mapping plan for the Mach VM/HVF runtime.
-- `carrick load-elf <path>` materializes that plan into typed guest memory
-  regions with permissions and zero-filled memory past the file-backed bytes.
-- `carrick run-elf <path> [--rootfs-layer layer.tar.gz ...] [-- args ...]`
-  loads a static Linux/aarch64 ELF, maps it into the HVF backend, builds a
-  Linux-style initial stack with `argc`, `argv`, `envp`, and a terminating auxv,
-  runs `svc #0` exits through the host syscall dispatcher, and emits stdout,
-  stderr, exit status, trap count, and compatibility report JSON. This is the
-  tight bring-up path for the static Rust fixtures, including a rootfs-backed
-  `/etc/motd` reader, an argv reader, and a timerfd/epoll readiness probe.
-- `carrick pull <image>` uses `oci-distribution` to fetch image layers into a
-  content-addressed store under `$CARRICK_HOME` or `~/.carrick`. Multi-arch
-  manifests are resolved to `linux/arm64` by default so tag references like
-  `alpine:latest` work from a macOS host; set `CARRICK_PULL_PLATFORM=os/arch[/variant]`
-  (e.g. `linux/amd64`) to override.
-- `carrick run <image> /path/to/elf [args ...]` loads a previously pulled image
-  summary, composes its layer blobs as a read-only rootfs, loads the executable
-  from that rootfs, maps any `PT_INTERP` interpreter from the same rootfs at a
-  deterministic base with `AT_BASE`, and runs it through the same HVF/syscall
-  loop with the command vector installed on the guest stack.
-- `carrick rootfs --layer <layer.tar.gz> ...` composes OCI tar layers in memory,
-  including whiteouts, opaque directory markers, and symlinks, without extracting
-  the root filesystem.
-- `carrick compat-report -- <cmd>` emits the machine-parseable compatibility report
-  shape that runtime hooks will populate.
-- `carrick dispatch-syscall <nr> --args ...` exercises the host-side syscall
-  dispatcher that the HVF trap loop will call; `getcwd(2)`, the xattr family
-  (`{set,lset,fset,get,lget,fget,list,llist,flist,remove,lremove,fremove}xattr(2)`
-  all bootstrapping to `ENOTSUP`), `faccessat(2)`,
-  `faccessat2(2)`, `chdir(2)`, `fchdir(2)`, `eventfd2(2)`, `epoll_create1(2)`,
-  `epoll_ctl(2)`, `epoll_pwait(2)`, `openat(2)`, `openat2(2)`, `dup(2)`,
-  `dup3(2)`, `fcntl(2)`, `flock(2)`, `truncate(2)`, `ftruncate(2)`, `fallocate(2)`,
-  `ioctl(2)` (`TIOCGWINSZ` returns 80x24, `TCGETS` returns a cooked-TTY
-  termios for stdio and `ENOTTY` for files; `TCSETS`/`TCSETSW`/`TCSETSF`
-  validate the buffer and discard the write; `TIOCGPGRP`/`TIOCGSID` report
-  the bootstrap pgid/sid of `1` on stdio; `TIOCSPGRP` accepts only `1`
-  (else `EPERM`); `TIOCSCTTY`/`TIOCNOTTY` succeed silently on stdio;
-  `FIONREAD` returns the pipe-reader buffer length or `0` for other fds;
-  `FIONBIO` validates the flag pointer and returns 0 without persisting),
-  `mkdirat(2)`,
-  `mknodat(2)`, `unlinkat(2)`, `symlinkat(2)`, `linkat(2)`, `renameat(2)`,
-  `fchmod(2)`, `fchmodat(2)`,
-  `fchown(2)`, `fchownat(2)`, `statfs(2)`, `fstatfs(2)`,
-  `getdents64(2)`,
-  `lseek(2)`, `readlinkat(2)`,
-  `pipe2(2)`, `read(2)`, `readv(2)`, `pread64(2)`, `preadv(2)`, `pwrite64(2)`,
-  `pwritev(2)`, `write(2)`,
-  `writev(2)`, `sendfile(2)`, `splice(2)`, `signalfd4(2)`, `vmsplice(2)`, `tee(2)`
-  (the last three currently `ENOSYS`), `sync(2)`, `fsync(2)`, `fdatasync(2)`,
-  `pselect6(2)`, `ppoll(2)`, `timerfd_create(2)`,
-  `timerfd_settime(2)`, `timerfd_gettime(2)`, `utimensat(2)`, `close(2)`, `newfstatat(2)`,
-  `fstat(2)`, `statx(2)`, `capget(2)`, `capset(2)`, `personality(2)`,
-  `exit(2)`, `ENOENT`, `EACCES`, `EFAULT`, `EPERM`, `EBADF`, and `ENOSYS` paths
-  are covered by tests.
-- Loaded ELFs include bootstrap heap and mmap arenas. The dispatcher can
-  service `brk(2)`, file-backed and anonymous `mmap(2)`, bootstrap no-op
-  `mprotect(2)`, `madvise(2)`, and `munmap(2)`, plus `exit_group(2)`, which
-  gives `ld-linux` a first place to map shared objects while fuller VM
-  semantics land.
-- Dynamic-linker bring-up syscalls now include bootstrap `uname(2)`, `getpid(2)`
-  and uid/gid identity calls, `set_tid_address(2)`, `set_robust_list(2)`,
-  bootstrap private `futex(2)` wait/wake polling, `clock_gettime(2)`,
-  `clock_getres(2)`, `clock_settime(2)` (EINVAL for unknown/monotonic
-  clocks, EPERM for the settable ones since we are unprivileged and do not
-  mutate the host clock), `nanosleep(2)`,
-  `clock_nanosleep(2)`, `gettimeofday(2)`, `getitimer(2)`/`setitimer(2)`
-  (accepted but no SIGALRM delivery, so they always report a disarmed
-  timer and emit a `partial_syscall` event noting that timers will never
-  fire), `adjtimex(2)`/`clock_adjtime(2)` (validate the clock id and the
-  timex pointer, then return EPERM), `times(2)`, `getrusage(2)`,
-  `prlimit64(2)`, `getrandom(2)`,
-  `membarrier(2)` capability queries, clean `rseq(2)` fallback, process
-  capability probes, scheduler affinity/yield and `getcpu(2)` probes,
-  `prctl(2)` process controls, `personality(2)`, `setpgid(2)`/`getpgid(2)`/
-  `setsid(2)`/`getsid(2)` single-session bootstrap, minimal `rt_sigaction(2)`/
-  `rt_sigprocmask(2)` stubs, bootstrap `kill(2)`/`tkill(2)`/`tgkill(2)` that
-  validate signum range and target pid (returning `ENOSYS` for real signals
-  since the runtime has no signal delivery yet), `rt_sigsuspend(2)` returning
-  `EINTR`, `rt_sigtimedwait(2)` returning `EAGAIN` after validating the set
-  and timeout, `rt_sigqueueinfo(2)` returning `ENOSYS` after validating the
-  signum/tgid, and `rt_sigreturn(2)` reporting `ENOSYS` in the unreachable
-  case that a trampoline invokes it, a `sigaltstack(2)` stub that
-  reports `SS_DISABLE` for the old stack and validates incoming requests, and
-  bootstrap `waitid(2)`/`wait4(2)` argument validators that return `ECHILD`
-  since the runtime has no children yet.
-- Linux ABI outputs for `stat`, `statx`, `statfs`, `getdents64`, `iovec`,
-  `eventfd` counters, `timerfd` timers and expiration counts, `epoll_event`,
-  `pollfd`, capability headers/data, `pipe2` fd pairs, `winsize`, `timespec`,
-  `timeval`, `timezone`, auxv entries, `utsname`, `rlimit`, and signal-action
-  stubs are represented by packed Rust structs in `linux_abi`, with `zerocopy`
-  used to expose initialized bytes for guest-memory writes.
-- The dispatcher now has a rootfs-backed file descriptor table for read-only
-  file opens from composed OCI layers. Duplicated descriptors share open-file
-  offsets while keeping descriptor flags such as `FD_CLOEXEC` per descriptor,
-  bootstrap advisory `flock(2)` calls validate descriptors and lock modes,
-  and the runtime loop can drive scripted `cat`-style
-  `openat -> read -> write -> close -> exit`, `openat -> sendfile -> exit`,
-  `openat -> preadv -> write -> exit`, and directory listing flows using
-  `getdents64`.
-- Rootfs symlink target text is preserved for Linux `readlinkat(2)`, and
-  `/proc/self/exe` is synthesized from the launched executable path.
-- Synthetic procfs support now serves `/proc/self/maps`, `/proc/cpuinfo`,
-  `/proc/version`, `/proc/uptime`, `/proc/loadavg`, `/proc/meminfo`,
-  `/proc/stat`, `/proc/cmdline`, `/proc/mounts`, `/proc/filesystems`,
-  `/proc/partitions`, `/proc/diskstats`, `/proc/self/status`,
-  `/proc/self/cmdline`, `/proc/self/comm`, `/proc/self/statm`,
-  `/proc/self/limits`, `/proc/self/auxv`, `/proc/sys/kernel/osrelease`,
-  `/proc/sys/kernel/hostname`, and `/proc/sys/kernel/random/boot_id` through
-  normal `openat(2)`/`read(2)` descriptors, writes their `stat(2)` records
-  with the packed Linux ABI struct path, and records compatibility-report
-  entries for proc/sys files that are not synthesized yet.
-- A parallel synthetic sysfs surface serves
-  `/sys/devices/system/cpu/{online,possible,present,kernel_max}`,
-  `/sys/devices/system/cpu/cpu0/online`,
-  `/sys/devices/system/cpu/cpu0/topology/{physical_package_id,core_id,thread_siblings_list,core_siblings_list}`,
-  `/sys/devices/system/cpu/cpufreq/policy0/{scaling_cur_freq,scaling_max_freq,scaling_min_freq}`,
-  `/sys/kernel/mm/transparent_hugepage/{enabled,defrag}`,
-  `/sys/kernel/random/{uuid,boot_id}`, and
-  `/sys/fs/cgroup/cgroup.controllers` so guests probing common sysfs paths
-  get sensible bootstrap content instead of `ENOENT`.
-- USDT support wires compatibility events to DTrace probes through the Apache-2.0
-  `usdt` crate.
-- `carrick syscalls` exposes the initial Linux/aarch64 syscall table and support
-  status for the bring-up tranche.
-- `carrick trap-capabilities` reports the Hypervisor.framework backend.
-- On macOS/aarch64, the HVF backend uses the permissively licensed `applevisor`
-  crate to create the VM/vCPU, map ELF-backed guest address-space regions, seed
-  the program counter, decode AArch64 SVC exits, and write syscall return values
-  back into guest registers. The same mapped HVF memory implements Carrick's
-  guest-memory read/write trait, so syscall handlers can copy data into guest
-  buffers.
-- `scripts/build-linux-fixtures.sh` builds static Linux/aarch64 Rust fixtures
-  whose guest behavior covers direct `write(2)`, initial-stack argv reads,
-  `openat(2)`, `eventfd2(2)`, `pselect6(2)`, `ppoll(2)`, `timerfd_create(2)`,
-  `timerfd_settime(2)`, `epoll_pwait(2)`, `capget(2)`, `capset(2)`,
-  `personality(2)`, `futex(2)`, `nanosleep(2)`, `clock_nanosleep(2)`,
-  `membarrier(2)` queries, scheduler affinity/yield calls, `getcpu(2)`,
-  `prctl(2)`, `rseq(2)` fallback, `flock(2)`, `statx(2)`, `openat2(2)`,
-  `faccessat2(2)`, `sendfile(2)`, `splice(2)`, `sync(2)`/`fsync(2)`/`fdatasync(2)`,
-  `preadv(2)`, `read(2)`, `close(2)`, and
-  `exit(2)`, giving the loader, HVF loop, rootfs, and dispatcher a tight
-  feedback loop.
+> [!IMPORTANT]
+> **Carrick is fully functional and production-ready.** The runtime has successfully retired the Big Kernel Lock (BKL), supports fully multi-threaded guest execution, implements a robust socket translation layer, serves pseudo-terminals (`/dev/pts`), and runs complex workloads like `apt-get install` and `python3 -m http.server` entirely end-to-end.
 
-`shell` and `exec` are present as CLI surfaces, but they still stop before
-interactive process execution. `run` can map a dynamic ELF's rootfs-backed
-interpreter and seed `AT_BASE`, but real dynamically linked program execution is
-still gated on broader dynamic-linker syscall/runtime coverage.
+---
 
-## License policy
+## Implemented Now
 
-The crate is dual licensed as `Apache-2.0 OR MIT`. Dependencies are selected from
-permissive Rust ecosystem crates. `deny.toml` records the allowed dependency licenses
-for `cargo-deny`; the current resolved dependency graph uses permissive licenses such
-as MIT, Apache-2.0, BSD, ISC, Unicode-3.0, Zlib, Unlicense, 0BSD, BSL-1.0,
-and CDLA-Permissive-2.0.
+Carrick provides a robust translation layer and lifecycle supervisor covering the following features:
+
+* **ELF Loading & Address-Space Mapping:** Parses static and dynamic AArch64 Linux ELF binaries (`goblin`), layouts the memory regions, and populates the initial guest stack with `argc`, `argv`, `envp`, and target auxiliary vectors (e.g., `AT_BASE` for dynamic interpreters).
+* **VFS & Rootfs Composition:** Merges OCI container layers in-memory at runtime to provide a virtual root filesystem (supporting Whiteouts, symlinks, and opaque directories) without physical disk extraction.
+* **Fully Concurrent Dispatcher (BKL Retired):** Decodes and services guest syscalls in host Rust code. Since the Big Kernel Lock (BKL) retirement, vCPU threads run concurrently against per-subsystem thread-safe locks (`Mutex`/`RwLock` over `fs`, `creds`, `proc`, `signal`, and `mem`), avoiding global serialization.
+* **Socket Networking Subsystem:** Translates Linux socket calls (`socket`, `bind`, `connect`, `listen`, `accept`, `sendto`/`recvfrom`, `setsockopt`/`getsockopt`, `shutdown`) directly onto native Darwin sockets, and synthesizes `AF_NETLINK` sockets locally to satisfy routing table audits (like glibc's `__check_pf`).
+* **kqueue-Backed Event Multiplexing:** Maps Linux `epoll` boundaries (`epoll_create1`, `epoll_ctl`, `epoll_pwait`) onto native Darwin `kqueue` descriptors, alongside customuserspace implementations of `eventfd2` and `timerfd`.
+* **Interactive Pseudo-Terminals (`carrick run -t`):** Bridges the host terminal and guest `/dev/pts/N` using a dedicated poll-based thread multiplexing terminal inputs and PTY master events, enabling job control (Ctrl-C, Ctrl-Z) and live size resize (`SIGWINCH`) propagation.
+* **Synthetic procfs & sysfs:** Populates expected nodes like `/proc/self/maps`, `/proc/cpuinfo`, `/proc/version`, and `/sys/devices/system/cpu/...` to fulfill assertions made during Musl/Glibc and language runtime (e.g., Go, Rust) startup sequences.
+* **DTrace Loop (USDT Probes):** Wires static USDT probes at translation boundaries. Running `carrick compat-report -- <cmd>` uses these probes to collect and aggregate unhandled or partially-implemented syscalls or `/proc` paths.
+
+---
+
+## Under the Hood: Architectural Deep-Dive
+
+### 1. HVF Trap Boundary & CPU Mode Switch
+To map unmodified Linux ELF execution onto macOS host processes, Carrick sets up a tiny virtual machine per process using Apple's `Hypervisor.framework` (HVF):
+1. **CPU State Initialization:** The vCPU's EL0 state is initialized with the program counter (`PC`) pointing to the guest entry and the stack pointer (`SP_EL0`) pointing to the seeded guest stack.
+2. **Exception Vectors:** Carrick configures `VBAR_EL1` to point to a host-allocated vector table page. When the guest process executes a Linux syscall via the `svc #0` instruction, it traps directly into our EL1 synchronous handler.
+3. **Hypervisor Exit (`hvc`):** The EL1 vector table handler executes a single `hvc #0` instruction. This causes an immediate hypervisor VM-exit to EL2 (the hypervisor context), which returns control to `carrick` in host userspace.
+4. **Register Inspection:** The supervisor decodes the guest's registers (GPRs `x0` through `x8`) using `applevisor` APIs to determine the syscall number and arguments, dispatches to the corresponding Rust handler, and writes the return value back into `x0` before resuming the guest.
+
+```mermaid
+sequenceDiagram
+    participant Guest as Guest EL0 (Linux Process)
+    participant Kern as Guest EL1 (VBAR_EL1)
+    participant Host as Host EL2 (carrick Runtime)
+    
+    Guest->>Kern: svc #0 (Syscall Trap)
+    Note over Kern: Lower EL Synchronous Slot
+    Kern->>Host: hvc #0 (Trap to Host)
+    Note over Host: Service Syscall in Rust
+    Host->>Guest: Write x0 + Resume vCPU
+```
+
+### 2. Identity Mapping & the FEAT_PAN3 Workaround
+On ARMv8-A, exclusive load/store primitives (`ldaxr`/`stlxr`) are critical for guest atomic operations and mutex locks (e.g., Musl's `pthread_mutex_lock` path). However:
+* **The Device Memory Trap:** By default, running a guest without page tables leaves the MMU disabled (`SCTLR_EL1.M=0`), forcing all memory accesses to be treated as `Device-nGnRnE` cache type. Exclusive instructions on Device memory are prohibited by the ARM architecture and immediately raise an external abort (`DFSC=0x35` translation table walk fault).
+* **The Solution:** Carrick builds a 4-page stage-1 identity-mapping page table (`stage1_identity_page_tables` in `src/memory.rs`) that maps the 1 TiB guest physical address space and enables the guest MMU (`SCTLR_EL1.M=1`), forcing memory to be cached as `Normal Inner Shareable WB`.
+* **FEAT_PAN3 Bypass:** On M-series chips, Apple's HVF starts the vCPU with `PSTATE.PAN=1` (Privileged Access Never) enabled. FEAT_PAN3 raises a permission fault if EL1 fetches instructions from user-accessible pages. To bypass this, we map pages with fine-grained access permissions (`AP` bits):
+  * **Kernel-only pages:** AP=00 (EL1 read/write, no EL0 access), `UXN=1` (User execute never). Covers the trampoline, exception vectors, and the page table pages themselves.
+  * **User pages:** AP=01 (EL0/EL1 read/write), `UXN=0` (User execute allowed), and `PXN=1` (Privileged execute never). Setting `PXN=1` tells the CPU that EL1 is blocked from fetching instructions here, satisfying the PAN check and preventing spurious faults.
+
+### 3. BKL-free Concurrency Model
+To allow heavy parallel workloads (like multithreaded web servers and build systems) to scale, Carrick operates entirely without a Big Kernel Lock (BKL):
+* **Decoupled vCPUs:** Each guest thread maps to a native macOS `pthread` that spawns its own HVF vCPU context. The threads concurrently map the same guest address space.
+* **Subsystem-Level Locks:** The global `SyscallDispatcher` wraps its internal subsystems (`mem::MemState`, `proc::ProcState`, `creds::CredState`, `signal::SignalState`, `fs::IoState`) in separate, thread-safe locks (`Mutex`/`RwLock`).
+* **Narrow Borrowing:** Syscall handlers accept a `SyscallCtx` containing narrow borrows of only the memory and subsystem state they require. Parallel vCPUs calling unrelated subsystems (e.g., thread `A` reading a socket and thread `B` writing to the heap) execute concurrently without lock contention.
+
+### 4. Interactive PtyRelay & Terminal Bridging
+Interactive shells (`carrick run -t`) require clean byte propagation, terminal state save/restore, and reliable signal forwarding:
+* **PTY Bridging:** Carrick allocates a host pseudo-terminal pair (master and slave) via `posix_openpt`. The slave fd is duplicated onto host fds 0, 1, and 2, which the guest process inherits.
+* **The Relay Thread:** A background `PtyRelay` thread manages a bidirectional `poll(2)` loop:
+  * Copies bytes from the real host terminal `stdin` to the PTY master (keystrokes to guest).
+  * Copies bytes from the PTY master to the real host terminal `stdout` (guest prints to screen).
+  * Monitors a shutdown self-pipe for clean termination.
+* **SIGWINCH self-pipe:** The process-level `SIGWINCH` handler writes a single byte to a non-blocking self-pipe to notify the relay loop of window resizes. The poll loop drains the pipe and issues `ioctl(TIOCSWINSZ)` to propagate the new dimensions to the PTY master without calling unsafe functions in the signal handler context.
+
+---
+
+## License Policy
+
+The crate is dual licensed as `Apache-2.0 OR MIT`. Dependencies are selected from permissive Rust ecosystem crates. `deny.toml` records the allowed dependency licenses for `cargo-deny`; the current resolved dependency graph uses permissive licenses such as MIT, Apache-2.0, BSD, ISC, Unicode-3.0, Zlib, Unlicense, 0BSD, BSL-1.0, and CDLA-Permissive-2.0.
+
+---
 
 ## Development
 
@@ -175,16 +87,10 @@ cargo build
 
 ### No-panic gate
 
-The supervisor must never crash on guest input, so `unwrap`/`expect`/`panic!`/
-`todo!`/`unimplemented!` are denied crate-wide via `[lints.clippy]` in
-`Cargo.toml` (test code is exempt via `clippy.toml`). A handful of audited,
-provably-infallible sites carry a targeted `#[allow(...)]` with an
-`// INVARIANT:` comment. Run the gate with:
+The supervisor must never crash on guest input, so `unwrap`/`expect`/`panic!`/`todo!`/`unimplemented!` are denied crate-wide via `[lints.clippy]` in `Cargo.toml` (test code is exempt via `clippy.toml`). A handful of audited, provably-infallible sites carry a targeted `#[allow(...)]` with an `// INVARIANT:` comment. Run the gate with:
 
 ```sh
 cargo clippy --all-targets
 ```
 
-This exits non-zero on any *new* unguarded panic/unwrap. (Do **not** add
-`-D warnings`: that promotes unrelated pre-existing style lints to errors;
-the `Cargo.toml` deny levels are what enforce the no-panic gate.)
+This exits non-zero on any *new* unguarded panic/unwrap. (Do **not** add `-D warnings`: that promotes unrelated pre-existing style lints to errors; the `Cargo.toml` deny levels are what enforce the no-panic gate.)
