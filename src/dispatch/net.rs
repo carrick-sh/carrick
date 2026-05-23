@@ -96,6 +96,26 @@ impl SyscallDispatcher {
         Ok(self.install_fd(description, linux_fd_flags_from_open_flags(flags)))
     }
 
+    /// Whether `fd` is a pollable target for `epoll_ctl(ADD)`. The kernel
+    /// returns EPERM when adding an fd whose file has no `->poll` op — regular
+    /// files, directories, and synthetic /proc files. Pipes, sockets, eventfd,
+    /// timerfd, epoll, netlink, and character devices (ptys) are all pollable.
+    fn fd_is_epollable(&self, fd: i32) -> bool {
+        let Some(open_file) = self.open_file(fd) else {
+            return false;
+        };
+        let open = open_file.description.read();
+        match &*open {
+            OpenDescription::File { .. }
+            | OpenDescription::Directory { .. }
+            | OpenDescription::SyntheticFile { .. } => false,
+            OpenDescription::HostFile { metadata, .. } => {
+                matches!(metadata.kind, crate::rootfs::RootFsEntryKind::CharDevice)
+            }
+            _ => true,
+        }
+    }
+
     pub(super) fn epoll_create1<M: GuestMemory>(
         &self,
         ctx: &mut SyscallCtx<M>,
@@ -122,12 +142,25 @@ impl SyscallDispatcher {
         let operation = ctx.arg(1);
         let fd = ctx.arg(2) as i32;
         let event_address = ctx.arg(3);
-        if epfd == fd || !self.fd_is_valid(fd) {
+        // A bad target fd is EBADF; a target equal to the epoll fd itself is
+        // EINVAL (an epoll instance can't monitor itself). (LTP epoll_ctl02.)
+        if !self.fd_is_valid(fd) {
             return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+        }
+        if epfd == fd {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            });
         }
 
         let Some(open_file) = self.open_file(epfd) else {
-            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+            return Ok(DispatchOutcome::Errno {
+                errno: if self.fd_is_valid(epfd) {
+                    LINUX_EINVAL
+                } else {
+                    LINUX_EBADF
+                },
+            });
         };
         let mut open = open_file.description.write();
         let OpenDescription::Epoll { interest, .. } = &mut *open else {
@@ -142,6 +175,11 @@ impl SyscallDispatcher {
                     Ok(event) => event,
                     Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
                 };
+                // The kernel rejects ADD of a target that has no ->poll support
+                // (regular files, directories) with EPERM. (LTP epoll_ctl02/05.)
+                if !self.fd_is_epollable(fd) {
+                    return Ok(DispatchOutcome::Errno { errno: LINUX_EPERM });
+                }
                 if interest.contains_key(&fd) {
                     return Ok(DispatchOutcome::Errno {
                         errno: LINUX_EEXIST,
@@ -196,18 +234,49 @@ impl SyscallDispatcher {
     ) -> Result<DispatchOutcome, DispatchError> {
         let epfd = ctx.arg(0) as i32;
         let events_address = ctx.arg(1);
-        let max_events =
-            usize::try_from(ctx.arg(2)).map_err(|_| DispatchError::LengthTooLarge(ctx.arg(2)))?;
+        // maxevents is a signed int; the kernel rejects <= 0 with EINVAL. A
+        // negative value arrives as a huge u64, so check the signed form.
+        // (LTP epoll_wait03.)
+        let max_events_signed = ctx.arg(2) as i32;
         let timeout_ms = ctx.arg(3) as i32;
+        // epoll_pwait carries a sigmask (arg4) + sigsetsize (arg5); epoll_wait
+        // passes a NULL mask. A non-NULL mask must have the right size and a
+        // readable pointer, else EINVAL/EFAULT. (LTP epoll_pwait04.)
+        let sigmask_ptr = ctx.arg(4);
+        let sigsetsize = ctx.arg(5);
         let memory = &mut *ctx.memory;
-        if max_events == 0 {
+        if max_events_signed <= 0 {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
             });
         }
+        let max_events = max_events_signed as usize;
+        if sigmask_ptr != 0 {
+            if sigsetsize != crate::linux_abi::LINUX_RT_SIGSET_SIZE {
+                return Ok(DispatchOutcome::Errno {
+                    errno: LINUX_EINVAL,
+                });
+            }
+            if memory
+                .read_bytes(sigmask_ptr, crate::linux_abi::LINUX_RT_SIGSET_SIZE as usize)
+                .is_err()
+            {
+                return Ok(DispatchOutcome::Errno {
+                    errno: LINUX_EFAULT,
+                });
+            }
+        }
 
         let Some(open_file) = self.open_file(epfd) else {
-            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+            // A valid fd that simply isn't an epoll instance is EINVAL; only a
+            // genuinely bad fd is EBADF. (LTP epoll_wait03.)
+            return Ok(DispatchOutcome::Errno {
+                errno: if self.fd_is_valid(epfd) {
+                    LINUX_EINVAL
+                } else {
+                    LINUX_EBADF
+                },
+            });
         };
         let interests = {
             let open = open_file.description.read();
