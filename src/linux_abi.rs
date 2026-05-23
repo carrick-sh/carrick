@@ -1247,6 +1247,11 @@ pub const LINUX_RT_SIGSET_SIZE: u64 = 8;
 pub const LINUX_MAX_SIGNUM: u64 = 64;
 pub const LINUX_SIGKILL: i32 = 9;
 pub const LINUX_SIGSTOP: i32 = 19;
+/// Timer-expiry signals: ITIMER_REAL→SIGALRM, ITIMER_VIRTUAL→SIGVTALRM,
+/// ITIMER_PROF→SIGPROF (aarch64/generic numbering).
+pub const LINUX_SIGALRM: i32 = 14;
+pub const LINUX_SIGVTALRM: i32 = 26;
+pub const LINUX_SIGPROF: i32 = 27;
 /// `how` argument values for `rt_sigprocmask`.
 pub const LINUX_SIG_BLOCK: u64 = 0;
 pub const LINUX_SIG_UNBLOCK: u64 = 1;
