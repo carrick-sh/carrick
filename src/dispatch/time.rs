@@ -431,11 +431,18 @@ impl SyscallDispatcher {
             .ok()
             .and_then(|s| s.checked_mul(LINUX_CLK_TCK))
             .unwrap_or(i64::MAX);
-        if buf != 0
-            && memory
-                .write_bytes(buf, LinuxTms::zeroed().abi_bytes())
-                .is_err()
-        {
+        // Fill the tms with real CPU time (clock ticks) from the host kernel.
+        let host = crate::host_proc::self_resource_usage().unwrap_or_default();
+        let to_ticks = |us: u64| (us as i64).saturating_mul(LINUX_CLK_TCK) / 1_000_000;
+        let tms = LinuxTms {
+            tms_utime: to_ticks(host.user_us),
+            tms_stime: to_ticks(host.system_us),
+            // Reaped-child CPU is accumulated by wait4 (guest + host), not from
+            // proc_pid_rusage's ri_child_* (which omits guest execution).
+            tms_cutime: to_ticks(crate::guest_cpu::child_user_us()),
+            tms_cstime: to_ticks(crate::guest_cpu::child_system_us()),
+        };
+        if buf != 0 && memory.write_bytes(buf, tms.abi_bytes()).is_err() {
             return Ok(LINUX_EFAULT.into());
         }
         Ok(DispatchOutcome::Returned { value: clock })
@@ -457,10 +464,26 @@ impl SyscallDispatcher {
         if usage == 0 {
             return Ok(LINUX_EFAULT.into());
         }
-        if memory
-            .write_bytes(usage, LinuxRusage::zeroed().abi_bytes())
-            .is_err()
-        {
+        // Fill CPU time + RSS from the host kernel (proc_pid_rusage /
+        // thread_info), the source of truth for this process. A zeroed rusage
+        // is the safe fallback if the query fails.
+        let host = crate::host_proc::self_resource_usage().unwrap_or_default();
+        let rusage = match who {
+            LINUX_RUSAGE_THREAD => {
+                let (user_us, system_us) =
+                    crate::host_proc::self_thread_cpu_us().unwrap_or((0, 0));
+                rusage_from(user_us, system_us, host.maxrss_bytes, host.majflt)
+            }
+            LINUX_RUSAGE_CHILDREN => rusage_from(
+                crate::guest_cpu::child_user_us(),
+                crate::guest_cpu::child_system_us(),
+                host.maxrss_bytes,
+                0,
+            ),
+            // RUSAGE_SELF (and any accepted value above).
+            _ => rusage_from(host.user_us, host.system_us, host.maxrss_bytes, host.majflt),
+        };
+        if memory.write_bytes(usage, rusage.abi_bytes()).is_err() {
             return Ok(LINUX_EFAULT.into());
         }
         Ok(DispatchOutcome::Returned { value: 0 })
@@ -568,6 +591,22 @@ fn timeval_from_duration(d: std::time::Duration) -> crate::linux_abi::LinuxTimev
         tv_sec: d.as_secs() as i64,
         tv_usec: i64::from(d.subsec_micros()),
     }
+}
+
+/// Build a `LinuxRusage` from CPU times (microseconds), peak RSS (bytes), and a
+/// major-fault count. `ru_maxrss` is reported in KiB, as Linux does. Fields we
+/// do not yet account (ixrss/idrss/swaps/blocks/context switches) stay zero.
+fn rusage_from(user_us: u64, system_us: u64, maxrss_bytes: u64, majflt: u64) -> LinuxRusage {
+    let timeval = |us: u64| crate::linux_abi::LinuxTimeval {
+        tv_sec: (us / 1_000_000) as i64,
+        tv_usec: (us % 1_000_000) as i64,
+    };
+    let mut ru = LinuxRusage::zeroed();
+    ru.ru_utime = timeval(user_us);
+    ru.ru_stime = timeval(system_us);
+    ru.ru_maxrss = (maxrss_bytes / 1024) as i64;
+    ru.ru_majflt = majflt as i64;
+    ru
 }
 
 /// Spawn the per-arm interval-timer thread. After the initial `value` delay it

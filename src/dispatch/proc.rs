@@ -89,6 +89,19 @@ enum AffinityTarget {
     NotFound,
 }
 
+/// Build a `LinuxRusage` carrying just CPU time (user/system microseconds);
+/// other fields stay zero. Used for the `wait4` rusage out-param.
+fn rusage_from_us(user_us: u64, system_us: u64) -> LinuxRusage {
+    let tv = |us: u64| crate::linux_abi::LinuxTimeval {
+        tv_sec: (us / 1_000_000) as i64,
+        tv_usec: (us % 1_000_000) as i64,
+    };
+    let mut ru = LinuxRusage::zeroed();
+    ru.ru_utime = tv(user_us);
+    ru.ru_stime = tv(system_us);
+    ru
+}
+
 /// Lowest CPU index set in a word-mask, or `None` if empty.
 pub(super) fn lowest_set_cpu(mask: &[u64]) -> Option<u32> {
     for (i, word) in mask.iter().enumerate() {
@@ -714,6 +727,7 @@ impl SyscallDispatcher {
         let pid = ctx.arg(0) as i32;
         let wstatus_addr = ctx.arg(1);
         let options = ctx.arg(2);
+        let rusage_addr = ctx.arg(3);
         let memory = &mut *ctx.memory;
         if options & !LINUX_WAIT4_SUPPORTED_FLAGS != 0 {
             return Ok(LINUX_EINVAL.into());
@@ -735,14 +749,18 @@ impl SyscallDispatcher {
             host_options |= libc::WCONTINUED;
         }
         let mut host_status: i32 = 0;
-        // Retry the blocking host waitpid across EINTR from carrick-internal
+        // Collect the reaped child's resource usage from Darwin's own wait4
+        // (the same mechanism Linux uses to fill RUSAGE_CHILDREN); we add the
+        // child's *guest* CPU — which the host rusage can't see — separately.
+        let mut host_rusage: libc::rusage = unsafe { std::mem::zeroed() };
+        // Retry the blocking host wait4 across EINTR from carrick-internal
         // host signals (e.g. the SIGURG vCPU kick). Without this, a shell
         // blocked waiting on a foreground job spuriously returns from wait,
         // leaves the wait, and spins. Only surface EINTR to the guest when a
         // signal it can actually take is pending (so its handler runs / it
         // dies) — same discipline as host_sleep_interruptible and read_host_pipe.
         let result = loop {
-            let r = unsafe { libc::waitpid(pid, &mut host_status, host_options) };
+            let r = unsafe { libc::wait4(pid, &mut host_status, host_options, &mut host_rusage) };
             match r.host_syscall_errno() {
                 Ok(value) => break Ok(value),
                 Err(errno) => {
@@ -764,6 +782,28 @@ impl SyscallDispatcher {
         if result == 0 {
             // WNOHANG and no child ready.
             return Ok(DispatchOutcome::Returned { value: 0 });
+        }
+        // Roll the reaped child's CPU into this process's child-time totals
+        // (getrusage RUSAGE_CHILDREN, times cutime/cstime). The host rusage
+        // covers carrick's host-side work for the child; the child's guest
+        // execution (invisible to the host rusage) is drained from the shared
+        // table the child published on exit. user = guest compute + host user;
+        // system = host system work.
+        let tv_us = |t: libc::timeval| t.tv_sec as u64 * 1_000_000 + t.tv_usec as u64;
+        let child_guest_us = crate::guest_cpu::reap_child_guest_ns(result as u32) / 1000;
+        let child_user_us = child_guest_us + tv_us(host_rusage.ru_utime);
+        let child_system_us = tv_us(host_rusage.ru_stime);
+        crate::guest_cpu::add_reaped_child(child_user_us, child_system_us);
+        // If the guest passed a rusage out-param, fill it with THIS child's
+        // usage (not the cumulative total).
+        if rusage_addr != 0 {
+            let child_rusage = rusage_from_us(child_user_us, child_system_us);
+            if memory
+                .write_bytes(rusage_addr, child_rusage.abi_bytes())
+                .is_err()
+            {
+                return Ok(LINUX_EFAULT.into());
+            }
         }
         // Linux and Darwin agree on the wstatus LAYOUT (low 7 bits = signal,
         // bit 7 = core flag, bits 8..15 = exit code) but NOT on signal
