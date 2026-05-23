@@ -72,9 +72,7 @@ impl SyscallDispatcher {
         if linux_clock_duration(clock_id).is_none()
             || flags & !(LINUX_TFD_NONBLOCK | LINUX_TFD_CLOEXEC) != 0
         {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         let description = OpenDescription::TimerFd {
             state: Arc::new(TimerFdState::new(clock_id)),
@@ -87,32 +85,28 @@ impl SyscallDispatcher {
         &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let fd = ctx.arg(0) as i32;
+        let fd: Fd = ctx.typed_arg(0);
         let flags = ctx.arg(1);
         let new_value = ctx.arg(2);
         let old_value = ctx.arg(3);
         let memory = &mut *ctx.memory;
         if flags & !LINUX_TIMER_ABSTIME != 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         let spec = match read_itimerspec(memory, new_value) {
             Ok(spec) => spec,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         let (next_interval, next_value) = match itimerspec_durations(spec) {
             Ok(value) => value,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
-        let Some(open_file) = self.open_file(fd) else {
-            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+        let Some(open_file) = self.open_file(fd.0) else {
+            return Ok(LINUX_EBADF.into());
         };
         let open = open_file.description.read();
         let OpenDescription::TimerFd { state, .. } = &*open else {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         };
         let state = Arc::clone(state);
         drop(open);
@@ -121,9 +115,7 @@ impl SyscallDispatcher {
         if old_value != 0 {
             let previous = timerfd_itimerspec(timer.clock_id, timer.interval, timer.deadline);
             if write_kernel_struct_raw(memory, old_value, &previous).is_err() {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_EFAULT,
-                });
+                return Ok(LINUX_EFAULT.into());
             }
         }
 
@@ -145,17 +137,15 @@ impl SyscallDispatcher {
         &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let fd = ctx.arg(0) as i32;
+        let fd: Fd = ctx.typed_arg(0);
         let current_value = ctx.arg(1);
         let memory = &mut *ctx.memory;
-        let Some(open_file) = self.open_file(fd) else {
-            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+        let Some(open_file) = self.open_file(fd.0) else {
+            return Ok(LINUX_EBADF.into());
         };
         let open = open_file.description.read();
         let OpenDescription::TimerFd { state, .. } = &*open else {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         };
         let mut timer = state.inner.lock();
         refresh_timerfd_locked(&mut timer);
@@ -171,11 +161,11 @@ impl SyscallDispatcher {
         let memory = &*ctx.memory;
         let timespec = match read_timespec(memory, request_address) {
             Ok(timespec) => timespec,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         let duration = match duration_from_linux_timespec(timespec) {
             Ok(duration) => duration,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         if let Some(duration) = duration {
             if let Some(remaining) = host_sleep_interruptible(duration) {
@@ -188,7 +178,7 @@ impl SyscallDispatcher {
                     let ts = linux_timespec_from_duration(remaining);
                     let _ = write_kernel_struct(memory, rem_ptr, &ts);
                 }
-                return Ok(DispatchOutcome::Errno { errno: LINUX_EINTR });
+                return Ok(LINUX_EINTR.into());
             }
         }
         Ok(DispatchOutcome::Returned { value: 0 })
@@ -203,22 +193,18 @@ impl SyscallDispatcher {
         let request_address = ctx.arg(2);
         let memory = &*ctx.memory;
         if flags & !LINUX_TIMER_ABSTIME != 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         let Some(now) = linux_clock_duration(clock_id) else {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         };
         let timespec = match read_timespec(memory, request_address) {
             Ok(timespec) => timespec,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         let requested = match duration_from_linux_timespec(timespec) {
             Ok(duration) => duration.unwrap_or(Duration::ZERO),
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         let sleep_duration = if flags & LINUX_TIMER_ABSTIME != 0 {
             requested.saturating_sub(now)
@@ -238,7 +224,7 @@ impl SyscallDispatcher {
                         let _ = write_kernel_struct(memory, rem_ptr, &ts);
                     }
                 }
-                return Ok(DispatchOutcome::Errno { errno: LINUX_EINTR });
+                return Ok(LINUX_EINTR.into());
             }
         }
         Ok(DispatchOutcome::Returned { value: 0 })
@@ -252,9 +238,7 @@ impl SyscallDispatcher {
         let address = ctx.arg(1);
         let memory = &mut *ctx.memory;
         let Some(duration) = linux_clock_duration(clock_id) else {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         };
         let timespec = linux_timespec_from_duration(duration);
         Ok(write_kernel_struct(memory, address, &timespec))
@@ -268,9 +252,7 @@ impl SyscallDispatcher {
         let address = ctx.arg(1);
         let memory = &mut *ctx.memory;
         if linux_clock_duration(clock_id).is_none() {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         if address == 0 {
             return Ok(DispatchOutcome::Returned { value: 0 });
@@ -290,9 +272,7 @@ impl SyscallDispatcher {
         let address = ctx.arg(1);
         let memory = &*ctx.memory;
         if !linux_clock_is_known(clock_id) {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         // Reading the timespec lets us surface EFAULT for bad pointers and
         // EINVAL for invalid tv_nsec, matching the order real Linux performs
@@ -300,25 +280,21 @@ impl SyscallDispatcher {
         // clocks.
         let timespec = match read_timespec(memory, address) {
             Ok(timespec) => timespec,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         let tv_nsec = timespec.tv_nsec;
         if !(0..1_000_000_000).contains(&tv_nsec) {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         // Monotonic-family clocks can never be set; report EINVAL like the
         // real kernel.
         if !linux_clock_is_settable(clock_id) {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         // For settable clocks (CLOCK_REALTIME, CLOCK_REALTIME_ALARM, CLOCK_TAI)
         // we still refuse: we are not root and we do not actually mutate the
         // host clock.
-        Ok(DispatchOutcome::Errno { errno: LINUX_EPERM })
+        Ok(LINUX_EPERM.into())
     }
 
     pub(super) fn getitimer<M: GuestMemory>(
@@ -329,14 +305,10 @@ impl SyscallDispatcher {
         let address = ctx.arg(1);
         let memory = &mut *ctx.memory;
         if !linux_itimer_which_is_valid(which) {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         if address == 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EFAULT,
-            });
+            return Ok(LINUX_EFAULT.into());
         }
         let current = itimerval_from_state(self.proc.lock().itimers[which as usize]);
         Ok(write_kernel_struct(memory, address, &current))
@@ -351,23 +323,19 @@ impl SyscallDispatcher {
         let old_address = ctx.arg(2);
         let memory = &mut *ctx.memory;
         if !linux_itimer_which_is_valid(which) {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         // Read+validate the new value first (so an EINVAL/EFAULT doesn't
         // disturb the currently-armed timer or the old_value out-param).
         let new_value = if new_address != 0 {
             let v = match read_itimerval(memory, new_address) {
                 Ok(value) => value,
-                Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                Err(errno) => return Ok(errno.into()),
             };
             if !linux_timeval_usec_is_valid(v.it_interval)
                 || !linux_timeval_usec_is_valid(v.it_value)
             {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_EINVAL,
-                });
+                return Ok(LINUX_EINVAL.into());
             }
             Some(v)
         } else {
@@ -447,9 +415,7 @@ impl SyscallDispatcher {
         // generally only CLOCK_REALTIME at all for adjtime semantics); anything
         // else is EINVAL.
         if clock_id != LINUX_CLOCK_REALTIME {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         Ok(adjtimex_bootstrap(memory, address))
     }
@@ -468,9 +434,7 @@ impl SyscallDispatcher {
                 .write_bytes(ctx.request.arg(0), timeval.as_bytes())
                 .is_err()
             {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_EFAULT,
-                });
+                return Ok(LINUX_EFAULT.into());
             }
         }
         if timezone != 0
@@ -478,9 +442,7 @@ impl SyscallDispatcher {
                 .write_bytes(timezone, LinuxTimezone::utc().abi_bytes())
                 .is_err()
         {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EFAULT,
-            });
+            return Ok(LINUX_EFAULT.into());
         }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
@@ -489,7 +451,7 @@ impl SyscallDispatcher {
         &self,
         _ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        Ok(DispatchOutcome::Errno { errno: LINUX_EPERM })
+        Ok(LINUX_EPERM.into())
     }
 
     pub(super) fn sysinfo<M: GuestMemory>(
@@ -513,9 +475,7 @@ impl SyscallDispatcher {
             _padding: [0; 8],
         };
         if write_kernel_struct_raw(memory, ctx.request.arg(0), &info).is_err() {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EFAULT,
-            });
+            return Ok(LINUX_EFAULT.into());
         }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
@@ -536,9 +496,7 @@ impl SyscallDispatcher {
                 .write_bytes(buf, LinuxTms::zeroed().abi_bytes())
                 .is_err()
         {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EFAULT,
-            });
+            return Ok(LINUX_EFAULT.into());
         }
         Ok(DispatchOutcome::Returned { value: clock })
     }
@@ -553,23 +511,17 @@ impl SyscallDispatcher {
         match who {
             LINUX_RUSAGE_SELF | LINUX_RUSAGE_CHILDREN | LINUX_RUSAGE_THREAD => {}
             _ => {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_EINVAL,
-                });
+                return Ok(LINUX_EINVAL.into());
             }
         }
         if usage == 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EFAULT,
-            });
+            return Ok(LINUX_EFAULT.into());
         }
         if memory
             .write_bytes(usage, LinuxRusage::zeroed().abi_bytes())
             .is_err()
         {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EFAULT,
-            });
+            return Ok(LINUX_EFAULT.into());
         }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
@@ -607,9 +559,7 @@ impl SyscallDispatcher {
         // prlimit64 writes the OLD limit before applying the new one, so a
         // read-modify-write (both pointers set) sees the prior value.
         if old_limit != 0 && write_kernel_struct_raw(memory, old_limit, &limit).is_err() {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EFAULT,
-            });
+            return Ok(LINUX_EFAULT.into());
         }
         // Setting a limit: validate and accept. carrick does not enforce most
         // resource limits (RLIMIT_CORE/CPU/etc. are advisory here), but a
@@ -620,9 +570,7 @@ impl SyscallDispatcher {
             let bytes = match memory.read_bytes(new_limit, 16) {
                 Ok(b) => b,
                 Err(_) => {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: LINUX_EFAULT,
-                    });
+                    return Ok(LINUX_EFAULT.into());
                 }
             };
             let rlim_cur = u64::from_le_bytes(bytes[0..8].try_into().unwrap_or([0; 8]));
@@ -630,9 +578,7 @@ impl SyscallDispatcher {
             // RLIM_INFINITY (u64::MAX) is the maximum; a soft limit above the
             // hard limit is EINVAL.
             if rlim_cur > rlim_max {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_EINVAL,
-                });
+                return Ok(LINUX_EINVAL.into());
             }
         }
         Ok(DispatchOutcome::Returned { value: 0 })
