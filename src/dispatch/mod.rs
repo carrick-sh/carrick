@@ -563,6 +563,18 @@ pub trait GuestMemory {
         Err(MemoryError::Unsupported)
     }
 
+    /// Back `[guest_addr, guest_addr+len)` with a host `MAP_SHARED|MAP_ANON`
+    /// region (no file), so a guest `MAP_SHARED` anonymous mapping stays shared
+    /// across `fork(2)` instead of being snapshotted private — POSIX requires
+    /// this, and a cross-process futex (LTP futex_wake03 forks children that
+    /// FUTEX_WAIT on a shared-anon word) depends on it. Like `map_shared_file`,
+    /// it marks the region `guest_shared` (not snapshotted on fork; eligible
+    /// for `shared_futex_host_addr`). Default: unsupported → caller falls back
+    /// to a private anon mapping.
+    fn map_shared_anon(&mut self, _guest_addr: u64, _len: usize) -> Result<(), MemoryError> {
+        Err(MemoryError::Unsupported)
+    }
+
     /// Tear down a shared file mapping previously created by
     /// `map_shared_file`. Default no-op.
     fn unmap_shared_file(&mut self, _guest_addr: u64, _len: usize) -> Result<(), MemoryError> {
@@ -2219,16 +2231,18 @@ fn dispatch_threaded_futex(
     match command {
         LINUX_FUTEX_WAKE => {
             if let Some(host_addr) = shared_host_addr {
-                // __ulock has no "count woken" return; report the requested
-                // count on success (0 if no waiter). tst_checkpoint wakes one.
-                let r = crate::ulock::wake(host_addr, value > 1);
-                let woke = if r < 0 {
-                    0
-                } else if value <= 1 {
-                    1
-                } else {
-                    i64::from(value)
-                };
+                // Linux FUTEX_WAKE wakes EXACTLY up to `value` waiters and
+                // returns the count. __ulock_wake only does wake-one or
+                // wake-all, so wake one at a time up to `value`, counting real
+                // wakes until none remain (-ENOENT). (LTP futex_wake03 wakes
+                // children incrementally and checks each count.)
+                let mut woke = 0i64;
+                for _ in 0..value {
+                    if crate::ulock::wake(host_addr, false) < 0 {
+                        break; // no more waiters
+                    }
+                    woke += 1;
+                }
                 return DispatchOutcome::Returned { value: woke };
             }
             let n = futex.wake(address, value);

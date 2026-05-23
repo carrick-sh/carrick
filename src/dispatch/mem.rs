@@ -221,6 +221,28 @@ impl SyscallDispatcher {
             }
         }
 
+        // Coherent MAP_SHARED anonymous mapping: back it with a host
+        // MAP_SHARED|MAP_ANON region (shared across fork), so the guest's
+        // shared-anon memory is genuinely shared between forked processes
+        // (POSIX) and usable as a cross-process futex word (LTP futex_wake03
+        // forks children that FUTEX_WAIT on it). MAP_FIXED keeps the snapshot
+        // path; the memory backend (--fs memory / tests) falls through too.
+        if flags & LINUX_MAP_ANONYMOUS != 0
+            && map_type == LINUX_MAP_SHARED
+            && flags & LINUX_MAP_FIXED == 0
+        {
+            let map_len = align_up_u64(length, hvf_page)
+                .and_then(|l| usize::try_from(l).ok())
+                .unwrap_or(length_usize);
+            if let Some(addr) = self.next_shared_file_address(map_len as u64) {
+                if memory.map_shared_anon(addr, map_len).is_ok() {
+                    self.mem.lock().shared_file_maps.push((addr, map_len));
+                    return Ok(DispatchOutcome::Returned { value: addr as i64 });
+                }
+                // else fall through to the private-anon snapshot path.
+            }
+        }
+
         let address = match self.next_mmap_address(requested, length, prot, flags) {
             Some(address) => address,
             None => {
