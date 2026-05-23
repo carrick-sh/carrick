@@ -73,6 +73,9 @@ use carrick::thread::{FutexTable, ThreadRegistry};
 use std::sync::Arc;
 
 const LINUX_EAGAIN: i32 = 11;
+const LINUX_ENOSYS: i32 = 38;
+const FUTEX_REQUEUE_REASON: &str =
+    "FUTEX_(CMP_)REQUEUE unsupported: host has no futex-requeue primitive";
 
 fn write_u32_le(memory: &mut LinearMemory, addr: u64, value: u32) {
     memory.write_bytes(addr, &value.to_le_bytes()).unwrap();
@@ -203,6 +206,78 @@ fn futex_wait_matching_value_blocks_via_outcome() {
         }
         other => panic!("expected FutexWait, got {other:?}"),
     }
+}
+
+#[test]
+fn futex_requeue_returns_enosys_and_records_compat_gap() {
+    let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
+    let reporter = CompatReporter::default();
+    let dispatcher = SyscallDispatcher::new();
+    let registry = Arc::new(ThreadRegistry::new(1000));
+    let futex = Arc::new(FutexTable::new());
+    write_u32_le(&mut memory, 0x10800, 0);
+    write_u32_le(&mut memory, 0x10900, 0);
+
+    let op = LINUX_FUTEX_REQUEUE | LINUX_FUTEX_PRIVATE_FLAG;
+    let outcome = dispatcher
+        .dispatch_threaded(
+            SyscallRequest::new(98, SyscallArgs::from([0x10800, op, 1, 8, 0x10900, 0])),
+            &mut memory,
+            &reporter,
+            1001,
+            &registry,
+            &futex,
+        )
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        DispatchOutcome::Errno {
+            errno: LINUX_ENOSYS
+        }
+    );
+    let report = reporter.finish();
+    assert_eq!(report.summary.distinct_partial_syscalls, 1);
+    assert_eq!(report.summary.partial_syscall_invocations, 1);
+    assert_eq!(report.partial_syscalls[0].number, 98);
+    assert_eq!(report.partial_syscalls[0].name, "futex");
+    assert_eq!(report.partial_syscalls[0].reason, FUTEX_REQUEUE_REASON);
+}
+
+#[test]
+fn futex_cmp_requeue_returns_enosys_and_records_compat_gap() {
+    let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
+    let reporter = CompatReporter::default();
+    let dispatcher = SyscallDispatcher::new();
+    let registry = Arc::new(ThreadRegistry::new(1000));
+    let futex = Arc::new(FutexTable::new());
+    write_u32_le(&mut memory, 0x10800, 77);
+    write_u32_le(&mut memory, 0x10900, 0);
+
+    let op = LINUX_FUTEX_CMP_REQUEUE | LINUX_FUTEX_PRIVATE_FLAG;
+    let outcome = dispatcher
+        .dispatch_threaded(
+            SyscallRequest::new(98, SyscallArgs::from([0x10800, op, 1, 8, 0x10900, 77])),
+            &mut memory,
+            &reporter,
+            1001,
+            &registry,
+            &futex,
+        )
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        DispatchOutcome::Errno {
+            errno: LINUX_ENOSYS
+        }
+    );
+    let report = reporter.finish();
+    assert_eq!(report.summary.distinct_partial_syscalls, 1);
+    assert_eq!(report.summary.partial_syscall_invocations, 1);
+    assert_eq!(report.partial_syscalls[0].number, 98);
+    assert_eq!(report.partial_syscalls[0].name, "futex");
+    assert_eq!(report.partial_syscalls[0].reason, FUTEX_REQUEUE_REASON);
 }
 
 // --- Sub-task B (P3): tgkill/tkill cross-thread routing ---
