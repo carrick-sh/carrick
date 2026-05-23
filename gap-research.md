@@ -58,6 +58,9 @@ Work package progress:
   - Completed: added an `OwnedHostMapping` RAII boundary for host `mmap` lifetimes while keeping HVF `hv_vm_map`/`hv_vm_unmap` calls explicit in the trap layer.
   - Completed: moved guest `PROT_NONE` intervals into shared process-wide protection metadata and carried that metadata through thread sibling specs.
   - Verified host mapping drop cleanup, shared protection updates across cloned thread metadata, `syscall_mem`, `syscall_thread`, and the memory concurrency contract.
+- [x] S6. FUTEX_REQUEUE Compatibility Coverage
+  - Completed: added syscall-thread regression coverage for both `FUTEX_REQUEUE` and `FUTEX_CMP_REQUEUE`.
+  - Verified both commands keep returning `ENOSYS` and emit the stable `FUTEX_(CMP_)REQUEUE unsupported` compatibility event.
 - [ ] Package 6. VFS and Stat Ownership
 - [ ] Hygiene gates and final verification sweep
 
@@ -474,7 +477,7 @@ Recommendation:
 
 Validation target:
 
-- `FUTEX_(CMP_)REQUEUE` returns `ENOSYS` and emits a stable compatibility event.
+- `FUTEX_(CMP_)REQUEUE` returns `ENOSYS` and emits a stable compatibility event. Completed with syscall-thread regression tests for both futex requeue commands.
 - Known condvar workloads in target libc versions do not hit the gap in normal operation.
 
 ### L1. Synthetic `/proc` and `/sys` ownership is inverted
