@@ -286,7 +286,7 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
     // a leftover SIGTERM.
     let _ = carrick::host_signal::take_pending();
 
-    // tkill(1, 0) -> success; tkill(0, 0) -> ESRCH (tid 0 isn't us).
+    // tkill(1, 0) -> success; tkill(0, 0) -> EINVAL (Linux rejects non-positive tids).
     assert_eq!(
         dispatcher
             .dispatch(
@@ -305,7 +305,9 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: LINUX_ESRCH }
+        DispatchOutcome::Errno {
+            errno: LINUX_EINVAL
+        }
     );
     // tkill(1, 65) -> EINVAL, tkill(99, 0) -> ESRCH, tkill(1, 1) -> ENOSYS.
     assert_eq!(
