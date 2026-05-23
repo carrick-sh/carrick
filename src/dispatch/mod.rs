@@ -356,7 +356,7 @@ mod signal;
 mod time;
 
 pub use crate::vfs::ProcMapsEntry;
-pub use abi_args::{Fd, GuestLen, GuestPtr, Pid};
+pub use abi_args::{Fd, GuestLen, GuestPtr, Pid, Signal};
 
 #[allow(dead_code)]
 const MAX_GUEST_PATH: usize = 4096;
