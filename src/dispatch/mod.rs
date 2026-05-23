@@ -3818,88 +3818,46 @@ impl HostSyscallResult for i64 {
 /// host's libc decided to name (or number) these — when we run on
 /// macOS, `libc::EAGAIN` is 35, but Linux's EAGAIN is 11. We need
 /// constant Linux numbers regardless of host.
+/// Linux UAPI errno values, re-exported under their bare names from the
+/// canonical table in `crate::linux_abi`. Sourced originally from
+/// `linux/include/uapi/asm-generic/errno-base.h` and `errno.h`. The Linux
+/// numbers are hardcoded (in `linux_abi`) so the translation is independent
+/// of whatever the host's libc decided to name (or number) these — on macOS
+/// `libc::EAGAIN` is 35, but Linux's EAGAIN is 11. `macos_to_linux_errno`
+/// and its tests refer to these as `linux_errno::EFAULT`; the numbers live
+/// in exactly one place (linux_abi's `LINUX_E*`) so the two can't drift.
 #[allow(dead_code)]
 pub mod linux_errno {
-    pub const EPERM: i32 = 1;
-    pub const ENOENT: i32 = 2;
-    pub const ESRCH: i32 = 3;
-    pub const EINTR: i32 = 4;
-    pub const EIO: i32 = 5;
-    pub const ENXIO: i32 = 6;
-    pub const E2BIG: i32 = 7;
-    pub const ENOEXEC: i32 = 8;
-    pub const EBADF: i32 = 9;
-    pub const ECHILD: i32 = 10;
-    pub const EAGAIN: i32 = 11; // ≡ EWOULDBLOCK
-    pub const ENOMEM: i32 = 12;
-    pub const EACCES: i32 = 13;
-    pub const EFAULT: i32 = 14;
-    pub const ENOTBLK: i32 = 15;
-    pub const EBUSY: i32 = 16;
-    pub const EEXIST: i32 = 17;
-    pub const EXDEV: i32 = 18;
-    pub const ENODEV: i32 = 19;
-    pub const ENOTDIR: i32 = 20;
-    pub const EISDIR: i32 = 21;
-    pub const EINVAL: i32 = 22;
-    pub const ENFILE: i32 = 23;
-    pub const EMFILE: i32 = 24;
-    pub const ENOTTY: i32 = 25;
-    pub const ETXTBSY: i32 = 26;
-    pub const EFBIG: i32 = 27;
-    pub const ENOSPC: i32 = 28;
-    pub const ESPIPE: i32 = 29;
-    pub const EROFS: i32 = 30;
-    pub const EMLINK: i32 = 31;
-    pub const EPIPE: i32 = 32;
-    pub const EDOM: i32 = 33;
-    pub const ERANGE: i32 = 34;
-    // ----- Linux SysV-style codes start here; macOS diverges -----
-    pub const EDEADLK: i32 = 35;
-    pub const ENAMETOOLONG: i32 = 36;
-    pub const ENOLCK: i32 = 37;
-    pub const ENOSYS: i32 = 38;
-    pub const ENOTEMPTY: i32 = 39;
-    pub const ELOOP: i32 = 40;
-    pub const ENOMSG: i32 = 42;
-    pub const EIDRM: i32 = 43;
-    pub const ENOLINK: i32 = 67;
-    pub const EBADMSG: i32 = 74;
-    pub const EOVERFLOW: i32 = 75;
-    pub const EILSEQ: i32 = 84;
-    pub const ENOTSOCK: i32 = 88;
-    pub const EDESTADDRREQ: i32 = 89;
-    pub const EMSGSIZE: i32 = 90;
-    pub const EPROTOTYPE: i32 = 91;
-    pub const ENOPROTOOPT: i32 = 92;
-    pub const EPROTONOSUPPORT: i32 = 93;
-    pub const ESOCKTNOSUPPORT: i32 = 94;
-    pub const EOPNOTSUPP: i32 = 95; // ≡ ENOTSUP
-    pub const EPFNOSUPPORT: i32 = 96;
-    pub const EAFNOSUPPORT: i32 = 97;
-    pub const EADDRINUSE: i32 = 98;
-    pub const EADDRNOTAVAIL: i32 = 99;
-    pub const ENETDOWN: i32 = 100;
-    pub const ENETUNREACH: i32 = 101;
-    pub const ENETRESET: i32 = 102;
-    pub const ECONNABORTED: i32 = 103;
-    pub const ECONNRESET: i32 = 104;
-    pub const ENOBUFS: i32 = 105;
-    pub const EISCONN: i32 = 106;
-    pub const ENOTCONN: i32 = 107;
-    pub const ESHUTDOWN: i32 = 108;
-    pub const ETOOMANYREFS: i32 = 109;
-    pub const ETIMEDOUT: i32 = 110;
-    pub const ECONNREFUSED: i32 = 111;
-    pub const EHOSTDOWN: i32 = 112;
-    pub const EHOSTUNREACH: i32 = 113;
-    pub const EALREADY: i32 = 114;
-    pub const EINPROGRESS: i32 = 115;
-    pub const ESTALE: i32 = 116;
-    pub const EUCLEAN: i32 = 117;
-    pub const EREMOTE: i32 = 121;
-    pub const EDQUOT: i32 = 122;
-    pub const ECANCELED: i32 = 125;
+    pub use crate::linux_abi::{
+        LINUX_E2BIG as E2BIG, LINUX_EACCES as EACCES, LINUX_EADDRINUSE as EADDRINUSE,
+        LINUX_EADDRNOTAVAIL as EADDRNOTAVAIL, LINUX_EAFNOSUPPORT as EAFNOSUPPORT,
+        LINUX_EAGAIN as EAGAIN, LINUX_EALREADY as EALREADY, LINUX_EBADF as EBADF,
+        LINUX_EBADMSG as EBADMSG, LINUX_EBUSY as EBUSY, LINUX_ECANCELED as ECANCELED,
+        LINUX_ECHILD as ECHILD, LINUX_ECONNABORTED as ECONNABORTED,
+        LINUX_ECONNREFUSED as ECONNREFUSED, LINUX_ECONNRESET as ECONNRESET,
+        LINUX_EDEADLK as EDEADLK, LINUX_EDESTADDRREQ as EDESTADDRREQ, LINUX_EDOM as EDOM,
+        LINUX_EDQUOT as EDQUOT, LINUX_EEXIST as EEXIST, LINUX_EFAULT as EFAULT,
+        LINUX_EFBIG as EFBIG, LINUX_EHOSTDOWN as EHOSTDOWN, LINUX_EHOSTUNREACH as EHOSTUNREACH,
+        LINUX_EIDRM as EIDRM, LINUX_EILSEQ as EILSEQ, LINUX_EINPROGRESS as EINPROGRESS,
+        LINUX_EINTR as EINTR, LINUX_EINVAL as EINVAL, LINUX_EIO as EIO, LINUX_EISCONN as EISCONN,
+        LINUX_EISDIR as EISDIR, LINUX_ELOOP as ELOOP, LINUX_EMFILE as EMFILE,
+        LINUX_EMLINK as EMLINK, LINUX_EMSGSIZE as EMSGSIZE, LINUX_ENAMETOOLONG as ENAMETOOLONG,
+        LINUX_ENETDOWN as ENETDOWN, LINUX_ENETRESET as ENETRESET, LINUX_ENETUNREACH as ENETUNREACH,
+        LINUX_ENFILE as ENFILE, LINUX_ENOBUFS as ENOBUFS, LINUX_ENODEV as ENODEV,
+        LINUX_ENOENT as ENOENT, LINUX_ENOEXEC as ENOEXEC, LINUX_ENOLCK as ENOLCK,
+        LINUX_ENOLINK as ENOLINK, LINUX_ENOMEM as ENOMEM, LINUX_ENOMSG as ENOMSG,
+        LINUX_ENOPROTOOPT as ENOPROTOOPT, LINUX_ENOSPC as ENOSPC, LINUX_ENOSYS as ENOSYS,
+        LINUX_ENOTBLK as ENOTBLK, LINUX_ENOTCONN as ENOTCONN, LINUX_ENOTDIR as ENOTDIR,
+        LINUX_ENOTEMPTY as ENOTEMPTY, LINUX_ENOTSOCK as ENOTSOCK, LINUX_ENOTTY as ENOTTY,
+        LINUX_ENXIO as ENXIO, LINUX_EOPNOTSUPP as EOPNOTSUPP, LINUX_EOVERFLOW as EOVERFLOW,
+        LINUX_EPERM as EPERM, LINUX_EPFNOSUPPORT as EPFNOSUPPORT, LINUX_EPIPE as EPIPE,
+        LINUX_EPROTONOSUPPORT as EPROTONOSUPPORT, LINUX_EPROTOTYPE as EPROTOTYPE,
+        LINUX_ERANGE as ERANGE, LINUX_EREMOTE as EREMOTE, LINUX_EROFS as EROFS,
+        LINUX_ESHUTDOWN as ESHUTDOWN, LINUX_ESOCKTNOSUPPORT as ESOCKTNOSUPPORT,
+        LINUX_ESPIPE as ESPIPE, LINUX_ESRCH as ESRCH, LINUX_ESTALE as ESTALE,
+        LINUX_ETIMEDOUT as ETIMEDOUT, LINUX_ETOOMANYREFS as ETOOMANYREFS, LINUX_ETXTBSY as ETXTBSY,
+        LINUX_EUCLEAN as EUCLEAN, LINUX_EXDEV as EXDEV,
+    };
 }
 
 /// Robust, systematic macOS-errno → Linux-errno translation. Driven

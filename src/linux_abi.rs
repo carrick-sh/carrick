@@ -1162,6 +1162,55 @@ pub const LINUX_ENOSYS: i32 = 38;
 pub const LINUX_ENOTEMPTY: i32 = 39;
 pub const LINUX_ENODATA: i32 = 61;
 pub const LINUX_E2BIG: i32 = 7;
+// Remaining Linux UAPI errno values (asm-generic/errno-base.h + errno.h),
+// canonical home for the `linux_errno` re-export table in dispatch/mod.rs.
+pub const LINUX_EIO: i32 = 5;
+pub const LINUX_ENOEXEC: i32 = 8;
+pub const LINUX_ENOTBLK: i32 = 15;
+pub const LINUX_EBUSY: i32 = 16;
+pub const LINUX_EXDEV: i32 = 18;
+pub const LINUX_ENODEV: i32 = 19;
+pub const LINUX_ENFILE: i32 = 23;
+pub const LINUX_EMFILE: i32 = 24;
+pub const LINUX_ETXTBSY: i32 = 26;
+pub const LINUX_ENOSPC: i32 = 28;
+pub const LINUX_EMLINK: i32 = 31;
+pub const LINUX_EDOM: i32 = 33;
+// ----- Linux SysV-style codes; macOS diverges -----
+pub const LINUX_EDEADLK: i32 = 35;
+pub const LINUX_ENOLCK: i32 = 37;
+pub const LINUX_ELOOP: i32 = 40;
+pub const LINUX_ENOMSG: i32 = 42;
+pub const LINUX_EIDRM: i32 = 43;
+pub const LINUX_ENOLINK: i32 = 67;
+pub const LINUX_EBADMSG: i32 = 74;
+pub const LINUX_EOVERFLOW: i32 = 75;
+pub const LINUX_EILSEQ: i32 = 84;
+pub const LINUX_EDESTADDRREQ: i32 = 89;
+pub const LINUX_EMSGSIZE: i32 = 90;
+pub const LINUX_EPROTOTYPE: i32 = 91;
+pub const LINUX_EPROTONOSUPPORT: i32 = 93;
+pub const LINUX_EOPNOTSUPP: i32 = 95; // ≡ ENOTSUP
+pub const LINUX_EPFNOSUPPORT: i32 = 96;
+pub const LINUX_EADDRINUSE: i32 = 98;
+pub const LINUX_EADDRNOTAVAIL: i32 = 99;
+pub const LINUX_ENETDOWN: i32 = 100;
+pub const LINUX_ENETUNREACH: i32 = 101;
+pub const LINUX_ENETRESET: i32 = 102;
+pub const LINUX_ECONNABORTED: i32 = 103;
+pub const LINUX_ECONNRESET: i32 = 104;
+pub const LINUX_ENOBUFS: i32 = 105;
+pub const LINUX_ENOTCONN: i32 = 107;
+pub const LINUX_ESHUTDOWN: i32 = 108;
+pub const LINUX_ETOOMANYREFS: i32 = 109;
+pub const LINUX_ECONNREFUSED: i32 = 111;
+pub const LINUX_EHOSTDOWN: i32 = 112;
+pub const LINUX_EHOSTUNREACH: i32 = 113;
+pub const LINUX_ESTALE: i32 = 116;
+pub const LINUX_EUCLEAN: i32 = 117;
+pub const LINUX_EREMOTE: i32 = 121;
+pub const LINUX_EDQUOT: i32 = 122;
+pub const LINUX_ECANCELED: i32 = 125;
 // Linux setxattr(2) flags. Same semantics as the macOS XATTR_CREATE/
 // XATTR_REPLACE options (which carry different numeric values).
 pub const LINUX_XATTR_CREATE: i32 = 0x1;
