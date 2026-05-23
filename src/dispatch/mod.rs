@@ -2916,6 +2916,7 @@ impl SyscallDispatcher {
 pub fn synthetic_proc_file(path: &str, ctx: &SyntheticProcContext) -> Option<Vec<u8>> {
     match path {
         "/proc/cmdline" => Some(synthetic_proc_cmdline().to_vec()),
+        "/proc/config.gz" => Some(synthetic_proc_config_gz()),
         "/proc/cpuinfo" => Some(synthetic_proc_cpuinfo().to_vec()),
         "/proc/diskstats" => Some(synthetic_proc_diskstats().to_vec()),
         "/proc/filesystems" => Some(synthetic_proc_filesystems().to_vec()),
@@ -3284,6 +3285,62 @@ fn synthetic_proc_filesystems() -> &'static [u8] {
 nodev\tproc\n\
 nodev\tsysfs\n\
 nodev\toverlay\n"
+}
+
+/// Gzipped kernel config for `/proc/config.gz`. LTP's `tst_kconfig` TBROKs the
+/// ENTIRE test ("Cannot parse kernel .config") when no config file exists,
+/// hiding every assertion behind a setup failure. Synthesising a parseable
+/// config turns those blanket TBROKs into real per-feature results: a test
+/// whose `.needs_kconfigs` option is present here runs; one that needs an
+/// option we omit cleanly TCONF-skips (as on a kernel without it). We enable
+/// the options for the syscall features carrick actually implements, so e.g.
+/// the eventfd/timerfd/epoll/signalfd tests run instead of breaking.
+fn synthetic_proc_config_gz() -> Vec<u8> {
+    use std::io::Write;
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<Vec<u8>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            // A permissive .config: features carrick models are `=y`. Order and
+            // exact set don't matter to tst_kconfig — it parses `KEY=VAL` lines.
+            let body = "\
+# Synthesised by carrick for /proc/config.gz\n\
+CONFIG_64BIT=y\n\
+CONFIG_ARM64=y\n\
+CONFIG_MMU=y\n\
+CONFIG_EVENTFD=y\n\
+CONFIG_SIGNALFD=y\n\
+CONFIG_TIMERFD=y\n\
+CONFIG_EPOLL=y\n\
+CONFIG_FUTEX=y\n\
+CONFIG_FUTEX_PI=y\n\
+CONFIG_POSIX_TIMERS=y\n\
+CONFIG_POSIX_MQUEUE=y\n\
+CONFIG_AIO=y\n\
+CONFIG_FHANDLE=y\n\
+CONFIG_INOTIFY_USER=y\n\
+CONFIG_SYSVIPC=y\n\
+CONFIG_SECCOMP=y\n\
+CONFIG_SECCOMP_FILTER=y\n\
+CONFIG_CGROUPS=y\n\
+CONFIG_PROC_FS=y\n\
+CONFIG_SYSFS=y\n\
+CONFIG_TMPFS=y\n\
+CONFIG_OVERLAY_FS=y\n\
+CONFIG_UNIX=y\n\
+CONFIG_INET=y\n\
+CONFIG_IPV6=y\n\
+CONFIG_NET=y\n\
+CONFIG_UTS_NS=y\n\
+CONFIG_IPC_NS=y\n\
+CONFIG_PID_NS=y\n\
+CONFIG_NET_NS=y\n\
+CONFIG_USER_NS=y\n";
+            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            let _ = enc.write_all(body.as_bytes());
+            enc.finish().unwrap_or_default()
+        })
+        .clone()
 }
 
 fn synthetic_proc_partitions() -> &'static [u8] {
