@@ -5,14 +5,68 @@
 
 ## Completion Ledger
 
-Status: in progress on branch `codex/address-gap-research`.
+Status: implementation complete on branch `codex/address-gap-research`; final full-suite verification and `main` fast-forward pending.
 
 Plan: `docs/superpowers/plans/2026-05-23-gap-research-completion.md`
 
-- [ ] Security and guest-visible correctness batch: xattrs, rooted path handling, allocation caps, memory advice, signal alt-stack validation, time/sysinfo, host socket nonblocking, entropy/ELF validation.
-- [ ] Runtime safety and maintainability batch: panic-safe trap rebuild, fork snapshot ownership, `PROT_NONE` lookup, `GPR_TABLE`, runtime trace flag caching, lock ordering, C-string reads, `/proc` task listing, SIGWINCH draining, DTrace RAII.
-- [ ] Partial-addressed review items: errno/error boundary, duplicated trap-loop responsibilities, and subsystem/crate error typing either completed or closed with evidence.
+- [x] Security and guest-visible correctness batch: xattrs, rooted path handling, allocation caps, memory advice, signal alt-stack validation, time/sysinfo, host socket nonblocking, entropy/ELF validation.
+- [x] Runtime safety and maintainability batch: panic-safe trap rebuild, fork snapshot ownership, `PROT_NONE` lookup, `GPR_TABLE`, runtime trace flag caching, lock ordering, C-string reads, `/proc` task listing, SIGWINCH draining, DTrace RAII.
+- [x] Partial-addressed review items: errno/error boundary, duplicated trap-loop responsibilities, and subsystem/crate error typing either completed or closed with evidence.
 - [ ] Final verification and integration: targeted tests, full cargo hygiene, logical commits, and fast-forward back into `main`.
+
+The historical review tables below are retained for traceability. This resolution ledger is authoritative for the current branch.
+
+### Resolution Ledger
+
+#### Previously Partially Addressed
+
+| Finding | Resolution | Evidence |
+|---|---|---|
+| Errno sign convention inconsistency | Closed. Dispatcher/runtime code now uses typed `DispatchError`, `HostSyscallError`, `host_syscall_errno()`, and explicit `DispatchOutcome::Errno`; `anyhow` remains only at CLI presentation boundaries. | `rg -n "anyhow!|anyhow::" src`; `cargo test --test syscall_fs -- --nocapture` |
+| Three trap loops duplicate responsibilities | Closed. Threaded HVF execution is centralized in `ThreadRuntimeState`; remaining split/combined loops are intentionally separate runtime modes (generic split-memory tests vs HVF) with shared syscall/exec/fork primitives and cached tracing. | `src/runtime.rs`; `cargo test --lib -- --nocapture` |
+| Per-subsystem error types | Closed. Library boundaries now expose typed errors (`DispatchError`, `RuntimeError`, `TrapError`, `AddressSpaceError`, `BackendError`, `RootFsError`, `DTraceError`, etc.); a crate-wide `CarrickError` would be unused wrapping churn. | `rg -n "pub enum .*Error" src`; `cargo test --lib -- --nocapture` |
+
+#### Previous Open Items
+
+| # | Resolution | Evidence |
+|---|---|---|
+| 1 `ptr::write(self)` in fork/execve | Fixed by moving no-drop replacement to `replace_destroyed_hvf_inner()`, after fresh HVF state is fully constructed. | `src/trap.rs`; `cargo test --lib -- --nocapture` |
+| 2 Internal xattrs leak | Fixed by hiding all `user.carrick.*` names from guest get/set/list xattr APIs. | `host_guest_xattr_api_hides_all_internal_carrick_names`; `cargo test --lib -- --nocapture` |
+| 3 Symlink TOCTOU in `resolve_beneath()` | Verified stale and guarded. There is no `resolve_beneath()`/`canonicalize()` path; host access stays under cap-std, with path-escape and symlink-loop tests. | `host_rejects_path_escape`; `host_resolve_following_enforces_symlink_hop_limit` |
+| 4 `ptsname()` thread-safety | Fixed production `/dev/pts` allocation to use `ptsname_r` FFI and return an owned slave path. | `vfs::devpts::tests::open_master_returns_fd_and_slave_name` |
+| 5 `truncate()` OOM | Fixed with `MAX_IN_MEMORY_FILE_SIZE` and EFBIG on oversized in-memory truncate/ftruncate/growth. | `ftruncate_rejects_unbounded_in_memory_file_growth`; `truncate_rejects_unbounded_in_memory_file_growth` |
+| 6 Linear `PROT_NONE` scan | Fixed with sorted/coalesced ranges and binary-search lookup. | `protection_ranges_are_sorted_coalesced_and_split_on_clear` |
+| 7 Duplicated `GPR_TABLE` | Fixed with one module-level `GPR_TABLE` shared by snapshot/restore/signal/exec paths. | `rg -n "const GPR_TABLE" src/trap.rs` |
+| 8 Runtime `env::var_os` in loops | Fixed by caching trace flags in loop/thread state. | `rg -n "CARRICK_TRACE_TRAPS" src/runtime.rs` |
+| 9 Lock ordering undocumented | Fixed with dispatch lock-ordering comments; FUTEX requeue explicitly returns ENOSYS instead of taking two bucket locks. | `src/dispatch/mod.rs`; `cargo test --test syscall_thread -- --nocapture` |
+| 10 `allocate_fd` TOCTOU | Verified stale: no `allocate_fd` path remains; fd reservation uses atomic install helpers with regression coverage. | `fd_install_helpers_reserve_single_and_pair_slots_atomically`; `rg -n "allocate_fd" src` |
+| 11 `MADV_DONTNEED` no-op | Fixed to zero-fill validated mapped ranges in chunks. | `cargo test --test syscall_mem -- --nocapture` |
+| 12 Symlink hop limit | Fixed/verified with 40-hop host resolver guard and existing rootfs symlink escape tests. | `host_resolve_following_enforces_symlink_hop_limit`; `rootfs::tests::*symlink*` |
+| 13 Fork snapshot buffers leak | Verified stale and comments corrected. Parent drops unused owned child snapshots; child moves owned snapshots into rebuilt mappings. | `src/trap.rs`; `host_mapping::tests::owned_host_mapping_unmaps_on_drop` |
+
+#### New Issues
+
+| Finding | Resolution | Evidence |
+|---|---|---|
+| SA_ONSTACK mapped-range validation | Fixed by checked alt-stack arithmetic and mapped/writable range validation before frame writes. | `signal_frame_stack_pointer_uses_checked_altstack_bounds`; `cargo test --lib -- --nocapture` |
+| `dup_fd` leak on shared-file mmap fallback | Fixed by making `GuestMemory::map_shared_file` own and close the duplicate fd on all returns. | `src/dispatch/mod.rs`; `src/trap.rs` |
+| `sysinfo.uptime` epoch time | Fixed with host boot-time uptime on macOS. | `sysinfo_reports_uptime_not_epoch_time`; `cargo test --test syscall_time -- --nocapture` |
+| `from_thread_spec` swallows `hv_vm_map` failures | Fixed to tolerate only `HV_BAD_ARGUMENT` and report all other HVF errors. | `src/trap.rs`; `cargo test --lib -- --nocapture` |
+| `getentropy` unchecked | Fixed with checked `getentropy()` and `/dev/urandom` fallback. | `fill_random_bytes_produces_nonzero_entropy` |
+| ELF segment `wrapping_add` | Fixed with checked segment-end arithmetic. | `rejects_load_segment_end_overflow_before_region_merge` |
+| `clock_gettime` monotonic overflow | Verified stale: current implementation uses host `clock_gettime()` into `Duration`, not `mach_absolute_time * numer`. | `cargo test --test syscall_time -- --nocapture` |
+| `rt_sigqueueinfo` self-signal after fork | Fixed by accepting the current host pid as self in addition to bootstrap pid. | `rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos` |
+| Host sockets blocking mode | Fixed by always setting host socket/socketpair fds nonblocking while preserving Linux-visible status flags. | `host_socket_install_forces_host_nonblocking_even_for_blocking_guest_fd`; `cargo test --test syscall_net -- --nocapture` |
+| `read_guest_c_string` byte-at-a-time | Fixed with chunked reads and boundary fallback. | `read_guest_c_string_reads_in_chunks_not_one_byte_at_a_time` |
+| `/proc/<pid>/task` fixed array | Verified stale: current renderer uses `current_thread_states()`/`Vec`, not a fixed 64-entry array. | `vfs::proc` tests via `cargo test --lib -- --nocapture` |
+| `FUTEX_CMP_REQUEUE` lock ordering | Fixed as an explicit ENOSYS compatibility gap with no source/destination bucket locking. | `src/dispatch/mod.rs` |
+| SIGWINCH drains one byte | Verified stale: relay drains the self-pipe in a loop until empty. | `src/pty_relay.rs`; `pty_relay::tests::*` |
+| `rt_sigprocmask(SIG_SETMASK)` stores SIGKILL/SIGSTOP | Verified fixed: mask clears SIGKILL/SIGSTOP before storage. | `cargo test --test syscall_signal -- --nocapture` |
+| Raw macOS errno in streamed stdio | Fixed to use `.host_syscall_errno()` translation. | `cargo test --test syscall_fs -- --nocapture` |
+| Syscall table sortedness | Fixed and guarded; the test caught and corrected misplaced `fchmodat2`. | `cargo test --test syscall_table -- --nocapture` |
+| ELF machine validation | Fixed by rejecting non-`EM_AARCH64` load plans. | `load_plan_rejects_non_aarch64_machine` |
+| `/proc/<pid>/cmdline` returns comm | Fixed by carrying current guest argv into synthetic proc and rendering NUL-separated argv. | `open_self_cmdline_uses_executable_path` |
+| DTrace manual cleanup | Fixed with RAII guards for DTrace handle, process handle, and owned output `FILE*`. | `dtrace_consumer::tests::*` via `cargo test --lib -- --nocapture` |
 
 ---
 
