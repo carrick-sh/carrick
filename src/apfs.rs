@@ -16,9 +16,10 @@
 //!   - case-sensitive paths (a hard Linux ABI requirement; the user's
 //!     usual `/Volumes/Macintosh HD` is case-insensitive and would
 //!     silently break paths like `/Foo` vs `/foo`),
-//!   - clonefile(2) seeding the scratch dir from the unpacked rootfs
-//!     becomes O(1) since the rootfs and the scratch share an APFS
-//!     container,
+//!   - the scratch dir lives on the same APFS volume as the unpacked
+//!     rootfs, so a future clonefile(2)-based seed could be O(1) (NOT
+//!     yet implemented — current seeding byte-copies via write_all; see
+//!     docs/superpowers/plans/2026-05-23-code-quality-darwin-ecosystem.md),
 //!   - throw-away on `carrick volume delete` is a single subvolume
 //!     destroy instead of an `rm -rf` of millions of inodes.
 
