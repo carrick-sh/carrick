@@ -202,7 +202,14 @@ pub fn spawn_signal_pump(
                 },
             ];
             unsafe {
-                libc::kevent(kq, changes.as_ptr(), 2, std::ptr::null_mut(), 0, std::ptr::null());
+                libc::kevent(
+                    kq,
+                    changes.as_ptr(),
+                    2,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null(),
+                );
             }
             // Publish the kq so `notify_pump` can NOTE_TRIGGER our EVFILT_USER.
             crate::host_signal::set_pump_kqueue(kq);
@@ -216,7 +223,14 @@ pub fn spawn_signal_pump(
             }];
             loop {
                 let n = unsafe {
-                    libc::kevent(kq, std::ptr::null(), 0, out.as_mut_ptr(), 1, std::ptr::null())
+                    libc::kevent(
+                        kq,
+                        std::ptr::null(),
+                        0,
+                        out.as_mut_ptr(),
+                        1,
+                        std::ptr::null(),
+                    )
                 };
                 if n < 0 {
                     let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);

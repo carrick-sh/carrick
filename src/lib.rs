@@ -21,7 +21,7 @@ pub mod rootfs;
 pub mod runtime;
 pub mod syscall;
 pub mod thread;
-pub mod ulock;
 pub mod trap;
+pub mod ulock;
 pub mod vcpu_kick;
 pub mod vfs;

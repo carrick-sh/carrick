@@ -15,7 +15,11 @@ use super::{DirEnt, EntryKind, Metadata, OpenContext, OpenFlags, Vfs, VfsError, 
 /// trailing-slashed) path, or `None` if the path isn't a task dir we serve.
 fn proc_task_dir_entries(path: &str) -> Option<Vec<DirEnt>> {
     let p = path.strip_suffix('/').unwrap_or(path);
-    let pid: u32 = p.strip_prefix("/proc/")?.strip_suffix("/task")?.parse().ok()?;
+    let pid: u32 = p
+        .strip_prefix("/proc/")?
+        .strip_suffix("/task")?
+        .parse()
+        .ok()?;
     let tids = crate::dispatch::synthetic_proc_task_dir(pid)?;
     let mut entries = vec![
         DirEnt {
