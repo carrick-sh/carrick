@@ -450,6 +450,22 @@ pub fn host_tty_tcgetpgrp(fd: i32) -> Result<i32, i32> {
     }
 }
 
+/// Return the session ID of the terminal `fd`, or the raw host errno on
+/// failure. This backs stdio `TIOCGSID` for interactive `-t` pty runs.
+pub fn host_tty_tcgetsid(fd: i32) -> Result<i32, i32> {
+    if !host_isatty(fd) {
+        return Err(unsafe { *libc::__error() });
+    }
+    // SAFETY: fd has been confirmed to be a tty; tcgetsid returns a pid_t
+    // (i32 on macOS) or -1 on error.
+    let sid = unsafe { libc::tcgetsid(fd) };
+    if sid < 0 {
+        Err(unsafe { *libc::__error() })
+    } else {
+        Ok(sid)
+    }
+}
+
 /// Set the foreground process-group of terminal `fd` to `pgrp`.  Returns `Ok(())`
 /// on success or `Err(errno)` on failure (raw macOS errno, not translated).
 ///

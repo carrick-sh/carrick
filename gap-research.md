@@ -31,10 +31,12 @@ Work package progress:
   - Added atomic single-fd and pair-fd install helpers and migrated fd-producing paths off allocate-then-insert.
   - Moved host fd close ownership onto cloned `OpenFile` handles and pinned blocking wait fds with duplicated host fds.
   - Verified with targeted fd allocation and wait-pin regression tests.
-- [ ] Package 2. Signal Pump and Fork Discipline
+- [x] Package 2. Signal Pump and Fork Discipline
   - Completed: split the async signal pump wake pipe from the blocking-I/O waiter self-pipe and made the pump drain only its dedicated pipe.
   - Verified that waiter-pipe drains cannot consume pump wake bytes.
-  - Remaining: fork safety still needs a host-thread-aware coordinator and stress coverage.
+  - Completed: added a host-fork coordinator that owns the signal pump lifecycle, joins the pump before the real host `fork(2)`, and restarts a fresh pump in parent, child, and fork-error paths.
+  - Completed: made real pty-backed `TIOCGSID` use Darwin `tcgetsid`, retaining the synthetic bootstrap sid only for non-tty/headless stdio.
+  - Verified with fork-coordinator, signal-pump, split-pipe, pty sid, syscall-thread, syscall-fs, and concurrency-contract tests.
 - [x] Package 3. Linux Blocking Object Semantics
   - Completed: `FIONBIO` now updates Linux-visible status flags and host nonblocking mode for host-backed fds.
   - Completed: blocking `eventfd` reads now wait and wake from writer updates while nonblocking reads still return `EAGAIN`.

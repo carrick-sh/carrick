@@ -1312,7 +1312,20 @@ impl SyscallDispatcher {
             },
             LINUX_TIOCGSID => match self.tty_ioctl_fd_kind(fd) {
                 Ok(TtyFdKind::Stdio) => {
-                    write_packed(&mut *ctx.memory, arg, &LINUX_BOOTSTRAP_SID.to_le_bytes())
+                    // Under `-t` stdio is a real pty slave. Ask Darwin for
+                    // the controlling session instead of returning Carrick's
+                    // bootstrap fallback, so interactive job-control probes
+                    // see the host pty state when it exists.
+                    if crate::host_tty::host_isatty(fd) {
+                        match crate::host_tty::host_tty_tcgetsid(fd) {
+                            Ok(sid) => write_packed(&mut *ctx.memory, arg, &sid.to_le_bytes()),
+                            Err(raw_errno) => DispatchOutcome::Errno {
+                                errno: crate::dispatch::macos_to_linux_errno(raw_errno),
+                            },
+                        }
+                    } else {
+                        write_packed(&mut *ctx.memory, arg, &LINUX_BOOTSTRAP_SID.to_le_bytes())
+                    }
                 }
                 Ok(TtyFdKind::Other) => DispatchOutcome::Errno {
                     errno: LINUX_ENOTTY,
