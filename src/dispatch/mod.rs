@@ -3012,8 +3012,11 @@ pub fn synthetic_proc_file(path: &str, ctx: &SyntheticProcContext) -> Option<Vec
         }
         // `/proc/<numeric-pid>/...` for a live guest process that is a
         // descendant of this one. (`/proc/self/...` is matched above.)
-        _ => parse_proc_pid_path(path)
-            .and_then(|(pid, rest)| synthetic_proc_pid_file(pid, rest)),
+        _ => {
+            let self_comm = process_short_name(&ctx.executable_path);
+            parse_proc_pid_path(path)
+                .and_then(|(pid, rest)| synthetic_proc_pid_file(pid, rest, &self_comm))
+        }
     }
 }
 
@@ -3331,7 +3334,45 @@ fn proc_stat_line(pid: u32, comm: &str, state: char, ppid: u32, pgrp: u32, sessi
 /// `/task/` reports the single main thread `tid == pid` (carrick forks each
 /// guest process single-threaded; a process's OWN multi-thread `/task/` is
 /// served from the self path with the live thread registry).
-fn synthetic_proc_pid_file(pid: u32, rest: &str) -> Option<Vec<u8>> {
+fn synthetic_proc_pid_file(pid: u32, rest: &str, self_comm: &str) -> Option<Vec<u8>> {
+    // Own-process THREAD (or the process's own numeric pid): a peer thread
+    // polling /proc/<tid>/stat for the 'S'/'R' state char. The thread tids are
+    // carrick ThreadIds, not host pids, so libproc can't see them — read the
+    // live registry instead. (LTP futex_wait03 waits on a clone-thread this way;
+    // futex_wake02 polls each task/<tid>.)
+    let own_threads = crate::thread::current_thread_states();
+    if let Some(&(tid, state)) = own_threads.iter().find(|(t, _)| *t as u32 == pid) {
+        // SAFETY: getppid is always successful.
+        let ppid = unsafe { libc::getppid() } as u32;
+        let me = std::process::id();
+        let want_stat = rest == "stat" || rest == format!("task/{tid}/stat");
+        if want_stat {
+            return Some(
+                proc_stat_line(pid, self_comm, state, ppid, me, me).into_bytes(),
+            );
+        }
+        match rest {
+            "comm" => return Some(format!("{self_comm}\n").into_bytes()),
+            "cmdline" => {
+                let mut b = self_comm.as_bytes().to_vec();
+                b.push(0);
+                return Some(b);
+            }
+            "status" => {
+                return Some(
+                    format!(
+                        "Name:\t{self_comm}\nState:\t{state} ({long})\nTgid:\t{me}\n\
+Pid:\t{pid}\nPPid:\t{ppid}\nThreads:\t{n}\n",
+                        long = proc_state_long(state),
+                        n = own_threads.len(),
+                    )
+                    .into_bytes(),
+                );
+            }
+            _ => return None,
+        }
+    }
+
     if !crate::host_proc::is_descendant_of_self(pid) {
         return None;
     }
