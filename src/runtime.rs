@@ -718,6 +718,9 @@ fn run_threaded_hvf_loop(
     let registry = Arc::new(ThreadRegistry::new(main_tid));
     // Publish for the /proc/<tid>/stat + /proc/<pid>/task/ synthesis.
     crate::thread::set_current_registry(Arc::clone(&registry));
+    // Record the root guest pid (before any fork) so /proc/<pid>/ can tell a
+    // guest process (any descendant of the root) from a host process.
+    crate::host_proc::set_root_guest_pid(std::process::id());
     let futex = Arc::new(FutexTable::new());
     let kernel = Arc::new(KernelState::new(dispatcher));
     // Track spawned sibling threads so the process doesn't tear down while a
