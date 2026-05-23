@@ -1130,8 +1130,10 @@ fn run_vcpu_until_exit(
                             // handle under its new tid (the inherited map's
                             // parent entries point at dead vCPUs and are inert).
                             kicker.register(this_tid, engine.vcpu_kick_handle());
-                            registry
-                                .record_thread_port(this_tid, crate::host_proc::current_thread_port());
+                            registry.record_thread_port(
+                                this_tid,
+                                crate::host_proc::current_thread_port(),
+                            );
                             // The signal-pump daemon (which forces a vCPU out of
                             // hv_vcpu_run on a process-directed signal) does not
                             // survive fork — only the calling thread does. Without
