@@ -82,6 +82,7 @@ use crate::linux_abi::{
     LINUX_EPOLL_CTL_DEL,
     LINUX_EPOLL_CTL_MOD,
     LINUX_EPOLLERR,
+    LINUX_EPOLLET,
     LINUX_EPOLLHUP,
     LINUX_EPOLLIN,
     LINUX_EPOLLOUT,
@@ -258,6 +259,12 @@ use crate::linux_abi::{
     LINUX_STATX_RESERVED,
     LINUX_TASK_COMM_LEN,
     LINUX_TCGETS,
+    LINUX_TCP_CORK,
+    LINUX_TCP_KEEPCNT,
+    LINUX_TCP_KEEPIDLE,
+    LINUX_TCP_KEEPINTVL,
+    LINUX_TCP_MAXSEG,
+    LINUX_TCP_NODELAY,
     LINUX_TCSETS,
     LINUX_TCSETSF,
     LINUX_TCSETSW,
@@ -645,8 +652,8 @@ pub enum DispatchError {
 
 /// One row of `/proc/self/maps`, captured from the guest's
 /// `AddressSpace` at boot. Stored on the dispatcher so that a guest
-/// `cat /proc/self/maps` (or Go runtime / glibc malloc introspection
-/// / gdb) sees the real loaded ELF, runtime regions, mmap arena,
+/// `cat /proc/self/maps` (or runtime / malloc / debugger introspection)
+/// sees the real loaded ELF, runtime regions, mmap arena,
 /// stack, and bootstrap pages — not the hard-coded four-line summary
 /// we shipped before.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -696,6 +703,12 @@ pub struct SyscallDispatcher {
 }
 
 #[derive(Debug, Clone)]
+struct EpollInterest {
+    event: LinuxEpollEvent,
+    last_ready: u32,
+}
+
+#[derive(Debug, Clone)]
 enum OpenDescription {
     File {
         path: String,
@@ -733,7 +746,7 @@ enum OpenDescription {
         status_flags: u64,
     },
     Epoll {
-        interest: HashMap<i32, LinuxEpollEvent>,
+        interest: HashMap<i32, EpollInterest>,
         status_flags: u64,
     },
     // In-memory pipe ends. Currently `pipe2(2)` routes through `HostPipe`

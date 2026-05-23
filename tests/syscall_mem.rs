@@ -114,6 +114,213 @@ fn mmap_maps_file_bytes_into_guest_memory_arena() {
 }
 
 #[test]
+fn mmap_anonymous_reservations_fit_in_runtime_arena() {
+    let mut memory = AddressSpace::from_segments(
+        0,
+        [(LINUX_MMAP_BASE, rwx_perms(), Vec::new(), LINUX_MMAP_SIZE)],
+    )
+    .unwrap();
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    let map_private_anonymous = 0x02 | 0x20;
+    let reservations = [
+        128 * 1024,
+        256 * 1024,
+        1024 * 1024,
+        8 * 1024 * 1024,
+        64 * 1024 * 1024,
+        512 * 1024 * 1024,
+    ];
+
+    let mut expected = LINUX_MMAP_BASE;
+    for length in reservations {
+        let outcome = dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    222,
+                    SyscallArgs::from([0, length, 0, map_private_anonymous, (-1_i64) as u64, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap();
+        assert_eq!(
+            outcome,
+            DispatchOutcome::Returned {
+                value: expected as i64
+            }
+        );
+        expected += length;
+    }
+
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn mmap_unsupported_prot_none_hint_does_not_consume_bump_space() {
+    let mut memory = AddressSpace::from_segments(
+        0,
+        [(LINUX_MMAP_BASE, rwx_perms(), Vec::new(), LINUX_MMAP_SIZE)],
+    )
+    .unwrap();
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    let map_private_anonymous = 0x02 | 0x20;
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    222,
+                    SyscallArgs::from([
+                        LINUX_MMAP_BASE + LINUX_MMAP_SIZE + 0x1000,
+                        64 * 1024 * 1024,
+                        0,
+                        map_private_anonymous,
+                        (-1_i64) as u64,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 12 }
+    );
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    222,
+                    SyscallArgs::from([0, 0x1000, 0, map_private_anonymous, (-1_i64) as u64, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned {
+            value: LINUX_MMAP_BASE as i64
+        }
+    );
+
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn mmap_without_hint_uses_next_page_granular_address() {
+    let mut memory = AddressSpace::from_segments(
+        0,
+        [(LINUX_MMAP_BASE, rwx_perms(), Vec::new(), LINUX_MMAP_SIZE)],
+    )
+    .unwrap();
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    let map_private_anonymous = 0x02 | 0x20;
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    222,
+                    SyscallArgs::from([
+                        0,
+                        128 * 1024,
+                        0,
+                        map_private_anonymous,
+                        (-1_i64) as u64,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned {
+            value: LINUX_MMAP_BASE as i64
+        }
+    );
+
+    let outcome = dispatcher
+        .dispatch(
+            SyscallRequest::new(
+                222,
+                SyscallArgs::from([
+                    0,
+                    64 * 1024 * 1024 + 4 * 1024 * 1024,
+                    0,
+                    map_private_anonymous,
+                    (-1_i64) as u64,
+                    0,
+                ]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+
+    let DispatchOutcome::Returned { value } = outcome else {
+        panic!("large reservation failed: {outcome:?}");
+    };
+    assert_eq!(value as u64, LINUX_MMAP_BASE + 128 * 1024);
+
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn mmap_non_fixed_hint_does_not_overlap_existing_bump_allocation() {
+    let mut memory = AddressSpace::from_segments(
+        0,
+        [(LINUX_MMAP_BASE, rwx_perms(), Vec::new(), LINUX_MMAP_SIZE)],
+    )
+    .unwrap();
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    let map_private_anonymous = 0x02 | 0x20;
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    222,
+                    SyscallArgs::from([0, 0x2000, 0, map_private_anonymous, (-1_i64) as u64, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned {
+            value: LINUX_MMAP_BASE as i64
+        }
+    );
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    222,
+                    SyscallArgs::from([
+                        LINUX_MMAP_BASE + 0x1000,
+                        0x1000,
+                        0,
+                        map_private_anonymous,
+                        (-1_i64) as u64,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned {
+            value: (LINUX_MMAP_BASE + 0x2000) as i64
+        }
+    );
+
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
 fn mm_lock_msync_mincore_stubs_validate_args_and_succeed() {
     const MS_SYNC: u64 = 0x04;
     const MS_ASYNC: u64 = 0x01;

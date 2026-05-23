@@ -264,6 +264,7 @@ pub struct LinuxEventfdValue {
 )]
 pub struct LinuxEpollEvent {
     pub events: u32,
+    pub _pad: u32,
     pub data: u64,
 }
 
@@ -717,16 +718,124 @@ impl LinuxSigaction {
     }
 }
 
+pub const LINUX_SIGINFO_SIZE: usize = 128;
+pub const LINUX_UCONTEXT_SIGMASK_PAD_BYTES: usize = 120;
+pub const LINUX_AARCH64_SIGCONTEXT_RESERVED_BYTES: usize = 4096;
+
+pub const LINUX_SI_USER: i32 = 0;
+
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct LinuxSiginfo {
+    pub si_signo: i32,
+    pub si_errno: i32,
+    pub si_code: i32,
+    pub _pad0: i32,
+    pub si_addr: u64,
+    pub _pad: [u8; LINUX_SIGINFO_SIZE - 24],
+}
+
+impl LinuxSiginfo {
+    pub const fn empty() -> Self {
+        Self {
+            si_signo: 0,
+            si_errno: 0,
+            si_code: 0,
+            _pad0: 0,
+            si_addr: 0,
+            _pad: [0; LINUX_SIGINFO_SIZE - 24],
+        }
+    }
+}
+
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct LinuxSignalStack {
+    pub ss_sp: u64,
+    pub ss_flags: i32,
+    pub _pad0: u32,
+    pub ss_size: u64,
+}
+
+impl LinuxSignalStack {
+    pub const fn empty() -> Self {
+        Self {
+            ss_sp: 0,
+            ss_flags: 0,
+            _pad0: 0,
+            ss_size: 0,
+        }
+    }
+}
+
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct LinuxSignalContext {
+    pub fault_address: u64,
+    pub regs: [u64; 31],
+    pub sp: u64,
+    pub pc: u64,
+    pub pstate: u64,
+    pub _pad: [u8; 8],
+    pub __reserved: [u8; LINUX_AARCH64_SIGCONTEXT_RESERVED_BYTES],
+}
+
+impl LinuxSignalContext {
+    pub const fn empty() -> Self {
+        Self {
+            fault_address: 0,
+            regs: [0; 31],
+            sp: 0,
+            pc: 0,
+            pstate: 0,
+            _pad: [0; 8],
+            __reserved: [0; LINUX_AARCH64_SIGCONTEXT_RESERVED_BYTES],
+        }
+    }
+}
+
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct LinuxUcontext {
+    pub uc_flags: u64,
+    pub uc_link: u64,
+    pub uc_stack: LinuxSignalStack,
+    pub uc_sigmask: u64,
+    pub _pad: [u8; LINUX_UCONTEXT_SIGMASK_PAD_BYTES],
+    pub _pad2: [u8; 8],
+    pub uc_mcontext: LinuxSignalContext,
+}
+
+impl LinuxUcontext {
+    pub const fn empty() -> Self {
+        Self {
+            uc_flags: 0,
+            uc_link: 0,
+            uc_stack: LinuxSignalStack::empty(),
+            uc_sigmask: 0,
+            _pad: [0; LINUX_UCONTEXT_SIGMASK_PAD_BYTES],
+            _pad2: [0; 8],
+            uc_mcontext: LinuxSignalContext::empty(),
+        }
+    }
+}
+
 /// Magic value placed in `CarrickSigframe::magic` so `rt_sigreturn` can
 /// detect a misaligned / corrupt frame and refuse to restore garbage.
 pub const CARRICK_SIGFRAME_MAGIC: u64 = 0x4361_7272_6963_6b53; // 'CarrickS'
 
-/// Carrick's private signal frame layout. The Linux kernel's real
-/// `struct rt_sigframe` carries a full `siginfo_t` + `ucontext_t`; we
-/// only need enough state to round-trip a handler invocation through
-/// `rt_sigreturn`, so we use a packed format we authored ourselves.
-/// Userspace never inspects this — it just passes the pointer back to
-/// `rt_sigreturn` via its registered restorer thunk.
+/// Carrick's signal frame layout. The leading fields are private so
+/// `rt_sigreturn` can authenticate and restore the frame. The embedded
+/// `siginfo_t` and AArch64 `ucontext_t` are Linux-shaped because SA_SIGINFO
+/// handlers can inspect or mutate the saved register context.
 #[repr(C, packed)]
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
@@ -739,6 +848,8 @@ pub struct CarrickSigframe {
     pub saved_pc: u64,
     pub saved_sp: u64,
     pub saved_spsr: u64,
+    pub siginfo: LinuxSiginfo,
+    pub ucontext: LinuxUcontext,
     pub _reserved: [u64; 6],
 }
 
@@ -752,6 +863,8 @@ impl CarrickSigframe {
             saved_pc: 0,
             saved_sp: 0,
             saved_spsr: 0,
+            siginfo: LinuxSiginfo::empty(),
+            ucontext: LinuxUcontext::empty(),
             _reserved: [0; 6],
         }
     }
@@ -865,8 +978,8 @@ kernel_abi!(
 kernel_abi!(LinuxEventfdValue, 8, "eventfd_t is u64");
 kernel_abi!(
     LinuxEpollEvent,
-    12,
-    "epoll_event packed = u32 events + u64 data"
+    16,
+    "aarch64 epoll_event = u32 events + u32 pad + u64 data"
 );
 kernel_abi!(
     LinuxPollFd,
@@ -1082,6 +1195,7 @@ pub const LINUX_EPOLLPRI: u32 = 0x002;
 pub const LINUX_EPOLLOUT: u32 = 0x004;
 pub const LINUX_EPOLLERR: u32 = 0x008;
 pub const LINUX_EPOLLHUP: u32 = 0x010;
+pub const LINUX_EPOLLET: u32 = 0x8000_0000;
 pub const LINUX_LOCK_SH: u64 = 1;
 pub const LINUX_LOCK_EX: u64 = 2;
 pub const LINUX_LOCK_NB: u64 = 4;
@@ -1222,6 +1336,13 @@ pub const LINUX_SOL_TCP: i32 = 6; // IPPROTO_TCP
 pub const LINUX_SOL_UDP: i32 = 17; // IPPROTO_UDP
 pub const LINUX_SOL_IPV6: i32 = 41; // IPPROTO_IPV6
 
+pub const LINUX_TCP_NODELAY: i32 = 1;
+pub const LINUX_TCP_MAXSEG: i32 = 2;
+pub const LINUX_TCP_CORK: i32 = 3;
+pub const LINUX_TCP_KEEPIDLE: i32 = 4;
+pub const LINUX_TCP_KEEPINTVL: i32 = 5;
+pub const LINUX_TCP_KEEPCNT: i32 = 6;
+
 pub const LINUX_SO_DEBUG: i32 = 1;
 pub const LINUX_SO_REUSEADDR: i32 = 2;
 pub const LINUX_SO_TYPE: i32 = 3;
@@ -1268,5 +1389,24 @@ mod kernel_abi_tests {
             <LinuxSigaltstack as KernelAbi>::ABI_SIZE <= core::mem::size_of::<LinuxSigaltstack>()
         );
         assert!(<LinuxSigaction as KernelAbi>::ABI_SIZE <= core::mem::size_of::<LinuxSigaction>());
+    }
+
+    #[test]
+    fn signal_frame_embeds_linux_aarch64_siginfo_and_ucontext_layout() {
+        assert_eq!(core::mem::size_of::<LinuxSiginfo>(), 128);
+        assert_eq!(core::mem::offset_of!(LinuxSiginfo, si_addr), 16);
+
+        assert_eq!(core::mem::offset_of!(LinuxSignalContext, regs), 8);
+        assert_eq!(core::mem::offset_of!(LinuxSignalContext, sp), 256);
+        assert_eq!(core::mem::offset_of!(LinuxSignalContext, pc), 264);
+        assert_eq!(core::mem::offset_of!(LinuxSignalContext, pstate), 272);
+        assert_eq!(core::mem::offset_of!(LinuxSignalContext, __reserved), 288);
+        assert_eq!(core::mem::size_of::<LinuxSignalContext>(), 4384);
+
+        assert_eq!(core::mem::offset_of!(LinuxUcontext, uc_stack), 16);
+        assert_eq!(core::mem::offset_of!(LinuxUcontext, uc_sigmask), 40);
+        assert_eq!(core::mem::offset_of!(LinuxUcontext, _pad), 48);
+        assert_eq!(core::mem::offset_of!(LinuxUcontext, _pad2), 168);
+        assert_eq!(core::mem::offset_of!(LinuxUcontext, uc_mcontext), 176);
     }
 }

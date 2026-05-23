@@ -70,6 +70,25 @@ mod carrick_usdt {
     /// byte count (negative on error). Used to trace whether a forked
     /// child's stdout actually reaches the parent's pipe read.
     fn host__pipe__io(_: u32, _: i32, _: i32, _: i64) {}
+    /// epoll_ctl decision: decoded guest event values without forcing DTrace
+    /// scripts to copyin guest memory. `errno` is zero on success.
+    fn epoll__ctl(_: i32, _: u64, _: i32, _: u32, _: u64, _: i32) {}
+    /// Per-interest epoll_pwait readiness decision. `requested`, `raw_ready`,
+    /// `last_ready`, and `ready` are Linux epoll event bitmasks.
+    fn epoll__interest(_: i32, _: i32, _: u32, _: u32, _: u32, _: u32) {}
+    /// Host-backed fd that epoll_pwait hands to the runtime's kqueue waiter.
+    /// `poll_events` is the libc POLL* mask used to build EVFILT registrations.
+    fn epoll__wait__fd(_: i32, _: i32, _: i32, _: i32, _: i32) {}
+    /// epoll_pwait result decision. `kind` is 0 for immediate guest return and
+    /// 1 for WaitOnFds handoff.
+    fn epoll__result(_: i32, _: i32, _: i32, _: i32, _: i32) {}
+    /// Runtime blocking-I/O wait begin. `tid` is the guest thread id,
+    /// `timeout_ms` is -1 for infinite, and fd0/events0 + fd1/events1 are the
+    /// first two host fd wait targets.
+    fn io__wait__begin(_: i32, _: i32, _: i64, _: i32, _: i32, _: i32) {}
+    /// Runtime blocking-I/O wait end. `result` is 0=Ready, 1=TimedOut,
+    /// 2=Interrupted; fd0/fd1/fd2 are the first host fds from the wait set.
+    fn io__wait__end(_: i32, _: i32, _: i32, _: i32, _: i32, _: i32) {}
     /// Fires on a filesystem-backend decision/outcome. `op` names the
     /// operation + result (e.g. "set_times:ok", "set_times:open_none",
     /// "set_times:futimens_err", "unlink", "rename"), `path` is the
@@ -145,6 +164,37 @@ pub fn fs_op(op: &str, path: &str, errno: i32) {
 
 pub fn host_pipe_io(host_fd: i32, dir: i32, n: i64) {
     carrick_usdt::host__pipe__io!(|| (libc::getpid() as u32, host_fd, dir, n));
+}
+
+pub fn epoll_ctl(epfd: i32, op: u64, fd: i32, events: u32, data: u64, errno: i32) {
+    carrick_usdt::epoll__ctl!(|| (epfd, op, fd, events, data, errno));
+}
+
+pub fn epoll_interest(
+    epfd: i32,
+    fd: i32,
+    requested: u32,
+    raw_ready: u32,
+    last_ready: u32,
+    ready: u32,
+) {
+    carrick_usdt::epoll__interest!(|| (epfd, fd, requested, raw_ready, last_ready, ready));
+}
+
+pub fn epoll_wait_fd(epfd: i32, fd: i32, host_fd: i32, poll_events: i32, timeout_ms: i32) {
+    carrick_usdt::epoll__wait__fd!(|| (epfd, fd, host_fd, poll_events, timeout_ms));
+}
+
+pub fn epoll_result(epfd: i32, ready_count: i32, wait_count: i32, timeout_ms: i32, kind: i32) {
+    carrick_usdt::epoll__result!(|| (epfd, ready_count, wait_count, timeout_ms, kind));
+}
+
+pub fn io_wait_begin(tid: i32, fd_count: i32, timeout_ms: i64, fd0: i32, events0: i32, fd1: i32) {
+    carrick_usdt::io__wait__begin!(|| (tid, fd_count, timeout_ms, fd0, events0, fd1));
+}
+
+pub fn io_wait_end(tid: i32, result: i32, fd_count: i32, fd0: i32, fd1: i32, fd2: i32) {
+    carrick_usdt::io__wait__end!(|| (tid, result, fd_count, fd0, fd1, fd2));
 }
 
 pub fn fork_post(pid: i32, pc: u64, elr: u64) {

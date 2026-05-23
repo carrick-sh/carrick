@@ -21,6 +21,13 @@ impl SyscallDispatcher {
             name: name.to_owned(),
             args: request.args,
         });
+        if let Some(addr) = super::watch_addr()
+            && let Ok(bytes) = memory.read_bytes(addr, 8)
+        {
+            let mut le = [0u8; 8];
+            le.copy_from_slice(&bytes[..8]);
+            crate::probes::mem_watch(request.number, addr, u64::from_le_bytes(le));
+        }
 
         let mut ctx = SyscallCtx {
             request,
@@ -140,7 +147,14 @@ impl SyscallDispatcher {
                         errno: LINUX_EEXIST,
                     });
                 }
-                interest.insert(fd, event);
+                interest.insert(
+                    fd,
+                    EpollInterest {
+                        event,
+                        last_ready: 0,
+                    },
+                );
+                crate::probes::epoll_ctl(epfd, operation, fd, event.events, event.data, 0);
                 Ok(DispatchOutcome::Returned { value: 0 })
             }
             LINUX_EPOLL_CTL_MOD => {
@@ -153,11 +167,16 @@ impl SyscallDispatcher {
                         errno: LINUX_ENOENT,
                     });
                 };
-                *slot = event;
+                *slot = EpollInterest {
+                    event,
+                    last_ready: 0,
+                };
+                crate::probes::epoll_ctl(epfd, operation, fd, event.events, event.data, 0);
                 Ok(DispatchOutcome::Returned { value: 0 })
             }
             LINUX_EPOLL_CTL_DEL => {
                 if interest.remove(&fd).is_some() {
+                    crate::probes::epoll_ctl(epfd, operation, fd, 0, 0, 0);
                     Ok(DispatchOutcome::Returned { value: 0 })
                 } else {
                     Ok(DispatchOutcome::Errno {
@@ -179,6 +198,7 @@ impl SyscallDispatcher {
         let events_address = ctx.arg(1);
         let max_events =
             usize::try_from(ctx.arg(2)).map_err(|_| DispatchError::LengthTooLarge(ctx.arg(2)))?;
+        let timeout_ms = ctx.arg(3) as i32;
         let memory = &mut *ctx.memory;
         if max_events == 0 {
             return Ok(DispatchOutcome::Errno {
@@ -198,18 +218,60 @@ impl SyscallDispatcher {
             };
             interest
                 .iter()
-                .map(|(fd, event)| (*fd, *event))
+                .map(|(fd, interest)| (*fd, interest.clone()))
                 .collect::<Vec<_>>()
         };
 
+        let has_interests = !interests.is_empty();
         let mut ready = Vec::new();
-        for (fd, event) in interests {
-            let requested_events = event.events;
-            let ready_events = self.epoll_ready_events(fd, requested_events);
+        let mut ready_updates = Vec::with_capacity(interests.len());
+        let mut wait_fds = Vec::new();
+        for (fd, interest) in interests {
+            let requested_events = interest.event.events;
+            let raw_ready_events = self.epoll_ready_events(fd, requested_events);
+            ready_updates.push((fd, raw_ready_events));
+            let ready_events = if requested_events & LINUX_EPOLLET != 0 {
+                raw_ready_events & !interest.last_ready
+            } else {
+                raw_ready_events
+            };
+            crate::probes::epoll_interest(
+                epfd,
+                fd,
+                requested_events,
+                raw_ready_events,
+                interest.last_ready,
+                ready_events,
+            );
+            if ready_events == 0
+                && timeout_ms != 0
+                && let Some(host_fd) = self.host_fd_for_poll(fd)
+            {
+                let events_to_wait_for = if requested_events & LINUX_EPOLLET != 0 {
+                    requested_events & !raw_ready_events
+                } else {
+                    requested_events
+                };
+                let mut poll_events = 0;
+                if events_to_wait_for & LINUX_EPOLLIN != 0 {
+                    poll_events |= libc::POLLIN;
+                }
+                if events_to_wait_for & LINUX_EPOLLOUT != 0 {
+                    poll_events |= libc::POLLOUT;
+                }
+                if events_to_wait_for & LINUX_EPOLLPRI != 0 {
+                    poll_events |= libc::POLLPRI;
+                }
+                if poll_events != 0 {
+                    crate::probes::epoll_wait_fd(epfd, fd, host_fd, poll_events as i32, timeout_ms);
+                    wait_fds.push((host_fd, poll_events));
+                }
+            }
             if ready_events != 0 {
                 ready.push(LinuxEpollEvent {
                     events: ready_events,
-                    data: event.data,
+                    _pad: 0,
+                    data: interest.event.data,
                 });
                 if ready.len() == max_events {
                     break;
@@ -236,6 +298,44 @@ impl SyscallDispatcher {
             }
         }
 
+        if !ready_updates.is_empty() {
+            let mut open = open_file.description.write();
+            if let OpenDescription::Epoll { interest, .. } = &mut *open {
+                for (fd, ready_events) in ready_updates {
+                    if let Some(slot) = interest.get_mut(&fd) {
+                        slot.last_ready = ready_events;
+                    }
+                }
+            }
+        }
+
+        if ready.is_empty() && timeout_ms != 0 && (has_interests || !wait_fds.is_empty()) {
+            let timeout = if timeout_ms < 0 {
+                None
+            } else {
+                Some(Duration::from_millis(timeout_ms as u64))
+            };
+            crate::probes::epoll_result(
+                epfd,
+                ready.len() as i32,
+                wait_fds.len() as i32,
+                timeout_ms,
+                1,
+            );
+            return Ok(DispatchOutcome::WaitOnFds {
+                fds: wait_fds,
+                timeout,
+                on_timeout: 0,
+            });
+        }
+
+        crate::probes::epoll_result(
+            epfd,
+            ready.len() as i32,
+            wait_fds.len() as i32,
+            timeout_ms,
+            0,
+        );
         Ok(DispatchOutcome::Returned {
             value: ready.len() as i64,
         })
@@ -2680,7 +2780,18 @@ fn linux_to_host_sockopt(level: i32, optname: i32) -> Option<(i32, i32)> {
             Some((libc::SOL_SOCKET, host_opt))
         }
         LINUX_SOL_IP => Some((libc::IPPROTO_IP, optname)),
-        LINUX_SOL_TCP => Some((libc::IPPROTO_TCP, optname)),
+        LINUX_SOL_TCP => {
+            let host_opt = match optname {
+                LINUX_TCP_NODELAY => libc::TCP_NODELAY,
+                LINUX_TCP_MAXSEG => libc::TCP_MAXSEG,
+                LINUX_TCP_CORK => libc::TCP_NOPUSH,
+                LINUX_TCP_KEEPIDLE => libc::TCP_KEEPALIVE,
+                LINUX_TCP_KEEPINTVL => libc::TCP_KEEPINTVL,
+                LINUX_TCP_KEEPCNT => libc::TCP_KEEPCNT,
+                _ => return None,
+            };
+            Some((libc::IPPROTO_TCP, host_opt))
+        }
         LINUX_SOL_UDP => Some((libc::IPPROTO_UDP, optname)),
         LINUX_SOL_IPV6 => Some((libc::IPPROTO_IPV6, optname)),
         _ => None,
