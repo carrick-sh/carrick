@@ -19,7 +19,7 @@ use carrick::thread::{FutexTable, ThreadRegistry};
 #[cfg(target_os = "macos")]
 use std::sync::{Arc, Mutex, mpsc};
 #[cfg(target_os = "macos")]
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
 const LINUX_TCP_KEEPIDLE: u64 = 4;
@@ -665,6 +665,186 @@ fn epoll_reports_timerfd_readiness_with_packed_event() {
         DispatchOutcome::Returned { value: 0 }
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn blocking_timerfd_read_waits_until_timer_is_armed() {
+    let dispatcher = Arc::new(SyscallDispatcher::new());
+    let reporter = Arc::new(CompatReporter::default());
+    let registry = Arc::new(ThreadRegistry::new(20));
+    let futex = Arc::new(FutexTable::new());
+    assert_eq!(registry.register_child(20), 21);
+
+    let mut setup_memory = LinearMemory::new(0x4000, vec![0; 0x100]);
+    let created = dispatcher
+        .dispatch_threaded(
+            SyscallRequest::new(85, SyscallArgs::from([1, 0, 0, 0, 0, 0])),
+            &mut setup_memory,
+            &reporter,
+            20,
+            &registry,
+            &futex,
+        )
+        .unwrap();
+    let DispatchOutcome::Returned { value: fd } = created else {
+        panic!("expected timerfd_create success, got {created:?}");
+    };
+
+    let (tx, rx) = mpsc::channel();
+    let read_dispatcher = Arc::clone(&dispatcher);
+    let read_reporter = Arc::clone(&reporter);
+    let read_registry = Arc::clone(&registry);
+    let read_futex = Arc::clone(&futex);
+    let reader = std::thread::spawn(move || {
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
+        let outcome = read_dispatcher
+            .dispatch_threaded(
+                SyscallRequest::new(63, SyscallArgs::from([fd as u64, 0x4000, 8, 0, 0, 0])),
+                &mut memory,
+                &read_reporter,
+                20,
+                &read_registry,
+                &read_futex,
+            )
+            .unwrap();
+        let expirations = read_timerfd_expirations(&memory, 0x4000).expirations;
+        tx.send((outcome, expirations)).unwrap();
+    });
+
+    std::thread::sleep(Duration::from_millis(25));
+    assert!(
+        rx.try_recv().is_err(),
+        "blocking timerfd read returned before timer was armed"
+    );
+
+    let mut arm_memory = LinearMemory::new(0x4000, vec![0; 0x100]);
+    let one_shot = LinuxItimerspec {
+        it_interval: LinuxTimespec::new(0, 0),
+        it_value: LinuxTimespec::new(0, 1),
+    };
+    arm_memory.write_bytes(0x4000, one_shot.as_bytes()).unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch_threaded(
+                SyscallRequest::new(86, SyscallArgs::from([fd as u64, 0, 0x4000, 0, 0, 0])),
+                &mut arm_memory,
+                &reporter,
+                21,
+                &registry,
+                &futex,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    let (outcome, expirations) = rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("blocking timerfd reader should wake after arming");
+    assert_eq!(outcome, DispatchOutcome::Returned { value: 8 });
+    assert!(expirations >= 1);
+    reader.join().expect("reader thread panicked");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn timerfd_rearm_wakes_blocked_reader_without_waiting_for_old_deadline() {
+    let dispatcher = Arc::new(SyscallDispatcher::new());
+    let reporter = Arc::new(CompatReporter::default());
+    let registry = Arc::new(ThreadRegistry::new(30));
+    let futex = Arc::new(FutexTable::new());
+    assert_eq!(registry.register_child(30), 31);
+
+    let mut setup_memory = LinearMemory::new(0x4000, vec![0; 0x100]);
+    let created = dispatcher
+        .dispatch_threaded(
+            SyscallRequest::new(85, SyscallArgs::from([1, 0, 0, 0, 0, 0])),
+            &mut setup_memory,
+            &reporter,
+            30,
+            &registry,
+            &futex,
+        )
+        .unwrap();
+    let DispatchOutcome::Returned { value: fd } = created else {
+        panic!("expected timerfd_create success, got {created:?}");
+    };
+
+    let long_timer = LinuxItimerspec {
+        it_interval: LinuxTimespec::new(0, 0),
+        it_value: LinuxTimespec::new(0, 250_000_000),
+    };
+    setup_memory
+        .write_bytes(0x4000, long_timer.as_bytes())
+        .unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch_threaded(
+                SyscallRequest::new(86, SyscallArgs::from([fd as u64, 0, 0x4000, 0, 0, 0])),
+                &mut setup_memory,
+                &reporter,
+                30,
+                &registry,
+                &futex,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    let (tx, rx) = mpsc::channel();
+    let read_dispatcher = Arc::clone(&dispatcher);
+    let read_reporter = Arc::clone(&reporter);
+    let read_registry = Arc::clone(&registry);
+    let read_futex = Arc::clone(&futex);
+    let reader = std::thread::spawn(move || {
+        let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
+        let outcome = read_dispatcher
+            .dispatch_threaded(
+                SyscallRequest::new(63, SyscallArgs::from([fd as u64, 0x4000, 8, 0, 0, 0])),
+                &mut memory,
+                &read_reporter,
+                30,
+                &read_registry,
+                &read_futex,
+            )
+            .unwrap();
+        tx.send(outcome).unwrap();
+    });
+
+    std::thread::sleep(Duration::from_millis(25));
+    let started = Instant::now();
+    let short_timer = LinuxItimerspec {
+        it_interval: LinuxTimespec::new(0, 0),
+        it_value: LinuxTimespec::new(0, 1),
+    };
+    let mut rearm_memory = LinearMemory::new(0x4000, vec![0; 0x100]);
+    rearm_memory
+        .write_bytes(0x4000, short_timer.as_bytes())
+        .unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch_threaded(
+                SyscallRequest::new(86, SyscallArgs::from([fd as u64, 0, 0x4000, 0, 0, 0])),
+                &mut rearm_memory,
+                &reporter,
+                31,
+                &registry,
+                &futex,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    assert_eq!(
+        rx.recv_timeout(Duration::from_millis(150))
+            .expect("re-armed timerfd reader should wake promptly"),
+        DispatchOutcome::Returned { value: 8 }
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(200),
+        "reader waited for the stale long deadline"
+    );
+    reader.join().expect("reader thread panicked");
 }
 
 #[cfg(target_os = "macos")]

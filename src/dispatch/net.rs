@@ -429,14 +429,8 @@ impl SyscallDispatcher {
                     0
                 }
             }
-            OpenDescription::TimerFd {
-                clock_id,
-                interval,
-                deadline,
-                expirations,
-                ..
-            } if requested_events & LINUX_EPOLLIN != 0
-                && timerfd_expirations(*clock_id, *interval, *deadline, *expirations).0 > 0 =>
+            OpenDescription::TimerFd { state, .. }
+                if requested_events & LINUX_EPOLLIN != 0 && timerfd_ready_count(state) > 0 =>
             {
                 LINUX_EPOLLIN
             }
@@ -1105,16 +1099,8 @@ impl SyscallDispatcher {
                     ready |= LINUX_POLLOUT;
                 }
             }
-            OpenDescription::TimerFd {
-                clock_id,
-                interval,
-                deadline,
-                expirations,
-                ..
-            } => {
-                if requested_events & LINUX_POLLIN != 0
-                    && timerfd_expirations(*clock_id, *interval, *deadline, *expirations).0 > 0
-                {
+            OpenDescription::TimerFd { state, .. } => {
+                if requested_events & LINUX_POLLIN != 0 && timerfd_ready_count(state) > 0 {
                     ready |= LINUX_POLLIN;
                 }
             }
