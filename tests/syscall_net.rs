@@ -8,6 +8,40 @@ mod support;
 
 use support::*;
 
+#[cfg(target_os = "macos")]
+use carrick::io_wait::{ThreadWaiter, WaitResult};
+use carrick::linux_abi::{
+    LINUX_AF_INET, LINUX_EINTR, LINUX_EPOLLOUT, LINUX_SOCK_CLOEXEC, LINUX_SOCK_NONBLOCK,
+    LINUX_SOCK_STREAM, LINUX_SOL_TCP,
+};
+#[cfg(target_os = "macos")]
+use carrick::thread::{FutexTable, ThreadRegistry};
+#[cfg(target_os = "macos")]
+use std::sync::{Arc, Mutex, mpsc};
+#[cfg(target_os = "macos")]
+use std::time::Duration;
+
+#[cfg(target_os = "macos")]
+const LINUX_TCP_KEEPIDLE: u64 = 4;
+
+#[test]
+fn epoll_event_matches_aarch64_c_abi_layout() {
+    assert_eq!(core::mem::size_of::<LinuxEpollEvent>(), 16);
+    assert_eq!(
+        <LinuxEpollEvent as carrick::linux_abi::KernelAbi>::ABI_SIZE,
+        16
+    );
+    let event = LinuxEpollEvent {
+        events: 0xaabb_ccdd,
+        _pad: 0,
+        data: 0x1122_3344_5566_7788,
+    };
+    let bytes = event.as_bytes();
+    assert_eq!(&bytes[0..4], &0xaabb_ccdd_u32.to_le_bytes());
+    assert_eq!(&bytes[4..8], &[0, 0, 0, 0]);
+    assert_eq!(&bytes[8..16], &0x1122_3344_5566_7788_u64.to_le_bytes());
+}
+
 #[test]
 fn fionread_and_fionbio_bootstrap_succeed_for_valid_fds() {
     let mut memory = LinearMemory::new(0x4000, vec![0xee; 0x200]);
@@ -490,6 +524,7 @@ fn epoll_reports_timerfd_readiness_with_packed_event() {
     );
     let wanted = LinuxEpollEvent {
         events: LINUX_EPOLLIN,
+        _pad: 0,
         data: 0x544d,
     };
     memory.write_bytes(0x4000, wanted.as_bytes()).unwrap();
@@ -585,6 +620,7 @@ fn epoll_reports_eventfd_readiness_with_packed_events() {
     );
     let wanted = LinuxEpollEvent {
         events: LINUX_EPOLLIN,
+        _pad: 0,
         data: 0xabc,
     };
     memory.write_bytes(0x4000, wanted.as_bytes()).unwrap();
@@ -639,6 +675,922 @@ fn epoll_reports_eventfd_readiness_with_packed_events() {
         DispatchOutcome::Returned { value: 0 }
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn epoll_edge_triggered_eventfd_reports_only_new_readiness() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x500]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(19, SyscallArgs::from([1, LINUX_EFD_NONBLOCK, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 3 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(20, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 4 }
+    );
+    let wanted = LinuxEpollEvent {
+        events: LINUX_EPOLLIN | LINUX_EPOLLET,
+        _pad: 0,
+        data: 0xfeed,
+    };
+    memory.write_bytes(0x4000, wanted.as_bytes()).unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    21,
+                    SyscallArgs::from([4, LINUX_EPOLL_CTL_ADD, 3, 0x4000, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(22, SyscallArgs::from([4, 0x4100, 4, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 1 }
+    );
+    let first = read_epoll_event(&memory, 0x4100);
+    let first_data = first.data;
+    assert_eq!(first.events & LINUX_EPOLLIN, LINUX_EPOLLIN);
+    assert_eq!(first_data, 0xfeed);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(22, SyscallArgs::from([4, 0x4100, 4, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(63, SyscallArgs::from([3, 0x4200, 8, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 8 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(22, SyscallArgs::from([4, 0x4100, 4, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    let one = LinuxEventfdValue { value: 1 };
+    memory.write_bytes(0x4300, one.as_bytes()).unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(64, SyscallArgs::from([3, 0x4300, 8, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 8 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(22, SyscallArgs::from([4, 0x4100, 4, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 1 }
+    );
+
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn epoll_timed_wait_blocks_after_edge_event_was_already_reported() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x500]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(19, SyscallArgs::from([1, LINUX_EFD_NONBLOCK, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 3 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(20, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 4 }
+    );
+    let wanted = LinuxEpollEvent {
+        events: LINUX_EPOLLIN | LINUX_EPOLLET,
+        _pad: 0,
+        data: 0xfeed,
+    };
+    memory.write_bytes(0x4000, wanted.as_bytes()).unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    21,
+                    SyscallArgs::from([4, LINUX_EPOLL_CTL_ADD, 3, 0x4000, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(22, SyscallArgs::from([4, 0x4100, 4, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 1 }
+    );
+
+    let outcome = dispatcher
+        .dispatch(
+            SyscallRequest::new(22, SyscallArgs::from([4, 0x4100, 4, 25, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    let DispatchOutcome::WaitOnFds {
+        fds,
+        timeout,
+        on_timeout,
+    } = outcome
+    else {
+        panic!("expected timed epoll wait handoff, got {outcome:?}");
+    };
+    assert!(fds.is_empty());
+    assert_eq!(timeout, Some(std::time::Duration::from_millis(25)));
+    assert_eq!(on_timeout, 0);
+
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn epoll_waits_on_host_backed_edge_interests_when_no_event_is_ready() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x500]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    59,
+                    SyscallArgs::from([0x4000, LINUX_O_NONBLOCK, 0, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let pair = read_fd_pair(&memory, 0x4000);
+    let read_fd = pair.read_fd as u64;
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(20, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 5 }
+    );
+    let wanted = LinuxEpollEvent {
+        events: LINUX_EPOLLIN | LINUX_EPOLLET,
+        _pad: 0,
+        data: 0xbeef,
+    };
+    memory.write_bytes(0x4040, wanted.as_bytes()).unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    21,
+                    SyscallArgs::from([5, LINUX_EPOLL_CTL_ADD, read_fd, 0x4040, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    let outcome = dispatcher
+        .dispatch(
+            SyscallRequest::new(22, SyscallArgs::from([5, 0x4100, 4, 25, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    let DispatchOutcome::WaitOnFds {
+        fds,
+        timeout,
+        on_timeout,
+    } = outcome
+    else {
+        panic!("expected epoll wait handoff, got {outcome:?}");
+    };
+    assert_eq!(fds.len(), 1);
+    assert!(fds[0].0 >= 0);
+    assert_eq!(fds[0].1 & libc::POLLIN, libc::POLLIN);
+    assert_eq!(timeout, Some(std::time::Duration::from_millis(25)));
+    assert_eq!(on_timeout, 0);
+
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn epoll_wakes_accepted_socket_after_peer_write() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x4000]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    let socket_type = (LINUX_SOCK_STREAM | LINUX_SOCK_NONBLOCK | LINUX_SOCK_CLOEXEC) as u64;
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    198,
+                    SyscallArgs::from([LINUX_AF_INET as u64, socket_type, 0, 0, 0, 0])
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 3 }
+    );
+    write_sockaddr_in(&mut memory, 0x4000, 0);
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(200, SyscallArgs::from([3, 0x4000, 16, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(201, SyscallArgs::from([3, 128, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    memory.write_bytes(0x4020, &16_u32.to_le_bytes()).unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(204, SyscallArgs::from([3, 0x4010, 0x4020, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let port = read_sockaddr_in_port(&memory, 0x4010);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(20, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 4 }
+    );
+    add_epoll_interest(&mut dispatcher, &mut memory, &reporter, 4, 3, 0x5000);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    198,
+                    SyscallArgs::from([LINUX_AF_INET as u64, socket_type, 0, 0, 0, 0])
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 5 }
+    );
+    write_sockaddr_in(&mut memory, 0x4030, port);
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(203, SyscallArgs::from([5, 0x4030, 16, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 115 }
+    );
+    add_epoll_interest(&mut dispatcher, &mut memory, &reporter, 4, 5, 0x5020);
+
+    memory.write_bytes(0x4060, &16_u32.to_le_bytes()).unwrap();
+    let accepted_fd = loop {
+        match dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    242,
+                    SyscallArgs::from([
+                        3,
+                        0x4050,
+                        0x4060,
+                        (LINUX_SOCK_NONBLOCK | LINUX_SOCK_CLOEXEC) as u64,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap()
+        {
+            DispatchOutcome::Returned { value } => break value as u64,
+            DispatchOutcome::Errno { errno: 11 } => {
+                let _ = dispatch_with_wait(
+                    &mut dispatcher,
+                    SyscallRequest::new(22, SyscallArgs::from([4, 0x5100, 8, 100, 0, 0])),
+                    &mut memory,
+                    &reporter,
+                );
+            }
+            other => panic!("unexpected accept4 outcome: {other:?}"),
+        }
+    };
+    add_epoll_interest(
+        &mut dispatcher,
+        &mut memory,
+        &reporter,
+        4,
+        accepted_fd,
+        0x5040,
+    );
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(63, SyscallArgs::from([accepted_fd, 0x5200, 64, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 11 }
+    );
+    let initial_count = match dispatcher
+        .dispatch(
+            SyscallRequest::new(22, SyscallArgs::from([4, 0x5100, 8, 0, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap()
+    {
+        DispatchOutcome::Returned { value } => value,
+        other => panic!("unexpected initial epoll outcome: {other:?}"),
+    };
+    assert!(initial_count >= 1);
+    let mut saw_accepted_out = false;
+    for index in 0..initial_count as u64 {
+        let initial_event = read_epoll_event(&memory, 0x5100 + index * 16);
+        let initial_event_data = initial_event.data;
+        let initial_event_events = initial_event.events;
+        if initial_event_data == accepted_fd {
+            assert_eq!(initial_event_events & LINUX_EPOLLOUT, LINUX_EPOLLOUT);
+            saw_accepted_out = true;
+        }
+    }
+    assert!(saw_accepted_out);
+
+    set_tcp_keepidle(&mut dispatcher, &mut memory, &reporter, 5, 0x5400);
+    set_tcp_keepidle(&mut dispatcher, &mut memory, &reporter, accepted_fd, 0x5410);
+
+    memory
+        .write_bytes(0x5300, b"GET /demo HTTP/1.1\r\n\r\n")
+        .unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(64, SyscallArgs::from([5, 0x5300, 22, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 22 }
+    );
+
+    let outcome = dispatch_with_wait(
+        &mut dispatcher,
+        SyscallRequest::new(22, SyscallArgs::from([4, 0x5100, 8, 100, 0, 0])),
+        &mut memory,
+        &reporter,
+    );
+    assert_eq!(outcome, DispatchOutcome::Returned { value: 1 });
+    let event = read_epoll_event(&memory, 0x5100);
+    let event_data = event.data;
+    let event_events = event.events;
+    assert_eq!(event_data, accepted_fd);
+    assert_eq!(event_events & LINUX_EPOLLIN, LINUX_EPOLLIN);
+
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn threaded_epoll_wait_wakes_when_peer_thread_writes_to_accepted_socket() {
+    let memory = Arc::new(Mutex::new(LinearMemory::new(0x4000, vec![0; 0x4000])));
+    let threaded = ThreadedDispatch::new(1000);
+    let server_tid = 1000;
+    let client_tid = threaded.registry.register_child(0);
+    let wait_tid = threaded.registry.register_child(0);
+
+    let socket_type = (LINUX_SOCK_STREAM | LINUX_SOCK_NONBLOCK | LINUX_SOCK_CLOEXEC) as u64;
+    assert_eq!(
+        dispatch_threaded_once(
+            &threaded,
+            &memory,
+            server_tid,
+            SyscallRequest::new(
+                198,
+                SyscallArgs::from([LINUX_AF_INET as u64, socket_type, 0, 0, 0, 0]),
+            ),
+        ),
+        DispatchOutcome::Returned { value: 3 }
+    );
+    {
+        let mut memory = memory.lock().unwrap();
+        write_sockaddr_in(&mut *memory, 0x4000, 0);
+    }
+    assert_eq!(
+        dispatch_threaded_once(
+            &threaded,
+            &memory,
+            server_tid,
+            SyscallRequest::new(200, SyscallArgs::from([3, 0x4000, 16, 0, 0, 0])),
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        dispatch_threaded_once(
+            &threaded,
+            &memory,
+            server_tid,
+            SyscallRequest::new(201, SyscallArgs::from([3, 128, 0, 0, 0, 0])),
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    {
+        let mut memory = memory.lock().unwrap();
+        memory.write_bytes(0x4020, &16_u32.to_le_bytes()).unwrap();
+    }
+    assert_eq!(
+        dispatch_threaded_once(
+            &threaded,
+            &memory,
+            server_tid,
+            SyscallRequest::new(204, SyscallArgs::from([3, 0x4010, 0x4020, 0, 0, 0])),
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let port = {
+        let memory = memory.lock().unwrap();
+        read_sockaddr_in_port(&*memory, 0x4010)
+    };
+
+    assert_eq!(
+        dispatch_threaded_once(
+            &threaded,
+            &memory,
+            server_tid,
+            SyscallRequest::new(20, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+        ),
+        DispatchOutcome::Returned { value: 4 }
+    );
+    add_epoll_interest_threaded(&threaded, &memory, server_tid, 4, 3, 0x5000);
+
+    assert_eq!(
+        dispatch_threaded_once(
+            &threaded,
+            &memory,
+            client_tid,
+            SyscallRequest::new(
+                198,
+                SyscallArgs::from([LINUX_AF_INET as u64, socket_type, 0, 0, 0, 0]),
+            ),
+        ),
+        DispatchOutcome::Returned { value: 5 }
+    );
+    {
+        let mut memory = memory.lock().unwrap();
+        write_sockaddr_in(&mut *memory, 0x4030, port);
+    }
+    assert_eq!(
+        dispatch_threaded_once(
+            &threaded,
+            &memory,
+            client_tid,
+            SyscallRequest::new(203, SyscallArgs::from([5, 0x4030, 16, 0, 0, 0])),
+        ),
+        DispatchOutcome::Errno { errno: 115 }
+    );
+    add_epoll_interest_threaded(&threaded, &memory, client_tid, 4, 5, 0x5020);
+
+    {
+        let mut memory = memory.lock().unwrap();
+        memory.write_bytes(0x4060, &16_u32.to_le_bytes()).unwrap();
+    }
+    let accepted_fd = loop {
+        match dispatch_threaded_once(
+            &threaded,
+            &memory,
+            server_tid,
+            SyscallRequest::new(
+                242,
+                SyscallArgs::from([
+                    3,
+                    0x4050,
+                    0x4060,
+                    (LINUX_SOCK_NONBLOCK | LINUX_SOCK_CLOEXEC) as u64,
+                    0,
+                    0,
+                ]),
+            ),
+        ) {
+            DispatchOutcome::Returned { value } => break value as u64,
+            DispatchOutcome::Errno { errno: 11 } => {
+                let _ = dispatch_threaded_with_wait(
+                    &threaded,
+                    &memory,
+                    server_tid,
+                    SyscallRequest::new(22, SyscallArgs::from([4, 0x5100, 8, 100, 0, 0])),
+                );
+            }
+            other => panic!("unexpected accept4 outcome: {other:?}"),
+        }
+    };
+    add_epoll_interest_threaded(&threaded, &memory, server_tid, 4, accepted_fd, 0x5040);
+
+    assert_eq!(
+        dispatch_threaded_once(
+            &threaded,
+            &memory,
+            server_tid,
+            SyscallRequest::new(63, SyscallArgs::from([accepted_fd, 0x5200, 64, 0, 0, 0])),
+        ),
+        DispatchOutcome::Errno { errno: 11 }
+    );
+    assert_eq!(
+        dispatch_threaded_once(
+            &threaded,
+            &memory,
+            server_tid,
+            SyscallRequest::new(22, SyscallArgs::from([4, 0x5100, 8, 0, 0, 0])),
+        ),
+        DispatchOutcome::Returned { value: 1 }
+    );
+
+    let (wait_tx, wait_rx) = mpsc::channel();
+    let wait_threaded = threaded.clone();
+    let wait_memory = Arc::clone(&memory);
+    let wait_handle = std::thread::spawn(move || {
+        dispatch_threaded_with_wait_notify(
+            &wait_threaded,
+            &wait_memory,
+            wait_tid,
+            SyscallRequest::new(22, SyscallArgs::from([4, 0x5100, 8, 1500, 0, 0])),
+            Some(wait_tx),
+        )
+    });
+    let wait_fds = wait_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("epoll_pwait should hand off to a host-fd wait before the peer writes");
+    assert!(
+        wait_fds
+            .iter()
+            .any(|(_, events)| events & libc::POLLIN != 0)
+    );
+
+    {
+        let mut memory = memory.lock().unwrap();
+        memory
+            .write_bytes(0x5300, b"GET /demo HTTP/1.1\r\n\r\n")
+            .unwrap();
+    }
+    assert_eq!(
+        dispatch_threaded_once(
+            &threaded,
+            &memory,
+            client_tid,
+            SyscallRequest::new(64, SyscallArgs::from([5, 0x5300, 22, 0, 0, 0])),
+        ),
+        DispatchOutcome::Returned { value: 22 }
+    );
+
+    let outcome = match wait_handle.join() {
+        Ok(outcome) => outcome,
+        Err(payload) => std::panic::resume_unwind(payload),
+    };
+    let DispatchOutcome::Returned { value: ready_count } = outcome else {
+        panic!("unexpected epoll outcome: {outcome:?}");
+    };
+    assert!(ready_count >= 1);
+    let memory = memory.lock().unwrap();
+    let mut saw_accepted_read = false;
+    for index in 0..ready_count as u64 {
+        let event = read_epoll_event(&*memory, 0x5100 + index * 16);
+        let event_data = event.data;
+        let event_events = event.events;
+        if event_data == accepted_fd && event_events & LINUX_EPOLLIN != 0 {
+            saw_accepted_read = true;
+        }
+    }
+    assert!(saw_accepted_read);
+    drop(memory);
+
+    let reporter = match Arc::try_unwrap(threaded.reporter) {
+        Ok(reporter) => reporter,
+        Err(_) => panic!("threaded dispatch reporter still has outstanding references"),
+    };
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[cfg(target_os = "macos")]
+fn write_sockaddr_in(memory: &mut impl GuestMemory, address: u64, port: u16) {
+    let mut sockaddr = [0u8; 16];
+    sockaddr[0..2].copy_from_slice(&(LINUX_AF_INET as u16).to_le_bytes());
+    sockaddr[2..4].copy_from_slice(&port.to_be_bytes());
+    sockaddr[4..8].copy_from_slice(&[127, 0, 0, 1]);
+    memory.write_bytes(address, &sockaddr).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+fn read_sockaddr_in_port(memory: &impl GuestMemory, address: u64) -> u16 {
+    let bytes = memory.read_bytes(address, 16).unwrap();
+    u16::from_be_bytes([bytes[2], bytes[3]])
+}
+
+#[cfg(target_os = "macos")]
+fn add_epoll_interest(
+    dispatcher: &mut SyscallDispatcher,
+    memory: &mut impl GuestMemory,
+    reporter: &CompatReporter,
+    epfd: u64,
+    fd: u64,
+    event_addr: u64,
+) {
+    let wanted = LinuxEpollEvent {
+        events: LINUX_EPOLLIN | LINUX_EPOLLOUT | LINUX_EPOLLET | 0x2000,
+        _pad: 0,
+        data: fd,
+    };
+    memory.write_bytes(event_addr, wanted.as_bytes()).unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    21,
+                    SyscallArgs::from([epfd, LINUX_EPOLL_CTL_ADD, fd, event_addr, 0, 0]),
+                ),
+                memory,
+                reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn dispatch_with_wait(
+    dispatcher: &mut SyscallDispatcher,
+    request: SyscallRequest,
+    memory: &mut impl GuestMemory,
+    reporter: &CompatReporter,
+) -> DispatchOutcome {
+    loop {
+        match dispatcher.dispatch(request, memory, reporter).unwrap() {
+            DispatchOutcome::WaitOnFds {
+                fds,
+                timeout,
+                on_timeout,
+            } => {
+                let waiter = ThreadWaiter::new(unsafe { libc::getpid() });
+                match waiter.wait(&fds, timeout) {
+                    WaitResult::Ready => {}
+                    WaitResult::TimedOut => return DispatchOutcome::Returned { value: on_timeout },
+                    WaitResult::Interrupted => {
+                        return DispatchOutcome::Errno { errno: LINUX_EINTR };
+                    }
+                }
+            }
+            other => return other,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn set_tcp_keepidle(
+    dispatcher: &mut SyscallDispatcher,
+    memory: &mut impl GuestMemory,
+    reporter: &CompatReporter,
+    fd: u64,
+    opt_addr: u64,
+) {
+    memory.write_bytes(opt_addr, &15_i32.to_ne_bytes()).unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    208,
+                    SyscallArgs::from([
+                        fd,
+                        LINUX_SOL_TCP as u64,
+                        LINUX_TCP_KEEPIDLE,
+                        opt_addr,
+                        4,
+                        0
+                    ]),
+                ),
+                memory,
+                reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone)]
+struct ThreadedDispatch {
+    dispatcher: Arc<SyscallDispatcher>,
+    reporter: Arc<CompatReporter>,
+    registry: Arc<ThreadRegistry>,
+    futex: Arc<FutexTable>,
+}
+
+#[cfg(target_os = "macos")]
+impl ThreadedDispatch {
+    fn new(main_tid: i32) -> Self {
+        Self {
+            dispatcher: Arc::new(SyscallDispatcher::new()),
+            reporter: Arc::new(CompatReporter::default()),
+            registry: Arc::new(ThreadRegistry::new(main_tid)),
+            futex: Arc::new(FutexTable::new()),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn dispatch_threaded_once(
+    threaded: &ThreadedDispatch,
+    memory: &Arc<Mutex<LinearMemory>>,
+    tid: i32,
+    request: SyscallRequest,
+) -> DispatchOutcome {
+    let mut memory = memory.lock().unwrap();
+    threaded
+        .dispatcher
+        .dispatch_threaded(
+            request,
+            &mut *memory,
+            threaded.reporter.as_ref(),
+            tid,
+            threaded.registry.as_ref(),
+            threaded.futex.as_ref(),
+        )
+        .unwrap()
+}
+
+#[cfg(target_os = "macos")]
+fn add_epoll_interest_threaded(
+    threaded: &ThreadedDispatch,
+    memory: &Arc<Mutex<LinearMemory>>,
+    tid: i32,
+    epfd: u64,
+    fd: u64,
+    event_addr: u64,
+) {
+    {
+        let mut memory = memory.lock().unwrap();
+        let wanted = LinuxEpollEvent {
+            events: LINUX_EPOLLIN | LINUX_EPOLLOUT | LINUX_EPOLLET | 0x2000,
+            _pad: 0,
+            data: fd,
+        };
+        memory.write_bytes(event_addr, wanted.as_bytes()).unwrap();
+    }
+    assert_eq!(
+        dispatch_threaded_once(
+            threaded,
+            memory,
+            tid,
+            SyscallRequest::new(
+                21,
+                SyscallArgs::from([epfd, LINUX_EPOLL_CTL_ADD, fd, event_addr, 0, 0]),
+            ),
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn dispatch_threaded_with_wait(
+    threaded: &ThreadedDispatch,
+    memory: &Arc<Mutex<LinearMemory>>,
+    tid: i32,
+    request: SyscallRequest,
+) -> DispatchOutcome {
+    dispatch_threaded_with_wait_notify(threaded, memory, tid, request, None)
+}
+
+#[cfg(target_os = "macos")]
+fn dispatch_threaded_with_wait_notify(
+    threaded: &ThreadedDispatch,
+    memory: &Arc<Mutex<LinearMemory>>,
+    tid: i32,
+    request: SyscallRequest,
+    mut wait_notify: Option<mpsc::Sender<Vec<(i32, i16)>>>,
+) -> DispatchOutcome {
+    loop {
+        let outcome = dispatch_threaded_once(threaded, memory, tid, request);
+        match outcome {
+            DispatchOutcome::WaitOnFds {
+                fds,
+                timeout,
+                on_timeout,
+            } => {
+                if let Some(sender) = wait_notify.take() {
+                    sender.send(fds.clone()).unwrap();
+                }
+                let waiter = ThreadWaiter::new(tid);
+                match waiter.wait(&fds, timeout) {
+                    WaitResult::Ready => {}
+                    WaitResult::TimedOut => return DispatchOutcome::Returned { value: on_timeout },
+                    WaitResult::Interrupted => {
+                        return DispatchOutcome::Errno { errno: LINUX_EINTR };
+                    }
+                }
+            }
+            other => return other,
+        }
+    }
 }
 
 #[test]

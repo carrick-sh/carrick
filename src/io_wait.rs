@@ -20,6 +20,7 @@ use std::os::fd::RawFd;
 use std::time::{Duration, Instant};
 
 /// Result of a blocking-I/O wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitResult {
     /// One of the watched fds is ready — the runtime re-dispatches the syscall.
     Ready,
@@ -75,17 +76,57 @@ impl ThreadWaiter {
     /// ready, `timeout` elapses, or a signal becomes pending. The dispatcher lock
     /// MUST NOT be held by the caller. `fds` may be empty (a pure sleep).
     pub fn wait(&self, fds: &[(i32, i16)], timeout: Option<Duration>) -> WaitResult {
+        let fd0 = fds.first().map_or(-1, |(fd, _)| *fd);
+        let events0 = fds.first().map_or(0, |(_, events)| i32::from(*events));
+        let fd1 = fds.get(1).map_or(-1, |(fd, _)| *fd);
+        crate::probes::io_wait_begin(
+            self.tid,
+            fds.len() as i32,
+            timeout
+                .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+                .unwrap_or(-1),
+            fd0,
+            events0,
+            fd1,
+        );
         // A signal that arrived just before we parked must not be missed.
         if crate::host_signal::has_pending_for(self.tid) {
+            crate::probes::io_wait_end(
+                self.tid,
+                wait_result_code(WaitResult::Interrupted),
+                fds.len() as i32,
+                fd0,
+                fd1,
+                fds.get(2).map_or(-1, |(fd, _)| *fd),
+            );
             return WaitResult::Interrupted;
         }
+        let result;
         #[cfg(target_os = "macos")]
         {
             if self.kq >= 0 {
-                return self.wait_kqueue(fds, timeout);
+                result = self.wait_kqueue(fds, timeout);
+                crate::probes::io_wait_end(
+                    self.tid,
+                    wait_result_code(result),
+                    fds.len() as i32,
+                    fd0,
+                    fd1,
+                    fds.get(2).map_or(-1, |(fd, _)| *fd),
+                );
+                return result;
             }
         }
-        self.fallback_poll(fds, timeout)
+        result = self.fallback_poll(fds, timeout);
+        crate::probes::io_wait_end(
+            self.tid,
+            wait_result_code(result),
+            fds.len() as i32,
+            fd0,
+            fd1,
+            fds.get(2).map_or(-1, |(fd, _)| *fd),
+        );
+        result
     }
 
     #[cfg(target_os = "macos")]
@@ -251,6 +292,14 @@ impl Drop for ThreadWaiter {
         if self.kq >= 0 {
             unsafe { libc::close(self.kq) };
         }
+    }
+}
+
+fn wait_result_code(result: WaitResult) -> i32 {
+    match result {
+        WaitResult::Ready => 0,
+        WaitResult::TimedOut => 1,
+        WaitResult::Interrupted => 2,
     }
 }
 

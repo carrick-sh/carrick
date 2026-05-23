@@ -2,7 +2,9 @@ use std::fs;
 use std::path::Path;
 
 use crate::dispatch::{GuestMemory, MemoryError};
-use crate::elf::{ElfInspectError, LoadPlan, SegmentPerms, plan_elf_load, plan_elf_load_bytes};
+use crate::elf::{
+    ElfInspectError, LoadPlan, LoadSegment, SegmentPerms, plan_elf_load, plan_elf_load_bytes,
+};
 use crate::linux_abi::{
     LINUX_AT_BASE, LINUX_AT_CLKTCK, LINUX_AT_EGID, LINUX_AT_ENTRY, LINUX_AT_EUID, LINUX_AT_EXECFN,
     LINUX_AT_FLAGS, LINUX_AT_GID, LINUX_AT_HWCAP, LINUX_AT_HWCAP2, LINUX_AT_NULL, LINUX_AT_PAGESZ,
@@ -74,7 +76,7 @@ const AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET: usize = 0x400;
 pub const LINUX_HEAP_BASE: u64 = 0x40_0000_0000; // 256 GiB
 pub const LINUX_HEAP_SIZE: u64 = 128 * 1024 * 1024; // 128 MiB
 pub const LINUX_MMAP_BASE: u64 = 0x60_0000_0000; // 384 GiB
-pub const LINUX_MMAP_SIZE: u64 = 512 * 1024 * 1024; // 512 MiB — apt's pkgcache alone wants 24 MiB
+pub const LINUX_MMAP_SIZE: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB runtime mmap arena.
 pub const LINUX_INTERPRETER_BASE: u64 = 0x80_0000_0000; // 512 GiB
 // Dedicated, initially-UNMAPPED window for real MAP_SHARED file mappings.
 // Each such mmap is backed by a libc MAP_SHARED mmap of the host file,
@@ -690,6 +692,19 @@ fn align_down_usize(value: usize, alignment: usize) -> usize {
     value / alignment * alignment
 }
 
+fn align_down_u64(value: u64, alignment: u64) -> u64 {
+    value / alignment * alignment
+}
+
+fn align_up_u64(value: u64, alignment: u64) -> Option<u64> {
+    let remainder = value % alignment;
+    if remainder == 0 {
+        Some(value)
+    } else {
+        value.checked_add(alignment - remainder)
+    }
+}
+
 fn regions_from_load_plan(
     file: &[u8],
     plan: &LoadPlan,
@@ -704,6 +719,7 @@ fn regions_from_load_plan(
     // union of the segments' perms (we then escalate to RWX in
     // `hvf_perms` anyway), and gaps are zero-padded in the host buffer.
     const MERGE_WINDOW: u64 = 16 * 1024 * 1024;
+    const HVF_MAPPING_PAGE_SIZE: u64 = 16 * 1024;
 
     if plan.segments.is_empty() {
         return Ok(Vec::new());
@@ -726,112 +742,122 @@ fn regions_from_load_plan(
         .max()
         .expect("non-empty segments");
     if max_end.saturating_sub(min_start) <= MERGE_WINDOW {
-        let total_size_u64 =
-            max_end
-                .checked_sub(min_start)
-                .ok_or(AddressSpaceError::RegionOverflow {
-                    start: min_start,
-                    size: 0,
-                })?;
-        let total_size = usize::try_from(total_size_u64)
-            .map_err(|_| AddressSpaceError::RegionTooLarge(total_size_u64))?;
-        let mut bytes = vec![0_u8; total_size];
-        let mut merged_perms = SegmentPerms::default();
-        for segment in &plan.segments {
-            merged_perms.read |= segment.perms.read;
-            merged_perms.write |= segment.perms.write;
-            merged_perms.execute |= segment.perms.execute;
-            let file_offset = usize::try_from(segment.file_offset).map_err(|_| {
-                AddressSpaceError::SegmentBeyondFile {
-                    virtual_address: segment.virtual_address,
-                }
-            })?;
-            let file_size = usize::try_from(segment.file_size).map_err(|_| {
-                AddressSpaceError::SegmentBeyondFile {
-                    virtual_address: segment.virtual_address,
-                }
-            })?;
-            let file_end =
-                file_offset
-                    .checked_add(file_size)
-                    .ok_or(AddressSpaceError::SegmentBeyondFile {
-                        virtual_address: segment.virtual_address,
-                    })?;
-            if file_end > file.len() {
-                return Err(AddressSpaceError::SegmentBeyondFile {
-                    virtual_address: segment.virtual_address,
-                });
-            }
-            let offset_in_region = usize::try_from(segment.virtual_address.wrapping_sub(min_start))
-                .map_err(|_| AddressSpaceError::RegionTooLarge(total_size_u64))?;
-            bytes[offset_in_region..offset_in_region + file_size]
-                .copy_from_slice(&file[file_offset..file_end]);
-        }
-        return Ok(vec![MemoryRegion {
-            start: min_start,
-            end: max_end,
-            perms: merged_perms,
-            bytes,
-        }]);
+        let segments = plan.segments.iter().collect::<Vec<_>>();
+        return Ok(vec![region_from_load_segments(file, &segments)?]);
     }
 
     let mut regions = Vec::with_capacity(plan.segments.len());
+    let mut segments = plan.segments.iter().collect::<Vec<_>>();
+    segments.sort_by_key(|segment| segment.virtual_address);
+    let mut group = Vec::new();
+    let mut group_mapped_end = 0;
 
-    for segment in &plan.segments {
-        // `virtual_address` is already rebased by the load plan (including
-        // the PIE bias for ET_DYN binaries). Treat it as the final guest
-        // address without further adjustment.
-        let start = segment.virtual_address;
+    for segment in segments {
+        let segment_end = segment
+            .virtual_address
+            .checked_add(segment.memory_size)
+            .ok_or(AddressSpaceError::RegionOverflow {
+                start: segment.virtual_address,
+                size: segment.memory_size,
+            })?;
+        let mapped_start = align_down_u64(segment.virtual_address, HVF_MAPPING_PAGE_SIZE);
+        let mapped_end = align_up_u64(segment_end, HVF_MAPPING_PAGE_SIZE).ok_or(
+            AddressSpaceError::RegionOverflow {
+                start: segment.virtual_address,
+                size: segment.memory_size,
+            },
+        )?;
 
+        if group.is_empty() {
+            group.push(segment);
+            group_mapped_end = mapped_end;
+        } else if mapped_start < group_mapped_end {
+            group.push(segment);
+            group_mapped_end = group_mapped_end.max(mapped_end);
+        } else {
+            regions.push(region_from_load_segments(file, &group)?);
+            group.clear();
+            group.push(segment);
+            group_mapped_end = mapped_end;
+        }
+    }
+
+    if !group.is_empty() {
+        regions.push(region_from_load_segments(file, &group)?);
+    }
+
+    Ok(regions)
+}
+
+fn region_from_load_segments(
+    file: &[u8],
+    segments: &[&LoadSegment],
+) -> Result<MemoryRegion, AddressSpaceError> {
+    #[allow(clippy::expect_used)]
+    let start = segments
+        .iter()
+        .map(|segment| segment.virtual_address)
+        .min()
+        .expect("non-empty load segment group");
+    #[allow(clippy::expect_used)]
+    let end = segments
+        .iter()
+        .map(|segment| segment.virtual_address.wrapping_add(segment.memory_size))
+        .max()
+        .expect("non-empty load segment group");
+    let total_size_u64 = end
+        .checked_sub(start)
+        .ok_or(AddressSpaceError::RegionOverflow { start, size: 0 })?;
+    let total_size = usize::try_from(total_size_u64)
+        .map_err(|_| AddressSpaceError::RegionTooLarge(total_size_u64))?;
+    let mut bytes = vec![0_u8; total_size];
+    let mut perms = SegmentPerms::default();
+
+    for segment in segments {
         if segment.file_size > segment.memory_size {
             return Err(AddressSpaceError::FileLargerThanMemory {
-                virtual_address: start,
+                virtual_address: segment.virtual_address,
                 file_size: segment.file_size,
                 memory_size: segment.memory_size,
             });
         }
 
+        perms.read |= segment.perms.read;
+        perms.write |= segment.perms.write;
+        perms.execute |= segment.perms.execute;
         let file_offset = usize::try_from(segment.file_offset).map_err(|_| {
             AddressSpaceError::SegmentBeyondFile {
-                virtual_address: start,
+                virtual_address: segment.virtual_address,
             }
         })?;
         let file_size = usize::try_from(segment.file_size).map_err(|_| {
             AddressSpaceError::SegmentBeyondFile {
-                virtual_address: start,
+                virtual_address: segment.virtual_address,
             }
         })?;
         let file_end =
             file_offset
                 .checked_add(file_size)
                 .ok_or(AddressSpaceError::SegmentBeyondFile {
-                    virtual_address: start,
+                    virtual_address: segment.virtual_address,
                 })?;
         if file_end > file.len() {
             return Err(AddressSpaceError::SegmentBeyondFile {
-                virtual_address: start,
+                virtual_address: segment.virtual_address,
             });
         }
-
-        let memory_size = usize::try_from(segment.memory_size)
-            .map_err(|_| AddressSpaceError::RegionTooLarge(segment.memory_size))?;
-        let mut bytes = vec![0; memory_size];
-        bytes[..file_size].copy_from_slice(&file[file_offset..file_end]);
-
-        regions.push(MemoryRegion {
-            start,
-            end: start.checked_add(segment.memory_size).ok_or(
-                AddressSpaceError::RegionOverflow {
-                    start,
-                    size: segment.memory_size,
-                },
-            )?,
-            perms: segment.perms,
-            bytes,
-        });
+        let offset_in_region = usize::try_from(segment.virtual_address.wrapping_sub(start))
+            .map_err(|_| AddressSpaceError::RegionTooLarge(total_size_u64))?;
+        bytes[offset_in_region..offset_in_region + file_size]
+            .copy_from_slice(&file[file_offset..file_end]);
     }
 
-    Ok(regions)
+    Ok(MemoryRegion {
+        start,
+        end,
+        perms,
+        bytes,
+    })
 }
 
 /// Build the byte image of the EL0 entry trampoline page. Offset 0 is a
@@ -1168,6 +1194,80 @@ impl GuestMemory for AddressSpace {
         }
         region.bytes[offset..end].copy_from_slice(bytes);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod loader_tests {
+    use super::*;
+    use crate::elf::{ElfType, LoadPlan, LoadSegment};
+
+    #[test]
+    fn merges_segments_that_overlap_after_hvf_page_rounding() {
+        let mut file = vec![0_u8; 0x9000];
+        file[0..0x3004].fill(0x11);
+        file[0x4000..0x6000].fill(0x22);
+        file[0x8000..0x9000].fill(0x33);
+
+        let plan = LoadPlan {
+            entry: 0x1ff000,
+            interpreter: None,
+            program_header_address: None,
+            program_header_entry_size: 56,
+            program_header_count: 3,
+            load_bias: 0,
+            e_type: ElfType::Exec,
+            segments: vec![
+                LoadSegment {
+                    file_offset: 0,
+                    virtual_address: 0x1ff000,
+                    file_size: 0x3004,
+                    memory_size: 0x3004,
+                    alignment: 0x1000,
+                    perms: SegmentPerms {
+                        read: true,
+                        write: false,
+                        execute: true,
+                    },
+                },
+                LoadSegment {
+                    file_offset: 0x4000,
+                    virtual_address: 0x203000,
+                    file_size: 0x2000,
+                    memory_size: 0x2000,
+                    alignment: 0x1000,
+                    perms: SegmentPerms {
+                        read: true,
+                        write: false,
+                        execute: false,
+                    },
+                },
+                LoadSegment {
+                    file_offset: 0x8000,
+                    virtual_address: 0x2000_0000,
+                    file_size: 0x1000,
+                    memory_size: 0x1000,
+                    alignment: 0x1000,
+                    perms: SegmentPerms {
+                        read: true,
+                        write: true,
+                        execute: false,
+                    },
+                },
+            ],
+        };
+
+        let regions = regions_from_load_plan(&file, &plan).unwrap();
+
+        assert_eq!(regions.len(), 2);
+        assert_eq!(regions[0].start, 0x1ff000);
+        assert_eq!(regions[0].end, 0x205000);
+        assert_eq!(regions[0].bytes()[0], 0x11);
+        assert_eq!(regions[0].bytes()[0x203000 - 0x1ff000], 0x22);
+        assert!(regions[0].perms.execute);
+        assert!(!regions[0].perms.write);
+        assert_eq!(regions[1].start, 0x2000_0000);
+        assert_eq!(regions[1].bytes()[0], 0x33);
     }
 }
 

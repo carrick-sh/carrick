@@ -378,8 +378,8 @@ fn run_address_space_with_hvf_and_dispatcher(
     trap.map_address_space(&image)?;
     // Hand the dispatcher the real region list so `/proc/self/maps`
     // reflects the loaded ELF, runtime regions, bootstrap pages, and
-    // stack instead of the legacy hard-coded summary. Go's runtime
-    // and glibc's malloc introspection both parse this file.
+    // stack instead of the legacy hard-coded summary. Language runtimes,
+    // malloc implementations, and debuggers all parse this file.
     dispatcher.set_address_space_regions(proc_maps_from_address_space(&image));
     run_threaded_hvf_loop(trap, dispatcher, max_traps)
 }
