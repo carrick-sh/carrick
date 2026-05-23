@@ -9,9 +9,8 @@ impl SyscallDispatcher {
         memory: &mut M,
         reporter: &CompatReporter,
     ) -> Option<Result<DispatchOutcome, DispatchError>> {
-        match request.number {
-            19..=22 | 72 | 73 | 198..=212 | 242 | 243 | 269 => {}
-            _ => return None,
+        if !syscall_handler_is(request.number, SyscallHandler::Network) {
+            return None;
         }
 
         let syscall = lookup_aarch64(request.number);
@@ -613,10 +612,8 @@ impl SyscallDispatcher {
                     timeout_ms,
                 )
             };
-            if n < 0 {
-                return Ok(DispatchOutcome::Errno {
-                    errno: host_errno(),
-                });
+            if let Err(errno) = n.host_syscall_errno() {
+                return Ok(DispatchOutcome::Errno { errno });
             }
             for (slot, p) in revents.iter_mut().zip(pollfds.iter()) {
                 *slot = p.revents;
@@ -847,10 +844,8 @@ impl SyscallDispatcher {
                     0,
                 )
             };
-            if n < 0 {
-                return Ok(DispatchOutcome::Errno {
-                    errno: host_errno(),
-                });
+            if let Err(errno) = n.host_syscall_errno() {
+                return Ok(DispatchOutcome::Errno { errno });
             }
             let mut ready = 0i64;
             for (i, p) in sys_pollfds.iter().enumerate() {
@@ -1258,12 +1253,12 @@ impl SyscallDispatcher {
         let base_type = type_ & !LinuxSocketTypeFlags::SUPPORTED_MASK;
         let host_family = linux_to_host_af(family);
         let host_type = linux_to_host_socktype(base_type);
-        let host_fd = unsafe { libc::socket(host_family, host_type, protocol) };
-        if host_fd < 0 {
-            return DispatchOutcome::Errno {
-                errno: host_errno(),
-            };
-        }
+        let host_fd = match (unsafe { libc::socket(host_family, host_type, protocol) })
+            .host_syscall_errno()
+        {
+            Ok(value) => value,
+            Err(errno) => return DispatchOutcome::Errno { errno },
+        };
         // Host fds keep their native blocking mode; carrick emulates the
         // guest's blocking via per-call MSG_DONTWAIT + a lockless kqueue wait
         // (see P2/blocking_io). Honour a guest-requested SOCK_NONBLOCK.
@@ -1314,10 +1309,8 @@ impl SyscallDispatcher {
         let mut host_fds: [i32; 2] = [-1, -1];
         let rc =
             unsafe { libc::socketpair(host_family, host_type, protocol, host_fds.as_mut_ptr()) };
-        if rc != 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: host_errno(),
-            });
+        if let Err(errno) = rc.host_syscall_errno() {
+            return Ok(DispatchOutcome::Errno { errno });
         }
         // Native blocking mode unless the guest asked for SOCK_NONBLOCK.
         if nonblock {
@@ -1513,10 +1506,8 @@ impl SyscallDispatcher {
                 host_addr.len() as u32,
             )
         };
-        Ok(if rc < 0 {
-            DispatchOutcome::Errno {
-                errno: host_errno(),
-            }
+        Ok(if let Err(errno) = rc.host_syscall_errno() {
+            DispatchOutcome::Errno { errno }
         } else {
             DispatchOutcome::Returned { value: 0 }
         })
@@ -1533,10 +1524,8 @@ impl SyscallDispatcher {
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
         let rc = unsafe { libc::listen(host_fd, backlog) };
-        if rc < 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: host_errno(),
-            });
+        if let Err(errno) = rc.host_syscall_errno() {
+            return Ok(DispatchOutcome::Errno { errno });
         }
         // A listen socket exists only to accept(2); make the HOST socket
         // non-blocking so accept never blocks under the dispatcher lock — the
@@ -1608,9 +1597,7 @@ impl SyscallDispatcher {
                     &mut sa_len as *mut _,
                 )
             };
-            if new_host < 0 {
-                return Err(host_errno());
-            }
+            let new_host = new_host.host_syscall_errno()?;
             if addr_addr != 0 && addrlen_addr != 0 {
                 let used = (sa_len as usize).min(sa_storage.len());
                 let linux_bytes = host_to_linux_sockaddr(&sa_storage[..used], family);
@@ -1701,7 +1688,7 @@ impl SyscallDispatcher {
         if rc == 0 {
             return Ok(DispatchOutcome::Returned { value: 0 });
         }
-        let e = host_errno();
+        let e = HostSyscallError::last().linux_errno();
         // EISCONN: the connection completed (we're back here via the POLLOUT
         // re-dispatch). Success.
         if e == LINUX_EISCONN {
@@ -1753,10 +1740,8 @@ impl SyscallDispatcher {
         let mut sa_len: libc::socklen_t = sa.len() as libc::socklen_t;
         let rc =
             unsafe { libc::getsockname(host_fd, sa.as_mut_ptr() as *mut _, &mut sa_len as *mut _) };
-        if rc < 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: host_errno(),
-            });
+        if let Err(errno) = rc.host_syscall_errno() {
+            return Ok(DispatchOutcome::Errno { errno });
         }
         let used = (sa_len as usize).min(sa.len());
         let linux_bytes = host_to_linux_sockaddr(&sa[..used], family);
@@ -1784,10 +1769,8 @@ impl SyscallDispatcher {
         let mut sa_len: libc::socklen_t = sa.len() as libc::socklen_t;
         let rc =
             unsafe { libc::getpeername(host_fd, sa.as_mut_ptr() as *mut _, &mut sa_len as *mut _) };
-        if rc < 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: host_errno(),
-            });
+        if let Err(errno) = rc.host_syscall_errno() {
+            return Ok(DispatchOutcome::Errno { errno });
         }
         let used = (sa_len as usize).min(sa.len());
         let linux_bytes = host_to_linux_sockaddr(&sa[..used], family);
@@ -1871,11 +1854,7 @@ impl SyscallDispatcher {
                     )
                 },
             };
-            if n < 0 {
-                Err(host_errno())
-            } else {
-                Ok(n as i64)
-            }
+            n.host_syscall_errno().map(|value| value as i64)
         });
         Ok(outcome)
     }
@@ -1947,9 +1926,7 @@ impl SyscallDispatcher {
                     true,
                 )
             };
-            if n < 0 {
-                return Err(host_errno());
-            }
+            let n = n.host_syscall_errno()?;
             if n > 0 && memory.write_bytes(buf_addr, &buf[..n as usize]).is_err() {
                 return Err(LINUX_EFAULT);
             }
@@ -2019,13 +1996,11 @@ impl SyscallDispatcher {
                 bytes.len() as u32,
             )
         };
-        Ok(if rc < 0 {
+        Ok(if let Err(errno) = rc.host_syscall_errno() {
             // Linux apps frequently set options that aren't supported on
             // macOS (eg IP_MTU_DISCOVER); swallow ENOPROTOOPT silently
             // when the equivalent option simply doesn't exist on macOS.
-            DispatchOutcome::Errno {
-                errno: host_errno(),
-            }
+            DispatchOutcome::Errno { errno }
         } else {
             DispatchOutcome::Returned { value: 0 }
         })
@@ -2091,10 +2066,8 @@ impl SyscallDispatcher {
                 &mut optlen as *mut _,
             )
         };
-        if rc < 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: host_errno(),
-            });
+        if let Err(errno) = rc.host_syscall_errno() {
+            return Ok(DispatchOutcome::Errno { errno });
         }
         let used = (optlen as usize).min(buf.len());
         if optval_addr != 0 && used > 0 && memory.write_bytes(optval_addr, &buf[..used]).is_err() {
@@ -2124,10 +2097,8 @@ impl SyscallDispatcher {
             Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
         };
         let rc = unsafe { libc::shutdown(host_fd, how) };
-        Ok(if rc < 0 {
-            DispatchOutcome::Errno {
-                errno: host_errno(),
-            }
+        Ok(if let Err(errno) = rc.host_syscall_errno() {
+            DispatchOutcome::Errno { errno }
         } else {
             DispatchOutcome::Returned { value: 0 }
         })
@@ -2210,11 +2181,7 @@ impl SyscallDispatcher {
                     )
                 },
             };
-            if n < 0 {
-                Err(host_errno())
-            } else {
-                Ok(n as i64)
-            }
+            n.host_syscall_errno().map(|value| value as i64)
         });
         Ok(outcome)
     }
@@ -2313,9 +2280,7 @@ impl SyscallDispatcher {
                     },
                 )
             };
-            if n < 0 {
-                return Err(host_errno());
-            }
+            let n = n.host_syscall_errno()?;
             // Scatter the received bytes back into the guest's iovecs.
             let mut remaining = n as usize;
             let mut cursor = 0usize;

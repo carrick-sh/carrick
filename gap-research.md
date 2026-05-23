@@ -66,6 +66,10 @@ Work package progress:
   - Verified VFS proc/sys unit tests plus existing synthetic `/proc` and `/sys` syscall-surface tests.
   - Completed L2/L3: added an `OpenDescription::stat_source` helper and shared `StatRecord` writer path for `stat`, `fstat`, and `statx`.
   - Verified `fstat` and `statx(AT_EMPTY_PATH)` now agree for eventfd, timerfd, epoll, pipe, and socket fds.
+  - Completed L4: extended the aarch64 syscall manifest with group, handler module, and compatibility-note fields; threaded dispatch route gates now consult the manifest handler owner instead of local ownership ranges.
+  - Verified manifest drift coverage for group-vs-handler cases such as `pselect6`/`ppoll`, bootstrap `ENOSYS` stubs, planned `execveat`, and partial `clone3`.
+  - Completed L5: replaced the ad hoc `host_errno()` propagation boundary with `HostSyscallResult`/`HostSyscallError`, migrated host syscall failure paths through that boundary, and removed the legacy helper.
+  - Verified macOS-to-Linux errno capture for divergent `EINPROGRESS`, `EAGAIN`, and `ECONNREFUSED` values.
 - [ ] Hygiene gates and final verification sweep
 
 ## Executive Summary
@@ -554,15 +558,15 @@ Recommendation:
 
 Validation target:
 
-- Changing a syscall's support level or handler location cannot leave stale metadata behind.
+- Changing a syscall's support level or handler location cannot leave stale metadata behind. Completed by adding `SyscallHandler` and compatibility notes to the aarch64 manifest, making threaded route gates use manifest handler ownership, and adding syscall-table tests for group/handler drift and supported syscall handler ownership.
 
 ### L5. Errno translation is good but not mandatory enough
 
 Severity: P2 correctness.
 
-The errno translation layer is one of the stronger patterns in the codebase: `host_errno()` maps Darwin errno through `macos_to_linux_errno` (`src/dispatch/mod.rs:4363-4368`), and Linux errno constants are explicit at `src/dispatch/mod.rs:4370-4458`.
+The errno translation layer is one of the stronger patterns in the codebase: host errno capture now flows through `HostSyscallError`/`HostSyscallResult`, Darwin errno still maps through `macos_to_linux_errno`, and Linux errno constants remain explicit in `src/dispatch/mod.rs`.
 
-The gap is enforcement. Some paths still return raw `host_errno()` correctly, while others manually choose Linux errno. That is sometimes appropriate, but the code does not make the distinction mechanically obvious.
+The original gap was enforcement: host syscall failures could read the translated host errno through an ad hoc helper, while semantic Linux errno decisions used the same plain `i32` shape. That made the boundary hard to audit.
 
 Recommendation:
 
@@ -572,7 +576,7 @@ Recommendation:
 
 Validation target:
 
-- No host `errno` value can escape as a Linux return without passing through translation.
+- No host `errno` value can escape as a Linux return without passing through translation. Completed by removing the legacy `host_errno()` helper, requiring host syscall return values to use `HostSyscallResult`, and adding a macOS unit test for divergent `EINPROGRESS`, `EAGAIN`, and `ECONNREFUSED` translation.
 
 ### L6. The runtime loop is carrying too many responsibilities
 

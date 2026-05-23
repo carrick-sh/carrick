@@ -1,4 +1,4 @@
-use carrick::syscall::{SupportLevel, lookup_aarch64};
+use carrick::syscall::{SupportLevel, SyscallHandler, aarch64_table, lookup_aarch64};
 
 #[test]
 fn names_linux_aarch64_bringup_syscalls() {
@@ -208,6 +208,54 @@ fn names_linux_aarch64_bringup_syscalls() {
 #[test]
 fn unknown_syscalls_are_explicit() {
     assert!(lookup_aarch64(9999).is_none());
+}
+
+#[test]
+fn manifest_records_group_handler_and_compatibility_notes() {
+    let pselect6 = lookup_aarch64(72).unwrap();
+    assert_eq!(pselect6.group, "fs");
+    assert_eq!(pselect6.subsystem, "fs");
+    assert_eq!(pselect6.handler, SyscallHandler::Network);
+    assert_eq!(pselect6.compat_note, None);
+
+    let signalfd4 = lookup_aarch64(74).unwrap();
+    assert_eq!(signalfd4.group, "signal");
+    assert_eq!(signalfd4.handler, SyscallHandler::BootstrapStub);
+    assert!(
+        signalfd4
+            .compat_note
+            .is_some_and(|note| note.contains("ENOSYS")),
+        "bootstrap stubs must carry an explicit compatibility note",
+    );
+
+    let getrusage = lookup_aarch64(165).unwrap();
+    assert_eq!(getrusage.group, "process");
+    assert_eq!(getrusage.handler, SyscallHandler::Time);
+
+    let execveat = lookup_aarch64(281).unwrap();
+    assert_eq!(execveat.support, SupportLevel::Planned);
+    assert_eq!(execveat.handler, SyscallHandler::Unimplemented);
+    assert!(execveat.compat_note.is_some());
+
+    let clone3 = lookup_aarch64(435).unwrap();
+    assert_eq!(clone3.support, SupportLevel::Planned);
+    assert_eq!(clone3.handler, SyscallHandler::Lifecycle);
+    assert!(clone3.compat_note.is_some());
+}
+
+#[test]
+fn bringup_manifest_entries_have_a_handler_owner() {
+    for syscall in aarch64_table() {
+        if syscall.support == SupportLevel::BringUp {
+            assert_ne!(
+                syscall.handler,
+                SyscallHandler::Unimplemented,
+                "bring-up syscall {} ({}) has no manifest handler owner",
+                syscall.number,
+                syscall.name,
+            );
+        }
+    }
 }
 
 #[test]
