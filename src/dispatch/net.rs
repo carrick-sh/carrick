@@ -83,9 +83,7 @@ impl SyscallDispatcher {
         let initial_value = ctx.arg(0);
         let flags = ctx.arg(1);
         if flags & !(LINUX_EFD_SEMAPHORE | LINUX_EFD_NONBLOCK | LINUX_EFD_CLOEXEC) != 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         let description = OpenDescription::EventFd {
             state: Arc::new(EventFdState::new(initial_value)),
@@ -121,9 +119,7 @@ impl SyscallDispatcher {
     ) -> Result<DispatchOutcome, DispatchError> {
         let flags = ctx.arg(0);
         if flags & !LINUX_EPOLL_CLOEXEC != 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         let description = OpenDescription::Epoll {
             interest: HashMap::new(),
@@ -144,45 +140,38 @@ impl SyscallDispatcher {
         // A bad target fd is EBADF; a target equal to the epoll fd itself is
         // EINVAL (an epoll instance can't monitor itself). (LTP epoll_ctl02.)
         if !self.fd_is_valid(fd) {
-            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+            return Ok(LINUX_EBADF.into());
         }
         if epfd == fd {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
 
         let Some(open_file) = self.open_file(epfd) else {
-            return Ok(DispatchOutcome::Errno {
-                errno: if self.fd_is_valid(epfd) {
-                    LINUX_EINVAL
-                } else {
-                    LINUX_EBADF
-                },
-            });
+            return Ok(if self.fd_is_valid(epfd) {
+                LINUX_EINVAL
+            } else {
+                LINUX_EBADF
+            }
+            .into());
         };
         let mut open = open_file.description.write();
         let OpenDescription::Epoll { interest, .. } = &mut *open else {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         };
 
         match operation {
             LINUX_EPOLL_CTL_ADD => {
                 let event = match read_epoll_event(memory, event_address) {
                     Ok(event) => event,
-                    Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                    Err(errno) => return Ok(errno.into()),
                 };
                 // The kernel rejects ADD of a target that has no ->poll support
                 // (regular files, directories) with EPERM. (LTP epoll_ctl02/05.)
                 if !self.fd_is_epollable(fd) {
-                    return Ok(DispatchOutcome::Errno { errno: LINUX_EPERM });
+                    return Ok(LINUX_EPERM.into());
                 }
                 if interest.contains_key(&fd) {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: LINUX_EEXIST,
-                    });
+                    return Ok(LINUX_EEXIST.into());
                 }
                 interest.insert(
                     fd,
@@ -197,12 +186,10 @@ impl SyscallDispatcher {
             LINUX_EPOLL_CTL_MOD => {
                 let event = match read_epoll_event(memory, event_address) {
                     Ok(event) => event,
-                    Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                    Err(errno) => return Ok(errno.into()),
                 };
                 let Some(slot) = interest.get_mut(&fd) else {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: LINUX_ENOENT,
-                    });
+                    return Ok(LINUX_ENOENT.into());
                 };
                 *slot = EpollInterest {
                     event,
@@ -216,14 +203,10 @@ impl SyscallDispatcher {
                     crate::probes::epoll_ctl(epfd, operation, fd, 0, 0, 0);
                     Ok(DispatchOutcome::Returned { value: 0 })
                 } else {
-                    Ok(DispatchOutcome::Errno {
-                        errno: LINUX_ENOENT,
-                    })
+                    Ok(LINUX_ENOENT.into())
                 }
             }
-            _ => Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            }),
+            _ => Ok(LINUX_EINVAL.into()),
         }
     }
 
@@ -245,44 +228,35 @@ impl SyscallDispatcher {
         let sigsetsize = ctx.arg(5);
         let memory = &mut *ctx.memory;
         if max_events_signed <= 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         let max_events = max_events_signed as usize;
         if sigmask_ptr != 0 {
             if sigsetsize != crate::linux_abi::LINUX_RT_SIGSET_SIZE {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_EINVAL,
-                });
+                return Ok(LINUX_EINVAL.into());
             }
             if memory
                 .read_bytes(sigmask_ptr, crate::linux_abi::LINUX_RT_SIGSET_SIZE as usize)
                 .is_err()
             {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_EFAULT,
-                });
+                return Ok(LINUX_EFAULT.into());
             }
         }
 
         let Some(open_file) = self.open_file(epfd) else {
             // A valid fd that simply isn't an epoll instance is EINVAL; only a
             // genuinely bad fd is EBADF. (LTP epoll_wait03.)
-            return Ok(DispatchOutcome::Errno {
-                errno: if self.fd_is_valid(epfd) {
-                    LINUX_EINVAL
-                } else {
-                    LINUX_EBADF
-                },
-            });
+            return Ok(if self.fd_is_valid(epfd) {
+                LINUX_EINVAL
+            } else {
+                LINUX_EBADF
+            }
+            .into());
         };
         let interests = {
             let open = open_file.description.read();
             let OpenDescription::Epoll { interest, .. } = &*open else {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_EINVAL,
-                });
+                return Ok(LINUX_EINVAL.into());
             };
             interest
                 .iter()
@@ -355,14 +329,10 @@ impl SyscallDispatcher {
                 .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
             let address = events_address.checked_add(offset).ok_or(LINUX_EFAULT);
             let Ok(address) = address else {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_EFAULT,
-                });
+                return Ok(LINUX_EFAULT.into());
             };
             if write_kernel_struct_raw(memory, address, event).is_err() {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_EFAULT,
-                });
+                return Ok(LINUX_EFAULT.into());
             }
         }
 
@@ -489,8 +459,7 @@ impl SyscallDispatcher {
         &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let nfds =
-            usize::try_from(ctx.arg(0)).map_err(|_| DispatchError::LengthTooLarge(ctx.arg(0)))?;
+        let nfds = GuestLen::try_from_arg(ctx.arg(0))?.0;
         let readfds_addr = ctx.arg(1);
         let writefds_addr = ctx.arg(2);
         let exceptfds_addr = ctx.arg(3);
@@ -523,15 +492,15 @@ impl SyscallDispatcher {
         // Pull each fd_set into memory.
         let read_set = match self.read_optional_fd_set(memory, readfds_addr, nfds)? {
             Ok(s) => s,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         let write_set = match self.read_optional_fd_set(memory, writefds_addr, nfds)? {
             Ok(s) => s,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         let except_set = match self.read_optional_fd_set(memory, exceptfds_addr, nfds)? {
             Ok(s) => s,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
 
         // Collect the union of the three sets into per-fd entries, and try to
@@ -554,7 +523,7 @@ impl SyscallDispatcher {
             }
             let fd_i32 = i32::try_from(fd).map_err(|_| DispatchError::LengthTooLarge(u64::MAX))?;
             if !self.fd_is_valid(fd_i32) {
-                return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+                return Ok(LINUX_EBADF.into());
             }
             let mut events: i16 = 0;
             if r {
@@ -613,7 +582,7 @@ impl SyscallDispatcher {
                 )
             };
             if let Err(errno) = n.host_syscall_errno() {
-                return Ok(DispatchOutcome::Errno { errno });
+                return Ok(errno.into());
             }
             for (slot, p) in revents.iter_mut().zip(pollfds.iter()) {
                 *slot = p.revents;
@@ -719,23 +688,17 @@ impl SyscallDispatcher {
         if let Some(s) = &new_read
             && memory.write_bytes(readfds_addr, s).is_err()
         {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EFAULT,
-            });
+            return Ok(LINUX_EFAULT.into());
         }
         if let Some(s) = &new_write
             && memory.write_bytes(writefds_addr, s).is_err()
         {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EFAULT,
-            });
+            return Ok(LINUX_EFAULT.into());
         }
         if let Some(s) = &new_except
             && memory.write_bytes(exceptfds_addr, s).is_err()
         {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EFAULT,
-            });
+            return Ok(LINUX_EFAULT.into());
         }
         Ok(DispatchOutcome::Returned { value: ready })
     }
@@ -807,14 +770,12 @@ impl SyscallDispatcher {
             let address = match address {
                 Ok(a) => a,
                 Err(_) => {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: LINUX_EFAULT,
-                    });
+                    return Ok(LINUX_EFAULT.into());
                 }
             };
             let pollfd = match read_pollfd(memory, address) {
                 Ok(p) => p,
-                Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                Err(errno) => return Ok(errno.into()),
             };
             fds.push(pollfd);
             addresses.push(address);
@@ -845,7 +806,7 @@ impl SyscallDispatcher {
                 )
             };
             if let Err(errno) = n.host_syscall_errno() {
-                return Ok(DispatchOutcome::Errno { errno });
+                return Ok(errno.into());
             }
             let mut ready = 0i64;
             for (i, p) in sys_pollfds.iter().enumerate() {
@@ -857,9 +818,7 @@ impl SyscallDispatcher {
                 // Always write back (zeroed revents on a not-ready probe) so a
                 // later timeout completion needs no further writes.
                 if write_kernel_struct_raw(memory, addresses[i], &pollfd).is_err() {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: LINUX_EFAULT,
-                    });
+                    return Ok(LINUX_EFAULT.into());
                 }
             }
             if ready > 0 || timeout_ms == 0 {
@@ -891,9 +850,7 @@ impl SyscallDispatcher {
                     ready += 1;
                 }
                 if write_kernel_struct_raw(memory, addresses[index], pollfd).is_err() {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: LINUX_EFAULT,
-                    });
+                    return Ok(LINUX_EFAULT.into());
                 }
             }
             if ready > 0 || timeout_ms == 0 {
@@ -1006,9 +963,7 @@ impl SyscallDispatcher {
                 if nonblocking {
                     // Guest wants non-blocking (fd O_NONBLOCK or per-call
                     // MSG_DONTWAIT): report EAGAIN, don't wait.
-                    DispatchOutcome::Errno {
-                        errno: LINUX_EAGAIN,
-                    }
+                    DispatchOutcome::errno(LINUX_EAGAIN)
                 } else {
                     // Blocking-mode: hand off to the runtime to wait on host-fd
                     // readiness with the dispatcher lock RELEASED (per-thread
@@ -1022,7 +977,7 @@ impl SyscallDispatcher {
                     }
                 }
             }
-            Err(e) => DispatchOutcome::Errno { errno: e },
+            Err(e) => DispatchOutcome::errno(e),
         }
     }
 
@@ -1225,9 +1180,7 @@ impl SyscallDispatcher {
         let cloexec = socket_flags.contains(LinuxSocketTypeFlags::CLOEXEC);
         let base_type = type_ & !LinuxSocketTypeFlags::SUPPORTED_MASK;
         if base_type != LINUX_SOCK_RAW && base_type != LINUX_SOCK_DGRAM {
-            return DispatchOutcome::Errno {
-                errno: LINUX_ESOCKTNOSUPPORT,
-            };
+            return DispatchOutcome::errno(LINUX_ESOCKTNOSUPPORT);
         }
         let status_flags = if nonblock { LINUX_O_NONBLOCK } else { 0 };
         let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };
@@ -1257,7 +1210,7 @@ impl SyscallDispatcher {
             .host_syscall_errno()
         {
             Ok(value) => value,
-            Err(errno) => return DispatchOutcome::Errno { errno },
+            Err(errno) => return DispatchOutcome::errno(errno),
         };
         // The host fd is always nonblocking; Carrick preserves the guest's
         // blocking mode in Linux-visible status_flags and waits outside the
@@ -1278,9 +1231,7 @@ impl SyscallDispatcher {
         let linux_fd = match self.install_fd_at_or_above(3, open_file) {
             Ok(fd) => fd,
             Err(_) => {
-                return DispatchOutcome::Errno {
-                    errno: linux_errno::EMFILE,
-                };
+                return DispatchOutcome::errno(linux_errno::EMFILE);
             }
         };
         DispatchOutcome::Returned {
@@ -1308,7 +1259,7 @@ impl SyscallDispatcher {
         let rc =
             unsafe { libc::socketpair(host_family, host_type, protocol, host_fds.as_mut_ptr()) };
         if let Err(errno) = rc.host_syscall_errno() {
-            return Ok(DispatchOutcome::Errno { errno });
+            return Ok(errno.into());
         }
         set_host_nonblocking(host_fds[0]);
         set_host_nonblocking(host_fds[1]);
@@ -1337,9 +1288,7 @@ impl SyscallDispatcher {
         let (read_fd, write_fd) = match self.install_fd_pair_at_or_above(3, first, second) {
             Ok(pair) => pair,
             Err(_) => {
-                return Ok(DispatchOutcome::Errno {
-                    errno: linux_errno::EMFILE,
-                });
+                return Ok(linux_errno::EMFILE.into());
             }
         };
         let pair = LinuxFdPair { read_fd, write_fd };
@@ -1351,9 +1300,7 @@ impl SyscallDispatcher {
             for open_file in removed.into_iter().flatten() {
                 self.close_open_file_and_free_pty(&open_file);
             }
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EFAULT,
-            });
+            return Ok(LINUX_EFAULT.into());
         }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
@@ -1383,14 +1330,12 @@ impl SyscallDispatcher {
     /// specifically model). Returns the number of bytes "sent".
     fn netlink_send(&self, fd: i32, request: &[u8]) -> DispatchOutcome {
         let Some(open_file) = self.open_file(fd) else {
-            return DispatchOutcome::Errno { errno: LINUX_EBADF };
+            return DispatchOutcome::errno(LINUX_EBADF);
         };
         let reply = {
             let open = open_file.description.read();
             let OpenDescription::Netlink { pid, .. } = &*open else {
-                return DispatchOutcome::Errno {
-                    errno: LINUX_ENOTSOCK,
-                };
+                return DispatchOutcome::errno(LINUX_ENOTSOCK);
             };
             let dest_pid = if *pid != 0 { *pid } else { std::process::id() };
             build_netlink_reply(request, dest_pid)
@@ -1413,9 +1358,7 @@ impl SyscallDispatcher {
     ) -> DispatchOutcome {
         let chunk = self.netlink_drain(fd, len);
         if !chunk.is_empty() && memory.write_bytes(buf_addr, &chunk).is_err() {
-            return DispatchOutcome::Errno {
-                errno: LINUX_EFAULT,
-            };
+            return DispatchOutcome::errno(LINUX_EFAULT);
         }
         DispatchOutcome::Returned {
             value: chunk.len() as i64,
@@ -1466,11 +1409,11 @@ impl SyscallDispatcher {
         }
         let (host_fd, family) = match self.host_socket_lookup(fd) {
             Ok(t) => t,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         let host_addr = match read_linux_sockaddr(memory, addr_addr, addrlen, family) {
             Ok(bytes) => bytes,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         // AF_UNIX pathname sockets are bound at a stable host path (see
         // unix_socket_host_path). The guest's unlink only tombstones a VFS
@@ -1502,7 +1445,7 @@ impl SyscallDispatcher {
             )
         };
         Ok(if let Err(errno) = rc.host_syscall_errno() {
-            DispatchOutcome::Errno { errno }
+            DispatchOutcome::errno(errno)
         } else {
             DispatchOutcome::Returned { value: 0 }
         })
@@ -1512,15 +1455,15 @@ impl SyscallDispatcher {
         &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let fd = ctx.arg(0) as i32;
+        let fd: Fd = ctx.typed_arg(0);
         let backlog = ctx.arg(1) as i32;
-        let (host_fd, _family) = match self.host_socket_lookup(fd) {
+        let (host_fd, _family) = match self.host_socket_lookup(fd.0) {
             Ok(t) => t,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         let rc = unsafe { libc::listen(host_fd, backlog) };
         if let Err(errno) = rc.host_syscall_errno() {
-            return Ok(DispatchOutcome::Errno { errno });
+            return Ok(errno.into());
         }
         // A listen socket exists only to accept(2); make the HOST socket
         // non-blocking so accept never blocks under the dispatcher lock — the
@@ -1559,7 +1502,7 @@ impl SyscallDispatcher {
         let addrlen_addr = request.arg(2);
         let (host_fd, family, type_) = {
             let Some(open_file) = self.open_file(fd) else {
-                return DispatchOutcome::Errno { errno: LINUX_EBADF };
+                return DispatchOutcome::errno(LINUX_EBADF);
             };
             match &*open_file.description.read() {
                 OpenDescription::HostSocket {
@@ -1569,9 +1512,7 @@ impl SyscallDispatcher {
                     ..
                 } => (*host_fd, *family, *type_),
                 _ => {
-                    return DispatchOutcome::Errno {
-                        errno: LINUX_ENOTSOCK,
-                    };
+                    return DispatchOutcome::errno(LINUX_ENOTSOCK);
                 }
             }
         };
@@ -1641,9 +1582,7 @@ impl SyscallDispatcher {
         let linux_fd = match self.install_fd_at_or_above(3, open_file) {
             Ok(fd) => fd,
             Err(_) => {
-                return DispatchOutcome::Errno {
-                    errno: linux_errno::EMFILE,
-                };
+                return DispatchOutcome::errno(linux_errno::EMFILE);
             }
         };
         DispatchOutcome::Returned {
@@ -1661,11 +1600,11 @@ impl SyscallDispatcher {
         let addrlen = ctx.request.arg(2) as u32;
         let (host_fd, family) = match self.host_socket_lookup(fd) {
             Ok(t) => t,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         let host_addr = match read_linux_sockaddr(memory, addr_addr, addrlen, family) {
             Ok(bytes) => bytes,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         // connect(2) has no per-call non-blocking flag, so put the host socket
         // non-blocking — it then returns EINPROGRESS instead of blocking under
@@ -1692,7 +1631,7 @@ impl SyscallDispatcher {
         if e == LINUX_EINPROGRESS || e == LINUX_EALREADY || e == LINUX_EAGAIN {
             if nonblocking {
                 // Non-blocking guest: hand EINPROGRESS/EALREADY straight back.
-                return Ok(DispatchOutcome::Errno { errno: e });
+                return Ok(e.into());
             }
             // Blocking guest: wait (lock released) for the socket to become
             // writable, then re-dispatch — connect then returns EISCONN or the
@@ -1703,7 +1642,7 @@ impl SyscallDispatcher {
                 on_timeout: -(LINUX_EINPROGRESS as i64),
             });
         }
-        Ok(DispatchOutcome::Errno { errno: e })
+        Ok(e.into())
     }
 
     pub(super) fn getsockname<M: GuestMemory>(
@@ -1721,29 +1660,25 @@ impl SyscallDispatcher {
         {
             let nl = sockaddr_nl_bytes(*pid, *groups);
             if write_linux_sockaddr(memory, addr_addr, addrlen_addr, &nl).is_err() {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_EFAULT,
-                });
+                return Ok(LINUX_EFAULT.into());
             }
             return Ok(DispatchOutcome::Returned { value: 0 });
         }
         let (host_fd, family) = match self.host_socket_lookup(fd) {
             Ok(t) => t,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         let mut sa = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
         let mut sa_len: libc::socklen_t = sa.len() as libc::socklen_t;
         let rc =
             unsafe { libc::getsockname(host_fd, sa.as_mut_ptr() as *mut _, &mut sa_len as *mut _) };
         if let Err(errno) = rc.host_syscall_errno() {
-            return Ok(DispatchOutcome::Errno { errno });
+            return Ok(errno.into());
         }
         let used = (sa_len as usize).min(sa.len());
         let linux_bytes = host_to_linux_sockaddr(&sa[..used], family);
         if write_linux_sockaddr(memory, addr_addr, addrlen_addr, &linux_bytes).is_err() {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EFAULT,
-            });
+            return Ok(LINUX_EFAULT.into());
         }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
@@ -1758,21 +1693,19 @@ impl SyscallDispatcher {
         let addrlen_addr = ctx.request.arg(2);
         let (host_fd, family) = match self.host_socket_lookup(fd) {
             Ok(t) => t,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         let mut sa = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
         let mut sa_len: libc::socklen_t = sa.len() as libc::socklen_t;
         let rc =
             unsafe { libc::getpeername(host_fd, sa.as_mut_ptr() as *mut _, &mut sa_len as *mut _) };
         if let Err(errno) = rc.host_syscall_errno() {
-            return Ok(DispatchOutcome::Errno { errno });
+            return Ok(errno.into());
         }
         let used = (sa_len as usize).min(sa.len());
         let linux_bytes = host_to_linux_sockaddr(&sa[..used], family);
         if write_linux_sockaddr(memory, addr_addr, addrlen_addr, &linux_bytes).is_err() {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EFAULT,
-            });
+            return Ok(LINUX_EFAULT.into());
         }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
@@ -1794,23 +1727,19 @@ impl SyscallDispatcher {
             let bytes = match memory.read_bytes(buf_addr, len) {
                 Ok(b) => b,
                 Err(_) => {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: LINUX_EFAULT,
-                    });
+                    return Ok(LINUX_EFAULT.into());
                 }
             };
             return Ok(self.netlink_send(fd, &bytes));
         }
         let (host_fd, family) = match self.host_socket_lookup(fd) {
             Ok(t) => t,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         let bytes = match memory.read_bytes(buf_addr, len) {
             Ok(bytes) => bytes,
             Err(_) => {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_EFAULT,
-                });
+                return Ok(LINUX_EFAULT.into());
             }
         };
         // Read the destination sockaddr (if any) from guest memory up front,
@@ -1821,7 +1750,7 @@ impl SyscallDispatcher {
         } else {
             match read_linux_sockaddr(memory, dest_addr, dest_len, family) {
                 Ok(b) => Some(b),
-                Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                Err(errno) => return Ok(errno.into()),
             }
         };
         let nonblocking = self.io_is_nonblocking(fd, flags);
@@ -1880,7 +1809,7 @@ impl SyscallDispatcher {
         }
         let (host_fd, family) = match self.host_socket_lookup(fd) {
             Ok(t) => t,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         // Native fd mode preserved; force this CALL non-blocking with
         // MSG_DONTWAIT and route through blocking_io: on EAGAIN a blocking-mode
@@ -1956,14 +1885,12 @@ impl SyscallDispatcher {
         }
         let (host_fd, _family) = match self.host_socket_lookup(fd) {
             Ok(t) => t,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         let (host_level, host_opt) = match linux_to_host_sockopt(level, optname) {
             Some(t) => t,
             None => {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_ENOPROTOOPT,
-                });
+                return Ok(LINUX_ENOPROTOOPT.into());
             }
         };
         let bytes = if optval_addr == 0 || optlen == 0 {
@@ -1972,9 +1899,7 @@ impl SyscallDispatcher {
             match memory.read_bytes(optval_addr, optlen as usize) {
                 Ok(b) => b,
                 Err(_) => {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: LINUX_EFAULT,
-                    });
+                    return Ok(LINUX_EFAULT.into());
                 }
             }
         };
@@ -1995,7 +1920,7 @@ impl SyscallDispatcher {
             // Linux apps frequently set options that aren't supported on
             // macOS (eg IP_MTU_DISCOVER); swallow ENOPROTOOPT silently
             // when the equivalent option simply doesn't exist on macOS.
-            DispatchOutcome::Errno { errno }
+            DispatchOutcome::errno(errno)
         } else {
             DispatchOutcome::Returned { value: 0 }
         })
@@ -2025,23 +1950,19 @@ impl SyscallDispatcher {
         }
         let (host_fd, _family) = match self.host_socket_lookup(fd) {
             Ok(t) => t,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         let (host_level, host_opt) = match linux_to_host_sockopt(level, optname) {
             Some(t) => t,
             None => {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_ENOPROTOOPT,
-                });
+                return Ok(LINUX_ENOPROTOOPT.into());
             }
         };
         // Read the guest's reported optlen so we don't overflow.
         let optlen_bytes = match memory.read_bytes(optlen_addr, 4) {
             Ok(b) => b,
             Err(_) => {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_EFAULT,
-                });
+                return Ok(LINUX_EFAULT.into());
             }
         };
         let mut optlen = u32::from_ne_bytes([
@@ -2062,21 +1983,17 @@ impl SyscallDispatcher {
             )
         };
         if let Err(errno) = rc.host_syscall_errno() {
-            return Ok(DispatchOutcome::Errno { errno });
+            return Ok(errno.into());
         }
         let used = (optlen as usize).min(buf.len());
         if optval_addr != 0 && used > 0 && memory.write_bytes(optval_addr, &buf[..used]).is_err() {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EFAULT,
-            });
+            return Ok(LINUX_EFAULT.into());
         }
         if memory
             .write_bytes(optlen_addr, &optlen.to_ne_bytes())
             .is_err()
         {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EFAULT,
-            });
+            return Ok(LINUX_EFAULT.into());
         }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
@@ -2085,15 +2002,15 @@ impl SyscallDispatcher {
         &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let fd = ctx.arg(0) as i32;
+        let fd: Fd = ctx.typed_arg(0);
         let how = ctx.arg(1) as i32;
-        let (host_fd, _family) = match self.host_socket_lookup(fd) {
+        let (host_fd, _family) = match self.host_socket_lookup(fd.0) {
             Ok(t) => t,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         let rc = unsafe { libc::shutdown(host_fd, how) };
         Ok(if let Err(errno) = rc.host_syscall_errno() {
-            DispatchOutcome::Errno { errno }
+            DispatchOutcome::errno(errno)
         } else {
             DispatchOutcome::Returned { value: 0 }
         })
@@ -2113,16 +2030,16 @@ impl SyscallDispatcher {
         } else {
             match self.host_socket_lookup(fd) {
                 Ok(t) => t,
-                Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                Err(errno) => return Ok(errno.into()),
             }
         };
         let msg = match read_linux_msghdr(memory, msg_addr) {
             Ok(m) => m,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         let iovecs = match read_iovecs(memory, msg.iov, msg.iovlen as usize) {
             Ok(v) => v,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         // Pack iovecs into a single contiguous send. Simple and avoids
         // having to keep guest pointers alive across the FFI call.
@@ -2131,9 +2048,7 @@ impl SyscallDispatcher {
             let chunk = match memory.read_bytes(iov.iov_base, iov.iov_len as usize) {
                 Ok(b) => b,
                 Err(_) => {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: LINUX_EFAULT,
-                    });
+                    return Ok(LINUX_EFAULT.into());
                 }
             };
             data.extend_from_slice(&chunk);
@@ -2148,7 +2063,7 @@ impl SyscallDispatcher {
         } else {
             match read_linux_sockaddr(memory, msg.name, msg.namelen, family) {
                 Ok(b) => Some(b),
-                Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                Err(errno) => return Ok(errno.into()),
             }
         };
         let nonblocking = self.io_is_nonblocking(fd, flags);
@@ -2195,16 +2110,16 @@ impl SyscallDispatcher {
         } else {
             match self.host_socket_lookup(fd) {
                 Ok(t) => t,
-                Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+                Err(errno) => return Ok(errno.into()),
             }
         };
         let msg = match read_linux_msghdr(memory, msg_addr) {
             Ok(m) => m,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         let iovecs = match read_iovecs(memory, msg.iov, msg.iovlen as usize) {
             Ok(v) => v,
-            Err(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            Err(errno) => return Ok(errno.into()),
         };
         // AF_NETLINK: drain the queued dump reply into the iovecs, fill in
         // the source sockaddr_nl (kernel; pid=0), and zero controllen/flags.
@@ -2224,9 +2139,7 @@ impl SyscallDispatcher {
                         .write_bytes(iov.iov_base, &chunk[cursor..cursor + take])
                         .is_err()
                     {
-                        return Ok(DispatchOutcome::Errno {
-                            errno: LINUX_EFAULT,
-                        });
+                        return Ok(LINUX_EFAULT.into());
                     }
                     cursor += take;
                     remaining -= take;
@@ -2240,9 +2153,7 @@ impl SyscallDispatcher {
                         .write_bytes(msg.name, &nl[..write_len as usize])
                         .is_err()
                 {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: LINUX_EFAULT,
-                    });
+                    return Ok(LINUX_EFAULT.into());
                 }
                 let _ = memory.write_bytes(msg_addr + 8, &(nl.len() as u32).to_ne_bytes());
             }
@@ -2350,9 +2261,7 @@ impl SyscallDispatcher {
             let entry = match msgvec.checked_add(i as u64 * MMSGHDR_SIZE) {
                 Some(a) => a,
                 None => {
-                    return DispatchOutcome::Errno {
-                        errno: LINUX_EFAULT,
-                    };
+                    return DispatchOutcome::errno(LINUX_EFAULT);
                 }
             };
             // Build a synthetic sendmsg request that points at this
@@ -2376,9 +2285,7 @@ impl SyscallDispatcher {
                     // sendmsg never produces a DispatchError; surface it
                     // as EFAULT to keep this helper's bare-outcome contract.
                     Err(_) => {
-                        return DispatchOutcome::Errno {
-                            errno: LINUX_EFAULT,
-                        };
+                        return DispatchOutcome::errno(LINUX_EFAULT);
                     }
                 }
             };
@@ -2389,9 +2296,7 @@ impl SyscallDispatcher {
                         .write_bytes(entry + MSG_LEN_OFFSET, &len_u32.to_le_bytes())
                         .is_err()
                     {
-                        return DispatchOutcome::Errno {
-                            errno: LINUX_EFAULT,
-                        };
+                        return DispatchOutcome::errno(LINUX_EFAULT);
                     }
                     sent += 1;
                 }
@@ -2402,7 +2307,7 @@ impl SyscallDispatcher {
                         // surfaces on the next call.
                         return DispatchOutcome::Returned { value: sent as i64 };
                     }
-                    return DispatchOutcome::Errno { errno };
+                    return DispatchOutcome::errno(errno);
                 }
                 other => return other,
             }
@@ -2428,9 +2333,7 @@ impl SyscallDispatcher {
             let entry = match msgvec.checked_add(i as u64 * MMSGHDR_SIZE) {
                 Some(a) => a,
                 None => {
-                    return DispatchOutcome::Errno {
-                        errno: LINUX_EFAULT,
-                    };
+                    return DispatchOutcome::errno(LINUX_EFAULT);
                 }
             };
             // After the first successful recvmsg, switch to non-blocking
@@ -2457,9 +2360,7 @@ impl SyscallDispatcher {
                     // recvmsg never produces a DispatchError; surface it
                     // as EFAULT to keep this helper's bare-outcome contract.
                     Err(_) => {
-                        return DispatchOutcome::Errno {
-                            errno: LINUX_EFAULT,
-                        };
+                        return DispatchOutcome::errno(LINUX_EFAULT);
                     }
                 }
             };
@@ -2470,9 +2371,7 @@ impl SyscallDispatcher {
                         .write_bytes(entry + MSG_LEN_OFFSET, &len_u32.to_le_bytes())
                         .is_err()
                     {
-                        return DispatchOutcome::Errno {
-                            errno: LINUX_EFAULT,
-                        };
+                        return DispatchOutcome::errno(LINUX_EFAULT);
                     }
                     received += 1;
                 }
@@ -2482,7 +2381,7 @@ impl SyscallDispatcher {
                             value: received as i64,
                         };
                     }
-                    return DispatchOutcome::Errno { errno };
+                    return DispatchOutcome::errno(errno);
                 }
                 other => return other,
             }
@@ -2611,9 +2510,7 @@ pub(super) fn drain_netlink_queue(
     }
     let chunk: Vec<u8> = queue.drain(..take).collect();
     if memory.write_bytes(address, &chunk).is_err() {
-        return DispatchOutcome::Errno {
-            errno: LINUX_EFAULT,
-        };
+        return DispatchOutcome::errno(LINUX_EFAULT);
     }
     DispatchOutcome::Returned {
         value: chunk.len() as i64,
