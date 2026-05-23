@@ -1,6 +1,22 @@
 use carrick::compat::{CompatEvent, CompatReportFormat, CompatReporter, SyscallArgs};
 
 #[test]
+fn syscall_entry_name_is_borrowed_not_allocated() {
+    use std::borrow::Cow;
+    let ev = carrick::compat::CompatEvent::SyscallEntry {
+        number: 64,
+        name: Cow::Borrowed("write"), // &'static str, zero alloc
+        args: carrick::compat::SyscallArgs([0; 6]),
+    };
+    match ev {
+        carrick::compat::CompatEvent::SyscallEntry { name, .. } => {
+            assert!(matches!(name, Cow::Borrowed("write")));
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[test]
 fn aggregates_unhandled_syscalls_by_name_and_number() {
     let reporter = CompatReporter::default();
 

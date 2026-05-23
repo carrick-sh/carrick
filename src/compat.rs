@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -63,12 +64,12 @@ pub struct GuestRegs {
 pub enum CompatEvent {
     SyscallEntry {
         number: u64,
-        name: String,
+        name: Cow<'static, str>,
         args: SyscallArgs,
     },
     SyscallReturn {
         number: u64,
-        name: String,
+        name: Cow<'static, str>,
         retval: i64,
         errno: Option<i32>,
     },

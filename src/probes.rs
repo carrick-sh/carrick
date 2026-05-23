@@ -276,7 +276,7 @@ fn fire_usdt(event: &CompatEvent) {
             // `args` lives in `event` for the duration of this synchronous
             // probe fire, so its address is valid when DTrace copyin's it.
             let args_ptr = args as *const SyscallArgs as u64;
-            carrick_usdt::syscall__entry!(|| (*number, name.as_str(), args_ptr));
+            carrick_usdt::syscall__entry!(|| (*number, name.as_ref(), args_ptr));
         }
         CompatEvent::SyscallReturn {
             number,
@@ -285,7 +285,7 @@ fn fire_usdt(event: &CompatEvent) {
             errno,
         } => {
             carrick_usdt::syscall__return!(|| {
-                (*number, name.as_str(), *retval, errno.unwrap_or(0))
+                (*number, name.as_ref(), *retval, errno.unwrap_or(0))
             });
         }
         CompatEvent::UnhandledSyscall { number, name, args } => {
