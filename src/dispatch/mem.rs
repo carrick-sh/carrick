@@ -59,9 +59,9 @@ impl SyscallDispatcher {
         &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let fd = ctx.arg(0) as i32;
-        if !self.fd_is_valid(fd) && !is_stdio_fd(fd) {
-            return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+        let fd: Fd = ctx.typed_arg(0);
+        if !self.fd_is_valid(fd.0) && !is_stdio_fd(fd.0) {
+            return Ok(LINUX_EBADF.into());
         }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
@@ -81,7 +81,7 @@ impl SyscallDispatcher {
         let length = ctx.arg(1);
         let prot = ctx.arg(2);
         let flags = ctx.arg(3);
-        let fd = ctx.arg(4) as i32;
+        let fd: Fd = ctx.typed_arg(4);
         let offset = ctx.arg(5);
         let memory = &mut *ctx.memory;
 
@@ -97,16 +97,12 @@ impl SyscallDispatcher {
             || (flags & LINUX_MAP_ANONYMOUS == 0 && !offset.is_multiple_of(LINUX_PAGE_SIZE))
             || (flags & LINUX_MAP_FIXED != 0 && !requested.is_multiple_of(LINUX_PAGE_SIZE))
         {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         let length = match align_up_u64(length, LINUX_PAGE_SIZE) {
             Some(length) => length,
             None => {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_ENOMEM,
-                });
+                return Ok(LINUX_ENOMEM.into());
             }
         };
         let length_usize =
@@ -131,8 +127,8 @@ impl SyscallDispatcher {
             && offset.is_multiple_of(hvf_page)
         {
             let dup_fd = {
-                let Some(open_file) = self.open_file(fd) else {
-                    return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+                let Some(open_file) = self.open_file(fd.0) else {
+                    return Ok(LINUX_EBADF.into());
                 };
                 let open = open_file.description.read();
                 match &*open {
@@ -190,9 +186,7 @@ impl SyscallDispatcher {
         let address = match self.next_mmap_address(requested, length, prot, flags) {
             Some(address) => address,
             None => {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_ENOMEM,
-                });
+                return Ok(LINUX_ENOMEM.into());
             }
         };
 
@@ -207,8 +201,8 @@ impl SyscallDispatcher {
 
         let mut bytes = vec![0; length_usize];
         if flags & LINUX_MAP_ANONYMOUS == 0 {
-            let Some(open_file) = self.open_file(fd) else {
-                return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+            let Some(open_file) = self.open_file(fd.0) else {
+                return Ok(LINUX_EBADF.into());
             };
             let open = open_file.description.read();
             let offset_usize =
@@ -250,7 +244,7 @@ impl SyscallDispatcher {
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::Netlink { .. } => {
-                    return Ok(DispatchOutcome::Errno { errno: LINUX_EBADF });
+                    return Ok(LINUX_EBADF.into());
                 }
             }
         }
@@ -342,9 +336,7 @@ impl SyscallDispatcher {
         let address = ctx.arg(0);
         let length = ctx.arg(1);
         if length == 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         // A real MAP_SHARED file mapping → tear down the host mmap + stage-2.
         let shared_mapping = {
@@ -359,9 +351,7 @@ impl SyscallDispatcher {
             return Ok(DispatchOutcome::Returned { value: 0 });
         }
         if !range_within(address, length, LINUX_MMAP_BASE, LINUX_MMAP_SIZE) {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
@@ -374,14 +364,10 @@ impl SyscallDispatcher {
         let length = ctx.arg(1);
         let flags = ctx.arg(2);
         if flags & !(LINUX_MS_ASYNC | LINUX_MS_INVALIDATE | LINUX_MS_SYNC) != 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         if flags & LINUX_MS_ASYNC != 0 && flags & LINUX_MS_SYNC != 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         if length == 0 {
             return Ok(DispatchOutcome::Returned { value: 0 });
@@ -401,9 +387,7 @@ impl SyscallDispatcher {
             return Ok(DispatchOutcome::Returned { value: 0 });
         }
         if ctx.memory.read_bytes(address, 1).is_err() {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_ENOMEM,
-            });
+            return Ok(LINUX_ENOMEM.into());
         }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
@@ -419,9 +403,7 @@ impl SyscallDispatcher {
             return Ok(DispatchOutcome::Returned { value: 0 });
         }
         if memory.read_bytes(address, 1).is_err() {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_ENOMEM,
-            });
+            return Ok(LINUX_ENOMEM.into());
         }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
@@ -439,9 +421,7 @@ impl SyscallDispatcher {
     ) -> Result<DispatchOutcome, DispatchError> {
         let flags = ctx.arg(0);
         if flags == 0 || flags & !(LINUX_MCL_CURRENT | LINUX_MCL_FUTURE | LINUX_MCL_ONFAULT) != 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
@@ -465,16 +445,12 @@ impl SyscallDispatcher {
             return Ok(DispatchOutcome::Returned { value: 0 });
         }
         if memory.read_bytes(address, 1).is_err() {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_ENOMEM,
-            });
+            return Ok(LINUX_ENOMEM.into());
         }
         let pages = length.div_ceil(LINUX_PAGE_SIZE);
         let bytes = vec![1u8; pages as usize];
         if memory.write_bytes(vec, &bytes).is_err() {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EFAULT,
-            });
+            return Ok(LINUX_EFAULT.into());
         }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
@@ -489,24 +465,16 @@ impl SyscallDispatcher {
         let new_size_req = ctx.request.arg(2);
         let flags = ctx.request.arg(3);
         if new_size_req == 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         if flags & !(LINUX_MREMAP_MAYMOVE | LINUX_MREMAP_FIXED | LINUX_MREMAP_DONTUNMAP) != 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         if !range_within(old_address, old_size, LINUX_MMAP_BASE, LINUX_MMAP_SIZE) {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         let Some(new_size) = align_up_u64(new_size_req, LINUX_PAGE_SIZE) else {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_ENOMEM,
-            });
+            return Ok(LINUX_ENOMEM.into());
         };
         if new_size <= old_size {
             return Ok(DispatchOutcome::Returned {
@@ -519,9 +487,7 @@ impl SyscallDispatcher {
         // the stage-2 mapping, so no copy is needed.
         if old_address.checked_add(old_size) == Some(self.mem.lock().mmap_next) {
             let Some(new_end) = old_address.checked_add(new_size) else {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_ENOMEM,
-                });
+                return Ok(LINUX_ENOMEM.into());
             };
             if range_within(old_address, new_size, LINUX_MMAP_BASE, LINUX_MMAP_SIZE) {
                 self.mem.lock().mmap_next = new_end;
@@ -534,23 +500,17 @@ impl SyscallDispatcher {
         // Otherwise the mapping can only grow by moving. Linux requires
         // MREMAP_MAYMOVE for that; without it the call fails.
         if flags & LINUX_MREMAP_MAYMOVE == 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_ENOMEM,
-            });
+            return Ok(LINUX_ENOMEM.into());
         }
         let Some(new_address) =
             self.next_mmap_address(0, new_size, LINUX_PROT_READ | LINUX_PROT_WRITE, 0)
         else {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_ENOMEM,
-            });
+            return Ok(LINUX_ENOMEM.into());
         };
         let copy_len = match usize::try_from(old_size) {
             Ok(len) => len,
             Err(_) => {
-                return Ok(DispatchOutcome::Errno {
-                    errno: LINUX_ENOMEM,
-                });
+                return Ok(LINUX_ENOMEM.into());
             }
         };
         if copy_len > 0 {
@@ -559,9 +519,7 @@ impl SyscallDispatcher {
                     let _ = memory.write_bytes(new_address, &bytes);
                 }
                 Err(_) => {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: LINUX_EFAULT,
-                    });
+                    return Ok(LINUX_EFAULT.into());
                 }
             }
         }
@@ -578,9 +536,7 @@ impl SyscallDispatcher {
         let length = ctx.arg(1);
         let prot = ctx.arg(2);
         if prot & !(LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC) != 0 {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         if length == 0 {
             return Ok(DispatchOutcome::Returned { value: 0 });
@@ -593,9 +549,7 @@ impl SyscallDispatcher {
         // don't currently model, and gating those calls produces an
         // ENOMEM-retry loop that prevents dynamic startup from finishing.
         if !address.is_multiple_of(LINUX_PAGE_SIZE) {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         // Track PROT_NONE so the syscall path faults on the range (EFAULT for a
         // buffer arg); re-enabling access clears it. This is the only part of
@@ -617,28 +571,20 @@ impl SyscallDispatcher {
         let memory = &mut *ctx.memory;
 
         if !address.is_multiple_of(LINUX_PAGE_SIZE) || !linux_madvise_advice_is_supported(advice) {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
+            return Ok(LINUX_EINVAL.into());
         }
         if length == 0 {
             return Ok(DispatchOutcome::Returned { value: 0 });
         }
 
         let Ok(length) = usize::try_from(length) else {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_ENOMEM,
-            });
+            return Ok(LINUX_ENOMEM.into());
         };
         let Some(last_address) = address.checked_add(length as u64 - 1) else {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_ENOMEM,
-            });
+            return Ok(LINUX_ENOMEM.into());
         };
         if memory.read_bytes(address, 1).is_err() || memory.read_bytes(last_address, 1).is_err() {
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_ENOMEM,
-            });
+            return Ok(LINUX_ENOMEM.into());
         }
         if advice == LINUX_MADV_DONTNEED {
             const ZERO_CHUNK: [u8; 4096] = [0; 4096];
@@ -647,9 +593,7 @@ impl SyscallDispatcher {
             while remaining > 0 {
                 let chunk = remaining.min(ZERO_CHUNK.len());
                 if memory.write_bytes(cursor, &ZERO_CHUNK[..chunk]).is_err() {
-                    return Ok(DispatchOutcome::Errno {
-                        errno: LINUX_ENOMEM,
-                    });
+                    return Ok(LINUX_ENOMEM.into());
                 }
                 remaining -= chunk;
                 cursor += chunk as u64;
@@ -665,9 +609,7 @@ impl SyscallDispatcher {
         if command == LINUX_MEMBARRIER_CMD_QUERY && flags == 0 {
             return DispatchOutcome::Returned { value: 0 };
         }
-        DispatchOutcome::Errno {
-            errno: LINUX_EINVAL,
-        }
+        DispatchOutcome::errno(LINUX_EINVAL)
     }
 
     pub(super) fn sys_membarrier<M: GuestMemory>(
