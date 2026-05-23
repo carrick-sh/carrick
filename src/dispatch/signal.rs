@@ -211,6 +211,13 @@ impl SyscallDispatcher {
     ) -> Result<DispatchOutcome, DispatchError> {
         let tid = ctx.arg(0) as i64;
         let signum = ctx.arg(1);
+        // The kernel rejects a non-positive tid with EINVAL before anything
+        // else (sys_tkill: `if (pid <= 0) return -EINVAL`). (LTP tkill02.)
+        if tid <= 0 {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            });
+        }
         if !is_valid_signum(signum) {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
@@ -235,6 +242,14 @@ impl SyscallDispatcher {
         let tgid = ctx.arg(0) as i64;
         let tid = ctx.arg(1) as i64;
         let signum = ctx.arg(2);
+        // The kernel rejects a non-positive tgid or tid with EINVAL up front
+        // (sys_tgkill: `if (pid <= 0 || tgid <= 0) return -EINVAL`), before
+        // resolving the target or validating the signal. (LTP tgkill03.)
+        if tgid <= 0 || tid <= 0 {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            });
+        }
         if !is_valid_signum(signum) {
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EINVAL,
@@ -383,8 +398,16 @@ impl SyscallDispatcher {
         let signum = ctx.arg(0) as i32;
         let new_action = ctx.arg(1);
         let old_action = ctx.arg(2);
-        let _sigset_size = ctx.arg(3);
+        let sigset_size = ctx.arg(3);
         let memory = &mut *ctx.memory;
+        // The kernel validates the sigset size FIRST: `rt_sigaction` rejects
+        // any sigsetsize != sizeof(sigset_t) (8 on aarch64) with EINVAL,
+        // before touching the user pointers. (LTP rt_sigaction03.)
+        if sigset_size != LINUX_RT_SIGSET_SIZE {
+            return Ok(DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            });
+        }
         // Linux returns EINVAL for signum <= 0 or > _NSIG (64 on
         // most arches). Reject these.
         if !(1..=64).contains(&signum) {
@@ -392,7 +415,51 @@ impl SyscallDispatcher {
                 errno: LINUX_EINVAL,
             });
         }
-        // Write back the previously-installed handler (or zero if none).
+        // Read the new handler (if any) BEFORE writing back the old one, to
+        // match the kernel ordering: copy_from_user(new) happens first, so a
+        // bad `new_action` pointer yields EFAULT with no side effects.
+        // (LTP rt_sigaction02 passes a deliberately bad pointer.)
+        let new_sa = if new_action != 0 {
+            let bytes = match memory.read_bytes(new_action, core::mem::size_of::<LinuxSigaction>())
+            {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    return Ok(DispatchOutcome::Errno {
+                        errno: LINUX_EFAULT,
+                    });
+                }
+            };
+            // Installing a handler for SIGKILL (9) or SIGSTOP (19) is rejected
+            // with EINVAL — these signals cannot be caught or ignored. signum 0
+            // never reaches here (the 1..=64 check above rejects it).
+            if signum == LINUX_SIGKILL || signum == LINUX_SIGSTOP {
+                return Ok(DispatchOutcome::Errno {
+                    errno: LINUX_EINVAL,
+                });
+            }
+            match LinuxSigaction::ref_from_bytes(&bytes) {
+                Ok(sa) => {
+                    let w = |o: usize| {
+                        bytes
+                            .get(o..o + 8)
+                            .and_then(|s| s.try_into().ok())
+                            .map(u64::from_le_bytes)
+                            .unwrap_or(0)
+                    };
+                    crate::probes::sigaction_read(signum, w(0), w(8), w(16), w(24));
+                    Some(*sa)
+                }
+                Err(_) => {
+                    return Ok(DispatchOutcome::Errno {
+                        errno: LINUX_EFAULT,
+                    });
+                }
+            }
+        } else {
+            None
+        };
+        // Write back the previously-installed handler (or zero if none). A bad
+        // `old_action` pointer is an EFAULT.
         if old_action != 0 {
             let prev = self
                 .signal
@@ -401,26 +468,15 @@ impl SyscallDispatcher {
                 .get(&signum)
                 .copied()
                 .unwrap_or_else(LinuxSigaction::empty);
-            let _ = write_kernel_struct_raw(memory, old_action, &prev);
+            if write_kernel_struct_raw(memory, old_action, &prev).is_err() {
+                return Ok(DispatchOutcome::Errno {
+                    errno: LINUX_EFAULT,
+                });
+            }
         }
-        // Read and store the new handler. The kernel rejects attempts
-        // to install handlers for SIGKILL (9) and SIGSTOP (19); leave
-        // signum=0 in the lenient bucket for the interactive sh probe.
-        if new_action != 0
-            && signum != 9
-            && signum != 19
-            && let Ok(bytes) = memory.read_bytes(new_action, core::mem::size_of::<LinuxSigaction>())
-            && let Ok(sa) = LinuxSigaction::ref_from_bytes(&bytes)
-        {
-            let w = |o: usize| {
-                bytes
-                    .get(o..o + 8)
-                    .and_then(|s| s.try_into().ok())
-                    .map(u64::from_le_bytes)
-                    .unwrap_or(0)
-            };
-            crate::probes::sigaction_read(signum, w(0), w(8), w(16), w(24));
-            self.signal.lock().handlers.insert(signum, *sa);
+        // Commit the new handler.
+        if let Some(sa) = new_sa {
+            self.signal.lock().handlers.insert(signum, sa);
             // If the guest installed a real handler (not SIG_DFL/IGN),
             // install a matching host handler so a cross-process kill
             // from another guest process is routed here instead of

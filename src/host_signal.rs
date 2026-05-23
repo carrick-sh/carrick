@@ -366,8 +366,16 @@ extern "C" fn handle_routed(host_signum: libc::c_int) {
 /// process). Idempotent per signal. Skips signals carrick must not hook:
 /// SIGKILL (9) / SIGSTOP (19) can't be caught, and SIGCHLD (17) must keep its
 /// default disposition or `wait4`'s host-`waitpid` passthrough breaks.
+/// SIGPIPE (13) is excluded too: carrick deliberately sets it to SIG_IGN
+/// process-wide (see main.rs) so its own host writes to a closed pipe yield
+/// EPIPE rather than a signal, and the guest's own pipe-write SIGPIPE is
+/// synthesised on the syscall path. Installing a host SIGPIPE handler here —
+/// triggered merely because a guest registered one (e.g. LTP's tst_sig.c
+/// installs handlers for every signal) — would re-route carrick's internal
+/// EPIPE writes into the guest as a spurious SIGPIPE. (LTP sigaltstack01,
+/// kill02, pause02/03, sigrelse01 all break this way.)
 pub fn ensure_host_handler(linux_signum: i32) {
-    if !(1..=63).contains(&linux_signum) || matches!(linux_signum, 9 | 17 | 19) {
+    if !(1..=63).contains(&linux_signum) || matches!(linux_signum, 9 | 13 | 17 | 19) {
         return;
     }
     let bit = 1u64 << linux_signum;
