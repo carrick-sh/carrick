@@ -4132,6 +4132,89 @@ fn fsync_family_flushes_host_backed_files() {
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn copy_file_range_uses_darwin_fast_path_for_whole_host_files() {
+    use carrick::fs_backend::HostFsBackend;
+
+    let scratch = tempfile::TempDir::new().unwrap();
+    let dir =
+        cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority()).unwrap();
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.set_fs_backend(Box::new(HostFsBackend::from_existing_dir(dir)));
+    let reporter = CompatReporter::default();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x300]);
+    memory.write_bytes(0x4000, b"/source.bin\0").unwrap();
+    memory.write_bytes(0x4020, b"/dest.bin\0").unwrap();
+
+    for (path, expected_fd) in [(0x4000, 3), (0x4020, 4)] {
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    SyscallRequest::new(
+                        56,
+                        SyscallArgs::from([(-100_i64) as u64, path, 0o100 | 0o2, 0o644, 0, 0,]),
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: expected_fd }
+        );
+    }
+
+    memory
+        .write_bytes(0x4100, b"copyfile-backed copy\n")
+        .unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(64, SyscallArgs::from([3, 0x4100, 21, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 21 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(62, SyscallArgs::from([3, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(285, SyscallArgs::from([3, 0, 4, 0, 21, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 21 }
+    );
+    assert_eq!(
+        std::fs::read(scratch.path().join("dest.bin")).unwrap(),
+        b"copyfile-backed copy\n"
+    );
+    for fd in [3, 4] {
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    SyscallRequest::new(62, SyscallArgs::from([fd, 0, 1, 0, 0, 0])),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: 21 }
+        );
+    }
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
 #[test]
 fn fcntl_on_bare_stdio_succeeds_not_ebadf() {
     // Regression: F_SETFL on bare stdio (fd 0/1/2, which have no
