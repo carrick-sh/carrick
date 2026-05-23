@@ -716,6 +716,8 @@ fn run_threaded_hvf_loop(
 
     let main_tid: ThreadId = std::process::id() as ThreadId;
     let registry = Arc::new(ThreadRegistry::new(main_tid));
+    // Publish for the /proc/<tid>/stat + /proc/<pid>/task/ synthesis.
+    crate::thread::set_current_registry(Arc::clone(&registry));
     let futex = Arc::new(FutexTable::new());
     let kernel = Arc::new(KernelState::new(dispatcher));
     // Track spawned sibling threads so the process doesn't tear down while a
@@ -831,17 +833,23 @@ fn run_vcpu_until_exit(
                     fds,
                     timeout,
                     on_timeout,
-                } => match waiter.wait(&fds, timeout) {
-                    crate::io_wait::WaitResult::Ready => continue,
-                    crate::io_wait::WaitResult::TimedOut => {
-                        break DispatchOutcome::Returned { value: on_timeout };
+                } => {
+                    // Parked on host fds → publish 'S' for /proc/<tid>/stat.
+                    registry.set_sleeping(this_tid, true);
+                    let r = waiter.wait(&fds, timeout);
+                    registry.set_sleeping(this_tid, false);
+                    match r {
+                        crate::io_wait::WaitResult::Ready => continue,
+                        crate::io_wait::WaitResult::TimedOut => {
+                            break DispatchOutcome::Returned { value: on_timeout };
+                        }
+                        crate::io_wait::WaitResult::Interrupted => {
+                            break DispatchOutcome::Errno {
+                                errno: crate::linux_abi::LINUX_EINTR,
+                            };
+                        }
                     }
-                    crate::io_wait::WaitResult::Interrupted => {
-                        break DispatchOutcome::Errno {
-                            errno: crate::linux_abi::LINUX_EINTR,
-                        };
-                    }
-                },
+                }
                 other => break other,
             }
         };
@@ -895,6 +903,9 @@ fn run_vcpu_until_exit(
                 // Interrupt the wait only for a signal deliverable to THIS
                 // thread (its own tgkill target or a process-directed one) —
                 // not a sibling's, which would surface a spurious EINTR.
+                // Publish this thread as sleeping so a peer polling
+                // /proc/<tid>/stat sees 'S' (LTP futex_wait03/wake02).
+                registry.set_sleeping(this_tid, true);
                 let retval: i64 =
                     match futex.wait_prepared_for_thread(wait, timeout, this_tid, &|| {
                         crate::host_signal::has_pending_for(this_tid)
@@ -903,6 +914,7 @@ fn run_vcpu_until_exit(
                         FutexWaitOutcome::TimedOut => -(crate::linux_abi::LINUX_ETIMEDOUT as i64),
                         FutexWaitOutcome::Interrupted => -(crate::linux_abi::LINUX_EINTR as i64),
                     };
+                registry.set_sleeping(this_tid, false);
                 engine.complete_syscall(retval)?;
                 last_syscall_retval = Some(retval);
             }
@@ -914,7 +926,9 @@ fn run_vcpu_until_exit(
                 // Cross-process futex (MAP_SHARED): block on the host __ulock
                 // keyed by the shared physical page, with the dispatcher lock
                 // released. Interruptible by a signal deliverable to this thread.
+                registry.set_sleeping(this_tid, true);
                 let retval = shared_futex_wait(host_addr, value, timeout, this_tid);
+                registry.set_sleeping(this_tid, false);
                 engine.complete_syscall(retval)?;
                 last_syscall_retval = Some(retval);
             }
@@ -1113,6 +1127,7 @@ fn run_vcpu_until_exit(
                             // delivery + real fork in the child.
                             this_tid = std::process::id() as ThreadId;
                             registry = Arc::new(ThreadRegistry::new(this_tid));
+                            crate::thread::set_current_registry(Arc::clone(&registry));
                             // kqueue isn't inherited across fork; the self-pipe
                             // is shared with the parent. Fresh ones for the child.
                             crate::host_signal::reinit_after_fork();
