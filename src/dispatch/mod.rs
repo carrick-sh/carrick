@@ -3010,7 +3010,10 @@ pub fn synthetic_proc_file(path: &str, ctx: &SyntheticProcContext) -> Option<Vec
         "/proc/net/if_inet6" => {
             Some(b"00000000000000000000000000000001 01 80 10 80       lo\n".to_vec())
         }
-        _ => None,
+        // `/proc/<numeric-pid>/...` for a live guest process that is a
+        // descendant of this one. (`/proc/self/...` is matched above.)
+        _ => parse_proc_pid_path(path)
+            .and_then(|(pid, rest)| synthetic_proc_pid_file(pid, rest)),
     }
 }
 
@@ -3304,15 +3307,104 @@ fn synthetic_proc_self_stat(executable_path: &str) -> String {
     let pid = std::process::id();
     // SAFETY: getppid(2) is always successful with no side effects.
     let ppid = unsafe { libc::getppid() } as u32;
-    // pid (comm) state ppid pgrp session tty tpgid flags minflt cminflt majflt
-    // cmajflt utime stime cutime cstime priority nice num_threads itrealvalue
-    // starttime vsize rss rsslim ... (remaining device/addr/signal fields 0;
-    // field 38 exit_signal = 17 = SIGCHLD).
+    proc_stat_line(pid, &comm, 'R', ppid, pid, pid)
+}
+
+/// Build the 52-field `/proc/<pid>/stat` line. Field 1 (pid), 2 (comm), 3
+/// (state), 4 (ppid), 5 (pgrp), 6 (session) carry the supplied values; the rest
+/// are the same plausible constants the self path uses (tests read a handful —
+/// comm, state, ppid, pgrp, session — and check relationships, not exact
+/// values). Field 38 (exit_signal) = 17 = SIGCHLD.
+fn proc_stat_line(pid: u32, comm: &str, state: char, ppid: u32, pgrp: u32, session: u32) -> String {
     format!(
-        "{pid} ({comm}) R {ppid} {pid} {pid} 0 -1 4194560 0 0 0 0 0 0 0 0 \
+        "{pid} ({comm}) {state} {ppid} {pgrp} {session} 0 -1 4194560 0 0 0 0 0 0 0 0 \
 20 0 1 0 1 10485760 256 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 0 \
 17 0 0 0 0 0 0 0 0 0 0 0 0\n"
     )
+}
+
+/// `/proc/<pid>/{stat,status,cmdline,comm}` and `/proc/<pid>/task/<tid>/...`
+/// for a guest process OTHER than self. The pid must be a live descendant of
+/// this process (validated via the host ppid chain) — otherwise `None`, which
+/// the caller turns into ENOENT, so a guest can't probe arbitrary host
+/// processes. State/identity come from the host kernel (libproc). Per-process
+/// `/task/` reports the single main thread `tid == pid` (carrick forks each
+/// guest process single-threaded; a process's OWN multi-thread `/task/` is
+/// served from the self path with the live thread registry).
+fn synthetic_proc_pid_file(pid: u32, rest: &str) -> Option<Vec<u8>> {
+    if !crate::host_proc::is_descendant_of_self(pid) {
+        return None;
+    }
+    let info = crate::host_proc::pid_info(pid)?;
+    let comm = if info.comm.is_empty() {
+        "carrick".to_owned()
+    } else {
+        info.comm.clone()
+    };
+    match rest {
+        "stat" | "task" => {
+            // (task dir listing is handled by the VFS readdir; "task/<tid>/stat"
+            // falls through to the tid arm below.)
+            if rest == "stat" {
+                Some(proc_stat_line(pid, &comm, info.state, info.ppid, info.pgid, info.pgid).into_bytes())
+            } else {
+                None
+            }
+        }
+        "comm" => Some(format!("{comm}\n").into_bytes()),
+        "cmdline" => {
+            let mut b = comm.clone().into_bytes();
+            b.push(0);
+            Some(b)
+        }
+        "status" => Some(
+            format!(
+                "Name:\t{comm}\n\
+State:\t{state} ({state_long})\n\
+Tgid:\t{pid}\n\
+Pid:\t{pid}\n\
+PPid:\t{ppid}\n\
+TracerPid:\t0\n\
+Uid:\t{uid}\t{uid}\t{uid}\t{uid}\n\
+Gid:\t{gid}\t{gid}\t{gid}\t{gid}\n\
+Threads:\t1\n",
+                state = info.state,
+                state_long = proc_state_long(info.state),
+                ppid = info.ppid,
+                uid = info.uid,
+                gid = info.gid,
+            )
+            .into_bytes(),
+        ),
+        // A single-threaded guest's task dir contains exactly task/<pid>/stat.
+        _ => {
+            let tid_stat = format!("task/{pid}/stat");
+            if rest == tid_stat {
+                Some(proc_stat_line(pid, &comm, info.state, info.ppid, info.pgid, info.pgid).into_bytes())
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Long state name for `/proc/<pid>/status` (`State:\tS (sleeping)`).
+fn proc_state_long(state: char) -> &'static str {
+    match state {
+        'S' => "sleeping",
+        'T' => "stopped",
+        'Z' => "zombie",
+        _ => "running",
+    }
+}
+
+/// Parse a `/proc/<pid>/<rest>` path with a NUMERIC pid (not `self`). Returns
+/// `(pid, rest)` where `rest` is the remainder after `/proc/<pid>/`.
+fn parse_proc_pid_path(path: &str) -> Option<(u32, &str)> {
+    let tail = path.strip_prefix("/proc/")?;
+    let (pid_str, rest) = tail.split_once('/')?;
+    let pid: u32 = pid_str.parse().ok()?;
+    Some((pid, rest))
 }
 
 fn synthetic_proc_self_statm() -> &'static [u8] {

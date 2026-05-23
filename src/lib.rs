@@ -6,6 +6,7 @@ pub mod dispatch;
 pub mod dtrace_consumer;
 pub mod elf;
 pub mod fs_backend;
+pub mod host_proc;
 pub mod host_signal;
 pub mod host_tty;
 pub mod interactive_supervisor;
