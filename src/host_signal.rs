@@ -208,19 +208,7 @@ fn notify_pump() {
     if kq < 0 {
         return;
     }
-    let trigger = libc::kevent {
-        ident: 0,
-        filter: libc::EVFILT_USER,
-        flags: 0,
-        fflags: libc::NOTE_TRIGGER,
-        data: 0,
-        udata: std::ptr::null_mut(),
-    };
-    // SAFETY: kevent with a single change and no event buffer; kq is a live
-    // kqueue fd owned by the pump for the process's lifetime.
-    unsafe {
-        libc::kevent(kq, &trigger, 1, std::ptr::null_mut(), 0, std::ptr::null());
-    }
+    let _ = crate::darwin_kqueue::trigger_user(kq, 0);
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]

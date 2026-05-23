@@ -3,6 +3,8 @@ pub mod apfs;
 pub mod compat;
 #[cfg(target_os = "macos")]
 pub(crate) mod darwin_fs;
+#[cfg(target_os = "macos")]
+pub(crate) mod darwin_kqueue;
 pub mod dispatch;
 #[cfg(target_os = "macos")]
 pub mod dtrace_consumer;

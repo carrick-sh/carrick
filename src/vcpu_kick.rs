@@ -204,11 +204,10 @@ pub fn spawn_signal_pump(
     let handle = std::thread::Builder::new()
         .name("carrick-signal-pump".to_owned())
         .spawn(move || {
-            let raw_kq = unsafe { libc::kqueue() };
-            if raw_kq < 0 {
+            let Some(kq) = crate::darwin_kqueue::Kqueue::new_internal() else {
                 return;
-            }
-            let kq = crate::host_signal::relocate_internal_fd(raw_kq);
+            };
+            let kq_fd = kq.raw_fd();
             // Two wake sources, both edge-triggered (EV_CLEAR), and we block
             // with NO timeout so the process genuinely sleeps when idle (a
             // poll would keep it SRUN and confound /proc/<pid>/stat):
@@ -224,64 +223,27 @@ pub fn spawn_signal_pump(
             //    pipe drain and no poll. (kevent isn't async-signal-safe, which
             //    is why the handler path uses the pipe instead.)
             let changes = [
-                libc::kevent {
-                    ident: pipe as usize,
-                    filter: libc::EVFILT_READ,
-                    flags: libc::EV_ADD | libc::EV_CLEAR,
-                    fflags: 0,
-                    data: 0,
-                    udata: std::ptr::null_mut(),
-                },
-                libc::kevent {
-                    ident: 0,
-                    filter: libc::EVFILT_USER,
-                    flags: libc::EV_ADD | libc::EV_CLEAR,
-                    fflags: 0,
-                    data: 0,
-                    udata: std::ptr::null_mut(),
-                },
+                crate::darwin_kqueue::Kevent::read(pipe, libc::EV_ADD | libc::EV_CLEAR),
+                crate::darwin_kqueue::Kevent::user(0, libc::EV_ADD | libc::EV_CLEAR),
             ];
-            unsafe {
-                libc::kevent(
-                    kq,
-                    changes.as_ptr(),
-                    2,
-                    std::ptr::null_mut(),
-                    0,
-                    std::ptr::null(),
-                );
-            }
+            let _ = kq.apply(&changes);
             // Publish the kq so `notify_pump` can NOTE_TRIGGER our EVFILT_USER.
-            crate::host_signal::set_pump_kqueue(kq);
-            let mut out = [libc::kevent {
-                ident: 0,
-                filter: 0,
-                flags: 0,
-                fflags: 0,
-                data: 0,
-                udata: std::ptr::null_mut(),
-            }];
+            crate::host_signal::set_pump_kqueue(kq_fd);
+            let mut out = [crate::darwin_kqueue::Kevent::empty()];
             while thread_running.load(std::sync::atomic::Ordering::SeqCst) {
-                let n = unsafe {
-                    libc::kevent(
-                        kq,
-                        std::ptr::null(),
-                        0,
-                        out.as_mut_ptr(),
-                        1,
-                        std::ptr::null(),
-                    )
-                };
-                if n < 0 {
-                    let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-                    if e == libc::EINTR {
-                        continue;
+                let n = match kq.wait(&[], &mut out, None) {
+                    Ok(n) => n,
+                    Err(errno) => {
+                        if errno == libc::EINTR {
+                            continue;
+                        }
+                        break;
                     }
-                    break;
-                }
-                for event in out.iter().take(n as usize) {
-                    if event.filter == libc::EVFILT_READ {
+                };
+                for event in out.iter().take(n) {
+                    if event.is_read() {
                         crate::host_signal::drain_pump_pipe();
+                        continue;
                     }
                 }
                 if !thread_running.load(std::sync::atomic::Ordering::SeqCst) {
@@ -302,8 +264,7 @@ pub fn spawn_signal_pump(
                     futex.notify_signal_pending_for(tid);
                 }
             }
-            crate::host_signal::clear_pump_kqueue(kq);
-            unsafe { libc::close(kq) };
+            crate::host_signal::clear_pump_kqueue(kq_fd);
         })
         .ok();
     SignalPump { running, handle }

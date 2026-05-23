@@ -50,6 +50,10 @@ Work package progress:
   - Completed: `sync` now invokes the host sync primitive, and host-backed `fsync`/`fdatasync`/`syncfs` flush the real host fd with optional `CARRICK_STRICT_DURABILITY=1` `F_FULLFSYNC` on macOS.
   - Completed: `HostFsBackend::seed_from_rootfs` now materializes through its cap-std rooted `Dir` instead of re-entering through an ambient path.
   - Completed: host-backed whole-file `copy_file_range` now tries Darwin `copyfile` before the bounded generic copy path; existing `msync` routing covers real MAP_SHARED file mappings.
+- [x] R4. Kqueue Unsafe Boundary
+  - Completed: added a `darwin_kqueue` boundary that owns kqueue fds with RAII, centralizes `kevent` construction, wraps `EVFILT_USER` triggering, and exposes typed event inspection.
+  - Completed: moved `ThreadWaiter`, signal-pump registration/draining, and `host_signal::notify_pump` off hand-built raw `libc::kevent` values.
+  - Verified kqueue fd closure, user-trigger wake behavior, signal-pump tests, host-signal split-pipe tests, and existing kqueue waiter integration tests.
 - [ ] Package 6. VFS and Stat Ownership
 - [ ] Hygiene gates and final verification sweep
 
