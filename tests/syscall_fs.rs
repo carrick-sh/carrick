@@ -2521,6 +2521,172 @@ fn statx_writes_basic_rootfs_fd_and_symlink_metadata() {
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
+fn assert_fstat_and_statx_empty_path_agree(
+    dispatcher: &mut SyscallDispatcher,
+    memory: &mut LinearMemory,
+    reporter: &CompatReporter,
+    fd: i32,
+    expected_mode_type: u32,
+) {
+    let stat_addr = 0x7000;
+    let statx_addr = 0x7200;
+    memory.write_bytes(0x7400, b"\0").unwrap();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(80, SyscallArgs::from([fd as u64, stat_addr, 0, 0, 0, 0])),
+                memory,
+                reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    291,
+                    SyscallArgs::from([
+                        fd as u64,
+                        0x7400,
+                        LINUX_AT_EMPTY_PATH,
+                        LINUX_STATX_BASIC_STATS as u64,
+                        statx_addr,
+                        0,
+                    ]),
+                ),
+                memory,
+                reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    let stat = read_stat(memory, stat_addr);
+    let statx = read_statx(memory, statx_addr);
+    let stat_mode = stat.st_mode;
+    let stat_size = stat.st_size;
+    let stat_nlink = stat.st_nlink;
+    let stat_uid = stat.st_uid;
+    let stat_gid = stat.st_gid;
+    let stat_blocks = stat.st_blocks;
+    let statx_mode = statx.stx_mode;
+    let statx_size = statx.stx_size;
+    let statx_nlink = statx.stx_nlink;
+    let statx_uid = statx.stx_uid;
+    let statx_gid = statx.stx_gid;
+    let statx_blocks = statx.stx_blocks;
+    assert_eq!(stat_mode, statx_mode as u32, "fd {fd} mode");
+    assert_eq!(stat_mode & LINUX_S_IFMT, expected_mode_type, "fd {fd} type");
+    assert_eq!(stat_size as u64, statx_size, "fd {fd} size");
+    assert_eq!(stat_nlink, statx_nlink, "fd {fd} nlink");
+    assert_eq!(stat_uid, statx_uid, "fd {fd} uid");
+    assert_eq!(stat_gid, statx_gid, "fd {fd} gid");
+    assert_eq!(stat_blocks as u64, statx_blocks, "fd {fd} blocks");
+}
+
+#[test]
+fn fstat_and_statx_empty_path_agree_for_anonymous_fd_kinds() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x4000]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    let eventfd = dispatcher
+        .dispatch(
+            SyscallRequest::new(19, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    let DispatchOutcome::Returned { value: eventfd } = eventfd else {
+        panic!("expected eventfd2 success, got {eventfd:?}");
+    };
+
+    let timerfd = dispatcher
+        .dispatch(
+            SyscallRequest::new(85, SyscallArgs::from([1, 0, 0, 0, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    let DispatchOutcome::Returned { value: timerfd } = timerfd else {
+        panic!("expected timerfd_create success, got {timerfd:?}");
+    };
+
+    let epoll = dispatcher
+        .dispatch(
+            SyscallRequest::new(20, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    let DispatchOutcome::Returned { value: epoll } = epoll else {
+        panic!("expected epoll_create1 success, got {epoll:?}");
+    };
+
+    let pipe_addr = 0x7600;
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(59, SyscallArgs::from([pipe_addr, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let pipe = read_fd_pair(&memory, pipe_addr);
+
+    let socket = dispatcher
+        .dispatch(
+            SyscallRequest::new(
+                198,
+                SyscallArgs::from([
+                    LINUX_AF_INET as u64,
+                    (LINUX_SOCK_STREAM | LINUX_SOCK_NONBLOCK) as u64,
+                    0,
+                    0,
+                    0,
+                    0,
+                ]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    let DispatchOutcome::Returned { value: socket } = socket else {
+        panic!("expected socket success, got {socket:?}");
+    };
+
+    for fd in [eventfd, timerfd, epoll] {
+        assert_fstat_and_statx_empty_path_agree(
+            &mut dispatcher,
+            &mut memory,
+            &reporter,
+            fd as i32,
+            0,
+        );
+    }
+    for fd in [pipe.read_fd, pipe.write_fd] {
+        assert_fstat_and_statx_empty_path_agree(
+            &mut dispatcher,
+            &mut memory,
+            &reporter,
+            fd,
+            LINUX_S_IFIFO,
+        );
+    }
+    assert_fstat_and_statx_empty_path_agree(
+        &mut dispatcher,
+        &mut memory,
+        &reporter,
+        socket as i32,
+        LINUX_S_IFSOCK,
+    );
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
 #[test]
 fn getdents64_lists_rootfs_directory_entries() {
     let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(

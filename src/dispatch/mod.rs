@@ -956,6 +956,87 @@ enum XattrTarget {
     Fd,
 }
 
+#[derive(Debug, Clone)]
+struct StatRecord {
+    path: std::path::PathBuf,
+    mode: u32,
+    nlink: u32,
+    uid: u32,
+    gid: u32,
+    size: u64,
+    atime: (i64, i64),
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl StatRecord {
+    fn from_metadata(metadata: &RootFsMetadata) -> Self {
+        Self {
+            path: metadata.path.clone(),
+            mode: linux_mode(metadata),
+            nlink: if metadata.kind == RootFsEntryKind::Directory {
+                2
+            } else {
+                1
+            },
+            uid: 0,
+            gid: 0,
+            size: metadata.size as u64,
+            atime: (0, 0),
+            mtime: (0, 0),
+            ctime: (0, 0),
+        }
+    }
+
+    fn from_real(path: &str, real: &crate::fs_backend::RealStat) -> Self {
+        let metadata = RootFsMetadata {
+            path: Path::new(path).to_path_buf(),
+            kind: real.kind,
+            mode: real.mode,
+            size: real.size as usize,
+        };
+        let mode = linux_mode(&metadata);
+        Self {
+            path: metadata.path,
+            mode,
+            nlink: real.nlink,
+            uid: real.uid,
+            gid: real.gid,
+            size: real.size,
+            atime: real.atime,
+            mtime: real.mtime,
+            ctime: real.ctime,
+        }
+    }
+
+    fn synthetic(path: &str, size: usize, mode: u32) -> Self {
+        Self {
+            path: Path::new(path).to_path_buf(),
+            mode,
+            nlink: 1,
+            uid: 0,
+            gid: 0,
+            size: size as u64,
+            atime: (0, 0),
+            mtime: (0, 0),
+            ctime: (0, 0),
+        }
+    }
+
+    fn size_usize(&self) -> usize {
+        self.size.min(usize::MAX as u64) as usize
+    }
+}
+
+#[derive(Debug, Clone)]
+enum OpenStatSource {
+    Record(StatRecord),
+    HostFile {
+        host_fd: i32,
+        metadata: RootFsMetadata,
+    },
+}
+
 impl OpenDescription {
     fn status_flags(&self) -> u64 {
         match self {
@@ -988,6 +1069,55 @@ impl OpenDescription {
             | OpenDescription::HostFile { status_flags, .. }
             | OpenDescription::HostSocket { status_flags, .. }
             | OpenDescription::Netlink { status_flags, .. } => *status_flags = next,
+        }
+    }
+
+    fn stat_source(&self) -> OpenStatSource {
+        match self {
+            OpenDescription::File { metadata, .. }
+            | OpenDescription::Directory { metadata, .. } => {
+                OpenStatSource::Record(StatRecord::from_metadata(metadata))
+            }
+            OpenDescription::HostFile {
+                host_fd, metadata, ..
+            } => OpenStatSource::HostFile {
+                host_fd: *host_fd,
+                metadata: metadata.clone(),
+            },
+            OpenDescription::SyntheticFile { path, contents, .. } => OpenStatSource::Record(
+                StatRecord::synthetic(path, contents.len(), LINUX_S_IFREG | 0o444),
+            ),
+            OpenDescription::EventFd { .. } => {
+                OpenStatSource::Record(StatRecord::synthetic("anon_inode:[eventfd]", 0, 0o600))
+            }
+            OpenDescription::TimerFd { .. } => {
+                OpenStatSource::Record(StatRecord::synthetic("anon_inode:[timerfd]", 0, 0o600))
+            }
+            OpenDescription::Epoll { .. } => {
+                OpenStatSource::Record(StatRecord::synthetic("anon_inode:[eventpoll]", 0, 0o600))
+            }
+            OpenDescription::PipeReader { .. } | OpenDescription::PipeWriter { .. } => {
+                OpenStatSource::Record(StatRecord::synthetic(
+                    "pipe:[carrick]",
+                    0,
+                    LINUX_S_IFIFO | 0o600,
+                ))
+            }
+            OpenDescription::HostPipe { pty, .. } => {
+                let (label, type_bits) = if pty.is_some() {
+                    ("char:[carrick-pty]", LINUX_S_IFCHR)
+                } else {
+                    ("pipe:[carrick]", LINUX_S_IFIFO)
+                };
+                OpenStatSource::Record(StatRecord::synthetic(label, 0, type_bits | 0o600))
+            }
+            OpenDescription::HostSocket { .. } | OpenDescription::Netlink { .. } => {
+                OpenStatSource::Record(StatRecord::synthetic(
+                    "socket:[carrick]",
+                    0,
+                    LINUX_S_IFSOCK | 0o600,
+                ))
+            }
         }
     }
 }
@@ -2748,29 +2878,34 @@ fn write_stat(
     statbuf: u64,
     metadata: &RootFsMetadata,
 ) -> DispatchOutcome {
+    write_stat_record(memory, statbuf, &StatRecord::from_metadata(metadata))
+}
+
+fn write_stat_record(
+    memory: &mut impl GuestMemory,
+    statbuf: u64,
+    record: &StatRecord,
+) -> DispatchOutcome {
+    let size = record.size_usize();
     let stat = LinuxStat {
         st_dev: 1,
-        st_ino: inode_for_path(&metadata.path),
-        st_mode: linux_mode(metadata),
-        st_nlink: if metadata.kind == RootFsEntryKind::Directory {
-            2
-        } else {
-            1
-        },
-        st_uid: 0,
-        st_gid: 0,
+        st_ino: inode_for_path(&record.path),
+        st_mode: record.mode,
+        st_nlink: record.nlink,
+        st_uid: record.uid,
+        st_gid: record.gid,
         st_rdev: 0,
         __pad1: 0,
-        st_size: metadata.size as i64,
+        st_size: record.size as i64,
         st_blksize: 4096,
         __pad2: 0,
-        st_blocks: blocks_512(metadata.size),
-        st_atime: 0,
-        st_atime_nsec: 0,
-        st_mtime: 0,
-        st_mtime_nsec: 0,
-        st_ctime: 0,
-        st_ctime_nsec: 0,
+        st_blocks: blocks_512(size),
+        st_atime: record.atime.0,
+        st_atime_nsec: record.atime.1 as u64,
+        st_mtime: record.mtime.0,
+        st_mtime_nsec: record.mtime.1 as u64,
+        st_ctime: record.ctime.0,
+        st_ctime_nsec: record.ctime.1 as u64,
         __unused4: 0,
         __unused5: 0,
     };
@@ -2828,41 +2963,7 @@ fn write_stat_real(
     path: &str,
     real: &crate::fs_backend::RealStat,
 ) -> DispatchOutcome {
-    let metadata = RootFsMetadata {
-        path: Path::new(path).to_path_buf(),
-        kind: real.kind,
-        mode: real.mode,
-        size: real.size as usize,
-    };
-    let stat = LinuxStat {
-        st_dev: 1,
-        st_ino: inode_for_path(&metadata.path),
-        st_mode: linux_mode(&metadata),
-        st_nlink: real.nlink,
-        st_uid: real.uid,
-        st_gid: real.gid,
-        st_rdev: 0,
-        __pad1: 0,
-        st_size: metadata.size as i64,
-        st_blksize: 4096,
-        __pad2: 0,
-        st_blocks: blocks_512(metadata.size),
-        st_atime: real.atime.0,
-        st_atime_nsec: real.atime.1 as u64,
-        st_mtime: real.mtime.0,
-        st_mtime_nsec: real.mtime.1 as u64,
-        st_ctime: real.ctime.0,
-        st_ctime_nsec: real.ctime.1 as u64,
-        __unused4: 0,
-        __unused5: 0,
-    };
-    if write_kernel_struct_raw(memory, statbuf, &stat).is_err() {
-        DispatchOutcome::Errno {
-            errno: LINUX_EFAULT,
-        }
-    } else {
-        DispatchOutcome::Returned { value: 0 }
-    }
+    write_stat_record(memory, statbuf, &StatRecord::from_real(path, real))
 }
 
 /// `statx` counterpart of [`write_stat_real`].
@@ -2872,52 +2973,7 @@ fn write_statx_real(
     path: &str,
     real: &crate::fs_backend::RealStat,
 ) -> DispatchOutcome {
-    let metadata = RootFsMetadata {
-        path: Path::new(path).to_path_buf(),
-        kind: real.kind,
-        mode: real.mode,
-        size: real.size as usize,
-    };
-    let zero_time = LinuxStatxTimestamp::zero();
-    let stx_ts = |t: (i64, i64)| LinuxStatxTimestamp {
-        tv_sec: t.0,
-        tv_nsec: t.1 as u32,
-        __reserved: 0,
-    };
-    let statx = LinuxStatx {
-        stx_mask: LINUX_STATX_BASIC_STATS,
-        stx_blksize: LINUX_PAGE_SIZE as u32,
-        stx_attributes: 0,
-        stx_nlink: real.nlink,
-        stx_uid: real.uid,
-        stx_gid: real.gid,
-        stx_mode: linux_mode(&metadata) as u16,
-        __spare0: [0; 1],
-        stx_ino: inode_for_path(&metadata.path),
-        stx_size: metadata.size as u64,
-        stx_blocks: blocks_512(metadata.size) as u64,
-        stx_attributes_mask: 0,
-        stx_atime: stx_ts(real.atime),
-        stx_btime: zero_time,
-        stx_ctime: stx_ts(real.ctime),
-        stx_mtime: stx_ts(real.mtime),
-        stx_rdev_major: 0,
-        stx_rdev_minor: 0,
-        stx_dev_major: 0,
-        stx_dev_minor: 1,
-        stx_mnt_id: 1,
-        stx_dio_mem_align: 0,
-        stx_dio_offset_align: 0,
-        stx_subvol: 0,
-        stx_atomic_write_unit_min: 0,
-        stx_atomic_write_unit_max: 0,
-        stx_atomic_write_segments_max: 0,
-        stx_dio_read_offset_align: 0,
-        stx_atomic_write_unit_max_opt: 0,
-        __spare2: [0; 1],
-        __spare3: [0; 8],
-    };
-    write_kernel_struct(memory, statxbuf, &statx)
+    write_statx_record(memory, statxbuf, &StatRecord::from_real(path, real))
 }
 
 fn write_statx(
@@ -2925,28 +2981,38 @@ fn write_statx(
     statxbuf: u64,
     metadata: &RootFsMetadata,
 ) -> DispatchOutcome {
+    write_statx_record(memory, statxbuf, &StatRecord::from_metadata(metadata))
+}
+
+fn write_statx_record(
+    memory: &mut impl GuestMemory,
+    statxbuf: u64,
+    record: &StatRecord,
+) -> DispatchOutcome {
     let zero_time = LinuxStatxTimestamp::zero();
+    let stx_ts = |t: (i64, i64)| LinuxStatxTimestamp {
+        tv_sec: t.0,
+        tv_nsec: t.1 as u32,
+        __reserved: 0,
+    };
+    let size = record.size_usize();
     let statx = LinuxStatx {
         stx_mask: LINUX_STATX_BASIC_STATS,
         stx_blksize: LINUX_PAGE_SIZE as u32,
         stx_attributes: 0,
-        stx_nlink: if metadata.kind == RootFsEntryKind::Directory {
-            2
-        } else {
-            1
-        },
-        stx_uid: 0,
-        stx_gid: 0,
-        stx_mode: linux_mode(metadata) as u16,
+        stx_nlink: record.nlink,
+        stx_uid: record.uid,
+        stx_gid: record.gid,
+        stx_mode: record.mode as u16,
         __spare0: [0; 1],
-        stx_ino: inode_for_path(&metadata.path),
-        stx_size: metadata.size as u64,
-        stx_blocks: blocks_512(metadata.size) as u64,
+        stx_ino: inode_for_path(&record.path),
+        stx_size: record.size,
+        stx_blocks: blocks_512(size) as u64,
         stx_attributes_mask: 0,
-        stx_atime: zero_time,
+        stx_atime: stx_ts(record.atime),
         stx_btime: zero_time,
-        stx_ctime: zero_time,
-        stx_mtime: zero_time,
+        stx_ctime: stx_ts(record.ctime),
+        stx_mtime: stx_ts(record.mtime),
         stx_rdev_major: 0,
         stx_rdev_minor: 0,
         stx_dev_major: 0,
@@ -2973,29 +3039,7 @@ fn write_synthetic_stat(
     size: usize,
     mode: u32,
 ) -> DispatchOutcome {
-    let stat = LinuxStat {
-        st_dev: 1,
-        st_ino: inode_for_path(Path::new(path)),
-        st_mode: mode,
-        st_nlink: 1,
-        st_uid: 0,
-        st_gid: 0,
-        st_rdev: 0,
-        __pad1: 0,
-        st_size: size as i64,
-        st_blksize: 4096,
-        __pad2: 0,
-        st_blocks: blocks_512(size),
-        st_atime: 0,
-        st_atime_nsec: 0,
-        st_mtime: 0,
-        st_mtime_nsec: 0,
-        st_ctime: 0,
-        st_ctime_nsec: 0,
-        __unused4: 0,
-        __unused5: 0,
-    };
-    write_kernel_struct(memory, statbuf, &stat)
+    write_stat_record(memory, statbuf, &StatRecord::synthetic(path, size, mode))
 }
 
 fn write_synthetic_statx(
@@ -3004,13 +3048,7 @@ fn write_synthetic_statx(
     path: &str,
     size: usize,
 ) -> DispatchOutcome {
-    let metadata = RootFsMetadata {
-        path: Path::new(path).to_path_buf(),
-        kind: RootFsEntryKind::File,
-        mode: 0o444,
-        size,
-    };
-    write_statx(memory, statxbuf, &metadata)
+    write_synthetic_statx_mode(memory, statxbuf, path, size, LINUX_S_IFREG | 0o444)
 }
 
 /// Like `write_synthetic_statx` but accepts an explicit `mode` word
@@ -3024,41 +3062,7 @@ fn write_synthetic_statx_mode(
     size: usize,
     mode: u32,
 ) -> DispatchOutcome {
-    let zero_time = LinuxStatxTimestamp::zero();
-    let statx = LinuxStatx {
-        stx_mask: LINUX_STATX_BASIC_STATS,
-        stx_blksize: LINUX_PAGE_SIZE as u32,
-        stx_attributes: 0,
-        stx_nlink: 1,
-        stx_uid: 0,
-        stx_gid: 0,
-        stx_mode: mode as u16,
-        __spare0: [0; 1],
-        stx_ino: inode_for_path(Path::new(path)),
-        stx_size: size as u64,
-        stx_blocks: blocks_512(size) as u64,
-        stx_attributes_mask: 0,
-        stx_atime: zero_time,
-        stx_btime: zero_time,
-        stx_ctime: zero_time,
-        stx_mtime: zero_time,
-        stx_rdev_major: 0,
-        stx_rdev_minor: 0,
-        stx_dev_major: 0,
-        stx_dev_minor: 1,
-        stx_mnt_id: 1,
-        stx_dio_mem_align: 0,
-        stx_dio_offset_align: 0,
-        stx_subvol: 0,
-        stx_atomic_write_unit_min: 0,
-        stx_atomic_write_unit_max: 0,
-        stx_atomic_write_segments_max: 0,
-        stx_dio_read_offset_align: 0,
-        stx_atomic_write_unit_max_opt: 0,
-        __spare2: [0; 1],
-        __spare3: [0; 8],
-    };
-    write_kernel_struct(memory, statxbuf, &statx)
+    write_statx_record(memory, statxbuf, &StatRecord::synthetic(path, size, mode))
 }
 
 impl SyscallDispatcher {
