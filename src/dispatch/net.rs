@@ -89,7 +89,7 @@ impl SyscallDispatcher {
             });
         }
         let description = OpenDescription::EventFd {
-            counter: initial_value,
+            state: Arc::new(EventFdState::new(initial_value)),
             semaphore: flags & LINUX_EFD_SEMAPHORE != 0,
             status_flags: flags & LINUX_EFD_NONBLOCK,
         };
@@ -416,8 +416,8 @@ impl SyscallDispatcher {
         };
         let open = open_file.description.read();
         match &*open {
-            OpenDescription::EventFd { counter, .. }
-                if *counter > 0 && requested_events & LINUX_EPOLLIN != 0 =>
+            OpenDescription::EventFd { state, .. }
+                if *state.counter.lock() > 0 && requested_events & LINUX_EPOLLIN != 0 =>
             {
                 LINUX_EPOLLIN
             }
@@ -1097,8 +1097,8 @@ impl SyscallDispatcher {
                 }
             }
             OpenDescription::Directory { .. } => {}
-            OpenDescription::EventFd { counter, .. } => {
-                if requested_events & LINUX_POLLIN != 0 && *counter > 0 {
+            OpenDescription::EventFd { state, .. } => {
+                if requested_events & LINUX_POLLIN != 0 && *state.counter.lock() > 0 {
                     ready |= LINUX_POLLIN;
                 }
                 if requested_events & LINUX_POLLOUT != 0 {
@@ -1284,26 +1284,24 @@ impl SyscallDispatcher {
         }
         let status_flags = if nonblock { LINUX_O_NONBLOCK } else { 0 };
         let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };
-        let Some(linux_fd) = self.allocate_fd(3) else {
-            unsafe {
-                libc::close(host_fd);
-            }
-            return DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            };
-        };
-        self.insert_open_file(
-            linux_fd,
-            OpenFile {
-                description: Arc::new(RwLock::new(OpenDescription::HostSocket {
-                    host_fd,
-                    family,
-                    type_: base_type,
-                    status_flags,
-                })),
-                fd_flags,
-            },
+        let open_file = OpenFile::with_host_fd(
+            Arc::new(RwLock::new(OpenDescription::HostSocket {
+                host_fd,
+                family,
+                type_: base_type,
+                status_flags,
+            })),
+            fd_flags,
+            host_fd,
         );
+        let linux_fd = match self.install_fd_at_or_above(3, open_file) {
+            Ok(fd) => fd,
+            Err(_) => {
+                return DispatchOutcome::Errno {
+                    errno: linux_errno::EMFILE,
+                };
+            }
+        };
         DispatchOutcome::Returned {
             value: linux_fd as i64,
         }
@@ -1339,58 +1337,47 @@ impl SyscallDispatcher {
         }
         let status_flags = if nonblock { LINUX_O_NONBLOCK } else { 0 };
         let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };
-        let Some(read_fd) = self.allocate_fd(3) else {
-            unsafe {
-                libc::close(host_fds[0]);
-                libc::close(host_fds[1]);
+        let first = OpenFile::with_host_fd(
+            Arc::new(RwLock::new(OpenDescription::HostSocket {
+                host_fd: host_fds[0],
+                family,
+                type_: base_type,
+                status_flags,
+            })),
+            fd_flags,
+            host_fds[0],
+        );
+        let second = OpenFile::with_host_fd(
+            Arc::new(RwLock::new(OpenDescription::HostSocket {
+                host_fd: host_fds[1],
+                family,
+                type_: base_type,
+                status_flags,
+            })),
+            fd_flags,
+            host_fds[1],
+        );
+        let (read_fd, write_fd) = match self.install_fd_pair_at_or_above(3, first, second) {
+            Ok(pair) => pair,
+            Err(_) => {
+                return Ok(DispatchOutcome::Errno {
+                    errno: linux_errno::EMFILE,
+                });
             }
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
-        };
-        let Some(write_fd) = self.allocate_fd(read_fd.saturating_add(1)) else {
-            unsafe {
-                libc::close(host_fds[0]);
-                libc::close(host_fds[1]);
-            }
-            return Ok(DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            });
         };
         let pair = LinuxFdPair { read_fd, write_fd };
         if write_kernel_struct_raw(memory, sv_addr, &pair).is_err() {
-            unsafe {
-                libc::close(host_fds[0]);
-                libc::close(host_fds[1]);
+            let removed = {
+                let mut table = self.io.open_files.write();
+                [table.remove(&read_fd), table.remove(&write_fd)]
+            };
+            for open_file in removed.into_iter().flatten() {
+                self.close_open_file_and_free_pty(&open_file);
             }
             return Ok(DispatchOutcome::Errno {
                 errno: LINUX_EFAULT,
             });
         }
-        self.insert_open_file(
-            read_fd,
-            OpenFile {
-                description: Arc::new(RwLock::new(OpenDescription::HostSocket {
-                    host_fd: host_fds[0],
-                    family,
-                    type_: base_type,
-                    status_flags,
-                })),
-                fd_flags,
-            },
-        );
-        self.insert_open_file(
-            write_fd,
-            OpenFile {
-                description: Arc::new(RwLock::new(OpenDescription::HostSocket {
-                    host_fd: host_fds[1],
-                    family,
-                    type_: base_type,
-                    status_flags,
-                })),
-                fd_flags,
-            },
-        );
         Ok(DispatchOutcome::Returned { value: 0 })
     }
 
@@ -1669,26 +1656,24 @@ impl SyscallDispatcher {
         }
         let status_flags = if nonblock { LINUX_O_NONBLOCK } else { 0 };
         let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };
-        let Some(linux_fd) = self.allocate_fd(3) else {
-            unsafe {
-                libc::close(new_host);
-            }
-            return DispatchOutcome::Errno {
-                errno: LINUX_EINVAL,
-            };
-        };
-        self.insert_open_file(
-            linux_fd,
-            OpenFile {
-                description: Arc::new(RwLock::new(OpenDescription::HostSocket {
-                    host_fd: new_host,
-                    family,
-                    type_,
-                    status_flags,
-                })),
-                fd_flags,
-            },
+        let open_file = OpenFile::with_host_fd(
+            Arc::new(RwLock::new(OpenDescription::HostSocket {
+                host_fd: new_host,
+                family,
+                type_,
+                status_flags,
+            })),
+            fd_flags,
+            new_host,
         );
+        let linux_fd = match self.install_fd_at_or_above(3, open_file) {
+            Ok(fd) => fd,
+            Err(_) => {
+                return DispatchOutcome::Errno {
+                    errno: linux_errno::EMFILE,
+                };
+            }
+        };
         DispatchOutcome::Returned {
             value: linux_fd as i64,
         }
