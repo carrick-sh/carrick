@@ -340,7 +340,7 @@ use crate::linux_abi::{
 use crate::memory::{LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE, LINUX_MMAP_SIZE};
 use crate::overlay::OverlayEntry;
 use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsError, RootFsMetadata};
-use crate::syscall::{SyscallHandler, lookup_aarch64};
+use crate::syscall::{SyscallHandler, handler_for_aarch64, lookup_aarch64};
 use parking_lot::{Condvar, Mutex, RwLock};
 use serde::Serialize;
 use thiserror::Error;
@@ -1169,7 +1169,7 @@ impl Default for SyscallDispatcher {
 macro_rules! normalized_dispatch {
     ( $( $num:pat => $handler:ident ),* $(,)? ) => {
         fn dispatch_normalized(
-            &mut self,
+            &self,
             request: SyscallRequest,
             memory: &mut impl GuestMemory,
             reporter: &CompatReporter,
@@ -1662,6 +1662,50 @@ impl SyscallDispatcher {
         Ok(outcome)
     }
 
+    /// Threaded dispatch for the subsystems whose handlers take no
+    /// thread context (Memory/Time/Credentials/Process). Records entry/
+    /// return like `dispatch_inner` and routes straight to the single
+    /// `dispatch_normalized` registry with `thread: None` — identical to
+    /// the per-subsystem `dispatch_threaded_*` functions this replaces.
+    fn dispatch_threaded_threadless<M: GuestMemory>(
+        &self,
+        request: SyscallRequest,
+        memory: &mut M,
+        reporter: &CompatReporter,
+    ) -> Option<Result<DispatchOutcome, DispatchError>> {
+        if !matches!(
+            handler_for_aarch64(request.number),
+            SyscallHandler::Memory
+                | SyscallHandler::Time
+                | SyscallHandler::Credentials
+                | SyscallHandler::Process
+        ) {
+            return None;
+        }
+        let name = lookup_aarch64(request.number).map_or("unknown", |s| s.name);
+        reporter.record(CompatEvent::SyscallEntry {
+            number: request.number,
+            name: ::std::borrow::Cow::Borrowed(name),
+            args: request.args,
+        });
+        let result = self.dispatch_normalized(request, memory, reporter, None);
+        let outcome = match result {
+            Some(Ok(outcome)) => outcome,
+            Some(Err(error)) => return Some(Err(error)),
+            // Gated number that the normalized table doesn't claim: fall
+            // through to the unhandled path (don't double-record return).
+            None => return None,
+        };
+        let (retval, errno) = outcome.retval_errno();
+        reporter.record(CompatEvent::SyscallReturn {
+            number: request.number,
+            name: ::std::borrow::Cow::Borrowed(name),
+            retval,
+            errno,
+        });
+        Some(Ok(outcome))
+    }
+
     /// Shared threaded dispatch path for subsystems already moved behind
     /// interior locks.
     #[allow(clippy::too_many_arguments)]
@@ -1674,16 +1718,7 @@ impl SyscallDispatcher {
         registry: &crate::thread::ThreadRegistry,
         futex: &crate::thread::FutexTable,
     ) -> Option<Result<DispatchOutcome, DispatchError>> {
-        if let Some(result) = self.dispatch_threaded_credentials(request, memory, reporter) {
-            return Some(result);
-        }
-        if let Some(result) = self.dispatch_threaded_process(request, memory, reporter) {
-            return Some(result);
-        }
-        if let Some(result) = self.dispatch_threaded_memory(request, memory, reporter) {
-            return Some(result);
-        }
-        if let Some(result) = self.dispatch_threaded_time(request, memory, reporter) {
+        if let Some(result) = self.dispatch_threaded_threadless(request, memory, reporter) {
             return Some(result);
         }
         if let Some(result) =
@@ -1711,283 +1746,6 @@ impl SyscallDispatcher {
             return Some(Ok(dispatch_threaded_unhandled(request, reporter)));
         }
         None
-    }
-
-    fn dispatch_threaded_process(
-        &self,
-        request: SyscallRequest,
-        memory: &mut impl GuestMemory,
-        reporter: &CompatReporter,
-    ) -> Option<Result<DispatchOutcome, DispatchError>> {
-        if !syscall_handler_is(request.number, SyscallHandler::Process) {
-            return None;
-        }
-
-        let syscall = lookup_aarch64(request.number);
-        let name = syscall.map_or("unknown", |syscall| syscall.name);
-        reporter.record(CompatEvent::SyscallEntry {
-            number: request.number,
-            name: ::std::borrow::Cow::Borrowed(name),
-            args: request.args,
-        });
-
-        let mut ctx = SyscallCtx {
-            request,
-            memory,
-            reporter,
-            thread: None,
-        };
-        let outcome = match match request.number {
-            92 => Ok({
-                let requested = request.arg(0);
-                let mut proc = self.proc.lock();
-                let previous = proc.personality;
-                if requested != LINUX_PERSONALITY_QUERY {
-                    proc.personality = requested;
-                }
-                DispatchOutcome::Returned {
-                    value: previous as i64,
-                }
-            }),
-            95 => self.waitid(&mut ctx),
-            117 => self.ptrace(&mut ctx),
-            123 => self.sched_getaffinity(&mut ctx),
-            142 => self.reboot(&mut ctx),
-            154 => self.setpgid(&mut ctx),
-            155 => self.getpgid(&mut ctx),
-            156 => self.getsid(&mut ctx),
-            157 => self.setsid(&mut ctx),
-            160 => self.uname(&mut ctx),
-            161 => self.sethostname(&mut ctx),
-            162 => self.setdomainname(&mut ctx),
-            167 => self.prctl(&mut ctx),
-            168 => self.getcpu(&mut ctx),
-            172 => Ok(self.getpid()),
-            173 => Ok({
-                let bootstrap_host_pid = self.proc.lock().bootstrap_host_pid;
-                let value = if std::process::id() == bootstrap_host_pid {
-                    LINUX_BOOTSTRAP_PID as i64
-                } else {
-                    unsafe { libc::getppid() as i64 }
-                };
-                DispatchOutcome::Returned { value }
-            }),
-            278 => self.getrandom(&mut ctx),
-            293 => self.sys_rseq(&mut ctx),
-            _ => unreachable!("unsupported threaded process syscall"),
-        } {
-            Ok(outcome) => outcome,
-            Err(error) => return Some(Err(error)),
-        };
-
-        let (retval, errno) = outcome.retval_errno();
-        reporter.record(CompatEvent::SyscallReturn {
-            number: request.number,
-            name: ::std::borrow::Cow::Borrowed(name),
-            retval,
-            errno,
-        });
-
-        Some(Ok(outcome))
-    }
-
-    fn dispatch_threaded_credentials(
-        &self,
-        request: SyscallRequest,
-        memory: &mut impl GuestMemory,
-        reporter: &CompatReporter,
-    ) -> Option<Result<DispatchOutcome, DispatchError>> {
-        if !syscall_handler_is(request.number, SyscallHandler::Credentials) {
-            return None;
-        }
-
-        let syscall = lookup_aarch64(request.number);
-        let name = syscall.map_or("unknown", |syscall| syscall.name);
-        reporter.record(CompatEvent::SyscallEntry {
-            number: request.number,
-            name: ::std::borrow::Cow::Borrowed(name),
-            args: request.args,
-        });
-
-        let mut ctx = SyscallCtx {
-            request,
-            memory,
-            reporter,
-            thread: None,
-        };
-        let outcome = match match request.number {
-            90 => self.capget(&mut ctx),
-            91 => self.capset(&mut ctx),
-            140 => self.setpriority(&mut ctx),
-            141 => self.getpriority(&mut ctx),
-            143 => Ok(self.dispatch_setregid(request)),
-            144 => Ok(self.dispatch_setgid(request)),
-            145 => Ok(self.dispatch_setreuid(request)),
-            146 => Ok(self.dispatch_setuid(request)),
-            147 => Ok(self.dispatch_setresuid(request)),
-            148 => Ok(self.dispatch_getresuid(request, memory)),
-            149 => Ok(self.dispatch_setresgid(request)),
-            150 => Ok(self.dispatch_getresgid(request, memory)),
-            151 => {
-                let creds = self.cred_snapshot();
-                Ok(DispatchOutcome::Returned {
-                    value: i64::from(creds.euid),
-                })
-            }
-            152 => {
-                let creds = self.cred_snapshot();
-                Ok(DispatchOutcome::Returned {
-                    value: i64::from(creds.egid),
-                })
-            }
-            158 => Ok(dispatch_getgroups(request, memory)),
-            159 => Ok(DispatchOutcome::Returned { value: 0 }),
-            166 => Ok(self.dispatch_umask(request)),
-            174 => {
-                let creds = self.cred_snapshot();
-                Ok(DispatchOutcome::Returned {
-                    value: i64::from(creds.ruid),
-                })
-            }
-            175 => {
-                let creds = self.cred_snapshot();
-                Ok(DispatchOutcome::Returned {
-                    value: i64::from(creds.euid),
-                })
-            }
-            176 => {
-                let creds = self.cred_snapshot();
-                Ok(DispatchOutcome::Returned {
-                    value: i64::from(creds.rgid),
-                })
-            }
-            177 => {
-                let creds = self.cred_snapshot();
-                Ok(DispatchOutcome::Returned {
-                    value: i64::from(creds.egid),
-                })
-            }
-            _ => unreachable!("unsupported threaded credential syscall"),
-        } {
-            Ok(outcome) => outcome,
-            Err(error) => return Some(Err(error)),
-        };
-
-        let (retval, errno) = outcome.retval_errno();
-        reporter.record(CompatEvent::SyscallReturn {
-            number: request.number,
-            name: ::std::borrow::Cow::Borrowed(name),
-            retval,
-            errno,
-        });
-
-        Some(Ok(outcome))
-    }
-
-    fn dispatch_umask(&self, request: SyscallRequest) -> DispatchOutcome {
-        let new = request.arg(0) as u32 & 0o777;
-        let mut creds = self.creds.lock();
-        let previous = creds.umask;
-        creds.umask = new;
-        DispatchOutcome::Returned {
-            value: previous as i64,
-        }
-    }
-
-    fn dispatch_setresuid(&self, request: SyscallRequest) -> DispatchOutcome {
-        let mut creds = self.creds.lock();
-        let r = request.arg(0);
-        let e = request.arg(1);
-        let s = request.arg(2);
-        if r as i64 != -1 {
-            creds.ruid = r as u32;
-        }
-        if e as i64 != -1 {
-            creds.euid = e as u32;
-        }
-        if s as i64 != -1 {
-            creds.suid = s as u32;
-        }
-        DispatchOutcome::Returned { value: 0 }
-    }
-
-    fn dispatch_setresgid(&self, request: SyscallRequest) -> DispatchOutcome {
-        let mut creds = self.creds.lock();
-        let r = request.arg(0);
-        let e = request.arg(1);
-        let s = request.arg(2);
-        if r as i64 != -1 {
-            creds.rgid = r as u32;
-        }
-        if e as i64 != -1 {
-            creds.egid = e as u32;
-        }
-        if s as i64 != -1 {
-            creds.sgid = s as u32;
-        }
-        DispatchOutcome::Returned { value: 0 }
-    }
-
-    fn dispatch_setreuid(&self, request: SyscallRequest) -> DispatchOutcome {
-        let mut creds = self.creds.lock();
-        let r = request.arg(0);
-        let e = request.arg(1);
-        if r as i64 != -1 {
-            creds.ruid = r as u32;
-        }
-        if e as i64 != -1 {
-            creds.euid = e as u32;
-        }
-        DispatchOutcome::Returned { value: 0 }
-    }
-
-    fn dispatch_setregid(&self, request: SyscallRequest) -> DispatchOutcome {
-        let mut creds = self.creds.lock();
-        let r = request.arg(0);
-        let e = request.arg(1);
-        if r as i64 != -1 {
-            creds.rgid = r as u32;
-        }
-        if e as i64 != -1 {
-            creds.egid = e as u32;
-        }
-        DispatchOutcome::Returned { value: 0 }
-    }
-
-    fn dispatch_setuid(&self, request: SyscallRequest) -> DispatchOutcome {
-        let u = request.arg(0) as u32;
-        let mut creds = self.creds.lock();
-        creds.ruid = u;
-        creds.euid = u;
-        creds.suid = u;
-        DispatchOutcome::Returned { value: 0 }
-    }
-
-    fn dispatch_setgid(&self, request: SyscallRequest) -> DispatchOutcome {
-        let g = request.arg(0) as u32;
-        let mut creds = self.creds.lock();
-        creds.rgid = g;
-        creds.egid = g;
-        creds.sgid = g;
-        DispatchOutcome::Returned { value: 0 }
-    }
-
-    fn dispatch_getresuid(
-        &self,
-        request: SyscallRequest,
-        memory: &mut impl GuestMemory,
-    ) -> DispatchOutcome {
-        let creds = self.cred_snapshot();
-        write_id_tuple(memory, request, [creds.ruid, creds.euid, creds.suid])
-    }
-
-    fn dispatch_getresgid(
-        &self,
-        request: SyscallRequest,
-        memory: &mut impl GuestMemory,
-    ) -> DispatchOutcome {
-        let creds = self.cred_snapshot();
-        write_id_tuple(memory, request, [creds.rgid, creds.egid, creds.sgid])
     }
 
     /// Thread-local syscall subset that does not touch mutable dispatcher
@@ -2318,50 +2076,6 @@ fn write_packed(memory: &mut impl GuestMemory, address: u64, bytes: &[u8]) -> Di
     } else {
         DispatchOutcome::Returned { value: 0 }
     }
-}
-
-fn write_id_tuple(
-    memory: &mut impl GuestMemory,
-    request: SyscallRequest,
-    values: [u32; 3],
-) -> DispatchOutcome {
-    for (index, value) in values.iter().enumerate() {
-        let ptr = request.arg(index);
-        if ptr == 0 {
-            continue;
-        }
-        if memory.write_bytes(ptr, &value.to_le_bytes()).is_err() {
-            return DispatchOutcome::Errno {
-                errno: LINUX_EFAULT,
-            };
-        }
-    }
-    DispatchOutcome::Returned { value: 0 }
-}
-
-fn dispatch_getgroups(request: SyscallRequest, memory: &mut impl GuestMemory) -> DispatchOutcome {
-    let size = request.arg(0) as i32;
-    if size < 0 {
-        return DispatchOutcome::Errno {
-            errno: LINUX_EINVAL,
-        };
-    }
-    if size == 0 {
-        return DispatchOutcome::Returned { value: 1 };
-    }
-    if size < 1 {
-        return DispatchOutcome::Errno {
-            errno: LINUX_EINVAL,
-        };
-    }
-    let list = request.arg(1);
-    let gid: u32 = 0;
-    if memory.write_bytes(list, &gid.to_le_bytes()).is_err() {
-        return DispatchOutcome::Errno {
-            errno: LINUX_EFAULT,
-        };
-    }
-    DispatchOutcome::Returned { value: 1 }
 }
 
 fn dispatch_threaded_unhandled(
