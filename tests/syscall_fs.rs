@@ -3,6 +3,10 @@
 //! Split out of the former tests/syscall_dispatch.rs monolith. Shared imports,
 //! constants, and helpers live in tests/common/syscall_support.rs.
 
+// clippy's allow-unwrap-in-tests heuristic does not cover helper functions in
+// integration test crates. The no-panic gate targets production code.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 #[path = "common/syscall_support.rs"]
 mod support;
 
