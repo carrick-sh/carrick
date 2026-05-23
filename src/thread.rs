@@ -14,10 +14,12 @@ pub type ThreadId = i32;
 struct ThreadEntry {
     /// Guest address to zero + FUTEX_WAKE on thread exit (CLONE_CHILD_CLEARTID).
     clear_child_tid: u64,
-    /// True while this thread is parked in a blocking syscall (futex/poll/wait).
-    /// Surfaced as the `/proc/<tid>/stat` state char ('S' vs 'R') so a peer
-    /// thread polling it (LTP futex_wait03/wake02) sees this thread sleeping.
-    sleeping: bool,
+    /// Mach port of the host thread backing this guest tid, recorded once when
+    /// the vCPU thread starts. `/proc/<tid>/stat`'s state char is read from the
+    /// KERNEL via `thread_info` on this port (no hand-tracked "sleeping" flag —
+    /// the kernel already knows whether the thread is WAITING, and it covers
+    /// every blocking path). 0 = not yet recorded.
+    mach_port: crate::host_proc::ThreadPort,
 }
 
 pub struct ThreadRegistry {
@@ -57,7 +59,7 @@ impl ThreadRegistry {
             main_tid,
             ThreadEntry {
                 clear_child_tid: 0,
-                sleeping: false,
+                mach_port: 0,
             },
         );
         Self {
@@ -78,7 +80,7 @@ impl ThreadRegistry {
                 tid,
                 ThreadEntry {
                     clear_child_tid,
-                    sleeping: false,
+                    mach_port: 0,
                 },
             );
         tid
@@ -135,10 +137,11 @@ impl ThreadRegistry {
             .contains_key(&tid)
     }
 
-    /// Mark `tid` as parked in a blocking syscall (or running again). The run
-    /// loop calls this around each blocking wait so `/proc/<tid>/stat` reports
-    /// the right state to a polling peer thread.
-    pub fn set_sleeping(&self, tid: ThreadId, sleeping: bool) {
+    /// Record the mach port of the host thread backing `tid`. Called ONCE by
+    /// the vCPU thread itself when it starts (it knows its own pthread). This
+    /// is the only per-thread state we keep for `/proc` — the run/sleep state
+    /// is read live from the kernel, not tracked here.
+    pub fn record_thread_port(&self, tid: ThreadId, port: crate::host_proc::ThreadPort) {
         #[allow(clippy::expect_used)]
         if let Some(e) = self
             .inner
@@ -146,20 +149,35 @@ impl ThreadRegistry {
             .expect("thread registry mutex poisoned")
             .get_mut(&tid)
         {
-            e.sleeping = sleeping;
+            e.mach_port = port;
         }
     }
 
     /// Live `(tid, state_char)` for every thread of this process — the data
-    /// behind `/proc/<pid>/task/` and `/proc/<tid>/stat`. `'S'` = parked in a
-    /// blocking syscall, `'R'` = running.
+    /// behind `/proc/<pid>/task/` and `/proc/<tid>/stat`. The state char is
+    /// read from the kernel via `thread_info` on each thread's recorded mach
+    /// port (`'S'` = WAITING, `'R'` = RUNNING, …); a thread whose port isn't
+    /// recorded yet reports `'R'`.
     pub fn thread_states(&self) -> Vec<(ThreadId, char)> {
         #[allow(clippy::expect_used)]
-        self.inner
+        let ports: Vec<(ThreadId, crate::host_proc::ThreadPort)> = self
+            .inner
             .lock()
             .expect("thread registry mutex poisoned")
             .iter()
-            .map(|(&tid, e)| (tid, if e.sleeping { 'S' } else { 'R' }))
+            .map(|(&tid, e)| (tid, e.mach_port))
+            .collect();
+        // Query the kernel OUTSIDE the lock (thread_info is a syscall).
+        ports
+            .into_iter()
+            .map(|(tid, port)| {
+                let state = if port != 0 {
+                    crate::host_proc::thread_run_state_char(port)
+                } else {
+                    'R'
+                };
+                (tid, state)
+            })
             .collect()
     }
 }

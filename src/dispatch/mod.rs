@@ -3335,6 +3335,18 @@ fn proc_stat_line(pid: u32, comm: &str, state: char, ppid: u32, pgrp: u32, sessi
 /// guest process single-threaded; a process's OWN multi-thread `/task/` is
 /// served from the self path with the live thread registry).
 fn synthetic_proc_pid_file(pid: u32, rest: &str, self_comm: &str) -> Option<Vec<u8>> {
+    // /proc/<pid>/task/<tid>/<file> → serve as that thread's own file. Recurse
+    // with the tid as the subject so any own-thread tid is covered (the listing
+    // of which tids exist comes from synthetic_proc_task_dir / ProcVfs).
+    if let Some(task_rest) = rest.strip_prefix("task/") {
+        if let Some((tid_str, file)) = task_rest.split_once('/') {
+            if let Ok(tid) = tid_str.parse::<u32>() {
+                return synthetic_proc_pid_file(tid, file, self_comm);
+            }
+        }
+        return None;
+    }
+
     // Own-process THREAD (or the process's own numeric pid): a peer thread
     // polling /proc/<tid>/stat for the 'S'/'R' state char. The thread tids are
     // carrick ThreadIds, not host pids, so libproc can't see them — read the
@@ -3345,13 +3357,11 @@ fn synthetic_proc_pid_file(pid: u32, rest: &str, self_comm: &str) -> Option<Vec<
         // SAFETY: getppid is always successful.
         let ppid = unsafe { libc::getppid() } as u32;
         let me = std::process::id();
-        let want_stat = rest == "stat" || rest == format!("task/{tid}/stat");
-        if want_stat {
-            return Some(
-                proc_stat_line(pid, self_comm, state, ppid, me, me).into_bytes(),
-            );
-        }
+        let _ = tid;
         match rest {
+            "stat" => {
+                return Some(proc_stat_line(pid, self_comm, state, ppid, me, me).into_bytes());
+            }
             "comm" => return Some(format!("{self_comm}\n").into_bytes()),
             "cmdline" => {
                 let mut b = self_comm.as_bytes().to_vec();
@@ -3383,14 +3393,8 @@ Pid:\t{pid}\nPPid:\t{ppid}\nThreads:\t{n}\n",
         info.comm.clone()
     };
     match rest {
-        "stat" | "task" => {
-            // (task dir listing is handled by the VFS readdir; "task/<tid>/stat"
-            // falls through to the tid arm below.)
-            if rest == "stat" {
-                Some(proc_stat_line(pid, &comm, info.state, info.ppid, info.pgid, info.pgid).into_bytes())
-            } else {
-                None
-            }
+        "stat" => {
+            Some(proc_stat_line(pid, &comm, info.state, info.ppid, info.pgid, info.pgid).into_bytes())
         }
         "comm" => Some(format!("{comm}\n").into_bytes()),
         "cmdline" => {
@@ -3417,16 +3421,24 @@ Threads:\t1\n",
             )
             .into_bytes(),
         ),
-        // A single-threaded guest's task dir contains exactly task/<pid>/stat.
-        _ => {
-            let tid_stat = format!("task/{pid}/stat");
-            if rest == tid_stat {
-                Some(proc_stat_line(pid, &comm, info.state, info.ppid, info.pgid, info.pgid).into_bytes())
-            } else {
-                None
-            }
-        }
+        // task/<tid>/<file> already handled by the recursion at the top.
+        _ => None,
     }
+}
+
+/// Directory entries (tid names) for `/proc/<pid>/task/`, or `None` if `pid`
+/// isn't a guest we expose. For THIS process, every live thread tid (from the
+/// registry — what `/proc/<pid>/task/` enumerates, LTP futex_wake02); for a
+/// single-threaded descendant, just its own pid.
+pub fn synthetic_proc_task_dir(pid: u32) -> Option<Vec<String>> {
+    let own = crate::thread::current_thread_states();
+    if own.iter().any(|(t, _)| *t as u32 == pid) {
+        return Some(own.iter().map(|(t, _)| t.to_string()).collect());
+    }
+    if crate::host_proc::is_descendant_of_self(pid) {
+        return Some(vec![pid.to_string()]);
+    }
+    None
 }
 
 /// Long state name for `/proc/<pid>/status` (`State:\tS (sleeping)`).
