@@ -842,6 +842,37 @@ impl HvfTrapEngine {
     }
 }
 
+/// Volatile byte copy out of guest-shared memory. Guest RAM is MAP_SHARED
+/// and the guest vCPU can mutate it concurrently on another host thread; a
+/// plain (non-volatile) read racing that write is UB in Rust's memory
+/// model (the optimizer may assume the bytes are stable and tear/hoist/
+/// elide the read). `read_volatile` per byte forbids that. This does NOT
+/// make the data race semantically correct — the guest owns its own
+/// synchronization — it only removes the language-level UB on the host side.
+///
+/// SAFETY: `src` must be valid for reads of `len` bytes and `dst` valid for
+/// writes of `len` bytes; the two regions must not overlap.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[inline]
+unsafe fn volatile_copy_from_guest(src: *const u8, dst: *mut u8, len: usize) {
+    for i in 0..len {
+        unsafe { dst.add(i).write(src.add(i).read_volatile()) };
+    }
+}
+
+/// Volatile byte copy INTO guest-shared memory. See
+/// [`volatile_copy_from_guest`] for why volatile is required.
+///
+/// SAFETY: `src` must be valid for reads of `len` bytes and `dst` valid for
+/// writes of `len` bytes; the two regions must not overlap.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[inline]
+unsafe fn volatile_copy_to_guest(src: *const u8, dst: *mut u8, len: usize) {
+    for i in 0..len {
+        unsafe { dst.add(i).write_volatile(src.add(i).read()) };
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl HvfInner {
     fn mapped_region_count(&self) -> usize {
@@ -1023,11 +1054,7 @@ impl HvfInner {
         let offset = (address - mapping.start) as usize;
         let mut bytes = vec![0u8; length];
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                mapping.host_addr.add(offset),
-                bytes.as_mut_ptr(),
-                length,
-            );
+            volatile_copy_from_guest(mapping.host_addr.add(offset), bytes.as_mut_ptr(), length);
         }
         Ok(bytes)
     }
@@ -1054,7 +1081,7 @@ impl HvfInner {
         };
         let offset = (address - mapping.start) as usize;
         unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), mapping.host_addr.add(offset), length);
+            volatile_copy_to_guest(bytes.as_ptr(), mapping.host_addr.add(offset), length);
         }
         Ok(())
     }
