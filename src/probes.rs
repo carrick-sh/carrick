@@ -135,6 +135,12 @@ mod carrick_usdt {
     /// instead of injecting a signal at this non-guest PC; a nonzero rate here
     /// is the signal-vs-trampoline race being correctly absorbed.
     fn kick__in_kernel(_: u64, _: u32) {}
+    /// Cumulative kick/inject counters fired once at process exit (cheap, one
+    /// fire per process) so a trace can read the totals without paying the
+    /// per-event `kick-in-kernel` cost: `el1_resumed` (kicks absorbed in the
+    /// EL1 trampoline), `kick_inject` (EL0 kick-path signal injections),
+    /// `inject_at_el1` (carrick-vs-guest invariant violations — must be 0).
+    fn kick__stats(_: u64, _: u64, _: u64) {}
     /// Reusable guest-memory watchpoint. When `CARRICK_WATCH_ADDR=<hex>` is
     /// set, fires before EVERY syscall with (`syscall_nr`, `addr`, the current
     /// little-endian u64 at `addr`). Lets a trace bracket exactly which
@@ -243,6 +249,10 @@ pub fn signal_restore(saved_pc: u64, sp: u64, magic: u64) {
 
 pub fn kick_in_kernel(pc: u64, el: u32) {
     carrick_usdt::kick__in_kernel!(|| (pc, el));
+}
+
+pub fn kick_stats(el1_resumed: u64, kick_inject: u64, inject_at_el1: u64) {
+    carrick_usdt::kick__stats!(|| (el1_resumed, kick_inject, inject_at_el1));
 }
 
 pub fn mem_watch(syscall_nr: u64, addr: u64, value: u64) {
