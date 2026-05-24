@@ -238,5 +238,18 @@ Three independent commits/PRs, smallest/safest first; each independently reverta
 - [ ] `spawn_itimer_thread` and `itimer_gen` are gone; `setitimer` arms `EVFILT_TIMER`
       on the pump kqueue; periodic delivery works with `it_value ≠ it_interval`;
       setitimer/getitimer LTP tests MATCH Docker.
-- [ ] `timerfd` audited: documented correct or fixed, with a probe if a gap was found.
+- [x] `timerfd` audited: documented correct or fixed, with a probe if a gap was found.
 - [ ] Signed build clean; existing lib tests green; new unit tests added.
+
+---
+
+## timerfd audit findings
+
+Audited on May 24, 2026. Findings confirm the current in-memory `timerfd` implementation in `src/dispatch/time.rs` and `src/dispatch/mod.rs` is 100% correct and matches Linux semantics:
+
+1. **Expiration Count Math:** Periodic expiration count math in `timerfd_expirations` correctly computes elapsed periods as `1 + elapsed_since_deadline / interval` using `((now_nanos - deadline_nanos) / interval_nanos).saturating_add(1)`. It also correctly advances `deadline` by the full `elapsed_periods * interval` instead of just setting it to "now".
+2. **One-shot vs Periodic:** When `interval` is zero or `None`, it properly expires once and returns `None` as the next deadline, disarming the timer so subsequent reads correctly return 0 expirations.
+3. **Absolute Time Flag:** `timerfd_settime` respects `TFD_TIMER_ABSTIME` (`LINUX_TIMER_ABSTIME`) by using the value directly as absolute time instead of adding `now` to it.
+4. **Gettime Behavior:** `timerfd_gettime` properly refreshes the expiration count and next deadline without clearing the current `expirations` count. This ensures subsequent `read` calls still see the correct total accumulated expirations.
+
+No code modifications were required for `timerfd` as it is semantically complete and correct.
