@@ -1222,6 +1222,7 @@ fn run_vcpu_until_exit(
                 unreachable!("serviced by the wait loop above")
             }
             DispatchOutcome::Exit { code } => {
+                crate::trap::dump_kick_stats();
                 // A forked child process (real macOS fork) exits via _exit so
                 // the rebuilt HVF context doesn't run the panicky Drops, and
                 // its buffered stdio is flushed to the inherited host fds.
