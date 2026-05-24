@@ -996,6 +996,12 @@ enum OpenDescription {
     Epoll {
         interest: HashMap<i32, EpollInterest>,
         status_flags: u64,
+        /// Ready events already observed from the backing kqueue or synthetic
+        /// readiness paths but not yet returned to the guest because the last
+        /// `epoll_wait` hit `maxevents`. Linux leaves those events queued for
+        /// the next wait; Carrick must preserve them explicitly because a
+        /// `kevent` drain consumes them eagerly.
+        pending_ready: VecDeque<LinuxEpollEvent>,
         /// Persistent kqueue backing this epoll instance (FreeBSD `linux_event`
         /// model): `epoll_ctl` registers host-backed fds here via
         /// `EVFILT_READ`/`EVFILT_WRITE`, so an fd added by one thread is seen by

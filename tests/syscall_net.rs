@@ -1133,6 +1133,94 @@ fn epoll_edge_triggered_eventfd_reports_only_new_readiness() {
 }
 
 #[test]
+fn epoll_edge_triggered_ready_overflow_is_returned_on_next_wait() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x700]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    for fd in 3..=5 {
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    SyscallRequest::new(
+                        19,
+                        SyscallArgs::from([1, LINUX_EFD_NONBLOCK, 0, 0, 0, 0]),
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: fd }
+        );
+    }
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(20, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 6 }
+    );
+    for (fd, data, addr) in [(3, 0x301_u64, 0x4000_u64), (4, 0x401, 0x4010), (5, 0x501, 0x4020)] {
+        let wanted = LinuxEpollEvent {
+            events: LINUX_EPOLLIN | LINUX_EPOLLET,
+            _pad: 0,
+            data,
+        };
+        memory.write_bytes(addr, wanted.as_bytes()).unwrap();
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    SyscallRequest::new(
+                        21,
+                        SyscallArgs::from([6, LINUX_EPOLL_CTL_ADD, fd, addr, 0, 0]),
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: 0 }
+        );
+    }
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(22, SyscallArgs::from([6, 0x4100, 2, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 2 }
+    );
+    let mut seen = std::collections::BTreeSet::new();
+    for index in 0..2_u64 {
+        let event = read_epoll_event(&memory, 0x4100 + index * 16);
+        assert_eq!(event.events & LINUX_EPOLLIN, LINUX_EPOLLIN);
+        seen.insert(event.data);
+    }
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(22, SyscallArgs::from([6, 0x4100, 2, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 1 }
+    );
+    let leftover = read_epoll_event(&memory, 0x4100);
+    assert_eq!(leftover.events & LINUX_EPOLLIN, LINUX_EPOLLIN);
+    seen.insert(leftover.data);
+    assert_eq!(seen, std::collections::BTreeSet::from([0x301_u64, 0x401, 0x501]));
+
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
 fn epoll_timed_wait_blocks_after_edge_event_was_already_reported() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x500]);
     let reporter = CompatReporter::default();
