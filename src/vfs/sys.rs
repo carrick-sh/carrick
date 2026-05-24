@@ -117,8 +117,8 @@ impl Vfs for SysVfs {
 
 /// CPU range list for `online`/`possible`/`present`: `"0-9\n"` for 10 CPUs,
 /// `"0\n"` for a uniprocessor — the format the kernel uses and that `nproc`,
-/// `lscpu`, and `sysconf(_SC_NPROCESSORS_*)` parse. Derived from the real host
-/// core count so it agrees with `sched_getaffinity`/`/proc/cpuinfo`.
+/// `lscpu`, and `sysconf(_SC_NPROCESSORS_*)` parse. Derived from the
+/// Linux-visible CPU count so it agrees with `sched_getaffinity`/`/proc/cpuinfo`.
 fn cpu_range_list() -> Vec<u8> {
     let ncpu = crate::host_facts::logical_cpu_count();
     if ncpu <= 1 {
