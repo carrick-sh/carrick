@@ -28,3 +28,7 @@ path = "src/bin/futex_sigurg.rs"
 [[bin]]
 name = "epoll-sigurg"
 path = "src/bin/epoll_sigurg.rs"
+
+[[bin]]
+name = "fp-sigurg"
+path = "src/bin/fp_sigurg.rs"
