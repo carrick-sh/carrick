@@ -93,6 +93,7 @@ use crate::linux_abi::{
     LINUX_EPOLLIN,
     LINUX_EPOLLOUT,
     LINUX_EPOLLPRI,
+    LINUX_EPOLLRDHUP,
     LINUX_ERANGE,
     LINUX_EROFS,
     LINUX_ESOCKTNOSUPPORT,
@@ -846,6 +847,17 @@ enum OpenDescription {
     Epoll {
         interest: HashMap<i32, EpollInterest>,
         status_flags: u64,
+        /// Persistent kqueue backing this epoll instance (FreeBSD `linux_event`
+        /// model): `epoll_ctl` registers host-backed fds here via
+        /// `EVFILT_READ`/`EVFILT_WRITE`, so an fd added by one thread is seen by
+        /// another thread already blocked in `epoll_wait` on this kqueue's fd —
+        /// the property carrick's old interest-snapshot wait lacked. Shared
+        /// (`Arc`) so a dup'd epoll fd refers to the same instance. In-memory
+        /// fds (eventfd/pipe/timerfd) aren't registered here; their readiness is
+        /// recomputed each `epoll_wait` and a blocked wait is woken by the
+        /// process-wide in-memory broadcast (`notify_inmem_epoll`) firing this
+        /// kqueue's `EVFILT_USER(0)`. See `docs/epoll-kqueue-plan.md`.
+        kqueue: Arc<crate::darwin_kqueue::Kqueue>,
     },
     // In-memory pipe ends. Currently `pipe2(2)` routes through `HostPipe`
     // (real macOS kernel pipe) so these are not constructed today, but the

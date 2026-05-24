@@ -1342,6 +1342,7 @@ pub const LINUX_EPOLLPRI: u32 = 0x002;
 pub const LINUX_EPOLLOUT: u32 = 0x004;
 pub const LINUX_EPOLLERR: u32 = 0x008;
 pub const LINUX_EPOLLHUP: u32 = 0x010;
+pub const LINUX_EPOLLRDHUP: u32 = 0x2000;
 pub const LINUX_EPOLLET: u32 = 0x8000_0000;
 pub const LINUX_LOCK_SH: u64 = 1;
 pub const LINUX_LOCK_EX: u64 = 2;

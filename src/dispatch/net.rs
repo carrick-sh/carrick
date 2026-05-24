@@ -121,9 +121,20 @@ impl SyscallDispatcher {
         if flags & !LINUX_EPOLL_CLOEXEC != 0 {
             return Ok(LINUX_EINVAL.into());
         }
+        let Some(kqueue) = crate::darwin_kqueue::Kqueue::new_internal() else {
+            return Ok(crate::linux_abi::LINUX_EMFILE.into());
+        };
+        // EVFILT_USER(0) is the in-memory wake channel: `notify_inmem_epoll`
+        // NOTE_TRIGGERs it when an eventfd/pipe/timerfd readiness changes, so a
+        // thread blocked on this kqueue's fd re-checks in-memory interests.
+        let _ = kqueue.apply(&[crate::darwin_kqueue::Kevent::user(
+            0,
+            libc::EV_ADD | libc::EV_CLEAR,
+        )]);
         let description = OpenDescription::Epoll {
             interest: HashMap::new(),
             status_flags: 0,
+            kqueue: Arc::new(kqueue),
         };
         Ok(self.install_fd(description, linux_fd_flags_from_open_flags(flags)))
     }
@@ -154,8 +165,17 @@ impl SyscallDispatcher {
             }
             .into());
         };
+        // The host fd backing this target (sockets/pipes/ptys); `None` for an
+        // in-memory eventfd/pipe/timerfd, whose readiness is recomputed each
+        // `epoll_wait` rather than registered on the kqueue. Computed before
+        // taking the epoll write lock (it locks the *target* fd's description).
+        let host_fd = self.host_fd_for_poll(fd);
+
         let mut open = open_file.description.write();
-        let OpenDescription::Epoll { interest, .. } = &mut *open else {
+        let OpenDescription::Epoll {
+            interest, kqueue, ..
+        } = &mut *open
+        else {
             return Ok(LINUX_EINVAL.into());
         };
 
@@ -172,6 +192,9 @@ impl SyscallDispatcher {
                 }
                 if interest.contains_key(&fd) {
                     return Ok(LINUX_EEXIST.into());
+                }
+                if let Some(host_fd) = host_fd {
+                    let _ = kqueue.apply(&epoll_kq_add_changes(host_fd, fd, event.events));
                 }
                 interest.insert(
                     fd,
@@ -191,6 +214,12 @@ impl SyscallDispatcher {
                 let Some(slot) = interest.get_mut(&fd) else {
                     return Ok(LINUX_ENOENT.into());
                 };
+                // MOD = delete the old filters then add for the new mask (Linux
+                // MOD isn't atomic on the emulation either; FreeBSD does the same).
+                if let Some(host_fd) = host_fd {
+                    epoll_kq_delete(kqueue, host_fd);
+                    let _ = kqueue.apply(&epoll_kq_add_changes(host_fd, fd, event.events));
+                }
                 *slot = EpollInterest {
                     event,
                     last_ready: 0,
@@ -200,6 +229,9 @@ impl SyscallDispatcher {
             }
             LINUX_EPOLL_CTL_DEL => {
                 if interest.remove(&fd).is_some() {
+                    if let Some(host_fd) = host_fd {
+                        epoll_kq_delete(kqueue, host_fd);
+                    }
                     crate::probes::epoll_ctl(epfd, operation, fd, 0, 0, 0);
                     Ok(DispatchOutcome::Returned { value: 0 })
                 } else {
@@ -253,73 +285,114 @@ impl SyscallDispatcher {
             }
             .into());
         };
-        let interests = {
+        // Snapshot interest metadata and the persistent instance kqueue. The
+        // kqueue is the authoritative readiness source for host-backed fds
+        // (sockets/pipes/ptys) — crucially, it monitors fds registered by OTHER
+        // threads while this thread is blocked, fixing the interest-snapshot
+        // race that lost a netpoller wakeup. In-memory fds (eventfd/pipe/timerfd)
+        // have no host fd and are recomputed each call.
+        let (interests, kq, kq_fd) = {
             let open = open_file.description.read();
-            let OpenDescription::Epoll { interest, .. } = &*open else {
+            let OpenDescription::Epoll {
+                interest, kqueue, ..
+            } = &*open
+            else {
                 return Ok(LINUX_EINVAL.into());
             };
-            interest
-                .iter()
-                .map(|(fd, interest)| (*fd, interest.clone()))
-                .collect::<Vec<_>>()
+            (
+                interest
+                    .iter()
+                    .map(|(fd, interest)| (*fd, interest.clone()))
+                    .collect::<Vec<_>>(),
+                Arc::clone(kqueue),
+                kqueue.raw_fd(),
+            )
         };
-
         let has_interests = !interests.is_empty();
-        let mut ready = Vec::new();
-        let mut ready_updates = Vec::with_capacity(interests.len());
-        let mut wait_fds = Vec::new();
-        for (fd, interest) in interests {
-            let requested_events = interest.event.events;
-            let raw_ready_events = self.epoll_ready_events(fd, requested_events);
-            ready_updates.push((fd, raw_ready_events));
-            let ready_events = if requested_events & LINUX_EPOLLET != 0 {
-                raw_ready_events & !interest.last_ready
-            } else {
-                raw_ready_events
+
+        // guest_fd -> (accumulated epoll events, epoll_data); read+write filters
+        // for the same fd merge into one returned event.
+        let mut acc: HashMap<i32, (u32, u64)> = HashMap::new();
+
+        // (1) Drain the instance kqueue (non-blocking) for host-backed fds.
+        {
+            let cap = interests.len() * 2 + 4;
+            let mut out = vec![crate::darwin_kqueue::Kevent::empty(); cap.max(1)];
+            let zero = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
             };
-            crate::probes::epoll_interest(
-                epfd,
-                fd,
-                requested_events,
-                raw_ready_events,
-                interest.last_ready,
-                ready_events,
-            );
-            if ready_events == 0
-                && timeout_ms != 0
-                && let Some(host_fd) = self.host_fd_for_poll(fd)
-            {
-                let events_to_wait_for = if requested_events & LINUX_EPOLLET != 0 {
-                    requested_events & !raw_ready_events
-                } else {
-                    requested_events
-                };
-                let mut poll_events = 0;
-                if events_to_wait_for & LINUX_EPOLLIN != 0 {
-                    poll_events |= libc::POLLIN;
-                }
-                if events_to_wait_for & LINUX_EPOLLOUT != 0 {
-                    poll_events |= libc::POLLOUT;
-                }
-                if events_to_wait_for & LINUX_EPOLLPRI != 0 {
-                    poll_events |= libc::POLLPRI;
-                }
-                if poll_events != 0 {
-                    crate::probes::epoll_wait_fd(epfd, fd, host_fd, poll_events as i32, timeout_ms);
-                    wait_fds.push((host_fd, poll_events));
-                }
-            }
-            if ready_events != 0 {
-                ready.push(LinuxEpollEvent {
-                    events: ready_events,
-                    _pad: 0,
-                    data: interest.event.data,
-                });
-                if ready.len() == max_events {
-                    break;
+            if let Ok(n) = kq.wait(&[], &mut out, Some(&zero)) {
+                for ev in &out[..n] {
+                    let bits = kevent_to_epoll(*ev);
+                    if bits == 0 {
+                        // EVFILT_USER(0) in-memory wake, or a filter with no
+                        // translatable bits — recompute below covers in-memory.
+                        continue;
+                    }
+                    let guest_fd = ev.udata_i32();
+                    if let Some((_, slot)) = interests.iter().find(|(f, _)| *f == guest_fd) {
+                        let masked =
+                            bits & (slot.event.events | LINUX_EPOLLHUP | LINUX_EPOLLERR);
+                        if masked != 0 {
+                            let entry = acc.entry(guest_fd).or_insert((0, slot.event.data));
+                            entry.0 |= masked;
+                        }
+                    }
                 }
             }
         }
+
+        // (2) In-memory fds (no host fd): recompute readiness; keep the EPOLLET
+        // `last_ready` edge latch for these (the kqueue handles edge/level for
+        // host fds natively, so they need no latch).
+        let mut ready_updates: Vec<(i32, u32)> = Vec::new();
+        for (fd, interest) in &interests {
+            if self.host_fd_for_poll(*fd).is_some() {
+                continue;
+            }
+            let requested = interest.event.events;
+            let raw_ready = self.epoll_ready_events(*fd, requested);
+            ready_updates.push((*fd, raw_ready));
+            let ready_events = if requested & LINUX_EPOLLET != 0 {
+                raw_ready & !interest.last_ready
+            } else {
+                raw_ready
+            };
+            crate::probes::epoll_interest(
+                epfd,
+                *fd,
+                requested,
+                raw_ready,
+                interest.last_ready,
+                ready_events,
+            );
+            if ready_events != 0 {
+                let entry = acc.entry(*fd).or_insert((0, interest.event.data));
+                entry.0 |= ready_events;
+            }
+        }
+
+        if !ready_updates.is_empty() {
+            let mut open = open_file.description.write();
+            if let OpenDescription::Epoll { interest, .. } = &mut *open {
+                for (fd, raw) in ready_updates {
+                    if let Some(slot) = interest.get_mut(&fd) {
+                        slot.last_ready = raw;
+                    }
+                }
+            }
+        }
+
+        let ready: Vec<LinuxEpollEvent> = acc
+            .into_iter()
+            .take(max_events)
+            .map(|(_, (events, data))| LinuxEpollEvent {
+                events,
+                _pad: 0,
+                data,
+            })
+            .collect();
 
         let event_size = core::mem::size_of::<LinuxEpollEvent>();
         for (index, event) in ready.iter().enumerate() {
@@ -336,44 +409,24 @@ impl SyscallDispatcher {
             }
         }
 
-        if !ready_updates.is_empty() {
-            let mut open = open_file.description.write();
-            if let OpenDescription::Epoll { interest, .. } = &mut *open {
-                for (fd, ready_events) in ready_updates {
-                    if let Some(slot) = interest.get_mut(&fd) {
-                        slot.last_ready = ready_events;
-                    }
-                }
-            }
-        }
-
-        if ready.is_empty() && timeout_ms != 0 && (has_interests || !wait_fds.is_empty()) {
+        if ready.is_empty() && timeout_ms != 0 && has_interests {
             let timeout = if timeout_ms < 0 {
                 None
             } else {
                 Some(Duration::from_millis(timeout_ms as u64))
             };
-            crate::probes::epoll_result(
-                epfd,
-                ready.len() as i32,
-                wait_fds.len() as i32,
-                timeout_ms,
-                1,
-            );
+            crate::probes::epoll_result(epfd, 0, 1, timeout_ms, 1);
+            // Block on the instance kqueue's own fd becoming readable: it does so
+            // the instant ANY registered filter fires (incl. an fd ADDed by
+            // another thread) or the in-memory wake triggers EVFILT_USER(0).
             return Ok(DispatchOutcome::WaitOnFds {
-                fds: wait_fds,
+                fds: vec![(kq_fd, libc::POLLIN)],
                 timeout,
                 on_timeout: 0,
             });
         }
 
-        crate::probes::epoll_result(
-            epfd,
-            ready.len() as i32,
-            wait_fds.len() as i32,
-            timeout_ms,
-            0,
-        );
+        crate::probes::epoll_result(epfd, ready.len() as i32, 0, timeout_ms, 0);
         Ok(DispatchOutcome::Returned {
             value: ready.len() as i64,
         })
@@ -2408,6 +2461,82 @@ impl SyscallDispatcher {
 
 fn read_epoll_event(memory: &impl GuestMemory, address: u64) -> Result<LinuxEpollEvent, i32> {
     read_kernel_struct(memory, address)
+}
+
+/// Build the kqueue change list to register a host-backed fd's epoll interest
+/// on the epoll instance's persistent kqueue. EPOLLIN/RDHUP/PRI ride the read
+/// filter (EV_EOF on read → EPOLLRDHUP); EPOLLOUT rides the write filter.
+/// EPOLLET → `EV_CLEAR` (edge); otherwise the filter is level-triggered, exactly
+/// matching Linux. `udata` carries the guest fd so a returned event maps
+/// straight back. A mask with neither IN nor OUT still arms a read filter so
+/// EPOLLHUP/EPOLLERR (which Linux always reports) are still observed.
+fn epoll_kq_add_changes(
+    host_fd: i32,
+    guest_fd: i32,
+    events: u32,
+) -> Vec<crate::darwin_kqueue::Kevent> {
+    use crate::darwin_kqueue::Kevent;
+    let edge: u16 = if events & LINUX_EPOLLET != 0 {
+        libc::EV_CLEAR
+    } else {
+        0
+    };
+    let base = libc::EV_ADD | libc::EV_ENABLE | edge;
+    let want_read = events & (LINUX_EPOLLIN | LINUX_EPOLLRDHUP | LINUX_EPOLLPRI) != 0;
+    let want_write = events & LINUX_EPOLLOUT != 0;
+    let mut changes = Vec::with_capacity(2);
+    if want_read || !want_write {
+        changes.push(Kevent::read(host_fd, base).with_udata(guest_fd));
+    }
+    if want_write {
+        changes.push(Kevent::write(host_fd, base).with_udata(guest_fd));
+    }
+    changes
+}
+
+/// Remove both filters for a host-backed fd from the epoll instance kqueue.
+/// Read and write are deleted in separate `kevent` calls so a missing filter's
+/// ENOENT doesn't abort the other (one changelist stops at the first failing
+/// entry without `EV_RECEIPT`).
+fn epoll_kq_delete(kqueue: &crate::darwin_kqueue::Kqueue, host_fd: i32) {
+    use crate::darwin_kqueue::Kevent;
+    let _ = kqueue.apply(&[Kevent::read(host_fd, libc::EV_DELETE)]);
+    let _ = kqueue.apply(&[Kevent::write(host_fd, libc::EV_DELETE)]);
+}
+
+/// Translate one returned kqueue event (from an epoll instance kqueue) to Linux
+/// epoll event bits. Direction-sensitive (jiixyj/epoll-shim model): read EOF →
+/// EPOLLRDHUP, write EOF → EPOLLHUP, `EV_ERROR` or `EV_EOF` carrying a non-zero
+/// `fflags` (the socket error) → EPOLLERR. Returns 0 for non-IO filters
+/// (EVFILT_USER), which the caller ignores.
+fn kevent_to_epoll(ev: crate::darwin_kqueue::Kevent) -> u32 {
+    let mut events = 0u32;
+    if ev.flags() & libc::EV_ERROR != 0 {
+        events |= LINUX_EPOLLERR;
+    }
+    let eof = ev.flags() & libc::EV_EOF != 0;
+    match ev.filter() {
+        libc::EVFILT_READ => {
+            events |= LINUX_EPOLLIN;
+            if eof {
+                events |= LINUX_EPOLLRDHUP;
+                if ev.fflags() != 0 {
+                    events |= LINUX_EPOLLERR;
+                }
+            }
+        }
+        libc::EVFILT_WRITE => {
+            events |= LINUX_EPOLLOUT;
+            if eof {
+                events |= LINUX_EPOLLHUP;
+                if ev.fflags() != 0 {
+                    events |= LINUX_EPOLLERR;
+                }
+            }
+        }
+        _ => {}
+    }
+    events
 }
 
 fn read_pollfd(memory: &impl GuestMemory, address: u64) -> Result<LinuxPollFd, i32> {
