@@ -898,12 +898,12 @@ impl HvfInner {
         // so this is execution time, not idle). HVF guest cycles don't accrue
         // to the host thread's rusage, so getrusage/times/`/proc` source the
         // guest's user CPU time from this. (hv_vcpu_get_exec_time was measured
-        // to under-report ~40× here, so it isn't used.) Keyed by this vCPU
-        // thread's mach port; summed process-wide by `guest_cpu`.
+        // to under-report ~40× here, so it isn't used.) Accumulated lock-free
+        // into this vCPU thread's slot; summed process-wide by `guest_cpu`.
         let run_start = std::time::Instant::now();
         let run_result = self.vcpu.run();
         let run_ns = run_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-        crate::guest_cpu::add(crate::host_proc::current_thread_port() as u64, run_ns);
+        crate::guest_cpu::add(run_ns);
         run_result.map_err(hvf_error)?;
         let exit = self.vcpu.get_exit_info();
         if exit.reason == ExitReason::CANCELED {
