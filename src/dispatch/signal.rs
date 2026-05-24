@@ -242,7 +242,10 @@ impl SyscallDispatcher {
     }
 
     pub fn restore_signal_mask(&self, tid: crate::thread::ThreadId, mask: u64) {
-        self.signal.lock().masks.insert(tid, sanitize_signal_mask(mask));
+        self.signal
+            .lock()
+            .masks
+            .insert(tid, sanitize_signal_mask(mask));
     }
 
     /// Lowest-numbered pending signal that is NOT currently blocked, cleared

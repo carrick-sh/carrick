@@ -3,8 +3,8 @@
 //! can be held across vCPU runs without entangling the dispatcher lock.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 
 use parking_lot::Mutex as ParkingMutex;
 use parking_lot_core::{FilterOp, ParkResult, ParkToken, UnparkToken};
@@ -32,8 +32,7 @@ pub struct ThreadRegistry {
 /// fs/open path, where the per-syscall registry isn't threaded through) can
 /// read this process's thread tids + states. Set when the vCPU loop creates
 /// its registry and re-set in a forked child (which builds a fresh one).
-static CURRENT_REGISTRY: ParkingMutex<Option<Arc<ThreadRegistry>>> =
-    ParkingMutex::new(None);
+static CURRENT_REGISTRY: ParkingMutex<Option<Arc<ThreadRegistry>>> = ParkingMutex::new(None);
 
 /// Publish `registry` as this process's current registry. Called by the run
 /// loop at startup and after fork (the child has its own registry).
@@ -68,31 +67,22 @@ impl ThreadRegistry {
 
     pub fn register_child(&self, clear_child_tid: u64) -> ThreadId {
         let tid = self.next_tid.fetch_add(1, Ordering::Relaxed);
-        self.inner
-            .lock()
-            .insert(
-                tid,
-                ThreadEntry {
-                    clear_child_tid,
-                    mach_port: 0,
-                },
-            );
+        self.inner.lock().insert(
+            tid,
+            ThreadEntry {
+                clear_child_tid,
+                mach_port: 0,
+            },
+        );
         tid
     }
 
     pub fn clear_child_tid(&self, tid: ThreadId) -> Option<u64> {
-        self.inner
-            .lock()
-            .get(&tid)
-            .map(|e| e.clear_child_tid)
+        self.inner.lock().get(&tid).map(|e| e.clear_child_tid)
     }
 
     pub fn set_clear_child_tid(&self, tid: ThreadId, addr: u64) {
-        if let Some(e) = self
-            .inner
-            .lock()
-            .get_mut(&tid)
-        {
+        if let Some(e) = self.inner.lock().get_mut(&tid) {
             e.clear_child_tid = addr;
         }
     }
@@ -105,17 +95,13 @@ impl ThreadRegistry {
     }
 
     pub fn live_count(&self) -> usize {
-        self.inner
-            .lock()
-            .len()
+        self.inner.lock().len()
     }
 
     /// Is `tid` a live thread of this process? Used to route a guest
     /// `tgkill`/`tkill` to a sibling vs. reporting ESRCH.
     pub fn is_live(&self, tid: ThreadId) -> bool {
-        self.inner
-            .lock()
-            .contains_key(&tid)
+        self.inner.lock().contains_key(&tid)
     }
 
     /// Record the mach port of the host thread backing `tid`. Called ONCE by
@@ -123,11 +109,7 @@ impl ThreadRegistry {
     /// is the only per-thread state we keep for `/proc` — the run/sleep state
     /// is read live from the kernel, not tracked here.
     pub fn record_thread_port(&self, tid: ThreadId, port: crate::host_proc::ThreadPort) {
-        if let Some(e) = self
-            .inner
-            .lock()
-            .get_mut(&tid)
-        {
+        if let Some(e) = self.inner.lock().get_mut(&tid) {
             e.mach_port = port;
         }
     }

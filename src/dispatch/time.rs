@@ -315,7 +315,11 @@ impl SyscallDispatcher {
                 if kq >= 0 {
                     let _ = crate::darwin_kqueue::apply_changes(
                         kq,
-                        &[crate::darwin_kqueue::Kevent::timer(ident, libc::EV_DELETE, 0)],
+                        &[crate::darwin_kqueue::Kevent::timer(
+                            ident,
+                            libc::EV_DELETE,
+                            0,
+                        )],
                     );
                 }
             } else {
@@ -502,8 +506,7 @@ impl SyscallDispatcher {
         let host = crate::host_proc::self_resource_usage().unwrap_or_default();
         let rusage = match who {
             LINUX_RUSAGE_THREAD => {
-                let (user_us, system_us) =
-                    crate::host_proc::self_thread_cpu_us().unwrap_or((0, 0));
+                let (user_us, system_us) = crate::host_proc::self_thread_cpu_us().unwrap_or((0, 0));
                 rusage_from(user_us, system_us, host.maxrss_bytes, host.majflt)
             }
             LINUX_RUSAGE_CHILDREN => rusage_from(
@@ -640,7 +643,6 @@ fn rusage_from(user_us: u64, system_us: u64, maxrss_bytes: u64, majflt: u64) -> 
     ru.ru_majflt = majflt as i64;
     ru
 }
-
 
 /// Render an interval-timer's state as an `itimerval`, computing the time
 /// remaining (`value - elapsed`, saturating to zero on/after expiry). A

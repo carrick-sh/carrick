@@ -99,8 +99,7 @@ impl ThreadWaiter {
         let kq = Kqueue::new_internal();
         let process_pipe_read = crate::host_signal::pending_pipe_read_fd();
         let thread_wake = crate::host_signal::register_thread_waiter(tid);
-        if let Some(kq) = kq.as_ref()
-        {
+        if let Some(kq) = kq.as_ref() {
             let mut changes = Vec::with_capacity(2);
             if process_pipe_read >= 0 {
                 // Persistent EVFILT_READ on the process self-pipe: any byte the
@@ -324,9 +323,7 @@ impl ThreadWaiter {
             if process_pipe_woke {
                 crate::host_signal::drain_pending_pipe();
             }
-            if thread_pipe_woke
-                && let Some(thread_wake) = self.thread_wake.as_ref()
-            {
+            if thread_pipe_woke && let Some(thread_wake) = self.thread_wake.as_ref() {
                 thread_wake.drain();
             }
             if crate::host_signal::has_unblocked_pending_for(self.tid, block_mask) {
