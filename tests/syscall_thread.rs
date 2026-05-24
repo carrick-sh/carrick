@@ -64,7 +64,8 @@ fn clone_fork_flags_still_fork() {
             &reporter,
         )
         .unwrap();
-    assert_eq!(outcome, DispatchOutcome::Fork);
+    // No CLONE_PIDFD in these flags, so no pidfd-out pointer.
+    assert_eq!(outcome, DispatchOutcome::Fork { pidfd_out: None });
 }
 
 // --- Sub-task B: per-thread tid + real futex via dispatch_threaded ---

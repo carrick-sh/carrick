@@ -1570,6 +1570,9 @@ bitflags! {
         const FS = LINUX_CLONE_FS;
         const FILES = LINUX_CLONE_FILES;
         const SIGHAND = LINUX_CLONE_SIGHAND;
+        /// Allocate a pidfd for the child. Legacy clone(2) returns it via the
+        /// parent_tid pointer (arg2); clone3 via clone_args.pidfd.
+        const PIDFD = 0x0000_1000;
         const THREAD = LINUX_CLONE_THREAD;
         const SETTLS = LINUX_CLONE_SETTLS;
         const PARENT_SETTID = LINUX_CLONE_PARENT_SETTID;

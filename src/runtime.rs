@@ -607,11 +607,16 @@ where
                 runtime.complete_syscall(value)?;
                 last_syscall_retval = Some(value);
             }
-            DispatchOutcome::Fork => {
+            DispatchOutcome::Fork { pidfd_out } => {
                 let outcome = runtime.fork()?;
                 let retval: i64 = match outcome {
                     crate::trap::ForkOutcome::Parent { child_pid } => {
                         waiter = crate::io_wait::ThreadWaiter::new(this_tid);
+                        // CLONE_PIDFD: hand the parent a pidfd for the new child.
+                        if let Some(addr) = pidfd_out {
+                            let fd = dispatcher.install_child_pidfd(child_pid).unwrap_or(-1);
+                            let _ = runtime.write_bytes(addr, &fd.to_le_bytes());
+                        }
                         i64::from(child_pid)
                     }
                     crate::trap::ForkOutcome::Child => {
@@ -1060,6 +1065,7 @@ impl ThreadRuntimeState {
         &mut self,
         kernel: &Kernel,
         engine: &mut HvfTrapEngine,
+        pidfd_out: Option<u64>,
     ) -> Result<Option<i64>, RuntimeError> {
         // Serialize forks: at most one quiesce/fork in flight. A concurrent
         // forker gets EAGAIN and, back in its run loop, parks at the barrier
@@ -1125,6 +1131,16 @@ impl ThreadRuntimeState {
                     .fork
                     .restart_after_parent_fork(prepared_fork, &self.kicker, &self.futex);
                 self.waiter = crate::io_wait::ThreadWaiter::new(self.this_tid);
+                // CLONE_PIDFD: allocate a pidfd for the new child and write its
+                // fd to the guest pidfd-out pointer. The child's pid mirrors a
+                // real host pid, so the pidfd watches it via EVFILT_PROC.
+                if let Some(addr) = pidfd_out {
+                    let fd = kernel
+                        .dispatcher
+                        .install_child_pidfd(child_pid)
+                        .unwrap_or(-1);
+                    let _ = engine.write_bytes(addr, &fd.to_le_bytes());
+                }
                 i64::from(child_pid)
             }
             crate::trap::ForkOutcome::Child => {
@@ -1416,8 +1432,8 @@ fn run_vcpu_until_exit(
                 // returning to userspace. The just-handled signal was cleared
                 // when delivered, so this can't re-deliver it.
             }
-            DispatchOutcome::Fork => {
-                if let Some(retval) = state.handle_fork(&kernel, &mut engine)? {
+            DispatchOutcome::Fork { pidfd_out } => {
+                if let Some(retval) = state.handle_fork(&kernel, &mut engine, pidfd_out)? {
                     last_syscall_retval = Some(state.complete_returned(&mut engine, retval)?);
                 }
             }
@@ -2022,11 +2038,16 @@ where
                 trap.complete_syscall(value)?;
                 last_syscall_retval = Some(value);
             }
-            DispatchOutcome::Fork => {
+            DispatchOutcome::Fork { pidfd_out } => {
                 let outcome = trap.fork()?;
                 let retval: i64 = match outcome {
                     crate::trap::ForkOutcome::Parent { child_pid } => {
                         waiter = crate::io_wait::ThreadWaiter::new(this_tid);
+                        // CLONE_PIDFD: hand the parent a pidfd for the new child.
+                        if let Some(addr) = pidfd_out {
+                            let fd = dispatcher.install_child_pidfd(child_pid).unwrap_or(-1);
+                            let _ = memory.write_bytes(addr, &fd.to_le_bytes());
+                        }
                         i64::from(child_pid)
                     }
                     crate::trap::ForkOutcome::Child => {

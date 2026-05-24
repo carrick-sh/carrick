@@ -60,7 +60,6 @@ use crate::linux_abi::{
     LINUX_EAGAIN,
     LINUX_EALREADY,
     LINUX_EBADF,
-    LINUX_ECHILD,
     LINUX_EEXIST,
     LINUX_EFAULT,
     LINUX_EFBIG,
@@ -451,7 +450,14 @@ pub enum DispatchOutcome {
     /// `clone(2)` with process-creation flags. The runtime must perform
     /// a real macOS fork against the trap engine, then write the child
     /// pid (parent) or 0 (child) into x0 to complete the syscall.
-    Fork,
+    ///
+    /// `pidfd_out` is `Some(addr)` when `CLONE_PIDFD` was requested: the
+    /// runtime allocates a pidfd for the new child and writes its (32-bit) fd
+    /// to `addr` in the parent. Go's `os/exec` clones with `CLONE_PIDFD` and
+    /// then waits on that fd.
+    Fork {
+        pidfd_out: Option<u64>,
+    },
     /// `execve(2)` succeeded so far in the dispatcher (path readable,
     /// argv/envp resolved). The runtime must:
     ///   1. Tear down the current guest address space.
@@ -574,7 +580,7 @@ impl DispatchOutcome {
             DispatchOutcome::Returned { value } => (*value, None),
             DispatchOutcome::Errno { errno } => (-(*errno as i64), Some(*errno)),
             DispatchOutcome::Exit { code } => (*code as i64, None),
-            DispatchOutcome::Fork => (0, None),
+            DispatchOutcome::Fork { .. } => (0, None),
             DispatchOutcome::Execve { .. } => (0, None),
             DispatchOutcome::SigReturn => (0, None),
             // CloneThread/ThreadExit/FutexWait are handled specially by the
