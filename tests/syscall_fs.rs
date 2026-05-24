@@ -778,6 +778,7 @@ fn cwd_and_access_syscalls_use_rootfs_state() {
     memory.write_bytes(0x4000, b"/etc\0").unwrap();
     memory.write_bytes(0x4010, b"motd\0").unwrap();
     memory.write_bytes(0x4020, b"/\0").unwrap();
+    memory.write_bytes(0x4030, b"//..\0").unwrap();
     let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
 
@@ -882,6 +883,17 @@ fn cwd_and_access_syscalls_use_rootfs_state() {
         dispatcher
             .dispatch(
                 SyscallRequest::new(49, SyscallArgs::from([0x4020, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(dispatcher.cwd(), "/");
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(49, SyscallArgs::from([0x4030, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
             )

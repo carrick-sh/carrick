@@ -594,7 +594,7 @@ fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         .context("--fs host: failed to stream OCI layers to scratch Dir")?;
                     let mut dispatcher = SyscallDispatcher::new();
                     dispatcher.set_executable_path(executable_path.clone());
-                    seed_known_hosts(&mut host);
+                    seed_guest_baseline(&mut host);
                     let _ = dispatcher.set_fs_backend(Box::new(host));
                     // Interactive pty (or --raw stream): hand the guest the pty
                     // slave as fds 0/1/2 and relay master <-> the user's terminal.
@@ -1045,7 +1045,7 @@ fn install_fs_backend(
                             "carrick: --fs host seed-from-rootfs failed ({err}); falling back to in-memory backend"
                         );
                         let mut mem: Box<dyn FsBackend> = Box::new(MemoryBackend::new());
-                        seed_known_hosts(&mut *mem);
+                        seed_guest_baseline(&mut *mem);
                         let _ = dispatcher.set_fs_backend(mem);
                         return Ok(());
                     }
@@ -1059,7 +1059,7 @@ fn install_fs_backend(
             }
         },
     };
-    seed_known_hosts(&mut *backend);
+    seed_guest_baseline(&mut *backend);
     let _ = dispatcher.set_fs_backend(backend);
     // The disk overlay now holds the entire filesystem; drop the redundant
     // in-memory rootfs layer so reads, execve and the ELF interpreter
@@ -1070,16 +1070,43 @@ fn install_fs_backend(
     Ok(())
 }
 
-/// Pre-populate the overlay's `/etc/hosts` with macOS-resolved IPs
-/// for the apt repos. glibc's NSS reads `hosts: files dns` from
-/// `/etc/nsswitch.conf`, so a hit in `/etc/hosts` short-circuits the
-/// DNS round-trip — which sidesteps the recvfrom timing that
-/// otherwise leaves apt's resolver stuck waiting for an AAAA-companion
-/// response. The resolution happens on the host in a single
-/// `ToSocketAddrs` call before the guest even starts, so no extra
-/// syscalls or guest-side waits.
-fn seed_known_hosts(backend: &mut dyn carrick::fs_backend::FsBackend) {
+/// Pre-populate the writable overlay with a small Linux baseline plus
+/// `/etc/hosts` entries resolved on the macOS host. Raw static binaries have
+/// no OCI rootfs to supply `/tmp`, passwd/group databases, or resolver files;
+/// enough real software assumes those paths exist that Carrick seeds them for
+/// both memory and host backends.
+fn seed_guest_baseline(backend: &mut dyn carrick::fs_backend::FsBackend) {
     use std::net::ToSocketAddrs;
+    for dir in [
+        "/tmp",
+        "/var",
+        "/var/tmp",
+        "/root",
+        "/etc",
+        "/bin",
+        "/sbin",
+        "/usr",
+        "/usr/bin",
+        "/usr/sbin",
+        "/usr/local",
+        "/usr/local/bin",
+        "/usr/local/sbin",
+    ] {
+        let _ = backend.make_dir(dir);
+    }
+    let _ = backend.set_mode("/tmp", 0o1777);
+    let _ = backend.set_mode("/var/tmp", 0o1777);
+    let _ = backend.set_file_contents(
+        "/etc/passwd",
+        b"root:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n"
+            .to_vec(),
+    );
+    let _ = backend.set_file_contents("/etc/group", b"root:x:0:\nnogroup:x:65534:\n".to_vec());
+    let _ = backend.set_file_contents(
+        "/etc/nsswitch.conf",
+        b"passwd: files\ngroup: files\nhosts: files dns\n".to_vec(),
+    );
+
     const HOSTNAMES: &[&str] = &[
         "deb.debian.org",
         "security.debian.org",
@@ -1107,7 +1134,6 @@ fn seed_known_hosts(backend: &mut dyn carrick::fs_backend::FsBackend) {
             }
         }
     }
-    let _ = backend.make_dir("/etc");
     let _ = backend.set_file_contents("/etc/hosts", hosts_content.into_bytes());
 }
 

@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::path::Path;
+use std::path::{Component, Path};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -3620,10 +3620,25 @@ fn inode_for_path(path: &Path) -> u64 {
 }
 
 fn join_rootfs_path(base: &str, path: &str) -> String {
-    if base == "/" {
-        format!("/{path}")
+    let mut parts = Vec::new();
+    for component in Path::new(base)
+        .components()
+        .chain(Path::new(path).components())
+    {
+        match component {
+            Component::Prefix(_) => {}
+            Component::RootDir => parts.clear(),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                parts.pop();
+            }
+            Component::Normal(name) => parts.push(name.to_string_lossy().into_owned()),
+        }
+    }
+    if parts.is_empty() {
+        "/".to_owned()
     } else {
-        format!("{}/{path}", base.trim_end_matches('/'))
+        format!("/{}", parts.join("/"))
     }
 }
 
@@ -4081,6 +4096,15 @@ mod overlay_dispatch_tests {
             Err(_) => panic!("expected next fd install to succeed"),
         };
         assert_eq!(next, 6);
+    }
+
+    #[test]
+    fn join_rootfs_path_normalizes_relative_components() {
+        assert_eq!(join_rootfs_path("/", "."), "/");
+        assert_eq!(join_rootfs_path("/", ".."), "/");
+        assert_eq!(join_rootfs_path("/tmp/work", ".."), "/tmp");
+        assert_eq!(join_rootfs_path("/tmp/work", "../other/."), "/tmp/other");
+        assert_eq!(join_rootfs_path("/tmp/work", "../../.."), "/");
     }
 
     #[test]
