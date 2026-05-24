@@ -34,3 +34,15 @@ count. Both precede SP3 (loader) and SP4 (drive-to-zero + runtime/net + T3).
 
 `runtime` and `net` not yet tallied (slow; expected to be dominated by the same
 two gaps — will re-run after SP2a/SP2b).
+
+## Progress update
+
+- **SP2a (EL0 fault → SIGSEGV/SIGBUS): DONE** (commit `feat(signal): deliver
+  synchronous EL0 faults…`). `sync/atomic` 86→**95/95** (TestNilDeref crash +
+  9-test cascade cleared); `segv-recover` probe → `SEGV_OK`.
+- **SP2b (pidfd): precise finding.** Go 1.24 `os/exec` `forkExec` aborts in the
+  PARENT at `pidfd_open(434)` → ENOSYS, **before any `clone`/fork** (trace: no
+  `fork-post`, no `execve`; only `[parent] ENOSYS nr=434` + `nr=293 rseq`). So
+  `pidfd_open` must succeed (return a real pollable fd) for Go to proceed to
+  `clone(CLONE_PIDFD)`. Also `rseq(293)` ENOSYS (Go 1.24 enables rseq; likely
+  tolerated, verify). Fix = kqueue-`EVFILT_PROC`-backed pidfd (see SP2b plan).
