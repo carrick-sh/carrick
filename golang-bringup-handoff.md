@@ -1,6 +1,27 @@
 # Handoff — Go runtime bring-up on carrick (2026-05-24, continued)
 
-## LATEST (2026-05-24 PM): Go `os/exec` multithreaded fork+exec
+## LATEST (2026-05-24 PM): `os/exec` down to raw-rootfs environment delta
+
+Current `scripts/go-conformance.sh os/exec` result:
+
+- Docker PASS: **36**
+- Carrick PASS: **35**
+- Carrick-only delta: **`TestString`** only.
+
+`TestWaitid` is fixed. The root cause was a Darwin/Linux `waitid` state-selection
+semantic mismatch: Darwin can report a SIGSTOPped child from
+`waitid(P_PID, child, WEXITED|WNOWAIT)`, while Linux reports only states selected
+by the caller's `W*` bits. Carrick now filters host `siginfo_t` states against
+the guest waitid options before deciding whether the child is waitable. Trace
+script: `scripts/trace-waitid-stop.d`.
+
+The remaining `TestString` item is not a wait/signal/process bug: Go skips it in
+Carrick because `exec.LookPath("echo")` cannot find an executable in the raw
+seeded rootfs. Do not satisfy this by planting a fake Mach-O or empty `echo`;
+use a real Linux rootfs/tooling path, or keep it classified as a raw-runner
+environment delta.
+
+## PRIOR LATEST (2026-05-24 PM): Go `os/exec` multithreaded fork+exec
 
 After the high-P deadlock fix (below), the next bring-up target was Go's
 `os/exec` (clone(`CLONE_VM|CLONE_VFORK|CLONE_PIDFD`) → execve → wait) under the
