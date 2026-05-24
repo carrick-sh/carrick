@@ -1,0 +1,30 @@
+[package]
+name = "mn-probes"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Differential reproducers isolating the carrick high-P (CARRICK_EXPOSED_CPUS=10)
+# Go stall to signals vs futex vs epoll. Built static-musl in a linux/arm64
+# container; run under carrick (exposed 4 vs 10) and in-container as the
+# real-Linux oracle. See memory project_go_highp_isolation_method.
+
+[dependencies]
+libc = "0.2"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+opt-level = 2
+
+[[bin]]
+name = "futex-only"
+path = "src/bin/futex_only.rs"
+
+[[bin]]
+name = "futex-sigurg"
+path = "src/bin/futex_sigurg.rs"
+
+[[bin]]
+name = "epoll-sigurg"
+path = "src/bin/epoll_sigurg.rs"
