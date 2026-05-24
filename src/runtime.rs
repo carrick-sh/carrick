@@ -536,7 +536,8 @@ where
                     fds,
                     timeout,
                     on_timeout,
-                } => match waiter.wait(&fds, timeout) {
+                    block_signals,
+                } => match waiter.wait(&fds, timeout, block_signals) {
                     crate::io_wait::WaitResult::Ready => continue,
                     crate::io_wait::WaitResult::TimedOut => {
                         break DispatchOutcome::Returned { value: on_timeout };
@@ -797,7 +798,8 @@ impl ThreadRuntimeState {
                     fds,
                     timeout,
                     on_timeout,
-                } => match self.waiter.wait(&fds, timeout) {
+                    block_signals,
+                } => match self.waiter.wait(&fds, timeout, block_signals) {
                     crate::io_wait::WaitResult::Ready => continue,
                     crate::io_wait::WaitResult::TimedOut => {
                         break Ok(DispatchOutcome::Returned { value: on_timeout });
@@ -1707,7 +1709,8 @@ where
                     fds,
                     timeout,
                     on_timeout,
-                } => match waiter.wait(&fds, timeout) {
+                    block_signals,
+                } => match waiter.wait(&fds, timeout, block_signals) {
                     crate::io_wait::WaitResult::Ready => continue,
                     crate::io_wait::WaitResult::TimedOut => {
                         break DispatchOutcome::Returned { value: on_timeout };
