@@ -766,6 +766,7 @@ impl SyscallDispatcher {
         }
         // si_pid (copied out of the possibly-unaligned host siginfo by value)
         // is 0 when no child was waitable.
+        clear_unrequested_waitid_state(&mut info, options);
         let si_pid = info.si_pid;
         if si_pid == 0 && !guest_nohang {
             // Nothing ready and the guest wants to block. Park the vCPU thread
@@ -801,6 +802,13 @@ impl SyscallDispatcher {
             loop {
                 let r = unsafe { libc::waitid(host_idtype, host_id, &mut info, host_options) };
                 if r == 0 {
+                    if !clear_unrequested_waitid_state(&mut info, options) {
+                        // With WNOWAIT Darwin can report the same unrequested
+                        // stopped state repeatedly. Back off until an actually
+                        // requested state arrives.
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        continue;
+                    }
                     break;
                 }
                 let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
@@ -1328,6 +1336,33 @@ fn translate_wait_status(status: i32) -> i32 {
     } else {
         // Exited normally: high byte is the exit code, left untouched.
         status
+    }
+}
+
+/// Darwin can report a stopped child from `waitid(WEXITED|WNOWAIT)`. Linux only
+/// reports SIGCHLD states selected by the caller's W* bits, so filter the host
+/// siginfo before deciding whether a child is waitable.
+fn clear_unrequested_waitid_state(info: &mut libc::siginfo_t, options: u64) -> bool {
+    if info.si_pid == 0 || waitid_state_requested(info.si_code, options) {
+        return true;
+    }
+    *info = unsafe { std::mem::zeroed() };
+    false
+}
+
+fn waitid_state_requested(si_code: i32, options: u64) -> bool {
+    const CLD_EXITED: i32 = 1;
+    const CLD_KILLED: i32 = 2;
+    const CLD_DUMPED: i32 = 3;
+    const CLD_TRAPPED: i32 = 4;
+    const CLD_STOPPED: i32 = 5;
+    const CLD_CONTINUED: i32 = 6;
+
+    match si_code {
+        CLD_EXITED | CLD_KILLED | CLD_DUMPED => options & crate::linux_abi::LINUX_WEXITED != 0,
+        CLD_TRAPPED | CLD_STOPPED => options & crate::linux_abi::LINUX_WSTOPPED != 0,
+        CLD_CONTINUED => options & crate::linux_abi::LINUX_WCONTINUED != 0,
+        _ => true,
     }
 }
 
