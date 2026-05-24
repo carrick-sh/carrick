@@ -8,6 +8,14 @@ mod support;
 
 use support::*;
 
+static PROCESS_WAIT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn process_wait_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    PROCESS_WAIT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[test]
 fn exit_syscall_requests_process_exit() {
     let mut memory = LinearMemory::new(0x4000, Vec::new());
@@ -262,6 +270,7 @@ fn unhandled_named_syscall_surfaces_by_name_in_compat_report() {
 
 #[test]
 fn wait_family_bootstrap_returns_echild() {
+    let _guard = process_wait_test_lock();
     const LINUX_P_ALL: u64 = 0;
     const LINUX_WNOHANG: u64 = 1;
     const LINUX_WEXITED: u64 = 4;
@@ -388,6 +397,7 @@ fn wait_family_bootstrap_returns_echild() {
 #[cfg(target_os = "macos")]
 #[test]
 fn blocking_wait4_for_specific_child_parks_on_proc_exit() {
+    let _guard = process_wait_test_lock();
     let child = unsafe { libc::fork() };
     assert!(child >= 0, "fork failed");
     if child == 0 {
@@ -404,6 +414,82 @@ fn blocking_wait4_for_specific_child_parks_on_proc_exit() {
     let outcome = dispatcher
         .dispatch(
             SyscallRequest::new(260, SyscallArgs::from([child as u64, 0, 0, 0, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+
+    unsafe {
+        libc::kill(child, libc::SIGKILL);
+        let mut status = 0;
+        libc::waitpid(child, &mut status, 0);
+    }
+
+    assert_eq!(
+        outcome,
+        DispatchOutcome::WaitOnProcExit {
+            pid: child,
+            block_signals: 0,
+        }
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn waitid_wexited_ignores_stopped_child() {
+    let _guard = process_wait_test_lock();
+    const LINUX_P_PID: u64 = 1;
+    const LINUX_WEXITED: u64 = 4;
+    const LINUX_WNOWAIT: u64 = 0x0100_0000;
+
+    let child = unsafe { libc::fork() };
+    assert!(child >= 0, "fork failed");
+    if child == 0 {
+        loop {
+            unsafe {
+                libc::pause();
+            }
+        }
+    }
+
+    unsafe {
+        assert_eq!(libc::kill(child, libc::SIGSTOP), 0);
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        for _ in 0..100 {
+            assert_eq!(
+                libc::waitid(
+                    libc::P_PID,
+                    child as libc::id_t,
+                    &mut info,
+                    libc::WSTOPPED | libc::WNOWAIT | libc::WNOHANG,
+                ),
+                0
+            );
+            if info.si_pid == child {
+                break;
+            }
+            libc::usleep(10_000);
+        }
+        assert_eq!(info.si_pid, child, "child did not report stopped state");
+    }
+
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    let outcome = dispatcher
+        .dispatch(
+            SyscallRequest::new(
+                95,
+                SyscallArgs::from([
+                    LINUX_P_PID,
+                    child as u64,
+                    0,
+                    LINUX_WEXITED | LINUX_WNOWAIT,
+                    0,
+                    0,
+                ]),
+            ),
             &mut memory,
             &reporter,
         )

@@ -12,7 +12,7 @@ FP + ExecLevel commits. Args: `-test.run 'Test' -test.short -test.v`.
 | `context` | 38 | 38 | **clean match** ✓ |
 | `time` | 0 | 0 | no `Test*` in `-test.short` (non-signal) |
 | `os/signal` | 18 | 15 | 3: `TestAtomicStop`, `TestDetectNohup` (pidfd re-exec), `TestNotifyContextNotifications` (possible real notify gap), `TestTerminalSignal` (pidfd "function not implemented") |
-| `os/exec` | 36 | 10 | 26: all subprocess-spawn tests → pidfd |
+| `os/exec` | 36 | 35 | 1: `TestString` → raw-rootfs PATH has no real `echo` executable |
 
 ## Two dominant root causes
 
@@ -46,3 +46,10 @@ two gaps — will re-run after SP2a/SP2b).
   `pidfd_open` must succeed (return a real pollable fd) for Go to proceed to
   `clone(CLONE_PIDFD)`. Also `rseq(293)` ENOSYS (Go 1.24 enables rseq; likely
   tolerated, verify). Fix = kqueue-`EVFILT_PROC`-backed pidfd (see SP2b plan).
+- **os/exec waitid stop-state bug: DONE** (2026-05-24). `TestWaitid` exposed a
+  Darwin adaptation mismatch: host `waitid(P_PID, child, WEXITED|WNOWAIT)`
+  reports a SIGSTOPped child even though Linux would not. Carrick now filters
+  host `siginfo_t` states against the guest's requested `W*` bits before
+  returning waitable status. Focused Go `TestWaitid` passes; full
+  `scripts/go-conformance.sh os/exec` is **35/36** with only `TestString`
+  remaining, because the raw seeded rootfs has no real `/usr/bin/echo`.
