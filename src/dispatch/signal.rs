@@ -782,7 +782,11 @@ fn signal_is_self_target(target: i64, tid_required: bool) -> bool {
     }
 }
 
-pub(crate) fn bootstrap_signal_send(target: i64, tid_required: bool, signum: u64) -> DispatchOutcome {
+pub(crate) fn bootstrap_signal_send(
+    target: i64,
+    tid_required: bool,
+    signum: u64,
+) -> DispatchOutcome {
     if !is_valid_signum(signum) {
         return DispatchOutcome::errno(LINUX_EINVAL);
     }

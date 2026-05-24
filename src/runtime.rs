@@ -813,6 +813,28 @@ impl ThreadRuntimeState {
             .record_thread_port(self.this_tid, crate::host_proc::current_thread_port());
     }
 
+    fn release_and_park_vcpu_for_fork(
+        &self,
+        engine: &mut HvfTrapEngine,
+    ) -> Result<(), RuntimeError> {
+        engine.release_vcpu_for_fork()?;
+        // Drop out of the kicker the instant the vCPU is gone: while parked we
+        // have no live vCPU, so another fork must not count us in `others` nor
+        // try to kick a destroyed vCPU.
+        self.kicker.unregister(self.this_tid);
+        fork_barrier().park_if_quiescing();
+        // Recreate the vCPU under the topology lock so vcpu_create cannot race
+        // another fork's hv_vm_destroy/create. Register only after it exists.
+        {
+            let _topo = crate::fork_quiesce::topology_lock()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            engine.rebuild_vcpu_after_fork()?;
+            self.register_vcpu(engine);
+        }
+        Ok(())
+    }
+
     fn trace_syscall(&self, traps: usize, frame: Aarch64SyscallFrame) {
         if !self.trace {
             return;
@@ -854,6 +876,10 @@ impl ThreadRuntimeState {
                         break Ok(DispatchOutcome::Returned { value: on_timeout });
                     }
                     crate::io_wait::WaitResult::Interrupted => {
+                        if crate::fork_quiesce::is_quiescing() {
+                            self.release_and_park_vcpu_for_fork(engine)?;
+                            continue;
+                        }
                         break Ok(DispatchOutcome::Errno {
                             errno: crate::linux_abi::LINUX_EINTR,
                         });
@@ -870,6 +896,10 @@ impl ThreadRuntimeState {
                         break Ok(DispatchOutcome::Returned { value: on_timeout });
                     }
                     crate::io_wait::WaitResult::Interrupted => {
+                        if crate::fork_quiesce::is_quiescing() {
+                            self.release_and_park_vcpu_for_fork(engine)?;
+                            continue;
+                        }
                         break Ok(DispatchOutcome::Errno {
                             errno: crate::linux_abi::LINUX_EINTR,
                         });
@@ -882,6 +912,10 @@ impl ThreadRuntimeState {
                         // Interrupted (signal/quiesce) → EINTR; the guest re-issues.
                         crate::io_wait::WaitResult::Interrupted
                         | crate::io_wait::WaitResult::TimedOut => {
+                            if crate::fork_quiesce::is_quiescing() {
+                                self.release_and_park_vcpu_for_fork(engine)?;
+                                continue;
+                            }
                             break Ok(DispatchOutcome::Errno {
                                 errno: crate::linux_abi::LINUX_EINTR,
                             });
@@ -914,19 +948,24 @@ impl ThreadRuntimeState {
     ) -> Result<i64, RuntimeError> {
         use crate::thread::FutexWaitOutcome;
 
-        let retval: i64 =
-            match self
-                .futex
-                .wait_prepared_for_thread(wait, timeout, self.this_tid, &|| {
-                    // Return (spurious EINTR) on a pending signal OR a fork
-                    // quiesce, so the thread reaches its run-loop-top barrier.
-                    crate::host_signal::has_pending_for(self.this_tid)
-                        || crate::fork_quiesce::is_quiescing()
-                }) {
-                FutexWaitOutcome::Woken => 0,
-                FutexWaitOutcome::TimedOut => -(crate::linux_abi::LINUX_ETIMEDOUT as i64),
-                FutexWaitOutcome::Interrupted => -(crate::linux_abi::LINUX_EINTR as i64),
-            };
+        let retval: i64 = loop {
+            let outcome =
+                match self
+                    .futex
+                    .wait_prepared_for_thread(wait, timeout, self.this_tid, &|| {
+                        crate::host_signal::has_pending_for(self.this_tid)
+                            || crate::fork_quiesce::is_quiescing()
+                    }) {
+                    FutexWaitOutcome::Woken => 0,
+                    FutexWaitOutcome::TimedOut => -(crate::linux_abi::LINUX_ETIMEDOUT as i64),
+                    FutexWaitOutcome::Interrupted if crate::fork_quiesce::is_quiescing() => {
+                        self.release_and_park_vcpu_for_fork(engine)?;
+                        continue;
+                    }
+                    FutexWaitOutcome::Interrupted => -(crate::linux_abi::LINUX_EINTR as i64),
+                };
+            break outcome;
+        };
         self.complete_returned(engine, retval)
     }
 
@@ -937,7 +976,16 @@ impl ThreadRuntimeState {
         value: u32,
         timeout: Option<Duration>,
     ) -> Result<i64, RuntimeError> {
-        let retval = shared_futex_wait(host_addr, value, timeout, self.this_tid);
+        let retval = loop {
+            let retval = shared_futex_wait(host_addr, value, timeout, self.this_tid);
+            if retval == -(crate::linux_abi::LINUX_EINTR as i64)
+                && crate::fork_quiesce::is_quiescing()
+            {
+                self.release_and_park_vcpu_for_fork(engine)?;
+                continue;
+            }
+            break retval;
+        };
         self.complete_returned(engine, retval)
     }
 
@@ -1130,20 +1178,28 @@ impl ThreadRuntimeState {
         // fork already holds the token, BLOCK rather than surfacing EAGAIN —
         // a multithreaded guest (Go's os/exec spawning concurrently) does not
         // retry a failed clone. Park at the in-flight fork's barrier so it can
-        // count this thread as quiesced and complete, then retry the token.
+        // count this thread as quiesced and complete, then retry the token. If
+        // this thread is already inside handle_fork, it will not reach the
+        // normal run-loop-top release path, so it must release its vCPU here
+        // before parking; otherwise the barrier counts it but hv_vm_destroy
+        // still sees its vCPU live.
         // This makes concurrent forks serialize transparently. The in-flight
         // forker is waiting on exactly this thread (live_count includes it), so
         // parking here can't deadlock it; once it ends the quiesce we wake and
         // win (or lose to a third forker and park again).
         while !fork_barrier().try_begin_fork() {
-            fork_barrier().park_if_quiescing();
+            if fork_barrier().is_quiescing() {
+                self.release_and_park_vcpu_for_fork(engine)?;
+            }
             std::thread::yield_now();
         }
         // Serialize VM topology against sibling vCPU creation for the whole
         // fork: while held, no thread can build a vCPU (they block in
         // spawn_clone_thread's critical section), so `hv_vm_destroy` below can't
         // race a being-born vCPU into HV_BUSY. Held until this function returns.
-        let _topology = crate::fork_quiesce::topology_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _topology = crate::fork_quiesce::topology_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Clear any VM published by a previous fork so siblings that release
         // their vCPUs this round see only THIS fork's republished VM (or, on a
         // quiesce abort, fall back to the still-live existing VM).
@@ -1170,17 +1226,21 @@ impl ThreadRuntimeState {
             self.kicker.kick_all_except(self.this_tid);
             self.futex.notify_signal_pending();
             crate::host_signal::wake_all_waiters();
-            if !barrier.wait_quiesced(others, std::time::Duration::from_secs(5)) {
+            while !barrier.wait_quiesced(others, Duration::from_millis(50)) {
                 crate::probes::fork_quiesce(
                     1,
                     others as i64,
                     barrier.paused_count() as i64,
                     self.this_tid,
                 );
-                barrier.end_quiesce();
-                barrier.end_fork();
-                engine.complete_syscall(-(crate::linux_abi::LINUX_EAGAIN as i64))?;
-                return Ok(None);
+                // Do not surface EAGAIN to the guest here. Go's os/exec does
+                // not retry a failed clone, and the in-flight fork is an
+                // internal Carrick serialization point rather than guest
+                // resource exhaustion. Keep nudging every wait class until all
+                // live vCPUs reach the barrier.
+                self.kicker.kick_all_except(self.this_tid);
+                self.futex.notify_signal_pending();
+                crate::host_signal::wake_all_waiters();
             }
             quiesced = true;
         }
@@ -1356,215 +1416,203 @@ fn run_vcpu_until_exit(
     // Run the vCPU loop in a closure so we can run vCPU cleanup on EVERY exit
     // path — `?` errors, early returns, and the trap-limit fall-through alike.
     let result: Result<VcpuLoopOutcome, RuntimeError> = (|| {
-    for traps in 1..=state.max_traps {
-        // Lock-safe point: no carrick lock is held here (each iteration acquires
-        // and releases its syscall's locks within the iteration). If another
-        // thread is forking a multithreaded guest, release this vCPU (so the
-        // forker can hv_vm_destroy), park until the fork completes, then
-        // recreate the vCPU in the parent's rebuilt VM and resume.
-        if fork_barrier().is_quiescing() {
-            engine.release_vcpu_for_fork()?;
-            // Drop out of the kicker the instant the vCPU is gone: while parked
-            // we have no live vCPU, so a concurrent fork must NOT count us in
-            // its `others` (we'd never reach the barrier from here) nor try to
-            // kick a destroyed vCPU.
-            state.kicker.unregister(state.this_tid);
-            fork_barrier().park_if_quiescing();
-            // Recreate the vCPU UNDER the topology lock so vcpu_create can't
-            // race another fork's hv_vm_destroy/create (HV_BUSY); we build in
-            // the VM that fork republished. Re-register only after it exists.
-            {
-                let _topo = crate::fork_quiesce::topology_lock()
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                engine.rebuild_vcpu_after_fork()?;
-                state.register_vcpu(&engine);
+        for traps in 1..=state.max_traps {
+            // Lock-safe point: no carrick lock is held here (each iteration acquires
+            // and releases its syscall's locks within the iteration). If another
+            // thread is forking a multithreaded guest, release this vCPU (so the
+            // forker can hv_vm_destroy), park until the fork completes, then
+            // recreate the vCPU in the parent's rebuilt VM and resume.
+            if fork_barrier().is_quiescing() {
+                state.release_and_park_vcpu_for_fork(&mut engine)?;
             }
-        }
-        // ---- vCPU run: NO dispatcher lock held ----
-        let frame = match engine.next_syscall() {
-            Ok(Some(f)) => f,
-            Ok(None) => {
-                // The vCPU was forced out of the guest by a cross-thread kick
-                // (hv_vcpus_exit) with no syscall pending — deliver a signal at
-                // the interrupted PC, then resume. A spurious kick with nothing
-                // deliverable just costs this one extra iteration.
-                let pc = engine.current_pc()?;
-                if let Some(outcome) = service_signals_threaded(
-                    &kernel,
-                    &mut engine,
-                    state.this_tid,
-                    None,
-                    Some(pc),
-                    traps,
-                )? {
-                    return Ok(outcome);
+            // ---- vCPU run: NO dispatcher lock held ----
+            let frame = match engine.next_syscall() {
+                Ok(Some(f)) => f,
+                Ok(None) => {
+                    // The vCPU was forced out of the guest by a cross-thread kick
+                    // (hv_vcpus_exit) with no syscall pending — deliver a signal at
+                    // the interrupted PC, then resume. A spurious kick with nothing
+                    // deliverable just costs this one extra iteration.
+                    let pc = engine.current_pc()?;
+                    if let Some(outcome) = service_signals_threaded(
+                        &kernel,
+                        &mut engine,
+                        state.this_tid,
+                        None,
+                        Some(pc),
+                        traps,
+                    )? {
+                        return Ok(outcome);
+                    }
+                    continue;
                 }
-                continue;
-            }
-            Err(TrapError::EL0Fault {
-                syndrome, elr, far, ..
-            }) => {
-                // A synchronous guest EL0 fault (nil deref, bad access). Deliver
-                // it to the guest as SIGSEGV/SIGBUS (Linux semantics) so its
-                // handler / Go's sigpanic runs, instead of killing the guest.
-                if let Some(outcome) = deliver_fault_signal(
-                    &kernel,
-                    &mut engine,
-                    state.this_tid,
-                    syndrome,
-                    elr,
-                    far,
-                    traps,
-                )? {
-                    return Ok(outcome);
+                Err(TrapError::EL0Fault {
+                    syndrome, elr, far, ..
+                }) => {
+                    // A synchronous guest EL0 fault (nil deref, bad access). Deliver
+                    // it to the guest as SIGSEGV/SIGBUS (Linux semantics) so its
+                    // handler / Go's sigpanic runs, instead of killing the guest.
+                    if let Some(outcome) = deliver_fault_signal(
+                        &kernel,
+                        &mut engine,
+                        state.this_tid,
+                        syndrome,
+                        elr,
+                        far,
+                        traps,
+                    )? {
+                        return Ok(outcome);
+                    }
+                    continue;
                 }
-                continue;
-            }
-            Err(e) => return Err(e.into()),
-        };
-        state.trace_syscall(traps, frame);
+                Err(e) => return Err(e.into()),
+            };
+            state.trace_syscall(traps, frame);
 
-        // ---- syscall service: no dispatcher-wide lock held ----
-        // A blocking-mode I/O syscall returns WaitOnFds; we then wait on the
-        // host fds without holding subsystem locks so sibling threads run.
-        // On readiness we re-dispatch; on timeout / signal we synthesize the
-        // terminal outcome.
-        let outcome = state.service_threaded_syscall(&kernel, &mut engine, frame)?;
+            // ---- syscall service: no dispatcher-wide lock held ----
+            // A blocking-mode I/O syscall returns WaitOnFds; we then wait on the
+            // host fds without holding subsystem locks so sibling threads run.
+            // On readiness we re-dispatch; on timeout / signal we synthesize the
+            // terminal outcome.
+            let outcome = state.service_threaded_syscall(&kernel, &mut engine, frame)?;
 
-        let mut last_syscall_retval: Option<i64> = None;
+            let mut last_syscall_retval: Option<i64> = None;
 
-        match outcome {
-            DispatchOutcome::WaitOnFds { .. }
-            | DispatchOutcome::WaitOnPollFds { .. }
-            | DispatchOutcome::WaitOnProcExit { .. } => {
-                unreachable!("serviced by the wait loop above")
-            }
-            DispatchOutcome::Exit { code } => {
-                crate::trap::dump_kick_stats();
-                // A forked child process (real macOS fork) exits via _exit so
-                // the rebuilt HVF context doesn't run the panicky Drops, and
-                // its buffered stdio is flushed to the inherited host fds.
-                if engine.is_forked_child() {
-                    crate::probes::guest_exit(code);
-                    forked_child_exit(code, kernel.dispatcher.stdout(), kernel.dispatcher.stderr());
+            match outcome {
+                DispatchOutcome::WaitOnFds { .. }
+                | DispatchOutcome::WaitOnPollFds { .. }
+                | DispatchOutcome::WaitOnProcExit { .. } => {
+                    unreachable!("serviced by the wait loop above")
                 }
-                // exit_group, or exit(2) as the last live thread. Tear the
-                // whole process down. For the main thread we return a
-                // RunResult; siblings just terminate the process.
-                let last = state.registry.exit(state.this_tid);
-                if !last && state.this_tid != (std::process::id() as ThreadId) {
-                    // A sibling ran exit_group(94): flush shared buffers and
-                    // terminate the entire process (other threads share it).
-                    let _ = std::io::Write::flush(&mut std::io::stdout());
-                    let _ = std::io::Write::flush(&mut std::io::stderr());
-                    let out = kernel.dispatcher.stdout();
-                    let err = kernel.dispatcher.stderr();
-                    let _ = unsafe { libc::write(1, out.as_ptr() as *const _, out.len()) };
-                    let _ = unsafe { libc::write(2, err.as_ptr() as *const _, err.len()) };
-                    unsafe { libc::_exit(code) };
+                DispatchOutcome::Exit { code } => {
+                    crate::trap::dump_kick_stats();
+                    // A forked child process (real macOS fork) exits via _exit so
+                    // the rebuilt HVF context doesn't run the panicky Drops, and
+                    // its buffered stdio is flushed to the inherited host fds.
+                    if engine.is_forked_child() {
+                        crate::probes::guest_exit(code);
+                        forked_child_exit(
+                            code,
+                            kernel.dispatcher.stdout(),
+                            kernel.dispatcher.stderr(),
+                        );
+                    }
+                    // exit_group, or exit(2) as the last live thread. Tear the
+                    // whole process down. For the main thread we return a
+                    // RunResult; siblings just terminate the process.
+                    let last = state.registry.exit(state.this_tid);
+                    if !last && state.this_tid != (std::process::id() as ThreadId) {
+                        // A sibling ran exit_group(94): flush shared buffers and
+                        // terminate the entire process (other threads share it).
+                        let _ = std::io::Write::flush(&mut std::io::stdout());
+                        let _ = std::io::Write::flush(&mut std::io::stderr());
+                        let out = kernel.dispatcher.stdout();
+                        let err = kernel.dispatcher.stderr();
+                        let _ = unsafe { libc::write(1, out.as_ptr() as *const _, out.len()) };
+                        let _ = unsafe { libc::write(2, err.as_ptr() as *const _, err.len()) };
+                        unsafe { libc::_exit(code) };
+                    }
+                    let result = assemble_run_result(&kernel, code, traps, false);
+                    return Ok(VcpuLoopOutcome::ProcessExit(Box::new(result)));
                 }
-                let result = assemble_run_result(&kernel, code, traps, false);
-                return Ok(VcpuLoopOutcome::ProcessExit(Box::new(result)));
-            }
-            DispatchOutcome::Returned { value } => {
-                last_syscall_retval = Some(state.complete_returned(&mut engine, value)?);
-            }
-            DispatchOutcome::Errno { errno } => {
-                last_syscall_retval = Some(state.complete_errno(&mut engine, errno)?);
-            }
-            DispatchOutcome::FutexWait { wait, timeout } => {
-                // Block with the dispatcher lock RELEASED so a sibling FUTEX_WAKE
-                // can run. The wait is interrupted if a signal becomes pending
-                // so even an all-threads-parked process delivers it; the
-                // ungated signal check below then runs. Re-lock only to
-                // complete the syscall.
-                last_syscall_retval =
-                    Some(state.complete_futex_wait(&mut engine, wait, timeout)?);
-            }
-            DispatchOutcome::SharedFutexWait {
-                host_addr,
-                value,
-                timeout,
-            } => {
-                // Cross-process futex (MAP_SHARED): block on the host __ulock
-                // keyed by the shared physical page, with the dispatcher lock
-                // released. Interruptible by a signal deliverable to this thread.
-                last_syscall_retval = Some(state.complete_shared_futex_wait(
-                    &mut engine,
+                DispatchOutcome::Returned { value } => {
+                    last_syscall_retval = Some(state.complete_returned(&mut engine, value)?);
+                }
+                DispatchOutcome::Errno { errno } => {
+                    last_syscall_retval = Some(state.complete_errno(&mut engine, errno)?);
+                }
+                DispatchOutcome::FutexWait { wait, timeout } => {
+                    // Block with the dispatcher lock RELEASED so a sibling FUTEX_WAKE
+                    // can run. The wait is interrupted if a signal becomes pending
+                    // so even an all-threads-parked process delivers it; the
+                    // ungated signal check below then runs. Re-lock only to
+                    // complete the syscall.
+                    last_syscall_retval =
+                        Some(state.complete_futex_wait(&mut engine, wait, timeout)?);
+                }
+                DispatchOutcome::SharedFutexWait {
                     host_addr,
                     value,
                     timeout,
-                )?);
-            }
-            DispatchOutcome::CloneThread {
-                stack,
-                tls,
-                flags: _,
-                parent_tid_addr,
-                child_tid_addr,
-            } => {
-                let tid = state.spawn_clone_thread(
-                    &kernel,
-                    &mut engine,
+                } => {
+                    // Cross-process futex (MAP_SHARED): block on the host __ulock
+                    // keyed by the shared physical page, with the dispatcher lock
+                    // released. Interruptible by a signal deliverable to this thread.
+                    last_syscall_retval = Some(state.complete_shared_futex_wait(
+                        &mut engine,
+                        host_addr,
+                        value,
+                        timeout,
+                    )?);
+                }
+                DispatchOutcome::CloneThread {
                     stack,
                     tls,
+                    flags: _,
                     parent_tid_addr,
                     child_tid_addr,
-                )?;
-                state.complete_returned(&mut engine, tid as i64)?;
-            }
-            DispatchOutcome::ThreadExit { code } => {
-                return Ok(state.handle_thread_exit(&kernel, &mut engine, code, traps));
-            }
-            DispatchOutcome::SignalThread {
-                tid: target,
-                signum,
-            } => {
-                last_syscall_retval =
-                    Some(state.complete_signal_thread(&mut engine, target, signum)?);
-            }
-            DispatchOutcome::Execve { path, argv, env } => {
-                state.handle_execve(&kernel, &mut engine, path, argv, env)?;
-            }
-            DispatchOutcome::SigReturn => {
-                let restored_sigmask = engine.restore_from_sigframe()?;
-                kernel
-                    .dispatcher
-                    .restore_signal_mask(state.this_tid, restored_sigmask);
-                // Deliver the next pending signal (if any) before resuming —
-                // the kernel delivers all deliverable pending signals before
-                // returning to userspace. The just-handled signal was cleared
-                // when delivered, so this can't re-deliver it.
-            }
-            DispatchOutcome::Fork { pidfd_out } => {
-                if let Some(retval) = state.handle_fork(&kernel, &mut engine, pidfd_out)? {
-                    last_syscall_retval = Some(state.complete_returned(&mut engine, retval)?);
+                } => {
+                    let tid = state.spawn_clone_thread(
+                        &kernel,
+                        &mut engine,
+                        stack,
+                        tls,
+                        parent_tid_addr,
+                        child_tid_addr,
+                    )?;
+                    state.complete_returned(&mut engine, tid as i64)?;
+                }
+                DispatchOutcome::ThreadExit { code } => {
+                    return Ok(state.handle_thread_exit(&kernel, &mut engine, code, traps));
+                }
+                DispatchOutcome::SignalThread {
+                    tid: target,
+                    signum,
+                } => {
+                    last_syscall_retval =
+                        Some(state.complete_signal_thread(&mut engine, target, signum)?);
+                }
+                DispatchOutcome::Execve { path, argv, env } => {
+                    state.handle_execve(&kernel, &mut engine, path, argv, env)?;
+                }
+                DispatchOutcome::SigReturn => {
+                    let restored_sigmask = engine.restore_from_sigframe()?;
+                    kernel
+                        .dispatcher
+                        .restore_signal_mask(state.this_tid, restored_sigmask);
+                    // Deliver the next pending signal (if any) before resuming —
+                    // the kernel delivers all deliverable pending signals before
+                    // returning to userspace. The just-handled signal was cleared
+                    // when delivered, so this can't re-deliver it.
+                }
+                DispatchOutcome::Fork { pidfd_out } => {
+                    if let Some(retval) = state.handle_fork(&kernel, &mut engine, pidfd_out)? {
+                        last_syscall_retval = Some(state.complete_returned(&mut engine, retval)?);
+                    }
                 }
             }
+
+            // Signal delivery. A signal targeted at THIS tid (guest tgkill/tkill)
+            // takes priority; otherwise a process-directed signal in the global
+            // slot is deliverable by any thread (valid Linux semantics — an
+            // arbitrary unblocking thread handles it). Threads parked in FUTEX_WAIT
+            // / blocking I/O interrupt on a pending-for-them signal and reach here
+            // too; a thread forced out of the guest by a kick (frame == None) lands
+            // here with `interrupted_pc` so the handler resumes at the right PC.
+            if let Some(outcome) = service_signals_threaded(
+                &kernel,
+                &mut engine,
+                state.this_tid,
+                last_syscall_retval,
+                None,
+                traps,
+            )? {
+                return Ok(outcome);
+            }
         }
 
-        // Signal delivery. A signal targeted at THIS tid (guest tgkill/tkill)
-        // takes priority; otherwise a process-directed signal in the global
-        // slot is deliverable by any thread (valid Linux semantics — an
-        // arbitrary unblocking thread handles it). Threads parked in FUTEX_WAIT
-        // / blocking I/O interrupt on a pending-for-them signal and reach here
-        // too; a thread forced out of the guest by a kick (frame == None) lands
-        // here with `interrupted_pc` so the handler resumes at the right PC.
-        if let Some(outcome) = service_signals_threaded(
-            &kernel,
-            &mut engine,
-            state.this_tid,
-            last_syscall_retval,
-            None,
-            traps,
-        )? {
-            return Ok(outcome);
-        }
-    }
-
-    let result = assemble_run_result(&kernel, -1, state.max_traps, true);
-    Ok(VcpuLoopOutcome::TrapLimit(Box::new(result)))
+        let result = assemble_run_result(&kernel, -1, state.max_traps, true);
+        Ok(VcpuLoopOutcome::TrapLimit(Box::new(result)))
     })();
     // This thread is leaving its vCPU loop. `HvfTrapEngine::drop` is a no-op, so
     // destroy the vCPU here on every path EXCEPT ProcessExit (the whole process
