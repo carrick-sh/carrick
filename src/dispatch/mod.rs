@@ -545,6 +545,21 @@ pub enum DispatchOutcome {
         /// is delivered after the syscall, per the persistent mask). `0` = none.
         block_signals: u64,
     },
+    /// Same contract as [`WaitOnFds`], but serviced by `poll(2)` instead of
+    /// the runtime's per-thread kqueue. This is for epoll's backing kqueue fd:
+    /// polling a kqueue fd observes pending epoll events without consuming
+    /// them, so the runtime can re-dispatch `epoll_pwait` and let that call
+    /// drain the epoll instance kqueue normally.
+    WaitOnPollFds {
+        /// (host_fd, poll events) pairs to wait on.
+        fds: Vec<(i32, i16)>,
+        /// `None` = wait forever (signal-interruptible).
+        timeout: Option<Duration>,
+        /// Value to complete the syscall with if the wait times out.
+        on_timeout: i64,
+        /// Signals (bit `signum-1`) temporarily blocked for the wait.
+        block_signals: u64,
+    },
 }
 
 impl DispatchOutcome {
@@ -571,6 +586,7 @@ impl DispatchOutcome {
             DispatchOutcome::FutexWait { .. } => (0, None),
             DispatchOutcome::SharedFutexWait { .. } => (0, None),
             DispatchOutcome::WaitOnFds { .. } => (0, None),
+            DispatchOutcome::WaitOnPollFds { .. } => (0, None),
         }
     }
 }

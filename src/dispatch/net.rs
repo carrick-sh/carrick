@@ -339,8 +339,7 @@ impl SyscallDispatcher {
                     }
                     let guest_fd = ev.udata_i32();
                     if let Some((_, slot)) = interests.iter().find(|(f, _)| *f == guest_fd) {
-                        let masked =
-                            bits & (slot.event.events | LINUX_EPOLLHUP | LINUX_EPOLLERR);
+                        let masked = bits & (slot.event.events | LINUX_EPOLLHUP | LINUX_EPOLLERR);
                         if masked != 0 {
                             let entry = acc.entry(guest_fd).or_insert((0, slot.event.data));
                             entry.0 |= masked;
@@ -423,10 +422,12 @@ impl SyscallDispatcher {
                 Some(Duration::from_millis(timeout_ms as u64))
             };
             crate::probes::epoll_result(epfd, 0, 1, timeout_ms, 1);
-            // Block on the instance kqueue's own fd becoming readable: it does so
-            // the instant ANY registered filter fires (incl. an fd ADDed by
-            // another thread) or the in-memory wake triggers EVFILT_USER(0).
-            return Ok(DispatchOutcome::WaitOnFds {
+            crate::probes::epoll_wait_fd(epfd, -1, kq_fd, libc::POLLIN as i32, timeout_ms);
+            // Poll the instance kqueue fd for readability. This avoids nesting
+            // the epoll kqueue inside the per-thread kqueue, and unlike calling
+            // kevent() here it does not consume pending epoll events before the
+            // re-dispatched epoll_pwait can copy them out.
+            return Ok(DispatchOutcome::WaitOnPollFds {
                 fds: vec![(kq_fd, libc::POLLIN)],
                 timeout,
                 on_timeout: 0,
@@ -827,7 +828,10 @@ impl SyscallDispatcher {
             if sigsetsize != crate::linux_abi::LINUX_RT_SIGSET_SIZE {
                 return Ok(LINUX_EINVAL.into());
             }
-            match memory.read_bytes(sigmask_addr, crate::linux_abi::LINUX_RT_SIGSET_SIZE as usize) {
+            match memory.read_bytes(
+                sigmask_addr,
+                crate::linux_abi::LINUX_RT_SIGSET_SIZE as usize,
+            ) {
                 Ok(bytes) => {
                     let mut le = [0u8; 8];
                     le.copy_from_slice(&bytes[..8]);
@@ -994,9 +998,7 @@ impl SyscallDispatcher {
                 // iff counter > 0), so epoll/poll/select watch it natively via
                 // EVFILT_READ/POLLIN — no in-memory recompute or EVFILT_USER
                 // broadcast needed (the robust path for Go's netpollBreak).
-                OpenDescription::EventFd { state, .. } if state.read_fd >= 0 => {
-                    Some(state.read_fd)
-                }
+                OpenDescription::EventFd { state, .. } if state.read_fd >= 0 => Some(state.read_fd),
                 _ => None,
             };
         }
