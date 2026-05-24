@@ -2227,16 +2227,37 @@ fn dispatch_threaded_futex(
                 }
             };
             if let Some(host_addr) = shared_host_addr {
+                // The shared path's compare-and-wait is atomic in the kernel
+                // (__ulock UL_COMPARE_AND_WAIT re-checks the word), so no
+                // generation snapshot is needed here.
                 return DispatchOutcome::SharedFutexWait {
                     host_addr,
                     value,
                     timeout,
                 };
             }
-            DispatchOutcome::FutexWait {
-                wait: futex.prepare_wait(address),
-                timeout,
+            // Private/anon futex: snapshot the wait generation BEFORE
+            // re-validating the word, then re-read the word. This closes a
+            // lost-wakeup race — capturing the generation only at park time
+            // (i.e. after the value was read at the top of the handler) loses a
+            // FUTEX_WAKE delivered in the window between that read and the
+            // enqueue: the waker bumps the generation, the waiter then captures
+            // the ALREADY-bumped value and sleeps forever. With the snapshot
+            // first, a racing wake either advances the captured generation (the
+            // wait returns Woken) or has already stored the new word value (the
+            // re-read mismatches → EAGAIN, no stale park). High-frequency Go
+            // scheduler M park/unpark hit this window and intermittently hung.
+            let wait = futex.prepare_wait(address);
+            match read_u32(memory, address) {
+                Ok(reread) if reread != value => {
+                    return DispatchOutcome::Errno {
+                        errno: LINUX_EAGAIN,
+                    };
+                }
+                Ok(_) => {}
+                Err(errno) => return DispatchOutcome::Errno { errno },
             }
+            DispatchOutcome::FutexWait { wait, timeout }
         }
         LINUX_FUTEX_REQUEUE | LINUX_FUTEX_CMP_REQUEUE => {
             // FUTEX_(CMP_)REQUEUE moves parked waiters between futex queues.
