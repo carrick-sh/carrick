@@ -104,6 +104,7 @@ static THREAD_PENDING: LazyLock<Mutex<HashMap<i32, i32>>> =
 /// call it only from normal dispatch context, which is the only place a guest
 /// tid is known.
 pub fn publish_pending_for(tid: i32, signum: i32) {
+    crate::probes::signal_publish(tid, signum, 1);
     #[allow(clippy::expect_used)]
     THREAD_PENDING
         .lock()
@@ -619,6 +620,9 @@ pub fn has_pending() -> bool {
 /// `kill(self, SIGINT)`). Lets the runtime's signal-injection path
 /// service synthetic raises the same way it services host SIGINT.
 pub fn raise_for_self(signum: i32) {
+    // Dispatch context (not a signal handler), so the probe is safe here —
+    // unlike `publish_pending` itself, which a host handler also calls.
+    crate::probes::signal_publish(0, signum, 0);
     publish_pending(signum);
 }
 

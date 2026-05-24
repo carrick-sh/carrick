@@ -199,6 +199,33 @@ the lightest targeted script + many runs).
 
 ---
 
+## 4b. Signal-delivery edge cases (found via the c>=20 probes; NOT Go-blocking)
+
+Investigating the c>=20 corruption (§4, FIXED by per-thread sigaltstack) surfaced
+two adjacent signal-DELIVERY bugs via probes. Neither is on Go's SIGURG path
+(Go preempts RUNNING Ms cross-thread, which works — the fixture passes), so they
+are follow-ups, not blockers. Regression guards: `selfraise` (single-threaded
+self-raise — PASSES), `altstacktid` (per-thread sigaltstack storage — PASSES).
+
+- **Cross-thread signal to a futex/`pthread_join`-blocked thread doesn't deliver
+  the handler.** A `pthread_kill(target, SIGUSR1)` where `target` is blocked in
+  `pthread_join` (futex wait) routes via `route_thread_signal` →
+  `SignalThread`/`publish_pending_for(target)` + kick, but the handler never
+  injects (the first `altstacktid` probe: `handled=false`). Single-threaded
+  self-raise and cross-thread-to-a-RUNNING-sibling (Go's path) both work. Likely
+  the futex-wait wake-for-thread-directed-signal → delivery boundary is missed
+  for a `pthread_join`-blocked thread specifically. Investigate the futex-wait
+  interrupt → `deliver_pending_signal` path for a thread-directed (not
+  process-directed) pending signal.
+- **(Watch) cross-thread kick-path altstack:** the sibling-signal `altstacktid`
+  variant showed `on_own=false` (handler not on the sibling's own alt stack)
+  while the Go fixture shows distinct per-thread `new_sp` + 0 faults — likely a
+  probe-timing artifact (storage is correct per the GET probe), but re-confirm if
+  a real workload regresses.
+
+`getpid`/`gettid`/`main_tid`/`this_tid` are all `std::process::id()` (consistent
+— ruled out as the cause).
+
 ## 5. epoll_wait03: EFAULT on a read-only events buffer (DESIGN — niche)
 
 **Problem.** LTP `epoll_wait03` maps the `events` output buffer `PROT_READ` and

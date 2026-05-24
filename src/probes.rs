@@ -53,6 +53,18 @@ mod carrick_usdt {
     /// near-zero hot-path overhead (it never fires on the happy path). The key
     /// diagnostic for the c>=20 sibling-vCPU corruption faults.
     fn vcpu__fault(_: u64, _: u64, _: u64, _: u64, _: u64, _: i32) {}
+    /// Fires when a signal is published for later delivery. `target_tid` is the
+    /// guest tid for a thread-directed signal (tkill/tgkill route) or 0 for a
+    /// process-directed one; `signum` the Linux signum; `kind` 1=thread-directed
+    /// 0=process-directed. Lets `carrick trace` see WHERE a signal was routed
+    /// (vs which tid actually drains it via `signal-deliver`) — the missing
+    /// visibility for the cross-thread / blocked-thread delivery bugs.
+    fn signal__publish(_: i32, _: i32, _: i32) {}
+    /// Fires at each `deliver_pending_signal` cycle. `tid` is the delivering
+    /// thread; `pending` the signum it drained (0 = nothing deliverable to it).
+    /// Pair with `signal-publish` to see a signal published for tid X but never
+    /// drained by X (the routing/tid-mismatch and blocked-thread cases).
+    fn signal__deliver(_: i32, _: i32) {}
     /// Fires when `execve_into` has finished swapping the engine to
     /// the new image. `path`, `entry`, `initial_sp`, `mapping_count`
     /// let dtrace operators verify the new process layout.
@@ -274,6 +286,16 @@ pub fn execve_sysregs(sctlr: u64, ttbr0: u64, mair: u64) {
 /// `vcpu__fault` provider doc. Cheap: only fires at the fault.
 pub fn vcpu_fault(esr: u64, elr: u64, far: u64, x30: u64, sp: u64, tid: i32) {
     carrick_usdt::vcpu__fault!(|| (esr, elr, far, x30, sp, tid));
+}
+
+/// A signal was published for delivery. See `signal__publish`.
+pub fn signal_publish(target_tid: i32, signum: i32, kind: i32) {
+    carrick_usdt::signal__publish!(|| (target_tid, signum, kind));
+}
+
+/// A `deliver_pending_signal` cycle ran. See `signal__deliver`.
+pub fn signal_deliver(tid: i32, pending: i32) {
+    carrick_usdt::signal__deliver!(|| (tid, pending));
 }
 
 pub fn register_dtrace_probes() -> Result<(), usdt::Error> {
