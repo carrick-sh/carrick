@@ -138,6 +138,9 @@ pub trait SyscallTrap {
         interrupted_pc: Option<u64>,
         altstack: Option<(u64, u64)>,
         saved_sigmask: u64,
+        // Some((si_code, si_addr)) for a synchronous fault (SIGSEGV/SIGBUS),
+        // None for a SI_USER-shaped delivery.
+        fault_siginfo: Option<(i32, u64)>,
     ) -> Result<(), TrapError>;
     /// Restore vCPU state from the `CarrickSigframe` at SP_EL0. Called
     /// when the guest invokes `rt_sigreturn(2)`. Does NOT advance PC
@@ -1185,9 +1188,9 @@ fn run_vcpu_until_exit(
     state.register_vcpu(&engine);
     for traps in 1..=state.max_traps {
         // ---- vCPU run: NO dispatcher lock held ----
-        let frame = match engine.next_syscall()? {
-            Some(f) => f,
-            None => {
+        let frame = match engine.next_syscall() {
+            Ok(Some(f)) => f,
+            Ok(None) => {
                 // The vCPU was forced out of the guest by a cross-thread kick
                 // (hv_vcpus_exit) with no syscall pending — deliver a signal at
                 // the interrupted PC, then resume. A spurious kick with nothing
@@ -1205,6 +1208,26 @@ fn run_vcpu_until_exit(
                 }
                 continue;
             }
+            Err(TrapError::EL0Fault {
+                syndrome, elr, far, ..
+            }) => {
+                // A synchronous guest EL0 fault (nil deref, bad access). Deliver
+                // it to the guest as SIGSEGV/SIGBUS (Linux semantics) so its
+                // handler / Go's sigpanic runs, instead of killing the guest.
+                if let Some(outcome) = deliver_fault_signal(
+                    &kernel,
+                    &mut engine,
+                    state.this_tid,
+                    syndrome,
+                    elr,
+                    far,
+                    traps,
+                )? {
+                    return Ok(outcome);
+                }
+                continue;
+            }
+            Err(e) => return Err(e.into()),
         };
         state.trace_syscall(traps, frame);
 
@@ -1505,6 +1528,7 @@ where
                 interrupted_pc,
                 altstack,
                 saved_sigmask,
+                None, // SI_USER-shaped (tkill/sysmon); faults use deliver_fault_signal
             )?;
             Ok(Some(PendingSignalAction { term_signal: None }))
         }
@@ -1543,6 +1567,109 @@ fn service_signals_threaded(
         let result = assemble_run_result(kernel, 128 + signum, traps, false);
         return Ok(Some(VcpuLoopOutcome::ProcessExit(Box::new(result))));
     }
+    Ok(None)
+}
+
+/// Map an EL0 synchronous-fault `ESR_EL1` to the Linux `(signum, si_code)` the
+/// kernel would deliver, or `None` for a class we don't translate (kept fatal).
+/// ESR EC: 0x20/0x21 = instruction abort, 0x24/0x25 = data abort. DFSC (low 6
+/// bits): 0b0001LL translation fault → SEGV_MAPERR; 0b0011LL permission fault →
+/// SEGV_ACCERR; 0b100001 alignment → SIGBUS/BUS_ADRALN.
+fn el0_fault_signal(esr: u64) -> Option<(i32, i32)> {
+    const SIGSEGV: i32 = 11;
+    const SIGBUS: i32 = 7;
+    const SEGV_MAPERR: i32 = 1;
+    const SEGV_ACCERR: i32 = 2;
+    const BUS_ADRALN: i32 = 1;
+    let ec = (esr >> 26) & 0x3f;
+    let dfsc = esr & 0x3f;
+    let segv_code = if (0x0c..=0x0f).contains(&dfsc) {
+        SEGV_ACCERR
+    } else {
+        SEGV_MAPERR
+    };
+    match ec {
+        0x20 | 0x21 => Some((SIGSEGV, segv_code)), // instruction abort
+        0x24 | 0x25 => {
+            if dfsc == 0x21 {
+                Some((SIGBUS, BUS_ADRALN)) // alignment fault
+            } else {
+                Some((SIGSEGV, segv_code))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Deliver a synchronous guest EL0 fault as a Linux signal (SIGSEGV/SIGBUS with
+/// `si_addr` = faulting address), exactly as the kernel does — so Go's
+/// nil-deref→sigpanic→recover idiom (and any guest SIGSEGV handler) works
+/// instead of carrick killing the guest. Returns `Some(outcome)` to terminate
+/// (no handler, signal blocked, or untranslatable fault — Linux forces the
+/// default action), `None` to resume into the injected handler. `elr` is the
+/// faulting instruction's PC (resumed unless the handler advances it).
+fn deliver_fault_signal(
+    kernel: &Kernel,
+    engine: &mut HvfTrapEngine,
+    this_tid: ThreadId,
+    esr: u64,
+    elr: u64,
+    far: u64,
+    traps: usize,
+) -> Result<Option<VcpuLoopOutcome>, RuntimeError> {
+    let dispatcher = &kernel.dispatcher;
+    let terminate = |signum: i32| -> Result<Option<VcpuLoopOutcome>, RuntimeError> {
+        if engine.is_forked_child() {
+            let out = dispatcher.stdout();
+            let err = dispatcher.stderr();
+            forked_child_die_by_signal(signum, &out, &err);
+        }
+        let result = assemble_run_result(kernel, 128 + signum, traps, false);
+        Ok(Some(VcpuLoopOutcome::ProcessExit(Box::new(result))))
+    };
+
+    // Untranslatable fault (EC=0 unknown, FP trap, …): default to SIGSEGV
+    // termination so it's still fatal+visible, but with proper exit semantics.
+    let Some((signum, si_code)) = el0_fault_signal(esr) else {
+        return terminate(11);
+    };
+    crate::probes::signal_deliver(this_tid, signum);
+
+    // A synchronous fault with the signal blocked, or no handler installed,
+    // forces the default action (terminate) on Linux.
+    let action = dispatcher.registered_signal_handler(signum);
+    if dispatcher.signal_blocked(this_tid, signum) || action.is_none() {
+        return terminate(signum);
+    }
+    let action = action.unwrap();
+    let restorer = if action.sa_flags & crate::linux_abi::LINUX_SA_RESTORER != 0 {
+        action.sa_restorer
+    } else {
+        0
+    };
+    let altstack = if action.sa_flags & crate::linux_abi::LINUX_SA_ONSTACK != 0 {
+        dispatcher.signal_altstack(this_tid)
+    } else {
+        None
+    };
+    let saved_sigmask = dispatcher.enter_signal_handler(this_tid, signum, action);
+    // The fault trapped via the EL1 HVC trampoline (like a syscall): ELR_EL1
+    // already holds the faulting EL0 instruction (aborts don't advance it), and
+    // there's a pending eret to EL0. So use the syscall-boundary form
+    // (`interrupted_pc=None`): inject sets the handler via ELR_EL1 and snapshots
+    // saved_pc=ELR_EL1=the faulting instruction (re-run on return unless the
+    // handler advances it, e.g. Go's sigpanic). `elr` is kept for the probe.
+    let _ = elr;
+    engine.inject_signal(
+        signum,
+        action.sa_handler,
+        restorer,
+        None,
+        None,
+        altstack,
+        saved_sigmask,
+        Some((si_code, far)),
+    )?;
     Ok(None)
 }
 
@@ -1956,6 +2083,7 @@ impl SyscallTrap for HvfTrapEngine {
         interrupted_pc: Option<u64>,
         altstack: Option<(u64, u64)>,
         saved_sigmask: u64,
+        fault_siginfo: Option<(i32, u64)>,
     ) -> Result<(), TrapError> {
         HvfTrapEngine::inject_signal(
             self,
@@ -1966,6 +2094,7 @@ impl SyscallTrap for HvfTrapEngine {
             interrupted_pc,
             altstack,
             saved_sigmask,
+            fault_siginfo,
         )
     }
 
