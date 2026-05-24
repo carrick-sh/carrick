@@ -421,6 +421,41 @@ git add docs/superpowers/go-conformance-baseline.md
 git commit -m "docs(go-conformance): os/exec passes after multithreaded fork support"
 ```
 
+## PROGRESS (2026-05-24) — quiesce done; HVF vCPU teardown is the last layer
+
+Tasks 1–3 + the wait-predicate quiescing are **implemented, committed, and
+incrementally validated** against `os/exec` TestEcho:
+
+- `clone(CLONE_VM|CLONE_VFORK|CLONE_PIDFD)` from multithreaded Go: ENOSYS →
+  (quiesce timeout) EAGAIN → **quiesce now completes** (all sibling threads park
+  at the run-loop-top barrier).
+- The fork is now ATTEMPTED. New, deeper error: **HV_BUSY (`0xfae94002`) in
+  `engine.fork()`'s pre-fork `hv_vm_destroy()`** — the parked sibling threads
+  still hold their HVF vCPUs, and `hv_vm_destroy` refuses while vCPUs exist.
+
+**The remaining layer — vCPU release/rebuild across the barrier (Task 3b):**
+`engine.fork()` tears down HVF (`hv_vcpu_destroy` + `hv_vm_destroy`) before
+`libc::fork` (HVF state isn't fork-safe). With siblings, the teardown must
+account for THEIR vCPUs too. Protocol:
+
+1. Sibling at the barrier (in `park_if_quiescing` / the run loop): snapshot its
+   vCPU registers, `hv_vcpu_destroy` its own vCPU, mark "vCPU released"
+   (a second barrier counter), then park.
+2. Forking thread waits for `released == others` (not just `paused`), then does
+   the existing own-vCPU + VM teardown (now succeeds — no live vCPUs) and forks.
+3. **Parent**: rebuild the VM (existing path), then publish the new VM handle to
+   the siblings and signal "VM ready"; each sibling `hv_vcpu_create`s in the new
+   VM, restores its snapshot (like `from_thread_spec`), and resumes.
+4. **Child**: single-threaded — the existing rebuild (own vCPU + VM); siblings
+   don't exist, so nothing to recreate.
+
+Key difficulty: the **shared VM handle** (`HvfInner._vm`, an `Arc` shared with
+thread siblings via `from_thread_spec`) changes across the parent's rebuild, so
+siblings must pick up the NEW handle — needs a shared cell (e.g.
+`Arc<Mutex<Option<VmHandle>>>`) the barrier publishes. This is an HVF-lifecycle
+change touching `trap.rs` `fork()`/`from_thread_spec` and the sibling run loop;
+it should be designed as its own careful step (Task 3b) — do NOT rush it.
+
 ## Self-review
 
 - **Spec coverage:** QuiesceBarrier (T1), run-loop park + global (T2), handle_fork quiesce/resume + child reset (T3), CLONE_PIDFD + waitid (T4), probe (T5), validation + no-regression (T6). All spec sections covered. The wait-predicate quiescing wake is realized via the existing `futex.notify_signal_pending()` + `host_signal` waiter wake in T3 Step 1/4 (blocked waiters return to the run-loop top and park there) — no separate predicate change needed, since the run-loop-top park is the single quiesce point.
