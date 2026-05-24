@@ -77,7 +77,16 @@ const AARCH64_VECTOR_LOWER_EL_SYNC_OFFSET: usize = 0x400;
 pub const LINUX_HEAP_BASE: u64 = 0x40_0000_0000; // 256 GiB
 pub const LINUX_HEAP_SIZE: u64 = 128 * 1024 * 1024; // 128 MiB
 pub const LINUX_MMAP_BASE: u64 = 0x60_0000_0000; // 384 GiB
-pub const LINUX_MMAP_SIZE: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB runtime mmap arena.
+// 32 GiB runtime mmap arena. The region is lazily backed (HVF demand-zeroes
+// touched pages; PROT_NONE reservations are never touched and cost nothing), so
+// the size is virtual-address-space, not RAM. A multithreaded Go program
+// reserves heap in many 64 MiB arena chunks plus per-thread stacks — at
+// concurrency it requested >7 GiB of address space and overran the old 2 GiB
+// arena, so the guest's pthread_create stack mmap got ENOMEM (surfaced by cgo
+// as "pthread_create failed: Resource temporarily unavailable"). 32 GiB fits
+// below the interpreter base (512 GiB) and within the L1A page tables. (Still a
+// non-reclaiming bump allocator; reclaiming munmap'd space is a follow-up.)
+pub const LINUX_MMAP_SIZE: u64 = 32 * 1024 * 1024 * 1024;
 pub const LINUX_INTERPRETER_BASE: u64 = 0x80_0000_0000; // 512 GiB
 // Dedicated, initially-UNMAPPED window for real MAP_SHARED file mappings.
 // Each such mmap is backed by a libc MAP_SHARED mmap of the host file,

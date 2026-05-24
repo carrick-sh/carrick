@@ -278,7 +278,7 @@ impl SyscallDispatcher {
         })
     }
 
-    fn next_mmap_address(&self, requested: u64, length: u64, prot: u64, flags: u64) -> Option<u64> {
+    fn next_mmap_address(&self, requested: u64, length: u64, _prot: u64, flags: u64) -> Option<u64> {
         if flags & LINUX_MAP_FIXED != 0 {
             // Bootstrap policy: accept MAP_FIXED at any page-aligned guest
             // address that fits in the configured IPA window. We do not
@@ -292,8 +292,6 @@ impl SyscallDispatcher {
             return Some(requested);
         }
 
-        let prot_none = prot & (LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC) == 0;
-        let anonymous_private = flags & LINUX_MAP_ANONYMOUS != 0 && flags & LINUX_MAP_PRIVATE != 0;
         if requested != 0 {
             let valid_hint = requested.is_multiple_of(LINUX_PAGE_SIZE)
                 && range_within(requested, length, LINUX_MMAP_BASE, LINUX_MMAP_SIZE);
@@ -304,9 +302,17 @@ impl SyscallDispatcher {
                     mem.mmap_next = end;
                     return Some(requested);
                 }
-            } else if prot_none && anonymous_private {
-                return None;
             }
+            // An out-of-window hint is ADVISORY without MAP_FIXED (POSIX), so we
+            // relocate the mapping into the arena rather than failing. This is
+            // what lets Go's heap-arena reservations work: Go probes PROT_NONE
+            // anonymous hints across the 64-bit space (256 GiB → 1.5+ TiB, far
+            // beyond our IPA/page-table coverage); honoring the *first* by
+            // relocating it into the arena makes Go accept the returned address
+            // and stop probing, instead of ENOMEM-ing every hint and stalling.
+            // Oversized reservations still ENOMEM via the arena bounds check
+            // below, so a pathological multi-hundred-GiB reservation can't
+            // exhaust the arena silently.
         }
 
         let mut mem = self.mem.lock();
