@@ -22,6 +22,19 @@ pub(crate) fn is_quiescing() -> bool {
     barrier().is_quiescing()
 }
 
+/// Serializes HVF VM-topology mutations: a sibling thread building its vCPU vs.
+/// a fork tearing the VM down and rebuilding it. Both hold this for the
+/// duration of their critical section, so a vCPU can never be created in the
+/// window where the forker calls `hv_vm_destroy` (which would be HV_BUSY), and
+/// a thread born during a fork waits and then builds in the *rebuilt* VM. A
+/// being-born thread holding this lock is NOT yet in the vCPU kicker, so the
+/// fork's quiesce (which waits only on kicker-registered vCPUs) never waits on
+/// it — no deadlock.
+pub(crate) fn topology_lock() -> &'static Mutex<()> {
+    static L: OnceLock<Mutex<()>> = OnceLock::new();
+    L.get_or_init(|| Mutex::new(()))
+}
+
 #[derive(Debug)]
 pub(crate) struct QuiesceBarrier {
     quiescing: AtomicBool,

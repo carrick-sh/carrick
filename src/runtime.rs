@@ -987,8 +987,18 @@ impl ThreadRuntimeState {
                 if trace {
                     eprintln!("[sibling tid#{tid}] thread started, building vCPU");
                 }
+                // Build the vCPU + register it in the kicker UNDER the topology
+                // lock, so this is atomic w.r.t. a fork's VM teardown: a fork
+                // either sees this vCPU in the kicker (and waits for it to park)
+                // or hasn't released the lock yet (so we build in the REBUILT VM
+                // afterwards). Never create a vCPU in a VM a fork is destroying.
+                let topo = crate::fork_quiesce::topology_lock()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 match HvfTrapEngine::from_thread_spec(spec) {
                     Ok(child_engine) => {
+                        child_kicker.register(tid, child_engine.vcpu_kick_handle());
+                        drop(topo);
                         if trace {
                             let pc = child_engine.program_counter().unwrap_or(0);
                             eprintln!("[sibling tid#{tid}] vCPU built, pc={pc:#x}, entering loop");
@@ -1015,6 +1025,7 @@ impl ThreadRuntimeState {
                         }
                     }
                     Err(e) => {
+                        drop(topo);
                         tracing::error!(tid, error = %e, "thread sibling vCPU failed to start");
                         child_registry.exit(tid);
                     }
@@ -1066,6 +1077,10 @@ impl ThreadRuntimeState {
             let result = assemble_run_result(kernel, code, traps, false);
             VcpuLoopOutcome::ProcessExit(Box::new(result))
         } else {
+            // A sibling thread is going away but the process lives on: destroy
+            // its vCPU now (the no-op Drop won't), else it leaks live and a
+            // later fork's hv_vm_destroy hits HV_BUSY on the dead thread's vCPU.
+            engine.destroy_vcpu_on_thread_exit();
             VcpuLoopOutcome::ThreadDone
         }
     }
@@ -1124,6 +1139,11 @@ impl ThreadRuntimeState {
             fork_barrier().park_if_quiescing();
             std::thread::yield_now();
         }
+        // Serialize VM topology against sibling vCPU creation for the whole
+        // fork: while held, no thread can build a vCPU (they block in
+        // spawn_clone_thread's critical section), so `hv_vm_destroy` below can't
+        // race a being-born vCPU into HV_BUSY. Held until this function returns.
+        let _topology = crate::fork_quiesce::topology_lock().lock().unwrap_or_else(|e| e.into_inner());
         // Clear any VM published by a previous fork so siblings that release
         // their vCPUs this round see only THIS fork's republished VM (or, on a
         // quiesce abort, fall back to the still-live existing VM).
@@ -1132,7 +1152,13 @@ impl ThreadRuntimeState {
         // guest vCPU thread is first paused at its lock-safe run-loop top, so
         // the child (which has only THIS thread after libc::fork) doesn't
         // inherit a carrick lock held by a thread that won't exist in it.
-        let others = self.registry.live_count().saturating_sub(1);
+        // Count the OTHER threads with a LIVE vCPU (kicker-registered) — not the
+        // registry's live_count, which includes a sibling that has a tid but
+        // hasn't built its vCPU yet (it holds the topology lock we now own, so
+        // it's blocked before vcpu_create and has nothing to quiesce). Counting
+        // it would make wait_quiesced wait for a thread that can't park.
+        let others = self.kicker.count().saturating_sub(1);
+        crate::probes::fork_quiesce(0, others as i64, self.kicker.count() as i64, self.this_tid);
         let mut quiesced = false;
         if others > 0 {
             let barrier = fork_barrier();
@@ -1145,14 +1171,12 @@ impl ThreadRuntimeState {
             self.futex.notify_signal_pending();
             crate::host_signal::wake_all_waiters();
             if !barrier.wait_quiesced(others, std::time::Duration::from_secs(5)) {
-                if std::env::var_os("CARRICK_FORK_DEBUG").is_some() {
-                    eprintln!(
-                        "[fork] quiesce TIMEOUT: others={others} paused={} live_count={} tid={}",
-                        barrier.paused_count(),
-                        self.registry.live_count(),
-                        self.this_tid,
-                    );
-                }
+                crate::probes::fork_quiesce(
+                    1,
+                    others as i64,
+                    barrier.paused_count() as i64,
+                    self.this_tid,
+                );
                 barrier.end_quiesce();
                 barrier.end_fork();
                 engine.complete_syscall(-(crate::linux_abi::LINUX_EAGAIN as i64))?;
@@ -1189,6 +1213,11 @@ impl ThreadRuntimeState {
                     .fork
                     .restart_after_parent_fork(prepared_fork, &self.kicker, &self.futex);
                 self.waiter = crate::io_wait::ThreadWaiter::new(self.this_tid);
+                // engine.fork() rebuilt this thread's own vCPU, so its old
+                // kicker handle is stale. Re-register the new one (under the
+                // topology lock we still hold) — otherwise a later fork can't
+                // kick this thread out of the guest and it never quiesces.
+                self.register_vcpu(engine);
                 // CLONE_PIDFD: allocate a pidfd for the new child and write its
                 // fd to the guest pidfd-out pointer. The child's pid mirrors a
                 // real host pid, so the pidfd watches it via EVFILT_PROC.
@@ -1324,6 +1353,9 @@ fn run_vcpu_until_exit(
 ) -> Result<VcpuLoopOutcome, RuntimeError> {
     let mut state = ThreadRuntimeState::new(registry, futex, this_tid, threads, kicker, max_traps);
     state.register_vcpu(&engine);
+    // Run the vCPU loop in a closure so we can run vCPU cleanup on EVERY exit
+    // path — `?` errors, early returns, and the trap-limit fall-through alike.
+    let result: Result<VcpuLoopOutcome, RuntimeError> = (|| {
     for traps in 1..=state.max_traps {
         // Lock-safe point: no carrick lock is held here (each iteration acquires
         // and releases its syscall's locks within the iteration). If another
@@ -1332,9 +1364,22 @@ fn run_vcpu_until_exit(
         // recreate the vCPU in the parent's rebuilt VM and resume.
         if fork_barrier().is_quiescing() {
             engine.release_vcpu_for_fork()?;
+            // Drop out of the kicker the instant the vCPU is gone: while parked
+            // we have no live vCPU, so a concurrent fork must NOT count us in
+            // its `others` (we'd never reach the barrier from here) nor try to
+            // kick a destroyed vCPU.
+            state.kicker.unregister(state.this_tid);
             fork_barrier().park_if_quiescing();
-            engine.rebuild_vcpu_after_fork()?;
-            state.register_vcpu(&engine);
+            // Recreate the vCPU UNDER the topology lock so vcpu_create can't
+            // race another fork's hv_vm_destroy/create (HV_BUSY); we build in
+            // the VM that fork republished. Re-register only after it exists.
+            {
+                let _topo = crate::fork_quiesce::topology_lock()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                engine.rebuild_vcpu_after_fork()?;
+                state.register_vcpu(&engine);
+            }
         }
         // ---- vCPU run: NO dispatcher lock held ----
         let frame = match engine.next_syscall() {
@@ -1520,6 +1565,20 @@ fn run_vcpu_until_exit(
 
     let result = assemble_run_result(&kernel, -1, state.max_traps, true);
     Ok(VcpuLoopOutcome::TrapLimit(Box::new(result)))
+    })();
+    // This thread is leaving its vCPU loop. `HvfTrapEngine::drop` is a no-op, so
+    // destroy the vCPU here on every path EXCEPT ProcessExit (the whole process
+    // is exiting — the kernel reclaims it) and ThreadDone (handle_thread_exit
+    // already destroyed it). This plugs the leak where an errored/trap-limited
+    // sibling left a live vCPU behind, tripping a later fork's hv_vm_destroy
+    // into HV_BUSY.
+    if !matches!(
+        &result,
+        Ok(VcpuLoopOutcome::ProcessExit(_)) | Ok(VcpuLoopOutcome::ThreadDone)
+    ) {
+        engine.destroy_vcpu_on_thread_exit();
+    }
+    result
 }
 
 /// Snapshot the shared kernel buffers + reporter into a RunResult. Called on
