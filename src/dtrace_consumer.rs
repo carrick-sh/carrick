@@ -12,6 +12,8 @@
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_uint, c_void};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 /// Bundled D program. Mirrors `scripts/syscalls.d` so the build artifact
 /// is self-contained.
@@ -45,7 +47,13 @@ type ConsumeProbeFn = extern "C" fn(data: *const c_void, arg: *mut c_void) -> c_
 type ConsumeRecFn =
     extern "C" fn(data: *const c_void, rec: *const c_void, arg: *mut c_void) -> c_int;
 
+/// Count of probe firings consumed, so the run loop can tell whether the trace
+/// stream is still active after the directly-spawned child has died (progeny
+/// still firing, or a `tick` still ticking) versus genuinely quiescent.
+static PROBE_FIRES: AtomicU64 = AtomicU64::new(0);
+
 extern "C" fn chew(_data: *const c_void, _arg: *mut c_void) -> c_int {
+    PROBE_FIRES.fetch_add(1, Ordering::Relaxed);
     DTRACE_CONSUME_THIS
 }
 
@@ -374,9 +382,22 @@ pub fn run_child_under_dtrace(
 
     unsafe { dtrace_proc_continue(hdl.as_ptr(), proc_h.as_ptr()) };
 
-    // Consume loop: sleep + work until tracing reports DONE or the child
-    // process is dead. dtrace_work prints to stdout for us.
+    // Consume loop. The directly-spawned child dying does NOT end the trace:
+    // a guest `fork`/`clone` becomes a real macOS child (or sibling vCPU thread)
+    // that re-registers its probes and can OUTLIVE its parent, and a fast-
+    // crashing guest still has buffered events plus a `tick`/`END` aggregation
+    // we must drain. So we keep consuming and stop only when:
+    //   * the D script itself exits (`DONE`) — the intended termination, which
+    //     covers the skill's mandated `tick-Ns { exit(0) }` bound; or
+    //   * the directly-spawned child is dead AND the stream has gone quiet (no
+    //     probe fired) for a short grace window — meaning no progeny are still
+    //     producing events and no `tick` is still pending. An active progeny or
+    //     a live tick keeps `PROBE_FIRES` advancing and holds the trace open.
+    // The outer `timeout(1)` the CLI wraps every run in remains the hard cap.
+    const POST_CHILD_QUIET_GRACE: Duration = Duration::from_millis(2000);
+    let mut last_activity = Instant::now();
     loop {
+        let fires_before = PROBE_FIRES.load(Ordering::Relaxed);
         unsafe { dtrace_sleep(hdl.as_ptr()) };
         let status =
             unsafe { dtrace_work(hdl.as_ptr(), out.fp(), chew, chewrec, std::ptr::null_mut()) };
@@ -385,12 +406,15 @@ pub fn run_child_under_dtrace(
         // live stream stays live even when the traced child never exits (e.g.
         // a deadlock we're trying to diagnose).
         unsafe { fflush(out.fp()) };
+        if PROBE_FIRES.load(Ordering::Relaxed) != fires_before {
+            last_activity = Instant::now();
+        }
         let proc_state = unsafe { dtrace_proc_state(hdl.as_ptr(), proc_h.as_ptr()) };
         let child_terminal = proc_state == PS_DEAD || proc_state == PS_UNDEAD;
         match status {
             DTRACE_WORKSTATUS_DONE => break,
             DTRACE_WORKSTATUS_OKAY => {
-                if child_terminal {
+                if child_terminal && last_activity.elapsed() >= POST_CHILD_QUIET_GRACE {
                     break;
                 }
             }
