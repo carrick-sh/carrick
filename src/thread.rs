@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use parking_lot::Mutex as ParkingMutex;
 use parking_lot_core::{FilterOp, ParkResult, ParkToken, UnparkToken};
@@ -24,7 +24,7 @@ struct ThreadEntry {
 
 pub struct ThreadRegistry {
     next_tid: AtomicI32,
-    inner: Mutex<HashMap<ThreadId, ThreadEntry>>,
+    inner: ParkingMutex<HashMap<ThreadId, ThreadEntry>>,
 }
 
 /// Process-global handle to THIS process's live thread registry, so the
@@ -32,23 +32,21 @@ pub struct ThreadRegistry {
 /// fs/open path, where the per-syscall registry isn't threaded through) can
 /// read this process's thread tids + states. Set when the vCPU loop creates
 /// its registry and re-set in a forked child (which builds a fresh one).
-static CURRENT_REGISTRY: std::sync::Mutex<Option<std::sync::Arc<ThreadRegistry>>> =
-    std::sync::Mutex::new(None);
+static CURRENT_REGISTRY: ParkingMutex<Option<Arc<ThreadRegistry>>> =
+    ParkingMutex::new(None);
 
 /// Publish `registry` as this process's current registry. Called by the run
 /// loop at startup and after fork (the child has its own registry).
-pub fn set_current_registry(registry: std::sync::Arc<ThreadRegistry>) {
-    if let Ok(mut g) = CURRENT_REGISTRY.lock() {
-        *g = Some(registry);
-    }
+pub fn set_current_registry(registry: Arc<ThreadRegistry>) {
+    *CURRENT_REGISTRY.lock() = Some(registry);
 }
 
 /// This process's live `(tid, state_char)` threads, or empty if unset.
 pub fn current_thread_states() -> Vec<(ThreadId, char)> {
     CURRENT_REGISTRY
         .lock()
-        .ok()
-        .and_then(|g| g.as_ref().map(|r| r.thread_states()))
+        .as_ref()
+        .map(|r| r.thread_states())
         .unwrap_or_default()
 }
 
@@ -64,18 +62,14 @@ impl ThreadRegistry {
         );
         Self {
             next_tid: AtomicI32::new(main_tid + 1),
-            inner: Mutex::new(map),
+            inner: ParkingMutex::new(map),
         }
     }
 
     pub fn register_child(&self, clear_child_tid: u64) -> ThreadId {
         let tid = self.next_tid.fetch_add(1, Ordering::Relaxed);
-        // INVARIANT: a poisoned mutex means another thread panicked while holding
-        // it — the registry is in an unknown state and recovery is impossible.
-        #[allow(clippy::expect_used)]
         self.inner
             .lock()
-            .expect("thread registry mutex poisoned")
             .insert(
                 tid,
                 ThreadEntry {
@@ -87,22 +81,16 @@ impl ThreadRegistry {
     }
 
     pub fn clear_child_tid(&self, tid: ThreadId) -> Option<u64> {
-        // INVARIANT: mutex poisoning is unrecoverable; panic propagation is correct.
-        #[allow(clippy::expect_used)]
         self.inner
             .lock()
-            .expect("thread registry mutex poisoned")
             .get(&tid)
             .map(|e| e.clear_child_tid)
     }
 
     pub fn set_clear_child_tid(&self, tid: ThreadId, addr: u64) {
-        // INVARIANT: mutex poisoning is unrecoverable; panic propagation is correct.
-        #[allow(clippy::expect_used)]
         if let Some(e) = self
             .inner
             .lock()
-            .expect("thread registry mutex poisoned")
             .get_mut(&tid)
         {
             e.clear_child_tid = addr;
@@ -111,29 +99,22 @@ impl ThreadRegistry {
 
     /// Returns true if this was the last live thread (process should exit).
     pub fn exit(&self, tid: ThreadId) -> bool {
-        // INVARIANT: mutex poisoning is unrecoverable; panic propagation is correct.
-        #[allow(clippy::expect_used)]
-        let mut map = self.inner.lock().expect("thread registry mutex poisoned");
+        let mut map = self.inner.lock();
         map.remove(&tid);
         map.is_empty()
     }
 
     pub fn live_count(&self) -> usize {
-        // INVARIANT: mutex poisoning is unrecoverable; panic propagation is correct.
-        #[allow(clippy::expect_used)]
         self.inner
             .lock()
-            .expect("thread registry mutex poisoned")
             .len()
     }
 
     /// Is `tid` a live thread of this process? Used to route a guest
     /// `tgkill`/`tkill` to a sibling vs. reporting ESRCH.
     pub fn is_live(&self, tid: ThreadId) -> bool {
-        #[allow(clippy::expect_used)]
         self.inner
             .lock()
-            .expect("thread registry mutex poisoned")
             .contains_key(&tid)
     }
 
@@ -142,11 +123,9 @@ impl ThreadRegistry {
     /// is the only per-thread state we keep for `/proc` — the run/sleep state
     /// is read live from the kernel, not tracked here.
     pub fn record_thread_port(&self, tid: ThreadId, port: crate::host_proc::ThreadPort) {
-        #[allow(clippy::expect_used)]
         if let Some(e) = self
             .inner
             .lock()
-            .expect("thread registry mutex poisoned")
             .get_mut(&tid)
         {
             e.mach_port = port;
@@ -159,11 +138,9 @@ impl ThreadRegistry {
     /// port (`'S'` = WAITING, `'R'` = RUNNING, …); a thread whose port isn't
     /// recorded yet reports `'R'`.
     pub fn thread_states(&self) -> Vec<(ThreadId, char)> {
-        #[allow(clippy::expect_used)]
         let ports: Vec<(ThreadId, crate::host_proc::ThreadPort)> = self
             .inner
             .lock()
-            .expect("thread registry mutex poisoned")
             .iter()
             .map(|(&tid, e)| (tid, e.mach_port))
             .collect();
