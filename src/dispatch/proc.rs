@@ -691,25 +691,97 @@ impl SyscallDispatcher {
         })
     }
 
+    /// waitid(2): wait for a child's state change without (optionally) reaping
+    /// it. Go's `os.Process.Wait` calls this (`P_PIDFD`/`P_PID` with
+    /// `WEXITED|WNOWAIT`) to block until a child is waitable, then reaps via
+    /// `wait4`; a stub `ECHILD` here breaks every `os/exec` round-trip. Backed
+    /// by Darwin's own `waitid` (guest pids mirror host pids); `P_PIDFD`
+    /// resolves through the pidfd's backing host pid.
     pub(super) fn waitid<M: GuestMemory>(
         &self,
         ctx: &mut SyscallCtx<M>,
     ) -> Result<DispatchOutcome, DispatchError> {
+        use crate::linux_abi::{
+            LINUX_WCONTINUED, LINUX_WEXITED, LINUX_WNOHANG, LINUX_WNOWAIT, LINUX_WSTOPPED,
+        };
         let idtype = ctx.arg(0);
+        let id = ctx.arg(1);
+        let infop_addr = ctx.arg(2);
         let options = ctx.arg(3);
-        match idtype {
-            LINUX_P_ALL | LINUX_P_PID | LINUX_P_PGID | LINUX_P_PIDFD => {}
-            _ => {
-                return Ok(LINUX_EINVAL.into());
-            }
-        }
         if options & !LINUX_WAITID_SUPPORTED_FLAGS != 0 {
             return Ok(LINUX_EINVAL.into());
         }
         if options & LINUX_WAITID_STATE_MASK == 0 {
             return Ok(LINUX_EINVAL.into());
         }
-        Ok(LINUX_ECHILD.into())
+        // Map the Linux (idtype, id) to a macOS (idtype_t, id). P_PIDFD has no
+        // host analogue, so resolve the pidfd to its backing host pid and wait
+        // by P_PID.
+        let (host_idtype, host_id): (libc::idtype_t, libc::id_t) = match idtype {
+            LINUX_P_ALL => (libc::P_ALL, 0),
+            LINUX_P_PID => (libc::P_PID, id as libc::id_t),
+            LINUX_P_PGID => (libc::P_PGID, id as libc::id_t),
+            LINUX_P_PIDFD => match self.pidfd_host_pid(id as i32) {
+                Some(host_pid) => (libc::P_PID, host_pid as libc::id_t),
+                None => return Ok(LINUX_EBADF.into()),
+            },
+            _ => return Ok(LINUX_EINVAL.into()),
+        };
+        // Linux and macOS agree on WNOHANG (1) but disagree on the state/wait
+        // bits (WEXITED/WSTOPPED/WCONTINUED/WNOWAIT), so translate explicitly.
+        let mut host_options: i32 = 0;
+        if options & LINUX_WEXITED != 0 {
+            host_options |= libc::WEXITED;
+        }
+        if options & LINUX_WSTOPPED != 0 {
+            host_options |= libc::WSTOPPED;
+        }
+        if options & LINUX_WCONTINUED != 0 {
+            host_options |= libc::WCONTINUED;
+        }
+        if options & LINUX_WNOHANG != 0 {
+            host_options |= libc::WNOHANG;
+        }
+        if options & LINUX_WNOWAIT != 0 {
+            host_options |= libc::WNOWAIT;
+        }
+
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // Retry across carrick-internal host-signal EINTR (the SIGURG vCPU
+        // kick), surfacing EINTR to the guest only when it has a deliverable
+        // signal pending — same discipline as wait4 above.
+        let result = loop {
+            let r = unsafe { libc::waitid(host_idtype, host_id, &mut info, host_options) };
+            if r == 0 {
+                break Ok(());
+            }
+            let errno = std::io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(0);
+            if errno == LINUX_EINTR && !crate::host_signal::has_process_pending() {
+                continue;
+            }
+            break Err(errno);
+        };
+        if let Err(errno) = result {
+            // macOS ECHILD/EINVAL share their numbers with Linux (10/22).
+            return Ok(DispatchOutcome::errno(errno));
+        }
+        // Fill the guest siginfo_t (SIGCHLD layout). macOS, like Linux, leaves
+        // si_pid == 0 with WNOHANG when no child is waitable — callers read that
+        // as "nothing ready", so propagate it verbatim.
+        if infop_addr != 0 {
+            let bytes = if info.si_pid == 0 {
+                [0u8; crate::linux_abi::LINUX_SIGINFO_SIZE]
+            } else {
+                build_sigchld_siginfo(info.si_pid, info.si_uid, info.si_code, info.si_status)
+            };
+            let memory = &mut *ctx.memory;
+            if memory.write_bytes(infop_addr, &bytes).is_err() {
+                return Ok(LINUX_EFAULT.into());
+            }
+        }
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
     pub(super) fn wait4<M: GuestMemory>(
@@ -892,7 +964,14 @@ impl SyscallDispatcher {
         }
 
         // Anything else (including the SIGCHLD-only fork case) → real fork.
-        Ok(DispatchOutcome::Fork)
+        // Legacy clone(2) returns the CLONE_PIDFD fd via the parent_tid pointer
+        // (arg2); it's mutually exclusive with CLONE_PARENT_SETTID.
+        let pidfd_out = if flags & LinuxCloneFlags::PIDFD.bits() != 0 {
+            Some(ctx.arg(2))
+        } else {
+            None
+        };
+        Ok(DispatchOutcome::Fork { pidfd_out })
     }
 
     /// pidfd_open(2): return a file descriptor referring to process `pid`. The
@@ -938,6 +1017,17 @@ impl SyscallDispatcher {
             status_flags,
         };
         self.install_fd(description, 0)
+    }
+
+    /// Allocate a pidfd referring to freshly-forked `child_pid` and return its
+    /// guest fd, or `None` if installation failed. Called by the runtime's
+    /// `CLONE_PIDFD` fork path (in the parent) to satisfy the clone pidfd-out
+    /// pointer. Public because the runtime drives fork from outside `dispatch`.
+    pub fn install_child_pidfd(&self, child_pid: i32) -> Option<i32> {
+        match self.open_pidfd(child_pid, 0) {
+            DispatchOutcome::Returned { value } => i32::try_from(value).ok(),
+            _ => None,
+        }
     }
 
     /// Resolve a pidfd to its backing host pid, or `None` if `fd` isn't a pidfd.
@@ -1057,7 +1147,13 @@ impl SyscallDispatcher {
         // posix_spawn's CLONE_VM|CLONE_VFORK|SIGCHLD and plain SIGCHLD forks
         // both land here. A real fork is a valid implementation of vfork (the
         // child execs or _exits immediately), so route to the same path.
-        DispatchOutcome::Fork
+        // clone3 returns the CLONE_PIDFD fd via the clone_args.pidfd field.
+        let pidfd_out = if flags & LinuxCloneFlags::PIDFD.bits() != 0 {
+            Some(args.pidfd)
+        } else {
+            None
+        };
+        DispatchOutcome::Fork { pidfd_out }
     }
 
     pub(super) fn getrandom<M: GuestMemory>(
@@ -1155,6 +1251,35 @@ fn translate_wait_status(status: i32) -> i32 {
         // Exited normally: high byte is the exit code, left untouched.
         status
     }
+}
+
+/// Build a Linux `siginfo_t` (SIGCHLD layout) for `waitid` from the fields
+/// macOS's `waitid` filled. The Linux struct places si_pid@16, si_uid@20,
+/// si_status@24 after the common si_signo/si_errno/si_code header. The CLD_*
+/// codes match between the kernels; si_status is the raw exit code for
+/// CLD_EXITED but a signal number otherwise, so translate that host->Linux.
+fn build_sigchld_siginfo(
+    si_pid: i32,
+    si_uid: u32,
+    si_code: i32,
+    si_status: i32,
+) -> [u8; crate::linux_abi::LINUX_SIGINFO_SIZE] {
+    const LINUX_SIGCHLD: i32 = 17;
+    const CLD_EXITED: i32 = 1;
+    let linux_status = if si_code == CLD_EXITED {
+        si_status
+    } else {
+        crate::host_signal::host_to_linux_signum(si_status)
+    };
+    let mut buf = [0u8; crate::linux_abi::LINUX_SIGINFO_SIZE];
+    buf[0..4].copy_from_slice(&LINUX_SIGCHLD.to_ne_bytes());
+    // si_errno [4..8] stays 0.
+    buf[8..12].copy_from_slice(&si_code.to_ne_bytes());
+    // _pad0 [12..16] stays 0 (union alignment on 64-bit).
+    buf[16..20].copy_from_slice(&si_pid.to_ne_bytes());
+    buf[20..24].copy_from_slice(&si_uid.to_ne_bytes());
+    buf[24..28].copy_from_slice(&linux_status.to_ne_bytes());
+    buf
 }
 
 #[cfg(test)]
