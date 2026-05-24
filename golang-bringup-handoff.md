@@ -30,6 +30,12 @@ Validated current results:
   changes passed 20/20; elapsed times were about 7.8-9.0 ms in the latest sweep.
 - `CARRICK_EXPOSED_CPUS=10` after the signal-wake fix still failed: 9/20 clean,
   10 client deadline panics, 1 timeout/kill.
+- `CARRICK_EXPOSED_CPUS=10 GOGC=off` still failed: 11/20 clean, 9 deadline
+  panics, 0 timeouts. GC is visible in schedtrace failures, but disabling GC is
+  not a fix.
+- `CARRICK_EXPOSED_CPUS=10 GOMAXPROCS=4` was much better but still not perfect:
+  19/20 clean, 1 deadline panic. The 10-CPU surface changes more than just the
+  default Go P count.
 - A traced failing `CARRICK_EXPOSED_CPUS=10` run still showed one
   `epoll_pwait` wait on the epoll kqueue fd timing out at about 5 seconds, so
   the remaining high-P issue is a progress/readiness stall, not the old EL0
@@ -106,6 +112,10 @@ Validated current results:
 - Carrick default Go c50: 20/20 clean.
 - Carrick `CARRICK_EXPOSED_CPUS=10` Go c50: 9/20 clean, 10 deadline panics,
   1 timeout/kill.
+- Carrick `CARRICK_EXPOSED_CPUS=10 GOGC=off` Go c50: 11/20 clean,
+  9 deadline panics, 0 timeouts.
+- Carrick `CARRICK_EXPOSED_CPUS=10 GOMAXPROCS=4` Go c50: 19/20 clean,
+  1 deadline panic, 0 timeouts.
 
 ## Darwin/macOS and FreeBSD leverage
 
@@ -146,7 +156,10 @@ The old stack-resident sigreturn crash is fixed, and the shared signal-pipe
 lost-wake hole is fixed, but high-P still produces client deadline panics and
 occasional timeouts. Latest trace evidence points at an epoll/netpoll progress
 stall: a failing traced run had an epoll kqueue fd wait return timeout after
-about five seconds.
+about five seconds. A schedtrace failure also showed `gomaxprocs=10`,
+`idleprocs=8`, empty run queues, and goroutines stuck in GC assist/mark
+termination for several seconds, but `GOGC=off` still fails, so GC is not the
+whole explanation.
 
 Next best path:
 
