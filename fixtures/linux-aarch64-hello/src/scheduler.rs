@@ -31,14 +31,14 @@ pub extern "C" fn _start() -> ! {
         if affinity != AFFINITY_BYTES as i64 {
             exit(11);
         }
-        let first = core::ptr::read_volatile(core::ptr::addr_of!(AFFINITY[0]));
-        if first != 1 {
-            exit(12);
-        }
-        for index in 1..AFFINITY_BYTES {
+        let mut any = false;
+        for index in 0..AFFINITY_BYTES {
             if core::ptr::read_volatile(core::ptr::addr_of!(AFFINITY[index])) != 0 {
-                exit(13);
+                any = true;
             }
+        }
+        if !any {
+            exit(12);
         }
 
         let wrote = syscall3(SYS_WRITE, 1, MESSAGE.as_ptr() as u64, MESSAGE.len() as u64);

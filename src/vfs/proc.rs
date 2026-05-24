@@ -281,7 +281,7 @@ fn label_for_region(region: &ProcMapsEntry, executable_path: &str) -> (u64, u64,
 }
 
 fn synthetic_proc_cpuinfo() -> Vec<u8> {
-    // One "processor" block per logical CPU so the count agrees with
+    // One "processor" block per Linux-visible logical CPU so the count agrees with
     // sched_getaffinity, /proc/stat and /sys/.../cpu/online. Go/nproc count
     // CPUs via sched_getaffinity, but lscpu and some runtimes parse this.
     let ncpu = crate::host_facts::logical_cpu_count();

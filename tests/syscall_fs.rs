@@ -2134,54 +2134,64 @@ fn missing_proc_file_records_compat_report_entry() {
 
 #[test]
 fn synthetic_sys_surface_serves_common_cpu_and_mm_files() {
-    let paths: [(&str, &[u8]); 17] = [
-        ("/sys/devices/system/cpu/online", b"0\n"),
-        ("/sys/devices/system/cpu/possible", b"0\n"),
-        ("/sys/devices/system/cpu/present", b"0\n"),
-        ("/sys/devices/system/cpu/kernel_max", b"0\n"),
-        ("/sys/devices/system/cpu/cpu0/online", b"1\n"),
+    let ncpu = carrick::host_facts::logical_cpu_count();
+    let cpu_range = if ncpu <= 1 {
+        b"0\n".to_vec()
+    } else {
+        format!("0-{}\n", ncpu - 1).into_bytes()
+    };
+    let kernel_max = format!("{}\n", ncpu.max(1) - 1).into_bytes();
+    let paths: Vec<(&str, Vec<u8>)> = vec![
+        ("/sys/devices/system/cpu/online", cpu_range.clone()),
+        ("/sys/devices/system/cpu/possible", cpu_range.clone()),
+        ("/sys/devices/system/cpu/present", cpu_range),
+        ("/sys/devices/system/cpu/kernel_max", kernel_max),
+        ("/sys/devices/system/cpu/cpu0/online", b"1\n".to_vec()),
         (
             "/sys/devices/system/cpu/cpu0/topology/physical_package_id",
-            b"0\n",
+            b"0\n".to_vec(),
         ),
-        ("/sys/devices/system/cpu/cpu0/topology/core_id", b"0\n"),
+        (
+            "/sys/devices/system/cpu/cpu0/topology/core_id",
+            b"0\n".to_vec(),
+        ),
         (
             "/sys/devices/system/cpu/cpu0/topology/thread_siblings_list",
-            b"0\n",
+            b"0\n".to_vec(),
         ),
         (
             "/sys/devices/system/cpu/cpu0/topology/core_siblings_list",
-            b"0\n",
+            b"0\n".to_vec(),
         ),
         (
             "/sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq",
-            b"2400000\n",
+            b"2400000\n".to_vec(),
         ),
         (
             "/sys/devices/system/cpu/cpufreq/policy0/scaling_max_freq",
-            b"2400000\n",
+            b"2400000\n".to_vec(),
         ),
         (
             "/sys/devices/system/cpu/cpufreq/policy0/scaling_min_freq",
-            b"600000\n",
+            b"600000\n".to_vec(),
         ),
         (
             "/sys/kernel/mm/transparent_hugepage/enabled",
-            b"always [madvise] never\n",
+            b"always [madvise] never\n".to_vec(),
         ),
         (
             "/sys/kernel/mm/transparent_hugepage/defrag",
-            b"always defer defer+madvise [madvise] never\n",
+            b"always defer defer+madvise [madvise] never\n".to_vec(),
         ),
         (
             "/sys/kernel/random/uuid",
-            b"00000000-0000-4000-8000-000000000000\n",
+            b"00000000-0000-4000-8000-000000000000\n".to_vec(),
         ),
         (
             "/sys/kernel/random/boot_id",
-            b"00000000-0000-4000-8000-000000000000\n",
+            b"00000000-0000-4000-8000-000000000000\n".to_vec(),
         ),
-        ("/sys/fs/cgroup/cgroup.controllers", b"\n"),
+        ("/sys/fs/cgroup/cgroup.controllers", b"\n".to_vec()),
     ];
 
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
@@ -2225,7 +2235,7 @@ fn synthetic_sys_surface_serves_common_cpu_and_mm_files() {
         let bytes = memory.read_bytes(read_buffer, read_len as usize).unwrap();
         assert_eq!(
             bytes.as_slice(),
-            expected,
+            expected.as_slice(),
             "{path} content mismatch: got {bytes:?}"
         );
     }
