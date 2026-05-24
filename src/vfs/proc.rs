@@ -10,7 +10,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::linux_abi::{LINUX_EACCES, LINUX_ENOENT, LINUX_ENOTDIR};
 use crate::memory::{
     LINUX_EL0_TRAMPOLINE_BASE, LINUX_EL1_VECTORS_BASE, LINUX_HEAP_BASE, LINUX_HEAP_SIZE,
-    LINUX_MMAP_BASE, LINUX_MMAP_SIZE, LINUX_PAGE_TABLES_BASE, LINUX_STACK_SIZE, LINUX_STACK_TOP,
+    LINUX_MMAP_BASE, LINUX_MMAP_SIZE, LINUX_PAGE_TABLES_BASE, LINUX_SIGRETURN_TRAMPOLINE_BASE,
+    LINUX_STACK_SIZE, LINUX_STACK_TOP,
 };
 
 use super::{DirEnt, EntryKind, Metadata, OpenContext, OpenFlags, Vfs, VfsError, VfsHandle};
@@ -263,6 +264,8 @@ fn label_for_region(region: &ProcMapsEntry, executable_path: &str) -> (u64, u64,
         "[stack]".to_owned()
     } else if start == LINUX_EL0_TRAMPOLINE_BASE {
         "[carrick-trampoline]".to_owned()
+    } else if start == LINUX_SIGRETURN_TRAMPOLINE_BASE {
+        "[carrick-sigreturn]".to_owned()
     } else if start == LINUX_EL1_VECTORS_BASE {
         "[carrick-vectors]".to_owned()
     } else if start == LINUX_PAGE_TABLES_BASE {

@@ -47,9 +47,11 @@ pub const LINUX_EL1_VECTORS_SIZE: u64 = 0x4000;
 pub const LINUX_PAGE_TABLES_BASE: u64 = 0x30000;
 pub const LINUX_PAGE_TABLES_SIZE: u64 = 0x4000; // 16 KiB allocated, three pages used
 // User-mode rt_sigreturn trampoline. This must be outside the first 2 MiB,
-// whose stage-1 block is kernel-only for the EL0-entry/vector pages, and far
-// below the PIE/heap/mmap/stack windows so normal guest mappings never collide.
-pub const LINUX_SIGRETURN_TRAMPOLINE_BASE: u64 = 0x20_0000;
+// whose stage-1 block is kernel-only for the EL0-entry/vector pages, and it
+// must not collide with ET_EXEC binaries that commonly start at 0x200000. Keep
+// it in the unused gap above the PIE default base and below the heap/mmap
+// arenas so normal guest mappings never collide.
+pub const LINUX_SIGRETURN_TRAMPOLINE_BASE: u64 = 0x30_0000_0000;
 pub const LINUX_SIGRETURN_TRAMPOLINE_SIZE: u64 = 0x4000;
 // AArch64 `eret` opcode, little-endian.
 const AARCH64_ERET_OPCODE: u32 = 0xd69f_03e0;
@@ -1400,7 +1402,7 @@ mod loader_tests {
                 0x01, 0x00, 0x00, 0xd4, // svc #0
             ]
         );
-        assert_eq!(LINUX_SIGRETURN_TRAMPOLINE_BASE, 0x20_0000);
+        assert_eq!(LINUX_SIGRETURN_TRAMPOLINE_BASE, 0x30_0000_0000);
     }
 }
 
