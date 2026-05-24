@@ -231,6 +231,36 @@ const GPR_TABLE: [applevisor::vcpu::Reg; 31] = [
     applevisor::vcpu::Reg::X30,
 ];
 
+/// Process-wide handoff for multithreaded fork: the forking thread (parent),
+/// after rebuilding its VM, publishes a clone here so quiesced sibling threads
+/// recreate their vCPUs in the same (new) process VM.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+type SharedVm = applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn rebuilt_vm_cell() -> &'static parking_lot::Mutex<Option<SharedVm>> {
+    static CELL: std::sync::OnceLock<parking_lot::Mutex<Option<SharedVm>>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(|| parking_lot::Mutex::new(None))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+thread_local! {
+    /// Per-sibling vCPU snapshot held between `release_vcpu_for_fork` and
+    /// `rebuild_vcpu_after_fork` (both run on the same thread, around the fork
+    /// quiesce park).
+    static FORK_VCPU_SNAPSHOT: std::cell::RefCell<Option<VcpuSnapshot>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Clear the published fork VM (child path; the child is single-threaded).
+pub fn clear_rebuilt_vm_for_fork() {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        *rebuilt_vm_cell().lock() = None;
+    }
+}
+
 /// V0–V31 SIMD/FP registers, saved/restored across signal delivery alongside
 /// the GPRs so a handler that uses SIMD (aarch64 `memcpy`/`memset`, the guest's
 /// own handler body) cannot corrupt the interrupted thread's vector state.
@@ -777,6 +807,39 @@ impl HvfTrapEngine {
 
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     pub fn restore_from_sigframe(&mut self) -> Result<u64, TrapError> {
+        Err(TrapError::UnsupportedPlatform)
+    }
+
+    /// Multithreaded-fork sibling: snapshot + destroy this vCPU (storing the
+    /// snapshot in a thread-local) so the forking thread can `hv_vm_destroy`.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn release_vcpu_for_fork(&mut self) -> Result<(), TrapError> {
+        self.inner.release_vcpu_for_fork()
+    }
+
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    pub fn release_vcpu_for_fork(&mut self) -> Result<(), TrapError> {
+        Err(TrapError::UnsupportedPlatform)
+    }
+
+    /// Multithreaded-fork parent: publish the rebuilt VM for quiesced siblings.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn publish_vm_for_siblings(&self) {
+        self.inner.publish_vm_for_siblings();
+    }
+
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    pub fn publish_vm_for_siblings(&self) {}
+
+    /// Multithreaded-fork sibling: recreate this vCPU in the parent's rebuilt VM
+    /// and restore the thread-local snapshot from `release_vcpu_for_fork`.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn rebuild_vcpu_after_fork(&mut self) -> Result<(), TrapError> {
+        self.inner.rebuild_vcpu_after_fork()
+    }
+
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    pub fn rebuild_vcpu_after_fork(&mut self) -> Result<(), TrapError> {
         Err(TrapError::UnsupportedPlatform)
     }
 
@@ -1487,6 +1550,49 @@ impl HvfInner {
             .set_sys_reg(SysReg::SCTLR_EL1, snap.sctlr_el1)
             .map_err(hvf_error)?;
         self.last_exit_class = snap.last_exit_class;
+        Ok(())
+    }
+
+    /// Multithreaded fork — sibling side, step 1. Snapshot this vCPU and destroy
+    /// it (raw `hv_vcpu_destroy`; only the owning thread may) so the forking
+    /// thread can `hv_vm_destroy` before `libc::fork` (which fails HV_BUSY while
+    /// any vCPU is alive). The wrapper is left stale until `rebuild_vcpu_after_fork`.
+    fn release_vcpu_for_fork(&mut self) -> Result<(), TrapError> {
+        let snap = self.snapshot_vcpu()?;
+        FORK_VCPU_SNAPSHOT.with(|s| *s.borrow_mut() = Some(snap));
+        let _ = unsafe { applevisor_sys::hv_vcpu_destroy(self.vcpu.id()) };
+        Ok(())
+    }
+
+    /// Multithreaded fork — forking thread (parent), after rebuilding its VM.
+    /// Publish a clone of the new process VM so quiesced siblings can recreate
+    /// their vCPUs in it.
+    fn publish_vm_for_siblings(&self) {
+        *rebuilt_vm_cell().lock() = Some(self._vm.clone());
+    }
+
+    /// Multithreaded fork — sibling side, step 2 (after the parent published the
+    /// rebuilt VM and released the quiesce). Recreate this vCPU in the new VM
+    /// and restore the pre-fork register state. Mappings are VM-global (the
+    /// parent remapped them into the shared VM), so nothing to re-map here.
+    fn rebuild_vcpu_after_fork(&mut self) -> Result<(), TrapError> {
+        let snap = FORK_VCPU_SNAPSHOT
+            .with(|s| s.borrow_mut().take())
+            .ok_or_else(|| TrapError::Hypervisor("no fork vCPU snapshot for rebuild".into()))?;
+        // Post-fork: recreate in the parent's rebuilt VM (published). On a
+        // quiesce ABORT (timeout — no fork happened), nothing was published and
+        // the existing VM is still live, so recreate the vCPU in it.
+        let new_vm = rebuilt_vm_cell()
+            .lock()
+            .clone()
+            .unwrap_or_else(|| self._vm.clone());
+        let new_vcpu = new_vm.vcpu_create().map_err(hvf_error)?;
+        // Replace _vm and vcpu WITHOUT running applevisor's panicky Drop on the
+        // old (already-destroyed) handles — mirror the fork/thread-sibling
+        // leak-until-exit discipline.
+        std::mem::forget(std::mem::replace(&mut self.vcpu, new_vcpu));
+        std::mem::forget(std::mem::replace(&mut self._vm, new_vm));
+        self.restore_vcpu(&snap)?;
         Ok(())
     }
 
