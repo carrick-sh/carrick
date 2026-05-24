@@ -245,6 +245,25 @@ pub fn spawn_signal_pump(
                         crate::host_signal::drain_pump_pipe();
                         continue;
                     }
+                    if let Some(ident) = event.timer_ident() {
+                        if let Some(which) = crate::itimer::which_for_ident(ident) {
+                            let signum = crate::itimer::signum_for(which);
+                            crate::probes::itimer_fire(signum, 0);
+                            crate::host_signal::publish_process_signal(signum);
+                            // EV_ONESHOT consumed the registration. If this timer
+                            // has a repeat interval, re-arm it as periodic on our
+                            // own kqueue (EV_ADD, no EV_ONESHOT). interval 0 = done.
+                            let interval = crate::itimer::interval_ns(which);
+                            if interval > 0 {
+                                let _ = kq.apply(&[crate::darwin_kqueue::Kevent::timer(
+                                    ident,
+                                    libc::EV_ADD,
+                                    interval as i64,
+                                )]);
+                            }
+                        }
+                        continue;
+                    }
                 }
                 if !thread_running.load(std::sync::atomic::Ordering::SeqCst) {
                     break;

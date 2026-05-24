@@ -33,13 +33,10 @@ pub(super) struct ProcState {
     /// setitimer/getitimer report the time remaining; `None` = disarmed.
     /// glibc's `alarm()` is `setitimer(ITIMER_REAL, …)` and returns the
     /// previous timer's remaining seconds. The matching expiry signal
-    /// (SIGALRM/SIGVTALRM/SIGPROF) is delivered by a per-arm timer thread;
-    /// `itimer_gen[which]` is a generation counter that cancels a thread when
-    /// its timer is re-armed or disarmed — a stale thread sees a bumped
-    /// generation and exits without firing. VIRTUAL/PROF are approximated with
-    /// a wall-clock thread (carrick has no per-process CPU-time accounting).
+    /// (SIGALRM/SIGVTALRM/SIGPROF) is delivered by an EVFILT_TIMER event on the
+    /// signal pump's kqueue (see crate::itimer). VIRTUAL/PROF are approximated
+    /// with a wall-clock timer (carrick has no per-process CPU-time accounting).
     pub itimers: [Option<ItimerState>; 3],
-    pub itimer_gen: std::sync::Arc<[std::sync::atomic::AtomicU64; 3]>,
     /// CPU affinity mask, one bit per logical CPU (word 0 holds CPUs 0..64).
     /// Seeded to "all online CPUs" (`hw.logicalcpu` low bits set) so
     /// `sched_getaffinity` reports the real core count — the Go runtime sizes
@@ -140,7 +137,6 @@ pub(super) struct ItimerState {
 
 impl ProcState {
     pub(super) fn new() -> Self {
-        use std::sync::atomic::AtomicU64;
         Self {
             executable_path: "/proc/self/exe".to_owned(),
             argv: vec!["/proc/self/exe".to_owned()],
@@ -150,11 +146,6 @@ impl ProcState {
             pdeathsig: 0,
             bootstrap_host_pid: std::process::id(),
             itimers: [None, None, None],
-            itimer_gen: std::sync::Arc::new([
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-                AtomicU64::new(0),
-            ]),
             affinity: default_affinity(crate::host_facts::logical_cpu_count()),
         }
     }

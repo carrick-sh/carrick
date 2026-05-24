@@ -295,11 +295,6 @@ impl SyscallDispatcher {
         if let Some(v) = new_value {
             let value = duration_from_timeval(v.it_value);
             let interval = duration_from_timeval(v.it_interval);
-            // Bump this timer's generation: any in-flight timer thread for it
-            // now sees a stale generation and exits without firing (this both
-            // disarms a running timer and supersedes it on re-arm).
-            let gen_arc = self.proc.lock().itimer_gen.clone();
-            let my_gen = gen_arc[idx].fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
             // A zero it_value disarms the timer (matching the kernel).
             self.proc.lock().itimers[idx] = if value.is_zero() {
                 None
@@ -310,12 +305,26 @@ impl SyscallDispatcher {
                     interval,
                 })
             };
-            if !value.is_zero() {
-                let signum = match which {
-                    LINUX_ITIMER_VIRTUAL => crate::linux_abi::LINUX_SIGVTALRM,
-                    LINUX_ITIMER_PROF => crate::linux_abi::LINUX_SIGPROF,
-                    _ => crate::linux_abi::LINUX_SIGALRM,
-                };
+
+            let ident = crate::itimer::ident_for(idx);
+            let kq = crate::host_signal::pump_kqueue();
+            if value.is_zero() {
+                // Disarm: clear the repeat interval and delete the kevent.
+                crate::itimer::set_interval_ns(idx, 0);
+                if kq >= 0 {
+                    let _ = crate::darwin_kqueue::apply_changes(
+                        kq,
+                        &[crate::darwin_kqueue::Kevent::timer(ident, libc::EV_DELETE, 0)],
+                    );
+                }
+            } else {
+                // Arm: record the repeat interval (ns; 0 = one-shot), then
+                // register a one-shot timer for the initial it_value. The pump
+                // re-arms a periodic timer on fire if the interval is non-zero.
+                let interval_ns = u64::try_from(interval.as_nanos()).unwrap_or(u64::MAX);
+                crate::itimer::set_interval_ns(idx, interval_ns);
+                let value_ns = i64::try_from(value.as_nanos()).unwrap_or(i64::MAX);
+                let signum = crate::itimer::signum_for(idx);
                 let signal_name = match signum {
                     crate::linux_abi::LINUX_SIGVTALRM => "SIGVTALRM",
                     crate::linux_abi::LINUX_SIGPROF => "SIGPROF",
@@ -327,10 +336,19 @@ impl SyscallDispatcher {
                         "setitimer",
                         ctx.request.args,
                         format!(
-                            "setitimer delivery is emulated with host timer thread and {signal_name}"
+                            "setitimer delivery is emulated with an EVFILT_TIMER on the signal pump kqueue and {signal_name}"
                         ),
                     ));
-                spawn_itimer_thread(gen_arc, idx, my_gen, value, interval, signum);
+                if kq >= 0 {
+                    let _ = crate::darwin_kqueue::apply_changes(
+                        kq,
+                        &[crate::darwin_kqueue::Kevent::timer(
+                            ident,
+                            libc::EV_ADD | libc::EV_ONESHOT,
+                            value_ns,
+                        )],
+                    );
+                }
             }
         }
         Ok(DispatchOutcome::Returned { value: 0 })
@@ -609,40 +627,6 @@ fn rusage_from(user_us: u64, system_us: u64, maxrss_bytes: u64, majflt: u64) -> 
     ru
 }
 
-/// Spawn the per-arm interval-timer thread. After the initial `value` delay it
-/// publishes `signum` (SIGALRM/SIGVTALRM/SIGPROF) to the guest and, if an
-/// `interval` is set, keeps re-firing. Before each fire it checks the timer's
-/// generation: if `setitimer` re-armed or disarmed this `which` in the
-/// meantime, `gen[idx]` no longer equals `my_gen` and the thread exits without
-/// firing. The thread holds only an `Arc` to the generation array, so it never
-/// outlives the process (and forked children never inherit it — threads don't
-/// survive fork).
-fn spawn_itimer_thread(
-    gen_arc: std::sync::Arc<[std::sync::atomic::AtomicU64; 3]>,
-    idx: usize,
-    my_gen: u64,
-    value: std::time::Duration,
-    interval: std::time::Duration,
-    signum: i32,
-) {
-    use std::sync::atomic::Ordering;
-    let _ = std::thread::Builder::new()
-        .name("carrick-itimer".to_owned())
-        .spawn(move || {
-            std::thread::sleep(value);
-            loop {
-                if gen_arc[idx].load(Ordering::SeqCst) != my_gen {
-                    return;
-                }
-                crate::probes::itimer_fire(signum, my_gen);
-                crate::host_signal::publish_process_signal(signum);
-                if interval.is_zero() {
-                    return;
-                }
-                std::thread::sleep(interval);
-            }
-        });
-}
 
 /// Render an interval-timer's state as an `itimerval`, computing the time
 /// remaining (`value - elapsed`, saturating to zero on/after expiry). A
