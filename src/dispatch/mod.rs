@@ -829,15 +829,90 @@ struct EpollInterest {
 struct EventFdState {
     counter: Mutex<u64>,
     readable: Condvar,
+    /// Host pipe whose read end mirrors "counter > 0": exactly one byte is
+    /// present iff the eventfd is readable. This gives the eventfd a REAL host
+    /// fd that the epoll instance kqueue watches via `EVFILT_READ` natively
+    /// (level-triggered → can't be lost), so Go's netpollBreak wakes the poller
+    /// without relying on the coarse `EVFILT_USER` broadcast. `-1` if pipe
+    /// creation failed (then readiness falls back to the in-memory recompute +
+    /// broadcast). The bytes are managed entirely by carrick (write_eventfd /
+    /// read_eventfd); the guest never reads the pipe directly.
+    read_fd: std::os::fd::RawFd,
+    write_fd: std::os::fd::RawFd,
 }
 
 impl EventFdState {
     fn new(counter: u64) -> Self {
+        let (read_fd, write_fd) = make_readiness_pipe().unwrap_or((-1, -1));
+        // Reflect a non-zero initial value as "readable" right away.
+        if counter > 0 && write_fd >= 0 {
+            let byte = [1u8];
+            unsafe { libc::write(write_fd, byte.as_ptr().cast(), 1) };
+        }
         Self {
             counter: Mutex::new(counter),
             readable: Condvar::new(),
+            read_fd,
+            write_fd,
         }
     }
+
+    /// Make `read_fd` readable iff `count > 0`: ensure exactly one byte present
+    /// when readable, drained when not. Called under the counter lock.
+    fn sync_readiness(&self, count: u64) {
+        if self.read_fd < 0 {
+            return;
+        }
+        if count > 0 {
+            // Ensure a byte is present (idempotent: a full 1-deep pipe EAGAINs).
+            let byte = [1u8];
+            unsafe { libc::write(self.write_fd, byte.as_ptr().cast(), 1) };
+        } else {
+            // Drain any bytes so the read end is not readable.
+            let mut buf = [0u8; 64];
+            loop {
+                let n = unsafe { libc::read(self.read_fd, buf.as_mut_ptr().cast(), buf.len()) };
+                if n <= 0 {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+impl Drop for EventFdState {
+    fn drop(&mut self) {
+        for fd in [self.read_fd, self.write_fd] {
+            if fd >= 0 {
+                unsafe { libc::close(fd) };
+            }
+        }
+    }
+}
+
+/// A non-blocking, CLOEXEC host pipe relocated above the guest fd range, used as
+/// an eventfd's readiness channel. `None` on failure (caller degrades to the
+/// in-memory recompute + EVFILT_USER broadcast).
+fn make_readiness_pipe() -> Option<(std::os::fd::RawFd, std::os::fd::RawFd)> {
+    let mut fds = [0i32; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    let read_fd = crate::host_signal::relocate_internal_fd(fds[0]);
+    let write_fd = crate::host_signal::relocate_internal_fd(fds[1]);
+    for fd in [read_fd, write_fd] {
+        unsafe {
+            let fl = libc::fcntl(fd, libc::F_GETFL);
+            if fl >= 0 {
+                libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
+            }
+            let fdfl = libc::fcntl(fd, libc::F_GETFD);
+            if fdfl >= 0 {
+                libc::fcntl(fd, libc::F_SETFD, fdfl | libc::FD_CLOEXEC);
+            }
+        }
+    }
+    Some((read_fd, write_fd))
 }
 
 #[derive(Debug)]
@@ -2970,6 +3045,10 @@ fn read_eventfd(
     } else {
         *counter = 0;
     }
+    // Keep the host readiness pipe in sync (drains it when the counter hits 0,
+    // so the read end stops being readable; EFD_SEMAPHORE keeps it readable
+    // while the counter is still > 0).
+    state.sync_readiness(*counter);
     DispatchOutcome::Returned {
         value: core::mem::size_of::<LinuxEventfdValue>() as i64,
     }
@@ -3000,11 +3079,15 @@ fn write_eventfd(bytes: &[u8], state: &EventFdState) -> DispatchOutcome {
     };
     let was_zero = *counter == 0;
     *counter = next;
+    // Mirror readiness onto the host pipe so the epoll instance kqueue sees it
+    // natively (level-triggered, can't be lost) — the robust path for Go's
+    // netpollBreak.
+    state.sync_readiness(next);
     if was_zero && next > 0 {
         state.readable.notify_all();
-        // Also wake any epoll instance watching this eventfd: it's an in-memory
-        // fd (not host-backed), so a blocked epoll_wait on the instance kqueue
-        // won't see the readiness without this. Go's netpollBreak relies on it.
+        // Belt-and-suspenders for any epoll instance that (rarely) registered
+        // the eventfd before its host fd was available: also poke the in-memory
+        // wake broadcast. Redundant with the host-backed pipe above; harmless.
         drop(counter);
         notify_inmem_epoll();
     }

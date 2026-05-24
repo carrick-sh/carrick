@@ -990,6 +990,13 @@ impl SyscallDispatcher {
                 OpenDescription::HostPipe { host_fd, .. }
                 | OpenDescription::HostSocket { host_fd, .. }
                 | OpenDescription::HostFile { host_fd, .. } => Some(*host_fd),
+                // eventfd is host-backed by a readiness pipe (read end readable
+                // iff counter > 0), so epoll/poll/select watch it natively via
+                // EVFILT_READ/POLLIN — no in-memory recompute or EVFILT_USER
+                // broadcast needed (the robust path for Go's netpollBreak).
+                OpenDescription::EventFd { state, .. } if state.read_fd >= 0 => {
+                    Some(state.read_fd)
+                }
                 _ => None,
             };
         }
