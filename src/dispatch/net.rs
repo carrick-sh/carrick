@@ -134,6 +134,7 @@ impl SyscallDispatcher {
         let description = OpenDescription::Epoll {
             interest: HashMap::new(),
             status_flags: 0,
+            pending_ready: VecDeque::new(),
             kqueue: Arc::new(crate::dispatch::EpollKqueue::new(kqueue)),
         };
         Ok(self.install_fd(description, linux_fd_flags_from_open_flags(flags)))
@@ -173,7 +174,10 @@ impl SyscallDispatcher {
 
         let mut open = open_file.description.write();
         let OpenDescription::Epoll {
-            interest, kqueue, ..
+            interest,
+            pending_ready,
+            kqueue,
+            ..
         } = &mut *open
         else {
             return Ok(LINUX_EINVAL.into());
@@ -220,6 +224,7 @@ impl SyscallDispatcher {
                     epoll_kq_delete(kqueue, host_fd);
                     let _ = kqueue.apply(&epoll_kq_add_changes(host_fd, fd, event.events));
                 }
+                clear_pending_epoll_ready(pending_ready, fd);
                 *slot = EpollInterest {
                     event,
                     last_ready: 0,
@@ -232,6 +237,7 @@ impl SyscallDispatcher {
                     if let Some(host_fd) = host_fd {
                         epoll_kq_delete(kqueue, host_fd);
                     }
+                    clear_pending_epoll_ready(pending_ready, fd);
                     crate::probes::epoll_ctl(epfd, operation, fd, 0, 0, 0);
                     Ok(DispatchOutcome::Returned { value: 0 })
                 } else {
@@ -292,12 +298,30 @@ impl SyscallDispatcher {
             }
             .into());
         };
+        // Snapshot any already-queued ready events first.
+        let mut ready = {
+            let mut open = open_file.description.write();
+            let OpenDescription::Epoll {
+                pending_ready, ..
+            } = &mut *open
+            else {
+                return Ok(LINUX_EINVAL.into());
+            };
+            drain_pending_epoll_ready(pending_ready, max_events)
+        };
+        if !ready.is_empty() {
+            crate::probes::epoll_result(epfd, ready.len() as i32, 0, timeout_ms, 0);
+            return write_epoll_events(memory, events_address, &ready);
+        }
+
         // Snapshot interest metadata and the persistent instance kqueue. The
         // kqueue is the authoritative readiness source for host-backed fds
         // (sockets/pipes/ptys) — crucially, it monitors fds registered by OTHER
         // threads while this thread is blocked, fixing the interest-snapshot
-        // race that lost a netpoller wakeup. In-memory fds (eventfd/pipe/timerfd)
-        // have no host fd and are recomputed each call.
+        // race that lost a netpoller wakeup. If a drained host event names a
+        // guest fd that is not in this snapshot, fall back to the live map
+        // before dropping it; that covers the narrow concurrent ADD race
+        // without putting a live lock lookup on every returned event.
         let (interests, kq, kq_fd) = {
             let open = open_file.description.read();
             let OpenDescription::Epoll {
@@ -338,12 +362,26 @@ impl SyscallDispatcher {
                         continue;
                     }
                     let guest_fd = ev.udata_i32();
-                    if let Some((_, slot)) = interests.iter().find(|(f, _)| *f == guest_fd) {
-                        let masked = bits & (slot.event.events | LINUX_EPOLLHUP | LINUX_EPOLLERR);
-                        if masked != 0 {
-                            let entry = acc.entry(guest_fd).or_insert((0, slot.event.data));
-                            entry.0 |= masked;
-                        }
+                    let Some((requested, data)) = interests
+                        .iter()
+                        .find(|(fd, _)| *fd == guest_fd)
+                        .map(|(_, slot)| (slot.event.events, slot.event.data))
+                        .or_else(|| {
+                            let open = open_file.description.read();
+                            match &*open {
+                                OpenDescription::Epoll { interest, .. } => interest
+                                    .get(&guest_fd)
+                                    .map(|slot| (slot.event.events, slot.event.data)),
+                                _ => None,
+                            }
+                        })
+                    else {
+                        continue;
+                    };
+                    let masked = bits & (requested | LINUX_EPOLLHUP | LINUX_EPOLLERR);
+                    if masked != 0 {
+                        let entry = acc.entry(guest_fd).or_insert((0, data));
+                        entry.0 |= masked;
                     }
                 }
             }
@@ -390,28 +428,19 @@ impl SyscallDispatcher {
             }
         }
 
-        let ready: Vec<LinuxEpollEvent> = acc
+        ready = acc
             .into_iter()
-            .take(max_events)
             .map(|(_, (events, data))| LinuxEpollEvent {
                 events,
                 _pad: 0,
                 data,
             })
             .collect();
-
-        let event_size = core::mem::size_of::<LinuxEpollEvent>();
-        for (index, event) in ready.iter().enumerate() {
-            let offset = index
-                .checked_mul(event_size)
-                .and_then(|offset| u64::try_from(offset).ok())
-                .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
-            let address = events_address.checked_add(offset).ok_or(LINUX_EFAULT);
-            let Ok(address) = address else {
-                return Ok(LINUX_EFAULT.into());
-            };
-            if write_kernel_struct_raw(memory, address, event).is_err() {
-                return Ok(LINUX_EFAULT.into());
+        if ready.len() > max_events {
+            let overflow = ready.split_off(max_events);
+            let mut open = open_file.description.write();
+            if let OpenDescription::Epoll { pending_ready, .. } = &mut *open {
+                pending_ready.extend(overflow);
             }
         }
 
@@ -436,9 +465,7 @@ impl SyscallDispatcher {
         }
 
         crate::probes::epoll_result(epfd, ready.len() as i32, 0, timeout_ms, 0);
-        Ok(DispatchOutcome::Returned {
-            value: ready.len() as i64,
-        })
+        write_epoll_events(memory, events_address, &ready)
     }
 
     fn epoll_ready_events(&self, fd: i32, requested_events: u32) -> u32 {
@@ -2547,6 +2574,42 @@ fn epoll_kq_delete(kqueue: &crate::darwin_kqueue::Kqueue, host_fd: i32) {
     use crate::darwin_kqueue::Kevent;
     let _ = kqueue.apply(&[Kevent::read(host_fd, libc::EV_DELETE)]);
     let _ = kqueue.apply(&[Kevent::write(host_fd, libc::EV_DELETE)]);
+}
+
+fn clear_pending_epoll_ready(pending_ready: &mut VecDeque<LinuxEpollEvent>, guest_fd: i32) {
+    pending_ready.retain(|event| event.data != guest_fd as u64);
+}
+
+fn drain_pending_epoll_ready(
+    pending_ready: &mut VecDeque<LinuxEpollEvent>,
+    max_events: usize,
+) -> Vec<LinuxEpollEvent> {
+    let take = pending_ready.len().min(max_events);
+    pending_ready.drain(..take).collect()
+}
+
+fn write_epoll_events<M: GuestMemory>(
+    memory: &mut M,
+    events_address: u64,
+    ready: &[LinuxEpollEvent],
+) -> Result<DispatchOutcome, DispatchError> {
+    let event_size = core::mem::size_of::<LinuxEpollEvent>();
+    for (index, event) in ready.iter().enumerate() {
+        let offset = index
+            .checked_mul(event_size)
+            .and_then(|offset| u64::try_from(offset).ok())
+            .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
+        let address = events_address.checked_add(offset).ok_or(LINUX_EFAULT);
+        let Ok(address) = address else {
+            return Ok(LINUX_EFAULT.into());
+        };
+        if write_kernel_struct_raw(memory, address, event).is_err() {
+            return Ok(LINUX_EFAULT.into());
+        }
+    }
+    Ok(DispatchOutcome::Returned {
+        value: ready.len() as i64,
+    })
 }
 
 /// Translate one returned kqueue event (from an epoll instance kqueue) to Linux
