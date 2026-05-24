@@ -539,6 +539,11 @@ pub enum DispatchOutcome {
         /// blocking recv/accept with a finite SO_RCVTIMEO (a timeout means
         /// "would have blocked"). Only consulted when `timeout` is `Some`.
         on_timeout: i64,
+        /// Signals (bit `signum-1`) this syscall temporarily blocks for the
+        /// duration of the wait — an `epoll_pwait`/`ppoll`/`pselect6` sigmask. A
+        /// signal blocked here does NOT interrupt the wait (it stays pending and
+        /// is delivered after the syscall, per the persistent mask). `0` = none.
+        block_signals: u64,
     },
 }
 
@@ -3784,6 +3789,7 @@ fn would_block_outcome(host_fd: i32, events: i16, nonblocking: bool) -> Dispatch
             fds: vec![(host_fd, events)],
             timeout: None,
             on_timeout: -(LINUX_EAGAIN as i64),
+            block_signals: 0,
         }
     }
 }

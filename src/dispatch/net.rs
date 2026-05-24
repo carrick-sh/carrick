@@ -263,17 +263,24 @@ impl SyscallDispatcher {
             return Ok(LINUX_EINVAL.into());
         }
         let max_events = max_events_signed as usize;
-        if sigmask_ptr != 0 {
+        // The sigmask temporarily blocks signals for the duration of the wait;
+        // capture it as a u64 bitmask (bit signum-1) to carry into WaitOnFds so
+        // a blocked signal doesn't interrupt the wait (LTP epoll_pwait01).
+        let block_signals: u64 = if sigmask_ptr != 0 {
             if sigsetsize != crate::linux_abi::LINUX_RT_SIGSET_SIZE {
                 return Ok(LINUX_EINVAL.into());
             }
-            if memory
-                .read_bytes(sigmask_ptr, crate::linux_abi::LINUX_RT_SIGSET_SIZE as usize)
-                .is_err()
-            {
-                return Ok(LINUX_EFAULT.into());
+            match memory.read_bytes(sigmask_ptr, crate::linux_abi::LINUX_RT_SIGSET_SIZE as usize) {
+                Ok(bytes) => {
+                    let mut le = [0u8; 8];
+                    le.copy_from_slice(&bytes[..8]);
+                    u64::from_le_bytes(le)
+                }
+                Err(_) => return Ok(LINUX_EFAULT.into()),
             }
-        }
+        } else {
+            0
+        };
 
         let Some(open_file) = self.open_file(epfd) else {
             // A valid fd that simply isn't an epoll instance is EINVAL; only a
@@ -423,6 +430,7 @@ impl SyscallDispatcher {
                 fds: vec![(kq_fd, libc::POLLIN)],
                 timeout,
                 on_timeout: 0,
+                block_signals,
             });
         }
 
@@ -888,6 +896,9 @@ impl SyscallDispatcher {
                 fds: wait_fds,
                 timeout,
                 on_timeout: 0,
+                // ppoll's sigmask is not yet applied during the wait (separate
+                // follow-up, like epoll_pwait was); preserve current behaviour.
+                block_signals: 0,
             });
         }
 
@@ -1027,6 +1038,7 @@ impl SyscallDispatcher {
                         fds: vec![(host_fd, dir.events())],
                         timeout: None,
                         on_timeout: -(LINUX_EAGAIN as i64),
+                        block_signals: 0,
                     }
                 }
             }
@@ -1693,6 +1705,7 @@ impl SyscallDispatcher {
                 fds: vec![(host_fd, libc::POLLOUT)],
                 timeout: None,
                 on_timeout: -(LINUX_EINPROGRESS as i64),
+                block_signals: 0,
             });
         }
         Ok(e.into())
