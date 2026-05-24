@@ -248,6 +248,101 @@ impl ThreadWaiter {
         result
     }
 
+    /// Block until process `pid` exits, a signal becomes pending, or a fork
+    /// quiesce begins. Used by a blocking `waitid(P_PID)`: the child's exit is
+    /// observed via the per-thread kqueue's `EVFILT_PROC`/`NOTE_EXIT` (macOS's
+    /// native process-lifecycle tracking) so the thread parks in `kevent()` —
+    /// interruptible by the self-pipe poke — instead of an uninterruptible
+    /// `libc::waitid`. The runtime re-dispatches the waitid on `Ready` to reap.
+    #[cfg(target_os = "macos")]
+    pub fn wait_proc_exit(&self, pid: i32, block_mask: u64) -> WaitResult {
+        let Some(kq) = self.kq.as_ref() else {
+            // No per-thread kqueue: let the caller fall back to a bounded poll.
+            return WaitResult::Interrupted;
+        };
+        if crate::host_signal::has_unblocked_pending_for(self.tid, block_mask)
+            || crate::fork_quiesce::is_quiescing()
+        {
+            return WaitResult::Interrupted;
+        }
+        let mut changes = vec![Kevent::proc_exit(pid)];
+        let cap = (1 + self.signal_pipe_count()).max(1);
+        let mut events_out: Vec<Kevent> = vec![Kevent::empty(); cap];
+        let result = loop {
+            // No deadline: the self-pipe wakes us on a signal/quiesce. Without a
+            // signal pipe, cap at 50ms to re-check the quiesce flag.
+            let ts = if self.has_signal_pipe() {
+                None
+            } else {
+                Some(libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 50_000_000,
+                })
+            };
+            let n = kq.wait(&changes, &mut events_out, ts.as_ref());
+            changes.clear(); // registration persists; only add once.
+            let n = match n {
+                Ok(n) => n,
+                Err(_) => {
+                    if crate::host_signal::has_unblocked_pending_for(self.tid, block_mask)
+                        || crate::fork_quiesce::is_quiescing()
+                    {
+                        break WaitResult::Interrupted;
+                    }
+                    continue;
+                }
+            };
+            let mut proc_woke = false;
+            let mut process_pipe_woke = false;
+            let mut thread_pipe_woke = false;
+            for e in &events_out[..n] {
+                if e.is_read_for_fd(self.process_pipe_read) {
+                    process_pipe_woke = true;
+                } else if self
+                    .thread_wake
+                    .as_ref()
+                    .is_some_and(|thread_wake| e.is_read_for_fd(thread_wake.read_fd()))
+                {
+                    thread_pipe_woke = true;
+                } else {
+                    // The EVFILT_PROC/NOTE_EXIT event (or an EV_ERROR because the
+                    // pid was already gone) — either way the child is now
+                    // reapable, so re-dispatch the waitid.
+                    proc_woke = true;
+                }
+            }
+            if proc_woke {
+                break WaitResult::Ready;
+            }
+            if process_pipe_woke {
+                crate::host_signal::drain_pending_pipe();
+            }
+            if thread_pipe_woke && let Some(thread_wake) = self.thread_wake.as_ref() {
+                thread_wake.drain();
+            }
+            if crate::host_signal::has_unblocked_pending_for(self.tid, block_mask)
+                || crate::fork_quiesce::is_quiescing()
+            {
+                break WaitResult::Interrupted;
+            }
+        };
+        // Drop the one-shot proc watch if it didn't fire (interrupted wait), so
+        // it can't accumulate on the long-lived kqueue. ENOENT is fine.
+        let zero = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let _ = kq.wait(&[Kevent::proc_exit_delete(pid)], &mut [], Some(&zero));
+        result
+    }
+
+    /// Non-macOS stub: no kqueue, so report interrupted and let the caller
+    /// fall back to a bounded retry.
+    #[cfg(not(target_os = "macos"))]
+    pub fn wait_proc_exit(&self, _pid: i32, _block_mask: u64) -> WaitResult {
+        WaitResult::Interrupted
+    }
+
     #[cfg(target_os = "macos")]
     fn wait_kqueue(
         &self,

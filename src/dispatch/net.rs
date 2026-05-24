@@ -1006,7 +1006,7 @@ impl SyscallDispatcher {
     /// `Some(host_fd)` means we can hand this off to libc::poll.
     /// `None` means it's synthetic (epoll/eventfd/timerfd/in-memory pipe)
     /// and ppoll has to fall back to the per-fd readiness loop.
-    fn host_fd_for_poll(&self, fd: i32) -> Option<i32> {
+    pub(super) fn host_fd_for_poll(&self, fd: i32) -> Option<i32> {
         if fd < 0 {
             // Negative fd in a pollfd entry: libc::poll ignores it
             // (revents=0), which is the right semantic. Pass it through.

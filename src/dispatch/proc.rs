@@ -739,37 +739,83 @@ impl SyscallDispatcher {
         if options & LINUX_WCONTINUED != 0 {
             host_options |= libc::WCONTINUED;
         }
-        if options & LINUX_WNOHANG != 0 {
-            host_options |= libc::WNOHANG;
-        }
         if options & LINUX_WNOWAIT != 0 {
             host_options |= libc::WNOWAIT;
         }
+        // Whether the guest asked for a non-blocking poll.
+        let guest_nohang = options & LINUX_WNOHANG != 0;
 
+        // Always probe non-blocking first (WNOHANG): a child that already
+        // changed state is reported immediately, and otherwise we decide how
+        // to block WITHOUT holding any lock or sitting in an uninterruptible
+        // host syscall (a stop-the-world fork must be able to wake us).
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        // Retry across carrick-internal host-signal EINTR (the SIGURG vCPU
-        // kick), surfacing EINTR to the guest only when it has a deliverable
-        // signal pending — same discipline as wait4 above.
-        let result = loop {
-            let r = unsafe { libc::waitid(host_idtype, host_id, &mut info, host_options) };
-            if r == 0 {
-                break Ok(());
-            }
+        let r =
+            unsafe { libc::waitid(host_idtype, host_id, &mut info, host_options | libc::WNOHANG) };
+        if r != 0 {
             let errno = std::io::Error::last_os_error()
                 .raw_os_error()
                 .unwrap_or(0);
-            if errno == LINUX_EINTR && !crate::host_signal::has_process_pending() {
-                continue;
-            }
-            break Err(errno);
-        };
-        if let Err(errno) = result {
-            // macOS ECHILD/EINVAL share their numbers with Linux (10/22).
+            // EINTR on a WNOHANG call is spurious (a carrick host signal); the
+            // caller re-issues. macOS ECHILD/EINVAL share Linux's numbers.
             return Ok(DispatchOutcome::errno(errno));
         }
-        // Fill the guest siginfo_t (SIGCHLD layout). macOS, like Linux, leaves
-        // si_pid == 0 with WNOHANG when no child is waitable — callers read that
-        // as "nothing ready", so propagate it verbatim.
+        // si_pid (copied out of the possibly-unaligned host siginfo by value)
+        // is 0 when no child was waitable.
+        let si_pid = info.si_pid;
+        if si_pid == 0 && !guest_nohang {
+            // Nothing ready and the guest wants to block. Park the vCPU thread
+            // on the child's exit event instead of blocking in libc::waitid
+            // (which a fork quiesce cannot interrupt — `hv_vcpus_exit` and the
+            // wake-pipe poke don't reach a thread inside a raw host syscall).
+            // P_PIDFD's backing kqueue (EVFILT_PROC/NOTE_EXIT) becomes readable
+            // when the child exits; poll it via WaitOnPollFds, which the
+            // per-thread waiter services and a quiesce / pending signal wakes.
+            // On wake the runtime re-dispatches this waitid, now reaping.
+            if idtype == LINUX_P_PIDFD {
+                if let Some(host_fd) = self.host_fd_for_poll(id as i32) {
+                    return Ok(DispatchOutcome::WaitOnPollFds {
+                        fds: vec![(host_fd, libc::POLLIN)],
+                        timeout: None,
+                        on_timeout: 0,
+                        block_signals: 0,
+                    });
+                }
+            }
+            // P_PID: park on the child's exit via EVFILT_PROC on the per-thread
+            // kqueue (interruptible by a signal or a fork quiesce). Go's
+            // os.Process.blockUntilWaitable takes this path.
+            if idtype == LINUX_P_PID {
+                return Ok(DispatchOutcome::WaitOnProcExit {
+                    pid: id as i32,
+                    block_signals: 0,
+                });
+            }
+            // P_ALL/P_PGID have no single pollable exit pid. Fall back to a
+            // blocking libc::waitid, breaking out if a fork quiesce begins (the
+            // guest re-issues on the resulting EINTR).
+            loop {
+                let r =
+                    unsafe { libc::waitid(host_idtype, host_id, &mut info, host_options) };
+                if r == 0 {
+                    break;
+                }
+                let errno = std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(0);
+                if errno == LINUX_EINTR
+                    && !crate::host_signal::has_process_pending()
+                    && !crate::fork_quiesce::is_quiescing()
+                {
+                    continue;
+                }
+                return Ok(DispatchOutcome::errno(errno));
+            }
+        }
+        // Fill the guest siginfo_t (SIGCHLD layout). Leave it zeroed when no
+        // child was waitable under a guest WNOHANG — Linux reports that as
+        // si_pid == 0, which callers (Go's blockUntilWaitable) read as "nothing
+        // ready".
         if infop_addr != 0 {
             let bytes = if info.si_pid == 0 {
                 [0u8; crate::linux_abi::LINUX_SIGINFO_SIZE]

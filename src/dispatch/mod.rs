@@ -566,6 +566,16 @@ pub enum DispatchOutcome {
         /// Signals (bit `signum-1`) temporarily blocked for the wait.
         block_signals: u64,
     },
+    /// A blocking `waitid(P_PID, pid, …)` whose target child hasn't changed
+    /// state yet. The runtime parks the vCPU thread on the child's exit via the
+    /// per-thread kqueue's `EVFILT_PROC`/`NOTE_EXIT` (interruptible by a signal
+    /// or a fork quiesce — unlike a raw `libc::waitid`), then re-dispatches the
+    /// waitid to reap. `block_signals` is the temporarily-blocked sigmask (0 for
+    /// a plain waitid).
+    WaitOnProcExit {
+        pid: i32,
+        block_signals: u64,
+    },
 }
 
 impl DispatchOutcome {
@@ -593,6 +603,7 @@ impl DispatchOutcome {
             DispatchOutcome::SharedFutexWait { .. } => (0, None),
             DispatchOutcome::WaitOnFds { .. } => (0, None),
             DispatchOutcome::WaitOnPollFds { .. } => (0, None),
+            DispatchOutcome::WaitOnProcExit { .. } => (0, None),
         }
     }
 }
