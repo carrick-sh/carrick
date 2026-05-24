@@ -14,6 +14,11 @@ pub(super) struct MemState {
     /// List of live MAP_SHARED file mappings (guest_addr, len) so
     /// munmap/msync can route to them. See [`SyscallDispatcher::mmap`].
     pub shared_file_maps: Vec<(u64, usize)>,
+    /// Freed in-arena anonymous/private ranges available for reuse, kept sorted
+    /// by start and coalesced. Reclaiming `munmap`'d space so a churning guest
+    /// doesn't exhaust the bump arena. NOT used for MAP_FIXED or shared-file
+    /// maps (those have their own lifecycles).
+    pub free_regions: Vec<(u64, u64)>,
     /// Snapshot of the guest's `AddressSpace` regions, captured at boot
     /// via [`SyscallDispatcher::set_address_space_regions`]. When present,
     /// `/proc/self/maps` is rendered from this list (with the heap end
@@ -29,9 +34,39 @@ impl MemState {
             mmap_next: LINUX_MMAP_BASE,
             shared_file_next: crate::memory::LINUX_SHARED_FILE_BASE,
             shared_file_maps: Vec::new(),
+            free_regions: Vec::new(),
             address_space_regions: None,
         }
     }
+}
+
+/// Insert `[addr, addr+len)` into `regions` (sorted by start), coalescing any
+/// adjacent or overlapping ranges. `len` must be > 0.
+fn free_regions_insert(regions: &mut Vec<(u64, u64)>, addr: u64, len: u64) {
+    let mut new_start = addr;
+    let mut new_end = addr.saturating_add(len);
+    let mut out: Vec<(u64, u64)> = Vec::with_capacity(regions.len() + 1);
+    let mut inserted = false;
+    for &(s, l) in regions.iter() {
+        let e = s.saturating_add(l);
+        if e < new_start || s > new_end {
+            // Disjoint from the (growing) merged range. Emit in sorted order.
+            if !inserted && s > new_end {
+                out.push((new_start, new_end - new_start));
+                inserted = true;
+            }
+            out.push((s, l));
+        } else {
+            // Overlapping or adjacent — absorb into the merged range.
+            new_start = new_start.min(s);
+            new_end = new_end.max(e);
+        }
+    }
+    if !inserted {
+        out.push((new_start, new_end - new_start));
+    }
+    out.sort_by_key(|&(s, _)| s);
+    *regions = out;
 }
 
 impl SyscallDispatcher {
@@ -191,12 +226,20 @@ impl SyscallDispatcher {
             }
         }
 
-        let address = match self.next_mmap_address(requested, length, prot, flags) {
-            Some(address) => address,
+        let (address, reused) = match self.next_mmap_address(requested, length, prot, flags) {
+            Some(pair) => pair,
             None => {
                 return Ok(LINUX_ENOMEM.into());
             }
         };
+        // A reused arena range carries the previous mapping's bytes; anonymous
+        // mmap must hand back zeroed memory. Fresh bump ranges are demand-zero
+        // (HVF), so zero ONLY on reuse — zeroing a fresh range would force it
+        // resident and defeat the lazy 32 GiB arena.
+        if reused {
+            let zeros = vec![0u8; length_usize];
+            let _ = memory.write_bytes(address, &zeros);
+        }
 
         let prot_none = prot & (LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC) == 0;
         if prot_none && flags & LINUX_MAP_ANONYMOUS != 0 {
@@ -278,7 +321,17 @@ impl SyscallDispatcher {
         })
     }
 
-    fn next_mmap_address(&self, requested: u64, length: u64, _prot: u64, flags: u64) -> Option<u64> {
+    /// Returns `(address, reused)`. `reused == true` means the range came from
+    /// the free-list and the caller MUST zero it (anonymous-mmap contract);
+    /// a fresh bump/FIXED/hint placement is demand-zero and must NOT be zeroed
+    /// (that would force it resident and defeat the lazy arena).
+    fn next_mmap_address(
+        &self,
+        requested: u64,
+        length: u64,
+        _prot: u64,
+        flags: u64,
+    ) -> Option<(u64, bool)> {
         if flags & LINUX_MAP_FIXED != 0 {
             // Bootstrap policy: accept MAP_FIXED at any page-aligned guest
             // address that fits in the configured IPA window. We do not
@@ -289,7 +342,7 @@ impl SyscallDispatcher {
             if requested == 0 || !requested.is_multiple_of(LINUX_PAGE_SIZE) {
                 return None;
             }
-            return Some(requested);
+            return Some((requested, false));
         }
 
         if requested != 0 {
@@ -300,7 +353,7 @@ impl SyscallDispatcher {
                 let end = requested.checked_add(length)?;
                 if requested >= mem.mmap_next {
                     mem.mmap_next = end;
-                    return Some(requested);
+                    return Some((requested, false));
                 }
             }
             // An out-of-window hint is ADVISORY without MAP_FIXED (POSIX), so we
@@ -316,12 +369,24 @@ impl SyscallDispatcher {
         }
 
         let mut mem = self.mem.lock();
+        // Reuse a freed in-arena region first (first-fit) so a churning guest
+        // doesn't grow the bump cursor forever. Reused ranges carry the previous
+        // mapping's bytes, so the caller zeroes them.
+        if let Some(pos) = mem.free_regions.iter().position(|&(_, l)| l >= length) {
+            let (s, l) = mem.free_regions[pos];
+            if l == length {
+                mem.free_regions.remove(pos);
+            } else {
+                mem.free_regions[pos] = (s + length, l - length);
+            }
+            return Some((s, true));
+        }
         let address = align_up_u64(mem.mmap_next, LINUX_PAGE_SIZE)?;
         if !range_within(address, length, LINUX_MMAP_BASE, LINUX_MMAP_SIZE) {
             return None;
         }
         mem.mmap_next = address.checked_add(length)?;
-        Some(address)
+        Some((address, false))
     }
 
     /// Bump-allocate a page-aligned guest address in the dedicated
@@ -366,6 +431,27 @@ impl SyscallDispatcher {
         }
         if !range_within(address, length, LINUX_MMAP_BASE, LINUX_MMAP_SIZE) {
             return Ok(LINUX_EINVAL.into());
+        }
+        // Reclaim the range so a churning guest reuses it instead of growing the
+        // bump cursor forever. The arena is flat stage-2-mapped, so there is no
+        // host/HVF unmap to do — only mark the VA reusable.
+        if let Some(len) = align_up_u64(length, LINUX_PAGE_SIZE) {
+            let mut mem = self.mem.lock();
+            // Fast path: freeing the top of the bump just lowers the cursor, then
+            // absorb any free region now sitting at the new top.
+            if address.checked_add(len) == Some(mem.mmap_next) {
+                mem.mmap_next = address;
+                while let Some(pos) = mem
+                    .free_regions
+                    .iter()
+                    .position(|&(s, l)| s.checked_add(l) == Some(mem.mmap_next))
+                {
+                    let (s, _l) = mem.free_regions.remove(pos);
+                    mem.mmap_next = s;
+                }
+            } else {
+                free_regions_insert(&mut mem.free_regions, address, len);
+            }
         }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
@@ -516,11 +602,20 @@ impl SyscallDispatcher {
         if flags & LINUX_MREMAP_MAYMOVE == 0 {
             return Ok(LINUX_ENOMEM.into());
         }
-        let Some(new_address) =
+        let Some((new_address, reused)) =
             self.next_mmap_address(0, new_size, LINUX_PROT_READ | LINUX_PROT_WRITE, 0)
         else {
             return Ok(LINUX_ENOMEM.into());
         };
+        // A reused arena range carries the previous mapping's bytes; zero the
+        // whole new extent so the grown tail reads zero (the head is overwritten
+        // by the copy below). A fresh bump range is demand-zero — skip it.
+        if reused
+            && let Ok(n) = usize::try_from(new_size)
+        {
+            let zeros = vec![0u8; n];
+            let _ = memory.write_bytes(new_address, &zeros);
+        }
         let copy_len = match usize::try_from(old_size) {
             Ok(len) => len,
             Err(_) => {
@@ -658,4 +753,27 @@ fn range_within(address: u64, length: u64, base: u64, size: u64) -> bool {
         return false;
     };
     address >= base && end <= limit
+}
+
+#[cfg(test)]
+mod tests {
+    use super::free_regions_insert;
+
+    #[test]
+    fn free_regions_coalesce_adjacent() {
+        let mut r = vec![];
+        free_regions_insert(&mut r, 0x1000, 0x1000); // [0x1000,0x2000)
+        free_regions_insert(&mut r, 0x3000, 0x1000); // [0x3000,0x4000)
+        free_regions_insert(&mut r, 0x2000, 0x1000); // bridges → one [0x1000,0x4000)
+        assert_eq!(r, vec![(0x1000, 0x3000)]);
+    }
+
+    #[test]
+    fn free_regions_coalesce_overlap_and_keep_disjoint() {
+        let mut r = vec![];
+        free_regions_insert(&mut r, 0x1000, 0x2000); // [0x1000,0x3000)
+        free_regions_insert(&mut r, 0x2000, 0x2000); // overlaps → [0x1000,0x4000)
+        free_regions_insert(&mut r, 0x9000, 0x1000); // disjoint
+        assert_eq!(r, vec![(0x1000, 0x3000), (0x9000, 0x1000)]);
+    }
 }
