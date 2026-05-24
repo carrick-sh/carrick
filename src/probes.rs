@@ -39,6 +39,12 @@ mod carrick_usdt {
     /// restored the snapshot. `pid` is the libc::fork return value
     /// (0 in the child, child pid in the parent).
     fn fork__post(_: i32, _: u64, _: u64) {}
+    /// Fork stop-the-world quiesce trace. `phase`: 0=begin (a=others to wait
+    /// for, b=kicker live count), 1=quiesce TIMEOUT (a=others, b=paused),
+    /// 2=hv_vm_destroy result (a=rc — NONZERO means a vCPU was still live, the
+    /// HV_BUSY root cause), 3=vcpu_create result in a sibling rebuild / spawn
+    /// (a=rc, b=site: 0=rebuild 1=spawn). `tid` is the acting thread.
+    fn fork__quiesce(_: i32, _: i64, _: i64, _: i32) {}
     /// Fires every syscall trap. `arg0` is the ADDRESS of a
     /// `compat::GuestRegs` (`#[repr(C)]`); DTrace does
     /// `copyin(arg0, sizeof(gregs_t))` and reads fields by offset. A
@@ -233,6 +239,10 @@ pub fn io_wait_begin(tid: i32, fd_count: i32, timeout_ms: i64, fd0: i32, events0
 
 pub fn io_wait_end(tid: i32, result: i32, fd_count: i32, fd0: i32, fd1: i32, fd2: i32) {
     carrick_usdt::io__wait__end!(|| (tid, result, fd_count, fd0, fd1, fd2));
+}
+
+pub fn fork_quiesce(phase: i32, a: i64, b: i64, tid: i32) {
+    carrick_usdt::fork__quiesce!(|| (phase, a, b, tid));
 }
 
 pub fn fork_post(pid: i32, pc: u64, elr: u64) {
