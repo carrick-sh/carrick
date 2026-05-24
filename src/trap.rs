@@ -231,6 +231,38 @@ const GPR_TABLE: [applevisor::vcpu::Reg; 31] = [
     applevisor::vcpu::Reg::X30,
 ];
 
+/// V0–V31 SIMD/FP registers, saved/restored across signal delivery alongside
+/// the GPRs so a handler that uses SIMD (aarch64 `memcpy`/`memset`, the guest's
+/// own handler body) cannot corrupt the interrupted thread's vector state.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const SIMD_FP_TABLE: [applevisor::vcpu::SimdFpReg; 32] = {
+    use applevisor_sys::hv_simd_fp_reg_t::*;
+    [
+        Q0, Q1, Q2, Q3, Q4, Q5, Q6, Q7, Q8, Q9, Q10, Q11, Q12, Q13, Q14, Q15, Q16, Q17, Q18, Q19,
+        Q20, Q21, Q22, Q23, Q24, Q25, Q26, Q27, Q28, Q29, Q30, Q31,
+    ]
+};
+
+/// Full-speed diagnostic counters (the dtrace consumer perturbs the
+/// SIGURG-vs-futex race away, so observe with cheap atomics instead). Dumped at
+/// process teardown when `CARRICK_KICK_STATS` is set.
+pub static EL1_KICK_RESUMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static INJECT_AT_EL1: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static KICK_PATH_INJECT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn dump_kick_stats() {
+    if std::env::var_os("CARRICK_KICK_STATS").is_some() {
+        use std::sync::atomic::Ordering;
+        eprintln!(
+            "[kick_stats pid={}] el1_kick_resumed={} kick_path_inject={} inject_at_el1={}",
+            unsafe { libc::getpid() },
+            EL1_KICK_RESUMED.load(Ordering::Relaxed),
+            KICK_PATH_INJECT.load(Ordering::Relaxed),
+            INJECT_AT_EL1.load(Ordering::Relaxed),
+        );
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Default)]
 struct MemoryProtections {
@@ -940,20 +972,41 @@ impl HvfInner {
         // guest's user CPU time from this. (hv_vcpu_get_exec_time was measured
         // to under-report ~40× here, so it isn't used.) Accumulated lock-free
         // into this vCPU thread's slot; summed process-wide by `guest_cpu`.
-        let run_start = std::time::Instant::now();
-        let run_result = self.vcpu.run();
-        let run_ns = run_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-        crate::guest_cpu::add(run_ns);
-        run_result.map_err(hvf_error)?;
-        let exit = self.vcpu.get_exit_info();
-        if exit.reason == ExitReason::CANCELED {
-            // A cross-thread `hv_vcpus_exit` (crate::vcpu_kick) forced this vCPU
-            // out of the guest so a pending signal can be delivered. There is no
-            // syscall; the loop runs signal delivery, then resumes the guest at
-            // its current PC. A spurious cancel with nothing pending just costs
-            // one extra loop iteration.
-            return Ok(None);
-        }
+        let exit = loop {
+            let run_start = std::time::Instant::now();
+            let run_result = self.vcpu.run();
+            let run_ns = run_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+            crate::guest_cpu::add(run_ns);
+            run_result.map_err(hvf_error)?;
+            let exit = self.vcpu.get_exit_info();
+            if exit.reason == ExitReason::CANCELED {
+                // A cross-thread `hv_vcpus_exit` (crate::vcpu_kick) forced this
+                // vCPU out of the guest so a pending signal can be delivered.
+                //
+                // But the kick can land while the vCPU is still inside carrick's
+                // EL1 trap trampoline — a guest EL0 `svc`/fault is mid-flight,
+                // between the vector entry (VBAR_EL1 = vectors_base, e.g. the
+                // sync-from-EL0 entry at +0x400) and the HVC that traps out to
+                // the host. PC there is an EL1 trampoline address, NOT a guest
+                // userspace PC. Injecting a signal frame at it (the run loop
+                // treats `None` as "deliver at current PC") overwrites the
+                // in-flight exception and wedges the thread — reproduced as a
+                // SIGURG storm corrupting a futex waiter (pc=vectors_base+0x404).
+                //
+                // Resume until the guest is back at EL0 so the trampoline
+                // completes its HVC and the real syscall is serviced; the
+                // pending signal is then delivered at that clean EL0 boundary.
+                let cpsr = self.vcpu.get_reg(Reg::CPSR).map_err(hvf_error)?;
+                let el = (cpsr >> 2) & 0b11;
+                if el != 0 {
+                    EL1_KICK_RESUMED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    crate::probes::kick_in_kernel(self.vcpu.get_reg(Reg::PC).unwrap_or(0), el as u32);
+                    continue;
+                }
+                return Ok(None);
+            }
+            break exit;
+        };
         if exit.reason != ExitReason::EXCEPTION {
             return Err(TrapError::UnexpectedExit {
                 reason: format!("{:?}", exit.reason),
@@ -1421,7 +1474,15 @@ impl HvfInner {
         // kick (CANCELED) exit there was no exception, so ELR_EL1 is stale and
         // the caller passes the live guest PC instead.
         frame.saved_pc = match interrupted_pc {
-            Some(pc) => pc,
+            Some(pc) => {
+                KICK_PATH_INJECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // Tripwire: a kick-path injection should never capture a PC in
+                // carrick's EL1 vector page — run_until_syscall resumes those.
+                if (0x20000..0x24000).contains(&pc) {
+                    INJECT_AT_EL1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                pc
+            }
             None => self.vcpu.get_sys_reg(SysReg::ELR_EL1).map_err(hvf_error)?,
         };
         frame.saved_sp = self.vcpu.get_sys_reg(SysReg::SP_EL0).map_err(hvf_error)?;
@@ -1437,6 +1498,11 @@ impl HvfInner {
         mcontext.sp = frame.saved_sp;
         mcontext.pc = frame.saved_pc;
         mcontext.pstate = frame.saved_spsr;
+        // Save V0–V31 + FPSR/FPCR as a Linux fpsimd_context at the start of
+        // sigcontext.__reserved, so the handler can't leak SIMD state into the
+        // interrupted thread (aarch64 memcpy/memset use V registers) and so a
+        // handler inspecting the ucontext sees real FP state.
+        self.save_fpsimd_into(&mut mcontext)?;
         let mut ucontext = crate::linux_abi::LinuxUcontext::empty();
         ucontext.uc_sigmask = saved_sigmask;
         ucontext.uc_mcontext = mcontext;
@@ -1550,6 +1616,63 @@ impl HvfInner {
         Ok(())
     }
 
+    /// Snapshot the guest V0–V31 + FPSR/FPCR into the Linux `fpsimd_context`
+    /// at the start of `mcontext.__reserved`. Mirrors what the arm64 kernel
+    /// writes at signal entry (`preserve_fpsimd_context`).
+    fn save_fpsimd_into(
+        &self,
+        mcontext: &mut crate::linux_abi::LinuxSignalContext,
+    ) -> Result<(), TrapError> {
+        use applevisor::prelude::*;
+        use zerocopy::IntoBytes;
+
+        let mut fp = crate::linux_abi::LinuxFpsimdContext::empty();
+        let mut vregs = [0u128; 32];
+        for (i, reg) in SIMD_FP_TABLE.iter().enumerate() {
+            vregs[i] = self.vcpu.get_simd_fp_reg(*reg).map_err(hvf_error)?;
+        }
+        fp.vregs = vregs;
+        fp.fpsr = self.vcpu.get_reg(Reg::FPSR).map_err(hvf_error)? as u32;
+        fp.fpcr = self.vcpu.get_reg(Reg::FPCR).map_err(hvf_error)? as u32;
+        let bytes = fp.as_bytes();
+        mcontext.__reserved[..bytes.len()].copy_from_slice(bytes);
+        Ok(())
+    }
+
+    /// Restore V0–V31 + FPSR/FPCR from the `fpsimd_context` saved in
+    /// `mcontext.__reserved`. A missing/!FPSIMD_MAGIC record is left alone
+    /// (vector registers keep their current values rather than taking garbage).
+    fn restore_fpsimd_from(
+        &self,
+        mcontext: &crate::linux_abi::LinuxSignalContext,
+    ) -> Result<(), TrapError> {
+        use applevisor::prelude::*;
+        use zerocopy::FromBytes;
+
+        let reserved = mcontext.__reserved;
+        let size = core::mem::size_of::<crate::linux_abi::LinuxFpsimdContext>();
+        let Ok(fp) = crate::linux_abi::LinuxFpsimdContext::read_from_bytes(&reserved[..size]) else {
+            return Ok(());
+        };
+        if fp.magic != crate::linux_abi::LINUX_FPSIMD_MAGIC {
+            return Ok(());
+        }
+        let vregs = fp.vregs;
+        for (i, reg) in SIMD_FP_TABLE.iter().enumerate() {
+            self.vcpu
+                .set_simd_fp_reg(*reg, vregs[i])
+                .map_err(hvf_error)?;
+        }
+        let (fpsr, fpcr) = (fp.fpsr, fp.fpcr);
+        self.vcpu
+            .set_reg(Reg::FPSR, u64::from(fpsr))
+            .map_err(hvf_error)?;
+        self.vcpu
+            .set_reg(Reg::FPCR, u64::from(fpcr))
+            .map_err(hvf_error)?;
+        Ok(())
+    }
+
     /// Pop the Carrick sigframe at SP_EL0 (placed there by
     /// `inject_signal`) and restore the pre-signal register state.
     fn restore_from_sigframe(&mut self) -> Result<u64, TrapError> {
@@ -1580,6 +1703,11 @@ impl HvfInner {
         for (reg, value) in GPR_TABLE.iter().zip(saved_x.iter()) {
             self.vcpu.set_reg(*reg, *value).map_err(hvf_error)?;
         }
+        // Restore V0–V31 + FPSR/FPCR from the fpsimd_context the matching
+        // inject_signal stored (a handler may have mutated it). Skip silently if
+        // the record's magic is absent (older/foreign frame) — never restore
+        // garbage over the vector registers.
+        self.restore_fpsimd_from(&mcontext)?;
         let saved_pc = mcontext.pc;
         let saved_sp = mcontext.sp;
         let saved_spsr = mcontext.pstate;
