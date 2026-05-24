@@ -54,9 +54,15 @@ pub(super) struct SignalState {
     /// Signals raised while blocked, awaiting unblock or a synchronous
     /// wait (`rt_sigtimedwait`). Bit `signum-1`.
     pub pending: u64,
-    /// Installed alternate signal stack (`sigaltstack`). `None` means no
-    /// alt stack is installed; queried back via the `old_ss` out-param.
-    pub altstack: Option<LinuxSigaltstack>,
+    /// Installed alternate signal stack (`sigaltstack`), PER GUEST THREAD.
+    /// `sigaltstack` is per-thread in Linux (each thread/M registers its own
+    /// signal stack), so this MUST be keyed by tid: a process-global slot made
+    /// every thread's SIGURG (Go async-preempt) frame land on the last-set
+    /// stack → concurrent frames overlapped → goroutine-stack corruption →
+    /// the c>=20 EL0 faults (found via `carrick trace` on the `signal-inject`
+    /// probe: identical `new_sp` across threads). Signal HANDLERS stay global
+    /// (Linux shares them across threads); only the alt stack is per-thread.
+    pub altstack: HashMap<crate::thread::ThreadId, LinuxSigaltstack>,
 }
 
 impl SignalState {
@@ -65,7 +71,7 @@ impl SignalState {
             handlers: HashMap::new(),
             mask: 0,
             pending: 0,
-            altstack: None,
+            altstack: HashMap::new(),
         }
     }
 }
@@ -152,8 +158,12 @@ impl SyscallDispatcher {
     /// The currently-installed alternate signal stack as `(ss_sp, ss_size)`,
     /// or `None` when no alt stack is set. The runtime uses this to place the
     /// signal frame on the alt stack when a handler is registered `SA_ONSTACK`.
-    pub fn signal_altstack(&self) -> Option<(u64, u64)> {
-        self.signal.lock().altstack.map(|a| (a.ss_sp, a.ss_size))
+    pub fn signal_altstack(&self, tid: crate::thread::ThreadId) -> Option<(u64, u64)> {
+        self.signal
+            .lock()
+            .altstack
+            .get(&tid)
+            .map(|a| (a.ss_sp, a.ss_size))
     }
 
     /// True iff the guest installed `SIG_IGN` for `signum`. Lets the
@@ -330,6 +340,8 @@ impl SyscallDispatcher {
     ) -> Result<DispatchOutcome, DispatchError> {
         let ss = ctx.arg(0);
         let old_ss = ctx.arg(1);
+        // sigaltstack is per-thread: key by the calling guest tid.
+        let tid = ctx.thread.as_ref().map(|t| t.tid).unwrap_or(0);
         let memory = &mut *ctx.memory;
 
         // Report the currently-installed alt stack (or a disabled stack
@@ -339,6 +351,8 @@ impl SyscallDispatcher {
                 .signal
                 .lock()
                 .altstack
+                .get(&tid)
+                .copied()
                 .unwrap_or_else(LinuxSigaltstack::disabled);
             if memory.write_bytes(old_ss, current.abi_bytes()).is_err() {
                 return Ok(LINUX_EFAULT.into());
@@ -365,17 +379,16 @@ impl SyscallDispatcher {
                 return Ok(LINUX_EINVAL.into());
             }
             if flags & LINUX_SS_DISABLE != 0 {
-                // SS_DISABLE removes any installed alt stack.
-                self.signal.lock().altstack = None;
+                // SS_DISABLE removes this thread's installed alt stack.
+                self.signal.lock().altstack.remove(&tid);
             } else {
                 let size = new_stack.ss_size;
                 if size < LINUX_MINSIGSTKSZ {
                     return Ok(LINUX_ENOMEM.into());
                 }
-                // Record the alt stack so a subsequent query returns it.
-                // (We don't yet switch to it during delivery, but glibc and
-                // sigaltstack(2) callers rely on the get/set round-trip.)
-                self.signal.lock().altstack = Some(new_stack);
+                // Record this thread's alt stack so a subsequent query returns
+                // it AND signal injection pushes the frame onto the right stack.
+                self.signal.lock().altstack.insert(tid, new_stack);
             }
         }
 

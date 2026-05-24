@@ -45,6 +45,14 @@ mod carrick_usdt {
     /// raw pointer (not JSON) keeps this hot probe cheap and lets D
     /// read full u64 register values exactly.
     fn vcpu__trap(_: u64) {}
+    /// Fires when a guest EL0 sync exception other than `svc #0` reaches the
+    /// trap loop (the fatal `EL0Fault` path) — an instruction/data abort or
+    /// undefined instruction that crashes the guest. Args: `esr`, `elr`, `far`,
+    /// `x30`(LR), `sp`(SP_EL0), `tid`. Fires only on the fault, so a
+    /// `carrick trace` script can `--stack`-walk the faulting guest thread with
+    /// near-zero hot-path overhead (it never fires on the happy path). The key
+    /// diagnostic for the c>=20 sibling-vCPU corruption faults.
+    fn vcpu__fault(_: u64, _: u64, _: u64, _: u64, _: u64, _: i32) {}
     /// Fires when `execve_into` has finished swapping the engine to
     /// the new image. `path`, `entry`, `initial_sp`, `mapping_count`
     /// let dtrace operators verify the new process layout.
@@ -260,6 +268,12 @@ pub fn execve_loaded(path: &str, entry: u64, initial_sp: u64, mapping_count: u64
 
 pub fn execve_sysregs(sctlr: u64, ttbr0: u64, mair: u64) {
     carrick_usdt::execve__sysregs!(|| (sctlr, ttbr0, mair));
+}
+
+/// Fires on a fatal guest EL0 fault (instruction/data abort, undef). See the
+/// `vcpu__fault` provider doc. Cheap: only fires at the fault.
+pub fn vcpu_fault(esr: u64, elr: u64, far: u64, x30: u64, sp: u64, tid: i32) {
+    carrick_usdt::vcpu__fault!(|| (esr, elr, far, x30, sp, tid));
 }
 
 pub fn register_dtrace_probes() -> Result<(), usdt::Error> {
