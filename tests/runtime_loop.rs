@@ -269,13 +269,14 @@ impl SyscallTrap for ScriptedTrap {
         _pending_syscall_retval: Option<i64>,
         _interrupted_pc: Option<u64>,
         _altstack: Option<(u64, u64)>,
+        _saved_sigmask: u64,
     ) -> Result<(), TrapError> {
         Err(TrapError::Hypervisor(
             "scripted trap does not implement inject_signal".to_owned(),
         ))
     }
 
-    fn restore_from_sigframe(&mut self) -> Result<(), TrapError> {
+    fn restore_from_sigframe(&mut self) -> Result<u64, TrapError> {
         Err(TrapError::Hypervisor(
             "scripted trap does not implement restore_from_sigframe".to_owned(),
         ))

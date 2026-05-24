@@ -137,12 +137,13 @@ pub trait SyscallTrap {
         pending_syscall_retval: Option<i64>,
         interrupted_pc: Option<u64>,
         altstack: Option<(u64, u64)>,
+        saved_sigmask: u64,
     ) -> Result<(), TrapError>;
     /// Restore vCPU state from the `CarrickSigframe` at SP_EL0. Called
     /// when the guest invokes `rt_sigreturn(2)`. Does NOT advance PC
     /// past the syscall the way `complete_syscall` does — the restored
     /// PC IS the next PC.
-    fn restore_from_sigframe(&mut self) -> Result<(), TrapError>;
+    fn restore_from_sigframe(&mut self) -> Result<u64, TrapError>;
 }
 
 #[derive(Debug, Error)]
@@ -651,7 +652,8 @@ where
                 // pre-signal register state. No `complete_syscall` —
                 // the restored x0 IS the syscall return value the
                 // pre-empted caller observes.
-                runtime.restore_from_sigframe()?;
+                let restored_sigmask = runtime.restore_from_sigframe()?;
+                dispatcher.restore_signal_mask(this_tid, restored_sigmask);
                 // Deliver the NEXT pending signal (if any) before resuming the
                 // restored context — the kernel delivers all deliverable pending
                 // signals back-to-back before returning to userspace. The just-
@@ -1306,7 +1308,10 @@ fn run_vcpu_until_exit(
                 state.handle_execve(&kernel, &mut engine, path, argv, env)?;
             }
             DispatchOutcome::SigReturn => {
-                engine.restore_from_sigframe()?;
+                let restored_sigmask = engine.restore_from_sigframe()?;
+                kernel
+                    .dispatcher
+                    .restore_signal_mask(state.this_tid, restored_sigmask);
                 // Deliver the next pending signal (if any) before resuming —
                 // the kernel delivers all deliverable pending signals before
                 // returning to userspace. The just-handled signal was cleared
@@ -1490,6 +1495,7 @@ where
             } else {
                 None
             };
+            let saved_sigmask = dispatcher.enter_signal_handler(tid, pending, action);
             trap.inject_signal(
                 pending,
                 action.sa_handler,
@@ -1497,6 +1503,7 @@ where
                 last_syscall_retval,
                 interrupted_pc,
                 altstack,
+                saved_sigmask,
             )?;
             Ok(Some(PendingSignalAction { term_signal: None }))
         }
@@ -1866,7 +1873,8 @@ where
                 }
             }
             DispatchOutcome::SigReturn => {
-                trap.restore_from_sigframe()?;
+                let restored_sigmask = trap.restore_from_sigframe()?;
+                dispatcher.restore_signal_mask(this_tid, restored_sigmask);
                 // Deliver the next pending signal (if any) before resuming —
                 // the kernel delivers all deliverable pending signals before
                 // returning to userspace. The just-handled signal was cleared
@@ -1946,6 +1954,7 @@ impl SyscallTrap for HvfTrapEngine {
         pending_syscall_retval: Option<i64>,
         interrupted_pc: Option<u64>,
         altstack: Option<(u64, u64)>,
+        saved_sigmask: u64,
     ) -> Result<(), TrapError> {
         HvfTrapEngine::inject_signal(
             self,
@@ -1955,10 +1964,11 @@ impl SyscallTrap for HvfTrapEngine {
             pending_syscall_retval,
             interrupted_pc,
             altstack,
+            saved_sigmask,
         )
     }
 
-    fn restore_from_sigframe(&mut self) -> Result<(), TrapError> {
+    fn restore_from_sigframe(&mut self) -> Result<u64, TrapError> {
         HvfTrapEngine::restore_from_sigframe(self)
     }
 }
