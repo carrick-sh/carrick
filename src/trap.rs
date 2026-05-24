@@ -405,11 +405,48 @@ struct VcpuSnapshot {
 struct HvfInner;
 
 /// One mapping descriptor for a thread sibling: the guest-physical range,
-/// the host VA backing it, its size, and the stage-2 perms. The child vCPU
-/// re-materialises these as `HvfMappedRegion { memory: None }` (UNOWNED) so
-/// it never unmaps/frees the buffers the main engine owns.
+/// the host VA backing it, its size, and the stage-2 perms. The sibling vCPU
+/// lives in the same HVF VM as the parent, so the stage-2 entries are already
+/// present; the descriptor only re-materialises local syscall-path metadata as
+/// `HvfMappedRegion { memory: None }` (UNOWNED) so the sibling never
+/// unmaps/frees buffers the main engine owns.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-type ThreadMappingDesc = (u64, u64, *mut u8, usize, applevisor::memory::MemPerms);
+#[derive(Debug, Clone, Copy)]
+struct ThreadMappingDesc {
+    start: u64,
+    end: u64,
+    host_addr: *mut u8,
+    size: usize,
+    perms: applevisor::memory::MemPerms,
+    guest_shared: bool,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl ThreadMappingDesc {
+    fn from_region(region: &HvfMappedRegion) -> Self {
+        Self {
+            start: region.start,
+            end: region.end,
+            host_addr: region.host_addr,
+            size: region.size,
+            perms: region.perms,
+            guest_shared: region.guest_shared,
+        }
+    }
+
+    fn into_unowned_region(self) -> HvfMappedRegion {
+        HvfMappedRegion {
+            start: self.start,
+            end: self.end,
+            host_addr: self.host_addr,
+            size: self.size,
+            perms: self.perms,
+            memory: None,
+            host_mapping: None,
+            guest_shared: self.guest_shared,
+        }
+    }
+}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 struct ForkMappingDesc {
@@ -451,8 +488,8 @@ impl ForkMappingHost {
 /// holding a clone keeps the single process VM alive and lets the new thread
 /// call `vcpu_create()` against it (HVF requires vCPU create on the owning
 /// thread). `mappings` are raw descriptors of the SAME host buffers the main
-/// engine mapped; the child re-issues `hv_vm_map` for each (the stage-2
-/// entries are per-VM but the host pages are shared process-wide).
+/// engine mapped; they are local syscall-path metadata only, because the
+/// stage-2 entries live on the shared HVF VM, not on each vCPU.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub struct ThreadSpec {
     vm: applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
@@ -543,8 +580,8 @@ impl HvfTrapEngine {
     }
 
     /// Materialise a thread sibling on the CURRENT host thread from a
-    /// [`ThreadSpec`]: create a new vCPU in the shared VM, re-map the
-    /// inherited host buffers (UNOWNED), and seed the child registers. The
+    /// [`ThreadSpec`]: create a new vCPU in the shared VM, mirror the
+    /// inherited mapping metadata (UNOWNED), and seed the child registers. The
     /// returned engine resumes the cloned guest thread on its next
     /// `next_syscall`. MUST be called on the host thread that will own the
     /// vCPU (HVF requires vCPU create+run+destroy on one thread).
@@ -1730,7 +1767,7 @@ impl HvfInner {
         let mappings: Vec<ThreadMappingDesc> = self
             .mappings
             .iter()
-            .map(|m| (m.start, m.end, m.host_addr, m.size, m.perms))
+            .map(ThreadMappingDesc::from_region)
             .collect();
         Ok(ThreadSpec {
             vm: self._vm.clone(),
@@ -1770,47 +1807,14 @@ impl HvfInner {
             protections,
         };
 
-        for (start, end, host_addr, size, perms) in mappings {
-            let perms_raw: u64 = u64::from(perms);
-            let r = unsafe {
-                applevisor_sys::hv_vm_map(
-                    host_addr as *mut std::ffi::c_void,
-                    start,
-                    size,
-                    perms_raw,
-                )
-            };
-            // The sibling shares the parent's VM (same `hv_vm` handle), so
-            // every snapshot region is ALREADY mapped — this re-map is a
-            // best-effort no-op whose only job is to populate `inner.mappings`
-            // bookkeeping. HVF reports an already-mapped guest range as either
-            // HV_BAD_ARGUMENT (0xfae94003) OR HV_ERROR (0xfae94001) — the
-            // latter for low pages like the 0x10000 EL0 trampoline, which made
-            // a multi-threaded Go runtime's 2nd+ goroutine vCPU fail to start
-            // and hang. Both are benign here (the region is present in the
-            // shared VM); surface only genuinely different failures
-            // (HV_NO_RESOURCES, HV_DENIED, …) so a sibling never silently runs
-            // with missing memory.
-            let already_mapped = r == applevisor_sys::hv_error_t::HV_BAD_ARGUMENT as i32
-                || r == applevisor_sys::hv_error_t::HV_ERROR as i32;
-            if r != 0 && !already_mapped {
-                return Err(TrapError::Hypervisor(format!(
-                    "hv_vm_map(host=0x{:x}, guest=0x{start:x}, size={size}) failed for thread sibling: 0x{r:x}",
-                    host_addr as u64
-                )));
-            }
-            inner.mappings.push(HvfMappedRegion {
-                start,
-                end,
-                host_addr,
-                size,
-                perms,
-                memory: None,
-                host_mapping: None,
-                // Thread siblings share the parent's address space verbatim and
-                // never take a fork snapshot; the flag is immaterial here.
-                guest_shared: false,
-            });
+        for mapping in mappings {
+            // `hv_vm_map` is VM-global on Hypervisor.framework. The new vCPU is
+            // created in the parent's VM clone, so the parent mappings are
+            // already visible here; reissuing them for every sibling is at best
+            // an already-mapped no-op and at worst map-table churn while other
+            // vCPUs are running. Keep only local metadata used by syscall-path
+            // guest-memory accessors.
+            inner.mappings.push(mapping.into_unowned_region());
         }
 
         inner.restore_vcpu_thread_start(&snapshot)?;
@@ -2507,5 +2511,30 @@ mod thread_sibling_tests {
         // out of EL1 (after we seed the vCPU) lands the child in EL0.
         assert_eq!(child.elr_el1, parent.elr_el1);
         assert_eq!(child.last_exit_class, parent.last_exit_class);
+    }
+
+    #[test]
+    fn thread_mapping_descriptor_preserves_shared_mapping_metadata() {
+        let region = HvfMappedRegion {
+            start: 0x1000,
+            end: 0x5000,
+            host_addr: 0x7000usize as *mut u8,
+            size: 0x4000,
+            perms: applevisor::memory::MemPerms::ReadWrite,
+            memory: None,
+            host_mapping: None,
+            guest_shared: true,
+        };
+
+        let copied = ThreadMappingDesc::from_region(&region).into_unowned_region();
+
+        assert_eq!(copied.start, region.start);
+        assert_eq!(copied.end, region.end);
+        assert_eq!(copied.host_addr, region.host_addr);
+        assert_eq!(copied.size, region.size);
+        assert_eq!(copied.perms, region.perms);
+        assert!(copied.memory.is_none());
+        assert!(copied.host_mapping.is_none());
+        assert!(copied.guest_shared);
     }
 }
