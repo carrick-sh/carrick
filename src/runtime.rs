@@ -1068,6 +1068,10 @@ impl ThreadRuntimeState {
             engine.complete_syscall(-(crate::linux_abi::LINUX_EAGAIN as i64))?;
             return Ok(None);
         }
+        // Clear any VM published by a previous fork so siblings that release
+        // their vCPUs this round see only THIS fork's republished VM (or, on a
+        // quiesce abort, fall back to the still-live existing VM).
+        crate::trap::clear_rebuilt_vm_for_fork();
         // Stop-the-world: a multithreaded guest can fork only if every OTHER
         // guest vCPU thread is first paused at its lock-safe run-loop top, so
         // the child (which has only THIS thread after libc::fork) doesn't
@@ -1110,8 +1114,10 @@ impl ThreadRuntimeState {
 
         let retval = match fork_outcome {
             crate::trap::ForkOutcome::Parent { child_pid } => {
-                // Resume the paused sibling threads (they re-check and continue).
+                // Publish the rebuilt VM so quiesced siblings recreate their
+                // vCPUs in it, THEN resume them.
                 if quiesced {
+                    engine.publish_vm_for_siblings();
                     fork_barrier().end_quiesce();
                 }
                 fork_barrier().end_fork();
@@ -1247,9 +1253,15 @@ fn run_vcpu_until_exit(
     for traps in 1..=state.max_traps {
         // Lock-safe point: no carrick lock is held here (each iteration acquires
         // and releases its syscall's locks within the iteration). If another
-        // thread is forking a multithreaded guest, park here so the child
-        // inherits no held carrick lock.
-        fork_barrier().park_if_quiescing();
+        // thread is forking a multithreaded guest, release this vCPU (so the
+        // forker can hv_vm_destroy), park until the fork completes, then
+        // recreate the vCPU in the parent's rebuilt VM and resume.
+        if fork_barrier().is_quiescing() {
+            engine.release_vcpu_for_fork()?;
+            fork_barrier().park_if_quiescing();
+            engine.rebuild_vcpu_after_fork()?;
+            state.register_vcpu(&engine);
+        }
         // ---- vCPU run: NO dispatcher lock held ----
         let frame = match engine.next_syscall() {
             Ok(Some(f)) => f,
