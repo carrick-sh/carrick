@@ -652,6 +652,7 @@ impl HvfTrapEngine {
         pending_syscall_retval: Option<i64>,
         interrupted_pc: Option<u64>,
         altstack: Option<(u64, u64)>,
+        saved_sigmask: u64,
     ) -> Result<(), TrapError> {
         self.inner.inject_signal(
             signum,
@@ -660,6 +661,7 @@ impl HvfTrapEngine {
             pending_syscall_retval,
             interrupted_pc,
             altstack,
+            saved_sigmask,
         )
     }
 
@@ -672,6 +674,7 @@ impl HvfTrapEngine {
         _pending_syscall_retval: Option<i64>,
         _interrupted_pc: Option<u64>,
         _altstack: Option<(u64, u64)>,
+        _saved_sigmask: u64,
     ) -> Result<(), TrapError> {
         Err(TrapError::UnsupportedPlatform)
     }
@@ -679,12 +682,12 @@ impl HvfTrapEngine {
     /// Pop the Carrick signal frame at SP_EL0 and restore the pre-
     /// signal register state. Used by `rt_sigreturn(2)`.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    pub fn restore_from_sigframe(&mut self) -> Result<(), TrapError> {
+    pub fn restore_from_sigframe(&mut self) -> Result<u64, TrapError> {
         self.inner.restore_from_sigframe()
     }
 
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    pub fn restore_from_sigframe(&mut self) -> Result<(), TrapError> {
+    pub fn restore_from_sigframe(&mut self) -> Result<u64, TrapError> {
         Err(TrapError::UnsupportedPlatform)
     }
 
@@ -1396,6 +1399,7 @@ impl HvfInner {
         pending_syscall_retval: Option<i64>,
         interrupted_pc: Option<u64>,
         altstack: Option<(u64, u64)>,
+        saved_sigmask: u64,
     ) -> Result<(), TrapError> {
         use applevisor::prelude::*;
         use zerocopy::IntoBytes;
@@ -1434,6 +1438,7 @@ impl HvfInner {
         mcontext.pc = frame.saved_pc;
         mcontext.pstate = frame.saved_spsr;
         let mut ucontext = crate::linux_abi::LinuxUcontext::empty();
+        ucontext.uc_sigmask = saved_sigmask;
         ucontext.uc_mcontext = mcontext;
         // When delivering on the alternate signal stack (SA_ONSTACK), the
         // ucontext's uc_stack describes that stack with SS_ONSTACK set, so a
@@ -1547,7 +1552,7 @@ impl HvfInner {
 
     /// Pop the Carrick sigframe at SP_EL0 (placed there by
     /// `inject_signal`) and restore the pre-signal register state.
-    fn restore_from_sigframe(&mut self) -> Result<(), TrapError> {
+    fn restore_from_sigframe(&mut self) -> Result<u64, TrapError> {
         use applevisor::prelude::*;
         use zerocopy::FromBytes;
 
@@ -1569,6 +1574,7 @@ impl HvfInner {
         // fields. Copy out the Linux ucontext first; SA_SIGINFO handlers may
         // mutate it before invoking rt_sigreturn.
         let ucontext = frame.ucontext;
+        let restored_sigmask = ucontext.uc_sigmask;
         let mcontext = ucontext.uc_mcontext;
         let saved_x = mcontext.regs;
         for (reg, value) in GPR_TABLE.iter().zip(saved_x.iter()) {
@@ -1587,7 +1593,7 @@ impl HvfInner {
         self.vcpu
             .set_sys_reg(SysReg::SPSR_EL1, saved_spsr)
             .map_err(hvf_error)?;
-        Ok(())
+        Ok(restored_sigmask)
     }
 
     fn fork(&mut self) -> Result<ForkOutcome, TrapError> {

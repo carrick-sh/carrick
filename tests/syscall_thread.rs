@@ -283,6 +283,8 @@ fn futex_cmp_requeue_returns_enosys_and_records_compat_gap() {
 // --- Sub-task B (P3): tgkill/tkill cross-thread routing ---
 
 const LINUX_ESRCH: i32 = 3;
+const LINUX_SIG_BLOCK: u64 = 0;
+const LINUX_SIG_UNBLOCK: u64 = 1;
 const SIGUSR1: u64 = 10;
 
 #[test]
@@ -335,6 +337,66 @@ fn tgkill_to_self_raises_locally() {
         )
         .unwrap();
     assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+}
+
+#[test]
+fn tgkill_to_masked_sibling_queues_without_signalthread() {
+    let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x2000]);
+    let reporter = CompatReporter::default();
+    let dispatcher = SyscallDispatcher::new();
+    let registry = Arc::new(ThreadRegistry::new(1000));
+    let futex = Arc::new(FutexTable::new());
+    let sibling = registry.register_child(0);
+
+    memory
+        .write_bytes(0x10000, &(1_u64 << (SIGUSR1 as i32 - 1)).to_le_bytes())
+        .unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch_threaded(
+                SyscallRequest::new(135, SyscallArgs::from([LINUX_SIG_BLOCK, 0x10000, 0, 8, 0, 0])),
+                &mut memory,
+                &reporter,
+                sibling,
+                &registry,
+                &futex,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    let outcome = dispatcher
+        .dispatch_threaded(
+            SyscallRequest::new(
+                131,
+                SyscallArgs::from([1000, sibling as u64, SIGUSR1, 0, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+            1000,
+            &registry,
+            &futex,
+        )
+        .unwrap();
+    assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+    assert_eq!(dispatcher.take_deliverable_pending(sibling), None);
+    assert_eq!(
+        dispatcher
+            .dispatch_threaded(
+                SyscallRequest::new(
+                    135,
+                    SyscallArgs::from([LINUX_SIG_UNBLOCK, 0x10000, 0, 8, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+                sibling,
+                &registry,
+                &futex,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(dispatcher.take_deliverable_pending(sibling), Some(SIGUSR1 as i32));
 }
 
 #[test]
