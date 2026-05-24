@@ -787,6 +787,10 @@ impl SyscallDispatcher {
         let nfds =
             usize::try_from(ctx.arg(1)).map_err(|_| DispatchError::LengthTooLarge(ctx.arg(1)))?;
         let timeout_address = ctx.arg(2);
+        // sigmask args read here (before the `memory` mutable borrow); the mask
+        // VALUE is read from guest memory below once `memory` is bound.
+        let sigmask_addr = ctx.arg(3);
+        let sigsetsize = ctx.arg(4);
         let request = &ctx.request;
         let memory = &mut *ctx.memory;
         let reporter = ctx.reporter;
@@ -812,6 +816,27 @@ impl SyscallDispatcher {
                 }
                 _ => 0,
             }
+        };
+
+        // ppoll(fds, nfds, timeout, sigmask, sigsetsize): capture the sigmask as
+        // a u64 bitmask (bit signum-1) so a blocked signal doesn't interrupt the
+        // wait (it stays pending, delivered after the syscall). Mirrors
+        // epoll_pwait. Read before the pollfd loop (returns an owned Vec, so the
+        // `memory` borrow is released).
+        let block_signals: u64 = if sigmask_addr != 0 {
+            if sigsetsize != crate::linux_abi::LINUX_RT_SIGSET_SIZE {
+                return Ok(LINUX_EINVAL.into());
+            }
+            match memory.read_bytes(sigmask_addr, crate::linux_abi::LINUX_RT_SIGSET_SIZE as usize) {
+                Ok(bytes) => {
+                    let mut le = [0u8; 8];
+                    le.copy_from_slice(&bytes[..8]);
+                    u64::from_le_bytes(le)
+                }
+                Err(_) => return Ok(LINUX_EFAULT.into()),
+            }
+        } else {
+            0
         };
 
         // Read all the pollfds up front so we can route them. Fast path:
@@ -896,9 +921,7 @@ impl SyscallDispatcher {
                 fds: wait_fds,
                 timeout,
                 on_timeout: 0,
-                // ppoll's sigmask is not yet applied during the wait (separate
-                // follow-up, like epoll_pwait was); preserve current behaviour.
-                block_signals: 0,
+                block_signals,
             });
         }
 
