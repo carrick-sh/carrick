@@ -1,6 +1,172 @@
 # Handoff — Go runtime bring-up on carrick (2026-05-24, continued)
 
-## LATEST (2026-05-24 PM): `os/exec` down to raw-rootfs environment delta
+## LATEST (2026-05-24 late PM): PIE is green; current blocker is async-preempted large equality
+
+### Logical commits landed in this continuation
+
+- `aba7101 fix(fork): quiesce vcpus during concurrent exec`
+- `9979728 fix(fs): seed raw guest baseline paths`
+- `aa55a78 fix(fs): preserve host symlink stat identity`
+- `3c497d5 fix(waitid): ignore unrequested stop states`
+- `919e762 fix(loader): support threaded Go PIE startup`
+- `10a694a test(go): add userarena large allocation repro`
+
+### PIE status
+
+Plain Go PIE startup is now working under the threaded runtime.
+
+What landed in `919e762`:
+
+- `run-elf --fs host <relative-path>` canonicalizes `argv[0]` for relative ELF
+  paths, fixing the external-static-pie path regression.
+- `AddressSpace::load_elf` can load a `PT_INTERP` dynamic linker and set the
+  initial PC to the interpreter entry.
+- Threaded engines can read guest loader bytes through the dispatcher/rootfs
+  path rather than assuming host paths.
+- EL0 reads of `CNTFRQ_EL0` / `CNTVCT_EL0` are emulated, which the dynamic
+  loader needs.
+- Thread siblings are no longer misclassified as forked children, and
+  process-wide exits propagate correctly through the threaded runtime.
+
+Verified before commit:
+
+```sh
+cargo fmt --all -- --check
+cargo test --release trap::thread_sibling_tests::decodes_el0_counter_register_traps -- --nocapture
+cargo test --release --test address_space -- --nocapture
+./scripts/build-signed.sh
+
+CARRICK_EXPOSED_CPUS=10 timeout -s KILL 30 \
+  target/release/carrick run-elf --raw --fs host \
+  fixtures/go-aarch64-hello/target/release/carrick-linux-aarch64-go-hello
+
+CARRICK_EXPOSED_CPUS=10 timeout -s KILL 60 \
+  target/release/carrick run-elf --rootfs-layer /tmp/carrick-pie-ld.tar \
+  --raw --fs memory /tmp/go-conformance/bin/go-hello-internal-pie
+```
+
+`/tmp/carrick-pie-ld.tar` is the scratch loader layer used during this bring-up;
+it supplies `/lib/ld-linux-aarch64.so.1` for internal dynamic PIE tests. Treat it
+as temp state unless/until we promote a reproducible loader/rootfs fixture.
+
+### Current failing Go oracle
+
+The focused runtime test still fails under high exposed CPU count:
+
+```sh
+CARRICK_EXPOSED_CPUS=10 timeout -s KILL 90 \
+  target/release/carrick run-elf --raw --fs host /tmp/go-conformance/bin/runtime.test \
+  -- -test.run '^TestUserArena$/^Alloc$/^largeScalar$' -test.count=1 -test.v
+```
+
+Failure shape:
+
+- Go reports `arena_test.go:180: failed integrity check`.
+- The value is `runtime_test.largeScalar`, a `[UserArenaChunkBytes + 1]byte`.
+  Since it exceeds `userArenaChunkMaxAllocBytes`, Go routes the allocation to
+  the heap, not to an arena chunk. This is useful: the data path is ordinary heap
+  copy/equality, not a special arena mmap edge.
+- The standalone repro in
+  `fixtures/go-aarch64-hello/src/userarena_large/main.go` byte-checks the whole
+  array and passes under carrick.
+- An uncommitted diagnostic edit adds direct array equality (`*got != *value`).
+  With `CARRICK_EXPOSED_CPUS=10`, equality intermittently fails while the
+  byte-by-byte check immediately after still passes. Docker `linux/arm64` passes,
+  and carrick P1/P2 pass.
+- 20-run sample on the equality repro:
+  - default P10: `array equality failed` in **12/20**
+  - `GODEBUG=asyncpreemptoff=1` P10: **0/20**
+
+This is not an mmap/userarena data-integrity failure. It is tied to Go async
+preemption (`SIGURG`) interrupting the generated large-array equality path.
+
+### Debug evidence so far
+
+- `go tool objdump` shows `main.main` calls `runtime.memequal`.
+- `runtime.memequal` uses SIMD registers (`V8`-`V11` in the hot path) and also
+  relies on condition flags across compare/branch pairs.
+- Go's `runtime.asyncPreempt.abi0` saves/restores `V0`-`V31`.
+- `carrick trace --script scripts/trace-go-signal.d` confirms SIGURG
+  inject/restore and no guest faults, but tracing perturbs timing enough that
+  the standalone repro often passes under trace. Use trace for signal shape, not
+  for pass/fail rate.
+- The existing `fp-sigurg` probe only clobbered `V0`-`V7,V16`-`V23`; an
+  uncommitted diagnostic edit extends it through `V8`-`V15`. The extended probe
+  still passes (`PROBE_D_OK ... preempts=...`), which argues against plain
+  signal FPSIMD save/restore corruption.
+
+Current best hypothesis: kick-path signal injection saves the wrong PSTATE in
+the signal frame. In `src/trap.rs`, `inject_signal` always stores
+`SPSR_EL1`. That is correct for syscall-boundary signal delivery, but on a
+cross-thread `hv_vcpus_exit` / `CANCELED` kick the vCPU is already running EL0
+guest code and the live state is `Reg::CPSR`. If SIGURG lands between a `CMP`
+and a later branch in `runtime.memequal`, restoring stale NZCV flags from
+`SPSR_EL1` can make equality return false even though the bytes are identical.
+
+Next fix to try:
+
+```rust
+frame.saved_spsr = if interrupted_pc.is_some() {
+    self.vcpu.get_reg(Reg::CPSR).map_err(hvf_error)?
+} else {
+    self.vcpu.get_sys_reg(SysReg::SPSR_EL1).map_err(hvf_error)?
+};
+```
+
+Add a small helper/unit test for this policy, then re-run the equality repro
+loop and the focused Go runtime test.
+
+### Repro commands for the current blocker
+
+Build the equality repro from the diagnostic source:
+
+```sh
+GOEXPERIMENT=arenas CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
+  go build -buildmode=pie -o /tmp/go-conformance/bin/userarena-large-eq-pie \
+  fixtures/go-aarch64-hello/src/userarena_large/main.go
+```
+
+Run a failure-rate loop:
+
+```sh
+fail=0
+for i in $(seq 1 20); do
+  pkill -9 -f '[c]arrick' || true
+  out=$(CARRICK_EXPOSED_CPUS=10 timeout -s KILL 60 \
+    target/release/carrick run-elf --rootfs-layer /tmp/carrick-pie-ld.tar \
+    --raw --fs memory /tmp/go-conformance/bin/userarena-large-eq-pie 2>&1)
+  if printf '%s\n' "$out" | rg -q 'array equality failed'; then
+    fail=$((fail+1)); printf F
+  else
+    printf .
+  fi
+done
+echo " fail=$fail/20"
+```
+
+Trace signal shape, not failure rate:
+
+```sh
+CARRICK_EXPOSED_CPUS=10 timeout -s KILL 80 \
+  target/release/carrick trace --script scripts/trace-go-signal.d \
+  --trace-out /tmp/carrick-userarena-signal.trace -- \
+  run-elf --rootfs-layer /tmp/carrick-pie-ld.tar --raw --fs memory \
+  /tmp/go-conformance/bin/userarena-large-eq-pie
+```
+
+### Dirty diagnostic changes at this handoff
+
+The worktree currently has two intentional, uncommitted diagnostic edits:
+
+- `fixtures/go-aarch64-hello/src/userarena_large/main.go`: direct large-array
+  equality check before the byte loop.
+- `fixtures/mn-probes/src/bin/fp_sigurg.rs`: clobber `V0`-`V23` instead of
+  skipping `V8`-`V15`.
+
+Commit them as repro/probe hardening if they stay useful; otherwise revert only
+those lines before the signal PSTATE fix.
+
+## PRIOR LATEST (2026-05-24 PM): `os/exec` down to raw-rootfs environment delta
 
 Current `scripts/go-conformance.sh os/exec` result:
 
