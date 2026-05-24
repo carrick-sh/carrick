@@ -4,8 +4,23 @@
 //! that won't exist in the child. See
 //! docs/superpowers/specs/2026-05-24-multithreaded-fork-design.md.
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Condvar, Mutex};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+/// Process-wide barrier (one HVF VM per process). Reachable from the run loop,
+/// `handle_fork`, AND the blocking-wait predicates (futex / io_wait) so a parked
+/// thread returns to its run-loop top when a quiesce begins.
+pub(crate) fn barrier() -> &'static QuiesceBarrier {
+    static B: OnceLock<QuiesceBarrier> = OnceLock::new();
+    B.get_or_init(QuiesceBarrier::new)
+}
+
+/// True while a fork quiesce is in progress. Blocking waits OR this into their
+/// wake predicate so they return (spurious EINTR) and reach the run-loop-top
+/// barrier instead of re-parking.
+pub(crate) fn is_quiescing() -> bool {
+    barrier().is_quiescing()
+}
 
 #[derive(Debug)]
 pub(crate) struct QuiesceBarrier {

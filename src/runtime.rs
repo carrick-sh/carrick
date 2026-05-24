@@ -9,13 +9,10 @@ use crate::dispatch::{
 use crate::memory::{AddressSpace, AddressSpaceError};
 use crate::rootfs::RootFs;
 
-/// Process-wide fork quiesce barrier. One HVF VM per process (like
-/// `host_signal`'s globals), so a singleton reachable from the run loop and
-/// `handle_fork` without threading it through every signature.
+/// Process-wide fork quiesce barrier (defined in `fork_quiesce` so the blocking
+/// wait predicates can reach the same instance).
 fn fork_barrier() -> &'static crate::fork_quiesce::QuiesceBarrier {
-    static BARRIER: std::sync::OnceLock<crate::fork_quiesce::QuiesceBarrier> =
-        std::sync::OnceLock::new();
-    BARRIER.get_or_init(crate::fork_quiesce::QuiesceBarrier::new)
+    crate::fork_quiesce::barrier()
 }
 use crate::trap::{HvfTrapEngine, TrapError};
 use serde::Serialize;
@@ -888,7 +885,10 @@ impl ThreadRuntimeState {
             match self
                 .futex
                 .wait_prepared_for_thread(wait, timeout, self.this_tid, &|| {
+                    // Return (spurious EINTR) on a pending signal OR a fork
+                    // quiesce, so the thread reaches its run-loop-top barrier.
                     crate::host_signal::has_pending_for(self.this_tid)
+                        || crate::fork_quiesce::is_quiescing()
                 }) {
                 FutexWaitOutcome::Woken => 0,
                 FutexWaitOutcome::TimedOut => -(crate::linux_abi::LINUX_ETIMEDOUT as i64),
@@ -1486,7 +1486,9 @@ fn shared_futex_wait(
 ) -> i64 {
     let deadline = timeout.map(|d| std::time::Instant::now() + d);
     loop {
-        if crate::host_signal::has_pending_for(this_tid as i32) {
+        if crate::host_signal::has_pending_for(this_tid as i32)
+            || crate::fork_quiesce::is_quiescing()
+        {
             return -(crate::linux_abi::LINUX_EINTR as i64);
         }
         let slice_us: u32 = match deadline {
