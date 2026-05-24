@@ -161,7 +161,9 @@ impl ThreadWaiter {
         );
         // A signal that arrived just before we parked must not be missed
         // (unless it's blocked by this wait's sigmask).
-        if crate::host_signal::has_unblocked_pending_for(self.tid, block_mask) || crate::fork_quiesce::is_quiescing() {
+        if crate::host_signal::has_unblocked_pending_for(self.tid, block_mask)
+            || crate::fork_quiesce::is_quiescing()
+        {
             crate::probes::io_wait_end(
                 self.tid,
                 wait_result_code(WaitResult::Interrupted),
@@ -224,7 +226,9 @@ impl ThreadWaiter {
             events0,
             fd1,
         );
-        if crate::host_signal::has_unblocked_pending_for(self.tid, block_mask) || crate::fork_quiesce::is_quiescing() {
+        if crate::host_signal::has_unblocked_pending_for(self.tid, block_mask)
+            || crate::fork_quiesce::is_quiescing()
+        {
             crate::probes::io_wait_end(
                 self.tid,
                 wait_result_code(WaitResult::Interrupted),
@@ -388,7 +392,9 @@ impl ThreadWaiter {
                 Ok(n) => n,
                 Err(_) => {
                     // EINTR (a signal raced in) — re-check the pending flag.
-                    if crate::host_signal::has_unblocked_pending_for(self.tid, block_mask) || crate::fork_quiesce::is_quiescing() {
+                    if crate::host_signal::has_unblocked_pending_for(self.tid, block_mask)
+                        || crate::fork_quiesce::is_quiescing()
+                    {
                         break WaitResult::Interrupted;
                     }
                     continue;
@@ -421,7 +427,9 @@ impl ThreadWaiter {
             if thread_pipe_woke && let Some(thread_wake) = self.thread_wake.as_ref() {
                 thread_wake.drain();
             }
-            if crate::host_signal::has_unblocked_pending_for(self.tid, block_mask) || crate::fork_quiesce::is_quiescing() {
+            if crate::host_signal::has_unblocked_pending_for(self.tid, block_mask)
+                || crate::fork_quiesce::is_quiescing()
+            {
                 break WaitResult::Interrupted;
             }
             // Spurious wake or fallback slice elapsed — re-park (the deadline
@@ -504,7 +512,9 @@ impl ThreadWaiter {
             index
         });
         loop {
-            if crate::host_signal::has_unblocked_pending_for(self.tid, block_mask) || crate::fork_quiesce::is_quiescing() {
+            if crate::host_signal::has_unblocked_pending_for(self.tid, block_mask)
+                || crate::fork_quiesce::is_quiescing()
+            {
                 return WaitResult::Interrupted;
             }
             for pfd in &mut pollfds {
@@ -544,13 +554,16 @@ impl ThreadWaiter {
                 {
                     thread_wake.drain();
                 }
-                if crate::host_signal::has_unblocked_pending_for(self.tid, block_mask) || crate::fork_quiesce::is_quiescing() {
+                if crate::host_signal::has_unblocked_pending_for(self.tid, block_mask)
+                    || crate::fork_quiesce::is_quiescing()
+                {
                     return WaitResult::Interrupted;
                 }
             } else if n < 0 {
                 let errno = std::io::Error::last_os_error().raw_os_error();
                 if errno == Some(libc::EINTR)
-                    && (crate::host_signal::has_unblocked_pending_for(self.tid, block_mask) || crate::fork_quiesce::is_quiescing())
+                    && (crate::host_signal::has_unblocked_pending_for(self.tid, block_mask)
+                        || crate::fork_quiesce::is_quiescing())
                 {
                     return WaitResult::Interrupted;
                 }

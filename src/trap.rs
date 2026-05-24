@@ -1879,7 +1879,8 @@ impl HvfInner {
         }
         let reserved = mcontext.__reserved;
         let size = core::mem::size_of::<crate::linux_abi::LinuxFpsimdContext>();
-        let Ok(fp) = crate::linux_abi::LinuxFpsimdContext::read_from_bytes(&reserved[..size]) else {
+        let Ok(fp) = crate::linux_abi::LinuxFpsimdContext::read_from_bytes(&reserved[..size])
+        else {
             return Ok(());
         };
         if fp.magic != crate::linux_abi::LINUX_FPSIMD_MAGIC {
@@ -2061,11 +2062,16 @@ impl HvfInner {
         // fork cleanup still uses the normal path (which now also goes
         // through ManuallyDrop, so neither side runs the panicky
         // destructors).
-        // Guest PROT_NONE ranges are part of the address space fork copies;
-        // carry them into the rebuilt engine so the child keeps faulting on
-        // them (it inherited the parent's mappings, perms and all).
-        let inherited_protections =
-            std::sync::Arc::new(MemoryProtections::from_ranges(self.protections.snapshot()));
+        // In the parent, keep the exact shared protection table siblings
+        // already use; otherwise post-fork mmap/mprotect changes split across
+        // two Arcs and one thread can see a valid Go heap futex as PROT_NONE.
+        // The child is single-threaded after fork, so it gets a private copy of
+        // the parent's ranges at the fork point.
+        let inherited_protections = if pid == 0 {
+            std::sync::Arc::new(MemoryProtections::from_ranges(self.protections.snapshot()))
+        } else {
+            std::sync::Arc::clone(&self.protections)
+        };
         let new_inner = HvfInner {
             _vm: new_vm,
             vcpu: new_vcpu,

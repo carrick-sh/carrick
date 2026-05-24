@@ -36,3 +36,7 @@ path = "src/bin/fp_sigurg.rs"
 [[bin]]
 name = "segv-recover"
 path = "src/bin/segv_recover.rs"
+
+[[bin]]
+name = "concurrent-fork"
+path = "src/bin/concurrent_fork.rs"

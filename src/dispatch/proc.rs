@@ -750,12 +750,16 @@ impl SyscallDispatcher {
         // to block WITHOUT holding any lock or sitting in an uninterruptible
         // host syscall (a stop-the-world fork must be able to wake us).
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        let r =
-            unsafe { libc::waitid(host_idtype, host_id, &mut info, host_options | libc::WNOHANG) };
+        let r = unsafe {
+            libc::waitid(
+                host_idtype,
+                host_id,
+                &mut info,
+                host_options | libc::WNOHANG,
+            )
+        };
         if r != 0 {
-            let errno = std::io::Error::last_os_error()
-                .raw_os_error()
-                .unwrap_or(0);
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
             // EINTR on a WNOHANG call is spurious (a carrick host signal); the
             // caller re-issues. macOS ECHILD/EINVAL share Linux's numbers.
             return Ok(DispatchOutcome::errno(errno));
@@ -795,14 +799,11 @@ impl SyscallDispatcher {
             // blocking libc::waitid, breaking out if a fork quiesce begins (the
             // guest re-issues on the resulting EINTR).
             loop {
-                let r =
-                    unsafe { libc::waitid(host_idtype, host_id, &mut info, host_options) };
+                let r = unsafe { libc::waitid(host_idtype, host_id, &mut info, host_options) };
                 if r == 0 {
                     break;
                 }
-                let errno = std::io::Error::last_os_error()
-                    .raw_os_error()
-                    .unwrap_or(0);
+                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
                 if errno == LINUX_EINTR
                     && !crate::host_signal::has_process_pending()
                     && !crate::fork_quiesce::is_quiescing()
@@ -863,21 +864,52 @@ impl SyscallDispatcher {
         // (the same mechanism Linux uses to fill RUSAGE_CHILDREN); we add the
         // child's *guest* CPU — which the host rusage can't see — separately.
         let mut host_rusage: libc::rusage = unsafe { std::mem::zeroed() };
-        // Retry the blocking host wait4 across EINTR from carrick-internal
-        // host signals (e.g. the SIGURG vCPU kick). Without this, a shell
-        // blocked waiting on a foreground job spuriously returns from wait,
-        // leaves the wait, and spins. Only surface EINTR to the guest when a
-        // signal it can actually take is pending (so its handler runs / it
-        // dies) — same discipline as host_sleep_interruptible and read_host_pipe.
-        let result = loop {
-            let r = unsafe { libc::wait4(pid, &mut host_status, host_options, &mut host_rusage) };
+        let can_park_on_proc_exit = pid > 0
+            && host_options & libc::WNOHANG == 0
+            && options & (crate::linux_abi::LINUX_WUNTRACED | crate::linux_abi::LINUX_WCONTINUED)
+                == 0;
+        let result = if can_park_on_proc_exit {
+            // Probe first. If the specific child is not waitable yet, park in
+            // the runtime's kqueue-backed process-exit waiter instead of raw
+            // libc::wait4. A fork quiesce can wake that waiter; it cannot wake
+            // a thread stuck inside the host wait4 syscall.
+            let r = unsafe {
+                libc::wait4(
+                    pid,
+                    &mut host_status,
+                    host_options | libc::WNOHANG,
+                    &mut host_rusage,
+                )
+            };
             match r.host_syscall_errno() {
-                Ok(value) => break Ok(value),
-                Err(errno) => {
-                    if errno == LINUX_EINTR && !crate::host_signal::has_process_pending() {
-                        continue;
+                Ok(0) => {
+                    return Ok(DispatchOutcome::WaitOnProcExit {
+                        pid,
+                        block_signals: 0,
+                    });
+                }
+                Ok(value) => Ok(value),
+                Err(errno) => Err(errno),
+            }
+        } else {
+            // Retry the blocking host wait4 across EINTR from carrick-internal
+            // host signals (e.g. the SIGURG vCPU kick). Without this, a shell
+            // blocked waiting on a foreground job spuriously returns from wait,
+            // leaves the wait, and spins. Only surface EINTR to the guest when a
+            // signal it can actually take is pending (so its handler runs / it
+            // dies) — same discipline as host_sleep_interruptible and
+            // read_host_pipe.
+            loop {
+                let r =
+                    unsafe { libc::wait4(pid, &mut host_status, host_options, &mut host_rusage) };
+                match r.host_syscall_errno() {
+                    Ok(value) => break Ok(value),
+                    Err(errno) => {
+                        if errno == LINUX_EINTR && !crate::host_signal::has_process_pending() {
+                            continue;
+                        }
+                        break Err(errno);
                     }
-                    break Err(errno);
                 }
             }
         };
