@@ -1023,6 +1023,9 @@ impl SyscallDispatcher {
                 // EVFILT_READ/POLLIN — no in-memory recompute or EVFILT_USER
                 // broadcast needed (the robust path for Go's netpollBreak).
                 OpenDescription::EventFd { state, .. } if state.read_fd >= 0 => Some(state.read_fd),
+                // A pidfd is read-ready when its process exits; the backing
+                // kqueue's own fd is what poll/epoll watch (EVFILT_PROC fires).
+                OpenDescription::Pidfd { kqueue, .. } => Some(kqueue.raw_fd()),
                 _ => None,
             };
         }
@@ -1176,6 +1179,9 @@ impl SyscallDispatcher {
                 }
             }
             OpenDescription::Epoll { .. } => {}
+            // Pidfd readiness is the kqueue's job (host_fd_for_poll returns the
+            // EVFILT_PROC kqueue fd), so there's no in-memory readiness here.
+            OpenDescription::Pidfd { .. } => {}
             OpenDescription::PipeReader { pipe, .. } => {
                 if requested_events & LINUX_POLLIN != 0 {
                     let pipe = pipe.lock();

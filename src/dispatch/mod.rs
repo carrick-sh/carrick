@@ -1014,6 +1014,17 @@ enum OpenDescription {
         /// kqueue's `EVFILT_USER(0)`. See `docs/epoll-kqueue-plan.md`.
         kqueue: Arc<EpollKqueue>,
     },
+    /// A Linux pidfd referring to a process. Backed by a host `kqueue` watching
+    /// the real macOS process (`EVFILT_PROC`/`NOTE_EXIT`): the kqueue fd becomes
+    /// read-ready when the process exits, so poll/epoll/`waitid(P_PIDFD)` on the
+    /// pidfd are serviced by the macOS kernel's process-lifecycle tracking
+    /// rather than carrick bookkeeping. `host_pid` is the macOS pid (guest pids
+    /// mirror host pids in carrick). Used by Go 1.24's `os/exec`.
+    Pidfd {
+        host_pid: i32,
+        kqueue: Arc<crate::darwin_kqueue::Kqueue>,
+        status_flags: u64,
+    },
     // In-memory pipe ends. Currently `pipe2(2)` routes through `HostPipe`
     // (real macOS kernel pipe) so these are not constructed today, but the
     // full read/write/poll machinery (`PipeState`, `read_pipe`, `write_pipe`)
@@ -1243,6 +1254,7 @@ impl OpenDescription {
             | OpenDescription::EventFd { status_flags, .. }
             | OpenDescription::TimerFd { status_flags, .. }
             | OpenDescription::Epoll { status_flags, .. }
+            | OpenDescription::Pidfd { status_flags, .. }
             | OpenDescription::PipeReader { status_flags, .. }
             | OpenDescription::PipeWriter { status_flags, .. }
             | OpenDescription::HostPipe { status_flags, .. }
@@ -1260,6 +1272,7 @@ impl OpenDescription {
             | OpenDescription::EventFd { status_flags, .. }
             | OpenDescription::TimerFd { status_flags, .. }
             | OpenDescription::Epoll { status_flags, .. }
+            | OpenDescription::Pidfd { status_flags, .. }
             | OpenDescription::PipeReader { status_flags, .. }
             | OpenDescription::PipeWriter { status_flags, .. }
             | OpenDescription::HostPipe { status_flags, .. }
@@ -1292,6 +1305,9 @@ impl OpenDescription {
             }
             OpenDescription::Epoll { .. } => {
                 OpenStatSource::Record(StatRecord::synthetic("anon_inode:[eventpoll]", 0, 0o600))
+            }
+            OpenDescription::Pidfd { .. } => {
+                OpenStatSource::Record(StatRecord::synthetic("anon_inode:[pidfd]", 0, 0o600))
             }
             OpenDescription::PipeReader { .. } | OpenDescription::PipeWriter { .. } => {
                 OpenStatSource::Record(StatRecord::synthetic(
@@ -1508,6 +1524,8 @@ impl SyscallDispatcher {
         267 => syncfs,
         276 => renameat2,
         278 => getrandom,
+        424 => pidfd_send_signal,
+        434 => pidfd_open,
         285 => copy_file_range,
         291 => statx,
         436 => close_range,

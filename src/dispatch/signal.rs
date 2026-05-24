@@ -738,7 +738,7 @@ impl SyscallDispatcher {
     }
 }
 
-fn is_valid_signum(signum: u64) -> bool {
+pub(crate) fn is_valid_signum(signum: u64) -> bool {
     signum <= LINUX_MAX_SIGNUM
 }
 
@@ -782,7 +782,7 @@ fn signal_is_self_target(target: i64, tid_required: bool) -> bool {
     }
 }
 
-fn bootstrap_signal_send(target: i64, tid_required: bool, signum: u64) -> DispatchOutcome {
+pub(crate) fn bootstrap_signal_send(target: i64, tid_required: bool, signum: u64) -> DispatchOutcome {
     if !is_valid_signum(signum) {
         return DispatchOutcome::errno(LINUX_EINVAL);
     }

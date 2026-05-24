@@ -895,6 +895,87 @@ impl SyscallDispatcher {
         Ok(DispatchOutcome::Fork)
     }
 
+    /// pidfd_open(2): return a file descriptor referring to process `pid`. The
+    /// fd is backed by a host kqueue watching the real macOS process via
+    /// `EVFILT_PROC`/`NOTE_EXIT` (guest pids mirror host pids), so the macOS
+    /// kernel tracks the process lifecycle. Go 1.24's `os/exec` requires this
+    /// to succeed before it will spawn (it probes pidfd support, then uses
+    /// `CLONE_PIDFD`).
+    pub(super) fn pidfd_open<M: GuestMemory>(
+        &self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let pid = ctx.arg(0) as i32;
+        let flags = ctx.arg(1);
+        // PIDFD_NONBLOCK == O_NONBLOCK (0o4000) on aarch64 Linux.
+        const PIDFD_NONBLOCK: u64 = 0o4000;
+        if pid <= 0 {
+            return Ok(LINUX_EINVAL.into());
+        }
+        if flags & !PIDFD_NONBLOCK != 0 {
+            return Ok(LINUX_EINVAL.into());
+        }
+        Ok(self.open_pidfd(pid, flags))
+    }
+
+    /// Allocate a pidfd for `host_pid`. Shared by `pidfd_open` and the
+    /// `CLONE_PIDFD` fork path. Registers `EVFILT_PROC`/`NOTE_EXIT` so the fd
+    /// becomes readable when the process exits.
+    pub(super) fn open_pidfd(&self, host_pid: i32, status_flags: u64) -> DispatchOutcome {
+        let Some(kqueue) = crate::darwin_kqueue::Kqueue::new_internal() else {
+            return crate::linux_abi::LINUX_EMFILE.into();
+        };
+        if kqueue
+            .apply(&[crate::darwin_kqueue::Kevent::proc_exit(host_pid)])
+            .is_err()
+        {
+            // No such process (already reaped, or never existed).
+            return crate::linux_abi::LINUX_ESRCH.into();
+        }
+        let description = OpenDescription::Pidfd {
+            host_pid,
+            kqueue: std::sync::Arc::new(kqueue),
+            status_flags,
+        };
+        self.install_fd(description, 0)
+    }
+
+    /// Resolve a pidfd to its backing host pid, or `None` if `fd` isn't a pidfd.
+    pub(super) fn pidfd_host_pid(&self, fd: i32) -> Option<i32> {
+        let open = self.open_file(fd)?;
+        let desc = open.description.read();
+        match &*desc {
+            OpenDescription::Pidfd { host_pid, .. } => Some(*host_pid),
+            _ => None,
+        }
+    }
+
+    /// pidfd_send_signal(2): send `sig` to the process referred to by `pidfd`.
+    /// Routed through the same cross-process delivery as `kill(2)` on the
+    /// resolved host pid (guest pids mirror host pids).
+    pub(super) fn pidfd_send_signal<M: GuestMemory>(
+        &self,
+        ctx: &mut SyscallCtx<M>,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let fd = ctx.arg(0) as i32;
+        let signum = ctx.arg(1);
+        let Some(host_pid) = self.pidfd_host_pid(fd) else {
+            return Ok(LINUX_EBADF.into());
+        };
+        if signum == 0 {
+            // Existence check.
+            return Ok(DispatchOutcome::Returned { value: 0 });
+        }
+        if !crate::dispatch::signal::is_valid_signum(signum) {
+            return Ok(LINUX_EINVAL.into());
+        }
+        Ok(crate::dispatch::signal::bootstrap_signal_send(
+            i64::from(host_pid),
+            /*tid_required=*/ false,
+            signum,
+        ))
+    }
+
     /// clone3(2): like clone, but flags and the rest of the parameters live in
     /// a `struct clone_args` pointed to by arg0 (arg1 is its size). glibc's
     /// posix_spawn/fork now prefer clone3; without it apt-get's worker spawn

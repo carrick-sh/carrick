@@ -290,6 +290,7 @@ impl SyscallDispatcher {
                 | OpenDescription::EventFd { .. }
                 | OpenDescription::TimerFd { .. }
                 | OpenDescription::Epoll { .. }
+                | OpenDescription::Pidfd { .. }
                 | OpenDescription::PipeReader { .. }
                 | OpenDescription::PipeWriter { .. }
                 | OpenDescription::HostPipe { .. }
