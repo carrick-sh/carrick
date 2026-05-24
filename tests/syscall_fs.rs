@@ -10,6 +10,8 @@
 #[path = "common/syscall_support.rs"]
 mod support;
 
+#[cfg(target_os = "macos")]
+use carrick::fs_backend::{FsBackend, HostFsBackend};
 use carrick::linux_abi::{LINUX_EFBIG, LINUX_O_CREAT, LINUX_O_RDWR};
 use carrick::vfs::MAX_IN_MEMORY_FILE_SIZE;
 use support::*;
@@ -2547,6 +2549,68 @@ fn statx_writes_basic_rootfs_fd_and_symlink_metadata() {
         DispatchOutcome::Errno { errno: 14 }
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn host_stat_following_symlink_reports_target_inode() {
+    let scratch = tempfile::TempDir::new().unwrap();
+    let dir =
+        cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority()).unwrap();
+    let backend = HostFsBackend::from_existing_dir(dir);
+    backend.make_dir("/tmp").unwrap();
+    backend.make_dir("/target").unwrap();
+    backend.symlink("/target", "/tmp/link").unwrap();
+
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.set_fs_backend(Box::new(backend));
+    let reporter = CompatReporter::default();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x600]);
+    memory.write_bytes(0x4000, b"/target\0").unwrap();
+    memory.write_bytes(0x4020, b"/tmp/link\0").unwrap();
+
+    for (path_addr, stat_addr, flags) in [
+        (0x4000, 0x4100, 0),
+        (0x4020, 0x4200, 0),
+        (0x4020, 0x4300, LINUX_AT_SYMLINK_NOFOLLOW),
+    ] {
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    SyscallRequest::new(
+                        79,
+                        SyscallArgs::from([(-100_i64) as u64, path_addr, stat_addr, flags, 0, 0,]),
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: 0 }
+        );
+    }
+
+    let target = read_stat(&memory, 0x4100);
+    let followed_link = read_stat(&memory, 0x4200);
+    let link = read_stat(&memory, 0x4300);
+    assert_eq!(target.st_mode & LINUX_S_IFMT, LINUX_S_IFDIR);
+    assert_eq!(followed_link.st_mode & LINUX_S_IFMT, LINUX_S_IFDIR);
+    assert_eq!(link.st_mode & LINUX_S_IFMT, LINUX_S_IFLNK);
+    let target_ino = target.st_ino;
+    let followed_link_ino = followed_link.st_ino;
+    let link_ino = link.st_ino;
+    assert_eq!(target_ino, followed_link_ino);
+    assert_ne!(target_ino, link_ino);
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(49, SyscallArgs::from([0x4020, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
 }
 
 fn assert_fstat_and_statx_empty_path_agree(
