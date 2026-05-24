@@ -354,7 +354,10 @@ fn tgkill_to_masked_sibling_queues_without_signalthread() {
     assert_eq!(
         dispatcher
             .dispatch_threaded(
-                SyscallRequest::new(135, SyscallArgs::from([LINUX_SIG_BLOCK, 0x10000, 0, 8, 0, 0])),
+                SyscallRequest::new(
+                    135,
+                    SyscallArgs::from([LINUX_SIG_BLOCK, 0x10000, 0, 8, 0, 0])
+                ),
                 &mut memory,
                 &reporter,
                 sibling,
@@ -396,7 +399,10 @@ fn tgkill_to_masked_sibling_queues_without_signalthread() {
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
     );
-    assert_eq!(dispatcher.take_deliverable_pending(sibling), Some(SIGUSR1 as i32));
+    assert_eq!(
+        dispatcher.take_deliverable_pending(sibling),
+        Some(SIGUSR1 as i32)
+    );
 }
 
 #[test]

@@ -301,10 +301,7 @@ impl SyscallDispatcher {
         // Snapshot any already-queued ready events first.
         let mut ready = {
             let mut open = open_file.description.write();
-            let OpenDescription::Epoll {
-                pending_ready, ..
-            } = &mut *open
-            else {
+            let OpenDescription::Epoll { pending_ready, .. } = &mut *open else {
                 return Ok(LINUX_EINVAL.into());
             };
             drain_pending_epoll_ready(pending_ready, max_events)

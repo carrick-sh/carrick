@@ -101,11 +101,7 @@ mod imp {
                 )
             }
         };
-        if rc < 0 {
-            neg_errno()
-        } else {
-            rc as i64
-        }
+        if rc < 0 { neg_errno() } else { rc as i64 }
     }
 
     /// Wake waiters on `host_addr`. Returns `>= 0` on success, `-errno`
@@ -120,11 +116,7 @@ mod imp {
                 os_sync_wake_by_address_any(host_addr as *mut c_void, FUTEX_WORD_SIZE, flags)
             }
         };
-        if rc < 0 {
-            neg_errno()
-        } else {
-            rc as i64
-        }
+        if rc < 0 { neg_errno() } else { rc as i64 }
     }
 }
 
@@ -151,7 +143,11 @@ mod tests {
         let addr = &word as *const AtomicU32 as usize;
         // Value matches (7), so we block; 10ms timeout -> -ETIMEDOUT.
         let rc = wait(addr, 7, 10_000);
-        assert_eq!(rc, -(libc::ETIMEDOUT as i64), "expected -ETIMEDOUT, got {rc}");
+        assert_eq!(
+            rc,
+            -(libc::ETIMEDOUT as i64),
+            "expected -ETIMEDOUT, got {rc}"
+        );
     }
 
     #[test]
@@ -169,6 +165,9 @@ mod tests {
         let addr = &word as *const AtomicU32 as usize;
         // No waiter parked: os_sync returns -1/ENOENT; wrapper maps to -errno.
         let rc = wake(addr, true);
-        assert!(rc < 0, "wake with no waiters should report an error, got {rc}");
+        assert!(
+            rc < 0,
+            "wake with no waiters should report an error, got {rc}"
+        );
     }
 }

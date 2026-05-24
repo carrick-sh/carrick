@@ -1163,7 +1163,11 @@ fn epoll_edge_triggered_ready_overflow_is_returned_on_next_wait() {
             .unwrap(),
         DispatchOutcome::Returned { value: 6 }
     );
-    for (fd, data, addr) in [(3, 0x301_u64, 0x4000_u64), (4, 0x401, 0x4010), (5, 0x501, 0x4020)] {
+    for (fd, data, addr) in [
+        (3, 0x301_u64, 0x4000_u64),
+        (4, 0x401, 0x4010),
+        (5, 0x501, 0x4020),
+    ] {
         let wanted = LinuxEpollEvent {
             events: LINUX_EPOLLIN | LINUX_EPOLLET,
             _pad: 0,
@@ -1215,7 +1219,10 @@ fn epoll_edge_triggered_ready_overflow_is_returned_on_next_wait() {
     let leftover = read_epoll_event(&memory, 0x4100);
     assert_eq!(leftover.events & LINUX_EPOLLIN, LINUX_EPOLLIN);
     seen.insert(leftover.data);
-    assert_eq!(seen, std::collections::BTreeSet::from([0x301_u64, 0x401, 0x501]));
+    assert_eq!(
+        seen,
+        std::collections::BTreeSet::from([0x301_u64, 0x401, 0x501])
+    );
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
