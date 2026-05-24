@@ -26,20 +26,20 @@ Validated current results:
 - Native macOS Go baseline is clean: `go version go1.26.2 darwin/arm64`;
   rebuilding `fixtures/go-aarch64-hello/src/main.go` natively and running
   `-benchmark -c 50 -n 300` passed 10/10.
-- Carrick default Go c50 after the sigreturn, signal-wake, epoll, and CPU-surface
-  changes passed 20/20; elapsed times were about 7.8-9.0 ms in the latest sweep.
-- `CARRICK_EXPOSED_CPUS=10` after the signal-wake fix still failed: 9/20 clean,
-  10 client deadline panics, 1 timeout/kill.
-- `CARRICK_EXPOSED_CPUS=10 GOGC=off` still failed: 11/20 clean, 9 deadline
-  panics, 0 timeouts. GC is visible in schedtrace failures, but disabling GC is
-  not a fix.
-- `CARRICK_EXPOSED_CPUS=10 GOMAXPROCS=4` was much better but still not perfect:
-  19/20 clean, 1 deadline panic. The 10-CPU surface changes more than just the
-  default Go P count.
-- A traced failing `CARRICK_EXPOSED_CPUS=10` run still showed one
-  `epoll_pwait` wait on the epoll kqueue fd timing out at about 5 seconds, so
-  the remaining high-P issue is a progress/readiness stall, not the old EL0
-  sigreturn fault.
+- Carrick default Go c50 on the current tree is clean: 10/10.
+- `CARRICK_EXPOSED_CPUS=10` on the current tree is still not clean:
+  6/10 clean, 2 client deadline panics, 2 timeout/kills.
+- `CARRICK_EXPOSED_CPUS=10 GODEBUG=asyncpreemptoff=1` on the current tree is
+  clean: 10/10.
+- `CARRICK_EXPOSED_CPUS=10 GOGC=off` still failed earlier: 11/20 clean, 9
+  deadline panics, 0 timeouts. GC is visible in schedtrace failures, but
+  disabling GC is not a fix.
+- A minimal `carrick trace` script (`scripts/trace-go-missed-event.d`) catches
+  the failing path without broad syscall tracing overhead. In a failing run it
+  showed one epoll kqueue wait timing out while a different tid absorbed 412
+  `SIGURG` publish/deliver cycles; the hottest interrupted PCs were inside Go's
+  runtime syscall wrappers (`runtime.futex.abi0`, `runtime.osyield.abi0`,
+  `runtime.nanotime1.abi0`).
 
 ## What changed in this continuation
 
@@ -72,6 +72,13 @@ Validated current results:
   - This closes the first-principles lost-wake hole where a non-target waiter
     could drain the shared pipe before the target waiter observed it. It did not
     eliminate the forced-10-CPU Go stall.
+- Signal-mask fidelity
+  - Thread-directed sibling signals that target a thread with that signal
+    currently blocked now queue directly in Carrick's per-thread pending set
+    instead of immediately kicking the target.
+  - Carrick now saves the target thread's previous guest signal mask in the
+    sigframe `ucontext`, installs the handler-time blocked mask before
+    injection, and restores that saved mask on `rt_sigreturn`.
 - Darwin CPU surface hardening
   - `host_facts::logical_cpu_count()` now selects `hw.perflevel0.logicalcpu` on
     macOS when present, capped by total logical CPUs. `CARRICK_EXPOSED_CPUS`
@@ -82,6 +89,9 @@ Validated current results:
   - `70b1a76` added `scripts/trace-go-futex.d` and `scripts/trace-go-signal.d`.
   - `d09005e` added `scripts/trace-go-net.d`.
   - `4c783cc` made the futex trace bounded and raised DTrace buffers.
+  - `scripts/trace-go-missed-event.d` is the current lightweight trace for the
+    residual race: only Carrick USDT epoll/signal/io-wait probes, no broad
+    syscall-entry/return coverage.
 
 ## Verification run this continuation
 
@@ -99,7 +109,9 @@ Validated current results:
   passed.
 - `cargo test --release --test io_wait -- --nocapture` passed: 2 tests.
 - `cargo test --release --test syscall_net -- --test-threads=1 --nocapture`
-  passed: 24 tests.
+  passed: 25 tests.
+- `cargo test --release --test syscall_thread -- --nocapture` passed: 15 tests.
+- `cargo test --release --test syscall_signal -- --nocapture` passed: 4 tests.
 - `./scripts/build-signed.sh` passed after the latest cargo test rebuilds.
 - Static scheduler fixture:
   `target/release/carrick run-elf --raw --fs host fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-scheduler`
@@ -109,12 +121,14 @@ Validated current results:
   passed before the final test rebuild; re-sign before using `target/release/carrick`
   for HVF runs.
 - Native macOS Go c50: 10/10 clean.
-- Carrick default Go c50: 20/20 clean.
-- Carrick `CARRICK_EXPOSED_CPUS=10` Go c50: 9/20 clean, 10 deadline panics,
-  1 timeout/kill.
-- Carrick `CARRICK_EXPOSED_CPUS=10 GOGC=off` Go c50: 11/20 clean,
+- Carrick default Go c50 on the current tree: 10/10 clean.
+- Carrick `CARRICK_EXPOSED_CPUS=10` Go c50 on the current tree: 6/10 clean,
+  2 deadline panics, 2 timeout/kills.
+- Carrick `CARRICK_EXPOSED_CPUS=10 GODEBUG=asyncpreemptoff=1` Go c50 on the
+  current tree: 10/10 clean.
+- Carrick `CARRICK_EXPOSED_CPUS=10 GOGC=off` Go c50 earlier: 11/20 clean,
   9 deadline panics, 0 timeouts.
-- Carrick `CARRICK_EXPOSED_CPUS=10 GOMAXPROCS=4` Go c50: 19/20 clean,
+- Carrick `CARRICK_EXPOSED_CPUS=10 GOMAXPROCS=4` Go c50 earlier: 19/20 clean,
   1 deadline panic, 0 timeouts.
 
 ## Darwin/macOS and FreeBSD leverage
@@ -146,30 +160,43 @@ Linux epoll syscall boundary.
 
 For CPU exposure, the Darwin leverage is `sysctl` topology, not a hardcoded
 Linux fiction. On this host, exposing `hw.perflevel0.logicalcpu` gives Go a
-stable default. Exposing all 10 logical CPUs is still available for stress runs
-via `CARRICK_EXPOSED_CPUS=10`, but it is not currently reliable.
+stable default. Go 1.26.2's Linux runtime computes its default CPU count from
+the `sched_getaffinity` population count (`runtime/os_linux.go:getCPUCount`),
+so Carrick's Linux-visible affinity mask is the surface that directly drives
+default `GOMAXPROCS`.
 
 ## Open blocker
 
 The remaining blocker is forced high-P progress with `CARRICK_EXPOSED_CPUS=10`.
-The old stack-resident sigreturn crash is fixed, and the shared signal-pipe
-lost-wake hole is fixed, but high-P still produces client deadline panics and
-occasional timeouts. Latest trace evidence points at an epoll/netpoll progress
-stall: a failing traced run had an epoll kqueue fd wait return timeout after
-about five seconds. A schedtrace failure also showed `gomaxprocs=10`,
-`idleprocs=8`, empty run queues, and goroutines stuck in GC assist/mark
-termination for several seconds, but `GOGC=off` still fails, so GC is not the
-whole explanation.
+The old stack-resident sigreturn crash is fixed, the shared waiter-pipe
+lost-wake hole is fixed, pending host-backed epoll events are now preserved
+across `maxevents`, and the handler-time guest signal mask is now saved and
+restored. High-P still produces deadline failures and timeouts.
+
+The strongest current diagnosis is: async preemption is still implicated, but
+not in the original "signal delivery is completely broken" way. On the current
+tree:
+
+- `asyncpreemptoff=1` makes the 10-CPU oracle clean.
+- lightweight `carrick trace` still catches a failing run.
+- in that failing trace, one thread receives a large `SIGURG` storm while a
+  different thread times out waiting on the epoll kqueue fd.
+
+That points to a remaining race or semantic mismatch in the async-preemption
+path or in how that path interacts with Go's scheduler/runtime state, not a
+plain missed epoll event.
 
 Next best path:
 
-- Capture a failing `CARRICK_EXPOSED_CPUS=10` run with both `scripts/trace-go-net.d`
-  and `GODEBUG=schedtrace=500,scheddetail=1` to correlate Go's P/M/G state with
-  the exact epoll timeout.
+- Keep using `scripts/trace-go-missed-event.d` for low-perturbation failing
+  samples; the broader syscall aggregators are too heavy for this race.
+- Correlate the hot `SIGURG` target tid with its interrupted PCs and Go runtime
+  state. The current failure signature is a thread stuck in repeated preemption
+  around `runtime.futex.abi0` / `runtime.osyield.abi0` / `runtime.nanotime1.abi0`.
 - Reduce the workload toward a loopback netpoll + timer/deadline fixture that
   keeps `GOMAXPROCS=10` but removes HTTP and JSON.
 - Keep the default CPU surface at the validated Darwin performance-cluster count
-  unless the high-P scheduler/progress bug is fixed.
+  unless the high-P async-preemption interaction is fixed.
 
 ## Commands
 
