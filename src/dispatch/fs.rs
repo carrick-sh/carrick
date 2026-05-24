@@ -496,6 +496,18 @@ impl SyscallDispatcher {
             Ok(path) => path,
             Err(errno) => return Ok(errno.into()),
         };
+        // Disk-backed overlay: follow a directory symlink the way Linux
+        // chdir(2) does. The generic RootFsVfs lookup intentionally preserves
+        // symlink metadata for lstat-style callers, so ask the backend for a
+        // following stat first when it can provide one.
+        if let Some(real) = self.fs.rootfs_vfs.overlay.real_stat(&path, true) {
+            if real.kind != RootFsEntryKind::Directory {
+                return Ok(LINUX_ENOTDIR.into());
+            }
+            *self.io.cwd.write() = display_rootfs_path(Path::new(&path));
+            return Ok(DispatchOutcome::Returned { value: 0 });
+        }
+
         // Use the LAYERED lookup (overlay/host backend first, then rootfs),
         // not just the immutable rootfs — otherwise a freshly mkdir'd
         // directory is invisible and chdir into it fails ENOENT (dpkg-deb

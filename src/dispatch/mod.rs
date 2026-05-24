@@ -1183,7 +1183,7 @@ enum XattrTarget {
 
 #[derive(Debug, Clone)]
 struct StatRecord {
-    path: std::path::PathBuf,
+    ino: u64,
     mode: u32,
     nlink: u32,
     uid: u32,
@@ -1197,7 +1197,7 @@ struct StatRecord {
 impl StatRecord {
     fn from_metadata(metadata: &RootFsMetadata) -> Self {
         Self {
-            path: metadata.path.clone(),
+            ino: inode_for_path(&metadata.path),
             mode: linux_mode(metadata),
             nlink: if metadata.kind == RootFsEntryKind::Directory {
                 2
@@ -1222,7 +1222,7 @@ impl StatRecord {
         };
         let mode = linux_mode(&metadata);
         Self {
-            path: metadata.path,
+            ino: real.ino,
             mode,
             nlink: real.nlink,
             uid: real.uid,
@@ -1235,8 +1235,9 @@ impl StatRecord {
     }
 
     fn synthetic(path: &str, size: usize, mode: u32) -> Self {
+        let path = Path::new(path).to_path_buf();
         Self {
-            path: Path::new(path).to_path_buf(),
+            ino: inode_for_path(&path),
             mode,
             nlink: 1,
             uid: 0,
@@ -2871,7 +2872,7 @@ fn write_stat_record(
     let size = record.size_usize();
     let stat = LinuxStat {
         st_dev: 1,
-        st_ino: inode_for_path(&record.path),
+        st_ino: record.ino,
         st_mode: record.mode,
         st_nlink: record.nlink,
         st_uid: record.uid,
@@ -2926,6 +2927,7 @@ pub(super) fn real_stat_from_libc(st: &libc::stat) -> crate::fs_backend::RealSta
     };
     crate::fs_backend::RealStat {
         kind,
+        ino: st.st_ino,
         nlink: st.st_nlink as u32,
         mode: st.st_mode as u32 & 0o7777,
         // Owner defaults to root; the HostFile fstat/statx path overrides from
@@ -2987,7 +2989,7 @@ fn write_statx_record(
         stx_gid: record.gid,
         stx_mode: record.mode as u16,
         __spare0: [0; 1],
-        stx_ino: inode_for_path(&record.path),
+        stx_ino: record.ino,
         stx_size: record.size,
         stx_blocks: blocks_512(size) as u64,
         stx_attributes_mask: 0,
