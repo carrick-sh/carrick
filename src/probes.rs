@@ -129,6 +129,12 @@ mod carrick_usdt {
     /// `magic` the frame magic read back. A corrupted `saved_pc` or `magic`
     /// here pinpoints sigframe corruption (the "PROT_REA" wild-PC crash).
     fn signal__restore(_: u64, _: u64, _: u64) {}
+    /// Fires when a cross-thread kick (`hv_vcpus_exit`) lands while the vCPU is
+    /// still executing carrick's EL1 trap trampoline (not at guest EL0). `pc` is
+    /// the EL1 PC, `el` the current exception level (1+). carrick resumes
+    /// instead of injecting a signal at this non-guest PC; a nonzero rate here
+    /// is the signal-vs-trampoline race being correctly absorbed.
+    fn kick__in_kernel(_: u64, _: u32) {}
     /// Reusable guest-memory watchpoint. When `CARRICK_WATCH_ADDR=<hex>` is
     /// set, fires before EVERY syscall with (`syscall_nr`, `addr`, the current
     /// little-endian u64 at `addr`). Lets a trace bracket exactly which
@@ -233,6 +239,10 @@ pub fn signal_inject(signum: i32, saved_pc: u64, new_sp: u64, handler: u64) {
 
 pub fn signal_restore(saved_pc: u64, sp: u64, magic: u64) {
     carrick_usdt::signal__restore!(|| (saved_pc, sp, magic));
+}
+
+pub fn kick_in_kernel(pc: u64, el: u32) {
+    carrick_usdt::kick__in_kernel!(|| (pc, el));
 }
 
 pub fn mem_watch(syscall_nr: u64, addr: u64, value: u64) {
