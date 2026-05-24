@@ -67,6 +67,16 @@ impl VcpuKicker {
             .insert(tid, handle);
     }
 
+    /// Number of threads with a registered (live) vCPU. The fork quiesce uses
+    /// this — not the thread registry's `live_count` — to decide how many
+    /// siblings it must wait for: only threads with an actual vCPU need to
+    /// release it, and a thread that has a tid but hasn't built its vCPU yet
+    /// must NOT be awaited (it would never reach the barrier).
+    pub fn count(&self) -> usize {
+        #[allow(clippy::expect_used)]
+        self.handles.lock().expect("VcpuKicker poisoned").len()
+    }
+
     /// Drop a thread's handle when it exits (so a kick can't target a dead vCPU
     /// and a recycled tid starts clean).
     pub fn unregister(&self, tid: ThreadId) {

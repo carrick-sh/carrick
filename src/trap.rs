@@ -244,6 +244,21 @@ fn rebuilt_vm_cell() -> &'static parking_lot::Mutex<Option<SharedVm>> {
     CELL.get_or_init(|| parking_lot::Mutex::new(None))
 }
 
+/// Process-global count of live HVF vCPUs (created minus destroyed). Pure
+/// diagnostic: reported in the fork__quiesce phase-2 probe so a `carrick trace`
+/// shows exactly how many vCPUs are alive when the forker calls hv_vm_destroy.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) static VCPU_LIVE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn vcpu_created() {
+    VCPU_LIVE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn vcpu_destroyed() {
+    VCPU_LIVE.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 thread_local! {
     /// Per-sibling vCPU snapshot held between `release_vcpu_for_fork` and
@@ -822,6 +837,20 @@ impl HvfTrapEngine {
         Err(TrapError::UnsupportedPlatform)
     }
 
+    /// A sibling guest thread is exiting: destroy ITS OWN vCPU (only the owning
+    /// thread may) so the slot is freed in the process-global VM. Without this,
+    /// the no-op `Drop` leaks the vCPU live forever, and a later fork's
+    /// `hv_vm_destroy` trips over the accumulated dead-thread vCPUs (HV_BUSY).
+    /// Raw `hv_vcpu_destroy`, not applevisor's panicky wrapper.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn destroy_vcpu_on_thread_exit(&mut self) {
+        let _ = unsafe { applevisor_sys::hv_vcpu_destroy(self.inner.vcpu.id()) };
+        vcpu_destroyed();
+    }
+
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    pub fn destroy_vcpu_on_thread_exit(&mut self) {}
+
     /// Multithreaded-fork parent: publish the rebuilt VM for quiesced siblings.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub fn publish_vm_for_siblings(&self) {
@@ -852,6 +881,7 @@ impl HvfTrapEngine {
         config.set_ipa_size(max_ipa).map_err(hvf_error)?;
         let vm = VirtualMachine::with_config(config).map_err(hvf_error)?;
         let vcpu = vm.vcpu_create().map_err(hvf_error)?;
+        vcpu_created();
         Ok(Self {
             inner: std::mem::ManuallyDrop::new(HvfInner {
                 _vm: vm,
@@ -1560,7 +1590,13 @@ impl HvfInner {
     fn release_vcpu_for_fork(&mut self) -> Result<(), TrapError> {
         let snap = self.snapshot_vcpu()?;
         FORK_VCPU_SNAPSHOT.with(|s| *s.borrow_mut() = Some(snap));
-        let _ = unsafe { applevisor_sys::hv_vcpu_destroy(self.vcpu.id()) };
+        let rc = unsafe { applevisor_sys::hv_vcpu_destroy(self.vcpu.id()) };
+        vcpu_destroyed();
+        // phase 3: a nonzero rc means this sibling FAILED to destroy its own
+        // vCPU, so it stays live and the forker's hv_vm_destroy hits HV_BUSY.
+        crate::probes::fork_quiesce(3, rc as i64, self.vcpu.id() as i64, unsafe {
+            libc::getpid()
+        });
         Ok(())
     }
 
@@ -1587,6 +1623,7 @@ impl HvfInner {
             .clone()
             .unwrap_or_else(|| self._vm.clone());
         let new_vcpu = new_vm.vcpu_create().map_err(hvf_error)?;
+        vcpu_created();
         // Replace _vm and vcpu WITHOUT running applevisor's panicky Drop on the
         // old (already-destroyed) handles — mirror the fork/thread-sibling
         // leak-until-exit discipline.
@@ -1967,7 +2004,17 @@ impl HvfInner {
         // Both processes then rebuild a fresh VM from the snapshot.
         let inherited_vcpu_id = self.vcpu.id();
         let _ = unsafe { applevisor_sys::hv_vcpu_destroy(inherited_vcpu_id) };
-        let _ = unsafe { applevisor_sys::hv_vm_destroy() };
+        vcpu_destroyed();
+        let vm_destroy_rc = unsafe { applevisor_sys::hv_vm_destroy() };
+        // phase 2: a nonzero rc means a vCPU was still live at teardown — the
+        // HV_BUSY root cause (the rebuilt VM is then corrupt and sibling
+        // vcpu_create fails). Traceable via `carrick trace` fork__quiesce.
+        crate::probes::fork_quiesce(
+            2,
+            vm_destroy_rc as i64,
+            VCPU_LIVE.load(std::sync::atomic::Ordering::SeqCst),
+            unsafe { libc::getpid() },
+        );
 
         // Real fork. Caller is expected to have flushed any host-side
         // stdio buffers; for our JSON-at-end report flow this is fine.
@@ -2001,6 +2048,7 @@ impl HvfInner {
         config.set_ipa_size(max_ipa).map_err(hvf_error)?;
         let new_vm = VirtualMachine::with_config(config).map_err(hvf_error)?;
         let new_vcpu = new_vm.vcpu_create().map_err(hvf_error)?;
+        vcpu_created();
 
         // Overwrite *self with the new HvfInner WITHOUT running Drop on
         // the old contents. The old struct holds applevisor wrappers
@@ -2117,7 +2165,16 @@ impl HvfInner {
             snapshot,
         } = spec;
 
+        // The spec captured `vm` at clone time. If a fork rebuilt the VM since
+        // then (the spec's `vm` was destroyed), create the vCPU in the CURRENT
+        // VM that the fork published instead — otherwise vcpu_create hits
+        // HV_BUSY on a torn-down VM. Between forks the published cell holds the
+        // live VM; with no fork yet it's empty and the spec's `vm` is current.
+        // The caller holds `fork_quiesce::topology_lock()`, so this read can't
+        // race a fork's republish.
+        let vm = rebuilt_vm_cell().lock().clone().unwrap_or(vm);
         let vcpu = vm.vcpu_create().map_err(hvf_error)?;
+        vcpu_created();
 
         let mut inner = HvfInner {
             _vm: vm,
@@ -2231,6 +2288,7 @@ impl HvfInner {
         // the `ManuallyDrop` wrapper around `HvfInner`).
         let inherited_vcpu_id = self.vcpu.id();
         let _ = unsafe { applevisor_sys::hv_vcpu_destroy(inherited_vcpu_id) };
+        vcpu_destroyed();
         let _ = unsafe { applevisor_sys::hv_vm_destroy() };
 
         // Create a fresh VM + vCPU.
@@ -2239,6 +2297,7 @@ impl HvfInner {
         config.set_ipa_size(max_ipa).map_err(hvf_error)?;
         let new_vm = VirtualMachine::with_config(config).map_err(hvf_error)?;
         let new_vcpu = new_vm.vcpu_create().map_err(hvf_error)?;
+        vcpu_created();
 
         // Preserve `is_forked_child` across execve. A process that
         // descended from the original `carrick run` invocation should
