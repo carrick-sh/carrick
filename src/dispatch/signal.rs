@@ -47,13 +47,16 @@ pub(super) struct SignalState {
     /// calls `rt_sigaction(signum, new, old, 8)` we record `new` here
     /// and return whatever was previously stored via `old`.
     pub handlers: HashMap<i32, LinuxSigaction>,
-    /// Guest's blocked-signal mask (bit `signum-1`). Updated by
-    /// `rt_sigprocmask`. A blocked signal that is raised is held in
-    /// `pending` instead of being delivered.
-    pub mask: u64,
-    /// Signals raised while blocked, awaiting unblock or a synchronous
-    /// wait (`rt_sigtimedwait`). Bit `signum-1`.
-    pub pending: u64,
+    /// Guest's blocked-signal mask (bit `signum-1`), PER GUEST THREAD. The
+    /// signal mask is per-thread in Linux; a process-global mask let one
+    /// thread's `rt_sigprocmask` (e.g. musl's pthread_create block/restore
+    /// dance) block a signal for ANOTHER thread → a cross-thread signal was
+    /// "blocked" at the target and never delivered (found via `carrick trace`
+    /// signal-publish/deliver probes). Default (absent key) = empty mask.
+    pub masks: HashMap<crate::thread::ThreadId, u64>,
+    /// Signals raised while blocked, awaiting unblock or a synchronous wait
+    /// (`rt_sigtimedwait`), PER GUEST THREAD (bit `signum-1`).
+    pub pendings: HashMap<crate::thread::ThreadId, u64>,
     /// Installed alternate signal stack (`sigaltstack`), PER GUEST THREAD.
     /// `sigaltstack` is per-thread in Linux (each thread/M registers its own
     /// signal stack), so this MUST be keyed by tid: a process-global slot made
@@ -69,10 +72,14 @@ impl SignalState {
     pub(super) fn new() -> Self {
         Self {
             handlers: HashMap::new(),
-            mask: 0,
-            pending: 0,
+            masks: HashMap::new(),
+            pendings: HashMap::new(),
             altstack: HashMap::new(),
         }
+    }
+
+    fn mask_for(&self, tid: crate::thread::ThreadId) -> u64 {
+        self.masks.get(&tid).copied().unwrap_or(0)
     }
 }
 
@@ -179,22 +186,32 @@ impl SyscallDispatcher {
 
     /// True iff `signum` is currently blocked by the guest's signal mask.
     /// SIGKILL/SIGSTOP can never be blocked, matching the kernel.
-    pub fn signal_blocked(&self, signum: i32) -> bool {
+    pub fn signal_blocked(&self, tid: crate::thread::ThreadId, signum: i32) -> bool {
         if signum == LINUX_SIGKILL || signum == LINUX_SIGSTOP {
             return false;
         }
         match sigmask_bit(signum) {
-            Some(bit) => self.signal.lock().mask & bit != 0,
+            Some(bit) => self.signal.lock().mask_for(tid) & bit != 0,
             None => false,
         }
     }
 
-    /// Record a (blocked) signal as pending. It stays queued until the
-    /// guest unblocks it or dequeues it via `rt_sigtimedwait`.
-    pub fn mark_signal_pending(&self, signum: i32) {
+    /// Record a (blocked) signal as pending for `tid`. It stays queued until the
+    /// thread unblocks it or dequeues it via `rt_sigtimedwait`.
+    pub fn mark_signal_pending(&self, tid: crate::thread::ThreadId, signum: i32) {
         if let Some(bit) = sigmask_bit(signum) {
-            self.signal.lock().pending |= bit;
+            *self.signal.lock().pendings.entry(tid).or_insert(0) |= bit;
         }
+    }
+
+    /// Drop a thread's per-thread signal state (mask/pending/alt stack) when it
+    /// exits, so the maps don't grow unbounded over a long run and a recycled
+    /// tid starts clean. Signal handlers are process-global and untouched.
+    pub fn forget_thread_signal_state(&self, tid: crate::thread::ThreadId) {
+        let mut s = self.signal.lock();
+        s.masks.remove(&tid);
+        s.pendings.remove(&tid);
+        s.altstack.remove(&tid);
     }
 
     /// Lowest-numbered pending signal that is NOT currently blocked, cleared
@@ -203,21 +220,22 @@ impl SyscallDispatcher {
     /// — one per cycle so each handler runs (and returns via rt_sigreturn)
     /// before the next is injected, matching the kernel's deliver-all-pending-
     /// before-returning-to-userspace behaviour. None when none remain.
-    pub fn take_deliverable_pending(&self) -> Option<i32> {
-        let mask = self.signal.lock().mask;
-        self.take_pending_in(!mask)
+    pub fn take_deliverable_pending(&self, tid: crate::thread::ThreadId) -> Option<i32> {
+        let mask = self.signal.lock().mask_for(tid);
+        self.take_pending_in(tid, !mask)
     }
 
-    /// Lowest-numbered pending signal that intersects `set`, cleared from
-    /// the pending set. Used by `rt_sigtimedwait`.
-    fn take_pending_in(&self, set: u64) -> Option<i32> {
+    /// Lowest-numbered pending signal for `tid` that intersects `set`, cleared
+    /// from that thread's pending set. Used by `rt_sigtimedwait`.
+    fn take_pending_in(&self, tid: crate::thread::ThreadId, set: u64) -> Option<i32> {
         let mut signal = self.signal.lock();
-        let candidates = signal.pending & set;
+        let cur = signal.pendings.get(&tid).copied().unwrap_or(0);
+        let candidates = cur & set;
         if candidates == 0 {
             return None;
         }
         let signum = candidates.trailing_zeros() as i32 + 1;
-        signal.pending &= !(1u64 << (signum - 1));
+        signal.pendings.insert(tid, cur & !(1u64 << (signum - 1)));
         Some(signum)
     }
 
@@ -225,17 +243,22 @@ impl SyscallDispatcher {
     /// target). If the signal is blocked it is held pending; otherwise it
     /// is handed to the runtime's delivery slot. signum 0 is the null
     /// probe and a no-op success.
-    fn raise_self(&self, signum: u64) -> DispatchOutcome {
+    fn raise_self(&self, tid: crate::thread::ThreadId, signum: u64) -> DispatchOutcome {
         if signum == 0 {
             return DispatchOutcome::Returned { value: 0 };
         }
         let s = signum as i32;
-        if self.signal_blocked(s) {
-            self.mark_signal_pending(s);
+        if self.signal_blocked(tid, s) {
+            self.mark_signal_pending(tid, s);
         } else {
             crate::host_signal::raise_for_self(s);
         }
         DispatchOutcome::Returned { value: 0 }
+    }
+
+    /// The calling guest thread's tid (or `0` if no thread context).
+    fn ctx_tid<M: GuestMemory>(ctx: &SyscallCtx<M>) -> crate::thread::ThreadId {
+        ctx.thread.as_ref().map(|t| t.tid).unwrap_or(0)
     }
 
     pub(super) fn kill<M: GuestMemory>(
@@ -248,7 +271,7 @@ impl SyscallDispatcher {
             return Ok(LINUX_EINVAL.into());
         }
         if signal_is_self_target(pid, /*tid_required=*/ false) {
-            return Ok(self.raise_self(signum));
+            return Ok(self.raise_self(Self::ctx_tid(ctx), signum));
         }
         Ok(bootstrap_signal_send(
             pid, /*tid_required=*/ false, signum,
@@ -274,7 +297,8 @@ impl SyscallDispatcher {
                 return Ok(routed);
             }
             if signal_is_self_target(tid, /*tid_required=*/ true) {
-                return Ok(this.raise_self(signum));
+                let self_tid = cx.thread.as_ref().map(|t| t.tid).unwrap_or(0);
+                return Ok(this.raise_self(self_tid, signum));
             }
             Ok(bootstrap_signal_send(tid, /*tid_required=*/ true, signum))
         }
@@ -304,7 +328,8 @@ impl SyscallDispatcher {
             if !valid_self {
                 return Ok(LINUX_ESRCH.into());
             }
-            Ok(this.raise_self(signum))
+            let self_tid = cx.thread.as_ref().map(|t| t.tid).unwrap_or(0);
+            Ok(this.raise_self(self_tid, signum))
         }
     }
 
@@ -323,7 +348,7 @@ impl SyscallDispatcher {
         let t = ctx.thread.as_ref()?;
         let target = tid as crate::thread::ThreadId;
         if i64::from(t.tid) == tid {
-            return Some(self.raise_self(signum));
+            return Some(self.raise_self(t.tid, signum));
         }
         if t.registry.is_live(target) {
             return Some(DispatchOutcome::SignalThread {
@@ -513,11 +538,12 @@ impl SyscallDispatcher {
         let new_set = ctx.arg(1);
         let old_set = ctx.arg(2);
         let sigset_size = ctx.arg(3);
+        let tid = Self::ctx_tid(ctx);
         let memory = &mut *ctx.memory;
         if sigset_size != LINUX_RT_SIGSET_SIZE {
             return Ok(LINUX_EINVAL.into());
         }
-        let previous_mask = self.signal.lock().mask;
+        let previous_mask = self.signal.lock().mask_for(tid);
         // Write back the *previous* mask before applying changes (the
         // caller may pass the same buffer for new_set and old_set).
         if old_set != 0
@@ -549,7 +575,7 @@ impl SyscallDispatcher {
             let unmaskable =
                 sigmask_bit(LINUX_SIGKILL).unwrap() | sigmask_bit(LINUX_SIGSTOP).unwrap();
             mask &= !unmaskable;
-            self.signal.lock().mask = mask;
+            self.signal.lock().masks.insert(tid, mask);
             // Signals that just became unblocked stay in `pending`; the runtime
             // drains them via `take_deliverable_pending` after this syscall,
             // delivering each handler in turn. (The previous code raised only
@@ -565,15 +591,13 @@ impl SyscallDispatcher {
     ) -> Result<DispatchOutcome, DispatchError> {
         let set_ptr = ctx.arg(0);
         let sigset_size = ctx.arg(1);
+        let tid = Self::ctx_tid(ctx);
         let memory = &mut *ctx.memory;
         if sigset_size != LINUX_RT_SIGSET_SIZE {
             return Ok(LINUX_EINVAL.into());
         }
-        if set_ptr != 0
-            && memory
-                .write_bytes(set_ptr, &self.signal.lock().pending.to_le_bytes())
-                .is_err()
-        {
+        let pending = self.signal.lock().pendings.get(&tid).copied().unwrap_or(0);
+        if set_ptr != 0 && memory.write_bytes(set_ptr, &pending.to_le_bytes()).is_err() {
             return Ok(LINUX_EFAULT.into());
         }
         Ok(DispatchOutcome::Returned { value: 0 })
@@ -587,6 +611,7 @@ impl SyscallDispatcher {
         let info_ptr = ctx.arg(1);
         let timeout_ptr = ctx.arg(2);
         let sigset_size = ctx.arg(3);
+        let tid = Self::ctx_tid(ctx);
         let memory = &*ctx.memory;
         if sigset_size != LINUX_RT_SIGSET_SIZE {
             return Ok(LINUX_EINVAL.into());
@@ -617,7 +642,7 @@ impl SyscallDispatcher {
         let memory = &mut *ctx.memory;
         // A signal already pending (e.g. raised while blocked) is dequeued
         // immediately and its number returned.
-        if let Some(signum) = self.take_pending_in(wait_set) {
+        if let Some(signum) = self.take_pending_in(tid, wait_set) {
             return Ok(rt_sigtimedwait_deliver(memory, info_ptr, signum));
         }
         // Nothing pending. A zero (or absent) timeout is a non-blocking poll.

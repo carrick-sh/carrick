@@ -964,6 +964,7 @@ impl ThreadRuntimeState {
         let last = self.registry.exit(self.this_tid);
         self.kicker.unregister(self.this_tid);
         crate::host_signal::forget_thread(self.this_tid);
+        kernel.dispatcher.forget_thread_signal_state(self.this_tid);
         if last {
             let result = assemble_run_result(kernel, code, traps, false);
             VcpuLoopOutcome::ProcessExit(Box::new(result))
@@ -1406,17 +1407,21 @@ where
         // dispatcher's pending set) — one per cycle, so each handler runs and
         // returns via rt_sigreturn before the next is injected (matching the
         // kernel delivering all pending signals before returning to userspace).
-        match dispatcher.take_deliverable_pending() {
+        match dispatcher.take_deliverable_pending(tid) {
             Some(s) => s,
             None => return Ok(None),
         }
     } else {
         pending
     };
+    // Fires only when this thread actually drained a signal — so a
+    // `signal-publish` for tid X with no matching `signal-deliver` from X means
+    // X never drained it (routing/tid-mismatch or blocked-thread non-delivery).
+    crate::probes::signal_deliver(tid, pending);
     // A blocked signal must not be delivered — hold it pending until the
     // guest unblocks it (rt_sigprocmask) or waits for it (rt_sigtimedwait).
-    if dispatcher.signal_blocked(pending) {
-        dispatcher.mark_signal_pending(pending);
+    if dispatcher.signal_blocked(tid, pending) {
+        dispatcher.mark_signal_pending(tid, pending);
         return Ok(Some(PendingSignalAction { term_signal: None }));
     }
     if dispatcher.signal_is_ignored(pending) {
