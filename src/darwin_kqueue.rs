@@ -106,6 +106,17 @@ impl Kevent {
         Self::new(ident, libc::EVFILT_USER, flags, 0)
     }
 
+    /// One-shot or periodic timer. `interval_ns` is the period in nanoseconds
+    /// (`NOTE_NSECONDS`); pass `EV_ADD | EV_ONESHOT` for a single fire or
+    /// `EV_ADD` for a repeating timer, and `EV_DELETE` (with `interval_ns` 0)
+    /// to disarm. The `ident` lives in the EVFILT_TIMER namespace, distinct
+    /// from EVFILT_READ fds and EVFILT_USER idents.
+    pub(crate) fn timer(ident: usize, flags: u16, interval_ns: i64) -> Self {
+        let mut ev = Self::new(ident, libc::EVFILT_TIMER, flags, libc::NOTE_NSECONDS);
+        ev.0.data = interval_ns as isize;
+        ev
+    }
+
     fn trigger_user(ident: usize) -> Self {
         Self::new(ident, libc::EVFILT_USER, 0, libc::NOTE_TRIGGER)
     }
@@ -129,6 +140,15 @@ impl Kevent {
         self.0.filter == libc::EVFILT_READ
     }
 
+    /// If this event is an EVFILT_TIMER firing, its timer ident; else `None`.
+    pub(crate) fn timer_ident(self) -> Option<usize> {
+        if self.0.filter == libc::EVFILT_TIMER {
+            Some(self.0.ident)
+        } else {
+            None
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn is_user(self, ident: usize) -> bool {
         self.0.ident == ident && self.0.filter == libc::EVFILT_USER
@@ -142,6 +162,27 @@ pub(crate) fn trigger_user(kq: RawFd, ident: usize) -> Result<(), i32> {
             kq,
             std::ptr::from_ref(&trigger).cast::<libc::kevent>(),
             1,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+        )
+    };
+    if rc < 0 {
+        Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0))
+    } else {
+        Ok(())
+    }
+}
+
+/// Apply kevent changes to a kqueue identified by raw fd (no RAII owner).
+/// Used to register/disarm timers on the signal pump's published kqueue from
+/// a different thread, mirroring `trigger_user`.
+pub(crate) fn apply_changes(kq: RawFd, changes: &[Kevent]) -> Result<(), i32> {
+    let rc = unsafe {
+        libc::kevent(
+            kq,
+            changes.as_ptr().cast::<libc::kevent>(),
+            changes.len() as libc::c_int,
             std::ptr::null_mut(),
             0,
             std::ptr::null(),
@@ -192,5 +233,21 @@ mod tests {
             .expect("wait user event");
         assert_eq!(n, 1);
         assert!(out[0].is_user(0));
+    }
+
+    #[test]
+    fn oneshot_timer_fires_and_reports_ident() {
+        let kqueue = Kqueue::new_internal().expect("kqueue should open");
+        let ident = 0xC1_0000usize;
+        // 1ms one-shot timer.
+        kqueue
+            .apply(&[Kevent::timer(ident, libc::EV_ADD | libc::EV_ONESHOT, 1_000_000)])
+            .expect("register timer");
+
+        let timeout = libc::timespec { tv_sec: 1, tv_nsec: 0 };
+        let mut out = [Kevent::empty()];
+        let n = kqueue.wait(&[], &mut out, Some(&timeout)).expect("wait timer");
+        assert_eq!(n, 1);
+        assert_eq!(out[0].timer_ident(), Some(ident));
     }
 }
