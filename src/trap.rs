@@ -1457,25 +1457,14 @@ impl HvfInner {
         // `rt_sigreturn(2)`. musl/x86-style libcs pass an explicit
         // `sa_restorer`; glibc on aarch64 passes 0 and relies on the kernel's
         // VDSO sigreturn trampoline (the aarch64 kernel ABI has no
-        // sa_restorer). Synthesise that trampoline ourselves: write
-        // `mov x8, #139; svc #0` into the frame's reserved tail (which lives
-        // ABOVE the handler's SP, so the handler can't clobber it; user pages
-        // are UXN=0, i.e. EL0-executable) and point LR there.
+        // sa_restorer). Use Carrick's fixed executable user trampoline rather
+        // than writing code into the guest signal stack: stack-resident code is
+        // vulnerable to I-cache coherency and frame-clobber timing at Go's
+        // SIGURG preemption rate.
         let restorer = if sa_restorer != 0 {
             sa_restorer
         } else {
-            // mov x8, #139 (__NR_rt_sigreturn); svc #0
-            const TRAMP: [u32; 2] = [0xd280_1168, 0xd400_0001];
-            let tramp_off =
-                core::mem::offset_of!(crate::linux_abi::CarrickSigframe, _reserved) as u64;
-            let tramp_addr = new_sp + tramp_off;
-            let mut bytes = [0u8; 8];
-            bytes[0..4].copy_from_slice(&TRAMP[0].to_le_bytes());
-            bytes[4..8].copy_from_slice(&TRAMP[1].to_le_bytes());
-            self.write_guest_bytes(tramp_addr, &bytes).map_err(|e| {
-                TrapError::Hypervisor(format!("sigreturn trampoline write failed: {e}"))
-            })?;
-            tramp_addr
+            crate::memory::LINUX_SIGRETURN_TRAMPOLINE_BASE
         };
         self.vcpu.set_reg(Reg::X30, restorer).map_err(hvf_error)?;
         crate::probes::signal_inject(signum, frame.saved_pc, new_sp, handler);

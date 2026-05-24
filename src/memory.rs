@@ -46,12 +46,21 @@ pub const LINUX_EL1_VECTORS_SIZE: u64 = 0x4000;
 // access as Device-nGnRnE and exclusive ops are prohibited.
 pub const LINUX_PAGE_TABLES_BASE: u64 = 0x30000;
 pub const LINUX_PAGE_TABLES_SIZE: u64 = 0x4000; // 16 KiB allocated, three pages used
+// User-mode rt_sigreturn trampoline. This must be outside the first 2 MiB,
+// whose stage-1 block is kernel-only for the EL0-entry/vector pages, and far
+// below the PIE/heap/mmap/stack windows so normal guest mappings never collide.
+pub const LINUX_SIGRETURN_TRAMPOLINE_BASE: u64 = 0x20_0000;
+pub const LINUX_SIGRETURN_TRAMPOLINE_SIZE: u64 = 0x4000;
 // AArch64 `eret` opcode, little-endian.
 const AARCH64_ERET_OPCODE: u32 = 0xd69f_03e0;
 // AArch64 `clrex` opcode (clears the local Exclusives monitor).
 const AARCH64_CLREX_OPCODE: u32 = 0xd5033f5f;
 // AArch64 `hvc #0` opcode, used to re-trap from EL1 to HVF.
 const AARCH64_HVC0_OPCODE: u32 = 0xd400_0002;
+// AArch64 `mov x8, #139`, the Linux aarch64 rt_sigreturn syscall number.
+const AARCH64_MOV_X8_RT_SIGRETURN_OPCODE: u32 = 0xd280_1168;
+// AArch64 `svc #0`, used by the user-mode sigreturn trampoline.
+const AARCH64_SVC0_OPCODE: u32 = 0xd400_0001;
 // AArch64 `nop` opcode, used as trampoline page padding.
 const AARCH64_NOP_OPCODE: u32 = 0xd503_201f;
 // AArch64 `tlbi vmalle1` — invalidate all stage-1 TLB entries for the
@@ -1040,6 +1049,27 @@ pub fn el0_trampoline_bytes() -> Vec<u8> {
     bytes
 }
 
+pub fn sigreturn_trampoline_bytes() -> Vec<u8> {
+    let size = LINUX_SIGRETURN_TRAMPOLINE_SIZE as usize;
+    let mut bytes = vec![0_u8; size];
+    let mut offset = 0;
+    for opcode in [
+        AARCH64_MOV_X8_RT_SIGRETURN_OPCODE,
+        AARCH64_SVC0_OPCODE,
+        AARCH64_NOP_OPCODE,
+    ] {
+        let bytes_le = opcode.to_le_bytes();
+        bytes[offset..offset + bytes_le.len()].copy_from_slice(&bytes_le);
+        offset += bytes_le.len();
+    }
+    let nop = AARCH64_NOP_OPCODE.to_le_bytes();
+    while offset + nop.len() <= size {
+        bytes[offset..offset + nop.len()].copy_from_slice(&nop);
+        offset += nop.len();
+    }
+    bytes
+}
+
 /// Build the byte image of the EL1 exception vector page. The first 2 KiB
 /// is the AArch64 vector table (16 slots of 0x80 bytes each); the rest of
 /// the page is filled with `nop`. Slot 0x400 ("Lower EL using AArch64,
@@ -1087,6 +1117,16 @@ pub fn el1_vectors_bytes() -> Vec<u8> {
 
 fn linux_runtime_regions() -> Result<Vec<MemoryRegion>, AddressSpaceError> {
     Ok(vec![
+        MemoryRegion {
+            start: LINUX_SIGRETURN_TRAMPOLINE_BASE,
+            end: LINUX_SIGRETURN_TRAMPOLINE_BASE + LINUX_SIGRETURN_TRAMPOLINE_SIZE,
+            perms: SegmentPerms {
+                read: true,
+                write: false,
+                execute: true,
+            },
+            bytes: sigreturn_trampoline_bytes(),
+        },
         zeroed_region(
             LINUX_HEAP_BASE,
             LINUX_HEAP_SIZE,
@@ -1336,6 +1376,31 @@ mod loader_tests {
         fill_random_bytes(&mut bytes).unwrap();
 
         assert_ne!(bytes, [0u8; 16]);
+    }
+
+    #[test]
+    fn linux_runtime_regions_include_fixed_user_sigreturn_trampoline() {
+        let regions = linux_runtime_regions().unwrap();
+        let trampoline = regions
+            .iter()
+            .find(|region| region.start == LINUX_SIGRETURN_TRAMPOLINE_BASE)
+            .expect("sigreturn trampoline region");
+
+        assert_eq!(
+            trampoline.end,
+            LINUX_SIGRETURN_TRAMPOLINE_BASE + LINUX_SIGRETURN_TRAMPOLINE_SIZE
+        );
+        assert!(trampoline.perms.read);
+        assert!(!trampoline.perms.write);
+        assert!(trampoline.perms.execute);
+        assert_eq!(
+            &trampoline.bytes()[0..8],
+            &[
+                0x68, 0x11, 0x80, 0xd2, // mov x8, #139
+                0x01, 0x00, 0x00, 0xd4, // svc #0
+            ]
+        );
+        assert_eq!(LINUX_SIGRETURN_TRAMPOLINE_BASE, 0x20_0000);
     }
 }
 
