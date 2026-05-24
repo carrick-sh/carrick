@@ -384,3 +384,42 @@ fn wait_family_bootstrap_returns_echild() {
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn blocking_wait4_for_specific_child_parks_on_proc_exit() {
+    let child = unsafe { libc::fork() };
+    assert!(child >= 0, "fork failed");
+    if child == 0 {
+        unsafe {
+            libc::sleep(2);
+            libc::_exit(0);
+        }
+    }
+
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    let outcome = dispatcher
+        .dispatch(
+            SyscallRequest::new(260, SyscallArgs::from([child as u64, 0, 0, 0, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+
+    unsafe {
+        libc::kill(child, libc::SIGKILL);
+        let mut status = 0;
+        libc::waitpid(child, &mut status, 0);
+    }
+
+    assert_eq!(
+        outcome,
+        DispatchOutcome::WaitOnProcExit {
+            pid: child,
+            block_signals: 0,
+        }
+    );
+}
