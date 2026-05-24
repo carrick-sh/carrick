@@ -53,6 +53,16 @@ pub const LINUX_PAGE_TABLES_SIZE: u64 = 0x4000; // 16 KiB allocated, three pages
 // arenas so normal guest mappings never collide.
 pub const LINUX_SIGRETURN_TRAMPOLINE_BASE: u64 = 0x30_0000_0000;
 pub const LINUX_SIGRETURN_TRAMPOLINE_SIZE: u64 = 0x4000;
+
+/// Is `va` inside carrick's EL1 trap trampoline (the VBAR_EL1 vector table)?
+/// Code there runs at EL1 and is NEVER guest userspace — a guest *resume* PC
+/// (signal injection target, syscall return) must never land here. This is the
+/// load-bearing carrick-vs-guest address invariant: a kick (`hv_vcpus_exit`)
+/// can stop the vCPU mid-vector, and the captured PC must not be mistaken for
+/// guest EL0 code (see `HvfTrapEngine::run_until_syscall`).
+pub fn is_carrick_el1_vector_va(va: u64) -> bool {
+    (LINUX_EL1_VECTORS_BASE..LINUX_EL1_VECTORS_BASE + LINUX_EL1_VECTORS_SIZE).contains(&va)
+}
 // AArch64 `eret` opcode, little-endian.
 const AARCH64_ERET_OPCODE: u32 = 0xd69f_03e0;
 // AArch64 `clrex` opcode (clears the local Exclusives monitor).
@@ -1403,6 +1413,22 @@ mod loader_tests {
             ]
         );
         assert_eq!(LINUX_SIGRETURN_TRAMPOLINE_BASE, 0x30_0000_0000);
+    }
+
+    #[test]
+    fn el1_vector_va_predicate_brackets_carrick_kernel_space() {
+        // The sync-from-EL0 vector entry (where a guest svc lands) is carrick.
+        assert!(is_carrick_el1_vector_va(LINUX_EL1_VECTORS_BASE));
+        assert!(is_carrick_el1_vector_va(LINUX_EL1_VECTORS_BASE + 0x404));
+        assert!(is_carrick_el1_vector_va(
+            LINUX_EL1_VECTORS_BASE + LINUX_EL1_VECTORS_SIZE - 1
+        ));
+        // The end is exclusive, and guest text / stack / heap are NOT carrick.
+        assert!(!is_carrick_el1_vector_va(
+            LINUX_EL1_VECTORS_BASE + LINUX_EL1_VECTORS_SIZE
+        ));
+        assert!(!is_carrick_el1_vector_va(0x400000)); // typical ET_EXEC text
+        assert!(!is_carrick_el1_vector_va(0x60_0000_0000)); // heap/mmap arena
     }
 }
 
