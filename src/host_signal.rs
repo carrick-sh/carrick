@@ -143,6 +143,28 @@ pub fn has_pending_for(tid: i32) -> bool {
         .contains_key(&tid)
 }
 
+/// Like [`has_pending_for`], but a signal blocked by `block_mask` (bit
+/// `signum-1`) does NOT count as deliverable-for-waking. Used by a blocking
+/// `epoll_pwait`/`ppoll`/`pselect6` whose temporary sigmask blocks a signal:
+/// the signal stays pending (delivered after the syscall, per the persistent
+/// mask) but must not break the wait. `block_mask == 0` is identical to
+/// [`has_pending_for`]. SIGKILL/SIGSTOP can't be blocked, matching the kernel.
+pub fn has_unblocked_pending_for(tid: i32, block_mask: u64) -> bool {
+    let blocked = |signum: i32| -> bool {
+        signum != crate::linux_abi::LINUX_SIGKILL
+            && signum != crate::linux_abi::LINUX_SIGSTOP
+            && (1..=64).contains(&signum)
+            && block_mask & (1u64 << (signum - 1)) != 0
+    };
+    let p = PENDING.load(Ordering::SeqCst);
+    if p != NO_PENDING_SIGNAL && !blocked(p) {
+        return true;
+    }
+    #[allow(clippy::expect_used)]
+    let guard = THREAD_PENDING.lock().expect("THREAD_PENDING poisoned");
+    guard.get(&tid).is_some_and(|&s| !blocked(s))
+}
+
 pub fn has_process_pending() -> bool {
     PENDING.load(Ordering::SeqCst) != NO_PENDING_SIGNAL
 }

@@ -114,7 +114,12 @@ impl ThreadWaiter {
     /// Block until one of `fds` (host fds, with `libc::POLL*` event masks) is
     /// ready, `timeout` elapses, or a signal becomes pending. The dispatcher lock
     /// MUST NOT be held by the caller. `fds` may be empty (a pure sleep).
-    pub fn wait(&self, fds: &[(i32, i16)], timeout: Option<Duration>) -> WaitResult {
+    ///
+    /// `block_mask` is the set of signals (bit `signum-1`) the caller's syscall
+    /// temporarily blocks (an `epoll_pwait`/`ppoll`/`pselect6` sigmask); a signal
+    /// blocked by it does not interrupt the wait (it stays pending for delivery
+    /// after the syscall, per the persistent mask). `0` = no extra blocking.
+    pub fn wait(&self, fds: &[(i32, i16)], timeout: Option<Duration>, block_mask: u64) -> WaitResult {
         let fd0 = fds.first().map_or(-1, |(fd, _)| *fd);
         let events0 = fds.first().map_or(0, |(_, events)| i32::from(*events));
         let fd1 = fds.get(1).map_or(-1, |(fd, _)| *fd);
@@ -128,8 +133,9 @@ impl ThreadWaiter {
             events0,
             fd1,
         );
-        // A signal that arrived just before we parked must not be missed.
-        if crate::host_signal::has_pending_for(self.tid) {
+        // A signal that arrived just before we parked must not be missed
+        // (unless it's blocked by this wait's sigmask).
+        if crate::host_signal::has_unblocked_pending_for(self.tid, block_mask) {
             crate::probes::io_wait_end(
                 self.tid,
                 wait_result_code(WaitResult::Interrupted),
@@ -146,7 +152,7 @@ impl ThreadWaiter {
         #[cfg(target_os = "macos")]
         {
             if let Some(kq) = self.kq.as_ref() {
-                result = self.wait_kqueue(kq, wait_fds, timeout);
+                result = self.wait_kqueue(kq, wait_fds, timeout, block_mask);
                 crate::probes::io_wait_end(
                     self.tid,
                     wait_result_code(result),
@@ -158,7 +164,7 @@ impl ThreadWaiter {
                 return result;
             }
         }
-        result = self.fallback_poll(wait_fds, timeout);
+        result = self.fallback_poll(wait_fds, timeout, block_mask);
         crate::probes::io_wait_end(
             self.tid,
             wait_result_code(result),
@@ -176,6 +182,7 @@ impl ThreadWaiter {
         kq: &Kqueue,
         fds: &[(i32, i16)],
         timeout: Option<Duration>,
+        block_mask: u64,
     ) -> WaitResult {
         let deadline = timeout.map(|d| Instant::now() + d);
         let mut changes: Vec<Kevent> = Vec::with_capacity(fds.len() * 2);
@@ -214,7 +221,7 @@ impl ThreadWaiter {
                 Ok(n) => n,
                 Err(_) => {
                     // EINTR (a signal raced in) — re-check the pending flag.
-                    if crate::host_signal::has_pending_for(self.tid) {
+                    if crate::host_signal::has_unblocked_pending_for(self.tid, block_mask) {
                         break WaitResult::Interrupted;
                     }
                     continue;
@@ -237,7 +244,7 @@ impl ThreadWaiter {
             if pipe_woke {
                 crate::host_signal::drain_pending_pipe();
             }
-            if crate::host_signal::has_pending_for(self.tid) {
+            if crate::host_signal::has_unblocked_pending_for(self.tid, block_mask) {
                 break WaitResult::Interrupted;
             }
             // Spurious wake or fallback slice elapsed — re-park (the deadline
@@ -274,7 +281,12 @@ impl ThreadWaiter {
     /// Bounded poll loop used when kqueue is unavailable (non-macOS stubs, or a
     /// `kqueue()` failure). 50ms signal-recheck slices, matching the pre-kqueue
     /// behaviour. fd-readiness still wakes promptly (poll blocks until ready).
-    fn fallback_poll(&self, fds: &[(i32, i16)], timeout: Option<Duration>) -> WaitResult {
+    fn fallback_poll(
+        &self,
+        fds: &[(i32, i16)],
+        timeout: Option<Duration>,
+        block_mask: u64,
+    ) -> WaitResult {
         const SLICE_MS: i32 = 50;
         let deadline = timeout.map(|d| Instant::now() + d);
         let mut pollfds: Vec<libc::pollfd> = fds
@@ -286,7 +298,7 @@ impl ThreadWaiter {
             })
             .collect();
         loop {
-            if crate::host_signal::has_pending_for(self.tid) {
+            if crate::host_signal::has_unblocked_pending_for(self.tid, block_mask) {
                 return WaitResult::Interrupted;
             }
             let slice_ms = match deadline {
