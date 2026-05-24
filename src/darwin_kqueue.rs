@@ -103,6 +103,19 @@ impl Kevent {
         Self::new(fd as usize, libc::EVFILT_WRITE, flags, 0)
     }
 
+    /// Watch process `pid` for exit. The kqueue becomes read-ready (and a
+    /// `kevent` returns this event) when the process terminates — the macOS
+    /// kernel's native process-lifecycle tracking that backs a guest pidfd.
+    /// One-shot: fires once on exit.
+    pub(crate) fn proc_exit(pid: i32) -> Self {
+        Self::new(
+            pid as usize,
+            libc::EVFILT_PROC,
+            (libc::EV_ADD | libc::EV_ONESHOT) as u16,
+            libc::NOTE_EXIT,
+        )
+    }
+
     /// Stash a small integer (a guest fd) in `udata` so a returned event maps
     /// straight back to its guest fd without a reverse lookup. Used by the
     /// epoll-backing kqueue (`dispatch::net`).
