@@ -1786,11 +1786,20 @@ impl HvfInner {
                     perms_raw,
                 )
             };
-            // HV_BAD_ARGUMENT is the only expected "already mapped" result
-            // when the main thread's shared VM already owns this stage-2
-            // region. Surface every other HVF failure instead of silently
-            // running a sibling with missing memory.
-            if r != 0 && r != applevisor_sys::hv_error_t::HV_BAD_ARGUMENT as i32 {
+            // The sibling shares the parent's VM (same `hv_vm` handle), so
+            // every snapshot region is ALREADY mapped — this re-map is a
+            // best-effort no-op whose only job is to populate `inner.mappings`
+            // bookkeeping. HVF reports an already-mapped guest range as either
+            // HV_BAD_ARGUMENT (0xfae94003) OR HV_ERROR (0xfae94001) — the
+            // latter for low pages like the 0x10000 EL0 trampoline, which made
+            // a multi-threaded Go runtime's 2nd+ goroutine vCPU fail to start
+            // and hang. Both are benign here (the region is present in the
+            // shared VM); surface only genuinely different failures
+            // (HV_NO_RESOURCES, HV_DENIED, …) so a sibling never silently runs
+            // with missing memory.
+            let already_mapped = r == applevisor_sys::hv_error_t::HV_BAD_ARGUMENT as i32
+                || r == applevisor_sys::hv_error_t::HV_ERROR as i32;
+            if r != 0 && !already_mapped {
                 return Err(TrapError::Hypervisor(format!(
                     "hv_vm_map(host=0x{:x}, guest=0x{start:x}, size={size}) failed for thread sibling: 0x{r:x}",
                     host_addr as u64
