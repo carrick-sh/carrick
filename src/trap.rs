@@ -739,6 +739,7 @@ impl HvfTrapEngine {
         interrupted_pc: Option<u64>,
         altstack: Option<(u64, u64)>,
         saved_sigmask: u64,
+        fault_siginfo: Option<(i32, u64)>,
     ) -> Result<(), TrapError> {
         self.inner.inject_signal(
             signum,
@@ -748,6 +749,7 @@ impl HvfTrapEngine {
             interrupted_pc,
             altstack,
             saved_sigmask,
+            fault_siginfo,
         )
     }
 
@@ -761,6 +763,7 @@ impl HvfTrapEngine {
         _interrupted_pc: Option<u64>,
         _altstack: Option<(u64, u64)>,
         _saved_sigmask: u64,
+        _fault_siginfo: Option<(i32, u64)>,
     ) -> Result<(), TrapError> {
         Err(TrapError::UnsupportedPlatform)
     }
@@ -1509,6 +1512,7 @@ impl HvfInner {
         interrupted_pc: Option<u64>,
         altstack: Option<(u64, u64)>,
         saved_sigmask: u64,
+        fault_siginfo: Option<(i32, u64)>,
     ) -> Result<(), TrapError> {
         use applevisor::prelude::*;
         use zerocopy::IntoBytes;
@@ -1553,7 +1557,19 @@ impl HvfInner {
 
         let mut siginfo = crate::linux_abi::LinuxSiginfo::empty();
         siginfo.si_signo = signum;
-        siginfo.si_code = crate::linux_abi::LINUX_SI_USER;
+        // A synchronous fault carries the kernel-style si_code (SEGV_MAPERR /
+        // SEGV_ACCERR / BUS_ADRALN) and si_addr=faulting address, so a handler
+        // (e.g. Go's runtime sigpanic) sees the real cause. Otherwise it's a
+        // SI_USER-shaped delivery (tkill/sysmon preempt).
+        match fault_siginfo {
+            Some((si_code, si_addr)) => {
+                siginfo.si_code = si_code;
+                siginfo.si_addr = si_addr;
+            }
+            None => {
+                siginfo.si_code = crate::linux_abi::LINUX_SI_USER;
+            }
+        }
         frame.siginfo = siginfo;
 
         let mut mcontext = crate::linux_abi::LinuxSignalContext::empty();

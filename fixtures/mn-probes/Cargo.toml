@@ -32,3 +32,7 @@ path = "src/bin/epoll_sigurg.rs"
 [[bin]]
 name = "fp-sigurg"
 path = "src/bin/fp_sigurg.rs"
+
+[[bin]]
+name = "segv-recover"
+path = "src/bin/segv_recover.rs"
