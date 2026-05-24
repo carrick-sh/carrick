@@ -1445,7 +1445,7 @@ where
             // this way, and LTP sigaltstack01 deliberately makes the main stack
             // unusable so the handler MUST land on the alt stack.
             let altstack = if action.sa_flags & crate::linux_abi::LINUX_SA_ONSTACK != 0 {
-                dispatcher.signal_altstack()
+                dispatcher.signal_altstack(tid)
             } else {
                 None
             };
