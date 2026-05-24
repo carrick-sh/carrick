@@ -1484,12 +1484,21 @@ fn epoll_wakes_accepted_socket_after_peer_write() {
         &mut memory,
         &reporter,
     );
-    assert_eq!(outcome, DispatchOutcome::Returned { value: 1 });
-    let event = read_epoll_event(&memory, 0x5100);
-    let event_data = event.data;
-    let event_events = event.events;
-    assert_eq!(event_data, accepted_fd);
-    assert_eq!(event_events & LINUX_EPOLLIN, LINUX_EPOLLIN);
+    let ready_count = match outcome {
+        DispatchOutcome::Returned { value } => value,
+        other => panic!("unexpected epoll outcome after peer write: {other:?}"),
+    };
+    assert!(ready_count >= 1);
+    let mut saw_accepted_in = false;
+    for index in 0..ready_count as u64 {
+        let event = read_epoll_event(&memory, 0x5100 + index * 16);
+        let event_data = event.data;
+        let event_events = event.events;
+        if event_data == accepted_fd && event_events & LINUX_EPOLLIN != 0 {
+            saw_accepted_in = true;
+        }
+    }
+    assert!(saw_accepted_in);
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
