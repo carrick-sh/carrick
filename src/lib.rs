@@ -19,6 +19,7 @@ pub mod host_proc;
 pub mod host_signal;
 pub mod host_tty;
 pub mod interactive_supervisor;
+pub(crate) mod itimer;
 pub mod io_wait;
 pub mod linux_abi;
 pub mod memory;
