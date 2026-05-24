@@ -134,7 +134,7 @@ impl SyscallDispatcher {
         let description = OpenDescription::Epoll {
             interest: HashMap::new(),
             status_flags: 0,
-            kqueue: Arc::new(kqueue),
+            kqueue: Arc::new(crate::dispatch::EpollKqueue::new(kqueue)),
         };
         Ok(self.install_fd(description, linux_fd_flags_from_open_flags(flags)))
     }
