@@ -300,14 +300,19 @@ pub fn fpsimd_save_enabled() -> bool {
 }
 
 pub fn dump_kick_stats() {
+    use std::sync::atomic::Ordering;
+    let (el1, inject, at_el1) = (
+        EL1_KICK_RESUMED.load(Ordering::Relaxed),
+        KICK_PATH_INJECT.load(Ordering::Relaxed),
+        INJECT_AT_EL1.load(Ordering::Relaxed),
+    );
+    // Surface the cumulative totals through one cheap USDT fire at exit, so a
+    // trace can read them without the per-event `kick-in-kernel` probe cost.
+    crate::probes::kick_stats(el1, inject, at_el1);
     if std::env::var_os("CARRICK_KICK_STATS").is_some() {
-        use std::sync::atomic::Ordering;
         eprintln!(
-            "[kick_stats pid={}] el1_kick_resumed={} kick_path_inject={} inject_at_el1={}",
+            "[kick_stats pid={}] el1_kick_resumed={el1} kick_path_inject={inject} inject_at_el1={at_el1}",
             unsafe { libc::getpid() },
-            EL1_KICK_RESUMED.load(Ordering::Relaxed),
-            KICK_PATH_INJECT.load(Ordering::Relaxed),
-            INJECT_AT_EL1.load(Ordering::Relaxed),
         );
     }
 }
