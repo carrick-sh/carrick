@@ -878,6 +878,42 @@ impl LinuxUcontext {
     }
 }
 
+/// `_aarch64_ctx.magic` for the FP/SIMD context record the kernel places in
+/// `sigcontext.__reserved`. The guest's signal handler and `rt_sigreturn` rely
+/// on V0–V31 + FPSR/FPCR being saved here and restored, exactly as Linux does
+/// (`arch/arm64/include/uapi/asm/sigcontext.h`). Without it, a handler that
+/// touches SIMD (e.g. aarch64 `memcpy`) silently corrupts the interrupted
+/// thread's vector state.
+pub const LINUX_FPSIMD_MAGIC: u32 = 0x4650_8001;
+
+/// AArch64 `struct fpsimd_context`: the FP/SIMD register record stored at the
+/// start of `sigcontext.__reserved`. `vregs` holds V0–V31 as 128-bit values.
+/// `#[repr(C, packed)]` matches the kernel's contiguous layout (head 8 + fpsr 4
+/// + fpcr 4 + vregs 512 = 528 bytes; `vregs` at offset 16).
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct LinuxFpsimdContext {
+    pub magic: u32,
+    pub size: u32,
+    pub fpsr: u32,
+    pub fpcr: u32,
+    pub vregs: [u128; 32],
+}
+
+impl LinuxFpsimdContext {
+    pub const fn empty() -> Self {
+        Self {
+            magic: LINUX_FPSIMD_MAGIC,
+            size: core::mem::size_of::<Self>() as u32,
+            fpsr: 0,
+            fpcr: 0,
+            vregs: [0; 32],
+        }
+    }
+}
+
 /// Magic value placed in `CarrickSigframe::magic` so `rt_sigreturn` can
 /// detect a misaligned / corrupt frame and refuse to restore garbage.
 pub const CARRICK_SIGFRAME_MAGIC: u64 = 0x4361_7272_6963_6b53; // 'CarrickS'
@@ -1772,5 +1808,22 @@ mod kernel_abi_tests {
         assert_eq!(core::mem::offset_of!(LinuxUcontext, _pad), 48);
         assert_eq!(core::mem::offset_of!(LinuxUcontext, _pad2), 168);
         assert_eq!(core::mem::offset_of!(LinuxUcontext, uc_mcontext), 176);
+    }
+
+    #[test]
+    fn fpsimd_context_matches_linux_aarch64_layout() {
+        // struct fpsimd_context: head{magic,size}=8, fpsr=4, fpcr=4, vregs[32]
+        // of __uint128_t = 512; total 528, vregs at offset 16.
+        assert_eq!(core::mem::offset_of!(LinuxFpsimdContext, fpsr), 8);
+        assert_eq!(core::mem::offset_of!(LinuxFpsimdContext, fpcr), 12);
+        assert_eq!(core::mem::offset_of!(LinuxFpsimdContext, vregs), 16);
+        assert_eq!(core::mem::size_of::<LinuxFpsimdContext>(), 528);
+        let fp = LinuxFpsimdContext::empty();
+        let (magic, size) = (fp.magic, fp.size);
+        assert_eq!(magic, LINUX_FPSIMD_MAGIC);
+        assert_eq!(size, 528);
+        // Must fit at the start of sigcontext.__reserved with room for the
+        // null terminator record the guest expects after it.
+        assert!(LINUX_AARCH64_SIGCONTEXT_RESERVED_BYTES >= 528 + 8);
     }
 }
