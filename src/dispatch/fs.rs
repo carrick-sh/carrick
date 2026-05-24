@@ -473,7 +473,8 @@ impl SyscallDispatcher {
                 .unwrap_or(DispatchOutcome::errno(LINUX_ENOENT)),
             OpenDescription::EventFd { .. }
             | OpenDescription::TimerFd { .. }
-            | OpenDescription::Epoll { .. } | OpenDescription::Pidfd { .. }
+            | OpenDescription::Epoll { .. }
+            | OpenDescription::Pidfd { .. }
             | OpenDescription::PipeReader { .. }
             | OpenDescription::PipeWriter { .. }
             | OpenDescription::HostPipe { .. }
@@ -529,7 +530,8 @@ impl SyscallDispatcher {
             | OpenDescription::SyntheticFile { .. }
             | OpenDescription::EventFd { .. }
             | OpenDescription::TimerFd { .. }
-            | OpenDescription::Epoll { .. } | OpenDescription::Pidfd { .. }
+            | OpenDescription::Epoll { .. }
+            | OpenDescription::Pidfd { .. }
             | OpenDescription::PipeReader { .. }
             | OpenDescription::PipeWriter { .. }
             | OpenDescription::HostPipe { .. }
@@ -2349,7 +2351,8 @@ impl SyscallDispatcher {
             OpenDescription::HostFile { .. } => unreachable!("HostFile lseek handled above"),
             OpenDescription::EventFd { .. }
             | OpenDescription::TimerFd { .. }
-            | OpenDescription::Epoll { .. } | OpenDescription::Pidfd { .. } => {
+            | OpenDescription::Epoll { .. }
+            | OpenDescription::Pidfd { .. } => {
                 return Ok(LINUX_EINVAL.into());
             }
         };
@@ -2372,7 +2375,8 @@ impl SyscallDispatcher {
             OpenDescription::HostFile { .. } => unreachable!("HostFile lseek handled above"),
             OpenDescription::EventFd { .. }
             | OpenDescription::TimerFd { .. }
-            | OpenDescription::Epoll { .. } | OpenDescription::Pidfd { .. }
+            | OpenDescription::Epoll { .. }
+            | OpenDescription::Pidfd { .. }
             | OpenDescription::PipeReader { .. }
             | OpenDescription::PipeWriter { .. }
             | OpenDescription::HostPipe { .. }
@@ -2466,7 +2470,9 @@ impl SyscallDispatcher {
             OpenDescription::Directory { .. } => {
                 return Ok(LINUX_EISDIR.into());
             }
-            OpenDescription::Epoll { .. } | OpenDescription::Pidfd { .. } | OpenDescription::PipeWriter { .. } => {
+            OpenDescription::Epoll { .. }
+            | OpenDescription::Pidfd { .. }
+            | OpenDescription::PipeWriter { .. } => {
                 return Ok(LINUX_EINVAL.into());
             }
             OpenDescription::HostSocket { host_fd, .. } => {
@@ -2563,7 +2569,8 @@ impl SyscallDispatcher {
             OpenDescription::Directory { .. }
             | OpenDescription::EventFd { .. }
             | OpenDescription::TimerFd { .. }
-            | OpenDescription::Epoll { .. } | OpenDescription::Pidfd { .. }
+            | OpenDescription::Epoll { .. }
+            | OpenDescription::Pidfd { .. }
             | OpenDescription::PipeReader { .. }
             | OpenDescription::PipeWriter { .. }
             | OpenDescription::HostPipe { .. }
@@ -2622,7 +2629,8 @@ impl SyscallDispatcher {
             OpenDescription::Directory { .. }
             | OpenDescription::EventFd { .. }
             | OpenDescription::TimerFd { .. }
-            | OpenDescription::Epoll { .. } | OpenDescription::Pidfd { .. }
+            | OpenDescription::Epoll { .. }
+            | OpenDescription::Pidfd { .. }
             | OpenDescription::PipeReader { .. }
             | OpenDescription::PipeWriter { .. }
             | OpenDescription::HostPipe { .. }
@@ -2703,7 +2711,8 @@ impl SyscallDispatcher {
             OpenDescription::Directory { .. }
             | OpenDescription::EventFd { .. }
             | OpenDescription::TimerFd { .. }
-            | OpenDescription::Epoll { .. } | OpenDescription::Pidfd { .. }
+            | OpenDescription::Epoll { .. }
+            | OpenDescription::Pidfd { .. }
             | OpenDescription::PipeReader { .. }
             | OpenDescription::PipeWriter { .. }
             | OpenDescription::HostPipe { .. }
@@ -2777,7 +2786,8 @@ impl SyscallDispatcher {
             | OpenDescription::HostPipe { .. }
             | OpenDescription::HostSocket { .. }
             | OpenDescription::Netlink { .. }
-            | OpenDescription::Epoll { .. } | OpenDescription::Pidfd { .. } => LINUX_ESPIPE,
+            | OpenDescription::Epoll { .. }
+            | OpenDescription::Pidfd { .. } => LINUX_ESPIPE,
         };
         Ok(errno.into())
     }
@@ -2861,7 +2871,8 @@ impl SyscallDispatcher {
             | OpenDescription::HostPipe { .. }
             | OpenDescription::HostSocket { .. }
             | OpenDescription::Netlink { .. }
-            | OpenDescription::Epoll { .. } | OpenDescription::Pidfd { .. } => LINUX_ESPIPE,
+            | OpenDescription::Epoll { .. }
+            | OpenDescription::Pidfd { .. } => LINUX_ESPIPE,
         };
         Ok(errno.into())
     }
@@ -3156,7 +3167,8 @@ impl SyscallDispatcher {
             OpenDescription::Directory { .. }
             | OpenDescription::EventFd { .. }
             | OpenDescription::TimerFd { .. }
-            | OpenDescription::Epoll { .. } | OpenDescription::Pidfd { .. }
+            | OpenDescription::Epoll { .. }
+            | OpenDescription::Pidfd { .. }
             | OpenDescription::PipeReader { .. }
             | OpenDescription::PipeWriter { .. }
             | OpenDescription::HostPipe { .. }
@@ -3192,7 +3204,8 @@ impl SyscallDispatcher {
             OpenDescription::Directory { .. }
             | OpenDescription::EventFd { .. }
             | OpenDescription::TimerFd { .. }
-            | OpenDescription::Epoll { .. } | OpenDescription::Pidfd { .. }
+            | OpenDescription::Epoll { .. }
+            | OpenDescription::Pidfd { .. }
             | OpenDescription::PipeReader { .. }
             | OpenDescription::PipeWriter { .. }
             | OpenDescription::HostPipe { .. }
@@ -5236,8 +5249,11 @@ impl SyscallDispatcher {
         // way (coreutils `ln` passed the zero-extended form → symlinkat/linkat
         // wrongly treated it as a real fd → EBADF).
         let dirfd = (dirfd as i32) as i64 as u64;
-        if path.is_empty() || Path::new(path).is_absolute() {
+        if path.is_empty() {
             return Ok(path.to_owned());
+        }
+        if Path::new(path).is_absolute() {
+            return Ok(join_rootfs_path("/", path));
         }
         if dirfd == LINUX_AT_FDCWD {
             let cwd = self.io.cwd.read().clone();
@@ -5252,7 +5268,8 @@ impl SyscallDispatcher {
                 | OpenDescription::SyntheticFile { .. }
                 | OpenDescription::EventFd { .. }
                 | OpenDescription::TimerFd { .. }
-                | OpenDescription::Epoll { .. } | OpenDescription::Pidfd { .. }
+                | OpenDescription::Epoll { .. }
+                | OpenDescription::Pidfd { .. }
                 | OpenDescription::PipeReader { .. }
                 | OpenDescription::PipeWriter { .. }
                 | OpenDescription::HostPipe { .. }
