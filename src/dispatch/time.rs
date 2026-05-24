@@ -309,8 +309,9 @@ impl SyscallDispatcher {
             let ident = crate::itimer::ident_for(idx);
             let kq = crate::host_signal::pump_kqueue();
             if value.is_zero() {
-                // Disarm: clear the repeat interval and delete the kevent.
-                crate::itimer::set_interval_ns(idx, 0);
+                // Disarm: mark disarmed (so a racing pump fire is dropped) and
+                // delete the kevent.
+                crate::itimer::disarm(idx);
                 if kq >= 0 {
                     let _ = crate::darwin_kqueue::apply_changes(
                         kq,
@@ -318,12 +319,24 @@ impl SyscallDispatcher {
                     );
                 }
             } else {
-                // Arm: record the repeat interval (ns; 0 = one-shot), then
-                // register a one-shot timer for the initial it_value. The pump
-                // re-arms a periodic timer on fire if the interval is non-zero.
+                // Arm. kqueue's EVFILT_TIMER has a single period, but Linux
+                // setitimer is two-phase (first after it_value, then every
+                // it_interval). Pick the registration that needs the least
+                // pump involvement:
+                //   * it_interval == 0      → one-shot, no repeat.
+                //   * it_value == interval  → pure periodic; the kernel repeats
+                //                             it and the pump never re-arms
+                //                             (no drift, race-free).
+                //   * else                  → one-shot for it_value; the pump
+                //                             arms the periodic timer ONCE on
+                //                             that first fire (needs_periodic).
                 let interval_ns = u64::try_from(interval.as_nanos()).unwrap_or(u64::MAX);
-                crate::itimer::set_interval_ns(idx, interval_ns);
                 let value_ns = i64::try_from(value.as_nanos()).unwrap_or(i64::MAX);
+                let interval_value_ns = i64::try_from(interval.as_nanos()).unwrap_or(i64::MAX);
+                let periodic = !interval.is_zero() && value == interval;
+                let needs_periodic = !interval.is_zero() && value != interval;
+                crate::itimer::arm(idx, interval_ns, needs_periodic);
+
                 let signum = crate::itimer::signum_for(idx);
                 let signal_name = match signum {
                     crate::linux_abi::LINUX_SIGVTALRM => "SIGVTALRM",
@@ -340,13 +353,14 @@ impl SyscallDispatcher {
                         ),
                     ));
                 if kq >= 0 {
+                    let (flags, data) = if periodic {
+                        (libc::EV_ADD, interval_value_ns)
+                    } else {
+                        (libc::EV_ADD | libc::EV_ONESHOT, value_ns)
+                    };
                     let _ = crate::darwin_kqueue::apply_changes(
                         kq,
-                        &[crate::darwin_kqueue::Kevent::timer(
-                            ident,
-                            libc::EV_ADD | libc::EV_ONESHOT,
-                            value_ns,
-                        )],
+                        &[crate::darwin_kqueue::Kevent::timer(ident, flags, data)],
                     );
                 }
             }
