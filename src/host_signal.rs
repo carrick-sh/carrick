@@ -193,6 +193,12 @@ pub fn set_pump_kqueue(kq: i32) {
     PUMP_KQUEUE.store(kq, Ordering::SeqCst);
 }
 
+/// The signal pump's kqueue fd, or `-1` if the pump has not registered yet.
+/// `setitimer` uses this to arm `EVFILT_TIMER` events on the pump's kqueue.
+pub fn pump_kqueue() -> i32 {
+    PUMP_KQUEUE.load(Ordering::SeqCst)
+}
+
 /// Clear the pump kqueue slot if it still names `kq`. Used when a stoppable
 /// signal pump exits so a later pump is not accidentally hidden.
 pub fn clear_pump_kqueue(kq: i32) {
