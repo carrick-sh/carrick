@@ -8,6 +8,15 @@ use crate::dispatch::{
 };
 use crate::memory::{AddressSpace, AddressSpaceError};
 use crate::rootfs::RootFs;
+
+/// Process-wide fork quiesce barrier. One HVF VM per process (like
+/// `host_signal`'s globals), so a singleton reachable from the run loop and
+/// `handle_fork` without threading it through every signature.
+fn fork_barrier() -> &'static crate::fork_quiesce::QuiesceBarrier {
+    static BARRIER: std::sync::OnceLock<crate::fork_quiesce::QuiesceBarrier> =
+        std::sync::OnceLock::new();
+    BARRIER.get_or_init(crate::fork_quiesce::QuiesceBarrier::new)
+}
 use crate::trap::{HvfTrapEngine, TrapError};
 use serde::Serialize;
 use thiserror::Error;
@@ -1187,6 +1196,11 @@ fn run_vcpu_until_exit(
     let mut state = ThreadRuntimeState::new(registry, futex, this_tid, threads, kicker, max_traps);
     state.register_vcpu(&engine);
     for traps in 1..=state.max_traps {
+        // Lock-safe point: no carrick lock is held here (each iteration acquires
+        // and releases its syscall's locks within the iteration). If another
+        // thread is forking a multithreaded guest, park here so the child
+        // inherits no held carrick lock.
+        fork_barrier().park_if_quiescing();
         // ---- vCPU run: NO dispatcher lock held ----
         let frame = match engine.next_syscall() {
             Ok(Some(f)) => f,
