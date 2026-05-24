@@ -23,7 +23,18 @@ fault, (5) epoll_wait03 EFAULT, (6) epoll_ctl05 ELOOP.
 
 ---
 
-## 1. ppoll / pselect6 sigmask (PLAN-READY)
+## 1. ppoll / pselect6 sigmask (ppoll DONE; pselect6 needs a refactor)
+
+> UPDATE (executed): **ppoll DONE** (commit on branch) — read arg3/arg4 sigmask
+> → `WaitOnFds.block_signals`; `ppollsig` probe MATCHES Docker. **pselect6 is
+> NOT done and needs more than the plan assumed:** it does NOT emit `WaitOnFds`
+> — it blocks DIRECTLY in `libc::poll(timeout_ms)` while holding the dispatcher
+> lock, so its `libc::poll` gets host-signal EINTR and returns EINTR. The right
+> fix routes pselect6's host-fd wait through `WaitOnFds` (so `block_signals`
+> applies AND it stops starving siblings under the lock), or wraps the poll in a
+> host `pthread_sigmask` of the host-translated mask. Its own follow-up.
+
+
 
 **Problem.** `epoll_pwait` now applies its sigmask during the wait (a blocked
 signal stays pending instead of EINTR-ing the wait — commit `0473901`), but
