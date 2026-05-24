@@ -1,5 +1,105 @@
 # Handoff — Go runtime bring-up on carrick (2026-05-24, continued)
 
+## LATEST (2026-05-24 PM): Go `os/exec` multithreaded fork+exec
+
+After the high-P deadlock fix (below), the next bring-up target was Go's
+`os/exec` (clone(`CLONE_VM|CLONE_VFORK|CLONE_PIDFD`) → execve → wait) under the
+per-thread-vCPU runtime. Commits: `feat(fork): multithreaded fork…`,
+`feat(fork): CLONE_PIDFD write + real waitid…`,
+`fix(fork): interruptible waitid + phantom-thread cleanup…`,
+`fix(fork): serialize vCPU topology + destroy vCPUs on thread death…` (`7bcad9e`).
+
+### GREEN
+- `os/exec` **TestEcho** + several others PASS end-to-end on a multithreaded
+  guest. Single-threaded fork+exec already worked; the new work made the
+  multithreaded fork path function.
+- Built on:
+  - **`waitid(2)`** implemented for real (was an `ECHILD` stub). Go's
+    `blockUntilWaitable` uses **`waitid(P_PID)`** (NOT P_PIDFD). A raw blocking
+    `libc::waitid` is NOT interruptible by the fork stop-the-world quiesce
+    (`hv_vcpus_exit` + the wake-pipe poke don't reach a thread sitting in a host
+    syscall) — that was the EAGAIN straggler. Fix: probe `WNOHANG` first, then
+    PARK on the child's exit via the per-thread kqueue —
+    `DispatchOutcome::WaitOnProcExit`(P_PID → `EVFILT_PROC`/`NOTE_EXIT`) or
+    `WaitOnPollFds`(P_PIDFD → its backing kqueue fd). Both wake on a signal OR a
+    quiesce; the runtime re-dispatches the waitid to reap.
+  - **`CLONE_PIDFD`**: `DispatchOutcome::Fork{pidfd_out}` carries the pidfd-out
+    pointer (legacy clone = arg2/parent_tid; clone3 = clone_args.pidfd); the
+    parent installs a pidfd (EVFILT_PROC on the mirror host pid) and writes the
+    fd.
+  - Concurrent forkers **block** (park at the in-flight fork's barrier + retry)
+    instead of returning EAGAIN — Go does not retry a failed clone.
+  - Topology lock (`fork_quiesce::topology_lock`) serializes VM teardown/rebuild
+    vs. sibling vCPU creation; the fork quiesce counts OTHER live vCPUs from the
+    **kicker**, not `registry.live_count` (a thread with a tid but no vCPU yet
+    must not be awaited); a thread destroys its own vCPU on EVERY death path
+    (`Drop` is a no-op).
+
+### STILL BROKEN
+- **`TestConcurrentExec`** (heavy concurrent fork+exec) intermittently
+  **HV_BUSY (0xfae94002)** at the forker's `hv_vm_destroy`. Root: a stray LIVE
+  vCPU at teardown. `HvfTrapEngine::drop` is a deliberate no-op, so any thread
+  that dies without destroying its own vCPU leaks it; a later fork's
+  `hv_vm_destroy` trips on it. Diagnosed via the new **`carrick trace`** probe
+  `fork__quiesce` (phase 2 = hv_vm_destroy rc + a `VCPU_LIVE` count; phase 3 =
+  release rc): confirmed `b=1..3` live vCPUs when busy, `0` when OK. The obvious
+  leak paths are plugged; one source still slips through under load.
+
+### Deferred / follow-up (priority order)
+1. **Close the remaining vCPU leak** → `TestConcurrentExec` green.
+2. **vfork-exec helper thread** (chosen redesign): a vCPU-less carrick thread
+   does `fork()`+`execve()` for the `CLONE_VFORK|CLONE_VM`+exec case (Go
+   os/exec, posix_spawn) — child execs immediately and never resumes guest
+   exec, so it needs NO VM teardown / quiesce / sibling rebuild. Keep
+   stop-the-world only for a true full `fork()`. (HVF binds each vCPU to its
+   creating thread — only that thread may destroy/run it — so a helper thread
+   can coordinate the VM but cannot destroy guest threads' vCPUs.)
+3. **Consolidate the 3 duplicated run-loops** (`run_vcpu_until_exit` = prod;
+   `run_syscall_loop`/`run_split_loop` = test-only) into ONE shared
+   `DispatchOutcome` handler. Every new outcome variant must currently be added
+   in 3 places; missing the threaded one routes to `unreachable!()` and KILLS a
+   vCPU thread (this happened with `WaitOnProcExit`). Do AFTER concurrency green.
+4. **os/exec gate to ~36/36** vs Docker (`scripts/go-conformance.sh os/exec`);
+   blocked on #1.
+5. **Loader (SP3):** run plain `go build` output, not just the
+   external-static-pie test recipe.
+6. **Breadth (SP4):** the rest of the conformance package set (runtime / net /
+   the broader list in `scripts/go-conformance-packages.txt`).
+7. **`waitid(P_ALL/P_PGID)` + blocking `wait4`** still use an uninterruptible
+   `libc` block — only `P_PID`/`P_PIDFD` got the kqueue-park treatment. Latent.
+8. **Residual ~1% GOMAXPROCS=10 tail** (the rare `index out of range`, below) —
+   extend `mn-probes` with a SIMD+SIGURG probe.
+9. Decide whether `VCPU_LIVE` / `fork__quiesce` stay as permanent probes or are
+   dropped once the leak is closed.
+
+### Specs / plans (superpowers) — the authoritative design + task docs
+Built with the brainstorming → writing-plans flow; read these before resuming:
+- **`docs/superpowers/specs/2026-05-24-go-full-conformance-design.md`** — the
+  overall "full conformance, run standard `go build` output" north star. Covers
+  deferred items #4–#6 (gate, loader/SP3, breadth/SP4).
+- **`docs/superpowers/specs/2026-05-24-multithreaded-fork-design.md`** — the
+  stop-the-world quiesce + hybrid design this session implemented. The
+  vfork-exec helper-thread idea (#2) is the planned EVOLUTION of this design and
+  is NOT yet written up — needs its own brainstorm → spec → plan before coding.
+- **`docs/superpowers/plans/2026-05-24-multithreaded-fork.md`** — task plan for
+  the quiesce/vCPU release-rebuild work. Tasks 1–3 done; the CLONE_PIDFD/waitid
+  pieces landed; the concurrent-fork hardening (#1) overran the plan and is
+  where TestConcurrentExec still fails.
+- **`docs/superpowers/plans/2026-05-24-pidfd-kqueue.md`** — pidfd via host
+  kqueue/EVFILT_PROC (DONE; pidfd_open + CLONE_PIDFD + waitid(P_PIDFD)).
+- **`docs/superpowers/plans/2026-05-24-go-conformance-gate.md`** — the
+  differential `scripts/go-conformance.sh` harness (DONE; it's how we measure
+  #4).
+- **`docs/superpowers/go-conformance-baseline.md`** — recorded baseline; update
+  it as packages go green.
+- Earlier follow-ups: `docs/superpowers/specs/2026-05-23-go-bringup-followups-design.md`.
+
+When picking up #2 (vfork-exec helper) or #3 (loop consolidation), start a new
+spec/plan under `docs/superpowers/` rather than extending the multithreaded-fork
+plan — they are distinct subsystems.
+
+---
+
 ## Headline: the high-P deadlock is root-caused and fixed
 
 The open blocker from the previous handoff — `CARRICK_EXPOSED_CPUS=10` Go c50
