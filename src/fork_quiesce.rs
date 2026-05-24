@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 #[derive(Debug)]
 pub(crate) struct QuiesceBarrier {
     quiescing: AtomicBool,
+    forking: AtomicBool,
     paused: Mutex<usize>,
     cv: Condvar,
 }
@@ -18,9 +19,26 @@ impl QuiesceBarrier {
     pub(crate) fn new() -> Self {
         Self {
             quiescing: AtomicBool::new(false),
+            forking: AtomicBool::new(false),
             paused: Mutex::new(0),
             cv: Condvar::new(),
         }
+    }
+
+    /// Serialize forks: at most one quiesce/fork at a time. Returns false if
+    /// another fork is in progress (caller returns EAGAIN; the guest retries,
+    /// and meanwhile this thread parks at the barrier the other fork raised).
+    /// CAS-based (not a held guard) so the flag survives `libc::fork` cleanly —
+    /// the child clears it via `end_fork`.
+    pub(crate) fn try_begin_fork(&self) -> bool {
+        self.forking
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    /// Release the fork serialization (every handle_fork exit path).
+    pub(crate) fn end_fork(&self) {
+        self.forking.store(false, Ordering::SeqCst);
     }
 
     /// Step 1 (forking thread): raise the quiesce flag. The caller then wakes

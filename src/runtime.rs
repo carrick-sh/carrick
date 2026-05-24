@@ -1061,15 +1061,46 @@ impl ThreadRuntimeState {
         kernel: &Kernel,
         engine: &mut HvfTrapEngine,
     ) -> Result<Option<i64>, RuntimeError> {
-        if self.registry.live_count() > 1 {
-            engine.complete_syscall(-(crate::linux_abi::LINUX_ENOSYS as i64))?;
+        // Serialize forks: at most one quiesce/fork in flight. A concurrent
+        // forker gets EAGAIN and, back in its run loop, parks at the barrier
+        // THIS fork raised (so it's counted as quiesced, not a straggler).
+        if !fork_barrier().try_begin_fork() {
+            engine.complete_syscall(-(crate::linux_abi::LINUX_EAGAIN as i64))?;
             return Ok(None);
+        }
+        // Stop-the-world: a multithreaded guest can fork only if every OTHER
+        // guest vCPU thread is first paused at its lock-safe run-loop top, so
+        // the child (which has only THIS thread after libc::fork) doesn't
+        // inherit a carrick lock held by a thread that won't exist in it.
+        let others = self.registry.live_count().saturating_sub(1);
+        let mut quiesced = false;
+        if others > 0 {
+            let barrier = fork_barrier();
+            barrier.set_quiescing();
+            // Wake every other thread so it reaches the barrier: kick in-guest
+            // vCPUs, and nudge blocked futex / io_wait waiters (same wakes as a
+            // process-directed signal). The flag is set FIRST so a woken thread
+            // observes `is_quiescing()` at the run-loop top and parks.
+            self.kicker.kick_all_except(self.this_tid);
+            self.futex.notify_signal_pending();
+            crate::host_signal::wake_all_waiters();
+            if !barrier.wait_quiesced(others, std::time::Duration::from_secs(5)) {
+                barrier.end_quiesce();
+                barrier.end_fork();
+                engine.complete_syscall(-(crate::linux_abi::LINUX_EAGAIN as i64))?;
+                return Ok(None);
+            }
+            quiesced = true;
         }
 
         let prepared_fork = kernel.fork.prepare_host_fork();
         let fork_outcome = match engine.fork() {
             Ok(outcome) => outcome,
             Err(error) => {
+                if quiesced {
+                    fork_barrier().end_quiesce();
+                }
+                fork_barrier().end_fork();
                 kernel
                     .fork
                     .restart_after_fork_error(prepared_fork, &self.kicker, &self.futex);
@@ -1079,6 +1110,11 @@ impl ThreadRuntimeState {
 
         let retval = match fork_outcome {
             crate::trap::ForkOutcome::Parent { child_pid } => {
+                // Resume the paused sibling threads (they re-check and continue).
+                if quiesced {
+                    fork_barrier().end_quiesce();
+                }
+                fork_barrier().end_fork();
                 kernel
                     .fork
                     .restart_after_parent_fork(prepared_fork, &self.kicker, &self.futex);
@@ -1093,6 +1129,19 @@ impl ThreadRuntimeState {
                 self.this_tid = std::process::id() as ThreadId;
                 self.registry = Arc::new(ThreadRegistry::new(self.this_tid));
                 crate::thread::set_current_registry(Arc::clone(&self.registry));
+                // The other guest threads do not exist in the child (libc::fork
+                // replicates only the calling thread). Drop their stale
+                // bookkeeping: a fresh futex table (no phantom waiters), a fresh
+                // kicker (only this vCPU is registered below), and an empty
+                // thread-handle vec. The (copied) quiesce flag is cleared so the
+                // child's run loop doesn't park.
+                self.futex = Arc::new(crate::thread::FutexTable::new());
+                self.kicker = Arc::new(crate::vcpu_kick::VcpuKicker::new());
+                self.threads = Arc::new(parking_lot::Mutex::new(Vec::new()));
+                // Clear the quiesce + fork flags the child inherited (copied)
+                // from the parent so the child's single-threaded run loop runs.
+                fork_barrier().end_quiesce();
+                fork_barrier().end_fork();
                 crate::host_signal::reinit_after_fork();
                 self.waiter = crate::io_wait::ThreadWaiter::new(self.this_tid);
                 self.kicker
