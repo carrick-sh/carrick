@@ -1,6 +1,7 @@
 use std::os::fd::RawFd;
 
 /// RAII owner for a Darwin kqueue fd.
+#[derive(Debug)]
 pub(crate) struct Kqueue {
     fd: RawFd,
 }
@@ -100,6 +101,35 @@ impl Kevent {
 
     pub(crate) fn write(fd: RawFd, flags: u16) -> Self {
         Self::new(fd as usize, libc::EVFILT_WRITE, flags, 0)
+    }
+
+    /// Stash a small integer (a guest fd) in `udata` so a returned event maps
+    /// straight back to its guest fd without a reverse lookup. Used by the
+    /// epoll-backing kqueue (`dispatch::net`).
+    pub(crate) fn with_udata(mut self, udata: i32) -> Self {
+        self.0.udata = udata as isize as *mut libc::c_void;
+        self
+    }
+
+    /// The kqueue filter (`EVFILT_READ`/`EVFILT_WRITE`/`EVFILT_USER`/…).
+    pub(crate) fn filter(self) -> i16 {
+        self.0.filter
+    }
+
+    /// The event flags (`EV_EOF`, `EV_ERROR`, …) on a returned event.
+    pub(crate) fn flags(self) -> u16 {
+        self.0.flags
+    }
+
+    /// The filter-specific flags (`fflags`) — for `EV_EOF` this carries the
+    /// socket/pipe error code, which maps to `EPOLLERR`.
+    pub(crate) fn fflags(self) -> u32 {
+        self.0.fflags
+    }
+
+    /// The integer previously stashed via [`with_udata`] (the guest fd).
+    pub(crate) fn udata_i32(self) -> i32 {
+        self.0.udata as isize as i32
     }
 
     pub(crate) fn user(ident: usize, flags: u16) -> Self {

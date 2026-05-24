@@ -439,11 +439,21 @@ fn run_cli(cli: Cli) -> anyhow::Result<()> {
             }
             let mut argv = vec![path.to_string_lossy().into_owned()];
             argv.extend(args);
+            // Forward a small allowlist of runtime-tuning/diagnostic env vars from
+            // the host when explicitly set (unset = absent, so this is a no-op in
+            // normal use). Lets an operator pass e.g. GODEBUG=schedtrace=1000 to a
+            // guest Go binary for differential debugging without rebuilding it.
+            let mut elf_env: Vec<String> = Vec::new();
+            for key in ["GODEBUG", "GOMAXPROCS", "GOTRACEBACK", "GOGC", "GODEBUGFLAGS"] {
+                if let Ok(val) = std::env::var(key) {
+                    elf_env.push(format!("{key}={val}"));
+                }
+            }
             let result = run_static_elf_with_hvf_args_and_dispatcher_debug(
                 &path,
                 dispatcher,
                 argv,
-                std::iter::empty(),
+                elf_env.into_iter(),
                 max_traps,
                 debug_state_path.as_ref(),
             )
@@ -540,7 +550,7 @@ fn run_cli(cli: Cli) -> anyhow::Result<()> {
             // Without PATH glibc-based tools like dpkg-query bail with
             // "PATH is not set" and apt's pre-fork helpers can't locate
             // their siblings.
-            let env: Vec<String> = vec![
+            let mut env: Vec<String> = vec![
                 "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_owned(),
                 "HOME=/root".to_owned(),
                 "TERM=xterm-256color".to_owned(),
@@ -549,6 +559,16 @@ fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 "DEBIAN_FRONTEND=noninteractive".to_owned(),
                 "PAGER=cat".to_owned(),
             ];
+            // Forward a small allowlist of runtime-tuning/diagnostic env vars from
+            // the host when explicitly set. These are no-ops in normal use (unset)
+            // but let an operator pass e.g. GODEBUG=schedtrace=1000 to a guest Go
+            // binary, or GOMAXPROCS, without baking it into the image — invaluable
+            // for differential debugging against Docker.
+            for key in ["GODEBUG", "GOMAXPROCS", "GOTRACEBACK", "GOGC", "GODEBUGFLAGS"] {
+                if let Ok(val) = std::env::var(key) {
+                    env.push(format!("{key}={val}"));
+                }
+            }
 
             let result = match fs_kind {
                 FsBackendKind::Host => {
