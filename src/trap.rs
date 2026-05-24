@@ -243,12 +243,61 @@ const SIMD_FP_TABLE: [applevisor::vcpu::SimdFpReg; 32] = {
     ]
 };
 
+/// Which privilege level a vCPU was executing at when carrick observed it. The
+/// Linux guest runs its own code at EL0; everything at EL1 is carrick's trap
+/// trampoline (the VBAR_EL1 vector table + the HVC that exits to the host),
+/// never guest code. Keeping the two straight is a load-bearing invariant: a PC
+/// (or register snapshot) captured at EL1 belongs to *carrick*, and must NEVER
+/// be treated as a guest resume PC — injecting a signal frame at an EL1 PC
+/// overwrites an in-flight syscall. This is the systematic carrick-vs-guest
+/// distinction; classify with `ExecLevel::from_pstate(CPSR)` at every point
+/// that captures a live vCPU PC for guest use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecLevel {
+    /// EL0 — genuine guest userspace. Its PC is a valid guest resume target.
+    Guest,
+    /// EL1+ — inside carrick's trap trampoline. Its PC is a carrick address.
+    Kernel,
+}
+
+impl ExecLevel {
+    /// Classify from PSTATE/SPSR. M[3:2] is the exception level (00 = EL0).
+    pub fn from_pstate(pstate: u64) -> Self {
+        if (pstate >> 2) & 0b11 == 0 {
+            ExecLevel::Guest
+        } else {
+            ExecLevel::Kernel
+        }
+    }
+
+    pub fn is_guest(self) -> bool {
+        matches!(self, ExecLevel::Guest)
+    }
+}
+
 /// Full-speed diagnostic counters (the dtrace consumer perturbs the
 /// SIGURG-vs-futex race away, so observe with cheap atomics instead). Dumped at
 /// process teardown when `CARRICK_KICK_STATS` is set.
 pub static EL1_KICK_RESUMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static INJECT_AT_EL1: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static KICK_PATH_INJECT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether to save/restore guest FP/SIMD across signal handlers (default on;
+/// `CARRICK_NO_FPSIMD` disables it for differential measurement). Cached after
+/// the first read so the signal hot path doesn't hit the environment.
+pub fn fpsimd_save_enabled() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static FLAG: AtomicU8 = AtomicU8::new(0);
+    match FLAG.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("CARRICK_NO_FPSIMD").is_none();
+            FLAG.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
 
 pub fn dump_kick_stats() {
     if std::env::var_os("CARRICK_KICK_STATS").is_some() {
@@ -997,10 +1046,12 @@ impl HvfInner {
                 // completes its HVC and the real syscall is serviced; the
                 // pending signal is then delivered at that clean EL0 boundary.
                 let cpsr = self.vcpu.get_reg(Reg::CPSR).map_err(hvf_error)?;
-                let el = (cpsr >> 2) & 0b11;
-                if el != 0 {
+                if !ExecLevel::from_pstate(cpsr).is_guest() {
                     EL1_KICK_RESUMED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    crate::probes::kick_in_kernel(self.vcpu.get_reg(Reg::PC).unwrap_or(0), el as u32);
+                    crate::probes::kick_in_kernel(
+                        self.vcpu.get_reg(Reg::PC).unwrap_or(0),
+                        ((cpsr >> 2) & 0b11) as u32,
+                    );
                     continue;
                 }
                 return Ok(None);
@@ -1476,10 +1527,17 @@ impl HvfInner {
         frame.saved_pc = match interrupted_pc {
             Some(pc) => {
                 KICK_PATH_INJECT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                // Tripwire: a kick-path injection should never capture a PC in
-                // carrick's EL1 vector page — run_until_syscall resumes those.
-                if (0x20000..0x24000).contains(&pc) {
+                // Invariant: a kick-path resume PC is genuine guest EL0 code,
+                // never carrick's EL1 trampoline — `run_until_syscall` resumes
+                // EL1-window kicks rather than reporting them. If this fires,
+                // that guard regressed and we're about to corrupt an in-flight
+                // syscall. Tripwire (release) + assert (debug).
+                if crate::memory::is_carrick_el1_vector_va(pc) {
                     INJECT_AT_EL1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    debug_assert!(
+                        false,
+                        "signal injection at EL1 trampoline PC 0x{pc:x} (carrick space, not guest)"
+                    );
                 }
                 pc
             }
@@ -1626,6 +1684,9 @@ impl HvfInner {
         use applevisor::prelude::*;
         use zerocopy::IntoBytes;
 
+        if !fpsimd_save_enabled() {
+            return Ok(());
+        }
         let mut fp = crate::linux_abi::LinuxFpsimdContext::empty();
         let mut vregs = [0u128; 32];
         for (i, reg) in SIMD_FP_TABLE.iter().enumerate() {
@@ -1649,6 +1710,9 @@ impl HvfInner {
         use applevisor::prelude::*;
         use zerocopy::FromBytes;
 
+        if !fpsimd_save_enabled() {
+            return Ok(());
+        }
         let reserved = mcontext.__reserved;
         let size = core::mem::size_of::<crate::linux_abi::LinuxFpsimdContext>();
         let Ok(fp) = crate::linux_abi::LinuxFpsimdContext::read_from_bytes(&reserved[..size]) else {
@@ -2516,6 +2580,18 @@ fn signal_frame_stack_pointer(
 #[cfg(test)]
 mod memory_protection_tests {
     use super::*;
+
+    #[test]
+    fn exec_level_classifies_el0_as_guest_el1_as_kernel() {
+        // PSTATE M[3:0]: EL0t=0b0000, EL1t=0b0100, EL1h=0b0101.
+        assert_eq!(ExecLevel::from_pstate(0b0000), ExecLevel::Guest);
+        assert!(ExecLevel::from_pstate(0b0000).is_guest());
+        // EL0t with DAIF/nzcv bits set high is still EL0 (only M[3:2] matter).
+        assert_eq!(ExecLevel::from_pstate(0x6000_0000), ExecLevel::Guest);
+        assert_eq!(ExecLevel::from_pstate(0b0100), ExecLevel::Kernel); // EL1t
+        assert_eq!(ExecLevel::from_pstate(0b0101), ExecLevel::Kernel); // EL1h
+        assert!(!ExecLevel::from_pstate(0b0101).is_guest());
+    }
 
     #[test]
     fn cloned_protection_metadata_shares_updates_across_thread_engines() {
