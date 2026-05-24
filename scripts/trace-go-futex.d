@@ -8,7 +8,8 @@
 
 #pragma D option quiet
 #pragma D option strsize=256
-#pragma D option bufsize=16m
+#pragma D option bufsize=64m
+#pragma D option aggsize=64m
 
 dtrace:::BEGIN
 {
@@ -83,10 +84,6 @@ carrick*:::io-wait-end
 tick-1s
 {
 	secs++;
-	printf("\n==== tick %d ====\n", secs);
-	printa("futex cmd=%-3d %@d\n", @futex_entry);
-	printa("epoll nr=%-3d ret=%-4d errno=%-3d %@d\n", @epoll_ret);
-	printa("wait result=%-2d count=%-2d fd0=%-4d fd1=%-4d fd2=%-4d %@d\n", @wait_end);
 }
 
 tick-1s
