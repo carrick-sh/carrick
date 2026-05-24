@@ -217,27 +217,53 @@ impl FutexBucket {
 const FUTEX_WAKE_TOKEN: usize = 1;
 const FUTEX_SIGNAL_TOKEN: usize = 2;
 
+/// Number of independently-locked shards of the futex address map. `bucket()`
+/// runs on EVERY futex syscall (wait and wake); a single global lock here
+/// serialized all guest threads' futex ops, which throttled high-concurrency
+/// runtimes (Go with GOMAXPROCS = ncpu spins up that many M's, each parking and
+/// waking on its own futex word). Sharding by address spreads that contention.
+/// 64 shards keeps per-shard contention low for any realistic thread count.
+const FUTEX_SHARDS: usize = 64;
+
 /// Address-keyed futex wait queues. Each guest futex word is identified by a
 /// stable Carrick-owned bucket key derived from an `Arc<FutexBucket>`, not by
-/// feeding raw guest addresses to `parking_lot_core`.
+/// feeding raw guest addresses to `parking_lot_core`. The address→bucket map is
+/// sharded so the lookup lock is not a global serialization point.
 pub struct FutexTable {
-    buckets: ParkingMutex<HashMap<u64, Arc<FutexBucket>>>,
+    shards: Box<[ParkingMutex<HashMap<u64, Arc<FutexBucket>>>; FUTEX_SHARDS]>,
 }
 
 impl FutexTable {
     pub fn new() -> Self {
         Self {
-            buckets: ParkingMutex::new(HashMap::new()),
+            shards: Box::new(std::array::from_fn(|_| ParkingMutex::new(HashMap::new()))),
         }
     }
 
+    /// Pick the shard for `addr`. A multiplicative (Fibonacci) hash spreads
+    /// aligned futex addresses (which share low bits) across shards.
+    fn shard(&self, addr: u64) -> &ParkingMutex<HashMap<u64, Arc<FutexBucket>>> {
+        let h = addr.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58;
+        &self.shards[h as usize % FUTEX_SHARDS]
+    }
+
     fn bucket(&self, addr: u64) -> Arc<FutexBucket> {
-        let mut buckets = self.buckets.lock();
+        let mut shard = self.shard(addr).lock();
         Arc::clone(
-            buckets
+            shard
                 .entry(addr)
                 .or_insert_with(|| Arc::new(FutexBucket::new())),
         )
+    }
+
+    /// Snapshot every live bucket across all shards (for process-/thread-directed
+    /// signal wakeups, which must reach waiters regardless of address).
+    fn all_buckets(&self) -> Vec<Arc<FutexBucket>> {
+        let mut all = Vec::new();
+        for shard in self.shards.iter() {
+            all.extend(shard.lock().values().cloned());
+        }
+        all
     }
 
     fn bucket_key(bucket: &Arc<FutexBucket>) -> usize {
@@ -366,7 +392,7 @@ impl FutexTable {
     /// deliver that signal, so every parked thread must re-evaluate its
     /// `interrupted()` predicate now rather than waiting for a timeout deadline.
     pub fn notify_signal_pending(&self) {
-        let buckets = self.buckets.lock().values().cloned().collect::<Vec<_>>();
+        let buckets = self.all_buckets();
         for bucket in buckets {
             let key = Self::bucket_key(&bucket);
             unsafe {
@@ -386,7 +412,7 @@ impl FutexTable {
         let Ok(token) = usize::try_from(tid) else {
             return;
         };
-        let buckets = self.buckets.lock().values().cloned().collect::<Vec<_>>();
+        let buckets = self.all_buckets();
         for bucket in buckets {
             let key = Self::bucket_key(&bucket);
             unsafe {
