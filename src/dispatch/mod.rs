@@ -766,6 +766,59 @@ pub struct SyscallDispatcher {
     fs: fs::FsState,
 }
 
+/// Live epoll-instance kqueue fds, so an in-memory readiness change
+/// (eventfd/pipe/timerfd) can wake every `epoll_wait` blocked on one. Go's
+/// `netpollBreak` writes an eventfd to wake the poller; that fd isn't host-backed,
+/// so without this the blocked io_wait on the instance kqueue never sees it → a
+/// lost wakeup → the c>=32 netpoller stall (all Ps idle until the 5s deadline).
+static EPOLL_INMEM_KQUEUES: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+
+pub(crate) fn register_epoll_kqueue(fd: i32) {
+    EPOLL_INMEM_KQUEUES.lock().push(fd);
+}
+
+pub(crate) fn unregister_epoll_kqueue(fd: i32) {
+    EPOLL_INMEM_KQUEUES.lock().retain(|&f| f != fd);
+}
+
+/// Wake every epoll instance (via its `EVFILT_USER(0)`) so a thread blocked in
+/// `epoll_wait` re-checks in-memory fd readiness. Call when an eventfd/pipe/
+/// timerfd becomes readable. A coarse broadcast — a spurious wake just makes the
+/// poller recompute and find nothing, which is harmless.
+pub(crate) fn notify_inmem_epoll() {
+    for &fd in EPOLL_INMEM_KQUEUES.lock().iter() {
+        let _ = crate::darwin_kqueue::trigger_user(fd, 0);
+    }
+}
+
+/// Owns an epoll instance's kqueue and keeps it in the in-memory-wake registry
+/// for its lifetime (deregistered on drop). Derefs to the inner `Kqueue` so the
+/// epoll handlers use it transparently.
+#[derive(Debug)]
+pub(crate) struct EpollKqueue {
+    kq: crate::darwin_kqueue::Kqueue,
+}
+
+impl EpollKqueue {
+    pub(crate) fn new(kq: crate::darwin_kqueue::Kqueue) -> Self {
+        register_epoll_kqueue(kq.raw_fd());
+        Self { kq }
+    }
+}
+
+impl Drop for EpollKqueue {
+    fn drop(&mut self) {
+        unregister_epoll_kqueue(self.kq.raw_fd());
+    }
+}
+
+impl std::ops::Deref for EpollKqueue {
+    type Target = crate::darwin_kqueue::Kqueue;
+    fn deref(&self) -> &Self::Target {
+        &self.kq
+    }
+}
+
 #[derive(Debug, Clone)]
 struct EpollInterest {
     event: LinuxEpollEvent,
@@ -862,7 +915,7 @@ enum OpenDescription {
         /// recomputed each `epoll_wait` and a blocked wait is woken by the
         /// process-wide in-memory broadcast (`notify_inmem_epoll`) firing this
         /// kqueue's `EVFILT_USER(0)`. See `docs/epoll-kqueue-plan.md`.
-        kqueue: Arc<crate::darwin_kqueue::Kqueue>,
+        kqueue: Arc<EpollKqueue>,
     },
     // In-memory pipe ends. Currently `pipe2(2)` routes through `HostPipe`
     // (real macOS kernel pipe) so these are not constructed today, but the
@@ -2949,6 +3002,11 @@ fn write_eventfd(bytes: &[u8], state: &EventFdState) -> DispatchOutcome {
     *counter = next;
     if was_zero && next > 0 {
         state.readable.notify_all();
+        // Also wake any epoll instance watching this eventfd: it's an in-memory
+        // fd (not host-backed), so a blocked epoll_wait on the instance kqueue
+        // won't see the readiness without this. Go's netpollBreak relies on it.
+        drop(counter);
+        notify_inmem_epoll();
     }
     DispatchOutcome::Returned {
         value: core::mem::size_of::<LinuxEventfdValue>() as i64,
