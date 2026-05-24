@@ -944,6 +944,11 @@ impl HvfInner {
                 let x29 = self.vcpu.get_reg(Reg::X29).unwrap_or(0);
                 let x30 = self.vcpu.get_reg(Reg::LR).unwrap_or(0);
                 let sp = self.vcpu.get_sys_reg(SysReg::SP_EL0).unwrap_or(0);
+                // Fire the fault probe so `carrick trace` can catch the exact
+                // fault (and `--stack`-walk the guest) — fires only here, never
+                // on the happy path, so it doesn't perturb the timing-sensitive
+                // c>=20 race it's meant to diagnose.
+                crate::probes::vcpu_fault(underlying, elr, far, x30, sp, unsafe { libc::getpid() });
                 return Err(TrapError::EL0Fault {
                     syndrome: underlying,
                     elr,
