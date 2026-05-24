@@ -270,6 +270,7 @@ impl SyscallTrap for ScriptedTrap {
         _interrupted_pc: Option<u64>,
         _altstack: Option<(u64, u64)>,
         _saved_sigmask: u64,
+        _fault_siginfo: Option<(i32, u64)>,
     ) -> Result<(), TrapError> {
         Err(TrapError::Hypervisor(
             "scripted trap does not implement inject_signal".to_owned(),
