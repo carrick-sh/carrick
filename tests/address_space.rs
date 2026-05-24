@@ -139,6 +139,34 @@ fn load_elf_from_rootfs_maps_pt_interp_at_base_and_sets_at_base() {
 }
 
 #[test]
+fn load_elf_from_host_maps_pt_interp_at_base_and_sets_at_base() {
+    let interpreter_path = format!("/tmp/carrickld-{}", std::process::id());
+    std::fs::write(&interpreter_path, interpreter_aarch64_elf()).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let app_path = dir.path().join("app");
+    std::fs::write(&app_path, dynamic_aarch64_elf(&interpreter_path)).unwrap();
+
+    let image = AddressSpace::load_elf(&app_path)
+        .unwrap()
+        .with_linux_initial_stack(
+            [app_path.to_string_lossy().into_owned()],
+            std::iter::empty::<String>(),
+        )
+        .unwrap();
+    let sp = image.initial_stack_pointer().unwrap();
+    let auxv = read_auxv(&image, sp + 32);
+
+    assert_eq!(image.entry(), LINUX_INTERPRETER_BASE + 0x120);
+    assert!(image.read_bytes(0x400120, 4).is_ok());
+    assert!(image.read_bytes(LINUX_INTERPRETER_BASE + 0x120, 4).is_ok());
+    assert!(auxv.contains(&(LINUX_AT_ENTRY, 0x400120)));
+    assert!(auxv.contains(&(LINUX_AT_BASE, LINUX_INTERPRETER_BASE)));
+
+    std::fs::remove_file(interpreter_path).unwrap();
+}
+
+#[test]
 fn dispatcher_can_write_from_loaded_guest_memory() {
     let mut image = AddressSpace::from_segments(
         0x1000,

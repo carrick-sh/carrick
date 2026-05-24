@@ -216,7 +216,7 @@ impl AddressSpace {
         let path = path.as_ref();
         let plan = plan_elf_load(path)?;
         let file = fs::read(path)?;
-        Self::load_elf_segments(&file, plan)
+        Self::load_elf_segments_with_interpreter(&file, plan, &|p| fs::read(p).ok())
     }
 
     pub fn load_elf_bytes(bytes: &[u8]) -> Result<Self, AddressSpaceError> {

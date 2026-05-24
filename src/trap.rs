@@ -7,8 +7,72 @@ use thiserror::Error;
 pub const HVF_PAGE_SIZE: u64 = 0x4000;
 pub const AARCH64_SVC_EXCEPTION_CLASS: u64 = 0x15;
 pub const AARCH64_HVC_EXCEPTION_CLASS: u64 = 0x16;
+const AARCH64_SYS64_EXCEPTION_CLASS: u64 = 0x18;
 const AARCH64_EXCEPTION_CLASS_SHIFT: u64 = 26;
 const AARCH64_EXCEPTION_CLASS_MASK: u64 = 0x3f;
+const AARCH64_ESR_ISS_MASK: u64 = (1 << 25) - 1;
+const AARCH64_SYS64_ISS_DIR_READ: u64 = 0x1;
+const AARCH64_SYS64_ISS_RT_SHIFT: u64 = 5;
+const AARCH64_SYS64_ISS_RT_MASK: u64 = 0x1f << AARCH64_SYS64_ISS_RT_SHIFT;
+const AARCH64_SYS64_ISS_CRM_SHIFT: u64 = 1;
+const AARCH64_SYS64_ISS_CRM_MASK: u64 = 0xf << AARCH64_SYS64_ISS_CRM_SHIFT;
+const AARCH64_SYS64_ISS_CRN_SHIFT: u64 = 10;
+const AARCH64_SYS64_ISS_CRN_MASK: u64 = 0xf << AARCH64_SYS64_ISS_CRN_SHIFT;
+const AARCH64_SYS64_ISS_OP1_SHIFT: u64 = 14;
+const AARCH64_SYS64_ISS_OP1_MASK: u64 = 0x7 << AARCH64_SYS64_ISS_OP1_SHIFT;
+const AARCH64_SYS64_ISS_OP2_SHIFT: u64 = 17;
+const AARCH64_SYS64_ISS_OP2_MASK: u64 = 0x7 << AARCH64_SYS64_ISS_OP2_SHIFT;
+const AARCH64_SYS64_ISS_OP0_SHIFT: u64 = 20;
+const AARCH64_SYS64_ISS_OP0_MASK: u64 = 0x3 << AARCH64_SYS64_ISS_OP0_SHIFT;
+const AARCH64_SYS64_ISS_SYS_OP_MASK: u64 = AARCH64_SYS64_ISS_OP0_MASK
+    | AARCH64_SYS64_ISS_OP1_MASK
+    | AARCH64_SYS64_ISS_OP2_MASK
+    | AARCH64_SYS64_ISS_CRN_MASK
+    | AARCH64_SYS64_ISS_CRM_MASK
+    | AARCH64_SYS64_ISS_DIR_READ;
+const AARCH64_GUEST_COUNTER_HZ: u64 = 1_000_000_000;
+
+const fn aarch64_sys64_iss_sys_val(op0: u64, op1: u64, op2: u64, crn: u64, crm: u64) -> u64 {
+    (op0 << AARCH64_SYS64_ISS_OP0_SHIFT)
+        | (op1 << AARCH64_SYS64_ISS_OP1_SHIFT)
+        | (op2 << AARCH64_SYS64_ISS_OP2_SHIFT)
+        | (crn << AARCH64_SYS64_ISS_CRN_SHIFT)
+        | (crm << AARCH64_SYS64_ISS_CRM_SHIFT)
+}
+
+const AARCH64_SYS64_ISS_SYS_CNTFRQ: u64 =
+    aarch64_sys64_iss_sys_val(3, 3, 0, 14, 0) | AARCH64_SYS64_ISS_DIR_READ;
+const AARCH64_SYS64_ISS_SYS_CNTVCT: u64 =
+    aarch64_sys64_iss_sys_val(3, 3, 2, 14, 0) | AARCH64_SYS64_ISS_DIR_READ;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum El0SysRegRead {
+    CntfrqEl0,
+    CntvctEl0,
+}
+
+fn decode_el0_sys64_read(esr: u64) -> Option<(u8, El0SysRegRead)> {
+    if aarch64_exception_class(esr) != AARCH64_SYS64_EXCEPTION_CLASS {
+        return None;
+    }
+    let iss = esr & AARCH64_ESR_ISS_MASK;
+    let rt = ((iss & AARCH64_SYS64_ISS_RT_MASK) >> AARCH64_SYS64_ISS_RT_SHIFT) as u8;
+    let reg = match iss & AARCH64_SYS64_ISS_SYS_OP_MASK {
+        AARCH64_SYS64_ISS_SYS_CNTFRQ => El0SysRegRead::CntfrqEl0,
+        AARCH64_SYS64_ISS_SYS_CNTVCT => El0SysRegRead::CntvctEl0,
+        _ => return None,
+    };
+    Some((rt, reg))
+}
+
+fn guest_counter_ticks() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_nanos()
+        .min(u64::MAX as u128) as u64
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -1182,6 +1246,9 @@ impl HvfInner {
         if is_aarch64_hvc_exception(exception.syndrome) {
             let underlying = self.vcpu.get_sys_reg(SysReg::ESR_EL1).map_err(hvf_error)?;
             if !is_aarch64_svc_exception(underlying) {
+                if self.emulate_el0_sys64_read(underlying)? {
+                    return self.run_until_syscall();
+                }
                 let elr = self.vcpu.get_sys_reg(SysReg::ELR_EL1).unwrap_or(0);
                 let far = self.vcpu.get_sys_reg(SysReg::FAR_EL1).unwrap_or(0);
                 let x16 = self.vcpu.get_reg(Reg::X16).unwrap_or(0);
@@ -1295,6 +1362,26 @@ impl HvfInner {
             );
         }
         Ok(())
+    }
+
+    fn emulate_el0_sys64_read(&mut self, esr: u64) -> Result<bool, TrapError> {
+        use applevisor::prelude::*;
+
+        let Some((rt, reg)) = decode_el0_sys64_read(esr) else {
+            return Ok(false);
+        };
+        let value = match reg {
+            El0SysRegRead::CntfrqEl0 => AARCH64_GUEST_COUNTER_HZ,
+            El0SysRegRead::CntvctEl0 => guest_counter_ticks(),
+        };
+        if let Some(target) = GPR_TABLE.get(rt as usize) {
+            self.vcpu.set_reg(*target, value).map_err(hvf_error)?;
+        }
+        let elr = self.vcpu.get_sys_reg(SysReg::ELR_EL1).map_err(hvf_error)?;
+        self.vcpu
+            .set_sys_reg(SysReg::ELR_EL1, elr.wrapping_add(4))
+            .map_err(hvf_error)?;
+        Ok(true)
     }
 
     /// True if `[address, address+length)` overlaps any PROT_NONE range. Used
@@ -2160,9 +2247,8 @@ impl HvfInner {
     /// rebuild path but KEEPS the shared VM (the spec's `vm` clone) instead
     /// of creating a new one, and marks every re-mapped region UNOWNED
     /// (`memory: None`) so this engine never unmaps the buffers the main
-    /// engine owns. `is_forked_child` is set so the runtime/Drop use the
-    /// no-teardown path (the vCPU and the VM-clone Arc leak until process
-    /// exit, exactly like the forked-child pattern; no double-free).
+    /// engine owns. Thread siblings are not forked child processes: the
+    /// runtime must keep normal process-wide signal/exit semantics for them.
     fn from_thread_spec(spec: ThreadSpec) -> Result<Self, TrapError> {
         let ThreadSpec {
             vm,
@@ -2187,11 +2273,7 @@ impl HvfInner {
             vcpu,
             mappings: Vec::with_capacity(mappings.len()),
             last_exit_class: snapshot.last_exit_class,
-            // Reuse the forked-child shutdown discipline: this engine's
-            // vCPU was created on this thread and must not be torn down by
-            // the panicky applevisor Drops; the VM clone just decrements
-            // the Arc on process exit.
-            is_forked_child: true,
+            is_forked_child: false,
             protections,
         };
 
@@ -2892,6 +2974,26 @@ mod thread_sibling_tests {
         let parent = parent_snapshot();
         let child = seed_child_snapshot(&parent, 0x7_0000, /*tls=*/ 0);
         assert_eq!(child.tpidr_el0, parent.tpidr_el0);
+    }
+
+    #[test]
+    fn decodes_el0_counter_register_traps() {
+        let cntfrq = (AARCH64_SYS64_EXCEPTION_CLASS << AARCH64_EXCEPTION_CLASS_SHIFT)
+            | AARCH64_SYS64_ISS_SYS_CNTFRQ
+            | (1 << AARCH64_SYS64_ISS_RT_SHIFT);
+        let cntvct = (AARCH64_SYS64_EXCEPTION_CLASS << AARCH64_EXCEPTION_CLASS_SHIFT)
+            | AARCH64_SYS64_ISS_SYS_CNTVCT
+            | (2 << AARCH64_SYS64_ISS_RT_SHIFT);
+
+        assert_eq!(
+            decode_el0_sys64_read(cntfrq),
+            Some((1, El0SysRegRead::CntfrqEl0))
+        );
+        assert_eq!(
+            decode_el0_sys64_read(cntvct),
+            Some((2, El0SysRegRead::CntvctEl0))
+        );
+        assert_eq!(decode_el0_sys64_read(0), None);
     }
 
     #[test]
