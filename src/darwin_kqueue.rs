@@ -116,6 +116,13 @@ impl Kevent {
         )
     }
 
+    /// Delete a previously-added `EVFILT_PROC`/`NOTE_EXIT` watch for `pid`.
+    /// `proc_exit` is `EV_ONESHOT` (auto-removed once it fires), so this is only
+    /// needed to drop a watch whose wait was interrupted before the exit fired.
+    pub(crate) fn proc_exit_delete(pid: i32) -> Self {
+        Self::new(pid as usize, libc::EVFILT_PROC, libc::EV_DELETE as u16, 0)
+    }
+
     /// Stash a small integer (a guest fd) in `udata` so a returned event maps
     /// straight back to its guest fd without a reverse lookup. Used by the
     /// epoll-backing kqueue (`dispatch::net`).

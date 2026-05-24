@@ -574,6 +574,19 @@ where
                         };
                     }
                 },
+                DispatchOutcome::WaitOnProcExit { pid, block_signals } => {
+                    match waiter.wait_proc_exit(pid, block_signals) {
+                        // Ready (child exited) → re-dispatch the waitid to reap.
+                        crate::io_wait::WaitResult::Ready => continue,
+                        // Interrupted (signal/quiesce) → EINTR; the guest re-issues.
+                        crate::io_wait::WaitResult::Interrupted
+                        | crate::io_wait::WaitResult::TimedOut => {
+                            break DispatchOutcome::Errno {
+                                errno: crate::linux_abi::LINUX_EINTR,
+                            };
+                        }
+                    }
+                }
                 other => break other,
             }
         };
@@ -581,7 +594,9 @@ where
         let mut last_syscall_retval: Option<i64> = None;
 
         match outcome {
-            DispatchOutcome::WaitOnFds { .. } | DispatchOutcome::WaitOnPollFds { .. } => {
+            DispatchOutcome::WaitOnFds { .. }
+            | DispatchOutcome::WaitOnPollFds { .. }
+            | DispatchOutcome::WaitOnProcExit { .. } => {
                 unreachable!("serviced by the wait loop above")
             }
             DispatchOutcome::Exit { code } => {
@@ -860,6 +875,19 @@ impl ThreadRuntimeState {
                         });
                     }
                 },
+                DispatchOutcome::WaitOnProcExit { pid, block_signals } => {
+                    match self.waiter.wait_proc_exit(pid, block_signals) {
+                        // Ready (child exited) → re-dispatch the waitid to reap.
+                        crate::io_wait::WaitResult::Ready => continue,
+                        // Interrupted (signal/quiesce) → EINTR; the guest re-issues.
+                        crate::io_wait::WaitResult::Interrupted
+                        | crate::io_wait::WaitResult::TimedOut => {
+                            break Ok(DispatchOutcome::Errno {
+                                errno: crate::linux_abi::LINUX_EINTR,
+                            });
+                        }
+                    }
+                }
                 other => break Ok(other),
             }
         }
@@ -942,6 +970,15 @@ impl ThreadRuntimeState {
         let child_futex = Arc::clone(&self.futex);
         let child_threads = Arc::clone(&self.threads);
         let child_kicker = Arc::clone(&self.kicker);
+        // Cleanup handles kept past the move into run_vcpu_until_exit: if the
+        // sibling loop returns Err, its normal thread-exit cleanup never ran, so
+        // we MUST still drop it from the registry + kicker here. Otherwise it
+        // lingers as a phantom live thread — inflating the fork quiesce's
+        // `others` count (every fork then times out → EAGAIN) and leaving a
+        // stale vCPU id in the kicker.
+        let cleanup_registry = Arc::clone(&self.registry);
+        let cleanup_kicker = Arc::clone(&self.kicker);
+        let cleanup_kernel = Arc::clone(kernel);
         let max_traps = self.max_traps;
         let trace = self.trace;
         let handle = std::thread::Builder::new()
@@ -968,6 +1005,13 @@ impl ThreadRuntimeState {
                         );
                         if let Err(e) = r {
                             tracing::error!(tid, error = %e, "thread sibling vCPU loop failed");
+                            // The errored loop skipped its own thread-exit
+                            // cleanup; deregister it here so it doesn't haunt
+                            // the registry/kicker as a phantom thread.
+                            cleanup_registry.exit(tid);
+                            cleanup_kicker.unregister(tid);
+                            crate::host_signal::forget_thread(tid);
+                            cleanup_kernel.dispatcher.forget_thread_signal_state(tid);
                         }
                     }
                     Err(e) => {
@@ -1067,12 +1111,18 @@ impl ThreadRuntimeState {
         engine: &mut HvfTrapEngine,
         pidfd_out: Option<u64>,
     ) -> Result<Option<i64>, RuntimeError> {
-        // Serialize forks: at most one quiesce/fork in flight. A concurrent
-        // forker gets EAGAIN and, back in its run loop, parks at the barrier
-        // THIS fork raised (so it's counted as quiesced, not a straggler).
-        if !fork_barrier().try_begin_fork() {
-            engine.complete_syscall(-(crate::linux_abi::LINUX_EAGAIN as i64))?;
-            return Ok(None);
+        // Serialize forks: at most one quiesce/fork in flight. When another
+        // fork already holds the token, BLOCK rather than surfacing EAGAIN —
+        // a multithreaded guest (Go's os/exec spawning concurrently) does not
+        // retry a failed clone. Park at the in-flight fork's barrier so it can
+        // count this thread as quiesced and complete, then retry the token.
+        // This makes concurrent forks serialize transparently. The in-flight
+        // forker is waiting on exactly this thread (live_count includes it), so
+        // parking here can't deadlock it; once it ends the quiesce we wake and
+        // win (or lose to a third forker and park again).
+        while !fork_barrier().try_begin_fork() {
+            fork_barrier().park_if_quiescing();
+            std::thread::yield_now();
         }
         // Clear any VM published by a previous fork so siblings that release
         // their vCPUs this round see only THIS fork's republished VM (or, on a
@@ -1095,6 +1145,14 @@ impl ThreadRuntimeState {
             self.futex.notify_signal_pending();
             crate::host_signal::wake_all_waiters();
             if !barrier.wait_quiesced(others, std::time::Duration::from_secs(5)) {
+                if std::env::var_os("CARRICK_FORK_DEBUG").is_some() {
+                    eprintln!(
+                        "[fork] quiesce TIMEOUT: others={others} paused={} live_count={} tid={}",
+                        barrier.paused_count(),
+                        self.registry.live_count(),
+                        self.this_tid,
+                    );
+                }
                 barrier.end_quiesce();
                 barrier.end_fork();
                 engine.complete_syscall(-(crate::linux_abi::LINUX_EAGAIN as i64))?;
@@ -1332,7 +1390,9 @@ fn run_vcpu_until_exit(
         let mut last_syscall_retval: Option<i64> = None;
 
         match outcome {
-            DispatchOutcome::WaitOnFds { .. } | DispatchOutcome::WaitOnPollFds { .. } => {
+            DispatchOutcome::WaitOnFds { .. }
+            | DispatchOutcome::WaitOnPollFds { .. }
+            | DispatchOutcome::WaitOnProcExit { .. } => {
                 unreachable!("serviced by the wait loop above")
             }
             DispatchOutcome::Exit { code } => {
@@ -2006,6 +2066,19 @@ where
                         };
                     }
                 },
+                DispatchOutcome::WaitOnProcExit { pid, block_signals } => {
+                    match waiter.wait_proc_exit(pid, block_signals) {
+                        // Ready (child exited) → re-dispatch the waitid to reap.
+                        crate::io_wait::WaitResult::Ready => continue,
+                        // Interrupted (signal/quiesce) → EINTR; the guest re-issues.
+                        crate::io_wait::WaitResult::Interrupted
+                        | crate::io_wait::WaitResult::TimedOut => {
+                            break DispatchOutcome::Errno {
+                                errno: crate::linux_abi::LINUX_EINTR,
+                            };
+                        }
+                    }
+                }
                 other => break other,
             }
         };
@@ -2013,7 +2086,9 @@ where
         let mut last_syscall_retval: Option<i64> = None;
 
         match outcome {
-            DispatchOutcome::WaitOnFds { .. } | DispatchOutcome::WaitOnPollFds { .. } => {
+            DispatchOutcome::WaitOnFds { .. }
+            | DispatchOutcome::WaitOnPollFds { .. }
+            | DispatchOutcome::WaitOnProcExit { .. } => {
                 unreachable!("serviced by the wait loop above")
             }
             DispatchOutcome::Exit { code } => {

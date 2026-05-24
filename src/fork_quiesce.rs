@@ -93,6 +93,11 @@ impl QuiesceBarrier {
         self.quiescing.load(Ordering::SeqCst)
     }
 
+    /// Number of threads currently parked at the barrier (diagnostic).
+    pub(crate) fn paused_count(&self) -> usize {
+        *self.paused.lock().unwrap()
+    }
+
     /// Called by every OTHER thread at the lock-safe run-loop top. If a quiesce
     /// is in progress, register as paused and block until it ends.
     pub(crate) fn park_if_quiescing(&self) {
