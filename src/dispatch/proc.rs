@@ -37,10 +37,11 @@ pub(super) struct ProcState {
     /// signal pump's kqueue (see crate::itimer). VIRTUAL/PROF are approximated
     /// with a wall-clock timer (carrick has no per-process CPU-time accounting).
     pub itimers: [Option<ItimerState>; 3],
-    /// CPU affinity mask, one bit per logical CPU (word 0 holds CPUs 0..64).
-    /// Seeded to "all online CPUs" (`hw.logicalcpu` low bits set) so
-    /// `sched_getaffinity` reports the real core count — the Go runtime sizes
-    /// `GOMAXPROCS` from its population count, and `nproc`/OpenMP read it too.
+    /// CPU affinity mask, one bit per Linux-visible logical CPU (word 0 holds
+    /// CPUs 0..64). Seeded to "all online CPUs" from `host_facts` so
+    /// `sched_getaffinity` reports Carrick's effective vCPU capacity — the Go
+    /// runtime sizes `GOMAXPROCS` from its population count, and `nproc`/OpenMP
+    /// read it too.
     /// `sched_setaffinity` updates it (intersected with the online set) so a
     /// set→get round-trips; Apple Silicon scheduling is advisory, so we honour
     /// the observable mask without physically pinning the host thread. Affinity

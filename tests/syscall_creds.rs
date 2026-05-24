@@ -437,11 +437,15 @@ fn scheduler_bootstrap_yields_and_writes_current_affinity() {
             value: LINUX_BOOTSTRAP_AFFINITY_BYTES as i64
         }
     );
+    let mut expected_affinity = vec![0u8; LINUX_BOOTSTRAP_AFFINITY_BYTES];
+    for cpu in 0..carrick::host_facts::logical_cpu_count().min(expected_affinity.len() * 8) {
+        expected_affinity[cpu / 8] |= 1 << (cpu % 8);
+    }
     assert_eq!(
         memory
             .read_bytes(0x4000, LINUX_BOOTSTRAP_AFFINITY_BYTES)
             .unwrap(),
-        [1, 0, 0, 0, 0, 0, 0, 0]
+        expected_affinity
     );
     assert_eq!(
         dispatcher
