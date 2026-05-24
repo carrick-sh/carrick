@@ -19,34 +19,40 @@
 //! the child) — so each process reports only its own guest threads, matching
 //! Linux's per-process CPU accounting.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
-/// vCPU key (its host mach thread port) → accumulated guest execution
-/// nanoseconds. One entry per vCPU; grows monotonically.
-static EXEC_NS: Mutex<Option<HashMap<u64, u64>>> = Mutex::new(None);
+/// Per-vCPU accumulated guest execution nanoseconds, one atomic slot per vCPU
+/// thread. `add` is called on EVERY vCPU run (every guest syscall), so it must
+/// be lock-free — a global lock here serialized all vCPU threads on every
+/// syscall and throttled multi-threaded guests (e.g. Go's netpoller +
+/// goroutine M's). Each thread claims a slot once and `fetch_add`s into it;
+/// readers sum the array. 512 slots covers any realistic thread count.
+const MAX_VCPUS: usize = 512;
+#[allow(clippy::declare_interior_mutable_const)]
+static EXEC_SLOTS: [AtomicU64; MAX_VCPUS] = [const { AtomicU64::new(0) }; MAX_VCPUS];
+static NEXT_SLOT: AtomicUsize = AtomicUsize::new(0);
 
-/// Add `delta_ns` of guest execution to a vCPU's running total. Called from the
-/// trap engine after each vCPU run with the time spent inside `hv_vcpu_run`;
-/// cheap (one lock + map update).
-pub fn add(vcpu_key: u64, delta_ns: u64) {
+thread_local! {
+    /// This vCPU thread's slot index, claimed once. Capped at the last slot if
+    /// somehow exceeded (degrades to shared accounting rather than UB).
+    static MY_SLOT: usize = NEXT_SLOT.fetch_add(1, Ordering::Relaxed).min(MAX_VCPUS - 1);
+}
+
+/// Add `delta_ns` of guest execution to this vCPU's running total. Called from
+/// the trap engine after each `hv_vcpu_run`; lock-free (a thread-local read +
+/// one relaxed `fetch_add`).
+pub fn add(delta_ns: u64) {
     if delta_ns == 0 {
         return;
     }
-    let mut guard = EXEC_NS.lock().unwrap_or_else(|e| e.into_inner());
-    let entry = guard.get_or_insert_with(HashMap::new).entry(vcpu_key).or_insert(0);
-    *entry = entry.saturating_add(delta_ns);
+    MY_SLOT.with(|&slot| {
+        EXEC_SLOTS[slot].fetch_add(delta_ns, Ordering::Relaxed);
+    });
 }
 
-/// Process-wide guest CPU time (nanoseconds): the sum of every vCPU's latest
-/// cumulative execution time.
+/// Process-wide guest CPU time (nanoseconds): the sum across all vCPU slots.
 pub fn total_ns() -> u64 {
-    let guard = EXEC_NS.lock().unwrap_or_else(|e| e.into_inner());
-    guard
-        .as_ref()
-        .map(|m| m.values().copied().sum())
-        .unwrap_or(0)
+    EXEC_SLOTS.iter().map(|s| s.load(Ordering::Relaxed)).sum()
 }
 
 /// Process-wide guest CPU time in microseconds (the unit accounting surfaces
@@ -59,9 +65,8 @@ pub fn total_us() -> u64 {
 /// exec clock at zero and it has not waited any children of its own. (The
 /// shared child-exit table is process-shared and intentionally NOT cleared.)
 pub fn reset() {
-    let mut guard = EXEC_NS.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(m) = guard.as_mut() {
-        m.clear();
+    for slot in &EXEC_SLOTS {
+        slot.store(0, Ordering::Relaxed);
     }
     CHILD_USER_US.store(0, Ordering::Relaxed);
     CHILD_SYS_US.store(0, Ordering::Relaxed);
@@ -185,13 +190,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn add_then_sum_across_vcpus() {
+    fn add_then_sum_accumulates() {
         reset();
-        add(11, 1_000_000); // vCPU 1: +1 ms
-        add(22, 2_000_000); // vCPU 2: +2 ms
-        add(11, 500_000); // vCPU 1 accumulates → 1.5 ms
-        assert_eq!(total_ns(), 1_500_000 + 2_000_000);
-        assert_eq!(total_us(), 3500);
+        add(1_000_000); // +1 ms
+        add(2_000_000); // +2 ms (same test thread → same slot, accumulates)
+        assert_eq!(total_ns(), 3_000_000);
+        assert_eq!(total_us(), 3000);
         reset();
         assert_eq!(total_ns(), 0);
     }
