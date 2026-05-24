@@ -70,6 +70,10 @@ pub enum BackendError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RealStat {
     pub kind: RootFsEntryKind,
+    /// Real inode number for disk-backed entries. Host-backed path and fd
+    /// stats use this so identity checks such as Go's PWD-vs-dot comparison
+    /// see a followed symlink as the same directory as its target.
+    pub ino: u64,
     /// Hard-link count (`st_nlink`).
     pub nlink: u32,
     /// Permission bits only (low 0o7777); the type bits are derived
@@ -1490,7 +1494,9 @@ impl FsBackend for HostFsBackend {
         let meta = if follow {
             let mut hops = 0u32;
             loop {
-                let rel = Self::rel_path(&normalized)?;
+                let Some(rel) = Self::rel_path(&normalized) else {
+                    break self.dir.dir_metadata().ok()?;
+                };
                 let m = self.dir.symlink_metadata(rel).ok()?;
                 if !m.is_symlink() {
                     break m;
@@ -1511,8 +1517,10 @@ impl FsBackend for HostFsBackend {
                 };
             }
         } else {
-            let rel = Self::rel_path(&normalized)?;
-            self.dir.symlink_metadata(rel).ok()?
+            match Self::rel_path(&normalized) {
+                Some(rel) => self.dir.symlink_metadata(rel).ok()?,
+                None => self.dir.dir_metadata().ok()?,
+            }
         };
         let kind = if meta.is_dir() {
             RootFsEntryKind::Directory
@@ -1546,6 +1554,7 @@ impl FsBackend for HostFsBackend {
         };
         Some(RealStat {
             kind,
+            ino: meta.ino(),
             nlink: meta.nlink() as u32,
             mode: override_mode.unwrap_or(if mode == 0 { default_mode } else { mode }),
             uid: owner.0.unwrap_or(0),
