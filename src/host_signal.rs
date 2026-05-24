@@ -533,6 +533,13 @@ fn notify_waiters_fallback() {
     }
 }
 
+/// Wake every blocking-I/O waiter via the process-wide self-pipe (the channel
+/// all `io_wait` kqueues watch). Used by the fork quiesce to nudge threads
+/// blocked in `io_wait` back to their run-loop top so they reach the barrier.
+pub fn wake_all_waiters() {
+    notify_waiters_fallback();
+}
+
 fn wake_thread_waiter(tid: i32) -> bool {
     let write_fd = {
         #[allow(clippy::expect_used)]
