@@ -1,202 +1,119 @@
-# Handoff — Go runtime bring-up on carrick (2026-05-24)
+# Handoff — Go runtime bring-up on carrick (2026-05-24, continued)
 
-## Current state
+## Headline: the high-P deadlock is root-caused and fixed
 
-Default Go bring-up is now reliable for the validated oracle on this macOS host:
-the signed Carrick binary runs the multithreaded Go HTTP fixture
-(`fixtures/go-aarch64-hello`: server goroutine + client + graceful shutdown;
-clone/futex/epoll-netpoller/loopback TCP/SIGURG preemption) at
-`-benchmark -c 50 -n 300` for 20/20 clean runs.
+The open blocker from the previous handoff — `CARRICK_EXPOSED_CPUS=10` Go c50
+deadlocking/timing out (6/10 clean) — is **fixed**. Root cause and fix below.
 
-Do **not** generalize that to every possible guest CPU exposure. Forcing
-`CARRICK_EXPOSED_CPUS=10` still reproduces the high-P progress stall, so full
-host-logical CPU stress remains an open issue. The durable default on this Apple
-Silicon machine is to expose the Darwin performance cluster count:
+- Go c50 `CARRICK_EXPOSED_CPUS=10` (`-benchmark -c 50 -n 300`):
+  **6/10 → ~199/201 (~99%)**, with **zero deadlocks/timeouts** (was 2 deadline
+  panics + 2 timeouts per 10).
+- Default Go c50 (Darwin perf-cluster CPU count): still clean (6/6 re-checked).
+- New differential probe `fixtures/mn-probes/futex-sigurg` (Mutex/Condvar ring +
+  Go-style SIGURG storm): was a **deterministic** deadlock under carrick at any
+  CPU count, now **12/12** (and passes on the Docker arm64 oracle, as it always
+  did — that's what made it a clean differential).
 
-- `hw.logicalcpu: 10`
-- `hw.ncpu: 10`
-- `hw.physicalcpu: 10`
-- `hw.perflevel0.name: Performance`
-- `hw.perflevel0.logicalcpu: 4`
-- `hw.perflevel1.name: Efficiency`
-- `hw.perflevel1.logicalcpu: 6`
+## Root cause: a cross-thread kick can capture an EL1 (carrick) PC
 
-Validated current results:
+Go async-preempts a running M by sending `SIGURG` via `tgkill`. carrick delivers
+a signal to an in-guest vCPU by kicking it out of `hv_vcpu_run` with
+`hv_vcpus_exit` (a `CANCELED` exit), then injecting a signal frame at the
+interrupted PC.
 
-- Native macOS Go baseline is clean: `go version go1.26.2 darwin/arm64`;
-  rebuilding `fixtures/go-aarch64-hello/src/main.go` natively and running
-  `-benchmark -c 50 -n 300` passed 10/10.
-- Carrick default Go c50 on the current tree is clean: 10/10.
-- `CARRICK_EXPOSED_CPUS=10` on the current tree is still not clean:
-  6/10 clean, 2 client deadline panics, 2 timeout/kills.
-- `CARRICK_EXPOSED_CPUS=10 GODEBUG=asyncpreemptoff=1` on the current tree is
-  clean: 10/10.
-- `CARRICK_EXPOSED_CPUS=10 GOGC=off` still failed earlier: 11/20 clean, 9
-  deadline panics, 0 timeouts. GC is visible in schedtrace failures, but
-  disabling GC is not a fix.
-- A minimal `carrick trace` script (`scripts/trace-go-missed-event.d`) catches
-  the failing path without broad syscall tracing overhead. In a failing run it
-  showed one epoll kqueue wait timing out while a different tid absorbed 412
-  `SIGURG` publish/deliver cycles; the hottest interrupted PCs were inside Go's
-  runtime syscall wrappers (`runtime.futex.abi0`, `runtime.osyield.abi0`,
-  `runtime.nanotime1.abi0`).
+A guest `svc` traps to carrick's **EL1 vector page** (`VBAR_EL1 =
+LINUX_EL1_VECTORS_BASE = 0x20000`; the sync-from-EL0 entry is at `+0x400`, i.e.
+`0x20404`). There is a small window between that vector entry and the `HVC` that
+exits to the host. **If the kick lands in that window**, the `CANCELED` exit
+happens while the vCPU is at **EL1**, and the run loop read `current_pc()`
+(`0x20404`, an EL1 trampoline address) and injected a signal frame there **as if
+it were a guest EL0 PC** — overwriting the in-flight syscall/exception and
+wedging the thread.
 
-## What changed in this continuation
+Under a SIGURG storm (high `GOMAXPROCS`) this is frequent: **~23k EL1-window
+kicks per Go c50 run**. That is the `CARRICK_EXPOSED_CPUS=10`
+deadlock/deadline-panic class. `GODEBUG=asyncpreemptoff=1` "fixed" it only by
+removing all SIGURG (hence all kicks).
 
-- `64e742b fix(epoll): poll backing kqueue waits`
-  - `epoll_pwait` no-ready handoff is now `WaitOnPollFds` on the epoll
-    instance kqueue fd. The runtime services it with `poll(2)`, not the
-    per-thread kqueue.
-  - Reason: polling a kqueue fd observes readability without draining events;
-    calling `kevent()` in the runtime would consume events before the
-    re-dispatched `epoll_pwait` can copy them to the guest.
-- `db27f5c fix(signal): use fixed sigreturn trampoline`
-  - Added a read/execute user trampoline for `rt_sigreturn` containing
-    `mov x8, #139; svc #0`.
-  - `inject_signal` now uses that trampoline when the guest did not provide a
-    real `sa_restorer`, instead of writing executable code into the signal frame
-    on the guest stack.
-- Follow-up sigreturn relocation
-  - The first fixed trampoline address, `0x200000`, overlapped small static
-    ET_EXEC fixtures. The trampoline is now at `0x30_0000_0000`, above the PIE
-    default base and below Carrick's heap/mmap arenas.
-  - `/proc/self/maps` labels it `[carrick-sigreturn]`.
-- `cd7b1b0 fix(hvf): avoid remapping shared VM regions for threads`
-  - Thread siblings now copy local mapping metadata only. The sibling vCPU is
-    created in the same Hypervisor.framework VM, so stage-2 mappings are
-    already VM-global and should not be reissued per vCPU.
-- Thread-directed signal wake hardening
-  - Thread-directed guest signals now wake a per-thread pipe watched only by the
-    target waiter. The process-wide async-safe self-pipe remains for
-    process-directed signals.
-  - This closes the first-principles lost-wake hole where a non-target waiter
-    could drain the shared pipe before the target waiter observed it. It did not
-    eliminate the forced-10-CPU Go stall.
-- Signal-mask fidelity
-  - Thread-directed sibling signals that target a thread with that signal
-    currently blocked now queue directly in Carrick's per-thread pending set
-    instead of immediately kicking the target.
-  - Carrick now saves the target thread's previous guest signal mask in the
-    sigframe `ucontext`, installs the handler-time blocked mask before
-    injection, and restores that saved mask on `rt_sigreturn`.
-- Darwin CPU surface hardening
-  - `host_facts::logical_cpu_count()` now selects `hw.perflevel0.logicalcpu` on
-    macOS when present, capped by total logical CPUs. `CARRICK_EXPOSED_CPUS`
-    overrides the default for differential runs.
-  - `/proc/cpuinfo`, `/sys/devices/system/cpu/*`, and `sched_getaffinity` tests
-    now derive expectations from the same Linux-visible CPU count.
-- Trace scripts
-  - `70b1a76` added `scripts/trace-go-futex.d` and `scripts/trace-go-signal.d`.
-  - `d09005e` added `scripts/trace-go-net.d`.
-  - `4c783cc` made the futex trace bounded and raised DTrace buffers.
-  - `scripts/trace-go-missed-event.d` is the current lightweight trace for the
-    residual race: only Carrick USDT epoll/signal/io-wait probes, no broad
-    syscall-entry/return coverage.
+### The fix (commit `fix(hvf): resume cross-thread kicks…`)
 
-## Verification run this continuation
+`HvfTrapEngine::run_until_syscall` now checks `PSTATE.M` on a `CANCELED` exit via
+`ExecLevel::from_pstate(cpsr)`. If the vCPU is at EL1 (in the trampoline), it
+**resumes** the vCPU instead of reporting a delivery point, so the trampoline
+completes its HVC and the real syscall is serviced; the pending signal is
+delivered at the next clean EL0 boundary. Full-speed counter (Go c50):
+`el1_kick_resumed≈23000`, `inject_at_el1=0`.
 
-- `sudo -n -l` verified NOPASSWD coverage for Carrick/project helper paths and
-  selected tracing tools. `sudo -n /usr/sbin/dtrace -V` and
-  `sudo -n target/release/carrick --version` both worked.
-- `cargo test --release memory::loader_tests::linux_runtime_regions_include_fixed_user_sigreturn_trampoline --lib -- --exact --nocapture`
-  passed.
-- `cargo test --release host_facts --lib -- --nocapture` passed: 4 tests.
-- `cargo test --release host_signal --lib -- --nocapture` passed: 6 tests.
-- `cargo test --release io_wait --lib -- --nocapture` passed: 1 test.
-- `cargo test --release --test syscall_creds scheduler_bootstrap_yields_and_writes_current_affinity -- --exact --nocapture`
-  passed.
-- `cargo test --release --test syscall_fs synthetic_sys_surface_serves_common_cpu_and_mm_files -- --exact --nocapture`
-  passed.
-- `cargo test --release --test io_wait -- --nocapture` passed: 2 tests.
-- `cargo test --release --test syscall_net -- --test-threads=1 --nocapture`
-  passed: 25 tests.
-- `cargo test --release --test syscall_thread -- --nocapture` passed: 15 tests.
-- `cargo test --release --test syscall_signal -- --nocapture` passed: 4 tests.
-- `./scripts/build-signed.sh` passed after the latest cargo test rebuilds.
-- Static scheduler fixture:
-  `target/release/carrick run-elf --raw --fs host fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/carrick-linux-aarch64-scheduler`
-  printed `scheduler`.
-- CLI scheduler fixture:
-  `cargo test --release --test cli run_elf_command_drives_scheduler_static_fixture -- --exact --nocapture`
-  passed before the final test rebuild; re-sign before using `target/release/carrick`
-  for HVF runs.
-- Native macOS Go c50: 10/10 clean.
-- Carrick default Go c50 on the current tree: 10/10 clean.
-- Carrick `CARRICK_EXPOSED_CPUS=10` Go c50 on the current tree: 6/10 clean,
-  2 deadline panics, 2 timeout/kills.
-- Carrick `CARRICK_EXPOSED_CPUS=10 GODEBUG=asyncpreemptoff=1` Go c50 on the
-  current tree: 10/10 clean.
-- Carrick `CARRICK_EXPOSED_CPUS=10 GOGC=off` Go c50 earlier: 11/20 clean,
-  9 deadline panics, 0 timeouts.
-- Carrick `CARRICK_EXPOSED_CPUS=10 GOMAXPROCS=4` Go c50 earlier: 19/20 clean,
-  1 deadline panic, 0 timeouts.
+## Two traps that cost hours (read before re-debugging)
 
-## Darwin/macOS and FreeBSD leverage
+1. **`carrick trace` perturbs this timing race away.** Running under the
+   in-process dtrace consumer slows the guest ~60× (≈14k vs ≈888k SIGURGs in the
+   same wall-clock), so the EL1-window race basically stops happening and the
+   bug **passes under trace**. Observe at full speed with cheap in-process
+   atomics instead: `CARRICK_KICK_STATS=1` prints
+   `el1_kick_resumed / kick_path_inject / inject_at_el1` at exit; the
+   `kick-stats` USDT probe carries the same totals (one fire per exit) and
+   `kick-in-kernel` fires per EL1-window kick. `CARRICK_TRACE_REGS=1` dumps guest
+   regs per trap (full speed) — that's how the hot futex PC/syscalls were found.
+2. **`0x20404` is NOT a wild/corrupt PC.** It's the normal EL1 vector entry that
+   **every** syscall passes through (`CARRICK_TRACE_REGS` shows `pc=0x20404
+   ec=0x15` on every SVC; `ELR_EL1` holds the real EL0 return). An earlier
+   reading of `0x20404` as a "wild guest jump" was wrong — it's carrick (EL1)
+   space. (User: "is that pc in carrick? … it does seem like the pc is the el
+   space.")
 
-FreeBSD's Linuxulator is the right comparison point for the epoll/kqueue shape:
+## The differential method that found it
 
-- `epoll_create_common` creates a real kqueue via `kern_kqueue`.
-  <https://github.com/freebsd/freebsd-src/blob/main/sys/compat/linux/linux_event.c#L103-L138>
-- `linux_epoll_ctl` translates Linux epoll interests into kqueue filters
-  (`EVFILT_READ`/`EVFILT_WRITE`, plus flags such as `EV_CLEAR`).
-  <https://github.com/freebsd/freebsd-src/blob/main/sys/compat/linux/linux_event.c#L282-L355>
-- `linux_epoll_wait_ts` waits by calling into kevent on that kqueue.
-  <https://github.com/freebsd/freebsd-src/blob/main/sys/compat/linux/linux_event.c#L369-L428>
-- FreeBSD also makes kqueue fds poll/read-ready when queued events exist.
-  <https://github.com/freebsd/freebsd-src/blob/main/sys/kern/kern_event.c#L406-L435>
+Instead of debugging the whole Go runtime, build small probes that each stress
+ONE primitive at high parallelism, and run each both under carrick (exposed 4 vs
+10) and on the Docker `linux/arm64` oracle (same static-musl binary). Built in a
+`rust:alpine` arm64 container; sources in `fixtures/mn-probes/`:
 
-Carrick cannot simply call `kevent()` in the runtime wait helper, because that
-would drain the epoll instance before `epoll_pwait` gets a chance to translate
-events back to Linux `struct epoll_event`. The useful Darwin leverage is:
+- `futex-only`: Condvar ring, no signals (control) — always passed.
+- `futex-sigurg`: same ring + a 50µs `tgkill` SIGURG storm — **isolated the bug
+  to signal delivery corrupting the futex path**. Deterministic, fast (≤30s),
+  2 threads enough.
+- `epoll-sigurg`: epoll loopback + SIGURG storm.
 
-- maintain the epoll instance as a persistent host kqueue;
-- register fd readiness with native EVFILT filters at `epoll_ctl`;
-- in the runtime, use `poll(2)` on the epoll kqueue fd only as a readiness
-  sleep primitive;
-- re-dispatch `epoll_pwait` to drain and translate the events.
+Build: `docker run --rm --platform linux/arm64 -v "$PWD/fixtures/mn-probes":/work
+-w /work rust:alpine sh -c 'cargo build --release'`.
+Oracle: run the same binary in an `alpine` arm64 container.
 
-This keeps the kernel as the readiness source of truth while preserving the
-Linux epoll syscall boundary.
+## Other changes this continuation
 
-For CPU exposure, the Darwin leverage is `sysctl` topology, not a hardcoded
-Linux fiction. On this host, exposing `hw.perflevel0.logicalcpu` gives Go a
-stable default. Go 1.26.2's Linux runtime computes its default CPU count from
-the `sched_getaffinity` population count (`runtime/os_linux.go:getCPUCount`),
-so Carrick's Linux-visible affinity mask is the surface that directly drives
-default `GOMAXPROCS`.
+- **FP/SIMD across signals** (`feat(abi)` + the hvf fix commit): carrick now
+  saves/restores guest V0–V31 + FPSR/FPCR in the Linux `fpsimd_context`
+  (`sigcontext.__reserved`) across signal handlers, like the arm64 kernel. It
+  was NOT the deadlock, but it is a real correctness gap (aarch64 memcpy/memset
+  use SIMD). Measured overhead on Go c50 is within run-to-run noise. Toggle with
+  `CARRICK_NO_FPSIMD` for differential runs.
+- **Systematic EL0/EL1 invariant** (`refactor(hvf)`): `ExecLevel{Guest,Kernel}`
+  + `memory::is_carrick_el1_vector_va()`, with a `debug_assert`/release-counter
+  tripwire in `inject_signal` so a kick-path resume PC in carrick's EL1 vector
+  range trips loudly. Encodes the carrick-vs-guest boundary as a checked
+  contract. Tests: ExecLevel classification, the VA predicate, fpsimd layout.
 
-## Open blocker
+## Open: residual ~1% long tail at forced GOMAXPROCS=10
 
-The remaining blocker is forced high-P progress with `CARRICK_EXPOSED_CPUS=10`.
-The old stack-resident sigreturn crash is fixed, the shared waiter-pipe
-lost-wake hole is fixed, pending host-backed epoll events are now preserved
-across `maxevents`, and the handler-time guest signal mask is now saved and
-restored. High-P still produces deadline failures and timeouts.
+Across ~200 `CARRICK_EXPOSED_CPUS=10` Go c50 runs after the fix, two failures:
+one `context deadline exceeded` (client 5s timeout) and one
+`fatal error: index out of range`.
 
-The strongest current diagnosis is: async preemption is still implicated, but
-not in the original "signal delivery is completely broken" way. On the current
-tree:
+- The **deadline** miss is the more common residual and is consistent with
+  oversubscription tail latency: forcing `GOMAXPROCS=10` onto a 4-perf-core
+  machine (6 efficiency cores are much slower). `asyncpreemptoff=1` did NOT
+  change the residual rate (30/30 both), i.e. it's not a remaining signal bug.
+  The validated durable default (expose `hw.perflevel0.logicalcpu` = 4) is clean.
+- The **index out of range** is a rare corruption (≈1 in many hundreds) — next
+  to investigate. Likely a residual async-preemption edge (an EL0 inject at an
+  unusual point); FP-on vs FP-off was inconclusive at this rarity. A probe that
+  combines SIMD-heavy work + a SIGURG storm may reproduce it deterministically
+  (extend `mn-probes`).
 
-- `asyncpreemptoff=1` makes the 10-CPU oracle clean.
-- lightweight `carrick trace` still catches a failing run.
-- in that failing trace, one thread receives a large `SIGURG` storm while a
-  different thread times out waiting on the epoll kqueue fd.
-
-That points to a remaining race or semantic mismatch in the async-preemption
-path or in how that path interacts with Go's scheduler/runtime state, not a
-plain missed epoll event.
-
-Next best path:
-
-- Keep using `scripts/trace-go-missed-event.d` for low-perturbation failing
-  samples; the broader syscall aggregators are too heavy for this race.
-- Correlate the hot `SIGURG` target tid with its interrupted PCs and Go runtime
-  state. The current failure signature is a thread stuck in repeated preemption
-  around `runtime.futex.abi0` / `runtime.osyield.abi0` / `runtime.nanotime1.abi0`.
-- Reduce the workload toward a loopback netpoll + timer/deadline fixture that
-  keeps `GOMAXPROCS=10` but removes HTTP and JSON.
-- Keep the default CPU surface at the validated Darwin performance-cluster count
-  unless the high-P async-preemption interaction is fixed.
+Next best path: extend the `mn-probes` family with a SIMD+signal probe to try to
+turn the rare `index out of range` into a deterministic repro, then trace via
+`CARRICK_TRACE_REGS` / `CARRICK_KICK_STATS` (NOT the dtrace consumer — it hides
+the race).
 
 ## Commands
 
@@ -206,30 +123,27 @@ Build and sign:
 ./scripts/build-signed.sh
 ```
 
-Carrick default c50 oracle:
+Differential probe (the deterministic repro for the fixed bug):
+
+```sh
+B="$PWD/fixtures/mn-probes/target/release"
+CARRICK_KICK_STATS=1 CARRICK_EXPOSED_CPUS=10 \
+  target/release/carrick run-elf --raw --fs host "$B/futex-sigurg" -- 2 50000
+# expect: PROBE_B_OK …  + [kick_stats] el1_kick_resumed=… inject_at_el1=0
+```
+
+Go high-P oracle:
 
 ```sh
 artifact="$PWD/fixtures/go-aarch64-hello/target/release/carrick-linux-aarch64-go-hello"
-target/release/carrick run-elf --raw --fs host "$artifact" -- -benchmark -c 50 -n 300
-```
-
-Forced high-P stress oracle:
-
-```sh
 CARRICK_EXPOSED_CPUS=10 \
   target/release/carrick run-elf --raw --fs host "$artifact" -- -benchmark -c 50 -n 300
 ```
 
-Native macOS baseline:
+Full-speed guest-reg trace (when the dtrace consumer is too perturbing):
 
 ```sh
-go build -o /tmp/carrick-go-native ./fixtures/go-aarch64-hello/src/main.go
-/tmp/carrick-go-native -benchmark -c 50 -n 300
-```
-
-Schedtrace failure oracle:
-
-```sh
-CARRICK_EXPOSED_CPUS=10 GODEBUG=schedtrace=500,scheddetail=1 \
-  target/release/carrick run-elf --raw --fs host "$artifact" -- -benchmark -c 50 -n 300
+CARRICK_TRACE_REGS=1 CARRICK_EXPOSED_CPUS=10 \
+  target/release/carrick run-elf --raw --fs host "$artifact" -- -benchmark -c 50 -n 300 2>&1 \
+  | grep TRAP | grep -oE 'ec=0x[0-9a-f]+\) pc=0x[0-9a-f]+ .* x8=[0-9-]+' | sort | uniq -c | sort -rn
 ```
