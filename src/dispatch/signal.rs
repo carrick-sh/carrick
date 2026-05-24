@@ -83,6 +83,13 @@ impl SignalState {
     }
 }
 
+fn sanitize_signal_mask(mut mask: u64) -> u64 {
+    #[allow(clippy::unwrap_used)]
+    let unmaskable = sigmask_bit(LINUX_SIGKILL).unwrap() | sigmask_bit(LINUX_SIGSTOP).unwrap();
+    mask &= !unmaskable;
+    mask
+}
+
 impl SyscallDispatcher {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn dispatch_threaded_signal<M: GuestMemory>(
@@ -196,6 +203,10 @@ impl SyscallDispatcher {
         }
     }
 
+    pub fn signal_mask_for(&self, tid: crate::thread::ThreadId) -> u64 {
+        self.signal.lock().mask_for(tid)
+    }
+
     /// Record a (blocked) signal as pending for `tid`. It stays queued until the
     /// thread unblocks it or dequeues it via `rt_sigtimedwait`.
     pub fn mark_signal_pending(&self, tid: crate::thread::ThreadId, signum: i32) {
@@ -212,6 +223,26 @@ impl SyscallDispatcher {
         s.masks.remove(&tid);
         s.pendings.remove(&tid);
         s.altstack.remove(&tid);
+    }
+
+    /// Apply Linux handler-time masking for `signum`, returning the previous
+    /// per-thread mask so `rt_sigreturn` can restore it from the sigframe.
+    pub fn enter_signal_handler(
+        &self,
+        tid: crate::thread::ThreadId,
+        signum: i32,
+        action: LinuxSigaction,
+    ) -> u64 {
+        let mut signal = self.signal.lock();
+        let previous = signal.mask_for(tid);
+        let delivered = sigmask_bit(signum).unwrap_or(0);
+        let handler_mask = sanitize_signal_mask(previous | delivered | action.sa_mask[0]);
+        signal.masks.insert(tid, handler_mask);
+        previous
+    }
+
+    pub fn restore_signal_mask(&self, tid: crate::thread::ThreadId, mask: u64) {
+        self.signal.lock().masks.insert(tid, sanitize_signal_mask(mask));
     }
 
     /// Lowest-numbered pending signal that is NOT currently blocked, cleared
@@ -335,10 +366,11 @@ impl SyscallDispatcher {
 
     /// Shared tgkill/tkill routing for the multi-threaded path. Returns
     /// `Some(outcome)` when `tid` names a live thread of this process:
-    /// `raise_self` if it's the caller, else a `SignalThread` outcome the
-    /// runtime delivers + kicks. Returns `None` (so the caller falls back to
-    /// the pid/bootstrap path) when there's no thread context (single-threaded)
-    /// or `tid` isn't a live sibling.
+    /// `raise_self` if it's the caller, a queued success if the sibling has the
+    /// signal blocked, else a `SignalThread` outcome the runtime delivers +
+    /// kicks. Returns `None` (so the caller falls back to the pid/bootstrap
+    /// path) when there's no thread context (single-threaded) or `tid` isn't a
+    /// live sibling.
     fn route_thread_signal<M: GuestMemory>(
         &self,
         ctx: &SyscallCtx<M>,
@@ -351,9 +383,14 @@ impl SyscallDispatcher {
             return Some(self.raise_self(t.tid, signum));
         }
         if t.registry.is_live(target) {
+            let signum_i32 = signum as i32;
+            if self.signal_blocked(target, signum_i32) {
+                self.mark_signal_pending(target, signum_i32);
+                return Some(DispatchOutcome::Returned { value: 0 });
+            }
             return Some(DispatchOutcome::SignalThread {
                 tid: target,
-                signum: signum as i32,
+                signum: signum_i32,
             });
         }
         None
@@ -569,12 +606,7 @@ impl SyscallDispatcher {
                     return Ok(LINUX_EINVAL.into());
                 }
             };
-            // SIGKILL and SIGSTOP can never be masked.
-            // INVARIANT: SIGKILL/SIGSTOP are valid signal numbers (< 64), so sigmask_bit is Some.
-            #[allow(clippy::unwrap_used)]
-            let unmaskable =
-                sigmask_bit(LINUX_SIGKILL).unwrap() | sigmask_bit(LINUX_SIGSTOP).unwrap();
-            mask &= !unmaskable;
+            mask = sanitize_signal_mask(mask);
             self.signal.lock().masks.insert(tid, mask);
             // Signals that just became unblocked stay in `pending`; the runtime
             // drains them via `take_deliverable_pending` after this syscall,
