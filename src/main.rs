@@ -437,7 +437,12 @@ fn run_cli(cli: Cli) -> anyhow::Result<()> {
             if raw {
                 dispatcher.set_stream_stdio(true);
             }
-            let mut argv = vec![path.to_string_lossy().into_owned()];
+            let executable_path = path
+                .canonicalize()
+                .unwrap_or_else(|_| path.clone())
+                .to_string_lossy()
+                .into_owned();
+            let mut argv = vec![executable_path];
             argv.extend(args);
             // Forward a small allowlist of runtime-tuning/diagnostic env vars from
             // the host when explicitly set (unset = absent, so this is a no-op in

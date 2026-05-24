@@ -191,10 +191,11 @@ pub fn run_static_elf_with_hvf_and_dispatcher(
     max_traps: usize,
 ) -> Result<RunResult, RuntimeError> {
     let path = path.as_ref();
+    let argv0 = canonical_host_executable_path(path);
     run_static_elf_with_hvf_args_and_dispatcher(
         path,
         dispatcher,
-        [path.to_string_lossy().into_owned()],
+        [argv0],
         std::iter::empty(),
         max_traps,
     )
@@ -229,16 +230,32 @@ where
     let path = path.as_ref();
     let argv: Vec<String> = argv.into_iter().collect();
     let env: Vec<String> = env.into_iter().collect();
-    dispatcher.set_executable_identity(path.to_string_lossy().into_owned(), argv.clone());
-    let image = AddressSpace::load_elf(path)?
-        .with_linux_initial_stack(argv, env)?
-        .with_el0_trampoline()?
-        .with_el1_vectors()?
-        .with_stage1_page_tables()?;
+    let identity = argv
+        .first()
+        .cloned()
+        .unwrap_or_else(|| canonical_host_executable_path(path));
+    dispatcher.set_executable_identity(identity, argv.clone());
+    let file = std::fs::read(path).map_err(AddressSpaceError::Io)?;
+    let image = AddressSpace::load_elf_bytes_with_reader(&file, &|p| {
+        dispatcher
+            .read_exec_file(p)
+            .or_else(|| std::fs::read(p).ok())
+    })?
+    .with_linux_initial_stack(argv, env)?
+    .with_el0_trampoline()?
+    .with_el1_vectors()?
+    .with_stage1_page_tables()?;
     if let Some(p) = maybe_dump_debug_state(&image, debug_state_path) {
         eprintln!("debug state written: {}", p.display());
     }
     run_address_space_with_hvf_and_dispatcher(image, dispatcher, max_traps)
+}
+
+fn canonical_host_executable_path(path: &Path) -> String {
+    path.canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
 }
 
 pub fn run_static_elf_bytes_with_hvf_and_dispatcher(
@@ -1061,15 +1078,38 @@ impl ThreadRuntimeState {
                             child_kicker,
                             max_traps,
                         );
-                        if let Err(e) = r {
-                            tracing::error!(tid, error = %e, "thread sibling vCPU loop failed");
-                            // The errored loop skipped its own thread-exit
-                            // cleanup; deregister it here so it doesn't haunt
-                            // the registry/kicker as a phantom thread.
-                            cleanup_registry.exit(tid);
-                            cleanup_kicker.unregister(tid);
-                            crate::host_signal::forget_thread(tid);
-                            cleanup_kernel.dispatcher.forget_thread_signal_state(tid);
+                        match r {
+                            Ok(VcpuLoopOutcome::ProcessExit(result)) => {
+                                let _ = std::io::Write::flush(&mut std::io::stdout());
+                                let _ = std::io::Write::flush(&mut std::io::stderr());
+                                let _ = unsafe {
+                                    libc::write(
+                                        1,
+                                        result.stdout.as_ptr() as *const _,
+                                        result.stdout.len(),
+                                    )
+                                };
+                                let _ = unsafe {
+                                    libc::write(
+                                        2,
+                                        result.stderr.as_ptr() as *const _,
+                                        result.stderr.len(),
+                                    )
+                                };
+                                unsafe { libc::_exit(result.exit_code) };
+                            }
+                            Ok(VcpuLoopOutcome::TrapLimit(_)) | Ok(VcpuLoopOutcome::ThreadDone) => {
+                            }
+                            Err(e) => {
+                                tracing::error!(tid, error = %e, "thread sibling vCPU loop failed");
+                                // The errored loop skipped its own thread-exit
+                                // cleanup; deregister it here so it doesn't haunt
+                                // the registry/kicker as a phantom thread.
+                                cleanup_registry.exit(tid);
+                                cleanup_kicker.unregister(tid);
+                                crate::host_signal::forget_thread(tid);
+                                cleanup_kernel.dispatcher.forget_thread_signal_state(tid);
+                            }
                         }
                     }
                     Err(e) => {
