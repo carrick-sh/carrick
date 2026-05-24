@@ -119,7 +119,12 @@ impl ThreadWaiter {
     /// temporarily blocks (an `epoll_pwait`/`ppoll`/`pselect6` sigmask); a signal
     /// blocked by it does not interrupt the wait (it stays pending for delivery
     /// after the syscall, per the persistent mask). `0` = no extra blocking.
-    pub fn wait(&self, fds: &[(i32, i16)], timeout: Option<Duration>, block_mask: u64) -> WaitResult {
+    pub fn wait(
+        &self,
+        fds: &[(i32, i16)],
+        timeout: Option<Duration>,
+        block_mask: u64,
+    ) -> WaitResult {
         let fd0 = fds.first().map_or(-1, |(fd, _)| *fd);
         let events0 = fds.first().map_or(0, |(_, events)| i32::from(*events));
         let fd1 = fds.get(1).map_or(-1, |(fd, _)| *fd);
@@ -165,6 +170,52 @@ impl ThreadWaiter {
             }
         }
         result = self.fallback_poll(wait_fds, timeout, block_mask);
+        crate::probes::io_wait_end(
+            self.tid,
+            wait_result_code(result),
+            fds.len() as i32,
+            fd0,
+            fd1,
+            fds.get(2).map_or(-1, |(fd, _)| *fd),
+        );
+        result
+    }
+
+    /// Block using `poll(2)` instead of the per-thread kqueue. This is used for
+    /// kqueue fds themselves: poll observes kqueue readability without draining
+    /// the queued events.
+    pub fn wait_poll(
+        &self,
+        fds: &[(i32, i16)],
+        timeout: Option<Duration>,
+        block_mask: u64,
+    ) -> WaitResult {
+        let fd0 = fds.first().map_or(-1, |(fd, _)| *fd);
+        let events0 = fds.first().map_or(0, |(_, events)| i32::from(*events));
+        let fd1 = fds.get(1).map_or(-1, |(fd, _)| *fd);
+        crate::probes::io_wait_begin(
+            self.tid,
+            fds.len() as i32,
+            timeout
+                .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+                .unwrap_or(-1),
+            fd0,
+            events0,
+            fd1,
+        );
+        if crate::host_signal::has_unblocked_pending_for(self.tid, block_mask) {
+            crate::probes::io_wait_end(
+                self.tid,
+                wait_result_code(WaitResult::Interrupted),
+                fds.len() as i32,
+                fd0,
+                fd1,
+                fds.get(2).map_or(-1, |(fd, _)| *fd),
+            );
+            return WaitResult::Interrupted;
+        }
+        let pinned_fds = PinnedWaitFds::new(fds);
+        let result = self.poll_with_signal(pinned_fds.as_wait_fds(), timeout, block_mask);
         crate::probes::io_wait_end(
             self.tid,
             wait_result_code(result),
@@ -287,6 +338,15 @@ impl ThreadWaiter {
         timeout: Option<Duration>,
         block_mask: u64,
     ) -> WaitResult {
+        self.poll_with_signal(fds, timeout, block_mask)
+    }
+
+    fn poll_with_signal(
+        &self,
+        fds: &[(i32, i16)],
+        timeout: Option<Duration>,
+        block_mask: u64,
+    ) -> WaitResult {
         const SLICE_MS: i32 = 50;
         let deadline = timeout.map(|d| Instant::now() + d);
         let mut pollfds: Vec<libc::pollfd> = fds
@@ -297,9 +357,23 @@ impl ThreadWaiter {
                 revents: 0,
             })
             .collect();
+        let signal_index = if self.pipe_read >= 0 {
+            let index = pollfds.len();
+            pollfds.push(libc::pollfd {
+                fd: self.pipe_read,
+                events: libc::POLLIN,
+                revents: 0,
+            });
+            Some(index)
+        } else {
+            None
+        };
         loop {
             if crate::host_signal::has_unblocked_pending_for(self.tid, block_mask) {
                 return WaitResult::Interrupted;
+            }
+            for pfd in &mut pollfds {
+                pfd.revents = 0;
             }
             let slice_ms = match deadline {
                 Some(dl) => {
@@ -319,7 +393,25 @@ impl ThreadWaiter {
                 )
             };
             if n > 0 {
-                return WaitResult::Ready;
+                if pollfds[..fds.len()].iter().any(|pfd| pfd.revents != 0) {
+                    return WaitResult::Ready;
+                }
+                if signal_index
+                    .and_then(|index| pollfds.get(index))
+                    .is_some_and(|pfd| pfd.revents != 0)
+                {
+                    crate::host_signal::drain_pending_pipe();
+                }
+                if crate::host_signal::has_unblocked_pending_for(self.tid, block_mask) {
+                    return WaitResult::Interrupted;
+                }
+            } else if n < 0 {
+                let errno = std::io::Error::last_os_error().raw_os_error();
+                if errno == Some(libc::EINTR)
+                    && crate::host_signal::has_unblocked_pending_for(self.tid, block_mask)
+                {
+                    return WaitResult::Interrupted;
+                }
             }
         }
     }

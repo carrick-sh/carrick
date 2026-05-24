@@ -548,6 +548,22 @@ where
                         };
                     }
                 },
+                DispatchOutcome::WaitOnPollFds {
+                    fds,
+                    timeout,
+                    on_timeout,
+                    block_signals,
+                } => match waiter.wait_poll(&fds, timeout, block_signals) {
+                    crate::io_wait::WaitResult::Ready => continue,
+                    crate::io_wait::WaitResult::TimedOut => {
+                        break DispatchOutcome::Returned { value: on_timeout };
+                    }
+                    crate::io_wait::WaitResult::Interrupted => {
+                        break DispatchOutcome::Errno {
+                            errno: crate::linux_abi::LINUX_EINTR,
+                        };
+                    }
+                },
                 other => break other,
             }
         };
@@ -555,7 +571,9 @@ where
         let mut last_syscall_retval: Option<i64> = None;
 
         match outcome {
-            DispatchOutcome::WaitOnFds { .. } => unreachable!("serviced by the wait loop above"),
+            DispatchOutcome::WaitOnFds { .. } | DispatchOutcome::WaitOnPollFds { .. } => {
+                unreachable!("serviced by the wait loop above")
+            }
             DispatchOutcome::Exit { code } => {
                 crate::probes::guest_exit(code);
                 if runtime.is_forked_child() {
@@ -800,6 +818,22 @@ impl ThreadRuntimeState {
                     on_timeout,
                     block_signals,
                 } => match self.waiter.wait(&fds, timeout, block_signals) {
+                    crate::io_wait::WaitResult::Ready => continue,
+                    crate::io_wait::WaitResult::TimedOut => {
+                        break Ok(DispatchOutcome::Returned { value: on_timeout });
+                    }
+                    crate::io_wait::WaitResult::Interrupted => {
+                        break Ok(DispatchOutcome::Errno {
+                            errno: crate::linux_abi::LINUX_EINTR,
+                        });
+                    }
+                },
+                DispatchOutcome::WaitOnPollFds {
+                    fds,
+                    timeout,
+                    on_timeout,
+                    block_signals,
+                } => match self.waiter.wait_poll(&fds, timeout, block_signals) {
                     crate::io_wait::WaitResult::Ready => continue,
                     crate::io_wait::WaitResult::TimedOut => {
                         break Ok(DispatchOutcome::Returned { value: on_timeout });
@@ -1182,7 +1216,9 @@ fn run_vcpu_until_exit(
         let mut last_syscall_retval: Option<i64> = None;
 
         match outcome {
-            DispatchOutcome::WaitOnFds { .. } => unreachable!("serviced by the wait loop above"),
+            DispatchOutcome::WaitOnFds { .. } | DispatchOutcome::WaitOnPollFds { .. } => {
+                unreachable!("serviced by the wait loop above")
+            }
             DispatchOutcome::Exit { code } => {
                 // A forked child process (real macOS fork) exits via _exit so
                 // the rebuilt HVF context doesn't run the panicky Drops, and
@@ -1726,6 +1762,22 @@ where
                         };
                     }
                 },
+                DispatchOutcome::WaitOnPollFds {
+                    fds,
+                    timeout,
+                    on_timeout,
+                    block_signals,
+                } => match waiter.wait_poll(&fds, timeout, block_signals) {
+                    crate::io_wait::WaitResult::Ready => continue,
+                    crate::io_wait::WaitResult::TimedOut => {
+                        break DispatchOutcome::Returned { value: on_timeout };
+                    }
+                    crate::io_wait::WaitResult::Interrupted => {
+                        break DispatchOutcome::Errno {
+                            errno: crate::linux_abi::LINUX_EINTR,
+                        };
+                    }
+                },
                 other => break other,
             }
         };
@@ -1733,7 +1785,9 @@ where
         let mut last_syscall_retval: Option<i64> = None;
 
         match outcome {
-            DispatchOutcome::WaitOnFds { .. } => unreachable!("serviced by the wait loop above"),
+            DispatchOutcome::WaitOnFds { .. } | DispatchOutcome::WaitOnPollFds { .. } => {
+                unreachable!("serviced by the wait loop above")
+            }
             DispatchOutcome::Exit { code } => {
                 if trap.is_forked_child() {
                     forked_child_exit(code, dispatcher.stdout(), dispatcher.stderr());
