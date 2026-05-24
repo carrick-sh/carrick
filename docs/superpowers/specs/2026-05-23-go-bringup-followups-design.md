@@ -154,10 +154,33 @@ guest thread executed an instruction in a data/stack region and took an
 undefined synchronous exception. Intermittent: a retry completes at ~22k req/s,
 so c=20 is ~7/8 OK. Not the mmap-reservation issue (that's fixed).
 
+**Code-level findings (this session's read).** A sibling vCPU is built by
+`spawn_clone_thread` (runtime.rs) → `build_thread_spec` (trap.rs:541) →
+`from_thread_spec` (trap.rs:1756). `build_thread_spec` captures, ON THE CLONING
+THREAD: (a) a `snapshot_vcpu()` of the parent vCPU's registers, then
+`seed_child_snapshot(parent, stack, tls)` to set the child's PC (=clone return,
+in ELF text), SP (=clone stack), TLS, x0=0; (b) a COPY of `self.mappings`
+(the cloning engine's HVF region list); (c) an `Arc::clone` of `protections`.
+`from_thread_spec` then `vcpu_create`s and best-effort re-maps the snapshot
+regions into the SHARED `hv_vm` (already-mapped → benign HV_ERROR/HV_BAD_ARG).
+Since the fault PC is in the mmap ARENA (not ELF text), the sibling did NOT start
+at a wrong entry PC — it ran from the correct entry and later transferred into
+the arena (a goroutine stack/return-address corruption, or a stack mapped in a
+region the sibling's snapshot/protections didn't cover).
+
 **Hypotheses to test (investigation, not yet a fix).**
-- Concurrency race in per-thread vCPU bring-up (`spawn_clone_thread` →
-  `from_thread_spec`): a thread starts executing before its stack/TLS or shared
-  stage-1 mapping is fully established → fetches garbage → EC=0.
+- The cloning thread's `self.mappings` copy is a per-engine list; under many
+  concurrent clones + concurrent mmap (which grows the arena / adds regions on
+  some engine), a sibling's snapshot mapping/protection set may be STALE relative
+  to where Go then places that sibling's goroutine stack → a stack access or
+  return lands in an arena page the sibling's `protections` marks no-access (or
+  unmapped in its bookkeeping) → garbage fetch / EC=0. Check whether goroutine
+  stacks for the new M live in arena regions added after the snapshot.
+- Concurrency race in per-thread vCPU bring-up: a thread starts executing before
+  its stack/TLS or shared stage-1 mapping is fully established → fetches garbage.
+- The reservation-relocation (`548fce`/§3): confirm Go always uses the RETURNED
+  mmap address for later MAP_FIXED commits (it should); a mismatch would leave a
+  goroutine stack pointing at an uncommitted/relocated arena address.
 - A corrupted return address / function pointer pointing into the arena (guest
   stack smash under load), possibly aggravated by the reservation-relocation if
   Go commits at an address it didn't expect (verify Go always uses the returned
