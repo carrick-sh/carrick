@@ -82,8 +82,10 @@ impl PinnedWaitFds {
 pub struct ThreadWaiter {
     #[cfg(target_os = "macos")]
     kq: Option<Kqueue>,
-    /// The self-pipe read fd this waiter registered, or `-1` if unavailable.
-    pipe_read: RawFd,
+    /// Process-wide self-pipe read fd for process-directed signals, or `-1`.
+    process_pipe_read: RawFd,
+    /// Per-thread wake pipe for thread-directed signals.
+    thread_wake: Option<crate::host_signal::ThreadWakePipe>,
     /// The guest tid this waiter runs for, so a pending signal targeted at a
     /// *sibling* thread doesn't spuriously interrupt this thread's blocking
     /// syscall (which would surface a wrong EINTR). Process-directed signals
@@ -95,20 +97,40 @@ impl ThreadWaiter {
     #[cfg(target_os = "macos")]
     pub fn new(tid: crate::thread::ThreadId) -> Self {
         let kq = Kqueue::new_internal();
-        let pipe_read = crate::host_signal::pending_pipe_read_fd();
+        let process_pipe_read = crate::host_signal::pending_pipe_read_fd();
+        let thread_wake = crate::host_signal::register_thread_waiter(tid);
         if let Some(kq) = kq.as_ref()
-            && pipe_read >= 0
         {
-            // Persistent EVFILT_READ on the self-pipe: any byte the signal
-            // handler writes wakes this thread's kevent() immediately.
-            let _ = kq.apply(&[Kevent::read(pipe_read, libc::EV_ADD)]);
+            let mut changes = Vec::with_capacity(2);
+            if process_pipe_read >= 0 {
+                // Persistent EVFILT_READ on the process self-pipe: any byte the
+                // async signal handler writes wakes waiters immediately.
+                changes.push(Kevent::read(process_pipe_read, libc::EV_ADD));
+            }
+            if let Some(thread_wake) = thread_wake.as_ref() {
+                // Thread-directed signals use a private pipe so siblings cannot
+                // drain the target's wake before its kqueue observes it.
+                changes.push(Kevent::read(thread_wake.read_fd(), libc::EV_ADD));
+            }
+            if !changes.is_empty() {
+                let _ = kq.apply(&changes);
+            }
         }
-        Self { kq, pipe_read, tid }
+        Self {
+            kq,
+            process_pipe_read,
+            thread_wake,
+            tid,
+        }
     }
 
     #[cfg(not(target_os = "macos"))]
     pub fn new(tid: crate::thread::ThreadId) -> Self {
-        Self { pipe_read: -1, tid }
+        Self {
+            process_pipe_read: -1,
+            thread_wake: None,
+            tid,
+        }
     }
 
     /// Block until one of `fds` (host fds, with `libc::POLL*` event masks) is
@@ -245,7 +267,7 @@ impl ThreadWaiter {
                 changes.push(Kevent::write(fd, libc::EV_ADD));
             }
         }
-        let cap = (changes.len() + 1).max(1);
+        let cap = (changes.len() + self.signal_pipe_count()).max(1);
         let mut events_out: Vec<Kevent> = vec![Kevent::empty(); cap];
 
         let result = loop {
@@ -257,9 +279,9 @@ impl ThreadWaiter {
                     }
                     Some(duration_to_timespec(dl - now))
                 }
-                // No deadline: the self-pipe wakes us on a signal, so block
+                // No deadline: a signal pipe wakes us on a signal, so block
                 // indefinitely. Without the pipe, cap at 50ms to re-check.
-                None if self.pipe_read >= 0 => None,
+                None if self.has_signal_pipe() => None,
                 None => Some(libc::timespec {
                     tv_sec: 0,
                     tv_nsec: 50_000_000,
@@ -279,10 +301,17 @@ impl ThreadWaiter {
                 }
             };
             let mut fd_ready = false;
-            let mut pipe_woke = false;
+            let mut process_pipe_woke = false;
+            let mut thread_pipe_woke = false;
             for e in &events_out[..n] {
-                if e.is_read_for_fd(self.pipe_read) {
-                    pipe_woke = true;
+                if e.is_read_for_fd(self.process_pipe_read) {
+                    process_pipe_woke = true;
+                } else if self
+                    .thread_wake
+                    .as_ref()
+                    .is_some_and(|thread_wake| e.is_read_for_fd(thread_wake.read_fd()))
+                {
+                    thread_pipe_woke = true;
                 } else {
                     // A real fd event, OR an EV_ERROR on a bad fd: either way,
                     // let the re-dispatched op observe the true state/errno.
@@ -292,8 +321,13 @@ impl ThreadWaiter {
             if fd_ready {
                 break WaitResult::Ready;
             }
-            if pipe_woke {
+            if process_pipe_woke {
                 crate::host_signal::drain_pending_pipe();
+            }
+            if thread_pipe_woke
+                && let Some(thread_wake) = self.thread_wake.as_ref()
+            {
+                thread_wake.drain();
             }
             if crate::host_signal::has_unblocked_pending_for(self.tid, block_mask) {
                 break WaitResult::Interrupted;
@@ -357,10 +391,10 @@ impl ThreadWaiter {
                 revents: 0,
             })
             .collect();
-        let signal_index = if self.pipe_read >= 0 {
+        let process_signal_index = if self.process_pipe_read >= 0 {
             let index = pollfds.len();
             pollfds.push(libc::pollfd {
-                fd: self.pipe_read,
+                fd: self.process_pipe_read,
                 events: libc::POLLIN,
                 revents: 0,
             });
@@ -368,6 +402,15 @@ impl ThreadWaiter {
         } else {
             None
         };
+        let thread_signal_index = self.thread_wake.as_ref().map(|thread_wake| {
+            let index = pollfds.len();
+            pollfds.push(libc::pollfd {
+                fd: thread_wake.read_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            });
+            index
+        });
         loop {
             if crate::host_signal::has_unblocked_pending_for(self.tid, block_mask) {
                 return WaitResult::Interrupted;
@@ -396,11 +439,18 @@ impl ThreadWaiter {
                 if pollfds[..fds.len()].iter().any(|pfd| pfd.revents != 0) {
                     return WaitResult::Ready;
                 }
-                if signal_index
+                if process_signal_index
                     .and_then(|index| pollfds.get(index))
                     .is_some_and(|pfd| pfd.revents != 0)
                 {
                     crate::host_signal::drain_pending_pipe();
+                }
+                if thread_signal_index
+                    .and_then(|index| pollfds.get(index))
+                    .is_some_and(|pfd| pfd.revents != 0)
+                    && let Some(thread_wake) = self.thread_wake.as_ref()
+                {
+                    thread_wake.drain();
                 }
                 if crate::host_signal::has_unblocked_pending_for(self.tid, block_mask) {
                     return WaitResult::Interrupted;
@@ -414,6 +464,14 @@ impl ThreadWaiter {
                 }
             }
         }
+    }
+
+    fn has_signal_pipe(&self) -> bool {
+        self.process_pipe_read >= 0 || self.thread_wake.is_some()
+    }
+
+    fn signal_pipe_count(&self) -> usize {
+        usize::from(self.process_pipe_read >= 0) + usize::from(self.thread_wake.is_some())
     }
 }
 
