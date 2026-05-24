@@ -2424,11 +2424,15 @@ fn linux_min_fd(value: u64) -> Result<i32, i32> {
 
 fn linux_clock_duration(clock_id: u64) -> Option<Duration> {
     match clock_id {
-        LINUX_CLOCK_REALTIME | LINUX_CLOCK_REALTIME_COARSE => Some(realtime_duration()),
-        LINUX_CLOCK_MONOTONIC
-        | LINUX_CLOCK_MONOTONIC_RAW
-        | LINUX_CLOCK_MONOTONIC_COARSE
-        | LINUX_CLOCK_BOOTTIME => Some(monotonic_duration()),
+        LINUX_CLOCK_REALTIME
+        | LINUX_CLOCK_REALTIME_COARSE
+        | LINUX_CLOCK_REALTIME_ALARM
+        | LINUX_CLOCK_TAI => Some(realtime_duration()),
+        LINUX_CLOCK_MONOTONIC | LINUX_CLOCK_MONOTONIC_RAW | LINUX_CLOCK_MONOTONIC_COARSE => {
+            Some(monotonic_duration())
+        }
+        // BOOTTIME includes suspend time; on macOS that is CLOCK_MONOTONIC.
+        LINUX_CLOCK_BOOTTIME | LINUX_CLOCK_BOOTTIME_ALARM => Some(boottime_duration()),
         // Linux↔macOS clock-id numbering DIFFERS, so map the Linux ids to
         // the host's symbolic libc constants rather than passing through.
         LINUX_CLOCK_PROCESS_CPUTIME_ID => host_clock_duration(libc::CLOCK_PROCESS_CPUTIME_ID),
@@ -2599,10 +2603,19 @@ fn host_clock_duration(clock_id: libc::clockid_t) -> Option<Duration> {
 }
 
 fn monotonic_duration() -> Duration {
-    // On real Linux CLOCK_MONOTONIC/CLOCK_BOOTTIME report system uptime (a
-    // large, monotonic value). Use the host's real monotonic clock so tv_sec
-    // is large rather than seconds-since-carrick-start (sub-second).
-    host_clock_duration(libc::CLOCK_MONOTONIC).unwrap_or(Duration::ZERO)
+    // Linux CLOCK_MONOTONIC does NOT advance while the system is suspended.
+    // On macOS that is CLOCK_UPTIME_RAW (mach_absolute_time) — NOT macOS
+    // CLOCK_MONOTONIC, which (unlike Linux) keeps counting through sleep and
+    // therefore corresponds to Linux CLOCK_BOOTTIME (see `boottime_duration`).
+    host_clock_duration(libc::CLOCK_UPTIME_RAW).unwrap_or(Duration::ZERO)
+}
+
+fn boottime_duration() -> Duration {
+    // Linux CLOCK_BOOTTIME = CLOCK_MONOTONIC + time spent suspended. macOS
+    // CLOCK_MONOTONIC (backed by mach_continuous_time) is exactly that: it
+    // continues to advance while the system sleeps, so it is >= the
+    // suspend-excluding `monotonic_duration` above.
+    host_clock_duration(libc::CLOCK_MONOTONIC).unwrap_or_else(monotonic_duration)
 }
 
 fn linux_timespec_from_duration(duration: Duration) -> LinuxTimespec {

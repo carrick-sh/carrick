@@ -44,6 +44,26 @@ fn main() {
         }
     }
 
+    // CLOCK_BOOTTIME >= CLOCK_MONOTONIC: BOOTTIME counts suspend time on top of
+    // MONOTONIC, so it is never behind. (Read MONOTONIC first so any elapsed
+    // time during the two calls only helps the >= hold.) This invariant holds
+    // on Linux and on carrick (which sources MONOTONIC from CLOCK_UPTIME_RAW
+    // and BOOTTIME from the sleep-inclusive host CLOCK_MONOTONIC).
+    {
+        let mut m = MaybeUninit::<libc::timespec>::uninit();
+        let mut bt = MaybeUninit::<libc::timespec>::uninit();
+        let r1 = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, m.as_mut_ptr()) };
+        let r2 = unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, bt.as_mut_ptr()) };
+        if r1 != 0 || r2 != 0 {
+            println!("clock_boottime_ge_monotonic=ERR:{}", errno());
+        } else {
+            let m = unsafe { m.assume_init() };
+            let bt = unsafe { bt.assume_init() };
+            let ge = (bt.tv_sec, bt.tv_nsec) >= (m.tv_sec, m.tv_nsec);
+            println!("clock_boottime_ge_monotonic={ge}");
+        }
+    }
+
     // clock_getres for REALTIME/MONOTONIC: res > 0 and <= 1 second (booleans).
     for (name, id) in [
         ("realtime", libc::CLOCK_REALTIME),
