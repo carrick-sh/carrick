@@ -12,6 +12,39 @@
 
 ---
 
+## REVISED ROOT CAUSE (2026-05-24, after Task 1) — the real blocker is multithreaded fork
+
+Task 1 (`pidfd_open` + plumbing) is **DONE and committed** — `pidfd_open(434)` now
+returns a valid fd. But `os/exec` STILL fails with "function not implemented",
+and deeper tracing found why:
+
+- Go's `os/exec` `forkExec` uses `clone(CLONE_VM|CLONE_VFORK|CLONE_PIDFD)`
+  (flags `0x5100`) — the modern vfork-style spawn that's safe from a
+  multithreaded runtime.
+- carrick's `handle_fork` (runtime.rs) **returns ENOSYS when `live_count > 1`**:
+  it refuses to fork/vfork a multithreaded process. Go's runtime is heavily
+  multithreaded by the time it spawns, so every `os/exec` hits this.
+- Confirmed: no `fork-pre`/`fork-post` fires; `clone(0x5100)` returns 0; the
+  ENOSYS is carrick's own fork-refusal, NOT a guest syscall (verified with an
+  ENOSYS-mapped-to-syscall trace across all children — there is none).
+
+So **SP2b's real work is multithreaded-vfork+exec support**, not pidfd alone:
+
+- Handle `clone(CLONE_VM|CLONE_VFORK)` (and plain fork) from a process with
+  `live_count > 1` for the fork+exec case. Linux semantics: the child has ONLY
+  the calling thread; for vfork+exec the child shares memory briefly then
+  execve's. carrick's model (real macOS fork + per-thread vCPU) must produce a
+  child that has just the calling thread's vCPU and immediately proceeds to
+  execve — the other guest threads' vCPUs must not be rebuilt in the child.
+- Then write the pidfd (`CLONE_PIDFD`) for the child (Task 2, using the Task 1
+  `open_pidfd` helper) and wire `waitid(P_PIDFD)` (Task 3).
+- This is a substantial new piece (multithreaded fork is the long-standing
+  carrick limitation noted in [[project_thread_clone_blocker]]); it likely needs
+  its own focused design. The `pidfd_open`/plumbing from Task 1 stays as the
+  foundation.
+
+---
+
 ## File structure
 
 - Modify: `src/dispatch/fs.rs` — add `OpenDescription::Pidfd { host_pid: i32, kq: Arc<Kqueue> }`; handle it in the fd close/poll/fstat match arms (follow each existing `OpenDescription::Epoll { .. }` arm).
