@@ -23,8 +23,9 @@
 //! is enough for that.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU64, Ordering};
-use std::sync::{LazyLock, Mutex};
+use std::os::fd::RawFd;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use crate::linux_abi::LINUX_SIGINT;
 
@@ -97,6 +98,61 @@ static PENDING: AtomicI32 = AtomicI32::new(NO_PENDING_SIGNAL);
 /// per tid mirrors the single-slot global model (last delivered wins).
 static THREAD_PENDING: LazyLock<Mutex<HashMap<i32, i32>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+static THREAD_WAITERS: LazyLock<Mutex<HashMap<i32, ThreadWakeRegistration>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+struct ThreadWakeRegistration {
+    fds: Arc<ThreadWakeFds>,
+}
+
+struct ThreadWakeFds {
+    read_fd: RawFd,
+    write_fd: RawFd,
+    closed: AtomicBool,
+}
+
+impl ThreadWakeFds {
+    fn new(read_fd: RawFd, write_fd: RawFd) -> Self {
+        Self {
+            read_fd,
+            write_fd,
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    fn close(&self) {
+        if self.closed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        unsafe {
+            libc::close(self.read_fd);
+            if self.write_fd != self.read_fd {
+                libc::close(self.write_fd);
+            }
+        }
+    }
+}
+
+pub struct ThreadWakePipe {
+    tid: i32,
+    fds: Arc<ThreadWakeFds>,
+}
+
+impl ThreadWakePipe {
+    pub fn read_fd(&self) -> RawFd {
+        self.fds.read_fd
+    }
+
+    pub fn drain(&self) {
+        drain_fd(self.fds.read_fd);
+    }
+}
+
+impl Drop for ThreadWakePipe {
+    fn drop(&mut self) {
+        unregister_thread_waiter(self.tid, &self.fds);
+    }
+}
 
 /// Publish a signal targeted at a specific guest `tid` and wake parked waiters.
 /// The waking thread (and only it, via `take_pending_for`) will deliver it.
@@ -110,7 +166,10 @@ pub fn publish_pending_for(tid: i32, signum: i32) {
         .lock()
         .expect("THREAD_PENDING poisoned")
         .insert(tid, signum);
-    notify_pending();
+    if !wake_thread_waiter(tid) {
+        notify_waiters_fallback();
+    }
+    wake_signal_pump_pipe();
 }
 
 /// Drain the signal deliverable to `tid`: a thread-directed one for this tid
@@ -249,6 +308,25 @@ pub fn pending_pipe_read_fd() -> i32 {
     PENDING_PIPE_READ.load(Ordering::SeqCst)
 }
 
+/// Register a per-thread wake pipe for thread-directed signals. Unlike the
+/// process-wide self-pipe, this pipe is watched and drained only by `tid`, so a
+/// sibling blocked in `kevent()` cannot consume the target's wake byte.
+pub fn register_thread_waiter(tid: i32) -> Option<ThreadWakePipe> {
+    let (read_fd, write_fd) = open_internal_pipe()?;
+    let fds = Arc::new(ThreadWakeFds::new(read_fd, write_fd));
+    let registration = ThreadWakeRegistration {
+        fds: Arc::clone(&fds),
+    };
+    {
+        #[allow(clippy::expect_used)]
+        THREAD_WAITERS
+            .lock()
+            .expect("THREAD_WAITERS poisoned")
+            .insert(tid, registration);
+    }
+    Some(ThreadWakePipe { tid, fds })
+}
+
 /// Read end of the signal pump's dedicated wake pipe.
 pub fn pump_pipe_read_fd() -> i32 {
     PUMP_PIPE_READ.load(Ordering::SeqCst)
@@ -321,6 +399,34 @@ fn replace_pipe(read_slot: &AtomicI32, write_slot: &AtomicI32, read_fd: i32, wri
     }
 }
 
+fn unregister_thread_waiter(tid: i32, fds: &Arc<ThreadWakeFds>) {
+    let removed = {
+        #[allow(clippy::expect_used)]
+        let mut guard = THREAD_WAITERS.lock().expect("THREAD_WAITERS poisoned");
+        match guard.get(&tid) {
+            Some(reg) if Arc::ptr_eq(&reg.fds, fds) => guard.remove(&tid),
+            _ => None,
+        }
+    };
+    drop(removed);
+    fds.close();
+}
+
+fn clear_thread_waiters() {
+    let waiters = {
+        #[allow(clippy::expect_used)]
+        THREAD_WAITERS
+            .lock()
+            .expect("THREAD_WAITERS poisoned")
+            .drain()
+            .map(|(_, registration)| registration.fds)
+            .collect::<Vec<_>>()
+    };
+    for fds in waiters {
+        fds.close();
+    }
+}
+
 fn close_raw_fds(fds: &[i32; 2]) {
     for fd in fds {
         unsafe { libc::close(*fd) };
@@ -384,6 +490,7 @@ pub fn reinit_after_fork() {
     if let Ok(mut map) = THREAD_PENDING.lock() {
         map.clear();
     }
+    clear_thread_waiters();
     PENDING.store(NO_PENDING_SIGNAL, Ordering::SeqCst);
 }
 
@@ -397,6 +504,7 @@ pub fn reset_after_supervisor_fork() {
     if let Ok(mut map) = THREAD_PENDING.lock() {
         map.clear();
     }
+    clear_thread_waiters();
     PENDING.store(NO_PENDING_SIGNAL, Ordering::SeqCst);
     open_pending_pipe();
 }
@@ -415,6 +523,33 @@ fn notify_pending() {
     wake_signal_pump_pipe();
 }
 
+fn notify_waiters_fallback() {
+    let w = PENDING_PIPE_WRITE.load(Ordering::SeqCst);
+    if w >= 0 {
+        let byte = [1u8];
+        unsafe {
+            libc::write(w, byte.as_ptr() as *const libc::c_void, 1);
+        }
+    }
+}
+
+fn wake_thread_waiter(tid: i32) -> bool {
+    let write_fd = {
+        #[allow(clippy::expect_used)]
+        THREAD_WAITERS
+            .lock()
+            .expect("THREAD_WAITERS poisoned")
+            .get(&tid)
+            .map(|registration| Arc::clone(&registration.fds))
+    };
+    let Some(fds) = write_fd else {
+        return false;
+    };
+    let byte = [1u8];
+    let rc = unsafe { libc::write(fds.write_fd, byte.as_ptr() as *const libc::c_void, 1) };
+    rc >= 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EAGAIN)
+}
+
 /// Drain the self-pipe (non-blocking). Called by a waiter after it observes the
 /// pipe readable so the level-triggered `EVFILT_READ` doesn't spin. Racing
 /// drains across threads are harmless — `has_pending` is the source of truth.
@@ -423,13 +558,7 @@ pub fn drain_pending_pipe() {
     if r < 0 {
         return;
     }
-    let mut buf = [0u8; 64];
-    loop {
-        let n = unsafe { libc::read(r, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-        if n <= 0 {
-            break;
-        }
-    }
+    drain_fd(r);
 }
 
 /// Drain the signal pump's dedicated wake pipe.
@@ -438,9 +567,13 @@ pub fn drain_pump_pipe() {
     if r < 0 {
         return;
     }
+    drain_fd(r);
+}
+
+fn drain_fd(fd: RawFd) {
     let mut buf = [0u8; 64];
     loop {
-        let n = unsafe { libc::read(r, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
         if n <= 0 {
             break;
         }
@@ -666,6 +799,31 @@ mod tests {
         PENDING.store(NO_PENDING_SIGNAL, Ordering::SeqCst);
     }
 
+    #[test]
+    fn thread_directed_wake_uses_target_private_pipe() {
+        let _g = TEST_LOCK.lock().unwrap();
+        reset_after_supervisor_fork();
+        PENDING.store(NO_PENDING_SIGNAL, Ordering::SeqCst);
+
+        let target_tid = 900_010;
+        let other_tid = 900_011;
+        let target = register_thread_waiter(target_tid).expect("target waiter pipe");
+        let other = register_thread_waiter(other_tid).expect("other waiter pipe");
+
+        publish_pending_for(target_tid, LINUX_SIGINT);
+        assert!(pipe_is_readable(target.read_fd()));
+        assert!(!pipe_is_readable(other.read_fd()));
+        assert!(!pipe_is_readable(pending_pipe_read_fd()));
+        assert!(pipe_is_readable(pump_pipe_read_fd()));
+
+        target.drain();
+        drain_pump_pipe();
+        assert!(!pipe_is_readable(target.read_fd()));
+        assert_eq!(take_pending_for(target_tid), LINUX_SIGINT);
+        drop(other);
+        drop(target);
+    }
+
     fn pipe_is_readable(fd: i32) -> bool {
         assert!(fd >= 0);
         let mut pollfd = libc::pollfd {
@@ -691,6 +849,8 @@ mod tests {
         assert_eq!(take_pending_for(tid), LINUX_SIGINT);
         // Consumed exactly once.
         assert_eq!(take_pending_for(tid), NO_PENDING_SIGNAL);
+        drain_pending_pipe();
+        drain_pump_pipe();
     }
 
     #[test]
@@ -701,6 +861,8 @@ mod tests {
         publish_pending_for(tid, 15);
         forget_thread(tid);
         assert_eq!(take_pending_for(tid), NO_PENDING_SIGNAL);
+        drain_pending_pipe();
+        drain_pump_pipe();
     }
 
     #[test]
