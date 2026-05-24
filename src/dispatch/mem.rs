@@ -610,9 +610,7 @@ impl SyscallDispatcher {
         // A reused arena range carries the previous mapping's bytes; zero the
         // whole new extent so the grown tail reads zero (the head is overwritten
         // by the copy below). A fresh bump range is demand-zero — skip it.
-        if reused
-            && let Ok(n) = usize::try_from(new_size)
-        {
+        if reused && let Ok(n) = usize::try_from(new_size) {
             let zeros = vec![0u8; n];
             let _ = memory.write_bytes(new_address, &zeros);
         }

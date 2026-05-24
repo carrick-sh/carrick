@@ -55,8 +55,7 @@ impl ItimerSlot {
     }
 }
 
-static SLOTS: [ItimerSlot; WHICH_COUNT] =
-    [ItimerSlot::new(), ItimerSlot::new(), ItimerSlot::new()];
+static SLOTS: [ItimerSlot; WHICH_COUNT] = [ItimerSlot::new(), ItimerSlot::new(), ItimerSlot::new()];
 
 /// EVFILT_TIMER ident for a `which`.
 pub fn ident_for(which: usize) -> usize {

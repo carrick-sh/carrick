@@ -444,7 +444,13 @@ fn run_cli(cli: Cli) -> anyhow::Result<()> {
             // normal use). Lets an operator pass e.g. GODEBUG=schedtrace=1000 to a
             // guest Go binary for differential debugging without rebuilding it.
             let mut elf_env: Vec<String> = Vec::new();
-            for key in ["GODEBUG", "GOMAXPROCS", "GOTRACEBACK", "GOGC", "GODEBUGFLAGS"] {
+            for key in [
+                "GODEBUG",
+                "GOMAXPROCS",
+                "GOTRACEBACK",
+                "GOGC",
+                "GODEBUGFLAGS",
+            ] {
                 if let Ok(val) = std::env::var(key) {
                     elf_env.push(format!("{key}={val}"));
                 }
@@ -564,7 +570,13 @@ fn run_cli(cli: Cli) -> anyhow::Result<()> {
             // but let an operator pass e.g. GODEBUG=schedtrace=1000 to a guest Go
             // binary, or GOMAXPROCS, without baking it into the image — invaluable
             // for differential debugging against Docker.
-            for key in ["GODEBUG", "GOMAXPROCS", "GOTRACEBACK", "GOGC", "GODEBUGFLAGS"] {
+            for key in [
+                "GODEBUG",
+                "GOMAXPROCS",
+                "GOTRACEBACK",
+                "GOGC",
+                "GODEBUGFLAGS",
+            ] {
                 if let Ok(val) = std::env::var(key) {
                     env.push(format!("{key}={val}"));
                 }

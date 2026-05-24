@@ -271,12 +271,21 @@ mod tests {
         let ident = 0xC1_0000usize;
         // 1ms one-shot timer.
         kqueue
-            .apply(&[Kevent::timer(ident, libc::EV_ADD | libc::EV_ONESHOT, 1_000_000)])
+            .apply(&[Kevent::timer(
+                ident,
+                libc::EV_ADD | libc::EV_ONESHOT,
+                1_000_000,
+            )])
             .expect("register timer");
 
-        let timeout = libc::timespec { tv_sec: 1, tv_nsec: 0 };
+        let timeout = libc::timespec {
+            tv_sec: 1,
+            tv_nsec: 0,
+        };
         let mut out = [Kevent::empty()];
-        let n = kqueue.wait(&[], &mut out, Some(&timeout)).expect("wait timer");
+        let n = kqueue
+            .wait(&[], &mut out, Some(&timeout))
+            .expect("wait timer");
         assert_eq!(n, 1);
         assert_eq!(out[0].timer_ident(), Some(ident));
     }

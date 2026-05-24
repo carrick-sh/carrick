@@ -94,7 +94,19 @@ pub const fn handler_for_aarch64(number: u64) -> SyscallHandler {
         90 | 91 | 140 | 141 | 143..=152 | 158 | 159 | 166 | 174..=177 => {
             SyscallHandler::Credentials
         }
-        92 | 95 | 117 | 122 | 123 | 142 | 154..=157 | 160..=162 | 167 | 168 | 172 | 173 | 278
+        92
+        | 95
+        | 117
+        | 122
+        | 123
+        | 142
+        | 154..=157
+        | 160..=162
+        | 167
+        | 168
+        | 172
+        | 173
+        | 278
         | 293 => SyscallHandler::Process,
         93 | 94 | 220 | 221 | 260 | 435 => SyscallHandler::Lifecycle,
         129..=139 => SyscallHandler::Signal,
