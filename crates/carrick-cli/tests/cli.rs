@@ -4,12 +4,10 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use assert_cmd::Command;
+use carrick_test_support::gzip_tar;
 use carrick_image::{ImageReference, ImageStore, LayerSummary, PullSummary};
-use flate2::Compression;
-use flate2::write::GzEncoder;
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
-use std::io::Write;
 
 #[test]
 fn inspect_elf_command_prints_json_metadata() {
@@ -1871,23 +1869,4 @@ fn minimal_aarch64_elf_with_load_segment() -> Vec<u8> {
     elf[ph + 48..ph + 56].copy_from_slice(&0x1000_u64.to_le_bytes());
     elf[0x1000..0x1004].copy_from_slice(b"\x1f\x20\x03\xd5");
     elf
-}
-
-fn gzip_tar<const N: usize>(files: [(&str, &[u8]); N]) -> Vec<u8> {
-    let mut tar_bytes = Vec::new();
-    {
-        let mut builder = tar::Builder::new(&mut tar_bytes);
-        for (path, contents) in files {
-            let mut header = tar::Header::new_gnu();
-            header.set_size(contents.len() as u64);
-            header.set_mode(0o644);
-            header.set_cksum();
-            builder.append_data(&mut header, path, contents).unwrap();
-        }
-        builder.finish().unwrap();
-    }
-
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(&tar_bytes).unwrap();
-    encoder.finish().unwrap()
 }

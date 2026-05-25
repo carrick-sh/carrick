@@ -47,5 +47,6 @@ applevisor-sys.workspace = true
 cc = "1"
 
 [dev-dependencies]
+carrick-test-support = { path = "../carrick-test-support" }
 tempfile.workspace = true
 carrick-image = { path = "../carrick-image" }
