@@ -340,19 +340,54 @@ use crate::linux_abi::{
 use crate::memory::{LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE, LINUX_MMAP_SIZE};
 use crate::overlay::OverlayEntry;
 use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsError, RootFsMetadata};
-use crate::syscall::{SyscallHandler, handler_for_aarch64, lookup_aarch64};
+use crate::syscall::{SyscallHandler, lookup_aarch64};
 use parking_lot::{Condvar, Mutex, RwLock};
 use serde::Serialize;
 use thiserror::Error;
 use zerocopy::{FromBytes, IntoBytes};
 
+macro_rules! define_syscall {
+    ( $(
+        $(#[$meta:meta])*
+        fn $name:ident ( $this:ident, $cx:ident $(, $arg:ident : $argty:ty )* $(,)? ) $body:block
+    )* ) => {
+        $(
+            $(#[$meta])*
+            #[allow(unused_variables)]
+            pub(super) fn $name<M: GuestMemory>(
+                &self,
+                ctx: &mut SyscallCtx<M>,
+            ) -> Result<DispatchOutcome, DispatchError> {
+                // Alias the receiver and context to caller-named idents (macro
+                // hygiene means a bare `self`/`ctx` in the body wouldn't bind).
+                let $this = self;
+                let $cx = ctx;
+                let mut __arg_index = 0usize;
+                $(
+                    let $arg: $argty = $cx.typed_arg(__arg_index);
+                    __arg_index += 1;
+                )*
+                let _ = __arg_index;
+                $body
+            }
+        )*
+    };
+}
+
 mod abi_args;
+#[macro_use]
 mod creds;
+#[macro_use]
 mod fs;
+#[macro_use]
 mod mem;
+#[macro_use]
 mod net;
+#[macro_use]
 mod proc;
+#[macro_use]
 mod signal;
+#[macro_use]
 mod time;
 
 pub use crate::vfs::ProcMapsEntry;
@@ -1866,50 +1901,6 @@ impl SyscallDispatcher {
         Ok(outcome)
     }
 
-    /// Threaded dispatch for the subsystems whose handlers take no
-    /// thread context (Memory/Time/Credentials/Process). Records entry/
-    /// return like `dispatch_inner` and routes straight to the single
-    /// `dispatch_normalized` registry with `thread: None` — identical to
-    /// the per-subsystem `dispatch_threaded_*` functions this replaces.
-    fn dispatch_threaded_threadless<M: GuestMemory>(
-        &self,
-        request: SyscallRequest,
-        memory: &mut M,
-        reporter: &CompatReporter,
-    ) -> Option<Result<DispatchOutcome, DispatchError>> {
-        if !matches!(
-            handler_for_aarch64(request.number),
-            SyscallHandler::Memory
-                | SyscallHandler::Time
-                | SyscallHandler::Credentials
-                | SyscallHandler::Process
-        ) {
-            return None;
-        }
-        let name = lookup_aarch64(request.number).map_or("unknown", |s| s.name);
-        reporter.record(CompatEvent::SyscallEntry {
-            number: request.number,
-            name: ::std::borrow::Cow::Borrowed(name),
-            args: request.args,
-        });
-        let result = self.dispatch_normalized(request, memory, reporter, None);
-        let outcome = match result {
-            Some(Ok(outcome)) => outcome,
-            Some(Err(error)) => return Some(Err(error)),
-            // Gated number that the normalized table doesn't claim: fall
-            // through to the unhandled path (don't double-record return).
-            None => return None,
-        };
-        let (retval, errno) = outcome.retval_errno();
-        reporter.record(CompatEvent::SyscallReturn {
-            number: request.number,
-            name: ::std::borrow::Cow::Borrowed(name),
-            retval,
-            errno,
-        });
-        Some(Ok(outcome))
-    }
-
     /// Shared threaded dispatch path for subsystems already moved behind
     /// interior locks.
     #[allow(clippy::too_many_arguments)]
@@ -1922,34 +1913,66 @@ impl SyscallDispatcher {
         registry: &crate::thread::ThreadRegistry,
         futex: &crate::thread::FutexTable,
     ) -> Option<Result<DispatchOutcome, DispatchError>> {
-        if let Some(result) = self.dispatch_threaded_threadless(request, memory, reporter) {
-            return Some(result);
-        }
-        if let Some(result) =
-            self.dispatch_threaded_lifecycle(request, memory, reporter, tid, registry, futex)
-        {
-            return Some(result);
-        }
-        if let Some(result) = self.dispatch_threaded_fs(request, memory, reporter) {
-            return Some(result);
-        }
-        if let Some(result) = self.dispatch_threaded_net(request, memory, reporter) {
-            return Some(result);
-        }
-        if let Some(result) =
-            self.dispatch_threaded_signal(request, memory, reporter, tid, registry, futex)
-        {
-            return Some(result);
-        }
         if let Some(result) =
             Self::dispatch_threaded_independent(request, memory, reporter, tid, registry, futex)
         {
             return Some(result);
         }
-        if !Self::dispatch_normalized_known(request.number) {
-            return Some(Ok(dispatch_threaded_unhandled(request, reporter)));
+
+        if request.number == 64 && !self.write_shared_supported(request.args.0[0] as i32) {
+            return None;
         }
-        None
+
+        if !Self::dispatch_normalized_known(request.number) {
+            return None;
+        }
+
+        let syscall = lookup_aarch64(request.number);
+        let name = syscall.map_or("unknown", |syscall| syscall.name);
+
+        for (nr, arg_index, mask) in SYSCALL_FLAG_VALIDATORS {
+            if *nr == request.number {
+                let value = request.arg(*arg_index as usize);
+                check_syscall_flags(reporter, request.number, name, *arg_index, value, *mask);
+            }
+        }
+
+        reporter.record(CompatEvent::SyscallEntry {
+            number: request.number,
+            name: ::std::borrow::Cow::Borrowed(name),
+            args: request.args,
+        });
+
+        if let Some(addr) = watch_addr()
+            && let Ok(bytes) = memory.read_bytes(addr, 8)
+        {
+            let mut le = [0u8; 8];
+            le.copy_from_slice(&bytes[..8]);
+            crate::probes::mem_watch(request.number, addr, u64::from_le_bytes(le));
+        }
+
+        let thread = Some(ThreadCtx {
+            tid,
+            registry,
+            futex,
+        });
+
+        let result = self.dispatch_normalized(request, memory, reporter, thread);
+        let outcome = match result {
+            Some(Ok(outcome)) => outcome,
+            Some(Err(error)) => return Some(Err(error)),
+            None => unreachable!("Already checked with dispatch_normalized_known"),
+        };
+
+        let (retval, errno) = outcome.retval_errno();
+        reporter.record(CompatEvent::SyscallReturn {
+            number: request.number,
+            name: ::std::borrow::Cow::Borrowed(name),
+            retval,
+            errno,
+        });
+
+        Some(Ok(outcome))
     }
 
     /// Thread-local syscall subset that does not touch mutable dispatcher
@@ -2282,34 +2305,6 @@ fn write_packed(memory: &mut impl GuestMemory, address: u64, bytes: &[u8]) -> Di
     }
 }
 
-fn dispatch_threaded_unhandled(
-    request: SyscallRequest,
-    reporter: &CompatReporter,
-) -> DispatchOutcome {
-    let syscall = lookup_aarch64(request.number);
-    let name = syscall.map_or("unknown", |syscall| syscall.name);
-    reporter.record(CompatEvent::SyscallEntry {
-        number: request.number,
-        name: ::std::borrow::Cow::Borrowed(name),
-        args: request.args,
-    });
-    reporter.record(CompatEvent::unhandled_syscall(
-        request.number,
-        name,
-        request.args,
-    ));
-    let outcome = DispatchOutcome::Errno {
-        errno: LINUX_ENOSYS,
-    };
-    let (retval, errno) = outcome.retval_errno();
-    reporter.record(CompatEvent::SyscallReturn {
-        number: request.number,
-        name: ::std::borrow::Cow::Borrowed(name),
-        retval,
-        errno,
-    });
-    outcome
-}
 
 /// Convert an ABSOLUTE futex deadline (FUTEX_WAIT_BITSET) to the remaining
 /// duration from now, on the host monotonic clock (or realtime when
