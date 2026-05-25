@@ -600,7 +600,7 @@ fn run_cli(cli: Cli) -> anyhow::Result<()> {
         }
         // `Shell` is normalised to `Run` (interactive /bin/sh) before this
         // match, so it is never reached here.
-        Commands::Shell { .. } => unreachable!("Shell is normalised to Run above"),
+        Commands::Shell { .. } => bail!("internal error: shell command was not normalized to run"),
         Commands::Exec { context, command } => {
             println!(
                 "{}",

@@ -621,7 +621,9 @@ where
             DispatchOutcome::WaitOnFds { .. }
             | DispatchOutcome::WaitOnPollFds { .. }
             | DispatchOutcome::WaitOnProcExit { .. } => {
-                unreachable!("serviced by the wait loop above")
+                let value = -(crate::linux_abi::LINUX_EINTR as i64);
+                runtime.complete_syscall(value)?;
+                last_syscall_retval = Some(value);
             }
             DispatchOutcome::Exit { code } => {
                 crate::probes::guest_exit(code);
@@ -724,7 +726,9 @@ where
                 // `dispatch_threaded` path (run_vcpu_until_exit). The
                 // single-threaded loops here always pass `thread: None`, so
                 // the dispatcher never produces them.
-                unreachable!("thread-clone outcomes only arise on the threaded runtime path")
+                let value = -(crate::linux_abi::LINUX_ENOSYS as i64);
+                runtime.complete_syscall(value)?;
+                last_syscall_retval = Some(value);
             }
         }
 
@@ -1529,7 +1533,8 @@ fn run_vcpu_until_exit(
                 DispatchOutcome::WaitOnFds { .. }
                 | DispatchOutcome::WaitOnPollFds { .. }
                 | DispatchOutcome::WaitOnProcExit { .. } => {
-                    unreachable!("serviced by the wait loop above")
+                    last_syscall_retval =
+                        Some(state.complete_errno(&mut engine, crate::linux_abi::LINUX_EINTR)?);
                 }
                 DispatchOutcome::Exit { code } => {
                     crate::trap::dump_kick_stats();
@@ -2244,7 +2249,9 @@ where
             DispatchOutcome::WaitOnFds { .. }
             | DispatchOutcome::WaitOnPollFds { .. }
             | DispatchOutcome::WaitOnProcExit { .. } => {
-                unreachable!("serviced by the wait loop above")
+                let value = -(crate::linux_abi::LINUX_EINTR as i64);
+                trap.complete_syscall(value)?;
+                last_syscall_retval = Some(value);
             }
             DispatchOutcome::Exit { code } => {
                 if trap.is_forked_child() {
@@ -2345,7 +2352,9 @@ where
                 // `dispatch_threaded` path (run_vcpu_until_exit). The
                 // single-threaded loops here always pass `thread: None`, so
                 // the dispatcher never produces them.
-                unreachable!("thread-clone outcomes only arise on the threaded runtime path")
+                let value = -(crate::linux_abi::LINUX_ENOSYS as i64);
+                trap.complete_syscall(value)?;
+                last_syscall_retval = Some(value);
             }
         }
 
