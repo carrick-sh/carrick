@@ -213,8 +213,10 @@ fn rejects_path_escape() {
                 )
                 .unwrap();
                 // Should return an error (UnsafePath from normalize_layer_path)
-                let result =
-                    carrick_runtime::rootfs::extract_layer_paths_to_dir(&[layer_path.clone()], &dir);
+                let result = carrick_runtime::rootfs::extract_layer_paths_to_dir(
+                    &[layer_path.clone()],
+                    &dir,
+                );
                 assert!(result.is_err(), "expected path escape to be rejected");
                 // Confirm nothing was written outside scratch
                 assert!(!tmp.path().join("evil").exists());

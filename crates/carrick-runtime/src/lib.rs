@@ -32,6 +32,7 @@ pub mod linux_abi;
 pub mod memory;
 pub mod overlay;
 
+pub mod execute;
 pub mod probes;
 pub mod pty_relay;
 pub mod rootfs;
@@ -43,5 +44,4 @@ pub mod ulock;
 pub mod vcpu_kick;
 pub mod vdso;
 pub mod vfs;
-pub mod execute;
 pub use execute::Runtime;

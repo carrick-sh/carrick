@@ -4,9 +4,9 @@
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
 
-use crate::dispatch::macos_to_linux_errno;
-use crate::linux_abi::{LINUX_EINVAL, LINUX_EROFS, LINUX_ENOENT};
 use super::{DirEnt, EntryKind, Metadata, OpenContext, OpenFlags, Vfs, VfsError, VfsHandle};
+use crate::dispatch::macos_to_linux_errno;
+use crate::linux_abi::{LINUX_EINVAL, LINUX_ENOENT, LINUX_EROFS};
 
 pub struct BindVfs {
     mount_point: String,
@@ -15,7 +15,11 @@ pub struct BindVfs {
 }
 
 impl BindVfs {
-    pub fn new(mount_point: impl Into<String>, host_path: impl Into<PathBuf>, readonly: bool) -> Self {
+    pub fn new(
+        mount_point: impl Into<String>,
+        host_path: impl Into<PathBuf>,
+        readonly: bool,
+    ) -> Self {
         Self {
             mount_point: mount_point.into(),
             host_path: host_path.into(),
@@ -231,7 +235,10 @@ impl Vfs for BindVfs {
             return Err(LINUX_EROFS);
         }
         let host = self.to_host(path)?;
-        let file = std::fs::OpenOptions::new().write(true).open(&host).map_err(map_io_error)?;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&host)
+            .map_err(map_io_error)?;
         file.set_len(len).map_err(map_io_error)
     }
 

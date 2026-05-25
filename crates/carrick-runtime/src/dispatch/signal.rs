@@ -2,7 +2,6 @@
 //! `super` for the dispatcher struct and the normalized dispatch table.
 use super::*;
 
-
 /// Owned signal-subsystem state. Split out of `SyscallDispatcher` so the
 /// signal handlers borrow only what they touch instead of the whole
 /// dispatcher. Field semantics are unchanged from the former loose
@@ -56,7 +55,6 @@ fn sanitize_signal_mask(mut mask: u64) -> u64 {
 }
 
 impl SyscallDispatcher {
-
     /// Look up the currently-installed handler for `signum`. Returns
     /// `None` when no handler has been recorded via `rt_sigaction`, or
     /// when the recorded handler is `SIG_DFL` / `SIG_IGN`. The runtime

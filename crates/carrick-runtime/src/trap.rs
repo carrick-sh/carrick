@@ -1462,8 +1462,7 @@ impl HvfInner {
         // absolute base is immaterial for CLOCK_MONOTONIC (durations cancel it);
         // it only shifts the realtime offset by a constant if HVF ever changed it.
         let guest_cntvct = host_cntvct;
-        let mono_ns =
-            ((guest_cntvct as u128).saturating_mul(1_000_000_000) / freq as u128) as u64;
+        let mono_ns = ((guest_cntvct as u128).saturating_mul(1_000_000_000) / freq as u128) as u64;
         let unix_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
@@ -1471,8 +1470,10 @@ impl HvfInner {
         let realtime_off = unix_ns.wrapping_sub(mono_ns);
 
         let base = crate::vdso::LINUX_VVAR_BASE;
-        let _ =
-            self.write_guest_bytes(base + crate::vdso::VVAR_OFF_FREQ as u64, &freq.to_le_bytes());
+        let _ = self.write_guest_bytes(
+            base + crate::vdso::VVAR_OFF_FREQ as u64,
+            &freq.to_le_bytes(),
+        );
         let _ = self.write_guest_bytes(
             base + crate::vdso::VVAR_OFF_REALTIME_OFF_NS as u64,
             &realtime_off.to_le_bytes(),

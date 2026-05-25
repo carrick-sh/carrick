@@ -9,7 +9,9 @@ mod support;
 use std::collections::VecDeque;
 use std::process::Command;
 
-use carrick_runtime::dispatch::{Aarch64SyscallFrame, GuestMemory, LinearMemory, SyscallDispatcher};
+use carrick_runtime::dispatch::{
+    Aarch64SyscallFrame, GuestMemory, LinearMemory, SyscallDispatcher,
+};
 use carrick_runtime::memory::AddressSpace;
 use carrick_runtime::rootfs::{LayerSource, RootFs};
 use carrick_runtime::runtime::{SyscallTrap, run_syscall_loop, run_syscall_loop_with_dispatcher};

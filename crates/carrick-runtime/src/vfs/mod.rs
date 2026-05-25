@@ -32,22 +32,21 @@
 //! union that the dispatcher converts to its own `OpenDescription`
 //! enum. `DevVfs` is the first concrete user of `open`.
 
+pub mod bind;
 pub mod dev;
 pub mod devpts;
 pub mod mount;
 pub mod proc;
 pub mod rootfs;
 pub mod sys;
-pub mod bind;
 
+pub use bind::BindVfs;
 pub use dev::DevVfs;
 pub use devpts::{DevptsVfs, PtyRole, PtyTable};
 pub use mount::VfsMounts;
 pub use proc::{ProcMapsEntry, ProcVfs, SyntheticProcContext};
 pub use rootfs::RootFsVfs;
 pub use sys::SysVfs;
-pub use bind::BindVfs;
-
 
 /// Maximum size Carrick will materialize as a `Vec<u8>` for memory-backed
 /// regular files. Larger files need a host-backed fd so growth remains sparse.

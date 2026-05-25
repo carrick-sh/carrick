@@ -52,266 +52,266 @@ impl SyscallDispatcher {
 }
 
 impl SyscallDispatcher {
-define_syscall! {
-    fn capget(this, cx, header_address: GuestPtr, data_address: GuestPtr) {
-        let memory = &mut *cx.memory;
-        let header = match read_capability_header(memory, header_address.0) {
-            Ok(header) => header,
-            Err(errno) => return Ok(errno.into()),
-        };
-        if !linux_capability_version_is_supported(header.version) {
-            return Ok(LINUX_EINVAL.into());
-        }
-        if header.pid < 0 {
-            return Ok(LINUX_ESRCH.into());
-        }
-        if data_address.0 == 0 {
-            return Ok(DispatchOutcome::Returned { value: 0 });
-        }
-        let words = linux_capability_data_words(header.version);
-        let empty = vec![LinuxCapabilityData::empty(); words];
-        if memory
-            .write_bytes(data_address.0, capability_data_bytes(&empty).as_slice())
-            .is_err()
-        {
-            return Ok(LINUX_EFAULT.into());
-        }
-        Ok(DispatchOutcome::Returned { value: 0 })
-    }
-
-    fn capset(this, cx, header_address: GuestPtr, data_address: GuestPtr) {
-        let memory = &*cx.memory;
-        let header = match read_capability_header(memory, header_address.0) {
-            Ok(header) => header,
-            Err(errno) => return Ok(errno.into()),
-        };
-        if !linux_capability_version_is_supported(header.version) {
-            return Ok(LINUX_EINVAL.into());
-        }
-        if header.pid < 0 {
-            return Ok(LINUX_ESRCH.into());
-        }
-        let words = linux_capability_data_words(header.version);
-        let data = match read_capability_data(memory, data_address.0, words) {
-            Ok(data) => data,
-            Err(errno) => return Ok(errno.into()),
-        };
-        if data.iter().any(|word| !word.is_empty()) {
-            return Ok(LINUX_EPERM.into());
-        }
-        Ok(DispatchOutcome::Returned { value: 0 })
-    }
-
-    fn umask(this, cx, new: u64) {
-        let new = new as u32 & 0o777;
-        let mut creds = this.creds.lock();
-        let previous = creds.umask;
-        creds.umask = new;
-        Ok(DispatchOutcome::Returned {
-            value: previous as i64,
-        })
-    }
-
-    fn setpriority(this, cx, which: u64, who: Pid, prio: u64) {
-        let prio = prio as i32;
-        if which > LINUX_PRIO_USER || !(-20..=19).contains(&prio) {
-            return Ok(LINUX_EINVAL.into());
-        }
-        if which == LINUX_PRIO_PROCESS && who.0 != 0 && who.0 != LINUX_BOOTSTRAP_PID as i32 {
-            return Ok(LINUX_ESRCH.into());
-        }
-        Ok(DispatchOutcome::Returned { value: 0 })
-    }
-
-    fn getpriority(this, cx, which: u64, who: Pid) {
-        if which > LINUX_PRIO_USER {
-            return Ok(LINUX_EINVAL.into());
-        }
-        if which == LINUX_PRIO_PROCESS && who.0 != 0 && who.0 != LINUX_BOOTSTRAP_PID as i32 {
-            return Ok(LINUX_ESRCH.into());
-        }
-        Ok(DispatchOutcome::Returned { value: 20 })
-    }
-
-    fn setresuid(this, cx, r: u64, e: u64, s: u64) {
-        let mut creds = this.creds.lock();
-        if r as i64 != -1 {
-            creds.ruid = r as u32;
-        }
-        if e as i64 != -1 {
-            creds.euid = e as u32;
-        }
-        if s as i64 != -1 {
-            creds.suid = s as u32;
-        }
-        Ok(DispatchOutcome::Returned { value: 0 })
-    }
-
-    fn setresgid(this, cx, r: u64, e: u64, s: u64) {
-        let mut creds = this.creds.lock();
-        if r as i64 != -1 {
-            creds.rgid = r as u32;
-        }
-        if e as i64 != -1 {
-            creds.egid = e as u32;
-        }
-        if s as i64 != -1 {
-            creds.sgid = s as u32;
-        }
-        Ok(DispatchOutcome::Returned { value: 0 })
-    }
-
-    fn setreuid(this, cx, r: u64, e: u64) {
-        let mut creds = this.creds.lock();
-        if r as i64 != -1 {
-            creds.ruid = r as u32;
-        }
-        if e as i64 != -1 {
-            creds.euid = e as u32;
-        }
-        Ok(DispatchOutcome::Returned { value: 0 })
-    }
-
-    fn setregid(this, cx, r: u64, e: u64) {
-        let mut creds = this.creds.lock();
-        if r as i64 != -1 {
-            creds.rgid = r as u32;
-        }
-        if e as i64 != -1 {
-            creds.egid = e as u32;
-        }
-        Ok(DispatchOutcome::Returned { value: 0 })
-    }
-
-    fn setuid(this, cx, u: u64) {
-        let u = u as u32;
-        let mut creds = this.creds.lock();
-        creds.ruid = u;
-        creds.euid = u;
-        creds.suid = u;
-        Ok(DispatchOutcome::Returned { value: 0 })
-    }
-
-    fn setgid(this, cx, g: u64) {
-        let g = g as u32;
-        let mut creds = this.creds.lock();
-        creds.rgid = g;
-        creds.egid = g;
-        creds.sgid = g;
-        Ok(DispatchOutcome::Returned { value: 0 })
-    }
-
-    fn getresuid(this, cx, ruid_ptr: GuestPtr, euid_ptr: GuestPtr, suid_ptr: GuestPtr) {
-        let creds = this.cred_snapshot();
-        for (ptr, value) in [
-            (ruid_ptr, creds.ruid),
-            (euid_ptr, creds.euid),
-            (suid_ptr, creds.suid),
-        ] {
-            if ptr.0 == 0 {
-                continue;
+    define_syscall! {
+        fn capget(this, cx, header_address: GuestPtr, data_address: GuestPtr) {
+            let memory = &mut *cx.memory;
+            let header = match read_capability_header(memory, header_address.0) {
+                Ok(header) => header,
+                Err(errno) => return Ok(errno.into()),
+            };
+            if !linux_capability_version_is_supported(header.version) {
+                return Ok(LINUX_EINVAL.into());
             }
-            if cx.memory.write_bytes(ptr.0, &value.to_le_bytes()).is_err() {
+            if header.pid < 0 {
+                return Ok(LINUX_ESRCH.into());
+            }
+            if data_address.0 == 0 {
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            }
+            let words = linux_capability_data_words(header.version);
+            let empty = vec![LinuxCapabilityData::empty(); words];
+            if memory
+                .write_bytes(data_address.0, capability_data_bytes(&empty).as_slice())
+                .is_err()
+            {
                 return Ok(LINUX_EFAULT.into());
             }
+            Ok(DispatchOutcome::Returned { value: 0 })
         }
-        Ok(DispatchOutcome::Returned { value: 0 })
-    }
 
-    fn getresgid(this, cx, rgid_ptr: GuestPtr, egid_ptr: GuestPtr, sgid_ptr: GuestPtr) {
-        let creds = this.cred_snapshot();
-        for (ptr, value) in [
-            (rgid_ptr, creds.rgid),
-            (egid_ptr, creds.egid),
-            (sgid_ptr, creds.sgid),
-        ] {
-            if ptr.0 == 0 {
-                continue;
+        fn capset(this, cx, header_address: GuestPtr, data_address: GuestPtr) {
+            let memory = &*cx.memory;
+            let header = match read_capability_header(memory, header_address.0) {
+                Ok(header) => header,
+                Err(errno) => return Ok(errno.into()),
+            };
+            if !linux_capability_version_is_supported(header.version) {
+                return Ok(LINUX_EINVAL.into());
             }
-            if cx.memory.write_bytes(ptr.0, &value.to_le_bytes()).is_err() {
+            if header.pid < 0 {
+                return Ok(LINUX_ESRCH.into());
+            }
+            let words = linux_capability_data_words(header.version);
+            let data = match read_capability_data(memory, data_address.0, words) {
+                Ok(data) => data,
+                Err(errno) => return Ok(errno.into()),
+            };
+            if data.iter().any(|word| !word.is_empty()) {
+                return Ok(LINUX_EPERM.into());
+            }
+            Ok(DispatchOutcome::Returned { value: 0 })
+        }
+
+        fn umask(this, cx, new: u64) {
+            let new = new as u32 & 0o777;
+            let mut creds = this.creds.lock();
+            let previous = creds.umask;
+            creds.umask = new;
+            Ok(DispatchOutcome::Returned {
+                value: previous as i64,
+            })
+        }
+
+        fn setpriority(this, cx, which: u64, who: Pid, prio: u64) {
+            let prio = prio as i32;
+            if which > LINUX_PRIO_USER || !(-20..=19).contains(&prio) {
+                return Ok(LINUX_EINVAL.into());
+            }
+            if which == LINUX_PRIO_PROCESS && who.0 != 0 && who.0 != LINUX_BOOTSTRAP_PID as i32 {
+                return Ok(LINUX_ESRCH.into());
+            }
+            Ok(DispatchOutcome::Returned { value: 0 })
+        }
+
+        fn getpriority(this, cx, which: u64, who: Pid) {
+            if which > LINUX_PRIO_USER {
+                return Ok(LINUX_EINVAL.into());
+            }
+            if which == LINUX_PRIO_PROCESS && who.0 != 0 && who.0 != LINUX_BOOTSTRAP_PID as i32 {
+                return Ok(LINUX_ESRCH.into());
+            }
+            Ok(DispatchOutcome::Returned { value: 20 })
+        }
+
+        fn setresuid(this, cx, r: u64, e: u64, s: u64) {
+            let mut creds = this.creds.lock();
+            if r as i64 != -1 {
+                creds.ruid = r as u32;
+            }
+            if e as i64 != -1 {
+                creds.euid = e as u32;
+            }
+            if s as i64 != -1 {
+                creds.suid = s as u32;
+            }
+            Ok(DispatchOutcome::Returned { value: 0 })
+        }
+
+        fn setresgid(this, cx, r: u64, e: u64, s: u64) {
+            let mut creds = this.creds.lock();
+            if r as i64 != -1 {
+                creds.rgid = r as u32;
+            }
+            if e as i64 != -1 {
+                creds.egid = e as u32;
+            }
+            if s as i64 != -1 {
+                creds.sgid = s as u32;
+            }
+            Ok(DispatchOutcome::Returned { value: 0 })
+        }
+
+        fn setreuid(this, cx, r: u64, e: u64) {
+            let mut creds = this.creds.lock();
+            if r as i64 != -1 {
+                creds.ruid = r as u32;
+            }
+            if e as i64 != -1 {
+                creds.euid = e as u32;
+            }
+            Ok(DispatchOutcome::Returned { value: 0 })
+        }
+
+        fn setregid(this, cx, r: u64, e: u64) {
+            let mut creds = this.creds.lock();
+            if r as i64 != -1 {
+                creds.rgid = r as u32;
+            }
+            if e as i64 != -1 {
+                creds.egid = e as u32;
+            }
+            Ok(DispatchOutcome::Returned { value: 0 })
+        }
+
+        fn setuid(this, cx, u: u64) {
+            let u = u as u32;
+            let mut creds = this.creds.lock();
+            creds.ruid = u;
+            creds.euid = u;
+            creds.suid = u;
+            Ok(DispatchOutcome::Returned { value: 0 })
+        }
+
+        fn setgid(this, cx, g: u64) {
+            let g = g as u32;
+            let mut creds = this.creds.lock();
+            creds.rgid = g;
+            creds.egid = g;
+            creds.sgid = g;
+            Ok(DispatchOutcome::Returned { value: 0 })
+        }
+
+        fn getresuid(this, cx, ruid_ptr: GuestPtr, euid_ptr: GuestPtr, suid_ptr: GuestPtr) {
+            let creds = this.cred_snapshot();
+            for (ptr, value) in [
+                (ruid_ptr, creds.ruid),
+                (euid_ptr, creds.euid),
+                (suid_ptr, creds.suid),
+            ] {
+                if ptr.0 == 0 {
+                    continue;
+                }
+                if cx.memory.write_bytes(ptr.0, &value.to_le_bytes()).is_err() {
+                    return Ok(LINUX_EFAULT.into());
+                }
+            }
+            Ok(DispatchOutcome::Returned { value: 0 })
+        }
+
+        fn getresgid(this, cx, rgid_ptr: GuestPtr, egid_ptr: GuestPtr, sgid_ptr: GuestPtr) {
+            let creds = this.cred_snapshot();
+            for (ptr, value) in [
+                (rgid_ptr, creds.rgid),
+                (egid_ptr, creds.egid),
+                (sgid_ptr, creds.sgid),
+            ] {
+                if ptr.0 == 0 {
+                    continue;
+                }
+                if cx.memory.write_bytes(ptr.0, &value.to_le_bytes()).is_err() {
+                    return Ok(LINUX_EFAULT.into());
+                }
+            }
+            Ok(DispatchOutcome::Returned { value: 0 })
+        }
+
+        fn getgroups(this, cx, size: u64, list: GuestPtr) {
+            let size = size as i32;
+            if size < 0 {
+                return Ok(LINUX_EINVAL.into());
+            }
+            if size == 0 {
+                return Ok(DispatchOutcome::Returned { value: 1 });
+            }
+            if size < 1 {
+                return Ok(LINUX_EINVAL.into());
+            }
+            if cx.memory.write_bytes(list.0, &0u32.to_le_bytes()).is_err() {
                 return Ok(LINUX_EFAULT.into());
             }
+            Ok(DispatchOutcome::Returned { value: 1 })
         }
-        Ok(DispatchOutcome::Returned { value: 0 })
-    }
 
-    fn getgroups(this, cx, size: u64, list: GuestPtr) {
-        let size = size as i32;
-        if size < 0 {
-            return Ok(LINUX_EINVAL.into());
+        fn sys_setfsuid(this, cx, _uid: u64) {
+            let creds = this.cred_snapshot();
+            Ok(DispatchOutcome::Returned {
+                value: i64::from(creds.euid),
+            })
         }
-        if size == 0 {
-            return Ok(DispatchOutcome::Returned { value: 1 });
+
+        fn sys_setfsgid(this, cx, _gid: u64) {
+            let creds = this.cred_snapshot();
+            Ok(DispatchOutcome::Returned {
+                value: i64::from(creds.egid),
+            })
         }
-        if size < 1 {
-            return Ok(LINUX_EINVAL.into());
+
+        fn sys_setgroups(this, cx, _size: u64, _list: GuestPtr) {
+            Ok(DispatchOutcome::Returned { value: 0 })
         }
-        if cx.memory.write_bytes(list.0, &0u32.to_le_bytes()).is_err() {
-            return Ok(LINUX_EFAULT.into());
+
+        fn sys_getpid(this, cx) {
+            Ok(this.getpid())
         }
-        Ok(DispatchOutcome::Returned { value: 1 })
-    }
 
-    fn sys_setfsuid(this, cx, _uid: u64) {
-        let creds = this.cred_snapshot();
-        Ok(DispatchOutcome::Returned {
-            value: i64::from(creds.euid),
-        })
-    }
+        fn sys_getppid(this, cx) {
+            let bootstrap_host_pid = this.proc.lock().bootstrap_host_pid;
+            let value = if std::process::id() == bootstrap_host_pid {
+                LINUX_BOOTSTRAP_PID as i64
+            } else {
+                unsafe { libc::getppid() as i64 }
+            };
+            Ok(DispatchOutcome::Returned { value })
+        }
 
-    fn sys_setfsgid(this, cx, _gid: u64) {
-        let creds = this.cred_snapshot();
-        Ok(DispatchOutcome::Returned {
-            value: i64::from(creds.egid),
-        })
-    }
+        fn sys_getuid(this, cx) {
+            let creds = this.cred_snapshot();
+            Ok(DispatchOutcome::Returned {
+                value: i64::from(creds.ruid),
+            })
+        }
 
-    fn sys_setgroups(this, cx, _size: u64, _list: GuestPtr) {
-        Ok(DispatchOutcome::Returned { value: 0 })
-    }
+        fn sys_geteuid(this, cx) {
+            let creds = this.cred_snapshot();
+            Ok(DispatchOutcome::Returned {
+                value: i64::from(creds.euid),
+            })
+        }
 
-    fn sys_getpid(this, cx) {
-        Ok(this.getpid())
-    }
+        fn sys_getgid(this, cx) {
+            let creds = this.cred_snapshot();
+            Ok(DispatchOutcome::Returned {
+                value: i64::from(creds.rgid),
+            })
+        }
 
-    fn sys_getppid(this, cx) {
-        let bootstrap_host_pid = this.proc.lock().bootstrap_host_pid;
-        let value = if std::process::id() == bootstrap_host_pid {
-            LINUX_BOOTSTRAP_PID as i64
-        } else {
-            unsafe { libc::getppid() as i64 }
-        };
-        Ok(DispatchOutcome::Returned { value })
+        fn sys_getegid(this, cx) {
+            let creds = this.cred_snapshot();
+            Ok(DispatchOutcome::Returned {
+                value: i64::from(creds.egid),
+            })
+        }
     }
-
-    fn sys_getuid(this, cx) {
-        let creds = this.cred_snapshot();
-        Ok(DispatchOutcome::Returned {
-            value: i64::from(creds.ruid),
-        })
-    }
-
-    fn sys_geteuid(this, cx) {
-        let creds = this.cred_snapshot();
-        Ok(DispatchOutcome::Returned {
-            value: i64::from(creds.euid),
-        })
-    }
-
-    fn sys_getgid(this, cx) {
-        let creds = this.cred_snapshot();
-        Ok(DispatchOutcome::Returned {
-            value: i64::from(creds.rgid),
-        })
-    }
-
-    fn sys_getegid(this, cx) {
-        let creds = this.cred_snapshot();
-        Ok(DispatchOutcome::Returned {
-            value: i64::from(creds.egid),
-        })
-    }
-}
 }
 
 fn read_capability_header(
