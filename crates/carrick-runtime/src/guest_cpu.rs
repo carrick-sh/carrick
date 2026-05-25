@@ -26,7 +26,11 @@ use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 /// be lock-free — a global lock here serialized all vCPU threads on every
 /// syscall and throttled multi-threaded guests (e.g. Go's netpoller +
 /// goroutine M's). Each thread claims a slot once and `fetch_add`s into it;
-/// readers sum the array. 512 slots covers any realistic thread count.
+/// readers sum the array. Slots are intentionally not recycled: the value in a
+/// departed thread's slot remains part of process-total CPU time, and recycling
+/// through TLS destructors would complicate fork reset semantics. 512 slots
+/// covers realistic active-lifetime vCPU thread counts; overflow shares the
+/// last slot, which preserves total accounting because updates are atomic.
 const MAX_VCPUS: usize = 512;
 #[allow(clippy::declare_interior_mutable_const)]
 static EXEC_SLOTS: [AtomicU64; MAX_VCPUS] = [const { AtomicU64::new(0) }; MAX_VCPUS];
