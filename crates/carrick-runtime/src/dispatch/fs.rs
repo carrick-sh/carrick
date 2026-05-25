@@ -587,7 +587,7 @@ impl SyscallDispatcher {
                     metadata,
                     contents,
                     offset: 0,
-                    status_flags: flags & !LINUX_O_CLOEXEC,
+                    base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
                     writable,
                 },
                 None,
@@ -600,7 +600,7 @@ impl SyscallDispatcher {
                 OpenDescription::HostFile {
                     host_fd,
                     metadata,
-                    status_flags: flags & !LINUX_O_CLOEXEC,
+                    base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
                     writable,
                 },
                 Some(HostFdRef::new(host_fd)),
@@ -615,7 +615,7 @@ impl SyscallDispatcher {
                         metadata,
                         entries,
                         offset: 0,
-                        status_flags: flags & !LINUX_O_CLOEXEC,
+                        base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
                     },
                     None,
                 )
@@ -673,7 +673,7 @@ impl SyscallDispatcher {
                         OpenDescription::HostFile {
                             host_fd,
                             metadata,
-                            status_flags: flags & !LINUX_O_CLOEXEC,
+                            base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
                             writable: true,
                         },
                         Some(HostFdRef::new(host_fd)),
@@ -696,7 +696,7 @@ impl SyscallDispatcher {
                             metadata,
                             contents: Vec::new(),
                             offset: 0,
-                            status_flags: flags & !LINUX_O_CLOEXEC,
+                            base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
                             writable: writable_request || want_create,
                         },
                         None,
@@ -789,7 +789,7 @@ impl SyscallDispatcher {
                     Arc::new(RwLock::new(OpenDescription::HostPipe {
                         host_fd: duped,
                         is_read_end: old_fd == 0,
-                        status_flags: 0,
+                        base: OpenDescriptionBase::new(0),
                         pty: None,
                     })),
                     Some(HostFdRef::new(duped)),
@@ -871,7 +871,7 @@ impl SyscallDispatcher {
                     Arc::new(RwLock::new(OpenDescription::HostPipe {
                         host_fd,
                         is_read_end,
-                        status_flags: status_flags as u64,
+                        base: OpenDescriptionBase::new(status_flags as u64),
                         pty: None,
                     })),
                     linux_fd_flags_from_open_flags(flags),
@@ -893,7 +893,9 @@ impl SyscallDispatcher {
                         path,
                         contents,
                         offset: 0,
-                        status_flags: ((status_flags as u64) | flags) & !LINUX_O_CLOEXEC,
+                        base: OpenDescriptionBase::new(
+                            ((status_flags as u64) | flags) & !LINUX_O_CLOEXEC,
+                        ),
                     })),
                     linux_fd_flags_from_open_flags(flags),
                 );
@@ -915,7 +917,7 @@ impl SyscallDispatcher {
                         // A pty end is bidirectional; route reads and
                         // writes through the host fd like /dev/null.
                         is_read_end: true,
-                        status_flags: status_flags as u64,
+                        base: OpenDescriptionBase::new(status_flags as u64),
                         pty: Some(crate::vfs::PtyRole {
                             index: pts_index,
                             is_master,
@@ -969,7 +971,7 @@ impl SyscallDispatcher {
                         metadata,
                         entries: rootfs_entries,
                         offset: 0,
-                        status_flags: status_flags as u64,
+                        base: OpenDescriptionBase::new(status_flags as u64),
                     })),
                     linux_fd_flags_from_open_flags(flags),
                 );
@@ -1239,8 +1241,8 @@ impl SyscallDispatcher {
         let open_file = self.open_file(fd)?;
         let open = open_file.description.read();
         match &*open {
-            OpenDescription::PipeReader { pipe, status_flags } => {
-                Some((Arc::clone(pipe), *status_flags))
+            OpenDescription::PipeReader { base, pipe } => {
+                Some((Arc::clone(pipe), base.status_flags()))
             }
             _ => None,
         }
@@ -1533,15 +1535,15 @@ impl SyscallDispatcher {
                         return write_host_pipe(bytes, *host_fd, nonblocking);
                     }
                     OpenDescription::HostFile {
+                        base,
                         host_fd,
                         writable,
-                        status_flags,
                         ..
                     } => {
                         if !*writable {
                             return DispatchOutcome::errno(LINUX_EBADF);
                         }
-                        if *status_flags & LINUX_O_APPEND != 0 {
+                        if base.status_flags() & LINUX_O_APPEND != 0 {
                             unsafe { libc::lseek(*host_fd, 0, libc::SEEK_END) };
                         }
                         return write_host_pipe(bytes, *host_fd, nonblocking);
@@ -2031,7 +2033,7 @@ define_syscall! {
             Arc::new(RwLock::new(OpenDescription::HostPipe {
                 host_fd: host_read,
                 is_read_end: true,
-                status_flags: LINUX_O_RDONLY | nonblock,
+                base: OpenDescriptionBase::new(LINUX_O_RDONLY | nonblock),
                 pty: None,
             })),
             fd_flags,
@@ -2041,7 +2043,7 @@ define_syscall! {
             Arc::new(RwLock::new(OpenDescription::HostPipe {
                 host_fd: host_write,
                 is_read_end: false,
-                status_flags: LINUX_O_WRONLY | nonblock,
+                base: OpenDescriptionBase::new(LINUX_O_WRONLY | nonblock),
                 pty: None,
             })),
             fd_flags,
@@ -2116,7 +2118,7 @@ define_syscall! {
                     Arc::new(RwLock::new(OpenDescription::HostPipe {
                         host_fd: duped,
                         is_read_end: old_fd.0 == 0,
-                        status_flags: 0,
+                        base: OpenDescriptionBase::new(0),
                         pty: None,
                     })),
                     Some(HostFdRef::new(duped)),
@@ -3126,13 +3128,13 @@ define_syscall! {
                 contents, offset, ..
             } => (contents, offset),
             OpenDescription::EventFd {
+                base,
                 state,
                 semaphore,
-                status_flags,
             } => {
                 let state = Arc::clone(state);
                 let semaphore = *semaphore;
-                let nonblocking = *status_flags & LINUX_O_NONBLOCK != 0;
+                let nonblocking = base.status_flags() & LINUX_O_NONBLOCK != 0;
                 drop(open);
                 return Ok(read_eventfd(
                     memory,
@@ -3143,17 +3145,14 @@ define_syscall! {
                     nonblocking,
                 ));
             }
-            OpenDescription::TimerFd {
-                state,
-                status_flags,
-            } => {
+            OpenDescription::TimerFd { base, state } => {
                 let state = Arc::clone(state);
-                let nonblocking = *status_flags & LINUX_TFD_NONBLOCK != 0;
+                let nonblocking = base.status_flags() & LINUX_TFD_NONBLOCK != 0;
                 drop(open);
                 return Ok(read_timerfd(memory, address, length, &state, nonblocking));
             }
-            OpenDescription::PipeReader { pipe, status_flags } => {
-                return Ok(read_pipe(memory, address, length, pipe, *status_flags));
+            OpenDescription::PipeReader { base, pipe } => {
+                return Ok(read_pipe(memory, address, length, pipe, base.status_flags()));
             }
             OpenDescription::HostPipe {
                 host_fd,
@@ -4043,9 +4042,9 @@ define_syscall! {
                         return Ok(write_host_pipe(&bytes, *host_fd, nonblocking));
                     }
                     OpenDescription::HostFile {
+                        base,
                         host_fd,
                         writable,
-                        status_flags,
                         ..
                     } => {
                         if !*writable {
@@ -4056,7 +4055,7 @@ define_syscall! {
                         // host fd isn't opened O_APPEND, so we emulate the
                         // seek-then-write; single-writer, which covers the
                         // shell/dpkg append cases.)
-                        if *status_flags & LINUX_O_APPEND != 0 {
+                        if base.status_flags() & LINUX_O_APPEND != 0 {
                             unsafe { libc::lseek(*host_fd, 0, libc::SEEK_END) };
                         }
                         // libc::write to the real fd: advances the
@@ -4171,9 +4170,9 @@ define_syscall! {
                             writeback = FileWriteback::None;
                         }
                         OpenDescription::HostFile {
+                            base,
                             host_fd,
                             writable,
-                            status_flags,
                             ..
                         } => {
                             if !*writable {
@@ -4183,7 +4182,7 @@ define_syscall! {
                             // libc::write to the real fd advances the shared
                             // kernel offset (visible across fork and to the
                             // readv that follows).
-                            if *status_flags & LINUX_O_APPEND != 0 {
+                            if base.status_flags() & LINUX_O_APPEND != 0 {
                                 unsafe { libc::lseek(*host_fd, 0, libc::SEEK_END) };
                             }
                             outcome = write_host_pipe(&bytes, *host_fd, nonblocking);

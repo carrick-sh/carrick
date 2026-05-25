@@ -12,7 +12,7 @@ define_syscall! {
         }
         let description = OpenDescription::TimerFd {
             state: Arc::new(TimerFdState::new(clock_id)),
-            status_flags: flags & LINUX_TFD_NONBLOCK,
+            base: OpenDescriptionBase::new(flags & LINUX_TFD_NONBLOCK),
         };
         Ok(this.install_fd(description, linux_fd_flags_from_open_flags(flags)))
     }
