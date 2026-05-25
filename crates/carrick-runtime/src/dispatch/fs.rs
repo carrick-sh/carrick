@@ -1218,7 +1218,7 @@ impl SyscallDispatcher {
         let contents = match &*open {
             OpenDescription::File { contents, .. }
             | OpenDescription::SyntheticFile { contents, .. } => contents,
-            OpenDescription::HostFile { .. } => unreachable!("HostFile sendfile handled above"),
+            OpenDescription::HostFile { .. } => return Err(LINUX_EINVAL),
             OpenDescription::Directory { .. }
             | OpenDescription::EventFd { .. }
             | OpenDescription::TimerFd { .. }
@@ -3052,7 +3052,9 @@ define_syscall! {
                 return Ok(LINUX_ESPIPE.into());
             }
             // HostFile is handled by the early libc::lseek above.
-            OpenDescription::HostFile { .. } => unreachable!("HostFile lseek handled above"),
+            OpenDescription::HostFile { .. } => {
+                return Ok(LINUX_EINVAL.into());
+            }
             OpenDescription::EventFd { .. }
             | OpenDescription::TimerFd { .. }
             | OpenDescription::Epoll { .. }
@@ -3076,7 +3078,9 @@ define_syscall! {
             OpenDescription::File { offset, .. }
             | OpenDescription::Directory { offset, .. }
             | OpenDescription::SyntheticFile { offset, .. } => *offset = next as usize,
-            OpenDescription::HostFile { .. } => unreachable!("HostFile lseek handled above"),
+            OpenDescription::HostFile { .. } => {
+                return Ok(LINUX_EINVAL.into());
+            }
             OpenDescription::EventFd { .. }
             | OpenDescription::TimerFd { .. }
             | OpenDescription::Epoll { .. }
@@ -3267,7 +3271,9 @@ define_syscall! {
             | OpenDescription::SyntheticFile {
                 contents, offset, ..
             } => (contents, offset),
-            OpenDescription::HostFile { .. } => unreachable!("HostFile readv handled above"),
+            OpenDescription::HostFile { .. } => {
+                return Ok(LINUX_EINVAL.into());
+            }
             OpenDescription::Directory { .. }
             | OpenDescription::EventFd { .. }
             | OpenDescription::TimerFd { .. }
@@ -3326,7 +3332,9 @@ define_syscall! {
         let contents = match &*open {
             OpenDescription::File { contents, .. }
             | OpenDescription::SyntheticFile { contents, .. } => contents,
-            OpenDescription::HostFile { .. } => unreachable!("HostFile pread handled above"),
+            OpenDescription::HostFile { .. } => {
+                return Ok(LINUX_EINVAL.into());
+            }
             OpenDescription::Directory { .. }
             | OpenDescription::EventFd { .. }
             | OpenDescription::TimerFd { .. }
@@ -3407,7 +3415,9 @@ define_syscall! {
         let contents = match &*open {
             OpenDescription::File { contents, .. }
             | OpenDescription::SyntheticFile { contents, .. } => contents,
-            OpenDescription::HostFile { .. } => unreachable!("HostFile preadv handled above"),
+            OpenDescription::HostFile { .. } => {
+                return Ok(LINUX_EINVAL.into());
+            }
             OpenDescription::Directory { .. }
             | OpenDescription::EventFd { .. }
             | OpenDescription::TimerFd { .. }
@@ -3476,7 +3486,7 @@ define_syscall! {
         }
         let errno = match &*open {
             OpenDescription::File { .. } | OpenDescription::SyntheticFile { .. } => LINUX_EBADF,
-            OpenDescription::HostFile { .. } => unreachable!("handled above"),
+            OpenDescription::HostFile { .. } => LINUX_EINVAL,
             OpenDescription::Directory { .. } => LINUX_EISDIR,
             OpenDescription::PipeReader { .. }
             | OpenDescription::PipeWriter { .. }
@@ -3560,7 +3570,7 @@ define_syscall! {
         }
         let errno = match &*open {
             OpenDescription::File { .. } | OpenDescription::SyntheticFile { .. } => LINUX_EBADF,
-            OpenDescription::HostFile { .. } => unreachable!("handled above"),
+            OpenDescription::HostFile { .. } => LINUX_EINVAL,
             OpenDescription::Directory { .. } => LINUX_EISDIR,
             OpenDescription::PipeReader { .. }
             | OpenDescription::PipeWriter { .. }

@@ -400,6 +400,8 @@ The DAC (discretionary access control) check lives in `dispatch/mod.rs` — shou
 | `cargo test --lib thread::tests` | blocked | Sandboxed run failed in the USDT/DTrace build step (`dtrace: failed to open header file '/dev/stdout'`), before tests executed. Direct non-sandbox cargo commands now build. |
 | `cargo test --lib errno_translation_maps_unknown_darwin_extensions_to_eio -- --nocapture` | done | Red/green verified: initially leaked Darwin `ENOATTR` as `93`; now maps to Linux `EIO` (`5`). |
 | `cargo test --lib close_cloexec_fds_removes_marked_descriptors_only -- --nocapture` | done | Verifies CLOEXEC sweep removes marked descriptors and preserves unmarked ones. |
+| `cargo test --lib threaded_independent_dispatch_support_matches_handler_table -- --nocapture` | done | Verifies the thread-local syscall handler table stays covered by the non-panicking threaded-independent dispatch subset. |
+| `cargo check -p carrick-cli` | done | Verifies the CLI fallback for an unnormalized `shell` command compiles. |
 
 ### Tier 1
 
@@ -409,7 +411,7 @@ The DAC (discretionary access control) check lives in `dispatch/mod.rs` — shou
 | 2 | Audit `EPOLL_INMEM_KQUEUES` x `open_files` lock ordering | done | `notify_inmem_epoll()` holds only `EPOLL_INMEM_KQUEUES` while triggering kqueues and does not acquire dispatcher fd/open-description locks. |
 | 3 | Extend lock ordering comment | done | Comment now covers `pty_table`, `EPOLL_INMEM_KQUEUES`, and the no-blocking/guest-memory rule; CLOEXEC sweep now drops `open_files` before pty cleanup. |
 | 4 | Fix host fd leak in `mmap` `map_shared_file` failure path | stale | Current `GuestMemory::map_shared_file` contract transfers fd ownership even on failure; default impl closes it, and HVF path closes in `OwnedHostMapping::map_shared_file` before returning. |
-| 5 | Replace `unreachable!()` with error returns in dispatch match | open | Scope to runtime/dispatch paths reachable from guest-controlled state; test before change. |
+| 5 | Replace `unreachable!()` with error returns in dispatch match | done | Production `unreachable!()` calls were removed from CLI/runtime/dispatch paths. Guest-facing unexpected outcomes now return `EINTR`, `ENOSYS`, or `EINVAL`; only the integration-test assertion helper still uses `unreachable!()`. |
 | 6 | Fix concatenated doc comments | done | `deliver_pending_signal` and `shared_futex_wait` now have separate doc blocks attached to the right functions. |
 
 ### Tier 2
