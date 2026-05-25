@@ -6,8 +6,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 // LOCK ORDERING: dispatch handlers must not hold subsystem locks while entering
 // guest-memory callbacks or blocking host waits. When multiple dispatcher
 // locks are unavoidable, acquire fd/open-description state before filesystem
-// overlay state, then proc/signal/thread registries. Futex waits are prepared
-// under dispatcher state and parked only after those locks have been released.
+// overlay state, then pty_table, then proc/signal/thread registries. The
+// EPOLL_INMEM_KQUEUES registry is independent and must not be held while
+// acquiring dispatcher fd/open-description locks; in-memory wake broadcasts only
+// trigger already-registered kqueues. Futex waits are prepared under dispatcher
+// state and parked only after those locks have been released.
 
 use crate::compat::{CompatEvent, CompatReporter, SyscallArgs};
 use crate::fs_backend::FsBackend;
@@ -1816,37 +1819,27 @@ impl SyscallDispatcher {
     /// remove it and run close_open_file (which honours the Rc-count
     /// guard, so we don't close a host fd a sibling fd still aliases).
     pub fn close_cloexec_fds(&self) {
-        let cloexec_fds: Vec<i32> = self
-            .io
-            .open_files
-            .read()
-            .iter()
-            .filter_map(|(fd, of)| {
-                if of.fd_flags & LINUX_FD_CLOEXEC != 0 {
-                    Some(*fd)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        let mut table = self.io.open_files.write();
-        for fd in cloexec_fds {
-            if let Some(open_file) = table.remove(&fd) {
-                // Drop the write lock before touching pty_table (a separate
-                // lock) so there is no lock-order issue: open_files write is
-                // released by removing the entry; we free the pty outside the
-                // map iteration. Here we inline the pty-check because the
-                // table write lock is already held and we need to release it
-                // before calling pty_table (different subsystem). We capture
-                // the index while we still have the OpenFile in hand, then
-                // free after the write lock is released below.
-                //
-                // Actually: the write lock is held for the duration of the
-                // loop, not per-iteration, but pty_table is a separate Mutex
-                // with no lock-ordering dependency on open_files, so calling
-                // self.close_open_file_and_free_pty here is safe.
-                self.close_open_file_and_free_pty(&open_file);
-            }
+        let removed: Vec<OpenFile> = {
+            let mut table = self.io.open_files.write();
+            let cloexec_fds: Vec<i32> = table
+                .iter()
+                .filter_map(|(fd, of)| {
+                    if of.fd_flags & LINUX_FD_CLOEXEC != 0 {
+                        Some(*fd)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            cloexec_fds
+                .into_iter()
+                .filter_map(|fd| table.remove(&fd))
+                .collect()
+        };
+
+        for open_file in removed {
+            self.close_open_file_and_free_pty(&open_file);
         }
     }
 
@@ -3987,8 +3980,11 @@ pub fn macos_to_linux_errno(macos: i32) -> i32 {
             x if x == libc::ENOMSG => ENOMSG,
             x if x == libc::EILSEQ => EILSEQ,
             x if x == libc::EBADMSG => EBADMSG,
-            // Codes 1..=34 overlap; anything else falls through.
-            other => other,
+            // Codes 1..=34 overlap; unmapped Darwin extension errnos above
+            // that range are not Linux numbers, so collapse them to EIO
+            // rather than leaking host-specific values to the guest.
+            other if (1..=34).contains(&other) => other,
+            _ => EIO,
         }
     }
     #[cfg(not(target_os = "macos"))]
@@ -4173,6 +4169,34 @@ mod overlay_dispatch_tests {
             Err(_) => panic!("expected next fd install to succeed"),
         };
         assert_eq!(next, 6);
+    }
+
+    #[test]
+    fn close_cloexec_fds_removes_marked_descriptors_only() {
+        let dispatcher = SyscallDispatcher::new();
+        let keep_fd = match dispatcher.install_fd_at_or_above(3, eventfd_open_file(1)) {
+            Ok(fd) => fd,
+            Err(_) => panic!("expected keep fd install to succeed"),
+        };
+        let cloexec_fd = match dispatcher.install_fd_at_or_above(
+            3,
+            OpenFile::new(
+                Arc::new(RwLock::new(OpenDescription::EventFd {
+                    state: Arc::new(EventFdState::new(2)),
+                    semaphore: false,
+                    status_flags: 0,
+                })),
+                LINUX_FD_CLOEXEC,
+            ),
+        ) {
+            Ok(fd) => fd,
+            Err(_) => panic!("expected cloexec fd install to succeed"),
+        };
+
+        dispatcher.close_cloexec_fds();
+
+        assert!(dispatcher.fd_is_valid(keep_fd));
+        assert!(!dispatcher.fd_is_valid(cloexec_fd));
     }
 
     #[test]
@@ -4573,6 +4597,15 @@ mod overlay_dispatch_tests {
             macos_to_linux_errno(libc::ECANCELED),
             linux_errno::ECANCELED
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn errno_translation_maps_unknown_darwin_extensions_to_eio() {
+        use crate::dispatch::{linux_errno, macos_to_linux_errno};
+
+        assert_eq!(macos_to_linux_errno(libc::ENOATTR), linux_errno::EIO);
+        assert_eq!(macos_to_linux_errno(999), linux_errno::EIO);
     }
 
     #[cfg(target_os = "macos")]
