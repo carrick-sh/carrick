@@ -419,6 +419,9 @@ The DAC (discretionary access control) check lives in `dispatch/mod.rs` — shou
 | `cargo test -p carrick-test-support` | done | Verifies the shared test helper crate builds and its doctest harness is clean. |
 | `cargo test -p carrick-cli --test cli rootfs_cli_lists_and_reads_composed_layers -- --nocapture` | done | Verifies CLI tests consume the shared gzip/tar helper. |
 | `cargo test -p carrick-runtime --test runtime_loop -- --nocapture` | done | Verifies the split single-threaded runtime path still handles static ELF dispatch, rootfs file/dir operations, and trap-limit reporting after dispatch-loop extraction. |
+| `rg -n "notify_inmem_epoll\\(" crates/carrick-runtime/src/dispatch -g '*.rs'` | done | Shows the O(n) broadcast is now only the `write_eventfd` fallback; eventfd readiness has a host pipe watched by epoll kqueues via `EVFILT_READ`. |
+| `cargo test -p carrick-runtime --test integration epoll_reports_eventfd_readiness_with_packed_events -- --nocapture` | done | Verifies eventfd readiness is visible through epoll. |
+| `cargo test -p carrick-runtime --test integration epoll_edge_triggered_eventfd_reports_only_new_readiness -- --nocapture` | done | Verifies eventfd edge-triggered epoll readiness still reports only new readiness transitions. |
 
 ### Tier 1
 
@@ -458,7 +461,7 @@ The DAC (discretionary access control) check lives in `dispatch/mod.rs` — shou
 | 22 | Expand conformance probes | deferred | Ongoing program, not one bounded patch. |
 | 23 | Consider mmap arena reclamation | done | Current `MemState` has `free_regions` reuse and tail-trim logic; added a focused regression and fixed the stale top-level mmap arena comment. |
 | 24 | Fix `epoll_ctl MOD` atomicity | done | MOD now applies new kqueue filters before deleting filters removed by the new mask, avoiding the old delete-then-add no-interest gap; added helper tests for filter selection and removed-filter changes. |
-| 25 | Address `EPOLL_INMEM_KQUEUES` O(n) broadcast scalability | open | Design-sized scalability change. |
+| 25 | Address `EPOLL_INMEM_KQUEUES` O(n) broadcast scalability | done | Current eventfd readiness is host-backed by a nonblocking pipe, so epoll instances watch it natively through their kqueues; the O(n) `notify_inmem_epoll()` call remains only as a fallback for rare readiness-pipe failure/legacy synthetic readiness. |
 | 26 | Implement `MAP_SHARED` writeback | deferred | Multi-day semantic feature; needs conformance spec. |
 | 27 | Add module-level docs to all files | done | Added leading `//!` docs to all production source files that lacked them, and converted the `fs_backend` and `overlay` file headers into module docs. |
 | 28 | Unify `run_cli()` logging | done | Replaced warning/status `eprintln!` calls in the CLI with `tracing::warn!`; retained the panic hook's direct stderr banner because it is process-abort reporting, not normal logging. |
