@@ -1,20 +1,20 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
-use carrick::compat::{CompatReportFormat, CompatReporter, SyscallArgs};
-use carrick::dispatch::{LinearMemory, SyscallDispatcher, SyscallRequest};
-use carrick::elf::{inspect_elf, plan_elf_load};
-use carrick::fs_backend::{FsBackend, HostFsBackend, MemoryBackend};
-use carrick::memory::AddressSpace;
-use carrick::oci::{ImageReference, ImageStore, pull_image};
-use carrick::rootfs::RootFs;
-use carrick::runtime::{
+use carrick_runtime::compat::{CompatReportFormat, CompatReporter, SyscallArgs};
+use carrick_runtime::dispatch::{LinearMemory, SyscallDispatcher, SyscallRequest};
+use carrick_runtime::elf::{inspect_elf, plan_elf_load};
+use carrick_runtime::fs_backend::{FsBackend, HostFsBackend, MemoryBackend};
+use carrick_runtime::memory::AddressSpace;
+use carrick_runtime::oci::{ImageReference, ImageStore, pull_image};
+use carrick_runtime::rootfs::RootFs;
+use carrick_runtime::runtime::{
     DEFAULT_MAX_TRAPS, DebugStateSnapshot, run_elf_from_dispatcher_debug,
     run_rootfs_elf_with_hvf_args_and_dispatcher_debug,
     run_static_elf_with_hvf_args_and_dispatcher_debug,
 };
-use carrick::syscall::{aarch64_table, lookup_aarch64};
-use carrick::trap::hvf_capabilities;
+use carrick_runtime::syscall::{aarch64_table, lookup_aarch64};
+use carrick_runtime::trap::hvf_capabilities;
 use clap::{Parser, Subcommand};
 
 /// Which writable-layer backend to install on the SyscallDispatcher.
@@ -279,18 +279,18 @@ fn setup_interactive_stdio(
     dispatcher: &mut SyscallDispatcher,
     tty: bool,
     raw: bool,
-) -> anyhow::Result<Option<carrick::interactive_supervisor::InteractiveParent>> {
+) -> anyhow::Result<Option<carrick_runtime::interactive_supervisor::InteractiveParent>> {
     if !tty {
         if raw {
             dispatcher.set_stream_stdio(true);
         }
         return Ok(None);
     }
-    match carrick::interactive_supervisor::fork_interactive_session()
+    match carrick_runtime::interactive_supervisor::fork_interactive_session()
         .context("failed to create interactive session supervisor")?
     {
-        carrick::interactive_supervisor::SupervisorFork::Parent(parent) => Ok(Some(parent)),
-        carrick::interactive_supervisor::SupervisorFork::Child(child) => {
+        carrick_runtime::interactive_supervisor::SupervisorFork::Parent(parent) => Ok(Some(parent)),
+        carrick_runtime::interactive_supervisor::SupervisorFork::Child(child) => {
             child
                 .adopt_stdio(dispatcher)
                 .context("failed to adopt interactive pty in runtime child")?;
@@ -548,7 +548,7 @@ fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     .rsplit('/')
                     .next()
                     .unwrap_or(executable_path);
-                carrick::dispatch::set_host_process_name(base.as_bytes());
+                carrick_runtime::dispatch::set_host_process_name(base.as_bytes());
             }
 
             // Resolve --fs (or the default) early so we can branch before
@@ -923,13 +923,13 @@ fn run_cli(cli: Cli) -> anyhow::Result<()> {
                         })?),
                         None => None,
                     };
-                let opts = carrick::dtrace_consumer::TraceOptions {
+                let opts = carrick_runtime::dtrace_consumer::TraceOptions {
                     flowindent,
                     script: script_src,
                     out_path: trace_out.as_ref().map(|p| p.to_string_lossy().into_owned()),
                     drop_credentials: trace_drop_credentials(trace_uid, trace_gid, &trace_groups),
                 };
-                carrick::dtrace_consumer::run_child_under_dtrace(&me, &command, &opts)
+                carrick_runtime::dtrace_consumer::run_child_under_dtrace(&me, &command, &opts)
                     .map_err(|e| anyhow::anyhow!("trace failed: {}", e))?;
             }
             #[cfg(not(target_os = "macos"))]
@@ -950,7 +950,7 @@ fn run_cli(cli: Cli) -> anyhow::Result<()> {
         #[cfg(target_os = "macos")]
         Commands::Volume { command } => match command {
             VolumeCommand::Create { quota } => {
-                let v = carrick::apfs::create_carrick_volume(quota)
+                let v = carrick_runtime::apfs::create_carrick_volume(quota)
                     .context("failed to create carrick scratch volume")?;
                 println!(
                     "{} {} {} case-sensitive={}",
@@ -964,7 +964,7 @@ fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 );
             }
             VolumeCommand::Info => {
-                match carrick::apfs::find_carrick_volume()
+                match carrick_runtime::apfs::find_carrick_volume()
                     .context("failed to query carrick scratch volume")?
                 {
                     Some(v) => {
@@ -987,7 +987,7 @@ fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 }
             }
             VolumeCommand::Delete { yes } => {
-                let Some(v) = carrick::apfs::find_carrick_volume()
+                let Some(v) = carrick_runtime::apfs::find_carrick_volume()
                     .context("failed to query carrick scratch volume")?
                 else {
                     println!("no carrick scratch volume to delete");
@@ -1000,7 +1000,7 @@ fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     );
                     return Ok(());
                 }
-                carrick::apfs::delete_carrick_volume()
+                carrick_runtime::apfs::delete_carrick_volume()
                     .context("failed to delete carrick scratch volume")?;
                 println!("deleted {} ({})", v.device, v.name);
             }
@@ -1080,7 +1080,7 @@ fn install_fs_backend(
 /// no OCI rootfs to supply `/tmp`, passwd/group databases, or resolver files;
 /// enough real software assumes those paths exist that Carrick seeds them for
 /// both memory and host backends.
-fn seed_guest_baseline(backend: &mut dyn carrick::fs_backend::FsBackend) {
+fn seed_guest_baseline(backend: &mut dyn carrick_runtime::fs_backend::FsBackend) {
     use std::net::ToSocketAddrs;
     for dir in [
         "/tmp",
@@ -1153,7 +1153,7 @@ fn default_fs_backend_kind() -> FsBackendKind {
     // Otherwise the decision and the real scratch location disagree: the
     // dedicated volume can be case-sensitive while `~/.carrick` is not, and we
     // would wrongly fall back to the in-memory backend.
-    let probe = carrick::apfs::preferred_scratch_root()
+    let probe = carrick_runtime::apfs::preferred_scratch_root()
         .unwrap_or_else(|_| std::env::temp_dir().join("carrick-scratch"));
     if std::fs::create_dir_all(&probe).is_err() {
         return FsBackendKind::Memory;
@@ -1215,7 +1215,7 @@ fn trace_drop_credentials(
     trace_uid: Option<u32>,
     trace_gid: Option<u32>,
     trace_groups: &[u32],
-) -> Option<carrick::dtrace_consumer::TraceDropCredentials> {
+) -> Option<carrick_runtime::dtrace_consumer::TraceDropCredentials> {
     let (uid, gid) = match (trace_uid, trace_gid) {
         (Some(uid), Some(gid)) => (uid, gid),
         _ => {
@@ -1225,7 +1225,7 @@ fn trace_drop_credentials(
         }
     };
 
-    Some(carrick::dtrace_consumer::TraceDropCredentials {
+    Some(carrick_runtime::dtrace_consumer::TraceDropCredentials {
         uid,
         gid,
         groups: normalize_trace_groups(gid, trace_groups),
@@ -1279,7 +1279,7 @@ fn exec_trace_child(
 /// carrick host process's fd 1 / fd 2 instead of wrapping them in JSON.
 /// This makes carrick feel like a normal command runner: `carrick run
 /// alpine /bin/busybox echo hi --raw` prints just `hi`.
-fn emit_raw(result: &carrick::runtime::RunResult) {
+fn emit_raw(result: &carrick_runtime::runtime::RunResult) {
     use std::io::Write;
     let _ = std::io::stdout().write_all(&result.stdout);
     let _ = std::io::stderr().write_all(&result.stderr);
@@ -1386,7 +1386,7 @@ fn decode_esr_el1(value: u64) -> serde_json::Value {
 }
 
 fn register_dtrace_probes() {
-    match carrick::probes::register_dtrace_probes() {
+    match carrick_runtime::probes::register_dtrace_probes() {
         Ok(()) => {
             if std::env::var_os("CARRICK_DTRACE_DEBUG").is_some() {
                 eprintln!(

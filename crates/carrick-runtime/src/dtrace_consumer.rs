@@ -15,14 +15,14 @@ use std::path::Path;
 
 /// Bundled D program. Mirrors `scripts/syscalls.d` so the build artifact
 /// is self-contained.
-pub const BUNDLED_D_SCRIPT: &str = include_str!("../scripts/syscalls.d");
+pub const BUNDLED_D_SCRIPT: &str = include_str!("../../../scripts/syscalls.d");
 
 /// Bundled guest stack-walker D program (`scripts/guest_stack.d`).
 /// copyin-walks the guest aarch64 frame-pointer chain from the
 /// `vcpu-trap` probe's GuestRegs struct. Selected by `carrick trace
 /// --stack`. NOTE: uses `#define` macros, so it must be compiled with
 /// the C preprocessor enabled (DTRACE_C_CPP).
-pub const BUNDLED_GUEST_STACK_D: &str = include_str!("../scripts/guest_stack.d");
+pub const BUNDLED_GUEST_STACK_D: &str = include_str!("../../../scripts/guest_stack.d");
 
 const DTRACE_VERSION: c_int = 3;
 const DTRACE_PROBESPEC_NAME: c_int = 3;
