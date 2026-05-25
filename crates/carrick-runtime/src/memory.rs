@@ -1600,10 +1600,21 @@ mod stage1_tests {
             "L1A[0] must point at the L2 sub-table"
         );
 
-        // L1A[1..511] must be USER 1 GiB BLOCK descriptors:
-        //   AP=01, PXN=1, UXN=0 (FEAT_PAN3-safe user mapping).
+        // L1A[1..511] are USER 1 GiB BLOCK descriptors (AP=01, PXN=1, UXN=0),
+        // EXCEPT the entry covering the kernel hole, which is a TABLE → L2_B.
+        let kernel_l1_index = (LINUX_KERNEL_REGION_BASE >> 30) as usize;
         for index in 1..512usize {
             let d = read_u64_le(&bytes, 0x1000 + index * 8);
+            if index == kernel_l1_index {
+                assert!(valid_table(d), "L1A[{}] (kernel hole) must be a table", index);
+                assert_eq!(
+                    d & 0x0000_FFFF_FFFF_F000,
+                    LINUX_PAGE_TABLES_BASE + 0x4000,
+                    "L1A[{}] must point at L2_B",
+                    index
+                );
+                continue;
+            }
             assert!(valid_block(d), "L1A[{}] must be a block", index);
             assert_eq!(ap(d), 0b01, "L1A[{}] AP must be 01", index);
             assert_eq!(pxn(d), 1, "L1A[{}] PXN must be 1", index);
@@ -1631,22 +1642,18 @@ mod stage1_tests {
             );
         }
 
-        // L2[0] is the KERNEL 2 MiB block (AP=00, PXN=0, UXN=1) covering 0..2 MiB.
+        // L2_A[0] is now a TABLE → L3_A (so the null guard can stay unmapped);
+        // L2_A[1..511] are user 2 MiB blocks covering 2 MiB..1 GiB.
         let l2_0 = read_u64_le(&bytes, 0x3000);
-        assert!(valid_block(l2_0), "L2[0] must be a block");
-        assert_eq!(ap(l2_0), 0b00, "L2[0] kernel block must use AP=00");
-        assert_eq!(pxn(l2_0), 0, "L2[0] PXN must be 0 (EL1 fetches trampoline)");
+        assert!(valid_table(l2_0), "L2_A[0] must be a table → L3_A");
         assert_eq!(
-            uxn(l2_0),
-            1,
-            "L2[0] UXN must be 1 (EL0 cannot fetch kernel)"
+            l2_0 & 0x0000_FFFF_FFFF_F000,
+            LINUX_PAGE_TABLES_BASE + 0x5000,
+            "L2_A[0] must point at L3_A"
         );
-        assert_eq!(l2_0 & 0x0000_FFFF_FFE0_0000, 0);
-
-        // L2[1..511] user 2 MiB blocks covering 2 MiB..1 GiB.
         for index in 1..512usize {
             let d = read_u64_le(&bytes, 0x3000 + index * 8);
-            assert!(valid_block(d), "L2[{}] must be a block", index);
+            assert!(valid_block(d), "L2_A[{}] must be a block", index);
             assert_eq!(ap(d), 0b01);
             assert_eq!(pxn(d), 1);
             assert_eq!(uxn(d), 0);
@@ -1655,6 +1662,37 @@ mod stage1_tests {
                 d & 0x0000_FFFF_FFE0_0000,
                 expected_pa & 0x0000_FFFF_FFE0_0000
             );
+        }
+
+        // L2_B (base+0x4000): block 0 is the KERNEL 2 MiB hole (AP=00, PXN=0,
+        // UXN=1) at PA = kernel region base; the rest are user 2 MiB blocks.
+        let l2b_base_pa = (kernel_l1_index as u64) << 30;
+        let l2b_0 = read_u64_le(&bytes, 0x4000);
+        assert!(valid_block(l2b_0), "L2_B[0] must be a block");
+        assert_eq!(ap(l2b_0), 0b00, "L2_B[0] kernel block must use AP=00");
+        assert_eq!(pxn(l2b_0), 0, "L2_B[0] PXN must be 0 (EL1 fetches trampoline)");
+        assert_eq!(uxn(l2b_0), 1, "L2_B[0] UXN must be 1");
+        assert_eq!(l2b_0 & 0x0000_FFFF_FFE0_0000, l2b_base_pa & 0x0000_FFFF_FFE0_0000);
+        assert_eq!(l2b_base_pa, LINUX_KERNEL_REGION_BASE);
+        for index in 1..512usize {
+            let d = read_u64_le(&bytes, 0x4000 + index * 8);
+            assert!(valid_block(d), "L2_B[{}] must be a block", index);
+            assert_eq!(ap(d), 0b01);
+        }
+
+        // L3_A (base+0x5000): VA 0..0x10000 (16 pages) UNMAPPED (null guard);
+        // 0x10000..2 MiB are user 4 KiB pages (descriptor type 0b11).
+        for index in 0..16usize {
+            let d = read_u64_le(&bytes, 0x5000 + index * 8);
+            assert_eq!(d & 0x1, 0, "L3_A[{}] must be invalid (null guard)", index);
+        }
+        for index in 16..512usize {
+            let d = read_u64_le(&bytes, 0x5000 + index * 8);
+            assert_eq!(d & 0x3, 0b11, "L3_A[{}] must be a valid page", index);
+            assert_eq!(ap(d), 0b01, "L3_A[{}] AP must be 01", index);
+            assert_eq!(uxn(d), 0, "L3_A[{}] UXN must be 0", index);
+            let expected_pa = (index as u64) << 12;
+            assert_eq!(d & 0x0000_FFFF_FFFF_F000, expected_pa & 0x0000_FFFF_FFFF_F000);
         }
 
         // No block descriptor may have RES0 bits set in the block's PA gap.
