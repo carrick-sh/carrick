@@ -52,7 +52,7 @@ impl Runtime {
                     dispatcher.set_cwd(cwd.as_str());
                 }
 
-                seed_guest_baseline(&mut host);
+                seed_guest_baseline(&mut host, None);
 
                 // Install custom bind mounts on dispatcher
                 for mount in &spec.mounts {
@@ -182,7 +182,7 @@ fn install_fs_backend(
             }
         },
     };
-    seed_guest_baseline(&mut *backend);
+    seed_guest_baseline(&mut *backend, dispatcher.rootfs());
     let _ = dispatcher.set_fs_backend(backend);
     if host_seeded {
         dispatcher.drop_rootfs_layer();
@@ -190,7 +190,7 @@ fn install_fs_backend(
     Ok(())
 }
 
-fn seed_guest_baseline(backend: &mut dyn FsBackend) {
+fn seed_guest_baseline(backend: &mut dyn FsBackend, rootfs: Option<&RootFs>) {
     use std::net::ToSocketAddrs;
     for dir in [
         "/tmp",
@@ -211,13 +211,22 @@ fn seed_guest_baseline(backend: &mut dyn FsBackend) {
     }
     let _ = backend.set_mode("/tmp", 0o1777);
     let _ = backend.set_mode("/var/tmp", 0o1777);
-    let _ = backend.set_file_contents(
+    set_baseline_file_if_missing(
+        backend,
+        rootfs,
         "/etc/passwd",
         b"root:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n"
             .to_vec(),
     );
-    let _ = backend.set_file_contents("/etc/group", b"root:x:0:\nnogroup:x:65534:\n".to_vec());
-    let _ = backend.set_file_contents(
+    set_baseline_file_if_missing(
+        backend,
+        rootfs,
+        "/etc/group",
+        b"root:x:0:\nnogroup:x:65534:\n".to_vec(),
+    );
+    set_baseline_file_if_missing(
+        backend,
+        rootfs,
         "/etc/nsswitch.conf",
         b"passwd: files\ngroup: files\nhosts: files dns\n".to_vec(),
     );
@@ -249,7 +258,23 @@ fn seed_guest_baseline(backend: &mut dyn FsBackend) {
             }
         }
     }
-    let _ = backend.set_file_contents("/etc/hosts", hosts_content.into_bytes());
+    set_baseline_file_if_missing(backend, rootfs, "/etc/hosts", hosts_content.into_bytes());
+}
+
+fn set_baseline_file_if_missing(
+    backend: &mut dyn FsBackend,
+    rootfs: Option<&RootFs>,
+    path: &str,
+    contents: Vec<u8>,
+) {
+    if backend.metadata(path).is_some()
+        || rootfs
+            .and_then(|rootfs| rootfs.metadata(path).ok())
+            .is_some()
+    {
+        return;
+    }
+    let _ = backend.set_file_contents(path, contents);
 }
 
 fn setup_interactive_stdio(
