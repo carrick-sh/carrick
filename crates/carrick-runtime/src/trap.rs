@@ -2564,6 +2564,7 @@ impl HvfInner {
         let actual_ttbr0 = self.vcpu.get_sys_reg(SysReg::TTBR0_EL1).unwrap_or(0);
         let actual_mair = self.vcpu.get_sys_reg(SysReg::MAIR_EL1).unwrap_or(0);
         crate::probes::execve_sysregs(actual_sctlr, actual_ttbr0, actual_mair);
+        self.populate_vdso_data_page();
         Ok(())
     }
 }
