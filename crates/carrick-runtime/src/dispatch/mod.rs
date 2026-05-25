@@ -343,7 +343,7 @@ use crate::linux_abi::{
 use crate::memory::{LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE, LINUX_MMAP_SIZE};
 use crate::overlay::OverlayEntry;
 use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsError, RootFsMetadata};
-use crate::syscall::{SyscallHandler, lookup_aarch64};
+use crate::syscall::lookup_aarch64;
 use parking_lot::{Condvar, Mutex, RwLock};
 use serde::Serialize;
 use thiserror::Error;
@@ -399,8 +399,8 @@ pub use abi_args::{Fd, GuestLen, GuestPtr, Pid, Signal};
 #[allow(dead_code)]
 const MAX_GUEST_PATH: usize = 4096;
 
-fn syscall_handler_is(number: u64, handler: SyscallHandler) -> bool {
-    lookup_aarch64(number).is_some_and(|syscall| syscall.handler == handler)
+fn threaded_independent_dispatch_supports(number: u64) -> bool {
+    matches!(number, 96 | 98 | 99 | 124 | 178)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -2034,7 +2034,9 @@ impl SyscallDispatcher {
         let outcome = match result {
             Some(Ok(outcome)) => outcome,
             Some(Err(error)) => return Some(Err(error)),
-            None => unreachable!("Already checked with dispatch_normalized_known"),
+            None => DispatchOutcome::Errno {
+                errno: LINUX_ENOSYS,
+            },
         };
 
         let (retval, errno) = outcome.retval_errno();
@@ -2061,7 +2063,7 @@ impl SyscallDispatcher {
         registry: &crate::thread::ThreadRegistry,
         futex: &crate::thread::FutexTable,
     ) -> Option<Result<DispatchOutcome, DispatchError>> {
-        if !syscall_handler_is(request.number, SyscallHandler::ThreadLocal) {
+        if !threaded_independent_dispatch_supports(request.number) {
             return None;
         }
         match request.number {
@@ -2130,7 +2132,9 @@ impl SyscallDispatcher {
                     }
                 }
             }
-            _ => unreachable!("unsupported threaded-independent syscall"),
+            _ => DispatchOutcome::Errno {
+                errno: LINUX_ENOSYS,
+            },
         };
 
         let (retval, errno) = outcome.retval_errno();
@@ -4197,6 +4201,27 @@ mod overlay_dispatch_tests {
 
         assert!(dispatcher.fd_is_valid(keep_fd));
         assert!(!dispatcher.fd_is_valid(cloexec_fd));
+    }
+
+    #[test]
+    fn threaded_independent_dispatch_support_matches_handler_table() {
+        let supported: Vec<u64> = crate::syscall::aarch64_table()
+            .iter()
+            .filter(|syscall| threaded_independent_dispatch_supports(syscall.number))
+            .map(|syscall| syscall.number)
+            .collect();
+        assert_eq!(supported, vec![96, 98, 99, 124, 178]);
+
+        for syscall in crate::syscall::aarch64_table() {
+            if syscall.handler == crate::syscall::SyscallHandler::ThreadLocal {
+                assert!(
+                    threaded_independent_dispatch_supports(syscall.number),
+                    "thread-local syscall {} ({}) must be handled without panicking",
+                    syscall.number,
+                    syscall.name
+                );
+            }
+        }
     }
 
     #[test]
