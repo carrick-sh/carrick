@@ -558,65 +558,13 @@ where
                 frame.x8, frame.x0, frame.x1, frame.x2, frame.x3, frame.x4, frame.x5
             );
         }
-        // Service blocking I/O (WaitOnFds) by waiting WITHOUT re-entering the
-        // dispatcher's blocking path: poll the host fds, then re-dispatch on
-        // readiness (single-threaded, so no lock contention, but the same code
-        // path keeps semantics identical across runtimes).
-        let outcome = loop {
-            let oc = dispatcher.dispatch(
-                SyscallRequest::from_aarch64_frame(frame),
-                runtime,
-                &reporter,
-            )?;
-            match oc {
-                DispatchOutcome::WaitOnFds {
-                    fds,
-                    timeout,
-                    on_timeout,
-                    block_signals,
-                } => match waiter.wait(&fds, timeout, block_signals) {
-                    crate::io_wait::WaitResult::Ready => continue,
-                    crate::io_wait::WaitResult::TimedOut => {
-                        break DispatchOutcome::Returned { value: on_timeout };
-                    }
-                    crate::io_wait::WaitResult::Interrupted => {
-                        break DispatchOutcome::Errno {
-                            errno: crate::linux_abi::LINUX_EINTR,
-                        };
-                    }
-                },
-                DispatchOutcome::WaitOnPollFds {
-                    fds,
-                    timeout,
-                    on_timeout,
-                    block_signals,
-                } => match waiter.wait_poll(&fds, timeout, block_signals) {
-                    crate::io_wait::WaitResult::Ready => continue,
-                    crate::io_wait::WaitResult::TimedOut => {
-                        break DispatchOutcome::Returned { value: on_timeout };
-                    }
-                    crate::io_wait::WaitResult::Interrupted => {
-                        break DispatchOutcome::Errno {
-                            errno: crate::linux_abi::LINUX_EINTR,
-                        };
-                    }
-                },
-                DispatchOutcome::WaitOnProcExit { pid, block_signals } => {
-                    match waiter.wait_proc_exit(pid, block_signals) {
-                        // Ready (child exited) → re-dispatch the waitid to reap.
-                        crate::io_wait::WaitResult::Ready => continue,
-                        // Interrupted (signal/quiesce) → EINTR; the guest re-issues.
-                        crate::io_wait::WaitResult::Interrupted
-                        | crate::io_wait::WaitResult::TimedOut => {
-                            break DispatchOutcome::Errno {
-                                errno: crate::linux_abi::LINUX_EINTR,
-                            };
-                        }
-                    }
-                }
-                other => break other,
-            }
-        };
+        let outcome = dispatch_single_threaded_syscall(
+            &mut dispatcher,
+            SyscallRequest::from_aarch64_frame(frame),
+            runtime,
+            &reporter,
+            &mut waiter,
+        )?;
 
         let mut last_syscall_retval: Option<i64> = None;
 
@@ -761,6 +709,71 @@ where
         report: reporter.finish(),
         trap_limit_hit: true,
     })
+}
+
+fn dispatch_single_threaded_syscall<M: GuestMemory>(
+    dispatcher: &mut SyscallDispatcher,
+    request: SyscallRequest,
+    memory: &mut M,
+    reporter: &CompatReporter,
+    waiter: &mut crate::io_wait::ThreadWaiter,
+) -> Result<DispatchOutcome, RuntimeError> {
+    use crate::io_wait::WaitResult;
+
+    // Service blocking I/O by waiting without re-entering the dispatcher's
+    // blocking path: poll the host fds, then re-dispatch the same syscall on
+    // readiness. This is the common single-threaded path for the combined and
+    // split runtimes; the threaded runtime keeps its own fork-quiesce handling.
+    loop {
+        let outcome = dispatcher.dispatch(request, memory, reporter)?;
+        match outcome {
+            DispatchOutcome::WaitOnFds {
+                fds,
+                timeout,
+                on_timeout,
+                block_signals,
+            } => match waiter.wait(&fds, timeout, block_signals) {
+                WaitResult::Ready => continue,
+                WaitResult::TimedOut => {
+                    return Ok(DispatchOutcome::Returned { value: on_timeout });
+                }
+                WaitResult::Interrupted => {
+                    return Ok(DispatchOutcome::Errno {
+                        errno: crate::linux_abi::LINUX_EINTR,
+                    });
+                }
+            },
+            DispatchOutcome::WaitOnPollFds {
+                fds,
+                timeout,
+                on_timeout,
+                block_signals,
+            } => match waiter.wait_poll(&fds, timeout, block_signals) {
+                WaitResult::Ready => continue,
+                WaitResult::TimedOut => {
+                    return Ok(DispatchOutcome::Returned { value: on_timeout });
+                }
+                WaitResult::Interrupted => {
+                    return Ok(DispatchOutcome::Errno {
+                        errno: crate::linux_abi::LINUX_EINTR,
+                    });
+                }
+            },
+            DispatchOutcome::WaitOnProcExit { pid, block_signals } => {
+                match waiter.wait_proc_exit(pid, block_signals) {
+                    // Ready (child exited) -> re-dispatch the waitid to reap.
+                    WaitResult::Ready => continue,
+                    // Interrupted (signal/quiesce) -> EINTR; the guest re-issues.
+                    WaitResult::Interrupted | WaitResult::TimedOut => {
+                        return Ok(DispatchOutcome::Errno {
+                            errno: crate::linux_abi::LINUX_EINTR,
+                        });
+                    }
+                }
+            }
+            other => return Ok(other),
+        }
+    }
 }
 
 // ===================================================================
@@ -2190,61 +2203,13 @@ where
                 continue;
             }
         };
-        let outcome = loop {
-            let oc = dispatcher.dispatch(
-                SyscallRequest::from_aarch64_frame(frame),
-                memory,
-                &reporter,
-            )?;
-            match oc {
-                DispatchOutcome::WaitOnFds {
-                    fds,
-                    timeout,
-                    on_timeout,
-                    block_signals,
-                } => match waiter.wait(&fds, timeout, block_signals) {
-                    crate::io_wait::WaitResult::Ready => continue,
-                    crate::io_wait::WaitResult::TimedOut => {
-                        break DispatchOutcome::Returned { value: on_timeout };
-                    }
-                    crate::io_wait::WaitResult::Interrupted => {
-                        break DispatchOutcome::Errno {
-                            errno: crate::linux_abi::LINUX_EINTR,
-                        };
-                    }
-                },
-                DispatchOutcome::WaitOnPollFds {
-                    fds,
-                    timeout,
-                    on_timeout,
-                    block_signals,
-                } => match waiter.wait_poll(&fds, timeout, block_signals) {
-                    crate::io_wait::WaitResult::Ready => continue,
-                    crate::io_wait::WaitResult::TimedOut => {
-                        break DispatchOutcome::Returned { value: on_timeout };
-                    }
-                    crate::io_wait::WaitResult::Interrupted => {
-                        break DispatchOutcome::Errno {
-                            errno: crate::linux_abi::LINUX_EINTR,
-                        };
-                    }
-                },
-                DispatchOutcome::WaitOnProcExit { pid, block_signals } => {
-                    match waiter.wait_proc_exit(pid, block_signals) {
-                        // Ready (child exited) → re-dispatch the waitid to reap.
-                        crate::io_wait::WaitResult::Ready => continue,
-                        // Interrupted (signal/quiesce) → EINTR; the guest re-issues.
-                        crate::io_wait::WaitResult::Interrupted
-                        | crate::io_wait::WaitResult::TimedOut => {
-                            break DispatchOutcome::Errno {
-                                errno: crate::linux_abi::LINUX_EINTR,
-                            };
-                        }
-                    }
-                }
-                other => break other,
-            }
-        };
+        let outcome = dispatch_single_threaded_syscall(
+            &mut dispatcher,
+            SyscallRequest::from_aarch64_frame(frame),
+            memory,
+            &reporter,
+            &mut waiter,
+        )?;
 
         let mut last_syscall_retval: Option<i64> = None;
 
