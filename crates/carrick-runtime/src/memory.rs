@@ -117,8 +117,8 @@ pub const LINUX_MMAP_BASE: u64 = 0x60_0000_0000; // 384 GiB
 // concurrency it requested >7 GiB of address space and overran the old 2 GiB
 // arena, so the guest's pthread_create stack mmap got ENOMEM (surfaced by cgo
 // as "pthread_create failed: Resource temporarily unavailable"). 32 GiB fits
-// below the interpreter base (512 GiB) and within the L1A page tables. (Still a
-// non-reclaiming bump allocator; reclaiming munmap'd space is a follow-up.)
+// below the interpreter base (512 GiB) and within the L1A page tables. Munmap'd
+// anonymous/private arena ranges are tracked in the dispatcher and reused.
 pub const LINUX_MMAP_SIZE: u64 = 32 * 1024 * 1024 * 1024;
 pub const LINUX_INTERPRETER_BASE: u64 = 0x80_0000_0000; // 512 GiB
 // Dedicated, initially-UNMAPPED window for real MAP_SHARED file mappings.
