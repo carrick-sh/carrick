@@ -1,8 +1,10 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, bail};
 use carrick_runtime::compat::{CompatReportFormat, CompatReporter, SyscallArgs};
 use carrick_runtime::dispatch::{LinearMemory, SyscallDispatcher, SyscallRequest};
+#[cfg(target_os = "macos")]
+use carrick_runtime::dtrace_consumer::join_ids;
 use carrick_runtime::elf::{inspect_elf, plan_elf_load};
 use carrick_runtime::fs_backend::{FsBackend, HostFsBackend, MemoryBackend};
 use carrick_runtime::memory::AddressSpace;
@@ -1054,7 +1056,7 @@ fn default_fs_backend_kind() -> FsBackendKind {
     if std::fs::create_dir_all(&probe).is_err() {
         return FsBackendKind::Memory;
     }
-    if probe_case_sensitive(&probe).unwrap_or(false) {
+    if carrick_runtime::apfs::probe_case_sensitive(&probe) {
         FsBackendKind::Host
     } else {
         eprintln!(
@@ -1064,26 +1066,6 @@ fn default_fs_backend_kind() -> FsBackendKind {
         );
         FsBackendKind::Memory
     }
-}
-
-/// Detect whether `path` lives on a case-sensitive volume by creating
-/// a sentinel file and trying to canonicalise the same path with the
-/// case flipped. We do NOT trust statfs flags here because APFS
-/// volumes routinely return MNT_NOATIME-style flags that say nothing
-/// about case-sensitivity.
-fn probe_case_sensitive(path: &Path) -> std::io::Result<bool> {
-    let lower = path.join(".carrick-case-probe");
-    let upper = path.join(".CARRICK-CASE-PROBE");
-    std::fs::write(&lower, b"")?;
-    let sensitive = if upper.exists() {
-        // If the kernel can see the upper-case spelling, it's a
-        // case-insensitive volume.
-        std::fs::canonicalize(&upper).ok() != std::fs::canonicalize(&lower).ok()
-    } else {
-        true
-    };
-    let _ = std::fs::remove_file(&lower);
-    Ok(sensitive)
 }
 
 #[cfg(target_os = "macos")]
@@ -1099,11 +1081,6 @@ fn current_supplementary_groups() -> Vec<u32> {
     }
     groups.truncate(n as usize);
     groups.into_iter().map(|g| g as u32).collect()
-}
-
-#[cfg(target_os = "macos")]
-fn join_ids(ids: &[u32]) -> String {
-    ids.iter().map(u32::to_string).collect::<Vec<_>>().join(",")
 }
 
 #[cfg(target_os = "macos")]

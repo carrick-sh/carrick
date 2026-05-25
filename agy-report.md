@@ -404,6 +404,7 @@ The DAC (discretionary access control) check lives in `dispatch/mod.rs` — shou
 | `cargo check -p carrick-cli` | done | Verifies the CLI fallback for an unnormalized `shell` command and the `FsBackendKind` `clap` feature path compile. |
 | `cargo check -p carrick-spec --no-default-features` | done | Verifies the shared spec crate builds without the optional CLI-facing `clap` feature. |
 | `cargo tree -p carrick-spec --no-default-features` | done | Inspected with `rg` for `clap`; no dependency is present in the bare spec dependency graph. |
+| `cargo test -p carrick-runtime --lib dtrace_consumer::tests::join_ids_formats_comma_separated_decimal_ids -- --nocapture` | done | Verifies the shared trace group-id formatter used by runtime and CLI. |
 
 ### Tier 1
 
@@ -429,7 +430,7 @@ The DAC (discretionary access control) check lives in `dispatch/mod.rs` — shou
 | 13 | Consolidate stat/statx writers | open | Behavior-preserving refactor. |
 | 14 | Unify `gzip_tar` test helper | open | Copy-paste still exists in CLI/runtime tests. |
 | 15 | Parameterize `linux_fixture.rs` tests | open | Test refactor. |
-| 16 | Delete duplicate `probe_case_sensitive` and `join_ids` from main.rs | open | Validate runtime helpers before replacing. |
+| 16 | Delete duplicate `probe_case_sensitive` and `join_ids` from main.rs | done | CLI now calls `carrick_runtime::apfs::probe_case_sensitive` and the shared `dtrace_consumer::join_ids`; the duplicate local helpers were removed. |
 
 ### Tier 3
 

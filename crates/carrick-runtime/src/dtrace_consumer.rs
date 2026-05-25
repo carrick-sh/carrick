@@ -450,13 +450,13 @@ fn cstring_arg(arg: &str) -> Result<CString, DTraceError> {
     CString::new(arg.as_bytes()).map_err(|_| DTraceError::BadArg(arg.to_owned()))
 }
 
-fn join_ids(ids: &[u32]) -> String {
+pub fn join_ids(ids: &[u32]) -> String {
     ids.iter().map(u32::to_string).collect::<Vec<_>>().join(",")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{TRACE_CHILD_COMMAND, TraceDropCredentials, trace_exec_argv};
+    use super::{TRACE_CHILD_COMMAND, TraceDropCredentials, join_ids, trace_exec_argv};
     use std::ffi::CString;
     use std::path::Path;
 
@@ -512,5 +512,12 @@ mod tests {
                 "alpine",
             ]
         );
+    }
+
+    #[test]
+    fn join_ids_formats_comma_separated_decimal_ids() {
+        assert_eq!(join_ids(&[]), "");
+        assert_eq!(join_ids(&[20]), "20");
+        assert_eq!(join_ids(&[20, 12, 501]), "20,12,501");
     }
 }
