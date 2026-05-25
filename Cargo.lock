@@ -294,14 +294,13 @@ dependencies = [
  "carrick-image",
  "carrick-runtime",
  "carrick-spec",
+ "carrick-test-support",
  "clap",
- "flate2",
  "futures-util",
  "libc",
  "predicates",
  "serde",
  "serde_json",
- "tar",
  "tempfile",
  "tokio",
  "tracing",
@@ -348,6 +347,7 @@ dependencies = [
  "cap-std",
  "carrick-image",
  "carrick-spec",
+ "carrick-test-support",
  "cc",
  "clap",
  "fd-lock",
@@ -381,6 +381,14 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "carrick-test-support"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "tar",
 ]
 
 [[package]]
