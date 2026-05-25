@@ -65,6 +65,21 @@ fn decode_el0_sys64_read(esr: u64) -> Option<(u8, El0SysRegRead)> {
     Some((rt, reg))
 }
 
+/// Read the host's ARM generic-timer virtual count and frequency at EL0. With
+/// `CNTKCTL_EL1.EL0VCTEN` set, the guest reads the SAME counter via CNTVCT_EL0,
+/// so these calibrate the vDSO's clock conversion. (macOS allows EL0 reads of
+/// both registers.)
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn host_counter() -> (u64, u64) {
+    let (cntvct, cntfrq): (u64, u64);
+    // SAFETY: cntvct_el0/cntfrq_el0 are unprivileged reads on aarch64 macOS.
+    unsafe {
+        core::arch::asm!("mrs {}, cntvct_el0", out(reg) cntvct, options(nomem, nostack));
+        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) cntfrq, options(nomem, nostack));
+    }
+    (cntvct, cntfrq)
+}
+
 fn guest_counter_ticks() -> u64 {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     START
@@ -317,6 +332,23 @@ pub(crate) static VCPU_LIVE: std::sync::atomic::AtomicI64 = std::sync::atomic::A
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn vcpu_created() {
     VCPU_LIVE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Enable EL0 direct reads of `CNTVCT_EL0`/`CNTFRQ_EL0` (`CNTKCTL_EL1.EL0VCTEN |
+/// EL0PCTEN`) on a freshly-created vCPU. Must run on EVERY vCPU — initial,
+/// per-thread, fork/execve rebuild. If only some vCPUs have it, the others trap
+/// CNTVCT and fall back to the host-`Instant` emulation, which is a DIFFERENT
+/// clock basis (ns-since-process-start, not the hardware counter the vDSO
+/// assumes). That skews the monotonic clock between Go's worker threads, so a
+/// timer scheduled on one vCPU is checked against a wildly different time on
+/// another and never fires — deadlocking `time.After`/timer tests with absurd
+/// (e.g. "179h") waits. Best-effort.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn enable_el0_counter_access(vcpu_id: applevisor_sys::hv_vcpu_t) {
+    const CNTKCTL_EL1: applevisor_sys::hv_sys_reg_t = applevisor_sys::hv_sys_reg_t::CNTKCTL_EL1;
+    unsafe {
+        let _ = applevisor_sys::hv_vcpu_set_sys_reg(vcpu_id, CNTKCTL_EL1, (1 << 1) | (1 << 0));
+    }
 }
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn vcpu_destroyed() {
@@ -982,6 +1014,7 @@ impl HvfTrapEngine {
         let vm = VirtualMachine::with_config(config).map_err(hvf_error)?;
         let vcpu = vm.vcpu_create().map_err(hvf_error)?;
         vcpu_created();
+        enable_el0_counter_access(vcpu.id());
         Ok(Self {
             inner: std::mem::ManuallyDrop::new(HvfInner {
                 _vm: vm,
@@ -1166,6 +1199,10 @@ impl HvfTrapEngine {
                 .set_sys_reg(SysReg::SP_EL0, stack_pointer)
                 .map_err(hvf_error)?;
         }
+        // Fill the vDSO vvar page so __kernel_clock_gettime can derive time from
+        // CNTVCT_EL0 in userspace. Best-effort: if the page isn't mapped (a load
+        // path without with_vdso) just skip — the guest falls back to syscalls.
+        self.inner.populate_vdso_data_page();
         Ok(())
     }
 
@@ -1482,6 +1519,40 @@ impl HvfInner {
         Ok(())
     }
 
+    /// Write the vDSO vvar data page: the counter frequency and the
+    /// monotonic→realtime offset, so `__kernel_clock_gettime` can convert
+    /// CNTVCT_EL0 to a timespec entirely in userspace. The guest reads the same
+    /// counter we calibrate against (CNTKCTL_EL1.EL0VCTEN), so the rate is exact;
+    /// monotonic durations depend only on the frequency. Best-effort: silently
+    /// skips if the vvar page isn't mapped.
+    fn populate_vdso_data_page(&mut self) {
+        let (host_cntvct, freq) = host_counter();
+        if freq == 0 {
+            return;
+        }
+        // HVF leaves the guest virtual-counter offset (CNTVOFF_EL2) at 0, so the
+        // guest's CNTVCT_EL0 reads the same virtual count carrick reads here. The
+        // absolute base is immaterial for CLOCK_MONOTONIC (durations cancel it);
+        // it only shifts the realtime offset by a constant if HVF ever changed it.
+        let guest_cntvct = host_cntvct;
+        let mono_ns =
+            ((guest_cntvct as u128).saturating_mul(1_000_000_000) / freq as u128) as u64;
+        let unix_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let realtime_off = unix_ns.wrapping_sub(mono_ns);
+
+        let base = crate::vdso::LINUX_VVAR_BASE;
+        let _ =
+            self.write_guest_bytes(base + crate::vdso::VVAR_OFF_FREQ as u64, &freq.to_le_bytes());
+        let _ = self.write_guest_bytes(
+            base + crate::vdso::VVAR_OFF_REALTIME_OFF_NS as u64,
+            &realtime_off.to_le_bytes(),
+        );
+        // seq stays 0 (even = stable); these aren't updated after boot.
+    }
+
     /// Mark `[address, address+len)` PROT_NONE (`no_access=true`) or clear it.
     /// Clearing performs interval subtraction so an mprotect/mmap that re-enables
     /// part of a PROT_NONE region leaves only the still-protected remainder.
@@ -1758,6 +1829,7 @@ impl HvfInner {
             .unwrap_or_else(|| self._vm.clone());
         let new_vcpu = new_vm.vcpu_create().map_err(hvf_error)?;
         vcpu_created();
+        enable_el0_counter_access(new_vcpu.id());
         // Replace _vm and vcpu WITHOUT running applevisor's panicky Drop on the
         // old (already-destroyed) handles — mirror the fork/thread-sibling
         // leak-until-exit discipline.
@@ -2209,6 +2281,7 @@ impl HvfInner {
         let new_vm = VirtualMachine::with_config(config).map_err(hvf_error)?;
         let new_vcpu = new_vm.vcpu_create().map_err(hvf_error)?;
         vcpu_created();
+        enable_el0_counter_access(new_vcpu.id());
 
         // Overwrite *self with the new HvfInner WITHOUT running Drop on
         // the old contents. The old struct holds applevisor wrappers
@@ -2339,6 +2412,7 @@ impl HvfInner {
         let vm = rebuilt_vm_cell().lock().clone().unwrap_or(vm);
         let vcpu = vm.vcpu_create().map_err(hvf_error)?;
         vcpu_created();
+        enable_el0_counter_access(vcpu.id());
 
         let mut inner = HvfInner {
             _vm: vm,
@@ -2458,6 +2532,7 @@ impl HvfInner {
         let new_vm = VirtualMachine::with_config(config).map_err(hvf_error)?;
         let new_vcpu = new_vm.vcpu_create().map_err(hvf_error)?;
         vcpu_created();
+        enable_el0_counter_access(new_vcpu.id());
 
         // Preserve `is_forked_child` across execve. A process that
         // descended from the original `carrick run` invocation should

@@ -246,7 +246,8 @@ where
     .with_linux_initial_stack(argv, env)?
     .with_el0_trampoline()?
     .with_el1_vectors()?
-    .with_stage1_page_tables()?;
+    .with_stage1_page_tables()?
+        .with_vdso()?;
     if let Some(p) = maybe_dump_debug_state(&image, debug_state_path) {
         eprintln!("debug state written: {}", p.display());
     }
@@ -268,7 +269,8 @@ pub fn run_static_elf_bytes_with_hvf_and_dispatcher(
     let image = AddressSpace::load_elf_bytes(bytes)?
         .with_el0_trampoline()?
         .with_el1_vectors()?
-        .with_stage1_page_tables()?;
+        .with_stage1_page_tables()?
+        .with_vdso()?;
     run_address_space_with_hvf_and_dispatcher(image, dispatcher, max_traps)
 }
 
@@ -292,7 +294,8 @@ where
         .with_linux_initial_stack(argv, env)?
         .with_el0_trampoline()?
         .with_el1_vectors()?
-        .with_stage1_page_tables()?;
+        .with_stage1_page_tables()?
+        .with_vdso()?;
     run_address_space_with_hvf_and_dispatcher(image, dispatcher, max_traps)
 }
 
@@ -334,7 +337,8 @@ where
         .with_linux_initial_stack(argv, env)?
         .with_el0_trampoline()?
         .with_el1_vectors()?
-        .with_stage1_page_tables()?;
+        .with_stage1_page_tables()?
+        .with_vdso()?;
     if let Some(p) = maybe_dump_debug_state(&image, debug_state_path) {
         eprintln!("debug state written: {}", p.display());
     }
@@ -372,7 +376,8 @@ where
             .with_linux_initial_stack(argv, env)?
             .with_el0_trampoline()?
             .with_el1_vectors()?
-            .with_stage1_page_tables()?;
+            .with_stage1_page_tables()?
+        .with_vdso()?;
     if let Some(p) = maybe_dump_debug_state(&image, debug_state_path) {
         eprintln!("debug state written: {}", p.display());
     }
@@ -2040,6 +2045,7 @@ fn load_execve_image(
     raw.with_el0_trampoline()
         .and_then(|a| a.with_el1_vectors())
         .and_then(|a| a.with_stage1_page_tables())
+        .and_then(|a| a.with_vdso())
         .and_then(|a| a.with_linux_initial_stack(argv, env))
         .map_err(|_| LINUX_ENOENT)
 }

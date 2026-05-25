@@ -511,6 +511,53 @@ impl AddressSpace {
         Ok(image)
     }
 
+    /// Append the vDSO: a read-only `vvar` data page (carrick fills it with the
+    /// clock parameters at boot) and the read+execute vDSO ELF page that the
+    /// guest's libc/Go resolve `__kernel_clock_gettime` from. `AT_SYSINFO_EHDR`
+    /// (added in `linux_auxv_from_load_plan`) points the guest at the ELF.
+    pub fn with_vdso(self) -> Result<Self, AddressSpaceError> {
+        let vvar = MemoryRegion {
+            start: crate::vdso::LINUX_VVAR_BASE,
+            end: crate::vdso::LINUX_VVAR_BASE + crate::vdso::LINUX_VVAR_SIZE,
+            perms: SegmentPerms {
+                read: true,
+                write: false,
+                execute: false,
+            },
+            bytes: vec![0u8; crate::vdso::LINUX_VVAR_SIZE as usize],
+        };
+        let mut vdso_bytes = crate::vdso::vdso_image_bytes();
+        vdso_bytes.resize(crate::vdso::LINUX_VDSO_SIZE as usize, 0);
+        let vdso = MemoryRegion {
+            start: crate::vdso::LINUX_VDSO_BASE,
+            end: crate::vdso::LINUX_VDSO_BASE + crate::vdso::LINUX_VDSO_SIZE,
+            perms: SegmentPerms {
+                read: true,
+                write: false,
+                execute: true,
+            },
+            bytes: vdso_bytes,
+        };
+
+        let AddressSpace {
+            entry,
+            regions,
+            initial_stack_pointer,
+            linux_auxv,
+            el0_trampoline_entry,
+            el1_vectors_base,
+            stage1_page_tables_base,
+        } = self;
+        let mut image =
+            Self::from_regions(entry, regions.into_iter().chain([vvar, vdso]).collect())?;
+        image.initial_stack_pointer = initial_stack_pointer;
+        image.linux_auxv = linux_auxv;
+        image.el0_trampoline_entry = el0_trampoline_entry;
+        image.el1_vectors_base = el1_vectors_base;
+        image.stage1_page_tables_base = stage1_page_tables_base;
+        Ok(image)
+    }
+
     pub fn with_linux_initial_stack<A, E>(self, argv: A, env: E) -> Result<Self, AddressSpaceError>
     where
         A: IntoIterator<Item = String>,
@@ -1219,6 +1266,13 @@ fn linux_auxv_from_load_plan(
     // (FP, ASIMD, AES, PMULL, SHA1, SHA2, CRC32, ATOMICS).
     auxv.push(LinuxAuxvEntry::new(LINUX_AT_HWCAP, 0x1fb));
     auxv.push(LinuxAuxvEntry::new(LINUX_AT_HWCAP2, 0));
+    // Point the guest at carrick's vDSO so libc/Go resolve __kernel_clock_gettime
+    // and read the clock in userspace (CNTVCT_EL0) instead of trapping out per
+    // call. The vvar+vdso pages are appended by `with_vdso`.
+    auxv.push(LinuxAuxvEntry::new(
+        crate::linux_abi::LINUX_AT_SYSINFO_EHDR,
+        crate::vdso::LINUX_VDSO_BASE,
+    ));
     // Sentinel addresses for AT_RANDOM, AT_PLATFORM, AT_EXECFN — the
     // actual stack offsets get patched in by `build_linux_initial_stack`
     // once it has placed the backing bytes on the stack. Using 0 here
