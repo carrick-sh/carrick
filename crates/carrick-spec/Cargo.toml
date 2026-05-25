@@ -1,0 +1,20 @@
+[package]
+name = "carrick-spec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "carrick_spec"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+camino = { workspace = true, features = ["serde1"] }
+clap = { workspace = true, features = ["derive", "env"] }
+oci-client = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
