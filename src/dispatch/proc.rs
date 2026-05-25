@@ -153,256 +153,6 @@ impl ProcState {
 }
 
 impl SyscallDispatcher {
-
-    pub(super) fn personality<M: GuestMemory>(
-        &self,
-        ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let requested = ctx.arg(0);
-        let mut proc = self.proc.lock();
-        let previous = proc.personality;
-        if requested != LINUX_PERSONALITY_QUERY {
-            proc.personality = requested;
-        }
-        Ok(DispatchOutcome::Returned {
-            value: previous as i64,
-        })
-    }
-
-    pub(super) fn prctl<M: GuestMemory>(
-        &self,
-        ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let memory = &mut *ctx.memory;
-        let option = ctx.request.arg(0);
-        Ok(match option {
-            LINUX_PR_GET_DUMPABLE => DispatchOutcome::Returned {
-                value: self.proc.lock().dumpable,
-            },
-            LINUX_PR_SET_DUMPABLE => {
-                let value = ctx.request.arg(1);
-                if value > 1 {
-                    return Ok(LINUX_EINVAL.into());
-                }
-                self.proc.lock().dumpable = value as i64;
-                DispatchOutcome::Returned { value: 0 }
-            }
-            LINUX_PR_SET_NAME => {
-                let address = ctx.request.arg(1);
-                let Ok(bytes) = memory.read_bytes(address, LINUX_TASK_COMM_LEN) else {
-                    return Ok(LINUX_EFAULT.into());
-                };
-                let task_name = linux_task_name_from_bytes(&bytes);
-                self.proc.lock().task_name = task_name;
-                // Reflect the guest's chosen name into the host
-                // process/thread name as `carrick: <name>`, so `ps -M`
-                // / Activity Monitor / lldb show which guest each
-                // carrick host process is running.
-                set_host_process_name(&task_name);
-                DispatchOutcome::Returned { value: 0 }
-            }
-            LINUX_PR_GET_NAME => {
-                let address = ctx.request.arg(1);
-                let task_name = self.proc.lock().task_name;
-                if memory.write_bytes(address, &task_name).is_err() {
-                    return Ok(LINUX_EFAULT.into());
-                }
-                DispatchOutcome::Returned { value: 0 }
-            }
-            LINUX_PR_SET_PDEATHSIG => {
-                // arg1 is a signal number: 0 clears, 1..=64 is valid, anything
-                // else is EINVAL (what the kernel returns).
-                let sig = ctx.request.arg(1);
-                if sig > 64 {
-                    return Ok(LINUX_EINVAL.into());
-                }
-                self.proc.lock().pdeathsig = sig as i64;
-                DispatchOutcome::Returned { value: 0 }
-            }
-            LINUX_PR_GET_PDEATHSIG => {
-                let address = ctx.request.arg(1);
-                let pdeathsig = self.proc.lock().pdeathsig;
-                if memory
-                    .write_bytes(address, &(pdeathsig as i32).to_ne_bytes())
-                    .is_err()
-                {
-                    return Ok(LINUX_EFAULT.into());
-                }
-                DispatchOutcome::Returned { value: 0 }
-            }
-            _ => DispatchOutcome::errno(LINUX_EINVAL),
-        })
-    }
-
-    pub(super) fn getcpu<M: GuestMemory>(
-        &self,
-        ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let memory = &mut *ctx.memory;
-        let cpu_address = ctx.request.arg(0);
-        let node_address = ctx.request.arg(1);
-        // Report the lowest CPU in this process's affinity mask. macOS has no
-        // portable "which CPU am I on" query, but a task pinned to a single
-        // CPU (sched_setaffinity to one bit) must observe getcpu() returning
-        // that CPU — LTP getcpu01 pins to CPU n-1 then expects it back. The
-        // lowest set bit equals the pinned CPU when restricted, and is always
-        // a valid online CPU otherwise. Single NUMA node (0).
-        let cpu = lowest_set_cpu(&self.proc.lock().affinity).unwrap_or(0);
-        let cpu_value = cpu.to_ne_bytes();
-        let node_value = 0u32.to_ne_bytes();
-
-        if cpu_address != 0 && memory.write_bytes(cpu_address, &cpu_value).is_err() {
-            return Ok(LINUX_EFAULT.into());
-        }
-        if node_address != 0 && memory.write_bytes(node_address, &node_value).is_err() {
-            return Ok(LINUX_EFAULT.into());
-        }
-        Ok(DispatchOutcome::Returned { value: 0 })
-    }
-
-    /// gettid(2). In the multi-threaded runtime each guest thread has its
-    /// own tid (allocated by the ThreadRegistry); fall back to the pid for
-    /// the single-threaded path.
-    pub(super) fn gettid<M: GuestMemory>(
-        &self,
-        ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        if let Some(t) = ctx.thread {
-            // Linux: in a single-threaded process gettid()==getpid(). Our
-            // main thread's tid is seeded from getpid AT PROCESS START, but a
-            // forked child gets a fresh host pid while keeping the inherited
-            // main_tid — so returning the stale tid would break the
-            // gettid==getpid invariant. While this is the sole live thread,
-            // answer with the live getpid; only once siblings exist do we
-            // hand out the distinct per-thread tid.
-            if t.registry.live_count() > 1 {
-                return Ok(DispatchOutcome::Returned {
-                    value: t.tid as i64,
-                });
-            }
-        }
-        Ok(self.getpid())
-    }
-
-    /// set_tid_address(addr). Records `addr` as this thread's
-    /// CLONE_CHILD_CLEARTID word (zeroed + FUTEX_WAKE'd on thread exit) and
-    /// returns the caller's tid. Single-threaded path just returns pid.
-    pub(super) fn set_tid_address<M: GuestMemory>(
-        &self,
-        ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let addr = ctx.arg(0);
-        if let Some(t) = ctx.thread {
-            t.registry.set_clear_child_tid(t.tid, addr);
-            return Ok(DispatchOutcome::Returned {
-                value: t.tid as i64,
-            });
-        }
-        Ok(self.getpid())
-    }
-
-    pub(super) fn set_robust_list<M: GuestMemory>(
-        &self,
-        ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let len = ctx.arg(1);
-        if len == 0 {
-            return Ok(LINUX_EINVAL.into());
-        }
-        Ok(DispatchOutcome::Returned { value: 0 })
-    }
-
-    pub(super) fn sched_yield<M: GuestMemory>(
-        &self,
-        _ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        std::thread::yield_now();
-        Ok(DispatchOutcome::Returned { value: 0 })
-    }
-
-    pub(super) fn sched_getaffinity<M: GuestMemory>(
-        &self,
-        ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let pid = ctx.arg(0);
-        let size = ctx.arg(1) as usize;
-        let address = ctx.arg(2);
-        let memory = &mut *ctx.memory;
-
-        if matches!(self.resolve_affinity_target(pid), AffinityTarget::NotFound) {
-            return Ok(LINUX_ESRCH.into());
-        }
-        // The kernel copies (and returns) `cpumask_size()` bytes — one `long`
-        // per 64 CPUs — and requires the user buffer to be at least that big.
-        let kernel_bytes = crate::host_facts::logical_cpu_count().div_ceil(64) * 8;
-        if size < kernel_bytes {
-            return Ok(LINUX_EINVAL.into());
-        }
-        let mask = self.proc.lock().affinity.clone();
-        let buf = affinity_to_bytes(&mask, kernel_bytes);
-        if memory.write_bytes(address, &buf).is_err() {
-            return Ok(LINUX_EFAULT.into());
-        }
-        Ok(DispatchOutcome::Returned {
-            value: kernel_bytes as i64,
-        })
-    }
-
-    /// sched_setaffinity(pid, size, mask). Honours the requested CPU mask
-    /// (intersected with the online set) so a set→get round-trips; macOS
-    /// thread scheduling is advisory so no physical pin is performed. An empty
-    /// effective mask is rejected with EINVAL, matching Linux ("no online CPU
-    /// in the set"). Affinity is per-process and inherited across fork.
-    pub(super) fn sched_setaffinity<M: GuestMemory>(
-        &self,
-        ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let pid = ctx.arg(0);
-        let size = ctx.arg(1) as usize;
-        let address = ctx.arg(2);
-        let memory = &*ctx.memory;
-
-        // Linux order: copy the mask from user (EFAULT) → find the task
-        // (ESRCH) → permission check (EPERM) → apply (EINVAL on empty set).
-        let read_len = size.min(128);
-        let bytes = match memory.read_bytes(address, read_len) {
-            Ok(bytes) => bytes,
-            Err(_) => return Ok(LINUX_EFAULT.into()),
-        };
-        let target = self.resolve_affinity_target(pid);
-        if matches!(target, AffinityTarget::NotFound) {
-            return Ok(LINUX_ESRCH.into());
-        }
-        // Setting ANOTHER process's affinity requires owning it or CAP_SYS_NICE.
-        // carrick models a single guest credential set and can't read a peer
-        // process's owner across the fork boundary, so it approximates the
-        // kernel's same-owner-or-capable rule: only the (root, euid 0) guest
-        // may target another process; a process that has dropped privileges
-        // gets EPERM. Setting one's OWN affinity is always permitted.
-        if matches!(target, AffinityTarget::OtherGuest) && self.creds.lock().euid != 0 {
-            return Ok(LINUX_EPERM.into());
-        }
-        // Intersect the requested mask with the online set. An empty result is
-        // EINVAL, exactly as Linux rejects a mask naming no usable CPU.
-        let ncpu = crate::host_facts::logical_cpu_count();
-        let online = default_affinity(ncpu);
-        let requested = affinity_from_bytes(&bytes, online.len());
-        let effective: Vec<u64> = online
-            .iter()
-            .zip(requested.iter())
-            .map(|(o, r)| o & r)
-            .collect();
-        if effective.iter().all(|w| *w == 0) {
-            return Ok(LINUX_EINVAL.into());
-        }
-        // We can only mutate our own mask; setting a peer's is a permitted
-        // no-op (macOS scheduling is advisory regardless).
-        if matches!(target, AffinityTarget::SelfProc) {
-            self.proc.lock().affinity = effective;
-        }
-        Ok(DispatchOutcome::Returned { value: 0 })
-    }
-
     /// Resolve an affinity pid argument. 0 or our own pid is `SelfProc`; any
     /// other thread/process in the guest tree is `OtherGuest`; anything else
     /// is `NotFound` (ESRCH).
@@ -414,618 +164,6 @@ impl SyscallDispatcher {
         } else {
             AffinityTarget::NotFound
         }
-    }
-
-    pub(super) fn futex<M: GuestMemory>(
-        &self,
-        ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let address = ctx.arg(0);
-        let operation = ctx.arg(1);
-        let value = ctx.arg(2) as u32;
-        let timeout_address = ctx.arg(3);
-        let args = ctx.request.args;
-        let thread = ctx.thread;
-        let memory = &*ctx.memory;
-        // FUTEX_*_BITSET (9/10) are the bitset variants glibc uses for
-        // pthread join/condvar; we treat them as their plain WAIT/WAKE
-        // counterparts (match-all bitset). CLOCK_REALTIME is accepted (we
-        // service the wait with a relative timeout regardless).
-        const LINUX_FUTEX_WAIT_BITSET: u64 = 9;
-        const LINUX_FUTEX_WAKE_BITSET: u64 = 10;
-        let raw_command = operation & LINUX_FUTEX_CMD_MASK;
-        let command = match raw_command {
-            LINUX_FUTEX_WAIT_BITSET => LINUX_FUTEX_WAIT,
-            LINUX_FUTEX_WAKE_BITSET => LINUX_FUTEX_WAKE,
-            other => other,
-        };
-        let flags = operation & !LINUX_FUTEX_CMD_MASK;
-        let futex_flags = LinuxFutexFlags::from_bits_retain(flags);
-        if flags & !LinuxFutexFlags::SUPPORTED_MASK != 0 {
-            return Ok(LINUX_EINVAL.into());
-        }
-        let word = match read_u32(memory, address) {
-            Ok(word) => word,
-            Err(errno) => return Ok(errno.into()),
-        };
-
-        // Single-threaded path (no ThreadCtx): keep the prior best-effort
-        // behaviour — WAKE is a no-op success, WAIT either EAGAINs (value
-        // mismatch / no timeout) or sleeps then ETIMEDOUTs. apt's update
-        // stage runs single-threaded and tolerates this.
-        let Some(thread) = thread else {
-            return Ok(match command {
-                LINUX_FUTEX_WAKE => DispatchOutcome::Returned { value: 0 },
-                LINUX_FUTEX_WAIT => {
-                    if word != value || timeout_address == 0 {
-                        return Ok(LINUX_EAGAIN.into());
-                    }
-                    let timespec = match read_timespec(memory, timeout_address) {
-                        Ok(t) => t,
-                        Err(errno) => return Ok(errno.into()),
-                    };
-                    let timeout = match duration_from_linux_timespec(timespec) {
-                        Ok(t) => t,
-                        Err(errno) => return Ok(errno.into()),
-                    };
-                    if let Some(timeout) = timeout {
-                        std::thread::sleep(timeout);
-                    }
-                    DispatchOutcome::errno(LINUX_ETIMEDOUT)
-                }
-                _ => DispatchOutcome::errno(LINUX_ENOSYS),
-            });
-        };
-
-        // Multi-threaded path: real cross-thread WAIT/WAKE via the shared
-        // FutexTable. We support private futexes; shared-flag futexes use the
-        // same table here (the address space is shared within the process,
-        // so the keying is identical) — note it via a partial-syscall probe.
-        if !futex_flags.contains(LinuxFutexFlags::PRIVATE) {
-            ctx.reporter
-                .record(crate::compat::CompatEvent::partial_syscall(
-                    98,
-                    "futex",
-                    args,
-                    "non-private futex treated as private (shared address space)",
-                ));
-        }
-
-        Ok(match command {
-            LINUX_FUTEX_WAKE => {
-                let n = thread.futex.wake(address, value);
-                DispatchOutcome::Returned {
-                    value: i64::from(n),
-                }
-            }
-            LINUX_FUTEX_WAIT => {
-                // Re-check *uaddr under the dispatcher lock. If it changed since
-                // the guest's last read, don't block (EAGAIN). Otherwise the
-                // runtime must block with the lock RELEASED, so surface a
-                // FutexWait outcome instead of sleeping here.
-                if word != value {
-                    return Ok(LINUX_EAGAIN.into());
-                }
-                let timeout = if timeout_address == 0 {
-                    None
-                } else {
-                    let timespec = match read_timespec(memory, timeout_address) {
-                        Ok(t) => t,
-                        Err(errno) => return Ok(errno.into()),
-                    };
-                    match duration_from_linux_timespec(timespec) {
-                        Ok(t) => t,
-                        Err(errno) => return Ok(errno.into()),
-                    }
-                };
-                DispatchOutcome::FutexWait {
-                    wait: thread.futex.prepare_wait(address),
-                    timeout,
-                }
-            }
-            _ => DispatchOutcome::errno(LINUX_ENOSYS),
-        })
-    }
-
-    pub(super) fn uname<M: GuestMemory>(
-        &self,
-        ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let memory = &mut *ctx.memory;
-        let address = ctx.request.arg(0);
-        if memory
-            .write_bytes(address, LinuxUtsname::carrick_aarch64().abi_bytes())
-            .is_err()
-        {
-            return Ok(LINUX_EFAULT.into());
-        }
-        Ok(DispatchOutcome::Returned { value: 0 })
-    }
-
-    pub(super) fn ptrace<M: GuestMemory>(
-        &self,
-        _ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        // Bootstrap: no debugger surface yet. Linux returns ENOSYS when ptrace
-        // is built out of the kernel; we surface the same answer so glibc /
-        // gdb fall back cleanly.
-        Ok(LINUX_ENOSYS.into())
-    }
-
-    pub(super) fn reboot<M: GuestMemory>(
-        &self,
-        _ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        // We're not root and we wouldn't honour the request anyway.
-        Ok(LINUX_EPERM.into())
-    }
-
-    pub(super) fn sethostname<M: GuestMemory>(
-        &self,
-        _ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        Ok(LINUX_EPERM.into())
-    }
-
-    pub(super) fn setdomainname<M: GuestMemory>(
-        &self,
-        _ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        Ok(LINUX_EPERM.into())
-    }
-
-    // Process-group / session calls delegate to the host. Guest pids equal
-    // host pids (getpid mirrors std::process::id), and carrick forks each
-    // guest process as a real host child, so the host process tree mirrors the
-    // guest tree — host pgid/sid state is therefore consistent across
-    // getpgid/getsid/setsid for the whole guest process group. The previous
-    // stubs assumed "the guest is always pid 1" and returned a constant 1,
-    // which broke getpgid(0)==getpid() (getpid now returns the real host pid)
-    // and let setsid() spuriously succeed for a group leader.
-    pub(super) fn setpgid<M: GuestMemory>(
-        &self,
-        ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let pid: Pid = ctx.typed_arg(0);
-        let pgid: Pid = ctx.typed_arg(1);
-        // SAFETY: setpgid has no memory side effects; errors surface via errno.
-        if let Err(errno) = (unsafe { libc::setpgid(pid.0, pgid.0) }).host_syscall_errno() {
-            return Ok(errno.into());
-        }
-        Ok(DispatchOutcome::Returned { value: 0 })
-    }
-
-    pub(super) fn getpgid<M: GuestMemory>(
-        &self,
-        ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let pid = ctx.arg(0) as libc::pid_t;
-        let r = match (unsafe { libc::getpgid(pid) }).host_syscall_errno() {
-            Ok(value) => value,
-            Err(errno) => return Ok(errno.into()),
-        };
-        Ok(DispatchOutcome::Returned {
-            value: i64::from(r),
-        })
-    }
-
-    pub(super) fn getsid<M: GuestMemory>(
-        &self,
-        ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let pid = ctx.arg(0) as libc::pid_t;
-        let r = match (unsafe { libc::getsid(pid) }).host_syscall_errno() {
-            Ok(value) => value,
-            Err(errno) => return Ok(errno.into()),
-        };
-        Ok(DispatchOutcome::Returned {
-            value: i64::from(r),
-        })
-    }
-
-    pub(super) fn setsid<M: GuestMemory>(
-        &self,
-        _ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let r = match (unsafe { libc::setsid() }).host_syscall_errno() {
-            Ok(value) => value,
-            Err(errno) => return Ok(errno.into()),
-        };
-        Ok(DispatchOutcome::Returned {
-            value: i64::from(r),
-        })
-    }
-
-    /// waitid(2): wait for a child's state change without (optionally) reaping
-    /// it. Go's `os.Process.Wait` calls this (`P_PIDFD`/`P_PID` with
-    /// `WEXITED|WNOWAIT`) to block until a child is waitable, then reaps via
-    /// `wait4`; a stub `ECHILD` here breaks every `os/exec` round-trip. Backed
-    /// by Darwin's own `waitid` (guest pids mirror host pids); `P_PIDFD`
-    /// resolves through the pidfd's backing host pid.
-    pub(super) fn waitid<M: GuestMemory>(
-        &self,
-        ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        use crate::linux_abi::{
-            LINUX_WCONTINUED, LINUX_WEXITED, LINUX_WNOHANG, LINUX_WNOWAIT, LINUX_WSTOPPED,
-        };
-        let idtype = ctx.arg(0);
-        let id = ctx.arg(1);
-        let infop_addr = ctx.arg(2);
-        let options = ctx.arg(3);
-        if options & !LINUX_WAITID_SUPPORTED_FLAGS != 0 {
-            return Ok(LINUX_EINVAL.into());
-        }
-        if options & LINUX_WAITID_STATE_MASK == 0 {
-            return Ok(LINUX_EINVAL.into());
-        }
-        // Map the Linux (idtype, id) to a macOS (idtype_t, id). P_PIDFD has no
-        // host analogue, so resolve the pidfd to its backing host pid and wait
-        // by P_PID.
-        let (host_idtype, host_id): (libc::idtype_t, libc::id_t) = match idtype {
-            LINUX_P_ALL => (libc::P_ALL, 0),
-            LINUX_P_PID => (libc::P_PID, id as libc::id_t),
-            LINUX_P_PGID => (libc::P_PGID, id as libc::id_t),
-            LINUX_P_PIDFD => match self.pidfd_host_pid(id as i32) {
-                Some(host_pid) => (libc::P_PID, host_pid as libc::id_t),
-                None => return Ok(LINUX_EBADF.into()),
-            },
-            _ => return Ok(LINUX_EINVAL.into()),
-        };
-        // Linux and macOS agree on WNOHANG (1) but disagree on the state/wait
-        // bits (WEXITED/WSTOPPED/WCONTINUED/WNOWAIT), so translate explicitly.
-        let mut host_options: i32 = 0;
-        if options & LINUX_WEXITED != 0 {
-            host_options |= libc::WEXITED;
-        }
-        if options & LINUX_WSTOPPED != 0 {
-            host_options |= libc::WSTOPPED;
-        }
-        if options & LINUX_WCONTINUED != 0 {
-            host_options |= libc::WCONTINUED;
-        }
-        if options & LINUX_WNOWAIT != 0 {
-            host_options |= libc::WNOWAIT;
-        }
-        // Whether the guest asked for a non-blocking poll.
-        let guest_nohang = options & LINUX_WNOHANG != 0;
-
-        // Always probe non-blocking first (WNOHANG): a child that already
-        // changed state is reported immediately, and otherwise we decide how
-        // to block WITHOUT holding any lock or sitting in an uninterruptible
-        // host syscall (a stop-the-world fork must be able to wake us).
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        let r = unsafe {
-            libc::waitid(
-                host_idtype,
-                host_id,
-                &mut info,
-                host_options | libc::WNOHANG,
-            )
-        };
-        if r != 0 {
-            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-            // EINTR on a WNOHANG call is spurious (a carrick host signal); the
-            // caller re-issues. macOS ECHILD/EINVAL share Linux's numbers.
-            return Ok(DispatchOutcome::errno(errno));
-        }
-        // si_pid (copied out of the possibly-unaligned host siginfo by value)
-        // is 0 when no child was waitable.
-        clear_unrequested_waitid_state(&mut info, options);
-        let si_pid = info.si_pid;
-        if si_pid == 0 && !guest_nohang {
-            // Nothing ready and the guest wants to block. Park the vCPU thread
-            // on the child's exit event instead of blocking in libc::waitid
-            // (which a fork quiesce cannot interrupt — `hv_vcpus_exit` and the
-            // wake-pipe poke don't reach a thread inside a raw host syscall).
-            // P_PIDFD's backing kqueue (EVFILT_PROC/NOTE_EXIT) becomes readable
-            // when the child exits; poll it via WaitOnPollFds, which the
-            // per-thread waiter services and a quiesce / pending signal wakes.
-            // On wake the runtime re-dispatches this waitid, now reaping.
-            if idtype == LINUX_P_PIDFD {
-                if let Some(host_fd) = self.host_fd_for_poll(id as i32) {
-                    return Ok(DispatchOutcome::WaitOnPollFds {
-                        fds: vec![(host_fd, libc::POLLIN)],
-                        timeout: None,
-                        on_timeout: 0,
-                        block_signals: 0,
-                    });
-                }
-            }
-            // P_PID: park on the child's exit via EVFILT_PROC on the per-thread
-            // kqueue (interruptible by a signal or a fork quiesce). Go's
-            // os.Process.blockUntilWaitable takes this path.
-            if idtype == LINUX_P_PID {
-                return Ok(DispatchOutcome::WaitOnProcExit {
-                    pid: id as i32,
-                    block_signals: 0,
-                });
-            }
-            // P_ALL/P_PGID have no single pollable exit pid. Fall back to a
-            // blocking libc::waitid, breaking out if a fork quiesce begins (the
-            // guest re-issues on the resulting EINTR).
-            loop {
-                let r = unsafe { libc::waitid(host_idtype, host_id, &mut info, host_options) };
-                if r == 0 {
-                    if !clear_unrequested_waitid_state(&mut info, options) {
-                        // With WNOWAIT Darwin can report the same unrequested
-                        // stopped state repeatedly. Back off until an actually
-                        // requested state arrives.
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                        continue;
-                    }
-                    break;
-                }
-                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-                if errno == LINUX_EINTR
-                    && !crate::host_signal::has_process_pending()
-                    && !crate::fork_quiesce::is_quiescing()
-                {
-                    continue;
-                }
-                return Ok(DispatchOutcome::errno(errno));
-            }
-        }
-        // Fill the guest siginfo_t (SIGCHLD layout). Leave it zeroed when no
-        // child was waitable under a guest WNOHANG — Linux reports that as
-        // si_pid == 0, which callers (Go's blockUntilWaitable) read as "nothing
-        // ready".
-        if infop_addr != 0 {
-            let bytes = if info.si_pid == 0 {
-                [0u8; crate::linux_abi::LINUX_SIGINFO_SIZE]
-            } else {
-                build_sigchld_siginfo(info.si_pid, info.si_uid, info.si_code, info.si_status)
-            };
-            let memory = &mut *ctx.memory;
-            if memory.write_bytes(infop_addr, &bytes).is_err() {
-                return Ok(LINUX_EFAULT.into());
-            }
-        }
-        Ok(DispatchOutcome::Returned { value: 0 })
-    }
-
-    pub(super) fn wait4<M: GuestMemory>(
-        &self,
-        ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let pid = ctx.arg(0) as i32;
-        let wstatus_addr = ctx.arg(1);
-        let options = ctx.arg(2);
-        let rusage_addr = ctx.arg(3);
-        let memory = &mut *ctx.memory;
-        if options & !LINUX_WAIT4_SUPPORTED_FLAGS != 0 {
-            return Ok(LINUX_EINVAL.into());
-        }
-        // Translate Linux wait options to macOS: WNOHANG/WUNTRACED share bits
-        // (1/2) but WCONTINUED is 8 on Linux vs 0x10 on macOS — passing the
-        // Linux bit straight through makes macOS waitpid reject it with EINVAL
-        // (breaking bash's WNOHANG|WUNTRACED|WCONTINUED job-control poll). The
-        // Linux-only thread flags (WALL/WCLONE/WNOTHREAD) have no macOS analogue
-        // and are dropped.
-        let mut host_options: i32 = 0;
-        if options & crate::linux_abi::LINUX_WNOHANG != 0 {
-            host_options |= libc::WNOHANG;
-        }
-        if options & crate::linux_abi::LINUX_WUNTRACED != 0 {
-            host_options |= libc::WUNTRACED;
-        }
-        if options & crate::linux_abi::LINUX_WCONTINUED != 0 {
-            host_options |= libc::WCONTINUED;
-        }
-        let mut host_status: i32 = 0;
-        // Collect the reaped child's resource usage from Darwin's own wait4
-        // (the same mechanism Linux uses to fill RUSAGE_CHILDREN); we add the
-        // child's *guest* CPU — which the host rusage can't see — separately.
-        let mut host_rusage: libc::rusage = unsafe { std::mem::zeroed() };
-        let can_park_on_proc_exit = pid > 0
-            && host_options & libc::WNOHANG == 0
-            && options & (crate::linux_abi::LINUX_WUNTRACED | crate::linux_abi::LINUX_WCONTINUED)
-                == 0;
-        let result = if can_park_on_proc_exit {
-            // Probe first. If the specific child is not waitable yet, park in
-            // the runtime's kqueue-backed process-exit waiter instead of raw
-            // libc::wait4. A fork quiesce can wake that waiter; it cannot wake
-            // a thread stuck inside the host wait4 syscall.
-            let r = unsafe {
-                libc::wait4(
-                    pid,
-                    &mut host_status,
-                    host_options | libc::WNOHANG,
-                    &mut host_rusage,
-                )
-            };
-            match r.host_syscall_errno() {
-                Ok(0) => {
-                    return Ok(DispatchOutcome::WaitOnProcExit {
-                        pid,
-                        block_signals: 0,
-                    });
-                }
-                Ok(value) => Ok(value),
-                Err(errno) => Err(errno),
-            }
-        } else {
-            // Retry the blocking host wait4 across EINTR from carrick-internal
-            // host signals (e.g. the SIGURG vCPU kick). Without this, a shell
-            // blocked waiting on a foreground job spuriously returns from wait,
-            // leaves the wait, and spins. Only surface EINTR to the guest when a
-            // signal it can actually take is pending (so its handler runs / it
-            // dies) — same discipline as host_sleep_interruptible and
-            // read_host_pipe.
-            loop {
-                let r =
-                    unsafe { libc::wait4(pid, &mut host_status, host_options, &mut host_rusage) };
-                match r.host_syscall_errno() {
-                    Ok(value) => break Ok(value),
-                    Err(errno) => {
-                        if errno == LINUX_EINTR && !crate::host_signal::has_process_pending() {
-                            continue;
-                        }
-                        break Err(errno);
-                    }
-                }
-            }
-        };
-        let result = match result {
-            Ok(value) => value,
-            Err(errno) => {
-                // ECHILD on macOS == ECHILD on Linux (10); EINTR surfaces only when
-                // a guest-deliverable signal is pending (see the retry loop).
-                return Ok(errno.into());
-            }
-        };
-        if result == 0 {
-            // WNOHANG and no child ready.
-            return Ok(DispatchOutcome::Returned { value: 0 });
-        }
-        // Roll the reaped child's CPU into this process's child-time totals
-        // (getrusage RUSAGE_CHILDREN, times cutime/cstime). The host rusage
-        // covers carrick's host-side work for the child; the child's guest
-        // execution (invisible to the host rusage) is drained from the shared
-        // table the child published on exit. user = guest compute + host user;
-        // system = host system work.
-        let tv_us = |t: libc::timeval| t.tv_sec as u64 * 1_000_000 + t.tv_usec as u64;
-        let child_guest_us = crate::guest_cpu::reap_child_guest_ns(result as u32) / 1000;
-        let child_user_us = child_guest_us + tv_us(host_rusage.ru_utime);
-        let child_system_us = tv_us(host_rusage.ru_stime);
-        crate::guest_cpu::add_reaped_child(child_user_us, child_system_us);
-        // If the guest passed a rusage out-param, fill it with THIS child's
-        // usage (not the cumulative total).
-        if rusage_addr != 0 {
-            let child_rusage = rusage_from_us(child_user_us, child_system_us);
-            if memory
-                .write_bytes(rusage_addr, child_rusage.abi_bytes())
-                .is_err()
-            {
-                return Ok(LINUX_EFAULT.into());
-            }
-        }
-        // Linux and Darwin agree on the wstatus LAYOUT (low 7 bits = signal,
-        // bit 7 = core flag, bits 8..15 = exit code) but NOT on signal
-        // NUMBERS, so a signal-death's termsig must be translated host->Linux
-        // (e.g. a child killed by SIGUSR1 dies as host signal 30; the guest
-        // must read WTERMSIG == 10). The exit-status byte is untouched.
-        let host_status = translate_wait_status(host_status);
-        if wstatus_addr != 0 {
-            let bytes = host_status.to_ne_bytes();
-            if memory.write_bytes(wstatus_addr, &bytes).is_err() {
-                return Ok(LINUX_EFAULT.into());
-            }
-        }
-        Ok(DispatchOutcome::Returned {
-            value: i64::from(result),
-        })
-    }
-
-    /// Linux `execve(2)` (aarch64 syscall 221). Reads pathname, argv,
-    /// and envp from guest memory, then surfaces `DispatchOutcome::Execve`
-    /// so the runtime can tear down the guest address space and load
-    /// the new image. Returns the usual errno on the failure paths
-    /// (EFAULT on bad pointers, ENAMETOOLONG on oversized strings).
-    pub(super) fn execve<M: GuestMemory>(
-        &self,
-        ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let pathname_addr = ctx.arg(0);
-        let argv_addr = ctx.arg(1);
-        let envp_addr = ctx.arg(2);
-        let memory = &*ctx.memory;
-
-        let path = match read_guest_c_string(memory, pathname_addr) {
-            Ok(p) => p,
-            Err(errno) => return Ok(errno.into()),
-        };
-        let argv = match read_guest_string_array(memory, argv_addr) {
-            Ok(v) => v,
-            Err(errno) => return Ok(errno.into()),
-        };
-        let env = match read_guest_string_array(memory, envp_addr) {
-            Ok(v) => v,
-            Err(errno) => return Ok(errno.into()),
-        };
-
-        Ok(DispatchOutcome::Execve { path, argv, env })
-    }
-
-    /// Linux `clone(2)` (aarch64 syscall 220). Real fork delegation:
-    /// the dispatcher recognises clone, returns `DispatchOutcome::Fork`,
-    /// and the runtime asks the trap engine to do a real macOS fork
-    /// against the live HVF state.
-    ///
-    /// Thread-create flags (CLONE_VM | CLONE_THREAD etc.) now emit
-    /// `DispatchOutcome::CloneThread` so the runtime can spin up a new
-    /// vCPU sharing the same address space.  All other flags (including
-    /// the SIGCHLD-only fork case) still return `DispatchOutcome::Fork`.
-    ///
-    /// aarch64 clone ABI: clone(flags, stack, parent_tid, tls, child_tid)
-    pub(super) fn clone<M: GuestMemory>(
-        &self,
-        ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let flags = ctx.arg(0);
-        let thread_mask = LinuxCloneFlags::THREAD_MASK;
-        if (flags & thread_mask) == thread_mask {
-            // aarch64 ABI: clone(flags, stack, parent_tid, tls, child_tid)
-            let stack = ctx.arg(1);
-            let parent_tid_addr = if flags & LinuxCloneFlags::PARENT_SETTID.bits() != 0 {
-                ctx.arg(2)
-            } else {
-                0
-            };
-            let tls = if flags & LinuxCloneFlags::SETTLS.bits() != 0 {
-                ctx.arg(3)
-            } else {
-                0
-            };
-            let child_tid_addr = if flags
-                & (LinuxCloneFlags::CHILD_SETTID | LinuxCloneFlags::CHILD_CLEARTID).bits()
-                != 0
-            {
-                ctx.arg(4)
-            } else {
-                0
-            };
-            return Ok(DispatchOutcome::CloneThread {
-                stack,
-                tls,
-                flags,
-                parent_tid_addr,
-                child_tid_addr,
-            });
-        }
-
-        // Anything else (including the SIGCHLD-only fork case) → real fork.
-        // Legacy clone(2) returns the CLONE_PIDFD fd via the parent_tid pointer
-        // (arg2); it's mutually exclusive with CLONE_PARENT_SETTID.
-        let pidfd_out = if flags & LinuxCloneFlags::PIDFD.bits() != 0 {
-            Some(ctx.arg(2))
-        } else {
-            None
-        };
-        Ok(DispatchOutcome::Fork { pidfd_out })
-    }
-
-    /// pidfd_open(2): return a file descriptor referring to process `pid`. The
-    /// fd is backed by a host kqueue watching the real macOS process via
-    /// `EVFILT_PROC`/`NOTE_EXIT` (guest pids mirror host pids), so the macOS
-    /// kernel tracks the process lifecycle. Go 1.24's `os/exec` requires this
-    /// to succeed before it will spawn (it probes pidfd support, then uses
-    /// `CLONE_PIDFD`).
-    pub(super) fn pidfd_open<M: GuestMemory>(
-        &self,
-        ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let pid = ctx.arg(0) as i32;
-        let flags = ctx.arg(1);
-        // PIDFD_NONBLOCK == O_NONBLOCK (0o4000) on aarch64 Linux.
-        const PIDFD_NONBLOCK: u64 = 0o4000;
-        if pid <= 0 {
-            return Ok(LINUX_EINVAL.into());
-        }
-        if flags & !PIDFD_NONBLOCK != 0 {
-            return Ok(LINUX_EINVAL.into());
-        }
-        Ok(self.open_pidfd(pid, flags))
     }
 
     /// Allocate a pidfd for `host_pid`. Shared by `pidfd_open` and the
@@ -1071,32 +209,6 @@ impl SyscallDispatcher {
         }
     }
 
-    /// pidfd_send_signal(2): send `sig` to the process referred to by `pidfd`.
-    /// Routed through the same cross-process delivery as `kill(2)` on the
-    /// resolved host pid (guest pids mirror host pids).
-    pub(super) fn pidfd_send_signal<M: GuestMemory>(
-        &self,
-        ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let fd = ctx.arg(0) as i32;
-        let signum = ctx.arg(1);
-        let Some(host_pid) = self.pidfd_host_pid(fd) else {
-            return Ok(LINUX_EBADF.into());
-        };
-        if signum == 0 {
-            // Existence check.
-            return Ok(DispatchOutcome::Returned { value: 0 });
-        }
-        if !crate::dispatch::signal::is_valid_signum(signum) {
-            return Ok(LINUX_EINVAL.into());
-        }
-        Ok(crate::dispatch::signal::bootstrap_signal_send(
-            i64::from(host_pid),
-            /*tid_required=*/ false,
-            signum,
-        ))
-    }
-
     /// clone3(2): like clone, but flags and the rest of the parameters live in
     /// a `struct clone_args` pointed to by arg0 (arg1 is its size). glibc's
     /// posix_spawn/fork now prefer clone3; without it apt-get's worker spawn
@@ -1109,18 +221,12 @@ impl SyscallDispatcher {
     ///
     /// Thread-create flags now emit `DispatchOutcome::CloneThread`.
     /// Fork-like flags still return `DispatchOutcome::Fork`.
-    fn clone3(&self, request: SyscallRequest, memory: &impl GuestMemory) -> DispatchOutcome {
-        let args_ptr = request.arg(0);
-        let args_size = request.arg(1);
-        // clone_args is at least flags(8)+pidfd(8)+child_tid(8)+parent_tid(8)
-        // +exit_signal(8) = 40 bytes; flags is the first field.
+    fn clone3(&self, args_ptr: GuestPtr, args_size: u64, memory: &impl GuestMemory) -> DispatchOutcome {
+        let args_ptr = args_ptr.0;
         if args_size < 8 {
             return DispatchOutcome::errno(LINUX_EINVAL);
         }
 
-        // Read up to the full struct (64 bytes through tls@56). glibc always
-        // passes the complete struct; if the caller passes a truncated struct
-        // with thread flags set we fall back to ENOSYS with a note below.
         let read_len = args_size.min(<LinuxCloneArgs as KernelAbi>::ABI_SIZE as u64) as usize;
         let args = match read_kernel_prefix::<LinuxCloneArgs>(memory, args_ptr, read_len) {
             Ok(args) => args,
@@ -1132,9 +238,6 @@ impl SyscallDispatcher {
         let flags = args.flags;
         let thread_mask = LinuxCloneFlags::THREAD_MASK;
         if (flags & thread_mask) == thread_mask {
-            // glibc always passes the full struct (64 bytes); if for some reason
-            // the caller passes a short struct with thread flags, return ENOSYS
-            // rather than misreading uninitialised fields.
             if args_size < 64 {
                 return DispatchOutcome::errno(LINUX_ENOSYS);
             }
@@ -1145,7 +248,6 @@ impl SyscallDispatcher {
             let stack_size = args.stack_size;
             let tls_val = args.tls;
 
-            // child SP = stack base + stack_size (stack grows down on aarch64)
             let child_sp = stack + stack_size;
             let tls = if flags & LinuxCloneFlags::SETTLS.bits() != 0 {
                 tls_val
@@ -1175,10 +277,6 @@ impl SyscallDispatcher {
             };
         }
 
-        // posix_spawn's CLONE_VM|CLONE_VFORK|SIGCHLD and plain SIGCHLD forks
-        // both land here. A real fork is a valid implementation of vfork (the
-        // child execs or _exits immediately), so route to the same path.
-        // clone3 returns the CLONE_PIDFD fd via the clone_args.pidfd field.
         let pidfd_out = if flags & LinuxCloneFlags::PIDFD.bits() != 0 {
             Some(args.pidfd)
         } else {
@@ -1187,19 +285,612 @@ impl SyscallDispatcher {
         DispatchOutcome::Fork { pidfd_out }
     }
 
-    pub(super) fn getrandom<M: GuestMemory>(
-        &self,
-        ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let address = ctx.arg(0);
-        let length =
-            usize::try_from(ctx.arg(1)).map_err(|_| DispatchError::LengthTooLarge(ctx.arg(1)))?;
-        let memory = &mut *ctx.memory;
+    fn rseq(&self) -> DispatchOutcome {
+        DispatchOutcome::errno(LINUX_ENOSYS)
+    }
+}
+
+impl SyscallDispatcher {
+define_syscall! {
+    fn personality(this, cx, requested: u64) {
+        let mut proc = this.proc.lock();
+        let previous = proc.personality;
+        if requested != LINUX_PERSONALITY_QUERY {
+            proc.personality = requested;
+        }
+        Ok(DispatchOutcome::Returned {
+            value: previous as i64,
+        })
+    }
+
+    fn prctl(this, cx, option: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) {
+        let memory = &mut *cx.memory;
+        Ok(match option {
+            LINUX_PR_GET_DUMPABLE => DispatchOutcome::Returned {
+                value: this.proc.lock().dumpable,
+            },
+            LINUX_PR_SET_DUMPABLE => {
+                if arg2 > 1 {
+                    return Ok(LINUX_EINVAL.into());
+                }
+                this.proc.lock().dumpable = arg2 as i64;
+                DispatchOutcome::Returned { value: 0 }
+            }
+            LINUX_PR_SET_NAME => {
+                let Ok(bytes) = memory.read_bytes(arg2, LINUX_TASK_COMM_LEN) else {
+                    return Ok(LINUX_EFAULT.into());
+                };
+                let task_name = linux_task_name_from_bytes(&bytes);
+                this.proc.lock().task_name = task_name;
+                set_host_process_name(&task_name);
+                DispatchOutcome::Returned { value: 0 }
+            }
+            LINUX_PR_GET_NAME => {
+                let task_name = this.proc.lock().task_name;
+                if memory.write_bytes(arg2, &task_name).is_err() {
+                    return Ok(LINUX_EFAULT.into());
+                }
+                DispatchOutcome::Returned { value: 0 }
+            }
+            LINUX_PR_SET_PDEATHSIG => {
+                if arg2 > 64 {
+                    return Ok(LINUX_EINVAL.into());
+                }
+                this.proc.lock().pdeathsig = arg2 as i64;
+                DispatchOutcome::Returned { value: 0 }
+            }
+            LINUX_PR_GET_PDEATHSIG => {
+                let pdeathsig = this.proc.lock().pdeathsig;
+                if memory
+                    .write_bytes(arg2, &(pdeathsig as i32).to_ne_bytes())
+                    .is_err()
+                {
+                    return Ok(LINUX_EFAULT.into());
+                }
+                DispatchOutcome::Returned { value: 0 }
+            }
+            _ => DispatchOutcome::errno(LINUX_EINVAL),
+        })
+    }
+
+    fn getcpu(this, cx, cpu_address: GuestPtr, node_address: GuestPtr) {
+        let memory = &mut *cx.memory;
+        let cpu = lowest_set_cpu(&this.proc.lock().affinity).unwrap_or(0);
+        let cpu_value = cpu.to_ne_bytes();
+        let node_value = 0u32.to_ne_bytes();
+
+        if cpu_address.0 != 0 && memory.write_bytes(cpu_address.0, &cpu_value).is_err() {
+            return Ok(LINUX_EFAULT.into());
+        }
+        if node_address.0 != 0 && memory.write_bytes(node_address.0, &node_value).is_err() {
+            return Ok(LINUX_EFAULT.into());
+        }
+        Ok(DispatchOutcome::Returned { value: 0 })
+    }
+
+    fn gettid(this, cx) {
+        if let Some(t) = cx.thread {
+            if t.registry.live_count() > 1 {
+                return Ok(DispatchOutcome::Returned {
+                    value: t.tid as i64,
+                });
+            }
+        }
+        Ok(this.getpid())
+    }
+
+    fn set_tid_address(this, cx, addr: GuestPtr) {
+        if let Some(t) = cx.thread {
+            t.registry.set_clear_child_tid(t.tid, addr.0);
+            return Ok(DispatchOutcome::Returned {
+                value: t.tid as i64,
+            });
+        }
+        Ok(this.getpid())
+    }
+
+    fn set_robust_list(this, cx, head: GuestPtr, len: u64) {
+        if len == 0 {
+            return Ok(LINUX_EINVAL.into());
+        }
+        Ok(DispatchOutcome::Returned { value: 0 })
+    }
+
+    fn sched_yield(this, cx) {
+        std::thread::yield_now();
+        Ok(DispatchOutcome::Returned { value: 0 })
+    }
+
+    fn sched_getaffinity(this, cx, pid: u64, size: u64, address: GuestPtr) {
+        let size = size as usize;
+        let memory = &mut *cx.memory;
+
+        if matches!(this.resolve_affinity_target(pid), AffinityTarget::NotFound) {
+            return Ok(LINUX_ESRCH.into());
+        }
+        let kernel_bytes = crate::host_facts::logical_cpu_count().div_ceil(64) * 8;
+        if size < kernel_bytes {
+            return Ok(LINUX_EINVAL.into());
+        }
+        let mask = this.proc.lock().affinity.clone();
+        let buf = affinity_to_bytes(&mask, kernel_bytes);
+        if memory.write_bytes(address.0, &buf).is_err() {
+            return Ok(LINUX_EFAULT.into());
+        }
+        Ok(DispatchOutcome::Returned {
+            value: kernel_bytes as i64,
+        })
+    }
+
+    fn sched_setaffinity(this, cx, pid: u64, size: u64, address: GuestPtr) {
+        let size = size as usize;
+        let memory = &*cx.memory;
+
+        let read_len = size.min(128);
+        let bytes = match memory.read_bytes(address.0, read_len) {
+            Ok(bytes) => bytes,
+            Err(_) => return Ok(LINUX_EFAULT.into()),
+        };
+        let target = this.resolve_affinity_target(pid);
+        if matches!(target, AffinityTarget::NotFound) {
+            return Ok(LINUX_ESRCH.into());
+        }
+        if matches!(target, AffinityTarget::OtherGuest) && this.creds.lock().euid != 0 {
+            return Ok(LINUX_EPERM.into());
+        }
+        let ncpu = crate::host_facts::logical_cpu_count();
+        let online = default_affinity(ncpu);
+        let requested = affinity_from_bytes(&bytes, online.len());
+        let effective: Vec<u64> = online
+            .iter()
+            .zip(requested.iter())
+            .map(|(o, r)| o & r)
+            .collect();
+        if effective.iter().all(|w| *w == 0) {
+            return Ok(LINUX_EINVAL.into());
+        }
+        if matches!(target, AffinityTarget::SelfProc) {
+            this.proc.lock().affinity = effective;
+        }
+        Ok(DispatchOutcome::Returned { value: 0 })
+    }
+
+    fn futex(this, cx, address: GuestPtr, operation: u64, value: u64, timeout_address: GuestPtr) {
+        let value = value as u32;
+        let args = cx.request.args;
+        let thread = cx.thread;
+        let memory = &*cx.memory;
+        const LINUX_FUTEX_WAIT_BITSET: u64 = 9;
+        const LINUX_FUTEX_WAKE_BITSET: u64 = 10;
+        let raw_command = operation & LINUX_FUTEX_CMD_MASK;
+        let command = match raw_command {
+            LINUX_FUTEX_WAIT_BITSET => LINUX_FUTEX_WAIT,
+            LINUX_FUTEX_WAKE_BITSET => LINUX_FUTEX_WAKE,
+            other => other,
+        };
+        let flags = operation & !LINUX_FUTEX_CMD_MASK;
+        let futex_flags = LinuxFutexFlags::from_bits_retain(flags);
+        if flags & !LinuxFutexFlags::SUPPORTED_MASK != 0 {
+            return Ok(LINUX_EINVAL.into());
+        }
+        let word = match read_u32(memory, address.0) {
+            Ok(word) => word,
+            Err(errno) => return Ok(errno.into()),
+        };
+
+        let Some(thread) = thread else {
+            return Ok(match command {
+                LINUX_FUTEX_WAKE => DispatchOutcome::Returned { value: 0 },
+                LINUX_FUTEX_WAIT => {
+                    if word != value || timeout_address.0 == 0 {
+                        return Ok(LINUX_EAGAIN.into());
+                    }
+                    let timespec = match read_timespec(memory, timeout_address.0) {
+                        Ok(t) => t,
+                        Err(errno) => return Ok(errno.into()),
+                    };
+                    let timeout = match duration_from_linux_timespec(timespec) {
+                        Ok(t) => t,
+                        Err(errno) => return Ok(errno.into()),
+                    };
+                    if let Some(timeout) = timeout {
+                        std::thread::sleep(timeout);
+                    }
+                    DispatchOutcome::errno(LINUX_ETIMEDOUT)
+                }
+                _ => DispatchOutcome::errno(LINUX_ENOSYS),
+            });
+        };
+
+        if !futex_flags.contains(LinuxFutexFlags::PRIVATE) {
+            cx.reporter
+                .record(crate::compat::CompatEvent::partial_syscall(
+                    98,
+                    "futex",
+                    args,
+                    "non-private futex treated as private (shared address space)",
+                ));
+        }
+
+        Ok(match command {
+            LINUX_FUTEX_WAKE => {
+                let n = thread.futex.wake(address.0, value);
+                DispatchOutcome::Returned {
+                    value: i64::from(n),
+                }
+            }
+            LINUX_FUTEX_WAIT => {
+                if word != value {
+                    return Ok(LINUX_EAGAIN.into());
+                }
+                let timeout = if timeout_address.0 == 0 {
+                    None
+                } else {
+                    let timespec = match read_timespec(memory, timeout_address.0) {
+                        Ok(t) => t,
+                        Err(errno) => return Ok(errno.into()),
+                    };
+                    match duration_from_linux_timespec(timespec) {
+                        Ok(t) => t,
+                        Err(errno) => return Ok(errno.into()),
+                    }
+                };
+                DispatchOutcome::FutexWait {
+                    wait: thread.futex.prepare_wait(address.0),
+                    timeout,
+                }
+            }
+            _ => DispatchOutcome::errno(LINUX_ENOSYS),
+        })
+    }
+
+    fn uname(this, cx, address: GuestPtr) {
+        let memory = &mut *cx.memory;
+        if memory
+            .write_bytes(address.0, LinuxUtsname::carrick_aarch64().abi_bytes())
+            .is_err()
+        {
+            return Ok(LINUX_EFAULT.into());
+        }
+        Ok(DispatchOutcome::Returned { value: 0 })
+    }
+
+    fn ptrace(this, cx) {
+        Ok(LINUX_ENOSYS.into())
+    }
+
+    fn reboot(this, cx) {
+        Ok(LINUX_EPERM.into())
+    }
+
+    fn sethostname(this, cx) {
+        Ok(LINUX_EPERM.into())
+    }
+
+    fn setdomainname(this, cx) {
+        Ok(LINUX_EPERM.into())
+    }
+
+    fn setpgid(this, cx, pid: Pid, pgid: Pid) {
+        if let Err(errno) = (unsafe { libc::setpgid(pid.0, pgid.0) }).host_syscall_errno() {
+            return Ok(errno.into());
+        }
+        Ok(DispatchOutcome::Returned { value: 0 })
+    }
+
+    fn getpgid(this, cx, pid: Pid) {
+        let r = match (unsafe { libc::getpgid(pid.0) }).host_syscall_errno() {
+            Ok(value) => value,
+            Err(errno) => return Ok(errno.into()),
+        };
+        Ok(DispatchOutcome::Returned {
+            value: i64::from(r),
+        })
+    }
+
+    fn getsid(this, cx, pid: Pid) {
+        let r = match (unsafe { libc::getsid(pid.0) }).host_syscall_errno() {
+            Ok(value) => value,
+            Err(errno) => return Ok(errno.into()),
+        };
+        Ok(DispatchOutcome::Returned {
+            value: i64::from(r),
+        })
+    }
+
+    fn setsid(this, cx) {
+        let r = match (unsafe { libc::setsid() }).host_syscall_errno() {
+            Ok(value) => value,
+            Err(errno) => return Ok(errno.into()),
+        };
+        Ok(DispatchOutcome::Returned {
+            value: i64::from(r),
+        })
+    }
+
+    fn waitid(this, cx, idtype: u64, id: u64, infop_addr: GuestPtr, options: u64) {
+        use crate::linux_abi::{
+            LINUX_WCONTINUED, LINUX_WEXITED, LINUX_WNOHANG, LINUX_WNOWAIT, LINUX_WSTOPPED,
+        };
+        if options & !LINUX_WAITID_SUPPORTED_FLAGS != 0 {
+            return Ok(LINUX_EINVAL.into());
+        }
+        if options & LINUX_WAITID_STATE_MASK == 0 {
+            return Ok(LINUX_EINVAL.into());
+        }
+        let (host_idtype, host_id): (libc::idtype_t, libc::id_t) = match idtype {
+            LINUX_P_ALL => (libc::P_ALL, 0),
+            LINUX_P_PID => (libc::P_PID, id as libc::id_t),
+            LINUX_P_PGID => (libc::P_PGID, id as libc::id_t),
+            LINUX_P_PIDFD => match this.pidfd_host_pid(id as i32) {
+                Some(host_pid) => (libc::P_PID, host_pid as libc::id_t),
+                None => return Ok(LINUX_EBADF.into()),
+            },
+            _ => return Ok(LINUX_EINVAL.into()),
+        };
+        let mut host_options: i32 = 0;
+        if options & LINUX_WEXITED != 0 {
+            host_options |= libc::WEXITED;
+        }
+        if options & LINUX_WSTOPPED != 0 {
+            host_options |= libc::WSTOPPED;
+        }
+        if options & LINUX_WCONTINUED != 0 {
+            host_options |= libc::WCONTINUED;
+        }
+        if options & LINUX_WNOWAIT != 0 {
+            host_options |= libc::WNOWAIT;
+        }
+        let guest_nohang = options & LINUX_WNOHANG != 0;
+
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let r = unsafe {
+            libc::waitid(
+                host_idtype,
+                host_id,
+                &mut info,
+                host_options | libc::WNOHANG,
+            )
+        };
+        if r != 0 {
+            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            return Ok(DispatchOutcome::errno(errno));
+        }
+        clear_unrequested_waitid_state(&mut info, options);
+        let si_pid = info.si_pid;
+        if si_pid == 0 && !guest_nohang {
+            if idtype == LINUX_P_PIDFD {
+                if let Some(host_fd) = this.host_fd_for_poll(id as i32) {
+                    return Ok(DispatchOutcome::WaitOnPollFds {
+                        fds: vec![(host_fd, libc::POLLIN)],
+                        timeout: None,
+                        on_timeout: 0,
+                        block_signals: 0,
+                    });
+                }
+            }
+            if idtype == LINUX_P_PID {
+                return Ok(DispatchOutcome::WaitOnProcExit {
+                    pid: id as i32,
+                    block_signals: 0,
+                });
+            }
+            loop {
+                let r = unsafe { libc::waitid(host_idtype, host_id, &mut info, host_options) };
+                if r == 0 {
+                    if !clear_unrequested_waitid_state(&mut info, options) {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        continue;
+                    }
+                    break;
+                }
+                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                if errno == LINUX_EINTR
+                    && !crate::host_signal::has_process_pending()
+                    && !crate::fork_quiesce::is_quiescing()
+                {
+                    continue;
+                }
+                return Ok(DispatchOutcome::errno(errno));
+            }
+        }
+        if infop_addr.0 != 0 {
+            let bytes = if info.si_pid == 0 {
+                [0u8; crate::linux_abi::LINUX_SIGINFO_SIZE]
+            } else {
+                build_sigchld_siginfo(info.si_pid, info.si_uid, info.si_code, info.si_status)
+            };
+            let memory = &mut *cx.memory;
+            if memory.write_bytes(infop_addr.0, &bytes).is_err() {
+                return Ok(LINUX_EFAULT.into());
+            }
+        }
+        Ok(DispatchOutcome::Returned { value: 0 })
+    }
+
+    fn wait4(this, cx, pid: Pid, wstatus_addr: GuestPtr, options: u64, rusage_addr: GuestPtr) {
+        let memory = &mut *cx.memory;
+        if options & !LINUX_WAIT4_SUPPORTED_FLAGS != 0 {
+            return Ok(LINUX_EINVAL.into());
+        }
+        let mut host_options: i32 = 0;
+        if options & crate::linux_abi::LINUX_WNOHANG != 0 {
+            host_options |= libc::WNOHANG;
+        }
+        if options & crate::linux_abi::LINUX_WUNTRACED != 0 {
+            host_options |= libc::WUNTRACED;
+        }
+        if options & crate::linux_abi::LINUX_WCONTINUED != 0 {
+            host_options |= libc::WCONTINUED;
+        }
+        let mut host_status: i32 = 0;
+        let mut host_rusage: libc::rusage = unsafe { std::mem::zeroed() };
+        let can_park_on_proc_exit = pid.0 > 0
+            && host_options & libc::WNOHANG == 0
+            && options & (crate::linux_abi::LINUX_WUNTRACED | crate::linux_abi::LINUX_WCONTINUED)
+                == 0;
+        let result = if can_park_on_proc_exit {
+            let r = unsafe {
+                libc::wait4(
+                    pid.0,
+                    &mut host_status,
+                    host_options | libc::WNOHANG,
+                    &mut host_rusage,
+                )
+            };
+            match r.host_syscall_errno() {
+                Ok(0) => {
+                    return Ok(DispatchOutcome::WaitOnProcExit {
+                        pid: pid.0,
+                        block_signals: 0,
+                    });
+                }
+                Ok(value) => Ok(value),
+                Err(errno) => Err(errno),
+            }
+        } else {
+            loop {
+                let r =
+                    unsafe { libc::wait4(pid.0, &mut host_status, host_options, &mut host_rusage) };
+                match r.host_syscall_errno() {
+                    Ok(value) => break Ok(value),
+                    Err(errno) => {
+                        if errno == LINUX_EINTR && !crate::host_signal::has_process_pending() {
+                            continue;
+                        }
+                        break Err(errno);
+                    }
+                }
+            }
+        };
+        let result = match result {
+            Ok(value) => value,
+            Err(errno) => {
+                return Ok(errno.into());
+            }
+        };
+        if result == 0 {
+            return Ok(DispatchOutcome::Returned { value: 0 });
+        }
+        let tv_us = |t: libc::timeval| t.tv_sec as u64 * 1_000_000 + t.tv_usec as u64;
+        let child_guest_us = crate::guest_cpu::reap_child_guest_ns(result as u32) / 1000;
+        let child_user_us = child_guest_us + tv_us(host_rusage.ru_utime);
+        let child_system_us = tv_us(host_rusage.ru_stime);
+        crate::guest_cpu::add_reaped_child(child_user_us, child_system_us);
+        if rusage_addr.0 != 0 {
+            let child_rusage = rusage_from_us(child_user_us, child_system_us);
+            if memory
+                .write_bytes(rusage_addr.0, child_rusage.abi_bytes())
+                .is_err()
+            {
+                return Ok(LINUX_EFAULT.into());
+            }
+        }
+        let host_status = translate_wait_status(host_status);
+        if wstatus_addr.0 != 0 {
+            let bytes = host_status.to_ne_bytes();
+            if memory.write_bytes(wstatus_addr.0, &bytes).is_err() {
+                return Ok(LINUX_EFAULT.into());
+            }
+        }
+        Ok(DispatchOutcome::Returned {
+            value: i64::from(result),
+        })
+    }
+
+    fn execve(this, cx, pathname_addr: GuestPtr, argv_addr: GuestPtr, envp_addr: GuestPtr) {
+        let memory = &*cx.memory;
+
+        let path = match read_guest_c_string(memory, pathname_addr.0) {
+            Ok(p) => p,
+            Err(errno) => return Ok(errno.into()),
+        };
+        let argv = match read_guest_string_array(memory, argv_addr.0) {
+            Ok(v) => v,
+            Err(errno) => return Ok(errno.into()),
+        };
+        let env = match read_guest_string_array(memory, envp_addr.0) {
+            Ok(v) => v,
+            Err(errno) => return Ok(errno.into()),
+        };
+
+        Ok(DispatchOutcome::Execve { path, argv, env })
+    }
+
+    fn clone(this, cx, flags: u64, stack: u64, parent_tid: GuestPtr, tls: u64, child_tid: GuestPtr) {
+        let thread_mask = LinuxCloneFlags::THREAD_MASK;
+        if (flags & thread_mask) == thread_mask {
+            let parent_tid_addr = if flags & LinuxCloneFlags::PARENT_SETTID.bits() != 0 {
+                parent_tid.0
+            } else {
+                0
+            };
+            let tls = if flags & LinuxCloneFlags::SETTLS.bits() != 0 {
+                tls
+            } else {
+                0
+            };
+            let child_tid_addr = if flags
+                & (LinuxCloneFlags::CHILD_SETTID | LinuxCloneFlags::CHILD_CLEARTID).bits()
+                != 0
+            {
+                child_tid.0
+            } else {
+                0
+            };
+            return Ok(DispatchOutcome::CloneThread {
+                stack,
+                tls,
+                flags,
+                parent_tid_addr,
+                child_tid_addr,
+            });
+        }
+
+        let pidfd_out = if flags & LinuxCloneFlags::PIDFD.bits() != 0 {
+            Some(parent_tid.0)
+        } else {
+            None
+        };
+        Ok(DispatchOutcome::Fork { pidfd_out })
+    }
+
+    fn pidfd_open(this, cx, pid: Pid, flags: u64) {
+        const PIDFD_NONBLOCK: u64 = 0o4000;
+        if pid.0 <= 0 {
+            return Ok(LINUX_EINVAL.into());
+        }
+        if flags & !PIDFD_NONBLOCK != 0 {
+            return Ok(LINUX_EINVAL.into());
+        }
+        Ok(this.open_pidfd(pid.0, flags))
+    }
+
+    fn pidfd_send_signal(this, cx, fd: Fd, signum: u64, _info: GuestPtr, _flags: u64) {
+        let Some(host_pid) = this.pidfd_host_pid(fd.0) else {
+            return Ok(LINUX_EBADF.into());
+        };
+        if signum == 0 {
+            return Ok(DispatchOutcome::Returned { value: 0 });
+        }
+        if !crate::dispatch::signal::is_valid_signum(signum) {
+            return Ok(LINUX_EINVAL.into());
+        }
+        Ok(crate::dispatch::signal::bootstrap_signal_send(
+            i64::from(host_pid),
+            /*tid_required=*/ false,
+            signum,
+        ))
+    }
+
+    fn getrandom(this, cx, address: GuestPtr, length: u64, flags: u64) {
+        let length = usize::try_from(length).map_err(|_| DispatchError::LengthTooLarge(length))?;
+        let memory = &mut *cx.memory;
         let mut bytes = vec![0; length];
         if getrandom::fill(&mut bytes).is_err() {
             fill_deterministic_bootstrap_random(&mut bytes);
         }
-        if memory.write_bytes(address, &bytes).is_err() {
+        if memory.write_bytes(address.0, &bytes).is_err() {
             return Ok(LINUX_EFAULT.into());
         }
         Ok(DispatchOutcome::Returned {
@@ -1207,20 +898,10 @@ impl SyscallDispatcher {
         })
     }
 
-    fn rseq(&self) -> DispatchOutcome {
-        DispatchOutcome::errno(LINUX_ENOSYS)
-    }
-
-    pub(super) fn sys_exit<M: GuestMemory>(
-        &self,
-        ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let code = ctx.request.arg(0) as i32;
-        // exit_group(94) always tears down the whole process. exit(93) ends
-        // just this thread IF siblings are still live; with only one live
-        // thread (or no ThreadCtx) it's equivalent to whole-process exit.
-        if ctx.request.number == 93
-            && let Some(t) = ctx.thread
+    fn sys_exit(this, cx, code: u64) {
+        let code = code as i32;
+        if cx.request.number == 93
+            && let Some(t) = cx.thread
             && t.registry.live_count() > 1
         {
             return Ok(DispatchOutcome::ThreadExit { code });
@@ -1228,19 +909,14 @@ impl SyscallDispatcher {
         Ok(DispatchOutcome::Exit { code })
     }
 
-    pub(super) fn sys_clone3<M: GuestMemory>(
-        &self,
-        ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        Ok(self.clone3(ctx.request, &*ctx.memory))
+    fn sys_clone3(this, cx, args_ptr: GuestPtr, size: u64) {
+        Ok(this.clone3(args_ptr, size, &*cx.memory))
     }
 
-    pub(super) fn sys_rseq<M: GuestMemory>(
-        &self,
-        _ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        Ok(self.rseq())
+    fn sys_rseq(this, cx) {
+        Ok(this.rseq())
     }
+}
 }
 
 fn fill_deterministic_bootstrap_random(bytes: &mut [u8]) {

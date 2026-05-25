@@ -2,41 +2,6 @@
 //! `super` for the dispatcher struct and the normalized dispatch table.
 use super::*;
 
-/// Generate a syscall handler whose arguments are declared with their ABI
-/// types, so the type is carried in the handler's definition and the args are
-/// bound at the correct width — `Pid`/`Signal` are `int`/`pid_t` and truncate
-/// to 32 bits, matching the kernel's syscall entry. This prevents the bug
-/// class where a 32-bit arg is read from the full 64-bit register (a guest
-/// `-1`, passed as `0xFFFFFFFF`, would otherwise look like a large positive
-/// value — see tkill02/tgkill03). The body receives the typed locals plus
-/// `self` and `ctx` (for guest memory + thread context). Register the
-/// generated method in `normalized_dispatch!` as usual.
-macro_rules! define_syscall {
-    ( $(
-        $(#[$meta:meta])*
-        fn $name:ident ( $this:ident, $cx:ident $(, $arg:ident : $argty:ty )* $(,)? ) $body:block
-    )* ) => {
-        $(
-            $(#[$meta])*
-            pub(super) fn $name<M: GuestMemory>(
-                &self,
-                ctx: &mut SyscallCtx<M>,
-            ) -> Result<DispatchOutcome, DispatchError> {
-                // Alias the receiver and context to caller-named idents (macro
-                // hygiene means a bare `self`/`ctx` in the body wouldn't bind).
-                let $this = self;
-                let $cx = ctx;
-                let mut __arg_index = 0usize;
-                $(
-                    let $arg: $argty = $cx.typed_arg(__arg_index);
-                    __arg_index += 1;
-                )*
-                let _ = __arg_index;
-                $body
-            }
-        )*
-    };
-}
 
 /// Owned signal-subsystem state. Split out of `SyscallDispatcher` so the
 /// signal handlers borrow only what they touch instead of the whole
@@ -234,38 +199,32 @@ impl SyscallDispatcher {
         ctx.thread.as_ref().map(|t| t.tid).unwrap_or(0)
     }
 
-    pub(super) fn kill<M: GuestMemory>(
-        &self,
-        ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let pid = ctx.arg(0) as i64;
-        let signum = ctx.arg(1);
-        if !is_valid_signum(signum) {
-            return Ok(LINUX_EINVAL.into());
-        }
-        if signal_is_self_target(pid, /*tid_required=*/ false) {
-            return Ok(self.raise_self(Self::ctx_tid(ctx), signum));
-        }
-        Ok(bootstrap_signal_send(
-            pid, /*tid_required=*/ false, signum,
-        ))
-    }
-
     define_syscall! {
-        /// tkill(tid, sig): send `sig` to thread `tid`. `tid`/`sig` are typed
-        /// (`Pid`/`Signal`) so they're read at the kernel's 32-bit width.
+        /// kill(pid, sig): send `sig` to process `pid`.
+        fn kill(this, cx, pid: Pid, sig: Signal) {
+            let pid = i64::from(pid.0);
+            let signum = sig.0 as u64;
+            if !is_valid_signum(signum) {
+                return Ok(LINUX_EINVAL.into());
+            }
+            if signal_is_self_target(pid, /*tid_required=*/ false) {
+                return Ok(this.raise_self(Self::ctx_tid(cx), signum));
+            }
+            Ok(bootstrap_signal_send(
+                pid, /*tid_required=*/ false, signum,
+            ))
+        }
+
+        /// tkill(tid, sig): send `sig` to thread `tid`.
         fn tkill(this, cx, tid: Pid, sig: Signal) {
             let tid = i64::from(tid.0);
             let signum = sig.0 as u64;
-            // The kernel rejects a non-positive tid with EINVAL before anything
-            // else (sys_tkill: `if (pid <= 0) return -EINVAL`). (LTP tkill02.)
             if tid <= 0 {
                 return Ok(LINUX_EINVAL.into());
             }
             if !is_valid_signum(signum) {
                 return Ok(LINUX_EINVAL.into());
             }
-            // tkill's target is a thread id, not a "0 means self" pid form.
             if let Some(routed) = this.route_thread_signal(cx, tid, signum) {
                 return Ok(routed);
             }
@@ -281,16 +240,12 @@ impl SyscallDispatcher {
             let tgid = i64::from(tgid.0);
             let tid = i64::from(tid.0);
             let signum = sig.0 as u64;
-            // The kernel rejects a non-positive tgid or tid with EINVAL up front
-            // (sys_tgkill: `if (pid <= 0 || tgid <= 0) return -EINVAL`), before
-            // resolving the target or validating the signal. (LTP tgkill03.)
             if tgid <= 0 || tid <= 0 {
                 return Ok(LINUX_EINVAL.into());
             }
             if !is_valid_signum(signum) {
                 return Ok(LINUX_EINVAL.into());
             }
-            // A sibling thread of this process: deliver to that tid's vCPU.
             if let Some(routed) = this.route_thread_signal(cx, tid, signum) {
                 return Ok(routed);
             }
@@ -303,6 +258,266 @@ impl SyscallDispatcher {
             }
             let self_tid = cx.thread.as_ref().map(|t| t.tid).unwrap_or(0);
             Ok(this.raise_self(self_tid, signum))
+        }
+
+        /// sigaltstack(ss, old_ss): set/query alternate signal stack.
+        fn sigaltstack(this, cx, ss: GuestPtr, old_ss: GuestPtr) {
+            let ss = ss.0;
+            let old_ss = old_ss.0;
+            let tid = cx.thread.as_ref().map(|t| t.tid).unwrap_or(0);
+            let memory = &mut *cx.memory;
+
+            if old_ss != 0 {
+                let current = this
+                    .signal
+                    .lock()
+                    .altstack
+                    .get(&tid)
+                    .copied()
+                    .unwrap_or_else(LinuxSigaltstack::disabled);
+                if memory.write_bytes(old_ss, current.abi_bytes()).is_err() {
+                    return Ok(LINUX_EFAULT.into());
+                }
+            }
+
+            if ss != 0 {
+                let bytes = match memory.read_bytes(ss, core::mem::size_of::<LinuxSigaltstack>()) {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        return Ok(LINUX_EFAULT.into());
+                    }
+                };
+                let new_stack = match LinuxSigaltstack::read_from_bytes(&bytes) {
+                    Ok(stack) => stack,
+                    Err(_) => {
+                        return Ok(LINUX_EFAULT.into());
+                    }
+                };
+                let flags = new_stack.ss_flags as u32 as u64;
+                if flags & !LINUX_SS_DISABLE != 0 {
+                    return Ok(LINUX_EINVAL.into());
+                }
+                if flags & LINUX_SS_DISABLE != 0 {
+                    this.signal.lock().altstack.remove(&tid);
+                } else {
+                    let size = new_stack.ss_size;
+                    if size < LINUX_MINSIGSTKSZ {
+                        return Ok(LINUX_ENOMEM.into());
+                    }
+                    this.signal.lock().altstack.insert(tid, new_stack);
+                }
+            }
+
+            Ok(DispatchOutcome::Returned { value: 0 })
+        }
+
+        /// rt_sigsuspend(mask_ptr, sigset_size): suspend thread until signal.
+        fn rt_sigsuspend(this, cx, mask_ptr: GuestPtr, sigset_size: u64) {
+            let mask_ptr = mask_ptr.0;
+            let memory = &*cx.memory;
+            if sigset_size != LINUX_RT_SIGSET_SIZE {
+                return Ok(LINUX_EINVAL.into());
+            }
+            if memory
+                .read_bytes(mask_ptr, LINUX_RT_SIGSET_SIZE as usize)
+                .is_err()
+            {
+                return Ok(LINUX_EFAULT.into());
+            }
+            Ok(LINUX_EINTR.into())
+        }
+
+        /// rt_sigaction(signum, new_action, old_action, sigset_size): configure handler.
+        fn rt_sigaction(this, cx, signum: Signal, new_action: GuestPtr, old_action: GuestPtr, sigset_size: u64) {
+            let signum = signum.0;
+            let new_action = new_action.0;
+            let old_action = old_action.0;
+            let memory = &mut *cx.memory;
+            if sigset_size != LINUX_RT_SIGSET_SIZE {
+                return Ok(LINUX_EINVAL.into());
+            }
+            if !(1..=64).contains(&signum) {
+                return Ok(LINUX_EINVAL.into());
+            }
+            let new_sa = if new_action != 0 {
+                let bytes =
+                    match memory.read_bytes(new_action, core::mem::size_of::<LinuxSigaction>()) {
+                        Ok(bytes) => bytes,
+                        Err(_) => {
+                            return Ok(LINUX_EFAULT.into());
+                        }
+                    };
+                if signum == LINUX_SIGKILL || signum == LINUX_SIGSTOP {
+                    return Ok(LINUX_EINVAL.into());
+                }
+                match LinuxSigaction::ref_from_bytes(&bytes) {
+                    Ok(sa) => {
+                        let w = |o: usize| {
+                            bytes
+                                .get(o..o + 8)
+                                .and_then(|s| s.try_into().ok())
+                                .map(u64::from_le_bytes)
+                                .unwrap_or(0)
+                        };
+                        crate::probes::sigaction_read(signum, w(0), w(8), w(16), w(24));
+                        Some(*sa)
+                    }
+                    Err(_) => {
+                        return Ok(LINUX_EFAULT.into());
+                    }
+                }
+            } else {
+                None
+            };
+            if old_action != 0 {
+                let prev = this
+                    .signal
+                    .lock()
+                    .handlers
+                    .get(&signum)
+                    .copied()
+                    .unwrap_or_else(LinuxSigaction::empty);
+                if write_kernel_struct_raw(memory, old_action, &prev).is_err() {
+                    return Ok(LINUX_EFAULT.into());
+                }
+            }
+            if let Some(sa) = new_sa {
+                this.signal.lock().handlers.insert(signum, sa);
+                let h = sa.sa_handler;
+                if h != crate::linux_abi::LINUX_SIG_DFL && h != crate::linux_abi::LINUX_SIG_IGN {
+                    crate::host_signal::ensure_host_handler(signum);
+                }
+            }
+            Ok(DispatchOutcome::Returned { value: 0 })
+        }
+
+        /// rt_sigprocmask(how, new_set, old_set, sigset_size): configure blocked mask.
+        fn rt_sigprocmask(this, cx, how: u64, new_set: GuestPtr, old_set: GuestPtr, sigset_size: u64) {
+            let new_set = new_set.0;
+            let old_set = old_set.0;
+            let tid = Self::ctx_tid(cx);
+            let memory = &mut *cx.memory;
+            if sigset_size != LINUX_RT_SIGSET_SIZE {
+                return Ok(LINUX_EINVAL.into());
+            }
+            let previous_mask = this.signal.lock().mask_for(tid);
+            if old_set != 0
+                && memory
+                    .write_bytes(old_set, &previous_mask.to_le_bytes())
+                    .is_err()
+            {
+                return Ok(LINUX_EFAULT.into());
+            }
+            if new_set != 0 {
+                let bytes = match memory.read_bytes(new_set, LINUX_RT_SIGSET_SIZE as usize) {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        return Ok(LINUX_EFAULT.into());
+                    }
+                };
+                let set = u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8]));
+                let mut mask = match how {
+                    LINUX_SIG_BLOCK => previous_mask | set,
+                    LINUX_SIG_UNBLOCK => previous_mask & !set,
+                    LINUX_SIG_SETMASK => set,
+                    _ => {
+                        return Ok(LINUX_EINVAL.into());
+                    }
+                };
+                mask = sanitize_signal_mask(mask);
+                this.signal.lock().masks.insert(tid, mask);
+            }
+            Ok(DispatchOutcome::Returned { value: 0 })
+        }
+
+        /// rt_sigpending(set_ptr, sigset_size): query pending mask.
+        fn rt_sigpending(this, cx, set_ptr: GuestPtr, sigset_size: u64) {
+            let set_ptr = set_ptr.0;
+            let tid = Self::ctx_tid(cx);
+            let memory = &mut *cx.memory;
+            if sigset_size != LINUX_RT_SIGSET_SIZE {
+                return Ok(LINUX_EINVAL.into());
+            }
+            let pending = this.signal.lock().pendings.get(&tid).copied().unwrap_or(0);
+            if set_ptr != 0 && memory.write_bytes(set_ptr, &pending.to_le_bytes()).is_err() {
+                return Ok(LINUX_EFAULT.into());
+            }
+            Ok(DispatchOutcome::Returned { value: 0 })
+        }
+
+        /// rt_sigtimedwait(set_ptr, info_ptr, timeout_ptr, sigset_size): wait for signals.
+        fn rt_sigtimedwait(this, cx, set_ptr: GuestPtr, info_ptr: GuestPtr, timeout_ptr: GuestPtr, sigset_size: u64) {
+            let set_ptr = set_ptr.0;
+            let info_ptr = info_ptr.0;
+            let timeout_ptr = timeout_ptr.0;
+            let tid = Self::ctx_tid(cx);
+            let memory = &*cx.memory;
+            if sigset_size != LINUX_RT_SIGSET_SIZE {
+                return Ok(LINUX_EINVAL.into());
+            }
+            let set_bytes = match memory.read_bytes(set_ptr, LINUX_RT_SIGSET_SIZE as usize) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    return Ok(LINUX_EFAULT.into());
+                }
+            };
+            let wait_set = u64::from_le_bytes(set_bytes.try_into().unwrap_or([0; 8]));
+            let mut timeout: Option<Duration> = None;
+            if timeout_ptr != 0 {
+                let ts = match read_timespec(memory, timeout_ptr) {
+                    Ok(ts) => ts,
+                    Err(errno) => return Ok(errno.into()),
+                };
+                let tv_sec = ts.tv_sec;
+                let tv_nsec = ts.tv_nsec;
+                if tv_sec < 0 || !(0..1_000_000_000).contains(&tv_nsec) {
+                    return Ok(LINUX_EINVAL.into());
+                }
+                timeout = Some(Duration::new(tv_sec as u64, tv_nsec as u32));
+            }
+
+            let memory = &mut *cx.memory;
+            if let Some(signum) = this.take_pending_in(tid, wait_set) {
+                return Ok(rt_sigtimedwait_deliver(memory, info_ptr, signum));
+            }
+            match timeout {
+                Some(d) if !d.is_zero() => {
+                    let deadline = Instant::now() + d.min(Duration::from_secs(5));
+                    while Instant::now() < deadline {
+                        let pending = crate::host_signal::take_pending();
+                        if pending != 0 {
+                            let in_set = sigmask_bit(pending).is_some_and(|b| wait_set & b != 0);
+                            if in_set {
+                                return Ok(rt_sigtimedwait_deliver(memory, info_ptr, pending));
+                            }
+                            crate::host_signal::raise_for_self(pending);
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Ok(LINUX_EAGAIN.into())
+                }
+                _ => Ok(LINUX_EAGAIN.into()),
+            }
+        }
+
+        /// rt_sigqueueinfo(tgid, sig, info_ptr): send queue info signal.
+        fn rt_sigqueueinfo(this, cx, tgid: Pid, sig: Signal, info_ptr: GuestPtr) {
+            let tgid = i64::from(tgid.0);
+            let signum = sig.0 as u64;
+            if !is_valid_signum(signum) {
+                return Ok(LINUX_EINVAL.into());
+            }
+            let self_tgids = [LINUX_BOOTSTRAP_PID as i64, std::process::id() as i64];
+            if !self_tgids.contains(&tgid) {
+                return Ok(LINUX_ESRCH.into());
+            }
+            Ok(LINUX_ENOSYS.into())
+        }
+
+        /// rt_sigreturn(): pop signal frame and restore registers.
+        fn rt_sigreturn(this, cx) {
+            Ok(DispatchOutcome::SigReturn)
         }
     }
 
@@ -336,344 +551,6 @@ impl SyscallDispatcher {
             });
         }
         None
-    }
-
-    pub(super) fn sigaltstack<M: GuestMemory>(
-        &self,
-        ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let ss = ctx.arg(0);
-        let old_ss = ctx.arg(1);
-        // sigaltstack is per-thread: key by the calling guest tid.
-        let tid = ctx.thread.as_ref().map(|t| t.tid).unwrap_or(0);
-        let memory = &mut *ctx.memory;
-
-        // Report the currently-installed alt stack (or a disabled stack
-        // when none is set) into the old_ss out-param.
-        if old_ss != 0 {
-            let current = self
-                .signal
-                .lock()
-                .altstack
-                .get(&tid)
-                .copied()
-                .unwrap_or_else(LinuxSigaltstack::disabled);
-            if memory.write_bytes(old_ss, current.abi_bytes()).is_err() {
-                return Ok(LINUX_EFAULT.into());
-            }
-        }
-
-        if ss != 0 {
-            let bytes = match memory.read_bytes(ss, core::mem::size_of::<LinuxSigaltstack>()) {
-                Ok(bytes) => bytes,
-                Err(_) => {
-                    return Ok(LINUX_EFAULT.into());
-                }
-            };
-            let new_stack = match LinuxSigaltstack::read_from_bytes(&bytes) {
-                Ok(stack) => stack,
-                Err(_) => {
-                    return Ok(LINUX_EFAULT.into());
-                }
-            };
-            let flags = new_stack.ss_flags as u32 as u64;
-            // SS_ONSTACK is a query-only flag; reject it along with anything
-            // unrecognized. Only SS_DISABLE is accepted from userspace.
-            if flags & !LINUX_SS_DISABLE != 0 {
-                return Ok(LINUX_EINVAL.into());
-            }
-            if flags & LINUX_SS_DISABLE != 0 {
-                // SS_DISABLE removes this thread's installed alt stack.
-                self.signal.lock().altstack.remove(&tid);
-            } else {
-                let size = new_stack.ss_size;
-                if size < LINUX_MINSIGSTKSZ {
-                    return Ok(LINUX_ENOMEM.into());
-                }
-                // Record this thread's alt stack so a subsequent query returns
-                // it AND signal injection pushes the frame onto the right stack.
-                self.signal.lock().altstack.insert(tid, new_stack);
-            }
-        }
-
-        Ok(DispatchOutcome::Returned { value: 0 })
-    }
-
-    pub(super) fn rt_sigsuspend<M: GuestMemory>(
-        &self,
-        ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let mask_ptr = ctx.arg(0);
-        let sigset_size = ctx.arg(1);
-        let memory = &*ctx.memory;
-        if sigset_size != LINUX_RT_SIGSET_SIZE {
-            return Ok(LINUX_EINVAL.into());
-        }
-        // Validate readability of the mask. The bootstrap has no signal
-        // delivery, so we don't need to honour the mask — but we do owe the
-        // caller an EFAULT if the pointer is bad. rt_sigsuspend is documented
-        // to always return -1; with no signals to deliver, EINTR is the only
-        // honest answer.
-        if memory
-            .read_bytes(mask_ptr, LINUX_RT_SIGSET_SIZE as usize)
-            .is_err()
-        {
-            return Ok(LINUX_EFAULT.into());
-        }
-        Ok(LINUX_EINTR.into())
-    }
-
-    pub(super) fn rt_sigaction<M: GuestMemory>(
-        &self,
-        ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let signum = ctx.arg(0) as i32;
-        let new_action: GuestPtr = ctx.typed_arg(1);
-        let old_action = ctx.arg(2);
-        let sigset_size = ctx.arg(3);
-        let memory = &mut *ctx.memory;
-        // The kernel validates the sigset size FIRST: `rt_sigaction` rejects
-        // any sigsetsize != sizeof(sigset_t) (8 on aarch64) with EINVAL,
-        // before touching the user pointers. (LTP rt_sigaction03.)
-        if sigset_size != LINUX_RT_SIGSET_SIZE {
-            return Ok(LINUX_EINVAL.into());
-        }
-        // Linux returns EINVAL for signum <= 0 or > _NSIG (64 on
-        // most arches). Reject these.
-        if !(1..=64).contains(&signum) {
-            return Ok(LINUX_EINVAL.into());
-        }
-        // Read the new handler (if any) BEFORE writing back the old one, to
-        // match the kernel ordering: copy_from_user(new) happens first, so a
-        // bad `new_action` pointer yields EFAULT with no side effects.
-        // (LTP rt_sigaction02 passes a deliberately bad pointer.)
-        let new_sa = if new_action.0 != 0 {
-            let bytes =
-                match memory.read_bytes(new_action.0, core::mem::size_of::<LinuxSigaction>()) {
-                    Ok(bytes) => bytes,
-                    Err(_) => {
-                        return Ok(LINUX_EFAULT.into());
-                    }
-                };
-            // Installing a handler for SIGKILL (9) or SIGSTOP (19) is rejected
-            // with EINVAL — these signals cannot be caught or ignored. signum 0
-            // never reaches here (the 1..=64 check above rejects it).
-            if signum == LINUX_SIGKILL || signum == LINUX_SIGSTOP {
-                return Ok(LINUX_EINVAL.into());
-            }
-            match LinuxSigaction::ref_from_bytes(&bytes) {
-                Ok(sa) => {
-                    let w = |o: usize| {
-                        bytes
-                            .get(o..o + 8)
-                            .and_then(|s| s.try_into().ok())
-                            .map(u64::from_le_bytes)
-                            .unwrap_or(0)
-                    };
-                    crate::probes::sigaction_read(signum, w(0), w(8), w(16), w(24));
-                    Some(*sa)
-                }
-                Err(_) => {
-                    return Ok(LINUX_EFAULT.into());
-                }
-            }
-        } else {
-            None
-        };
-        // Write back the previously-installed handler (or zero if none). A bad
-        // `old_action` pointer is an EFAULT.
-        if old_action != 0 {
-            let prev = self
-                .signal
-                .lock()
-                .handlers
-                .get(&signum)
-                .copied()
-                .unwrap_or_else(LinuxSigaction::empty);
-            if write_kernel_struct_raw(memory, old_action, &prev).is_err() {
-                return Ok(LINUX_EFAULT.into());
-            }
-        }
-        // Commit the new handler.
-        if let Some(sa) = new_sa {
-            self.signal.lock().handlers.insert(signum, sa);
-            // If the guest installed a real handler (not SIG_DFL/IGN),
-            // install a matching host handler so a cross-process kill
-            // from another guest process is routed here instead of
-            // taking the host's default action (process termination).
-            let h = sa.sa_handler;
-            if h != crate::linux_abi::LINUX_SIG_DFL && h != crate::linux_abi::LINUX_SIG_IGN {
-                crate::host_signal::ensure_host_handler(signum);
-            }
-        }
-        Ok(DispatchOutcome::Returned { value: 0 })
-    }
-
-    pub(super) fn rt_sigprocmask<M: GuestMemory>(
-        &self,
-        ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let how = ctx.arg(0);
-        let new_set = ctx.arg(1);
-        let old_set = ctx.arg(2);
-        let sigset_size = ctx.arg(3);
-        let tid = Self::ctx_tid(ctx);
-        let memory = &mut *ctx.memory;
-        if sigset_size != LINUX_RT_SIGSET_SIZE {
-            return Ok(LINUX_EINVAL.into());
-        }
-        let previous_mask = self.signal.lock().mask_for(tid);
-        // Write back the *previous* mask before applying changes (the
-        // caller may pass the same buffer for new_set and old_set).
-        if old_set != 0
-            && memory
-                .write_bytes(old_set, &previous_mask.to_le_bytes())
-                .is_err()
-        {
-            return Ok(LINUX_EFAULT.into());
-        }
-        if new_set != 0 {
-            let bytes = match memory.read_bytes(new_set, LINUX_RT_SIGSET_SIZE as usize) {
-                Ok(bytes) => bytes,
-                Err(_) => {
-                    return Ok(LINUX_EFAULT.into());
-                }
-            };
-            let set = u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8]));
-            let mut mask = match how {
-                LINUX_SIG_BLOCK => previous_mask | set,
-                LINUX_SIG_UNBLOCK => previous_mask & !set,
-                LINUX_SIG_SETMASK => set,
-                _ => {
-                    return Ok(LINUX_EINVAL.into());
-                }
-            };
-            mask = sanitize_signal_mask(mask);
-            self.signal.lock().masks.insert(tid, mask);
-            // Signals that just became unblocked stay in `pending`; the runtime
-            // drains them via `take_deliverable_pending` after this syscall,
-            // delivering each handler in turn. (The previous code raised only
-            // the lowest into the single host-signal slot, losing the rest when
-            // several signals were raised while blocked — LTP sigpending02.)
-        }
-        Ok(DispatchOutcome::Returned { value: 0 })
-    }
-
-    pub(super) fn rt_sigpending<M: GuestMemory>(
-        &self,
-        ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let set_ptr = ctx.arg(0);
-        let sigset_size = ctx.arg(1);
-        let tid = Self::ctx_tid(ctx);
-        let memory = &mut *ctx.memory;
-        if sigset_size != LINUX_RT_SIGSET_SIZE {
-            return Ok(LINUX_EINVAL.into());
-        }
-        let pending = self.signal.lock().pendings.get(&tid).copied().unwrap_or(0);
-        if set_ptr != 0 && memory.write_bytes(set_ptr, &pending.to_le_bytes()).is_err() {
-            return Ok(LINUX_EFAULT.into());
-        }
-        Ok(DispatchOutcome::Returned { value: 0 })
-    }
-
-    pub(super) fn rt_sigtimedwait<M: GuestMemory>(
-        &self,
-        ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let set_ptr = ctx.arg(0);
-        let info_ptr = ctx.arg(1);
-        let timeout_ptr = ctx.arg(2);
-        let sigset_size = ctx.arg(3);
-        let tid = Self::ctx_tid(ctx);
-        let memory = &*ctx.memory;
-        if sigset_size != LINUX_RT_SIGSET_SIZE {
-            return Ok(LINUX_EINVAL.into());
-        }
-        let set_bytes = match memory.read_bytes(set_ptr, LINUX_RT_SIGSET_SIZE as usize) {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                return Ok(LINUX_EFAULT.into());
-            }
-        };
-        let wait_set = u64::from_le_bytes(set_bytes.try_into().unwrap_or([0; 8]));
-        let mut timeout: Option<Duration> = None;
-        if timeout_ptr != 0 {
-            let ts = match read_timespec(memory, timeout_ptr) {
-                Ok(ts) => ts,
-                Err(errno) => return Ok(errno.into()),
-            };
-            // Copy out of the packed struct before use (taking a reference
-            // to a packed field is UB / a hard error).
-            let tv_sec = ts.tv_sec;
-            let tv_nsec = ts.tv_nsec;
-            if tv_sec < 0 || !(0..1_000_000_000).contains(&tv_nsec) {
-                return Ok(LINUX_EINVAL.into());
-            }
-            timeout = Some(Duration::new(tv_sec as u64, tv_nsec as u32));
-        }
-
-        let memory = &mut *ctx.memory;
-        // A signal already pending (e.g. raised while blocked) is dequeued
-        // immediately and its number returned.
-        if let Some(signum) = self.take_pending_in(tid, wait_set) {
-            return Ok(rt_sigtimedwait_deliver(memory, info_ptr, signum));
-        }
-        // Nothing pending. A zero (or absent) timeout is a non-blocking poll.
-        match timeout {
-            Some(d) if !d.is_zero() => {
-                // Bounded wait: the only async source that can arrive is the
-                // host slot (e.g. SIGINT). Sleep up to the timeout (capped so
-                // the conformance harness can't wedge) re-checking it.
-                let deadline = Instant::now() + d.min(Duration::from_secs(5));
-                while Instant::now() < deadline {
-                    let pending = crate::host_signal::take_pending();
-                    if pending != 0 {
-                        let in_set = sigmask_bit(pending).is_some_and(|b| wait_set & b != 0);
-                        if in_set {
-                            return Ok(rt_sigtimedwait_deliver(memory, info_ptr, pending));
-                        }
-                        // Not awaited: re-queue for normal delivery and stop.
-                        crate::host_signal::raise_for_self(pending);
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                Ok(LINUX_EAGAIN.into())
-            }
-            _ => Ok(LINUX_EAGAIN.into()),
-        }
-    }
-
-    pub(super) fn rt_sigqueueinfo<M: GuestMemory>(
-        &self,
-        ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let tgid = ctx.arg(0) as i64;
-        let signum = ctx.arg(1);
-        if !is_valid_signum(signum) {
-            return Ok(LINUX_EINVAL.into());
-        }
-        let self_tgids = [LINUX_BOOTSTRAP_PID as i64, std::process::id() as i64];
-        if !self_tgids.contains(&tgid) {
-            return Ok(LINUX_ESRCH.into());
-        }
-        // No signal delivery; surface the gap explicitly rather than silently
-        // swallowing the queued siginfo.
-        Ok(LINUX_ENOSYS.into())
-    }
-
-    pub(super) fn rt_sigreturn<M: GuestMemory>(
-        &self,
-        _ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        // rt_sigreturn is invoked from a signal trampoline to restore the
-        // pre-signal context. The dispatcher can't perform the restore
-        // itself — only the trap engine has access to the vCPU register
-        // file — so we signal `SigReturn` and let the runtime drive
-        // `HvfTrapEngine::rt_sigreturn`. There is no x0 retval to write;
-        // the restored x0 IS the value the guest sees.
-        Ok(DispatchOutcome::SigReturn)
     }
 }
 

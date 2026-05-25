@@ -1212,8 +1212,8 @@ enum TtyFdKind {
 /// variants name a file by path; the f-variant names it by open fd.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum XattrTarget {
-    Path,
-    Fd,
+    Path(GuestPtr),
+    Fd(Fd),
 }
 
 #[derive(Debug, Clone)]
