@@ -922,6 +922,7 @@ impl EventFdState {
         // Reflect a non-zero initial value as "readable" right away.
         if counter > 0 && write_fd >= 0 {
             let byte = [1u8];
+            // BLOCKING-IO-OK: readiness pipe is set to O_NONBLOCK during creation
             unsafe { libc::write(write_fd, byte.as_ptr().cast(), 1) };
         }
         Self {
@@ -941,11 +942,13 @@ impl EventFdState {
         if count > 0 {
             // Ensure a byte is present (idempotent: a full 1-deep pipe EAGAINs).
             let byte = [1u8];
+            // BLOCKING-IO-OK: readiness pipe is set to O_NONBLOCK during creation
             unsafe { libc::write(self.write_fd, byte.as_ptr().cast(), 1) };
         } else {
             // Drain any bytes so the read end is not readable.
             let mut buf = [0u8; 64];
             loop {
+                // BLOCKING-IO-OK: readiness pipe is set to O_NONBLOCK during creation
                 let n = unsafe { libc::read(self.read_fd, buf.as_mut_ptr().cast(), buf.len()) };
                 if n <= 0 {
                     break;

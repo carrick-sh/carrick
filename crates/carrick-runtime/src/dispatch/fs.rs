@@ -128,6 +128,10 @@ impl FsState {
 }
 
 impl SyscallDispatcher {
+    pub fn register_mount(&mut self, point: impl Into<std::path::PathBuf>, vfs: Box<dyn crate::vfs::Vfs>) {
+        self.fs.vfs_mounts.mount(point, vfs);
+    }
+
     pub(super) fn write_shared_supported(&self, fd: i32) -> bool {
         let Some(open_file) = self.open_file(fd) else {
             return true;
@@ -4265,7 +4269,7 @@ define_syscall! {
             Err(errno) => return Ok(errno.into()),
         };
 
-        let target = if path == "/proc/this/exe" || path == "/proc/curproc/exe" {
+        let target = if path == "/proc/self/exe" || path == "/proc/this/exe" || path == "/proc/curproc/exe" {
             this.proc.lock().executable_path.clone()
         } else if let Some(t) = this.proc_self_fd_tty_link(&path) {
             // /proc/this/fd/{0,1,2} → /dev/pts/N when the guest's stdio is the
