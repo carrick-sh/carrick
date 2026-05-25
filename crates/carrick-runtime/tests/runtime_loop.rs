@@ -6,11 +6,11 @@
 use std::collections::VecDeque;
 use std::process::Command;
 
-use carrick::dispatch::{Aarch64SyscallFrame, GuestMemory, LinearMemory, SyscallDispatcher};
-use carrick::memory::AddressSpace;
-use carrick::rootfs::{LayerSource, RootFs};
-use carrick::runtime::{SyscallTrap, run_syscall_loop, run_syscall_loop_with_dispatcher};
-use carrick::trap::TrapError;
+use carrick_runtime::dispatch::{Aarch64SyscallFrame, GuestMemory, LinearMemory, SyscallDispatcher};
+use carrick_runtime::memory::AddressSpace;
+use carrick_runtime::rootfs::{LayerSource, RootFs};
+use carrick_runtime::runtime::{SyscallTrap, run_syscall_loop, run_syscall_loop_with_dispatcher};
+use carrick_runtime::trap::TrapError;
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use std::io::Write;
@@ -249,13 +249,13 @@ impl SyscallTrap for ScriptedTrap {
         Ok(())
     }
 
-    fn fork(&mut self) -> Result<carrick::trap::ForkOutcome, TrapError> {
+    fn fork(&mut self) -> Result<carrick_runtime::trap::ForkOutcome, TrapError> {
         Err(TrapError::Hypervisor(
             "scripted trap does not implement fork".to_owned(),
         ))
     }
 
-    fn execve_into(&mut self, _: &carrick::memory::AddressSpace) -> Result<(), TrapError> {
+    fn execve_into(&mut self, _: &carrick_runtime::memory::AddressSpace) -> Result<(), TrapError> {
         Err(TrapError::Hypervisor(
             "scripted trap does not implement execve".to_owned(),
         ))

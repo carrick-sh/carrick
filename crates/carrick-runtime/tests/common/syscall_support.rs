@@ -11,13 +11,13 @@
 // them. Allow unwrap/expect here explicitly — the no-panic gate targets production code.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-pub use carrick::compat::{CompatReporter, SyscallArgs};
-pub use carrick::dispatch::{
+pub use carrick_runtime::compat::{CompatReporter, SyscallArgs};
+pub use carrick_runtime::dispatch::{
     Aarch64SyscallFrame, DispatchOutcome, GuestMemory, LinearMemory, SyscallDispatcher,
     SyscallRequest,
 };
-pub use carrick::elf::SegmentPerms;
-pub use carrick::linux_abi::{
+pub use carrick_runtime::elf::SegmentPerms;
+pub use carrick_runtime::linux_abi::{
     LINUX_AF_INET, LINUX_DIRENT64_HEADER_SIZE, LINUX_DT_REG, LINUX_EPOLLET, LINUX_S_IFCHR,
     LINUX_S_IFDIR, LINUX_S_IFIFO, LINUX_S_IFLNK, LINUX_S_IFMT, LINUX_S_IFREG, LINUX_S_IFSOCK,
     LINUX_SOCK_NONBLOCK, LINUX_SOCK_STREAM, LINUX_TIOCGPTN, LINUX_TIOCSPTLCK, LinuxCapabilityData,
@@ -26,10 +26,10 @@ pub use carrick::linux_abi::{
     LinuxSigaltstack, LinuxStat, LinuxStatfs, LinuxStatx, LinuxTermios, LinuxTimerfdExpirations,
     LinuxTimespec, LinuxTimeval, LinuxTimezone, LinuxTms, LinuxUtsname, LinuxWinsize,
 };
-pub use carrick::memory::{
+pub use carrick_runtime::memory::{
     AddressSpace, LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE, LINUX_MMAP_SIZE,
 };
-pub use carrick::rootfs::{LayerSource, RootFs};
+pub use carrick_runtime::rootfs::{LayerSource, RootFs};
 pub use flate2::Compression;
 pub use flate2::write::GzEncoder;
 pub use std::io::Write;

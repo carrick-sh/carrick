@@ -301,7 +301,7 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
     );
     // Drain the pending slot so subsequent tests aren't surprised by
     // a leftover SIGTERM.
-    let _ = carrick::host_signal::take_pending();
+    let _ = carrick_runtime::host_signal::take_pending();
 
     // tkill(1, 0) -> success; tkill(0, 0) -> EINVAL (Linux rejects non-positive tids).
     assert_eq!(
@@ -360,7 +360,7 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
     );
-    let _ = carrick::host_signal::take_pending();
+    let _ = carrick_runtime::host_signal::take_pending();
 
     // tgkill(1, 1, 0) -> success.
     assert_eq!(
@@ -418,7 +418,7 @@ fn kill_tkill_tgkill_bootstrap_validates_targets_and_signals() {
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
     );
-    let _ = carrick::host_signal::take_pending();
+    let _ = carrick_runtime::host_signal::take_pending();
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }

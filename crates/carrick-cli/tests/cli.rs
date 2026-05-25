@@ -4,7 +4,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use assert_cmd::Command;
-use carrick::oci::{ImageReference, ImageStore, LayerSummary, PullSummary};
+use carrick_image::{ImageReference, ImageStore, LayerSummary, PullSummary};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use predicates::prelude::PredicateBooleanExt;

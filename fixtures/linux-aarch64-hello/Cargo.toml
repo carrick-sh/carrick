@@ -1,3 +1,5 @@
+[workspace]
+
 [package]
 name = "carrick-linux-aarch64-hello"
 version = "0.1.0"

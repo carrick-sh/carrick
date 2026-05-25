@@ -3,17 +3,17 @@
 // production code, so allow unwrap/expect across this integration test file.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use carrick::dispatch::{GuestMemory, SyscallDispatcher, SyscallRequest};
-use carrick::elf::SegmentPerms;
-use carrick::linux_abi::{
+use carrick_runtime::dispatch::{GuestMemory, SyscallDispatcher, SyscallRequest};
+use carrick_runtime::elf::SegmentPerms;
+use carrick_runtime::linux_abi::{
     LINUX_AT_BASE, LINUX_AT_ENTRY, LINUX_AT_NULL, LINUX_AT_PAGESZ, LINUX_AT_PHDR, LINUX_AT_PHENT,
     LINUX_AT_PHNUM, LinuxAuxvEntry,
 };
-use carrick::memory::{AddressSpace, LINUX_HEAP_BASE, LINUX_INTERPRETER_BASE, LINUX_MMAP_BASE};
-use carrick::rootfs::{LayerSource, RootFs};
+use carrick_runtime::memory::{AddressSpace, LINUX_HEAP_BASE, LINUX_INTERPRETER_BASE, LINUX_MMAP_BASE};
+use carrick_runtime::rootfs::{LayerSource, RootFs};
 use zerocopy::{FromBytes, IntoBytes};
 
-use carrick::compat::{CompatReporter, SyscallArgs};
+use carrick_runtime::compat::{CompatReporter, SyscallArgs};
 
 #[test]
 fn loads_static_linux_fixture_into_guest_address_space() {
