@@ -1557,7 +1557,7 @@ fn run_vcpu_until_exit(
                     // A forked child process (real macOS fork) exits via _exit so
                     // the rebuilt HVF context doesn't run the panicky Drops, and
                     // its buffered stdio is flushed to the inherited host fds.
-                    if engine.is_forked_child() {
+                    if engine.is_forked_child() || kernel.dispatcher.is_forked_guest_process() {
                         crate::probes::guest_exit(code);
                         forked_child_exit(
                             code,
