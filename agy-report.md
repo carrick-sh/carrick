@@ -408,6 +408,9 @@ The DAC (discretionary access control) check lives in `dispatch/mod.rs` — shou
 | `cargo test -p carrick-runtime --lib dispatch::mem::tests::next_mmap_address_reuses_freed_arena_region -- --nocapture` | done | Verifies anonymous/private mmap arena holes are reused from `free_regions`. |
 | `cargo test -p carrick-runtime --lib 'dispatch::net::tests::' -- --nocapture` | done | Verifies address-family, message-flag, sockaddr layout, sockaddr truncation, and host-socket nonblocking translation tests. |
 | `cargo test -p carrick-cli --test linux_fixture builds_static_linux_aarch64_hello_fixture -- --nocapture` | done | Verifies the table-driven static fixture inventory still builds and validates every expected AArch64 fixture. |
+| `cargo test -p carrick-runtime --test integration rootfs_overlay::reads_file_from_uppermost_layer -- --nocapture` | done | Verifies `rootfs_overlay` uses the shared gzip/tar helper. |
+| `cargo test -p carrick-runtime --test integration address_space::load_elf_from_rootfs_maps_pt_interp_at_base_and_sets_at_base -- --nocapture` | done | Verifies the shared mode-aware gzip/tar helper preserves executable ELF entries. |
+| `cargo test -p carrick-runtime --test runtime_loop runtime_loop_can_cat_a_rootfs_file -- --nocapture` | done | Verifies `runtime_loop` uses the shared gzip/tar helper. |
 
 ### Tier 1
 
@@ -431,7 +434,7 @@ The DAC (discretionary access control) check lives in `dispatch/mod.rs` — shou
 | 11 | Split `main.rs` into command modules | open | Structural refactor. |
 | 12 | Extract `OpenDescription` status flags | open | Behavior-preserving refactor with high call-site count. |
 | 13 | Consolidate stat/statx writers | open | Behavior-preserving refactor. |
-| 14 | Unify `gzip_tar` test helper | open | Copy-paste still exists in CLI/runtime tests. |
+| 14 | Unify `gzip_tar` test helper | open | Runtime test duplicates now use `integration/common/syscall_support.rs`, including a mode-aware helper for executable ELF layers. A separate CLI-local helper remains; fully unifying that would need a shared test-support crate or public test helper. |
 | 15 | Parameterize `linux_fixture.rs` tests | done | Collapsed repeated static fixture metadata/load-plan assertions into one fixture table and loop while preserving the special ET_EXEC and PIE checks. |
 | 16 | Delete duplicate `probe_case_sensitive` and `join_ids` from main.rs | done | CLI now calls `carrick_runtime::apfs::probe_case_sensitive` and the shared `dtrace_consumer::join_ids`; the duplicate local helpers were removed. |
 

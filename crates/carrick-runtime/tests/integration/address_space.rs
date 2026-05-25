@@ -3,6 +3,9 @@
 // production code, so allow unwrap/expect across this integration test file.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "common/syscall_support.rs"]
+mod support;
+
 use carrick_runtime::dispatch::{GuestMemory, SyscallDispatcher, SyscallRequest};
 use carrick_runtime::elf::SegmentPerms;
 use carrick_runtime::linux_abi::{
@@ -14,6 +17,7 @@ use carrick_runtime::rootfs::{LayerSource, RootFs};
 use zerocopy::{FromBytes, IntoBytes};
 
 use carrick_runtime::compat::{CompatReporter, SyscallArgs};
+use support::gzip_tar_with_modes;
 
 #[test]
 fn loads_static_linux_fixture_into_guest_address_space() {
@@ -116,9 +120,11 @@ fn loaded_elf_initial_stack_includes_linux_auxv() {
 
 #[test]
 fn load_elf_from_rootfs_maps_pt_interp_at_base_and_sets_at_base() {
-    let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([
-        ("bin/app", dynamic_aarch64_elf("/lib/ld-linux-aarch64.so.1")),
-        ("lib/ld-linux-aarch64.so.1", interpreter_aarch64_elf()),
+    let app = dynamic_aarch64_elf("/lib/ld-linux-aarch64.so.1");
+    let interpreter = interpreter_aarch64_elf();
+    let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar_with_modes([
+        ("bin/app", app.as_slice(), 0o755),
+        ("lib/ld-linux-aarch64.so.1", interpreter.as_slice(), 0o755),
     ]))])
     .unwrap();
 
@@ -436,25 +442,4 @@ fn elf64_ident() -> [u8; 16] {
     ident[5] = 1;
     ident[6] = 1;
     ident
-}
-
-fn gzip_tar<const N: usize>(files: [(&str, Vec<u8>); N]) -> Vec<u8> {
-    let mut tar_bytes = Vec::new();
-    {
-        let mut builder = tar::Builder::new(&mut tar_bytes);
-        for (path, contents) in files {
-            let mut header = tar::Header::new_gnu();
-            header.set_size(contents.len() as u64);
-            header.set_mode(0o755);
-            header.set_cksum();
-            builder
-                .append_data(&mut header, path, contents.as_slice())
-                .unwrap();
-        }
-        builder.finish().unwrap();
-    }
-
-    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    std::io::Write::write_all(&mut encoder, &tar_bytes).unwrap();
-    encoder.finish().unwrap()
 }

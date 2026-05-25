@@ -3,6 +3,9 @@
 // production code, so allow unwrap/expect across this integration test file.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "integration/common/syscall_support.rs"]
+mod support;
+
 use std::collections::VecDeque;
 use std::process::Command;
 
@@ -11,9 +14,7 @@ use carrick_runtime::memory::AddressSpace;
 use carrick_runtime::rootfs::{LayerSource, RootFs};
 use carrick_runtime::runtime::{SyscallTrap, run_syscall_loop, run_syscall_loop_with_dispatcher};
 use carrick_runtime::trap::TrapError;
-use flate2::Compression;
-use flate2::write::GzEncoder;
-use std::io::Write;
+use support::gzip_tar;
 
 const HELLO: &[u8] = b"hello from carrick\n";
 
@@ -289,23 +290,4 @@ fn build_linux_fixture() {
         .status()
         .unwrap();
     assert!(status.success());
-}
-
-fn gzip_tar<const N: usize>(files: [(&str, &[u8]); N]) -> Vec<u8> {
-    let mut tar_bytes = Vec::new();
-    {
-        let mut builder = tar::Builder::new(&mut tar_bytes);
-        for (path, contents) in files {
-            let mut header = tar::Header::new_gnu();
-            header.set_size(contents.len() as u64);
-            header.set_mode(0o644);
-            header.set_cksum();
-            builder.append_data(&mut header, path, contents).unwrap();
-        }
-        builder.finish().unwrap();
-    }
-
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(&tar_bytes).unwrap();
-    encoder.finish().unwrap()
 }
