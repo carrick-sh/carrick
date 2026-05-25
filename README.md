@@ -79,11 +79,37 @@ The crate is dual licensed as `Apache-2.0 OR MIT`. Dependencies are selected fro
 
 ## Development
 
+Carrick is a Cargo workspace:
+
+| Crate | Responsibility |
+| --- | --- |
+| `carrick-spec` | Pure vocabulary types (`RunSpec`, `ContainerSpec`, `ImageConfig`, `Mount`, `NamespaceConfig`) shared across layers. |
+| `carrick-image` | OCI image references, pull/store, image-config parsing, layer + config resolution. |
+| `carrick-runtime` | The HVF runtime: ELF loading, syscall dispatch, VFS, fs backends, and the `execute(&RunSpec)` seam. |
+| `carrick-engine` | The container layer: docker `run` merge semantics, lowering a `CliRunRequest` into a `RunSpec`. |
+| `carrick-cli` | The `carrick` binary (docker-compatible `run` + diagnostic subcommands). |
+
+The dependency direction is `cli → engine → {image, runtime} → spec`; `runtime` and `image` never depend on each other or on `engine`.
+
 ```sh
 cargo fmt --all
-cargo test
 cargo build
+cargo test --workspace
 ```
+
+### Build performance
+
+`carrick-runtime` is a single large crate (~41k lines), and the workspace links
+27 integration-test binaries plus the cli, each statically linking its rlib.
+With macOS's default `ld64`, an incremental rebuild after a one-line runtime
+edit spent ~37s of its ~57s wall time in the linker. `.cargo/config.toml`
+selects LLVM's `lld` (`brew install lld`) for the `aarch64-apple-darwin`
+target, roughly halving that to ~26s. The signed binary still carries the
+hypervisor entitlement and runs under HVF unchanged.
+
+The remaining incremental cost is rustc recompiling the monolithic runtime
+crate; that is inherent to keeping the runtime as one crate (its
+dispatch/memory/trap internals are too coupled to split cheaply).
 
 ### No-panic gate
 
