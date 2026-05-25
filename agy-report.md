@@ -418,12 +418,13 @@ The DAC (discretionary access control) check lives in `dispatch/mod.rs` — shou
 | `rg -n "fn gzip_tar" crates -g '*.rs'` | done | Only `crates/carrick-test-support/src/lib.rs` defines the shared gzip/tar helper family. |
 | `cargo test -p carrick-test-support` | done | Verifies the shared test helper crate builds and its doctest harness is clean. |
 | `cargo test -p carrick-cli --test cli rootfs_cli_lists_and_reads_composed_layers -- --nocapture` | done | Verifies CLI tests consume the shared gzip/tar helper. |
+| `cargo test -p carrick-runtime --test runtime_loop -- --nocapture` | done | Verifies the split single-threaded runtime path still handles static ELF dispatch, rootfs file/dir operations, and trap-limit reporting after dispatch-loop extraction. |
 
 ### Tier 1
 
 | # | Item | Status | Notes |
 |---|---|---|---|
-| 1 | Extract shared dispatch loop logic | open | Validate current runtime drift first; requires tests around each loop. |
+| 1 | Extract shared dispatch loop logic | done | `run_combined_syscall_loop_with_dispatcher` and `run_split_loop` now share `dispatch_single_threaded_syscall` for `WaitOnFds`, `WaitOnPollFds`, and `WaitOnProcExit` re-dispatch handling; the threaded path remains separate because it must park vCPUs during fork quiesce. |
 | 2 | Audit `EPOLL_INMEM_KQUEUES` x `open_files` lock ordering | done | `notify_inmem_epoll()` holds only `EPOLL_INMEM_KQUEUES` while triggering kqueues and does not acquire dispatcher fd/open-description locks. |
 | 3 | Extend lock ordering comment | done | Comment now covers `pty_table`, `EPOLL_INMEM_KQUEUES`, and the no-blocking/guest-memory rule; CLOEXEC sweep now drops `open_files` before pty cleanup. |
 | 4 | Fix host fd leak in `mmap` `map_shared_file` failure path | stale | Current `GuestMemory::map_shared_file` contract transfers fd ownership even on failure; default impl closes it, and HVF path closes in `OwnedHostMapping::map_shared_file` before returning. |
