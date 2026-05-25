@@ -6,7 +6,7 @@
 #[path = "common/syscall_support.rs"]
 mod support;
 
-use carrick::linux_abi::LinuxSysinfo;
+use carrick_runtime::linux_abi::LinuxSysinfo;
 use support::*;
 
 #[test]

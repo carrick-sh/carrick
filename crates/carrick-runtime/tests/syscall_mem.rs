@@ -194,7 +194,7 @@ fn mmap_rejects_unknown_map_flag_bits() {
 }
 
 #[test]
-fn mmap_unsupported_prot_none_hint_does_not_consume_bump_space() {
+fn mmap_out_of_bounds_hint_relocated_advisory() {
     let mut memory = AddressSpace::from_segments(
         0,
         [(LINUX_MMAP_BASE, rwx_perms(), Vec::new(), LINUX_MMAP_SIZE)],
@@ -204,6 +204,7 @@ fn mmap_unsupported_prot_none_hint_does_not_consume_bump_space() {
     let mut dispatcher = SyscallDispatcher::new();
     let map_private_anonymous = 0x02 | 0x20;
 
+    // Out-of-bounds hints are advisory: relocate into the arena rather than ENOMEM-ing.
     assert_eq!(
         dispatcher
             .dispatch(
@@ -222,9 +223,12 @@ fn mmap_unsupported_prot_none_hint_does_not_consume_bump_space() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 12 }
+        DispatchOutcome::Returned {
+            value: LINUX_MMAP_BASE as i64
+        }
     );
 
+    // The prior allocation consumed 64 MiB of bump space.
     assert_eq!(
         dispatcher
             .dispatch(
@@ -237,7 +241,7 @@ fn mmap_unsupported_prot_none_hint_does_not_consume_bump_space() {
             )
             .unwrap(),
         DispatchOutcome::Returned {
-            value: LINUX_MMAP_BASE as i64
+            value: (LINUX_MMAP_BASE + 64 * 1024 * 1024) as i64
         }
     );
 

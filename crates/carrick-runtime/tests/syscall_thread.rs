@@ -70,7 +70,7 @@ fn clone_fork_flags_still_fork() {
 
 // --- Sub-task B: per-thread tid + real futex via dispatch_threaded ---
 
-use carrick::thread::{FutexTable, ThreadRegistry};
+use carrick_runtime::thread::{FutexTable, ThreadRegistry};
 use std::sync::Arc;
 
 const LINUX_EAGAIN: i32 = 11;

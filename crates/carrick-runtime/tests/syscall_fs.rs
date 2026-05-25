@@ -11,9 +11,9 @@
 mod support;
 
 #[cfg(target_os = "macos")]
-use carrick::fs_backend::{FsBackend, HostFsBackend};
-use carrick::linux_abi::{LINUX_EFBIG, LINUX_O_CREAT, LINUX_O_RDWR};
-use carrick::vfs::MAX_IN_MEMORY_FILE_SIZE;
+use carrick_runtime::fs_backend::{FsBackend, HostFsBackend};
+use carrick_runtime::linux_abi::{LINUX_EFBIG, LINUX_O_CREAT, LINUX_O_RDWR};
+use carrick_runtime::vfs::MAX_IN_MEMORY_FILE_SIZE;
 use support::*;
 
 #[test]
@@ -382,7 +382,7 @@ fn tiocgpgrp_on_real_tty_uses_host_value_not_bootstrap() {
 
     // The slave is a real tty.
     assert!(
-        carrick::host_tty::host_isatty(slave),
+        carrick_runtime::host_tty::host_isatty(slave),
         "pty slave must be a tty"
     );
 
@@ -391,7 +391,7 @@ fn tiocgpgrp_on_real_tty_uses_host_value_not_bootstrap() {
     let direct = unsafe { libc::tcgetpgrp(slave) };
 
     // Our helper must agree with the direct call.
-    let via_helper = carrick::host_tty::host_tty_tcgetpgrp(slave);
+    let via_helper = carrick_runtime::host_tty::host_tty_tcgetpgrp(slave);
     match via_helper {
         Ok(pgrp) => {
             assert_eq!(
@@ -401,7 +401,7 @@ fn tiocgpgrp_on_real_tty_uses_host_value_not_bootstrap() {
             // Must never be the synthesised bootstrap constant on a real tty.
             assert_ne!(
                 pgrp,
-                carrick::linux_abi::LINUX_BOOTSTRAP_PGID,
+                carrick_runtime::linux_abi::LINUX_BOOTSTRAP_PGID,
                 "host_tty_tcgetpgrp must not return the faked bootstrap pgid on a real tty"
             );
         }
@@ -446,19 +446,19 @@ fn tiocgsid_on_real_tty_uses_host_value_not_bootstrap() {
     };
 
     assert!(
-        carrick::host_tty::host_isatty(slave),
+        carrick_runtime::host_tty::host_isatty(slave),
         "pty slave must be a tty"
     );
 
     // SAFETY: slave is a valid open fd.
     let direct = unsafe { libc::tcgetsid(slave) };
-    let via_helper = carrick::host_tty::host_tty_tcgetsid(slave);
+    let via_helper = carrick_runtime::host_tty::host_tty_tcgetsid(slave);
     match via_helper {
         Ok(sid) => {
             assert_eq!(sid, direct, "host_tty_tcgetsid must match tcgetsid");
             assert_ne!(
                 sid,
-                carrick::linux_abi::LINUX_BOOTSTRAP_SID,
+                carrick_runtime::linux_abi::LINUX_BOOTSTRAP_SID,
                 "host_tty_tcgetsid must not return the faked bootstrap sid on a real tty"
             );
         }
@@ -504,7 +504,7 @@ fn tiocspgrp_on_real_tty_calls_host_not_fake() {
     let our_pgrp = unsafe { libc::getpgrp() };
     // Call our helper — it may succeed or fail (EPERM/ENOTTY in harness), but
     // it must not panic.  Verify it returns the same outcome as a direct call.
-    let result_helper = carrick::host_tty::host_tty_tcsetpgrp(slave, our_pgrp);
+    let result_helper = carrick_runtime::host_tty::host_tty_tcsetpgrp(slave, our_pgrp);
     // SAFETY: same fd, same call.
     let direct_r = unsafe { libc::tcsetpgrp(slave, our_pgrp) };
     match result_helper {
@@ -2148,7 +2148,7 @@ fn missing_proc_file_records_compat_report_entry() {
 
 #[test]
 fn synthetic_sys_surface_serves_common_cpu_and_mm_files() {
-    let ncpu = carrick::host_facts::logical_cpu_count();
+    let ncpu = carrick_runtime::host_facts::logical_cpu_count();
     let cpu_range = if ncpu <= 1 {
         b"0\n".to_vec()
     } else {
@@ -4432,7 +4432,7 @@ fn sync_and_fsync_family_return_zero_for_valid_fds_and_ebadf_otherwise() {
 #[cfg(target_os = "macos")]
 #[test]
 fn fsync_family_flushes_host_backed_files() {
-    use carrick::fs_backend::HostFsBackend;
+    use carrick_runtime::fs_backend::HostFsBackend;
 
     let scratch = tempfile::TempDir::new().unwrap();
     let dir =
@@ -4490,7 +4490,7 @@ fn fsync_family_flushes_host_backed_files() {
 #[cfg(target_os = "macos")]
 #[test]
 fn copy_file_range_uses_darwin_fast_path_for_whole_host_files() {
-    use carrick::fs_backend::HostFsBackend;
+    use carrick_runtime::fs_backend::HostFsBackend;
 
     let scratch = tempfile::TempDir::new().unwrap();
     let dir =

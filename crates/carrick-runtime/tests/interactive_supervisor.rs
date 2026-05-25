@@ -7,7 +7,7 @@
 #[test]
 fn supervisor_sync_pipe_fds_are_high_and_cloexec() {
     let (read_fd, write_fd) =
-        carrick::interactive_supervisor::sync_pipe_for_test().expect("sync pipe");
+        carrick_runtime::interactive_supervisor::sync_pipe_for_test().expect("sync pipe");
 
     assert!(
         read_fd >= 16 * 1024,

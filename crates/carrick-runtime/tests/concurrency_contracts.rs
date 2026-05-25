@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
-use carrick::compat::{CompatEvent, CompatReporter, SyscallArgs};
-use carrick::dispatch::{
+use carrick_runtime::compat::{CompatEvent, CompatReporter, SyscallArgs};
+use carrick_runtime::dispatch::{
     DispatchOutcome, GuestMemory, LinearMemory, SyscallDispatcher, SyscallRequest,
 };
-use carrick::memory::LINUX_HEAP_BASE;
-use carrick::rootfs::{LayerSource, RootFs};
-use carrick::thread::{FutexTable, ThreadRegistry};
+use carrick_runtime::memory::LINUX_HEAP_BASE;
+use carrick_runtime::rootfs::{LayerSource, RootFs};
+use carrick_runtime::thread::{FutexTable, ThreadRegistry};
 
 fn assert_send_sync<T: Send + Sync>() {}
 

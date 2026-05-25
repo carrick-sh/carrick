@@ -1,4 +1,4 @@
-use carrick::elf::{ElfType, LINUX_PIE_DEFAULT_BASE, Machine, inspect_elf, plan_elf_load};
+use carrick_runtime::elf::{ElfType, LINUX_PIE_DEFAULT_BASE, Machine, inspect_elf, plan_elf_load};
 
 #[test]
 fn builds_static_linux_aarch64_hello_fixture() {
