@@ -622,7 +622,7 @@ fn run_cli(cli: Cli) -> anyhow::Result<()> {
             if command.is_empty() {
                 bail!("compat-report needs a command after --");
             }
-            eprintln!(
+            tracing::warn!(
                 "compat-report runtime hooks are scaffolded; returning an empty report for {:?}",
                 command
             );
@@ -709,7 +709,7 @@ fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     .join("scripts")
                     .join("carrick_lldb.py");
                 if !path.exists() {
-                    eprintln!(
+                    tracing::warn!(
                         "warning: lldb plugin not found at {} (CARGO_MANIFEST_DIR may not match runtime tree)",
                         path.display()
                     );
@@ -771,7 +771,7 @@ fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     // whole `carrick trace ...` invocation under sudo so the
                     // caller doesn't have to remember the prefix.
                     use std::os::unix::process::CommandExt;
-                    eprintln!("carrick trace: not root; re-executing under sudo…");
+                    tracing::warn!("carrick trace: not root; re-executing under sudo");
                     // Plain `sudo` resets the environment (env_reset), which
                     // would drop the CARRICK_* knobs the trace'd run needs
                     // (CARRICK_INSECURE_REGISTRIES, CARRICK_WATCH_ADDR,
@@ -949,7 +949,7 @@ fn install_fs_backend(
                 // rename) by giving it real Linux fs semantics.
                 if let Some(rootfs) = dispatcher.rootfs() {
                     if let Err(err) = host.seed_from_rootfs(rootfs) {
-                        eprintln!(
+                        tracing::warn!(
                             "carrick: --fs host seed-from-rootfs failed ({err}); falling back to in-memory backend"
                         );
                         let mut mem: Box<dyn FsBackend> = Box::new(MemoryBackend::new());
@@ -962,7 +962,7 @@ fn install_fs_backend(
                 Box::new(host)
             }
             Err(err) => {
-                eprintln!("carrick: --fs host failed ({err}); falling back to in-memory backend");
+                tracing::warn!("carrick: --fs host failed ({err}); falling back to in-memory backend");
                 Box::new(MemoryBackend::new())
             }
         },
@@ -1064,7 +1064,7 @@ fn default_fs_backend_kind() -> FsBackendKind {
     if carrick_runtime::apfs::probe_case_sensitive(&probe) {
         FsBackendKind::Host
     } else {
-        eprintln!(
+        tracing::warn!(
             "carrick: {} is case-insensitive; defaulting --fs to memory. \
              Pass `--fs host` to force the cap-std backend (some Linux tools may misbehave).",
             probe.display()
@@ -1330,7 +1330,7 @@ fn register_dtrace_probes() {
     match carrick_runtime::probes::register_dtrace_probes() {
         Ok(()) => {
             if std::env::var_os("CARRICK_DTRACE_DEBUG").is_some() {
-                eprintln!(
+                tracing::warn!(
                     "carrick: dtrace probes registered (pid={})",
                     std::process::id()
                 );
@@ -1339,7 +1339,7 @@ fn register_dtrace_probes() {
         Err(err) => {
             // Always surface registration failures: silent failure here is
             // what makes the dtrace path feel broken.
-            eprintln!("carrick: failed to register DTrace probes: {err}");
+            tracing::warn!("carrick: failed to register DTrace probes: {err}");
         }
     }
 }
