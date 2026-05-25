@@ -190,6 +190,52 @@ tick-1s { secs++; }
 tick-1s /secs >= 8/ { exit(0); }
 ```
 
+## Reading GUEST memory (a guest VA is NOT a host VA)
+
+`copyin(addr, n)` reads the **traced carrick host** address space. A pointer the
+guest passed to a syscall (e.g. the buffer of `write(2)`, a path string, the
+`iovec` base) is a **guest virtual address** — it lives in the guest's mapped
+RAM at a *different* host address, so `copyin(guest_va, n)` reads garbage and the
+probe silently **drops** (you get an empty `--trace-out` and conclude, wrongly,
+that "the write never happened"). This bites constantly — symptom: `syscall-return`
+shows `write` ret=105 but every attempt to print the buffer yields nothing.
+
+Three ways to actually read guest bytes:
+
+1. **Host pointers the probe already carries** — the easiest. carrick copies
+   guest buffers into a host `Vec` to service many syscalls; some probes hand you
+   that host pointer directly. `copyin(arg2, 48)` for the 6-u64 syscall-arg array
+   works because arg2 is a *host* address (the `SyscallArgs` struct), not a guest
+   VA — that's why arg-array reads succeed while buffer reads fail.
+
+2. **Stack-region translation** (what `--stack` uses): the `vcpu__trap`
+   `GuestRegs` exposes `stack_guest_base` / `stack_host_base` / `stack_guest_end`.
+   For a guest VA on the stack: `host = stack_host_base + (va - stack_guest_base)`,
+   valid only when `stack_guest_base <= va < stack_guest_end`. Good for stack
+   buffers; useless for heap/rodata (a Go/glibc fatal string is often in rodata).
+
+3. **Add a one-line temporary probe at the carrick site that already has the host
+   buffer.** When you need the *content* of an arbitrary guest buffer (heap,
+   rodata, anywhere), don't fight VA translation — find the handler that already
+   read it into host memory and fire a probe with `vec.as_ptr() as u64` + len,
+   then `copyin` that host pointer. Worked example — capturing a process's stderr
+   (which the parent may send to `/dev/null`) to read a glibc/Go fatal message:
+
+   ```rust
+   // in the write(2) handler, after `let bytes = memory.read_bytes(addr, len)?;`
+   if fd == 1 || fd == 2 { crate::probes::guest_write_dbg(fd, bytes.as_ptr() as u64, bytes.len() as u64); }
+   ```
+   ```d
+   carrick*:::guest-write-dbg
+   /(pid == $target || progenyof($target)) && arg0 == 2/
+   { printf("STDERR[%d] |%s|\n", pid, stringof(copyin(arg1, (int)arg2))); }
+   ```
+   This is how the os/exec `TestCommandRelativeName` SIGABRT was cracked: the
+   message turned out to be glibc's `_dl_get_origin: Assertion linkval[0]=='/'`
+   — i.e. `/proc/self/exe` returned a *relative* path after a relative-path
+   execve. Remove the temp probe once you have your answer (like the kick-stats
+   tripwires, it's fine to keep cheap always-on counters, but not content dumps).
+
 ## Symbolicating carrick (host) stacks
 
 `ustack()` on the carrick PIE binary often prints raw hex. Build with symbols +
