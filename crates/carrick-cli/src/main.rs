@@ -6,28 +6,17 @@ use carrick_runtime::dispatch::{LinearMemory, SyscallDispatcher, SyscallRequest}
 use carrick_runtime::elf::{inspect_elf, plan_elf_load};
 use carrick_runtime::fs_backend::{FsBackend, HostFsBackend, MemoryBackend};
 use carrick_runtime::memory::AddressSpace;
-use carrick_runtime::oci::{ImageReference, ImageStore, pull_image};
+use carrick_image::{ImageReference, ImageStore, pull_image};
+use carrick_spec::FsBackendKind;
 use carrick_runtime::rootfs::RootFs;
 use carrick_runtime::runtime::{
-    DEFAULT_MAX_TRAPS, DebugStateSnapshot, run_elf_from_dispatcher_debug,
-    run_rootfs_elf_with_hvf_args_and_dispatcher_debug,
+    DEFAULT_MAX_TRAPS, DebugStateSnapshot,
     run_static_elf_with_hvf_args_and_dispatcher_debug,
 };
 use carrick_runtime::syscall::{aarch64_table, lookup_aarch64};
 use carrick_runtime::trap::hvf_capabilities;
 use clap::{Parser, Subcommand};
 
-/// Which writable-layer backend to install on the SyscallDispatcher.
-/// See `src/fs_backend.rs` for the trait and both implementations.
-#[derive(Debug, Clone, Copy, clap::ValueEnum)]
-enum FsBackendKind {
-    /// In-memory tmpfs. Fast, ephemeral, ideal for CI/tests/one-shots.
-    Memory,
-    /// Host APFS scratch directory, sandboxed via cap-std. Durable,
-    /// byte-copied from the unpacked rootfs, the secure-by-default
-    /// production option.
-    Host,
-}
 
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
@@ -91,16 +80,46 @@ enum Commands {
         /// Suppress the JSON compat-report envelope.
         #[arg(long)]
         raw: bool,
-        /// Allocate a pseudo-terminal and run interactively, bridging the
-        /// guest's stdin/stdout to this terminal (like `docker run -it`).
-        /// Implies raw stdio.
+        /// Allocate a pseudo-terminal and run interactively (like `docker run -it`).
         #[arg(short = 't', long = "tty")]
         tty: bool,
+        /// Keep STDIN open even if not attached (like `docker run -it`).
+        #[arg(short = 'i', long = "interactive")]
+        interactive: bool,
         /// Which writable-layer backend to use. Defaults to `host` on
-        /// case-sensitive volumes (APFS scratch dir + cap-std sandbox)
-        /// and `memory` elsewhere (in-memory tmpfs).
+        /// case-sensitive volumes and `memory` elsewhere.
         #[arg(long, value_enum)]
         fs: Option<FsBackendKind>,
+        /// Set environment variables
+        #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
+        env: Vec<String>,
+        /// Read in a file of environment variables
+        #[arg(long = "env-file", value_name = "FILE")]
+        env_file: Option<PathBuf>,
+        /// Working directory inside the container
+        #[arg(short = 'w', long = "workdir", value_name = "DIR")]
+        workdir: Option<String>,
+        /// Username or UID
+        #[arg(short = 'u', long = "user", value_name = "USER")]
+        user: Option<String>,
+        /// Overwrite the default ENTRYPOINT of the image
+        #[arg(long = "entrypoint", value_name = "COMMAND")]
+        entrypoint: Option<String>,
+        /// Bind mount a volume
+        #[arg(short = 'v', long = "volume", value_name = "host-src:container-dest[:ro|rw]")]
+        volume: Vec<String>,
+        /// Attach a filesystem mount to the container
+        #[arg(long = "mount", value_name = "type=bind,source=host-src,target=container-dest[,readonly]")]
+        mount: Vec<String>,
+        /// Assign a name to the container
+        #[arg(long = "name", value_name = "NAME")]
+        name: Option<String>,
+        /// Automatically remove the container when it exits
+        #[arg(long = "rm")]
+        rm: bool,
+        /// Publish a container's port(s) to the host (no-op under host networking)
+        #[arg(short = 'p', long = "publish", value_name = "hostPort:containerPort")]
+        publish: Vec<String>,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
@@ -268,36 +287,6 @@ enum RootfsCommand {
 /// current-thread runtime that drops before the trap loop even begins,
 /// so by the time fork can fire there is no tokio state to break.
 /// Wire up guest stdio for a run.
-///
-/// For a non-interactive `--raw` run this just enables stdio streaming. For an
-/// interactive `-t` run it forks a session-leader supervisor that owns the pty
-/// and relay; the Carrick runtime continues only in the child process, in a
-/// foreground process group under that supervisor. The parent returns an
-/// `InteractiveParent` and must call `relay_and_wait()` instead of entering the
-/// HVF runtime.
-fn setup_interactive_stdio(
-    dispatcher: &mut SyscallDispatcher,
-    tty: bool,
-    raw: bool,
-) -> anyhow::Result<Option<carrick_runtime::interactive_supervisor::InteractiveParent>> {
-    if !tty {
-        if raw {
-            dispatcher.set_stream_stdio(true);
-        }
-        return Ok(None);
-    }
-    match carrick_runtime::interactive_supervisor::fork_interactive_session()
-        .context("failed to create interactive session supervisor")?
-    {
-        carrick_runtime::interactive_supervisor::SupervisorFork::Parent(parent) => Ok(Some(parent)),
-        carrick_runtime::interactive_supervisor::SupervisorFork::Child(child) => {
-            child
-                .adopt_stdio(dispatcher)
-                .context("failed to adopt interactive pty in runtime child")?;
-            Ok(None)
-        }
-    }
-}
 
 fn main() -> anyhow::Result<()> {
     // Ignore SIGPIPE in the host so a guest writing to a closed
@@ -382,7 +371,18 @@ fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 debug_state_path: None,
                 raw: !interactive,
                 tty: interactive,
+                interactive,
                 fs: None,
+                env: vec![],
+                env_file: None,
+                workdir: None,
+                user: None,
+                entrypoint: None,
+                volume: vec![],
+                mount: vec![],
+                name: None,
+                rm: false,
+                publish: vec![],
                 command: vec!["/bin/sh".to_owned()],
             }
         }
@@ -508,164 +508,61 @@ fn run_cli(cli: Cli) -> anyhow::Result<()> {
             debug_state_path,
             raw,
             tty,
+            interactive,
             fs,
+            env,
+            env_file,
+            workdir,
+            user,
+            entrypoint,
+            volume,
+            mount,
+            name,
+            rm,
+            publish: _,
             command,
         } => {
-            let image = ImageReference::parse(&image)?;
-            let command = if command.is_empty() {
-                vec!["/bin/sh".to_owned()]
-            } else {
-                command
-            };
-            // docker-run semantics: use the locally-stored image if present,
-            // otherwise pull it on demand. A bare name like `python:3.12-slim`
-            // is already canonicalised to `docker.io/library/python:3.12-slim`
-            // by the reference parser, so the pull and the store lookup agree.
-            let summary = block_on_oci(async {
-                match store.load_pull_summary(&image).await {
-                    Ok(summary) => Ok(summary),
-                    Err(_) => {
-                        eprintln!(
-                            "carrick: image {} not in store; pulling…",
-                            image.canonical()
-                        );
-                        pull_image(&image, &store).await
-                    }
-                }
-            })
-            .with_context(|| format!("failed to obtain image {}", image.canonical()))?;
-            let rootfs_layers: Vec<PathBuf> = summary
-                .layers
-                .iter()
-                .map(|layer| layer.path.clone())
-                .collect();
-            let executable_path = &command[0];
-            // Name the host process `carrick: <basename>` up front so
-            // it's identifiable in ps/Activity Monitor even before the
-            // guest sets its own comm via prctl.
-            {
-                let base = executable_path
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or(executable_path);
-                carrick_runtime::dispatch::set_host_process_name(base.as_bytes());
+            // Parse environment variables from env_file if specified
+            let mut env_overrides = env.clone();
+            if let Some(file_path) = &env_file {
+                let file_envs = parse_env_file(file_path)?;
+                env_overrides.extend(file_envs);
             }
 
-            // Resolve --fs (or the default) early so we can branch before
-            // touching the in-memory rootfs. For --fs host we stream layers
-            // straight onto the cap-std scratch Dir; for --fs memory we keep
-            // the original in-memory RootFs path.
-            let fs_kind = fs.unwrap_or_else(default_fs_backend_kind);
-
-            // Standard Linux environment provided to every guest run.
-            // Without PATH glibc-based tools like dpkg-query bail with
-            // "PATH is not set" and apt's pre-fork helpers can't locate
-            // their siblings.
-            let mut env: Vec<String> = vec![
-                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_owned(),
-                "HOME=/root".to_owned(),
-                "TERM=xterm-256color".to_owned(),
-                "LANG=C.UTF-8".to_owned(),
-                "LC_ALL=C.UTF-8".to_owned(),
-                "DEBIAN_FRONTEND=noninteractive".to_owned(),
-                "PAGER=cat".to_owned(),
-            ];
-            // Forward a small allowlist of runtime-tuning/diagnostic env vars from
-            // the host when explicitly set. These are no-ops in normal use (unset)
-            // but let an operator pass e.g. GODEBUG=schedtrace=1000 to a guest Go
-            // binary, or GOMAXPROCS, without baking it into the image — invaluable
-            // for differential debugging against Docker.
-            for key in [
-                "GODEBUG",
-                "GOMAXPROCS",
-                "GOTRACEBACK",
-                "GOGC",
-                "GODEBUGFLAGS",
-            ] {
-                if let Ok(val) = std::env::var(key) {
-                    env.push(format!("{key}={val}"));
-                }
+            // Parse mounts
+            let mut mounts = Vec::new();
+            for v_str in &volume {
+                mounts.push(parse_volume_mount(v_str)?);
+            }
+            for m_str in &mount {
+                mounts.push(parse_mount_flag(m_str)?);
             }
 
-            let result = match fs_kind {
-                FsBackendKind::Host => {
-                    // Stream every OCI layer straight onto the cap-std scratch
-                    // Dir.  No in-memory RootFs is built: the disk overlay is
-                    // immediately authoritative for all fs syscalls AND for the
-                    // initial ELF load (via read_exec_file / overlay-first).
-                    let mut host = HostFsBackend::new()
-                        .context("--fs host: failed to create scratch directory")?;
-                    host.extract_layers(&rootfs_layers)
-                        .context("--fs host: failed to stream OCI layers to scratch Dir")?;
-                    let mut dispatcher = SyscallDispatcher::new();
-                    dispatcher.set_executable_path(executable_path.clone());
-                    seed_guest_baseline(&mut host);
-                    let _ = dispatcher.set_fs_backend(Box::new(host));
-                    // Interactive pty (or --raw stream): hand the guest the pty
-                    // slave as fds 0/1/2 and relay master <-> the user's terminal.
-                    let _supervisor_parent = setup_interactive_stdio(&mut dispatcher, tty, raw)?;
-                    if let Some(parent) = _supervisor_parent {
-                        let code = parent.relay_and_wait()?;
-                        std::process::exit(code);
-                    }
-                    // Capture the run result WITHOUT `?` so contextual errors
-                    // still include the selected fs backend and image.
-                    let run_result = run_elf_from_dispatcher_debug(
-                        executable_path.as_str(),
-                        dispatcher,
-                        command.clone(),
-                        env,
-                        max_traps,
-                        debug_state_path.as_ref(),
-                    );
-                    run_result.with_context(|| {
-                        format!(
-                            "failed to run ELF {} from image {} (--fs host)",
-                            executable_path,
-                            image.canonical()
-                        )
-                    })?
-                }
-                FsBackendKind::Memory => {
-                    // Classic in-memory path: unchanged behaviour.
-                    let rootfs = RootFs::from_layer_paths(&rootfs_layers)
-                        .context("failed to compose image rootfs layers")?;
-                    let mut dispatcher = SyscallDispatcher::with_rootfs_and_executable(
-                        rootfs.clone(),
-                        executable_path.clone(),
-                    );
-                    install_fs_backend(&mut dispatcher, Some(FsBackendKind::Memory))?;
-                    // Interactive pty (or --raw stream): hand the guest the pty
-                    // slave as fds 0/1/2 and relay master <-> the user's terminal.
-                    let _supervisor_parent = setup_interactive_stdio(&mut dispatcher, tty, raw)?;
-                    if let Some(parent) = _supervisor_parent {
-                        let code = parent.relay_and_wait()?;
-                        std::process::exit(code);
-                    }
-                    // Capture the run result WITHOUT `?` so contextual errors
-                    // still include the selected fs backend and image.
-                    let run_result = run_rootfs_elf_with_hvf_args_and_dispatcher_debug(
-                        executable_path.as_str(),
-                        &rootfs,
-                        dispatcher,
-                        command.clone(),
-                        env,
-                        max_traps,
-                        debug_state_path.as_ref(),
-                    );
-                    run_result.with_context(|| {
-                        format!(
-                            "failed to run ELF {} from image {} (--fs memory)",
-                            executable_path,
-                            image.canonical()
-                        )
-                    })?
-                }
+            let entrypoint_override = entrypoint.map(|ep| vec![ep]);
+
+            let req = carrick_engine::CliRunRequest {
+                image_ref: image,
+                args: command,
+                env_overrides,
+                mounts,
+                workdir,
+                user,
+                entrypoint_override,
+                tty,
+                interactive,
+                rm,
+                name,
+                max_traps,
+                debug_state_path: debug_state_path.map(|p| p.to_string_lossy().into_owned()),
+                fs,
             };
 
-            if tty {
-                // Guest output already went to the terminal via the relay;
-                // the stdout/stderr buffers are empty under stream_stdio.
+            let engine = carrick_engine::Engine::new(store.clone());
+            let result = block_on_oci(async {
+                engine.run(req.clone()).await
+            })?;
+
+            if tty || interactive {
                 std::process::exit(if result.trap_limit_hit {
                     1
                 } else {
@@ -679,20 +576,19 @@ fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     result.exit_code
                 });
             }
+
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
-                    "image": image.canonical(),
-                    "command": command,
+                    "image": req.image_ref,
+                    "command": req.args,
                     "store": store.root(),
-                    "rootfs_layers": rootfs_layers,
                     "exit_code": result.exit_code,
                     "stdout": String::from_utf8_lossy(&result.stdout),
                     "stderr": String::from_utf8_lossy(&result.stderr),
                     "traps": result.traps,
                     "trap_limit_hit": result.trap_limit_hit,
                     "report": result.report,
-                    "trap": hvf_capabilities(),
                 }))?
             );
             if result.trap_limit_hit {
@@ -1285,6 +1181,69 @@ fn emit_raw(result: &carrick_runtime::runtime::RunResult) {
     let _ = std::io::stderr().write_all(&result.stderr);
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
+}
+
+fn parse_volume_mount(s: &str) -> anyhow::Result<carrick_spec::Mount> {
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() < 2 || parts.len() > 3 {
+        anyhow::bail!("invalid volume format '{}', expected host_path:guest_path[:ro|rw]", s);
+    }
+    let source = camino::Utf8PathBuf::from(parts[0]);
+    let target = camino::Utf8PathBuf::from(parts[1]);
+    let readonly = if parts.len() == 3 {
+        match parts[2] {
+            "ro" => true,
+            "rw" => false,
+            other => anyhow::bail!("invalid volume mode '{}', expected ro or rw", other),
+        }
+    } else {
+        false
+    };
+    Ok(carrick_spec::Mount {
+        source,
+        target,
+        readonly,
+    })
+}
+
+fn parse_mount_flag(s: &str) -> anyhow::Result<carrick_spec::Mount> {
+    let mut source = None;
+    let mut target = None;
+    let mut readonly = false;
+    for part in s.split(',') {
+        if let Some((k, v)) = part.split_once('=') {
+            match k {
+                "source" | "src" => source = Some(camino::Utf8PathBuf::from(v)),
+                "target" | "dst" | "destination" => target = Some(camino::Utf8PathBuf::from(v)),
+                "readonly" | "ro" => {
+                    readonly = v.parse::<bool>().unwrap_or(true);
+                }
+                _ => {}
+            }
+        } else if part == "readonly" {
+            readonly = true;
+        }
+    }
+    let source = source.ok_or_else(|| anyhow::anyhow!("mount option missing source: {}", s))?;
+    let target = target.ok_or_else(|| anyhow::anyhow!("mount option missing target: {}", s))?;
+    Ok(carrick_spec::Mount {
+        source,
+        target,
+        readonly,
+    })
+}
+
+fn parse_env_file(path: &std::path::Path) -> anyhow::Result<Vec<String>> {
+    let content = std::fs::read_to_string(path)?;
+    let mut envs = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        envs.push(trimmed.to_string());
+    }
+    Ok(envs)
 }
 
 /// Run a single OCI-related future on a short-lived current-thread tokio
