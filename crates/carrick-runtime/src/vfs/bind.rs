@@ -71,6 +71,11 @@ impl Vfs for BindVfs {
         std::fs::read_link(&host).map_err(map_io_error)
     }
 
+    fn read_file(&self, path: &str) -> Result<Vec<u8>, VfsError> {
+        let host = self.to_host(path)?;
+        std::fs::read(&host).map_err(map_io_error)
+    }
+
     fn readdir(&self, path: &str) -> Result<Vec<DirEnt>, VfsError> {
         let host = self.to_host(path)?;
         let mut entries = Vec::new();
