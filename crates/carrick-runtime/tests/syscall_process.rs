@@ -3,7 +3,7 @@
 //! Split out of the former tests/syscall_dispatch.rs monolith. Shared imports,
 //! constants, and helpers live in tests/common/syscall_support.rs.
 
-#[path = "common/syscall_support.rs"]
+#[path = "integration/common/syscall_support.rs"]
 mod support;
 
 use support::*;
