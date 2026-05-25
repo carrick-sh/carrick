@@ -1,34 +1,34 @@
-// Swappable filesystem-write backend behind a single trait.
-//
-// Carrick's OCI rootfs is read-only by construction (the layers come
-// out of an OCI image and are immutable). To let the guest do useful
-// work — `apt update` mkdir's `/var/lib/apt/lists/partial`, `dpkg`
-// rewrites status files, build tools touch `/tmp` — the dispatcher
-// needs a writable layer that sits on top.
-//
-// There are two reasonable places to put that layer:
-//
-//   * `MemoryBackend`: pure in-memory `HashMap<PathBuf, Vec<u8>>`,
-//     fast, ephemeral, ideal for CI / tests / one-shot runs.
-//   * `HostFsBackend`: a real APFS scratch directory, sandboxed via
-//     `cap_std::fs::Dir` (kernel-rooted, syscall-level escape-proof),
-//     byte-copied from the unpacked rootfs (a future clonefile(2) seed
-//     would be O(1) on APFS). This is the production / durable option.
-//
-// Both implement the same [`FsBackend`] trait. The dispatcher holds
-// a `Box<dyn FsBackend>` and is otherwise agnostic to which one is
-// in use. The CLI `--fs <memory|host>` flag selects at runtime.
-//
-// API choice: the trait methods mirror the high-level operations the
-// dispatcher already performs (`lookup`, `make_dir`, `set_file_contents`,
-// `mark_deleted`, ...). They are intentionally *layer-aware* rather
-// than POSIX-shaped — the dispatcher already does its own overlay-
-// first + rootfs-fallback merging, so the backend's job is to be the
-// "upper" layer. A POSIX-shaped open/read/write trait was considered
-// but would have required either duplicating the layering logic in
-// each backend or rewriting every fs-touching syscall site; the
-// current shape is the minimum-risk version that still lets the host
-// backend live behind the same trait.
+//! Swappable filesystem-write backend behind a single trait.
+//!
+//! Carrick's OCI rootfs is read-only by construction (the layers come
+//! out of an OCI image and are immutable). To let the guest do useful
+//! work - `apt update` mkdirs `/var/lib/apt/lists/partial`, `dpkg`
+//! rewrites status files, build tools touch `/tmp` - the dispatcher
+//! needs a writable layer that sits on top.
+//!
+//! There are two reasonable places to put that layer:
+//!
+//! * `MemoryBackend`: pure in-memory `HashMap<PathBuf, Vec<u8>>`,
+//!   fast, ephemeral, ideal for CI / tests / one-shot runs.
+//! * `HostFsBackend`: a real APFS scratch directory, sandboxed via
+//!   `cap_std::fs::Dir` (kernel-rooted, syscall-level escape-proof),
+//!   byte-copied from the unpacked rootfs (a future clonefile(2) seed
+//!   would be O(1) on APFS). This is the production / durable option.
+//!
+//! Both implement the same [`FsBackend`] trait. The dispatcher holds
+//! a `Box<dyn FsBackend>` and is otherwise agnostic to which one is
+//! in use. The CLI `--fs <memory|host>` flag selects at runtime.
+//!
+//! API choice: the trait methods mirror the high-level operations the
+//! dispatcher already performs (`lookup`, `make_dir`, `set_file_contents`,
+//! `mark_deleted`, ...). They are intentionally layer-aware rather
+//! than POSIX-shaped: the dispatcher already does its own overlay-first
+//! plus rootfs-fallback merging, so the backend's job is to be the
+//! "upper" layer. A POSIX-shaped open/read/write trait was considered
+//! but would have required either duplicating the layering logic in
+//! each backend or rewriting every fs-touching syscall site; the
+//! current shape is the minimum-risk version that still lets the host
+//! backend live behind the same trait.
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};

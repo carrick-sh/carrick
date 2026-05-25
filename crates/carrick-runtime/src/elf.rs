@@ -1,3 +1,5 @@
+//! ELF inspection and load-planning helpers for Linux AArch64 executables.
+
 use std::fs;
 use std::path::Path;
 

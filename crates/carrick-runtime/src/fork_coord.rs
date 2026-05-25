@@ -1,3 +1,6 @@
+//! Coordination for Carrick-owned host state that must be quiesced around
+//! real host fork operations.
+
 use std::sync::Arc;
 
 use parking_lot::Mutex;

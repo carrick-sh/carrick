@@ -1,3 +1,6 @@
+//! Shared Carrick data model for OCI references, image config, mounts,
+//! namespaces, and run specs.
+
 use std::collections::{HashMap, HashSet};
 use camino::Utf8PathBuf;
 use oci_client::Reference;

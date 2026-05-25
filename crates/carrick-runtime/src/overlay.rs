@@ -1,10 +1,8 @@
-// Historical home of the in-memory writable overlay. Kept around as
-// a back-compat re-export so older code paths that say
-// `crate::overlay::WritableOverlay` keep compiling, but the real
-// implementation now lives in [`crate::fs_backend`] behind the
-// swappable [`FsBackend`] trait. See `fs_backend.rs` for the trait,
-// the in-memory backend (`MemoryBackend`), and the cap-std-backed
-// host-fs backend (`HostFsBackend`).
+//! Back-compat re-export for the historical in-memory writable overlay.
+//!
+//! The implementation now lives in [`crate::fs_backend`] behind the
+//! swappable `FsBackend` trait, but older code paths still refer to
+//! `crate::overlay::WritableOverlay`.
 
 pub use crate::fs_backend::{
     MemoryBackend as WritableOverlay, OverlayEntry, layered_directory_entries,

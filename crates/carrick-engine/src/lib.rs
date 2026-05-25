@@ -1,3 +1,8 @@
+//! High-level orchestration layer for Carrick run requests.
+//!
+//! The engine bridges CLI-facing run specs to image resolution, rootfs
+//! composition, filesystem backend selection, and runtime execution.
+
 use std::collections::HashMap;
 use camino::Utf8PathBuf;
 

@@ -1,3 +1,6 @@
+//! USDT probe definitions and safe wrapper functions for Carrick runtime
+//! observability.
+
 use crate::compat::{CompatEvent, SyscallArgs};
 
 /// USDT probes for the carrick provider. The `usdt` crate's hard cap is

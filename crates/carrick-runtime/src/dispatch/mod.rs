@@ -1,3 +1,8 @@
+//! Linux syscall dispatch core.
+//!
+//! This module owns guest ABI request decoding, descriptor state, wait
+//! outcomes, and shared syscall helpers used by the per-domain handlers.
+
 use std::collections::{HashMap, VecDeque};
 use std::path::{Component, Path};
 use std::sync::Arc;

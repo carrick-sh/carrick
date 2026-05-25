@@ -1,3 +1,6 @@
+//! Hypervisor.framework trap engine, guest register/memory access, signal
+//! frames, and fork/exec address-space management.
+
 use crate::dispatch::{Aarch64SyscallFrame, GuestMemory, MemoryError};
 use crate::elf::SegmentPerms;
 use crate::memory::AddressSpace;

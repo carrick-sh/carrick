@@ -1,3 +1,6 @@
+//! Linux AArch64 ABI constants and wire-format structs used by the dispatcher
+//! and guest memory helpers.
+
 use bitflags::bitflags;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 

@@ -1,3 +1,6 @@
+//! OCI layer and rootfs composition support, including whiteout handling and
+//! read-only lookup APIs.
+
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Cursor, Read, Write};

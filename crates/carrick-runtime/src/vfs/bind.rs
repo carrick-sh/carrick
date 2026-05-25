@@ -1,3 +1,6 @@
+//! Bind-mount VFS implementation backed by host paths with Linux errno
+//! translation.
+
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
 
