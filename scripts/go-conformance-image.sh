@@ -34,12 +34,25 @@ logs="/tmp/go-img-conformance"; mkdir -p "$logs"
 printf '%-14s %-8s %s\n' "PACKAGE" "RESULT" "DETAIL"
 for p in "${pkgs[@]}"; do
   n=$(echo "$p" | tr / _); log="$logs/$n.log"
+  # Per-package exclusions for ENVIRONMENTAL failures — ones that fail
+  # identically under a plain Docker linux/arm64 run of the same binary, so they
+  # are not carrick gaps. Each must be justified inline (differential oracle).
+  skip=""
+  case "$p" in
+    os/signal)
+      # TestTerminalSignal requires a controlling TTY and its own session; the
+      # non-interactive harness (no `carrick run -t`) provides none. The same
+      # binary fails under plain Docker linux/arm64 with
+      # "fork/exec ...: operation not permitted", so this is environmental.
+      skip="-test.skip=TestTerminalSignal" ;;
+  esac
   # cwd = the package source dir so the test's relative file reads resolve;
   # cap output hard (some failures dump megabytes).
   CARRICK_EXPOSED_CPUS="$EXPOSED_CPUS" timeout -s KILL "$RUN_TIMEOUT" \
     "$carrick" run --raw -w "/usr/local/go/src/$p" "$IMG" \
-    "/conformance/$n.test" -test.run Test -test.short 2>&1 | head -c 200000 > "$log"
-  rc=${PIPESTATUS[1]}
+    "/conformance/$n.test" -test.run Test -test.short $skip 2>&1 | head -c 200000 > "$log"
+  # PIPESTATUS[0] is `timeout` (137 on SIGKILL); [1] is head. We want the former.
+  rc=${PIPESTATUS[0]}
   if grep -aqE '^ok\b|^PASS$' "$log" && ! grep -aqE '^--- FAIL|^FAIL$|panic:|fatal error:' "$log"; then
     printf '%-14s %-8s\n' "$n" "PASS"
   elif grep -aqE 'panic:|fatal error:' "$log"; then
