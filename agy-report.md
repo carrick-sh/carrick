@@ -413,6 +413,8 @@ The DAC (discretionary access control) check lives in `dispatch/mod.rs` — shou
 | `cargo test -p carrick-runtime --test runtime_loop runtime_loop_can_cat_a_rootfs_file -- --nocapture` | done | Verifies `runtime_loop` uses the shared gzip/tar helper. |
 | source module-doc audit | done | `find crates \( -path '*/src/*.rs' -o -path '*/src/**/*.rs' \) ...` now prints no production source files missing a leading `//!` module doc. |
 | `rg -n "eprintln!" crates/carrick-cli/src/main.rs` | done | Only the intentional panic abort banner remains on direct stderr; CLI warning/status diagnostics now use `tracing::warn!`. |
+| `cargo test -p carrick-runtime --test integration fstat_and_statx_empty_path_agree_for_anonymous_fd_kinds -- --nocapture` | done | Verifies fd-based `fstat` and empty-path `statx` agree across anonymous descriptor kinds through the shared `StatRecord` path. |
+| `cargo test -p carrick-runtime --test integration newfstatat_and_fstat_write_typed_linux_stat -- --nocapture` | done | Verifies typed Linux stat output for `newfstatat` and `fstat` still matches expected rootfs metadata. |
 
 ### Tier 1
 
@@ -435,7 +437,7 @@ The DAC (discretionary access control) check lives in `dispatch/mod.rs` — shou
 | 10 | Split `dispatch/net.rs` | open | Structural refactor. |
 | 11 | Split `main.rs` into command modules | open | Structural refactor. |
 | 12 | Extract `OpenDescription` status flags | open | Behavior-preserving refactor with high call-site count. |
-| 13 | Consolidate stat/statx writers | open | Behavior-preserving refactor. |
+| 13 | Consolidate stat/statx writers | done | Current code already routes metadata, real-stat, fd-stat, and synthetic-stat cases through `StatRecord`, `write_stat_record`, and `write_statx_record`; focused stat/statx agreement tests pass. |
 | 14 | Unify `gzip_tar` test helper | open | Runtime test duplicates now use `integration/common/syscall_support.rs`, including a mode-aware helper for executable ELF layers. A separate CLI-local helper remains; fully unifying that would need a shared test-support crate or public test helper. |
 | 15 | Parameterize `linux_fixture.rs` tests | done | Collapsed repeated static fixture metadata/load-plan assertions into one fixture table and loop while preserving the special ET_EXEC and PIE checks. |
 | 16 | Delete duplicate `probe_case_sensitive` and `join_ids` from main.rs | done | CLI now calls `carrick_runtime::apfs::probe_case_sensitive` and the shared `dtrace_consumer::join_ids`; the duplicate local helpers were removed. |
