@@ -348,6 +348,7 @@ dependencies = [
  "cap-std",
  "carrick-image",
  "carrick-spec",
+ "cc",
  "clap",
  "fd-lock",
  "flate2",

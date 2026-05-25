@@ -43,6 +43,9 @@ carrick-spec = { path = "../carrick-spec" }
 applevisor.workspace = true
 applevisor-sys.workspace = true
 
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.build-dependencies]
+cc = "1"
+
 [dev-dependencies]
 tempfile.workspace = true
 carrick-image = { path = "../carrick-image" }
