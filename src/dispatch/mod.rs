@@ -425,6 +425,18 @@ pub struct SyscallCtx<'a, M: GuestMemory> {
     pub thread: Option<ThreadCtx<'a>>,
 }
 
+impl<M: GuestMemory> SyscallCtx<'_, M> {
+    #[inline]
+    pub fn number(&self) -> u64 {
+        self.request.number
+    }
+
+    #[inline]
+    pub fn raw_args(&self) -> SyscallArgs {
+        self.request.args
+    }
+}
+
 /// Per-thread coordination handles handed to tid-aware syscall handlers
 /// (`gettid`, `set_tid_address`, `futex`).
 #[derive(Clone, Copy)]
