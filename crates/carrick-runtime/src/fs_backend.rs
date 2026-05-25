@@ -1933,7 +1933,7 @@ mod tests {
     fn host_open_raw_fd_then_set_mode_visible_via_fget_xattr() {
         // Mirrors the openat(O_CREAT)+fstat path: create+open a real fd, set
         // the guest mode, then read it back from THAT fd (what fstat does).
-        let (mut b, _scratch) = host_backend();
+        let (b, _scratch) = host_backend();
         let fd = b.open_raw_fd("/g", true, true, true).expect("open_raw_fd");
         b.set_mode("/g", 0o041).unwrap();
         assert_eq!(fget_mode_xattr(fd), Some(0o041), "fstat-side xattr read");
@@ -1943,7 +1943,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn host_set_mode_roundtrips_via_xattr_even_when_inaccessible() {
-        let (mut b, _scratch) = host_backend();
+        let (b, _scratch) = host_backend();
         b.create_file("/f").unwrap();
         // A mode with no owner-read would lock carrick out if applied
         // literally; the xattr must still report it faithfully.
@@ -1958,7 +1958,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn host_guest_xattr_api_hides_all_internal_carrick_names() {
-        let (mut b, _scratch) = host_backend();
+        let (b, _scratch) = host_backend();
         b.set_file_contents("/f", b"x".to_vec()).unwrap();
         b.set_mode("/f", 0o600).unwrap();
         b.set_owner("/f", 123, 456).unwrap();
@@ -2003,7 +2003,7 @@ mod tests {
         std::fs::create_dir(&scratch).unwrap();
         let dir =
             cap_std::fs::Dir::open_ambient_dir(&scratch, cap_std::ambient_authority()).unwrap();
-        let mut b = HostFsBackend::from_existing_dir(dir);
+        let b = HostFsBackend::from_existing_dir(dir);
         // Try to escape via `..`. cap-std rejects this at the path-
         // walking layer, not via a Rust-level check, which is exactly
         // the secure-by-default guarantee we wanted.
@@ -2051,7 +2051,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn host_backend_survives_libc_fork_for_etc_hosts() {
-        let (mut b, scratch) = host_backend();
+        let (b, scratch) = host_backend();
         b.make_dir("/etc").unwrap();
         b.set_file_contents("/etc/hosts", b"151.101.194.132\tdeb.debian.org\n".to_vec())
             .unwrap();

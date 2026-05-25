@@ -841,7 +841,7 @@ mod tests {
 
     #[test]
     fn open_rootfs_file_returns_bytes() {
-        let mut v = RootFsVfs::with_rootfs(rootfs_with_files());
+        let v = RootFsVfs::with_rootfs(rootfs_with_files());
         let h = v
             .open(
                 "/etc/hosts",
@@ -862,7 +862,7 @@ mod tests {
 
     #[test]
     fn open_write_to_rootfs_only_is_erofs() {
-        let mut v = RootFsVfs::with_rootfs(rootfs_with_files());
+        let v = RootFsVfs::with_rootfs(rootfs_with_files());
         let result = v.open(
             "/etc/hosts",
             OpenFlags {
@@ -876,7 +876,7 @@ mod tests {
 
     #[test]
     fn overlay_shadows_rootfs() {
-        let mut v = RootFsVfs::with_rootfs(rootfs_with_files());
+        let v = RootFsVfs::with_rootfs(rootfs_with_files());
         v.overlay
             .set_file_contents("/etc/hosts", b"10.0.0.1 myhost\n".to_vec())
             .unwrap();
@@ -906,33 +906,33 @@ mod tests {
 
     #[test]
     fn tombstone_shadows_rootfs() {
-        let mut v = RootFsVfs::with_rootfs(rootfs_with_files());
+        let v = RootFsVfs::with_rootfs(rootfs_with_files());
         v.overlay.mark_deleted("/etc/hosts").unwrap();
         assert_eq!(v.lookup("/etc/hosts"), Err(LINUX_ENOENT));
     }
 
     #[test]
     fn unlink_tombstones_rootfs_path() {
-        let mut v = RootFsVfs::with_rootfs(rootfs_with_files());
+        let v = RootFsVfs::with_rootfs(rootfs_with_files());
         v.unlink("/etc/hosts").unwrap();
         assert_eq!(v.lookup("/etc/hosts"), Err(LINUX_ENOENT));
     }
 
     #[test]
     fn unlink_dir_returns_eisdir() {
-        let mut v = RootFsVfs::with_rootfs(rootfs_with_files());
+        let v = RootFsVfs::with_rootfs(rootfs_with_files());
         assert_eq!(v.unlink("/etc"), Err(LINUX_EISDIR));
     }
 
     #[test]
     fn unlink_missing_returns_enoent() {
-        let mut v = RootFsVfs::with_rootfs(rootfs_with_files());
+        let v = RootFsVfs::with_rootfs(rootfs_with_files());
         assert_eq!(v.unlink("/no-such"), Err(LINUX_ENOENT));
     }
 
     #[test]
     fn mkdir_then_lookup() {
-        let mut v = RootFsVfs::with_rootfs(rootfs_with_files());
+        let v = RootFsVfs::with_rootfs(rootfs_with_files());
         v.mkdir("/tmp", 0o755).unwrap();
         let md = v.lookup("/tmp").unwrap();
         assert_eq!(md.kind, EntryKind::Directory);
@@ -940,7 +940,7 @@ mod tests {
 
     #[test]
     fn readdir_layered() {
-        let mut v = RootFsVfs::with_rootfs(rootfs_with_files());
+        let v = RootFsVfs::with_rootfs(rootfs_with_files());
         // Add an overlay-owned file.
         v.mkdir("/etc/extras", 0o755).unwrap();
         let entries = v.readdir("/etc").unwrap();
@@ -951,7 +951,7 @@ mod tests {
 
     #[test]
     fn rename_overlay_file_to_new_path() {
-        let mut v = RootFsVfs::with_rootfs(rootfs_with_files());
+        let v = RootFsVfs::with_rootfs(rootfs_with_files());
         v.overlay
             .set_file_contents("/etc/source", b"hello\n".to_vec())
             .unwrap();
@@ -965,7 +965,7 @@ mod tests {
 
     #[test]
     fn rename_rootfs_file_promotes_into_overlay() {
-        let mut v = RootFsVfs::with_rootfs(rootfs_with_files());
+        let v = RootFsVfs::with_rootfs(rootfs_with_files());
         v.rename_with_flags("/etc/hosts", "/etc/renamed_hosts", false)
             .unwrap();
         // Source tombstoned in overlay.
@@ -978,7 +978,7 @@ mod tests {
 
     #[test]
     fn rename_with_no_replace_rejects_existing() {
-        let mut v = RootFsVfs::with_rootfs(rootfs_with_files());
+        let v = RootFsVfs::with_rootfs(rootfs_with_files());
         v.overlay
             .set_file_contents("/etc/source", b"x".to_vec())
             .unwrap();
@@ -989,14 +989,14 @@ mod tests {
 
     #[test]
     fn rename_missing_source_is_enoent() {
-        let mut v = RootFsVfs::with_rootfs(rootfs_with_files());
+        let v = RootFsVfs::with_rootfs(rootfs_with_files());
         let result = v.rename_with_flags("/etc/no-such", "/etc/dest", false);
         assert_eq!(result, Err(LINUX_ENOENT));
     }
 
     #[test]
     fn open_for_dispatch_overlay_file() {
-        let mut v = RootFsVfs::with_rootfs(rootfs_with_files());
+        let v = RootFsVfs::with_rootfs(rootfs_with_files());
         v.overlay
             .set_file_contents("/etc/scratch", b"overlay\n".to_vec())
             .unwrap();
@@ -1016,7 +1016,7 @@ mod tests {
 
     #[test]
     fn open_for_dispatch_rootfs_file_with_writable_promotes() {
-        let mut v = RootFsVfs::with_rootfs(rootfs_with_files());
+        let v = RootFsVfs::with_rootfs(rootfs_with_files());
         let result = v
             .open_for_dispatch("/etc/hosts", false, false, false, true)
             .unwrap();
@@ -1033,7 +1033,7 @@ mod tests {
 
     #[test]
     fn open_for_dispatch_directory_returns_layered_entries() {
-        let mut v = RootFsVfs::with_rootfs(rootfs_with_files());
+        let v = RootFsVfs::with_rootfs(rootfs_with_files());
         v.mkdir("/etc/extras", 0o755).unwrap();
         let result = v
             .open_for_dispatch("/etc", false, false, false, false)
@@ -1051,7 +1051,7 @@ mod tests {
 
     #[test]
     fn open_for_dispatch_not_found_create_signals_caller() {
-        let mut v = RootFsVfs::with_rootfs(rootfs_with_files());
+        let v = RootFsVfs::with_rootfs(rootfs_with_files());
         let result = v
             .open_for_dispatch("/etc/new", true, false, false, true)
             .unwrap();
@@ -1060,27 +1060,27 @@ mod tests {
 
     #[test]
     fn open_for_dispatch_excl_on_existing_is_eexist() {
-        let mut v = RootFsVfs::with_rootfs(rootfs_with_files());
+        let v = RootFsVfs::with_rootfs(rootfs_with_files());
         let result = v.open_for_dispatch("/etc/hosts", true, true, false, true);
         assert_eq!(result.err(), Some(LINUX_EEXIST));
     }
 
     #[test]
     fn mkdir_layered_eexist() {
-        let mut v = RootFsVfs::with_rootfs(rootfs_with_files());
+        let v = RootFsVfs::with_rootfs(rootfs_with_files());
         // Rootfs has /etc; mkdir of an existing path is EEXIST.
         assert_eq!(v.mkdir("/etc", 0o755), Err(LINUX_EEXIST));
     }
 
     #[test]
     fn mkdir_no_parent_is_enoent() {
-        let mut v = RootFsVfs::with_rootfs(rootfs_with_files());
+        let v = RootFsVfs::with_rootfs(rootfs_with_files());
         assert_eq!(v.mkdir("/no-such-parent/sub", 0o755), Err(LINUX_ENOENT));
     }
 
     #[test]
     fn is_directory_layered() {
-        let mut v = RootFsVfs::with_rootfs(rootfs_with_files());
+        let v = RootFsVfs::with_rootfs(rootfs_with_files());
         assert!(v.is_directory("/etc"));
         assert!(!v.is_directory("/etc/hosts"));
         assert!(!v.is_directory("/no-such"));
@@ -1089,7 +1089,7 @@ mod tests {
 
     #[test]
     fn open_overlay_trunc_clears_bytes() {
-        let mut v = RootFsVfs::with_rootfs(rootfs_with_files());
+        let v = RootFsVfs::with_rootfs(rootfs_with_files());
         v.overlay
             .set_file_contents("/etc/hosts", b"original\n".to_vec())
             .unwrap();
