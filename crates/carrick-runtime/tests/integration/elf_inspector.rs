@@ -1,4 +1,6 @@
-use carrick_runtime::elf::{ElfClass, ElfEndianness, Machine, SegmentPerms, inspect_elf, plan_elf_load};
+use carrick_runtime::elf::{
+    ElfClass, ElfEndianness, Machine, SegmentPerms, inspect_elf, plan_elf_load,
+};
 
 #[test]
 fn inspects_minimal_aarch64_linux_elf() {

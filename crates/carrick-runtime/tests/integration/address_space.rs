@@ -12,7 +12,9 @@ use carrick_runtime::linux_abi::{
     LINUX_AT_BASE, LINUX_AT_ENTRY, LINUX_AT_NULL, LINUX_AT_PAGESZ, LINUX_AT_PHDR, LINUX_AT_PHENT,
     LINUX_AT_PHNUM, LinuxAuxvEntry,
 };
-use carrick_runtime::memory::{AddressSpace, LINUX_HEAP_BASE, LINUX_INTERPRETER_BASE, LINUX_MMAP_BASE};
+use carrick_runtime::memory::{
+    AddressSpace, LINUX_HEAP_BASE, LINUX_INTERPRETER_BASE, LINUX_MMAP_BASE,
+};
 use carrick_runtime::rootfs::{LayerSource, RootFs};
 use zerocopy::{FromBytes, IntoBytes};
 

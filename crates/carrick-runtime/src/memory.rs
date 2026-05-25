@@ -1606,7 +1606,11 @@ mod stage1_tests {
         for index in 1..512usize {
             let d = read_u64_le(&bytes, 0x1000 + index * 8);
             if index == kernel_l1_index {
-                assert!(valid_table(d), "L1A[{}] (kernel hole) must be a table", index);
+                assert!(
+                    valid_table(d),
+                    "L1A[{}] (kernel hole) must be a table",
+                    index
+                );
                 assert_eq!(
                     d & 0x0000_FFFF_FFFF_F000,
                     LINUX_PAGE_TABLES_BASE + 0x4000,
@@ -1670,9 +1674,16 @@ mod stage1_tests {
         let l2b_0 = read_u64_le(&bytes, 0x4000);
         assert!(valid_block(l2b_0), "L2_B[0] must be a block");
         assert_eq!(ap(l2b_0), 0b00, "L2_B[0] kernel block must use AP=00");
-        assert_eq!(pxn(l2b_0), 0, "L2_B[0] PXN must be 0 (EL1 fetches trampoline)");
+        assert_eq!(
+            pxn(l2b_0),
+            0,
+            "L2_B[0] PXN must be 0 (EL1 fetches trampoline)"
+        );
         assert_eq!(uxn(l2b_0), 1, "L2_B[0] UXN must be 1");
-        assert_eq!(l2b_0 & 0x0000_FFFF_FFE0_0000, l2b_base_pa & 0x0000_FFFF_FFE0_0000);
+        assert_eq!(
+            l2b_0 & 0x0000_FFFF_FFE0_0000,
+            l2b_base_pa & 0x0000_FFFF_FFE0_0000
+        );
         assert_eq!(l2b_base_pa, LINUX_KERNEL_REGION_BASE);
         for index in 1..512usize {
             let d = read_u64_le(&bytes, 0x4000 + index * 8);
@@ -1692,7 +1703,10 @@ mod stage1_tests {
             assert_eq!(ap(d), 0b01, "L3_A[{}] AP must be 01", index);
             assert_eq!(uxn(d), 0, "L3_A[{}] UXN must be 0", index);
             let expected_pa = (index as u64) << 12;
-            assert_eq!(d & 0x0000_FFFF_FFFF_F000, expected_pa & 0x0000_FFFF_FFFF_F000);
+            assert_eq!(
+                d & 0x0000_FFFF_FFFF_F000,
+                expected_pa & 0x0000_FFFF_FFFF_F000
+            );
         }
 
         // No block descriptor may have RES0 bits set in the block's PA gap.

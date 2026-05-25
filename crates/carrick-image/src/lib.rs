@@ -4,17 +4,17 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
+use oci_client::Client;
 use oci_client::client::ClientConfig;
 use oci_client::manifest::{
     IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE, IMAGE_DOCKER_LAYER_TAR_MEDIA_TYPE,
     IMAGE_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_MEDIA_TYPE, ImageIndexEntry,
 };
 use oci_client::secrets::RegistryAuth;
-use oci_client::Client;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 
-pub use carrick_spec::{ImageReference, OciBootstrapError, ImageConfig};
+pub use carrick_spec::{ImageConfig, ImageReference, OciBootstrapError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageStore {
@@ -320,34 +320,36 @@ impl OciImageConfigContainer {
 }
 
 impl ImageStore {
-    pub async fn resolve(&self, image: &ImageReference) -> Result<ResolvedImage, OciBootstrapError> {
+    pub async fn resolve(
+        &self,
+        image: &ImageReference,
+    ) -> Result<ResolvedImage, OciBootstrapError> {
         let summary = match self.load_pull_summary(image).await {
             Ok(summary) => summary,
             Err(_) => {
-                eprintln!("carrick: image {} not in store; pulling…", image.canonical());
+                eprintln!(
+                    "carrick: image {} not in store; pulling…",
+                    image.canonical()
+                );
                 pull_image(image, self).await?
             }
         };
 
-        let layers: Vec<camino::Utf8PathBuf> = summary.layers
+        let layers: Vec<camino::Utf8PathBuf> = summary
+            .layers
             .iter()
             .map(|l| camino::Utf8PathBuf::from(l.path.to_string_lossy().into_owned()))
             .collect();
 
         let config_path = summary.image_dir.join("config.json");
         let config = match fs::read(&config_path).await {
-            Ok(config_bytes) => {
-                serde_json::from_slice::<OciImageConfigContainer>(&config_bytes)
-                    .map(|c| c.into_image_config())
-                    .unwrap_or_default()
-            }
+            Ok(config_bytes) => serde_json::from_slice::<OciImageConfigContainer>(&config_bytes)
+                .map(|c| c.into_image_config())
+                .unwrap_or_default(),
             Err(_) => ImageConfig::default(),
         };
 
-        Ok(ResolvedImage {
-            layers,
-            config,
-        })
+        Ok(ResolvedImage { layers, config })
     }
 }
 

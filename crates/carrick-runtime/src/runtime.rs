@@ -250,7 +250,7 @@ where
     .with_el0_trampoline()?
     .with_el1_vectors()?
     .with_stage1_page_tables()?
-        .with_vdso()?;
+    .with_vdso()?;
     if let Some(p) = maybe_dump_debug_state(&image, debug_state_path) {
         eprintln!("debug state written: {}", p.display());
     }
@@ -380,7 +380,7 @@ where
             .with_el0_trampoline()?
             .with_el1_vectors()?
             .with_stage1_page_tables()?
-        .with_vdso()?;
+            .with_vdso()?;
     if let Some(p) = maybe_dump_debug_state(&image, debug_state_path) {
         eprintln!("debug state written: {}", p.display());
     }

@@ -229,7 +229,12 @@ impl SyscallDispatcher {
     ///
     /// Thread-create flags now emit `DispatchOutcome::CloneThread`.
     /// Fork-like flags still return `DispatchOutcome::Fork`.
-    fn clone3(&self, args_ptr: GuestPtr, args_size: u64, memory: &impl GuestMemory) -> DispatchOutcome {
+    fn clone3(
+        &self,
+        args_ptr: GuestPtr,
+        args_size: u64,
+        memory: &impl GuestMemory,
+    ) -> DispatchOutcome {
         let args_ptr = args_ptr.0;
         if args_size < 8 {
             return DispatchOutcome::errno(LINUX_EINVAL);
@@ -299,632 +304,632 @@ impl SyscallDispatcher {
 }
 
 impl SyscallDispatcher {
-define_syscall! {
-    fn personality(this, cx, requested: u64) {
-        let mut proc = this.proc.lock();
-        let previous = proc.personality;
-        if requested != LINUX_PERSONALITY_QUERY {
-            proc.personality = requested;
+    define_syscall! {
+        fn personality(this, cx, requested: u64) {
+            let mut proc = this.proc.lock();
+            let previous = proc.personality;
+            if requested != LINUX_PERSONALITY_QUERY {
+                proc.personality = requested;
+            }
+            Ok(DispatchOutcome::Returned {
+                value: previous as i64,
+            })
         }
-        Ok(DispatchOutcome::Returned {
-            value: previous as i64,
-        })
-    }
 
-    fn prctl(this, cx, option: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) {
-        let memory = &mut *cx.memory;
-        Ok(match option {
-            LINUX_PR_GET_DUMPABLE => DispatchOutcome::Returned {
-                value: this.proc.lock().dumpable,
-            },
-            LINUX_PR_SET_DUMPABLE => {
-                if arg2 > 1 {
-                    return Ok(LINUX_EINVAL.into());
+        fn prctl(this, cx, option: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) {
+            let memory = &mut *cx.memory;
+            Ok(match option {
+                LINUX_PR_GET_DUMPABLE => DispatchOutcome::Returned {
+                    value: this.proc.lock().dumpable,
+                },
+                LINUX_PR_SET_DUMPABLE => {
+                    if arg2 > 1 {
+                        return Ok(LINUX_EINVAL.into());
+                    }
+                    this.proc.lock().dumpable = arg2 as i64;
+                    DispatchOutcome::Returned { value: 0 }
                 }
-                this.proc.lock().dumpable = arg2 as i64;
-                DispatchOutcome::Returned { value: 0 }
-            }
-            LINUX_PR_SET_NAME => {
-                let Ok(bytes) = memory.read_bytes(arg2, LINUX_TASK_COMM_LEN) else {
-                    return Ok(LINUX_EFAULT.into());
-                };
-                let task_name = linux_task_name_from_bytes(&bytes);
-                this.proc.lock().task_name = task_name;
-                set_host_process_name(&task_name);
-                DispatchOutcome::Returned { value: 0 }
-            }
-            LINUX_PR_GET_NAME => {
-                let task_name = this.proc.lock().task_name;
-                if memory.write_bytes(arg2, &task_name).is_err() {
-                    return Ok(LINUX_EFAULT.into());
+                LINUX_PR_SET_NAME => {
+                    let Ok(bytes) = memory.read_bytes(arg2, LINUX_TASK_COMM_LEN) else {
+                        return Ok(LINUX_EFAULT.into());
+                    };
+                    let task_name = linux_task_name_from_bytes(&bytes);
+                    this.proc.lock().task_name = task_name;
+                    set_host_process_name(&task_name);
+                    DispatchOutcome::Returned { value: 0 }
                 }
-                DispatchOutcome::Returned { value: 0 }
-            }
-            LINUX_PR_SET_PDEATHSIG => {
-                if arg2 > 64 {
-                    return Ok(LINUX_EINVAL.into());
+                LINUX_PR_GET_NAME => {
+                    let task_name = this.proc.lock().task_name;
+                    if memory.write_bytes(arg2, &task_name).is_err() {
+                        return Ok(LINUX_EFAULT.into());
+                    }
+                    DispatchOutcome::Returned { value: 0 }
                 }
-                this.proc.lock().pdeathsig = arg2 as i64;
-                DispatchOutcome::Returned { value: 0 }
-            }
-            LINUX_PR_GET_PDEATHSIG => {
-                let pdeathsig = this.proc.lock().pdeathsig;
-                if memory
-                    .write_bytes(arg2, &(pdeathsig as i32).to_ne_bytes())
-                    .is_err()
-                {
-                    return Ok(LINUX_EFAULT.into());
+                LINUX_PR_SET_PDEATHSIG => {
+                    if arg2 > 64 {
+                        return Ok(LINUX_EINVAL.into());
+                    }
+                    this.proc.lock().pdeathsig = arg2 as i64;
+                    DispatchOutcome::Returned { value: 0 }
                 }
-                DispatchOutcome::Returned { value: 0 }
-            }
-            _ => DispatchOutcome::errno(LINUX_EINVAL),
-        })
-    }
-
-    fn getcpu(this, cx, cpu_address: GuestPtr, node_address: GuestPtr) {
-        let memory = &mut *cx.memory;
-        let cpu = lowest_set_cpu(&this.proc.lock().affinity).unwrap_or(0);
-        let cpu_value = cpu.to_ne_bytes();
-        let node_value = 0u32.to_ne_bytes();
-
-        if cpu_address.0 != 0 && memory.write_bytes(cpu_address.0, &cpu_value).is_err() {
-            return Ok(LINUX_EFAULT.into());
+                LINUX_PR_GET_PDEATHSIG => {
+                    let pdeathsig = this.proc.lock().pdeathsig;
+                    if memory
+                        .write_bytes(arg2, &(pdeathsig as i32).to_ne_bytes())
+                        .is_err()
+                    {
+                        return Ok(LINUX_EFAULT.into());
+                    }
+                    DispatchOutcome::Returned { value: 0 }
+                }
+                _ => DispatchOutcome::errno(LINUX_EINVAL),
+            })
         }
-        if node_address.0 != 0 && memory.write_bytes(node_address.0, &node_value).is_err() {
-            return Ok(LINUX_EFAULT.into());
-        }
-        Ok(DispatchOutcome::Returned { value: 0 })
-    }
 
-    fn gettid(this, cx) {
-        if let Some(t) = cx.thread {
-            if t.registry.live_count() > 1 {
+        fn getcpu(this, cx, cpu_address: GuestPtr, node_address: GuestPtr) {
+            let memory = &mut *cx.memory;
+            let cpu = lowest_set_cpu(&this.proc.lock().affinity).unwrap_or(0);
+            let cpu_value = cpu.to_ne_bytes();
+            let node_value = 0u32.to_ne_bytes();
+
+            if cpu_address.0 != 0 && memory.write_bytes(cpu_address.0, &cpu_value).is_err() {
+                return Ok(LINUX_EFAULT.into());
+            }
+            if node_address.0 != 0 && memory.write_bytes(node_address.0, &node_value).is_err() {
+                return Ok(LINUX_EFAULT.into());
+            }
+            Ok(DispatchOutcome::Returned { value: 0 })
+        }
+
+        fn gettid(this, cx) {
+            if let Some(t) = cx.thread {
+                if t.registry.live_count() > 1 {
+                    return Ok(DispatchOutcome::Returned {
+                        value: t.tid as i64,
+                    });
+                }
+            }
+            Ok(this.getpid())
+        }
+
+        fn set_tid_address(this, cx, addr: GuestPtr) {
+            if let Some(t) = cx.thread {
+                t.registry.set_clear_child_tid(t.tid, addr.0);
                 return Ok(DispatchOutcome::Returned {
                     value: t.tid as i64,
                 });
             }
-        }
-        Ok(this.getpid())
-    }
-
-    fn set_tid_address(this, cx, addr: GuestPtr) {
-        if let Some(t) = cx.thread {
-            t.registry.set_clear_child_tid(t.tid, addr.0);
-            return Ok(DispatchOutcome::Returned {
-                value: t.tid as i64,
-            });
-        }
-        Ok(this.getpid())
-    }
-
-    fn set_robust_list(this, cx, head: GuestPtr, len: u64) {
-        if len == 0 {
-            return Ok(LINUX_EINVAL.into());
-        }
-        Ok(DispatchOutcome::Returned { value: 0 })
-    }
-
-    fn sched_yield(this, cx) {
-        std::thread::yield_now();
-        Ok(DispatchOutcome::Returned { value: 0 })
-    }
-
-    fn sched_getaffinity(this, cx, pid: u64, size: u64, address: GuestPtr) {
-        let size = size as usize;
-        let memory = &mut *cx.memory;
-
-        if matches!(this.resolve_affinity_target(pid), AffinityTarget::NotFound) {
-            return Ok(LINUX_ESRCH.into());
-        }
-        let kernel_bytes = crate::host_facts::logical_cpu_count().div_ceil(64) * 8;
-        if size < kernel_bytes {
-            return Ok(LINUX_EINVAL.into());
-        }
-        let mask = this.proc.lock().affinity.clone();
-        let buf = affinity_to_bytes(&mask, kernel_bytes);
-        if memory.write_bytes(address.0, &buf).is_err() {
-            return Ok(LINUX_EFAULT.into());
-        }
-        Ok(DispatchOutcome::Returned {
-            value: kernel_bytes as i64,
-        })
-    }
-
-    fn sched_setaffinity(this, cx, pid: u64, size: u64, address: GuestPtr) {
-        let size = size as usize;
-        let memory = &*cx.memory;
-
-        let read_len = size.min(128);
-        let bytes = match memory.read_bytes(address.0, read_len) {
-            Ok(bytes) => bytes,
-            Err(_) => return Ok(LINUX_EFAULT.into()),
-        };
-        let target = this.resolve_affinity_target(pid);
-        if matches!(target, AffinityTarget::NotFound) {
-            return Ok(LINUX_ESRCH.into());
-        }
-        if matches!(target, AffinityTarget::OtherGuest) && this.creds.lock().euid != 0 {
-            return Ok(LINUX_EPERM.into());
-        }
-        let ncpu = crate::host_facts::logical_cpu_count();
-        let online = default_affinity(ncpu);
-        let requested = affinity_from_bytes(&bytes, online.len());
-        let effective: Vec<u64> = online
-            .iter()
-            .zip(requested.iter())
-            .map(|(o, r)| o & r)
-            .collect();
-        if effective.iter().all(|w| *w == 0) {
-            return Ok(LINUX_EINVAL.into());
-        }
-        if matches!(target, AffinityTarget::SelfProc) {
-            this.proc.lock().affinity = effective;
-        }
-        Ok(DispatchOutcome::Returned { value: 0 })
-    }
-
-    fn futex(this, cx, address: GuestPtr, operation: u64, value: u64, timeout_address: GuestPtr) {
-        let value = value as u32;
-        let args = cx.raw_args();
-        let thread = cx.thread;
-        let memory = &*cx.memory;
-        const LINUX_FUTEX_WAIT_BITSET: u64 = 9;
-        const LINUX_FUTEX_WAKE_BITSET: u64 = 10;
-        let raw_command = operation & LINUX_FUTEX_CMD_MASK;
-        let command = match raw_command {
-            LINUX_FUTEX_WAIT_BITSET => LINUX_FUTEX_WAIT,
-            LINUX_FUTEX_WAKE_BITSET => LINUX_FUTEX_WAKE,
-            other => other,
-        };
-        let flags = operation & !LINUX_FUTEX_CMD_MASK;
-        let futex_flags = LinuxFutexFlags::from_bits_retain(flags);
-        if flags & !LinuxFutexFlags::SUPPORTED_MASK != 0 {
-            return Ok(LINUX_EINVAL.into());
-        }
-        let word = match read_u32(memory, address.0) {
-            Ok(word) => word,
-            Err(errno) => return Ok(errno.into()),
-        };
-
-        let Some(thread) = thread else {
-            return Ok(match command {
-                LINUX_FUTEX_WAKE => DispatchOutcome::Returned { value: 0 },
-                LINUX_FUTEX_WAIT => {
-                    if word != value || timeout_address.0 == 0 {
-                        return Ok(LINUX_EAGAIN.into());
-                    }
-                    let timespec = match read_timespec(memory, timeout_address.0) {
-                        Ok(t) => t,
-                        Err(errno) => return Ok(errno.into()),
-                    };
-                    let timeout = match duration_from_linux_timespec(timespec) {
-                        Ok(t) => t,
-                        Err(errno) => return Ok(errno.into()),
-                    };
-                    if let Some(timeout) = timeout {
-                        std::thread::sleep(timeout);
-                    }
-                    DispatchOutcome::errno(LINUX_ETIMEDOUT)
-                }
-                _ => DispatchOutcome::errno(LINUX_ENOSYS),
-            });
-        };
-
-        if !futex_flags.contains(LinuxFutexFlags::PRIVATE) {
-            cx.reporter
-                .record(crate::compat::CompatEvent::partial_syscall(
-                    98,
-                    "futex",
-                    args,
-                    "non-private futex treated as private (shared address space)",
-                ));
+            Ok(this.getpid())
         }
 
-        Ok(match command {
-            LINUX_FUTEX_WAKE => {
-                let n = thread.futex.wake(address.0, value);
-                DispatchOutcome::Returned {
-                    value: i64::from(n),
-                }
+        fn set_robust_list(this, cx, head: GuestPtr, len: u64) {
+            if len == 0 {
+                return Ok(LINUX_EINVAL.into());
             }
-            LINUX_FUTEX_WAIT => {
-                if word != value {
-                    return Ok(LINUX_EAGAIN.into());
-                }
-                let timeout = if timeout_address.0 == 0 {
-                    None
-                } else {
-                    let timespec = match read_timespec(memory, timeout_address.0) {
-                        Ok(t) => t,
-                        Err(errno) => return Ok(errno.into()),
-                    };
-                    match duration_from_linux_timespec(timespec) {
-                        Ok(t) => t,
-                        Err(errno) => return Ok(errno.into()),
-                    }
-                };
-                DispatchOutcome::FutexWait {
-                    wait: thread.futex.prepare_wait(address.0),
-                    timeout,
-                }
-            }
-            _ => DispatchOutcome::errno(LINUX_ENOSYS),
-        })
-    }
-
-    fn uname(this, cx, address: GuestPtr) {
-        let memory = &mut *cx.memory;
-        if memory
-            .write_bytes(address.0, LinuxUtsname::carrick_aarch64().abi_bytes())
-            .is_err()
-        {
-            return Ok(LINUX_EFAULT.into());
+            Ok(DispatchOutcome::Returned { value: 0 })
         }
-        Ok(DispatchOutcome::Returned { value: 0 })
-    }
 
-    fn ptrace(this, cx) {
-        Ok(LINUX_ENOSYS.into())
-    }
-
-    fn reboot(this, cx) {
-        Ok(LINUX_EPERM.into())
-    }
-
-    fn sethostname(this, cx) {
-        Ok(LINUX_EPERM.into())
-    }
-
-    fn setdomainname(this, cx) {
-        Ok(LINUX_EPERM.into())
-    }
-
-    fn setpgid(this, cx, pid: Pid, pgid: Pid) {
-        if let Err(errno) = (unsafe { libc::setpgid(pid.0, pgid.0) }).host_syscall_errno() {
-            return Ok(errno.into());
+        fn sched_yield(this, cx) {
+            std::thread::yield_now();
+            Ok(DispatchOutcome::Returned { value: 0 })
         }
-        Ok(DispatchOutcome::Returned { value: 0 })
-    }
 
-    fn getpgid(this, cx, pid: Pid) {
-        let r = match (unsafe { libc::getpgid(pid.0) }).host_syscall_errno() {
-            Ok(value) => value,
-            Err(errno) => return Ok(errno.into()),
-        };
-        Ok(DispatchOutcome::Returned {
-            value: i64::from(r),
-        })
-    }
-
-    fn getsid(this, cx, pid: Pid) {
-        let r = match (unsafe { libc::getsid(pid.0) }).host_syscall_errno() {
-            Ok(value) => value,
-            Err(errno) => return Ok(errno.into()),
-        };
-        Ok(DispatchOutcome::Returned {
-            value: i64::from(r),
-        })
-    }
-
-    fn setsid(this, cx) {
-        let r = match (unsafe { libc::setsid() }).host_syscall_errno() {
-            Ok(value) => value,
-            Err(errno) => return Ok(errno.into()),
-        };
-        Ok(DispatchOutcome::Returned {
-            value: i64::from(r),
-        })
-    }
-
-    fn waitid(this, cx, idtype: u64, id: u64, infop_addr: GuestPtr, options: u64) {
-        use crate::linux_abi::{
-            LINUX_WCONTINUED, LINUX_WEXITED, LINUX_WNOHANG, LINUX_WNOWAIT, LINUX_WSTOPPED,
-        };
-        if options & !LINUX_WAITID_SUPPORTED_FLAGS != 0 {
-            return Ok(LINUX_EINVAL.into());
-        }
-        if options & LINUX_WAITID_STATE_MASK == 0 {
-            return Ok(LINUX_EINVAL.into());
-        }
-        let (host_idtype, host_id): (libc::idtype_t, libc::id_t) = match idtype {
-            LINUX_P_ALL => (libc::P_ALL, 0),
-            LINUX_P_PID => (libc::P_PID, id as libc::id_t),
-            LINUX_P_PGID => (libc::P_PGID, id as libc::id_t),
-            LINUX_P_PIDFD => match this.pidfd_host_pid(id as i32) {
-                Some(host_pid) => (libc::P_PID, host_pid as libc::id_t),
-                None => return Ok(LINUX_EBADF.into()),
-            },
-            _ => return Ok(LINUX_EINVAL.into()),
-        };
-        let mut host_options: i32 = 0;
-        if options & LINUX_WEXITED != 0 {
-            host_options |= libc::WEXITED;
-        }
-        if options & LINUX_WSTOPPED != 0 {
-            host_options |= libc::WSTOPPED;
-        }
-        if options & LINUX_WCONTINUED != 0 {
-            host_options |= libc::WCONTINUED;
-        }
-        if options & LINUX_WNOWAIT != 0 {
-            host_options |= libc::WNOWAIT;
-        }
-        let guest_nohang = options & LINUX_WNOHANG != 0;
-
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        let r = unsafe {
-            libc::waitid(
-                host_idtype,
-                host_id,
-                &mut info,
-                host_options | libc::WNOHANG,
-            )
-        };
-        if r != 0 {
-            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-            return Ok(DispatchOutcome::errno(errno));
-        }
-        clear_unrequested_waitid_state(&mut info, options);
-        let si_pid = info.si_pid;
-        if si_pid == 0 && !guest_nohang {
-            if idtype == LINUX_P_PIDFD {
-                if let Some(host_fd) = this.host_fd_for_poll(id as i32) {
-                    return Ok(DispatchOutcome::WaitOnPollFds {
-                        fds: vec![(host_fd, libc::POLLIN)],
-                        timeout: None,
-                        on_timeout: 0,
-                        block_signals: 0,
-                    });
-                }
-            }
-            if idtype == LINUX_P_PID {
-                return Ok(DispatchOutcome::WaitOnProcExit {
-                    pid: id as i32,
-                    block_signals: 0,
-                });
-            }
-            loop {
-                let r = unsafe { libc::waitid(host_idtype, host_id, &mut info, host_options) };
-                if r == 0 {
-                    if !clear_unrequested_waitid_state(&mut info, options) {
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                        continue;
-                    }
-                    break;
-                }
-                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-                if errno == LINUX_EINTR
-                    && !crate::host_signal::has_process_pending()
-                    && !crate::fork_quiesce::is_quiescing()
-                {
-                    continue;
-                }
-                return Ok(DispatchOutcome::errno(errno));
-            }
-        }
-        if infop_addr.0 != 0 {
-            let bytes = if info.si_pid == 0 {
-                [0u8; crate::linux_abi::LINUX_SIGINFO_SIZE]
-            } else {
-                build_sigchld_siginfo(info.si_pid, info.si_uid, info.si_code, info.si_status)
-            };
+        fn sched_getaffinity(this, cx, pid: u64, size: u64, address: GuestPtr) {
+            let size = size as usize;
             let memory = &mut *cx.memory;
-            if memory.write_bytes(infop_addr.0, &bytes).is_err() {
+
+            if matches!(this.resolve_affinity_target(pid), AffinityTarget::NotFound) {
+                return Ok(LINUX_ESRCH.into());
+            }
+            let kernel_bytes = crate::host_facts::logical_cpu_count().div_ceil(64) * 8;
+            if size < kernel_bytes {
+                return Ok(LINUX_EINVAL.into());
+            }
+            let mask = this.proc.lock().affinity.clone();
+            let buf = affinity_to_bytes(&mask, kernel_bytes);
+            if memory.write_bytes(address.0, &buf).is_err() {
                 return Ok(LINUX_EFAULT.into());
             }
+            Ok(DispatchOutcome::Returned {
+                value: kernel_bytes as i64,
+            })
         }
-        Ok(DispatchOutcome::Returned { value: 0 })
-    }
 
-    fn wait4(this, cx, pid: Pid, wstatus_addr: GuestPtr, options: u64, rusage_addr: GuestPtr) {
-        let memory = &mut *cx.memory;
-        if options & !LINUX_WAIT4_SUPPORTED_FLAGS != 0 {
-            return Ok(LINUX_EINVAL.into());
-        }
-        let mut host_options: i32 = 0;
-        if options & crate::linux_abi::LINUX_WNOHANG != 0 {
-            host_options |= libc::WNOHANG;
-        }
-        if options & crate::linux_abi::LINUX_WUNTRACED != 0 {
-            host_options |= libc::WUNTRACED;
-        }
-        if options & crate::linux_abi::LINUX_WCONTINUED != 0 {
-            host_options |= libc::WCONTINUED;
-        }
-        let mut host_status: i32 = 0;
-        let mut host_rusage: libc::rusage = unsafe { std::mem::zeroed() };
-        let can_park_on_proc_exit = pid.0 > 0
-            && host_options & libc::WNOHANG == 0
-            && options & (crate::linux_abi::LINUX_WUNTRACED | crate::linux_abi::LINUX_WCONTINUED)
-                == 0;
-        let result = if can_park_on_proc_exit {
-            let r = unsafe {
-                libc::wait4(
-                    pid.0,
-                    &mut host_status,
-                    host_options | libc::WNOHANG,
-                    &mut host_rusage,
-                )
+        fn sched_setaffinity(this, cx, pid: u64, size: u64, address: GuestPtr) {
+            let size = size as usize;
+            let memory = &*cx.memory;
+
+            let read_len = size.min(128);
+            let bytes = match memory.read_bytes(address.0, read_len) {
+                Ok(bytes) => bytes,
+                Err(_) => return Ok(LINUX_EFAULT.into()),
             };
-            match r.host_syscall_errno() {
-                Ok(0) => {
-                    return Ok(DispatchOutcome::WaitOnProcExit {
-                        pid: pid.0,
-                        block_signals: 0,
-                    });
-                }
-                Ok(value) => Ok(value),
-                Err(errno) => Err(errno),
+            let target = this.resolve_affinity_target(pid);
+            if matches!(target, AffinityTarget::NotFound) {
+                return Ok(LINUX_ESRCH.into());
             }
-        } else {
-            loop {
-                let r =
-                    unsafe { libc::wait4(pid.0, &mut host_status, host_options, &mut host_rusage) };
-                match r.host_syscall_errno() {
-                    Ok(value) => break Ok(value),
-                    Err(errno) => {
-                        if errno == LINUX_EINTR && !crate::host_signal::has_process_pending() {
-                            continue;
+            if matches!(target, AffinityTarget::OtherGuest) && this.creds.lock().euid != 0 {
+                return Ok(LINUX_EPERM.into());
+            }
+            let ncpu = crate::host_facts::logical_cpu_count();
+            let online = default_affinity(ncpu);
+            let requested = affinity_from_bytes(&bytes, online.len());
+            let effective: Vec<u64> = online
+                .iter()
+                .zip(requested.iter())
+                .map(|(o, r)| o & r)
+                .collect();
+            if effective.iter().all(|w| *w == 0) {
+                return Ok(LINUX_EINVAL.into());
+            }
+            if matches!(target, AffinityTarget::SelfProc) {
+                this.proc.lock().affinity = effective;
+            }
+            Ok(DispatchOutcome::Returned { value: 0 })
+        }
+
+        fn futex(this, cx, address: GuestPtr, operation: u64, value: u64, timeout_address: GuestPtr) {
+            let value = value as u32;
+            let args = cx.raw_args();
+            let thread = cx.thread;
+            let memory = &*cx.memory;
+            const LINUX_FUTEX_WAIT_BITSET: u64 = 9;
+            const LINUX_FUTEX_WAKE_BITSET: u64 = 10;
+            let raw_command = operation & LINUX_FUTEX_CMD_MASK;
+            let command = match raw_command {
+                LINUX_FUTEX_WAIT_BITSET => LINUX_FUTEX_WAIT,
+                LINUX_FUTEX_WAKE_BITSET => LINUX_FUTEX_WAKE,
+                other => other,
+            };
+            let flags = operation & !LINUX_FUTEX_CMD_MASK;
+            let futex_flags = LinuxFutexFlags::from_bits_retain(flags);
+            if flags & !LinuxFutexFlags::SUPPORTED_MASK != 0 {
+                return Ok(LINUX_EINVAL.into());
+            }
+            let word = match read_u32(memory, address.0) {
+                Ok(word) => word,
+                Err(errno) => return Ok(errno.into()),
+            };
+
+            let Some(thread) = thread else {
+                return Ok(match command {
+                    LINUX_FUTEX_WAKE => DispatchOutcome::Returned { value: 0 },
+                    LINUX_FUTEX_WAIT => {
+                        if word != value || timeout_address.0 == 0 {
+                            return Ok(LINUX_EAGAIN.into());
                         }
-                        break Err(errno);
+                        let timespec = match read_timespec(memory, timeout_address.0) {
+                            Ok(t) => t,
+                            Err(errno) => return Ok(errno.into()),
+                        };
+                        let timeout = match duration_from_linux_timespec(timespec) {
+                            Ok(t) => t,
+                            Err(errno) => return Ok(errno.into()),
+                        };
+                        if let Some(timeout) = timeout {
+                            std::thread::sleep(timeout);
+                        }
+                        DispatchOutcome::errno(LINUX_ETIMEDOUT)
+                    }
+                    _ => DispatchOutcome::errno(LINUX_ENOSYS),
+                });
+            };
+
+            if !futex_flags.contains(LinuxFutexFlags::PRIVATE) {
+                cx.reporter
+                    .record(crate::compat::CompatEvent::partial_syscall(
+                        98,
+                        "futex",
+                        args,
+                        "non-private futex treated as private (shared address space)",
+                    ));
+            }
+
+            Ok(match command {
+                LINUX_FUTEX_WAKE => {
+                    let n = thread.futex.wake(address.0, value);
+                    DispatchOutcome::Returned {
+                        value: i64::from(n),
                     }
                 }
-            }
-        };
-        let result = match result {
-            Ok(value) => value,
-            Err(errno) => {
-                return Ok(errno.into());
-            }
-        };
-        if result == 0 {
-            return Ok(DispatchOutcome::Returned { value: 0 });
+                LINUX_FUTEX_WAIT => {
+                    if word != value {
+                        return Ok(LINUX_EAGAIN.into());
+                    }
+                    let timeout = if timeout_address.0 == 0 {
+                        None
+                    } else {
+                        let timespec = match read_timespec(memory, timeout_address.0) {
+                            Ok(t) => t,
+                            Err(errno) => return Ok(errno.into()),
+                        };
+                        match duration_from_linux_timespec(timespec) {
+                            Ok(t) => t,
+                            Err(errno) => return Ok(errno.into()),
+                        }
+                    };
+                    DispatchOutcome::FutexWait {
+                        wait: thread.futex.prepare_wait(address.0),
+                        timeout,
+                    }
+                }
+                _ => DispatchOutcome::errno(LINUX_ENOSYS),
+            })
         }
-        let tv_us = |t: libc::timeval| t.tv_sec as u64 * 1_000_000 + t.tv_usec as u64;
-        let child_guest_us = crate::guest_cpu::reap_child_guest_ns(result as u32) / 1000;
-        let child_user_us = child_guest_us + tv_us(host_rusage.ru_utime);
-        let child_system_us = tv_us(host_rusage.ru_stime);
-        crate::guest_cpu::add_reaped_child(child_user_us, child_system_us);
-        if rusage_addr.0 != 0 {
-            let child_rusage = rusage_from_us(child_user_us, child_system_us);
+
+        fn uname(this, cx, address: GuestPtr) {
+            let memory = &mut *cx.memory;
             if memory
-                .write_bytes(rusage_addr.0, child_rusage.abi_bytes())
+                .write_bytes(address.0, LinuxUtsname::carrick_aarch64().abi_bytes())
                 .is_err()
             {
                 return Ok(LINUX_EFAULT.into());
             }
+            Ok(DispatchOutcome::Returned { value: 0 })
         }
-        let host_status = translate_wait_status(host_status);
-        if wstatus_addr.0 != 0 {
-            let bytes = host_status.to_ne_bytes();
-            if memory.write_bytes(wstatus_addr.0, &bytes).is_err() {
+
+        fn ptrace(this, cx) {
+            Ok(LINUX_ENOSYS.into())
+        }
+
+        fn reboot(this, cx) {
+            Ok(LINUX_EPERM.into())
+        }
+
+        fn sethostname(this, cx) {
+            Ok(LINUX_EPERM.into())
+        }
+
+        fn setdomainname(this, cx) {
+            Ok(LINUX_EPERM.into())
+        }
+
+        fn setpgid(this, cx, pid: Pid, pgid: Pid) {
+            if let Err(errno) = (unsafe { libc::setpgid(pid.0, pgid.0) }).host_syscall_errno() {
+                return Ok(errno.into());
+            }
+            Ok(DispatchOutcome::Returned { value: 0 })
+        }
+
+        fn getpgid(this, cx, pid: Pid) {
+            let r = match (unsafe { libc::getpgid(pid.0) }).host_syscall_errno() {
+                Ok(value) => value,
+                Err(errno) => return Ok(errno.into()),
+            };
+            Ok(DispatchOutcome::Returned {
+                value: i64::from(r),
+            })
+        }
+
+        fn getsid(this, cx, pid: Pid) {
+            let r = match (unsafe { libc::getsid(pid.0) }).host_syscall_errno() {
+                Ok(value) => value,
+                Err(errno) => return Ok(errno.into()),
+            };
+            Ok(DispatchOutcome::Returned {
+                value: i64::from(r),
+            })
+        }
+
+        fn setsid(this, cx) {
+            let r = match (unsafe { libc::setsid() }).host_syscall_errno() {
+                Ok(value) => value,
+                Err(errno) => return Ok(errno.into()),
+            };
+            Ok(DispatchOutcome::Returned {
+                value: i64::from(r),
+            })
+        }
+
+        fn waitid(this, cx, idtype: u64, id: u64, infop_addr: GuestPtr, options: u64) {
+            use crate::linux_abi::{
+                LINUX_WCONTINUED, LINUX_WEXITED, LINUX_WNOHANG, LINUX_WNOWAIT, LINUX_WSTOPPED,
+            };
+            if options & !LINUX_WAITID_SUPPORTED_FLAGS != 0 {
+                return Ok(LINUX_EINVAL.into());
+            }
+            if options & LINUX_WAITID_STATE_MASK == 0 {
+                return Ok(LINUX_EINVAL.into());
+            }
+            let (host_idtype, host_id): (libc::idtype_t, libc::id_t) = match idtype {
+                LINUX_P_ALL => (libc::P_ALL, 0),
+                LINUX_P_PID => (libc::P_PID, id as libc::id_t),
+                LINUX_P_PGID => (libc::P_PGID, id as libc::id_t),
+                LINUX_P_PIDFD => match this.pidfd_host_pid(id as i32) {
+                    Some(host_pid) => (libc::P_PID, host_pid as libc::id_t),
+                    None => return Ok(LINUX_EBADF.into()),
+                },
+                _ => return Ok(LINUX_EINVAL.into()),
+            };
+            let mut host_options: i32 = 0;
+            if options & LINUX_WEXITED != 0 {
+                host_options |= libc::WEXITED;
+            }
+            if options & LINUX_WSTOPPED != 0 {
+                host_options |= libc::WSTOPPED;
+            }
+            if options & LINUX_WCONTINUED != 0 {
+                host_options |= libc::WCONTINUED;
+            }
+            if options & LINUX_WNOWAIT != 0 {
+                host_options |= libc::WNOWAIT;
+            }
+            let guest_nohang = options & LINUX_WNOHANG != 0;
+
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let r = unsafe {
+                libc::waitid(
+                    host_idtype,
+                    host_id,
+                    &mut info,
+                    host_options | libc::WNOHANG,
+                )
+            };
+            if r != 0 {
+                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                return Ok(DispatchOutcome::errno(errno));
+            }
+            clear_unrequested_waitid_state(&mut info, options);
+            let si_pid = info.si_pid;
+            if si_pid == 0 && !guest_nohang {
+                if idtype == LINUX_P_PIDFD {
+                    if let Some(host_fd) = this.host_fd_for_poll(id as i32) {
+                        return Ok(DispatchOutcome::WaitOnPollFds {
+                            fds: vec![(host_fd, libc::POLLIN)],
+                            timeout: None,
+                            on_timeout: 0,
+                            block_signals: 0,
+                        });
+                    }
+                }
+                if idtype == LINUX_P_PID {
+                    return Ok(DispatchOutcome::WaitOnProcExit {
+                        pid: id as i32,
+                        block_signals: 0,
+                    });
+                }
+                loop {
+                    let r = unsafe { libc::waitid(host_idtype, host_id, &mut info, host_options) };
+                    if r == 0 {
+                        if !clear_unrequested_waitid_state(&mut info, options) {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                            continue;
+                        }
+                        break;
+                    }
+                    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                    if errno == LINUX_EINTR
+                        && !crate::host_signal::has_process_pending()
+                        && !crate::fork_quiesce::is_quiescing()
+                    {
+                        continue;
+                    }
+                    return Ok(DispatchOutcome::errno(errno));
+                }
+            }
+            if infop_addr.0 != 0 {
+                let bytes = if info.si_pid == 0 {
+                    [0u8; crate::linux_abi::LINUX_SIGINFO_SIZE]
+                } else {
+                    build_sigchld_siginfo(info.si_pid, info.si_uid, info.si_code, info.si_status)
+                };
+                let memory = &mut *cx.memory;
+                if memory.write_bytes(infop_addr.0, &bytes).is_err() {
+                    return Ok(LINUX_EFAULT.into());
+                }
+            }
+            Ok(DispatchOutcome::Returned { value: 0 })
+        }
+
+        fn wait4(this, cx, pid: Pid, wstatus_addr: GuestPtr, options: u64, rusage_addr: GuestPtr) {
+            let memory = &mut *cx.memory;
+            if options & !LINUX_WAIT4_SUPPORTED_FLAGS != 0 {
+                return Ok(LINUX_EINVAL.into());
+            }
+            let mut host_options: i32 = 0;
+            if options & crate::linux_abi::LINUX_WNOHANG != 0 {
+                host_options |= libc::WNOHANG;
+            }
+            if options & crate::linux_abi::LINUX_WUNTRACED != 0 {
+                host_options |= libc::WUNTRACED;
+            }
+            if options & crate::linux_abi::LINUX_WCONTINUED != 0 {
+                host_options |= libc::WCONTINUED;
+            }
+            let mut host_status: i32 = 0;
+            let mut host_rusage: libc::rusage = unsafe { std::mem::zeroed() };
+            let can_park_on_proc_exit = pid.0 > 0
+                && host_options & libc::WNOHANG == 0
+                && options & (crate::linux_abi::LINUX_WUNTRACED | crate::linux_abi::LINUX_WCONTINUED)
+                    == 0;
+            let result = if can_park_on_proc_exit {
+                let r = unsafe {
+                    libc::wait4(
+                        pid.0,
+                        &mut host_status,
+                        host_options | libc::WNOHANG,
+                        &mut host_rusage,
+                    )
+                };
+                match r.host_syscall_errno() {
+                    Ok(0) => {
+                        return Ok(DispatchOutcome::WaitOnProcExit {
+                            pid: pid.0,
+                            block_signals: 0,
+                        });
+                    }
+                    Ok(value) => Ok(value),
+                    Err(errno) => Err(errno),
+                }
+            } else {
+                loop {
+                    let r =
+                        unsafe { libc::wait4(pid.0, &mut host_status, host_options, &mut host_rusage) };
+                    match r.host_syscall_errno() {
+                        Ok(value) => break Ok(value),
+                        Err(errno) => {
+                            if errno == LINUX_EINTR && !crate::host_signal::has_process_pending() {
+                                continue;
+                            }
+                            break Err(errno);
+                        }
+                    }
+                }
+            };
+            let result = match result {
+                Ok(value) => value,
+                Err(errno) => {
+                    return Ok(errno.into());
+                }
+            };
+            if result == 0 {
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            }
+            let tv_us = |t: libc::timeval| t.tv_sec as u64 * 1_000_000 + t.tv_usec as u64;
+            let child_guest_us = crate::guest_cpu::reap_child_guest_ns(result as u32) / 1000;
+            let child_user_us = child_guest_us + tv_us(host_rusage.ru_utime);
+            let child_system_us = tv_us(host_rusage.ru_stime);
+            crate::guest_cpu::add_reaped_child(child_user_us, child_system_us);
+            if rusage_addr.0 != 0 {
+                let child_rusage = rusage_from_us(child_user_us, child_system_us);
+                if memory
+                    .write_bytes(rusage_addr.0, child_rusage.abi_bytes())
+                    .is_err()
+                {
+                    return Ok(LINUX_EFAULT.into());
+                }
+            }
+            let host_status = translate_wait_status(host_status);
+            if wstatus_addr.0 != 0 {
+                let bytes = host_status.to_ne_bytes();
+                if memory.write_bytes(wstatus_addr.0, &bytes).is_err() {
+                    return Ok(LINUX_EFAULT.into());
+                }
+            }
+            Ok(DispatchOutcome::Returned {
+                value: i64::from(result),
+            })
+        }
+
+        fn execve(this, cx, pathname_addr: GuestPtr, argv_addr: GuestPtr, envp_addr: GuestPtr) {
+            let memory = &*cx.memory;
+
+            let path = match read_guest_c_string(memory, pathname_addr.0) {
+                Ok(p) => p,
+                Err(errno) => return Ok(errno.into()),
+            };
+            let argv = match read_guest_string_array(memory, argv_addr.0) {
+                Ok(v) => v,
+                Err(errno) => return Ok(errno.into()),
+            };
+            let env = match read_guest_string_array(memory, envp_addr.0) {
+                Ok(v) => v,
+                Err(errno) => return Ok(errno.into()),
+            };
+
+            Ok(DispatchOutcome::Execve { path, argv, env })
+        }
+
+        fn clone(this, cx, flags: u64, stack: u64, parent_tid: GuestPtr, tls: u64, child_tid: GuestPtr) {
+            let thread_mask = LinuxCloneFlags::THREAD_MASK;
+            if (flags & thread_mask) == thread_mask {
+                let parent_tid_addr = if flags & LinuxCloneFlags::PARENT_SETTID.bits() != 0 {
+                    parent_tid.0
+                } else {
+                    0
+                };
+                let tls = if flags & LinuxCloneFlags::SETTLS.bits() != 0 {
+                    tls
+                } else {
+                    0
+                };
+                let child_tid_addr = if flags
+                    & (LinuxCloneFlags::CHILD_SETTID | LinuxCloneFlags::CHILD_CLEARTID).bits()
+                    != 0
+                {
+                    child_tid.0
+                } else {
+                    0
+                };
+                return Ok(DispatchOutcome::CloneThread {
+                    stack,
+                    tls,
+                    flags,
+                    parent_tid_addr,
+                    child_tid_addr,
+                });
+            }
+
+            let pidfd_out = if flags & LinuxCloneFlags::PIDFD.bits() != 0 {
+                Some(parent_tid.0)
+            } else {
+                None
+            };
+            Ok(DispatchOutcome::Fork { pidfd_out })
+        }
+
+        fn pidfd_open(this, cx, pid: Pid, flags: u64) {
+            const PIDFD_NONBLOCK: u64 = 0o4000;
+            if pid.0 <= 0 {
+                return Ok(LINUX_EINVAL.into());
+            }
+            if flags & !PIDFD_NONBLOCK != 0 {
+                return Ok(LINUX_EINVAL.into());
+            }
+            Ok(this.open_pidfd(pid.0, flags))
+        }
+
+        fn pidfd_send_signal(this, cx, fd: Fd, signum: u64, _info: GuestPtr, _flags: u64) {
+            let Some(host_pid) = this.pidfd_host_pid(fd.0) else {
+                return Ok(LINUX_EBADF.into());
+            };
+            if signum == 0 {
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            }
+            if !crate::dispatch::signal::is_valid_signum(signum) {
+                return Ok(LINUX_EINVAL.into());
+            }
+            Ok(crate::dispatch::signal::bootstrap_signal_send(
+                i64::from(host_pid),
+                /*tid_required=*/ false,
+                signum,
+            ))
+        }
+
+        fn getrandom(this, cx, address: GuestPtr, length: u64, flags: u64) {
+            let length = usize::try_from(length).map_err(|_| DispatchError::LengthTooLarge(length))?;
+            let memory = &mut *cx.memory;
+            let mut bytes = vec![0; length];
+            if getrandom::fill(&mut bytes).is_err() {
+                fill_deterministic_bootstrap_random(&mut bytes);
+            }
+            if memory.write_bytes(address.0, &bytes).is_err() {
                 return Ok(LINUX_EFAULT.into());
             }
+            Ok(DispatchOutcome::Returned {
+                value: length as i64,
+            })
         }
-        Ok(DispatchOutcome::Returned {
-            value: i64::from(result),
-        })
-    }
 
-    fn execve(this, cx, pathname_addr: GuestPtr, argv_addr: GuestPtr, envp_addr: GuestPtr) {
-        let memory = &*cx.memory;
-
-        let path = match read_guest_c_string(memory, pathname_addr.0) {
-            Ok(p) => p,
-            Err(errno) => return Ok(errno.into()),
-        };
-        let argv = match read_guest_string_array(memory, argv_addr.0) {
-            Ok(v) => v,
-            Err(errno) => return Ok(errno.into()),
-        };
-        let env = match read_guest_string_array(memory, envp_addr.0) {
-            Ok(v) => v,
-            Err(errno) => return Ok(errno.into()),
-        };
-
-        Ok(DispatchOutcome::Execve { path, argv, env })
-    }
-
-    fn clone(this, cx, flags: u64, stack: u64, parent_tid: GuestPtr, tls: u64, child_tid: GuestPtr) {
-        let thread_mask = LinuxCloneFlags::THREAD_MASK;
-        if (flags & thread_mask) == thread_mask {
-            let parent_tid_addr = if flags & LinuxCloneFlags::PARENT_SETTID.bits() != 0 {
-                parent_tid.0
-            } else {
-                0
-            };
-            let tls = if flags & LinuxCloneFlags::SETTLS.bits() != 0 {
-                tls
-            } else {
-                0
-            };
-            let child_tid_addr = if flags
-                & (LinuxCloneFlags::CHILD_SETTID | LinuxCloneFlags::CHILD_CLEARTID).bits()
-                != 0
+        fn sys_exit(this, cx, code: u64) {
+            let code = code as i32;
+            if cx.number() == 93
+                && let Some(t) = cx.thread
+                && t.registry.live_count() > 1
             {
-                child_tid.0
-            } else {
-                0
-            };
-            return Ok(DispatchOutcome::CloneThread {
-                stack,
-                tls,
-                flags,
-                parent_tid_addr,
-                child_tid_addr,
-            });
+                return Ok(DispatchOutcome::ThreadExit { code });
+            }
+            Ok(DispatchOutcome::Exit { code })
         }
 
-        let pidfd_out = if flags & LinuxCloneFlags::PIDFD.bits() != 0 {
-            Some(parent_tid.0)
-        } else {
-            None
-        };
-        Ok(DispatchOutcome::Fork { pidfd_out })
-    }
+        fn sys_clone3(this, cx, args_ptr: GuestPtr, size: u64) {
+            Ok(this.clone3(args_ptr, size, &*cx.memory))
+        }
 
-    fn pidfd_open(this, cx, pid: Pid, flags: u64) {
-        const PIDFD_NONBLOCK: u64 = 0o4000;
-        if pid.0 <= 0 {
-            return Ok(LINUX_EINVAL.into());
+        fn sys_rseq(this, cx) {
+            Ok(this.rseq())
         }
-        if flags & !PIDFD_NONBLOCK != 0 {
-            return Ok(LINUX_EINVAL.into());
-        }
-        Ok(this.open_pidfd(pid.0, flags))
     }
-
-    fn pidfd_send_signal(this, cx, fd: Fd, signum: u64, _info: GuestPtr, _flags: u64) {
-        let Some(host_pid) = this.pidfd_host_pid(fd.0) else {
-            return Ok(LINUX_EBADF.into());
-        };
-        if signum == 0 {
-            return Ok(DispatchOutcome::Returned { value: 0 });
-        }
-        if !crate::dispatch::signal::is_valid_signum(signum) {
-            return Ok(LINUX_EINVAL.into());
-        }
-        Ok(crate::dispatch::signal::bootstrap_signal_send(
-            i64::from(host_pid),
-            /*tid_required=*/ false,
-            signum,
-        ))
-    }
-
-    fn getrandom(this, cx, address: GuestPtr, length: u64, flags: u64) {
-        let length = usize::try_from(length).map_err(|_| DispatchError::LengthTooLarge(length))?;
-        let memory = &mut *cx.memory;
-        let mut bytes = vec![0; length];
-        if getrandom::fill(&mut bytes).is_err() {
-            fill_deterministic_bootstrap_random(&mut bytes);
-        }
-        if memory.write_bytes(address.0, &bytes).is_err() {
-            return Ok(LINUX_EFAULT.into());
-        }
-        Ok(DispatchOutcome::Returned {
-            value: length as i64,
-        })
-    }
-
-    fn sys_exit(this, cx, code: u64) {
-        let code = code as i32;
-        if cx.number() == 93
-            && let Some(t) = cx.thread
-            && t.registry.live_count() > 1
-        {
-            return Ok(DispatchOutcome::ThreadExit { code });
-        }
-        Ok(DispatchOutcome::Exit { code })
-    }
-
-    fn sys_clone3(this, cx, args_ptr: GuestPtr, size: u64) {
-        Ok(this.clone3(args_ptr, size, &*cx.memory))
-    }
-
-    fn sys_rseq(this, cx) {
-        Ok(this.rseq())
-    }
-}
 }
 
 fn fill_deterministic_bootstrap_random(bytes: &mut [u8]) {
