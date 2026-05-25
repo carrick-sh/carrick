@@ -3,6 +3,12 @@
 //! before `libc::fork`, so the child inherits no carrick lock held by a thread
 //! that won't exist in the child. See
 //! docs/superpowers/specs/2026-05-24-multithreaded-fork-design.md.
+// INVARIANT: every `.unwrap()` in this module is on a std::sync Mutex/Condvar
+// guard. `lock()`/`wait()` only return `Err` on poisoning — a thread panicking
+// while holding the guard — which cannot occur in this no-panic codebase. The
+// allow is module-scoped because every lock site shares the identical
+// invariant; a per-line allow would be pure noise.
+#![allow(clippy::unwrap_used)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
