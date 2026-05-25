@@ -11,9 +11,13 @@ path = "src/lib.rs"
 [lints]
 workspace = true
 
+[features]
+default = []
+clap = ["dep:clap"]
+
 [dependencies]
 camino = { workspace = true, features = ["serde1"] }
-clap = { workspace = true, features = ["derive", "env"] }
+clap = { workspace = true, features = ["derive", "env"], optional = true }
 oci-client = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

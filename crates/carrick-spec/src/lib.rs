@@ -121,23 +121,8 @@ impl Default for NamespaceConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ContainerSpec {
-    pub image_ref: Option<ImageReference>,
-    pub argv: Vec<String>,
-    pub env: Vec<String>,
-    pub cwd: Option<Utf8PathBuf>,
-    pub user: Option<String>,
-    pub tty: bool,
-    pub interactive: bool,
-    pub rm: bool,
-    pub name: Option<String>,
-    pub mounts: Vec<Mount>,
-    pub namespaces: NamespaceConfig,
-    pub labels: HashMap<String, String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 pub enum FsBackendKind {
     Memory,
     Host,
@@ -186,4 +171,3 @@ mod tests {
         assert!(config.env.is_empty());
     }
 }
-
