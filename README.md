@@ -102,10 +102,16 @@ cargo test --workspace
 `carrick-runtime` is a single large crate (~41k lines), and the workspace links
 27 integration-test binaries plus the cli, each statically linking its rlib.
 With macOS's default `ld64`, an incremental rebuild after a one-line runtime
-edit spent ~37s of its ~57s wall time in the linker. `.cargo/config.toml`
-selects LLVM's `lld` (`brew install lld`) for the `aarch64-apple-darwin`
-target, roughly halving that to ~26s. The signed binary still carries the
-hypervisor entitlement and runs under HVF unchanged.
+edit spends ~37s of its ~57s wall time in the linker.
+
+> [!WARNING]
+> Do **not** switch the linker to LLVM `lld` globally. `lld`'s Mach-O port
+> drops the `__DATA,__dof_carrick` section that the `usdt` crate's
+> `register_probes()` reads, so `carrick trace`'s USDT probes silently stop
+> firing (the provider registers empty; `dtrace -l` shows nothing). `ld64`
+> preserves the section. A faster linker can be re-introduced only if it keeps
+> `__dof_carrick` — verify with `otool -l target/release/carrick | grep dof`
+> and confirm `carrick trace` still emits syscall events.
 
 The remaining incremental cost is rustc recompiling the monolithic runtime
 crate; that is inherent to keeping the runtime as one crate (its
