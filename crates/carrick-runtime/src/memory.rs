@@ -26,7 +26,16 @@ use zerocopy::IntoBytes;
 // starts at EL1h; to deliver user code at EL0t we install a single-page
 // region whose first instruction is `eret`. The base is well below the
 // PIE/heap/mmap/stack window so it cannot collide with the user image.
-pub const LINUX_EL0_TRAMPOLINE_BASE: u64 = 0x10000;
+// Carrick's EL1-only regions (entry trampoline, exception vectors, page
+// tables) live in a dedicated 2 MiB "kernel hole" at 180 GiB — well above any
+// guest image (even a static binary at 0x10000) and below the heap (256 GiB) /
+// mmap (384 GiB) / sigreturn (192 GiB) / vvar (184 GiB) windows. They USED to
+// sit at 0x10000/0x20000/0x30000, but Go static (non-PIE) binaries — notably
+// the `go` toolchain — load their first segment at vaddr 0x10000 and collided
+// with both the regions and the kernel-only first-2 MiB block, so they couldn't
+// run. Moving the hole high frees the low VA range for such binaries.
+pub const LINUX_KERNEL_REGION_BASE: u64 = 0x2D_0000_0000;
+pub const LINUX_EL0_TRAMPOLINE_BASE: u64 = LINUX_KERNEL_REGION_BASE;
 // Trampoline region size. Must be at least one HVF page (16 KiB) so the
 // stage-2 mapping is aligned. The first 4 bytes carry the `eret` opcode;
 // the rest is padded with `nop` so a runaway fetch is harmless.
@@ -35,17 +44,20 @@ pub const LINUX_EL0_TRAMPOLINE_SIZE: u64 = 0x4000;
 // vector table is 2 KiB (16 slots of 0x80 bytes); we round up to one HVF
 // page (16 KiB) so the stage-2 mapping is aligned. VBAR_EL1 is set to this
 // base so EL0 `svc #0` synchronous traps land in the slot at offset 0x400.
-pub const LINUX_EL1_VECTORS_BASE: u64 = 0x20000;
+pub const LINUX_EL1_VECTORS_BASE: u64 = LINUX_KERNEL_REGION_BASE + 0x10000;
 pub const LINUX_EL1_VECTORS_SIZE: u64 = 0x4000;
-// Stage-1 identity page table for EL0/EL1. Three 4 KiB pages:
+// Stage-1 identity page table for EL0/EL1. Five 4 KiB pages:
 //   - one L0 table (2 valid entries, 512 GiB each)
 //   - two L1 tables (512 block descriptors × 1 GiB each)
+//   - one L2 sub-table for the first 1 GiB (so VA 0..2 MiB is fine-grained)
+//   - one L2 sub-table for the 180 GiB GiB containing the kernel hole, whose
+//     first 2 MiB block is kernel-only (trampoline/vectors/page-tables)
 // Identity-maps 0..1 TiB into the same VA range with "Normal Inner
 // Shareable WB cacheable" memory (MAIR index 0). This is what
 // `ldaxr`/`stlxr` need to work — without it ARMv8 treats every data
 // access as Device-nGnRnE and exclusive ops are prohibited.
-pub const LINUX_PAGE_TABLES_BASE: u64 = 0x30000;
-pub const LINUX_PAGE_TABLES_SIZE: u64 = 0x4000; // 16 KiB allocated, three pages used
+pub const LINUX_PAGE_TABLES_BASE: u64 = LINUX_KERNEL_REGION_BASE + 0x20000;
+pub const LINUX_PAGE_TABLES_SIZE: u64 = 0x8000; // 32 KiB allocated, five pages used
 // User-mode rt_sigreturn trampoline. This must be outside the first 2 MiB,
 // whose stage-1 block is kernel-only for the EL0-entry/vector pages, and it
 // must not collide with ET_EXEC binaries that commonly start at 0x200000. Keep
@@ -996,6 +1008,19 @@ pub fn stage1_identity_page_tables() -> Vec<u8> {
     let l1_a_pa = LINUX_PAGE_TABLES_BASE + 0x1000;
     let l1_b_pa = LINUX_PAGE_TABLES_BASE + 0x2000;
     let l2_a_pa = LINUX_PAGE_TABLES_BASE + 0x3000;
+    // L2_B: fine-grained 2 MiB blocks for the 1 GiB region that holds the kernel
+    // hole, so only its first 2 MiB block is kernel-only.
+    let l2_b_pa = LINUX_PAGE_TABLES_BASE + 0x4000;
+    // L3_A: fine-grained 4 KiB pages for the first 2 MiB, so the null-guard
+    // (VA 0..0x10000) stays UNMAPPED while 0x10000..2 MiB is user — letting a
+    // low-loading static binary (Go's `go`, first segment at 0x10000) run while
+    // a guest NULL deref still faults cleanly at stage 1 (→ SIGSEGV), instead of
+    // hitting an unbacked stage-2 fault that crashes the vCPU thread.
+    let l3_a_pa = LINUX_PAGE_TABLES_BASE + 0x5000;
+    // Which L1A entry (1 GiB index) covers the kernel hole, and the kernel
+    // block's PA within it.
+    let kernel_l1_index = LINUX_KERNEL_REGION_BASE >> 30;
+    let kernel_block_pa = LINUX_KERNEL_REGION_BASE;
 
     // Table descriptors point at the next-level table. Bits 47:12 hold the
     // PA of the next-level table; bits 1:0 = 11 (valid table). AP/PXN/UXN
@@ -1023,10 +1048,14 @@ pub fn stage1_identity_page_tables() -> Vec<u8> {
     //   UXN = 0  (EL0 can fetch user code)
     //   AF, SH, AttrIndex same as kernel block.
     const USER_BLOCK_FLAGS: u64 = (1u64 << 53) | (1 << 10) | (0b11 << 8) | (0b01 << 6) | 0b01;
+    // Same as USER_BLOCK_FLAGS but a level-3 PAGE descriptor (bits[1:0] = 0b11)
+    // instead of a block (0b01).
+    const USER_PAGE_FLAGS: u64 = USER_BLOCK_FLAGS | 0b10;
 
-    // PA masks for block descriptors at each level.
+    // PA masks for descriptors at each level.
     const PA_MASK_1GIB: u64 = 0x0000_FFFF_C000_0000; // bits 47..30
     const PA_MASK_2MIB: u64 = 0x0000_FFFF_FFE0_0000; // bits 47..21
+    const PA_MASK_4KIB: u64 = 0x0000_FFFF_FFFF_F000; // bits 47..12
 
     // ----- L0 -----
     bytes[0..8].copy_from_slice(&table_descriptor(l1_a_pa).to_le_bytes());
@@ -1036,11 +1065,16 @@ pub fn stage1_identity_page_tables() -> Vec<u8> {
     // L1A[0] is a table descriptor pointing at L2_A so the first 1 GiB gets
     // fine-grained AP via 2 MiB blocks.
     bytes[0x1000..0x1008].copy_from_slice(&table_descriptor(l2_a_pa).to_le_bytes());
-    // L1A[1..511] are 1 GiB user blocks.
+    // L1A[1..511] are 1 GiB user blocks — except the entry covering the kernel
+    // hole, which is a table descriptor to L2_B (so a single 2 MiB block inside
+    // it can be made kernel-only).
     for index in 1..512_u64 {
-        let pa = index << 30;
-        let descriptor = (pa & PA_MASK_1GIB) | USER_BLOCK_FLAGS;
         let off = 0x1000 + (index as usize) * 8;
+        let descriptor = if index == kernel_l1_index {
+            table_descriptor(l2_b_pa)
+        } else {
+            (index << 30) & PA_MASK_1GIB | USER_BLOCK_FLAGS
+        };
         bytes[off..off + 8].copy_from_slice(&descriptor.to_le_bytes());
     }
 
@@ -1052,19 +1086,41 @@ pub fn stage1_identity_page_tables() -> Vec<u8> {
         bytes[off..off + 8].copy_from_slice(&descriptor.to_le_bytes());
     }
 
-    // ----- L2_A: covers the first 1 GiB in 2 MiB blocks -----
-    // L2[0] covers VA 0..2 MiB — kernel-only.
-    // INVARIANT: this entry maps physical address 0; the `0u64 & PA_MASK_2MIB`
-    // is written out (rather than just KERNEL_BLOCK_FLAGS) to keep the parallel
-    // `pa & PA_MASK_2MIB` structure of the surrounding L2 entries explicit.
-    #[allow(clippy::erasing_op)]
-    let l2_0 = (0u64 & PA_MASK_2MIB) | KERNEL_BLOCK_FLAGS;
-    bytes[0x3000..0x3008].copy_from_slice(&l2_0.to_le_bytes());
-    // L2[1..511] are 2 MiB user blocks.
+    // ----- L2_A: first 1 GiB in 2 MiB blocks; block 0 is fine-grained (L3) ----
+    // L2_A[0] (VA 0..2 MiB) points at L3_A so the null-guard page range stays
+    // unmapped; L2_A[1..511] are 2 MiB user blocks.
+    bytes[0x3000..0x3008].copy_from_slice(&table_descriptor(l3_a_pa).to_le_bytes());
     for index in 1..512_u64 {
         let pa = index << 21;
         let descriptor = (pa & PA_MASK_2MIB) | USER_BLOCK_FLAGS;
         let off = 0x3000 + (index as usize) * 8;
+        bytes[off..off + 8].copy_from_slice(&descriptor.to_le_bytes());
+    }
+
+    // ----- L3_A: first 2 MiB in 4 KiB pages -----
+    // VA 0..0x10000 (16 pages) is left INVALID as the null guard (matches Linux
+    // mmap_min_addr); 0x10000..2 MiB are user pages so a static binary loading
+    // at 0x10000 can run.
+    const NULL_GUARD_PAGES: u64 = 0x10000 / 0x1000; // 16
+    for index in NULL_GUARD_PAGES..512_u64 {
+        let pa = index << 12;
+        let descriptor = (pa & PA_MASK_4KIB) | USER_PAGE_FLAGS;
+        let off = 0x5000 + (index as usize) * 8;
+        bytes[off..off + 8].copy_from_slice(&descriptor.to_le_bytes());
+    }
+
+    // ----- L2_B: the 1 GiB region holding the kernel hole, in 2 MiB blocks -----
+    // Block 0 (the kernel hole's first 2 MiB) is kernel-only; the rest are user.
+    let l2_b_base_pa = kernel_l1_index << 30;
+    for index in 0..512_u64 {
+        let pa = l2_b_base_pa + (index << 21);
+        let flags = if pa == kernel_block_pa {
+            KERNEL_BLOCK_FLAGS
+        } else {
+            USER_BLOCK_FLAGS
+        };
+        let descriptor = (pa & PA_MASK_2MIB) | flags;
+        let off = 0x4000 + (index as usize) * 8;
         bytes[off..off + 8].copy_from_slice(&descriptor.to_le_bytes());
     }
 
