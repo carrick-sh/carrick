@@ -1707,61 +1707,9 @@ struct PendingSignalAction {
 
 /// Drain whatever signal is sitting in the host pending slot and
 /// dispatch it to the guest. Returns `Ok(None)` when nothing was
-/// pending. Returns `Ok(Some(...))` with `exit_code: Some(code)` when
-/// a default-action signal fires (the runtime should treat this like
-/// an `exit_group(code)`). Returns `Ok(Some(...))` with
-/// `exit_code: None` when the handler was injected (or the signal was
-/// SIG_IGN'd) and the vCPU should resume.
-/// Block on a cross-process (`MAP_SHARED`) futex via the host `__ulock`,
-/// interruptibly. Mirrors the parking-lot `FutexWait` contract: returns 0 when
-/// woken (or the futex word already changed — the guest re-checks), `-EINTR`
-/// when a signal deliverable to THIS thread is pending, `-ETIMEDOUT` at the
-/// guest's deadline. `__ulock_wait` is woken by another process's
-/// `__ulock_wake` on the same physical page; we cap each wait slice so a
-/// pending guest signal (whose cross-thread kick can't interrupt `__ulock`)
-/// is still observed promptly. errnos are translated host→Linux.
-fn shared_futex_wait(
-    host_addr: usize,
-    value: u32,
-    timeout: Option<std::time::Duration>,
-    this_tid: ThreadId,
-) -> i64 {
-    let deadline = timeout.map(|d| std::time::Instant::now() + d);
-    loop {
-        if crate::host_signal::has_pending_for(this_tid as i32)
-            || crate::fork_quiesce::is_quiescing()
-        {
-            return -(crate::linux_abi::LINUX_EINTR as i64);
-        }
-        let slice_us: u32 = match deadline {
-            Some(dl) => {
-                let now = std::time::Instant::now();
-                if now >= dl {
-                    return -(crate::linux_abi::LINUX_ETIMEDOUT as i64);
-                }
-                u32::try_from((dl - now).as_micros().min(20_000)).unwrap_or(20_000)
-            }
-            // No guest timeout: 20ms slices so a pending signal is seen promptly.
-            None => 20_000,
-        };
-        let r = crate::ulock::wait(host_addr, value, slice_us);
-        if r >= 0 {
-            // Woken by a wake, or the value already differed — either way the
-            // guest re-evaluates its own condition. Linux FUTEX_WAIT returns 0.
-            return 0;
-        }
-        // `-errno` is a HOST errno; translate the ones we act on to Linux.
-        let host_errno = (-r) as i32;
-        if host_errno == libc::ETIMEDOUT || host_errno == libc::EINTR {
-            // Slice expired or a signal nudged us — re-check deadline + pending
-            // at the top of the loop rather than surfacing a spurious return.
-            continue;
-        }
-        // EFAULT (bad futex address) shares its value on macOS and Linux (14).
-        return -i64::from(host_errno);
-    }
-}
-
+/// pending. Returns `Ok(Some(...))` when a default-action signal fires,
+/// a handler was injected, or the signal was consumed without resuming
+/// immediately.
 fn deliver_pending_signal<T>(
     trap: &mut T,
     dispatcher: &SyscallDispatcher,
@@ -1842,6 +1790,56 @@ where
         None => Ok(Some(PendingSignalAction {
             term_signal: Some(pending),
         })),
+    }
+}
+
+/// Block on a cross-process (`MAP_SHARED`) futex via the host `__ulock`,
+/// interruptibly. Mirrors the parking-lot `FutexWait` contract: returns 0 when
+/// woken (or the futex word already changed — the guest re-checks), `-EINTR`
+/// when a signal deliverable to THIS thread is pending, `-ETIMEDOUT` at the
+/// guest's deadline. `__ulock_wait` is woken by another process's
+/// `__ulock_wake` on the same physical page; we cap each wait slice so a
+/// pending guest signal (whose cross-thread kick can't interrupt `__ulock`)
+/// is still observed promptly. errnos are translated host→Linux.
+fn shared_futex_wait(
+    host_addr: usize,
+    value: u32,
+    timeout: Option<std::time::Duration>,
+    this_tid: ThreadId,
+) -> i64 {
+    let deadline = timeout.map(|d| std::time::Instant::now() + d);
+    loop {
+        if crate::host_signal::has_pending_for(this_tid as i32)
+            || crate::fork_quiesce::is_quiescing()
+        {
+            return -(crate::linux_abi::LINUX_EINTR as i64);
+        }
+        let slice_us: u32 = match deadline {
+            Some(dl) => {
+                let now = std::time::Instant::now();
+                if now >= dl {
+                    return -(crate::linux_abi::LINUX_ETIMEDOUT as i64);
+                }
+                u32::try_from((dl - now).as_micros().min(20_000)).unwrap_or(20_000)
+            }
+            // No guest timeout: 20ms slices so a pending signal is seen promptly.
+            None => 20_000,
+        };
+        let r = crate::ulock::wait(host_addr, value, slice_us);
+        if r >= 0 {
+            // Woken by a wake, or the value already differed — either way the
+            // guest re-evaluates its own condition. Linux FUTEX_WAIT returns 0.
+            return 0;
+        }
+        // `-errno` is a HOST errno; translate the ones we act on to Linux.
+        let host_errno = (-r) as i32;
+        if host_errno == libc::ETIMEDOUT || host_errno == libc::EINTR {
+            // Slice expired or a signal nudged us — re-check deadline + pending
+            // at the top of the loop rather than surfacing a spurious return.
+            continue;
+        }
+        // EFAULT (bad futex address) shares its value on macOS and Linux (14).
+        return -i64::from(host_errno);
     }
 }
 
