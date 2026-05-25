@@ -7,47 +7,11 @@ use oci_client::manifest::{
     IMAGE_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_MEDIA_TYPE, ImageIndexEntry,
 };
 use oci_client::secrets::RegistryAuth;
-use oci_client::{Client, Reference};
+use oci_client::Client;
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 use tokio::fs;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ImageReference {
-    inner: Reference,
-}
-
-impl ImageReference {
-    pub fn parse(input: &str) -> Result<Self, OciBootstrapError> {
-        Ok(Self {
-            inner: input.parse()?,
-        })
-    }
-
-    pub fn registry(&self) -> &str {
-        self.inner.registry()
-    }
-
-    pub fn repository(&self) -> &str {
-        self.inner.repository()
-    }
-
-    pub fn tag(&self) -> Option<&str> {
-        self.inner.tag()
-    }
-
-    pub fn digest(&self) -> Option<&str> {
-        self.inner.digest()
-    }
-
-    pub fn canonical(&self) -> String {
-        self.inner.whole()
-    }
-
-    pub fn as_oci_reference(&self) -> &Reference {
-        &self.inner
-    }
-}
+pub use carrick_spec::{ImageReference, OciBootstrapError, ImageConfig};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageStore {
@@ -122,20 +86,6 @@ pub struct LayerSummary {
     pub path: PathBuf,
 }
 
-#[derive(Debug, Error)]
-pub enum OciBootstrapError {
-    #[error("invalid OCI image reference: {0}")]
-    ParseReference(#[from] oci_client::ParseError),
-    #[error("invalid OCI content digest: {0}")]
-    InvalidDigest(String),
-    #[error("OCI registry operation failed: {0}")]
-    Registry(#[from] oci_client::errors::OciDistributionError),
-    #[error("failed to write image store: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("failed to serialize OCI metadata: {0}")]
-    Json(#[from] serde_json::Error),
-}
-
 impl ImageStore {
     pub fn image_summary_path(&self, image: &ImageReference) -> PathBuf {
         self.image_dir(image).join("carrick-image.json")
@@ -150,35 +100,17 @@ impl ImageStore {
     }
 }
 
-/// Environment variable used to override the platform that
-/// [`pull_image`] requests when a registry returns a multi-arch image
-/// index. Format: `os/arch[/variant]`, e.g. `linux/amd64` or
-/// `linux/arm64/v8`. When unset, defaults to `linux/arm64` (the
-/// architecture Carrick's HVF backend executes).
 pub const PLATFORM_OVERRIDE_ENV: &str = "CARRICK_PULL_PLATFORM";
-
-/// Comma-separated registry hosts (`host` or `host:port`) to contact over
-/// plain HTTP instead of HTTPS. Used to pull from a local, throwaway
-/// `registry:2` (e.g. the LTP conformance image) without standing up TLS.
-/// `localhost` and `127.0.0.1` are always treated as insecure; this env var
-/// extends the set. Never affects real registries like docker.io.
 pub const INSECURE_REGISTRIES_ENV: &str = "CARRICK_INSECURE_REGISTRIES";
 
-/// A parsed `os/arch[/variant]` platform target used to pick a manifest
-/// from an OCI image index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlatformTarget {
     pub os: String,
     pub arch: String,
-    /// `None` means "match either a missing variant or any variant
-    /// considered ABI-compatible by [`PlatformTarget::matches`]". A
-    /// concrete `Some("v8")` requires the manifest to either declare
-    /// that variant or declare no variant at all.
     pub variant: Option<String>,
 }
 
 impl PlatformTarget {
-    /// The default Carrick target: linux/arm64 with no required variant.
     pub fn default_target() -> Self {
         Self {
             os: "linux".to_string(),
@@ -187,8 +119,6 @@ impl PlatformTarget {
         }
     }
 
-    /// Parse a `os/arch[/variant]` string. Returns `None` if the value
-    /// can't be split into at least two non-empty components.
     pub fn parse(value: &str) -> Option<Self> {
         let mut parts = value.split('/');
         let os = parts.next()?.trim();
@@ -207,13 +137,6 @@ impl PlatformTarget {
         })
     }
 
-    /// Returns true if this target should accept the given platform
-    /// entry. The os and arch must match exactly. For arm64, a
-    /// missing required variant accepts entries with no variant or
-    /// the `v8` variant (the only ABI-compatible variant for arm64
-    /// on the host); other variants are rejected. If this target
-    /// declares a specific variant, the entry must either declare
-    /// the same variant or no variant at all.
     pub fn matches(&self, entry_os: &str, entry_arch: &str, entry_variant: Option<&str>) -> bool {
         if entry_os != self.os || entry_arch != self.arch {
             return false;
@@ -224,9 +147,6 @@ impl PlatformTarget {
                 if self.arch == "arm64" {
                     v == "v8"
                 } else {
-                    // For other architectures be permissive: variants
-                    // beyond the bare arch are typically ABI-compatible
-                    // (e.g. amd64 has no meaningful variants on Linux).
                     true
                 }
             }
@@ -236,9 +156,6 @@ impl PlatformTarget {
     }
 }
 
-/// Read the platform target from `CARRICK_PULL_PLATFORM`, falling
-/// back to [`PlatformTarget::default_target`] when unset or
-/// unparseable.
 pub fn platform_target_from_env() -> PlatformTarget {
     env::var(PLATFORM_OVERRIDE_ENV)
         .ok()
@@ -247,9 +164,6 @@ pub fn platform_target_from_env() -> PlatformTarget {
         .unwrap_or_else(PlatformTarget::default_target)
 }
 
-/// Walk an OCI image index's manifest entries and return the digest
-/// of the manifest that matches `target`, or `None` if no entry
-/// matches. Entries without a `platform` block are skipped.
 pub fn select_manifest_digest(
     entries: &[ImageIndexEntry],
     target: &PlatformTarget,
@@ -265,12 +179,7 @@ pub fn select_manifest_digest(
     })
 }
 
-/// Build the list of registry hosts to contact over plain HTTP: the
-/// always-insecure loopback hosts plus any from [`INSECURE_REGISTRIES_ENV`].
 fn insecure_registries() -> Vec<String> {
-    // oci-distribution matches the FULL `host:port` string, so we enumerate
-    // both bare and the conventional registry:2 port (5000). Extra forms come
-    // from the env var.
     let mut hosts = vec![
         "localhost".to_string(),
         "127.0.0.1".to_string(),
@@ -365,6 +274,80 @@ pub async fn pull_image(
     Ok(summary)
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolvedImage {
+    pub layers: Vec<camino::Utf8PathBuf>,
+    pub config: ImageConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OciImageConfigContainer {
+    config: Option<OciImageConfigInner>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct OciImageConfigInner {
+    user: Option<String>,
+    exposed_ports: Option<std::collections::HashMap<String, serde_json::Value>>,
+    env: Option<Vec<String>>,
+    entrypoint: Option<Vec<String>>,
+    cmd: Option<Vec<String>>,
+    working_dir: Option<camino::Utf8PathBuf>,
+    labels: Option<std::collections::HashMap<String, String>>,
+}
+
+impl OciImageConfigContainer {
+    fn into_image_config(self) -> ImageConfig {
+        if let Some(inner) = self.config {
+            let exposed = inner.exposed_ports.map(|m| m.into_keys().collect());
+            ImageConfig {
+                entrypoint: inner.entrypoint,
+                cmd: inner.cmd,
+                env: inner.env.unwrap_or_default(),
+                working_dir: inner.working_dir,
+                user: inner.user,
+                exposed_ports: exposed,
+                labels: inner.labels,
+            }
+        } else {
+            ImageConfig::default()
+        }
+    }
+}
+
+impl ImageStore {
+    pub async fn resolve(&self, image: &ImageReference) -> Result<ResolvedImage, OciBootstrapError> {
+        let summary = match self.load_pull_summary(image).await {
+            Ok(summary) => summary,
+            Err(_) => {
+                eprintln!("carrick: image {} not in store; pulling…", image.canonical());
+                pull_image(image, self).await?
+            }
+        };
+
+        let layers: Vec<camino::Utf8PathBuf> = summary.layers
+            .iter()
+            .map(|l| camino::Utf8PathBuf::from(l.path.to_string_lossy().into_owned()))
+            .collect();
+
+        let config_path = summary.image_dir.join("config.json");
+        let config = match fs::read(&config_path).await {
+            Ok(config_bytes) => {
+                serde_json::from_slice::<OciImageConfigContainer>(&config_bytes)
+                    .map(|c| c.into_image_config())
+                    .unwrap_or_default()
+            }
+            Err(_) => ImageConfig::default(),
+        };
+
+        Ok(ResolvedImage {
+            layers,
+            config,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -433,8 +416,6 @@ mod tests {
 
     #[test]
     fn rejects_arm64_v7_variant() {
-        // arm64 with a non-v8 variant must NOT be selected; the ABI
-        // does not match the host's arm64/v8 expectation.
         let entries = vec![entry("linux", "arm64", Some("v7"), "sha256:arm64v7")];
         let target = PlatformTarget::default_target();
         assert_eq!(select_manifest_digest(&entries, &target), None);
@@ -466,9 +447,6 @@ mod tests {
 
     #[test]
     fn override_arm64_v8_matches_unspecified_entry() {
-        // If the override pins variant=v8 but the registry's entry
-        // omits variant, we still accept it (a missing variant on the
-        // entry side is treated as compatible).
         let entries = vec![entry("linux", "arm64", None, "sha256:arm64")];
         let target = PlatformTarget::parse("linux/arm64/v8").expect("parse");
         assert_eq!(
@@ -488,5 +466,41 @@ mod tests {
             select_manifest_digest(&entries, &target),
             Some("sha256:arm64".to_string())
         );
+    }
+
+    #[test]
+    fn test_parse_oci_config_json() {
+        let raw_json = r#"{
+            "config": {
+                "User": "nobody",
+                "ExposedPorts": {
+                    "80/tcp": {},
+                    "443/tcp": {}
+                },
+                "Env": [
+                    "PATH=/usr/bin",
+                    "MY_VAR=value"
+                ],
+                "Entrypoint": [
+                    "/init"
+                ],
+                "Cmd": [
+                    "--arg"
+                ],
+                "WorkingDir": "/opt/app",
+                "Labels": {
+                    "maintainer": "test@example.com"
+                }
+            }
+        }"#;
+
+        let oci_container: OciImageConfigContainer = serde_json::from_str(raw_json).unwrap();
+        let config = oci_container.into_image_config();
+
+        assert_eq!(config.user.as_deref(), Some("nobody"));
+        assert_eq!(config.entrypoint, Some(vec!["/init".to_string()]));
+        assert_eq!(config.cmd, Some(vec!["--arg".to_string()]));
+        assert_eq!(config.working_dir.unwrap().as_str(), "/opt/app");
+        assert!(config.exposed_ports.unwrap().contains("80/tcp"));
     }
 }
