@@ -146,15 +146,12 @@ fn section_a_mremap_grow() {
             println!("a_mremap_repeated_grow_preserved={}", all_ok);
 
             // mremap SHRINK 16 -> 2 pages.
-            let r = unsafe {
-                libc::mremap(cur, PAGE * old_pages, PAGE * 2, libc::MREMAP_MAYMOVE)
-            };
+            let r = unsafe { libc::mremap(cur, PAGE * old_pages, PAGE * 2, libc::MREMAP_MAYMOVE) };
             if r == libc::MAP_FAILED {
                 println!("a_shrink_16to2=ERR:{}", errno());
             } else {
                 println!("a_shrink_16to2_rc_success={}", true);
-                let intact =
-                    page_first_last_eq(r, 0, 0xA0) && page_first_last_eq(r, 1, 0xA1);
+                let intact = page_first_last_eq(r, 0, 0xA0) && page_first_last_eq(r, 1, 0xA1);
                 println!("a_shrink_remaining_pages_intact={}", intact);
                 unsafe { libc::munmap(r, PAGE * 2) };
             }
@@ -216,7 +213,14 @@ fn section_b_shared_coherence() {
     // 2) pwrite a different 16-byte marker at offset 4096 to the fd, then read
     //    it THROUGH the mapping.
     let marker_b: [u8; 16] = *b"MARKER_B__abcdef";
-    let wn = unsafe { libc::pwrite(fd, marker_b.as_ptr() as *const _, marker_b.len(), PAGE as libc::off_t) };
+    let wn = unsafe {
+        libc::pwrite(
+            fd,
+            marker_b.as_ptr() as *const _,
+            marker_b.len(),
+            PAGE as libc::off_t,
+        )
+    };
     let mut via_map = [0u8; 16];
     unsafe {
         std::ptr::copy_nonoverlapping(
@@ -248,22 +252,14 @@ fn section_b_shared_coherence() {
         } else {
             let marker_c: [u8; 16] = *b"MARKER_C__XYZ789";
             unsafe {
-                std::ptr::copy_nonoverlapping(
-                    marker_c.as_ptr(),
-                    map1 as *mut u8,
-                    marker_c.len(),
-                );
+                std::ptr::copy_nonoverlapping(marker_c.as_ptr(), map1 as *mut u8, marker_c.len());
             }
             // No msync required for shared-mapping coherence between two
             // mappings of the same file on Linux, but issue one to be safe.
             let _ = unsafe { libc::msync(map1, PAGE * 2, libc::MS_SYNC) };
             let mut via2 = [0u8; 16];
             unsafe {
-                std::ptr::copy_nonoverlapping(
-                    map2 as *const u8,
-                    via2.as_mut_ptr(),
-                    via2.len(),
-                );
+                std::ptr::copy_nonoverlapping(map2 as *const u8, via2.as_mut_ptr(), via2.len());
             }
             println!("b_two_shared_maps_coherent={}", via2 == marker_c);
             unsafe { libc::munmap(map2, PAGE * 2) };
@@ -271,10 +267,45 @@ fn section_b_shared_coherence() {
         unsafe { libc::close(fd2) };
     }
 
+    // 4) MAP_SHARED writes are immediately visible through file reads even
+    // before an explicit msync; munmap must not lose the dirty page.
+    let marker_d: [u8; 16] = *b"MARKER_D__UVW123";
+    unsafe {
+        std::ptr::copy_nonoverlapping(marker_d.as_ptr(), (map1 as *mut u8).add(32), marker_d.len());
+    }
+    let mut rb_before_unmap = [0u8; 16];
+    let n = unsafe {
+        libc::pread(
+            fd,
+            rb_before_unmap.as_mut_ptr() as *mut _,
+            rb_before_unmap.len(),
+            32,
+        )
+    };
+    println!(
+        "b_shared_write_visible_without_msync={}",
+        n == marker_d.len() as isize && rb_before_unmap == marker_d
+    );
+
     unsafe {
         libc::munmap(map1, PAGE * 2);
-        libc::close(fd);
     }
+
+    let mut rb_after_unmap = [0u8; 16];
+    let n = unsafe {
+        libc::pread(
+            fd,
+            rb_after_unmap.as_mut_ptr() as *mut _,
+            rb_after_unmap.len(),
+            32,
+        )
+    };
+    println!(
+        "b_shared_write_survives_munmap={}",
+        n == marker_d.len() as isize && rb_after_unmap == marker_d
+    );
+
+    unsafe { libc::close(fd) };
 }
 
 // ---------------------------------------------------------------------------
