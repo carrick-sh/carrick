@@ -5,7 +5,7 @@
 
 use std::io::Write;
 
-use carrick::rootfs::{LayerSource, RootFs};
+use carrick_runtime::rootfs::{LayerSource, RootFs};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 

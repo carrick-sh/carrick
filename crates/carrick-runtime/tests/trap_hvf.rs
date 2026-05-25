@@ -1,6 +1,6 @@
-use carrick::elf::SegmentPerms;
-use carrick::memory::{AddressSpace, LINUX_EL1_VECTORS_BASE};
-use carrick::trap::{
+use carrick_runtime::elf::SegmentPerms;
+use carrick_runtime::memory::{AddressSpace, LINUX_EL1_VECTORS_BASE};
+use carrick_runtime::trap::{
     AARCH64_HVC_EXCEPTION_CLASS, AARCH64_SVC_EXCEPTION_CLASS, GuestMappingPlan, HVF_PAGE_SIZE,
     HvfTrapEngine, TrapBackend, aarch64_exception_class, hvf_capabilities,
     is_aarch64_hvc_exception, is_aarch64_svc_exception, is_aarch64_syscall_exception,

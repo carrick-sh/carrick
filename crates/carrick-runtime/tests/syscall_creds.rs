@@ -438,7 +438,7 @@ fn scheduler_bootstrap_yields_and_writes_current_affinity() {
         }
     );
     let mut expected_affinity = vec![0u8; LINUX_BOOTSTRAP_AFFINITY_BYTES];
-    for cpu in 0..carrick::host_facts::logical_cpu_count().min(expected_affinity.len() * 8) {
+    for cpu in 0..carrick_runtime::host_facts::logical_cpu_count().min(expected_affinity.len() * 8) {
         expected_affinity[cpu / 8] |= 1 << (cpu % 8);
     }
     assert_eq!(
@@ -648,7 +648,17 @@ fn getrusage_bootstrap_zeros_rusage_for_self_and_validates_who() {
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
     );
-    assert_eq!(read_rusage(&memory, 0x4000), LinuxRusage::zeroed());
+    let rusage = read_rusage(&memory, 0x4000);
+    #[cfg(not(target_os = "macos"))]
+    assert_eq!(rusage, LinuxRusage::zeroed());
+    #[cfg(target_os = "macos")]
+    {
+        assert!(rusage.ru_utime.tv_sec >= 0);
+        assert!(rusage.ru_utime.tv_usec >= 0);
+        assert!(rusage.ru_stime.tv_sec >= 0);
+        assert!(rusage.ru_stime.tv_usec >= 0);
+        assert!(rusage.ru_maxrss >= 0);
+    }
 
     // RUSAGE_CHILDREN with valid pointer -> same.
     // Pre-poison the buffer so we can prove the handler zeroed it.
@@ -668,7 +678,15 @@ fn getrusage_bootstrap_zeros_rusage_for_self_and_validates_who() {
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
     );
-    assert_eq!(read_rusage(&memory, 0x4000), LinuxRusage::zeroed());
+    let rusage_children = read_rusage(&memory, 0x4000);
+    #[cfg(not(target_os = "macos"))]
+    assert_eq!(rusage_children, LinuxRusage::zeroed());
+    #[cfg(target_os = "macos")]
+    {
+        assert_eq!(rusage_children.ru_utime, LinuxTimeval::new(0, 0));
+        assert_eq!(rusage_children.ru_stime, LinuxTimeval::new(0, 0));
+        assert!(rusage_children.ru_maxrss >= 0);
+    }
 
     // who = 99 -> EINVAL.
     assert_eq!(

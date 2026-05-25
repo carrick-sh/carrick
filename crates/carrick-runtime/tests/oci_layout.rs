@@ -1,4 +1,4 @@
-use carrick::oci::{ImageReference, ImageStore, LayerSummary, PullSummary};
+use carrick_image::{ImageReference, ImageStore, LayerSummary, PullSummary};
 
 #[test]
 fn normalizes_short_docker_hub_references() {

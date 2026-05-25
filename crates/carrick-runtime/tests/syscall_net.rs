@@ -13,13 +13,13 @@ mod support;
 use support::*;
 
 #[cfg(target_os = "macos")]
-use carrick::io_wait::{ThreadWaiter, WaitResult};
-use carrick::linux_abi::{
+use carrick_runtime::io_wait::{ThreadWaiter, WaitResult};
+use carrick_runtime::linux_abi::{
     LINUX_AF_INET, LINUX_EINTR, LINUX_EPOLLOUT, LINUX_SOCK_CLOEXEC, LINUX_SOCK_NONBLOCK,
     LINUX_SOCK_STREAM, LINUX_SOL_TCP,
 };
 #[cfg(target_os = "macos")]
-use carrick::thread::{FutexTable, ThreadRegistry};
+use carrick_runtime::thread::{FutexTable, ThreadRegistry};
 #[cfg(target_os = "macos")]
 use std::sync::{Arc, Mutex, mpsc};
 #[cfg(target_os = "macos")]
@@ -32,7 +32,7 @@ const LINUX_TCP_KEEPIDLE: u64 = 4;
 fn epoll_event_matches_aarch64_c_abi_layout() {
     assert_eq!(core::mem::size_of::<LinuxEpollEvent>(), 16);
     assert_eq!(
-        <LinuxEpollEvent as carrick::linux_abi::KernelAbi>::ABI_SIZE,
+        <LinuxEpollEvent as carrick_runtime::linux_abi::KernelAbi>::ABI_SIZE,
         16
     );
     let event = LinuxEpollEvent {

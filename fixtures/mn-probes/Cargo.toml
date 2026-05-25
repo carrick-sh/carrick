@@ -1,3 +1,5 @@
+[workspace]
+
 [package]
 name = "mn-probes"
 version = "0.1.0"

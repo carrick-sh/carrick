@@ -48,7 +48,7 @@ fn extracts_file_dir_symlink_with_mode() {
     });
     let dir =
         cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority()).unwrap();
-    let stats = carrick::rootfs::extract_layer_paths_to_dir(&[layer], &dir).unwrap();
+    let stats = carrick_runtime::rootfs::extract_layer_paths_to_dir(&[layer], &dir).unwrap();
     assert_eq!(stats.files, 1);
     assert_eq!(stats.dirs, 1);
     assert_eq!(stats.symlinks, 1);
@@ -109,7 +109,7 @@ fn later_layer_overrides_and_whiteout_deletes() {
     });
     let dir =
         cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority()).unwrap();
-    carrick::rootfs::extract_layer_paths_to_dir(&[l0, l1], &dir).unwrap();
+    carrick_runtime::rootfs::extract_layer_paths_to_dir(&[l0, l1], &dir).unwrap();
     assert_eq!(std::fs::read(scratch.path().join("a.txt")).unwrap(), b"v1");
     assert!(!scratch.path().join("b.txt").exists());
 }
@@ -142,7 +142,7 @@ fn opaque_whiteout_clears_dir() {
     });
     let dir =
         cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority()).unwrap();
-    carrick::rootfs::extract_layer_paths_to_dir(&[l0, l1], &dir).unwrap();
+    carrick_runtime::rootfs::extract_layer_paths_to_dir(&[l0, l1], &dir).unwrap();
     assert!(!scratch.path().join("d/old.txt").exists());
     assert!(scratch.path().join("d/new.txt").is_file());
 }
@@ -169,7 +169,7 @@ fn skips_special_file() {
     });
     let dir =
         cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority()).unwrap();
-    let stats = carrick::rootfs::extract_layer_paths_to_dir(&[layer], &dir).unwrap();
+    let stats = carrick_runtime::rootfs::extract_layer_paths_to_dir(&[layer], &dir).unwrap();
     assert_eq!(stats.skipped_special, 1);
     assert_eq!(stats.files, 1);
     assert!(scratch.path().join("readme.txt").is_file());
@@ -214,7 +214,7 @@ fn rejects_path_escape() {
                 .unwrap();
                 // Should return an error (UnsafePath from normalize_layer_path)
                 let result =
-                    carrick::rootfs::extract_layer_paths_to_dir(&[layer_path.clone()], &dir);
+                    carrick_runtime::rootfs::extract_layer_paths_to_dir(&[layer_path.clone()], &dir);
                 assert!(result.is_err(), "expected path escape to be rejected");
                 // Confirm nothing was written outside scratch
                 assert!(!tmp.path().join("evil").exists());

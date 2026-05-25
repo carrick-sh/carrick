@@ -1,4 +1,4 @@
-use carrick::syscall::{SupportLevel, SyscallHandler, aarch64_table, lookup_aarch64};
+use carrick_runtime::syscall::{SupportLevel, SyscallHandler, aarch64_table, lookup_aarch64};
 
 #[test]
 fn aarch64_syscall_table_is_sorted_for_binary_search() {
