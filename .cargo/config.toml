@@ -1,0 +1,13 @@
+# Use LLVM lld as the linker on Apple Silicon.
+#
+# carrick-runtime is a single ~41k-line crate, and the workspace links 27
+# integration-test binaries (plus the cli) that each statically link its rlib.
+# With macOS's default ld64, relinking after a one-line edit to the runtime
+# crate spends ~30s of kernel time purely in the linker. lld links Mach-O
+# several times faster, cutting the edit/test inner loop substantially.
+#
+# lld is provided by the Homebrew `lld` formula (/opt/homebrew/bin/ld.lld).
+# The produced binaries are still codesigned by scripts/build-signed.sh and
+# run under HVF unchanged (verified).
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]
