@@ -407,6 +407,7 @@ The DAC (discretionary access control) check lives in `dispatch/mod.rs` — shou
 | `cargo test -p carrick-runtime --lib dtrace_consumer::tests::join_ids_formats_comma_separated_decimal_ids -- --nocapture` | done | Verifies the shared trace group-id formatter used by runtime and CLI. |
 | `cargo test -p carrick-runtime --lib dispatch::mem::tests::next_mmap_address_reuses_freed_arena_region -- --nocapture` | done | Verifies anonymous/private mmap arena holes are reused from `free_regions`. |
 | `cargo test -p carrick-runtime --lib 'dispatch::net::tests::' -- --nocapture` | done | Verifies address-family, message-flag, sockaddr layout, sockaddr truncation, and host-socket nonblocking translation tests. |
+| `cargo test -p carrick-cli --test linux_fixture builds_static_linux_aarch64_hello_fixture -- --nocapture` | done | Verifies the table-driven static fixture inventory still builds and validates every expected AArch64 fixture. |
 
 ### Tier 1
 
@@ -431,7 +432,7 @@ The DAC (discretionary access control) check lives in `dispatch/mod.rs` — shou
 | 12 | Extract `OpenDescription` status flags | open | Behavior-preserving refactor with high call-site count. |
 | 13 | Consolidate stat/statx writers | open | Behavior-preserving refactor. |
 | 14 | Unify `gzip_tar` test helper | open | Copy-paste still exists in CLI/runtime tests. |
-| 15 | Parameterize `linux_fixture.rs` tests | open | Test refactor. |
+| 15 | Parameterize `linux_fixture.rs` tests | done | Collapsed repeated static fixture metadata/load-plan assertions into one fixture table and loop while preserving the special ET_EXEC and PIE checks. |
 | 16 | Delete duplicate `probe_case_sensitive` and `join_ids` from main.rs | done | CLI now calls `carrick_runtime::apfs::probe_case_sensitive` and the shared `dtrace_consumer::join_ids`; the duplicate local helpers were removed. |
 
 ### Tier 3
