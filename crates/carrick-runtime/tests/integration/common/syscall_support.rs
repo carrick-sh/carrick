@@ -409,13 +409,17 @@ pub fn rwx_perms() -> SegmentPerms {
 }
 
 pub fn gzip_tar<const N: usize>(files: [(&str, &[u8]); N]) -> Vec<u8> {
+    gzip_tar_with_modes(files.map(|(path, contents)| (path, contents, 0o644)))
+}
+
+pub fn gzip_tar_with_modes<const N: usize>(files: [(&str, &[u8], u32); N]) -> Vec<u8> {
     let mut tar_bytes = Vec::new();
     {
         let mut builder = tar::Builder::new(&mut tar_bytes);
-        for (path, contents) in files {
+        for (path, contents, mode) in files {
             let mut header = tar::Header::new_gnu();
             header.set_size(contents.len() as u64);
-            header.set_mode(0o644);
+            header.set_mode(mode);
             header.set_cksum();
             builder.append_data(&mut header, path, contents).unwrap();
         }
