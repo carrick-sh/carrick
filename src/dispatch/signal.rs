@@ -91,67 +91,6 @@ fn sanitize_signal_mask(mut mask: u64) -> u64 {
 }
 
 impl SyscallDispatcher {
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn dispatch_threaded_signal<M: GuestMemory>(
-        &self,
-        request: SyscallRequest,
-        memory: &mut M,
-        reporter: &CompatReporter,
-        tid: crate::thread::ThreadId,
-        registry: &crate::thread::ThreadRegistry,
-        futex: &crate::thread::FutexTable,
-    ) -> Option<Result<DispatchOutcome, DispatchError>> {
-        if !syscall_handler_is(request.number, SyscallHandler::Signal) {
-            return None;
-        }
-
-        let syscall = lookup_aarch64(request.number);
-        let name = syscall.map_or("unknown", |syscall| syscall.name);
-        reporter.record(CompatEvent::SyscallEntry {
-            number: request.number,
-            name: ::std::borrow::Cow::Borrowed(name),
-            args: request.args,
-        });
-
-        let thread = Some(ThreadCtx {
-            tid,
-            registry,
-            futex,
-        });
-        let mut ctx = SyscallCtx {
-            request,
-            memory,
-            reporter,
-            thread,
-        };
-        let outcome = match match request.number {
-            129 => self.kill(&mut ctx),
-            130 => self.tkill(&mut ctx),
-            131 => self.tgkill(&mut ctx),
-            132 => self.sigaltstack(&mut ctx),
-            133 => self.rt_sigsuspend(&mut ctx),
-            134 => self.rt_sigaction(&mut ctx),
-            135 => self.rt_sigprocmask(&mut ctx),
-            136 => self.rt_sigpending(&mut ctx),
-            137 => self.rt_sigtimedwait(&mut ctx),
-            138 => self.rt_sigqueueinfo(&mut ctx),
-            139 => self.rt_sigreturn(&mut ctx),
-            _ => unreachable!("unsupported threaded signal syscall"),
-        } {
-            Ok(outcome) => outcome,
-            Err(error) => return Some(Err(error)),
-        };
-
-        let (retval, errno) = outcome.retval_errno();
-        reporter.record(CompatEvent::SyscallReturn {
-            number: request.number,
-            name: ::std::borrow::Cow::Borrowed(name),
-            retval,
-            errno,
-        });
-
-        Some(Ok(outcome))
-    }
 
     /// Look up the currently-installed handler for `signum`. Returns
     /// `None` when no handler has been recorded via `rt_sigaction`, or
