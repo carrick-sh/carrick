@@ -1943,6 +1943,8 @@ fn deliver_fault_signal(
     if dispatcher.signal_blocked(this_tid, signum) || action.is_none() {
         return terminate(signum);
     }
+    // INVARIANT: the `action.is_none()` arm above returned, so this is `Some`.
+    #[allow(clippy::unwrap_used)]
     let action = action.unwrap();
     let restorer = if action.sa_flags & crate::linux_abi::LINUX_SA_RESTORER != 0 {
         action.sa_restorer
