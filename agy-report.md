@@ -412,6 +412,7 @@ The DAC (discretionary access control) check lives in `dispatch/mod.rs` — shou
 | `cargo test -p carrick-runtime --test integration address_space::load_elf_from_rootfs_maps_pt_interp_at_base_and_sets_at_base -- --nocapture` | done | Verifies the shared mode-aware gzip/tar helper preserves executable ELF entries. |
 | `cargo test -p carrick-runtime --test runtime_loop runtime_loop_can_cat_a_rootfs_file -- --nocapture` | done | Verifies `runtime_loop` uses the shared gzip/tar helper. |
 | source module-doc audit | done | `find crates \( -path '*/src/*.rs' -o -path '*/src/**/*.rs' \) ...` now prints no production source files missing a leading `//!` module doc. |
+| `rg -n "eprintln!" crates/carrick-cli/src/main.rs` | done | Only the intentional panic abort banner remains on direct stderr; CLI warning/status diagnostics now use `tracing::warn!`. |
 
 ### Tier 1
 
@@ -454,6 +455,6 @@ The DAC (discretionary access control) check lives in `dispatch/mod.rs` — shou
 | 25 | Address `EPOLL_INMEM_KQUEUES` O(n) broadcast scalability | open | Design-sized scalability change. |
 | 26 | Implement `MAP_SHARED` writeback | deferred | Multi-day semantic feature; needs conformance spec. |
 | 27 | Add module-level docs to all files | done | Added leading `//!` docs to all production source files that lacked them, and converted the `fs_backend` and `overlay` file headers into module docs. |
-| 28 | Unify `run_cli()` logging | open | CLI behavior/logging cleanup. |
+| 28 | Unify `run_cli()` logging | done | Replaced warning/status `eprintln!` calls in the CLI with `tracing::warn!`; retained the panic hook's direct stderr banner because it is process-abort reporting, not normal logging. |
 | 29 | Decide `carrick-engine` fate | deferred | Product/API decision; current implementation appears to be growing the engine. |
 | 30 | Consider slot reuse for `NEXT_SLOT` in `guest_cpu.rs` | done | Audited lifecycle: slot reuse is intentionally avoided because departed slots still contribute to total CPU time and TLS-destructor reuse would complicate fork reset semantics; overflow shares the last atomic slot without losing total accounting. |
