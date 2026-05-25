@@ -44,14 +44,18 @@ impl SyscallDispatcher {
         *self.creds.lock()
     }
 
-    pub(super) fn capget<M: GuestMemory>(
-        &self,
-        ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let header_address = ctx.arg(0);
-        let data_address = ctx.arg(1);
-        let memory = &mut *ctx.memory;
-        let header = match read_capability_header(memory, header_address) {
+    pub(super) fn getpid(&self) -> DispatchOutcome {
+        DispatchOutcome::Returned {
+            value: std::process::id() as i64,
+        }
+    }
+}
+
+impl SyscallDispatcher {
+define_syscall! {
+    fn capget(this, cx, header_address: GuestPtr, data_address: GuestPtr) {
+        let memory = &mut *cx.memory;
+        let header = match read_capability_header(memory, header_address.0) {
             Ok(header) => header,
             Err(errno) => return Ok(errno.into()),
         };
@@ -61,13 +65,13 @@ impl SyscallDispatcher {
         if header.pid < 0 {
             return Ok(LINUX_ESRCH.into());
         }
-        if data_address == 0 {
+        if data_address.0 == 0 {
             return Ok(DispatchOutcome::Returned { value: 0 });
         }
         let words = linux_capability_data_words(header.version);
         let empty = vec![LinuxCapabilityData::empty(); words];
         if memory
-            .write_bytes(data_address, capability_data_bytes(&empty).as_slice())
+            .write_bytes(data_address.0, capability_data_bytes(&empty).as_slice())
             .is_err()
         {
             return Ok(LINUX_EFAULT.into());
@@ -75,14 +79,9 @@ impl SyscallDispatcher {
         Ok(DispatchOutcome::Returned { value: 0 })
     }
 
-    pub(super) fn capset<M: GuestMemory>(
-        &self,
-        ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let header_address = ctx.arg(0);
-        let data_address = ctx.arg(1);
-        let memory = &*ctx.memory;
-        let header = match read_capability_header(memory, header_address) {
+    fn capset(this, cx, header_address: GuestPtr, data_address: GuestPtr) {
+        let memory = &*cx.memory;
+        let header = match read_capability_header(memory, header_address.0) {
             Ok(header) => header,
             Err(errno) => return Ok(errno.into()),
         };
@@ -93,7 +92,7 @@ impl SyscallDispatcher {
             return Ok(LINUX_ESRCH.into());
         }
         let words = linux_capability_data_words(header.version);
-        let data = match read_capability_data(memory, data_address, words) {
+        let data = match read_capability_data(memory, data_address.0, words) {
             Ok(data) => data,
             Err(errno) => return Ok(errno.into()),
         };
@@ -103,18 +102,9 @@ impl SyscallDispatcher {
         Ok(DispatchOutcome::Returned { value: 0 })
     }
 
-    pub(super) fn getpid(&self) -> DispatchOutcome {
-        DispatchOutcome::Returned {
-            value: std::process::id() as i64,
-        }
-    }
-
-    pub(super) fn umask<M: GuestMemory>(
-        &self,
-        ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let new = ctx.arg(0) as u32 & 0o777;
-        let mut creds = self.creds.lock();
+    fn umask(this, cx, new: u64) {
+        let new = new as u32 & 0o777;
+        let mut creds = this.creds.lock();
         let previous = creds.umask;
         creds.umask = new;
         Ok(DispatchOutcome::Returned {
@@ -122,51 +112,29 @@ impl SyscallDispatcher {
         })
     }
 
-    pub(super) fn setpriority<M: GuestMemory>(
-        &self,
-        ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let which = ctx.arg(0);
-        let who = ctx.arg(1) as i32;
-        let prio = ctx.arg(2) as i32;
+    fn setpriority(this, cx, which: u64, who: Pid, prio: u64) {
+        let prio = prio as i32;
         if which > LINUX_PRIO_USER || !(-20..=19).contains(&prio) {
             return Ok(LINUX_EINVAL.into());
         }
-        if which == LINUX_PRIO_PROCESS && who != 0 && who != LINUX_BOOTSTRAP_PID as i32 {
+        if which == LINUX_PRIO_PROCESS && who.0 != 0 && who.0 != LINUX_BOOTSTRAP_PID as i32 {
             return Ok(LINUX_ESRCH.into());
         }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
 
-    pub(super) fn getpriority<M: GuestMemory>(
-        &self,
-        ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let which = ctx.arg(0);
-        let who = ctx.arg(1) as i32;
+    fn getpriority(this, cx, which: u64, who: Pid) {
         if which > LINUX_PRIO_USER {
             return Ok(LINUX_EINVAL.into());
         }
-        if which == LINUX_PRIO_PROCESS && who != 0 && who != LINUX_BOOTSTRAP_PID as i32 {
+        if which == LINUX_PRIO_PROCESS && who.0 != 0 && who.0 != LINUX_BOOTSTRAP_PID as i32 {
             return Ok(LINUX_ESRCH.into());
         }
-        // Linux returns 20 - nice. Default nice is 0 → return 20. This is a
-        // bootstrap value; we don't model per-process priority.
         Ok(DispatchOutcome::Returned { value: 20 })
     }
 
-    /// `setresuid(ruid, euid, suid)`. -1 means "don't change". We record
-    /// the new values; the guest gets to see them via getuid/geteuid/
-    /// getresuid. Always succeeds — we're single-identity and tools
-    /// can pretend to drop privileges as they like.
-    pub(super) fn setresuid<M: GuestMemory>(
-        &self,
-        ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let r = ctx.arg(0);
-        let e = ctx.arg(1);
-        let s = ctx.arg(2);
-        let mut creds = self.creds.lock();
+    fn setresuid(this, cx, r: u64, e: u64, s: u64) {
+        let mut creds = this.creds.lock();
         if r as i64 != -1 {
             creds.ruid = r as u32;
         }
@@ -179,14 +147,8 @@ impl SyscallDispatcher {
         Ok(DispatchOutcome::Returned { value: 0 })
     }
 
-    pub(super) fn setresgid<M: GuestMemory>(
-        &self,
-        ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let r = ctx.arg(0);
-        let e = ctx.arg(1);
-        let s = ctx.arg(2);
-        let mut creds = self.creds.lock();
+    fn setresgid(this, cx, r: u64, e: u64, s: u64) {
+        let mut creds = this.creds.lock();
         if r as i64 != -1 {
             creds.rgid = r as u32;
         }
@@ -199,14 +161,8 @@ impl SyscallDispatcher {
         Ok(DispatchOutcome::Returned { value: 0 })
     }
 
-    /// `setreuid(ruid, euid)`: same as setresuid with suid=-1.
-    pub(super) fn setreuid<M: GuestMemory>(
-        &self,
-        ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let r = ctx.arg(0);
-        let e = ctx.arg(1);
-        let mut creds = self.creds.lock();
+    fn setreuid(this, cx, r: u64, e: u64) {
+        let mut creds = this.creds.lock();
         if r as i64 != -1 {
             creds.ruid = r as u32;
         }
@@ -216,13 +172,8 @@ impl SyscallDispatcher {
         Ok(DispatchOutcome::Returned { value: 0 })
     }
 
-    pub(super) fn setregid<M: GuestMemory>(
-        &self,
-        ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let r = ctx.arg(0);
-        let e = ctx.arg(1);
-        let mut creds = self.creds.lock();
+    fn setregid(this, cx, r: u64, e: u64) {
+        let mut creds = this.creds.lock();
         if r as i64 != -1 {
             creds.rgid = r as u32;
         }
@@ -232,196 +183,135 @@ impl SyscallDispatcher {
         Ok(DispatchOutcome::Returned { value: 0 })
     }
 
-    /// `setuid(uid)`: set effective uid and (if currently privileged)
-    /// real + saved too. We always treat the caller as privileged so
-    /// all three move together — matches what apt expects.
-    pub(super) fn setuid<M: GuestMemory>(
-        &self,
-        ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let u = ctx.arg(0) as u32;
-        let mut creds = self.creds.lock();
+    fn setuid(this, cx, u: u64) {
+        let u = u as u32;
+        let mut creds = this.creds.lock();
         creds.ruid = u;
         creds.euid = u;
         creds.suid = u;
         Ok(DispatchOutcome::Returned { value: 0 })
     }
 
-    pub(super) fn setgid<M: GuestMemory>(
-        &self,
-        ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let g = ctx.arg(0) as u32;
-        let mut creds = self.creds.lock();
+    fn setgid(this, cx, g: u64) {
+        let g = g as u32;
+        let mut creds = this.creds.lock();
         creds.rgid = g;
         creds.egid = g;
         creds.sgid = g;
         Ok(DispatchOutcome::Returned { value: 0 })
     }
 
-    /// `getresuid(*ruid, *euid, *suid)` — write our tracked tuple.
-    pub(super) fn getresuid<M: GuestMemory>(
-        &self,
-        ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let creds = self.cred_snapshot();
-        for (i, value) in [creds.ruid, creds.euid, creds.suid].iter().enumerate() {
-            let ptr = ctx.arg(i);
-            if ptr == 0 {
+    fn getresuid(this, cx, ruid_ptr: GuestPtr, euid_ptr: GuestPtr, suid_ptr: GuestPtr) {
+        let creds = this.cred_snapshot();
+        for (ptr, value) in [
+            (ruid_ptr, creds.ruid),
+            (euid_ptr, creds.euid),
+            (suid_ptr, creds.suid),
+        ] {
+            if ptr.0 == 0 {
                 continue;
             }
-            if ctx.memory.write_bytes(ptr, &value.to_le_bytes()).is_err() {
+            if cx.memory.write_bytes(ptr.0, &value.to_le_bytes()).is_err() {
                 return Ok(LINUX_EFAULT.into());
             }
         }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
 
-    pub(super) fn getresgid<M: GuestMemory>(
-        &self,
-        ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let creds = self.cred_snapshot();
-        for (i, value) in [creds.rgid, creds.egid, creds.sgid].iter().enumerate() {
-            let ptr = ctx.arg(i);
-            if ptr == 0 {
+    fn getresgid(this, cx, rgid_ptr: GuestPtr, egid_ptr: GuestPtr, sgid_ptr: GuestPtr) {
+        let creds = this.cred_snapshot();
+        for (ptr, value) in [
+            (rgid_ptr, creds.rgid),
+            (egid_ptr, creds.egid),
+            (sgid_ptr, creds.sgid),
+        ] {
+            if ptr.0 == 0 {
                 continue;
             }
-            if ctx.memory.write_bytes(ptr, &value.to_le_bytes()).is_err() {
+            if cx.memory.write_bytes(ptr.0, &value.to_le_bytes()).is_err() {
                 return Ok(LINUX_EFAULT.into());
             }
         }
         Ok(DispatchOutcome::Returned { value: 0 })
     }
 
-    /// `getgroups(size, *list)`. Linux returns the number of
-    /// supplementary groups; the carrick guest runs as root (uid/gid 0)
-    /// and belongs to the single supplementary group gid 0, matching a
-    /// fresh root shell in the container. With `size == 0` we report the
-    /// count (1) without touching `list`; otherwise we write the one
-    /// gid_t to the guest buffer and return the number written.
-    pub(super) fn getgroups<M: GuestMemory>(
-        &self,
-        ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        // `size` is a Linux `int`; a negative value is invalid.
-        let size = ctx.arg(0) as i32;
+    fn getgroups(this, cx, size: u64, list: GuestPtr) {
+        let size = size as i32;
         if size < 0 {
             return Ok(LINUX_EINVAL.into());
         }
-        // Query mode: report the count without writing.
         if size == 0 {
             return Ok(DispatchOutcome::Returned { value: 1 });
         }
-        // The buffer is too small to hold the supplementary group list.
         if size < 1 {
             return Ok(LINUX_EINVAL.into());
         }
-        // Write the single supplementary group (gid 0) as a little-endian
-        // gid_t (u32, 4 bytes).
-        let list = ctx.arg(1);
-        let gid: u32 = 0;
-        if ctx.memory.write_bytes(list, &gid.to_le_bytes()).is_err() {
+        if cx.memory.write_bytes(list.0, &0u32.to_le_bytes()).is_err() {
             return Ok(LINUX_EFAULT.into());
         }
         Ok(DispatchOutcome::Returned { value: 1 })
     }
 
-    pub(super) fn sys_setfsuid<M: GuestMemory>(
-        &self,
-        _ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let creds = self.cred_snapshot();
+    fn sys_setfsuid(this, cx, _uid: u64) {
+        let creds = this.cred_snapshot();
         Ok(DispatchOutcome::Returned {
             value: i64::from(creds.euid),
         })
     }
 
-    pub(super) fn sys_setfsgid<M: GuestMemory>(
-        &self,
-        _ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let creds = self.cred_snapshot();
+    fn sys_setfsgid(this, cx, _gid: u64) {
+        let creds = this.cred_snapshot();
         Ok(DispatchOutcome::Returned {
             value: i64::from(creds.egid),
         })
     }
 
-    pub(super) fn sys_setgroups<M: GuestMemory>(
-        &self,
-        _ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
+    fn sys_setgroups(this, cx, _size: u64, _list: GuestPtr) {
         Ok(DispatchOutcome::Returned { value: 0 })
     }
 
-    pub(super) fn sys_getpid<M: GuestMemory>(
-        &self,
-        _ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        Ok(self.getpid())
+    fn sys_getpid(this, cx) {
+        Ok(this.getpid())
     }
 
-    pub(super) fn sys_getppid<M: GuestMemory>(
-        &self,
-        _ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        // getpid() reports the real host pid, and carrick forks each guest
-        // process as a real host child, so the host process tree mirrors the
-        // guest tree. The root guest process reports the stable bootstrap
-        // parent (init) rather than leaking carrick's non-deterministic host
-        // launcher pid; a forked child reports its real host parent, which IS
-        // its parent guest process. Returning a hardcoded 1 here made every
-        // forked child look reparented-to-init — tripping LTP's tst_test
-        // heartbeat ("Main test process might have exit!").
-        let bootstrap_host_pid = self.proc.lock().bootstrap_host_pid;
+    fn sys_getppid(this, cx) {
+        let bootstrap_host_pid = this.proc.lock().bootstrap_host_pid;
         let value = if std::process::id() == bootstrap_host_pid {
             LINUX_BOOTSTRAP_PID as i64
         } else {
-            // SAFETY: getppid(2) is always successful and has no side effects.
             unsafe { libc::getppid() as i64 }
         };
         Ok(DispatchOutcome::Returned { value })
     }
 
-    pub(super) fn sys_getuid<M: GuestMemory>(
-        &self,
-        _ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let creds = self.cred_snapshot();
+    fn sys_getuid(this, cx) {
+        let creds = this.cred_snapshot();
         Ok(DispatchOutcome::Returned {
             value: i64::from(creds.ruid),
         })
     }
 
-    pub(super) fn sys_geteuid<M: GuestMemory>(
-        &self,
-        _ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let creds = self.cred_snapshot();
+    fn sys_geteuid(this, cx) {
+        let creds = this.cred_snapshot();
         Ok(DispatchOutcome::Returned {
             value: i64::from(creds.euid),
         })
     }
 
-    pub(super) fn sys_getgid<M: GuestMemory>(
-        &self,
-        _ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let creds = self.cred_snapshot();
+    fn sys_getgid(this, cx) {
+        let creds = this.cred_snapshot();
         Ok(DispatchOutcome::Returned {
             value: i64::from(creds.rgid),
         })
     }
 
-    pub(super) fn sys_getegid<M: GuestMemory>(
-        &self,
-        _ctx: &mut SyscallCtx<M>,
-    ) -> Result<DispatchOutcome, DispatchError> {
-        let creds = self.cred_snapshot();
+    fn sys_getegid(this, cx) {
+        let creds = this.cred_snapshot();
         Ok(DispatchOutcome::Returned {
             value: i64::from(creds.egid),
         })
     }
+}
 }
 
 fn read_capability_header(
