@@ -250,6 +250,15 @@ pub trait Vfs: Send + Sync {
     }
 
     /// Human-readable name for diagnostics / `--fs` reporting.
+    /// Read an entire file's bytes by absolute guest path. Used by the initial
+    /// ELF exec loader (`read_exec_file`), which runs before the guest has any
+    /// fds and so cannot go through the normal `open`/`read` fd path. Default:
+    /// unsupported (only backends that can serve an executable — e.g. a `-v`
+    /// bind mount — implement it).
+    fn read_file(&self, _path: &str) -> Result<Vec<u8>, VfsError> {
+        Err(crate::linux_abi::LINUX_ENOSYS)
+    }
+
     fn name(&self) -> &'static str {
         "vfs"
     }
