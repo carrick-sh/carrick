@@ -34,9 +34,10 @@ static CONFORMANCE_LOCK: Mutex<()> = Mutex::new(());
 /// A divergence in one of these is treated as an expected-fail (the suite
 /// stays green), but if a known-gap probe unexpectedly PASSES, the test
 /// FAILS so we remove it from this list — that's the signal the gap was
-/// fixed. Each entry must cite the gap. (Empty: the former "memmap" gap —
-/// MAP_SHARED file coherence — is now fixed via real host-file-backed
-/// stage-2 mappings.)
+/// fixed. Each entry must cite the gap. Empty: the former "memmap" gap —
+/// MAP_SHARED file coherence — is fixed via real host-file-backed stage-2
+/// mappings, and the fork/process, rootfs metadata, and exec-vDSO probe gaps
+/// are covered by the full probe suite.
 const KNOWN_PROBE_GAPS: &[&str] = &[];
 use std::time::{Duration, Instant};
 
@@ -126,8 +127,20 @@ const CASES: &[Case] = &[
     },
 ];
 
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("carrick-cli lives under crates/carrick-cli")
+        .to_path_buf()
+}
+
+fn repo_path(path: &str) -> PathBuf {
+    repo_root().join(path)
+}
+
 fn carrick_bin() -> Option<PathBuf> {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/release/carrick");
+    let p = repo_path("target/release/carrick");
     p.exists().then_some(p)
 }
 
@@ -136,7 +149,7 @@ fn carrick_bin() -> Option<PathBuf> {
 /// HV_DENIED (0xfae94007) — the dominant source of conformance "flakiness".
 /// Signing in setup guarantees the harness never tests an unsigned build.
 fn ensure_signed(bin: &PathBuf) {
-    let plist = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/entitlements.plist");
+    let plist = repo_path("scripts/entitlements.plist");
     let _ = Command::new("codesign")
         .args(["--force", "--sign", "-", "--entitlements"])
         .arg(&plist)
@@ -160,12 +173,8 @@ fn normalize(s: &str) -> String {
 /// case's leak can't make the next flaky. Best-effort (needs the project's
 /// NOPASSWD sudo path); ignored if unavailable.
 fn sweep_wedged_guests() {
-    let _ = Command::new("sudo")
-        .args([
-            "-n",
-            concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/sudo/kill.sh"),
-        ])
-        .output();
+    let kill_script = repo_path("scripts/sudo/kill.sh");
+    let _ = Command::new("sudo").args(["-n"]).arg(kill_script).output();
 }
 
 fn run_carrick(bin: &PathBuf, snippet: &str) -> String {
@@ -192,12 +201,8 @@ fn run_carrick(bin: &PathBuf, snippet: &str) -> String {
                     // Kill the process group, then sweep any reparented wedged
                     // guest procs so the next case starts clean.
                     unsafe { libc::kill(-pid, libc::SIGKILL) };
-                    let _ = Command::new("sudo")
-                        .args([
-                            "-n",
-                            concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/sudo/kill.sh"),
-                        ])
-                        .output();
+                    let kill_script = repo_path("scripts/sudo/kill.sh");
+                    let _ = Command::new("sudo").args(["-n"]).arg(kill_script).output();
                     return true;
                 }
                 std::thread::sleep(Duration::from_millis(200));
@@ -373,8 +378,7 @@ const PROBE_SNIPPET: &str = "base64 -d > /tmp/p && chmod +x /tmp/p && /tmp/p";
 
 /// Directory holding the compiled probe executables, if built.
 fn probes_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("conformance-probes/target/aarch64-unknown-linux-musl/release")
+    repo_path("conformance-probes/target/aarch64-unknown-linux-musl/release")
 }
 
 /// Enumerate probe executables in `probes_dir()`: top-level files only, no
@@ -446,12 +450,8 @@ fn run_carrick_probe(bin: &PathBuf, stdin_bytes: &[u8]) -> String {
             while !done.load(Ordering::Relaxed) {
                 if start.elapsed() > CASE_DEADLINE {
                     unsafe { libc::kill(-pid, libc::SIGKILL) };
-                    let _ = Command::new("sudo")
-                        .args([
-                            "-n",
-                            concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/sudo/kill.sh"),
-                        ])
-                        .output();
+                    let kill_script = repo_path("scripts/sudo/kill.sh");
+                    let _ = Command::new("sudo").args(["-n"]).arg(kill_script).output();
                     return true;
                 }
                 std::thread::sleep(Duration::from_millis(200));
@@ -654,13 +654,14 @@ fn conformance_go_fixture() {
 
     ensure_signed(&bin);
 
-    let output = std::process::Command::new("scripts/build-go-fixtures.sh")
+    let output = std::process::Command::new(repo_path("scripts/build-go-fixtures.sh"))
+        .current_dir(repo_root())
         .output()
         .unwrap();
     assert!(output.status.success(), "Go fixture build failed");
 
-    let go_artifact = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("fixtures/go-aarch64-hello/target/release/carrick-linux-aarch64-go-hello");
+    let go_artifact =
+        repo_path("fixtures/go-aarch64-hello/target/release/carrick-linux-aarch64-go-hello");
 
     let raw = std::fs::read(&go_artifact).expect("read Go binary");
     let engine = base64::engine::general_purpose::STANDARD;
