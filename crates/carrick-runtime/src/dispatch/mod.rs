@@ -993,6 +993,27 @@ fn make_readiness_pipe() -> Option<(std::os::fd::RawFd, std::os::fd::RawFd)> {
     Some((read_fd, write_fd))
 }
 
+/// Normalize an already-absolute (leading-`/`) guest path: collapse `//`,
+/// drop `.` components, and resolve `..` lexically (Linux `/proc/self/exe`
+/// stores a resolved absolute path). Always returns a leading-`/` path.
+fn normalize_abs_path(path: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for comp in path.split('/') {
+        match comp {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            c => out.push(c),
+        }
+    }
+    if out.is_empty() {
+        "/".to_owned()
+    } else {
+        format!("/{}", out.join("/"))
+    }
+}
+
 #[derive(Debug)]
 struct TimerFdState {
     inner: Mutex<TimerFdInner>,
@@ -1691,9 +1712,23 @@ impl SyscallDispatcher {
 
     pub fn set_executable_identity(&self, path: impl Into<String>, argv: Vec<String>) {
         let path = path.into();
+        // `/proc/self/exe` MUST resolve to an absolute path: the Linux kernel
+        // always stores the absolute, resolved executable path regardless of how
+        // execve was called. glibc's dynamic loader asserts this
+        // (`_dl_get_origin`: `linkval[0] == '/'`) and aborts the process if the
+        // readlink result is relative — which is exactly what happens when a
+        // program execs itself by a RELATIVE path (e.g. Go's os/exec
+        // TestCommandRelativeName). Absolutize a relative execve path against the
+        // guest cwd so the stored identity matches kernel semantics.
+        let abs = if path.starts_with('/') {
+            normalize_abs_path(&path)
+        } else {
+            let cwd = self.cwd();
+            normalize_abs_path(&format!("{}/{}", cwd.trim_end_matches('/'), path))
+        };
         let mut proc = self.proc.lock();
-        proc.executable_path = path.clone();
-        proc.argv = if argv.is_empty() { vec![path] } else { argv };
+        proc.executable_path = abs.clone();
+        proc.argv = if argv.is_empty() { vec![abs] } else { argv };
     }
 
     /// Name of the currently-installed backend (for logging / debug).
