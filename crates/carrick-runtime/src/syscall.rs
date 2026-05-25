@@ -1,3 +1,6 @@
+//! Static AArch64 syscall metadata used for dispatch grouping, coverage
+//! reporting, and compatibility summaries.
+
 use serde::Serialize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

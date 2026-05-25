@@ -1,3 +1,9 @@
+//! Carrick runtime crate.
+//!
+//! This crate hosts the Linux ABI translation layer, guest address-space
+//! management, syscall dispatcher, rootfs/VFS support, signal/thread handling,
+//! and HVF trap engine used by the CLI and engine crates.
+
 #[cfg(target_os = "macos")]
 pub mod apfs;
 pub mod compat;
@@ -39,4 +45,3 @@ pub mod vdso;
 pub mod vfs;
 pub mod execute;
 pub use execute::Runtime;
-

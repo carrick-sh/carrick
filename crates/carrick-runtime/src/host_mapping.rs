@@ -1,3 +1,5 @@
+//! RAII ownership for host mmap regions that back HVF guest mappings.
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HostMappingKind {
     PrivateAnon,

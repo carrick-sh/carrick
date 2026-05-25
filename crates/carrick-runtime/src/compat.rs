@@ -1,3 +1,6 @@
+//! Compatibility reporting primitives for syscall coverage, unknown flags,
+//! partial implementations, and runtime diagnostics.
+
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};

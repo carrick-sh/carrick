@@ -1,3 +1,6 @@
+//! OCI image resolution and layer-fetching support used by the CLI and
+//! engine crates.
+
 use std::env;
 use std::path::{Path, PathBuf};
 
