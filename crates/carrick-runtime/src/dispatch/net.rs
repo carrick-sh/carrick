@@ -161,16 +161,7 @@ impl SyscallDispatcher {
         let Some(open_file) = self.open_file(fd) else {
             return 0;
         };
-        match &*open_file.description.read() {
-            OpenDescription::HostSocket { status_flags, .. }
-            | OpenDescription::HostPipe { status_flags, .. }
-            | OpenDescription::HostFile { status_flags, .. }
-            | OpenDescription::PipeReader { status_flags, .. }
-            | OpenDescription::PipeWriter { status_flags, .. }
-            | OpenDescription::File { status_flags, .. }
-            | OpenDescription::Netlink { status_flags, .. } => *status_flags,
-            _ => 0,
-        }
+        open_file.description.read().status_flags()
     }
 
     /// THE single chokepoint for blocking-mode host I/O — every recv/send/
@@ -413,7 +404,7 @@ impl SyscallDispatcher {
                 pid: 0,
                 groups: 0,
                 recv_queue: VecDeque::new(),
-                status_flags,
+                base: OpenDescriptionBase::new(status_flags),
             },
             fd_flags,
         )
@@ -446,7 +437,7 @@ impl SyscallDispatcher {
                 host_fd,
                 family,
                 type_: base_type,
-                status_flags,
+                base: OpenDescriptionBase::new(status_flags),
             })),
             fd_flags,
             host_fd,
@@ -622,7 +613,7 @@ impl SyscallDispatcher {
                 host_fd: new_host,
                 family,
                 type_,
-                status_flags,
+                base: OpenDescriptionBase::new(status_flags),
             })),
             fd_flags,
             new_host,
@@ -1633,7 +1624,7 @@ define_syscall! {
         let description = OpenDescription::EventFd {
             state: Arc::new(EventFdState::new(initial_value)),
             semaphore: flags & LINUX_EFD_SEMAPHORE != 0,
-            status_flags: flags & LINUX_EFD_NONBLOCK,
+            base: OpenDescriptionBase::new(flags & LINUX_EFD_NONBLOCK),
         };
         Ok(this.install_fd(description, linux_fd_flags_from_open_flags(flags)))
     
@@ -1657,7 +1648,7 @@ define_syscall! {
         )]);
         let description = OpenDescription::Epoll {
             interest: HashMap::new(),
-            status_flags: 0,
+            base: OpenDescriptionBase::new(0),
             pending_ready: VecDeque::new(),
             kqueue: Arc::new(crate::dispatch::EpollKqueue::new(kqueue)),
         };
@@ -2487,7 +2478,7 @@ define_syscall! {
                 host_fd: host_fds[0],
                 family,
                 type_: base_type,
-                status_flags,
+                base: OpenDescriptionBase::new(status_flags),
             })),
             fd_flags,
             host_fds[0],
@@ -2497,7 +2488,7 @@ define_syscall! {
                 host_fd: host_fds[1],
                 family,
                 type_: base_type,
-                status_flags,
+                base: OpenDescriptionBase::new(status_flags),
             })),
             fd_flags,
             host_fds[1],

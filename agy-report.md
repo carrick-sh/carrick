@@ -422,6 +422,10 @@ The DAC (discretionary access control) check lives in `dispatch/mod.rs` — shou
 | `rg -n "notify_inmem_epoll\\(" crates/carrick-runtime/src/dispatch -g '*.rs'` | done | Shows the O(n) broadcast is now only the `write_eventfd` fallback; eventfd readiness has a host pipe watched by epoll kqueues via `EVFILT_READ`. |
 | `cargo test -p carrick-runtime --test integration epoll_reports_eventfd_readiness_with_packed_events -- --nocapture` | done | Verifies eventfd readiness is visible through epoll. |
 | `cargo test -p carrick-runtime --test integration epoll_edge_triggered_eventfd_reports_only_new_readiness -- --nocapture` | done | Verifies eventfd edge-triggered epoll readiness still reports only new readiness transitions. |
+| `cargo check -p carrick-runtime` | done | Verifies the `OpenDescriptionBase` status-flag extraction compiles across runtime dispatch modules. |
+| `cargo test -p carrick-runtime --test integration fcntl_gets_and_sets_descriptor_and_status_flags -- --nocapture` | done | Verifies descriptor flags and open-description status flags still round-trip through `fcntl`. |
+| `cargo test -p carrick-runtime --test integration fionbio_updates_pipe_status_flags_and_host_nonblocking_mode -- --nocapture` | done | Verifies `FIONBIO` still updates Linux-visible status flags and host nonblocking mode. |
+| `cargo test -p carrick-runtime --lib host_socket_install_forces_host_nonblocking_even_for_blocking_guest_fd -- --nocapture` | done | Verifies socket status flags preserve guest blocking mode while host fds stay nonblocking. |
 
 ### Tier 1
 
@@ -443,7 +447,7 @@ The DAC (discretionary access control) check lives in `dispatch/mod.rs` — shou
 | 9 | Split `trap.rs` | open | Structural refactor; avoid until runtime loop work is stable. |
 | 10 | Split `dispatch/net.rs` | open | Structural refactor. |
 | 11 | Split `main.rs` into command modules | open | Structural refactor. |
-| 12 | Extract `OpenDescription` status flags | open | Behavior-preserving refactor with high call-site count. |
+| 12 | Extract `OpenDescription` status flags | done | Added shared `OpenDescriptionBase` carrying `status_flags`; all `OpenDescription` variants now embed the base and use common `status_flags` / `set_status_flags` accessors. |
 | 13 | Consolidate stat/statx writers | done | Current code already routes metadata, real-stat, fd-stat, and synthetic-stat cases through `StatRecord`, `write_stat_record`, and `write_statx_record`; focused stat/statx agreement tests pass. |
 | 14 | Unify `gzip_tar` test helper | done | Added `carrick-test-support` with shared `gzip_tar`, `gzip_tar_with_modes`, and `gzip_tar_with_links`; runtime support and CLI tests now import it instead of carrying local copies. |
 | 15 | Parameterize `linux_fixture.rs` tests | done | Collapsed repeated static fixture metadata/load-plan assertions into one fixture table and loop while preserving the special ET_EXEC and PIE checks. |

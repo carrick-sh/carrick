@@ -1051,42 +1051,61 @@ struct TimerFdInner {
 }
 
 #[derive(Debug, Clone)]
+struct OpenDescriptionBase {
+    status_flags: u64,
+}
+
+impl OpenDescriptionBase {
+    fn new(status_flags: u64) -> Self {
+        Self { status_flags }
+    }
+
+    fn status_flags(&self) -> u64 {
+        self.status_flags
+    }
+
+    fn set_status_flags(&mut self, next: u64) {
+        self.status_flags = next;
+    }
+}
+
+#[derive(Debug, Clone)]
 enum OpenDescription {
     File {
+        base: OpenDescriptionBase,
         path: String,
         metadata: RootFsMetadata,
         contents: Vec<u8>,
         offset: usize,
-        status_flags: u64,
         /// True iff this fd targets the writable overlay. Writes
         /// to a writable=false File are still RO (return EROFS).
         writable: bool,
     },
     Directory {
+        base: OpenDescriptionBase,
         path: String,
         metadata: RootFsMetadata,
         entries: Vec<RootFsDirEntry>,
         offset: usize,
-        status_flags: u64,
     },
     SyntheticFile {
+        base: OpenDescriptionBase,
         path: String,
         contents: Vec<u8>,
         offset: usize,
-        status_flags: u64,
     },
     EventFd {
+        base: OpenDescriptionBase,
         state: Arc<EventFdState>,
         semaphore: bool,
-        status_flags: u64,
     },
     TimerFd {
+        base: OpenDescriptionBase,
         state: Arc<TimerFdState>,
-        status_flags: u64,
     },
     Epoll {
+        base: OpenDescriptionBase,
         interest: HashMap<i32, EpollInterest>,
-        status_flags: u64,
         /// Ready events already observed from the backing kqueue or synthetic
         /// readiness paths but not yet returned to the guest because the last
         /// `epoll_wait` hit `maxevents`. Linux leaves those events queued for
@@ -1112,9 +1131,9 @@ enum OpenDescription {
     /// rather than carrick bookkeeping. `host_pid` is the macOS pid (guest pids
     /// mirror host pids in carrick). Used by Go 1.24's `os/exec`.
     Pidfd {
+        base: OpenDescriptionBase,
         host_pid: i32,
         kqueue: Arc<crate::darwin_kqueue::Kqueue>,
-        status_flags: u64,
     },
     // In-memory pipe ends. Currently `pipe2(2)` routes through `HostPipe`
     // (real macOS kernel pipe) so these are not constructed today, but the
@@ -1122,17 +1141,23 @@ enum OpenDescription {
     // is kept wired as the portable, host-fd-free pipe model and is matched
     // throughout the fd handlers. Retained as deliberate API surface.
     #[allow(dead_code)]
-    PipeReader { pipe: PipeRef, status_flags: u64 },
+    PipeReader {
+        base: OpenDescriptionBase,
+        pipe: PipeRef,
+    },
     #[allow(dead_code)]
-    PipeWriter { pipe: PipeRef, status_flags: u64 },
+    PipeWriter {
+        base: OpenDescriptionBase,
+        pipe: PipeRef,
+    },
     /// Host kernel pipe end backed by a real macOS file descriptor.
     /// Survives `libc::fork(2)` natively — both parent and child see
     /// the same kernel pipe object, so the post-fork sh-pipe demo
     /// can actually carry data across the carrick process boundary.
     HostPipe {
+        base: OpenDescriptionBase,
         host_fd: i32,
         is_read_end: bool,
-        status_flags: u64,
         /// `Some` iff this fd is a pty master/slave end. Data I/O is
         /// identical to a plain host pipe; this only changes ioctl
         /// handling and close cleanup. `None` for ordinary host pipes,
@@ -1145,10 +1170,10 @@ enum OpenDescription {
     /// subsequent socket syscalls (sockaddr translation, getsockopt
     /// SO_TYPE, etc.) can answer in Linux terms.
     HostSocket {
+        base: OpenDescriptionBase,
         host_fd: i32,
         family: i32,
         type_: i32,
-        status_flags: u64,
     },
     /// A regular file backed by a REAL macOS file descriptor into the
     /// `--fs host` overlay scratch. Unlike `File` (which caches bytes
@@ -1158,9 +1183,9 @@ enum OpenDescription {
     /// patterns work. read/write/lseek/fstat/mmap operate directly on
     /// `host_fd`; the kernel owns the offset.
     HostFile {
+        base: OpenDescriptionBase,
         host_fd: i32,
         metadata: RootFsMetadata,
-        status_flags: u64,
         writable: bool,
     },
     /// Synthetic AF_NETLINK socket. macOS has no AF_NETLINK, so we can't
@@ -1172,6 +1197,7 @@ enum OpenDescription {
     /// synthetic response into `recv_queue` that the next recvmsg/recvfrom
     /// drains, terminated by NLMSG_DONE.
     Netlink {
+        base: OpenDescriptionBase,
         #[allow(dead_code)]
         protocol: i32,
         /// Netlink "port id" the socket is bound to (0 until bind picks one).
@@ -1180,7 +1206,6 @@ enum OpenDescription {
         groups: u32,
         /// Bytes queued by a dump request, drained by recvmsg/recvfrom.
         recv_queue: VecDeque<u8>,
-        status_flags: u64,
     },
 }
 
@@ -1338,40 +1363,48 @@ enum OpenStatSource {
 }
 
 impl OpenDescription {
-    fn status_flags(&self) -> u64 {
+    fn base(&self) -> &OpenDescriptionBase {
         match self {
-            OpenDescription::File { status_flags, .. }
-            | OpenDescription::Directory { status_flags, .. }
-            | OpenDescription::SyntheticFile { status_flags, .. }
-            | OpenDescription::EventFd { status_flags, .. }
-            | OpenDescription::TimerFd { status_flags, .. }
-            | OpenDescription::Epoll { status_flags, .. }
-            | OpenDescription::Pidfd { status_flags, .. }
-            | OpenDescription::PipeReader { status_flags, .. }
-            | OpenDescription::PipeWriter { status_flags, .. }
-            | OpenDescription::HostPipe { status_flags, .. }
-            | OpenDescription::HostFile { status_flags, .. }
-            | OpenDescription::HostSocket { status_flags, .. }
-            | OpenDescription::Netlink { status_flags, .. } => *status_flags,
+            OpenDescription::File { base, .. }
+            | OpenDescription::Directory { base, .. }
+            | OpenDescription::SyntheticFile { base, .. }
+            | OpenDescription::EventFd { base, .. }
+            | OpenDescription::TimerFd { base, .. }
+            | OpenDescription::Epoll { base, .. }
+            | OpenDescription::Pidfd { base, .. }
+            | OpenDescription::PipeReader { base, .. }
+            | OpenDescription::PipeWriter { base, .. }
+            | OpenDescription::HostPipe { base, .. }
+            | OpenDescription::HostFile { base, .. }
+            | OpenDescription::HostSocket { base, .. }
+            | OpenDescription::Netlink { base, .. } => base,
         }
     }
 
-    fn set_status_flags(&mut self, next: u64) {
+    fn base_mut(&mut self) -> &mut OpenDescriptionBase {
         match self {
-            OpenDescription::File { status_flags, .. }
-            | OpenDescription::Directory { status_flags, .. }
-            | OpenDescription::SyntheticFile { status_flags, .. }
-            | OpenDescription::EventFd { status_flags, .. }
-            | OpenDescription::TimerFd { status_flags, .. }
-            | OpenDescription::Epoll { status_flags, .. }
-            | OpenDescription::Pidfd { status_flags, .. }
-            | OpenDescription::PipeReader { status_flags, .. }
-            | OpenDescription::PipeWriter { status_flags, .. }
-            | OpenDescription::HostPipe { status_flags, .. }
-            | OpenDescription::HostFile { status_flags, .. }
-            | OpenDescription::HostSocket { status_flags, .. }
-            | OpenDescription::Netlink { status_flags, .. } => *status_flags = next,
+            OpenDescription::File { base, .. }
+            | OpenDescription::Directory { base, .. }
+            | OpenDescription::SyntheticFile { base, .. }
+            | OpenDescription::EventFd { base, .. }
+            | OpenDescription::TimerFd { base, .. }
+            | OpenDescription::Epoll { base, .. }
+            | OpenDescription::Pidfd { base, .. }
+            | OpenDescription::PipeReader { base, .. }
+            | OpenDescription::PipeWriter { base, .. }
+            | OpenDescription::HostPipe { base, .. }
+            | OpenDescription::HostFile { base, .. }
+            | OpenDescription::HostSocket { base, .. }
+            | OpenDescription::Netlink { base, .. } => base,
         }
+    }
+
+    fn status_flags(&self) -> u64 {
+        self.base().status_flags()
+    }
+
+    fn set_status_flags(&mut self, next: u64) {
+        self.base_mut().set_status_flags(next);
     }
 
     fn stat_source(&self) -> OpenStatSource {
@@ -4147,7 +4180,7 @@ mod overlay_dispatch_tests {
             Arc::new(RwLock::new(OpenDescription::EventFd {
                 state: Arc::new(EventFdState::new(counter)),
                 semaphore: false,
-                status_flags: 0,
+                base: OpenDescriptionBase::new(0),
             })),
             0,
         )
@@ -4193,7 +4226,7 @@ mod overlay_dispatch_tests {
                 Arc::new(RwLock::new(OpenDescription::EventFd {
                     state: Arc::new(EventFdState::new(2)),
                     semaphore: false,
-                    status_flags: 0,
+                    base: OpenDescriptionBase::new(0),
                 })),
                 LINUX_FD_CLOEXEC,
             ),
