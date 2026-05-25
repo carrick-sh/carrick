@@ -153,6 +153,14 @@ impl ProcState {
 }
 
 impl SyscallDispatcher {
+    /// True once this dispatcher is running in a real host child created for a
+    /// guest `fork`/fork-like `clone`. Such descendants inherited the original
+    /// CLI process state and must use `_exit` on guest process exit instead of
+    /// returning through normal Rust/Tokio cleanup.
+    pub(crate) fn is_forked_guest_process(&self) -> bool {
+        std::process::id() != self.proc.lock().bootstrap_host_pid
+    }
+
     /// Resolve an affinity pid argument. 0 or our own pid is `SelfProc`; any
     /// other thread/process in the guest tree is `OtherGuest`; anything else
     /// is `NotFound` (ESRCH).
