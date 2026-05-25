@@ -572,7 +572,7 @@ fn range_within(address: u64, length: u64, base: u64, size: u64) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::free_regions_insert;
+    use super::*;
 
     #[test]
     fn free_regions_coalesce_adjacent() {
@@ -590,5 +590,23 @@ mod tests {
         free_regions_insert(&mut r, 0x2000, 0x2000); // overlaps → [0x1000,0x4000)
         free_regions_insert(&mut r, 0x9000, 0x1000); // disjoint
         assert_eq!(r, vec![(0x1000, 0x3000), (0x9000, 0x1000)]);
+    }
+
+    #[test]
+    fn next_mmap_address_reuses_freed_arena_region() {
+        let dispatcher = SyscallDispatcher::new();
+        let freed = LINUX_MMAP_BASE + (4 * LINUX_PAGE_SIZE);
+        {
+            let mut mem = dispatcher.mem.lock();
+            free_regions_insert(&mut mem.free_regions, freed, 2 * LINUX_PAGE_SIZE);
+        }
+
+        let first = dispatcher.next_mmap_address(0, LINUX_PAGE_SIZE, 0, 0);
+        assert_eq!(first, Some((freed, true)));
+
+        let second = dispatcher.next_mmap_address(0, LINUX_PAGE_SIZE, 0, 0);
+        assert_eq!(second, Some((freed + LINUX_PAGE_SIZE, true)));
+
+        assert!(dispatcher.mem.lock().free_regions.is_empty());
     }
 }
