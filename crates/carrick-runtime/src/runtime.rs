@@ -163,6 +163,8 @@ pub enum RuntimeError {
     Trap(#[from] TrapError),
     #[error("syscall dispatch failed: {0}")]
     Dispatch(#[from] DispatchError),
+    #[error("filesystem backend error: {0}")]
+    FsBackend(anyhow::Error),
     #[error("guest did not exit after {max_traps} traps")]
     TrapLimitExceeded { max_traps: usize },
 }

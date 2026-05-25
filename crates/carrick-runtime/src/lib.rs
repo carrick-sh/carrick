@@ -24,8 +24,8 @@ pub mod io_wait;
 pub(crate) mod itimer;
 pub mod linux_abi;
 pub mod memory;
-pub mod oci;
 pub mod overlay;
+
 pub mod probes;
 pub mod pty_relay;
 pub mod rootfs;
@@ -36,3 +36,6 @@ pub mod trap;
 pub mod ulock;
 pub mod vcpu_kick;
 pub mod vfs;
+pub mod execute;
+pub use execute::Runtime;
+
