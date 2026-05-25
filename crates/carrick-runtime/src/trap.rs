@@ -1134,6 +1134,17 @@ impl HvfTrapEngine {
             .vcpu
             .set_sys_reg(SysReg::CPACR_EL1, CPACR_EL1_FPEN_NO_TRAP)
             .map_err(hvf_error)?;
+        // Allow EL0 to read the virtual (EL0VCTEN, bit 1) and physical
+        // (EL0PCTEN, bit 0) counters directly without trapping to EL1. This is
+        // the foundation for the vDSO fast clock path: `__kernel_clock_gettime`
+        // reads CNTVCT_EL0 in userspace, so it must NOT vmexit. The
+        // emulate_el0_sys64_read path stays as a fallback for any guest whose
+        // read still traps. Harmless for guests that don't read the counter.
+        const CNTKCTL_EL1_EL0_COUNTER_ACCESS: u64 = (1 << 1) | (1 << 0);
+        self.inner
+            .vcpu
+            .set_sys_reg(SysReg::CNTKCTL_EL1, CNTKCTL_EL1_EL0_COUNTER_ACCESS)
+            .map_err(hvf_error)?;
         // Route lower-EL synchronous exceptions (EL0 `svc #0`) through our
         // vector page. Without this, VBAR_EL1 defaults to 0 (or whatever
         // HVF leaves it at) and the SVC fetch faults on an unmapped page.
