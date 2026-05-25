@@ -13,7 +13,7 @@ workspace = true
 
 [dependencies]
 carrick-runtime = { path = "../carrick-runtime" }
-carrick-spec = { path = "../carrick-spec" }
+carrick-spec = { path = "../carrick-spec", features = ["clap"] }
 carrick-image = { path = "../carrick-image" }
 carrick-engine = { path = "../carrick-engine" }
 anyhow.workspace = true
