@@ -1422,6 +1422,90 @@ pub(super) fn set_host_nonblocking(fd: i32) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn address_family_translation_covers_bsd_families_and_passthrough() {
+        assert_eq!(linux_to_host_af(LINUX_AF_UNSPEC), libc::AF_UNSPEC);
+        assert_eq!(linux_to_host_af(LINUX_AF_UNIX), libc::AF_UNIX);
+        assert_eq!(linux_to_host_af(LINUX_AF_INET), libc::AF_INET);
+        assert_eq!(linux_to_host_af(LINUX_AF_INET6), libc::AF_INET6);
+        assert_eq!(linux_to_host_af(12345), 12345);
+
+        assert_eq!(host_to_linux_af(libc::AF_UNSPEC as u16), LINUX_AF_UNSPEC as u16);
+        assert_eq!(host_to_linux_af(libc::AF_UNIX as u16), LINUX_AF_UNIX as u16);
+        assert_eq!(host_to_linux_af(libc::AF_INET as u16), LINUX_AF_INET as u16);
+        assert_eq!(host_to_linux_af(libc::AF_INET6 as u16), LINUX_AF_INET6 as u16);
+        assert_eq!(host_to_linux_af(54321), 54321);
+    }
+
+    #[test]
+    fn message_flag_translation_maps_supported_flags_and_ignores_linux_only_flags() {
+        let flags = LINUX_MSG_OOB
+            | LINUX_MSG_PEEK
+            | LINUX_MSG_DONTROUTE
+            | LINUX_MSG_TRUNC
+            | LINUX_MSG_DONTWAIT
+            | LINUX_MSG_EOR
+            | LINUX_MSG_WAITALL
+            | LINUX_MSG_NOSIGNAL
+            | LINUX_MSG_CMSG_CLOEXEC;
+
+        let host = linux_to_host_msg_flags(flags);
+        assert_eq!(host & libc::MSG_OOB, libc::MSG_OOB);
+        assert_eq!(host & libc::MSG_PEEK, libc::MSG_PEEK);
+        assert_eq!(host & libc::MSG_DONTROUTE, libc::MSG_DONTROUTE);
+        assert_eq!(host & libc::MSG_TRUNC, libc::MSG_TRUNC);
+        assert_eq!(host & libc::MSG_DONTWAIT, libc::MSG_DONTWAIT);
+        assert_eq!(host & libc::MSG_EOR, libc::MSG_EOR);
+        assert_eq!(host & libc::MSG_WAITALL, libc::MSG_WAITALL);
+        assert_eq!(host & !(libc::MSG_OOB
+            | libc::MSG_PEEK
+            | libc::MSG_DONTROUTE
+            | libc::MSG_TRUNC
+            | libc::MSG_DONTWAIT
+            | libc::MSG_EOR
+            | libc::MSG_WAITALL), 0);
+    }
+
+    #[test]
+    fn ipv4_sockaddr_round_trips_between_linux_and_host_layouts() {
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0x1000]);
+        let addr = 0x1100;
+        let mut linux = vec![0u8; 16];
+        linux[0..2].copy_from_slice(&(LINUX_AF_INET as u16).to_ne_bytes());
+        linux[2..4].copy_from_slice(&8080u16.to_be_bytes());
+        linux[4..8].copy_from_slice(&[127, 0, 0, 1]);
+        memory.write_bytes(addr, &linux).unwrap();
+
+        let host = read_linux_sockaddr(&memory, addr, linux.len() as u32, LINUX_AF_INET).unwrap();
+        assert_eq!(host[0], 16);
+        assert_eq!(host[1], libc::AF_INET as u8);
+        assert_eq!(&host[2..8], &linux[2..8]);
+
+        let round_trip = host_to_linux_sockaddr(&host, LINUX_AF_INET);
+        assert_eq!(round_trip, linux);
+    }
+
+    #[test]
+    fn write_linux_sockaddr_truncates_to_guest_buffer_and_reports_required_len() {
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0x1000]);
+        let addr = 0x1100;
+        let addrlen_addr = 0x1200;
+        memory
+            .write_bytes(addrlen_addr, &4u32.to_ne_bytes())
+            .unwrap();
+
+        let mut linux = vec![0u8; 16];
+        linux[0..2].copy_from_slice(&(LINUX_AF_INET as u16).to_ne_bytes());
+        linux[2..4].copy_from_slice(&8080u16.to_be_bytes());
+        linux[4..8].copy_from_slice(&[127, 0, 0, 1]);
+
+        write_linux_sockaddr(&mut memory, addr, addrlen_addr, &linux).unwrap();
+
+        assert_eq!(memory.read_bytes(addr, 4).unwrap(), linux[..4]);
+        let required = memory.read_bytes(addrlen_addr, 4).unwrap();
+        assert_eq!(u32::from_ne_bytes(required.try_into().unwrap()), 16);
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn host_socket_install_forces_host_nonblocking_even_for_blocking_guest_fd() {
@@ -3115,4 +3199,3 @@ impl SyscallDispatcher {
         Ok(outcome)
     }
 }
-
