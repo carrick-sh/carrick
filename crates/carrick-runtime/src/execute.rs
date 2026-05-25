@@ -1,14 +1,17 @@
 //! Runtime execution entry points that bridge shared run specs to
 //! dispatcher-backed guest execution.
 
-use std::path::PathBuf;
-use carrick_spec::{RunSpec, FsBackendKind};
-use crate::runtime::{RunResult, RuntimeError, run_elf_from_dispatcher_debug, run_rootfs_elf_with_hvf_args_and_dispatcher_debug};
 use crate::dispatch::SyscallDispatcher;
+use crate::fs_backend::{FsBackend, HostFsBackend, MemoryBackend};
 use crate::rootfs::RootFs;
-use crate::fs_backend::{FsBackend, MemoryBackend, HostFsBackend};
+use crate::runtime::{
+    RunResult, RuntimeError, run_elf_from_dispatcher_debug,
+    run_rootfs_elf_with_hvf_args_and_dispatcher_debug,
+};
 use crate::vfs::BindVfs;
 use anyhow::{Context, Result};
+use carrick_spec::{FsBackendKind, RunSpec};
+use std::path::PathBuf;
 
 pub struct Runtime;
 
@@ -34,17 +37,23 @@ impl Runtime {
         let result = match spec.fs_backend {
             FsBackendKind::Host => {
                 // Stream every OCI layer straight onto the cap-std scratch Dir.
-                let mut host = HostFsBackend::new()
-                    .map_err(|e| RuntimeError::FsBackend(anyhow::anyhow!("failed to create scratch directory: {}", e)))?;
-                
+                let mut host = HostFsBackend::new().map_err(|e| {
+                    RuntimeError::FsBackend(anyhow::anyhow!(
+                        "failed to create scratch directory: {}",
+                        e
+                    ))
+                })?;
+
                 // Convert layers to Vec<PathBuf>
-                let layer_paths: Vec<PathBuf> = spec.rootfs_layers
+                let layer_paths: Vec<PathBuf> = spec
+                    .rootfs_layers
                     .iter()
                     .map(|p| PathBuf::from(p.as_std_path()))
                     .collect();
 
-                host.extract_layers(&layer_paths)
-                    .map_err(|e| RuntimeError::FsBackend(anyhow::anyhow!("failed to stream OCI layers: {}", e)))?;
+                host.extract_layers(&layer_paths).map_err(|e| {
+                    RuntimeError::FsBackend(anyhow::anyhow!("failed to stream OCI layers: {}", e))
+                })?;
 
                 let mut dispatcher = SyscallDispatcher::new();
                 dispatcher.set_executable_path(spec.executable.clone());
@@ -58,22 +67,27 @@ impl Runtime {
                 for mount in &spec.mounts {
                     let host_path = PathBuf::from(mount.source.as_std_path());
                     let target_path = PathBuf::from(mount.target.as_std_path());
-                    let bind_vfs = BindVfs::new(
-                        mount.target.as_str(),
-                        host_path,
-                        mount.readonly,
-                    );
+                    let bind_vfs = BindVfs::new(mount.target.as_str(), host_path, mount.readonly);
                     dispatcher.register_mount(target_path, Box::new(bind_vfs));
                 }
 
                 let _ = dispatcher.set_fs_backend(Box::new(host));
 
                 // Interactive pty or raw stream
-                let _supervisor_parent = setup_interactive_stdio(&mut dispatcher, spec.tty, spec.raw)
-                    .map_err(|e| RuntimeError::FsBackend(anyhow::anyhow!("failed to setup interactive stdio: {}", e)))?;
+                let _supervisor_parent =
+                    setup_interactive_stdio(&mut dispatcher, spec.tty, spec.raw).map_err(|e| {
+                        RuntimeError::FsBackend(anyhow::anyhow!(
+                            "failed to setup interactive stdio: {}",
+                            e
+                        ))
+                    })?;
                 if let Some(parent) = _supervisor_parent {
-                    let code = parent.relay_and_wait()
-                        .map_err(|e| RuntimeError::FsBackend(anyhow::anyhow!("interactive supervisor failed: {}", e)))?;
+                    let code = parent.relay_and_wait().map_err(|e| {
+                        RuntimeError::FsBackend(anyhow::anyhow!(
+                            "interactive supervisor failed: {}",
+                            e
+                        ))
+                    })?;
                     return Ok(RunResult {
                         exit_code: code,
                         stdout: Vec::new(),
@@ -84,7 +98,10 @@ impl Runtime {
                     });
                 }
 
-                let debug_path = spec.debug_state_path.as_ref().map(|p| PathBuf::from(p.as_std_path()));
+                let debug_path = spec
+                    .debug_state_path
+                    .as_ref()
+                    .map(|p| PathBuf::from(p.as_std_path()));
                 let run_result = run_elf_from_dispatcher_debug(
                     &spec.executable,
                     dispatcher,
@@ -93,17 +110,24 @@ impl Runtime {
                     spec.max_traps,
                     debug_path.as_ref(),
                 );
-                run_result.map_err(|e| RuntimeError::FsBackend(anyhow::anyhow!("failed to run ELF from dispatcher: {}", e)))?
+                run_result.map_err(|e| {
+                    RuntimeError::FsBackend(anyhow::anyhow!(
+                        "failed to run ELF from dispatcher: {}",
+                        e
+                    ))
+                })?
             }
             FsBackendKind::Memory => {
-                let layer_paths: Vec<PathBuf> = spec.rootfs_layers
+                let layer_paths: Vec<PathBuf> = spec
+                    .rootfs_layers
                     .iter()
                     .map(|p| PathBuf::from(p.as_std_path()))
                     .collect();
 
-                let rootfs = RootFs::from_layer_paths(&layer_paths)
-                    .map_err(|e| RuntimeError::FsBackend(anyhow::anyhow!("failed to compose rootfs: {}", e)))?;
-                
+                let rootfs = RootFs::from_layer_paths(&layer_paths).map_err(|e| {
+                    RuntimeError::FsBackend(anyhow::anyhow!("failed to compose rootfs: {}", e))
+                })?;
+
                 let mut dispatcher = SyscallDispatcher::with_rootfs_and_executable(
                     rootfs.clone(),
                     spec.executable.clone(),
@@ -112,27 +136,33 @@ impl Runtime {
                     dispatcher.set_cwd(cwd.as_str());
                 }
 
-                install_fs_backend(&mut dispatcher, FsBackendKind::Memory)
-                    .map_err(|e| RuntimeError::FsBackend(anyhow::anyhow!("failed to install fs backend: {}", e)))?;
+                install_fs_backend(&mut dispatcher, FsBackendKind::Memory).map_err(|e| {
+                    RuntimeError::FsBackend(anyhow::anyhow!("failed to install fs backend: {}", e))
+                })?;
 
                 // Install custom bind mounts on dispatcher
                 for mount in &spec.mounts {
                     let host_path = PathBuf::from(mount.source.as_std_path());
                     let target_path = PathBuf::from(mount.target.as_std_path());
-                    let bind_vfs = BindVfs::new(
-                        mount.target.as_str(),
-                        host_path,
-                        mount.readonly,
-                    );
+                    let bind_vfs = BindVfs::new(mount.target.as_str(), host_path, mount.readonly);
                     dispatcher.register_mount(target_path, Box::new(bind_vfs));
                 }
 
                 // Interactive pty or raw stream
-                let _supervisor_parent = setup_interactive_stdio(&mut dispatcher, spec.tty, spec.raw)
-                    .map_err(|e| RuntimeError::FsBackend(anyhow::anyhow!("failed to setup interactive stdio: {}", e)))?;
+                let _supervisor_parent =
+                    setup_interactive_stdio(&mut dispatcher, spec.tty, spec.raw).map_err(|e| {
+                        RuntimeError::FsBackend(anyhow::anyhow!(
+                            "failed to setup interactive stdio: {}",
+                            e
+                        ))
+                    })?;
                 if let Some(parent) = _supervisor_parent {
-                    let code = parent.relay_and_wait()
-                        .map_err(|e| RuntimeError::FsBackend(anyhow::anyhow!("interactive supervisor failed: {}", e)))?;
+                    let code = parent.relay_and_wait().map_err(|e| {
+                        RuntimeError::FsBackend(anyhow::anyhow!(
+                            "interactive supervisor failed: {}",
+                            e
+                        ))
+                    })?;
                     return Ok(RunResult {
                         exit_code: code,
                         stdout: Vec::new(),
@@ -143,7 +173,10 @@ impl Runtime {
                     });
                 }
 
-                let debug_path = spec.debug_state_path.as_ref().map(|p| PathBuf::from(p.as_std_path()));
+                let debug_path = spec
+                    .debug_state_path
+                    .as_ref()
+                    .map(|p| PathBuf::from(p.as_std_path()));
                 let run_result = run_rootfs_elf_with_hvf_args_and_dispatcher_debug(
                     &spec.executable,
                     &rootfs,
@@ -153,7 +186,9 @@ impl Runtime {
                     spec.max_traps,
                     debug_path.as_ref(),
                 );
-                run_result.map_err(|e| RuntimeError::FsBackend(anyhow::anyhow!("failed to run rootfs ELF: {}", e)))?
+                run_result.map_err(|e| {
+                    RuntimeError::FsBackend(anyhow::anyhow!("failed to run rootfs ELF: {}", e))
+                })?
             }
         };
 

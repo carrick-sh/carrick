@@ -67,8 +67,8 @@ fn free_regions_insert(regions: &mut Vec<(u64, u64)>, addr: u64, len: u64) {
     }
     out.sort_by_key(|&(s, _)| s);
     *regions = out;
-}impl SyscallDispatcher {
-
+}
+impl SyscallDispatcher {
     fn next_mmap_address(
         &self,
         requested: u64,
@@ -139,409 +139,409 @@ fn free_regions_insert(regions: &mut Vec<(u64, u64)>, addr: u64, len: u64) {
 }
 
 impl SyscallDispatcher {
-define_syscall! {
-    fn fadvise64(this, cx, fd: Fd, _offset: u64, _len: u64, _advice: u64) {
-        if !this.fd_is_valid(fd.0) && !is_stdio_fd(fd.0) {
-            return Ok(LINUX_EBADF.into());
-        }
-        Ok(DispatchOutcome::Returned { value: 0 })
-    }
-
-    fn brk(this, cx, requested: u64) {
-        let mut mem = this.mem.lock();
-        if requested == 0 {
-            return Ok(DispatchOutcome::Returned {
-                value: mem.brk_current as i64,
-            });
-        }
-        if range_within(requested, 0, LINUX_HEAP_BASE, LINUX_HEAP_SIZE) {
-            mem.brk_current = requested;
-        }
-        Ok(DispatchOutcome::Returned {
-            value: mem.brk_current as i64,
-        })
-    }
-
-    fn mmap(this, cx, requested: GuestPtr, length: u64, prot: u64, flags: u64, fd: Fd, offset: u64) {
-        let mut flags = flags;
-        let memory = &mut *cx.memory;
-
-        if flags & LINUX_MAP_FIXED_NOREPLACE != 0 {
-            flags |= LINUX_MAP_FIXED;
-        }
-
-        let map_type = flags & (LINUX_MAP_SHARED | LINUX_MAP_PRIVATE);
-        if length == 0
-            || prot & !(LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC) != 0
-            || flags & !LinuxMmapFlags::SUPPORTED_MASK != 0
-            || (map_type != LINUX_MAP_SHARED && map_type != LINUX_MAP_PRIVATE)
-            || (flags & LINUX_MAP_ANONYMOUS == 0 && !offset.is_multiple_of(LINUX_PAGE_SIZE))
-            || (flags & LINUX_MAP_FIXED != 0 && !requested.0.is_multiple_of(LINUX_PAGE_SIZE))
-        {
-            return Ok(LINUX_EINVAL.into());
-        }
-        let length = match align_up_u64(length, LINUX_PAGE_SIZE) {
-            Some(length) => length,
-            None => {
-                return Ok(LINUX_ENOMEM.into());
+    define_syscall! {
+        fn fadvise64(this, cx, fd: Fd, _offset: u64, _len: u64, _advice: u64) {
+            if !this.fd_is_valid(fd.0) && !is_stdio_fd(fd.0) {
+                return Ok(LINUX_EBADF.into());
             }
-        };
-        let length_usize =
-            usize::try_from(length).map_err(|_| DispatchError::LengthTooLarge(length))?;
+            Ok(DispatchOutcome::Returned { value: 0 })
+        }
 
-        let hvf_page = crate::trap::HVF_PAGE_SIZE;
-        if flags & LINUX_MAP_ANONYMOUS == 0
-            && map_type == LINUX_MAP_SHARED
-            && flags & LINUX_MAP_FIXED == 0
-            && offset.is_multiple_of(hvf_page)
-        {
-            let dup_fd = {
+        fn brk(this, cx, requested: u64) {
+            let mut mem = this.mem.lock();
+            if requested == 0 {
+                return Ok(DispatchOutcome::Returned {
+                    value: mem.brk_current as i64,
+                });
+            }
+            if range_within(requested, 0, LINUX_HEAP_BASE, LINUX_HEAP_SIZE) {
+                mem.brk_current = requested;
+            }
+            Ok(DispatchOutcome::Returned {
+                value: mem.brk_current as i64,
+            })
+        }
+
+        fn mmap(this, cx, requested: GuestPtr, length: u64, prot: u64, flags: u64, fd: Fd, offset: u64) {
+            let mut flags = flags;
+            let memory = &mut *cx.memory;
+
+            if flags & LINUX_MAP_FIXED_NOREPLACE != 0 {
+                flags |= LINUX_MAP_FIXED;
+            }
+
+            let map_type = flags & (LINUX_MAP_SHARED | LINUX_MAP_PRIVATE);
+            if length == 0
+                || prot & !(LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC) != 0
+                || flags & !LinuxMmapFlags::SUPPORTED_MASK != 0
+                || (map_type != LINUX_MAP_SHARED && map_type != LINUX_MAP_PRIVATE)
+                || (flags & LINUX_MAP_ANONYMOUS == 0 && !offset.is_multiple_of(LINUX_PAGE_SIZE))
+                || (flags & LINUX_MAP_FIXED != 0 && !requested.0.is_multiple_of(LINUX_PAGE_SIZE))
+            {
+                return Ok(LINUX_EINVAL.into());
+            }
+            let length = match align_up_u64(length, LINUX_PAGE_SIZE) {
+                Some(length) => length,
+                None => {
+                    return Ok(LINUX_ENOMEM.into());
+                }
+            };
+            let length_usize =
+                usize::try_from(length).map_err(|_| DispatchError::LengthTooLarge(length))?;
+
+            let hvf_page = crate::trap::HVF_PAGE_SIZE;
+            if flags & LINUX_MAP_ANONYMOUS == 0
+                && map_type == LINUX_MAP_SHARED
+                && flags & LINUX_MAP_FIXED == 0
+                && offset.is_multiple_of(hvf_page)
+            {
+                let dup_fd = {
+                    let Some(open_file) = this.open_file(fd.0) else {
+                        return Ok(LINUX_EBADF.into());
+                    };
+                    let open = open_file.description.read();
+                    match &*open {
+                        OpenDescription::HostFile { host_fd, .. } => {
+                            let d = unsafe { libc::dup(*host_fd) };
+                            if d < 0 { None } else { Some(d) }
+                        }
+                        _ => None,
+                    }
+                };
+                if let Some(dup_fd) = dup_fd {
+                    let map_len = align_up_u64(length, hvf_page)
+                        .and_then(|l| usize::try_from(l).ok())
+                        .unwrap_or(length_usize);
+                    match this.next_shared_file_address(map_len as u64) {
+                        Some(addr) => {
+                            match memory.map_shared_file(addr, map_len, dup_fd, offset) {
+                                Ok(()) => {
+                                    this.mem.lock().shared_file_maps.push((addr, map_len));
+                                    return Ok(DispatchOutcome::Returned { value: addr as i64 });
+                                }
+                                Err(_) => { /* fall through */ }
+                            }
+                        }
+                        None => unsafe {
+                            libc::close(dup_fd);
+                        },
+                    }
+                }
+            }
+
+            if flags & LINUX_MAP_ANONYMOUS != 0
+                && map_type == LINUX_MAP_SHARED
+                && flags & LINUX_MAP_FIXED == 0
+            {
+                let map_len = align_up_u64(length, hvf_page)
+                    .and_then(|l| usize::try_from(l).ok())
+                    .unwrap_or(length_usize);
+                if let Some(addr) = this.next_shared_file_address(map_len as u64) {
+                    if memory.map_shared_anon(addr, map_len).is_ok() {
+                        this.mem.lock().shared_file_maps.push((addr, map_len));
+                        return Ok(DispatchOutcome::Returned { value: addr as i64 });
+                    }
+                }
+            }
+
+            let (address, reused) = match this.next_mmap_address(requested.0, length, prot, flags) {
+                Some(pair) => pair,
+                None => {
+                    return Ok(LINUX_ENOMEM.into());
+                }
+            };
+            if reused {
+                let zeros = vec![0u8; length_usize];
+                let _ = memory.write_bytes(address, &zeros);
+            }
+
+            let prot_none = prot & (LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC) == 0;
+            if prot_none && flags & LINUX_MAP_ANONYMOUS != 0 {
+                memory.set_no_access(address, length_usize, false);
+                memory.set_no_access(address, length_usize, true);
+                return Ok(DispatchOutcome::Returned {
+                    value: address as i64,
+                });
+            }
+
+            let mut bytes = vec![0; length_usize];
+            if flags & LINUX_MAP_ANONYMOUS == 0 {
                 let Some(open_file) = this.open_file(fd.0) else {
                     return Ok(LINUX_EBADF.into());
                 };
                 let open = open_file.description.read();
+                let offset_usize =
+                    usize::try_from(offset).map_err(|_| DispatchError::LengthTooLarge(offset))?;
                 match &*open {
-                    OpenDescription::HostFile { host_fd, .. } => {
-                        let d = unsafe { libc::dup(*host_fd) };
-                        if d < 0 { None } else { Some(d) }
-                    }
-                    _ => None,
-                }
-            };
-            if let Some(dup_fd) = dup_fd {
-                let map_len = align_up_u64(length, hvf_page)
-                    .and_then(|l| usize::try_from(l).ok())
-                    .unwrap_or(length_usize);
-                match this.next_shared_file_address(map_len as u64) {
-                    Some(addr) => {
-                        match memory.map_shared_file(addr, map_len, dup_fd, offset) {
-                            Ok(()) => {
-                                this.mem.lock().shared_file_maps.push((addr, map_len));
-                                return Ok(DispatchOutcome::Returned { value: addr as i64 });
-                            }
-                            Err(_) => { /* fall through */ }
+                    OpenDescription::File { contents, .. }
+                    | OpenDescription::SyntheticFile { contents, .. } => {
+                        if offset_usize < contents.len() {
+                            let available = &contents[offset_usize..];
+                            let copy_len = available.len().min(length_usize);
+                            bytes[..copy_len].copy_from_slice(&available[..copy_len]);
                         }
                     }
-                    None => unsafe {
-                        libc::close(dup_fd);
-                    },
-                }
-            }
-        }
-
-        if flags & LINUX_MAP_ANONYMOUS != 0
-            && map_type == LINUX_MAP_SHARED
-            && flags & LINUX_MAP_FIXED == 0
-        {
-            let map_len = align_up_u64(length, hvf_page)
-                .and_then(|l| usize::try_from(l).ok())
-                .unwrap_or(length_usize);
-            if let Some(addr) = this.next_shared_file_address(map_len as u64) {
-                if memory.map_shared_anon(addr, map_len).is_ok() {
-                    this.mem.lock().shared_file_maps.push((addr, map_len));
-                    return Ok(DispatchOutcome::Returned { value: addr as i64 });
-                }
-            }
-        }
-
-        let (address, reused) = match this.next_mmap_address(requested.0, length, prot, flags) {
-            Some(pair) => pair,
-            None => {
-                return Ok(LINUX_ENOMEM.into());
-            }
-        };
-        if reused {
-            let zeros = vec![0u8; length_usize];
-            let _ = memory.write_bytes(address, &zeros);
-        }
-
-        let prot_none = prot & (LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC) == 0;
-        if prot_none && flags & LINUX_MAP_ANONYMOUS != 0 {
-            memory.set_no_access(address, length_usize, false);
-            memory.set_no_access(address, length_usize, true);
-            return Ok(DispatchOutcome::Returned {
-                value: address as i64,
-            });
-        }
-
-        let mut bytes = vec![0; length_usize];
-        if flags & LINUX_MAP_ANONYMOUS == 0 {
-            let Some(open_file) = this.open_file(fd.0) else {
-                return Ok(LINUX_EBADF.into());
-            };
-            let open = open_file.description.read();
-            let offset_usize =
-                usize::try_from(offset).map_err(|_| DispatchError::LengthTooLarge(offset))?;
-            match &*open {
-                OpenDescription::File { contents, .. }
-                | OpenDescription::SyntheticFile { contents, .. } => {
-                    if offset_usize < contents.len() {
-                        let available = &contents[offset_usize..];
-                        let copy_len = available.len().min(length_usize);
-                        bytes[..copy_len].copy_from_slice(&available[..copy_len]);
+                    OpenDescription::HostFile { host_fd, .. } => {
+                        let n = unsafe {
+                            libc::pread(
+                                *host_fd,
+                                bytes.as_mut_ptr() as *mut _,
+                                length_usize,
+                                offset as libc::off_t,
+                            )
+                        };
+                        let _ = n;
+                    }
+                    _ => {
+                        return Ok(LINUX_EBADF.into());
                     }
                 }
-                OpenDescription::HostFile { host_fd, .. } => {
-                    let n = unsafe {
-                        libc::pread(
-                            *host_fd,
-                            bytes.as_mut_ptr() as *mut _,
-                            length_usize,
-                            offset as libc::off_t,
-                        )
-                    };
-                    let _ = n;
-                }
-                _ => {
-                    return Ok(LINUX_EBADF.into());
-                }
             }
+
+            memory.set_no_access(address, length_usize, false);
+            let _ = memory.write_bytes(address, &bytes);
+            if prot_none {
+                memory.set_no_access(address, length_usize, true);
+            }
+            Ok(DispatchOutcome::Returned {
+                value: address as i64,
+            })
         }
 
-        memory.set_no_access(address, length_usize, false);
-        let _ = memory.write_bytes(address, &bytes);
-        if prot_none {
-            memory.set_no_access(address, length_usize, true);
-        }
-        Ok(DispatchOutcome::Returned {
-            value: address as i64,
-        })
-    }
-
-    fn munmap(this, cx, address: GuestPtr, length: u64) {
-        if length == 0 {
-            return Ok(LINUX_EINVAL.into());
-        }
-        let shared_mapping = {
-            let mut mem = this.mem.lock();
-            mem.shared_file_maps
-                .iter()
-                .position(|(a, _)| *a == address.0)
-                .map(|pos| mem.shared_file_maps.remove(pos))
-        };
-        if let Some((addr, len)) = shared_mapping {
-            let _ = cx.memory.unmap_shared_file(addr, len);
-            return Ok(DispatchOutcome::Returned { value: 0 });
-        }
-        if !range_within(address.0, length, LINUX_MMAP_BASE, LINUX_MMAP_SIZE) {
-            return Ok(LINUX_EINVAL.into());
-        }
-        if let Some(len) = align_up_u64(length, LINUX_PAGE_SIZE) {
-            let mut mem = this.mem.lock();
-            if address.0.checked_add(len) == Some(mem.mmap_next) {
-                mem.mmap_next = address.0;
-                while let Some(pos) = mem
-                    .free_regions
+        fn munmap(this, cx, address: GuestPtr, length: u64) {
+            if length == 0 {
+                return Ok(LINUX_EINVAL.into());
+            }
+            let shared_mapping = {
+                let mut mem = this.mem.lock();
+                mem.shared_file_maps
                     .iter()
-                    .position(|&(s, l)| s.checked_add(l) == Some(mem.mmap_next))
-                {
-                    let (s, _l) = mem.free_regions.remove(pos);
-                    mem.mmap_next = s;
-                }
-            } else {
-                free_regions_insert(&mut mem.free_regions, address.0, len);
+                    .position(|(a, _)| *a == address.0)
+                    .map(|pos| mem.shared_file_maps.remove(pos))
+            };
+            if let Some((addr, len)) = shared_mapping {
+                let _ = cx.memory.unmap_shared_file(addr, len);
+                return Ok(DispatchOutcome::Returned { value: 0 });
             }
-        }
-        Ok(DispatchOutcome::Returned { value: 0 })
-    }
-
-    fn msync(this, cx, address: GuestPtr, length: u64, flags: u64) {
-        if flags & !(LINUX_MS_ASYNC | LINUX_MS_INVALIDATE | LINUX_MS_SYNC) != 0 {
-            return Ok(LINUX_EINVAL.into());
-        }
-        if flags & LINUX_MS_ASYNC != 0 && flags & LINUX_MS_SYNC != 0 {
-            return Ok(LINUX_EINVAL.into());
-        }
-        if length == 0 {
-            return Ok(DispatchOutcome::Returned { value: 0 });
-        }
-        let shared_mapping = this
-            .mem
-            .lock()
-            .shared_file_maps
-            .iter()
-            .find(|(a, _)| *a == address.0)
-            .copied();
-        if let Some((addr, len)) = shared_mapping {
-            let _ = cx.memory.msync_shared_file(addr, len);
-            return Ok(DispatchOutcome::Returned { value: 0 });
-        }
-        if cx.memory.read_bytes(address.0, 1).is_err() {
-            return Ok(LINUX_ENOMEM.into());
-        }
-        Ok(DispatchOutcome::Returned { value: 0 })
-    }
-
-    fn mlock(this, cx, address: GuestPtr, length: u64) {
-        let memory = &mut *cx.memory;
-        if length == 0 {
-            return Ok(DispatchOutcome::Returned { value: 0 });
-        }
-        if memory.read_bytes(address.0, 1).is_err() {
-            return Ok(LINUX_ENOMEM.into());
-        }
-        Ok(DispatchOutcome::Returned { value: 0 })
-    }
-
-    fn munlock(this, cx, address: GuestPtr, length: u64) {
-        let memory = &mut *cx.memory;
-        if length == 0 {
-            return Ok(DispatchOutcome::Returned { value: 0 });
-        }
-        if memory.read_bytes(address.0, 1).is_err() {
-            return Ok(LINUX_ENOMEM.into());
-        }
-        Ok(DispatchOutcome::Returned { value: 0 })
-    }
-
-    fn mlockall(this, cx, flags: u64) {
-        if flags == 0 || flags & !(LINUX_MCL_CURRENT | LINUX_MCL_FUTURE | LINUX_MCL_ONFAULT) != 0 {
-            return Ok(LINUX_EINVAL.into());
-        }
-        Ok(DispatchOutcome::Returned { value: 0 })
-    }
-
-    fn munlockall(this, cx) {
-        Ok(DispatchOutcome::Returned { value: 0 })
-    }
-
-    fn mincore(this, cx, address: GuestPtr, length: u64, vec: GuestPtr) {
-        let memory = &mut *cx.memory;
-        if length == 0 {
-            return Ok(DispatchOutcome::Returned { value: 0 });
-        }
-        if memory.read_bytes(address.0, 1).is_err() {
-            return Ok(LINUX_ENOMEM.into());
-        }
-        let pages = length.div_ceil(LINUX_PAGE_SIZE);
-        let bytes = vec![1u8; pages as usize];
-        if memory.write_bytes(vec.0, &bytes).is_err() {
-            return Ok(LINUX_EFAULT.into());
-        }
-        Ok(DispatchOutcome::Returned { value: 0 })
-    }
-
-    fn mremap(this, cx, old_address: GuestPtr, old_size: u64, new_size_req: u64, flags: u64, _new_address: GuestPtr) {
-        let memory = &mut *cx.memory;
-        if new_size_req == 0 {
-            return Ok(LINUX_EINVAL.into());
-        }
-        if flags & !(LINUX_MREMAP_MAYMOVE | LINUX_MREMAP_FIXED | LINUX_MREMAP_DONTUNMAP) != 0 {
-            return Ok(LINUX_EINVAL.into());
-        }
-        if !range_within(old_address.0, old_size, LINUX_MMAP_BASE, LINUX_MMAP_SIZE) {
-            return Ok(LINUX_EINVAL.into());
-        }
-        let Some(new_size) = align_up_u64(new_size_req, LINUX_PAGE_SIZE) else {
-            return Ok(LINUX_ENOMEM.into());
-        };
-        if new_size <= old_size {
-            return Ok(DispatchOutcome::Returned {
-                value: old_address.0 as i64,
-            });
+            if !range_within(address.0, length, LINUX_MMAP_BASE, LINUX_MMAP_SIZE) {
+                return Ok(LINUX_EINVAL.into());
+            }
+            if let Some(len) = align_up_u64(length, LINUX_PAGE_SIZE) {
+                let mut mem = this.mem.lock();
+                if address.0.checked_add(len) == Some(mem.mmap_next) {
+                    mem.mmap_next = address.0;
+                    while let Some(pos) = mem
+                        .free_regions
+                        .iter()
+                        .position(|&(s, l)| s.checked_add(l) == Some(mem.mmap_next))
+                    {
+                        let (s, _l) = mem.free_regions.remove(pos);
+                        mem.mmap_next = s;
+                    }
+                } else {
+                    free_regions_insert(&mut mem.free_regions, address.0, len);
+                }
+            }
+            Ok(DispatchOutcome::Returned { value: 0 })
         }
 
-        if old_address.0.checked_add(old_size) == Some(this.mem.lock().mmap_next) {
-            let Some(new_end) = old_address.0.checked_add(new_size) else {
+        fn msync(this, cx, address: GuestPtr, length: u64, flags: u64) {
+            if flags & !(LINUX_MS_ASYNC | LINUX_MS_INVALIDATE | LINUX_MS_SYNC) != 0 {
+                return Ok(LINUX_EINVAL.into());
+            }
+            if flags & LINUX_MS_ASYNC != 0 && flags & LINUX_MS_SYNC != 0 {
+                return Ok(LINUX_EINVAL.into());
+            }
+            if length == 0 {
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            }
+            let shared_mapping = this
+                .mem
+                .lock()
+                .shared_file_maps
+                .iter()
+                .find(|(a, _)| *a == address.0)
+                .copied();
+            if let Some((addr, len)) = shared_mapping {
+                let _ = cx.memory.msync_shared_file(addr, len);
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            }
+            if cx.memory.read_bytes(address.0, 1).is_err() {
+                return Ok(LINUX_ENOMEM.into());
+            }
+            Ok(DispatchOutcome::Returned { value: 0 })
+        }
+
+        fn mlock(this, cx, address: GuestPtr, length: u64) {
+            let memory = &mut *cx.memory;
+            if length == 0 {
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            }
+            if memory.read_bytes(address.0, 1).is_err() {
+                return Ok(LINUX_ENOMEM.into());
+            }
+            Ok(DispatchOutcome::Returned { value: 0 })
+        }
+
+        fn munlock(this, cx, address: GuestPtr, length: u64) {
+            let memory = &mut *cx.memory;
+            if length == 0 {
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            }
+            if memory.read_bytes(address.0, 1).is_err() {
+                return Ok(LINUX_ENOMEM.into());
+            }
+            Ok(DispatchOutcome::Returned { value: 0 })
+        }
+
+        fn mlockall(this, cx, flags: u64) {
+            if flags == 0 || flags & !(LINUX_MCL_CURRENT | LINUX_MCL_FUTURE | LINUX_MCL_ONFAULT) != 0 {
+                return Ok(LINUX_EINVAL.into());
+            }
+            Ok(DispatchOutcome::Returned { value: 0 })
+        }
+
+        fn munlockall(this, cx) {
+            Ok(DispatchOutcome::Returned { value: 0 })
+        }
+
+        fn mincore(this, cx, address: GuestPtr, length: u64, vec: GuestPtr) {
+            let memory = &mut *cx.memory;
+            if length == 0 {
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            }
+            if memory.read_bytes(address.0, 1).is_err() {
+                return Ok(LINUX_ENOMEM.into());
+            }
+            let pages = length.div_ceil(LINUX_PAGE_SIZE);
+            let bytes = vec![1u8; pages as usize];
+            if memory.write_bytes(vec.0, &bytes).is_err() {
+                return Ok(LINUX_EFAULT.into());
+            }
+            Ok(DispatchOutcome::Returned { value: 0 })
+        }
+
+        fn mremap(this, cx, old_address: GuestPtr, old_size: u64, new_size_req: u64, flags: u64, _new_address: GuestPtr) {
+            let memory = &mut *cx.memory;
+            if new_size_req == 0 {
+                return Ok(LINUX_EINVAL.into());
+            }
+            if flags & !(LINUX_MREMAP_MAYMOVE | LINUX_MREMAP_FIXED | LINUX_MREMAP_DONTUNMAP) != 0 {
+                return Ok(LINUX_EINVAL.into());
+            }
+            if !range_within(old_address.0, old_size, LINUX_MMAP_BASE, LINUX_MMAP_SIZE) {
+                return Ok(LINUX_EINVAL.into());
+            }
+            let Some(new_size) = align_up_u64(new_size_req, LINUX_PAGE_SIZE) else {
                 return Ok(LINUX_ENOMEM.into());
             };
-            if range_within(old_address.0, new_size, LINUX_MMAP_BASE, LINUX_MMAP_SIZE) {
-                this.mem.lock().mmap_next = new_end;
+            if new_size <= old_size {
                 return Ok(DispatchOutcome::Returned {
                     value: old_address.0 as i64,
                 });
             }
-        }
 
-        if flags & LINUX_MREMAP_MAYMOVE == 0 {
-            return Ok(LINUX_ENOMEM.into());
-        }
-        let Some((new_addr, reused)) =
-            this.next_mmap_address(0, new_size, LINUX_PROT_READ | LINUX_PROT_WRITE, 0)
-        else {
-            return Ok(LINUX_ENOMEM.into());
-        };
-        if reused && let Ok(n) = usize::try_from(new_size) {
-            let zeros = vec![0u8; n];
-            let _ = memory.write_bytes(new_addr, &zeros);
-        }
-        let copy_len = match usize::try_from(old_size) {
-            Ok(len) => len,
-            Err(_) => {
+            if old_address.0.checked_add(old_size) == Some(this.mem.lock().mmap_next) {
+                let Some(new_end) = old_address.0.checked_add(new_size) else {
+                    return Ok(LINUX_ENOMEM.into());
+                };
+                if range_within(old_address.0, new_size, LINUX_MMAP_BASE, LINUX_MMAP_SIZE) {
+                    this.mem.lock().mmap_next = new_end;
+                    return Ok(DispatchOutcome::Returned {
+                        value: old_address.0 as i64,
+                    });
+                }
+            }
+
+            if flags & LINUX_MREMAP_MAYMOVE == 0 {
                 return Ok(LINUX_ENOMEM.into());
             }
-        };
-        if copy_len > 0 {
-            match memory.read_bytes(old_address.0, copy_len) {
-                Ok(bytes) => {
-                    let _ = memory.write_bytes(new_addr, &bytes);
-                }
-                Err(_) => {
-                    return Ok(LINUX_EFAULT.into());
-                }
+            let Some((new_addr, reused)) =
+                this.next_mmap_address(0, new_size, LINUX_PROT_READ | LINUX_PROT_WRITE, 0)
+            else {
+                return Ok(LINUX_ENOMEM.into());
+            };
+            if reused && let Ok(n) = usize::try_from(new_size) {
+                let zeros = vec![0u8; n];
+                let _ = memory.write_bytes(new_addr, &zeros);
             }
-        }
-        Ok(DispatchOutcome::Returned {
-            value: new_addr as i64,
-        })
-    }
-
-    fn mprotect(this, cx, address: GuestPtr, length: u64, prot: u64) {
-        if prot & !(LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC) != 0 {
-            return Ok(LINUX_EINVAL.into());
-        }
-        if length == 0 {
-            return Ok(DispatchOutcome::Returned { value: 0 });
-        }
-        if !address.0.is_multiple_of(LINUX_PAGE_SIZE) {
-            return Ok(LINUX_EINVAL.into());
-        }
-        if let Ok(len) = usize::try_from(length) {
-            let prot_none = prot & (LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC) == 0;
-            cx.memory.set_no_access(address.0, len, prot_none);
-        }
-        Ok(DispatchOutcome::Returned { value: 0 })
-    }
-
-    fn madvise(this, cx, address: GuestPtr, length: u64, advice: u64) {
-        let memory = &mut *cx.memory;
-
-        if !address.0.is_multiple_of(LINUX_PAGE_SIZE) || !linux_madvise_advice_is_supported(advice) {
-            return Ok(LINUX_EINVAL.into());
-        }
-        if length == 0 {
-            return Ok(DispatchOutcome::Returned { value: 0 });
-        }
-
-        let Ok(length) = usize::try_from(length) else {
-            return Ok(LINUX_ENOMEM.into());
-        };
-        let Some(last_address) = address.0.checked_add(length as u64 - 1) else {
-            return Ok(LINUX_ENOMEM.into());
-        };
-        if memory.read_bytes(address.0, 1).is_err() || memory.read_bytes(last_address, 1).is_err() {
-            return Ok(LINUX_ENOMEM.into());
-        }
-        if advice == LINUX_MADV_DONTNEED {
-            const ZERO_CHUNK: [u8; 4096] = [0; 4096];
-            let mut remaining = length;
-            let mut cursor = address.0;
-            while remaining > 0 {
-                let chunk = remaining.min(ZERO_CHUNK.len());
-                if memory.write_bytes(cursor, &ZERO_CHUNK[..chunk]).is_err() {
+            let copy_len = match usize::try_from(old_size) {
+                Ok(len) => len,
+                Err(_) => {
                     return Ok(LINUX_ENOMEM.into());
                 }
-                remaining -= chunk;
-                cursor += chunk as u64;
+            };
+            if copy_len > 0 {
+                match memory.read_bytes(old_address.0, copy_len) {
+                    Ok(bytes) => {
+                        let _ = memory.write_bytes(new_addr, &bytes);
+                    }
+                    Err(_) => {
+                        return Ok(LINUX_EFAULT.into());
+                    }
+                }
             }
+            Ok(DispatchOutcome::Returned {
+                value: new_addr as i64,
+            })
         }
-        Ok(DispatchOutcome::Returned { value: 0 })
-    }
 
-    fn sys_membarrier(this, cx, command: u64, flags: u64) {
-        Ok(this.membarrier(command, flags))
+        fn mprotect(this, cx, address: GuestPtr, length: u64, prot: u64) {
+            if prot & !(LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC) != 0 {
+                return Ok(LINUX_EINVAL.into());
+            }
+            if length == 0 {
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            }
+            if !address.0.is_multiple_of(LINUX_PAGE_SIZE) {
+                return Ok(LINUX_EINVAL.into());
+            }
+            if let Ok(len) = usize::try_from(length) {
+                let prot_none = prot & (LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC) == 0;
+                cx.memory.set_no_access(address.0, len, prot_none);
+            }
+            Ok(DispatchOutcome::Returned { value: 0 })
+        }
+
+        fn madvise(this, cx, address: GuestPtr, length: u64, advice: u64) {
+            let memory = &mut *cx.memory;
+
+            if !address.0.is_multiple_of(LINUX_PAGE_SIZE) || !linux_madvise_advice_is_supported(advice) {
+                return Ok(LINUX_EINVAL.into());
+            }
+            if length == 0 {
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            }
+
+            let Ok(length) = usize::try_from(length) else {
+                return Ok(LINUX_ENOMEM.into());
+            };
+            let Some(last_address) = address.0.checked_add(length as u64 - 1) else {
+                return Ok(LINUX_ENOMEM.into());
+            };
+            if memory.read_bytes(address.0, 1).is_err() || memory.read_bytes(last_address, 1).is_err() {
+                return Ok(LINUX_ENOMEM.into());
+            }
+            if advice == LINUX_MADV_DONTNEED {
+                const ZERO_CHUNK: [u8; 4096] = [0; 4096];
+                let mut remaining = length;
+                let mut cursor = address.0;
+                while remaining > 0 {
+                    let chunk = remaining.min(ZERO_CHUNK.len());
+                    if memory.write_bytes(cursor, &ZERO_CHUNK[..chunk]).is_err() {
+                        return Ok(LINUX_ENOMEM.into());
+                    }
+                    remaining -= chunk;
+                    cursor += chunk as u64;
+                }
+            }
+            Ok(DispatchOutcome::Returned { value: 0 })
+        }
+
+        fn sys_membarrier(this, cx, command: u64, flags: u64) {
+            Ok(this.membarrier(command, flags))
+        }
     }
-}
 }
 
 fn linux_madvise_advice_is_supported(advice: u64) -> bool {

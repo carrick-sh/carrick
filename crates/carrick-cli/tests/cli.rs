@@ -4,8 +4,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use assert_cmd::Command;
-use carrick_test_support::gzip_tar;
 use carrick_image::{ImageReference, ImageStore, LayerSummary, PullSummary};
+use carrick_test_support::gzip_tar;
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 

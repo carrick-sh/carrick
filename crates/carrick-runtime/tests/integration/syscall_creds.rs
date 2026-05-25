@@ -438,7 +438,8 @@ fn scheduler_bootstrap_yields_and_writes_current_affinity() {
         }
     );
     let mut expected_affinity = vec![0u8; LINUX_BOOTSTRAP_AFFINITY_BYTES];
-    for cpu in 0..carrick_runtime::host_facts::logical_cpu_count().min(expected_affinity.len() * 8) {
+    for cpu in 0..carrick_runtime::host_facts::logical_cpu_count().min(expected_affinity.len() * 8)
+    {
         expected_affinity[cpu / 8] |= 1 << (cpu % 8);
     }
     assert_eq!(

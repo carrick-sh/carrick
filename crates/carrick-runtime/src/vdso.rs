@@ -183,9 +183,30 @@ pub fn vdso_image_bytes() -> Vec<u8> {
         w64(buf, o + 16, size); // st_size
     };
     sym(&mut buf, 0, 0, 0, 0, false);
-    sym(&mut buf, 1, name_gettime, off_code as u64 + SYM_CLOCK_GETTIME, SYM_GETTIMEOFDAY - SYM_CLOCK_GETTIME, true);
-    sym(&mut buf, 2, name_gtod, off_code as u64 + SYM_GETTIMEOFDAY, SYM_CLOCK_GETRES - SYM_GETTIMEOFDAY, true);
-    sym(&mut buf, 3, name_getres, off_code as u64 + SYM_CLOCK_GETRES, (VDSO_CODE.len() as u64) - SYM_CLOCK_GETRES, true);
+    sym(
+        &mut buf,
+        1,
+        name_gettime,
+        off_code as u64 + SYM_CLOCK_GETTIME,
+        SYM_GETTIMEOFDAY - SYM_CLOCK_GETTIME,
+        true,
+    );
+    sym(
+        &mut buf,
+        2,
+        name_gtod,
+        off_code as u64 + SYM_GETTIMEOFDAY,
+        SYM_CLOCK_GETRES - SYM_GETTIMEOFDAY,
+        true,
+    );
+    sym(
+        &mut buf,
+        3,
+        name_getres,
+        off_code as u64 + SYM_CLOCK_GETRES,
+        (VDSO_CODE.len() as u64) - SYM_CLOCK_GETRES,
+        true,
+    );
 
     // ---- .dynstr ----
     buf[off_dynstr..off_dynstr + dynstr.len()].copy_from_slice(&dynstr);

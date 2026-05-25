@@ -3,12 +3,12 @@
 //! The engine bridges CLI-facing run specs to image resolution, rootfs
 //! composition, filesystem backend selection, and runtime execution.
 
-use std::collections::HashMap;
 use camino::Utf8PathBuf;
+use std::collections::HashMap;
 
-pub use carrick_spec::{RunSpec, FsBackendKind, Mount, ImageConfig};
 pub use carrick_image::{ImageStore, ResolvedImage};
 pub use carrick_runtime::runtime::RunResult;
+pub use carrick_spec::{FsBackendKind, ImageConfig, Mount, RunSpec};
 
 #[derive(Debug, Clone)]
 pub struct CliRunRequest {
@@ -28,10 +28,7 @@ pub struct CliRunRequest {
     pub fs: Option<FsBackendKind>,
 }
 
-pub fn resolve_run_spec(
-    req: CliRunRequest,
-    image: ResolvedImage,
-) -> Result<RunSpec, String> {
+pub fn resolve_run_spec(req: CliRunRequest, image: ResolvedImage) -> Result<RunSpec, String> {
     // 1. Resolve argv (entrypoint + cmd overrides)
     let effective_entrypoint = match req.entrypoint_override {
         Some(overrides) => overrides,
@@ -66,7 +63,10 @@ pub fn resolve_run_spec(
 
     // Add baseline defaults ONLY if not already set by image config
     let baseline_defaults = [
-        ("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
+        (
+            "PATH",
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        ),
         ("HOME", "/root"),
         ("TERM", "xterm-256color"),
         ("LANG", "C.UTF-8"),
@@ -75,7 +75,9 @@ pub fn resolve_run_spec(
         ("PAGER", "cat"),
     ];
     for (k, v) in baseline_defaults {
-        env_map.entry(k.to_string()).or_insert_with(|| v.to_string());
+        env_map
+            .entry(k.to_string())
+            .or_insert_with(|| v.to_string());
     }
 
     // Add env overrides (last-wins)
@@ -95,7 +97,8 @@ pub fn resolve_run_spec(
     let cwd = match req.workdir {
         Some(w) => Some(Utf8PathBuf::from(w)),
         None => image.config.working_dir.clone(),
-    }.or_else(|| Some(Utf8PathBuf::from("/")));
+    }
+    .or_else(|| Some(Utf8PathBuf::from("/")));
 
     // 4. Resolve user
     let _user = req.user.clone().or_else(|| image.config.user.clone());
@@ -144,22 +147,29 @@ impl Engine {
         let image_ref = carrick_spec::ImageReference::parse(&req.image_ref)
             .map_err(|e| anyhow::anyhow!("invalid image reference: {}", e))?;
 
-        let resolved = self.store.resolve(&image_ref).await
+        let resolved = self
+            .store
+            .resolve(&image_ref)
+            .await
             .map_err(|e| anyhow::anyhow!("failed to resolve image: {}", e))?;
 
-        let run_spec = resolve_run_spec(req, resolved)
-            .map_err(|e| anyhow::Error::msg(e))?;
+        let run_spec = resolve_run_spec(req, resolved).map_err(|e| anyhow::Error::msg(e))?;
 
         let result = carrick_runtime::Runtime::execute(&run_spec)?;
         Ok(result)
-     }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn make_test_image(entrypoint: Option<Vec<String>>, cmd: Option<Vec<String>>, env: Vec<String>, working_dir: Option<Utf8PathBuf>) -> ResolvedImage {
+    fn make_test_image(
+        entrypoint: Option<Vec<String>>,
+        cmd: Option<Vec<String>>,
+        env: Vec<String>,
+        working_dir: Option<Utf8PathBuf>,
+    ) -> ResolvedImage {
         ResolvedImage {
             layers: vec![Utf8PathBuf::from("/layer1")],
             config: ImageConfig {
@@ -284,12 +294,17 @@ mod tests {
             fs: Some(FsBackendKind::Memory),
         };
         let spec = resolve_run_spec(req, image).unwrap();
-        
-        let env_map: HashMap<String, String> = spec.envp
+
+        let env_map: HashMap<String, String> = spec
+            .envp
             .iter()
-            .map(|e| e.split_once('=').map(|(k, v)| (k.to_string(), v.to_string())).unwrap())
+            .map(|e| {
+                e.split_once('=')
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .unwrap()
+            })
             .collect();
-        
+
         assert_eq!(env_map.get("PATH").unwrap(), "/image/bin"); // Image env wins over baseline defaults
         assert_eq!(env_map.get("CUSTOM").unwrap(), "2"); // Override wins over image env
         assert_eq!(env_map.get("USER_VAR").unwrap(), "yes");
