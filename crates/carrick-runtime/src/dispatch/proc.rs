@@ -183,7 +183,7 @@ impl SyscallDispatcher {
         let description = OpenDescription::Pidfd {
             host_pid,
             kqueue: std::sync::Arc::new(kqueue),
-            status_flags,
+            base: OpenDescriptionBase::new(status_flags),
         };
         self.install_fd(description, 0)
     }
