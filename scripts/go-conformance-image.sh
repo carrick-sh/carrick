@@ -23,7 +23,11 @@ export CARRICK_INSECURE_REGISTRIES="${CARRICK_INSECURE_REGISTRIES:-localhost:500
 
 pkgs=("$@")
 if [ ${#pkgs[@]} -eq 0 ]; then
-  mapfile -t pkgs < "$repo/scripts/go-conformance-packages.txt"
+  # bash 3.2 (macOS default) has no `mapfile`; read the package list portably.
+  pkgs=()
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -n "$line" ] && pkgs+=("$line")
+  done < "$repo/scripts/go-conformance-packages.txt"
 fi
 
 logs="/tmp/go-img-conformance"; mkdir -p "$logs"
