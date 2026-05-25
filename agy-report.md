@@ -406,6 +406,7 @@ The DAC (discretionary access control) check lives in `dispatch/mod.rs` — shou
 | `cargo tree -p carrick-spec --no-default-features` | done | Inspected with `rg` for `clap`; no dependency is present in the bare spec dependency graph. |
 | `cargo test -p carrick-runtime --lib dtrace_consumer::tests::join_ids_formats_comma_separated_decimal_ids -- --nocapture` | done | Verifies the shared trace group-id formatter used by runtime and CLI. |
 | `cargo test -p carrick-runtime --lib dispatch::mem::tests::next_mmap_address_reuses_freed_arena_region -- --nocapture` | done | Verifies anonymous/private mmap arena holes are reused from `free_regions`. |
+| `cargo test -p carrick-runtime --lib 'dispatch::net::tests::' -- --nocapture` | done | Verifies address-family, message-flag, sockaddr layout, sockaddr truncation, and host-socket nonblocking translation tests. |
 
 ### Tier 1
 
@@ -440,7 +441,7 @@ The DAC (discretionary access control) check lives in `dispatch/mod.rs` — shou
 | 17 | Remove `clap` from `carrick-spec` dependencies | done | `clap` is now optional behind a `clap` feature; `FsBackendKind` derives `ValueEnum` only when that feature is enabled, and `carrick-cli` opts in. |
 | 18 | Remove unused `ContainerSpec` from `carrick-spec` | done | Removed the unused public type after repo-wide `rg` showed no references outside its definition. |
 | 19 | Add catch-all errno mapping for unmapped Darwin codes >34 | done | Added regression for Darwin `ENOATTR` and unknown `999`; fallback now preserves 1..=34 identity and maps unmapped extensions to Linux `EIO`. |
-| 20 | Add unit tests for translation functions | open | Errno has tests; sockaddr/flags need inventory. |
+| 20 | Add unit tests for translation functions | done | Added focused net translation tests for address families, message flags, IPv4 sockaddr layout round-trip, and Linux sockaddr truncation semantics; errno translation was already covered. |
 | 21 | Add ELF fuzzing harness | deferred | Requires fuzzing toolchain choice and CI policy. |
 | 22 | Expand conformance probes | deferred | Ongoing program, not one bounded patch. |
 | 23 | Consider mmap arena reclamation | done | Current `MemState` has `free_regions` reuse and tail-trim logic; added a focused regression and fixed the stale top-level mmap arena comment. |
