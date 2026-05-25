@@ -338,7 +338,7 @@ impl CompatReporter {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompatReport {
     pub summary: CompatSummary,
     pub unhandled_syscalls: Vec<SyscallCount>,

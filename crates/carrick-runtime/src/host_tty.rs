@@ -581,6 +581,8 @@ mod tests {
         assert_eq!(l2.c_cc[0], 0x42);
     }
 
+    static TTY_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     // ---- helpers for make_raw tests ----
 
     fn open_test_pty_for_raw() -> (i32, i32) {
@@ -598,6 +600,7 @@ mod tests {
 
     #[test]
     fn make_raw_clears_icanon_and_echo() {
+        let _guard = TTY_TEST_LOCK.lock();
         let (master, slave) = open_test_pty_for_raw();
         let before = unsafe {
             let mut t: libc::termios = std::mem::zeroed();
@@ -627,6 +630,7 @@ mod tests {
 
     #[test]
     fn make_raw_snapshot_survives_restore() {
+        let _guard = TTY_TEST_LOCK.lock();
         // Open a fresh pty slave so we don't interfere with fd-0 restore state.
         let (master, slave) = open_test_pty_for_raw();
 
