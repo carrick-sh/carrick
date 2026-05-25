@@ -1830,6 +1830,25 @@ impl SyscallDispatcher {
         self.io.cwd.read().clone()
     }
 
+    /// Set the guest's initial working directory (docker `-w` / image
+    /// `WorkingDir`), applied before the guest starts. `getcwd(2)` and relative
+    /// path resolution observe it. The path is normalized to an absolute,
+    /// no-trailing-slash form; non-absolute input is ignored (the default `/`
+    /// stands). Existence is not enforced here — matching docker, which treats
+    /// a missing workdir leniently — a later `chdir` validates if the guest
+    /// makes one.
+    pub fn set_cwd(&self, path: &str) {
+        if !path.starts_with('/') {
+            return;
+        }
+        let trimmed = path.trim_end_matches('/');
+        *self.io.cwd.write() = if trimmed.is_empty() {
+            "/".to_owned()
+        } else {
+            trimmed.to_owned()
+        };
+    }
+
     /// Shared pseudo-terminal table. Also held by the `/dev` (ptmx) and
     /// `/dev/pts` mounts — all three see the same Arc. Used by the ioctl
     /// (TIOCSPTLCK) and close (free-on-master-close) handlers.
