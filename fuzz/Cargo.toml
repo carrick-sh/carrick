@@ -1,0 +1,21 @@
+[package]
+name = "carrick-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+carrick-runtime = { path = "../crates/carrick-runtime" }
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "elf_load_plan"
+path = "fuzz_targets/elf_load_plan.rs"
+test = false
+doc = false
+bench = false
