@@ -278,14 +278,14 @@ fn dispatch_declares_no_abi_constants() {
     // only; function-body `const` locals (e.g. ad-hoc SYS_* inside a probe fn)
     // are not module ABI and are intentionally allowed.
     let sources = [
-        include_str!("../src/dispatch/mod.rs"),
-        include_str!("../src/dispatch/fs.rs"),
-        include_str!("../src/dispatch/mem.rs"),
-        include_str!("../src/dispatch/signal.rs"),
-        include_str!("../src/dispatch/creds.rs"),
-        include_str!("../src/dispatch/net.rs"),
-        include_str!("../src/dispatch/time.rs"),
-        include_str!("../src/dispatch/proc.rs"),
+        include_str!("../../src/dispatch/mod.rs"),
+        include_str!("../../src/dispatch/fs.rs"),
+        include_str!("../../src/dispatch/mem.rs"),
+        include_str!("../../src/dispatch/signal.rs"),
+        include_str!("../../src/dispatch/creds.rs"),
+        include_str!("../../src/dispatch/net.rs"),
+        include_str!("../../src/dispatch/time.rs"),
+        include_str!("../../src/dispatch/proc.rs"),
     ];
     for src in sources {
         for line in src.lines() {
