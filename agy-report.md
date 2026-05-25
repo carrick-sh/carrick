@@ -455,4 +455,4 @@ The DAC (discretionary access control) check lives in `dispatch/mod.rs` — shou
 | 27 | Add module-level docs to all files | open | Documentation sweep. |
 | 28 | Unify `run_cli()` logging | open | CLI behavior/logging cleanup. |
 | 29 | Decide `carrick-engine` fate | deferred | Product/API decision; current implementation appears to be growing the engine. |
-| 30 | Consider slot reuse for `NEXT_SLOT` in `guest_cpu.rs` | open | Needs current slot lifecycle audit. |
+| 30 | Consider slot reuse for `NEXT_SLOT` in `guest_cpu.rs` | done | Audited lifecycle: slot reuse is intentionally avoided because departed slots still contribute to total CPU time and TLS-destructor reuse would complicate fork reset semantics; overflow shares the last atomic slot without losing total accounting. |
