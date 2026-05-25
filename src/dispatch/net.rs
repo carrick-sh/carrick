@@ -1821,7 +1821,8 @@ define_syscall! {
         let writefds_addr = writefds.0;
         let exceptfds_addr = exceptfds.0;
         let timeout_addr = timeout.0;
-        let request = &cx.request;
+        let request_number = cx.number();
+        let request_args = cx.raw_args();
         let memory = &mut *cx.memory;
         let reporter = cx.reporter;
 
@@ -1977,9 +1978,9 @@ define_syscall! {
                     // missing readiness signal, not a real idle wait. Make it
                     // loud in `carrick trace` instead of silently returning 0.
                     reporter.record(CompatEvent::partial_syscall(
-                        request.number,
+                        request_number,
                         "pselect6",
-                        request.args,
+                        request_args,
                         "blocked ~60s with no fd ready (possible poll deadlock)",
                     ));
                     break;
@@ -2071,7 +2072,8 @@ define_syscall! {
         // VALUE is read from guest memory below once `memory` is bound.
         let sigmask_addr = sigmask.0;
         let sigsetsize = sigsetsize;
-        let request = &cx.request;
+        let request_number = cx.number();
+        let request_args = cx.raw_args();
         let memory = &mut *cx.memory;
         let reporter = cx.reporter;
 
@@ -2245,9 +2247,9 @@ define_syscall! {
                 // no fd ever became ready — surface it loudly in carrick trace
                 // rather than silently returning 0 (a likely poll deadlock).
                 reporter.record(CompatEvent::partial_syscall(
-                    request.number,
+                    request_number,
                     "ppoll",
-                    request.args,
+                    request_args,
                     "blocked ~60s with no fd ready (possible poll deadlock)",
                 ));
                 break;

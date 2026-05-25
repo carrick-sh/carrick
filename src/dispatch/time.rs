@@ -264,7 +264,7 @@ define_syscall! {
                     .record(crate::compat::CompatEvent::partial_syscall(
                         103,
                         "setitimer",
-                        cx.request.args,
+                        cx.raw_args(),
                         format!(
                             "setitimer delivery is emulated with an EVFILT_TIMER on the signal pump kqueue and {signal_name}"
                         ),

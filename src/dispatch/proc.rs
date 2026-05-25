@@ -457,7 +457,7 @@ define_syscall! {
 
     fn futex(this, cx, address: GuestPtr, operation: u64, value: u64, timeout_address: GuestPtr) {
         let value = value as u32;
-        let args = cx.request.args;
+        let args = cx.raw_args();
         let thread = cx.thread;
         let memory = &*cx.memory;
         const LINUX_FUTEX_WAIT_BITSET: u64 = 9;
@@ -900,7 +900,7 @@ define_syscall! {
 
     fn sys_exit(this, cx, code: u64) {
         let code = code as i32;
-        if cx.request.number == 93
+        if cx.number() == 93
             && let Some(t) = cx.thread
             && t.registry.live_count() > 1
         {
