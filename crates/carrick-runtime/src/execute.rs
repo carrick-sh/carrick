@@ -20,18 +20,13 @@ impl Runtime {
             crate::dispatch::set_host_process_name(base.as_bytes());
         }
 
-        // Standard Linux environment provided to every guest run.
-        let mut env: Vec<String> = vec![
-            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_owned(),
-            "HOME=/root".to_owned(),
-            "TERM=xterm-256color".to_owned(),
-            "LANG=C.UTF-8".to_owned(),
-            "LC_ALL=C.UTF-8".to_owned(),
-            "DEBIAN_FRONTEND=noninteractive".to_owned(),
-            "PAGER=cat".to_owned(),
-        ];
-        // Forward envp from spec
-        env.extend(spec.envp.clone());
+        // The environment is already fully resolved by the engine layer
+        // (image ENV + baseline defaults for missing keys + CLI overrides, in
+        // docker precedence). Pass it through verbatim — injecting a second
+        // baseline here would place duplicate keys *before* spec.envp, and
+        // glibc's getenv returns the first match, silently overriding the
+        // image's own ENV (e.g. PATH). The engine is the single source of env.
+        let env: Vec<String> = spec.envp.clone();
 
         let result = match spec.fs_backend {
             FsBackendKind::Host => {
@@ -50,6 +45,9 @@ impl Runtime {
 
                 let mut dispatcher = SyscallDispatcher::new();
                 dispatcher.set_executable_path(spec.executable.clone());
+                if let Some(cwd) = &spec.cwd {
+                    dispatcher.set_cwd(cwd.as_str());
+                }
 
                 seed_guest_baseline(&mut host);
 
@@ -107,6 +105,9 @@ impl Runtime {
                     rootfs.clone(),
                     spec.executable.clone(),
                 );
+                if let Some(cwd) = &spec.cwd {
+                    dispatcher.set_cwd(cwd.as_str());
+                }
 
                 install_fs_backend(&mut dispatcher, FsBackendKind::Memory)
                     .map_err(|e| RuntimeError::FsBackend(anyhow::anyhow!("failed to install fs backend: {}", e)))?;
