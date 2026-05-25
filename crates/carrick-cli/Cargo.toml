@@ -1,0 +1,24 @@
+[package]
+name = "carrick-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "carrick"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+carrick-runtime = { path = "../carrick-runtime" }
+anyhow.workspace = true
+clap.workspace = true
+camino.workspace = true
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
