@@ -35,6 +35,7 @@ pub mod thread;
 pub mod trap;
 pub mod ulock;
 pub mod vcpu_kick;
+pub mod vdso;
 pub mod vfs;
 pub mod execute;
 pub use execute::Runtime;

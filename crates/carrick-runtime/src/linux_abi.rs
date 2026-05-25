@@ -33,6 +33,8 @@ pub const LINUX_AT_SECURE: u64 = 23;
 pub const LINUX_AT_RANDOM: u64 = 25;
 pub const LINUX_AT_HWCAP2: u64 = 26;
 pub const LINUX_AT_EXECFN: u64 = 31;
+/// Base address of the kernel-provided vDSO ELF (carrick's fast clock page).
+pub const LINUX_AT_SYSINFO_EHDR: u64 = 33;
 pub const LINUX_PAGE_SIZE: u64 = 4096;
 pub const LINUX_UTSNAME_FIELD_SIZE: usize = 65;
 /// Number of u64s in the kernel ABI sigset_t. Linux uapi defines
