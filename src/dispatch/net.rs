@@ -666,29 +666,10 @@ impl SyscallDispatcher {
                     return DispatchOutcome::errno(LINUX_EFAULT);
                 }
             };
-            // Build a synthetic sendmsg request that points at this
-            // entry's msg_hdr (which is the first 56 bytes of the
-            // mmsghdr). Reusing sendmsg keeps the iovec-pack + sockaddr-
-            // translate logic in one place.
-            let inner_req = SyscallRequest::new(
-                211, // sendmsg
-                SyscallArgs([fd as u64, entry, 0, flags as u64, 0, 0]),
-            );
-            let inner_reporter = CompatReporter::default();
-            let outcome = {
-                let mut inner_ctx = SyscallCtx {
-                    request: inner_req,
-                    memory: &mut *memory,
-                    reporter: &inner_reporter,
-                    thread: None,
-                };
-                match self.sendmsg(&mut inner_ctx) {
-                    Ok(o) => o,
-                    // sendmsg never produces a DispatchError; surface it
-                    // as EFAULT to keep this helper's bare-outcome contract.
-                    Err(_) => {
-                        return DispatchOutcome::errno(LINUX_EFAULT);
-                    }
+            let outcome = match self.sendmsg_inner(fd, entry, flags, &*memory) {
+                Ok(o) => o,
+                Err(_) => {
+                    return DispatchOutcome::errno(LINUX_EFAULT);
                 }
             };
             match outcome {
@@ -753,25 +734,10 @@ impl SyscallDispatcher {
             } else {
                 flags
             };
-            let inner_req = SyscallRequest::new(
-                212, // recvmsg
-                SyscallArgs([fd as u64, entry, entry_flags as u64, 0, 0, 0]),
-            );
-            let inner_reporter = CompatReporter::default();
-            let outcome = {
-                let mut inner_ctx = SyscallCtx {
-                    request: inner_req,
-                    memory: &mut *memory,
-                    reporter: &inner_reporter,
-                    thread: None,
-                };
-                match self.recvmsg(&mut inner_ctx) {
-                    Ok(o) => o,
-                    // recvmsg never produces a DispatchError; surface it
-                    // as EFAULT to keep this helper's bare-outcome contract.
-                    Err(_) => {
-                        return DispatchOutcome::errno(LINUX_EFAULT);
-                    }
+            let outcome = match self.recvmsg_inner(fd, entry, entry_flags, &mut *memory) {
+                Ok(o) => o,
+                Err(_) => {
+                    return DispatchOutcome::errno(LINUX_EFAULT);
                 }
             };
             match outcome {
@@ -2899,16 +2865,41 @@ define_syscall! {
     }
 
     fn sendmsg(this, cx, fd: Fd, msg: GuestPtr, flags: u64) {
+        this.sendmsg_inner(fd.0, msg.0, flags as i32, &*cx.memory)
+    }
 
-        let memory = &*cx.memory;
-        let fd = fd.0 as i32;
-        let msg_addr = msg.0;
-        let flags = flags as i32;
-        let is_netlink = this.fd_is_netlink(fd);
+    fn recvmsg(this, cx, fd: Fd, msg: GuestPtr, flags: u64) {
+        this.recvmsg_inner(fd.0, msg.0, flags as i32, &mut *cx.memory)
+    }
+
+    fn sys_recvmmsg(this, cx, fd: Fd, mmsg: GuestPtr, vlen: u64, flags: u64, timeout: GuestPtr) {
+
+        Ok(this.recvmmsg(fd, mmsg, vlen, flags, timeout, cx.memory))
+    
+    }
+
+    fn sys_sendmmsg(this, cx, fd: Fd, mmsg: GuestPtr, vlen: u64, flags: u64) {
+
+        Ok(this.sendmmsg(fd, mmsg, vlen, flags, cx.memory))
+    
+    }
+
+}
+}
+
+impl SyscallDispatcher {
+    fn sendmsg_inner(
+        &self,
+        fd: i32,
+        msg_addr: u64,
+        flags: i32,
+        memory: &impl GuestMemory,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let is_netlink = self.fd_is_netlink(fd);
         let (host_fd, family) = if is_netlink {
             (-1, LINUX_AF_NETLINK)
         } else {
-            match this.host_socket_lookup(fd) {
+            match self.host_socket_lookup(fd) {
                 Ok(t) => t,
                 Err(errno) => return Ok(errno.into()),
             }
@@ -2936,7 +2927,7 @@ define_syscall! {
         // AF_NETLINK: parse the assembled request and queue a synthetic
         // dump reply, ignoring the destination sockaddr (always the kernel).
         if is_netlink {
-            return Ok(this.netlink_send(fd, &data));
+            return Ok(self.netlink_send(fd, &data));
         }
         let host_addr = if msg.name == 0 || msg.namelen == 0 {
             None
@@ -2946,9 +2937,9 @@ define_syscall! {
                 Err(errno) => return Ok(errno.into()),
             }
         };
-        let nonblocking = this.io_is_nonblocking(fd, flags);
+        let nonblocking = self.io_is_nonblocking(fd, flags);
         let host_flags = linux_to_host_msg_flags(flags) | libc::MSG_DONTWAIT;
-        let outcome = this.blocking_io(host_fd, IoDir::Write, nonblocking, || {
+        let outcome = self.blocking_io(host_fd, IoDir::Write, nonblocking, || {
             let n = match &host_addr {
                 None => unsafe {
                     libc::sendto(
@@ -2974,20 +2965,20 @@ define_syscall! {
             n.host_syscall_errno().map(|value| value as i64)
         });
         Ok(outcome)
-    
     }
 
-    fn recvmsg(this, cx, fd: Fd, msg: GuestPtr, flags: u64) {
-
-        let memory = &mut *cx.memory;
-        let fd = fd.0 as i32;
-        let msg_addr = msg.0;
-        let flags = flags as i32;
-        let is_netlink = this.fd_is_netlink(fd);
+    fn recvmsg_inner(
+        &self,
+        fd: i32,
+        msg_addr: u64,
+        flags: i32,
+        memory: &mut impl GuestMemory,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let is_netlink = self.fd_is_netlink(fd);
         let (host_fd, family) = if is_netlink {
             (-1, LINUX_AF_NETLINK)
         } else {
-            match this.host_socket_lookup(fd) {
+            match self.host_socket_lookup(fd) {
                 Ok(t) => t,
                 Err(errno) => return Ok(errno.into()),
             }
@@ -3004,7 +2995,7 @@ define_syscall! {
         // the source sockaddr_nl (kernel; pid=0), and zero controllen/flags.
         if is_netlink {
             let total: usize = iovecs.iter().map(|iov| iov.iov_len as usize).sum();
-            let chunk = this.netlink_drain(fd, total);
+            let chunk = self.netlink_drain(fd, total);
             let n = chunk.len();
             let mut remaining = n;
             let mut cursor = 0usize;
@@ -3041,9 +3032,9 @@ define_syscall! {
             return Ok(DispatchOutcome::Returned { value: n as i64 });
         }
         let total: usize = iovecs.iter().map(|iov| iov.iov_len as usize).sum();
-        let nonblocking = this.io_is_nonblocking(fd, flags);
+        let nonblocking = self.io_is_nonblocking(fd, flags);
         let host_flags = linux_to_host_msg_flags(flags) | libc::MSG_DONTWAIT;
-        let outcome = this.blocking_io(host_fd, IoDir::Read, nonblocking, || {
+        let outcome = self.blocking_io(host_fd, IoDir::Read, nonblocking, || {
             let mut buf = vec![0u8; total];
             let mut sa = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
             let mut sa_len: libc::socklen_t = sa.len() as libc::socklen_t;
@@ -3120,20 +3111,6 @@ define_syscall! {
             Ok(n as i64)
         });
         Ok(outcome)
-    
     }
-
-    fn sys_recvmmsg(this, cx, fd: Fd, mmsg: GuestPtr, vlen: u64, flags: u64, timeout: GuestPtr) {
-
-        Ok(this.recvmmsg(fd, mmsg, vlen, flags, timeout, cx.memory))
-    
-    }
-
-    fn sys_sendmmsg(this, cx, fd: Fd, mmsg: GuestPtr, vlen: u64, flags: u64) {
-
-        Ok(this.sendmmsg(fd, mmsg, vlen, flags, cx.memory))
-    
-    }
-
 }
-}
+
