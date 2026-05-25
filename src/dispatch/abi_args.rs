@@ -59,7 +59,7 @@ impl<M: GuestMemory> SyscallCtx<'_, M> {
     /// Typed argument extraction: `let fd: Fd = ctx.typed_arg(0);`
     #[inline]
     pub fn typed_arg<T: FromGuestArg>(&self, index: usize) -> T {
-        T::from_arg(self.arg(index))
+        T::from_arg(self.request.arg(index))
     }
 }
 

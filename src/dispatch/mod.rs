@@ -434,12 +434,7 @@ pub struct ThreadCtx<'a> {
     pub futex: &'a crate::thread::FutexTable,
 }
 
-impl<M: GuestMemory> SyscallCtx<'_, M> {
-    #[inline]
-    pub fn arg(&self, index: usize) -> u64 {
-        self.request.arg(index)
-    }
-}
+
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
