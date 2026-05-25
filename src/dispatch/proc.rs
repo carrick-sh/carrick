@@ -153,61 +153,6 @@ impl ProcState {
 }
 
 impl SyscallDispatcher {
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn dispatch_threaded_lifecycle<M: GuestMemory>(
-        &self,
-        request: SyscallRequest,
-        memory: &mut M,
-        reporter: &CompatReporter,
-        tid: crate::thread::ThreadId,
-        registry: &crate::thread::ThreadRegistry,
-        futex: &crate::thread::FutexTable,
-    ) -> Option<Result<DispatchOutcome, DispatchError>> {
-        if !syscall_handler_is(request.number, SyscallHandler::Lifecycle) {
-            return None;
-        }
-
-        let syscall = lookup_aarch64(request.number);
-        let name = syscall.map_or("unknown", |syscall| syscall.name);
-        reporter.record(CompatEvent::SyscallEntry {
-            number: request.number,
-            name: ::std::borrow::Cow::Borrowed(name),
-            args: request.args,
-        });
-
-        let thread = Some(ThreadCtx {
-            tid,
-            registry,
-            futex,
-        });
-        let mut ctx = SyscallCtx {
-            request,
-            memory,
-            reporter,
-            thread,
-        };
-        let outcome = match match request.number {
-            93 | 94 => self.sys_exit(&mut ctx),
-            220 => self.clone(&mut ctx),
-            221 => self.execve(&mut ctx),
-            260 => self.wait4(&mut ctx),
-            435 => self.sys_clone3(&mut ctx),
-            _ => unreachable!("unsupported threaded lifecycle syscall"),
-        } {
-            Ok(outcome) => outcome,
-            Err(error) => return Some(Err(error)),
-        };
-
-        let (retval, errno) = outcome.retval_errno();
-        reporter.record(CompatEvent::SyscallReturn {
-            number: request.number,
-            name: ::std::borrow::Cow::Borrowed(name),
-            retval,
-            errno,
-        });
-
-        Some(Ok(outcome))
-    }
 
     pub(super) fn personality<M: GuestMemory>(
         &self,
