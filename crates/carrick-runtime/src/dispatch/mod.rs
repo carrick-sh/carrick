@@ -4243,7 +4243,7 @@ mod overlay_dispatch_tests {
 
     #[test]
     fn every_migrated_syscall_is_claimed_by_the_normalized_table() {
-        let mut d = SyscallDispatcher::new();
+        let d = SyscallDispatcher::new();
         let mut mem = LinearMemory::new(0, vec![0u8; 4096]);
         let reporter = CompatReporter::default();
         // Numbers that used to live in the deleted legacy match. Each must now
