@@ -1718,7 +1718,23 @@ impl SyscallDispatcher {
         if let Some(bytes) = self.fs.rootfs_vfs.overlay.file_contents(path) {
             return Some(bytes);
         }
-        self.fs.rootfs_vfs.rootfs.as_ref()?.read(path).ok()
+        if let Some(bytes) = self
+            .fs
+            .rootfs_vfs
+            .rootfs
+            .as_ref()
+            .and_then(|r| r.read(path).ok())
+        {
+            return Some(bytes);
+        }
+        // A docker `-v` bind mount can supply the executable itself (e.g.
+        // `carrick run -v /host/bin:/gobin img /gobin/foo.test`). The overlay
+        // and rootfs miss it, so consult the mount table. `read_file` takes the
+        // absolute guest path; BindVfs strips its own mount point.
+        self.fs
+            .vfs_mounts
+            .resolve(path)
+            .and_then(|m| m.vfs.read_file(path).ok())
     }
 
     pub fn stdout(&self) -> Vec<u8> {
