@@ -1,3 +1,8 @@
+//! Carrick command-line interface.
+//!
+//! This binary wires image pulling, rootfs setup, ELF execution, tracing,
+//! compatibility reports, and APFS volume management onto the runtime crates.
+
 use std::path::PathBuf;
 
 use anyhow::{Context, bail};

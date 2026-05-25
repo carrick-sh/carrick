@@ -1,3 +1,6 @@
+//! Guest runtime loops for single-threaded and threaded execution, signal
+//! delivery, fork/exec, and wait handling.
+
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 

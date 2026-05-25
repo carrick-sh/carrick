@@ -1,3 +1,6 @@
+//! Runtime execution entry points that bridge shared run specs to
+//! dispatcher-backed guest execution.
+
 use std::path::PathBuf;
 use carrick_spec::{RunSpec, FsBackendKind};
 use crate::runtime::{RunResult, RuntimeError, run_elf_from_dispatcher_debug, run_rootfs_elf_with_hvf_args_and_dispatcher_debug};

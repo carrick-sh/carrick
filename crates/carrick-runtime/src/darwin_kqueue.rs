@@ -1,3 +1,6 @@
+//! Thin safe wrapper around Darwin kqueue/kevent operations used by waits,
+//! epoll emulation, timers, and signal pumping.
+
 use std::os::fd::RawFd;
 
 /// RAII owner for a Darwin kqueue fd.

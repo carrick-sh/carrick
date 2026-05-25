@@ -1,3 +1,6 @@
+//! Guest virtual-address layout, ELF/rootfs loading, page tables, and
+//! linear-memory helpers used by the trap engine and syscall dispatcher.
+
 use std::fs;
 use std::io::Read;
 use std::path::Path;
