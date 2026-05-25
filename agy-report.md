@@ -401,7 +401,9 @@ The DAC (discretionary access control) check lives in `dispatch/mod.rs` — shou
 | `cargo test --lib errno_translation_maps_unknown_darwin_extensions_to_eio -- --nocapture` | done | Red/green verified: initially leaked Darwin `ENOATTR` as `93`; now maps to Linux `EIO` (`5`). |
 | `cargo test --lib close_cloexec_fds_removes_marked_descriptors_only -- --nocapture` | done | Verifies CLOEXEC sweep removes marked descriptors and preserves unmarked ones. |
 | `cargo test --lib threaded_independent_dispatch_support_matches_handler_table -- --nocapture` | done | Verifies the thread-local syscall handler table stays covered by the non-panicking threaded-independent dispatch subset. |
-| `cargo check -p carrick-cli` | done | Verifies the CLI fallback for an unnormalized `shell` command compiles. |
+| `cargo check -p carrick-cli` | done | Verifies the CLI fallback for an unnormalized `shell` command and the `FsBackendKind` `clap` feature path compile. |
+| `cargo check -p carrick-spec --no-default-features` | done | Verifies the shared spec crate builds without the optional CLI-facing `clap` feature. |
+| `cargo tree -p carrick-spec --no-default-features` | done | Inspected with `rg` for `clap`; no dependency is present in the bare spec dependency graph. |
 
 ### Tier 1
 
@@ -433,8 +435,8 @@ The DAC (discretionary access control) check lives in `dispatch/mod.rs` — shou
 
 | # | Item | Status | Notes |
 |---|---|---|---|
-| 17 | Remove `clap` from `carrick-spec` dependencies | open | Likely needs a feature-gated derive or CLI-side parser. |
-| 18 | Remove unused `ContainerSpec` from `carrick-spec` | open | `rg` shows definition only; verify external API impact before removal. |
+| 17 | Remove `clap` from `carrick-spec` dependencies | done | `clap` is now optional behind a `clap` feature; `FsBackendKind` derives `ValueEnum` only when that feature is enabled, and `carrick-cli` opts in. |
+| 18 | Remove unused `ContainerSpec` from `carrick-spec` | done | Removed the unused public type after repo-wide `rg` showed no references outside its definition. |
 | 19 | Add catch-all errno mapping for unmapped Darwin codes >34 | done | Added regression for Darwin `ENOATTR` and unknown `999`; fallback now preserves 1..=34 identity and maps unmapped extensions to Linux `EIO`. |
 | 20 | Add unit tests for translation functions | open | Errno has tests; sockaddr/flags need inventory. |
 | 21 | Add ELF fuzzing harness | deferred | Requires fuzzing toolchain choice and CI policy. |
