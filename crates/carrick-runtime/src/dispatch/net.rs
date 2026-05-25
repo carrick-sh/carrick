@@ -772,6 +772,21 @@ fn read_epoll_event(memory: &impl GuestMemory, address: u64) -> Result<LinuxEpol
     read_kernel_struct(memory, address)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EpollKqFilters {
+    read: bool,
+    write: bool,
+}
+
+fn epoll_kq_filters(events: u32) -> EpollKqFilters {
+    let read = events & (LINUX_EPOLLIN | LINUX_EPOLLRDHUP | LINUX_EPOLLPRI) != 0;
+    let write = events & LINUX_EPOLLOUT != 0;
+    EpollKqFilters {
+        read: read || !write,
+        write,
+    }
+}
+
 /// Build the kqueue change list to register a host-backed fd's epoll interest
 /// on the epoll instance's persistent kqueue. EPOLLIN/RDHUP/PRI ride the read
 /// filter (EV_EOF on read → EPOLLRDHUP); EPOLLOUT rides the write filter.
@@ -791,16 +806,44 @@ fn epoll_kq_add_changes(
         0
     };
     let base = libc::EV_ADD | libc::EV_ENABLE | edge;
-    let want_read = events & (LINUX_EPOLLIN | LINUX_EPOLLRDHUP | LINUX_EPOLLPRI) != 0;
-    let want_write = events & LINUX_EPOLLOUT != 0;
+    let filters = epoll_kq_filters(events);
     let mut changes = Vec::with_capacity(2);
-    if want_read || !want_write {
+    if filters.read {
         changes.push(Kevent::read(host_fd, base).with_udata(guest_fd));
     }
-    if want_write {
+    if filters.write {
         changes.push(Kevent::write(host_fd, base).with_udata(guest_fd));
     }
     changes
+}
+
+fn epoll_kq_removed_filter_changes(
+    host_fd: i32,
+    old_events: u32,
+    new_events: u32,
+) -> Vec<crate::darwin_kqueue::Kevent> {
+    use crate::darwin_kqueue::Kevent;
+    let old = epoll_kq_filters(old_events);
+    let new = epoll_kq_filters(new_events);
+    let mut changes = Vec::with_capacity(2);
+    if old.read && !new.read {
+        changes.push(Kevent::read(host_fd, libc::EV_DELETE));
+    }
+    if old.write && !new.write {
+        changes.push(Kevent::write(host_fd, libc::EV_DELETE));
+    }
+    changes
+}
+
+fn epoll_kq_delete_removed_filters(
+    kqueue: &crate::darwin_kqueue::Kqueue,
+    host_fd: i32,
+    old_events: u32,
+    new_events: u32,
+) {
+    for change in epoll_kq_removed_filter_changes(host_fd, old_events, new_events) {
+        let _ = kqueue.apply(&[change]);
+    }
 }
 
 /// Remove both filters for a host-backed fd from the epoll instance kqueue.
@@ -1506,6 +1549,53 @@ mod tests {
         assert_eq!(u32::from_ne_bytes(required.try_into().unwrap()), 16);
     }
 
+    #[test]
+    fn epoll_kqueue_filter_selection_preserves_hup_err_observability() {
+        assert_eq!(
+            epoll_kq_filters(0),
+            EpollKqFilters {
+                read: true,
+                write: false,
+            }
+        );
+        assert_eq!(
+            epoll_kq_filters(LINUX_EPOLLIN),
+            EpollKqFilters {
+                read: true,
+                write: false,
+            }
+        );
+        assert_eq!(
+            epoll_kq_filters(LINUX_EPOLLOUT),
+            EpollKqFilters {
+                read: false,
+                write: true,
+            }
+        );
+        assert_eq!(
+            epoll_kq_filters(LINUX_EPOLLIN | LINUX_EPOLLOUT),
+            EpollKqFilters {
+                read: true,
+                write: true,
+            }
+        );
+    }
+
+    #[test]
+    fn epoll_mod_delete_list_contains_only_filters_removed_by_new_mask() {
+        let removed =
+            epoll_kq_removed_filter_changes(42, LINUX_EPOLLIN | LINUX_EPOLLOUT, LINUX_EPOLLOUT);
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].filter(), libc::EVFILT_READ);
+
+        let removed =
+            epoll_kq_removed_filter_changes(42, LINUX_EPOLLIN | LINUX_EPOLLOUT, LINUX_EPOLLIN);
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].filter(), libc::EVFILT_WRITE);
+
+        assert!(epoll_kq_removed_filter_changes(42, LINUX_EPOLLIN, LINUX_EPOLLIN).is_empty());
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn host_socket_install_forces_host_nonblocking_even_for_blocking_guest_fd() {
@@ -1651,11 +1741,18 @@ define_syscall! {
                 let Some(slot) = interest.get_mut(&fd) else {
                     return Ok(LINUX_ENOENT.into());
                 };
-                // MOD = delete the old filters then add for the new mask (Linux
-                // MOD isn't atomic on the emulation either; FreeBSD does the same).
+                let old_events = slot.event.events;
+                // MOD first applies the new filters, then removes filters no
+                // longer present in the new mask. That avoids a no-interest
+                // gap where a readiness edge can be lost; the transient overlap
+                // can only produce an extra wake.
                 if let Some(host_fd) = host_fd {
-                    epoll_kq_delete(kqueue, host_fd);
-                    let _ = kqueue.apply(&epoll_kq_add_changes(host_fd, fd, event.events));
+                    if kqueue
+                        .apply(&epoll_kq_add_changes(host_fd, fd, event.events))
+                        .is_ok()
+                    {
+                        epoll_kq_delete_removed_filters(kqueue, host_fd, old_events, event.events);
+                    }
                 }
                 clear_pending_epoll_ready(pending_ready, fd);
                 *slot = EpollInterest {

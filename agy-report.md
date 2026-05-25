@@ -406,7 +406,7 @@ The DAC (discretionary access control) check lives in `dispatch/mod.rs` — shou
 | `cargo tree -p carrick-spec --no-default-features` | done | Inspected with `rg` for `clap`; no dependency is present in the bare spec dependency graph. |
 | `cargo test -p carrick-runtime --lib dtrace_consumer::tests::join_ids_formats_comma_separated_decimal_ids -- --nocapture` | done | Verifies the shared trace group-id formatter used by runtime and CLI. |
 | `cargo test -p carrick-runtime --lib dispatch::mem::tests::next_mmap_address_reuses_freed_arena_region -- --nocapture` | done | Verifies anonymous/private mmap arena holes are reused from `free_regions`. |
-| `cargo test -p carrick-runtime --lib 'dispatch::net::tests::' -- --nocapture` | done | Verifies address-family, message-flag, sockaddr layout, sockaddr truncation, and host-socket nonblocking translation tests. |
+| `cargo test -p carrick-runtime --lib 'dispatch::net::tests::' -- --nocapture` | done | Verifies address-family, message-flag, sockaddr layout, sockaddr truncation, epoll MOD filter-change, and host-socket nonblocking translation tests. |
 | `cargo test -p carrick-cli --test linux_fixture builds_static_linux_aarch64_hello_fixture -- --nocapture` | done | Verifies the table-driven static fixture inventory still builds and validates every expected AArch64 fixture. |
 | `cargo test -p carrick-runtime --test integration rootfs_overlay::reads_file_from_uppermost_layer -- --nocapture` | done | Verifies `rootfs_overlay` uses the shared gzip/tar helper. |
 | `cargo test -p carrick-runtime --test integration address_space::load_elf_from_rootfs_maps_pt_interp_at_base_and_sets_at_base -- --nocapture` | done | Verifies the shared mode-aware gzip/tar helper preserves executable ELF entries. |
@@ -449,7 +449,7 @@ The DAC (discretionary access control) check lives in `dispatch/mod.rs` — shou
 | 21 | Add ELF fuzzing harness | deferred | Requires fuzzing toolchain choice and CI policy. |
 | 22 | Expand conformance probes | deferred | Ongoing program, not one bounded patch. |
 | 23 | Consider mmap arena reclamation | done | Current `MemState` has `free_regions` reuse and tail-trim logic; added a focused regression and fixed the stale top-level mmap arena comment. |
-| 24 | Fix `epoll_ctl MOD` atomicity | open | Needs behavioral test or documented kqueue contract. |
+| 24 | Fix `epoll_ctl MOD` atomicity | done | MOD now applies new kqueue filters before deleting filters removed by the new mask, avoiding the old delete-then-add no-interest gap; added helper tests for filter selection and removed-filter changes. |
 | 25 | Address `EPOLL_INMEM_KQUEUES` O(n) broadcast scalability | open | Design-sized scalability change. |
 | 26 | Implement `MAP_SHARED` writeback | deferred | Multi-day semantic feature; needs conformance spec. |
 | 27 | Add module-level docs to all files | open | Documentation sweep. |
