@@ -396,7 +396,7 @@ The DAC (discretionary access control) check lives in `dispatch/mod.rs` — shou
 | Check | Status | Notes |
 |---|---|---|
 | Branch/worktree | done | Working in-place on `main`; `agy-report.md` was untracked at start. |
-| `cargo fmt --all -- --check` | open | Fails before this implementation pass; rustfmt drift spans CLI/image/engine/runtime files. |
+| `cargo fmt --all -- --check` | deferred | Still fails due broad pre-existing rustfmt drift across CLI/image/engine/runtime files; applying it would create thousands of unrelated formatting-only diff lines. |
 | `cargo test --lib thread::tests` | blocked | Sandboxed run failed in the USDT/DTrace build step (`dtrace: failed to open header file '/dev/stdout'`), before tests executed. Direct non-sandbox cargo commands now build. |
 | `cargo test --lib errno_translation_maps_unknown_darwin_extensions_to_eio -- --nocapture` | done | Red/green verified: initially leaked Darwin `ENOATTR` as `93`; now maps to Linux `EIO` (`5`). |
 | `cargo test --lib close_cloexec_fds_removes_marked_descriptors_only -- --nocapture` | done | Verifies CLOEXEC sweep removes marked descriptors and preserves unmarked ones. |
@@ -426,6 +426,7 @@ The DAC (discretionary access control) check lives in `dispatch/mod.rs` — shou
 | `cargo test -p carrick-runtime --test integration fcntl_gets_and_sets_descriptor_and_status_flags -- --nocapture` | done | Verifies descriptor flags and open-description status flags still round-trip through `fcntl`. |
 | `cargo test -p carrick-runtime --test integration fionbio_updates_pipe_status_flags_and_host_nonblocking_mode -- --nocapture` | done | Verifies `FIONBIO` still updates Linux-visible status flags and host nonblocking mode. |
 | `cargo test -p carrick-runtime --lib host_socket_install_forces_host_nonblocking_even_for_blocking_guest_fd -- --nocapture` | done | Verifies socket status flags preserve guest blocking mode while host fds stay nonblocking. |
+| `wc -l crates/carrick-runtime/src/dispatch/fs.rs crates/carrick-runtime/src/dispatch/mod.rs crates/carrick-runtime/src/trap.rs crates/carrick-runtime/src/dispatch/net.rs crates/carrick-cli/src/main.rs` | done | Current split candidates remain large structural projects: 5,073 / 4,867 / 3,194 / 3,289 / 1,382 lines respectively. |
 
 ### Tier 1
 
@@ -442,11 +443,11 @@ The DAC (discretionary access control) check lives in `dispatch/mod.rs` — shou
 
 | # | Item | Status | Notes |
 |---|---|---|---|
-| 7 | Split `dispatch/fs.rs` | open | Structural refactor; do after Tier 1 behavior is protected. |
-| 8 | Split `dispatch/mod.rs` | open | Structural refactor; current file already contains some extracted modules. |
-| 9 | Split `trap.rs` | open | Structural refactor; avoid until runtime loop work is stable. |
-| 10 | Split `dispatch/net.rs` | open | Structural refactor. |
-| 11 | Split `main.rs` into command modules | open | Structural refactor. |
+| 7 | Split `dispatch/fs.rs` | deferred | Still a 5,073-line structural split touching broad filesystem syscall behavior; should be done as its own staged move/refactor plan after the current behavior-protection commits. |
+| 8 | Split `dispatch/mod.rs` | deferred | Still a 4,867-line core-dispatch split; some modules already exist (`abi_args`, `creds`, `mem`, `proc`, `signal`, `time`), but fd table, epoll/eventfd, ABI registry, and shared helpers need a dedicated ownership plan. |
+| 9 | Split `trap.rs` | deferred | Still a 3,194-line HVF/address-space/signal/fork split; needs focused HVF regression coverage and module-boundary design before moving code. |
+| 10 | Split `dispatch/net.rs` | deferred | Still a 3,289-line socket/epoll/poll/select/eventfd split; should be staged separately with net/epoll focused tests. |
+| 11 | Split `main.rs` into command modules | deferred | CLI remains 1,382 lines; moving clap command types and `run_cli()` arms into modules is a broad CLI API/test refactor, not a safe tail-end mechanical cleanup. |
 | 12 | Extract `OpenDescription` status flags | done | Added shared `OpenDescriptionBase` carrying `status_flags`; all `OpenDescription` variants now embed the base and use common `status_flags` / `set_status_flags` accessors. |
 | 13 | Consolidate stat/statx writers | done | Current code already routes metadata, real-stat, fd-stat, and synthetic-stat cases through `StatRecord`, `write_stat_record`, and `write_statx_record`; focused stat/statx agreement tests pass. |
 | 14 | Unify `gzip_tar` test helper | done | Added `carrick-test-support` with shared `gzip_tar`, `gzip_tar_with_modes`, and `gzip_tar_with_links`; runtime support and CLI tests now import it instead of carrying local copies. |
