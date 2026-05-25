@@ -330,6 +330,7 @@ thread_local! {
     /// quiesce park).
     static FORK_VCPU_SNAPSHOT: std::cell::RefCell<Option<VcpuSnapshot>> =
         const { std::cell::RefCell::new(None) };
+
 }
 
 /// Clear the published fork VM (child path; the child is single-threaded).
@@ -351,6 +352,41 @@ const SIMD_FP_TABLE: [applevisor::vcpu::SimdFpReg; 32] = {
         Q20, Q21, Q22, Q23, Q24, Q25, Q26, Q27, Q28, Q29, Q30, Q31,
     ]
 };
+
+/// Write a 128-bit value into a guest SIMD&FP (V) register.
+///
+/// Apple's `hv_simd_fp_uchar16_t` is `__attribute__((ext_vector_type(16)))
+/// uint8_t` — a 16-byte SIMD vector, which AAPCS64 passes BY VALUE in a vector
+/// (V) register. The `applevisor-sys` binding (without the nightly-only
+/// `simd-nightly` feature) mistypes the by-value `set` parameter as `u128`,
+/// which Rust passes in a general-purpose register PAIR (x2/x3). The kernel
+/// then reads the value from a V register and gets unrelated bytes — in
+/// practice zeroes — so `hv_vcpu_set_simd_fp_reg` silently corrupts the target
+/// register while returning `HV_SUCCESS`. (`get` is unaffected: it is
+/// pointer-based, so there is no register-class mismatch.)
+///
+/// This broke signal delivery: `restore_from_sigframe` could not restore the
+/// interrupted thread's V registers, so any signal taken while the guest was
+/// mid-SIMD (aarch64 `memmove`/`memequal`, FP math) resumed with zeroed vector
+/// state. Under Go that surfaced as the async-preemption (SIGURG) corruption —
+/// e.g. runtime `TestUserArena/largeScalar` comparing a buffer whose bytes are
+/// intact but whose compare loop returns the wrong answer.
+///
+/// Passing a 16-byte vector by value across `extern "C"` from Rust needs the
+/// nightly `simd_ffi` feature, so we route through a tiny C shim
+/// (`carrick_shim.c`) that takes the 16 bytes by pointer and reconstructs the
+/// `hv_simd_fp_uchar16_t` for the kernel call — C gets the vector ABI right on
+/// stable. Returns the raw `hv_return_t` (0 = `HV_SUCCESS`).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn set_simd_fp_reg_v(vcpu_id: u64, reg: applevisor_sys::hv_simd_fp_reg_t, value: u128) -> i32 {
+    unsafe extern "C" {
+        fn carrick_set_simd_fp_reg(vcpu: u64, reg: u32, bytes: *const u8) -> i32;
+    }
+    // u128 -> 16 little-endian bytes, matching the byte order `get_simd_fp_reg`
+    // produces, so save/restore round-trips as identity.
+    let bytes = value.to_le_bytes();
+    unsafe { carrick_set_simd_fp_reg(vcpu_id, reg as u32, bytes.as_ptr()) }
+}
 
 /// Which privilege level a vCPU was executing at when carrick observed it. The
 /// Linux guest runs its own code at EL0; everything at EL1 is carrick's trap
@@ -1783,7 +1819,24 @@ impl HvfInner {
             None => self.vcpu.get_sys_reg(SysReg::ELR_EL1).map_err(hvf_error)?,
         };
         frame.saved_sp = self.vcpu.get_sys_reg(SysReg::SP_EL0).map_err(hvf_error)?;
-        frame.saved_spsr = self.vcpu.get_sys_reg(SysReg::SPSR_EL1).map_err(hvf_error)?;
+        // Snapshot the interrupted code's PSTATE (incl. NZCV condition flags),
+        // restored verbatim by rt_sigreturn → eret. The correct source differs
+        // by injection path:
+        //   * syscall-boundary (interrupted_pc == None): the guest `svc` took a
+        //     synchronous exception to EL1, so the hardware latched the EL0
+        //     PSTATE into SPSR_EL1. CPSR now reads the EL1 trampoline's state.
+        //     SPSR_EL1 is authoritative.
+        //   * kick (interrupted_pc == Some): a cross-thread hv_vcpus_exit forced
+        //     a CANCELED exit while the guest was live at EL0 — NO exception was
+        //     taken, so SPSR_EL1 is stale (it holds whatever the *previous*
+        //     syscall latched). The live EL0 PSTATE is in CPSR. Reading SPSR_EL1
+        //     here resumes the preempted routine with stale NZCV — conditional
+        //     branches go the wrong way (memory intact, computation wrong),
+        //     which is exactly Go's async-preemption (SIGURG) corruption.
+        frame.saved_spsr = match interrupted_pc {
+            Some(_) => self.vcpu.get_reg(Reg::CPSR).map_err(hvf_error)?,
+            None => self.vcpu.get_sys_reg(SysReg::SPSR_EL1).map_err(hvf_error)?,
+        };
 
         let mut siginfo = crate::linux_abi::LinuxSiginfo::empty();
         siginfo.si_signo = signum;
@@ -1974,10 +2027,18 @@ impl HvfInner {
             return Ok(());
         }
         let vregs = fp.vregs;
+        let vcpu_id = self.vcpu.id();
         for (i, reg) in SIMD_FP_TABLE.iter().enumerate() {
-            self.vcpu
-                .set_simd_fp_reg(*reg, vregs[i])
-                .map_err(hvf_error)?;
+            // NB: route through the C shim, NOT applevisor's set_simd_fp_reg —
+            // its u128 by-value param uses the wrong (GP) register class for
+            // Apple's vector-typed API and silently zeroes the register. See
+            // `set_simd_fp_reg_v`.
+            let rc = set_simd_fp_reg_v(vcpu_id, *reg, vregs[i]);
+            if rc != 0 {
+                return Err(TrapError::Hypervisor(format!(
+                    "hv_vcpu_set_simd_fp_reg(q{i}) failed: rc={rc:#x}"
+                )));
+            }
         }
         let (fpsr, fpcr) = (fp.fpsr, fp.fpcr);
         self.vcpu
