@@ -2162,11 +2162,14 @@ fn load_execve_image(
         argv
     };
 
+    // Absolutize a RELATIVE execve target against the guest cwd before any
+    // layer lookup (Linux resolves `execve("b/foo")` against the caller's cwd;
+    // carrick's layers key on absolute guest paths). See `resolve_exec_path`.
     // Resolve `#!` shebang scripts the way the Linux kernel does: read
     // the file, and if it begins with `#!`, re-target exec at the
     // interpreter with the script path spliced into argv. Bounded to 4
     // levels (Linux's BINPRM_MAX_RECURSION) to stop interpreter loops.
-    let mut path = path.to_string();
+    let mut path = dispatcher.resolve_exec_path(path);
     for _ in 0..4 {
         let Some(head) = dispatcher.read_exec_file(&path) else {
             break;
