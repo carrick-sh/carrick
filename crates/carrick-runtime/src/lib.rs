@@ -31,6 +31,7 @@ pub(crate) mod itimer;
 pub mod linux_abi;
 pub mod memory;
 pub mod overlay;
+pub(crate) mod page_table;
 
 pub mod execute;
 pub mod probes;
