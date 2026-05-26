@@ -644,6 +644,72 @@ impl SyscallDispatcher {
             .map(|md| vfs_md_to_rootfs_md(path, &md))
     }
 
+    /// Read a symlink's target string through the layered view (writable overlay
+    /// first, then rootfs/mounts) — mirrors `readlinkat`. `None` if `path` isn't
+    /// a symlink any backend can read.
+    fn readlink_layered(&self, path: &str) -> Option<String> {
+        if let Some(target) = self.fs.rootfs_vfs.overlay.read_link(path) {
+            return Some(target);
+        }
+        use crate::vfs::Vfs as _;
+        self.fs
+            .rootfs_vfs
+            .readlink(path)
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+    }
+
+    /// Resolve `path` following a trailing symlink chain THROUGH the full VFS
+    /// (overlay + mount table), returning the final non-symlink absolute guest
+    /// path. The per-backend `real_stat`/`lookup` only follow symlinks within a
+    /// single backend, so a symlink in one mount (e.g. a `/tmp` host-scratch
+    /// link) whose target lands in another (e.g. a `/run` bind mount) doesn't
+    /// resolve — the cause of `chdir`-to-such-a-symlink returning ENOTDIR and
+    /// `stat`'s dev/ino mismatching across the boundary (Go os/exec
+    /// TestExplicitPWD). We re-resolve each target against the whole VFS.
+    /// Bounded by `LINUX_ELOOP`. Follows only the FINAL component; an
+    /// intermediate cross-mount symlink is a known, separate limitation.
+    /// Layered LSTAT: like `layered_metadata` but does NOT follow a trailing
+    /// symlink — reports `Symlink` for a symlink so `canonicalize_following` can
+    /// read its target. (`layered_metadata`/`Vfs::lookup` follow, and a
+    /// cross-mount symlink they can't follow gets misclassified as a plain
+    /// File.) Mounts answer for their subtree; otherwise the overlay-aware
+    /// `lookup_nofollow` does.
+    fn layered_lstat(&self, path: &str) -> Result<RootFsMetadata, i32> {
+        if let Some(m) = self.fs.vfs_mounts.resolve(path)
+            && let Ok(md) = m.vfs.lookup(&m.full_path)
+        {
+            return Ok(vfs_md_to_rootfs_md(path, &md));
+        }
+        self.fs
+            .rootfs_vfs
+            .lookup_nofollow(path)
+            .map(|md| vfs_md_to_rootfs_md(path, &md))
+    }
+
+    fn canonicalize_following(&self, path: &str) -> Result<String, i32> {
+        let mut cur = path.to_string();
+        for _ in 0..40 {
+            let md = self.layered_lstat(&cur)?;
+            if md.kind != RootFsEntryKind::Symlink {
+                return Ok(cur);
+            }
+            let target = self
+                .readlink_layered(&cur)
+                .ok_or(crate::linux_abi::LINUX_ENOENT)?;
+            cur = if target.starts_with('/') {
+                join_rootfs_path("/", &target)
+            } else {
+                let parent = Path::new(&cur)
+                    .parent()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "/".to_string());
+                join_rootfs_path(&parent, &target)
+            };
+        }
+        Err(crate::linux_abi::LINUX_ELOOP)
+    }
+
     /// `close_range(first, last, flags)` — close every fd in `[first, last]`
     /// (inclusive). Used by glibc's posix_spawn / apt's pre-fork cleanup
     /// to drop inherited fds in O(1) syscalls instead of an O(N) fcntl
@@ -1862,23 +1928,18 @@ impl SyscallDispatcher {
                 Ok(path) => path,
                 Err(errno) => return Ok(errno.into()),
             };
-            // Disk-backed overlay: follow a directory symlink the way Linux
-            // chdir(2) does. The generic RootFsVfs lookup intentionally preserves
-            // symlink metadata for lstat-style callers, so ask the backend for a
-            // following stat first when it can provide one.
-            if let Some(real) = this.fs.rootfs_vfs.overlay.real_stat(&path, true) {
-                if real.kind != RootFsEntryKind::Directory {
-                    return Ok(LINUX_ENOTDIR.into());
-                }
-                *this.io.cwd.write() = display_rootfs_path(Path::new(&path));
-                return Ok(DispatchOutcome::Returned { value: 0 });
-            }
-
-            // Use the LAYERED lookup (overlay/host backend first, then rootfs),
-            // not just the immutable rootfs — otherwise a freshly mkdir'd
-            // directory is invisible and chdir into it fails ENOENT (dpkg-deb
-            // mkdir's its extraction dir then chdir's there).
-            let metadata = match this.layered_metadata(&path) {
+            // Follow a trailing directory symlink the way Linux chdir(2) does,
+            // THROUGH the full VFS — so a symlink whose target lands in a
+            // different mount (e.g. a /tmp scratch link → /run bind mount)
+            // resolves instead of returning ENOTDIR (the per-backend real_stat
+            // only follows within one backend). getcwd then reports the resolved
+            // target's canonical path, matching the kernel. Uses the LAYERED
+            // lookup so a freshly mkdir'd dir is visible (dpkg-deb chdir).
+            let resolved = match this.canonicalize_following(&path) {
+                Ok(resolved) => resolved,
+                Err(errno) => return Ok(errno.into()),
+            };
+            let metadata = match this.layered_metadata(&resolved) {
                 Ok(metadata) => metadata,
                 Err(errno) => return Ok(errno.into()),
             };
@@ -4939,6 +5000,21 @@ impl SyscallDispatcher {
             // `AT_SYMLINK_NOFOLLOW` selects lstat (report the link) vs stat
             // (report the target) semantics.
             let follow = flags & LINUX_AT_SYMLINK_NOFOLLOW == 0;
+            if let Some(real) = this.fs.rootfs_vfs.overlay.real_stat(&path, follow) {
+                return Ok(write_stat_real(memory, statbuf, &path, &real));
+            }
+            // real_stat couldn't answer. If following and `path` is a symlink
+            // whose target lands in ANOTHER mount, resolve it through the full
+            // VFS and stat the target — so its dev/ino matches a direct stat of
+            // the target (Go os.Getwd's $PWD trust check stats $PWD and ".", and
+            // a /tmp-scratch link → /run-bind-mount target must agree). No-op for
+            // non-symlinks and AT_SYMLINK_NOFOLLOW (lstat).
+            let path = if follow {
+                this.canonicalize_following(&path).unwrap_or(path)
+            } else {
+                path
+            };
+            // Retry the fast path in case the resolved target is in the scratch.
             if let Some(real) = this.fs.rootfs_vfs.overlay.real_stat(&path, follow) {
                 return Ok(write_stat_real(memory, statbuf, &path, &real));
             }
