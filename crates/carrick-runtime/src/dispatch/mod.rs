@@ -678,6 +678,22 @@ pub trait GuestMemory {
     /// backend and unit tests don't model protections).
     fn set_no_access(&mut self, _address: u64, _len: usize, _no_access: bool) {}
 
+    /// Change the guest-VISIBLE protection of `[address, address+len)` by
+    /// editing the EL1 stage-1 page descriptors and flushing the stage-1 TLB,
+    /// so a guest access that violates `prot` faults during EL0 execution
+    /// (delivered as SIGSEGV) — not only on host-side `read_bytes` checks.
+    /// `prot` is the Linux PROT mask (0 = PROT_NONE). Default: no-op (the
+    /// in-memory backend has no stage-1 tables; it relies on `set_no_access`).
+    fn protect_range(&mut self, _address: u64, _len: usize, _prot: u64) -> Result<(), MemoryError> {
+        Ok(())
+    }
+
+    /// Make `[address, address+len)` unmapped in stage-1 (faults until reused),
+    /// for guest `munmap`. Default: no-op.
+    fn unmap_range(&mut self, _address: u64, _len: usize) -> Result<(), MemoryError> {
+        Ok(())
+    }
+
     /// Host virtual address of the byte at `guest_addr`, but ONLY when it lies
     /// in a host-`MAP_SHARED` guest region — i.e. the boot-mapped shared
     /// aperture that backs guest `MAP_SHARED` mmaps. That backing is shared
