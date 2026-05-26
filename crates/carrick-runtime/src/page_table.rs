@@ -62,8 +62,22 @@ pub(crate) struct PageTableManager {
     base: u64,
     /// Byte offset of the next free spare page (bump allocator).
     next_free: u64,
-    /// PAs of spare sub-tables freed by coalescing, reused before bumping.
+    /// PAs of spare sub-tables freed by coalescing, reused before bumping. Only
+    /// populated while single-vCPU (coalesce is gated on that), so a reused page
+    /// can never be referenced by a sibling's stale walk cache.
     free_tables: Vec<u64>,
+    /// Whether more than one guest vCPU is currently live. Set per-edit by the
+    /// engine from the process-wide live-vCPU count; gates coalescing (a
+    /// break-before-make structural change that is unsafe without an all-vCPU
+    /// TLB flush HVF can't give one vCPU).
+    multi_vcpu: bool,
+    /// Byte offsets edited since the last sync, in write order, tagged
+    /// `is_table_pointer`. The host sync replays them as aligned atomic stores,
+    /// writing a table descriptor (which exposes a sub-table to the guest's
+    /// hardware walker) only AFTER its child entries are visible — the
+    /// break-before-make ordering that keeps a concurrent sibling walk safe
+    /// without quiescing.
+    dirty: Vec<(usize, bool)>,
 }
 
 impl PageTableManager {
@@ -73,7 +87,15 @@ impl PageTableManager {
             base,
             next_free: SPARE_START_OFFSET,
             free_tables: Vec::new(),
+            multi_vcpu: false,
+            dirty: Vec::new(),
         }
+    }
+
+    /// Tell the manager whether sibling vCPUs are live (set per-edit from the
+    /// process-wide live-vCPU count). Gates coalescing.
+    pub(crate) fn set_multi_vcpu(&mut self, multi: bool) {
+        self.multi_vcpu = multi;
     }
 
     /// True iff `pa` is a runtime-allocated spare sub-table (never a boot table
@@ -83,7 +105,9 @@ impl PageTableManager {
         pa >= self.base + SPARE_START_OFFSET && pa < self.base + self.bytes.len() as u64
     }
 
-    /// Zero a freed spare sub-table and return it to the free list.
+    /// Zero a freed spare sub-table and return it to the reusable free list.
+    /// Only reached from `try_coalesce`, which is gated on single-vCPU, so the
+    /// reused page can never be referenced by a sibling's stale walk cache.
     fn free_table(&mut self, pa: u64) {
         if let Ok(off) = self.pa_to_off(pa) {
             for b in &mut self.bytes[off..off + PT_PAGE as usize] {
@@ -98,19 +122,55 @@ impl PageTableManager {
         self.bytes
     }
 
-    /// The current table image, for syncing edits back to the host backing.
-    pub(crate) fn bytes(&self) -> &[u8] {
-        &self.bytes
-    }
-
     fn read_desc(&self, off: usize) -> u64 {
         let mut a = [0u8; 8];
         a.copy_from_slice(&self.bytes[off..off + 8]);
         u64::from_le_bytes(a)
     }
 
+    /// Write a leaf/child descriptor (a block, page, or sub-table entry that is
+    /// not itself newly pointing the walker at a fresh table).
     fn write_desc(&mut self, off: usize, desc: u64) {
         self.bytes[off..off + 8].copy_from_slice(&desc.to_le_bytes());
+        self.dirty.push((off, false));
+    }
+
+    /// Write a table descriptor that exposes a (freshly populated) sub-table to
+    /// the walker. Tagged so the host sync orders it AFTER the sub-table's
+    /// entries are visible.
+    fn write_table_desc(&mut self, off: usize, desc: u64) {
+        self.bytes[off..off + 8].copy_from_slice(&desc.to_le_bytes());
+        self.dirty.push((off, true));
+    }
+
+    /// Replay this edit's descriptor stores to the host page-table backing as
+    /// aligned atomic 64-bit writes, with a release barrier before each
+    /// table-pointer store so a concurrent sibling hardware walk never sees a
+    /// table descriptor pointing at not-yet-visible child entries. Clears the
+    /// dirty set. `host` is the VA of byte offset 0 of the region.
+    ///
+    /// # Safety
+    /// `host` must point to a writable mapping of at least `self.bytes.len()`
+    /// bytes that backs the live guest page tables.
+    pub(crate) unsafe fn sync_to_host(&mut self, host: *mut u8) {
+        use core::sync::atomic::{AtomicU64, Ordering, fence};
+        for (off, is_ptr) in self.dirty.drain(..) {
+            let mut a = [0u8; 8];
+            a.copy_from_slice(&self.bytes[off..off + 8]);
+            let v = u64::from_le_bytes(a);
+            if is_ptr {
+                // Ensure the child-table entries written earlier are globally
+                // visible before the pointer that exposes them.
+                fence(Ordering::SeqCst);
+            }
+            // Offsets are 8-byte aligned (index*8), so this is a single atomic
+            // store the guest walker observes whole.
+            unsafe {
+                let slot = host.add(off) as *mut AtomicU64;
+                (*slot).store(v, Ordering::SeqCst);
+            }
+        }
+        fence(Ordering::SeqCst);
     }
 
     /// Byte offset of a PA known to live inside the page-table region.
@@ -163,8 +223,9 @@ impl PageTableManager {
             let desc = (child_pa & child_pa_mask) | attrs | child_type;
             self.write_desc(table_off + (i as usize) * 8, desc);
         }
-        // Parent becomes a table descriptor.
-        self.write_desc(parent_off, (table_pa & PA_MASK_TABLE) | TYPE_TABLE_OR_PAGE);
+        // Parent becomes a table descriptor — exposed to the walker only after
+        // the children above are visible (enforced in sync_to_host).
+        self.write_table_desc(parent_off, (table_pa & PA_MASK_TABLE) | TYPE_TABLE_OR_PAGE);
         Ok(())
     }
 
@@ -250,6 +311,18 @@ impl PageTableManager {
     /// Only spare tables are touched (the boot L2_A/L2_B/L3_A — null guard +
     /// kernel hole — are never uniform and never spare, so are doubly safe).
     fn try_coalesce(&mut self, va: u64) {
+        // Coalescing flips a table descriptor to a block (and frees the
+        // sub-table) for a live VA. That is a break-before-make structural
+        // change: a sibling vCPU mid-walk through the old table-pointer can hit
+        // the being-freed sub-table and fault (proven via the mmap-churn
+        // reproducer + host-table walk). Correct break-before-make needs an
+        // all-vCPU TLB flush, which one vCPU's `tlbi vmalle1is` does not provide
+        // under HVF. So coalesce only when single-vCPU (no siblings to race);
+        // when multi-vCPU the structure stays split — safe, at the cost of not
+        // reclaiming until back to one vCPU.
+        if self.multi_vcpu {
+            return;
+        }
         let idx = indices(va);
         let Some(l1_pa) = self.child_table_pa(idx[0] * 8) else {
             return;
@@ -511,6 +584,31 @@ mod tests {
         assert!(
             !mgr.free_tables.is_empty(),
             "coalesce reclaimed a sub-table"
+        );
+    }
+
+    #[test]
+    fn multi_vcpu_does_not_coalesce() {
+        // With sibling vCPUs live, a full-block restore must NOT coalesce
+        // (coalesce is a break-before-make change unsafe without an all-vCPU
+        // flush). The structure stays split; no table is reclaimed.
+        let mut mgr = manager();
+        mgr.set_multi_vcpu(true);
+        let block = LINUX_MMAP_BASE + 0x60_0000;
+        mgr.set_prot_none(block, 0x1000).expect("split");
+        mgr.set_rw(block, 1 << 21).expect("restore");
+        assert!(mgr.is_valid(block));
+        assert!(
+            mgr.free_tables.is_empty(),
+            "multi-vCPU must NOT coalesce/reclaim"
+        );
+        // Back to single-vCPU, a subsequent full-block restore coalesces again.
+        mgr.set_multi_vcpu(false);
+        mgr.set_prot_none(block, 0x1000).expect("split");
+        mgr.set_rw(block, 1 << 21).expect("restore");
+        assert!(
+            !mgr.free_tables.is_empty(),
+            "single-vCPU coalesces/reclaims"
         );
     }
 
