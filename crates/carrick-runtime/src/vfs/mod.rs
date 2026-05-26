@@ -37,6 +37,7 @@ pub mod dev;
 pub mod devpts;
 pub mod mount;
 pub mod proc;
+pub mod resolvconf;
 pub mod rootfs;
 pub mod sys;
 
@@ -45,6 +46,7 @@ pub use dev::DevVfs;
 pub use devpts::{DevptsVfs, PtyRole, PtyTable};
 pub use mount::VfsMounts;
 pub use proc::{ProcMapsEntry, ProcVfs, SyntheticProcContext};
+pub use resolvconf::ResolvConfVfs;
 pub use rootfs::RootFsVfs;
 pub use sys::SysVfs;
 
