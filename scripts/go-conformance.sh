@@ -19,18 +19,18 @@ RUN_TIMEOUT="${RUN_TIMEOUT:-120}"
 # process/exec surface — PATH lookup of real binaries (echo, nohup), relative-
 # name exec, and the test binary's own argv[0] needing real ancestor dirs —
 # which only behaves like the Docker oracle when the binary, its cwd, and /bin
-# all live in one filesystem. The rootfs cleanly fixes os/signal's
-# TestDetectNohup (nohup now resolves). The others stay on the faster bare-ELF
-# path where they're already conformant.
+# all live in one filesystem. Fixes os/signal's TestDetectNohup (nohup
+# resolves) and os/exec's TestString (echo on PATH) + TestCommandRelativeName
+# (binary at /b with real ancestor dirs + the execve relative-path fix). The
+# other packages stay on the faster bare-ELF path where they're conformant.
 #
-# NOTE: os/exec is deliberately NOT here. Its 3 bare-ELF gaps (TestString,
-# TestCommandRelativeName, TestExplicitPWD) DO need the rootfs, but under it
-# TestConcurrentExec's heavy concurrent fork+exec reliably triggers the known
-# HV_BUSY multithreaded-fork race (0xfae94002, leaked vCPU; see
-# project_go_osexec_mtfork) and times out the whole binary — strictly worse
-# (7 PASS) than the bare-ELF run (34 PASS). os/exec joins this set once that
-# fork race is fixed. The execve relative-path fix it needs is already landed.
-ROOTFS_PKGS="${ROOTFS_PKGS:-os/signal}"
+# os/exec was previously excluded: TestConcurrentExec's heavy concurrent
+# fork+exec triggered the HV_BUSY multithreaded-fork race under the rootfs's
+# heavier memory. The per-fork mincore fix (perf(fork): bound the snapshot scan
+# to the arena high-water) cut fork cost ~10x and closed that race window;
+# os/exec now runs 36/37 stably under the rootfs (3/3 runs, no crash). The lone
+# remaining gap, TestExplicitPWD, is a cross-mount symlink/$PWD resolution gap.
+ROOTFS_PKGS="${ROOTFS_PKGS:-os/signal os/exec}"
 ROOTFS_IMAGE="${ROOTFS_IMAGE:-debian:stable-slim}"
 # Tests that need host infra neither carrick nor the Docker oracle can provide:
 # a separate ptrace tracer process (gdb/lldb), a C toolchain (cgo), or the test's
