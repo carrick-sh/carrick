@@ -15,9 +15,16 @@ cache="/tmp/go-conformance"; mkdir -p "$cache/bin" "$cache/logs"
 carrick="$repo/target/release/carrick"
 RUN_TIMEOUT="${RUN_TIMEOUT:-120}"
 
+# Portable package-list load: macOS ships bash 3.2 which has no `mapfile`, and
+# `set -u` errors on an empty `${arr[@]}`, so seed the array with a sentinel and
+# strip it after reading (works on bash 3.2 and 4+).
 pkgs=("$@")
 if [ ${#pkgs[@]} -eq 0 ]; then
-  mapfile -t pkgs < "$repo/scripts/go-conformance-packages.txt"
+  pkgs=("")
+  while IFS= read -r _line || [ -n "$_line" ]; do
+    [ -n "$_line" ] && pkgs+=("$_line")
+  done < "$repo/scripts/go-conformance-packages.txt"
+  pkgs=("${pkgs[@]:1}") # drop the seed
 fi
 
 build() {
