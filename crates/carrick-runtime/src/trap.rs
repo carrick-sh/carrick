@@ -393,6 +393,22 @@ pub static EL1_KICK_RESUMED: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 pub static INJECT_AT_EL1: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static KICK_PATH_INJECT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Guest mmap-arena high-water mark (the dispatcher's `mmap_next`), published by
+/// `handle_fork` just before forking. `clone_region_for_child` reads it to bound
+/// the per-fork resident-page `mincore` scan of the 32 GiB arena window to the
+/// used prefix `[LINUX_MMAP_BASE, this)` instead of scanning all 2M pages — the
+/// dominant per-fork cost (a `mincore` over the full window measured ~470 ms).
+/// `u64::MAX` (the default) means "unknown, scan the full region" so non-fork
+/// callers and tests keep the original, always-correct behaviour.
+pub(crate) static GUEST_ARENA_HIGH_WATER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Publish the arena high-water for the next fork's snapshot scan. Called by
+/// `handle_fork` with `SyscallDispatcher::mmap_arena_high_water()`.
+pub(crate) fn set_guest_arena_high_water(addr: u64) {
+    GUEST_ARENA_HIGH_WATER.store(addr, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// Whether to save/restore guest FP/SIMD across signal handlers (default on;
 /// `CARRICK_NO_FPSIMD` disables it for differential measurement). Cached after
 /// the first read so the signal hot path doesn't hit the environment.
@@ -2232,7 +2248,7 @@ impl HvfInner {
             let child_host = if desc.guest_shared {
                 ForkMappingHost::Borrowed(desc.host.ptr()) // shared mapping: child maps the SAME buffer
             } else {
-                ForkMappingHost::Owned(clone_region_for_child(desc.host.ptr(), desc.size)?)
+                ForkMappingHost::Owned(clone_region_for_child(desc.host.ptr(), desc.size, desc.start)?)
             };
             child_descs.push(ForkMappingDesc {
                 start: desc.start,
@@ -2819,6 +2835,7 @@ fn align_up(value: u64, alignment: u64) -> Result<u64, TrapError> {
 fn clone_region_for_child(
     src: *mut u8,
     size: usize,
+    guest_start: u64,
 ) -> Result<crate::host_mapping::OwnedHostMapping, TrapError> {
     let dst = crate::host_mapping::OwnedHostMapping::map_shared_anon(
         size,
@@ -2834,12 +2851,30 @@ fn clone_region_for_child(
         let p = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         if p <= 0 { 16 * 1024 } else { p as usize }
     };
-    let n_pages = size.div_ceil(page);
+    // Bound the residency scan to the region's used prefix. The 32 GiB mmap
+    // arena is mapped once but the guest only bump-allocates a sliver from its
+    // base; `mincore` over the full window walks all ~2M pages (~470 ms/fork —
+    // the dominant cost of any subprocess-spawning guest). The dispatcher's
+    // arena high-water (published into GUEST_ARENA_HIGH_WATER by handle_fork)
+    // says the guest has only touched `[LINUX_MMAP_BASE, hw)`; pages past it are
+    // untouched in the parent too, so the child's freshly-zeroed snapshot needs
+    // no copy there. Other regions (heap, stack, trampolines) keep the full
+    // scan. `u64::MAX` default ⇒ full scan (non-fork callers / tests).
+    let scan_size = if guest_start == crate::memory::LINUX_MMAP_BASE {
+        let hw = GUEST_ARENA_HIGH_WATER.load(std::sync::atomic::Ordering::SeqCst);
+        hw.saturating_sub(guest_start).try_into().unwrap_or(size).min(size)
+    } else {
+        size
+    };
+    if scan_size == 0 {
+        return Ok(dst); // nothing resident to copy; dst stays lazily zero
+    }
+    let n_pages = scan_size.div_ceil(page);
     let mut resident = vec![0u8; n_pages];
     let rc = unsafe {
         libc::mincore(
             src as *mut libc::c_void,
-            size,
+            scan_size,
             resident.as_mut_ptr() as *mut libc::c_char,
         )
     };
