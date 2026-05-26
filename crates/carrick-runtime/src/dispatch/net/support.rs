@@ -438,7 +438,30 @@ pub(super) fn linux_to_host_sockopt(level: i32, optname: i32) -> Option<(i32, i3
             };
             Some((libc::SOL_SOCKET, host_opt))
         }
-        LINUX_SOL_IP => Some((libc::IPPROTO_IP, optname)),
+        // IPPROTO_IP options: Linux and macOS use DIFFERENT numbers, so translate
+        // explicitly (macOS values from <netinet/in.h>; the libc crate is missing
+        // several, hence literals). Unknown options pass through (best-effort).
+        // Constants are fully-qualified so a missing import can't silently become
+        // a catch-all binding that mis-maps everything.
+        LINUX_SOL_IP => {
+            use crate::linux_abi as a;
+            let host_opt = match optname {
+                a::LINUX_IP_OPTIONS => 1,
+                a::LINUX_IP_HDRINCL => 2,
+                a::LINUX_IP_TOS => 3,
+                a::LINUX_IP_TTL => 4,
+                a::LINUX_IP_MULTICAST_IF => 9,
+                a::LINUX_IP_MULTICAST_TTL => 10,
+                a::LINUX_IP_MULTICAST_LOOP => 11,
+                a::LINUX_IP_ADD_MEMBERSHIP => 12,
+                a::LINUX_IP_DROP_MEMBERSHIP => 13,
+                a::LINUX_IP_RECVTTL => 24,
+                a::LINUX_IP_PKTINFO => 26,
+                a::LINUX_IP_RECVTOS => 27,
+                other => other,
+            };
+            Some((libc::IPPROTO_IP, host_opt))
+        }
         LINUX_SOL_TCP => {
             let host_opt = match optname {
                 LINUX_TCP_NODELAY => libc::TCP_NODELAY,
@@ -452,7 +475,27 @@ pub(super) fn linux_to_host_sockopt(level: i32, optname: i32) -> Option<(i32, i3
             Some((libc::IPPROTO_TCP, host_opt))
         }
         LINUX_SOL_UDP => Some((libc::IPPROTO_UDP, optname)),
-        LINUX_SOL_IPV6 => Some((libc::IPPROTO_IPV6, optname)),
+        // IPPROTO_IPV6 options: same story (macOS <netinet6/in6.h>).
+        LINUX_SOL_IPV6 => {
+            use crate::linux_abi as a;
+            let host_opt = match optname {
+                a::LINUX_IPV6_UNICAST_HOPS => 4,
+                a::LINUX_IPV6_MULTICAST_IF => 9,
+                a::LINUX_IPV6_MULTICAST_HOPS => 10,
+                a::LINUX_IPV6_MULTICAST_LOOP => 11,
+                a::LINUX_IPV6_JOIN_GROUP => 12,
+                a::LINUX_IPV6_LEAVE_GROUP => 13,
+                a::LINUX_IPV6_V6ONLY => 27,
+                a::LINUX_IPV6_RECVTCLASS => 35,
+                a::LINUX_IPV6_TCLASS => 36,
+                a::LINUX_IPV6_RECVHOPLIMIT => 37,
+                a::LINUX_IPV6_PKTINFO => 46,
+                a::LINUX_IPV6_HOPLIMIT => 47,
+                a::LINUX_IPV6_RECVPKTINFO => 61,
+                other => other,
+            };
+            Some((libc::IPPROTO_IPV6, host_opt))
+        }
         _ => None,
     }
 }
