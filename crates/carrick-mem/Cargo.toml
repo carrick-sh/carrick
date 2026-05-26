@@ -1,0 +1,21 @@
+[package]
+name = "carrick-mem"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "carrick_mem"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+carrick-abi = { path = "../carrick-abi" }
+carrick-guest-mem = { path = "../carrick-guest-mem" }
+goblin.workspace = true
+libc.workspace = true
+serde = { workspace = true, features = ["derive"] }
+thiserror.workspace = true
+zerocopy = { workspace = true, features = ["derive"] }
