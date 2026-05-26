@@ -272,13 +272,34 @@ fn split_at_last_paren(s: &str) -> (&str, &str) {
 /// the dedicated carrick APFS volume (always case-sensitive, isolated,
 /// throw-away-able). Fall back to `~/.carrick/scratch` for hosts where
 /// the volume hasn't been laid down yet.
+///
+/// HOT PATH: this runs at the start of every `carrick` invocation that
+/// uses the host FS backend. It must NOT shell out to `diskutil apfs
+/// list` — that enumerates every APFS container on the system and costs
+/// ~250 ms, which a profile showed dominated trivial-guest startup. A
+/// volume named `carrick` is mounted by `diskutil apfs addVolume` at the
+/// conventional `/Volumes/carrick`, so a single `stat` of that path is an
+/// equivalent (and instant) probe for the common case. The slow
+/// `diskutil`-backed `find_carrick_volume` is reserved for the explicit
+/// `carrick volume` subcommands, not this per-run path.
 pub fn preferred_scratch_root() -> std::io::Result<PathBuf> {
-    if let Ok(Some(volume)) = find_carrick_volume()
-        && let Some(mp) = volume.mount_point
-    {
-        return Ok(mp);
+    // Cached once per process; the scratch root cannot change while we run.
+    static CACHE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    Ok(CACHE.get_or_init(resolve_scratch_root).clone())
+}
+
+fn resolve_scratch_root() -> PathBuf {
+    // Fast path: the conventional mount point of the carrick volume. Verify
+    // it's actually case-sensitive (a Linux ABI requirement) so a coincidental
+    // dir at that path on a case-insensitive boot volume can't be mistaken for
+    // our volume.
+    let conventional = Path::new("/Volumes").join(DEFAULT_VOLUME_NAME);
+    if conventional.is_dir() && probe_case_sensitive(&conventional) {
+        return conventional;
     }
-    // Fallback: honour the user's $CARRICK_HOME, else $HOME/.carrick.
+    // Fallback: honour the user's $CARRICK_HOME, else $HOME/.carrick. (No
+    // diskutil: a host without the conventional mount almost certainly has no
+    // carrick volume, and an exotic mount can be pointed at via $CARRICK_HOME.)
     let home = std::env::var_os("CARRICK_HOME")
         .map(PathBuf::from)
         .or_else(|| {
@@ -289,9 +310,7 @@ pub fn preferred_scratch_root() -> std::io::Result<PathBuf> {
             })
         })
         .unwrap_or_else(|| PathBuf::from("/tmp/carrick"));
-    let mut path = home;
-    path.push("scratch");
-    Ok(path)
+    home.join("scratch")
 }
 
 /// Probe whether `path` resides on a case-sensitive filesystem.
