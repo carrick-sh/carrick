@@ -2030,6 +2030,29 @@ fn el0_fault_signal(esr: u64) -> Option<(i32, i32)> {
     }
 }
 
+/// Map an EL0 synchronous *debug* exception `ESR_EL1` to the Linux
+/// `(SIGTRAP, si_code)` the kernel would deliver, or `None` if it isn't a debug
+/// class (leaving it to `el0_fault_signal`). These are distinct from
+/// instruction/data aborts: a guest `BRK #imm` (Go's debug-call protocol),
+/// software single-step, and HW breakpoints/watchpoints all surface SIGTRAP, not
+/// SIGSEGV. ESR EC (bits 31:26): 0x3c = `BRK` (AArch64), 0x30/0x31 = HW
+/// breakpoint, 0x32/0x33 = software step, 0x34/0x35 = watchpoint. si_addr for a
+/// debug SIGTRAP is the PC (the BRK address), not FAR — see `deliver_fault_signal`.
+fn el0_debug_signal(esr: u64) -> Option<(i32, i32)> {
+    const SIGTRAP: i32 = 5;
+    const TRAP_BRKPT: i32 = 1; // software breakpoint (BRK)
+    const TRAP_TRACE: i32 = 2; // process trace trap (single-step)
+    const TRAP_HWBKPT: i32 = 4; // hardware breakpoint/watchpoint
+    let ec = (esr >> 26) & 0x3f;
+    match ec {
+        0x3c => Some((SIGTRAP, TRAP_BRKPT)),         // BRK (AArch64)
+        0x32 | 0x33 => Some((SIGTRAP, TRAP_TRACE)),  // software step
+        0x30 | 0x31 => Some((SIGTRAP, TRAP_HWBKPT)), // HW breakpoint
+        0x34 | 0x35 => Some((SIGTRAP, TRAP_HWBKPT)), // watchpoint
+        _ => None,
+    }
+}
+
 /// Deliver a synchronous guest EL0 fault as a Linux signal (SIGSEGV/SIGBUS with
 /// `si_addr` = faulting address), exactly as the kernel does — so Go's
 /// nil-deref→sigpanic→recover idiom (and any guest SIGSEGV handler) works
@@ -2057,9 +2080,17 @@ fn deliver_fault_signal(
         Ok(Some(VcpuLoopOutcome::ProcessExit(Box::new(result))))
     };
 
-    // Untranslatable fault (EC=0 unknown, FP trap, …): default to SIGSEGV
-    // termination so it's still fatal+visible, but with proper exit semantics.
-    let Some((signum, si_code)) = el0_fault_signal(esr) else {
+    // Classify the synchronous exception. A debug class (BRK/step/HW) is a
+    // SIGTRAP whose si_addr is the *PC* (the BRK instruction itself — ELR_EL1
+    // for a BRK is the BRK's own address, not the next instruction); an
+    // instruction/data abort is SIGSEGV/SIGBUS whose si_addr is the faulting
+    // address (FAR). Anything else is untranslatable → fatal SIGSEGV (still
+    // visible, but with proper exit semantics).
+    let (signum, si_code, si_addr) = if let Some((signum, si_code)) = el0_debug_signal(esr) {
+        (signum, si_code, elr)
+    } else if let Some((signum, si_code)) = el0_fault_signal(esr) {
+        (signum, si_code, far)
+    } else {
         return terminate(11);
     };
     crate::probes::signal_deliver(this_tid, signum);
@@ -2085,12 +2116,13 @@ fn deliver_fault_signal(
     };
     let saved_sigmask = dispatcher.enter_signal_handler(this_tid, signum, action);
     // The fault trapped via the EL1 HVC trampoline (like a syscall): ELR_EL1
-    // already holds the faulting EL0 instruction (aborts don't advance it), and
-    // there's a pending eret to EL0. So use the syscall-boundary form
+    // already holds the faulting EL0 instruction (neither aborts nor BRK advance
+    // it), and there's a pending eret to EL0. So use the syscall-boundary form
     // (`interrupted_pc=None`): inject sets the handler via ELR_EL1 and snapshots
     // saved_pc=ELR_EL1=the faulting instruction (re-run on return unless the
-    // handler advances it, e.g. Go's sigpanic). `elr` is kept for the probe.
-    let _ = elr;
+    // handler advances it — e.g. Go's sigpanic, or its debug-call handler doing
+    // `set_pc(pc+4)` to step past the BRK). For a BRK this makes `sigpc` point at
+    // the BRK so Go reads `*(*uint32)(sigpc) == 0xd4200000`.
     engine.inject_signal(
         signum,
         action.sa_handler,
@@ -2099,7 +2131,7 @@ fn deliver_fault_signal(
         None,
         altstack,
         saved_sigmask,
-        Some((si_code, far)),
+        Some((si_code, si_addr)),
     )?;
     Ok(None)
 }
@@ -2508,5 +2540,52 @@ impl SyscallTrap for HvfTrapEngine {
 
     fn restore_from_sigframe(&mut self) -> Result<u64, TrapError> {
         HvfTrapEngine::restore_from_sigframe(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Linux asm-generic/siginfo.h SIGTRAP si_codes.
+    const SIGTRAP: i32 = 5;
+    const TRAP_BRKPT: i32 = 1;
+    const TRAP_TRACE: i32 = 2;
+    const TRAP_HWBKPT: i32 = 4;
+
+    fn esr(ec: u64) -> u64 {
+        ec << 26
+    }
+
+    #[test]
+    fn brk_aarch64_maps_to_sigtrap_brkpt() {
+        // EC=0x3c is `BRK #imm` from AArch64 — the in-guest software breakpoint
+        // Go's debug-call protocol hits. Linux delivers SIGTRAP/TRAP_BRKPT.
+        assert_eq!(el0_debug_signal(esr(0x3c)), Some((SIGTRAP, TRAP_BRKPT)));
+    }
+
+    #[test]
+    fn software_step_maps_to_sigtrap_trace() {
+        // EC=0x32/0x33 software-step exception → SIGTRAP/TRAP_TRACE (PTRACE_SINGLESTEP).
+        assert_eq!(el0_debug_signal(esr(0x32)), Some((SIGTRAP, TRAP_TRACE)));
+        assert_eq!(el0_debug_signal(esr(0x33)), Some((SIGTRAP, TRAP_TRACE)));
+    }
+
+    #[test]
+    fn hw_breakpoint_and_watchpoint_map_to_sigtrap_hwbkpt() {
+        // EC=0x30/0x31 HW breakpoint, 0x34/0x35 watchpoint → SIGTRAP/TRAP_HWBKPT.
+        assert_eq!(el0_debug_signal(esr(0x30)), Some((SIGTRAP, TRAP_HWBKPT)));
+        assert_eq!(el0_debug_signal(esr(0x31)), Some((SIGTRAP, TRAP_HWBKPT)));
+        assert_eq!(el0_debug_signal(esr(0x34)), Some((SIGTRAP, TRAP_HWBKPT)));
+        assert_eq!(el0_debug_signal(esr(0x35)), Some((SIGTRAP, TRAP_HWBKPT)));
+    }
+
+    #[test]
+    fn non_debug_faults_are_not_debug_signals() {
+        // Aborts and unknown classes are NOT debug exceptions — they stay on the
+        // SIGSEGV/SIGBUS path (`el0_fault_signal`), so the classifier returns None.
+        assert_eq!(el0_debug_signal(esr(0x20)), None); // instruction abort
+        assert_eq!(el0_debug_signal(esr(0x24)), None); // data abort
+        assert_eq!(el0_debug_signal(esr(0x00)), None); // unknown
     }
 }
