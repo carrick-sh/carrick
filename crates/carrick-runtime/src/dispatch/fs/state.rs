@@ -120,6 +120,15 @@ impl FsState {
                 );
                 m.mount("/proc", Box::new(crate::vfs::ProcVfs::new()));
                 m.mount("/sys", Box::new(crate::vfs::SysVfs::new()));
+                // Inject a working /etc/resolv.conf synthesized from the macOS
+                // host DNS config (the `--net host` / docker contract), so the
+                // guest resolver gets real nameservers instead of ENOENT →
+                // `[::1]:53` fallback. A single-file mount, so it shadows only
+                // this exact path; the rest of /etc comes from the rootfs.
+                m.mount(
+                    "/etc/resolv.conf",
+                    Box::new(crate::vfs::ResolvConfVfs::new()),
+                );
                 m
             },
             rootfs_vfs: crate::vfs::RootFsVfs::new(),
