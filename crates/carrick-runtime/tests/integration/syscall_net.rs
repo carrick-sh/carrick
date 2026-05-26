@@ -28,6 +28,65 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "macos")]
 const LINUX_TCP_KEEPIDLE: u64 = 4;
 
+/// Regression for the Go `net` unix-socket hang (docs/go-conformance-punchlist.md
+/// P1b): carrick translates a guest unix path to a hashed host path under
+/// carrick-unix-sockets/, but `getsockname` returned that HOST path verbatim — so
+/// Go's `ln.Addr()` reported it and a subsequent Dial re-translated (double-hash)
+/// → `connect: no such file or directory`. getsockname must reverse-translate to
+/// the original guest path.
+#[cfg(target_os = "macos")]
+#[test]
+fn getsockname_returns_the_guest_unix_path_not_the_host_translation() {
+    const LINUX_AF_UNIX: u16 = 1;
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x600]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    let ret = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| -> i64 {
+        match d
+            .dispatch(SyscallRequest::new(nr, SyscallArgs::from(args)), m, &reporter)
+            .unwrap()
+        {
+            DispatchOutcome::Returned { value } => value,
+            other => panic!("nr {nr} unexpected outcome: {other:?}"),
+        }
+    };
+
+    // Unique guest path so repeated runs don't collide on the host socket node.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let guest_path = format!("/tmp/carrick-ut-{nanos}.sock");
+    let gpb = guest_path.as_bytes();
+
+    // socket(AF_UNIX, SOCK_STREAM)
+    let fd = ret(&mut dispatcher, &mut memory, 198, [LINUX_AF_UNIX as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0]);
+    assert!(fd >= 0, "socket(AF_UNIX) failed: {fd}");
+    let fd = fd as u64;
+
+    // sockaddr_un at 0x4200: family(2) + path + NUL; bind it.
+    let mut sa = vec![0u8; 2 + gpb.len() + 1];
+    sa[0..2].copy_from_slice(&LINUX_AF_UNIX.to_ne_bytes());
+    sa[2..2 + gpb.len()].copy_from_slice(gpb);
+    memory.write_bytes(0x4200, &sa).unwrap();
+    assert_eq!(ret(&mut dispatcher, &mut memory, 200, [fd, 0x4200, sa.len() as u64, 0, 0, 0]), 0, "bind failed");
+
+    // getsockname(fd, buf=0x4300, *0x4400 = capacity)
+    memory.write_bytes(0x4400, &256u32.to_ne_bytes()).unwrap();
+    assert_eq!(ret(&mut dispatcher, &mut memory, 204, [fd, 0x4300, 0x4400, 0, 0, 0]), 0, "getsockname failed");
+    let outlen = {
+        let b = memory.read_bytes(0x4400, 4).unwrap();
+        u32::from_ne_bytes([b[0], b[1], b[2], b[3]]) as usize
+    };
+    let out = memory.read_bytes(0x4300, outlen.min(256)).unwrap();
+    let path = &out[2..];
+    let path = &path[..path.iter().position(|&b| b == 0).unwrap_or(path.len())];
+    assert_eq!(
+        path, gpb,
+        "getsockname returned the carrick-unix-sockets host path, not the guest path"
+    );
+}
+
 /// Regression for the Go `net` `TestFileListener` hang (docs/go-conformance-punchlist.md
 /// P1): a dup'd socket shares ONE host fd, but carrick's epoll kqueue is keyed by
 /// host fd. An `EPOLL_CTL_DEL` of one dup must NOT deafen the OTHER guest fds that
