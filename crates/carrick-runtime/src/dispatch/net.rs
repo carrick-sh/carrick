@@ -1790,6 +1790,20 @@ impl SyscallDispatcher {
                     Err(errno) => errno.into(),
                 });
             }
+            // AF_UNIX bind to a directory-like pathname (trailing '/', e.g. "//"
+            // = "/") can't hold a socket node on Linux → EADDRINUSE. carrick maps
+            // every path to a fresh hashed host node, so without this check it
+            // would wrongly succeed (TestProtocolListenError).
+            if family == libc::AF_UNIX
+                && let Ok(raw) = memory.read_bytes(addr_addr, addrlen as usize)
+                && raw.len() > 2
+                && raw[2] != 0
+            {
+                let nul = raw[2..].iter().position(|&b| b == 0).map(|p| 2 + p).unwrap_or(raw.len());
+                if raw[..nul].last() == Some(&b'/') {
+                    return Ok(linux_errno::EADDRINUSE.into());
+                }
+            }
             let host_addr = match read_linux_sockaddr(memory, addr_addr, addrlen, family) {
                 Ok(bytes) => bytes,
                 Err(errno) => return Ok(errno.into()),
