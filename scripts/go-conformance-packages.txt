@@ -6,3 +6,4 @@ os/signal
 os/exec
 runtime
 net
+cgo-smoke

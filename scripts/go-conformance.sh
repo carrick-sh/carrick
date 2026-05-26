@@ -50,19 +50,31 @@ fi
 build() {
   local need=()
   for p in "${pkgs[@]}"; do
+    [ "$p" = "cgo-smoke" ] && continue # local fixture, built below
     local n; n=$(echo "$p" | tr / _)
     [ -x "$cache/bin/$n.test" ] || need+=("$p")
   done
-  [ ${#need[@]} -eq 0 ] && return 0
-  echo "building: ${need[*]}"
-  docker run --rm --platform linux/arm64 -v "$cache/bin":/out golang:1.24-bookworm sh -c '
-    for p in '"${need[*]}"'; do
-      n=$(echo "$p" | tr / _)
-      CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go test -c -buildmode=pie \
-        -ldflags "-linkmode external -extldflags -static-pie" -o /out/$n.test "$p" \
-        && echo "  built $n.test" || echo "  BUILD FAIL $p"
-    done
-    chmod -R a+rwx /out'
+  if [ ${#need[@]} -gt 0 ]; then
+    echo "building: ${need[*]}"
+    docker run --rm --platform linux/arm64 -v "$cache/bin":/out golang:1.24-bookworm sh -c '
+      for p in '"${need[*]}"'; do
+        n=$(echo "$p" | tr / _)
+        CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go test -c -buildmode=pie \
+          -ldflags "-linkmode external -extldflags -static-pie" -o /out/$n.test "$p" \
+          && echo "  built $n.test" || echo "  BUILD FAIL $p"
+      done
+      chmod -R a+rwx /out'
+  fi
+  # cgo conformance smoke fixture (local source, not a std package): exercises
+  # Go->C, C->Go callback, and C-pthread->Go callback — the cgo runtime paths.
+  if printf '%s\n' "${pkgs[@]}" | grep -qx cgo-smoke && [ ! -x "$cache/bin/cgo-smoke.test" ]; then
+    echo "building: cgo-smoke (fixture)"
+    docker run --rm --platform linux/arm64 -v "$repo/scripts/cgo-smoke":/src -v "$cache/bin":/out \
+      -w /src golang:1.24-bookworm sh -c \
+      'CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go test -c -buildmode=pie \
+         -ldflags "-linkmode external -extldflags -static-pie" -o /out/cgo-smoke.test . \
+         && chmod a+rwx /out/cgo-smoke.test && echo "  built cgo-smoke.test"'
+  fi
 }
 
 # Provision the test ENVIRONMENT both sides need so environmental failures don't
