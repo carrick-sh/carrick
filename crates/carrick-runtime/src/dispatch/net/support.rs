@@ -511,7 +511,38 @@ fn unix_socket_host_path(sun_path: &[u8]) -> Option<std::path::PathBuf> {
         hash ^= b as u64;
         hash = hash.wrapping_mul(0x100000001b3);
     }
-    Some(dir.join(format!("{hash:016x}.sock")))
+    let host = dir.join(format!("{hash:016x}.sock"));
+    // Record host→guest so getsockname/getpeername/accept can REVERSE-translate:
+    // the guest must get back the path it used (not the <hash>.sock host node),
+    // or dialing `ln.Addr()` re-hashes the host path → wrong node → ENOENT.
+    if let Ok(mut map) = unix_path_registry().lock() {
+        map.insert(host.clone(), guest_path.to_vec());
+    }
+    Some(host)
+}
+
+/// Process-global host-socket-path → original-guest-`sun_path` map, populated by
+/// `unix_socket_host_path` at every bind/connect/sendto translation and consumed
+/// by `host_to_linux_sockaddr` to undo the hash. Process-global (not fork-shared):
+/// a socket's own address is recorded by the process that bound/connected it,
+/// which is the same process that later calls getsockname/getpeername on it.
+fn unix_path_registry() -> &'static std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Vec<u8>>>
+{
+    static REG: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Vec<u8>>>,
+    > = std::sync::OnceLock::new();
+    REG.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// The original guest `sun_path` bytes for a carrick host socket path, if known.
+fn guest_unix_path_for(host_path: &[u8]) -> Option<Vec<u8>> {
+    let nul = host_path
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(host_path.len());
+    use std::os::unix::ffi::OsStringExt;
+    let key = std::path::PathBuf::from(std::ffi::OsString::from_vec(host_path[..nul].to_vec()));
+    unix_path_registry().lock().ok()?.get(&key).cloned()
 }
 
 /// Translate a Linux-formatted sockaddr (read from guest memory) into the
@@ -631,11 +662,17 @@ pub(super) fn host_to_linux_sockaddr(bytes: &[u8], _family_hint: i32) -> Vec<u8>
             // Linux sockaddr_un is family(2) path[108]. macOS path starts
             // at offset 2; skip the host's sun_len byte at offset 0.
             let path_len = bytes.len().saturating_sub(2);
-            let mut out = vec![0u8; 2 + path_len];
+            let host_path = &bytes[2..2 + path_len];
+            // Reverse the guest→host hash so the guest sees the path IT used (not
+            // carrick's <hash>.sock host node). Without this, Go's ln.Addr()
+            // reports the host path and re-dialing it double-translates → ENOENT.
+            // Unknown host node (e.g. a peer bound by another process): pass the
+            // host path through unchanged.
+            let path_out = guest_unix_path_for(host_path);
+            let path_bytes: &[u8] = path_out.as_deref().unwrap_or(host_path);
+            let mut out = vec![0u8; 2 + path_bytes.len()];
             out[0..2].copy_from_slice(&linux_family.to_ne_bytes());
-            if path_len > 0 {
-                out[2..].copy_from_slice(&bytes[2..2 + path_len]);
-            }
+            out[2..].copy_from_slice(path_bytes);
             out
         }
         _ => {
