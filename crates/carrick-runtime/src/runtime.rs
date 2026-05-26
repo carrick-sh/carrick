@@ -17,6 +17,12 @@ use crate::rootfs::RootFs;
 fn fork_barrier() -> &'static crate::fork_quiesce::QuiesceBarrier {
     crate::fork_quiesce::barrier()
 }
+
+/// Process-wide page-table-edit Pause-Modify-Resume barrier (defined in
+/// `fork_quiesce` alongside the fork barrier).
+fn pt_barrier() -> &'static crate::fork_quiesce::PtQuiesce {
+    crate::fork_quiesce::pt_barrier()
+}
 use crate::trap::{HvfTrapEngine, TrapError};
 use serde::Serialize;
 use thiserror::Error;
@@ -824,6 +830,10 @@ struct ThreadRuntimeState {
     this_tid: ThreadId,
     threads: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
     kicker: Arc<crate::vcpu_kick::VcpuKicker>,
+    /// This vCPU's "currently in `hv_vcpu_run`" flag, shared with the kicker so
+    /// a page-table-edit coordinator can tell whether this thread is walking
+    /// guest memory. Set true around `next_syscall`, false otherwise.
+    in_guest: Arc<std::sync::atomic::AtomicBool>,
     waiter: crate::io_wait::ThreadWaiter,
     max_traps: usize,
     trace: bool,
@@ -838,12 +848,14 @@ impl ThreadRuntimeState {
         kicker: Arc<crate::vcpu_kick::VcpuKicker>,
         max_traps: usize,
     ) -> Self {
+        let in_guest = kicker.register_in_guest(this_tid);
         Self {
             registry,
             futex,
             this_tid,
             threads,
             kicker,
+            in_guest,
             waiter: crate::io_wait::ThreadWaiter::new(this_tid),
             max_traps,
             trace: std::env::var_os("CARRICK_TRACE_TRAPS").is_some(),
@@ -855,6 +867,60 @@ impl ThreadRuntimeState {
             .register(self.this_tid, engine.vcpu_kick_handle());
         self.registry
             .record_thread_port(self.this_tid, crate::host_proc::current_thread_port());
+    }
+
+    /// Pause sibling vCPUs for a stage-1 page-table edit (mmap/mprotect/munmap),
+    /// returning an RAII guard that resumes them on drop. carrick (the VMM)
+    /// edits the guest's shared stage-1 descriptors from the host; a sibling
+    /// walking a block mid-edit would fault. We become the sole edit
+    /// coordinator, raise the quiesce flag, kick in-guest siblings out of
+    /// `hv_vcpu_run`, and wait until none is walking the tables. The Dekker
+    /// handshake at the run-loop top guarantees a sibling either observes the
+    /// quiesce (and parks) or has its `in_guest` flag observed here — never
+    /// both miss. Siblings blocked in host syscalls have `in_guest == false`
+    /// and need no wake (this is what the reverted attempt-1 got wrong: it
+    /// waited on a paused-count and fired spurious signals, deadlocking).
+    fn pt_pause(&self) -> crate::fork_quiesce::PtPauseGuard {
+        let b = pt_barrier();
+        // Serialize editors: at most one stop-the-world at a time. A loser parks
+        // (if the winner has raised quiescing) or yields (tiny pre-flag window),
+        // then retries.
+        loop {
+            if b.try_become_coordinator() {
+                break;
+            }
+            if b.is_quiescing() {
+                b.park();
+            } else {
+                std::thread::yield_now();
+            }
+        }
+        b.set_quiescing();
+        let tid = self.this_tid as i32;
+        crate::probes::pt_pause_begin(
+            tid,
+            i32::from(self.kicker.any_other_in_guest(self.this_tid)),
+            self.kicker.count() as i32,
+        );
+        // Force in-guest siblings out so they reach the run-loop-top park, then
+        // wait until none is walking the tables. Re-kick each spin in case a
+        // vCPU was between runs when the first kick landed. The deadline is a
+        // backstop against a logic bug — it must converge quickly in practice;
+        // a `pt-pause-timeout` fire means a sibling stayed in guest.
+        let start = std::time::Instant::now();
+        let deadline = start + std::time::Duration::from_millis(500);
+        let mut spins: i32 = 0;
+        while self.kicker.any_other_in_guest(self.this_tid) {
+            self.kicker.kick_all_except(self.this_tid);
+            if std::time::Instant::now() >= deadline {
+                crate::probes::pt_pause_timeout(tid, start.elapsed().as_micros() as i64);
+                break;
+            }
+            spins = spins.saturating_add(1);
+            std::thread::yield_now();
+        }
+        crate::probes::pt_pause_ready(tid, spins, start.elapsed().as_micros() as i64);
+        b.pause_guard(tid)
     }
 
     fn release_and_park_vcpu_for_fork(
@@ -898,6 +964,16 @@ impl ThreadRuntimeState {
         engine: &mut HvfTrapEngine,
         frame: Aarch64SyscallFrame,
     ) -> Result<DispatchOutcome, RuntimeError> {
+        // Stage-1 page-table editors — munmap(215), mremap(216), mmap(222),
+        // mprotect(226) — mutate the shared guest descriptors from the host.
+        // With sibling vCPUs live, Pause-Modify-Resume them so none walks a
+        // half-edited descriptor tree; the guard's drop resumes them on every
+        // exit path of this syscall. Single-vCPU (no siblings): skip entirely
+        // — the common case stays a plain dispatch with zero added cost.
+        let _pt_pause = match frame.x8 {
+            215 | 216 | 222 | 226 if self.kicker.count() > 1 => Some(self.pt_pause()),
+            _ => None,
+        };
         loop {
             let request = SyscallRequest::from_aarch64_frame(frame);
             let outcome = kernel.dispatcher.dispatch_threaded(
@@ -1492,8 +1568,35 @@ fn run_vcpu_until_exit(
             if fork_barrier().is_quiescing() {
                 state.release_and_park_vcpu_for_fork(&mut engine)?;
             }
+            // Page-table-edit Pause-Modify-Resume: if a sibling vCPU is editing
+            // the shared stage-1 tables from the host, park here (KEEPING this
+            // vCPU — unlike fork) until it finishes, so this vCPU never walks a
+            // half-edited descriptor tree.
+            if pt_barrier().is_quiescing() {
+                pt_barrier().park();
+            }
+            // Publish that we are about to enter the guest (and may walk page
+            // tables). The store here and the re-check below form a Dekker
+            // handshake with the edit coordinator, which sets `quiescing` then
+            // reads `in_guest`: SeqCst guarantees at least one side observes the
+            // other, so this vCPU never enters guest concurrently with an edit.
+            state
+                .in_guest
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            if pt_barrier().is_quiescing() {
+                state
+                    .in_guest
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                pt_barrier().park();
+                continue;
+            }
             // ---- vCPU run: NO dispatcher lock held ----
-            let frame = match engine.next_syscall() {
+            let next = engine.next_syscall();
+            // Out of guest now (in host): a coordinator may proceed past us.
+            state
+                .in_guest
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            let frame = match next {
                 Ok(Some(f)) => f,
                 Ok(None) => {
                     // The vCPU was forced out of the guest by a cross-thread kick
