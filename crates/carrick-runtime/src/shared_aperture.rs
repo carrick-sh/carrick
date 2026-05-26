@@ -115,14 +115,6 @@ impl SharedAperture {
         Some(alloc)
     }
 
-    /// The backing for the live allocation starting at `guest_addr`, if any.
-    pub(crate) fn backing(&self, guest_addr: u64) -> Option<BackingObject> {
-        self.live
-            .iter()
-            .find(|a| a.guest_addr == guest_addr)
-            .map(|a| a.backing)
-    }
-
     /// All live allocations (used by `msync`-all and fork bookkeeping).
     pub(crate) fn live(&self) -> &[SharedAlloc] {
         &self.live
@@ -212,9 +204,9 @@ mod tests {
                 },
             )
             .expect("alloc");
-        let got = ap.backing(a).expect("live");
+        let got = ap.live().iter().find(|x| x.guest_addr == a).expect("live");
         assert!(matches!(
-            got,
+            got.backing,
             BackingObject::SharedFile {
                 host_fd: 7,
                 offset: 0x1000
