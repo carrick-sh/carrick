@@ -1663,6 +1663,36 @@ pub const LINUX_SOL_TCP: i32 = 6; // IPPROTO_TCP
 pub const LINUX_SOL_UDP: i32 = 17; // IPPROTO_UDP
 pub const LINUX_SOL_IPV6: i32 = 41; // IPPROTO_IPV6
 
+// IPPROTO_IP / IPPROTO_IPV6 option numbers differ from macOS, so they must be
+// translated (not passed through). Linux uapi values (include/uapi/linux/in.h,
+// in6.h):
+pub const LINUX_IP_TOS: i32 = 1;
+pub const LINUX_IP_TTL: i32 = 2;
+pub const LINUX_IP_HDRINCL: i32 = 3;
+pub const LINUX_IP_OPTIONS: i32 = 4;
+pub const LINUX_IP_RECVTOS: i32 = 13;
+pub const LINUX_IP_RECVTTL: i32 = 12;
+pub const LINUX_IP_PKTINFO: i32 = 8;
+pub const LINUX_IP_MULTICAST_IF: i32 = 32;
+pub const LINUX_IP_MULTICAST_TTL: i32 = 33;
+pub const LINUX_IP_MULTICAST_LOOP: i32 = 34;
+pub const LINUX_IP_ADD_MEMBERSHIP: i32 = 35;
+pub const LINUX_IP_DROP_MEMBERSHIP: i32 = 36;
+
+pub const LINUX_IPV6_UNICAST_HOPS: i32 = 16;
+pub const LINUX_IPV6_MULTICAST_IF: i32 = 17;
+pub const LINUX_IPV6_MULTICAST_HOPS: i32 = 18;
+pub const LINUX_IPV6_MULTICAST_LOOP: i32 = 19;
+pub const LINUX_IPV6_JOIN_GROUP: i32 = 20;
+pub const LINUX_IPV6_LEAVE_GROUP: i32 = 21;
+pub const LINUX_IPV6_V6ONLY: i32 = 26;
+pub const LINUX_IPV6_RECVPKTINFO: i32 = 49;
+pub const LINUX_IPV6_PKTINFO: i32 = 50;
+pub const LINUX_IPV6_RECVHOPLIMIT: i32 = 51;
+pub const LINUX_IPV6_HOPLIMIT: i32 = 52;
+pub const LINUX_IPV6_RECVTCLASS: i32 = 66;
+pub const LINUX_IPV6_TCLASS: i32 = 67;
+
 pub const LINUX_TCP_NODELAY: i32 = 1;
 pub const LINUX_TCP_MAXSEG: i32 = 2;
 pub const LINUX_TCP_CORK: i32 = 3;
