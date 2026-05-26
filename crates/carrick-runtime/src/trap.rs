@@ -1,7 +1,10 @@
 //! Hypervisor.framework trap engine, guest register/memory access, signal
 //! frames, and fork/exec address-space management.
 
-use crate::dispatch::{Aarch64SyscallFrame, GuestMemory, MemoryError};
+// The hub types live in the leaf crate carrick-guest-mem (A2); import them from
+// there, not via `crate::dispatch`, so trap.rs has NO dependency on the
+// dispatcher — the last edge blocking a future carrick-hvf crate (A3).
+use carrick_guest_mem::{Aarch64SyscallFrame, GuestMemory, MemoryError};
 use crate::elf::SegmentPerms;
 use crate::memory::AddressSpace;
 use serde::Serialize;
