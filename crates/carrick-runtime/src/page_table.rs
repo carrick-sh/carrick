@@ -66,7 +66,50 @@ pub(crate) fn indices(va: u64) -> [usize; 4] {
     ]
 }
 
+/// Diagnostic: walk a raw stage-1 long-descriptor table image for `va`,
+/// returning the descriptor read at each level `[L0, L1, L2, L3]`. A level not
+/// reached (an earlier block descriptor terminated the walk, or a descriptor
+/// was invalid, or the table PA fell outside the region) is left `0`. `bytes`
+/// is the live page-table region, `base` the PA mapped at byte offset 0. Lets a
+/// fault handler PROVE whether the leaf PTE is invalid IN MEMORY (a logic bug)
+/// versus valid-in-memory but stale in the faulting vCPU's TLB (a coherence
+/// bug) — the two have opposite fixes.
+pub(crate) fn walk_descriptors(bytes: &[u8], base: u64, va: u64) -> [u64; 4] {
+    let idx = indices(va);
+    let mut out = [0u64; 4];
+    let mut table_off: usize = 0; // L0 table at byte offset 0
+    for level in 0..4 {
+        let off = table_off + idx[level] * 8;
+        if off + 8 > bytes.len() {
+            break;
+        }
+        let mut desc = 0u64;
+        for (i, b) in bytes[off..off + 8].iter().enumerate() {
+            desc |= (*b as u64) << (i * 8);
+        }
+        out[level] = desc;
+        if desc & VALID == 0 {
+            break; // invalid descriptor: walk stops here
+        }
+        if level == 3 || desc & TYPE_BITS != TYPE_TABLE_OR_PAGE {
+            break; // L3 page, or an L1/L2 block descriptor: leaf reached
+        }
+        let child_pa = desc & PA_MASK_TABLE;
+        let Some(child_off) = child_pa.checked_sub(base) else {
+            break;
+        };
+        table_off = child_off as usize;
+    }
+    out
+}
+
 /// Mutable editor over a copy of the page-table region bytes.
+///
+/// `Clone` is used by `fork`: the child needs its OWN manager (it gets a
+/// private copy of the page-table backing) but MUST inherit the parent's
+/// `next_free`/`free_tables` — a fresh manager would reset the bump cursor and
+/// re-hand-out table pages already live in the copied backing, corrupting it.
+#[derive(Clone)]
 pub(crate) struct PageTableManager {
     bytes: Vec<u8>,
     /// PA mapped at byte offset 0 (`LINUX_PAGE_TABLES_BASE`).
@@ -191,6 +234,17 @@ impl PageTableManager {
             return Err(PageTableError::BadAddress);
         }
         Ok((pa - self.base) as usize)
+    }
+
+    /// Spare sub-table pool occupancy for diagnostics/tracing:
+    /// `(in_use, free_list, capacity)` pages. `in_use` is bumped-minus-reclaimed
+    /// (live split tables); a monotonically rising `in_use` toward `capacity`
+    /// under multithreaded churn is the coalesce-disabled pool leak.
+    pub(crate) fn pool_stats(&self) -> (u32, u32, u32) {
+        let bumped = (self.next_free - SPARE_START_OFFSET) / PT_PAGE;
+        let free = self.free_tables.len() as u64;
+        let capacity = (self.bytes.len() as u64 - SPARE_START_OFFSET) / PT_PAGE;
+        ((bumped - free) as u32, free as u32, capacity as u32)
     }
 
     /// Carve a zeroed table page: reuse a coalesced one if available, else bump
@@ -586,6 +640,44 @@ mod tests {
         mgr.set_rw(va, 0x2000).expect("rw");
         assert!(mgr.is_valid(va));
         assert!(mgr.is_valid(va + 0x1000));
+    }
+
+    #[test]
+    fn clone_preserves_bump_cursor_so_fork_child_does_not_realloc_live_tables() {
+        // Regression for the cross-test TestUserArenaNew SIGSEGV: fork rebuilt
+        // the child (and, before the fix, the PARENT) with a FRESH manager,
+        // resetting `next_free` to the first spare while the copied backing
+        // already had that page live as an L2 table. The next split then
+        // re-handed-out the in-use page and wrote L3 entries over the live L2
+        // table. fork must CLONE the manager (preserving the cursor), not reset.
+        let mut parent = manager();
+        // Split two distinct 1 GiB regions → two live spare sub-tables.
+        parent
+            .set_prot_none(LINUX_MMAP_BASE + 0x10_0000, 0x1000)
+            .unwrap();
+        parent
+            .set_prot_none(LINUX_MMAP_BASE + 0x4080_0000, 0x1000)
+            .unwrap();
+        let (parent_in_use, _, _) = parent.pool_stats();
+        assert!(parent_in_use >= 2, "two splits allocated >=2 tables");
+
+        // The child inherits a CLONE — cursor and live tables intact.
+        let mut child = parent.clone();
+        assert_eq!(child.pool_stats(), parent.pool_stats(), "cursor preserved");
+        // The parent's splits are visible (and correct) in the child.
+        assert!(!child.is_valid(LINUX_MMAP_BASE + 0x10_0000));
+        assert!(child.is_valid(LINUX_MMAP_BASE + 0x10_0000 + 0x1000));
+
+        // A NEW split in the child must allocate a FRESH page (in_use grows),
+        // never re-use a live table — and must not disturb the parent's edits.
+        child
+            .set_prot_none(LINUX_MMAP_BASE + 0x8080_0000, 0x1000)
+            .unwrap();
+        let (child_in_use, _, _) = child.pool_stats();
+        assert!(child_in_use > parent_in_use, "fresh table, no re-handout");
+        // The first split's neighborhood is still a correctly-mapped page (the
+        // bug clobbered exactly this L2 table with an L3 page descriptor).
+        assert!(child.is_valid(LINUX_MMAP_BASE + 0x10_0000 + 0x1000));
     }
 
     #[test]

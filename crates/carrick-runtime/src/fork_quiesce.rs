@@ -141,6 +141,93 @@ impl QuiesceBarrier {
     }
 }
 
+/// Process-wide Pause-Modify-Resume barrier for runtime guest stage-1
+/// page-table edits (mprotect / PROT_NONE / munmap). Carrick (the VMM) edits
+/// the guest's stage-1 tables from the HOST while sibling vCPUs run; a sibling
+/// walking a block mid-structural-change can fault. The editing thread becomes
+/// the sole coordinator, raises `quiescing` so every OTHER vCPU parks (KEEPING
+/// its vCPU) at its run-loop top before re-entering guest, waits until no
+/// sibling is in-guest (via the kicker's in_guest flags — not a count), edits,
+/// then resumes. Distinct from fork's quiesce (which tears vCPUs down).
+pub(crate) fn pt_barrier() -> &'static PtQuiesce {
+    static B: OnceLock<PtQuiesce> = OnceLock::new();
+    B.get_or_init(PtQuiesce::new)
+}
+
+#[derive(Debug)]
+pub(crate) struct PtQuiesce {
+    coordinator: AtomicBool,
+    quiescing: AtomicBool,
+    lock: Mutex<()>,
+    cv: Condvar,
+}
+
+impl PtQuiesce {
+    pub(crate) fn new() -> Self {
+        Self {
+            coordinator: AtomicBool::new(false),
+            quiescing: AtomicBool::new(false),
+            lock: Mutex::new(()),
+            cv: Condvar::new(),
+        }
+    }
+
+    pub(crate) fn is_quiescing(&self) -> bool {
+        self.quiescing.load(Ordering::SeqCst)
+    }
+
+    /// Try to become the sole pausing editor (loser parks + retries).
+    pub(crate) fn try_become_coordinator(&self) -> bool {
+        self.coordinator
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    pub(crate) fn set_quiescing(&self) {
+        self.quiescing.store(true, Ordering::SeqCst);
+    }
+
+    /// OTHER thread (or a coordinator-CAS loser) parks here until the pause
+    /// ends, keeping its vCPU. Called at the lock-safe run-loop top.
+    pub(crate) fn park(&self) {
+        let mut g = self.lock.lock().unwrap();
+        while self.quiescing.load(Ordering::SeqCst) {
+            g = self.cv.wait(g).unwrap();
+        }
+    }
+
+    /// Coordinator: end the pause, wake parked threads, drop coordinator.
+    pub(crate) fn end(&self) {
+        let _g = self.lock.lock().unwrap();
+        self.quiescing.store(false, Ordering::SeqCst);
+        self.coordinator.store(false, Ordering::SeqCst);
+        self.cv.notify_all();
+    }
+
+    /// Mint the RAII resume-guard. The caller MUST already be the coordinator
+    /// (won `try_become_coordinator`), have raised `set_quiescing`, and waited
+    /// for siblings to leave guest. Dropping the guard calls `end`, so the pause
+    /// is released on EVERY exit path of the editing syscall (incl. `?`-errors).
+    /// `tid` is the editor, recorded so the drop can fire `pt-pause-end`.
+    pub(crate) fn pause_guard(&'static self, tid: i32) -> PtPauseGuard {
+        PtPauseGuard { barrier: self, tid }
+    }
+}
+
+/// RAII handle that ends a page-table-edit pause (resuming sibling vCPUs) when
+/// dropped. Held for the duration of the table-editing syscall.
+pub(crate) struct PtPauseGuard {
+    barrier: &'static PtQuiesce,
+    tid: i32,
+}
+
+impl Drop for PtPauseGuard {
+    fn drop(&mut self) {
+        self.barrier.end();
+        crate::probes::pt_pause_end(self.tid);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

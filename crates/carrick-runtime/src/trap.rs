@@ -1316,6 +1316,11 @@ impl HvfInner {
             // Freed sub-tables are only safe to repurpose when we're single-vCPU
             // (no sibling can hold a stale walk-cache reference). Tell the
             // manager the current live-vCPU count so it quarantines vs reuses.
+            // NOTE: PMR pauses siblings during the EDIT, but a freed page reused
+            // for a different structural role still races a sibling's cached
+            // walk across PMR boundaries — proven: re-enabling coalesce
+            // multi-vCPU produced an alloc_table use-after-free (a live L2 table
+            // reused as an L3 split target, corrupting it). So the gate stays.
             mgr.set_multi_vcpu(VCPU_LIVE.load(std::sync::atomic::Ordering::SeqCst) > 1);
             let changed = edit(mgr).map_err(|e| match e {
                 PageTableError::OutOfTables => {
@@ -1326,6 +1331,10 @@ impl HvfInner {
                     length: 0,
                 },
             })?;
+            // Pool occupancy after the edit — a rising `in_use` toward capacity
+            // is the leak; flat proves coalescing keeps it bounded.
+            let (in_use, free_list, capacity) = mgr.pool_stats();
+            crate::probes::pt_pool(in_use, free_list, capacity, i32::from(changed));
             if changed {
                 // SAFETY: `host` backs the live page-table region for the whole
                 // process lifetime; the manager only writes 8-byte-aligned
@@ -1447,6 +1456,22 @@ impl HvfInner {
                 // on the happy path, so it doesn't perturb the timing-sensitive
                 // c>=20 race it's meant to diagnose.
                 crate::probes::vcpu_fault(underlying, elr, far, x30, sp, unsafe { libc::getpid() });
+                // Walk the LIVE host page-table backing at the faulting VA so a
+                // trace can tell whether the leaf PTE is invalid in memory (a
+                // logic bug — a missing/lost validate) vs valid-but-stale-TLB (a
+                // coherence bug). Reads exactly what the guest HW walker sees.
+                if let Some(host) = self.pt_host_ptr() {
+                    let size = crate::memory::LINUX_PAGE_TABLES_SIZE as usize;
+                    // SAFETY: `host` backs the page-table region for the whole
+                    // process; we read `size` bytes from it, no writes.
+                    let bytes = unsafe { std::slice::from_raw_parts(host, size) };
+                    let d = crate::page_table::walk_descriptors(
+                        bytes,
+                        crate::memory::LINUX_PAGE_TABLES_BASE,
+                        far,
+                    );
+                    crate::probes::pt_fault_walk(far, d[0], d[1], d[2], d[3]);
+                }
                 return Err(TrapError::EL0Fault {
                     syndrome: underlying,
                     elr,
@@ -2281,6 +2306,21 @@ impl HvfInner {
         } else {
             std::sync::Arc::clone(&self.protections)
         };
+        // The stage-1 page-table manager must survive fork EXACTLY like
+        // protections. The PARENT's tables and their host backing are unchanged
+        // by fork, so it keeps the SAME shared manager — a fresh manager would
+        // rebuild from the (live) backing with `next_free` reset to the first
+        // spare, then re-hand-out table pages already in use, writing L3 entries
+        // over a live L2 table (proven: the cross-test TestUserArenaNew SIGSEGV,
+        // an L2 slot holding `USER_PAGE_FLAGS | <arena PA>`). The CHILD gets a
+        // private backing copy, so it needs its OWN manager — but a CLONE of the
+        // parent's state, not a reset, so its bump cursor matches that backing.
+        let inherited_page_tables = if pid == 0 {
+            let cloned = self.page_tables.lock().clone();
+            std::sync::Arc::new(parking_lot::Mutex::new(cloned))
+        } else {
+            std::sync::Arc::clone(&self.page_tables)
+        };
         let new_inner = HvfInner {
             _vm: new_vm,
             vcpu: new_vcpu,
@@ -2288,7 +2328,7 @@ impl HvfInner {
             last_exit_class: snapshot.last_exit_class,
             is_forked_child: pid == 0,
             protections: inherited_protections,
-            page_tables: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+            page_tables: inherited_page_tables,
         };
         replace_destroyed_hvf_inner(self, new_inner);
 
