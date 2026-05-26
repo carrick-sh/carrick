@@ -653,6 +653,18 @@ impl HostFsBackend {
         &mut self,
         paths: &[std::path::PathBuf],
     ) -> std::io::Result<crate::rootfs::ExtractStats> {
+        // Fast path: seed the scratch from the digest-keyed clonefile cache (an
+        // O(1) COW clone of a once-extracted layer stack) instead of re-doing a
+        // full byte-copy extraction. Only when we own a real scratch TempDir
+        // (the production path); tests using `from_existing_dir` have no path to
+        // anchor the cache against and fall straight through.
+        if let Some(scratch) = self._scratch.as_ref().map(|t| t.path().to_path_buf())
+            && matches!(crate::layer_cache::try_seed_scratch(paths, &scratch), Ok(true))
+        {
+            // The clone reproduces the same on-disk tree a direct extraction
+            // would; per-file ExtractStats aren't recovered for a cache hit.
+            return Ok(crate::rootfs::ExtractStats::default());
+        }
         crate::rootfs::extract_layer_paths_to_dir(paths, &self.dir)
             .map_err(|e| std::io::Error::other(e.to_string()))
     }
