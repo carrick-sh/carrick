@@ -62,6 +62,8 @@ pub(crate) struct PageTableManager {
     base: u64,
     /// Byte offset of the next free spare page (bump allocator).
     next_free: u64,
+    /// PAs of spare sub-tables freed by coalescing, reused before bumping.
+    free_tables: Vec<u64>,
 }
 
 impl PageTableManager {
@@ -70,6 +72,24 @@ impl PageTableManager {
             bytes,
             base,
             next_free: SPARE_START_OFFSET,
+            free_tables: Vec::new(),
+        }
+    }
+
+    /// True iff `pa` is a runtime-allocated spare sub-table (never a boot table
+    /// — the boot L0/L1/L2/L3 hold the null guard and kernel hole and must
+    /// never be coalesced/freed).
+    fn is_spare_table(&self, pa: u64) -> bool {
+        pa >= self.base + SPARE_START_OFFSET && pa < self.base + self.bytes.len() as u64
+    }
+
+    /// Zero a freed spare sub-table and return it to the free list.
+    fn free_table(&mut self, pa: u64) {
+        if let Ok(off) = self.pa_to_off(pa) {
+            for b in &mut self.bytes[off..off + PT_PAGE as usize] {
+                *b = 0;
+            }
+            self.free_tables.push(pa);
         }
     }
 
@@ -102,14 +122,18 @@ impl PageTableManager {
         Ok((pa - self.base) as usize)
     }
 
-    /// Carve a fresh zeroed table page from the spare tail; returns its PA.
+    /// Carve a zeroed table page: reuse a coalesced one if available, else bump
+    /// the spare tail. Freed pages were zeroed on free, the tail is zero from
+    /// boot, so the returned page is always all-invalid descriptors.
     fn alloc_table(&mut self) -> Result<u64, PageTableError> {
+        if let Some(pa) = self.free_tables.pop() {
+            return Ok(pa);
+        }
         let off = self.next_free;
         if off + PT_PAGE > self.bytes.len() as u64 {
             return Err(PageTableError::OutOfTables);
         }
         self.next_free += PT_PAGE;
-        // Bytes are already zero (invalid descriptors) from boot zero-fill.
         Ok(self.base + off)
     }
 
@@ -179,6 +203,102 @@ impl PageTableManager {
         Err(PageTableError::BadAddress)
     }
 
+    /// Next-level table PA if the entry at `off` is a valid table descriptor.
+    fn child_table_pa(&self, off: usize) -> Option<u64> {
+        let d = self.read_desc(off);
+        if d & VALID != 0 && d & TYPE_BITS == TYPE_TABLE_OR_PAGE {
+            Some(d & PA_MASK_TABLE)
+        } else {
+            None
+        }
+    }
+
+    /// If every one of a table's 512 entries is a valid leaf of `child_type`
+    /// with contiguous identity PA (`child_pa_mask`/`child_stride`) and IDENTICAL
+    /// attributes — i.e. the table is exactly equivalent to one coarse block —
+    /// return `(base_pa, attrs)` for that block. Otherwise `None` (don't
+    /// coalesce). The strict equality is what makes coalescing safe: the block
+    /// we write maps precisely what the table did.
+    fn uniform_block(
+        &self,
+        table_off: usize,
+        child_pa_mask: u64,
+        child_stride: u64,
+        child_type: u64,
+    ) -> Option<(u64, u64)> {
+        let e0 = self.read_desc(table_off);
+        if e0 & VALID == 0 || e0 & TYPE_BITS != child_type {
+            return None;
+        }
+        let base_pa = e0 & child_pa_mask;
+        let attrs = e0 & !child_pa_mask & !TYPE_BITS;
+        for i in 0..512u64 {
+            let d = self.read_desc(table_off + (i as usize) * 8);
+            if d & VALID == 0
+                || d & TYPE_BITS != child_type
+                || (d & child_pa_mask) != base_pa + i * child_stride
+                || (d & !child_pa_mask & !TYPE_BITS) != attrs
+            {
+                return None;
+            }
+        }
+        Some((base_pa, attrs))
+    }
+
+    /// Collapse fully-uniform spare sub-tables covering `va` back into a single
+    /// block, reclaiming the table page. L3→L2 (2 MiB) then L2→L1 (1 GiB).
+    /// Only spare tables are touched (the boot L2_A/L2_B/L3_A — null guard +
+    /// kernel hole — are never uniform and never spare, so are doubly safe).
+    fn try_coalesce(&mut self, va: u64) {
+        let idx = indices(va);
+        let Some(l1_pa) = self.child_table_pa(idx[0] * 8) else {
+            return;
+        };
+        let Ok(l1_off) = self.pa_to_off(l1_pa) else {
+            return;
+        };
+        let l1_entry = l1_off + idx[1] * 8;
+
+        // L3 -> L2: the L2 entry must point at a spare L3 table of uniform pages.
+        if let Some(l2_pa) = self.child_table_pa(l1_entry) {
+            if let Ok(l2_off) = self.pa_to_off(l2_pa) {
+                let l2_entry = l2_off + idx[2] * 8;
+                if let Some(l3_pa) = self.child_table_pa(l2_entry) {
+                    if self.is_spare_table(l3_pa) {
+                        if let Ok(l3_off) = self.pa_to_off(l3_pa) {
+                            if let Some((base, attrs)) = self.uniform_block(
+                                l3_off,
+                                PA_MASK_4KIB,
+                                1 << 12,
+                                TYPE_TABLE_OR_PAGE,
+                            ) {
+                                self.write_desc(
+                                    l2_entry,
+                                    (base & PA_MASK_2MIB) | attrs | TYPE_BLOCK,
+                                );
+                                self.free_table(l3_pa);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // L2 -> L1: the L1 entry must point at a spare L2 table of uniform blocks.
+        if let Some(l2_pa) = self.child_table_pa(l1_entry) {
+            if self.is_spare_table(l2_pa) {
+                if let Ok(l2_off) = self.pa_to_off(l2_pa) {
+                    if let Some((base, attrs)) =
+                        self.uniform_block(l2_off, PA_MASK_2MIB, 1 << 21, TYPE_BLOCK)
+                    {
+                        self.write_desc(l1_entry, (base & PA_MASK_1GIB) | attrs | TYPE_BLOCK);
+                        self.free_table(l2_pa);
+                    }
+                }
+            }
+        }
+    }
+
     /// `(valid, AP)` of the covering leaf for `va` WITHOUT splitting (the leaf
     /// may be a coarse block), or `None` if the walk hits an unmapped level.
     /// Granularity-agnostic, so it answers "is this page already at the target
@@ -220,6 +340,17 @@ impl PageTableManager {
             let (off, _level) = self.leaf_offset(page_va, true)?;
             self.write_desc(off, target(page_va));
             changed = true;
+        }
+        // Reclaim any sub-table that the edit left fully uniform again (e.g. a
+        // 2 MiB range fully restored to RW after munmap), so churn doesn't leak
+        // the spare-table pool. Walk one VA per 2 MiB block in the range.
+        if changed {
+            let end = va + (pages * PT_PAGE);
+            let mut block = va & !((1 << 21) - 1);
+            while block < end {
+                self.try_coalesce(block);
+                block += 1 << 21;
+            }
         }
         Ok(changed)
     }
@@ -359,6 +490,45 @@ mod tests {
         let mut mgr = PageTableManager::new(bytes, LINUX_PAGE_TABLES_BASE);
         // Already RW → no change, no split, no allocation.
         assert_eq!(mgr.set_rw(LINUX_MMAP_BASE + 0x10_0000, 0x4000), Ok(false));
+    }
+
+    #[test]
+    fn full_block_restore_coalesces_and_reclaims_table() {
+        // Split a 2 MiB block (set one page PROT_NONE), then restore the WHOLE
+        // 2 MiB to RW: the sub-table becomes uniform and is reclaimed, so the
+        // spare cursor/free-list returns to its pre-split capacity.
+        let mut mgr = manager();
+        let block = LINUX_MMAP_BASE + 0x20_0000; // 2 MiB-aligned arena block
+        mgr.set_prot_none(block, 0x1000).expect("split");
+        let after_split = mgr.next_free;
+        assert!(
+            after_split > SPARE_START_OFFSET,
+            "split consumed spare pages"
+        );
+        // Restore the entire 2 MiB block to RW -> uniform -> coalesce.
+        mgr.set_rw(block, 1 << 21).expect("restore");
+        assert!(mgr.is_valid(block));
+        assert!(
+            !mgr.free_tables.is_empty(),
+            "coalesce reclaimed a sub-table"
+        );
+    }
+
+    #[test]
+    fn partial_protection_does_not_coalesce() {
+        // One page RO, the rest RW: NOT uniform -> must keep the sub-table.
+        let mut mgr = manager();
+        let block = LINUX_MMAP_BASE + 0x40_0000;
+        mgr.set_readonly(block, 0x1000).expect("ro one page");
+        mgr.set_rw(block, 1 << 21).expect("rw the rest");
+        // The RO page was overwritten to RW by the full-block set_rw, so it WILL
+        // coalesce; instead verify a genuinely-mixed state is preserved:
+        let mut mgr2 = manager();
+        mgr2.set_readonly(block, 0x1000).expect("ro one page");
+        mgr2.set_rw(block + 0x1000, 0x1000).expect("rw next page");
+        assert_eq!(mgr2.ap_bits(block), AP_RO, "mixed block keeps RO page");
+        assert_eq!(mgr2.ap_bits(block + 0x1000), AP_RW);
+        assert!(mgr2.free_tables.is_empty(), "mixed block must not coalesce");
     }
 
     #[test]
