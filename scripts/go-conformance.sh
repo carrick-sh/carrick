@@ -122,10 +122,23 @@ for p in "${pkgs[@]}"; do
     -test.timeout "${TEST_TIMEOUT}s" > "$cache/logs/$n.docker" 2>&1
 
   pkill -9 -f "carrick run-elf" 2>/dev/null
-  CARRICK_EXPOSED_CPUS=10 timeout -s KILL "$RUN_TIMEOUT" "$carrick" run-elf --raw --fs host \
-    -v "$cache/run:/run" -w "/run/src/$p" \
-    "$bin" -- -test.run 'Test' -test.skip "$SKIP" -test.short -test.v \
-    -test.timeout "${TEST_TIMEOUT}s" > "$cache/logs/$n.carrick" 2>&1
+  # CARRICK_SUDO=1 runs the guest as root so raw-socket tests (ip:tcp, ip4:icmp)
+  # work — macOS has no CAP_NET_RAW equivalent, so raw sockets need root (the same
+  # privilege Docker grants by default). Off by default: running guest code as
+  # root is a heavier posture and `sudo -n` needs a tty. Under sudo we skip the
+  # outer `timeout` (sudo'ing `timeout` wouldn't match the carrick NOPASSWD rule)
+  # and rely on -test.timeout + the pkill; CPUs ride in via sudo's env arg.
+  if [ -n "${CARRICK_SUDO:-}" ]; then
+    sudo -n CARRICK_EXPOSED_CPUS=10 "$carrick" run-elf --raw --fs host \
+      -v "$cache/run:/run" -w "/run/src/$p" \
+      "$bin" -- -test.run 'Test' -test.skip "$SKIP" -test.short -test.v \
+      -test.timeout "${TEST_TIMEOUT}s" > "$cache/logs/$n.carrick" 2>&1
+  else
+    CARRICK_EXPOSED_CPUS=10 timeout -s KILL "$RUN_TIMEOUT" "$carrick" run-elf --raw --fs host \
+      -v "$cache/run:/run" -w "/run/src/$p" \
+      "$bin" -- -test.run 'Test' -test.skip "$SKIP" -test.short -test.v \
+      -test.timeout "${TEST_TIMEOUT}s" > "$cache/logs/$n.carrick" 2>&1
+  fi
   pkill -9 -f "carrick run-elf" 2>/dev/null
 
   gap=$(comm -23 <(verdicts "$cache/logs/$n.docker"  | grep '^PASS ' | awk '{print $2}' | sort -u) \
