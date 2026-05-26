@@ -1075,6 +1075,16 @@ impl SyscallDispatcher {
         self.mem.lock().address_space_regions = Some(regions);
     }
 
+    /// High-water mark (bump cursor) of the anonymous mmap arena: the guest has
+    /// only ever touched `[LINUX_MMAP_BASE, this)` of the 32 GiB arena window.
+    /// `HvfInner::fork` uses it to bound the per-fork resident-page `mincore`
+    /// scan to the used prefix instead of all 2M pages of the full window — the
+    /// difference between a ~470 ms and a sub-millisecond fork for a guest that
+    /// has mmap'd only a sliver (i.e. essentially every guest).
+    pub fn mmap_arena_high_water(&self) -> u64 {
+        self.mem.lock().mmap_next
+    }
+
     pub fn with_rootfs(rootfs: RootFs) -> Self {
         let mut s = Self::new();
         s.fs.rootfs_vfs.rootfs = Some(rootfs);

@@ -1397,6 +1397,10 @@ impl ThreadRuntimeState {
             quiesced = true;
         }
 
+        // Publish the arena high-water so the child snapshot's mincore scan is
+        // bounded to the guest's used prefix, not all 32 GiB (see
+        // clone_region_for_child / GUEST_ARENA_HIGH_WATER).
+        crate::trap::set_guest_arena_high_water(kernel.dispatcher.mmap_arena_high_water());
         let prepared_fork = kernel.fork.prepare_host_fork();
         let fork_outcome = match engine.fork() {
             Ok(outcome) => outcome,
