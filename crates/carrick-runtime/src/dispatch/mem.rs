@@ -473,6 +473,11 @@ impl SyscallDispatcher {
 
         fn mincore(this, cx, address: GuestPtr, length: u64, vec: GuestPtr) {
             let memory = &mut *cx.memory;
+            // Linux requires a page-aligned start address, else EINVAL (this is
+            // what Go's TestMincoreErrorSign checks — the errno must be -EINVAL).
+            if !address.0.is_multiple_of(LINUX_PAGE_SIZE) {
+                return Ok(LINUX_EINVAL.into());
+            }
             if length == 0 {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
