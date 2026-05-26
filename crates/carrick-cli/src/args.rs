@@ -53,6 +53,15 @@ pub(crate) enum Commands {
         /// and `memory` elsewhere (in-memory tmpfs).
         #[arg(long, value_enum)]
         fs: Option<FsBackendKind>,
+        /// Bind-mount a host directory/file into the guest:
+        /// `HOST:GUEST[:ro]`. Needed under `--fs host` (a sandboxed scratch, not
+        /// the real host FS) to expose host paths — e.g. a test's `testdata/`.
+        #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro]")]
+        volume: Vec<String>,
+        /// The guest's initial working directory. Defaults (under `--fs host`) to
+        /// carrick's launch directory.
+        #[arg(short = 'w', long = "workdir", value_name = "DIR")]
+        workdir: Option<String>,
         #[arg(last = true)]
         args: Vec<String>,
     },
