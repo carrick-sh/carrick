@@ -11,7 +11,7 @@
 #   RUN_TIMEOUT=120  per-binary carrick timeout (seconds)
 set -uo pipefail
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cache="/tmp/go-conformance"; mkdir -p "$cache/bin" "$cache/logs"
+cache="/tmp/go-conformance"; mkdir -p "$cache/bin" "$cache/logs" "$cache/run" "$cache/etc"
 carrick="$repo/target/release/carrick"
 RUN_TIMEOUT="${RUN_TIMEOUT:-120}"
 # Tests that need host infra neither carrick nor the Docker oracle can provide:
@@ -65,11 +65,44 @@ build() {
     chmod -R a+rwx /out'
 }
 
+# Provision the test ENVIRONMENT both sides need so environmental failures don't
+# pollute the differential: the std-lib `testdata/` trees (e.g. net needs
+# `testdata/hosts`, `testdata/resolv.conf`, and `../testdata/Isaac.Newton-Opticks.txt`)
+# and `/etc/services` (cgo/getservbyname). We mirror the Go `src/` layout under
+# $cache/run so each test's relative `testdata/…` and `../testdata/…` resolve, and
+# run every binary with CWD = that package's mirrored src dir. Both the Docker
+# oracle (bind-mount + -w) and carrick (`cd` then --fs host) use the same tree, so
+# the comparison stays fair while real (non-environmental) gaps still show.
+provision() {
+  echo "provisioning testdata + /etc/services from golang image"
+  # Candidate testdata dirs: the shared src/testdata, each package's own, and its
+  # parent's (the `../testdata` a nested package like os/exec references).
+  local cand="src/testdata"
+  local p parent
+  for p in "${pkgs[@]}"; do
+    cand="$cand src/$p/testdata"
+    parent=$(dirname "$p")
+    [ "$parent" != "." ] && cand="$cand src/$parent/testdata"
+  done
+  docker run --rm --platform linux/arm64 golang:1.24-bookworm sh -c '
+    cd /usr/local/go
+    avail=""
+    for d in '"$cand"'; do [ -d "$d" ] && avail="$avail $d"; done
+    [ -n "$avail" ] && tar cf - $avail || true' > "$cache/run/testdata.tar" 2>/dev/null
+  tar xf "$cache/run/testdata.tar" -C "$cache/run" 2>/dev/null || true
+  rm -f "$cache/run/testdata.tar"
+  docker run --rm --platform linux/arm64 golang:1.24-bookworm cat /etc/services \
+    > "$cache/etc/services" 2>/dev/null || true
+  # A CWD must exist for every package even when it ships no testdata.
+  for p in "${pkgs[@]}"; do mkdir -p "$cache/run/src/$p"; done
+}
+
 # Extract "PASS <Test>" / "FAIL <Test>" verdict lines.
 verdicts() { grep -oE '^--- (PASS|FAIL): [A-Za-z0-9_/]+' "$1" \
   | sed -E 's/^--- (PASS|FAIL): /\1 /' | sort -u; }
 
 build
+provision
 
 total_gap=0
 for p in "${pkgs[@]}"; do
@@ -78,12 +111,19 @@ for p in "${pkgs[@]}"; do
     echo "[$p] NO BINARY (build failed) — gap"; total_gap=$((total_gap+1)); continue
   fi
 
-  docker run --rm --platform linux/arm64 -v "$cache/bin":/b -w /b debian:stable-slim \
-    "./$n.test" -test.run 'Test' -test.skip "$SKIP" -test.short -test.v \
+  # Run both sides with CWD = the package's mirrored src dir so each test's
+  # relative testdata/ and ../testdata/ resolve; provide /etc/services. Docker
+  # bind-mounts the run tree + -w; carrick does the same via run-elf -v/-w —
+  # `--fs host` is a sandboxed scratch (NOT the real host FS), so the testdata
+  # must be bind-mounted in. See provision().
+  docker run --rm --platform linux/arm64 -v "$cache/bin":/b -v "$cache/run":/run \
+    -v "$cache/etc/services":/etc/services:ro -w "/run/src/$p" debian:stable-slim \
+    "/b/$n.test" -test.run 'Test' -test.skip "$SKIP" -test.short -test.v \
     -test.timeout "${TEST_TIMEOUT}s" > "$cache/logs/$n.docker" 2>&1
 
   pkill -9 -f "carrick run-elf" 2>/dev/null
   CARRICK_EXPOSED_CPUS=10 timeout -s KILL "$RUN_TIMEOUT" "$carrick" run-elf --raw --fs host \
+    -v "$cache/run:/run" -w "/run/src/$p" \
     "$bin" -- -test.run 'Test' -test.skip "$SKIP" -test.short -test.v \
     -test.timeout "${TEST_TIMEOUT}s" > "$cache/logs/$n.carrick" 2>&1
   pkill -9 -f "carrick run-elf" 2>/dev/null
