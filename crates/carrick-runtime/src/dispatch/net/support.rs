@@ -976,13 +976,24 @@ pub(super) fn host_to_linux_sockaddr(bytes: &[u8], _family_hint: i32) -> Vec<u8>
             // at offset 2; skip the host's sun_len byte at offset 0.
             let path_len = bytes.len().saturating_sub(2);
             let host_path = &bytes[2..2 + path_len];
-            // Reverse the guest→host hash so the guest sees the path IT used (not
-            // carrick's <hash>.sock host node). Without this, Go's ln.Addr()
-            // reports the host path and re-dialing it double-translates → ENOENT.
-            // Unknown host node (e.g. a peer bound by another process): pass the
-            // host path through unchanged.
-            let path_out = guest_unix_path_for(host_path);
-            let path_bytes: &[u8] = path_out.as_deref().unwrap_or(host_path);
+            // An UNNAMED sender (unbound unix/unixgram socket) → macOS reports an
+            // empty/zero-filled path. Return an EMPTY sockaddr (length 0): Linux
+            // reports AF_UNSPEC/len-0 for this, and Go only treats a source as
+            // "no address" (nil) when the family is AF_UNSPEC — a family-only
+            // AF_UNIX reply would be misread via sun_path[0]==0 as the abstract
+            // address "@". Trim at the first NUL (pathname host paths are C strings).
+            let nul = host_path
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(host_path.len());
+            if nul == 0 {
+                return Vec::new();
+            }
+            // Reverse the guest→host hash so the guest sees the path/abstract name
+            // IT used (not carrick's <hash>.sock host node); an unknown host node
+            // (a peer bound by another process) passes the host path through.
+            let path_out = guest_unix_path_for(&host_path[..nul]);
+            let path_bytes: &[u8] = path_out.as_deref().unwrap_or(&host_path[..nul]);
             let mut out = vec![0u8; 2 + path_bytes.len()];
             out[0..2].copy_from_slice(&linux_family.to_ne_bytes());
             out[2..].copy_from_slice(path_bytes);
