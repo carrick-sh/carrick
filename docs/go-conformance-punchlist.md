@@ -25,7 +25,20 @@ to all interested guest fds). Regression test:
 `epoll_del_of_one_dup_keeps_readiness_for_the_shared_host_socket`. The TCP
 FileListener reducer is now green.
 
-### P1b — net: Unix-domain sockets broken (NEW — the big remaining net lever)
+### P1b — net: Unix-domain socket path translation — ✅ FIXED (2026-05-26)
+The guest→host unix path hash was one-way: `getsockname`/`getpeername`/`accept`
+returned the host node `…/carrick-unix-sockets/<hash>.sock` verbatim, so `ln.Addr()`
+reported it and re-dialing double-translated → ENOENT → every unix listen→dial→
+accept hung. Fixed in `dispatch/net/support.rs` (host-path→guest-path registry +
+reverse translation). `TestUnixConnSpecificMethods`, `TestUnixListenerSpecificMethods`,
+`TestConnAndListener/unix` now PASS; the unix reducer is green. Regression test
+`getsockname_returns_the_guest_unix_path_not_the_host_translation`.
+**Remaining (separate, lower priority):** `unixpacket`/`SOCK_SEQPACKET` over
+AF_UNIX is unsupported on macOS (the OS has no AF_UNIX SEQPACKET) — would need
+emulation over SOCK_STREAM. `TestFileListener` and `TestConnAndListener` still fail
+ONLY on their `unixpacket` iteration.
+
+### P1b (original) — net: Unix-domain sockets broken
 Discovered while reducing TestFileListener. A minimal reducer (`net.Listen("unix",…)`
 → Dial → Accept) **hangs** under carrick: the dial fails with
 `connect: no such file or directory` on a path under
