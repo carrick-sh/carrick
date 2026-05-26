@@ -15,6 +15,26 @@ panic = "deny"
 todo = "deny"
 unimplemented = "deny"
 
+# Build-speed tuning that does NOT touch the linker or DTrace (see
+# docs/build-decomposition-design.md and .cargo/config.toml for why lld is off).
+# macOS defaults to bundling debuginfo into a .dSYM via dsymutil on every link;
+# `unpacked` skips that packaging step (lldb/`carrick trace` still resolve line
+# info from the .o), cutting the link-dominated test-binary rebuild waves.
+[profile.dev]
+split-debuginfo = "unpacked"
+
+[profile.test]
+split-debuginfo = "unpacked"
+
+# Everyday fast inner-loop profile: drop heavy type/variable DWARF, keep line
+# tables (backtraces + `carrick trace`/lldb line numbers still work). Use
+# `cargo build/test --profile dev-fast` for the normal loop; plain `dev` keeps
+# full debuginfo for deep lldb variable inspection (the macos-vm-lldb-debug flow).
+[profile.dev-fast]
+inherits = "dev"
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
 [workspace.dependencies]
 anyhow = "1.0.100"
 bitflags = "2.10.0"

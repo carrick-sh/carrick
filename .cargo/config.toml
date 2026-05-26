@@ -1,0 +1,21 @@
+# carrick cargo config.
+#
+# ⚠️  DO NOT set the linker to lld here (`-fuse-ld=lld`).
+#
+# It is tempting (lld links the 44k-line carrick-runtime rlib far faster — see
+# docs/build-decomposition-design.md), but it BREAKS `carrick trace`. Root cause:
+# the `usdt` 0.6 crate hardcodes the macOS "Linker" backend (usdt-impl build.rs:
+# `Some("macos") => Backend::Linker`), which depends on Apple ld64's proprietary
+# DTrace probe-processing pass to synthesize the `__dof_carrick` Mach-O section.
+# `ld64.lld` does not implement that pass, so `__dof_carrick` is never created and
+# `usdt::register_probes()` finds zero probes (verified: 551 USDT probes under
+# ld64 → 0 under lld on the same trace). This is the regression that caused the
+# earlier lld adoption to be reverted.
+#
+# lld can only be adopted once carrick moves usdt to its linker-agnostic
+# `no-linker` backend (runtime-built DOF via the dof_helper ioctl), which needs a
+# usdt fork/patch. Until then, the default (Apple ld64) is mandatory for any build
+# that `carrick trace` will trace (the signed release binary in particular).
+#
+# Build-speed wins that are SAFE (no linker change, no DTrace impact) live in the
+# workspace `[profile.*]` blocks in Cargo.toml.
