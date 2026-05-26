@@ -107,13 +107,20 @@ TestDialerControl, TestListenConfigControl, TestZeroByteRead PASS on unixpacket.
 KNOWN LIMITATION: no message framing (true SEQPACKET boundaries) — no current test
 needs it; length-prefix framing is the follow-up.
 
-### net: ABSTRACT + autobind AF_UNIX sockets (NEW cluster — next)
-Linux abstract namespace (`sun_path[0]==0`, `@name`) and autobind (empty path,
-kernel-assigned name) have no macOS equivalent. carrick returns None for these →
-bind ENOENT. Fixes a cluster: `TestUnixAndUnixpacketServer`, `TestUnixgramServer`,
-`TestUnixgramAutobind`, `TestUnixAutobindClose`, `TestUnixgramLinuxAbstractLongName`,
-`TestReadUnixgramWithUnnamedSocket`. Map abstract/autobind names to a distinct
-host-path namespace + reverse-translate getsockname to the abstract form.
+### net: ABSTRACT + autobind AF_UNIX sockets — ✅ COMPLETE (2026-05-26)
+No macOS equivalent (abstract namespace is Linux-only; macOS bind → ENOENT,
+autobind → EINVAL). Emulated: abstract names → an `abstract/` host subdir;
+Linux-style autobind names (NUL+5hex) generated at bind; getsockname/recvfrom
+reverse-translate (incl. unnamed source → AF_UNSPEC/empty, not "@"). All 6 PASS:
+TestUnixAndUnixpacketServer, TestUnixgramServer, TestUnixgramAutobind,
+TestUnixAutobindClose, TestUnixgramLinuxAbstractLongName,
+TestReadUnixgramWithUnnamedSocket.
+
+### Remaining net carrick-only gaps (after this session's work)
+`TestSplice` (large socket-write POLLOUT readiness — deep netpoll), `TestIPConn*`
+(raw IP sockets — privileged on macOS, may be environmental), and any items a
+fresh full `net` diff surfaces now that sendfile/sockopt/interfaces/SEQPACKET/
+abstract are fixed.
 
 ### (historical) Biggest remaining net cluster — AF_UNIX SOCK_SEQPACKET (macOS platform gap)
 `unixpacket` is unsupported on macOS (no AF_UNIX SEQPACKET). This single gap is
