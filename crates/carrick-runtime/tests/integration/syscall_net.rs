@@ -28,6 +28,69 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "macos")]
 const LINUX_TCP_KEEPIDLE: u64 = 4;
 
+/// Regression for the Go `net` `TestFileListener` hang (docs/go-conformance-punchlist.md
+/// P1): a dup'd socket shares ONE host fd, but carrick's epoll kqueue is keyed by
+/// host fd. An `EPOLL_CTL_DEL` of one dup must NOT deafen the OTHER guest fds that
+/// still watch the same host socket — Linux epoll interest is per-fd. Before the
+/// fix, DEL of the dup did an unconditional `EV_DELETE` on the shared host fd, so
+/// the surviving fd never saw readiness → accept/read blocked forever.
+#[cfg(target_os = "macos")]
+#[test]
+fn epoll_del_of_one_dup_keeps_readiness_for_the_shared_host_socket() {
+    const LINUX_AF_UNIX: u64 = 1;
+    const LINUX_EPOLL_CTL_DEL: u64 = 2;
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    let ret = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| -> i64 {
+        match d
+            .dispatch(SyscallRequest::new(nr, SyscallArgs::from(args)), m, &reporter)
+            .unwrap()
+        {
+            DispatchOutcome::Returned { value } => value,
+            other => panic!("nr {nr} unexpected outcome: {other:?}"),
+        }
+    };
+
+    // socketpair(AF_UNIX, SOCK_STREAM) -> a real connected host pair; fds @0x4000.
+    assert_eq!(
+        ret(&mut dispatcher, &mut memory, 199, [LINUX_AF_UNIX, LINUX_SOCK_STREAM as u64, 0, 0x4000, 0, 0]),
+        0
+    );
+    let pair = memory.read_bytes(0x4000, 8).unwrap();
+    let fd_a = i32::from_le_bytes([pair[0], pair[1], pair[2], pair[3]]) as u64; // readable end
+    let fd_b = i32::from_le_bytes([pair[4], pair[5], pair[6], pair[7]]) as u64; // peer end
+
+    // dup(fd_a) -> a second guest fd sharing fd_a's host socket.
+    let fd_dup = ret(&mut dispatcher, &mut memory, 23, [fd_a, 0, 0, 0, 0, 0]) as u64;
+    assert!(fd_dup >= 3 && fd_dup != fd_a && fd_dup != fd_b);
+
+    // epoll_create1 -> epfd.
+    let epfd = ret(&mut dispatcher, &mut memory, 20, [0, 0, 0, 0, 0, 0]) as u64;
+
+    // epoll_ctl ADD fd_a (data 0xAAAA) and ADD fd_dup (data 0xBBBB) — same host fd.
+    let ev_a = LinuxEpollEvent { events: LINUX_EPOLLIN, _pad: 0, data: 0xAAAA };
+    memory.write_bytes(0x4040, ev_a.as_bytes()).unwrap();
+    assert_eq!(ret(&mut dispatcher, &mut memory, 21, [epfd, LINUX_EPOLL_CTL_ADD, fd_a, 0x4040, 0, 0]), 0);
+    let ev_d = LinuxEpollEvent { events: LINUX_EPOLLIN, _pad: 0, data: 0xBBBB };
+    memory.write_bytes(0x4060, ev_d.as_bytes()).unwrap();
+    assert_eq!(ret(&mut dispatcher, &mut memory, 21, [epfd, LINUX_EPOLL_CTL_ADD, fd_dup, 0x4060, 0, 0]), 0);
+
+    // DEL the dup — must keep fd_a's interest alive.
+    assert_eq!(ret(&mut dispatcher, &mut memory, 21, [epfd, LINUX_EPOLL_CTL_DEL, fd_dup, 0, 0, 0]), 0);
+
+    // Make fd_a readable by writing a byte to its peer end (fd_b).
+    memory.write_bytes(0x4080, b"x").unwrap();
+    assert_eq!(ret(&mut dispatcher, &mut memory, 64, [fd_b, 0x4080, 1, 0, 0, 0]), 1);
+
+    // epoll_pwait(timeout=0): fd_a MUST be reported readable (data 0xAAAA).
+    let n = ret(&mut dispatcher, &mut memory, 22, [epfd, 0x4100, 4, 0, 0, 0]);
+    assert_eq!(n, 1, "DEL of the dup deafened the shared host socket (the TestFileListener hang)");
+    let ready_data = read_epoll_event(&memory, 0x4100).data;
+    assert_eq!(ready_data, 0xAAAA);
+}
+
 #[test]
 fn epoll_event_matches_aarch64_c_abi_layout() {
     assert_eq!(core::mem::size_of::<LinuxEpollEvent>(), 16);
