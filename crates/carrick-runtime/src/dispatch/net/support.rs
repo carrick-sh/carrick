@@ -944,7 +944,12 @@ pub(super) fn read_linux_sockaddr(
 
 /// Translate a macOS BSD sockaddr (as returned by accept/getsockname/...
 /// into Linux-formatted bytes suitable for the guest to consume.
-pub(super) fn host_to_linux_sockaddr(bytes: &[u8], _family_hint: i32) -> Vec<u8> {
+/// Translate a macOS BSD sockaddr to Linux form. `unnamed_unspec` selects the
+/// behaviour for an UNNAMED AF_UNIX address (empty path): a datagram *peer
+/// source* (recvfrom/recvmsg) wants AF_UNSPEC/empty so Go reports `from == nil`;
+/// a *local/connection* address (getsockname/getpeername/accept) wants a
+/// family-only AF_UNIX sockaddr so Go reports a non-nil `&UnixAddr{Name:""}`.
+pub(super) fn host_to_linux_sockaddr(bytes: &[u8], _family_hint: i32, unnamed_unspec: bool) -> Vec<u8> {
     if bytes.len() < 2 {
         return Vec::new();
     }
@@ -987,7 +992,12 @@ pub(super) fn host_to_linux_sockaddr(bytes: &[u8], _family_hint: i32) -> Vec<u8>
                 .position(|&b| b == 0)
                 .unwrap_or(host_path.len());
             if nul == 0 {
-                return Vec::new();
+                if unnamed_unspec {
+                    return Vec::new();
+                }
+                let mut out = vec![0u8; 2];
+                out[0..2].copy_from_slice(&linux_family.to_ne_bytes());
+                return out;
             }
             // Reverse the guest→host hash so the guest sees the path/abstract name
             // IT used (not carrick's <hash>.sock host node); an unknown host node
@@ -1142,7 +1152,7 @@ mod tests {
         assert_eq!(host[1], libc::AF_INET as u8);
         assert_eq!(&host[2..8], &linux[2..8]);
 
-        let round_trip = host_to_linux_sockaddr(&host, LINUX_AF_INET);
+        let round_trip = host_to_linux_sockaddr(&host, LINUX_AF_INET, false);
         assert_eq!(round_trip, linux);
     }
 

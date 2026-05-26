@@ -588,7 +588,7 @@ impl SyscallDispatcher {
             let new_host = new_host.host_syscall_errno()?;
             if addr_addr != 0 && addrlen_addr != 0 {
                 let used = (sa_len as usize).min(sa_storage.len());
-                let linux_bytes = host_to_linux_sockaddr(&sa_storage[..used], family);
+                let linux_bytes = host_to_linux_sockaddr(&sa_storage[..used], family, false);
                 if write_linux_sockaddr(memory, addr_addr, addrlen_addr, &linux_bytes).is_err() {
                     unsafe { libc::close(new_host) };
                     return Err(LINUX_EFAULT);
@@ -1950,7 +1950,7 @@ impl SyscallDispatcher {
                 return Ok(errno.into());
             }
             let used = (sa_len as usize).min(sa.len());
-            let linux_bytes = host_to_linux_sockaddr(&sa[..used], family);
+            let linux_bytes = host_to_linux_sockaddr(&sa[..used], family, false);
             if write_linux_sockaddr(memory, addr_addr, addrlen_addr, &linux_bytes).is_err() {
                 return Ok(LINUX_EFAULT.into());
             }
@@ -1976,7 +1976,7 @@ impl SyscallDispatcher {
                 return Ok(errno.into());
             }
             let used = (sa_len as usize).min(sa.len());
-            let linux_bytes = host_to_linux_sockaddr(&sa[..used], family);
+            let linux_bytes = host_to_linux_sockaddr(&sa[..used], family, false);
             if write_linux_sockaddr(memory, addr_addr, addrlen_addr, &linux_bytes).is_err() {
                 return Ok(LINUX_EFAULT.into());
             }
@@ -2127,7 +2127,7 @@ impl SyscallDispatcher {
                 }
                 if used_addr && src_addr != 0 && src_len_addr != 0 {
                     let used = (sa_len as usize).min(sa.len());
-                    let linux_bytes = host_to_linux_sockaddr(&sa[..used], family);
+                    let linux_bytes = host_to_linux_sockaddr(&sa[..used], family, true);
                     if write_linux_sockaddr(memory, src_addr, src_len_addr, &linux_bytes).is_err() {
                         return Err(LINUX_EFAULT);
                     }
@@ -2510,7 +2510,7 @@ impl SyscallDispatcher {
             }
             if msg.name != 0 && msg.namelen != 0 {
                 let used = (sa_len as usize).min(sa.len());
-                let linux_bytes = host_to_linux_sockaddr(&sa[..used], family);
+                let linux_bytes = host_to_linux_sockaddr(&sa[..used], family, true);
                 let write_len = (linux_bytes.len() as u32).min(msg.namelen);
                 if write_len > 0
                     && memory
