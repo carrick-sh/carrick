@@ -159,6 +159,10 @@ pub struct MemoryRegion {
     pub start: u64,
     pub end: u64,
     pub perms: SegmentPerms,
+    /// When true, this region's host backing is `MAP_SHARED` (kept shared
+    /// across `fork(2)`, never snapshotted). Used for the boot-mapped shared
+    /// aperture. All other regions are private.
+    pub shared: bool,
     #[serde(skip)]
     bytes: Vec<u8>,
 }
@@ -327,6 +331,7 @@ impl AddressSpace {
                 start,
                 end,
                 perms,
+                shared: false,
                 bytes,
             });
         }
@@ -415,6 +420,7 @@ impl AddressSpace {
                 write: false,
                 execute: true,
             },
+            shared: false,
             bytes,
         };
 
@@ -463,6 +469,7 @@ impl AddressSpace {
                 write: false,
                 execute: true,
             },
+            shared: false,
             bytes,
         };
 
@@ -505,6 +512,7 @@ impl AddressSpace {
                 write: false,
                 execute: false,
             },
+            shared: false,
             bytes,
         };
 
@@ -539,6 +547,7 @@ impl AddressSpace {
                 write: false,
                 execute: false,
             },
+            shared: false,
             bytes: vec![0u8; crate::vdso::LINUX_VVAR_SIZE as usize],
         };
         let mut vdso_bytes = crate::vdso::vdso_image_bytes();
@@ -551,6 +560,7 @@ impl AddressSpace {
                 write: false,
                 execute: true,
             },
+            shared: false,
             bytes: vdso_bytes,
         };
 
@@ -742,6 +752,7 @@ fn build_linux_initial_stack(
                 write: true,
                 execute: false,
             },
+            shared: false,
             bytes,
         },
         stack_start + stack_pointer_offset as u64,
@@ -968,6 +979,7 @@ fn region_from_load_segments(
         start,
         end,
         perms,
+        shared: false,
         bytes,
     })
 }
@@ -1243,6 +1255,7 @@ fn linux_runtime_regions() -> Result<Vec<MemoryRegion>, AddressSpaceError> {
                 write: false,
                 execute: true,
             },
+            shared: false,
             bytes: sigreturn_trampoline_bytes(),
         },
         zeroed_region(
@@ -1261,6 +1274,19 @@ fn linux_runtime_regions() -> Result<Vec<MemoryRegion>, AddressSpaceError> {
                 read: true,
                 write: true,
                 execute: true,
+            },
+        )?,
+        // Stable, boot-mapped aperture that guest MAP_SHARED mmaps sub-allocate
+        // from (see `shared_aperture::SharedAperture`). Backed by a host
+        // MAP_ANON|MAP_SHARED region so the range stays shared across fork(2)
+        // and never needs a post-vCPU hv_vm_map.
+        shared_zeroed_region(
+            LINUX_SHARED_FILE_BASE,
+            LINUX_SHARED_FILE_SIZE,
+            SegmentPerms {
+                read: true,
+                write: true,
+                execute: false,
             },
         )?,
     ])
@@ -1284,8 +1310,22 @@ fn zeroed_region(
         start,
         end,
         perms,
+        shared: false,
         bytes: Vec::new(),
     })
+}
+
+/// Like `zeroed_region`, but the host backing is `MAP_SHARED` so the range
+/// stays shared across `fork(2)` (never snapshotted). Used for the shared
+/// aperture that guest `MAP_SHARED` mmaps sub-allocate from.
+fn shared_zeroed_region(
+    start: u64,
+    size: u64,
+    perms: SegmentPerms,
+) -> Result<MemoryRegion, AddressSpaceError> {
+    let mut region = zeroed_region(start, size, perms)?;
+    region.shared = true;
+    Ok(region)
 }
 
 fn linux_auxv_from_load_plan(
@@ -1730,5 +1770,17 @@ mod stage1_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn runtime_regions_include_shared_aperture() {
+        let regions = linux_runtime_regions().expect("runtime regions");
+        let shared = regions
+            .iter()
+            .find(|r| r.start == LINUX_SHARED_FILE_BASE)
+            .expect("shared aperture region present");
+        assert_eq!(shared.end, LINUX_SHARED_FILE_BASE + LINUX_SHARED_FILE_SIZE);
+        assert!(shared.shared, "shared aperture must be flagged shared");
+        assert!(shared.perms.read && shared.perms.write);
     }
 }
