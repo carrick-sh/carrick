@@ -266,34 +266,48 @@ fn seed_guest_baseline(backend: &mut dyn FsBackend, rootfs: Option<&RootFs>) {
         b"passwd: files\ngroup: files\nhosts: files dns\n".to_vec(),
     );
 
-    const HOSTNAMES: &[&str] = &[
-        "deb.debian.org",
-        "security.debian.org",
-        "ftp.debian.org",
-        "archive.ubuntu.com",
-        "security.ubuntu.com",
-        "ports.ubuntu.com",
-    ];
-    let mut hosts_content = String::from(
-        "127.0.0.1\tlocalhost\n\
-         ::1\tlocalhost ip6-localhost ip6-loopback\n\
-         ff02::1\tip6-allnodes\n\
-         ff02::2\tip6-allrouters\n",
-    );
-    for hostname in HOSTNAMES {
-        if let Ok(addrs) = (*hostname, 80u16).to_socket_addrs() {
-            for addr in addrs {
-                match addr.ip() {
-                    std::net::IpAddr::V4(v4) => {
-                        hosts_content.push_str(&format!("{}\t{}\n", v4, hostname));
-                        break;
+    // /etc/hosts. Check existence FIRST so we never resolve (below) only to
+    // discard the result when the guest already has a hosts file.
+    let have_hosts = backend.metadata("/etc/hosts").is_some()
+        || rootfs
+            .and_then(|rootfs| rootfs.metadata("/etc/hosts").ok())
+            .is_some();
+    if !have_hosts {
+        let mut hosts_content = String::from(
+            "127.0.0.1\tlocalhost\n\
+             ::1\tlocalhost ip6-localhost ip6-loopback\n\
+             ff02::1\tip6-allnodes\n\
+             ff02::2\tip6-allrouters\n",
+        );
+        // Pre-resolving the Debian/Ubuntu apt mirrors here was ~8 blocking
+        // getaddrinfo() calls (~80 ms via mDNSResponder) on EVERY startup — a
+        // profile showed it was the #2 cost after diskutil. It predates carrick
+        // synthesizing /etc/resolv.conf from the host resolver, so the guest now
+        // resolves these mirrors itself; the static seed is redundant. Keep it
+        // available behind an opt-in env for offline/locked-down apt runs, but
+        // off the default hot path.
+        if std::env::var_os("CARRICK_SEED_APT_MIRRORS").is_some() {
+            const HOSTNAMES: &[&str] = &[
+                "deb.debian.org",
+                "security.debian.org",
+                "ftp.debian.org",
+                "archive.ubuntu.com",
+                "security.ubuntu.com",
+                "ports.ubuntu.com",
+            ];
+            for hostname in HOSTNAMES {
+                if let Ok(addrs) = (*hostname, 80u16).to_socket_addrs() {
+                    for addr in addrs {
+                        if let std::net::IpAddr::V4(v4) = addr.ip() {
+                            hosts_content.push_str(&format!("{}\t{}\n", v4, hostname));
+                            break;
+                        }
                     }
-                    std::net::IpAddr::V6(_) => {}
                 }
             }
         }
+        let _ = backend.set_file_contents("/etc/hosts", hosts_content.into_bytes());
     }
-    set_baseline_file_if_missing(backend, rootfs, "/etc/hosts", hosts_content.into_bytes());
 }
 
 fn set_baseline_file_if_missing(
