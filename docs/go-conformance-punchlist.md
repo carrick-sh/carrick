@@ -86,10 +86,32 @@ passes all of these.
   [[project_shared_file_coherence]] is NOT this. Confirm whether the fd-derived
   listener's fd is ever registered with the netpoll.
 
-### P2 — net: Dialer / ListenConfig Control callbacks
-`TestDialerControl`, `TestDialerControlContext`, `TestListenConfigControl` — the
-`Control func(network, address string, c syscall.RawConn) error` hook (raw-fd
-setsockopt before bind/connect). A feature gap in `RawConn.Control` plumbing.
+### P2 — net: Dialer / ListenConfig Control callbacks — ✅ mostly FIXED (2026-05-26)
+Root cause was NOT the Control plumbing but `setsockopt(IPPROTO_IP/IPV6, …)`
+passing the Linux option NUMBER straight to macOS (different numbering) →
+ENOPROTOOPT. Fixed with a comprehensive Linux→macOS IP/IPV6 sockopt translation
+(`dispatch/net/support.rs`). `TestRawConnControl` PASSES; `TestDialerControl`/
+`Context`/`TestListenConfigControl` now pass tcp/tcp4/tcp6/unix/udp. The ONLY
+remaining failure in these is their `unixpacket` subtest → see the SEQPACKET gap.
+
+### Biggest remaining net cluster — AF_UNIX SOCK_SEQPACKET (macOS platform gap)
+`unixpacket` is unsupported on macOS (no AF_UNIX SEQPACKET). This single gap is
+the *sole* remaining failure in `TestFileListener`, `TestConnAndListener`,
+`TestDialerControl`, `TestDialerControlContext`, `TestListenConfigControl`,
+`TestUnixAndUnixpacketServer`, `TestZeroByteRead/unixpacket`, etc. No native
+option; would need SEQPACKET emulation over SOCK_STREAM (message framing) — a
+real feature, not a quick fix. Highest test-count cluster but highest effort.
+
+### net: interface enumeration — needs richer rtnetlink (getifaddrs)
+`TestInterfaceAddrs`, `TestInterfaceUnicastAddrs`, `TestParseProcNet` — carrick's
+synthetic rtnetlink only models a loopback interface. Darwin-native path: feed
+macOS `getifaddrs(3)` into the synthetic RTM_GETLINK/RTM_GETADDR responses.
+
+### net: splice (TestSplice) — large socket-write readiness
+splice EINVALs all socket↔pipe directions (impl gap) AND the read/write fallback
+deadlocks a large (5 MiB) socket write — two goroutines stuck on POLLOUT-write +
+EPOLLIN-read. io_wait DOES register EVFILT_WRITE, so it's a subtler large-transfer
+readiness/coordination issue. Deeper netpoll investigation.
 
 ### P3 — net: interface enumeration
 `TestInterfaceAddrs`, `TestInterfaceUnicastAddrs` — `getifaddrs`/`SIOCGIFCONF`
