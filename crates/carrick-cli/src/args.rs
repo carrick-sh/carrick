@@ -62,6 +62,13 @@ pub(crate) enum Commands {
         /// carrick's launch directory.
         #[arg(short = 'w', long = "workdir", value_name = "DIR")]
         workdir: Option<String>,
+        /// `KEY=VAL` env vars to set in this process before the guest starts.
+        /// Lets a `sudo`-launched run carry `CARRICK_*` tunables (e.g.
+        /// `CARRICK_EXPOSED_CPUS`) across sudo's `env_reset` without needing
+        /// SETENV in sudoers - CLI args survive sudo where env vars don't. Same
+        /// idiom as `trace --forward-env`.
+        #[arg(long = "forward-env", value_name = "KEY=VAL")]
+        forward_env: Vec<String>,
         #[arg(last = true)]
         args: Vec<String>,
     },

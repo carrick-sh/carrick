@@ -98,8 +98,18 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             fs,
             volume,
             workdir,
+            forward_env,
             args,
         } => {
+            // Apply forwarded env BEFORE anything reads it (host_facts caches the
+            // CPU count on first query). CLI args survive sudo's env_reset where
+            // a bare `sudo VAR=val` is rejected without SETENV in sudoers.
+            for kv in &forward_env {
+                if let Some((k, v)) = kv.split_once('=') {
+                    // SAFETY: single-threaded at this point (pre-runtime).
+                    unsafe { std::env::set_var(k, v) };
+                }
+            }
             let mut dispatcher = if rootfs_layers.is_empty() {
                 SyscallDispatcher::new()
             } else {
