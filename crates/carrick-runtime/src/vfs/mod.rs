@@ -35,6 +35,7 @@
 pub mod bind;
 pub mod dev;
 pub mod devpts;
+pub mod etc_services;
 pub mod mount;
 pub mod proc;
 pub mod resolvconf;
@@ -44,6 +45,7 @@ pub mod sys;
 pub use bind::BindVfs;
 pub use dev::DevVfs;
 pub use devpts::{DevptsVfs, PtyRole, PtyTable};
+pub use etc_services::EtcServicesVfs;
 pub use mount::VfsMounts;
 pub use proc::{ProcMapsEntry, ProcVfs, SyntheticProcContext};
 pub use resolvconf::ResolvConfVfs;
