@@ -116,7 +116,22 @@ TestUnixAndUnixpacketServer, TestUnixgramServer, TestUnixgramAutobind,
 TestUnixAutobindClose, TestUnixgramLinuxAbstractLongName,
 TestReadUnixgramWithUnnamedSocket.
 
-### Remaining net carrick-only gaps — fresh full diff 2026-05-26
+### net — ✅ FULLY CONFORMANT (2026-05-26)
+After /etc/services (EtcServicesVfs), TestProtocolListenError (reject bind to a
+trailing-'/' path), and raw sockets via CARRICK_SUDO, the full net suite has ZERO
+carrick-only gaps: 238 PASS under `CARRICK_SUDO=1`, empty docker-vs-carrick diff,
+no root-regressions. Unprivileged, only the 2 raw-IP tests gap (need root —
+macOS has no CAP_NET_RAW; Docker grants it by default).
+
+### cgo — ✅ WORKS (verified 2026-05-26)
+Go↔C calls, C→Go callbacks, and C-pthread→Go callbacks (the hard g0/needm path)
+all run under carrick matching Docker; the cgo resolver works via /etc/services.
+The TestCgo* runtime tests in the SKIP list need a *runtime* C/go toolchain
+(compile-on-the-fly), which the bare conformance binary lacks — they cancel on
+both sides, so they're not carrick gaps. Recommend adding a cgo smoke fixture
+(callbacks + C thread) to the harness for continuous coverage.
+
+### Remaining net carrick-only gaps — fresh full diff 2026-05-26 (historical)
 carrick net: **232 PASS / 6 FAIL / no crash / no timeout** (vs ~52-then-truncate
 at the start of this session's net work). The 6 docker-PASS-carrick-FAIL:
 - `TestCgoLookupPort`(+WithCancel), `TestReadLine` — guest can't open
