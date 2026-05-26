@@ -23,7 +23,13 @@ RUN_TIMEOUT="${RUN_TIMEOUT:-120}"
 # NOTE: TestDebugCall is NOT here — despite the name it uses no ptrace (in-process
 # tgkill(SIGTRAP) + an in-guest BRK #0); carrick delivers guest BRK as SIGTRAP
 # (see docs/ptrace-darwin-design.md Phase 1), so it runs and passes on both sides.
-SKIP="${SKIP:-TestGdb|TestLldb|TestCgo|TestTracebackSystem}"
+# TestGoLookupIPCNAMEOrderHostsAliasesFilesDNSMode hangs IDENTICALLY on carrick AND
+# the Docker linux/arm64 oracle (same goroutine stack: goLookupIPCNAMEOrder blocked
+# on a result chan, dnsclient_unix.go:683) — it needs reachable real DNS that
+# neither sandbox provides. A test-timeout panic kills the whole net.test binary,
+# so leaving it in falsely marks every later test "absent" on BOTH sides. Skipping
+# it un-truncates net (Docker 52→149 PASS) and keeps the diff fair.
+SKIP="${SKIP:-TestGdb|TestLldb|TestCgo|TestTracebackSystem|TestGoLookupIPCNAMEOrderHostsAliasesFilesDNSMode}"
 # Per-binary Go test timeout: a hung/slow test (e.g. net's DNS lookups) aborts
 # itself with a goroutine dump well before the carrick hard-kill, so a stuck
 # binary no longer burns the whole RUN_TIMEOUT. Kept comfortably under it.
