@@ -60,22 +60,44 @@ pub const LINUX_EL1_VECTORS_SIZE: u64 = 0x4000;
 // `ldaxr`/`stlxr` need to work — without it ARMv8 treats every data
 // access as Device-nGnRnE and exclusive ops are prohibited.
 pub const LINUX_PAGE_TABLES_BASE: u64 = LINUX_KERNEL_REGION_BASE + 0x20000;
-// 256 KiB: six boot tables (L0, L1A, L1B, L2A, L2B, L3A in the first six 4 KiB
-// pages) plus a 58-page spare pool the runtime page-table manager
+// 1.75 MiB: six boot tables (L0, L1A, L1B, L2A, L2B, L3A in the first six 4 KiB
+// pages) plus a 442-page spare pool the runtime page-table manager
 // (`crate::page_table`) carves sub-tables from when it splits a coarse block to
 // finer granularity for guest mprotect/PROT_NONE/munmap. The spare tail is
-// zero-filled (invalid descriptors). Still well within the kernel hole's first
-// 2 MiB block (0x20000 + 0x40000 = 0x60000 < 0x200000), so it stays kernel-only.
-pub const LINUX_PAGE_TABLES_SIZE: u64 = 0x40000;
+// zero-filled (invalid descriptors). Sized up from 0x40000 (58 spare): each
+// distinct 2 MiB region that gets any 4 KiB-granular mapping holds one live L3
+// table that is NOT reclaimable while any of its pages stays mapped (Go returns
+// memory via madvise, not munmap, so coalescing rarely fires) — the cumulative
+// live working set of the full Go runtime.test reached the 58-page cap and
+// OOM'd in TestPageAllocAlloc (PROVEN via the pt-pool watermark hitting 58/58).
+// Whole region stays inside the kernel hole's first 2 MiB block alongside the
+// maintenance trampoline (0x20000 + 0x1C0000 + maint 0x4000 = 0x1E4000 <
+// 0x200000), so it remains kernel-only.
+pub const LINUX_PAGE_TABLES_SIZE: u64 = 0x1C0000;
 // Carrick-owned EL1 stage-1 maintenance trampoline. After the host edits page
 // descriptors (host backing of the table region), the stage-1 TLB is stale; the
 // guest can't observe the edit until a `tlbi`. arm64 public HVF has no stage-2
 // TLBI, but Carrick owns guest EL1, so it runs this tiny EL1 routine
 // (`dsb sy; tlbi vmalle1is; dsb sy; isb; hvc #1`) on its own vCPU to flush
-// stage-1. Lives just past the page-table region, still inside the kernel
-// hole's first 2 MiB block (so it's EL1-only, EL1-executable: PXN=0/UXN=1).
-pub const LINUX_EL1_MAINT_BASE: u64 = LINUX_KERNEL_REGION_BASE + 0x60000;
+// stage-1. Lives just past the (grown) page-table region, still inside the
+// kernel hole's first 2 MiB block (so it's EL1-only, EL1-executable:
+// PXN=0/UXN=1). 0x20000 (PT base) + 0x1C0000 (PT size) = 0x1E0000.
+pub const LINUX_EL1_MAINT_BASE: u64 = LINUX_KERNEL_REGION_BASE + 0x1E0000;
 pub const LINUX_EL1_MAINT_SIZE: u64 = 0x4000;
+// Layout invariant: the page tables + the maintenance trampoline must both sit
+// inside the kernel hole's first 2 MiB block (mapped kernel-only EL1-RWX by the
+// single KERNEL_BLOCK_FLAGS 2 MiB block in `stage1_identity_page_tables`).
+// Overflowing it would place tables/maint on a USER 2 MiB block (EL0-reachable,
+// and PXN=1 so the maint trampoline could not be fetched at EL1).
+const _: () = assert!(
+    (LINUX_PAGE_TABLES_BASE - LINUX_KERNEL_REGION_BASE) + LINUX_PAGE_TABLES_SIZE
+        <= (LINUX_EL1_MAINT_BASE - LINUX_KERNEL_REGION_BASE),
+    "page-table region overlaps the EL1 maintenance trampoline",
+);
+const _: () = assert!(
+    (LINUX_EL1_MAINT_BASE - LINUX_KERNEL_REGION_BASE) + LINUX_EL1_MAINT_SIZE <= 0x200000,
+    "EL1 maintenance trampoline escapes the kernel-only first 2 MiB block",
+);
 // User-mode rt_sigreturn trampoline. This must be outside the first 2 MiB,
 // whose stage-1 block is kernel-only for the EL0-entry/vector pages, and it
 // must not collide with ET_EXEC binaries that commonly start at 0x200000. Keep
