@@ -205,8 +205,9 @@ impl PageTableManager {
         want_valid: bool,
         want_ap: u64,
         target: impl Fn(u64) -> u64,
-    ) -> Result<(), PageTableError> {
+    ) -> Result<bool, PageTableError> {
         let pages = (len as u64).div_ceil(PT_PAGE);
+        let mut changed = false;
         for p in 0..pages {
             let page_va = va + p * PT_PAGE;
             if let Some((valid, ap)) = self.current_prot(page_va) {
@@ -218,12 +219,13 @@ impl PageTableManager {
             }
             let (off, _level) = self.leaf_offset(page_va, true)?;
             self.write_desc(off, target(page_va));
+            changed = true;
         }
-        Ok(())
+        Ok(changed)
     }
 
     /// Mark `[va, va+len)` invalid (faults on any access → SEGV_MAPERR).
-    pub(crate) fn set_prot_none(&mut self, va: u64, len: usize) -> Result<(), PageTableError> {
+    pub(crate) fn set_prot_none(&mut self, va: u64, len: usize) -> Result<bool, PageTableError> {
         self.apply(va, len, false, 0, |pv| {
             (pv & PA_MASK_4KIB) | (USER_PAGE_FLAGS & !VALID)
         })
@@ -231,19 +233,19 @@ impl PageTableManager {
 
     /// Alias for `set_prot_none`, used by `munmap` (the freed range faults
     /// until reused).
-    pub(crate) fn invalidate(&mut self, va: u64, len: usize) -> Result<(), PageTableError> {
+    pub(crate) fn invalidate(&mut self, va: u64, len: usize) -> Result<bool, PageTableError> {
         self.set_prot_none(va, len)
     }
 
     /// Mark `[va, va+len)` valid read-only (AP=RO).
-    pub(crate) fn set_readonly(&mut self, va: u64, len: usize) -> Result<(), PageTableError> {
+    pub(crate) fn set_readonly(&mut self, va: u64, len: usize) -> Result<bool, PageTableError> {
         self.apply(va, len, true, AP_RO, |pv| {
             (pv & PA_MASK_4KIB) | (USER_PAGE_FLAGS & !AP_MASK) | AP_RO
         })
     }
 
     /// Restore `[va, va+len)` to a valid RW user page (identity-mapped).
-    pub(crate) fn set_rw(&mut self, va: u64, len: usize) -> Result<(), PageTableError> {
+    pub(crate) fn set_rw(&mut self, va: u64, len: usize) -> Result<bool, PageTableError> {
         self.apply(va, len, true, AP_RW, |pv| {
             (pv & PA_MASK_4KIB) | USER_PAGE_FLAGS
         })
@@ -355,7 +357,8 @@ mod tests {
         let mut bytes = stage1_identity_page_tables();
         bytes.truncate(6 * 0x1000);
         let mut mgr = PageTableManager::new(bytes, LINUX_PAGE_TABLES_BASE);
-        assert_eq!(mgr.set_rw(LINUX_MMAP_BASE + 0x10_0000, 0x4000), Ok(()));
+        // Already RW → no change, no split, no allocation.
+        assert_eq!(mgr.set_rw(LINUX_MMAP_BASE + 0x10_0000, 0x4000), Ok(false));
     }
 
     #[test]
