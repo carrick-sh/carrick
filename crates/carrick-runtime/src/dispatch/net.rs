@@ -1757,6 +1757,39 @@ impl SyscallDispatcher {
                 Ok(t) => t,
                 Err(errno) => return Ok(errno.into()),
             };
+            // AF_UNIX autobind: a bind with only the family (addrlen == 2, empty
+            // path) asks the kernel to assign a unique abstract name. macOS has
+            // no autobind, so generate the name + a host node and bind there; a
+            // later getsockname reverse-translates the host path → the abstract
+            // name via the registry.
+            if family == libc::AF_UNIX && addrlen <= 2 {
+                let host_path = autobind_unix_host_path();
+                let p = host_path.to_string_lossy();
+                let pb = p.as_bytes();
+                if pb.len() >= 104 {
+                    return Ok(LINUX_ENAMETOOLONG.into());
+                }
+                let mut sa = vec![0u8; 2 + pb.len() + 1];
+                sa[0] = sa.len().min(255) as u8;
+                sa[1] = libc::AF_UNIX as u8;
+                sa[2..2 + pb.len()].copy_from_slice(pb);
+                // Remove a stale socket node left by a prior run (the generated
+                // name is per-process; a leftover host file would be EADDRINUSE),
+                // mirroring the pathname unlink-then-bind below.
+                if let Ok(md) = std::fs::symlink_metadata(&*p) {
+                    use std::os::unix::fs::FileTypeExt;
+                    if md.file_type().is_socket() {
+                        let _ = std::fs::remove_file(&*p);
+                    }
+                }
+                let rc = unsafe {
+                    libc::bind(host_fd, sa.as_ptr() as *const libc::sockaddr, sa.len() as u32)
+                };
+                return Ok(match rc.host_syscall_errno() {
+                    Ok(_) => DispatchOutcome::Returned { value: 0 },
+                    Err(errno) => errno.into(),
+                });
+            }
             let host_addr = match read_linux_sockaddr(memory, addr_addr, addrlen, family) {
                 Ok(bytes) => bytes,
                 Err(errno) => return Ok(errno.into()),

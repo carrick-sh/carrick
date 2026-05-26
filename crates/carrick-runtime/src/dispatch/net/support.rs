@@ -807,6 +807,33 @@ fn unix_socket_host_path(sun_path: &[u8]) -> Option<std::path::PathBuf> {
     Some(host)
 }
 
+/// AF_UNIX autobind: an empty bind address asks the kernel to assign a unique
+/// abstract name (Linux: NUL + 5 hex digits). macOS has neither autobind nor an
+/// abstract namespace, so generate that name ourselves, map it to a host node
+/// (like any abstract socket), register it for getsockname reverse-translation,
+/// and return the host path to `bind`.
+pub(super) fn autobind_unix_host_path() -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static CTR: AtomicU32 = AtomicU32::new(1);
+    let n = CTR.fetch_add(1, Ordering::Relaxed);
+    // Abstract sun_path: leading NUL + 5 hex digits, exactly as Linux autobind.
+    let name = format!("{:05x}", n & 0xf_ffff);
+    let mut sun: Vec<u8> = vec![0];
+    sun.extend_from_slice(name.as_bytes());
+    let base = unix_socket_host_dir().join("abstract");
+    let _ = std::fs::create_dir_all(&base);
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &b in &sun[1..] {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let host = base.join(format!("{hash:016x}.sock"));
+    if let Ok(mut map) = unix_path_registry().lock() {
+        map.insert(host.clone(), sun);
+    }
+    host
+}
+
 /// Process-global host-socket-path → original-guest-`sun_path` map, populated by
 /// `unix_socket_host_path` at every bind/connect/sendto translation and consumed
 /// by `host_to_linux_sockaddr` to undo the hash. Process-global (not fork-shared):
