@@ -352,6 +352,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "carrick-mem"
+version = "0.1.0"
+dependencies = [
+ "carrick-abi",
+ "carrick-guest-mem",
+ "goblin",
+ "libc",
+ "serde",
+ "thiserror",
+ "zerocopy",
+]
+
+[[package]]
 name = "carrick-runtime"
 version = "0.1.0"
 dependencies = [
@@ -364,6 +377,7 @@ dependencies = [
  "carrick-abi",
  "carrick-guest-mem",
  "carrick-image",
+ "carrick-mem",
  "carrick-spec",
  "carrick-test-support",
  "cc",
