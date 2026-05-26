@@ -129,6 +129,13 @@ impl FsState {
                     "/etc/resolv.conf",
                     Box::new(crate::vfs::ResolvConfVfs::new()),
                 );
+                // /etc/services from the macOS host (format-identical to Linux),
+                // so the guest's getservbyname/port lookups work under --fs host
+                // (the scratch has no /etc/services). Single-file mount.
+                m.mount(
+                    "/etc/services",
+                    Box::new(crate::vfs::EtcServicesVfs::new()),
+                );
                 m
             },
             rootfs_vfs: crate::vfs::RootFsVfs::new(),
