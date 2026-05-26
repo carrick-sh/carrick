@@ -294,10 +294,19 @@ impl SyscallDispatcher {
                 let _ = memory.write_bytes(address, &zeros);
             }
 
+            // Restore guest-visible stage-1 validity for arena allocations: a
+            // page reclaimed from a prior munmap (which invalidated it) must be
+            // valid+RW again, and a PROT_NONE mmap must actually fault. No-op
+            // (no TLBI) when the page is already at the target protection.
+            let in_arena = range_within(address, length, LINUX_MMAP_BASE, LINUX_MMAP_SIZE);
+
             let prot_none = prot & (LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC) == 0;
             if prot_none && flags & LINUX_MAP_ANONYMOUS != 0 {
                 memory.set_no_access(address, length_usize, false);
                 memory.set_no_access(address, length_usize, true);
+                if in_arena && memory.protect_range(address, length_usize, 0).is_err() {
+                    return Ok(LINUX_ENOMEM.into());
+                }
                 return Ok(DispatchOutcome::Returned {
                     value: address as i64,
                 });
@@ -342,6 +351,11 @@ impl SyscallDispatcher {
             if prot_none {
                 memory.set_no_access(address, length_usize, true);
             }
+            // Make the requested protection guest-visible (also restores RW for
+            // a reused range). prot==0 here means file-backed PROT_NONE.
+            if in_arena && memory.protect_range(address, length_usize, prot).is_err() {
+                return Ok(LINUX_ENOMEM.into());
+            }
             Ok(DispatchOutcome::Returned {
                 value: address as i64,
             })
@@ -366,19 +380,28 @@ impl SyscallDispatcher {
                 return Ok(LINUX_EINVAL.into());
             }
             if let Some(len) = align_up_u64(length, LINUX_PAGE_SIZE) {
-                let mut mem = this.mem.lock();
-                if address.0.checked_add(len) == Some(mem.mmap_next) {
-                    mem.mmap_next = address.0;
-                    while let Some(pos) = mem
-                        .free_regions
-                        .iter()
-                        .position(|&(s, l)| s.checked_add(l) == Some(mem.mmap_next))
-                    {
-                        let (s, _l) = mem.free_regions.remove(pos);
-                        mem.mmap_next = s;
+                {
+                    let mut mem = this.mem.lock();
+                    if address.0.checked_add(len) == Some(mem.mmap_next) {
+                        mem.mmap_next = address.0;
+                        while let Some(pos) = mem
+                            .free_regions
+                            .iter()
+                            .position(|&(s, l)| s.checked_add(l) == Some(mem.mmap_next))
+                        {
+                            let (s, _l) = mem.free_regions.remove(pos);
+                            mem.mmap_next = s;
+                        }
+                    } else {
+                        free_regions_insert(&mut mem.free_regions, address.0, len);
                     }
-                } else {
-                    free_regions_insert(&mut mem.free_regions, address.0, len);
+                }
+                // Invalidate the freed range in stage-1 so a use-after-munmap
+                // faults in-guest; a later mmap that reuses the range restores
+                // validity. Best-effort (failure leaves it accessible, the
+                // pre-existing behavior).
+                if let Ok(len_usize) = usize::try_from(len) {
+                    let _ = cx.memory.unmap_range(address.0, len_usize);
                 }
             }
             Ok(DispatchOutcome::Returned { value: 0 })
