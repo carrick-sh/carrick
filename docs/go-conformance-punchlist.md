@@ -94,7 +94,28 @@ ENOPROTOOPT. Fixed with a comprehensive Linux→macOS IP/IPV6 sockopt translatio
 `Context`/`TestListenConfigControl` now pass tcp/tcp4/tcp6/unix/udp. The ONLY
 remaining failure in these is their `unixpacket` subtest → see the SEQPACKET gap.
 
-### Biggest remaining net cluster — AF_UNIX SOCK_SEQPACKET (macOS platform gap)
+### net: interface enumeration — ✅ COMPLETE (2026-05-26)
+`getifaddrs(3)` feeds the synthetic rtnetlink (all interfaces, IPv4+IPv6, real
+flags/index/prefixlen/hwaddr); `/proc/net/igmp[6]` synthesized for multicast.
+TestInterfaces, TestInterfaceAddrs, TestInterfaceUnicastAddrs,
+TestInterfaceMulticastAddrs, TestParseProcNet all PASS.
+
+### net: AF_UNIX SOCK_SEQPACKET — ✅ COMPLETE for plumbing (2026-05-26)
+macOS lacks AF_UNIX SEQPACKET (EPROTONOSUPPORT); backed with host SOCK_STREAM +
+getsockopt(SO_TYPE) reports the guest type. TestFileListener, TestConnAndListener,
+TestDialerControl, TestListenConfigControl, TestZeroByteRead PASS on unixpacket.
+KNOWN LIMITATION: no message framing (true SEQPACKET boundaries) — no current test
+needs it; length-prefix framing is the follow-up.
+
+### net: ABSTRACT + autobind AF_UNIX sockets (NEW cluster — next)
+Linux abstract namespace (`sun_path[0]==0`, `@name`) and autobind (empty path,
+kernel-assigned name) have no macOS equivalent. carrick returns None for these →
+bind ENOENT. Fixes a cluster: `TestUnixAndUnixpacketServer`, `TestUnixgramServer`,
+`TestUnixgramAutobind`, `TestUnixAutobindClose`, `TestUnixgramLinuxAbstractLongName`,
+`TestReadUnixgramWithUnnamedSocket`. Map abstract/autobind names to a distinct
+host-path namespace + reverse-translate getsockname to the abstract form.
+
+### (historical) Biggest remaining net cluster — AF_UNIX SOCK_SEQPACKET (macOS platform gap)
 `unixpacket` is unsupported on macOS (no AF_UNIX SEQPACKET). This single gap is
 the *sole* remaining failure in `TestFileListener`, `TestConnAndListener`,
 `TestDialerControl`, `TestDialerControlContext`, `TestListenConfigControl`,
