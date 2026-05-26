@@ -14,6 +14,17 @@ repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cache="/tmp/go-conformance"; mkdir -p "$cache/bin" "$cache/logs"
 carrick="$repo/target/release/carrick"
 RUN_TIMEOUT="${RUN_TIMEOUT:-120}"
+# Tests that need host infra neither carrick nor the Docker oracle can provide:
+# a ptrace tracer (debug/gdb/lldb), a C toolchain (cgo), or the test's own Go
+# source tree (tracebacksystem). They HANG or panic-abort the test binary rather
+# than FAIL cleanly, so the binary would burn the full RUN_TIMEOUT and every
+# downstream test would look "absent" (the bogus runtime "277"). Skipped on BOTH
+# sides so the carrick-vs-Docker diff stays fair. Override via SKIP=.
+SKIP="${SKIP:-TestDebugCall|TestGdb|TestLldb|TestCgo|TestTracebackSystem}"
+# Per-binary Go test timeout: a hung/slow test (e.g. net's DNS lookups) aborts
+# itself with a goroutine dump well before the carrick hard-kill, so a stuck
+# binary no longer burns the whole RUN_TIMEOUT. Kept comfortably under it.
+TEST_TIMEOUT=$(( RUN_TIMEOUT > 60 ? RUN_TIMEOUT - 30 : RUN_TIMEOUT ))
 
 # Portable package-list load: macOS ships bash 3.2 which has no `mapfile`, and
 # `set -u` errors on an empty `${arr[@]}`, so seed the array with a sentinel and
@@ -59,11 +70,13 @@ for p in "${pkgs[@]}"; do
   fi
 
   docker run --rm --platform linux/arm64 -v "$cache/bin":/b -w /b debian:stable-slim \
-    "./$n.test" -test.run 'Test' -test.short -test.v > "$cache/logs/$n.docker" 2>&1
+    "./$n.test" -test.run 'Test' -test.skip "$SKIP" -test.short -test.v \
+    -test.timeout "${TEST_TIMEOUT}s" > "$cache/logs/$n.docker" 2>&1
 
   pkill -9 -f "carrick run-elf" 2>/dev/null
   CARRICK_EXPOSED_CPUS=10 timeout -s KILL "$RUN_TIMEOUT" "$carrick" run-elf --raw --fs host \
-    "$bin" -- -test.run 'Test' -test.short -test.v > "$cache/logs/$n.carrick" 2>&1
+    "$bin" -- -test.run 'Test' -test.skip "$SKIP" -test.short -test.v \
+    -test.timeout "${TEST_TIMEOUT}s" > "$cache/logs/$n.carrick" 2>&1
   pkill -9 -f "carrick run-elf" 2>/dev/null
 
   gap=$(comm -23 <(verdicts "$cache/logs/$n.docker"  | grep '^PASS ' | awk '{print $2}' | sort -u) \
