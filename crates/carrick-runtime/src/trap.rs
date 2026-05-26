@@ -131,6 +131,9 @@ pub struct GuestMapping {
     pub offset_in_mapping: u64,
     pub payload_size: u64,
     pub perms: SegmentPerms,
+    /// Host backing is `MAP_SHARED` (kept shared across fork). Mirrors
+    /// `MemoryRegion::shared`.
+    pub shared: bool,
     #[serde(skip)]
     image: Vec<u8>,
 }
@@ -167,6 +170,7 @@ impl GuestMappingPlan {
                 offset_in_mapping,
                 payload_size: region.bytes().len() as u64,
                 perms: region.perms,
+                shared: region.shared,
                 image,
             });
         }
@@ -2767,13 +2771,17 @@ fn map_region_raw(mapping: &GuestMapping) -> Result<HvfMappedRegion, TrapError> 
     // MAP_SHARED anon is HVF-coherent (same as `map_shared_file`). The cost:
     // fork(2) no longer COW-isolates these pages, so `HvfInner::fork` takes an
     // explicit private snapshot for the child (see `clone_region_for_child`).
-    let host_mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
-        size,
-        crate::host_mapping::HostMappingKind::PrivateAnon,
-    )
-    .map_err(|error| {
-        TrapError::Hypervisor(format!("mmap guest region (size={size}) failed: {error}"))
-    })?;
+    // The aperture region is host-MAP_SHARED so it stays shared across fork(2)
+    // (never snapshotted); all other regions are private guest RAM.
+    let kind = if mapping.shared {
+        crate::host_mapping::HostMappingKind::SharedAnon
+    } else {
+        crate::host_mapping::HostMappingKind::PrivateAnon
+    };
+    let host_mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(size, kind)
+        .map_err(|error| {
+            TrapError::Hypervisor(format!("mmap guest region (size={size}) failed: {error}"))
+        })?;
     let host = host_mapping.as_ptr();
     let size = host_mapping.len();
     // Copy the payload prefix into the freshly-zeroed region; the rest stays
