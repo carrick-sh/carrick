@@ -14,6 +14,24 @@ repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cache="/tmp/go-conformance"; mkdir -p "$cache/bin" "$cache/logs" "$cache/run" "$cache/etc"
 carrick="$repo/target/release/carrick"
 RUN_TIMEOUT="${RUN_TIMEOUT:-120}"
+# Packages that must run inside a COHERENT debian rootfs (via `carrick run
+# <image>`) rather than the bare `--fs host` scratch, because they exercise the
+# process/exec surface — PATH lookup of real binaries (echo, nohup), relative-
+# name exec, and the test binary's own argv[0] needing real ancestor dirs —
+# which only behaves like the Docker oracle when the binary, its cwd, and /bin
+# all live in one filesystem. The rootfs cleanly fixes os/signal's
+# TestDetectNohup (nohup now resolves). The others stay on the faster bare-ELF
+# path where they're already conformant.
+#
+# NOTE: os/exec is deliberately NOT here. Its 3 bare-ELF gaps (TestString,
+# TestCommandRelativeName, TestExplicitPWD) DO need the rootfs, but under it
+# TestConcurrentExec's heavy concurrent fork+exec reliably triggers the known
+# HV_BUSY multithreaded-fork race (0xfae94002, leaked vCPU; see
+# project_go_osexec_mtfork) and times out the whole binary — strictly worse
+# (7 PASS) than the bare-ELF run (34 PASS). os/exec joins this set once that
+# fork race is fixed. The execve relative-path fix it needs is already landed.
+ROOTFS_PKGS="${ROOTFS_PKGS:-os/signal}"
+ROOTFS_IMAGE="${ROOTFS_IMAGE:-debian:stable-slim}"
 # Tests that need host infra neither carrick nor the Docker oracle can provide:
 # a separate ptrace tracer process (gdb/lldb), a C toolchain (cgo), or the test's
 # own Go source tree (tracebacksystem). They HANG or panic-abort the test binary
@@ -163,27 +181,37 @@ for p in "${pkgs[@]}"; do
     "/b/$n.test" -test.run 'Test' -test.skip "$SKIP" -test.short -test.v \
     -test.timeout "${TEST_TIMEOUT}s" > "$cache/logs/$n.docker" 2>&1
 
-  pkill -9 -f "carrick run-elf" 2>/dev/null
+  pkill -9 -f "carrick run" 2>/dev/null
+  # Build the carrick subcommand. ROOTFS_PKGS run inside a coherent debian
+  # rootfs (same image + bind mounts as the Docker oracle), with the test binary
+  # referenced by its in-rootfs mount path (/b/$n.test) so argv[0] has real
+  # ancestor dirs; everything else runs the static ELF directly under --fs host.
+  # Test args are shared. `--forward-env` carries the CPU count across sudo's
+  # env_reset (a CLI arg survives where the NOPASSWD rule's lack of SETENV would
+  # reject `sudo VAR=val carrick`).
+  test_args=(-test.run Test -test.skip "$SKIP" -test.short -test.v -test.timeout "${TEST_TIMEOUT}s")
+  case " $ROOTFS_PKGS " in
+    *" $p "*)
+      carrick_args=(run --raw --forward-env CARRICK_EXPOSED_CPUS=10
+        -v "$cache/bin:/b" -v "$cache/run:/run" -v "$cache/zoneinfo:/usr/share/zoneinfo:ro"
+        -w "/run/src/$p" "$ROOTFS_IMAGE" "/b/$n.test" "${test_args[@]}") ;;
+    *)
+      carrick_args=(run-elf --raw --fs host --forward-env CARRICK_EXPOSED_CPUS=10
+        -v "$cache/run:/run" -v "$cache/zoneinfo:/usr/share/zoneinfo:ro"
+        -w "/run/src/$p" "$bin" -- "${test_args[@]}") ;;
+  esac
   # CARRICK_SUDO=1 runs the guest as root so raw-socket tests (ip:tcp, ip4:icmp)
   # work — macOS has no CAP_NET_RAW equivalent, so raw sockets need root (the same
   # privilege Docker grants by default). Off by default: running guest code as
   # root is a heavier posture and `sudo -n` needs a tty. Under sudo we skip the
   # outer `timeout` (sudo'ing `timeout` wouldn't match the carrick NOPASSWD rule)
-  # and rely on -test.timeout + the pkill. The CPU count rides in via
-  # `--forward-env` (a CLI arg) because sudo's env_reset strips CARRICK_EXPOSED_CPUS
-  # and the NOPASSWD rule lacks SETENV, so `sudo -n VAR=val carrick` is rejected.
+  # and rely on -test.timeout + the pkill.
   if [ -n "${CARRICK_SUDO:-}" ]; then
-    sudo -n "$carrick" run-elf --raw --fs host --forward-env CARRICK_EXPOSED_CPUS=10 \
-      -v "$cache/run:/run" -v "$cache/zoneinfo:/usr/share/zoneinfo:ro" -w "/run/src/$p" \
-      "$bin" -- -test.run 'Test' -test.skip "$SKIP" -test.short -test.v \
-      -test.timeout "${TEST_TIMEOUT}s" > "$cache/logs/$n.carrick" 2>&1
+    sudo -n "$carrick" "${carrick_args[@]}" > "$cache/logs/$n.carrick" 2>&1
   else
-    CARRICK_EXPOSED_CPUS=10 timeout -s KILL "$RUN_TIMEOUT" "$carrick" run-elf --raw --fs host \
-      -v "$cache/run:/run" -v "$cache/zoneinfo:/usr/share/zoneinfo:ro" -w "/run/src/$p" \
-      "$bin" -- -test.run 'Test' -test.skip "$SKIP" -test.short -test.v \
-      -test.timeout "${TEST_TIMEOUT}s" > "$cache/logs/$n.carrick" 2>&1
+    timeout -s KILL "$RUN_TIMEOUT" "$carrick" "${carrick_args[@]}" > "$cache/logs/$n.carrick" 2>&1
   fi
-  pkill -9 -f "carrick run-elf" 2>/dev/null
+  pkill -9 -f "carrick run" 2>/dev/null
 
   gap=$(comm -23 <(verdicts "$cache/logs/$n.docker"  | grep '^PASS ' | awk '{print $2}' | sort -u) \
                  <(verdicts "$cache/logs/$n.carrick" | grep '^PASS ' | awk '{print $2}' | sort -u))

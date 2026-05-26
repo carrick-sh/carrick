@@ -56,6 +56,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 name: None,
                 rm: false,
                 publish: vec![],
+                forward_env: vec![],
                 command: vec!["/bin/sh".to_owned()],
             }
         }
@@ -223,8 +224,18 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             name,
             rm,
             publish: _,
+            forward_env,
             command,
         } => {
+            // Apply forwarded env BEFORE anything reads it (e.g. host_facts'
+            // CPU-count cache). CLI args survive sudo's env_reset where a bare
+            // `sudo VAR=val` is rejected without SETENV in sudoers.
+            for kv in &forward_env {
+                if let Some((k, v)) = kv.split_once('=') {
+                    // SAFETY: single-threaded at this point (pre-runtime).
+                    unsafe { std::env::set_var(k, v) };
+                }
+            }
             let mut env_overrides = env.clone();
             if let Some(file_path) = &env_file {
                 let file_envs = parse_env_file(file_path)?;
