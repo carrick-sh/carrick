@@ -96,6 +96,26 @@ setsockopt before bind/connect). A feature gap in `RawConn.Control` plumbing.
 emulation. Verify whether this is a real gap vs environmental (the carrick
 guest's view of host interfaces) before investing.
 
+### Container/environment — ✅ richer now (2026-05-26)
+The harness (`scripts/go-conformance.sh`) now `provision()`s the std-lib
+`testdata/` trees + `/etc/services` and runs BOTH sides with the right CWD —
+docker via bind-mount+`-w`, carrick via the new `run-elf -v/-w` (`--fs host` is a
+sandboxed scratch, NOT the real host FS, so testdata is bind-mounted in). This
+converts ~10 environmental cancels into real signal: `TestLookupStaticHost/Addr`,
+`TestDNSReadConfig` now PASS under carrick.
+
+### P4a — net: sendfile — ✅ FIXED (Darwin-native sendfile(2))
+All 6 net sendfile tests pass. Root causes: VFS regular files were non-seekable
+HostPipe (→ HostFile); 2 GiB buffer alloc (→ capped); userspace copy hung on
+socket backpressure (→ macOS sendfile(2), in-kernel, partial-len+EAGAIN → Go
+netpoll EPOLLOUT). See `dispatch/fs.rs`.
+
+### P4b — net: splice — TestSplice still hangs
+`splice(2)` (pipe↔socket) is a different syscall from sendfile and still hangs —
+likely the same backpressure issue the sendfile fast-path solved, but for the
+splice path. Apply an analogous Darwin approach (or pipe-buffer + nonblocking
+socket write with EPOLLOUT). Next sendfile-family item.
+
 ### P4 — os/exec: signal + formatting
 - `TestSIGCHLD` — child process exits status **151** (128+23 → killed by signal
   23 = SIGURG on Linux) → a SIGCHLD/async-signal delivery gap in the child.
