@@ -16,7 +16,36 @@ build-graph A1).
 
 ## Remaining carrick-only gaps (prioritized)
 
-### P1 — net: netpoll doesn't wake blocked socket ops (the big one)
+### P1a — net: dup'd-fd epoll readiness — ✅ FIXED (2026-05-26)
+`File()`/`FileListener` dup a socket so several guest fds share one host fd; the
+epoll kqueue is keyed by host fd, so `EPOLL_CTL_DEL` of one dup deafened the
+others and readiness reached only the `udata` fd. Fixed in `dispatch/net.rs`
+(DEL re-binds the shared filter to a survivor; the drain fans a host-fd event out
+to all interested guest fds). Regression test:
+`epoll_del_of_one_dup_keeps_readiness_for_the_shared_host_socket`. The TCP
+FileListener reducer is now green.
+
+### P1b — net: Unix-domain sockets broken (NEW — the big remaining net lever)
+Discovered while reducing TestFileListener. A minimal reducer (`net.Listen("unix",…)`
+→ Dial → Accept) **hangs** under carrick: the dial fails with
+`connect: no such file or directory` on a path under
+`…/carrick-unix-sockets/<hash>.sock` — carrick translates the guest's unix socket
+path to a host path, but the **listener bind and the dial don't resolve to the
+same host path**, so the connection never reaches the listener. Separately,
+`unixpacket` (SOCK_SEQPACKET) fails to even listen: `protocol not supported`.
+This single root cause explains a large cluster of net carrick-only failures/hangs:
+`TestFileListener` (its unix/unixpacket iterations), `TestConnAndListener/unix`
++`/unixpacket`, `TestUnixConnSpecificMethods`, `TestUnixListenerSpecificMethods`,
+`TestUnixgramServer`, and others. **Highest-leverage remaining net item.** Start
+from the reducer at `/tmp/netrepro` (`plain:unix`); trace `bind`(200)/`connect`(203)
+sockaddr path translation in `dispatch/net.rs`.
+
+### P1c — net: remaining netpoll/close-unblock items
+`TestPacketConn`, `TestConnAndPacketConn`, `TestFilePacketConn`, `TestFileFdBlocks`,
+`TestIPConnRemoteName/SpecificMethods` — re-triage after P1b (some are unix/packet,
+some may be independent). Original analysis below.
+
+### P1 (original) — net: netpoll doesn't wake blocked socket ops
 One theme explains BOTH the net hangs and most net failures: a blocked socket
 operation (Accept / Read / close-notify) never gets its readiness wakeup from
 carrick's netpoll for **unix, unixgram/packet, and fd-derived** sockets. Docker
