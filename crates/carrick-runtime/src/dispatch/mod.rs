@@ -667,50 +667,6 @@ pub trait GuestMemory {
     fn read_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError>;
     fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError>;
 
-    /// Back the guest range `[guest_addr, guest_addr+len)` with a real
-    /// `MAP_SHARED` mapping of the host file `host_fd` at `offset`, so the
-    /// guest CPU AND the dispatcher's accessor both operate on the file's
-    /// page cache (full coherence + persistence). `host_fd` ownership is
-    /// transferred even on failure — the impl must close it before returning.
-    /// Default: the backend doesn't support real shared mappings, so it closes
-    /// the duplicate and lets the caller fall back to a private snapshot copy.
-    fn map_shared_file(
-        &mut self,
-        _guest_addr: u64,
-        _len: usize,
-        host_fd: i32,
-        _offset: u64,
-    ) -> Result<(), MemoryError> {
-        unsafe {
-            libc::close(host_fd);
-        }
-        Err(MemoryError::Unsupported)
-    }
-
-    /// Back `[guest_addr, guest_addr+len)` with a host `MAP_SHARED|MAP_ANON`
-    /// region (no file), so a guest `MAP_SHARED` anonymous mapping stays shared
-    /// across `fork(2)` instead of being snapshotted private — POSIX requires
-    /// this, and a cross-process futex (LTP futex_wake03 forks children that
-    /// FUTEX_WAIT on a shared-anon word) depends on it. Like `map_shared_file`,
-    /// it marks the region `guest_shared` (not snapshotted on fork; eligible
-    /// for `shared_futex_host_addr`). Default: unsupported → caller falls back
-    /// to a private anon mapping.
-    fn map_shared_anon(&mut self, _guest_addr: u64, _len: usize) -> Result<(), MemoryError> {
-        Err(MemoryError::Unsupported)
-    }
-
-    /// Tear down a shared file mapping previously created by
-    /// `map_shared_file`. Default no-op.
-    fn unmap_shared_file(&mut self, _guest_addr: u64, _len: usize) -> Result<(), MemoryError> {
-        Ok(())
-    }
-
-    /// Flush a shared file mapping to the backing file (`msync`). Default
-    /// no-op (the snapshot path has nothing to flush).
-    fn msync_shared_file(&mut self, _guest_addr: u64, _len: usize) -> Result<(), MemoryError> {
-        Ok(())
-    }
-
     /// Mark a guest range `PROT_NONE` (`no_access=true`) or accessible again
     /// (`false`). carrick backs the whole mmap arena with one accessible host
     /// region, so a `PROT_NONE` mmap is otherwise readable/writable on the
@@ -723,13 +679,14 @@ pub trait GuestMemory {
     fn set_no_access(&mut self, _address: u64, _len: usize, _no_access: bool) {}
 
     /// Host virtual address of the byte at `guest_addr`, but ONLY when it lies
-    /// in a genuine `MAP_SHARED` file mapping (`map_shared_file`). Such a region
-    /// is backed by a host `MAP_SHARED` mapping of the real file, so the same
-    /// physical page is visible to every carrick process that mapped the file —
-    /// which makes it a valid target for a cross-process futex via the host's
-    /// `__ulock` (`UL_COMPARE_AND_WAIT_SHARED`, keyed on the physical page).
-    /// Returns `None` for private/anon guest memory (those futexes stay
-    /// in-process via the parking-lot table). Default: `None`.
+    /// in a host-`MAP_SHARED` guest region — i.e. the boot-mapped shared
+    /// aperture that backs guest `MAP_SHARED` mmaps. That backing is shared
+    /// across `fork(2)`, so the same physical page is visible to every carrick
+    /// process — which makes it a valid target for a cross-process futex via
+    /// the public `os_sync_wait_on_address` API with
+    /// `OS_SYNC_WAIT_ON_ADDRESS_SHARED` (keyed on the physical page; see
+    /// `crate::ulock`). Returns `None` for private/anon guest memory (those
+    /// futexes stay in-process via the parking-lot table). Default: `None`.
     fn shared_futex_host_addr(&self, _guest_addr: u64) -> Option<usize> {
         None
     }
