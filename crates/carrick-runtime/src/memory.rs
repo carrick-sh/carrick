@@ -67,6 +67,15 @@ pub const LINUX_PAGE_TABLES_BASE: u64 = LINUX_KERNEL_REGION_BASE + 0x20000;
 // zero-filled (invalid descriptors). Still well within the kernel hole's first
 // 2 MiB block (0x20000 + 0x40000 = 0x60000 < 0x200000), so it stays kernel-only.
 pub const LINUX_PAGE_TABLES_SIZE: u64 = 0x40000;
+// Carrick-owned EL1 stage-1 maintenance trampoline. After the host edits page
+// descriptors (host backing of the table region), the stage-1 TLB is stale; the
+// guest can't observe the edit until a `tlbi`. arm64 public HVF has no stage-2
+// TLBI, but Carrick owns guest EL1, so it runs this tiny EL1 routine
+// (`dsb sy; tlbi vmalle1is; dsb sy; isb; hvc #1`) on its own vCPU to flush
+// stage-1. Lives just past the page-table region, still inside the kernel
+// hole's first 2 MiB block (so it's EL1-only, EL1-executable: PXN=0/UXN=1).
+pub const LINUX_EL1_MAINT_BASE: u64 = LINUX_KERNEL_REGION_BASE + 0x60000;
+pub const LINUX_EL1_MAINT_SIZE: u64 = 0x4000;
 // User-mode rt_sigreturn trampoline. This must be outside the first 2 MiB,
 // whose stage-1 block is kernel-only for the EL0-entry/vector pages, and it
 // must not collide with ET_EXEC binaries that commonly start at 0x200000. Keep
@@ -90,6 +99,10 @@ const AARCH64_ERET_OPCODE: u32 = 0xd69f_03e0;
 const AARCH64_CLREX_OPCODE: u32 = 0xd5033f5f;
 // AArch64 `hvc #0` opcode, used to re-trap from EL1 to HVF.
 const AARCH64_HVC0_OPCODE: u32 = 0xd400_0002;
+// AArch64 `hvc #1` — the EL1 stage-1 maintenance trampoline's completion
+// marker. The HVC immediate sits in bits[20:5], so `hvc #1` = `hvc #0` | (1<<5).
+// `run_el1_maintenance` distinguishes this from the `hvc #0` syscall-forward.
+const AARCH64_HVC1_OPCODE: u32 = AARCH64_HVC0_OPCODE | (1 << 5);
 // AArch64 `mov x8, #139`, the Linux aarch64 rt_sigreturn syscall number.
 const AARCH64_MOV_X8_RT_SIGRETURN_OPCODE: u32 = 0xd280_1168;
 // AArch64 `svc #0`, used by the user-mode sigreturn trampoline.
@@ -523,6 +536,21 @@ impl AddressSpace {
             bytes,
         };
 
+        // The EL1 stage-1 maintenance trampoline lives in the same kernel hole
+        // and is added alongside the page tables (both are EL1 stage-1
+        // plumbing). Read+execute (EL1 fetch); never writable.
+        let maint = MemoryRegion {
+            start: LINUX_EL1_MAINT_BASE,
+            end: LINUX_EL1_MAINT_BASE + LINUX_EL1_MAINT_SIZE,
+            perms: SegmentPerms {
+                read: true,
+                write: false,
+                execute: true,
+            },
+            shared: false,
+            bytes: el1_maintenance_bytes(),
+        };
+
         let AddressSpace {
             entry,
             regions,
@@ -532,7 +560,8 @@ impl AddressSpace {
             el1_vectors_base,
             ..
         } = self;
-        let mut image = Self::from_regions(entry, regions.into_iter().chain([region]).collect())?;
+        let mut image =
+            Self::from_regions(entry, regions.into_iter().chain([region, maint]).collect())?;
         image.initial_stack_pointer = initial_stack_pointer;
         image.linux_auxv = linux_auxv;
         image.el0_trampoline_entry = el0_trampoline_entry;
@@ -1186,6 +1215,35 @@ pub fn el0_trampoline_bytes() -> Vec<u8> {
     bytes
 }
 
+/// Build the byte image of the EL1 stage-1 maintenance trampoline. Carrick
+/// runs this on its own vCPU (PC = `LINUX_EL1_MAINT_BASE`, PSTATE = EL1h) after
+/// editing page descriptors, to flush the stale stage-1 TLB so the guest
+/// observes the new mapping. The closing `hvc #1` traps back to the host (a
+/// completion marker distinct from the `hvc #0` syscall forward); the rest is
+/// `nop` padding so an over-run is harmless.
+pub fn el1_maintenance_bytes() -> Vec<u8> {
+    let size = LINUX_EL1_MAINT_SIZE as usize;
+    let mut bytes = vec![0_u8; size];
+    let mut offset = 0;
+    for opcode in [
+        AARCH64_DSB_SY_OPCODE,        // make prior descriptor stores observable
+        AARCH64_TLBI_VMALLE1_OPCODE,  // drop all stage-1 TLB entries (IS)
+        AARCH64_DSB_SY_OPCODE,        // make the invalidation observable
+        AARCH64_ISB_OPCODE,           // resynchronise translation
+        AARCH64_HVC1_OPCODE,          // trap back to host: maintenance complete
+    ] {
+        let bytes_le = opcode.to_le_bytes();
+        bytes[offset..offset + bytes_le.len()].copy_from_slice(&bytes_le);
+        offset += bytes_le.len();
+    }
+    let nop = AARCH64_NOP_OPCODE.to_le_bytes();
+    while offset + nop.len() <= size {
+        bytes[offset..offset + nop.len()].copy_from_slice(&nop);
+        offset += nop.len();
+    }
+    bytes
+}
+
 pub fn sigreturn_trampoline_bytes() -> Vec<u8> {
     let size = LINUX_SIGRETURN_TRAMPOLINE_SIZE as usize;
     let mut bytes = vec![0_u8; size];
@@ -1777,6 +1835,28 @@ mod stage1_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn el1_maintenance_bytes_emit_tlbi_then_hvc1() {
+        let bytes = el1_maintenance_bytes();
+        assert_eq!(bytes.len() as u64, LINUX_EL1_MAINT_SIZE);
+        let op = |i: usize| {
+            let mut a = [0u8; 4];
+            a.copy_from_slice(&bytes[i * 4..i * 4 + 4]);
+            u32::from_le_bytes(a)
+        };
+        assert_eq!(op(0), AARCH64_DSB_SY_OPCODE);
+        assert_eq!(op(1), AARCH64_TLBI_VMALLE1_OPCODE);
+        assert_eq!(op(2), AARCH64_DSB_SY_OPCODE);
+        assert_eq!(op(3), AARCH64_ISB_OPCODE);
+        assert_eq!(op(4), AARCH64_HVC1_OPCODE);
+        assert_eq!(AARCH64_HVC1_OPCODE, 0xd400_0022); // hvc #1
+        // Trampoline stays inside the kernel hole's first 2 MiB block.
+        let end_off = (LINUX_EL1_MAINT_BASE - LINUX_KERNEL_REGION_BASE) + LINUX_EL1_MAINT_SIZE;
+        assert!(end_off <= 0x200000);
+        // ...and does not overlap the page-table region just below it.
+        assert!(LINUX_EL1_MAINT_BASE >= LINUX_PAGE_TABLES_BASE + LINUX_PAGE_TABLES_SIZE);
     }
 
     #[test]
