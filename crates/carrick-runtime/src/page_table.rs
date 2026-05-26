@@ -308,20 +308,15 @@ mod tests {
 
     #[test]
     fn exhausting_spare_tables_errors() {
-        // No spare pages: every block split must fail with OutOfTables.
-        let bytes = stage1_identity_page_tables(); // 0x8000: only 2 spare pages
+        // Truncate to exactly the six boot tables (no spare pool), so the very
+        // first block split has nowhere to allocate and surfaces OutOfTables.
+        let mut bytes = stage1_identity_page_tables();
+        bytes.truncate(6 * 0x1000);
         let mut mgr = PageTableManager::new(bytes, LINUX_PAGE_TABLES_BASE);
-        // Walk many distinct 1 GiB blocks; each needs 2 splits, so the 2 spare
-        // pages are exhausted quickly and a later split returns OutOfTables.
-        let mut saw_oot = false;
-        for g in 0..8u64 {
-            let va = LINUX_MMAP_BASE + g * (1 << 30);
-            if mgr.set_prot_none(va, 0x1000) == Err(PageTableError::OutOfTables) {
-                saw_oot = true;
-                break;
-            }
-        }
-        assert!(saw_oot, "spare-table exhaustion must surface OutOfTables");
+        assert_eq!(
+            mgr.set_prot_none(LINUX_MMAP_BASE + 0x10_0000, 0x1000),
+            Err(PageTableError::OutOfTables),
+        );
     }
 
     #[test]
