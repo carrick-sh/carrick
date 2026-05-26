@@ -420,7 +420,7 @@ impl SyscallDispatcher {
         let cloexec = socket_flags.contains(LinuxSocketTypeFlags::CLOEXEC);
         let base_type = type_ & !LinuxSocketTypeFlags::SUPPORTED_MASK;
         let host_family = linux_to_host_af(family);
-        let host_type = linux_to_host_socktype(base_type);
+        let host_type = host_socktype_backing(family, base_type);
         let host_fd = match (unsafe { libc::socket(host_family, host_type, protocol) })
             .host_syscall_errno()
         {
@@ -465,6 +465,18 @@ impl SyscallDispatcher {
                 host_fd, family, ..
             } => Ok((*host_fd, *family)),
             _ => Err(LINUX_ENOTSOCK),
+        }
+    }
+
+    /// The GUEST-requested socket type for `fd` (e.g. SOCK_SEQPACKET), which can
+    /// differ from the host backing — carrick backs a guest AF_UNIX SEQPACKET
+    /// with a host SOCK_STREAM, so the host's SO_TYPE would mis-report it.
+    fn socket_guest_type(&self, fd: i32) -> Option<i32> {
+        let open_file = self.open_file(fd)?;
+        let open = open_file.description.read();
+        match &*open {
+            OpenDescription::HostSocket { type_, .. } => Some(*type_),
+            _ => None,
         }
     }
 
@@ -1663,7 +1675,7 @@ impl SyscallDispatcher {
             let cloexec = socket_flags.contains(LinuxSocketTypeFlags::CLOEXEC);
             let base_type = type_ & !LinuxSocketTypeFlags::SUPPORTED_MASK;
             let host_family = linux_to_host_af(family);
-            let host_type = linux_to_host_socktype(base_type);
+            let host_type = host_socktype_backing(family, base_type);
 
             let mut host_fds: [i32; 2] = [-1, -1];
             let rc =
@@ -2171,6 +2183,17 @@ impl SyscallDispatcher {
                 let _ = memory.write_bytes(optval_addr, &val.to_ne_bytes());
                 let _ = memory.write_bytes(optlen_addr, &4u32.to_ne_bytes());
                 return Ok(DispatchOutcome::Returned { value: 0 });
+            }
+            // SO_TYPE must report the GUEST-requested type, not the host backing:
+            // a guest AF_UNIX SOCK_SEQPACKET is backed by a host SOCK_STREAM, but
+            // Go derives the network ("unixpacket") from SO_TYPE, so the host's
+            // STREAM answer would mislabel the socket.
+            if level == LINUX_SOL_SOCKET && optname == LINUX_SO_TYPE {
+                if let Some(t) = this.socket_guest_type(fd) {
+                    let _ = memory.write_bytes(optval_addr, &t.to_ne_bytes());
+                    let _ = memory.write_bytes(optlen_addr, &4u32.to_ne_bytes());
+                    return Ok(DispatchOutcome::Returned { value: 0 });
+                }
             }
             let (host_fd, _family) = match this.host_socket_lookup(fd) {
                 Ok(t) => t,
