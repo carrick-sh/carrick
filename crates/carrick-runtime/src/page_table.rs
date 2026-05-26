@@ -18,7 +18,6 @@ const TYPE_BITS: u64 = 0b11;
 const TYPE_TABLE_OR_PAGE: u64 = 0b11; // L0..L2 table descriptor, or L3 page
 const TYPE_BLOCK: u64 = 0b01; // L1/L2 block descriptor
 const AP_MASK: u64 = 0b11 << 6; // AP[2:1]
-#[cfg(test)]
 const AP_RW: u64 = 0b01 << 6; // RW at EL0+EL1
 const AP_RO: u64 = 0b11 << 6; // RO at EL0+EL1
 
@@ -180,45 +179,73 @@ impl PageTableManager {
         Err(PageTableError::BadAddress)
     }
 
-    /// Run `edit` on the 4 KiB leaf descriptor of every page in `[va, va+len)`,
-    /// splitting covering blocks as needed.
-    fn edit_pages(
+    /// `(valid, AP)` of the covering leaf for `va` WITHOUT splitting (the leaf
+    /// may be a coarse block), or `None` if the walk hits an unmapped level.
+    /// Granularity-agnostic, so it answers "is this page already at the target
+    /// protection?" cheaply.
+    fn current_prot(&mut self, va: u64) -> Option<(bool, u64)> {
+        match self.leaf_offset(va, false) {
+            Ok((off, _)) => {
+                let d = self.read_desc(off);
+                Some((d & VALID != 0, d & AP_MASK))
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// Set every 4 KiB page in `[va, va+len)` to `target(page_va)`, splitting
+    /// covering blocks only when a page is not ALREADY at `(want_valid,
+    /// want_ap)`. The skip is what keeps the spare-table pool bounded: a
+    /// protection that already matches the covering block (e.g. RW on the
+    /// default RW arena) costs no split.
+    fn apply(
         &mut self,
         va: u64,
         len: usize,
-        edit: impl Fn(u64, u64) -> u64,
+        want_valid: bool,
+        want_ap: u64,
+        target: impl Fn(u64) -> u64,
     ) -> Result<(), PageTableError> {
         let pages = (len as u64).div_ceil(PT_PAGE);
         for p in 0..pages {
             let page_va = va + p * PT_PAGE;
+            if let Some((valid, ap)) = self.current_prot(page_va) {
+                // Already satisfied: invalid pages match any want_ap; valid
+                // pages must also match AP.
+                if valid == want_valid && (!want_valid || ap == want_ap) {
+                    continue;
+                }
+            }
             let (off, _level) = self.leaf_offset(page_va, true)?;
-            let desc = self.read_desc(off);
-            self.write_desc(off, edit(desc, page_va));
+            self.write_desc(off, target(page_va));
         }
         Ok(())
     }
 
     /// Mark `[va, va+len)` invalid (faults on any access → SEGV_MAPERR).
     pub(crate) fn set_prot_none(&mut self, va: u64, len: usize) -> Result<(), PageTableError> {
-        self.edit_pages(va, len, |desc, _| desc & !VALID)
+        self.apply(va, len, false, 0, |pv| {
+            (pv & PA_MASK_4KIB) | (USER_PAGE_FLAGS & !VALID)
+        })
     }
 
     /// Alias for `set_prot_none`, used by `munmap` (the freed range faults
-    /// until reused). Kept distinct for call-site clarity; the caller lands in
-    /// Phase D (dispatcher wiring).
+    /// until reused).
     pub(crate) fn invalidate(&mut self, va: u64, len: usize) -> Result<(), PageTableError> {
         self.set_prot_none(va, len)
     }
 
-    /// Mark `[va, va+len)` read-only (valid, AP=RO). Clears UXN unchanged.
+    /// Mark `[va, va+len)` valid read-only (AP=RO).
     pub(crate) fn set_readonly(&mut self, va: u64, len: usize) -> Result<(), PageTableError> {
-        self.edit_pages(va, len, |desc, _| (desc & !AP_MASK) | AP_RO | VALID)
+        self.apply(va, len, true, AP_RO, |pv| {
+            (pv & PA_MASK_4KIB) | (USER_PAGE_FLAGS & !AP_MASK) | AP_RO
+        })
     }
 
     /// Restore `[va, va+len)` to a valid RW user page (identity-mapped).
     pub(crate) fn set_rw(&mut self, va: u64, len: usize) -> Result<(), PageTableError> {
-        self.edit_pages(va, len, |_desc, page_va| {
-            (page_va & PA_MASK_4KIB) | USER_PAGE_FLAGS
+        self.apply(va, len, true, AP_RW, |pv| {
+            (pv & PA_MASK_4KIB) | USER_PAGE_FLAGS
         })
     }
 
@@ -319,6 +346,16 @@ mod tests {
             mgr.set_prot_none(LINUX_MMAP_BASE + 0x10_0000, 0x1000),
             Err(PageTableError::OutOfTables),
         );
+    }
+
+    #[test]
+    fn set_rw_on_default_rw_block_does_not_split() {
+        // No spare pages: setting RW on the already-RW arena must skip (no
+        // split) and succeed, rather than exhaust the pool.
+        let mut bytes = stage1_identity_page_tables();
+        bytes.truncate(6 * 0x1000);
+        let mut mgr = PageTableManager::new(bytes, LINUX_PAGE_TABLES_BASE);
+        assert_eq!(mgr.set_rw(LINUX_MMAP_BASE + 0x10_0000, 0x4000), Ok(()));
     }
 
     #[test]
