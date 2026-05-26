@@ -4,7 +4,6 @@
 pub(crate) enum HostMappingKind {
     PrivateAnon,
     SharedAnon,
-    SharedFile,
     ChildPrivateSnapshot,
 }
 
@@ -43,25 +42,6 @@ impl OwnedHostMapping {
         Self::from_mmap_result(host, len, kind)
     }
 
-    pub(crate) fn map_shared_file(
-        len: usize,
-        host_fd: i32,
-        offset: u64,
-    ) -> Result<Self, std::io::Error> {
-        let host = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                host_fd,
-                offset as libc::off_t,
-            )
-        };
-        unsafe { libc::close(host_fd) };
-        Self::from_mmap_result(host, len, HostMappingKind::SharedFile)
-    }
-
     fn from_mmap_result(
         host: *mut libc::c_void,
         len: usize,
@@ -87,10 +67,7 @@ impl OwnedHostMapping {
     }
 
     pub(crate) fn guest_shared(&self) -> bool {
-        matches!(
-            self.kind,
-            HostMappingKind::SharedAnon | HostMappingKind::SharedFile
-        )
+        matches!(self.kind, HostMappingKind::SharedAnon)
     }
 }
 
