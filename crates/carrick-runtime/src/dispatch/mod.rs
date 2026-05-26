@@ -1281,6 +1281,23 @@ impl SyscallDispatcher {
         self.io.cwd.read().clone()
     }
 
+    /// Absolutize an `execve(2)` target path against the guest cwd, matching
+    /// Linux semantics: a relative program path resolves against the calling
+    /// process's working directory. carrick's overlay/rootfs/bind-mount layers
+    /// all key on absolute guest paths, so a bare relative path (e.g. Go
+    /// os/exec `TestCommandRelativeName`, which sets `cmd.Path = "dirBase/base"`
+    /// with `cmd.Dir = "/"`) would miss every layer and fail ENOENT. argv[0] is
+    /// left untouched by the caller (Linux preserves whatever the caller
+    /// passed); only the path used to LOAD the image is absolutized.
+    pub fn resolve_exec_path(&self, path: &str) -> String {
+        if path.starts_with('/') {
+            normalize_abs_path(path)
+        } else {
+            let cwd = self.cwd();
+            normalize_abs_path(&format!("{}/{}", cwd.trim_end_matches('/'), path))
+        }
+    }
+
     /// Set the guest's initial working directory (docker `-w` / image
     /// `WorkingDir`), applied before the guest starts. `getcwd(2)` and relative
     /// path resolution observe it. The path is normalized to an absolute,
@@ -4167,6 +4184,22 @@ mod overlay_dispatch_tests {
                 "syscall {nr} fell through the normalized table",
             );
         }
+    }
+
+    #[test]
+    fn resolve_exec_path_absolutizes_relative_against_cwd() {
+        let d = SyscallDispatcher::new();
+        // Default cwd is "/": a relative exec path resolves against it. This is
+        // the Go os/exec TestCommandRelativeName shape (cmd.Path="b/foo",
+        // cmd.Dir="/").
+        assert_eq!(d.resolve_exec_path("b/os_exec.test"), "/b/os_exec.test");
+        // With a deeper cwd, the relative path joins onto it.
+        d.set_cwd("/run/src/os/exec");
+        assert_eq!(d.resolve_exec_path("./echo"), "/run/src/os/exec/echo");
+        assert_eq!(d.resolve_exec_path("../x"), "/run/src/os/x");
+        // Absolute paths are normalized but not cwd-joined.
+        assert_eq!(d.resolve_exec_path("/bin/sh"), "/bin/sh");
+        assert_eq!(d.resolve_exec_path("/bin/../bin/sh"), "/bin/sh");
     }
 
     #[test]
