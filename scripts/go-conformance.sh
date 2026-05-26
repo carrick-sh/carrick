@@ -139,9 +139,11 @@ for p in "${pkgs[@]}"; do
   # privilege Docker grants by default). Off by default: running guest code as
   # root is a heavier posture and `sudo -n` needs a tty. Under sudo we skip the
   # outer `timeout` (sudo'ing `timeout` wouldn't match the carrick NOPASSWD rule)
-  # and rely on -test.timeout + the pkill; CPUs ride in via sudo's env arg.
+  # and rely on -test.timeout + the pkill. The CPU count rides in via
+  # `--forward-env` (a CLI arg) because sudo's env_reset strips CARRICK_EXPOSED_CPUS
+  # and the NOPASSWD rule lacks SETENV, so `sudo -n VAR=val carrick` is rejected.
   if [ -n "${CARRICK_SUDO:-}" ]; then
-    sudo -n CARRICK_EXPOSED_CPUS=10 "$carrick" run-elf --raw --fs host \
+    sudo -n "$carrick" run-elf --raw --fs host --forward-env CARRICK_EXPOSED_CPUS=10 \
       -v "$cache/run:/run" -w "/run/src/$p" \
       "$bin" -- -test.run 'Test' -test.skip "$SKIP" -test.short -test.v \
       -test.timeout "${TEST_TIMEOUT}s" > "$cache/logs/$n.carrick" 2>&1
