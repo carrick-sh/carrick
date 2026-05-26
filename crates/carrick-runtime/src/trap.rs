@@ -523,10 +523,12 @@ struct HvfInner {
     /// Lazily-built editor over the EL1 stage-1 page-table image, used to give
     /// `mprotect`/`PROT_NONE`/`munmap` guest-visible semantics. Built from the
     /// page-table region's host backing on first edit; reset to `None` on
-    /// fork/execve (fresh tables). NOTE: per-engine for now — concurrent
-    /// sibling edits need a shared manager (Phase D follow-up); callers must
-    /// quiesce siblings around an edit until then.
-    page_tables: Option<crate::page_table::PageTableManager>,
+    /// fork/execve (fresh tables). SHARED across sibling vCPU threads (one HVF
+    /// VM ⇒ one set of stage-1 tables): the mutex serializes edits so the
+    /// spare-table allocator stays consistent, and `sync_to_host` orders the
+    /// descriptor stores so a concurrent sibling hardware walk stays safe
+    /// without quiescing.
+    page_tables: std::sync::Arc<parking_lot::Mutex<Option<crate::page_table::PageTableManager>>>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -703,6 +705,9 @@ pub struct ThreadSpec {
     vm: applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
     mappings: Vec<ThreadMappingDesc>,
     protections: std::sync::Arc<MemoryProtections>,
+    /// Shared stage-1 page-table editor (one VM ⇒ one set of tables; siblings
+    /// share this so concurrent edits serialize through its mutex).
+    page_tables: std::sync::Arc<parking_lot::Mutex<Option<crate::page_table::PageTableManager>>>,
     snapshot: VcpuSnapshot,
 }
 
@@ -968,7 +973,7 @@ impl HvfTrapEngine {
                 last_exit_class: 0,
                 is_forked_child: false,
                 protections: std::sync::Arc::new(MemoryProtections::default()),
-                page_tables: None,
+                page_tables: std::sync::Arc::new(parking_lot::Mutex::new(None)),
             }),
         })
     }
@@ -1278,40 +1283,11 @@ impl HvfInner {
             .map(|m| m.host_addr)
     }
 
-    /// Build the page-table manager from the live host backing on first use.
-    fn ensure_pt_manager(&mut self) -> Result<(), MemoryError> {
-        if self.page_tables.is_some() {
-            return Ok(());
-        }
-        let host = self
-            .pt_host_ptr()
-            .ok_or_else(|| MemoryError::HostMap("page-table region not mapped".to_string()))?;
-        let size = crate::memory::LINUX_PAGE_TABLES_SIZE as usize;
-        let mut bytes = vec![0u8; size];
-        unsafe { std::ptr::copy_nonoverlapping(host, bytes.as_mut_ptr(), size) };
-        self.page_tables = Some(crate::page_table::PageTableManager::new(
-            bytes,
-            crate::memory::LINUX_PAGE_TABLES_BASE,
-        ));
-        Ok(())
-    }
-
-    /// Copy the manager's edited image back to the host page-table backing.
-    fn sync_pt_to_host(&self) -> Result<(), MemoryError> {
-        let host = self
-            .pt_host_ptr()
-            .ok_or_else(|| MemoryError::HostMap("page-table region not mapped".to_string()))?;
-        let mgr = self
-            .page_tables
-            .as_ref()
-            .ok_or_else(|| MemoryError::HostMap("page-table manager not built".to_string()))?;
-        let bytes = mgr.bytes();
-        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), host, bytes.len()) };
-        Ok(())
-    }
-
-    /// Edit stage-1 descriptors, sync to the host backing, then flush the
-    /// stage-1 TLB via the EL1 maintenance trampoline so the guest observes it.
+    /// Edit stage-1 descriptors under the shared manager lock, atomically sync
+    /// the changed descriptors to the host backing (ordered so a concurrent
+    /// sibling walk stays safe), then flush the stage-1 TLB via the EL1
+    /// maintenance trampoline so this vCPU (and, inner-shareable, its siblings)
+    /// observe the change.
     fn pt_edit_and_flush(
         &mut self,
         edit: impl FnOnce(
@@ -1319,26 +1295,50 @@ impl HvfInner {
         ) -> Result<bool, crate::page_table::PageTableError>,
     ) -> Result<(), MemoryError> {
         use crate::page_table::PageTableError;
-        self.ensure_pt_manager()?;
-        let mgr = self
-            .page_tables
-            .as_mut()
-            .ok_or_else(|| MemoryError::HostMap("page-table manager not built".to_string()))?;
-        let changed = edit(mgr).map_err(|e| match e {
-            PageTableError::OutOfTables => {
-                MemoryError::HostMap("stage-1 page-table pool exhausted".to_string())
+        let host = self
+            .pt_host_ptr()
+            .ok_or_else(|| MemoryError::HostMap("page-table region not mapped".to_string()))?;
+        let pt = std::sync::Arc::clone(&self.page_tables);
+        let changed = {
+            let mut guard = pt.lock();
+            if guard.is_none() {
+                // Build from the live host backing on first edit (matches the
+                // boot image; nothing else writes the tables before this).
+                let size = crate::memory::LINUX_PAGE_TABLES_SIZE as usize;
+                let mut bytes = vec![0u8; size];
+                unsafe { std::ptr::copy_nonoverlapping(host, bytes.as_mut_ptr(), size) };
+                *guard = Some(crate::page_table::PageTableManager::new(
+                    bytes,
+                    crate::memory::LINUX_PAGE_TABLES_BASE,
+                ));
             }
-            PageTableError::BadAddress => MemoryError::OutOfBounds {
-                address: 0,
-                length: 0,
-            },
-        })?;
-        // Nothing changed (range already at the target protection): no need to
-        // touch the host backing or pay a stage-1 TLBI.
+            let mgr = guard.as_mut().expect("just built");
+            // Freed sub-tables are only safe to repurpose when we're single-vCPU
+            // (no sibling can hold a stale walk-cache reference). Tell the
+            // manager the current live-vCPU count so it quarantines vs reuses.
+            mgr.set_multi_vcpu(VCPU_LIVE.load(std::sync::atomic::Ordering::SeqCst) > 1);
+            let changed = edit(mgr).map_err(|e| match e {
+                PageTableError::OutOfTables => {
+                    MemoryError::HostMap("stage-1 page-table pool exhausted".to_string())
+                }
+                PageTableError::BadAddress => MemoryError::OutOfBounds {
+                    address: 0,
+                    length: 0,
+                },
+            })?;
+            if changed {
+                // SAFETY: `host` backs the live page-table region for the whole
+                // process lifetime; the manager only writes 8-byte-aligned
+                // descriptor slots within it.
+                unsafe { mgr.sync_to_host(host) };
+            }
+            changed
+        };
+        // Nothing changed (range already at the target protection): no host
+        // write, no TLBI.
         if !changed {
             return Ok(());
         }
-        self.sync_pt_to_host()?;
         self.run_el1_maintenance()
             .map_err(|e| MemoryError::HostMap(format!("stage-1 TLBI failed: {e}")))?;
         Ok(())
@@ -2288,7 +2288,7 @@ impl HvfInner {
             last_exit_class: snapshot.last_exit_class,
             is_forked_child: pid == 0,
             protections: inherited_protections,
-            page_tables: None,
+            page_tables: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         };
         replace_destroyed_hvf_inner(self, new_inner);
 
@@ -2362,6 +2362,7 @@ impl HvfInner {
             vm: self._vm.clone(),
             mappings,
             protections: std::sync::Arc::clone(&self.protections),
+            page_tables: std::sync::Arc::clone(&self.page_tables),
             snapshot,
         })
     }
@@ -2377,6 +2378,7 @@ impl HvfInner {
             vm,
             mappings,
             protections,
+            page_tables,
             snapshot,
         } = spec;
 
@@ -2399,7 +2401,7 @@ impl HvfInner {
             last_exit_class: snapshot.last_exit_class,
             is_forked_child: false,
             protections,
-            page_tables: None,
+            page_tables,
         };
 
         for mapping in mappings {
@@ -2531,7 +2533,7 @@ impl HvfInner {
             // execve replaces the address space; any prior PROT_NONE ranges are
             // gone. The new image starts with none until it mmaps them.
             protections: std::sync::Arc::new(MemoryProtections::default()),
-            page_tables: None,
+            page_tables: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         };
         replace_destroyed_hvf_inner(self, new_inner);
 

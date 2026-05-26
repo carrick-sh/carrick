@@ -380,28 +380,30 @@ impl SyscallDispatcher {
                 return Ok(LINUX_EINVAL.into());
             }
             if let Some(len) = align_up_u64(length, LINUX_PAGE_SIZE) {
-                {
-                    let mut mem = this.mem.lock();
-                    if address.0.checked_add(len) == Some(mem.mmap_next) {
-                        mem.mmap_next = address.0;
-                        while let Some(pos) = mem
-                            .free_regions
-                            .iter()
-                            .position(|&(s, l)| s.checked_add(l) == Some(mem.mmap_next))
-                        {
-                            let (s, _l) = mem.free_regions.remove(pos);
-                            mem.mmap_next = s;
-                        }
-                    } else {
-                        free_regions_insert(&mut mem.free_regions, address.0, len);
-                    }
-                }
-                // Invalidate the freed range in stage-1 so a use-after-munmap
-                // faults in-guest; a later mmap that reuses the range restores
-                // validity. Best-effort (failure leaves it accessible, the
-                // pre-existing behavior).
+                let mut mem = this.mem.lock();
+                // Invalidate the freed range in stage-1 (use-after-munmap faults
+                // in-guest) BEFORE returning it to the allocator, holding `mem`
+                // across the edit. A concurrent mmap that reuses this address
+                // must re-acquire `mem` to allocate it, so its validity-restore
+                // is strictly ordered AFTER this invalidate — otherwise a late
+                // invalidate could clobber the new owner's mapping and fault it.
+                // Best-effort: a failure leaves it accessible (pre-existing
+                // behavior).
                 if let Ok(len_usize) = usize::try_from(len) {
                     let _ = cx.memory.unmap_range(address.0, len_usize);
+                }
+                if address.0.checked_add(len) == Some(mem.mmap_next) {
+                    mem.mmap_next = address.0;
+                    while let Some(pos) = mem
+                        .free_regions
+                        .iter()
+                        .position(|&(s, l)| s.checked_add(l) == Some(mem.mmap_next))
+                    {
+                        let (s, _l) = mem.free_regions.remove(pos);
+                        mem.mmap_next = s;
+                    }
+                } else {
+                    free_regions_insert(&mut mem.free_regions, address.0, len);
                 }
             }
             Ok(DispatchOutcome::Returned { value: 0 })
