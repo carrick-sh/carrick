@@ -1,8 +1,22 @@
 # Design: Linux `ptrace(2)` on carrick (Darwin / HVF)
 
-Status: research/design (no implementation). Author: research agent, 2026-05-26.
-Driven via the superpowers `brainstorming` skill (context exploration → approach
-comparison → recommendation → written design).
+Status: **Phase 1 IMPLEMENTED + verified (2026-05-26)**; Phases 2–4 remain
+design. Author: research agent, 2026-05-26. Driven via the superpowers
+`brainstorming` skill (context exploration → approach comparison →
+recommendation → written design).
+
+> **Phase 1 landed.** Guest `BRK`/step/HW-debug exceptions now deliver SIGTRAP
+> (`el0_debug_signal` + `deliver_fault_signal`, `crates/carrick-runtime/src/runtime.rs`)
+> instead of a fatal SIGSEGV. All six `TestDebugCall*` pass under carrick,
+> matching the Docker linux/arm64 oracle, and the **entire `runtime` package now
+> runs to completion (341 PASS / 0 FAIL, docker=341 carrick=341)** — the
+> previously-assumed "runtime early hang" was this BRK bug killing the test
+> binary mid-suite, *not* the stage-2 coherence bug it was attributed to. R-1
+> (ELR points at the BRK) confirmed via `carrick trace` (EC=0x3c, ESR=0xf2000000)
+> and proven by the passing GrowStack/Panic phases that step past BRKs with
+> `set_pc(pc+4)`. `ptrace(2)` itself is unchanged (still ENOSYS — the test never
+> calls it). Phases 2–4 (cross-process ptrace for gdb/Delve) remain unbuilt and
+> are not exercised by the Go conformance harness.
 
 Scope: make Go's `runtime.test` `TestDebugCall` family pass on carrick, and lay a
 phased path to Delve/`gdb`/`lldb`-style debugging of guest processes. Deliverable
@@ -468,7 +482,7 @@ Minimal viable broker, reusing carrick idioms:
 
 ## 8. Phased implementation plan
 
-### Phase 1 — Milestone: `TestDebugCall` passes (no ptrace at all)
+### Phase 1 — Milestone: `TestDebugCall` passes (no ptrace at all) — ✅ DONE (2026-05-26)
 Make a guest software breakpoint deliver SIGTRAP to the guest handler instead of
 killing the process. Concretely:
 
