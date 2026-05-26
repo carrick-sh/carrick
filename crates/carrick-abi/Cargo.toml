@@ -1,0 +1,16 @@
+[package]
+name = "carrick-abi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "carrick_abi"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+bitflags.workspace = true
+zerocopy.workspace = true

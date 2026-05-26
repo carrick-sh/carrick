@@ -282,6 +282,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "carrick-abi"
+version = "0.1.0"
+dependencies = [
+ "bitflags",
+ "zerocopy",
+]
+
+[[package]]
 name = "carrick-cli"
 version = "0.1.0"
 dependencies = [
@@ -345,6 +353,7 @@ dependencies = [
  "bitflags",
  "camino",
  "cap-std",
+ "carrick-abi",
  "carrick-image",
  "carrick-spec",
  "carrick-test-support",
