@@ -36,6 +36,17 @@ const PT_PAGE: u64 = 0x1000; // stage-1 table page size (4 KiB granule)
 // first six 4 KiB pages; runtime-allocated sub-tables come from the spare tail.
 const SPARE_START_OFFSET: u64 = 6 * PT_PAGE;
 
+/// A protection change applied to a guest VA range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PtOp {
+    /// Clear the valid bit — any access faults (SEGV_MAPERR).
+    Invalidate,
+    /// Valid, AP=read-only.
+    ReadOnly,
+    /// Valid, AP=read-write (identity-mapped user page/block).
+    ReadWrite,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PageTableError {
     /// No spare table pages left to split a block.
@@ -215,12 +226,22 @@ impl PageTableManager {
         } else {
             TYPE_BLOCK
         };
+        // The children must map exactly what the parent block did. Crucially,
+        // preserve the parent's VALIDITY: splitting an INVALID block (e.g. a
+        // coarse PROT_NONE reservation) must yield invalid children, not valid
+        // ones — `child_type` sets the valid bit, so clear it when the parent
+        // was invalid. (Getting this wrong silently revalidated PROT_NONE
+        // reservations and broke Go's page-summary region.)
+        let parent_valid = block & VALID != 0;
 
         let table_pa = self.alloc_table()?;
         let table_off = self.pa_to_off(table_pa)?;
         for i in 0..512u64 {
             let child_pa = base_pa + i * child_stride;
-            let desc = (child_pa & child_pa_mask) | attrs | child_type;
+            let mut desc = (child_pa & child_pa_mask) | attrs | child_type;
+            if !parent_valid {
+                desc &= !VALID;
+            }
             self.write_desc(table_off + (i as usize) * 8, desc);
         }
         // Parent becomes a table descriptor — exposed to the walker only after
@@ -372,53 +393,85 @@ impl PageTableManager {
         }
     }
 
-    /// `(valid, AP)` of the covering leaf for `va` WITHOUT splitting (the leaf
-    /// may be a coarse block), or `None` if the walk hits an unmapped level.
-    /// Granularity-agnostic, so it answers "is this page already at the target
-    /// protection?" cheaply.
-    fn current_prot(&mut self, va: u64) -> Option<(bool, u64)> {
-        match self.leaf_offset(va, false) {
-            Ok((off, _)) => {
-                let d = self.read_desc(off);
-                Some((d & VALID != 0, d & AP_MASK))
-            }
-            Err(_) => None,
+    /// Block size in bytes mapped by a leaf at `level` (1=1 GiB, 2=2 MiB,
+    /// 3=4 KiB) and the matching PA mask.
+    fn level_span(level: usize) -> (u64, u64) {
+        match level {
+            1 => (1 << 30, PA_MASK_1GIB),
+            2 => (1 << 21, PA_MASK_2MIB),
+            _ => (1 << 12, PA_MASK_4KIB),
         }
     }
 
-    /// Set every 4 KiB page in `[va, va+len)` to `target(page_va)`, splitting
-    /// covering blocks only when a page is not ALREADY at `(want_valid,
-    /// want_ap)`. The skip is what keeps the spare-table pool bounded: a
-    /// protection that already matches the covering block (e.g. RW on the
-    /// default RW arena) costs no split.
-    fn apply(
-        &mut self,
-        va: u64,
-        len: usize,
-        want_valid: bool,
-        want_ap: u64,
-        target: impl Fn(u64) -> u64,
-    ) -> Result<bool, PageTableError> {
-        let pages = (len as u64).div_ceil(PT_PAGE);
-        let mut changed = false;
-        for p in 0..pages {
-            let page_va = va + p * PT_PAGE;
-            if let Some((valid, ap)) = self.current_prot(page_va) {
-                // Already satisfied: invalid pages match any want_ap; valid
-                // pages must also match AP.
-                if valid == want_valid && (!want_valid || ap == want_ap) {
-                    continue;
-                }
-            }
-            let (off, _level) = self.leaf_offset(page_va, true)?;
-            self.write_desc(off, target(page_va));
-            changed = true;
+    /// Build the leaf descriptor for `op` covering `base_pa` at `level`.
+    fn desc_for(op: PtOp, base_pa: u64, level: usize) -> u64 {
+        let (_, mask) = Self::level_span(level);
+        // Block at L1/L2, page at L3 (type bit differs; USER_PAGE_FLAGS adds it).
+        let flags = if level == 3 {
+            USER_PAGE_FLAGS
+        } else {
+            USER_BLOCK_FLAGS
+        };
+        let base = base_pa & mask;
+        match op {
+            PtOp::Invalidate => base | (flags & !VALID),
+            PtOp::ReadWrite => base | flags,
+            PtOp::ReadOnly => base | (flags & !AP_MASK) | AP_RO,
         }
-        // Reclaim any sub-table that the edit left fully uniform again (e.g. a
-        // 2 MiB range fully restored to RW after munmap), so churn doesn't leak
-        // the spare-table pool. Walk one VA per 2 MiB block in the range.
+    }
+
+    /// Does a leaf with `(valid, ap)` already satisfy `op`?
+    fn satisfies(op: PtOp, valid: bool, ap: u64) -> bool {
+        match op {
+            PtOp::Invalidate => !valid,
+            PtOp::ReadWrite => valid && ap == AP_RW,
+            PtOp::ReadOnly => valid && ap == AP_RO,
+        }
+    }
+
+    /// Apply `op` to `[va, va+len)` at the COARSEST granularity possible: edit a
+    /// covering block descriptor in place when the whole block lies inside the
+    /// range, and split one level finer only at an unaligned range edge. This
+    /// keeps the stage-1 tables sparse — a 512 MiB `PROT_NONE` reservation costs
+    /// one L1→L2 split + 256 L2-block edits (1 table), not 256 L3 tables. Skips
+    /// granules already at the target protection (so RW-on-already-RW is free).
+    fn apply(&mut self, va: u64, len: usize, op: PtOp) -> Result<bool, PageTableError> {
+        let end = va + (len as u64).div_ceil(PT_PAGE) * PT_PAGE;
+        let mut cur = va;
+        let mut changed = false;
+        while cur < end {
+            // The existing covering descriptor (block or page) for `cur`.
+            let (off, level) = self.leaf_offset(cur, false)?;
+            let (span, mask) = Self::level_span(level);
+            let block_start = cur & mask;
+            let block_end = block_start + span;
+            let desc = self.read_desc(off);
+            if Self::satisfies(op, desc & VALID != 0, desc & AP_MASK) {
+                // The covering block is ALREADY at the target — skip its whole
+                // span with no split (this is what keeps RW-on-already-RW, and a
+                // re-protect of an unchanged range, free).
+                cur = block_end;
+            } else if block_start >= va && block_end <= end {
+                // The whole covering block is inside the range and needs the
+                // change: edit it in place at this level (no split).
+                self.write_desc(off, Self::desc_for(op, block_start, level));
+                changed = true;
+                cur = block_end;
+            } else {
+                // The range edge bisects a block that needs changing: split one
+                // level finer and re-examine (a 4 KiB page is never bisected —
+                // len is page aligned — so `level` here is always 1 or 2). The
+                // split itself mutates the tables (parent → table pointer + a
+                // new sub-table), so it must be synced even if the subsequent
+                // in-range edits all happen to be no-ops.
+                self.split_block(off, level)?;
+                changed = true;
+                // `cur` unchanged; loop re-reads the now-finer covering leaf.
+            }
+        }
+        // Reclaim any sub-table the edit left fully uniform (single-vCPU only;
+        // see try_coalesce). Walk one VA per 2 MiB block touched.
         if changed {
-            let end = va + (pages * PT_PAGE);
             let mut block = va & !((1 << 21) - 1);
             while block < end {
                 self.try_coalesce(block);
@@ -430,9 +483,7 @@ impl PageTableManager {
 
     /// Mark `[va, va+len)` invalid (faults on any access → SEGV_MAPERR).
     pub(crate) fn set_prot_none(&mut self, va: u64, len: usize) -> Result<bool, PageTableError> {
-        self.apply(va, len, false, 0, |pv| {
-            (pv & PA_MASK_4KIB) | (USER_PAGE_FLAGS & !VALID)
-        })
+        self.apply(va, len, PtOp::Invalidate)
     }
 
     /// Alias for `set_prot_none`, used by `munmap` (the freed range faults
@@ -443,16 +494,12 @@ impl PageTableManager {
 
     /// Mark `[va, va+len)` valid read-only (AP=RO).
     pub(crate) fn set_readonly(&mut self, va: u64, len: usize) -> Result<bool, PageTableError> {
-        self.apply(va, len, true, AP_RO, |pv| {
-            (pv & PA_MASK_4KIB) | (USER_PAGE_FLAGS & !AP_MASK) | AP_RO
-        })
+        self.apply(va, len, PtOp::ReadOnly)
     }
 
     /// Restore `[va, va+len)` to a valid RW user page (identity-mapped).
     pub(crate) fn set_rw(&mut self, va: u64, len: usize) -> Result<bool, PageTableError> {
-        self.apply(va, len, true, AP_RW, |pv| {
-            (pv & PA_MASK_4KIB) | USER_PAGE_FLAGS
-        })
+        self.apply(va, len, PtOp::ReadWrite)
     }
 
     /// True iff the leaf for `va` (block or page) is valid. Test/diagnostic.
@@ -585,6 +632,70 @@ mod tests {
             !mgr.free_tables.is_empty(),
             "coalesce reclaimed a sub-table"
         );
+    }
+
+    #[test]
+    fn large_aligned_prot_none_is_coarse_not_dense() {
+        // A 512 MiB PROT_NONE on the (1 GiB-aligned) arena base must cost ONE
+        // L1->L2 split (then 256 in-place L2-block edits), NOT 256 L3 tables.
+        // This is the Go page-summary-reservation regression fix.
+        let mut mgr = manager();
+        assert_eq!(
+            LINUX_MMAP_BASE % (1 << 30),
+            0,
+            "arena base is 1 GiB-aligned"
+        );
+        let before = mgr.next_free;
+        mgr.set_prot_none(LINUX_MMAP_BASE, 512 << 20)
+            .expect("coarse prot_none");
+        let pages_used = (mgr.next_free - before) / 0x1000;
+        assert_eq!(
+            pages_used, 1,
+            "512 MiB PROT_NONE used {pages_used} tables, want 1"
+        );
+        assert!(!mgr.is_valid(LINUX_MMAP_BASE));
+        assert!(!mgr.is_valid(LINUX_MMAP_BASE + (512 << 20) - 0x1000));
+        // Just past the range stays valid.
+        assert!(mgr.is_valid(LINUX_MMAP_BASE + (512 << 20)));
+    }
+
+    #[test]
+    fn rw_commit_into_prot_none_block_keeps_neighbors_invalid() {
+        // Go's page allocator shape: reserve a region PROT_NONE (coarse,
+        // invalid block), then RW-commit a single page inside it (MAP_FIXED).
+        // The committed page must become RW; the rest of the (split) block must
+        // STAY invalid — splitting an invalid block must not revalidate it.
+        let mut mgr = manager();
+        let block = LINUX_MMAP_BASE; // 2 MiB-aligned
+        mgr.set_prot_none(block, 1 << 21)
+            .expect("reserve PROT_NONE");
+        assert!(!mgr.is_valid(block));
+        assert!(!mgr.is_valid(block + 0x1000));
+        // Commit one page RW (splits the invalid 2 MiB block to L3).
+        mgr.set_rw(block + 0x10000, 0x1000).expect("RW commit");
+        assert!(mgr.is_valid(block + 0x10000), "committed page is RW");
+        assert_eq!(mgr.ap_bits(block + 0x10000), AP_RW);
+        assert!(!mgr.is_valid(block), "neighbor page 0 stays invalid");
+        assert!(
+            !mgr.is_valid(block + 0x1000),
+            "neighbor page 1 stays invalid"
+        );
+        assert!(
+            !mgr.is_valid(block + 0x1ff000),
+            "last page of the 2 MiB block stays invalid"
+        );
+    }
+
+    #[test]
+    fn full_1gib_prot_none_edits_block_with_no_split() {
+        // A whole 1 GiB-aligned 1 GiB PROT_NONE flips the L1 block in place — 0
+        // splits — so it works even with no spare pages.
+        let mut bytes = stage1_identity_page_tables();
+        bytes.truncate(6 * 0x1000);
+        let mut mgr = PageTableManager::new(bytes, LINUX_PAGE_TABLES_BASE);
+        assert_eq!(mgr.set_prot_none(LINUX_MMAP_BASE, 1 << 30), Ok(true));
+        assert!(!mgr.is_valid(LINUX_MMAP_BASE));
+        assert!(!mgr.is_valid(LINUX_MMAP_BASE + (1 << 30) - 0x1000));
     }
 
     #[test]
