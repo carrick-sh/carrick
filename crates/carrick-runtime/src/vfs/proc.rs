@@ -68,12 +68,97 @@ pub(crate) fn synthetic_file(path: &str, ctx: &SyntheticProcContext) -> Option<V
         "/proc/net/if_inet6" => {
             Some(b"00000000000000000000000000000001 01 80 10 80       lo\n".to_vec())
         }
+        // Multicast group memberships — Go's Interface.MulticastAddrs reads these.
+        "/proc/net/igmp" => Some(synthetic_proc_net_igmp()),
+        "/proc/net/igmp6" => Some(synthetic_proc_net_igmp6()),
         _ => {
             let self_comm = process_short_name(&ctx.executable_path);
             parse_proc_pid_path(path)
                 .and_then(|(pid, rest)| synthetic_proc_pid_file(pid, rest, &self_comm))
         }
     }
+}
+
+/// `(index, name, has_ipv4, has_ipv6)` for each host interface, via getifaddrs.
+/// Used to synthesize `/proc/net/igmp[6]` so a guest's `Interface.MulticastAddrs`
+/// reports the standard multicast groups every Linux interface joins.
+#[cfg(target_os = "macos")]
+fn host_mc_interfaces() -> Vec<(u32, String, bool, bool)> {
+    use std::collections::BTreeMap;
+    let mut map: BTreeMap<String, (u32, bool, bool)> = BTreeMap::new();
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut head) } != 0 || head.is_null() {
+        return Vec::new();
+    }
+    let mut cur = head;
+    while !cur.is_null() {
+        let ifa = unsafe { &*cur };
+        cur = ifa.ifa_next;
+        if ifa.ifa_name.is_null() {
+            continue;
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }
+            .to_string_lossy()
+            .into_owned();
+        let idx = {
+            let c = std::ffi::CString::new(name.clone()).unwrap_or_default();
+            unsafe { libc::if_nametoindex(c.as_ptr()) }
+        };
+        let entry = map.entry(name).or_insert((idx, false, false));
+        if idx != 0 {
+            entry.0 = idx;
+        }
+        if !ifa.ifa_addr.is_null() {
+            match unsafe { (*ifa.ifa_addr).sa_family } as i32 {
+                libc::AF_INET => entry.1 = true,
+                libc::AF_INET6 => entry.2 = true,
+                _ => {}
+            }
+        }
+    }
+    unsafe { libc::freeifaddrs(head) };
+    map.into_iter()
+        .map(|(name, (idx, v4, v6))| (idx, name, v4, v6))
+        .collect()
+}
+#[cfg(not(target_os = "macos"))]
+fn host_mc_interfaces() -> Vec<(u32, String, bool, bool)> {
+    vec![(1, "lo".to_owned(), true, true)]
+}
+
+/// `/proc/net/igmp`: one block per IPv4 interface listing the all-hosts group
+/// (224.0.0.1), matching the format Go's `parseProcNetIGMP` reads (the group is
+/// the address in NATIVE/little-endian hex).
+fn synthetic_proc_net_igmp() -> Vec<u8> {
+    let mut s = String::from("Idx\tDevice    : Count Querier\tGroup    Users Timer\tReporter\n");
+    for (idx, name, v4, _v6) in host_mc_interfaces() {
+        if !v4 {
+            continue;
+        }
+        s.push_str(&format!("{idx}\t{name:<10}:     1      V3\n"));
+        // 224.0.0.1 = 0xE0000001; native (LE) byte order -> "010000E0".
+        s.push_str("\t\t\t\t010000E0     1 0:00000000\t\t0\n");
+    }
+    s.into_bytes()
+}
+
+/// `/proc/net/igmp6`: the all-nodes link-local (ff02::1) and interface-local
+/// (ff01::1) groups per IPv6 interface — the address is straight network-order
+/// hex, as Go's `parseProcNetIGMP6` reads.
+fn synthetic_proc_net_igmp6() -> Vec<u8> {
+    let mut s = String::new();
+    for (idx, name, _v4, v6) in host_mc_interfaces() {
+        if !v6 {
+            continue;
+        }
+        s.push_str(&format!(
+            "{idx:<4} {name:<16}ff020000000000000000000000000001     1 0000000C 0\n"
+        ));
+        s.push_str(&format!(
+            "{idx:<4} {name:<16}ff010000000000000000000000000001     1 00000008 0\n"
+        ));
+    }
+    s.into_bytes()
 }
 
 /// Directory entries (tid names) for `/proc/<pid>/task/`, or `None` if `pid`
