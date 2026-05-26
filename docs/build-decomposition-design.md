@@ -18,6 +18,25 @@ build-systems investigation.
 > a prerequisite for the big link-time win. `.cargo/config.toml` now carries a
 > guard comment so nobody re-adds lld blindly.
 >
+> **CRATE SPLIT PROGRESS (2026-05-26).** Lower layer DONE + verified:
+> `carrick-abi` (A1, linux_abi) → `carrick-guest-mem` (A2, the GuestMemory/
+> MemoryError/Aarch64SyscallFrame hub types — BREAKS the memory↔dispatch cycle) →
+> `carrick-mem` (A3-lower: memory+page_table+elf+vdso). A2.5 first broke the
+> `memory→rootfs` edge (AddressSpace is now rootfs-agnostic via a read-closure).
+> trap.rs was also fully decoupled from `dispatch` (its only edge was the hub
+> types, now imported from carrick-guest-mem). All re-exported under original
+> paths (zero call-site churn); each step verified (build + tests + signed +
+> `carrick trace`).
+>
+> **Remaining A3/A4 (carrick-hvf, carrick-dispatch) — mapped, not yet done.**
+> `carrick-hvf` is an ~8-module cluster, not a single lift: trap.rs (3,222 LOC) +
+> host_mapping, vcpu_kick, fork_quiesce, ulock, guest_cpu, compat, probes. trap→
+> dispatch is now gone; the one tricky external edge is `vcpu_kick → thread`
+> (resolve by placing `thread` below hvf or splitting the kick interface).
+> `carrick-dispatch` (A4) is the largest (dispatch/* ~15k LOC + fs_backend + vfs +
+> rootfs + overlay) and must be checked for dispatch↔runtime/thread cycles before
+> lifting. These are the next dedicated build session.
+>
 > **Landed instead (DOF-safe, no linker change):** `[profile.dev]`/`[profile.test]`
 > `split-debuginfo = "unpacked"` (skip macOS dsymutil bundling per link) and a
 > `[profile.dev-fast]` (`debug = "line-tables-only"`). Verified: release
