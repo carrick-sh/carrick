@@ -1316,7 +1316,7 @@ impl HvfInner {
         &mut self,
         edit: impl FnOnce(
             &mut crate::page_table::PageTableManager,
-        ) -> Result<(), crate::page_table::PageTableError>,
+        ) -> Result<bool, crate::page_table::PageTableError>,
     ) -> Result<(), MemoryError> {
         use crate::page_table::PageTableError;
         self.ensure_pt_manager()?;
@@ -1324,7 +1324,7 @@ impl HvfInner {
             .page_tables
             .as_mut()
             .ok_or_else(|| MemoryError::HostMap("page-table manager not built".to_string()))?;
-        edit(mgr).map_err(|e| match e {
+        let changed = edit(mgr).map_err(|e| match e {
             PageTableError::OutOfTables => {
                 MemoryError::HostMap("stage-1 page-table pool exhausted".to_string())
             }
@@ -1333,6 +1333,11 @@ impl HvfInner {
                 length: 0,
             },
         })?;
+        // Nothing changed (range already at the target protection): no need to
+        // touch the host backing or pay a stage-1 TLBI.
+        if !changed {
+            return Ok(());
+        }
         self.sync_pt_to_host()?;
         self.run_el1_maintenance()
             .map_err(|e| MemoryError::HostMap(format!("stage-1 TLBI failed: {e}")))?;
