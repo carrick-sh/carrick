@@ -116,11 +116,20 @@ TestUnixAndUnixpacketServer, TestUnixgramServer, TestUnixgramAutobind,
 TestUnixAutobindClose, TestUnixgramLinuxAbstractLongName,
 TestReadUnixgramWithUnnamedSocket.
 
-### Remaining net carrick-only gaps (after this session's work)
-`TestSplice` (large socket-write POLLOUT readiness — deep netpoll), `TestIPConn*`
-(raw IP sockets — privileged on macOS, may be environmental), and any items a
-fresh full `net` diff surfaces now that sendfile/sockopt/interfaces/SEQPACKET/
-abstract are fixed.
+### Remaining net carrick-only gaps — fresh full diff 2026-05-26
+carrick net: **232 PASS / 6 FAIL / no crash / no timeout** (vs ~52-then-truncate
+at the start of this session's net work). The 6 docker-PASS-carrick-FAIL:
+- `TestCgoLookupPort`(+WithCancel), `TestReadLine` — guest can't open
+  **/etc/services** (the --fs host scratch lacks it). FIX: synthesize from the
+  macOS host's /etc/services (Darwin-native VFS, like resolvconf). [3 tests]
+- `TestIPConnRemoteName`, `TestIPConnSpecificMethods` — **raw IP sockets** →
+  EPERM (need root on macOS). Environmental/privileged.
+- `TestProtocolListenError` — carrick is too lenient: a unix listen that "should
+  fail" succeeded. Small real gap.
+Note: `TestCgo*` is already in the harness SKIP; raw-IP needs root — so the
+genuinely-actionable remainder is /etc/services (3) + TestProtocolListenError (1).
+`TestSplice` no longer appears (the sendfile-family/socket fixes resolved its
+path, or it now completes).
 
 ### (historical) Biggest remaining net cluster — AF_UNIX SOCK_SEQPACKET (macOS platform gap)
 `unixpacket` is unsupported on macOS (no AF_UNIX SEQPACKET). This single gap is
