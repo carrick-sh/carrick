@@ -173,6 +173,35 @@ mod carrick_usdt {
     fn supervisor__foreground__pgrp(_: i32, _: i32) {}
     /// Fires when the supervisor reaps the runtime child.
     fn supervisor__child__exit(_: i32, _: i32) {}
+    /// Page-table-edit Pause-Modify-Resume tracing. carrick (the VMM) edits the
+    /// guest's shared stage-1 descriptors from the host while sibling vCPUs run;
+    /// these probes let a `carrick trace` PROVE the stop-the-world engages and
+    /// converges (rather than guessing).
+    ///  * `pt__pause__begin`: an editing vCPU became the sole coordinator.
+    ///    `tid` editor, `others_in_guest` siblings still walking tables at entry,
+    ///    `count` live vCPUs.
+    ///  * `pt__pause__ready`: all siblings left guest; the edit may proceed.
+    ///    `spins` wait iterations, `wait_us` microseconds waited.
+    ///  * `pt__pause__timeout`: the convergence deadline was hit. MUST never
+    ///    fire — a nonzero rate means a sibling stayed in guest (exactly the
+    ///    corruption PMR prevents). `wait_us` is the deadline budget.
+    ///  * `pt__pause__end`: the pause was released and siblings resumed. `tid`.
+    fn pt__pause__begin(_: i32, _: i32, _: i32) {}
+    fn pt__pause__ready(_: i32, _: i32, _: i64) {}
+    fn pt__pause__timeout(_: i32, _: i64) {}
+    fn pt__pause__end(_: i32) {}
+    /// Stage-1 spare sub-table pool occupancy, fired after each table edit.
+    /// `in_use` live split tables, `free_list` reclaimable pages, `capacity`
+    /// total spare pages. A rising `in_use` toward `capacity` is the
+    /// coalesce-disabled pool leak; flat `in_use` proves coalescing keeps it
+    /// bounded. `changed` is 1 if this edit mutated descriptors (0 = no-op skip).
+    fn pt__pool(_: u32, _: u32, _: u32, _: i32) {}
+    /// Fault-site host page-table walk. On a guest EL0 translation/permission
+    /// fault, the live stage-1 descriptors read from the host backing at the
+    /// faulting VA: `far` and `l0`/`l1`/`l2`/`l3`. An invalid (`& 1 == 0`) leaf
+    /// proves the PTE is wrong IN MEMORY (logic bug); a valid RW leaf proves the
+    /// memory is fine and the faulting vCPU's TLB was stale (coherence bug).
+    fn pt__fault__walk(_: u64, _: u64, _: u64, _: u64, _: u64) {}
 }
 
 pub fn fork_pre(pc: u64, elr: u64, cpsr: u64) {
@@ -290,6 +319,30 @@ pub fn supervisor_foreground_pgrp(pgid: i32, errno: i32) {
 
 pub fn supervisor_child_exit(pid: i32, status: i32) {
     carrick_usdt::supervisor__child__exit!(|| (pid, status));
+}
+
+pub fn pt_pause_begin(tid: i32, others_in_guest: i32, count: i32) {
+    carrick_usdt::pt__pause__begin!(|| (tid, others_in_guest, count));
+}
+
+pub fn pt_pause_ready(tid: i32, spins: i32, wait_us: i64) {
+    carrick_usdt::pt__pause__ready!(|| (tid, spins, wait_us));
+}
+
+pub fn pt_pause_timeout(tid: i32, wait_us: i64) {
+    carrick_usdt::pt__pause__timeout!(|| (tid, wait_us));
+}
+
+pub fn pt_pause_end(tid: i32) {
+    carrick_usdt::pt__pause__end!(|| tid);
+}
+
+pub fn pt_pool(in_use: u32, free_list: u32, capacity: u32, changed: i32) {
+    carrick_usdt::pt__pool!(|| (in_use, free_list, capacity, changed));
+}
+
+pub fn pt_fault_walk(far: u64, l0: u64, l1: u64, l2: u64, l3: u64) {
+    carrick_usdt::pt__fault__walk!(|| (far, l0, l1, l2, l3));
 }
 
 // `#[inline(never)]`: usdt embeds the probe site (an asm! anchor) in

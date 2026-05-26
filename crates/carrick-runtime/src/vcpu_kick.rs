@@ -50,11 +50,42 @@ impl VcpuKickHandle {
 #[derive(Default)]
 pub struct VcpuKicker {
     handles: Mutex<HashMap<ThreadId, VcpuKickHandle>>,
+    /// Per-vCPU "currently inside hv_vcpu_run (walking guest memory)" flag. The
+    /// page-table-edit Pause-Modify-Resume coordinator waits until every OTHER
+    /// vCPU has this false (out of guest) before editing the shared stage-1
+    /// tables — siblings blocked in host syscalls have it false and need no
+    /// wake, which avoids the spurious-signal/blocking-wait deadlock.
+    in_guest: Mutex<HashMap<ThreadId, std::sync::Arc<std::sync::atomic::AtomicBool>>>,
 }
 
 impl VcpuKicker {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Register (and return) this thread's in-guest flag. The vcpu loop sets it
+    /// true immediately before `hv_vcpu_run` and false immediately after.
+    pub fn register_in_guest(
+        &self,
+        tid: ThreadId,
+    ) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        #[allow(clippy::expect_used)]
+        self.in_guest
+            .lock()
+            .expect("VcpuKicker poisoned")
+            .insert(tid, std::sync::Arc::clone(&flag));
+        flag
+    }
+
+    /// True if any OTHER registered vCPU is currently in-guest.
+    pub fn any_other_in_guest(&self, except: ThreadId) -> bool {
+        #[allow(clippy::expect_used)]
+        self.in_guest
+            .lock()
+            .expect("VcpuKicker poisoned")
+            .iter()
+            .any(|(tid, f)| *tid != except && f.load(std::sync::atomic::Ordering::SeqCst))
     }
 
     /// Record this thread's vCPU handle so siblings can kick it. Called once
@@ -82,6 +113,11 @@ impl VcpuKicker {
     pub fn unregister(&self, tid: ThreadId) {
         #[allow(clippy::expect_used)]
         self.handles
+            .lock()
+            .expect("VcpuKicker poisoned")
+            .remove(&tid);
+        #[allow(clippy::expect_used)]
+        self.in_guest
             .lock()
             .expect("VcpuKicker poisoned")
             .remove(&tid);
