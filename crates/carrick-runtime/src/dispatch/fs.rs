@@ -749,13 +749,36 @@ impl SyscallDispatcher {
                 is_read_end,
                 status_flags,
             } => {
-                let open_file = OpenFile::with_host_fd(
-                    Arc::new(RwLock::new(OpenDescription::HostPipe {
+                // A VFS-served (e.g. bind-mounted) REGULAR file must become a
+                // seekable HostFile, not a HostPipe — otherwise lseek/pread-at-
+                // offset and sendfile/splice reject it (EINVAL), since a pipe
+                // isn't seekable. Only genuine streams (devices, fifos) stay
+                // HostPipe. fstat the real fd to decide.
+                let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                let is_regular = unsafe { libc::fstat(host_fd, &mut st) } == 0
+                    && (st.st_mode & libc::S_IFMT) == libc::S_IFREG;
+                let description = if is_regular {
+                    OpenDescription::HostFile {
+                        host_fd,
+                        metadata: crate::rootfs::RootFsMetadata {
+                            path: std::path::PathBuf::from(path),
+                            kind: RootFsEntryKind::File,
+                            mode: (st.st_mode & 0o7777) as u32,
+                            size: st.st_size.max(0) as usize,
+                        },
+                        base: OpenDescriptionBase::new(status_flags as u64),
+                        writable: !is_read_end,
+                    }
+                } else {
+                    OpenDescription::HostPipe {
                         host_fd,
                         is_read_end,
                         base: OpenDescriptionBase::new(status_flags as u64),
                         pty: None,
-                    })),
+                    }
+                };
+                let open_file = OpenFile::with_host_fd(
+                    Arc::new(RwLock::new(description)),
                     linux_fd_flags_from_open_flags(flags),
                     host_fd,
                 );
@@ -1084,14 +1107,20 @@ impl SyscallDispatcher {
             return Err(LINUX_EBADF);
         };
         let open = in_file.description.read();
-        // HostFile: pread the requested window from the real fd.
+        // HostFile: pread the requested window from the real fd. Cap the buffer:
+        // callers (Go's poll.SendFile) pass count = INT_MAX, and a naive
+        // `vec![0u8; count]` would zero-fill 2 GiB per call. Linux sendfile is
+        // free to transfer fewer than `count` bytes (the caller loops), so read
+        // at most one chunk; pread then truncates to what the file holds.
         if let OpenDescription::HostFile { host_fd, .. } = &*open {
-            let mut buf = vec![0u8; count];
+            const SENDFILE_CHUNK: usize = 1 << 24; // 16 MiB
+            let want = count.min(SENDFILE_CHUNK);
+            let mut buf = vec![0u8; want];
             let n = unsafe {
                 libc::pread(
                     *host_fd,
                     buf.as_mut_ptr() as *mut _,
-                    count,
+                    want,
                     offset as libc::off_t,
                 )
             };
@@ -1117,6 +1146,28 @@ impl SyscallDispatcher {
         let available = contents.get(offset..).unwrap_or_default();
         let write_len = available.len().min(count);
         Ok(available[..write_len].to_vec())
+    }
+
+    /// Host fd of `fd` iff it is a real regular file (HostFile) — the source
+    /// macOS `sendfile(2)` can stream.
+    fn regular_host_file_fd(&self, fd: i32) -> Option<i32> {
+        let open_file = self.open_file(fd)?;
+        let open = open_file.description.read();
+        match &*open {
+            OpenDescription::HostFile { host_fd, .. } => Some(*host_fd),
+            _ => None,
+        }
+    }
+
+    /// Host fd of `fd` iff it is a host socket — the destination macOS
+    /// `sendfile(2)` streams to.
+    fn host_socket_fd(&self, fd: i32) -> Option<i32> {
+        let open_file = self.open_file(fd)?;
+        let open = open_file.description.read();
+        match &*open {
+            OpenDescription::HostSocket { host_fd, .. } => Some(*host_fd),
+            _ => None,
+        }
     }
 
     fn pipe_reader(&self, fd: i32) -> Option<(PipeRef, u64)> {
@@ -3482,6 +3533,72 @@ impl SyscallDispatcher {
                 Ok(offset) => offset,
                 Err(errno) => return Ok(errno.into()),
             };
+
+            // Darwin-native fast path: a regular file -> socket uses macOS
+            // sendfile(2) (BSD-style, in-kernel, zero-copy). It honors socket
+            // backpressure by returning a partial `len` + EAGAIN, which Go's
+            // netpoller drives via EPOLLOUT — so a large transfer does NOT hang
+            // the way a userspace read-into-buffer-then-write does. Non-socket
+            // destinations and in-memory file sources fall through to the buffer
+            // path below.
+            if let (Some(file_fd), Some(sock_fd)) =
+                (this.regular_host_file_fd(in_fd.0), this.host_socket_fd(out_fd.0))
+            {
+                let mut len: libc::off_t = count as libc::off_t;
+                // SAFETY: both are live host fds owned by these guest fds; `len`
+                // is in (bytes to send) / out (bytes sent); no header/trailer.
+                let rc = unsafe {
+                    libc::sendfile(
+                        file_fd,
+                        sock_fd,
+                        offset as libc::off_t,
+                        &mut len,
+                        std::ptr::null_mut(),
+                        0,
+                    )
+                };
+                let sent = len.max(0) as usize;
+                let advance_and_return = |offset: usize,
+                                          sent: usize,
+                                          memory: &mut dyn GuestMemory|
+                 -> Result<DispatchOutcome, DispatchError> {
+                    let new_off = offset.saturating_add(sent);
+                    if offset_address == 0 {
+                        // macOS sendfile takes an explicit `offset` and does NOT
+                        // advance the file's kernel offset; do it so a follow-up
+                        // read/sendfile (no explicit offset) continues correctly.
+                        unsafe { libc::lseek(file_fd, new_off as libc::off_t, libc::SEEK_SET) };
+                    } else if memory
+                        .write_bytes(offset_address, &(new_off as u64).to_ne_bytes())
+                        .is_err()
+                    {
+                        return Ok(LINUX_EFAULT.into());
+                    }
+                    Ok(DispatchOutcome::Returned { value: sent as i64 })
+                };
+                match (rc as i64).host_syscall_errno() {
+                    Ok(_) => return advance_and_return(offset, sent, memory),
+                    Err(e) if e == LINUX_EAGAIN => {
+                        if sent > 0 {
+                            // Partial transfer before the socket filled: report it
+                            // (Go advances and loops).
+                            return advance_and_return(offset, sent, memory);
+                        }
+                        return Ok(if this.io_is_nonblocking(out_fd.0, 0) {
+                            DispatchOutcome::errno(LINUX_EAGAIN)
+                        } else {
+                            DispatchOutcome::WaitOnFds {
+                                fds: vec![(sock_fd, libc::POLLOUT as i16)],
+                                timeout: None,
+                                on_timeout: -(LINUX_EAGAIN as i64),
+                                block_signals: 0,
+                            }
+                        });
+                    }
+                    Err(e) => return Ok(e.into()),
+                }
+            }
+
             let bytes = match this.sendfile_bytes(in_fd.0, offset, count) {
                 Ok(bytes) => bytes,
                 Err(errno) => return Ok(errno.into()),
