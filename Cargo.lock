@@ -331,6 +331,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "carrick-guest-mem"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror",
+]
+
+[[package]]
 name = "carrick-image"
 version = "0.1.0"
 dependencies = [
@@ -354,6 +362,7 @@ dependencies = [
  "camino",
  "cap-std",
  "carrick-abi",
+ "carrick-guest-mem",
  "carrick-image",
  "carrick-spec",
  "carrick-test-support",
