@@ -760,34 +760,49 @@ fn unix_socket_host_dir() -> std::path::PathBuf {
 /// family), return the host pathname to bind/connect on, or `None` for an
 /// abstract-namespace / autobind address (which we pass through verbatim).
 fn unix_socket_host_path(sun_path: &[u8]) -> Option<std::path::PathBuf> {
-    // Empty (autobind) or abstract (leading NUL): not a filesystem path.
-    if sun_path.is_empty() || sun_path[0] == 0 {
-        return None;
-    }
-    // Pathname socket: bytes up to the first NUL.
-    let nul = sun_path
-        .iter()
-        .position(|&b| b == 0)
-        .unwrap_or(sun_path.len());
-    let guest_path = &sun_path[..nul];
-    if guest_path.is_empty() {
+    // Empty: autobind — a unique name must be generated and remembered per
+    // socket, which happens at bind() (`autobind_unix`), not here.
+    if sun_path.is_empty() {
         return None;
     }
     let dir = unix_socket_host_dir();
-    let _ = std::fs::create_dir_all(&dir);
-    // Short, collision-resistant, deterministic name derived from the guest
-    // path so bind and connect agree and the result fits macOS sun_path.
+    // ABSTRACT namespace (leading NUL): the name is the LENGTH-delimited bytes
+    // after the NUL — it may contain NULs and is NOT NUL-terminated. macOS has no
+    // abstract namespace, so map it to a dedicated `abstract/` host subdir.
+    // PATHNAME sockets use the bytes up to the first NUL, in the base dir.
+    let abstract_ns = sun_path[0] == 0;
+    let (key, base): (&[u8], std::path::PathBuf) = if abstract_ns {
+        (&sun_path[1..], dir.join("abstract"))
+    } else {
+        let nul = sun_path
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(sun_path.len());
+        (&sun_path[..nul], dir)
+    };
+    if key.is_empty() {
+        return None;
+    }
+    let _ = std::fs::create_dir_all(&base);
+    // Short, collision-resistant, deterministic name derived from the abstract
+    // name / path so bind and connect agree and the result fits macOS sun_path
+    // (constant length even for a long abstract name).
     let mut hash: u64 = 0xcbf29ce484222325;
-    for &b in guest_path {
+    for &b in key {
         hash ^= b as u64;
         hash = hash.wrapping_mul(0x100000001b3);
     }
-    let host = dir.join(format!("{hash:016x}.sock"));
-    // Record host→guest so getsockname/getpeername/accept can REVERSE-translate:
-    // the guest must get back the path it used (not the <hash>.sock host node),
-    // or dialing `ln.Addr()` re-hashes the host path → wrong node → ENOENT.
+    let host = base.join(format!("{hash:016x}.sock"));
+    // Record host→guest so getsockname/getpeername/accept REVERSE-translate to
+    // exactly what the guest used: the abstract form (leading NUL + name) or the
+    // pathname (no trailing NUL) — else a peer re-translating ln.Addr() misses.
+    let stored: Vec<u8> = if abstract_ns {
+        sun_path.to_vec()
+    } else {
+        key.to_vec()
+    };
     if let Ok(mut map) = unix_path_registry().lock() {
-        map.insert(host.clone(), guest_path.to_vec());
+        map.insert(host.clone(), stored);
     }
     Some(host)
 }
