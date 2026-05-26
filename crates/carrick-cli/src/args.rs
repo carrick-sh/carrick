@@ -132,6 +132,12 @@ pub(crate) enum Commands {
         /// Publish a container's port(s) to the host (no-op under host networking)
         #[arg(short = 'p', long = "publish", value_name = "hostPort:containerPort")]
         publish: Vec<String>,
+        /// `KEY=VAL` env vars to set in this process before the guest starts.
+        /// Carries `CARRICK_*` tunables across `sudo`'s env_reset without needing
+        /// SETENV in sudoers (CLI args survive sudo where env vars don't). Same
+        /// idiom as `run-elf`/`trace --forward-env`.
+        #[arg(long = "forward-env", value_name = "KEY=VAL")]
+        forward_env: Vec<String>,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
