@@ -15,12 +15,15 @@ cache="/tmp/go-conformance"; mkdir -p "$cache/bin" "$cache/logs"
 carrick="$repo/target/release/carrick"
 RUN_TIMEOUT="${RUN_TIMEOUT:-120}"
 # Tests that need host infra neither carrick nor the Docker oracle can provide:
-# a ptrace tracer (debug/gdb/lldb), a C toolchain (cgo), or the test's own Go
-# source tree (tracebacksystem). They HANG or panic-abort the test binary rather
-# than FAIL cleanly, so the binary would burn the full RUN_TIMEOUT and every
-# downstream test would look "absent" (the bogus runtime "277"). Skipped on BOTH
-# sides so the carrick-vs-Docker diff stays fair. Override via SKIP=.
-SKIP="${SKIP:-TestDebugCall|TestGdb|TestLldb|TestCgo|TestTracebackSystem}"
+# a separate ptrace tracer process (gdb/lldb), a C toolchain (cgo), or the test's
+# own Go source tree (tracebacksystem). They HANG or panic-abort the test binary
+# rather than FAIL cleanly, so the binary would burn the full RUN_TIMEOUT and
+# every downstream test would look "absent" (the bogus runtime "277"). Skipped on
+# BOTH sides so the carrick-vs-Docker diff stays fair. Override via SKIP=.
+# NOTE: TestDebugCall is NOT here — despite the name it uses no ptrace (in-process
+# tgkill(SIGTRAP) + an in-guest BRK #0); carrick delivers guest BRK as SIGTRAP
+# (see docs/ptrace-darwin-design.md Phase 1), so it runs and passes on both sides.
+SKIP="${SKIP:-TestGdb|TestLldb|TestCgo|TestTracebackSystem}"
 # Per-binary Go test timeout: a hung/slow test (e.g. net's DNS lookups) aborts
 # itself with a goroutine dump well before the carrick hard-kill, so a stuck
 # binary no longer burns the whole RUN_TIMEOUT. Kept comfortably under it.
