@@ -9,11 +9,10 @@ pub(super) struct MemState {
     pub brk_current: u64,
     /// Bump cursor for the anonymous mmap arena.
     pub mmap_next: u64,
-    /// Bump allocator for the MAP_SHARED file-mapping IPA window.
-    pub shared_file_next: u64,
-    /// List of live MAP_SHARED file mappings (guest_addr, len) so
-    /// munmap/msync can route to them. See [`SyscallDispatcher::mmap`].
-    pub shared_file_maps: Vec<(u64, usize)>,
+    /// Sub-allocator for the boot-mapped shared aperture. Guest `MAP_SHARED`
+    /// mmaps carve sub-ranges here; the aperture itself is `hv_vm_map`'d once
+    /// at boot, so no stage-2 mutation happens at mmap time.
+    pub shared: crate::shared_aperture::SharedAperture,
     /// Freed in-arena anonymous/private ranges available for reuse, kept sorted
     /// by start and coalesced. Reclaiming `munmap`'d space so a churning guest
     /// doesn't exhaust the bump arena. NOT used for MAP_FIXED or shared-file
@@ -32,8 +31,7 @@ impl MemState {
         Self {
             brk_current: LINUX_HEAP_BASE,
             mmap_next: LINUX_MMAP_BASE,
-            shared_file_next: crate::memory::LINUX_SHARED_FILE_BASE,
-            shared_file_maps: Vec::new(),
+            shared: crate::shared_aperture::SharedAperture::new(),
             free_regions: Vec::new(),
             address_space_regions: None,
         }
@@ -114,20 +112,34 @@ impl SyscallDispatcher {
         Some((address, false))
     }
 
-    fn next_shared_file_address(&self, length: u64) -> Option<u64> {
-        use crate::memory::{LINUX_SHARED_FILE_BASE, LINUX_SHARED_FILE_SIZE};
-        let mut mem = self.mem.lock();
-        let address = align_up_u64(mem.shared_file_next, crate::trap::HVF_PAGE_SIZE)?;
-        if !range_within(
-            address,
-            length,
-            LINUX_SHARED_FILE_BASE,
-            LINUX_SHARED_FILE_SIZE,
-        ) {
-            return None;
+    /// Write a freed `SharedFile` allocation's bytes back to its host fd and
+    /// close the owned dup. `SharedAnon` frees need no writeback. Called from
+    /// `munmap` (close_fd=true) and `msync` (close_fd=false, no free).
+    fn writeback_shared<M: GuestMemory>(
+        &self,
+        cx: &mut SyscallCtx<'_, M>,
+        alloc: &crate::shared_aperture::SharedAlloc,
+        close_fd: bool,
+    ) {
+        if let crate::shared_aperture::BackingObject::SharedFile { host_fd, offset } = alloc.backing
+        {
+            let len = usize::try_from(alloc.len).unwrap_or(0);
+            if len > 0 {
+                if let Ok(bytes) = cx.memory.read_bytes(alloc.guest_addr, len) {
+                    unsafe {
+                        libc::pwrite(
+                            host_fd,
+                            bytes.as_ptr() as *const _,
+                            bytes.len(),
+                            offset as libc::off_t,
+                        );
+                    }
+                }
+            }
+            if close_fd {
+                unsafe { libc::close(host_fd) };
+            }
         }
-        mem.shared_file_next = address.checked_add(length)?;
-        Some(address)
     }
 
     fn membarrier(&self, command: u64, flags: u64) -> DispatchOutcome {
@@ -190,6 +202,11 @@ impl SyscallDispatcher {
                 usize::try_from(length).map_err(|_| DispatchError::LengthTooLarge(length))?;
 
             let hvf_page = crate::trap::HVF_PAGE_SIZE;
+            // Guest MAP_SHARED of a file: carve a sub-range out of the
+            // boot-mapped shared aperture, seed it with the file's bytes, and
+            // record a SharedFile backing (owning a dup of the host fd) so
+            // msync(MS_SYNC)/munmap write dirty bytes back. NO post-vCPU
+            // hv_vm_map — the aperture is already stage-2 mapped.
             if flags & LINUX_MAP_ANONYMOUS == 0
                 && map_type == LINUX_MAP_SHARED
                 && flags & LINUX_MAP_FIXED == 0
@@ -209,39 +226,61 @@ impl SyscallDispatcher {
                     }
                 };
                 if let Some(dup_fd) = dup_fd {
-                    let map_len = align_up_u64(length, hvf_page)
-                        .and_then(|l| usize::try_from(l).ok())
-                        .unwrap_or(length_usize);
-                    match this.next_shared_file_address(map_len as u64) {
-                        Some(addr) => {
-                            match memory.map_shared_file(addr, map_len, dup_fd, offset) {
-                                Ok(()) => {
-                                    this.mem.lock().shared_file_maps.push((addr, map_len));
-                                    return Ok(DispatchOutcome::Returned { value: addr as i64 });
-                                }
-                                Err(_) => { /* fall through */ }
-                            }
-                        }
-                        None => unsafe {
-                            libc::close(dup_fd);
-                        },
+                    let map_len = align_up_u64(length, hvf_page).unwrap_or(length);
+                    let map_len_usize = usize::try_from(map_len)
+                        .map_err(|_| DispatchError::LengthTooLarge(map_len))?;
+                    let addr = {
+                        let mut mem = this.mem.lock();
+                        mem.shared.alloc(
+                            map_len,
+                            crate::shared_aperture::BackingObject::SharedFile {
+                                host_fd: dup_fd,
+                                offset,
+                            },
+                        )
+                    };
+                    if let Some(addr) = addr {
+                        // Seed the aperture sub-range with the file's bytes; a
+                        // short read leaves the tail zero (BSS-like).
+                        let mut bytes = vec![0u8; map_len_usize];
+                        let n = unsafe {
+                            libc::pread(
+                                dup_fd,
+                                bytes.as_mut_ptr() as *mut _,
+                                map_len_usize,
+                                offset as libc::off_t,
+                            )
+                        };
+                        let _ = n;
+                        let _ = memory.write_bytes(addr, &bytes);
+                        return Ok(DispatchOutcome::Returned { value: addr as i64 });
                     }
+                    // Window exhausted: drop the dup and fall through to private.
+                    unsafe { libc::close(dup_fd) };
                 }
             }
 
+            // Guest MAP_SHARED|MAP_ANON: a sub-range of the shared aperture.
+            // The bytes already live in the boot-mapped shared region, so we
+            // only allocate, zero (recycled memory), and return.
             if flags & LINUX_MAP_ANONYMOUS != 0
                 && map_type == LINUX_MAP_SHARED
                 && flags & LINUX_MAP_FIXED == 0
             {
-                let map_len = align_up_u64(length, hvf_page)
-                    .and_then(|l| usize::try_from(l).ok())
-                    .unwrap_or(length_usize);
-                if let Some(addr) = this.next_shared_file_address(map_len as u64) {
-                    if memory.map_shared_anon(addr, map_len).is_ok() {
-                        this.mem.lock().shared_file_maps.push((addr, map_len));
-                        return Ok(DispatchOutcome::Returned { value: addr as i64 });
-                    }
+                let map_len = align_up_u64(length, hvf_page).unwrap_or(length);
+                let addr = {
+                    let mut mem = this.mem.lock();
+                    mem.shared
+                        .alloc(map_len, crate::shared_aperture::BackingObject::SharedAnon)
+                };
+                if let Some(addr) = addr {
+                    let map_len_usize = usize::try_from(map_len)
+                        .map_err(|_| DispatchError::LengthTooLarge(map_len))?;
+                    let zeros = vec![0u8; map_len_usize];
+                    let _ = memory.write_bytes(addr, &zeros);
+                    return Ok(DispatchOutcome::Returned { value: addr as i64 });
                 }
+                return Ok(LINUX_ENOMEM.into());
             }
 
             let (address, reused) = match this.next_mmap_address(requested.0, length, prot, flags) {
@@ -312,15 +351,15 @@ impl SyscallDispatcher {
             if length == 0 {
                 return Ok(LINUX_EINVAL.into());
             }
-            let shared_mapping = {
+            let freed = {
                 let mut mem = this.mem.lock();
-                mem.shared_file_maps
-                    .iter()
-                    .position(|(a, _)| *a == address.0)
-                    .map(|pos| mem.shared_file_maps.remove(pos))
+                mem.shared.free(address.0)
             };
-            if let Some((addr, len)) = shared_mapping {
-                let _ = cx.memory.unmap_shared_file(addr, len);
+            if let Some(alloc) = freed {
+                // SharedFile backings write dirty bytes back and close the dup;
+                // SharedAnon frees are pure bookkeeping. The aperture stays
+                // stage-2 mapped — no hv_vm_unmap.
+                this.writeback_shared(cx, &alloc, true);
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
             if !range_within(address.0, length, LINUX_MMAP_BASE, LINUX_MMAP_SIZE) {
@@ -355,15 +394,17 @@ impl SyscallDispatcher {
             if length == 0 {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
-            let shared_mapping = this
-                .mem
-                .lock()
-                .shared_file_maps
-                .iter()
-                .find(|(a, _)| *a == address.0)
-                .copied();
-            if let Some((addr, len)) = shared_mapping {
-                let _ = cx.memory.msync_shared_file(addr, len);
+            let alloc = {
+                let mem = this.mem.lock();
+                mem.shared
+                    .live()
+                    .iter()
+                    .find(|a| a.guest_addr == address.0)
+                    .copied()
+            };
+            if let Some(alloc) = alloc {
+                // Write a SharedFile backing's dirty bytes back without freeing.
+                this.writeback_shared(cx, &alloc, false);
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
             if cx.memory.read_bytes(address.0, 1).is_err() {
