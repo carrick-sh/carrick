@@ -130,7 +130,10 @@ fn load_elf_from_rootfs_maps_pt_interp_at_base_and_sets_at_base() {
     ]))])
     .unwrap();
 
-    let image = AddressSpace::load_elf_from_rootfs("/bin/app", &rootfs)
+    // AddressSpace is rootfs-agnostic (build-graph A2.5): read the binary via the
+    // rootfs, resolve PT_INTERP through the rootfs read-closure.
+    let file = rootfs.read("/bin/app").unwrap();
+    let image = AddressSpace::load_elf_bytes_with_reader(&file, &|p| rootfs.read(p).ok())
         .unwrap()
         .with_linux_initial_stack(["/bin/app".to_owned()], std::iter::empty::<String>())
         .unwrap();

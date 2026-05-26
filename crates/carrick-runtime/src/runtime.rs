@@ -168,6 +168,11 @@ pub trait SyscallTrap {
 pub enum RuntimeError {
     #[error("failed to load ELF image: {0}")]
     AddressSpace(#[from] AddressSpaceError),
+    // Reading a rootfs-backed ELF (main binary / PT_INTERP) lives at the runtime
+    // layer now that AddressSpace loading is rootfs-agnostic (closure reader) —
+    // this is what decoupled `memory` from `rootfs` (build-graph A2.5).
+    #[error("failed to read rootfs-backed ELF: {0}")]
+    RootFs(#[from] crate::rootfs::RootFsError),
     #[error("trap engine failed: {0}")]
     Trap(#[from] TrapError),
     #[error("syscall dispatch failed: {0}")]
@@ -342,7 +347,11 @@ where
     let argv: Vec<String> = argv.into_iter().collect();
     let env: Vec<String> = env.into_iter().collect();
     dispatcher.set_executable_identity(path.to_string_lossy().into_owned(), argv.clone());
-    let image = AddressSpace::load_elf_from_rootfs(path, rootfs)?
+    // Read the main binary from the rootfs here (runtime layer); AddressSpace
+    // resolves any PT_INTERP through the rootfs read-closure, staying
+    // rootfs-agnostic so `memory` doesn't depend on `rootfs`.
+    let file = rootfs.read(path)?;
+    let image = AddressSpace::load_elf_bytes_with_reader(&file, &|p| rootfs.read(p).ok())?
         .with_linux_initial_stack(argv, env)?
         .with_el0_trampoline()?
         .with_el1_vectors()?
