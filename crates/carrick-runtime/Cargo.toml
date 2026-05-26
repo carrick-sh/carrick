@@ -12,6 +12,7 @@ path = "src/lib.rs"
 workspace = true
 
 [dependencies]
+carrick-abi = { path = "../carrick-abi" }
 anyhow.workspace = true
 bitflags.workspace = true
 libc.workspace = true
