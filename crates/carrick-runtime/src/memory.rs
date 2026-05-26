@@ -60,7 +60,13 @@ pub const LINUX_EL1_VECTORS_SIZE: u64 = 0x4000;
 // `ldaxr`/`stlxr` need to work — without it ARMv8 treats every data
 // access as Device-nGnRnE and exclusive ops are prohibited.
 pub const LINUX_PAGE_TABLES_BASE: u64 = LINUX_KERNEL_REGION_BASE + 0x20000;
-pub const LINUX_PAGE_TABLES_SIZE: u64 = 0x8000; // 32 KiB allocated, five pages used
+// 256 KiB: six boot tables (L0, L1A, L1B, L2A, L2B, L3A in the first six 4 KiB
+// pages) plus a 58-page spare pool the runtime page-table manager
+// (`crate::page_table`) carves sub-tables from when it splits a coarse block to
+// finer granularity for guest mprotect/PROT_NONE/munmap. The spare tail is
+// zero-filled (invalid descriptors). Still well within the kernel hole's first
+// 2 MiB block (0x20000 + 0x40000 = 0x60000 < 0x200000), so it stays kernel-only.
+pub const LINUX_PAGE_TABLES_SIZE: u64 = 0x40000;
 // User-mode rt_sigreturn trampoline. This must be outside the first 2 MiB,
 // whose stage-1 block is kernel-only for the EL0-entry/vector pages, and it
 // must not collide with ET_EXEC binaries that commonly start at 0x200000. Keep
@@ -1771,6 +1777,22 @@ mod stage1_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn page_tables_reserve_spare_pool_within_kernel_block() {
+        let bytes = stage1_identity_page_tables();
+        assert_eq!(bytes.len() as u64, LINUX_PAGE_TABLES_SIZE);
+        // Six boot tables (0..0x6000); the rest is a spare pool of >=8 pages.
+        let spare_pages = (LINUX_PAGE_TABLES_SIZE - 0x6000) / 0x1000;
+        assert!(spare_pages >= 8, "need a spare-table pool, got {spare_pages}");
+        // Spare tail is zero-filled (invalid descriptors).
+        assert!(bytes[0x6000..].iter().all(|&b| b == 0));
+        // Whole table region stays inside the kernel hole's first 2 MiB block,
+        // so it remains kernel-only (EL1) after the size bump.
+        let region_end_off = (LINUX_PAGE_TABLES_BASE - LINUX_KERNEL_REGION_BASE)
+            + LINUX_PAGE_TABLES_SIZE;
+        assert!(region_end_off <= 0x200000, "page tables overflow kernel block");
     }
 
     #[test]
