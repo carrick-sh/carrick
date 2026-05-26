@@ -96,6 +96,8 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             debug_state_path,
             raw,
             fs,
+            volume,
+            workdir,
             args,
         } => {
             let mut dispatcher = if rootfs_layers.is_empty() {
@@ -107,6 +109,28 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 )
             };
             install_fs_backend(&mut dispatcher, fs)?;
+            // Bind-mount host paths into the guest. `--fs host` is a sandboxed
+            // scratch (NOT the real host FS), so this is the only way to expose a
+            // host directory — e.g. a conformance test's `testdata/`. `HOST:GUEST[:ro]`.
+            for v in &volume {
+                let parts: Vec<&str> = v.splitn(3, ':').collect();
+                if parts.len() < 2 {
+                    anyhow::bail!("invalid -v/--volume {v:?}: expected HOST:GUEST[:ro]");
+                }
+                let (host_src, guest_dst) = (parts[0], parts[1]);
+                let readonly = parts.get(2).is_some_and(|m| *m == "ro");
+                let bind = carrick_runtime::vfs::BindVfs::new(
+                    guest_dst,
+                    std::path::PathBuf::from(host_src),
+                    readonly,
+                );
+                dispatcher.register_mount(std::path::PathBuf::from(guest_dst), Box::new(bind));
+            }
+            // Set the guest's initial CWD from -w (so a test's relative
+            // `testdata/...`/`../testdata/...` resolves against a bind-mounted dir).
+            if let Some(dir) = &workdir {
+                dispatcher.set_cwd(dir);
+            }
             if raw {
                 dispatcher.set_stream_stdio(true);
             }

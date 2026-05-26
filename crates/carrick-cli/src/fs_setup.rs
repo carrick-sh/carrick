@@ -17,7 +17,7 @@ use carrick_spec::FsBackendKind;
 pub(crate) fn install_fs_backend(
     dispatcher: &mut SyscallDispatcher,
     fs: Option<FsBackendKind>,
-) -> Result<()> {
+) -> Result<FsBackendKind> {
     let kind = fs.unwrap_or_else(default_fs_backend_kind);
     // Set once the host backend has materialised the COMPLETE rootfs onto
     // disk - after which the in-memory rootfs layer is redundant and gets
@@ -47,7 +47,7 @@ pub(crate) fn install_fs_backend(
                         let mut mem: Box<dyn FsBackend> = Box::new(MemoryBackend::new());
                         seed_guest_baseline(&mut *mem);
                         let _ = dispatcher.set_fs_backend(mem);
-                        return Ok(());
+                        return Ok(FsBackendKind::Memory);
                     }
                     host_seeded = true;
                 }
@@ -69,7 +69,7 @@ pub(crate) fn install_fs_backend(
     if host_seeded {
         dispatcher.drop_rootfs_layer();
     }
-    Ok(())
+    Ok(kind)
 }
 
 /// Pre-populate the writable overlay with a small Linux baseline plus
