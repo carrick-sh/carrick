@@ -227,6 +227,17 @@ fn host_to_linux_af(host_family: u16) -> u16 {
     }
 }
 
+/// The host socket type to actually create for a guest `(family, base_type)`.
+/// macOS has no AF_UNIX `SOCK_SEQPACKET`, so back it with a `SOCK_STREAM` socket;
+/// carrick frames messages on top to recover SEQPACKET boundary semantics (see
+/// `OpenDescription::HostSocket.seqpacket`). Everything else maps 1:1.
+pub(super) fn host_socktype_backing(family: i32, base_type: i32) -> i32 {
+    if family == LINUX_AF_UNIX && base_type == LINUX_SOCK_SEQPACKET {
+        return libc::SOCK_STREAM;
+    }
+    linux_to_host_socktype(base_type)
+}
+
 pub(super) fn linux_to_host_socktype(t: i32) -> i32 {
     // Linux and macOS agree on the numeric values for the BSD socket
     // types we care about (1=STREAM, 2=DGRAM, 3=RAW, 5=SEQPACKET).
