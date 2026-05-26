@@ -105,6 +105,35 @@ provision() {
   rm -f "$cache/run/testdata.tar"
   docker run --rm --platform linux/arm64 golang:1.24-bookworm cat /etc/services \
     > "$cache/etc/services" 2>/dev/null || true
+  # IANA tz database for the `time` package. The test needs it in TWO places:
+  #
+  #  1. lib/time/zoneinfo.zip in the mirrored GOROOT tree. `time`'s init() calls
+  #     ForceUSPacificForTesting() -> initTestingZone(), which "for hermeticity"
+  #     deliberately ignores the system zoneinfo AND $ZONEINFO and loads only
+  #     `../../lib/time/zoneinfo.zip` relative to its CWD (GOROOT/src/time). With
+  #     CWD=/run/src/time that resolves to /run/lib/time/zoneinfo.zip. Absent it,
+  #     init() panics and the WHOLE binary aborts before any test runs (0/0).
+  #  2. /usr/share/zoneinfo (bind-mounted at run time). The non-hermetic tests
+  #     call time.LoadLocation("Asia/Jerusalem", ...) which uses the platform
+  #     zoneinfo sources; without it those tests fail. Mounting it lets them pass
+  #     on both sides (richer coverage) AND exercises carrick's zoneinfo reads.
+  #
+  # debian:stable-slim (oracle) and carrick's --fs host scratch ship neither, so
+  # we mirror both from the golang build image.
+  if [ ! -f "$cache/run/lib/time/zoneinfo.zip" ]; then
+    echo "provisioning lib/time/zoneinfo.zip into the GOROOT tree"
+    mkdir -p "$cache/run/lib/time"
+    docker run --rm --platform linux/arm64 golang:1.24-bookworm \
+      cat /usr/local/go/lib/time/zoneinfo.zip > "$cache/run/lib/time/zoneinfo.zip" 2>/dev/null || true
+  fi
+  if [ ! -d "$cache/zoneinfo/America" ]; then
+    echo "provisioning /usr/share/zoneinfo from golang image"
+    mkdir -p "$cache/zoneinfo"
+    docker run --rm --platform linux/arm64 golang:1.24-bookworm \
+      tar cf - -C /usr/share/zoneinfo . 2>/dev/null > "$cache/zoneinfo.tar"
+    tar xf "$cache/zoneinfo.tar" -C "$cache/zoneinfo" 2>/dev/null || true
+    rm -f "$cache/zoneinfo.tar"
+  fi
   # A CWD must exist for every package even when it ships no testdata.
   for p in "${pkgs[@]}"; do mkdir -p "$cache/run/src/$p"; done
 }
@@ -129,7 +158,8 @@ for p in "${pkgs[@]}"; do
   # `--fs host` is a sandboxed scratch (NOT the real host FS), so the testdata
   # must be bind-mounted in. See provision().
   docker run --rm --platform linux/arm64 -v "$cache/bin":/b -v "$cache/run":/run \
-    -v "$cache/etc/services":/etc/services:ro -w "/run/src/$p" debian:stable-slim \
+    -v "$cache/etc/services":/etc/services:ro -v "$cache/zoneinfo":/usr/share/zoneinfo:ro \
+    -w "/run/src/$p" debian:stable-slim \
     "/b/$n.test" -test.run 'Test' -test.skip "$SKIP" -test.short -test.v \
     -test.timeout "${TEST_TIMEOUT}s" > "$cache/logs/$n.docker" 2>&1
 
@@ -144,12 +174,12 @@ for p in "${pkgs[@]}"; do
   # and the NOPASSWD rule lacks SETENV, so `sudo -n VAR=val carrick` is rejected.
   if [ -n "${CARRICK_SUDO:-}" ]; then
     sudo -n "$carrick" run-elf --raw --fs host --forward-env CARRICK_EXPOSED_CPUS=10 \
-      -v "$cache/run:/run" -w "/run/src/$p" \
+      -v "$cache/run:/run" -v "$cache/zoneinfo:/usr/share/zoneinfo:ro" -w "/run/src/$p" \
       "$bin" -- -test.run 'Test' -test.skip "$SKIP" -test.short -test.v \
       -test.timeout "${TEST_TIMEOUT}s" > "$cache/logs/$n.carrick" 2>&1
   else
     CARRICK_EXPOSED_CPUS=10 timeout -s KILL "$RUN_TIMEOUT" "$carrick" run-elf --raw --fs host \
-      -v "$cache/run:/run" -w "/run/src/$p" \
+      -v "$cache/run:/run" -v "$cache/zoneinfo:/usr/share/zoneinfo:ro" -w "/run/src/$p" \
       "$bin" -- -test.run 'Test' -test.skip "$SKIP" -test.short -test.v \
       -test.timeout "${TEST_TIMEOUT}s" > "$cache/logs/$n.carrick" 2>&1
   fi
