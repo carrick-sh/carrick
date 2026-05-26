@@ -428,9 +428,17 @@ pub const LINUX_NLM_F_MULTI: u16 = 0x2;
 
 // Interface flags / types we report for `lo`.
 pub const LINUX_IFF_UP: u32 = 0x1;
+pub const LINUX_IFF_BROADCAST: u32 = 0x2;
 pub const LINUX_IFF_LOOPBACK: u32 = 0x8;
+pub const LINUX_IFF_POINTOPOINT: u32 = 0x10;
 pub const LINUX_IFF_RUNNING: u32 = 0x40;
+pub const LINUX_IFF_MULTICAST: u32 = 0x1000;
+pub const LINUX_ARPHRD_ETHER: u16 = 1;
 pub const LINUX_ARPHRD_LOOPBACK: u16 = 772;
+// rtnetlink address scopes (rtnetlink.h rt_scope_t).
+pub const LINUX_RT_SCOPE_UNIVERSE: u8 = 0;
+pub const LINUX_RT_SCOPE_LINK: u8 = 253;
+pub const LINUX_RT_SCOPE_HOST: u8 = 254;
 
 // rtattr types.
 pub const LINUX_IFLA_ADDRESS: u16 = 1;
