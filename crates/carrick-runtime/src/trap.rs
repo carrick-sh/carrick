@@ -520,6 +520,13 @@ struct HvfInner {
     /// Thread siblings share this metadata so syscall-path memory access checks
     /// observe `mprotect(PROT_NONE)` changes made by any guest thread.
     protections: std::sync::Arc<MemoryProtections>,
+    /// Lazily-built editor over the EL1 stage-1 page-table image, used to give
+    /// `mprotect`/`PROT_NONE`/`munmap` guest-visible semantics. Built from the
+    /// page-table region's host backing on first edit; reset to `None` on
+    /// fork/execve (fresh tables). NOTE: per-engine for now — concurrent
+    /// sibling edits need a shared manager (Phase D follow-up); callers must
+    /// quiesce siblings around an edit until then.
+    page_tables: Option<crate::page_table::PageTableManager>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -961,6 +968,7 @@ impl HvfTrapEngine {
                 last_exit_class: 0,
                 is_forked_child: false,
                 protections: std::sync::Arc::new(MemoryProtections::default()),
+                page_tables: None,
             }),
         })
     }
@@ -1195,6 +1203,157 @@ impl HvfInner {
 
     fn vcpu_kick_handle(&self) -> crate::vcpu_kick::VcpuKickHandle {
         crate::vcpu_kick::VcpuKickHandle::new(self.vcpu.get_handle())
+    }
+
+    /// Run the EL1 stage-1 maintenance trampoline on THIS vCPU to flush the
+    /// stale stage-1 TLB after the host edited page descriptors (the only way
+    /// to make a descriptor change guest-observable; arm64 public HVF has no
+    /// stage-2 TLBI). The caller must have quiesced sibling vCPUs. The
+    /// trampoline touches no GPRs/SP and its closing `hvc #1` traps EL1→EL2, so
+    /// EL1 register state is intact; we still save/restore the interrupted
+    /// EL1-vector PC/CPSR/ELR_EL1/SPSR_EL1 defensively so the in-flight syscall
+    /// resumes exactly as before.
+    fn run_el1_maintenance(&mut self) -> Result<(), TrapError> {
+        use applevisor::prelude::*;
+        // M[3:0]=0b0101 EL1h (SP_EL1) + DAIF masked; same value boot uses to
+        // run the EL0-entry trampoline at EL1.
+        const AARCH64_PSTATE_EL1H_DAIF_MASKED: u64 = 0x3c5;
+
+        let saved_pc = self.vcpu.get_reg(Reg::PC).map_err(hvf_error)?;
+        let saved_cpsr = self.vcpu.get_reg(Reg::CPSR).map_err(hvf_error)?;
+        let saved_elr = self.vcpu.get_sys_reg(SysReg::ELR_EL1).map_err(hvf_error)?;
+        let saved_spsr = self.vcpu.get_sys_reg(SysReg::SPSR_EL1).map_err(hvf_error)?;
+
+        self.vcpu
+            .set_reg(Reg::PC, crate::memory::LINUX_EL1_MAINT_BASE)
+            .map_err(hvf_error)?;
+        self.vcpu
+            .set_reg(Reg::CPSR, AARCH64_PSTATE_EL1H_DAIF_MASKED)
+            .map_err(hvf_error)?;
+
+        let result = loop {
+            self.vcpu.run().map_err(hvf_error)?;
+            let exit = self.vcpu.get_exit_info();
+            match exit.reason {
+                // A cross-thread kick landed mid-flush; the trampoline is tiny
+                // and idempotent, so just resume it to completion.
+                ExitReason::CANCELED => continue,
+                ExitReason::EXCEPTION => {
+                    if is_aarch64_hvc_maintenance(exit.exception.syndrome) {
+                        break Ok(());
+                    }
+                    // Per spec: an ambiguous exit here means we cannot trust
+                    // guest memory visibility — surface it rather than resume.
+                    break Err(TrapError::UnexpectedException {
+                        syndrome: exit.exception.syndrome,
+                        virtual_address: exit.exception.virtual_address,
+                        physical_address: exit.exception.physical_address,
+                    });
+                }
+                _ => {
+                    break Err(TrapError::UnexpectedExit {
+                        reason: format!("{:?} during EL1 maintenance", exit.reason),
+                    });
+                }
+            }
+        };
+
+        // Restore the interrupted EL1-vector state regardless of outcome.
+        self.vcpu.set_reg(Reg::PC, saved_pc).map_err(hvf_error)?;
+        self.vcpu
+            .set_reg(Reg::CPSR, saved_cpsr)
+            .map_err(hvf_error)?;
+        self.vcpu
+            .set_sys_reg(SysReg::ELR_EL1, saved_elr)
+            .map_err(hvf_error)?;
+        self.vcpu
+            .set_sys_reg(SysReg::SPSR_EL1, saved_spsr)
+            .map_err(hvf_error)?;
+        result
+    }
+
+    /// Host VA of the page-table region's backing (offset 0 == base).
+    fn pt_host_ptr(&self) -> Option<*mut u8> {
+        self.mapping_for_range(crate::memory::LINUX_PAGE_TABLES_BASE, 8)
+            .map(|m| m.host_addr)
+    }
+
+    /// Build the page-table manager from the live host backing on first use.
+    fn ensure_pt_manager(&mut self) -> Result<(), MemoryError> {
+        if self.page_tables.is_some() {
+            return Ok(());
+        }
+        let host = self
+            .pt_host_ptr()
+            .ok_or_else(|| MemoryError::HostMap("page-table region not mapped".to_string()))?;
+        let size = crate::memory::LINUX_PAGE_TABLES_SIZE as usize;
+        let mut bytes = vec![0u8; size];
+        unsafe { std::ptr::copy_nonoverlapping(host, bytes.as_mut_ptr(), size) };
+        self.page_tables = Some(crate::page_table::PageTableManager::new(
+            bytes,
+            crate::memory::LINUX_PAGE_TABLES_BASE,
+        ));
+        Ok(())
+    }
+
+    /// Copy the manager's edited image back to the host page-table backing.
+    fn sync_pt_to_host(&self) -> Result<(), MemoryError> {
+        let host = self
+            .pt_host_ptr()
+            .ok_or_else(|| MemoryError::HostMap("page-table region not mapped".to_string()))?;
+        let mgr = self
+            .page_tables
+            .as_ref()
+            .ok_or_else(|| MemoryError::HostMap("page-table manager not built".to_string()))?;
+        let bytes = mgr.bytes();
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), host, bytes.len()) };
+        Ok(())
+    }
+
+    /// Edit stage-1 descriptors, sync to the host backing, then flush the
+    /// stage-1 TLB via the EL1 maintenance trampoline so the guest observes it.
+    fn pt_edit_and_flush(
+        &mut self,
+        edit: impl FnOnce(
+            &mut crate::page_table::PageTableManager,
+        ) -> Result<(), crate::page_table::PageTableError>,
+    ) -> Result<(), MemoryError> {
+        use crate::page_table::PageTableError;
+        self.ensure_pt_manager()?;
+        let mgr = self
+            .page_tables
+            .as_mut()
+            .ok_or_else(|| MemoryError::HostMap("page-table manager not built".to_string()))?;
+        edit(mgr).map_err(|e| match e {
+            PageTableError::OutOfTables => {
+                MemoryError::HostMap("stage-1 page-table pool exhausted".to_string())
+            }
+            PageTableError::BadAddress => MemoryError::OutOfBounds {
+                address: 0,
+                length: 0,
+            },
+        })?;
+        self.sync_pt_to_host()?;
+        self.run_el1_maintenance()
+            .map_err(|e| MemoryError::HostMap(format!("stage-1 TLBI failed: {e}")))?;
+        Ok(())
+    }
+
+    fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
+        use crate::linux_abi::{LINUX_PROT_READ, LINUX_PROT_WRITE};
+        self.pt_edit_and_flush(|mgr| {
+            if prot & LINUX_PROT_WRITE != 0 {
+                mgr.set_rw(address, len)
+            } else if prot & LINUX_PROT_READ != 0 {
+                mgr.set_readonly(address, len)
+            } else {
+                mgr.set_prot_none(address, len)
+            }
+        })
+    }
+
+    fn unmap_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+        self.pt_edit_and_flush(|mgr| mgr.invalidate(address, len))
     }
 
     fn run_until_syscall(&mut self) -> Result<Option<Aarch64SyscallFrame>, TrapError> {
@@ -2124,6 +2283,7 @@ impl HvfInner {
             last_exit_class: snapshot.last_exit_class,
             is_forked_child: pid == 0,
             protections: inherited_protections,
+            page_tables: None,
         };
         replace_destroyed_hvf_inner(self, new_inner);
 
@@ -2234,6 +2394,7 @@ impl HvfInner {
             last_exit_class: snapshot.last_exit_class,
             is_forked_child: false,
             protections,
+            page_tables: None,
         };
 
         for mapping in mappings {
@@ -2365,6 +2526,7 @@ impl HvfInner {
             // execve replaces the address space; any prior PROT_NONE ranges are
             // gone. The new image starts with none until it mmaps them.
             protections: std::sync::Arc::new(MemoryProtections::default()),
+            page_tables: None,
         };
         replace_destroyed_hvf_inner(self, new_inner);
 
@@ -2515,6 +2677,14 @@ impl GuestMemory for HvfTrapEngine {
         self.inner.set_no_access(address, len, no_access);
     }
 
+    fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
+        self.inner.protect_range(address, len, prot)
+    }
+
+    fn unmap_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+        self.inner.unmap_range(address, len)
+    }
+
     fn shared_futex_host_addr(&self, address: u64) -> Option<usize> {
         self.inner.shared_futex_host_addr(address)
     }
@@ -2530,6 +2700,14 @@ pub fn is_aarch64_svc_exception(syndrome: u64) -> bool {
 
 pub fn is_aarch64_hvc_exception(syndrome: u64) -> bool {
     aarch64_exception_class(syndrome) == AARCH64_HVC_EXCEPTION_CLASS
+}
+
+/// True for the EL1 stage-1 maintenance trampoline's `hvc #1` completion
+/// marker. The HVC immediate is the low 16 bits of the syndrome ISS. Distinct
+/// from the `hvc #0` syscall forward so the maintenance run loop and the
+/// syscall trap path never confuse the two.
+pub fn is_aarch64_hvc_maintenance(syndrome: u64) -> bool {
+    is_aarch64_hvc_exception(syndrome) && (syndrome & 0xffff) == 1
 }
 
 /// True for syscall-shaped traps that the host can dispatch identically:
