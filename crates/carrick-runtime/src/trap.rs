@@ -1313,15 +1313,25 @@ impl HvfInner {
                 ));
             }
             let mgr = guard.as_mut().expect("just built");
-            // Freed sub-tables are only safe to repurpose when we're single-vCPU
-            // (no sibling can hold a stale walk-cache reference). Tell the
-            // manager the current live-vCPU count so it quarantines vs reuses.
-            // NOTE: PMR pauses siblings during the EDIT, but a freed page reused
-            // for a different structural role still races a sibling's cached
-            // walk across PMR boundaries — proven: re-enabling coalesce
-            // multi-vCPU produced an alloc_table use-after-free (a live L2 table
-            // reused as an L3 split target, corrupting it). So the gate stays.
-            mgr.set_multi_vcpu(VCPU_LIVE.load(std::sync::atomic::Ordering::SeqCst) > 1);
+            // Coalescing reclaims spare sub-tables into the 58-page pool; without
+            // it, sustained discontiguous mmap/munmap churn leaks them until
+            // OutOfTables → ENOMEM (PROVEN: the pt-pool watermark climbed to
+            // 55/58, free=0, then Go OOM'd in TestPageAllocAlloc). Coalesce is a
+            // break-before-make table↔block flip plus a page free — unsafe only
+            // if a sibling holds a stale walk-cache reference to the freed page.
+            // PMR removes exactly that hazard: every multi-vCPU table edit pauses
+            // ALL siblings out of guest and `tlbi vmalle1is`-broadcasts before
+            // resuming them, so none holds a stale walk across the free OR a
+            // later reuse. So coalesce is safe iff the edit is EXCLUSIVE —
+            // single-vCPU, or PMR-protected (the pt pause is held right now). The
+            // flag is historically named `multi_vcpu` but really means "unsafe to
+            // coalesce". (The earlier note blaming coalesce for an alloc_table
+            // use-after-free was a misattribution: that was the fork-manager
+            // reset bug, present coalesce on AND off, since fixed.)
+            let live_multi = VCPU_LIVE.load(std::sync::atomic::Ordering::SeqCst) > 1;
+            let unsafe_to_coalesce =
+                live_multi && !crate::fork_quiesce::pt_barrier().is_quiescing();
+            mgr.set_multi_vcpu(unsafe_to_coalesce);
             let changed = edit(mgr).map_err(|e| match e {
                 PageTableError::OutOfTables => {
                     MemoryError::HostMap("stage-1 page-table pool exhausted".to_string())
