@@ -17,7 +17,6 @@ use crate::linux_abi::{
     LINUX_AT_PHDR, LINUX_AT_PHENT, LINUX_AT_PHNUM, LINUX_AT_PLATFORM, LINUX_AT_RANDOM,
     LINUX_AT_SECURE, LINUX_AT_UID, LINUX_PAGE_SIZE, LinuxAuxvEntry,
 };
-use crate::rootfs::{RootFs, RootFsError};
 use serde::Serialize;
 use thiserror::Error;
 use zerocopy::IntoBytes;
@@ -241,8 +240,6 @@ pub enum AddressSpaceError {
     Elf(#[from] ElfInspectError),
     #[error("failed to read ELF bytes: {0}")]
     Io(#[from] std::io::Error),
-    #[error("failed to read rootfs-backed ELF dependency: {0}")]
-    RootFs(#[from] RootFsError),
     #[error(
         "ELF segment at 0x{virtual_address:x} has file size {file_size} greater than memory size {memory_size}"
     )]
@@ -285,15 +282,6 @@ impl AddressSpace {
     pub fn load_elf_bytes(bytes: &[u8]) -> Result<Self, AddressSpaceError> {
         let plan = plan_elf_load_bytes(bytes)?;
         Self::load_elf_segments(bytes, plan)
-    }
-
-    pub fn load_elf_from_rootfs(
-        path: impl AsRef<Path>,
-        rootfs: &RootFs,
-    ) -> Result<Self, AddressSpaceError> {
-        let file = rootfs.read(path)?;
-        let plan = plan_elf_load_bytes(&file)?;
-        Self::load_elf_segments_with_interpreter(&file, plan, &|p| rootfs.read(p).ok())
     }
 
     /// Load a main-binary image from already-read bytes, resolving its
