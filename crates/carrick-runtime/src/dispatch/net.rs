@@ -903,16 +903,46 @@ impl SyscallDispatcher {
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
                 LINUX_EPOLL_CTL_DEL => {
-                    if interest.remove(&fd).is_some() {
-                        if let Some(host_fd) = host_fd {
-                            epoll_kq_delete(kqueue, host_fd);
+                    let Some(removed) = interest.remove(&fd) else {
+                        return Ok(LINUX_ENOENT.into());
+                    };
+                    if let Some(host_fd) = host_fd {
+                        // Other guest fds in THIS epoll instance can be dups of the
+                        // same socket/pipe, all sharing ONE host fd. The kqueue
+                        // filter is keyed by host fd, so an unconditional EV_DELETE
+                        // here would deafen those survivors — but Linux epoll
+                        // interest is per-fd, so they must keep getting readiness.
+                        // (This is the Go `net` TestFileListener hang: File() +
+                        // FileListener dup the listener, then the intermediate dup
+                        // is DEL'd, which used to rip out the shared filter.)
+                        // Re-bind the filter to a surviving fd with the UNION of all
+                        // survivors' masks, and only drop filter classes no survivor
+                        // still wants. With no survivor, delete as before.
+                        let mut survivor: Option<i32> = None;
+                        let mut union_events: u32 = 0;
+                        for (&other, slot) in interest.iter() {
+                            if this.host_fd_for_poll(other) == Some(host_fd) {
+                                survivor.get_or_insert(other);
+                                union_events |= slot.event.events;
+                            }
                         }
-                        clear_pending_epoll_ready(pending_ready, fd);
-                        crate::probes::epoll_ctl(epfd, operation, fd, 0, 0, 0);
-                        Ok(DispatchOutcome::Returned { value: 0 })
-                    } else {
-                        Ok(LINUX_ENOENT.into())
+                        match survivor {
+                            Some(sfd) => {
+                                let _ = kqueue
+                                    .apply(&epoll_kq_add_changes(host_fd, sfd, union_events));
+                                epoll_kq_delete_removed_filters(
+                                    kqueue,
+                                    host_fd,
+                                    removed.event.events,
+                                    union_events,
+                                );
+                            }
+                            None => epoll_kq_delete(kqueue, host_fd),
+                        }
                     }
+                    clear_pending_epoll_ready(pending_ready, fd);
+                    crate::probes::epoll_ctl(epfd, operation, fd, 0, 0, 0);
+                    Ok(DispatchOutcome::Returned { value: 0 })
                 }
                 _ => Ok(LINUX_EINVAL.into()),
             }
@@ -1028,11 +1058,35 @@ impl SyscallDispatcher {
                             continue;
                         }
                         let guest_fd = ev.udata_i32();
-                        let Some((requested, data)) = interests
-                            .iter()
-                            .find(|(fd, _)| *fd == guest_fd)
-                            .map(|(_, slot)| (slot.event.events, slot.event.data))
-                            .or_else(|| {
+                        // The kqueue filter is keyed by HOST fd, but several guest
+                        // fds can be dups of one socket/pipe sharing that host fd,
+                        // and Linux wakes EACH fd's pollDesc independently. The
+                        // event carries only one `udata`, so fan the readiness out
+                        // to every interested guest fd that shares this host fd —
+                        // otherwise a dup the app is actually waiting on (e.g. the
+                        // FileListener while the original listener is also
+                        // registered) never wakes. (Go `net` TestFileListener.)
+                        let event_host_fd = this.host_fd_for_poll(guest_fd);
+                        let mut reported_any = false;
+                        for (ifd, slot) in interests.iter() {
+                            let shares = *ifd == guest_fd
+                                || (event_host_fd.is_some()
+                                    && this.host_fd_for_poll(*ifd) == event_host_fd);
+                            if !shares {
+                                continue;
+                            }
+                            reported_any = true;
+                            let masked =
+                                bits & (slot.event.events | LINUX_EPOLLHUP | LINUX_EPOLLERR);
+                            if masked != 0 {
+                                let entry = acc.entry(*ifd).or_insert((0, slot.event.data));
+                                entry.0 |= masked;
+                            }
+                        }
+                        if !reported_any {
+                            // Concurrent-ADD race: the udata fd isn't in this
+                            // snapshot yet. Fall back to the live map for it alone.
+                            let live = {
                                 let open = open_file.description.read();
                                 match &*open {
                                     OpenDescription::Epoll { interest, .. } => interest
@@ -1040,14 +1094,13 @@ impl SyscallDispatcher {
                                         .map(|slot| (slot.event.events, slot.event.data)),
                                     _ => None,
                                 }
-                            })
-                        else {
-                            continue;
-                        };
-                        let masked = bits & (requested | LINUX_EPOLLHUP | LINUX_EPOLLERR);
-                        if masked != 0 {
-                            let entry = acc.entry(guest_fd).or_insert((0, data));
-                            entry.0 |= masked;
+                            };
+                            if let Some((requested, data)) = live {
+                                let masked = bits & (requested | LINUX_EPOLLHUP | LINUX_EPOLLERR);
+                                if masked != 0 {
+                                    acc.entry(guest_fd).or_insert((0, data)).0 |= masked;
+                                }
+                            }
                         }
                     }
                 }
