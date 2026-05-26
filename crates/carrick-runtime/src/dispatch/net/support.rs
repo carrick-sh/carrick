@@ -5,6 +5,10 @@ use std::collections::VecDeque;
 use zerocopy::{FromBytes, IntoBytes};
 
 use super::super::*;
+use crate::linux_abi::{
+    LINUX_ARPHRD_ETHER, LINUX_IFF_BROADCAST, LINUX_IFF_MULTICAST, LINUX_IFF_POINTOPOINT,
+    LINUX_RT_SCOPE_HOST, LINUX_RT_SCOPE_LINK, LINUX_RT_SCOPE_UNIVERSE,
+};
 
 pub(super) fn read_epoll_event(
     memory: &impl GuestMemory,
@@ -319,6 +323,189 @@ fn push_nlmsg_done(out: &mut Vec<u8>, seq: u32, pid: u32) {
     push_nlmsg(out, LINUX_NLMSG_DONE, seq, pid, &0i32.to_ne_bytes());
 }
 
+/// One host network interface, in Linux-shaped terms.
+struct HostIface {
+    name: String,
+    index: u32,
+    arphrd: u16,
+    linux_flags: u32,
+    hw_addr: Vec<u8>,
+}
+
+/// One host interface address (IPv4 or IPv6), in Linux-shaped terms.
+struct HostAddr {
+    index: u32,
+    name: String,
+    family: u8, // LINUX_AF_INET / LINUX_AF_INET6
+    addr: Vec<u8>,
+    prefixlen: u8,
+    scope: u8,
+}
+
+/// Count the leading set bits of a netmask's raw address bytes (the CIDR
+/// prefix length). macOS gives the mask as a sockaddr; we count across its
+/// address octets.
+fn prefix_len_from_mask(bytes: &[u8]) -> u8 {
+    let mut n = 0u8;
+    for &b in bytes {
+        n += b.count_ones() as u8;
+    }
+    n
+}
+
+/// macOS interface flags -> Linux IFF_* flags.
+fn linux_iff_flags(mac: u32) -> u32 {
+    let mut out = 0;
+    if mac & (libc::IFF_UP as u32) != 0 {
+        out |= LINUX_IFF_UP;
+    }
+    if mac & (libc::IFF_BROADCAST as u32) != 0 {
+        out |= LINUX_IFF_BROADCAST;
+    }
+    if mac & (libc::IFF_LOOPBACK as u32) != 0 {
+        out |= LINUX_IFF_LOOPBACK;
+    }
+    if mac & (libc::IFF_POINTOPOINT as u32) != 0 {
+        out |= LINUX_IFF_POINTOPOINT;
+    }
+    if mac & (libc::IFF_RUNNING as u32) != 0 {
+        out |= LINUX_IFF_RUNNING;
+    }
+    if mac & (libc::IFF_MULTICAST as u32) != 0 {
+        out |= LINUX_IFF_MULTICAST;
+    }
+    out
+}
+
+/// Enumerate the host's interfaces + addresses via macOS `getifaddrs(3)` and
+/// translate them to Linux-shaped records, so the synthetic rtnetlink reports
+/// the REAL interfaces (all of them, IPv4 + IPv6) rather than a fixed loopback.
+/// Empty on failure (caller falls back to a synthetic loopback).
+fn host_interfaces() -> (Vec<HostIface>, Vec<HostAddr>) {
+    let mut ifaces: Vec<HostIface> = Vec::new();
+    let mut addrs: Vec<HostAddr> = Vec::new();
+    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs allocates a list we free via freeifaddrs below.
+    if unsafe { libc::getifaddrs(&mut head) } != 0 || head.is_null() {
+        return (ifaces, addrs);
+    }
+    let mut cur = head;
+    while !cur.is_null() {
+        // SAFETY: `cur` is a valid node for the duration of this iteration.
+        let ifa = unsafe { &*cur };
+        cur = ifa.ifa_next;
+        if ifa.ifa_name.is_null() {
+            continue;
+        }
+        // SAFETY: ifa_name is a NUL-terminated C string owned by the list.
+        let name = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }
+            .to_string_lossy()
+            .into_owned();
+        // SAFETY: if_nametoindex on a known name.
+        let index = {
+            let c = std::ffi::CString::new(name.clone()).unwrap_or_default();
+            unsafe { libc::if_nametoindex(c.as_ptr()) }
+        };
+        let mac_flags = ifa.ifa_flags;
+        let is_loopback = mac_flags & (libc::IFF_LOOPBACK as u32) != 0;
+        if ifa.ifa_addr.is_null() {
+            continue;
+        }
+        // SAFETY: ifa_addr points at a sockaddr whose sa_family selects the type.
+        let family = unsafe { (*ifa.ifa_addr).sa_family } as i32;
+        match family {
+            libc::AF_LINK => {
+                // One interface record per AF_LINK entry (carries the index + hw).
+                // SAFETY: AF_LINK sockaddr is a sockaddr_dl.
+                let dl = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_dl) };
+                let nlen = dl.sdl_nlen as usize;
+                let alen = dl.sdl_alen as usize;
+                let mut hw = Vec::new();
+                if alen > 0 && nlen + alen <= dl.sdl_data.len() {
+                    hw = dl.sdl_data[nlen..nlen + alen]
+                        .iter()
+                        .map(|&c| c as u8)
+                        .collect();
+                }
+                let idx = if index != 0 { index } else { dl.sdl_index as u32 };
+                ifaces.push(HostIface {
+                    name,
+                    index: idx,
+                    arphrd: if is_loopback {
+                        LINUX_ARPHRD_LOOPBACK
+                    } else {
+                        LINUX_ARPHRD_ETHER
+                    },
+                    linux_flags: linux_iff_flags(mac_flags),
+                    hw_addr: hw,
+                });
+            }
+            libc::AF_INET => {
+                // SAFETY: AF_INET sockaddr is a sockaddr_in.
+                let sin = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in) };
+                let addr = sin.sin_addr.s_addr.to_ne_bytes().to_vec();
+                let prefixlen = if ifa.ifa_netmask.is_null() {
+                    32
+                } else {
+                    // SAFETY: netmask sockaddr_in.
+                    let m = unsafe { &*(ifa.ifa_netmask as *const libc::sockaddr_in) };
+                    prefix_len_from_mask(&m.sin_addr.s_addr.to_ne_bytes())
+                };
+                addrs.push(HostAddr {
+                    index,
+                    name,
+                    family: LINUX_AF_INET as u8,
+                    addr,
+                    prefixlen,
+                    scope: if is_loopback {
+                        LINUX_RT_SCOPE_HOST
+                    } else {
+                        LINUX_RT_SCOPE_UNIVERSE
+                    },
+                });
+            }
+            libc::AF_INET6 => {
+                // SAFETY: AF_INET6 sockaddr is a sockaddr_in6.
+                let sin6 = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in6) };
+                let mut a = sin6.sin6_addr.s6_addr;
+                // Link-local (fe80::/10): macOS embeds the scope id in bytes 2-3.
+                // Linux carries scope separately, so zero them for the guest view.
+                let link_local = a[0] == 0xfe && (a[1] & 0xc0) == 0x80;
+                if link_local {
+                    a[2] = 0;
+                    a[3] = 0;
+                }
+                let prefixlen = if ifa.ifa_netmask.is_null() {
+                    128
+                } else {
+                    // SAFETY: netmask sockaddr_in6.
+                    let m = unsafe { &*(ifa.ifa_netmask as *const libc::sockaddr_in6) };
+                    prefix_len_from_mask(&m.sin6_addr.s6_addr)
+                };
+                let scope = if is_loopback {
+                    LINUX_RT_SCOPE_HOST
+                } else if link_local {
+                    LINUX_RT_SCOPE_LINK
+                } else {
+                    LINUX_RT_SCOPE_UNIVERSE
+                };
+                addrs.push(HostAddr {
+                    index,
+                    name,
+                    family: LINUX_AF_INET6 as u8,
+                    addr: a.to_vec(),
+                    prefixlen,
+                    scope,
+                });
+            }
+            _ => {}
+        }
+    }
+    // SAFETY: free the list getifaddrs allocated.
+    unsafe { libc::freeifaddrs(head) };
+    (ifaces, addrs)
+}
+
 /// Build the synthetic rtnetlink reply for a guest's request. We inspect
 /// the leading nlmsghdr's `nlmsg_type`:
 ///   - RTM_GETLINK  -> one RTM_NEWLINK for `lo`, then NLMSG_DONE
@@ -338,41 +525,71 @@ pub(super) fn build_netlink_reply(request: &[u8], pid: u32) -> Vec<u8> {
         (0, 0)
     };
 
+    // Enumerate the real host interfaces/addresses. Fall back to a synthetic
+    // loopback if getifaddrs yields nothing (keeps `lo` always present).
+    let (mut ifaces, mut addrs) = host_interfaces();
+    if ifaces.is_empty() {
+        ifaces.push(HostIface {
+            name: "lo".to_owned(),
+            index: 1,
+            arphrd: LINUX_ARPHRD_LOOPBACK,
+            linux_flags: LINUX_IFF_UP | LINUX_IFF_LOOPBACK | LINUX_IFF_RUNNING,
+            hw_addr: vec![0u8; 6],
+        });
+    }
+    if addrs.is_empty() {
+        addrs.push(HostAddr {
+            index: 1,
+            name: "lo".to_owned(),
+            family: LINUX_AF_INET as u8,
+            addr: vec![127, 0, 0, 1],
+            prefixlen: 8,
+            scope: LINUX_RT_SCOPE_HOST,
+        });
+    }
+
     let mut out = Vec::new();
     match req_type {
         LINUX_RTM_GETLINK => {
-            let mut payload = Vec::new();
-            let ifi = LinuxIfInfoMsg {
-                ifi_family: 0, // AF_UNSPEC
-                ifi_pad: 0,
-                ifi_type: LINUX_ARPHRD_LOOPBACK,
-                ifi_index: 1,
-                ifi_flags: LINUX_IFF_UP | LINUX_IFF_LOOPBACK | LINUX_IFF_RUNNING,
-                ifi_change: 0,
-            };
-            payload.extend_from_slice(ifi.as_bytes());
-            // IFLA_IFNAME is a NUL-terminated string.
-            push_rtattr(&mut payload, LINUX_IFLA_IFNAME, b"lo\0");
-            // IFLA_ADDRESS: loopback hardware address (6 zero bytes).
-            push_rtattr(&mut payload, LINUX_IFLA_ADDRESS, &[0u8; 6]);
-            push_nlmsg(&mut out, LINUX_RTM_NEWLINK, seq, pid, &payload);
+            for iface in &ifaces {
+                let mut payload = Vec::new();
+                let ifi = LinuxIfInfoMsg {
+                    ifi_family: 0, // AF_UNSPEC
+                    ifi_pad: 0,
+                    ifi_type: iface.arphrd,
+                    ifi_index: iface.index as i32,
+                    ifi_flags: iface.linux_flags,
+                    ifi_change: 0,
+                };
+                payload.extend_from_slice(ifi.as_bytes());
+                let mut name = iface.name.clone().into_bytes();
+                name.push(0);
+                push_rtattr(&mut payload, LINUX_IFLA_IFNAME, &name);
+                if !iface.hw_addr.is_empty() {
+                    push_rtattr(&mut payload, LINUX_IFLA_ADDRESS, &iface.hw_addr);
+                }
+                push_nlmsg(&mut out, LINUX_RTM_NEWLINK, seq, pid, &payload);
+            }
             push_nlmsg_done(&mut out, seq, pid);
         }
         LINUX_RTM_GETADDR => {
-            let mut payload = Vec::new();
-            let ifa = LinuxIfAddrMsg {
-                ifa_family: LINUX_AF_INET as u8,
-                ifa_prefixlen: 8,
-                ifa_flags: 0,
-                ifa_scope: 254, // RT_SCOPE_HOST
-                ifa_index: 1,
-            };
-            payload.extend_from_slice(ifa.as_bytes());
-            let loopback = [127u8, 0, 0, 1];
-            push_rtattr(&mut payload, LINUX_IFA_ADDRESS, &loopback);
-            push_rtattr(&mut payload, LINUX_IFA_LOCAL, &loopback);
-            push_rtattr(&mut payload, LINUX_IFA_LABEL, b"lo\0");
-            push_nlmsg(&mut out, LINUX_RTM_NEWADDR, seq, pid, &payload);
+            for a in &addrs {
+                let mut payload = Vec::new();
+                let ifa = LinuxIfAddrMsg {
+                    ifa_family: a.family,
+                    ifa_prefixlen: a.prefixlen,
+                    ifa_flags: 0,
+                    ifa_scope: a.scope,
+                    ifa_index: a.index,
+                };
+                payload.extend_from_slice(ifa.as_bytes());
+                push_rtattr(&mut payload, LINUX_IFA_ADDRESS, &a.addr);
+                push_rtattr(&mut payload, LINUX_IFA_LOCAL, &a.addr);
+                let mut label = a.name.clone().into_bytes();
+                label.push(0);
+                push_rtattr(&mut payload, LINUX_IFA_LABEL, &label);
+                push_nlmsg(&mut out, LINUX_RTM_NEWADDR, seq, pid, &payload);
+            }
             push_nlmsg_done(&mut out, seq, pid);
         }
         _ => {
