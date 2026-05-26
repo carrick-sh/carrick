@@ -554,7 +554,14 @@ struct HvfMappedRegion {
     /// `None` (after `mem::forget` on the inherited inner) — the host
     /// pages stay alive via COW; the unmap would target the parent's
     /// HVF context which no longer exists in the child.
+    ///
+    /// `#[allow(dead_code)]`: these are RAII ownership holders, kept alive for
+    /// their `Drop` side effects (freeing host pages), not read. Every region
+    /// is now built by `map_region_raw` with `memory: None` +
+    /// `host_mapping: Some(..)`.
+    #[allow(dead_code)]
     memory: Option<applevisor::memory::Memory>,
+    #[allow(dead_code)]
     host_mapping: Option<crate::host_mapping::OwnedHostMapping>,
     /// True for a genuine guest `MAP_SHARED` file mapping (`map_shared_file`).
     /// Guest memory is host-`MAP_SHARED` for HVF coherence, so fork(2) does
@@ -1423,9 +1430,10 @@ impl HvfInner {
         Ok(bytes)
     }
 
-    /// Host VA of `address` iff it lives in a genuine `MAP_SHARED` file
-    /// mapping (shared across carrick processes via a host MAP_SHARED of the
-    /// real file). Used to back a cross-process futex with `__ulock`.
+    /// Host VA of `address` iff it lives in a host-`MAP_SHARED` guest region
+    /// (the boot-mapped shared aperture; shared across carrick processes via
+    /// the inherited MAP_SHARED backing). Used to back a cross-process futex
+    /// with the public `os_sync_wait_on_address` API (see `crate::ulock`).
     fn shared_futex_host_addr(&self, address: u64) -> Option<usize> {
         let mapping = self.mapping_for_range(address, 4)?;
         if !mapping.guest_shared {
@@ -1490,133 +1498,6 @@ impl HvfInner {
     /// part of a PROT_NONE region leaves only the still-protected remainder.
     fn set_no_access(&mut self, address: u64, len: usize, no_access: bool) {
         self.protections.set_no_access(address, len, no_access);
-    }
-
-    /// Back `[guest_addr, guest_addr+len)` with a real `MAP_SHARED` mmap of
-    /// the host file `host_fd`, mapped into the guest IPA via `hv_vm_map`.
-    /// Both the guest CPU (stage-2) and the dispatcher accessor
-    /// (`read_guest_bytes`, via `host_addr`) then share the file's page
-    /// cache → full MAP_SHARED coherence + persistence. Takes ownership of
-    /// `host_fd` (closes it once mapped — the mapping outlives the fd).
-    fn map_shared_file(
-        &mut self,
-        guest_addr: u64,
-        len: usize,
-        host_fd: i32,
-        offset: u64,
-    ) -> Result<(), MemoryError> {
-        let host_mapping = crate::host_mapping::OwnedHostMapping::map_shared_file(
-            len, host_fd, offset,
-        )
-        .map_err(|error| MemoryError::HostMap(format!("mmap(MAP_SHARED) failed: {error}")))?;
-        let host = host_mapping.as_ptr();
-        let len = host_mapping.len();
-        let perms = hvf_perms(SegmentPerms {
-            read: true,
-            write: true,
-            execute: false,
-        });
-        let perms_raw: u64 = u64::from(perms);
-        let r = unsafe {
-            applevisor_sys::hv_vm_map(host.cast::<std::ffi::c_void>(), guest_addr, len, perms_raw)
-        };
-        if r != 0 {
-            return Err(MemoryError::HostMap(format!("hv_vm_map failed: 0x{r:x}")));
-        }
-        let guest_shared = host_mapping.guest_shared();
-        self.mappings.push(HvfMappedRegion {
-            start: guest_addr,
-            end: guest_addr + len as u64,
-            host_addr: host,
-            size: len,
-            perms,
-            // We own the libc mmap (not an applevisor Memory). Torn down by
-            // `unmap_shared_file`; on engine drop the VM tear-down releases
-            // the stage-2 entries and the host pages leak only at exit.
-            memory: None,
-            host_mapping: Some(host_mapping),
-            // A genuine guest MAP_SHARED file mapping: must stay shared across
-            // fork (no private snapshot).
-            guest_shared,
-        });
-        Ok(())
-    }
-
-    /// Like `map_shared_file` but anonymous: a host `MAP_SHARED|MAP_ANON`
-    /// region mapped into the guest IPA, kept shared across fork. Used for a
-    /// guest `MAP_SHARED|MAP_ANONYMOUS` mmap (cross-process futex / shared IPC).
-    fn map_shared_anon(&mut self, guest_addr: u64, len: usize) -> Result<(), MemoryError> {
-        let host_mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
-            len,
-            crate::host_mapping::HostMappingKind::SharedAnon,
-        )
-        .map_err(|error| {
-            MemoryError::HostMap(format!("mmap(MAP_SHARED|MAP_ANON) failed: {error}"))
-        })?;
-        let host = host_mapping.as_ptr();
-        let len = host_mapping.len();
-        let perms = hvf_perms(SegmentPerms {
-            read: true,
-            write: true,
-            execute: false,
-        });
-        let perms_raw: u64 = u64::from(perms);
-        let r = unsafe {
-            applevisor_sys::hv_vm_map(host.cast::<std::ffi::c_void>(), guest_addr, len, perms_raw)
-        };
-        if r != 0 {
-            return Err(MemoryError::HostMap(format!("hv_vm_map failed: 0x{r:x}")));
-        }
-        let guest_shared = host_mapping.guest_shared();
-        self.mappings.push(HvfMappedRegion {
-            start: guest_addr,
-            end: guest_addr + len as u64,
-            host_addr: host,
-            size: len,
-            perms,
-            memory: None,
-            host_mapping: Some(host_mapping),
-            // Genuine guest MAP_SHARED mapping — shared across fork, never
-            // snapshotted, and a valid cross-process futex target.
-            guest_shared,
-        });
-        Ok(())
-    }
-
-    fn unmap_shared_file(&mut self, guest_addr: u64, len: usize) -> Result<(), MemoryError> {
-        if let Some(pos) = self
-            .mappings
-            .iter()
-            .position(|m| m.start == guest_addr && m.memory.is_none() && m.size == len)
-        {
-            let m = self.mappings.remove(pos);
-            let owns_host_mapping = m.host_mapping.is_some();
-            unsafe {
-                applevisor_sys::hv_vm_unmap(guest_addr, len);
-                if !owns_host_mapping {
-                    libc::munmap(m.host_addr.cast::<std::ffi::c_void>(), len);
-                }
-            }
-            drop(m);
-        }
-        Ok(())
-    }
-
-    fn msync_shared_file(&mut self, guest_addr: u64, len: usize) -> Result<(), MemoryError> {
-        if let Some(m) = self
-            .mappings
-            .iter()
-            .find(|m| m.start == guest_addr && m.memory.is_none())
-        {
-            unsafe {
-                libc::msync(
-                    m.host_addr as *mut std::ffi::c_void,
-                    len.min(m.size),
-                    libc::MS_SYNC,
-                );
-            }
-        }
-        Ok(())
     }
 
     fn mapping_for_range(&self, address: u64, length: usize) -> Option<&HvfMappedRegion> {
@@ -2630,28 +2511,6 @@ impl GuestMemory for HvfTrapEngine {
         self.inner.write_guest_bytes(address, bytes)
     }
 
-    fn map_shared_file(
-        &mut self,
-        guest_addr: u64,
-        len: usize,
-        host_fd: i32,
-        offset: u64,
-    ) -> Result<(), MemoryError> {
-        self.inner.map_shared_file(guest_addr, len, host_fd, offset)
-    }
-
-    fn map_shared_anon(&mut self, guest_addr: u64, len: usize) -> Result<(), MemoryError> {
-        self.inner.map_shared_anon(guest_addr, len)
-    }
-
-    fn unmap_shared_file(&mut self, guest_addr: u64, len: usize) -> Result<(), MemoryError> {
-        self.inner.unmap_shared_file(guest_addr, len)
-    }
-
-    fn msync_shared_file(&mut self, guest_addr: u64, len: usize) -> Result<(), MemoryError> {
-        self.inner.msync_shared_file(guest_addr, len)
-    }
-
     fn set_no_access(&mut self, address: u64, len: usize, no_access: bool) {
         self.inner.set_no_access(address, len, no_access);
     }
@@ -2778,8 +2637,8 @@ fn map_region_raw(mapping: &GuestMapping) -> Result<HvfMappedRegion, TrapError> 
     } else {
         crate::host_mapping::HostMappingKind::PrivateAnon
     };
-    let host_mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(size, kind)
-        .map_err(|error| {
+    let host_mapping =
+        crate::host_mapping::OwnedHostMapping::map_shared_anon(size, kind).map_err(|error| {
             TrapError::Hypervisor(format!("mmap guest region (size={size}) failed: {error}"))
         })?;
     let host = host_mapping.as_ptr();
