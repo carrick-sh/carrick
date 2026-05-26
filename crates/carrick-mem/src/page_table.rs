@@ -48,7 +48,7 @@ enum PtOp {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PageTableError {
+pub enum PageTableError {
     /// No spare table pages left to split a block.
     OutOfTables,
     /// A guest VA whose translation path leaves the page-table region, or an
@@ -57,7 +57,7 @@ pub(crate) enum PageTableError {
 }
 
 /// Per-level table index for `va` (4 KiB granule, 40-bit IPA).
-pub(crate) fn indices(va: u64) -> [usize; 4] {
+pub fn indices(va: u64) -> [usize; 4] {
     [
         ((va >> 39) & 0x1ff) as usize,
         ((va >> 30) & 0x1ff) as usize,
@@ -74,7 +74,7 @@ pub(crate) fn indices(va: u64) -> [usize; 4] {
 /// fault handler PROVE whether the leaf PTE is invalid IN MEMORY (a logic bug)
 /// versus valid-in-memory but stale in the faulting vCPU's TLB (a coherence
 /// bug) — the two have opposite fixes.
-pub(crate) fn walk_descriptors(bytes: &[u8], base: u64, va: u64) -> [u64; 4] {
+pub fn walk_descriptors(bytes: &[u8], base: u64, va: u64) -> [u64; 4] {
     let idx = indices(va);
     let mut out = [0u64; 4];
     let mut table_off: usize = 0; // L0 table at byte offset 0
@@ -110,7 +110,7 @@ pub(crate) fn walk_descriptors(bytes: &[u8], base: u64, va: u64) -> [u64; 4] {
 /// `next_free`/`free_tables` — a fresh manager would reset the bump cursor and
 /// re-hand-out table pages already live in the copied backing, corrupting it.
 #[derive(Clone)]
-pub(crate) struct PageTableManager {
+pub struct PageTableManager {
     bytes: Vec<u8>,
     /// PA mapped at byte offset 0 (`LINUX_PAGE_TABLES_BASE`).
     base: u64,
@@ -135,7 +135,7 @@ pub(crate) struct PageTableManager {
 }
 
 impl PageTableManager {
-    pub(crate) fn new(bytes: Vec<u8>, base: u64) -> Self {
+    pub fn new(bytes: Vec<u8>, base: u64) -> Self {
         Self {
             bytes,
             base,
@@ -148,7 +148,7 @@ impl PageTableManager {
 
     /// Tell the manager whether sibling vCPUs are live (set per-edit from the
     /// process-wide live-vCPU count). Gates coalescing.
-    pub(crate) fn set_multi_vcpu(&mut self, multi: bool) {
+    pub fn set_multi_vcpu(&mut self, multi: bool) {
         self.multi_vcpu = multi;
     }
 
@@ -172,7 +172,7 @@ impl PageTableManager {
     }
 
     #[cfg(test)]
-    pub(crate) fn into_bytes(self) -> Vec<u8> {
+    pub fn into_bytes(self) -> Vec<u8> {
         self.bytes
     }
 
@@ -206,7 +206,7 @@ impl PageTableManager {
     /// # Safety
     /// `host` must point to a writable mapping of at least `self.bytes.len()`
     /// bytes that backs the live guest page tables.
-    pub(crate) unsafe fn sync_to_host(&mut self, host: *mut u8) {
+    pub unsafe fn sync_to_host(&mut self, host: *mut u8) {
         use core::sync::atomic::{AtomicU64, Ordering, fence};
         for (off, is_ptr) in self.dirty.drain(..) {
             let mut a = [0u8; 8];
@@ -240,7 +240,7 @@ impl PageTableManager {
     /// `(in_use, free_list, capacity)` pages. `in_use` is bumped-minus-reclaimed
     /// (live split tables); a monotonically rising `in_use` toward `capacity`
     /// under multithreaded churn is the coalesce-disabled pool leak.
-    pub(crate) fn pool_stats(&self) -> (u32, u32, u32) {
+    pub fn pool_stats(&self) -> (u32, u32, u32) {
         let bumped = (self.next_free - SPARE_START_OFFSET) / PT_PAGE;
         let free = self.free_tables.len() as u64;
         let capacity = (self.bytes.len() as u64 - SPARE_START_OFFSET) / PT_PAGE;
@@ -536,29 +536,29 @@ impl PageTableManager {
     }
 
     /// Mark `[va, va+len)` invalid (faults on any access → SEGV_MAPERR).
-    pub(crate) fn set_prot_none(&mut self, va: u64, len: usize) -> Result<bool, PageTableError> {
+    pub fn set_prot_none(&mut self, va: u64, len: usize) -> Result<bool, PageTableError> {
         self.apply(va, len, PtOp::Invalidate)
     }
 
     /// Alias for `set_prot_none`, used by `munmap` (the freed range faults
     /// until reused).
-    pub(crate) fn invalidate(&mut self, va: u64, len: usize) -> Result<bool, PageTableError> {
+    pub fn invalidate(&mut self, va: u64, len: usize) -> Result<bool, PageTableError> {
         self.set_prot_none(va, len)
     }
 
     /// Mark `[va, va+len)` valid read-only (AP=RO).
-    pub(crate) fn set_readonly(&mut self, va: u64, len: usize) -> Result<bool, PageTableError> {
+    pub fn set_readonly(&mut self, va: u64, len: usize) -> Result<bool, PageTableError> {
         self.apply(va, len, PtOp::ReadOnly)
     }
 
     /// Restore `[va, va+len)` to a valid RW user page (identity-mapped).
-    pub(crate) fn set_rw(&mut self, va: u64, len: usize) -> Result<bool, PageTableError> {
+    pub fn set_rw(&mut self, va: u64, len: usize) -> Result<bool, PageTableError> {
         self.apply(va, len, PtOp::ReadWrite)
     }
 
     /// True iff the leaf for `va` (block or page) is valid. Test/diagnostic.
     #[cfg(test)]
-    pub(crate) fn is_valid(&mut self, va: u64) -> bool {
+    pub fn is_valid(&mut self, va: u64) -> bool {
         match self.leaf_offset(va, false) {
             Ok((off, _)) => self.read_desc(off) & VALID != 0,
             Err(_) => false,
@@ -567,7 +567,7 @@ impl PageTableManager {
 
     /// AP[2:1] of the leaf for `va`. Test/diagnostic.
     #[cfg(test)]
-    pub(crate) fn ap_bits(&mut self, va: u64) -> u64 {
+    pub fn ap_bits(&mut self, va: u64) -> u64 {
         match self.leaf_offset(va, false) {
             Ok((off, _)) => self.read_desc(off) & AP_MASK,
             Err(_) => 0,

@@ -14,7 +14,6 @@ pub(crate) mod darwin_kqueue;
 pub mod dispatch;
 #[cfg(target_os = "macos")]
 pub mod dtrace_consumer;
-pub mod elf;
 pub(crate) mod fork_coord;
 pub(crate) mod fork_quiesce;
 pub mod fs_backend;
@@ -33,9 +32,12 @@ pub(crate) mod itimer;
 // path so every `crate::linux_abi::…` / `carrick_runtime::linux_abi::…` site is
 // unchanged.
 pub use carrick_abi as linux_abi;
-pub mod memory;
+// elf/memory/page_table/vdso were lifted into the leaf crate `carrick-mem`
+// (build-graph A3). Re-exported under their original paths so every
+// `crate::memory::…` / `crate::elf::…` / `crate::page_table::…` / `crate::vdso::…`
+// site (and the `carrick_runtime::*` ones) is unchanged.
+pub use carrick_mem::{elf, memory, page_table, vdso};
 pub mod overlay;
-pub(crate) mod page_table;
 
 pub mod execute;
 pub mod probes;
@@ -48,6 +50,5 @@ pub mod thread;
 pub mod trap;
 pub mod ulock;
 pub mod vcpu_kick;
-pub mod vdso;
 pub mod vfs;
 pub use execute::Runtime;
