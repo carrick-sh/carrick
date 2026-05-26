@@ -540,6 +540,15 @@ impl SyscallDispatcher {
             if let Ok(len) = usize::try_from(length) {
                 let prot_none = prot & (LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC) == 0;
                 cx.memory.set_no_access(address.0, len, prot_none);
+                // Make the new protection guest-VISIBLE (a violating access
+                // faults during EL0 execution) by editing the stage-1 page
+                // tables. Scoped to the private mmap arena for now — the shared
+                // aperture and image/heap regions keep host-side checks only.
+                if range_within(address.0, length, LINUX_MMAP_BASE, LINUX_MMAP_SIZE)
+                    && cx.memory.protect_range(address.0, len, prot).is_err()
+                {
+                    return Ok(LINUX_ENOMEM.into());
+                }
             }
             Ok(DispatchOutcome::Returned { value: 0 })
         }

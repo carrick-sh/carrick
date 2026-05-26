@@ -1226,11 +1226,11 @@ pub fn el1_maintenance_bytes() -> Vec<u8> {
     let mut bytes = vec![0_u8; size];
     let mut offset = 0;
     for opcode in [
-        AARCH64_DSB_SY_OPCODE,        // make prior descriptor stores observable
-        AARCH64_TLBI_VMALLE1_OPCODE,  // drop all stage-1 TLB entries (IS)
-        AARCH64_DSB_SY_OPCODE,        // make the invalidation observable
-        AARCH64_ISB_OPCODE,           // resynchronise translation
-        AARCH64_HVC1_OPCODE,          // trap back to host: maintenance complete
+        AARCH64_DSB_SY_OPCODE,       // make prior descriptor stores observable
+        AARCH64_TLBI_VMALLE1_OPCODE, // drop all stage-1 TLB entries (IS)
+        AARCH64_DSB_SY_OPCODE,       // make the invalidation observable
+        AARCH64_ISB_OPCODE,          // resynchronise translation
+        AARCH64_HVC1_OPCODE,         // trap back to host: maintenance complete
     ] {
         let bytes_le = opcode.to_le_bytes();
         bytes[offset..offset + bytes_le.len()].copy_from_slice(&bytes_le);
@@ -1865,14 +1865,20 @@ mod stage1_tests {
         assert_eq!(bytes.len() as u64, LINUX_PAGE_TABLES_SIZE);
         // Six boot tables (0..0x6000); the rest is a spare pool of >=8 pages.
         let spare_pages = (LINUX_PAGE_TABLES_SIZE - 0x6000) / 0x1000;
-        assert!(spare_pages >= 8, "need a spare-table pool, got {spare_pages}");
+        assert!(
+            spare_pages >= 8,
+            "need a spare-table pool, got {spare_pages}"
+        );
         // Spare tail is zero-filled (invalid descriptors).
         assert!(bytes[0x6000..].iter().all(|&b| b == 0));
         // Whole table region stays inside the kernel hole's first 2 MiB block,
         // so it remains kernel-only (EL1) after the size bump.
-        let region_end_off = (LINUX_PAGE_TABLES_BASE - LINUX_KERNEL_REGION_BASE)
-            + LINUX_PAGE_TABLES_SIZE;
-        assert!(region_end_off <= 0x200000, "page tables overflow kernel block");
+        let region_end_off =
+            (LINUX_PAGE_TABLES_BASE - LINUX_KERNEL_REGION_BASE) + LINUX_PAGE_TABLES_SIZE;
+        assert!(
+            region_end_off <= 0x200000,
+            "page tables overflow kernel block"
+        );
     }
 
     #[test]

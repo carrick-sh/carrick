@@ -12,17 +12,13 @@
 //!
 //! 4 KiB translation granule, 40-bit IPA, AArch64 long-descriptor format.
 
-// The editor is consumed by the syscall path in Phase D of this plan
-// (mprotect/PROT_NONE/munmap wiring); until then only the unit tests exercise
-// it. Remove this allow when `trap.rs` calls `protect_range`/`unmap_range`.
-#![allow(dead_code)]
-
 // Leaf attribute layout (must match `memory::stage1_identity_page_tables`).
 const VALID: u64 = 1 << 0;
 const TYPE_BITS: u64 = 0b11;
 const TYPE_TABLE_OR_PAGE: u64 = 0b11; // L0..L2 table descriptor, or L3 page
 const TYPE_BLOCK: u64 = 0b01; // L1/L2 block descriptor
 const AP_MASK: u64 = 0b11 << 6; // AP[2:1]
+#[cfg(test)]
 const AP_RW: u64 = 0b01 << 6; // RW at EL0+EL1
 const AP_RO: u64 = 0b11 << 6; // RO at EL0+EL1
 
@@ -78,8 +74,14 @@ impl PageTableManager {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn into_bytes(self) -> Vec<u8> {
         self.bytes
+    }
+
+    /// The current table image, for syncing edits back to the host backing.
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
     }
 
     fn read_desc(&self, off: usize) -> u64 {
