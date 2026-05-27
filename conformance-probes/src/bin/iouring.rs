@@ -29,6 +29,7 @@ const IORING_OP_RECV: u8 = 27;
 const IORING_OP_SENDMSG: u8 = 9;
 const IORING_OP_RECVMSG: u8 = 10;
 const IORING_OP_ACCEPT: u8 = 13;
+const IORING_OP_CONNECT: u8 = 16;
 
 #[repr(C)]
 struct Iovec {
@@ -371,7 +372,17 @@ unsafe fn ring_ops(r: &mut Ring) -> bool {
         return false;
     }
     let cli = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
-    if cli < 0 || libc::connect(cli, &sa as *const _ as *const libc::sockaddr, salen) != 0 {
+    if cli < 0 {
+        return false;
+    }
+    // io_uring CONNECT (client side): sqe.addr = sockaddr, sqe.off = addrlen.
+    if r.submit_reap(|sqe| {
+        *sqe.add(0) = IORING_OP_CONNECT;
+        ptr::write_unaligned(sqe.add(4) as *mut i32, cli);
+        ptr::write_unaligned(sqe.add(8) as *mut u64, salen as u64);
+        ptr::write_unaligned(sqe.add(16) as *mut u64, &sa as *const _ as u64);
+    }) != Some(0)
+    {
         return false;
     }
     let afd = match r.submit_reap(|sqe| {
