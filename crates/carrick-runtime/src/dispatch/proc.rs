@@ -322,6 +322,46 @@ impl SyscallDispatcher {
             })
         }
 
+        fn sys_seccomp(this, cx, operation: u64, _flags: u64, args: GuestPtr) {
+            // SECCOMP_SET_MODE_FILTER installs a cBPF filter from a sock_fprog;
+            // the dispatcher checks it before every subsequent syscall (see
+            // `seccomp_precheck`). STRICT mode and the filter flags (TSYNC/LOG/…)
+            // are not differentiated in v1.
+            match operation as u32 {
+                crate::seccomp::SECCOMP_SET_MODE_FILTER => {
+                    let memory = &*cx.memory;
+                    // struct sock_fprog { unsigned short len; <pad>; sock_filter *filter; }
+                    // — `filter` is 8-byte aligned, so it sits at offset 8.
+                    let Ok(len_bytes) = memory.read_bytes(args.0, 2) else {
+                        return Ok(LINUX_EFAULT.into());
+                    };
+                    let len = u16::from_ne_bytes([len_bytes[0], len_bytes[1]]) as usize;
+                    if len == 0 || len > 4096 {
+                        return Ok(LINUX_EINVAL.into());
+                    }
+                    let Ok(ptr_bytes) = memory.read_bytes(args.0 + 8, 8) else {
+                        return Ok(LINUX_EFAULT.into());
+                    };
+                    let filter_ptr = u64::from_ne_bytes([
+                        ptr_bytes[0], ptr_bytes[1], ptr_bytes[2], ptr_bytes[3],
+                        ptr_bytes[4], ptr_bytes[5], ptr_bytes[6], ptr_bytes[7],
+                    ]);
+                    let Ok(prog_bytes) = memory.read_bytes(filter_ptr, len * 8) else {
+                        return Ok(LINUX_EFAULT.into());
+                    };
+                    let Some(prog) = crate::seccomp::SockFilter::parse_program(&prog_bytes) else {
+                        return Ok(LINUX_EINVAL.into());
+                    };
+                    this.seccomp.install(prog);
+                    Ok(DispatchOutcome::Returned { value: 0 })
+                }
+                // STRICT mode (allow only read/write/exit/sigreturn) is not
+                // emulated yet; unknown operations are EINVAL.
+                crate::seccomp::SECCOMP_SET_MODE_STRICT => Ok(LINUX_ENOSYS.into()),
+                _ => Ok(LINUX_EINVAL.into()),
+            }
+        }
+
         fn prctl(this, cx, option: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) {
             let memory = &mut *cx.memory;
             Ok(match option {

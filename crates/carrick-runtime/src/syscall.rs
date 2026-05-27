@@ -108,6 +108,7 @@ pub const fn handler_for_aarch64(number: u64) -> SyscallHandler {
         | 168
         | 172
         | 173
+        | 277
         | 278
         | 293
         | 424
@@ -402,7 +403,7 @@ const AARCH64_SYSCALLS: &[Syscall] = &[
     syscall(274, "sched_setattr", "sched", SupportLevel::Deferred),
     syscall(275, "sched_getattr", "sched", SupportLevel::Deferred),
     syscall(276, "renameat2", "fs", SupportLevel::BringUp),
-    syscall(277, "seccomp", "process", SupportLevel::Deferred),
+    syscall(277, "seccomp", "process", SupportLevel::BringUp),
     syscall(278, "getrandom", "random", SupportLevel::BringUp),
     syscall(279, "memfd_create", "fs", SupportLevel::Deferred),
     syscall(280, "bpf", "process", SupportLevel::Deferred),

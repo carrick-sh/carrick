@@ -517,3 +517,63 @@ fn waitid_wexited_ignores_stopped_child() {
         }
     );
 }
+
+#[test]
+fn seccomp_filter_blocks_the_targeted_syscall_with_errno() {
+    // Install (via the real seccomp(2) syscall) the canonical libseccomp-style
+    // filter "deny getpid(172) with EPERM, allow everything else", then confirm
+    // the dispatcher enforces it before the handler runs.
+    const BPF_LD_W_ABS: u16 = 0x20;
+    const BPF_JMP_JEQ: u16 = 0x15;
+    const BPF_RET_K: u16 = 0x06;
+    const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
+    const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    let write_insn = |m: &mut LinearMemory, addr: u64, code: u16, jt: u8, jf: u8, k: u32| {
+        let mut b = [0u8; 8];
+        b[0..2].copy_from_slice(&code.to_ne_bytes());
+        b[2] = jt;
+        b[3] = jf;
+        b[4..8].copy_from_slice(&k.to_ne_bytes());
+        m.write_bytes(addr, &b).unwrap();
+    };
+    // Filter program @0x4020: LD nr; JEQ 172 -> RET ERRNO|EPERM else RET ALLOW.
+    write_insn(&mut memory, 0x4020, BPF_LD_W_ABS, 0, 0, 0);
+    write_insn(&mut memory, 0x4028, BPF_JMP_JEQ, 0, 1, 172);
+    write_insn(&mut memory, 0x4030, BPF_RET_K, 0, 0, SECCOMP_RET_ERRNO | 1);
+    write_insn(&mut memory, 0x4038, BPF_RET_K, 0, 0, SECCOMP_RET_ALLOW);
+    // struct sock_fprog @0x4000: len=4 @0, filter ptr=0x4020 @8.
+    memory.write_bytes(0x4000, &4u16.to_ne_bytes()).unwrap();
+    memory.write_bytes(0x4008, &0x4020u64.to_ne_bytes()).unwrap();
+
+    let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
+        d.dispatch(SyscallRequest::new(nr, SyscallArgs::from(args)), m, &reporter)
+            .unwrap()
+    };
+
+    // getpid before the filter is installed -> a real pid.
+    assert!(matches!(
+        run(&mut dispatcher, &mut memory, 172, [0; 6]),
+        DispatchOutcome::Returned { value } if value > 0
+    ));
+
+    // seccomp(SECCOMP_SET_MODE_FILTER=1, flags=0, &fprog) -> 0.
+    assert_eq!(
+        run(&mut dispatcher, &mut memory, 277, [1, 0, 0x4000, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    // getpid(172) is now denied with EPERM (1); getppid(173) still works.
+    assert_eq!(
+        run(&mut dispatcher, &mut memory, 172, [0; 6]),
+        DispatchOutcome::Errno { errno: 1 }
+    );
+    assert!(matches!(
+        run(&mut dispatcher, &mut memory, 173, [0; 6]),
+        DispatchOutcome::Returned { value } if value >= 0
+    ));
+}

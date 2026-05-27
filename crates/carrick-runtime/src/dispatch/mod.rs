@@ -782,6 +782,11 @@ pub struct SyscallDispatcher {
     /// the `/` rootfs + writable overlay). See [`fs::FsState`]. Handlers
     /// that touch only fs state borrow `self.fs` narrowly.
     fs: fs::FsState,
+    /// Installed seccomp(2) cBPF filters, checked before every syscall once
+    /// active. Internally locked; `libc::fork` inherits the filters via the
+    /// process memory copy and sibling threads share them (process-wide), which
+    /// matches Linux's filter-inheritance semantics. See [`crate::seccomp`].
+    seccomp: crate::seccomp::SeccompState,
 }
 
 /// Live epoll-instance kqueue fds, so an in-memory readiness change
@@ -1049,6 +1054,7 @@ impl SyscallDispatcher {
         266 => clock_adjtime,
         267 => syncfs,
         276 => renameat2,
+        277 => sys_seccomp,
         278 => getrandom,
         424 => pidfd_send_signal,
         434 => pidfd_open,
@@ -1094,6 +1100,7 @@ impl SyscallDispatcher {
             creds: Mutex::new(creds::CredState::new()),
             signal: Mutex::new(signal::SignalState::new()),
             fs: fs::FsState::new(),
+            seccomp: crate::seccomp::SeccompState::default(),
         }
     }
 
@@ -1389,6 +1396,42 @@ impl SyscallDispatcher {
         self.dispatch_inner(request, memory, reporter, None)
     }
 
+    /// Evaluate installed seccomp filters against `request` before its handler
+    /// runs. Returns `Some(outcome)` when a filter blocks the call (ERRNO →
+    /// that errno; KILL/TRAP → terminate, fail-closed), or `None` to allow it.
+    /// Fast path: no lock when no filter is installed.
+    fn seccomp_precheck(&self, request: &SyscallRequest) -> Option<DispatchOutcome> {
+        if !self.seccomp.is_active() {
+            return None;
+        }
+        let data = crate::seccomp::SeccompData {
+            nr: request.number as i32,
+            arch: crate::seccomp::AUDIT_ARCH_AARCH64,
+            instruction_pointer: 0,
+            args: request.args.0,
+        };
+        let ret = self.seccomp.check(&data);
+        match ret & crate::seccomp::SECCOMP_RET_ACTION_FULL {
+            crate::seccomp::SECCOMP_RET_ALLOW
+            | crate::seccomp::SECCOMP_RET_LOG
+            | crate::seccomp::SECCOMP_RET_TRACE => None,
+            crate::seccomp::SECCOMP_RET_ERRNO => {
+                // RET_DATA is the errno, clamped to the kernel's 0..=4095 range.
+                let errno = (ret & crate::seccomp::SECCOMP_RET_DATA).min(4095) as i32;
+                Some(DispatchOutcome::Errno { errno })
+            }
+            // KILL_PROCESS / KILL_THREAD / TRAP (and any unmodelled action):
+            // fail closed by terminating the guest with SIGSYS's wait status
+            // (128 + SIGSYS). A *catchable* SIGSYS for RET_TRAP is a follow-up.
+            crate::seccomp::SECCOMP_RET_KILL_PROCESS
+            | crate::seccomp::SECCOMP_RET_KILL_THREAD
+            | crate::seccomp::SECCOMP_RET_TRAP => {
+                Some(DispatchOutcome::Exit { code: 128 + 31 })
+            }
+            _ => Some(DispatchOutcome::Exit { code: 128 + 31 }),
+        }
+    }
+
     // (see `watch_addr` below)
 
     /// Multi-threaded dispatch through a shared dispatcher reference. Handlers
@@ -1404,6 +1447,11 @@ impl SyscallDispatcher {
         registry: &crate::thread::ThreadRegistry,
         futex: &crate::thread::FutexTable,
     ) -> Result<DispatchOutcome, DispatchError> {
+        // seccomp veto applies on the multi-threaded path too (filters are
+        // process-wide), before any handler — including the lockless hot path.
+        if let Some(outcome) = self.seccomp_precheck(&request) {
+            return Ok(outcome);
+        }
         if let Some(result) =
             self.dispatch_threaded_shared(request, memory, reporter, tid, registry, futex)
         {
@@ -1629,6 +1677,19 @@ impl SyscallDispatcher {
             name: ::std::borrow::Cow::Borrowed(name),
             args: request.args,
         });
+
+        // seccomp: installed cBPF filters get to veto the syscall before its
+        // handler runs (ERRNO / kill), mirroring the kernel's pre-syscall check.
+        if let Some(outcome) = self.seccomp_precheck(&request) {
+            let (retval, errno) = outcome.retval_errno();
+            reporter.record(CompatEvent::SyscallReturn {
+                number: request.number,
+                name: ::std::borrow::Cow::Borrowed(name),
+                retval,
+                errno,
+            });
+            return Ok(outcome);
+        }
 
         // Reusable guest-memory watchpoint (CARRICK_WATCH_ADDR=<hex>): fire a
         // probe with the current u64 at the watched address before each
