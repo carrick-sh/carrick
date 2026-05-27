@@ -1379,6 +1379,10 @@ impl SyscallDispatcher {
             OpenDescription::HostPipe {
                 is_read_end: false, ..
             } => None,
+            // A host socket is a valid splice destination (pipe->socket, the
+            // io.Copy(conn, pipe) direction); the host send enforces its own
+            // errors. Without this the `_` arm below rejected it with EINVAL.
+            OpenDescription::HostSocket { .. } => None,
             // Splicing FROM a pipe INTO a regular file is valid on Linux (only
             // ONE end must be a pipe). The write + offset advance is handled by
             // write_output_fd. A read-only fd is EBADF.
@@ -3950,6 +3954,37 @@ impl SyscallDispatcher {
                 // niche path to the lockless wait is a tracked follow-up, not a
                 // server hot path.
                 let n = unsafe { libc::read(host_fd, buf.as_mut_ptr() as *mut _, count) };
+                let n = match n.host_syscall_errno() {
+                    Ok(value) => value,
+                    Err(errno) => return Ok(errno.into()),
+                };
+                buf.truncate(n as usize);
+                let outcome = this.write_output_fd(out_fd.0, &buf);
+                return Ok(outcome);
+            }
+
+            // Splice OUT of a host socket (socket -> pipe, and socket -> socket).
+            // This is the path Go's `io.Copy(pipe, conn)` takes; without it a
+            // socket source fell through to the sendfile path below, which treats
+            // `in_fd` as a regular file and fails. The host socket fd is
+            // non-blocking, so an empty socket yields EAGAIN — which is exactly
+            // what a non-blocking guest (the Go netpoller) expects; a true
+            // blocking-wait for an empty socket is the same tracked follow-up as
+            // the host-pipe branch above.
+            if let Some(host_fd) = this.host_socket_fd(in_fd.0) {
+                if off_in_address != 0 || off_out_address != 0 {
+                    return Ok(LINUX_EINVAL.into());
+                }
+                if let Some(errno) = this.splice_output_errno(out_fd.0) {
+                    return Ok(errno.into());
+                }
+                let mut buf = vec![0u8; count];
+                // MSG_DONTWAIT keeps this off the kernel-lock path: the host
+                // socket is already non-blocking, and a non-blocking guest (the
+                // Go netpoller) wants the EAGAIN rather than a blocked vCPU.
+                let n = unsafe {
+                    libc::recv(host_fd, buf.as_mut_ptr() as *mut _, count, libc::MSG_DONTWAIT)
+                };
                 let n = match n.host_syscall_errno() {
                     Ok(value) => value,
                     Err(errno) => return Ok(errno.into()),
