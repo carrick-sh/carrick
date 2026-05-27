@@ -22,7 +22,7 @@
 use super::*;
 use crate::linux_abi::{
     LinuxIoCqringOffsets, LinuxIoSqringOffsets, LinuxIoUringCqe, LinuxIoUringParams,
-    LinuxIoUringSqe, LINUX_IORING_FEAT_NODROP, LINUX_IORING_FEAT_SINGLE_MMAP,
+    LinuxIoUringSqe, LinuxIovec, LINUX_IORING_FEAT_NODROP, LINUX_IORING_FEAT_SINGLE_MMAP,
     LINUX_IORING_OFF_CQ_RING, LINUX_IORING_OFF_SQES, LINUX_IORING_OFF_SQ_RING,
     LINUX_IORING_OP_CLOSE, LINUX_IORING_OP_FSYNC, LINUX_IORING_OP_NOP, LINUX_IORING_OP_READ,
     LINUX_IORING_OP_READV, LINUX_IORING_OP_WRITE, LINUX_IORING_OP_WRITEV,
@@ -184,6 +184,21 @@ fn read_ring_u32(memory: &impl GuestMemory, addr: u64) -> u32 {
 
 fn write_ring_u32(memory: &mut impl GuestMemory, addr: u64, v: u32) {
     let _ = memory.write_bytes(addr, &v.to_ne_bytes());
+}
+
+/// Read `count` `iovec`s (16 bytes each) from the guest array at `addr`. `count`
+/// is capped at IOV_MAX (1024) so a bogus SQE can't drive an unbounded alloc.
+fn read_iovecs(memory: &impl GuestMemory, addr: u64, count: usize) -> Option<Vec<LinuxIovec>> {
+    if count > 1024 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let bytes = memory.read_bytes(addr + (i as u64) * 16, 16).ok()?;
+        let (iov, _) = LinuxIovec::read_from_prefix(&bytes).ok()?;
+        out.push(iov);
+    }
+    Some(out)
 }
 
 impl SyscallDispatcher {
@@ -350,6 +365,70 @@ impl SyscallDispatcher {
                 };
                 match n.host_syscall_errno() {
                     Ok(put) => put as i32,
+                    Err(e) => -e,
+                }
+            }
+            LINUX_IORING_OP_READV => {
+                let Some(hfd) = self.regular_host_file_fd(sqe.fd) else {
+                    return -LINUX_EINVAL;
+                };
+                let Some(iovs) = read_iovecs(memory, sqe.addr, sqe.len as usize) else {
+                    return -LINUX_EFAULT;
+                };
+                let total: usize = iovs.iter().map(|v| v.iov_len as usize).sum();
+                let mut buf = vec![0u8; total];
+                let n = unsafe {
+                    libc::pread(hfd, buf.as_mut_ptr() as *mut _, total, sqe.off as libc::off_t)
+                };
+                match n.host_syscall_errno() {
+                    Ok(got) => {
+                        let got = got as usize;
+                        // Scatter the bytes read across the iovecs in order.
+                        let mut done = 0usize;
+                        for v in &iovs {
+                            if done >= got {
+                                break;
+                            }
+                            let chunk = (v.iov_len as usize).min(got - done);
+                            if memory.write_bytes(v.iov_base, &buf[done..done + chunk]).is_err() {
+                                return -LINUX_EFAULT;
+                            }
+                            done += chunk;
+                        }
+                        got as i32
+                    }
+                    Err(e) => -e,
+                }
+            }
+            LINUX_IORING_OP_WRITEV => {
+                let Some(hfd) = self.regular_host_file_fd(sqe.fd) else {
+                    return -LINUX_EINVAL;
+                };
+                let Some(iovs) = read_iovecs(memory, sqe.addr, sqe.len as usize) else {
+                    return -LINUX_EFAULT;
+                };
+                // Gather the iovecs into one buffer, then a single pwrite.
+                let mut buf = Vec::new();
+                for v in &iovs {
+                    let Ok(chunk) = memory.read_bytes(v.iov_base, v.iov_len as usize) else {
+                        return -LINUX_EFAULT;
+                    };
+                    buf.extend_from_slice(&chunk);
+                }
+                let n = unsafe {
+                    libc::pwrite(hfd, buf.as_ptr() as *const _, buf.len(), sqe.off as libc::off_t)
+                };
+                match n.host_syscall_errno() {
+                    Ok(put) => put as i32,
+                    Err(e) => -e,
+                }
+            }
+            LINUX_IORING_OP_FSYNC => {
+                let Some(hfd) = self.regular_host_file_fd(sqe.fd) else {
+                    return -LINUX_EINVAL;
+                };
+                match unsafe { libc::fsync(hfd) }.host_syscall_errno() {
+                    Ok(_) => 0,
                     Err(e) => -e,
                 }
             }
