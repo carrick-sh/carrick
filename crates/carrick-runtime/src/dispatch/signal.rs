@@ -550,6 +550,11 @@ impl SyscallDispatcher {
             if !self_tgids.contains(&tgid) {
                 return Ok(LINUX_ESRCH.into());
             }
+            // NOTE: the RT-signal *queue* infrastructure is in place
+            // (mark_signal_pending / rt_pending_counts), but wiring this to
+            // raise_self is deferred: a no-runtime caller of an UNBLOCKED signal
+            // would host-raise into the carrick process, so the delivery path
+            // (and the existing validation tests) need rework first.
             Ok(LINUX_ENOSYS.into())
         }
 
