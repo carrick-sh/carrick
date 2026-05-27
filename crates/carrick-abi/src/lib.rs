@@ -1441,6 +1441,12 @@ pub const LINUX_RT_SIGSET_SIZE: u64 = 8;
 pub const LINUX_MAX_SIGNUM: u64 = 64;
 pub const LINUX_SIGKILL: i32 = 9;
 pub const LINUX_SIGSTOP: i32 = 19;
+/// Signals whose DEFAULT disposition is "ignore" (Linux `man 7 signal`: the
+/// `Ign` action) — SIGCHLD, SIGURG, SIGWINCH. A no-handler instance of these is
+/// silently dropped, NOT a terminating default action. (aarch64/generic nums.)
+pub const LINUX_SIGCHLD: i32 = 17;
+pub const LINUX_SIGURG: i32 = 23;
+pub const LINUX_SIGWINCH: i32 = 28;
 /// Timer-expiry signals: ITIMER_REAL→SIGALRM, ITIMER_VIRTUAL→SIGVTALRM,
 /// ITIMER_PROF→SIGPROF (aarch64/generic numbering).
 pub const LINUX_SIGALRM: i32 = 14;
