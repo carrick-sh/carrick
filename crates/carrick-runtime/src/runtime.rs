@@ -366,7 +366,10 @@ where
     let path_str = path.to_string_lossy();
     let (file, argv) = match maybe_redirect_to_rosetta(&path_str, &file, &argv) {
         None => (file, argv),
-        Some(Ok((rosetta_bytes, new_argv))) => (rosetta_bytes, new_argv),
+        Some(Ok((rosetta_bytes, new_argv))) => {
+            dispatcher.set_executable_path(ROSETTA_INTERPRETER);
+            (rosetta_bytes, new_argv)
+        }
         Some(Err(errno)) => return Err(rosetta_unavailable(errno, &path_str)),
     };
     let image = AddressSpace::load_elf_bytes_with_reader(&file, &|p| {
@@ -412,7 +415,12 @@ where
     // Redirect x86_64 binaries through Rosetta 2 (binfmt_misc-style).
     let (bytes, argv) = match maybe_redirect_to_rosetta(path, &bytes, &argv) {
         None => (bytes, argv),
-        Some(Ok((rosetta_bytes, new_argv))) => (rosetta_bytes, new_argv),
+        Some(Ok((rosetta_bytes, new_argv))) => {
+            // /proc/self/exe should resolve to the interpreter that's actually
+            // loaded (Rosetta opens it during its startup handshake).
+            dispatcher.set_executable_path(ROSETTA_INTERPRETER);
+            (rosetta_bytes, new_argv)
+        }
         Some(Err(errno)) => return Err(rosetta_unavailable(errno, path)),
     };
     let image =

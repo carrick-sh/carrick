@@ -392,6 +392,23 @@ impl SyscallDispatcher {
             Err(errno) => return Ok(errno.into()),
         };
 
+        // `/proc/self/exe` (and the thread-self/curproc/this aliases) are
+        // symlinks to the running executable that Linux lets you open() directly
+        // to get an fd on the backing file. Resolve to the executable path so
+        // the open hits the real file. Apple's Rosetta opens this at startup
+        // (and runs its licensing ioctl on the resulting fd); under translation
+        // the executable path points at the bind-mounted Rosetta interpreter.
+        let path = match path.as_str() {
+            "/proc/self/exe" | "/proc/thread-self/exe" | "/proc/this/exe"
+            | "/proc/curproc/exe" => {
+                let exe = self.proc.lock().executable_path.clone();
+                // Avoid the circular default (`executable_path` is itself
+                // "/proc/self/exe" until an image is loaded).
+                if exe.starts_with("/proc/") { path } else { exe }
+            }
+            _ => path,
+        };
+
         // VFS-mount routing. DevVfs serves /dev/*, ProcVfs serves
         // /proc/*, SysVfs serves /sys/*. The dispatcher converts each
         // VfsHandle variant into the matching OpenDescription, then

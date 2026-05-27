@@ -176,6 +176,36 @@ pub const LINUX_SHARED_FILE_SIZE: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
 pub const LINUX_STACK_TOP: u64 = 0xff_ffff_0000; // just under 1 TiB
 pub const LINUX_STACK_SIZE: u64 = 2 * 1024 * 1024; // 2 MiB
 
+// ── Rosetta 2 high-VA alias ──────────────────────────────────────────────────
+// Apple's Rosetta Linux interpreter is a non-relocatable ET_EXEC fixed-linked at
+// 2^47. M-series HVF caps the guest IPA at 40 bits, so we cannot hv_vm_map at
+// that address. Instead — exactly as Apple's Virtualization.framework does via
+// the guest kernel's own page tables — we alias the Rosetta VA window down to a
+// low IPA: the guest's stage-1 tables translate VA 2^47.. to this low IPA, which
+// is what actually gets hv_vm_map'd (well within 40 bits). This is the ONLY
+// region whose VA differs from its IPA; everything else stays identity-mapped.
+pub const LINUX_ROSETTA_VA_BASE: u64 = 0x8000_0000_0000; // 2^47, Rosetta's link base
+pub const LINUX_ROSETTA_IPA_BASE: u64 = 0x10_0000_0000; // 64 GiB (free; < 40-bit IPA)
+pub const LINUX_ROSETTA_WINDOW_SIZE: u64 = 0x20_0000; // 2 MiB (one L2 block; Rosetta ~1.7 MiB)
+
+/// True if `va` falls in the Rosetta high-VA alias window.
+pub fn is_rosetta_va(va: u64) -> bool {
+    va >= LINUX_ROSETTA_VA_BASE && va < LINUX_ROSETTA_VA_BASE + LINUX_ROSETTA_WINDOW_SIZE
+}
+
+/// The IPA that `hv_vm_map` should use for a guest VA. Identity everywhere
+/// except the Rosetta window, which is aliased down to [`LINUX_ROSETTA_IPA_BASE`]
+/// (HVF's 40-bit IPA can't reach Rosetta's 2^47 link base). The guest's stage-1
+/// page tables carry the matching VA→IPA translation (see
+/// `stage1_identity_page_tables`).
+pub fn ipa_for_va(va: u64) -> u64 {
+    if is_rosetta_va(va) {
+        LINUX_ROSETTA_IPA_BASE + (va - LINUX_ROSETTA_VA_BASE)
+    } else {
+        va
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AddressSpace {
     entry: u64,
@@ -1187,6 +1217,27 @@ pub fn stage1_identity_page_tables() -> Vec<u8> {
         bytes[off..off + 8].copy_from_slice(&descriptor.to_le_bytes());
     }
 
+    // ----- Rosetta high-VA alias -----
+    // Map the 2 MiB window at VA 2^47 (LINUX_ROSETTA_VA_BASE) down to the low
+    // IPA at LINUX_ROSETTA_IPA_BASE, so Apple's non-relocatable Rosetta ET_EXEC
+    // can execute from its fixed link base while the actual hv_vm_map stays
+    // within HVF's 40-bit IPA. Two fresh tables (pages 6 and 7 of this region):
+    //   L0[256] (VA bits 47:39) → L1_rosetta
+    //   L1_rosetta[0] (bits 38:30) → L2_rosetta
+    //   L2_rosetta[0] (bits 29:21) = 2 MiB USER block → LINUX_ROSETTA_IPA_BASE
+    // Harmless for non-amd64 guests: they never touch 2^47, and the low IPA is
+    // only backed when a Rosetta image is actually mapped.
+    let l1_rosetta_pa = LINUX_PAGE_TABLES_BASE + 0x6000;
+    let l2_rosetta_pa = LINUX_PAGE_TABLES_BASE + 0x7000;
+    let l0_rosetta_index = (LINUX_ROSETTA_VA_BASE >> 39) as usize; // 256
+    bytes[l0_rosetta_index * 8..l0_rosetta_index * 8 + 8]
+        .copy_from_slice(&table_descriptor(l1_rosetta_pa).to_le_bytes());
+    // L1_rosetta[0] → L2_rosetta (offset 0x6000 within this buffer).
+    bytes[0x6000..0x6008].copy_from_slice(&table_descriptor(l2_rosetta_pa).to_le_bytes());
+    // L2_rosetta[0] → 2 MiB user block at the low IPA (offset 0x7000).
+    let rosetta_block = (LINUX_ROSETTA_IPA_BASE & PA_MASK_2MIB) | USER_BLOCK_FLAGS;
+    bytes[0x7000..0x7008].copy_from_slice(&rosetta_block.to_le_bytes());
+
     bytes
 }
 
@@ -1875,14 +1926,15 @@ mod stage1_tests {
     fn page_tables_reserve_spare_pool_within_kernel_block() {
         let bytes = stage1_identity_page_tables();
         assert_eq!(bytes.len() as u64, LINUX_PAGE_TABLES_SIZE);
-        // Six boot tables (0..0x6000); the rest is a spare pool of >=8 pages.
-        let spare_pages = (LINUX_PAGE_TABLES_SIZE - 0x6000) / 0x1000;
+        // Eight boot tables (0..0x8000: six identity + two Rosetta alias); the
+        // rest is a spare pool of >=8 pages.
+        let spare_pages = (LINUX_PAGE_TABLES_SIZE - 0x8000) / 0x1000;
         assert!(
             spare_pages >= 8,
             "need a spare-table pool, got {spare_pages}"
         );
         // Spare tail is zero-filled (invalid descriptors).
-        assert!(bytes[0x6000..].iter().all(|&b| b == 0));
+        assert!(bytes[0x8000..].iter().all(|&b| b == 0));
         // Whole table region stays inside the kernel hole's first 2 MiB block,
         // so it remains kernel-only (EL1) after the size bump.
         let region_end_off =
