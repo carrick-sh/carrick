@@ -19,8 +19,18 @@ pub(super) struct SignalState {
     /// signal-publish/deliver probes). Default (absent key) = empty mask.
     pub masks: HashMap<crate::thread::ThreadId, u64>,
     /// Signals raised while blocked, awaiting unblock or a synchronous wait
-    /// (`rt_sigtimedwait`), PER GUEST THREAD (bit `signum-1`).
+    /// (`rt_sigtimedwait`), PER GUEST THREAD (bit `signum-1`). For a standard
+    /// signal the bit is presence only (multiple sends coalesce, matching
+    /// Linux). For a real-time signal (SIGRTMIN..=SIGRTMAX) the COUNT of queued
+    /// instances lives in `rt_pending_counts`; the bit here just mirrors
+    /// "count > 0".
     pub pendings: HashMap<crate::thread::ThreadId, u64>,
+    /// Queue depth for pending REAL-TIME signals, keyed by `(tid, signum)`.
+    /// RT signals must deliver once per send (POSIX queuing), unlike standard
+    /// signals which coalesce — so N `rt_sigqueueinfo`/`kill` of an RT signal
+    /// while blocked must yield N deliveries on unblock. `take_pending_in`
+    /// decrements this and only clears the pending bit when it hits 0.
+    pub rt_pending_counts: HashMap<(crate::thread::ThreadId, i32), u32>,
     /// Installed alternate signal stack (`sigaltstack`), PER GUEST THREAD.
     /// `sigaltstack` is per-thread in Linux (each thread/M registers its own
     /// signal stack), so this MUST be keyed by tid: a process-global slot made
@@ -38,6 +48,7 @@ impl SignalState {
             handlers: HashMap::new(),
             masks: HashMap::new(),
             pendings: HashMap::new(),
+            rt_pending_counts: HashMap::new(),
             altstack: HashMap::new(),
         }
     }
@@ -45,6 +56,12 @@ impl SignalState {
     fn mask_for(&self, tid: crate::thread::ThreadId) -> u64 {
         self.masks.get(&tid).copied().unwrap_or(0)
     }
+}
+
+/// Real-time signals (`SIGRTMIN`..=`SIGRTMAX`, kernel numbers 32..=64) queue
+/// per POSIX; standard signals (1..=31) coalesce.
+fn is_rt_signal(signum: i32) -> bool {
+    (32..=64).contains(&signum)
 }
 
 fn sanitize_signal_mask(mut mask: u64) -> u64 {
@@ -110,10 +127,16 @@ impl SyscallDispatcher {
     }
 
     /// Record a (blocked) signal as pending for `tid`. It stays queued until the
-    /// thread unblocks it or dequeues it via `rt_sigtimedwait`.
+    /// thread unblocks it or dequeues it via `rt_sigtimedwait`. Real-time
+    /// signals queue (each send adds a deliverable instance); standard signals
+    /// coalesce (the bit is set-once), matching Linux.
     pub fn mark_signal_pending(&self, tid: crate::thread::ThreadId, signum: i32) {
         if let Some(bit) = sigmask_bit(signum) {
-            *self.signal.lock().pendings.entry(tid).or_insert(0) |= bit;
+            let mut s = self.signal.lock();
+            *s.pendings.entry(tid).or_insert(0) |= bit;
+            if is_rt_signal(signum) {
+                *s.rt_pending_counts.entry((tid, signum)).or_insert(0) += 1;
+            }
         }
     }
 
@@ -124,6 +147,7 @@ impl SyscallDispatcher {
         let mut s = self.signal.lock();
         s.masks.remove(&tid);
         s.pendings.remove(&tid);
+        s.rt_pending_counts.retain(|(t, _), _| *t != tid);
         s.altstack.remove(&tid);
     }
 
@@ -171,6 +195,22 @@ impl SyscallDispatcher {
             return None;
         }
         let signum = candidates.trailing_zeros() as i32 + 1;
+        // RT signals queue: take one instance, and only clear the pending bit
+        // once the last queued instance is drained (so N sends → N deliveries).
+        if is_rt_signal(signum) {
+            let key = (tid, signum);
+            let remaining = signal
+                .rt_pending_counts
+                .get(&key)
+                .copied()
+                .unwrap_or(0)
+                .saturating_sub(1);
+            if remaining > 0 {
+                signal.rt_pending_counts.insert(key, remaining);
+                return Some(signum); // more queued — leave the bit set
+            }
+            signal.rt_pending_counts.remove(&key);
+        }
         signal.pendings.insert(tid, cur & !(1u64 << (signum - 1)));
         Some(signum)
     }
@@ -648,4 +688,45 @@ pub(crate) fn bootstrap_signal_send(
         return DispatchOutcome::errno(errno);
     }
     DispatchOutcome::Returned { value: 0 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rt_signals_queue_while_standard_signals_coalesce() {
+        let d = SyscallDispatcher::new();
+        let tid: crate::thread::ThreadId = 1;
+
+        // A standard signal (10) sent 3× while pending coalesces to one delivery.
+        d.mark_signal_pending(tid, 10);
+        d.mark_signal_pending(tid, 10);
+        d.mark_signal_pending(tid, 10);
+        assert_eq!(d.take_deliverable_pending(tid), Some(10));
+        assert_eq!(d.take_deliverable_pending(tid), None);
+
+        // A real-time signal (34) sent 3× delivers 3× (POSIX queuing).
+        d.mark_signal_pending(tid, 34);
+        d.mark_signal_pending(tid, 34);
+        d.mark_signal_pending(tid, 34);
+        assert_eq!(d.take_deliverable_pending(tid), Some(34));
+        assert_eq!(d.take_deliverable_pending(tid), Some(34));
+        assert_eq!(d.take_deliverable_pending(tid), Some(34));
+        assert_eq!(d.take_deliverable_pending(tid), None);
+
+        // Mixed: the lowest deliverable comes first, then the RT queue drains.
+        d.mark_signal_pending(tid, 34);
+        d.mark_signal_pending(tid, 34);
+        d.mark_signal_pending(tid, 10);
+        assert_eq!(d.take_deliverable_pending(tid), Some(10));
+        assert_eq!(d.take_deliverable_pending(tid), Some(34));
+        assert_eq!(d.take_deliverable_pending(tid), Some(34));
+        assert_eq!(d.take_deliverable_pending(tid), None);
+
+        // Thread teardown clears the RT queue too (no leak into a recycled tid).
+        d.mark_signal_pending(tid, 34);
+        d.forget_thread_signal_state(tid);
+        assert_eq!(d.take_deliverable_pending(tid), None);
+    }
 }
