@@ -1361,6 +1361,15 @@ pub const LINUX_MADV_SEQUENTIAL: u64 = 2;
 pub const LINUX_MADV_WILLNEED: u64 = 3;
 pub const LINUX_MADV_DONTNEED: u64 = 4;
 pub const LINUX_MADV_FREE: u64 = 8;
+// Transparent-huge-page advisory hints. carrick presents 4 KiB guest pages and
+// cannot promote a range to a huge page, but these advices are purely advisory:
+// real Linux returns 0 for them whenever THP is built in (the common
+// `always`/`madvise` modes), so accepting them as a success no-op matches the
+// kernel and keeps allocators (Go runtime, jemalloc, glibc) from treating a
+// spurious EINVAL as a hard error.
+pub const LINUX_MADV_HUGEPAGE: u64 = 14;
+pub const LINUX_MADV_NOHUGEPAGE: u64 = 15;
+pub const LINUX_MADV_COLLAPSE: u64 = 25;
 pub const LINUX_MREMAP_MAYMOVE: u64 = 0x01;
 pub const LINUX_MREMAP_FIXED: u64 = 0x02;
 pub const LINUX_MREMAP_DONTUNMAP: u64 = 0x04;
