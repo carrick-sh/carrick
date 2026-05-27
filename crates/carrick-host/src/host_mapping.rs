@@ -1,7 +1,7 @@
 //! RAII ownership for host mmap regions that back HVF guest mappings.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum HostMappingKind {
+pub enum HostMappingKind {
     PrivateAnon,
     SharedAnon,
     ChildPrivateSnapshot,
@@ -12,14 +12,14 @@ pub(crate) enum HostMappingKind {
 /// The trap engine still performs `hv_vm_map`/`hv_vm_unmap` explicitly; this
 /// type owns only the host `mmap` lifetime and makes failure rollback local.
 #[derive(Debug)]
-pub(crate) struct OwnedHostMapping {
+pub struct OwnedHostMapping {
     ptr: *mut u8,
     len: usize,
     kind: HostMappingKind,
 }
 
 impl OwnedHostMapping {
-    pub(crate) fn map_shared_anon(
+    pub fn map_shared_anon(
         len: usize,
         kind: HostMappingKind,
     ) -> Result<Self, std::io::Error> {
@@ -58,15 +58,15 @@ impl OwnedHostMapping {
         }
     }
 
-    pub(crate) fn as_ptr(&self) -> *mut u8 {
+    pub fn as_ptr(&self) -> *mut u8 {
         self.ptr
     }
 
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.len
     }
 
-    pub(crate) fn guest_shared(&self) -> bool {
+    pub fn guest_shared(&self) -> bool {
         matches!(self.kind, HostMappingKind::SharedAnon)
     }
 }

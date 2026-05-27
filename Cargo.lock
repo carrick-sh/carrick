@@ -339,6 +339,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "carrick-host"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "carrick-image"
 version = "0.1.0"
 dependencies = [
@@ -376,6 +383,7 @@ dependencies = [
  "cap-std",
  "carrick-abi",
  "carrick-guest-mem",
+ "carrick-host",
  "carrick-image",
  "carrick-mem",
  "carrick-spec",
