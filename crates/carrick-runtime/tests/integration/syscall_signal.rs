@@ -182,7 +182,21 @@ fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
             .unwrap(),
         DispatchOutcome::Errno { errno: LINUX_ESRCH }
     );
-    // rt_sigqueueinfo(1, 1, NULL) -> ENOSYS (no signal delivery).
+    // rt_sigqueueinfo delivers to self, so block SIGHUP(1) first — the queue
+    // then holds it (rt_pending_counts) instead of raising a real host SIGHUP.
+    memory.write_bytes(0x4080, &1u64.to_le_bytes()).unwrap(); // mask = {SIGHUP}
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                // rt_sigprocmask(SIG_BLOCK=0, set=0x4080, oldset=NULL, size=8)
+                SyscallRequest::new(135, SyscallArgs::from([0, 0x4080, 0, 8, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    // rt_sigqueueinfo(1, 1, NULL) -> 0: queued to self (SIGHUP blocked).
     assert_eq!(
         dispatcher
             .dispatch(
@@ -191,9 +205,7 @@ fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno {
-            errno: LINUX_ENOSYS
-        }
+        DispatchOutcome::Returned { value: 0 }
     );
     // A forked child self-signal uses its real host pid as tgid; that must be
     // accepted as "self" rather than rejected as a nonexistent bootstrap pid.
@@ -208,9 +220,7 @@ fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno {
-            errno: LINUX_ENOSYS
-        }
+        DispatchOutcome::Returned { value: 0 }
     );
 
     // rt_sigreturn now surfaces a `SigReturn` outcome the runtime
