@@ -27,6 +27,18 @@ arg expose it as `arg0`; the rest shift accordingly. Cast pointers/ints with
 | `signal-restore` | saved_pc (u64) | sp (u64) | magic (u64) | — | — |
 | `vcpu-trap` | regs_addr (u64)⁴ | — | — | — | — |
 | `sigaction-read` | signum (i32) | … (4 u64) | | | |
+| `vcpu-fault` | esr (u64) | elr (u64) | far (u64) | x30 (u64) | sp (u64), tid (i32) |
+| `vcpu-fault-regs` | esr (u64) | elr (u64) | far (u64) | insn (u64) | rn (u32), xrn (u64) |
+
+`vcpu-fault` / `vcpu-fault-regs` fire ONLY on a guest EL0 synchronous fault
+(instruction/data abort, undef) — never on the happy path, so they're free to
+leave always-on. Use them to debug a guest SIGSEGV/SIGBUS/SIGILL: `far` is the
+HW-latched faulting address, `insn` the faulting instruction word (read
+host-side; you can't `copyin` a guest VA), `rn`/`xrn` the base register a
+load/store dereferenced (`xrn` is best-effort — read after the EL1 trampoline;
+trust `far`). Both pass SCALARS (not a copyin pointer) so they survive a fault
+that kills the process before DTrace's action runs. Ready-made script:
+`scripts/trace-guest-fault.d`.
 
 ¹ `args_addr` points at a contiguous `[u64; 6]` of syscall args:
 `this->a = (uint64_t *)copyin(arg2, 48);` then `this->a[0..5]`.
