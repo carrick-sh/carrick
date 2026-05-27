@@ -174,6 +174,28 @@ impl Kevent {
         Self::new(ident, libc::EVFILT_USER, 0, libc::NOTE_TRIGGER)
     }
 
+    /// Watch a vnode (open fd) for the given `NOTE_*` changes — the backing for
+    /// inotify watches. `EV_CLEAR` so each `kevent` returns only the changes
+    /// since the last read (edge-triggered, like inotify's event drain).
+    pub(crate) fn vnode(fd: RawFd, note: u32) -> Self {
+        Self::new(
+            fd as usize,
+            libc::EVFILT_VNODE,
+            (libc::EV_ADD | libc::EV_CLEAR) as u16,
+            note,
+        )
+    }
+
+    /// Remove a previously-added `EVFILT_VNODE` watch for `fd`.
+    pub(crate) fn vnode_delete(fd: RawFd) -> Self {
+        Self::new(fd as usize, libc::EVFILT_VNODE, libc::EV_DELETE as u16, 0)
+    }
+
+    /// The fd a returned `EVFILT_VNODE` event refers to (its `ident`).
+    pub(crate) fn vnode_ident(self) -> RawFd {
+        self.0.ident as RawFd
+    }
+
     fn new(ident: usize, filter: i16, flags: u16, fflags: u32) -> Self {
         Self(libc::kevent {
             ident,
