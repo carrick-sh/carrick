@@ -347,7 +347,7 @@ use crate::linux_abi::{
     LinuxUtsname,
     LinuxWinsize,
 };
-use crate::memory::{LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE, LINUX_MMAP_SIZE};
+use crate::memory::{LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE};
 use crate::overlay::OverlayEntry;
 use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsError, RootFsMetadata};
 use crate::syscall::lookup_aarch64;

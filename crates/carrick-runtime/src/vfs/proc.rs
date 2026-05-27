@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::linux_abi::{LINUX_EACCES, LINUX_ENOENT, LINUX_ENOTDIR};
 use crate::memory::{
     LINUX_EL0_TRAMPOLINE_BASE, LINUX_EL1_VECTORS_BASE, LINUX_HEAP_BASE, LINUX_HEAP_SIZE,
-    LINUX_MMAP_BASE, LINUX_MMAP_SIZE, LINUX_PAGE_TABLES_BASE, LINUX_SIGRETURN_TRAMPOLINE_BASE,
+    LINUX_MMAP_BASE, LINUX_PAGE_TABLES_BASE, LINUX_SIGRETURN_TRAMPOLINE_BASE,
     LINUX_STACK_SIZE, LINUX_STACK_TOP,
 };
 
@@ -308,7 +308,7 @@ fn synthetic_proc_maps(ctx: &SyntheticProcContext) -> String {
         heap_base = LINUX_HEAP_BASE,
         heap_end = LINUX_HEAP_BASE + LINUX_HEAP_SIZE,
         mmap_base = LINUX_MMAP_BASE,
-        mmap_end = LINUX_MMAP_BASE + LINUX_MMAP_SIZE,
+        mmap_end = LINUX_MMAP_BASE + crate::memory::mmap_arena_size(),
     )
 }
 
