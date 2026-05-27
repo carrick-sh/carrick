@@ -204,6 +204,65 @@ fn proc_task_dir_entries(path: &str) -> Option<Vec<DirEnt>> {
     Some(entries)
 }
 
+/// Per-process files Carrick exposes under `/proc/<pid>/` (matching
+/// `synthetic_proc_pid_file`). Listed by `readdir` so `ps`/`ls` can enumerate.
+const PROC_PID_FILES: &[&str] = &["cmdline", "comm", "stat", "status"];
+
+/// Directory listing for `/proc/<pid>` when `pid` is a known process (an own
+/// guest thread or a guest process), else `None`.
+fn proc_pid_dir_entries(path: &str) -> Option<Vec<DirEnt>> {
+    let p = path.strip_suffix('/').unwrap_or(path);
+    let pid: u32 = p.strip_prefix("/proc/")?.parse().ok()?;
+    // `synthetic_task_dir` is `Some` only for a known process (own thread or a
+    // guest process) — reuse it as the "is this a real pid" gate.
+    synthetic_task_dir(pid)?;
+    let mut entries = vec![
+        DirEnt {
+            name: ".".to_string(),
+            kind: EntryKind::Directory,
+        },
+        DirEnt {
+            name: "..".to_string(),
+            kind: EntryKind::Directory,
+        },
+        DirEnt {
+            name: "task".to_string(),
+            kind: EntryKind::Directory,
+        },
+    ];
+    entries.extend(PROC_PID_FILES.iter().map(|f| DirEnt {
+        name: (*f).to_string(),
+        kind: EntryKind::File,
+    }));
+    Some(entries)
+}
+
+/// Guest process pids (this process + its guest descendants) for enumerating
+/// `/proc`. libproc's all-pids list filtered by `is_guest_process`.
+#[cfg(target_os = "macos")]
+fn enumerate_guest_pids() -> Vec<u32> {
+    let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    if count <= 0 {
+        return Vec::new();
+    }
+    let mut pids = vec![0i32; count as usize + 16];
+    let cap = (pids.len() * std::mem::size_of::<i32>()) as libc::c_int;
+    let got = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), cap) };
+    if got <= 0 {
+        return Vec::new();
+    }
+    pids.truncate(got as usize);
+    pids.into_iter()
+        .filter(|&p| p > 0 && crate::host_proc::is_guest_process(p as u32))
+        .map(|p| p as u32)
+        .collect()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn enumerate_guest_pids() -> Vec<u32> {
+    Vec::new()
+}
+
 pub struct ProcVfs;
 
 impl ProcVfs {
@@ -220,7 +279,10 @@ impl Default for ProcVfs {
 
 impl Vfs for ProcVfs {
     fn lookup(&self, path: &str) -> Result<Metadata, VfsError> {
-        if path == "/proc" || proc_task_dir_entries(path).is_some() {
+        if path == "/proc"
+            || proc_task_dir_entries(path).is_some()
+            || proc_pid_dir_entries(path).is_some()
+        {
             return Ok(Metadata {
                 kind: EntryKind::Directory,
                 mode: 0o555,
@@ -246,8 +308,36 @@ impl Vfs for ProcVfs {
     }
 
     fn readdir(&self, path: &str) -> Result<Vec<super::DirEnt>, VfsError> {
-        if path != "/proc" {
-            return Err(LINUX_ENOTDIR);
+        if path == "/proc" {
+            // Top-level: `.`/`..`, `self`, a representative set of synthetic
+            // files, and every guest process pid (so `ps`/`ls /proc` enumerate).
+            let mut entries = vec![
+                DirEnt { name: ".".to_string(), kind: EntryKind::Directory },
+                DirEnt { name: "..".to_string(), kind: EntryKind::Directory },
+                DirEnt { name: "self".to_string(), kind: EntryKind::Directory },
+            ];
+            for name in [
+                "cpuinfo", "meminfo", "stat", "uptime", "loadavg", "version", "cmdline",
+                "mounts", "filesystems",
+            ] {
+                entries.push(DirEnt {
+                    name: name.to_string(),
+                    kind: EntryKind::File,
+                });
+            }
+            for pid in enumerate_guest_pids() {
+                entries.push(DirEnt {
+                    name: pid.to_string(),
+                    kind: EntryKind::Directory,
+                });
+            }
+            return Ok(entries);
+        }
+        if let Some(entries) = proc_task_dir_entries(path) {
+            return Ok(entries);
+        }
+        if let Some(entries) = proc_pid_dir_entries(path) {
+            return Ok(entries);
         }
         Err(LINUX_ENOTDIR)
     }
@@ -258,7 +348,7 @@ impl Vfs for ProcVfs {
         flags: OpenFlags,
         ctx: &OpenContext<'_>,
     ) -> Result<VfsHandle, VfsError> {
-        if let Some(entries) = proc_task_dir_entries(path) {
+        if let Some(entries) = proc_task_dir_entries(path).or_else(|| proc_pid_dir_entries(path)) {
             return Ok(VfsHandle::Directory {
                 path: path.to_string(),
                 entries,
@@ -820,6 +910,33 @@ mod tests {
         let md = v.lookup("/proc").unwrap();
         assert_eq!(md.kind, EntryKind::Directory);
         assert_eq!(md.mode, 0o555);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn proc_pid_dir_enumerates_and_lists_files() {
+        // Mark this process as the guest root so is_guest_process(self) is true,
+        // then /proc and /proc/<self> enumerate. Restore the root afterwards so
+        // sibling tests are unaffected.
+        let me = std::process::id();
+        crate::host_proc::set_root_guest_pid(me);
+        let v = ProcVfs::new();
+
+        // /proc/<self> is a directory listing the per-process files.
+        let pid_path = format!("/proc/{me}");
+        assert_eq!(v.lookup(&pid_path).unwrap().kind, EntryKind::Directory);
+        let files = v.readdir(&pid_path).unwrap();
+        for want in ["stat", "comm", "cmdline", "status", "task"] {
+            assert!(files.iter().any(|d| d.name == want), "missing {want}");
+        }
+        // /proc enumerates this guest process.
+        let root = v.readdir("/proc").unwrap();
+        assert!(
+            root.iter().any(|d| d.name == me.to_string()),
+            "/proc should list the guest pid {me}"
+        );
+
+        crate::host_proc::set_root_guest_pid(0);
     }
 
     #[test]
