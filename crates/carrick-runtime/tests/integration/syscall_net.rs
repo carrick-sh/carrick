@@ -150,6 +150,67 @@ fn epoll_del_of_one_dup_keeps_readiness_for_the_shared_host_socket() {
     assert_eq!(ready_data, 0xAAAA);
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn getsockopt_so_peercred_returns_linux_ucred_from_local_peercred() {
+    // SO_PEERCRED has no direct macOS equivalent; carrick synthesizes the Linux
+    // `struct ucred { pid, uid, gid }` from LOCAL_PEERCRED + LOCAL_PEERPID. A
+    // socketpair's peer is this very process, so the credentials must be ours.
+    const LINUX_AF_UNIX: u64 = 1;
+    const LINUX_SOL_SOCKET: u64 = 1;
+    const LINUX_SO_PEERCRED: u64 = 17;
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    let ret = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| -> i64 {
+        match d
+            .dispatch(SyscallRequest::new(nr, SyscallArgs::from(args)), m, &reporter)
+            .unwrap()
+        {
+            DispatchOutcome::Returned { value } => value,
+            other => panic!("nr {nr} unexpected outcome: {other:?}"),
+        }
+    };
+
+    // socketpair(AF_UNIX, SOCK_STREAM) -> connected host pair; fds @0x4000.
+    assert_eq!(
+        ret(&mut dispatcher, &mut memory, 199, [LINUX_AF_UNIX, LINUX_SOCK_STREAM as u64, 0, 0x4000, 0, 0]),
+        0
+    );
+    let pair = memory.read_bytes(0x4000, 8).unwrap();
+    let fd_a = i32::from_le_bytes([pair[0], pair[1], pair[2], pair[3]]) as u64;
+
+    // optlen @0x4010 = 12 (sizeof ucred); ucred written @0x4020.
+    memory.write_bytes(0x4010, &12u32.to_ne_bytes()).unwrap();
+    assert_eq!(
+        ret(&mut dispatcher, &mut memory, 209, [fd_a, LINUX_SOL_SOCKET, LINUX_SO_PEERCRED, 0x4020, 0x4010, 0]),
+        0
+    );
+
+    let written_len = u32::from_ne_bytes(memory.read_bytes(0x4010, 4).unwrap().try_into().unwrap());
+    assert_eq!(written_len, 12, "ucred is 12 bytes (pid,uid,gid)");
+    let cred = memory.read_bytes(0x4020, 12).unwrap();
+    let pid = u32::from_ne_bytes([cred[0], cred[1], cred[2], cred[3]]);
+    let uid = u32::from_ne_bytes([cred[4], cred[5], cred[6], cred[7]]);
+    let gid = u32::from_ne_bytes([cred[8], cred[9], cred[10], cred[11]]);
+
+    assert_eq!(uid, unsafe { libc::geteuid() }, "peer uid is our euid");
+    assert_eq!(gid, unsafe { libc::getegid() }, "peer gid is our egid");
+    // LOCAL_PEERPID is best-effort: our pid when supported, else 0.
+    let me = unsafe { libc::getpid() } as u32;
+    assert!(pid == me || pid == 0, "peer pid {pid} should be {me} or 0");
+
+    // A short optlen must clamp, not overflow the guest buffer.
+    memory.write_bytes(0x4010, &4u32.to_ne_bytes()).unwrap();
+    assert_eq!(
+        ret(&mut dispatcher, &mut memory, 209, [fd_a, LINUX_SOL_SOCKET, LINUX_SO_PEERCRED, 0x4020, 0x4010, 0]),
+        0
+    );
+    let clamped = u32::from_ne_bytes(memory.read_bytes(0x4010, 4).unwrap().try_into().unwrap());
+    assert_eq!(clamped, 4, "optlen must clamp to the guest-provided size");
+}
+
 #[test]
 fn epoll_event_matches_aarch64_c_abi_layout() {
     assert_eq!(core::mem::size_of::<LinuxEpollEvent>(), 16);

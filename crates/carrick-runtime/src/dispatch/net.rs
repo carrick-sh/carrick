@@ -2242,6 +2242,73 @@ impl SyscallDispatcher {
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 }
             }
+            // SO_PEERCRED: Linux returns `struct ucred { pid, uid, gid }`. macOS
+            // has no single equivalent, so synthesize it from LOCAL_PEERCRED
+            // (peer uid + primary gid via `xucred`) and LOCAL_PEERPID (peer pid).
+            // Used by D-Bus / systemd peer authentication over AF_UNIX. Done here
+            // because `linux_to_host_sockopt` has no Darwin opt to map it to.
+            if level == LINUX_SOL_SOCKET && optname == crate::linux_abi::LINUX_SO_PEERCRED {
+                let (host_fd, _family) = match this.host_socket_lookup(fd) {
+                    Ok(t) => t,
+                    Err(errno) => return Ok(errno.into()),
+                };
+                let mut xucred: libc::xucred = unsafe { std::mem::zeroed() };
+                let mut xlen = std::mem::size_of::<libc::xucred>() as libc::socklen_t;
+                let cred_rc = unsafe {
+                    libc::getsockopt(
+                        host_fd,
+                        libc::SOL_LOCAL,
+                        libc::LOCAL_PEERCRED,
+                        (&mut xucred as *mut libc::xucred).cast(),
+                        &mut xlen,
+                    )
+                };
+                if let Err(errno) = cred_rc.host_syscall_errno() {
+                    return Ok(errno.into());
+                }
+                // Peer pid is a separate Darwin option; best-effort (0 if absent).
+                let mut peer_pid: libc::pid_t = 0;
+                let mut plen = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+                let pid: u32 = if unsafe {
+                    libc::getsockopt(
+                        host_fd,
+                        libc::SOL_LOCAL,
+                        libc::LOCAL_PEERPID,
+                        (&mut peer_pid as *mut libc::pid_t).cast(),
+                        &mut plen,
+                    )
+                } == 0
+                {
+                    peer_pid as u32
+                } else {
+                    0
+                };
+                let gid = xucred.cr_groups.first().copied().unwrap_or(0);
+                let mut ucred = [0u8; crate::linux_abi::LINUX_UCRED_SIZE];
+                ucred[0..4].copy_from_slice(&pid.to_ne_bytes());
+                ucred[4..8].copy_from_slice(&(xucred.cr_uid).to_ne_bytes());
+                ucred[8..12].copy_from_slice(&gid.to_ne_bytes());
+                // Honor the guest's optlen: write at most what it offered and
+                // report the bytes actually written (Linux clamps to the buffer).
+                let guest_optlen = match memory.read_bytes(optlen_addr, 4) {
+                    Ok(b) => u32::from_ne_bytes([b[0], b[1], b[2], b[3]]),
+                    Err(_) => return Ok(LINUX_EFAULT.into()),
+                };
+                let n = (guest_optlen as usize).min(crate::linux_abi::LINUX_UCRED_SIZE);
+                if optval_addr != 0
+                    && n > 0
+                    && memory.write_bytes(optval_addr, &ucred[..n]).is_err()
+                {
+                    return Ok(LINUX_EFAULT.into());
+                }
+                if memory
+                    .write_bytes(optlen_addr, &(n as u32).to_ne_bytes())
+                    .is_err()
+                {
+                    return Ok(LINUX_EFAULT.into());
+                }
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            }
             let (host_fd, _family) = match this.host_socket_lookup(fd) {
                 Ok(t) => t,
                 Err(errno) => return Ok(errno.into()),
