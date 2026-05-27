@@ -1738,9 +1738,14 @@ pub const LINUX_SO_KEEPALIVE: i32 = 9;
 pub const LINUX_SO_OOBINLINE: i32 = 10;
 pub const LINUX_SO_LINGER: i32 = 13;
 pub const LINUX_SO_REUSEPORT: i32 = 15;
+pub const LINUX_SO_PEERCRED: i32 = 17;
 pub const LINUX_SO_RCVTIMEO: i32 = 20;
 pub const LINUX_SO_SNDTIMEO: i32 = 21;
 pub const LINUX_SO_ACCEPTCONN: i32 = 30;
+
+/// Wire size of Linux `struct ucred { pid_t pid; uid_t uid; gid_t gid; }`
+/// (three u32s). What `getsockopt(SOL_SOCKET, SO_PEERCRED)` returns.
+pub const LINUX_UCRED_SIZE: usize = 12;
 
 #[cfg(test)]
 mod kernel_abi_tests {
