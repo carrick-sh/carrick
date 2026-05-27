@@ -237,6 +237,7 @@ impl SyscallDispatcher {
             | OpenDescription::TimerFd { .. }
             | OpenDescription::Epoll { .. }
             | OpenDescription::Pidfd { .. }
+            | OpenDescription::Inotify { .. }
             | OpenDescription::PipeReader { .. }
             | OpenDescription::PipeWriter { .. }
             | OpenDescription::HostPipe { .. }
@@ -1235,6 +1236,7 @@ impl SyscallDispatcher {
             | OpenDescription::TimerFd { .. }
             | OpenDescription::Epoll { .. }
             | OpenDescription::Pidfd { .. }
+            | OpenDescription::Inotify { .. }
             | OpenDescription::PipeReader { .. }
             | OpenDescription::PipeWriter { .. }
             | OpenDescription::HostPipe { .. }
@@ -1278,6 +1280,7 @@ impl SyscallDispatcher {
             | OpenDescription::TimerFd { .. }
             | OpenDescription::Epoll { .. }
             | OpenDescription::Pidfd { .. }
+            | OpenDescription::Inotify { .. }
             | OpenDescription::PipeReader { .. }
             | OpenDescription::PipeWriter { .. }
             | OpenDescription::HostPipe { .. }
@@ -1307,6 +1310,16 @@ impl SyscallDispatcher {
         let open = open_file.description.read();
         match &*open {
             OpenDescription::HostSocket { host_fd, .. } => Some(*host_fd),
+            _ => None,
+        }
+    }
+
+    /// The [`InotifyState`] behind `fd` iff it is an inotify instance.
+    fn inotify_state(&self, fd: i32) -> Option<Arc<crate::inotify::InotifyState>> {
+        let open_file = self.open_file(fd)?;
+        let open = open_file.description.read();
+        match &*open {
+            OpenDescription::Inotify { state, .. } => Some(Arc::clone(state)),
             _ => None,
         }
     }
@@ -1942,6 +1955,7 @@ impl SyscallDispatcher {
                 | OpenDescription::TimerFd { .. }
                 | OpenDescription::Epoll { .. }
                 | OpenDescription::Pidfd { .. }
+                | OpenDescription::Inotify { .. }
                 | OpenDescription::PipeReader { .. }
                 | OpenDescription::PipeWriter { .. }
                 | OpenDescription::HostPipe { .. }
@@ -2049,6 +2063,7 @@ impl SyscallDispatcher {
                 | OpenDescription::TimerFd { .. }
                 | OpenDescription::Epoll { .. }
                 | OpenDescription::Pidfd { .. }
+                | OpenDescription::Inotify { .. }
                 | OpenDescription::PipeReader { .. }
                 | OpenDescription::PipeWriter { .. }
                 | OpenDescription::HostPipe { .. }
@@ -3148,7 +3163,8 @@ impl SyscallDispatcher {
                 OpenDescription::EventFd { .. }
                 | OpenDescription::TimerFd { .. }
                 | OpenDescription::Epoll { .. }
-                | OpenDescription::Pidfd { .. } => {
+                | OpenDescription::Pidfd { .. }
+                | OpenDescription::Inotify { .. } => {
                     return Ok(LINUX_EINVAL.into());
                 }
             };
@@ -3175,6 +3191,7 @@ impl SyscallDispatcher {
                 | OpenDescription::TimerFd { .. }
                 | OpenDescription::Epoll { .. }
                 | OpenDescription::Pidfd { .. }
+                | OpenDescription::Inotify { .. }
                 | OpenDescription::PipeReader { .. }
                 | OpenDescription::PipeWriter { .. }
                 | OpenDescription::HostPipe { .. }
@@ -3238,6 +3255,27 @@ impl SyscallDispatcher {
                     let nonblocking = base.status_flags() & LINUX_TFD_NONBLOCK != 0;
                     drop(open);
                     return Ok(read_timerfd(memory, address, length, &state, nonblocking));
+                }
+                OpenDescription::Inotify { state, .. } => {
+                    let state = Arc::clone(state);
+                    drop(open);
+                    // Drain queued inotify_event records into the guest buffer.
+                    // An empty queue is EAGAIN (inotify fds are overwhelmingly
+                    // used non-blocking + epoll; a true blocking wait on the
+                    // backing kqueue fd is a tracked follow-up).
+                    return Ok(match state.read_records(length) {
+                        Ok(bytes) if bytes.is_empty() => LINUX_EAGAIN.into(),
+                        Ok(bytes) => {
+                            if memory.write_bytes(address, &bytes).is_err() {
+                                LINUX_EFAULT.into()
+                            } else {
+                                DispatchOutcome::Returned {
+                                    value: bytes.len() as i64,
+                                }
+                            }
+                        }
+                        Err(errno) => errno.into(),
+                    });
                 }
                 OpenDescription::PipeReader { base, pipe } => {
                     return Ok(read_pipe(memory, address, length, pipe, base.status_flags()));
@@ -3366,6 +3404,7 @@ impl SyscallDispatcher {
                 | OpenDescription::TimerFd { .. }
                 | OpenDescription::Epoll { .. }
                 | OpenDescription::Pidfd { .. }
+                | OpenDescription::Inotify { .. }
                 | OpenDescription::PipeReader { .. }
                 | OpenDescription::PipeWriter { .. }
                 | OpenDescription::HostPipe { .. }
@@ -3427,6 +3466,7 @@ impl SyscallDispatcher {
                 | OpenDescription::TimerFd { .. }
                 | OpenDescription::Epoll { .. }
                 | OpenDescription::Pidfd { .. }
+                | OpenDescription::Inotify { .. }
                 | OpenDescription::PipeReader { .. }
                 | OpenDescription::PipeWriter { .. }
                 | OpenDescription::HostPipe { .. }
@@ -3510,6 +3550,7 @@ impl SyscallDispatcher {
                 | OpenDescription::TimerFd { .. }
                 | OpenDescription::Epoll { .. }
                 | OpenDescription::Pidfd { .. }
+                | OpenDescription::Inotify { .. }
                 | OpenDescription::PipeReader { .. }
                 | OpenDescription::PipeWriter { .. }
                 | OpenDescription::HostPipe { .. }
@@ -3583,7 +3624,8 @@ impl SyscallDispatcher {
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::Netlink { .. }
                 | OpenDescription::Epoll { .. }
-                | OpenDescription::Pidfd { .. } => LINUX_ESPIPE,
+                | OpenDescription::Pidfd { .. }
+                | OpenDescription::Inotify { .. } => LINUX_ESPIPE,
             };
             Ok(errno.into())
 
@@ -3667,7 +3709,8 @@ impl SyscallDispatcher {
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::Netlink { .. }
                 | OpenDescription::Epoll { .. }
-                | OpenDescription::Pidfd { .. } => LINUX_ESPIPE,
+                | OpenDescription::Pidfd { .. }
+                | OpenDescription::Inotify { .. } => LINUX_ESPIPE,
             };
             Ok(errno.into())
 
@@ -4041,6 +4084,64 @@ impl SyscallDispatcher {
 
             Ok(DispatchOutcome::Returned { value })
 
+        }
+
+        fn inotify_init1(this, cx, flags: u64) {
+            let known = crate::inotify::IN_NONBLOCK as u64 | crate::inotify::IN_CLOEXEC as u64;
+            if flags & !known != 0 {
+                return Ok(LINUX_EINVAL.into());
+            }
+            let Some(state) = crate::inotify::InotifyState::new() else {
+                return Ok(crate::linux_abi::LINUX_EMFILE.into());
+            };
+            let description = OpenDescription::Inotify {
+                base: OpenDescriptionBase::new(flags & LINUX_O_NONBLOCK),
+                state: Arc::new(state),
+            };
+            Ok(this.install_fd(description, linux_fd_flags_from_open_flags(flags)))
+        }
+
+        fn inotify_add_watch(this, cx, fd: Fd, pathname: GuestPtr, mask: u64) {
+            let Some(state) = this.inotify_state(fd.0) else {
+                return Ok(LINUX_EINVAL.into());
+            };
+            let path = match read_guest_c_string(&*cx.memory, pathname.0) {
+                Ok(path) => path,
+                Err(errno) => return Ok(errno.into()),
+            };
+            let path = match this.resolve_at_path(LINUX_AT_FDCWD, &path) {
+                Ok(path) => path,
+                Err(errno) => return Ok(errno.into()),
+            };
+            // A watchable host vnode comes from the host fs backend; the
+            // in-memory backend and directory targets have no host fd to
+            // register, so inotify watches require `--fs host` (ENOSPC
+            // otherwise — a documented limitation; dir-entry-name events are a
+            // separate kqueue-fidelity follow-up).
+            match this
+                .fs
+                .rootfs_vfs
+                .open_for_dispatch(&path, false, false, false, false)
+            {
+                Ok(crate::vfs::rootfs::OpenDispatchResult::HostFile { host_fd, .. }) => {
+                    Ok(match state.add_watch(host_fd, mask as u32) {
+                        Ok(wd) => DispatchOutcome::Returned { value: wd as i64 },
+                        Err(errno) => errno.into(),
+                    })
+                }
+                Ok(_) => Ok(crate::linux_abi::LINUX_ENOSPC.into()),
+                Err(errno) => Ok(errno.into()),
+            }
+        }
+
+        fn inotify_rm_watch(this, cx, fd: Fd, wd: u64) {
+            let Some(state) = this.inotify_state(fd.0) else {
+                return Ok(LINUX_EINVAL.into());
+            };
+            Ok(match state.rm_watch(wd as i32) {
+                Ok(()) => DispatchOutcome::Returned { value: 0 },
+                Err(errno) => errno.into(),
+            })
         }
 
         fn sync(this, cx) {

@@ -28,7 +28,9 @@ pub(crate) const IN_ATTRIB: u32 = 0x0000_0004;
 pub(crate) const IN_CLOSE_WRITE: u32 = 0x0000_0008;
 pub(crate) const IN_MOVED_FROM: u32 = 0x0000_0040;
 pub(crate) const IN_MOVED_TO: u32 = 0x0000_0080;
-pub(crate) const IN_CREATE: u32 = 0x0000_0100;
+// IN_CREATE (0x100) is intentionally omitted: kqueue's EVFILT_VNODE reports a
+// directory was written but not *which* entry changed, so file-creation events
+// with a name are a follow-up (see module docs); we never synthesize IN_CREATE.
 pub(crate) const IN_DELETE: u32 = 0x0000_0200;
 pub(crate) const IN_DELETE_SELF: u32 = 0x0000_0400;
 pub(crate) const IN_MOVE_SELF: u32 = 0x0000_0800;
@@ -100,6 +102,10 @@ struct Inner {
     next_wd: i32,
     watches: HashMap<i32, Watch>,
     wd_by_fd: HashMap<RawFd, i32>,
+    /// Encoded `inotify_event` records observed from the kqueue but not yet
+    /// handed to the guest (a `read(2)` whose buffer was smaller than the
+    /// available events keeps the rest here, like the kernel's event queue).
+    pending: Vec<u8>,
 }
 
 /// One inotify instance: a kqueue plus its watch-descriptor table. Owns every
@@ -118,6 +124,7 @@ impl InotifyState {
                 next_wd: 1,
                 watches: HashMap::new(),
                 wd_by_fd: HashMap::new(),
+                pending: Vec::new(),
             }),
         })
     }
@@ -133,9 +140,11 @@ impl InotifyState {
     /// existing wd (matching inotify, which returns the same wd for a re-add).
     pub(crate) fn add_watch(&self, host_fd: RawFd, mask: u32) -> Result<i32, i32> {
         let note = linux_mask_to_note(mask);
-        self.kqueue
-            .apply(&[Kevent::vnode(host_fd, note)])
-            .map_err(|_| LINUX_ENOSPC)?;
+        if self.kqueue.apply(&[Kevent::vnode(host_fd, note)]).is_err() {
+            // Registration failed: we own the fd, so don't leak it.
+            unsafe { libc::close(host_fd) };
+            return Err(LINUX_ENOSPC);
+        }
         let mut inner = self.inner.lock();
         if let Some(&wd) = inner.wd_by_fd.get(&host_fd) {
             if let Some(w) = inner.watches.get_mut(&wd) {
@@ -164,19 +173,21 @@ impl InotifyState {
         Ok(())
     }
 
-    /// Drain currently-ready vnode events into encoded Linux `inotify_event`
-    /// records (header only — self-watches carry no name). Non-blocking: a
-    /// zero timeout, so an empty drain returns an empty Vec and the caller maps
-    /// that to EAGAIN / a kqueue-fd wait.
-    pub(crate) fn drain(&self) -> Vec<u8> {
+    /// Read up to `max_bytes` of encoded Linux `inotify_event` records (header
+    /// only — self-watches carry no name). First drains any newly-ready vnode
+    /// changes from the kqueue, then returns whole records up to the caller's
+    /// buffer size, keeping the remainder queued (`pending`) for the next read.
+    /// An empty return means no events are ready (caller maps to EAGAIN / a
+    /// wait on [`poll_fd`]). A non-empty queue with `max_bytes` too small for a
+    /// single record is signalled by `Err(EINVAL)`, matching Linux.
+    pub(crate) fn read_records(&self, max_bytes: usize) -> Result<Vec<u8>, i32> {
         let mut events = [Kevent::empty(); 32];
         let timeout = libc::timespec {
             tv_sec: 0,
             tv_nsec: 0,
         };
         let n = self.kqueue.wait(&[], &mut events, Some(&timeout)).unwrap_or(0);
-        let inner = self.inner.lock();
-        let mut out = Vec::new();
+        let mut inner = self.inner.lock();
         for ev in &events[..n] {
             let fd = ev.vnode_ident();
             let Some(&wd) = inner.wd_by_fd.get(&fd) else {
@@ -187,12 +198,21 @@ impl InotifyState {
             if mask == 0 {
                 continue;
             }
-            out.extend_from_slice(&wd.to_ne_bytes());
-            out.extend_from_slice(&mask.to_ne_bytes());
-            out.extend_from_slice(&0u32.to_ne_bytes()); // cookie
-            out.extend_from_slice(&0u32.to_ne_bytes()); // len (no name)
+            inner.pending.extend_from_slice(&wd.to_ne_bytes());
+            inner.pending.extend_from_slice(&mask.to_ne_bytes());
+            inner.pending.extend_from_slice(&0u32.to_ne_bytes()); // cookie
+            inner.pending.extend_from_slice(&0u32.to_ne_bytes()); // len (no name)
         }
-        out
+        if inner.pending.is_empty() {
+            return Ok(Vec::new());
+        }
+        if max_bytes < INOTIFY_EVENT_HEADER_SIZE {
+            return Err(LINUX_EINVAL);
+        }
+        // Return whole records only, up to the buffer size.
+        let take = (max_bytes.min(inner.pending.len()) / INOTIFY_EVENT_HEADER_SIZE)
+            * INOTIFY_EVENT_HEADER_SIZE;
+        Ok(inner.pending.drain(..take).collect())
     }
 }
 
@@ -229,7 +249,7 @@ mod tests {
         f.flush().unwrap();
         drop(f);
 
-        let bytes = state.drain();
+        let bytes = state.read_records(4096).expect("read_records");
         assert!(
             bytes.len() >= INOTIFY_EVENT_HEADER_SIZE,
             "expected at least one inotify_event, got {} bytes",
