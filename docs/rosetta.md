@@ -42,19 +42,32 @@ handshake, enables hardware TSO, opens `/proc/self/exe`, parses the vDSO, reads
 from the user's own install at runtime), `CARRICK_ACCEPT_ROSETTA_TERMS=1` accepts the macOS SLA
 responsibility and silences the per-run notice.
 
-### Remaining blocker — the general VA split (deferred follow-up)
+### The general VA split — DONE
 
-Rosetta then `mmap`s a 256 MiB **`MAP_FIXED` working region at 0xf00000000000 (240 TiB)** and
-SIGSEGVs because carrick can't back arbitrary high-VA mmaps: its mmap path sub-allocates from a
-pre-mapped 384 GiB arena and never issues a dynamic `hv_vm_map`, and `PageTableManager` only
-edits permissions on the existing identity map — it can't build a fresh VA→IPA path for a
-far-flung address. Closing this requires the **general VA-virtualisation subsystem**: a
-low-IPA alias arena, a runtime "map this VA→IPA" outcome, dynamic page-table construction for
-arbitrary 48-bit VAs, and fork integration. The static image alias above is the proof-of-concept
-for that mechanism; generalising it is the next step.
+The general high-VA→low-IPA mmap subsystem is implemented (it was the deferred follow-up).
+A guest `mmap` at a VA ≥ 1 TiB (HVF's IPA ceiling) is routed to a low alias arena via
+`DispatchOutcome::MapHostAlias` → `HvfTrapEngine::map_host_alias`, which `hv_vm_map`s anon
+memory at the reserved IPA, builds a fresh VA→IPA stage-1 path
+(`PageTableManager::map_aliased`, 2 MiB blocks or 4 KiB pages), copies in the file payload for
+file-backed maps, and registers the region (VA-keyed for syscall access). Only high-VA mmaps
+take this path, so normal guests are unaffected. With it, Rosetta's 256 MiB anonymous
+translation arena at 240 TiB **and** its file-backed maps are all backed.
 
-Reproduce: `CARRICK_ACCEPT_ROSETTA_TERMS=1 carrick run --platform linux/amd64 alpine:latest /bin/uname -m`
-(add `CARRICK_TRACE_TRAPS=1` to see Rosetta's full init syscall sequence ending at the 240 TiB mmap).
+### Current frontier — Rosetta's AOT-cache / non-canonical mmap
+
+`carrick run --platform linux/amd64 --fs host alpine:latest /bin/uname -m` now runs **~30
+Rosetta init syscalls** (licence handshake, TSO, both high-VA reservations, AOT cache-dir
+creation via mkdirat, ELF-header reads, `/proc/self/fd` readlink, signal setup). It then
+`mmap`s its fd 3 at a **non-canonical `0xfffffffffff3a000`** (bits ≥48 set — untranslatable by
+the 48-bit TTBR0). carrick returns EEXIST for that `MAP_FIXED_NOREPLACE`, after which Rosetta
+gives up with `unable to mmap ELF: 17`. The high address is almost certainly read out of
+Rosetta's freshly-created (empty) AOT translation cache — i.e. the next gap is making
+Rosetta's AOT cache round-trip correctly (or forcing JIT-only), then the actual x86→arm64
+translated execution. This needs deeper Rosetta reverse-engineering.
+
+Reproduce: `CARRICK_ACCEPT_ROSETTA_TERMS=1 carrick run --platform linux/amd64 --fs host alpine:latest /bin/uname -m`
+(trace with `carrick trace --script <path>/rosetta-open.d -- run --platform linux/amd64 …`, or
+`CARRICK_TRACE_TRAPS=1` for the raw syscall stream).
 
 ---
 
