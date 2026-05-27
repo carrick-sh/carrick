@@ -569,8 +569,14 @@ impl SyscallDispatcher {
             }
         }
 
-        /// rt_sigqueueinfo(tgid, sig, info_ptr): send queue info signal.
-        fn rt_sigqueueinfo(this, cx, tgid: Pid, sig: Signal, info_ptr: GuestPtr) {
+        /// rt_sigqueueinfo(tgid, sig, info_ptr): queue `sig` to the thread group.
+        /// Self-target only (guest pid == host pid); delivered to the calling
+        /// thread like `kill`, so a blocked RT signal queues (N sends -> N
+        /// deliveries via the rt_pending_counts queue) and an unblocked one is
+        /// handed to the runtime's delivery cycle. The caller-supplied `siginfo`
+        /// is not yet propagated to the guest handler (carrick synthesizes it);
+        /// that's a follow-up.
+        fn rt_sigqueueinfo(this, cx, tgid: Pid, sig: Signal, _info_ptr: GuestPtr) {
             let tgid = i64::from(tgid.0);
             let signum = sig.0 as u64;
             if !is_valid_signum(signum) {
@@ -580,12 +586,7 @@ impl SyscallDispatcher {
             if !self_tgids.contains(&tgid) {
                 return Ok(LINUX_ESRCH.into());
             }
-            // NOTE: the RT-signal *queue* infrastructure is in place
-            // (mark_signal_pending / rt_pending_counts), but wiring this to
-            // raise_self is deferred: a no-runtime caller of an UNBLOCKED signal
-            // would host-raise into the carrick process, so the delivery path
-            // (and the existing validation tests) need rework first.
-            Ok(LINUX_ENOSYS.into())
+            Ok(this.raise_self(Self::ctx_tid(cx), signum))
         }
 
         /// rt_sigreturn(): pop signal frame and restore registers.
