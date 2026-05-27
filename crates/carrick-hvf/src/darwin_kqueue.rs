@@ -5,12 +5,12 @@ use std::os::fd::RawFd;
 
 /// RAII owner for a Darwin kqueue fd.
 #[derive(Debug)]
-pub(crate) struct Kqueue {
+pub struct Kqueue {
     fd: RawFd,
 }
 
 impl Kqueue {
-    pub(crate) fn new_internal() -> Option<Self> {
+    pub fn new_internal() -> Option<Self> {
         let raw = unsafe { libc::kqueue() };
         if raw < 0 {
             return None;
@@ -20,11 +20,11 @@ impl Kqueue {
         })
     }
 
-    pub(crate) fn raw_fd(&self) -> RawFd {
+    pub fn raw_fd(&self) -> RawFd {
         self.fd
     }
 
-    pub(crate) fn apply(&self, changes: &[Kevent]) -> Result<(), i32> {
+    pub fn apply(&self, changes: &[Kevent]) -> Result<(), i32> {
         let rc = unsafe {
             libc::kevent(
                 self.fd,
@@ -42,7 +42,7 @@ impl Kqueue {
         }
     }
 
-    pub(crate) fn wait(
+    pub fn wait(
         &self,
         changes: &[Kevent],
         events: &mut [Kevent],
@@ -84,10 +84,10 @@ impl Drop for Kqueue {
 /// raw `libc::kevent` values themselves.
 #[derive(Clone, Copy)]
 #[repr(transparent)]
-pub(crate) struct Kevent(libc::kevent);
+pub struct Kevent(libc::kevent);
 
 impl Kevent {
-    pub(crate) fn empty() -> Self {
+    pub fn empty() -> Self {
         Self(libc::kevent {
             ident: 0,
             filter: 0,
@@ -98,11 +98,11 @@ impl Kevent {
         })
     }
 
-    pub(crate) fn read(fd: RawFd, flags: u16) -> Self {
+    pub fn read(fd: RawFd, flags: u16) -> Self {
         Self::new(fd as usize, libc::EVFILT_READ, flags, 0)
     }
 
-    pub(crate) fn write(fd: RawFd, flags: u16) -> Self {
+    pub fn write(fd: RawFd, flags: u16) -> Self {
         Self::new(fd as usize, libc::EVFILT_WRITE, flags, 0)
     }
 
@@ -110,7 +110,7 @@ impl Kevent {
     /// `kevent` returns this event) when the process terminates — the macOS
     /// kernel's native process-lifecycle tracking that backs a guest pidfd.
     /// One-shot: fires once on exit.
-    pub(crate) fn proc_exit(pid: i32) -> Self {
+    pub fn proc_exit(pid: i32) -> Self {
         Self::new(
             pid as usize,
             libc::EVFILT_PROC,
@@ -122,40 +122,40 @@ impl Kevent {
     /// Delete a previously-added `EVFILT_PROC`/`NOTE_EXIT` watch for `pid`.
     /// `proc_exit` is `EV_ONESHOT` (auto-removed once it fires), so this is only
     /// needed to drop a watch whose wait was interrupted before the exit fired.
-    pub(crate) fn proc_exit_delete(pid: i32) -> Self {
+    pub fn proc_exit_delete(pid: i32) -> Self {
         Self::new(pid as usize, libc::EVFILT_PROC, libc::EV_DELETE as u16, 0)
     }
 
     /// Stash a small integer (a guest fd) in `udata` so a returned event maps
     /// straight back to its guest fd without a reverse lookup. Used by the
     /// epoll-backing kqueue (`dispatch::net`).
-    pub(crate) fn with_udata(mut self, udata: i32) -> Self {
+    pub fn with_udata(mut self, udata: i32) -> Self {
         self.0.udata = udata as isize as *mut libc::c_void;
         self
     }
 
     /// The kqueue filter (`EVFILT_READ`/`EVFILT_WRITE`/`EVFILT_USER`/…).
-    pub(crate) fn filter(self) -> i16 {
+    pub fn filter(self) -> i16 {
         self.0.filter
     }
 
     /// The event flags (`EV_EOF`, `EV_ERROR`, …) on a returned event.
-    pub(crate) fn flags(self) -> u16 {
+    pub fn flags(self) -> u16 {
         self.0.flags
     }
 
     /// The filter-specific flags (`fflags`) — for `EV_EOF` this carries the
     /// socket/pipe error code, which maps to `EPOLLERR`.
-    pub(crate) fn fflags(self) -> u32 {
+    pub fn fflags(self) -> u32 {
         self.0.fflags
     }
 
     /// The integer previously stashed via [`with_udata`] (the guest fd).
-    pub(crate) fn udata_i32(self) -> i32 {
+    pub fn udata_i32(self) -> i32 {
         self.0.udata as isize as i32
     }
 
-    pub(crate) fn user(ident: usize, flags: u16) -> Self {
+    pub fn user(ident: usize, flags: u16) -> Self {
         Self::new(ident, libc::EVFILT_USER, flags, 0)
     }
 
@@ -164,7 +164,7 @@ impl Kevent {
     /// `EV_ADD` for a repeating timer, and `EV_DELETE` (with `interval_ns` 0)
     /// to disarm. The `ident` lives in the EVFILT_TIMER namespace, distinct
     /// from EVFILT_READ fds and EVFILT_USER idents.
-    pub(crate) fn timer(ident: usize, flags: u16, interval_ns: i64) -> Self {
+    pub fn timer(ident: usize, flags: u16, interval_ns: i64) -> Self {
         let mut ev = Self::new(ident, libc::EVFILT_TIMER, flags, libc::NOTE_NSECONDS);
         ev.0.data = interval_ns as isize;
         ev
@@ -177,7 +177,7 @@ impl Kevent {
     /// Watch a vnode (open fd) for the given `NOTE_*` changes — the backing for
     /// inotify watches. `EV_CLEAR` so each `kevent` returns only the changes
     /// since the last read (edge-triggered, like inotify's event drain).
-    pub(crate) fn vnode(fd: RawFd, note: u32) -> Self {
+    pub fn vnode(fd: RawFd, note: u32) -> Self {
         Self::new(
             fd as usize,
             libc::EVFILT_VNODE,
@@ -187,12 +187,12 @@ impl Kevent {
     }
 
     /// Remove a previously-added `EVFILT_VNODE` watch for `fd`.
-    pub(crate) fn vnode_delete(fd: RawFd) -> Self {
+    pub fn vnode_delete(fd: RawFd) -> Self {
         Self::new(fd as usize, libc::EVFILT_VNODE, libc::EV_DELETE as u16, 0)
     }
 
     /// The fd a returned `EVFILT_VNODE` event refers to (its `ident`).
-    pub(crate) fn vnode_ident(self) -> RawFd {
+    pub fn vnode_ident(self) -> RawFd {
         self.0.ident as RawFd
     }
 
@@ -207,16 +207,16 @@ impl Kevent {
         })
     }
 
-    pub(crate) fn is_read_for_fd(self, fd: RawFd) -> bool {
+    pub fn is_read_for_fd(self, fd: RawFd) -> bool {
         self.0.ident as RawFd == fd && self.0.filter == libc::EVFILT_READ
     }
 
-    pub(crate) fn is_read(self) -> bool {
+    pub fn is_read(self) -> bool {
         self.0.filter == libc::EVFILT_READ
     }
 
     /// If this event is an EVFILT_TIMER firing, its timer ident; else `None`.
-    pub(crate) fn timer_ident(self) -> Option<usize> {
+    pub fn timer_ident(self) -> Option<usize> {
         if self.0.filter == libc::EVFILT_TIMER {
             Some(self.0.ident)
         } else {
@@ -225,12 +225,12 @@ impl Kevent {
     }
 
     #[cfg(test)]
-    pub(crate) fn is_user(self, ident: usize) -> bool {
+    pub fn is_user(self, ident: usize) -> bool {
         self.0.ident == ident && self.0.filter == libc::EVFILT_USER
     }
 }
 
-pub(crate) fn trigger_user(kq: RawFd, ident: usize) -> Result<(), i32> {
+pub fn trigger_user(kq: RawFd, ident: usize) -> Result<(), i32> {
     let trigger = Kevent::trigger_user(ident);
     let rc = unsafe {
         libc::kevent(
@@ -252,7 +252,7 @@ pub(crate) fn trigger_user(kq: RawFd, ident: usize) -> Result<(), i32> {
 /// Apply kevent changes to a kqueue identified by raw fd (no RAII owner).
 /// Used to register/disarm timers on the signal pump's published kqueue from
 /// a different thread, mirroring `trigger_user`.
-pub(crate) fn apply_changes(kq: RawFd, changes: &[Kevent]) -> Result<(), i32> {
+pub fn apply_changes(kq: RawFd, changes: &[Kevent]) -> Result<(), i32> {
     let rc = unsafe {
         libc::kevent(
             kq,

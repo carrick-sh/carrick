@@ -439,7 +439,7 @@ fn duplicate_internal_fd(fd: i32) -> Option<i32> {
     if duped >= 0 { Some(duped) } else { None }
 }
 
-pub(crate) fn relocate_internal_fd(fd: i32) -> i32 {
+pub fn relocate_internal_fd(fd: i32) -> i32 {
     let Some(duped) = duplicate_internal_fd(fd) else {
         return fd;
     };

@@ -13,7 +13,7 @@ use crate::memory::{LINUX_SHARED_FILE_BASE, LINUX_SHARED_FILE_SIZE};
 /// spec's backing-object model; later plans add `PrivateAnon`, `PrivateFile`,
 /// and `CarrickKernel`. The shared aperture only ever holds shared backings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BackingObject {
+pub enum BackingObject {
     /// Guest `MAP_SHARED | MAP_ANON`: lives entirely in the aperture's host
     /// backing, shared across `fork(2)`, never copied. No writeback.
     SharedAnon,
@@ -26,7 +26,7 @@ pub(crate) enum BackingObject {
 
 /// One live allocation within the shared aperture.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct SharedAlloc {
+pub struct SharedAlloc {
     pub guest_addr: u64,
     pub len: u64,
     pub backing: BackingObject,
@@ -37,7 +37,7 @@ pub(crate) struct SharedAlloc {
 /// All sizes/addresses are HVF-granule (`0x4000`) aligned. No HVF calls happen
 /// here — the window is `hv_vm_map`'d once at boot.
 #[derive(Debug, Clone)]
-pub(crate) struct SharedAperture {
+pub struct SharedAperture {
     next: u64,
     /// Freed `(start, len)` ranges, sorted by start, coalesced. Reused before
     /// the bump cursor advances.
@@ -56,8 +56,14 @@ fn align_up(value: u64, align: u64) -> Option<u64> {
     }
 }
 
+impl Default for SharedAperture {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SharedAperture {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             next: LINUX_SHARED_FILE_BASE,
             free: Vec::new(),
@@ -71,7 +77,7 @@ impl SharedAperture {
 
     /// Reserve `len` bytes (rounded up to the granule). Returns the guest IPA,
     /// or `None` if the window is exhausted. Records the backing.
-    pub(crate) fn alloc(&mut self, len: u64, backing: BackingObject) -> Option<u64> {
+    pub fn alloc(&mut self, len: u64, backing: BackingObject) -> Option<u64> {
         if len == 0 {
             return None;
         }
@@ -108,7 +114,7 @@ impl SharedAperture {
     /// Free the allocation starting at `guest_addr`. Returns the removed
     /// allocation (so the caller can write back / close the fd), or `None` if
     /// no live allocation starts there.
-    pub(crate) fn free(&mut self, guest_addr: u64) -> Option<SharedAlloc> {
+    pub fn free(&mut self, guest_addr: u64) -> Option<SharedAlloc> {
         let pos = self.live.iter().position(|a| a.guest_addr == guest_addr)?;
         let alloc = self.live.remove(pos);
         free_insert(&mut self.free, alloc.guest_addr, alloc.len);
@@ -116,7 +122,7 @@ impl SharedAperture {
     }
 
     /// All live allocations (used by `msync`-all and fork bookkeeping).
-    pub(crate) fn live(&self) -> &[SharedAlloc] {
+    pub fn live(&self) -> &[SharedAlloc] {
         &self.live
     }
 }
