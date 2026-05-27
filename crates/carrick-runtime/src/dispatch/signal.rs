@@ -352,16 +352,46 @@ impl SyscallDispatcher {
         /// rt_sigsuspend(mask_ptr, sigset_size): suspend thread until signal.
         fn rt_sigsuspend(this, cx, mask_ptr: GuestPtr, sigset_size: u64) {
             let mask_ptr = mask_ptr.0;
+            let tid = Self::ctx_tid(cx);
             let memory = &*cx.memory;
             if sigset_size != LINUX_RT_SIGSET_SIZE {
                 return Ok(LINUX_EINVAL.into());
             }
-            if memory
-                .read_bytes(mask_ptr, LINUX_RT_SIGSET_SIZE as usize)
-                .is_err()
-            {
-                return Ok(LINUX_EFAULT.into());
+            let mask_bytes = match memory.read_bytes(mask_ptr, LINUX_RT_SIGSET_SIZE as usize) {
+                Ok(bytes) => bytes,
+                Err(_) => return Ok(LINUX_EFAULT.into()),
+            };
+            let suspend_mask = sanitize_signal_mask(u64::from_le_bytes(
+                mask_bytes.try_into().unwrap_or([0; 8]),
+            ));
+            // sigsuspend: atomically install `suspend_mask`, wait until a signal
+            // deliverable under it arrives (so the runtime's delivery cycle runs
+            // the handler), then restore the prior mask and return -EINTR. The
+            // wait is bounded (like rt_sigtimedwait) rather than truly infinite:
+            // a no-signal timeout yields a spurious EINTR, which the canonical
+            // `while (!flag) sigsuspend(&mask)` idiom re-suspends through. A
+            // pending signal already deliverable under the mask returns at once.
+            let original = this.signal_mask_for(tid);
+            this.restore_signal_mask(tid, suspend_mask);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let pending = this.signal.lock().pendings.get(&tid).copied().unwrap_or(0);
+                if pending & !suspend_mask != 0 {
+                    break; // a queued signal is now deliverable
+                }
+                let host_pending = crate::host_signal::take_pending();
+                if host_pending != 0 {
+                    // Re-raise so the runtime's delivery cycle injects the
+                    // handler after this syscall returns EINTR.
+                    crate::host_signal::raise_for_self(host_pending);
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
             }
+            this.restore_signal_mask(tid, original);
             Ok(LINUX_EINTR.into())
         }
 
