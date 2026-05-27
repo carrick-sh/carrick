@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use crate::compat::{CompatReport, CompatReporter};
 use crate::dispatch::{
-    Aarch64SyscallFrame, DispatchError, DispatchOutcome, GuestMemory, ProcMapsEntry,
+    Aarch64SyscallFrame, DispatchError, DispatchOutcome, GuestMemory, MemoryError, ProcMapsEntry,
     SyscallDispatcher, SyscallRequest,
 };
 use crate::memory::{AddressSpace, AddressSpaceError};
@@ -2547,223 +2547,110 @@ fn forked_child_die_by_signal(
     }
 }
 
+/// Adapter presenting a separate (`memory`, `trap`) pair as one
+/// `GuestMemory + SyscallTrap` object, so `run_split_loop` reuses the combined
+/// run loop instead of duplicating its ~200-line body. `GuestMemory` delegates
+/// to `mem`, `SyscallTrap` to `trap`.
+struct SplitView<'a, M: GuestMemory, T: SyscallTrap> {
+    mem: &'a mut M,
+    trap: &'a mut T,
+}
+
+impl<M: GuestMemory, T: SyscallTrap> GuestMemory for SplitView<'_, M, T> {
+    fn read_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+        self.mem.read_bytes(address, length)
+    }
+    fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+        self.mem.write_bytes(address, bytes)
+    }
+    fn set_no_access(&mut self, address: u64, len: usize, no_access: bool) {
+        self.mem.set_no_access(address, len, no_access);
+    }
+    fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
+        self.mem.protect_range(address, len, prot)
+    }
+    fn unmap_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+        self.mem.unmap_range(address, len)
+    }
+    fn shared_futex_host_addr(&self, guest_addr: u64) -> Option<usize> {
+        self.mem.shared_futex_host_addr(guest_addr)
+    }
+}
+
+impl<M: GuestMemory, T: SyscallTrap> SyscallTrap for SplitView<'_, M, T> {
+    fn next_syscall(&mut self) -> Result<Option<Aarch64SyscallFrame>, TrapError> {
+        self.trap.next_syscall()
+    }
+    fn current_pc(&self) -> Result<u64, TrapError> {
+        self.trap.current_pc()
+    }
+    fn complete_syscall(&mut self, return_value: i64) -> Result<(), TrapError> {
+        self.trap.complete_syscall(return_value)
+    }
+    fn fork(&mut self) -> Result<crate::trap::ForkOutcome, TrapError> {
+        self.trap.fork()
+    }
+    fn execve_into(&mut self, new_image: &AddressSpace) -> Result<(), TrapError> {
+        self.trap.execve_into(new_image)
+    }
+    fn is_forked_child(&self) -> bool {
+        self.trap.is_forked_child()
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn inject_signal(
+        &mut self,
+        signum: i32,
+        handler: u64,
+        sa_restorer: u64,
+        pending_syscall_retval: Option<i64>,
+        interrupted_pc: Option<u64>,
+        altstack: Option<(u64, u64)>,
+        saved_sigmask: u64,
+        fault_siginfo: Option<(i32, u64)>,
+    ) -> Result<(), TrapError> {
+        self.trap.inject_signal(
+            signum,
+            handler,
+            sa_restorer,
+            pending_syscall_retval,
+            interrupted_pc,
+            altstack,
+            saved_sigmask,
+            fault_siginfo,
+        )
+    }
+    fn restore_from_sigframe(&mut self) -> Result<u64, TrapError> {
+        self.trap.restore_from_sigframe()
+    }
+    fn set_memory_model(&mut self, tso: bool) -> Result<(), TrapError> {
+        self.trap.set_memory_model(tso)
+    }
+    fn map_host_alias(
+        &mut self,
+        va: u64,
+        ipa: u64,
+        len: u64,
+        payload: &[u8],
+    ) -> Result<(), TrapError> {
+        self.trap.map_host_alias(va, ipa, len, payload)
+    }
+}
+
+/// Single-threaded run loop over a separate (`memory`, `trap`) pair. Wraps them
+/// in a [`SplitView`] and delegates to `run_combined_syscall_loop_with_dispatcher`
+/// — one loop body, two entry shapes (this was ~200 duplicated lines).
 fn run_split_loop<M, T>(
     memory: &mut M,
     trap: &mut T,
-    mut dispatcher: SyscallDispatcher,
+    dispatcher: SyscallDispatcher,
     max_traps: usize,
 ) -> Result<RunResult, RuntimeError>
 where
     M: GuestMemory,
     T: SyscallTrap,
 {
-    let reporter = CompatReporter::default();
-    crate::host_signal::install_default_handlers();
-    // Snapshot the host stdin termios so a guest crash mid-`stty raw`
-    // doesn't leave the user's terminal wedged. The guard drops at the
-    // end of this function and restores the saved state if we touched
-    // it.
-    let _termios_guard = crate::host_tty::TermiosRestoreGuard::new();
-
-    let this_tid = std::process::id() as ThreadId;
-    // Per-thread blocking-I/O waiter (owns this thread's kqueue). Recreated in
-    // a forked child below (kqueue is not inherited across fork).
-    let mut waiter = crate::io_wait::ThreadWaiter::new(this_tid);
-    for traps in 1..=max_traps {
-        let frame = match trap.next_syscall()? {
-            Some(f) => f,
-            None => {
-                // Kicked out of the guest for signal delivery (process-directed
-                // pump). Deliver at the interrupted PC, then resume.
-                let pc = trap.current_pc()?;
-                if let Some(action) =
-                    deliver_pending_signal(trap, &dispatcher, None, this_tid, Some(pc))?
-                    && let Some(signum) = action.term_signal
-                {
-                    if trap.is_forked_child() {
-                        forked_child_die_by_signal(
-                            signum,
-                            dispatcher.stdout(),
-                            dispatcher.stderr(),
-                        );
-                    }
-                    return Ok(RunResult {
-                        exit_code: 128 + signum,
-                        stdout: dispatcher.stdout().to_vec(),
-                        stderr: dispatcher.stderr().to_vec(),
-                        traps,
-                        report: reporter.finish(),
-                        trap_limit_hit: false,
-                    });
-                }
-                continue;
-            }
-        };
-        let outcome = dispatch_single_threaded_syscall(
-            &mut dispatcher,
-            SyscallRequest::from_aarch64_frame(frame),
-            memory,
-            &reporter,
-            &mut waiter,
-        )?;
-
-        let mut last_syscall_retval: Option<i64> = None;
-
-        match outcome {
-            DispatchOutcome::WaitOnFds { .. }
-            | DispatchOutcome::WaitOnPollFds { .. }
-            | DispatchOutcome::WaitOnProcExit { .. } => {
-                let value = -(crate::linux_abi::LINUX_EINTR as i64);
-                trap.complete_syscall(value)?;
-                last_syscall_retval = Some(value);
-            }
-            DispatchOutcome::Exit { code } => {
-                if trap.is_forked_child() {
-                    forked_child_exit(code, dispatcher.stdout(), dispatcher.stderr());
-                }
-                return Ok(RunResult {
-                    exit_code: code,
-                    stdout: dispatcher.stdout().to_vec(),
-                    stderr: dispatcher.stderr().to_vec(),
-                    traps,
-                    report: reporter.finish(),
-                    trap_limit_hit: false,
-                });
-            }
-            DispatchOutcome::Returned { value } => {
-                trap.complete_syscall(value)?;
-                last_syscall_retval = Some(value);
-            }
-            DispatchOutcome::Errno { errno } => {
-                let value = -(errno as i64);
-                trap.complete_syscall(value)?;
-                last_syscall_retval = Some(value);
-            }
-            DispatchOutcome::Fork { pidfd_out } => {
-                let outcome = trap.fork()?;
-                let retval: i64 = match outcome {
-                    crate::trap::ForkOutcome::Parent { child_pid } => {
-                        waiter = crate::io_wait::ThreadWaiter::new(this_tid);
-                        // CLONE_PIDFD: hand the parent a pidfd for the new child.
-                        if let Some(addr) = pidfd_out {
-                            let fd = dispatcher.install_child_pidfd(child_pid).unwrap_or(-1);
-                            let _ = memory.write_bytes(addr, &fd.to_le_bytes());
-                        }
-                        i64::from(child_pid)
-                    }
-                    crate::trap::ForkOutcome::Child => {
-                        dispatcher.clear_output_buffers();
-                        // kqueue is NOT inherited across fork, and the inherited
-                        // self-pipe is shared with the parent — give the child
-                        // fresh ones so its parked-thread wakes are its own.
-                        crate::host_signal::reinit_after_fork();
-                        // The child's pid changed; its waiter watches for
-                        // signals targeted at the new tid (or process-directed).
-                        waiter = crate::io_wait::ThreadWaiter::new(std::process::id() as ThreadId);
-                        0
-                    }
-                };
-                trap.complete_syscall(retval)?;
-                last_syscall_retval = Some(retval);
-            }
-            DispatchOutcome::Execve { path, argv, env } => {
-                crate::probes::execve_argv(&path, &argv);
-                let proc_argv = argv.clone();
-                // Reflect the new program into the host process name
-                // (`carrick: <basename>`), so a hung forked-exec'd
-                // child is identifiable in `ps -M` / Activity Monitor.
-                let base = path.rsplit('/').next().unwrap_or(&path);
-                crate::dispatch::set_host_process_name(base.as_bytes());
-                match load_execve_image(&dispatcher, &path, argv, env) {
-                    Ok(new_image) => {
-                        crate::probes::execve_loaded(
-                            &path,
-                            new_image.entry(),
-                            new_image.initial_stack_pointer().unwrap_or(0),
-                            new_image.regions().len() as u64,
-                        );
-                        // Linux semantics: drop every fd marked FD_CLOEXEC.
-                        // Without this, a forked-then-exec'd child keeps
-                        // its parent's pipe ends open, which leaves the
-                        // host kernel pipe in a state where the parent's
-                        // POLLIN can't fire — the cause of the apt update
-                        // deadlock between apt-main and its http method.
-                        dispatcher.set_executable_identity(path.clone(), proc_argv);
-                        dispatcher.close_cloexec_fds();
-                        trap.execve_into(&new_image)?;
-                    }
-                    Err(errno) => {
-                        let value = -(errno as i64);
-                        trap.complete_syscall(value)?;
-                        last_syscall_retval = Some(value);
-                    }
-                }
-            }
-            DispatchOutcome::SigReturn => {
-                let restored_sigmask = trap.restore_from_sigframe()?;
-                dispatcher.restore_signal_mask(this_tid, restored_sigmask);
-                // Deliver the next pending signal (if any) before resuming —
-                // the kernel delivers all deliverable pending signals before
-                // returning to userspace. The just-handled signal was cleared
-                // when delivered, so this can't re-deliver it.
-            }
-            DispatchOutcome::SetMemoryModel { tso } => {
-                // Rosetta requested hardware x86_64 TSO on this vCPU.
-                trap.set_memory_model(tso)?;
-                trap.complete_syscall(0)?;
-                last_syscall_retval = Some(0);
-            }
-            DispatchOutcome::MapHostAlias {
-                va,
-                ipa,
-                len,
-                payload,
-            } => {
-                trap.map_host_alias(va, ipa, len, &payload)?;
-                trap.complete_syscall(va as i64)?;
-                last_syscall_retval = Some(va as i64);
-            }
-            DispatchOutcome::CloneThread { .. }
-            | DispatchOutcome::ThreadExit { .. }
-            | DispatchOutcome::SignalThread { .. }
-            | DispatchOutcome::FutexWait { .. }
-            | DispatchOutcome::SharedFutexWait { .. } => {
-                // These are emitted only on the multi-threaded
-                // `dispatch_threaded` path (run_vcpu_until_exit). The
-                // single-threaded loops here always pass `thread: None`, so
-                // the dispatcher never produces them.
-                let value = -(crate::linux_abi::LINUX_ENOSYS as i64);
-                trap.complete_syscall(value)?;
-                last_syscall_retval = Some(value);
-            }
-        }
-
-        if let Some(action) =
-            deliver_pending_signal(trap, &dispatcher, last_syscall_retval, this_tid, None)?
-            && let Some(signum) = action.term_signal
-        {
-            if trap.is_forked_child() {
-                forked_child_die_by_signal(signum, dispatcher.stdout(), dispatcher.stderr());
-            }
-            return Ok(RunResult {
-                exit_code: 128 + signum,
-                stdout: dispatcher.stdout().to_vec(),
-                stderr: dispatcher.stderr().to_vec(),
-                traps,
-                report: reporter.finish(),
-                trap_limit_hit: false,
-            });
-        }
-    }
-
-    Ok(RunResult {
-        exit_code: -1,
-        stdout: dispatcher.stdout().to_vec(),
-        stderr: dispatcher.stderr().to_vec(),
-        traps: max_traps,
-        report: reporter.finish(),
-        trap_limit_hit: true,
-    })
+    let mut view = SplitView { mem: memory, trap };
+    run_combined_syscall_loop_with_dispatcher(&mut view, dispatcher, max_traps)
 }
 
 impl SyscallTrap for HvfTrapEngine {
