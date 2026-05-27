@@ -137,6 +137,7 @@ pub(super) fn deliver_fault_signal(
         altstack,
         saved_sigmask,
         Some((si_code, si_addr)),
+        false, // a synchronous fault re-runs the faulting instruction, never a syscall restart
     )?;
     Ok(None)
 }

@@ -1958,6 +1958,18 @@ where
             } else {
                 None
             };
+            // SA_RESTART: if this handler interrupted a blocking, restartable
+            // syscall that returned EINTR, restart it instead of surfacing the
+            // EINTR. Only on the syscall-boundary path (interrupted_pc is None);
+            // a kick/preempt resumes mid-instruction, not at a syscall, and the
+            // restartable set excludes the timeout-bearing waits (poll/select/
+            // epoll/nanosleep) that EINTR even under SA_RESTART on Linux.
+            let restart_syscall = interrupted_pc.is_none()
+                && last_syscall_retval == Some(-(crate::linux_abi::LINUX_EINTR as i64))
+                && action.sa_flags & crate::linux_abi::LINUX_SA_RESTART != 0
+                && trap
+                    .last_syscall_nr()
+                    .is_some_and(is_restartable_syscall);
             let saved_sigmask = dispatcher.enter_signal_handler(tid, pending, action);
             trap.inject_signal(
                 pending,
@@ -1968,6 +1980,7 @@ where
                 altstack,
                 saved_sigmask,
                 None, // SI_USER-shaped (tkill/sysmon); faults use deliver_fault_signal
+                restart_syscall,
             )?;
             Ok(Some(PendingSignalAction { term_signal: None }))
         }
@@ -1988,6 +2001,31 @@ where
             term_signal: Some(pending),
         })),
     }
+}
+
+/// Linux aarch64 syscall numbers that auto-restart when interrupted by an
+/// SA_RESTART handler (the kernel's `ERESTARTSYS` set). DELIBERATELY EXCLUDES
+/// the timeout-bearing waits — poll/ppoll/select/pselect6/epoll_wait/
+/// epoll_pwait/nanosleep/clock_nanosleep/futex/rt_sigtimedwait — which return
+/// EINTR even under SA_RESTART on Linux (`ERESTART_RESTARTBLOCK`/no-restart), so
+/// restarting them would diverge from the oracle. The blocking, restartable
+/// file/socket/process-wait calls are what LTP's `tst_test` reap needs.
+fn is_restartable_syscall(nr: u64) -> bool {
+    // Scoped to the process-wait pair (wait4 + waitid) — exactly what LTP's
+    // `tst_test` parent reap needs, and verified to match Linux via the
+    // `waitrestart` probe + getpid01 (0/100 -> 100/100). The broader classic
+    // restart set (read/write/accept/connect/recv/send/ioctl/fcntl/flock/
+    // openat) is INTENTIONALLY excluded for now: enabling it segfaulted
+    // signal-heavy children (e.g. sigaltstack02), so restarting those paths has
+    // a separate bug (likely a stale ELR_EL1 on a non-wait blocking path) that
+    // must be root-caused before they can be safely restarted. Timeout-bearing
+    // waits (poll/select/epoll/nanosleep/futex/rt_sigtimedwait) are excluded by
+    // design — Linux returns EINTR for them even under SA_RESTART.
+    matches!(
+        nr,
+        95  // waitid
+        | 260 // wait4
+    )
 }
 
 /// Signals whose DEFAULT disposition is "ignore" (Linux `Ign`): a no-handler
@@ -2243,6 +2281,7 @@ impl<M: GuestMemory, T: SyscallTrap> SyscallTrap for SplitView<'_, M, T> {
         altstack: Option<(u64, u64)>,
         saved_sigmask: u64,
         fault_siginfo: Option<(i32, u64)>,
+        restart_syscall: bool,
     ) -> Result<(), TrapError> {
         self.trap.inject_signal(
             signum,
@@ -2253,7 +2292,11 @@ impl<M: GuestMemory, T: SyscallTrap> SyscallTrap for SplitView<'_, M, T> {
             altstack,
             saved_sigmask,
             fault_siginfo,
+            restart_syscall,
         )
+    }
+    fn last_syscall_nr(&self) -> Option<u64> {
+        self.trap.last_syscall_nr()
     }
     fn restore_from_sigframe(&mut self) -> Result<u64, TrapError> {
         self.trap.restore_from_sigframe()
