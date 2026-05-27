@@ -390,6 +390,8 @@ macro_rules! define_syscall {
 mod abi_args;
 #[macro_use]
 mod creds;
+mod epoll_shim;
+pub(crate) use epoll_shim::{notify_inmem_epoll, register_epoll_kqueue, unregister_epoll_kqueue};
 mod fd_table;
 #[macro_use]
 mod fs;
@@ -790,31 +792,6 @@ pub struct SyscallDispatcher {
     /// process memory copy and sibling threads share them (process-wide), which
     /// matches Linux's filter-inheritance semantics. See [`crate::seccomp`].
     seccomp: crate::seccomp::SeccompState,
-}
-
-/// Live epoll-instance kqueue fds, so an in-memory readiness change
-/// (eventfd/pipe/timerfd) can wake every `epoll_wait` blocked on one. Go's
-/// `netpollBreak` writes an eventfd to wake the poller; that fd isn't host-backed,
-/// so without this the blocked io_wait on the instance kqueue never sees it → a
-/// lost wakeup → the c>=32 netpoller stall (all Ps idle until the 5s deadline).
-static EPOLL_INMEM_KQUEUES: Mutex<Vec<i32>> = Mutex::new(Vec::new());
-
-pub(crate) fn register_epoll_kqueue(fd: i32) {
-    EPOLL_INMEM_KQUEUES.lock().push(fd);
-}
-
-pub(crate) fn unregister_epoll_kqueue(fd: i32) {
-    EPOLL_INMEM_KQUEUES.lock().retain(|&f| f != fd);
-}
-
-/// Wake every epoll instance (via its `EVFILT_USER(0)`) so a thread blocked in
-/// `epoll_wait` re-checks in-memory fd readiness. Call when an eventfd/pipe/
-/// timerfd becomes readable. A coarse broadcast — a spurious wake just makes the
-/// poller recompute and find nothing, which is harmless.
-pub(crate) fn notify_inmem_epoll() {
-    for &fd in EPOLL_INMEM_KQUEUES.lock().iter() {
-        let _ = crate::darwin_kqueue::trigger_user(fd, 0);
-    }
 }
 
 /// Owns an epoll instance's kqueue and keeps it in the in-memory-wake registry
