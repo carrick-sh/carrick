@@ -53,21 +53,33 @@ file-backed maps, and registers the region (VA-keyed for syscall access). Only h
 take this path, so normal guests are unaffected. With it, Rosetta's 256 MiB anonymous
 translation arena at 240 TiB **and** its file-backed maps are all backed.
 
-### Current frontier — Rosetta's AOT-cache / non-canonical mmap
+### Current frontier — TTBR1 / x86-64 high-half addresses
 
 `carrick run --platform linux/amd64 --fs host alpine:latest /bin/uname -m` now runs **~30
-Rosetta init syscalls** (licence handshake, TSO, both high-VA reservations, AOT cache-dir
-creation via mkdirat, ELF-header reads, `/proc/self/fd` readlink, signal setup). It then
-`mmap`s its fd 3 at a **non-canonical `0xfffffffffff3a000`** (bits ≥48 set — untranslatable by
-the 48-bit TTBR0). carrick returns EEXIST for that `MAP_FIXED_NOREPLACE`, after which Rosetta
-gives up with `unable to mmap ELF: 17`. The high address is almost certainly read out of
-Rosetta's freshly-created (empty) AOT translation cache — i.e. the next gap is making
-Rosetta's AOT cache round-trip correctly (or forcing JIT-only), then the actual x86→arm64
-translated execution. This needs deeper Rosetta reverse-engineering.
+Rosetta init syscalls**: licence handshake, hardware TSO, both high-VA reservations (incl. the
+256 MiB arena at 240 TiB), AOT cache-dir creation, ELF-header reads, `/proc/self/{exe,fd,maps}`,
+`/proc/sys/vm/mmap_min_addr`, signal setup. It opens the real busybox ELF (Alpine's `/bin/uname`
+→ `/bin/busybox`, now that `openat` follows symlinks), `fstat`s it, then:
+
+> `mmap(0xfffffffffff3a000, 0xc4708, PROT_READ, MAP_PRIVATE|MAP_FIXED_NOREPLACE, busybox_fd)`
+
+`0xfffffffffff3a000` is `-0xc6000` — an **x86-64-canonical *high-half* (negative) address**
+(bits 63:48 all set). Rosetta maps the translated binary into the upper VA half, as x86-64
+kernels lay out the negative address space. carrick's guest is configured **TTBR0-only**
+(`TCR_EL1.EPD1 = 1`, lower 48-bit half), so there is no upper-half translation and the address
+is untranslatable. carrick returns EEXIST for the `MAP_FIXED_NOREPLACE`; Rosetta then aborts
+with `unable to mmap ELF: 17`.
+
+**Next architectural step: TTBR1 / upper-half support.** Enable `TTBR1_EL1` (`EPD1 = 0`,
+`T1SZ`), give it a stage-1 table root, and alias upper-half guest VAs (`0xffff_…`) down to the
+low IPA arena (the same `MapHostAlias` mechanism, but driven from the TTBR1 walk). Then the
+guest-fault and software-access paths must accept upper-half VAs. After that comes the AOT
+cache round-trip and the actual x86→AArch64 JIT execution (the first real translated
+instructions + the final `write(1, "x86_64\n")`).
 
 Reproduce: `CARRICK_ACCEPT_ROSETTA_TERMS=1 carrick run --platform linux/amd64 --fs host alpine:latest /bin/uname -m`
-(trace with `carrick trace --script <path>/rosetta-open.d -- run --platform linux/amd64 …`, or
-`CARRICK_TRACE_TRAPS=1` for the raw syscall stream).
+(trace with `carrick trace --script scripts/rosetta-open.d -- run --platform linux/amd64 …`, or
+`CARRICK_TRACE_TRAPS=1` for the raw per-syscall stream).
 
 ---
 
