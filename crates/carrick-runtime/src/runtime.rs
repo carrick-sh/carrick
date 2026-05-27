@@ -162,6 +162,15 @@ pub trait SyscallTrap {
     /// past the syscall the way `complete_syscall` does — the restored
     /// PC IS the next PC.
     fn restore_from_sigframe(&mut self) -> Result<u64, TrapError>;
+    /// Toggle the vCPU's memory-ordering model (`prctl(PR_SET_MEM_MODEL, …)`).
+    /// `tso == true` enables hardware x86_64 Total Store Ordering on this vCPU
+    /// (`ACTLR_EL1.EnTSO`), required for Rosetta-translated guests; `false`
+    /// restores AArch64's default weakly-ordered model. The default
+    /// implementation is a no-op (non-HVF / test traps have no vCPU register).
+    fn set_memory_model(&mut self, tso: bool) -> Result<(), TrapError> {
+        let _ = tso;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Error)]
@@ -351,8 +360,19 @@ where
     // resolves any PT_INTERP through the rootfs read-closure, staying
     // rootfs-agnostic so `memory` doesn't depend on `rootfs`.
     let file = rootfs.read(path)?;
-    let image = AddressSpace::load_elf_bytes_with_reader(&file, &|p| rootfs.read(p).ok())?
-        .with_linux_initial_stack(argv, env)?
+    // Redirect x86_64 binaries through Rosetta 2 (binfmt_misc-style). Rosetta
+    // is read from the host (not the rootfs); it is statically linked, so the
+    // rootfs reader below is never asked for a Rosetta PT_INTERP.
+    let path_str = path.to_string_lossy();
+    let (file, argv) = match maybe_redirect_to_rosetta(&path_str, &file, &argv) {
+        None => (file, argv),
+        Some(Ok((rosetta_bytes, new_argv))) => (rosetta_bytes, new_argv),
+        Some(Err(errno)) => return Err(rosetta_unavailable(errno, &path_str)),
+    };
+    let image = AddressSpace::load_elf_bytes_with_reader(&file, &|p| {
+        rootfs.read(p).ok().or_else(|| std::fs::read(p).ok())
+    })?
+    .with_linux_initial_stack(argv, env)?
         .with_el0_trampoline()?
         .with_el1_vectors()?
         .with_stage1_page_tables()?
@@ -389,6 +409,12 @@ where
             path.to_owned(),
         )))
     })?;
+    // Redirect x86_64 binaries through Rosetta 2 (binfmt_misc-style).
+    let (bytes, argv) = match maybe_redirect_to_rosetta(path, &bytes, &argv) {
+        None => (bytes, argv),
+        Some(Ok((rosetta_bytes, new_argv))) => (rosetta_bytes, new_argv),
+        Some(Err(errno)) => return Err(rosetta_unavailable(errno, path)),
+    };
     let image =
         AddressSpace::load_elf_bytes_with_reader(&bytes, &|p| dispatcher.read_exec_file(p))?
             .with_linux_initial_stack(argv, env)?
@@ -682,6 +708,13 @@ where
                 // delivered, so this can't re-deliver it. `last_syscall_retval`
                 // is None on this path, so the next inject preserves the
                 // restored x0.
+            }
+            DispatchOutcome::SetMemoryModel { tso } => {
+                // Rosetta requested hardware x86_64 TSO on this vCPU. Toggle
+                // ACTLR_EL1.EnTSO, then complete prctl with 0.
+                runtime.set_memory_model(tso)?;
+                runtime.complete_syscall(0)?;
+                last_syscall_retval = Some(0);
             }
             DispatchOutcome::CloneThread { .. }
             | DispatchOutcome::ThreadExit { .. }
@@ -1810,6 +1843,11 @@ fn run_vcpu_until_exit(
                         last_syscall_retval = Some(state.complete_returned(&mut engine, retval)?);
                     }
                 }
+                DispatchOutcome::SetMemoryModel { tso } => {
+                    // Rosetta requested hardware x86_64 TSO on this vCPU.
+                    engine.set_memory_model(tso)?;
+                    last_syscall_retval = Some(state.complete_returned(&mut engine, 0)?);
+                }
             }
 
             // Signal delivery. A signal targeted at THIS tid (guest tgkill/tkill)
@@ -2215,6 +2253,100 @@ fn deliver_fault_signal(
 /// through the dispatcher's rootfs when present; falls back to the
 /// host filesystem otherwise (useful for tests where no rootfs is
 /// configured).
+/// Absolute host path to Apple's Rosetta 2 Linux ELF interpreter. This is an
+/// AArch64 binary that JIT-translates an x86_64 Linux guest in user space.
+pub(crate) const ROSETTA_INTERPRETER: &str =
+    "/Library/Apple/usr/libexec/oah/RosettaLinux/rosetta";
+
+/// The installed Rosetta interpreter's bytes, read once and cached. `None` when
+/// Rosetta isn't installed for Linux. Both the ELF-load redirect and the ioctl
+/// handshake source data from this single read.
+pub(crate) fn rosetta_binary_bytes() -> Option<&'static [u8]> {
+    static CACHE: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| std::fs::read(ROSETTA_INTERPRETER).ok())
+        .as_deref()
+}
+
+/// The verification blob Apple's Rosetta `memcmp`s the licensing-ioctl result
+/// against. Rosetta keeps its own copy embedded at a fixed offset and compares
+/// the kernel's answer against it, so we echo back *exactly that* — sourced
+/// live from the installed binary rather than embedded in carrick's source.
+/// This keeps Apple's string out of our tree and stays correct if Apple
+/// revises it. Returns the bytes through (and including) the NUL terminator.
+pub(crate) fn rosetta_license_blob() -> Option<&'static [u8]> {
+    static CACHE: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let bytes = rosetta_binary_bytes()?;
+            // Anchor on a short distinctive prefix; the full response is taken
+            // from the binary, not encoded here.
+            const ANCHOR: &[u8] = b"Our hard work";
+            let start = bytes.windows(ANCHOR.len()).position(|w| w == ANCHOR)?;
+            let nul = bytes[start..].iter().position(|&b| b == 0)?;
+            Some(bytes[start..=start + nul].to_vec())
+        })
+        .as_deref()
+}
+
+/// Inspect raw ELF bytes about to be loaded into the guest. If they describe an
+/// x86_64 binary, rewrite the load to run Apple's Rosetta 2 interpreter instead
+/// — exactly as Linux `binfmt_misc` redirects a foreign-arch binary to its
+/// registered interpreter:
+///
+///   argv = ["<rosetta>", "<target>", <original argv[1..]>]
+///
+/// Returns:
+///   * `None`         — the binary is AArch64 (or not an ELF we recognise); the
+///                      caller proceeds with the original bytes/argv.
+///   * `Some(Ok(..))` — the binary is x86_64; `(rosetta_bytes, new_argv)`.
+///   * `Some(Err(e))` — the binary is x86_64 but Rosetta isn't readable on this
+///                      host (`-errno` for the caller to surface).
+///
+/// Rosetta itself is statically linked, so the AddressSpace loader never needs
+/// to resolve a PT_INTERP for it from the guest VFS.
+pub(crate) fn maybe_redirect_to_rosetta(
+    target_path: &str,
+    target_bytes: &[u8],
+    argv: &[String],
+) -> Option<Result<(Vec<u8>, Vec<String>), i32>> {
+    use crate::elf::{Machine, inspect_elf_bytes};
+    use crate::linux_abi::LINUX_ENOENT;
+
+    let meta = inspect_elf_bytes(target_bytes).ok()?;
+    if meta.machine != Machine::X86_64 {
+        return None;
+    }
+
+    crate::probes::execve_argv("rosetta-redirect", &[target_path.to_owned()]);
+
+    let rosetta_bytes = match rosetta_binary_bytes() {
+        Some(b) => b.to_vec(),
+        None => return Some(Err(LINUX_ENOENT)),
+    };
+
+    // binfmt_misc interpreter calling convention: argv[0] = interpreter path,
+    // argv[1] = the foreign binary, argv[2..] = the original arguments (the
+    // original argv[0] is dropped).
+    let mut new_argv = Vec::with_capacity(argv.len() + 1);
+    new_argv.push(ROSETTA_INTERPRETER.to_string());
+    new_argv.push(target_path.to_string());
+    new_argv.extend(argv.iter().skip(1).cloned());
+
+    Some(Ok((rosetta_bytes, new_argv)))
+}
+
+/// Build the `RuntimeError` for "this is an x86_64 binary but Rosetta 2 is not
+/// available on the host" — surfaced from the initial-load call sites (the
+/// execve path returns the bare `-errno` instead).
+fn rosetta_unavailable(errno: i32, path: &str) -> RuntimeError {
+    RuntimeError::FsBackend(anyhow::anyhow!(
+        "{path}: x86_64 binary requires Apple Rosetta 2 at {ROSETTA_INTERPRETER} \
+         (errno {errno}); is Rosetta installed for Linux? \
+         `softwareupdate --install-rosetta`"
+    ))
+}
+
 fn load_execve_image(
     dispatcher: &SyscallDispatcher,
     path: &str,
@@ -2267,13 +2399,22 @@ fn load_execve_image(
     // in-memory rootfs layer (which `--fs host` drops after seeding). When
     // there's no overlay/rootfs at all (e.g. a bare RunElf test), fall back
     // to reading the main binary straight off the host filesystem.
-    let raw = match dispatcher.read_exec_file(&path) {
-        Some(bytes) => {
-            AddressSpace::load_elf_bytes_with_reader(&bytes, &|p| dispatcher.read_exec_file(p))
-                .map_err(|_| LINUX_ENOENT)?
-        }
-        None => AddressSpace::load_elf(&path).map_err(|_| LINUX_ENOENT)?,
+    let raw_bytes = dispatcher
+        .read_exec_file(&path)
+        .or_else(|| std::fs::read(&path).ok())
+        .ok_or(LINUX_ENOENT)?;
+    // Redirect x86_64 binaries through Rosetta 2 (binfmt_misc-style), so a guest
+    // `execve` of a further x86_64 image (a child process, a shell spawning a
+    // tool) is translated too — not just the initial container entrypoint.
+    let (raw_bytes, argv) = match maybe_redirect_to_rosetta(&path, &raw_bytes, &argv) {
+        None => (raw_bytes, argv),
+        Some(Ok((rosetta_bytes, new_argv))) => (rosetta_bytes, new_argv),
+        Some(Err(errno)) => return Err(errno),
     };
+    let raw = AddressSpace::load_elf_bytes_with_reader(&raw_bytes, &|p| {
+        dispatcher.read_exec_file(p).or_else(|| std::fs::read(p).ok())
+    })
+    .map_err(|_| LINUX_ENOENT)?;
     raw.with_el0_trampoline()
         .and_then(|a| a.with_el1_vectors())
         .and_then(|a| a.with_stage1_page_tables())
@@ -2524,6 +2665,12 @@ where
                 // returning to userspace. The just-handled signal was cleared
                 // when delivered, so this can't re-deliver it.
             }
+            DispatchOutcome::SetMemoryModel { tso } => {
+                // Rosetta requested hardware x86_64 TSO on this vCPU.
+                trap.set_memory_model(tso)?;
+                trap.complete_syscall(0)?;
+                last_syscall_retval = Some(0);
+            }
             DispatchOutcome::CloneThread { .. }
             | DispatchOutcome::ThreadExit { .. }
             | DispatchOutcome::SignalThread { .. }
@@ -2590,6 +2737,10 @@ impl SyscallTrap for HvfTrapEngine {
 
     fn complete_syscall(&mut self, return_value: i64) -> Result<(), TrapError> {
         self.complete_syscall(return_value)
+    }
+
+    fn set_memory_model(&mut self, tso: bool) -> Result<(), TrapError> {
+        self.set_hardware_tso(tso)
     }
 
     fn inject_signal(
@@ -2680,5 +2831,75 @@ mod tests {
         assert_eq!(el0_debug_signal(esr(0x20)), None); // instruction abort
         assert_eq!(el0_debug_signal(esr(0x24)), None); // data abort
         assert_eq!(el0_debug_signal(esr(0x00)), None); // unknown
+    }
+}
+
+#[cfg(test)]
+mod rosetta_tests {
+    use super::*;
+
+    /// Minimal goblin-parseable ELF64 header with the given `e_machine`. No
+    /// program headers needed — `inspect_elf_bytes` only reads the header.
+    fn synthetic_elf(e_machine: u16) -> Vec<u8> {
+        let mut elf = vec![0u8; 64];
+        elf[0..4].copy_from_slice(b"\x7fELF");
+        elf[4] = 2; // ELFCLASS64
+        elf[5] = 1; // ELFDATA2LSB
+        elf[6] = 1; // EV_CURRENT
+        elf[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+        elf[18..20].copy_from_slice(&e_machine.to_le_bytes());
+        elf[20..24].copy_from_slice(&1u32.to_le_bytes()); // version
+        elf[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+        elf
+    }
+
+    const EM_AARCH64: u16 = 183;
+    const EM_X86_64: u16 = 62;
+
+    #[test]
+    fn aarch64_binary_is_not_redirected() {
+        let elf = synthetic_elf(EM_AARCH64);
+        let argv = vec!["/bin/sh".to_string(), "-c".to_string()];
+        assert!(maybe_redirect_to_rosetta("/bin/sh", &elf, &argv).is_none());
+    }
+
+    #[test]
+    fn non_elf_is_not_redirected() {
+        let not_elf = b"#!/bin/sh\necho hi\n";
+        let argv = vec!["/script".to_string()];
+        assert!(maybe_redirect_to_rosetta("/script", not_elf, &argv).is_none());
+    }
+
+    #[test]
+    fn x86_64_binary_redirects_to_rosetta_with_binfmt_argv() {
+        let elf = synthetic_elf(EM_X86_64);
+        let argv = vec!["/usr/bin/uname".to_string(), "-m".to_string()];
+        match maybe_redirect_to_rosetta("/usr/bin/uname", &elf, &argv) {
+            // Rosetta installed: the load is rewritten to Rosetta + binfmt argv.
+            Some(Ok((rosetta_bytes, new_argv))) => {
+                assert!(rosetta_bytes.starts_with(b"\x7fELF"));
+                assert_eq!(
+                    new_argv,
+                    vec![
+                        ROSETTA_INTERPRETER.to_string(),
+                        "/usr/bin/uname".to_string(),
+                        "-m".to_string(),
+                    ]
+                );
+            }
+            // No Rosetta on this host: detected as x86_64 but unavailable.
+            Some(Err(errno)) => assert_eq!(errno, crate::linux_abi::LINUX_ENOENT),
+            None => panic!("x86_64 ELF must be detected for redirect"),
+        }
+    }
+
+    #[test]
+    fn rosetta_license_blob_is_sourced_from_binary_if_present() {
+        // When Rosetta is installed, the licence blob is the NUL-terminated
+        // verification string read live from its binary (never embedded here).
+        if let Some(blob) = rosetta_license_blob() {
+            assert!(blob.starts_with(b"Our hard work"));
+            assert_eq!(blob.last(), Some(&0u8), "blob must end at the NUL");
+        }
     }
 }

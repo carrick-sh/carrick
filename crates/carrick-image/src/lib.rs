@@ -58,6 +58,19 @@ impl ImageStore {
         path
     }
 
+    /// Per-platform image directory. The host-native default (linux/arm64)
+    /// keeps the legacy un-suffixed path so existing stores still resolve;
+    /// any other platform (e.g. linux/amd64 for Rosetta) is cached in a
+    /// sibling subdirectory so the two architectures never collide.
+    pub fn image_dir_for(&self, image: &ImageReference, target: &PlatformTarget) -> PathBuf {
+        let base = self.image_dir(image);
+        if *target == PlatformTarget::default_target() {
+            base
+        } else {
+            base.join(format!("__platform__{}_{}", target.os, target.arch))
+        }
+    }
+
     pub fn blob_path(&self, digest: &str) -> Result<PathBuf, OciBootstrapError> {
         let (algorithm, encoded) = digest
             .split_once(':')
@@ -92,6 +105,23 @@ pub struct LayerSummary {
 impl ImageStore {
     pub fn image_summary_path(&self, image: &ImageReference) -> PathBuf {
         self.image_dir(image).join("carrick-image.json")
+    }
+
+    pub fn image_summary_path_for(
+        &self,
+        image: &ImageReference,
+        target: &PlatformTarget,
+    ) -> PathBuf {
+        self.image_dir_for(image, target).join("carrick-image.json")
+    }
+
+    pub async fn load_pull_summary_for(
+        &self,
+        image: &ImageReference,
+        target: &PlatformTarget,
+    ) -> Result<PullSummary, OciBootstrapError> {
+        let bytes = fs::read(self.image_summary_path_for(image, target)).await?;
+        Ok(serde_json::from_slice(&bytes)?)
     }
 
     pub async fn load_pull_summary(
@@ -201,9 +231,9 @@ fn insecure_registries() -> Vec<String> {
     hosts
 }
 
-fn build_oci_client() -> Client {
+fn build_oci_client_for(target: &PlatformTarget) -> Client {
     use oci_client::client::ClientProtocol;
-    let target = platform_target_from_env();
+    let target = target.clone();
     let config = ClientConfig {
         protocol: ClientProtocol::HttpsExcept(insecure_registries()),
         platform_resolver: Some(Box::new(move |entries: &[ImageIndexEntry]| {
@@ -218,7 +248,19 @@ pub async fn pull_image(
     image: &ImageReference,
     store: &ImageStore,
 ) -> Result<PullSummary, OciBootstrapError> {
-    let client = build_oci_client();
+    pull_image_with_platform(image, store, &platform_target_from_env()).await
+}
+
+/// Pull `image` for an explicit platform, selecting the matching OCI manifest
+/// entry and caching it in the platform-keyed image directory. Layer blobs are
+/// content-addressed so they share the store's blob directory regardless of
+/// platform.
+pub async fn pull_image_with_platform(
+    image: &ImageReference,
+    store: &ImageStore,
+    target: &PlatformTarget,
+) -> Result<PullSummary, OciBootstrapError> {
+    let client = build_oci_client_for(target);
     let data = client
         .pull(
             image.as_oci_reference(),
@@ -251,7 +293,7 @@ pub async fn pull_image(
         });
     }
 
-    let image_dir = store.image_dir(image);
+    let image_dir = store.image_dir_for(image, target);
     fs::create_dir_all(&image_dir).await?;
     fs::write(image_dir.join("config.json"), data.config.data).await?;
     if let Some(manifest) = data.manifest {
@@ -324,14 +366,29 @@ impl ImageStore {
         &self,
         image: &ImageReference,
     ) -> Result<ResolvedImage, OciBootstrapError> {
-        let summary = match self.load_pull_summary(image).await {
+        self.resolve_with_platform(image, &platform_target_from_env())
+            .await
+    }
+
+    /// Resolve an image for an explicit platform. Looks up the platform-keyed
+    /// cache first, pulling the matching manifest if absent. Used by the engine
+    /// to fetch the `linux/amd64` variant for Rosetta-translated runs without
+    /// clobbering the host-native arm64 cache.
+    pub async fn resolve_with_platform(
+        &self,
+        image: &ImageReference,
+        target: &PlatformTarget,
+    ) -> Result<ResolvedImage, OciBootstrapError> {
+        let summary = match self.load_pull_summary_for(image, target).await {
             Ok(summary) => summary,
             Err(_) => {
                 eprintln!(
-                    "carrick: image {} not in store; pulling…",
-                    image.canonical()
+                    "carrick: image {} ({}/{}) not in store; pulling…",
+                    image.canonical(),
+                    target.os,
+                    target.arch
                 );
-                pull_image(image, self).await?
+                pull_image_with_platform(image, self, target).await?
             }
         };
 

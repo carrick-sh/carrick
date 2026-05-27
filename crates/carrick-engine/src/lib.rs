@@ -8,11 +8,14 @@ use std::collections::HashMap;
 
 pub use carrick_image::{ImageStore, ResolvedImage};
 pub use carrick_runtime::runtime::RunResult;
-pub use carrick_spec::{FsBackendKind, ImageConfig, Mount, RunSpec};
+pub use carrick_spec::{FsBackendKind, ImageConfig, Mount, Platform, RunSpec};
 
 #[derive(Debug, Clone)]
 pub struct CliRunRequest {
     pub image_ref: String,
+    /// Raw OCI platform string from the CLI (`--platform linux/amd64`), or
+    /// `None` to default to the host architecture (arm64).
+    pub platform: Option<String>,
     pub args: Vec<String>,
     pub env_overrides: Vec<String>,
     pub mounts: Vec<Mount>,
@@ -28,7 +31,18 @@ pub struct CliRunRequest {
     pub fs: Option<FsBackendKind>,
 }
 
+/// Parse the request's `--platform` into the canonical [`Platform`], falling
+/// back to the host default (arm64) when absent or unrecognised.
+pub fn request_platform(req: &CliRunRequest) -> Platform {
+    req.platform
+        .as_deref()
+        .and_then(Platform::from_oci_str)
+        .unwrap_or_default()
+}
+
 pub fn resolve_run_spec(req: CliRunRequest, image: ResolvedImage) -> Result<RunSpec, String> {
+    let platform = request_platform(&req);
+
     // 1. Resolve argv (entrypoint + cmd overrides)
     let effective_entrypoint = match req.entrypoint_override {
         Some(overrides) => overrides,
@@ -131,6 +145,7 @@ pub fn resolve_run_spec(req: CliRunRequest, image: ResolvedImage) -> Result<RunS
         interactive: req.interactive,
         max_traps: req.max_traps,
         debug_state_path,
+        platform,
     })
 }
 
@@ -147,9 +162,18 @@ impl Engine {
         let image_ref = carrick_spec::ImageReference::parse(&req.image_ref)
             .map_err(|e| anyhow::anyhow!("invalid image reference: {}", e))?;
 
+        // Select the OCI manifest entry for the requested platform. amd64
+        // images are cached separately from the host-native arm64 so the two
+        // never collide in the store, and pulling honours the platform hint.
+        let platform = request_platform(&req);
+        let target = carrick_image::PlatformTarget {
+            os: "linux".to_string(),
+            arch: platform.oci_arch().to_string(),
+            variant: None,
+        };
         let resolved = self
             .store
-            .resolve(&image_ref)
+            .resolve_with_platform(&image_ref, &target)
             .await
             .map_err(|e| anyhow::anyhow!("failed to resolve image: {}", e))?;
 
@@ -194,6 +218,7 @@ mod tests {
         );
         let req = CliRunRequest {
             image_ref: "alpine".to_string(),
+            platform: None,
             args: vec![],
             env_overrides: vec![],
             mounts: vec![],
@@ -223,6 +248,7 @@ mod tests {
         );
         let req = CliRunRequest {
             image_ref: "alpine".to_string(),
+            platform: None,
             args: vec!["/bin/ls".to_string()],
             env_overrides: vec![],
             mounts: vec![],
@@ -251,6 +277,7 @@ mod tests {
         );
         let req = CliRunRequest {
             image_ref: "alpine".to_string(),
+            platform: None,
             args: vec![],
             env_overrides: vec![],
             mounts: vec![],
@@ -279,6 +306,7 @@ mod tests {
         );
         let req = CliRunRequest {
             image_ref: "alpine".to_string(),
+            platform: None,
             args: vec!["/bin/ls".to_string()],
             env_overrides: vec!["CUSTOM=2".to_string(), "USER_VAR=yes".to_string()],
             mounts: vec![],
@@ -316,6 +344,7 @@ mod tests {
         let image = make_test_image(None, None, vec![], Some(Utf8PathBuf::from("/image/app")));
         let req = CliRunRequest {
             image_ref: "alpine".to_string(),
+            platform: None,
             args: vec!["/bin/ls".to_string()],
             env_overrides: vec![],
             mounts: vec![],

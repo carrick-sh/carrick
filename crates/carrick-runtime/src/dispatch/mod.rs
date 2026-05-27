@@ -206,9 +206,13 @@ use crate::linux_abi::{
     LINUX_POLLNVAL,
     LINUX_POLLOUT,
     LINUX_PR_GET_DUMPABLE,
+    LINUX_PR_GET_MEM_MODEL,
     LINUX_PR_GET_NAME,
     LINUX_PR_GET_PDEATHSIG,
     LINUX_PR_SET_DUMPABLE,
+    LINUX_PR_SET_MEM_MODEL,
+    LINUX_PR_SET_MEM_MODEL_DEFAULT,
+    LINUX_PR_SET_MEM_MODEL_TSO,
     LINUX_PR_SET_NAME,
     LINUX_PR_SET_PDEATHSIG,
     LINUX_PRIO_PROCESS,
@@ -514,6 +518,14 @@ pub enum DispatchOutcome {
         argv: Vec<String>,
         env: Vec<String>,
     },
+    /// Guest requested a change to the vCPU memory-ordering model via
+    /// `prctl(PR_SET_MEM_MODEL, …)`. Apple Rosetta 2 issues this at startup to
+    /// turn on hardware x86_64 TSO ordering. The dispatcher has no access to the
+    /// vCPU, so the runtime loop performs the `ACTLR_EL1.EnTSO` write on the
+    /// active vCPU thread and then completes the syscall with 0.
+    SetMemoryModel {
+        tso: bool,
+    },
     /// Guest invoked `rt_sigreturn(2)` (syscall 139). The runtime must
     /// pop the Carrick sigframe at SP_EL0, restore the saved register
     /// state, and resume — without advancing PC the way a normal SVC
@@ -635,6 +647,7 @@ impl DispatchOutcome {
             DispatchOutcome::Fork { .. } => (0, None),
             DispatchOutcome::Execve { .. } => (0, None),
             DispatchOutcome::SigReturn => (0, None),
+            DispatchOutcome::SetMemoryModel { .. } => (0, None),
             // CloneThread/ThreadExit/FutexWait are handled specially by the
             // runtime and never flow through retval_errno — the runtime acts
             // on them directly before any x0 write.
@@ -1814,6 +1827,46 @@ fn write_packed(memory: &mut impl GuestMemory, address: u64, bytes: &[u8]) -> Di
     } else {
         DispatchOutcome::Returned { value: 0 }
     }
+}
+
+/// Service Apple Rosetta 2's startup handshake ioctls. Returns `Some(outcome)`
+/// when `request` is one of Rosetta's verification/info ioctls (so the ioctl
+/// handler returns it), else `None` (continue normal ioctl handling).
+///
+/// See `dispatch::fs::ioctl` and `crate::runtime::rosetta_license_blob` for the
+/// reverse-engineered details. The expected response bytes are sourced live
+/// from the installed Rosetta binary rather than embedded here.
+pub(super) fn rosetta_handshake_ioctl(
+    memory: &mut impl GuestMemory,
+    request: u64,
+    arg: u64,
+) -> Option<DispatchOutcome> {
+    // Licensing ioctls whose result Rosetta `memcmp`s against its embedded blob.
+    const ROSETTA_LICENSE_IOCTLS: [u64; 2] = [0x80456122, 0x80456125];
+    // Info ioctl: only the (non-negative) return value matters to Rosetta.
+    const ROSETTA_INFO_IOCTLS: [u64; 1] = [0x80806123];
+
+    let is_license = ROSETTA_LICENSE_IOCTLS.contains(&request);
+    let is_info = ROSETTA_INFO_IOCTLS.contains(&request);
+    if !is_license && !is_info {
+        return None;
+    }
+
+    // The response length is encoded in the ioctl request's size field [29:16].
+    let size = ((request >> 16) & 0x3fff) as usize;
+    let mut payload = vec![0u8; size];
+    if is_license
+        && let Some(blob) = crate::runtime::rosetta_license_blob()
+    {
+        let n = blob.len().min(size);
+        payload[..n].copy_from_slice(&blob[..n]);
+    }
+    if memory.write_bytes(arg, &payload).is_err() {
+        return Some(DispatchOutcome::Errno {
+            errno: LINUX_EFAULT,
+        });
+    }
+    Some(DispatchOutcome::Returned { value: 0 })
 }
 
 /// Convert an ABSOLUTE futex deadline (FUTEX_WAIT_BITSET) to the remaining
@@ -4274,5 +4327,57 @@ mod overlay_dispatch_tests {
         assert_eq!(EINPROGRESS, 115);
         assert_eq!(ETIMEDOUT, 110);
         assert_eq!(ECONNREFUSED, 111);
+    }
+}
+
+#[cfg(test)]
+mod rosetta_handshake_tests {
+    use super::*;
+
+    const BASE: u64 = 0x4000;
+
+    fn mem() -> LinearMemory {
+        LinearMemory::new(BASE, vec![0xABu8; 256])
+    }
+
+    #[test]
+    fn non_rosetta_ioctl_passes_through() {
+        // A normal ioctl (e.g. TCGETS=0x5401) is not claimed by the handshake.
+        let mut m = mem();
+        assert!(rosetta_handshake_ioctl(&mut m, 0x5401, BASE).is_none());
+    }
+
+    #[test]
+    fn info_ioctl_returns_zero_and_zeroes_buffer() {
+        // 0x80806123: size field = 0x80 (128). Not memcmp'd; success + zeroed.
+        let mut m = mem();
+        let outcome = rosetta_handshake_ioctl(&mut m, 0x80806123, BASE)
+            .expect("info ioctl must be handled");
+        assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+        let buf = m.read_bytes(BASE, 128).unwrap();
+        assert!(buf.iter().all(|&b| b == 0), "info buffer must be zeroed");
+    }
+
+    #[test]
+    fn license_ioctl_writes_blob_when_rosetta_present() {
+        // 0x80456125: size field = 0x45 (69). When Rosetta is installed the
+        // buffer is filled with its verification blob; either way it succeeds.
+        let mut m = mem();
+        let outcome = rosetta_handshake_ioctl(&mut m, 0x80456125, BASE)
+            .expect("licence ioctl must be handled");
+        assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+        if crate::runtime::rosetta_license_blob().is_some() {
+            let buf = m.read_bytes(BASE, 13).unwrap();
+            assert_eq!(&buf, b"Our hard work");
+        }
+    }
+
+    #[test]
+    fn faulting_address_returns_efault() {
+        // An out-of-bounds buffer address must surface EFAULT, not panic.
+        let mut m = mem();
+        let outcome = rosetta_handshake_ioctl(&mut m, 0x80806123, 0xDEAD_0000)
+            .expect("info ioctl must be handled");
+        assert_eq!(outcome, DispatchOutcome::Errno { errno: LINUX_EFAULT });
     }
 }

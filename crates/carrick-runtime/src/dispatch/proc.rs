@@ -48,6 +48,11 @@ pub(super) struct ProcState {
     /// is inherited across `fork`, which the address-space copy gives us for
     /// free. See [[host_facts]].
     pub affinity: Vec<u64>,
+    /// Whether hardware x86_64 TSO memory ordering is active for this guest
+    /// (`prctl(PR_SET_MEM_MODEL, PR_SET_MEM_MODEL_TSO)`, set by Rosetta). Tracked
+    /// so `PR_GET_MEM_MODEL` reports the current model. The actual ACTLR_EL1
+    /// toggle happens in the runtime loop (the dispatcher can't reach the vCPU).
+    pub tso_enabled: bool,
 }
 
 /// Default affinity mask for `ncpu` logical CPUs: the low `ncpu` bits set
@@ -148,6 +153,7 @@ impl ProcState {
             bootstrap_host_pid: std::process::id(),
             itimers: [None, None, None],
             affinity: default_affinity(crate::host_facts::logical_cpu_count()),
+            tso_enabled: false,
         }
     }
 }
@@ -362,6 +368,28 @@ impl SyscallDispatcher {
                     }
                     DispatchOutcome::Returned { value: 0 }
                 }
+                // PR_GET_MEM_MODEL — query the active CPU memory-ordering model.
+                // 0 = default (weakly-ordered AArch64), 1 = TSO (x86_64-compatible).
+                LINUX_PR_GET_MEM_MODEL => DispatchOutcome::Returned {
+                    value: i64::from(this.proc.lock().tso_enabled),
+                },
+                // PR_SET_MEM_MODEL — request a memory-ordering model. Rosetta
+                // calls this with PR_SET_MEM_MODEL_TSO at startup. We record the
+                // request and hand the runtime a SetMemoryModel outcome; the
+                // runtime loop performs the ACTLR_EL1.EnTSO write on the active
+                // vCPU thread (the dispatcher can't reach the vCPU) and completes
+                // prctl with 0.
+                LINUX_PR_SET_MEM_MODEL => match arg2 {
+                    LINUX_PR_SET_MEM_MODEL_DEFAULT => {
+                        this.proc.lock().tso_enabled = false;
+                        DispatchOutcome::SetMemoryModel { tso: false }
+                    }
+                    LINUX_PR_SET_MEM_MODEL_TSO => {
+                        this.proc.lock().tso_enabled = true;
+                        DispatchOutcome::SetMemoryModel { tso: true }
+                    }
+                    _ => DispatchOutcome::errno(LINUX_EINVAL),
+                },
                 _ => DispatchOutcome::errno(LINUX_EINVAL),
             })
         }
