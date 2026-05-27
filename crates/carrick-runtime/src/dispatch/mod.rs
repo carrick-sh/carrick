@@ -1287,7 +1287,7 @@ impl SyscallDispatcher {
     /// to a pty master this process owns, drop its `/dev/pts` entry. Use this
     /// on every fd-close path (close, close_range, exec CLOEXEC sweep) so the
     /// PtyTable never desyncs from the real fd lifetime.
-    pub(self) fn close_open_file_and_free_pty(&self, open_file: &OpenFile) {
+    pub(in crate::dispatch) fn close_open_file_and_free_pty(&self, open_file: &OpenFile) {
         let pty_master_index = if Arc::strong_count(&open_file.description) == 1 {
             match &*open_file.description.read() {
                 OpenDescription::HostPipe {

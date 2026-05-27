@@ -23,6 +23,7 @@ const IORING_OP_NOP: u8 = 0;
 const IORING_OP_READV: u8 = 1;
 const IORING_OP_READ: u8 = 22;
 const IORING_OP_WRITE: u8 = 23;
+const IORING_OP_CLOSE: u8 = 19;
 const IORING_ENTER_GETEVENTS: u32 = 1;
 
 const P_SQ_ENTRIES: usize = 0;
@@ -218,6 +219,15 @@ unsafe fn ring_ops(r: &mut Ring) -> bool {
     }) != Some(msg.len() as i32)
         || &a != b"io_u"
         || &b != b"ring!"
+    {
+        return false;
+    }
+
+    // CLOSE the file via the ring (res 0).
+    if r.submit_reap(|sqe| {
+        *sqe.add(0) = IORING_OP_CLOSE;
+        ptr::write_unaligned(sqe.add(4) as *mut i32, file);
+    }) != Some(0)
     {
         return false;
     }
