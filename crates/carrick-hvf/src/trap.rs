@@ -1496,18 +1496,19 @@ impl HvfInner {
         let pt = std::sync::Arc::clone(&self.page_tables);
         let changed = {
             let mut guard = pt.lock();
-            if guard.is_none() {
-                // Build from the live host backing on first edit (matches the
-                // boot image; nothing else writes the tables before this).
+            // Build from the live host backing on first edit (matches the boot
+            // image; nothing else writes the tables before this). `get_or_insert_with`
+            // returns the live manager whether it already existed or was just built,
+            // so there is no Option to unwrap.
+            let mgr = guard.get_or_insert_with(|| {
                 let size = crate::memory::LINUX_PAGE_TABLES_SIZE as usize;
                 let mut bytes = vec![0u8; size];
                 unsafe { std::ptr::copy_nonoverlapping(host, bytes.as_mut_ptr(), size) };
-                *guard = Some(crate::page_table::PageTableManager::new(
+                crate::page_table::PageTableManager::new(
                     bytes,
                     crate::memory::LINUX_PAGE_TABLES_BASE,
-                ));
-            }
-            let mgr = guard.as_mut().expect("just built");
+                )
+            });
             // Coalescing reclaims spare sub-tables into the 58-page pool; without
             // it, sustained discontiguous mmap/munmap churn leaks them until
             // OutOfTables → ENOMEM (PROVEN: the pt-pool watermark climbed to
