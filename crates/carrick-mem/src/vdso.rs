@@ -127,7 +127,27 @@ pub fn vdso_image_bytes() -> Vec<u8> {
     ];
     let off_dyn_end = off_dyn + dyn_entries.len() * 16;
     let off_code = align_up(off_dyn_end, 16);
-    let total = off_code + VDSO_CODE.len();
+    let off_code_end = off_code + VDSO_CODE.len();
+
+    // ---- section-header string table + section headers ----
+    // glibc/Go resolve vDSO symbols from PT_DYNAMIC and never need sections, so
+    // historically we emitted none. Stricter parsers (Apple Rosetta) iterate the
+    // SECTION headers looking for SHT_DYNSYM, so emit a minimal table: NULL,
+    // .dynsym, .dynstr, .shstrtab.
+    const SHENT: usize = 64; // sizeof(Elf64_Shdr)
+    const NSH: usize = 4;
+    let mut shstr = Vec::new();
+    shstr.push(0u8);
+    let sh_name_dynsym = shstr.len() as u32;
+    shstr.extend_from_slice(b".dynsym\0");
+    let sh_name_dynstr = shstr.len() as u32;
+    shstr.extend_from_slice(b".dynstr\0");
+    let sh_name_shstrtab = shstr.len() as u32;
+    shstr.extend_from_slice(b".shstrtab\0");
+
+    let off_shstrtab = align_up(off_code_end, 4);
+    let off_shdr = align_up(off_shstrtab + shstr.len(), 8);
+    let total = off_shdr + NSH * SHENT;
 
     let mut buf = vec![0u8; total];
 
@@ -141,14 +161,14 @@ pub fn vdso_image_bytes() -> Vec<u8> {
     w32(&mut buf, 20, 1); // e_version
     w64(&mut buf, 24, 0); // e_entry
     w64(&mut buf, 32, off_phdr as u64); // e_phoff
-    w64(&mut buf, 40, 0); // e_shoff
+    w64(&mut buf, 40, off_shdr as u64); // e_shoff
     w32(&mut buf, 48, 0); // e_flags
     w16(&mut buf, 52, EHDR as u16); // e_ehsize
     w16(&mut buf, 54, PHENT as u16); // e_phentsize
     w16(&mut buf, 56, NPH as u16); // e_phnum
-    w16(&mut buf, 58, 0); // e_shentsize
-    w16(&mut buf, 60, 0); // e_shnum
-    w16(&mut buf, 62, 0); // e_shstrndx
+    w16(&mut buf, 58, SHENT as u16); // e_shentsize
+    w16(&mut buf, 60, NSH as u16); // e_shnum
+    w16(&mut buf, 62, 3); // e_shstrndx (.shstrtab is section index 3)
 
     // ---- program headers ----
     // PT_LOAD: covers the whole blob, R+X, vaddr==offset==0.
@@ -243,6 +263,79 @@ pub fn vdso_image_bytes() -> Vec<u8> {
     // ---- code ----
     buf[off_code..off_code + VDSO_CODE.len()].copy_from_slice(VDSO_CODE);
 
+    // ---- .shstrtab ----
+    buf[off_shstrtab..off_shstrtab + shstr.len()].copy_from_slice(&shstr);
+
+    // ---- section headers ----
+    // The vDSO loads with vaddr == file offset (PT_LOAD p_vaddr = 0), so each
+    // ALLOC section's sh_addr equals its sh_offset.
+    const SHT_STRTAB: u32 = 3;
+    const SHT_DYNSYM: u32 = 11;
+    const SHF_ALLOC: u64 = 0x2;
+    let mut shdr = |idx: usize,
+                    name: u32,
+                    sh_type: u32,
+                    flags: u64,
+                    addr_off: u64,
+                    size: u64,
+                    link: u32,
+                    info: u32,
+                    align: u64,
+                    entsize: u64| {
+        let o = off_shdr + idx * SHENT;
+        w32(&mut buf, o, name);
+        w32(&mut buf, o + 4, sh_type);
+        w64(&mut buf, o + 8, flags);
+        w64(&mut buf, o + 16, addr_off); // sh_addr (== sh_offset; vaddr==offset)
+        w64(&mut buf, o + 24, addr_off); // sh_offset
+        w64(&mut buf, o + 32, size);
+        w32(&mut buf, o + 40, link);
+        w32(&mut buf, o + 44, info);
+        w64(&mut buf, o + 48, align);
+        w64(&mut buf, o + 56, entsize);
+    };
+    // [0] SHT_NULL (all zero).
+    shdr(0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    // [1] .dynsym — sh_link → .dynstr (index 2), sh_info = first global symbol (1).
+    shdr(
+        1,
+        sh_name_dynsym,
+        SHT_DYNSYM,
+        SHF_ALLOC,
+        off_dynsym as u64,
+        (NSYM * SYMENT) as u64,
+        2,
+        1,
+        8,
+        SYMENT as u64,
+    );
+    // [2] .dynstr
+    shdr(
+        2,
+        sh_name_dynstr,
+        SHT_STRTAB,
+        SHF_ALLOC,
+        off_dynstr as u64,
+        dynstr.len() as u64,
+        0,
+        0,
+        1,
+        0,
+    );
+    // [3] .shstrtab (not ALLOC; only present for section-table parsers).
+    shdr(
+        3,
+        sh_name_shstrtab,
+        SHT_STRTAB,
+        0,
+        off_shstrtab as u64,
+        shstr.len() as u64,
+        0,
+        0,
+        1,
+        0,
+    );
+
     buf
 }
 
@@ -277,5 +370,18 @@ mod tests {
             }
         }
         assert!(found, "__kernel_clock_gettime not exported");
+    }
+}
+
+#[cfg(test)]
+mod rosetta_vdso_size_test {
+    #[test]
+    fn vdso_image_fits_in_one_page_and_has_dynsym() {
+        let img = super::vdso_image_bytes();
+        assert!(img.len() <= super::LINUX_VDSO_SIZE as usize,
+            "vDSO image {} exceeds page {}", img.len(), super::LINUX_VDSO_SIZE);
+        let elf = goblin::elf::Elf::parse(&img).unwrap();
+        assert!(elf.section_headers.iter().any(|s| s.sh_type == 11),
+            "vDSO must expose a SHT_DYNSYM section header for strict parsers");
     }
 }

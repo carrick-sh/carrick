@@ -32,9 +32,11 @@ const USER_BLOCK_FLAGS: u64 = (1u64 << 53) | (1 << 10) | (0b11 << 8) | (0b01 << 
 const USER_PAGE_FLAGS: u64 = USER_BLOCK_FLAGS | 0b10;
 
 const PT_PAGE: u64 = 0x1000; // stage-1 table page size (4 KiB granule)
-// The boot image lays out six tables (L0, L1A, L1B, L2A, L2B, L3A) in the
-// first six 4 KiB pages; runtime-allocated sub-tables come from the spare tail.
-const SPARE_START_OFFSET: u64 = 6 * PT_PAGE;
+// The boot image lays out eight tables in the first eight 4 KiB pages:
+// L0, L1A, L1B, L2A, L2B, L3A (pages 0..5), then L1_rosetta, L2_rosetta
+// (pages 6..7, the high-VA Rosetta alias). Runtime-allocated sub-tables come
+// from the spare tail after them.
+const SPARE_START_OFFSET: u64 = 8 * PT_PAGE;
 
 /// A protection change applied to a guest VA range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

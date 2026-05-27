@@ -64,6 +64,10 @@ pub(crate) fn synthetic_file(path: &str, ctx: &SyntheticProcContext) -> Option<V
         // this to bound pid scans; without it tst_test aborts with ENOENT.
         "/proc/sys/kernel/pid_max" => Some(b"4194304\n".to_vec()),
         "/proc/sys/kernel/random/boot_id" => Some(synthetic_proc_boot_id().to_vec()),
+        // Lowest address a process may mmap. Matches carrick's stage-1 null-guard
+        // (VA 0..0x10000 unmapped). Apple Rosetta reads this at startup to size
+        // its allocation tracker and aborts if it's missing.
+        "/proc/sys/vm/mmap_min_addr" => Some(b"65536\n".to_vec()),
         // glibc's `__check_pf` fallback for AF_NETLINK-less hosts.
         "/proc/net/if_inet6" => {
             Some(b"00000000000000000000000000000001 01 80 10 80       lo\n".to_vec())

@@ -129,7 +129,14 @@ pub struct GuestMappingPlan {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GuestMapping {
+    /// Guest VIRTUAL address the region is mapped at (also the key for
+    /// software syscall-path memory access). Equals `ipa_start` for every
+    /// region except Rosetta's high-VA alias.
     pub guest_start: u64,
+    /// Intermediate physical address actually handed to `hv_vm_map`. Identity
+    /// (== `guest_start`) for all regions but the Rosetta window, which is
+    /// aliased to a low IPA (see `crate::memory::ipa_for_va`).
+    pub ipa_start: u64,
     pub mapped_size: u64,
     pub offset_in_mapping: u64,
     pub payload_size: u64,
@@ -146,7 +153,16 @@ impl GuestMappingPlan {
         let mut mappings = Vec::with_capacity(address_space.regions().len());
         for region in address_space.regions() {
             let guest_start = align_down(region.start, HVF_PAGE_SIZE);
-            let guest_end = align_up(region.end, HVF_PAGE_SIZE)?;
+            // The IPA actually mapped — identity for everything except the
+            // Rosetta high-VA window, which is aliased down to a low IPA.
+            let ipa_start = align_down(crate::memory::ipa_for_va(region.start), HVF_PAGE_SIZE);
+            // Back the FULL Rosetta window (2 MiB) so its page-table block has no
+            // unbacked tail; other regions round their end up to a page.
+            let guest_end = if crate::memory::is_rosetta_va(region.start) {
+                crate::memory::LINUX_ROSETTA_VA_BASE + crate::memory::LINUX_ROSETTA_WINDOW_SIZE
+            } else {
+                align_up(region.end, HVF_PAGE_SIZE)?
+            };
             let mapped_size =
                 guest_end
                     .checked_sub(guest_start)
@@ -169,6 +185,7 @@ impl GuestMappingPlan {
 
             mappings.push(GuestMapping {
                 guest_start,
+                ipa_start,
                 mapped_size,
                 offset_in_mapping,
                 payload_size: region.bytes().len() as u64,
@@ -563,8 +580,13 @@ fn replace_destroyed_hvf_inner(slot: &mut HvfInner, new_inner: HvfInner) {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug)]
 struct HvfMappedRegion {
+    /// Guest VIRTUAL start (the syscall-path lookup key). Differs from `ipa`
+    /// only for the Rosetta high-VA alias.
     start: u64,
     end: u64,
+    /// IPA this region was `hv_vm_map`'d at — needed to re-map across fork(2).
+    /// Identity (== `start`) for every region but the Rosetta window.
+    ipa: u64,
     /// Host VA of the buffer backing this guest-physical mapping. We
     /// record this explicitly so the fork(2) path can re-issue
     /// `hv_vm_map` in the child against the same (COW'd) host pages
@@ -643,6 +665,7 @@ struct HvfInner;
 #[derive(Debug, Clone, Copy)]
 struct ThreadMappingDesc {
     start: u64,
+    ipa: u64,
     end: u64,
     host_addr: *mut u8,
     size: usize,
@@ -655,6 +678,7 @@ impl ThreadMappingDesc {
     fn from_region(region: &HvfMappedRegion) -> Self {
         Self {
             start: region.start,
+            ipa: region.ipa,
             end: region.end,
             host_addr: region.host_addr,
             size: region.size,
@@ -666,6 +690,7 @@ impl ThreadMappingDesc {
     fn into_unowned_region(self) -> HvfMappedRegion {
         HvfMappedRegion {
             start: self.start,
+            ipa: self.ipa,
             end: self.end,
             host_addr: self.host_addr,
             size: self.size,
@@ -680,6 +705,7 @@ impl ThreadMappingDesc {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 struct ForkMappingDesc {
     start: u64,
+    ipa: u64,
     end: u64,
     host: ForkMappingHost,
     size: usize,
@@ -1128,14 +1154,17 @@ impl HvfTrapEngine {
                 .set_sys_reg(SysReg::MAIR_EL1, 0xFF)
                 .map_err(hvf_error)?;
             // TCR_EL1:
-            //   T0SZ = 24  (40-bit VA, start at L0)
+            //   T0SZ = 16  (48-bit VA, start at L0) — wide enough to address
+            //              Rosetta's fixed ET_EXEC load base at 2^47; existing
+            //              low identity mappings are unaffected (same L0[0..1]).
             //   IRGN0 = 0b11 (Inner WB Cacheable)
             //   ORGN0 = 0b11 (Outer WB Cacheable)
             //   SH0   = 0b11 (Inner Shareable)
             //   TG0   = 0b00 (4K granule)
             //   EPD1  = 1    (disable TTBR1 walks)
-            //   IPS   = 0b010 (40-bit IPA, max for M-series HVF)
-            const T0SZ: u64 = 24;
+            //   IPS   = 0b010 (40-bit IPA, max for M-series HVF — output stays
+            //              ≤40 bits; high VAs are mapped down to a low IPA)
+            const T0SZ: u64 = 16;
             const TCR_EL1_BOOTSTRAP: u64 =
                 T0SZ | (0b11 << 8) | (0b11 << 10) | (0b11 << 12) | (1 << 23) | (0b010 << 32);
             self.inner
@@ -2254,6 +2283,7 @@ impl HvfInner {
             .iter()
             .map(|m| ForkMappingDesc {
                 start: m.start,
+                ipa: m.ipa,
                 end: m.end,
                 host: ForkMappingHost::Borrowed(m.host_addr),
                 size: m.size,
@@ -2280,6 +2310,7 @@ impl HvfInner {
             };
             child_descs.push(ForkMappingDesc {
                 start: desc.start,
+                ipa: desc.ipa,
                 end: desc.end,
                 host: child_host,
                 size: desc.size,
@@ -2402,7 +2433,7 @@ impl HvfInner {
             let r = unsafe {
                 applevisor_sys::hv_vm_map(
                     host_addr as *mut std::ffi::c_void,
-                    desc.start,
+                    desc.ipa,
                     desc.size,
                     perms_raw,
                 )
@@ -2410,13 +2441,14 @@ impl HvfInner {
             if r != 0 {
                 return Err(TrapError::ChildMapFailed {
                     host_addr: host_addr as u64,
-                    guest_start: desc.start,
+                    guest_start: desc.ipa,
                     size: desc.size,
                     code: r as u32,
                 });
             }
             self.mappings.push(HvfMappedRegion {
                 start: desc.start,
+                ipa: desc.ipa,
                 end: desc.end,
                 host_addr,
                 size: desc.size,
@@ -2672,7 +2704,8 @@ impl HvfInner {
             self.vcpu
                 .set_sys_reg(SysReg::MAIR_EL1, 0xFF)
                 .map_err(hvf_error)?;
-            const T0SZ: u64 = 24;
+            // 48-bit VA (see the matching comment in map_address_space).
+            const T0SZ: u64 = 16;
             const TCR_EL1_BOOTSTRAP: u64 =
                 T0SZ | (0b11 << 8) | (0b11 << 10) | (0b11 << 12) | (1 << 23) | (0b010 << 32);
             self.vcpu
@@ -2960,18 +2993,20 @@ fn map_region_raw(mapping: &GuestMapping) -> Result<HvfMappedRegion, TrapError> 
     }
     let perms = hvf_perms(mapping.perms);
     let perms_raw: u64 = u64::from(perms);
+    // Map at the IPA (identity for all but the Rosetta alias); the guest's
+    // stage-1 page tables translate the VIRTUAL `guest_start` to this IPA.
     let r = unsafe {
         applevisor_sys::hv_vm_map(
             host.cast::<std::ffi::c_void>(),
-            mapping.guest_start,
+            mapping.ipa_start,
             size,
             perms_raw,
         )
     };
     if r != 0 {
         return Err(TrapError::Hypervisor(format!(
-            "hv_vm_map(guest=0x{:x}, size={size}) failed: 0x{r:x}",
-            mapping.guest_start
+            "hv_vm_map(ipa=0x{:x}, va=0x{:x}, size={size}) failed: 0x{r:x}",
+            mapping.ipa_start, mapping.guest_start
         )));
     }
     let end =
@@ -2985,6 +3020,7 @@ fn map_region_raw(mapping: &GuestMapping) -> Result<HvfMappedRegion, TrapError> 
     let guest_shared = host_mapping.guest_shared();
     Ok(HvfMappedRegion {
         start: mapping.guest_start,
+        ipa: mapping.ipa_start,
         end,
         host_addr: host,
         size,
@@ -3098,18 +3134,6 @@ fn signal_frame_stack_pointer(
 #[cfg(test)]
 mod memory_protection_tests {
     use super::*;
-
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    #[test]
-    fn probe_max_ipa_size() {
-        use applevisor::prelude::*;
-        let max = VirtualMachineConfig::get_max_ipa_size().unwrap();
-        let dflt = VirtualMachineConfig::get_default_ipa_size().unwrap();
-        eprintln!(
-            "MAX_IPA_BITS={max} (covers 0x{:x}) DEFAULT_IPA_BITS={dflt}; rosetta base 2^47 needs >=48",
-            1u128 << max
-        );
-    }
 
     #[test]
     fn exec_level_classifies_el0_as_guest_el1_as_kernel() {
@@ -3277,6 +3301,7 @@ mod thread_sibling_tests {
     fn thread_mapping_descriptor_preserves_shared_mapping_metadata() {
         let region = HvfMappedRegion {
             start: 0x1000,
+            ipa: 0x1000,
             end: 0x5000,
             host_addr: 0x7000usize as *mut u8,
             size: 0x4000,
