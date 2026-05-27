@@ -1675,6 +1675,27 @@ impl HvfInner {
                 // on the happy path, so it doesn't perturb the timing-sensitive
                 // c>=20 race it's meant to diagnose.
                 crate::probes::vcpu_fault(underlying, elr, far, x30, sp, unsafe { libc::getpid() });
+                // Decoded fault diagnostics for `carrick trace` (vcpu-fault-regs)
+                // as SCALARS — the faulting instruction word + the base register
+                // a load/store dereferenced and its value. So a script sees e.g.
+                // `ldr x0,[x0,#8]` with x0=17 -> far=0x19, without an eprintln
+                // rebuild. Scalars survive a fault that kills the process before
+                // DTrace's action runs (a copyin-pointer probe would not). Built
+                // only at the fault (never on the happy path); the host-side read
+                // of the instruction word can't be done in D (guest VA != host).
+                {
+                    let insn = self
+                        .read_guest_bytes(elr, 4)
+                        .ok()
+                        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u64)
+                        .unwrap_or(0);
+                    let rn = ((insn >> 5) & 0x1f) as u32;
+                    let xrn = self
+                        .vcpu
+                        .get_reg(GPR_TABLE[rn as usize])
+                        .unwrap_or(0);
+                    crate::probes::vcpu_fault_regs(underlying, elr, far, insn, rn, xrn);
+                }
                 // Walk the LIVE host page-table backing at the faulting VA so a
                 // trace can tell whether the leaf PTE is invalid in memory (a
                 // logic bug — a missing/lost validate) vs valid-but-stale-TLB (a
