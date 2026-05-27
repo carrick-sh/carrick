@@ -287,7 +287,7 @@ impl CompatReporter {
         let syscall_entries = self.syscall_entries.load(Ordering::Relaxed);
         let syscall_returns_ok = self.syscall_returns_ok.load(Ordering::Relaxed);
         let syscall_returns_errno = self.syscall_returns_errno.load(Ordering::Relaxed);
-        let unhandled_syscalls = self.unhandled_syscalls.lock().clone();
+        let unhandled_raw = self.unhandled_syscalls.lock().clone();
         let partial_syscalls = self.partial_syscalls.lock().clone();
         let unhandled_ioctls = self.unhandled_ioctls.lock().clone();
         let proc_read_unimplemented = self.proc_read_unimplemented.lock().clone();
@@ -295,8 +295,25 @@ impl CompatReporter {
         let unsupported_signals = self.unsupported_signals.lock().clone();
         let unknown_syscall_flags = self.unknown_syscall_flags.lock().clone();
 
-        let unhandled_syscall_invocations = unhandled_syscalls.values().sum::<u64>();
-        let unhandled_syscalls = sorted_syscalls(unhandled_syscalls);
+        // Split hit-but-unimplemented syscalls into those the aarch64 table
+        // recognises (Deferred/Planned roadmap entries — e.g. io_uring_setup)
+        // versus genuinely unknown numbers. This lets the report tell "we know
+        // this syscall and haven't emulated it yet" apart from "we have no idea
+        // what this number is", so a real workload's deferred-syscall hit-counts
+        // can drive what to implement next.
+        let mut deferred_map: HashMap<(u64, String), u64> = HashMap::new();
+        let mut unknown_map: HashMap<(u64, String), u64> = HashMap::new();
+        for (key, count) in unhandled_raw {
+            if crate::syscall::lookup_aarch64(key.0).is_some() {
+                deferred_map.insert(key, count);
+            } else {
+                unknown_map.insert(key, count);
+            }
+        }
+        let unhandled_syscall_invocations = unknown_map.values().sum::<u64>();
+        let deferred_syscall_invocations = deferred_map.values().sum::<u64>();
+        let unhandled_syscalls = sorted_syscalls(unknown_map);
+        let deferred_syscalls = sorted_syscalls(deferred_map);
         let partial_syscall_invocations = partial_syscalls.values().sum::<u64>();
         let partial_syscalls = sorted_partials(partial_syscalls);
         let unhandled_ioctl_invocations = unhandled_ioctls.values().sum::<u64>();
@@ -313,6 +330,8 @@ impl CompatReporter {
             syscall_returns_errno,
             distinct_unhandled_syscalls: unhandled_syscalls.len() as u64,
             unhandled_syscall_invocations,
+            distinct_deferred_syscalls: deferred_syscalls.len() as u64,
+            deferred_syscall_invocations,
             distinct_partial_syscalls: partial_syscalls.len() as u64,
             partial_syscall_invocations,
             distinct_unhandled_ioctls: unhandled_ioctls.len() as u64,
@@ -327,6 +346,7 @@ impl CompatReporter {
         CompatReport {
             summary,
             unhandled_syscalls,
+            deferred_syscalls,
             partial_syscalls,
             unhandled_ioctls,
             proc_read_unimplemented,
@@ -344,7 +364,13 @@ impl CompatReporter {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompatReport {
     pub summary: CompatSummary,
+    /// Hit-but-unimplemented syscalls whose numbers are NOT in the aarch64
+    /// table — genuinely unknown to Carrick.
     pub unhandled_syscalls: Vec<SyscallCount>,
+    /// Hit-but-unimplemented syscalls the aarch64 table DOES recognise
+    /// (Deferred/Planned). Sorted by call count so the top entries are the
+    /// highest-value emulation targets for the workload that produced them.
+    pub deferred_syscalls: Vec<SyscallCount>,
     pub partial_syscalls: Vec<PartialSyscallCount>,
     pub unhandled_ioctls: Vec<IoctlCount>,
     pub proc_read_unimplemented: Vec<PathCount>,
@@ -397,6 +423,8 @@ pub struct CompatSummary {
     pub syscall_returns_errno: u64,
     pub distinct_unhandled_syscalls: u64,
     pub unhandled_syscall_invocations: u64,
+    pub distinct_deferred_syscalls: u64,
+    pub deferred_syscall_invocations: u64,
     pub distinct_partial_syscalls: u64,
     pub partial_syscall_invocations: u64,
     pub distinct_unhandled_ioctls: u64,
@@ -430,6 +458,10 @@ impl CompatReport {
             s.distinct_unhandled_syscalls, s.unhandled_syscall_invocations,
         ));
         out.push_str(&format!(
+            "  deferred syscalls (recognised, not yet emulated): {} distinct, {} invocations\n",
+            s.distinct_deferred_syscalls, s.deferred_syscall_invocations,
+        ));
+        out.push_str(&format!(
             "  partial syscalls: {} distinct, {} invocations\n",
             s.distinct_partial_syscalls, s.partial_syscall_invocations,
         ));
@@ -450,6 +482,11 @@ impl CompatReport {
             s.distinct_unsupported_signals,
         ));
         render_section(&mut out, "Unhandled syscalls", &self.unhandled_syscalls);
+        render_section(
+            &mut out,
+            "Deferred syscalls (recognised, not yet emulated, top by call count)",
+            &self.deferred_syscalls,
+        );
         render_section(&mut out, "Partial syscalls", &self.partial_syscalls);
         render_section(&mut out, "Unhandled ioctls", &self.unhandled_ioctls);
         render_section(
