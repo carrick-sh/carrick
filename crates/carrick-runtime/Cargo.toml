@@ -14,6 +14,7 @@ workspace = true
 [dependencies]
 carrick-abi = { path = "../carrick-abi" }
 carrick-guest-mem = { path = "../carrick-guest-mem" }
+carrick-hvf = { path = "../carrick-hvf" }
 carrick-host = { path = "../carrick-host" }
 carrick-mem = { path = "../carrick-mem" }
 anyhow.workspace = true
@@ -46,9 +47,6 @@ carrick-spec = { path = "../carrick-spec" }
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 applevisor.workspace = true
 applevisor-sys.workspace = true
-
-[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.build-dependencies]
-cc = "1"
 
 [dev-dependencies]
 carrick-test-support = { path = "../carrick-test-support" }

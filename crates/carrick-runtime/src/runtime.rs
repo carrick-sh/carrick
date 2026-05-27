@@ -24,6 +24,10 @@ fn pt_barrier() -> &'static crate::fork_quiesce::PtQuiesce {
     crate::fork_quiesce::pt_barrier()
 }
 use crate::trap::{HvfTrapEngine, TrapError};
+// `SyscallTrap` moved to carrick-hvf (`crate::trap`); re-export it from this
+// module so the original `carrick_runtime::runtime::SyscallTrap` path (used by
+// the runtime_loop tests and the engine crate) is unchanged.
+pub use crate::trap::SyscallTrap;
 use serde::Serialize;
 use thiserror::Error;
 
@@ -96,95 +100,10 @@ pub fn maybe_dump_debug_state(image: &AddressSpace, path: Option<&PathBuf>) -> O
 
 pub const DEFAULT_MAX_TRAPS: usize = 1_000_000;
 
-pub trait SyscallTrap {
-    /// Run the vCPU until it traps. `Ok(Some(frame))` is a guest syscall;
-    /// `Ok(None)` means the vCPU was forced out of the guest by a cross-thread
-    /// kick (`hv_vcpus_exit`, [`crate::vcpu_kick`]) with no syscall pending —
-    /// the loop should run signal delivery and resume. `Err` is a real fault.
-    fn next_syscall(&mut self) -> Result<Option<Aarch64SyscallFrame>, TrapError>;
-    /// The guest PC the vCPU is currently parked at. Used as the resume address
-    /// when injecting a signal on a non-syscall (kick) exit, where `ELR_EL1`
-    /// does not hold a meaningful return address.
-    fn current_pc(&self) -> Result<u64, TrapError>;
-    fn complete_syscall(&mut self, return_value: i64) -> Result<(), TrapError>;
-    /// Real macOS fork. Returns the child pid in the parent, 0 in the
-    /// child. After this returns, the trap engine in the child holds a
-    /// freshly rebuilt HVF context pointing at the same COW'd guest
-    /// memory; the runtime then writes the appropriate retval into the
-    /// guest's x0 via `complete_syscall`.
-    fn fork(&mut self) -> Result<crate::trap::ForkOutcome, TrapError>;
-    /// `execve(2)` — tear down the current guest address space and
-    /// re-initialise this engine with `new_image`. Does NOT advance
-    /// past a syscall (execve has no successful return); the next
-    /// `next_syscall` resumes at the new image's entry point.
-    fn execve_into(&mut self, new_image: &AddressSpace) -> Result<(), TrapError>;
-    fn is_forked_child(&self) -> bool {
-        false
-    }
-    /// Inject a guest signal frame for `signum`. Writes a
-    /// `CarrickSigframe` to SP_EL0, points the guest's x30 at
-    /// `sa_restorer`, sets x0 to `signum`, and redirects the vCPU's
-    /// next resumed PC (`ELR_EL1`) to the user handler. The pre-signal
-    /// register state is preserved in the frame and recovered by
-    /// `restore_from_sigframe` on `rt_sigreturn`.
-    ///
-    /// `pending_syscall_retval` is the retval the dispatcher computed
-    /// for the syscall that was just trapped, since signals are
-    /// delivered between `complete_syscall` and the next vCPU run we
-    /// already wrote it into x0; the frame snapshots the post-retval
-    /// state so the handler-return path picks up where the caller left
-    /// off. Pass `None` when injecting outside a syscall completion
-    /// (e.g. when raising at the top of the trap loop before the first
-    /// syscall has run).
-    /// `interrupted_pc` is `Some(pc)` when injecting on a non-syscall kick exit
-    /// (the vCPU was mid-userspace; `pc` is where it should resume after the
-    /// handler returns and is redirected via `Reg::PC` rather than `ELR_EL1`).
-    /// `None` is the syscall-boundary case (resume via the post-svc `ELR_EL1`).
-    /// `altstack` is `Some((ss_sp, ss_size))` when the handler was registered
-    /// `SA_ONSTACK` and an alternate signal stack is installed — the frame is
-    /// pushed onto that stack instead of the interrupted SP_EL0. `None` keeps
-    /// the frame on the current stack.
-    fn inject_signal(
-        &mut self,
-        signum: i32,
-        handler: u64,
-        sa_restorer: u64,
-        pending_syscall_retval: Option<i64>,
-        interrupted_pc: Option<u64>,
-        altstack: Option<(u64, u64)>,
-        saved_sigmask: u64,
-        // Some((si_code, si_addr)) for a synchronous fault (SIGSEGV/SIGBUS),
-        // None for a SI_USER-shaped delivery.
-        fault_siginfo: Option<(i32, u64)>,
-    ) -> Result<(), TrapError>;
-    /// Restore vCPU state from the `CarrickSigframe` at SP_EL0. Called
-    /// when the guest invokes `rt_sigreturn(2)`. Does NOT advance PC
-    /// past the syscall the way `complete_syscall` does — the restored
-    /// PC IS the next PC.
-    fn restore_from_sigframe(&mut self) -> Result<u64, TrapError>;
-    /// Toggle the vCPU's memory-ordering model (`prctl(PR_SET_MEM_MODEL, …)`).
-    /// `tso == true` enables hardware x86_64 Total Store Ordering on this vCPU
-    /// (`ACTLR_EL1.EnTSO`), required for Rosetta-translated guests; `false`
-    /// restores AArch64's default weakly-ordered model. The default
-    /// implementation is a no-op (non-HVF / test traps have no vCPU register).
-    fn set_memory_model(&mut self, tso: bool) -> Result<(), TrapError> {
-        let _ = tso;
-        Ok(())
-    }
-    /// Back a dynamic high-VA mmap (`DispatchOutcome::MapHostAlias`): map host
-    /// memory at `ipa` and build the VA→IPA stage-1 path. Default no-op error
-    /// for non-HVF/test traps (they never emit the outcome).
-    fn map_host_alias(
-        &mut self,
-        va: u64,
-        ipa: u64,
-        len: u64,
-        payload: &[u8],
-    ) -> Result<(), TrapError> {
-        let _ = (va, ipa, len, payload);
-        Err(TrapError::UnsupportedPlatform)
-    }
-}
+// `SyscallTrap` (the trap-engine contract the loops drive) moved into
+// carrick-hvf alongside `TrapError`/`ForkOutcome`/`HvfTrapEngine`. Re-exported
+// from `crate::trap`; imported here via the `use crate::trap::{…}` below so
+// `SplitView`/`HvfTrapEngine` impls and the loop bounds are unchanged.
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
@@ -2653,73 +2572,10 @@ where
     run_combined_syscall_loop_with_dispatcher(&mut view, dispatcher, max_traps)
 }
 
-impl SyscallTrap for HvfTrapEngine {
-    fn fork(&mut self) -> Result<crate::trap::ForkOutcome, TrapError> {
-        self.fork()
-    }
-
-    fn execve_into(&mut self, new_image: &AddressSpace) -> Result<(), TrapError> {
-        self.execve_into(new_image)
-    }
-
-    fn is_forked_child(&self) -> bool {
-        HvfTrapEngine::is_forked_child(self)
-    }
-
-    fn next_syscall(&mut self) -> Result<Option<Aarch64SyscallFrame>, TrapError> {
-        self.run_until_syscall()
-    }
-
-    fn current_pc(&self) -> Result<u64, TrapError> {
-        self.program_counter()
-    }
-
-    fn complete_syscall(&mut self, return_value: i64) -> Result<(), TrapError> {
-        self.complete_syscall(return_value)
-    }
-
-    fn set_memory_model(&mut self, tso: bool) -> Result<(), TrapError> {
-        self.set_hardware_tso(tso)
-    }
-
-    fn map_host_alias(
-        &mut self,
-        va: u64,
-        ipa: u64,
-        len: u64,
-        payload: &[u8],
-    ) -> Result<(), TrapError> {
-        HvfTrapEngine::map_host_alias(self, va, ipa, len, payload)
-    }
-
-    fn inject_signal(
-        &mut self,
-        signum: i32,
-        handler: u64,
-        sa_restorer: u64,
-        pending_syscall_retval: Option<i64>,
-        interrupted_pc: Option<u64>,
-        altstack: Option<(u64, u64)>,
-        saved_sigmask: u64,
-        fault_siginfo: Option<(i32, u64)>,
-    ) -> Result<(), TrapError> {
-        HvfTrapEngine::inject_signal(
-            self,
-            signum,
-            handler,
-            sa_restorer,
-            pending_syscall_retval,
-            interrupted_pc,
-            altstack,
-            saved_sigmask,
-            fault_siginfo,
-        )
-    }
-
-    fn restore_from_sigframe(&mut self) -> Result<u64, TrapError> {
-        HvfTrapEngine::restore_from_sigframe(self)
-    }
-}
+// `impl SyscallTrap for HvfTrapEngine` moved into carrick-hvf (trap.rs):
+// both the trait and the type now live there, so the impl must too (orphan
+// rule). The blanket loop bounds (`T: SyscallTrap`) and `SplitView` impl below
+// use the re-exported trait and are unchanged.
 
 #[cfg(test)]
 mod tests {
