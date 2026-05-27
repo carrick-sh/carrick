@@ -526,6 +526,17 @@ pub enum DispatchOutcome {
     SetMemoryModel {
         tso: bool,
     },
+    /// Back a dynamic high-VA `mmap` (a guest VA at/above 1 TiB that can't be
+    /// identity-mapped — HVF's IPA is 40 bits). Apple Rosetta reserves its
+    /// translation working set at ~240 TiB. The runtime `hv_vm_map`s anonymous
+    /// memory at `ipa`, builds a VA→IPA stage-1 path for `[va, va+len)`, and
+    /// completes the `mmap` with `va`. The dispatcher has already reserved `ipa`
+    /// from the low alias arena (`crate::memory::LINUX_ALIAS_IPA_BASE`).
+    MapHostAlias {
+        va: u64,
+        ipa: u64,
+        len: u64,
+    },
     /// Guest invoked `rt_sigreturn(2)` (syscall 139). The runtime must
     /// pop the Carrick sigframe at SP_EL0, restore the saved register
     /// state, and resume — without advancing PC the way a normal SVC
@@ -648,6 +659,7 @@ impl DispatchOutcome {
             DispatchOutcome::Execve { .. } => (0, None),
             DispatchOutcome::SigReturn => (0, None),
             DispatchOutcome::SetMemoryModel { .. } => (0, None),
+            DispatchOutcome::MapHostAlias { .. } => (0, None),
             // CloneThread/ThreadExit/FutexWait are handled specially by the
             // runtime and never flow through retval_errno — the runtime acts
             // on them directly before any x0 write.

@@ -193,6 +193,25 @@ pub fn is_rosetta_va(va: u64) -> bool {
     va >= LINUX_ROSETTA_VA_BASE && va < LINUX_ROSETTA_VA_BASE + LINUX_ROSETTA_WINDOW_SIZE
 }
 
+// ── Dynamic high-VA mmap alias arena ─────────────────────────────────────────
+// Guest mmaps at a VA at or above 1 TiB can't be backed identity-mapped (HVF's
+// IPA is 40 bits → max 1 TiB). Apple Rosetta reserves its translation working
+// set at ~240 TiB, so the dispatcher routes any high-VA MAP_FIXED to a low IPA
+// drawn from this arena, and the runtime maps it + builds a VA→IPA page-table
+// path (the dynamic counterpart of the static Rosetta image alias above).
+/// Guest VAs at or above this are aliased to a low IPA rather than mapped
+/// identity. Above every identity region (stack top is just under 1 TiB).
+pub const LINUX_HIGH_VA_THRESHOLD: u64 = 0x100_0000_0000; // 1 TiB (2^40)
+/// Low-IPA arena the alias mappings are drawn from. Free, 2 MiB-aligned, and
+/// below the 40-bit IPA ceiling and the kernel region (180 GiB).
+pub const LINUX_ALIAS_IPA_BASE: u64 = 0x18_0000_0000; // 96 GiB
+pub const LINUX_ALIAS_IPA_SIZE: u64 = 0x10_0000_0000; // 64 GiB of alias space
+
+/// True if `va` must be served by the dynamic high-VA alias arena.
+pub fn is_high_va(va: u64) -> bool {
+    va >= LINUX_HIGH_VA_THRESHOLD
+}
+
 /// The IPA that `hv_vm_map` should use for a guest VA. Identity everywhere
 /// except the Rosetta window, which is aliased down to [`LINUX_ROSETTA_IPA_BASE`]
 /// (HVF's 40-bit IPA can't reach Rosetta's 2^47 link base). The guest's stage-1

@@ -842,6 +842,17 @@ impl HvfTrapEngine {
         Err(TrapError::UnsupportedPlatform)
     }
 
+    /// Back a dynamic high-VA `mmap` (see `DispatchOutcome::MapHostAlias`).
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn map_host_alias(&mut self, va: u64, ipa: u64, len: u64) -> Result<(), TrapError> {
+        self.inner.map_host_alias(va, ipa, len)
+    }
+
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    pub fn map_host_alias(&mut self, _va: u64, _ipa: u64, _len: u64) -> Result<(), TrapError> {
+        Err(TrapError::UnsupportedPlatform)
+    }
+
     /// Real macOS fork(2). The parent continues running its existing HVF
     /// context unchanged; the child returns with a freshly-rebuilt VM
     /// pointing at the same host buffers (COW via Mach VM), all sysregs
@@ -1454,6 +1465,49 @@ impl HvfInner {
 
     fn unmap_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
         self.pt_edit_and_flush(|mgr| mgr.invalidate(address, len))
+    }
+
+    /// Back a dynamic high-VA `mmap`: `hv_vm_map` host-anon memory at the
+    /// reserved low IPA, build the VA→IPA stage-1 path, and register the region
+    /// for syscall-path access (keyed by the VA). RWX so a JIT (Rosetta) can
+    /// both write and execute it; the guest may `mprotect` afterwards.
+    fn map_host_alias(&mut self, va: u64, ipa: u64, len: u64) -> Result<(), TrapError> {
+        let size = usize::try_from(len).map_err(|_| TrapError::MappingTooLarge(len))?;
+        let host_mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+            size,
+            crate::host_mapping::HostMappingKind::PrivateAnon,
+        )
+        .map_err(|e| TrapError::Hypervisor(format!("alias mmap (size={size}) failed: {e}")))?;
+        let host = host_mapping.as_ptr();
+        let size = host_mapping.len();
+        let perms = hvf_perms(SegmentPerms {
+            read: true,
+            write: true,
+            execute: true,
+        });
+        let r =
+            unsafe { applevisor_sys::hv_vm_map(host.cast(), ipa, size, u64::from(perms)) };
+        if r != 0 {
+            return Err(TrapError::Hypervisor(format!(
+                "hv_vm_map alias va=0x{va:x} ipa=0x{ipa:x} size={size} failed: 0x{r:x}"
+            )));
+        }
+        // Build VA→IPA descriptors + TLBI so the guest's own accesses translate.
+        self.pt_edit_and_flush(|mgr| mgr.map_aliased(va, ipa, len))
+            .map_err(|e| TrapError::Hypervisor(format!("alias page-table build failed: {e}")))?;
+        let guest_shared = host_mapping.guest_shared();
+        self.mappings.push(HvfMappedRegion {
+            start: va,
+            ipa,
+            end: va + size as u64,
+            host_addr: host,
+            size,
+            perms,
+            memory: None,
+            host_mapping: Some(host_mapping),
+            guest_shared,
+        });
+        Ok(())
     }
 
     fn run_until_syscall(&mut self) -> Result<Option<Aarch64SyscallFrame>, TrapError> {

@@ -558,6 +558,64 @@ impl PageTableManager {
         self.apply(va, len, PtOp::ReadWrite)
     }
 
+    /// Build a fresh VA→IPA translation for `[va, va+len)` (RWX-for-EL0),
+    /// creating any missing L1/L2/L3 sub-tables. This is the dynamic counterpart
+    /// of the boot Rosetta alias: it maps high guest VAs (which can't be
+    /// identity-mapped — HVF's IPA is only 40 bits) down to a low IPA the caller
+    /// has `hv_vm_map`'d. Uses 2 MiB blocks when `va`/`ipa`/`len` are 2 MiB
+    /// aligned, else 4 KiB pages. The target VA range must be previously
+    /// unmapped (high space the boot tables never populate). Always Ok(true).
+    pub fn map_aliased(&mut self, va: u64, ipa: u64, len: u64) -> Result<bool, PageTableError> {
+        const TWO_MIB: u64 = 1 << 21;
+        const FOUR_KIB: u64 = 1 << 12;
+        if va % TWO_MIB == 0 && ipa % TWO_MIB == 0 && len % TWO_MIB == 0 {
+            let n = len / TWO_MIB;
+            for i in 0..n {
+                let v = va + i * TWO_MIB;
+                let p = ipa + i * TWO_MIB;
+                let l2_off = self.descend_creating(v, 2)?;
+                let idx = indices(v);
+                self.write_desc(l2_off + idx[2] * 8, (p & PA_MASK_2MIB) | USER_BLOCK_FLAGS);
+            }
+            return Ok(true);
+        }
+        let pages = len.div_ceil(FOUR_KIB);
+        for i in 0..pages {
+            let v = va + i * FOUR_KIB;
+            let p = ipa + i * FOUR_KIB;
+            let l3_off = self.descend_creating(v, 3)?;
+            let idx = indices(v);
+            self.write_desc(l3_off + idx[3] * 8, (p & PA_MASK_4KIB) | USER_PAGE_FLAGS);
+        }
+        Ok(true)
+    }
+
+    /// Descend from L0 to the table at `target_level` (1, 2, or 3), allocating
+    /// any missing intermediate table from the spare pool. Returns the byte
+    /// offset of that table within the region. Errors if an existing block sits
+    /// on the path (never the case for the high alias space).
+    fn descend_creating(&mut self, va: u64, target_level: usize) -> Result<usize, PageTableError> {
+        let idx = indices(va);
+        let mut table_off = 0usize; // L0 at byte offset 0
+        for level in 0..target_level {
+            let off = table_off + idx[level] * 8;
+            let desc = self.read_desc(off);
+            let valid = desc & VALID != 0;
+            let is_table = desc & TYPE_BITS == TYPE_TABLE_OR_PAGE;
+            if valid && is_table {
+                table_off = self.pa_to_off(desc & PA_MASK_TABLE)?;
+                continue;
+            }
+            if valid {
+                return Err(PageTableError::BadAddress);
+            }
+            let pa = self.alloc_table()?;
+            table_off = self.pa_to_off(pa)?;
+            self.write_table_desc(off, (pa & PA_MASK_TABLE) | TYPE_TABLE_OR_PAGE);
+        }
+        Ok(table_off)
+    }
+
     /// True iff the leaf for `va` (block or page) is valid. Test/diagnostic.
     #[cfg(test)]
     pub fn is_valid(&mut self, va: u64) -> bool {
