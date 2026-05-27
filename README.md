@@ -91,11 +91,22 @@ Carrick is a Cargo workspace:
 
 The dependency direction is `cli → engine → {image, runtime} → spec`; `runtime` and `image` never depend on each other or on `engine`.
 
+A [`justfile`](justfile) wraps the common workflows (`just --list` to see them all):
+
 ```sh
-cargo fmt --all
-cargo build
-cargo test --workspace
+just build          # build + codesign the release binary (the only runnable build)
+just run run ubuntu:24.04 /bin/echo hi
+just clippy         # the no-panic lint gate
+just test           # host unit/integration tests (no HVF/Docker needed)
+just conformance    # differential suite vs Docker
 ```
+
+> [!IMPORTANT]
+> Run a guest only from a **codesigned** binary. `cargo build` strips the
+> signature on macOS, so a bare build fails every run with `HV_DENIED`
+> (`0xfae94007`). `just build` (i.e. [`scripts/build-signed.sh`](scripts/build-signed.sh))
+> re-applies the `com.apple.security.hypervisor` entitlement after linking.
+> Use plain `cargo build`/`cargo test` only for compile-checking, never to run.
 
 ### Build performance
 
