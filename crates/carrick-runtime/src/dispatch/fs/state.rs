@@ -53,6 +53,10 @@ pub(in crate::dispatch) struct IoState {
     /// to recover the binary path. Best-effort: populated on open, cleared on
     /// close (a stale entry for a recycled fd is overwritten by the next open).
     pub fd_open_paths: RwLock<HashMap<i32, String>>,
+    /// Live io_uring instances keyed by ring fd (WS-H4-B1). Side table rather
+    /// than an `OpenDescription` variant so io_uring needs no new arm across the
+    /// ~24 fd match sites; `mmap`/`io_uring_enter` look the ring up here.
+    pub io_uring_instances: RwLock<HashMap<i32, crate::dispatch::ioring::IoUringState>>,
 }
 
 impl IoState {
@@ -66,6 +70,7 @@ impl IoState {
             cwd: RwLock::new("/".to_owned()),
             stdio_cloexec: Mutex::new([false; 3]),
             fd_open_paths: RwLock::new(HashMap::new()),
+            io_uring_instances: RwLock::new(HashMap::new()),
         }
     }
 }

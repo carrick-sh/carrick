@@ -71,7 +71,7 @@ fn free_regions_insert(regions: &mut Vec<(u64, u64)>, addr: u64, len: u64) {
     *regions = out;
 }
 impl SyscallDispatcher {
-    fn next_mmap_address(
+    pub(in crate::dispatch) fn next_mmap_address(
         &self,
         requested: u64,
         length: u64,
@@ -181,6 +181,17 @@ impl SyscallDispatcher {
         fn mmap(this, cx, requested: GuestPtr, length: u64, prot: u64, flags: u64, fd: Fd, offset: u64) {
             let mut flags = flags;
             let memory = &mut *cx.memory;
+
+            // io_uring ring mapping: the SQ/CQ rings and SQE array already live
+            // in the guest arena (allocated by io_uring_setup); the guest maps
+            // them off the ring fd with offset = IORING_OFF_*. Hand back the
+            // address carrick placed them at, so guest and runtime share the
+            // same coherent ring memory.
+            if flags & LINUX_MAP_ANONYMOUS == 0 && fd.0 >= 0 {
+                if let Some(addr) = this.io_uring_mmap_addr(fd.0, offset) {
+                    return Ok(DispatchOutcome::Returned { value: addr as i64 });
+                }
+            }
 
             if flags & LINUX_MAP_FIXED_NOREPLACE != 0 {
                 flags |= LINUX_MAP_FIXED;
@@ -666,6 +677,22 @@ impl SyscallDispatcher {
 
         fn sys_membarrier(this, cx, command: u64, flags: u64) {
             Ok(this.membarrier(command, flags))
+        }
+
+        // io_uring (WS-H4-B1). setup allocates the rings in the guest arena and
+        // returns a ring fd; the guest mmaps the rings off it (handled in the
+        // mmap path); enter drains the SQ ring. register is ENOSYS for now (the
+        // fixed-file/buffer optimization, not needed for correctness).
+        fn io_uring_setup(this, cx, entries: u64, params_ptr: GuestPtr) {
+            Ok(this.io_uring_setup_impl(cx.memory, entries as u32, params_ptr.0))
+        }
+
+        fn io_uring_enter(this, cx, fd: Fd, to_submit: u64, _min_complete: u64, _flags: u64, _argp: GuestPtr, _argsz: u64) {
+            Ok(this.io_uring_enter_impl(cx.memory, fd.0, to_submit as u32))
+        }
+
+        fn io_uring_register(this, cx, _fd: Fd, _opcode: u64, _arg: GuestPtr, _nr_args: u64) {
+            Ok(LINUX_ENOSYS.into())
         }
     }
 }

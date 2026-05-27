@@ -16,14 +16,18 @@
 //! to an unsupported opcode — so even the partial set is non-harmful (apps see
 //! a normal CQE error, not a hang).
 
-#![allow(dead_code)] // wired by the io_uring_setup/enter step; see module docs.
+#![allow(dead_code)] // complete_sqe/opcode_serviced are the unit-tested reference; the
+// wired enter path inlines the op match for borrow simplicity.
 
+use super::*;
 use crate::linux_abi::{
     LinuxIoCqringOffsets, LinuxIoSqringOffsets, LinuxIoUringCqe, LinuxIoUringParams,
     LinuxIoUringSqe, LINUX_IORING_FEAT_NODROP, LINUX_IORING_FEAT_SINGLE_MMAP,
+    LINUX_IORING_OFF_CQ_RING, LINUX_IORING_OFF_SQES, LINUX_IORING_OFF_SQ_RING,
     LINUX_IORING_OP_CLOSE, LINUX_IORING_OP_FSYNC, LINUX_IORING_OP_NOP, LINUX_IORING_OP_READ,
     LINUX_IORING_OP_READV, LINUX_IORING_OP_WRITE, LINUX_IORING_OP_WRITEV,
 };
+use zerocopy::{FromBytes, IntoBytes};
 
 const EINVAL: i32 = 22;
 const U32: u32 = 4;
@@ -120,6 +124,20 @@ fn align_up_u32(v: u32, align: u32) -> u32 {
     v.div_ceil(align) * align
 }
 
+/// A live io_uring instance, tracked in a side table keyed by the ring fd (so
+/// no `OpenDescription` variant — and its ~24 match sites — is needed). The SQ/
+/// CQ rings and SQE array live in the guest mmap arena at these addresses;
+/// carrick reads/writes them coherently, and the guest maps them via
+/// `mmap(ring_fd, IORING_OFF_*)` which returns these same addresses.
+#[derive(Debug, Clone, Copy)]
+pub(in crate::dispatch) struct IoUringState {
+    pub layout: RingLayout,
+    /// Base of the combined SQ+CQ ring mapping (IORING_OFF_SQ_RING/CQ_RING).
+    pub ring_addr: u64,
+    /// Base of the SQE-array mapping (IORING_OFF_SQES).
+    pub sqes_addr: u64,
+}
+
 /// True for the opcodes carrick phase 1 actually executes (the rest complete
 /// with -EINVAL). Exposed so the enter path can decide whether to invoke I/O.
 pub(crate) fn opcode_serviced(op: u8) -> bool {
@@ -152,6 +170,191 @@ pub(crate) fn complete_sqe(
         user_data: sqe.user_data,
         res,
         flags: 0,
+    }
+}
+
+fn read_ring_u32(memory: &impl GuestMemory, addr: u64) -> u32 {
+    memory
+        .read_bytes(addr, 4)
+        .ok()
+        .and_then(|b| <[u8; 4]>::try_from(b.as_slice()).ok())
+        .map(u32::from_ne_bytes)
+        .unwrap_or(0)
+}
+
+fn write_ring_u32(memory: &mut impl GuestMemory, addr: u64, v: u32) {
+    let _ = memory.write_bytes(addr, &v.to_ne_bytes());
+}
+
+impl SyscallDispatcher {
+    /// `io_uring_setup(entries, params)`: allocate the SQ/CQ rings and the SQE
+    /// array in the guest mmap arena, initialise the control words the guest
+    /// reads, fill `params`, install a placeholder fd (so close/stat work), and
+    /// record the instance in the side table. Returns the ring fd.
+    pub(in crate::dispatch) fn io_uring_setup_impl(
+        &self,
+        memory: &mut impl GuestMemory,
+        entries: u32,
+        params_ptr: u64,
+    ) -> DispatchOutcome {
+        if entries == 0 || entries > 4096 {
+            return DispatchOutcome::errno(LINUX_EINVAL);
+        }
+        let layout = RingLayout::new(entries);
+        let prot = LINUX_PROT_READ | LINUX_PROT_WRITE;
+        let (Some((ring_addr, _)), Some((sqes_addr, _))) = (
+            self.next_mmap_address(0, layout.ring_bytes as u64, prot, 0),
+            self.next_mmap_address(0, layout.sqes_bytes as u64, prot, 0),
+        ) else {
+            return DispatchOutcome::errno(LINUX_ENOMEM);
+        };
+        if memory.write_bytes(ring_addr, &vec![0u8; layout.ring_bytes]).is_err()
+            || memory.write_bytes(sqes_addr, &vec![0u8; layout.sqes_bytes]).is_err()
+        {
+            return DispatchOutcome::errno(LINUX_EFAULT);
+        }
+        // Control words the guest's ring code reads (mask + entry count).
+        write_ring_u32(memory, ring_addr + layout.sq_off.ring_mask as u64, layout.sq_entries - 1);
+        write_ring_u32(memory, ring_addr + layout.sq_off.ring_entries as u64, layout.sq_entries);
+        write_ring_u32(memory, ring_addr + layout.cq_off.ring_mask as u64, layout.cq_entries - 1);
+        write_ring_u32(memory, ring_addr + layout.cq_off.ring_entries as u64, layout.cq_entries);
+
+        let mut params = LinuxIoUringParams::default();
+        layout.fill_params(&mut params);
+        if memory.write_bytes(params_ptr, params.as_bytes()).is_err() {
+            return DispatchOutcome::errno(LINUX_EFAULT);
+        }
+
+        let desc = OpenDescription::SyntheticFile {
+            base: OpenDescriptionBase::new(0),
+            path: "[io_uring]".to_owned(),
+            contents: Vec::new(),
+            offset: 0,
+        };
+        let open_file = OpenFile::new(std::sync::Arc::new(parking_lot::RwLock::new(desc)), 0);
+        let Ok(fd) = self.install_fd_at_or_above(3, open_file) else {
+            return DispatchOutcome::errno(linux_errno::EMFILE);
+        };
+        self.io.io_uring_instances.write().insert(
+            fd,
+            IoUringState {
+                layout,
+                ring_addr,
+                sqes_addr,
+            },
+        );
+        DispatchOutcome::Returned { value: fd as i64 }
+    }
+
+    /// The guest-arena address a `mmap(ring_fd, off)` should resolve to, or
+    /// `None` if `fd` is not an io_uring ring. The ring memory already lives in
+    /// the arena, so mmap just hands back its address.
+    pub(in crate::dispatch) fn io_uring_mmap_addr(&self, fd: i32, off: u64) -> Option<u64> {
+        let table = self.io.io_uring_instances.read();
+        let state = table.get(&fd)?;
+        match off {
+            LINUX_IORING_OFF_SQ_RING | LINUX_IORING_OFF_CQ_RING => Some(state.ring_addr),
+            LINUX_IORING_OFF_SQES => Some(state.sqes_addr),
+            _ => None,
+        }
+    }
+
+    /// `io_uring_enter(fd, to_submit, …)`: drain up to `to_submit` SQEs from the
+    /// SQ ring, run each, and post a CQE. Synchronous — every completion is
+    /// ready by the time enter returns, so `min_complete` is already satisfied.
+    pub(in crate::dispatch) fn io_uring_enter_impl(
+        &self,
+        memory: &mut impl GuestMemory,
+        fd: i32,
+        to_submit: u32,
+    ) -> DispatchOutcome {
+        let Some(state) = self.io.io_uring_instances.read().get(&fd).copied() else {
+            return DispatchOutcome::errno(LINUX_EINVAL);
+        };
+        let layout = state.layout;
+        let ring = state.ring_addr;
+        let sq_mask = layout.sq_entries - 1;
+        let cq_mask = layout.cq_entries - 1;
+
+        let sq_tail = read_ring_u32(memory, ring + layout.sq_off.tail as u64);
+        let mut sq_head = read_ring_u32(memory, ring + layout.sq_off.head as u64);
+        let mut cq_tail = read_ring_u32(memory, ring + layout.cq_off.tail as u64);
+
+        let mut submitted = 0u32;
+        while submitted < to_submit && sq_head != sq_tail {
+            let arr_slot = ring + layout.sq_off.array as u64 + ((sq_head & sq_mask) as u64) * 4;
+            let sqe_idx = read_ring_u32(memory, arr_slot);
+            let sqe_addr = state.sqes_addr + (sqe_idx as u64) * 64;
+            let sqe = memory
+                .read_bytes(sqe_addr, core::mem::size_of::<LinuxIoUringSqe>())
+                .ok()
+                .and_then(|b| LinuxIoUringSqe::read_from_prefix(&b).ok().map(|(s, _)| s));
+            let (user_data, res) = match sqe {
+                Some(sqe) => (sqe.user_data, self.io_uring_run_op(memory, &sqe)),
+                None => (0, -LINUX_EFAULT),
+            };
+            let cqe = LinuxIoUringCqe {
+                user_data,
+                res,
+                flags: 0,
+            };
+            let cqe_addr = ring + layout.cq_off.cqes as u64 + ((cq_tail & cq_mask) as u64) * 16;
+            let _ = memory.write_bytes(cqe_addr, cqe.as_bytes());
+            cq_tail = cq_tail.wrapping_add(1);
+            sq_head = sq_head.wrapping_add(1);
+            submitted += 1;
+        }
+        // Publish the consumed SQ head and the produced CQ tail back to the guest.
+        write_ring_u32(memory, ring + layout.sq_off.head as u64, sq_head);
+        write_ring_u32(memory, ring + layout.cq_off.tail as u64, cq_tail);
+        DispatchOutcome::Returned {
+            value: submitted as i64,
+        }
+    }
+
+    /// Execute one SQE, returning the CQE `res` (bytes transferred or `-errno`).
+    /// Phase 1: NOP and host-file READ/WRITE; any other opcode → `-EINVAL`,
+    /// matching the kernel's response to an unsupported opcode.
+    fn io_uring_run_op(&self, memory: &mut impl GuestMemory, sqe: &LinuxIoUringSqe) -> i32 {
+        match sqe.opcode {
+            LINUX_IORING_OP_NOP => 0,
+            LINUX_IORING_OP_READ => {
+                let Some(hfd) = self.regular_host_file_fd(sqe.fd) else {
+                    return -LINUX_EINVAL;
+                };
+                let len = sqe.len as usize;
+                let mut buf = vec![0u8; len];
+                let n = unsafe {
+                    libc::pread(hfd, buf.as_mut_ptr() as *mut _, len, sqe.off as libc::off_t)
+                };
+                match n.host_syscall_errno() {
+                    Ok(got) => {
+                        let got = got as usize;
+                        if memory.write_bytes(sqe.addr, &buf[..got]).is_err() {
+                            return -LINUX_EFAULT;
+                        }
+                        got as i32
+                    }
+                    Err(e) => -e,
+                }
+            }
+            LINUX_IORING_OP_WRITE => {
+                let Some(hfd) = self.regular_host_file_fd(sqe.fd) else {
+                    return -LINUX_EINVAL;
+                };
+                let Ok(buf) = memory.read_bytes(sqe.addr, sqe.len as usize) else {
+                    return -LINUX_EFAULT;
+                };
+                let n = unsafe {
+                    libc::pwrite(hfd, buf.as_ptr() as *const _, buf.len(), sqe.off as libc::off_t)
+                };
+                match n.host_syscall_errno() {
+                    Ok(put) => put as i32,
+                    Err(e) => -e,
+                }
+            }
+            _ => -LINUX_EINVAL,
+        }
     }
 }
 
