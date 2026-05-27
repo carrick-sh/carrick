@@ -408,6 +408,34 @@ impl SyscallDispatcher {
         let want_excl = flags & LINUX_O_EXCL != 0;
         let want_trunc = flags & LINUX_O_TRUNC != 0;
 
+        // O_TMPFILE: `pathname` names a directory; the result is an unnamed,
+        // writable regular file. Model it as an anonymous in-memory File with no
+        // overlay/namespace entry — it's never linked anywhere, exactly the
+        // "unlinked temp file" semantics tmpfile(3)/build tools rely on. Requires
+        // write access (the kernel rejects O_RDONLY|O_TMPFILE with EINVAL).
+        // (linkat(AT_EMPTY_PATH) to later materialize it is a separate follow-up.)
+        if flags & crate::linux_abi::LINUX_O_TMPFILE != 0 {
+            if !writable_request {
+                return Ok(LINUX_EINVAL.into());
+            }
+            let creds = self.cred_snapshot();
+            let create_mode = (mode as u32 & 0o7777) & !(creds.umask & 0o777);
+            let description = OpenDescription::File {
+                path: "/__carrick_o_tmpfile".to_string(),
+                metadata: RootFsMetadata {
+                    path: Path::new("/__carrick_o_tmpfile").to_path_buf(),
+                    kind: RootFsEntryKind::File,
+                    mode: create_mode,
+                    size: 0,
+                },
+                contents: Vec::new(),
+                offset: 0,
+                base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
+                writable: true,
+            };
+            return Ok(self.install_fd(description, linux_fd_flags_from_open_flags(flags)));
+        }
+
         let path = match read_guest_c_string(memory, pathname) {
             Ok(path) => path,
             Err(errno) => return Ok(errno.into()),
