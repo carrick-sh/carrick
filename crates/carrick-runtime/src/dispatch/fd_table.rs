@@ -351,6 +351,20 @@ impl OpenFile {
     }
 }
 
+impl OpenDescription {
+    /// The guest path this fd was opened at, for descriptions that track one
+    /// (regular files, directories, synthetic files). `None` for host-fd-backed
+    /// or anonymous descriptions. Used to serve `readlink(/proc/self/fd/N)`.
+    pub(super) fn open_path(&self) -> Option<&str> {
+        match self {
+            OpenDescription::File { path, .. }
+            | OpenDescription::Directory { path, .. }
+            | OpenDescription::SyntheticFile { path, .. } => Some(path.as_str()),
+            _ => None,
+        }
+    }
+}
+
 pub(super) type OpenDescriptionRef = Arc<RwLock<OpenDescription>>;
 pub(super) type PipeRef = Arc<Mutex<PipeState>>;
 

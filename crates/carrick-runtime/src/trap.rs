@@ -844,12 +844,24 @@ impl HvfTrapEngine {
 
     /// Back a dynamic high-VA `mmap` (see `DispatchOutcome::MapHostAlias`).
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    pub fn map_host_alias(&mut self, va: u64, ipa: u64, len: u64) -> Result<(), TrapError> {
-        self.inner.map_host_alias(va, ipa, len)
+    pub fn map_host_alias(
+        &mut self,
+        va: u64,
+        ipa: u64,
+        len: u64,
+        payload: &[u8],
+    ) -> Result<(), TrapError> {
+        self.inner.map_host_alias(va, ipa, len, payload)
     }
 
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    pub fn map_host_alias(&mut self, _va: u64, _ipa: u64, _len: u64) -> Result<(), TrapError> {
+    pub fn map_host_alias(
+        &mut self,
+        _va: u64,
+        _ipa: u64,
+        _len: u64,
+        _payload: &[u8],
+    ) -> Result<(), TrapError> {
         Err(TrapError::UnsupportedPlatform)
     }
 
@@ -1471,7 +1483,13 @@ impl HvfInner {
     /// reserved low IPA, build the VA→IPA stage-1 path, and register the region
     /// for syscall-path access (keyed by the VA). RWX so a JIT (Rosetta) can
     /// both write and execute it; the guest may `mprotect` afterwards.
-    fn map_host_alias(&mut self, va: u64, ipa: u64, len: u64) -> Result<(), TrapError> {
+    fn map_host_alias(
+        &mut self,
+        va: u64,
+        ipa: u64,
+        len: u64,
+        payload: &[u8],
+    ) -> Result<(), TrapError> {
         let size = usize::try_from(len).map_err(|_| TrapError::MappingTooLarge(len))?;
         let host_mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
             size,
@@ -1480,6 +1498,11 @@ impl HvfInner {
         .map_err(|e| TrapError::Hypervisor(format!("alias mmap (size={size}) failed: {e}")))?;
         let host = host_mapping.as_ptr();
         let size = host_mapping.len();
+        // Seed the file content (empty for anon — the anon mapping is zeroed).
+        if !payload.is_empty() {
+            let n = payload.len().min(size);
+            unsafe { std::ptr::copy_nonoverlapping(payload.as_ptr(), host, n) };
+        }
         let perms = hvf_perms(SegmentPerms {
             read: true,
             write: true,

@@ -174,8 +174,14 @@ pub trait SyscallTrap {
     /// Back a dynamic high-VA mmap (`DispatchOutcome::MapHostAlias`): map host
     /// memory at `ipa` and build the VA→IPA stage-1 path. Default no-op error
     /// for non-HVF/test traps (they never emit the outcome).
-    fn map_host_alias(&mut self, va: u64, ipa: u64, len: u64) -> Result<(), TrapError> {
-        let _ = (va, ipa, len);
+    fn map_host_alias(
+        &mut self,
+        va: u64,
+        ipa: u64,
+        len: u64,
+        payload: &[u8],
+    ) -> Result<(), TrapError> {
+        let _ = (va, ipa, len, payload);
         Err(TrapError::UnsupportedPlatform)
     }
 }
@@ -731,9 +737,14 @@ where
                 runtime.complete_syscall(0)?;
                 last_syscall_retval = Some(0);
             }
-            DispatchOutcome::MapHostAlias { va, ipa, len } => {
+            DispatchOutcome::MapHostAlias {
+                va,
+                ipa,
+                len,
+                payload,
+            } => {
                 // Back a dynamic high-VA mmap; complete with the VA.
-                runtime.map_host_alias(va, ipa, len)?;
+                runtime.map_host_alias(va, ipa, len, &payload)?;
                 runtime.complete_syscall(va as i64)?;
                 last_syscall_retval = Some(va as i64);
             }
@@ -1869,8 +1880,13 @@ fn run_vcpu_until_exit(
                     engine.set_memory_model(tso)?;
                     last_syscall_retval = Some(state.complete_returned(&mut engine, 0)?);
                 }
-                DispatchOutcome::MapHostAlias { va, ipa, len } => {
-                    engine.map_host_alias(va, ipa, len)?;
+                DispatchOutcome::MapHostAlias {
+                    va,
+                    ipa,
+                    len,
+                    payload,
+                } => {
+                    engine.map_host_alias(va, ipa, len, &payload)?;
                     last_syscall_retval =
                         Some(state.complete_returned(&mut engine, va as i64)?);
                 }
@@ -2697,8 +2713,13 @@ where
                 trap.complete_syscall(0)?;
                 last_syscall_retval = Some(0);
             }
-            DispatchOutcome::MapHostAlias { va, ipa, len } => {
-                trap.map_host_alias(va, ipa, len)?;
+            DispatchOutcome::MapHostAlias {
+                va,
+                ipa,
+                len,
+                payload,
+            } => {
+                trap.map_host_alias(va, ipa, len, &payload)?;
                 trap.complete_syscall(va as i64)?;
                 last_syscall_retval = Some(va as i64);
             }
@@ -2774,8 +2795,14 @@ impl SyscallTrap for HvfTrapEngine {
         self.set_hardware_tso(tso)
     }
 
-    fn map_host_alias(&mut self, va: u64, ipa: u64, len: u64) -> Result<(), TrapError> {
-        HvfTrapEngine::map_host_alias(self, va, ipa, len)
+    fn map_host_alias(
+        &mut self,
+        va: u64,
+        ipa: u64,
+        len: u64,
+        payload: &[u8],
+    ) -> Result<(), TrapError> {
+        HvfTrapEngine::map_host_alias(self, va, ipa, len, payload)
     }
 
     fn inject_signal(
