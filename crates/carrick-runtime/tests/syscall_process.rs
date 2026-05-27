@@ -259,11 +259,19 @@ fn unhandled_named_syscall_surfaces_by_name_in_compat_report() {
     assert_eq!(outcome, DispatchOutcome::Errno { errno: 38 });
 
     let report = reporter.finish();
+    // execveat(281) is a number the aarch64 table recognises (Planned), so it
+    // surfaces in the `deferred_syscalls` bucket — "recognised, not yet
+    // emulated" — under its real name, NOT in `unhandled_syscalls` (which is
+    // reserved for genuinely unknown numbers like 9999).
+    assert!(
+        report.unhandled_syscalls.iter().all(|e| e.number != 281),
+        "recognised syscalls must not land in the truly-unknown bucket",
+    );
     let entry = report
-        .unhandled_syscalls
+        .deferred_syscalls
         .iter()
         .find(|entry| entry.number == 281)
-        .expect("execveat should surface in the compat report");
+        .expect("execveat should surface as a deferred syscall in the compat report");
     assert_eq!(entry.name, "execveat");
     assert_eq!(entry.count, 1);
 }
