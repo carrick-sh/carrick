@@ -24,6 +24,9 @@ pub(super) struct MemState {
     /// tracking `brk_current` and the mmap arena end tracking `mmap_next`)
     /// instead of the hard-coded four-line summary.
     pub address_space_regions: Option<Vec<ProcMapsEntry>>,
+    /// Bump cursor for the low-IPA arena backing dynamic high-VA aliases
+    /// (`crate::memory::LINUX_ALIAS_IPA_BASE`). See `is_high_va`.
+    pub alias_ipa_next: u64,
 }
 
 impl MemState {
@@ -34,6 +37,7 @@ impl MemState {
             shared: crate::shared_aperture::SharedAperture::new(),
             free_regions: Vec::new(),
             address_space_regions: None,
+            alias_ipa_next: crate::memory::LINUX_ALIAS_IPA_BASE,
         }
     }
 }
@@ -289,6 +293,39 @@ impl SyscallDispatcher {
                     return Ok(LINUX_ENOMEM.into());
                 }
             };
+
+            // A high guest VA (>= 1 TiB) can't be identity-mapped (HVF IPA is 40
+            // bits). Back it from the low alias arena: reserve an IPA (2 MiB
+            // aligned so the runtime can use 2 MiB blocks) and hand the runtime a
+            // MapHostAlias outcome that hv_vm_maps it and builds the VA->IPA
+            // page-table path. Apple Rosetta's ~240 TiB translation working set
+            // takes this path. Anonymous-only; the region comes back zeroed.
+            if crate::memory::is_high_va(address) {
+                if flags & LINUX_MAP_ANONYMOUS == 0 {
+                    return Ok(LINUX_ENOMEM.into());
+                }
+                const TWO_MIB: u64 = 1 << 21;
+                let alias_len = align_up_u64(length, TWO_MIB).unwrap_or(length);
+                let ipa = {
+                    let mut mem = this.mem.lock();
+                    let base = mem.alias_ipa_next;
+                    let limit =
+                        crate::memory::LINUX_ALIAS_IPA_BASE + crate::memory::LINUX_ALIAS_IPA_SIZE;
+                    match base.checked_add(alias_len).filter(|e| *e <= limit) {
+                        Some(end) => {
+                            mem.alias_ipa_next = end;
+                            base
+                        }
+                        None => return Ok(LINUX_ENOMEM.into()),
+                    }
+                };
+                return Ok(DispatchOutcome::MapHostAlias {
+                    va: address,
+                    ipa,
+                    len: alias_len,
+                });
+            }
+
             if reused {
                 let zeros = vec![0u8; length_usize];
                 let _ = memory.write_bytes(address, &zeros);

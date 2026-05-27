@@ -335,6 +335,12 @@ fn render_proc_maps_from_regions(
         let r = if region.read { 'r' } else { '-' };
         let w = if region.write { 'w' } else { '-' };
         let x = if region.execute { 'x' } else { '-' };
+        // Real Linux /proc/self/maps reports page-aligned VMA bounds. Some
+        // consumers (Apple Rosetta's VM tracker) assert on this. Round to 16 KiB
+        // (carrick's HVF page; also satisfies a 4 KiB check) — start down, end up.
+        const PAGE: u64 = 0x4000;
+        let start = start & !(PAGE - 1);
+        let end = end.div_ceil(PAGE) * PAGE;
         out.push_str(&format!(
             "{start:016x}-{end:016x} {r}{w}{x}p 00000000 00:00 0                          {label}\n",
         ));
