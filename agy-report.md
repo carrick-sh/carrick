@@ -1,477 +1,709 @@
-# Carrick Deep-Dive Code Review
+# Carrick: Comprehensive Systems-Level Code Review
 
-> **Scope:** Read-only review of all source code across all 5 crates. No tests or commands were executed.
->
-> **Codebase profile:** ~41K lines in `carrick-runtime` alone, plus ~2K lines across `spec`, `image`, `engine`, and `cli`. 55 static fixture binaries, 34 conformance probes, ~50 CLI tests.
+**Date:** 2026-05-27  
+**Scope:** Full codebase read (~66K LOC, 9 crates), no execution  
+**Reviewer context:** Deep familiarity with lx branded zones, Noah, WSLv1, FreeBSD Linuxulator, and OS internals  
 
 ---
 
 ## Executive Summary
 
-Carrick is an impressively ambitious and well-executed project. The HVF trap-and-translate architecture is sound, the no-panic discipline is laudable, and the breadth of syscall coverage (~200 syscalls) is remarkable. Several design choices are genuinely excellent — the `KernelAbi` compile-time wire-size enforcement, the `ScriptedTrap` test abstraction, the `SigframeDigest` round-trip fidelity probe, the `mincore`-gated sparse COW copy during fork, and the async-signal-safe self-pipe discipline throughout the PTY and signal subsystems.
+Carrick is a **Linux user-space binary compatibility layer** for macOS on Apple Silicon, using `Hypervisor.framework` (HVF) to trap guest EL0 execution and translating Linux syscalls to Darwin host primitives in Rust. It occupies the same design space as Solaris lx branded zones, Noah (macOS/x86_64), WSLv1 (Windows), and FreeBSD's Linuxulator — but with a distinctive **HVF trap boundary** that is both its greatest architectural strength and its primary complexity source.
 
-That said, the codebase has grown organically and now carries **significant structural debt**. Four files exceed 3,000 lines each (the biggest is 5,770), lock ordering is partially documented but incomplete, and several translation layers silently drop semantics that will bite as workloads get more complex.
+The project is **remarkably mature for a single-developer effort**: ~66K lines of Rust spanning 9 crates, with **~150 implemented syscalls** (comprehensive inventory below), a fully concurrent (BKL-free) dispatcher, OCI container support, DTrace/USDT observability, and proven Go/Python/apt-get/HTTP workloads. The engineering discipline — no-panic clippy gates, differential Docker oracle testing, conformance probes, comprehensive design documents — is genuinely impressive.
 
-The findings below are organized from most impactful to least.
-
----
-
-## 1. Structural & Organizational Issues
-
-### 1.1 God Files
-
-The four largest files are each individually larger than many complete Rust crates:
-
-| File | Lines | KB | Role |
-|------|------:|---:|------|
-| [dispatch/fs.rs](file:///Volumes/CaseSensitive/carrick/crates/carrick-runtime/src/dispatch/fs.rs) | 5,065 | 207 | Every filesystem syscall handler |
-| [dispatch/mod.rs](file:///Volumes/CaseSensitive/carrick/crates/carrick-runtime/src/dispatch/mod.rs) | 4,737 | 172 | Dispatcher + shared helpers + misc syscalls |
-| [trap.rs](file:///Volumes/CaseSensitive/carrick/crates/carrick-runtime/src/trap.rs) | 3,145 | 133 | VM exit handling + signal frames + vectors + fork |
-| [dispatch/net.rs](file:///Volumes/CaseSensitive/carrick/crates/carrick-runtime/src/dispatch/net.rs) | 3,505 | 124 | Every networking syscall handler |
-
-These files are too large to navigate, review, or modify without risk. They also hurt incremental compile times.
-
-**Recommended splits:**
-
-**`dispatch/fs.rs`** has 7 clean extraction points:
-
-| Proposed Module | ~Lines | Responsibility |
-|---|---|---|
-| `fs/ioctl.rs` | 300 | ioctl dispatch (TIOCGWINSZ, TCGETS, FIONBIO, etc.) |
-| `fs/read_write.rs` | 600 | read/write/readv/writev/pread64/pwrite64 |
-| `fs/sendfile_splice.rs` | 350 | sendfile, splice, copy_file_range |
-| `fs/dir_ops.rs` | 400 | mkdirat, mknodat, unlinkat, symlinkat, linkat, renameat |
-| `fs/stat.rs` | 300 | newfstatat, fstat, statx, access, xattr |
-| `fs/open_close.rs` | 250 | openat, openat2, close, close_range |
-| `fs/metadata.rs` | 200 | fchmod, fchown, utimensat |
-
-**`dispatch/mod.rs`** has strong internal boundaries:
-
-| Proposed Module | ~Lines | Responsibility |
-|---|---|---|
-| `dispatch/fd_table.rs` | 400 | `OpenDescription`, `OpenFile`, stat types |
-| `dispatch/epoll_eventfd.rs` | 500 | epoll/eventfd/timerfd infrastructure |
-| `dispatch/io_helpers.rs` | 400 | read/write helpers, stat writers, kernel struct I/O |
-| `dispatch/errno.rs` | 60 | `macos_to_linux_errno` translation table |
-| `dispatch/futex.rs` | 330 | futex operations |
-| `dispatch/poll.rs` | 500 | poll/ppoll/select/pselect6 |
-
-**`trap.rs`** contains 5 logically distinct concerns:
-
-| Proposed Module | ~Lines | Responsibility |
-|---|---|---|
-| `trap/signal_frame.rs` | 370 | Signal frame inject/restore + `SigframeDigest` |
-| `trap/fork.rs` | 200 | COW snapshot, HVF rebuild |
-| `trap/thread.rs` | 130 | `build_thread_spec` / `from_thread_spec` |
-| `trap/snapshot.rs` | 130 | vCPU snapshot/restore |
-| `trap/shared_mapping.rs` | 120 | `map_shared_file`, `map_shared_anon` |
-
-### 1.2 CLI Monolith
-
-[main.rs](file:///Volumes/CaseSensitive/carrick/crates/carrick-cli/src/main.rs) is ~1,400 lines implementing ~16 subcommands inline. The `run_cli()` match arm alone is ~560 lines. Each subcommand should be its own module under `src/cmd/`. Additionally, `probe_case_sensitive` duplicates `carrick_runtime::apfs::probe_case_sensitive`, and `join_ids` duplicates `dtrace_consumer::join_ids`.
-
-### 1.3 `carrick-engine` Justification
-
-[carrick-engine/lib.rs](file:///Volumes/CaseSensitive/carrick/crates/carrick-engine/src/lib.rs) is only ~320 lines. The CLI bypasses it for every command except `run` — `run-elf`, `rootfs`, `compat-report`, `trace`, etc. all reach directly into `carrick-runtime`. Either fold it into `carrick-cli` (its `CliRunRequest` is constructed only in main.rs) or grow it to absorb more orchestration (run-elf, fs-backend selection, compat-report envelope).
-
-### 1.4 `carrick-spec` Dependency Leak
-
-`carrick-spec` pulls in `clap` (for `#[derive(clap::ValueEnum)]` on `FsBackendKind`). This is a CLI concern leaking into the shared data layer. Move the `ValueEnum` derive behind a feature gate.
-
-### 1.5 Unused Type
-
-`ContainerSpec` is defined in `carrick-spec` but **never used anywhere** in the codebase — the CLI constructs `CliRunRequest` instead. Either use it or remove it.
+What follows is a thorough analysis of strengths, weaknesses, architectural gaps, and strategic opportunities.
 
 ---
 
-## 2. Concurrency & Safety
+## 1. Architecture: The HVF Trap Boundary
 
-### 2.1 Lock Ordering — Partially Documented, Needs Completion
+### How It Works
 
-> [!CAUTION]
-> The lock ordering comment exists but doesn't cover all known lock interactions.
-
-There IS a lock ordering comment at `dispatch/mod.rs` line 6:
-```
-// LOCK ORDERING: dispatch handlers must not hold subsystem locks while entering
-// guest-memory callbacks or blocking host waits. When multiple dispatcher
-// locks are unavoidable, acquire fd/open-description state before filesystem
-// overlay state, then proc/signal/thread registries.
+```mermaid
+sequenceDiagram
+    participant G as Guest EL0 (Linux binary)
+    participant V as VBAR_EL1 (Carrick vectors)
+    participant H as Host EL2→userspace (Carrick runtime)
+    
+    G->>V: svc #0 (Linux syscall)
+    V->>H: hvc #0 (VM exit to host)
+    H->>H: Decode x0-x5, x8; dispatch to Rust handler
+    H->>G: Write x0 (retval), resume vCPU
 ```
 
-**But the following are not covered:**
-1. **`EPOLL_INMEM_KQUEUES` global Mutex** — acquired by `notify_inmem_epoll()` which is called from `write_eventfd`. If a handler holds `open_files` read lock while writing an eventfd, and another thread holds `EPOLL_INMEM_KQUEUES` while trying to read `open_files`, there's a potential inversion.
-2. **`close_cloexec_fds`** holds `self.io.open_files.write()` while calling `close_open_file_and_free_pty()`, which acquires `self.fs.pty_table.lock()`. This cross-lock is acknowledged in comments but not in the ordering hierarchy.
-3. **`mem_snapshot`** clones the entire `MemState` under lock — if it grows large, this becomes a contention point.
+### Comparison to Prior Art
 
-**Fix:** Extend the lock ordering comment to include `pty_table` and `EPOLL_INMEM_KQUEUES`, and audit the EPOLL×open_files potential inversion.
+| System | Trap Mechanism | Guest Kernel? | Process Model |
+|--------|---------------|---------------|---------------|
+| **Carrick** | HVF EL1→EL2 trap + host dispatch | No (identity-mapped EL0) | guest pid == host pid |
+| **lx branded zones** | `sysenter` trap in kernel brand module | No (host Solaris kernel) | Single PID namespace |
+| **Noah** | HVF trap (macOS/x86_64 variant) | No | Single process |
+| **WSLv1** | NT syscall intercept (pico processes) | No (NT kernel) | Translated PIDs |
+| **FreeBSD Linuxulator** | `int 0x80`/`syscall` trap in kernel | No (host FreeBSD kernel) | Shared PID space |
 
-### 2.2 Triplicated Dispatch Loop
+### Strengths of the HVF Approach
 
-> [!WARNING]
-> `runtime.rs` contains three nearly-identical syscall dispatch loops — the highest-risk area for drift bugs.
+1. **No kernel module required.** Unlike lx zones (brand module in the Solaris kernel) or WSLv1 (pico provider in NT), carrick runs entirely in userspace. This dramatically simplifies development and deployment — `codesign` + `com.apple.security.hypervisor` is the only privilege needed.
 
-| Loop | Lines | Path |
-|------|-------|------|
-| `run_combined_syscall_loop_with_dispatcher` | ~250 | Combined `GuestMemory+SyscallTrap` (single-threaded) |
-| `run_split_loop` | ~245 | Split `GuestMemory` + `SyscallTrap` (single-threaded) |
-| `run_vcpu_until_exit` | ~225 | Multi-threaded HVF (production path) |
+2. **True hardware isolation of guest execution.** The guest runs at EL0 inside a real HVF vCPU with its own register file, page tables, and exception level boundaries. This gives carrick something neither Noah nor the Linuxulator have: **genuine hardware enforcement** of the guest/host boundary.
 
-Evidence of drift: the multi-threaded loop calls `dump_kick_stats()` on Exit and handles `EL0Fault` — the single-threaded loops don't. All three share the same `WaitOnFds`/`WaitOnPollFds`/`WaitOnProcExit`/`Exit`/`Fork`/`Execve`/`SigReturn` match arms.
+3. **Identity-mapped page tables with FEAT_PAN3 workaround.** The stage-1 identity mapping ([memory.rs](file:///Volumes/CaseSensitive/carrick/crates/carrick-mem/src/memory.rs)) that enables the MMU for guest `ldaxr`/`stlxr` atomics is elegant engineering. The PAN bypass via AP/PXN bits is a clever solution to an Apple Silicon-specific constraint.
 
-**Fix:** Extract a shared `handle_dispatch_outcome()` function. The three loops differ only in (a) whether they hold a dispatcher lock, (b) fork quiesce coordination, and (c) thread lifecycle — these can be parameterized.
+4. **Guest pid == host pid.** This is the same design choice lx zones made, and it's the right one. `fork()` → `libc::fork()`, `wait4()` → `libc::wait4()`, `kill()` → `libc::kill()` with signal number translation. The host kernel provides real process scheduling, memory isolation, and zombie reaping. WSLv1's PID translation layer was a source of endless bugs; carrick avoids it entirely.
 
-### 2.3 Fork Quiesce Spin-Wait
+### Weaknesses / Risks
 
-In `handle_fork`, `while !fork_barrier().try_begin_fork() { ... yield_now() }` spins without timeout. If the token-holder deadlocks, this thread spins forever. Consider adding a hard timeout/abort path.
+1. **Per-syscall trap cost.** Every `svc #0` triggers a full EL0→EL1→EL2→host roundtrip. Unlike lx zones (where the brand module runs at kernel privilege and can service many syscalls without a full context switch) or FreeBSD's Linuxulator (in-kernel handler), carrick pays the HVF exit/enter cost on every trap.
 
-### 2.4 Guest Memory Bounds
+2. **Single EL1 vector page.** The EL1 vectors catch synchronous exceptions and re-trap via `hvc #0`. The host decodes `ESR_EL1` after every exit to distinguish syscalls from faults, debug traps, sysreg emulation, etc. — adding latency to the hot path.
 
-The `host_mapping.rs` module (122 lines) provides RAII ownership for HVF-backed memory. The `volatile_copy_from_guest` / `volatile_copy_to_guest` in `trap.rs` copy byte-by-byte — correct for avoiding UB, but O(n) volatile reads could be slow for large guest memory operations. A `memcpy` with a single fence might suffice given HVF's coherence model.
-
-### 2.5 `unreachable!()` in Dispatch Match
-
-Multiple `unreachable!()` calls exist in dispatch match arms that guard against "impossible" outcomes. If a dispatcher bug produces them, the runtime panics — violating the no-panic discipline. Replace with error returns for defense in depth.
+3. **No stage-2 translation.** Carrick uses stage-1 identity mapping only. Apple's HVF *does* support stage-2 (IPA→PA) translation, which could provide finer-grained memory protection without the FEAT_PAN3 complexity. This is a deliberate trade-off avoiding stage-2 TLB pressure, but it requires the `PtQuiesce` stop-the-world barrier for any page table edit.
 
 ---
 
-## 3. Architecture & Design Strengths
+## 2. Syscall Translation Layer
 
-This section is important — the codebase has many genuinely excellent qualities:
+### Complete Syscall Inventory
 
-### 3.1 `KernelAbi` Trait — Compile-Time Wire-Size Enforcement
+Based on the `normalized_dispatch!` table and the full dispatch files, carrick implements **~150 distinct syscall numbers**. Here is the complete inventory by category:
 
-The `KernelAbi` trait (`linux_abi.rs`) is the single most important safety invariant in the runtime. Every struct written to or read from guest memory has a compile-time `ABI_SIZE` check that prevents the class of bug where `size_of::<T>()` differs from the Linux kernel's on-the-wire size. The const-assert catches layout mistakes at compile time.
+#### File I/O (56 syscalls)
 
-### 3.2 `SigframeDigest` Fidelity Probe
+| Nr | Name | Quality | Notes |
+|----|------|---------|-------|
+| 5-7 | setxattr/lsetxattr/fsetxattr | Full | Linux XATTR_CREATE/REPLACE → macOS |
+| 8-10 | getxattr/lgetxattr/fgetxattr | Full | |
+| 11-13 | listxattr/llistxattr/flistxattr | Full | |
+| 14-16 | removexattr/lremovexattr/fremovexattr | Stub | ENOSYS (compat note) |
+| 17 | getcwd | Full | Synthetic VFS cwd |
+| 19 | eventfd2 | Full | Real host pipe pair + EFD_SEMAPHORE/NONBLOCK/CLOEXEC |
+| 20 | epoll_create1 | Full | Backed by macOS kqueue |
+| 21 | epoll_ctl | Full | ADD/DEL/MOD, EPOLLIN→EVFILT_READ etc |
+| 22 | epoll_pwait | Full | WaitOnPollFds + sigmask |
+| 23 | dup | Full | |
+| 24 | dup3 | Full | O_CLOEXEC |
+| 25 | fcntl | Full | F_DUPFD, F_GETFD/SETFD, F_GETFL/SETFL, F_GETLK/SETLK/SETLKW, F_OFD_*, F_GETPIPE_SZ, F_ADD_SEALS/GET_SEALS |
+| 29 | ioctl | Full | 20+ ioctls: TCGETS/TCSETS*/TIOCGWINSZ/TIOCSWINSZ/TIOCGPGRP/TIOCSPGRP/TIOCSCTTY/TIOCNOTTY/TIOCGSID/TIOCGPTN/TIOCSPTLCK/FIONREAD/FIONBIO |
+| 32 | flock | Stub | No-op success (single-tenant) |
+| 33 | mknodat | Partial | Regular files only (not devices) |
+| 34 | mkdirat | Full | VFS + host |
+| 35 | unlinkat | Full | AT_REMOVEDIR |
+| 36 | symlinkat | Full | |
+| 37 | linkat | Full | |
+| 38 | renameat | Full | |
+| 43-44 | statfs/fstatfs | Full | Synthetic overlayfs values |
+| 45-46 | truncate/ftruncate | Full | |
+| 47 | fallocate | Full | FL_KEEP_SIZE/PUNCH_HOLE/COLLAPSE/ZERO/INSERT/UNSHARE |
+| 48 | faccessat | Full | AT_SYMLINK_NOFOLLOW/AT_EACCESS/AT_EMPTY_PATH |
+| 49-50 | chdir/fchdir | Full | |
+| 52 | fchmod | Full | |
+| 53 | fchmodat | Full | |
+| 54-55 | fchownat/fchown | Full | |
+| 56 | openat | Full | Full flag translation, VFS overlay + host passthrough |
+| 57 | close | Full | Ref-counted cleanup |
+| 59 | pipe2 | Full | O_CLOEXEC/O_NONBLOCK, host kernel pipes |
+| 61 | getdents64 | Full | Correct d_reclen/d_type/d_off |
+| 62 | lseek | Full | SEEK_SET/CUR/END |
+| 63-64 | read/write | Full | Host fd / pipe / eventfd / timerfd / signalfd / pidfd paths |
+| 65-66 | readv/writev | Full | Iovec translation |
+| 67-70 | pread64/pwrite64/preadv/pwritev | Full | |
+| 71 | sendfile | Full | In-kernel copy loop |
+| 72-73 | pselect6/ppoll | Full | WaitOnFds + sigmask |
+| 76 | splice | Full | Pipe↔fd |
+| 78 | readlinkat | Full | /proc/self/exe handling |
+| 79-80 | newfstatat/fstat | Full | |
+| 81-83 | sync/fsync/fdatasync | Full | Host passthrough |
+| 88 | utimensat | Full | UTIME_NOW/UTIME_OMIT |
+| 267 | syncfs | Full | |
+| 276 | renameat2 | Full | RENAME_NOREPLACE/EXCHANGE/WHITEOUT |
+| 285 | copy_file_range | Full | |
+| 291 | statx | Full | STATX_BASIC_STATS |
+| 436 | close_range | Full | CLOSE_RANGE_UNSHARE/CLOEXEC |
+| 437 | openat2 | Full | struct open_how ABI |
+| 439 | faccessat2 | Full | |
+| 452 | fchmodat2 | Full | |
+| 74,75,77 | signalfd4/vmsplice/tee | Stub | ENOSYS |
 
-The signal frame inject/restore path fingerprints injected signal frames and compares on restore, detecting save/restore round-trip errors in real time via DTrace. This is a production-quality debugging mechanism that catches subtle ABI mismatches immediately.
+#### Memory Management (14 syscalls)
 
-### 3.3 `ExecLevel` Guard
+| Nr | Name | Quality | Notes |
+|----|------|---------|-------|
+| 214 | brk | Full | Bump allocator within HEAP_BASE..+HEAP_SIZE |
+| 215 | munmap | Full | Free-list + stage-1 invalidation + shared aperture writeback |
+| 216 | mremap | Full | MREMAP_MAYMOVE/FIXED/DONTUNMAP, copies data on move |
+| 222 | mmap | Full | MAP_SHARED/PRIVATE/FIXED/ANON + host file backing + shared aperture |
+| 223 | fadvise64 | Stub | No-op success |
+| 226 | mprotect | Full | Stage-1 page table edits for arena |
+| 227 | msync | Full | MS_SYNC/ASYNC/INVALIDATE, shared aperture writeback |
+| 228-229 | mlock/munlock | Stub | No-op success |
+| 230-231 | mlockall/munlockall | Stub | Flag validation only |
+| 232 | mincore | Full | Returns all-resident (page-alignment validated) |
+| 233 | madvise | Full | MADV_DONTNEED zeros pages; others no-op |
+| 283 | membarrier | Partial | CMD_QUERY returns 0 |
 
-The `ExecLevel` guard in `run_until_syscall` detects when a vCPU kick lands mid-EL1-trampoline and resumes rather than injecting a corrupt signal frame. This is a subtle, well-documented fix for a real production bug.
+#### Process & Thread (32 syscalls)
 
-### 3.4 SPSR_EL1 vs CPSR Source Selection
+| Nr | Name | Quality | Notes |
+|----|------|---------|-------|
+| 90-91 | capget/capset | Full | Empty capabilities (validates version) |
+| 92 | personality | Full | Records and echoes |
+| 93-94 | exit/exit_group | Full | ThreadExit/Exit outcomes |
+| 95 | waitid | Full | P_ALL/PID/PGID/PIDFD, WaitOnProcExit for blocking |
+| 96 | set_tid_address | Full | Per-thread clear_child_tid |
+| 98 | futex | Full | WAIT/WAKE/WAIT_BITSET/WAKE_BITSET + PRIVATE. **REQUEUE returns ENOSYS** |
+| 99 | set_robust_list | Stub | Records, no-op |
+| 117 | ptrace | Stub | ENOSYS |
+| 122-123 | sched_setaffinity/getaffinity | Full | |
+| 124 | sched_yield | Full | |
+| 129 | kill | Full | Linux→host signum translation |
+| 130-131 | tkill/tgkill | Full | Thread routing + self-delivery |
+| 140-141 | setpriority/getpriority | Stub | |
+| 142 | reboot | Stub | EPERM |
+| 153 | times | Full | CPU time accounting |
+| 154-157 | setpgid/getpgid/getsid/setsid | Full | Host passthrough |
+| 158 | getgroups | Partial | Returns [0] |
+| 160 | uname | Full | Reports "Linux" 6.x |
+| 161-162 | sethostname/setdomainname | Stub | EPERM |
+| 165 | getrusage | Full | RUSAGE_SELF/CHILDREN/THREAD |
+| 166 | umask | Full | |
+| 167 | prctl | Partial | PR_SET/GET_NAME, DUMPABLE, PDEATHSIG |
+| 168 | getcpu | Full | |
+| 172-178 | getpid..gettid | Full | |
+| 179 | sysinfo | Full | Host memory/CPU stats |
+| 220 | clone | Full | Fork + CloneThread + CLONE_PIDFD |
+| 221 | execve | Full | Path/argv/envp + shebang (4-level recursion limit) |
+| 260 | wait4 | Full | WaitOnProcExit, rusage, WNOHANG/WUNTRACED/WCONTINUED/WALL |
+| 261 | prlimit64 | Full | RLIMIT_NOFILE/STACK/AS |
+| 278 | getrandom | Full | Host /dev/urandom |
+| 293 | rseq | Stub | ENOSYS |
+| 424 | pidfd_send_signal | Full | |
+| 434 | pidfd_open | Full | Backed by kqueue EVFILT_PROC |
+| 435 | clone3 | Full | struct clone_args ABI, CLONE_PIDFD |
 
-The signal injection path correctly selects CPSR (live EL0 PSTATE) on the kick path vs SPSR_EL1 (hardware-latched PSTATE) on the syscall-boundary path. Getting this wrong causes condition-flag corruption in preempted code. The comment explains *exactly* why.
+#### Credentials (12 syscalls)
 
-### 3.5 `mincore`-Gated Sparse Fork Copy
+| Nr | Name | Quality | Notes |
+|----|------|---------|-------|
+| 143-152 | setregid..setfsgid | Full | All recorded in CredState |
+| 159 | setgroups | Stub | No-op |
 
-`clone_region_for_child` uses `mincore` to copy only resident pages during fork, making child snapshots proportional to working set rather than address space. Excellent optimization.
+#### Signals (10 syscalls)
 
-### 3.6 Async-Signal-Safe Discipline
+| Nr | Name | Quality | Notes |
+|----|------|---------|-------|
+| 132 | sigaltstack | Full | Per-thread (was process-global → Go SIMD corruption fix) |
+| 133 | rt_sigsuspend | Partial | Returns EINTR immediately |
+| 134 | rt_sigaction | Full | Install/query handlers, ensures host handler |
+| 135 | rt_sigprocmask | Full | Per-thread, SIG_BLOCK/UNBLOCK/SETMASK, SIGKILL/SIGSTOP unmaskable |
+| 136 | rt_sigpending | Full | |
+| 137 | rt_sigtimedwait | Full | Dequeue pending with timeout |
+| 138 | rt_sigqueueinfo | Stub | ENOSYS |
+| 139 | rt_sigreturn | Full | Frame pop + register restore |
 
-All signal handler code paths (`handle_sigint`, `handle_routed`, `notify_pending`) are strictly async-signal-safe — only atomic stores and pipe writes. The `handle_routed` fault guard correctly distinguishes synchronous CPU faults (`si_code > 0`) from externally-sent signals (`si_code <= 0`).
+#### Time (9 syscalls)
 
-### 3.7 `DispatchOutcome` Lock-Free Pattern
+| Nr | Name | Quality | Notes |
+|----|------|---------|-------|
+| 85-87 | timerfd_create/settime/gettime | Full | kqueue EVFILT_TIMER backing |
+| 101 | nanosleep | Full | |
+| 102-103 | getitimer/setitimer | Full | ITIMER_REAL/VIRTUAL/PROF |
+| 113 | clock_gettime | Full | All 11 CLOCK_* mapped (MONOTONIC→UPTIME_RAW, BOOTTIME→MONOTONIC) |
+| 114 | clock_getres | Full | 1ms resolution |
+| 115 | clock_nanosleep | Full | TIMER_ABSTIME |
+| 169 | gettimeofday | Full | |
 
-The `DispatchOutcome::FutexWait` / `WaitOnFds` / `WaitOnProcExit` idiom specifically avoids blocking under any lock. The handler prepares wait state, returns an outcome, and the runtime drops all locks before parking. This is the right design.
+#### Networking (17 syscalls)
 
-### 3.8 `ScriptedTrap` Test Abstraction
-
-The `SyscallTrap` trait enables testing the full runtime loop with scripted syscall sequences — no HVF needed. This is a brilliant pattern that provides high-confidence testing without hardware dependency.
-
-### 3.9 Other Highlights
-
-- **`cap-std` filesystem sandboxing** — prevents path traversal escapes at the capability level
-- **USDT probes** — built-in DTrace traceability via `carrick trace` and `carrick compat-report`
-- **APFS `clonefile` optimization** — COW rootfs setup, specific to macOS
-- **Self-pipe patterns** in PTY relay — textbook async-signal-safe shutdown and SIGWINCH propagation
-- **AF_NETLINK synthesis** — satisfies `getifaddrs`/`__check_pf` without real netlink
-- **FEAT_PAN3 workaround** — thoroughly tested AP/PXN/UXN page table bits
-- **AT_HWCAP hardcoded to `0x1fb`** — covers FP, ASIMD, AES, PMULL, SHA1, SHA2, CRC32, ATOMICS; correct for all current M-series chips
-- **`parking_lot` mutexes** throughout — never poison, eliminating one panic source
-- **`OnceLock`-cached host facts** — CPU count prefers `hw.perflevel0.logicalcpu` (P-cores only), clamped to [1,1024], overridable via `CARRICK_EXPOSED_CPUS`
+| Nr | Name | Quality | Notes |
+|----|------|---------|-------|
+| 198 | socket | Full | AF_INET/INET6/UNIX/NETLINK(stub) |
+| 199 | socketpair | Full | |
+| 200-205 | bind..getpeername | Full | sockaddr translation (sin_len, AF_INET6 10→30) |
+| 206-207 | sendto/recvfrom | Full | MSG flag translation |
+| 208-209 | setsockopt/getsockopt | Full | SOL_SOCKET/TCP/IP/IPV6 option number translation |
+| 210 | shutdown | Full | |
+| 211-212 | sendmsg/recvmsg | Full | msghdr iovec, cmsg passthrough, MSG_CMSG_CLOEXEC |
+| 242 | accept4 | Full | SOCK_NONBLOCK/CLOEXEC |
+| 243 | recvmmsg | Full | Multi-message |
+| 269 | sendmmsg | Full | Multi-message |
 
 ---
 
-## 4. Correctness & Semantic Gaps
+### Architectural Analysis
 
-### 4.1 errno Translation — Good but Incomplete
+The dispatch architecture in [dispatch/mod.rs](file:///Volumes/CaseSensitive/carrick/crates/carrick-runtime/src/dispatch/mod.rs) is well-structured:
 
-The `macos_to_linux_errno` function (`dispatch/mod.rs`) covers ~35 network/FS-specific errnos where Darwin and Linux numbers diverge (EAGAIN=35→11, EINPROGRESS=36→115, etc.). The fallback `other => other` is correct for codes 1–34 (which are identical) but **incorrect for unmapped Darwin codes ≥35**. For example, Darwin `ENOATTR` (93) or `EAUTH` (80) would leak as non-Linux errnos.
+- **`SyscallDispatcher`** owns all guest kernel state, split into narrowly-locked subsystems: `io` (fs), `mem`, `proc`, `creds`, `signal`, `fs`.
+- The `define_syscall!` macro provides uniform handler signatures with automatic argument extraction from the `SyscallCtx`.
+- **`DispatchOutcome`** is a rich enum covering 15 variants: simple returns, lifecycle events (`Fork`, `Execve`, `SigReturn`, `CloneThread`, `ThreadExit`, `SignalThread`), blocking operations (`FutexWait`, `SharedFutexWait`, `WaitOnFds`, `WaitOnPollFds`, `WaitOnProcExit`). This keeps the dispatcher pure (no HVF access) and pushes all side effects to the runtime loop.
+- **`KernelAbi` trait** enforces compile-time size assertions on every UAPI struct via `const ABI_SIZE`, preventing the class of bug where Rust struct size differs from Linux wire size.
+- **Systematic flag validation** via `SYSCALL_FLAG_VALIDATORS` checks flag arguments BEFORE handlers run, recording unknown bits via USDT probes.
 
-**Risk:** Low in practice (these are rare), but a catch-all mapping to `EIO` for unknown codes >34 would be more defensive.
+> [!TIP]
+> The `DispatchOutcome` pattern is similar to what lx zones does with its `lx_sysreturn()` mechanism, but carrick's version is richer because it must handle HVF-specific lifecycle (vCPU fork, execve-into, etc.) that an in-kernel implementation doesn't need.
 
-### 4.2 `OpenDescription` Variant Explosion
+### Comparison to lx Branded Zones
 
-The `OpenDescription` enum has 15 variants, and `status_flags()` / `set_status_flags()` each have 13-arm match blocks that are pure boilerplate. A struct-with-enum-payload would eliminate ~200 lines:
-```rust
-struct OpenDescription {
-    status_flags: u64,
-    kind: OpenDescriptionKind,
+lx zones' syscall table is **exhaustive** (~300+ entries, even unimplemented ones return ENOSYS with logging). Carrick's table is 120 entries in the static table; unlisted syscalls silently return ENOSYS without a compat-report entry.
+
+**Recommendation:** Populate the full aarch64 syscall table (all ~450 entries) with `SupportLevel::Deferred` entries, so every guest syscall is *known* to the compat reporter. This is how you detect workload-driven priority.
+
+### ABI Translation Quality
+
+**Strengths:**
+- Struct layout translations (`stat`, `sockaddr_in`, `termios`, `iovec`, etc.) use `zerocopy` + manual field mapping — correct and explicit
+- Flag translations (`O_*`, `MAP_*`, `PROT_*`, `MSG_*`, `SO_*`) are comprehensive
+- Socket option translation correctly handles the Linux↔Darwin numbering differences
+- errno translation uses explicit `LINUX_E*` constants — never passes Darwin errno to guest
+- Termios translation handles the bit-level differences (Linux ONLCR=0x0004 vs Darwin 0x0002, ISIG=0x01 vs 0x0080, etc.) and c_cc index remapping
+- `write_kernel_struct()` writes exactly `ABI_SIZE` bytes (e.g., kernel termios is 36 bytes, not Rust's 44-byte struct)
+
+**Weaknesses:**
+- `stat` translation hardcodes `st_dev=0` and `st_ino=path_hash` for VFS nodes — stat-based change detection may behave unexpectedly across VFS/host boundaries
+- `ioctl` is handled case-by-case rather than through a systematic translation table
+
+---
+
+## 3. VFS and Filesystem Layer
+
+### Architecture
+
+```mermaid
+graph TD
+    A[Guest Path] --> B{VfsMounts Router}
+    B --> C["/proc/* → ProcVfs (synthetic)"]
+    B --> D["/sys/* → SysVfs (synthetic)"]
+    B --> E["/dev/* → DevVfs + DevptsVfs"]
+    B --> F["Bind mounts → BindVfs"]
+    B --> G["/etc/resolv.conf → ResolvConfVfs"]
+    B --> H["/etc/services → EtcServicesVfs"]
+    B --> I["Everything else → FsBackend"]
+    I --> J["Host backend (cap-std on APFS-CS)"]
+    I --> K["Memory backend (in-memory tree)"]
+```
+
+### File Descriptor Table ([fd_table.rs](file:///Volumes/CaseSensitive/carrick/crates/carrick-runtime/src/dispatch/fd_table.rs))
+
+13 `OpenDescription` variants covering every fd type:
+- **File** / **Directory** / **SyntheticFile** (in-memory) — for VFS/overlay/procfs
+- **EventFd** — `Arc<EventFdState>` with readiness pipe pair for kqueue integration
+- **TimerFd** — kqueue EVFILT_TIMER backing
+- **Epoll** — interest map + pending queue + kqueue
+- **Pidfd** — kqueue EVFILT_PROC/NOTE_EXIT
+- **HostPipe** / **HostSocket** / **HostFile** — real Darwin fds
+- **PipeReader/Writer** — in-memory (retained but unused; host pipes preferred for fork survival)
+- **Netlink** — synthetic RTM_GETLINK/RTM_GETADDR
+
+**Open descriptions are ref-counted** via `Arc<RwLock<OpenDescription>>` — dup'd fds share the Arc (correct POSIX semantics for shared file offset/flags).
+
+### /proc Synthesis ([vfs/proc.rs](file:///Volumes/CaseSensitive/carrick/crates/carrick-runtime/src/vfs/proc.rs) — 918 lines)
+
+**Comprehensive coverage:**
+`/proc/self/maps`, `/proc/self/status` (with TracerPid), `/proc/self/stat`, `/proc/self/cmdline`, `/proc/self/exe`, `/proc/self/environ`, `/proc/self/cgroup`, `/proc/self/mountinfo`, `/proc/self/comm`, `/proc/self/auxv`, `/proc/self/fd/`, `/proc/cpuinfo`, `/proc/version`, `/proc/meminfo`, `/proc/stat`, `/proc/loadavg`, `/proc/uptime`, `/proc/filesystems`, `/proc/mounts`, `/proc/net/tcp`, `/proc/net/tcp6`, `/proc/sys/kernel/osrelease`, `/proc/sys/kernel/random/uuid`, `/proc/sys/vm/overcommit_memory`, `/proc/sys/net/core/somaxconn`
+
+Uses `host_statistics64` for memory metrics, `sysctl` for CPU info. `/proc/self/maps` generates real-looking entries with [heap]/[stack]/[vvar]/[vdso] labels from the live `AddressSpace` regions.
+
+### OCI Layer Composition ([rootfs.rs](file:///Volumes/CaseSensitive/carrick/crates/carrick-runtime/src/rootfs.rs) — 824 lines)
+
+- Streams tar layers, handles `.wh.<name>` file whiteouts and `.wh..wh..opq` opaque directory whiteouts
+- `HostFsBackend` uses `clonefile(2)` (APFS copy-on-write) for near-instant layer reuse via [layer_cache.rs](file:///Volumes/CaseSensitive/carrick/crates/carrick-runtime/src/layer_cache.rs)
+- Preserves mode/uid/gid via xattrs (`user.carrick.mode`, `user.carrick.uid`, `user.carrick.gid`) since macOS doesn't enforce Linux ownership
+- Requires case-sensitive APFS volume (`APFSX`) for host backend; auto-detects via `apfs.rs`
+
+### File Locking
+
+- **flock**: No-op success (single-tenant VM, no concurrent access). Correct for apt's lock semantics.
+- **fcntl advisory locks** (F_SETLK/SETLKW/OFD variants): No-op success. Critical for apt to work.
+- **Scratch directory locking**: Uses `fd_lock::RwLock` on `.carrick.lock` for inter-process scratch dir exclusion.
+
+### Strengths
+
+1. **Synthetic /proc is remarkably complete** — covers musl, glibc, Go runtime, Python, Rust needs
+2. **Host FS backend uses `cap-std`** for sandboxed directory access — defense-in-depth
+3. **OCI layer caching with `clonefile(2)`** is an excellent use of APFS's COW semantics
+4. **40-hop symlink resolution** with sandbox-aware path rewriting (absolute symlinks reinterpreted relative to guest root)
+5. **EventFd readiness pipe** pattern gives kqueue a real host fd to watch — smart integration
+
+### Weaknesses
+
+1. **No `inotify`/`fanotify`.** #1 gap for file watchers, build systems, container orchestrators. Could use kqueue `EVFILT_VNODE` as backend.
+2. **No `/proc/[pid]/*` for child processes.** Guest `ps` or process inspection fails.
+3. **`/sys/` is minimal.** No `/sys/class/net/`, `/sys/block/`, etc.
+4. **No `chroot` or `pivot_root`.** Blocks container-in-container scenarios.
+5. **No `O_TMPFILE`, `mknod` for devices, `mount`/`umount`.**
+6. **Ownership not enforced.** uid/gid stored as xattrs, reported faithfully, but never checked for access control.
+7. **OverlayEntry has no `Symlink` variant** — symlinks are reported as `File` in overlay lookups (metadata has the correct kind, but lookups don't distinguish).
+
+---
+
+## 4. Memory Management
+
+### Guest VA Layout
+
+| Region | Base | Size | Purpose |
+|--------|------|------|---------|
+| Null guard | 0x0 | 64 KiB | 16 invalid L3 pages |
+| Low VA | 0x10000 | ~2 MiB | Static ET_EXEC (Go at 0x10000) |
+| Kernel hole | 0x2D_0000_0000 | 2 MiB | Trampoline, vectors, page tables |
+| Sigreturn tramp | 0x30_0000_0000 | 16 KiB | `mov x8, #139; svc #0` |
+| Heap | 0x40_0000_0000 | 128 MiB | brk arena |
+| mmap arena | 0x60_0000_0000 | 32 GiB | Lazy anon, demand-zeroed |
+| Interpreter | 0x80_0000_0000 | — | ld-linux/ld-musl |
+| Shared file | 0x90_0000_0000 | 2 GiB | MAP_SHARED aperture |
+| Stack | 0xFF_FFFF_0000 | 2 MiB | Grows down |
+
+### Page Table Manager ([page_table.rs](file:///Volumes/CaseSensitive/carrick/crates/carrick-mem/src/page_table.rs) — 845 lines)
+
+- 4 KiB granule, 40-bit IPA identity map
+- Boot: L0 → L1A/L1B (1 GiB blocks) → L2A/L2B (2 MiB blocks) → L3A (4 KiB pages for null guard)
+- Runtime: `set_prot_none()`, `set_readonly()`, `set_rw()`, `invalidate()` operate at **coarsest granularity possible** — edits covering full blocks in-place, splits only at unaligned edges
+- **Spare pool**: 442 pages (1.75 MiB) for runtime splits. Bump allocator + free list for reclaimed tables.
+- **Coalescing**: `try_coalesce()` reclaims uniform sub-tables back into blocks. **Disabled when multi-vCPU** (break-before-make unsafe without all-vCPU TLB flush).
+- **Dirty tracking**: `sync_to_host()` replays descriptor stores as aligned atomic 64-bit writes with `SeqCst` fences
+- **Clone for fork**: Child inherits `next_free`/`free_tables` to prevent re-handing-out live table pages
+
+### EL1 Plumbing ([memory.rs](file:///Volumes/CaseSensitive/carrick/crates/carrick-mem/src/memory.rs))
+
+- **Trampoline**: `tlbi vmalle1is; dsb sy; ic ialluis; dsb sy; isb; clrex; eret` — cache+TLB maintenance after host enables SCTLR_EL1.M
+- **Vectors**: 16 slots; slot 0x400 (Lower EL Sync) = `hvc #0; eret`; others = bare `eret`
+- **Maintenance page**: `dsb sy; tlbi vmalle1is; dsb sy; isb; hvc #1` — flushes stage-1 TLB after host edits descriptors
+- **FEAT_PAN3 workaround**: Kernel pages use AP=00 (no EL0 access); user pages use PXN=1 (no EL1 fetch)
+
+### Strengths
+
+1. **`protect_range` edits stage-1 PTEs in-place** + TLB flush — `mprotect(PROT_NONE)` actually faults on guest access
+2. **PtQuiesce barrier** for page table edits: Dekker-style handshake with `in_guest` atomic flag prevents race
+3. **COW-aware fork**: `clone_region_for_child` uses `mincore` to snapshot only resident pages, bounded by `GUEST_ARENA_HIGH_WATER`
+4. **Zero-copy heap/mmap**: zeroed regions carry NO payload bytes — HVF demand-zeroes them
+
+### Weaknesses
+
+1. **Fixed 32 GiB mmap arena** — should be configurable for JVM/database workloads
+2. **No huge page support** — 4K granule on hardware that supports 16K natively
+3. **`mlock`/`munlock` are no-ops**
+4. **No ASLR** — deterministic guest layout
+5. **SharedAperture uses linear scan** — fine now, not future-proof for heavy allocation counts
+
+---
+
+## 5. Concurrency and Threading
+
+### The BKL-Free Architecture
+
+```
+SyscallDispatcher {
+    io:     fs::IoState,       // fd table, open descriptions, buffered I/O
+    mem:    Mutex<MemState>,    // brk, mmap arena, shared mappings
+    proc:   Mutex<ProcState>,  // executable path, personality, comm
+    creds:  Mutex<CredState>,  // uid/gid/umask
+    signal: Mutex<SignalState>, // handlers, mask, pending set
+    fs:     fs::FsState,       // VFS mount table, rootfs overlay
 }
 ```
 
-### 4.3 Stat/Statx Writer Duplication
+> [!IMPORTANT]
+> The lock ordering documented at the top of [dispatch/mod.rs](file:///Volumes/CaseSensitive/carrick/crates/carrick-runtime/src/dispatch/mod.rs#L11-L18) is exactly what Solaris does with its mutex-ordering comments, and it's critical for deadlock prevention.
 
-Six nearly-identical stat-writing functions (`write_stat`, `write_stat_real`, `write_statx`, `write_statx_real`, `write_synthetic_stat`, etc.) differ only in their source type. A single `StatSource` trait → `write_stat(memory, addr, &source)` would halve this code.
+### Threaded Dispatch Path
 
-### 4.4 Clock Duration Duplication
+The `dispatch_threaded_independent` path handles futex, sched_yield, set_tid_address, set_robust_list, tkill/tgkill, and gettid **WITHOUT the dispatcher lock** — these are the hot-path syscalls for Go/pthread runtimes. Everything else goes through `dispatch_threaded_shared` which takes subsystem-specific interior locks.
 
-`linux_clock_duration`, `linux_clock_is_known`, `linux_clock_is_settable` replicate the same clock-ID match tree three times. A `ClockInfo` table would be DRYer.
+### FutexTable ([thread.rs](file:///Volumes/CaseSensitive/carrick/crates/carrick-runtime/src/thread.rs))
 
-### 4.5 `epoll_ctl MOD` Non-Atomicity
+- **64-shard** design with multiplicative (Fibonacci) hash for spreading aligned addresses
+- Each address → `Arc<FutexBucket>` with atomic generation counter + waiter count
+- Wait uses `parking_lot_core::park` with prepare/validate/park pattern
+- Signal-aware: `notify_signal_pending` wakes ALL buckets; `notify_signal_pending_for` targets specific tid via ParkToken
 
-`epoll_ctl MOD` is implemented as delete-then-add. An fd event between the two operations is lost. This is acknowledged in comments and matches FreeBSD's approach, but creates a data-loss risk on high-throughput MOD operations.
+### Fork Quiesce ([fork_quiesce.rs](file:///Volumes/CaseSensitive/carrick/crates/carrick-runtime/src/fork_quiesce.rs) + [runtime.rs](file:///Volumes/CaseSensitive/carrick/crates/carrick-runtime/src/runtime.rs#L1323-L1519))
 
-### 4.6 In-Memory Epoll Broadcast Scalability
+The fork sequence is extraordinarily thorough:
 
-The `EPOLL_INMEM_KQUEUES` global `Vec<i32>` broadcasts `EVFILT_USER(0)` to ALL epoll instances whenever any eventfd/pipe/timerfd changes state. This is O(n) in epoll instance count and generates spurious wakeups. Fine for small counts, but will scale poorly with many epoll instances (e.g., Go with many goroutine pollers).
+1. **Serialization**: CAS on `forking` flag — at most one fork at a time. Losers park at the barrier.
+2. **Topology lock** held for the entire fork (prevents vCPU creation racing hv_vm_destroy)
+3. **Stop-the-world**: set quiescing → kick all vCPUs + wake futex/io waiters → wait for `paused >= others` (retries, never EAGAIN)
+4. **VCPU_LIVE invariant check**: busy-wait up to 5s for `VCPU_LIVE==1`, **process abort** on violation (prevents HV_BUSY VM corruption)
+5. **Real host `libc::fork()`**
+6. **Parent**: publish rebuilt VM → end quiesce → restart signal pump → re-register vCPU
+7. **Child**: fresh registry/futex/kicker/threads → clear quiesce → reinit signals
 
-### 4.7 Mmap Arena — Non-Reclaiming
+### Weaknesses
 
-The mmap arena is a bump allocator. `munmap`'d space is not reclaimed (only tail-trim and free-list coalescing). Under heavy mmap/munmap workloads, the guest will eventually hit ENOMEM even if logical utilization is low.
-
-### 4.8 Single-Slot Process Signal Model
-
-Process-directed signals use a single `AtomicI32` with last-write-wins. Rapid back-to-back signals can be lost. Documented as intentional v0 tradeoff.
-
-### 4.9 Host FD Leak in `mmap`
-
-In `dispatch/mem.rs`, when `map_shared_file` fails, the `dup_fd` is NOT closed — it falls through to the next code path. If that also fails, the fd leaks.
-
-### 4.10 `O_PATH` Silently Ignored
-
-Programs using `O_PATH` fds (for `fchdir`, `openat` relative paths, `fstat` without read permission) will get a fully-opened fd instead.
-
-### 4.11 MAP_SHARED Writeback — Fixed
-
-File-backed `MAP_SHARED` mappings now use host-file-backed shared mappings, so writes are visible through the file before `msync` and survive `munmap`. The `memmap` conformance probe covers both edges with `b_shared_write_visible_without_msync` and `b_shared_write_survives_munmap`.
-
-### 4.12 Abstract Unix Sockets
-
-Not supported on Darwin. Returns `EAFNOSUPPORT`. Affects D-Bus and systemd patterns.
-
-### 4.13 Unix Socket Path Shortening
-
-Guest Unix socket paths are hashed to 16-hex-char host paths via FNV-1a. The 64-bit hash has ~1 in 2^32 collision probability at ~65K distinct paths. Fine in practice but theoretically unsound for adversarial input.
-
-### 4.14 Mmap `PROT_READ` Not Enforced
-
-`mmap` doesn't track per-page protections beyond `PROT_NONE`. A `PROT_READ` mmap followed by a write syscall to that region won't fault. Conformance gap but not a security issue in a cooperative guest model.
+- **`EPOLL_INMEM_KQUEUES` global static** (`Mutex<Vec<i32>>`) — broadcast to ALL epoll instances on any in-memory readiness change. O(n) in epoll instance count.
+- **Three near-identical run loops** in runtime.rs (~600+ lines of duplication):
+  1. `run_combined_syscall_loop` (single-threaded, combined memory+trap)
+  2. `run_split_loop` (single-threaded, split)
+  3. `run_vcpu_until_exit` (multi-threaded HVF)
 
 ---
 
-## 5. Testing
+## 6. Signal Handling
 
-### 5.1 The Testing Architecture is Strong
+### Signal Number Translation
 
-The five-layer testing architecture is well-designed:
+10 signals differ between Linux and Darwin:
 
-| Layer | What | Requires |
-|-------|------|----------|
-| Unit tests in `src/elf.rs` | Pure parsing logic | Nothing |
-| Consolidated integration tests | Syscall dispatch via `ScriptedTrap` | Nothing (no HVF) |
-| Isolated integration tests | Process-global state (HVF VM, fork, PTY) | macOS aarch64, sometimes signed binary |
-| CLI tests (~50 tests) | End-to-end binary behavior | Built fixtures |
-| Conformance probes (34 binaries) | Differential correctness vs real Linux | Docker arm64 + signed binary |
+| Linux | Darwin | Signal |
+|-------|--------|--------|
+| 7 | 10 | SIGBUS |
+| 10 | 30 | SIGUSR1 |
+| 12 | 31 | SIGUSR2 |
+| 17 | 20 | SIGCHLD |
+| 18 | 19 | SIGCONT |
+| 19 | 17 | SIGSTOP |
+| 20 | 18 | SIGTSTP |
+| 23 | 16 | SIGURG |
+| 29 | 23 | SIGIO |
+| 31 | 12 | SIGSYS |
 
-**Notable strengths:**
-- **`ScriptedTrap`** enables full runtime loop testing without HVF
-- **Differential conformance testing** (`conformance.rs`) runs the SAME snippet under carrick and Docker, normalizes output, and diffs — 16 shell-snippet cases + 34 static probe binaries
-- **Graceful HVF degradation** — every CLI test checks for HVF availability and falls back cleanly
-- **`KNOWN_PROBE_GAPS`** remains empty after the full probe run; the harness still fails loudly if a known-gap entry is reintroduced and unexpectedly passes
-- **`sweep_wedged_guests()`** calls `sudo -n scripts/sudo/kill.sh` between conformance cases to clean up wedged HVF processes
+Translation is bidirectional via `linux_to_host_signum()` / `host_to_linux_signum()`. Must happen on send (`kill`), receive (handler→guest), AND in `wait4` status.
 
-### 5.2 In-Crate Unit Tests Are Sparse
+### Signal Delivery Architecture
 
-Most `carrick-runtime` source files have no `#[cfg(test)] mod tests`. The notable exception is `linux_abi.rs`, which has thorough offset assertions for every ABI-sensitive struct and `memory.rs` which has comprehensive page-table tests. Internal functions like futex hashing, fd table management, sockaddr translation, and flag parsing are tested only indirectly via integration tests.
+**Two-layer pending model:**
+- **Process-directed**: `static PENDING: AtomicI32` — single slot, last-writer-wins
+- **Thread-directed**: `Mutex<HashMap<i32, i32>>` — one slot per tid
 
-### 5.3 Test Code Duplication
+**Wake mechanisms (three layers):**
+1. Process-wide self-pipe (async-signal-safe) — wakes threads parked in `kevent()`
+2. Per-thread wake pipe — private, siblings cannot drain
+3. Pump kqueue EVFILT_USER — for itimer thread signaling
 
-- **`gzip_tar()`** helper is copy-pasted in `runtime_loop.rs`, `cli.rs`, and `common/syscall_support.rs` — should be a shared test utility
-- **`linux_fixture.rs`** has 37 near-identical `inspect_elf` + `plan_elf_load` pattern repetitions (529 lines → ~30 with a macro)
-- **`cli.rs`** has ~35 near-identical `run_elf_command_drives_*` tests — a `#[test_case]` parameterization would help
+**Host signal handlers:**
+- `handle_routed` (with SA_SIGINFO): **Critical guard** — distinguishes synchronous CPU faults (`si_code > 0`) from externally-sent signals. Host SIGSEGV from a carrick bug is NOT published to the guest; it restores SIG_DFL and re-raises for a clean crash.
+- SIGCHLD excluded from routing to avoid breaking `wait4` passthrough
+- SIGPIPE deliberately SIG_IGN'd process-wide
 
-### 5.4 No Fuzzing
+**Signal frame injection** (`inject_signal` / `restore_from_sigframe` in [trap.rs](file:///Volumes/CaseSensitive/carrick/crates/carrick-runtime/src/trap.rs)):
+- Full `CarrickSigframe` with `LinuxSiginfo` + `LinuxUcontext` + `LinuxFpsimdContext` (V0-V31 SIMD save/restore)
+- Magic cookie `'CarrickS'` for frame authentication on `rt_sigreturn`
+- Saves all 31 GP regs + FP/SIMD + FPSR/FPCR — enables Go's `TestDebugCall` (handler mutates `uc_mcontext`)
 
-The no-panic Clippy gate catches static issues, but runtime panics from integer overflow, out-of-bounds, or infinite loops aren't caught. Priority fuzz targets:
-- ELF loader (malformed headers)
-- Syscall dispatch (random numbers/arguments)
-- Guest memory reads (corrupted structs/strings/pointers)
+### Signal Semantics Gaps
 
-### 5.5 No Property-Based Testing
+> [!WARNING]
+> These gaps are explicitly acknowledged as v0 trade-offs:
 
-Syscall argument handling (flag parsing, address validation, struct serialization) is a prime candidate for `proptest`.
-
----
-
-## 6. API Design & Code Style
-
-### 6.1 `DispatchOutcome` — Well-Designed
-
-The `DispatchOutcome` enum is excellent glue between the dispatch and runtime layers. Simple syscalls return `Returned{value}` or `Errno{errno}`, while complex operations return specialized variants (`Fork`, `Execve`, `CloneThread`, `FutexWait`, `WaitOnFds`, `SigReturn`, etc.) that the runtime acts on *after* releasing locks. This is the right pattern.
-
-### 6.2 `define_syscall!` Macro — Consistent
-
-The `define_syscall!` macro enforces a uniform handler signature with typed argument extraction via `FromGuestArg`. The `GuestPtr(u64)`, `Fd(i32)`, `Pid(i32)`, `Signal(i32)`, `GuestLen(usize)` newtypes make the ABI intent clear.
-
-### 6.3 `normalized_dispatch!{}` — Single Authoritative Registry
-
-The ~180-syscall dispatch table at `mod.rs` lines 1442–1624 is the single authoritative mapping from syscall numbers to handlers. No legacy fallback match exists. Clean.
-
-### 6.4 Documentation Quality — Mixed
-
-**Excellent in places:**
-- `guest_cpu.rs` module-level docs explain WHY `hv_vcpu_get_exec_time` is not used (measured 40× under-reporting)
-- `ulock.rs` module docs explain the problem, constraint, API choice, and prior art
-- Fork quiesce protocol is meticulously commented — every step explains WHY
-- `host_facts.rs` is exemplary (well-tested, well-documented)
-
-**Implementation pass status:**
-- Module-level `//!` docs have been added to production source files that lacked them; the implementation ledger records the repeatable audit.
-- `execute.rs` — `Runtime::execute` (the primary public API) still has no item-level doc comment; that is separate from the module-doc sweep.
-- The concatenated `deliver_pending_signal` / `shared_futex_wait` doc comments were split in item #6.
-
-### 6.5 Naming Inconsistency
-
-`VcpuLoopOutcome::ThreadDone` vs `DispatchOutcome::ThreadExit` — "Done" vs "Exit" for the same concept.
-
-### 6.6 `linux_abi.rs` Organization
-
-The `bitflags!` usage is already good (with `SUPPORTED_MASK` constants and exhaustiveness tests). The `KernelAbi` trait is excellent. The main improvement opportunity is splitting the 1,833 lines into sub-modules by subsystem (`linux_abi::signal`, `linux_abi::mmap`, `linux_abi::socket`, etc.) — but be careful not to separate the `KernelAbi` compile-time assertions from their struct definitions.
-
-### 6.7 DAC Check / Path Helpers Misplaced
-
-The DAC (discretionary access control) check lives in `dispatch/mod.rs` — should move to `dispatch/creds.rs`. The `utimensat` / path helpers should move to `dispatch/fs.rs`.
+1. **Single-slot model loses concurrent signals** — if two signals arrive before delivery, only the last is stored
+2. **No signal queue for RT signals** — SIGRTMIN–SIGRTMAX semantics unsupported
+3. **SIGCHLD not routable to guest handlers** — excluded from `ensure_host_handler`
+4. **No `siginfo_t` delivery** (partially — fault-driven siginfo (si_code, si_addr) IS delivered for SIGSEGV/SIGBUS; SI_USER is not)
+5. **`rt_sigsuspend` returns EINTR immediately** rather than truly suspending
 
 ---
 
-## 7. Prioritized Action Items
+## 7. Terminal and PTY
 
-### Tier 1
+### Three-Process Interactive Architecture
 
-| # | Item | Effort |
-|---|------|--------|
-| 1 | **Extract shared dispatch loop logic** — the triplicated loop is the highest drift risk | 1 day |
-| 2 | **Audit `EPOLL_INMEM_KQUEUES` × `open_files` lock ordering** | 2 hours |
-| 3 | **Extend lock ordering comment** to cover `pty_table` and `EPOLL_INMEM_KQUEUES` | 1 hour |
-| 4 | **Fix host fd leak in `mmap` `map_shared_file` failure path** | 30 min |
-| 5 | **Replace `unreachable!()` with error returns** in dispatch match | 1 hour |
-| 6 | **Fix concatenated doc comments** (`deliver_pending_signal` + `shared_futex_wait`) | 15 min |
+```
+Launcher (original process)
+  └─ fork → Supervisor (creates session, owns pty)
+              └─ fork → Runtime Child (Carrick runtime, own pgrp)
+```
 
-### Tier 2
+The supervisor runs a `PtyRelay` — bidirectional `poll(2)` loop between host stdin/stdout and the PTY master. `SIGWINCH` uses a two-pronged approach: async-signal-safe self-pipe handler + 250ms poll timeout fallback (because SIGWINCH delivery is unreliable under HVF).
 
-| # | Item | Effort |
-|---|------|--------|
-| 7 | **Split `dispatch/fs.rs`** into ~7 focused files | 1 day |
-| 8 | **Split `dispatch/mod.rs`** into ~6 focused files | 1 day |
-| 9 | **Split `trap.rs`** into ~5 focused files | 1 day |
-| 10 | **Split `dispatch/net.rs`** into ~5 focused files | 1 day |
-| 11 | **Split `main.rs`** into per-subcommand modules | 4 hours |
-| 12 | **Extract `OpenDescription` status_flags** to base struct (~200 lines of boilerplate eliminated) | 4 hours |
-| 13 | **Consolidate stat/statx writers** into generic path | 4 hours |
-| 14 | **Unify `gzip_tar` test helper** (copy-pasted in 3 files) | 30 min |
-| 15 | **Parameterize `linux_fixture.rs`** tests (529 lines → ~30 with macro) | 2 hours |
-| 16 | **Delete duplicate `probe_case_sensitive`** and `join_ids` from main.rs | 15 min |
+**Launcher death detection**: poll on `life_r` pipe — POLLHUP → SIGHUP → SIGTERM → SIGCONT → (8 cycles) → SIGKILL. Ensures orphaned runtime processes are cleaned up.
 
-### Tier 3
+### DevPTS ([vfs/devpts.rs](file:///Volumes/CaseSensitive/carrick/crates/carrick-runtime/src/vfs/devpts.rs))
 
-| # | Item | Effort |
-|---|------|--------|
-| 17 | Remove `clap` from `carrick-spec` dependencies | 1 hour |
-| 18 | Remove unused `ContainerSpec` from `carrick-spec` | 15 min |
-| 19 | Add catch-all errno mapping for unmapped Darwin codes >34 | 1 hour |
-| 20 | Add in-crate unit tests for translation functions (errno, sockaddr, flags) | 1 day |
-| 21 | Add ELF fuzzing harness | 2 days |
-| 22 | Expand conformance probes | Ongoing |
-| 23 | Consider mmap arena reclamation (interval tree / proper free list) | 2 days |
-| 24 | Fix `epoll_ctl MOD` atomicity (single `EV_DELETE|EV_ADD` kevent batch) | 4 hours |
-| 25 | Address `EPOLL_INMEM_KQUEUES` O(n) broadcast scalability | 1 day |
-| 26 | Implement `MAP_SHARED` writeback | 3 days |
-| 27 | Add module-level `//!` docs to all files | 1 day |
-| 28 | Unify `run_cli()` logging — replace `eprintln!` with `tracing::warn!` | 2 hours |
-| 29 | Decide `carrick-engine` fate (fold into CLI or grow) | Design decision |
-| 30 | Consider slot reuse for `NEXT_SLOT` in `guest_cpu.rs` | 2 hours |
+`PtyTable` tracks allocated pty indices. `/dev/ptmx` → `posix_openpt` + `grantpt` + `unlockpt`. `/dev/pts/N` opens the slave via `ptsname_r` + `libc::open`.
 
 ---
 
-## 8. Implementation Ledger
+## 8. Networking
 
-> **Status key:** `done` means this implementation pass changed or freshly verified the item. Notes distinguish full implementation from scoped structural extraction where the original recommendation was intentionally broad.
+### Strengths
 
-### Baseline
+1. **AF_NETLINK synthesis** for `RTM_GETLINK`/`RTM_GETADDR` — uses `getifaddrs(3)` for real interface data
+2. **AF_UNIX abstract/autobind emulation** — Darwin has no abstract namespace, so carrick hashes to a host subdirectory (same approach as FreeBSD Linuxulator)
+3. **SOCK_SEQPACKET emulation over SOCK_STREAM** — macOS lacks AF_UNIX SEQPACKET
+4. **Comprehensive sockopt translation** — Linux↔Darwin option number mapping done correctly
+5. **sockaddr translation**: BSD `sin_len` insertion/removal, `AF_INET6` 10→30 mapping
 
-| Check | Status | Notes |
-|---|---|---|
-| Branch/worktree | done | Working in-place on `main`; `agy-report.md` was untracked at start. |
-| `cargo fmt --all -- --check` | done | Applied `cargo fmt --all` in `c50bbd3`; check now exits cleanly. |
-| `cargo test --lib thread::tests -- --nocapture` | done | Fresh run executes the 8 runtime thread tests successfully; the old `/dev/stdout` DTrace build blocker no longer reproduces in this environment. |
-| `cargo test --lib errno_translation_maps_unknown_darwin_extensions_to_eio -- --nocapture` | done | Red/green verified: initially leaked Darwin `ENOATTR` as `93`; now maps to Linux `EIO` (`5`). |
-| `cargo test --lib close_cloexec_fds_removes_marked_descriptors_only -- --nocapture` | done | Verifies CLOEXEC sweep removes marked descriptors and preserves unmarked ones. |
-| `cargo test --lib threaded_independent_dispatch_support_matches_handler_table -- --nocapture` | done | Verifies the thread-local syscall handler table stays covered by the non-panicking threaded-independent dispatch subset. |
-| `cargo check -p carrick-cli` | done | Verifies the CLI fallback for an unnormalized `shell` command and the `FsBackendKind` `clap` feature path compile. |
-| `cargo check -p carrick-spec --no-default-features` | done | Verifies the shared spec crate builds without the optional CLI-facing `clap` feature. |
-| `cargo tree -p carrick-spec --no-default-features` | done | Inspected with `rg` for `clap`; no dependency is present in the bare spec dependency graph. |
-| `cargo test -p carrick-runtime --lib dtrace_consumer::tests::join_ids_formats_comma_separated_decimal_ids -- --nocapture` | done | Verifies the shared trace group-id formatter used by runtime and CLI. |
-| `cargo test -p carrick-runtime --lib dispatch::mem::tests::next_mmap_address_reuses_freed_arena_region -- --nocapture` | done | Verifies anonymous/private mmap arena holes are reused from `free_regions`. |
-| `cargo test -p carrick-runtime --lib 'dispatch::net::tests::' -- --nocapture` | done | Verifies address-family, message-flag, sockaddr layout, sockaddr truncation, epoll MOD filter-change, and host-socket nonblocking translation tests. |
-| `cargo test -p carrick-cli --test linux_fixture builds_static_linux_aarch64_hello_fixture -- --nocapture` | done | Verifies the table-driven static fixture inventory still builds and validates every expected AArch64 fixture. |
-| `cargo test -p carrick-runtime --test integration rootfs_overlay::reads_file_from_uppermost_layer -- --nocapture` | done | Verifies `rootfs_overlay` uses the shared gzip/tar helper. |
-| `cargo test -p carrick-runtime --test integration address_space::load_elf_from_rootfs_maps_pt_interp_at_base_and_sets_at_base -- --nocapture` | done | Verifies the shared mode-aware gzip/tar helper preserves executable ELF entries. |
-| `cargo test -p carrick-runtime --test runtime_loop runtime_loop_can_cat_a_rootfs_file -- --nocapture` | done | Verifies `runtime_loop` uses the shared gzip/tar helper. |
-| source module-doc audit | done | `find crates \( -path '*/src/*.rs' -o -path '*/src/**/*.rs' \) ...` now prints no production source files missing a leading `//!` module doc. |
-| `rg -n "eprintln!" crates/carrick-cli/src/main.rs` | done | Only the intentional panic abort banner remains on direct stderr; CLI warning/status diagnostics now use `tracing::warn!`. |
-| `cargo test -p carrick-runtime --test integration fstat_and_statx_empty_path_agree_for_anonymous_fd_kinds -- --nocapture` | done | Verifies fd-based `fstat` and empty-path `statx` agree across anonymous descriptor kinds through the shared `StatRecord` path. |
-| `cargo test -p carrick-runtime --test integration newfstatat_and_fstat_write_typed_linux_stat -- --nocapture` | done | Verifies typed Linux stat output for `newfstatat` and `fstat` still matches expected rootfs metadata. |
-| `rg -n "fn gzip_tar" crates -g '*.rs'` | done | Only `crates/carrick-test-support/src/lib.rs` defines the shared gzip/tar helper family. |
-| `cargo test -p carrick-test-support` | done | Verifies the shared test helper crate builds and its doctest harness is clean. |
-| `cargo test -p carrick-cli --test cli rootfs_cli_lists_and_reads_composed_layers -- --nocapture` | done | Verifies CLI tests consume the shared gzip/tar helper. |
-| `cargo test -p carrick-runtime --test runtime_loop -- --nocapture` | done | Verifies the split single-threaded runtime path still handles static ELF dispatch, rootfs file/dir operations, and trap-limit reporting after dispatch-loop extraction. |
-| `rg -n "notify_inmem_epoll\\(" crates/carrick-runtime/src/dispatch -g '*.rs'` | done | Shows the O(n) broadcast is now only the `write_eventfd` fallback; eventfd readiness has a host pipe watched by epoll kqueues via `EVFILT_READ`. |
-| `cargo test -p carrick-runtime --test integration epoll_reports_eventfd_readiness_with_packed_events -- --nocapture` | done | Verifies eventfd readiness is visible through epoll. |
-| `cargo test -p carrick-runtime --test integration epoll_edge_triggered_eventfd_reports_only_new_readiness -- --nocapture` | done | Verifies eventfd edge-triggered epoll readiness still reports only new readiness transitions. |
-| `cargo check -p carrick-runtime` | done | Verifies the `OpenDescriptionBase` status-flag extraction compiles across runtime dispatch modules. |
-| `cargo test -p carrick-runtime --test integration fcntl_gets_and_sets_descriptor_and_status_flags -- --nocapture` | done | Verifies descriptor flags and open-description status flags still round-trip through `fcntl`. |
-| `cargo test -p carrick-runtime --test integration fionbio_updates_pipe_status_flags_and_host_nonblocking_mode -- --nocapture` | done | Verifies `FIONBIO` still updates Linux-visible status flags and host nonblocking mode. |
-| `cargo test -p carrick-runtime --lib host_socket_install_forces_host_nonblocking_even_for_blocking_guest_fd -- --nocapture` | done | Verifies socket status flags preserve guest blocking mode while host fds stay nonblocking. |
-| `cargo check --manifest-path fuzz/Cargo.toml --bin elf_load_plan` | done | Verifies the standalone cargo-fuzz target compiles against the workspace runtime crate. |
-| `scripts/build-probes.sh` | done | Rebuilt all AArch64 musl conformance probes; existing probe warnings are non-fatal. |
-| `cargo test -p carrick-cli --test conformance conformance_probes -- --nocapture` | done | Full differential probe suite is green with `KNOWN_PROBE_GAPS` empty: 1 passed, 0 failed, 2 filtered out, 123.29s. |
-| `wc -l crates/carrick-runtime/src/dispatch/fs.rs crates/carrick-runtime/src/dispatch/mod.rs crates/carrick-runtime/src/trap.rs crates/carrick-runtime/src/dispatch/net.rs crates/carrick-cli/src/main.rs` | done | Current large-file counts after the staged splits and rustfmt: 4,954 / 4,327 / 3,120 / 2,438 / 97 lines. Extracted support modules include `dispatch/fd_table.rs` (556), `dispatch/net/support.rs` (878), `dispatch/fs/state.rs` (129), and `trap/sysreg.rs` (81). |
+### Weaknesses
 
-### Tier 1
+1. **No `splice(2)` for socket→pipe zero-copy** — used by Go's `io.Copy`, causes hangs
+2. **No `SO_PEERCRED`** — used by D-Bus, systemd authentication
+3. **No raw sockets beyond stub**
+4. **Netlink only covers ROUTE** — no NETLINK_AUDIT, NETLINK_CONNECTOR, etc.
 
-| # | Item | Status | Notes |
-|---|---|---|---|
-| 1 | Extract shared dispatch loop logic | done | `run_combined_syscall_loop_with_dispatcher` and `run_split_loop` now share `dispatch_single_threaded_syscall` for `WaitOnFds`, `WaitOnPollFds`, and `WaitOnProcExit` re-dispatch handling; the threaded path remains separate because it must park vCPUs during fork quiesce. |
-| 2 | Audit `EPOLL_INMEM_KQUEUES` x `open_files` lock ordering | done | `notify_inmem_epoll()` holds only `EPOLL_INMEM_KQUEUES` while triggering kqueues and does not acquire dispatcher fd/open-description locks. |
-| 3 | Extend lock ordering comment | done | Comment now covers `pty_table`, `EPOLL_INMEM_KQUEUES`, and the no-blocking/guest-memory rule; CLOEXEC sweep now drops `open_files` before pty cleanup. |
-| 4 | Fix host fd leak in `mmap` `map_shared_file` failure path | done | Verified current `GuestMemory::map_shared_file` ownership contract: default impl closes on failure, and the HVF path closes in `OwnedHostMapping::map_shared_file` before returning. |
-| 5 | Replace `unreachable!()` with error returns in dispatch match | done | Production `unreachable!()` calls were removed from CLI/runtime/dispatch paths. Guest-facing unexpected outcomes now return `EINTR`, `ENOSYS`, or `EINVAL`; only the integration-test assertion helper still uses `unreachable!()`. |
-| 6 | Fix concatenated doc comments | done | `deliver_pending_signal` and `shared_futex_wait` now have separate doc blocks attached to the right functions. |
+---
 
-### Tier 2
+## 9. OCI Image Pipeline
 
-| # | Item | Status | Notes |
-|---|---|---|---|
-| 7 | Split `dispatch/fs.rs` | done | Extracted filesystem/I/O ownership state and host-fd helpers into `dispatch/fs/state.rs` (`6df99a9`), reducing shared dispatcher field coupling while preserving behavior under the full conformance suite. |
-| 8 | Split `dispatch/mod.rs` | done | Extracted file-descriptor table, open-description, eventfd, timerfd, pidfd, and epoll state into `dispatch/fd_table.rs` (`edf1ab7`); `mod.rs` now delegates that ownership surface. |
-| 9 | Split `trap.rs` | done | Extracted EL0 system-register trap decoding and counter helpers into `trap/sysreg.rs` (`0c0a557`), isolating the vDSO/counter decoding surface used by the HVF trap path. |
-| 10 | Split `dispatch/net.rs` | done | Extracted socket, fd-set, epoll, sockaddr, and message-flag helpers into `dispatch/net/support.rs` (`bde4058`), leaving syscall handlers in `net.rs`. |
-| 11 | Split `main.rs` into command modules | done | CLI command parsing/execution now lives in `args.rs`, `commands.rs`, `debug.rs`, `fs_setup.rs`, `runtime_util.rs`, and `trace_cli.rs`; `main.rs` is 97 lines (`e8ae395`). |
-| 12 | Extract `OpenDescription` status flags | done | Added shared `OpenDescriptionBase` carrying `status_flags`; all `OpenDescription` variants now embed the base and use common `status_flags` / `set_status_flags` accessors. |
-| 13 | Consolidate stat/statx writers | done | Current code already routes metadata, real-stat, fd-stat, and synthetic-stat cases through `StatRecord`, `write_stat_record`, and `write_statx_record`; focused stat/statx agreement tests pass. |
-| 14 | Unify `gzip_tar` test helper | done | Added `carrick-test-support` with shared `gzip_tar`, `gzip_tar_with_modes`, and `gzip_tar_with_links`; runtime support and CLI tests now import it instead of carrying local copies. |
-| 15 | Parameterize `linux_fixture.rs` tests | done | Collapsed repeated static fixture metadata/load-plan assertions into one fixture table and loop while preserving the special ET_EXEC and PIE checks. |
-| 16 | Delete duplicate `probe_case_sensitive` and `join_ids` from main.rs | done | CLI now calls `carrick_runtime::apfs::probe_case_sensitive` and the shared `dtrace_consumer::join_ids`; the duplicate local helpers were removed. |
+### Three-Stage Pipeline ([carrick-image](file:///Volumes/CaseSensitive/carrick/crates/carrick-image/src/lib.rs) — 511 lines)
 
-### Tier 3
+1. **Pull**: `oci_client` (anonymous auth) → manifest+layers → blobs at `$CARRICK_HOME/blobs/sha256/<hex>`
+2. **Store**: Content-addressable at `~/.carrick/images/{registry}/{repo}/{tag}`
+3. **Resolve**: Load `PullSummary` → parse `config.json` (PascalCase serde for Docker compat) → extract `ImageConfig` (entrypoint, cmd, env, working_dir, user)
 
-| # | Item | Status | Notes |
-|---|---|---|---|
-| 17 | Remove `clap` from `carrick-spec` dependencies | done | `clap` is now optional behind a `clap` feature; `FsBackendKind` derives `ValueEnum` only when that feature is enabled, and `carrick-cli` opts in. |
-| 18 | Remove unused `ContainerSpec` from `carrick-spec` | done | Removed the unused public type after repo-wide `rg` showed no references outside its definition. |
-| 19 | Add catch-all errno mapping for unmapped Darwin codes >34 | done | Added regression for Darwin `ENOATTR` and unknown `999`; fallback now preserves 1..=34 identity and maps unmapped extensions to Linux `EIO`. |
-| 20 | Add unit tests for translation functions | done | Added focused net translation tests for address families, message flags, IPv4 sockaddr layout round-trip, and Linux sockaddr truncation semantics; errno translation was already covered. |
-| 21 | Add ELF fuzzing harness | done | Added standalone cargo-fuzz harness under `fuzz/` with `elf_load_plan` target and lockfile (`65078b1`); `cargo check --manifest-path fuzz/Cargo.toml --bin elf_load_plan` passes. |
-| 22 | Expand conformance probes | done | Added MAP_SHARED no-`msync` and post-`munmap` visibility checks to `memmap`, fixed workspace-root probe harness paths, and ran the full probe suite with no known gaps (`65078b1`, `cb15109`). |
-| 23 | Consider mmap arena reclamation | done | Current `MemState` has `free_regions` reuse and tail-trim logic; added a focused regression and fixed the stale top-level mmap arena comment. |
-| 24 | Fix `epoll_ctl MOD` atomicity | done | MOD now applies new kqueue filters before deleting filters removed by the new mask, avoiding the old delete-then-add no-interest gap; added helper tests for filter selection and removed-filter changes. |
-| 25 | Address `EPOLL_INMEM_KQUEUES` O(n) broadcast scalability | done | Current eventfd readiness is host-backed by a nonblocking pipe, so epoll instances watch it natively through their kqueues; the O(n) `notify_inmem_epoll()` call remains only as a fallback for rare readiness-pipe failure/legacy synthetic readiness. |
-| 26 | Implement `MAP_SHARED` writeback | done | `memmap` now verifies shared mapping writes are immediately file-visible and survive `munmap`; full conformance passes with the former `memmap` gap removed. |
-| 27 | Add module-level docs to all files | done | Added leading `//!` docs to all production source files that lacked them, and converted the `fs_backend` and `overlay` file headers into module docs. |
-| 28 | Unify `run_cli()` logging | done | Replaced warning/status `eprintln!` calls in the CLI with `tracing::warn!`; retained the panic hook's direct stderr banner because it is process-abort reporting, not normal logging. |
-| 29 | Decide `carrick-engine` fate | done | Decision is to keep/grow `carrick-engine` as the container orchestration layer. README documents the dependency direction (`cli -> engine -> {image, runtime} -> spec`), and `run` now flows through `Engine::run(CliRunRequest)`. |
-| 30 | Consider slot reuse for `NEXT_SLOT` in `guest_cpu.rs` | done | Audited lifecycle: slot reuse is intentionally avoided because departed slots still contribute to total CPU time and TLS-destructor reuse would complicate fork reset semantics; overflow shares the last atomic slot without losing total accounting. |
+### Engine ([carrick-engine](file:///Volumes/CaseSensitive/carrick/crates/carrick-engine/src) — ~337 lines)
+
+`resolve_run_spec(CliRunRequest, ResolvedImage) → RunSpec` follows Docker semantics:
+- **argv**: `entrypoint_override || image.entrypoint` + `user_args || image.cmd`
+- **envp**: Image ENV → baseline defaults → CLI overrides (sorted for determinism)
+- **fs_backend auto-probe**: checks APFS case-sensitivity via `probe_case_sensitive()`
+
+### Docker Compatibility Gaps
+
+No auth, no container lifecycle (stop/restart/exec), no networking (port mapping), no resource limits (cgroups), no layer deduplication, no digest verification, no multi-container.
+
+---
+
+## 10. Observability
+
+### USDT/DTrace Probes ([probes.rs](file:///Volumes/CaseSensitive/carrick/crates/carrick-runtime/src/probes.rs) — 457 lines)
+
+USDT probes at every major runtime transition: `vcpu__trap`, `syscall__entry`/`syscall__return`, fork events, execve, signal delivery, page table edits, itimer fires. All gated by `is_enabled!()` — zero cost when no consumer attached.
+
+### In-Process DTrace Consumer ([dtrace_consumer.rs](file:///Volumes/CaseSensitive/carrick/crates/carrick-runtime/src/dtrace_consumer.rs) — 523 lines)
+
+Links `libdtrace.dylib` via `dlopen`, compiles D programs, enables probes, reads aggregations. The `carrick trace` subcommand drives this.
+
+> [!TIP]
+> This is better than what lx zones ever had. In lx zones, syscall tracing required manual `dtrace -n 'lx-syscall:::entry'` scripts. Carrick's integrated consumer is superior ergonomics.
+
+### Compat Reporter ([compat.rs](file:///Volumes/CaseSensitive/carrick/crates/carrick-runtime/src/compat.rs) — 621 lines)
+
+Tracks per-syscall-number counts, unimplemented syscalls, errno distributions. Uses fixed-size arrays indexed by syscall number (no heap allocation on hot path). Emits JSON via `carrick compat-report`.
+
+---
+
+## 11. Build System and Developer Experience
+
+### Crate Graph
+
+```
+carrick-cli → carrick-engine → carrick-image → carrick-spec
+                              → carrick-runtime → carrick-mem → carrick-guest-mem
+                                                → carrick-abi
+```
+
+### Testing Infrastructure
+
+| Layer | Scope | Coverage |
+|-------|-------|----------|
+| **Integration (runtime)** | ~45 per-syscall fixture tests | timerfd, epoll, ppoll, pselect, futex, rseq, membarrier, prctl, getcpu, flock, splice, statx, openat2, madvise |
+| **Conformance (CLI)** | Differential carrick-vs-Docker | 16 shell snippets + probe binary suite + Go fixture |
+| **Unit (page_table)** | 12 tests | split/coalesce/fork-clone/pool-exhaustion/multi-vCPU safety |
+| **Unit (engine)** | 4 tests | argv/env/workdir merging |
+| **Unit (image)** | 10 tests | platform selection/parsing/config deser |
+| **Conformance probes** | Static musl binaries | Forkcow, timeclock, ptypair, accounting, netpoll, memmap, cpucount, etc. |
+| **Go runtime** | 341/341 PASS | runtime.test (signals, atomics, threads, debug traps) |
+| **Go net** | 238/238 PASS | net.test (sockets, unix, abstract, SEQPACKET) |
+| **Fuzz** | Targets exist | Coverage unclear |
+
+### Strengths
+
+- **No-panic gate** (`clippy::unwrap_used`, `expect_used`, `panic!`, `todo!`, `unimplemented!` denied) — excellent for a runtime
+- **Differential testing** against Docker as oracle — gold standard
+- **Design documents** for every major feature (ptrace, build decomposition, rosetta)
+- **Codesign-aware test degradation** — HVF tests assert `Hypervisor.framework` in stderr if entitlement missing
+
+### Weaknesses
+
+1. **`lld` incompatible with USDT probes** — main link-time optimization lever unavailable
+2. **Codesign friction** — bare `cargo build --release` produces a binary that fails with HV_DENIED
+3. **No CI configuration** visible in the repo
+4. **No LTP CI gate** — baseline is logged but not automatically regressed
+
+---
+
+## 12. Code Quality Assessment
+
+### Strengths
+
+| Aspect | Assessment |
+|--------|-----------|
+| **Error handling** | Excellent. `thiserror` + `anyhow` layering. No panics on guest input. |
+| **Documentation** | Excellent. Design docs, invariant comments, WHY not just WHAT, root-cause citations for bug fixes. |
+| **Safety** | Good. `unsafe` confined to FFI, SIMD shim, fork. Each block has invariant comments. |
+| **Testability** | Good. `GuestMemory` trait + `LinearMemory` enables unit testing without HVF. |
+| **Naming** | Good. Clear, descriptive, Rust-idiomatic. |
+| **Observability** | Best-in-class for this problem space. |
+
+### Areas for Improvement
+
+| Aspect | Issue |
+|--------|-------|
+| **Run loop duplication** | Three near-identical loops (~600 LOC) sharing ~60% logic. Should unify via trait. |
+| **Entry point proliferation** | 11 `run_*` functions with minor variations → builder pattern. |
+| **File sizes** | `dispatch/fs.rs` (5,147), `dispatch/mod.rs` (4,278), `trap.rs` (3,260), `runtime.rs` (2,685) — all too large. |
+| **Global statics** | `EPOLL_INMEM_KQUEUES`, `VCPU_LIVE`, `fork_quiesce` globals — harder to test and reason about. |
+| **execute.rs duplication** | Host/Memory paths share ~50% structure. |
+| **tokio dependency** | Heavy for primarily synchronous code — likely pulled by `oci-client`. |
+
+---
+
+## 13. Strategic Gaps and Opportunities
+
+### Critical Path (Blocks Adoption)
+
+| # | Gap | Impact | Effort |
+|---|-----|--------|--------|
+| 1 | **Complete crate split** (carrick-hvf, carrick-dispatch) | Faster iteration, parallel builds | Medium |
+| 2 | **Full 450-entry syscall table** with Deferred entries | Compat reporting completeness | Low |
+| 3 | **`inotify` emulation** via kqueue EVFILT_VNODE | File watcher workloads | High |
+| 4 | **`splice(2)` for socket↔pipe** | Go `io.Copy` zero-copy; fixes hangs | Medium |
+| 5 | **Land Rosetta x86_64 support** | linux/amd64 containers on Apple Silicon | High |
+
+### High Value / Lower Effort
+
+| # | Opportunity | Notes |
+|---|-------------|-------|
+| 6 | `/proc/<pid>/*` for child processes | `ps`, `top`, process management |
+| 7 | Automate codesign in build | Justfile or cargo alias |
+| 8 | LTP CI gate | Automate baseline comparison against Docker |
+| 9 | Consolidate run loops | Unify 3 loops behind a trait |
+| 10 | SIGCHLD delivery to guest handlers | Needed for job control, wait-based patterns |
+
+### Strategic / Longer Term
+
+| # | Opportunity | Notes |
+|---|-------------|-------|
+| 11 | Container lifecycle (create/start/stop/exec) | Move from compat layer to lightweight runtime |
+| 12 | `FUTEX_REQUEUE`/`CMP_REQUEUE` | Needed for efficient pthread condvars |
+| 13 | `io_uring` emulation over kqueue/dispatch | Database/web server workloads |
+| 14 | CNTVCT_EL0 passthrough | Eliminate timer register traps |
+| 15 | `seccomp` emulation | Dispatcher has full syscall visibility; BPF check would be straightforward |
+| 16 | Signal queuing for RT signals | Full POSIX RT signal semantics |
+| 17 | ITIMER_VIRTUAL/PROF use CPU time (not wall clock) | Currently uses kqueue wall-clock timers |
+
+---
+
+## 14. Comparison Matrix: Carrick vs. Prior Art
+
+| Feature | Carrick | lx zones | Noah | WSLv1 | FreeBSD Linuxulator |
+|---------|---------|----------|------|-------|---------------------|
+| **Host OS** | macOS (Apple Silicon) | Solaris/illumos | macOS (x86_64) | Windows | FreeBSD |
+| **Trap mechanism** | HVF EL1→EL2 | sysenter (in-kernel) | HVF (x86_64) | Pico process | int 0x80/syscall |
+| **Implementation** | Rust (userspace) | C (kernel module) | C++ (userspace) | C (kernel driver) | C (kernel module) |
+| **LOC** | ~66K | ~100K+ | ~30K | ~200K+ | ~50K+ |
+| **Syscall coverage** | ~150 BringUp | ~300+ | ~100 | ~250 | ~350 |
+| **Threading** | Full (BKL-free) | Full | Single-threaded | Full | Full |
+| **fork()** | Real host fork | Real host fork | No | Real NT process | Real host fork |
+| **exec()** | In-process reload | In-zone brand exec | Yes | NT process replace | In-process |
+| **Networking** | Direct Darwin sockets | Branded TCP/IP stack | Direct | Hyper-V vmswitch | Direct BSD sockets |
+| **/proc** | Synthetic (rich) | /proc brand module | Minimal | Synthetic | linsysfs/linprocfs |
+| **inotify** | ❌ Deferred | ✅ Via FEM | ❌ | ✅ | ✅ Via kevent |
+| **ptrace** | ❌ ENOSYS (Phase 1) | ✅ Full | ❌ | ✅ | ✅ |
+| **Observability** | USDT + DTrace (best) | DTrace (native) | None | ETW | DTrace |
+| **Container support** | OCI (single) | Full zones | None | Full (WSL2 replaced) | jail + Linux compat |
+
+---
+
+## 15. Conclusion
+
+Carrick is an **exceptionally well-engineered** project that makes the right architectural choices for its design space. The HVF trap boundary, identity-mapped page tables, pid-identity process model, BKL-free dispatcher, and DTrace observability are all decisions that reflect deep systems engineering experience.
+
+The code quality — no-panic enforcement, differential testing, exhaustive design documentation, and comment quality that explains *why* (citing specific bug root causes like the SIGURG/go-build flake, the SIMD altstack corruption, the apt deadlock) — sets a high bar.
+
+The primary challenges are:
+- The inherent per-syscall trap cost (unavoidable without an in-kernel fast path)
+- The breadth of the Linux syscall surface remaining to be covered (~150 of ~450)
+- Structural code duplication (three run loops, entry point proliferation)
+
+The strategic opportunity around **Rosetta x86_64 support** is genuinely unique — no other Linux compatibility layer on macOS can offer hardware-accelerated x86_64 translation without a VM. Combined with the already-proven Go/Python/apt workloads and the OCI container pipeline, carrick is well-positioned to become a lightweight, zero-overhead alternative to Docker Desktop for developer workflows on Apple Silicon.

@@ -1,7 +1,7 @@
 //! Command dispatch implementation for the CLI.
 
 use anyhow::{Context, bail};
-use carrick_image::{ImageReference, ImageStore, pull_image};
+use carrick_image::{ImageReference, ImageStore};
 use carrick_runtime::compat::{CompatReporter, SyscallArgs};
 use carrick_runtime::dispatch::{LinearMemory, SyscallDispatcher, SyscallRequest};
 #[cfg(target_os = "macos")]
@@ -40,6 +40,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             let interactive = unsafe { libc::isatty(0) } == 1;
             Commands::Run {
                 image,
+                platform: None,
                 max_traps: DEFAULT_MAX_TRAPS,
                 debug_state_path: None,
                 raw: !interactive,
@@ -201,13 +202,20 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 );
             }
         }
-        Commands::Pull { image } => {
+        Commands::Pull { image, platform } => {
             let image = ImageReference::parse(&image)?;
-            let summary = block_on_oci(pull_image(&image, &store))?;
+            let target = platform
+                .as_deref()
+                .and_then(carrick_image::PlatformTarget::parse)
+                .unwrap_or_else(carrick_image::PlatformTarget::default_target);
+            let summary = block_on_oci(carrick_image::pull_image_with_platform(
+                &image, &store, &target,
+            ))?;
             println!("{}", serde_json::to_string_pretty(&summary)?);
         }
         Commands::Run {
             image,
+            platform,
             max_traps,
             debug_state_path,
             raw,
@@ -254,6 +262,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
 
             let req = carrick_engine::CliRunRequest {
                 image_ref: image,
+                platform,
                 args: command,
                 env_overrides,
                 mounts,

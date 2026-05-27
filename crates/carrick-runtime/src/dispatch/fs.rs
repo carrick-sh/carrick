@@ -2338,6 +2338,22 @@ impl SyscallDispatcher {
                 return Ok(LINUX_EBADF.into());
             }
 
+            // ── Rosetta 2 virtualization handshake ──────────────────────────────────
+            // At startup Apple's Rosetta issues a small set of ioctls on its
+            // /proc/.../exe fd to confirm it is running inside an Apple
+            // virtualization environment. The size field (bits [29:16]) of the
+            // request encodes the expected response length. The licensing ioctl
+            // (...6125) is `memcmp`'d against a verification string Rosetta keeps
+            // embedded in its own binary — so we echo back exactly that blob,
+            // read live from the installed Rosetta binary (never embedded in
+            // carrick). The info ioctl (...6123) is not compared; Rosetta only
+            // requires a non-negative return, so a zeroed buffer suffices.
+            if let Some(outcome) =
+                rosetta_handshake_ioctl(&mut *cx.memory, ioctl_request, arg)
+            {
+                return Ok(outcome);
+            }
+
             // ── PTY ioctls ────────────────────────────────────────────────────────
             // If this fd is a pty master or slave, handle all tty ioctls here by
             // passing through to the host fd (real macOS pty). Return early so the
