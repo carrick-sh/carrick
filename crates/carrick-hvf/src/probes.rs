@@ -62,6 +62,18 @@ mod carrick_usdt {
     /// near-zero hot-path overhead (it never fires on the happy path). The key
     /// diagnostic for the c>=20 sibling-vCPU corruption faults.
     fn vcpu__fault(_: u64, _: u64, _: u64, _: u64, _: u64, _: i32) {}
+    /// Companion to `vcpu__fault` carrying the decoded fault diagnostics as
+    /// SCALARS (captured at probe-fire time — robust even when the fault kills
+    /// the process immediately, unlike a copyin-a-pointer probe whose action
+    /// runs too late). `insn` is the faulting instruction word (read host-side
+    /// at `elr` — DTrace can't copyin a guest VA); `rn` is the base register a
+    /// load/store dereferenced (`(insn>>5)&0x1f`); `xrn` is that register's
+    /// value, BEST-EFFORT (read after the EL1 trap trampoline, which may have
+    /// clobbered it). The AUTHORITATIVE faulting pointer is `far` (HW-latched):
+    /// for a data abort `far == base + imm`, so a `ldr xN,[xN,#8]` with far=0x19
+    /// means the base held 0x11=17. Lets a trace see the faulting access
+    /// WITHOUT an eprintln rebuild. Fires only at the fault.
+    fn vcpu__fault__regs(_: u64, _: u64, _: u64, _: u64, _: u32, _: u64) {}
     /// Fires when a signal is published for later delivery. `target_tid` is the
     /// guest tid for a thread-directed signal (tkill/tgkill route) or 0 for a
     /// process-directed one; `signum` the Linux signum; `kind` 1=thread-directed
@@ -372,6 +384,13 @@ pub fn execve_sysregs(sctlr: u64, ttbr0: u64, mair: u64) {
 /// `vcpu__fault` provider doc. Cheap: only fires at the fault.
 pub fn vcpu_fault(esr: u64, elr: u64, far: u64, x30: u64, sp: u64, tid: i32) {
     carrick_usdt::vcpu__fault!(|| (esr, elr, far, x30, sp, tid));
+}
+
+/// Emit the decoded fault diagnostics as scalars. See the `vcpu__fault__regs`
+/// provider doc. Scalars are captured at fire time, so this survives a fault
+/// that kills the process before DTrace's action runs. Fires only at the fault.
+pub fn vcpu_fault_regs(esr: u64, elr: u64, far: u64, insn: u64, rn: u32, xrn: u64) {
+    carrick_usdt::vcpu__fault__regs!(|| (esr, elr, far, insn, rn, xrn));
 }
 
 /// A signal was published for delivery. See `signal__publish`.
