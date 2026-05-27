@@ -648,6 +648,51 @@ impl SyscallDispatcher {
         }
     }
 
+    /// connect(2) core with always-wait-on-block semantics, for the io_uring
+    /// CONNECT op (the synchronous `connect` handler keeps its own non-blocking
+    /// branch). Returns Returned{0} on success/EISCONN, WaitOnFds (POLLOUT) while
+    /// the connect is in progress, or Errno otherwise.
+    pub(in crate::dispatch) fn connect_common(
+        &self,
+        fd: i32,
+        addr_addr: u64,
+        addrlen: u32,
+        memory: &impl GuestMemory,
+    ) -> DispatchOutcome {
+        let (host_fd, family) = match self.host_socket_lookup(fd) {
+            Ok(t) => t,
+            Err(errno) => return errno.into(),
+        };
+        let host_addr = match read_linux_sockaddr(memory, addr_addr, addrlen, family) {
+            Ok(bytes) => bytes,
+            Err(errno) => return errno.into(),
+        };
+        set_host_nonblocking(host_fd);
+        let rc = unsafe {
+            libc::connect(
+                host_fd,
+                host_addr.as_ptr() as *const _,
+                host_addr.len() as u32,
+            )
+        };
+        if rc == 0 {
+            return DispatchOutcome::Returned { value: 0 };
+        }
+        let e = HostSyscallError::last().linux_errno();
+        if e == LINUX_EISCONN {
+            return DispatchOutcome::Returned { value: 0 };
+        }
+        if e == LINUX_EINPROGRESS || e == LINUX_EALREADY || e == LINUX_EAGAIN {
+            return DispatchOutcome::WaitOnFds {
+                fds: vec![(host_fd, libc::POLLOUT)],
+                timeout: None,
+                on_timeout: -(LINUX_EINPROGRESS as i64),
+                block_signals: 0,
+            };
+        }
+        e.into()
+    }
+
     /// `sendmmsg(sockfd, msgvec, vlen, flags)` — Linux's batched
     /// sendmsg. glibc's getaddrinfo uses sendmmsg for DNS queries even
     /// when only a single message is sent; without this handler the

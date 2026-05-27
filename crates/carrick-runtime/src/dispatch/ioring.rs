@@ -25,7 +25,8 @@ use crate::linux_abi::{
     LinuxIoUringSqe, LinuxIovec, LinuxMsghdr, LINUX_IORING_FEAT_NODROP,
     LINUX_IORING_FEAT_SINGLE_MMAP, LINUX_IORING_OFF_CQ_RING, LINUX_IORING_OFF_SQES,
     LINUX_IORING_OFF_SQ_RING, LINUX_IORING_OP_CLOSE, LINUX_IORING_OP_FSYNC, LINUX_IORING_OP_NOP,
-    LINUX_IORING_OP_ACCEPT, LINUX_IORING_OP_POLL_ADD, LINUX_IORING_OP_READ, LINUX_IORING_OP_READV,
+    LINUX_IORING_OP_ACCEPT, LINUX_IORING_OP_CONNECT, LINUX_IORING_OP_POLL_ADD,
+    LINUX_IORING_OP_READ, LINUX_IORING_OP_READV,
     LINUX_IORING_OP_RECV, LINUX_IORING_OP_RECVMSG, LINUX_IORING_OP_SEND, LINUX_IORING_OP_SENDMSG,
     LINUX_IORING_OP_WRITE, LINUX_IORING_OP_WRITEV,
 };
@@ -159,6 +160,7 @@ fn is_async_op(op: u8) -> bool {
             | LINUX_IORING_OP_RECVMSG
             | LINUX_IORING_OP_POLL_ADD
             | LINUX_IORING_OP_ACCEPT
+            | LINUX_IORING_OP_CONNECT
     )
 }
 
@@ -630,6 +632,19 @@ impl SyscallDispatcher {
                     DispatchOutcome::WaitOnFds { fds, .. } => match fds.first() {
                         Some(&(h, e)) => AsyncOutcome::Block(h, e),
                         None => AsyncOutcome::Ready(-LINUX_EAGAIN),
+                    },
+                    _ => AsyncOutcome::Ready(-LINUX_EINVAL),
+                }
+            }
+            LINUX_IORING_OP_CONNECT => {
+                // sqe.addr = sockaddr, sqe.off = addrlen. connect_common waits on
+                // POLLOUT while in progress; we map its outcome to the ring.
+                match self.connect_common(sqe.fd, sqe.addr, sqe.off as u32, memory) {
+                    DispatchOutcome::Returned { value } => AsyncOutcome::Ready(value as i32),
+                    DispatchOutcome::Errno { errno } => AsyncOutcome::Ready(-errno),
+                    DispatchOutcome::WaitOnFds { fds, .. } => match fds.first() {
+                        Some(&(h, e)) => AsyncOutcome::Block(h, e),
+                        None => AsyncOutcome::Ready(-LINUX_EINVAL),
                     },
                     _ => AsyncOutcome::Ready(-LINUX_EINVAL),
                 }
