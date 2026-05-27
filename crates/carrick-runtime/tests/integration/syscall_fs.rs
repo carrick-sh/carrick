@@ -1660,6 +1660,59 @@ fn inotify_init_add_watch_read_dispatch_plumbing() {
 }
 
 #[test]
+fn open_o_tmpfile_creates_anonymous_writable_file() {
+    // O_TMPFILE returns an unnamed, writable regular file; verify the
+    // write -> lseek -> read round-trip, and that O_RDONLY|O_TMPFILE is EINVAL.
+    const LINUX_O_RDWR: u64 = 2;
+    const LINUX_O_TMPFILE: u64 = 0o20000000;
+    const LINUX_AT_FDCWD: u64 = (-100_i64) as u64;
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
+        d.dispatch(SyscallRequest::new(nr, SyscallArgs::from(args)), m, &reporter)
+            .unwrap()
+    };
+
+    // openat(AT_FDCWD, <dir>, O_TMPFILE|O_RDWR, 0600); pathname is unused for
+    // O_TMPFILE, so a null pointer is fine.
+    let fd = match run(
+        &mut dispatcher,
+        &mut memory,
+        56,
+        [LINUX_AT_FDCWD, 0, LINUX_O_TMPFILE | LINUX_O_RDWR, 0o600, 0, 0],
+    ) {
+        DispatchOutcome::Returned { value } => {
+            assert!(value >= 3, "tmpfile fd {value}");
+            value as u64
+        }
+        other => panic!("openat O_TMPFILE: {other:?}"),
+    };
+
+    memory.write_bytes(0x4100, b"hi").unwrap();
+    assert_eq!(
+        run(&mut dispatcher, &mut memory, 64, [fd, 0x4100, 2, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 2 }
+    );
+    // lseek(fd, 0, SEEK_SET) -> 0
+    assert_eq!(
+        run(&mut dispatcher, &mut memory, 62, [fd, 0, 0, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        run(&mut dispatcher, &mut memory, 63, [fd, 0x4200, 2, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 2 }
+    );
+    assert_eq!(memory.read_bytes(0x4200, 2).unwrap(), b"hi");
+
+    // O_TMPFILE requires write access; O_RDONLY|O_TMPFILE is EINVAL.
+    assert_eq!(
+        run(&mut dispatcher, &mut memory, 56, [LINUX_AT_FDCWD, 0, LINUX_O_TMPFILE, 0o600, 0, 0]),
+        DispatchOutcome::Errno { errno: 22 }
+    );
+}
+
+#[test]
 fn readv_reads_file_across_packed_iovecs() {
     let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
         "etc/motd",
