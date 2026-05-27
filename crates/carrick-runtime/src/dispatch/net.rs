@@ -547,7 +547,7 @@ impl SyscallDispatcher {
         recv_queue.drain(..take).collect()
     }
 
-    fn accept_common(
+    pub(in crate::dispatch) fn accept_common(
         &self,
         fd: Fd,
         addr: GuestPtr,

@@ -25,9 +25,9 @@ use crate::linux_abi::{
     LinuxIoUringSqe, LinuxIovec, LinuxMsghdr, LINUX_IORING_FEAT_NODROP,
     LINUX_IORING_FEAT_SINGLE_MMAP, LINUX_IORING_OFF_CQ_RING, LINUX_IORING_OFF_SQES,
     LINUX_IORING_OFF_SQ_RING, LINUX_IORING_OP_CLOSE, LINUX_IORING_OP_FSYNC, LINUX_IORING_OP_NOP,
-    LINUX_IORING_OP_POLL_ADD, LINUX_IORING_OP_READ, LINUX_IORING_OP_READV, LINUX_IORING_OP_RECV,
-    LINUX_IORING_OP_RECVMSG, LINUX_IORING_OP_SEND, LINUX_IORING_OP_SENDMSG, LINUX_IORING_OP_WRITE,
-    LINUX_IORING_OP_WRITEV,
+    LINUX_IORING_OP_ACCEPT, LINUX_IORING_OP_POLL_ADD, LINUX_IORING_OP_READ, LINUX_IORING_OP_READV,
+    LINUX_IORING_OP_RECV, LINUX_IORING_OP_RECVMSG, LINUX_IORING_OP_SEND, LINUX_IORING_OP_SENDMSG,
+    LINUX_IORING_OP_WRITE, LINUX_IORING_OP_WRITEV,
 };
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -158,6 +158,7 @@ fn is_async_op(op: u8) -> bool {
             | LINUX_IORING_OP_SENDMSG
             | LINUX_IORING_OP_RECVMSG
             | LINUX_IORING_OP_POLL_ADD
+            | LINUX_IORING_OP_ACCEPT
     )
 }
 
@@ -603,6 +604,34 @@ impl SyscallDispatcher {
                     Ok(put) => AsyncOutcome::Ready(put as i32),
                     Err(e) if e == LINUX_EAGAIN => AsyncOutcome::Block(hfd, libc::POLLOUT),
                     Err(e) => AsyncOutcome::Ready(-e),
+                }
+            }
+            LINUX_IORING_OP_ACCEPT => {
+                // Reuse the accept(2) path: sqe.addr = sockaddr-out, sqe.off =
+                // addrlen-out, sqe.op_flags = accept4 flags. It returns the new
+                // guest fd (Returned), or signals would-block as WaitOnFds/EAGAIN
+                // which we translate to a readiness wait on the listen socket.
+                let outcome = self.accept_common(
+                    Fd(sqe.fd),
+                    GuestPtr(sqe.addr),
+                    GuestPtr(sqe.off),
+                    memory,
+                    sqe.op_flags as i32,
+                );
+                match outcome {
+                    DispatchOutcome::Returned { value } => AsyncOutcome::Ready(value as i32),
+                    DispatchOutcome::Errno { errno } if errno == LINUX_EAGAIN => {
+                        match self.host_socket_fd(sqe.fd) {
+                            Some(h) => AsyncOutcome::Block(h, libc::POLLIN),
+                            None => AsyncOutcome::Ready(-LINUX_EINVAL),
+                        }
+                    }
+                    DispatchOutcome::Errno { errno } => AsyncOutcome::Ready(-errno),
+                    DispatchOutcome::WaitOnFds { fds, .. } => match fds.first() {
+                        Some(&(h, e)) => AsyncOutcome::Block(h, e),
+                        None => AsyncOutcome::Ready(-LINUX_EAGAIN),
+                    },
+                    _ => AsyncOutcome::Ready(-LINUX_EINVAL),
                 }
             }
             LINUX_IORING_OP_POLL_ADD => {

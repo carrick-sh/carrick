@@ -912,7 +912,7 @@ fn guest_unix_path_for(host_path: &[u8]) -> Option<Vec<u8>> {
 /// Translate a Linux-formatted sockaddr (read from guest memory) into the
 /// macOS BSD form. Returns the host-formatted bytes ready to hand to
 /// libc::bind/connect/sendto.
-pub(super) fn read_linux_sockaddr(
+pub(in crate::dispatch) fn read_linux_sockaddr(
     memory: &impl GuestMemory,
     addr: u64,
     addrlen: u32,
