@@ -432,6 +432,20 @@ impl SyscallDispatcher {
                     Err(e) => -e,
                 }
             }
+            LINUX_IORING_OP_CLOSE => {
+                // Same path as close(2): drop the fd from the table and free its
+                // host fd / pty entry. Also clear any io_uring side-table entry
+                // (closing a ring fd this way).
+                let removed = self.io.open_files.write().remove(&sqe.fd);
+                match removed {
+                    Some(open_file) => {
+                        self.close_open_file_and_free_pty(&open_file);
+                        self.io.io_uring_instances.write().remove(&sqe.fd);
+                        0
+                    }
+                    None => -LINUX_EBADF,
+                }
+            }
             _ => -LINUX_EINVAL,
         }
     }
