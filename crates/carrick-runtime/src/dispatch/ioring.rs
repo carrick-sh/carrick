@@ -24,8 +24,9 @@ use crate::linux_abi::{
     LinuxIoCqringOffsets, LinuxIoSqringOffsets, LinuxIoUringCqe, LinuxIoUringParams,
     LinuxIoUringSqe, LinuxIovec, LINUX_IORING_FEAT_NODROP, LINUX_IORING_FEAT_SINGLE_MMAP,
     LINUX_IORING_OFF_CQ_RING, LINUX_IORING_OFF_SQES, LINUX_IORING_OFF_SQ_RING,
-    LINUX_IORING_OP_CLOSE, LINUX_IORING_OP_FSYNC, LINUX_IORING_OP_NOP, LINUX_IORING_OP_READ,
-    LINUX_IORING_OP_READV, LINUX_IORING_OP_WRITE, LINUX_IORING_OP_WRITEV,
+    LINUX_IORING_OP_CLOSE, LINUX_IORING_OP_FSYNC, LINUX_IORING_OP_NOP, LINUX_IORING_OP_POLL_ADD,
+    LINUX_IORING_OP_READ, LINUX_IORING_OP_READV, LINUX_IORING_OP_RECV, LINUX_IORING_OP_SEND,
+    LINUX_IORING_OP_WRITE, LINUX_IORING_OP_WRITEV,
 };
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -136,6 +137,23 @@ pub(in crate::dispatch) struct IoUringState {
     pub ring_addr: u64,
     /// Base of the SQE-array mapping (IORING_OFF_SQES).
     pub sqes_addr: u64,
+}
+
+/// Outcome of attempting an async (readiness-driven) op: it either completed
+/// now, or would block and must wait on `host_fd` for `events`.
+enum AsyncOutcome {
+    Ready(i32),
+    Block(i32, i16),
+}
+
+/// Opcodes serviced via the kqueue/ThreadWaiter readiness path (SEND/RECV on
+/// sockets, POLL_ADD) — they may need to wait, so the enter loop routes them
+/// through `try_async_op` rather than the synchronous `io_uring_run_op`.
+fn is_async_op(op: u8) -> bool {
+    matches!(
+        op,
+        LINUX_IORING_OP_SEND | LINUX_IORING_OP_RECV | LINUX_IORING_OP_POLL_ADD
+    )
 }
 
 /// True for the opcodes carrick phase 1 actually executes (the rest complete
@@ -295,8 +313,14 @@ impl SyscallDispatcher {
         let mut sq_head = read_ring_u32(memory, ring + layout.sq_off.head as u64);
         let mut cq_tail = read_ring_u32(memory, ring + layout.cq_off.tail as u64);
 
-        let mut submitted = 0u32;
-        while submitted < to_submit && sq_head != sq_tail {
+        // Process submitted SQEs in order. Synchronous ops (and ready async ops)
+        // complete inline; an async op that would block hands off to the runtime's
+        // kqueue wait via WaitOnFds WITHOUT advancing sq_head — so the re-dispatch
+        // resumes at the same op (all ring state lives in guest memory, which
+        // persists across the re-dispatch). carrick assumes `to_submit` matches
+        // the number of SQEs the guest queued (the liburing invariant); ops run in
+        // submission order (head-of-line), not Linux's out-of-order async.
+        while sq_head != sq_tail {
             let arr_slot = ring + layout.sq_off.array as u64 + ((sq_head & sq_mask) as u64) * 4;
             let sqe_idx = read_ring_u32(memory, arr_slot);
             let sqe_addr = state.sqes_addr + (sqe_idx as u64) * 64;
@@ -304,12 +328,27 @@ impl SyscallDispatcher {
                 .read_bytes(sqe_addr, core::mem::size_of::<LinuxIoUringSqe>())
                 .ok()
                 .and_then(|b| LinuxIoUringSqe::read_from_prefix(&b).ok().map(|(s, _)| s));
-            let (user_data, res) = match sqe {
-                Some(sqe) => (sqe.user_data, self.io_uring_run_op(memory, &sqe)),
-                None => (0, -LINUX_EFAULT),
+            let res = match &sqe {
+                Some(sqe) if is_async_op(sqe.opcode) => match self.try_async_op(memory, sqe) {
+                    AsyncOutcome::Ready(res) => res,
+                    AsyncOutcome::Block(host_fd, events) => {
+                        // Persist progress and wait on readiness; the runtime
+                        // re-dispatches io_uring_enter, which resumes here.
+                        write_ring_u32(memory, ring + layout.sq_off.head as u64, sq_head);
+                        write_ring_u32(memory, ring + layout.cq_off.tail as u64, cq_tail);
+                        return DispatchOutcome::WaitOnFds {
+                            fds: vec![(host_fd, events)],
+                            timeout: None,
+                            on_timeout: 0,
+                            block_signals: 0,
+                        };
+                    }
+                },
+                Some(sqe) => self.io_uring_run_op(memory, sqe),
+                None => -LINUX_EFAULT,
             };
             let cqe = LinuxIoUringCqe {
-                user_data,
+                user_data: sqe.map(|s| s.user_data).unwrap_or(0),
                 res,
                 flags: 0,
             };
@@ -317,11 +356,13 @@ impl SyscallDispatcher {
             let _ = memory.write_bytes(cqe_addr, cqe.as_bytes());
             cq_tail = cq_tail.wrapping_add(1);
             sq_head = sq_head.wrapping_add(1);
-            submitted += 1;
         }
         // Publish the consumed SQ head and the produced CQ tail back to the guest.
         write_ring_u32(memory, ring + layout.sq_off.head as u64, sq_head);
         write_ring_u32(memory, ring + layout.cq_off.tail as u64, cq_tail);
+        // SQEs consumed = those no longer between head and tail (correct across a
+        // WaitOnFds re-dispatch, since sq_head lives in the persisted ring).
+        let submitted = to_submit.saturating_sub(sq_tail.wrapping_sub(sq_head));
         DispatchOutcome::Returned {
             value: submitted as i64,
         }
@@ -447,6 +488,71 @@ impl SyscallDispatcher {
                 }
             }
             _ => -LINUX_EINVAL,
+        }
+    }
+
+    /// Attempt a readiness-driven op without blocking: Ready(res) if it completed
+    /// or errored, Block(host_fd, poll_events) if it would block (the enter loop
+    /// then hands off to the runtime's kqueue wait). RECV/SEND go through the host
+    /// socket; POLL_ADD polls the fd with a zero timeout.
+    fn try_async_op(&self, memory: &mut impl GuestMemory, sqe: &LinuxIoUringSqe) -> AsyncOutcome {
+        match sqe.opcode {
+            LINUX_IORING_OP_RECV => {
+                let Some(hfd) = self.host_socket_fd(sqe.fd) else {
+                    return AsyncOutcome::Ready(-LINUX_EINVAL);
+                };
+                let len = sqe.len as usize;
+                let mut buf = vec![0u8; len];
+                let n =
+                    unsafe { libc::recv(hfd, buf.as_mut_ptr() as *mut _, len, libc::MSG_DONTWAIT) };
+                match n.host_syscall_errno() {
+                    Ok(got) => {
+                        let got = got as usize;
+                        if memory.write_bytes(sqe.addr, &buf[..got]).is_err() {
+                            return AsyncOutcome::Ready(-LINUX_EFAULT);
+                        }
+                        AsyncOutcome::Ready(got as i32)
+                    }
+                    Err(e) if e == LINUX_EAGAIN => AsyncOutcome::Block(hfd, libc::POLLIN),
+                    Err(e) => AsyncOutcome::Ready(-e),
+                }
+            }
+            LINUX_IORING_OP_SEND => {
+                let Some(hfd) = self.host_socket_fd(sqe.fd) else {
+                    return AsyncOutcome::Ready(-LINUX_EINVAL);
+                };
+                let Ok(buf) = memory.read_bytes(sqe.addr, sqe.len as usize) else {
+                    return AsyncOutcome::Ready(-LINUX_EFAULT);
+                };
+                let n = unsafe {
+                    libc::send(hfd, buf.as_ptr() as *const _, buf.len(), libc::MSG_DONTWAIT)
+                };
+                match n.host_syscall_errno() {
+                    Ok(put) => AsyncOutcome::Ready(put as i32),
+                    Err(e) if e == LINUX_EAGAIN => AsyncOutcome::Block(hfd, libc::POLLOUT),
+                    Err(e) => AsyncOutcome::Ready(-e),
+                }
+            }
+            LINUX_IORING_OP_POLL_ADD => {
+                let Some(hfd) = self
+                    .host_socket_fd(sqe.fd)
+                    .or_else(|| self.regular_host_file_fd(sqe.fd))
+                else {
+                    return AsyncOutcome::Ready(-LINUX_EINVAL);
+                };
+                let want = (sqe.op_flags & 0xFFFF) as i16;
+                let mut pfd = libc::pollfd {
+                    fd: hfd,
+                    events: want,
+                    revents: 0,
+                };
+                if unsafe { libc::poll(&mut pfd, 1, 0) } > 0 {
+                    AsyncOutcome::Ready(i32::from(pfd.revents))
+                } else {
+                    AsyncOutcome::Block(hfd, want)
+                }
+            }
+            _ => AsyncOutcome::Ready(-LINUX_EINVAL),
         }
     }
 }

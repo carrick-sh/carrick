@@ -1905,6 +1905,10 @@ pub const LINUX_IORING_OP_FSYNC: u8 = 3;
 pub const LINUX_IORING_OP_READ: u8 = 22;
 pub const LINUX_IORING_OP_WRITE: u8 = 23;
 pub const LINUX_IORING_OP_CLOSE: u8 = 19;
+// Async (readiness-driven) ops — serviced via the kqueue/ThreadWaiter wait path.
+pub const LINUX_IORING_OP_POLL_ADD: u8 = 6;
+pub const LINUX_IORING_OP_SEND: u8 = 26;
+pub const LINUX_IORING_OP_RECV: u8 = 27;
 
 // mmap offsets the guest passes to map each ring region off the io_uring fd.
 pub const LINUX_IORING_OFF_SQ_RING: u64 = 0;
