@@ -1804,9 +1804,132 @@ pub const LINUX_SO_ACCEPTCONN: i32 = 30;
 /// (three u32s). What `getsockopt(SOL_SOCKET, SO_PEERCRED)` returns.
 pub const LINUX_UCRED_SIZE: usize = 12;
 
+// ===== io_uring (WS-H4-B1) =====
+// The submission/completion-queue-entry ABI is fixed (the guest fills SQEs and
+// reads CQEs), so these structs must match the kernel byte-for-byte. The ring
+// region offsets are flexible — carrick reports its own layout via the
+// io_sqring/io_cqring offsets in io_uring_params.
+
+/// `struct io_uring_sqe` — a 64-byte submission-queue entry. The kernel uses
+/// unions for several fields; we flatten to the members carrick's phase-1
+/// opcodes touch (`off`/`addr`/`len`/`op_flags` cover the rw + fsync ops).
+#[repr(C)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable,
+)]
+pub struct LinuxIoUringSqe {
+    pub opcode: u8,
+    pub flags: u8,
+    pub ioprio: u16,
+    pub fd: i32,
+    pub off: u64,          // union: off / addr2
+    pub addr: u64,         // union: addr / splice_off_in
+    pub len: u32,
+    pub op_flags: u32,     // union: rw_flags / fsync_flags / poll_events / …
+    pub user_data: u64,
+    pub buf_index: u16,    // union: buf_index / buf_group
+    pub personality: u16,
+    pub splice_fd_in: i32, // union: splice_fd_in / file_index
+    pub pad2: [u64; 2],
+}
+
+/// `struct io_uring_cqe` — a 16-byte completion-queue entry.
+#[repr(C)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable,
+)]
+pub struct LinuxIoUringCqe {
+    pub user_data: u64,
+    pub res: i32,
+    pub flags: u32,
+}
+
+/// `struct io_sqring_offsets` — where each SQ-ring field sits in the mmapped
+/// SQ region, reported back to the guest by `io_uring_setup`.
+#[repr(C)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable,
+)]
+pub struct LinuxIoSqringOffsets {
+    pub head: u32,
+    pub tail: u32,
+    pub ring_mask: u32,
+    pub ring_entries: u32,
+    pub flags: u32,
+    pub dropped: u32,
+    pub array: u32,
+    pub resv1: u32,
+    pub resv2: u64,
+}
+
+/// `struct io_cqring_offsets`.
+#[repr(C)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable,
+)]
+pub struct LinuxIoCqringOffsets {
+    pub head: u32,
+    pub tail: u32,
+    pub ring_mask: u32,
+    pub ring_entries: u32,
+    pub overflow: u32,
+    pub cqes: u32,
+    pub flags: u32,
+    pub resv1: u32,
+    pub resv2: u64,
+}
+
+/// `struct io_uring_params` — in/out argument of `io_uring_setup`.
+#[repr(C)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable,
+)]
+pub struct LinuxIoUringParams {
+    pub sq_entries: u32,
+    pub cq_entries: u32,
+    pub flags: u32,
+    pub sq_thread_cpu: u32,
+    pub sq_thread_idle: u32,
+    pub features: u32,
+    pub wq_fd: u32,
+    pub resv: [u32; 3],
+    pub sq_off: LinuxIoSqringOffsets,
+    pub cq_off: LinuxIoCqringOffsets,
+}
+
+// io_uring opcodes (subset carrick phase 1 services; others → CQE -EINVAL).
+pub const LINUX_IORING_OP_NOP: u8 = 0;
+pub const LINUX_IORING_OP_READV: u8 = 1;
+pub const LINUX_IORING_OP_WRITEV: u8 = 2;
+pub const LINUX_IORING_OP_FSYNC: u8 = 3;
+pub const LINUX_IORING_OP_READ: u8 = 22;
+pub const LINUX_IORING_OP_WRITE: u8 = 23;
+pub const LINUX_IORING_OP_CLOSE: u8 = 19;
+
+// mmap offsets the guest passes to map each ring region off the io_uring fd.
+pub const LINUX_IORING_OFF_SQ_RING: u64 = 0;
+pub const LINUX_IORING_OFF_CQ_RING: u64 = 0x0800_0000;
+pub const LINUX_IORING_OFF_SQES: u64 = 0x1000_0000;
+
+// io_uring_params.features bits carrick advertises.
+pub const LINUX_IORING_FEAT_SINGLE_MMAP: u32 = 1 << 0;
+pub const LINUX_IORING_FEAT_NODROP: u32 = 1 << 1;
+
 #[cfg(test)]
 mod kernel_abi_tests {
     use super::*;
+
+    #[test]
+    fn io_uring_struct_sizes_match_kernel_abi() {
+        // The guest fills SQEs and reads CQEs/params at these exact sizes; a
+        // mismatch silently corrupts the ring. (Linux: sqe 64, cqe 16,
+        // sqring/cqring offsets 40, params 120.)
+        assert_eq!(core::mem::size_of::<LinuxIoUringSqe>(), 64);
+        assert_eq!(core::mem::size_of::<LinuxIoUringCqe>(), 16);
+        assert_eq!(core::mem::size_of::<LinuxIoSqringOffsets>(), 40);
+        assert_eq!(core::mem::size_of::<LinuxIoCqringOffsets>(), 40);
+        assert_eq!(core::mem::size_of::<LinuxIoUringParams>(), 120);
+    }
 
     #[test]
     fn termios_kernel_abi_size_is_36_not_44() {

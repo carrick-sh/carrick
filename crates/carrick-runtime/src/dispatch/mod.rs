@@ -392,6 +392,7 @@ mod abi_args;
 mod creds;
 mod epoll_shim;
 pub(crate) use epoll_shim::{notify_inmem_epoll, register_epoll_kqueue, unregister_epoll_kqueue};
+mod ioring;
 mod fd_table;
 #[macro_use]
 mod fs;
