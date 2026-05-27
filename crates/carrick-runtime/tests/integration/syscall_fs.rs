@@ -1539,6 +1539,62 @@ fn splice_moves_bytes_between_rootfs_files_pipes_and_stdout() {
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn splice_moves_bytes_between_sockets_and_pipes() {
+    // Go's io.Copy(pipe, conn) / io.Copy(conn, pipe) splices between a socket
+    // and a pipe. socket->pipe was the gap (socket input fell through to the
+    // sendfile path and failed); pipe->socket already worked via write_output_fd.
+    const LINUX_AF_UNIX: u64 = 1;
+    const LINUX_SOCK_STREAM: u64 = 1;
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x600]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    let ret = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| -> i64 {
+        match d
+            .dispatch(SyscallRequest::new(nr, SyscallArgs::from(args)), m, &reporter)
+            .unwrap()
+        {
+            DispatchOutcome::Returned { value } => value,
+            other => panic!("nr {nr} unexpected outcome: {other:?}"),
+        }
+    };
+
+    // socketpair(AF_UNIX, SOCK_STREAM) @0x4000; pipe2 @0x4010.
+    assert_eq!(
+        ret(&mut dispatcher, &mut memory, 199, [LINUX_AF_UNIX, LINUX_SOCK_STREAM, 0, 0x4000, 0, 0]),
+        0
+    );
+    let sock = read_fd_pair(&memory, 0x4000);
+    assert_eq!(ret(&mut dispatcher, &mut memory, 59, [0x4010, 0, 0, 0, 0, 0]), 0);
+    let pipe = read_fd_pair(&memory, 0x4010);
+
+    // socket -> pipe: write "ping" into sock end B, splice sock end A -> pipe
+    // write end, read it back off the pipe read end.
+    memory.write_bytes(0x4100, b"ping").unwrap();
+    assert_eq!(ret(&mut dispatcher, &mut memory, 64, [sock.write_fd as u64, 0x4100, 4, 0, 0, 0]), 4);
+    assert_eq!(
+        ret(&mut dispatcher, &mut memory, 76, [sock.read_fd as u64, 0, pipe.write_fd as u64, 0, 4, 0]),
+        4,
+        "splice socket->pipe must move bytes"
+    );
+    assert_eq!(ret(&mut dispatcher, &mut memory, 63, [pipe.read_fd as u64, 0x4200, 4, 0, 0, 0]), 4);
+    assert_eq!(memory.read_bytes(0x4200, 4).unwrap(), b"ping");
+
+    // pipe -> socket: write "pong" into the pipe, splice pipe read end -> sock
+    // end A, recv it on sock end B.
+    memory.write_bytes(0x4300, b"pong").unwrap();
+    assert_eq!(ret(&mut dispatcher, &mut memory, 64, [pipe.write_fd as u64, 0x4300, 4, 0, 0, 0]), 4);
+    assert_eq!(
+        ret(&mut dispatcher, &mut memory, 76, [pipe.read_fd as u64, 0, sock.read_fd as u64, 0, 4, 0]),
+        4,
+        "splice pipe->socket must move bytes"
+    );
+    assert_eq!(ret(&mut dispatcher, &mut memory, 63, [sock.write_fd as u64, 0x4400, 4, 0, 0, 0]), 4);
+    assert_eq!(memory.read_bytes(0x4400, 4).unwrap(), b"pong");
+}
+
 #[test]
 fn readv_reads_file_across_packed_iovecs() {
     let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
