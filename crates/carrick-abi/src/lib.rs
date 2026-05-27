@@ -72,6 +72,14 @@ pub const LINUX_SA_RESTORER: u64 = 0x0400_0000;
 /// handlers with this flag.
 pub const LINUX_SA_ONSTACK: u64 = 0x0800_0000;
 
+/// `SA_RESTART`: a blocking, restartable syscall interrupted by this handler is
+/// transparently restarted (the kernel's `ERESTARTSYS` path) instead of failing
+/// with `EINTR`. LTP's `tst_test` installs SA_RESTART handlers for its
+/// SIGALRM/SIGUSR1 timeout+heartbeat, so the parent's `SAFE_WAITPID` reap must
+/// restart when one fires — without this carrick surfaced EINTR and TBROK'd
+/// nearly the whole suite.
+pub const LINUX_SA_RESTART: u64 = 0x1000_0000;
+
 pub const LINUX_DIRENT64_HEADER_SIZE: usize = core::mem::size_of::<LinuxDirent64Header>();
 
 #[repr(C, packed)]

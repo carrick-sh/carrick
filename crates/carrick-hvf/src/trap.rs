@@ -83,7 +83,19 @@ pub trait SyscallTrap {
         // Some((si_code, si_addr)) for a synchronous fault (SIGSEGV/SIGBUS),
         // None for a SI_USER-shaped delivery.
         fault_siginfo: Option<(i32, u64)>,
+        // SA_RESTART: this handler interrupted a restartable syscall that
+        // returned EINTR. Resume at the `svc` (not after it) with the original
+        // arg0 restored, so the guest re-executes the syscall after the handler
+        // returns. Valid only on the syscall-boundary path (`interrupted_pc`
+        // is None); ignored otherwise.
+        restart_syscall: bool,
     ) -> Result<(), TrapError>;
+    /// The Linux syscall number of the most recently dispatched `svc`, used to
+    /// decide whether an interrupted syscall is in the SA_RESTART-restartable
+    /// set. `None` before the first syscall / on traps with no vCPU.
+    fn last_syscall_nr(&self) -> Option<u64> {
+        None
+    }
     /// Restore vCPU state from the `CarrickSigframe` at SP_EL0. Called
     /// when the guest invokes `rt_sigreturn(2)`. Does NOT advance PC
     /// past the syscall the way `complete_syscall` does — the restored
@@ -593,6 +605,12 @@ struct HvfInner {
     /// descriptor stores so a concurrent sibling hardware walk stays safe
     /// without quiescing.
     page_tables: std::sync::Arc<parking_lot::Mutex<Option<crate::page_table::PageTableManager>>>,
+    /// The Linux syscall number (x8) and original arg0 (x0) of the most recent
+    /// `svc` trap, captured before the dispatcher overwrites x0 with the retval.
+    /// Used to restart an `EINTR`'d restartable syscall under SA_RESTART: the
+    /// handler-injection path rewinds PC to the `svc` and restores this x0.
+    last_syscall_nr: Option<u64>,
+    last_syscall_orig_x0: u64,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -842,6 +860,10 @@ impl HvfTrapEngine {
         self.inner.complete_syscall(return_value)
     }
 
+    pub fn last_syscall_nr(&self) -> Option<u64> {
+        self.inner.last_syscall_nr()
+    }
+
     /// Toggle hardware x86_64 Total Store Ordering on this vCPU by setting or
     /// clearing `ACTLR_EL1.EnTSO` (bit index 1). Apple Rosetta-translated
     /// guests request this via `prctl(PR_SET_MEM_MODEL, PR_SET_MEM_MODEL_TSO)`
@@ -991,6 +1013,7 @@ impl HvfTrapEngine {
         altstack: Option<(u64, u64)>,
         saved_sigmask: u64,
         fault_siginfo: Option<(i32, u64)>,
+        restart_syscall: bool,
     ) -> Result<(), TrapError> {
         self.inner.inject_signal(
             signum,
@@ -1001,6 +1024,7 @@ impl HvfTrapEngine {
             altstack,
             saved_sigmask,
             fault_siginfo,
+            restart_syscall,
         )
     }
 
@@ -1015,6 +1039,7 @@ impl HvfTrapEngine {
         _altstack: Option<(u64, u64)>,
         _saved_sigmask: u64,
         _fault_siginfo: Option<(i32, u64)>,
+        _restart_syscall: bool,
     ) -> Result<(), TrapError> {
         Err(TrapError::UnsupportedPlatform)
     }
@@ -1098,6 +1123,8 @@ impl HvfTrapEngine {
                 is_forked_child: false,
                 protections: std::sync::Arc::new(MemoryProtections::default()),
                 page_tables: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+                last_syscall_nr: None,
+                last_syscall_orig_x0: 0,
             }),
         })
     }
@@ -1718,6 +1745,12 @@ impl HvfInner {
             x5: self.vcpu.get_reg(Reg::X5).map_err(hvf_error)?,
             x8: self.vcpu.get_reg(Reg::X8).map_err(hvf_error)?,
         };
+        // Snapshot the syscall number + original arg0 before the dispatcher
+        // overwrites x0 with the retval, so an SA_RESTART handler that
+        // interrupts this syscall can restart it (rewind PC to the `svc`,
+        // restore this x0) instead of surfacing EINTR.
+        self.last_syscall_nr = Some(frame.x8);
+        self.last_syscall_orig_x0 = frame.x0;
         // Guest EL0 PC at the trap. HVF sets ELR_EL1 to the
         // instruction-after-svc when it dispatches the synchronous
         // exception, so this is the address the guest will resume at
@@ -1748,6 +1781,10 @@ impl HvfInner {
             stack_guest_end,
         });
         Ok(Some(frame))
+    }
+
+    fn last_syscall_nr(&self) -> Option<u64> {
+        self.last_syscall_nr
     }
 
     fn complete_syscall(&mut self, return_value: i64) -> Result<(), TrapError> {
@@ -2056,6 +2093,7 @@ impl HvfInner {
         altstack: Option<(u64, u64)>,
         saved_sigmask: u64,
         fault_siginfo: Option<(i32, u64)>,
+        restart_syscall: bool,
     ) -> Result<(), TrapError> {
         use applevisor::prelude::*;
         use zerocopy::IntoBytes;
@@ -2069,7 +2107,15 @@ impl HvfInner {
         // syscall's retval. Snapshot that value (not the pre-syscall
         // arg0) so the handler-return path resumes with the right
         // retval visible.
-        if let Some(retval) = pending_syscall_retval {
+        //
+        // SA_RESTART (restart_syscall): the interrupted syscall returned EINTR
+        // and its handler is restartable. Restore the ORIGINAL arg0 instead so
+        // that, after rt_sigreturn rewinds PC to the `svc` (below), the guest
+        // re-executes the syscall with its real arguments (x8=sysno is
+        // untouched by complete_syscall; x1..x5 were never clobbered).
+        if restart_syscall {
+            frame.saved_x[0] = self.last_syscall_orig_x0;
+        } else if let Some(retval) = pending_syscall_retval {
             frame.saved_x[0] = retval as u64;
         }
         // Resume address after the handler returns. On a syscall-boundary
@@ -2095,6 +2141,14 @@ impl HvfInner {
             }
             None => self.vcpu.get_sys_reg(SysReg::ELR_EL1).map_err(hvf_error)?,
         };
+        // SA_RESTART: rewind PC by one instruction (4 bytes) so it points back
+        // at the `svc` rather than the instruction after it. After the handler
+        // returns via rt_sigreturn the guest re-executes the syscall (the
+        // kernel's ERESTARTSYS). Only valid on the syscall-boundary path
+        // (caller guarantees restart_syscall ⇒ interrupted_pc is None).
+        if restart_syscall {
+            frame.saved_pc = frame.saved_pc.wrapping_sub(4);
+        }
         frame.saved_sp = self.vcpu.get_sys_reg(SysReg::SP_EL0).map_err(hvf_error)?;
         // Snapshot the interrupted code's PSTATE (incl. NZCV condition flags),
         // restored verbatim by rt_sigreturn → eret. The correct source differs
@@ -2523,6 +2577,8 @@ impl HvfInner {
             is_forked_child: pid == 0,
             protections: inherited_protections,
             page_tables: inherited_page_tables,
+            last_syscall_nr: None,
+            last_syscall_orig_x0: 0,
         };
         replace_destroyed_hvf_inner(self, new_inner);
 
@@ -2637,6 +2693,8 @@ impl HvfInner {
             is_forked_child: false,
             protections,
             page_tables,
+            last_syscall_nr: None,
+            last_syscall_orig_x0: 0,
         };
 
         for mapping in mappings {
@@ -2769,6 +2827,8 @@ impl HvfInner {
             // gone. The new image starts with none until it mmaps them.
             protections: std::sync::Arc::new(MemoryProtections::default()),
             page_tables: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+            last_syscall_nr: None,
+            last_syscall_orig_x0: 0,
         };
         replace_destroyed_hvf_inner(self, new_inner);
 
@@ -2893,6 +2953,10 @@ impl HvfInner {
 
     fn complete_syscall(&mut self, _: i64) -> Result<(), TrapError> {
         Err(TrapError::UnsupportedPlatform)
+    }
+
+    fn last_syscall_nr(&self) -> Option<u64> {
+        None
     }
 
     fn read_guest_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
@@ -3479,6 +3543,7 @@ impl SyscallTrap for HvfTrapEngine {
         altstack: Option<(u64, u64)>,
         saved_sigmask: u64,
         fault_siginfo: Option<(i32, u64)>,
+        restart_syscall: bool,
     ) -> Result<(), TrapError> {
         HvfTrapEngine::inject_signal(
             self,
@@ -3490,7 +3555,12 @@ impl SyscallTrap for HvfTrapEngine {
             altstack,
             saved_sigmask,
             fault_siginfo,
+            restart_syscall,
         )
+    }
+
+    fn last_syscall_nr(&self) -> Option<u64> {
+        self.last_syscall_nr()
     }
 
     fn restore_from_sigframe(&mut self) -> Result<u64, TrapError> {
