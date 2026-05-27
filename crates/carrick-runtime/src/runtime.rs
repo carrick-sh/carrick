@@ -1924,10 +1924,36 @@ where
             )?;
             Ok(Some(PendingSignalAction { term_signal: None }))
         }
+        // No registered handler → the kernel takes the signal's DEFAULT action.
+        // For SIGCHLD/SIGURG/SIGWINCH that action is IGNORE, not terminate, so the
+        // signal is silently dropped. Without this, a no-handler SIGURG (Go's
+        // async-preempt / GC stack-scan signal, which flies around constantly and
+        // which a freshly fork+exec'd guest may receive before its runtime
+        // installs the handler) was treated as a terminating default action:
+        // `forked_child_die_by_signal(23)` then `raise(SIGURG)` (host default =
+        // ignore, a no-op) fell through to `_exit(128+23)=151` — the ~30% flaky
+        // `go build` failure (multithreaded `go` fork+exec'ing `go tool compile`).
+        // Linux ignores it; so must we.
+        None if is_default_ignore_signal(pending) => {
+            Ok(Some(PendingSignalAction { term_signal: None }))
+        }
         None => Ok(Some(PendingSignalAction {
             term_signal: Some(pending),
         })),
     }
+}
+
+/// Signals whose DEFAULT disposition is "ignore" (Linux `Ign`): a no-handler
+/// instance is dropped, not a terminating default action. SIGCONT (resume) and
+/// the stop signals are handled separately; everything else defaults to
+/// terminate/core.
+fn is_default_ignore_signal(signum: i32) -> bool {
+    matches!(
+        signum,
+        crate::linux_abi::LINUX_SIGCHLD
+            | crate::linux_abi::LINUX_SIGURG
+            | crate::linux_abi::LINUX_SIGWINCH
+    )
 }
 
 /// Block on a cross-process (`MAP_SHARED`) futex via the host `__ulock`,
@@ -2562,6 +2588,21 @@ impl SyscallTrap for HvfTrapEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_ignore_signals_are_not_terminating() {
+        // SIGCHLD/SIGURG/SIGWINCH default to Ign — a no-handler instance is
+        // dropped, not terminated. SIGURG=23 is the one that made `go build`
+        // flaky (raise(SIGURG) is a host no-op → _exit(128+23)=151).
+        assert!(is_default_ignore_signal(crate::linux_abi::LINUX_SIGURG));
+        assert!(is_default_ignore_signal(crate::linux_abi::LINUX_SIGCHLD));
+        assert!(is_default_ignore_signal(crate::linux_abi::LINUX_SIGWINCH));
+        // Genuinely-terminating defaults must NOT be treated as ignore.
+        assert!(!is_default_ignore_signal(crate::linux_abi::LINUX_SIGINT)); // 2
+        assert!(!is_default_ignore_signal(crate::linux_abi::LINUX_SIGTERM)); // 15
+        assert!(!is_default_ignore_signal(13)); // SIGPIPE: default IS terminate
+        assert!(!is_default_ignore_signal(11)); // SIGSEGV
+    }
 
     // Linux asm-generic/siginfo.h SIGTRAP si_codes.
     const SIGTRAP: i32 = 5;
