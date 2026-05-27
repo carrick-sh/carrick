@@ -1023,12 +1023,16 @@ mod tests {
 
     #[test]
     fn proc_maps_uses_vfs_owned_context() {
+        // Reserve a 64 KiB heap region but set the program break partway in, at an
+        // unaligned offset. Real Linux reports page-aligned VMA bounds, so the [heap]
+        // line must end at the break rounded UP to carrick's 16 KiB page — not at the
+        // raw break, and not at the full region end. 0x1234 rounds up to 0x4000.
         let ctx = SyntheticProcContext {
             executable_path: "/bin/demo".to_owned(),
             argv: vec!["/bin/demo".to_owned()],
             address_space_regions: Some(vec![ProcMapsEntry {
                 start: LINUX_HEAP_BASE,
-                end: LINUX_HEAP_BASE + 0x4000,
+                end: LINUX_HEAP_BASE + 0x10000,
                 read: true,
                 write: true,
                 execute: false,
@@ -1039,6 +1043,9 @@ mod tests {
         };
         let maps = String::from_utf8(synthetic_file("/proc/self/maps", &ctx).unwrap()).unwrap();
         assert!(maps.contains("[heap]"));
-        assert!(maps.contains(&format!("{:016x}", LINUX_HEAP_BASE + 0x1234)));
+        // The heap ends at the page-aligned break (0x1234 → 0x4000), proving the
+        // VFS-owned brk_current drives the end rather than the reserved region end.
+        assert!(maps.contains(&format!("{:016x}", LINUX_HEAP_BASE + 0x4000)));
+        assert!(!maps.contains(&format!("{:016x}", LINUX_HEAP_BASE + 0x10000)));
     }
 }
