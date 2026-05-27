@@ -87,7 +87,7 @@ impl SyscallDispatcher {
 
         if requested != 0 {
             let valid_hint = requested.is_multiple_of(LINUX_PAGE_SIZE)
-                && range_within(requested, length, LINUX_MMAP_BASE, LINUX_MMAP_SIZE);
+                && range_within(requested, length, LINUX_MMAP_BASE, crate::memory::mmap_arena_size());
             if valid_hint {
                 let mut mem = self.mem.lock();
                 let end = requested.checked_add(length)?;
@@ -109,7 +109,7 @@ impl SyscallDispatcher {
             return Some((s, true));
         }
         let address = align_up_u64(mem.mmap_next, LINUX_PAGE_SIZE)?;
-        if !range_within(address, length, LINUX_MMAP_BASE, LINUX_MMAP_SIZE) {
+        if !range_within(address, length, LINUX_MMAP_BASE, crate::memory::mmap_arena_size()) {
             return None;
         }
         mem.mmap_next = address.checked_add(length)?;
@@ -303,7 +303,7 @@ impl SyscallDispatcher {
             // page reclaimed from a prior munmap (which invalidated it) must be
             // valid+RW again, and a PROT_NONE mmap must actually fault. No-op
             // (no TLBI) when the page is already at the target protection.
-            let in_arena = range_within(address, length, LINUX_MMAP_BASE, LINUX_MMAP_SIZE);
+            let in_arena = range_within(address, length, LINUX_MMAP_BASE, crate::memory::mmap_arena_size());
 
             let prot_none = prot & (LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC) == 0;
             if prot_none && flags & LINUX_MAP_ANONYMOUS != 0 {
@@ -422,7 +422,7 @@ impl SyscallDispatcher {
                 this.writeback_shared(cx, &alloc, true);
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
-            if !range_within(address.0, length, LINUX_MMAP_BASE, LINUX_MMAP_SIZE) {
+            if !range_within(address.0, length, LINUX_MMAP_BASE, crate::memory::mmap_arena_size()) {
                 return Ok(LINUX_EINVAL.into());
             }
             if let Some(len) = align_up_u64(length, LINUX_PAGE_SIZE) {
@@ -546,7 +546,7 @@ impl SyscallDispatcher {
             if flags & !(LINUX_MREMAP_MAYMOVE | LINUX_MREMAP_FIXED | LINUX_MREMAP_DONTUNMAP) != 0 {
                 return Ok(LINUX_EINVAL.into());
             }
-            if !range_within(old_address.0, old_size, LINUX_MMAP_BASE, LINUX_MMAP_SIZE) {
+            if !range_within(old_address.0, old_size, LINUX_MMAP_BASE, crate::memory::mmap_arena_size()) {
                 return Ok(LINUX_EINVAL.into());
             }
             let Some(new_size) = align_up_u64(new_size_req, LINUX_PAGE_SIZE) else {
@@ -562,7 +562,7 @@ impl SyscallDispatcher {
                 let Some(new_end) = old_address.0.checked_add(new_size) else {
                     return Ok(LINUX_ENOMEM.into());
                 };
-                if range_within(old_address.0, new_size, LINUX_MMAP_BASE, LINUX_MMAP_SIZE) {
+                if range_within(old_address.0, new_size, LINUX_MMAP_BASE, crate::memory::mmap_arena_size()) {
                     this.mem.lock().mmap_next = new_end;
                     return Ok(DispatchOutcome::Returned {
                         value: old_address.0 as i64,
@@ -620,7 +620,7 @@ impl SyscallDispatcher {
                 // faults during EL0 execution) by editing the stage-1 page
                 // tables. Scoped to the private mmap arena for now — the shared
                 // aperture and image/heap regions keep host-side checks only.
-                if range_within(address.0, length, LINUX_MMAP_BASE, LINUX_MMAP_SIZE)
+                if range_within(address.0, length, LINUX_MMAP_BASE, crate::memory::mmap_arena_size())
                     && cx.memory.protect_range(address.0, len, prot).is_err()
                 {
                     return Ok(LINUX_ENOMEM.into());

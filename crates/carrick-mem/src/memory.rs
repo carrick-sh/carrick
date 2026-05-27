@@ -166,6 +166,36 @@ pub const LINUX_MMAP_BASE: u64 = 0x60_0000_0000; // 384 GiB
 // anonymous/private arena ranges are tracked in the dispatcher and reused.
 pub const LINUX_MMAP_SIZE: u64 = 32 * 1024 * 1024 * 1024;
 pub const LINUX_INTERPRETER_BASE: u64 = 0x80_0000_0000; // 512 GiB
+
+/// Largest the mmap arena may grow to before colliding with the interpreter
+/// base — the whole VA gap between `LINUX_MMAP_BASE` and `LINUX_INTERPRETER_BASE`
+/// (128 GiB), which the boot identity-map page tables already cover.
+pub const LINUX_MMAP_SIZE_MAX: u64 = LINUX_INTERPRETER_BASE - LINUX_MMAP_BASE;
+
+/// Resolve the arena size (bytes) from a requested GiB count, clamped to
+/// `[LINUX_MMAP_SIZE, LINUX_MMAP_SIZE_MAX]` — never below the 32 GiB Go-multithread
+/// floor nor past the interpreter base. `None` (unset) keeps the 32 GiB default.
+fn resolve_arena_size(requested_gib: Option<u64>) -> u64 {
+    match requested_gib {
+        Some(gib) => gib
+            .saturating_mul(1024 * 1024 * 1024)
+            .clamp(LINUX_MMAP_SIZE, LINUX_MMAP_SIZE_MAX),
+        None => LINUX_MMAP_SIZE,
+    }
+}
+
+/// The runtime mmap-arena size. Defaults to 32 GiB; `CARRICK_MMAP_ARENA_GIB=<n>`
+/// raises it (clamped to [32, 128] GiB) for large-heap workloads (JVM, databases)
+/// that reserve more than 32 GiB of anonymous address space. Cached on first use.
+pub fn mmap_arena_size() -> u64 {
+    static SIZE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        let requested = std::env::var("CARRICK_MMAP_ARENA_GIB")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok());
+        resolve_arena_size(requested)
+    })
+}
 // Stable shared aperture for guest MAP_SHARED mmaps. The whole window is
 // hv_vm_map'd ONCE at boot (host MAP_ANON|MAP_SHARED|MAP_NORESERVE; see
 // `linux_runtime_regions`), then guest MAP_SHARED|MAP_ANON and MAP_SHARED file
@@ -1416,7 +1446,7 @@ fn linux_runtime_regions() -> Result<Vec<MemoryRegion>, AddressSpaceError> {
         )?,
         zeroed_region(
             LINUX_MMAP_BASE,
-            LINUX_MMAP_SIZE,
+            mmap_arena_size(),
             SegmentPerms {
                 read: true,
                 write: true,
@@ -1575,6 +1605,29 @@ impl GuestMemory for AddressSpace {
         }
         region.bytes[offset..end].copy_from_slice(bytes);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod arena_size_tests {
+    use super::*;
+
+    #[test]
+    fn arena_size_defaults_and_clamps() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        // Unset -> 32 GiB default.
+        assert_eq!(resolve_arena_size(None), LINUX_MMAP_SIZE);
+        assert_eq!(resolve_arena_size(None), 32 * GIB);
+        // A valid raise within [32, 128] GiB is honored.
+        assert_eq!(resolve_arena_size(Some(64)), 64 * GIB);
+        assert_eq!(resolve_arena_size(Some(128)), 128 * GIB);
+        // Below the 32 GiB floor clamps up (never shrink the Go-multithread arena).
+        assert_eq!(resolve_arena_size(Some(8)), LINUX_MMAP_SIZE);
+        // Past the interpreter base clamps down to the max, and can't overflow.
+        assert_eq!(resolve_arena_size(Some(1000)), LINUX_MMAP_SIZE_MAX);
+        assert_eq!(resolve_arena_size(Some(u64::MAX)), LINUX_MMAP_SIZE_MAX);
+        // The arena never collides with the interpreter base.
+        assert!(LINUX_MMAP_BASE + LINUX_MMAP_SIZE_MAX <= LINUX_INTERPRETER_BASE);
     }
 }
 
