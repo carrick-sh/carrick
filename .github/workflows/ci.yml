@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref to save runner minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Compile + lint + host tests. carrick-runtime links Hypervisor.framework, so
+  # this must run on macOS/arm64 — but these steps never launch a guest vCPU, so
+  # a GitHub-hosted runner (no hypervisor entitlement / no nested virt) is fine.
+  check:
+    name: fmt · clippy · build · unit tests
+    runs-on: macos-14 # Apple Silicon
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      # The no-panic gate: unwrap/expect/panic/todo/unimplemented are denied via
+      # crate-level attributes, and `-D warnings` promotes every other lint too.
+      - name: Clippy (no-panic gate)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --workspace
+
+      # `--lib` runs the crate unit tests only; the HVF-dependent integration
+      # binaries (trap_hvf, runtime_loop, interactive_tty, …) need an entitled
+      # vCPU and run in the self-hosted job below. The pure-logic integration
+      # suites that do NOT touch HVF are listed explicitly so they still gate here.
+      - name: Unit tests
+        run: cargo test --workspace --lib
+
+      - name: Host integration tests (no HVF)
+        run: |
+          cargo test -p carrick-runtime --test integration
+          cargo test -p carrick-runtime --test syscall_process
+          cargo test -p carrick-engine
+          cargo test -p carrick-image
+
+  # Full HVF runtime + differential conformance vs Docker. Requires a self-hosted
+  # Apple-Silicon runner that (a) holds the com.apple.security.hypervisor
+  # entitlement and (b) has Docker available. GitHub-hosted macOS runners can do
+  # neither, so this job is DORMANT until a runner exists: set the repo variable
+  # CARRICK_SELF_HOSTED=true (and register a runner with the matching labels) to
+  # enable it. Defined now so the pipeline is ready the moment a runner lands.
+  hvf-conformance:
+    name: HVF runtime · conformance
+    if: ${{ vars.CARRICK_SELF_HOSTED == 'true' }}
+    runs-on: [self-hosted, macos, arm64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build + codesign
+        run: ./scripts/build-signed.sh
+
+      - name: Full test suite (incl. HVF integration)
+        run: cargo test --workspace
+
+      # Differential carrick-vs-Docker suite. Self-skips if Docker is unreachable
+      # or the signed binary is missing, so it is safe even on a partial runner.
+      - name: Conformance (carrick vs Docker)
+        run: cargo test -p carrick-cli --test conformance -- --nocapture
