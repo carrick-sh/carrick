@@ -585,6 +585,11 @@ where
                 let retval: i64 = match outcome {
                     crate::trap::ForkOutcome::Parent { child_pid } => {
                         waiter = crate::io_wait::ThreadWaiter::new(this_tid);
+                        // Watch the child's exit (EVFILT_PROC/NOTE_EXIT) so the
+                        // signal pump delivers SIGCHLD to this (parent) tid when
+                        // it exits — without a host SIGCHLD handler, which would
+                        // break wait4's host-waitpid reap.
+                        crate::host_signal::register_child_exit_watch(child_pid, this_tid as i32);
                         // CLONE_PIDFD: hand the parent a pidfd for the new child.
                         if let Some(addr) = pidfd_out {
                             let fd = dispatcher.install_child_pidfd(child_pid).unwrap_or(-1);
@@ -1454,6 +1459,12 @@ impl ThreadRuntimeState {
                 // topology lock we still hold) — otherwise a later fork can't
                 // kick this thread out of the guest and it never quiesces.
                 self.register_vcpu(engine);
+                // Watch the child's exit (EVFILT_PROC/NOTE_EXIT) so the signal
+                // pump delivers SIGCHLD to this (parent) tid when it exits —
+                // without a host SIGCHLD handler, which would break wait4's
+                // host-waitpid reap. The pump was just restarted above, so its
+                // kqueue exists (rearm covers the registration-before-pump race).
+                crate::host_signal::register_child_exit_watch(child_pid, self.this_tid as i32);
                 // CLONE_PIDFD: allocate a pidfd for the new child and write its
                 // fd to the guest pidfd-out pointer. The child's pid mirrors a
                 // real host pid, so the pidfd watches it via EVFILT_PROC.

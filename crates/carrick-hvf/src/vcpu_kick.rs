@@ -275,6 +275,10 @@ pub fn spawn_signal_pump(
             let _ = kq.apply(&changes);
             // Publish the kq so `notify_pump` can NOTE_TRIGGER our EVFILT_USER.
             crate::host_signal::set_pump_kqueue(kq_fd);
+            // Arm EVFILT_PROC/NOTE_EXIT for any guest child forked before the
+            // pump learned its kqueue, so a fast-exiting child still yields
+            // SIGCHLD. New children are armed directly by register_child_exit_watch.
+            crate::host_signal::rearm_child_watches(kq_fd);
             let mut out = [crate::darwin_kqueue::Kevent::empty()];
             while thread_running.load(std::sync::atomic::Ordering::SeqCst) {
                 let n = match kq.wait(&[], &mut out, None) {
@@ -289,6 +293,26 @@ pub fn spawn_signal_pump(
                 for event in out.iter().take(n) {
                     if event.is_read() {
                         crate::host_signal::drain_pump_pipe();
+                        continue;
+                    }
+                    if let Some(child_pid) = event.proc_exit_ident() {
+                        // A watched guest child exited (NOTE_EXIT) or was already
+                        // gone (EV_ERROR on EVFILT_PROC) — either way deliver
+                        // SIGCHLD to the forking parent tid. publish_pending_for
+                        // marks SIGCHLD (linux signum 17) pending and wakes the
+                        // parent's waiter/vCPU; the runtime's delivery cycle then
+                        // applies the guest's SIGCHLD disposition (drop on
+                        // SIG_IGN / default-ignore, else inject the handler). The
+                        // child's exit status is NOT consumed here, so the
+                        // guest's wait4 still reaps it via host waitpid.
+                        if let Some(parent_tid) =
+                            crate::host_signal::take_child_exit_parent(child_pid)
+                        {
+                            crate::host_signal::publish_pending_for(
+                                parent_tid,
+                                crate::linux_abi::LINUX_SIGCHLD,
+                            );
+                        }
                         continue;
                     }
                     if let Some(ident) = event.timer_ident() {
