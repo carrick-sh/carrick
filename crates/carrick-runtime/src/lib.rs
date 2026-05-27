@@ -26,6 +26,7 @@ pub mod host_signal;
 pub mod host_tty;
 pub mod interactive_supervisor;
 pub mod io_wait;
+pub(crate) mod inotify;
 pub(crate) mod itimer;
 pub mod layer_cache;
 // `linux_abi` was lifted into the leaf crate `carrick-abi` (build-graph split,
