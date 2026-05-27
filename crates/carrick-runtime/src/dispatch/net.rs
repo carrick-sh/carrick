@@ -141,6 +141,9 @@ impl SyscallDispatcher {
                 // A pidfd is read-ready when its process exits; the backing
                 // kqueue's own fd is what poll/epoll watch (EVFILT_PROC fires).
                 OpenDescription::Pidfd { kqueue, .. } => Some(kqueue.raw_fd()),
+                // inotify readiness is the backing kqueue's fd, so poll/epoll/
+                // blocking-read wait on it natively.
+                OpenDescription::Inotify { state, .. } => Some(state.poll_fd()),
                 _ => None,
             };
         }
@@ -288,6 +291,9 @@ impl SyscallDispatcher {
             // Pidfd readiness is the kqueue's job (host_fd_for_poll returns the
             // EVFILT_PROC kqueue fd), so there's no in-memory readiness here.
             OpenDescription::Pidfd { .. } => {}
+            // Inotify readiness is likewise the backing kqueue's job
+            // (host_fd_for_poll returns its fd); no in-memory readiness here.
+            OpenDescription::Inotify { .. } => {}
             OpenDescription::PipeReader { pipe, .. } => {
                 if requested_events & LINUX_POLLIN != 0 {
                     let pipe = pipe.lock();

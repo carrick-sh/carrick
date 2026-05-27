@@ -1596,6 +1596,70 @@ fn splice_moves_bytes_between_sockets_and_pipes() {
 }
 
 #[test]
+fn inotify_init_add_watch_read_dispatch_plumbing() {
+    // The event mechanism itself is unit-tested against a real vnode in
+    // src/inotify.rs; here we verify the syscall plumbing at the dispatch seam.
+    // The in-memory backend has no host vnode, so watching an existing path is
+    // ENOSPC (inotify watches require `--fs host`); we exercise the fd
+    // lifecycle and the error paths.
+    const IN_NONBLOCK: u64 = 0o4000;
+    const IN_MODIFY: u64 = 0x2;
+    let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
+        "etc/motd",
+        b"hi\n".as_slice(),
+    )]))])
+    .unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
+    let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
+        d.dispatch(SyscallRequest::new(nr, SyscallArgs::from(args)), m, &reporter)
+            .unwrap()
+    };
+
+    // inotify_init1(IN_NONBLOCK) -> a fresh fd >= 3.
+    let ifd = match run(&mut dispatcher, &mut memory, 26, [IN_NONBLOCK, 0, 0, 0, 0, 0]) {
+        DispatchOutcome::Returned { value } => {
+            assert!(value >= 3, "init1 fd {value}");
+            value as u64
+        }
+        other => panic!("inotify_init1: {other:?}"),
+    };
+
+    // read with no events queued -> EAGAIN (11).
+    assert_eq!(
+        run(&mut dispatcher, &mut memory, 63, [ifd, 0x4100, 64, 0, 0, 0]),
+        DispatchOutcome::Errno { errno: 11 }
+    );
+
+    // add_watch on an existing in-memory path -> ENOSPC (28): no host vnode.
+    memory.write_bytes(0x4200, b"/etc/motd\0").unwrap();
+    assert_eq!(
+        run(&mut dispatcher, &mut memory, 27, [ifd, 0x4200, IN_MODIFY, 0, 0, 0]),
+        DispatchOutcome::Errno { errno: 28 }
+    );
+
+    // add_watch on a nonexistent path -> ENOENT (2).
+    memory.write_bytes(0x4280, b"/no/such\0").unwrap();
+    assert_eq!(
+        run(&mut dispatcher, &mut memory, 27, [ifd, 0x4280, IN_MODIFY, 0, 0, 0]),
+        DispatchOutcome::Errno { errno: 2 }
+    );
+
+    // rm_watch of an unknown wd -> EINVAL (22).
+    assert_eq!(
+        run(&mut dispatcher, &mut memory, 28, [ifd, 99, 0, 0, 0, 0]),
+        DispatchOutcome::Errno { errno: 22 }
+    );
+
+    // add_watch / rm_watch on a non-inotify fd -> EINVAL (22).
+    assert_eq!(
+        run(&mut dispatcher, &mut memory, 28, [0, 1, 0, 0, 0, 0]),
+        DispatchOutcome::Errno { errno: 22 }
+    );
+}
+
+#[test]
 fn readv_reads_file_across_packed_iovecs() {
     let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
         "etc/motd",

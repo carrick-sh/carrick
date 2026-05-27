@@ -71,8 +71,7 @@ const fn syscall(
 pub const fn handler_for_aarch64(number: u64) -> SyscallHandler {
     match number {
         5..=17
-        | 23..=25
-        | 29
+        | 23..=29
         | 32..=38
         | 43..=50
         | 52..=57
@@ -168,9 +167,9 @@ const AARCH64_SYSCALLS: &[Syscall] = &[
     syscall(23, "dup", "fs", SupportLevel::BringUp),
     syscall(24, "dup3", "fs", SupportLevel::BringUp),
     syscall(25, "fcntl", "fs", SupportLevel::BringUp),
-    syscall(26, "inotify_init1", "fs", SupportLevel::Deferred),
-    syscall(27, "inotify_add_watch", "fs", SupportLevel::Deferred),
-    syscall(28, "inotify_rm_watch", "fs", SupportLevel::Deferred),
+    syscall(26, "inotify_init1", "fs", SupportLevel::BringUp),
+    syscall(27, "inotify_add_watch", "fs", SupportLevel::BringUp),
+    syscall(28, "inotify_rm_watch", "fs", SupportLevel::BringUp),
     syscall(29, "ioctl", "fs", SupportLevel::BringUp),
     syscall(30, "ioprio_set", "sched", SupportLevel::Deferred),
     syscall(31, "ioprio_get", "sched", SupportLevel::Deferred),
