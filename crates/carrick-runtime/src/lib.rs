@@ -46,6 +46,7 @@ pub mod probes;
 pub mod pty_relay;
 pub mod rootfs;
 pub mod runtime;
+pub(crate) mod seccomp;
 pub(crate) mod shared_aperture;
 pub mod syscall;
 pub mod thread;
