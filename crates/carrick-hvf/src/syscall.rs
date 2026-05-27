@@ -92,7 +92,7 @@ pub const fn handler_for_aarch64(number: u64) -> SyscallHandler {
         85..=87 | 101..=103 | 112..=115 | 153 | 165 | 169..=171 | 179 | 261 | 266 => {
             SyscallHandler::Time
         }
-        214..=216 | 222 | 223 | 226..=233 | 283 => SyscallHandler::Memory,
+        214..=216 | 222 | 223 | 226..=233 | 283 | 425 | 426 => SyscallHandler::Memory,
         90 | 91 | 140 | 141 | 143..=152 | 158 | 159 | 166 | 174..=177 => {
             SyscallHandler::Credentials
         }
@@ -442,8 +442,8 @@ const AARCH64_SYSCALLS: &[Syscall] = &[
     syscall(422, "futex_time64", "process", SupportLevel::Deferred),
     syscall(423, "sched_rr_get_interval_time64", "sched", SupportLevel::Deferred),
     syscall(424, "pidfd_send_signal", "process", SupportLevel::BringUp),
-    syscall(425, "io_uring_setup", "io", SupportLevel::Deferred),
-    syscall(426, "io_uring_enter", "io", SupportLevel::Deferred),
+    syscall(425, "io_uring_setup", "io", SupportLevel::BringUp),
+    syscall(426, "io_uring_enter", "io", SupportLevel::BringUp),
     syscall(427, "io_uring_register", "io", SupportLevel::Deferred),
     syscall(428, "open_tree", "fs", SupportLevel::Deferred),
     syscall(429, "move_mount", "fs", SupportLevel::Deferred),
