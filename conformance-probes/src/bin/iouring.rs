@@ -28,6 +28,7 @@ const IORING_OP_SEND: u8 = 26;
 const IORING_OP_RECV: u8 = 27;
 const IORING_OP_SENDMSG: u8 = 9;
 const IORING_OP_RECVMSG: u8 = 10;
+const IORING_OP_ACCEPT: u8 = 13;
 
 #[repr(C)]
 struct Iovec {
@@ -345,6 +346,51 @@ unsafe fn ring_ops(r: &mut Ring) -> bool {
         ptr::write_unaligned(sqe.add(16) as *mut u64, &rmsg as *const Msghdr as u64);
     }) != Some(payload.len() as i32)
         || &mb[..payload.len()] != payload
+    {
+        return false;
+    }
+
+    // io_uring ACCEPT: a listening AF_UNIX socket + a normal client connect
+    // (which backlogs), then reap the accepted fd via the ring and confirm data
+    // flows over it with an io_uring RECV.
+    let sock_path = b"/tmp/iou_acc.sock\0";
+    libc::unlink(sock_path.as_ptr() as *const _);
+    let lsn = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+    if lsn < 0 {
+        return false;
+    }
+    let mut sa: libc::sockaddr_un = std::mem::zeroed();
+    sa.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (i, &byte) in sock_path.iter().enumerate() {
+        sa.sun_path[i] = byte as libc::c_char;
+    }
+    let salen = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+    if libc::bind(lsn, &sa as *const _ as *const libc::sockaddr, salen) != 0
+        || libc::listen(lsn, 1) != 0
+    {
+        return false;
+    }
+    let cli = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+    if cli < 0 || libc::connect(cli, &sa as *const _ as *const libc::sockaddr, salen) != 0 {
+        return false;
+    }
+    let afd = match r.submit_reap(|sqe| {
+        *sqe.add(0) = IORING_OP_ACCEPT;
+        ptr::write_unaligned(sqe.add(4) as *mut i32, lsn);
+        // addr (offset 16) and off (offset 8) stay 0 -> no sockaddr writeback.
+    }) {
+        Some(fd) if fd > 2 => fd,
+        _ => return false,
+    };
+    libc::write(cli, b"yo".as_ptr() as *const _, 2);
+    let mut yb = [0u8; 2];
+    if r.submit_reap(|sqe| {
+        *sqe.add(0) = IORING_OP_RECV;
+        ptr::write_unaligned(sqe.add(4) as *mut i32, afd);
+        ptr::write_unaligned(sqe.add(16) as *mut u64, yb.as_mut_ptr() as u64);
+        ptr::write_unaligned(sqe.add(24) as *mut u32, 2);
+    }) != Some(2)
+        || &yb != b"yo"
     {
         return false;
     }

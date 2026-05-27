@@ -1907,6 +1907,8 @@ pub const LINUX_IORING_OP_WRITE: u8 = 23;
 pub const LINUX_IORING_OP_CLOSE: u8 = 19;
 // Async (readiness-driven) ops — serviced via the kqueue/ThreadWaiter wait path.
 pub const LINUX_IORING_OP_POLL_ADD: u8 = 6;
+pub const LINUX_IORING_OP_ACCEPT: u8 = 13;
+pub const LINUX_IORING_OP_CONNECT: u8 = 16;
 pub const LINUX_IORING_OP_SENDMSG: u8 = 9;
 pub const LINUX_IORING_OP_RECVMSG: u8 = 10;
 pub const LINUX_IORING_OP_SEND: u8 = 26;
