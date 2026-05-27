@@ -159,6 +159,19 @@ impl Kevent {
         Self::new(ident, libc::EVFILT_USER, flags, 0)
     }
 
+    /// If this returned event is an `EVFILT_PROC`/`NOTE_EXIT` firing (a watched
+    /// process exited), the pid that exited; else `None`. The signal pump uses
+    /// this to map a child exit back to the forking guest tid and publish
+    /// SIGCHLD. An `EV_ERROR` event (e.g. the pid was already gone) also carries
+    /// `EVFILT_PROC`, so the caller treats both as "the child is now reapable".
+    pub fn proc_exit_ident(self) -> Option<i32> {
+        if self.0.filter == libc::EVFILT_PROC {
+            Some(self.0.ident as i32)
+        } else {
+            None
+        }
+    }
+
     /// One-shot or periodic timer. `interval_ns` is the period in nanoseconds
     /// (`NOTE_NSECONDS`); pass `EV_ADD | EV_ONESHOT` for a single fire or
     /// `EV_ADD` for a repeating timer, and `EV_DELETE` (with `interval_ns` 0)
