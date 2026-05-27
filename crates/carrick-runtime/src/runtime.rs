@@ -1397,6 +1397,42 @@ impl ThreadRuntimeState {
             quiesced = true;
         }
 
+        // INVARIANT before tearing down the VM: no OTHER guest vCPU is live
+        // besides this forker's (VCPU_LIVE == 1). The quiesce above is supposed
+        // to guarantee it, but `wait_quiesced`'s `paused` counter is a racy
+        // proxy — across back-to-back forks a slow-waking parker from the
+        // PREVIOUS fork can satisfy `paused >= others` while a sibling has not
+        // actually released its vCPU (proven via the on-HV_BUSY dump: VCPU_LIVE=1,
+        // kicker=6 after a "successful" quiesce). Hold the invariant true: give
+        // the kicked siblings a BOUNDED window (sleeping, NOT spinning) to finish
+        // releasing, re-nudging; if it still doesn't hold, ABORT LOUDLY rather
+        // than proceed into a corrupting hv_vm_destroy (HV_BUSY) or spin forever.
+        // A clean abort lets the kernel reclaim the HVF VM — no wedged spinning
+        // guest. Asserting the invariant (and dying loudly if violated) is the
+        // contract; enforcing it by an unbounded spin is not.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            use std::sync::atomic::Ordering::SeqCst;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while crate::trap::VCPU_LIVE.load(SeqCst) > 1 {
+                if std::time::Instant::now() >= deadline {
+                    tracing::error!(
+                        vcpu_live = crate::trap::VCPU_LIVE.load(SeqCst),
+                        kicker = self.kicker.count(),
+                        others,
+                        pid = std::process::id(),
+                        "fork quiesce failed to release sibling vCPUs in 5s; aborting \
+                         to avoid HV_BUSY VM corruption"
+                    );
+                    std::process::abort();
+                }
+                self.kicker.kick_all_except(self.this_tid);
+                self.futex.notify_signal_pending();
+                crate::host_signal::wake_all_waiters();
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
+        }
+
         // Publish the arena high-water so the child snapshot's mincore scan is
         // bounded to the guest's used prefix, not all 32 GiB (see
         // clone_region_for_child / GUEST_ARENA_HIGH_WATER).
