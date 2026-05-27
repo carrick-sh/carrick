@@ -47,6 +47,12 @@ pub(in crate::dispatch) struct IoState {
     /// without persisting it here, F_GETFD always read back 0 (diverging
     /// from real Linux on the fcntlstdio conformance probe).
     pub stdio_cloexec: Mutex<[bool; 3]>,
+    /// Guest path each open fd was opened at, regardless of backend (host-fd
+    /// backed `OpenDescription`s carry no path of their own). Serves
+    /// `readlink(/proc/self/fd/N)` — Apple Rosetta readlinks its main-binary fd
+    /// to recover the binary path. Best-effort: populated on open, cleared on
+    /// close (a stale entry for a recycled fd is overwritten by the next open).
+    pub fd_open_paths: RwLock<HashMap<i32, String>>,
 }
 
 impl IoState {
@@ -59,6 +65,7 @@ impl IoState {
             next_fd: Mutex::new(3),
             cwd: RwLock::new("/".to_owned()),
             stdio_cloexec: Mutex::new([false; 3]),
+            fd_open_paths: RwLock::new(HashMap::new()),
         }
     }
 }

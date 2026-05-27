@@ -5,6 +5,30 @@ mod state;
 use state::*;
 pub(super) use state::{FsState, IoState};
 
+/// If `path` is a `/proc/{self,thread-self,curproc,this}/fd/N` magic symlink,
+/// return the descriptor number N. Used to serve `open()` of these (Linux
+/// re-opens the file behind fd N); Apple Rosetta opens its main-binary fd this
+/// way.
+fn proc_self_fd_number(path: &str) -> Option<i32> {
+    let rest = path
+        .strip_prefix("/proc/self/fd/")
+        .or_else(|| path.strip_prefix("/proc/thread-self/fd/"))
+        .or_else(|| path.strip_prefix("/proc/curproc/fd/"))
+        .or_else(|| path.strip_prefix("/proc/this/fd/"))
+        .or_else(|| {
+            // /proc/<pid>/fd/N — carrick is one guest process, so any numeric
+            // pid component refers to "self".
+            let after = path.strip_prefix("/proc/")?;
+            let (pid, tail) = after.split_once('/')?;
+            if pid.chars().all(|c| c.is_ascii_digit()) && !pid.is_empty() {
+                tail.strip_prefix("fd/")
+            } else {
+                None
+            }
+        })?;
+    rest.parse::<i32>().ok()
+}
+
 impl SyscallDispatcher {
     pub fn register_mount(
         &mut self,
@@ -392,12 +416,28 @@ impl SyscallDispatcher {
             Err(errno) => return Ok(errno.into()),
         };
 
+        // Trace every open attempt. The per-backend `path_open` calls further
+        // down only fire for the legacy synthetic/overlay/rootfs chain, so
+        // VFS-mount opens (/dev, /proc, /sys) and the /proc/self/{exe,fd}
+        // resolutions below were invisible to `carrick trace`.
+        crate::probes::path_open(&path, 0, 0);
+
+        // `/proc/self/fd/N` (and the pid/thread-self/curproc aliases) re-open the
+        // file behind descriptor N — Linux lets you open() the magic symlink to
+        // get a fresh fd referring to the same open file. Rosetta opens its
+        // main-binary fd this way. Serve it by duplicating N (works for host-fd
+        // backed files, which carry no guest path to re-resolve).
+        if let Some(n) = proc_self_fd_number(&path) {
+            return Ok(self.duplicate_fd(n, 0, flags & LINUX_O_CLOEXEC));
+        }
+
         // `/proc/self/exe` (and the thread-self/curproc/this aliases) are
         // symlinks to the running executable that Linux lets you open() directly
         // to get an fd on the backing file. Resolve to the executable path so
         // the open hits the real file. Apple's Rosetta opens this at startup
         // (and runs its licensing ioctl on the resulting fd); under translation
         // the executable path points at the bind-mounted Rosetta interpreter.
+
         let path = match path.as_str() {
             "/proc/self/exe" | "/proc/thread-self/exe" | "/proc/this/exe"
             | "/proc/curproc/exe" => {
@@ -475,6 +515,9 @@ impl SyscallDispatcher {
                 crate::probes::path_open(&path, 0, *errno);
             }
         }
+        // Remember the guest path so readlink(/proc/self/fd/N) can recover it
+        // (host-fd-backed descriptions store no path of their own).
+        let record_path = path.clone();
         let (description, host_fd_owner) = match dispatch_result {
             Ok(crate::vfs::rootfs::OpenDispatchResult::File {
                 metadata,
@@ -613,6 +656,7 @@ impl SyscallDispatcher {
         let Ok(fd) = self.install_fd_at_or_above(3, open_file) else {
             return Ok(linux_errno::EMFILE.into());
         };
+        self.io.fd_open_paths.write().insert(fd, record_path);
         Ok(DispatchOutcome::Returned { value: fd as i64 })
     }
 
@@ -4376,6 +4420,20 @@ impl SyscallDispatcher {
                 // /proc/this/fd/{0,1,2} → /dev/pts/N when the guest's stdio is the
                 // `carrick run -t` controlling pty. This is what glibc `ttyname(3)`
                 // reads, so `tty(1)` and tty-name lookups resolve.
+                t
+            } else if let Some(t) = proc_self_fd_number(&path).and_then(|n| {
+                this.io
+                    .fd_open_paths
+                    .read()
+                    .get(&n)
+                    .cloned()
+                    .or_else(|| {
+                        this.open_file(n)
+                            .and_then(|f| f.description.read().open_path().map(str::to_owned))
+                    })
+            }) {
+                // /proc/self/fd/N → the path fd N was opened at. Rosetta readlinks
+                // its main-binary fd this way to recover the binary's path.
                 t
             } else if let Some(t) = this.fs.rootfs_vfs.overlay.read_link(&path) {
                 // Symlink created in the writable backend (cap-std on --fs host).
