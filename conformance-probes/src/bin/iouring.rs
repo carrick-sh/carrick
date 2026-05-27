@@ -24,6 +24,8 @@ const IORING_OP_READV: u8 = 1;
 const IORING_OP_READ: u8 = 22;
 const IORING_OP_WRITE: u8 = 23;
 const IORING_OP_CLOSE: u8 = 19;
+const IORING_OP_SEND: u8 = 26;
+const IORING_OP_RECV: u8 = 27;
 const IORING_ENTER_GETEVENTS: u32 = 1;
 
 const P_SQ_ENTRIES: usize = 0;
@@ -229,6 +231,64 @@ unsafe fn ring_ops(r: &mut Ring) -> bool {
         ptr::write_unaligned(sqe.add(4) as *mut i32, file);
     }) != Some(0)
     {
+        return false;
+    }
+
+    // Socket SEND/RECV over a socketpair — first the ready path, then a blocking
+    // RECV that must park on the kqueue until a forked child writes.
+    let mut sv = [0i32; 2];
+    if libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) != 0 {
+        return false;
+    }
+    let (a, b) = (sv[0], sv[1]);
+
+    let ping = b"ping!";
+    if r.submit_reap(|sqe| {
+        *sqe.add(0) = IORING_OP_SEND;
+        ptr::write_unaligned(sqe.add(4) as *mut i32, a);
+        ptr::write_unaligned(sqe.add(16) as *mut u64, ping.as_ptr() as u64);
+        ptr::write_unaligned(sqe.add(24) as *mut u32, ping.len() as u32);
+    }) != Some(ping.len() as i32)
+    {
+        return false;
+    }
+    let mut rb = [0u8; 8];
+    if r.submit_reap(|sqe| {
+        *sqe.add(0) = IORING_OP_RECV;
+        ptr::write_unaligned(sqe.add(4) as *mut i32, b);
+        ptr::write_unaligned(sqe.add(16) as *mut u64, rb.as_mut_ptr() as u64);
+        ptr::write_unaligned(sqe.add(24) as *mut u32, ping.len() as u32);
+    }) != Some(ping.len() as i32)
+        || &rb[..ping.len()] != ping
+    {
+        return false;
+    }
+
+    // Blocking RECV: the child writes after a delay; the parent's io_uring RECV
+    // has no data yet, so it must park on the socket's readiness (the kqueue/
+    // WaitOnFds path) and complete only once the child writes.
+    let pid = libc::fork();
+    if pid == 0 {
+        libc::close(b);
+        let ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 80_000_000,
+        };
+        libc::nanosleep(&ts, ptr::null_mut());
+        libc::write(a, b"delayed!".as_ptr() as *const _, 8);
+        libc::_exit(0);
+    }
+    libc::close(a);
+    let mut db = [0u8; 8];
+    let rv = r.submit_reap(|sqe| {
+        *sqe.add(0) = IORING_OP_RECV;
+        ptr::write_unaligned(sqe.add(4) as *mut i32, b);
+        ptr::write_unaligned(sqe.add(16) as *mut u64, db.as_mut_ptr() as u64);
+        ptr::write_unaligned(sqe.add(24) as *mut u32, 8);
+    });
+    let mut st = 0i32;
+    libc::waitpid(pid, &mut st, 0);
+    if rv != Some(8) || &db != b"delayed!" {
         return false;
     }
 
