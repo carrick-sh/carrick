@@ -198,15 +198,8 @@ where
             .read_exec_file(p)
             .or_else(|| std::fs::read(p).ok())
     })?
-    .with_linux_initial_stack(argv, env)?
-    .with_el0_trampoline()?
-    .with_el1_vectors()?
-    .with_stage1_page_tables()?
-    .with_vdso()?;
-    if let Some(p) = maybe_dump_debug_state(&image, debug_state_path) {
-        eprintln!("debug state written: {}", p.display());
-    }
-    run_address_space_with_hvf_and_dispatcher(image, dispatcher, max_traps)
+    .with_linux_initial_stack(argv, env)?;
+    finish_and_run_image(image, dispatcher, max_traps, debug_state_path)
 }
 
 fn canonical_host_executable_path(path: &Path) -> String {
@@ -221,12 +214,8 @@ pub fn run_static_elf_bytes_with_hvf_and_dispatcher(
     dispatcher: SyscallDispatcher,
     max_traps: usize,
 ) -> Result<RunResult, RuntimeError> {
-    let image = AddressSpace::load_elf_bytes(bytes)?
-        .with_el0_trampoline()?
-        .with_el1_vectors()?
-        .with_stage1_page_tables()?
-        .with_vdso()?;
-    run_address_space_with_hvf_and_dispatcher(image, dispatcher, max_traps)
+    let image = AddressSpace::load_elf_bytes(bytes)?;
+    finish_and_run_image(image, dispatcher, max_traps, None)
 }
 
 pub fn run_static_elf_bytes_with_hvf_args_and_dispatcher<A, E>(
@@ -245,13 +234,8 @@ where
     if let Some(first) = argv.first() {
         dispatcher.set_executable_identity(first.clone(), argv.clone());
     }
-    let image = AddressSpace::load_elf_bytes(bytes)?
-        .with_linux_initial_stack(argv, env)?
-        .with_el0_trampoline()?
-        .with_el1_vectors()?
-        .with_stage1_page_tables()?
-        .with_vdso()?;
-    run_address_space_with_hvf_and_dispatcher(image, dispatcher, max_traps)
+    let image = AddressSpace::load_elf_bytes(bytes)?.with_linux_initial_stack(argv, env)?;
+    finish_and_run_image(image, dispatcher, max_traps, None)
 }
 
 pub fn run_rootfs_elf_with_hvf_args_and_dispatcher<A, E>(
@@ -307,15 +291,8 @@ where
     let image = AddressSpace::load_elf_bytes_with_reader(&file, &|p| {
         rootfs.read(p).ok().or_else(|| std::fs::read(p).ok())
     })?
-    .with_linux_initial_stack(argv, env)?
-        .with_el0_trampoline()?
-        .with_el1_vectors()?
-        .with_stage1_page_tables()?
-        .with_vdso()?;
-    if let Some(p) = maybe_dump_debug_state(&image, debug_state_path) {
-        eprintln!("debug state written: {}", p.display());
-    }
-    run_address_space_with_hvf_and_dispatcher(image, dispatcher, max_traps)
+    .with_linux_initial_stack(argv, env)?;
+    finish_and_run_image(image, dispatcher, max_traps, debug_state_path)
 }
 
 /// Run an ELF whose filesystem is entirely in the dispatcher's overlay
@@ -357,15 +334,8 @@ where
     };
     let image =
         AddressSpace::load_elf_bytes_with_reader(&bytes, &|p| dispatcher.read_exec_file(p))?
-            .with_linux_initial_stack(argv, env)?
-            .with_el0_trampoline()?
-            .with_el1_vectors()?
-            .with_stage1_page_tables()?
-            .with_vdso()?;
-    if let Some(p) = maybe_dump_debug_state(&image, debug_state_path) {
-        eprintln!("debug state written: {}", p.display());
-    }
-    run_address_space_with_hvf_and_dispatcher(image, dispatcher, max_traps)
+            .with_linux_initial_stack(argv, env)?;
+    finish_and_run_image(image, dispatcher, max_traps, debug_state_path)
 }
 
 pub fn run_rootfs_elf_with_hvf_args<A, E>(
@@ -422,6 +392,30 @@ fn run_address_space_with_hvf_and_dispatcher(
     // malloc implementations, and debuggers all parse this file.
     dispatcher.set_address_space_regions(proc_maps_from_address_space(&image));
     run_threaded_hvf_loop(trap, dispatcher, max_traps)
+}
+
+/// Finish a freshly-loaded image (its initial stack already set, if any) and
+/// run it: install the EL0 trampoline, EL1 vectors, stage-1 page tables and
+/// vDSO, optionally dump debug state, then enter the HVF run loop. This
+/// trampoline→vectors→page-tables→vdso→dump→run tail was duplicated verbatim
+/// across every `run_*` entry point; the entry points now differ only in how
+/// they obtain the image bytes (host file / raw bytes / rootfs / overlay) and
+/// set up identity + Rosetta redirection.
+fn finish_and_run_image(
+    image: AddressSpace,
+    dispatcher: SyscallDispatcher,
+    max_traps: usize,
+    debug_state_path: Option<&PathBuf>,
+) -> Result<RunResult, RuntimeError> {
+    let image = image
+        .with_el0_trampoline()?
+        .with_el1_vectors()?
+        .with_stage1_page_tables()?
+        .with_vdso()?;
+    if let Some(p) = maybe_dump_debug_state(&image, debug_state_path) {
+        eprintln!("debug state written: {}", p.display());
+    }
+    run_address_space_with_hvf_and_dispatcher(image, dispatcher, max_traps)
 }
 
 /// Convert the engine's `AddressSpace` regions into the dispatcher's
