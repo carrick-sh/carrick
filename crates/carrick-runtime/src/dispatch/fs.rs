@@ -438,7 +438,7 @@ impl SyscallDispatcher {
         // (and runs its licensing ioctl on the resulting fd); under translation
         // the executable path points at the bind-mounted Rosetta interpreter.
 
-        let path = match path.as_str() {
+        let mut path = match path.as_str() {
             "/proc/self/exe" | "/proc/thread-self/exe" | "/proc/this/exe"
             | "/proc/curproc/exe" => {
                 let exe = self.proc.lock().executable_path.clone();
@@ -448,6 +448,20 @@ impl SyscallDispatcher {
             }
             _ => path,
         };
+
+        // Follow a trailing symlink (unless O_NOFOLLOW, or an exclusive create),
+        // matching kernel path resolution: opening Alpine's /bin/uname must
+        // resolve to /bin/busybox and return the busybox ELF, not the symlink's
+        // 12-byte target string. Rosetta open()s its main x86 binary by name and
+        // parses the result as an ELF, so a returned symlink corrupts it.
+        // Best-effort: a non-symlink or not-yet-existent (O_CREAT) path is left
+        // unchanged.
+        const LINUX_O_NOFOLLOW: u64 = 0o400000;
+        if flags & LINUX_O_NOFOLLOW == 0 && !(want_create && want_excl) {
+            if let Ok(resolved) = self.canonicalize_following(&path) {
+                path = resolved;
+            }
+        }
 
         // VFS-mount routing. DevVfs serves /dev/*, ProcVfs serves
         // /proc/*, SysVfs serves /sys/*. The dispatcher converts each
