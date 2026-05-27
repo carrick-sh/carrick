@@ -536,6 +536,10 @@ pub enum DispatchOutcome {
         va: u64,
         ipa: u64,
         len: u64,
+        /// Bytes to copy into the freshly-mapped region at offset 0 (the file
+        /// content for a file-backed mmap; empty for anonymous, which the host
+        /// anon mapping already zeroes).
+        payload: Vec<u8>,
     },
     /// Guest invoked `rt_sigreturn(2)` (syscall 139). The runtime must
     /// pop the Carrick sigframe at SP_EL0, restore the saved register

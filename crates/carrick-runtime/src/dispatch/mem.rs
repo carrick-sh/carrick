@@ -294,39 +294,7 @@ impl SyscallDispatcher {
                 }
             };
 
-            // A high guest VA (>= 1 TiB) can't be identity-mapped (HVF IPA is 40
-            // bits). Back it from the low alias arena: reserve an IPA (2 MiB
-            // aligned so the runtime can use 2 MiB blocks) and hand the runtime a
-            // MapHostAlias outcome that hv_vm_maps it and builds the VA->IPA
-            // page-table path. Apple Rosetta's ~240 TiB translation working set
-            // takes this path. Anonymous-only; the region comes back zeroed.
-            if crate::memory::is_high_va(address) {
-                if flags & LINUX_MAP_ANONYMOUS == 0 {
-                    return Ok(LINUX_ENOMEM.into());
-                }
-                const TWO_MIB: u64 = 1 << 21;
-                let alias_len = align_up_u64(length, TWO_MIB).unwrap_or(length);
-                let ipa = {
-                    let mut mem = this.mem.lock();
-                    let base = mem.alias_ipa_next;
-                    let limit =
-                        crate::memory::LINUX_ALIAS_IPA_BASE + crate::memory::LINUX_ALIAS_IPA_SIZE;
-                    match base.checked_add(alias_len).filter(|e| *e <= limit) {
-                        Some(end) => {
-                            mem.alias_ipa_next = end;
-                            base
-                        }
-                        None => return Ok(LINUX_ENOMEM.into()),
-                    }
-                };
-                return Ok(DispatchOutcome::MapHostAlias {
-                    va: address,
-                    ipa,
-                    len: alias_len,
-                });
-            }
-
-            if reused {
+            if reused && !crate::memory::is_high_va(address) {
                 let zeros = vec![0u8; length_usize];
                 let _ = memory.write_bytes(address, &zeros);
             }
@@ -381,6 +349,47 @@ impl SyscallDispatcher {
                         return Ok(LINUX_EBADF.into());
                     }
                 }
+            }
+
+            // A high guest VA (>= 1 TiB) can't be identity-mapped (HVF IPA is 40
+            // bits). Reserve a low alias IPA and hand the runtime a MapHostAlias
+            // outcome that hv_vm_maps it, builds the VA->IPA page-table path, and
+            // copies `bytes` (file content, or zeros for anon) in. Apple Rosetta
+            // maps both its anon translation arena (240 TiB) and the x86 binary
+            // this way.
+            if crate::memory::is_high_va(address) {
+                // Addresses with bits >= 48 set are non-canonical for the 48-bit
+                // TTBR0 and can't be translated. MAP_FIXED_NOREPLACE is a hint the
+                // caller will retry without if it can't have exactly this address,
+                // so return EEXIST (Rosetta then maps into the normal arena).
+                const VA_48: u64 = 1 << 48;
+                if address >= VA_48 {
+                    if flags & LINUX_MAP_FIXED_NOREPLACE != 0 {
+                        return Ok(linux_errno::EEXIST.into());
+                    }
+                    return Ok(LINUX_ENOMEM.into());
+                }
+                const TWO_MIB: u64 = 1 << 21;
+                let alias_len = align_up_u64(length, TWO_MIB).unwrap_or(length);
+                let ipa = {
+                    let mut mem = this.mem.lock();
+                    let base = mem.alias_ipa_next;
+                    let limit =
+                        crate::memory::LINUX_ALIAS_IPA_BASE + crate::memory::LINUX_ALIAS_IPA_SIZE;
+                    match base.checked_add(alias_len).filter(|e| *e <= limit) {
+                        Some(end) => {
+                            mem.alias_ipa_next = end;
+                            base
+                        }
+                        None => return Ok(LINUX_ENOMEM.into()),
+                    }
+                };
+                return Ok(DispatchOutcome::MapHostAlias {
+                    va: address,
+                    ipa,
+                    len: alias_len,
+                    payload: bytes,
+                });
             }
 
             memory.set_no_access(address, length_usize, false);
