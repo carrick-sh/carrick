@@ -6,6 +6,58 @@ no binfmt_misc kernel module.
 
 ---
 
+## Implementation status (2026-05-26, branch `feat/rosetta-amd64`)
+
+The full plan below is **implemented**, plus the MMU/procfs/vDSO groundwork the plan did
+not anticipate. Under carrick, Apple's Rosetta interpreter now **loads and runs its entire
+initialisation** for `carrick run --platform linux/amd64 …`: it passes the licensing `ioctl`
+handshake, enables hardware TSO, opens `/proc/self/exe`, parses the vDSO, reads
+`mmap_min_addr`, and executes ~13 syscalls successfully before the one remaining gap.
+
+**Corrections to the plan, verified against the real binary/crate (the plan's guesses were wrong):**
+- `ACTLR_EL1 = 0xc081` (not `0x6021`), gated behind applevisor feature `macos-15-0` (bumped from `macos-13-0`).
+- The TSO enable bit is `ACTLR_EL1.EnTSO` = **bit 1**, not bit 0.
+- `prctl PR_SET_MEM_MODEL = 0x4d4d444c` / `PR_GET_MEM_MODEL = 0x6d4d444c` (the Asahi/Apple
+  "MMDL" magic values — *not* 70/71, which collide with upstream `PR_RISCV_V_*`). Confirmed by
+  disassembling rosetta (`mov w0,#0x444c; movk w0,#0x4d4d`).
+- Handshake `ioctl`s observed: `0x80456125` (licence, size 69) and `0x80806123` (info, size 128).
+  The licence response is the verification blob Rosetta `memcmp`s against its **own embedded
+  copy**, so carrick reads it **live from the installed Rosetta binary** rather than embedding
+  Apple's string. The info ioctl just needs a non-negative return.
+- Image cache is now **per-platform** (arm64/amd64 no longer collide in the store).
+
+**Additional groundwork (not in the plan):**
+- HVF max IPA on M-series is **40 bits**, but Rosetta is a non-relocatable `ET_EXEC` fixed-linked
+  at **2^47**. Widened guest VA to 48-bit (`TCR_EL1.T0SZ` 24→16) and added a **non-identity
+  page-table alias** that maps Rosetta's 2 MiB image window down to a low IPA (the IPA output
+  stays within 40 bits — mirrors how Apple's own Virtualization.framework uses the guest
+  kernel's page tables). `MemoryRegion`/`GuestMapping`/`HvfMappedRegion`/`ForkMappingDesc` now
+  carry a distinct `ipa` (identity for every region except this alias).
+- vDSO now emits a real section-header table (`SHT_DYNSYM`) so strict parsers like Rosetta
+  resolve it (glibc/Go use `PT_DYNAMIC` and never needed sections). Generic improvement.
+- `open("/proc/self/exe")` (+ thread-self/curproc aliases) now resolves to the executable —
+  generic for every guest. `/proc/sys/vm/mmap_min_addr` synthesised.
+
+**Licensing safeguards:** opt-in (`--platform`), zero Apple bytes bundled (everything is read
+from the user's own install at runtime), `CARRICK_ACCEPT_ROSETTA_TERMS=1` accepts the macOS SLA
+responsibility and silences the per-run notice.
+
+### Remaining blocker — the general VA split (deferred follow-up)
+
+Rosetta then `mmap`s a 256 MiB **`MAP_FIXED` working region at 0xf00000000000 (240 TiB)** and
+SIGSEGVs because carrick can't back arbitrary high-VA mmaps: its mmap path sub-allocates from a
+pre-mapped 384 GiB arena and never issues a dynamic `hv_vm_map`, and `PageTableManager` only
+edits permissions on the existing identity map — it can't build a fresh VA→IPA path for a
+far-flung address. Closing this requires the **general VA-virtualisation subsystem**: a
+low-IPA alias arena, a runtime "map this VA→IPA" outcome, dynamic page-table construction for
+arbitrary 48-bit VAs, and fork integration. The static image alias above is the proof-of-concept
+for that mechanism; generalising it is the next step.
+
+Reproduce: `CARRICK_ACCEPT_ROSETTA_TERMS=1 carrick run --platform linux/amd64 alpine:latest /bin/uname -m`
+(add `CARRICK_TRACE_TRAPS=1` to see Rosetta's full init syscall sequence ending at the 240 TiB mmap).
+
+---
+
 ## Background and Execution Model
 
 Carrick executes Linux user-space binaries as native macOS threads. The guest runs at EL0
