@@ -17,11 +17,6 @@ pub mod dtrace_consumer;
 pub(crate) mod fork_coord;
 pub(crate) mod fork_quiesce;
 pub mod fs_backend;
-pub mod guest_cpu;
-pub mod host_facts;
-#[cfg(target_os = "macos")]
-pub(crate) mod host_mapping;
-pub mod host_proc;
 pub mod host_signal;
 pub mod host_tty;
 pub mod interactive_supervisor;
@@ -39,6 +34,12 @@ pub use carrick_abi as linux_abi;
 // `crate::memory::…` / `crate::elf::…` / `crate::page_table::…` / `crate::vdso::…`
 // site (and the `carrick_runtime::*` ones) is unchanged.
 pub use carrick_mem::{elf, memory, page_table, vdso};
+// guest_cpu/host_facts/host_mapping/host_proc/ulock were lifted into the leaf
+// crate `carrick-host` (Darwin host primitives — machine facts, __ulock, host
+// shared mappings, CPU accounting, libproc introspection; no dispatch/trap/VFS
+// deps). Re-exported under their original paths so every `crate::host_proc::…`
+// / `crate::guest_cpu::…` / `crate::ulock::…` site is unchanged.
+pub use carrick_host::{guest_cpu, host_facts, host_mapping, host_proc, ulock};
 pub mod overlay;
 
 pub mod execute;
@@ -51,7 +52,6 @@ pub(crate) mod shared_aperture;
 pub mod syscall;
 pub mod thread;
 pub mod trap;
-pub mod ulock;
 pub mod vcpu_kick;
 pub mod vfs;
 pub use execute::Runtime;
