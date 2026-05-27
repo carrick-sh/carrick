@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 /// Process-wide barrier (one HVF VM per process). Reachable from the run loop,
 /// `handle_fork`, AND the blocking-wait predicates (futex / io_wait) so a parked
 /// thread returns to its run-loop top when a quiesce begins.
-pub(crate) fn barrier() -> &'static QuiesceBarrier {
+pub fn barrier() -> &'static QuiesceBarrier {
     static B: OnceLock<QuiesceBarrier> = OnceLock::new();
     B.get_or_init(QuiesceBarrier::new)
 }
@@ -24,7 +24,7 @@ pub(crate) fn barrier() -> &'static QuiesceBarrier {
 /// True while a fork quiesce is in progress. Blocking waits OR this into their
 /// wake predicate so they return (spurious EINTR) and reach the run-loop-top
 /// barrier instead of re-parking.
-pub(crate) fn is_quiescing() -> bool {
+pub fn is_quiescing() -> bool {
     barrier().is_quiescing()
 }
 
@@ -36,21 +36,27 @@ pub(crate) fn is_quiescing() -> bool {
 /// being-born thread holding this lock is NOT yet in the vCPU kicker, so the
 /// fork's quiesce (which waits only on kicker-registered vCPUs) never waits on
 /// it — no deadlock.
-pub(crate) fn topology_lock() -> &'static Mutex<()> {
+pub fn topology_lock() -> &'static Mutex<()> {
     static L: OnceLock<Mutex<()>> = OnceLock::new();
     L.get_or_init(|| Mutex::new(()))
 }
 
 #[derive(Debug)]
-pub(crate) struct QuiesceBarrier {
+pub struct QuiesceBarrier {
     quiescing: AtomicBool,
     forking: AtomicBool,
     paused: Mutex<usize>,
     cv: Condvar,
 }
 
+impl Default for QuiesceBarrier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl QuiesceBarrier {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             quiescing: AtomicBool::new(false),
             forking: AtomicBool::new(false),
@@ -64,14 +70,14 @@ impl QuiesceBarrier {
     /// and meanwhile this thread parks at the barrier the other fork raised).
     /// CAS-based (not a held guard) so the flag survives `libc::fork` cleanly —
     /// the child clears it via `end_fork`.
-    pub(crate) fn try_begin_fork(&self) -> bool {
+    pub fn try_begin_fork(&self) -> bool {
         self.forking
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
     }
 
     /// Release the fork serialization (every handle_fork exit path).
-    pub(crate) fn end_fork(&self) {
+    pub fn end_fork(&self) {
         self.forking.store(false, Ordering::SeqCst);
     }
 
@@ -80,14 +86,14 @@ impl QuiesceBarrier {
     /// calls `wait_quiesced`. Split from the wait so the wakes happen between —
     /// a thread woken by the kick/notify must observe `is_quiescing()==true` at
     /// the run-loop top, so the flag MUST be raised before the wakes.
-    pub(crate) fn set_quiescing(&self) {
+    pub fn set_quiescing(&self) {
         self.quiescing.store(true, Ordering::SeqCst);
     }
 
     /// Step 2 (forking thread): wait until `others` threads have parked at the
     /// barrier, or `timeout`. Returns false on timeout (caller aborts the fork
     /// with EAGAIN and calls `end_quiesce`).
-    pub(crate) fn wait_quiesced(&self, others: usize, timeout: Duration) -> bool {
+    pub fn wait_quiesced(&self, others: usize, timeout: Duration) -> bool {
         if others == 0 {
             return true;
         }
@@ -108,18 +114,18 @@ impl QuiesceBarrier {
     }
 
     /// Is a quiesce in progress? Cheap; checked at the run-loop top.
-    pub(crate) fn is_quiescing(&self) -> bool {
+    pub fn is_quiescing(&self) -> bool {
         self.quiescing.load(Ordering::SeqCst)
     }
 
     /// Number of threads currently parked at the barrier (diagnostic).
-    pub(crate) fn paused_count(&self) -> usize {
+    pub fn paused_count(&self) -> usize {
         *self.paused.lock().unwrap()
     }
 
     /// Called by every OTHER thread at the lock-safe run-loop top. If a quiesce
     /// is in progress, register as paused and block until it ends.
-    pub(crate) fn park_if_quiescing(&self) {
+    pub fn park_if_quiescing(&self) {
         if !self.is_quiescing() {
             return;
         }
@@ -134,7 +140,7 @@ impl QuiesceBarrier {
 
     /// Called by the forking thread (parent path, child path, or timeout abort)
     /// to lower the flag and release the parked threads.
-    pub(crate) fn end_quiesce(&self) {
+    pub fn end_quiesce(&self) {
         self.quiescing.store(false, Ordering::SeqCst);
         let _g = self.paused.lock().unwrap();
         self.cv.notify_all();
@@ -149,21 +155,27 @@ impl QuiesceBarrier {
 /// its vCPU) at its run-loop top before re-entering guest, waits until no
 /// sibling is in-guest (via the kicker's in_guest flags — not a count), edits,
 /// then resumes. Distinct from fork's quiesce (which tears vCPUs down).
-pub(crate) fn pt_barrier() -> &'static PtQuiesce {
+pub fn pt_barrier() -> &'static PtQuiesce {
     static B: OnceLock<PtQuiesce> = OnceLock::new();
     B.get_or_init(PtQuiesce::new)
 }
 
 #[derive(Debug)]
-pub(crate) struct PtQuiesce {
+pub struct PtQuiesce {
     coordinator: AtomicBool,
     quiescing: AtomicBool,
     lock: Mutex<()>,
     cv: Condvar,
 }
 
+impl Default for PtQuiesce {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PtQuiesce {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             coordinator: AtomicBool::new(false),
             quiescing: AtomicBool::new(false),
@@ -172,24 +184,24 @@ impl PtQuiesce {
         }
     }
 
-    pub(crate) fn is_quiescing(&self) -> bool {
+    pub fn is_quiescing(&self) -> bool {
         self.quiescing.load(Ordering::SeqCst)
     }
 
     /// Try to become the sole pausing editor (loser parks + retries).
-    pub(crate) fn try_become_coordinator(&self) -> bool {
+    pub fn try_become_coordinator(&self) -> bool {
         self.coordinator
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
     }
 
-    pub(crate) fn set_quiescing(&self) {
+    pub fn set_quiescing(&self) {
         self.quiescing.store(true, Ordering::SeqCst);
     }
 
     /// OTHER thread (or a coordinator-CAS loser) parks here until the pause
     /// ends, keeping its vCPU. Called at the lock-safe run-loop top.
-    pub(crate) fn park(&self) {
+    pub fn park(&self) {
         let mut g = self.lock.lock().unwrap();
         while self.quiescing.load(Ordering::SeqCst) {
             g = self.cv.wait(g).unwrap();
@@ -197,7 +209,7 @@ impl PtQuiesce {
     }
 
     /// Coordinator: end the pause, wake parked threads, drop coordinator.
-    pub(crate) fn end(&self) {
+    pub fn end(&self) {
         let _g = self.lock.lock().unwrap();
         self.quiescing.store(false, Ordering::SeqCst);
         self.coordinator.store(false, Ordering::SeqCst);
@@ -209,14 +221,14 @@ impl PtQuiesce {
     /// for siblings to leave guest. Dropping the guard calls `end`, so the pause
     /// is released on EVERY exit path of the editing syscall (incl. `?`-errors).
     /// `tid` is the editor, recorded so the drop can fire `pt-pause-end`.
-    pub(crate) fn pause_guard(&'static self, tid: i32) -> PtPauseGuard {
+    pub fn pause_guard(&'static self, tid: i32) -> PtPauseGuard {
         PtPauseGuard { barrier: self, tid }
     }
 }
 
 /// RAII handle that ends a page-table-edit pause (resuming sibling vCPUs) when
 /// dropped. Held for the duration of the table-editing syscall.
-pub(crate) struct PtPauseGuard {
+pub struct PtPauseGuard {
     barrier: &'static PtQuiesce,
     tid: i32,
 }

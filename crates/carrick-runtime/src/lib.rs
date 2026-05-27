@@ -6,23 +6,15 @@
 
 #[cfg(target_os = "macos")]
 pub mod apfs;
-pub mod compat;
 #[cfg(target_os = "macos")]
 pub(crate) mod darwin_fs;
-#[cfg(target_os = "macos")]
-pub(crate) mod darwin_kqueue;
 pub mod dispatch;
 #[cfg(target_os = "macos")]
 pub mod dtrace_consumer;
-pub(crate) mod fork_coord;
-pub(crate) mod fork_quiesce;
 pub mod fs_backend;
-pub mod host_signal;
 pub mod host_tty;
 pub mod interactive_supervisor;
-pub mod io_wait;
 pub(crate) mod inotify;
-pub(crate) mod itimer;
 pub mod layer_cache;
 // `linux_abi` was lifted into the leaf crate `carrick-abi` (build-graph split,
 // docs/build-decomposition-design.md §3.A-A1). Re-exported under the original
@@ -40,18 +32,27 @@ pub use carrick_mem::{elf, memory, page_table, vdso};
 // deps). Re-exported under their original paths so every `crate::host_proc::…`
 // / `crate::guest_cpu::…` / `crate::ulock::…` site is unchanged.
 pub use carrick_host::{guest_cpu, host_facts, host_mapping, host_proc, ulock};
+// The dispatch-free vCPU / exec-engine cluster was lifted into the leaf crate
+// `carrick-hvf` (report item #1): the HVF trap engine (`trap`, incl. the
+// `SyscallTrap` contract + SIMD/FP C shim), cross-thread vCPU coordination
+// (`thread`/`vcpu_kick`/`io_wait`/`itimer`/`fork_quiesce`/`fork_coord`), the
+// shared-aperture allocator, the Darwin `kqueue` wrapper, host-signal capture,
+// the USDT probe provider (`probes`), compat-reporting (`compat`), and static
+// syscall metadata (`syscall`). None depend on dispatch/VFS. Re-exported under
+// their original `crate::trap::…` / `crate::thread::…` / … paths so every call
+// site across the runtime is unchanged.
+pub use carrick_hvf::{
+    compat, fork_coord, fork_quiesce, host_signal, io_wait, itimer, probes, shared_aperture,
+    syscall, thread, trap, vcpu_kick,
+};
+#[cfg(target_os = "macos")]
+pub use carrick_hvf::darwin_kqueue;
 pub mod overlay;
 
 pub mod execute;
-pub mod probes;
 pub mod pty_relay;
 pub mod rootfs;
 pub mod runtime;
 pub(crate) mod seccomp;
-pub(crate) mod shared_aperture;
-pub mod syscall;
-pub mod thread;
-pub mod trap;
-pub mod vcpu_kick;
 pub mod vfs;
 pub use execute::Runtime;

@@ -1,0 +1,34 @@
+[package]
+name = "carrick-hvf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "carrick_hvf"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+carrick-abi = { path = "../carrick-abi" }
+carrick-guest-mem = { path = "../carrick-guest-mem" }
+carrick-host = { path = "../carrick-host" }
+carrick-mem = { path = "../carrick-mem" }
+clap.workspace = true
+libc.workspace = true
+parking_lot.workspace = true
+parking_lot_core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+usdt.workspace = true
+zerocopy.workspace = true
+
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+applevisor.workspace = true
+applevisor-sys.workspace = true
+
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.build-dependencies]
+cc = "1"

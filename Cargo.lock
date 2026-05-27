@@ -346,6 +346,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "carrick-hvf"
+version = "0.1.0"
+dependencies = [
+ "applevisor",
+ "applevisor-sys",
+ "carrick-abi",
+ "carrick-guest-mem",
+ "carrick-host",
+ "carrick-mem",
+ "cc",
+ "clap",
+ "libc",
+ "parking_lot",
+ "parking_lot_core",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "usdt",
+ "zerocopy",
+]
+
+[[package]]
 name = "carrick-image"
 version = "0.1.0"
 dependencies = [
@@ -384,11 +406,11 @@ dependencies = [
  "carrick-abi",
  "carrick-guest-mem",
  "carrick-host",
+ "carrick-hvf",
  "carrick-image",
  "carrick-mem",
  "carrick-spec",
  "carrick-test-support",
- "cc",
  "clap",
  "fd-lock",
  "flate2",

@@ -10,22 +10,28 @@ use crate::vcpu_kick::{SignalPump, VcpuKicker};
 
 /// Coordinates Carrick-owned host state that must not be left mid-flight across
 /// a real host `fork(2)`.
-pub(crate) struct ForkCoordinator {
+pub struct ForkCoordinator {
     signal_pump: Mutex<Option<SignalPump>>,
 }
 
-pub(crate) struct PreparedHostFork {
+pub struct PreparedHostFork {
     _private: (),
 }
 
+impl Default for ForkCoordinator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ForkCoordinator {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             signal_pump: Mutex::new(None),
         }
     }
 
-    pub(crate) fn start_signal_pump(&self, kicker: &Arc<VcpuKicker>, futex: &Arc<FutexTable>) {
+    pub fn start_signal_pump(&self, kicker: &Arc<VcpuKicker>, futex: &Arc<FutexTable>) {
         let mut pump = self.signal_pump.lock();
         if pump.is_none() {
             *pump = Some(crate::vcpu_kick::spawn_signal_pump(
@@ -35,14 +41,14 @@ impl ForkCoordinator {
         }
     }
 
-    pub(crate) fn prepare_host_fork(&self) -> PreparedHostFork {
+    pub fn prepare_host_fork(&self) -> PreparedHostFork {
         if let Some(pump) = self.signal_pump.lock().take() {
             pump.stop();
         }
         PreparedHostFork { _private: () }
     }
 
-    pub(crate) fn restart_after_parent_fork(
+    pub fn restart_after_parent_fork(
         &self,
         _prepared: PreparedHostFork,
         kicker: &Arc<VcpuKicker>,
@@ -51,7 +57,7 @@ impl ForkCoordinator {
         self.start_signal_pump(kicker, futex);
     }
 
-    pub(crate) fn restart_after_child_fork(
+    pub fn restart_after_child_fork(
         &self,
         _prepared: PreparedHostFork,
         kicker: &Arc<VcpuKicker>,
@@ -60,7 +66,7 @@ impl ForkCoordinator {
         self.start_signal_pump(kicker, futex);
     }
 
-    pub(crate) fn restart_after_fork_error(
+    pub fn restart_after_fork_error(
         &self,
         _prepared: PreparedHostFork,
         kicker: &Arc<VcpuKicker>,
