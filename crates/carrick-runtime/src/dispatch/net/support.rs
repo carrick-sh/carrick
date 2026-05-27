@@ -7,7 +7,9 @@ use zerocopy::{FromBytes, IntoBytes};
 use super::super::*;
 use crate::linux_abi::{
     LINUX_ARPHRD_ETHER, LINUX_IFF_BROADCAST, LINUX_IFF_MULTICAST, LINUX_IFF_POINTOPOINT,
-    LINUX_RT_SCOPE_HOST, LINUX_RT_SCOPE_LINK, LINUX_RT_SCOPE_UNIVERSE,
+    LINUX_RT_SCOPE_HOST, LINUX_RT_SCOPE_LINK, LINUX_RT_SCOPE_UNIVERSE, LINUX_RT_TABLE_MAIN,
+    LINUX_RTA_DST, LINUX_RTA_OIF, LINUX_RTM_GETNEIGH, LINUX_RTM_GETROUTE, LINUX_RTM_NEWROUTE,
+    LINUX_RTN_UNICAST, LINUX_RTPROT_KERNEL, LinuxRtMsg,
 };
 
 pub(super) fn read_epoll_event(
@@ -603,14 +605,63 @@ pub(super) fn build_netlink_reply(request: &[u8], pid: u32) -> Vec<u8> {
             }
             push_nlmsg_done(&mut out, seq, pid);
         }
+        LINUX_RTM_GETROUTE => {
+            // One connected route per address: the network it sits on, via its
+            // interface. `ip route` and Go's net route enumeration expect at
+            // least the loopback route; addresses with prefixlen 0 (a bare host
+            // address with no network) are skipped.
+            for a in &addrs {
+                if a.prefixlen == 0 {
+                    continue;
+                }
+                let mut payload = Vec::new();
+                let rtm = LinuxRtMsg {
+                    rtm_family: a.family,
+                    rtm_dst_len: a.prefixlen,
+                    rtm_src_len: 0,
+                    rtm_tos: 0,
+                    rtm_table: LINUX_RT_TABLE_MAIN,
+                    rtm_protocol: LINUX_RTPROT_KERNEL,
+                    rtm_scope: a.scope,
+                    rtm_type: LINUX_RTN_UNICAST,
+                    rtm_flags: 0,
+                };
+                payload.extend_from_slice(rtm.as_bytes());
+                push_rtattr(&mut payload, LINUX_RTA_DST, &masked_network(&a.addr, a.prefixlen));
+                push_rtattr(&mut payload, LINUX_RTA_OIF, &(a.index).to_ne_bytes());
+                push_nlmsg(&mut out, LINUX_RTM_NEWROUTE, seq, pid, &payload);
+            }
+            push_nlmsg_done(&mut out, seq, pid);
+        }
+        LINUX_RTM_GETNEIGH => {
+            // No synthetic neighbour (ARP/NDP) entries — an empty-but-valid dump,
+            // which is what `ip neigh` shows on a freshly-started host too.
+            push_nlmsg_done(&mut out, seq, pid);
+        }
         _ => {
-            // Unmodelled request (e.g. RTM_GETROUTE, RTM_GETNEIGH): return
-            // an empty dump so the caller's enumeration loop terminates
-            // cleanly rather than blocking.
+            // Any other unmodelled request: a bare NLMSG_DONE so the caller's
+            // enumeration loop terminates cleanly rather than blocking.
             push_nlmsg_done(&mut out, seq, pid);
         }
     }
     out
+}
+
+/// Mask an IPv4/IPv6 address down to its network prefix (`addr & netmask`), so
+/// an RTM_NEWROUTE's RTA_DST carries the network rather than the host address.
+fn masked_network(addr: &[u8], prefixlen: u8) -> Vec<u8> {
+    let mut net = addr.to_vec();
+    let prefix = prefixlen as usize;
+    for (i, byte) in net.iter_mut().enumerate() {
+        let bit_start = i * 8;
+        if bit_start >= prefix {
+            *byte = 0;
+        } else if bit_start + 8 > prefix {
+            let keep = prefix - bit_start; // high `keep` bits stay set
+            *byte &= 0xFFu8 << (8 - keep);
+        }
+    }
+    net
 }
 
 pub(super) fn linux_to_host_msg_flags(flags: i32) -> i32 {
@@ -1083,6 +1134,48 @@ pub(in crate::dispatch) fn set_host_nonblocking(fd: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn netlink_rtm_getroute_synthesizes_terminated_route_dump() {
+        let req = LinuxNlMsgHdr {
+            nlmsg_len: std::mem::size_of::<LinuxNlMsgHdr>() as u32,
+            nlmsg_type: LINUX_RTM_GETROUTE,
+            nlmsg_flags: 0,
+            nlmsg_seq: 7,
+            nlmsg_pid: 0,
+        };
+        let reply = build_netlink_reply(req.as_bytes(), 42);
+        // Walk the multipart reply (each message 4-byte aligned): expect at least
+        // one connected RTM_NEWROUTE, terminated by NLMSG_DONE, nothing else.
+        let hdr_size = std::mem::size_of::<LinuxNlMsgHdr>();
+        let mut offset = 0;
+        let mut routes = 0;
+        let mut saw_done = false;
+        while offset + hdr_size <= reply.len() {
+            let (h, _) = LinuxNlMsgHdr::read_from_prefix(&reply[offset..]).unwrap();
+            match h.nlmsg_type {
+                LINUX_RTM_NEWROUTE => routes += 1,
+                LINUX_NLMSG_DONE => saw_done = true,
+                other => panic!("unexpected nlmsg_type {other} in RTM_GETROUTE reply"),
+            }
+            let aligned = (h.nlmsg_len as usize).next_multiple_of(NLMSG_ALIGNTO);
+            if aligned == 0 {
+                break;
+            }
+            offset += aligned;
+        }
+        assert!(routes >= 1, "expected at least the loopback connected route");
+        assert!(saw_done, "route dump must terminate with NLMSG_DONE");
+    }
+
+    #[test]
+    fn masked_network_zeroes_host_bits() {
+        // 127.0.0.1/8 -> 127.0.0.0 ; 192.168.5.9/24 -> 192.168.5.0
+        assert_eq!(masked_network(&[127, 0, 0, 1], 8), vec![127, 0, 0, 0]);
+        assert_eq!(masked_network(&[192, 168, 5, 9], 24), vec![192, 168, 5, 0]);
+        // /20 splits the third byte: keep high 4 bits (0xF0).
+        assert_eq!(masked_network(&[10, 1, 0xFF, 0xFF], 20), vec![10, 1, 0xF0, 0]);
+    }
 
     #[test]
     fn address_family_translation_covers_bsd_families_and_passthrough() {

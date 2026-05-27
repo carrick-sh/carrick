@@ -404,6 +404,38 @@ pub struct LinuxIfAddrMsg {
     pub ifa_index: u32,
 }
 
+/// `struct rtmsg` — payload of an RTM_NEWROUTE message (a routing-table entry).
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct LinuxRtMsg {
+    pub rtm_family: u8,
+    pub rtm_dst_len: u8,
+    pub rtm_src_len: u8,
+    pub rtm_tos: u8,
+    pub rtm_table: u8,
+    pub rtm_protocol: u8,
+    pub rtm_scope: u8,
+    pub rtm_type: u8,
+    pub rtm_flags: u32,
+}
+
+/// `struct ndmsg` — payload of an RTM_NEWNEIGH message (a neighbour entry).
+#[repr(C, packed)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct LinuxNdMsg {
+    pub ndm_family: u8,
+    pub ndm_pad1: u8,
+    pub ndm_pad2: u16,
+    pub ndm_ifindex: i32,
+    pub ndm_state: u16,
+    pub ndm_flags: u8,
+    pub ndm_type: u8,
+}
+
 /// `struct rtattr` — TLV attribute header used inside rtnetlink payloads.
 #[repr(C, packed)]
 #[derive(
@@ -422,6 +454,18 @@ pub const LINUX_RTM_GETLINK: u16 = 18;
 pub const LINUX_RTM_NEWLINK: u16 = 16;
 pub const LINUX_RTM_GETADDR: u16 = 22;
 pub const LINUX_RTM_NEWADDR: u16 = 20;
+pub const LINUX_RTM_NEWROUTE: u16 = 24;
+pub const LINUX_RTM_GETROUTE: u16 = 26;
+pub const LINUX_RTM_NEWNEIGH: u16 = 28;
+pub const LINUX_RTM_GETNEIGH: u16 = 30;
+
+// rtattr types inside an rtmsg (RTM_*ROUTE).
+pub const LINUX_RTA_DST: u16 = 1;
+pub const LINUX_RTA_OIF: u16 = 4;
+// rtm_table / rtm_protocol / rtm_type / rtm_scope values for a connected route.
+pub const LINUX_RT_TABLE_MAIN: u8 = 254;
+pub const LINUX_RTPROT_KERNEL: u8 = 2;
+pub const LINUX_RTN_UNICAST: u8 = 1;
 
 // nlmsg_flags.
 pub const LINUX_NLM_F_MULTI: u16 = 0x2;
