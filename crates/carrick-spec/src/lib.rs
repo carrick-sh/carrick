@@ -131,6 +131,41 @@ pub enum FsBackendKind {
     Host,
 }
 
+/// The instruction-set architecture of the Linux container to run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Platform {
+    /// AArch64 / arm64 — native on Apple Silicon. Default.
+    #[default]
+    Aarch64,
+    /// x86_64 / amd64 — translated via Apple Rosetta 2.
+    Amd64,
+}
+
+impl Platform {
+    /// Parse from OCI platform strings ("linux/amd64", "linux/arm64", …) or
+    /// bare arch tokens ("amd64", "arm64"). Returns `None` for anything we
+    /// can't run, so the caller can fall back to the default.
+    pub fn from_oci_str(s: &str) -> Option<Self> {
+        // Accept an optional "linux/" (or other os/) prefix; we only run linux
+        // guests, so the os component is advisory.
+        let arch = s.rsplit('/').next().unwrap_or(s).trim();
+        match arch {
+            "amd64" | "x86_64" | "x86-64" => Some(Self::Amd64),
+            "arm64" | "aarch64" => Some(Self::Aarch64),
+            _ => None,
+        }
+    }
+
+    /// The OCI `architecture` token used in image-index platform matching.
+    pub fn oci_arch(self) -> &'static str {
+        match self {
+            Self::Aarch64 => "arm64",
+            Self::Amd64 => "amd64",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunSpec {
     pub executable: String,
@@ -145,6 +180,11 @@ pub struct RunSpec {
     pub interactive: bool,
     pub max_traps: usize,
     pub debug_state_path: Option<Utf8PathBuf>,
+    /// Target ISA of the container. `Amd64` enables Rosetta 2 translation:
+    /// the runtime redirects x86_64 ELF loads through Rosetta and bind-mounts
+    /// the host Rosetta runtime into the guest VFS. Defaults to `Aarch64`.
+    #[serde(default)]
+    pub platform: Platform,
 }
 
 #[cfg(test)]
@@ -164,6 +204,27 @@ mod tests {
 
         let deserialized: ImageReference = serde_json::from_str(&serialized).expect("deserialize");
         assert_eq!(deserialized, reference);
+    }
+
+    #[test]
+    fn test_platform_from_oci_str() {
+        assert_eq!(Platform::from_oci_str("linux/amd64"), Some(Platform::Amd64));
+        assert_eq!(
+            Platform::from_oci_str("linux/x86_64"),
+            Some(Platform::Amd64)
+        );
+        assert_eq!(Platform::from_oci_str("amd64"), Some(Platform::Amd64));
+        assert_eq!(
+            Platform::from_oci_str("linux/arm64"),
+            Some(Platform::Aarch64)
+        );
+        assert_eq!(
+            Platform::from_oci_str("linux/aarch64"),
+            Some(Platform::Aarch64)
+        );
+        assert_eq!(Platform::from_oci_str("linux/riscv64"), None);
+        assert_eq!(Platform::default(), Platform::Aarch64);
+        assert_eq!(Platform::Amd64.oci_arch(), "amd64");
     }
 
     #[test]

@@ -1486,6 +1486,18 @@ pub const LINUX_PR_GET_DUMPABLE: u64 = 3;
 pub const LINUX_PR_SET_DUMPABLE: u64 = 4;
 pub const LINUX_PR_SET_NAME: u64 = 15;
 pub const LINUX_PR_GET_NAME: u64 = 16;
+/// `prctl(PR_GET_MEM_MODEL, …)` / `prctl(PR_SET_MEM_MODEL, …)` — query or set
+/// the CPU memory-ordering model. Apple Rosetta 2 issues
+/// `PR_SET_MEM_MODEL(PR_SET_MEM_MODEL_TSO)` at startup to request hardware
+/// x86_64 TSO ordering. These are the magic ASCII ("mMDL"/"MMDL") option values
+/// from the Apple-Silicon/Asahi downstream kernel ABI that Apple's Rosetta was
+/// built against — NOT small integers (the spec's "70/71" guess collides with
+/// upstream PR_RISCV_V_* / PR_SET_MEMORY_CONSISTENCY_MODEL).
+pub const LINUX_PR_GET_MEM_MODEL: u64 = 0x6d4d444c;
+pub const LINUX_PR_SET_MEM_MODEL: u64 = 0x4d4d444c;
+/// `arg2` values for PR_SET_MEM_MODEL.
+pub const LINUX_PR_SET_MEM_MODEL_DEFAULT: u64 = 0;
+pub const LINUX_PR_SET_MEM_MODEL_TSO: u64 = 1;
 pub const LINUX_P_ALL: u64 = 0;
 pub const LINUX_P_PID: u64 = 1;
 pub const LINUX_P_PGID: u64 = 2;

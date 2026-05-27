@@ -60,8 +60,11 @@ tracing = "0.1.43"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt"] }
 usdt = "0.6.0"
 zerocopy = { version = "0.8.48", features = ["derive"] }
-applevisor = { version = "1.0.0", default-features = false, features = ["macos-13-0"] }
-applevisor-sys = { version = "1.0.0", default-features = false, features = ["macos-13-0"] }
+# macos-15-0 (vs 13-0) exposes hv_sys_reg_t::ACTLR_EL1 (0xc081), whose EnTSO bit
+# (index 1) toggles hardware x86_64 TSO memory ordering — required by Rosetta 2
+# translation (see docs/rosetta.md). Host must be macOS 15+.
+applevisor = { version = "1.0.0", default-features = false, features = ["macos-15-0"] }
+applevisor-sys = { version = "1.0.0", default-features = false, features = ["macos-15-0"] }
 # dev
 assert_cmd = "2.1.1"
 predicates = "3.1.3"

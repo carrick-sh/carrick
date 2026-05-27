@@ -10,13 +10,66 @@ use crate::runtime::{
 };
 use crate::vfs::BindVfs;
 use anyhow::{Context, Result};
-use carrick_spec::{FsBackendKind, RunSpec};
+use carrick_spec::{FsBackendKind, Platform, RunSpec};
 use std::path::PathBuf;
+
+/// For an `amd64` (Rosetta-translated) container, expose the host's Rosetta
+/// runtime files inside the guest VFS at the same paths. Rosetta opens these at
+/// startup to load its support libraries and (optionally) its AOT translation
+/// cache; they do not exist in the OCI image. The `oah` runtime dir is mapped
+/// read-only; the per-user cache dir is writable (best-effort — it is
+/// SIP-protected and may be inaccessible, in which case Rosetta JITs without a
+/// persistent cache).
+/// Environment variable by which the operator acknowledges responsibility for
+/// complying with Apple's macOS Software License Agreement when running amd64
+/// containers through Rosetta 2. Setting it (to any value) accepts that risk
+/// and suppresses the per-run reminder.
+pub const ROSETTA_ACCEPT_ENV: &str = "CARRICK_ACCEPT_ROSETTA_TERMS";
+
+/// Print a one-time (per process) reminder that amd64 support drives Apple's
+/// Rosetta 2 — which carrick does not bundle or redistribute — and that its use
+/// is governed by Apple's macOS Software License Agreement. Suppressed once the
+/// operator accepts the terms via [`ROSETTA_ACCEPT_ENV`] (or the legacy
+/// `CARRICK_NO_ROSETTA_NOTICE`). Goes to stderr so it never corrupts a `--raw`
+/// guest's stdout.
+fn rosetta_license_notice() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static SHOWN: AtomicBool = AtomicBool::new(false);
+    if std::env::var_os(ROSETTA_ACCEPT_ENV).is_some()
+        || std::env::var_os("CARRICK_NO_ROSETTA_NOTICE").is_some()
+    {
+        return;
+    }
+    if SHOWN.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    eprintln!(
+        "carrick: running an amd64 container via Apple Rosetta 2 (translation \
+         provided by your macOS install; carrick bundles none of it). Use is \
+         subject to Apple's macOS Software License Agreement. Set {ROSETTA_ACCEPT_ENV}=1 \
+         to accept and silence this notice."
+    );
+}
+
+fn install_rosetta_mounts(dispatcher: &mut SyscallDispatcher) {
+    const ROSETTA_RUNTIME_DIR: &str = "/Library/Apple/usr/libexec/oah";
+    const ROSETTA_CACHE_DIR: &str = "/var/db/oah";
+    for (path, readonly) in [(ROSETTA_RUNTIME_DIR, true), (ROSETTA_CACHE_DIR, false)] {
+        if !std::path::Path::new(path).exists() {
+            continue;
+        }
+        let bind = BindVfs::new(path, PathBuf::from(path), readonly);
+        dispatcher.register_mount(PathBuf::from(path), Box::new(bind));
+    }
+}
 
 pub struct Runtime;
 
 impl Runtime {
     pub fn execute(spec: &RunSpec) -> Result<RunResult, RuntimeError> {
+        if spec.platform == Platform::Amd64 {
+            rosetta_license_notice();
+        }
         // Name the host process `carrick: <basename>` up front so
         // it's identifiable in ps/Activity Monitor even before the
         // guest sets its own comm via prctl.
@@ -69,6 +122,9 @@ impl Runtime {
                     let target_path = PathBuf::from(mount.target.as_std_path());
                     let bind_vfs = BindVfs::new(mount.target.as_str(), host_path, mount.readonly);
                     dispatcher.register_mount(target_path, Box::new(bind_vfs));
+                }
+                if spec.platform == Platform::Amd64 {
+                    install_rosetta_mounts(&mut dispatcher);
                 }
 
                 let _ = dispatcher.set_fs_backend(Box::new(host));
@@ -146,6 +202,9 @@ impl Runtime {
                     let target_path = PathBuf::from(mount.target.as_std_path());
                     let bind_vfs = BindVfs::new(mount.target.as_str(), host_path, mount.readonly);
                     dispatcher.register_mount(target_path, Box::new(bind_vfs));
+                }
+                if spec.platform == Platform::Amd64 {
+                    install_rosetta_mounts(&mut dispatcher);
                 }
 
                 // Interactive pty or raw stream

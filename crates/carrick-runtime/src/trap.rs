@@ -788,6 +788,34 @@ impl HvfTrapEngine {
         self.inner.complete_syscall(return_value)
     }
 
+    /// Toggle hardware x86_64 Total Store Ordering on this vCPU by setting or
+    /// clearing `ACTLR_EL1.EnTSO` (bit index 1). Apple Rosetta-translated
+    /// guests request this via `prctl(PR_SET_MEM_MODEL, PR_SET_MEM_MODEL_TSO)`
+    /// so x86 atomics/ordering are honoured in hardware instead of needing
+    /// expensive barrier emulation. `applevisor` only permits this single bit
+    /// to be set via `ACTLR_EL1`. Per-vCPU: must run on the active vCPU thread.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn set_hardware_tso(&self, tso: bool) -> Result<(), TrapError> {
+        use applevisor::prelude::*;
+        const EN_TSO: u64 = 1 << 1;
+        let actlr = self
+            .inner
+            .vcpu
+            .get_sys_reg(SysReg::ACTLR_EL1)
+            .map_err(hvf_error)?;
+        let next = if tso { actlr | EN_TSO } else { actlr & !EN_TSO };
+        self.inner
+            .vcpu
+            .set_sys_reg(SysReg::ACTLR_EL1, next)
+            .map_err(hvf_error)?;
+        Ok(())
+    }
+
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    pub fn set_hardware_tso(&self, _tso: bool) -> Result<(), TrapError> {
+        Err(TrapError::UnsupportedPlatform)
+    }
+
     /// Real macOS fork(2). The parent continues running its existing HVF
     /// context unchanged; the child returns with a freshly-rebuilt VM
     /// pointing at the same host buffers (COW via Mach VM), all sysregs
@@ -3070,6 +3098,18 @@ fn signal_frame_stack_pointer(
 #[cfg(test)]
 mod memory_protection_tests {
     use super::*;
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn probe_max_ipa_size() {
+        use applevisor::prelude::*;
+        let max = VirtualMachineConfig::get_max_ipa_size().unwrap();
+        let dflt = VirtualMachineConfig::get_default_ipa_size().unwrap();
+        eprintln!(
+            "MAX_IPA_BITS={max} (covers 0x{:x}) DEFAULT_IPA_BITS={dflt}; rosetta base 2^47 needs >=48",
+            1u128 << max
+        );
+    }
 
     #[test]
     fn exec_level_classifies_el0_as_guest_el1_as_kernel() {

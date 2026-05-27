@@ -74,9 +74,19 @@ pub(crate) enum Commands {
     },
     Pull {
         image: String,
+        /// Target platform, e.g. `linux/amd64` or `linux/arm64`. Selects the
+        /// OCI manifest entry for a multi-arch image. Defaults to arm64.
+        #[arg(long, value_name = "OS/ARCH")]
+        platform: Option<String>,
     },
     Run {
         image: String,
+        /// Target platform, e.g. `linux/amd64` or `linux/arm64`. Selects the
+        /// OCI manifest entry for multi-arch images and, for amd64, enables
+        /// Rosetta 2 translation of the x86_64 guest. Defaults to the host
+        /// architecture (arm64 on Apple Silicon).
+        #[arg(long, value_name = "OS/ARCH")]
+        platform: Option<String>,
         #[arg(long, default_value_t = DEFAULT_MAX_TRAPS)]
         max_traps: usize,
         /// See `run-elf --debug-state-path`.
