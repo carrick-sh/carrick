@@ -545,7 +545,7 @@ where
                     deliver_pending_signal(runtime, &dispatcher, None, this_tid, Some(pc))?
                     && let Some(signum) = action.term_signal
                 {
-                    if runtime.is_forked_child() {
+                    if runtime.is_forked_child() || dispatcher.is_forked_guest_process() {
                         forked_child_die_by_signal(
                             signum,
                             dispatcher.stdout(),
@@ -593,7 +593,7 @@ where
             }
             DispatchOutcome::Exit { code } => {
                 crate::probes::guest_exit(code);
-                if runtime.is_forked_child() {
+                if runtime.is_forked_child() || dispatcher.is_forked_guest_process() {
                     forked_child_exit(code, dispatcher.stdout(), dispatcher.stderr());
                 }
                 return Ok(RunResult {
@@ -702,7 +702,7 @@ where
             deliver_pending_signal(runtime, &dispatcher, last_syscall_retval, this_tid, None)?
             && let Some(signum) = action.term_signal
         {
-            if runtime.is_forked_child() {
+            if runtime.is_forked_child() || dispatcher.is_forked_guest_process() {
                 forked_child_die_by_signal(signum, dispatcher.stdout(), dispatcher.stderr());
             }
             return Ok(RunResult {
@@ -2001,7 +2001,7 @@ fn service_signals_threaded(
         interrupted_pc,
     )? && let Some(signum) = action.term_signal
     {
-        if engine.is_forked_child() {
+        if engine.is_forked_child() || kernel.dispatcher.is_forked_guest_process() {
             let out = kernel.dispatcher.stdout();
             let err = kernel.dispatcher.stderr();
             forked_child_die_by_signal(signum, &out, &err);
@@ -2084,7 +2084,7 @@ fn deliver_fault_signal(
 ) -> Result<Option<VcpuLoopOutcome>, RuntimeError> {
     let dispatcher = &kernel.dispatcher;
     let terminate = |signum: i32| -> Result<Option<VcpuLoopOutcome>, RuntimeError> {
-        if engine.is_forked_child() {
+        if engine.is_forked_child() || kernel.dispatcher.is_forked_guest_process() {
             let out = dispatcher.stdout();
             let err = dispatcher.stderr();
             forked_child_die_by_signal(signum, &out, &err);
