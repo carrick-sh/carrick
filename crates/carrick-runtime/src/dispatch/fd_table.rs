@@ -226,6 +226,14 @@ pub(super) enum OpenDescription {
         host_pid: i32,
         kqueue: Arc<crate::darwin_kqueue::Kqueue>,
     },
+    /// A Linux inotify instance. Backed by an [`InotifyState`] (a kqueue +
+    /// `EVFILT_VNODE` watch table); like `Pidfd`/`TimerFd` it is a pollable,
+    /// non-seekable, non-file fd whose readiness is the backing kqueue's fd.
+    /// `read(2)` drains queued vnode changes as Linux `inotify_event` records.
+    Inotify {
+        base: OpenDescriptionBase,
+        state: Arc<crate::inotify::InotifyState>,
+    },
     // In-memory pipe ends. Currently `pipe2(2)` routes through `HostPipe`
     // (real macOS kernel pipe) so these are not constructed today, but the
     // full read/write/poll machinery (`PipeState`, `read_pipe`, `write_pipe`)
@@ -486,6 +494,7 @@ impl OpenDescription {
             | OpenDescription::HostPipe { base, .. }
             | OpenDescription::HostFile { base, .. }
             | OpenDescription::HostSocket { base, .. }
+            | OpenDescription::Inotify { base, .. }
             | OpenDescription::Netlink { base, .. } => base,
         }
     }
@@ -504,6 +513,7 @@ impl OpenDescription {
             | OpenDescription::HostPipe { base, .. }
             | OpenDescription::HostFile { base, .. }
             | OpenDescription::HostSocket { base, .. }
+            | OpenDescription::Inotify { base, .. }
             | OpenDescription::Netlink { base, .. } => base,
         }
     }
@@ -542,6 +552,9 @@ impl OpenDescription {
             }
             OpenDescription::Pidfd { .. } => {
                 OpenStatSource::Record(StatRecord::synthetic("anon_inode:[pidfd]", 0, 0o600))
+            }
+            OpenDescription::Inotify { .. } => {
+                OpenStatSource::Record(StatRecord::synthetic("anon_inode:[inotify]", 0, 0o600))
             }
             OpenDescription::PipeReader { .. } | OpenDescription::PipeWriter { .. } => {
                 OpenStatSource::Record(StatRecord::synthetic(
