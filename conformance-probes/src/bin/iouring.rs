@@ -26,6 +26,27 @@ const IORING_OP_WRITE: u8 = 23;
 const IORING_OP_CLOSE: u8 = 19;
 const IORING_OP_SEND: u8 = 26;
 const IORING_OP_RECV: u8 = 27;
+const IORING_OP_SENDMSG: u8 = 9;
+const IORING_OP_RECVMSG: u8 = 10;
+
+#[repr(C)]
+struct Iovec {
+    base: u64,
+    len: u64,
+}
+
+#[repr(C)]
+struct Msghdr {
+    name: u64,
+    namelen: u32,
+    _p0: u32,
+    iov: u64,
+    iovlen: u64,
+    control: u64,
+    controllen: u64,
+    flags: u32,
+    _p1: u32,
+}
 const IORING_ENTER_GETEVENTS: u32 = 1;
 
 const P_SQ_ENTRIES: usize = 0;
@@ -292,5 +313,55 @@ unsafe fn ring_ops(r: &mut Ring) -> bool {
         return false;
     }
 
+    // SENDMSG / RECVMSG over a fresh socketpair (single iovec each).
+    let mut sv2 = [0i32; 2];
+    if libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv2.as_mut_ptr()) != 0 {
+        return false;
+    }
+    let (c, d) = (sv2[0], sv2[1]);
+    let payload = b"msg-hi";
+    let siov = Iovec {
+        base: payload.as_ptr() as u64,
+        len: payload.len() as u64,
+    };
+    let smsg = msghdr_one(&siov);
+    if r.submit_reap(|sqe| {
+        *sqe.add(0) = IORING_OP_SENDMSG;
+        ptr::write_unaligned(sqe.add(4) as *mut i32, c);
+        ptr::write_unaligned(sqe.add(16) as *mut u64, &smsg as *const Msghdr as u64);
+    }) != Some(payload.len() as i32)
+    {
+        return false;
+    }
+    let mut mb = [0u8; 8];
+    let riov = Iovec {
+        base: mb.as_mut_ptr() as u64,
+        len: mb.len() as u64,
+    };
+    let rmsg = msghdr_one(&riov);
+    if r.submit_reap(|sqe| {
+        *sqe.add(0) = IORING_OP_RECVMSG;
+        ptr::write_unaligned(sqe.add(4) as *mut i32, d);
+        ptr::write_unaligned(sqe.add(16) as *mut u64, &rmsg as *const Msghdr as u64);
+    }) != Some(payload.len() as i32)
+        || &mb[..payload.len()] != payload
+    {
+        return false;
+    }
+
     true
+}
+
+fn msghdr_one(iov: &Iovec) -> Msghdr {
+    Msghdr {
+        name: 0,
+        namelen: 0,
+        _p0: 0,
+        iov: iov as *const Iovec as u64,
+        iovlen: 1,
+        control: 0,
+        controllen: 0,
+        flags: 0,
+        _p1: 0,
+    }
 }

@@ -22,11 +22,12 @@
 use super::*;
 use crate::linux_abi::{
     LinuxIoCqringOffsets, LinuxIoSqringOffsets, LinuxIoUringCqe, LinuxIoUringParams,
-    LinuxIoUringSqe, LinuxIovec, LINUX_IORING_FEAT_NODROP, LINUX_IORING_FEAT_SINGLE_MMAP,
-    LINUX_IORING_OFF_CQ_RING, LINUX_IORING_OFF_SQES, LINUX_IORING_OFF_SQ_RING,
-    LINUX_IORING_OP_CLOSE, LINUX_IORING_OP_FSYNC, LINUX_IORING_OP_NOP, LINUX_IORING_OP_POLL_ADD,
-    LINUX_IORING_OP_READ, LINUX_IORING_OP_READV, LINUX_IORING_OP_RECV, LINUX_IORING_OP_SEND,
-    LINUX_IORING_OP_WRITE, LINUX_IORING_OP_WRITEV,
+    LinuxIoUringSqe, LinuxIovec, LinuxMsghdr, LINUX_IORING_FEAT_NODROP,
+    LINUX_IORING_FEAT_SINGLE_MMAP, LINUX_IORING_OFF_CQ_RING, LINUX_IORING_OFF_SQES,
+    LINUX_IORING_OFF_SQ_RING, LINUX_IORING_OP_CLOSE, LINUX_IORING_OP_FSYNC, LINUX_IORING_OP_NOP,
+    LINUX_IORING_OP_POLL_ADD, LINUX_IORING_OP_READ, LINUX_IORING_OP_READV, LINUX_IORING_OP_RECV,
+    LINUX_IORING_OP_RECVMSG, LINUX_IORING_OP_SEND, LINUX_IORING_OP_SENDMSG, LINUX_IORING_OP_WRITE,
+    LINUX_IORING_OP_WRITEV,
 };
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -152,8 +153,24 @@ enum AsyncOutcome {
 fn is_async_op(op: u8) -> bool {
     matches!(
         op,
-        LINUX_IORING_OP_SEND | LINUX_IORING_OP_RECV | LINUX_IORING_OP_POLL_ADD
+        LINUX_IORING_OP_SEND
+            | LINUX_IORING_OP_RECV
+            | LINUX_IORING_OP_SENDMSG
+            | LINUX_IORING_OP_RECVMSG
+            | LINUX_IORING_OP_POLL_ADD
     )
+}
+
+/// Read the iovec array referenced by a Linux `msghdr` at `addr` (RECVMSG/
+/// SENDMSG point their SQE at one). msg_name/msg_control are ignored — carrick
+/// services connected-socket message I/O, the common io_uring case.
+fn read_msghdr_iovecs(memory: &impl GuestMemory, addr: u64) -> Option<Vec<LinuxIovec>> {
+    let bytes = memory
+        .read_bytes(addr, core::mem::size_of::<LinuxMsghdr>())
+        .ok()?;
+    let (mh, _) = LinuxMsghdr::read_from_prefix(&bytes).ok()?;
+    let (iov, iovlen) = (mh.iov, mh.iovlen); // copy packed fields to locals
+    read_iovecs(memory, iov, iovlen as usize)
 }
 
 /// True for the opcodes carrick phase 1 actually executes (the rest complete
@@ -524,6 +541,61 @@ impl SyscallDispatcher {
                 let Ok(buf) = memory.read_bytes(sqe.addr, sqe.len as usize) else {
                     return AsyncOutcome::Ready(-LINUX_EFAULT);
                 };
+                let n = unsafe {
+                    libc::send(hfd, buf.as_ptr() as *const _, buf.len(), libc::MSG_DONTWAIT)
+                };
+                match n.host_syscall_errno() {
+                    Ok(put) => AsyncOutcome::Ready(put as i32),
+                    Err(e) if e == LINUX_EAGAIN => AsyncOutcome::Block(hfd, libc::POLLOUT),
+                    Err(e) => AsyncOutcome::Ready(-e),
+                }
+            }
+            LINUX_IORING_OP_RECVMSG => {
+                let Some(hfd) = self.host_socket_fd(sqe.fd) else {
+                    return AsyncOutcome::Ready(-LINUX_EINVAL);
+                };
+                let Some(iovs) = read_msghdr_iovecs(memory, sqe.addr) else {
+                    return AsyncOutcome::Ready(-LINUX_EFAULT);
+                };
+                let total: usize = iovs.iter().map(|v| v.iov_len as usize).sum();
+                let mut buf = vec![0u8; total];
+                let n = unsafe {
+                    libc::recv(hfd, buf.as_mut_ptr() as *mut _, total, libc::MSG_DONTWAIT)
+                };
+                match n.host_syscall_errno() {
+                    Ok(got) => {
+                        let got = got as usize;
+                        let mut done = 0usize;
+                        for v in &iovs {
+                            if done >= got {
+                                break;
+                            }
+                            let chunk = (v.iov_len as usize).min(got - done);
+                            if memory.write_bytes(v.iov_base, &buf[done..done + chunk]).is_err() {
+                                return AsyncOutcome::Ready(-LINUX_EFAULT);
+                            }
+                            done += chunk;
+                        }
+                        AsyncOutcome::Ready(got as i32)
+                    }
+                    Err(e) if e == LINUX_EAGAIN => AsyncOutcome::Block(hfd, libc::POLLIN),
+                    Err(e) => AsyncOutcome::Ready(-e),
+                }
+            }
+            LINUX_IORING_OP_SENDMSG => {
+                let Some(hfd) = self.host_socket_fd(sqe.fd) else {
+                    return AsyncOutcome::Ready(-LINUX_EINVAL);
+                };
+                let Some(iovs) = read_msghdr_iovecs(memory, sqe.addr) else {
+                    return AsyncOutcome::Ready(-LINUX_EFAULT);
+                };
+                let mut buf = Vec::new();
+                for v in &iovs {
+                    let Ok(chunk) = memory.read_bytes(v.iov_base, v.iov_len as usize) else {
+                        return AsyncOutcome::Ready(-LINUX_EFAULT);
+                    };
+                    buf.extend_from_slice(&chunk);
+                }
                 let n = unsafe {
                     libc::send(hfd, buf.as_ptr() as *const _, buf.len(), libc::MSG_DONTWAIT)
                 };
