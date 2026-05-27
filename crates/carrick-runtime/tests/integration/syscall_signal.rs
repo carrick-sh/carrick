@@ -58,7 +58,10 @@ fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
     let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
-    // rt_sigsuspend(mask=0x4000, sigsetsize=8) -> EINTR (no signals to wake us).
+    // rt_sigsuspend(mask=0x4000, sigsetsize=8) -> EINTR. A deliverable signal is
+    // pending, so the suspend wakes promptly (rt_sigsuspend now installs the
+    // mask and waits for a deliverable signal rather than returning instantly).
+    dispatcher.mark_signal_pending(0, 10);
     assert_eq!(
         dispatcher
             .dispatch(
@@ -537,4 +540,33 @@ fn sigaltstack_bootstrap_zeroes_old_stack_and_validates_new() {
     );
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn rt_sigsuspend_applies_mask_then_returns_eintr_on_pending_signal() {
+    // rt_sigsuspend installs the given mask, waits for a deliverable signal,
+    // then restores the mask and returns -EINTR. Pre-mark a deliverable signal
+    // so it returns promptly (rather than busy-waiting to the bound).
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    // Signal 10 already pending for the (no-thread-context) tid 0; with a
+    // suspend mask of 0 (block nothing) it is immediately deliverable.
+    dispatcher.mark_signal_pending(0, 10);
+    memory.write_bytes(0x4000, &0u64.to_le_bytes()).unwrap();
+
+    // rt_sigsuspend(mask_ptr=0x4000, sigsetsize=8) -> EINTR (4).
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(133, SyscallArgs::from([0x4000, 8, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 4 }
+    );
+    // The pre-suspend mask (0) is restored, not left as the suspend mask.
+    assert_eq!(dispatcher.signal_mask_for(0), 0);
 }
