@@ -20,6 +20,20 @@ fn syscall_entry_name_is_borrowed_not_allocated() {
 fn aggregates_unhandled_syscalls_by_name_and_number() {
     let reporter = CompatReporter::default();
 
+    // A genuinely unknown number (not in the aarch64 table) aggregates in
+    // `unhandled_syscalls`; a recognised one (openat=56, which the table knows
+    // even though it hit the ENOSYS fallthrough here) aggregates in the
+    // `deferred_syscalls` bucket. Both dedup by (number, name) and count.
+    reporter.record(CompatEvent::unhandled_syscall(
+        4242,
+        "unknown",
+        SyscallArgs::from([1, 2, 3, 4, 5, 6]),
+    ));
+    reporter.record(CompatEvent::unhandled_syscall(
+        4242,
+        "unknown",
+        SyscallArgs::from([6, 5, 4, 3, 2, 1]),
+    ));
     reporter.record(CompatEvent::unhandled_syscall(
         56,
         "openat",
@@ -34,9 +48,12 @@ fn aggregates_unhandled_syscalls_by_name_and_number() {
 
     let report = reporter.finish();
 
-    assert_eq!(report.unhandled_syscalls[0].number, 56);
-    assert_eq!(report.unhandled_syscalls[0].name, "openat");
+    assert_eq!(report.unhandled_syscalls[0].number, 4242);
+    assert_eq!(report.unhandled_syscalls[0].name, "unknown");
     assert_eq!(report.unhandled_syscalls[0].count, 2);
+    assert_eq!(report.deferred_syscalls[0].number, 56);
+    assert_eq!(report.deferred_syscalls[0].name, "openat");
+    assert_eq!(report.deferred_syscalls[0].count, 2);
     assert_eq!(report.unhandled_ioctls[0].request, 0x5413);
 }
 
