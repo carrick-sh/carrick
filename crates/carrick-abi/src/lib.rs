@@ -1308,6 +1308,10 @@ pub const LINUX_O_EXCL: u64 = 0o200;
 pub const LINUX_O_TRUNC: u64 = 0o1000;
 pub const LINUX_O_APPEND: u64 = 0o2000;
 pub const LINUX_O_DIRECTORY: u64 = 0o200000;
+/// `__O_TMPFILE` — the distinguishing bit of `O_TMPFILE` (which is
+/// `__O_TMPFILE | O_DIRECTORY`). The `pathname` names the parent directory and
+/// the kernel returns an unnamed regular file in it.
+pub const LINUX_O_TMPFILE: u64 = 0o20000000;
 pub const LINUX_PROT_READ: u64 = 0x1;
 pub const LINUX_PROT_WRITE: u64 = 0x2;
 pub const LINUX_PROT_EXEC: u64 = 0x4;
