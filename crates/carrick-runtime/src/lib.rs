@@ -8,6 +8,7 @@
 pub mod apfs;
 #[cfg(target_os = "macos")]
 pub(crate) mod darwin_fs;
+pub mod cred_ipc;
 pub mod dispatch;
 #[cfg(target_os = "macos")]
 pub mod dtrace_consumer;

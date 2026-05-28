@@ -349,8 +349,9 @@ impl SyscallDispatcher {
             if signal_is_self_target(pid, /*tid_required=*/ false) {
                 return Ok(this.raise_self(Self::ctx_tid(cx), signum));
             }
-            Ok(bootstrap_signal_send(
-                pid, /*tid_required=*/ false, signum,
+            let caller_euid = Some(this.cred_snapshot().euid);
+            Ok(bootstrap_signal_send_as(
+                pid, /*tid_required=*/ false, signum, caller_euid,
             ))
         }
 
@@ -842,6 +843,19 @@ pub(crate) fn bootstrap_signal_send(
     tid_required: bool,
     signum: u64,
 ) -> DispatchOutcome {
+    bootstrap_signal_send_as(target, tid_required, signum, /*caller_euid=*/ None)
+}
+
+/// Same as [`bootstrap_signal_send`] but the caller passes its own current
+/// euid so we can enforce Linux's kill(2) permission check across guest
+/// processes. `None` means "skip the check" (used by the self-target /
+/// process-group cases that don't cross processes).
+pub(crate) fn bootstrap_signal_send_as(
+    target: i64,
+    tid_required: bool,
+    signum: u64,
+    caller_euid: Option<u32>,
+) -> DispatchOutcome {
     if !is_valid_signum(signum) {
         return DispatchOutcome::errno(LINUX_EINVAL);
     }
@@ -868,6 +882,21 @@ pub(crate) fn bootstrap_signal_send(
         // applies the default action (terminate with 128 + signum).
         crate::host_signal::raise_for_self(signum as i32);
         return DispatchOutcome::Returned { value: 0 };
+    }
+    // Cross-process: enforce kill(2)'s Linux permission model when both
+    // the caller and the target have published a guest euid. Root (euid==0)
+    // can signal anyone (matches Linux's CAP_KILL effective semantics for
+    // the simple uid-only model); a non-root caller must share the
+    // target's euid. LTP `kill05` walks this path: parent sets euid=Y,
+    // child sets euid=X (different); parent's `kill(child, SIGKILL)` must
+    // return EPERM. If we can't read either cred (peer is non-carrick or
+    // hasn't published yet) we fall through to allow — matching today's
+    // behaviour for processes outside the published set.
+    if let (Some(caller), Some(target_euid)) = (
+        caller_euid,
+        crate::cred_ipc::read_target(target as i32),
+    ) && caller != 0 && caller != target_euid {
+        return DispatchOutcome::errno(LINUX_EPERM);
     }
     // Cross-process kill: target is some other host pid. After clone(),
     // child guests run as separate host processes — apt's parent
