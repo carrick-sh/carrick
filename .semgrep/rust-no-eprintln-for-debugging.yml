@@ -24,7 +24,7 @@ rules:
           regex: ^(?!main$|run$|run_cli$|init_tracing$|setup_logging$).*
     paths:
       include:
-        - "crates/**/*.rs"
+        - "/crates/**/*.rs"
       exclude:
         - "**/tests/**"
         - "**/*_test.rs"
