@@ -19,27 +19,44 @@ rules:
       `sleep` mid-`loop {}` checking a memory flag.
     patterns:
       - pattern-either:
+          # A SHORT-literal sleep inside any loop — the polling smell.
+          # An interval/deadline sleep (`sleep(interval)` where interval
+          # is a parameter / computed Duration) is NOT flagged: that is
+          # the literal contract of e.g. an itimer fallback thread or a
+          # periodic posix_timer worker.
           - pattern: |
               loop {
                 ...
-                std::thread::sleep(...);
+                std::thread::sleep(Duration::from_millis($N));
                 ...
               }
           - pattern: |
               while $COND {
                 ...
-                std::thread::sleep(...);
+                std::thread::sleep(Duration::from_millis($N));
                 ...
               }
           - pattern: |
               loop {
                 ...
-                tokio::time::sleep(...).await;
+                std::thread::sleep(Duration::from_micros($N));
                 ...
               }
+          - pattern: |
+              loop {
+                ...
+                tokio::time::sleep(Duration::from_millis($N)).await;
+                ...
+              }
+      # Cap the literal at a busy-loop scale (≤ 50 ms). A bigger sleep
+      # is more likely a deliberate poll interval against an external
+      # system (CI status, deploy queue) than a race-papering hack.
+      - metavariable-comparison:
+          metavariable: $N
+          comparison: int($N) <= 50
     paths:
       include:
-        - "crates/**/*.rs"
+        - "/crates/**/*.rs"
       exclude:
         - "**/tests/**"
         - "**/*_test.rs"
