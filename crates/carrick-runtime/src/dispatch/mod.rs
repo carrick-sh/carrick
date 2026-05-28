@@ -406,6 +406,7 @@ mod proc;
 mod proctitle;
 #[macro_use]
 mod signal;
+mod sysv;
 #[macro_use]
 mod time;
 
@@ -817,6 +818,9 @@ pub struct SyscallDispatcher {
     /// process memory copy and sibling threads share them (process-wide), which
     /// matches Linux's filter-inheritance semantics. See [`crate::seccomp`].
     seccomp: crate::seccomp::SeccompState,
+    /// SysV shared-memory registry (per-process; host-file-backed so forked
+    /// guests share segments by inode through `/tmp/carrick-shm/`).
+    sysv: Mutex<sysv::SysvShmState>,
 }
 
 /// Owns an epoll instance's kqueue and keeps it in the in-memory-wake registry
@@ -1035,6 +1039,10 @@ impl SyscallDispatcher {
         170 => settimeofday,
         171 => adjtimex,
         179 => sysinfo,
+        194 => shmget,
+        195 => shmctl,
+        196 => shmat,
+        197 => shmdt,
         198 => socket,
         199 => socketpair,
         200 => bind,
@@ -1121,6 +1129,7 @@ impl SyscallDispatcher {
             signal: Mutex::new(signal::SignalState::new()),
             fs: fs::FsState::new(),
             seccomp: crate::seccomp::SeccompState::default(),
+            sysv: Mutex::new(sysv::SysvShmState::new()),
         }
     }
 
