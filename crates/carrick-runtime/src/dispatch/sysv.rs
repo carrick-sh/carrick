@@ -30,6 +30,48 @@ use super::*;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
+
+/// Linux aarch64 `struct ipc64_perm` (UAPI, `include/uapi/asm-generic/ipcbuf.h`).
+/// 48 bytes; embedded in shmid_ds. `mode` is `__kernel_mode_t` which is
+/// `unsigned int` on 64-bit kernels (so 4 bytes, NOT 2 — the old `ipc_perm`
+/// form). `__unused1` is u64-aligned via a 4-byte pad following `pad2`.
+#[repr(C, packed)]
+#[derive(Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned, Default)]
+pub(super) struct LinuxIpcPerm {
+    pub key: i32,      // @0
+    pub uid: u32,      // @4
+    pub gid: u32,      // @8
+    pub cuid: u32,     // @12
+    pub cgid: u32,     // @16
+    pub mode: u32,     // @20
+    pub seq: u16,      // @24
+    pub __pad2: u16,   // @26
+    pub __pad3: u32,   // @28 — aligns __unused1 to 8
+    pub __unused1: u64, // @32
+    pub __unused2: u64, // @40 → end @48
+}
+
+/// Linux aarch64 `struct shmid_ds` (UAPI). 112 bytes. Verified against the
+/// kernel's `arch/arm64/include/uapi/asm/shmbuf.h` (which falls back to the
+/// generic asm-generic/shmbuf.h for 64-bit). LTP shmctl01 reads each field.
+#[repr(C, packed)]
+#[derive(Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned, Default)]
+pub(super) struct LinuxShmidDs {
+    pub shm_perm: LinuxIpcPerm, // 48
+    pub shm_segsz: u64,         // 8
+    pub shm_atime: u64,         // 8 — last attach time
+    pub shm_dtime: u64,         // 8 — last detach time
+    pub shm_ctime: u64,         // 8 — creation/last-IPC_SET time
+    pub shm_cpid: i32,          // 4 — pid of creator
+    pub shm_lpid: i32,          // 4 — pid of last shmop
+    pub shm_nattch: u64,        // 8 — current attaches
+    pub __unused4: u64,         // 8
+    pub __unused5: u64,         // 8
+}
+
+const _: () = assert!(core::mem::size_of::<LinuxShmidDs>() == 112);
+const _: () = assert!(core::mem::size_of::<LinuxIpcPerm>() == 48);
 
 /// Host directory for SysV shmem backing files. World-writable + sticky so
 /// any carrick guest process (including a forked child running as the same
@@ -42,8 +84,12 @@ const LINUX_IPC_CREAT: u64 = 0o1000;
 const LINUX_IPC_EXCL: u64 = 0o2000;
 const LINUX_IPC_PRIVATE: i32 = 0;
 const LINUX_IPC_RMID: u64 = 0;
-const LINUX_IPC_STAT: u64 = 2;
 const LINUX_IPC_SET: u64 = 1;
+const LINUX_IPC_STAT: u64 = 2;
+const LINUX_IPC_INFO: u64 = 3;
+const LINUX_SHM_STAT: u64 = 13;
+const LINUX_SHM_INFO: u64 = 14;
+const LINUX_SHM_STAT_ANY: u64 = 15;
 
 #[derive(Clone, Debug)]
 pub(super) struct ShmSegment {
@@ -51,6 +97,21 @@ pub(super) struct ShmSegment {
     pub size: usize,
     /// Permission bits the user requested via `shmget(.., flags & 0o777)`.
     pub mode: u32,
+    /// Number of live attaches in THIS process. Linux's `shm_nattch` is a
+    /// PROCESS-AGGREGATED counter — shmat across siblings each increments
+    /// it. Since carrick guests fork into separate host processes that
+    /// don't share dispatcher state, we track this per-process only;
+    /// LTP `shmat01` exercises the single-process attach-count semantics
+    /// (4 sub-tests, each verifies the count after a shmat/shmdt pair).
+    pub nattch: u64,
+    /// shm_ctime — Unix time (seconds) the segment was created. Linux
+    /// writes this on shmget and IPC_SET; shmctl01 verifies it's within a
+    /// reasonable window of "now".
+    pub ctime: u64,
+    /// shm_atime — last attach time. Updated on shmat.
+    pub atime: u64,
+    /// shm_dtime — last detach time. Updated on shmdt.
+    pub dtime: u64,
 }
 
 #[derive(Default, Debug)]
@@ -59,6 +120,9 @@ pub(super) struct SysvShmState {
     /// Populated lazily: a shmat against a known key but unfamiliar shmid
     /// resolves through the filesystem and inserts on the fly.
     pub segments: HashMap<i32, ShmSegment>,
+    /// Map guest VA (returned from shmat) → shmid so shmdt can find which
+    /// segment to decrement when given just an address.
+    pub attachments: HashMap<u64, i32>,
     /// Counter for IPC_PRIVATE segment filenames (combined with pid for
     /// uniqueness — fork-safe because each forked carrick process has its
     /// own pid).
@@ -69,6 +133,7 @@ impl SysvShmState {
     pub(super) fn new() -> Self {
         Self {
             segments: HashMap::new(),
+            attachments: HashMap::new(),
             private_counter: AtomicU32::new(1),
         }
     }
@@ -161,14 +226,28 @@ pub(super) fn shmget_open(
     // 2 billion values per fs which is plenty per session.
     let shmid = (st.st_ino as i32).max(1); // never 0 (would collide with shmctl(IPC_RMID))
     let actual_size = if size > 0 { size } else { st.st_size as usize };
-    state.segments.insert(
-        shmid,
-        ShmSegment {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    state
+        .segments
+        .entry(shmid)
+        .and_modify(|s| {
+            // Pre-existing key (lookup-by-key hit): refresh ctime per Linux
+            // shmget when called with IPC_CREAT on an existing segment? No
+            // — Linux only updates ctime on IPC_SET/RMID. Leave ctime alone.
+            s.size = actual_size;
+        })
+        .or_insert(ShmSegment {
             path: path.clone(),
             size: actual_size,
             mode,
-        },
-    );
+            nattch: 0,
+            ctime: now,
+            atime: 0,
+            dtime: 0,
+        });
     unsafe { libc::close(fd) };
     Ok(shmid)
 }
@@ -208,39 +287,28 @@ pub(super) fn shmctl_rmid(state: &mut SysvShmState, shmid: i32) -> Result<(), i3
     Ok(())
 }
 
-/// Fill a Linux `shmid_ds` (the 112-byte form) from the segment's metadata.
-/// Linux's struct shmid_ds layout (aarch64):
-///   struct ipc_perm shm_perm;        // 48 bytes
-///   __kernel_size_t shm_segsz;       // 8
-///   __kernel_time_t shm_atime;       // 8
-///   __kernel_time_t shm_dtime;       // 8
-///   __kernel_time_t shm_ctime;       // 8
-///   __kernel_pid_t  shm_cpid;        // 4
-///   __kernel_pid_t  shm_lpid;        // 4
-///   __kernel_ulong_t shm_nattch;     // 8
-///   __kernel_ulong_t __unused4;      // 8
-///   __kernel_ulong_t __unused5;      // 8
-/// Total: 112 bytes. We fill segsz, perm.mode + perm.uid/gid; the times +
-/// pids are stubbed (0 / our pid) — the LTP tests we care about (kill05,
-/// kill07) don't read them.
+/// Fill a Linux `shmid_ds` (the 112-byte aarch64 UAPI form) from the
+/// segment's metadata. LTP shmctl01 reads every populated field.
 pub(super) fn shmid_ds_bytes(segment: &ShmSegment) -> [u8; 112] {
+    let pid = std::process::id() as i32;
+    let ds = LinuxShmidDs {
+        shm_perm: LinuxIpcPerm {
+            mode: segment.mode,
+            ..Default::default()
+        },
+        shm_segsz: segment.size as u64,
+        shm_atime: segment.atime,
+        shm_dtime: segment.dtime,
+        shm_ctime: segment.ctime,
+        shm_cpid: pid,
+        shm_lpid: pid,
+        shm_nattch: segment.nattch,
+        __unused4: 0,
+        __unused5: 0,
+    };
     let mut out = [0u8; 112];
-    let pid = std::process::id();
-    // ipc_perm.key      i32  @ 0
-    // ipc_perm.uid     u32  @ 4
-    // ipc_perm.gid     u32  @ 8
-    // ipc_perm.cuid    u32  @ 12
-    // ipc_perm.cgid    u32  @ 16
-    // ipc_perm.mode    u16  @ 20  (+ 2 pad)
-    // ipc_perm.seq     u16  @ 24
-    // (rest pad)
-    out[20..22].copy_from_slice(&(segment.mode as u16).to_le_bytes());
-    // shm_segsz at offset 48
-    out[48..56].copy_from_slice(&(segment.size as u64).to_le_bytes());
-    // shm_cpid at offset 80
-    out[80..84].copy_from_slice(&(pid as i32).to_le_bytes());
-    // shm_lpid at offset 84
-    out[84..88].copy_from_slice(&(pid as i32).to_le_bytes());
+    ds.write_to(out.as_mut_slice())
+        .expect("LinuxShmidDs is exactly 112 bytes");
     out
 }
 
@@ -316,6 +384,18 @@ impl SyscallDispatcher {
             let va = crate::memory::LINUX_HIGH_VA_THRESHOLD
                 + (ipa - crate::memory::LINUX_ALIAS_IPA_BASE);
             let host_prot = libc::PROT_READ | libc::PROT_WRITE;
+
+            // Track the attach so shmdt can find the shmid and the
+            // shm_nattch counter (read by LTP shmat01 via IPC_STAT) is
+            // accurate.
+            {
+                let mut state = this.sysv.lock();
+                state.attachments.insert(va, shmid);
+                if let Some(seg) = state.segments.get_mut(&shmid) {
+                    seg.nattch = seg.nattch.saturating_add(1);
+                }
+            }
+
             Ok(DispatchOutcome::MapHostAlias {
                 va,
                 ipa,
@@ -325,14 +405,20 @@ impl SyscallDispatcher {
             })
         }
 
-        /// shmdt(addr). Linux unmaps the attached segment at `addr`. We treat
-        /// this as a logical no-op: the alias VA stays mapped through the
-        /// runtime's lifetime (acceptable for the LTP tests we target —
-        /// kill05/kill07 fork+attach in a child that exits, and process exit
-        /// reclaims its mappings). A proper munmap of the alias range is a
-        /// follow-up — recorded so it can be implemented once we have a
-        /// test that demonstrates a leak from this simplification.
-        fn shmdt(this, cx, _addr: u64) {
+        /// shmdt(addr). Decrement the segment's nattch and drop the
+        /// addr→shmid mapping so LTP shmat01's IPC_STAT-after-shmdt sees
+        /// the right count. The alias VA stays mapped in the guest until
+        /// process exit (proper munmap of the alias range is a follow-up;
+        /// the LTP tests we target don't observe the leak).
+        fn shmdt(this, cx, addr: u64) {
+            let mut state = this.sysv.lock();
+            let shmid = match state.attachments.remove(&addr) {
+                Some(id) => id,
+                None => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
+            };
+            if let Some(seg) = state.segments.get_mut(&shmid) {
+                seg.nattch = seg.nattch.saturating_sub(1);
+            }
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
@@ -368,6 +454,51 @@ impl SyscallDispatcher {
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
                 LINUX_IPC_SET => Ok(DispatchOutcome::Returned { value: 0 }),
+                LINUX_SHM_STAT | LINUX_SHM_STAT_ANY => {
+                    // SHM_STAT takes an INDEX into the kernel's segment
+                    // table (NOT a shmid). It writes the shmid_ds for the
+                    // segment at that index into `buf` and returns the
+                    // shmid. LTP shmctl01 builds an index→shmid mapping by
+                    // iterating SHM_STAT(0..N).
+                    let state = this.sysv.lock();
+                    let mut ids: Vec<i32> = state.segments.keys().copied().collect();
+                    ids.sort();
+                    let idx = shmid as usize; // SHM_STAT uses the first arg as idx
+                    let target_id = match ids.get(idx) {
+                        Some(id) => *id,
+                        None => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
+                    };
+                    let segment = state.segments.get(&target_id).cloned();
+                    drop(state);
+                    let Some(segment) = segment else {
+                        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                    };
+                    if buf != 0 {
+                        let bytes = shmid_ds_bytes(&segment);
+                        let memory = &mut *cx.memory;
+                        if memory.write_bytes(buf, &bytes).is_err() {
+                            return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                        }
+                    }
+                    Ok(DispatchOutcome::Returned { value: target_id as i64 })
+                }
+                LINUX_IPC_INFO | LINUX_SHM_INFO => {
+                    // Aggregate info. Linux fills `struct shminfo`
+                    // (IPC_INFO) or `struct shm_info` (SHM_INFO). Return
+                    // values: max shmid INDEX currently in use (Linux).
+                    let state = this.sysv.lock();
+                    let used_ids = state.segments.len() as i64;
+                    if buf != 0 {
+                        let bytes = [0u8; 112];
+                        let memory = &mut *cx.memory;
+                        if memory.write_bytes(buf, &bytes).is_err() {
+                            return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                        }
+                    }
+                    Ok(DispatchOutcome::Returned {
+                        value: (used_ids - 1).max(0),
+                    })
+                }
                 _ => Ok(DispatchOutcome::errno(LINUX_EINVAL)),
             }
         }

@@ -1,0 +1,23 @@
+rules:
+  - id: rust-no-handrolled-abi-bytes
+    languages: [rust]
+    severity: WARNING
+    message: |
+      Hand-rolled offset write into a fixed ABI buffer detected.
+      Prefer a `#[repr(C, packed)]` struct deriving `IntoBytes` (zerocopy)
+      and call `.write_to(buf)` — it is checked at compile time (size,
+      layout) and cannot drift the moment a field changes width.
+      Worked example: `crates/carrick-runtime/src/dispatch/sysv.rs`'s
+      `LinuxShmidDs`. Pattern caught: `<slice>[N..M].copy_from_slice(&<expr>.to_le_bytes())`.
+    patterns:
+      - pattern-either:
+          - pattern: $BUF[$LO..$HI].copy_from_slice(&$VAL.to_le_bytes())
+          - pattern: $BUF[$LO..$HI].copy_from_slice(&$VAL.to_be_bytes())
+          - pattern: $BUF[$LO..$HI].copy_from_slice(&($VAL as $T).to_le_bytes())
+    paths:
+      include:
+        - "crates/**/*.rs"
+      exclude:
+        - "**/tests/**"
+        - "**/*_test.rs"
+        - "**/test_*.rs"

@@ -1,0 +1,35 @@
+rules:
+  - id: rust-no-eprintln-for-debugging
+    languages: [rust]
+    severity: WARNING
+    message: |
+      `eprintln!`/`println!` used as a debugging hook. Use a USDT probe
+      (`crate::probes::*` or `carrick_usdt::*` via `dtrace_probes`) instead —
+      they are free at build time, can be filtered by `carrick trace -s …`,
+      survive in production builds, and don't pollute guest stdout/stderr.
+      Worked examples: `crate::probes::ulock_wake`,
+      `crate::probes::signal_publish`.
+      See `[[feedback_use_debuggers]]`.
+    patterns:
+      - pattern-either:
+          - pattern: eprintln!(...)
+          - pattern: println!(...)
+      - pattern-not-inside: |
+          fn $F(...) -> $R {
+            ...
+          }
+        # Allow eprintln/println in main(), tests, and tracing-helper init.
+      - metavariable-regex:
+          metavariable: $F
+          regex: ^(?!main$|run$|run_cli$|init_tracing$|setup_logging$).*
+    paths:
+      include:
+        - "crates/**/*.rs"
+      exclude:
+        - "**/tests/**"
+        - "**/*_test.rs"
+        - "**/test_*.rs"
+        - "**/bin/*.rs"  # CLI entry points
+        - "**/main.rs"
+        - "**/commands/**"  # CLI-facing user output
+        - "**/conformance-probes/**"  # Probes intentionally print
