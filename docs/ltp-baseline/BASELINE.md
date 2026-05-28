@@ -50,10 +50,9 @@ count in `docs/conformance-coverage.md` — a MATCH without a probe is not "done
 
 ## Per-area tally
 
-Snapshot at **1154 / 1436 swept (80%)** — representative; the tail is mostly
-`process` (privileged syscalls → high NO_ORACLE). Re-run
-`python3 scripts/ltp-baseline.py --tally` for the live table; this includes the
-fcntl-record-lock, writev-iovec, and SysV-semaphore fixes landed against it.
+**Complete sweep: 1436 / 1436.** Re-run `python3 scripts/ltp-baseline.py
+--tally` for the live table. Includes the fcntl-record-lock, writev-iovec,
+SysV-semaphore, and SysV-msg-queue fixes landed against it.
 
 | area | MATCH | PARTIAL | DIFF | TBROK | TIMEOUT | NO_ORACLE | total | verified-MATCH (of oracle-valid) |
 |---|---|---|---|---|---|---|---|---|
@@ -61,18 +60,19 @@ fcntl-record-lock, writev-iovec, and SysV-semaphore fixes landed against it.
 | signals    | 32 | 0 | 7   | 7  | 3 | 2   | 51  | **65%** |
 | epoll_poll | 30 | 3 | 7   | 13 | 0 | 9   | 62  | **57%** |
 | sched      | 28 | 0 | 16  | 5  | 0 | 18  | 67  | **57%** |
+| other      | 36 | 1 | 29  | 2  | 0 | 53  | 121 | **53%** |
 | fs         | 142| 0 | 115 | 44 | 0 | 141 | 442 | **47%** |
-| process    | 45 | 1 | 23  | 32 | 1 | 129 | 231 | **44%** |
+| process    | 87 | 1 | 52  | 45 | 1 | 206 | 392 | **47%** |
+| ipc        | 14 | 0 | 14  | 12 | 0 | 7   | 47  | **35%** (sem + msg queues now functional) |
 | net        | 12 | 0 | 15  | 10 | 0 | 16  | 53  | **32%** |
 | mm         | 18 | 1 | 32  | 22 | 1 | 43  | 117 | **24%** |
-| ipc        | 4  | 0 | 9   | 27 | 0 | 7   | 47  | **10%** (sem done; msg-queue half still ENOSYS) |
 | xattr      | 0  | 0 | 4   | 1  | 0 | 24  | 29  | **0%** |
-| **TOTAL**  | **337** | **5** | **230** | **169** | **5** | **408** | **1154** | **337/746 = 45%** |
+| **TOTAL**  | **425** | **6** | **293** | **169** | **5** | **538** | **1436** | **425/898 = 47%** |
 
 ### The target (DoD #2)
 
-Baseline: **45% verified-MATCH** of oracle-valid tests (337/746). The climbing
-gate:
+Baseline: **47% verified-MATCH** of oracle-valid tests (425/898; full sweep).
+The climbing gate:
 - **Phase 1 — 60%**: clear the biggest TBROK framework-blocker classes (ipc
   msg-queues, the `mount(tmpfs)` setup, the tst_test variant-switching hang)
   and the concentrated DIFF clusters (each → an owning probe).
@@ -85,6 +85,7 @@ gate:
 - fcntl record locks (host forwarding) → `fcntllock`
 - writev/readv iovec validation → `iovecedge`
 - SysV semaphores (host forwarding) → `sysvsem`
+- SysV message queues (host forwarding) → `sysvmsg`
 
 <!-- prior early-sample note retained below for history -->
 _(early fs sample was: 47 MATCH / 12 DIFF / 3 TBROK
