@@ -4217,7 +4217,7 @@ fn fallocate_grows_open_files_on_writable_overlay_and_validates_arguments() {
             .dispatch(
                 SyscallRequest::new(
                     56,
-                    SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
+                    SyscallArgs::from([(-100_i64) as u64, 0x4000, LINUX_O_RDWR, 0, 0, 0]),
                 ),
                 &mut memory,
                 &reporter,
