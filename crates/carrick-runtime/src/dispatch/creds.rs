@@ -161,9 +161,23 @@ impl SyscallDispatcher {
                 Err(errno) => return Ok(errno.into()),
             };
             if !linux_capability_version_is_supported(header.version) {
+                // Linux writes the kernel's PREFERRED version back into the
+                // header and returns EINVAL, so a probing caller can retry with
+                // the right version (LTP capget02). version is the first u32.
+                let pref = crate::linux_abi::LINUX_CAPABILITY_VERSION_3;
+                let _ = memory.write_bytes(header_address.0, &pref.to_le_bytes());
                 return Ok(LINUX_EINVAL.into());
             }
+            // pid < 0 is EINVAL (not ESRCH); a positive pid that isn't this
+            // process is ESRCH. carrick is a single guest process, so only
+            // 0 / our pid / the bootstrap alias exist (LTP capget02).
             if header.pid < 0 {
+                return Ok(LINUX_EINVAL.into());
+            }
+            if header.pid > 0
+                && header.pid != std::process::id() as i32
+                && header.pid != LINUX_BOOTSTRAP_PID as i32
+            {
                 return Ok(LINUX_ESRCH.into());
             }
             if data_address.0 == 0 {
