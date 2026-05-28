@@ -249,6 +249,38 @@ impl PageTableManager {
         ((bumped - free) as u32, free as u32, capacity as u32)
     }
 
+    /// Read-only descriptor walk for `va`, for `carrick trace` diagnostics:
+    /// returns `[L0, L1, L2, L3]` descriptors as the MANAGER sees them in its
+    /// own `bytes` (not the host backing), stopping (rest 0) at the first
+    /// non-table or out-of-range link. Lets a trace compare the manager's view
+    /// across e.g. parent vs forked child.
+    pub fn debug_walk(&self, va: u64) -> [u64; 4] {
+        let idx = indices(va);
+        let mut out = [0u64; 4];
+        let mut table_off = 0usize;
+        for level in 0..4usize {
+            let off = table_off + idx[level] * 8;
+            if off + 8 > self.bytes.len() {
+                break;
+            }
+            let desc = self.read_desc(off);
+            out[level] = desc;
+            if level == 3 {
+                break;
+            }
+            let valid = desc & VALID != 0;
+            let is_table = desc & TYPE_BITS == TYPE_TABLE_OR_PAGE;
+            if !(valid && is_table) {
+                break;
+            }
+            match self.pa_to_off(desc & PA_MASK_TABLE) {
+                Ok(o) => table_off = o,
+                Err(_) => break,
+            }
+        }
+        out
+    }
+
     /// Carve a zeroed table page: reuse a coalesced one if available, else bump
     /// the spare tail. Freed pages were zeroed on free, the tail is zero from
     /// boot, so the returned page is always all-invalid descriptors.
@@ -607,7 +639,16 @@ impl PageTableManager {
                 continue;
             }
             if valid {
-                return Err(PageTableError::BadAddress);
+                // A valid BLOCK leaf covering this VA. Split it into a finer
+                // sub-table (preserving its mapping + validity) so we can
+                // descend and install a sub-range — e.g. a finer mapping inside
+                // a 2 MiB block an earlier alias mapping created (the case a
+                // forked child hits when it maps inside a block its parent's
+                // cloned tables already established). Mirrors `leaf_offset`.
+                self.split_block(off, level)?;
+                let desc2 = self.read_desc(off);
+                table_off = self.pa_to_off(desc2 & PA_MASK_TABLE)?;
+                continue;
             }
             let pa = self.alloc_table()?;
             table_off = self.pa_to_off(pa)?;
