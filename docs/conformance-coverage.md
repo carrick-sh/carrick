@@ -11,8 +11,29 @@ behavior down so it can never silently regress.
 the deliverable; the LTP MATCH is just confirmation. When you fix something,
 add its row here.
 
-**Headline metric:** # of owned invariant tests, and which curated-MATCH LTP
-behaviors are still LTP-only (the backlog below).
+**Headline metric** (run `python3 scripts/coverage-metric.py` to recompute —
+it parses this doc + the probe binaries on disk and fails CI if the doc cites
+a probe that doesn't exist):
+
+```
+Owned invariant probes (on disk):  73
+Invariant rows with an owning test: 77/77 (100%)
+Distinct curated LTP tests owned:   432/432 (100%)
+```
+
+This is the number the project tracks INSTEAD of "LTP MATCH count": the probe
+suite is the authoritative ABI gate (`cargo test --release --test conformance
+conformance_probes`), and the metric answers "how complete is that gate?".
+Every curated invariant row and every LTP test it stands in for now has an
+owning probe or lib test. New gap-fixes MUST keep this at 100% — the probe is
+the deliverable; the LTP MATCH is just confirmation.
+
+Known LTP tests NOT in the curated map (out of scope, tracked in handoff, not
+counted above): rt_sigtimedwait01 / sched_getparam01-syscall-variant (LTP
+test-variant-switching framework hang), shmat01 (alias-VA reuse semantics),
+epoll_pwait2 (syscall 441), clone08 (CLONE_VM-child-stack thread shape),
+futex_cmp_requeue01 (accepted host limitation — Darwin `__ulock` has no
+requeue primitive).
 
 Legend: ✅ owned by a probe · 🧪 owned by a lib unit test · ⬜ LTP-only (no
 carrick test yet — backlog).
@@ -77,6 +98,7 @@ underlying gap got fixed):
 | **sigsuspend(empty): pending blocked sig delivered, handler runs, returns -1/EINTR, original mask restored, pending consumed** | ✅ `pauseeintr` | sigsuspend01 |
 | sigprocmask BLOCK/UNBLOCK round-trip (sighold/sigrelse equivalent) | ✅ `pauseeintr` + `signals` | sighold02, sigrelse01 |
 | **rt_sigqueueinfo: queue delivers, handler runs; SA_SIGINFO si_value.sival_int payload reaches the handler** | ✅ `rtsigqueueinfo` | rt_sigqueueinfo01, sigqueue01 |
+| **rt_sigqueueinfo(sibling_tid, …): routes to a sibling thread of the same process (not just self/peer-pid); the sibling's SA_SIGINFO handler runs and the si_value payload propagates** | ✅ `rtsigqueueinfoxthread` | rt_sigqueueinfo01 (the canonical thread-target shape) |
 | Interval timers (SIGALRM/SIGVTALRM/SIGPROF) fire incl. busy-wait + forked child | ✅ `itimer` | setitimer01/02, getitimer01/02, alarm02–07 |
 | **Default-disposition death-by-signal: SIGTERM/SIGKILL kill child→WIFSIGNALED/WTERMSIG; abort() resets SIGABRT→SIG_DFL and re-raises** | ✅ `abortdeath` | kill05, kill07, abort01 |
 | **`WCOREDUMP(status)` set for core-dumping signals (SIGABRT/SIGSEGV/SIGQUIT/SIGILL/SIGTRAP/SIGBUS/SIGFPE/SIGXCPU/SIGXFSZ/SIGSYS), unset for non-core signals (SIGTERM/SIGKILL) — 0x80 bit synthesized through macOS's default RLIMIT_CORE=0** | ✅ `coredumpbit` | abort01 |
@@ -96,7 +118,7 @@ underlying gap got fixed):
 | **Orphan child (double-fork) is reparented to PID 1 in its PID namespace; orphan's `getppid()` returns 1** | ✅ `reparenttoinit` | getpid01 (orphan-reparent), classical daemonize idiom |
 | process lifecycle / exit codes / WIFSIGNALED | ✅ `proclife` | (wait4 status) |
 | **`waitid(2)` siginfo encoding: CLD_EXITED/CLD_KILLED + si_status; WNOWAIT peek-then-reap; P_ALL+WNOHANG→ECHILD when no children** | ✅ `waitidspec` | waitid01, waitid02, waitid03 |
-| clone basic + thread flags | (LTP) | clone01–09 (mostly MATCH) |
+| **clone basic + thread-flag validation: `clone(SIGCHLD)` forks (positive pid parent / 0 child / clean reap); `clone(CLONE_THREAD)` without CLONE_VM\|CLONE_SIGHAND → EINVAL (kernel flag-consistency: THREAD→SIGHAND→VM)** | ✅ `clonebasic` | clone01–04, clone06, clone08 (negative shape) |
 | **clone3 arg validation: happy path returns child pid + clean reap; truncated `size`, unknown flag bit, inconsistent stack/stack_size pair each rejected (EINVAL on real Linux, ENOSYS under Docker default seccomp)** | ✅ `clone3args` | clone301, clone302, clone303, clone05, clone08 |
 
 ### fork/clone — backlog
@@ -112,7 +134,7 @@ underlying gap got fixed):
 | sched affinity / getcpu / hw cpu count | ✅ `cpucount` | sched_getaffinity01, getcpu01/02 |
 | POSIX timers: create/settime/gettime remaining/getoverrun/delete + stale-id EINVAL; SIGEV_SIGNAL delivers SIGUSR1 | ✅ `posixtimers` | timer_create01–07, timer_settime01/02, timer_gettime01, timer_delete01, timer_getoverrun01 |
 | sched_* invariants: get_priority_{max,min} for OTHER/FIFO/RR; getscheduler→SCHED_OTHER; getparam priority=0; rr_get_interval non-neg | ✅ `schedparam` | sched_get_priority_max01, sched_get_priority_min01, sched_getparam01, sched_getscheduler01, sched_rr_get_interval01, sched_setparam01, sched_setscheduler01 |
-| **sched_get/setparam/rr_get_interval accept ANY live pid (not just self): the calling process can query any task's params, mirroring Linux's task-wide read access** | ✅ (covered by existing `schedparam` post-`sched_pid_exists` fix) | sched_setparam01 (MATCH), sched_getparam01 libc variant (4/4 PASS) |
+| **sched_get/setparam/rr_get_interval accept ANY live pid (not just self): the calling process can query any task's params, mirroring Linux's task-wide read access (via the sched_pid_exists kill(pid,0) check)** | ✅ `schedparam` | sched_setparam01 (MATCH), sched_getparam01 libc variant (4/4 PASS) |
 
 | FUTEX_WAIT / FUTEX_WAIT_BITSET on mismatched expected → EAGAIN; FUTEX_WAKE with no waiters → 0; cross-thread wait/wake round-trip on a private futex | ✅ `futexextra` | futex_wait02 (mismatch), futex_wake04, futex_wait_bitset01 |
 
