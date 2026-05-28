@@ -378,10 +378,16 @@ mod rosetta_vdso_size_test {
     #[test]
     fn vdso_image_fits_in_one_page_and_has_dynsym() {
         let img = super::vdso_image_bytes();
-        assert!(img.len() <= super::LINUX_VDSO_SIZE as usize,
-            "vDSO image {} exceeds page {}", img.len(), super::LINUX_VDSO_SIZE);
+        assert!(
+            img.len() <= super::LINUX_VDSO_SIZE as usize,
+            "vDSO image {} exceeds page {}",
+            img.len(),
+            super::LINUX_VDSO_SIZE
+        );
         let elf = goblin::elf::Elf::parse(&img).unwrap();
-        assert!(elf.section_headers.iter().any(|s| s.sh_type == 11),
-            "vDSO must expose a SHT_DYNSYM section header for strict parsers");
+        assert!(
+            elf.section_headers.iter().any(|s| s.sh_type == 11),
+            "vDSO must expose a SHT_DYNSYM section header for strict parsers"
+        );
     }
 }

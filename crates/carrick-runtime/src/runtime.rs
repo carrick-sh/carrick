@@ -667,9 +667,10 @@ where
                 ipa,
                 len,
                 payload,
+                file,
             } => {
                 // Back a dynamic high-VA mmap; complete with the VA.
-                runtime.map_host_alias(va, ipa, len, &payload)?;
+                runtime.map_host_alias(va, ipa, len, &payload, file)?;
                 runtime.complete_syscall(va as i64)?;
                 last_syscall_retval = Some(va as i64);
             }
@@ -1816,10 +1817,10 @@ fn run_vcpu_until_exit(
                     ipa,
                     len,
                     payload,
+                    file,
                 } => {
-                    engine.map_host_alias(va, ipa, len, &payload)?;
-                    last_syscall_retval =
-                        Some(state.complete_returned(&mut engine, va as i64)?);
+                    engine.map_host_alias(va, ipa, len, &payload, file)?;
+                    last_syscall_retval = Some(state.complete_returned(&mut engine, va as i64)?);
                 }
             }
 
@@ -1967,9 +1968,7 @@ where
             let restart_syscall = interrupted_pc.is_none()
                 && last_syscall_retval == Some(-(crate::linux_abi::LINUX_EINTR as i64))
                 && action.sa_flags & crate::linux_abi::LINUX_SA_RESTART != 0
-                && trap
-                    .last_syscall_nr()
-                    .is_some_and(is_restartable_syscall);
+                && trap.last_syscall_nr().is_some_and(is_restartable_syscall);
             let saved_sigmask = dispatcher.enter_signal_handler(tid, pending, action);
             trap.inject_signal(
                 pending,
@@ -2129,8 +2128,7 @@ fn service_signals_threaded(
 /// configured).
 /// Absolute host path to Apple's Rosetta 2 Linux ELF interpreter. This is an
 /// AArch64 binary that JIT-translates an x86_64 Linux guest in user space.
-pub(crate) const ROSETTA_INTERPRETER: &str =
-    "/Library/Apple/usr/libexec/oah/RosettaLinux/rosetta";
+pub(crate) const ROSETTA_INTERPRETER: &str = "/Library/Apple/usr/libexec/oah/RosettaLinux/rosetta";
 
 /// The installed Rosetta interpreter's bytes, read once and cached. `None` when
 /// Rosetta isn't installed for Linux. Both the ELF-load redirect and the ioctl
@@ -2310,8 +2308,9 @@ impl<M: GuestMemory, T: SyscallTrap> SyscallTrap for SplitView<'_, M, T> {
         ipa: u64,
         len: u64,
         payload: &[u8],
+        file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
     ) -> Result<(), TrapError> {
-        self.trap.map_host_alias(va, ipa, len, payload)
+        self.trap.map_host_alias(va, ipa, len, payload, file)
     }
 }
 

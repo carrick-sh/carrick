@@ -4,9 +4,9 @@
 // The hub types live in the leaf crate carrick-guest-mem (A2); import them from
 // there, not via `crate::dispatch`, so trap.rs has NO dependency on the
 // dispatcher — the last edge blocking a future carrick-hvf crate (A3).
-use carrick_guest_mem::{Aarch64SyscallFrame, GuestMemory, MemoryError};
 use crate::elf::SegmentPerms;
 use crate::memory::AddressSpace;
+use carrick_guest_mem::{Aarch64SyscallFrame, GuestMemory, MemoryError};
 use serde::Serialize;
 use thiserror::Error;
 
@@ -119,12 +119,12 @@ pub trait SyscallTrap {
         ipa: u64,
         len: u64,
         payload: &[u8],
+        file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
     ) -> Result<(), TrapError> {
-        let _ = (va, ipa, len, payload);
+        let _ = (va, ipa, len, payload, file);
         Err(TrapError::UnsupportedPlatform)
     }
 }
-
 
 pub const HVF_PAGE_SIZE: u64 = 0x4000;
 pub const AARCH64_SVC_EXCEPTION_CLASS: u64 = 0x15;
@@ -900,8 +900,9 @@ impl HvfTrapEngine {
         ipa: u64,
         len: u64,
         payload: &[u8],
+        file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
     ) -> Result<(), TrapError> {
-        self.inner.map_host_alias(va, ipa, len, payload)
+        self.inner.map_host_alias(va, ipa, len, payload, file)
     }
 
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -911,6 +912,7 @@ impl HvfTrapEngine {
         _ipa: u64,
         _len: u64,
         _payload: &[u8],
+        _file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
     ) -> Result<(), TrapError> {
         Err(TrapError::UnsupportedPlatform)
     }
@@ -1545,27 +1547,50 @@ impl HvfInner {
         ipa: u64,
         len: u64,
         payload: &[u8],
+        file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
     ) -> Result<(), TrapError> {
         let size = usize::try_from(len).map_err(|_| TrapError::MappingTooLarge(len))?;
-        let host_mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
-            size,
-            crate::host_mapping::HostMappingKind::PrivateAnon,
-        )
-        .map_err(|e| TrapError::Hypervisor(format!("alias mmap (size={size}) failed: {e}")))?;
+        let host_mapping = match file {
+            // Live MAP_SHARED file: back the guest region with the file's page
+            // cache directly, so writes are coherent with other openers and
+            // survive fork. The dispatcher handed us a dup'd fd it owns; mmap
+            // takes its own reference, so close the dup once mapped.
+            Some((fd, offset, prot)) => {
+                let m = crate::host_mapping::OwnedHostMapping::map_shared_file(
+                    fd, offset, size, prot,
+                )
+                .map_err(|e| {
+                    unsafe { libc::close(fd) };
+                    TrapError::Hypervisor(format!(
+                        "alias MAP_SHARED file (fd={fd} off={offset} size={size} prot={prot}) failed: {e}"
+                    ))
+                })?;
+                unsafe { libc::close(fd) };
+                m
+            }
+            None => crate::host_mapping::OwnedHostMapping::map_shared_anon(
+                size,
+                crate::host_mapping::HostMappingKind::PrivateAnon,
+            )
+            .map_err(|e| TrapError::Hypervisor(format!("alias mmap (size={size}) failed: {e}")))?,
+        };
         let host = host_mapping.as_ptr();
         let size = host_mapping.len();
-        // Seed the file content (empty for anon — the anon mapping is zeroed).
-        if !payload.is_empty() {
+        // Seed the file content (empty for anon — the anon mapping is zeroed; a
+        // live MAP_SHARED file mapping is already backed by the page cache).
+        if file.is_none() && !payload.is_empty() {
             let n = payload.len().min(size);
             unsafe { std::ptr::copy_nonoverlapping(payload.as_ptr(), host, n) };
         }
+        // Alias mappings keep permissive stage-2 rights; guest-visible
+        // protections are enforced in stage-1 and adjusted by mprotect.
         let perms = hvf_perms(SegmentPerms {
             read: true,
             write: true,
             execute: true,
         });
-        let r =
-            unsafe { applevisor_sys::hv_vm_map(host.cast(), ipa, size, u64::from(perms)) };
+        let r = unsafe { applevisor_sys::hv_vm_map(host.cast(), ipa, size, u64::from(perms)) };
+        crate::probes::hv_vm_map_alias(va, ipa, size as u64, r as i32, self.is_forked_child as i32);
         if r != 0 {
             return Err(TrapError::Hypervisor(format!(
                 "hv_vm_map alias va=0x{va:x} ipa=0x{ipa:x} size={size} failed: 0x{r:x}"
@@ -1703,10 +1728,7 @@ impl HvfInner {
                         .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u64)
                         .unwrap_or(0);
                     let rn = ((insn >> 5) & 0x1f) as u32;
-                    let xrn = self
-                        .vcpu
-                        .get_reg(GPR_TABLE[rn as usize])
-                        .unwrap_or(0);
+                    let xrn = self.vcpu.get_reg(GPR_TABLE[rn as usize]).unwrap_or(0);
                     crate::probes::vcpu_fault_regs(underlying, elr, far, insn, rn, xrn);
                 }
                 // Walk the LIVE host page-table backing at the faulting VA so a
@@ -2500,7 +2522,11 @@ impl HvfInner {
             let child_host = if desc.guest_shared {
                 ForkMappingHost::Borrowed(desc.host.ptr()) // shared mapping: child maps the SAME buffer
             } else {
-                ForkMappingHost::Owned(clone_region_for_child(desc.host.ptr(), desc.size, desc.start)?)
+                ForkMappingHost::Owned(clone_region_for_child(
+                    desc.host.ptr(),
+                    desc.size,
+                    desc.start,
+                )?)
             };
             child_descs.push(ForkMappingDesc {
                 start: desc.start,
@@ -3127,7 +3153,10 @@ fn clone_region_for_child(
     // scan. `u64::MAX` default ⇒ full scan (non-fork callers / tests).
     let scan_size = if guest_start == crate::memory::LINUX_MMAP_BASE {
         let hw = GUEST_ARENA_HIGH_WATER.load(std::sync::atomic::Ordering::SeqCst);
-        hw.saturating_sub(guest_start).try_into().unwrap_or(size).min(size)
+        hw.saturating_sub(guest_start)
+            .try_into()
+            .unwrap_or(size)
+            .min(size)
     } else {
         size
     };
@@ -3563,8 +3592,9 @@ impl SyscallTrap for HvfTrapEngine {
         ipa: u64,
         len: u64,
         payload: &[u8],
+        file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
     ) -> Result<(), TrapError> {
-        HvfTrapEngine::map_host_alias(self, va, ipa, len, payload)
+        HvfTrapEngine::map_host_alias(self, va, ipa, len, payload, file)
     }
 
     fn inject_signal(
@@ -3601,4 +3631,3 @@ impl SyscallTrap for HvfTrapEngine {
         HvfTrapEngine::restore_from_sigframe(self)
     }
 }
-

@@ -233,8 +233,10 @@ pub fn rearm_child_watches(kq: i32) {
             .collect()
     };
     for pid in pids {
-        let _ =
-            crate::darwin_kqueue::apply_changes(kq, &[crate::darwin_kqueue::Kevent::proc_exit(pid)]);
+        let _ = crate::darwin_kqueue::apply_changes(
+            kq,
+            &[crate::darwin_kqueue::Kevent::proc_exit(pid)],
+        );
     }
 }
 

@@ -812,13 +812,19 @@ mod tests {
             );
         }
         // Pre-execve: the caught handler is live.
-        assert!(d.registered_signal_handler(crate::linux_abi::LINUX_SIGCHLD).is_some());
+        assert!(
+            d.registered_signal_handler(crate::linux_abi::LINUX_SIGCHLD)
+                .is_some()
+        );
 
         d.reset_signal_handlers_on_execve();
 
         // The caught SIGCHLD handler is reset to default (no leak of the old
         // image's handler address — the bug that crashed shell-launched tests).
-        assert!(d.registered_signal_handler(crate::linux_abi::LINUX_SIGCHLD).is_none());
+        assert!(
+            d.registered_signal_handler(crate::linux_abi::LINUX_SIGCHLD)
+                .is_none()
+        );
         // SIG_IGN survives execve (Linux semantics).
         assert!(d.signal_is_ignored(10));
         // The alternate signal stack is cleared.

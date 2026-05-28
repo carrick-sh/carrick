@@ -1822,20 +1822,18 @@ pub const LINUX_UCRED_SIZE: usize = 12;
 /// unions for several fields; we flatten to the members carrick's phase-1
 /// opcodes touch (`off`/`addr`/`len`/`op_flags` cover the rw + fsync ops).
 #[repr(C)]
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable)]
 pub struct LinuxIoUringSqe {
     pub opcode: u8,
     pub flags: u8,
     pub ioprio: u16,
     pub fd: i32,
-    pub off: u64,          // union: off / addr2
-    pub addr: u64,         // union: addr / splice_off_in
+    pub off: u64,  // union: off / addr2
+    pub addr: u64, // union: addr / splice_off_in
     pub len: u32,
-    pub op_flags: u32,     // union: rw_flags / fsync_flags / poll_events / …
+    pub op_flags: u32, // union: rw_flags / fsync_flags / poll_events / …
     pub user_data: u64,
-    pub buf_index: u16,    // union: buf_index / buf_group
+    pub buf_index: u16, // union: buf_index / buf_group
     pub personality: u16,
     pub splice_fd_in: i32, // union: splice_fd_in / file_index
     pub pad2: [u64; 2],
@@ -1843,9 +1841,7 @@ pub struct LinuxIoUringSqe {
 
 /// `struct io_uring_cqe` — a 16-byte completion-queue entry.
 #[repr(C)]
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable)]
 pub struct LinuxIoUringCqe {
     pub user_data: u64,
     pub res: i32,

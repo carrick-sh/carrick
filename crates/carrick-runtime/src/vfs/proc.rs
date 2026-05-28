@@ -10,8 +10,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::linux_abi::{LINUX_EACCES, LINUX_ENOENT, LINUX_ENOTDIR};
 use crate::memory::{
     LINUX_EL0_TRAMPOLINE_BASE, LINUX_EL1_VECTORS_BASE, LINUX_HEAP_BASE, LINUX_HEAP_SIZE,
-    LINUX_MMAP_BASE, LINUX_PAGE_TABLES_BASE, LINUX_SIGRETURN_TRAMPOLINE_BASE,
-    LINUX_STACK_SIZE, LINUX_STACK_TOP,
+    LINUX_MMAP_BASE, LINUX_PAGE_TABLES_BASE, LINUX_SIGRETURN_TRAMPOLINE_BASE, LINUX_STACK_SIZE,
+    LINUX_STACK_TOP,
 };
 
 use super::{DirEnt, EntryKind, Metadata, OpenContext, OpenFlags, Vfs, VfsError, VfsHandle};
@@ -312,13 +312,29 @@ impl Vfs for ProcVfs {
             // Top-level: `.`/`..`, `self`, a representative set of synthetic
             // files, and every guest process pid (so `ps`/`ls /proc` enumerate).
             let mut entries = vec![
-                DirEnt { name: ".".to_string(), kind: EntryKind::Directory },
-                DirEnt { name: "..".to_string(), kind: EntryKind::Directory },
-                DirEnt { name: "self".to_string(), kind: EntryKind::Directory },
+                DirEnt {
+                    name: ".".to_string(),
+                    kind: EntryKind::Directory,
+                },
+                DirEnt {
+                    name: "..".to_string(),
+                    kind: EntryKind::Directory,
+                },
+                DirEnt {
+                    name: "self".to_string(),
+                    kind: EntryKind::Directory,
+                },
             ];
             for name in [
-                "cpuinfo", "meminfo", "stat", "uptime", "loadavg", "version", "cmdline",
-                "mounts", "filesystems",
+                "cpuinfo",
+                "meminfo",
+                "stat",
+                "uptime",
+                "loadavg",
+                "version",
+                "cmdline",
+                "mounts",
+                "filesystems",
             ] {
                 entries.push(DirEnt {
                     name: name.to_string(),

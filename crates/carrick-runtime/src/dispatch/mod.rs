@@ -392,8 +392,8 @@ mod abi_args;
 mod creds;
 mod epoll_shim;
 pub(crate) use epoll_shim::{notify_inmem_epoll, register_epoll_kqueue, unregister_epoll_kqueue};
-mod ioring;
 mod fd_table;
+mod ioring;
 #[macro_use]
 mod fs;
 #[macro_use]
@@ -544,8 +544,18 @@ pub enum DispatchOutcome {
         len: u64,
         /// Bytes to copy into the freshly-mapped region at offset 0 (the file
         /// content for a file-backed mmap; empty for anonymous, which the host
-        /// anon mapping already zeroes).
+        /// anon mapping already zeroes). Ignored when `file` is `Some` — a live
+        /// `MAP_SHARED` file mapping is backed by the page cache directly.
         payload: Vec<u8>,
+        /// `Some((fd, offset, host_prot))` for a live `MAP_SHARED` file mapping:
+        /// the host memory at `ipa` is `mmap(host_prot, MAP_SHARED, fd, offset)`,
+        /// so guest writes go to the file's page cache (coherent with other
+        /// openers and across `fork`). `host_prot` is the guest's requested prot
+        /// translated to `PROT_*` — it MUST match the fd's access mode (a
+        /// `PROT_WRITE` MAP_SHARED of a read-only fd is EACCES). The fd is a dup
+        /// the runtime owns and closes after mapping. `None` → anonymous (the
+        /// high-VA / `payload`-snapshot path).
+        file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
     },
     /// Guest invoked `rt_sigreturn(2)` (syscall 139). The runtime must
     /// pop the Carrick sigframe at SP_EL0, restore the saved register
@@ -1409,9 +1419,7 @@ impl SyscallDispatcher {
             // (128 + SIGSYS). A *catchable* SIGSYS for RET_TRAP is a follow-up.
             crate::seccomp::SECCOMP_RET_KILL_PROCESS
             | crate::seccomp::SECCOMP_RET_KILL_THREAD
-            | crate::seccomp::SECCOMP_RET_TRAP => {
-                Some(DispatchOutcome::Exit { code: 128 + 31 })
-            }
+            | crate::seccomp::SECCOMP_RET_TRAP => Some(DispatchOutcome::Exit { code: 128 + 31 }),
             _ => Some(DispatchOutcome::Exit { code: 128 + 31 }),
         }
     }
@@ -1919,9 +1927,7 @@ pub(super) fn rosetta_handshake_ioctl(
     // The response length is encoded in the ioctl request's size field [29:16].
     let size = ((request >> 16) & 0x3fff) as usize;
     let mut payload = vec![0u8; size];
-    if is_license
-        && let Some(blob) = crate::runtime::rosetta_license_blob()
-    {
+    if is_license && let Some(blob) = crate::runtime::rosetta_license_blob() {
         let n = blob.len().min(size);
         payload[..n].copy_from_slice(&blob[..n]);
     }
@@ -4415,8 +4421,8 @@ mod rosetta_handshake_tests {
     fn info_ioctl_returns_zero_and_zeroes_buffer() {
         // 0x80806123: size field = 0x80 (128). Not memcmp'd; success + zeroed.
         let mut m = mem();
-        let outcome = rosetta_handshake_ioctl(&mut m, 0x80806123, BASE)
-            .expect("info ioctl must be handled");
+        let outcome =
+            rosetta_handshake_ioctl(&mut m, 0x80806123, BASE).expect("info ioctl must be handled");
         assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
         let buf = m.read_bytes(BASE, 128).unwrap();
         assert!(buf.iter().all(|&b| b == 0), "info buffer must be zeroed");
@@ -4442,6 +4448,11 @@ mod rosetta_handshake_tests {
         let mut m = mem();
         let outcome = rosetta_handshake_ioctl(&mut m, 0x80806123, 0xDEAD_0000)
             .expect("info ioctl must be handled");
-        assert_eq!(outcome, DispatchOutcome::Errno { errno: LINUX_EFAULT });
+        assert_eq!(
+            outcome,
+            DispatchOutcome::Errno {
+                errno: LINUX_EFAULT
+            }
+        );
     }
 }

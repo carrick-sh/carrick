@@ -13,8 +13,8 @@ pub mod dispatch;
 pub mod dtrace_consumer;
 pub mod fs_backend;
 pub mod host_tty;
-pub mod interactive_supervisor;
 pub(crate) mod inotify;
+pub mod interactive_supervisor;
 pub mod layer_cache;
 // `linux_abi` was lifted into the leaf crate `carrick-abi` (build-graph split,
 // docs/build-decomposition-design.md §3.A-A1). Re-exported under the original
@@ -41,12 +41,12 @@ pub use carrick_host::{guest_cpu, host_facts, host_mapping, host_proc, ulock};
 // syscall metadata (`syscall`). None depend on dispatch/VFS. Re-exported under
 // their original `crate::trap::…` / `crate::thread::…` / … paths so every call
 // site across the runtime is unchanged.
+#[cfg(target_os = "macos")]
+pub use carrick_hvf::darwin_kqueue;
 pub use carrick_hvf::{
     compat, fork_coord, fork_quiesce, host_signal, io_wait, itimer, probes, shared_aperture,
     syscall, thread, trap, vcpu_kick,
 };
-#[cfg(target_os = "macos")]
-pub use carrick_hvf::darwin_kqueue;
 pub mod overlay;
 
 pub mod execute;
