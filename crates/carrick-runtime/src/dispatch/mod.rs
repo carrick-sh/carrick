@@ -402,10 +402,13 @@ mod mem;
 mod net;
 #[macro_use]
 mod proc;
+mod proctitle;
 #[macro_use]
 mod signal;
 #[macro_use]
 mod time;
+
+pub use proctitle::{init as proctitle_init, set_host_process_name};
 
 pub use crate::vfs::ProcMapsEntry;
 pub use abi_args::{Fd, GuestLen, GuestPtr, Pid, Signal};
@@ -2358,65 +2361,6 @@ fn linux_task_name_from_bytes(bytes: &[u8]) -> [u8; LINUX_TASK_COMM_LEN] {
     name[..length].copy_from_slice(&bytes[..length]);
     name
 }
-
-/// Set the host thread/process name to `carrick: <comm>` so external
-/// tools (Activity Monitor, `ps -M`, `sample`, lldb) can tell which
-/// guest a carrick host process is running — invaluable when a forked
-/// child hangs. `comm` is the guest's NUL-padded task name. macOS's
-/// `pthread_setname_np` sets the calling thread's name (capped at
-/// MAXTHREADNAMESIZE=64), which for our single-vCPU-thread model is
-/// the process's visible name.
-#[cfg(target_os = "macos")]
-pub fn set_host_process_name(comm: &[u8]) {
-    let end = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
-    let name = String::from_utf8_lossy(&comm[..end]);
-    let label = format!("carrick: {}", name.trim());
-
-    // (1) Thread name — shows in lldb / Instruments / sample / crash
-    // reports. Capped at MAXTHREADNAMESIZE (64).
-    let thread_label: String = label.chars().take(63).collect();
-    if let Ok(cstr) = std::ffi::CString::new(thread_label) {
-        unsafe {
-            libc::pthread_setname_np(cstr.as_ptr());
-        }
-    }
-
-    // (2) argv[0] in-place overwrite — what `ps` reads. macOS's `ps`
-    // shows the argument vector; overwriting argv[0]'s bytes (bounded
-    // by its original length so we never run past the contiguous
-    // argv/env block) changes the visible command. This is the same
-    // technique libuv/Node use for `process.title`. NUL-pad the
-    // remainder so a shortened name doesn't leave stale trailing text.
-    unsafe {
-        let argv = libc::_NSGetArgv();
-        if !argv.is_null() && !(*argv).is_null() {
-            let arg0 = *(*argv);
-            if !arg0.is_null() {
-                let orig_len = libc::strlen(arg0);
-                let bytes = label.as_bytes();
-                let n = bytes.len().min(orig_len);
-                std::ptr::copy_nonoverlapping(bytes.as_ptr(), arg0 as *mut u8, n);
-                // Pad the rest of the original arg0 with NULs.
-                for i in n..orig_len {
-                    *arg0.add(i) = 0;
-                }
-            }
-        }
-    }
-
-    // NOTE: we deliberately do NOT set the Activity Monitor display name
-    // via LaunchServices/CoreFoundation here. Carrick runs guests by
-    // forking WITHOUT a subsequent exec (the guest executes in-process on
-    // the HVF vCPU), and CoreFoundation/LaunchServices are not fork-safe:
-    // a forked child calling into them deadlocks intermittently when a CF
-    // lock was held at fork time (it blocks talking to launchservicesd
-    // over Mach), which wedged the guest's vCPU and hung the parent in
-    // wait4. The argv[0] overwrite above already gives `ps`/tooling the
-    // visible `carrick: <name>` title, which is all we rely on.
-}
-
-#[cfg(not(target_os = "macos"))]
-pub fn set_host_process_name(_comm: &[u8]) {}
 
 fn linux_statx_flags_are_supported(flags: u64) -> bool {
     const SUPPORTED: u64 = LINUX_AT_SYMLINK_NOFOLLOW
