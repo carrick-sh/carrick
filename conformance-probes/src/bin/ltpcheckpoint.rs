@@ -178,6 +178,38 @@ fn main() {
             shm_futex_xprocess_wake_wakes_wait = exit_code & 2 != 0,
         );
 
+        // (10) The LTP shape is REVERSED from (9): child FUTEX_WAKEs in a loop
+        //      (retrying because the parent might not be in FUTEX_WAIT yet),
+        //      and the parent then FUTEX_WAITs. `tst_checkpoint_wait/wake`
+        //      is exactly this direction. The cross-process futex on a
+        //      host-file MAP_SHARED must serve both directions equally.
+        core::ptr::write_volatile(word, 0);
+        let child = libc::fork();
+        if child == 0 {
+            let start = Instant::now();
+            loop {
+                let woke = futex_op(word, FUTEX_WAKE, i32::MAX as u32, std::ptr::null());
+                if woke >= 1 {
+                    libc::_exit(0);
+                }
+                if Instant::now().duration_since(start) > Duration::from_secs(2) {
+                    libc::_exit(1);
+                }
+                let ts = libc::timespec { tv_sec: 0, tv_nsec: 1_000_000 };
+                libc::nanosleep(&ts, std::ptr::null_mut());
+            }
+        }
+        if child < 0 {
+            report!(shm_futex_child_wake_parent_wait = false);
+        } else {
+            let ts = libc::timespec { tv_sec: 2, tv_nsec: 0 };
+            let _ = futex_op(word, FUTEX_WAIT, 0, &ts);
+            let mut status = 0i32;
+            let _ = libc::wait4(child, &mut status, 0, std::ptr::null_mut());
+            let child_wake_observed = libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
+            report!(shm_futex_child_wake_parent_wait = child_wake_observed);
+        }
+
         // Cleanup.
         let _ = libc::munmap(addr, pagesize as usize);
         let _ = libc::unlink(cpath.as_ptr());
