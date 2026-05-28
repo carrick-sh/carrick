@@ -3076,13 +3076,27 @@ fn read_iovecs(
 
     let mut iovecs = Vec::with_capacity(count);
     let size = core::mem::size_of::<LinuxIovec>();
+    // Linux validates the iov array at syscall entry (rw_copy_check_uvector):
+    // each iov_len and the running total must stay within SSIZE_MAX, else
+    // EINVAL — NOT EFAULT. carrick previously let an oversized iov_len fall
+    // through to a `read_bytes(base, huge)` that EFAULTed (LTP writev01).
+    const SSIZE_MAX: u64 = i64::MAX as u64;
+    let mut total: u64 = 0;
     for index in 0..count {
         let offset = index
             .checked_mul(size)
             .and_then(|offset| u64::try_from(offset).ok())
             .ok_or(LINUX_EINVAL)?;
         let iovec_address = address.checked_add(offset).ok_or(LINUX_EFAULT)?;
-        iovecs.push(read_kernel_struct(memory, iovec_address)?);
+        let iovec: LinuxIovec = read_kernel_struct(memory, iovec_address)?;
+        if iovec.iov_len > SSIZE_MAX {
+            return Err(LINUX_EINVAL);
+        }
+        total = total.checked_add(iovec.iov_len).ok_or(LINUX_EINVAL)?;
+        if total > SSIZE_MAX {
+            return Err(LINUX_EINVAL);
+        }
+        iovecs.push(iovec);
     }
     Ok(iovecs)
 }
