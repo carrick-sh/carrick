@@ -29,6 +29,7 @@ zero. The list is intentionally kept around for future gaps._
 | Probe | Gates |
 |---|---|
 | `sysvshm` | SysV shared memory: shmget(IPC_PRIVATE,…) → shmid; shmat returns a mapped address; r/w roundtrip; cross-process coherence after fork; shmdt returns 0; shmctl(IPC_RMID) returns 0. Backed by host files under `/tmp/carrick-shm/` so forked guests see the same inode (LTP `kill07` MATCH; `kill05` advances past the prior `shmget ENOSYS` TBROK). |
+| `killuidperm` | `kill(2)` permission model: root → other-uid is allowed; non-root cross-uid returns -1/EPERM; non-root same-uid is allowed. Backed by per-process `/tmp/carrick-cred-<host_pid>` so a peer carrick process publishes the euid the kill check reads (LTP `kill05` MATCH 1/1). |
 | `rtsigqueueinfoxthread` | rt_sigqueueinfo(sibling_tid, SIGUSR1, &info) delivers the signal to the sibling thread's SA_SIGINFO handler and propagates si_value — the LTP `rt_sigqueueinfo01` shape (now MATCHing 2/2 assertions after route_thread_signal routing in rt_sigqueueinfo). |
 | `futexwakecount` | `FUTEX_WAKE(INT_MAX)` returns EXACTLY N when N waiters are parked on a MAP_SHARED word — the `sched_yield` between `__ulock_wake_any` iterations invariant from commit 3c6c711 (and the no-phantom-counts invariant from commit e0dd202). Stands in for LTP `futex_wake03`. |
 | `coredumpbit` | `WCOREDUMP(status)` is TRUE for the Linux core-dumping signal set (SIGABRT/SIGSEGV/SIGQUIT/…) and FALSE for non-core signals (SIGTERM/SIGKILL). Synthesizes the 0x80 bit even though macOS's default RLIMIT_CORE=0 suppresses it on the host wait status — commit 0b55501. Stands in for LTP `abort01`. |
@@ -111,6 +112,7 @@ underlying gap got fixed):
 | sched affinity / getcpu / hw cpu count | ✅ `cpucount` | sched_getaffinity01, getcpu01/02 |
 | POSIX timers: create/settime/gettime remaining/getoverrun/delete + stale-id EINVAL; SIGEV_SIGNAL delivers SIGUSR1 | ✅ `posixtimers` | timer_create01–07, timer_settime01/02, timer_gettime01, timer_delete01, timer_getoverrun01 |
 | sched_* invariants: get_priority_{max,min} for OTHER/FIFO/RR; getscheduler→SCHED_OTHER; getparam priority=0; rr_get_interval non-neg | ✅ `schedparam` | sched_get_priority_max01, sched_get_priority_min01, sched_getparam01, sched_getscheduler01, sched_rr_get_interval01, sched_setparam01, sched_setscheduler01 |
+| **sched_get/setparam/rr_get_interval accept ANY live pid (not just self): the calling process can query any task's params, mirroring Linux's task-wide read access** | ✅ (covered by existing `schedparam` post-`sched_pid_exists` fix) | sched_setparam01 (MATCH), sched_getparam01 libc variant (4/4 PASS) |
 
 | FUTEX_WAIT / FUTEX_WAIT_BITSET on mismatched expected → EAGAIN; FUTEX_WAKE with no waiters → 0; cross-thread wait/wake round-trip on a private futex | ✅ `futexextra` | futex_wait02 (mismatch), futex_wake04, futex_wait_bitset01 |
 
@@ -196,4 +198,5 @@ underlying gap got fixed):
 
 | Invariant | Owned by | Stands in for (LTP) |
 |---|---|---|
-| **`shmget` + `shmat` + `shmdt` + `shmctl(IPC_RMID)` round-trip; cross-process coherence after fork via host-file-backed `/tmp/carrick-shm/<key>`** | ✅ `sysvshm` | kill07 (MATCH), kill05 (advances past TBROK), shmget/shmat/shmdt/shmctl LTP families |
+| **`shmget` + `shmat` + `shmdt` + `shmctl(IPC_RMID/IPC_STAT/SHM_STAT/SHM_INFO)` round-trip; per-segment `shm_nattch` / `shm_ctime` / `shm_atime`; cross-process coherence after fork via host-file-backed `/tmp/carrick-shm/<key>` (inode = shmid)** | ✅ `sysvshm` | kill07 (MATCH), kill05 (advances past TBROK), shmctl01 (6/12 → bumped from 0/12), shmat01 (1/4 → bumped from 0/4), shmget/shmdt LTP families |
+| **`kill(2)` permission model across peer guest processes: root → any allowed; non-root cross-uid → EPERM; non-root same-uid → allowed. Cred propagation via per-process `/tmp/carrick-cred-<host_pid>` updated on every setuid/setreuid/setresuid** | ✅ `killuidperm` | kill05 (MATCH 1/1) |
