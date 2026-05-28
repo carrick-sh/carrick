@@ -34,11 +34,27 @@ static CONFORMANCE_LOCK: Mutex<()> = Mutex::new(());
 /// A divergence in one of these is treated as an expected-fail (the suite
 /// stays green), but if a known-gap probe unexpectedly PASSES, the test
 /// FAILS so we remove it from this list — that's the signal the gap was
-/// fixed. Each entry must cite the gap. Empty: the former "memmap" gap —
-/// MAP_SHARED file coherence — is fixed via real host-file-backed stage-2
-/// mappings, and the fork/process, rootfs metadata, and exec-vDSO probe gaps
-/// are covered by the full probe suite.
-const KNOWN_PROBE_GAPS: &[&str] = &[];
+/// fixed. Each entry must cite the gap.
+const KNOWN_PROBE_GAPS: &[&str] = &[
+    // pause() does not wake on a setitimer-delivered SIGALRM in carrick: the
+    // probe TIMEOUTs after 45s instead of returning -1/EINTR. The earlier
+    // d97a47a "preserve itimer delivery for wait restarts" fix covered the
+    // wait4 path; the pause() / sigsuspend() wait path is the next domino.
+    "pauseeintr",
+    // POSIX timers (`timer_create`/`_settime`/`_gettime`/`_delete`/`_getoverrun`)
+    // are ENOSYS in carrick. The probe gates implementation when it lands.
+    "posixtimers",
+    // rt_sigqueueinfo: the caller-supplied siginfo is not propagated to the
+    // guest handler — carrick synthesizes it (see signal.rs `rt_sigqueueinfo`
+    // note). The probe will pass once the dispatcher threads the user
+    // siginfo through to the sigframe.
+    "rtsigqueueinfo",
+    // sched_* query syscalls (`sched_get_priority_min`/`max`,
+    // `sched_getscheduler`, `sched_getparam`, `sched_rr_get_interval`,
+    // `sched_setparam`/`setscheduler`) are unregistered in carrick. The
+    // probe gates the implementation when it lands.
+    "schedparam",
+];
 use std::time::{Duration, Instant};
 
 /// Per-case wall-clock deadline. A single wedged guest process (e.g. a
