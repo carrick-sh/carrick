@@ -786,6 +786,11 @@ impl SyscallDispatcher {
             // through `__ulock` (the same path the multi-threaded
             // dispatcher uses) so the wakeup keys on the physical page.
             let shared_host_addr = memory.shared_futex_host_addr(address.0);
+            crate::probes::futex_route(
+                address.0,
+                command as i32,
+                if shared_host_addr.is_some() { 1 } else { 0 },
+            );
 
             Ok(match command {
                 LINUX_FUTEX_WAKE => {

@@ -2030,6 +2030,11 @@ fn dispatch_threaded_futex(
     // shared physical page so a waker in another carrick process is reached.
     // Private/anon futexes stay in the in-process parking-lot table.
     let shared_host_addr = memory.shared_futex_host_addr(address);
+    crate::probes::futex_route(
+        address,
+        command as i32,
+        if shared_host_addr.is_some() { 1 } else { 0 },
+    );
 
     match command {
         LINUX_FUTEX_WAKE => {

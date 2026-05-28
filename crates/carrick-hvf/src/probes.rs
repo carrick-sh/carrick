@@ -92,6 +92,13 @@ mod carrick_usdt {
     /// (vs which tid actually drains it via `signal-deliver`) — the missing
     /// visibility for the cross-thread / blocked-thread delivery bugs.
     fn signal__publish(_: i32, _: i32, _: i32) {}
+    /// Fires every time the dispatcher routes a `futex(2)` syscall. `pid`,
+    /// `addr` (guest VA of the futex word), `op` (FUTEX_WAIT=0 / WAKE=1 / ...),
+    /// `shared` (1 = routed through `__ulock` because the address lives in a
+    /// host-MAP_SHARED region; 0 = routed through the per-process parking lot).
+    /// A WAKE that returns 0 on a `shared=1` address but the waiter exists in
+    /// another process — that's the cross-process rendezvous failing.
+    fn futex__route(_: u32, _: u64, _: i32, _: i32) {}
     /// Fires at each `deliver_pending_signal` cycle. `tid` is the delivering
     /// thread; `pending` the signum it drained (0 = nothing deliverable to it).
     /// Pair with `signal-publish` to see a signal published for tid X but never
@@ -241,6 +248,10 @@ pub fn path_open(path: &str, result_size: u64, errno: i32) {
 
 pub fn itimer_fire(signum: i32, generation: u64) {
     carrick_usdt::itimer__fire!(|| (libc::getpid() as u32, signum, generation));
+}
+
+pub fn futex_route(addr: u64, op: i32, shared: i32) {
+    carrick_usdt::futex__route!(|| (libc::getpid() as u32, addr, op, shared));
 }
 
 pub fn guest_exit(code: i32) {
