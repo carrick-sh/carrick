@@ -60,9 +60,10 @@ underlying gap got fixed):
 | sigprocmask BLOCK/UNBLOCK round-trip (sighold/sigrelse equivalent) | ✅ `pauseeintr` + `signals` | sighold02, sigrelse01 |
 | **rt_sigqueueinfo: queue delivers, handler runs; SA_SIGINFO si_value.sival_int payload reaches the handler** | ✅ `rtsigqueueinfo` | rt_sigqueueinfo01, sigqueue01 |
 | Interval timers (SIGALRM/SIGVTALRM/SIGPROF) fire incl. busy-wait + forked child | ✅ `itimer` | setitimer01/02, getitimer01/02, alarm02–07 |
+| **Default-disposition death-by-signal: SIGTERM/SIGKILL kill child→WIFSIGNALED/WTERMSIG; abort() resets SIGABRT→SIG_DFL and re-raises** | ✅ `abortdeath` | kill05, kill07, abort01 |
 
 ### Signals — backlog (LTP-only, no carrick probe yet)
-- ⬜ `kill05/07` (remaining kill-family tests), `abort01`.
+- _(none — all signals-backlog rows are owned by probes)_
 
 ## fork / clone / process & procfs
 
