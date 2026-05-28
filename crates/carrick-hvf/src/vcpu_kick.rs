@@ -279,6 +279,16 @@ pub fn spawn_signal_pump(
             // pump learned its kqueue, so a fast-exiting child still yields
             // SIGCHLD. New children are armed directly by register_child_exit_watch.
             crate::host_signal::rearm_child_watches(kq_fd);
+            // A freshly forked process can run `setitimer` before this pump
+            // thread publishes its kqueue. Replay any already-armed timers so
+            // their pending SIGALRM/SIGVTALRM/SIGPROF delivery is not lost.
+            for arm in crate::itimer::current_arms() {
+                let _ = kq.apply(&[crate::darwin_kqueue::Kevent::timer(
+                    arm.ident,
+                    arm.flags,
+                    arm.delay_ns,
+                )]);
+            }
             let mut out = [crate::darwin_kqueue::Kevent::empty()];
             while thread_running.load(std::sync::atomic::Ordering::SeqCst) {
                 let n = match kq.wait(&[], &mut out, None) {
