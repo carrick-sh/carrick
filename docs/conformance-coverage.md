@@ -24,7 +24,6 @@ tracked here; a probe leaving this list = the gap got fixed):
 | Probe | Gap |
 |---|---|
 | `posixtimers` | timer_create/settime/gettime/delete/getoverrun are ENOSYS. |
-| `rtsigqueueinfo` | caller-supplied siginfo's `si_value` isn't propagated to the guest handler (synthesised siginfo). |
 
 **Fixed this session** (probes that flipped from gap → MATCH because the
 underlying gap got fixed):
@@ -33,6 +32,7 @@ underlying gap got fixed):
 |---|---|
 | `schedparam` | Registered sysno 118–121, 125–127 with Linux-conformant constants (proc.rs). |
 | `pauseeintr` | Bounded `wait_kqueue` retry to 50 ms even with a signal pipe (io_wait.rs); added Linux's `set_restore_sigmask` analogue to rt_sigsuspend so a pending blocked signal is actually delivered when the temp mask unblocks it. |
+| `rtsigqueueinfo` | Read the caller's siginfo in `rt_sigqueueinfo`, queue it via `record_pending_siginfo`, and thread an `Option<LinuxSiginfo>` through `inject_signal` so the SA_SIGINFO handler sees the real `si_value` payload instead of a synthesised SI_USER. |
 
 ## Signals & process control
 
@@ -58,7 +58,7 @@ underlying gap got fixed):
 | **pause(): unblocked signal mid-wait → handler runs, returns -1/EINTR** *(carrick gap exposed: pause() doesn't wake on a setitimer-delivered SIGALRM — TIMEOUT)* | ✅ `pauseeintr` | pause01 |
 | **sigsuspend(empty): pending blocked sig delivered, handler runs, returns -1/EINTR, original mask restored, pending consumed** | ✅ `pauseeintr` | sigsuspend01 |
 | sigprocmask BLOCK/UNBLOCK round-trip (sighold/sigrelse equivalent) | ✅ `pauseeintr` + `signals` | sighold02, sigrelse01 |
-| **rt_sigqueueinfo: queue delivers, handler runs; SA_SIGINFO si_value.sival_int payload reaches the handler (carrick gap exposed: synthesized siginfo, payload lost)** | ✅ `rtsigqueueinfo` | rt_sigqueueinfo01, sigqueue01 |
+| **rt_sigqueueinfo: queue delivers, handler runs; SA_SIGINFO si_value.sival_int payload reaches the handler** | ✅ `rtsigqueueinfo` | rt_sigqueueinfo01, sigqueue01 |
 | Interval timers (SIGALRM/SIGVTALRM/SIGPROF) fire incl. busy-wait + forked child | ✅ `itimer` | setitimer01/02, getitimer01/02, alarm02–07 |
 
 ### Signals — backlog (LTP-only, no carrick probe yet)

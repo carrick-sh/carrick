@@ -1,6 +1,8 @@
 //! signal syscall handlers. Methods on `SyscallDispatcher`; see
 //! `super` for the dispatcher struct and the normalized dispatch table.
 use super::*;
+use crate::linux_abi::LinuxSiginfo;
+use std::collections::VecDeque;
 
 /// Owned signal-subsystem state. Split out of `SyscallDispatcher` so the
 /// signal handlers borrow only what they touch instead of the whole
@@ -49,6 +51,13 @@ pub(super) struct SignalState {
     /// the sigframe. `enter_signal_handler` consumes the entry the first
     /// time a handler runs after it's armed.
     pub restore_masks: HashMap<crate::thread::ThreadId, u64>,
+    /// Caller-supplied `siginfo_t` queued for delivery, keyed by `(tid,
+    /// signum)`. `rt_sigqueueinfo` pushes the user's siginfo here so the
+    /// SA_SIGINFO handler sees the original `si_value` payload instead of
+    /// a synthesised SI_USER. RT signals (32..=64) queue multiple entries
+    /// (POSIX queuing); standard signals overwrite the head. Each delivery
+    /// pops the front entry.
+    pub pending_siginfos: HashMap<(crate::thread::ThreadId, i32), VecDeque<LinuxSiginfo>>,
 }
 
 impl SignalState {
@@ -60,6 +69,7 @@ impl SignalState {
             rt_pending_counts: HashMap::new(),
             altstack: HashMap::new(),
             restore_masks: HashMap::new(),
+            pending_siginfos: HashMap::new(),
         }
     }
 
@@ -216,6 +226,46 @@ impl SyscallDispatcher {
         signal
             .restore_masks
             .insert(tid, sanitize_signal_mask(mask));
+    }
+
+    /// Queue a caller-supplied `siginfo_t` for the next delivery of
+    /// `(tid, signum)`. Standard signals overwrite the single queued entry;
+    /// RT signals (32..=64) append (POSIX queuing). `take_pending_siginfo`
+    /// pops the front.
+    pub fn record_pending_siginfo(
+        &self,
+        tid: crate::thread::ThreadId,
+        signum: i32,
+        info: LinuxSiginfo,
+    ) {
+        let mut signal = self.signal.lock();
+        let entry = signal
+            .pending_siginfos
+            .entry((tid, signum))
+            .or_default();
+        if !is_rt_signal(signum) {
+            entry.clear();
+        }
+        entry.push_back(info);
+    }
+
+    /// Pop the next queued `siginfo_t` for `(tid, signum)`, if any. Returned to
+    /// the signal-delivery path so `inject_signal` can carry the caller's
+    /// payload (e.g. `rt_sigqueueinfo`'s `si_value.sival_int`) instead of
+    /// synthesising an SI_USER siginfo. Returns `None` when no siginfo was
+    /// queued (the normal raise/kill case — synthesised SI_USER is correct).
+    pub fn take_pending_siginfo(
+        &self,
+        tid: crate::thread::ThreadId,
+        signum: i32,
+    ) -> Option<LinuxSiginfo> {
+        let mut signal = self.signal.lock();
+        let queue = signal.pending_siginfos.get_mut(&(tid, signum))?;
+        let front = queue.pop_front();
+        if queue.is_empty() {
+            signal.pending_siginfos.remove(&(tid, signum));
+        }
+        front
     }
 
     pub fn restore_signal_mask(&self, tid: crate::thread::ThreadId, mask: u64) {
@@ -620,14 +670,14 @@ impl SyscallDispatcher {
             }
         }
 
-        /// rt_sigqueueinfo(tgid, sig, info_ptr): queue `sig` to the thread group.
-        /// Self-target only (guest pid == host pid); delivered to the calling
-        /// thread like `kill`, so a blocked RT signal queues (N sends -> N
-        /// deliveries via the rt_pending_counts queue) and an unblocked one is
-        /// handed to the runtime's delivery cycle. The caller-supplied `siginfo`
-        /// is not yet propagated to the guest handler (carrick synthesizes it);
-        /// that's a follow-up.
-        fn rt_sigqueueinfo(this, cx, tgid: Pid, sig: Signal, _info_ptr: GuestPtr) {
+        /// rt_sigqueueinfo(tgid, sig, info_ptr): queue `sig` to the thread group
+        /// with a caller-supplied `siginfo_t` whose `si_value` payload the
+        /// SA_SIGINFO handler must observe. Self-target only (guest pid == host
+        /// pid); the signal is mark-pending'd (NOT raised via the host slot)
+        /// so the queued siginfo can be paired with the delivery: the runtime
+        /// pops it from `pending_siginfos[(tid, signum)]` and writes it into
+        /// the sigframe instead of synthesising SI_USER.
+        fn rt_sigqueueinfo(this, cx, tgid: Pid, sig: Signal, info_ptr: GuestPtr) {
             let tgid = i64::from(tgid.0);
             let signum = sig.0 as u64;
             if !is_valid_signum(signum) {
@@ -637,7 +687,27 @@ impl SyscallDispatcher {
             if !self_tgids.contains(&tgid) {
                 return Ok(LINUX_ESRCH.into());
             }
-            Ok(this.raise_self(Self::ctx_tid(cx), signum))
+            let s = signum as i32;
+            let tid = Self::ctx_tid(cx);
+            // Read the user siginfo so the SA_SIGINFO handler sees the original
+            // `si_value`. The kernel re-stamps si_signo to the syscall's `sig`
+            // (per the rt_sigqueueinfo(2) ABI); we mirror that.
+            if info_ptr.0 != 0 {
+                let memory = &*cx.memory;
+                if let Ok(bytes) =
+                    memory.read_bytes(info_ptr.0, core::mem::size_of::<LinuxSiginfo>())
+                {
+                    if let Some(mut info) = LinuxSiginfo::read_from_bytes(&bytes).ok() {
+                        info.si_signo = s;
+                        this.record_pending_siginfo(tid, s, info);
+                    }
+                }
+            }
+            // Always mark pending (don't fall through to raise_for_self / host
+            // PENDING) so the queued siginfo pairs with the delivery. RT signals
+            // already track per-instance counts via rt_pending_counts.
+            this.mark_signal_pending(tid, s);
+            Ok(DispatchOutcome::Returned { value: 0 })
         }
 
         /// rt_sigreturn(): pop signal frame and restore registers.
