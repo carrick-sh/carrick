@@ -2150,12 +2150,23 @@ fn shared_futex_wait(
     this_tid: ThreadId,
 ) -> i64 {
     let deadline = timeout.map(|d| std::time::Instant::now() + d);
+    // Diagnostic: surface *host_addr right before entering __ulock so a probe
+    // can see whether the kernel's compare-and-wait will succeed or short-
+    // circuit. Reuses the futex-route probe encoding: op=99 marks a
+    // pre-ulock-wait peek; arg2=value-passed, arg3=value-at-host-addr-NOW.
+    let host_value = unsafe { (host_addr as *const u32).read() };
+    crate::probes::futex_route(host_addr as u64, 99, value as i32, host_value as u64);
     loop {
         if crate::host_signal::has_pending_for(this_tid as i32)
             || crate::fork_quiesce::is_quiescing()
         {
             return -(crate::linux_abi::LINUX_EINTR as i64);
         }
+        // Slice the kernel wait so a pending guest signal (whose cross-thread
+        // kick can't interrupt __ulock) is still observed within ~20 ms. The
+        // earlier "phantom waiter" inflation we suspected here was actually
+        // macOS's `__ulock_wake` returning spurious successes (see the wake
+        // path); slicing here is signal-delivery latency only, not the cause.
         let slice_us: u32 = match deadline {
             Some(dl) => {
                 let now = std::time::Instant::now();
@@ -2164,10 +2175,11 @@ fn shared_futex_wait(
                 }
                 u32::try_from((dl - now).as_micros().min(20_000)).unwrap_or(20_000)
             }
-            // No guest timeout: 20ms slices so a pending signal is seen promptly.
             None => 20_000,
         };
+        crate::probes::ulock_wait(host_addr as u64, value, slice_us, 0, 0);
         let r = crate::ulock::wait(host_addr, value, slice_us);
+        crate::probes::ulock_wait(host_addr as u64, value, slice_us, 1, r);
         if r >= 0 {
             // Woken by a wake, or the value already differed — either way the
             // guest re-evaluates its own condition. Linux FUTEX_WAIT returns 0.
