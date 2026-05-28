@@ -28,6 +28,8 @@ zero. The list is intentionally kept around for future gaps._
 
 | Probe | Gates |
 |---|---|
+| `sysvshm` | SysV shared memory: shmget(IPC_PRIVATE,…) → shmid; shmat returns a mapped address; r/w roundtrip; cross-process coherence after fork; shmdt returns 0; shmctl(IPC_RMID) returns 0. Backed by host files under `/tmp/carrick-shm/` so forked guests see the same inode (LTP `kill07` MATCH; `kill05` advances past the prior `shmget ENOSYS` TBROK). |
+| `rtsigqueueinfoxthread` | rt_sigqueueinfo(sibling_tid, SIGUSR1, &info) delivers the signal to the sibling thread's SA_SIGINFO handler and propagates si_value — the LTP `rt_sigqueueinfo01` shape (now MATCHing 2/2 assertions after route_thread_signal routing in rt_sigqueueinfo). |
 | `futexwakecount` | `FUTEX_WAKE(INT_MAX)` returns EXACTLY N when N waiters are parked on a MAP_SHARED word — the `sched_yield` between `__ulock_wake_any` iterations invariant from commit 3c6c711 (and the no-phantom-counts invariant from commit e0dd202). Stands in for LTP `futex_wake03`. |
 | `coredumpbit` | `WCOREDUMP(status)` is TRUE for the Linux core-dumping signal set (SIGABRT/SIGSEGV/SIGQUIT/…) and FALSE for non-core signals (SIGTERM/SIGKILL). Synthesizes the 0x80 bit even though macOS's default RLIMIT_CORE=0 suppresses it on the host wait status — commit 0b55501. Stands in for LTP `abort01`. |
 | `unlinkatbindmount` | `unlinkat(AT_FDCWD, "/dev/shm/<f>", 0)` removes a file created via the same bind-mounted path. Mirrors openat's vfs_mounts.resolve routing for unlink/unlinkat (commit 063ccf4) — without this, every `tst_checkpoint`-using LTP test TBROKs at setup_ipc. |
@@ -189,3 +191,9 @@ underlying gap got fixed):
 | Invariant | Owned by | Stands in for (LTP) |
 |---|---|---|
 | `tst_test` setup_ipc reduction: `/dev/shm` exists, open(O_CREAT\|O_EXCL), chmod 0666, ftruncate, mmap MAP_SHARED, close-then-write coherence, fork-coherent shared word, BOTH directions of cross-process FUTEX_WAIT/WAKE on the shared word | ✅ `ltpcheckpoint` | (`tst_checkpoint`-using tests: pause01, sigwaitinfo01, sigtimedwait01, sighold02, sigrelse01, rt_sigtimedwait01, kill05, tgkill02, …) |
+
+## SysV IPC
+
+| Invariant | Owned by | Stands in for (LTP) |
+|---|---|---|
+| **`shmget` + `shmat` + `shmdt` + `shmctl(IPC_RMID)` round-trip; cross-process coherence after fork via host-file-backed `/tmp/carrick-shm/<key>`** | ✅ `sysvshm` | kill07 (MATCH), kill05 (advances past TBROK), shmget/shmat/shmdt/shmctl LTP families |
