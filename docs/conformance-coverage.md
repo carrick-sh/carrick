@@ -137,6 +137,7 @@ underlying gap got fixed):
 |---|---|---|
 | clock_gettime/clock_getres/nanosleep/clock_nanosleep/gettimeofday/times/getrusage/time on all supported clocks | ✅ `timeclock` | clock_gettime01–03, clock_getres01, nanosleep01–04, clock_nanosleep01/02, gettimeofday01, times01/02, getrusage01–04, time01 |
 | CPU-time + memory accounting non-zero after burning measurable work (getrusage / times / `/proc/self/statm` / `/proc/self/status`) | ✅ `accounting` | (Darwin-sourced rusage/task_info plumbing) |
+| **clock_gettime/getres positivity + monotonic nondecreasing across a busy-wait; gettimeofday/times nonneg; unprivileged clock_settime/clock_adjtime → EPERM (no CAP_SYS_TIME)** | ✅ `timeextra` | clock_gettime01 (TIMEOUT), gettimeofday02, times03, clock_settime02, clock_adjtime01/02 |
 
 ## process / sys-info / misc
 
