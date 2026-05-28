@@ -2,6 +2,17 @@
 //! `super` for the dispatcher struct and the normalized dispatch table.
 use super::*;
 
+/// Pack a `(value_ns, interval_ns)` pair into a `LinuxItimerspec` (the Linux
+/// kernel ABI `struct __kernel_itimerspec`). Used by `timer_settime`'s
+/// `old_value` and `timer_gettime`'s `cur_value` writes.
+fn build_itimerspec_ns(value_ns: u64, interval_ns: u64) -> LinuxItimerspec {
+    let split = |ns: u64| LinuxTimespec {
+        tv_sec: i64::try_from(ns / 1_000_000_000).unwrap_or(i64::MAX),
+        tv_nsec: i64::try_from(ns % 1_000_000_000).unwrap_or(0),
+    };
+    LinuxItimerspec::new(split(interval_ns), split(value_ns))
+}
+
 impl SyscallDispatcher {
     define_syscall! {
         fn timerfd_create(this, cx, clock_id: u64, flags: u64) {
@@ -290,6 +301,134 @@ impl SyscallDispatcher {
                 }
             }
             Ok(DispatchOutcome::Returned { value: 0 })
+        }
+
+        /// `timer_create(clock_id, sevp, &id)`: allocate a per-process timer.
+        /// `sevp == NULL` means "default: deliver SIGALRM via SIGEV_SIGNAL".
+        /// Only SIGEV_SIGNAL (and NULL default) are implemented; SIGEV_THREAD
+        /// would require synthesising a guest thread we can't create from the
+        /// host. Linux sigevent layout: si_value (8) | sigev_signo (4) |
+        /// sigev_notify (4) | _sigev_un (48) = 64 bytes total.
+        fn timer_create(this, cx, clock_id: u64, sevp: GuestPtr, id_out: GuestPtr) {
+            let memory = &mut *cx.memory;
+            // Validate the clock — we only support the same set as clock_gettime.
+            if linux_clock_duration(clock_id).is_none() {
+                return Ok(LINUX_EINVAL.into());
+            }
+            if id_out.0 == 0 {
+                return Ok(LINUX_EFAULT.into());
+            }
+            let mut signum = crate::linux_abi::LINUX_SIGALRM;
+            if sevp.0 != 0 {
+                let bytes = match memory.read_bytes(sevp.0, 16) {
+                    Ok(b) => b,
+                    Err(_) => return Ok(LINUX_EFAULT.into()),
+                };
+                let signo = i32::from_le_bytes(bytes[8..12].try_into().unwrap_or([0; 4]));
+                let notify = i32::from_le_bytes(bytes[12..16].try_into().unwrap_or([0; 4]));
+                const LINUX_SIGEV_SIGNAL: i32 = 0;
+                const LINUX_SIGEV_NONE: i32 = 1;
+                if notify == LINUX_SIGEV_NONE {
+                    // Accept but never fires a signal; we just track for
+                    // settime/gettime/delete bookkeeping.
+                    signum = 0;
+                } else if notify == LINUX_SIGEV_SIGNAL {
+                    if !(1..=64).contains(&signo) {
+                        return Ok(LINUX_EINVAL.into());
+                    }
+                    signum = signo;
+                } else {
+                    // SIGEV_THREAD / SIGEV_THREAD_ID: not implemented.
+                    return Ok(LINUX_ENOTSUP.into());
+                }
+            }
+            let timer_id = crate::posix_timer::create(clock_id as i32, signum);
+            // Linux uses an opaque pointer-sized `timer_t`; we hand back the
+            // small integer id widened to 64 bits.
+            let id_bytes = (timer_id as i64 as u64).to_le_bytes();
+            if memory.write_bytes(id_out.0, &id_bytes).is_err() {
+                let _ = crate::posix_timer::delete(timer_id);
+                return Ok(LINUX_EFAULT.into());
+            }
+            Ok(DispatchOutcome::Returned { value: 0 })
+        }
+
+        /// `timer_settime(id, flags, new, old)`: arm / disarm the timer.
+        /// `flags` of 0 = relative `it_value`; we don't yet honour
+        /// TIMER_ABSTIME. `old` (NULL allowed) receives the previous spec.
+        fn timer_settime(this, cx, timer_id: u64, _flags: u64, new_ptr: GuestPtr, old_ptr: GuestPtr) {
+            let memory = &mut *cx.memory;
+            let id = timer_id as i64 as i32;
+            if !crate::posix_timer::exists(id) {
+                return Ok(LINUX_EINVAL.into());
+            }
+            if new_ptr.0 == 0 {
+                return Ok(LINUX_EFAULT.into());
+            }
+            let spec = match read_itimerspec(memory, new_ptr.0) {
+                Ok(spec) => spec,
+                Err(errno) => return Ok(errno.into()),
+            };
+            let value_ns =
+                u64::try_from(spec.it_value.tv_sec.saturating_mul(1_000_000_000))
+                    .unwrap_or(0)
+                    .saturating_add(u64::try_from(spec.it_value.tv_nsec).unwrap_or(0));
+            let interval_ns =
+                u64::try_from(spec.it_interval.tv_sec.saturating_mul(1_000_000_000))
+                    .unwrap_or(0)
+                    .saturating_add(u64::try_from(spec.it_interval.tv_nsec).unwrap_or(0));
+            let old = crate::posix_timer::arm(id, value_ns, interval_ns);
+            if old_ptr.0 != 0 {
+                let prev = old.unwrap_or(crate::posix_timer::TimerSpec {
+                    signum: 0,
+                    value_ns: 0,
+                    interval_ns: 0,
+                });
+                let old_spec = build_itimerspec_ns(prev.value_ns, prev.interval_ns);
+                if memory
+                    .write_bytes(old_ptr.0, old_spec.as_bytes())
+                    .is_err()
+                {
+                    return Ok(LINUX_EFAULT.into());
+                }
+            }
+            Ok(DispatchOutcome::Returned { value: 0 })
+        }
+
+        /// `timer_gettime(id, cur)`: write the remaining time + interval.
+        fn timer_gettime(this, cx, timer_id: u64, cur_ptr: GuestPtr) {
+            let memory = &mut *cx.memory;
+            let id = timer_id as i64 as i32;
+            let Some((value_ns, interval_ns)) = crate::posix_timer::remaining(id) else {
+                return Ok(LINUX_EINVAL.into());
+            };
+            if cur_ptr.0 == 0 {
+                return Ok(LINUX_EFAULT.into());
+            }
+            let spec = build_itimerspec_ns(value_ns, interval_ns);
+            if memory.write_bytes(cur_ptr.0, spec.as_bytes()).is_err() {
+                return Ok(LINUX_EFAULT.into());
+            }
+            Ok(DispatchOutcome::Returned { value: 0 })
+        }
+
+        /// `timer_delete(id)`: tear down a timer.
+        fn timer_delete(this, cx, timer_id: u64) {
+            let id = timer_id as i64 as i32;
+            if crate::posix_timer::delete(id) {
+                Ok(DispatchOutcome::Returned { value: 0 })
+            } else {
+                Ok(LINUX_EINVAL.into())
+            }
+        }
+
+        /// `timer_getoverrun(id)`: number of missed expiries since last query.
+        fn timer_getoverrun(this, cx, timer_id: u64) {
+            let id = timer_id as i64 as i32;
+            match crate::posix_timer::getoverrun(id) {
+                Some(n) => Ok(DispatchOutcome::Returned { value: n as i64 }),
+                None => Ok(LINUX_EINVAL.into()),
+            }
         }
 
         fn adjtimex(this, cx, address: GuestPtr) {
