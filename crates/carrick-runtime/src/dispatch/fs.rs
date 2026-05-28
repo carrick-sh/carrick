@@ -97,6 +97,23 @@ fn forward_record_lock<M: GuestMemory>(
     DispatchOutcome::Returned { value: 0 }
 }
 
+/// Linux path-length limits enforced at resolution time: NAME_MAX (255) per
+/// component, PATH_MAX (4096) for the whole path. Either overflow →
+/// ENAMETOOLONG. (`PATH_MAX` includes the NUL, so the usable length is 4095.)
+fn check_path_length(path: &str) -> Result<(), i32> {
+    const NAME_MAX: usize = 255;
+    const PATH_MAX: usize = 4096;
+    if path.len() >= PATH_MAX {
+        return Err(LINUX_ENAMETOOLONG);
+    }
+    for component in path.split('/') {
+        if component.len() > NAME_MAX {
+            return Err(LINUX_ENAMETOOLONG);
+        }
+    }
+    Ok(())
+}
+
 fn proc_self_fd_number(path: &str) -> Option<i32> {
     let rest = path
         .strip_prefix("/proc/self/fd/")
@@ -1124,33 +1141,63 @@ impl SyscallDispatcher {
         if path.is_empty() {
             return Ok(path.to_owned());
         }
-        if Path::new(path).is_absolute() {
-            return Ok(join_rootfs_path("/", path));
+        // ENAMETOOLONG: Linux rejects any single component > NAME_MAX (255) and
+        // any total path > PATH_MAX (4096) at resolution time. carrick lacked
+        // these limits, so a too-long path SUCCEEDED instead of failing
+        // (LTP lstat02/stat03/truncate03/open13/… "returned 0, expected -1").
+        if let Err(errno) = check_path_length(path) {
+            return Err(errno);
         }
-        if dirfd == LINUX_AT_FDCWD {
+        let abs = if Path::new(path).is_absolute() {
+            join_rootfs_path("/", path)
+        } else if dirfd == LINUX_AT_FDCWD {
             let cwd = self.io.cwd.read().clone();
-            return Ok(join_rootfs_path(&cwd, path));
-        }
+            join_rootfs_path(&cwd, path)
+        } else {
+            match self.open_file(dirfd as i32).as_ref() {
+                Some(open_file) => match &*open_file.description.read() {
+                    OpenDescription::Directory { path: dir, .. } => join_rootfs_path(dir, path),
+                    _ => return Err(LINUX_ENOTDIR),
+                },
+                None => return Err(LINUX_EBADF),
+            }
+        };
+        // ENOTDIR: an existing intermediate component that is not a directory
+        // can't be traversed. carrick previously let the final lookup return
+        // ENOENT (or leniently resolved through it). Synthesize ENOTDIR here so
+        // `stat("/etc/passwd/foo")` & co match Linux (lstat02/stat03/…).
+        self.validate_intermediate_dirs(&abs)?;
+        Ok(abs)
+    }
 
-        match self.open_file(dirfd as i32).as_ref() {
-            Some(open_file) => match &*open_file.description.read() {
-                OpenDescription::Directory { path: dir, .. } => Ok(join_rootfs_path(dir, path)),
-                OpenDescription::File { .. }
-                | OpenDescription::HostFile { .. }
-                | OpenDescription::SyntheticFile { .. }
-                | OpenDescription::EventFd { .. }
-                | OpenDescription::TimerFd { .. }
-                | OpenDescription::Epoll { .. }
-                | OpenDescription::Pidfd { .. }
-                | OpenDescription::Inotify { .. }
-                | OpenDescription::PipeReader { .. }
-                | OpenDescription::PipeWriter { .. }
-                | OpenDescription::HostPipe { .. }
-                | OpenDescription::HostSocket { .. }
-                | OpenDescription::Netlink { .. } => Err(LINUX_ENOTDIR),
-            },
-            None => Err(LINUX_EBADF),
+    /// Walk the intermediate (non-final) components of an already-joined
+    /// absolute guest path; if any EXISTING intermediate is a non-directory
+    /// (regular file / char device), traversing it is ENOTDIR. A missing
+    /// intermediate is left alone — the final lookup surfaces ENOENT, which is
+    /// correct. Symlink intermediates are followed by the downstream resolver,
+    /// so they're not flagged here. Cheap: short-circuits at the first missing
+    /// component (so a fresh deep path costs one lookup).
+    fn validate_intermediate_dirs(&self, abs: &str) -> Result<(), i32> {
+        let comps: Vec<&str> = abs.split('/').filter(|c| !c.is_empty()).collect();
+        if comps.len() < 2 {
+            return Ok(()); // no intermediates
         }
+        let mut prefix = String::new();
+        for comp in &comps[..comps.len() - 1] {
+            prefix.push('/');
+            prefix.push_str(comp);
+            match self.layered_metadata(&prefix) {
+                Ok(md) => match md.kind {
+                    RootFsEntryKind::Directory | RootFsEntryKind::Symlink => {}
+                    // A regular file / char device can't be a path component.
+                    _ => return Err(LINUX_ENOTDIR),
+                },
+                // Intermediate doesn't exist (or isn't statable) → stop; the
+                // final resolution returns ENOENT as Linux does.
+                Err(_) => return Ok(()),
+            }
+        }
+        Ok(())
     }
 }
 
