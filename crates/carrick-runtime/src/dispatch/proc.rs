@@ -1152,6 +1152,22 @@ impl SyscallDispatcher {
         }
 
         fn clone(this, cx, flags: u64, stack: u64, parent_tid: GuestPtr, tls: u64, child_tid: GuestPtr) {
+            // Kernel flag-consistency rules (linux/kernel/fork.c copy_process):
+            // CLONE_THREAD requires CLONE_SIGHAND, and CLONE_SIGHAND requires
+            // CLONE_VM. A guest that asks for a thread without sharing signal
+            // handlers + the address space gets EINVAL on real Linux; carrick
+            // must mirror that BEFORE the THREAD_MASK dispatch, or a malformed
+            // clone would silently take the fork path (LTP clone08 negative
+            // shape; the `clonebasic` probe's CLONE_THREAD-alone assertion).
+            let vm = LinuxCloneFlags::VM.bits();
+            let sighand = LinuxCloneFlags::SIGHAND.bits();
+            let thread = LinuxCloneFlags::THREAD.bits();
+            if (flags & thread != 0 && flags & sighand == 0)
+                || (flags & sighand != 0 && flags & vm == 0)
+            {
+                return Ok(LINUX_EINVAL.into());
+            }
+
             let thread_mask = LinuxCloneFlags::THREAD_MASK;
             if (flags & thread_mask) == thread_mask {
                 let parent_tid_addr = if flags & LinuxCloneFlags::PARENT_SETTID.bits() != 0 {
