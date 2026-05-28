@@ -1258,10 +1258,40 @@ impl SyscallDispatcher {
             let writefds_addr = writefds.0;
             let exceptfds_addr = exceptfds.0;
             let timeout_addr = timeout.0;
+            let sigmask_addr = sigmask.0;
             let request_number = cx.number();
             let request_args = cx.raw_args();
             let memory = &mut *cx.memory;
             let reporter = cx.reporter;
+
+            // Linux's pselect6 ABI for the 6th argument is NOT a bare sigset_t *
+            // but a pointer to `struct { const sigset_t *ss; size_t ss_len; }`
+            // (the kernel "sigset_argpack"). We read the pair, then if ss != 0
+            // and ss_len == LINUX_RT_SIGSET_SIZE, read the actual 8-byte sigset
+            // for the bitmask. NULL outer arg means "no mask change". This bit
+            // mask gates the waiter via `block_signals`: a blocked signal stays
+            // pending instead of EINTR-ing the wait (LTP pselect02 case).
+            let block_signals: u64 = if sigmask_addr != 0 {
+                match memory.read_bytes(sigmask_addr, 16) {
+                    Ok(pack) => {
+                        let ss_ptr = u64::from_le_bytes(pack[0..8].try_into().unwrap_or([0; 8]));
+                        let ss_len = u64::from_le_bytes(pack[8..16].try_into().unwrap_or([0; 8]));
+                        if ss_ptr != 0 && ss_len == crate::linux_abi::LINUX_RT_SIGSET_SIZE {
+                            match memory.read_bytes(ss_ptr, ss_len as usize) {
+                                Ok(bytes) => u64::from_le_bytes(
+                                    bytes.try_into().unwrap_or([0; 8]),
+                                ),
+                                Err(_) => return Ok(LINUX_EFAULT.into()),
+                            }
+                        } else {
+                            0
+                        }
+                    }
+                    Err(_) => return Ok(LINUX_EFAULT.into()),
+                }
+            } else {
+                0
+            };
 
             // Decode timespec → millis for libc::poll. NULL = block forever (-1).
             let timeout_ms: i32 = if timeout_addr == 0 {
@@ -1350,15 +1380,29 @@ impl SyscallDispatcher {
             let all_host: Option<Vec<i32>> = host_map.iter().copied().collect();
 
             if owners.is_empty() {
-                if timeout_ms > 0 {
-                    unsafe {
-                        let ts = libc::timespec {
-                            tv_sec: (timeout_ms / 1000) as libc::time_t,
-                            tv_nsec: ((timeout_ms % 1000) as i64 * 1_000_000) as libc::c_long,
-                        };
-                        libc::nanosleep(&ts, std::ptr::null_mut());
-                    }
-                }
+                // No fds in any set. The original raw `libc::nanosleep` here
+                // never observed guest pending signals (the pump publishes via
+                // the dispatcher-thread-invisible PENDING atomic, not a host
+                // signal), so pselect(0, NULL, NULL, NULL, &ts, NULL) slept the
+                // whole timeout instead of EINTR-ing on SIGALRM. Hand off to
+                // the runtime's lockless waiter just like ppoll does: empty
+                // fds + Some(timeout) parks on the signal pipe with the
+                // timeout, returns Interrupted (EINTR) on a wake, TimedOut
+                // (returned=0) on the deadline.
+                let timeout = if timeout_ms < 0 {
+                    None
+                } else {
+                    Some(std::time::Duration::from_millis(timeout_ms as u64))
+                };
+                let _ = reporter;
+                let _ = request_number;
+                let _ = request_args;
+                return Ok(DispatchOutcome::WaitOnFds {
+                    fds: Vec::new(),
+                    timeout,
+                    on_timeout: 0,
+                    block_signals,
+                });
             } else if let Some(host_fds) = all_host {
                 let mut pollfds: Vec<libc::pollfd> = host_fds
                     .iter()
