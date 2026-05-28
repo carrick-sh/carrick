@@ -29,10 +29,31 @@ fn main() {
         Err(e) => println!("stat_passwd=ERR:{}", e.raw_os_error().unwrap_or(-1)),
     }
 
-    // symlink_metadata of a known symlink (if any) — use /bin (often a symlink).
-    match fs::symlink_metadata("/bin") {
-        Ok(m) => println!("lstat_bin symlink={} dir={}", m.file_type().is_symlink(), m.is_dir()),
-        Err(e) => println!("lstat_bin=ERR:{}", e.raw_os_error().unwrap_or(-1)),
+    // lstat vs stat on a symlink WE create — the real syscall invariants:
+    // lstat reports a symlink and does NOT follow it; stat FOLLOWS to the
+    // target; readlink returns the verbatim target. Using a probe-created
+    // symlink tests the syscalls themselves, not how the image rootfs happens
+    // to represent /bin (carrick deliberately flattens image symlinks like
+    // /bin->usr/bin into real dirs so cap-std — which refuses symlink traversal
+    // — can still reach /bin/sh; that's a rootfs tradeoff, not an lstat bug).
+    let _ = fs::remove_file("/tmp/probe/lnk");
+    fs::write("/tmp/probe/tgt", b"x").ok();
+    std::os::unix::fs::symlink("tgt", "/tmp/probe/lnk").ok();
+    match fs::symlink_metadata("/tmp/probe/lnk") {
+        Ok(m) => println!(
+            "lstat_symlink is_symlink={} is_file={}",
+            m.file_type().is_symlink(),
+            m.is_file()
+        ),
+        Err(e) => println!("lstat_symlink=ERR:{}", e.raw_os_error().unwrap_or(-1)),
+    }
+    match fs::metadata("/tmp/probe/lnk") {
+        Ok(m) => println!("stat_symlink_follows_is_file={}", m.is_file()),
+        Err(e) => println!("stat_symlink=ERR:{}", e.raw_os_error().unwrap_or(-1)),
+    }
+    match fs::read_link("/tmp/probe/lnk") {
+        Ok(t) => println!("readlink_target_ok={}", t == std::path::Path::new("tgt")),
+        Err(e) => println!("readlink=ERR:{}", e.raw_os_error().unwrap_or(-1)),
     }
 
     // access() family via faccessat: readable/writable/executable as root.
