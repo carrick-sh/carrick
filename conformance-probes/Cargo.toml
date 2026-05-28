@@ -13,6 +13,15 @@ autobins = true
 # the exact syscall (the "reducer"). Bins are auto-discovered — add a new
 # probe by dropping a file in src/bin/ (no Cargo.toml edit, conflict-free
 # for parallel authoring).
+#
+# src/lib.rs is the shared `conformance_probes` crate exposing helper
+# functions for signal/fd/process boilerplate that previously got copy-pasted
+# into every probe. New probes should `use conformance_probes::*;` instead
+# of re-implementing install_handler/block_signal/errno/etc.
+
+[lib]
+name = "conformance_probes"
+path = "src/lib.rs"
 
 [dependencies]
 libc = "0.2"
