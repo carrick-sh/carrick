@@ -42,6 +42,17 @@ fn configure_process_environment() {
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
 
+    // Relocate `environ` onto the heap so the contiguous argv/env stack
+    // bytes become a wider writable buffer for `set_host_process_name`.
+    // MUST run BEFORE any setenv: the first setenv on the pristine env
+    // appends a heap-allocated entry to the environ array, which breaks
+    // our contiguity walk (the new heap string doesn't abut the stack
+    // run) and forces the legacy argv[0]-only fallback. libuv/Postgres
+    // also relocate before any env mutation. Subsequent setenv may
+    // realloc our heap environ — fine: the title buffer is the stack
+    // range, not the env array, so it's unaffected.
+    carrick_runtime::dispatch::proctitle_init();
+
     // Disable Apple's os_log activity tracing for this process tree.
     // Hypervisor.framework's `hv_vcpu_create` initializes an os_log
     // handle internally, and that handle is NOT fork-safe - a forked
@@ -58,13 +69,6 @@ fn configure_process_environment() {
         let val = std::ffi::CString::new("disable").unwrap();
         libc::setenv(key.as_ptr(), val.as_ptr(), 1);
     }
-
-    // Relocate `environ` onto the heap so the contiguous argv/env stack
-    // bytes become a wider writable buffer for `set_host_process_name`.
-    // Must run AFTER the OS_ACTIVITY_MODE setenv above — libc's setenv
-    // may realloc the environ array, which would invalidate the heap
-    // pointer we just installed (Postgres has the same caveat).
-    carrick_runtime::dispatch::proctitle_init();
 
     install_guest_abort_banner();
 

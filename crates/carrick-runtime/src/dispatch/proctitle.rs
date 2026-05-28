@@ -185,7 +185,13 @@ unsafe fn discover_and_relocate() -> Option<Buffer> {
 
         // Then the environment strings — same contiguity rule. We also count
         // them so we know how big a heap-side environ pointer array to allocate.
+        // STOP-AT-FIRST-BREAK semantics: if any setenv has run before init()
+        // (eg the host added OS_ACTIVITY_MODE on a realloc'd environ array),
+        // the freshly-malloc'd heap string won't abut the stack run. Stop
+        // claiming bytes for the writable buffer at that point, but keep
+        // walking the array so we still strdup every env entry onto the heap.
         let mut env_count: usize = 0;
+        let mut still_contiguous = true;
         if !environ.is_null() {
             let mut i: usize = 0;
             loop {
@@ -193,12 +199,15 @@ unsafe fn discover_and_relocate() -> Option<Buffer> {
                 if p.is_null() {
                     break;
                 }
-                if (p as *const libc::c_char) != cursor {
-                    return None;
+                if still_contiguous {
+                    if (p as *const libc::c_char) == cursor {
+                        let l = libc::strlen(p);
+                        end = (p as *const u8).add(l) as *const libc::c_char;
+                        cursor = end.add(1);
+                    } else {
+                        still_contiguous = false;
+                    }
                 }
-                let l = libc::strlen(p);
-                end = (p as *const u8).add(l) as *const libc::c_char;
-                cursor = end.add(1);
                 i += 1;
             }
             env_count = i;
