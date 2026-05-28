@@ -41,10 +41,10 @@ carrick test yet — backlog).
 | **pause(): unblocked signal mid-wait → handler runs, returns -1/EINTR** | ✅ `pauseeintr` | pause01 |
 | **sigsuspend(empty): pending blocked sig delivered, handler runs, returns -1/EINTR, original mask restored, pending consumed** | ✅ `pauseeintr` | sigsuspend01 |
 | sigprocmask BLOCK/UNBLOCK round-trip (sighold/sigrelse equivalent) | ✅ `pauseeintr` + `signals` | sighold02, sigrelse01 |
+| **rt_sigqueueinfo: queue delivers, handler runs; SA_SIGINFO si_value.sival_int payload reaches the handler (carrick gap exposed: synthesized siginfo, payload lost)** | ✅ `rtsigqueueinfo` | rt_sigqueueinfo01, sigqueue01 |
 | Interval timers (SIGALRM/SIGVTALRM/SIGPROF) fire incl. busy-wait + forked child | ✅ `itimer` | setitimer01/02, getitimer01/02, alarm02–07 |
 
 ### Signals — backlog (LTP-only, no carrick probe yet)
-- ⬜ `rt_sigqueueinfo01` — self-queue+deliver (ENOSYS stub).
 - ⬜ `kill05/07` (remaining kill-family tests), `abort01`.
 
 ## fork / clone / process & procfs
@@ -68,9 +68,9 @@ carrick test yet — backlog).
 |---|---|---|
 | Cross-process futex WAIT/WAKE on MAP_SHARED word (`__ulock`) | ✅ `futexshare` | futex_wait02/03, futex_wake02/03 |
 | sched affinity / getcpu / hw cpu count | ✅ `cpucount` | sched_getaffinity01, getcpu01/02 |
+| POSIX timers: create/settime/gettime remaining/getoverrun/delete + stale-id EINVAL; SIGEV_SIGNAL delivers SIGUSR1 | ✅ `posixtimers` | timer_create01–07, timer_settime01/02, timer_gettime01, timer_delete01, timer_getoverrun01 |
 
 ### sched — backlog (the big ENOSYS cluster)
-- ⬜ **POSIX timers** `timer_create/settime/gettime/delete/getoverrun` — all `carrick passed 0` (unregistered). Register → ~7 tests.
 - ⬜ **`sched_*`** `get_priority_max/min`, `getparam`, `getscheduler`, `rr_get_interval`, `setparam`, `setscheduler` — all `carrick passed 0` (unregistered). Register → ~7 tests.
 - ⬜ `futex_cmp_requeue01` (accepted host limitation), `futex_wake04`, `futex_wait_bitset01`.
 
