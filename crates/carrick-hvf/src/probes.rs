@@ -98,7 +98,13 @@ mod carrick_usdt {
     /// host-MAP_SHARED region; 0 = routed through the per-process parking lot).
     /// A WAKE that returns 0 on a `shared=1` address but the waiter exists in
     /// another process — that's the cross-process rendezvous failing.
-    fn futex__route(_: u32, _: u64, _: i32, _: i32) {}
+    fn futex__route(_: u32, _: u64, _: i32, _: i32, _: u64) {}
+    /// Fires at each `ulock::wait` entry and exit. `pid`, `host_addr`,
+    /// `value`, `timeout_us`, `phase` (0=entry, 1=exit), `rc` (exit only).
+    fn ulock__wait(_: u32, _: u64, _: u32, _: u32, _: i32, _: i64) {}
+    /// Fires for each iteration of the dispatcher's FUTEX_WAKE loop:
+    /// `pid`, `host_addr`, `iter`, `rc` (0 on wake-one success, <0 on ENOENT).
+    fn ulock__wake(_: u32, _: u64, _: i32, _: i64) {}
     /// Fires at each `deliver_pending_signal` cycle. `tid` is the delivering
     /// thread; `pending` the signum it drained (0 = nothing deliverable to it).
     /// Pair with `signal-publish` to see a signal published for tid X but never
@@ -250,8 +256,16 @@ pub fn itimer_fire(signum: i32, generation: u64) {
     carrick_usdt::itimer__fire!(|| (libc::getpid() as u32, signum, generation));
 }
 
-pub fn futex_route(addr: u64, op: i32, shared: i32) {
-    carrick_usdt::futex__route!(|| (libc::getpid() as u32, addr, op, shared));
+pub fn futex_route(addr: u64, op: i32, shared: i32, host_addr: u64) {
+    carrick_usdt::futex__route!(|| (libc::getpid() as u32, addr, op, shared, host_addr));
+}
+
+pub fn ulock_wait(host_addr: u64, value: u32, timeout_us: u32, phase: i32, rc: i64) {
+    carrick_usdt::ulock__wait!(|| (libc::getpid() as u32, host_addr, value, timeout_us, phase, rc));
+}
+
+pub fn ulock_wake(host_addr: u64, iter: i32, rc: i64) {
+    carrick_usdt::ulock__wake!(|| (libc::getpid() as u32, host_addr, iter, rc));
 }
 
 pub fn guest_exit(code: i32) {

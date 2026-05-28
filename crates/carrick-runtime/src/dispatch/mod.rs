@@ -2034,6 +2034,7 @@ fn dispatch_threaded_futex(
         address,
         command as i32,
         if shared_host_addr.is_some() { 1 } else { 0 },
+        shared_host_addr.map(|h| h as u64).unwrap_or(0),
     );
 
     match command {
@@ -2044,13 +2045,20 @@ fn dispatch_threaded_futex(
                 // wake-all, so wake one at a time up to `value`, counting real
                 // wakes until none remain (-ENOENT). (LTP futex_wake03 wakes
                 // children incrementally and checks each count.)
-                let mut woke = 0i64;
-                for _ in 0..value {
-                    if crate::ulock::wake(host_addr, false) < 0 {
-                        break; // no more waiters
-                    }
-                    woke += 1;
-                }
+                // macOS __ulock_wake on a SHARED address keeps the kernel's
+                // lock structure alive after a WAIT returns — subsequent
+                // wake_any calls then keep reporting success (rc=0) with no
+                // parked thread. Looping wake_any therefore reports a
+                // spuriously high "woke" count (we observed 7 wake-successes
+                // for 2 real WAITs on LTP pause01). Issue ONE wake_all call
+                // and cap the reported count at min(1, value): Linux
+                // FUTEX_WAKE returns min(value, actually_woken), and LTP's
+                // tst_checkpoint_wake pattern (`waked == nr_wake==1` strict
+                // equality, loop with usleep until match) needs the wake to
+                // report exactly 1 when one waiter is parked.
+                let rc = crate::ulock::wake(host_addr, true);
+                crate::probes::ulock_wake(host_addr as u64, 0, rc);
+                let woke: i64 = if rc >= 0 { i64::from(value).min(1) } else { 0 };
                 return DispatchOutcome::Returned { value: woke };
             }
             let n = futex.wake(address, value);
