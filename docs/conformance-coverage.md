@@ -24,6 +24,17 @@ tracked here; a probe leaving this list = the gap got fixed):
 _None — all four gap-exposing probes added this session have been driven to
 zero. The list is intentionally kept around for future gaps._
 
+**Backfilled** (probes added to gate previously-landed-but-unguarded fixes):
+
+| Probe | Gates |
+|---|---|
+| `futexwakecount` | `FUTEX_WAKE(INT_MAX)` returns EXACTLY N when N waiters are parked on a MAP_SHARED word — the `sched_yield` between `__ulock_wake_any` iterations invariant from commit 3c6c711 (and the no-phantom-counts invariant from commit e0dd202). Stands in for LTP `futex_wake03`. |
+| `coredumpbit` | `WCOREDUMP(status)` is TRUE for the Linux core-dumping signal set (SIGABRT/SIGSEGV/SIGQUIT/…) and FALSE for non-core signals (SIGTERM/SIGKILL). Synthesizes the 0x80 bit even though macOS's default RLIMIT_CORE=0 suppresses it on the host wait status — commit 0b55501. Stands in for LTP `abort01`. |
+| `unlinkatbindmount` | `unlinkat(AT_FDCWD, "/dev/shm/<f>", 0)` removes a file created via the same bind-mounted path. Mirrors openat's vfs_mounts.resolve routing for unlink/unlinkat (commit 063ccf4) — without this, every `tst_checkpoint`-using LTP test TBROKs at setup_ipc. |
+| `reparenttoinit` | Double-fork orphans a grandchild; after the intermediate parent exits, `getppid()` in the orphan returns 1 (the PID-namespace init). Process-tree mirror must reparent on the macOS host the same way Linux does in its PID namespace. Stands in for LTP `getpid01`. |
+| `prctldumpable` | `PR_SET_DUMPABLE`/`PR_GET_DUMPABLE` round-trip: initial=1, set 0→get 0, set 1→get 1, set 2 returns OBSERVED rc/errno (newer kernels reject with EINVAL — probe records the tuple), set 99→EINVAL. Stands in for LTP `prctl04`/`prctl08`. |
+| `waitidspec` | `waitid(2)` siginfo encoding: CLD_EXITED+si_status, CLD_KILLED+si_status==SIGKILL, WNOWAIT peek-then-reap leaves the zombie, P_ALL+WNOHANG→ECHILD with no children. Distinct ABI from wait4 (covered by `proclife`/`waitrestart`). Stands in for LTP `waitid01`/`waitid02`/`waitid03`. |
+
 **Fixed this session** (probes that flipped from gap → MATCH because the
 underlying gap got fixed):
 
@@ -65,6 +76,7 @@ underlying gap got fixed):
 | **rt_sigqueueinfo: queue delivers, handler runs; SA_SIGINFO si_value.sival_int payload reaches the handler** | ✅ `rtsigqueueinfo` | rt_sigqueueinfo01, sigqueue01 |
 | Interval timers (SIGALRM/SIGVTALRM/SIGPROF) fire incl. busy-wait + forked child | ✅ `itimer` | setitimer01/02, getitimer01/02, alarm02–07 |
 | **Default-disposition death-by-signal: SIGTERM/SIGKILL kill child→WIFSIGNALED/WTERMSIG; abort() resets SIGABRT→SIG_DFL and re-raises** | ✅ `abortdeath` | kill05, kill07, abort01 |
+| **`WCOREDUMP(status)` set for core-dumping signals (SIGABRT/SIGSEGV/SIGQUIT/SIGILL/SIGTRAP/SIGBUS/SIGFPE/SIGXCPU/SIGXFSZ/SIGSYS), unset for non-core signals (SIGTERM/SIGKILL) — 0x80 bit synthesized through macOS's default RLIMIT_CORE=0** | ✅ `coredumpbit` | abort01 |
 
 ### Signals — backlog (LTP-only, no carrick probe yet)
 - _(none — all signals-backlog rows are owned by probes)_
@@ -78,7 +90,9 @@ underlying gap got fixed):
 | fork+wait4+SIGCHLD/SIGUSR1 + list-walk leaves heap intact; wait status correct | ✅ `forksigwalk` | (shell/framework fork+reap) |
 | `/proc/<pid>/{stat,status,cmdline,comm}` + `task/` for descendants; paused child→'S' | ✅ `procstat` | pause02/03, futex_wait03 |
 | getpid/getppid/gettid identity | ✅ `procid`, `ppid` | gettid02, getpid* |
+| **Orphan child (double-fork) is reparented to PID 1 in its PID namespace; orphan's `getppid()` returns 1** | ✅ `reparenttoinit` | getpid01 (orphan-reparent), classical daemonize idiom |
 | process lifecycle / exit codes / WIFSIGNALED | ✅ `proclife` | (wait4 status) |
+| **`waitid(2)` siginfo encoding: CLD_EXITED/CLD_KILLED + si_status; WNOWAIT peek-then-reap; P_ALL+WNOHANG→ECHILD when no children** | ✅ `waitidspec` | waitid01, waitid02, waitid03 |
 | clone basic + thread flags | (LTP) | clone01–09 (mostly MATCH) |
 | **clone3 arg validation: happy path returns child pid + clean reap; truncated `size`, unknown flag bit, inconsistent stack/stack_size pair each rejected (EINVAL on real Linux, ENOSYS under Docker default seccomp)** | ✅ `clone3args` | clone301, clone302, clone303, clone05, clone08 |
 
@@ -90,6 +104,8 @@ underlying gap got fixed):
 | Invariant | Owned by | Stands in for (LTP) |
 |---|---|---|
 | Cross-process futex WAIT/WAKE on MAP_SHARED word (`__ulock`) | ✅ `futexshare` | futex_wait02/03, futex_wake02/03 |
+| **`FUTEX_WAKE(INT_MAX)` returns exactly N when N waiters are parked on a MAP_SHARED word — `__ulock_wake_any` lock-structure zombie window neutralised by sched_yield between iterations** | ✅ `futexwakecount` | futex_wake03 |
+| **Diagnostic: `FUTEX_WAKE` on a fresh MAP_SHARED page with no waiters returns 0 (no phantom counts)** | ✅ `futexghost` | (no LTP equiv — repro for e0dd202) |
 | sched affinity / getcpu / hw cpu count | ✅ `cpucount` | sched_getaffinity01, getcpu01/02 |
 | POSIX timers: create/settime/gettime remaining/getoverrun/delete + stale-id EINVAL; SIGEV_SIGNAL delivers SIGUSR1 | ✅ `posixtimers` | timer_create01–07, timer_settime01/02, timer_gettime01, timer_delete01, timer_getoverrun01 |
 | sched_* invariants: get_priority_{max,min} for OTHER/FIFO/RR; getscheduler→SCHED_OTHER; getparam priority=0; rr_get_interval non-neg | ✅ `schedparam` | sched_get_priority_max01, sched_get_priority_min01, sched_getparam01, sched_getscheduler01, sched_rr_get_interval01, sched_setparam01, sched_setscheduler01 |
@@ -120,6 +136,7 @@ underlying gap got fixed):
 |---|---|---|
 | access/faccessat/faccessat2 edges under guest-uid=0 (root bypasses rwx; F_OK/R_OK/W_OK/X_OK; AT_EACCESS) | ✅ `accessx` | access01–04, faccessat01/02, faccessat2_* |
 | mkdir/rmdir, nested dirs, readdir ordering + content, hard/sym/relative links, dir rename, unlink, getdents-on-cwd | ✅ `dirops` | mkdir01–09, rmdir01–03, readdir01/2, link01–08, symlink01–05, rename01–14, unlink01–08, getdents01/02 |
+| **`unlinkat(AT_FDCWD, "/dev/shm/<f>", 0)` removes a file created via the same bind-mounted path; both unlinkat and libc::unlink route through `vfs_mounts.resolve` (parallels openat) — the LTP `tst_checkpoint` setup_ipc unblocker** | ✅ `unlinkatbindmount` | (tst_test setup_ipc; ~10 SIGNALS-area tests) |
 | stat / lstat / fstat / access / readlink / getcwd-family | ✅ `fsmeta` | stat01–06, lstat01/02, fstat01–05, readlink01–04, getcwd01–04 |
 | `fstat(fd) == fstatat(path) == statx(fd, AT_EMPTY_PATH)` (size/mtime/mode/inode all agree — apt-cache regression gate) | ✅ `fdstat` | (apt cross-check; statx vs fstat consistency) |
 | readlinkat edge cases + fstat st_mode TYPE bits (regular/dir/symlink/fifo/sock) | ✅ `linkstat` | readlinkat01/02, fstat *_isreg/dir/lnk |
@@ -150,6 +167,7 @@ underlying gap got fixed):
 | Invariant | Owned by | Stands in for (LTP) |
 |---|---|---|
 | uname/sysinfo/getrlimit/prlimit64/prctl/getrandom/sched_getaffinity/sched_yield/getpriority/gettid/umask/getcpu/capget | ✅ `sysinfo` | uname01–04, sysinfo01–03, getrlimit01–03, prlimit64_01–02, prctl01–08, getrandom01–05, sched_getaffinity01, sched_yield01, getpriority01/02, gettid01, umask01–03, getcpu01/02, capget01/02 |
+| **`PR_SET_DUMPABLE`/`PR_GET_DUMPABLE` tri-state round-trip (0↔1↔2) + EINVAL on bogus values** | ✅ `prctldumpable` | prctl04, prctl08 |
 
 ## net / sockets / netlink / pty
 
