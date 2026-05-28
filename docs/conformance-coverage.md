@@ -44,9 +44,17 @@ needs a carrick-managed shared redirect registry keyed on the futex word's
 stable physical-page identity (each process maps the shared page at a
 different host VA, so the per-process `__ulock` host address can't be the
 key) — a tracked follow-up, NOT an accepted limitation of the primitive. A
-guest-thread RESPAWN bug ("current thread handle already set" when a process
-spawns a second batch of threads after the first exits, surfaced by
-`futexrequeue`) is also tracked.
+guest-thread RESPAWN bug is also tracked: a Rust guest that spawns a batch of
+threads, joins them, then spawns a SECOND batch aborts the second batch with
+"current thread handle already set during thread spawn" (Rust std detecting a
+new thread's `#[thread_local] CURRENT` is already populated). Minimal repro:
+`batch(3); batch(3)` — batch 1 runs, batch 2 aborts. `carrick trace` shows
+batch-2 threads get FRESH, distinct TLS addresses (0x…208b78 vs batch-1's
+0x…207b78), so it is NOT literal same-address TLS reuse; the recycled TLS
+block's `.tbss` (where CURRENT lives) isn't reaching the new thread zeroed,
+or the child runs with a stale tpidr_el0. A deep guest-TLS-lifecycle /
+CLONE_VM-thread-teardown investigation — tracked, not yet fixed (the
+`futexrequeue` probe sidesteps it with a single threaded round).
 
 Legend: ✅ owned by a probe · 🧪 owned by a lib unit test · ⬜ LTP-only (no
 carrick test yet — backlog).
