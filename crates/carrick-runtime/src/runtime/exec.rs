@@ -72,12 +72,18 @@ pub(super) fn load_execve_image(
         dispatcher.read_exec_file(p).or_else(|| std::fs::read(p).ok())
     })
     .map_err(|_| LINUX_ENOENT)?;
-    raw.with_el0_trampoline()
+    let image = raw
+        .with_el0_trampoline()
         .and_then(|a| a.with_el1_vectors())
         .and_then(|a| a.with_stage1_page_tables())
         .and_then(|a| a.with_vdso())
         .and_then(|a| a.with_linux_initial_stack(argv, env))
-        .map_err(|_| LINUX_ENOENT)
+        .map_err(|_| LINUX_ENOENT)?;
+    // execve point of no return (image fully built): reset CAUGHT signal
+    // handlers to SIG_DFL as the kernel does, so the new image never inherits
+    // the old image's handler addresses (SIG_IGN/mask/pending are preserved).
+    dispatcher.reset_signal_handlers_on_execve();
+    Ok(image)
 }
 
 /// Parse a `#!` shebang line into (interpreter, optional single arg),
