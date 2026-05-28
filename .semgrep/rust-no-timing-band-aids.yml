@@ -1,0 +1,49 @@
+rules:
+  - id: rust-no-timing-band-aids
+    languages: [rust]
+    severity: WARNING
+    message: |
+      `sleep` used inside a `loop { … sleep … }` pattern that looks like
+      timing-as-correctness — i.e., "wait a bit and hope the race resolves"
+      rather than waiting on an actual notification (futex / kqueue /
+      condvar / pipe). Timing band-aids are flaky under load and silently
+      drop events.
+      Prefer:
+        * `EVFILT_USER` + `kevent` for cross-thread wakeups,
+        * `__ulock_*` for guest futex on SHARED pages,
+        * a self-pipe `read` blocked on a host signal handler,
+        * `parking_lot::Condvar`, `tokio::sync::Notify`,
+        * `crate::io_wait::WaitOnFds`/`WaitOnSignals`.
+      A sleep is FINE when the literal contract is "wait N seconds"
+      (deadline / poll interval over an external system); the smell is a
+      `sleep` mid-`loop {}` checking a memory flag.
+    patterns:
+      - pattern-either:
+          - pattern: |
+              loop {
+                ...
+                std::thread::sleep(...);
+                ...
+              }
+          - pattern: |
+              while $COND {
+                ...
+                std::thread::sleep(...);
+                ...
+              }
+          - pattern: |
+              loop {
+                ...
+                tokio::time::sleep(...).await;
+                ...
+              }
+    paths:
+      include:
+        - "crates/**/*.rs"
+      exclude:
+        - "**/tests/**"
+        - "**/*_test.rs"
+        - "**/test_*.rs"
+        - "**/conformance-probes/**"  # Probes intentionally use bounded waits
+        - "**/runtime.rs"  # The runtime owns the legitimate wait loops
+        - "**/io_wait*.rs"  # io_wait is the canonical wait abstraction
