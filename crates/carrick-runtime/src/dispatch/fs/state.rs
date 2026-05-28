@@ -145,6 +145,24 @@ impl FsState {
                 // so the guest's getservbyname/port lookups work under --fs host
                 // (the scratch has no /etc/services). Single-file mount.
                 m.mount("/etc/services", Box::new(crate::vfs::EtcServicesVfs::new()));
+                // POSIX shared-memory: Linux apps (and LTP's `tst_test` —
+                // ~10 SIGNALS-area tests TBROKed without it) expect /dev/shm
+                // to be a writable tmpfs-style directory where MAP_SHARED
+                // files live. Bind-mount a per-process host directory under
+                // /private/tmp/carrick-shm-<pid>/ so the kernel-backed file
+                // is a real macOS file (which the existing mmap MAP_SHARED
+                // alias machinery already handles fork-coherently). The
+                // longest-prefix-wins mount table takes precedence over the
+                // /dev DevVfs mount for /dev/shm/*.
+                let shm_host = std::path::PathBuf::from(format!(
+                    "/private/tmp/carrick-shm-{}",
+                    std::process::id()
+                ));
+                let _ = std::fs::create_dir_all(&shm_host);
+                m.mount(
+                    "/dev/shm",
+                    Box::new(crate::vfs::BindVfs::new("/dev/shm", shm_host, false)),
+                );
                 m
             },
             rootfs_vfs: crate::vfs::RootFsVfs::new(),
