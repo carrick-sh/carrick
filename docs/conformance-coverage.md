@@ -26,7 +26,13 @@ tracked here; a probe leaving this list = the gap got fixed):
 | `pauseeintr` | pause()/sigsuspend() wait path doesn't wake on setitimer SIGALRM (the post-d97a47a wait4-path fix doesn't cover pause). |
 | `posixtimers` | timer_create/settime/gettime/delete/getoverrun are ENOSYS. |
 | `rtsigqueueinfo` | caller-supplied siginfo's `si_value` isn't propagated to the guest handler (synthesised siginfo). |
-| `schedparam` | sched_get_priority_*/getscheduler/getparam/rr_get_interval are unregistered. |
+
+**Fixed this session** (probes that flipped from gap → MATCH because the
+underlying gap got fixed):
+
+| Probe | Fix |
+|---|---|
+| `schedparam` | Registered sysno 118–121, 125–127 with Linux-conformant constants (proc.rs). |
 
 ## Signals & process control
 
