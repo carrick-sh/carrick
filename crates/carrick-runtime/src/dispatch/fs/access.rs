@@ -48,6 +48,19 @@ impl SyscallDispatcher {
         if let Some(outcome) = self.synthetic_access(path, mode) {
             return outcome;
         }
+        // VFS mounts (e.g. /dev/shm BindVfs) own their lookup — consult them
+        // first, otherwise an `access("/dev/shm", F_OK)` falls through to
+        // rootfs_vfs which doesn't know about the mounted directory and
+        // returns ENOENT. (LTP's tst_test uses this access call to choose
+        // /dev/shm vs a tmpdir for its SHM file; ENOENT here makes the
+        // tmpdir branch fire spuriously.)
+        use crate::vfs::Vfs as _;
+        if let Some(m) = self.fs.vfs_mounts.resolve(path) {
+            return match m.vfs.lookup(&m.full_path) {
+                Ok(md) => access_metadata(&vfs_md_to_rootfs_md(path, &md), mode),
+                Err(errno) => DispatchOutcome::errno(errno),
+            };
+        }
         // Real DAC check when the backend exposes owner+mode (--fs host):
         // access(2) tests the REAL ids, faccessat(AT_EACCESS) the effective.
         if let Some(outcome) = self.dac_access(path, mode, flags & LINUX_AT_EACCESS != 0) {
@@ -56,7 +69,6 @@ impl SyscallDispatcher {
         // Fallback (no real owner/mode, e.g. --fs memory): legacy root model.
         // AT_SYMLINK_NOFOLLOW doesn't change the access mask in our compat
         // layer, so we use the default lookup.
-        use crate::vfs::Vfs as _;
         match self.fs.rootfs_vfs.lookup(path) {
             Ok(md) => access_metadata(&vfs_md_to_rootfs_md(path, &md), mode),
             Err(errno) => DispatchOutcome::errno(errno),
