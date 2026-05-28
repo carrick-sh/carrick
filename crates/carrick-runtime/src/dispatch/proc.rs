@@ -309,7 +309,18 @@ impl SyscallDispatcher {
         memory: &impl GuestMemory,
     ) -> DispatchOutcome {
         let args_ptr = args_ptr.0;
-        if args_size < 8 {
+        // The Linux kernel only accepts size == one of the documented
+        // CLONE_ARGS_SIZE_VERn — anything else is EINVAL (clone302 / glibc's
+        // probe). Carrick had this as `< 8` which silently accepted a
+        // truncated args buffer and then forked anyway, fork-bombing into
+        // the rest of the probe.
+        const CLONE_ARGS_SIZE_VER0: u64 = 64;
+        const CLONE_ARGS_SIZE_VER1: u64 = 80;
+        const CLONE_ARGS_SIZE_VER2: u64 = 88;
+        if !matches!(
+            args_size,
+            CLONE_ARGS_SIZE_VER0 | CLONE_ARGS_SIZE_VER1 | CLONE_ARGS_SIZE_VER2
+        ) {
             return DispatchOutcome::errno(LINUX_EINVAL);
         }
 
@@ -322,6 +333,18 @@ impl SyscallDispatcher {
         };
 
         let flags = args.flags;
+        // Reject unknown flag bits (clone303 — kernel allows bits 8..34 only).
+        // 0x7_FFFF_FF00 covers CLONE_VM (0x100) through CLONE_INTO_CGROUP
+        // (0x4_0000_0000). Anything outside that range is reserved-zero.
+        const CLONE3_VALID_FLAGS: u64 = 0x0000_0007_FFFF_FF00;
+        if flags & !CLONE3_VALID_FLAGS != 0 {
+            return DispatchOutcome::errno(LINUX_EINVAL);
+        }
+        // Inconsistent stack/stack_size pair → EINVAL (clone05/08 shape). A
+        // non-zero stack_size with a zero stack is gibberish; symmetric.
+        if (args.stack == 0) != (args.stack_size == 0) {
+            return DispatchOutcome::errno(LINUX_EINVAL);
+        }
         let thread_mask = LinuxCloneFlags::THREAD_MASK;
         if (flags & thread_mask) == thread_mask {
             if args_size < 64 {
