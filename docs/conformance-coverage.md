@@ -17,6 +17,17 @@ behaviors are still LTP-only (the backlog below).
 Legend: ✅ owned by a probe · 🧪 owned by a lib unit test · ⬜ LTP-only (no
 carrick test yet — backlog).
 
+**Currently exposed gaps** (probes whose carrick-vs-Linux diff is non-empty,
+listed in `KNOWN_PROBE_GAPS` so the harness stays green while the gap is
+tracked here; a probe leaving this list = the gap got fixed):
+
+| Probe | Gap |
+|---|---|
+| `pauseeintr` | pause()/sigsuspend() wait path doesn't wake on setitimer SIGALRM (the post-d97a47a wait4-path fix doesn't cover pause). |
+| `posixtimers` | timer_create/settime/gettime/delete/getoverrun are ENOSYS. |
+| `rtsigqueueinfo` | caller-supplied siginfo's `si_value` isn't propagated to the guest handler (synthesised siginfo). |
+| `schedparam` | sched_get_priority_*/getscheduler/getparam/rr_get_interval are unregistered. |
+
 ## Signals & process control
 
 | Invariant | Owned by | Stands in for (LTP) |
@@ -38,7 +49,7 @@ carrick test yet — backlog).
 | **death-by-signal → wait4 WIFSIGNALED/WTERMSIG; clean exit → WIFEXITED** | ✅ `signalexit` | kill03/06/09 |
 | **Pending on unblock: standard coalesces to 1, real-time queues N** | ✅ `pendingunblock` + 🧪 `rt_signals_queue_…` | (RT vs standard delivery) |
 | ppoll: blocked signal raised mid-wait does NOT interrupt | ✅ `ppollsig` | ppoll01 |
-| **pause(): unblocked signal mid-wait → handler runs, returns -1/EINTR** | ✅ `pauseeintr` | pause01 |
+| **pause(): unblocked signal mid-wait → handler runs, returns -1/EINTR** *(carrick gap exposed: pause() doesn't wake on a setitimer-delivered SIGALRM — TIMEOUT)* | ✅ `pauseeintr` | pause01 |
 | **sigsuspend(empty): pending blocked sig delivered, handler runs, returns -1/EINTR, original mask restored, pending consumed** | ✅ `pauseeintr` | sigsuspend01 |
 | sigprocmask BLOCK/UNBLOCK round-trip (sighold/sigrelse equivalent) | ✅ `pauseeintr` + `signals` | sighold02, sigrelse01 |
 | **rt_sigqueueinfo: queue delivers, handler runs; SA_SIGINFO si_value.sival_int payload reaches the handler (carrick gap exposed: synthesized siginfo, payload lost)** | ✅ `rtsigqueueinfo` | rt_sigqueueinfo01, sigqueue01 |
