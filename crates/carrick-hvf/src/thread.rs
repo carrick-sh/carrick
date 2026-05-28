@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 
 use parking_lot::Mutex as ParkingMutex;
-use parking_lot_core::{FilterOp, ParkResult, ParkToken, UnparkToken};
+use parking_lot_core::{FilterOp, ParkResult, ParkToken, RequeueOp, UnparkResult, UnparkToken};
 
 pub type ThreadId = i32;
 
@@ -417,6 +417,121 @@ impl FutexTable {
         result.unparked_threads as u32
     }
 
+    /// `FUTEX_REQUEUE`/`FUTEX_CMP_REQUEUE` core: wake up to `nr_wake` waiters
+    /// on `from`, then move up to `nr_requeue` of the REMAINING waiters to
+    /// `to`'s queue (where a later `FUTEX_WAKE(to)` will reach them). Returns
+    /// `(woken, requeued)`.
+    ///
+    /// This is the primitive Darwin's `__ulock` lacks but `parking_lot_core`
+    /// provides via `unpark_requeue`: it atomically relinks parked thread
+    /// records from one parking-lot key to another. A requeued guest thread
+    /// stays blocked inside its original `park()` call — it does NOT return to
+    /// the wait loop and re-park on the old key — so the move is durable; the
+    /// thread only wakes when someone unparks `to`'s key, at which point it
+    /// returns `Woken` via the `FUTEX_WAKE_TOKEN` match (the per-bucket
+    /// generation check is bypassed for a token unpark, which is exactly why
+    /// requeue composes with the generation model).
+    ///
+    /// A large `nr_requeue` (glibc/musl pass `INT_MAX` for "requeue everyone")
+    /// takes the O(queue) `RequeueAll`/`UnparkOneRequeueRest` fast path; a
+    /// bounded `nr_requeue` loops `RequeueOne` so the count is exact. The
+    /// caller is responsible for rejecting a negative `nr_requeue` (the kernel
+    /// returns EINVAL) before calling this.
+    pub fn requeue(&self, from: u64, to: u64, nr_wake: u32, nr_requeue: u32) -> (u32, u32) {
+        // glibc/musl request "all" via INT_MAX; anything at/above this cap is
+        // treated as unbounded so it takes the single-pass fast path rather
+        // than an INT_MAX-iteration RequeueOne loop.
+        const REQUEUE_ALL: u32 = i32::MAX as u32;
+        let from_bucket = self.bucket(from);
+        let to_bucket = self.bucket(to);
+        let key_from = Self::bucket_key(&from_bucket);
+        let key_to = Self::bucket_key(&to_bucket);
+
+        // Waking advances the source generation so the woken threads observe a
+        // change; requeued threads are reached by a token unpark on `to`.
+        if nr_wake > 0 {
+            from_bucket.generation.fetch_add(1, Ordering::AcqRel);
+        }
+
+        let mut woken: u32 = 0;
+        let mut requeued: u32 = 0;
+
+        // Fast path: requeue-all (nr_requeue saturated). One unpark_requeue
+        // call wakes ≤1 and moves the rest. For nr_wake >= 2 we first wake the
+        // extra (nr_wake - 1) via the normal filter, since unpark_requeue only
+        // wakes one.
+        if nr_requeue >= REQUEUE_ALL {
+            if nr_wake >= 2 {
+                woken += self.wake_no_genbump(&from_bucket, nr_wake - 1);
+            }
+            let op = if nr_wake >= 1 {
+                RequeueOp::UnparkOneRequeueRest
+            } else {
+                RequeueOp::RequeueAll
+            };
+            let res: UnparkResult = unsafe {
+                parking_lot_core::unpark_requeue(
+                    key_from,
+                    key_to,
+                    || op,
+                    |_op, _res| UnparkToken(FUTEX_WAKE_TOKEN),
+                )
+            };
+            woken += res.unparked_threads as u32;
+            requeued += res.requeued_threads as u32;
+            return (woken, requeued);
+        }
+
+        // Bounded path: wake nr_wake, then requeue exactly up to nr_requeue.
+        if nr_wake > 0 {
+            woken += self.wake_no_genbump(&from_bucket, nr_wake);
+        }
+        while requeued < nr_requeue {
+            let res: UnparkResult = unsafe {
+                parking_lot_core::unpark_requeue(
+                    key_from,
+                    key_to,
+                    || RequeueOp::RequeueOne,
+                    |_op, _res| UnparkToken(FUTEX_WAKE_TOKEN),
+                )
+            };
+            if res.requeued_threads == 0 {
+                break; // source queue drained
+            }
+            requeued += res.requeued_threads as u32;
+            if !res.have_more_threads {
+                break;
+            }
+        }
+        (woken, requeued)
+    }
+
+    /// Unpark up to `n` waiters on an already-resolved bucket WITHOUT bumping
+    /// its generation (the caller bumped it once up front). Used by `requeue`
+    /// to wake the `nr_wake` portion.
+    fn wake_no_genbump(&self, bucket: &Arc<FutexBucket>, n: u32) -> u32 {
+        if n == 0 {
+            return 0;
+        }
+        let key = Self::bucket_key(bucket);
+        let mut remaining = n as usize;
+        let result = unsafe {
+            parking_lot_core::unpark_filter(
+                key,
+                |_| {
+                    if remaining == 0 {
+                        FilterOp::Stop
+                    } else {
+                        remaining -= 1;
+                        FilterOp::Unpark
+                    }
+                },
+                |_| UnparkToken(FUTEX_WAKE_TOKEN),
+            )
+        };
+        result.unparked_threads as u32
+    }
+
     #[cfg(test)]
     pub fn waiter_count(&self, addr: u64) -> usize {
         self.bucket(addr).waiters.load(Ordering::Acquire)
@@ -498,6 +613,94 @@ mod tests {
         );
 
         waker.join().unwrap();
+    }
+
+    #[test]
+    fn requeue_moves_waiters_from_one_addr_to_another() {
+        // N threads park on `from`; requeue(nr_wake=1, nr_requeue=ALL) wakes 1
+        // and moves the rest to `to`; a wake(to) then frees them, while a
+        // wake(from) afterwards finds nobody.
+        let table = Arc::new(FutexTable::new());
+        let from = 0x1111_0000_u64;
+        let to = 0x2222_0000_u64;
+        const N: usize = 4;
+
+        let parked = Arc::new(AtomicUsize::new(0));
+        let returned = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..N {
+            let t = Arc::clone(&table);
+            let parked = Arc::clone(&parked);
+            let returned = Arc::clone(&returned);
+            handles.push(std::thread::spawn(move || {
+                parked.fetch_add(1, Ordering::SeqCst);
+                // Park on `from`; a requeue relinks us to `to` transparently.
+                let _ = t.wait(from, Some(Duration::from_secs(5)), &|| false);
+                returned.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+        // Wait for all parked, plus a beat to enter park().
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while parked.load(Ordering::SeqCst) < N && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+
+        let (woken, requeued) = table.requeue(from, to, 1, u32::MAX);
+        assert_eq!(woken, 1, "exactly one waiter woken");
+        assert_eq!(requeued, (N - 1) as u32, "the rest requeued to `to`");
+
+        // `from` is now empty.
+        assert_eq!(table.wake(from, u32::MAX), 0, "no waiters left on `from`");
+        // `to` holds the N-1 requeued; wake them.
+        assert_eq!(
+            table.wake(to, u32::MAX),
+            (N - 1) as u32,
+            "the requeued waiters are reachable on `to`"
+        );
+
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(returned.load(Ordering::SeqCst), N, "all waiters completed");
+    }
+
+    #[test]
+    fn requeue_bounded_count_is_exact() {
+        // requeue with a BOUNDED nr_requeue moves exactly that many, leaving
+        // the rest on `from`.
+        let table = Arc::new(FutexTable::new());
+        let from = 0x3333_0000_u64;
+        let to = 0x4444_0000_u64;
+        const N: usize = 5;
+
+        let parked = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..N {
+            let t = Arc::clone(&table);
+            let parked = Arc::clone(&parked);
+            handles.push(std::thread::spawn(move || {
+                parked.fetch_add(1, Ordering::SeqCst);
+                let _ = t.wait(from, Some(Duration::from_secs(5)), &|| false);
+            }));
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while parked.load(Ordering::SeqCst) < N && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Wake 0, requeue exactly 2 of the 5.
+        let (woken, requeued) = table.requeue(from, to, 0, 2);
+        assert_eq!(woken, 0);
+        assert_eq!(requeued, 2, "exactly 2 requeued");
+        // `to` has 2; `from` still has 3.
+        assert_eq!(table.wake(to, u32::MAX), 2, "2 reachable on `to`");
+        assert_eq!(table.wake(from, u32::MAX), 3, "3 remain on `from`");
+
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 
     #[test]

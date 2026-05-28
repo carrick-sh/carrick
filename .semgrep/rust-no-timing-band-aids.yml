@@ -54,6 +54,17 @@ rules:
       - metavariable-comparison:
           metavariable: $N
           comparison: int($N) <= 50
+      # Exclude inline #[cfg(test)] modules: test code legitimately polls
+      # for thread-readiness (there's no notification primitive for "all
+      # spawned test threads have entered park()"). The production rule
+      # targets shipped wait loops, not test scaffolding. (Path-based
+      # `**/tests/**` doesn't catch inline `#[cfg(test)] mod tests` in a
+      # src file, so match the module structurally.)
+      - pattern-not-inside: |
+          mod tests { ... }
+      - pattern-not-inside: |
+          #[test]
+          fn $F() { ... }
     paths:
       include:
         - "/crates/**/*.rs"
