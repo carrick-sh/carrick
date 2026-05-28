@@ -375,9 +375,13 @@ impl ThreadWaiter {
                     }
                     Some(duration_to_timespec(dl - now))
                 }
-                // No deadline: a signal pipe wakes us on a signal, so block
-                // indefinitely. Without the pipe, cap at 50ms to re-check.
-                None if self.has_signal_pipe() => None,
+                // Bound the wait even when a signal pipe exists. The kqueue
+                // event is still the fast path, but a freshly forked child
+                // can race signal-pump/self-pipe reinitialisation and lose a
+                // wake edge forever (this is the exact bug d97a47a fixed for
+                // wait4; ppoll(0,0,NULL,...) — which musl uses for pause() on
+                // aarch64 — needs the same 50 ms retry to guarantee a pending
+                // guest signal is observed).
                 None => Some(libc::timespec {
                     tv_sec: 0,
                     tv_nsec: 50_000_000,
