@@ -2,7 +2,7 @@
 //! delivery, fork/exec, and wait handling.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::compat::{CompatReport, CompatReporter};
 use crate::dispatch::{
@@ -37,6 +37,8 @@ use crate::trap::{HvfTrapEngine, TrapError};
 pub use crate::trap::SyscallTrap;
 use serde::Serialize;
 use thiserror::Error;
+
+const SIGNAL_WAIT_SLICE: Duration = Duration::from_millis(50);
 
 /// JSON-serialisable snapshot of the guest layout the trap engine is about
 /// to run. Written by `run-elf --debug-state-path` / `run --debug-state-path`
@@ -553,7 +555,8 @@ where
         match outcome {
             DispatchOutcome::WaitOnFds { .. }
             | DispatchOutcome::WaitOnPollFds { .. }
-            | DispatchOutcome::WaitOnProcExit { .. } => {
+            | DispatchOutcome::WaitOnProcExit { .. }
+            | DispatchOutcome::WaitOnSignals { .. } => {
                 let value = -(crate::linux_abi::LINUX_EINTR as i64);
                 runtime.complete_syscall(value)?;
                 last_syscall_retval = Some(value);
@@ -730,6 +733,7 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
     // blocking path: poll the host fds, then re-dispatch the same syscall on
     // readiness. This is the common single-threaded path for the combined and
     // split runtimes; the threaded runtime keeps its own fork-quiesce handling.
+    let mut signal_wait_deadline = None;
     loop {
         let outcome = dispatcher.dispatch(request, memory, reporter)?;
         match outcome {
@@ -777,9 +781,51 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
                     }
                 }
             }
+            DispatchOutcome::WaitOnSignals { wait_set, timeout } => {
+                let slice = match signal_wait_slice(&mut signal_wait_deadline, timeout) {
+                    Some(slice) => slice,
+                    None => {
+                        return Ok(DispatchOutcome::Errno {
+                            errno: crate::linux_abi::LINUX_EAGAIN,
+                        });
+                    }
+                };
+                match waiter.wait(&[], Some(slice), !wait_set) {
+                    WaitResult::Ready | WaitResult::Interrupted => continue,
+                    WaitResult::TimedOut => {
+                        if signal_wait_expired(signal_wait_deadline) {
+                            return Ok(DispatchOutcome::Errno {
+                                errno: crate::linux_abi::LINUX_EAGAIN,
+                            });
+                        }
+                        continue;
+                    }
+                }
+            }
             other => return Ok(other),
         }
     }
+}
+
+fn signal_wait_slice(
+    deadline: &mut Option<Instant>,
+    timeout: Option<Duration>,
+) -> Option<Duration> {
+    if let Some(timeout) = timeout {
+        let target = deadline.get_or_insert_with(|| Instant::now() + timeout);
+        let now = Instant::now();
+        if now >= *target {
+            return None;
+        }
+        Some((*target - now).min(SIGNAL_WAIT_SLICE))
+    } else {
+        *deadline = None;
+        Some(SIGNAL_WAIT_SLICE)
+    }
+}
+
+fn signal_wait_expired(deadline: Option<Instant>) -> bool {
+    deadline.is_some_and(|target| Instant::now() >= target)
 }
 
 // ===================================================================
@@ -974,6 +1020,7 @@ impl ThreadRuntimeState {
             215 | 216 | 222 | 226 if self.kicker.count() > 1 => Some(self.pt_pause()),
             _ => None,
         };
+        let mut signal_wait_deadline = None;
         loop {
             let request = SyscallRequest::from_aarch64_frame(frame);
             let outcome = kernel.dispatcher.dispatch_threaded(
@@ -1039,6 +1086,33 @@ impl ThreadRuntimeState {
                             break Ok(DispatchOutcome::Errno {
                                 errno: crate::linux_abi::LINUX_EINTR,
                             });
+                        }
+                    }
+                }
+                DispatchOutcome::WaitOnSignals { wait_set, timeout } => {
+                    let slice = match signal_wait_slice(&mut signal_wait_deadline, timeout) {
+                        Some(slice) => slice,
+                        None => {
+                            break Ok(DispatchOutcome::Errno {
+                                errno: crate::linux_abi::LINUX_EAGAIN,
+                            });
+                        }
+                    };
+                    match self.waiter.wait(&[], Some(slice), !wait_set) {
+                        crate::io_wait::WaitResult::Ready => continue,
+                        crate::io_wait::WaitResult::TimedOut => {
+                            if signal_wait_expired(signal_wait_deadline) {
+                                break Ok(DispatchOutcome::Errno {
+                                    errno: crate::linux_abi::LINUX_EAGAIN,
+                                });
+                            }
+                            continue;
+                        }
+                        crate::io_wait::WaitResult::Interrupted => {
+                            if crate::fork_quiesce::is_quiescing() {
+                                self.release_and_park_vcpu_for_fork(engine)?;
+                            }
+                            continue;
                         }
                     }
                 }
@@ -1697,7 +1771,8 @@ fn run_vcpu_until_exit(
             match outcome {
                 DispatchOutcome::WaitOnFds { .. }
                 | DispatchOutcome::WaitOnPollFds { .. }
-                | DispatchOutcome::WaitOnProcExit { .. } => {
+                | DispatchOutcome::WaitOnProcExit { .. }
+                | DispatchOutcome::WaitOnSignals { .. } => {
                     last_syscall_retval =
                         Some(state.complete_errno(&mut engine, crate::linux_abi::LINUX_EINTR)?);
                 }

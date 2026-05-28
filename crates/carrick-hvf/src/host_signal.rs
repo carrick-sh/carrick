@@ -278,6 +278,40 @@ pub fn take_pending_for(tid: i32) -> i32 {
     PENDING.swap(NO_PENDING_SIGNAL, Ordering::SeqCst)
 }
 
+/// Drain a signal pending for `tid` only if it intersects `wait_set` (bit
+/// `signum-1`). Used by `rt_sigtimedwait`: signals outside the waited set must
+/// remain pending for normal delivery instead of being consumed and requeued.
+pub fn take_pending_in_for(tid: i32, wait_set: u64) -> i32 {
+    let in_set = |signum: i32| -> bool {
+        (1..=64).contains(&signum) && wait_set & (1u64 << (signum - 1)) != 0
+    };
+    #[allow(clippy::expect_used)]
+    {
+        let mut guard = THREAD_PENDING.lock().expect("THREAD_PENDING poisoned");
+        if let Some(&signum) = guard.get(&tid)
+            && in_set(signum)
+        {
+            guard.remove(&tid);
+            return signum;
+        }
+    }
+    let pending = PENDING.load(Ordering::SeqCst);
+    if pending != NO_PENDING_SIGNAL
+        && in_set(pending)
+        && PENDING
+            .compare_exchange(
+                pending,
+                NO_PENDING_SIGNAL,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    {
+        return pending;
+    }
+    NO_PENDING_SIGNAL
+}
+
 /// Is a signal deliverable to `tid` pending? True for a thread-directed signal
 /// for this tid OR any process-directed signal. Used by a thread parked in
 /// `kevent`/`futex` to decide whether to break its wait so the trap loop can
@@ -990,6 +1024,26 @@ mod tests {
         assert_eq!(take_pending_for(tid), LINUX_SIGINT);
         // Consumed exactly once.
         assert_eq!(take_pending_for(tid), NO_PENDING_SIGNAL);
+        drain_pending_pipe();
+        drain_pump_pipe();
+    }
+
+    #[test]
+    fn take_pending_in_for_leaves_non_matching_signals_queued() {
+        let _g = TEST_LOCK.lock().unwrap();
+        PENDING.store(NO_PENDING_SIGNAL, Ordering::SeqCst);
+        let tid = 900_012;
+        publish_pending_for(tid, 12);
+
+        assert_eq!(
+            take_pending_in_for(tid, 1u64 << (LINUX_SIGINT - 1)),
+            NO_PENDING_SIGNAL
+        );
+        assert_eq!(take_pending_in_for(tid, 1u64 << (12 - 1)), 12);
+        assert_eq!(
+            take_pending_in_for(tid, 1u64 << (12 - 1)),
+            NO_PENDING_SIGNAL
+        );
         drain_pending_pipe();
         drain_pump_pipe();
     }

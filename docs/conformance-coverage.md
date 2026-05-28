@@ -23,7 +23,8 @@ carrick test yet — backlog).
 |---|---|---|
 | rt_sigaction: install/restore, bad addr→EFAULT, bad sigsetsize→EINVAL, SIGKILL/STOP→EINVAL | ✅ `signals` | rt_sigaction01/02/03, sigaction01/02 |
 | rt_sigprocmask block/unblock/read; sigpending membership | ✅ `signals` | rt_sigprocmask01/02, sigpending02 |
-| rt_sigtimedwait dequeues a pending signal | ✅ `signals` | sigtimedwait01 (wait path still a gap) |
+| rt_sigtimedwait dequeues an already-pending signal | ✅ `signals` | sigtimedwait01 |
+| rt_sigtimedwait with timeout=NULL blocks until a waited signal arrives; fills siginfo; consumes without handler delivery | ✅ `sigwaitblock` | sigwait01, sigwaitinfo01, sigtimedwait01, rt_sigtimedwait01 |
 | Self-`raise()` of a caught signal runs the handler before returning | ✅ `selfraise` | signal01–06, kill03 |
 | SIGCHLD delivered to a parent handler on child exit; reap still works; SIG_IGN auto-reaps | ✅ `sigchld` | (framework heartbeat; wait4) |
 | Cross-process signal (child→parent SIGUSR1) runs handler, not default; Linux↔macOS signum xlate | ✅ `xsignal` | tgkill01, tkill01/02, kill09 |
@@ -39,7 +40,6 @@ carrick test yet — backlog).
 | Interval timers (SIGALRM/SIGVTALRM/SIGPROF) fire incl. busy-wait + forked child | ✅ `itimer` | setitimer01/02, getitimer01/02, alarm02–07 |
 
 ### Signals — backlog (LTP-only, no carrick probe yet)
-- ⬜ **Blocking signal-wait family**: `sigwait01`, `sigwaitinfo01`, `sigtimedwait01`, `rt_sigtimedwait01` — currently TIMEOUT (the wait never receives the raised signal). High-priority gap + probe.
 - ⬜ `rt_sigqueueinfo01` — self-queue+deliver (ENOSYS stub).
 - ⬜ pause/EINTR cluster: `pause01`, `sighold02`, `sigrelse01`, `sigsuspend01`.
 - ⬜ process-group kill: `kill10/11/12` (TIMEOUT), `kill02` self-kill wait-status, `kill05/07`.
