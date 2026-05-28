@@ -568,24 +568,14 @@ impl SyscallDispatcher {
             if let Some(signum) = this.take_pending_in(tid, wait_set) {
                 return Ok(rt_sigtimedwait_deliver(memory, info_ptr, signum));
             }
+            let signum = crate::host_signal::take_pending_in_for(tid, wait_set);
+            if signum != crate::host_signal::NO_PENDING_SIGNAL {
+                return Ok(rt_sigtimedwait_deliver(memory, info_ptr, signum));
+            }
+            install_host_handlers_for_wait_set(wait_set);
             match timeout {
-                Some(d) if !d.is_zero() => {
-                    let deadline = Instant::now() + d.min(Duration::from_secs(5));
-                    while Instant::now() < deadline {
-                        let pending = crate::host_signal::take_pending();
-                        if pending != 0 {
-                            let in_set = sigmask_bit(pending).is_some_and(|b| wait_set & b != 0);
-                            if in_set {
-                                return Ok(rt_sigtimedwait_deliver(memory, info_ptr, pending));
-                            }
-                            crate::host_signal::raise_for_self(pending);
-                            break;
-                        }
-                        std::thread::sleep(Duration::from_millis(1));
-                    }
-                    Ok(LINUX_EAGAIN.into())
-                }
-                _ => Ok(LINUX_EAGAIN.into()),
+                Some(d) if d.is_zero() => Ok(LINUX_EAGAIN.into()),
+                _ => Ok(DispatchOutcome::WaitOnSignals { wait_set, timeout }),
             }
         }
 
@@ -659,6 +649,17 @@ fn sigmask_bit(signum: i32) -> Option<u64> {
         Some(1u64 << (signum - 1))
     } else {
         None
+    }
+}
+
+fn install_host_handlers_for_wait_set(wait_set: u64) {
+    for signum in 1..=64 {
+        let Some(bit) = sigmask_bit(signum) else {
+            continue;
+        };
+        if wait_set & bit != 0 {
+            crate::host_signal::ensure_host_handler(signum);
+        }
     }
 }
 

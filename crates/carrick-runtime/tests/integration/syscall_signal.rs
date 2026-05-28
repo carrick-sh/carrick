@@ -72,6 +72,7 @@ fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
             .unwrap(),
         DispatchOutcome::Errno { errno: LINUX_EINTR }
     );
+    assert_eq!(dispatcher.take_deliverable_pending(0), Some(10));
     // rt_sigsuspend with wrong sigsetsize -> EINVAL.
     assert_eq!(
         dispatcher
@@ -99,7 +100,12 @@ fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
         }
     );
 
-    // rt_sigtimedwait(set=0x4000, info=NULL, timeout=NULL, sigsetsize=8) -> EAGAIN.
+    memory
+        .write_bytes(0x4000, &(1u64 << 9).to_le_bytes())
+        .unwrap();
+    // rt_sigtimedwait(set={SIGUSR1}, info=NULL, timeout=NULL, sigsetsize=8)
+    // blocks indefinitely when no matching signal is pending, so the dispatcher
+    // hands the wait to the runtime instead of returning EAGAIN.
     assert_eq!(
         dispatcher
             .dispatch(
@@ -108,8 +114,9 @@ fn rt_sig_family_bootstrap_validates_args_and_returns_sensible_errnos() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno {
-            errno: LINUX_EAGAIN
+        DispatchOutcome::WaitOnSignals {
+            wait_set: 1u64 << 9,
+            timeout: None
         }
     );
     // rt_sigtimedwait with zero timeout -> EAGAIN.
