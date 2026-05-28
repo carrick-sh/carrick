@@ -22,6 +22,7 @@
 //! at most one spurious fire instead of leaving a runaway periodic timer.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 /// Base of the EVFILT_TIMER ident range for itimers. Idents are
 /// `BASE + which` for `which` in 0..3. The EVFILT_TIMER ident namespace is
@@ -34,6 +35,12 @@ const WHICH_COUNT: usize = 3;
 
 /// Per-`which` interval-timer state shared between `setitimer` and the pump.
 struct ItimerSlot {
+    /// Monotonic generation bumped on every arm/disarm. Fallback timer threads
+    /// use it to avoid firing after a later disarm or replacement arm.
+    generation: AtomicU64,
+    /// First expiry in nanoseconds. Used to replay an arm when `setitimer`
+    /// races ahead of a freshly-forked signal pump publishing its kqueue.
+    value_ns: AtomicU64,
     /// Repeat period in nanoseconds; 0 = no repeat (one-shot).
     interval_ns: AtomicU64,
     /// True between an arm and the matching disarm. A fire for a `!armed`
@@ -48,6 +55,8 @@ struct ItimerSlot {
 impl ItimerSlot {
     const fn new() -> Self {
         Self {
+            generation: AtomicU64::new(0),
+            value_ns: AtomicU64::new(0),
             interval_ns: AtomicU64::new(0),
             armed: AtomicBool::new(false),
             needs_periodic: AtomicBool::new(false),
@@ -78,16 +87,32 @@ pub fn signum_for(which: usize) -> i32 {
     }
 }
 
+/// Complete EVFILT_TIMER arm state for an armed interval timer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimerArm {
+    pub ident: usize,
+    pub flags: u16,
+    pub delay_ns: i64,
+}
+
 /// Mark `which` armed with the given repeat interval (0 = one-shot) and whether
 /// the pump must transition a one-shot to periodic on its first fire. Called by
 /// `setitimer`. Out-of-range `which` is ignored.
-pub fn arm(which: usize, interval_ns: u64, needs_periodic: bool) {
+pub fn arm(which: usize, value_ns: u64, interval_ns: u64, needs_periodic: bool) -> u64 {
     if let Some(slot) = SLOTS.get(which) {
+        let generation = slot
+            .generation
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1);
+        slot.value_ns.store(value_ns, Ordering::SeqCst);
         slot.interval_ns.store(interval_ns, Ordering::SeqCst);
         slot.needs_periodic.store(needs_periodic, Ordering::SeqCst);
         // Publish `armed` last so a pump fire that observes `armed` also sees
         // the interval/needs_periodic written above.
         slot.armed.store(true, Ordering::SeqCst);
+        generation
+    } else {
+        0
     }
 }
 
@@ -95,10 +120,18 @@ pub fn arm(which: usize, interval_ns: u64, needs_periodic: bool) {
 /// `it_value`. Out-of-range `which` is ignored.
 pub fn disarm(which: usize) {
     if let Some(slot) = SLOTS.get(which) {
+        slot.generation.fetch_add(1, Ordering::SeqCst);
         slot.armed.store(false, Ordering::SeqCst);
+        slot.value_ns.store(0, Ordering::SeqCst);
         slot.interval_ns.store(0, Ordering::SeqCst);
         slot.needs_periodic.store(false, Ordering::SeqCst);
     }
+}
+
+fn generation_matches(which: usize, generation: u64) -> bool {
+    SLOTS
+        .get(which)
+        .is_some_and(|slot| slot.generation.load(Ordering::SeqCst) == generation)
 }
 
 /// Is `which` currently armed? The pump uses this to drop stale fires.
@@ -115,6 +148,61 @@ pub fn interval_ns(which: usize) -> u64 {
         .map_or(0, |slot| slot.interval_ns.load(Ordering::SeqCst))
 }
 
+/// Current kqueue timer arm for `which`, if it is armed. This is used when a
+/// freshly forked process starts its signal pump after `setitimer` has already
+/// run; without replaying the arm, the timer state says "armed" but no kqueue
+/// event can ever fire.
+pub fn current_arm(which: usize) -> Option<TimerArm> {
+    let slot = SLOTS.get(which)?;
+    if !slot.armed.load(Ordering::SeqCst) {
+        return None;
+    }
+    let value_ns = slot.value_ns.load(Ordering::SeqCst);
+    let interval_ns = slot.interval_ns.load(Ordering::SeqCst);
+    let needs_periodic = slot.needs_periodic.load(Ordering::SeqCst);
+    if value_ns == 0 {
+        return None;
+    }
+    let flags = if interval_ns != 0 && !needs_periodic && value_ns == interval_ns {
+        libc::EV_ADD
+    } else {
+        libc::EV_ADD | libc::EV_ONESHOT
+    };
+    Some(TimerArm {
+        ident: ident_for(which),
+        flags,
+        delay_ns: i64::try_from(value_ns).unwrap_or(i64::MAX),
+    })
+}
+
+pub fn current_arms() -> impl Iterator<Item = TimerArm> {
+    (0..WHICH_COUNT).filter_map(current_arm)
+}
+
+/// Fallback delivery for runtimes that do not have a signal-pump kqueue. The
+/// threaded runtime uses EVFILT_TIMER so a busy-waiting vCPU can be kicked; this
+/// fallback is for single-threaded fork/exec children parked in host waits, where
+/// publishing to the pending pipe is sufficient to interrupt the wait.
+pub fn spawn_fallback_timer(which: usize, generation: u64, value: Duration, interval: Duration) {
+    let _ = std::thread::Builder::new()
+        .name("carrick-itimer-fallback".to_owned())
+        .spawn(move || {
+            std::thread::sleep(value);
+            loop {
+                if !generation_matches(which, generation) || !is_armed(which) {
+                    break;
+                }
+                let signum = signum_for(which);
+                crate::probes::itimer_fire(signum, 1);
+                crate::host_signal::publish_process_signal(signum);
+                if interval.is_zero() {
+                    break;
+                }
+                std::thread::sleep(interval);
+            }
+        });
+}
+
 /// Atomically take the `needs_periodic` flag for `which`, returning whether the
 /// pump should arm the periodic timer now (and clearing it so later periodic
 /// fires don't re-arm).
@@ -127,6 +215,9 @@ pub fn take_needs_periodic(which: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn ident_round_trips_for_each_which() {
@@ -151,13 +242,14 @@ mod tests {
 
     #[test]
     fn arm_disarm_round_trip() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         // Use which=2 (PROF) to avoid colliding with other tests' slots.
         let which = 2;
         disarm(which);
         assert!(!is_armed(which));
         assert_eq!(interval_ns(which), 0);
 
-        arm(which, 5_000, true);
+        arm(which, 10_000, 5_000, true);
         assert!(is_armed(which));
         assert_eq!(interval_ns(which), 5_000);
         // First take consumes the flag; the second sees it cleared.
@@ -172,12 +264,47 @@ mod tests {
 
     #[test]
     fn one_shot_arm_has_no_periodic_transition() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let which = 1; // VIRTUAL
         disarm(which);
-        arm(which, 0, false);
+        arm(which, 5_000, 0, false);
         assert!(is_armed(which));
         assert_eq!(interval_ns(which), 0);
         assert!(!take_needs_periodic(which));
+        disarm(which);
+    }
+
+    #[test]
+    fn current_arm_reconstructs_one_shot_timer() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let which = 0; // REAL
+        disarm(which);
+        arm(which, 50_000_000, 0, false);
+        assert_eq!(
+            current_arm(which),
+            Some(TimerArm {
+                ident: ident_for(which),
+                flags: libc::EV_ADD | libc::EV_ONESHOT,
+                delay_ns: 50_000_000,
+            })
+        );
+        disarm(which);
+    }
+
+    #[test]
+    fn current_arm_reconstructs_periodic_timer() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let which = 1; // VIRTUAL
+        disarm(which);
+        arm(which, 25_000_000, 25_000_000, false);
+        assert_eq!(
+            current_arm(which),
+            Some(TimerArm {
+                ident: ident_for(which),
+                flags: libc::EV_ADD,
+                delay_ns: 25_000_000,
+            })
+        );
         disarm(which);
     }
 }

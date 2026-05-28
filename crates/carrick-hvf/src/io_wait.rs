@@ -273,16 +273,14 @@ impl ThreadWaiter {
         let cap = (1 + self.signal_pipe_count()).max(1);
         let mut events_out: Vec<Kevent> = vec![Kevent::empty(); cap];
         let result = loop {
-            // No deadline: the self-pipe wakes us on a signal/quiesce. Without a
-            // signal pipe, cap at 50ms to re-check the quiesce flag.
-            let ts = if self.has_signal_pipe() {
-                None
-            } else {
-                Some(libc::timespec {
-                    tv_sec: 0,
-                    tv_nsec: 50_000_000,
-                })
-            };
+            // Bound the wait even when a signal pipe exists. A freshly forked
+            // child can race signal-pump/self-pipe reinitialisation; the kqueue
+            // event is still the fast path, but this retry guarantees a pending
+            // guest signal is observed instead of losing the wake edge forever.
+            let ts = Some(libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 50_000_000,
+            });
             let n = kq.wait(&changes, &mut events_out, ts.as_ref());
             changes.clear(); // registration persists; only add once.
             let n = match n {

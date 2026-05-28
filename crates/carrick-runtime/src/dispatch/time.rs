@@ -248,11 +248,13 @@ impl SyscallDispatcher {
                     }
                 } else {
                     let interval_ns = u64::try_from(interval.as_nanos()).unwrap_or(u64::MAX);
+                    let arm_value_ns = u64::try_from(value.as_nanos()).unwrap_or(u64::MAX);
                     let value_ns = i64::try_from(value.as_nanos()).unwrap_or(i64::MAX);
                     let interval_value_ns = i64::try_from(interval.as_nanos()).unwrap_or(i64::MAX);
                     let periodic = !interval.is_zero() && value == interval;
                     let needs_periodic = !interval.is_zero() && value != interval;
-                    crate::itimer::arm(idx, interval_ns, needs_periodic);
+                    let generation =
+                        crate::itimer::arm(idx, arm_value_ns, interval_ns, needs_periodic);
 
                     let signum = crate::itimer::signum_for(idx);
                     let signal_name = match signum {
@@ -269,16 +271,21 @@ impl SyscallDispatcher {
                                 "setitimer delivery is emulated with an EVFILT_TIMER on the signal pump kqueue and {signal_name}"
                             ),
                         ));
+                    let mut armed_on_kqueue = false;
                     if kq >= 0 {
                         let (flags, data) = if periodic {
                             (libc::EV_ADD, interval_value_ns)
                         } else {
                             (libc::EV_ADD | libc::EV_ONESHOT, value_ns)
                         };
-                        let _ = crate::darwin_kqueue::apply_changes(
+                        armed_on_kqueue = crate::darwin_kqueue::apply_changes(
                             kq,
                             &[crate::darwin_kqueue::Kevent::timer(ident, flags, data)],
-                        );
+                        )
+                        .is_ok();
+                    }
+                    if !armed_on_kqueue {
+                        crate::itimer::spawn_fallback_timer(idx, generation, value, interval);
                     }
                 }
             }
