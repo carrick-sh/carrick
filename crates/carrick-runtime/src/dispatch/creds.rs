@@ -37,6 +37,107 @@ impl CredState {
             umask: LINUX_DEFAULT_UMASK,
         }
     }
+
+    /// We model the CAP_SETUID/CAP_SETGID capability as "running as root"
+    /// (euid 0) — carrick has no finer capability model, and LTP's set*id
+    /// tests gate their privileged/unprivileged expectations on euid==0.
+    fn is_privileged(&self) -> bool {
+        self.euid == 0
+    }
+}
+
+/// The Linux `(uid_t)-1` "leave unchanged" sentinel. uid_t is unsigned, so the
+/// guest passes 0xFFFFFFFF zero-extended into a 64-bit register; decode that as
+/// "keep", any other value as a concrete id. (The old `arg as i64 != -1` check
+/// was wrong: 0xFFFFFFFF as i64 is 4294967295, never -1, so a `-1` arg was
+/// treated as a real uid 4294967295.)
+fn keep_or(arg: u64) -> Option<u32> {
+    let v = arg as u32;
+    if v == u32::MAX { None } else { Some(v) }
+}
+
+/// Linux set*id transition rules (kernel/sys.c). Each returns `Err(())` ⇒ the
+/// caller maps to EPERM. Pure functions on the (r,e,s) triple so they're
+/// unit-testable independent of which uid/gid family they serve.
+mod setid {
+    /// setresuid/setresgid: when unprivileged, every non-(-1) target id must
+    /// already be one of {real, effective, saved}; privileged sets anything.
+    pub(super) fn setres(
+        privileged: bool,
+        cur: (u32, u32, u32),
+        r: Option<u32>,
+        e: Option<u32>,
+        s: Option<u32>,
+    ) -> Result<(u32, u32, u32), ()> {
+        let (mut real, mut eff, mut saved) = cur;
+        if !privileged {
+            let allowed = |id: u32| id == real || id == eff || id == saved;
+            for id in [r, e, s].into_iter().flatten() {
+                if !allowed(id) {
+                    return Err(());
+                }
+            }
+        }
+        if let Some(v) = r {
+            real = v;
+        }
+        if let Some(v) = e {
+            eff = v;
+        }
+        if let Some(v) = s {
+            saved = v;
+        }
+        Ok((real, eff, saved))
+    }
+
+    /// setreuid/setregid + the saved-id rule. Unprivileged: new real ∈
+    /// {real, eff}; new eff ∈ {real, eff, saved}. If real is changed, OR eff is
+    /// set to a value != the PREVIOUS real, the saved id becomes the new eff.
+    pub(super) fn setre(
+        privileged: bool,
+        cur: (u32, u32, u32),
+        r: Option<u32>,
+        e: Option<u32>,
+    ) -> Result<(u32, u32, u32), ()> {
+        let (old_real, old_eff, old_saved) = cur;
+        if !privileged {
+            if let Some(nr) = r {
+                if nr != old_real && nr != old_eff {
+                    return Err(());
+                }
+            }
+            if let Some(ne) = e {
+                if ne != old_real && ne != old_eff && ne != old_saved {
+                    return Err(());
+                }
+            }
+        }
+        let real = r.unwrap_or(old_real);
+        let eff = e.unwrap_or(old_eff);
+        let saved = if r.is_some() || e.is_some_and(|ne| ne != old_real) {
+            eff
+        } else {
+            old_saved
+        };
+        Ok((real, eff, saved))
+    }
+
+    /// setuid/setgid. Privileged sets real=eff=saved=u. Unprivileged: u must be
+    /// the real or saved id, and only the EFFECTIVE id changes.
+    pub(super) fn set(
+        privileged: bool,
+        cur: (u32, u32, u32),
+        u: u32,
+    ) -> Result<(u32, u32, u32), ()> {
+        let (real, _eff, saved) = cur;
+        if privileged {
+            return Ok((u, u, u));
+        }
+        if u != real && u != saved {
+            return Err(());
+        }
+        Ok((real, u, saved))
+    }
 }
 
 impl SyscallDispatcher {
@@ -135,14 +236,11 @@ impl SyscallDispatcher {
 
         fn setresuid(this, cx, r: u64, e: u64, s: u64) {
             let mut creds = this.creds.lock();
-            if r as i64 != -1 {
-                creds.ruid = r as u32;
-            }
-            if e as i64 != -1 {
-                creds.euid = e as u32;
-            }
-            if s as i64 != -1 {
-                creds.suid = s as u32;
+            let priv_ = creds.is_privileged();
+            match setid::setres(priv_, (creds.ruid, creds.euid, creds.suid),
+                                 keep_or(r), keep_or(e), keep_or(s)) {
+                Ok((ru, eu, su)) => { creds.ruid = ru; creds.euid = eu; creds.suid = su; }
+                Err(()) => return Ok(LINUX_EPERM.into()),
             }
             let new_euid = creds.euid;
             drop(creds);
@@ -152,25 +250,22 @@ impl SyscallDispatcher {
 
         fn setresgid(this, cx, r: u64, e: u64, s: u64) {
             let mut creds = this.creds.lock();
-            if r as i64 != -1 {
-                creds.rgid = r as u32;
-            }
-            if e as i64 != -1 {
-                creds.egid = e as u32;
-            }
-            if s as i64 != -1 {
-                creds.sgid = s as u32;
+            let priv_ = creds.is_privileged();
+            match setid::setres(priv_, (creds.rgid, creds.egid, creds.sgid),
+                                 keep_or(r), keep_or(e), keep_or(s)) {
+                Ok((rg, eg, sg)) => { creds.rgid = rg; creds.egid = eg; creds.sgid = sg; }
+                Err(()) => return Ok(LINUX_EPERM.into()),
             }
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
         fn setreuid(this, cx, r: u64, e: u64) {
             let mut creds = this.creds.lock();
-            if r as i64 != -1 {
-                creds.ruid = r as u32;
-            }
-            if e as i64 != -1 {
-                creds.euid = e as u32;
+            let priv_ = creds.is_privileged();
+            match setid::setre(priv_, (creds.ruid, creds.euid, creds.suid),
+                               keep_or(r), keep_or(e)) {
+                Ok((ru, eu, su)) => { creds.ruid = ru; creds.euid = eu; creds.suid = su; }
+                Err(()) => return Ok(LINUX_EPERM.into()),
             }
             let new_euid = creds.euid;
             drop(creds);
@@ -180,32 +275,35 @@ impl SyscallDispatcher {
 
         fn setregid(this, cx, r: u64, e: u64) {
             let mut creds = this.creds.lock();
-            if r as i64 != -1 {
-                creds.rgid = r as u32;
-            }
-            if e as i64 != -1 {
-                creds.egid = e as u32;
+            let priv_ = creds.is_privileged();
+            match setid::setre(priv_, (creds.rgid, creds.egid, creds.sgid),
+                               keep_or(r), keep_or(e)) {
+                Ok((rg, eg, sg)) => { creds.rgid = rg; creds.egid = eg; creds.sgid = sg; }
+                Err(()) => return Ok(LINUX_EPERM.into()),
             }
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
         fn setuid(this, cx, u: u64) {
-            let u = u as u32;
             let mut creds = this.creds.lock();
-            creds.ruid = u;
-            creds.euid = u;
-            creds.suid = u;
+            let priv_ = creds.is_privileged();
+            match setid::set(priv_, (creds.ruid, creds.euid, creds.suid), u as u32) {
+                Ok((ru, eu, su)) => { creds.ruid = ru; creds.euid = eu; creds.suid = su; }
+                Err(()) => return Ok(LINUX_EPERM.into()),
+            }
+            let new_euid = creds.euid;
             drop(creds);
-            crate::cred_ipc::publish_self(u);
+            crate::cred_ipc::publish_self(new_euid);
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
         fn setgid(this, cx, g: u64) {
-            let g = g as u32;
             let mut creds = this.creds.lock();
-            creds.rgid = g;
-            creds.egid = g;
-            creds.sgid = g;
+            let priv_ = creds.is_privileged();
+            match setid::set(priv_, (creds.rgid, creds.egid, creds.sgid), g as u32) {
+                Ok((rg, eg, sg)) => { creds.rgid = rg; creds.egid = eg; creds.sgid = sg; }
+                Err(()) => return Ok(LINUX_EPERM.into()),
+            }
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
@@ -368,5 +466,71 @@ fn linux_capability_data_words(version: u32) -> usize {
         1
     } else {
         2
+    }
+}
+
+#[cfg(test)]
+mod setid_tests {
+    use super::setid;
+
+    // setres: unprivileged may only set ids already in {r,e,s}; privileged any.
+    #[test]
+    fn setres_unprivileged_restricts_to_current_ids() {
+        // cur = (100, 100, 100). Unprivileged set to 200 → EPERM.
+        assert_eq!(setid::setres(false, (100, 100, 100), Some(200), None, None), Err(()));
+        // To an id already held (100) → ok, no change.
+        assert_eq!(setid::setres(false, (100, 100, 100), Some(100), None, None), Ok((100, 100, 100)));
+    }
+
+    #[test]
+    fn setres_privileged_sets_anything_and_keeps_minus_one() {
+        // -1 (None) leaves a field unchanged; others set.
+        assert_eq!(setid::setres(true, (0, 0, 0), Some(5), None, Some(7)), Ok((5, 0, 7)));
+    }
+
+    // setreuid saved-id rule (the subtle part LTP setreuid02 pins down).
+    #[test]
+    fn setre_saved_id_follows_when_real_changes() {
+        // Privileged, cur (0,0,0). setreuid(ruid=5, euid=6): real changes →
+        // saved becomes the new euid (6).
+        assert_eq!(setid::setre(true, (0, 0, 0), Some(5), Some(6)), Ok((5, 6, 6)));
+    }
+
+    #[test]
+    fn setre_saved_id_follows_when_euid_differs_from_old_real() {
+        // cur (10, 10, 10). setreuid(-1, euid=20): real unchanged but new euid
+        // (20) != old real (10) → saved follows → (10, 20, 20).
+        assert_eq!(setid::setre(true, (10, 10, 10), None, Some(20)), Ok((10, 20, 20)));
+    }
+
+    #[test]
+    fn setre_saved_id_unchanged_when_euid_equals_old_real() {
+        // cur (10, 99, 88). setreuid(-1, euid=10): euid set to OLD REAL (10),
+        // real not given → saved stays 88.
+        assert_eq!(setid::setre(true, (10, 99, 88), None, Some(10)), Ok((10, 10, 88)));
+    }
+
+    #[test]
+    fn setre_unprivileged_rejects_foreign_real() {
+        // cur (100, 100, 100). new real 200 ∉ {100,100} → EPERM.
+        assert_eq!(setid::setre(false, (100, 100, 100), Some(200), None), Err(()));
+        // new euid may be the saved id even if unprivileged.
+        assert_eq!(setid::setre(false, (100, 100, 50), None, Some(50)), Ok((100, 50, 50)));
+    }
+
+    // setuid: privileged sets all three; unprivileged only the effective id,
+    // and only to the real or saved id.
+    #[test]
+    fn set_privileged_sets_all_three() {
+        assert_eq!(setid::set(true, (0, 0, 0), 9), Ok((9, 9, 9)));
+    }
+
+    #[test]
+    fn set_unprivileged_changes_only_effective_and_gates_value() {
+        // cur (100, 100, 50). setuid(50): 50 is the saved id → ok, only euid
+        // changes → (100, 50, 50→unchanged=50). real+saved unchanged.
+        assert_eq!(setid::set(false, (100, 100, 50), 50), Ok((100, 50, 50)));
+        // setuid(999): not real/saved → EPERM.
+        assert_eq!(setid::set(false, (100, 100, 50), 999), Err(()));
     }
 }
