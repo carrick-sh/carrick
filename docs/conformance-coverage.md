@@ -105,11 +105,53 @@ underlying gap got fixed):
 - ⬜ `select01/02/03` (TIMEOUT — select-with-timeout wait path), `pselect02`.
 - ⬜ `pipe07/08/12/13`, `pipe2_*`.
 
-## fs / mm / time / misc
-(Existing probes: `accessx`, `dirops`, `fsmeta`, `fsx`, `linkstat`, `fdstat`,
-`fcntlstdio`, `mem`, `memmap`, `mmaprecl`, `hugepage`, `timeclock`, `sysinfo`,
-`accounting`, `iouring`, `net`, `netlink_route`, `icmp`, `ptypair`. Map these
-to their LTP areas as those areas are swept.)
+## fs / metadata / dir
 
-### time — backlog
-- ⬜ `clock_gettime01` (TIMEOUT), `gettimeofday02`/`times03` (TIMEOUT), `clock_settime02`/`clock_adjtime01/02` (need caps; partly fail on Docker too).
+| Invariant | Owned by | Stands in for (LTP) |
+|---|---|---|
+| access/faccessat/faccessat2 edges under guest-uid=0 (root bypasses rwx; F_OK/R_OK/W_OK/X_OK; AT_EACCESS) | ✅ `accessx` | access01–04, faccessat01/02, faccessat2_* |
+| mkdir/rmdir, nested dirs, readdir ordering + content, hard/sym/relative links, dir rename, unlink, getdents-on-cwd | ✅ `dirops` | mkdir01–09, rmdir01–03, readdir01/2, link01–08, symlink01–05, rename01–14, unlink01–08, getdents01/02 |
+| stat / lstat / fstat / access / readlink / getcwd-family | ✅ `fsmeta` | stat01–06, lstat01/02, fstat01–05, readlink01–04, getcwd01–04 |
+| `fstat(fd) == fstatat(path) == statx(fd, AT_EMPTY_PATH)` (size/mtime/mode/inode all agree — apt-cache regression gate) | ✅ `fdstat` | (apt cross-check; statx vs fstat consistency) |
+| readlinkat edge cases + fstat st_mode TYPE bits (regular/dir/symlink/fifo/sock) | ✅ `linkstat` | readlinkat01/02, fstat *_isreg/dir/lnk |
+| statfs / fstatfs, utimensat, fadvise64, fallocate, sync/syncfs/fsync/fdatasync, xattr family, faccessat2, readlinkat, chdir+getcwd, mknod/mknodat | ✅ `fsx` | statfs01–03, fstatfs01/02, utimensat01–04, fadvise64_01, fallocate01–06, sync01, syncfs01, fsync01–04, fdatasync01–03, lsetxattr/getxattr/listxattr01, mknod01–09 |
+| fcntl(F_GETFL/F_SETFL/F_GETFD/F_SETFD) on stdio (0/1/2) returns the right errnos (the dpkg `fcntl(0, F_SETFL, O_NONBLOCK)→EBADF` regression gate) | ✅ `fcntlstdio` | fcntl01–35, dup01–06 |
+
+## mm (memory management)
+
+| Invariant | Owned by | Stands in for (LTP) |
+|---|---|---|
+| mmap/mprotect/munmap/mremap/brk/sbrk/madvise/mlock/munlock/msync | ✅ `mem` | mmap01–18, mprotect01–05, munmap01–03, mremap01–05, brk01, madvise01–11, mlock01–05, msync01–04 |
+| MAP_SHARED file coherence + mremap-grow preservation (apt DynamicMMap path) | ✅ `memmap` | mmap-shared + apt DynamicMMap |
+| Multi-page MAP_SHARED-file alias mappings (16 KiB / 32 KiB) succeed where single-page does (HV_ERROR isolation) | ✅ `aliassize` | (carrick-specific: live file alias HV_ERROR repro) |
+| Post-boot `hv_vm_map` via the MapHostAlias high-VA path works in a forked child (>= 1 TiB MAP_FIXED) | ✅ `forkhighva` | (carrick-specific: post-fork high-VA hv_vm_map) |
+| `mmap` arena reclaim — touch+free 800 × 64 MiB succeeds without exhausting the 32 GiB arena; reused regions read back zero | ✅ `mmaprecl` | (Go-heap-style arena reuse) |
+| MADV_HUGEPAGE / MADV_NOHUGEPAGE return 0 (advisory; allocators must not treat the hint as an error) | ✅ `hugepage` | madvise/THP-hint conformance |
+
+## time (clocks + nanosleep + accounting)
+
+| Invariant | Owned by | Stands in for (LTP) |
+|---|---|---|
+| clock_gettime/clock_getres/nanosleep/clock_nanosleep/gettimeofday/times/getrusage/time on all supported clocks | ✅ `timeclock` | clock_gettime01–03, clock_getres01, nanosleep01–04, clock_nanosleep01/02, gettimeofday01, times01/02, getrusage01–04, time01 |
+| CPU-time + memory accounting non-zero after burning measurable work (getrusage / times / `/proc/self/statm` / `/proc/self/status`) | ✅ `accounting` | (Darwin-sourced rusage/task_info plumbing) |
+
+## process / sys-info / misc
+
+| Invariant | Owned by | Stands in for (LTP) |
+|---|---|---|
+| uname/sysinfo/getrlimit/prlimit64/prctl/getrandom/sched_getaffinity/sched_yield/getpriority/gettid/umask/getcpu/capget | ✅ `sysinfo` | uname01–04, sysinfo01–03, getrlimit01–03, prlimit64_01–02, prctl01–08, getrandom01–05, sched_getaffinity01, sched_yield01, getpriority01/02, gettid01, umask01–03, getcpu01/02, capget01/02 |
+
+## net / sockets / netlink / pty
+
+| Invariant | Owned by | Stands in for (LTP) |
+|---|---|---|
+| socket/socketpair/bind/listen/connect/accept/getsockname/setsockopt/getsockopt across AF_UNIX/INET/INET6/NETLINK | ✅ `net` | socket01/02, socketpair01–04, bind01/06, listen01, connect01/02, accept01/04, getsockname01, setsockopt01–10, getsockopt01–07 |
+| rtnetlink `RTM_GETROUTE` dump: at least one `RTM_NEWROUTE` followed by `NLMSG_DONE` | ✅ `netlink_route` | (rtnetlink shape conformance) |
+| Unprivileged `socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)` ping socket sends an echo request to loopback | ✅ `icmp` | (unprivileged ICMP / ping_group_range path) |
+| pty pair round-trip: posix_openpt → grantpt → unlockpt → ptsname → open slave → write master/read slave (+ reverse) | ✅ `ptypair` | openpt01, grantpt01, ptsname01, posix_openpt01 |
+
+## io_uring
+
+| Invariant | Owned by | Stands in for (LTP) |
+|---|---|---|
+| Raw io_uring_setup → mmap rings → submit (NOP + WRITE + READ + READV) → io_uring_enter → reap CQEs end-to-end | ✅ `iouring` | (io_uring data path; WS-H4-B1) |
