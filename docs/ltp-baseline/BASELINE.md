@@ -50,14 +50,44 @@ count in `docs/conformance-coverage.md` — a MATCH without a probe is not "done
 
 ## Per-area tally
 
-> **Status: sweep in progress.** Run `python3 scripts/ltp-baseline.py --tally`
-> for the live table. The committed snapshot below is updated as areas
-> complete. The 4 curated areas (signals/epoll/timers/sched) were ~54%
-> MATCH under the old count-based verdict; this baseline re-measures them
-> under the honest-oracle classifier alongside the ~1370 previously-unmeasured
-> tests.
+Snapshot at **1154 / 1436 swept (80%)** — representative; the tail is mostly
+`process` (privileged syscalls → high NO_ORACLE). Re-run
+`python3 scripts/ltp-baseline.py --tally` for the live table; this includes the
+fcntl-record-lock, writev-iovec, and SysV-semaphore fixes landed against it.
 
-_(snapshot pending full sweep — early fs sample: 47 MATCH / 12 DIFF / 3 TBROK
+| area | MATCH | PARTIAL | DIFF | TBROK | TIMEOUT | NO_ORACLE | total | verified-MATCH (of oracle-valid) |
+|---|---|---|---|---|---|---|---|---|
+| timers     | 26 | 0 | 2   | 8  | 0 | 19  | 55  | **72%** |
+| signals    | 32 | 0 | 7   | 7  | 3 | 2   | 51  | **65%** |
+| epoll_poll | 30 | 3 | 7   | 13 | 0 | 9   | 62  | **57%** |
+| sched      | 28 | 0 | 16  | 5  | 0 | 18  | 67  | **57%** |
+| fs         | 142| 0 | 115 | 44 | 0 | 141 | 442 | **47%** |
+| process    | 45 | 1 | 23  | 32 | 1 | 129 | 231 | **44%** |
+| net        | 12 | 0 | 15  | 10 | 0 | 16  | 53  | **32%** |
+| mm         | 18 | 1 | 32  | 22 | 1 | 43  | 117 | **24%** |
+| ipc        | 4  | 0 | 9   | 27 | 0 | 7   | 47  | **10%** (sem done; msg-queue half still ENOSYS) |
+| xattr      | 0  | 0 | 4   | 1  | 0 | 24  | 29  | **0%** |
+| **TOTAL**  | **337** | **5** | **230** | **169** | **5** | **408** | **1154** | **337/746 = 45%** |
+
+### The target (DoD #2)
+
+Baseline: **45% verified-MATCH** of oracle-valid tests (337/746). The climbing
+gate:
+- **Phase 1 — 60%**: clear the biggest TBROK framework-blocker classes (ipc
+  msg-queues, the `mount(tmpfs)` setup, the tst_test variant-switching hang)
+  and the concentrated DIFF clusters (each → an owning probe).
+- **Phase 2 — 75%**: bring every worked area to ≥75%; the curated four
+  (signals/epoll/timers/sched) to ≥90%.
+- The whole-suite floor rises with each area; `process`/privileged tests that
+  Docker itself can't run stay NO_ORACLE (excluded, not counted against us).
+
+### Landed against this baseline (each probe-gated)
+- fcntl record locks (host forwarding) → `fcntllock`
+- writev/readv iovec validation → `iovecedge`
+- SysV semaphores (host forwarding) → `sysvsem`
+
+<!-- prior early-sample note retained below for history -->
+_(early fs sample was: 47 MATCH / 12 DIFF / 3 TBROK
 / 29 NO_ORACLE = 76% verified-MATCH of oracle-valid, notably above the curated
 areas' 54%, confirming substantial uncurated conformance was simply
 unmeasured.)_
