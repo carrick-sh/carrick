@@ -775,18 +775,30 @@ impl SyscallDispatcher {
                 });
             };
 
-            if !futex_flags.contains(LinuxFutexFlags::PRIVATE) {
-                cx.reporter
-                    .record(crate::compat::CompatEvent::partial_syscall(
-                        98,
-                        "futex",
-                        args,
-                        "non-private futex treated as private (shared address space)",
-                    ));
-            }
+            // A futex word that lives in a genuine MAP_SHARED file mapping is
+            // a CROSS-PROCESS rendezvous (e.g. LTP `tst_checkpoint` between
+            // a parent and a forked child sharing `/dev/shm/ltp_*`). The
+            // single-threaded dispatcher used to short-circuit to the
+            // per-process parking-lot table here, which made the parent's
+            // WAIT and the child's WAKE land in DIFFERENT tables — so the
+            // wake never reached the wait and LTP TBROKed on
+            // `tst_checkpoint_wake … ETIMEDOUT`. Route shared addresses
+            // through `__ulock` (the same path the multi-threaded
+            // dispatcher uses) so the wakeup keys on the physical page.
+            let shared_host_addr = memory.shared_futex_host_addr(address.0);
 
             Ok(match command {
                 LINUX_FUTEX_WAKE => {
+                    if let Some(host_addr) = shared_host_addr {
+                        let mut woke = 0i64;
+                        for _ in 0..value {
+                            if crate::ulock::wake(host_addr, false) < 0 {
+                                break;
+                            }
+                            woke += 1;
+                        }
+                        return Ok(DispatchOutcome::Returned { value: woke });
+                    }
                     let n = thread.futex.wake(address.0, value);
                     DispatchOutcome::Returned {
                         value: i64::from(n),
@@ -808,6 +820,22 @@ impl SyscallDispatcher {
                             Err(errno) => return Ok(errno.into()),
                         }
                     };
+                    if let Some(host_addr) = shared_host_addr {
+                        return Ok(DispatchOutcome::SharedFutexWait {
+                            host_addr,
+                            value,
+                            timeout,
+                        });
+                    }
+                    if !futex_flags.contains(LinuxFutexFlags::PRIVATE) {
+                        cx.reporter
+                            .record(crate::compat::CompatEvent::partial_syscall(
+                                98,
+                                "futex",
+                                args,
+                                "non-private futex treated as private (shared address space)",
+                            ));
+                    }
                     DispatchOutcome::FutexWait {
                         wait: thread.futex.prepare_wait(address.0),
                         timeout,
