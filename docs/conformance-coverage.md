@@ -37,11 +37,13 @@ carrick test yet — backlog).
 | **death-by-signal → wait4 WIFSIGNALED/WTERMSIG; clean exit → WIFEXITED** | ✅ `signalexit` | kill03/06/09 |
 | **Pending on unblock: standard coalesces to 1, real-time queues N** | ✅ `pendingunblock` + 🧪 `rt_signals_queue_…` | (RT vs standard delivery) |
 | ppoll: blocked signal raised mid-wait does NOT interrupt | ✅ `ppollsig` | ppoll01 |
+| **pause(): unblocked signal mid-wait → handler runs, returns -1/EINTR** | ✅ `pauseeintr` | pause01 |
+| **sigsuspend(empty): pending blocked sig delivered, handler runs, returns -1/EINTR, original mask restored, pending consumed** | ✅ `pauseeintr` | sigsuspend01 |
+| sigprocmask BLOCK/UNBLOCK round-trip (sighold/sigrelse equivalent) | ✅ `pauseeintr` + `signals` | sighold02, sigrelse01 |
 | Interval timers (SIGALRM/SIGVTALRM/SIGPROF) fire incl. busy-wait + forked child | ✅ `itimer` | setitimer01/02, getitimer01/02, alarm02–07 |
 
 ### Signals — backlog (LTP-only, no carrick probe yet)
 - ⬜ `rt_sigqueueinfo01` — self-queue+deliver (ENOSYS stub).
-- ⬜ pause/EINTR cluster: `pause01`, `sighold02`, `sigrelse01`, `sigsuspend01`.
 - ⬜ process-group kill: `kill10/11/12` (TIMEOUT), `kill02` self-kill wait-status, `kill05/07`.
 - ⬜ `tgkill02/03` invalid-tgid-with-valid-tid; `abort01`.
 
