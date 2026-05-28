@@ -39,11 +39,6 @@ const KNOWN_PROBE_GAPS: &[&str] = &[
     // POSIX timers (`timer_create`/`_settime`/`_gettime`/`_delete`/`_getoverrun`)
     // are ENOSYS in carrick. The probe gates implementation when it lands.
     "posixtimers",
-    // rt_sigqueueinfo: the caller-supplied siginfo is not propagated to the
-    // guest handler — carrick synthesizes it (see signal.rs `rt_sigqueueinfo`
-    // note). The probe will pass once the dispatcher threads the user
-    // siginfo through to the sigframe.
-    "rtsigqueueinfo",
 ];
 use std::time::{Duration, Instant};
 
