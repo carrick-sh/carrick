@@ -573,10 +573,6 @@ impl ThreadWaiter {
         }
     }
 
-    fn has_signal_pipe(&self) -> bool {
-        self.process_pipe_read >= 0 || self.thread_wake.is_some()
-    }
-
     fn signal_pipe_count(&self) -> usize {
         usize::from(self.process_pipe_read >= 0) + usize::from(self.thread_wake.is_some())
     }

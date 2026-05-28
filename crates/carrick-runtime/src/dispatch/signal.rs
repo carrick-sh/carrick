@@ -40,6 +40,15 @@ pub(super) struct SignalState {
     /// probe: identical `new_sp` across threads). Signal HANDLERS stay global
     /// (Linux shares them across threads); only the alt stack is per-thread.
     pub altstack: HashMap<crate::thread::ThreadId, LinuxSigaltstack>,
+    /// Linux's `set_restore_sigmask()` shadow: when a syscall (sigsuspend,
+    /// pselect, ppoll with a sigmask) temporarily replaced the thread's
+    /// signal mask, this records the mask to restore AFTER the next signal
+    /// handler runs — NOT immediately on syscall return. The handler runs
+    /// under the temporary mask (so a now-deliverable pending signal can
+    /// actually be delivered), and `rt_sigreturn` then pops THIS mask off
+    /// the sigframe. `enter_signal_handler` consumes the entry the first
+    /// time a handler runs after it's armed.
+    pub restore_masks: HashMap<crate::thread::ThreadId, u64>,
 }
 
 impl SignalState {
@@ -50,6 +59,7 @@ impl SignalState {
             pendings: HashMap::new(),
             rt_pending_counts: HashMap::new(),
             altstack: HashMap::new(),
+            restore_masks: HashMap::new(),
         }
     }
 
@@ -171,8 +181,15 @@ impl SyscallDispatcher {
         s.altstack.clear();
     }
 
-    /// Apply Linux handler-time masking for `signum`, returning the previous
-    /// per-thread mask so `rt_sigreturn` can restore it from the sigframe.
+    /// Apply Linux handler-time masking for `signum`, returning the mask that
+    /// `rt_sigreturn` should restore (saved in the sigframe).
+    ///
+    /// Normally that's the thread's current mask. But if a syscall armed a
+    /// "restore mask" via `arm_restore_mask` (Linux's `saved_sigmask`/
+    /// `set_restore_sigmask` analogue — sigsuspend / pselect / ppoll with a
+    /// sigmask), THAT mask is what `rt_sigreturn` must restore — the
+    /// temp-masked syscall lets the handler run with the temp mask, then
+    /// the original mask comes back. We consume the entry on first use.
     pub fn enter_signal_handler(
         &self,
         tid: crate::thread::ThreadId,
@@ -180,11 +197,25 @@ impl SyscallDispatcher {
         action: LinuxSigaction,
     ) -> u64 {
         let mut signal = self.signal.lock();
-        let previous = signal.mask_for(tid);
+        let saved = signal
+            .restore_masks
+            .remove(&tid)
+            .unwrap_or_else(|| signal.mask_for(tid));
         let delivered = sigmask_bit(signum).unwrap_or(0);
-        let handler_mask = sanitize_signal_mask(previous | delivered | action.sa_mask[0]);
+        let current = signal.mask_for(tid);
+        let handler_mask = sanitize_signal_mask(current | delivered | action.sa_mask[0]);
         signal.masks.insert(tid, handler_mask);
-        previous
+        saved
+    }
+
+    /// Arm a "restore this mask after the next handler runs" override (Linux's
+    /// `set_restore_sigmask`). The next `enter_signal_handler` for `tid`
+    /// returns `mask` as the sigframe's saved mask and clears the arm.
+    pub fn arm_restore_mask(&self, tid: crate::thread::ThreadId, mask: u64) {
+        let mut signal = self.signal.lock();
+        signal
+            .restore_masks
+            .insert(tid, sanitize_signal_mask(mask));
     }
 
     pub fn restore_signal_mask(&self, tid: crate::thread::ThreadId, mask: u64) {
@@ -384,13 +415,20 @@ impl SyscallDispatcher {
             let suspend_mask = sanitize_signal_mask(u64::from_le_bytes(
                 mask_bytes.try_into().unwrap_or([0; 8]),
             ));
-            // sigsuspend: atomically install `suspend_mask`, wait until a signal
-            // deliverable under it arrives (so the runtime's delivery cycle runs
-            // the handler), then restore the prior mask and return -EINTR. The
-            // wait is bounded (like rt_sigtimedwait) rather than truly infinite:
-            // a no-signal timeout yields a spurious EINTR, which the canonical
-            // `while (!flag) sigsuspend(&mask)` idiom re-suspends through. A
-            // pending signal already deliverable under the mask returns at once.
+            // sigsuspend semantics (Linux kernel: signal.c rt_sigsuspend):
+            //   1. save the current mask;
+            //   2. install `suspend_mask`;
+            //   3. block until a signal deliverable under `suspend_mask`;
+            //   4. arm restore_sigmask so the next handler delivery restores the
+            //      saved mask AFTER the handler runs (NOT immediately on
+            //      syscall return);
+            //   5. return -EINTR.
+            // The runtime's delivery cycle then injects the handler under
+            // `suspend_mask` (so a previously-pending signal is now deliverable),
+            // and `rt_sigreturn` pops the saved mask back via the sigframe.
+            // The 5 s wait bound is a safety belt — a missed wake edge yields
+            // a spurious EINTR, which the canonical `while (!flag) sigsuspend`
+            // idiom transparently re-enters.
             let original = this.signal_mask_for(tid);
             this.restore_signal_mask(tid, suspend_mask);
             let deadline = Instant::now() + Duration::from_secs(5);
@@ -411,7 +449,10 @@ impl SyscallDispatcher {
                 }
                 std::thread::sleep(Duration::from_millis(1));
             }
-            this.restore_signal_mask(tid, original);
+            // Leave the mask as `suspend_mask` so the runtime can deliver the
+            // newly-deliverable signal; arm_restore_mask makes that handler's
+            // rt_sigreturn restore `original` instead of `suspend_mask`.
+            this.arm_restore_mask(tid, original);
             Ok(LINUX_EINTR.into())
         }
 
