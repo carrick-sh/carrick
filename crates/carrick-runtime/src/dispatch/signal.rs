@@ -683,15 +683,15 @@ impl SyscallDispatcher {
             if !is_valid_signum(signum) {
                 return Ok(LINUX_EINVAL.into());
             }
-            let self_tgids = [LINUX_BOOTSTRAP_PID as i64, std::process::id() as i64];
-            if !self_tgids.contains(&tgid) {
-                return Ok(LINUX_ESRCH.into());
-            }
+            let host_pid = std::process::id() as i64;
+            let bootstrap_pid = LINUX_BOOTSTRAP_PID as i64;
+            let is_self = tgid == host_pid || tgid == bootstrap_pid;
             let s = signum as i32;
-            let tid = Self::ctx_tid(cx);
-            // Read the user siginfo so the SA_SIGINFO handler sees the original
-            // `si_value`. The kernel re-stamps si_signo to the syscall's `sig`
-            // (per the rt_sigqueueinfo(2) ABI); we mirror that.
+
+            // Read the caller's siginfo once up front — same source of truth
+            // regardless of whether we deliver to self, a sibling, or a peer.
+            // The kernel re-stamps si_signo per the rt_sigqueueinfo(2) ABI.
+            let mut user_info: Option<LinuxSiginfo> = None;
             if info_ptr.0 != 0 {
                 let memory = &*cx.memory;
                 if let Ok(bytes) =
@@ -699,13 +699,46 @@ impl SyscallDispatcher {
                 {
                     if let Some(mut info) = LinuxSiginfo::read_from_bytes(&bytes).ok() {
                         info.si_signo = s;
-                        this.record_pending_siginfo(tid, s, info);
+                        user_info = Some(info);
                     }
                 }
             }
-            // Always mark pending (don't fall through to raise_for_self / host
-            // PENDING) so the queued siginfo pairs with the delivery. RT signals
-            // already track per-instance counts via rt_pending_counts.
+
+            // If `tgid` names a sibling thread, deliver to that thread directly
+            // (parallels what tkill/tgkill do). LTP `rt_sigqueueinfo01` relies
+            // on this: it spawns a thread, calls
+            // `rt_sigqueueinfo(sibling_tid, SIGUSR1, &info)`, and expects the
+            // sibling's SA_SIGINFO handler to observe the queued payload. Linux
+            // permits a non-leader tid here because `find_vpid` plus
+            // `thread_group` still resolves to the same process; we mirror that
+            // by routing to the sibling tid so its SA_SIGINFO frame carries
+            // the original `si_value`.
+            if let Some(routed) = this.route_thread_signal(cx, tgid, signum) {
+                let target_tid = tgid as crate::thread::ThreadId;
+                if let Some(info) = user_info {
+                    this.record_pending_siginfo(target_tid, s, info);
+                }
+                return Ok(routed);
+            }
+
+            if !is_self {
+                // Cross-process (target is some other host pid, not a sibling
+                // thread of ours). Defer to bootstrap_signal_send for the
+                // kill(2)-style host route. User siginfo payload doesn't
+                // cross the process boundary today — receiver synthesises
+                // SI_USER, same shape as a host kill — tracked separately.
+                return Ok(bootstrap_signal_send(
+                    tgid, /*tid_required=*/ false, signum,
+                ));
+            }
+
+            // Single-threaded self-target (or multi-threaded but no thread
+            // registry hit): queue against the caller's tid so the delivery
+            // pairs with the same SA_SIGINFO frame.
+            let tid = Self::ctx_tid(cx);
+            if let Some(info) = user_info {
+                this.record_pending_siginfo(tid, s, info);
+            }
             this.mark_signal_pending(tid, s);
             Ok(DispatchOutcome::Returned { value: 0 })
         }
