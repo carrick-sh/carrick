@@ -33,6 +33,7 @@ underlying gap got fixed):
 | `pauseeintr` | Bounded `wait_kqueue` retry to 50 ms even with a signal pipe (io_wait.rs); added Linux's `set_restore_sigmask` analogue to rt_sigsuspend so a pending blocked signal is actually delivered when the temp mask unblocks it. |
 | `rtsigqueueinfo` | Read the caller's siginfo in `rt_sigqueueinfo`, queue it via `record_pending_siginfo`, and thread an `Option<LinuxSiginfo>` through `inject_signal` so the SA_SIGINFO handler sees the real `si_value` payload instead of a synthesised SI_USER. |
 | `posixtimers` | New `crate::posix_timer` module (per-process timer registry with fallback-thread delivery); wired sysnos 107–111 (`timer_create`/`_gettime`/`_getoverrun`/`_settime`/`_delete`) in dispatch. SIGEV_SIGNAL only; SIGEV_THREAD returns ENOTSUP. |
+| `selecttimeout` | pselect6 empty-fds path now goes through `WaitOnFds` instead of a raw `libc::nanosleep` so SIGALRM EINTRs the wait; added Linux's `sigset_argpack` decode + a `block_signals` bitmask so the sigmask arg actually gates which signals interrupt the wait. |
 
 ## Signals & process control
 
