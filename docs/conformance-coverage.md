@@ -69,9 +69,9 @@ carrick test yet — backlog).
 | Cross-process futex WAIT/WAKE on MAP_SHARED word (`__ulock`) | ✅ `futexshare` | futex_wait02/03, futex_wake02/03 |
 | sched affinity / getcpu / hw cpu count | ✅ `cpucount` | sched_getaffinity01, getcpu01/02 |
 | POSIX timers: create/settime/gettime remaining/getoverrun/delete + stale-id EINVAL; SIGEV_SIGNAL delivers SIGUSR1 | ✅ `posixtimers` | timer_create01–07, timer_settime01/02, timer_gettime01, timer_delete01, timer_getoverrun01 |
+| sched_* invariants: get_priority_{max,min} for OTHER/FIFO/RR; getscheduler→SCHED_OTHER; getparam priority=0; rr_get_interval non-neg | ✅ `schedparam` | sched_get_priority_max01, sched_get_priority_min01, sched_getparam01, sched_getscheduler01, sched_rr_get_interval01, sched_setparam01, sched_setscheduler01 |
 
 ### sched — backlog (the big ENOSYS cluster)
-- ⬜ **`sched_*`** `get_priority_max/min`, `getparam`, `getscheduler`, `rr_get_interval`, `setparam`, `setscheduler` — all `carrick passed 0` (unregistered). Register → ~7 tests.
 - ⬜ `futex_cmp_requeue01` (accepted host limitation), `futex_wake04`, `futex_wait_bitset01`.
 
 ## epoll / poll / select / pipe / eventfd
