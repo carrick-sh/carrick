@@ -151,6 +151,26 @@ impl SyscallDispatcher {
         s.altstack.remove(&tid);
     }
 
+    /// Reset signal dispositions across `execve(2)`, matching the kernel: every
+    /// CAUGHT signal (a handler installed) is reset to `SIG_DFL`; `SIG_IGN`
+    /// dispositions are PRESERVED; the blocked mask and pending signals are
+    /// preserved (the new image inherits them). The alternate signal stack is
+    /// cleared. Without this, a process that installed handlers and then execs
+    /// (e.g. a shell `exec`ing — or `/bin/sh -c CMD` fork+exec'ing — a program)
+    /// leaks the OLD image's handler ADDRESSES into the new image; a later
+    /// signal then jumps to a stale address that is unrelated code in the new
+    /// binary and crashes (the `/bin/sh -c <ltp-test>` mass segfaults: dash's
+    /// SIGCHLD handler addr, invoked in the test's address space when its child
+    /// exited). Handlers are process-global, so this resets for the process.
+    pub fn reset_signal_handlers_on_execve(&self) {
+        let mut s = self.signal.lock();
+        // Keep only SIG_IGN dispositions; a caught handler → default (absent).
+        s.handlers
+            .retain(|_, a| a.sa_handler == crate::linux_abi::LINUX_SIG_IGN);
+        // execve disestablishes any alternate signal stack for the process.
+        s.altstack.clear();
+    }
+
     /// Apply Linux handler-time masking for `signum`, returning the previous
     /// per-thread mask so `rt_sigreturn` can restore it from the sigframe.
     pub fn enter_signal_handler(
@@ -764,5 +784,44 @@ mod tests {
         d.mark_signal_pending(tid, 34);
         d.forget_thread_signal_state(tid);
         assert_eq!(d.take_deliverable_pending(tid), None);
+    }
+
+    #[test]
+    fn execve_resets_caught_handlers_preserves_sig_ign_and_clears_altstack() {
+        let d = SyscallDispatcher::new();
+        let tid: crate::thread::ThreadId = 1;
+        {
+            let mut s = d.signal.lock();
+            // A CAUGHT SIGCHLD handler (a real address) — must reset to default.
+            let mut chld = LinuxSigaction::empty();
+            chld.sa_handler = 0x1000133c0;
+            s.handlers.insert(crate::linux_abi::LINUX_SIGCHLD, chld);
+            // SIG_IGN for SIGUSR1 (10) — must be PRESERVED across execve.
+            let mut ign = LinuxSigaction::empty();
+            ign.sa_handler = crate::linux_abi::LINUX_SIG_IGN;
+            s.handlers.insert(10, ign);
+            // An installed alternate signal stack — execve disestablishes it.
+            s.altstack.insert(
+                tid,
+                LinuxSigaltstack {
+                    ss_sp: 0x4000,
+                    ss_flags: 0,
+                    __pad: 0,
+                    ss_size: 0x2000,
+                },
+            );
+        }
+        // Pre-execve: the caught handler is live.
+        assert!(d.registered_signal_handler(crate::linux_abi::LINUX_SIGCHLD).is_some());
+
+        d.reset_signal_handlers_on_execve();
+
+        // The caught SIGCHLD handler is reset to default (no leak of the old
+        // image's handler address — the bug that crashed shell-launched tests).
+        assert!(d.registered_signal_handler(crate::linux_abi::LINUX_SIGCHLD).is_none());
+        // SIG_IGN survives execve (Linux semantics).
+        assert!(d.signal_is_ignored(10));
+        // The alternate signal stack is cleared.
+        assert!(d.signal_altstack(tid).is_none());
     }
 }
