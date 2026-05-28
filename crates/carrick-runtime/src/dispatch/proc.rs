@@ -1224,9 +1224,25 @@ fn translate_wait_status(status: i32) -> i32 {
         (linux_stopsig << 8) | 0x7f
     } else if low != 0 {
         // Terminated by signal: translate the termination signal.
-        let core = status & 0x80;
         let linux_sig = crate::host_signal::host_to_linux_signum(low);
-        (linux_sig & 0x7f) | core
+        // macOS by default has RLIMIT_CORE=0 so the host wait status doesn't
+        // set the core-dumped bit (0x80) — but the Linux contract is that
+        // `WCOREDUMP(status)` is true whenever the process died by a
+        // core-dumping signal (SIGABRT/SEGV/BUS/FPE/ILL/QUIT/SYS/TRAP/XCPU/
+        // XFSZ). Apps that check `WCOREDUMP` care about "did this die in a
+        // core-dumping way", not whether a core file was physically written.
+        // Mirror Linux by OR-ing the bit on for those signals; preserve the
+        // host's bit if it set it.
+        let host_core = status & 0x80;
+        // Linux core-dumping signals per signal(7): SIGQUIT(3), SIGILL(4),
+        // SIGTRAP(5), SIGABRT(6), SIGBUS(7), SIGFPE(8), SIGSEGV(11),
+        // SIGXCPU(24), SIGXFSZ(25), SIGSYS(31).
+        let synthetic_core = if matches!(linux_sig, 3 | 4 | 5 | 6 | 7 | 8 | 11 | 24 | 25 | 31) {
+            0x80
+        } else {
+            0
+        };
+        (linux_sig & 0x7f) | host_core | synthetic_core
     } else {
         // Exited normally: high byte is the exit code, left untouched.
         status
