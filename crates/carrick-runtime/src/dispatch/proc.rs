@@ -796,13 +796,20 @@ impl SyscallDispatcher {
             Ok(match command {
                 LINUX_FUTEX_WAKE => {
                     if let Some(host_addr) = shared_host_addr {
-                        // See dispatch/mod.rs futex_threaded for the rationale:
-                        // macOS __ulock_wake keeps the lock structure alive
-                        // across WAIT returns, so a wake_any loop reports
-                        // spurious successes. Issue one wake_all and cap at 1.
-                        let rc = crate::ulock::wake(host_addr, true);
-                        crate::probes::ulock_wake(host_addr as u64, 0, rc);
-                        let woke: i64 = if rc >= 0 { i64::from(value).min(1) } else { 0 };
+                        // See dispatch/mod.rs futex_threaded — sched_yield
+                        // between iterations is the cure for macOS's
+                        // wake_by_address_any reporting spurious successes
+                        // when called back-to-back on a SHARED address.
+                        let mut woke = 0i64;
+                        for i in 0..value {
+                            let rc = crate::ulock::wake(host_addr, false);
+                            crate::probes::ulock_wake(host_addr as u64, i as i32, rc);
+                            if rc < 0 {
+                                break;
+                            }
+                            woke += 1;
+                            unsafe { libc::sched_yield(); }
+                        }
                         return Ok(DispatchOutcome::Returned { value: woke });
                     }
                     let n = thread.futex.wake(address.0, value);
