@@ -3664,6 +3664,12 @@ impl SyscallDispatcher {
                 let iov_base = iovec.iov_base;
                 let iov_len = usize::try_from(iovec.iov_len)
                     .map_err(|_| DispatchError::LengthTooLarge(iovec.iov_len))?;
+                // A zero-length iovec is a no-op regardless of its base — Linux
+                // never dereferences it, so a {NULL, 0} entry must be skipped,
+                // not EFAULTed (LTP writev01 "NULL and zero length iovec").
+                if iov_len == 0 {
+                    continue;
+                }
                 let bytes = match memory.read_bytes(iov_base, iov_len) {
                     Ok(bytes) => bytes,
                     Err(_) => {
