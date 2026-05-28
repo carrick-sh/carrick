@@ -4202,7 +4202,15 @@ impl SyscallDispatcher {
                 return Ok(LINUX_EROFS.into());
             }
             use crate::vfs::Vfs as _;
-            let result = if remove_dir {
+            // Route through bind mounts (e.g. /dev/shm → host-tmp) so a file
+            // CREATED via the openat mount path can also be unlinkat'd. The
+            // open path resolves mounts first then falls through to rootfs;
+            // unlinkat must mirror that or LTP's SAFE_UNLINK(shm_path) — which
+            // creates the IPC region then immediately unlinks it (the mapping
+            // outlives the name) — fails ENOENT and TBROKs setup_ipc.
+            let result = if let Some(m) = this.fs.vfs_mounts.resolve(&resolved) {
+                if remove_dir { m.vfs.rmdir(&m.full_path) } else { m.vfs.unlink(&m.full_path) }
+            } else if remove_dir {
                 this.fs.rootfs_vfs.rmdir(&resolved)
             } else {
                 this.fs.rootfs_vfs.unlink(&resolved)
