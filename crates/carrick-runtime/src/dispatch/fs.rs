@@ -15,6 +15,88 @@ pub(super) use state::{FsState, IoState};
 /// return the descriptor number N. Used to serve `open()` of these (Linux
 /// re-opens the file behind fd N); Apple Rosetta opens its main-binary fd this
 /// way.
+/// Forward a classic POSIX record lock (F_SETLK/F_SETLKW/F_GETLK) on a
+/// host-backed fd to the host kernel's real `fcntl` locking, translating the
+/// `struct flock` between the Linux-aarch64 and macOS layouts (which differ in
+/// BOTH field order and the `l_type` constants). `host_syscall_errno` maps the
+/// host errno back to Linux (covering the EAGAIN↔EDEADLK number swap).
+///
+/// Linux aarch64 flock (32 bytes): l_type:i16@0, l_whence:i16@2, l_start:i64@8,
+///   l_len:i64@16, l_pid:i32@24. l_type: RDLCK=0, WRLCK=1, UNLCK=2.
+/// macOS flock (`libc::flock`): l_start:i64, l_len:i64, l_pid:i32, l_type:i16,
+///   l_whence:i16. l_type: RDLCK=1, UNLCK=2, WRLCK=3. cmd: GETLK=7/SETLK=8/SETLKW=9.
+fn forward_record_lock<M: GuestMemory>(
+    memory: &mut M,
+    host_fd: i32,
+    linux_cmd: u64,
+    arg: u64,
+) -> DispatchOutcome {
+    const LINUX_F_RDLCK: i16 = 0;
+    const LINUX_F_WRLCK: i16 = 1;
+    const LINUX_F_UNLCK: i16 = 2;
+
+    let bytes = match memory.read_bytes(arg, 32) {
+        Ok(b) => b,
+        Err(_) => return DispatchOutcome::errno(LINUX_EFAULT),
+    };
+    let i16_at = |o: usize| i16::from_le_bytes([bytes[o], bytes[o + 1]]);
+    let i64_at = |o: usize| {
+        let mut a = [0u8; 8];
+        a.copy_from_slice(&bytes[o..o + 8]);
+        i64::from_le_bytes(a)
+    };
+    let l_type_linux = i16_at(0);
+    let l_whence = i16_at(2);
+    let l_start = i64_at(8);
+    let l_len = i64_at(16);
+
+    let l_type_host: i16 = match l_type_linux {
+        LINUX_F_RDLCK => libc::F_RDLCK as i16,
+        LINUX_F_WRLCK => libc::F_WRLCK as i16,
+        LINUX_F_UNLCK => libc::F_UNLCK as i16,
+        _ => return DispatchOutcome::errno(LINUX_EINVAL),
+    };
+    let host_cmd: i32 = match linux_cmd {
+        LINUX_F_GETLK => libc::F_GETLK,
+        LINUX_F_SETLK => libc::F_SETLK,
+        LINUX_F_SETLKW => libc::F_SETLKW,
+        _ => return DispatchOutcome::errno(LINUX_EINVAL),
+    };
+
+    let mut fl: libc::flock = unsafe { core::mem::zeroed() };
+    fl.l_start = l_start as libc::off_t;
+    fl.l_len = l_len as libc::off_t;
+    fl.l_type = l_type_host;
+    fl.l_whence = l_whence;
+
+    let rc = unsafe { libc::fcntl(host_fd, host_cmd, &mut fl as *mut libc::flock) };
+    if let Err(errno) = rc.host_syscall_errno() {
+        return DispatchOutcome::errno(errno);
+    }
+
+    // F_GETLK: write the (possibly conflicting) lock back in Linux layout.
+    if linux_cmd == LINUX_F_GETLK {
+        let host_type = fl.l_type as i32;
+        let l_type_back: i16 = if host_type == libc::F_RDLCK as i32 {
+            LINUX_F_RDLCK
+        } else if host_type == libc::F_WRLCK as i32 {
+            LINUX_F_WRLCK
+        } else {
+            LINUX_F_UNLCK
+        };
+        let mut out = [0u8; 32];
+        out[0..2].copy_from_slice(&l_type_back.to_le_bytes());
+        out[2..4].copy_from_slice(&fl.l_whence.to_le_bytes());
+        out[8..16].copy_from_slice(&(fl.l_start as i64).to_le_bytes());
+        out[16..24].copy_from_slice(&(fl.l_len as i64).to_le_bytes());
+        out[24..28].copy_from_slice(&(fl.l_pid as i32).to_le_bytes());
+        if memory.write_bytes(arg, &out).is_err() {
+            return DispatchOutcome::errno(LINUX_EFAULT);
+        }
+    }
+    DispatchOutcome::Returned { value: 0 }
+}
+
 fn proc_self_fd_number(path: &str) -> Option<i32> {
     let rest = path
         .strip_prefix("/proc/self/fd/")
@@ -1512,25 +1594,54 @@ impl SyscallDispatcher {
                     open_file.description.write().set_status_flags(next_flags);
                     DispatchOutcome::Returned { value: 0 }
                 }
-                // Advisory record locks: apt uses fcntl(F_SETLK) on
-                // /var/lib/apt/lists/lock as its inter-process lock. Carrick
-                // runs the guest as a single-tenant VM (no real concurrent
-                // apt invocations against the same overlay), so we treat the
-                // whole F_*LK family as no-op success. Without this apt
-                // reports "Could not get lock ... open (22: Invalid argument)"
-                // because the F_SETLK that follows the openat is what
-                // actually fails — apt's error message just blames open.
-                LINUX_F_SETLK | LINUX_F_SETLKW | LINUX_F_OFD_SETLK | LINUX_F_OFD_SETLKW => {
+                // Classic POSIX advisory record locks (F_SETLK/F_SETLKW/
+                // F_GETLK). Forward to the host fd's REAL fcntl locking — macOS
+                // implements byte-range advisory locks with conflict and
+                // deadlock (EDEADLK) detection, and carrick's guest processes
+                // are separate host processes sharing the host file, so the
+                // host kernel gives correct cross-process conflict detection
+                // for free (the Darwin-native path). The `struct flock` layout
+                // AND the l_type constants differ between Linux and macOS, so
+                // both are translated; `host_syscall_errno` maps the host errno
+                // (incl. the EAGAIN/EDEADLK swap) back to Linux. Falls back to
+                // the historical no-op success when the fd isn't host-backed
+                // (in-memory/synthetic files, --fs memory) so apt's
+                // /var/lib/apt/lists/lock path keeps working.
+                LINUX_F_SETLK | LINUX_F_SETLKW => {
                     if !this.fd_is_valid(fd.0) {
                         return Ok(LINUX_EBADF.into());
                     }
-                    DispatchOutcome::Returned { value: 0 }
+                    match this.host_file_fd_for_flush(fd.0) {
+                        Ok(Some(host_fd)) => {
+                            forward_record_lock(&mut *cx.memory, host_fd, command, arg)
+                        }
+                        // Not host-backed → preserve the single-tenant no-op.
+                        Ok(None) => DispatchOutcome::Returned { value: 0 },
+                        Err(errno) => DispatchOutcome::errno(errno),
+                    }
                 }
-                LINUX_F_GETLK | LINUX_F_OFD_GETLK => {
-                    // Indicate "no lock present" by leaving the caller's
-                    // struct flock untouched and returning 0. apt only ever
-                    // probes after a successful SETLK so it doesn't
-                    // re-inspect the buffer.
+                LINUX_F_GETLK => {
+                    if !this.fd_is_valid(fd.0) {
+                        return Ok(LINUX_EBADF.into());
+                    }
+                    match this.host_file_fd_for_flush(fd.0) {
+                        Ok(Some(host_fd)) => {
+                            forward_record_lock(&mut *cx.memory, host_fd, command, arg)
+                        }
+                        // Not host-backed → "no lock present": leave the
+                        // caller's struct flock untouched (l_type=F_UNLCK is
+                        // what callers re-read) and succeed.
+                        Ok(None) => DispatchOutcome::Returned { value: 0 },
+                        Err(errno) => DispatchOutcome::errno(errno),
+                    }
+                }
+                // OFD locks (F_OFD_*) are owned by the open file description,
+                // not the process. macOS has no OFD-lock primitive, so we keep
+                // the single-tenant no-op success for them rather than
+                // mis-forwarding to classic (process-owned) locks, whose
+                // ownership semantics differ. Tracked for a future shared
+                // OFD-lock registry.
+                LINUX_F_OFD_SETLK | LINUX_F_OFD_SETLKW | LINUX_F_OFD_GETLK => {
                     if !this.fd_is_valid(fd.0) {
                         return Ok(LINUX_EBADF.into());
                     }
