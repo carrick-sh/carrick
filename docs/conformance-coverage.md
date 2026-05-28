@@ -32,8 +32,12 @@ Known LTP tests NOT in the curated map (out of scope, tracked in handoff, not
 counted above): rt_sigtimedwait01 / sched_getparam01-syscall-variant (LTP
 test-variant-switching framework hang), shmat01 (alias-VA reuse semantics),
 epoll_pwait2 (syscall 441), clone08 (CLONE_VM-child-stack thread shape),
-futex_cmp_requeue01 (accepted host limitation — Darwin `__ulock` has no
-requeue primitive).
+futex_cmp_requeue01 (the requeue PRIMITIVE is now implemented + probe-owned —
+see `futexrequeue` below; the LTP test still TBROKs on a separate
+waitpid-EINTR-restart follow-up, not requeue). A guest-thread RESPAWN bug
+("current thread handle already set" when a process spawns a second batch of
+threads after the first exits) was also surfaced by `futexrequeue` and is
+tracked for follow-up.
 
 Legend: ✅ owned by a probe · 🧪 owned by a lib unit test · ⬜ LTP-only (no
 carrick test yet — backlog).
@@ -137,9 +141,10 @@ underlying gap got fixed):
 | **sched_get/setparam/rr_get_interval accept ANY live pid (not just self): the calling process can query any task's params, mirroring Linux's task-wide read access (via the sched_pid_exists kill(pid,0) check)** | ✅ `schedparam` | sched_setparam01 (MATCH), sched_getparam01 libc variant (4/4 PASS) |
 
 | FUTEX_WAIT / FUTEX_WAIT_BITSET on mismatched expected → EAGAIN; FUTEX_WAKE with no waiters → 0; cross-thread wait/wake round-trip on a private futex | ✅ `futexextra` | futex_wait02 (mismatch), futex_wake04, futex_wait_bitset01 |
+| **FUTEX_CMP_REQUEUE / FUTEX_REQUEUE on a private futex: CMP_REQUEUE(nr_wake=1, INT_MAX) over N waiters wakes 1 + requeues N-1 (returns N); a WAKE(uaddr1) after drains to 0 (the rest really left); a WAKE(uaddr2) reaches the N-1 requeued; val3 mismatch → EAGAIN; negative count → EINVAL; empty REQUEUE → 0. Implemented over `parking_lot_core::unpark_requeue` (the primitive Darwin `__ulock` lacks); shared/cross-process futexes degrade to wake-all (correct per the spurious-wake-tolerant futex contract)** | ✅ `futexrequeue` | futex_cmp_requeue01 (requeue primitive — returns the correct 3+7=10; the test's residual TBROK is an unrelated waitpid-EINTR-restart gap) |
 
 ### sched — backlog (the big ENOSYS cluster)
-- ⬜ `futex_cmp_requeue01` (accepted host limitation — Darwin `__ulock` has no requeue primitive).
+- _(none — FUTEX_(CMP_)REQUEUE is now implemented + owned by `futexrequeue`)_
 
 ## epoll / poll / select / pipe / eventfd
 

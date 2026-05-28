@@ -2147,28 +2147,62 @@ fn dispatch_threaded_futex(
             DispatchOutcome::FutexWait { wait, timeout }
         }
         LINUX_FUTEX_REQUEUE | LINUX_FUTEX_CMP_REQUEUE => {
-            // FUTEX_(CMP_)REQUEUE moves parked waiters between futex queues.
-            // Carrick deliberately does not acquire two futex bucket locks for
-            // this operation: returning ENOSYS avoids the source/destination
-            // lock-ordering hazard while preserving an explicit compatibility
-            // signal for the unsupported primitive.
-            // Neither host primitive can do that: __ulock has no requeue, and a
-            // parking_lot/__ulock waiter is a guest thread blocked in the
-            // FUTEX_WAIT syscall — "requeueing" it would mean it re-waits on
-            // uaddr2 without the guest asking, which we can't synthesise.
-            // Waking-instead-of-requeueing was tried and is worse: it fails the
-            // exact-count semantics AND can hang (LTP futex_cmp_requeue01).
-            // Modern glibc (>=2.34) and musl no longer use CMP_REQUEUE for
-            // condvars, so ENOSYS here has little real-program impact. Surface
-            // the gap explicitly rather than silently mis-waking.
-            reporter.record(crate::compat::CompatEvent::partial_syscall(
-                98,
-                "futex",
-                request.args,
-                "FUTEX_(CMP_)REQUEUE unsupported: host has no futex-requeue primitive",
-            ));
-            DispatchOutcome::Errno {
-                errno: LINUX_ENOSYS,
+            // FUTEX_(CMP_)REQUEUE: wake `nr_wake` waiters on uaddr1, then move
+            // up to `nr_requeue` of the rest to uaddr2's queue. For this op the
+            // futex(2) ABI REINTERPRETS the arg slots: arg3 (normally the
+            // timeout pointer) is `nr_requeue`, arg4 is uaddr2, arg5 is val3
+            // (the CMP_REQUEUE expected value).
+            let nr_wake = value;
+            // nr_wake and nr_requeue are signed ints in the kernel ABI; a
+            // negative value (e.g. a guest passing ~0 as a "max" by mistake)
+            // is EINVAL, checked BEFORE the val3 comparison.
+            if (request.arg(2) as i32) < 0 || (request.arg(3) as i32) < 0 {
+                return DispatchOutcome::Errno {
+                    errno: LINUX_EINVAL,
+                };
+            }
+            let nr_requeue = request.arg(3) as u32;
+            let uaddr2 = request.arg(4);
+            let val3 = request.arg(5) as u32;
+
+            // CMP_REQUEUE atomically validates *uaddr1 == val3 before doing any
+            // work (the race-free condvar handoff); plain REQUEUE skips it.
+            if raw_command == LINUX_FUTEX_CMP_REQUEUE && word != val3 {
+                return DispatchOutcome::Errno {
+                    errno: LINUX_EAGAIN,
+                };
+            }
+
+            // The shared (cross-process __ulock) path has no native requeue.
+            // Requeue is an OPTIMISATION over wake (the futex contract permits
+            // spurious wakeups, so waking a thread that "should" have been
+            // requeued is still correct — the woken guest re-checks its word
+            // and re-waits on uaddr2 itself). So for shared futexes we degrade
+            // to waking nr_wake + nr_requeue waiters: correct, just without the
+            // thundering-herd avoidance. Private/anon futexes — where glibc and
+            // musl condvars and LTP futex_cmp_requeue01 actually live — take the
+            // real parking-lot requeue below.
+            if let Some(host_addr) = shared_host_addr {
+                let total = (nr_wake as u64).saturating_add(nr_requeue as u64);
+                let mut woke = 0i64;
+                let mut i = 0u64;
+                while i < total {
+                    let rc = crate::ulock::wake(host_addr, false);
+                    if rc < 0 {
+                        break;
+                    }
+                    woke += 1;
+                    unsafe { libc::sched_yield() };
+                    i += 1;
+                }
+                return DispatchOutcome::Returned { value: woke };
+            }
+
+            // Private/anon: real requeue via parking_lot_core::unpark_requeue.
+            let (woken, requeued) = futex.requeue(address, uaddr2, nr_wake, nr_requeue);
+            // Linux returns the total number of waiters woken PLUS requeued.
+            DispatchOutcome::Returned {
+                value: i64::from(woken + requeued),
             }
         }
         _ => DispatchOutcome::Errno {
