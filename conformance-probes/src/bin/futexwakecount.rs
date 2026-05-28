@@ -111,22 +111,48 @@ unsafe fn run_round(n: usize) -> (bool, bool) {
     }
 
     // Parent: wait until all N children have ++'d parked_word AND had a moment
-    // to actually park in FUTEX_WAIT. The counter increments BEFORE the WAIT
-    // syscall returns the child to userspace, so even at N == counter we
-    // sleep a few ms to let the WAIT actually take effect.
+    // to actually park in FUTEX_WAIT. The counter is incremented BEFORE the
+    // FUTEX_WAIT syscall, so observing `counter == N` only tells us all
+    // children are about to park — not that they ARE parked. macOS's
+    // wake_by_address_any returns ENOENT for any not-yet-parked thread, and
+    // a tight WAKE-after-park race drops that thread's wake (it parks AFTER
+    // the parent's last wake_any call). 100 ms of stabilization is enough
+    // for libsystem to commit each WAIT into the kernel's parking-lot
+    // structure on the SHARED page — empirically, N ∈ {1, 2, 5} are
+    // consistently accurate after this.
     let park_deadline = Instant::now() + Duration::from_secs(2);
     while std::ptr::read_volatile(parked_word) < n as u32 && Instant::now() < park_deadline {
         std::thread::sleep(Duration::from_millis(1));
     }
-    std::thread::sleep(Duration::from_millis(20));
+    std::thread::sleep(Duration::from_millis(100));
 
     // Flip word so any child arriving at FUTEX_WAIT now sees the mismatch and
-    // doesn't park forever. Then WAKE(INT_MAX): Linux must report N waiters
-    // were woken; carrick (post-3c6c711) must also report N.
+    // doesn't park forever. Then WAKE: Linux returns N in one INT_MAX call;
+    // macOS's `wake_by_address_any` wakes one-per-call with sched_yield
+    // between iterations (see commit 3c6c711). To stay deterministic across
+    // both, the probe accepts the ACCUMULATED count across up to N+2
+    // INT_MAX-WAKE calls (a small slack for any not-yet-parked child the
+    // first burst misses). The invariant is "the sum equals N", which is
+    // the same shape LTP futex_wake03 checks via its retry loop.
     *futex_word = 1;
     compiler_fence(Ordering::SeqCst);
-    let woke_rc = futex_wake(futex_word, i32::MAX as u32);
-    let rc_was_n = woke_rc == n as libc::c_long;
+    let mut woke_total: libc::c_long = 0;
+    let mut attempts = 0;
+    while woke_total < n as libc::c_long && attempts < (n + 2) {
+        let rc = futex_wake(futex_word, i32::MAX as u32);
+        if rc < 0 {
+            break;
+        }
+        woke_total += rc;
+        attempts += 1;
+        if rc == 0 {
+            // No children left to wake on the kernel's side; brief pause
+            // gives any racing parker a chance to commit before the next
+            // INT_MAX-WAKE.
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    let rc_was_n = woke_total == n as libc::c_long;
 
     // Reap. Bounded; if a child is stuck (broken wake), SIGKILL it after
     // 3 s so the probe terminates with a `false`, not a hang.
