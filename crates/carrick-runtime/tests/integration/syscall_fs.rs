@@ -1553,7 +1553,11 @@ fn splice_moves_bytes_between_sockets_and_pipes() {
 
     let ret = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| -> i64 {
         match d
-            .dispatch(SyscallRequest::new(nr, SyscallArgs::from(args)), m, &reporter)
+            .dispatch(
+                SyscallRequest::new(nr, SyscallArgs::from(args)),
+                m,
+                &reporter,
+            )
             .unwrap()
         {
             DispatchOutcome::Returned { value } => value,
@@ -1563,35 +1567,85 @@ fn splice_moves_bytes_between_sockets_and_pipes() {
 
     // socketpair(AF_UNIX, SOCK_STREAM) @0x4000; pipe2 @0x4010.
     assert_eq!(
-        ret(&mut dispatcher, &mut memory, 199, [LINUX_AF_UNIX, LINUX_SOCK_STREAM, 0, 0x4000, 0, 0]),
+        ret(
+            &mut dispatcher,
+            &mut memory,
+            199,
+            [LINUX_AF_UNIX, LINUX_SOCK_STREAM, 0, 0x4000, 0, 0]
+        ),
         0
     );
     let sock = read_fd_pair(&memory, 0x4000);
-    assert_eq!(ret(&mut dispatcher, &mut memory, 59, [0x4010, 0, 0, 0, 0, 0]), 0);
+    assert_eq!(
+        ret(&mut dispatcher, &mut memory, 59, [0x4010, 0, 0, 0, 0, 0]),
+        0
+    );
     let pipe = read_fd_pair(&memory, 0x4010);
 
     // socket -> pipe: write "ping" into sock end B, splice sock end A -> pipe
     // write end, read it back off the pipe read end.
     memory.write_bytes(0x4100, b"ping").unwrap();
-    assert_eq!(ret(&mut dispatcher, &mut memory, 64, [sock.write_fd as u64, 0x4100, 4, 0, 0, 0]), 4);
     assert_eq!(
-        ret(&mut dispatcher, &mut memory, 76, [sock.read_fd as u64, 0, pipe.write_fd as u64, 0, 4, 0]),
+        ret(
+            &mut dispatcher,
+            &mut memory,
+            64,
+            [sock.write_fd as u64, 0x4100, 4, 0, 0, 0]
+        ),
+        4
+    );
+    assert_eq!(
+        ret(
+            &mut dispatcher,
+            &mut memory,
+            76,
+            [sock.read_fd as u64, 0, pipe.write_fd as u64, 0, 4, 0]
+        ),
         4,
         "splice socket->pipe must move bytes"
     );
-    assert_eq!(ret(&mut dispatcher, &mut memory, 63, [pipe.read_fd as u64, 0x4200, 4, 0, 0, 0]), 4);
+    assert_eq!(
+        ret(
+            &mut dispatcher,
+            &mut memory,
+            63,
+            [pipe.read_fd as u64, 0x4200, 4, 0, 0, 0]
+        ),
+        4
+    );
     assert_eq!(memory.read_bytes(0x4200, 4).unwrap(), b"ping");
 
     // pipe -> socket: write "pong" into the pipe, splice pipe read end -> sock
     // end A, recv it on sock end B.
     memory.write_bytes(0x4300, b"pong").unwrap();
-    assert_eq!(ret(&mut dispatcher, &mut memory, 64, [pipe.write_fd as u64, 0x4300, 4, 0, 0, 0]), 4);
     assert_eq!(
-        ret(&mut dispatcher, &mut memory, 76, [pipe.read_fd as u64, 0, sock.read_fd as u64, 0, 4, 0]),
+        ret(
+            &mut dispatcher,
+            &mut memory,
+            64,
+            [pipe.write_fd as u64, 0x4300, 4, 0, 0, 0]
+        ),
+        4
+    );
+    assert_eq!(
+        ret(
+            &mut dispatcher,
+            &mut memory,
+            76,
+            [pipe.read_fd as u64, 0, sock.read_fd as u64, 0, 4, 0]
+        ),
         4,
         "splice pipe->socket must move bytes"
     );
-    assert_eq!(ret(&mut dispatcher, &mut memory, 63, [sock.write_fd as u64, 0x4400, 4, 0, 0, 0]), 4);
+    assert_eq!(
+        ret(
+            &mut dispatcher,
+            &mut memory,
+            63,
+            [sock.write_fd as u64, 0x4400, 4, 0, 0, 0]
+        ),
+        4
+    );
     assert_eq!(memory.read_bytes(0x4400, 4).unwrap(), b"pong");
 }
 
@@ -1613,12 +1667,21 @@ fn inotify_init_add_watch_read_dispatch_plumbing() {
     let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
     let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
-        d.dispatch(SyscallRequest::new(nr, SyscallArgs::from(args)), m, &reporter)
-            .unwrap()
+        d.dispatch(
+            SyscallRequest::new(nr, SyscallArgs::from(args)),
+            m,
+            &reporter,
+        )
+        .unwrap()
     };
 
     // inotify_init1(IN_NONBLOCK) -> a fresh fd >= 3.
-    let ifd = match run(&mut dispatcher, &mut memory, 26, [IN_NONBLOCK, 0, 0, 0, 0, 0]) {
+    let ifd = match run(
+        &mut dispatcher,
+        &mut memory,
+        26,
+        [IN_NONBLOCK, 0, 0, 0, 0, 0],
+    ) {
         DispatchOutcome::Returned { value } => {
             assert!(value >= 3, "init1 fd {value}");
             value as u64
@@ -1635,14 +1698,24 @@ fn inotify_init_add_watch_read_dispatch_plumbing() {
     // add_watch on an existing in-memory path -> ENOSPC (28): no host vnode.
     memory.write_bytes(0x4200, b"/etc/motd\0").unwrap();
     assert_eq!(
-        run(&mut dispatcher, &mut memory, 27, [ifd, 0x4200, IN_MODIFY, 0, 0, 0]),
+        run(
+            &mut dispatcher,
+            &mut memory,
+            27,
+            [ifd, 0x4200, IN_MODIFY, 0, 0, 0]
+        ),
         DispatchOutcome::Errno { errno: 28 }
     );
 
     // add_watch on a nonexistent path -> ENOENT (2).
     memory.write_bytes(0x4280, b"/no/such\0").unwrap();
     assert_eq!(
-        run(&mut dispatcher, &mut memory, 27, [ifd, 0x4280, IN_MODIFY, 0, 0, 0]),
+        run(
+            &mut dispatcher,
+            &mut memory,
+            27,
+            [ifd, 0x4280, IN_MODIFY, 0, 0, 0]
+        ),
         DispatchOutcome::Errno { errno: 2 }
     );
 
@@ -1670,8 +1743,12 @@ fn open_o_tmpfile_creates_anonymous_writable_file() {
     let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
     let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
-        d.dispatch(SyscallRequest::new(nr, SyscallArgs::from(args)), m, &reporter)
-            .unwrap()
+        d.dispatch(
+            SyscallRequest::new(nr, SyscallArgs::from(args)),
+            m,
+            &reporter,
+        )
+        .unwrap()
     };
 
     // openat(AT_FDCWD, <dir>, O_TMPFILE|O_RDWR, 0600); pathname is unused for
@@ -1680,7 +1757,14 @@ fn open_o_tmpfile_creates_anonymous_writable_file() {
         &mut dispatcher,
         &mut memory,
         56,
-        [LINUX_AT_FDCWD, 0, LINUX_O_TMPFILE | LINUX_O_RDWR, 0o600, 0, 0],
+        [
+            LINUX_AT_FDCWD,
+            0,
+            LINUX_O_TMPFILE | LINUX_O_RDWR,
+            0o600,
+            0,
+            0,
+        ],
     ) {
         DispatchOutcome::Returned { value } => {
             assert!(value >= 3, "tmpfile fd {value}");
@@ -1707,7 +1791,12 @@ fn open_o_tmpfile_creates_anonymous_writable_file() {
 
     // O_TMPFILE requires write access; O_RDONLY|O_TMPFILE is EINVAL.
     assert_eq!(
-        run(&mut dispatcher, &mut memory, 56, [LINUX_AT_FDCWD, 0, LINUX_O_TMPFILE, 0o600, 0, 0]),
+        run(
+            &mut dispatcher,
+            &mut memory,
+            56,
+            [LINUX_AT_FDCWD, 0, LINUX_O_TMPFILE, 0o600, 0, 0]
+        ),
         DispatchOutcome::Errno { errno: 22 }
     );
 }

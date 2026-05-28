@@ -97,6 +97,22 @@ impl SyscallDispatcher {
         }
     }
 
+    /// Writable host fd of `fd` iff it is a guest-writable HostFile. The host
+    /// fd may be broader than guest access mode for HVF mmap max-protection, so
+    /// write-side callers must use this helper rather than `regular_host_file_fd`.
+    pub(in crate::dispatch) fn regular_host_file_write_fd(&self, fd: i32) -> Option<i32> {
+        let open_file = self.open_file(fd)?;
+        let open = open_file.description.read();
+        match &*open {
+            OpenDescription::HostFile {
+                host_fd,
+                writable: true,
+                ..
+            } => Some(*host_fd),
+            _ => None,
+        }
+    }
+
     /// Host fd of `fd` iff it is a host socket — the destination macOS
     /// `sendfile(2)` streams to.
     pub(in crate::dispatch) fn host_socket_fd(&self, fd: i32) -> Option<i32> {
@@ -109,7 +125,10 @@ impl SyscallDispatcher {
     }
 
     /// The [`InotifyState`] behind `fd` iff it is an inotify instance.
-    pub(in crate::dispatch) fn inotify_state(&self, fd: i32) -> Option<Arc<crate::inotify::InotifyState>> {
+    pub(in crate::dispatch) fn inotify_state(
+        &self,
+        fd: i32,
+    ) -> Option<Arc<crate::inotify::InotifyState>> {
         let open_file = self.open_file(fd)?;
         let open = open_file.description.read();
         match &*open {
@@ -199,5 +218,4 @@ impl SyscallDispatcher {
             _ => Some(LINUX_EINVAL),
         }
     }
-
 }

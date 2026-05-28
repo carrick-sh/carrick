@@ -274,8 +274,7 @@ impl SyscallDispatcher {
         // the executable path points at the bind-mounted Rosetta interpreter.
 
         let mut path = match path.as_str() {
-            "/proc/self/exe" | "/proc/thread-self/exe" | "/proc/this/exe"
-            | "/proc/curproc/exe" => {
+            "/proc/self/exe" | "/proc/thread-self/exe" | "/proc/this/exe" | "/proc/curproc/exe" => {
                 let exe = self.proc.lock().executable_path.clone();
                 // Avoid the circular default (`executable_path` is itself
                 // "/proc/self/exe" until an image is loaded).
@@ -1911,8 +1910,14 @@ impl SyscallDispatcher {
                 let mut open = open_file.description.write();
                 match &mut *open {
                     OpenDescription::File {
-                        contents, metadata, ..
+                        contents,
+                        metadata,
+                        writable,
+                        ..
                     } if grow => {
+                        if !*writable {
+                            return Ok(LINUX_EBADF.into());
+                        }
                         // In-memory model (--fs memory): grow the cached bytes.
                         if new_size > crate::vfs::MAX_IN_MEMORY_FILE_SIZE {
                             return Ok(LINUX_EFBIG.into());
@@ -1924,12 +1929,20 @@ impl SyscallDispatcher {
                         writeback = None;
                         outcome = DispatchOutcome::Returned { value: 0 };
                     }
-                    OpenDescription::File { .. } => {
+                    OpenDescription::File { writable, .. } => {
+                        if !*writable {
+                            return Ok(LINUX_EBADF.into());
+                        }
                         // KEEP_SIZE: don't change apparent size.
                         writeback = None;
                         outcome = DispatchOutcome::Returned { value: 0 };
                     }
-                    OpenDescription::HostFile { host_fd, .. } => {
+                    OpenDescription::HostFile {
+                        host_fd, writable, ..
+                    } => {
+                        if !*writable {
+                            return Ok(LINUX_EBADF.into());
+                        }
                         // Real fd into the cap-std scratch: grow with ftruncate
                         // (the change is visible across fork). KEEP_SIZE → no-op.
                         if grow {

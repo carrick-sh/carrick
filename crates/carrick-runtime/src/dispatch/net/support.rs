@@ -440,7 +440,11 @@ fn host_interfaces() -> (Vec<HostIface>, Vec<HostAddr>) {
                         .map(|&c| c as u8)
                         .collect();
                 }
-                let idx = if index != 0 { index } else { dl.sdl_index as u32 };
+                let idx = if index != 0 {
+                    index
+                } else {
+                    dl.sdl_index as u32
+                };
                 ifaces.push(HostIface {
                     name,
                     index: idx,
@@ -627,7 +631,11 @@ pub(super) fn build_netlink_reply(request: &[u8], pid: u32) -> Vec<u8> {
                     rtm_flags: 0,
                 };
                 payload.extend_from_slice(rtm.as_bytes());
-                push_rtattr(&mut payload, LINUX_RTA_DST, &masked_network(&a.addr, a.prefixlen));
+                push_rtattr(
+                    &mut payload,
+                    LINUX_RTA_DST,
+                    &masked_network(&a.addr, a.prefixlen),
+                );
                 push_rtattr(&mut payload, LINUX_RTA_OIF, &(a.index).to_ne_bytes());
                 push_nlmsg(&mut out, LINUX_RTM_NEWROUTE, seq, pid, &payload);
             }
@@ -890,8 +898,8 @@ pub(super) fn autobind_unix_host_path() -> std::path::PathBuf {
 /// by `host_to_linux_sockaddr` to undo the hash. Process-global (not fork-shared):
 /// a socket's own address is recorded by the process that bound/connected it,
 /// which is the same process that later calls getsockname/getpeername on it.
-fn unix_path_registry() -> &'static std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Vec<u8>>>
-{
+fn unix_path_registry()
+-> &'static std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Vec<u8>>> {
     static REG: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Vec<u8>>>,
     > = std::sync::OnceLock::new();
@@ -1000,7 +1008,11 @@ pub(in crate::dispatch) fn read_linux_sockaddr(
 /// source* (recvfrom/recvmsg) wants AF_UNSPEC/empty so Go reports `from == nil`;
 /// a *local/connection* address (getsockname/getpeername/accept) wants a
 /// family-only AF_UNIX sockaddr so Go reports a non-nil `&UnixAddr{Name:""}`.
-pub(super) fn host_to_linux_sockaddr(bytes: &[u8], _family_hint: i32, unnamed_unspec: bool) -> Vec<u8> {
+pub(super) fn host_to_linux_sockaddr(
+    bytes: &[u8],
+    _family_hint: i32,
+    unnamed_unspec: bool,
+) -> Vec<u8> {
     if bytes.len() < 2 {
         return Vec::new();
     }
@@ -1164,7 +1176,10 @@ mod tests {
             }
             offset += aligned;
         }
-        assert!(routes >= 1, "expected at least the loopback connected route");
+        assert!(
+            routes >= 1,
+            "expected at least the loopback connected route"
+        );
         assert!(saw_done, "route dump must terminate with NLMSG_DONE");
     }
 
@@ -1174,7 +1189,10 @@ mod tests {
         assert_eq!(masked_network(&[127, 0, 0, 1], 8), vec![127, 0, 0, 0]);
         assert_eq!(masked_network(&[192, 168, 5, 9], 24), vec![192, 168, 5, 0]);
         // /20 splits the third byte: keep high 4 bits (0xF0).
-        assert_eq!(masked_network(&[10, 1, 0xFF, 0xFF], 20), vec![10, 1, 0xF0, 0]);
+        assert_eq!(
+            masked_network(&[10, 1, 0xFF, 0xFF], 20),
+            vec![10, 1, 0xF0, 0]
+        );
     }
 
     #[test]

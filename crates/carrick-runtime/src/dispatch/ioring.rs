@@ -21,14 +21,13 @@
 
 use super::*;
 use crate::linux_abi::{
+    LINUX_IORING_FEAT_NODROP, LINUX_IORING_FEAT_SINGLE_MMAP, LINUX_IORING_OFF_CQ_RING,
+    LINUX_IORING_OFF_SQ_RING, LINUX_IORING_OFF_SQES, LINUX_IORING_OP_ACCEPT, LINUX_IORING_OP_CLOSE,
+    LINUX_IORING_OP_CONNECT, LINUX_IORING_OP_FSYNC, LINUX_IORING_OP_NOP, LINUX_IORING_OP_POLL_ADD,
+    LINUX_IORING_OP_READ, LINUX_IORING_OP_READV, LINUX_IORING_OP_RECV, LINUX_IORING_OP_RECVMSG,
+    LINUX_IORING_OP_SEND, LINUX_IORING_OP_SENDMSG, LINUX_IORING_OP_WRITE, LINUX_IORING_OP_WRITEV,
     LinuxIoCqringOffsets, LinuxIoSqringOffsets, LinuxIoUringCqe, LinuxIoUringParams,
-    LinuxIoUringSqe, LinuxIovec, LinuxMsghdr, LINUX_IORING_FEAT_NODROP,
-    LINUX_IORING_FEAT_SINGLE_MMAP, LINUX_IORING_OFF_CQ_RING, LINUX_IORING_OFF_SQES,
-    LINUX_IORING_OFF_SQ_RING, LINUX_IORING_OP_CLOSE, LINUX_IORING_OP_FSYNC, LINUX_IORING_OP_NOP,
-    LINUX_IORING_OP_ACCEPT, LINUX_IORING_OP_CONNECT, LINUX_IORING_OP_POLL_ADD,
-    LINUX_IORING_OP_READ, LINUX_IORING_OP_READV,
-    LINUX_IORING_OP_RECV, LINUX_IORING_OP_RECVMSG, LINUX_IORING_OP_SEND, LINUX_IORING_OP_SENDMSG,
-    LINUX_IORING_OP_WRITE, LINUX_IORING_OP_WRITEV,
+    LinuxIoUringSqe, LinuxIovec, LinuxMsghdr,
 };
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -261,16 +260,36 @@ impl SyscallDispatcher {
         ) else {
             return DispatchOutcome::errno(LINUX_ENOMEM);
         };
-        if memory.write_bytes(ring_addr, &vec![0u8; layout.ring_bytes]).is_err()
-            || memory.write_bytes(sqes_addr, &vec![0u8; layout.sqes_bytes]).is_err()
+        if memory
+            .write_bytes(ring_addr, &vec![0u8; layout.ring_bytes])
+            .is_err()
+            || memory
+                .write_bytes(sqes_addr, &vec![0u8; layout.sqes_bytes])
+                .is_err()
         {
             return DispatchOutcome::errno(LINUX_EFAULT);
         }
         // Control words the guest's ring code reads (mask + entry count).
-        write_ring_u32(memory, ring_addr + layout.sq_off.ring_mask as u64, layout.sq_entries - 1);
-        write_ring_u32(memory, ring_addr + layout.sq_off.ring_entries as u64, layout.sq_entries);
-        write_ring_u32(memory, ring_addr + layout.cq_off.ring_mask as u64, layout.cq_entries - 1);
-        write_ring_u32(memory, ring_addr + layout.cq_off.ring_entries as u64, layout.cq_entries);
+        write_ring_u32(
+            memory,
+            ring_addr + layout.sq_off.ring_mask as u64,
+            layout.sq_entries - 1,
+        );
+        write_ring_u32(
+            memory,
+            ring_addr + layout.sq_off.ring_entries as u64,
+            layout.sq_entries,
+        );
+        write_ring_u32(
+            memory,
+            ring_addr + layout.cq_off.ring_mask as u64,
+            layout.cq_entries - 1,
+        );
+        write_ring_u32(
+            memory,
+            ring_addr + layout.cq_off.ring_entries as u64,
+            layout.cq_entries,
+        );
 
         let mut params = LinuxIoUringParams::default();
         layout.fill_params(&mut params);
@@ -415,14 +434,23 @@ impl SyscallDispatcher {
                 }
             }
             LINUX_IORING_OP_WRITE => {
-                let Some(hfd) = self.regular_host_file_fd(sqe.fd) else {
-                    return -LINUX_EINVAL;
+                let Some(hfd) = self.regular_host_file_write_fd(sqe.fd) else {
+                    return if self.regular_host_file_fd(sqe.fd).is_some() {
+                        -LINUX_EBADF
+                    } else {
+                        -LINUX_EINVAL
+                    };
                 };
                 let Ok(buf) = memory.read_bytes(sqe.addr, sqe.len as usize) else {
                     return -LINUX_EFAULT;
                 };
                 let n = unsafe {
-                    libc::pwrite(hfd, buf.as_ptr() as *const _, buf.len(), sqe.off as libc::off_t)
+                    libc::pwrite(
+                        hfd,
+                        buf.as_ptr() as *const _,
+                        buf.len(),
+                        sqe.off as libc::off_t,
+                    )
                 };
                 match n.host_syscall_errno() {
                     Ok(put) => put as i32,
@@ -439,7 +467,12 @@ impl SyscallDispatcher {
                 let total: usize = iovs.iter().map(|v| v.iov_len as usize).sum();
                 let mut buf = vec![0u8; total];
                 let n = unsafe {
-                    libc::pread(hfd, buf.as_mut_ptr() as *mut _, total, sqe.off as libc::off_t)
+                    libc::pread(
+                        hfd,
+                        buf.as_mut_ptr() as *mut _,
+                        total,
+                        sqe.off as libc::off_t,
+                    )
                 };
                 match n.host_syscall_errno() {
                     Ok(got) => {
@@ -451,7 +484,10 @@ impl SyscallDispatcher {
                                 break;
                             }
                             let chunk = (v.iov_len as usize).min(got - done);
-                            if memory.write_bytes(v.iov_base, &buf[done..done + chunk]).is_err() {
+                            if memory
+                                .write_bytes(v.iov_base, &buf[done..done + chunk])
+                                .is_err()
+                            {
                                 return -LINUX_EFAULT;
                             }
                             done += chunk;
@@ -462,8 +498,12 @@ impl SyscallDispatcher {
                 }
             }
             LINUX_IORING_OP_WRITEV => {
-                let Some(hfd) = self.regular_host_file_fd(sqe.fd) else {
-                    return -LINUX_EINVAL;
+                let Some(hfd) = self.regular_host_file_write_fd(sqe.fd) else {
+                    return if self.regular_host_file_fd(sqe.fd).is_some() {
+                        -LINUX_EBADF
+                    } else {
+                        -LINUX_EINVAL
+                    };
                 };
                 let Some(iovs) = read_iovecs(memory, sqe.addr, sqe.len as usize) else {
                     return -LINUX_EFAULT;
@@ -477,7 +517,12 @@ impl SyscallDispatcher {
                     buf.extend_from_slice(&chunk);
                 }
                 let n = unsafe {
-                    libc::pwrite(hfd, buf.as_ptr() as *const _, buf.len(), sqe.off as libc::off_t)
+                    libc::pwrite(
+                        hfd,
+                        buf.as_ptr() as *const _,
+                        buf.len(),
+                        sqe.off as libc::off_t,
+                    )
                 };
                 match n.host_syscall_errno() {
                     Ok(put) => put as i32,
@@ -574,7 +619,10 @@ impl SyscallDispatcher {
                                 break;
                             }
                             let chunk = (v.iov_len as usize).min(got - done);
-                            if memory.write_bytes(v.iov_base, &buf[done..done + chunk]).is_err() {
+                            if memory
+                                .write_bytes(v.iov_base, &buf[done..done + chunk])
+                                .is_err()
+                            {
                                 return AsyncOutcome::Ready(-LINUX_EFAULT);
                             }
                             done += chunk;
@@ -721,14 +769,19 @@ mod tests {
         l.fill_params(&mut p);
         assert_eq!(p.sq_entries, 8);
         assert_eq!(p.cq_entries, 16);
-        assert_eq!(p.features & LINUX_IORING_FEAT_SINGLE_MMAP, LINUX_IORING_FEAT_SINGLE_MMAP);
+        assert_eq!(
+            p.features & LINUX_IORING_FEAT_SINGLE_MMAP,
+            LINUX_IORING_FEAT_SINGLE_MMAP
+        );
         assert_eq!(p.sq_off, l.sq_off);
         assert_eq!(p.cq_off, l.cq_off);
     }
 
     #[test]
     fn nop_completes_with_zero_and_preserves_user_data() {
-        let c = complete_sqe(&sqe(LINUX_IORING_OP_NOP, 0xABCD), |_| panic!("NOP must not call io"));
+        let c = complete_sqe(&sqe(LINUX_IORING_OP_NOP, 0xABCD), |_| {
+            panic!("NOP must not call io")
+        });
         assert_eq!(c.res, 0);
         assert_eq!(c.user_data, 0xABCD);
     }
@@ -736,7 +789,9 @@ mod tests {
     #[test]
     fn unknown_opcode_completes_with_einval_not_io() {
         // 200 is not a real opcode; must NOT invoke io, must CQE -EINVAL.
-        let c = complete_sqe(&sqe(200, 0x11), |_| panic!("unknown opcode must not call io"));
+        let c = complete_sqe(&sqe(200, 0x11), |_| {
+            panic!("unknown opcode must not call io")
+        });
         assert_eq!(c.res, -EINVAL);
         assert_eq!(c.user_data, 0x11);
     }

@@ -7,7 +7,6 @@ use std::path::Path;
 
 // Imported from the leaf crate (not `crate::dispatch`) — this is the edge that
 // previously closed the `memory ↔ dispatch` cycle (docs/build-decomposition-design.md §3.A-A2).
-use carrick_guest_mem::{GuestMemory, MemoryError};
 use crate::elf::{
     ElfInspectError, LoadPlan, LoadSegment, SegmentPerms, plan_elf_load, plan_elf_load_bytes,
 };
@@ -17,6 +16,7 @@ use crate::linux_abi::{
     LINUX_AT_PHDR, LINUX_AT_PHENT, LINUX_AT_PHNUM, LINUX_AT_PLATFORM, LINUX_AT_RANDOM,
     LINUX_AT_SECURE, LINUX_AT_UID, LINUX_PAGE_SIZE, LinuxAuxvEntry,
 };
+use carrick_guest_mem::{GuestMemory, MemoryError};
 use serde::Serialize;
 use thiserror::Error;
 use zerocopy::IntoBytes;

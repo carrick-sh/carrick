@@ -43,7 +43,11 @@ fn getsockname_returns_the_guest_unix_path_not_the_host_translation() {
     let mut dispatcher = SyscallDispatcher::new();
     let ret = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| -> i64 {
         match d
-            .dispatch(SyscallRequest::new(nr, SyscallArgs::from(args)), m, &reporter)
+            .dispatch(
+                SyscallRequest::new(nr, SyscallArgs::from(args)),
+                m,
+                &reporter,
+            )
             .unwrap()
         {
             DispatchOutcome::Returned { value } => value,
@@ -60,7 +64,12 @@ fn getsockname_returns_the_guest_unix_path_not_the_host_translation() {
     let gpb = guest_path.as_bytes();
 
     // socket(AF_UNIX, SOCK_STREAM)
-    let fd = ret(&mut dispatcher, &mut memory, 198, [LINUX_AF_UNIX as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0]);
+    let fd = ret(
+        &mut dispatcher,
+        &mut memory,
+        198,
+        [LINUX_AF_UNIX as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
+    );
     assert!(fd >= 0, "socket(AF_UNIX) failed: {fd}");
     let fd = fd as u64;
 
@@ -69,11 +78,29 @@ fn getsockname_returns_the_guest_unix_path_not_the_host_translation() {
     sa[0..2].copy_from_slice(&LINUX_AF_UNIX.to_ne_bytes());
     sa[2..2 + gpb.len()].copy_from_slice(gpb);
     memory.write_bytes(0x4200, &sa).unwrap();
-    assert_eq!(ret(&mut dispatcher, &mut memory, 200, [fd, 0x4200, sa.len() as u64, 0, 0, 0]), 0, "bind failed");
+    assert_eq!(
+        ret(
+            &mut dispatcher,
+            &mut memory,
+            200,
+            [fd, 0x4200, sa.len() as u64, 0, 0, 0]
+        ),
+        0,
+        "bind failed"
+    );
 
     // getsockname(fd, buf=0x4300, *0x4400 = capacity)
     memory.write_bytes(0x4400, &256u32.to_ne_bytes()).unwrap();
-    assert_eq!(ret(&mut dispatcher, &mut memory, 204, [fd, 0x4300, 0x4400, 0, 0, 0]), 0, "getsockname failed");
+    assert_eq!(
+        ret(
+            &mut dispatcher,
+            &mut memory,
+            204,
+            [fd, 0x4300, 0x4400, 0, 0, 0]
+        ),
+        0,
+        "getsockname failed"
+    );
     let outlen = {
         let b = memory.read_bytes(0x4400, 4).unwrap();
         u32::from_ne_bytes([b[0], b[1], b[2], b[3]]) as usize
@@ -104,7 +131,11 @@ fn epoll_del_of_one_dup_keeps_readiness_for_the_shared_host_socket() {
 
     let ret = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| -> i64 {
         match d
-            .dispatch(SyscallRequest::new(nr, SyscallArgs::from(args)), m, &reporter)
+            .dispatch(
+                SyscallRequest::new(nr, SyscallArgs::from(args)),
+                m,
+                &reporter,
+            )
             .unwrap()
         {
             DispatchOutcome::Returned { value } => value,
@@ -114,7 +145,12 @@ fn epoll_del_of_one_dup_keeps_readiness_for_the_shared_host_socket() {
 
     // socketpair(AF_UNIX, SOCK_STREAM) -> a real connected host pair; fds @0x4000.
     assert_eq!(
-        ret(&mut dispatcher, &mut memory, 199, [LINUX_AF_UNIX, LINUX_SOCK_STREAM as u64, 0, 0x4000, 0, 0]),
+        ret(
+            &mut dispatcher,
+            &mut memory,
+            199,
+            [LINUX_AF_UNIX, LINUX_SOCK_STREAM as u64, 0, 0x4000, 0, 0]
+        ),
         0
     );
     let pair = memory.read_bytes(0x4000, 8).unwrap();
@@ -129,23 +165,61 @@ fn epoll_del_of_one_dup_keeps_readiness_for_the_shared_host_socket() {
     let epfd = ret(&mut dispatcher, &mut memory, 20, [0, 0, 0, 0, 0, 0]) as u64;
 
     // epoll_ctl ADD fd_a (data 0xAAAA) and ADD fd_dup (data 0xBBBB) — same host fd.
-    let ev_a = LinuxEpollEvent { events: LINUX_EPOLLIN, _pad: 0, data: 0xAAAA };
+    let ev_a = LinuxEpollEvent {
+        events: LINUX_EPOLLIN,
+        _pad: 0,
+        data: 0xAAAA,
+    };
     memory.write_bytes(0x4040, ev_a.as_bytes()).unwrap();
-    assert_eq!(ret(&mut dispatcher, &mut memory, 21, [epfd, LINUX_EPOLL_CTL_ADD, fd_a, 0x4040, 0, 0]), 0);
-    let ev_d = LinuxEpollEvent { events: LINUX_EPOLLIN, _pad: 0, data: 0xBBBB };
+    assert_eq!(
+        ret(
+            &mut dispatcher,
+            &mut memory,
+            21,
+            [epfd, LINUX_EPOLL_CTL_ADD, fd_a, 0x4040, 0, 0]
+        ),
+        0
+    );
+    let ev_d = LinuxEpollEvent {
+        events: LINUX_EPOLLIN,
+        _pad: 0,
+        data: 0xBBBB,
+    };
     memory.write_bytes(0x4060, ev_d.as_bytes()).unwrap();
-    assert_eq!(ret(&mut dispatcher, &mut memory, 21, [epfd, LINUX_EPOLL_CTL_ADD, fd_dup, 0x4060, 0, 0]), 0);
+    assert_eq!(
+        ret(
+            &mut dispatcher,
+            &mut memory,
+            21,
+            [epfd, LINUX_EPOLL_CTL_ADD, fd_dup, 0x4060, 0, 0]
+        ),
+        0
+    );
 
     // DEL the dup — must keep fd_a's interest alive.
-    assert_eq!(ret(&mut dispatcher, &mut memory, 21, [epfd, LINUX_EPOLL_CTL_DEL, fd_dup, 0, 0, 0]), 0);
+    assert_eq!(
+        ret(
+            &mut dispatcher,
+            &mut memory,
+            21,
+            [epfd, LINUX_EPOLL_CTL_DEL, fd_dup, 0, 0, 0]
+        ),
+        0
+    );
 
     // Make fd_a readable by writing a byte to its peer end (fd_b).
     memory.write_bytes(0x4080, b"x").unwrap();
-    assert_eq!(ret(&mut dispatcher, &mut memory, 64, [fd_b, 0x4080, 1, 0, 0, 0]), 1);
+    assert_eq!(
+        ret(&mut dispatcher, &mut memory, 64, [fd_b, 0x4080, 1, 0, 0, 0]),
+        1
+    );
 
     // epoll_pwait(timeout=0): fd_a MUST be reported readable (data 0xAAAA).
     let n = ret(&mut dispatcher, &mut memory, 22, [epfd, 0x4100, 4, 0, 0, 0]);
-    assert_eq!(n, 1, "DEL of the dup deafened the shared host socket (the TestFileListener hang)");
+    assert_eq!(
+        n, 1,
+        "DEL of the dup deafened the shared host socket (the TestFileListener hang)"
+    );
     let ready_data = read_epoll_event(&memory, 0x4100).data;
     assert_eq!(ready_data, 0xAAAA);
 }
@@ -165,7 +239,11 @@ fn getsockopt_so_peercred_returns_linux_ucred_from_local_peercred() {
 
     let ret = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| -> i64 {
         match d
-            .dispatch(SyscallRequest::new(nr, SyscallArgs::from(args)), m, &reporter)
+            .dispatch(
+                SyscallRequest::new(nr, SyscallArgs::from(args)),
+                m,
+                &reporter,
+            )
             .unwrap()
         {
             DispatchOutcome::Returned { value } => value,
@@ -175,7 +253,12 @@ fn getsockopt_so_peercred_returns_linux_ucred_from_local_peercred() {
 
     // socketpair(AF_UNIX, SOCK_STREAM) -> connected host pair; fds @0x4000.
     assert_eq!(
-        ret(&mut dispatcher, &mut memory, 199, [LINUX_AF_UNIX, LINUX_SOCK_STREAM as u64, 0, 0x4000, 0, 0]),
+        ret(
+            &mut dispatcher,
+            &mut memory,
+            199,
+            [LINUX_AF_UNIX, LINUX_SOCK_STREAM as u64, 0, 0x4000, 0, 0]
+        ),
         0
     );
     let pair = memory.read_bytes(0x4000, 8).unwrap();
@@ -184,7 +267,12 @@ fn getsockopt_so_peercred_returns_linux_ucred_from_local_peercred() {
     // optlen @0x4010 = 12 (sizeof ucred); ucred written @0x4020.
     memory.write_bytes(0x4010, &12u32.to_ne_bytes()).unwrap();
     assert_eq!(
-        ret(&mut dispatcher, &mut memory, 209, [fd_a, LINUX_SOL_SOCKET, LINUX_SO_PEERCRED, 0x4020, 0x4010, 0]),
+        ret(
+            &mut dispatcher,
+            &mut memory,
+            209,
+            [fd_a, LINUX_SOL_SOCKET, LINUX_SO_PEERCRED, 0x4020, 0x4010, 0]
+        ),
         0
     );
 
@@ -204,7 +292,12 @@ fn getsockopt_so_peercred_returns_linux_ucred_from_local_peercred() {
     // A short optlen must clamp, not overflow the guest buffer.
     memory.write_bytes(0x4010, &4u32.to_ne_bytes()).unwrap();
     assert_eq!(
-        ret(&mut dispatcher, &mut memory, 209, [fd_a, LINUX_SOL_SOCKET, LINUX_SO_PEERCRED, 0x4020, 0x4010, 0]),
+        ret(
+            &mut dispatcher,
+            &mut memory,
+            209,
+            [fd_a, LINUX_SOL_SOCKET, LINUX_SO_PEERCRED, 0x4020, 0x4010, 0]
+        ),
         0
     );
     let clamped = u32::from_ne_bytes(memory.read_bytes(0x4010, 4).unwrap().try_into().unwrap());

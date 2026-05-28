@@ -79,8 +79,7 @@ fn net_interfaces() -> Vec<NetIface> {
     while !cur.is_null() {
         // SAFETY: cur is a non-null node in the getifaddrs list.
         let ifa = unsafe { &*cur };
-        if !ifa.ifa_addr.is_null()
-            && (unsafe { (*ifa.ifa_addr).sa_family } as i32) == libc::AF_LINK
+        if !ifa.ifa_addr.is_null() && (unsafe { (*ifa.ifa_addr).sa_family } as i32) == libc::AF_LINK
         {
             // SAFETY: an AF_LINK ifa_addr is a sockaddr_dl.
             let sdl = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_dl) };
@@ -145,7 +144,12 @@ fn synthetic_net_file(path: &str) -> Option<Vec<u8>> {
         "flags" => format!("0x{:x}\n", iface.flags),
         // ARPHRD_LOOPBACK (772) vs ARPHRD_ETHER (1); default MTU by type.
         "type" => if iface.is_loopback { "772\n" } else { "1\n" }.to_string(),
-        "mtu" => if iface.is_loopback { "16384\n" } else { "1500\n" }.to_string(),
+        "mtu" => if iface.is_loopback {
+            "16384\n"
+        } else {
+            "1500\n"
+        }
+        .to_string(),
         _ => return None,
     };
     Some(body.into_bytes())
@@ -395,7 +399,10 @@ mod tests {
         let v = SysVfs::new();
         // /sys/class/net is a directory listing the host interfaces; loopback
         // ("lo") is always present.
-        assert_eq!(v.lookup("/sys/class/net").unwrap().kind, EntryKind::Directory);
+        assert_eq!(
+            v.lookup("/sys/class/net").unwrap().kind,
+            EntryKind::Directory
+        );
         let ifaces = v.readdir("/sys/class/net").unwrap();
         assert!(!ifaces.is_empty(), "host interfaces should be listed");
         // Interface names mirror the host's getifaddrs view (the same source
@@ -404,7 +411,9 @@ mod tests {
         let lo = ifaces
             .iter()
             .map(|d| d.name.clone())
-            .find(|n| synthetic_net_file(&format!("/sys/class/net/{n}/type")) == Some(b"772\n".to_vec()))
+            .find(|n| {
+                synthetic_net_file(&format!("/sys/class/net/{n}/type")) == Some(b"772\n".to_vec())
+            })
             .expect("a loopback interface");
         // It's a directory whose attribute files exist and render.
         assert_eq!(
@@ -412,15 +421,25 @@ mod tests {
             EntryKind::Directory
         );
         assert_eq!(
-            v.lookup(&format!("/sys/class/net/{lo}/ifindex")).unwrap().kind,
+            v.lookup(&format!("/sys/class/net/{lo}/ifindex"))
+                .unwrap()
+                .kind,
             EntryKind::File
         );
         let attrs = v.readdir(&format!("/sys/class/net/{lo}")).unwrap();
         assert!(attrs.iter().any(|d| d.name == "operstate"));
         assert!(attrs.iter().any(|d| d.name == "address"));
-        assert!(synthetic_net_file(&format!("/sys/class/net/{lo}/ifindex")).unwrap().len() > 1);
+        assert!(
+            synthetic_net_file(&format!("/sys/class/net/{lo}/ifindex"))
+                .unwrap()
+                .len()
+                > 1
+        );
         // An interface that doesn't exist is ENOENT.
-        assert_eq!(v.lookup("/sys/class/net/definitely-not-a-nic"), Err(LINUX_ENOENT));
+        assert_eq!(
+            v.lookup("/sys/class/net/definitely-not-a-nic"),
+            Err(LINUX_ENOENT)
+        );
     }
 
     #[test]
