@@ -1,0 +1,5 @@
+# Raw per-run results accumulate during the sweep; the committed deliverable is
+# the summarized tally (BASELINE.md), not the churn. The manifest + inventory
+# ARE committed (they define the denominator).
+results.jsonl
+syscalls.manifest
