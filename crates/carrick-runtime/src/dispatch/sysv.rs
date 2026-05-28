@@ -27,6 +27,53 @@
 //!     orthogonal subsystems; the same file-backed approach would work.
 
 use super::*;
+
+// The `libc` crate exposes the SysV semaphore family on macOS but NOT the
+// message-queue family, so declare those externs ourselves. Signatures per
+// macOS <sys/msg.h>.
+unsafe extern "C" {
+    fn msgget(key: libc::key_t, msgflg: libc::c_int) -> libc::c_int;
+    fn msgsnd(
+        msqid: libc::c_int,
+        msgp: *const libc::c_void,
+        msgsz: libc::size_t,
+        msgflg: libc::c_int,
+    ) -> libc::c_int;
+    fn msgrcv(
+        msqid: libc::c_int,
+        msgp: *mut libc::c_void,
+        msgsz: libc::size_t,
+        msgtyp: libc::c_long,
+        msgflg: libc::c_int,
+    ) -> libc::ssize_t;
+    fn msgctl(msqid: libc::c_int, cmd: libc::c_int, buf: *mut libc::c_void) -> libc::c_int;
+}
+
+/// macOS `struct msqid_ds` field offsets (measured via offsetof). Used to
+/// translate IPC_STAT into the Linux aarch64 `msqid64_ds` layout.
+const MACOS_MSQID_DS_SIZE: usize = 116;
+const MAC_MSG_CBYTES: usize = 32; // u64
+const MAC_MSG_QNUM: usize = 40; // u64
+const MAC_MSG_QBYTES: usize = 48; // u64
+const MAC_MSG_LSPID: usize = 56; // i32
+const MAC_MSG_LRPID: usize = 60; // i32
+const MAC_MSG_STIME: usize = 64; // time_t (read low 8)
+const MAC_MSG_RTIME: usize = 76; // time_t
+const MAC_MSG_CTIME: usize = 88; // time_t
+
+// Linux aarch64 `struct msqid64_ds` field offsets (asm-generic/msgbuf.h):
+// ipc64_perm(48), msg_stime@48, msg_rtime@56, msg_ctime@64, msg_cbytes@72,
+// msg_qnum@80, msg_qbytes@88, msg_lspid@96, msg_lrpid@100. Total 120.
+const LIN_MSG_STIME: usize = 48;
+const LIN_MSG_RTIME: usize = 56;
+const LIN_MSG_CTIME: usize = 64;
+const LIN_MSG_CBYTES: usize = 72;
+const LIN_MSG_QNUM: usize = 80;
+const LIN_MSG_QBYTES: usize = 88;
+const LIN_MSG_LSPID: usize = 96;
+const LIN_MSG_LRPID: usize = 100;
+const LINUX_MSQID_DS_SIZE: usize = 120;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -498,6 +545,138 @@ impl SyscallDispatcher {
                     Ok(DispatchOutcome::Returned {
                         value: (used_ids - 1).max(0),
                     })
+                }
+                _ => Ok(DispatchOutcome::errno(LINUX_EINVAL)),
+            }
+        }
+
+        /// msgget(key, msgflg): allocate/look up a SysV message queue.
+        /// Forwarded to the host (macOS has SysV message queues; IPC_CREAT/
+        /// IPC_EXCL share Linux's values). Cross-process for free.
+        fn msgget(this, cx, key: u64, msgflg: u64) {
+            let _ = (this, cx);
+            let rc = unsafe { msgget(key as i32 as libc::key_t, msgflg as i32) };
+            match rc.host_syscall_errno() {
+                Ok(id) => Ok(DispatchOutcome::Returned { value: id as i64 }),
+                Err(errno) => Ok(DispatchOutcome::errno(errno)),
+            }
+        }
+
+        /// msgsnd(msqid, msgp, msgsz, msgflg): send a message. The msgbuf
+        /// layout (`long mtype; char mtext[msgsz]`) is identical Linux↔macOS,
+        /// so the buffer forwards verbatim (8-byte mtype + msgsz payload).
+        fn msgsnd(this, cx, msqid: u64, msgp: GuestPtr, msgsz: u64, msgflg: u64) {
+            let _ = this;
+            let sz = msgsz as usize;
+            // Read mtype (8) + payload (sz).
+            let buf = match cx.memory.read_bytes(msgp.0, 8 + sz) {
+                Ok(b) => b,
+                Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+            };
+            let rc = unsafe {
+                msgsnd(
+                    msqid as i32,
+                    buf.as_ptr() as *const libc::c_void,
+                    sz,
+                    msgflg as i32,
+                )
+            };
+            match rc.host_syscall_errno() {
+                Ok(_) => Ok(DispatchOutcome::Returned { value: 0 }),
+                Err(errno) => Ok(DispatchOutcome::errno(errno)),
+            }
+        }
+
+        /// msgrcv(msqid, msgp, msgsz, msgtyp, msgflg): receive a message into
+        /// `msgp` (`long mtype; char mtext[msgsz]`). Returns the payload byte
+        /// count received.
+        fn msgrcv(this, cx, msqid: u64, msgp: GuestPtr, msgsz: u64, msgtyp: u64, msgflg: u64) {
+            let _ = this;
+            let sz = msgsz as usize;
+            let mut buf = vec![0u8; 8 + sz];
+            let rc = unsafe {
+                msgrcv(
+                    msqid as i32,
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    sz,
+                    msgtyp as libc::c_long,
+                    msgflg as i32,
+                )
+            };
+            match rc.host_syscall_errno() {
+                Ok(received) => {
+                    let received = received as usize;
+                    // Write back mtype (8) + the received payload.
+                    if cx
+                        .memory
+                        .write_bytes(msgp.0, &buf[..8 + received])
+                        .is_err()
+                    {
+                        return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                    }
+                    Ok(DispatchOutcome::Returned { value: received as i64 })
+                }
+                Err(errno) => Ok(DispatchOutcome::errno(errno)),
+            }
+        }
+
+        /// msgctl(msqid, cmd, buf). IPC_RMID forwards; IPC_STAT fills a
+        /// best-effort msqid_ds (msg_qnum + msg_qbytes, the fields LTP reads);
+        /// IPC_SET is a no-op success.
+        fn msgctl(this, cx, msqid: u64, cmd: u64, buf: u64) {
+            let _ = this;
+            match cmd {
+                LINUX_IPC_RMID => {
+                    let rc = unsafe { msgctl(msqid as i32, libc::IPC_RMID, core::ptr::null_mut()) };
+                    match rc.host_syscall_errno() {
+                        Ok(_) => Ok(DispatchOutcome::Returned { value: 0 }),
+                        Err(errno) => Ok(DispatchOutcome::errno(errno)),
+                    }
+                }
+                LINUX_IPC_SET => Ok(DispatchOutcome::Returned { value: 0 }),
+                LINUX_IPC_STAT => {
+                    // Stat into a raw macOS msqid_ds buffer (libc lacks the
+                    // type on macOS); extract msg_qnum/msg_qbytes from the
+                    // measured offsets.
+                    let mut ds = [0u8; MACOS_MSQID_DS_SIZE];
+                    let rc = unsafe {
+                        msgctl(msqid as i32, libc::IPC_STAT, ds.as_mut_ptr() as *mut libc::c_void)
+                    };
+                    if let Err(errno) = rc.host_syscall_errno() {
+                        return Ok(DispatchOutcome::errno(errno));
+                    }
+                    let rd8 = |o: usize| {
+                        let mut a = [0u8; 8];
+                        a.copy_from_slice(&ds[o..o + 8]);
+                        u64::from_le_bytes(a)
+                    };
+                    let rd4 = |o: usize| {
+                        let mut a = [0u8; 4];
+                        a.copy_from_slice(&ds[o..o + 4]);
+                        i32::from_le_bytes(a)
+                    };
+                    if buf != 0 {
+                        let mut out = [0u8; LINUX_MSQID_DS_SIZE];
+                        let put8 = |out: &mut [u8], o: usize, v: u64| {
+                            out[o..o + 8].copy_from_slice(&v.to_le_bytes())
+                        };
+                        let put4 = |out: &mut [u8], o: usize, v: i32| {
+                            out[o..o + 4].copy_from_slice(&v.to_le_bytes())
+                        };
+                        put8(&mut out, LIN_MSG_STIME, rd8(MAC_MSG_STIME));
+                        put8(&mut out, LIN_MSG_RTIME, rd8(MAC_MSG_RTIME));
+                        put8(&mut out, LIN_MSG_CTIME, rd8(MAC_MSG_CTIME));
+                        put8(&mut out, LIN_MSG_CBYTES, rd8(MAC_MSG_CBYTES));
+                        put8(&mut out, LIN_MSG_QNUM, rd8(MAC_MSG_QNUM));
+                        put8(&mut out, LIN_MSG_QBYTES, rd8(MAC_MSG_QBYTES));
+                        put4(&mut out, LIN_MSG_LSPID, rd4(MAC_MSG_LSPID));
+                        put4(&mut out, LIN_MSG_LRPID, rd4(MAC_MSG_LRPID));
+                        let memory = &mut *cx.memory;
+                        if memory.write_bytes(buf, &out).is_err() {
+                            return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                        }
+                    }
+                    Ok(DispatchOutcome::Returned { value: 0 })
                 }
                 _ => Ok(DispatchOutcome::errno(LINUX_EINVAL)),
             }
