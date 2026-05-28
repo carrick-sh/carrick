@@ -1042,9 +1042,13 @@ impl SyscallDispatcher {
                     }
                 }
                 if idtype == LINUX_P_PID {
+                    // Same no-interrupt mask as wait4: a blocked or
+                    // delivered-and-dropped signal must not EINTR the park.
+                    let tid = Self::ctx_tid(cx);
+                    let block_signals = this.non_interrupting_signal_mask(tid);
                     return Ok(DispatchOutcome::WaitOnProcExit {
                         pid: id as i32,
-                        block_signals: 0,
+                        block_signals,
                     });
                 }
                 loop {
@@ -1112,9 +1116,18 @@ impl SyscallDispatcher {
                 };
                 match r.host_syscall_errno() {
                     Ok(0) => {
+                        // Don't interrupt the park for a pending signal that is
+                        // blocked OR will be delivered-and-dropped (SIG_IGN /
+                        // default-ignore SIGCHLD/SIGURG/SIGWINCH). Otherwise a
+                        // sibling child's default-ignored SIGCHLD spuriously
+                        // EINTRs this wait — LTP futex_cmp_requeue01 / any
+                        // multi-child reap. A real handler still interrupts
+                        // (then SA_RESTART restarts wait4).
+                        let tid = Self::ctx_tid(cx);
+                        let block_signals = this.non_interrupting_signal_mask(tid);
                         return Ok(DispatchOutcome::WaitOnProcExit {
                             pid: pid.0,
-                            block_signals: 0,
+                            block_signals,
                         });
                     }
                     Ok(value) => Ok(value),
