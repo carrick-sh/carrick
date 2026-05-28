@@ -130,6 +130,45 @@ impl SyscallDispatcher {
             .unwrap_or(false)
     }
 
+    /// Bitmask (bit `signum-1`) of signals that must NOT interrupt a blocking,
+    /// restartable syscall (wait4/waitid) for `tid`. On Linux a syscall is
+    /// interrupted only by a signal that is both unblocked AND has an effect:
+    /// a signal that is blocked, explicitly `SIG_IGN`, or `SIG_DFL` with a
+    /// default action of "ignore" (SIGCHLD/SIGURG/SIGWINCH) is delivered-and-
+    /// dropped without interrupting. carrick previously interrupted the wait
+    /// for ANY pending signal, so a sibling child's default-ignored SIGCHLD
+    /// spuriously EINTR'd a `waitpid(other_child)` (LTP futex_cmp_requeue01's
+    /// `SAFE_WAITPID` then TBROKed). Folding the ignored set into the wait's
+    /// block mask makes those pending-but-inert signals leave the wait running.
+    pub fn non_interrupting_signal_mask(&self, tid: crate::thread::ThreadId) -> u64 {
+        let signal = self.signal.lock();
+        // Start from the thread's blocked set.
+        let mut mask = signal.mask_for(tid);
+        for signum in 1..=64i32 {
+            let Some(bit) = sigmask_bit(signum) else {
+                continue;
+            };
+            let disposition = signal.handlers.get(&signum).map(|a| a.sa_handler);
+            let ignored = match disposition {
+                Some(h) if h == crate::linux_abi::LINUX_SIG_IGN => true,
+                // No recorded handler, or SIG_DFL: inert only when the DEFAULT
+                // action is ignore (SIGCHLD/SIGURG/SIGWINCH). Every other
+                // SIG_DFL signal (terminate/core/stop) still interrupts.
+                None => is_default_ignore_signum(signum),
+                Some(h) if h == crate::linux_abi::LINUX_SIG_DFL => {
+                    is_default_ignore_signum(signum)
+                }
+                // A real handler is installed → the signal interrupts (then
+                // SA_RESTART decides whether the syscall restarts).
+                Some(_) => false,
+            };
+            if ignored {
+                mask |= bit;
+            }
+        }
+        mask
+    }
+
     /// True iff `signum` is currently blocked by the guest's signal mask.
     /// SIGKILL/SIGSTOP can never be blocked, matching the kernel.
     pub fn signal_blocked(&self, tid: crate::thread::ThreadId, signum: i32) -> bool {
@@ -334,7 +373,7 @@ impl SyscallDispatcher {
     }
 
     /// The calling guest thread's tid (or `0` if no thread context).
-    fn ctx_tid<M: GuestMemory>(ctx: &SyscallCtx<M>) -> crate::thread::ThreadId {
+    pub(crate) fn ctx_tid<M: GuestMemory>(ctx: &SyscallCtx<M>) -> crate::thread::ThreadId {
         ctx.thread.as_ref().map(|t| t.tid).unwrap_or(0)
     }
 
@@ -785,6 +824,19 @@ impl SyscallDispatcher {
 
 pub(crate) fn is_valid_signum(signum: u64) -> bool {
     signum <= LINUX_MAX_SIGNUM
+}
+
+/// Signals whose Linux DEFAULT disposition is "ignore" (`Ign`): a SIG_DFL /
+/// no-handler instance is dropped, not a terminating action. Mirrors the
+/// runtime's `is_default_ignore_signal`; kept here so the dispatcher can
+/// compute the no-interrupt mask without crossing crates.
+fn is_default_ignore_signum(signum: i32) -> bool {
+    matches!(
+        signum,
+        crate::linux_abi::LINUX_SIGCHLD
+            | crate::linux_abi::LINUX_SIGURG
+            | crate::linux_abi::LINUX_SIGWINCH
+    )
 }
 
 /// Bit mask for `signum` (1..=64) within a Linux `sigset_t` word, or
