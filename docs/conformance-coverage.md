@@ -31,13 +31,22 @@ the deliverable; the LTP MATCH is just confirmation.
 Known LTP tests NOT in the curated map (out of scope, tracked in handoff, not
 counted above): rt_sigtimedwait01 / sched_getparam01-syscall-variant (LTP
 test-variant-switching framework hang), shmat01 (alias-VA reuse semantics),
-epoll_pwait2 (syscall 441), clone08 (CLONE_VM-child-stack thread shape),
-futex_cmp_requeue01 (the requeue PRIMITIVE is now implemented + probe-owned —
-see `futexrequeue` below; the LTP test still TBROKs on a separate
-waitpid-EINTR-restart follow-up, not requeue). A guest-thread RESPAWN bug
-("current thread handle already set" when a process spawns a second batch of
-threads after the first exits) was also surfaced by `futexrequeue` and is
-tracked for follow-up.
+epoll_pwait2 (syscall 441), clone08 (CLONE_VM-child-stack thread shape).
+`futex_cmp_requeue01`: the requeue PRIMITIVE is implemented + probe-owned for
+PRIVATE futexes (`futexrequeue` below); the LTP test uses FORKED-CHILD
+(cross-process, MAP_SHARED) waiters to test the kernel MECHANISM (are the
+requeued waiters actually parked on uaddr2?). carrick's shared/cross-process
+path degrades CMP_REQUEUE to wake-all — program-correct (the futex contract
+permits spurious wakes; a woken guest re-checks + re-waits) but not
+mechanism-exact, so `futex_wake(uaddr2)` finds 0 and the test's
+requeue-location assertion fails. A mechanism-exact cross-process requeue
+needs a carrick-managed shared redirect registry keyed on the futex word's
+stable physical-page identity (each process maps the shared page at a
+different host VA, so the per-process `__ulock` host address can't be the
+key) — a tracked follow-up, NOT an accepted limitation of the primitive. A
+guest-thread RESPAWN bug ("current thread handle already set" when a process
+spawns a second batch of threads after the first exits, surfaced by
+`futexrequeue`) is also tracked.
 
 Legend: ✅ owned by a probe · 🧪 owned by a lib unit test · ⬜ LTP-only (no
 carrick test yet — backlog).
@@ -93,6 +102,7 @@ underlying gap got fixed):
 | Per-thread `sigaltstack` storage (not clobbered across threads) | ✅ `altstacktid` | sigaltstack01 |
 | SA_ONSTACK delivery on the alt stack | ✅ `signals`/`altstacktid` | sigaltstack01/02 |
 | **SA_RESTART restarts wait4; non-SA_RESTART EINTRs; awaited-child exit never spurious-EINTRs** | ✅ `waitrestart` | (reap blocker — whole tst_test suite) |
+| **A blocking `waitpid(A)` is NOT interrupted by a sibling child B's default-ignore SIGCHLD (no handler → delivered-and-dropped → no EINTR); a SIGCHLD HANDLER without SA_RESTART DOES interrupt (EINTR). The dispatcher folds blocked + effectively-ignored signals into the wait's no-interrupt mask** | ✅ `waitsiblingsigchld` | futex_cmp_requeue01 / any multi-child SAFE_WAITPID reap |
 | **execve resets caught handlers→SIG_DFL, keeps SIG_IGN, preserves mask + pending; sigaltstack is preserved (empirically, despite man-page wording)** | ✅ `execvereset` + 🧪 `signal::tests::execve_resets_…` | (shell-wrapped tests; pause/kill) |
 | **fork: child inherits blocked mask; child pending cleared; parent pending survives** | ✅ `maskfork` | (fork signal semantics) |
 | **death-by-signal → wait4 WIFSIGNALED/WTERMSIG; clean exit → WIFEXITED** | ✅ `signalexit` | kill03/06/09 |
