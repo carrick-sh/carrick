@@ -1353,6 +1353,13 @@ impl SyscallDispatcher {
         }
 
         fn getrandom(this, cx, address: GuestPtr, length: u64, flags: u64) {
+            // Only GRND_NONBLOCK(1) | GRND_RANDOM(2) | GRND_INSECURE(4) are
+            // valid; any other bit → EINVAL (LTP getrandom05). carrick draws
+            // from the host CSPRNG regardless of the source/blocking flags.
+            const GRND_SUPPORTED: u64 = 0x0001 | 0x0002 | 0x0004;
+            if flags & !GRND_SUPPORTED != 0 {
+                return Ok(LINUX_EINVAL.into());
+            }
             let length = usize::try_from(length).map_err(|_| DispatchError::LengthTooLarge(length))?;
             let memory = &mut *cx.memory;
             let mut bytes = vec![0; length];
