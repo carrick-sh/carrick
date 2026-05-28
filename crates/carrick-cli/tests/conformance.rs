@@ -49,11 +49,6 @@ const KNOWN_PROBE_GAPS: &[&str] = &[
     // note). The probe will pass once the dispatcher threads the user
     // siginfo through to the sigframe.
     "rtsigqueueinfo",
-    // sched_* query syscalls (`sched_get_priority_min`/`max`,
-    // `sched_getscheduler`, `sched_getparam`, `sched_rr_get_interval`,
-    // `sched_setparam`/`setscheduler`) are unregistered in carrick. The
-    // probe gates the implementation when it lands.
-    "schedparam",
 ];
 use std::time::{Duration, Instant};
 

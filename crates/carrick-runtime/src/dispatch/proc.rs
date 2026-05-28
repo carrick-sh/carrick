@@ -2,6 +2,73 @@
 //! `super` for the dispatcher struct and the normalized dispatch table.
 use super::*;
 
+/// Linux SCHED_* policy values (kernel ABI, not the libc-internal names).
+const LINUX_SCHED_OTHER: i32 = 0; // a.k.a. SCHED_NORMAL
+const LINUX_SCHED_FIFO: i32 = 1;
+const LINUX_SCHED_RR: i32 = 2;
+const LINUX_SCHED_BATCH: i32 = 3;
+const LINUX_SCHED_IDLE: i32 = 5;
+const LINUX_SCHED_DEADLINE: i32 = 6;
+
+/// Per-Linux-policy priority window for `sched_get_priority_{max,min}`. RT
+/// policies expose MAX_USER_RT_PRIO-1 / 1; time-sharing policies expose 0/0;
+/// unknown policy is EINVAL.
+fn sched_priority_for(policy: i32, max: bool) -> DispatchOutcome {
+    match policy {
+        LINUX_SCHED_FIFO | LINUX_SCHED_RR => DispatchOutcome::Returned {
+            value: if max { 99 } else { 1 },
+        },
+        LINUX_SCHED_OTHER | LINUX_SCHED_BATCH | LINUX_SCHED_IDLE | LINUX_SCHED_DEADLINE => {
+            DispatchOutcome::Returned { value: 0 }
+        }
+        _ => LINUX_EINVAL.into(),
+    }
+}
+
+/// True when `pid` names "this guest process" for the purposes of a sched_*
+/// query. Linux accepts both `0` (the calling task) and the calling task's
+/// own pid. Carrick presents the host pid as the guest pid, plus
+/// `LINUX_BOOTSTRAP_PID` (the stable guest-init alias used elsewhere). Any
+/// other value is ESRCH.
+fn sched_pid_is_self(pid: u64) -> bool {
+    pid == 0
+        || pid == std::process::id() as u64
+        || pid == LINUX_BOOTSTRAP_PID as u64
+}
+
+/// True when `policy` is one of the kernel's known scheduling policies.
+fn sched_policy_is_known(policy: i32) -> bool {
+    matches!(
+        policy,
+        LINUX_SCHED_OTHER
+            | LINUX_SCHED_FIFO
+            | LINUX_SCHED_RR
+            | LINUX_SCHED_BATCH
+            | LINUX_SCHED_IDLE
+            | LINUX_SCHED_DEADLINE
+    )
+}
+
+/// Read a `struct sched_param { int sched_priority; }` out of guest memory
+/// at `address` (or EFAULT on a bad pointer). The struct's only field is the
+/// priority on Linux (sched_setattr is a separate richer entry point).
+fn sched_read_param_priority<M: GuestMemory>(
+    cx: &mut SyscallCtx<M>,
+    address: GuestPtr,
+) -> Result<i32, DispatchError> {
+    if address.0 == 0 {
+        return Ok(-1);
+    }
+    let memory = &*cx.memory;
+    match memory.read_bytes(address.0, 4) {
+        Ok(b) => {
+            let arr: [u8; 4] = b.as_slice().try_into().unwrap_or([0; 4]);
+            Ok(i32::from_le_bytes(arr))
+        }
+        Err(_) => Ok(-1),
+    }
+}
+
 /// Owned process-subsystem state. Split out of `SyscallDispatcher`.
 pub(super) struct ProcState {
     /// Path of the currently-running executable, surfaced via
@@ -532,6 +599,108 @@ impl SyscallDispatcher {
             }
             if matches!(target, AffinityTarget::SelfProc) {
                 this.proc.lock().affinity = effective;
+            }
+            Ok(DispatchOutcome::Returned { value: 0 })
+        }
+
+        /// `sched_get_priority_max(policy)`: per Linux kernel/sched/core.c, the
+        /// real-time policies (SCHED_FIFO, SCHED_RR) expose MAX_USER_RT_PRIO-1
+        /// = 99; the time-sharing policies (NORMAL/OTHER, BATCH, IDLE) and
+        /// SCHED_DEADLINE all return 0; any other policy value is EINVAL.
+        fn sched_get_priority_max(this, cx, policy: u64) {
+            Ok(sched_priority_for(policy as i32, /*max=*/ true))
+        }
+
+        /// `sched_get_priority_min(policy)`: the symmetric pair — RT policies
+        /// return 1, time-sharing policies return 0, anything else EINVAL.
+        fn sched_get_priority_min(this, cx, policy: u64) {
+            Ok(sched_priority_for(policy as i32, /*max=*/ false))
+        }
+
+        /// `sched_getscheduler(pid)`: return the per-process policy. Carrick
+        /// doesn't track guest-set policy yet, so a normal (unprivileged)
+        /// process is SCHED_OTHER (0). pid=0 / self / our own host pid all
+        /// resolve to self; any other pid is ESRCH.
+        fn sched_getscheduler(this, cx, pid: u64) {
+            if !sched_pid_is_self(pid) {
+                return Ok(LINUX_ESRCH.into());
+            }
+            Ok(DispatchOutcome::Returned { value: LINUX_SCHED_OTHER as i64 })
+        }
+
+        /// `sched_getparam(pid, &sched_param)`: write the scheduling priority
+        /// for `pid` into `*sched_param`. With a stubbed SCHED_OTHER, this is
+        /// always `sched_priority = 0`.
+        fn sched_getparam(this, cx, pid: u64, address: GuestPtr) {
+            if !sched_pid_is_self(pid) {
+                return Ok(LINUX_ESRCH.into());
+            }
+            if address.0 == 0 {
+                return Ok(LINUX_EINVAL.into());
+            }
+            let memory = &mut *cx.memory;
+            let prio: i32 = 0;
+            if memory.write_bytes(address.0, &prio.to_le_bytes()).is_err() {
+                return Ok(LINUX_EFAULT.into());
+            }
+            Ok(DispatchOutcome::Returned { value: 0 })
+        }
+
+        /// `sched_setscheduler(pid, policy, &param)`: switch a process's
+        /// policy. Without CAP_SYS_NICE (we are non-root in the guest), Linux
+        /// refuses any RT policy with EPERM; SCHED_OTHER+priority=0 succeeds
+        /// as a no-op. Unknown policies are EINVAL.
+        fn sched_setscheduler(this, cx, pid: u64, policy: u64, address: GuestPtr) {
+            if !sched_pid_is_self(pid) {
+                return Ok(LINUX_ESRCH.into());
+            }
+            let policy_i = policy as i32;
+            if !sched_policy_is_known(policy_i) {
+                return Ok(LINUX_EINVAL.into());
+            }
+            let prio = sched_read_param_priority(cx, address)?;
+            if policy_i == LINUX_SCHED_FIFO || policy_i == LINUX_SCHED_RR {
+                // No CAP_SYS_NICE in carrick guest → mirror Linux's EPERM.
+                return Ok(LINUX_EPERM.into());
+            }
+            // Time-sharing policies require priority==0.
+            if prio != 0 {
+                return Ok(LINUX_EINVAL.into());
+            }
+            Ok(DispatchOutcome::Returned { value: LINUX_SCHED_OTHER as i64 })
+        }
+
+        /// `sched_setparam(pid, &param)`: change just the priority. For our
+        /// SCHED_OTHER-only model the only valid priority is 0; anything else
+        /// is EINVAL (matches Linux for SCHED_NORMAL/OTHER/BATCH/IDLE).
+        fn sched_setparam(this, cx, pid: u64, address: GuestPtr) {
+            if !sched_pid_is_self(pid) {
+                return Ok(LINUX_ESRCH.into());
+            }
+            let prio = sched_read_param_priority(cx, address)?;
+            if prio != 0 {
+                return Ok(LINUX_EINVAL.into());
+            }
+            Ok(DispatchOutcome::Returned { value: 0 })
+        }
+
+        /// `sched_rr_get_interval(pid, &timespec)`: write the round-robin
+        /// quantum into `*timespec`. SCHED_OTHER tasks aren't on a RR
+        /// schedule; Linux returns {0, 0} (and 0). We mirror that.
+        fn sched_rr_get_interval(this, cx, pid: u64, address: GuestPtr) {
+            if !sched_pid_is_self(pid) {
+                return Ok(LINUX_ESRCH.into());
+            }
+            if address.0 == 0 {
+                return Ok(LINUX_EINVAL.into());
+            }
+            let memory = &mut *cx.memory;
+            // struct timespec on aarch64: i64 tv_sec, i64 tv_nsec.
+            let mut buf = [0u8; 16];
+            buf[0..8].copy_from_slice(&0i64.to_le_bytes());
+            buf[8..16].copy_from_slice(&0i64.to_le_bytes());
+            if memory.write_bytes(address.0, &buf).is_err() {
+                return Ok(LINUX_EFAULT.into());
             }
             Ok(DispatchOutcome::Returned { value: 0 })
         }
