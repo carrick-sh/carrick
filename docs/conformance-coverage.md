@@ -105,9 +105,9 @@ underlying gap got fixed):
 | eventfd read/write/poll + semaphore mode | ✅ `pollevent` | eventfd01–06, eventfd2_* |
 | pipe create/rw/O_NONBLOCK/F_GETPIPE_SZ | ✅ `splicepipe`, `fdio` | pipe01/03/05/06/09/10/11/14 |
 | **select/pselect timeout & wakeup: bare-timeout rc==0, ready-pipe rc==1 with bit set, not-ready rc==0; pselect sigmask blocks→signal stays pending and times out; sigmask=NULL→alarm interrupts with EINTR** | ✅ `selecttimeout` | select01, select02, select03, pselect02 |
+| **epoll edge/oneshot/exclusive + pwait sigmask: EPOLL_CLOEXEC create, EPOLLEXCLUSIVE add, double-ADD→EEXIST, ADD events=0 silent until MOD, EPOLLET fires-once-per-edge, EPOLLONESHOT disarms until MOD rearm, pwait sigmask blocks SIGALRM through wait, NULL mask EINTRs** | ✅ `epollexclusive` | epoll_ctl05, epoll_wait05, epoll_wait06, epoll_wait07, epoll_pwait01, epoll_pwait02, epoll_pwait05 |
 
 ### epoll/poll/select — backlog
-- ⬜ `epoll_ctl05` EPOLLEXCLUSIVE; `epoll_wait05/06/07`, `epoll_pwait01/02/05`.
 - ⬜ `pipe07/08/12/13`, `pipe2_*`.
 
 ## fs / metadata / dir
