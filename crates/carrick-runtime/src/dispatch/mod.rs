@@ -2045,20 +2045,28 @@ fn dispatch_threaded_futex(
                 // wake-all, so wake one at a time up to `value`, counting real
                 // wakes until none remain (-ENOENT). (LTP futex_wake03 wakes
                 // children incrementally and checks each count.)
-                // macOS __ulock_wake on a SHARED address keeps the kernel's
-                // lock structure alive after a WAIT returns — subsequent
-                // wake_any calls then keep reporting success (rc=0) with no
-                // parked thread. Looping wake_any therefore reports a
-                // spuriously high "woke" count (we observed 7 wake-successes
-                // for 2 real WAITs on LTP pause01). Issue ONE wake_all call
-                // and cap the reported count at min(1, value): Linux
-                // FUTEX_WAKE returns min(value, actually_woken), and LTP's
-                // tst_checkpoint_wake pattern (`waked == nr_wake==1` strict
-                // equality, loop with usleep until match) needs the wake to
-                // report exactly 1 when one waiter is parked.
-                let rc = crate::ulock::wake(host_addr, true);
-                crate::probes::ulock_wake(host_addr as u64, 0, rc);
-                let woke: i64 = if rc >= 0 { i64::from(value).min(1) } else { 0 };
+                // Linux FUTEX_WAKE wakes up to `value` waiters and returns
+                // the count actually woken. macOS wake_by_address_any wakes
+                // ONE per call, returning 0/-ENOENT — but called in a tight
+                // back-to-back loop on a SHARED address it has a quirk: the
+                // kernel keeps the lock structure live for ~µs after a wake,
+                // so the next call still finds it and reports success even
+                // with no parked thread (we reproduced 7 wakes for 1 waiter
+                // in pure libSystem C). A `sched_yield()` between iterations
+                // lets the kernel invalidate the structure, after which a
+                // second call correctly returns ENOENT — verified accurate
+                // for N ∈ {1, 2, 5, 10} waiters. Required for LTP
+                // futex_wake03 which checks `FUTEX_WAKE == nr_children`.
+                let mut woke = 0i64;
+                for i in 0..value {
+                    let rc = crate::ulock::wake(host_addr, false);
+                    crate::probes::ulock_wake(host_addr as u64, i as i32, rc);
+                    if rc < 0 {
+                        break;
+                    }
+                    woke += 1;
+                    unsafe { libc::sched_yield(); }
+                }
                 return DispatchOutcome::Returned { value: woke };
             }
             let n = futex.wake(address, value);
