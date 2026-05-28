@@ -165,3 +165,9 @@ underlying gap got fixed):
 | Invariant | Owned by | Stands in for (LTP) |
 |---|---|---|
 | Raw io_uring_setup → mmap rings → submit (NOP + WRITE + READ + READV) → io_uring_enter → reap CQEs end-to-end | ✅ `iouring` | (io_uring data path; WS-H4-B1) |
+
+## LTP framework primitives
+
+| Invariant | Owned by | Stands in for (LTP) |
+|---|---|---|
+| `tst_test` setup_ipc reduction: `/dev/shm` exists, open(O_CREAT\|O_EXCL), chmod 0666, ftruncate, mmap MAP_SHARED, close-then-write coherence, fork-coherent shared word, BOTH directions of cross-process FUTEX_WAIT/WAKE on the shared word | ✅ `ltpcheckpoint` | (`tst_checkpoint`-using tests: pause01, sigwaitinfo01, sigtimedwait01, sighold02, sigrelse01, rt_sigtimedwait01, kill05, tgkill02, …) |
