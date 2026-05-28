@@ -274,6 +274,7 @@ impl SyscallTrap for ScriptedTrap {
         _altstack: Option<(u64, u64)>,
         _saved_sigmask: u64,
         _fault_siginfo: Option<(i32, u64)>,
+        _queued_siginfo: Option<carrick_runtime::linux_abi::LinuxSiginfo>,
         _restart_syscall: bool,
     ) -> Result<(), TrapError> {
         Err(TrapError::Hypervisor(

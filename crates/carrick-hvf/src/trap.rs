@@ -83,6 +83,12 @@ pub trait SyscallTrap {
         // Some((si_code, si_addr)) for a synchronous fault (SIGSEGV/SIGBUS),
         // None for a SI_USER-shaped delivery.
         fault_siginfo: Option<(i32, u64)>,
+        // Caller-supplied siginfo (rt_sigqueueinfo / sigqueue). When present
+        // it WINS over synthesis: the kernel rewrote si_signo, the rest of
+        // the struct (notably si_value.sival_int) is the caller's. fault_
+        // siginfo is mutually exclusive — synchronous faults can't carry a
+        // queued payload.
+        queued_siginfo: Option<crate::linux_abi::LinuxSiginfo>,
         // SA_RESTART: this handler interrupted a restartable syscall that
         // returned EINTR. Resume at the `svc` (not after it) with the original
         // arg0 restored, so the guest re-executes the syscall after the handler
@@ -1015,6 +1021,7 @@ impl HvfTrapEngine {
         altstack: Option<(u64, u64)>,
         saved_sigmask: u64,
         fault_siginfo: Option<(i32, u64)>,
+        queued_siginfo: Option<crate::linux_abi::LinuxSiginfo>,
         restart_syscall: bool,
     ) -> Result<(), TrapError> {
         self.inner.inject_signal(
@@ -1026,6 +1033,7 @@ impl HvfTrapEngine {
             altstack,
             saved_sigmask,
             fault_siginfo,
+            queued_siginfo,
             restart_syscall,
         )
     }
@@ -1041,6 +1049,7 @@ impl HvfTrapEngine {
         _altstack: Option<(u64, u64)>,
         _saved_sigmask: u64,
         _fault_siginfo: Option<(i32, u64)>,
+        _queued_siginfo: Option<crate::linux_abi::LinuxSiginfo>,
         _restart_syscall: bool,
     ) -> Result<(), TrapError> {
         Err(TrapError::UnsupportedPlatform)
@@ -2149,6 +2158,7 @@ impl HvfInner {
         altstack: Option<(u64, u64)>,
         saved_sigmask: u64,
         fault_siginfo: Option<(i32, u64)>,
+        queued_siginfo: Option<crate::linux_abi::LinuxSiginfo>,
         restart_syscall: bool,
     ) -> Result<(), TrapError> {
         use applevisor::prelude::*;
@@ -2225,21 +2235,29 @@ impl HvfInner {
             None => self.vcpu.get_sys_reg(SysReg::SPSR_EL1).map_err(hvf_error)?,
         };
 
-        let mut siginfo = crate::linux_abi::LinuxSiginfo::empty();
+        // A queued siginfo (rt_sigqueueinfo / sigqueue) wins over synthesis: it
+        // carries the caller's si_value payload and the kernel-set si_code
+        // (SI_QUEUE etc.). A synchronous fault carries the kernel-style
+        // si_code (SEGV_MAPERR/SEGV_ACCERR/BUS_ADRALN) and si_addr=faulting
+        // address so a handler (Go's sigpanic) sees the real cause.
+        // Otherwise it's a SI_USER-shaped delivery (tkill/sysmon preempt).
+        let mut siginfo = match (queued_siginfo, fault_siginfo) {
+            (Some(q), _) => q,
+            (None, Some((si_code, si_addr))) => {
+                let mut s = crate::linux_abi::LinuxSiginfo::empty();
+                s.si_code = si_code;
+                s.si_addr = si_addr;
+                s
+            }
+            (None, None) => {
+                let mut s = crate::linux_abi::LinuxSiginfo::empty();
+                s.si_code = crate::linux_abi::LINUX_SI_USER;
+                s
+            }
+        };
+        // The kernel re-stamps si_signo to the actually-delivered signum even
+        // when a queued siginfo carried a stale field.
         siginfo.si_signo = signum;
-        // A synchronous fault carries the kernel-style si_code (SEGV_MAPERR /
-        // SEGV_ACCERR / BUS_ADRALN) and si_addr=faulting address, so a handler
-        // (e.g. Go's runtime sigpanic) sees the real cause. Otherwise it's a
-        // SI_USER-shaped delivery (tkill/sysmon preempt).
-        match fault_siginfo {
-            Some((si_code, si_addr)) => {
-                siginfo.si_code = si_code;
-                siginfo.si_addr = si_addr;
-            }
-            None => {
-                siginfo.si_code = crate::linux_abi::LINUX_SI_USER;
-            }
-        }
         frame.siginfo = siginfo;
 
         let mut mcontext = crate::linux_abi::LinuxSignalContext::empty();
@@ -3607,6 +3625,7 @@ impl SyscallTrap for HvfTrapEngine {
         altstack: Option<(u64, u64)>,
         saved_sigmask: u64,
         fault_siginfo: Option<(i32, u64)>,
+        queued_siginfo: Option<crate::linux_abi::LinuxSiginfo>,
         restart_syscall: bool,
     ) -> Result<(), TrapError> {
         HvfTrapEngine::inject_signal(
@@ -3619,6 +3638,7 @@ impl SyscallTrap for HvfTrapEngine {
             altstack,
             saved_sigmask,
             fault_siginfo,
+            queued_siginfo,
             restart_syscall,
         )
     }

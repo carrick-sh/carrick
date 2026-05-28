@@ -2045,6 +2045,10 @@ where
                 && action.sa_flags & crate::linux_abi::LINUX_SA_RESTART != 0
                 && trap.last_syscall_nr().is_some_and(is_restartable_syscall);
             let saved_sigmask = dispatcher.enter_signal_handler(tid, pending, action);
+            // If rt_sigqueueinfo queued a caller-supplied siginfo for this
+            // (tid, signum), pop it now and hand it to inject_signal so the
+            // SA_SIGINFO handler sees the original si_value payload.
+            let queued_siginfo = dispatcher.take_pending_siginfo(tid, pending);
             trap.inject_signal(
                 pending,
                 action.sa_handler,
@@ -2054,6 +2058,7 @@ where
                 altstack,
                 saved_sigmask,
                 None, // SI_USER-shaped (tkill/sysmon); faults use deliver_fault_signal
+                queued_siginfo,
                 restart_syscall,
             )?;
             Ok(Some(PendingSignalAction { term_signal: None }))
@@ -2354,6 +2359,7 @@ impl<M: GuestMemory, T: SyscallTrap> SyscallTrap for SplitView<'_, M, T> {
         altstack: Option<(u64, u64)>,
         saved_sigmask: u64,
         fault_siginfo: Option<(i32, u64)>,
+        queued_siginfo: Option<crate::linux_abi::LinuxSiginfo>,
         restart_syscall: bool,
     ) -> Result<(), TrapError> {
         self.trap.inject_signal(
@@ -2365,6 +2371,7 @@ impl<M: GuestMemory, T: SyscallTrap> SyscallTrap for SplitView<'_, M, T> {
             altstack,
             saved_sigmask,
             fault_siginfo,
+            queued_siginfo,
             restart_syscall,
         )
     }
