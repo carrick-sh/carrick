@@ -1105,6 +1105,16 @@ impl SyscallDispatcher {
             let mut acc: HashMap<i32, (u32, u64)> = HashMap::new();
 
             // (1) Drain the instance kqueue (non-blocking) for host-backed fds.
+            // `kq_drained_all_filtered` tracks the corner case where the kqueue
+            // had readiness events but the user's interest mask filters them
+            // all out (e.g. `epoll_ctl(ADD, fd, events=0)` plus data on the
+            // pipe — the read filter still fires because Linux must surface
+            // EPOLLHUP/EPOLLERR, but no event bit matches). Without this flag
+            // we'd return `WaitOnPollFds` and the runtime would re-poll the
+            // already-readable kq_fd, re-dispatch, and tight-loop until the
+            // harness deadline. Detect it once here and switch to an empty
+            // `WaitOnFds` (signal-pipe-and-timeout-only) below.
+            let mut kq_drained_all_filtered = false;
             {
                 let cap = interests.len() * 2 + 4;
                 let mut out = vec![crate::darwin_kqueue::Kevent::empty(); cap.max(1)];
@@ -1113,6 +1123,7 @@ impl SyscallDispatcher {
                     tv_nsec: 0,
                 };
                 if let Ok(n) = kq.wait(&[], &mut out, Some(&zero)) {
+                    let acc_before = acc.len();
                     for ev in &out[..n] {
                         let bits = kevent_to_epoll(*ev);
                         if bits == 0 {
@@ -1166,6 +1177,10 @@ impl SyscallDispatcher {
                             }
                         }
                     }
+                    // The kqueue had events but our interest masks let none of
+                    // them through (the events=0-with-data case). Polling kq_fd
+                    // would just see the same readiness and spin.
+                    kq_drained_all_filtered = n > 0 && acc.len() == acc_before;
                 }
             }
 
@@ -1199,7 +1214,21 @@ impl SyscallDispatcher {
                 }
             }
 
-            if !ready_updates.is_empty() {
+            // EPOLLONESHOT: every interest that just fired must be disarmed
+            // until EPOLL_CTL_MOD re-arms it (Linux semantics — the fd never
+            // appears in a subsequent epoll_wait without an explicit MOD).
+            // Collect the fds-to-disarm before consuming `acc`.
+            let oneshot_fds: Vec<i32> = acc
+                .iter()
+                .filter(|(fd, _)| {
+                    interests
+                        .iter()
+                        .any(|(ifd, slot)| ifd == *fd && slot.event.events & LINUX_EPOLLONESHOT != 0)
+                })
+                .map(|(fd, _)| *fd)
+                .collect();
+
+            if !ready_updates.is_empty() || !oneshot_fds.is_empty() {
                 let mut open = open_file.description.write();
                 if let OpenDescription::Epoll { interest, .. } = &mut *open {
                     for (fd, raw) in ready_updates {
@@ -1207,6 +1236,25 @@ impl SyscallDispatcher {
                             slot.last_ready = raw;
                         }
                     }
+                    for fd in &oneshot_fds {
+                        if let Some(slot) = interest.get_mut(fd) {
+                            // Clear the events mask so subsequent waits never
+                            // surface this fd until EPOLL_CTL_MOD re-arms it.
+                            slot.event.events = 0;
+                        }
+                    }
+                }
+            }
+            // Also remove the host kqueue filter for each disarmed fd so the
+            // level-triggered EVFILT_READ doesn't keep firing and tight-loop
+            // the next epoll_wait (the same shape as the events=0 fix above,
+            // applied to the freshly-disarmed ONESHOT slot).
+            for fd in &oneshot_fds {
+                if let Some(host_fd) = this.host_fd_for_poll(*fd) {
+                    let _ = kq.apply(&[
+                        crate::darwin_kqueue::Kevent::read(host_fd, libc::EV_DELETE),
+                        crate::darwin_kqueue::Kevent::write(host_fd, libc::EV_DELETE),
+                    ]);
                 }
             }
 
@@ -1226,12 +1274,29 @@ impl SyscallDispatcher {
                 }
             }
 
-            if ready.is_empty() && timeout_ms != 0 && has_interests {
+            if ready.is_empty() && timeout_ms != 0 {
                 let timeout = if timeout_ms < 0 {
                     None
                 } else {
                     Some(Duration::from_millis(timeout_ms as u64))
                 };
+                if kq_drained_all_filtered || !has_interests {
+                    // Either the kqueue is already readable for events we
+                    // DON'T care about (filtered to zero by the interest mask),
+                    // or no interests are registered at all (epoll_pwait with
+                    // an empty interest set must still honour the timeout +
+                    // signal interrupt path, not return 0 immediately).
+                    // Either way: polling kq_fd would spin or be pointless.
+                    // Sleep the timeout on the signal pipe — interruptible by
+                    // a real signal.
+                    crate::probes::epoll_result(epfd, 0, 1, timeout_ms, 2);
+                    return Ok(DispatchOutcome::WaitOnFds {
+                        fds: Vec::new(),
+                        timeout,
+                        on_timeout: 0,
+                        block_signals,
+                    });
+                }
                 crate::probes::epoll_result(epfd, 0, 1, timeout_ms, 1);
                 crate::probes::epoll_wait_fd(epfd, -1, kq_fd, libc::POLLIN as i32, timeout_ms);
                 // Poll the instance kqueue fd for readability. This avoids nesting
