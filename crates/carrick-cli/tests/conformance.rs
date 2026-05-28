@@ -35,11 +35,7 @@ static CONFORMANCE_LOCK: Mutex<()> = Mutex::new(());
 /// stays green), but if a known-gap probe unexpectedly PASSES, the test
 /// FAILS so we remove it from this list — that's the signal the gap was
 /// fixed. Each entry must cite the gap.
-const KNOWN_PROBE_GAPS: &[&str] = &[
-    // POSIX timers (`timer_create`/`_settime`/`_gettime`/`_delete`/`_getoverrun`)
-    // are ENOSYS in carrick. The probe gates implementation when it lands.
-    "posixtimers",
-];
+const KNOWN_PROBE_GAPS: &[&str] = &[];
 use std::time::{Duration, Instant};
 
 /// Per-case wall-clock deadline. A single wedged guest process (e.g. a

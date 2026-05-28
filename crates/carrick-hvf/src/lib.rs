@@ -35,6 +35,7 @@ pub mod fork_quiesce;
 pub mod host_signal;
 pub mod io_wait;
 pub mod itimer;
+pub mod posix_timer;
 pub mod probes;
 pub mod shared_aperture;
 pub mod syscall;

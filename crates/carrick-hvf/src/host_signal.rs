@@ -609,6 +609,11 @@ pub fn reinit_after_fork() {
     // re-spawns its own pump (which calls set_pump_kqueue). Until then, no
     // EVFILT_USER target — publish_process_signal still wakes via the pipe.
     PUMP_KQUEUE.store(-1, Ordering::SeqCst);
+    // POSIX timers registered by the parent have their fallback threads dead
+    // in the child (fork copies only the calling thread). Clear the registry
+    // so the child doesn't accidentally reuse the parent's timer IDs without
+    // a backing thread.
+    crate::posix_timer::clear();
     // The child is single-threaded (fork copies only the calling thread); any
     // sibling-directed pending entries inherited from the parent are stale.
     if let Ok(mut map) = THREAD_PENDING.lock() {
