@@ -8,15 +8,34 @@ rules:
       and call `.write_to(buf)` — it is checked at compile time (size,
       layout) and cannot drift the moment a field changes width.
       Worked example: `crates/carrick-runtime/src/dispatch/sysv.rs`'s
-      `LinuxShmidDs`. Pattern caught: `<slice>[N..M].copy_from_slice(&<expr>.to_le_bytes())`.
+      `LinuxShmidDs`. Pattern caught: `<slice>[<int>..<int>].copy_from_slice(&<expr>.to_le_bytes())`
+      where both offsets are integer literals (the struct-build smell).
+      Loop-parameterized writes (`bytes[off..off+8]` where `off = base + i*8`)
+      are explicitly excluded — those are sequence writes, not struct
+      builds, and packed structs don't apply.
     patterns:
       - pattern-either:
           - pattern: $BUF[$LO..$HI].copy_from_slice(&$VAL.to_le_bytes())
           - pattern: $BUF[$LO..$HI].copy_from_slice(&$VAL.to_be_bytes())
           - pattern: $BUF[$LO..$HI].copy_from_slice(&($VAL as $T).to_le_bytes())
+      - metavariable-regex:
+          # Only flag patterns with LITERAL integer offsets (struct-build
+          # smell). Computed offsets (off, off+8, base + i*8, …) are
+          # legitimate sequence writes.
+          metavariable: $LO
+          regex: '^(0x[0-9a-fA-F_]+|[0-9_]+)$'
+      # Tighten the rule to FIXED-SIZE buffers — `[u8; N]` is the
+      # struct-build signature. A `Vec<u8>` return type or unsized
+      # buffer is page-table / ELF-image building, not ABI struct
+      # marshalling. Test fixtures returning `Vec<u8>` (synthetic ELFs,
+      # synthetic sockaddrs) are excluded by this clause too.
+      - pattern-inside: |
+          fn $F(...) -> [u8; $N] {
+            ...
+          }
     paths:
       include:
-        - "crates/**/*.rs"
+        - "/crates/**/*.rs"
       exclude:
         - "**/tests/**"
         - "**/*_test.rs"
