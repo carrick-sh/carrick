@@ -186,7 +186,10 @@ impl InotifyState {
             tv_sec: 0,
             tv_nsec: 0,
         };
-        let n = self.kqueue.wait(&[], &mut events, Some(&timeout)).unwrap_or(0);
+        let n = self
+            .kqueue
+            .wait(&[], &mut events, Some(&timeout))
+            .unwrap_or(0);
         let mut inner = self.inner.lock();
         for ev in &events[..n] {
             let fd = ev.vnode_ident();
@@ -232,8 +235,7 @@ mod tests {
 
     #[test]
     fn vnode_watch_reports_file_modification_as_in_modify() {
-        let path =
-            std::env::temp_dir().join(format!("carrick-inotify-{}.tmp", std::process::id()));
+        let path = std::env::temp_dir().join(format!("carrick-inotify-{}.tmp", std::process::id()));
         std::fs::write(&path, b"seed").unwrap();
         let cpath = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
         // O_EVTONLY: an event-only descriptor, ideal for watching a vnode.
@@ -244,7 +246,10 @@ mod tests {
         let wd = state.add_watch(fd, IN_MODIFY).expect("add_watch");
 
         // Modify the file through a *different* fd; the vnode event still fires.
-        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         f.write_all(b"-more").unwrap();
         f.flush().unwrap();
         drop(f);
@@ -272,6 +277,9 @@ mod tests {
         assert_eq!(note_to_linux_mask(libc::NOTE_WRITE, IN_MODIFY), IN_MODIFY);
         assert_eq!(note_to_linux_mask(libc::NOTE_ATTRIB, IN_MODIFY), 0);
         // Self-delete is always surfaced even if not explicitly requested.
-        assert_eq!(note_to_linux_mask(libc::NOTE_DELETE, IN_MODIFY), IN_DELETE_SELF);
+        assert_eq!(
+            note_to_linux_mask(libc::NOTE_DELETE, IN_MODIFY),
+            IN_DELETE_SELF
+        );
     }
 }

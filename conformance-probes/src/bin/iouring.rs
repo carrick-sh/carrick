@@ -248,12 +248,29 @@ unsafe fn ring_ops(r: &mut Ring) -> bool {
         return false;
     }
 
-    // CLOSE the file via the ring (res 0).
+    // CLOSE the writable file via the ring (res 0).
     if r.submit_reap(|sqe| {
         *sqe.add(0) = IORING_OP_CLOSE;
         ptr::write_unaligned(sqe.add(4) as *mut i32, file);
     }) != Some(0)
     {
+        return false;
+    }
+
+    // WRITE through an O_RDONLY regular file must fail with EBADF even if the
+    // host runtime internally holds a broader fd for mmap/HVF purposes.
+    let ro = libc::open(path.as_ptr(), libc::O_RDONLY);
+    if ro < 0 {
+        return false;
+    }
+    let ro_res = r.submit_reap(|sqe| {
+        *sqe.add(0) = IORING_OP_WRITE;
+        ptr::write_unaligned(sqe.add(4) as *mut i32, ro);
+        ptr::write_unaligned(sqe.add(16) as *mut u64, wbuf);
+        ptr::write_unaligned(sqe.add(24) as *mut u32, msg.len() as u32);
+    });
+    libc::close(ro);
+    if ro_res != Some(-libc::EBADF) {
         return false;
     }
 

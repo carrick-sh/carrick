@@ -69,7 +69,9 @@ pub(super) fn load_execve_image(
         Some(Err(errno)) => return Err(errno),
     };
     let raw = AddressSpace::load_elf_bytes_with_reader(&raw_bytes, &|p| {
-        dispatcher.read_exec_file(p).or_else(|| std::fs::read(p).ok())
+        dispatcher
+            .read_exec_file(p)
+            .or_else(|| std::fs::read(p).ok())
     })
     .map_err(|_| LINUX_ENOENT)?;
     let image = raw
@@ -115,7 +117,11 @@ fn parse_shebang(head: &[u8]) -> Option<(String, Option<String>)> {
 /// `_exit(2)` to bypass Rust's normal Drop chain. Without this, the
 /// rebuilt HVF context in the child would trigger an `applevisor::Vcpu`
 /// Drop panic ("no VM or vCPU available") during shutdown.
-pub(super) fn forked_child_exit(code: i32, stdout_buf: impl AsRef<[u8]>, stderr_buf: impl AsRef<[u8]>) -> ! {
+pub(super) fn forked_child_exit(
+    code: i32,
+    stdout_buf: impl AsRef<[u8]>,
+    stderr_buf: impl AsRef<[u8]>,
+) -> ! {
     // Publish our total guest CPU so our parent's wait4 can roll it into its
     // child-time totals (cutime/cstime, RUSAGE_CHILDREN) — Linux does this for
     // reaped children, and the child's guest CPU isn't visible in the host

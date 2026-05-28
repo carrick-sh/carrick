@@ -80,6 +80,11 @@ mod carrick_usdt {
     /// else nonzero). Diagnoses why a forked child's alias mapping diverges from
     /// the parent's. Fires only on this path (no hot-path cost).
     fn pt__alias__walk(_: u64, _: u64, _: u64, _: u64, _: u64, _: i32) {}
+    /// Fires from `map_host_alias` right after the stage-2 `hv_vm_map` with the
+    /// alias VA/IPA/size and the raw `hv_return_t` (`rc`: 0 ok). Diagnoses an
+    /// hv_vm_map failure in a forked child (the stage-2 coherence wall) before
+    /// the page-table build is even attempted. `forked` bit: this is a forked child.
+    fn hv__vm__map__alias(_: u64, _: u64, _: u64, _: i32, _: i32) {}
     /// Fires when a signal is published for later delivery. `target_tid` is the
     /// guest tid for a thread-directed signal (tkill/tgkill route) or 0 for a
     /// process-directed one; `signum` the Linux signum; `kind` 1=thread-directed
@@ -403,6 +408,12 @@ pub fn vcpu_fault_regs(esr: u64, elr: u64, far: u64, insn: u64, rn: u32, xrn: u6
 /// forked child, bit1 = the page-table build failed.
 pub fn pt_alias_walk(va: u64, descs: [u64; 4], flag: i32) {
     carrick_usdt::pt__alias__walk!(|| (va, descs[0], descs[1], descs[2], descs[3], flag));
+}
+
+/// Emit the stage-2 `hv_vm_map` result for an alias mapping. See
+/// `hv__vm__map__alias`. Fires right after the call, success or failure.
+pub fn hv_vm_map_alias(va: u64, ipa: u64, size: u64, rc: i32, forked: i32) {
+    carrick_usdt::hv__vm__map__alias!(|| (va, ipa, size, rc, forked));
 }
 
 /// A signal was published for delivery. See `signal__publish`.

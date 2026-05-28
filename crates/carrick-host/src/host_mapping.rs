@@ -5,6 +5,10 @@ pub enum HostMappingKind {
     PrivateAnon,
     SharedAnon,
     ChildPrivateSnapshot,
+    /// A live `MAP_SHARED` mapping of a host file — coherent with the file's
+    /// page cache and shared across `fork(2)`. Backs a guest MAP_SHARED file
+    /// mapping `hv_vm_map`'d at a fresh IPA.
+    SharedFile,
 }
 
 /// RAII owner for host virtual memory that backs a guest HVF mapping.
@@ -19,10 +23,7 @@ pub struct OwnedHostMapping {
 }
 
 impl OwnedHostMapping {
-    pub fn map_shared_anon(
-        len: usize,
-        kind: HostMappingKind,
-    ) -> Result<Self, std::io::Error> {
+    pub fn map_shared_anon(len: usize, kind: HostMappingKind) -> Result<Self, std::io::Error> {
         let host = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -40,6 +41,36 @@ impl OwnedHostMapping {
             )
         };
         Self::from_mmap_result(host, len, kind)
+    }
+
+    /// `MAP_SHARED` a host file region. The resulting mapping is coherent with
+    /// the file's page cache: writes the guest makes are visible to any other
+    /// process that mmaps or reads the file, and survive `fork(2)` because the
+    /// kernel object is the file, not anonymous swap. `fd` need only outlive
+    /// this call — `mmap` retains its own reference — so the caller may close
+    /// (or close a dup of) it immediately after.
+    ///
+    /// `prot` is the guest's requested protection (`PROT_*`) and MUST be a
+    /// subset of the fd's access mode: a `PROT_WRITE` MAP_SHARED mapping of a
+    /// read-only fd is rejected with `EACCES` by the host (matching Linux), so
+    /// the caller must pass the guest's actual prot, not a blanket RW.
+    pub fn map_shared_file(
+        fd: libc::c_int,
+        offset: libc::off_t,
+        len: usize,
+        prot: libc::c_int,
+    ) -> Result<Self, std::io::Error> {
+        let host = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                prot,
+                libc::MAP_SHARED,
+                fd,
+                offset,
+            )
+        };
+        Self::from_mmap_result(host, len, HostMappingKind::SharedFile)
     }
 
     fn from_mmap_result(
@@ -67,7 +98,10 @@ impl OwnedHostMapping {
     }
 
     pub fn guest_shared(&self) -> bool {
-        matches!(self.kind, HostMappingKind::SharedAnon)
+        matches!(
+            self.kind,
+            HostMappingKind::SharedAnon | HostMappingKind::SharedFile
+        )
     }
 }
 

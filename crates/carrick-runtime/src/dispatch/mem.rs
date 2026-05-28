@@ -87,7 +87,12 @@ impl SyscallDispatcher {
 
         if requested != 0 {
             let valid_hint = requested.is_multiple_of(LINUX_PAGE_SIZE)
-                && range_within(requested, length, LINUX_MMAP_BASE, crate::memory::mmap_arena_size());
+                && range_within(
+                    requested,
+                    length,
+                    LINUX_MMAP_BASE,
+                    crate::memory::mmap_arena_size(),
+                );
             if valid_hint {
                 let mut mem = self.mem.lock();
                 let end = requested.checked_add(length)?;
@@ -109,7 +114,12 @@ impl SyscallDispatcher {
             return Some((s, true));
         }
         let address = align_up_u64(mem.mmap_next, LINUX_PAGE_SIZE)?;
-        if !range_within(address, length, LINUX_MMAP_BASE, crate::memory::mmap_arena_size()) {
+        if !range_within(
+            address,
+            length,
+            LINUX_MMAP_BASE,
+            crate::memory::mmap_arena_size(),
+        ) {
             return None;
         }
         mem.mmap_next = address.checked_add(length)?;
@@ -217,11 +227,17 @@ impl SyscallDispatcher {
                 usize::try_from(length).map_err(|_| DispatchError::LengthTooLarge(length))?;
 
             let hvf_page = crate::trap::HVF_PAGE_SIZE;
-            // Guest MAP_SHARED of a file: carve a sub-range out of the
-            // boot-mapped shared aperture, seed it with the file's bytes, and
-            // record a SharedFile backing (owning a dup of the host fd) so
-            // msync(MS_SYNC)/munmap write dirty bytes back. NO post-vCPU
-            // hv_vm_map — the aperture is already stage-2 mapped.
+            // Guest MAP_SHARED of a file: back the guest region with the host
+            // file's page cache LIVE, via an aliased stage-2 mapping at a fresh
+            // high VA. `mmap(MAP_SHARED, fd)` on the host means guest writes hit
+            // the page cache directly — coherent with any other opener (and with
+            // a sibling mapping of the same file) and inherited across fork,
+            // because the backing kernel object is the file, not a snapshot.
+            // This replaces the old aperture-snapshot+msync-writeback model,
+            // which was only coherent at msync/munmap time (the memmap b_*
+            // invariant). The dispatcher reserves the alias IPA and hands the
+            // runtime a MapHostAlias carrying a dup'd fd; the runtime mmaps it
+            // and builds the VA->IPA stage-1 path.
             if flags & LINUX_MAP_ANONYMOUS == 0
                 && map_type == LINUX_MAP_SHARED
                 && flags & LINUX_MAP_FIXED == 0
@@ -241,37 +257,52 @@ impl SyscallDispatcher {
                     }
                 };
                 if let Some(dup_fd) = dup_fd {
+                    // hv_vm_map needs 16 KiB-granular size/IPA; reserve the IPA
+                    // in 2 MiB blocks so no two file mappings share a stage-1
+                    // block (the existing high-VA anon path does the same).
+                    const TWO_MIB: u64 = 1 << 21;
                     let map_len = align_up_u64(length, hvf_page).unwrap_or(length);
-                    let map_len_usize = usize::try_from(map_len)
-                        .map_err(|_| DispatchError::LengthTooLarge(map_len))?;
-                    let addr = {
+                    let alias_len = align_up_u64(length, TWO_MIB).unwrap_or(length);
+                    let ipa = {
                         let mut mem = this.mem.lock();
-                        mem.shared.alloc(
-                            map_len,
-                            crate::shared_aperture::BackingObject::SharedFile {
-                                host_fd: dup_fd,
-                                offset,
-                            },
-                        )
+                        let base = mem.alias_ipa_next;
+                        let limit = crate::memory::LINUX_ALIAS_IPA_BASE
+                            + crate::memory::LINUX_ALIAS_IPA_SIZE;
+                        match base.checked_add(alias_len).filter(|e| *e <= limit) {
+                            Some(end) => {
+                                mem.alias_ipa_next = end;
+                                Some(base)
+                            }
+                            None => None,
+                        }
                     };
-                    if let Some(addr) = addr {
-                        // Seed the aperture sub-range with the file's bytes; a
-                        // short read leaves the tail zero (BSS-like).
-                        let mut bytes = vec![0u8; map_len_usize];
-                        let n = unsafe {
-                            libc::pread(
-                                dup_fd,
-                                bytes.as_mut_ptr() as *mut _,
-                                map_len_usize,
-                                offset as libc::off_t,
-                            )
-                        };
-                        let _ = n;
-                        let _ = memory.write_bytes(addr, &bytes);
-                        return Ok(DispatchOutcome::Returned { value: addr as i64 });
+                    let Some(ipa) = ipa else {
+                        // Alias arena exhausted: drop the dup, surface ENOMEM.
+                        unsafe { libc::close(dup_fd) };
+                        return Ok(LINUX_ENOMEM.into());
+                    };
+                    let va = crate::memory::LINUX_HIGH_VA_THRESHOLD
+                        + (ipa - crate::memory::LINUX_ALIAS_IPA_BASE);
+                    // Host mmap prot MUST match the guest's request (and thus the
+                    // fd's access mode): MAP_SHARED|PROT_WRITE of a read-only fd
+                    // is EACCES. Translate the guest PROT_* bits to host PROT_*.
+                    let mut host_prot = 0;
+                    if prot & LINUX_PROT_READ != 0 {
+                        host_prot |= libc::PROT_READ;
                     }
-                    // Window exhausted: drop the dup and fall through to private.
-                    unsafe { libc::close(dup_fd) };
+                    if prot & LINUX_PROT_WRITE != 0 {
+                        host_prot |= libc::PROT_WRITE;
+                    }
+                    if prot & LINUX_PROT_EXEC != 0 {
+                        host_prot |= libc::PROT_EXEC;
+                    }
+                    return Ok(DispatchOutcome::MapHostAlias {
+                        va,
+                        ipa,
+                        len: map_len,
+                        payload: Vec::new(),
+                        file: Some((dup_fd, offset as libc::off_t, host_prot)),
+                    });
                 }
             }
 
@@ -400,6 +431,7 @@ impl SyscallDispatcher {
                     ipa,
                     len: alias_len,
                     payload: bytes,
+                    file: None,
                 });
             }
 

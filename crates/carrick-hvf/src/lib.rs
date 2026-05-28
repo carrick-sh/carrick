@@ -24,8 +24,8 @@
 // modules' `crate::linux_abi::…` / `crate::memory::…` / `crate::host_mapping::…`
 // paths resolve unchanged inside carrick-hvf.
 pub use carrick_abi as linux_abi;
-pub use carrick_mem::{elf, memory, page_table, vdso};
 pub use carrick_host::{guest_cpu, host_facts, host_mapping, host_proc, ulock};
+pub use carrick_mem::{elf, memory, page_table, vdso};
 
 pub mod compat;
 #[cfg(target_os = "macos")]

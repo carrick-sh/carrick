@@ -548,11 +548,17 @@ fn seccomp_filter_blocks_the_targeted_syscall_with_errno() {
     write_insn(&mut memory, 0x4038, BPF_RET_K, 0, 0, SECCOMP_RET_ALLOW);
     // struct sock_fprog @0x4000: len=4 @0, filter ptr=0x4020 @8.
     memory.write_bytes(0x4000, &4u16.to_ne_bytes()).unwrap();
-    memory.write_bytes(0x4008, &0x4020u64.to_ne_bytes()).unwrap();
+    memory
+        .write_bytes(0x4008, &0x4020u64.to_ne_bytes())
+        .unwrap();
 
     let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
-        d.dispatch(SyscallRequest::new(nr, SyscallArgs::from(args)), m, &reporter)
-            .unwrap()
+        d.dispatch(
+            SyscallRequest::new(nr, SyscallArgs::from(args)),
+            m,
+            &reporter,
+        )
+        .unwrap()
     };
 
     // getpid before the filter is installed -> a real pid.

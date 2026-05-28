@@ -175,10 +175,12 @@ pub trait FsBackend: Send + Sync {
     /// makes apt's "child writes a temp file / pipe, parent reads it"
     /// verification patterns work under `--fs host`.
     ///
-    /// `write` -> O_RDWR (else O_RDONLY); `create` -> +O_CREAT;
+    /// `write` -> guest requested write access; `create` -> +O_CREAT;
     /// `trunc` -> +O_TRUNC. Returns the raw fd (caller owns it, must
-    /// close it). `MemoryBackend` returns None: an in-memory HashMap
-    /// has no kernel fd and cannot be shared across a real fork, so
+    /// close it). A disk backend may internally open read-only guest fds
+    /// with broader host access when safe; the dispatcher separately tracks
+    /// guest-visible writability. `MemoryBackend` returns None: an in-memory
+    /// HashMap has no kernel fd and cannot be shared across a real fork, so
     /// the dispatcher keeps its in-memory File model there.
     fn open_raw_fd(&self, path: &str, write: bool, create: bool, trunc: bool) -> Option<i32>;
 
@@ -659,7 +661,10 @@ impl HostFsBackend {
         // (the production path); tests using `from_existing_dir` have no path to
         // anchor the cache against and fall straight through.
         if let Some(scratch) = self._scratch.as_ref().map(|t| t.path().to_path_buf())
-            && matches!(crate::layer_cache::try_seed_scratch(paths, &scratch), Ok(true))
+            && matches!(
+                crate::layer_cache::try_seed_scratch(paths, &scratch),
+                Ok(true)
+            )
         {
             // The clone reproduces the same on-disk tree a direct extraction
             // would; per-file ExtractStats aren't recovered for a cache hit.
@@ -1197,13 +1202,25 @@ impl FsBackend for HostFsBackend {
             self.dir.create_dir_all(parent).ok()?;
         }
         let mut opts = cap_std::fs::OpenOptions::new();
+        opts.read(true);
         if write {
-            opts.read(true).write(true);
-        } else {
-            opts.read(true);
+            opts.write(true);
         }
         opts.create(create).truncate(trunc);
-        let file = self.dir.open_with(rel, &opts).ok()?;
+        let file = if !write && !trunc && !create {
+            // HVF rejects hv_vm_map of a MAP_SHARED file VMA whose backing fd
+            // only allows read max-protection. Prefer an O_RDWR host fd for
+            // Carrick-owned scratch files, while still recording guest
+            // writability separately in OpenDescription::HostFile.
+            let mut rw_opts = cap_std::fs::OpenOptions::new();
+            rw_opts.read(true).write(true);
+            self.dir
+                .open_with(rel, &rw_opts)
+                .or_else(|_| self.dir.open_with(rel, &opts))
+                .ok()?
+        } else {
+            self.dir.open_with(rel, &opts).ok()?
+        };
         // Hand the kernel fd to the caller. `into_raw_fd` consumes the
         // cap-std File without closing it, so the dispatcher owns the
         // fd lifetime (it closes it on guest close()).
@@ -1949,6 +1966,20 @@ mod tests {
         let fd = b.open_raw_fd("/g", true, true, true).expect("open_raw_fd");
         b.set_mode("/g", 0o041).unwrap();
         assert_eq!(fget_mode_xattr(fd), Some(0o041), "fstat-side xattr read");
+        unsafe { libc::close(fd) };
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_readonly_open_prefers_writable_host_fd() {
+        let (b, _scratch) = host_backend();
+        b.set_file_contents("/g", b"hvf maxprot\n".to_vec())
+            .unwrap();
+        let fd = b
+            .open_raw_fd("/g", false, false, false)
+            .expect("open_raw_fd");
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert_eq!(flags & libc::O_ACCMODE, libc::O_RDWR);
         unsafe { libc::close(fd) };
     }
 

@@ -153,7 +153,11 @@ pub(crate) fn eval_filter(prog: &[SockFilter], data: &SeccompData) -> u32 {
                     BPF_JSET => acc & rhs != 0,
                     _ => return SECCOMP_RET_KILL_PROCESS,
                 };
-                pc += if taken { ins.jt as usize } else { ins.jf as usize };
+                pc += if taken {
+                    ins.jt as usize
+                } else {
+                    ins.jf as usize
+                };
             }
             BPF_RET => {
                 return if ins.code & BPF_RVAL == BPF_A {
@@ -231,10 +235,30 @@ mod tests {
     ///   RET ALLOW
     fn deny_nr_filter(deny_nr: u32, errno: u32) -> Vec<SockFilter> {
         vec![
-            SockFilter { code: BPF_LD | 0x20, jt: 0, jf: 0, k: 0 }, // LD|W|ABS [0] (nr)
-            SockFilter { code: BPF_JMP | BPF_JEQ, jt: 0, jf: 1, k: deny_nr },
-            SockFilter { code: BPF_RET, jt: 0, jf: 0, k: SECCOMP_RET_ERRNO | errno },
-            SockFilter { code: BPF_RET, jt: 0, jf: 0, k: SECCOMP_RET_ALLOW },
+            SockFilter {
+                code: BPF_LD | 0x20,
+                jt: 0,
+                jf: 0,
+                k: 0,
+            }, // LD|W|ABS [0] (nr)
+            SockFilter {
+                code: BPF_JMP | BPF_JEQ,
+                jt: 0,
+                jf: 1,
+                k: deny_nr,
+            },
+            SockFilter {
+                code: BPF_RET,
+                jt: 0,
+                jf: 0,
+                k: SECCOMP_RET_ERRNO | errno,
+            },
+            SockFilter {
+                code: BPF_RET,
+                jt: 0,
+                jf: 0,
+                k: SECCOMP_RET_ALLOW,
+            },
         ]
     }
 
@@ -262,17 +286,55 @@ mod tests {
         // LD [4] (arch); JEQ AARCH64 ? continue : kill; LD [16] (arg0);
         // JSET 0x1 ? RET ERRNO : RET ALLOW  — deny odd arg0.
         let prog = vec![
-            SockFilter { code: BPF_LD | 0x20, jt: 0, jf: 0, k: 4 },
-            SockFilter { code: BPF_JMP | BPF_JEQ, jt: 1, jf: 0, k: AUDIT_ARCH_AARCH64 },
-            SockFilter { code: BPF_RET, jt: 0, jf: 0, k: SECCOMP_RET_KILL_PROCESS },
-            SockFilter { code: BPF_LD | 0x20, jt: 0, jf: 0, k: 16 },
-            SockFilter { code: BPF_JMP | BPF_JSET, jt: 0, jf: 1, k: 0x1 },
-            SockFilter { code: BPF_RET, jt: 0, jf: 0, k: SECCOMP_RET_ERRNO | 13 },
-            SockFilter { code: BPF_RET, jt: 0, jf: 0, k: SECCOMP_RET_ALLOW },
+            SockFilter {
+                code: BPF_LD | 0x20,
+                jt: 0,
+                jf: 0,
+                k: 4,
+            },
+            SockFilter {
+                code: BPF_JMP | BPF_JEQ,
+                jt: 1,
+                jf: 0,
+                k: AUDIT_ARCH_AARCH64,
+            },
+            SockFilter {
+                code: BPF_RET,
+                jt: 0,
+                jf: 0,
+                k: SECCOMP_RET_KILL_PROCESS,
+            },
+            SockFilter {
+                code: BPF_LD | 0x20,
+                jt: 0,
+                jf: 0,
+                k: 16,
+            },
+            SockFilter {
+                code: BPF_JMP | BPF_JSET,
+                jt: 0,
+                jf: 1,
+                k: 0x1,
+            },
+            SockFilter {
+                code: BPF_RET,
+                jt: 0,
+                jf: 0,
+                k: SECCOMP_RET_ERRNO | 13,
+            },
+            SockFilter {
+                code: BPF_RET,
+                jt: 0,
+                jf: 0,
+                k: SECCOMP_RET_ALLOW,
+            },
         ];
         let mut odd = data_for(63);
         odd.args[0] = 0x3;
-        assert_eq!(eval_filter(&prog, &odd) & SECCOMP_RET_ACTION_FULL, SECCOMP_RET_ERRNO);
+        assert_eq!(
+            eval_filter(&prog, &odd) & SECCOMP_RET_ACTION_FULL,
+            SECCOMP_RET_ERRNO
+        );
         let mut even = data_for(63);
         even.args[0] = 0x2;
         assert_eq!(eval_filter(&prog, &even), SECCOMP_RET_ALLOW);
@@ -281,7 +343,12 @@ mod tests {
     #[test]
     fn malformed_or_runaway_filter_fails_closed() {
         // No RET reached (runs off the end) -> KILL.
-        let prog = vec![SockFilter { code: BPF_LD | 0x20, jt: 0, jf: 0, k: 0 }];
+        let prog = vec![SockFilter {
+            code: BPF_LD | 0x20,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        }];
         assert_eq!(eval_filter(&prog, &data_for(1)), SECCOMP_RET_KILL_PROCESS);
         assert!(SockFilter::parse_program(&[0u8; 7]).is_none());
         assert!(SockFilter::parse_program(&[0u8; 8]).is_some());
@@ -296,8 +363,14 @@ mod tests {
         state.install(deny_nr_filter(202, 1));
         assert!(state.is_active());
         // 101 denied by the first filter, allowed by the second -> ERRNO wins.
-        assert_eq!(state.check(&data_for(101)) & SECCOMP_RET_ACTION_FULL, SECCOMP_RET_ERRNO);
-        assert_eq!(state.check(&data_for(202)) & SECCOMP_RET_ACTION_FULL, SECCOMP_RET_ERRNO);
+        assert_eq!(
+            state.check(&data_for(101)) & SECCOMP_RET_ACTION_FULL,
+            SECCOMP_RET_ERRNO
+        );
+        assert_eq!(
+            state.check(&data_for(202)) & SECCOMP_RET_ACTION_FULL,
+            SECCOMP_RET_ERRNO
+        );
         assert_eq!(state.check(&data_for(63)), SECCOMP_RET_ALLOW);
     }
 }
