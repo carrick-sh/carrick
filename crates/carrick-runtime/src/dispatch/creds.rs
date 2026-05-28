@@ -144,6 +144,9 @@ impl SyscallDispatcher {
             if s as i64 != -1 {
                 creds.suid = s as u32;
             }
+            let new_euid = creds.euid;
+            drop(creds);
+            crate::cred_ipc::publish_self(new_euid);
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
@@ -169,6 +172,9 @@ impl SyscallDispatcher {
             if e as i64 != -1 {
                 creds.euid = e as u32;
             }
+            let new_euid = creds.euid;
+            drop(creds);
+            crate::cred_ipc::publish_self(new_euid);
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
@@ -189,6 +195,8 @@ impl SyscallDispatcher {
             creds.ruid = u;
             creds.euid = u;
             creds.suid = u;
+            drop(creds);
+            crate::cred_ipc::publish_self(u);
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
