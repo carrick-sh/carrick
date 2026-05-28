@@ -664,6 +664,15 @@ pub enum DispatchOutcome {
         pid: i32,
         block_signals: u64,
     },
+    /// `rt_sigtimedwait` found no matching signal already pending and must wait
+    /// until one of `wait_set` arrives, or until `timeout` elapses. The runtime
+    /// parks without holding dispatcher locks, wakes only for matching signals,
+    /// then re-dispatches the same syscall so the dispatcher can dequeue the
+    /// signal and write `siginfo_t` through the original guest pointer.
+    WaitOnSignals {
+        wait_set: u64,
+        timeout: Option<Duration>,
+    },
 }
 
 impl DispatchOutcome {
@@ -694,6 +703,7 @@ impl DispatchOutcome {
             DispatchOutcome::WaitOnFds { .. } => (0, None),
             DispatchOutcome::WaitOnPollFds { .. } => (0, None),
             DispatchOutcome::WaitOnProcExit { .. } => (0, None),
+            DispatchOutcome::WaitOnSignals { .. } => (0, None),
         }
     }
 }
