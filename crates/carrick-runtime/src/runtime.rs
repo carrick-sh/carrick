@@ -677,11 +677,26 @@ where
                 runtime.complete_syscall(va as i64)?;
                 last_syscall_retval = Some(va as i64);
             }
+            DispatchOutcome::SharedFutexWait {
+                host_addr,
+                value,
+                timeout,
+            } => {
+                // A cross-process MAP_SHARED futex (e.g. /dev/shm-backed
+                // LTP tst_checkpoint) goes through __ulock so a waker in
+                // another carrick process is reached. Single-threaded
+                // guests (like LTP test binaries) hit this path too; the
+                // legacy `dispatch_threaded`-only short-circuit was the
+                // root cause of LTP pause01 TBROKing on
+                // `tst_checkpoint_wake ETIMEDOUT`.
+                let retval = shared_futex_wait(host_addr, value, timeout, this_tid);
+                runtime.complete_syscall(retval)?;
+                last_syscall_retval = Some(retval);
+            }
             DispatchOutcome::CloneThread { .. }
             | DispatchOutcome::ThreadExit { .. }
             | DispatchOutcome::SignalThread { .. }
-            | DispatchOutcome::FutexWait { .. }
-            | DispatchOutcome::SharedFutexWait { .. } => {
+            | DispatchOutcome::FutexWait { .. } => {
                 // These are emitted only on the multi-threaded
                 // `dispatch_threaded` path (run_vcpu_until_exit). The
                 // single-threaded loops here always pass `thread: None`, so
