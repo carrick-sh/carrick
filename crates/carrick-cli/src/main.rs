@@ -59,6 +59,13 @@ fn configure_process_environment() {
         libc::setenv(key.as_ptr(), val.as_ptr(), 1);
     }
 
+    // Relocate `environ` onto the heap so the contiguous argv/env stack
+    // bytes become a wider writable buffer for `set_host_process_name`.
+    // Must run AFTER the OS_ACTIVITY_MODE setenv above — libc's setenv
+    // may realloc the environ array, which would invalidate the heap
+    // pointer we just installed (Postgres has the same caveat).
+    carrick_runtime::dispatch::proctitle_init();
+
     install_guest_abort_banner();
 
     tracing_subscriber::fmt()
