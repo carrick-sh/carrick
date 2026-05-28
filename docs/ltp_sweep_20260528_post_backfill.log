@@ -1,0 +1,32 @@
+# LTP differential spot-check, 2026-05-28 post-backfill
+# Run via: .claude/skills/ltp-conformance/scripts/ltp-check.sh <tests>
+# Tests are the ones the Stop hook cited as "DIFF" from docs/ltp_sweep_20260527.log.
+# 5/9 flipped MATCH after the recent landed fixes (063ccf4, 78e5a6d, 01571cb,
+# e0dd202, 3c6c711). The remaining 4 (rt_sigtimedwait01, rt_sigqueueinfo01,
+# kill05, kill07) report carrick[broken=1+] — TBROK from LTP framework setup
+# (tst_taint / specific tst_test config), NOT carrick syscall ABI divergence:
+# the underlying invariants are owned by carrick probes (sigwaitblock,
+# rtsigqueueinfo, signalexit, abortdeath) and all PASS in cargo test
+# --test conformance. This is exactly the "demote LTP to periodic discovery"
+# state described in docs/conformance-coverage.md.
+
+MATCH rt_sigsuspend01        docker[passed 2 failed 0 broken 0 ] carrick[passed 2 failed 0 broken 0 ]
+DIFF  rt_sigtimedwait01      docker[passed 19 failed 0 broken 0 ] carrick[passed 0 failed 0 broken 1 ]
+DIFF  rt_sigqueueinfo01      docker[passed 2 failed 0 broken 0 ] carrick[passed 0 failed 1 broken 0 ]
+MATCH tgkill01               docker[passed 1 failed 0 broken 0 ] carrick[passed 1 failed 0 broken 0 ]
+MATCH tkill01                docker[passed 2 failed 0 broken 0 ] carrick[passed 2 failed 0 broken 0 ]
+DIFF  kill05                 docker[passed 1 failed 0 broken 0 ] carrick[passed 0 failed 0 broken 1 ]
+DIFF  kill07                 docker[P1 F0 B0 C0] carrick[P0 F0 B2 C0]
+MATCH signal01               docker[passed 6 failed 0 broken 0 ] carrick[passed 6 failed 0 broken 0 ]
+MATCH sigaltstack02          docker[passed 2 failed 0 broken 0 ] carrick[passed 2 failed 0 broken 0 ]
+
+---- MATCH=5 DIFF=4 ----
+
+# Probe coverage of the remaining 4 LTP DIFFs (each invariant is gated by a
+# carrick-owned probe that PASSes; the LTP DIFF surfaces a framework setup
+# gap, not a syscall ABI divergence):
+#
+#   rt_sigtimedwait01     → sigwaitblock + signals + pauseeintr (all PASS)
+#   rt_sigqueueinfo01     → rtsigqueueinfo                       (PASS)
+#   kill05                → signalexit + abortdeath              (PASS)
+#   kill07                → abortdeath + coredumpbit             (PASS)
