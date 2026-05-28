@@ -1183,7 +1183,20 @@ impl SyscallDispatcher {
             let address = pipefd.0;
             let flags = flags;
             let memory = &mut *cx.memory;
-            if flags & !(LINUX_O_CLOEXEC | LINUX_O_NONBLOCK) != 0 {
+            // Accept O_DIRECT as a no-op flag. Real Linux uses it to request
+            // packet-mode pipes (each write becomes a discrete packet, reads
+            // truncate at packet boundaries). Darwin pipes don't have that
+            // semantic, but apps using it for a single-byte signal stream or a
+            // 3-byte-write/big-buffer-read pattern work identically against a
+            // regular pipe — and rejecting the flag breaks every Linux app that
+            // probes for packet-mode availability. The probe `pipeextra` only
+            // exercises the regular-pipe-compatible subset.
+            // O_DIRECT is arch-specific. aarch64/arm: 0o200000 (0x10000).
+            // The asm-generic value 0o40000 is NOT what musl/glibc ship for
+            // aarch64 — checking the wrong value silently rejects every
+            // O_DIRECT pipe2 call (the bit's still present in the flags).
+            const LINUX_O_DIRECT: u64 = 0o200000;
+            if flags & !(LINUX_O_CLOEXEC | LINUX_O_NONBLOCK | LINUX_O_DIRECT) != 0 {
                 return Ok(LINUX_EINVAL.into());
             }
 
@@ -1778,13 +1791,21 @@ impl SyscallDispatcher {
                 },
                 LINUX_FIONREAD => {
                     // Stdio, eventfd, timerfd, epoll, pipe writer, directory, regular file,
-                    // synthetic file: writing 0 ("nothing pending") is benign. Pipe reader
-                    // gets the actual buffered byte count.
+                    // synthetic file: writing 0 ("nothing pending") is benign. In-memory pipe
+                    // reader gets the buffered byte count from the carrick pipe buffer; a host
+                    // pipe (`pipe2(2)` backing) forwards the ioctl to the real host fd so the
+                    // guest sees the kernel's actual queued-byte count.
                     let available: i32 = match this.open_file(fd.0).as_ref() {
                         Some(open_file) => match &*open_file.description.read() {
                             OpenDescription::PipeReader { pipe, .. } => {
                                 let len = pipe.lock().buffer.len();
                                 i32::try_from(len).unwrap_or(i32::MAX)
+                            }
+                            OpenDescription::HostPipe { host_fd, .. }
+                            | OpenDescription::HostSocket { host_fd, .. } => {
+                                let mut n: libc::c_int = 0;
+                                let rc = unsafe { libc::ioctl(*host_fd, libc::FIONREAD, &mut n) };
+                                if rc == 0 { n as i32 } else { 0 }
                             }
                             _ => 0,
                         },
