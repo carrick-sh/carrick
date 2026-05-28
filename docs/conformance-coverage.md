@@ -102,10 +102,10 @@ underlying gap got fixed):
 | epoll readiness/edge/level events | ✅ `pollevent`, `netpoll` | epoll_wait01/04, eventfd01/02/03 |
 | eventfd read/write/poll + semaphore mode | ✅ `pollevent` | eventfd01–06, eventfd2_* |
 | pipe create/rw/O_NONBLOCK/F_GETPIPE_SZ | ✅ `splicepipe`, `fdio` | pipe01/03/05/06/09/10/11/14 |
+| **select/pselect timeout & wakeup: bare-timeout rc==0, ready-pipe rc==1 with bit set, not-ready rc==0; pselect sigmask blocks→signal stays pending and times out; sigmask=NULL→alarm interrupts with EINTR** | ✅ `selecttimeout` | select01, select02, select03, pselect02 |
 
 ### epoll/poll/select — backlog
 - ⬜ `epoll_ctl05` EPOLLEXCLUSIVE; `epoll_wait05/06/07`, `epoll_pwait01/02/05`.
-- ⬜ `select01/02/03` (TIMEOUT — select-with-timeout wait path), `pselect02`.
 - ⬜ `pipe07/08/12/13`, `pipe2_*`.
 
 ## fs / metadata / dir
