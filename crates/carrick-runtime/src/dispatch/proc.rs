@@ -874,6 +874,44 @@ impl SyscallDispatcher {
                         timeout,
                     }
                 }
+                LINUX_FUTEX_REQUEUE | LINUX_FUTEX_CMP_REQUEUE => {
+                    // Mirror the multi-threaded path (dispatch/mod.rs): arg3 is
+                    // nr_requeue, arg4 uaddr2, arg5 val3. See that handler for
+                    // the full rationale on how requeue composes with the
+                    // parking-lot generation/token model.
+                    let nr_wake = value;
+                    if (args.0[2] as i32) < 0 || (args.0[3] as i32) < 0 {
+                        return Ok(LINUX_EINVAL.into());
+                    }
+                    let nr_requeue = args.0[3] as u32;
+                    let uaddr2 = args.0[4];
+                    let val3 = args.0[5] as u32;
+                    if raw_command == LINUX_FUTEX_CMP_REQUEUE && word != val3 {
+                        return Ok(LINUX_EAGAIN.into());
+                    }
+                    if let Some(host_addr) = shared_host_addr {
+                        // Shared path: no native requeue → wake nr_wake+nr_requeue
+                        // (correct per the spurious-wake-tolerant futex contract).
+                        let total = (nr_wake as u64).saturating_add(nr_requeue as u64);
+                        let mut woke = 0i64;
+                        let mut i = 0u64;
+                        while i < total {
+                            let rc = crate::ulock::wake(host_addr, false);
+                            if rc < 0 {
+                                break;
+                            }
+                            woke += 1;
+                            unsafe { libc::sched_yield() };
+                            i += 1;
+                        }
+                        return Ok(DispatchOutcome::Returned { value: woke });
+                    }
+                    let (woken, requeued) =
+                        thread.futex.requeue(address.0, uaddr2, nr_wake, nr_requeue);
+                    DispatchOutcome::Returned {
+                        value: i64::from(woken + requeued),
+                    }
+                }
                 _ => DispatchOutcome::errno(LINUX_ENOSYS),
             })
         }
