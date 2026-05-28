@@ -2,6 +2,11 @@
 //! `super` for the dispatcher struct and the normalized dispatch table.
 use super::*;
 
+/// Process I/O priority stored by `ioprio_set` and echoed by `ioprio_get`.
+/// carrick has no real I/O scheduler; default is IOPRIO_CLASS_BE(2) level 4 =
+/// (2<<13)|4, what the kernel reports for a process that never set one.
+static IOPRIO_VALUE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new((2 << 13) | 4);
+
 /// Linux SCHED_* policy values (kernel ABI, not the libc-internal names).
 const LINUX_SCHED_OTHER: i32 = 0; // a.k.a. SCHED_NORMAL
 const LINUX_SCHED_FIFO: i32 = 1;
@@ -579,6 +584,69 @@ impl SyscallDispatcher {
         fn set_robust_list(this, cx, head: GuestPtr, len: u64) {
             if len == 0 {
                 return Ok(LINUX_EINVAL.into());
+            }
+            Ok(DispatchOutcome::Returned { value: 0 })
+        }
+
+        /// ioprio_set(which, who, ioprio): set the I/O scheduling priority.
+        /// carrick has no real I/O scheduler, so this stores a per-process
+        /// value that ioprio_get echoes back. Validates `which` ∈ {PROCESS,
+        /// PGRP, USER} and the class/data per Linux (LTP ioprio_set02 checks
+        /// the EINVAL edges). `who == 0` means the calling process.
+        fn ioprio_set(this, cx, which: u64, _who: u64, ioprio: u64) {
+            const PROCESS: u64 = 1;
+            const PGRP: u64 = 2;
+            const USER: u64 = 3;
+            if !matches!(which, PROCESS | PGRP | USER) {
+                return Ok(LINUX_EINVAL.into());
+            }
+            let v = ioprio as u32;
+            let class = v >> 13;
+            let data = v & 0x1fff;
+            // Classes: 0=NONE 1=RT 2=BE 3=IDLE (kernel ioprio.c set_task_ioprio).
+            // NONE is valid only with level 0 (resets to default), else EINVAL;
+            // IDLE ignores the level; RT/BE carry a 0..7 level.
+            match class {
+                0 => {
+                    if data != 0 {
+                        return Ok(LINUX_EINVAL.into());
+                    }
+                }
+                3 => {} // IDLE: data ignored
+                1 | 2 => {
+                    if data >= 8 {
+                        return Ok(LINUX_EINVAL.into());
+                    }
+                }
+                _ => return Ok(LINUX_EINVAL.into()),
+            }
+            IOPRIO_VALUE.store(v, std::sync::atomic::Ordering::SeqCst);
+            Ok(DispatchOutcome::Returned { value: 0 })
+        }
+
+        /// ioprio_get(which, who): return the stored I/O priority. Default is
+        /// IOPRIO_CLASS_BE (2) level 4 — what the kernel reports for a process
+        /// that never set one (LTP ioprio_get01 only checks the class is in
+        /// range).
+        fn ioprio_get(this, cx, which: u64, _who: u64) {
+            const PROCESS: u64 = 1;
+            const PGRP: u64 = 2;
+            const USER: u64 = 3;
+            if !matches!(which, PROCESS | PGRP | USER) {
+                return Ok(LINUX_EINVAL.into());
+            }
+            let v = IOPRIO_VALUE.load(std::sync::atomic::Ordering::SeqCst);
+            Ok(DispatchOutcome::Returned { value: v as i64 })
+        }
+
+        /// vhangup(): "virtually hang up" the current tty. Requires
+        /// CAP_SYS_TTY_CONFIG, which carrick models as euid==0 — so a non-root
+        /// caller gets EPERM (LTP vhangup01) and root succeeds (vhangup02).
+        /// carrick has no real controlling tty to revoke, so success is a
+        /// no-op.
+        fn vhangup(this, cx) {
+            if this.creds.lock().euid != 0 {
+                return Ok(LINUX_EPERM.into());
             }
             Ok(DispatchOutcome::Returned { value: 0 })
         }
