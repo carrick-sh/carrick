@@ -1,0 +1,50 @@
+/Volumes/CaseSensitive/carrick/.claude/skills/ltp-conformance/scripts/ltp-check.sh: line 35: 75050 Killed: 9               timeout 40 "$CARRICK" run "$IMAGE" --raw --fs host /bin/sh -c "/opt/ltp/testcases/bin/$t" > /tmp/ltpck_c.out 2>&1
+/Volumes/CaseSensitive/carrick/.claude/skills/ltp-conformance/scripts/ltp-check.sh: line 35: 75426 Killed: 9               timeout 40 "$CARRICK" run "$IMAGE" --raw --fs host /bin/sh -c "/opt/ltp/testcases/bin/$t" > /tmp/ltpck_c.out 2>&1
+/Volumes/CaseSensitive/carrick/.claude/skills/ltp-conformance/scripts/ltp-check.sh: line 35: 75576 Killed: 9               timeout 40 "$CARRICK" run "$IMAGE" --raw --fs host /bin/sh -c "/opt/ltp/testcases/bin/$t" > /tmp/ltpck_c.out 2>&1
+/Volumes/CaseSensitive/carrick/.claude/skills/ltp-conformance/scripts/ltp-check.sh: line 35: 75708 Killed: 9               timeout 40 "$CARRICK" run "$IMAGE" --raw --fs host /bin/sh -c "/opt/ltp/testcases/bin/$t" > /tmp/ltpck_c.out 2>&1
+/Volumes/CaseSensitive/carrick/.claude/skills/ltp-conformance/scripts/ltp-check.sh: line 35: 75960 Killed: 9               timeout 40 "$CARRICK" run "$IMAGE" --raw --fs host /bin/sh -c "/opt/ltp/testcases/bin/$t" > /tmp/ltpck_c.out 2>&1
+/Volumes/CaseSensitive/carrick/.claude/skills/ltp-conformance/scripts/ltp-check.sh: line 35: 76066 Killed: 9               timeout 40 "$CARRICK" run "$IMAGE" --raw --fs host /bin/sh -c "/opt/ltp/testcases/bin/$t" > /tmp/ltpck_c.out 2>&1
+/Volumes/CaseSensitive/carrick/.claude/skills/ltp-conformance/scripts/ltp-check.sh: line 35: 76400 Killed: 9               timeout 40 "$CARRICK" run "$IMAGE" --raw --fs host /bin/sh -c "/opt/ltp/testcases/bin/$t" > /tmp/ltpck_c.out 2>&1
+/Volumes/CaseSensitive/carrick/.claude/skills/ltp-conformance/scripts/ltp-check.sh: line 35: 76818 Killed: 9               timeout 40 "$CARRICK" run "$IMAGE" --raw --fs host /bin/sh -c "/opt/ltp/testcases/bin/$t" > /tmp/ltpck_c.out 2>&1
+/Volumes/CaseSensitive/carrick/.claude/skills/ltp-conformance/scripts/ltp-check.sh: line 35: 77202 Killed: 9               timeout 40 "$CARRICK" run "$IMAGE" --raw --fs host /bin/sh -c "/opt/ltp/testcases/bin/$t" > /tmp/ltpck_c.out 2>&1
+/Volumes/CaseSensitive/carrick/.claude/skills/ltp-conformance/scripts/ltp-check.sh: line 35: 77265 Killed: 9               timeout 40 "$CARRICK" run "$IMAGE" --raw --fs host /bin/sh -c "/opt/ltp/testcases/bin/$t" > /tmp/ltpck_c.out 2>&1
+MATCH sched_getaffinity01    docker[passed 4 failed 0 broken 0 ] carrick[passed 4 failed 0 broken 0 ]
+MATCH sched_setaffinity01    docker[passed 4 failed 0 broken 0 ] carrick[passed 4 failed 0 broken 0 ]
+MATCH sched_yield01          docker[P1 F0 B0 C0] carrick[P1 F0 B0 C0]
+DIFF  gettid01               docker[passed 2 failed 0 broken 0 ] carrick[passed 1 failed 1 broken 0 ]
+MATCH gettid02               docker[passed 11 failed 0 broken 0 ] carrick[passed 11 failed 0 broken 0 ]
+MATCH getcpu01               docker[passed 1 failed 0 broken 0 ] carrick[passed 1 failed 0 broken 0 ]
+DIFF  getcpu02               docker[passed 2 failed 0 broken 0 ] carrick[]
+MATCH futex_wait01           docker[passed 4 failed 0 broken 0 ] carrick[passed 4 failed 0 broken 0 ]
+MATCH futex_wait02           docker[passed 1 failed 0 broken 0 ] carrick[passed 1 failed 0 broken 0 ]
+MATCH futex_wait03           docker[passed 1 failed 0 broken 0 ] carrick[passed 1 failed 0 broken 0 ]
+DIFF  futex_wait04           docker[passed 1 failed 0 broken 0 ] carrick[]
+DIFF  futex_wait05           docker[passed 5 failed 2 broken 0 ] carrick[]
+MATCH futex_wake01           docker[passed 6 failed 0 broken 0 ] carrick[passed 6 failed 0 broken 0 ]
+MATCH futex_wake02           docker[passed 11 failed 0 broken 0 ] carrick[passed 11 failed 0 broken 0 ]
+DIFF  futex_wake03           docker[passed 11 failed 0 broken 0 ] carrick[]
+DIFF  futex_wake04           docker[P0 F0 B1 C0] carrick[P0 F0 B0 C1]
+DIFF  futex_cmp_requeue01    docker[passed 7 failed 0 broken 0 ] carrick[passed 0 failed 0 broken 0 ]
+DIFF  futex_wait_bitset01    docker[passed 2 failed 0 broken 0 ] carrick[passed 1 failed 1 broken 0 ]
+MATCH clone01                docker[passed 2 failed 0 broken 0 ] carrick[passed 2 failed 0 broken 0 ]
+MATCH clone02                docker[P2 F0 B0 C0] carrick[P2 F0 B0 C0]
+MATCH clone03                docker[passed 1 failed 0 broken 0 ] carrick[passed 1 failed 0 broken 0 ]
+MATCH clone04                docker[passed 1 failed 0 broken 0 ] carrick[passed 1 failed 0 broken 0 ]
+DIFF  clone05                docker[passed 1 failed 0 broken 0 ] carrick[passed 0 failed 1 broken 0 ]
+MATCH clone06                docker[passed 1 failed 0 broken 0 ] carrick[passed 1 failed 0 broken 0 ]
+DIFF  clone07                docker[passed 1 failed 0 broken 0 ] carrick[]
+DIFF  clone08                docker[passed 5 failed 0 broken 0 ] carrick[passed 0 failed 1 broken 1 ]
+MATCH clone09                docker[passed 0 failed 0 broken 1 ] carrick[passed 0 failed 0 broken 1 ]
+DIFF  clone301               docker[passed 0 failed 0 broken 0 ] carrick[passed 5 failed 2 broken 0 ]
+DIFF  clone302               docker[passed 1 failed 0 broken 0 ] carrick[]
+DIFF  clone303               docker[passed 0 failed 0 broken 0 ] carrick[passed 0 failed 0 broken 1 ]
+MATCH set_tid_address01      docker[P1 F0 B0 C0] carrick[P1 F0 B0 C0]
+MATCH sched_get_priority_max01 docker[passed 6 failed 0 broken 0 ] carrick[passed 6 failed 0 broken 0 ]
+DIFF  sched_get_priority_min01 docker[passed 6 failed 0 broken 0 ] carrick[]
+DIFF  sched_getparam01       docker[passed 4 failed 0 broken 0 ] carrick[P1 F1 B0 C0]
+MATCH sched_getscheduler01   docker[passed 2 failed 4 broken 0 ] carrick[passed 2 failed 4 broken 0 ]
+DIFF  sched_rr_get_interval01 docker[passed 4 failed 4 broken 0 ] carrick[passed 2 failed 4 broken 0 ]
+MATCH sched_setparam01       docker[passed 2 failed 0 broken 0 ] carrick[passed 2 failed 0 broken 0 ]
+DIFF  sched_setscheduler01   docker[passed 8 failed 0 broken 0 ] carrick[passed 6 failed 2 broken 0 ]
+
+ALL DONE
