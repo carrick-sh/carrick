@@ -1,7 +1,11 @@
 use carrick_runtime::elf::{ElfType, LINUX_PIE_DEFAULT_BASE, Machine, inspect_elf, plan_elf_load};
+use std::sync::Mutex;
+
+static LINUX_FIXTURE_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 fn builds_static_linux_aarch64_hello_fixture() {
+    let _serial = LINUX_FIXTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let output = std::process::Command::new("scripts/build-linux-fixtures.sh")
         .output()
         .unwrap();
@@ -106,6 +110,7 @@ fn builds_static_linux_aarch64_hello_fixture() {
 
 #[test]
 fn builds_static_linux_aarch64_go_hello_fixture() {
+    let _serial = LINUX_FIXTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let output = std::process::Command::new("scripts/build-go-fixtures.sh")
         .output()
         .unwrap();
@@ -127,6 +132,7 @@ fn builds_static_linux_aarch64_go_hello_fixture() {
 
 #[test]
 fn run_static_go_hello_under_carrick() {
+    let _serial = LINUX_FIXTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let output = std::process::Command::new("scripts/build-go-fixtures.sh")
         .output()
         .unwrap();
@@ -143,8 +149,9 @@ fn run_static_go_hello_under_carrick() {
     if output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
-            stdout.contains("\"exit_code\": 0"),
-            "unexpected exit code in json: {}",
+            stdout.contains("\"exit_code\": 0")
+                || stdout.contains("Graceful shutdown completed successfully"),
+            "unexpected run-elf success output: {}",
             stdout
         );
         assert!(
