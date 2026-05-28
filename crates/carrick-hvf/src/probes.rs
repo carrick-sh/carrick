@@ -74,6 +74,12 @@ mod carrick_usdt {
     /// means the base held 0x11=17. Lets a trace see the faulting access
     /// WITHOUT an eprintln rebuild. Fires only at the fault.
     fn vcpu__fault__regs(_: u64, _: u64, _: u64, _: u64, _: u32, _: u64) {}
+    /// Fires from `map_host_alias` (the post-boot high-VA hv_vm_map path) with
+    /// the MANAGER's L0..L3 stage-1 descriptors for the alias VA + whether this
+    /// is a forked child and whether the page-table build succeeded (rc: 0 ok,
+    /// else nonzero). Diagnoses why a forked child's alias mapping diverges from
+    /// the parent's. Fires only on this path (no hot-path cost).
+    fn pt__alias__walk(_: u64, _: u64, _: u64, _: u64, _: u64, _: i32) {}
     /// Fires when a signal is published for later delivery. `target_tid` is the
     /// guest tid for a thread-directed signal (tkill/tgkill route) or 0 for a
     /// process-directed one; `signum` the Linux signum; `kind` 1=thread-directed
@@ -391,6 +397,12 @@ pub fn vcpu_fault(esr: u64, elr: u64, far: u64, x30: u64, sp: u64, tid: i32) {
 /// that kills the process before DTrace's action runs. Fires only at the fault.
 pub fn vcpu_fault_regs(esr: u64, elr: u64, far: u64, insn: u64, rn: u32, xrn: u64) {
     carrick_usdt::vcpu__fault__regs!(|| (esr, elr, far, insn, rn, xrn));
+}
+
+/// Emit a high-VA alias page-table walk. See `pt__alias__walk`. `flag` bit0 =
+/// forked child, bit1 = the page-table build failed.
+pub fn pt_alias_walk(va: u64, descs: [u64; 4], flag: i32) {
+    carrick_usdt::pt__alias__walk!(|| (va, descs[0], descs[1], descs[2], descs[3], flag));
 }
 
 /// A signal was published for delivery. See `signal__publish`.

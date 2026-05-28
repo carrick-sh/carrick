@@ -1572,8 +1572,21 @@ impl HvfInner {
             )));
         }
         // Build VA→IPA descriptors + TLBI so the guest's own accesses translate.
-        self.pt_edit_and_flush(|mgr| mgr.map_aliased(va, ipa, len))
-            .map_err(|e| TrapError::Hypervisor(format!("alias page-table build failed: {e}")))?;
+        let pt_res = self.pt_edit_and_flush(|mgr| mgr.map_aliased(va, ipa, len));
+        {
+            // Trace the manager's view of the alias path (carrick trace:
+            // pt-alias-walk) — fires for parent (ok) and forked child (fail) so
+            // a trace can diff them. bit0=forked child, bit1=build failed.
+            let descs = self
+                .page_tables
+                .lock()
+                .as_ref()
+                .map(|m| m.debug_walk(va))
+                .unwrap_or([0u64; 4]);
+            let flag = (self.is_forked_child as i32) | ((pt_res.is_err() as i32) << 1);
+            crate::probes::pt_alias_walk(va, descs, flag);
+        }
+        pt_res.map_err(|e| TrapError::Hypervisor(format!("alias page-table build failed: {e}")))?;
         let guest_shared = host_mapping.guest_shared();
         self.mappings.push(HvfMappedRegion {
             start: va,
