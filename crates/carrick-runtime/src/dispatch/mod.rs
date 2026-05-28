@@ -3593,6 +3593,11 @@ pub fn macos_to_linux_errno(macos: i32) -> i32 {
             x if x == libc::ENOMSG => ENOMSG,
             x if x == libc::EILSEQ => EILSEQ,
             x if x == libc::EBADMSG => EBADMSG,
+            // macOS ENOATTR ("attribute not found", 93) is Linux ENODATA (61) —
+            // what getxattr/removexattr return for a missing xattr. Without
+            // this it collapsed to EIO and LTP getxattr01/removexattr* failed
+            // their ENODATA expectation.
+            x if x == libc::ENOATTR => crate::linux_abi::LINUX_ENODATA,
             // Codes 1..=34 overlap; unmapped Darwin extension errnos above
             // that range are not Linux numbers, so collapse them to EIO
             // rather than leaking host-specific values to the guest.
@@ -4238,7 +4243,12 @@ mod overlay_dispatch_tests {
     fn errno_translation_maps_unknown_darwin_extensions_to_eio() {
         use crate::dispatch::{linux_errno, macos_to_linux_errno};
 
-        assert_eq!(macos_to_linux_errno(libc::ENOATTR), linux_errno::EIO);
+        // ENOATTR ("attribute not found") maps to Linux ENODATA, the errno
+        // getxattr/removexattr return for a missing xattr.
+        assert_eq!(
+            macos_to_linux_errno(libc::ENOATTR),
+            crate::linux_abi::LINUX_ENODATA
+        );
         assert_eq!(macos_to_linux_errno(999), linux_errno::EIO);
     }
 
