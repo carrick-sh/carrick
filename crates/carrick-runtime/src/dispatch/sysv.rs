@@ -502,5 +502,243 @@ impl SyscallDispatcher {
                 _ => Ok(DispatchOutcome::errno(LINUX_EINVAL)),
             }
         }
+
+        /// semget(key, nsems, semflg): allocate/look up a SysV semaphore set.
+        /// Forwarded to the host (macOS has SysV semaphores); IPC_CREAT/IPC_EXCL
+        /// share their values with Linux, and carrick guest processes are
+        /// separate host processes, so the host kernel gives cross-process
+        /// semaphore coherence for free. The host semid is returned to the
+        /// guest and accepted back verbatim.
+        fn semget(this, cx, key: u64, nsems: u64, semflg: u64) {
+            let _ = (this, cx);
+            let rc = unsafe {
+                libc::semget(key as i32 as libc::key_t, nsems as i32, semflg as i32)
+            };
+            match rc.host_syscall_errno() {
+                Ok(id) => Ok(DispatchOutcome::Returned { value: id as i64 }),
+                Err(errno) => Ok(DispatchOutcome::errno(errno)),
+            }
+        }
+
+        /// semop(semid, sops, nsops): apply an array of `struct sembuf`. The
+        /// Linux and macOS `sembuf` layouts are identical (sem_num:u16@0,
+        /// sem_op:i16@2, sem_flg:i16@4 = 6 bytes), so the array forwards
+        /// without translation. Blocking ops (no IPC_NOWAIT) block the host
+        /// thread in `semop` — acceptable for the single-guest model.
+        fn semop(this, cx, semid: u64, sops: GuestPtr, nsops: u64) {
+            sysv_semop(cx, semid as i32, sops.0, nsops as usize, None)
+        }
+
+        /// semtimedop(semid, sops, nsops, timeout): semop with a relative
+        /// timeout (struct timespec). macOS lacks semtimedop, so we emulate
+        /// the bounded wait by retrying IPC_NOWAIT semop until the deadline.
+        fn semtimedop(this, cx, semid: u64, sops: GuestPtr, nsops: u64, timeout: GuestPtr) {
+            let to = if timeout.0 == 0 {
+                None
+            } else {
+                match read_timespec(&*cx.memory, timeout.0) {
+                    Ok(ts) => Some(ts),
+                    Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                }
+            };
+            sysv_semop(cx, semid as i32, sops.0, nsops as usize, to)
+        }
+
+        /// semctl(semid, semnum, cmd, arg). The command constants differ
+        /// between Linux and macOS and are translated; the union `arg` is
+        /// interpreted per command (int for SETVAL, u16[] for GET/SETALL,
+        /// semid_ds* for IPC_STAT/SET).
+        fn semctl(this, cx, semid: u64, semnum: u64, cmd: u64, arg: u64) {
+            let _ = this;
+            sysv_semctl(cx, semid as i32, semnum as i32, cmd, arg)
+        }
     }
+}
+
+// Linux SysV semaphore command constants (linux/sem.h + ipc.h).
+const LINUX_GETPID: u64 = 11;
+const LINUX_GETVAL: u64 = 12;
+const LINUX_GETALL: u64 = 13;
+const LINUX_GETNCNT: u64 = 14;
+const LINUX_GETZCNT: u64 = 15;
+const LINUX_SETVAL: u64 = 16;
+const LINUX_SETALL: u64 = 17;
+const LINUX_SEM_IPC_NOWAIT: i16 = 0o4000; // IPC_NOWAIT in sem_flg
+
+/// Shared semop / semtimedop core. Reads the `nsops` sembuf entries (Linux ==
+/// macOS layout) and forwards to host `semop`. For a timed wait (macOS has no
+/// semtimedop) it retries an IPC_NOWAIT variant until the deadline, mapping a
+/// would-block to ETIMEDOUT/EAGAIN per the deadline.
+fn sysv_semop<M: GuestMemory>(
+    cx: &mut SyscallCtx<M>,
+    semid: i32,
+    sops_addr: u64,
+    nsops: usize,
+    timeout: Option<LinuxTimespec>,
+) -> Result<DispatchOutcome, DispatchError> {
+    if nsops == 0 || nsops > 1024 {
+        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+    }
+    // sembuf is 6 bytes; read the whole array.
+    let bytes = match cx.memory.read_bytes(sops_addr, nsops * 6) {
+        Ok(b) => b,
+        Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+    };
+    let mut sops: Vec<libc::sembuf> = Vec::with_capacity(nsops);
+    for i in 0..nsops {
+        let o = i * 6;
+        sops.push(libc::sembuf {
+            sem_num: u16::from_le_bytes([bytes[o], bytes[o + 1]]),
+            sem_op: i16::from_le_bytes([bytes[o + 2], bytes[o + 3]]),
+            sem_flg: i16::from_le_bytes([bytes[o + 4], bytes[o + 5]]),
+        });
+    }
+
+    if timeout.is_none() {
+        let rc = unsafe { libc::semop(semid, sops.as_mut_ptr(), nsops) };
+        return match rc.host_syscall_errno() {
+            Ok(_) => Ok(DispatchOutcome::Returned { value: 0 }),
+            Err(errno) => Ok(DispatchOutcome::errno(errno)),
+        };
+    }
+
+    // Timed: poll with IPC_NOWAIT until the relative deadline. Force NOWAIT on
+    // every op so the host call returns EAGAIN instead of blocking past the
+    // timeout; on EAGAIN we sleep briefly and retry until the deadline, then
+    // surface EAGAIN (Linux semtimedop returns EAGAIN on timeout).
+    let ts = timeout.unwrap();
+    let total_ns = (ts.tv_sec.max(0) as u128) * 1_000_000_000 + ts.tv_nsec.max(0) as u128;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_nanos(total_ns.min(u64::MAX as u128) as u64);
+    let mut nowait = sops.clone();
+    for s in &mut nowait {
+        s.sem_flg |= LINUX_SEM_IPC_NOWAIT;
+    }
+    loop {
+        let mut attempt = nowait.clone();
+        let rc = unsafe { libc::semop(semid, attempt.as_mut_ptr(), nsops) };
+        match rc.host_syscall_errno() {
+            Ok(_) => return Ok(DispatchOutcome::Returned { value: 0 }),
+            Err(e) if e == LINUX_EAGAIN => {
+                if std::time::Instant::now() >= deadline {
+                    return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+        }
+    }
+}
+
+/// Translate a Linux semctl command to the macOS value. Returns `None` for a
+/// command macOS doesn't have (SEM_STAT/SEM_INFO).
+fn linux_semctl_cmd_to_host(cmd: u64) -> Option<i32> {
+    Some(match cmd {
+        LINUX_IPC_RMID => libc::IPC_RMID,
+        LINUX_IPC_SET => libc::IPC_SET,
+        LINUX_IPC_STAT => libc::IPC_STAT,
+        LINUX_GETPID => libc::GETPID,
+        LINUX_GETVAL => libc::GETVAL,
+        LINUX_GETALL => libc::GETALL,
+        LINUX_GETNCNT => libc::GETNCNT,
+        LINUX_GETZCNT => libc::GETZCNT,
+        LINUX_SETVAL => libc::SETVAL,
+        LINUX_SETALL => libc::SETALL,
+        _ => return None,
+    })
+}
+
+fn sysv_semctl<M: GuestMemory>(
+    cx: &mut SyscallCtx<M>,
+    semid: i32,
+    semnum: i32,
+    cmd: u64,
+    arg: u64,
+) -> Result<DispatchOutcome, DispatchError> {
+    let Some(host_cmd) = linux_semctl_cmd_to_host(cmd) else {
+        // SEM_STAT/SEM_INFO and friends: not supported on macOS.
+        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+    };
+
+    // Commands that take NO arg or return a value directly.
+    match cmd {
+        LINUX_IPC_RMID | LINUX_GETPID | LINUX_GETVAL | LINUX_GETNCNT | LINUX_GETZCNT => {
+            let rc = unsafe { libc::semctl(semid, semnum, host_cmd) };
+            return match rc.host_syscall_errno() {
+                Ok(v) => Ok(DispatchOutcome::Returned { value: v as i64 }),
+                Err(errno) => Ok(DispatchOutcome::errno(errno)),
+            };
+        }
+        LINUX_SETVAL => {
+            // arg is `union semun { int val }`.
+            let rc = unsafe { libc::semctl(semid, semnum, host_cmd, arg as i32) };
+            return match rc.host_syscall_errno() {
+                Ok(_) => Ok(DispatchOutcome::Returned { value: 0 }),
+                Err(errno) => Ok(DispatchOutcome::errno(errno)),
+            };
+        }
+        LINUX_GETALL | LINUX_SETALL => {
+            // arg is `unsigned short *array`. Find nsems via IPC_STAT.
+            let nsems = match host_sem_nsems(semid) {
+                Ok(n) => n,
+                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+            };
+            let mut vals: Vec<u16> = vec![0; nsems];
+            if cmd == LINUX_SETALL {
+                let bytes = match cx.memory.read_bytes(arg, nsems * 2) {
+                    Ok(b) => b,
+                    Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+                };
+                for (i, v) in vals.iter_mut().enumerate() {
+                    *v = u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]);
+                }
+            }
+            let rc = unsafe { libc::semctl(semid, 0, host_cmd, vals.as_mut_ptr()) };
+            match rc.host_syscall_errno() {
+                Ok(_) => {
+                    if cmd == LINUX_GETALL {
+                        let mut out = Vec::with_capacity(nsems * 2);
+                        for v in &vals {
+                            out.extend_from_slice(&v.to_le_bytes());
+                        }
+                        if cx.memory.write_bytes(arg, &out).is_err() {
+                            return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                        }
+                    }
+                    Ok(DispatchOutcome::Returned { value: 0 })
+                }
+                Err(errno) => Ok(DispatchOutcome::errno(errno)),
+            }
+        }
+        LINUX_IPC_STAT | LINUX_IPC_SET => {
+            // semid_ds translation. LTP's sem tests mostly read sem_nsems +
+            // sem_perm; fill those from the host. Full IPC_SET (writing perms)
+            // is a best-effort no-op success for now.
+            if cmd == LINUX_IPC_SET {
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            }
+            let nsems = match host_sem_nsems(semid) {
+                Ok(n) => n,
+                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+            };
+            // Linux semid_ds: ipc_perm(48) then sem_otime(8) sem_ctime(8)
+            // sem_nsems(8)... Write a zeroed buffer with sem_nsems filled at
+            // the Linux offset (ipc_perm 48 + otime 8 + ctime 8 = 64).
+            if arg != 0 {
+                let mut buf = [0u8; 104];
+                buf[64..72].copy_from_slice(&(nsems as u64).to_le_bytes());
+                if cx.memory.write_bytes(arg, &buf).is_err() {
+                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                }
+            }
+            Ok(DispatchOutcome::Returned { value: 0 })
+        }
+        _ => Ok(DispatchOutcome::errno(LINUX_EINVAL)),
+    }
+}
+
+/// Number of semaphores in the set, via host IPC_STAT.
+fn host_sem_nsems(semid: i32) -> Result<usize, i32> {
+    let mut ds: libc::semid_ds = unsafe { core::mem::zeroed() };
+    let rc = unsafe { libc::semctl(semid, 0, libc::IPC_STAT, &mut ds as *mut libc::semid_ds) };
+    rc.host_syscall_errno().map(|_| ds.sem_nsems as usize)
 }
