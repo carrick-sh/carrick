@@ -589,8 +589,15 @@ impl SyscallDispatcher {
             else {
                 return Ok(LINUX_ENOMEM.into());
             };
-            if reused && let Ok(n) = usize::try_from(new_size) {
-                let zeros = vec![0u8; n];
+            let new_len = match usize::try_from(new_size) {
+                Ok(n) => n,
+                Err(_) => return Ok(LINUX_ENOMEM.into()),
+            };
+            // Clear stale no-access tracking on the destination — it may be a
+            // range reclaimed from a prior munmap (which marked it no-access).
+            memory.set_no_access(new_addr, new_len, false);
+            if reused {
+                let zeros = vec![0u8; new_len];
                 let _ = memory.write_bytes(new_addr, &zeros);
             }
             let copy_len = match usize::try_from(old_size) {
@@ -608,6 +615,17 @@ impl SyscallDispatcher {
                         return Ok(LINUX_EFAULT.into());
                     }
                 }
+            }
+            // Re-validate the destination's guest stage-1 entries, exactly as
+            // mmap does. A range reused from a munmap'd region was invalidated;
+            // without this the guest FAULTS reading the freshly-mremap'd memory
+            // (carrick wrote the copy host-side, so no guest write-fault ever
+            // re-established the page). new_addr is always in the arena here.
+            if memory
+                .protect_range(new_addr, new_len, LINUX_PROT_READ | LINUX_PROT_WRITE)
+                .is_err()
+            {
+                return Ok(LINUX_ENOMEM.into());
             }
             Ok(DispatchOutcome::Returned {
                 value: new_addr as i64,
