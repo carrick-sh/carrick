@@ -44,8 +44,8 @@ pub use carrick_host::{guest_cpu, host_facts, host_mapping, host_proc, ulock};
 #[cfg(target_os = "macos")]
 pub use carrick_hvf::darwin_kqueue;
 pub use carrick_hvf::{
-    compat, fork_coord, fork_quiesce, host_signal, io_wait, itimer, probes, shared_aperture,
-    syscall, thread, trap, vcpu_kick,
+    compat, fork_coord, fork_quiesce, host_signal, io_wait, itimer, posix_timer, probes,
+    shared_aperture, syscall, thread, trap, vcpu_kick,
 };
 pub mod overlay;
 

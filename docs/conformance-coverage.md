@@ -21,9 +21,8 @@ carrick test yet — backlog).
 listed in `KNOWN_PROBE_GAPS` so the harness stays green while the gap is
 tracked here; a probe leaving this list = the gap got fixed):
 
-| Probe | Gap |
-|---|---|
-| `posixtimers` | timer_create/settime/gettime/delete/getoverrun are ENOSYS. |
+_None — all four gap-exposing probes added this session have been driven to
+zero. The list is intentionally kept around for future gaps._
 
 **Fixed this session** (probes that flipped from gap → MATCH because the
 underlying gap got fixed):
@@ -33,6 +32,7 @@ underlying gap got fixed):
 | `schedparam` | Registered sysno 118–121, 125–127 with Linux-conformant constants (proc.rs). |
 | `pauseeintr` | Bounded `wait_kqueue` retry to 50 ms even with a signal pipe (io_wait.rs); added Linux's `set_restore_sigmask` analogue to rt_sigsuspend so a pending blocked signal is actually delivered when the temp mask unblocks it. |
 | `rtsigqueueinfo` | Read the caller's siginfo in `rt_sigqueueinfo`, queue it via `record_pending_siginfo`, and thread an `Option<LinuxSiginfo>` through `inject_signal` so the SA_SIGINFO handler sees the real `si_value` payload instead of a synthesised SI_USER. |
+| `posixtimers` | New `crate::posix_timer` module (per-process timer registry with fallback-thread delivery); wired sysnos 107–111 (`timer_create`/`_gettime`/`_getoverrun`/`_settime`/`_delete`) in dispatch. SIGEV_SIGNAL only; SIGEV_THREAD returns ENOTSUP. |
 
 ## Signals & process control
 
