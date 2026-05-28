@@ -77,9 +77,10 @@ underlying gap got fixed):
 | getpid/getppid/gettid identity | ✅ `procid`, `ppid` | gettid02, getpid* |
 | process lifecycle / exit codes / WIFSIGNALED | ✅ `proclife` | (wait4 status) |
 | clone basic + thread flags | (LTP) | clone01–09 (mostly MATCH) |
+| **clone3 arg validation: happy path returns child pid + clean reap; truncated `size`, unknown flag bit, inconsistent stack/stack_size pair each rejected (EINVAL on real Linux, ENOSYS under Docker default seccomp)** | ✅ `clone3args` | clone301, clone302, clone303, clone05, clone08 |
 
 ### fork/clone — backlog
-- ⬜ `clone301/302/303` clone3 arg validation; `clone05/08`.
+- _(none — clone3 arg-validation backlog is owned by `clone3args`)_
 
 ## futex / sched
 
