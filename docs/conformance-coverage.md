@@ -23,7 +23,6 @@ tracked here; a probe leaving this list = the gap got fixed):
 
 | Probe | Gap |
 |---|---|
-| `pauseeintr` | pause()/sigsuspend() wait path doesn't wake on setitimer SIGALRM (the post-d97a47a wait4-path fix doesn't cover pause). |
 | `posixtimers` | timer_create/settime/gettime/delete/getoverrun are ENOSYS. |
 | `rtsigqueueinfo` | caller-supplied siginfo's `si_value` isn't propagated to the guest handler (synthesised siginfo). |
 
@@ -33,6 +32,7 @@ underlying gap got fixed):
 | Probe | Fix |
 |---|---|
 | `schedparam` | Registered sysno 118–121, 125–127 with Linux-conformant constants (proc.rs). |
+| `pauseeintr` | Bounded `wait_kqueue` retry to 50 ms even with a signal pipe (io_wait.rs); added Linux's `set_restore_sigmask` analogue to rt_sigsuspend so a pending blocked signal is actually delivered when the temp mask unblocks it. |
 
 ## Signals & process control
 

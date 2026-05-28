@@ -36,11 +36,6 @@ static CONFORMANCE_LOCK: Mutex<()> = Mutex::new(());
 /// FAILS so we remove it from this list — that's the signal the gap was
 /// fixed. Each entry must cite the gap.
 const KNOWN_PROBE_GAPS: &[&str] = &[
-    // pause() does not wake on a setitimer-delivered SIGALRM in carrick: the
-    // probe TIMEOUTs after 45s instead of returning -1/EINTR. The earlier
-    // d97a47a "preserve itimer delivery for wait restarts" fix covered the
-    // wait4 path; the pause() / sigsuspend() wait path is the next domino.
-    "pauseeintr",
     // POSIX timers (`timer_create`/`_settime`/`_gettime`/`_delete`/`_getoverrun`)
     // are ENOSYS in carrick. The probe gates implementation when it lands.
     "posixtimers",
