@@ -36,6 +36,22 @@ fn sched_pid_is_self(pid: u64) -> bool {
         || pid == LINUX_BOOTSTRAP_PID as u64
 }
 
+/// True when `pid` names a live process accessible to the guest: either
+/// the calling process / its alias, or a peer host pid the kernel
+/// confirms via `kill(pid, 0)`. Used by sched_get* queries so they can
+/// answer for any task in the system the way Linux does (with our
+/// uniform SCHED_OTHER + prio 0 model, the actual answer is the same for
+/// every valid pid; only the "does it exist?" check varies).
+fn sched_pid_exists(pid: u64) -> bool {
+    if sched_pid_is_self(pid) {
+        return true;
+    }
+    if pid == 0 || pid > i32::MAX as u64 {
+        return false;
+    }
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
 /// True when `policy` is one of the kernel's known scheduling policies.
 fn sched_policy_is_known(policy: i32) -> bool {
     matches!(
@@ -655,7 +671,11 @@ impl SyscallDispatcher {
         /// for `pid` into `*sched_param`. With a stubbed SCHED_OTHER, this is
         /// always `sched_priority = 0`.
         fn sched_getparam(this, cx, pid: u64, address: GuestPtr) {
-            if !sched_pid_is_self(pid) {
+            // Linux semantics: any process can query any other process's
+            // sched params. With SCHED_OTHER+prio 0 across the board, the
+            // value the guest reads back is the same regardless of which
+            // valid pid it picks. Reject only unknown pids (-1/ESRCH).
+            if !sched_pid_exists(pid) {
                 return Ok(LINUX_ESRCH.into());
             }
             if address.0 == 0 {
@@ -697,7 +717,7 @@ impl SyscallDispatcher {
         /// SCHED_OTHER-only model the only valid priority is 0; anything else
         /// is EINVAL (matches Linux for SCHED_NORMAL/OTHER/BATCH/IDLE).
         fn sched_setparam(this, cx, pid: u64, address: GuestPtr) {
-            if !sched_pid_is_self(pid) {
+            if !sched_pid_exists(pid) {
                 return Ok(LINUX_ESRCH.into());
             }
             let prio = sched_read_param_priority(cx, address)?;
@@ -711,7 +731,7 @@ impl SyscallDispatcher {
         /// quantum into `*timespec`. SCHED_OTHER tasks aren't on a RR
         /// schedule; Linux returns {0, 0} (and 0). We mirror that.
         fn sched_rr_get_interval(this, cx, pid: u64, address: GuestPtr) {
-            if !sched_pid_is_self(pid) {
+            if !sched_pid_exists(pid) {
                 return Ok(LINUX_ESRCH.into());
             }
             if address.0 == 0 {
