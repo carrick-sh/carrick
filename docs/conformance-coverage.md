@@ -238,6 +238,7 @@ underlying gap got fixed):
 |---|---|---|
 | uname/sysinfo/getrlimit/prlimit64/prctl/getrandom/sched_getaffinity/sched_yield/getpriority/gettid/umask/getcpu/capget | ✅ `sysinfo` | uname01–04, sysinfo01–03, getrlimit01–03, prlimit64_01–02, prctl01–08, getrandom01–05, sched_getaffinity01, sched_yield01, getpriority01/02, gettid01, umask01–03, getcpu01/02, capget01/02 |
 | **`PR_SET_DUMPABLE`/`PR_GET_DUMPABLE` tri-state round-trip (0↔1↔2) + EINVAL on bogus values** | ✅ `prctldumpable` | prctl04, prctl08 |
+| **setfsuid/setfsgid fs-id model: a tracked fsuid/fsgid (default = euid/egid, reset by every set*uid/set*gid) that setfs*id RETURNS (the previous value) and updates when privileged or the arg matches r/e/s/fs; `(uid_t)-1` is a query** | ✅ `setfsid` | setfsuid01/03, setfsgid01/02 (setfsuid04 = fs-id DAC open() enforcement, the host-backed guest-root class — deferred) |
 | **`sched_getattr(pid, attr, size, flags)` (nr 275, was ENOSYS): pid 0/self → success with a zeroed SCHED_OTHER sched_attr (size field set); flags≠0 / size<SCHED_ATTR_SIZE_VER0(48) / NULL attr → EINVAL; non-existent pid → ESRCH** | ✅ `schedgetattr` | sched_getattr02 |
 | **prlimit64/getrlimit/setrlimit reject an invalid resource (>= RLIM_NLIMITS=16) with EINVAL before any limit read/write (was treating unknown resources as RLIM_INFINITY and succeeding); valid resources 0..15 unaffected** | ✅ `rlimitresource` | getrlimit02 (getrlimit03 per-resource default VALUES + setrlimit02/03 EPERM-raise-hard-limit deferred) |
 
