@@ -2140,6 +2140,20 @@ impl SyscallDispatcher {
                 Ok(t) => t,
                 Err(errno) => return Ok(errno.into()),
             };
+            // getsockname needs both output pointers; a NULL addr or addrlen →
+            // EFAULT (getsockname01), checked after the fd validation so a
+            // bad/non-socket fd still surfaces EBADF/ENOTSOCK first.
+            if addr_addr == 0 || addrlen_addr == 0 {
+                return Ok(LINUX_EFAULT.into());
+            }
+            // A negative input *addrlen → EINVAL (getsockname01); the kernel
+            // reads addrlen first and rejects len < 0 before copying out. A bad
+            // (unreadable) addrlen pointer surfaces EFAULT via the write below.
+            if let Ok(b) = memory.read_bytes(addrlen_addr, 4)
+                && i32::from_ne_bytes([b[0], b[1], b[2], b[3]]) < 0
+            {
+                return Ok(LINUX_EINVAL.into());
+            }
             let mut sa = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
             let mut sa_len: libc::socklen_t = sa.len() as libc::socklen_t;
             let rc =
