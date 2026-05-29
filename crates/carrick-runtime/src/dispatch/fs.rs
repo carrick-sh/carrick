@@ -1375,6 +1375,27 @@ impl SyscallDispatcher {
         }
         mode
     }
+
+    /// Linux raises SIGPIPE on the writing thread when a write hits a broken
+    /// pipe (the read end is closed → EPIPE), in addition to returning EPIPE
+    /// (LTP write05). Mark it pending so the runtime delivers it per the
+    /// disposition: a handler runs, SIG_DFL terminates, a blocked SIGPIPE stays
+    /// pending. Skip the mark when SIGPIPE is ignored (the common case for
+    /// pipe/socket-heavy programs) so we don't queue a signal that's discarded.
+    fn raise_sigpipe_on_epipe<M: GuestMemory>(
+        &self,
+        cx: &SyscallCtx<M>,
+        outcome: DispatchOutcome,
+    ) -> DispatchOutcome {
+        const LINUX_SIGPIPE: i32 = 13;
+        if matches!(&outcome, DispatchOutcome::Errno { errno } if *errno == LINUX_EPIPE)
+            && !self.signal_is_ignored(LINUX_SIGPIPE)
+        {
+            let tid = Self::ctx_tid(cx);
+            self.mark_signal_pending(tid, LINUX_SIGPIPE);
+        }
+        outcome
+    }
 }
 
 impl SyscallDispatcher {
@@ -4076,7 +4097,10 @@ impl SyscallDispatcher {
                             if *is_read_end && pty.is_none() && !*bidirectional {
                                 return Ok(LINUX_EBADF.into());
                             }
-                            return Ok(write_host_pipe(&bytes, *host_fd, nonblocking));
+                            // A broken pipe (read end closed) → EPIPE AND a
+                            // SIGPIPE on the writer (write05).
+                            let out = write_host_pipe(&bytes, *host_fd, nonblocking);
+                            return Ok(this.raise_sigpipe_on_epipe(cx, out));
                         }
                         OpenDescription::HostSocket { host_fd, .. } => {
                             // write(2) on a connected socket maps directly to a
