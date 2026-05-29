@@ -394,6 +394,46 @@ impl SyscallDispatcher {
             ))
         }
 
+        /// signalfd4(fd, mask, sizemask, flags): create (fd==-1) or re-target a
+        /// signalfd. macOS has no signalfd, so this is emulated. SFD_CLOEXEC ==
+        /// O_CLOEXEC and SFD_NONBLOCK == O_NONBLOCK; the dispatch flag table
+        /// already rejects other bits (defensive re-check here). Only the fd-flag
+        /// surface (FD_CLOEXEC / O_NONBLOCK on the returned fd) is exercised today
+        /// (signalfd4_01/02); a read()/poll() delivery path that drains the
+        /// process's pending masked signals is a tracked follow-up.
+        fn signalfd4(this, cx, fd: Fd, mask: GuestPtr, _sizemask: u64, flags: u64) {
+            if flags & !(LINUX_O_NONBLOCK | LINUX_O_CLOEXEC) != 0 {
+                return Ok(LINUX_EINVAL.into());
+            }
+            // The kernel sigset_t ABI is 8 bytes; read it (EFAULT on bad ptr).
+            let mask_val = match cx.memory.read_bytes(mask.0, 8) {
+                Ok(b) => {
+                    let arr: [u8; 8] = b.as_slice().try_into().unwrap_or([0u8; 8]);
+                    u64::from_le_bytes(arr)
+                }
+                Err(_) => return Ok(LINUX_EFAULT.into()),
+            };
+            if fd.0 == -1 {
+                let description = OpenDescription::SignalFd {
+                    base: OpenDescriptionBase::new(flags & LINUX_O_NONBLOCK),
+                    mask: mask_val,
+                };
+                Ok(this.install_fd(description, linux_fd_flags_from_open_flags(flags)))
+            } else {
+                let Some(open_file) = this.open_file(fd.0) else {
+                    return Ok(LINUX_EBADF.into());
+                };
+                let mut open = open_file.description.write();
+                match &mut *open {
+                    OpenDescription::SignalFd { mask, .. } => {
+                        *mask = mask_val;
+                        Ok(DispatchOutcome::Returned { value: fd.0 as i64 })
+                    }
+                    _ => Ok(LINUX_EINVAL.into()),
+                }
+            }
+        }
+
         /// tkill(tid, sig): send `sig` to thread `tid`.
         fn tkill(this, cx, tid: Pid, sig: Signal) {
             let tid = i64::from(tid.0);

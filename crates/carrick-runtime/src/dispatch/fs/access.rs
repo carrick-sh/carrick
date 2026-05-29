@@ -207,6 +207,7 @@ impl SyscallDispatcher {
             | OpenDescription::PipeWriter { .. }
             | OpenDescription::HostPipe { .. }
             | OpenDescription::HostSocket { .. }
+            | OpenDescription::SignalFd { .. }
             | OpenDescription::Netlink { .. } => synthetic_readonly_access(mode),
         }
     }
