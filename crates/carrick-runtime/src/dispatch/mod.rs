@@ -3645,6 +3645,13 @@ pub fn macos_to_linux_errno(macos: i32) -> i32 {
 /// Linux `NLMSG_ALIGNTO` — netlink messages and attributes are 4-byte aligned.
 const NLMSG_ALIGNTO: usize = 4;
 
+/// Linux clamps a single read/recv/getrandom transfer to MAX_RW_COUNT (INT_MAX
+/// rounded down to a page) and returns a short count; it never allocates the
+/// caller's raw count. carrick stages guest reads into a host Vec, so without
+/// this clamp a huge guest count is an immediate multi-terabyte allocation that
+/// aborts the whole runtime (a one-syscall DoS). Probe: `bigread`.
+pub(crate) const MAX_RW_COUNT: usize = 0x7fff_f000;
+
 /// read(2) on a host-backed fd (pipe/socket/file). read has no per-call
 /// non-blocking flag, so we put the host fd non-blocking (idempotent; immaterial
 /// for files, which never block) and convert EAGAIN: a blocking-mode guest fd
@@ -3661,6 +3668,9 @@ fn read_host_pipe(
     if length == 0 {
         return DispatchOutcome::Returned { value: 0 };
     }
+    // Clamp to Linux's MAX_RW_COUNT before staging a host buffer; a huge guest
+    // count would otherwise be a one-syscall OOM-abort of the runtime.
+    let length = length.min(MAX_RW_COUNT);
     crate::dispatch::net::set_host_nonblocking(host_fd);
     let mut buf = vec![0u8; length];
     let n = unsafe { libc::read(host_fd, buf.as_mut_ptr() as *mut _, length) };

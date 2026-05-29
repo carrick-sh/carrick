@@ -568,8 +568,15 @@ impl SyscallDispatcher {
         fn msgsnd(this, cx, msqid: u64, msgp: GuestPtr, msgsz: u64, msgflg: u64) {
             let _ = this;
             let sz = msgsz as usize;
+            // Guard the 8+sz add: an overflow would wrap to a tiny read while the
+            // original huge msgsz is forwarded to the host. Linux EINVALs an
+            // oversized msgsz. Probe: msgoverflow.
+            let total = match sz.checked_add(8) {
+                Some(t) if t <= crate::dispatch::MAX_RW_COUNT => t,
+                _ => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
+            };
             // Read mtype (8) + payload (sz).
-            let buf = match cx.memory.read_bytes(msgp.0, 8 + sz) {
+            let buf = match cx.memory.read_bytes(msgp.0, total) {
                 Ok(b) => b,
                 Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
             };
@@ -593,7 +600,13 @@ impl SyscallDispatcher {
         fn msgrcv(this, cx, msqid: u64, msgp: GuestPtr, msgsz: u64, msgtyp: u64, msgflg: u64) {
             let _ = this;
             let sz = msgsz as usize;
-            let mut buf = vec![0u8; 8 + sz];
+            // Bound the eager allocation and guard the 8+sz add (a huge msgsz
+            // would otherwise OOM-abort or wrap). Linux EINVALs oversized msgsz.
+            let total = match sz.checked_add(8) {
+                Some(t) if t <= crate::dispatch::MAX_RW_COUNT => t,
+                _ => return Ok(DispatchOutcome::errno(LINUX_EINVAL)),
+            };
+            let mut buf = vec![0u8; total];
             let rc = unsafe {
                 msgrcv(
                     msqid as i32,

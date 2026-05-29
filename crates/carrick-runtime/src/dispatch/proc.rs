@@ -1484,6 +1484,9 @@ impl SyscallDispatcher {
                 return Ok(LINUX_EINVAL.into());
             }
             let length = usize::try_from(length).map_err(|_| DispatchError::LengthTooLarge(length))?;
+            // Linux caps getrandom at 2^31-1 and returns a short count; clamp so a
+            // huge length can't OOM-abort the runtime. Probe: bigread (read class).
+            let length = length.min(crate::dispatch::MAX_RW_COUNT);
             let memory = &mut *cx.memory;
             let mut bytes = vec![0; length];
             if getrandom::fill(&mut bytes).is_err() {
