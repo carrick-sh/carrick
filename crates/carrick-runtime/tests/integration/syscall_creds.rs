@@ -764,7 +764,11 @@ fn umask_setpriority_getpriority_sysinfo_bootstrap_stubs() {
         DispatchOutcome::Returned { value: 0o077 }
     );
 
-    // setpriority: prio out of range -> EINVAL; which out of range -> EINVAL.
+    // setpriority: an out-of-range prio is CLAMPED, not rejected (Linux
+    // set_user_nice clamps to [-20,19]; EINVAL is reserved for a bad `which`).
+    // prio=-21 clamps to -20; as full-capability root (euid 0) lowering nice
+    // succeeds -> 0. (Docker oracle returns EPERM only because it drops
+    // CAP_SYS_NICE; carrick models unrestricted root.)
     assert_eq!(
         dispatcher
             .dispatch(
@@ -776,7 +780,7 @@ fn umask_setpriority_getpriority_sysinfo_bootstrap_stubs() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Returned { value: 0 }
     );
     assert_eq!(
         dispatcher
@@ -811,7 +815,9 @@ fn umask_setpriority_getpriority_sysinfo_bootstrap_stubs() {
         DispatchOutcome::Errno { errno: 3 }
     );
 
-    // getpriority returns 20 (nice = 0) for our pid.
+    // getpriority returns the raw kernel ABI `20 - nice`. setpriority now
+    // persists the nice value (process-global static); the last successful
+    // setpriority above stored nice=5, so this reports 20-5=15.
     assert_eq!(
         dispatcher
             .dispatch(
@@ -820,7 +826,7 @@ fn umask_setpriority_getpriority_sysinfo_bootstrap_stubs() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Returned { value: 20 }
+        DispatchOutcome::Returned { value: 15 }
     );
 
     // sysinfo populates a 64-bit-aligned struct at the provided address.

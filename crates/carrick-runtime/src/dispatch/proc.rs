@@ -12,14 +12,6 @@ static IOPRIO_VALUE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32
 /// caller's `len` to equal this exactly; get_robust_list reports it.
 const ROBUST_LIST_HEAD_SIZE: u64 = 24;
 
-/// Linux SCHED_* policy values (kernel ABI, not the libc-internal names).
-const LINUX_SCHED_OTHER: i32 = 0; // a.k.a. SCHED_NORMAL
-const LINUX_SCHED_FIFO: i32 = 1;
-const LINUX_SCHED_RR: i32 = 2;
-const LINUX_SCHED_BATCH: i32 = 3;
-const LINUX_SCHED_IDLE: i32 = 5;
-const LINUX_SCHED_DEADLINE: i32 = 6;
-
 /// Per-Linux-policy priority window for `sched_get_priority_{max,min}`. RT
 /// policies expose MAX_USER_RT_PRIO-1 / 1; time-sharing policies expose 0/0;
 /// unknown policy is EINVAL.

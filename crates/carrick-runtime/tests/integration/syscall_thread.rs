@@ -81,9 +81,6 @@ use carrick_runtime::thread::{FutexTable, ThreadRegistry};
 use std::sync::Arc;
 
 const LINUX_EAGAIN: i32 = 11;
-const LINUX_ENOSYS: i32 = 38;
-const FUTEX_REQUEUE_REASON: &str =
-    "FUTEX_(CMP_)REQUEUE unsupported: host has no futex-requeue primitive";
 
 fn write_u32_le(memory: &mut LinearMemory, addr: u64, value: u32) {
     memory.write_bytes(addr, &value.to_le_bytes()).unwrap();
@@ -217,7 +214,7 @@ fn futex_wait_matching_value_blocks_via_outcome() {
 }
 
 #[test]
-fn futex_requeue_returns_enosys_and_records_compat_gap() {
+fn futex_requeue_private_no_waiters_returns_zero() {
     let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
     let reporter = CompatReporter::default();
     let dispatcher = SyscallDispatcher::new();
@@ -238,22 +235,18 @@ fn futex_requeue_returns_enosys_and_records_compat_gap() {
         )
         .unwrap();
 
-    assert_eq!(
-        outcome,
-        DispatchOutcome::Errno {
-            errno: LINUX_ENOSYS
-        }
-    );
+    // Real Linux FUTEX_REQUEUE returns the count of waiters woken+requeued
+    // (0 with no waiters parked) and SUCCEEDS — verified vs docker linux/arm64
+    // (rc=0 errno=0). It is no longer an ENOSYS stub (impl: parking_lot
+    // unpark_requeue, commit 1372821); a PRIVATE futex records NO compat gap.
+    assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
     let report = reporter.finish();
-    assert_eq!(report.summary.distinct_partial_syscalls, 1);
-    assert_eq!(report.summary.partial_syscall_invocations, 1);
-    assert_eq!(report.partial_syscalls[0].number, 98);
-    assert_eq!(report.partial_syscalls[0].name, "futex");
-    assert_eq!(report.partial_syscalls[0].reason, FUTEX_REQUEUE_REASON);
+    assert_eq!(report.summary.distinct_partial_syscalls, 0);
+    assert_eq!(report.summary.partial_syscall_invocations, 0);
 }
 
 #[test]
-fn futex_cmp_requeue_returns_enosys_and_records_compat_gap() {
+fn futex_cmp_requeue_matching_val3_no_waiters_returns_zero() {
     let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
     let reporter = CompatReporter::default();
     let dispatcher = SyscallDispatcher::new();
@@ -274,18 +267,15 @@ fn futex_cmp_requeue_returns_enosys_and_records_compat_gap() {
         )
         .unwrap();
 
-    assert_eq!(
-        outcome,
-        DispatchOutcome::Errno {
-            errno: LINUX_ENOSYS
-        }
-    );
+    // FUTEX_CMP_REQUEUE is implemented: *uaddr1 (77) == val3 (77), so the
+    // compare passes; with no waiters parked it wakes+requeues 0 and returns 0
+    // -- matching real Linux (verified on the docker linux/arm64 oracle:
+    // ret=0/errno=0; a val3 MISMATCH instead returns EAGAIN).
+    assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+    // Private futex with the requeue primitive implemented records no compat gap.
     let report = reporter.finish();
-    assert_eq!(report.summary.distinct_partial_syscalls, 1);
-    assert_eq!(report.summary.partial_syscall_invocations, 1);
-    assert_eq!(report.partial_syscalls[0].number, 98);
-    assert_eq!(report.partial_syscalls[0].name, "futex");
-    assert_eq!(report.partial_syscalls[0].reason, FUTEX_REQUEUE_REASON);
+    assert_eq!(report.summary.distinct_partial_syscalls, 0);
+    assert_eq!(report.summary.partial_syscall_invocations, 0);
 }
 
 // --- Sub-task B (P3): tgkill/tkill cross-thread routing ---

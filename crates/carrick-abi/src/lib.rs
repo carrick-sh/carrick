@@ -13,6 +13,16 @@ pub const LINUX_S_IFCHR: u32 = 0o020000;
 pub const LINUX_S_IFBLK: u32 = 0o060000;
 pub const LINUX_S_IFSOCK: u32 = 0o140000;
 
+/// Linux SCHED_* policy values (kernel ABI, not the libc-internal names).
+/// From include/uapi/linux/sched.h. Value 4 is intentionally skipped
+/// (reserved for the never-merged SCHED_ISO).
+pub const LINUX_SCHED_OTHER: i32 = 0; // a.k.a. SCHED_NORMAL
+pub const LINUX_SCHED_FIFO: i32 = 1;
+pub const LINUX_SCHED_RR: i32 = 2;
+pub const LINUX_SCHED_BATCH: i32 = 3;
+pub const LINUX_SCHED_IDLE: i32 = 5;
+pub const LINUX_SCHED_DEADLINE: i32 = 6;
+
 pub const LINUX_DT_FIFO: u8 = 1;
 pub const LINUX_DT_CHR: u8 = 2;
 pub const LINUX_DT_DIR: u8 = 4;
