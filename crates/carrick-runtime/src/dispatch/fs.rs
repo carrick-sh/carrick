@@ -1326,6 +1326,7 @@ impl SyscallDispatcher {
                 | OpenDescription::PipeWriter { .. }
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
+                | OpenDescription::SignalFd { .. }
                 | OpenDescription::Netlink { .. } => DispatchOutcome::errno(LINUX_ENOTDIR),
             })
 
@@ -2479,6 +2480,7 @@ impl SyscallDispatcher {
                 | OpenDescription::PipeWriter { .. }
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
+                | OpenDescription::SignalFd { .. }
                 | OpenDescription::Netlink { .. } => {
                     return Ok(LINUX_ESPIPE.into());
                 }
@@ -2522,6 +2524,7 @@ impl SyscallDispatcher {
                 | OpenDescription::PipeWriter { .. }
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
+                | OpenDescription::SignalFd { .. }
                 | OpenDescription::Netlink { .. } => {}
             }
             Ok(DispatchOutcome::Returned { value: next })
@@ -2630,6 +2633,7 @@ impl SyscallDispatcher {
                 }
                 OpenDescription::Epoll { .. }
                 | OpenDescription::Pidfd { .. }
+                | OpenDescription::SignalFd { .. }
                 | OpenDescription::PipeWriter { .. } => {
                     return Ok(LINUX_EINVAL.into());
                 }
@@ -2735,6 +2739,7 @@ impl SyscallDispatcher {
                 | OpenDescription::PipeWriter { .. }
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
+                | OpenDescription::SignalFd { .. }
                 | OpenDescription::Netlink { .. } => {
                     return Ok(LINUX_EINVAL.into());
                 }
@@ -2797,6 +2802,7 @@ impl SyscallDispatcher {
                 | OpenDescription::PipeWriter { .. }
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
+                | OpenDescription::SignalFd { .. }
                 | OpenDescription::Netlink { .. } => {
                     return Ok(LINUX_EINVAL.into());
                 }
@@ -2881,6 +2887,7 @@ impl SyscallDispatcher {
                 | OpenDescription::PipeWriter { .. }
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
+                | OpenDescription::SignalFd { .. }
                 | OpenDescription::Netlink { .. } => {
                     return Ok(LINUX_EINVAL.into());
                 }
@@ -2948,6 +2955,7 @@ impl SyscallDispatcher {
                 | OpenDescription::TimerFd { .. }
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
+                | OpenDescription::SignalFd { .. }
                 | OpenDescription::Netlink { .. }
                 | OpenDescription::Epoll { .. }
                 | OpenDescription::Pidfd { .. }
@@ -3033,6 +3041,7 @@ impl SyscallDispatcher {
                 | OpenDescription::TimerFd { .. }
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
+                | OpenDescription::SignalFd { .. }
                 | OpenDescription::Netlink { .. }
                 | OpenDescription::Epoll { .. }
                 | OpenDescription::Pidfd { .. }
