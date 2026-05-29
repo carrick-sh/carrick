@@ -711,6 +711,14 @@ impl SyscallDispatcher {
         /// guest and accepted back verbatim.
         fn semget(this, cx, key: u64, nsems: u64, semflg: u64) {
             let _ = (this, cx);
+            // Linux caps nsems at SEMMSL (default 32000): nsems > SEMMSL → EINVAL
+            // (LTP semget02). macOS has a much smaller limit and returns ENOSPC
+            // for the same over-large request, so validate against the Linux
+            // limit before forwarding to the host.
+            const LINUX_SEMMSL: i32 = 32000;
+            if (nsems as i32) > LINUX_SEMMSL {
+                return Ok(LINUX_EINVAL.into());
+            }
             let rc = unsafe {
                 libc::semget(key as i32 as libc::key_t, nsems as i32, semflg as i32)
             };
