@@ -1334,6 +1334,14 @@ impl SyscallDispatcher {
             let result = match result {
                 Ok(value) => value,
                 Err(errno) => {
+                    // A process-group wait (pid < -1) for a group the kernel
+                    // can't find is ESRCH on Linux; macOS surfaces EINVAL for
+                    // the bad pgid (LTP waitpid04 INT_MIN case). Remap only that
+                    // case — a valid pgid with no children stays ECHILD, and
+                    // every other error passes through unchanged.
+                    if (pid.0 as i32) < -1 && errno == LINUX_EINVAL {
+                        return Ok(LINUX_ESRCH.into());
+                    }
                     return Ok(errno.into());
                 }
             };
