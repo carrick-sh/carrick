@@ -1231,12 +1231,29 @@ pub fn stage1_identity_page_tables() -> Vec<u8> {
     // L1A[1..511] are 1 GiB user blocks — except the entry covering the kernel
     // hole, which is a table descriptor to L2_B (so a single 2 MiB block inside
     // it can be made kernel-only).
+    // UXN (Unprivileged eXecute Never), bit 54. The anonymous mmap arena
+    // defaults NON-executable (W^X / NX): a guest `mmap` without PROT_EXEC must
+    // not be executable, matching Linux. Setting UXN on the arena's boot blocks
+    // makes the common RW mmap a NO-OP in the runtime page-table manager (the
+    // leaf already matches → no block split), so only a rare PROT_EXEC mmap/
+    // mprotect splits a block to CLEAR UXN. (Doing the opposite — boot-exec,
+    // flip-to-NX-on-mmap — would dense-split the whole 32 GiB arena, which the
+    // durable-memory design explicitly forbids.) The image (low VA), the
+    // sigreturn/EL1 trampolines and the vDSO code stay executable (UXN clear).
+    const UXN_BIT: u64 = 1 << 54;
+    let arena_start = LINUX_MMAP_BASE;
+    let arena_end = LINUX_MMAP_BASE + mmap_arena_size();
     for index in 1..512_u64 {
         let off = 0x1000 + (index as usize) * 8;
+        let va = index << 30;
         let descriptor = if index == kernel_l1_index {
             table_descriptor(l2_b_pa)
         } else {
-            (index << 30) & PA_MASK_1GIB | USER_BLOCK_FLAGS
+            let mut flags = USER_BLOCK_FLAGS;
+            if va >= arena_start && va < arena_end {
+                flags |= UXN_BIT;
+            }
+            (va & PA_MASK_1GIB) | flags
         };
         bytes[off..off + 8].copy_from_slice(&descriptor.to_le_bytes());
     }
@@ -1897,7 +1914,19 @@ mod stage1_tests {
             assert!(valid_block(d), "L1A[{}] must be a block", index);
             assert_eq!(ap(d), 0b01, "L1A[{}] AP must be 01", index);
             assert_eq!(pxn(d), 1, "L1A[{}] PXN must be 1", index);
-            assert_eq!(uxn(d), 0, "L1A[{}] UXN must be 0", index);
+            // The anonymous mmap arena defaults NON-executable (UXN=1, W^X / NX);
+            // every other 1 GiB user block stays executable (UXN=0).
+            let va = (index as u64) << 30;
+            let in_arena = va >= LINUX_MMAP_BASE && va < LINUX_MMAP_BASE + mmap_arena_size();
+            let expected_uxn = u64::from(in_arena);
+            assert_eq!(
+                uxn(d),
+                expected_uxn,
+                "L1A[{}] UXN must be {} (arena={})",
+                index,
+                expected_uxn,
+                in_arena
+            );
             let expected_pa = (index as u64) << 30;
             assert_eq!(
                 d & 0x0000_FFFF_C000_0000,
