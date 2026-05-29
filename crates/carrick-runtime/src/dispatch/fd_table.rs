@@ -148,6 +148,10 @@ pub(super) struct OpenDescriptionBase {
     /// F_UNLCK(2). Lives on the open-file-description so a dup'd fd shares it,
     /// matching the kernel. Default F_UNLCK = no lease.
     lease: i32,
+    /// SO_RCVTIMEO: bounds a blocking recv on this socket. None = block forever.
+    recv_timeout: Option<Duration>,
+    /// SO_SNDTIMEO: bounds a blocking send on this socket. None = block forever.
+    send_timeout: Option<Duration>,
 }
 
 impl OpenDescriptionBase {
@@ -155,6 +159,8 @@ impl OpenDescriptionBase {
         Self {
             status_flags,
             lease: crate::linux_abi::LINUX_F_UNLCK,
+            recv_timeout: None,
+            send_timeout: None,
         }
     }
 
@@ -172,6 +178,22 @@ impl OpenDescriptionBase {
 
     pub(super) fn set_lease(&mut self, lease: i32) {
         self.lease = lease;
+    }
+
+    pub(super) fn recv_timeout(&self) -> Option<Duration> {
+        self.recv_timeout
+    }
+
+    pub(super) fn send_timeout(&self) -> Option<Duration> {
+        self.send_timeout
+    }
+
+    pub(super) fn set_recv_timeout(&mut self, t: Option<Duration>) {
+        self.recv_timeout = t;
+    }
+
+    pub(super) fn set_send_timeout(&mut self, t: Option<Duration>) {
+        self.send_timeout = t;
     }
 }
 
@@ -565,6 +587,24 @@ impl OpenDescription {
 
     pub(super) fn set_lease(&mut self, lease: i32) {
         self.base_mut().set_lease(lease);
+    }
+
+    /// SO_RCVTIMEO for this description. Only HostSocket carries one; every
+    /// other variant has no socket timeout, so returns None.
+    pub(super) fn recv_timeout(&self) -> Option<Duration> {
+        match self {
+            OpenDescription::HostSocket { base, .. } => base.recv_timeout(),
+            _ => None,
+        }
+    }
+
+    /// SO_SNDTIMEO for this description. Only HostSocket carries one; every
+    /// other variant has no socket timeout, so returns None.
+    pub(super) fn send_timeout(&self) -> Option<Duration> {
+        match self {
+            OpenDescription::HostSocket { base, .. } => base.send_timeout(),
+            _ => None,
+        }
     }
 
     pub(super) fn stat_source(&self) -> OpenStatSource {

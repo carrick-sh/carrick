@@ -49,11 +49,11 @@ const KNOWN_PROBE_GAPS: &[&str] = &[
     // M4/M3 batch — probes on disk, fixes integrated one batch at a time; each
     // entry is removed in the same commit that lands its fix.
     // linuxsysinfo FIXED in M4 (struct padding) — now PASSES.
-    "recvmsgtrunc",    // M4: recvmsg never reports MSG_TRUNC
+    // recvmsgtrunc FIXED in M4 (host recvmsg + msg_flags translation) — now PASSES.
     // termiosbits FIXED in M4 (c_cflag/c_iflag per-field translation) — now PASSES.
     // timersettimeabs FIXED in M4 (ABSTIME + timespec validation) — now PASSES.
     // iouringenterflag FIXED in M4 (flag/arg validation + to_submit bound) — now PASSES.
-    "sotimeo",         // M3: SO_RCVTIMEO/SO_SNDTIMEO honored on blocking recv/send
+    // sotimeo FIXED in M3 (SO_RCVTIMEO/SO_SNDTIMEO stored per-OFD + threaded into blocking_io) — now PASSES.
     // epollstaledel FIXED in M3 (pending_ready keyed by fd) — now PASSES.
 ];
 use std::time::{Duration, Instant};
