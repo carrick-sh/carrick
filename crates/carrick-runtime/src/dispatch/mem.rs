@@ -234,6 +234,15 @@ impl SyscallDispatcher {
                 flags |= LINUX_MAP_FIXED;
             }
 
+            // Linux validates the fd FIRST for a file mapping: ksys_mmap_pgoff
+            // does fget(fd) and returns EBADF before do_mmap ever checks the
+            // length/prot/flags (which would yield EINVAL). So a bad fd beats a
+            // bad length — LTP mmap08 maps length 0 on a closed fd and expects
+            // EBADF, not EINVAL. (Anonymous mappings take no fd → skip.)
+            if flags & LINUX_MAP_ANONYMOUS == 0 && this.open_file(fd.0).is_none() {
+                return Ok(LINUX_EBADF.into());
+            }
+
             let map_type = flags & (LINUX_MAP_SHARED | LINUX_MAP_PRIVATE);
             if length == 0
                 || prot & !(LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC) != 0
@@ -478,6 +487,13 @@ impl SyscallDispatcher {
         }
 
         fn munmap(this, cx, address: GuestPtr, length: u64) {
+            // Linux munmap EINVAL edges (__vm_munmap): the address must be
+            // page-aligned and the length non-zero. LTP munmap03 munmaps the
+            // address of a BSS global (8-aligned, not page-aligned) and that
+            // address + 8, expecting EINVAL — carrick lacked the alignment gate.
+            if !address.0.is_multiple_of(LINUX_PAGE_SIZE) {
+                return Ok(LINUX_EINVAL.into());
+            }
             if length == 0 {
                 return Ok(LINUX_EINVAL.into());
             }
@@ -490,6 +506,27 @@ impl SyscallDispatcher {
                 // SharedAnon frees are pure bookkeeping. The aperture stays
                 // stage-2 mapped — no hv_vm_unmap.
                 this.writeback_shared(cx, &alloc, true);
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            }
+            // A guest VA inside the high-VA alias window is a dynamic alias
+            // mapping — a MAP_SHARED file region (backed LIVE by the host page
+            // cache, so no writeback is owed). It is a valid mapping, so munmap
+            // must succeed (LTP munmap01/02 unmapped a MAP_SHARED file region
+            // and carrick wrongly returned EINVAL because the alias VA is in
+            // neither the shared aperture nor the mmap arena). Best-effort
+            // stage-1 invalidate so use-after-munmap faults; arm64 HVF has no
+            // stage-2 unmap, so the alias IPA + dup fd are reclaimed at process
+            // teardown. Addresses BEYOND the window (e.g. RLIM_INFINITY, which
+            // LTP munmap03 passes to assert EINVAL, or the Rosetta arena) fall
+            // through to the range check below and stay EINVAL.
+            let alias_end =
+                crate::memory::LINUX_HIGH_VA_THRESHOLD + crate::memory::LINUX_ALIAS_IPA_SIZE;
+            if address.0 >= crate::memory::LINUX_HIGH_VA_THRESHOLD && address.0 < alias_end {
+                if let Some(len) = align_up_u64(length, LINUX_PAGE_SIZE)
+                    && let Ok(len_usize) = usize::try_from(len)
+                {
+                    let _ = cx.memory.unmap_range(address.0, len_usize);
+                }
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
             if !range_within(address.0, length, LINUX_MMAP_BASE, crate::memory::mmap_arena_size()) {
