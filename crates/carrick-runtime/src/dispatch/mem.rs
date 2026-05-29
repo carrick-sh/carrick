@@ -801,8 +801,11 @@ impl SyscallDispatcher {
             Ok(this.io_uring_setup_impl(cx.memory, entries as u32, params_ptr.0))
         }
 
-        fn io_uring_enter(this, cx, fd: Fd, to_submit: u64, _min_complete: u64, _flags: u64, _argp: GuestPtr, _argsz: u64) {
-            Ok(this.io_uring_enter_impl(cx.memory, fd.0, to_submit as u32))
+        // `_min_complete` stays unused: carrick's enter is synchronous, so every
+        // CQE the guest waited for is posted by the time enter returns. flags/
+        // argp/argsz are now validated by the impl. (audit M4)
+        fn io_uring_enter(this, cx, fd: Fd, to_submit: u64, _min_complete: u64, flags: u64, argp: GuestPtr, argsz: u64) {
+            Ok(this.io_uring_enter_impl(cx.memory, fd.0, to_submit as u32, flags as u32, argp.0, argsz))
         }
 
         fn io_uring_register(this, cx, _fd: Fd, _opcode: u64, _arg: GuestPtr, _nr_args: u64) {

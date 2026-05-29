@@ -2030,6 +2030,23 @@ pub const LINUX_IORING_OP_RECVMSG: u8 = 10;
 pub const LINUX_IORING_OP_SEND: u8 = 26;
 pub const LINUX_IORING_OP_RECV: u8 = 27;
 
+// io_uring_enter `flags` bits Linux defines (uapi <linux/io_uring.h>). Any flag
+// bit outside FLAGS_MASK is rejected with EINVAL at syscall entry. (audit M4)
+pub const LINUX_IORING_ENTER_GETEVENTS: u32 = 1 << 0;
+pub const LINUX_IORING_ENTER_SQ_WAKEUP: u32 = 1 << 1;
+pub const LINUX_IORING_ENTER_SQ_WAIT: u32 = 1 << 2;
+pub const LINUX_IORING_ENTER_EXT_ARG: u32 = 1 << 3;
+pub const LINUX_IORING_ENTER_REGISTERED_RING: u32 = 1 << 4;
+pub const LINUX_IORING_ENTER_ABS_TIMER: u32 = 1 << 5;
+pub const LINUX_IORING_ENTER_EXT_ARG_REG: u32 = 1 << 6;
+pub const LINUX_IORING_ENTER_FLAGS_MASK: u32 = LINUX_IORING_ENTER_GETEVENTS
+    | LINUX_IORING_ENTER_SQ_WAKEUP
+    | LINUX_IORING_ENTER_SQ_WAIT
+    | LINUX_IORING_ENTER_EXT_ARG
+    | LINUX_IORING_ENTER_REGISTERED_RING
+    | LINUX_IORING_ENTER_ABS_TIMER
+    | LINUX_IORING_ENTER_EXT_ARG_REG;
+
 // mmap offsets the guest passes to map each ring region off the io_uring fd.
 pub const LINUX_IORING_OFF_SQ_RING: u64 = 0;
 pub const LINUX_IORING_OFF_CQ_RING: u64 = 0x0800_0000;
