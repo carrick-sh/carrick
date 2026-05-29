@@ -65,9 +65,9 @@ SysV-semaphore, and SysV-msg-queue fixes landed against it.
 | process    | 114| 1 | 29  | 41 | 1 | 206 | 392 | **61%** |
 | ipc        | 14 | 0 | 14  | 12 | 0 | 7   | 47  | **35%** (sem + msg queues functional) |
 | net        | 13 | 0 | 15  | 9  | 0 | 16  | 53  | **35%** |
-| mm         | 19 | 1 | 30  | 23 | 1 | 43  | 117 | **26%** |
+| mm         | 25 | 1 | 28  | 19 | 1 | 43  | 117 | **34%** |
 | xattr      | 3  | 0 | 1   | 1  | 0 | 24  | 29  | **60%** |
-| **TOTAL**  | **529** | **7** | **201** | **148** | **11** | **540** | **1436** | **529/896 = 59%** |
+| **TOTAL**  | **535** | **7** | **199** | **144** | **11** | **540** | **1436** | **535/896 = 60%** |
 
 _Last refresh (2026-05-28): the functional-FIFO cluster (commit `31f2a7c`) added
 +6 verified-MATCH — `select01` flipped to MATCH (16/16) via the FIFO O_RDWR leg +
@@ -77,7 +77,15 @@ the select multi-set return-count fix; `mknod02–05/09`, `mknodat01` now MATCH
 (macOS can't `mknod` char/block devices — inherent), `mknod06` tst_test re-exec
 hang, `select03`/`pselect02` select error-edge TBROK, `mknod08` DAC EACCES._
 
-_Last refresh (2026-05-29): the mkdir setgid-directory-inheritance fix (commit
+_Last refresh (2026-05-29, mm): the mmap/munmap correctness fixes (commit
+`4878690`) re-swept the mmap*/munmap* family — `mmap08` (bad-fd-before-length →
+EBADF), `munmap01`/`munmap02` (unmap a MAP_SHARED/MAP_PRIVATE file region), and
+`munmap03` (page-alignment + out-of-range EINVAL edges) all → MATCH. The
+re-sweep also caught up stale mm records from earlier M4 commits: mm MATCH
+19→25, DIFF 30→28, TBROK 23→19 (no test regressed). Probe `mmapmunmap`. Total
+verified-MATCH 529→535/896 (60%); mm 26%→34%._
+
+_Earlier 2026-05-29: the mkdir setgid-directory-inheritance fix (commit
 `f6280ba`) flipped `mkdir02` → MATCH (+1) — a dir created inside an S_ISGID
 parent now inherits the parent's GID + gets S_ISGID. fs 188→189; DIFF 202→201.
 Probe `mkdirsetgid`. `mkdir04` stays DIFF (mkdir-in-non-writable-parent →
