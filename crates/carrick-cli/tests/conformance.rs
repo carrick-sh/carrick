@@ -41,7 +41,7 @@ const KNOWN_PROBE_GAPS: &[&str] = &[
     // scheduled for the cited milestone; removed from this list when the fix lands
     // (the "UNEXPECTED PASS" guard fails the suite if we forget).
     "fsetfl",       // M4: F_SETFL clobbers access mode + stores creation bits (fs.rs:1899)
-    "rosharedbus",  // M1: write thru RO MAP_SHARED -> host SIGBUS (write_guest_bytes perms gap)
+    // rosharedbus FIXED in M1 (write_guest_bytes_checked perms check) — now PASSES.
     "mapfixed",     // M5: MAP_FIXED|MAP_PRIVATE over shared aperture must remap private
     "forkaltstack", // M2: sigaltstack not inherited across fork (per-tid altstack)
     "pselecteintr", // M3: select()/pselect6 blocks uninterruptibly (no EINTR)
