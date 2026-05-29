@@ -823,6 +823,64 @@ impl SyscallDispatcher {
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
+        /// rt_tgsigqueueinfo(tgid, tid, sig, uinfo): queue `sig` with the
+        /// caller's siginfo to a SPECIFIC thread `tid` within thread-group
+        /// `tgid` (Linux nr 240). Same delivery machinery as rt_sigqueueinfo,
+        /// but the thread routing keys on the explicit `tid` argument rather
+        /// than re-using the tgid as the thread. LTP rt_tgsigqueueinfo01 spawns
+        /// threads and checks each target's SA_SIGINFO handler observes the
+        /// queued si_ptr payload (signal-to-self, to a sibling, and to the
+        /// parent thread).
+        fn rt_tgsigqueueinfo(this, cx, tgid: Pid, tid: Pid, sig: Signal, info_ptr: GuestPtr) {
+            let tgid = i64::from(tgid.0);
+            let tid = i64::from(tid.0);
+            let signum = sig.0 as u64;
+            if !is_valid_signum(signum) {
+                return Ok(LINUX_EINVAL.into());
+            }
+            let s = signum as i32;
+
+            // Read the caller's siginfo; the kernel re-stamps si_signo.
+            let mut user_info: Option<LinuxSiginfo> = None;
+            if info_ptr.0 != 0 {
+                let memory = &*cx.memory;
+                if let Ok(bytes) =
+                    memory.read_bytes(info_ptr.0, core::mem::size_of::<LinuxSiginfo>())
+                    && let Ok(mut info) = LinuxSiginfo::read_from_bytes(&bytes)
+                {
+                    info.si_signo = s;
+                    user_info = Some(info);
+                }
+            }
+
+            // Route to the named thread `tid` (within our process). Mirrors
+            // rt_sigqueueinfo's sibling path so the SA_SIGINFO frame carries the
+            // original si_value.
+            if let Some(routed) = this.route_thread_signal(cx, tid, signum) {
+                let target_tid = tid as crate::thread::ThreadId;
+                if let Some(info) = user_info {
+                    this.record_pending_siginfo(target_tid, s, info);
+                }
+                return Ok(routed);
+            }
+
+            // Cross-process: the target thread-group is some other host pid.
+            let host_pid = std::process::id() as i64;
+            let is_self = tgid == host_pid || tgid == LINUX_BOOTSTRAP_PID as i64;
+            if !is_self {
+                return Ok(bootstrap_signal_send(tgid, /*tid_required=*/ false, signum));
+            }
+
+            // Self-target single-threaded (or no sibling hit): queue against the
+            // caller's tid so delivery pairs with the same SA_SIGINFO frame.
+            let ctid = Self::ctx_tid(cx);
+            if let Some(info) = user_info {
+                this.record_pending_siginfo(ctid, s, info);
+            }
+            this.mark_signal_pending(ctid, s);
+            Ok(DispatchOutcome::Returned { value: 0 })
+        }
+
         /// rt_sigreturn(): pop signal frame and restore registers.
         fn rt_sigreturn(this, cx) {
             Ok(DispatchOutcome::SigReturn)
