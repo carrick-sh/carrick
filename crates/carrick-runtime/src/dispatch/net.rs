@@ -2320,6 +2320,7 @@ impl SyscallDispatcher {
             // gets EAGAIN. Never blocks under the dispatcher lock.
             let nonblocking = this.io_is_nonblocking(fd, flags);
             let host_flags = linux_to_host_msg_flags(flags) | libc::MSG_DONTWAIT;
+            let len = len.min(crate::dispatch::MAX_RW_COUNT);
             let mut buf = vec![0u8; len];
             let outcome = this.blocking_io(host_fd, IoDir::Read, nonblocking, || {
                 let mut sa = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
