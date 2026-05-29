@@ -278,6 +278,7 @@ underlying gap got fixed):
 
 | Invariant | Owned by | Stands in for (LTP) |
 |---|---|---|
+| **semctl(SETVAL)/SETALL value-range: a semaphore value must be in [0, SEMVMX(32767)]; negative or too-large → ERANGE (macOS doesn't enforce the Linux bound)** | ✅ `semctlrange` | semctl05 |
 | **`shmget` + `shmat` + `shmdt` + `shmctl(IPC_RMID/IPC_STAT/SHM_STAT/SHM_INFO)` round-trip; per-segment `shm_nattch` / `shm_ctime` / `shm_atime`; cross-process coherence after fork via host-file-backed `/tmp/carrick-shm/<key>` (inode = shmid)** | ✅ `sysvshm` | kill07 (MATCH), kill05 (advances past TBROK), shmctl01 (6/12 → bumped from 0/12), shmat01 (1/4 → bumped from 0/4), shmget/shmdt LTP families |
 | **`msgctl(IPC_STAT)` fills the ipc64_perm (key @0, mode @20) in the returned msqid64_ds — was leaving them zero (only the msg_* fields were translated); owner ids from the guest creds, key/mode/seq from the host stat** | ✅ `msgctlstat` | msgctl01 |
 | **`semget(key, nsems, flg)` with nsems > Linux SEMMSL (32000) → EINVAL (was forwarding to macOS semget, which returns ENOSPC for its far-smaller limit)** | ✅ `semgetnsems` | semget02 (nsems-too-large leg; semget02's nsems>existing-set→EINVAL-before-EACCES ordering + semget05 deferred — an errno-order vs macOS perm-gate mismatch) |

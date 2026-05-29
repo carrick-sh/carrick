@@ -877,8 +877,15 @@ fn sysv_semctl<M: GuestMemory>(
             };
         }
         LINUX_SETVAL => {
-            // arg is `union semun { int val }`.
-            let rc = unsafe { libc::semctl(semid, semnum, host_cmd, arg as i32) };
+            // arg is `union semun { int val }`. Linux requires the value be in
+            // [0, SEMVMX(32767)]; out of range → ERANGE (semctl05). macOS does
+            // not enforce the Linux bound, so validate before forwarding.
+            const SEMVMX: i32 = 32767;
+            let val = arg as i32;
+            if !(0..=SEMVMX).contains(&val) {
+                return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ERANGE));
+            }
+            let rc = unsafe { libc::semctl(semid, semnum, host_cmd, val) };
             return match rc.host_syscall_errno() {
                 Ok(_) => Ok(DispatchOutcome::Returned { value: 0 }),
                 Err(errno) => Ok(DispatchOutcome::errno(errno)),
@@ -898,6 +905,11 @@ fn sysv_semctl<M: GuestMemory>(
                 };
                 for (i, v) in vals.iter_mut().enumerate() {
                     *v = u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]);
+                }
+                // SETALL: every value must be <= SEMVMX(32767) → else ERANGE
+                // (semctl05; macOS doesn't enforce the Linux bound).
+                if vals.iter().any(|&v| v > 32767) {
+                    return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ERANGE));
                 }
             }
             let rc = unsafe { libc::semctl(semid, 0, host_cmd, vals.as_mut_ptr()) };
