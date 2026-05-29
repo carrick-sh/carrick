@@ -75,8 +75,12 @@ pub(super) fn deliver_fault_signal(
     traps: usize,
 ) -> Result<Option<VcpuLoopOutcome>, RuntimeError> {
     let dispatcher = &kernel.dispatcher;
+    // Capture the forked-child flag up front so the `terminate` closure does not
+    // borrow `engine` — it is now also called in the inject-failure arm below,
+    // after a &mut engine use, and a closure-held &engine would conflict. (M1b)
+    let is_forked_child = engine.is_forked_child();
     let terminate = |signum: i32| -> Result<Option<VcpuLoopOutcome>, RuntimeError> {
-        if engine.is_forked_child() || kernel.dispatcher.is_forked_guest_process() {
+        if is_forked_child || kernel.dispatcher.is_forked_guest_process() {
             let out = dispatcher.stdout();
             let err = dispatcher.stderr();
             forked_child_die_by_signal(signum, &out, &err);
@@ -128,7 +132,9 @@ pub(super) fn deliver_fault_signal(
     // handler advances it — e.g. Go's sigpanic, or its debug-call handler doing
     // `set_pc(pc+4)` to step past the BRK). For a BRK this makes `sigpc` point at
     // the BRK so Go reads `*(*uint32)(sigpc) == 0xd4200000`.
-    engine.inject_signal(
+    // Bind the result to release the &mut engine borrow before calling the
+    // `terminate` closure (which borrows engine immutably).
+    let injected = engine.inject_signal(
         signum,
         action.sa_handler,
         restorer,
@@ -139,6 +145,13 @@ pub(super) fn deliver_fault_signal(
         Some((si_code, si_addr)),
         None, // a synchronous fault never carries a queued (rt_sigqueueinfo) siginfo
         false, // a synchronous fault re-runs the faulting instruction, never a syscall restart
-    )?;
-    Ok(None)
+    );
+    match injected {
+        Ok(()) => Ok(None),
+        // Linux force_sigsegv: the handler frame couldn't be written to the
+        // user stack -> the thread-group dies by SIGSEGV (exit 139), not a
+        // fatal carrick error.
+        Err(crate::trap::TrapError::SignalDeliveryFault) => terminate(11), // SIGSEGV
+        Err(e) => Err(e.into()),
+    }
 }
