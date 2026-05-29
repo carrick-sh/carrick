@@ -990,6 +990,7 @@ impl SyscallDispatcher {
         96 => set_tid_address,
         98 => futex,
         99 => set_robust_list,
+        100 => get_robust_list,
         101 => nanosleep,
         102 => getitimer,
         103 => setitimer,
@@ -1094,6 +1095,7 @@ impl SyscallDispatcher {
         231 => munlockall,
         232 => mincore,
         233 => madvise,
+        240 => rt_tgsigqueueinfo,
         242 => accept4,
         260 => wait4,
         261 => prlimit64,
@@ -1667,8 +1669,11 @@ impl SyscallDispatcher {
             }
             98 => dispatch_threaded_futex(request, memory, reporter, futex),
             99 => {
+                // set_robust_list: len must equal sizeof(struct
+                // robust_list_head) (24); anything else → EINVAL (matches the
+                // serialized macro handler — LTP set_robust_list01).
                 let len = request.arg(1);
-                if len == 0 {
+                if len != 24 {
                     DispatchOutcome::Errno {
                         errno: LINUX_EINVAL,
                     }
