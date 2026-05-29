@@ -1367,7 +1367,13 @@ pub const LINUX_O_CREAT: u64 = 0o100;
 pub const LINUX_O_EXCL: u64 = 0o200;
 pub const LINUX_O_TRUNC: u64 = 0o1000;
 pub const LINUX_O_APPEND: u64 = 0o2000;
-pub const LINUX_O_DIRECTORY: u64 = 0o200000;
+// aarch64 fcntl flag values (asm-generic): O_DIRECTORY=0o40000,
+// O_NOFOLLOW=0o100000, O_DIRECT=0o200000, O_LARGEFILE=0o400000. carrick had
+// O_DIRECTORY/O_DIRECT swapped (and O_NOFOLLOW wrong), so O_DIRECTORY never
+// triggered the directory-required path and an O_DIRECT open was mistaken for
+// it. Verified against a real aarch64-musl binary.
+pub const LINUX_O_DIRECTORY: u64 = 0o40000;
+pub const LINUX_O_NOFOLLOW: u64 = 0o100000;
 /// `__O_TMPFILE` — the distinguishing bit of `O_TMPFILE` (which is
 /// `__O_TMPFILE | O_DIRECTORY`). The `pathname` names the parent directory and
 /// the kernel returns an unnamed regular file in it.
@@ -1634,10 +1640,10 @@ bitflags! {
         const NONBLOCK = LINUX_O_NONBLOCK;
         const DSYNC = 0o10000;
         const ASYNC = 0o20000;
-        const DIRECT = 0o40000;
-        const LARGEFILE = 0o100000;
+        const DIRECT = 0o200000;
+        const LARGEFILE = 0o400000;
         const DIRECTORY = LINUX_O_DIRECTORY;
-        const NOFOLLOW = 0o400000;
+        const NOFOLLOW = LINUX_O_NOFOLLOW;
         const NOATIME = 0o1000000;
         const CLOEXEC = LINUX_O_CLOEXEC;
         const SYNC = 0o4010000;
