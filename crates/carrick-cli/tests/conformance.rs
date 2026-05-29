@@ -40,7 +40,7 @@ const KNOWN_PROBE_GAPS: &[&str] = &[
     // Each probe encodes a confirmed, dynamically-validated finding whose fix is
     // scheduled for the cited milestone; removed from this list when the fix lands
     // (the "UNEXPECTED PASS" guard fails the suite if we forget).
-    "fsetfl",       // M4: F_SETFL clobbers access mode + stores creation bits (fs.rs:1899)
+    // fsetfl FIXED in M4 (F_SETFL preserves access mode, masks mutable bits) — now PASSES.
     // rosharedbus FIXED in M1 (write_guest_bytes_checked perms check) — now PASSES.
     "mapfixed",     // M5: MAP_FIXED|MAP_PRIVATE over shared aperture must remap private
     // forkaltstack FIXED in M2 (migrate_thread_signal_state) — now PASSES.
