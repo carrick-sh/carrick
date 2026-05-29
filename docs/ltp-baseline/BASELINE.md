@@ -61,13 +61,13 @@ SysV-semaphore, and SysV-msg-queue fixes landed against it.
 | epoll_poll | 34 | 3 | 6   | 9  | 0 | 10  | 62  | **65%** |
 | sched      | 33 | 0 | 11  | 5  | 0 | 18  | 67  | **67%** |
 | other      | 47 | 2 | 17  | 2  | 0 | 53  | 121 | **69%** |
-| fs         | 187| 0 | 76  | 32 | 6 | 141 | 442 | **62%** |
+| fs         | 188| 0 | 75  | 32 | 6 | 141 | 442 | **62%** |
 | process    | 114| 1 | 29  | 41 | 1 | 206 | 392 | **61%** |
 | ipc        | 14 | 0 | 14  | 12 | 0 | 7   | 47  | **35%** (sem + msg queues functional) |
 | net        | 13 | 0 | 15  | 9  | 0 | 16  | 53  | **35%** |
 | mm         | 19 | 1 | 30  | 23 | 1 | 43  | 117 | **26%** |
 | xattr      | 3  | 0 | 1   | 1  | 0 | 24  | 29  | **60%** |
-| **TOTAL**  | **526** | **7** | **204** | **148** | **11** | **540** | **1436** | **526/896 = 59%** |
+| **TOTAL**  | **527** | **7** | **203** | **148** | **11** | **540** | **1436** | **527/896 = 59%** |
 
 _Last refresh (2026-05-28): the functional-FIFO cluster (commit `31f2a7c`) added
 +6 verified-MATCH — `select01` flipped to MATCH (16/16) via the FIFO O_RDWR leg +
@@ -85,8 +85,8 @@ probe-gated; conformance gate green at 92 probes. fs jumped 142→171._
 
 ### The target (DoD #2)
 
-Live: **59% verified-MATCH** of oracle-valid tests (526/896; full sweep, HEAD;
-59% incl. partial). NOTE: re-measuring the fcntl family surfaced fcntl07/14
+Live: **59% verified-MATCH** of oracle-valid tests (527/896; full sweep, HEAD;
+60% incl. partial). NOTE: re-measuring the fcntl family surfaced fcntl07/14
 (+_64) as TIMEOUT (F_SETLKW cross-process blocking locks — a separate
 blocking-lock/framework-lifecycle cluster, NOT the F_GETLK path this batch
 fixed; the change is dead-code for F_SETLKW and fcntl05 MATCHes). Committed baseline was 47% (425/898). The curated four are
