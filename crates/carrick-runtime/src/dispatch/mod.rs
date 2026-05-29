@@ -1099,6 +1099,7 @@ impl SyscallDispatcher {
         261 => prlimit64,
         266 => clock_adjtime,
         267 => syncfs,
+        84 => sync_file_range,
         276 => renameat2,
         277 => sys_seccomp,
         275 => sched_getattr,

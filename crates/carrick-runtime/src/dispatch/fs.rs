@@ -3857,6 +3857,54 @@ impl SyscallDispatcher {
 
         }
 
+        /// `sync_file_range(fd, offset, nbytes, flags)` (advisory range flush).
+        /// macOS has no equivalent, so it's a validating best-effort flush.
+        /// Validation order matches Linux (LTP sync_file_range01): unknown
+        /// flags / negative offset / negative nbytes (or offset+nbytes
+        /// overflow) → EINVAL; bad fd → EBADF; a pipe/socket/anon fd (no page
+        /// cache range) → ESPIPE; a regular file → best-effort fsync, return 0.
+        fn sync_file_range(this, cx, fd: Fd, offset: u64, nbytes: u64, flags: u64) {
+            let fd: Fd = fd;
+            // SYNC_FILE_RANGE_WAIT_BEFORE(1) | WRITE(2) | WAIT_AFTER(4).
+            const VALID_FLAGS: u64 = 0x1 | 0x2 | 0x4;
+            if flags & !VALID_FLAGS != 0 {
+                return Ok(LINUX_EINVAL.into());
+            }
+            let offset_i = offset as i64;
+            let nbytes_i = nbytes as i64;
+            if offset_i < 0 || nbytes_i < 0 || offset_i.checked_add(nbytes_i).is_none() {
+                return Ok(LINUX_EINVAL.into());
+            }
+            let Some(open_file) = this.open_file(fd.0) else {
+                return Ok(LINUX_EBADF.into());
+            };
+            // A pipe/socket/eventfd/timerfd/epoll/pidfd/inotify/signalfd/netlink
+            // fd has no page-cache range to sync → ESPIPE.
+            let is_special = matches!(
+                &*open_file.description.read(),
+                OpenDescription::HostPipe { .. }
+                    | OpenDescription::HostSocket { .. }
+                    | OpenDescription::PipeReader { .. }
+                    | OpenDescription::PipeWriter { .. }
+                    | OpenDescription::EventFd { .. }
+                    | OpenDescription::TimerFd { .. }
+                    | OpenDescription::Epoll { .. }
+                    | OpenDescription::Pidfd { .. }
+                    | OpenDescription::Inotify { .. }
+                    | OpenDescription::SignalFd { .. }
+                    | OpenDescription::Netlink { .. }
+            );
+            if is_special {
+                return Ok(LINUX_ESPIPE.into());
+            }
+            // Regular / synthetic / in-memory file: best-effort flush a real
+            // host fd; otherwise a no-op (the range-cache effect isn't observable).
+            if let Ok(Some(host_fd)) = this.host_file_fd_for_flush(fd.0) {
+                let _ = flush_host_fd(host_fd);
+            }
+            Ok(DispatchOutcome::Returned { value: 0 })
+        }
+
         fn fdatasync(this, cx, fd: Fd) {
 
             let fd: Fd = fd;
