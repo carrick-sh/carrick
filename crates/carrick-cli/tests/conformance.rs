@@ -44,7 +44,9 @@ const KNOWN_PROBE_GAPS: &[&str] = &[
     // rosharedbus FIXED in M1 (write_guest_bytes_checked perms check) — now PASSES.
     "mapfixed",     // M5: MAP_FIXED|MAP_PRIVATE over shared aperture must remap private
     // forkaltstack FIXED in M2 (migrate_thread_signal_state) — now PASSES.
-    "pselecteintr", // M3: select()/pselect6 blocks uninterruptibly (no EINTR)
+    // pselecteintr FIXED in M3 (WaitOnFdsSelect: select/pselect6 hand off to the
+    //   signal-interruptible waiter; fd-sets left intact across the wait, zeroed
+    //   only on timeout) — now PASSES.
     // forkfpregs FIXED in M2 (VcpuSnapshot V0-V31/FPSR/FPCR) — now PASSES.
     // M4/M3 batch — probes on disk, fixes integrated one batch at a time; each
     // entry is removed in the same commit that lands its fix.
