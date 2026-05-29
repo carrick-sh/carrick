@@ -232,6 +232,13 @@ impl SyscallDispatcher {
             if which > LINUX_PRIO_USER || !(-20..=19).contains(&prio) {
                 return Ok(LINUX_EINVAL.into());
             }
+            // A negative id (pid/pgid/uid) names no target → ESRCH for every
+            // PRIO_* class (setpriority02). The EACCES (unprivileged
+            // nice-lowering) and EPERM (cross-uid target) cases need a fuller
+            // priority/uid model — tracked follow-up.
+            if who.0 < 0 {
+                return Ok(LINUX_ESRCH.into());
+            }
             if which == LINUX_PRIO_PROCESS && who.0 != 0 && who.0 != LINUX_BOOTSTRAP_PID as i32 {
                 return Ok(LINUX_ESRCH.into());
             }
@@ -241,6 +248,11 @@ impl SyscallDispatcher {
         fn getpriority(this, cx, which: u64, who: Pid) {
             if which > LINUX_PRIO_USER {
                 return Ok(LINUX_EINVAL.into());
+            }
+            // A negative id names no target → ESRCH, for every PRIO_* class
+            // (getpriority02); PRIO_PROCESS additionally resolves only self/init.
+            if who.0 < 0 {
+                return Ok(LINUX_ESRCH.into());
             }
             if which == LINUX_PRIO_PROCESS && who.0 != 0 && who.0 != LINUX_BOOTSTRAP_PID as i32 {
                 return Ok(LINUX_ESRCH.into());

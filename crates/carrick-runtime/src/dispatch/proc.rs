@@ -76,8 +76,10 @@ fn sched_policy_is_known(policy: i32) -> bool {
 fn sched_read_param_priority<M: GuestMemory>(
     cx: &mut SyscallCtx<M>,
     address: GuestPtr,
-) -> Result<i32, DispatchError> {
+) -> Result<i32, i32> {
     if address.0 == 0 {
+        // NULL param: kept as the legacy "-1" sentinel so the time-sharing
+        // policies' prio!=0 check yields EINVAL (unchanged behavior).
         return Ok(-1);
     }
     let memory = &*cx.memory;
@@ -86,7 +88,9 @@ fn sched_read_param_priority<M: GuestMemory>(
             let arr: [u8; 4] = b.as_slice().try_into().unwrap_or([0; 4]);
             Ok(i32::from_le_bytes(arr))
         }
-        Err(_) => Ok(-1),
+        // A bad (non-NULL) param pointer is EFAULT — checked before the
+        // priority-range validation (sched_setscheduler01 bad-ptr case).
+        Err(_) => Err(LINUX_EFAULT),
     }
 }
 
@@ -732,6 +736,10 @@ impl SyscallDispatcher {
         /// process is SCHED_OTHER (0). pid=0 / self / our own host pid all
         /// resolve to self; any other pid is ESRCH.
         fn sched_getscheduler(this, cx, pid: u64) {
+            // Linux rejects a negative pid with EINVAL before the ESRCH path.
+            if (pid as i32) < 0 {
+                return Ok(LINUX_EINVAL.into());
+            }
             if !sched_pid_is_self(pid) {
                 return Ok(LINUX_ESRCH.into());
             }
@@ -745,7 +753,10 @@ impl SyscallDispatcher {
             // Linux semantics: any process can query any other process's
             // sched params. With SCHED_OTHER+prio 0 across the board, the
             // value the guest reads back is the same regardless of which
-            // valid pid it picks. Reject only unknown pids (-1/ESRCH).
+            // valid pid it picks. A negative pid is EINVAL (before ESRCH).
+            if (pid as i32) < 0 {
+                return Ok(LINUX_EINVAL.into());
+            }
             if !sched_pid_exists(pid) {
                 return Ok(LINUX_ESRCH.into());
             }
@@ -765,6 +776,9 @@ impl SyscallDispatcher {
         /// refuses any RT policy with EPERM; SCHED_OTHER+priority=0 succeeds
         /// as a no-op. Unknown policies are EINVAL.
         fn sched_setscheduler(this, cx, pid: u64, policy: u64, address: GuestPtr) {
+            if (pid as i32) < 0 {
+                return Ok(LINUX_EINVAL.into());
+            }
             if !sched_pid_is_self(pid) {
                 return Ok(LINUX_ESRCH.into());
             }
@@ -772,7 +786,10 @@ impl SyscallDispatcher {
             if !sched_policy_is_known(policy_i) {
                 return Ok(LINUX_EINVAL.into());
             }
-            let prio = sched_read_param_priority(cx, address)?;
+            let prio = match sched_read_param_priority(cx, address) {
+                Ok(prio) => prio,
+                Err(errno) => return Ok(errno.into()),
+            };
             if policy_i == LINUX_SCHED_FIFO || policy_i == LINUX_SCHED_RR {
                 // No CAP_SYS_NICE in carrick guest → mirror Linux's EPERM.
                 return Ok(LINUX_EPERM.into());
@@ -788,10 +805,16 @@ impl SyscallDispatcher {
         /// SCHED_OTHER-only model the only valid priority is 0; anything else
         /// is EINVAL (matches Linux for SCHED_NORMAL/OTHER/BATCH/IDLE).
         fn sched_setparam(this, cx, pid: u64, address: GuestPtr) {
+            if (pid as i32) < 0 {
+                return Ok(LINUX_EINVAL.into());
+            }
             if !sched_pid_exists(pid) {
                 return Ok(LINUX_ESRCH.into());
             }
-            let prio = sched_read_param_priority(cx, address)?;
+            let prio = match sched_read_param_priority(cx, address) {
+                Ok(prio) => prio,
+                Err(errno) => return Ok(errno.into()),
+            };
             if prio != 0 {
                 return Ok(LINUX_EINVAL.into());
             }
