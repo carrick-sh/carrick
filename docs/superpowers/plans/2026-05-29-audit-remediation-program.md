@@ -146,6 +146,16 @@ The cluster that lets a guest crash/escape the host. Highest priority for releas
 
 - `pselect6`/`select` all-host path → `WaitOnFds` handoff (signal-interruptible),
   mirroring `ppoll`; honor the sigmask arg.
+  - **DEFERRED (attempted, reverted): not a simple ppoll mirror.** select's fd_sets
+    are input==output. The runtime's WaitOnFds completion (runtime.rs:1084) does
+    `Ready`→re-dispatch (the handler re-reads the guest fd_sets, so they must be
+    the ORIGINAL input) but `TimedOut`→returns `on_timeout` directly (so the sets
+    must already be ZEROED — Linux zeroes them on timeout). A plain handoff can't
+    satisfy both: preserving input regresses `selecttimeout` (not-ready bit stays
+    set after timeout); zeroing first breaks the readiness re-dispatch. Correct fix
+    needs either (a) carrick-side per-tid snapshot of the original fd_sets restored
+    on re-dispatch + zeroed write for timeout, or (b) runtime re-dispatch-on-timeout
+    for select so the handler can zero+return 0. `pselecteintr` stays XFAIL until then.
 - `SO_RCVTIMEO`/`SO_SNDTIMEO` honored on blocking recv/send (thread the per-socket
   timeout into the `WaitOnFds` timeout).
 - `rt_sigsuspend` waits on the per-tid `THREAD_PENDING` set (tkill/tgkill wakeups),
