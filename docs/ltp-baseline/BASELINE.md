@@ -64,10 +64,10 @@ SysV-semaphore, and SysV-msg-queue fixes landed against it.
 | fs         | 206| 0 | 61  | 23 | 11 | 141 | 442 | **68%** |
 | process    | 115| 1 | 28  | 41 | 1 | 206 | 392 | **62%** |
 | ipc        | 14 | 0 | 14  | 12 | 0 | 7   | 47  | **35%** (sem + msg queues functional) |
-| net        | 15 | 0 | 13  | 9  | 0 | 16  | 53  | **40%** |
+| net        | 16 | 0 | 12  | 9  | 0 | 16  | 53  | **43%** |
 | mm         | 25 | 1 | 28  | 19 | 1 | 43  | 117 | **34%** |
 | xattr      | 3  | 0 | 1   | 1  | 0 | 24  | 29  | **60%** |
-| **TOTAL**  | **565** | **7** | **173** | **135** | **16** | **540** | **1436** | **565/896 = 63%** |
+| **TOTAL**  | **566** | **7** | **172** | **135** | **16** | **540** | **1436** | **566/896 = 63%** |
 
 _Last refresh (2026-05-28): the functional-FIFO cluster (commit `31f2a7c`) added
 +6 verified-MATCH — `select01` flipped to MATCH (16/16) via the FIFO O_RDWR leg +
@@ -77,7 +77,12 @@ the select multi-set return-count fix; `mknod02–05/09`, `mknodat01` now MATCH
 (macOS can't `mknod` char/block devices — inherent), `mknod06` tst_test re-exec
 hang, `select03`/`pselect02` select error-edge TBROK, `mknod08` DAC EACCES._
 
-_Last refresh (2026-05-29, process): waitpid on an invalid process group →
+_Last refresh (2026-05-29, net): getpeername output-pointer validation (commit
+`7c6a13f`): getpeername01 → MATCH (+1) — NULL ptr→EFAULT, negative *addrlen→
+EINVAL (symmetric with getsockname). net MATCH 15→16 (**43%**); total
+verified-MATCH 565→566/896. Probe `getsocknameval` (+getpeername leg)._
+
+_Earlier 2026-05-29 (process): waitpid on an invalid process group →
 ESRCH (commit `e145339`): waitpid04 → MATCH (+1). process MATCH 114→115
 (**62%**); total verified-MATCH 564→565/896. Probe `waitpgid`._
 
