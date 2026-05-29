@@ -10,8 +10,10 @@ pub const LINUX_S_IFREG: u32 = 0o100000;
 pub const LINUX_S_IFLNK: u32 = 0o120000;
 pub const LINUX_S_IFIFO: u32 = 0o010000;
 pub const LINUX_S_IFCHR: u32 = 0o020000;
+pub const LINUX_S_IFBLK: u32 = 0o060000;
 pub const LINUX_S_IFSOCK: u32 = 0o140000;
 
+pub const LINUX_DT_FIFO: u8 = 1;
 pub const LINUX_DT_CHR: u8 = 2;
 pub const LINUX_DT_DIR: u8 = 4;
 pub const LINUX_DT_REG: u8 = 8;

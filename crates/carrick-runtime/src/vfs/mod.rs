@@ -75,6 +75,8 @@ pub enum EntryKind {
     Directory,
     Symlink,
     CharDevice,
+    /// Named pipe (FIFO). Maps to/from [`crate::rootfs::RootFsEntryKind::Fifo`].
+    Fifo,
 }
 
 /// Per-entry metadata. Mode is the permission bits only (the
