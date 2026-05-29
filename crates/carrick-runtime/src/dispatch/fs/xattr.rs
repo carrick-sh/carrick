@@ -6,10 +6,6 @@
 use super::*;
 
 impl SyscallDispatcher {
-    pub(super) fn xattr_unsupported(&self) -> DispatchOutcome {
-        DispatchOutcome::errno(LINUX_ENOTSUP)
-    }
-
     /// Resolve the first argument of an xattr syscall to the rootfs path it
     /// names: a path string (path/lpath variants) or the path of the file an
     /// fd refers to (f-variant). Returns `Err(errno)` on a bad path or an fd
@@ -158,5 +154,31 @@ impl SyscallDispatcher {
         Ok(DispatchOutcome::Returned {
             value: list.len() as i64,
         })
+    }
+
+    pub(super) fn removexattr(
+        &self,
+        memory: &mut impl GuestMemory,
+        target: XattrTarget,
+        name_ptr: GuestPtr,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        // removexattr(path/fd, name)
+        let resolved = match self.xattr_target_path(memory, target) {
+            Ok(p) => p,
+            Err(errno) => return Ok(errno.into()),
+        };
+        // A path that doesn't exist is ENOENT, distinct from ENODATA (an absent
+        // attribute on a file that DOES exist) — removexattr02 checks both.
+        if self.layered_metadata(&resolved).is_err() {
+            return Ok(LINUX_ENOENT.into());
+        }
+        let name = match read_guest_c_string(memory, name_ptr.0) {
+            Ok(name) => name,
+            Err(errno) => return Ok(errno.into()),
+        };
+        match self.fs.rootfs_vfs.overlay.remove_xattr(&resolved, &name) {
+            Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
+            Err(errno) => Ok(errno.into()),
+        }
     }
 }
