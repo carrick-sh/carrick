@@ -2793,6 +2793,19 @@ impl SyscallDispatcher {
                 return Ok(LINUX_EBADF.into());
             };
             let mut open = open_file.description.write();
+            // read() on a regular file opened write-only (O_WRONLY) → EBADF
+            // (open09/creat01 read a creat()'d write-only fd). Only regular-file
+            // descriptions carry O_ACCMODE semantics; pipes/sockets/eventfds and
+            // the like have their own readability rules handled per-branch.
+            if matches!(
+                &*open,
+                OpenDescription::File { .. }
+                    | OpenDescription::SyntheticFile { .. }
+                    | OpenDescription::HostFile { .. }
+            ) && open.status_flags() & LINUX_O_ACCMODE == LINUX_O_WRONLY
+            {
+                return Ok(LINUX_EBADF.into());
+            }
             let (contents, offset) = match &mut *open {
                 OpenDescription::File {
                     contents, offset, ..
