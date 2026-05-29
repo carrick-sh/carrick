@@ -369,12 +369,17 @@ impl SyscallDispatcher {
         }
 
         /// `timer_settime(id, flags, new, old)`: arm / disarm the timer.
-        /// `flags` of 0 = relative `it_value`; we don't yet honour
-        /// TIMER_ABSTIME. `old` (NULL allowed) receives the previous spec.
-        fn timer_settime(this, cx, timer_id: u64, _flags: u64, new_ptr: GuestPtr, old_ptr: GuestPtr) {
+        /// `flags` of 0 = relative `it_value`; TIMER_ABSTIME = an absolute
+        /// deadline on the timer's clock, converted to a relative interval here.
+        /// `old` (NULL allowed) receives the previous spec.
+        fn timer_settime(this, cx, timer_id: u64, flags: u64, new_ptr: GuestPtr, old_ptr: GuestPtr) {
             let memory = &mut *cx.memory;
             let id = timer_id as i64 as i32;
             if !crate::posix_timer::exists(id) {
+                return Ok(LINUX_EINVAL.into());
+            }
+            // Only TIMER_ABSTIME is a valid flag; reject any other bit. (audit M4)
+            if flags & !LINUX_TIMER_ABSTIME != 0 {
                 return Ok(LINUX_EINVAL.into());
             }
             if new_ptr.0 == 0 {
@@ -384,14 +389,31 @@ impl SyscallDispatcher {
                 Ok(spec) => spec,
                 Err(errno) => return Ok(errno.into()),
             };
-            let value_ns =
-                u64::try_from(spec.it_value.tv_sec.saturating_mul(1_000_000_000))
-                    .unwrap_or(0)
-                    .saturating_add(u64::try_from(spec.it_value.tv_nsec).unwrap_or(0));
+            // Validate the timespec (EINVAL on tv_nsec>=1e9 or negative) via the
+            // shared helper, exactly like timerfd_settime. (audit M4)
+            let (interval_dur, value_dur) = match itimerspec_durations(spec) {
+                Ok(durations) => durations,
+                Err(errno) => return Ok(errno.into()),
+            };
             let interval_ns =
-                u64::try_from(spec.it_interval.tv_sec.saturating_mul(1_000_000_000))
-                    .unwrap_or(0)
-                    .saturating_add(u64::try_from(spec.it_interval.tv_nsec).unwrap_or(0));
+                interval_dur.map_or(0, |d| u64::try_from(duration_to_nanos(d)).unwrap_or(u64::MAX));
+            let value_ns = match value_dur {
+                None => 0, // all-zero it_value disarms (Linux semantics)
+                Some(deadline) => {
+                    if flags & LINUX_TIMER_ABSTIME != 0 {
+                        // Absolute deadline on the timer's clock -> relative.
+                        let now =
+                            linux_clock_duration(crate::posix_timer::clock_id(id) as u64)
+                                .unwrap_or(Duration::ZERO);
+                        // A now/past deadline must still arm-and-fire; arm() uses
+                        // value_ns==0 as the DISARM sentinel, so floor at 1ns.
+                        let rel = deadline.saturating_sub(now);
+                        u64::try_from(duration_to_nanos(rel)).unwrap_or(u64::MAX).max(1)
+                    } else {
+                        u64::try_from(duration_to_nanos(deadline)).unwrap_or(u64::MAX)
+                    }
+                }
+            };
             let old = crate::posix_timer::arm(id, value_ns, interval_ns);
             if old_ptr.0 != 0 {
                 let prev = old.unwrap_or(crate::posix_timer::TimerSpec {
@@ -499,7 +521,9 @@ impl SyscallDispatcher {
                 totalhigh: 0,
                 freehigh: 0,
                 mem_unit: 1,
-                _padding: [0; 8],
+                pad: 0,
+                _pad_align: [0; 4],
+                _f: [0; 4],
             };
             if write_kernel_struct_raw(memory, info_ptr.0, &info).is_err() {
                 return Ok(LINUX_EFAULT.into());

@@ -207,6 +207,16 @@ pub fn exists(id: i32) -> bool {
     map.contains_key(&id)
 }
 
+/// The clock a timer was created with (Linux `timer_create` clock_id). Returns
+/// 0 (CLOCK_REALTIME) for an unknown id; callers (timer_settime) validate
+/// existence first, so the live path never hits the fallback. Used to convert a
+/// TIMER_ABSTIME deadline to a relative interval on the right clock. (audit M4)
+pub fn clock_id(id: i32) -> i32 {
+    let mut guard = registry();
+    let map = ensure_registry(&mut guard);
+    map.get(&id).map(|s| s.clock_id).unwrap_or(0)
+}
+
 /// Clear the whole registry; called by `reinit_after_fork` so a forked
 /// child doesn't inherit the parent's timer IDs (whose fallback threads
 /// died with the fork anyway).

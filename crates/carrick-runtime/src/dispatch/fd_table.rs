@@ -216,8 +216,10 @@ pub(super) enum OpenDescription {
         /// readiness paths but not yet returned to the guest because the last
         /// `epoll_wait` hit `maxevents`. Linux leaves those events queued for
         /// the next wait; Carrick must preserve them explicitly because a
-        /// `kevent` drain consumes them eagerly.
-        pending_ready: VecDeque<LinuxEpollEvent>,
+        /// `kevent` drain consumes them eagerly. The `i32` is the ORIGINATING
+        /// guest fd, so EPOLL_CTL_DEL/MOD purges the right queued entry even
+        /// when the guest's epoll_data token != fd. (audit M3; probe epollstaledel)
+        pending_ready: VecDeque<(i32, LinuxEpollEvent)>,
         /// Persistent kqueue backing this epoll instance (FreeBSD `linux_event`
         /// model): `epoll_ctl` registers host-backed fds here via
         /// `EVFILT_READ`/`EVFILT_WRITE`, so an fd added by one thread is seen by
