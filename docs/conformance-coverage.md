@@ -135,6 +135,7 @@ underlying gap got fixed):
 
 | Invariant | Owned by | Stands in for (LTP) |
 |---|---|---|
+| **/proc/self/status Pid/Tgid agree with getpid()/gettid() (carrick hardcoded Pid:1 while getpid returned process::id())** | ✅ `procselfpid` | gettid01 |
 | **waitpid error edges: pid<-1 naming a nonexistent process group → ESRCH (carrick forwarded to the host which gives EINVAL); invalid options → EINVAL; no children → ECHILD** | ✅ `waitpgid` | waitpid04 |
 | fork memory isolation (COW) across .data/.bss/heap/mmap | ✅ `forkcow` | (fork correctness) |
 | MAP_SHARED coherence across multi-level fork, both directions | ✅ `forkshared` | (tst_checkpoint shared mem) |
