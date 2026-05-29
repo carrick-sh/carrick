@@ -1559,12 +1559,17 @@ impl HvfInner {
     }
 
     fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
-        use crate::linux_abi::{LINUX_PROT_READ, LINUX_PROT_WRITE};
+        use crate::linux_abi::{LINUX_PROT_EXEC, LINUX_PROT_READ, LINUX_PROT_WRITE};
+        // PROT_EXEC clears UXN (executable); its absence sets UXN so a data page
+        // is non-executable (W^X / NX), matching Linux. (Boot regions — the
+        // image's own code, trampolines, vDSO — are mapped executable at boot
+        // and are not edited here; only guest mmap/mprotect ranges pass through.)
+        let exec = prot & LINUX_PROT_EXEC != 0;
         self.pt_edit_and_flush(|mgr| {
             if prot & LINUX_PROT_WRITE != 0 {
-                mgr.set_rw(address, len)
+                mgr.set_rw(address, len, exec)
             } else if prot & LINUX_PROT_READ != 0 {
-                mgr.set_readonly(address, len)
+                mgr.set_readonly(address, len, exec)
             } else {
                 mgr.set_prot_none(address, len)
             }
