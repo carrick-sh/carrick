@@ -4916,6 +4916,13 @@ impl SyscallDispatcher {
             if this.layered_metadata(&resolved_link).is_ok() {
                 return Ok(LINUX_EEXIST.into());
             }
+            // DAC: creating the symlink entry needs write+search on the parent
+            // directory (symlink03 case 1 → EACCES). Root bypasses.
+            if let Some(parent) = Path::new(&resolved_link).parent()
+                && !this.guest_can_modify_dir(&display_rootfs_path(parent))
+            {
+                return Ok(LINUX_EACCES.into());
+            }
             // Create a real symlink in the writable backend (cap-std). The
             // target is stored verbatim, matching symlinkat(2). MemoryBackend
             // returns Unsupported → EROFS.
