@@ -20,6 +20,12 @@ const TYPE_BLOCK: u64 = 0b01; // L1/L2 block descriptor
 const AP_MASK: u64 = 0b11 << 6; // AP[2:1]
 const AP_RW: u64 = 0b01 << 6; // RW at EL0+EL1
 const AP_RO: u64 = 0b11 << 6; // RO at EL0+EL1
+// UXN (Unprivileged eXecute Never), bit 54: when set, EL0 instruction fetch
+// from the page faults (instruction abort → SIGSEGV). USER_*_FLAGS leave it
+// CLEAR (executable) because the boot image identity-maps code; guest `mmap`/
+// `mprotect` set it per `PROT_EXEC` so a data page is non-executable (W^X / NX),
+// matching Linux. PXN (bit 53, already in USER_*_FLAGS) keeps EL1 from fetching.
+const UXN: u64 = 1 << 54;
 
 // PA field masks per level (identical to memory.rs).
 const PA_MASK_1GIB: u64 = 0x0000_FFFF_C000_0000;
@@ -43,10 +49,10 @@ const SPARE_START_OFFSET: u64 = 8 * PT_PAGE;
 enum PtOp {
     /// Clear the valid bit — any access faults (SEGV_MAPERR).
     Invalidate,
-    /// Valid, AP=read-only.
-    ReadOnly,
-    /// Valid, AP=read-write (identity-mapped user page/block).
-    ReadWrite,
+    /// Valid, AP=read-only. `exec` clears UXN (PROT_EXEC); else UXN set (NX).
+    ReadOnly { exec: bool },
+    /// Valid, AP=read-write. `exec` clears UXN (PROT_EXEC); else UXN set (NX).
+    ReadWrite { exec: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -501,19 +507,23 @@ impl PageTableManager {
             USER_BLOCK_FLAGS
         };
         let base = base_pa & mask;
+        // UXN (bit 54) is set for a non-exec leaf; cleared for an exec one.
+        // USER_*_FLAGS start UXN-clear (executable), so OR in UXN when !exec.
+        let uxn = |exec: bool| if exec { 0 } else { UXN };
         match op {
             PtOp::Invalidate => base | (flags & !VALID),
-            PtOp::ReadWrite => base | flags,
-            PtOp::ReadOnly => base | (flags & !AP_MASK) | AP_RO,
+            PtOp::ReadWrite { exec } => base | flags | uxn(exec),
+            PtOp::ReadOnly { exec } => base | (flags & !AP_MASK) | AP_RO | uxn(exec),
         }
     }
 
-    /// Does a leaf with `(valid, ap)` already satisfy `op`?
-    fn satisfies(op: PtOp, valid: bool, ap: u64) -> bool {
+    /// Does a leaf with `(valid, ap, uxn_set)` already satisfy `op`? Includes the
+    /// UXN (execute) bit so a re-protect that only flips PROT_EXEC still applies.
+    fn satisfies(op: PtOp, valid: bool, ap: u64, uxn_set: bool) -> bool {
         match op {
             PtOp::Invalidate => !valid,
-            PtOp::ReadWrite => valid && ap == AP_RW,
-            PtOp::ReadOnly => valid && ap == AP_RO,
+            PtOp::ReadWrite { exec } => valid && ap == AP_RW && uxn_set == !exec,
+            PtOp::ReadOnly { exec } => valid && ap == AP_RO && uxn_set == !exec,
         }
     }
 
@@ -534,7 +544,7 @@ impl PageTableManager {
             let block_start = cur & mask;
             let block_end = block_start + span;
             let desc = self.read_desc(off);
-            if Self::satisfies(op, desc & VALID != 0, desc & AP_MASK) {
+            if Self::satisfies(op, desc & VALID != 0, desc & AP_MASK, desc & UXN != 0) {
                 // The covering block is ALREADY at the target — skip its whole
                 // span with no split (this is what keeps RW-on-already-RW, and a
                 // re-protect of an unchanged range, free).
@@ -580,14 +590,16 @@ impl PageTableManager {
         self.set_prot_none(va, len)
     }
 
-    /// Mark `[va, va+len)` valid read-only (AP=RO).
-    pub fn set_readonly(&mut self, va: u64, len: usize) -> Result<bool, PageTableError> {
-        self.apply(va, len, PtOp::ReadOnly)
+    /// Mark `[va, va+len)` valid read-only (AP=RO). `exec` clears UXN
+    /// (executable, PROT_EXEC); otherwise UXN is set (non-executable / NX).
+    pub fn set_readonly(&mut self, va: u64, len: usize, exec: bool) -> Result<bool, PageTableError> {
+        self.apply(va, len, PtOp::ReadOnly { exec })
     }
 
-    /// Restore `[va, va+len)` to a valid RW user page (identity-mapped).
-    pub fn set_rw(&mut self, va: u64, len: usize) -> Result<bool, PageTableError> {
-        self.apply(va, len, PtOp::ReadWrite)
+    /// Restore `[va, va+len)` to a valid RW user page (identity-mapped). `exec`
+    /// clears UXN (executable, PROT_EXEC); otherwise UXN is set (NX).
+    pub fn set_rw(&mut self, va: u64, len: usize, exec: bool) -> Result<bool, PageTableError> {
+        self.apply(va, len, PtOp::ReadWrite { exec })
     }
 
     /// Build a fresh VA→IPA translation for `[va, va+len)` for EL0, creating
@@ -747,10 +759,10 @@ mod tests {
     fn set_readonly_then_rw_round_trips() {
         let mut mgr = manager();
         let va = LINUX_MMAP_BASE + 0x20_0000;
-        mgr.set_readonly(va, 0x1000).expect("ro");
+        mgr.set_readonly(va, 0x1000, true).expect("ro");
         assert_eq!(mgr.ap_bits(va), AP_RO);
         assert!(mgr.is_valid(va));
-        mgr.set_rw(va, 0x1000).expect("rw");
+        mgr.set_rw(va, 0x1000, true).expect("rw");
         assert_eq!(mgr.ap_bits(va), AP_RW);
         assert!(mgr.is_valid(va));
     }
@@ -762,7 +774,7 @@ mod tests {
         mgr.set_prot_none(va, 0x2000).expect("none");
         assert!(!mgr.is_valid(va));
         assert!(!mgr.is_valid(va + 0x1000));
-        mgr.set_rw(va, 0x2000).expect("rw");
+        mgr.set_rw(va, 0x2000, true).expect("rw");
         assert!(mgr.is_valid(va));
         assert!(mgr.is_valid(va + 0x1000));
     }
@@ -820,13 +832,18 @@ mod tests {
 
     #[test]
     fn set_rw_on_default_rw_block_does_not_split() {
-        // No spare pages: setting RW on the already-RW arena must skip (no
-        // split) and succeed, rather than exhaust the pool.
+        // No spare pages: setting RW-non-exec on the already-RW-non-exec arena
+        // must skip (no split) and succeed, rather than exhaust the pool. The
+        // arena's boot blocks default UXN=1 (NX), so a non-exec mmap matches the
+        // existing leaf — the common case must stay a no-op (no dense split).
         let mut bytes = stage1_identity_page_tables();
         bytes.truncate(6 * 0x1000);
         let mut mgr = PageTableManager::new(bytes, LINUX_PAGE_TABLES_BASE);
-        // Already RW → no change, no split, no allocation.
-        assert_eq!(mgr.set_rw(LINUX_MMAP_BASE + 0x10_0000, 0x4000), Ok(false));
+        // Already RW + non-exec → no change, no split, no allocation.
+        assert_eq!(
+            mgr.set_rw(LINUX_MMAP_BASE + 0x10_0000, 0x4000, false),
+            Ok(false)
+        );
     }
 
     #[test]
@@ -843,7 +860,7 @@ mod tests {
             "split consumed spare pages"
         );
         // Restore the entire 2 MiB block to RW -> uniform -> coalesce.
-        mgr.set_rw(block, 1 << 21).expect("restore");
+        mgr.set_rw(block, 1 << 21, true).expect("restore");
         assert!(mgr.is_valid(block));
         assert!(
             !mgr.free_tables.is_empty(),
@@ -889,7 +906,7 @@ mod tests {
         assert!(!mgr.is_valid(block));
         assert!(!mgr.is_valid(block + 0x1000));
         // Commit one page RW (splits the invalid 2 MiB block to L3).
-        mgr.set_rw(block + 0x10000, 0x1000).expect("RW commit");
+        mgr.set_rw(block + 0x10000, 0x1000, true).expect("RW commit");
         assert!(mgr.is_valid(block + 0x10000), "committed page is RW");
         assert_eq!(mgr.ap_bits(block + 0x10000), AP_RW);
         assert!(!mgr.is_valid(block), "neighbor page 0 stays invalid");
@@ -924,7 +941,7 @@ mod tests {
         mgr.set_multi_vcpu(true);
         let block = LINUX_MMAP_BASE + 0x60_0000;
         mgr.set_prot_none(block, 0x1000).expect("split");
-        mgr.set_rw(block, 1 << 21).expect("restore");
+        mgr.set_rw(block, 1 << 21, true).expect("restore");
         assert!(mgr.is_valid(block));
         assert!(
             mgr.free_tables.is_empty(),
@@ -933,7 +950,7 @@ mod tests {
         // Back to single-vCPU, a subsequent full-block restore coalesces again.
         mgr.set_multi_vcpu(false);
         mgr.set_prot_none(block, 0x1000).expect("split");
-        mgr.set_rw(block, 1 << 21).expect("restore");
+        mgr.set_rw(block, 1 << 21, true).expect("restore");
         assert!(
             !mgr.free_tables.is_empty(),
             "single-vCPU coalesces/reclaims"
@@ -945,13 +962,13 @@ mod tests {
         // One page RO, the rest RW: NOT uniform -> must keep the sub-table.
         let mut mgr = manager();
         let block = LINUX_MMAP_BASE + 0x40_0000;
-        mgr.set_readonly(block, 0x1000).expect("ro one page");
-        mgr.set_rw(block, 1 << 21).expect("rw the rest");
+        mgr.set_readonly(block, 0x1000, true).expect("ro one page");
+        mgr.set_rw(block, 1 << 21, true).expect("rw the rest");
         // The RO page was overwritten to RW by the full-block set_rw, so it WILL
         // coalesce; instead verify a genuinely-mixed state is preserved:
         let mut mgr2 = manager();
-        mgr2.set_readonly(block, 0x1000).expect("ro one page");
-        mgr2.set_rw(block + 0x1000, 0x1000).expect("rw next page");
+        mgr2.set_readonly(block, 0x1000, true).expect("ro one page");
+        mgr2.set_rw(block + 0x1000, 0x1000, true).expect("rw next page");
         assert_eq!(mgr2.ap_bits(block), AP_RO, "mixed block keeps RO page");
         assert_eq!(mgr2.ap_bits(block + 0x1000), AP_RW);
         assert!(mgr2.free_tables.is_empty(), "mixed block must not coalesce");
