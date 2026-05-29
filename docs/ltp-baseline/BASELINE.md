@@ -61,13 +61,13 @@ SysV-semaphore, and SysV-msg-queue fixes landed against it.
 | epoll_poll | 34 | 3 | 6   | 9  | 0 | 10  | 62  | **65%** |
 | sched      | 36 | 0 | 8   | 5  | 0 | 18  | 67  | **73%** |
 | other      | 55 | 2 | 9   | 2  | 0 | 53  | 121 | **81%** |
-| fs         | 200| 0 | 67  | 23 | 11 | 141 | 442 | **66%** |
+| fs         | 201| 0 | 66  | 23 | 11 | 141 | 442 | **67%** |
 | process    | 114| 1 | 29  | 41 | 1 | 206 | 392 | **61%** |
 | ipc        | 14 | 0 | 14  | 12 | 0 | 7   | 47  | **35%** (sem + msg queues functional) |
 | net        | 13 | 0 | 15  | 9  | 0 | 16  | 53  | **35%** |
 | mm         | 25 | 1 | 28  | 19 | 1 | 43  | 117 | **34%** |
 | xattr      | 3  | 0 | 1   | 1  | 0 | 24  | 29  | **60%** |
-| **TOTAL**  | **556** | **7** | **182** | **135** | **16** | **540** | **1436** | **556/896 = 62%** |
+| **TOTAL**  | **557** | **7** | **181** | **135** | **16** | **540** | **1436** | **557/896 = 62%** |
 
 _Last refresh (2026-05-28): the functional-FIFO cluster (commit `31f2a7c`) added
 +6 verified-MATCH — `select01` flipped to MATCH (16/16) via the FIFO O_RDWR leg +
@@ -77,7 +77,11 @@ the select multi-set return-count fix; `mknod02–05/09`, `mknodat01` now MATCH
 (macOS can't `mknod` char/block devices — inherent), `mknod06` tst_test re-exec
 hang, `select03`/`pselect02` select error-edge TBROK, `mknod08` DAC EACCES._
 
-_Last refresh (2026-05-29, fs): fchmod refreshes the fd's cached mode (commit
+_Last refresh (2026-05-29, fs): *at dirfd valid-but-non-dir → ENOTDIR (commit
+`6acd4d9`): statx03 → MATCH (+1). fs MATCH 200→201 (**67%**); total
+verified-MATCH 556→557/896. Probe `dirfdnotdir`._
+
+_Earlier 2026-05-29 (fs): fchmod refreshes the fd's cached mode (commit
 `6003386`): fchmod04, fchmod05 → MATCH (+2). fs MATCH 198→200 (**66%**); total
 verified-MATCH 554→556/896. Probe `fchmoddir`._
 
