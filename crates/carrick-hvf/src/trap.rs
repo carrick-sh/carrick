@@ -2067,6 +2067,48 @@ impl HvfInner {
         // seq stays 0 (even = stable); these aren't updated after boot.
     }
 
+    /// Repoint guest VA `[va, va+len)` to a slot in the boot-mapped PRIVATE
+    /// overlay aperture, seeding the slot with `content`. Backs a
+    /// `MAP_FIXED|MAP_PRIVATE` over a shared-aperture VA: afterwards the guest's
+    /// stores to `va` translate (stage-1) to `overlay_ipa` and hit the
+    /// per-process overlay page, NOT the shared backing — so a "private" write
+    /// no longer leaks to peers or across fork. Stage-1 ONLY (the overlay window
+    /// was `hv_vm_map`'d at boot); arm64 has no stage-2 TLB shootdown, which is
+    /// exactly why we never re-map stage-2 here.
+    fn repoint_private(
+        &mut self,
+        va: u64,
+        overlay_ipa: u64,
+        len: usize,
+        content: &[u8],
+    ) -> Result<(), MemoryError> {
+        // Seed the overlay slot FIRST, while `va` still translates to the OLD
+        // (shared) IPA, so no concurrent reader sees a torn page through `va`.
+        // `overlay_ipa` is identity (== overlay VA); it lives in the overlay
+        // region, which is the only mapping that contains it.
+        let dst = {
+            let mapping = self.mapping_for_range(overlay_ipa, len.max(1)).ok_or(
+                MemoryError::OutOfBounds {
+                    address: overlay_ipa,
+                    length: len,
+                },
+            )?;
+            let offset = (overlay_ipa - mapping.start) as usize;
+            unsafe { mapping.host_addr.add(offset) }
+        };
+        if !content.is_empty() {
+            let n = content.len().min(len);
+            unsafe {
+                std::ptr::copy_nonoverlapping(content.as_ptr(), dst, n);
+            }
+        }
+        // Stage-1 repoint + TLB flush. `map_aliased` splits the covering boot
+        // block (1 GiB/2 MiB) down to a page leaf via `descend_creating` when
+        // `va`/`len` aren't block-aligned, so a single page within the shared
+        // aperture is repointed without disturbing its neighbours.
+        self.pt_edit_and_flush(|mgr| mgr.map_aliased(va, overlay_ipa, len as u64, true))
+    }
+
     /// Mark `[address, address+len)` PROT_NONE (`no_access=true`) or clear it.
     /// Clearing performs interval subtraction so an mprotect/mmap that re-enables
     /// part of a PROT_NONE region leaves only the still-protected remainder.
@@ -3198,6 +3240,16 @@ impl GuestMemory for HvfTrapEngine {
 
     fn unmap_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
         self.inner.unmap_range(address, len)
+    }
+
+    fn repoint_private(
+        &mut self,
+        va: u64,
+        overlay_ipa: u64,
+        len: usize,
+        content: &[u8],
+    ) -> Result<(), MemoryError> {
+        self.inner.repoint_private(va, overlay_ipa, len, content)
     }
 
     fn shared_futex_host_addr(&self, address: u64) -> Option<usize> {

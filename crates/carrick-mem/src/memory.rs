@@ -203,6 +203,27 @@ pub fn mmap_arena_size() -> u64 {
 // post-vCPU hv_vm_map. Kept disjoint from the private anonymous mmap arena.
 pub const LINUX_SHARED_FILE_BASE: u64 = 0x90_0000_0000; // 576 GiB
 pub const LINUX_SHARED_FILE_SIZE: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
+
+// Private overlay aperture: mirrors the shared aperture but its host backing is
+// NOT MAP_SHARED, so fork(2) takes a per-process private snapshot of it (like
+// the heap/arena). A guest MAP_FIXED|MAP_PRIVATE that lands on a shared-aperture
+// VA is served by carving an overlay slot here and repointing the VA's stage-1
+// leaf to the overlay IPA (identity IPA==VA, boot-mapped) — so the guest's
+// stores hit per-process-private pages instead of the shared backing, without
+// any post-vCPU hv_vm_map. Placed above the shared aperture (576+2 GiB) and well
+// below the stack top (~1 TiB); identity-mapped like every region but Rosetta.
+pub const LINUX_PRIVATE_OVERLAY_BASE: u64 = 0x98_0000_0000; // 608 GiB
+pub const LINUX_PRIVATE_OVERLAY_SIZE: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB, mirrors shared
+
+/// True if `[va, va+len)` lies entirely within the boot-mapped shared aperture
+/// window. Used by `mmap` to detect a MAP_FIXED|MAP_PRIVATE that overlaps a
+/// shared region (which must get genuinely-private backing, not write through).
+pub fn va_in_shared_aperture(va: u64, len: u64) -> bool {
+    match va.checked_add(len) {
+        Some(end) => va >= LINUX_SHARED_FILE_BASE && end <= LINUX_SHARED_FILE_BASE + LINUX_SHARED_FILE_SIZE,
+        None => false,
+    }
+}
 pub const LINUX_STACK_TOP: u64 = 0xff_ffff_0000; // just under 1 TiB
 pub const LINUX_STACK_SIZE: u64 = 2 * 1024 * 1024; // 2 MiB
 
@@ -1460,6 +1481,20 @@ fn linux_runtime_regions() -> Result<Vec<MemoryRegion>, AddressSpaceError> {
         shared_zeroed_region(
             LINUX_SHARED_FILE_BASE,
             LINUX_SHARED_FILE_SIZE,
+            SegmentPerms {
+                read: true,
+                write: true,
+                execute: false,
+            },
+        )?,
+        // Private overlay aperture (NOT shared): backs MAP_FIXED|MAP_PRIVATE
+        // mappings that land on a shared-aperture VA. `shared:false` makes fork
+        // snapshot it per-process, so a child's stores to a repointed VA stay
+        // private. hv_vm_map'd once at boot like every region — the per-mapping
+        // repoint is a stage-1 edit only (no post-vCPU hv_vm_map).
+        zeroed_region(
+            LINUX_PRIVATE_OVERLAY_BASE,
+            LINUX_PRIVATE_OVERLAY_SIZE,
             SegmentPerms {
                 read: true,
                 write: true,

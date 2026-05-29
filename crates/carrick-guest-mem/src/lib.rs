@@ -59,6 +59,24 @@ pub trait GuestMemory {
         Ok(())
     }
 
+    /// Repoint guest VA `[va, va+len)` to a slot in the boot-mapped PRIVATE
+    /// overlay aperture (`overlay_ipa`, identity IPA==VA), seeding the slot with
+    /// `content` first. Used for `MAP_FIXED|MAP_PRIVATE` over a shared-aperture
+    /// VA: after this, the guest's stores to `va` hit the per-process overlay
+    /// page, not the shared backing. The repoint is a stage-1 page-table edit +
+    /// TLB flush only — the overlay window was `hv_vm_map`'d at boot, so no
+    /// post-vCPU stage-2 mutation happens. Default: no-op (the in-memory backend
+    /// and unit tests have no stage-1 tables and don't model the overlay).
+    fn repoint_private(
+        &mut self,
+        _va: u64,
+        _overlay_ipa: u64,
+        _len: usize,
+        _content: &[u8],
+    ) -> Result<(), MemoryError> {
+        Ok(())
+    }
+
     /// Host virtual address of the byte at `guest_addr`, but ONLY when it lies
     /// in a host-`MAP_SHARED` guest region — i.e. the boot-mapped shared
     /// aperture that backs guest `MAP_SHARED` mmaps. That backing is shared
