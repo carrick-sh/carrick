@@ -2,6 +2,13 @@
 //! `super` for the dispatcher struct and the normalized dispatch table.
 use super::*;
 
+/// Per-process nice value (the calling process's PRIO_PROCESS priority).
+/// Default 0. setpriority(PRIO_PROCESS, self) stores it (clamped to [-20,19])
+/// and getpriority(PRIO_PROCESS, self) reports it as the kernel-ABI `20 - nice`
+/// (glibc converts back). A process-global static is correct: nice is a
+/// per-process attribute and carrick's fork creates a fresh address space.
+static NICE_VALUE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
 /// Owned credentials-subsystem state. Split out of `SyscallDispatcher`.
 ///
 /// Tracked (real, effective, saved) uid and gid plus the umask. Carrick
@@ -228,24 +235,40 @@ impl SyscallDispatcher {
         }
 
         fn setpriority(this, cx, which: u64, who: Pid, prio: u64) {
+            use std::sync::atomic::Ordering;
             let prio = prio as i32;
-            if which > LINUX_PRIO_USER || !(-20..=19).contains(&prio) {
+            if which > LINUX_PRIO_USER {
                 return Ok(LINUX_EINVAL.into());
             }
             // A negative id (pid/pgid/uid) names no target → ESRCH for every
-            // PRIO_* class (setpriority02). The EACCES (unprivileged
-            // nice-lowering) and EPERM (cross-uid target) cases need a fuller
-            // priority/uid model — tracked follow-up.
+            // PRIO_* class (setpriority02).
             if who.0 < 0 {
                 return Ok(LINUX_ESRCH.into());
             }
             if which == LINUX_PRIO_PROCESS && who.0 != 0 && who.0 != LINUX_BOOTSTRAP_PID as i32 {
                 return Ok(LINUX_ESRCH.into());
             }
+            // Linux CLAMPS the nice value to [-20,19] (it does NOT reject an
+            // out-of-range value with EINVAL): glibc's nice() passes
+            // current+increment straight through and relies on this clamp
+            // (LTP nice02 does nice(50) → clamps to 19).
+            let clamped = prio.clamp(-20, 19);
+            // For the calling process, enforce the unprivileged nice-lowering
+            // rule (raising priority needs CAP_SYS_NICE): a non-root euid can't
+            // set a nice BELOW the current one (LTP nice04 nice(-10) → EPERM),
+            // and persist the value so getpriority reflects it (nice03).
+            if which == LINUX_PRIO_PROCESS {
+                let current = NICE_VALUE.load(Ordering::Relaxed);
+                if clamped < current && this.cred_snapshot().euid != 0 {
+                    return Ok(LINUX_EPERM.into());
+                }
+                NICE_VALUE.store(clamped, Ordering::Relaxed);
+            }
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
         fn getpriority(this, cx, which: u64, who: Pid) {
+            use std::sync::atomic::Ordering;
             if which > LINUX_PRIO_USER {
                 return Ok(LINUX_EINVAL.into());
             }
@@ -257,7 +280,17 @@ impl SyscallDispatcher {
             if which == LINUX_PRIO_PROCESS && who.0 != 0 && who.0 != LINUX_BOOTSTRAP_PID as i32 {
                 return Ok(LINUX_ESRCH.into());
             }
-            Ok(DispatchOutcome::Returned { value: 20 })
+            // Kernel ABI: getpriority returns `20 - nice` (so the value is never
+            // negative); glibc converts it back. Report the calling process's
+            // stored nice for PRIO_PROCESS, else the default (nice 0 → 20).
+            let nice = if which == LINUX_PRIO_PROCESS {
+                NICE_VALUE.load(Ordering::Relaxed)
+            } else {
+                0
+            };
+            Ok(DispatchOutcome::Returned {
+                value: (20 - nice) as i64,
+            })
         }
 
         fn setresuid(this, cx, r: u64, e: u64, s: u64) {
