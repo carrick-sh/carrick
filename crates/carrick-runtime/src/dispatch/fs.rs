@@ -3089,6 +3089,12 @@ impl SyscallDispatcher {
                 return Ok(LINUX_EBADF.into());
             };
             let open = open_file.description.read();
+            // preadv reads the fd, so a descriptor not open for reading
+            // (O_WRONLY) is EBADF (preadv02 "not open for reading" case), exactly
+            // as the kernel rejects it before touching the data.
+            if open.status_flags() & LINUX_O_ACCMODE == LINUX_O_WRONLY {
+                return Ok(LINUX_EBADF.into());
+            }
             // Real host file: positional readv via libc::pread per iovec
             // (kernel offset untouched).
             if let OpenDescription::HostFile { host_fd, .. } = &*open {
