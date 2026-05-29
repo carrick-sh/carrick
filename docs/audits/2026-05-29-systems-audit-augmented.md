@@ -152,10 +152,16 @@ SIGBUS, and `host_signal` treats the synchronous fault as a fatal carrick bug �
 the process dies. Linux returns EFAULT to the task. Three unprivileged syscalls.
 
 **[P1] `MAP_FIXED|MAP_PRIVATE` write leaks to the parent's shared page** — probe `mapfixed`
+— **FIXED (M5, 2026-05-29).** Both `mapfixed` and `mapfixedfork` now MATCH.
 ```
 - linux:   parent_value_preserved=true   parent_clobbered_by_child=false
-+ carrick: parent_value_preserved=false  parent_clobbered_by_child=true
++ carrick: parent_value_preserved=false  parent_clobbered_by_child=true   (PRE-FIX)
 ```
+Fixed NOT by the syscall-write-path note below (the clobber is the guest's own CPU
+store through stage-2, not `write_guest_bytes`) but by a boot-mapped per-process
+PRIVATE overlay aperture + a stage-1 repoint of the VA to a private slot (no late
+`hv_vm_map`). See the program doc M5 STATUS for the design + the tracked
+durable-memory remainder (late-`MapHostAlias` removal, mprotect NX).
 A child that `MAP_FIXED`-replaces a shared page with a private mapping and writes
 to it corrupts the *parent's* page — `MAP_PRIVATE` is not private. Same root
 cause; the write path goes through to the shared backing. (The static audit also
