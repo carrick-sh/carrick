@@ -21,7 +21,8 @@
 
 use super::*;
 use crate::linux_abi::{
-    LINUX_IORING_FEAT_NODROP, LINUX_IORING_FEAT_SINGLE_MMAP, LINUX_IORING_OFF_CQ_RING,
+    LINUX_IORING_ENTER_EXT_ARG, LINUX_IORING_ENTER_FLAGS_MASK, LINUX_IORING_FEAT_NODROP,
+    LINUX_IORING_FEAT_SINGLE_MMAP, LINUX_IORING_OFF_CQ_RING,
     LINUX_IORING_OFF_SQ_RING, LINUX_IORING_OFF_SQES, LINUX_IORING_OP_ACCEPT, LINUX_IORING_OP_CLOSE,
     LINUX_IORING_OP_CONNECT, LINUX_IORING_OP_FSYNC, LINUX_IORING_OP_NOP, LINUX_IORING_OP_POLL_ADD,
     LINUX_IORING_OP_READ, LINUX_IORING_OP_READV, LINUX_IORING_OP_RECV, LINUX_IORING_OP_RECVMSG,
@@ -339,10 +340,25 @@ impl SyscallDispatcher {
         memory: &mut impl GuestMemory,
         fd: i32,
         to_submit: u32,
+        flags: u32,
+        argp: u64,
+        argsz: u64,
     ) -> DispatchOutcome {
         let Some(state) = self.io.io_uring_instances.read().get(&fd).copied() else {
             return DispatchOutcome::errno(LINUX_EINVAL);
         };
+        // Reject any flag bit Linux does not define (before consuming the SQ
+        // ring, matching the kernel entry check). carrick services neither the
+        // SQPOLL kthread nor the EXT_ARG getevents timeout/sigmask struct, so
+        // reject EXT_ARG and any nonzero argp/argsz too, rather than silently
+        // ignoring them. (audit M4; probe iouringenterflag)
+        if flags & !LINUX_IORING_ENTER_FLAGS_MASK != 0
+            || flags & LINUX_IORING_ENTER_EXT_ARG != 0
+            || argp != 0
+            || argsz != 0
+        {
+            return DispatchOutcome::errno(LINUX_EINVAL);
+        }
         let layout = state.layout;
         let ring = state.ring_addr;
         let sq_mask = layout.sq_entries - 1;
@@ -351,6 +367,7 @@ impl SyscallDispatcher {
         let sq_tail = read_ring_u32(memory, ring + layout.sq_off.tail as u64);
         let mut sq_head = read_ring_u32(memory, ring + layout.sq_off.head as u64);
         let mut cq_tail = read_ring_u32(memory, ring + layout.cq_off.tail as u64);
+        let mut processed: u32 = 0;
 
         // Process submitted SQEs in order. Synchronous ops (and ready async ops)
         // complete inline; an async op that would block hands off to the runtime's
@@ -359,7 +376,7 @@ impl SyscallDispatcher {
         // persists across the re-dispatch). carrick assumes `to_submit` matches
         // the number of SQEs the guest queued (the liburing invariant); ops run in
         // submission order (head-of-line), not Linux's out-of-order async.
-        while sq_head != sq_tail {
+        while sq_head != sq_tail && processed < to_submit {
             let arr_slot = ring + layout.sq_off.array as u64 + ((sq_head & sq_mask) as u64) * 4;
             let sqe_idx = read_ring_u32(memory, arr_slot);
             let sqe_addr = state.sqes_addr + (sqe_idx as u64) * 64;
@@ -395,15 +412,15 @@ impl SyscallDispatcher {
             let _ = memory.write_bytes(cqe_addr, cqe.as_bytes());
             cq_tail = cq_tail.wrapping_add(1);
             sq_head = sq_head.wrapping_add(1);
+            processed = processed.wrapping_add(1);
         }
         // Publish the consumed SQ head and the produced CQ tail back to the guest.
         write_ring_u32(memory, ring + layout.sq_off.head as u64, sq_head);
         write_ring_u32(memory, ring + layout.cq_off.tail as u64, cq_tail);
-        // SQEs consumed = those no longer between head and tail (correct across a
-        // WaitOnFds re-dispatch, since sq_head lives in the persisted ring).
-        let submitted = to_submit.saturating_sub(sq_tail.wrapping_sub(sq_head));
+        // Number of SQEs this call submitted (bounded by to_submit; correct
+        // across a WaitOnFds re-dispatch, which recounts only still-pending SQEs).
         DispatchOutcome::Returned {
-            value: submitted as i64,
+            value: processed as i64,
         }
     }
 

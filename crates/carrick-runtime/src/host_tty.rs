@@ -33,13 +33,15 @@ use parking_lot::Mutex;
 
 use crate::linux_abi::{LinuxTermios, LinuxWinsize};
 
-/// POSIX `c_iflag` bits that share values between Linux and Darwin.
-/// IGNBRK 0x0001, BRKINT 0x0002, IGNPAR 0x0004, PARMRK 0x0008,
-/// INPCK 0x0010, ISTRIP 0x0020, INLCR 0x0040, IGNCR 0x0080,
-/// ICRNL 0x0100, IXON 0x0200, IXANY 0x0800, IXOFF 0x0400 (Linux
-/// uses 0x1000; we leave that one out of the shared mask). Same
-/// for IUTF8 (Linux 0x4000, Darwin 0x4000 — matches on modern macOS).
-const COMMON_IFLAG_MASK: u32 = 0x0000_0FFF;
+/// POSIX `c_iflag` bits that share VALUES between Linux and Darwin:
+/// IGNBRK 0x01..ICRNL 0x100 (=0x1FF), IXANY 0x800, IUTF8 0x4000.
+/// IXON/IXOFF do NOT share values (Linux 0x400/0x1000 vs Darwin
+/// 0x200/0x400) and are translated explicitly below. (audit M4; probe termiosbits)
+const COMMON_IFLAG_MASK: u32 = 0x0000_49FF;
+const LINUX_IXON: u32 = 0x0400;
+const LINUX_IXOFF: u32 = 0x1000;
+const DARWIN_IXON: u64 = 0x0200;
+const DARWIN_IXOFF: u64 = 0x0400;
 
 /// POSIX `c_oflag` bits with matching values: OPOST 0x0001,
 /// ONLCR 0x0004 (Linux) — Darwin uses 0x0002 for ONLCR. To keep
@@ -51,10 +53,30 @@ const DARWIN_ONLCR: u64 = 0x0002;
 const LINUX_OCRNL: u32 = 0x0008;
 const DARWIN_OCRNL: u64 = 0x0010;
 
-/// POSIX `c_cflag` bits CS5/CS6/CS7/CS8 (0x00/0x10/0x20/0x30 mask
-/// 0x30), CSTOPB 0x40, CREAD 0x80, PARENB 0x100, PARODD 0x200,
-/// HUPCL 0x400, CLOCAL 0x800.
-const COMMON_CFLAG_MASK: u32 = 0x0000_0FFF;
+/// c_cflag field values. Linux and Darwin use DIFFERENT bit positions for the
+/// CSIZE/CSTOPB/parity group, so each is translated per-field (not masked 1:1).
+/// The CBAUD baud nibble is NOT copied (baud rides in c_ispeed/c_ospeed).
+/// (audit M4; probe termiosbits)
+const LINUX_CSIZE: u32 = 0x0030;
+const LINUX_CS6: u32 = 0x0010;
+const LINUX_CS7: u32 = 0x0020;
+const LINUX_CS8: u32 = 0x0030;
+const LINUX_CSTOPB: u32 = 0x0040;
+const LINUX_CREAD: u32 = 0x0080;
+const LINUX_PARENB: u32 = 0x0100;
+const LINUX_PARODD: u32 = 0x0200;
+const LINUX_HUPCL: u32 = 0x0400;
+const LINUX_CLOCAL: u32 = 0x0800;
+const DARWIN_CSIZE: u64 = 0x0300;
+const DARWIN_CS6: u64 = 0x0100;
+const DARWIN_CS7: u64 = 0x0200;
+const DARWIN_CS8: u64 = 0x0300;
+const DARWIN_CSTOPB: u64 = 0x0400;
+const DARWIN_CREAD: u64 = 0x0800;
+const DARWIN_PARENB: u64 = 0x1000;
+const DARWIN_PARODD: u64 = 0x2000;
+const DARWIN_HUPCL: u64 = 0x4000;
+const DARWIN_CLOCAL: u64 = 0x8000;
 
 /// POSIX `c_lflag` bits ISIG 0x01, ICANON 0x02, ECHO 0x08, ECHOE
 /// 0x10, ECHOK 0x20, ECHONL 0x40, NOFLSH 0x80, TOSTOP 0x100,
@@ -185,7 +207,13 @@ pub fn get_host_winsize(fd: i32) -> Option<LinuxWinsize> {
 }
 
 fn darwin_to_linux_termios(d: &libc::termios) -> LinuxTermios {
-    let iflag = (d.c_iflag as u32) & COMMON_IFLAG_MASK;
+    let mut iflag = (d.c_iflag as u32) & COMMON_IFLAG_MASK;
+    if d.c_iflag & DARWIN_IXON != 0 {
+        iflag |= LINUX_IXON;
+    }
+    if d.c_iflag & DARWIN_IXOFF != 0 {
+        iflag |= LINUX_IXOFF;
+    }
 
     let mut oflag = (d.c_oflag as u32) & COMMON_OFLAG_MASK;
     if d.c_oflag & DARWIN_ONLCR != 0 {
@@ -195,7 +223,31 @@ fn darwin_to_linux_termios(d: &libc::termios) -> LinuxTermios {
         oflag |= LINUX_OCRNL;
     }
 
-    let cflag = (d.c_cflag as u32) & COMMON_CFLAG_MASK;
+    // CSIZE is a 2-bit FIELD; match the whole field (CS5==0 on both).
+    let mut cflag = match d.c_cflag & DARWIN_CSIZE {
+        x if x == DARWIN_CS8 => LINUX_CS8,
+        x if x == DARWIN_CS7 => LINUX_CS7,
+        x if x == DARWIN_CS6 => LINUX_CS6,
+        _ => 0,
+    };
+    if d.c_cflag & DARWIN_CSTOPB != 0 {
+        cflag |= LINUX_CSTOPB;
+    }
+    if d.c_cflag & DARWIN_CREAD != 0 {
+        cflag |= LINUX_CREAD;
+    }
+    if d.c_cflag & DARWIN_PARENB != 0 {
+        cflag |= LINUX_PARENB;
+    }
+    if d.c_cflag & DARWIN_PARODD != 0 {
+        cflag |= LINUX_PARODD;
+    }
+    if d.c_cflag & DARWIN_HUPCL != 0 {
+        cflag |= LINUX_HUPCL;
+    }
+    if d.c_cflag & DARWIN_CLOCAL != 0 {
+        cflag |= LINUX_CLOCAL;
+    }
 
     let mut lflag = 0u32;
     let dl = d.c_lflag;
@@ -256,9 +308,16 @@ fn darwin_to_linux_termios(d: &libc::termios) -> LinuxTermios {
 
 fn linux_to_darwin_termios(l: &LinuxTermios, d: &mut libc::termios) {
     // Preserve any host-specific bits outside the masks we translate.
-    let preserved_iflag = d.c_iflag & !(COMMON_IFLAG_MASK as u64);
+    let preserved_iflag = d.c_iflag & !((COMMON_IFLAG_MASK as u64) | DARWIN_IXON | DARWIN_IXOFF);
     let preserved_oflag = d.c_oflag & !((COMMON_OFLAG_MASK as u64) | DARWIN_ONLCR | DARWIN_OCRNL);
-    let preserved_cflag = d.c_cflag & !(COMMON_CFLAG_MASK as u64);
+    let preserved_cflag = d.c_cflag
+        & !(DARWIN_CSIZE
+            | DARWIN_CSTOPB
+            | DARWIN_CREAD
+            | DARWIN_PARENB
+            | DARWIN_PARODD
+            | DARWIN_HUPCL
+            | DARWIN_CLOCAL);
     let preserved_lflag = d.c_lflag
         & !(DARWIN_LFLAG_ISIG
             | DARWIN_LFLAG_ICANON
@@ -270,7 +329,13 @@ fn linux_to_darwin_termios(l: &LinuxTermios, d: &mut libc::termios) {
             | DARWIN_LFLAG_TOSTOP
             | DARWIN_LFLAG_IEXTEN);
 
-    let iflag = preserved_iflag | (l.c_iflag as u64 & COMMON_IFLAG_MASK as u64);
+    let mut iflag = preserved_iflag | (l.c_iflag as u64 & COMMON_IFLAG_MASK as u64);
+    if l.c_iflag & LINUX_IXON != 0 {
+        iflag |= DARWIN_IXON;
+    }
+    if l.c_iflag & LINUX_IXOFF != 0 {
+        iflag |= DARWIN_IXOFF;
+    }
 
     let mut oflag = preserved_oflag | (l.c_oflag as u64 & COMMON_OFLAG_MASK as u64);
     if l.c_oflag & LINUX_ONLCR != 0 {
@@ -280,7 +345,31 @@ fn linux_to_darwin_termios(l: &LinuxTermios, d: &mut libc::termios) {
         oflag |= DARWIN_OCRNL;
     }
 
-    let cflag = preserved_cflag | (l.c_cflag as u64 & COMMON_CFLAG_MASK as u64);
+    let mut cflag = preserved_cflag;
+    cflag |= match l.c_cflag & LINUX_CSIZE {
+        x if x == LINUX_CS8 => DARWIN_CS8,
+        x if x == LINUX_CS7 => DARWIN_CS7,
+        x if x == LINUX_CS6 => DARWIN_CS6,
+        _ => 0,
+    };
+    if l.c_cflag & LINUX_CSTOPB != 0 {
+        cflag |= DARWIN_CSTOPB;
+    }
+    if l.c_cflag & LINUX_CREAD != 0 {
+        cflag |= DARWIN_CREAD;
+    }
+    if l.c_cflag & LINUX_PARENB != 0 {
+        cflag |= DARWIN_PARENB;
+    }
+    if l.c_cflag & LINUX_PARODD != 0 {
+        cflag |= DARWIN_PARODD;
+    }
+    if l.c_cflag & LINUX_HUPCL != 0 {
+        cflag |= DARWIN_HUPCL;
+    }
+    if l.c_cflag & LINUX_CLOCAL != 0 {
+        cflag |= DARWIN_CLOCAL;
+    }
 
     let mut lflag = preserved_lflag;
     if l.c_lflag & LINUX_LFLAG_ISIG != 0 {
