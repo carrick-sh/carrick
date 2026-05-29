@@ -61,13 +61,13 @@ SysV-semaphore, and SysV-msg-queue fixes landed against it.
 | epoll_poll | 34 | 3 | 6   | 9  | 0 | 10  | 62  | **65%** |
 | sched      | 36 | 0 | 8   | 5  | 0 | 18  | 67  | **73%** |
 | other      | 55 | 2 | 9   | 2  | 0 | 53  | 121 | **81%** |
-| fs         | 196| 0 | 71  | 23 | 11 | 141 | 442 | **65%** |
+| fs         | 198| 0 | 69  | 23 | 11 | 141 | 442 | **66%** |
 | process    | 114| 1 | 29  | 41 | 1 | 206 | 392 | **61%** |
 | ipc        | 14 | 0 | 14  | 12 | 0 | 7   | 47  | **35%** (sem + msg queues functional) |
 | net        | 13 | 0 | 15  | 9  | 0 | 16  | 53  | **35%** |
 | mm         | 25 | 1 | 28  | 19 | 1 | 43  | 117 | **34%** |
 | xattr      | 3  | 0 | 1   | 1  | 0 | 24  | 29  | **60%** |
-| **TOTAL**  | **552** | **7** | **186** | **135** | **16** | **540** | **1436** | **552/896 = 62%** |
+| **TOTAL**  | **554** | **7** | **184** | **135** | **16** | **540** | **1436** | **554/896 = 62%** |
 
 _Last refresh (2026-05-28): the functional-FIFO cluster (commit `31f2a7c`) added
 +6 verified-MATCH — `select01` flipped to MATCH (16/16) via the FIFO O_RDWR leg +
@@ -77,7 +77,11 @@ the select multi-set return-count fix; `mknod02–05/09`, `mknodat01` now MATCH
 (macOS can't `mknod` char/block devices — inherent), `mknod06` tst_test re-exec
 hang, `select03`/`pselect02` select error-edge TBROK, `mknod08` DAC EACCES._
 
-_Last refresh (2026-05-29, fs): preadv on a non-readable (O_WRONLY) fd → EBADF
+_Last refresh (2026-05-29, fs): read(2) on a write-only fd → EBADF (commit
+`3708461`): open09, creat01 → MATCH (+2). fs MATCH 196→198 (**66%**); total
+verified-MATCH 552→554/896. Probe `readwronly`._
+
+_Earlier 2026-05-29 (fs): preadv on a non-readable (O_WRONLY) fd → EBADF
 (commit `0ce024b`): preadv02/preadv02_64/preadv202/preadv202_64 → MATCH (+4). fs
 MATCH 192→196 (**65%**); total verified-MATCH 548→552/896 (**62%**). Probe
 `preadvwronly`._
