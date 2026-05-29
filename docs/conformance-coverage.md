@@ -189,7 +189,7 @@ underlying gap got fixed):
 
 | Invariant | Owned by | Stands in for (LTP) |
 |---|---|---|
-| **directory-modify DAC: an unprivileged guest (euid≠0) can mkdir/rmdir/unlink an entry only in a dir it has write+search on (else EACCES); a sticky (S_ISVTX) dir additionally requires owning the entry or the dir to remove (else EPERM). Root (CAP_DAC_OVERRIDE) bypasses — the default root guest + demos are unaffected** | ✅ `dirdac` | mkdir04, rmdir03, unlink08 |
+| **directory-modify DAC: an unprivileged guest (euid≠0) can mkdir/rmdir/unlink an entry only in a dir it has write+search on (else EACCES); a sticky (S_ISVTX) dir additionally requires owning the entry or the dir to remove (else EPERM). Root (CAP_DAC_OVERRIDE) bypasses — the default root guest + demos are unaffected** | ✅ `dirdac` | mkdir04, rmdir03, unlink08, symlink03 |
 | access/faccessat/faccessat2 edges under guest-uid=0 (root bypasses rwx; F_OK/R_OK/W_OK/X_OK; AT_EACCESS) | ✅ `accessx` | access01–04, faccessat01/02, faccessat2_* |
 | **O_DIRECTORY on a non-directory → ENOTDIR; on a directory → success; O_RDWR on a directory → EISDIR. Fixed the swapped aarch64 fcntl constants (O_DIRECTORY=0o40000 not 0o200000=O_DIRECT; O_NOFOLLOW=0o100000 not 0o400000) — O_DIRECTORY had never triggered the must-be-a-dir check** | ✅ `odirectory` | open08 (O_NOFOLLOW→ELOOP enforcement is a tracked follow-up; the constant is now correct so the flag is detected) |
 | **preadv on a write-only (O_WRONLY) fd → EBADF (reads the fd, so it must be open for reading); a readable fd returns the bytes** | ✅ `preadvwronly` | preadv02/preadv02_64/preadv202/preadv202_64 (the "not open for reading" case) |
