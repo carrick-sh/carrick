@@ -60,14 +60,14 @@ SysV-semaphore, and SysV-msg-queue fixes landed against it.
 | signals    | 36 | 0 | 3   | 7  | 3 | 2   | 51  | **73%** |
 | epoll_poll | 34 | 3 | 6   | 9  | 0 | 10  | 62  | **65%** |
 | sched      | 33 | 0 | 11  | 5  | 0 | 18  | 67  | **67%** |
-| other      | 48 | 2 | 16  | 2  | 0 | 53  | 121 | **71%** |
+| other      | 51 | 2 | 13  | 2  | 0 | 53  | 121 | **75%** |
 | fs         | 189| 0 | 74  | 32 | 6 | 141 | 442 | **63%** |
 | process    | 114| 1 | 29  | 41 | 1 | 206 | 392 | **61%** |
 | ipc        | 14 | 0 | 14  | 12 | 0 | 7   | 47  | **35%** (sem + msg queues functional) |
 | net        | 13 | 0 | 15  | 9  | 0 | 16  | 53  | **35%** |
 | mm         | 25 | 1 | 28  | 19 | 1 | 43  | 117 | **34%** |
 | xattr      | 3  | 0 | 1   | 1  | 0 | 24  | 29  | **60%** |
-| **TOTAL**  | **535** | **7** | **199** | **144** | **11** | **540** | **1436** | **535/896 = 60%** |
+| **TOTAL**  | **538** | **7** | **196** | **144** | **11** | **540** | **1436** | **538/896 = 60%** |
 
 _Last refresh (2026-05-28): the functional-FIFO cluster (commit `31f2a7c`) added
 +6 verified-MATCH — `select01` flipped to MATCH (16/16) via the FIFO O_RDWR leg +
@@ -77,7 +77,13 @@ the select multi-set return-count fix; `mknod02–05/09`, `mknodat01` now MATCH
 (macOS can't `mknod` char/block devices — inherent), `mknod06` tst_test re-exec
 hang, `select03`/`pselect02` select error-edge TBROK, `mknod08` DAC EACCES._
 
-_Last refresh (2026-05-29, mm): the mmap/munmap correctness fixes (commit
+_Last refresh (2026-05-29, other): get_robust_list (100) + rt_tgsigqueueinfo
+(240) implemented and set_robust_list (99) len-validated (commit `f7d175e`):
+`get_robust_list01`, `set_robust_list01`, `rt_tgsigqueueinfo01` → MATCH (+3).
+other MATCH 48→51 (**75%**); total verified-MATCH 535→538/896. Probes
+`robustlist` + `tgsigqueue`._
+
+_Earlier 2026-05-29 (mm): the mmap/munmap correctness fixes (commit
 `4878690`) re-swept the mmap*/munmap* family — `mmap08` (bad-fd-before-length →
 EBADF), `munmap01`/`munmap02` (unmap a MAP_SHARED/MAP_PRIVATE file region), and
 `munmap03` (page-alignment + out-of-range EINVAL edges) all → MATCH. The
