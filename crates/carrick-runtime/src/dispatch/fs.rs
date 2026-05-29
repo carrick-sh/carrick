@@ -4847,7 +4847,10 @@ impl SyscallDispatcher {
             let newdirfd = newdirfd;
             let newpath = newpath.0;
             let flags = flags;
-            if flags & !(LINUX_AT_SYMLINK_NOFOLLOW | LINUX_AT_EMPTY_PATH) != 0 {
+            // linkat accepts AT_SYMLINK_FOLLOW + AT_EMPTY_PATH (NOT
+            // AT_SYMLINK_NOFOLLOW — that is a *at-stat/chmod flag); reject any
+            // other bit with EINVAL, before path faults. (audit M4; probe linkatflag)
+            if flags & !(LINUX_AT_SYMLINK_FOLLOW | LINUX_AT_EMPTY_PATH) != 0 {
                 return Ok(LINUX_EINVAL.into());
             }
             let old = match read_guest_c_string(&*cx.memory, oldpath) {

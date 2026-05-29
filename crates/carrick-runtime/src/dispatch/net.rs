@@ -1261,21 +1261,32 @@ impl SyscallDispatcher {
                 }
             }
 
-            ready = acc
+            // Tag each ready event with its ORIGINATING guest fd (acc is keyed by
+            // guest fd) so an overflow queued into pending_ready can be purged by
+            // fd on EPOLL_CTL_DEL/MOD even when epoll_data != fd. Split the tail
+            // (still fd-tagged) into pending_ready, THEN strip fds for the
+            // guest-visible `ready`. (audit M3; probe epollstaledel)
+            let mut ready_tagged: Vec<(i32, LinuxEpollEvent)> = acc
                 .into_iter()
-                .map(|(_, (events, data))| LinuxEpollEvent {
-                    events,
-                    _pad: 0,
-                    data,
+                .map(|(fd, (events, data))| {
+                    (
+                        fd,
+                        LinuxEpollEvent {
+                            events,
+                            _pad: 0,
+                            data,
+                        },
+                    )
                 })
                 .collect();
-            if ready.len() > max_events {
-                let overflow = ready.split_off(max_events);
+            if ready_tagged.len() > max_events {
+                let overflow: Vec<(i32, LinuxEpollEvent)> = ready_tagged.split_off(max_events);
                 let mut open = open_file.description.write();
                 if let OpenDescription::Epoll { pending_ready, .. } = &mut *open {
                     pending_ready.extend(overflow);
                 }
             }
+            ready = ready_tagged.into_iter().map(|(_fd, event)| event).collect();
 
             if ready.is_empty() && timeout_ms != 0 {
                 let timeout = if timeout_ms < 0 {

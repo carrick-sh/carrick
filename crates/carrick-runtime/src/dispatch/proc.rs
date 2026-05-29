@@ -1208,7 +1208,9 @@ impl SyscallDispatcher {
                 )
             };
             if r != 0 {
-                let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                // Route the host errno through the central Darwin->Linux helper
+                // (a raw Darwin errno >34 would otherwise leak to the guest).
+                let errno = crate::dispatch::HostSyscallError::last().linux_errno();
                 return Ok(DispatchOutcome::errno(errno));
             }
             clear_unrequested_waitid_state(&mut info, options);
@@ -1243,7 +1245,7 @@ impl SyscallDispatcher {
                         }
                         break;
                     }
-                    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                    let errno = crate::dispatch::HostSyscallError::last().linux_errno();
                     if errno == LINUX_EINTR
                         && !crate::host_signal::has_process_pending()
                         && !crate::fork_quiesce::is_quiescing()
@@ -1251,6 +1253,22 @@ impl SyscallDispatcher {
                         continue;
                     }
                     return Ok(DispatchOutcome::errno(errno));
+                }
+            }
+            // Mirror wait4 (the child-CPU drain): roll a reaped child's guest CPU
+            // into this process's child-time accumulators (RUSAGE_CHILDREN / times
+            // cutime). Only on a TERMINAL reap that consumed the zombie: si_pid
+            // set, not WNOWAIT (peek leaves the zombie for the real reap), and an
+            // exit/kill code (not stop/continue). (audit M4; probe waitidcputime)
+            {
+                const CLD_EXITED: i32 = 1;
+                const CLD_KILLED: i32 = 2;
+                const CLD_DUMPED: i32 = 3;
+                let terminal = matches!(info.si_code, CLD_EXITED | CLD_KILLED | CLD_DUMPED);
+                if info.si_pid != 0 && options & LINUX_WNOWAIT == 0 && terminal {
+                    let child_guest_us =
+                        crate::guest_cpu::reap_child_guest_ns(info.si_pid as u32) / 1000;
+                    crate::guest_cpu::add_reaped_child(child_guest_us, 0);
                 }
             }
             if infop_addr.0 != 0 {
