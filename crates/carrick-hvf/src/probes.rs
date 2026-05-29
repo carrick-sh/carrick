@@ -48,6 +48,12 @@ mod carrick_usdt {
     /// HV_BUSY root cause), 3=vcpu_create result in a sibling rebuild / spawn
     /// (a=rc, b=site: 0=rebuild 1=spawn). `tid` is the acting thread.
     fn fork__quiesce(_: i32, _: i64, _: i64, _: i32) {}
+    /// Per-run lifecycle marker, one probe fired at each phase boundary so a
+    /// DTrace consumer can time each phase as a delta. `phase`:
+    /// 0=run-entry, 1=image-ready, 2=vm-created, 3=guest-loaded (ready to run),
+    /// 4=first-vcpu-run, 5=vm-destroy-begin, 6=vm-destroy-end. (guest-exit has
+    /// its own probe between 4 and 5.) Cheap: fires a handful of times per run.
+    fn lifecycle(_: u32) {}
     /// Fires every syscall trap. `arg0` is the ADDRESS of a
     /// `compat::GuestRegs` (`#[repr(C)]`); DTrace does
     /// `copyin(arg0, sizeof(gregs_t))` and reads fields by offset. A
@@ -270,6 +276,23 @@ pub fn ulock_wake(host_addr: u64, iter: i32, rc: i64) {
 
 pub fn guest_exit(code: i32) {
     carrick_usdt::guest__exit!(|| (libc::getpid() as u32, code));
+}
+
+/// Per-run lifecycle phase markers (see the `lifecycle` provider doc). Fire one
+/// at each boundary so `carrick trace` can attribute the per-run wall-clock to
+/// startup / VM-create / guest-load / run / teardown phases.
+pub mod phase {
+    pub const RUN_ENTRY: u32 = 0;
+    pub const IMAGE_READY: u32 = 1;
+    pub const VM_CREATED: u32 = 2;
+    pub const GUEST_LOADED: u32 = 3;
+    pub const FIRST_VCPU_RUN: u32 = 4;
+    pub const VM_DESTROY_BEGIN: u32 = 5;
+    pub const VM_DESTROY_END: u32 = 6;
+}
+
+pub fn lifecycle(phase: u32) {
+    carrick_usdt::lifecycle!(|| phase);
 }
 
 pub fn execve_argv(path: &str, argv: &[String]) {
