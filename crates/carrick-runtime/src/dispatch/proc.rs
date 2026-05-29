@@ -771,6 +771,45 @@ impl SyscallDispatcher {
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
+        /// `sched_getattr(pid, attr, size, flags)`: read a task's scheduling
+        /// attributes. carrick presents every task as SCHED_OTHER / nice 0 /
+        /// prio 0, so the success path returns a zeroed sched_attr (with the
+        /// size field set). Validation matches Linux (LTP sched_getattr02):
+        /// flags must be 0, size >= SCHED_ATTR_SIZE_VER0, attr non-NULL (all
+        /// EINVAL), and a non-existent pid → ESRCH. Was ENOSYS.
+        fn sched_getattr(this, cx, pid: u64, attr: GuestPtr, size: u64, flags: u64) {
+            const SCHED_ATTR_SIZE_VER0: u64 = 48;
+            // No sched_getattr flags are defined → any flag is EINVAL.
+            if flags != 0 {
+                return Ok(LINUX_EINVAL.into());
+            }
+            // The buffer must be at least the ver0 struct.
+            if size < SCHED_ATTR_SIZE_VER0 {
+                return Ok(LINUX_EINVAL.into());
+            }
+            // Linux returns EINVAL (not EFAULT) for a NULL attr pointer.
+            if attr.0 == 0 {
+                return Ok(LINUX_EINVAL.into());
+            }
+            if (pid as i32) < 0 {
+                return Ok(LINUX_EINVAL.into());
+            }
+            if !sched_pid_exists(pid) {
+                return Ok(LINUX_ESRCH.into());
+            }
+            // SCHED_OTHER, nice 0, priority 0 — a zeroed sched_attr with only
+            // the leading `size` field populated (layout: size@0 u32,
+            // sched_policy@4 u32, sched_flags@8 u64, sched_nice@16 s32,
+            // sched_priority@20 u32, runtime/deadline/period@24/32/40 u64).
+            let memory = &mut *cx.memory;
+            let mut buf = [0u8; SCHED_ATTR_SIZE_VER0 as usize];
+            buf[0..4].copy_from_slice(&(SCHED_ATTR_SIZE_VER0 as u32).to_le_bytes());
+            if memory.write_bytes(attr.0, &buf).is_err() {
+                return Ok(LINUX_EFAULT.into());
+            }
+            Ok(DispatchOutcome::Returned { value: 0 })
+        }
+
         /// `sched_setscheduler(pid, policy, &param)`: switch a process's
         /// policy. Without CAP_SYS_NICE (we are non-root in the guest), Linux
         /// refuses any RT policy with EPERM; SCHED_OTHER+priority=0 succeeds
