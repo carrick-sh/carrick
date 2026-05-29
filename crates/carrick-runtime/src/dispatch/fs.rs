@@ -1223,6 +1223,72 @@ impl SyscallDispatcher {
         }
         Ok(())
     }
+
+    /// Shared core of fchmodat / fchmodat2: resolve `pathname` against `dirfd`,
+    /// then apply `mode` (with the setgid-clear rule) to the writable backend.
+    /// Synthetic /proc /sys paths and the in-memory backend accept it as a
+    /// no-op success as long as the path exists. Flag handling differs between
+    /// the two callers, so it stays in the syscall wrappers.
+    fn chmod_at(
+        &self,
+        dirfd: u64,
+        pathname: u64,
+        mode: u64,
+        memory: &impl GuestMemory,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let path = match read_guest_c_string(memory, pathname) {
+            Ok(path) => path,
+            Err(errno) => return Ok(errno.into()),
+        };
+        if path.is_empty() {
+            return Ok(LINUX_ENOENT.into());
+        }
+        let resolved = match self.resolve_at_path(dirfd, &path) {
+            Ok(resolved) => resolved,
+            Err(errno) => return Ok(errno.into()),
+        };
+        if crate::vfs::is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context()) {
+            return Ok(DispatchOutcome::Returned { value: 0 });
+        }
+        if let Err(errno) = self.layered_metadata(&resolved) {
+            return Ok(errno.into());
+        }
+        let mode = self.maybe_clear_setgid(&resolved, (mode & 0o7777) as u32);
+        match self.fs.rootfs_vfs.overlay.set_mode(&resolved, mode) {
+            Ok(()) | Err(crate::fs_backend::BackendError::Unsupported) => {
+                Ok(DispatchOutcome::Returned { value: 0 })
+            }
+            Err(_) => Ok(DispatchOutcome::Returned { value: 0 }),
+        }
+    }
+
+    /// Linux clears the setgid bit (S_ISGID) on a chmod by an UNPRIVILEGED
+    /// process whose effective gid doesn't match the file's group — so a
+    /// non-owner-group user can't make a file setgid to a group it isn't in
+    /// (chmod05/fchmod05). Root (euid==0) keeps the bit. carrick tracks only the
+    /// effective gid (not supplementary groups), which is what the LTP tests
+    /// exercise. Returns the mode to actually apply.
+    fn maybe_clear_setgid(&self, path: &str, mode: u32) -> u32 {
+        const S_ISGID: u32 = 0o2000;
+        if mode & S_ISGID == 0 {
+            return mode;
+        }
+        let creds = self.cred_snapshot();
+        if creds.euid == 0 {
+            return mode;
+        }
+        let file_gid = self
+            .fs
+            .rootfs_vfs
+            .overlay
+            .get_owner(path)
+            .map(|(_, g)| g)
+            .unwrap_or(0);
+        if file_gid != creds.egid {
+            return mode & !S_ISGID;
+        }
+        mode
+    }
 }
 
 impl SyscallDispatcher {
@@ -4100,6 +4166,7 @@ impl SyscallDispatcher {
                     _ => None,
                 });
             if let Some(path) = path {
+                let mode = this.maybe_clear_setgid(&path, mode);
                 let _ = this.fs.rootfs_vfs.overlay.set_mode(&path, mode);
             }
             Ok(DispatchOutcome::Returned { value: 0 })
@@ -4188,45 +4255,28 @@ impl SyscallDispatcher {
 
         fn fchmodat(this, cx, dirfd: u64, pathname: GuestPtr, mode: u64, flags: u64) {
 
-            let dirfd = dirfd;
-            let pathname = pathname.0;
             // The fchmodat syscall (nr 53) is SYSCALL_DEFINE3 in Linux: it takes
             // only (dirfd, path, mode) and IGNORES the 4th register. glibc's
             // AT_SYMLINK_NOFOLLOW path still leaves the flag in that register —
             // `apt-get update` issues fchmodat(AT_FDCWD, path, 0644, 0x100) on
             // every downloaded index — and the real kernel silently ignores it.
             // Rejecting non-zero flags here made every apt download chmod fail
-            // with EINVAL ("chmod 0644 of file … failed - 201::URIDone"). Only
-            // fchmodat2 (452) carries a real flags argument; on the
-            // disk-authoritative host backend its mode-setting is best-effort, so
-            // AT_SYMLINK_NOFOLLOW stays advisory.
-            let path = match read_guest_c_string(&*cx.memory, pathname) {
-                Ok(path) => path,
-                Err(errno) => return Ok(errno.into()),
-            };
-            if path.is_empty() {
-                return Ok(LINUX_ENOENT.into());
+            // ("chmod 0644 of file … failed - 201::URIDone"). Only fchmodat2 (452)
+            // validates the flags.
+            let _ = flags;
+            this.chmod_at(dirfd, pathname.0, mode, &*cx.memory)
+
+        }
+
+        fn fchmodat2(this, cx, dirfd: u64, pathname: GuestPtr, mode: u64, flags: u64) {
+
+            // fchmodat2 (nr 452) carries a REAL flags argument: only
+            // AT_SYMLINK_NOFOLLOW is valid (fchmodat2_02 passes -1 → EINVAL). On
+            // the disk-authoritative host backend the flag itself stays advisory.
+            if flags & !LINUX_AT_SYMLINK_NOFOLLOW != 0 {
+                return Ok(LINUX_EINVAL.into());
             }
-            let resolved = match this.resolve_at_path(dirfd, &path) {
-                Ok(resolved) => resolved,
-                Err(errno) => return Ok(errno.into()),
-            };
-            // Apply the mode to the writable backend (cap-std set_permissions on
-            // --fs host). Synthetic /proc /sys paths and the in-memory backend
-            // (Unsupported) accept it as a no-op as long as the path exists.
-            if crate::vfs::is_synthetic_virtual_file(&resolved, &this.synthetic_proc_context()) {
-                return Ok(DispatchOutcome::Returned { value: 0 });
-            }
-            if let Err(errno) = this.layered_metadata(&resolved) {
-                return Ok(errno.into());
-            }
-            let mode = (mode & 0o7777) as u32;
-            match this.fs.rootfs_vfs.overlay.set_mode(&resolved, mode) {
-                Ok(()) | Err(crate::fs_backend::BackendError::Unsupported) => {
-                    Ok(DispatchOutcome::Returned { value: 0 })
-                }
-                Err(_) => Ok(DispatchOutcome::Returned { value: 0 }),
-            }
+            this.chmod_at(dirfd, pathname.0, mode, &*cx.memory)
 
         }
 
