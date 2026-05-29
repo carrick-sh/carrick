@@ -2101,7 +2101,7 @@ where
             // (tid, signum), pop it now and hand it to inject_signal so the
             // SA_SIGINFO handler sees the original si_value payload.
             let queued_siginfo = dispatcher.take_pending_siginfo(tid, pending);
-            trap.inject_signal(
+            match trap.inject_signal(
                 pending,
                 action.sa_handler,
                 restorer,
@@ -2112,8 +2112,19 @@ where
                 None, // SI_USER-shaped (tkill/sysmon); faults use deliver_fault_signal
                 queued_siginfo,
                 restart_syscall,
-            )?;
-            Ok(Some(PendingSignalAction { term_signal: None }))
+            ) {
+                Ok(()) => Ok(Some(PendingSignalAction { term_signal: None })),
+                // Linux force_sigsegv: the signal frame couldn't be written to
+                // the user stack (guest mprotect'd its own stack PROT_NONE, bad
+                // SP, ...). Terminate the whole thread-group by SIGSEGV (exit
+                // 139) instead of a fatal carrick error — and a sibling thread
+                // takes the group down cleanly rather than silently vanishing
+                // and deadlocking its peers.
+                Err(TrapError::SignalDeliveryFault) => Ok(Some(PendingSignalAction {
+                    term_signal: Some(11), // SIGSEGV
+                })),
+                Err(e) => Err(e.into()),
+            }
         }
         // No registered handler → the kernel takes the signal's DEFAULT action.
         // For SIGCHLD/SIGURG/SIGWINCH that action is IGNORE, not terminate, so the
