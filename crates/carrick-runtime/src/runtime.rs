@@ -707,6 +707,22 @@ where
             }
         }
 
+        if trace_traps && let Some(ret) = last_syscall_retval {
+            // Return-side companion to the entry line above: shows what carrick
+            // returned to the guest. A negative value in [-4095, -1] is -errno
+            // (decode it), otherwise it's a plain return. This makes the trap
+            // stream a request+result log — the reducer aligns it against the
+            // Docker oracle to localise a divergence (wrong errno) or the last
+            // syscall before a hang (no return line printed).
+            if (-4095..0).contains(&ret) {
+                let e = (-ret) as u32;
+                let ename = crate::linux_abi::errno_name(e).unwrap_or("?");
+                eprintln!("trap#{traps}:   -> errno={e} ({ename})");
+            } else {
+                eprintln!("trap#{traps}:   -> ret={ret:#x} ({ret})");
+            }
+        }
+
         if let Some(action) =
             deliver_pending_signal(runtime, &dispatcher, last_syscall_retval, this_tid, None)?
             && let Some(signum) = action.term_signal
@@ -1017,6 +1033,25 @@ impl ThreadRuntimeState {
             "tid#{} trap#{}: x8={} ({name}) x0={:#x} x1={:#x} x2={:#x} x3={:#x} x4={:#x}",
             self.this_tid, traps, frame.x8, frame.x0, frame.x1, frame.x2, frame.x3, frame.x4
         );
+    }
+
+    /// Return-side companion to [`trace_syscall`]: logs what carrick handed back
+    /// to the guest. A value in [-4095, -1] is -errno (decoded); otherwise a
+    /// plain return. Pairs with the entry line so the trap stream is a full
+    /// request+result log — the reducer aligns it against the Docker oracle to
+    /// localise a wrong-errno divergence or the last syscall before a hang.
+    fn trace_syscall_return(&self, traps: usize, ret: Option<i64>) {
+        if !self.trace {
+            return;
+        }
+        let Some(ret) = ret else { return };
+        if (-4095..0).contains(&ret) {
+            let e = (-ret) as u32;
+            let ename = crate::linux_abi::errno_name(e).unwrap_or("?");
+            eprintln!("tid#{} trap#{traps}:   -> errno={e} ({ename})", self.this_tid);
+        } else {
+            eprintln!("tid#{} trap#{traps}:   -> ret={ret:#x} ({ret})", self.this_tid);
+        }
     }
 
     fn service_threaded_syscall(
@@ -1913,6 +1948,8 @@ fn run_vcpu_until_exit(
                     last_syscall_retval = Some(state.complete_returned(&mut engine, va as i64)?);
                 }
             }
+
+            state.trace_syscall_return(traps, last_syscall_retval);
 
             // Signal delivery. A signal targeted at THIS tid (guest tgkill/tkill)
             // takes priority; otherwise a process-directed signal in the global
