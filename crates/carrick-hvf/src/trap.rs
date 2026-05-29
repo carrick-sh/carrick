@@ -719,6 +719,14 @@ struct VcpuSnapshot {
     /// because the thread's tid never lands at the expected slot.
     tpidr_el0: u64,
     last_exit_class: u64,
+    /// V0-V31 + FPSR/FPCR, captured/restored across fork(2)/clone. A forked
+    /// child (and the parent — both rebuild a fresh vCPU) would otherwise resume
+    /// with the vector file zeroed by hv_vcpu_create, corrupting any runtime
+    /// that keeps live caller-saved V-state across a raw clone svc (Go, inline
+    /// NEON). Restored via the set_simd_fp_reg_v shim. (audit M2; probe forkfpregs)
+    vregs: [u128; 32],
+    fpsr: u32,
+    fpcr: u32,
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -2090,6 +2098,17 @@ impl HvfInner {
         for (i, reg) in GPR_TABLE.iter().enumerate() {
             gprs[i] = self.vcpu.get_reg(*reg).map_err(hvf_error)?;
         }
+        // V0-V31 + FPSR/FPCR (audit M2): preserved across fork/clone so the
+        // vector file survives the vCPU rebuild. Gated like the signal path.
+        let mut vregs = [0u128; 32];
+        let (mut fpsr, mut fpcr) = (0u32, 0u32);
+        if fpsimd_save_enabled() {
+            for (i, reg) in SIMD_FP_TABLE.iter().enumerate() {
+                vregs[i] = self.vcpu.get_simd_fp_reg(*reg).map_err(hvf_error)?;
+            }
+            fpsr = self.vcpu.get_reg(Reg::FPSR).map_err(hvf_error)? as u32;
+            fpcr = self.vcpu.get_reg(Reg::FPCR).map_err(hvf_error)? as u32;
+        }
         Ok(VcpuSnapshot {
             gprs,
             pc: self.vcpu.get_reg(Reg::PC).map_err(hvf_error)?,
@@ -2117,6 +2136,9 @@ impl HvfInner {
                 .get_sys_reg(SysReg::TPIDR_EL0)
                 .map_err(hvf_error)?,
             last_exit_class: self.last_exit_class,
+            vregs,
+            fpsr,
+            fpcr,
         })
     }
 
@@ -2159,6 +2181,25 @@ impl HvfInner {
         self.vcpu
             .set_sys_reg(SysReg::SCTLR_EL1, snap.sctlr_el1)
             .map_err(hvf_error)?;
+        // Restore V0-V31 + FPSR/FPCR via the C shim (NOT applevisor's
+        // set_simd_fp_reg, which zeroes via the wrong register class). (audit M2)
+        if fpsimd_save_enabled() {
+            let vcpu_id = self.vcpu.id();
+            for (i, reg) in SIMD_FP_TABLE.iter().enumerate() {
+                let rc = set_simd_fp_reg_v(vcpu_id, *reg, snap.vregs[i]);
+                if rc != 0 {
+                    return Err(TrapError::Hypervisor(format!(
+                        "fork restore set_simd_fp_reg(q{i}) failed: rc={rc:#x}"
+                    )));
+                }
+            }
+            self.vcpu
+                .set_reg(Reg::FPSR, u64::from(snap.fpsr))
+                .map_err(hvf_error)?;
+            self.vcpu
+                .set_reg(Reg::FPCR, u64::from(snap.fpcr))
+                .map_err(hvf_error)?;
+        }
         self.last_exit_class = snap.last_exit_class;
         Ok(())
     }
@@ -3565,6 +3606,9 @@ mod thread_sibling_tests {
             elr_el1: 0x5678, // post-syscall resume point (instruction after svc)
             tpidr_el0: 0xBEEF_0000,
             last_exit_class: AARCH64_HVC_EXCEPTION_CLASS,
+            vregs: [0u128; 32],
+            fpsr: 0,
+            fpcr: 0,
         }
     }
 

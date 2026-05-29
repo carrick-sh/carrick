@@ -43,9 +43,9 @@ const KNOWN_PROBE_GAPS: &[&str] = &[
     "fsetfl",       // M4: F_SETFL clobbers access mode + stores creation bits (fs.rs:1899)
     // rosharedbus FIXED in M1 (write_guest_bytes_checked perms check) — now PASSES.
     "mapfixed",     // M5: MAP_FIXED|MAP_PRIVATE over shared aperture must remap private
-    "forkaltstack", // M2: sigaltstack not inherited across fork (per-tid altstack)
+    // forkaltstack FIXED in M2 (migrate_thread_signal_state) — now PASSES.
     "pselecteintr", // M3: select()/pselect6 blocks uninterruptibly (no EINTR)
-    "forkfpregs",   // M2: SIMD/FP regs zeroed across fork (VcpuSnapshot lacks V/FPSR/FPCR)
+    // forkfpregs FIXED in M2 (VcpuSnapshot V0-V31/FPSR/FPCR) — now PASSES.
 ];
 use std::time::{Duration, Instant};
 
