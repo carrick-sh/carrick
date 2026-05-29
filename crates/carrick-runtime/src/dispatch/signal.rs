@@ -417,7 +417,24 @@ impl SyscallDispatcher {
                 return Ok(LINUX_EINVAL.into());
             }
             if signal_is_self_target(pid, /*tid_required=*/ false) {
-                return Ok(this.raise_self(Self::ctx_tid(cx), signum));
+                let tid = Self::ctx_tid(cx);
+                // Linux populates si_pid/si_uid with the sender's identity for a
+                // kill(2)-delivered signal (si_code SI_USER). Queue that siginfo
+                // so the SA_SIGINFO handler sees the real sender instead of the
+                // all-zero synthesised SI_USER. (tkill/tgkill — si_code SI_TKILL
+                // — and cross-process sender identity route through the shared
+                // thread-signal / host-kill paths and are a tracked follow-up;
+                // see conformance-probes/src/bin/siginfo.rs.)
+                if signum != 0 {
+                    let info = crate::linux_abi::LinuxSiginfo::kill(
+                        signum as i32,
+                        crate::linux_abi::LINUX_SI_USER,
+                        std::process::id() as i32,
+                        this.cred_snapshot().ruid,
+                    );
+                    this.record_pending_siginfo(tid, signum as i32, info);
+                }
+                return Ok(this.raise_self(tid, signum));
             }
             let caller_euid = Some(this.cred_snapshot().euid);
             Ok(bootstrap_signal_send_as(

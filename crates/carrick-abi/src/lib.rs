@@ -847,6 +847,9 @@ pub const LINUX_UCONTEXT_SIGMASK_PAD_BYTES: usize = 120;
 pub const LINUX_AARCH64_SIGCONTEXT_RESERVED_BYTES: usize = 4096;
 
 pub const LINUX_SI_USER: i32 = 0;
+/// `si_code` for a `tkill(2)`/`tgkill(2)`-delivered signal (and glibc/musl
+/// `raise(3)`, which uses `tgkill`). Distinct from `SI_USER` (`kill(2)`).
+pub const LINUX_SI_TKILL: i32 = -6;
 
 #[repr(C, packed)]
 #[derive(
@@ -871,6 +874,21 @@ impl LinuxSiginfo {
             si_addr: 0,
             _pad: [0; LINUX_SIGINFO_SIZE - 24],
         }
+    }
+
+    /// Build an SI_USER/SI_TKILL/SI_QUEUE "_kill"-family siginfo carrying the
+    /// sender's identity. On Linux aarch64 the `_sifields` union begins at
+    /// offset 16, and the `_kill` member is `{ int si_pid; uint si_uid; }` —
+    /// the same 8 bytes occupied by `si_addr` for the fault family. On
+    /// little-endian, packing `si_pid` in the low word and `si_uid` in the high
+    /// word reproduces that layout exactly, so a guest reading `info->si_pid` /
+    /// `info->si_uid` sees the sender's pid/uid.
+    pub fn kill(si_signo: i32, si_code: i32, si_pid: i32, si_uid: u32) -> Self {
+        let mut s = Self::empty();
+        s.si_signo = si_signo;
+        s.si_code = si_code;
+        s.si_addr = (u64::from(si_uid) << 32) | u64::from(si_pid as u32);
+        s
     }
 }
 
