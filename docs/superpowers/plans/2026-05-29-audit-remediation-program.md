@@ -203,18 +203,31 @@ and repoints the VA's stage-1 leaf (`GuestMemory::repoint_private` →
 (workflow `wf_a5c73fa7-79e`): identity-mapped overlay (no IPA collision), Design A
 + B's correctness points.
 
-**Durable-memory remainder (NOT done — honest accounting; high-risk, no probed
-guest bug, scoped by the durable-memory spec as Plans C/D):**
-1. **Late-`MapHostAlias` removal** — the high-VA anon (`mem.rs:438`) and
-   MAP_SHARED-file (`mem.rs:335`) paths still `hv_vm_map` AFTER vCPUs exist
-   (`trap.rs:1638`). The real durability debt; this fix adds no new late map.
-   Next step: collapse them onto the same boot-window + `repoint_private` primitive.
-2. **mprotect NX/UXN enforcement** — `PtOp` has no exec dimension; all user pages
-   are EL0-executable (UXN=0) and mprotect never toggles execute. `mprotect01`
-   LTP DIFFs on this (pre-existing; this fix didn't touch mprotect). A real fix
-   flips the global executability default + per-segment exec tracking, with broad
-   re-test of JIT/trampoline paths (Go/glibc/Rosetta) — its own milestone-sized,
-   high-regression-risk effort; deferred to avoid destabilizing execution pre-release.
+**Durable-memory remainder (status after the 2026-05-29 follow-up session):**
+1. **Late-`MapHostAlias` removal** — STILL OPEN; splits in two:
+   - **High-VA anon** (`mem.rs:438` → `trap.rs:1638`, Rosetta's translation
+     arena + any guest mmap ≥1 TiB): the *mechanism* to remove the late map is
+     proven (it is exactly the M5 overlay-aperture pattern — pre-map the 64 GiB
+     `LINUX_ALIAS_IPA` window at boot, then `map_aliased`+seed per mmap, zero
+     post-vCPU `hv_vm_map`). Implementable, BUT touches the working Rosetta path
+     + the fork sparse-snapshot of a large aperture → warrants a dedicated effort
+     with Rosetta/`forkhighva` regression testing, not a session-tail change.
+   - **MAP_SHARED file** (`mem.rs:335` → `trap.rs:1638`): the hard case and an
+     UNSOLVED research item. The late map exists *because* the design needs the
+     file's live page cache at an IPA; a pre-mapped anon aperture can't provide
+     live file coherence, and host `MAP_FIXED`-over-aperture is unproven under
+     HVF (stage-2 likely pins host-physical at `hv_vm_map` time). The durable
+     spec defers this to the **Mach VM remap probe (Plan 5)**; no proven
+     no-late-map coherent mechanism exists today. Documented gap, not a point fix.
+2. **mprotect NX/UXN enforcement** — **PARTIALLY DONE (commit 87c4775).** W^X/NX
+   is now enforced for the anonymous **mmap arena**: arena boot blocks default
+   UXN=1 (non-exec), `mmap`/`mprotect` honor PROT_EXEC via `protect_range`
+   (probe `mprotectexec` MATCHes all 4 cases). Chosen over the naive
+   flip-on-mmap design, which dense-split the whole arena → PT-pool exhaustion →
+   guest malloc abort (caught by the gate). REMAINDER: NX is arena-scoped; the
+   heap/shared-aperture/overlay/stack still default executable, and guest
+   `mprotect` on those non-arena ranges is still skipped — enforcing W^X there
+   needs per-region UXN in the boot identity map ("mprotect beyond the arena").
 3. `MAP_FIXED|MAP_PRIVATE` of a FILE over a shared-aperture VA (anon handled);
    lazy/fault-driven file COW (eager seed used); syscall-path read/write/futex
    *directly* on an overlaid VA (resolves to the shared mapping — the guest-CPU
