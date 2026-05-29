@@ -6,6 +6,18 @@ Ranked by leverage (tests-unblocked ÷ effort × confidence). The top 12
 were adversarially verified (a skeptic agent tried to refute each); the
 `verified` column records that. **DONE** marks clusters already landed.
 
+## M4 session landed (2026-05-29) — 47%→56% verified-MATCH (504/896), 92 probes green
+
+Done (probe-gated, zero regressions; see git log + docs/conformance-coverage.md):
+- **#1 (partial)** ENAMETOOLONG + intermediate-ENOTDIR (probe `patherrno`). **ELOOP still TODO** (the resolve_following Vfs-trait change — judge-panel design).
+- **#4** signalfd4 (`signalfd4`). **#5** openat2 open_how validation + flags/mode pass-through (`openat2valid`; openat201/203). **#6/#7/#10** errno + fsync/fadvise/ftruncate/pidfd (`cluster10errno`). **#13** sched/priority negative-pid/EFAULT/ESRCH (`schedprio`). **#17** flock host-forward + removexattr (`flocklock`,`fsx`). **#11 (partial)** chmod setgid-clear + fchmodat2 flag (`chmodsetgid`). **#22 (partial)** fcntl leases F_SETLEASE/F_GETLEASE (`fcntllease`). **#8 (partial)** pread/readv special-fd EISDIR/ESPIPE (`preadspecial`).
+- Tooling: Docker-oracle cache (carrick-only re-sweeps) + lifecycle USDT probe; per-run overhead measured + zygote design banked in `docs/sweep-perf.md`.
+
+Top remaining levers (curated areas gated by these → DoD #2 90%):
+- **Framework blockers (TBROK, ~157 tests)** — the highest leverage for the curated 90%: functional FIFO (mkfifo create works but open(O_RDONLY) blocks the dispatcher → needs open-as-HostPipe O_NONBLOCK + kqueue blocking; unblocks select01/03, pselect02, mknod01-09) and the tst_test variant-switching hang.
+- **ELOOP resolver** (#1 remainder), **DAC enforcement** (#19), **mm high-VA alias** (#3), **rlimit** (#18).
+- Deferred residuals: openat202 RESOLVE_* enforcement, fcntl32 cross-process F_WRLCK conflict, setpriority02 EACCES/EPERM, preadv negative-offset, msgctl/semctl struct+validation (#15), net errno (#14 — note socket01 SOCK_RAW is a host-limit/Docker artifact, not cleanly MATCHable).
+
 | # | cluster | area | tests | approach | effort | conf | verified | fix |
 |---|---|---|---|---|---|---|---|---|
 | 1 | Shared path-resolution errno helper (ENAMETOOLONG / ELOOP / intermediate ENOTDIR) | fs | 24 | semantic-edge | large | high | ✅ sound | Add one shared resolve helper that (a) returns ENAMETOOLONG when any component>255 or path>4096; (b) walks components returning ENOTDIR for a non-directory intermediate; (c) bounds total symlink expansions across the ... |
