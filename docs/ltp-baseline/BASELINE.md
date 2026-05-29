@@ -58,7 +58,7 @@ SysV-semaphore, and SysV-msg-queue fixes landed against it.
 |---|---|---|---|---|---|---|---|---|
 | timers     | 26 | 0 | 2   | 7  | 0 | 20  | 55  | **74%** |
 | signals    | 36 | 0 | 3   | 7  | 3 | 2   | 51  | **73%** |
-| epoll_poll | 32 | 3 | 6   | 11 | 0 | 10  | 62  | **62%** |
+| epoll_poll | 34 | 3 | 6   | 9  | 0 | 10  | 62  | **65%** |
 | sched      | 32 | 0 | 12  | 5  | 0 | 18  | 67  | **65%** |
 | other      | 47 | 2 | 17  | 2  | 0 | 53  | 121 | **69%** |
 | fs         | 176| 0 | 87  | 37 | 1 | 141 | 442 | **58%** |
@@ -67,7 +67,7 @@ SysV-semaphore, and SysV-msg-queue fixes landed against it.
 | net        | 13 | 0 | 15  | 9  | 0 | 16  | 53  | **35%** |
 | mm         | 18 | 1 | 32  | 22 | 1 | 43  | 117 | **24%** |
 | xattr      | 3  | 0 | 1   | 1  | 0 | 24  | 29  | **60%** |
-| **TOTAL**  | **510** | **7** | **219** | **154** | **6** | **540** | **1436** | **510/896 = 57%** |
+| **TOTAL**  | **512** | **7** | **219** | **152** | **6** | **540** | **1436** | **512/896 = 57%** |
 
 _Last refresh (2026-05-28): the functional-FIFO cluster (commit `31f2a7c`) added
 +6 verified-MATCH — `select01` flipped to MATCH (16/16) via the FIFO O_RDWR leg +
@@ -85,11 +85,11 @@ probe-gated; conformance gate green at 92 probes. fs jumped 142→171._
 
 ### The target (DoD #2)
 
-Live: **57% verified-MATCH** of oracle-valid tests (510/896; full sweep, HEAD;
+Live: **57% verified-MATCH** of oracle-valid tests (512/896; full sweep, HEAD;
 58% incl. partial). Committed baseline was 47% (425/898). The curated four are
 gated mostly by TBROK framework blockers, not errno DIFFs: signals 73% (DIFF 3 /
 TBROK 7 / TIMEOUT 3), timers 74% (DIFF 2 / TBROK 7), sched 65% (DIFF 12 / TBROK
-5), epoll 62% (DIFF 6 / TBROK 11) — clearing the tst_test framework blocker
+5), epoll 65% (DIFF 6 / TBROK 9) — clearing the tst_test framework blocker
 (+ the mkfifo-setup / functional-FIFO class) is the highest-leverage path to the
 90% curated target. (Docker-oracle cache added to the sweep harness: re-sweeps
 are now carrick-only, ~halved cycle time.)
