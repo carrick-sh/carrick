@@ -144,11 +144,18 @@ pub(super) struct TimerFdInner {
 #[derive(Debug, Clone)]
 pub(super) struct OpenDescriptionBase {
     status_flags: u64,
+    /// Linux file-lease state (F_SETLEASE/F_GETLEASE): F_RDLCK(0)/F_WRLCK(1)/
+    /// F_UNLCK(2). Lives on the open-file-description so a dup'd fd shares it,
+    /// matching the kernel. Default F_UNLCK = no lease.
+    lease: i32,
 }
 
 impl OpenDescriptionBase {
     pub(super) fn new(status_flags: u64) -> Self {
-        Self { status_flags }
+        Self {
+            status_flags,
+            lease: crate::linux_abi::LINUX_F_UNLCK,
+        }
     }
 
     pub(super) fn status_flags(&self) -> u64 {
@@ -157,6 +164,14 @@ impl OpenDescriptionBase {
 
     pub(super) fn set_status_flags(&mut self, next: u64) {
         self.status_flags = next;
+    }
+
+    pub(super) fn lease(&self) -> i32 {
+        self.lease
+    }
+
+    pub(super) fn set_lease(&mut self, lease: i32) {
+        self.lease = lease;
     }
 }
 
@@ -535,6 +550,14 @@ impl OpenDescription {
 
     pub(super) fn set_status_flags(&mut self, next: u64) {
         self.base_mut().set_status_flags(next);
+    }
+
+    pub(super) fn lease(&self) -> i32 {
+        self.base().lease()
+    }
+
+    pub(super) fn set_lease(&mut self, lease: i32) {
+        self.base_mut().set_lease(lease);
     }
 
     pub(super) fn stat_source(&self) -> OpenStatSource {
