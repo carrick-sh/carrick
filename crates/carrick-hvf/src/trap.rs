@@ -1749,7 +1749,13 @@ impl HvfInner {
                         .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as u64)
                         .unwrap_or(0);
                     let rn = ((insn >> 5) & 0x1f) as u32;
-                    let xrn = self.vcpu.get_reg(GPR_TABLE[rn as usize]).unwrap_or(0);
+                    // rn==31 encodes SP/XZR; GPR_TABLE is [Reg; 31] (X0..X30), so
+                    // a direct index panics (host abort) on any SP-relative
+                    // faulting load. Use the checked accessor. Fixture: sp_fault.
+                    let xrn = GPR_TABLE
+                        .get(rn as usize)
+                        .and_then(|r| self.vcpu.get_reg(*r).ok())
+                        .unwrap_or(0);
                     crate::probes::vcpu_fault_regs(underlying, elr, far, insn, rn, xrn);
                 }
                 // Walk the LIVE host page-table backing at the faulting VA so a

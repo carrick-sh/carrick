@@ -3040,7 +3040,10 @@ impl SyscallDispatcher {
                     ));
                 }
             };
-            let remaining = &contents[*offset..];
+            // lseek may store *offset past EOF (Linux permits seeking beyond the
+            // end); a read there returns 0, never a slice-index panic. `.get`
+            // yields None -> empty slice for offset > len. Probe: readpasteof.
+            let remaining: &[u8] = contents.get(*offset..).unwrap_or(&[]);
             let read_len = remaining.len().min(length);
             let bytes = &remaining[..read_len];
             if memory.write_bytes(address, bytes).is_err() {
@@ -3145,6 +3148,7 @@ impl SyscallDispatcher {
             // Real host file: positional read via libc::pread (doesn't
             // disturb the shared kernel offset).
             if let OpenDescription::HostFile { host_fd, .. } = &*open {
+                let length = length.min(crate::dispatch::MAX_RW_COUNT);
                 let mut buf = vec![0u8; length];
                 let n = unsafe {
                     libc::pread(
