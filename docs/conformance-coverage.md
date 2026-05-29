@@ -219,6 +219,7 @@ underlying gap got fixed):
 | Post-boot `hv_vm_map` via the MapHostAlias high-VA path works in a forked child (>= 1 TiB MAP_FIXED) | ✅ `forkhighva` | (carrick-specific: post-fork high-VA hv_vm_map) |
 | `mmap` arena reclaim — touch+free 800 × 64 MiB succeeds without exhausting the 32 GiB arena; reused regions read back zero | ✅ `mmaprecl` | (Go-heap-style arena reuse) |
 | MADV_HUGEPAGE / MADV_NOHUGEPAGE return 0 (advisory; allocators must not treat the hint as an error) | ✅ `hugepage` | madvise/THP-hint conformance |
+| **mmap/munmap errno ordering + behavior: a file mapping on a bad fd → EBADF even when length is also invalid (Linux `fget` precedes `do_mmap`, so EBADF beats EINVAL); munmap of a MAP_SHARED-file mapping (a high-VA alias) succeeds; munmap requires a page-aligned address (else EINVAL) and rejects out-of-address-space ranges with EINVAL** | ✅ `mmapmunmap` | mmap08 (len-0 bad-fd→EBADF), munmap01/02 (unmap a valid MAP_SHARED/MAP_PRIVATE file region), munmap03 (unaligned addr / len 0 / out-of-range → EINVAL) |
 
 ## time (clocks + nanosleep + accounting)
 
