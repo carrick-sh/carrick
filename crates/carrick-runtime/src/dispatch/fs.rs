@@ -1396,6 +1396,68 @@ impl SyscallDispatcher {
         }
         outcome
     }
+
+    /// Linux DAC: may the calling guest create/remove an entry in directory
+    /// `dir_path`? It needs WRITE + EXECUTE (search) on the directory for its
+    /// permission class (owner/group/other), evaluated against the
+    /// guest-tracked mode + owner xattrs and the guest fs-uid/gid. Root (euid 0
+    /// = CAP_DAC_OVERRIDE) always passes; an unknown mode/owner fails OPEN so a
+    /// directory carrick has no record for is never wrongly denied. Only bites
+    /// when a guest drops to a non-root euid — the default root guest (incl. the
+    /// apt/python demos) is unaffected.
+    fn guest_can_modify_dir(&self, dir_path: &str) -> bool {
+        let creds = self.cred_snapshot();
+        if creds.euid == 0 {
+            return true;
+        }
+        let Ok(md) = self.layered_metadata(dir_path) else {
+            return true;
+        };
+        let mode = md.mode & 0o7777;
+        let (ouid, ogid) = self
+            .fs
+            .rootfs_vfs
+            .overlay
+            .get_owner(dir_path)
+            .unwrap_or((0, 0));
+        let class_bits = if creds.fsuid == ouid {
+            mode >> 6
+        } else if creds.fsgid == ogid {
+            mode >> 3
+        } else {
+            mode
+        } & 0o7;
+        // Need both write (2) and execute/search (1).
+        class_bits & 0o3 == 0o3
+    }
+
+    /// Linux sticky-bit (S_ISVTX) protection for removing `entry_path` from its
+    /// parent `dir_path`: in a sticky directory an unprivileged caller may
+    /// remove an entry only if it owns the entry OR owns the directory; else
+    /// EPERM (LTP rmdir03 case 2). Returns true (allowed) for root, a
+    /// non-sticky dir, or unknown ownership (fail open).
+    fn guest_sticky_delete_ok(&self, dir_path: &str, entry_path: &str) -> bool {
+        const S_ISVTX: u32 = 0o1000;
+        let creds = self.cred_snapshot();
+        if creds.euid == 0 {
+            return true;
+        }
+        let Ok(md) = self.layered_metadata(dir_path) else {
+            return true;
+        };
+        if md.mode & S_ISVTX == 0 {
+            return true; // not sticky → no extra restriction
+        }
+        let dir_owner = self.fs.rootfs_vfs.overlay.get_owner(dir_path).map(|o| o.0);
+        let entry_owner = self
+            .fs
+            .rootfs_vfs
+            .overlay
+            .get_owner(entry_path)
+            .map(|o| o.0);
+        // Allowed only if the caller owns the entry or the directory.
+        entry_owner == Some(creds.fsuid) || dir_owner == Some(creds.fsuid)
+    }
 }
 
 impl SyscallDispatcher {
@@ -4518,6 +4580,16 @@ impl SyscallDispatcher {
             if crate::vfs::is_synthetic_virtual_file(&resolved, &this.synthetic_proc_context()) {
                 return Ok(LINUX_EEXIST.into());
             }
+            // DAC: creating a new entry needs write+search on the parent dir
+            // (mkdir04). Only when the target doesn't already exist — an
+            // existing target is EEXIST (returned by mkdir below), which the
+            // kernel reports before the permission error.
+            if this.layered_metadata(&resolved).is_err()
+                && let Some(parent) = Path::new(&resolved).parent()
+                && !this.guest_can_modify_dir(&display_rootfs_path(parent))
+            {
+                return Ok(LINUX_EACCES.into());
+            }
             // Layered existence + parent-exists checks live inside
             // RootFsVfs::mkdir; the dispatcher only handles synthetic
             // path shadowing.
@@ -4987,6 +5059,24 @@ impl SyscallDispatcher {
                 return Ok(LINUX_EROFS.into());
             }
             use crate::vfs::Vfs as _;
+            // DAC: removing an entry needs write+search on the parent dir
+            // (unlink08: 0555 lacks write, 0666 lacks search — both → EACCES).
+            // A sticky parent (S_ISVTX) additionally requires owning the entry
+            // or the dir (rmdir03 case 2 → EPERM). Only when the target exists
+            // (a missing one is ENOENT) and on the rootfs path (not the
+            // carrick-internal bind-mount IPC paths).
+            if this.fs.vfs_mounts.resolve(&resolved).is_none()
+                && this.layered_metadata(&resolved).is_ok()
+                && let Some(parent) = Path::new(&resolved).parent()
+            {
+                let parent_str = display_rootfs_path(parent);
+                if !this.guest_can_modify_dir(&parent_str) {
+                    return Ok(LINUX_EACCES.into());
+                }
+                if !this.guest_sticky_delete_ok(&parent_str, &resolved) {
+                    return Ok(LINUX_EPERM.into());
+                }
+            }
             // Route through bind mounts (e.g. /dev/shm → host-tmp) so a file
             // CREATED via the openat mount path can also be unlinkat'd. The
             // open path resolves mounts first then falls through to rootfs;
