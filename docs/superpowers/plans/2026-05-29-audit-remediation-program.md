@@ -206,12 +206,21 @@ and repoints the VA's stage-1 leaf (`GuestMemory::repoint_private` →
 **Durable-memory remainder (status after the 2026-05-29 follow-up session):**
 1. **Late-`MapHostAlias` removal** — STILL OPEN; splits in two:
    - **High-VA anon** (`mem.rs:438` → `trap.rs:1638`, Rosetta's translation
-     arena + any guest mmap ≥1 TiB): the *mechanism* to remove the late map is
-     proven (it is exactly the M5 overlay-aperture pattern — pre-map the 64 GiB
-     `LINUX_ALIAS_IPA` window at boot, then `map_aliased`+seed per mmap, zero
-     post-vCPU `hv_vm_map`). Implementable, BUT touches the working Rosetta path
-     + the fork sparse-snapshot of a large aperture → warrants a dedicated effort
-     with Rosetta/`forkhighva` regression testing, not a session-tail change.
+     arena + any guest mmap ≥1 TiB): the *mechanism* (boot-map the 64 GiB
+     `LINUX_ALIAS_IPA` window, then `map_aliased`+seed per mmap, zero post-vCPU
+     `hv_vm_map` — the M5 overlay pattern) was IMPLEMENTED and ATTEMPTED
+     (2026-05-29) and the `forkhighva` probe MATCHed. **But it was REVERTED: it
+     broke basic dynamic guests** (`carrick run debian:stable /bin/echo` →
+     `hv_vm_map alias ipa=0x1800000000 failed 0xfae94001`, and the conformance
+     gate hung 51 min). ROOT CAUSE — a real design flaw the design pass missed:
+     the boot anon aperture occupies `[LINUX_ALIAS_IPA_BASE, +64 GiB]`, but the
+     OUT-OF-SCOPE MAP_SHARED-file arm (`mem.rs:335`, kept its late `hv_vm_map`)
+     reserves its IPA from the SAME `alias_ipa_next` bump arena → its runtime
+     `hv_vm_map` now OVERLAPS the boot aperture → HVF double-map error. **Fix for
+     the future: give the boot anon aperture its OWN IPA window disjoint from the
+     file-arm arena** (split `alias_ipa_next` into two ranges, or move the file
+     arm to a separate IPA region), then the anon-aperture+`map_aliased` approach
+     works. Still warrants a dedicated effort with Rosetta/`forkhighva` testing.
    - **MAP_SHARED file** (`mem.rs:335` → `trap.rs:1638`): the hard case and an
      UNSOLVED research item. The late map exists *because* the design needs the
      file's live page cache at an IPA; a pre-mapped anon aperture can't provide
