@@ -2280,6 +2280,14 @@ impl SyscallDispatcher {
                 Ok(t) => t,
                 Err(errno) => return Ok(errno.into()),
             };
+            // MSG_ERRQUEUE reads the socket's error queue. carrick keeps no
+            // error queue, so it's always empty → EAGAIN (recv01/recvfrom01),
+            // matching Linux when no error is queued. Checked after the socket
+            // lookup so a bad/non-socket fd still surfaces EBADF/ENOTSOCK.
+            const LINUX_MSG_ERRQUEUE: i32 = 0x2000;
+            if flags & LINUX_MSG_ERRQUEUE != 0 {
+                return Ok(LINUX_EAGAIN.into());
+            }
             // Native fd mode preserved; force this CALL non-blocking with
             // MSG_DONTWAIT and route through blocking_io: on EAGAIN a blocking-mode
             // guest fd waits losslessly (kqueue, lock released), a non-blocking one
