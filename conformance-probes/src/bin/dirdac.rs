@@ -41,6 +41,16 @@ fn main() {
         let r3 = libc::rmdir(b"/tmp/dac_pub/y\0".as_ptr() as *const _);
         println!("rmdir_in_writable_ok={}", r3 == 0);
 
+        // symlink creation honors the same parent write+search DAC (symlink03).
+        let r4 = libc::symlink(
+            b"t\0".as_ptr() as *const _,
+            b"/tmp/dac_priv/l\0".as_ptr() as *const _,
+        );
+        println!(
+            "symlink_in_unwritable_eacces={}",
+            r4 == -1 && errno() == libc::EACCES
+        );
+
         let _ = errno;
     }
 }
