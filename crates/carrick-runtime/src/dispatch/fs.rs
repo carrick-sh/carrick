@@ -1785,6 +1785,42 @@ impl SyscallDispatcher {
                     }
                     DispatchOutcome::Returned { value: 0 }
                 }
+                // File leases (F_SETLEASE/F_GETLEASE). macOS has no lease
+                // primitive, so the lease type is recorded on the open-file
+                // description (shared across dup). The single-fd round-trip
+                // (fcntl23-26) is exact; cross-PROCESS open-conflict EAGAIN
+                // (fcntl27/32) needs an inode-wide opener count — a tracked
+                // follow-up. Lease-break SIGIO delivery is likewise deferred.
+                LINUX_F_SETLEASE => {
+                    let Some(open_file) = this.open_file(fd.0) else {
+                        return Ok(LINUX_EBADF.into());
+                    };
+                    let lease = arg as i32;
+                    if lease != LINUX_F_RDLCK
+                        && lease != LINUX_F_WRLCK
+                        && lease != LINUX_F_UNLCK
+                    {
+                        return Ok(LINUX_EINVAL.into());
+                    }
+                    // A read lease requires the fd be opened read-only: an fd
+                    // open for writing is itself a conflicting writer → EAGAIN,
+                    // matching Linux.
+                    if lease == LINUX_F_RDLCK {
+                        let acc = open_file.description.read().status_flags() & LINUX_O_ACCMODE;
+                        if acc != LINUX_O_RDONLY {
+                            return Ok(LINUX_EAGAIN.into());
+                        }
+                    }
+                    open_file.description.write().set_lease(lease);
+                    DispatchOutcome::Returned { value: 0 }
+                }
+                LINUX_F_GETLEASE => {
+                    let Some(open_file) = this.open_file(fd.0) else {
+                        return Ok(LINUX_EBADF.into());
+                    };
+                    let lease = open_file.description.read().lease();
+                    DispatchOutcome::Returned { value: lease as i64 }
+                }
                 _ => DispatchOutcome::errno(LINUX_EINVAL),
             })
 

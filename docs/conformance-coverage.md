@@ -196,6 +196,7 @@ underlying gap got fixed):
 | **flock(2) real advisory locking: an exclusive lock on one fd makes a second independent fd's LOCK_NB exclusive request EAGAIN, reacquirable after LOCK_UN; bad fd→EBADF (host-forwarded so cross-process/fork-shared conflicts are real). Bad-operation→EINVAL matches mainline Linux but the Docker LinuxKit kernel disagrees, so it's carrick-correct but not probe-asserted.** | ✅ `flocklock` | flock04, flock06 |
 | fcntl(F_GETFL/F_SETFL/F_GETFD/F_SETFD) on stdio (0/1/2) returns the right errnos (the dpkg `fcntl(0, F_SETFL, O_NONBLOCK)→EBADF` regression gate) | ✅ `fcntlstdio` | fcntl01–35, dup01–06 |
 | **pidfd_open sets FD_CLOEXEC; posix_fadvise out-of-range advice→EINVAL + pipe(FIFO)→ESPIPE; ftruncate read-only fd→EINVAL (not EBADF); a freshly `O_RDONLY\|O_CREAT`'d file is a non-writable fd (guest writability follows the access mode, not O_CREAT); fsync/fdatasync on a pipe/socket/char-device→EINVAL (dir/regular unaffected)** | ✅ `cluster10errno` | pidfd_open01, posix_fadvise03, posix_fadvise04, ftruncate03, fdatasync01/02 |
+| **fcntl file leases (F_SETLEASE/F_GETLEASE, recorded per open-file-description): O_RDONLY read-lease round-trip RDLCK↔UNLCK; bad lease type→EINVAL; F_RDLCK on a write-capable fd→EAGAIN (fcntl32 cross-process F_WRLCK conflict deferred — needs inode-wide opener count)** | ✅ `fcntllease` | fcntl23–27 (+_64) |
 
 ## mm (memory management)
 
