@@ -3905,6 +3905,62 @@ impl SyscallDispatcher {
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
+        /// `cachestat(fd, cstat_range, cstat, flags)`: page-cache stats for a
+        /// file range. macOS exposes no per-page cache map, so carrick reports
+        /// every in-range, in-file page as cached (nr_cache) and nothing
+        /// evicted/dirty/in-writeback — which for a populated file matches
+        /// Linux's observable result and the LTP cachestat02 invariant
+        /// `nr_cache + nr_evicted == num_pages`. flags!=0 → EINVAL; bad/
+        /// non-cache-backed fd → EBADF; bad pointers → EFAULT. Was ENOSYS.
+        fn cachestat(this, cx, fd: Fd, cstat_range: GuestPtr, cstat: GuestPtr, flags: u64) {
+            let fd: Fd = fd;
+            if flags != 0 {
+                return Ok(LINUX_EINVAL.into());
+            }
+            let Some(open_file) = this.open_file(fd.0) else {
+                return Ok(LINUX_EBADF.into());
+            };
+            let file_size: u64 = {
+                let open = open_file.description.read();
+                match &*open {
+                    OpenDescription::HostFile { host_fd, .. } => {
+                        let mut st: libc::stat = unsafe { core::mem::zeroed() };
+                        if unsafe { libc::fstat(*host_fd, &mut st) } != 0 {
+                            return Ok(LINUX_EBADF.into());
+                        }
+                        st.st_size.max(0) as u64
+                    }
+                    OpenDescription::File { contents, .. }
+                    | OpenDescription::SyntheticFile { contents, .. } => contents.len() as u64,
+                    // cachestat needs a page-cache-backed fd (regular file /
+                    // shmem); anything else has no cache → EBADF.
+                    _ => return Ok(LINUX_EBADF.into()),
+                }
+            };
+            let memory = &mut *cx.memory;
+            let range = match memory.read_bytes(cstat_range.0, 16) {
+                Ok(b) => b,
+                Err(_) => return Ok(LINUX_EFAULT.into()),
+            };
+            let off = u64::from_le_bytes(range[0..8].try_into().unwrap_or([0; 8]));
+            let len = u64::from_le_bytes(range[8..16].try_into().unwrap_or([0; 8]));
+            let page = crate::linux_abi::LINUX_PAGE_SIZE;
+            let end = off.saturating_add(len).min(file_size);
+            let nr_cache = if off >= end {
+                0u64
+            } else {
+                end.div_ceil(page) - off / page
+            };
+            // struct cachestat: nr_cache, nr_dirty, nr_writeback, nr_evicted,
+            // nr_recently_evicted (5 × u64). Only nr_cache is non-zero.
+            let mut cs = [0u8; 40];
+            cs[0..8].copy_from_slice(&nr_cache.to_le_bytes());
+            if memory.write_bytes(cstat.0, &cs).is_err() {
+                return Ok(LINUX_EFAULT.into());
+            }
+            Ok(DispatchOutcome::Returned { value: 0 })
+        }
+
         fn fdatasync(this, cx, fd: Fd) {
 
             let fd: Fd = fd;
