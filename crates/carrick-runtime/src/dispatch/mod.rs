@@ -656,6 +656,30 @@ pub enum DispatchOutcome {
         /// is delivered after the syscall, per the persistent mask). `0` = none.
         block_signals: u64,
     },
+    /// Like [`WaitOnFds`] but for `select`/`pselect6`, whose fd-set bitmaps are
+    /// BOTH input and output (unlike `poll`'s separate `events`/`revents`).
+    /// The handler therefore leaves the guest fd-sets UNMODIFIED across the
+    /// wait, so:
+    ///   - a `Ready` re-dispatch re-reads the original input sets and reports
+    ///     the now-ready fds (a fd that becomes ready *during* the block — the
+    ///     primary use of select — is found correctly), and
+    ///   - an `Interrupted` (EINTR) return leaves the sets unmodified, exactly
+    ///     as Linux specifies on signal interruption.
+    /// Only `TimedOut` must present zeroed sets (select returns 0 with empty
+    /// sets), which the runtime does by zeroing each `clear_on_timeout`
+    /// `(guest_addr, byte_len)` range before completing the syscall with 0.
+    /// `on_timeout` is implicitly 0 (a select timeout means "no fds ready").
+    WaitOnFdsSelect {
+        /// (host_fd, poll events) pairs to wait on.
+        fds: Vec<(i32, i16)>,
+        /// `None` = wait forever (signal-interruptible).
+        timeout: Option<Duration>,
+        /// Temporarily-blocked sigmask for the wait (pselect6); `0` = none.
+        block_signals: u64,
+        /// Guest `(address, byte length)` of each present fd-set to zero if the
+        /// wait times out. Empty when no fd-set was supplied.
+        clear_on_timeout: Vec<(u64, usize)>,
+    },
     /// Same contract as [`WaitOnFds`], but serviced by `poll(2)` instead of
     /// the runtime's per-thread kqueue. This is for epoll's backing kqueue fd:
     /// polling a kqueue fd observes pending epoll events without consuming
@@ -718,6 +742,7 @@ impl DispatchOutcome {
             DispatchOutcome::FutexWait { .. } => (0, None),
             DispatchOutcome::SharedFutexWait { .. } => (0, None),
             DispatchOutcome::WaitOnFds { .. } => (0, None),
+            DispatchOutcome::WaitOnFdsSelect { .. } => (0, None),
             DispatchOutcome::WaitOnPollFds { .. } => (0, None),
             DispatchOutcome::WaitOnProcExit { .. } => (0, None),
             DispatchOutcome::WaitOnSignals { .. } => (0, None),

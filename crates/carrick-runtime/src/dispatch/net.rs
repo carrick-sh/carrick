@@ -1522,15 +1522,53 @@ impl SyscallDispatcher {
                         revents: 0,
                     })
                     .collect();
+                // NON-BLOCKING probe (timeout 0). A blocking libc::poll here
+                // would (a) tie up this vCPU thread without releasing it for
+                // siblings, and (b) never wake on a guest signal — carrick
+                // publishes pending signals via an atomic the dispatcher checks
+                // between dispatches, not a host signal that interrupts poll —
+                // so select could never return EINTR. Instead, if nothing is
+                // ready and the caller wants to wait, hand off to the runtime's
+                // signal-interruptible waiter via WaitOnFdsSelect (mirrors how
+                // ppoll uses WaitOnFds).
                 let n = unsafe {
-                    libc::poll(
-                        pollfds.as_mut_ptr(),
-                        pollfds.len() as libc::nfds_t,
-                        timeout_ms,
-                    )
+                    libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, 0)
                 };
                 if let Err(errno) = n.host_syscall_errno() {
                     return Ok(errno.into());
+                }
+                if n == 0 && timeout_ms != 0 {
+                    // Nothing ready yet, caller wants to block. Leave the guest
+                    // fd-sets UNTOUCHED (select's bitmaps are input==output): a
+                    // Ready re-dispatch must re-read the original input, and an
+                    // EINTR must leave them unmodified (Linux semantics). The
+                    // runtime zeroes them only if the wait times out.
+                    let timeout = if timeout_ms < 0 {
+                        None
+                    } else {
+                        Some(std::time::Duration::from_millis(timeout_ms as u64))
+                    };
+                    let wait_fds: Vec<(i32, i16)> = host_fds
+                        .iter()
+                        .zip(events_list.iter())
+                        .map(|(hf, ev)| (*hf, *ev))
+                        .collect();
+                    let mut clear_on_timeout: Vec<(u64, usize)> = Vec::new();
+                    if let Some(s) = &read_set {
+                        clear_on_timeout.push((readfds_addr, s.len()));
+                    }
+                    if let Some(s) = &write_set {
+                        clear_on_timeout.push((writefds_addr, s.len()));
+                    }
+                    if let Some(s) = &except_set {
+                        clear_on_timeout.push((exceptfds_addr, s.len()));
+                    }
+                    return Ok(DispatchOutcome::WaitOnFdsSelect {
+                        fds: wait_fds,
+                        timeout,
+                        block_signals,
+                        clear_on_timeout,
+                    });
                 }
                 for (slot, p) in revents.iter_mut().zip(pollfds.iter()) {
                     *slot = p.revents;
