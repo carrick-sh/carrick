@@ -57,28 +57,33 @@ SysV-semaphore, and SysV-msg-queue fixes landed against it.
 | area | MATCH | PARTIAL | DIFF | TBROK | TIMEOUT | NO_ORACLE | total | verified-MATCH (of oracle-valid) |
 |---|---|---|---|---|---|---|---|---|
 | timers     | 26 | 0 | 2   | 7  | 0 | 20  | 55  | **74%** |
-| signals    | 33 | 0 | 7   | 6  | 3 | 2   | 51  | **67%** |
+| signals    | 36 | 0 | 2   | 8  | 3 | 2   | 51  | **73%** |
 | epoll_poll | 30 | 3 | 7   | 12 | 0 | 10  | 62  | **58%** |
-| sched      | 28 | 0 | 16  | 5  | 0 | 18  | 67  | **57%** |
-| other      | 41 | 2 | 23  | 2  | 0 | 53  | 121 | **60%** |
-| fs         | 147| 0 | 113 | 41 | 0 | 141 | 442 | **49%** |
-| process    | 111| 1 | 31  | 41 | 2 | 206 | 392 | **60%** |
+| sched      | 32 | 0 | 12  | 5  | 0 | 18  | 67  | **65%** |
+| other      | 47 | 2 | 17  | 2  | 0 | 53  | 121 | **69%** |
+| fs         | 156| 0 | 105 | 40 | 0 | 141 | 442 | **52%** |
+| process    | 113| 1 | 29  | 42 | 1 | 206 | 392 | **61%** |
 | ipc        | 14 | 0 | 14  | 12 | 0 | 7   | 47  | **35%** (sem + msg queues functional) |
 | net        | 13 | 0 | 15  | 9  | 0 | 16  | 53  | **35%** |
 | mm         | 18 | 1 | 32  | 22 | 1 | 43  | 117 | **24%** |
-| xattr      | 1  | 0 | 3   | 1  | 0 | 24  | 29  | **20%** (ENOATTR→ENODATA) |
-| **TOTAL**  | **462** | **7** | **263** | **158** | **6** | **540** | **1436** | **462/896 = 52%** |
+| xattr      | 3  | 0 | 1   | 1  | 0 | 24  | 29  | **60%** |
+| **TOTAL**  | **488** | **7** | **236** | **160** | **5** | **540** | **1436** | **488/896 = 54%** |
 
-_Refreshed 2026-05-28 against HEAD (re-swept the 473 non-MATCH oracle-valid
-tests after the post-14:25 fixes: set\*id cred model, ENAMETOOLONG/ENOTDIR,
-ioprio/vhangup, getrandom, capget, ENOATTR→ENODATA). +37 MATCH vs the committed
-425; `process` jumped 87→111 from the set\*id keystone. NO_ORACLE 538→540 = 2
-Docker-side jitter tests (re-confirm not masking a regression)._
+_Refreshed 2026-05-28 against HEAD after the 5-cluster M4 batch (roadmap #10
+errno + fsync, #4 signalfd4, #13 sched/priority errno, #17 flock+removexattr,
+#11 chmod setgid+fchmodat2). +26 MATCH vs the prior 462 (20 directly targeted +
+cascade); **zero area regressed** (every area's MATCH count held or rose). Each
+fix probe-gated; conformance gate green at 89 probes. Cumulative +63 vs the
+committed 425._
 
 ### The target (DoD #2)
 
-Live: **52% verified-MATCH** of oracle-valid tests (462/896; full sweep, HEAD).
-Committed baseline was 47% (425/898).
+Live: **54% verified-MATCH** of oracle-valid tests (488/896; full sweep, HEAD).
+Committed baseline was 47% (425/898). The curated four are gated mostly by
+TBROK framework blockers, not errno DIFFs: signals 73% (DIFF 2 / TBROK 8 /
+TIMEOUT 3), timers 74% (DIFF 2 / TBROK 7), sched 65% (DIFF 12 / TBROK 5), epoll
+58% (DIFF 7 / TBROK 12) — clearing the tst_test framework blocker is the
+highest-leverage path to the 90% curated target.
 The climbing gate:
 - **Phase 1 — 60%**: clear the biggest TBROK framework-blocker classes (ipc
   msg-queues, the `mount(tmpfs)` setup, the tst_test variant-switching hang)
