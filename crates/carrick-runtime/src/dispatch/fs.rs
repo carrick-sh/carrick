@@ -4564,6 +4564,22 @@ impl SyscallDispatcher {
             if let Some(path) = path {
                 let mode = this.maybe_clear_setgid(&path, mode);
                 let _ = this.fs.rootfs_vfs.overlay.set_mode(&path, mode);
+                // Refresh THIS fd's cached metadata so a subsequent fstat on it
+                // sees the new mode. A Directory/File fstat reads the cached
+                // metadata (only HostFile re-reads the live xattr), so without
+                // this an fchmod(dirfd)+fstat(dirfd) reported the stale
+                // open-time mode (LTP fchmod04/05). metadata.mode holds the
+                // permission bits; the type comes from `kind`.
+                if let Some(of) = this.open_file(fd.0) {
+                    match &mut *of.description.write() {
+                        OpenDescription::Directory { metadata, .. }
+                        | OpenDescription::File { metadata, .. }
+                        | OpenDescription::HostFile { metadata, .. } => {
+                            metadata.mode = mode;
+                        }
+                        _ => {}
+                    }
+                }
             }
             Ok(DispatchOutcome::Returned { value: 0 })
 
