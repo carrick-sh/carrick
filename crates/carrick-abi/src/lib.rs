@@ -1852,6 +1852,7 @@ pub const LINUX_MSG_DONTROUTE: i32 = 0x0004;
 pub const LINUX_MSG_TRUNC: i32 = 0x0020;
 pub const LINUX_MSG_DONTWAIT: i32 = 0x0040;
 pub const LINUX_MSG_EOR: i32 = 0x0080;
+pub const LINUX_MSG_CTRUNC: i32 = 0x0008;
 pub const LINUX_MSG_WAITALL: i32 = 0x0100;
 pub const LINUX_MSG_NOSIGNAL: i32 = 0x4000;
 pub const LINUX_MSG_CMSG_CLOEXEC: i32 = 0x4000_0000_u32 as i32;
