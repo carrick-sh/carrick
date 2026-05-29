@@ -3311,6 +3311,16 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
 
+            // in_fd must be READABLE — sendfile reads the source from it. An
+            // O_WRONLY in_fd → EBADF (LTP sendfile03 case 4). A bad in_fd is
+            // caught as EBADF by sendfile_offset below; out_fd writability is
+            // enforced on the write path (sendfile03 case 2 already passes).
+            if let Some(in_file) = this.open_file(in_fd.0)
+                && in_file.description.read().status_flags() & LINUX_O_ACCMODE == LINUX_O_WRONLY
+            {
+                return Ok(LINUX_EBADF.into());
+            }
+
             let mut offset = match this.sendfile_offset(in_fd.0, offset_address, memory)? {
                 Ok(offset) => offset,
                 Err(errno) => return Ok(errno.into()),
