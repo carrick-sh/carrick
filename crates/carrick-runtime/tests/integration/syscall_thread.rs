@@ -64,8 +64,15 @@ fn clone_fork_flags_still_fork() {
             &reporter,
         )
         .unwrap();
-    // No CLONE_PIDFD in these flags, so no pidfd-out pointer.
-    assert_eq!(outcome, DispatchOutcome::Fork { pidfd_out: None });
+    // No CLONE_PIDFD in these flags, so no pidfd-out pointer. The low byte
+    // (0x11 = SIGCHLD) is threaded through as the child-exit signal.
+    assert_eq!(
+        outcome,
+        DispatchOutcome::Fork {
+            pidfd_out: None,
+            exit_signal: 0x11,
+        }
+    );
 }
 
 // --- Sub-task B: per-thread tid + real futex via dispatch_threaded ---

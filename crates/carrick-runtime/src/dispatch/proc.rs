@@ -424,7 +424,13 @@ impl SyscallDispatcher {
         } else {
             None
         };
-        DispatchOutcome::Fork { pidfd_out }
+        // clone3 carries the exit signal in its own field; mask to the low
+        // byte (signal domain) — faithful and bounded.
+        let exit_signal = (args.exit_signal & 0xff) as u32;
+        DispatchOutcome::Fork {
+            pidfd_out,
+            exit_signal,
+        }
     }
 
     fn rseq(&self) -> DispatchOutcome {
@@ -1462,7 +1468,14 @@ impl SyscallDispatcher {
             } else {
                 None
             };
-            Ok(DispatchOutcome::Fork { pidfd_out })
+            // Legacy clone encodes the exit signal in the low byte of `flags`
+            // (CSIGNAL = 0xff). Thread it through so the parent receives the
+            // requested signal on child exit instead of a hardcoded SIGCHLD.
+            let exit_signal = (flags & 0xff) as u32;
+            Ok(DispatchOutcome::Fork {
+                pidfd_out,
+                exit_signal,
+            })
         }
 
         fn pidfd_open(this, cx, pid: Pid, flags: u64) {

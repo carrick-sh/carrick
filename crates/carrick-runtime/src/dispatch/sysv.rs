@@ -21,8 +21,10 @@
 //!     stat (size, perms, attach-time stubs).
 //!
 //! What this does NOT implement (yet):
-//!   - SHM_RDONLY / SHM_REMAP / SHM_RND flags (rare and not exercised by
-//!     the LTP tests this unblocks — kill05/kill07).
+//!   - addr_hint placement / SHM_REMAP / SHM_RND — carrick owns the alias VA
+//!     arena and picks the placement, so a caller-supplied address can't be
+//!     honored. Documented arch gap. (SHM_RDONLY *is* honored — the alias is
+//!     mapped read-only so a guest store faults SIGSEGV like Linux.)
 //!   - SysV semaphores (semget/semop/semctl) and message queues. They're
 //!     orthogonal subsystems; the same file-backed approach would work.
 
@@ -137,6 +139,7 @@ const LINUX_IPC_INFO: u64 = 3;
 const LINUX_SHM_STAT: u64 = 13;
 const LINUX_SHM_INFO: u64 = 14;
 const LINUX_SHM_STAT_ANY: u64 = 15;
+const LINUX_SHM_RDONLY: u64 = 0o10000;
 
 #[derive(Clone, Debug)]
 pub(super) struct ShmSegment {
@@ -353,9 +356,10 @@ pub(super) fn shmid_ds_bytes(segment: &ShmSegment) -> [u8; 112] {
         __unused4: 0,
         __unused5: 0,
     };
+    // `LinuxShmidDs` is exactly 112 bytes (static-asserted above), so its
+    // `as_bytes()` view is infallibly 112 bytes — copy it into the array.
     let mut out = [0u8; 112];
-    ds.write_to(out.as_mut_slice())
-        .expect("LinuxShmidDs is exactly 112 bytes");
+    out.copy_from_slice(ds.as_bytes());
     out
 }
 
@@ -391,10 +395,13 @@ impl SyscallDispatcher {
         }
 
         /// shmat(shmid, addr_hint, flag). Map the segment into the guest's
-        /// alias VA arena and return the guest VA. `addr_hint` and `flag` are
-        /// ignored on this minimal path (no SHM_RDONLY / SHM_REMAP / SHM_RND
-        /// support yet).
-        fn shmat(this, cx, shmid: u64, _addr: u64, _flag: u64) {
+        /// alias VA arena and return the guest VA. SHM_RDONLY is honored: the
+        /// alias is mapped read-only so a guest STORE faults SIGSEGV, matching
+        /// Linux. `addr_hint`, SHM_REMAP and SHM_RND remain a documented arch
+        /// gap — carrick owns the alias VA arena and picks the placement, so it
+        /// cannot honor a caller-supplied address. Unknown shmflg bits are
+        /// silently ignored (Linux do_shmat acts only on the known bits).
+        fn shmat(this, cx, shmid: u64, _addr: u64, flag: u64) {
             let shmid = shmid as i32;
             let (host_fd, size) = {
                 let mut state = this.sysv.lock();
@@ -430,7 +437,15 @@ impl SyscallDispatcher {
             };
             let va = crate::memory::LINUX_HIGH_VA_THRESHOLD
                 + (ipa - crate::memory::LINUX_ALIAS_IPA_BASE);
-            let host_prot = libc::PROT_READ | libc::PROT_WRITE;
+            // SHM_RDONLY → map the alias read-only. STEP 1 (host PROT_READ)
+            // makes the syscall write-path return EFAULT; STEP 2 (the alias
+            // leaf built AP=RO via map_aliased) makes a DIRECT guest store
+            // fault SIGSEGV — together matching Linux do_shmat.
+            let host_prot = if flag & LINUX_SHM_RDONLY != 0 {
+                libc::PROT_READ
+            } else {
+                libc::PROT_READ | libc::PROT_WRITE
+            };
 
             // Track the attach so shmdt can find the shmid and the
             // shm_nattch counter (read by LTP shmat01 via IPC_STAT) is
@@ -827,7 +842,11 @@ fn sysv_semop<M: GuestMemory>(
     // every op so the host call returns EAGAIN instead of blocking past the
     // timeout; on EAGAIN we sleep briefly and retry until the deadline, then
     // surface EAGAIN (Linux semtimedop returns EAGAIN on timeout).
-    let ts = timeout.unwrap();
+    // `timeout.is_none()` returned above, so this is always Some; the else arm
+    // is unreachable but keeps us off `unwrap()` (workspace denies it).
+    let Some(ts) = timeout else {
+        return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+    };
     let total_ns = (ts.tv_sec.max(0) as u128) * 1_000_000_000 + ts.tv_nsec.max(0) as u128;
     let deadline = std::time::Instant::now() + std::time::Duration::from_nanos(total_ns.min(u64::MAX as u128) as u64);
     let mut nowait = sops.clone();

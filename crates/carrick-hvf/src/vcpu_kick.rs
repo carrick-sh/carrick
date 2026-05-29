@@ -315,13 +315,22 @@ pub fn spawn_signal_pump(
                         // SIG_IGN / default-ignore, else inject the handler). The
                         // child's exit status is NOT consumed here, so the
                         // guest's wait4 still reaps it via host waitpid.
-                        if let Some(parent_tid) =
+                        if let Some((parent_tid, exit_signal)) =
                             crate::host_signal::take_child_exit_parent(child_pid)
                         {
-                            crate::host_signal::publish_pending_for(
-                                parent_tid,
-                                crate::linux_abi::LINUX_SIGCHLD,
-                            );
+                            // A 0 exit_signal (e.g. clone(0)) means the guest
+                            // asked for NO exit notification; publishing a
+                            // default-ignore SIGCHLD anyway would wrongly
+                            // satisfy a sigtimedwait({SIGCHLD}). The wait4/waitid
+                            // wake does not depend on this publish (wait_proc_exit
+                            // owns its own EVFILT_PROC + 50ms re-poll), so
+                            // suppressing it is hang-free and more faithful.
+                            if exit_signal != 0 {
+                                crate::host_signal::publish_pending_for(
+                                    parent_tid,
+                                    exit_signal,
+                                );
+                            }
                         }
                         continue;
                     }

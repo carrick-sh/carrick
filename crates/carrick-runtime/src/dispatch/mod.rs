@@ -525,6 +525,10 @@ pub enum DispatchOutcome {
     /// then waits on that fd.
     Fork {
         pidfd_out: Option<u64>,
+        /// Guest-requested exit signal (low byte of clone flags / clone3
+        /// `exit_signal`). Delivered to the parent on child exit instead of a
+        /// hardcoded SIGCHLD. `0` means "no exit signal" (e.g. `clone(0)`).
+        exit_signal: u32,
     },
     /// `execve(2)` succeeded so far in the dispatcher (path readable,
     /// argv/envp resolved). The runtime must:
@@ -2413,6 +2417,44 @@ fn linux_clock_duration(clock_id: u64) -> Option<Duration> {
         LINUX_CLOCK_PROCESS_CPUTIME_ID => host_clock_duration(libc::CLOCK_PROCESS_CPUTIME_ID),
         LINUX_CLOCK_THREAD_CPUTIME_ID => host_clock_duration(libc::CLOCK_THREAD_CPUTIME_ID),
         _ => None,
+    }
+}
+
+/// Linux clock_getres resolution in nanoseconds, selected per clock id.
+///
+/// The exact value is NOT a host-portable invariant: a CONFIG_HIGH_RES_TIMERS
+/// kernel reports 1ns for the hrtimer-backed clocks, but a low-res kernel —
+/// e.g. Docker Desktop's LinuxKit VM at CONFIG_HZ=1000 — reports TICK_NSEC =
+/// 1ms for ALL of them (verified live: clock_getres on REALTIME/MONOTONIC/
+/// MONOTONIC_RAW/BOOTTIME returns tv_nsec==1000000 under `gcc:13` linux/arm64).
+/// carrick therefore reports the 1ms stand-in (LINUX_CLOCK_RESOLUTION_NSEC),
+/// which matches the Docker oracle on these hosts. The clockgetres probe
+/// asserts only the portable invariant (rc==0, tv_sec==0). The per-clock match
+/// is retained so a future CONFIG_HZ/hrtimer-aware value can be wired in here
+/// without re-plumbing the call site. Only clocks `linux_clock_duration`
+/// returns Some for reach this (clock_getres rejects unknown ids with EINVAL
+/// before the write).
+fn linux_clock_getres_nsec(clock_id: u64) -> i64 {
+    match clock_id {
+        // hrtimer-backed hi-res clocks (1ns on a CONFIG_HIGH_RES_TIMERS
+        // kernel) and the posix CPU clocks. The 1ms stand-in is what the
+        // low-res Docker host kernels actually report; the value is not
+        // probe-asserted, so this stays host-portable.
+        LINUX_CLOCK_REALTIME
+        | LINUX_CLOCK_MONOTONIC
+        | LINUX_CLOCK_MONOTONIC_RAW
+        | LINUX_CLOCK_BOOTTIME
+        | LINUX_CLOCK_REALTIME_ALARM
+        | LINUX_CLOCK_BOOTTIME_ALARM
+        | LINUX_CLOCK_TAI
+        | LINUX_CLOCK_PROCESS_CPUTIME_ID
+        | LINUX_CLOCK_THREAD_CPUTIME_ID => LINUX_CLOCK_RESOLUTION_NSEC,
+        // COARSE clocks report TICK_NSEC (CONFIG_HZ-dependent, NOT
+        // host-portable). Same 1ms stand-in; not probe-asserted.
+        LINUX_CLOCK_REALTIME_COARSE | LINUX_CLOCK_MONOTONIC_COARSE => {
+            LINUX_CLOCK_RESOLUTION_NSEC
+        }
+        _ => LINUX_CLOCK_RESOLUTION_NSEC,
     }
 }
 

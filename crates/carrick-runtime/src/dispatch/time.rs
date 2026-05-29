@@ -167,7 +167,14 @@ impl SyscallDispatcher {
             Ok(write_packed(
                 memory,
                 address.0,
-                LinuxTimespec::new(0, LINUX_CLOCK_RESOLUTION_NSEC).as_bytes(),
+                // Resolution is host-kernel-dependent and NOT a host-portable
+                // invariant: a CONFIG_HIGH_RES_TIMERS kernel reports 1ns, but a
+                // low-res kernel (e.g. Docker Desktop's LinuxKit VM at
+                // CONFIG_HZ=1000) reports TICK_NSEC = 1ms. carrick reports the
+                // 1ms stand-in (LINUX_CLOCK_RESOLUTION_NSEC), which is what the
+                // Docker oracle on these hosts actually returns; the clockgetres
+                // probe asserts only rc==0 + tv_sec==0 (sub-second resolution).
+                LinuxTimespec::new(0, linux_clock_getres_nsec(clock_id)).as_bytes(),
             ))
         }
 
