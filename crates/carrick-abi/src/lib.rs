@@ -1341,6 +1341,12 @@ pub const LINUX_F_SETLKW: u64 = 7;
 pub const LINUX_F_OFD_GETLK: u64 = 36;
 pub const LINUX_F_OFD_SETLK: u64 = 37;
 pub const LINUX_F_OFD_SETLKW: u64 = 38;
+pub const LINUX_F_SETLEASE: u64 = 1024;
+pub const LINUX_F_GETLEASE: u64 = 1025;
+/// fcntl lock/lease type args (also l_type in struct flock).
+pub const LINUX_F_RDLCK: i32 = 0;
+pub const LINUX_F_WRLCK: i32 = 1;
+pub const LINUX_F_UNLCK: i32 = 2;
 pub const LINUX_F_DUPFD_CLOEXEC: u64 = 1030;
 pub const LINUX_F_GETPIPE_SZ: u64 = 1032;
 pub const LINUX_F_ADD_SEALS: u64 = 1033;
