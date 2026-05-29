@@ -3135,10 +3135,17 @@ impl SyscallDispatcher {
             if offset < 0 {
                 return Ok(LINUX_EINVAL.into());
             }
-            let bytes = match (*cx.memory).read_bytes(address, length) {
-                Ok(b) => b,
-                Err(_) => {
-                    return Ok(LINUX_EFAULT.into());
+            // A zero-length write never accesses the buffer — `pwrite(fd, NULL,
+            // 0)` returns 0, NOT EFAULT (Linux checks count before touching the
+            // buffer; LTP pwrite03). Only read guest memory when count > 0.
+            let bytes = if length == 0 {
+                Vec::new()
+            } else {
+                match (*cx.memory).read_bytes(address, length) {
+                    Ok(b) => b,
+                    Err(_) => {
+                        return Ok(LINUX_EFAULT.into());
+                    }
                 }
             };
             if is_stdio_fd(fd.0) {
@@ -3209,7 +3216,11 @@ impl SyscallDispatcher {
             for iovec in &iovecs {
                 let iov_len = usize::try_from(iovec.iov_len)
                     .map_err(|_| DispatchError::LengthTooLarge(iovec.iov_len))?;
-                if memory.read_bytes(iovec.iov_base, iov_len).is_err() {
+                // A zero-length iovec segment is permitted and must NOT fault,
+                // even with a NULL/invalid base (LTP pwritev01/pwritev201 pass
+                // `{NULL, 0}` as the second segment). Only validate non-empty
+                // segments.
+                if iov_len != 0 && memory.read_bytes(iovec.iov_base, iov_len).is_err() {
                     return Ok(LINUX_EFAULT.into());
                 }
             }
@@ -3850,10 +3861,16 @@ impl SyscallDispatcher {
             let address = buf.0;
             let length =
                 usize::try_from(count).map_err(|_| DispatchError::LengthTooLarge(count))?;
-            let bytes = match (*cx.memory).read_bytes(address, length) {
-                Ok(bytes) => bytes,
-                Err(_) => {
-                    return Ok(LINUX_EFAULT.into());
+            // A zero-length write never accesses the buffer (write(fd, NULL, 0)
+            // returns 0, not EFAULT) — only read guest memory when count > 0.
+            let bytes = if length == 0 {
+                Vec::new()
+            } else {
+                match (*cx.memory).read_bytes(address, length) {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        return Ok(LINUX_EFAULT.into());
+                    }
                 }
             };
 
