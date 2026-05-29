@@ -198,6 +198,7 @@ underlying gap got fixed):
 | **pidfd_open sets FD_CLOEXEC; posix_fadvise out-of-range advice→EINVAL + pipe(FIFO)→ESPIPE; ftruncate read-only fd→EINVAL (not EBADF); a freshly `O_RDONLY\|O_CREAT`'d file is a non-writable fd (guest writability follows the access mode, not O_CREAT); fsync/fdatasync on a pipe/socket/char-device→EINVAL (dir/regular unaffected)** | ✅ `cluster10errno` | pidfd_open01, posix_fadvise03, posix_fadvise04, ftruncate03, fdatasync01/02 |
 | **fcntl file leases (F_SETLEASE/F_GETLEASE, recorded per open-file-description): O_RDONLY read-lease round-trip RDLCK↔UNLCK; bad lease type→EINVAL; F_RDLCK on a write-capable fd→EAGAIN (fcntl32 cross-process F_WRLCK conflict deferred — needs inode-wide opener count)** | ✅ `fcntllease` | fcntl23–27 (+_64) |
 | **positional/vector read on a special fd: pread on a pipe→ESPIPE, pread/readv on a directory→EISDIR (was EINVAL); pread on a regular file unaffected** | ✅ `preadspecial` | pread02 (+_64), readv02 (preadv02/202 negative-offset/iovec residual deferred) |
+| **openat2 open_how validation: normal O_RDWR\|O_CREAT open succeeds (flags+mode passed through, no longer whitelisted); mode-without-O_CREAT / mode>0o7777 / unknown-resolve-bits / size<sizeof → EINVAL; size>sizeof zero-pad accepted, nonzero-pad→E2BIG; bad dirfd→EBADF** | ✅ `openat2valid` | openat201, openat203 (openat202 RESOLVE_* path enforcement deferred) |
 
 ## mm (memory management)
 
