@@ -4691,6 +4691,69 @@ impl SyscallDispatcher {
 
         }
 
+        fn memfd_create(this, cx, name: GuestPtr, flags: u64) {
+            // memfd_create(name, flags): an anonymous in-memory file. macOS has
+            // no memfd, so model it as an unlinked, writable in-memory File
+            // (same shape as O_TMPFILE). MFD_CLOEXEC → FD_CLOEXEC;
+            // MFD_ALLOW_SEALING is accepted (fcntl F_ADD_SEALS sealing itself is
+            // a separate follow-up — that's what gates memfd_create01).
+            const MFD_CLOEXEC: u64 = 0x0001;
+            const MFD_ALLOW_SEALING: u64 = 0x0002;
+            const MFD_HUGETLB: u64 = 0x0004;
+            const MFD_KNOWN: u64 = MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_HUGETLB;
+            // Linux validates the flags BEFORE the name (LTP memfd_create02
+            // passes a valid name with bad flags and still expects EINVAL).
+            if flags & !MFD_KNOWN != 0 {
+                return Ok(LINUX_EINVAL.into());
+            }
+            // The name is bounded by MFD_NAME_MAX_LEN (256 − len("memfd:") − 1 =
+            // 249): a NULL/unmapped pointer → EFAULT; no NUL within 250 bytes →
+            // EINVAL (name too long). read_guest_c_string can't be reused — it
+            // caps at PATH_MAX and returns ENAMETOOLONG, not the memfd EINVAL.
+            const MFD_NAME_MAX_LEN: usize = 249;
+            let memory = &*cx.memory;
+            let mut name_bytes = Vec::new();
+            let mut terminated = false;
+            for off in 0..=MFD_NAME_MAX_LEN {
+                let Some(addr) = name.0.checked_add(off as u64) else {
+                    return Ok(LINUX_EFAULT.into());
+                };
+                let byte = match memory.read_bytes(addr, 1) {
+                    Ok(b) => b[0],
+                    Err(_) => return Ok(LINUX_EFAULT.into()),
+                };
+                if byte == 0 {
+                    terminated = true;
+                    break;
+                }
+                name_bytes.push(byte);
+            }
+            if !terminated {
+                return Ok(LINUX_EINVAL.into());
+            }
+            let name = String::from_utf8_lossy(&name_bytes).into_owned();
+            let path = format!("/memfd:{name}");
+            let description = OpenDescription::File {
+                metadata: RootFsMetadata {
+                    path: Path::new(&path).to_path_buf(),
+                    kind: RootFsEntryKind::File,
+                    mode: 0o777,
+                    size: 0,
+                },
+                path,
+                contents: Vec::new(),
+                offset: 0,
+                base: OpenDescriptionBase::new(0),
+                writable: true,
+            };
+            let fd_flags = if flags & MFD_CLOEXEC != 0 {
+                LINUX_FD_CLOEXEC
+            } else {
+                0
+            };
+            Ok(this.install_fd(description, fd_flags))
+        }
+
         fn unlinkat(this, cx, dirfd: u64, pathname: GuestPtr, flags: u64) {
 
             let dirfd = dirfd;
