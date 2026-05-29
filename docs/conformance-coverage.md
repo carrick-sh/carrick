@@ -252,6 +252,7 @@ underlying gap got fixed):
 
 | Invariant | Owned by | Stands in for (LTP) |
 |---|---|---|
+| **getsockname output-pointer validation: NULL addr or NULL addrlen → EFAULT; a negative input *addrlen → EINVAL; valid → success** | ✅ `getsocknameval` | getsockname01 |
 | **recv/recvfrom with MSG_ERRQUEUE on a socket with no queued error → EAGAIN (carrick has no error queue, so it returned 0 / a normal recv)** | ✅ `recverrqueue` | recv01 (recvfrom01's invalid-addrlen leg remains) |
 | socket/socketpair/bind/listen/connect/accept/getsockname/setsockopt/getsockopt across AF_UNIX/INET/INET6/NETLINK | ✅ `net` | socket01/02, socketpair01–04, bind01/06, listen01, connect01/02, accept01/04, getsockname01, setsockopt01–10, getsockopt01–07 |
 | rtnetlink `RTM_GETROUTE` dump: at least one `RTM_NEWROUTE` followed by `NLMSG_DONE` | ✅ `netlink_route` | (rtnetlink shape conformance) |
