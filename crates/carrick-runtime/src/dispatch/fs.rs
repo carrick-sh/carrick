@@ -400,8 +400,7 @@ impl SyscallDispatcher {
         // parses the result as an ELF, so a returned symlink corrupts it.
         // Best-effort: a non-symlink or not-yet-existent (O_CREAT) path is left
         // unchanged.
-        const LINUX_O_NOFOLLOW: u64 = 0o400000;
-        if flags & LINUX_O_NOFOLLOW == 0 && !(want_create && want_excl) {
+        if flags & crate::linux_abi::LINUX_O_NOFOLLOW == 0 && !(want_create && want_excl) {
             if let Ok(resolved) = self.canonicalize_following(&path) {
                 path = resolved;
             }
@@ -519,6 +518,23 @@ impl SyscallDispatcher {
             }
             Err(errno) => {
                 crate::probes::path_open(&path, 0, *errno);
+            }
+        }
+        // O_DIRECTORY: opening anything that isn't a directory fails ENOTDIR
+        // (LTP open08). Close a host fd the dispatch already opened so it
+        // doesn't leak.
+        if flags & LINUX_O_DIRECTORY != 0 {
+            match &dispatch_result {
+                Ok(crate::vfs::rootfs::OpenDispatchResult::HostFile { host_fd, .. }) => {
+                    unsafe {
+                        libc::close(*host_fd);
+                    }
+                    return Ok(LINUX_ENOTDIR.into());
+                }
+                Ok(crate::vfs::rootfs::OpenDispatchResult::File { .. }) => {
+                    return Ok(LINUX_ENOTDIR.into());
+                }
+                _ => {}
             }
         }
         // Remember the guest path so readlink(/proc/self/fd/N) can recover it
@@ -756,7 +772,7 @@ impl SyscallDispatcher {
             create: flags & LINUX_O_CREAT != 0,
             excl: flags & LINUX_O_EXCL != 0,
             directory: flags & LINUX_O_DIRECTORY != 0,
-            nofollow: flags & 0o400000 != 0,
+            nofollow: flags & crate::linux_abi::LINUX_O_NOFOLLOW != 0,
             mode: 0,
         };
         let handle = {
