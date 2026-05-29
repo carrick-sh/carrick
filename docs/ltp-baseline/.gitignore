@@ -3,3 +3,5 @@
 # ARE committed (they define the denominator).
 results.jsonl
 syscalls.manifest
+# Per-test triage cards from ltp-reduce.py — regenerable, not a deliverable.
+reductions/
