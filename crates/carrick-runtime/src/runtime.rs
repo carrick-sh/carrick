@@ -1608,7 +1608,16 @@ impl ThreadRuntimeState {
                 // Don't inherit the parent's accumulated guest CPU time: the
                 // child's new vCPU starts the hypervisor exec clock at zero.
                 crate::guest_cpu::reset();
+                let parent_tid = self.this_tid;
                 self.this_tid = std::process::id() as ThreadId;
+                // The child inherits the parent's blocked mask + alternate
+                // signal stack (POSIX) but has a NEW tid; re-key the dispatcher's
+                // per-tid signal state so an inherited SA_ONSTACK alt stack isn't
+                // silently lost (the mask survives via the host fallback; the
+                // altstack has none). (audit M2; probe forkaltstack)
+                kernel
+                    .dispatcher
+                    .migrate_thread_signal_state(parent_tid, self.this_tid);
                 self.registry = Arc::new(ThreadRegistry::new(self.this_tid));
                 crate::thread::set_current_registry(Arc::clone(&self.registry));
                 // The other guest threads do not exist in the child (libc::fork
