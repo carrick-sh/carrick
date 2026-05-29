@@ -704,6 +704,26 @@ pub(super) fn linux_to_host_msg_flags(flags: i32) -> i32 {
     out
 }
 
+/// Translate host (macOS/BSD) msg_flags returned by recvmsg back into the
+/// Linux numeric space the guest expects. Only the output flags recvmsg can
+/// set are mapped; bit positions differ between Linux and Darwin.
+pub(super) fn host_to_linux_msg_flags(flags: i32) -> i32 {
+    let mut out = 0;
+    if flags & libc::MSG_OOB != 0 {
+        out |= LINUX_MSG_OOB; // host 0x1 -> linux 0x1
+    }
+    if flags & libc::MSG_EOR != 0 {
+        out |= LINUX_MSG_EOR; // host 0x8 -> linux 0x80
+    }
+    if flags & libc::MSG_TRUNC != 0 {
+        out |= LINUX_MSG_TRUNC; // host 0x10 -> linux 0x20
+    }
+    if flags & libc::MSG_CTRUNC != 0 {
+        out |= LINUX_MSG_CTRUNC; // host 0x20 -> linux 0x8
+    }
+    out
+}
+
 pub(super) fn linux_to_host_sockopt(level: i32, optname: i32) -> Option<(i32, i32)> {
     match level {
         LINUX_SOL_SOCKET => {

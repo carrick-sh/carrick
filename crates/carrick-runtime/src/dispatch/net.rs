@@ -185,7 +185,14 @@ impl SyscallDispatcher {
     /// loudly in debug/test builds and self-heal (force non-blocking) in
     /// release so a missed creation site can never silently reintroduce the
     /// starvation.
-    fn blocking_io<F>(&self, host_fd: i32, dir: IoDir, nonblocking: bool, op: F) -> DispatchOutcome
+    fn blocking_io<F>(
+        &self,
+        host_fd: i32,
+        dir: IoDir,
+        nonblocking: bool,
+        timeout: Option<std::time::Duration>,
+        op: F,
+    ) -> DispatchOutcome
     where
         F: FnOnce() -> Result<i64, i32>,
     {
@@ -199,12 +206,14 @@ impl SyscallDispatcher {
                 } else {
                     // Blocking-mode: hand off to the runtime to wait on host-fd
                     // readiness with the dispatcher lock RELEASED (per-thread
-                    // kqueue), then re-dispatch. SO_RCVTIMEO/SO_SNDTIMEO not yet
-                    // modelled → block forever (signal-interruptible); when
-                    // added, pass the deadline + on_timeout=-EAGAIN.
+                    // kqueue), then re-dispatch. `timeout` carries the per-fd
+                    // SO_RCVTIMEO/SO_SNDTIMEO (None = block forever, signal-
+                    // interruptible); on WaitResult::TimedOut the run-loops
+                    // return on_timeout = -EAGAIN, matching the Linux SO_*TIMEO
+                    // recv/send result.
                     DispatchOutcome::WaitOnFds {
                         fds: vec![(host_fd, dir.events())],
-                        timeout: None,
+                        timeout,
                         on_timeout: -(LINUX_EAGAIN as i64),
                         block_signals: 0,
                     }
@@ -584,7 +593,8 @@ impl SyscallDispatcher {
         // run in the closure (no &self); the fd is installed AFTER (the
         // install needs &self, which blocking_io's &self closure can't hold).
         let nonblocking = self.io_is_nonblocking(fd, 0);
-        let outcome = self.blocking_io(host_fd, IoDir::Read, nonblocking, || {
+        // accept(2) has no SO_*TIMEO bound on Linux — no per-fd timeout.
+        let outcome = self.blocking_io(host_fd, IoDir::Read, nonblocking, None, || {
             let mut sa_storage = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
             let mut sa_len: libc::socklen_t = sa_storage.len() as libc::socklen_t;
             let new_host = unsafe {
@@ -2262,7 +2272,10 @@ impl SyscallDispatcher {
             };
             let nonblocking = this.io_is_nonblocking(fd, flags);
             let host_flags = linux_to_host_msg_flags(flags) | libc::MSG_DONTWAIT;
-            let outcome = this.blocking_io(host_fd, IoDir::Write, nonblocking, || {
+            let send_to = this
+                .open_file(fd)
+                .and_then(|f| f.description.read().send_timeout());
+            let outcome = this.blocking_io(host_fd, IoDir::Write, nonblocking, send_to, || {
                 let n = match &host_addr {
                     None => unsafe {
                         libc::sendto(
@@ -2333,7 +2346,10 @@ impl SyscallDispatcher {
             let host_flags = linux_to_host_msg_flags(flags) | libc::MSG_DONTWAIT;
             let len = len.min(crate::dispatch::MAX_RW_COUNT);
             let mut buf = vec![0u8; len];
-            let outcome = this.blocking_io(host_fd, IoDir::Read, nonblocking, || {
+            let recv_to = this
+                .open_file(fd)
+                .and_then(|f| f.description.read().recv_timeout());
+            let outcome = this.blocking_io(host_fd, IoDir::Read, nonblocking, recv_to, || {
                 let mut sa = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
                 let mut sa_len: libc::socklen_t = sa.len() as libc::socklen_t;
                 let (n, used_addr) = if src_addr == 0 {
@@ -2401,6 +2417,51 @@ impl SyscallDispatcher {
                 Ok(t) => t,
                 Err(errno) => return Ok(errno.into()),
             };
+            // SO_RCVTIMEO/SO_SNDTIMEO: the host fd is ALWAYS O_NONBLOCK (the
+            // blocking_io invariant), so a host-side timeval is dead. Store the
+            // timeout per open-file-description and let blocking_io thread it
+            // into the WaitOnFds. Intercept BEFORE the host passthrough.
+            if level == LINUX_SOL_SOCKET
+                && (optname == LINUX_SO_RCVTIMEO || optname == LINUX_SO_SNDTIMEO)
+            {
+                // aarch64 SO_RCVTIMEO/SO_SNDTIMEO use `struct __kernel_old_timeval`
+                // = two i64 (tv_sec, tv_usec) = 16 bytes.
+                let dur = if optval_addr == 0 || optlen < 16 {
+                    None
+                } else {
+                    match memory.read_bytes(optval_addr, 16) {
+                        Ok(b) => {
+                            let sec = i64::from_ne_bytes([
+                                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+                            ]);
+                            let usec = i64::from_ne_bytes([
+                                b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
+                            ]);
+                            // {0,0} disables the timeout (block forever).
+                            if sec <= 0 && usec <= 0 {
+                                None
+                            } else {
+                                Some(std::time::Duration::new(
+                                    sec.max(0) as u64,
+                                    (usec.max(0) as u32).saturating_mul(1000),
+                                ))
+                            }
+                        }
+                        Err(_) => return Ok(LINUX_EFAULT.into()),
+                    }
+                };
+                if let Some(open_file) = this.open_file(fd) {
+                    let mut open = open_file.description.write();
+                    if let OpenDescription::HostSocket { base, .. } = &mut *open {
+                        if optname == LINUX_SO_RCVTIMEO {
+                            base.set_recv_timeout(dur);
+                        } else {
+                            base.set_send_timeout(dur);
+                        }
+                    }
+                }
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            }
             let (host_level, host_opt) = match linux_to_host_sockopt(level, optname) {
                 Some(t) => t,
                 None => {
@@ -2469,6 +2530,52 @@ impl SyscallDispatcher {
                 if let Some(t) = this.socket_guest_type(fd) {
                     let _ = memory.write_bytes(optval_addr, &t.to_ne_bytes());
                     let _ = memory.write_bytes(optlen_addr, &4u32.to_ne_bytes());
+                    return Ok(DispatchOutcome::Returned { value: 0 });
+                }
+            }
+            // SO_RCVTIMEO/SO_SNDTIMEO readback: the set side stores these per
+            // open-file-description and bypasses the (dead) host fd, so the
+            // generic path below would read back {0,0}. Answer from the stored
+            // Option<Duration> as a 16-byte two-i64 timeval. If the fd is not a
+            // HostSocket, fall through to the generic path.
+            if level == LINUX_SOL_SOCKET
+                && (optname == LINUX_SO_RCVTIMEO || optname == LINUX_SO_SNDTIMEO)
+            {
+                let mut handled = false;
+                let mut dur: Option<std::time::Duration> = None;
+                if let Some(open_file) = this.open_file(fd) {
+                    if let OpenDescription::HostSocket { base, .. } = &*open_file.description.read() {
+                        handled = true;
+                        dur = if optname == LINUX_SO_RCVTIMEO {
+                            base.recv_timeout()
+                        } else {
+                            base.send_timeout()
+                        };
+                    }
+                }
+                if handled {
+                    let tv_sec = dur.map(|d| d.as_secs() as i64).unwrap_or(0);
+                    let tv_usec = dur.map(|d| d.subsec_micros() as i64).unwrap_or(0);
+                    let mut tv_bytes = [0u8; 16];
+                    tv_bytes[0..8].copy_from_slice(&tv_sec.to_ne_bytes());
+                    tv_bytes[8..16].copy_from_slice(&tv_usec.to_ne_bytes());
+                    let guest_optlen = match memory.read_bytes(optlen_addr, 4) {
+                        Ok(b) => u32::from_ne_bytes([b[0], b[1], b[2], b[3]]),
+                        Err(_) => return Ok(LINUX_EFAULT.into()),
+                    };
+                    let n = (guest_optlen as usize).min(16);
+                    if optval_addr != 0
+                        && n > 0
+                        && memory.write_bytes(optval_addr, &tv_bytes[..n]).is_err()
+                    {
+                        return Ok(LINUX_EFAULT.into());
+                    }
+                    if memory
+                        .write_bytes(optlen_addr, &(n as u32).to_ne_bytes())
+                        .is_err()
+                    {
+                        return Ok(LINUX_EFAULT.into());
+                    }
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 }
             }
@@ -2682,7 +2789,10 @@ impl SyscallDispatcher {
         };
         let nonblocking = self.io_is_nonblocking(fd, flags);
         let host_flags = linux_to_host_msg_flags(flags) | libc::MSG_DONTWAIT;
-        let outcome = self.blocking_io(host_fd, IoDir::Write, nonblocking, || {
+        let send_to = self
+            .open_file(fd)
+            .and_then(|f| f.description.read().send_timeout());
+        let outcome = self.blocking_io(host_fd, IoDir::Write, nonblocking, send_to, || {
             let n = match &host_addr {
                 None => unsafe {
                     libc::sendto(
@@ -2777,28 +2887,29 @@ impl SyscallDispatcher {
         let total: usize = iovecs.iter().map(|iov| iov.iov_len as usize).sum();
         let nonblocking = self.io_is_nonblocking(fd, flags);
         let host_flags = linux_to_host_msg_flags(flags) | libc::MSG_DONTWAIT;
-        let outcome = self.blocking_io(host_fd, IoDir::Read, nonblocking, || {
+        let recv_to = self
+            .open_file(fd)
+            .and_then(|f| f.description.read().recv_timeout());
+        let outcome = self.blocking_io(host_fd, IoDir::Read, nonblocking, recv_to, || {
             let mut buf = vec![0u8; total];
             let mut sa = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
-            let mut sa_len: libc::socklen_t = sa.len() as libc::socklen_t;
-            let n = unsafe {
-                libc::recvfrom(
-                    host_fd,
-                    buf.as_mut_ptr() as *mut _,
-                    buf.len(),
-                    host_flags,
-                    if msg.name == 0 {
-                        std::ptr::null_mut()
-                    } else {
-                        sa.as_mut_ptr() as *mut _
-                    },
-                    if msg.name == 0 {
-                        std::ptr::null_mut()
-                    } else {
-                        &mut sa_len as *mut _
-                    },
-                )
+            // Use the host recvmsg (not recvfrom) so the kernel can report
+            // MSG_TRUNC/MSG_CTRUNC/MSG_EOR in the returned msg_flags. macOS/XNU
+            // sets MSG_TRUNC on truncated atomic (PR_ATOMIC) records exactly
+            // like Linux, so translating those flags back is a faithful match.
+            let mut hiov = libc::iovec {
+                iov_base: buf.as_mut_ptr() as *mut _,
+                iov_len: buf.len(),
             };
+            let mut hmsg: libc::msghdr = unsafe { std::mem::zeroed() };
+            if msg.name != 0 {
+                hmsg.msg_name = sa.as_mut_ptr() as *mut _;
+                hmsg.msg_namelen = sa.len() as libc::socklen_t;
+            }
+            hmsg.msg_iov = &mut hiov as *mut _;
+            hmsg.msg_iovlen = 1; // c_int on macOS
+            // msg_control stays null / controllen 0 (we model no ancillary data).
+            let n = unsafe { libc::recvmsg(host_fd, &mut hmsg as *mut _, host_flags) };
             let n = n.host_syscall_errno()?;
             // Scatter the received bytes back into the guest's iovecs.
             let mut remaining = n as usize;
@@ -2820,7 +2931,7 @@ impl SyscallDispatcher {
                 }
             }
             if msg.name != 0 && msg.namelen != 0 {
-                let used = (sa_len as usize).min(sa.len());
+                let used = (hmsg.msg_namelen as usize).min(sa.len());
                 let linux_bytes = host_to_linux_sockaddr(&sa[..used], family, true);
                 let write_len = (linux_bytes.len() as u32).min(msg.namelen);
                 if write_len > 0
@@ -2838,15 +2949,17 @@ impl SyscallDispatcher {
                     return Err(LINUX_EFAULT);
                 }
             }
-            // No ancillary-data translation; report controllen=0, msg_flags=0.
+            // No ancillary-data translation; controllen stays 0. But the host
+            // recvmsg's msg_flags (MSG_TRUNC etc.) must propagate to the guest.
             if memory
                 .write_bytes(msg_addr + 40, &0u64.to_ne_bytes())
                 .is_err()
             {
                 return Err(LINUX_EFAULT);
             }
+            let linux_flags = host_to_linux_msg_flags(hmsg.msg_flags);
             if memory
-                .write_bytes(msg_addr + 48, &0i32.to_ne_bytes())
+                .write_bytes(msg_addr + 48, &linux_flags.to_ne_bytes())
                 .is_err()
             {
                 return Err(LINUX_EFAULT);
