@@ -449,11 +449,19 @@ impl SyscallDispatcher {
         /// surface (FD_CLOEXEC / O_NONBLOCK on the returned fd) is exercised today
         /// (signalfd4_01/02); a read()/poll() delivery path that drains the
         /// process's pending masked signals is a tracked follow-up.
-        fn signalfd4(this, cx, fd: Fd, mask: GuestPtr, _sizemask: u64, flags: u64) {
+        fn signalfd4(this, cx, fd: Fd, mask: GuestPtr, sizemask: u64, flags: u64) {
             if flags & !(LINUX_O_NONBLOCK | LINUX_O_CLOEXEC) != 0 {
                 return Ok(LINUX_EINVAL.into());
             }
-            // The kernel sigset_t ABI is 8 bytes; read it (EFAULT on bad ptr).
+            // The kernel sigset_t ABI is exactly 8 bytes (_NSIG/8 on aarch64); any
+            // other sizemask is rejected with EINVAL BEFORE the mask pointer is
+            // touched (fs/signalfd.c: `if (sizemask != sizeof(sigset_t)) return
+            // -EINVAL`). Verified vs docker linux/arm64. (glibc's signalfd() always
+            // passes 8 here regardless of its 128-byte userspace sigset_t.)
+            if sizemask != 8 {
+                return Ok(LINUX_EINVAL.into());
+            }
+            // sigset_t is 8 bytes; read it (EFAULT on bad ptr).
             let mask_val = match cx.memory.read_bytes(mask.0, 8) {
                 Ok(b) => {
                     let arr: [u8; 8] = b.as_slice().try_into().unwrap_or([0u8; 8]);

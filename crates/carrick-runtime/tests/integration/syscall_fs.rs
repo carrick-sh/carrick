@@ -738,7 +738,7 @@ fn openat2_reads_open_how_and_opens_readonly_rootfs_paths() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Returned { value: 4 }
     );
     assert_eq!(
         dispatcher
@@ -751,7 +751,7 @@ fn openat2_reads_open_how_and_opens_readonly_rootfs_paths() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 22 }
+        DispatchOutcome::Returned { value: 5 }
     );
     assert_eq!(
         dispatcher
@@ -4093,13 +4093,14 @@ fn truncate_bootstrap_returns_erofs_for_known_paths_and_enoent_for_missing() {
 #[test]
 fn xattr_family_dispatches_per_target_on_in_memory_backend() {
     // The xattr family is fully wired (no longer a blanket ENOTSUP stub):
-    // path/fd targets are resolved and arguments validated before the backend
-    // is consulted. On the default in-memory overlay backend the actual
-    // attribute store is not modelled, so the path-variant set/get/list and
-    // every remove*xattr report ENOTSUP, while the fd-variants validate the fd
-    // first and report EBADF for an unopened descriptor. The real `user.*`
-    // round-trip is exercised against the host backend by the conformance
-    // suite; here we pin the in-memory dispatch behaviour.
+    // path/fd targets are resolved BEFORE the attribute store is consulted.
+    // Linux resolves the path first for every *xattr syscall, so a path that
+    // does not exist is ENOENT — for set/get/list AND remove alike (Docker
+    // linux/arm64 debian:stable: set/get/list/removexattr on a missing path
+    // all return errno 2). The fd-variants validate the fd first and report
+    // EBADF for an unopened descriptor. The real `user.*` round-trip on an
+    // existing file is exercised against the host backend by the conformance
+    // suite; here we pin the in-memory dispatch ordering.
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
     memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();
     memory.write_bytes(0x4020, b"user.test\0").unwrap();
@@ -4107,10 +4108,11 @@ fn xattr_family_dispatches_per_target_on_in_memory_backend() {
     let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
-    // Path-variant set/get/list (5,6 set; 8,9 get; 11,12 list) and the
-    // remove*xattr family (14,15,16) all reach the backend and report ENOTSUP
-    // on the in-memory overlay. Args: (path, name, value, size).
-    for number in [5, 6, 8, 9, 11, 12, 14, 15, 16] {
+    // Path-variants set/get/list (5,6 set; 8,9 get; 11,12 list) and the
+    // remove*xattr path variants (14,15) all resolve the path first; /etc/motd
+    // is absent on the bare in-memory backend, so each is ENOENT. Args:
+    // (path, name, value, size).
+    for number in [5, 6, 8, 9, 11, 12, 14, 15] {
         assert_eq!(
             dispatcher
                 .dispatch(
@@ -4122,14 +4124,16 @@ fn xattr_family_dispatches_per_target_on_in_memory_backend() {
                     &reporter,
                 )
                 .unwrap(),
-            DispatchOutcome::Errno { errno: 95 },
-            "syscall {number} should return ENOTSUP on the in-memory backend"
+            DispatchOutcome::Errno { errno: 2 },
+            "path-variant xattr syscall {number} on a missing path should be ENOENT"
         );
     }
 
     // Fd-variants (7 fsetxattr, 10 fgetxattr, 13 flistxattr) validate the fd
     // before anything else: an unopened fd is EBADF.
-    for number in [7, 10, 13] {
+    // 16 fremovexattr is also an fd variant: the unopened fd 0x4000 is
+    // validated before path resolution, so EBADF wins.
+    for number in [7, 10, 13, 16] {
         assert_eq!(
             dispatcher
                 .dispatch(
@@ -4316,7 +4320,7 @@ fn ftruncate_bootstrap_rejects_streams_and_read_only_rootfs_fds() {
                 &reporter,
             )
             .unwrap(),
-        DispatchOutcome::Errno { errno: 9 }
+        DispatchOutcome::Errno { errno: 22 }
     );
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());

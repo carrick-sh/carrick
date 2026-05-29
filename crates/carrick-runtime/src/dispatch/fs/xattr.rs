@@ -21,7 +21,16 @@ impl SyscallDispatcher {
                 if path.is_empty() {
                     return Err(LINUX_ENOENT);
                 }
-                self.resolve_at_path(LINUX_AT_FDCWD, &path)
+                let resolved = self.resolve_at_path(LINUX_AT_FDCWD, &path)?;
+                // Linux resolves the path FIRST for every *xattr syscall: a path
+                // that does not exist is ENOENT, before any attr/namespace check
+                // (oracle: debian:stable arm64 set/get/list/remove on a missing
+                // path all -> errno 2). Without this the request falls through to
+                // the backend, which reports ENOTSUP (in-memory) / ENODATA (host).
+                if self.layered_metadata(&resolved).is_err() {
+                    return Err(LINUX_ENOENT);
+                }
+                Ok(resolved)
             }
             XattrTarget::Fd(fd) => {
                 let open_file = self.open_file(fd.0).ok_or(LINUX_EBADF)?;
@@ -167,11 +176,9 @@ impl SyscallDispatcher {
             Ok(p) => p,
             Err(errno) => return Ok(errno.into()),
         };
-        // A path that doesn't exist is ENOENT, distinct from ENODATA (an absent
-        // attribute on a file that DOES exist) — removexattr02 checks both.
-        if self.layered_metadata(&resolved).is_err() {
-            return Ok(LINUX_ENOENT.into());
-        }
+        // Path existence (missing -> ENOENT, distinct from ENODATA for an
+        // absent attribute on a file that DOES exist; removexattr02 checks
+        // both) is now enforced centrally in xattr_target_path.
         let name = match read_guest_c_string(memory, name_ptr.0) {
             Ok(name) => name,
             Err(errno) => return Ok(errno.into()),

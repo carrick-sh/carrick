@@ -96,7 +96,9 @@ pub const fn handler_for_aarch64(number: u64) -> SyscallHandler {
         90 | 91 | 140 | 141 | 143..=152 | 158 | 159 | 166 | 174..=177 => {
             SyscallHandler::Credentials
         }
-        92
+        30..=31
+        | 58
+        | 92
         | 95
         | 117
         | 122
@@ -112,11 +114,12 @@ pub const fn handler_for_aarch64(number: u64) -> SyscallHandler {
         | 278
         | 293
         | 424
-        | 434 => SyscallHandler::Process,
+        | 434
+        | 186..=197 => SyscallHandler::Process,
         93 | 94 | 220 | 221 | 260 | 435 => SyscallHandler::Lifecycle,
-        129..=139 => SyscallHandler::Signal,
+        74 | 129..=139 => SyscallHandler::Signal,
         96 | 98 | 99 | 124 | 178 => SyscallHandler::ThreadLocal,
-        74 | 75 | 77 => SyscallHandler::BootstrapStub,
+        75 | 77 => SyscallHandler::BootstrapStub,
         _ => SyscallHandler::Unimplemented,
     }
 }
@@ -124,7 +127,6 @@ pub const fn handler_for_aarch64(number: u64) -> SyscallHandler {
 pub const fn compat_note_for_aarch64(number: u64) -> Option<&'static str> {
     match number {
         14..=16 => Some("xattr removal is reported as unsupported for bring-up compatibility"),
-        74 => Some("signalfd4 is an explicit bootstrap ENOSYS stub"),
         75 => Some("vmsplice is an explicit bootstrap ENOSYS stub"),
         77 => Some("tee is an explicit bootstrap ENOSYS stub"),
         281 => Some("execveat remains planned and currently routes to unimplemented ENOSYS"),
