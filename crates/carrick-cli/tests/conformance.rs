@@ -46,6 +46,15 @@ const KNOWN_PROBE_GAPS: &[&str] = &[
     // forkaltstack FIXED in M2 (migrate_thread_signal_state) — now PASSES.
     "pselecteintr", // M3: select()/pselect6 blocks uninterruptibly (no EINTR)
     // forkfpregs FIXED in M2 (VcpuSnapshot V0-V31/FPSR/FPCR) — now PASSES.
+    // M4/M3 batch — probes on disk, fixes integrated one batch at a time; each
+    // entry is removed in the same commit that lands its fix.
+    // linuxsysinfo FIXED in M4 (struct padding) — now PASSES.
+    "recvmsgtrunc",    // M4: recvmsg never reports MSG_TRUNC
+    "termiosbits",     // M4: termios c_cflag/c_iflag bit translation
+    // timersettimeabs FIXED in M4 (ABSTIME + timespec validation) — now PASSES.
+    "iouringenterflag",// M4: io_uring_enter unsupported-flag/arg validation + bound
+    "sotimeo",         // M3: SO_RCVTIMEO/SO_SNDTIMEO honored on blocking recv/send
+    // epollstaledel FIXED in M3 (pending_ready keyed by fd) — now PASSES.
 ];
 use std::time::{Duration, Instant};
 

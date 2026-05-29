@@ -104,18 +104,20 @@ pub(super) fn epoll_kq_delete(kqueue: &crate::darwin_kqueue::Kqueue, host_fd: i3
 }
 
 pub(super) fn clear_pending_epoll_ready(
-    pending_ready: &mut VecDeque<LinuxEpollEvent>,
+    pending_ready: &mut VecDeque<(i32, LinuxEpollEvent)>,
     guest_fd: i32,
 ) {
-    pending_ready.retain(|event| event.data != guest_fd as u64);
+    // Purge by the ORIGINATING guest fd, not the epoll_data token (which the
+    // guest can set to anything != fd). (audit M3; probe epollstaledel)
+    pending_ready.retain(|(fd, _event)| *fd != guest_fd);
 }
 
 pub(super) fn drain_pending_epoll_ready(
-    pending_ready: &mut VecDeque<LinuxEpollEvent>,
+    pending_ready: &mut VecDeque<(i32, LinuxEpollEvent)>,
     max_events: usize,
 ) -> Vec<LinuxEpollEvent> {
     let take = pending_ready.len().min(max_events);
-    pending_ready.drain(..take).collect()
+    pending_ready.drain(..take).map(|(_fd, event)| event).collect()
 }
 
 pub(super) fn write_epoll_events<M: GuestMemory>(

@@ -598,6 +598,15 @@ impl SyscallDispatcher {
                 if pending & !suspend_mask != 0 {
                     break; // a queued signal is now deliverable
                 }
+                // A sibling tgkill/tkill of an unblocked signal lands in the
+                // per-tid host slot (THREAD_PENDING) via complete_signal_thread
+                // -> publish_pending_for; the global take_pending() below never
+                // sees it and the vCPU kick is a no-op while we spin here. Detect
+                // it WITHOUT consuming, so the post-EINTR delivery cycle injects
+                // the handler under suspend_mask. (audit M3; probe sigsuspendxthread)
+                if crate::host_signal::has_unblocked_pending_for(tid, suspend_mask) {
+                    break;
+                }
                 let host_pending = crate::host_signal::take_pending();
                 if host_pending != 0 {
                     // Re-raise so the runtime's delivery cycle injects the

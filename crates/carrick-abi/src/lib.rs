@@ -807,10 +807,17 @@ pub struct LinuxSysinfo {
     pub totalswap: u64,
     pub freeswap: u64,
     pub procs: u16,
-    pub _padding: [u8; 8],
+    // Reproduce the naturally-aligned kernel `struct sysinfo` (aarch64) under
+    // repr(C,packed): a 2-byte explicit pad after `procs` + 4 implicit-alignment
+    // bytes before the next u64, then a 4-byte trailing pad. The old single
+    // `_padding: [u8; 8]` shifted totalhigh/freehigh/mem_unit by 2 bytes (the
+    // guest read mem_unit as 65536). Size is now 112, matching Linux. (audit M4)
+    pub pad: u16,
+    pub _pad_align: [u8; 4],
     pub totalhigh: u64,
     pub freehigh: u64,
     pub mem_unit: u32,
+    pub _f: [u8; 4],
 }
 
 #[repr(C, packed)]
@@ -1409,6 +1416,7 @@ pub fn errno_name(e: u32) -> Option<&'static str> {
 }
 pub const LINUX_AT_FDCWD: u64 = (-100_i64) as u64;
 pub const LINUX_AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+pub const LINUX_AT_SYMLINK_FOLLOW: u64 = 0x400;
 pub const LINUX_AT_EACCESS: u64 = 0x200;
 pub const LINUX_AT_EMPTY_PATH: u64 = 0x1000;
 pub const LINUX_AT_REMOVEDIR: u64 = 0x200;
