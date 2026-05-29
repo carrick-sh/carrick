@@ -63,11 +63,11 @@ SysV-semaphore, and SysV-msg-queue fixes landed against it.
 | other      | 55 | 2 | 9   | 2  | 0 | 53  | 121 | **81%** |
 | fs         | 206| 0 | 61  | 23 | 11 | 141 | 442 | **68%** |
 | process    | 115| 1 | 28  | 41 | 1 | 206 | 392 | **62%** |
-| ipc        | 14 | 0 | 14  | 12 | 0 | 7   | 47  | **35%** (sem + msg queues functional) |
+| ipc        | 15 | 0 | 13  | 12 | 0 | 7   | 47  | **38%** (sem + msg queues functional) |
 | net        | 16 | 0 | 12  | 9  | 0 | 16  | 53  | **43%** |
 | mm         | 25 | 1 | 28  | 19 | 1 | 43  | 117 | **34%** |
 | xattr      | 3  | 0 | 1   | 1  | 0 | 24  | 29  | **60%** |
-| **TOTAL**  | **567** | **7** | **171** | **135** | **16** | **540** | **1436** | **567/896 = 63%** |
+| **TOTAL**  | **568** | **7** | **170** | **135** | **16** | **540** | **1436** | **568/896 = 63%** |
 
 _Last refresh (2026-05-28): the functional-FIFO cluster (commit `31f2a7c`) added
 +6 verified-MATCH — `select01` flipped to MATCH (16/16) via the FIFO O_RDWR leg +
@@ -77,7 +77,11 @@ the select multi-set return-count fix; `mknod02–05/09`, `mknodat01` now MATCH
 (macOS can't `mknod` char/block devices — inherent), `mknod06` tst_test re-exec
 hang, `select03`/`pselect02` select error-edge TBROK, `mknod08` DAC EACCES._
 
-_Last refresh (2026-05-29, sched): /proc/self/status Pid/Tgid match getpid()
+_Last refresh (2026-05-29, ipc): semctl SETVAL/SETALL value-range → ERANGE
+(commit `bf12b31`): semctl05 → MATCH (+1). ipc MATCH 14→15 (**38%**); total
+verified-MATCH 567→568/896. Probe `semctlrange`._
+
+_Earlier 2026-05-29 (sched): /proc/self/status Pid/Tgid match getpid()
 (commit `eafdbe2`): gettid01 → MATCH (+1). sched MATCH 36→37 (**76%**); total
 verified-MATCH 566→567/896. Probe `procselfpid`._
 
