@@ -105,17 +105,32 @@ verified this session.
 
 The cluster that lets a guest crash/escape the host. Highest priority for release.
 
-- `write_guest_bytes`/`read_guest_bytes` consult a per-mapping permission + range set
-  → synthesize `EFAULT` for a write into a non-writable / out-of-user-range mapping;
-  reject `MAP_FIXED` outside the legal user range. **Fixes `rosharedbus` + `mapfixed`
-  + the static MAP_FIXED-into-EL1 case in one change.**
+- `GuestMemory::write_bytes` (the syscall path; trap.rs:3076) routes through a
+  permission-checked variant that consults `mapping.perms.write` → synthesize
+  `EFAULT` for a write into a non-writable mapping. Carrick-internal writes (vdso
+  vvar, sigframe, bootstrap) keep calling the unchecked `inner.write_guest_bytes`.
+  **Fixes `rosharedbus`** (a PROT_READ `MAP_SHARED` file alias carries
+  `perms.write=false`).
+- Reject `MAP_FIXED` placement into carrick-owned IPA regions (EL1 page tables,
+  vector table, trampolines, shared aperture control) → `EINVAL`. Closes the static
+  MAP_FIXED-into-EL1 host-corruption/escape path. (Not conformance-probe-testable —
+  Linux would map there; guard with a unit test / fixture that confirms carrick
+  rejects rather than corrupts.)
 - Signal inject-failure (unwritable stack) → forced default-action SIGSEGV that
   terminates the whole guest thread-group with stdout/stderr flushed; sibling-thread
   error path must perform the `clear_child_tid` futex wake (else peers deadlock).
+  New probe `sigbadstack` (whole-thread-group SIGSEGV → 139).
 - Read-side `access_ok`-equivalent: `read(huge_count)` returns EFAULT when
   `buf+count` overflows the guest VA range (the fidelity follow-up M0 surfaced).
-- **DoD:** `rosharedbus`, `mapfixed` MATCH; a new `sigbadstack` probe shows whole-
-  thread-group SIGSEGV (139); no guest-reachable host crash remains in this class.
+- **Scope correction (found during M1 design):** `mapfixed`'s full fix — making
+  `MAP_FIXED|MAP_PRIVATE` over a `guest_shared` aperture region genuinely private
+  (a real private remap, so the child's write does NOT reach the shared backing) —
+  needs the durable-memory mapping work and MOVES TO **M5**. It stays in
+  KNOWN_PROBE_GAPS until then. The `perms.write` check does NOT cover it (the shared
+  aperture is writable).
+- **DoD:** `rosharedbus` MATCH; `sigbadstack` → 139; MAP_FIXED-into-EL1 rejected
+  (unit/fixture); no guest-reachable host *crash/corruption* remains in this class
+  (`mapfixed`'s privacy-fidelity is deferred to M5, tracked).
 
 ### M2 — Fork / vCPU state fidelity  (serial; trap.rs)
 
@@ -158,9 +173,12 @@ validation; `mprotect` PROT_EXEC→UXN/PXN (NX enforcement) + arena free-list oc
 Align with `docs/superpowers/specs/2026-05-26-durable-memory-architecture-design.md`
 (Plans C/D). Remove the residual late-`hv_vm_map` `MapHostAlias` cases + the alias
 IPA/dup-fd leak on `munmap`; make guest `mprotect` enforced beyond the private arena
-(image/heap/shared aperture) at the stage-1 boundary. Open with a judge-panel design
-review before coding (high blast radius). **DoD:** the durable-memory probes + the
-mm LTP cluster advance; no late stage-2 mutation after vCPUs exist for ordinary ops.
+(image/heap/shared aperture) at the stage-1 boundary. Also: `MAP_FIXED|MAP_PRIVATE`
+over a `guest_shared` aperture region must allocate a genuine private backing so the
+child's write does not reach the shared pages (the `mapfixed` finding, moved here
+from M1). Open with a judge-panel design review before coding (high blast radius).
+**DoD:** the durable-memory probes + `mapfixed` MATCH + the mm LTP cluster advance;
+no late stage-2 mutation after vCPUs exist for ordinary ops.
 
 ### M6 — P3 polish + remainder  (parallel lanes)
 
