@@ -671,6 +671,27 @@ impl SyscallDispatcher {
                         put8(&mut out, LIN_MSG_QBYTES, rd8(MAC_MSG_QBYTES));
                         put4(&mut out, LIN_MSG_LSPID, rd4(MAC_MSG_LSPID));
                         put4(&mut out, LIN_MSG_LRPID, rd4(MAC_MSG_LRPID));
+                        // ipc64_perm (bytes 0..28): the macOS msg_perm sits at
+                        // offset 0 of msqid_ds — uid@0,gid@4,cuid@8,cgid@12,
+                        // mode@16(u16),_seq@18(u16),_key@20(i32). Map into the
+                        // Linux ipc64_perm — key@0,uid@4,gid@8,cuid@12,cgid@16,
+                        // mode@20(u32),seq@24(u16). key/mode/seq come from the
+                        // host stat; the owner/creator ids come from the GUEST
+                        // creds (carrick's macOS process is not the guest uid).
+                        // (msgctl01 reads msg_perm.key + msg_perm.mode.)
+                        let rd2 = |o: usize| {
+                            let mut a = [0u8; 2];
+                            a.copy_from_slice(&ds[o..o + 2]);
+                            u16::from_le_bytes(a)
+                        };
+                        let creds = this.cred_snapshot();
+                        put4(&mut out, 0, rd4(20)); // key
+                        put4(&mut out, 4, creds.euid as i32); // uid
+                        put4(&mut out, 8, creds.egid as i32); // gid
+                        put4(&mut out, 12, creds.euid as i32); // cuid
+                        put4(&mut out, 16, creds.egid as i32); // cgid
+                        out[20..24].copy_from_slice(&(rd2(16) as u32).to_le_bytes()); // mode
+                        out[24..26].copy_from_slice(&rd2(18).to_le_bytes()); // seq
                         let memory = &mut *cx.memory;
                         if memory.write_bytes(buf, &out).is_err() {
                             return Ok(DispatchOutcome::errno(LINUX_EFAULT));
