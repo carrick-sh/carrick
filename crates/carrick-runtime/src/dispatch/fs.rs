@@ -886,6 +886,23 @@ impl SyscallDispatcher {
         })
     }
 
+    /// True iff `fd` refers to a pipe / socket / character device — kinds with
+    /// no `->fsync` file op, so `fsync`/`fdatasync` on them is EINVAL on Linux
+    /// (e.g. fdatasync02 on `/dev/null`, which carrick serves as a `HostPipe`).
+    /// A directory (dir fsync is valid) and synthetic / in-memory files are a
+    /// no-op success, so they return false.
+    fn fd_lacks_fsync(&self, fd: i32) -> bool {
+        self.open_file(fd).is_some_and(|of| {
+            matches!(
+                &*of.description.read(),
+                OpenDescription::HostPipe { .. }
+                    | OpenDescription::HostSocket { .. }
+                    | OpenDescription::PipeReader { .. }
+                    | OpenDescription::PipeWriter { .. }
+            )
+        })
+    }
+
     fn write_output_fd(&self, fd: i32, bytes: &[u8]) -> DispatchOutcome {
         let nonblocking = self.io_is_nonblocking(fd, 0);
         // Mirror `write`/`writev`: any fd present in `open_files` (e.g.
@@ -3550,32 +3567,38 @@ impl SyscallDispatcher {
         fn fsync(this, cx, fd: Fd) {
 
             let fd: Fd = fd;
-            let host_fd = match this.host_file_fd_for_flush(fd.0) {
-                Ok(host_fd) => host_fd,
-                Err(errno) => return Ok(errno.into()),
-            };
-            if let Some(host_fd) = host_fd {
-                if let Err(errno) = flush_host_fd(host_fd) {
-                    return Ok(errno.into());
+            match this.host_file_fd_for_flush(fd.0) {
+                Ok(Some(host_fd)) => {
+                    if let Err(errno) = flush_host_fd(host_fd) {
+                        return Ok(errno.into());
+                    }
+                    Ok(DispatchOutcome::Returned { value: 0 })
                 }
+                // Non-HostFile: a pipe/socket/char device has no ->fsync op
+                // (EINVAL); a directory / synthetic / in-memory file is a no-op.
+                Ok(None) if this.fd_lacks_fsync(fd.0) => Ok(LINUX_EINVAL.into()),
+                Ok(None) => Ok(DispatchOutcome::Returned { value: 0 }),
+                Err(errno) => Ok(errno.into()),
             }
-            Ok(DispatchOutcome::Returned { value: 0 })
 
         }
 
         fn fdatasync(this, cx, fd: Fd) {
 
             let fd: Fd = fd;
-            let host_fd = match this.host_file_fd_for_flush(fd.0) {
-                Ok(host_fd) => host_fd,
-                Err(errno) => return Ok(errno.into()),
-            };
-            if let Some(host_fd) = host_fd {
-                if let Err(errno) = flush_host_fd(host_fd) {
-                    return Ok(errno.into());
+            match this.host_file_fd_for_flush(fd.0) {
+                Ok(Some(host_fd)) => {
+                    if let Err(errno) = flush_host_fd(host_fd) {
+                        return Ok(errno.into());
+                    }
+                    Ok(DispatchOutcome::Returned { value: 0 })
                 }
+                // fdatasync02: /dev/null (a char device) → EINVAL; regular files
+                // flush, directories / synthetic files no-op.
+                Ok(None) if this.fd_lacks_fsync(fd.0) => Ok(LINUX_EINVAL.into()),
+                Ok(None) => Ok(DispatchOutcome::Returned { value: 0 }),
+                Err(errno) => Ok(errno.into()),
             }
-            Ok(DispatchOutcome::Returned { value: 0 })
 
         }
 
