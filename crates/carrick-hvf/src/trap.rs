@@ -150,6 +150,15 @@ pub enum TrapError {
     UnsupportedPlatform,
     #[error("Hypervisor.framework operation failed: {0}")]
     Hypervisor(String),
+    /// The signal frame could not be written to the guest's user stack (the
+    /// guest mprotect'd its own stack PROT_NONE, SP points at an unmapped page,
+    /// or the alt stack is unwritable). Linux force_sigsegv()s: the whole guest
+    /// thread-group dies by SIGSEGV (exit 139). Signal-delivery callers map this
+    /// to a term_signal=SIGSEGV termination instead of propagating a fatal
+    /// carrick error (and so a sibling thread terminates the group rather than
+    /// silently vanishing and deadlocking its peers). (audit M1b)
+    #[error("signal frame could not be delivered to the guest stack")]
+    SignalDeliveryFault,
     #[error("guest mapping size {0} does not fit this host")]
     MappingTooLarge(u64),
     #[error("guest mapping at 0x{guest_start:x} with size {mapped_size} overflows")]
@@ -2365,15 +2374,16 @@ impl HvfInner {
         let frame_bytes = frame.as_bytes();
         let new_sp = signal_frame_stack_pointer(frame.saved_sp, altstack, frame_bytes.len())?;
         if altstack.is_some() && !self.guest_range_is_writable(new_sp, frame_bytes.len()) {
-            return Err(TrapError::Hypervisor(format!(
-                "signal alt stack frame range is not mapped/writable: 0x{new_sp:x}+{}",
-                frame_bytes.len()
-            )));
+            // Unwritable alt stack: Linux force_sigsegv -> terminate the
+            // thread-group by SIGSEGV, not a fatal carrick error.
+            return Err(TrapError::SignalDeliveryFault);
         }
 
-        // Write the frame into guest memory at the new SP.
+        // Write the frame into guest memory at the new SP. An unwritable/
+        // unmapped stack is Linux force_sigsegv territory: terminate the
+        // thread-group by SIGSEGV rather than crashing carrick.
         self.write_guest_bytes(new_sp, frame_bytes)
-            .map_err(|e| TrapError::Hypervisor(format!("sigframe write failed: {e}")))?;
+            .map_err(|_| TrapError::SignalDeliveryFault)?;
 
         // Adjust SP_EL0 to point past the freshly-written frame.
         self.vcpu
