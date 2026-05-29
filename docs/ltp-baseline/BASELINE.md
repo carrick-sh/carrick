@@ -60,14 +60,14 @@ SysV-semaphore, and SysV-msg-queue fixes landed against it.
 | signals    | 36 | 0 | 3   | 7  | 3 | 2   | 51  | **73%** |
 | epoll_poll | 34 | 3 | 6   | 9  | 0 | 10  | 62  | **65%** |
 | sched      | 36 | 0 | 8   | 5  | 0 | 18  | 67  | **73%** |
-| other      | 51 | 2 | 13  | 2  | 0 | 53  | 121 | **75%** |
+| other      | 55 | 2 | 9   | 2  | 0 | 53  | 121 | **81%** |
 | fs         | 189| 0 | 74  | 32 | 6 | 141 | 442 | **63%** |
 | process    | 114| 1 | 29  | 41 | 1 | 206 | 392 | **61%** |
 | ipc        | 14 | 0 | 14  | 12 | 0 | 7   | 47  | **35%** (sem + msg queues functional) |
 | net        | 13 | 0 | 15  | 9  | 0 | 16  | 53  | **35%** |
 | mm         | 25 | 1 | 28  | 19 | 1 | 43  | 117 | **34%** |
 | xattr      | 3  | 0 | 1   | 1  | 0 | 24  | 29  | **60%** |
-| **TOTAL**  | **541** | **7** | **193** | **144** | **11** | **540** | **1436** | **541/896 = 60%** |
+| **TOTAL**  | **545** | **7** | **189** | **144** | **11** | **540** | **1436** | **545/896 = 61%** |
 
 _Last refresh (2026-05-28): the functional-FIFO cluster (commit `31f2a7c`) added
 +6 verified-MATCH — `select01` flipped to MATCH (16/16) via the FIFO O_RDWR leg +
@@ -77,7 +77,13 @@ the select multi-set return-count fix; `mknod02–05/09`, `mknodat01` now MATCH
 (macOS can't `mknod` char/block devices — inherent), `mknod06` tst_test re-exec
 hang, `select03`/`pselect02` select error-edge TBROK, `mknod08` DAC EACCES._
 
-_Last refresh (2026-05-29, sched): the nice value model (commit `8e2167e`):
+_Last refresh (2026-05-29, other): setfsuid/setfsgid fs-id model (commit
+`66bdb2b`): a tracked fsuid/fsgid (default=euid/egid, reset by set*uid/gid) that
+setfs*id returns + updates. `setfsuid01/03`, `setfsgid01/02` → MATCH (+4);
+setfsuid04 stays DIFF (fs-id DAC open() enforcement). other MATCH 51→55
+(**81%**); total verified-MATCH 541→545/896 (**61%**). Probe `setfsid`._
+
+_Earlier 2026-05-29 (sched): the nice value model (commit `8e2167e`):
 setpriority now clamps the nice to [-20,19] + persists it (getpriority reflects
 it) + EPERM on non-root nice-lowering. `nice02`/`nice03`/`nice04` → MATCH (+3);
 nice01/nice05/setpriority01 are NO_ORACLE (Docker LinuxKit timing/perm). sched
