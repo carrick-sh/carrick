@@ -61,13 +61,13 @@ SysV-semaphore, and SysV-msg-queue fixes landed against it.
 | epoll_poll | 34 | 3 | 6   | 9  | 0 | 10  | 62  | **65%** |
 | sched      | 36 | 0 | 8   | 5  | 0 | 18  | 67  | **73%** |
 | other      | 55 | 2 | 9   | 2  | 0 | 53  | 121 | **81%** |
-| fs         | 205| 0 | 62  | 23 | 11 | 141 | 442 | **68%** |
+| fs         | 206| 0 | 61  | 23 | 11 | 141 | 442 | **68%** |
 | process    | 114| 1 | 29  | 41 | 1 | 206 | 392 | **61%** |
 | ipc        | 14 | 0 | 14  | 12 | 0 | 7   | 47  | **35%** (sem + msg queues functional) |
 | net        | 15 | 0 | 13  | 9  | 0 | 16  | 53  | **40%** |
 | mm         | 25 | 1 | 28  | 19 | 1 | 43  | 117 | **34%** |
 | xattr      | 3  | 0 | 1   | 1  | 0 | 24  | 29  | **60%** |
-| **TOTAL**  | **563** | **7** | **175** | **135** | **16** | **540** | **1436** | **563/896 = 63%** |
+| **TOTAL**  | **564** | **7** | **174** | **135** | **16** | **540** | **1436** | **564/896 = 63%** |
 
 _Last refresh (2026-05-28): the functional-FIFO cluster (commit `31f2a7c`) added
 +6 verified-MATCH — `select01` flipped to MATCH (16/16) via the FIFO O_RDWR leg +
@@ -77,7 +77,11 @@ the select multi-set return-count fix; `mknod02–05/09`, `mknodat01` now MATCH
 (macOS can't `mknod` char/block devices — inherent), `mknod06` tst_test re-exec
 hang, `select03`/`pselect02` select error-edge TBROK, `mknod08` DAC EACCES._
 
-_Last refresh (2026-05-29, fs): guest DAC for directory-modify (commit
+_Last refresh (2026-05-29, fs): guest DAC extended to symlink creation (commit
+`3dba76d`): symlink03 → MATCH (+1). fs MATCH 205→206 (**68%**); total
+verified-MATCH 563→564/896. Probe `dirdac` (+symlink assertion)._
+
+_Earlier 2026-05-29 (fs): guest DAC for directory-modify (commit
 `cfa24b4`): an unprivileged guest mkdir/rmdir/unlink needs write+search on the
 parent (else EACCES) + sticky-bit ownership to remove (else EPERM); root
 bypasses (demos unaffected). `mkdir04`/`rmdir03`/`unlink08` → MATCH (+3). fs
