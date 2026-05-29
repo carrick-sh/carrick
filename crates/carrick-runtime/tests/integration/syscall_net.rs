@@ -2162,6 +2162,9 @@ fn dispatch_with_wait(
                     WaitResult::Interrupted => {
                         return DispatchOutcome::Errno { errno: LINUX_EINTR };
                     }
+                    WaitResult::Errno(errno) => {
+                        return DispatchOutcome::Errno { errno };
+                    }
                 }
             }
             DispatchOutcome::WaitOnPollFds {
@@ -2176,6 +2179,9 @@ fn dispatch_with_wait(
                     WaitResult::TimedOut => return DispatchOutcome::Returned { value: on_timeout },
                     WaitResult::Interrupted => {
                         return DispatchOutcome::Errno { errno: LINUX_EINTR };
+                    }
+                    WaitResult::Errno(errno) => {
+                        return DispatchOutcome::Errno { errno };
                     }
                 }
             }
@@ -2326,6 +2332,9 @@ fn dispatch_threaded_with_wait_notify(
                     WaitResult::Interrupted => {
                         return DispatchOutcome::Errno { errno: LINUX_EINTR };
                     }
+                    WaitResult::Errno(errno) => {
+                        return DispatchOutcome::Errno { errno };
+                    }
                 }
             }
             DispatchOutcome::WaitOnPollFds {
@@ -2343,6 +2352,9 @@ fn dispatch_threaded_with_wait_notify(
                     WaitResult::TimedOut => return DispatchOutcome::Returned { value: on_timeout },
                     WaitResult::Interrupted => {
                         return DispatchOutcome::Errno { errno: LINUX_EINTR };
+                    }
+                    WaitResult::Errno(errno) => {
+                        return DispatchOutcome::Errno { errno };
                     }
                 }
             }

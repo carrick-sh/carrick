@@ -1643,7 +1643,11 @@ impl HvfInner {
             )));
         }
         // Build VA→IPA descriptors + TLBI so the guest's own accesses translate.
-        let pt_res = self.pt_edit_and_flush(|mgr| mgr.map_aliased(va, ipa, len));
+        // Thread guest writability through: a SHM_RDONLY (PROT_READ) alias is
+        // built AP=RO so a direct guest store faults SIGSEGV (stage-1 first),
+        // matching Linux do_shmat — preserving the IPA output address.
+        let pt_res =
+            self.pt_edit_and_flush(|mgr| mgr.map_aliased(va, ipa, len, alias_guest_writable));
         {
             // Trace the manager's view of the alias path (carrick trace:
             // pt-alias-walk) — fires for parent (ok) and forked child (fail) so

@@ -153,6 +153,42 @@ pub struct PtyRelay {
     old_sigwinch: Option<libc::sigaction>,
 }
 
+/// RAII rollback for the SIGWINCH install in `start_with_pair_and_winsize`.
+/// While uncommitted, it owns the just-installed handler disposition + the
+/// winch self-pipe fds. If anything between handler-install and a successful
+/// relay spawn fails (the `?` on `start_inner` drops this), `drop` disarms the
+/// global write-end, restores the saved disposition, and closes both fds —
+/// mirroring `stop()`'s teardown order. `commit()` (set `committed = true`)
+/// once the relay owns those resources, after which `drop` is a no-op.
+struct SigwinchInstallGuard {
+    old: libc::sigaction,
+    winch_r: RawFd,
+    winch_w: RawFd,
+    committed: bool,
+}
+
+impl Drop for SigwinchInstallGuard {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        // Disarm the global FIRST (mirrors stop()'s order) so a late signal
+        // between the restore and the close is a no-op.
+        WINCH_PIPE_WRITE.store(-1, Ordering::SeqCst);
+        // SAFETY: self.old came from a checked-successful sigaction() below.
+        unsafe {
+            libc::sigaction(libc::SIGWINCH, &self.old, core::ptr::null_mut());
+        }
+        // SAFETY: both fds are owned by the guard until committed; on the
+        // rollback path the relay thread never spawned, so relay_loop never
+        // closed winch_r — closing both here is correct (no double-close).
+        unsafe {
+            libc::close(self.winch_r);
+            libc::close(self.winch_w);
+        }
+    }
+}
+
 impl PtyRelay {
     /// Return the slave fd so the caller can hand it to the guest as fds 0/1/2.
     pub fn slave_fd(&self) -> i32 {
@@ -217,10 +253,10 @@ impl PtyRelay {
                 libc::fcntl(winch_r, libc::F_SETFL, fl | libc::O_NONBLOCK);
             }
         }
-        // Publish write end to global so the handler can reach it.
-        WINCH_PIPE_WRITE.store(winch_w, Ordering::SeqCst);
-
-        // Install handler; save old disposition for restore in stop().
+        // Install the handler BEFORE publishing the write end, with the
+        // sigaction return CHECKED: on failure nothing is published and both
+        // winch fds are closed, so there is no leak and no half-installed
+        // global state.
         // SAFETY: zeroed sigaction is the documented "no flags, empty mask" form.
         let old_sigwinch = unsafe {
             let mut action: libc::sigaction = core::mem::zeroed();
@@ -228,8 +264,23 @@ impl PtyRelay {
             libc::sigemptyset(&mut action.sa_mask);
             action.sa_flags = libc::SA_RESTART;
             let mut old: libc::sigaction = core::mem::zeroed();
-            libc::sigaction(libc::SIGWINCH, &action, &mut old);
+            if libc::sigaction(libc::SIGWINCH, &action, &mut old) != 0 {
+                let e = io::Error::last_os_error();
+                libc::close(winch_r);
+                libc::close(winch_w);
+                return Err(e); // nothing published yet; clean
+            }
             old
+        };
+        // Handler is now live. Publish the write end so the handler is
+        // functional, then take ownership of the install via a rollback guard
+        // so any later failure (relay spawn) fully reverts.
+        WINCH_PIPE_WRITE.store(winch_w, Ordering::SeqCst);
+        let mut guard = SigwinchInstallGuard {
+            old: old_sigwinch,
+            winch_r,
+            winch_w,
+            committed: false,
         };
 
         // Propagate initial size before the guest sees any data. In the
@@ -237,11 +288,17 @@ impl PtyRelay {
         // changes through that side of the pty.
         propagate_winsize(real_in, pair.slave_fd);
 
+        // `?` here drops `guard` on Err → full rollback (disarm global, restore
+        // disposition, close both winch fds). The relay thread never spawned on
+        // that path, so relay_loop never closed winch_r — no double-close.
         let mut relay = Self::start_inner(pair, real_in, real_out, winch_r, winsize_r)?;
         relay.raw_active = true;
         relay.winch_r = winch_r;
         relay.winch_w = winch_w;
-        relay.old_sigwinch = Some(old_sigwinch);
+        relay.old_sigwinch = Some(guard.old);
+        // The relay now owns the fds + restore responsibility; suppress the
+        // guard's rollback.
+        guard.committed = true;
         Ok(relay)
     }
 
@@ -288,6 +345,11 @@ impl PtyRelay {
             Ok(t) => t,
             Err(e) => {
                 // SAFETY: these fds are owned here and not yet handed off.
+                // NOTE: winch_r/winch_w are intentionally NOT closed here — on
+                // the production path they are owned by the caller's
+                // SigwinchInstallGuard, which closes them on this Err (the `?`
+                // at the call site drops the guard). Closing them here too would
+                // be a double-close.
                 unsafe {
                     libc::close(shutdown_r);
                     libc::close(shutdown_w);

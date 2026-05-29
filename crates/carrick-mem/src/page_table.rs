@@ -590,16 +590,40 @@ impl PageTableManager {
         self.apply(va, len, PtOp::ReadWrite)
     }
 
-    /// Build a fresh VA→IPA translation for `[va, va+len)` (RWX-for-EL0),
-    /// creating any missing L1/L2/L3 sub-tables. This is the dynamic counterpart
-    /// of the boot Rosetta alias: it maps high guest VAs (which can't be
+    /// Build a fresh VA→IPA translation for `[va, va+len)` for EL0, creating
+    /// any missing L1/L2/L3 sub-tables. This is the dynamic counterpart of the
+    /// boot Rosetta alias: it maps high guest VAs (which can't be
     /// identity-mapped — HVF's IPA is only 40 bits) down to a low IPA the caller
     /// has `hv_vm_map`'d. Uses 2 MiB blocks when `va`/`ipa`/`len` are 2 MiB
     /// aligned, else 4 KiB pages. The target VA range must be previously
     /// unmapped (high space the boot tables never populate). Always Ok(true).
-    pub fn map_aliased(&mut self, va: u64, ipa: u64, len: u64) -> Result<bool, PageTableError> {
+    ///
+    /// `writable`: when false the leaf is built AP=RO (read-only at EL0/EL1)
+    /// while PRESERVING the IPA output address — so a guest store to a
+    /// SHM_RDONLY shmat alias raises a stage-1 permission abort (SIGSEGV),
+    /// matching Linux. The output address must stay the low IPA (NOT VA&mask),
+    /// because an alias is non-identity (VA != IPA); set_readonly/apply would
+    /// rebuild it from the VA and destroy the mapping, which is why writability
+    /// is threaded in HERE instead.
+    pub fn map_aliased(
+        &mut self,
+        va: u64,
+        ipa: u64,
+        len: u64,
+        writable: bool,
+    ) -> Result<bool, PageTableError> {
         const TWO_MIB: u64 = 1 << 21;
         const FOUR_KIB: u64 = 1 << 12;
+        let block_flags = if writable {
+            USER_BLOCK_FLAGS
+        } else {
+            (USER_BLOCK_FLAGS & !AP_MASK) | AP_RO
+        };
+        let page_flags = if writable {
+            USER_PAGE_FLAGS
+        } else {
+            (USER_PAGE_FLAGS & !AP_MASK) | AP_RO
+        };
         if va % TWO_MIB == 0 && ipa % TWO_MIB == 0 && len % TWO_MIB == 0 {
             let n = len / TWO_MIB;
             for i in 0..n {
@@ -607,7 +631,7 @@ impl PageTableManager {
                 let p = ipa + i * TWO_MIB;
                 let l2_off = self.descend_creating(v, 2)?;
                 let idx = indices(v);
-                self.write_desc(l2_off + idx[2] * 8, (p & PA_MASK_2MIB) | USER_BLOCK_FLAGS);
+                self.write_desc(l2_off + idx[2] * 8, (p & PA_MASK_2MIB) | block_flags);
             }
             return Ok(true);
         }
@@ -617,7 +641,7 @@ impl PageTableManager {
             let p = ipa + i * FOUR_KIB;
             let l3_off = self.descend_creating(v, 3)?;
             let idx = indices(v);
-            self.write_desc(l3_off + idx[3] * 8, (p & PA_MASK_4KIB) | USER_PAGE_FLAGS);
+            self.write_desc(l3_off + idx[3] * 8, (p & PA_MASK_4KIB) | page_flags);
         }
         Ok(true)
     }

@@ -584,16 +584,24 @@ where
                 runtime.complete_syscall(value)?;
                 last_syscall_retval = Some(value);
             }
-            DispatchOutcome::Fork { pidfd_out } => {
+            DispatchOutcome::Fork {
+                pidfd_out,
+                exit_signal,
+            } => {
                 let outcome = runtime.fork()?;
                 let retval: i64 = match outcome {
                     crate::trap::ForkOutcome::Parent { child_pid } => {
                         waiter = crate::io_wait::ThreadWaiter::new(this_tid);
                         // Watch the child's exit (EVFILT_PROC/NOTE_EXIT) so the
-                        // signal pump delivers SIGCHLD to this (parent) tid when
-                        // it exits — without a host SIGCHLD handler, which would
-                        // break wait4's host-waitpid reap.
-                        crate::host_signal::register_child_exit_watch(child_pid, this_tid as i32);
+                        // signal pump delivers the requested exit signal to this
+                        // (parent) tid when it exits — without a host SIGCHLD
+                        // handler, which would break wait4's host-waitpid reap.
+                        crate::host_signal::register_child_exit_watch(
+                            child_pid,
+                            this_tid as i32,
+                            i32::try_from(exit_signal)
+                                .unwrap_or(crate::linux_abi::LINUX_SIGCHLD),
+                        );
                         // CLONE_PIDFD: hand the parent a pidfd for the new child.
                         if let Some(addr) = pidfd_out {
                             let fd = dispatcher.install_child_pidfd(child_pid).unwrap_or(-1);
@@ -783,6 +791,9 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
                         errno: crate::linux_abi::LINUX_EINTR,
                     });
                 }
+                // Could not pin a watched fd (host fd table exhausted). The
+                // errno is already Linux; surface it verbatim.
+                WaitResult::Errno(errno) => return Ok(DispatchOutcome::Errno { errno }),
             },
             DispatchOutcome::WaitOnPollFds {
                 fds,
@@ -799,6 +810,9 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
                         errno: crate::linux_abi::LINUX_EINTR,
                     });
                 }
+                // Could not pin a watched fd (host fd table exhausted). The
+                // errno is already Linux; surface it verbatim.
+                WaitResult::Errno(errno) => return Ok(DispatchOutcome::Errno { errno }),
             },
             DispatchOutcome::WaitOnProcExit { pid, block_signals } => {
                 match waiter.wait_proc_exit(pid, block_signals) {
@@ -809,6 +823,11 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
                         return Ok(DispatchOutcome::Errno {
                             errno: crate::linux_abi::LINUX_EINTR,
                         });
+                    }
+                    // wait_proc_exit never builds PinnedWaitFds, so this is
+                    // unreachable in practice; present for exhaustiveness.
+                    WaitResult::Errno(errno) => {
+                        return Ok(DispatchOutcome::Errno { errno });
                     }
                 }
             }
@@ -830,6 +849,11 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
                             });
                         }
                         continue;
+                    }
+                    // WaitOnSignals waits over an EMPTY fd slice, so new() never
+                    // dups and this is unreachable; present for exhaustiveness.
+                    WaitResult::Errno(errno) => {
+                        return Ok(DispatchOutcome::Errno { errno });
                     }
                 }
             }
@@ -1101,6 +1125,11 @@ impl ThreadRuntimeState {
                             errno: crate::linux_abi::LINUX_EINTR,
                         });
                     }
+                    // Could not pin a watched fd (host fd table exhausted). The
+                    // errno is already Linux; surface it verbatim.
+                    crate::io_wait::WaitResult::Errno(errno) => {
+                        break Ok(DispatchOutcome::Errno { errno });
+                    }
                 },
                 DispatchOutcome::WaitOnPollFds {
                     fds,
@@ -1121,6 +1150,11 @@ impl ThreadRuntimeState {
                             errno: crate::linux_abi::LINUX_EINTR,
                         });
                     }
+                    // Could not pin a watched fd (host fd table exhausted). The
+                    // errno is already Linux; surface it verbatim.
+                    crate::io_wait::WaitResult::Errno(errno) => {
+                        break Ok(DispatchOutcome::Errno { errno });
+                    }
                 },
                 DispatchOutcome::WaitOnProcExit { pid, block_signals } => {
                     match self.waiter.wait_proc_exit(pid, block_signals) {
@@ -1136,6 +1170,11 @@ impl ThreadRuntimeState {
                             break Ok(DispatchOutcome::Errno {
                                 errno: crate::linux_abi::LINUX_EINTR,
                             });
+                        }
+                        // wait_proc_exit never builds PinnedWaitFds, so this is
+                        // unreachable in practice; present for exhaustiveness.
+                        crate::io_wait::WaitResult::Errno(errno) => {
+                            break Ok(DispatchOutcome::Errno { errno });
                         }
                     }
                 }
@@ -1163,6 +1202,12 @@ impl ThreadRuntimeState {
                                 self.release_and_park_vcpu_for_fork(engine)?;
                             }
                             continue;
+                        }
+                        // WaitOnSignals waits over an EMPTY fd slice, so new()
+                        // never dups and this is unreachable; present for
+                        // exhaustiveness.
+                        crate::io_wait::WaitResult::Errno(errno) => {
+                            break Ok(DispatchOutcome::Errno { errno });
                         }
                     }
                 }
@@ -1440,6 +1485,7 @@ impl ThreadRuntimeState {
         kernel: &Kernel,
         engine: &mut HvfTrapEngine,
         pidfd_out: Option<u64>,
+        exit_signal: u32,
     ) -> Result<Option<i64>, RuntimeError> {
         // Serialize forks: at most one quiesce/fork in flight. When another
         // fork already holds the token, BLOCK rather than surfacing EAGAIN —
@@ -1590,7 +1636,11 @@ impl ThreadRuntimeState {
                 // without a host SIGCHLD handler, which would break wait4's
                 // host-waitpid reap. The pump was just restarted above, so its
                 // kqueue exists (rearm covers the registration-before-pump race).
-                crate::host_signal::register_child_exit_watch(child_pid, self.this_tid as i32);
+                crate::host_signal::register_child_exit_watch(
+                    child_pid,
+                    self.this_tid as i32,
+                    i32::try_from(exit_signal).unwrap_or(crate::linux_abi::LINUX_SIGCHLD),
+                );
                 // CLONE_PIDFD: allocate a pidfd for the new child and write its
                 // fd to the guest pidfd-out pointer. The child's pid mirrors a
                 // real host pid, so the pidfd watches it via EVFILT_PROC.
@@ -1936,8 +1986,13 @@ fn run_vcpu_until_exit(
                     // returning to userspace. The just-handled signal was cleared
                     // when delivered, so this can't re-deliver it.
                 }
-                DispatchOutcome::Fork { pidfd_out } => {
-                    if let Some(retval) = state.handle_fork(&kernel, &mut engine, pidfd_out)? {
+                DispatchOutcome::Fork {
+                    pidfd_out,
+                    exit_signal,
+                } => {
+                    if let Some(retval) =
+                        state.handle_fork(&kernel, &mut engine, pidfd_out, exit_signal)?
+                    {
                         last_syscall_retval = Some(state.complete_returned(&mut engine, retval)?);
                     }
                 }
