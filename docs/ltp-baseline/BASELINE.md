@@ -64,10 +64,10 @@ SysV-semaphore, and SysV-msg-queue fixes landed against it.
 | fs         | 202| 0 | 65  | 23 | 11 | 141 | 442 | **67%** |
 | process    | 114| 1 | 29  | 41 | 1 | 206 | 392 | **61%** |
 | ipc        | 14 | 0 | 14  | 12 | 0 | 7   | 47  | **35%** (sem + msg queues functional) |
-| net        | 13 | 0 | 15  | 9  | 0 | 16  | 53  | **35%** |
+| net        | 14 | 0 | 14  | 9  | 0 | 16  | 53  | **38%** |
 | mm         | 25 | 1 | 28  | 19 | 1 | 43  | 117 | **34%** |
 | xattr      | 3  | 0 | 1   | 1  | 0 | 24  | 29  | **60%** |
-| **TOTAL**  | **558** | **7** | **180** | **135** | **16** | **540** | **1436** | **558/896 = 62%** |
+| **TOTAL**  | **559** | **7** | **179** | **135** | **16** | **540** | **1436** | **559/896 = 62%** |
 
 _Last refresh (2026-05-28): the functional-FIFO cluster (commit `31f2a7c`) added
 +6 verified-MATCH — `select01` flipped to MATCH (16/16) via the FIFO O_RDWR leg +
@@ -77,7 +77,11 @@ the select multi-set return-count fix; `mknod02–05/09`, `mknodat01` now MATCH
 (macOS can't `mknod` char/block devices — inherent), `mknod06` tst_test re-exec
 hang, `select03`/`pselect02` select error-edge TBROK, `mknod08` DAC EACCES._
 
-_Last refresh (2026-05-29, fs): SIGPIPE on a broken-pipe write (commit
+_Last refresh (2026-05-29, net): recv MSG_ERRQUEUE empty → EAGAIN (commit
+`15686fe`): recv01 → MATCH (+1). net MATCH 13→14 (**38%**); total verified-MATCH
+558→559/896. Probe `recverrqueue`._
+
+_Earlier 2026-05-29 (fs): SIGPIPE on a broken-pipe write (commit
 `8330dc4`): write05 → MATCH (+1). fs MATCH 201→202 (**67%**); total
 verified-MATCH 557→558/896. Probe `sigpipewrite`._
 
