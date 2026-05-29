@@ -42,7 +42,9 @@ const KNOWN_PROBE_GAPS: &[&str] = &[
     // (the "UNEXPECTED PASS" guard fails the suite if we forget).
     // fsetfl FIXED in M4 (F_SETFL preserves access mode, masks mutable bits) — now PASSES.
     // rosharedbus FIXED in M1 (write_guest_bytes_checked perms check) — now PASSES.
-    "mapfixed",     // M5: MAP_FIXED|MAP_PRIVATE over shared aperture must remap private
+    // mapfixed FIXED in M5 (private overlay aperture + stage-1 repoint; no late
+    //   hv_vm_map) — MAP_FIXED|MAP_PRIVATE over a shared-aperture VA now gets
+    //   genuinely-private backing, so a child's store stays private. now PASSES.
     // forkaltstack FIXED in M2 (migrate_thread_signal_state) — now PASSES.
     // pselecteintr FIXED in M3 (WaitOnFdsSelect: select/pselect6 hand off to the
     //   signal-interruptible waiter; fd-sets left intact across the wait, zeroed

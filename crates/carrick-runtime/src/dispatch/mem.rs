@@ -13,6 +13,11 @@ pub(super) struct MemState {
     /// mmaps carve sub-ranges here; the aperture itself is `hv_vm_map`'d once
     /// at boot, so no stage-2 mutation happens at mmap time.
     pub shared: crate::shared_aperture::SharedAperture,
+    /// Sub-allocator for the boot-mapped PRIVATE overlay aperture. A guest
+    /// `MAP_FIXED|MAP_PRIVATE` that lands on a shared-aperture VA carves a slot
+    /// here and repoints the VA's stage-1 leaf to it (so stores stay private),
+    /// without any post-vCPU `hv_vm_map`. Per-process (fork snapshots it).
+    pub overlay: crate::shared_aperture::SharedAperture,
     /// Freed in-arena anonymous/private ranges available for reuse, kept sorted
     /// by start and coalesced. Reclaiming `munmap`'d space so a churning guest
     /// doesn't exhaust the bump arena. NOT used for MAP_FIXED or shared-file
@@ -35,6 +40,10 @@ impl MemState {
             brk_current: LINUX_HEAP_BASE,
             mmap_next: LINUX_MMAP_BASE,
             shared: crate::shared_aperture::SharedAperture::new(),
+            overlay: crate::shared_aperture::SharedAperture::with_window(
+                crate::memory::LINUX_PRIVATE_OVERLAY_BASE,
+                crate::memory::LINUX_PRIVATE_OVERLAY_SIZE,
+            ),
             free_regions: Vec::new(),
             address_space_regions: None,
             alias_ipa_next: crate::memory::LINUX_ALIAS_IPA_BASE,
@@ -261,6 +270,52 @@ impl SyscallDispatcher {
             };
             let length_usize =
                 usize::try_from(length).map_err(|_| DispatchError::LengthTooLarge(length))?;
+
+            // MAP_FIXED|MAP_PRIVATE|ANON landing on a shared-aperture VA: the
+            // guest wants a genuinely PRIVATE page at exactly this (currently
+            // shared) address. Writing through to the shared backing would leak
+            // the guest's "private" stores to every other mapper and across
+            // fork (the mapfixed privacy bug). Instead carve a slot in the
+            // per-process private overlay aperture and repoint this VA's stage-1
+            // leaf to it — stage-1 ONLY, since the overlay window is boot-mapped
+            // (no post-vCPU hv_vm_map, per the durable-memory rule). requested.0
+            // and length are already validated page-aligned/non-zero above.
+            // (MAP_FIXED|MAP_PRIVATE of a FILE over a shared-aperture VA is a
+            // tracked remainder — the probe and common case are anon.)
+            if flags & LINUX_MAP_FIXED != 0
+                && map_type == LINUX_MAP_PRIVATE
+                && flags & LINUX_MAP_ANONYMOUS != 0
+                && crate::memory::va_in_shared_aperture(requested.0, length)
+            {
+                let overlay_va = {
+                    let mut mem = this.mem.lock();
+                    // Re-MAP_FIXED over the same VA: free the prior overlay slot.
+                    if let Some(old) = mem.overlay.find_by_source(requested.0) {
+                        mem.overlay.free(old);
+                    }
+                    mem.overlay.alloc_sourced(
+                        length,
+                        crate::shared_aperture::BackingObject::PrivateAnon,
+                        Some(requested.0),
+                    )
+                };
+                let Some(overlay_va) = overlay_va else {
+                    return Ok(LINUX_ENOMEM.into());
+                };
+                // Anonymous => fresh zero page. Seed + stage-1 repoint atomically
+                // on the engine; on failure roll the slot back so it's reusable.
+                let zeros = vec![0u8; length_usize];
+                if memory
+                    .repoint_private(requested.0, overlay_va, length_usize, &zeros)
+                    .is_err()
+                {
+                    this.mem.lock().overlay.free(overlay_va);
+                    return Ok(LINUX_ENOMEM.into());
+                }
+                return Ok(DispatchOutcome::Returned {
+                    value: requested.0 as i64,
+                });
+            }
 
             let hvf_page = crate::trap::HVF_PAGE_SIZE;
             // Guest MAP_SHARED of a file: back the guest region with the host

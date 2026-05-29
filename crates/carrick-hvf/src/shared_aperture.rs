@@ -22,14 +22,23 @@ pub enum BackingObject {
     /// `msync(MS_SYNC)`/`munmap`. `host_fd` is a dup the allocator owns until
     /// the allocation is freed.
     SharedFile { host_fd: i32, offset: u64 },
+    /// Private overlay slot (lives in the PRIVATE overlay window, not the shared
+    /// one): backs a `MAP_FIXED|MAP_PRIVATE` that landed on a shared-aperture VA.
+    /// The window's host backing is per-process (fork snapshots it), so stores
+    /// stay private. No writeback.
+    PrivateAnon,
 }
 
-/// One live allocation within the shared aperture.
+/// One live allocation within an aperture.
 #[derive(Debug, Clone, Copy)]
 pub struct SharedAlloc {
     pub guest_addr: u64,
     pub len: u64,
     pub backing: BackingObject,
+    /// For a `PrivateAnon` overlay slot: the shared-aperture VA this slot backs
+    /// (so a re-`MAP_FIXED` over the same VA can find and free the old slot).
+    /// `None` for ordinary shared-aperture allocations.
+    pub source: Option<u64>,
 }
 
 /// Bump-plus-free-list sub-allocator over the fixed shared aperture window
@@ -38,6 +47,8 @@ pub struct SharedAlloc {
 /// here — the window is `hv_vm_map`'d once at boot.
 #[derive(Debug, Clone)]
 pub struct SharedAperture {
+    base: u64,
+    size: u64,
     next: u64,
     /// Freed `(start, len)` ranges, sorted by start, coalesced. Reused before
     /// the bump cursor advances.
@@ -64,20 +75,40 @@ impl Default for SharedAperture {
 
 impl SharedAperture {
     pub fn new() -> Self {
+        Self::with_window(LINUX_SHARED_FILE_BASE, LINUX_SHARED_FILE_SIZE)
+    }
+
+    /// A sub-allocator over an arbitrary boot-mapped window. The shared aperture
+    /// uses `new()`; the private overlay aperture uses this with its own window.
+    pub fn with_window(base: u64, size: u64) -> Self {
         Self {
-            next: LINUX_SHARED_FILE_BASE,
+            base,
+            size,
+            next: base,
             free: Vec::new(),
             live: Vec::new(),
         }
     }
 
-    fn window_end() -> u64 {
-        LINUX_SHARED_FILE_BASE + LINUX_SHARED_FILE_SIZE
+    fn window_end(&self) -> u64 {
+        self.base + self.size
     }
 
     /// Reserve `len` bytes (rounded up to the granule). Returns the guest IPA,
     /// or `None` if the window is exhausted. Records the backing.
     pub fn alloc(&mut self, len: u64, backing: BackingObject) -> Option<u64> {
+        self.alloc_sourced(len, backing, None)
+    }
+
+    /// Like [`alloc`], but tags the slot with the shared-aperture VA it backs
+    /// (a `PrivateAnon` overlay slot), so [`find_by_source`] can locate it for a
+    /// re-`MAP_FIXED` over the same VA.
+    pub fn alloc_sourced(
+        &mut self,
+        len: u64,
+        backing: BackingObject,
+        source: Option<u64>,
+    ) -> Option<u64> {
         if len == 0 {
             return None;
         }
@@ -94,12 +125,13 @@ impl SharedAperture {
                 guest_addr: s,
                 len,
                 backing,
+                source,
             });
             return Some(s);
         }
         let addr = align_up(self.next, GRANULE)?;
         let end = addr.checked_add(len)?;
-        if end > Self::window_end() {
+        if end > self.window_end() {
             return None;
         }
         self.next = end;
@@ -107,8 +139,18 @@ impl SharedAperture {
             guest_addr: addr,
             len,
             backing,
+            source,
         });
         Some(addr)
+    }
+
+    /// The overlay slot (guest_addr) currently backing shared-aperture VA
+    /// `source`, if any. Used to free/replace it on a re-`MAP_FIXED`.
+    pub fn find_by_source(&self, source: u64) -> Option<u64> {
+        self.live
+            .iter()
+            .find(|a| a.source == Some(source))
+            .map(|a| a.guest_addr)
     }
 
     /// Free the allocation starting at `guest_addr`. Returns the removed
