@@ -1264,6 +1264,11 @@ impl SyscallDispatcher {
                     OpenDescription::Directory { path: dir, .. } => join_rootfs_path(dir, path),
                     _ => return Err(LINUX_ENOTDIR),
                 },
+                // A valid fd that isn't in the table (e.g. a stdio fd) is still a
+                // non-directory, so a relative path can't be anchored to it →
+                // ENOTDIR; only a genuinely-invalid fd is EBADF (statx03 uses
+                // dfd=1 → ENOTDIR, dfd=-1 → EBADF).
+                None if self.fd_is_valid(dirfd as i32) => return Err(LINUX_ENOTDIR),
                 None => return Err(LINUX_EBADF),
             }
         };
