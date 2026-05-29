@@ -554,6 +554,7 @@ where
 
         match outcome {
             DispatchOutcome::WaitOnFds { .. }
+            | DispatchOutcome::WaitOnFdsSelect { .. }
             | DispatchOutcome::WaitOnPollFds { .. }
             | DispatchOutcome::WaitOnProcExit { .. }
             | DispatchOutcome::WaitOnSignals { .. } => {
@@ -793,6 +794,34 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
                 }
                 // Could not pin a watched fd (host fd table exhausted). The
                 // errno is already Linux; surface it verbatim.
+                WaitResult::Errno(errno) => return Ok(DispatchOutcome::Errno { errno }),
+            },
+            DispatchOutcome::WaitOnFdsSelect {
+                fds,
+                timeout,
+                block_signals,
+                clear_on_timeout,
+            } => match waiter.wait(&fds, timeout, block_signals) {
+                // A fd became ready -> re-dispatch; the handler re-reads the
+                // (untouched) input sets and reports the now-ready fds.
+                WaitResult::Ready => continue,
+                // Timeout -> select returns 0 with the fd-sets zeroed. The
+                // handler left them intact (so Ready/EINTR are correct), so
+                // zero them here before completing.
+                WaitResult::TimedOut => {
+                    for (addr, len) in &clear_on_timeout {
+                        let zeros = vec![0u8; *len];
+                        let _ = memory.write_bytes(*addr, &zeros);
+                    }
+                    return Ok(DispatchOutcome::Returned { value: 0 });
+                }
+                // Signal interrupt -> EINTR; Linux leaves the fd-sets unmodified
+                // on EINTR, and the handler already did.
+                WaitResult::Interrupted => {
+                    return Ok(DispatchOutcome::Errno {
+                        errno: crate::linux_abi::LINUX_EINTR,
+                    });
+                }
                 WaitResult::Errno(errno) => return Ok(DispatchOutcome::Errno { errno }),
             },
             DispatchOutcome::WaitOnPollFds {
@@ -1127,6 +1156,36 @@ impl ThreadRuntimeState {
                     }
                     // Could not pin a watched fd (host fd table exhausted). The
                     // errno is already Linux; surface it verbatim.
+                    crate::io_wait::WaitResult::Errno(errno) => {
+                        break Ok(DispatchOutcome::Errno { errno });
+                    }
+                },
+                DispatchOutcome::WaitOnFdsSelect {
+                    fds,
+                    timeout,
+                    block_signals,
+                    clear_on_timeout,
+                } => match self.waiter.wait(&fds, timeout, block_signals) {
+                    // See the non-threaded loop above for the select fd-set
+                    // input==output rationale: leave the sets intact across the
+                    // wait; zero them only on timeout.
+                    crate::io_wait::WaitResult::Ready => continue,
+                    crate::io_wait::WaitResult::TimedOut => {
+                        for (addr, len) in &clear_on_timeout {
+                            let zeros = vec![0u8; *len];
+                            let _ = engine.write_bytes(*addr, &zeros);
+                        }
+                        break Ok(DispatchOutcome::Returned { value: 0 });
+                    }
+                    crate::io_wait::WaitResult::Interrupted => {
+                        if crate::fork_quiesce::is_quiescing() {
+                            self.release_and_park_vcpu_for_fork(engine)?;
+                            continue;
+                        }
+                        break Ok(DispatchOutcome::Errno {
+                            errno: crate::linux_abi::LINUX_EINTR,
+                        });
+                    }
                     crate::io_wait::WaitResult::Errno(errno) => {
                         break Ok(DispatchOutcome::Errno { errno });
                     }
@@ -1879,6 +1938,7 @@ fn run_vcpu_until_exit(
 
             match outcome {
                 DispatchOutcome::WaitOnFds { .. }
+                | DispatchOutcome::WaitOnFdsSelect { .. }
                 | DispatchOutcome::WaitOnPollFds { .. }
                 | DispatchOutcome::WaitOnProcExit { .. }
                 | DispatchOutcome::WaitOnSignals { .. } => {
