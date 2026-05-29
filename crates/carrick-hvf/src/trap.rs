@@ -1639,6 +1639,18 @@ impl HvfInner {
     fn run_until_syscall(&mut self) -> Result<Option<Aarch64SyscallFrame>, TrapError> {
         use applevisor::prelude::*;
 
+        // Lifecycle marker: the first entry here is the moment the guest first
+        // runs — i.e. INITIAL boot/setup is done. Fired once per process; since
+        // carrick forks via no-exec `libc::fork`, a forked child inherits the
+        // parent's already-completed Once and does NOT re-fire this — so it
+        // cleanly means "first boot", distinct from a fork (which rebuilds the
+        // child's HVF context + restores a snapshot WITHOUT reloading the image,
+        // bracketed by the separate fork__pre/fork__post probes). A trace splits
+        // a fresh run into boot (start→here) / guest (here→guest-exit) /
+        // teardown (guest-exit→process-exit); fork cost is fork__pre→fork__post.
+        static FIRST_RUN: std::sync::Once = std::sync::Once::new();
+        FIRST_RUN.call_once(|| crate::probes::lifecycle(crate::probes::phase::FIRST_VCPU_RUN));
+
         // Time the vCPU's guest execution: the wall time spent inside
         // hv_vcpu_run is the time this vCPU thread was on-CPU running guest
         // code (blocking guest syscalls trap OUT and wait in carrick host code,
