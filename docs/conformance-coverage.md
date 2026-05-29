@@ -186,6 +186,7 @@ underlying gap got fixed):
 | Invariant | Owned by | Stands in for (LTP) |
 |---|---|---|
 | access/faccessat/faccessat2 edges under guest-uid=0 (root bypasses rwx; F_OK/R_OK/W_OK/X_OK; AT_EACCESS) | ✅ `accessx` | access01–04, faccessat01/02, faccessat2_* |
+| **chmod setgid-clear: an unprivileged owner whose egid ≠ the file's group cannot set S_ISGID (chmod succeeds, bit stripped); fchmodat2 (nr 452) rejects an unknown flag bit with EINVAL (plain fchmodat nr 53 ignores the flags register — apt relies on it)** | ✅ `chmodsetgid` | chmod05, fchmodat02, fchmodat2_02 (fchmod04/05 fd-on-dir mode persistence + mkdir02/04 gid inheritance remain) |
 | mkdir/rmdir, nested dirs, readdir ordering + content, hard/sym/relative links, dir rename, unlink, getdents-on-cwd | ✅ `dirops` | mkdir01–09, rmdir01–03, readdir01/2, link01–08, symlink01–05, rename01–14, unlink01–08, getdents01/02 |
 | **`unlinkat(AT_FDCWD, "/dev/shm/<f>", 0)` removes a file created via the same bind-mounted path; both unlinkat and libc::unlink route through `vfs_mounts.resolve` (parallels openat) — the LTP `tst_checkpoint` setup_ipc unblocker** | ✅ `unlinkatbindmount` | (tst_test setup_ipc; ~10 SIGNALS-area tests) |
 | stat / lstat / fstat / access / readlink / getcwd-family | ✅ `fsmeta` | stat01–06, lstat01/02, fstat01–05, readlink01–04, getcwd01–04 |

@@ -208,6 +208,12 @@ pub trait FsBackend: Send + Sync {
         Ok(())
     }
 
+    /// Read the guest-visible (uid, gid) of `path`, or `None` if unknown.
+    /// Defaults to root (0,0) on backends that don't track ownership.
+    fn get_owner(&self, _path: &str) -> Option<(u32, u32)> {
+        None
+    }
+
     /// Set the access/modification times of `path`. Each component is
     /// `Some((sec, nsec))` to set an explicit time, or `None` to leave it
     /// unchanged (UTIME_OMIT). The caller is responsible for resolving
@@ -1305,6 +1311,18 @@ impl FsBackend for HostFsBackend {
             .unwrap_or(false);
         write_owner_xattr(&self.dir, rel, is_dir, uid, gid);
         Ok(())
+    }
+
+    fn get_owner(&self, path: &str) -> Option<(u32, u32)> {
+        let normalized = normalize(path)?;
+        let rel = Self::rel_path(&normalized)?;
+        let is_dir = self
+            .dir
+            .symlink_metadata(rel)
+            .map(|m| m.is_dir())
+            .unwrap_or(false);
+        let (uid, gid) = read_owner_xattr(&self.dir, rel, is_dir);
+        Some((uid.unwrap_or(0), gid.unwrap_or(0)))
     }
 
     fn set_times(
