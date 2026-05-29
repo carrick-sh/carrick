@@ -252,4 +252,5 @@ underlying gap got fixed):
 | Invariant | Owned by | Stands in for (LTP) |
 |---|---|---|
 | **`shmget` + `shmat` + `shmdt` + `shmctl(IPC_RMID/IPC_STAT/SHM_STAT/SHM_INFO)` round-trip; per-segment `shm_nattch` / `shm_ctime` / `shm_atime`; cross-process coherence after fork via host-file-backed `/tmp/carrick-shm/<key>` (inode = shmid)** | ✅ `sysvshm` | kill07 (MATCH), kill05 (advances past TBROK), shmctl01 (6/12 → bumped from 0/12), shmat01 (1/4 → bumped from 0/4), shmget/shmdt LTP families |
+| **`msgctl(IPC_STAT)` fills the ipc64_perm (key @0, mode @20) in the returned msqid64_ds — was leaving them zero (only the msg_* fields were translated); owner ids from the guest creds, key/mode/seq from the host stat** | ✅ `msgctlstat` | msgctl01 |
 | **`kill(2)` permission model across peer guest processes: root → any allowed; non-root cross-uid → EPERM; non-root same-uid → allowed. Cred propagation via per-process `/tmp/carrick-cred-<host_pid>` updated on every setuid/setreuid/setresuid** | ✅ `killuidperm` | kill05 (MATCH 1/1) |
