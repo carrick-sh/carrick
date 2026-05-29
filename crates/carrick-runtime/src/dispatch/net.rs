@@ -1321,6 +1321,15 @@ impl SyscallDispatcher {
 
         fn pselect6(this, cx, nfds: u64, readfds: GuestPtr, writefds: GuestPtr, exceptfds: GuestPtr, timeout: GuestPtr, sigmask: GuestPtr) {
 
+            // Linux rejects nfds < 0 with EINVAL BEFORE anything else. The guest
+            // passes nfds as a (sign-extended) int; -1 arrives as u64::MAX.
+            // Without this, pselect6(-1, NULL, NULL, NULL, NULL, mask) — LTP
+            // pselect02 case 2 — falls through to the empty-fd-set NULL-timeout
+            // path and blocks the test child forever (the tst_test watchdog then
+            // SIGALRM-kills it → TBROK). Validate first.
+            if (nfds as i64) < 0 {
+                return Ok(LINUX_EINVAL.into());
+            }
             let nfds = GuestLen::try_from_arg(nfds)?.0;
             let readfds_addr = readfds.0;
             let writefds_addr = writefds.0;
@@ -1369,6 +1378,13 @@ impl SyscallDispatcher {
                     Ok(timespec) => {
                         let sec = timespec.tv_sec;
                         let nsec = timespec.tv_nsec;
+                        // Linux rejects an invalid timespec with EINVAL (negative
+                        // seconds/nanoseconds or nsec out of [0, 1e9)) — LTP
+                        // pselect02 case 3. carrick previously clamped it to 0
+                        // (returned "timed out" instead of erroring).
+                        if sec < 0 || nsec < 0 || nsec >= 1_000_000_000 {
+                            return Ok(LINUX_EINVAL.into());
+                        }
                         let ms = sec.saturating_mul(1000).saturating_add(nsec / 1_000_000);
                         if ms <= 0 {
                             0
@@ -1378,6 +1394,10 @@ impl SyscallDispatcher {
                             ms as i32
                         }
                     }
+                    // A bad timeout pointer: leave the existing behavior (a guest
+                    // read of an unmapped VA already injects a fault upstream);
+                    // only the value-validation above is new. (faulty-pointer
+                    // EFAULT vs guest-SIGSEGV is select03's domain — left as-is.)
                     _ => 0,
                 }
             };
