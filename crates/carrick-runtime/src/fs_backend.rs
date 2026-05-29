@@ -254,6 +254,12 @@ pub trait FsBackend: Send + Sync {
         Err(crate::linux_abi::LINUX_ENOTSUP)
     }
 
+    /// Remove the `user.*` extended attribute `name` from `path`.
+    /// `Err(LINUX_ENODATA)` if the attribute is absent. Default: unsupported.
+    fn remove_xattr(&self, _path: &str, _name: &str) -> Result<(), i32> {
+        Err(crate::linux_abi::LINUX_ENOTSUP)
+    }
+
     /// Read the REAL on-disk stat for `path` (type + hard-link count +
     /// mode + size), the way a kernel `newfstatat`/`statx` would see it.
     ///
@@ -1509,6 +1515,30 @@ impl FsBackend for HostFsBackend {
             .map(|s| s.to_owned())
             .collect();
         Ok(names)
+    }
+
+    fn remove_xattr(&self, path: &str, name: &str) -> Result<(), i32> {
+        // Mirror get_xattr: a non-`user.*` or carrick-internal name has no
+        // guest-visible attribute to remove → ENODATA.
+        if !name.starts_with("user.") || is_internal_carrick_xattr(name) {
+            return Err(crate::linux_abi::LINUX_ENODATA);
+        }
+        let host_fd = self
+            .open_raw_fd(path, true, false, false)
+            .ok_or(crate::linux_abi::LINUX_ENODATA)?;
+        let cname = match std::ffi::CString::new(name) {
+            Ok(c) => c,
+            Err(_) => {
+                unsafe { libc::close(host_fd) };
+                return Err(crate::linux_abi::LINUX_EINVAL);
+            }
+        };
+        // macOS fremovexattr; ENOATTR (absent attribute) maps to Linux ENODATA
+        // via host_syscall_errno (commit d9b1822).
+        let rc = unsafe { libc::fremovexattr(host_fd, cname.as_ptr(), 0) };
+        let err = rc.host_syscall_errno().map(|_| ());
+        unsafe { libc::close(host_fd) };
+        err
     }
 
     fn real_stat(&self, path: &str, follow: bool) -> Option<RealStat> {

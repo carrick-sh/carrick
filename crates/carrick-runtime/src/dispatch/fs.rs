@@ -2076,10 +2076,27 @@ impl SyscallDispatcher {
             }
 
             let lock_operation = operation & !LINUX_LOCK_NB;
-            Ok(match lock_operation {
-                LINUX_LOCK_SH | LINUX_LOCK_EX | LINUX_LOCK_UN => DispatchOutcome::Returned { value: 0 },
-                _ => DispatchOutcome::errno(LINUX_EINVAL),
-            })
+            if !matches!(
+                lock_operation,
+                LINUX_LOCK_SH | LINUX_LOCK_EX | LINUX_LOCK_UN
+            ) {
+                return Ok(LINUX_EINVAL.into());
+            }
+            // Host-backed fd: forward to the macOS kernel's flock(2) so that
+            // cross-process lock conflicts are real — a forked guest shares the
+            // same host fd, so the parent's lock blocks the child's conflicting
+            // LOCK_NB attempt (flock04/06). macOS LOCK_SH/EX/UN/NB are
+            // numerically identical to Linux's, so `operation` passes straight
+            // through; EWOULDBLOCK maps to Linux EAGAIN via host_syscall_errno.
+            // A non-host fd (in-memory backend) keeps the single-tenant no-op.
+            if let Some(host_fd) = this.regular_host_file_fd(fd.0) {
+                let rc = unsafe { libc::flock(host_fd, operation as i32) };
+                return Ok(match rc.host_syscall_errno() {
+                    Ok(_) => DispatchOutcome::Returned { value: 0 },
+                    Err(errno) => DispatchOutcome::errno(errno),
+                });
+            }
+            Ok(DispatchOutcome::Returned { value: 0 })
 
         }
 
@@ -3543,9 +3560,16 @@ impl SyscallDispatcher {
 
         }
 
-        fn sys_xattr_unsupported(this, cx) {
+        fn sys_removexattr_path(this, cx, path: GuestPtr, name: GuestPtr, follow: u64) {
 
-            Ok(this.xattr_unsupported())
+            let _ = follow;
+            this.removexattr(cx.memory, XattrTarget::Path(path), name)
+
+        }
+
+        fn sys_removexattr_fd(this, cx, fd: Fd, name: GuestPtr) {
+
+            this.removexattr(cx.memory, XattrTarget::Fd(fd), name)
 
         }
 
