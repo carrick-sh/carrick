@@ -1896,12 +1896,24 @@ impl SyscallDispatcher {
                         }
                         return Ok(LINUX_EBADF.into());
                     };
-                    let next_flags = arg & !LINUX_O_CLOEXEC;
+                    // Linux F_SETFL changes ONLY the mutable file-status flags;
+                    // it cannot change the access mode (O_RDONLY/WRONLY/RDWR) and
+                    // ignores creation-only bits (O_CREAT/O_EXCL/O_TRUNC) and
+                    // O_CLOEXEC. Preserve the description's access mode and take
+                    // only the mutable status bits from `arg`, so a later F_GETFL
+                    // reports the Linux-correct combination instead of whatever
+                    // junk the guest passed. (audit M4; probe fsetfl)
+                    // O_APPEND + O_NONBLOCK are the mutable status bits a guest
+                    // realistically toggles via F_SETFL (O_DIRECT/O_NOATIME/
+                    // O_ASYNC have no carrick const yet and aren't exercised).
+                    const LINUX_F_SETFL_MUTABLE: u64 = LINUX_O_APPEND | LINUX_O_NONBLOCK;
+                    let open = open_file.description.read();
+                    let next_flags =
+                        (open.status_flags() & LINUX_O_ACCMODE) | (arg & LINUX_F_SETFL_MUTABLE);
                     // Propagate O_NONBLOCK to the underlying host fd when one
                     // exists. Without this, our libc::read still blocks even
                     // after the guest set O_NONBLOCK — apt's http method
                     // depends on this for the pselect6 wait pattern.
-                    let open = open_file.description.read();
                     if let Some(host_fd) = match &*open {
                         OpenDescription::HostPipe { host_fd, .. }
                         | OpenDescription::HostSocket { host_fd, .. } => Some(*host_fd),
