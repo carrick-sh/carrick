@@ -563,7 +563,12 @@ impl SyscallDispatcher {
                             host_fd,
                             metadata,
                             base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
-                            writable: true,
+                            // A newly-created file's GUEST writability is its
+                            // access mode, NOT the O_CREAT flag: O_RDONLY|O_CREAT
+                            // creates the file but a later write/ftruncate on the
+                            // fd is EINVAL (ftruncate03 read_fd). The host fd is
+                            // still opened RW above so creation/overlay works.
+                            writable: writable_request,
                         },
                         Some(HostFdRef::new(host_fd)),
                     )
@@ -586,7 +591,9 @@ impl SyscallDispatcher {
                             contents: Vec::new(),
                             offset: 0,
                             base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
-                            writable: writable_request || want_create,
+                            // Guest writability follows the access mode, not
+                            // O_CREAT (O_RDONLY|O_CREAT → read-only fd).
+                            writable: writable_request,
                         },
                         None,
                     )
@@ -2194,7 +2201,10 @@ impl SyscallDispatcher {
                         ..
                     } => {
                         if !*writable {
-                            return Ok(LINUX_EBADF.into());
+                            // RO fd is a valid fd opened the wrong way → EINVAL,
+                            // not EBADF (ftruncate03). EBADF is for an invalid fd
+                            // (handled by open_file→None above).
+                            return Ok(LINUX_EINVAL.into());
                         }
                         if length as u64 > crate::vfs::MAX_IN_MEMORY_FILE_SIZE {
                             return Ok(LINUX_EFBIG.into());
@@ -2216,7 +2226,8 @@ impl SyscallDispatcher {
                         host_fd, writable, ..
                     } => {
                         if !*writable {
-                            return Ok(LINUX_EBADF.into());
+                            // RO fd → EINVAL (ftruncate03), not EBADF.
+                            return Ok(LINUX_EINVAL.into());
                         }
                         // Real fd: ftruncate the kernel file directly (the
                         // change is visible across fork).
