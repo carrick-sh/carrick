@@ -35,7 +35,18 @@ static CONFORMANCE_LOCK: Mutex<()> = Mutex::new(());
 /// stays green), but if a known-gap probe unexpectedly PASSES, the test
 /// FAILS so we remove it from this list — that's the signal the gap was
 /// fixed. Each entry must cite the gap.
-const KNOWN_PROBE_GAPS: &[&str] = &[];
+const KNOWN_PROBE_GAPS: &[&str] = &[
+    // Audit remediation program (docs/superpowers/plans/2026-05-29-audit-remediation-program.md).
+    // Each probe encodes a confirmed, dynamically-validated finding whose fix is
+    // scheduled for the cited milestone; removed from this list when the fix lands
+    // (the "UNEXPECTED PASS" guard fails the suite if we forget).
+    "fsetfl",       // M4: F_SETFL clobbers access mode + stores creation bits (fs.rs:1899)
+    "rosharedbus",  // M1: write thru RO MAP_SHARED -> host SIGBUS (write_guest_bytes perms gap)
+    "mapfixed",     // M5: MAP_FIXED|MAP_PRIVATE over shared aperture must remap private
+    "forkaltstack", // M2: sigaltstack not inherited across fork (per-tid altstack)
+    "pselecteintr", // M3: select()/pselect6 blocks uninterruptibly (no EINTR)
+    "forkfpregs",   // M2: SIMD/FP regs zeroed across fork (VcpuSnapshot lacks V/FPSR/FPCR)
+];
 use std::time::{Duration, Instant};
 
 /// Per-case wall-clock deadline. A single wedged guest process (e.g. a

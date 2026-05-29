@@ -1,0 +1,47 @@
+rules:
+  # The EL0-fault diagnostic indexed GPR_TABLE ([Reg; 31]) with a guest-derived
+  # Rn that can be 31 (SP/XZR), panicking the host on any SP-relative faulting
+  # load. Direct indexing of GPR_TABLE is forbidden — use the checked accessor.
+  # (audit M0; fixture sp_fault)
+  - id: carrick-gpr-table-checked-index
+    languages: [rust]
+    severity: ERROR
+    message: |
+      Direct GPR_TABLE[..] indexing can panic: GPR_TABLE is [Reg; 31] (X0..X30)
+      but a faulting instruction's Rn field can be 31 (SP/XZR). Use
+      `GPR_TABLE.get(rn).and_then(|r| self.vcpu.get_reg(*r).ok()).unwrap_or(0)`.
+    patterns:
+      - pattern: GPR_TABLE[$I]
+    paths:
+      include:
+        - "/crates/**/*.rs"
+
+  # waitid (and friends) returned `io::Error::last_os_error().raw_os_error()`
+  # straight into the guest, leaking a Darwin errno where a Linux errno is
+  # required. Route host errnos through the central translation helper
+  # (HostSyscallError::last().linux_errno() / macos_to_linux_errno).
+  # (audit P1 waitid-errno; tighten in M4)
+  - id: carrick-host-errno-must-translate
+    languages: [rust]
+    severity: WARNING
+    message: |
+      Raw host errno flowing into a guest-visible errno. Darwin errno values
+      differ from Linux for some codes; translate via the central host-errno
+      path instead of passing raw_os_error()/*libc::__error() through.
+    patterns:
+      - pattern-either:
+          - pattern: DispatchOutcome::errno($X.raw_os_error().unwrap_or($D))
+          - pattern: DispatchOutcome::errno($X.raw_os_error())
+          - pattern: DispatchOutcome::errno(*libc::__error())
+    paths:
+      include:
+        - "/crates/**/*.rs"
+      exclude:
+        - "**/tests/**"
+
+# NOTE: the unbounded-guest-length allocation class (vec![0u8; guest_count]) is
+# NOT guarded by a Semgrep rule — a pattern broad enough to catch it also flags
+# every already-clamped/validated allocation (too noisy to be a useful gate). It
+# is guarded instead by: the crate::dispatch::MAX_RW_COUNT helper, the `bigread`
+# conformance probe, and the audit's explicit site inventory (recvmsg, io_uring,
+# preadv, ppoll capacity) clamped in M3/M4.
