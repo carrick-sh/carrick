@@ -64,6 +64,12 @@ pub enum RootFsEntryKind {
     /// Character device (e.g. the `/dev/*` and `/dev/pts/N` nodes served by the
     /// VFS mounts). Reports `S_IFCHR` from stat and `DT_CHR` from getdents.
     CharDevice,
+    /// Named pipe (FIFO), created via `mknod`/`mkfifo`. On `--fs host` it is a
+    /// real `mkfifoat(2)` node on the cap-std scratch; stat reports `S_IFIFO`
+    /// and getdents `DT_FIFO`. Opened as a non-blocking `HostPipe` so a guest
+    /// open/read/write of a writer-less FIFO parks on kqueue instead of wedging
+    /// the dispatcher (see `open_at_path`).
+    Fifo,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

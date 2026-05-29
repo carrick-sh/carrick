@@ -232,9 +232,13 @@ impl RootFsVfs {
         };
         match rootfs_metadata {
             Some(metadata) => match metadata.kind {
-                // CharDevice never occurs in the / rootfs (only via /dev mounts);
-                // treat like a regular file for the unreachable case.
-                RootFsEntryKind::File | RootFsEntryKind::CharDevice => {
+                // CharDevice/Fifo never occur in the / rootfs (only via /dev
+                // mounts or the overlay, where guest FIFOs are intercepted
+                // before open_for_dispatch); treat like a regular file for the
+                // unreachable case.
+                RootFsEntryKind::File
+                | RootFsEntryKind::CharDevice
+                | RootFsEntryKind::Fifo => {
                     if want_create && want_excl {
                         return Err(LINUX_EEXIST);
                     }
@@ -335,7 +339,8 @@ impl RootFsVfs {
                 Some(md) => match md.kind {
                     RootFsEntryKind::File
                     | RootFsEntryKind::Symlink
-                    | RootFsEntryKind::CharDevice => {
+                    | RootFsEntryKind::CharDevice
+                    | RootFsEntryKind::Fifo => {
                         // INVARIANT: this arm is reached only via the
                         // `self.rootfs.as_ref().and_then(..symlink_metadata..)`
                         // match above, which already proved rootfs is Some.
@@ -399,7 +404,10 @@ impl RootFsVfs {
         // (rootfs-only entry). Materialise the destination, then
         // tombstone the rootfs source.
         match src_kind {
-            RootFsEntryKind::File | RootFsEntryKind::Symlink | RootFsEntryKind::CharDevice => {
+            RootFsEntryKind::File
+            | RootFsEntryKind::Symlink
+            | RootFsEntryKind::CharDevice
+            | RootFsEntryKind::Fifo => {
                 self.overlay
                     .set_file_contents(to, src_contents.unwrap_or_default())
                     .map_err(|_| LINUX_EINVAL)?;
@@ -473,6 +481,22 @@ impl Vfs for RootFsVfs {
             // 0o111). Fall back to defaults only if the backend can't
             // produce metadata for an entry it just reported.
             let backend_md = self.overlay.metadata(path);
+            // A FIFO is reported by the backend as a (present, empty) File
+            // entry — opening it to read bytes would block — but its true kind
+            // lives in `metadata`. Surface S_IFIFO before the generic File arm.
+            if let Some(md) = &backend_md
+                && md.kind == RootFsEntryKind::Fifo
+            {
+                return Ok(Metadata {
+                    kind: EntryKind::Fifo,
+                    mode: md.mode,
+                    size: 0,
+                    uid: 0,
+                    gid: 0,
+                    mtime_secs: 0,
+                    mtime_nanos: 0,
+                });
+            }
             match entry {
                 OverlayEntry::Deleted => return Err(LINUX_ENOENT),
                 OverlayEntry::Dir => {
@@ -507,6 +531,7 @@ impl Vfs for RootFsVfs {
                 RootFsEntryKind::Directory => EntryKind::Directory,
                 RootFsEntryKind::Symlink => EntryKind::Symlink,
                 RootFsEntryKind::CharDevice => EntryKind::CharDevice,
+                RootFsEntryKind::Fifo => EntryKind::Fifo,
             },
             mode: md.mode,
             size: md.size as u64,
@@ -607,6 +632,7 @@ impl Vfs for RootFsVfs {
                         RootFsEntryKind::Directory => EntryKind::Directory,
                         RootFsEntryKind::Symlink => EntryKind::Symlink,
                         RootFsEntryKind::CharDevice => EntryKind::CharDevice,
+                RootFsEntryKind::Fifo => EntryKind::Fifo,
                     },
                 })
                 .collect()),

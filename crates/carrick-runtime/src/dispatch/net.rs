@@ -1566,29 +1566,30 @@ impl SyscallDispatcher {
             for ((fd, req_mask), p) in owners.iter().zip(pollfds.iter()) {
                 let fd_usize = *fd as usize;
                 let revs = p.revents;
-                let mut fired = false;
+                // select(2) returns the TOTAL number of ready bits across all
+                // three sets — an fd that is ready for both read AND write
+                // (e.g. an O_RDWR FIFO/socket placed in readfds and writefds,
+                // LTP select01) counts as 2, not 1. Count each set-bit, not the
+                // fd once.
                 if (req_mask & 0x01) != 0
                     && (revs & (libc::POLLIN | libc::POLLHUP)) != 0
                     && let Some(ref mut set) = new_read
                 {
                     fd_set_set(set, fd_usize);
-                    fired = true;
+                    ready += 1;
                 }
                 if (req_mask & 0x02) != 0
                     && (revs & libc::POLLOUT) != 0
                     && let Some(ref mut set) = new_write
                 {
                     fd_set_set(set, fd_usize);
-                    fired = true;
+                    ready += 1;
                 }
                 if (req_mask & 0x04) != 0
                     && (revs & (libc::POLLPRI | libc::POLLERR)) != 0
                     && let Some(ref mut set) = new_except
                 {
                     fd_set_set(set, fd_usize);
-                    fired = true;
-                }
-                if fired {
                     ready += 1;
                 }
             }
