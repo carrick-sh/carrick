@@ -76,10 +76,7 @@ fn ensure_registry<'a>(
         Option<HashMap<i32, std::sync::Arc<PosixTimerSlot>>>,
     >,
 ) -> &'a mut HashMap<i32, std::sync::Arc<PosixTimerSlot>> {
-    if guard.is_none() {
-        **guard = Some(HashMap::new());
-    }
-    guard.as_mut().expect("registry just initialised")
+    guard.get_or_insert_with(HashMap::new)
 }
 
 /// Monotonic-ns reference. Each arm samples `Instant::now().duration_since(*BASE_INSTANT)`

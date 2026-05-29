@@ -1152,13 +1152,34 @@ impl FsBackend for HostFsBackend {
         // mknod(2) does NOT create intermediate directories (unlike the
         // overlay's create_file). A missing parent must surface as ENOENT —
         // mkfifoat below reports it; the dispatcher maps the failure.
-        let c_rel = std::ffi::CString::new(rel.to_str().ok_or(BackendError::Invalid)?)
+        //
+        // Operate on a CONFINED parent handle + slash-free leaf so the raw
+        // *at primitives cannot resolve any symlink against the HOST root and
+        // cannot escape the sandbox. cap_std::fs::Dir::open_dir follows only
+        // in-sandbox symlink components and returns Err on an absolute or
+        // net-`..` escape. The fchmodat below is still PATH-BASED (it never
+        // opens the FIFO node), preserving the no-open property below.
+        let parent_rel = rel.parent();
+        let file_name = rel.file_name().ok_or(BackendError::Invalid)?;
+        let c_name = std::ffi::CString::new(file_name.to_str().ok_or(BackendError::Invalid)?)
             .map_err(|_| BackendError::Invalid)?;
-        let dirfd = self.dir.as_raw_fd();
+        // For a non-empty parent, open it through cap-std (confined); for a
+        // top-level FIFO (empty parent), the sandbox root self.dir is the parent.
+        let parent_dir = match parent_rel {
+            Some(p) if !p.as_os_str().is_empty() => {
+                Some(self.dir.open_dir(p).map_err(|_| BackendError::Io)?)
+            }
+            _ => None,
+        };
+        let dirfd = match &parent_dir {
+            Some(pdir) => pdir.as_raw_fd(),
+            None => self.dir.as_raw_fd(),
+        };
         // Real named pipe on the cap-std scratch (fork-shareable, stats as
         // S_IFIFO). mkfifoat applies the host process umask; override it below
         // with the exact guest-requested mode so stat reports it faithfully.
-        let rc = unsafe { libc::mkfifoat(dirfd, c_rel.as_ptr(), (mode & 0o7777) as libc::mode_t) };
+        let rc =
+            unsafe { libc::mkfifoat(dirfd, c_name.as_ptr(), (mode & 0o7777) as libc::mode_t) };
         if rc != 0 {
             return Err(BackendError::Io);
         }
@@ -1169,7 +1190,7 @@ impl FsBackend for HostFsBackend {
         // FIFOs because reading it back would also have to open the node;
         // `symlink_metadata` reads the on-disk mode without opening it.
         unsafe {
-            libc::fchmodat(dirfd, c_rel.as_ptr(), (mode & 0o7777) as libc::mode_t, 0);
+            libc::fchmodat(dirfd, c_name.as_ptr(), (mode & 0o7777) as libc::mode_t, 0);
         }
         Ok(())
     }
@@ -1418,12 +1439,25 @@ impl FsBackend for HostFsBackend {
         // A FIFO's mode lives on the real node (not an xattr); set it via
         // PATH-BASED fchmodat — neither set_permissions nor the xattr write may
         // open the node, since an O_RDONLY open of a writer-less FIFO blocks.
+        // Operate on a CONFINED parent handle + slash-free leaf so the raw
+        // fchmodat cannot resolve a symlink component against the HOST root and
+        // cannot escape the sandbox (same guard as create_fifo). fchmodat stays
+        // PATH-BASED, so it never opens the FIFO node.
         if let Ok(m) = &meta
             && m.mode() & (libc::S_IFMT as u32) == libc::S_IFIFO as u32
-            && let Ok(c_rel) = std::ffi::CString::new(rel.to_str().unwrap_or(""))
+            && let Some(file_name) = rel.file_name()
+            && let Ok(c_name) = std::ffi::CString::new(file_name.to_str().unwrap_or(""))
         {
+            let parent_dir = match rel.parent() {
+                Some(p) if !p.as_os_str().is_empty() => self.dir.open_dir(p).ok(),
+                _ => None,
+            };
+            let dirfd = match &parent_dir {
+                Some(pdir) => pdir.as_raw_fd(),
+                None => self.dir.as_raw_fd(),
+            };
             unsafe {
-                libc::fchmodat(self.dir.as_raw_fd(), c_rel.as_ptr(), mode as libc::mode_t, 0);
+                libc::fchmodat(dirfd, c_name.as_ptr(), mode as libc::mode_t, 0);
             }
             return Ok(());
         }

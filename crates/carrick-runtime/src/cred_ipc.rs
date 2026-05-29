@@ -12,6 +12,7 @@
 //! decision (matching today's pre-fix behaviour).
 
 use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -38,7 +39,19 @@ pub fn publish_self(euid: u32) {
     // not yet committed) or the new ones, never a partial.
     let tmp = path.with_extension("tmp");
     let bytes = euid.to_le_bytes();
-    if let Ok(mut f) = std::fs::File::create(&tmp) {
+    // Create the tmp file 0600 (owner-only) with O_NOFOLLOW so a pre-planted
+    // symlink at <tmp> makes the open fail (ELOOP) rather than following it.
+    // We own the host uid in /tmp and the name is per-pid, so this is
+    // best-effort hardening; the value written is our own euid regardless,
+    // then atomically renamed into place.
+    let open = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&tmp);
+    if let Ok(mut f) = open {
         let _ = f.write_all(&bytes);
         let _ = f.sync_all();
         let _ = std::fs::rename(&tmp, &path);
@@ -46,9 +59,34 @@ pub fn publish_self(euid: u32) {
 }
 
 /// Read `pid`'s published euid. Returns `None` if the file doesn't exist
-/// (peer not running carrick / not yet published) or can't be read.
+/// (peer not running carrick / not yet published), can't be read, or fails
+/// the owner / permission / staleness guards below. Falling to `None` is
+/// always safe: the kill(2) caller then takes the conservative ALLOW path,
+/// so kill conformance is byte-for-byte unchanged.
 pub fn read_target(pid: i32) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt as _;
     let path = cred_path(pid);
+    let meta = std::fs::metadata(&path).ok()?;
+    // Owner guard: only trust a cred file written by THIS host process's uid.
+    // Guest set*id is virtualized, so legit files are always our uid.
+    let our_uid = unsafe { libc::getuid() };
+    if meta.uid() != our_uid {
+        return None;
+    }
+    // Reject a group/other-writable (tampered/forged) cred file.
+    if meta.mode() & 0o022 != 0 {
+        return None;
+    }
+    // Staleness guard: the named host pid must still be alive. kill(pid,0)
+    // returns 0 if alive, -1/ESRCH if dead, -1/EPERM if alive-but-foreign.
+    // Treat ONLY ESRCH as dead (ignore the file). A positive target pid only
+    // reaches here (read_target is called with a positive target).
+    if unsafe { libc::kill(pid, 0) } == -1 {
+        let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        if e == libc::ESRCH {
+            return None;
+        }
+    }
     let bytes = std::fs::read(&path).ok()?;
     if bytes.len() < 4 {
         return None;

@@ -110,7 +110,11 @@ static THREAD_WAITERS: LazyLock<Mutex<HashMap<i32, ThreadWakeRegistration>>> =
 /// passthrough (carrick reaps guest children with real host `waitpid`/`wait4`).
 /// `NOTE_EXIT` is purely a readiness notification: it does NOT consume the
 /// child's exit status, so the actual reap stays with the guest's `wait4`.
-static CHILD_WATCHES: LazyLock<Mutex<HashMap<i32, i32>>> =
+/// Value is `(parent_tid, exit_signal)`: the guest tid to wake on the child's
+/// exit, and the signal the guest asked for (clone exit_signal / clone3
+/// `exit_signal`). `0` means "no exit signal" (e.g. `clone(0)`) — the pump
+/// publishes nothing in that case.
+static CHILD_WATCHES: LazyLock<Mutex<HashMap<i32, (i32, i32)>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 struct ThreadWakeRegistration {
@@ -193,15 +197,25 @@ pub fn publish_pending_for(tid: i32, signum: i32) {
 /// next learns the pid (we re-arm on every register); a missing watch only
 /// delays SIGCHLD, never breaks `wait4`. The `EV_ONESHOT` watch (see
 /// `Kevent::proc_exit`) auto-removes once it fires.
-pub fn register_child_exit_watch(child_pid: i32, parent_tid: i32) {
+pub fn register_child_exit_watch(child_pid: i32, parent_tid: i32, exit_signal: i32) {
     if child_pid <= 0 {
         return;
     }
+    // Sanitize the requested exit signal: 0 is the "no exit signal" sentinel
+    // (preserved as-is); any value outside the valid signal range falls back
+    // to SIGCHLD so a malformed signum still produces SIGCHLD-class behavior.
+    let exit_signal = if exit_signal == 0 {
+        0
+    } else if (1..=64).contains(&exit_signal) {
+        exit_signal
+    } else {
+        crate::linux_abi::LINUX_SIGCHLD
+    };
     #[allow(clippy::expect_used)]
     CHILD_WATCHES
         .lock()
         .expect("CHILD_WATCHES poisoned")
-        .insert(child_pid, parent_tid);
+        .insert(child_pid, (parent_tid, exit_signal));
     let kq = PUMP_KQUEUE.load(Ordering::SeqCst);
     if kq >= 0 {
         // ENOENT (the child already exited and was reaped before we armed) is
@@ -240,10 +254,12 @@ pub fn rearm_child_watches(kq: i32) {
     }
 }
 
-/// Resolve a child pid whose `NOTE_EXIT` fired to the guest tid that should
-/// receive SIGCHLD, removing the entry (the watch is one-shot). `None` if the
-/// pid was not a tracked guest child. Called only from the signal pump.
-pub fn take_child_exit_parent(child_pid: i32) -> Option<i32> {
+/// Resolve a child pid whose `NOTE_EXIT` fired to the `(parent_tid,
+/// exit_signal)` pair: the guest tid that should receive the exit signal and
+/// the signal the guest requested at clone time, removing the entry (the watch
+/// is one-shot). `None` if the pid was not a tracked guest child. Called only
+/// from the signal pump.
+pub fn take_child_exit_parent(child_pid: i32) -> Option<(i32, i32)> {
     #[allow(clippy::expect_used)]
     CHILD_WATCHES
         .lock()
@@ -930,9 +946,12 @@ mod tests {
         PUMP_KQUEUE.store(-1, Ordering::SeqCst);
         let child_pid = 0x7FFF_0001;
         let parent_tid = 0x7FFF_0002;
-        register_child_exit_watch(child_pid, parent_tid);
+        register_child_exit_watch(child_pid, parent_tid, crate::linux_abi::LINUX_SIGCHLD);
         assert!(is_tracked_child(child_pid));
-        assert_eq!(take_child_exit_parent(child_pid), Some(parent_tid));
+        assert_eq!(
+            take_child_exit_parent(child_pid),
+            Some((parent_tid, crate::linux_abi::LINUX_SIGCHLD))
+        );
         // One-shot: a second resolve (a duplicate event) yields nothing.
         assert!(!is_tracked_child(child_pid));
         assert_eq!(take_child_exit_parent(child_pid), None);
@@ -941,8 +960,8 @@ mod tests {
     #[test]
     fn child_exit_watch_ignores_invalid_pid() {
         let _g = TEST_LOCK.lock().unwrap();
-        register_child_exit_watch(0, 1234);
-        register_child_exit_watch(-1, 1234);
+        register_child_exit_watch(0, 1234, crate::linux_abi::LINUX_SIGCHLD);
+        register_child_exit_watch(-1, 1234, crate::linux_abi::LINUX_SIGCHLD);
         assert!(!is_tracked_child(0));
         assert!(!is_tracked_child(-1));
     }
@@ -951,7 +970,7 @@ mod tests {
     fn reinit_after_fork_clears_child_watches() {
         let _g = TEST_LOCK.lock().unwrap();
         let child_pid = 0x7FFE_0001;
-        register_child_exit_watch(child_pid, 0x7FFE_0002);
+        register_child_exit_watch(child_pid, 0x7FFE_0002, crate::linux_abi::LINUX_SIGCHLD);
         assert!(is_tracked_child(child_pid));
         reinit_after_fork();
         assert!(

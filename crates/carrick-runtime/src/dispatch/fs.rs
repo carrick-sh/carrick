@@ -1299,7 +1299,60 @@ impl SyscallDispatcher {
         // ENOENT (or leniently resolved through it). Synthesize ENOTDIR here so
         // `stat("/etc/passwd/foo")` & co match Linux (lstat02/stat03/…).
         self.validate_intermediate_dirs(&abs)?;
-        Ok(abs)
+        // Collapse intermediate (non-final) directory symlinks so the returned
+        // path is symlink-free in its parent chain. Downstream consumers
+        // (real_stat via cap-std, layered_metadata, canonicalize_following's
+        // final-component follow) cannot traverse an intermediate symlink whose
+        // target is absolute (cap-std treats an absolute target as a sandbox
+        // escape), so `stat("/link/f")` where `/link -> /realdir` would wrongly
+        // return ENOENT. Rewriting to `/realdir/f` matches Linux path
+        // resolution. The final component is intentionally NOT followed here —
+        // each caller decides lstat-vs-stat semantics (AT_SYMLINK_NOFOLLOW).
+        Ok(self.resolve_intermediate_symlinks(&abs))
+    }
+
+    /// Rewrite `abs` so every intermediate (non-final) directory-symlink
+    /// component is replaced by its resolved target, leaving the final
+    /// component untouched. Best-effort: a component that doesn't resolve to a
+    /// directory (dangling/non-dir symlink, ELOOP) leaves the path from that
+    /// point unchanged, so the downstream lookup surfaces the correct
+    /// ENOENT/ENOTDIR. Bounded by `canonicalize_following`'s own ELOOP guard.
+    fn resolve_intermediate_symlinks(&self, abs: &str) -> String {
+        let comps: Vec<&str> = abs.split('/').filter(|c| !c.is_empty()).collect();
+        if comps.len() < 2 {
+            return abs.to_owned();
+        }
+        let mut base = String::new();
+        for comp in &comps[..comps.len() - 1] {
+            let mut candidate = base.clone();
+            candidate.push('/');
+            candidate.push_str(comp);
+            match self.layered_lstat(&candidate) {
+                Ok(md) if md.kind == RootFsEntryKind::Symlink => {
+                    match self.canonicalize_following(&candidate) {
+                        Ok(target) if self.path_is_directory(&target) => {
+                            base = target.trim_end_matches('/').to_owned();
+                        }
+                        // Unresolvable/non-dir symlink intermediate: stop
+                        // rewriting; leave the rest for the downstream lookup.
+                        _ => return abs.to_owned(),
+                    }
+                }
+                // Plain directory (or not-yet-statable): keep walking.
+                _ => {
+                    base = candidate;
+                }
+            }
+        }
+        if let Some(name) = comps.last() {
+            base.push('/');
+            base.push_str(name);
+        }
+        if base.is_empty() {
+            "/".to_owned()
+        } else {
+            base
+        }
     }
 
     /// Walk the intermediate (non-final) components of an already-joined
@@ -1318,9 +1371,22 @@ impl SyscallDispatcher {
         for comp in &comps[..comps.len() - 1] {
             prefix.push('/');
             prefix.push_str(comp);
-            match self.layered_metadata(&prefix) {
+            match self.layered_lstat(&prefix) {
                 Ok(md) => match md.kind {
-                    RootFsEntryKind::Directory | RootFsEntryKind::Symlink => {}
+                    RootFsEntryKind::Directory => {}
+                    // A symlink intermediate is traversable IFF it resolves to a
+                    // directory (Linux follows it). Resolve through the layered
+                    // VFS — this handles an absolute in-rootfs target (e.g.
+                    // `/tmp/sm_link -> /tmp/sm_real`) that a single-backend
+                    // cap-std follow can't (it treats absolute as a sandbox
+                    // escape). A symlink to a non-directory (or a dangling one)
+                    // is ENOTDIR, matching Linux.
+                    RootFsEntryKind::Symlink => {
+                        match self.canonicalize_following(&prefix) {
+                            Ok(target) if self.path_is_directory(&target) => {}
+                            _ => return Err(LINUX_ENOTDIR),
+                        }
+                    }
                     // A regular file / char device can't be a path component.
                     _ => return Err(LINUX_ENOTDIR),
                 },
@@ -2168,6 +2234,22 @@ impl SyscallDispatcher {
                         // SAFETY: host_fd is our live pty fd. Best-effort.
                         unsafe { libc::ioctl(host_fd, libc::TIOCSCTTY as libc::c_ulong, 0i32) };
                         DispatchOutcome::Returned { value: 0 }
+                    }
+                    LINUX_FIONREAD => {
+                        // A BSD pts supports FIONREAD/TIOCINQ on its input queue;
+                        // forward to the live macOS pty fd. Without this arm a pty
+                        // fd hits the catch-all below and returns ENOTTY, diverging
+                        // from Linux (which reports the pending byte count).
+                        let mut n: libc::c_int = 0;
+                        // SAFETY: host_fd is our live pty fd; &mut n is valid stack storage.
+                        let rc = unsafe { libc::ioctl(host_fd, libc::FIONREAD, &mut n) };
+                        if rc < 0 {
+                            DispatchOutcome::errno(crate::dispatch::macos_to_linux_errno(unsafe {
+                                *libc::__error()
+                            }))
+                        } else {
+                            write_packed(&mut *cx.memory, arg, &(n as i32).to_le_bytes())
+                        }
                     }
                     _ => {
                         cx.reporter
@@ -4534,13 +4616,34 @@ impl SyscallDispatcher {
             // parent is ENOENT (LTP mknod06). An intermediate path component
             // that is a non-directory already surfaced as ENOTDIR from
             // resolve_at_path above. Mirrors the open(O_CREAT) parent check.
+            //
+            // Follow a contained symlink-to-dir parent leaf exactly like Linux:
+            // `mkfifo /link/f` where `/link -> /realdir` must land the node at
+            // /realdir/f. We resolve the PARENT through canonicalize_following
+            // (LINUX_ELOOP-bounded; the one-level leaf-of-parent case is what
+            // the probe and LTP require) and rebuild the materialisation path
+            // from the resolved parent + the final component. This (a) makes
+            // the path_is_directory check see the followed directory instead of
+            // misclassifying the symlink as a File → spurious ENOENT, and (b)
+            // hands the backend a symlink-FREE path so its cap-std confinement
+            // never has to follow an absolute in-rootfs symlink (which cap-std
+            // refuses as a sandbox escape).
+            let mut materialize_path = resolved.clone();
             if let Some(parent) = Path::new(&resolved).parent() {
                 let parent_str = display_rootfs_path(parent);
-                if !parent_str.is_empty()
-                    && parent_str != "/"
-                    && !this.path_is_directory(&parent_str)
-                {
-                    return Ok(LINUX_ENOENT.into());
+                if !parent_str.is_empty() && parent_str != "/" {
+                    let resolved_parent = this
+                        .canonicalize_following(&parent_str)
+                        .unwrap_or_else(|_| parent_str.clone());
+                    if !this.path_is_directory(&resolved_parent) {
+                        return Ok(LINUX_ENOENT.into());
+                    }
+                    if resolved_parent != parent_str
+                        && let Some(name) = Path::new(&resolved).file_name()
+                    {
+                        materialize_path =
+                            display_rootfs_path(&Path::new(&resolved_parent).join(name));
+                    }
                 }
             }
             // Linux mknod(2) type dispatch. A zero type field means S_IFREG.
@@ -4564,7 +4667,7 @@ impl SyscallDispatcher {
                             .fs
                             .rootfs_vfs
                             .overlay
-                            .create_fifo(&resolved, fifo_mode)
+                            .create_fifo(&materialize_path, fifo_mode)
                         {
                             Ok(()) => DispatchOutcome::Returned { value: 0 },
                             Err(crate::fs_backend::BackendError::Unsupported) => {
@@ -4591,14 +4694,14 @@ impl SyscallDispatcher {
             // Create an empty regular file in the writable backend (cap-std).
             // MemoryBackend's create_file works in-memory too. After this the
             // path exists in the layered view.
-            match this.fs.rootfs_vfs.overlay.create_file(&resolved) {
+            match this.fs.rootfs_vfs.overlay.create_file(&materialize_path) {
                 Ok(()) => {
                     if mode & 0o7777 != 0 {
                         let _ = this
                             .fs
                             .rootfs_vfs
                             .overlay
-                            .set_mode(&resolved, mode & 0o7777);
+                            .set_mode(&materialize_path, mode & 0o7777);
                     }
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }

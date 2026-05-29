@@ -31,6 +31,9 @@ pub enum WaitResult {
     TimedOut,
     /// A signal became pending — the runtime delivers it (syscall → EINTR).
     Interrupted,
+    /// Could not pin (dup) a watched fd — host fd table exhausted. Carries the
+    /// LINUX errno to surface to the guest (LINUX_EMFILE / LINUX_ENFILE).
+    Errno(i32),
 }
 
 struct PinnedWaitFd {
@@ -54,23 +57,38 @@ struct PinnedWaitFds {
 }
 
 impl PinnedWaitFds {
-    fn new(fds: &[(RawFd, i16)]) -> Self {
+    /// Pin (dup) every watched fd so a sibling thread's close()+open() cannot
+    /// silently re-target the parked wait at a different file. FAIL-CLOSED: on
+    /// ANY dup() failure (host fd table exhausted) return Err with a LINUX
+    /// errno — never fall back to parking on the raw, unowned guest fd (the
+    /// exact fd-reuse race this dup is meant to prevent). The partially-duped
+    /// set is dropped via PinnedWaitFd::Drop (RAII rollback).
+    fn new(fds: &[(RawFd, i16)]) -> Result<Self, i32> {
         let mut wait_fds = Vec::with_capacity(fds.len());
         let mut pinned = Vec::with_capacity(fds.len());
         for &(fd, events) in fds {
             let duped = unsafe { libc::dup(fd) };
-            let (wait_fd, owned) = if duped >= 0 {
-                (duped, true)
-            } else {
-                (fd, false)
-            };
-            wait_fds.push((wait_fd, events));
-            pinned.push(PinnedWaitFd { fd: wait_fd, owned });
+            if duped < 0 {
+                // Read errno IMMEDIATELY (before any other libc call clobbers it).
+                let host = std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EMFILE);
+                let linux_errno = match host {
+                    libc::ENFILE => crate::linux_abi::LINUX_ENFILE,
+                    _ => crate::linux_abi::LINUX_EMFILE,
+                };
+                return Err(linux_errno); // partial `pinned` drops here → closes already-duped fds
+            }
+            wait_fds.push((duped, events));
+            pinned.push(PinnedWaitFd {
+                fd: duped,
+                owned: true,
+            });
         }
-        Self {
+        Ok(Self {
             wait_fds,
             _pinned: pinned,
-        }
+        })
     }
 
     fn as_wait_fds(&self) -> &[(RawFd, i16)] {
@@ -174,7 +192,20 @@ impl ThreadWaiter {
             );
             return WaitResult::Interrupted;
         }
-        let pinned_fds = PinnedWaitFds::new(fds);
+        let pinned_fds = match PinnedWaitFds::new(fds) {
+            Ok(p) => p,
+            Err(errno) => {
+                crate::probes::io_wait_end(
+                    self.tid,
+                    wait_result_code(WaitResult::Errno(errno)),
+                    fds.len() as i32,
+                    fd0,
+                    fd1,
+                    fds.get(2).map_or(-1, |(fd, _)| *fd),
+                );
+                return WaitResult::Errno(errno);
+            }
+        };
         let wait_fds = pinned_fds.as_wait_fds();
         let result;
         #[cfg(target_os = "macos")]
@@ -239,7 +270,20 @@ impl ThreadWaiter {
             );
             return WaitResult::Interrupted;
         }
-        let pinned_fds = PinnedWaitFds::new(fds);
+        let pinned_fds = match PinnedWaitFds::new(fds) {
+            Ok(p) => p,
+            Err(errno) => {
+                crate::probes::io_wait_end(
+                    self.tid,
+                    wait_result_code(WaitResult::Errno(errno)),
+                    fds.len() as i32,
+                    fd0,
+                    fd1,
+                    fds.get(2).map_or(-1, |(fd, _)| *fd),
+                );
+                return WaitResult::Errno(errno);
+            }
+        };
         let result = self.poll_with_signal(pinned_fds.as_wait_fds(), timeout, block_mask);
         crate::probes::io_wait_end(
             self.tid,
@@ -583,6 +627,8 @@ fn wait_result_code(result: WaitResult) -> i32 {
         WaitResult::Ready => 0,
         WaitResult::TimedOut => 1,
         WaitResult::Interrupted => 2,
+        // Trace-only code (io_wait_end USDT); any stable value is fine.
+        WaitResult::Errno(_) => 3,
     }
 }
 
@@ -600,7 +646,8 @@ mod tests {
     fn pinned_wait_fd_survives_original_close() {
         let mut fds = [-1, -1];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        let pinned = super::PinnedWaitFds::new(&[(fds[0], libc::POLLIN)]);
+        let pinned = super::PinnedWaitFds::new(&[(fds[0], libc::POLLIN)])
+            .expect("dup should succeed in test");
         assert_eq!(unsafe { libc::close(fds[0]) }, 0);
         assert_eq!(unsafe { libc::write(fds[1], b"x".as_ptr().cast(), 1) }, 1);
 
@@ -612,5 +659,16 @@ mod tests {
         assert_eq!(unsafe { libc::poll(&mut pollfd, 1, 0) }, 1);
         assert_ne!(pollfd.revents & libc::POLLIN, 0);
         assert_eq!(unsafe { libc::close(fds[1]) }, 0);
+    }
+
+    #[test]
+    fn pinned_wait_fds_errors_on_bad_fd() {
+        // dup() of a closed/invalid fd fails (EBADF) deterministically, no
+        // rlimit perturbation. new() must return Err, not park on the raw fd.
+        let bad = 100_000; // not an open fd in the test process
+        assert!(matches!(
+            super::PinnedWaitFds::new(&[(bad, libc::POLLIN)]),
+            Err(_)
+        ));
     }
 }
