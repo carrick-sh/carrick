@@ -2187,6 +2187,18 @@ impl SyscallDispatcher {
             if let Err(errno) = rc.host_syscall_errno() {
                 return Ok(errno.into());
             }
+            // Connected (the host call succeeded): a NULL addr/addrlen → EFAULT
+            // and a negative input *addrlen → EINVAL (symmetric with
+            // getsockname; checked after the host call so an unconnected
+            // socket's ENOTCONN still wins). getpeername01.
+            if addr_addr == 0 || addrlen_addr == 0 {
+                return Ok(LINUX_EFAULT.into());
+            }
+            if let Ok(b) = memory.read_bytes(addrlen_addr, 4)
+                && i32::from_ne_bytes([b[0], b[1], b[2], b[3]]) < 0
+            {
+                return Ok(LINUX_EINVAL.into());
+            }
             let used = (sa_len as usize).min(sa.len());
             let linux_bytes = host_to_linux_sockaddr(&sa[..used], family, false);
             if write_linux_sockaddr(memory, addr_addr, addrlen_addr, &linux_bytes).is_err() {

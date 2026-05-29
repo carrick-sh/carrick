@@ -38,8 +38,24 @@ fn main() {
         let mut good: libc::socklen_t = std::mem::size_of::<libc::sockaddr_storage>() as u32;
         let r4 = libc::getsockname(s, addr_ptr, &mut good);
         println!("getsockname_ok={}", r4 == 0);
-
         libc::close(s);
+
+        // getpeername is symmetric on a CONNECTED socket: a negative input
+        // *addrlen → EINVAL (getpeername01). Use a connected socketpair.
+        let mut sv = [0i32; 2];
+        if libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) == 0 {
+            let mut peer: libc::sockaddr_storage = std::mem::zeroed();
+            let peer_ptr = &mut peer as *mut _ as *mut libc::sockaddr;
+            let mut neg2: libc::socklen_t = u32::MAX;
+            let p = libc::getpeername(sv[0], peer_ptr, &mut neg2);
+            println!(
+                "getpeername_neg_len_einval={}",
+                p == -1 && errno() == libc::EINVAL
+            );
+            libc::close(sv[0]);
+            libc::close(sv[1]);
+        }
+
         let _ = errno;
     }
 }
