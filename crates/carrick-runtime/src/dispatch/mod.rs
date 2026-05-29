@@ -1101,6 +1101,7 @@ impl SyscallDispatcher {
         267 => syncfs,
         276 => renameat2,
         277 => sys_seccomp,
+        275 => sched_getattr,
         278 => getrandom,
         279 => memfd_create,
         424 => pidfd_send_signal,
