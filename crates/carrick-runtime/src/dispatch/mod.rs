@@ -60,6 +60,7 @@ use crate::linux_abi::{
     LINUX_DIRENT64_HEADER_SIZE,
     LINUX_DT_CHR,
     LINUX_DT_DIR,
+    LINUX_DT_FIFO,
     LINUX_DT_LNK,
     LINUX_DT_REG,
     LINUX_E2BIG,
@@ -239,11 +240,14 @@ use crate::linux_abi::{
     LINUX_RUSAGE_CHILDREN,
     LINUX_RUSAGE_SELF,
     LINUX_RUSAGE_THREAD,
+    LINUX_S_IFBLK,
     LINUX_S_IFCHR,
     LINUX_S_IFDIR,
+    LINUX_S_IFIFO,
     LINUX_S_IFLNK,
     LINUX_S_IFMT,
     LINUX_S_IFREG,
+    LINUX_S_IFSOCK,
     LINUX_SEEK_CUR,
     LINUX_SEEK_END,
     LINUX_SEEK_SET,
@@ -3161,6 +3165,7 @@ fn linux_mode(metadata: &RootFsMetadata) -> u32 {
         RootFsEntryKind::Directory => LINUX_S_IFDIR,
         RootFsEntryKind::Symlink => LINUX_S_IFLNK,
         RootFsEntryKind::CharDevice => LINUX_S_IFCHR,
+        RootFsEntryKind::Fifo => LINUX_S_IFIFO,
     };
     kind | (metadata.mode & 0o7777)
 }
@@ -3283,6 +3288,7 @@ fn linux_dirent_type(kind: RootFsEntryKind) -> u8 {
         RootFsEntryKind::Directory => LINUX_DT_DIR,
         RootFsEntryKind::Symlink => LINUX_DT_LNK,
         RootFsEntryKind::CharDevice => LINUX_DT_CHR,
+        RootFsEntryKind::Fifo => LINUX_DT_FIFO,
     }
 }
 
@@ -3427,6 +3433,7 @@ fn vfs_md_to_rootfs_md(path: &str, md: &crate::vfs::Metadata) -> RootFsMetadata 
             crate::vfs::EntryKind::Directory => RootFsEntryKind::Directory,
             crate::vfs::EntryKind::Symlink => RootFsEntryKind::Symlink,
             crate::vfs::EntryKind::CharDevice => RootFsEntryKind::CharDevice,
+            crate::vfs::EntryKind::Fifo => RootFsEntryKind::Fifo,
         },
         mode: md.mode,
         size: md.size as usize,

@@ -286,6 +286,11 @@ pub(super) enum OpenDescription {
         /// handling and close cleanup. `None` for ordinary host pipes,
         /// sockets-as-pipes, and `/dev/*` chardevs.
         pty: Option<crate::vfs::PtyRole>,
+        /// `true` iff both read and write are permitted on this fd (a FIFO
+        /// opened `O_RDWR`). Ordinary pipe ends are one-way (gated by
+        /// `is_read_end`); a `O_RDWR` FIFO is bidirectional like a pty but is
+        /// NOT a tty, so it sets this flag instead of a fake `pty` role.
+        bidirectional: bool,
     },
     /// Host BSD socket backed by a real macOS file descriptor.
     /// Survives `libc::fork(2)`; the `family`/`type_` fields capture

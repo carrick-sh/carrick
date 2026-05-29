@@ -421,6 +421,54 @@ impl SyscallDispatcher {
             return Ok(errno.into());
         }
 
+        // FIFO (named pipe): open the REAL host FIFO in NON-BLOCKING mode and
+        // model it as a HostPipe. A blocking host open of a writer-less
+        // O_RDONLY FIFO would wedge the single dispatcher thread; opening
+        // O_NONBLOCK returns immediately and the guest's blocking read/write
+        // then parks on the kqueue WaitOnFds path (with the dispatcher lock
+        // released). An O_RDWR FIFO is bidirectional (e.g. LTP select01).
+        if let Ok(md) = self.layered_metadata(&path)
+            && md.kind == RootFsEntryKind::Fifo
+        {
+            // An existing FIFO + O_CREAT|O_EXCL must fail like the kernel.
+            if want_create && want_excl {
+                return Ok(LINUX_EEXIST.into());
+            }
+            // Linux O_ACCMODE is 0=RDONLY, 1=WRONLY, 2=RDWR.
+            let access_idx = (access & LINUX_O_ACCMODE) as u32;
+            match self
+                .fs
+                .rootfs_vfs
+                .overlay
+                .open_fifo_nonblock(&path, access_idx)
+            {
+                Some(host_fd) => {
+                    let description = OpenDescription::HostPipe {
+                        host_fd,
+                        is_read_end: access != LINUX_O_WRONLY,
+                        base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
+                        pty: None,
+                        bidirectional: access == LINUX_O_RDWR,
+                    };
+                    let open_file = OpenFile {
+                        description: Arc::new(RwLock::new(description)),
+                        fd_flags: linux_fd_flags_from_open_flags(flags),
+                        host_fd_owner: Some(HostFdRef::new(host_fd)),
+                    };
+                    let Ok(fd) = self.install_fd_at_or_above(3, open_file) else {
+                        return Ok(linux_errno::EMFILE.into());
+                    };
+                    self.io.fd_open_paths.write().insert(fd, path.clone());
+                    return Ok(DispatchOutcome::Returned { value: fd as i64 });
+                }
+                // The non-blocking open failed — most commonly O_WRONLY with no
+                // reader (ENXIO, the correct O_NONBLOCK errno). A blocking
+                // O_WRONLY open that should wait for a reader is a known
+                // unimplemented case (it would block the dispatcher).
+                None => return Ok(linux_errno::ENXIO.into()),
+            }
+        }
+
         // /proc/* and /sys/* synthetic file opens now flow through
         // ProcVfs / SysVfs (mounted in `SyscallDispatcher::new`). Any
         // unknown /proc or /sys path returns ENOSYS from the mount
@@ -643,6 +691,7 @@ impl SyscallDispatcher {
                         is_read_end: old_fd == 0,
                         base: OpenDescriptionBase::new(0),
                         pty: None,
+                        bidirectional: false,
                     })),
                     Some(HostFdRef::new(duped)),
                 )
@@ -745,6 +794,7 @@ impl SyscallDispatcher {
                         is_read_end,
                         base: OpenDescriptionBase::new(status_flags as u64),
                         pty: None,
+                        bidirectional: false,
                     }
                 };
                 let open_file = OpenFile::with_host_fd(
@@ -797,6 +847,8 @@ impl SyscallDispatcher {
                             index: pts_index,
                             is_master,
                         }),
+                        // pty bidirectionality is already expressed by `pty`.
+                        bidirectional: false,
                     })),
                     linux_fd_flags_from_open_flags(flags),
                     host_fd,
@@ -821,6 +873,7 @@ impl SyscallDispatcher {
                             crate::vfs::EntryKind::Directory => RootFsEntryKind::Directory,
                             crate::vfs::EntryKind::Symlink => RootFsEntryKind::Symlink,
                             crate::vfs::EntryKind::CharDevice => RootFsEntryKind::CharDevice,
+                            crate::vfs::EntryKind::Fifo => RootFsEntryKind::Fifo,
                             crate::vfs::EntryKind::File => RootFsEntryKind::File,
                         };
                         RootFsDirEntry {
@@ -927,11 +980,12 @@ impl SyscallDispatcher {
                         host_fd,
                         is_read_end,
                         pty,
+                        bidirectional,
                         ..
                     } => {
-                        // pty ends are bidirectional (O_RDWR); only real one-way
-                        // pipe ends are gated by is_read_end.
-                        return if *is_read_end && pty.is_none() {
+                        // pty ends and O_RDWR FIFOs are bidirectional; only real
+                        // one-way pipe ends are gated by is_read_end.
+                        return if *is_read_end && pty.is_none() && !*bidirectional {
                             DispatchOutcome::errno(LINUX_EBADF)
                         } else {
                             write_host_pipe(bytes, *host_fd, nonblocking)
@@ -1460,6 +1514,7 @@ impl SyscallDispatcher {
                     is_read_end: true,
                     base: OpenDescriptionBase::new(LINUX_O_RDONLY | nonblock),
                     pty: None,
+                    bidirectional: false,
                 })),
                 fd_flags,
                 host_read,
@@ -1470,6 +1525,7 @@ impl SyscallDispatcher {
                     is_read_end: false,
                     base: OpenDescriptionBase::new(LINUX_O_WRONLY | nonblock),
                     pty: None,
+                    bidirectional: false,
                 })),
                 fd_flags,
                 host_write,
@@ -1545,6 +1601,7 @@ impl SyscallDispatcher {
                             is_read_end: old_fd.0 == 0,
                             base: OpenDescriptionBase::new(0),
                             pty: None,
+                            bidirectional: false,
                         })),
                         Some(HostFdRef::new(duped)),
                     )
@@ -2768,11 +2825,12 @@ impl SyscallDispatcher {
                     host_fd,
                     is_read_end,
                     pty,
+                    bidirectional,
                     ..
                 } => {
-                    // pty ends are bidirectional (O_RDWR); only real one-way
-                    // pipe ends are gated by is_read_end.
-                    if !*is_read_end && pty.is_none() {
+                    // pty ends and O_RDWR FIFOs are bidirectional; only real
+                    // one-way pipe ends are gated by is_read_end.
+                    if !*is_read_end && pty.is_none() && !*bidirectional {
                         return Ok(LINUX_EBADF.into());
                     }
                     return Ok(read_host_pipe(
@@ -3828,11 +3886,12 @@ impl SyscallDispatcher {
                             host_fd,
                             is_read_end,
                             pty,
+                            bidirectional,
                             ..
                         } => {
-                            // pty ends are bidirectional (O_RDWR); only real one-way
-                            // pipe ends are gated by is_read_end.
-                            if *is_read_end && pty.is_none() {
+                            // pty ends and O_RDWR FIFOs are bidirectional; only
+                            // real one-way pipe ends are gated by is_read_end.
+                            if *is_read_end && pty.is_none() && !*bidirectional {
                                 return Ok(LINUX_EBADF.into());
                             }
                             return Ok(write_host_pipe(&bytes, *host_fd, nonblocking));
@@ -3963,11 +4022,12 @@ impl SyscallDispatcher {
                                 host_fd,
                                 is_read_end,
                                 pty,
+                                bidirectional,
                                 ..
                             } => {
-                                // pty ends are bidirectional (O_RDWR); only real one-way
-                                // pipe ends are gated by is_read_end.
-                                if *is_read_end && pty.is_none() {
+                                // pty ends and O_RDWR FIFOs are bidirectional;
+                                // only real one-way pipe ends gate on is_read_end.
+                                if *is_read_end && pty.is_none() && !*bidirectional {
                                     return Ok(LINUX_EBADF.into());
                                 }
                                 outcome = write_host_pipe(&bytes, *host_fd, nonblocking);
@@ -4155,13 +4215,63 @@ impl SyscallDispatcher {
             if this.layered_metadata(&resolved).is_ok() {
                 return Ok(LINUX_EEXIST.into());
             }
-            // Linux mknod(2): a zero type field means S_IFREG. Only regular
-            // files are materialised on the host backend (like open O_CREAT);
-            // device/fifo/socket nodes can't be backed by the cap-std scratch,
-            // so they report EPERM (matching the unprivileged-mknod errno).
+            // mknod(2) does NOT create intermediate directories: a missing
+            // parent is ENOENT (LTP mknod06). An intermediate path component
+            // that is a non-directory already surfaced as ENOTDIR from
+            // resolve_at_path above. Mirrors the open(O_CREAT) parent check.
+            if let Some(parent) = Path::new(&resolved).parent() {
+                let parent_str = display_rootfs_path(parent);
+                if !parent_str.is_empty()
+                    && parent_str != "/"
+                    && !this.path_is_directory(&parent_str)
+                {
+                    return Ok(LINUX_ENOENT.into());
+                }
+            }
+            // Linux mknod(2) type dispatch. A zero type field means S_IFREG.
+            // An ambiguous/invalid type (e.g. S_IFMT, multiple type bits) is
+            // EINVAL (LTP mknod09); a valid device/socket type carrick can't
+            // back on the cap-std scratch is EPERM (the unprivileged-mknod
+            // errno); FIFO and regular files are materialised below.
             let type_bits = mode & LINUX_S_IFMT;
-            if type_bits != 0 && type_bits != LINUX_S_IFREG {
-                return Ok(LINUX_EPERM.into());
+            match type_bits {
+                // FIFO: create a real named pipe on the host backend
+                // (mkfifoat). Opened later as a non-blocking HostPipe so a
+                // writer-less open can't wedge the dispatcher. The
+                // MemoryBackend can't back a real pipe → Unsupported → EPERM.
+                t if t == LINUX_S_IFIFO => {
+                    // mknod(2) applies the umask to the permission bits (the
+                    // suid/sgid/sticky bits are NOT masked).
+                    let umask = this.cred_snapshot().umask & 0o777;
+                    let fifo_mode = (mode & 0o7777) & !umask;
+                    return Ok(
+                        match this
+                            .fs
+                            .rootfs_vfs
+                            .overlay
+                            .create_fifo(&resolved, fifo_mode)
+                        {
+                            Ok(()) => DispatchOutcome::Returned { value: 0 },
+                            Err(crate::fs_backend::BackendError::Unsupported) => {
+                                LINUX_EPERM.into()
+                            }
+                            Err(_) => LINUX_EROFS.into(),
+                        },
+                    );
+                }
+                // Device/socket nodes: a valid type carrick can't back → EPERM.
+                t if t == LINUX_S_IFCHR
+                    || t == LINUX_S_IFBLK
+                    || t == LINUX_S_IFSOCK =>
+                {
+                    return Ok(LINUX_EPERM.into());
+                }
+                // Regular file (0 or S_IFREG): materialised below.
+                0 => {}
+                t if t == LINUX_S_IFREG => {}
+                // Anything else (S_IFMT, S_IFDIR, multiple type bits) is an
+                // invalid mknod type → EINVAL.
+                _ => return Ok(LINUX_EINVAL.into()),
             }
             // Create an empty regular file in the writable backend (cap-std).
             // MemoryBackend's create_file works in-memory too. After this the

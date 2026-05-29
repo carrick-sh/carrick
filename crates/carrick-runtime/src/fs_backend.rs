@@ -140,6 +140,16 @@ pub trait FsBackend: Send + Sync {
     /// when the file did not previously exist.
     fn create_file(&self, path: &str) -> Result<(), BackendError>;
 
+    /// Create a named pipe (FIFO) at `path` with permission bits `mode`
+    /// (low 0o7777). Used by `mknod(2)`/`mkfifo(3)` for `S_IFIFO`. The host
+    /// backend makes a real `mkfifoat(2)` node on the cap-std scratch (so the
+    /// FIFO is fork-shareable and stats as `S_IFIFO`); the in-memory backend
+    /// can't back a real pipe and returns `Unsupported` (→ guest `EPERM`,
+    /// matching unprivileged mknod). Default: unsupported.
+    fn create_fifo(&self, _path: &str, _mode: u32) -> Result<(), BackendError> {
+        Err(BackendError::Unsupported)
+    }
+
     /// Replace the contents of `path`. Used by write/writev/pwrite/
     /// ftruncate writeback and by rename-into-overlay.
     fn set_file_contents(&self, path: &str, contents: Vec<u8>) -> Result<(), BackendError>;
@@ -183,6 +193,17 @@ pub trait FsBackend: Send + Sync {
     /// HashMap has no kernel fd and cannot be shared across a real fork, so
     /// the dispatcher keeps its in-memory File model there.
     fn open_raw_fd(&self, path: &str, write: bool, create: bool, trunc: bool) -> Option<i32>;
+
+    /// Open a real host fd on the FIFO at `path` in NON-BLOCKING mode for the
+    /// given guest access (`0`=RDONLY, `1`=WRONLY, `2`=RDWR). Always
+    /// `O_NONBLOCK` so a writer-less `O_RDONLY` open returns immediately instead
+    /// of blocking the dispatcher; the dispatcher then services guest blocking
+    /// semantics via the kqueue `WaitOnFds` path (see `open_at_path`). Returns
+    /// `None` if the backend can't (no real node) or the open failed (e.g.
+    /// `O_WRONLY|O_NONBLOCK` with no reader → ENXIO). Default: unsupported.
+    fn open_fifo_nonblock(&self, _path: &str, _access: u32) -> Option<i32> {
+        None
+    }
 
     /// Create a symlink at `linkpath` pointing at `target` (the target is
     /// stored verbatim, not resolved). Default: unsupported.
@@ -948,6 +969,16 @@ impl FsBackend for HostFsBackend {
                 target.to_string_lossy().into_owned().into_bytes(),
             ));
         }
+        // A FIFO is present but unreadable as bytes (opening it would block).
+        // Report it as a (empty) File-shaped entry so the layered lookup
+        // treats the path as existing; `metadata`/`RootFsVfs::lookup` carry
+        // the true `Fifo` kind. Crucially, do NOT open the node here.
+        {
+            use cap_std::fs::MetadataExt;
+            if meta.mode() & (libc::S_IFMT as u32) == libc::S_IFIFO as u32 {
+                return Some(OverlayEntry::File(Vec::new()));
+            }
+        }
         None
     }
 
@@ -969,6 +1000,14 @@ impl FsBackend for HostFsBackend {
         if meta.is_symlink() {
             return Some(OverlayEntryKind::File);
         }
+        // FIFO: present (File-shaped in the kind vocabulary; the true `Fifo`
+        // kind is carried by `metadata`). Never opens the node.
+        {
+            use cap_std::fs::MetadataExt;
+            if meta.mode() & (libc::S_IFMT as u32) == libc::S_IFIFO as u32 {
+                return Some(OverlayEntryKind::File);
+            }
+        }
         None
     }
 
@@ -988,6 +1027,24 @@ impl FsBackend for HostFsBackend {
         }
         let rel = Self::rel_path(&normalized)?;
         let meta = self.dir.symlink_metadata(rel).ok()?;
+        // FIFO (named pipe): symlink_metadata reports neither dir/file/symlink.
+        // Detect it from the raw type bits and report S_IFIFO. The mode lives on
+        // the real node (create_fifo set it exactly), NOT in an xattr — reading
+        // the xattr would open() the FIFO and an O_RDONLY open of a writer-less
+        // FIFO blocks, wedging the dispatcher. `symlink_metadata` is fstatat,
+        // so this never opens the node.
+        {
+            use cap_std::fs::MetadataExt;
+            if meta.mode() & (libc::S_IFMT as u32) == libc::S_IFIFO as u32 {
+                let mode = meta.mode() & 0o7777;
+                return Some(RootFsMetadata {
+                    path: normalized,
+                    kind: RootFsEntryKind::Fifo,
+                    mode: if mode == 0 { 0o644 } else { mode },
+                    size: 0,
+                });
+            }
+        }
         // A guest-mode xattr is the guest-visible mode (see CARRICK_MODE_XATTR);
         // the real file's mode was forced owner-accessible and isn't faithful.
         // Symlinks always report 0777, so skip the (link-following) xattr read.
@@ -1085,6 +1142,35 @@ impl FsBackend for HostFsBackend {
         self.dir
             .open_with(rel, &opts)
             .map_err(|_| BackendError::Io)?;
+        Ok(())
+    }
+
+    fn create_fifo(&self, path: &str, mode: u32) -> Result<(), BackendError> {
+        use std::os::fd::AsRawFd;
+        let normalized = normalize(path).ok_or(BackendError::Invalid)?;
+        let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
+        // mknod(2) does NOT create intermediate directories (unlike the
+        // overlay's create_file). A missing parent must surface as ENOENT —
+        // mkfifoat below reports it; the dispatcher maps the failure.
+        let c_rel = std::ffi::CString::new(rel.to_str().ok_or(BackendError::Invalid)?)
+            .map_err(|_| BackendError::Invalid)?;
+        let dirfd = self.dir.as_raw_fd();
+        // Real named pipe on the cap-std scratch (fork-shareable, stats as
+        // S_IFIFO). mkfifoat applies the host process umask; override it below
+        // with the exact guest-requested mode so stat reports it faithfully.
+        let rc = unsafe { libc::mkfifoat(dirfd, c_rel.as_ptr(), (mode & 0o7777) as libc::mode_t) };
+        if rc != 0 {
+            return Err(BackendError::Io);
+        }
+        // Force the exact mode via PATH-BASED fchmodat — NOT cap-std's
+        // set_permissions, which opens the node first: an O_RDONLY open of a
+        // writer-less FIFO blocks and would wedge the single dispatcher thread.
+        // Likewise the guest-mode xattr (CARRICK_MODE_XATTR) is skipped for
+        // FIFOs because reading it back would also have to open the node;
+        // `symlink_metadata` reads the on-disk mode without opening it.
+        unsafe {
+            libc::fchmodat(dirfd, c_rel.as_ptr(), (mode & 0o7777) as libc::mode_t, 0);
+        }
         Ok(())
     }
 
@@ -1239,6 +1325,31 @@ impl FsBackend for HostFsBackend {
         Some(file.into_std().into_raw_fd())
     }
 
+    fn open_fifo_nonblock(&self, path: &str, access: u32) -> Option<i32> {
+        use std::os::fd::AsRawFd;
+        // resolve_following won't open the node; it just resolves the path.
+        let normalized = self.resolve_following(path)?;
+        let rel = Self::rel_path(&normalized)?;
+        let c_rel = std::ffi::CString::new(rel.to_str()?).ok()?;
+        let host_access = match access {
+            0 => libc::O_RDONLY,
+            1 => libc::O_WRONLY,
+            _ => libc::O_RDWR,
+        };
+        // O_NONBLOCK is the whole point: an O_RDONLY open of a writer-less FIFO
+        // returns immediately instead of blocking the dispatcher thread. The
+        // resulting fd stays non-blocking; read_host_pipe/write_host_pipe route
+        // EAGAIN to the kqueue WaitOnFds park for guest blocking semantics.
+        let fd = unsafe {
+            libc::openat(
+                self.dir.as_raw_fd(),
+                c_rel.as_ptr(),
+                host_access | libc::O_NONBLOCK,
+            )
+        };
+        if fd < 0 { None } else { Some(fd) }
+    }
+
     fn symlink(&self, target: &str, linkpath: &str) -> Result<(), BackendError> {
         let normalized = normalize(linkpath).ok_or(BackendError::Invalid)?;
         let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
@@ -1278,19 +1389,30 @@ impl FsBackend for HostFsBackend {
     }
 
     fn set_mode(&self, path: &str, mode: u32) -> Result<(), BackendError> {
+        use cap_std::fs::MetadataExt;
         use cap_std::fs::Permissions;
         use cap_std::fs::PermissionsExt;
+        use std::os::fd::AsRawFd;
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
         let mode = mode & 0o7777;
+        let meta = self.dir.symlink_metadata(rel);
+        // A FIFO's mode lives on the real node (not an xattr); set it via
+        // PATH-BASED fchmodat — neither set_permissions nor the xattr write may
+        // open the node, since an O_RDONLY open of a writer-less FIFO blocks.
+        if let Ok(m) = &meta
+            && m.mode() & (libc::S_IFMT as u32) == libc::S_IFIFO as u32
+            && let Ok(c_rel) = std::ffi::CString::new(rel.to_str().unwrap_or(""))
+        {
+            unsafe {
+                libc::fchmodat(self.dir.as_raw_fd(), c_rel.as_ptr(), mode as libc::mode_t, 0);
+            }
+            return Ok(());
+        }
         // Force owner rwx on the REAL file so carrick (a non-root macOS
         // process) can always still open/stat/unlink it, then record the
         // guest-visible mode in an xattr ON the file (see CARRICK_MODE_XATTR).
-        let is_dir = self
-            .dir
-            .symlink_metadata(rel)
-            .map(|m| m.is_dir())
-            .unwrap_or(false);
+        let is_dir = meta.map(|m| m.is_dir()).unwrap_or(false);
         let _ = self
             .dir
             .set_permissions(rel, Permissions::from_mode(mode | 0o700));
@@ -1314,14 +1436,16 @@ impl FsBackend for HostFsBackend {
     }
 
     fn get_owner(&self, path: &str) -> Option<(u32, u32)> {
+        use cap_std::fs::MetadataExt;
         let normalized = normalize(path)?;
         let rel = Self::rel_path(&normalized)?;
-        let is_dir = self
-            .dir
-            .symlink_metadata(rel)
-            .map(|m| m.is_dir())
-            .unwrap_or(false);
-        let (uid, gid) = read_owner_xattr(&self.dir, rel, is_dir);
+        let meta = self.dir.symlink_metadata(rel).ok()?;
+        // A FIFO has no owner xattr and reading one would open() the node
+        // (O_RDONLY blocks a writer-less FIFO) — report root (0,0) directly.
+        if meta.mode() & (libc::S_IFMT as u32) == libc::S_IFIFO as u32 {
+            return Some((0, 0));
+        }
+        let (uid, gid) = read_owner_xattr(&self.dir, rel, meta.is_dir());
         Some((uid.unwrap_or(0), gid.unwrap_or(0)))
     }
 
@@ -1603,6 +1727,8 @@ impl FsBackend for HostFsBackend {
             RootFsEntryKind::Directory
         } else if meta.is_symlink() {
             RootFsEntryKind::Symlink
+        } else if meta.mode() & (libc::S_IFMT as u32) == libc::S_IFIFO as u32 {
+            RootFsEntryKind::Fifo
         } else {
             RootFsEntryKind::File
         };
@@ -1610,14 +1736,18 @@ impl FsBackend for HostFsBackend {
         let default_mode = match kind {
             RootFsEntryKind::Directory => 0o755,
             RootFsEntryKind::Symlink => 0o777,
-            RootFsEntryKind::File | RootFsEntryKind::CharDevice => 0o644,
+            RootFsEntryKind::File | RootFsEntryKind::CharDevice | RootFsEntryKind::Fifo => 0o644,
         };
         // The real file's mode was forced owner-accessible; the guest-visible
         // mode lives in an xattr on the (symlink-resolved) target. Symlinks
-        // always report 0777, so skip the link-following xattr read for them.
-        let (override_mode, owner) = if matches!(kind, RootFsEntryKind::Symlink) {
-            (None, (None, None))
-        } else {
+        // report 0777, and a FIFO's xattr read would have to open() the node
+        // (O_RDONLY blocks a writer-less FIFO and wedges the dispatcher) — its
+        // mode lives on the real node (set by create_fifo). Skip the xattr for
+        // both; use the real on-disk mode.
+        let (override_mode, owner) =
+            if matches!(kind, RootFsEntryKind::Symlink | RootFsEntryKind::Fifo) {
+                (None, (None, None))
+            } else {
             match Self::rel_path(&normalized) {
                 Some(rel) => {
                     let is_dir = matches!(kind, RootFsEntryKind::Directory);
@@ -1773,7 +1903,7 @@ pub fn layered_directory_entries(
         let metadata = match kind {
             // CharDevice never appears in the writable overlay (it only comes
             // from the /dev VFS mounts), but the match must be exhaustive.
-            RootFsEntryKind::File | RootFsEntryKind::CharDevice => {
+            RootFsEntryKind::File | RootFsEntryKind::CharDevice | RootFsEntryKind::Fifo => {
                 let size = overlay.file_contents(&path).map(|b| b.len()).unwrap_or(0);
                 RootFsMetadata {
                     path: normalized,
