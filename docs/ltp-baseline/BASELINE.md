@@ -61,13 +61,13 @@ SysV-semaphore, and SysV-msg-queue fixes landed against it.
 | epoll_poll | 34 | 3 | 6   | 9  | 0 | 10  | 62  | **65%** |
 | sched      | 36 | 0 | 8   | 5  | 0 | 18  | 67  | **73%** |
 | other      | 55 | 2 | 9   | 2  | 0 | 53  | 121 | **81%** |
-| fs         | 189| 0 | 74  | 32 | 6 | 141 | 442 | **63%** |
+| fs         | 192| 0 | 75  | 23 | 11 | 141 | 442 | **64%** |
 | process    | 114| 1 | 29  | 41 | 1 | 206 | 392 | **61%** |
 | ipc        | 14 | 0 | 14  | 12 | 0 | 7   | 47  | **35%** (sem + msg queues functional) |
 | net        | 13 | 0 | 15  | 9  | 0 | 16  | 53  | **35%** |
 | mm         | 25 | 1 | 28  | 19 | 1 | 43  | 117 | **34%** |
 | xattr      | 3  | 0 | 1   | 1  | 0 | 24  | 29  | **60%** |
-| **TOTAL**  | **545** | **7** | **189** | **144** | **11** | **540** | **1436** | **545/896 = 61%** |
+| **TOTAL**  | **548** | **7** | **190** | **135** | **16** | **540** | **1436** | **548/896 = 61%** |
 
 _Last refresh (2026-05-28): the functional-FIFO cluster (commit `31f2a7c`) added
 +6 verified-MATCH — `select01` flipped to MATCH (16/16) via the FIFO O_RDWR leg +
@@ -77,7 +77,16 @@ the select multi-set return-count fix; `mknod02–05/09`, `mknodat01` now MATCH
 (macOS can't `mknod` char/block devices — inherent), `mknod06` tst_test re-exec
 hang, `select03`/`pselect02` select error-edge TBROK, `mknod08` DAC EACCES._
 
-_Last refresh (2026-05-29, other): setfsuid/setfsgid fs-id model (commit
+_Last refresh (2026-05-29, fs full re-sweep): corrected the aarch64
+O_DIRECTORY/O_NOFOLLOW fcntl constants + O_DIRECTORY→ENOTDIR (commit `c41607d`).
+Full fs re-sweep: MATCH 189→192 (open08 + 2 flag-cascade flips), fs **64%**;
+total verified-MATCH 545→548/896. The TBROK 32→23 / TIMEOUT 6→11 shuffle is the
+known flaky tst_test process-lifecycle class (fcntl07/14 blocking-locks,
+mknod06/write04 forked-exec hang, dup05/fsync03/linkat01/lseek02/open06) — those
+tests never reach verified-MATCH either way; not a regression (every
+flag-sensitive open/openat/symlink test stayed MATCH or was already DIFF)._
+
+_Earlier 2026-05-29 (other): setfsuid/setfsgid fs-id model (commit
 `66bdb2b`): a tracked fsuid/fsgid (default=euid/egid, reset by set*uid/gid) that
 setfs*id returns + updates. `setfsuid01/03`, `setfsgid01/02` → MATCH (+4);
 setfsuid04 stays DIFF (fs-id DAC open() enforcement). other MATCH 51→55
