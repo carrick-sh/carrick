@@ -205,6 +205,26 @@ fn main() {
             libc::listxattr(path.as_ptr(), buf.as_mut_ptr() as *mut _, buf.len())
         };
         println!("listxattr={}", rc_or_err(lr as i64));
+
+        // removexattr round-trip: drop the attr just set, then a get must report
+        // ENODATA and a second remove (now absent) likewise ENODATA; removing
+        // from a non-existent path is ENOENT (distinct from ENODATA).
+        let rr = unsafe { libc::removexattr(path.as_ptr(), name.as_ptr()) };
+        println!("removexattr={}", rc_or_err(rr as i64));
+        let gr2 = unsafe {
+            libc::getxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                buf.as_mut_ptr() as *mut _,
+                buf.len(),
+            )
+        };
+        println!("getxattr_after_remove={}", rc_or_err(gr2 as i64));
+        let rr2 = unsafe { libc::removexattr(path.as_ptr(), name.as_ptr()) };
+        println!("removexattr_absent={}", rc_or_err(rr2 as i64));
+        let nopath = CString::new("/tmp/xattr_nope").unwrap();
+        let rr3 = unsafe { libc::removexattr(nopath.as_ptr(), name.as_ptr()) };
+        println!("removexattr_nopath={}", rc_or_err(rr3 as i64));
     }
 
     // access modes via faccessat2 with AT_EACCESS on /etc/passwd (R_OK): rc.
