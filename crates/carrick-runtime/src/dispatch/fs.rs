@@ -77,21 +77,32 @@ fn forward_record_lock<M: GuestMemory>(
     // F_GETLK: write the (possibly conflicting) lock back in Linux layout.
     if linux_cmd == LINUX_F_GETLK {
         let host_type = fl.l_type as i32;
-        let l_type_back: i16 = if host_type == libc::F_RDLCK as i32 {
-            LINUX_F_RDLCK
-        } else if host_type == libc::F_WRLCK as i32 {
-            LINUX_F_WRLCK
+        if host_type == libc::F_UNLCK as i32 {
+            // No conflicting lock. Linux leaves the caller's struct UNCHANGED
+            // except l_type = F_UNLCK — in particular l_pid keeps the value the
+            // caller passed (LTP fcntl05 pre-sets l_pid = getpid() and checks it
+            // survives). carrick previously rewrote the whole struct from the
+            // macOS flock result, which zeroes l_pid. Touch only l_type@0.
+            if memory.write_bytes(arg, &LINUX_F_UNLCK.to_le_bytes()).is_err() {
+                return DispatchOutcome::errno(LINUX_EFAULT);
+            }
         } else {
-            LINUX_F_UNLCK
-        };
-        let mut out = [0u8; 32];
-        out[0..2].copy_from_slice(&l_type_back.to_le_bytes());
-        out[2..4].copy_from_slice(&fl.l_whence.to_le_bytes());
-        out[8..16].copy_from_slice(&(fl.l_start as i64).to_le_bytes());
-        out[16..24].copy_from_slice(&(fl.l_len as i64).to_le_bytes());
-        out[24..28].copy_from_slice(&(fl.l_pid as i32).to_le_bytes());
-        if memory.write_bytes(arg, &out).is_err() {
-            return DispatchOutcome::errno(LINUX_EFAULT);
+            // Conflicting lock found: report its full details (Linux fills the
+            // whole struct, including the holder's l_pid).
+            let l_type_back: i16 = if host_type == libc::F_RDLCK as i32 {
+                LINUX_F_RDLCK
+            } else {
+                LINUX_F_WRLCK
+            };
+            let mut out = [0u8; 32];
+            out[0..2].copy_from_slice(&l_type_back.to_le_bytes());
+            out[2..4].copy_from_slice(&fl.l_whence.to_le_bytes());
+            out[8..16].copy_from_slice(&(fl.l_start as i64).to_le_bytes());
+            out[16..24].copy_from_slice(&(fl.l_len as i64).to_le_bytes());
+            out[24..28].copy_from_slice(&(fl.l_pid as i32).to_le_bytes());
+            if memory.write_bytes(arg, &out).is_err() {
+                return DispatchOutcome::errno(LINUX_EFAULT);
+            }
         }
     }
     DispatchOutcome::Returned { value: 0 }
