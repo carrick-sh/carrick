@@ -78,6 +78,26 @@ fn main() {
         }
         libc::ftruncate(fd, 4096);
 
+        // fcntl13: the kernel validates the `struct flock` BEFORE attempting the
+        // lock, regardless of fd backing. These fail before any lock is taken,
+        // so they don't perturb the conflict tests below.
+        // (e) Invalid l_whence (not SEEK_SET/CUR/END) → EINVAL.
+        let mut bad_whence = mk(F_WRLCK, 0, 10);
+        bad_whence.l_whence = 999;
+        let rc_w = flock_op(fd, F_SETLK, &mut bad_whence);
+        report!(setlk_bad_whence_einval = rc_w == -1 && errno() == libc::EINVAL);
+        // (f) A bad (PROT_NONE, unreadable) flock pointer → EFAULT.
+        let bad = libc::mmap(
+            std::ptr::null_mut(),
+            4096,
+            libc::PROT_NONE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        );
+        let rc_f = libc::syscall(libc::SYS_fcntl, fd, F_SETLK, bad);
+        report!(setlk_bad_ptr_efault = rc_f == -1 && errno() == libc::EFAULT);
+
         // Parent takes a WRITE lock on [0,10).
         let mut wl = mk(F_WRLCK, 0, 10);
         let parent_lock_ok = flock_op(fd, F_SETLK, &mut wl) == 0;
