@@ -166,9 +166,36 @@ impl SyscallDispatcher {
 
 impl SyscallDispatcher {
     define_syscall! {
-        fn fadvise64(this, cx, fd: Fd, _offset: u64, _len: u64, _advice: u64) {
+        fn fadvise64(this, cx, fd: Fd, _offset: u64, _len: u64, advice: u64) {
             if !this.fd_is_valid(fd.0) && !is_stdio_fd(fd.0) {
                 return Ok(LINUX_EBADF.into());
+            }
+            // Linux's generic_fadvise rejects a pipe/FIFO with ESPIPE (checked
+            // before the advice value), so posix_fadvise04 (a real pipe) → ESPIPE.
+            // A /dev chardev is also a HostPipe in carrick but is NOT a FIFO, so
+            // ask the host kernel (fstat S_IFIFO) rather than keying on the
+            // variant alone.
+            if let Some(open_file) = this.open_file(fd.0) {
+                let is_fifo = match &*open_file.description.read() {
+                    OpenDescription::PipeReader { .. } | OpenDescription::PipeWriter { .. } => true,
+                    OpenDescription::HostPipe { host_fd, .. } => {
+                        let mut st: libc::stat = unsafe { core::mem::zeroed() };
+                        let fstat_ok = unsafe { libc::fstat(*host_fd, &mut st) } == 0;
+                        fstat_ok
+                            && (st.st_mode as u32 & libc::S_IFMT as u32)
+                                == libc::S_IFIFO as u32
+                    }
+                    _ => false,
+                };
+                if is_fifo {
+                    return Ok(LINUX_ESPIPE.into());
+                }
+            }
+            // POSIX_FADV_{NORMAL,RANDOM,SEQUENTIAL,WILLNEED,DONTNEED,NOREUSE} =
+            // 0..=5 on aarch64 (asm-generic values); anything else is EINVAL
+            // (posix_fadvise03). advice is u64, so a negative arg is huge → caught.
+            if advice > 5 {
+                return Ok(LINUX_EINVAL.into());
             }
             Ok(DispatchOutcome::Returned { value: 0 })
         }

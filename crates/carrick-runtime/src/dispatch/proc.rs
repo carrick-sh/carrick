@@ -287,7 +287,10 @@ impl SyscallDispatcher {
             kqueue: std::sync::Arc::new(kqueue),
             base: OpenDescriptionBase::new(status_flags),
         };
-        self.install_fd(description, 0)
+        // Linux creates the pidfd with O_CLOEXEC unconditionally (the flags arg
+        // only carries PIDFD_NONBLOCK), so the returned fd must have FD_CLOEXEC
+        // set — pidfd_open01 asserts F_GETFD & FD_CLOEXEC.
+        self.install_fd(description, LINUX_FD_CLOEXEC)
     }
 
     /// Allocate a pidfd referring to freshly-forked `child_pid` and return its
