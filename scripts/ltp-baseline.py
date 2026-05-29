@@ -38,6 +38,12 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 INVENTORY = os.path.join(ROOT, "docs", "ltp-baseline", "inventory.json")
 RESULTS = os.path.join(ROOT, "docs", "ltp-baseline", "results.jsonl")
+# Docker's verdict for a test is STABLE per image, so cache it and skip the
+# (~2s/test) Docker run on every re-sweep — roughly halves cycle time. Keyed by
+# test name → {docker, drc}. `--refresh-oracle` re-runs Docker (use when the LTP
+# image changes). NO_ORACLE/jitter tests are excluded from the denominator
+# anyway, so a stale flaky verdict can't corrupt the headline number.
+DOCKER_ORACLE = os.path.join(ROOT, "docs", "ltp-baseline", "docker-oracle.jsonl")
 CARRICK = os.environ.get("CARRICK", os.path.join(ROOT, "target", "release", "carrick"))
 KILL = os.environ.get("KILL", os.path.join(ROOT, "scripts", "sudo", "kill.sh"))
 DOCKER_IMAGE = os.environ.get("LTP_DOCKER_IMAGE", "ltp:arm64")
@@ -167,12 +173,29 @@ def tally():
               f"swept {grand} of ~1436.")
 
 
+def load_oracle():
+    """Cached Docker verdicts: test -> (verdict_tuple, rc)."""
+    oracle = {}
+    if os.path.exists(DOCKER_ORACLE):
+        with open(DOCKER_ORACLE) as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                    oracle[r["test"]] = (tuple(r["docker"]), r["drc"])
+                except Exception:
+                    pass
+    return oracle
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--area", action="append", default=[])
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--tally", action="store_true")
+    ap.add_argument("--refresh-oracle", action="store_true",
+                    help="re-run Docker instead of using the cached oracle "
+                         "(use when the LTP image changes)")
     args = ap.parse_args()
 
     if args.tally:
@@ -200,12 +223,25 @@ def main():
     print(f"baseline: {len(todo)} to run ({len(done)} already recorded) "
           f"in areas {areas}", flush=True)
 
+    oracle = {} if args.refresh_oracle else load_oracle()
+    cached = sum(1 for (_, t) in todo if t in oracle)
+    print(f"docker-oracle cache: {cached}/{len(todo)} hits "
+          f"({len(todo) - cached} Docker runs needed)", flush=True)
     os.makedirs(os.path.dirname(RESULTS), exist_ok=True)
+    oracle_out = open(DOCKER_ORACLE, "a")
     with open(RESULTS, "a") as out:
         for i, (area, test) in enumerate(todo, 1):
-            dtext, drc = run_docker(test)
+            if test in oracle:
+                dverd, drc = oracle[test]
+            else:
+                dtext, drc = run_docker(test)
+                dverd = parse_verdict(dtext)
+                oracle[test] = (dverd, drc)
+                oracle_out.write(
+                    json.dumps({"test": test, "docker": dverd, "drc": drc}) + "\n")
+                oracle_out.flush()
             ctext, crc = run_carrick(test)
-            dverd, cverd = parse_verdict(dtext), parse_verdict(ctext)
+            cverd = parse_verdict(ctext)
             cls = classify(dverd, drc, cverd, crc)
             rec = {"test": test, "area": area, "class": cls,
                    "docker": dverd, "carrick": cverd,
@@ -214,6 +250,7 @@ def main():
             out.flush()
             print(f"[{i}/{len(todo)}] {cls:9s} {area}/{test} "
                   f"docker{dverd} carrick{cverd}", flush=True)
+    oracle_out.close()
 
 
 if __name__ == "__main__":
