@@ -56,22 +56,29 @@ SysV-semaphore, and SysV-msg-queue fixes landed against it.
 
 | area | MATCH | PARTIAL | DIFF | TBROK | TIMEOUT | NO_ORACLE | total | verified-MATCH (of oracle-valid) |
 |---|---|---|---|---|---|---|---|---|
-| timers     | 26 | 0 | 2   | 8  | 0 | 19  | 55  | **72%** |
-| signals    | 32 | 0 | 7   | 7  | 3 | 2   | 51  | **65%** |
-| epoll_poll | 30 | 3 | 7   | 13 | 0 | 9   | 62  | **57%** |
+| timers     | 26 | 0 | 2   | 7  | 0 | 20  | 55  | **74%** |
+| signals    | 33 | 0 | 7   | 6  | 3 | 2   | 51  | **67%** |
+| epoll_poll | 30 | 3 | 7   | 12 | 0 | 10  | 62  | **58%** |
 | sched      | 28 | 0 | 16  | 5  | 0 | 18  | 67  | **57%** |
-| other      | 36 | 1 | 29  | 2  | 0 | 53  | 121 | **53%** |
-| fs         | 142| 0 | 115 | 44 | 0 | 141 | 442 | **47%** |
-| process    | 87 | 1 | 52  | 45 | 1 | 206 | 392 | **47%** |
-| ipc        | 14 | 0 | 14  | 12 | 0 | 7   | 47  | **35%** (sem + msg queues now functional) |
-| net        | 12 | 0 | 15  | 10 | 0 | 16  | 53  | **32%** |
+| other      | 41 | 2 | 23  | 2  | 0 | 53  | 121 | **60%** |
+| fs         | 147| 0 | 113 | 41 | 0 | 141 | 442 | **49%** |
+| process    | 111| 1 | 31  | 41 | 2 | 206 | 392 | **60%** |
+| ipc        | 14 | 0 | 14  | 12 | 0 | 7   | 47  | **35%** (sem + msg queues functional) |
+| net        | 13 | 0 | 15  | 9  | 0 | 16  | 53  | **35%** |
 | mm         | 18 | 1 | 32  | 22 | 1 | 43  | 117 | **24%** |
-| xattr      | 0  | 0 | 4   | 1  | 0 | 24  | 29  | **0%** |
-| **TOTAL**  | **425** | **6** | **293** | **169** | **5** | **538** | **1436** | **425/898 = 47%** |
+| xattr      | 1  | 0 | 3   | 1  | 0 | 24  | 29  | **20%** (ENOATTR→ENODATA) |
+| **TOTAL**  | **462** | **7** | **263** | **158** | **6** | **540** | **1436** | **462/896 = 52%** |
+
+_Refreshed 2026-05-28 against HEAD (re-swept the 473 non-MATCH oracle-valid
+tests after the post-14:25 fixes: set\*id cred model, ENAMETOOLONG/ENOTDIR,
+ioprio/vhangup, getrandom, capget, ENOATTR→ENODATA). +37 MATCH vs the committed
+425; `process` jumped 87→111 from the set\*id keystone. NO_ORACLE 538→540 = 2
+Docker-side jitter tests (re-confirm not masking a regression)._
 
 ### The target (DoD #2)
 
-Baseline: **47% verified-MATCH** of oracle-valid tests (425/898; full sweep).
+Live: **52% verified-MATCH** of oracle-valid tests (462/896; full sweep, HEAD).
+Committed baseline was 47% (425/898).
 The climbing gate:
 - **Phase 1 — 60%**: clear the biggest TBROK framework-blocker classes (ipc
   msg-queues, the `mount(tmpfs)` setup, the tst_test variant-switching hang)
