@@ -621,13 +621,18 @@ fn synthetic_proc_self_status(executable_path: &str) -> String {
     let rss_kb = host.resident_bytes / 1024;
     let peak_kb = (host.virtual_bytes.max(host.maxrss_bytes)) / 1024;
     let hwm_kb = host.maxrss_bytes / 1024;
+    // Pid/Tgid must match what getpid()/gettid() return (std::process::id()),
+    // not a hardcoded 1 — LTP gettid01 reads /proc/self/status "Pid:" and
+    // asserts it equals gettid()/getpid(). A single-threaded process has
+    // Pid == Tgid.
+    let pid = std::process::id();
     format!(
         "Name:\t{comm}\n\
 Umask:\t0022\n\
 State:\tR (running)\n\
-Tgid:\t1\n\
+Tgid:\t{pid}\n\
 Ngid:\t0\n\
-Pid:\t1\n\
+Pid:\t{pid}\n\
 PPid:\t0\n\
 TracerPid:\t0\n\
 Uid:\t0\t0\t0\t0\n\
