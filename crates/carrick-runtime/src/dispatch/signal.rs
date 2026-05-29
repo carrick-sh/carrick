@@ -210,6 +210,37 @@ impl SyscallDispatcher {
         s.altstack.remove(&tid);
     }
 
+    /// Re-key a thread's per-thread signal state from `old` to `new` across
+    /// fork(2): the child gets a NEW tid (its own pid) but INHERITS the
+    /// parent's blocked mask and alternate signal stack (POSIX). The pending
+    /// set is NOT migrated — fork clears the child's pending signals. Without
+    /// this, the child's per-tid lookups miss (the state stays orphaned under
+    /// the parent's tid) and an inherited SA_ONSTACK alt stack is silently lost.
+    /// (audit M2; probe forkaltstack)
+    pub fn migrate_thread_signal_state(
+        &self,
+        old: crate::thread::ThreadId,
+        new: crate::thread::ThreadId,
+    ) {
+        if old == new {
+            return;
+        }
+        let mut s = self.signal.lock();
+        if let Some(mask) = s.masks.remove(&old) {
+            s.masks.insert(new, mask);
+        }
+        if let Some(alt) = s.altstack.remove(&old) {
+            s.altstack.insert(new, alt);
+        }
+        if let Some(rm) = s.restore_masks.remove(&old) {
+            s.restore_masks.insert(new, rm);
+        }
+        // fork clears the child's pending set; drop any stale entries keyed
+        // under the new tid so the child starts clean.
+        s.pendings.remove(&new);
+        s.rt_pending_counts.retain(|(t, _), _| *t != new);
+    }
+
     /// Reset signal dispositions across `execve(2)`, matching the kernel: every
     /// CAUGHT signal (a handler installed) is reset to `SIG_DFL`; `SIG_IGN`
     /// dispositions are PRESERVED; the blocked mask and pending signals are
