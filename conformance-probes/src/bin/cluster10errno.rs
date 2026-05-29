@@ -5,6 +5,8 @@
 //!   - posix_fadvise on a pipe/FIFO → ESPIPE.                  — posix_fadvise04
 //!   - ftruncate on a read-only fd → EINVAL (NOT EBADF; the fd is valid, it is
 //!     just not open for writing).                             — ftruncate03
+//!   - fdatasync on a char device (/dev/null) → EINVAL; bad fd → EBADF;
+//!     regular file → 0.                                       — fdatasync02/01
 //!
 //! Deterministic booleans only; the harness diffs carrick vs real Linux
 //! line-exact. (All four are oracle-agreed: Docker linux/arm64 cleanly passes
@@ -79,6 +81,30 @@ fn main() {
         println!("ftruncate_ro_not_ebadf={}", !(rc == -1 && e == libc::EBADF));
         if rofd >= 0 {
             libc::close(rofd);
+        }
+
+        // (5) fdatasync: a char device (/dev/null) has no ->fsync op → EINVAL;
+        //     an invalid fd → EBADF; a regular file → 0.
+        let devnull = open("/dev/null", libc::O_RDONLY, 0);
+        let rc = libc::fdatasync(devnull);
+        println!(
+            "fdatasync_devnull_einval={}",
+            rc == -1 && errno() == libc::EINVAL
+        );
+        if devnull >= 0 {
+            libc::close(devnull);
+        }
+        let rc = libc::fdatasync(-1);
+        println!("fdatasync_badfd_ebadf={}", rc == -1 && errno() == libc::EBADF);
+        let rfd = open(
+            "/tmp/cl10_sync",
+            libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC,
+            0o644,
+        );
+        let rc = libc::fdatasync(rfd);
+        println!("fdatasync_regular_ok={}", rc == 0);
+        if rfd >= 0 {
+            libc::close(rfd);
         }
     }
 }
