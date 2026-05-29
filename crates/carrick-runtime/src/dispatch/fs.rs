@@ -1553,7 +1553,7 @@ impl SyscallDispatcher {
             };
             let mut table = this.io.open_files.write();
             if let Some(replaced) = table.remove(&new_fd.0) {
-                close_open_file(&replaced);
+                this.close_open_file_and_free_pty(&replaced);
             }
             retain_open_file(&description);
             table.insert(
@@ -2414,20 +2414,56 @@ impl SyscallDispatcher {
             let size = size;
             let arg0 = dirfd;
             let arg1 = pathname.0;
-            if size != LINUX_OPEN_HOW_SIZE {
+            // copy_struct_from_user semantics for `open_how`:
+            //  - size < sizeof(open_how) (incl. 0) → EINVAL (openat203 invalid-size-zero);
+            //  - size > sizeof: the trailing bytes are forward-compat padding —
+            //    they must be readable (else EFAULT, openat203 invalid-size-big)
+            //    and all zero (else E2BIG, invalid-size-big-with-pad); zero pad
+            //    is accepted (openat201 case 15 uses sizeof+8 with zero pad).
+            if size < LINUX_OPEN_HOW_SIZE {
                 return Ok(LINUX_EINVAL.into());
+            }
+            if size > LINUX_OPEN_HOW_SIZE {
+                let pad_len = (size - LINUX_OPEN_HOW_SIZE) as usize;
+                match (*cx.memory).read_bytes(how_address + LINUX_OPEN_HOW_SIZE, pad_len) {
+                    Ok(pad) => {
+                        if pad.iter().any(|&b| b != 0) {
+                            return Ok(LINUX_E2BIG.into());
+                        }
+                    }
+                    Err(_) => return Ok(LINUX_EFAULT.into()),
+                }
             }
             let how = match read_open_how(&*cx.memory, how_address) {
                 Ok(how) => how,
                 Err(errno) => return Ok(errno.into()),
             };
-            if how.mode != 0
-                || how.resolve != 0
-                || how.flags & !(LINUX_O_CLOEXEC | LINUX_O_NONBLOCK) != 0
-            {
+            // open_how validation, matching the kernel's build_open_how():
+            //  - mode must be within 0o7777 (openat203 invalid-mode: mode=-1);
+            //  - mode may be nonzero only when creating (openat203 invalid-flags:
+            //    mode set without O_CREAT/O_TMPFILE → EINVAL);
+            //  - resolve may carry only known RESOLVE_* bits (openat203
+            //    invalid-resolve: resolve=-1 → EINVAL).
+            let mode = how.mode;
+            let flags = how.flags;
+            let resolve = how.resolve;
+            if mode & !0o7777 != 0 {
                 return Ok(LINUX_EINVAL.into());
             }
-            this.open_at_path(arg0, arg1, how.flags, how.mode, &*cx.memory, cx.reporter)
+            if mode != 0 && flags & (LINUX_O_CREAT | crate::linux_abi::LINUX_O_TMPFILE) == 0 {
+                return Ok(LINUX_EINVAL.into());
+            }
+            // RESOLVE_{NO_XDEV,NO_MAGICLINKS,NO_SYMLINKS,BENEATH,IN_ROOT,CACHED}.
+            const VALID_RESOLVE: u64 = 0x3f;
+            if resolve & !VALID_RESOLVE != 0 {
+                return Ok(LINUX_EINVAL.into());
+            }
+            // Pass the real flags + mode through to the shared open path (which
+            // validates the open flags and yields EBADF for a bad dirfd / EFAULT
+            // for a bad pathname). carrick does not yet ENFORCE the RESOLVE_*
+            // path restrictions (tracked — openat202); accepting them lets normal
+            // opens through (openat201, previously rejected by a 2-flag whitelist).
+            this.open_at_path(arg0, arg1, flags, mode, &*cx.memory, cx.reporter)
 
         }
 
