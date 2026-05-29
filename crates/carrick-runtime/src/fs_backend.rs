@@ -1242,7 +1242,25 @@ impl FsBackend for HostFsBackend {
             let kind = match entry.file_type() {
                 Ok(ft) if ft.is_dir() => RootFsEntryKind::Directory,
                 Ok(ft) if ft.is_symlink() => RootFsEntryKind::Symlink,
-                _ => RootFsEntryKind::File,
+                _ => {
+                    // cap-std's FileType only distinguishes dir/symlink, so a
+                    // FIFO falls here. It MUST be classified as Fifo (via the
+                    // raw mode — fstatat, no open): downstream readdir size
+                    // lookup reads File contents, and opening a writer-less
+                    // FIFO O_RDONLY blocks the dispatcher forever (the tst_test
+                    // framework-hang). S_IFIFO check keeps it path-based.
+                    use cap_std::fs::MetadataExt;
+                    let is_fifo = entry
+                        .metadata()
+                        .ok()
+                        .map(|m| m.mode() & (libc::S_IFMT as u32) == libc::S_IFIFO as u32)
+                        .unwrap_or(false);
+                    if is_fifo {
+                        RootFsEntryKind::Fifo
+                    } else {
+                        RootFsEntryKind::File
+                    }
+                }
             };
             out.push((name, kind));
         }
@@ -1901,9 +1919,21 @@ pub fn layered_directory_entries(
         let path = joined(dir, &name);
         let normalized = normalize(&path).unwrap_or_default();
         let metadata = match kind {
+            // A FIFO must NEVER be read here: `file_contents` opens the node
+            // O_RDONLY and a writer-less FIFO open BLOCKS the dispatcher thread
+            // forever. This is the tst_test framework-hang — a test that
+            // mknod()s a FIFO in its tmpdir, then the framework openat()s the
+            // tmpdir (O_DIRECTORY) and enumerates it, wedging on the FIFO's
+            // size lookup. A FIFO's stat size is 0, so just report that.
+            RootFsEntryKind::Fifo => RootFsMetadata {
+                path: normalized,
+                kind,
+                mode: 0o644,
+                size: 0,
+            },
             // CharDevice never appears in the writable overlay (it only comes
             // from the /dev VFS mounts), but the match must be exhaustive.
-            RootFsEntryKind::File | RootFsEntryKind::CharDevice | RootFsEntryKind::Fifo => {
+            RootFsEntryKind::File | RootFsEntryKind::CharDevice => {
                 let size = overlay.file_contents(&path).map(|b| b.len()).unwrap_or(0);
                 RootFsMetadata {
                     path: normalized,
