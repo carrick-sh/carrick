@@ -1102,6 +1102,7 @@ impl SyscallDispatcher {
         276 => renameat2,
         277 => sys_seccomp,
         278 => getrandom,
+        279 => memfd_create,
         424 => pidfd_send_signal,
         425 => io_uring_setup,
         426 => io_uring_enter,
