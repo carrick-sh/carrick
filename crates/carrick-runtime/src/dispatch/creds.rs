@@ -27,6 +27,12 @@ pub(super) struct CredState {
     pub rgid: u32,
     pub egid: u32,
     pub sgid: u32,
+    /// Filesystem uid/gid (the id used for VFS access checks). Tracks euid/egid
+    /// by default — every set*uid/set*gid resets it to the new euid/egid — but
+    /// setfsuid/setfsgid can point it elsewhere independently. setfs*id returns
+    /// the PREVIOUS value (LTP setfsuid01/03, setfsgid01/02).
+    pub fsuid: u32,
+    pub fsgid: u32,
     pub umask: u32,
 }
 
@@ -41,6 +47,8 @@ impl CredState {
             rgid: 0,
             egid: 0,
             sgid: 0,
+            fsuid: 0,
+            fsgid: 0,
             umask: LINUX_DEFAULT_UMASK,
         }
     }
@@ -298,7 +306,7 @@ impl SyscallDispatcher {
             let priv_ = creds.is_privileged();
             match setid::setres(priv_, (creds.ruid, creds.euid, creds.suid),
                                  keep_or(r), keep_or(e), keep_or(s)) {
-                Ok((ru, eu, su)) => { creds.ruid = ru; creds.euid = eu; creds.suid = su; }
+                Ok((ru, eu, su)) => { creds.ruid = ru; creds.euid = eu; creds.suid = su; creds.fsuid = creds.euid; }
                 Err(()) => return Ok(LINUX_EPERM.into()),
             }
             let new_euid = creds.euid;
@@ -312,7 +320,7 @@ impl SyscallDispatcher {
             let priv_ = creds.is_privileged();
             match setid::setres(priv_, (creds.rgid, creds.egid, creds.sgid),
                                  keep_or(r), keep_or(e), keep_or(s)) {
-                Ok((rg, eg, sg)) => { creds.rgid = rg; creds.egid = eg; creds.sgid = sg; }
+                Ok((rg, eg, sg)) => { creds.rgid = rg; creds.egid = eg; creds.sgid = sg; creds.fsgid = creds.egid; }
                 Err(()) => return Ok(LINUX_EPERM.into()),
             }
             Ok(DispatchOutcome::Returned { value: 0 })
@@ -323,7 +331,7 @@ impl SyscallDispatcher {
             let priv_ = creds.is_privileged();
             match setid::setre(priv_, (creds.ruid, creds.euid, creds.suid),
                                keep_or(r), keep_or(e)) {
-                Ok((ru, eu, su)) => { creds.ruid = ru; creds.euid = eu; creds.suid = su; }
+                Ok((ru, eu, su)) => { creds.ruid = ru; creds.euid = eu; creds.suid = su; creds.fsuid = creds.euid; }
                 Err(()) => return Ok(LINUX_EPERM.into()),
             }
             let new_euid = creds.euid;
@@ -337,7 +345,7 @@ impl SyscallDispatcher {
             let priv_ = creds.is_privileged();
             match setid::setre(priv_, (creds.rgid, creds.egid, creds.sgid),
                                keep_or(r), keep_or(e)) {
-                Ok((rg, eg, sg)) => { creds.rgid = rg; creds.egid = eg; creds.sgid = sg; }
+                Ok((rg, eg, sg)) => { creds.rgid = rg; creds.egid = eg; creds.sgid = sg; creds.fsgid = creds.egid; }
                 Err(()) => return Ok(LINUX_EPERM.into()),
             }
             Ok(DispatchOutcome::Returned { value: 0 })
@@ -347,7 +355,7 @@ impl SyscallDispatcher {
             let mut creds = this.creds.lock();
             let priv_ = creds.is_privileged();
             match setid::set(priv_, (creds.ruid, creds.euid, creds.suid), u as u32) {
-                Ok((ru, eu, su)) => { creds.ruid = ru; creds.euid = eu; creds.suid = su; }
+                Ok((ru, eu, su)) => { creds.ruid = ru; creds.euid = eu; creds.suid = su; creds.fsuid = creds.euid; }
                 Err(()) => return Ok(LINUX_EPERM.into()),
             }
             let new_euid = creds.euid;
@@ -360,7 +368,7 @@ impl SyscallDispatcher {
             let mut creds = this.creds.lock();
             let priv_ = creds.is_privileged();
             match setid::set(priv_, (creds.rgid, creds.egid, creds.sgid), g as u32) {
-                Ok((rg, eg, sg)) => { creds.rgid = rg; creds.egid = eg; creds.sgid = sg; }
+                Ok((rg, eg, sg)) => { creds.rgid = rg; creds.egid = eg; creds.sgid = sg; creds.fsgid = creds.egid; }
                 Err(()) => return Ok(LINUX_EPERM.into()),
             }
             Ok(DispatchOutcome::Returned { value: 0 })
@@ -417,17 +425,42 @@ impl SyscallDispatcher {
             Ok(DispatchOutcome::Returned { value: 1 })
         }
 
-        fn sys_setfsuid(this, cx, _uid: u64) {
-            let creds = this.cred_snapshot();
+        fn sys_setfsuid(this, cx, uid: u64) {
+            // Always returns the PREVIOUS fsuid (setfsuid never fails). The new
+            // fsuid takes effect only if privileged or `uid` already matches one
+            // of {ruid, euid, suid, fsuid}; `(uid_t)-1` is a pure query.
+            let mut creds = this.creds.lock();
+            let prev = creds.fsuid;
+            let uid = uid as u32;
+            if uid != u32::MAX
+                && (creds.is_privileged()
+                    || uid == creds.ruid
+                    || uid == creds.euid
+                    || uid == creds.suid
+                    || uid == creds.fsuid)
+            {
+                creds.fsuid = uid;
+            }
             Ok(DispatchOutcome::Returned {
-                value: i64::from(creds.euid),
+                value: i64::from(prev),
             })
         }
 
-        fn sys_setfsgid(this, cx, _gid: u64) {
-            let creds = this.cred_snapshot();
+        fn sys_setfsgid(this, cx, gid: u64) {
+            let mut creds = this.creds.lock();
+            let prev = creds.fsgid;
+            let gid = gid as u32;
+            if gid != u32::MAX
+                && (creds.is_privileged()
+                    || gid == creds.rgid
+                    || gid == creds.egid
+                    || gid == creds.sgid
+                    || gid == creds.fsgid)
+            {
+                creds.fsgid = gid;
+            }
             Ok(DispatchOutcome::Returned {
-                value: i64::from(creds.egid),
+                value: i64::from(prev),
             })
         }
 
