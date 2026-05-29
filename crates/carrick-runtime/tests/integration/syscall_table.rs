@@ -230,15 +230,13 @@ fn manifest_records_group_handler_and_compatibility_notes() {
     assert_eq!(pselect6.handler, SyscallHandler::Network);
     assert_eq!(pselect6.compat_note, None);
 
+    // signalfd4 (nr 74) is implemented (validates sizemask/flags, installs a
+    // SignalFd description) — it is a real Signal handler, not a bootstrap ENOSYS
+    // stub, so it carries no ENOSYS compat note.
     let signalfd4 = lookup_aarch64(74).unwrap();
     assert_eq!(signalfd4.group, "signal");
-    assert_eq!(signalfd4.handler, SyscallHandler::BootstrapStub);
-    assert!(
-        signalfd4
-            .compat_note
-            .is_some_and(|note| note.contains("ENOSYS")),
-        "bootstrap stubs must carry an explicit compatibility note",
-    );
+    assert_eq!(signalfd4.handler, SyscallHandler::Signal);
+    assert_eq!(signalfd4.compat_note, None);
 
     let getrusage = lookup_aarch64(165).unwrap();
     assert_eq!(getrusage.group, "process");

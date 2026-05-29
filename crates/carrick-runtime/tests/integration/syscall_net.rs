@@ -2581,7 +2581,24 @@ fn signalfd4_vmsplice_tee_bootstrap_return_enosys() {
     let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
-    for number in [74_u64, 75, 77] {
+    // signalfd4 (nr 74) is implemented. With sizemask=0 (!= sizeof(sigset_t)=8)
+    // Linux rejects with EINVAL(22) before touching the mask pointer
+    // (fs/signalfd.c: `if (sizemask != sizeof(sigset_t)) return -EINVAL`),
+    // verified against docker linux/arm64.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(74, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 22 },
+        "signalfd4 with sizemask != 8 should return EINVAL"
+    );
+
+    // vmsplice (75) and tee (77) are not yet implemented; carrick returns ENOSYS.
+    for number in [75_u64, 77] {
         assert_eq!(
             dispatcher
                 .dispatch(
