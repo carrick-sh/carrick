@@ -197,6 +197,7 @@ underlying gap got fixed):
 | fcntl(F_GETFL/F_SETFL/F_GETFD/F_SETFD) on stdio (0/1/2) returns the right errnos (the dpkg `fcntl(0, F_SETFL, O_NONBLOCK)→EBADF` regression gate) | ✅ `fcntlstdio` | fcntl01–35, dup01–06 |
 | **pidfd_open sets FD_CLOEXEC; posix_fadvise out-of-range advice→EINVAL + pipe(FIFO)→ESPIPE; ftruncate read-only fd→EINVAL (not EBADF); a freshly `O_RDONLY\|O_CREAT`'d file is a non-writable fd (guest writability follows the access mode, not O_CREAT); fsync/fdatasync on a pipe/socket/char-device→EINVAL (dir/regular unaffected)** | ✅ `cluster10errno` | pidfd_open01, posix_fadvise03, posix_fadvise04, ftruncate03, fdatasync01/02 |
 | **fcntl file leases (F_SETLEASE/F_GETLEASE, recorded per open-file-description): O_RDONLY read-lease round-trip RDLCK↔UNLCK; bad lease type→EINVAL; F_RDLCK on a write-capable fd→EAGAIN (fcntl32 cross-process F_WRLCK conflict deferred — needs inode-wide opener count)** | ✅ `fcntllease` | fcntl23–27 (+_64) |
+| **positional/vector read on a special fd: pread on a pipe→ESPIPE, pread/readv on a directory→EISDIR (was EINVAL); pread on a regular file unaffected** | ✅ `preadspecial` | pread02 (+_64), readv02 (preadv02/202 negative-offset/iovec residual deferred) |
 
 ## mm (memory management)
 

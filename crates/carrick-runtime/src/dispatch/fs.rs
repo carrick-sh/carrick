@@ -2848,8 +2848,13 @@ impl SyscallDispatcher {
                 OpenDescription::HostFile { .. } => {
                     return Ok(LINUX_EINVAL.into());
                 }
-                OpenDescription::Directory { .. }
-                | OpenDescription::EventFd { .. }
+                // readv on a directory is EISDIR (readv02). Other non-regular
+                // fds keep EINVAL here (readv on a pipe/socket reading at the
+                // current offset is a separate, untested path).
+                OpenDescription::Directory { .. } => {
+                    return Ok(LINUX_EISDIR.into());
+                }
+                OpenDescription::EventFd { .. }
                 | OpenDescription::TimerFd { .. }
                 | OpenDescription::Epoll { .. }
                 | OpenDescription::Pidfd { .. }
@@ -2911,8 +2916,10 @@ impl SyscallDispatcher {
                 OpenDescription::HostFile { .. } => {
                     return Ok(LINUX_EINVAL.into());
                 }
-                OpenDescription::Directory { .. }
-                | OpenDescription::EventFd { .. }
+                OpenDescription::Directory { .. } => {
+                    return Ok(LINUX_EISDIR.into());
+                }
+                OpenDescription::EventFd { .. }
                 | OpenDescription::TimerFd { .. }
                 | OpenDescription::Epoll { .. }
                 | OpenDescription::Pidfd { .. }
@@ -2923,7 +2930,9 @@ impl SyscallDispatcher {
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::SignalFd { .. }
                 | OpenDescription::Netlink { .. } => {
-                    return Ok(LINUX_EINVAL.into());
+                    // Positional read on a non-seekable fd (pipe/socket/anon) is
+                    // ESPIPE on Linux; a directory is EISDIR (above). pread02.
+                    return Ok(LINUX_ESPIPE.into());
                 }
             };
 
@@ -2996,8 +3005,10 @@ impl SyscallDispatcher {
                 OpenDescription::HostFile { .. } => {
                     return Ok(LINUX_EINVAL.into());
                 }
-                OpenDescription::Directory { .. }
-                | OpenDescription::EventFd { .. }
+                OpenDescription::Directory { .. } => {
+                    return Ok(LINUX_EISDIR.into());
+                }
+                OpenDescription::EventFd { .. }
                 | OpenDescription::TimerFd { .. }
                 | OpenDescription::Epoll { .. }
                 | OpenDescription::Pidfd { .. }
@@ -3008,7 +3019,9 @@ impl SyscallDispatcher {
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::SignalFd { .. }
                 | OpenDescription::Netlink { .. } => {
-                    return Ok(LINUX_EINVAL.into());
+                    // Positional read on a non-seekable fd → ESPIPE; directory →
+                    // EISDIR (above). preadv02.
+                    return Ok(LINUX_ESPIPE.into());
                 }
             };
             let read_len = read_from_contents_at(memory, contents, offset, &iovecs)?;
