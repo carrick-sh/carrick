@@ -4464,14 +4464,38 @@ impl SyscallDispatcher {
                     // stamp the creating process's owner — mkdir previously dropped
                     // both, so DAC checks against the new dir were wrong.
                     let creds = this.cred_snapshot();
-                    let create_mode = (mode as u32 & 0o7777) & !(creds.umask & 0o777);
+                    let mut create_mode = (mode as u32 & 0o7777) & !(creds.umask & 0o777);
+                    let mut owner_gid = creds.egid;
+                    // setgid-directory inheritance (LTP mkdir02/04): a new dir in
+                    // a parent with S_ISGID inherits the parent's GID *and* gets
+                    // S_ISGID itself (so a shared-group subtree propagates).
+                    // Otherwise the new dir's group is the creator's egid.
+                    let mut inherited_gid = false;
+                    const S_ISGID: u32 = 0o2000;
+                    if let Some(parent) = Path::new(&resolved).parent() {
+                        let parent_str = display_rootfs_path(parent);
+                        if let Ok(pmd) = this.layered_metadata(&parent_str)
+                            && pmd.mode & S_ISGID != 0
+                        {
+                            create_mode |= S_ISGID;
+                            if let Some((_, pgid)) =
+                                this.fs.rootfs_vfs.overlay.get_owner(&parent_str)
+                            {
+                                owner_gid = pgid;
+                                inherited_gid = true;
+                            }
+                        }
+                    }
                     let _ = this.fs.rootfs_vfs.overlay.set_mode(&resolved, create_mode);
-                    if creds.euid != 0 || creds.egid != 0 {
+                    // Stamp the owner when it's non-root OR the gid was inherited
+                    // from a setgid parent (so a root-created dir still records the
+                    // inherited group).
+                    if creds.euid != 0 || owner_gid != 0 || inherited_gid {
                         let _ = this
                             .fs
                             .rootfs_vfs
                             .overlay
-                            .set_owner(&resolved, creds.euid, creds.egid);
+                            .set_owner(&resolved, creds.euid, owner_gid);
                     }
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
