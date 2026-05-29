@@ -674,6 +674,14 @@ struct HvfMappedRegion {
     /// runs in a forked child that writes pass/fail counts to a `MAP_SHARED`
     /// results file the parent then reads.)
     guest_shared: bool,
+    /// The guest's INTENDED writability (Linux PROT_WRITE), tracked separately
+    /// from `perms` — alias regions force `perms` to RWX for the HVF stage-2
+    /// translation quirk, so it cannot be used to detect a read-only mapping.
+    /// The syscall write-path (`write_guest_bytes_checked`) rejects a write into
+    /// a non-writable mapping with EFAULT instead of faulting the host (SIGBUS on
+    /// a PROT_READ MAP_SHARED file alias) or corrupting a carrick-owned
+    /// `write:false` region. (audit M1; probe `rosharedbus`)
+    guest_writable: bool,
 }
 
 /// Snapshot of vCPU register state captured before fork(2). The child
@@ -723,6 +731,7 @@ struct ThreadMappingDesc {
     size: usize,
     perms: applevisor::memory::MemPerms,
     guest_shared: bool,
+    guest_writable: bool,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -736,6 +745,7 @@ impl ThreadMappingDesc {
             size: region.size,
             perms: region.perms,
             guest_shared: region.guest_shared,
+            guest_writable: region.guest_writable,
         }
     }
 
@@ -750,6 +760,7 @@ impl ThreadMappingDesc {
             memory: None,
             host_mapping: None,
             guest_shared: self.guest_shared,
+            guest_writable: self.guest_writable,
         }
     }
 }
@@ -763,6 +774,7 @@ struct ForkMappingDesc {
     size: usize,
     perms: applevisor::memory::MemPerms,
     guest_shared: bool,
+    guest_writable: bool,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1559,6 +1571,14 @@ impl HvfInner {
         file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
     ) -> Result<(), TrapError> {
         let size = usize::try_from(len).map_err(|_| TrapError::MappingTooLarge(len))?;
+        // The host page is mapped at the guest's actual prot (map_shared_file),
+        // so a PROT_READ file alias has a read-only host backing. Track the
+        // guest-intended writability so the syscall write-path returns EFAULT
+        // instead of SIGBUS-ing the host. Anon aliases are RW-backed.
+        let alias_guest_writable = match file {
+            Some((_, _, prot)) => prot & libc::PROT_WRITE != 0,
+            None => true,
+        };
         let host_mapping = match file {
             // Live MAP_SHARED file: back the guest region with the file's page
             // cache directly, so writes are coherent with other openers and
@@ -1632,6 +1652,7 @@ impl HvfInner {
             memory: None,
             host_mapping: Some(host_mapping),
             guest_shared,
+            guest_writable: alias_guest_writable,
         });
         Ok(())
     }
@@ -1952,6 +1973,37 @@ impl HvfInner {
         let Some(mapping) = self.mapping_for_range_mut(address, length) else {
             return Err(MemoryError::OutOfBounds { address, length });
         };
+        let offset = (address - mapping.start) as usize;
+        unsafe {
+            volatile_copy_to_guest(bytes.as_ptr(), mapping.host_addr.add(offset), length);
+        }
+        Ok(())
+    }
+
+    /// Permission-respecting write used by the SYSCALL path
+    /// (`GuestMemory::write_bytes`): a write into a non-writable mapping returns
+    /// EFAULT (`MemoryError::OutOfBounds`) instead of either faulting the host
+    /// (SIGBUS on a genuinely read-only `MAP_SHARED` file alias) or silently
+    /// corrupting a carrick-owned region (the EL1 page tables / vector table are
+    /// registered `write:false`). Carrick-internal writes (vdso vvar, sigframe,
+    /// bootstrap) deliberately use the unchecked `write_guest_bytes`.
+    /// (audit M1; probe `rosharedbus`)
+    fn write_guest_bytes_checked(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+        let length = bytes.len();
+        if self.range_no_access(address, length) {
+            return Err(MemoryError::OutOfBounds { address, length });
+        }
+        let Some(mapping) = self.mapping_for_range_mut(address, length) else {
+            return Err(MemoryError::OutOfBounds { address, length });
+        };
+        // A write into a non-writable mapping (a PROT_READ MAP_SHARED file
+        // alias, or a carrick-owned write:false region) returns EFAULT to the
+        // guest instead of faulting the host (SIGBUS) or corrupting carrick
+        // state. `guest_writable` is the guest's intended PROT_WRITE, tracked
+        // separately from the (escalated) stage-2 `perms`.
+        if !mapping.guest_writable {
+            return Err(MemoryError::OutOfBounds { address, length });
+        }
         let offset = (address - mapping.start) as usize;
         unsafe {
             volatile_copy_to_guest(bytes.as_ptr(), mapping.host_addr.add(offset), length);
@@ -2541,6 +2593,7 @@ impl HvfInner {
                 size: m.size,
                 perms: m.perms,
                 guest_shared: m.guest_shared,
+                guest_writable: m.guest_writable,
             })
             .collect();
 
@@ -2572,6 +2625,7 @@ impl HvfInner {
                 size: desc.size,
                 perms: desc.perms,
                 guest_shared: desc.guest_shared,
+                guest_writable: desc.guest_writable,
             });
         }
 
@@ -2711,6 +2765,7 @@ impl HvfInner {
                 host_addr,
                 size: desc.size,
                 perms: desc.perms,
+                guest_writable: desc.guest_writable,
                 // No Memory object — the host buffer is either an inherited
                 // shared mapping or a snapshot copy. Drop runs no HVF call for
                 // this mapping; the engine's VM tear-down releases all stage-2
@@ -3073,7 +3128,9 @@ impl GuestMemory for HvfTrapEngine {
     }
 
     fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
-        self.inner.write_guest_bytes(address, bytes)
+        // Syscall path: enforce the guest-visible mapping permission so a write
+        // into a read-only / carrick-owned mapping returns EFAULT (audit M1).
+        self.inner.write_guest_bytes_checked(address, bytes)
     }
 
     fn set_no_access(&mut self, address: u64, len: usize, no_access: bool) {
@@ -3298,6 +3355,9 @@ fn map_region_raw(mapping: &GuestMapping) -> Result<HvfMappedRegion, TrapError> 
         host_mapping: Some(host_mapping),
         // Private guest RAM (data/bss/heap/stack/MAP_PRIVATE): fork snapshots it.
         guest_shared,
+        // Boot regions carry their true guest write-intent (image=RX, page
+        // tables=RO -> not writable; heap/stack/data=RW -> writable).
+        guest_writable: mapping.perms.write,
     })
 }
 
@@ -3578,6 +3638,7 @@ mod thread_sibling_tests {
             memory: None,
             host_mapping: None,
             guest_shared: true,
+            guest_writable: true,
         };
 
         let copied = ThreadMappingDesc::from_region(&region).into_unowned_region();
