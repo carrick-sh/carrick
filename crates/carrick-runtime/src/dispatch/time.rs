@@ -562,6 +562,15 @@ impl SyscallDispatcher {
 
         fn prlimit64(this, cx, pid: Pid, resource: u64, new_limit: GuestPtr, old_limit: GuestPtr) {
             let memory = &mut *cx.memory;
+            // An invalid resource (>= RLIM_NLIMITS) is EINVAL, checked before any
+            // limit read/write (LTP getrlimit02 invalid-resource-type case).
+            // Valid resources are 0..=15 (RLIMIT_CPU..RLIMIT_RTTIME); carrick
+            // previously treated unknown resources as RLIM_INFINITY and
+            // "succeeded".
+            const LINUX_RLIM_NLIMITS: u64 = 16;
+            if resource >= LINUX_RLIM_NLIMITS {
+                return Ok(LINUX_EINVAL.into());
+            }
             const LINUX_RLIMIT_NOFILE: u64 = 7;
             const LINUX_RLIMIT_NPROC: u64 = 6;
             const LINUX_RLIMIT_STACK: u64 = 3;

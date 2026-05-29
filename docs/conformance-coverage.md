@@ -230,6 +230,7 @@ underlying gap got fixed):
 |---|---|---|
 | uname/sysinfo/getrlimit/prlimit64/prctl/getrandom/sched_getaffinity/sched_yield/getpriority/gettid/umask/getcpu/capget | ✅ `sysinfo` | uname01–04, sysinfo01–03, getrlimit01–03, prlimit64_01–02, prctl01–08, getrandom01–05, sched_getaffinity01, sched_yield01, getpriority01/02, gettid01, umask01–03, getcpu01/02, capget01/02 |
 | **`PR_SET_DUMPABLE`/`PR_GET_DUMPABLE` tri-state round-trip (0↔1↔2) + EINVAL on bogus values** | ✅ `prctldumpable` | prctl04, prctl08 |
+| **prlimit64/getrlimit/setrlimit reject an invalid resource (>= RLIM_NLIMITS=16) with EINVAL before any limit read/write (was treating unknown resources as RLIM_INFINITY and succeeding); valid resources 0..15 unaffected** | ✅ `rlimitresource` | getrlimit02 (getrlimit03 per-resource default VALUES + setrlimit02/03 EPERM-raise-hard-limit deferred) |
 
 ## net / sockets / netlink / pty
 
