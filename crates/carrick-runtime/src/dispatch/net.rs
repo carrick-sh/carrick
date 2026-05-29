@@ -294,6 +294,9 @@ impl SyscallDispatcher {
             // Inotify readiness is likewise the backing kqueue's job
             // (host_fd_for_poll returns its fd); no in-memory readiness here.
             OpenDescription::Inotify { .. } => {}
+            // signalfd readiness would track pending masked signals; delivery is
+            // a tracked follow-up, so there is no in-memory readiness here.
+            OpenDescription::SignalFd { .. } => {}
             OpenDescription::PipeReader { pipe, .. } => {
                 if requested_events & LINUX_POLLIN != 0 {
                     let pipe = pipe.lock();

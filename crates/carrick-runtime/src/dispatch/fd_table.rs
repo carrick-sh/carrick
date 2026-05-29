@@ -234,6 +234,15 @@ pub(super) enum OpenDescription {
         base: OpenDescriptionBase,
         state: Arc<crate::inotify::InotifyState>,
     },
+    /// A Linux signalfd (syscall 74 `signalfd4`). macOS has no signalfd, so this
+    /// is emulated: `mask` records the signal set the fd accepts. Today only the
+    /// fd-flag surface (SFD_CLOEXEC→FD_CLOEXEC, SFD_NONBLOCK→O_NONBLOCK, both via
+    /// `base`) is exercised (signalfd4_01/02); a read()/poll() delivery path that
+    /// drains the process's pending masked signals is a tracked follow-up.
+    SignalFd {
+        base: OpenDescriptionBase,
+        mask: u64,
+    },
     // In-memory pipe ends. Currently `pipe2(2)` routes through `HostPipe`
     // (real macOS kernel pipe) so these are not constructed today, but the
     // full read/write/poll machinery (`PipeState`, `read_pipe`, `write_pipe`)
@@ -495,6 +504,7 @@ impl OpenDescription {
             | OpenDescription::HostFile { base, .. }
             | OpenDescription::HostSocket { base, .. }
             | OpenDescription::Inotify { base, .. }
+            | OpenDescription::SignalFd { base, .. }
             | OpenDescription::Netlink { base, .. } => base,
         }
     }
@@ -514,6 +524,7 @@ impl OpenDescription {
             | OpenDescription::HostFile { base, .. }
             | OpenDescription::HostSocket { base, .. }
             | OpenDescription::Inotify { base, .. }
+            | OpenDescription::SignalFd { base, .. }
             | OpenDescription::Netlink { base, .. } => base,
         }
     }
@@ -555,6 +566,9 @@ impl OpenDescription {
             }
             OpenDescription::Inotify { .. } => {
                 OpenStatSource::Record(StatRecord::synthetic("anon_inode:[inotify]", 0, 0o600))
+            }
+            OpenDescription::SignalFd { .. } => {
+                OpenStatSource::Record(StatRecord::synthetic("anon_inode:[signalfd]", 0, 0o600))
             }
             OpenDescription::PipeReader { .. } | OpenDescription::PipeWriter { .. } => {
                 OpenStatSource::Record(StatRecord::synthetic(
