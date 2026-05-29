@@ -58,16 +58,24 @@ SysV-semaphore, and SysV-msg-queue fixes landed against it.
 |---|---|---|---|---|---|---|---|---|
 | timers     | 26 | 0 | 2   | 7  | 0 | 20  | 55  | **74%** |
 | signals    | 36 | 0 | 3   | 7  | 3 | 2   | 51  | **73%** |
-| epoll_poll | 31 | 3 | 6   | 12 | 0 | 10  | 62  | **60%** |
+| epoll_poll | 32 | 3 | 6   | 11 | 0 | 10  | 62  | **62%** |
 | sched      | 32 | 0 | 12  | 5  | 0 | 18  | 67  | **65%** |
 | other      | 47 | 2 | 17  | 2  | 0 | 53  | 121 | **69%** |
-| fs         | 171| 0 | 91  | 39 | 0 | 141 | 442 | **57%** |
+| fs         | 176| 0 | 87  | 37 | 1 | 141 | 442 | **58%** |
 | process    | 113| 1 | 30  | 41 | 1 | 206 | 392 | **61%** |
 | ipc        | 14 | 0 | 14  | 12 | 0 | 7   | 47  | **35%** (sem + msg queues functional) |
 | net        | 13 | 0 | 15  | 9  | 0 | 16  | 53  | **35%** |
 | mm         | 18 | 1 | 32  | 22 | 1 | 43  | 117 | **24%** |
 | xattr      | 3  | 0 | 1   | 1  | 0 | 24  | 29  | **60%** |
-| **TOTAL**  | **504** | **7** | **223** | **157** | **5** | **540** | **1436** | **504/896 = 56%** |
+| **TOTAL**  | **510** | **7** | **219** | **154** | **6** | **540** | **1436** | **510/896 = 57%** |
+
+_Last refresh (2026-05-28): the functional-FIFO cluster (commit `31f2a7c`) added
++6 verified-MATCH — `select01` flipped to MATCH (16/16) via the FIFO O_RDWR leg +
+the select multi-set return-count fix; `mknod02–05/09`, `mknodat01` now MATCH
+(real `mkfifoat` FIFOs). fs 171→176, epoll_poll 31→32; DIFF 223→219, TBROK
+157→154. Residual in this cluster is non-FIFO: `mknod01` device-node creation
+(macOS can't `mknod` char/block devices — inherent), `mknod06` tst_test re-exec
+hang, `select03`/`pselect02` select error-edge TBROK, `mknod08` DAC EACCES._
 
 _Refreshed 2026-05-29 against HEAD after 11 M4 fix clusters (roadmap #10 errno +
 fsync, #4 signalfd4, #13 sched/priority errno, #17 flock+removexattr, #11 chmod
@@ -77,11 +85,11 @@ probe-gated; conformance gate green at 92 probes. fs jumped 142→171._
 
 ### The target (DoD #2)
 
-Live: **56% verified-MATCH** of oracle-valid tests (504/896; full sweep, HEAD;
-57% incl. partial). Committed baseline was 47% (425/898). The curated four are
+Live: **57% verified-MATCH** of oracle-valid tests (510/896; full sweep, HEAD;
+58% incl. partial). Committed baseline was 47% (425/898). The curated four are
 gated mostly by TBROK framework blockers, not errno DIFFs: signals 73% (DIFF 3 /
 TBROK 7 / TIMEOUT 3), timers 74% (DIFF 2 / TBROK 7), sched 65% (DIFF 12 / TBROK
-5), epoll 60% (DIFF 6 / TBROK 12) — clearing the tst_test framework blocker
+5), epoll 62% (DIFF 6 / TBROK 11) — clearing the tst_test framework blocker
 (+ the mkfifo-setup / functional-FIFO class) is the highest-leverage path to the
 90% curated target. (Docker-oracle cache added to the sweep harness: re-sweeps
 are now carrick-only, ~halved cycle time.)
