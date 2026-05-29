@@ -50,6 +50,11 @@ fn forward_record_lock<M: GuestMemory>(
     let l_start = i64_at(8);
     let l_len = i64_at(16);
 
+    // l_whence must be SEEK_SET/SEEK_CUR/SEEK_END; Linux rejects anything else
+    // with EINVAL in flock_to_posix_lock, before attempting the lock.
+    if !(0..=2).contains(&l_whence) {
+        return DispatchOutcome::errno(LINUX_EINVAL);
+    }
     let l_type_host: i16 = match l_type_linux {
         LINUX_F_RDLCK => libc::F_RDLCK as i16,
         LINUX_F_WRLCK => libc::F_WRLCK as i16,
@@ -106,6 +111,23 @@ fn forward_record_lock<M: GuestMemory>(
         }
     }
     DispatchOutcome::Returned { value: 0 }
+}
+
+/// Front-door `struct flock` validation Linux performs for F_GETLK/F_SETLK/
+/// F_SETLKW BEFORE acting on the lock, regardless of the fd's backing: a bad
+/// pointer → EFAULT, an out-of-range `l_type` or `l_whence` → EINVAL. carrick's
+/// non-host-backed no-op path (e.g. fd=1, in-memory/synthetic files) skipped
+/// this, so LTP fcntl13 (fd=1 with a bad address / bad l_whence) wrongly
+/// succeeded. Mirrors the host-backed path's checks in `forward_record_lock`.
+fn validate_flock_arg<M: GuestMemory>(memory: &M, arg: u64) -> Result<(), i32> {
+    let bytes = memory.read_bytes(arg, 32).map_err(|_| LINUX_EFAULT)?;
+    let l_type = i16::from_le_bytes([bytes[0], bytes[1]]);
+    let l_whence = i16::from_le_bytes([bytes[2], bytes[3]]);
+    // l_type: RDLCK=0/WRLCK=1/UNLCK=2; l_whence: SEEK_SET=0/SEEK_CUR=1/SEEK_END=2.
+    if !(0..=2).contains(&l_type) || !(0..=2).contains(&l_whence) {
+        return Err(LINUX_EINVAL);
+    }
+    Ok(())
 }
 
 /// Linux path-length limits enforced at resolution time: NAME_MAX (255) per
@@ -1925,8 +1947,13 @@ impl SyscallDispatcher {
                         Ok(Some(host_fd)) => {
                             forward_record_lock(&mut *cx.memory, host_fd, command, arg)
                         }
-                        // Not host-backed → preserve the single-tenant no-op.
-                        Ok(None) => DispatchOutcome::Returned { value: 0 },
+                        // Not host-backed → preserve the single-tenant no-op,
+                        // but still do the kernel's front-door flock validation
+                        // (EFAULT/EINVAL) that precedes the lock attempt.
+                        Ok(None) => match validate_flock_arg(&*cx.memory, arg) {
+                            Ok(()) => DispatchOutcome::Returned { value: 0 },
+                            Err(errno) => DispatchOutcome::errno(errno),
+                        },
                         Err(errno) => DispatchOutcome::errno(errno),
                     }
                 }
@@ -1940,8 +1967,12 @@ impl SyscallDispatcher {
                         }
                         // Not host-backed → "no lock present": leave the
                         // caller's struct flock untouched (l_type=F_UNLCK is
-                        // what callers re-read) and succeed.
-                        Ok(None) => DispatchOutcome::Returned { value: 0 },
+                        // what callers re-read) and succeed — after the same
+                        // front-door flock validation Linux applies first.
+                        Ok(None) => match validate_flock_arg(&*cx.memory, arg) {
+                            Ok(()) => DispatchOutcome::Returned { value: 0 },
+                            Err(errno) => DispatchOutcome::errno(errno),
+                        },
                         Err(errno) => DispatchOutcome::errno(errno),
                     }
                 }
