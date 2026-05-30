@@ -27,6 +27,7 @@ IMAGE="${IMAGE:-localhost:5050/ltp:arm64}"
 DOCKER_IMAGE="${DOCKER_IMAGE:-ltp:arm64}"
 KILL="${KILL:-$REPO/scripts/sudo/kill.sh}"
 export CARRICK_INSECURE_REGISTRIES="${CARRICK_INSECURE_REGISTRIES:-localhost:5050}"
+[ -x "$CARRICK" ] || { echo "carrick not built/signed: $CARRICK — run ./scripts/build-signed.sh" >&2; exit 2; }
 TC="${TC:-15}"   # carrick per-test timeout (s)
 TD="${TD:-15}"   # docker per-test timeout (s)
 OUT="${OUT:-/tmp/ltp-full-$(date +%Y%m%d)}"; mkdir -p "$OUT"

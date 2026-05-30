@@ -13,6 +13,7 @@ set -uo pipefail
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cache="/tmp/go-conformance"; mkdir -p "$cache/bin" "$cache/logs" "$cache/run" "$cache/etc"
 carrick="$repo/target/release/carrick"
+[ -x "$carrick" ] || { echo "carrick not built/signed: $carrick — run ./scripts/build-signed.sh" >&2; exit 2; }
 RUN_TIMEOUT="${RUN_TIMEOUT:-120}"
 # Packages that must run inside a COHERENT debian rootfs (via `carrick run
 # <image>`) rather than the bare `--fs host` scratch, because they exercise the
