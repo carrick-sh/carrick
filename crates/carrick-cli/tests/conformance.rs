@@ -75,6 +75,14 @@ const GATE_SKIP_PROBES: &[&str] = &[
     // the gate's timing probes; keep it as a manual reducer until rooted+fixed.
     // See docs/cpython-baseline/TRIAGE.md cluster 1.
     "forksleepfork",
+    // mtforkcorrupt: WIP reducer for the test_subprocess parent-heap-corruption
+    // SEGV (a long-lived multithreaded parent's heap pointer → 0x7878... after
+    // ~130 fork+exec cycles; fault-traced 2026-05-30). This v1 (sibling pipe
+    // churn + main forks a failed-exec child) does NOT yet reproduce — it
+    // MATCHes Docker — so it's a negative-result baseline, not a gate signal.
+    // Skipped until a variant reproduces (successful execs / PIPE+dup2 child /
+    // large parent heap are the next ingredients). See project memory.
+    "mtforkcorrupt",
 ];
 use std::time::{Duration, Instant};
 
