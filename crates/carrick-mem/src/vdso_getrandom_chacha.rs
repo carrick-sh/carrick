@@ -148,16 +148,22 @@ pub fn getrandom_fill(
     let mut key = load_key(state);
     let nonce = [0u32; 3];
     let mut counter: u32 = 0;
-    let mut off = 0;
-    while off < buf.len() {
-        let mut ks = block_to_bytes(&chacha20_block(&key, counter, &nonce));
-        let n = core::cmp::min(64, buf.len() - off);
-        buf[off..off + n].copy_from_slice(&ks[..n]);
-        for b in ks.iter_mut() {
-            *b = 0; // zeroize the keystream block after use
+    // Panic-free fill: the blob is freestanding, so NO runtime slice range (which
+    // would emit a slice_index_fail call into core). Emit byte-by-byte over
+    // `buf.iter_mut()`; `pos & 63` keeps the keystream index provably < 64.
+    let mut ks = [0u8; 64];
+    let mut pos = 64usize;
+    for slot in buf.iter_mut() {
+        if pos >= 64 {
+            ks = block_to_bytes(&chacha20_block(&key, counter, &nonce));
+            counter += 1;
+            pos = 0;
         }
-        off += n;
-        counter += 1;
+        *slot = ks[pos & 63];
+        pos += 1;
+    }
+    for b in ks.iter_mut() {
+        *b = 0; // zeroize the last keystream block
     }
 
     // Ratchet: re-key from a block BEYOND those served (counters 0..counter were

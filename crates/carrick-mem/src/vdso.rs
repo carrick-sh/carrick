@@ -28,6 +28,12 @@ pub const LINUX_VDSO_SIZE: u64 = 0x1000;
 pub const VVAR_OFF_SEQ: usize = 0; // seqlock (even = stable) — reserved
 pub const VVAR_OFF_FREQ: usize = 8; // CNTFRQ_EL0 in Hz
 pub const VVAR_OFF_REALTIME_OFF_NS: usize = 16; // wall_ns - monotonic_ns
+/// RNG generation the userspace getrandom blob reads (P2). carrick stamps each
+/// process's host PID here (unique per process), and re-stamps a forked child's
+/// PID in rebuild_vcpu_after_fork — so a child's generation never matches the
+/// snapshot it COW-inherited from its parent, forcing a reseed (no keystream
+/// reuse across fork). See docs/vdso-getrandom-design.md.
+pub const VVAR_OFF_RNG_GENERATION: usize = 24;
 
 /// The assembled clock functions (aarch64). Offsets within this blob:
 /// `__kernel_clock_gettime` @ 0x00, `__kernel_gettimeofday` @ 0x84,
@@ -52,34 +58,30 @@ const VDSO_CODE: &[u8] = &[
     0xe8, 0x00, 0x00, 0x54, 0x81, 0x00, 0x00, 0xb4, 0x3f, 0x00, 0x00, 0xf9, 0x22, 0x00, 0x80, 0xd2,
     0x22, 0x04, 0x00, 0xf9, 0x00, 0x00, 0x80, 0x52, 0xc0, 0x03, 0x5f, 0xd6, 0x48, 0x0e, 0x80, 0xd2,
     0x01, 0x00, 0x00, 0xd4, 0xc0, 0x03, 0x5f, 0xd6,
-    // __kernel_rt_sigreturn (8 bytes): `mov x8, #139 (__NR_rt_sigreturn); svc #0`.
-    // The canonical aarch64 sigreturn trampoline body — unwinders (libgcc, gdb,
-    // Go traceback) recognise a signal frame by matching this exact instruction
-    // pair at the PC. (See SYM_RT_SIGRETURN; it precedes getrandom below.)
+    // __kernel_rt_sigreturn (8 bytes, the trailing 8 of VDSO_CODE): `mov x8, #139
+    // (__NR_rt_sigreturn); svc #0`. The canonical aarch64 sigreturn trampoline
+    // body — unwinders (libgcc, gdb, Go traceback) recognise a signal frame by
+    // matching this exact instruction pair at the PC.
     0x68, 0x11, 0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4,
-    // __kernel_getrandom (72 bytes, assembled from tools/vdso_fns.s; P1). QUERY
-    // mode (opaque_len == ~0UL) fills vgetrandom_opaque_params{size_of_opaque_
-    // state=144, mmap_prot=3, mmap_flags=0x28 (MAP_ANON|MAP_DROPPABLE)} and
-    // returns 0; otherwise falls back to the getrandom(2) syscall (x8=278). Fully
-    // position-independent (movz immediates only, no literal pool).
-    0x9f, 0x04, 0x00, 0xb1, 0xc1, 0x01, 0x00, 0x54, 0x09, 0x12, 0x80, 0x52, 0x69, 0x00, 0x00, 0xb9,
-    0x69, 0x00, 0x80, 0x52, 0x69, 0x04, 0x00, 0xb9, 0x09, 0x05, 0x80, 0x52, 0x69, 0x08, 0x00, 0xb9,
-    0x6a, 0x30, 0x00, 0x91, 0xab, 0x01, 0x80, 0x52, 0x5f, 0x45, 0x00, 0xb8, 0x6b, 0x05, 0x00, 0x71,
-    0xc1, 0xff, 0xff, 0x54, 0x00, 0x00, 0x80, 0xd2, 0xc0, 0x03, 0x5f, 0xd6, 0xc8, 0x22, 0x80, 0xd2,
-    0x01, 0x00, 0x00, 0xd4, 0xc0, 0x03, 0x5f, 0xd6,
 ];
 
-// Symbol offsets within VDSO_CODE.
+/// __kernel_getrandom (P2): the position-independent, zero-relocation blob
+/// produced by tools/build-vdso-getrandom.sh from the no_std Rust source
+/// (vdso_getrandom_blob.rs + the host-tested ChaCha/state-machine core). Its
+/// `__kernel_getrandom` entry is at offset 0. Appended AFTER VDSO_CODE in the
+/// image; never edited by hand — regenerate with the build script.
+const GETRANDOM_BLOB: &[u8] = include_bytes!("vdso_getrandom_blob.bin");
+
+// Symbol offsets within the code section (VDSO_CODE ‖ GETRANDOM_BLOB).
 const SYM_CLOCK_GETTIME: u64 = 0x00;
 const SYM_GETTIMEOFDAY: u64 = 0x84;
 const SYM_CLOCK_GETRES: u64 = 0xdc;
-// rt_sigreturn (8 B) then getrandom (72 B) are the trailing functions of
-// VDSO_CODE; derive their offsets from the blob length so they stay correct
-// regardless of the clock functions' size.
-const GETRANDOM_LEN: u64 = 72;
+// rt_sigreturn is the trailing 8 bytes of VDSO_CODE; getrandom is the blob
+// appended right after. Derive offsets from the lengths so they stay correct.
 const RT_SIGRETURN_LEN: u64 = 8;
-const SYM_GETRANDOM: u64 = VDSO_CODE.len() as u64 - GETRANDOM_LEN;
-const SYM_RT_SIGRETURN: u64 = SYM_GETRANDOM - RT_SIGRETURN_LEN;
+const SYM_RT_SIGRETURN: u64 = VDSO_CODE.len() as u64 - RT_SIGRETURN_LEN;
+const SYM_GETRANDOM: u64 = VDSO_CODE.len() as u64;
+const GETRANDOM_LEN: u64 = GETRANDOM_BLOB.len() as u64;
 
 const EM_AARCH64: u16 = 183;
 const ET_DYN: u16 = 3;
@@ -158,7 +160,7 @@ pub fn vdso_image_bytes() -> Vec<u8> {
     ];
     let off_dyn_end = off_dyn + dyn_entries.len() * 16;
     let off_code = align_up(off_dyn_end, 16);
-    let off_code_end = off_code + VDSO_CODE.len();
+    let off_code_end = off_code + VDSO_CODE.len() + GETRANDOM_BLOB.len();
 
     // ---- section-header string table + section headers ----
     // glibc/Go resolve vDSO symbols from PT_DYNAMIC and never need sections, so
@@ -320,6 +322,9 @@ pub fn vdso_image_bytes() -> Vec<u8> {
 
     // ---- code ----
     buf[off_code..off_code + VDSO_CODE.len()].copy_from_slice(VDSO_CODE);
+    // __kernel_getrandom blob, immediately after the hand-asm code (SYM_GETRANDOM).
+    let off_blob = off_code + VDSO_CODE.len();
+    buf[off_blob..off_blob + GETRANDOM_BLOB.len()].copy_from_slice(GETRANDOM_BLOB);
 
     // ---- .shstrtab ----
     buf[off_shstrtab..off_shstrtab + shstr.len()].copy_from_slice(&shstr);
@@ -486,11 +491,13 @@ mod tests {
         assert_eq!(svc_0, 0xd400_0001, "expected `svc #0`");
     }
 
-    /// __kernel_getrandom (P1) must start with the query-mode discriminator
-    /// (`cmn x4, #1` — is opaque_len == ~0UL?) and contain the getrandom(2)
-    /// syscall fallback (`mov x8, #278 ; svc #0`).
+    /// __kernel_getrandom (P2) is the embedded position-independent blob: its
+    /// symbol must resolve, be STT_FUNC, span the whole blob, point at the blob's
+    /// start (right after VDSO_CODE), and contain an `svc #0` (the reseed/fallback
+    /// syscall). The actual generate behaviour is verified by the host ChaCha/
+    /// state-machine tests + the getrandomvdso differential probe.
     #[test]
-    fn vdso_getrandom_has_query_check_and_syscall_fallback() {
+    fn vdso_getrandom_blob_is_embedded() {
         let img = vdso_image_bytes();
         let elf = goblin::elf::Elf::parse(&img).unwrap();
         let sym = elf
@@ -499,19 +506,25 @@ mod tests {
             .find(|s| elf.dynstrtab.get_at(s.st_name) == Some("__kernel_getrandom"))
             .expect("__kernel_getrandom must exist");
         assert!(sym.is_function(), "__kernel_getrandom must be STT_FUNC");
+        assert_eq!(
+            sym.st_size as usize,
+            super::GETRANDOM_BLOB.len(),
+            "symbol must span the whole blob"
+        );
         let off = sym.st_value as usize;
-        let first = u32::from_le_bytes(img[off..off + 4].try_into().unwrap());
-        assert_eq!(first, 0xb100_049f, "expected `cmn x4, #1` (query check)");
-        // The body must contain `mov x8, #278` (0xd28022c8) then `svc #0`.
-        let words: Vec<u32> = img[off..off + super::GETRANDOM_LEN as usize]
+        let blob = &img[off..off + super::GETRANDOM_BLOB.len()];
+        assert_eq!(
+            blob,
+            super::GETRANDOM_BLOB,
+            "embedded bytes must match the blob"
+        );
+        let has_svc = blob
             .chunks_exact(4)
-            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-            .collect();
-        let i = words
-            .iter()
-            .position(|&w| w == 0xd280_22c8)
-            .expect("expected `mov x8, #278` (getrandom syscall fallback)");
-        assert_eq!(words[i + 1], 0xd400_0001, "expected `svc #0` after x8=278");
+            .any(|c| u32::from_le_bytes(c.try_into().unwrap()) == 0xd400_0001);
+        assert!(
+            has_svc,
+            "blob must contain `svc #0` (reseed/fallback syscall)"
+        );
     }
 }
 

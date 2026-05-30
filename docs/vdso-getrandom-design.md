@@ -67,3 +67,30 @@ query mode to work — garbage here → wrong-sized/flagged state page.
 - On fork, bump the generation so a child's cached batch reseeds (P2 only).
 
 Full research (per-agent ABI/embed/synthesis): workflow run `wf_c485321a-1cb`.
+
+## P2 status (2026-05-30): implemented + verified, fast path GATED OFF
+
+P2 is built end-to-end and the Rust-ecosystem embed works:
+- `vdso_getrandom_chacha.rs` — ChaCha20 (RFC 8439 KAT) + getrandom_fill reseed/
+  ratchet state machine, 5 host tests incl. fork-no-reuse (+ control).
+- `tools/vdso_getrandom_blob.rs` + `build-vdso-getrandom.sh` — the no_std blob,
+  compiled `rustc → rust-lld (flat linker script) → objcopy -O binary` to a
+  ZERO-RELOCATION aarch64 blob (verified), `include_bytes!`'d into vdso.rs.
+- `MAP_DROPPABLE` (0x8) accepted in mem.rs (default PRIVATE); getrandomvdso probe
+  MATCHes the oracle (query 144/3/0x28, generate 32).
+
+**BLOCKER — the userspace fast path (`FAST_PATH` in the blob) is OFF.** It needs
+a per-process generation in the vvar that a forked child re-reads; carrick stamps
+the host PID (populate_vdso_data_page + the re-stamp in rebuild_vcpu_after_fork),
+BUT the `gendbg` diagnostic proved a forked child still reads the PARENT's
+generation: the child's host-side write to its (COW) vvar is invisible to the
+child's guest read — arm64 HVF has no stage-2 TLB shootdown (see
+[[project_shared_file_coherence]]). So a child would REUSE the parent's keystream.
+Until that coherence is fixed, GENERATE always syscalls (always-fresh, fork-safe);
+`conformance-probes/getrandomvdsofork` (child_reused must be false on both sides)
+gates flipping FAST_PATH on.
+
+Fix direction: make the child's vvar generation write reach its guest read — e.g.
+stamp during the child's region re-map in `fork()` (where child_descs hold the
+host buffer the guest actually reads), or recreate-the-vCPU-for-fresh-TLB after
+the stamp (the only coherence approach not ruled out in shared_file_coherence).
