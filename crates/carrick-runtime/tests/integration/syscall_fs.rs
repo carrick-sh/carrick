@@ -3200,8 +3200,16 @@ fn getdents64_lists_rootfs_directory_entries() {
         ));
         off += reclen;
     }
-    assert!(entries.iter().any(|(n, t)| n == "." && *t == 4u8 /* DT_DIR */));
-    assert!(entries.iter().any(|(n, t)| n == ".." && *t == 4u8 /* DT_DIR */));
+    assert!(
+        entries
+            .iter()
+            .any(|(n, t)| n == "." && *t == 4u8 /* DT_DIR */)
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|(n, t)| n == ".." && *t == 4u8 /* DT_DIR */)
+    );
     assert!(
         entries
             .iter()

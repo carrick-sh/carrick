@@ -592,7 +592,12 @@ impl PageTableManager {
 
     /// Mark `[va, va+len)` valid read-only (AP=RO). `exec` clears UXN
     /// (executable, PROT_EXEC); otherwise UXN is set (non-executable / NX).
-    pub fn set_readonly(&mut self, va: u64, len: usize, exec: bool) -> Result<bool, PageTableError> {
+    pub fn set_readonly(
+        &mut self,
+        va: u64,
+        len: usize,
+        exec: bool,
+    ) -> Result<bool, PageTableError> {
         self.apply(va, len, PtOp::ReadOnly { exec })
     }
 
@@ -906,7 +911,8 @@ mod tests {
         assert!(!mgr.is_valid(block));
         assert!(!mgr.is_valid(block + 0x1000));
         // Commit one page RW (splits the invalid 2 MiB block to L3).
-        mgr.set_rw(block + 0x10000, 0x1000, true).expect("RW commit");
+        mgr.set_rw(block + 0x10000, 0x1000, true)
+            .expect("RW commit");
         assert!(mgr.is_valid(block + 0x10000), "committed page is RW");
         assert_eq!(mgr.ap_bits(block + 0x10000), AP_RW);
         assert!(!mgr.is_valid(block), "neighbor page 0 stays invalid");
@@ -968,7 +974,8 @@ mod tests {
         // coalesce; instead verify a genuinely-mixed state is preserved:
         let mut mgr2 = manager();
         mgr2.set_readonly(block, 0x1000, true).expect("ro one page");
-        mgr2.set_rw(block + 0x1000, 0x1000, true).expect("rw next page");
+        mgr2.set_rw(block + 0x1000, 0x1000, true)
+            .expect("rw next page");
         assert_eq!(mgr2.ap_bits(block), AP_RO, "mixed block keeps RO page");
         assert_eq!(mgr2.ap_bits(block + 0x1000), AP_RW);
         assert!(mgr2.free_tables.is_empty(), "mixed block must not coalesce");
