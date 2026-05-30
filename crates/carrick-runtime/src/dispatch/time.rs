@@ -592,6 +592,31 @@ impl SyscallDispatcher {
 
         fn prlimit64(this, cx, pid: Pid, resource: u64, new_limit: GuestPtr, old_limit: GuestPtr) {
             let memory = &mut *cx.memory;
+            // The pid arg selects the target process: 0 names the caller, any
+            // other pid names another task that must EXIST or the call is ESRCH
+            // (CPython test_resource.test_prlimit: prlimit(-1)→ESRCH,
+            // prlimit(0)→ok, prlimit(999999)→ESRCH). carrick's getpid returns the
+            // host pid, so the guest's "own pid" is std::process::id(); any other
+            // pid is probed via kill(pid,0) — rc==0 (signalable) or EPERM (exists,
+            // foreign owner, e.g. launchd) means it exists, ESRCH means it does
+            // not. A negative or out-of-range pid is never a real task → ESRCH.
+            {
+                let pid = i64::from(pid.0);
+                let self_pid = std::process::id() as i64;
+                if pid != 0 && pid != self_pid {
+                    let exists = pid > 0
+                        && pid <= i32::MAX as i64
+                        && {
+                            let rc = unsafe { libc::kill(pid as i32, 0) };
+                            rc == 0
+                                || std::io::Error::last_os_error().raw_os_error()
+                                    == Some(libc::EPERM)
+                        };
+                    if !exists {
+                        return Ok(LINUX_ESRCH.into());
+                    }
+                }
+            }
             // An invalid resource (>= RLIM_NLIMITS) is EINVAL, checked before any
             // limit read/write (LTP getrlimit02 invalid-resource-type case).
             // Valid resources are 0..=15 (RLIMIT_CPU..RLIMIT_RTTIME); carrick
