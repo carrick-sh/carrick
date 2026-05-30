@@ -114,6 +114,7 @@ unsafe extern "C" {
     fn fflush(stream: *mut libc_file) -> c_int;
     fn fopen(path: *const c_char, mode: *const c_char) -> *mut libc_file;
     fn fclose(stream: *mut libc_file) -> c_int;
+    fn fileno(stream: *mut libc_file) -> c_int;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -148,7 +149,14 @@ struct TraceOutput {
 }
 
 impl TraceOutput {
-    fn open(path: Option<&str>) -> Result<Self, DTraceError> {
+    /// Open the event sink. `owner` is the invoking user's (uid, gid) when the
+    /// tracer is running under sudo (the libdtrace parent must be root, but the
+    /// user invoked `carrick trace`): the freshly-created file is `fchown`'d to
+    /// them so they fully own their trace output — otherwise it lands root:wheel
+    /// and `rm`/editing it needs sudo (which made `--trace-out` LOOK broken: a
+    /// naive `sudo cat` without NOPASSWD silently fails to read it). The file is
+    /// world-readable either way (fopen "w" → 0644), so reads never need sudo.
+    fn open(path: Option<&str>, owner: Option<(u32, u32)>) -> Result<Self, DTraceError> {
         match path {
             Some(path) => {
                 let pc =
@@ -157,6 +165,14 @@ impl TraceOutput {
                 let fp = unsafe { fopen(pc.as_ptr(), mode.as_ptr()) };
                 if fp.is_null() {
                     return Err(DTraceError::OutOpen(path.into()));
+                }
+                if let Some((uid, gid)) = owner {
+                    // Best-effort: hand the file to the invoking user. A failure
+                    // (e.g. not actually privileged) is non-fatal — the trace
+                    // still writes; it's just root-owned.
+                    unsafe {
+                        libc::fchown(fileno(fp), uid, gid);
+                    }
                 }
                 Ok(Self { fp, owned: true })
             }
@@ -305,7 +321,10 @@ pub fn run_child_under_dtrace(
     // `out_path` redirects to a file so trace output doesn't intermix with an
     // interactive guest's own stdout. The returned fp must outlive the consume
     // loop; closed at the end if we opened it.
-    let out = TraceOutput::open(opts.out_path.as_deref())?;
+    let out = TraceOutput::open(
+        opts.out_path.as_deref(),
+        opts.drop_credentials.as_ref().map(|c| (c.uid, c.gid)),
+    )?;
     let hdl = DtraceHandle::open()?;
 
     // Sensible runtime defaults are appended to in `all_opts` below.
