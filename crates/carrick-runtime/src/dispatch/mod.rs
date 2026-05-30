@@ -99,8 +99,8 @@ use crate::linux_abi::{
     LINUX_EPOLLERR,
     LINUX_EPOLLET,
     LINUX_EPOLLHUP,
-    LINUX_EPOLLONESHOT,
     LINUX_EPOLLIN,
+    LINUX_EPOLLONESHOT,
     LINUX_EPOLLOUT,
     LINUX_EPOLLPRI,
     LINUX_EPOLLRDHUP,
@@ -250,15 +250,15 @@ use crate::linux_abi::{
     LINUX_S_IFMT,
     LINUX_S_IFREG,
     LINUX_S_IFSOCK,
-    LINUX_SEEK_CUR,
-    LINUX_SEEK_END,
-    LINUX_SEEK_SET,
     LINUX_SCHED_BATCH,
     LINUX_SCHED_DEADLINE,
     LINUX_SCHED_FIFO,
     LINUX_SCHED_IDLE,
     LINUX_SCHED_OTHER,
     LINUX_SCHED_RR,
+    LINUX_SEEK_CUR,
+    LINUX_SEEK_END,
+    LINUX_SEEK_SET,
     LINUX_SIG_BLOCK,
     LINUX_SIG_SETMASK,
     LINUX_SIG_UNBLOCK,
@@ -2144,7 +2144,9 @@ fn dispatch_threaded_futex(
                         break;
                     }
                     woke += 1;
-                    unsafe { libc::sched_yield(); }
+                    unsafe {
+                        libc::sched_yield();
+                    }
                 }
                 return DispatchOutcome::Returned { value: woke };
             }
@@ -2484,9 +2486,7 @@ fn linux_clock_getres_nsec(clock_id: u64) -> i64 {
         | LINUX_CLOCK_THREAD_CPUTIME_ID => LINUX_CLOCK_RESOLUTION_NSEC,
         // COARSE clocks report TICK_NSEC (CONFIG_HZ-dependent, NOT
         // host-portable). Same 1ms stand-in; not probe-asserted.
-        LINUX_CLOCK_REALTIME_COARSE | LINUX_CLOCK_MONOTONIC_COARSE => {
-            LINUX_CLOCK_RESOLUTION_NSEC
-        }
+        LINUX_CLOCK_REALTIME_COARSE | LINUX_CLOCK_MONOTONIC_COARSE => LINUX_CLOCK_RESOLUTION_NSEC,
         _ => LINUX_CLOCK_RESOLUTION_NSEC,
     }
 }
@@ -3767,6 +3767,12 @@ fn read_host_pipe(
         return DispatchOutcome::Errno { errno: e };
     }
     let n_usize = n as usize;
+    if std::env::var_os("CARRICK_IO_DBG").is_some() && n_usize > 0 {
+        eprintln!(
+            "[IODBG] READ host_fd={host_fd} n={n_usize} bytes={:02x?}",
+            &buf[..n_usize.min(64)]
+        );
+    }
     if n_usize > 0 && memory.write_bytes(guest_addr, &buf[..n_usize]).is_err() {
         return DispatchOutcome::Errno {
             errno: LINUX_EFAULT,
@@ -3777,8 +3783,41 @@ fn read_host_pipe(
 
 /// write(2) on a host-backed fd. Same lockless discipline as `read_host_pipe`.
 fn write_host_pipe(bytes: &[u8], host_fd: i32, nonblocking: bool) -> DispatchOutcome {
+    if std::env::var_os("CARRICK_IO_DBG").is_some() && !bytes.is_empty() {
+        eprintln!(
+            "[IODBG] WRITE host_fd={host_fd} n={} bytes={:02x?}",
+            bytes.len(),
+            &bytes[..bytes.len().min(64)]
+        );
+    }
     crate::dispatch::net::set_host_nonblocking(host_fd);
+    if std::env::var_os("CARRICK_TTY_DBG").is_some() && bytes.contains(&0x0a) {
+        unsafe {
+            let isatty = libc::isatty(host_fd);
+            let mut t: libc::termios = core::mem::zeroed();
+            let tg = libc::tcgetattr(host_fd, &mut t);
+            let mut outq: libc::c_int = -1;
+            libc::ioctl(host_fd, libc::TIOCOUTQ, &mut outq);
+            let fl = libc::fcntl(host_fd, libc::F_GETFL);
+            let mut st: libc::stat = core::mem::zeroed();
+            libc::fstat(host_fd, &mut st);
+            let oflag = t.c_oflag;
+            let lflag = t.c_lflag;
+            let rdev = st.st_rdev;
+            let blen = bytes.len();
+            eprintln!(
+                "[TTYDBG-PRE] host_fd={host_fd} isatty={isatty} tg={tg} oflag=0x{oflag:x} lflag=0x{lflag:x} outq={outq} flags=0x{fl:x} rdev={rdev} n={blen}"
+            );
+        }
+    }
     let n = unsafe { libc::write(host_fd, bytes.as_ptr() as *const _, bytes.len()) };
+    if std::env::var_os("CARRICK_TTY_DBG").is_some() && bytes.contains(&0x0a) {
+        unsafe {
+            let mut outq: libc::c_int = -1;
+            libc::ioctl(host_fd, libc::TIOCOUTQ, &mut outq);
+            eprintln!("[TTYDBG-POST] host_fd={host_fd} wrote={n} outq_after={outq}");
+        }
+    }
     #[cfg(target_os = "macos")]
     crate::probes::host_pipe_io(host_fd, 1, n as i64);
     if let Err(e) = n.host_syscall_errno() {
