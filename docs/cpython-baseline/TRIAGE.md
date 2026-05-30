@@ -125,3 +125,26 @@ triage individually.
 - `conformance-probes/src/bin/ctrel0.rs` — EL0 CTR_EL0/DCZID/cache-ops (landed).
 - TODO: `forkexecveloop` (cluster 1), `statfdidentity` (cluster 3),
   `fcntlpipesize` (cluster 4).
+
+---
+
+## Full-suite sweep (2026-05-30): 482 unique modules, 356 MATCH
+
+Fanned out the ~441 unbaselined CPython 3.12 modules across 12 agents
+(`cpython-baseline-sweep` workflow) + earlier baselines. Overall:
+**356 MATCH / 74 DIFF / 9 CARRICK_TIMEOUT / 42 BOTH_EMPTY(benign skips) / 1 DOCKER_TIMEOUT**
+≈ 81% of comparable (non-both-empty) modules at parity.
+
+### Clusters (synthesis; root causes are HYPOTHESES to re-verify, per feedback_verify_diagnoses_empirically):
+- **Multiprocessing nested fork-exec worker bring-up** [sev=critical, fix=hard, 19 modules]: HYPOTHESIS=TRIAGE Bug B/task4 nested-fork HVF wedge; verify forksleepfork flake-rate not trace
+  - modules: test.test_concurrent_futures.test_shutdown, test.test_concurrent_futures.test_wait, test.test_concurrent_futures.test_as_completed, test.test_concurrent_futures.test_deadlock, test.test_concurrent_futures.test_init, test.test_concurrent_futures.test_process_pool, test.test_concurrent_futures.test_thread_pool, test.test_multiprocessing_spawn.test_processes, test.test_multiprocessing_spawn.test_threads, test.test_multiprocessing_spawn.test_manager, test.test_multiprocessing_spawn.test_misc, test.test_multiprocessing_fork.test_manager, test.test_multiprocessing_fork.test_misc, test.test_multiprocessing_fork.test_processes, test.test_multiprocessing_fork.test_threads, test.test_multiprocessing_forkserver.test_manager, test.test_multiprocessing_forkserver.test_misc, test.test_multiprocessing_forkserver.test_processes, test.test_multiprocessing_forkserver.test_threads
+- **Non-UTF8 undecodable filename handling** [sev=high, fix=moderate, 8 modules]: HYPOTHESIS fs.rs to_string_lossy/from_utf8_lossy drops non-UTF8 path bytes; fix raw bytes as OsStr
+  - modules: test_sqlite3, test_httpservers, test_zipimport, test_import, test_cmd_line_script, test_ntpath, test_capi, test_cgi
+- **Deep-recursion crash mid-run UNPROVEN** [sev=high, fix=moderate, 8 modules]: HYPOTHESIS not SEGV not race; fault.rs already injects SIGSEGV so overflow should reach recursion-guard; re-verify with reducer
+  - modules: test_ast, test_dictviews, test_isinstance, test_functools, test_call, test_dict, test_descr, test_exceptions
+- **FS inode-identity samestat plus symlink copy** [sev=high, fix=moderate, 3 modules]: HYPOTHESIS=TRIAGE cluster3: lstat vs fstat disagree on st_ino so samestat FALSE; rmtree/extract refuse, EEXIST cascade
+  - modules: test_tarfile, test_shutil, test_copy
+- **Unicode filename normalization host APFS** [sev=medium, fix=moderate, 2 modules]: HYPOTHESIS apfs.rs host normalizes NFC/NFD so valid UTF-8 names read back differently; verify memory backend passes
+  - modules: test_unicode_file_functions, test_unicode_file
+- **localhost loopback socket-fd async subprocess gaps** [sev=high, fix=hard, 7 modules]: HYPOTHESIS split: loopback accept-readiness; asyncio subprocess likely same fork-exec as cluster1; socket errno; verify non-forking loop
+  - modules: test_wsgiref, test_httplib, test.test_asyncio.test_subprocess, test.test_asyncio.test_events, test.test_asyncio.test_sock_lowlevel, test.test_asyncio.test_sendfile, test.test_asyncio.test_unix_events
