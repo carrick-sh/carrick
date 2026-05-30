@@ -14,10 +14,16 @@
 # per-line TPASS/TFAIL or (better) reduce it to a deterministic conformance
 # probe (line-exact). Flaky/timing tests: run a few times before believing it.
 set -u
-CARRICK="${CARRICK:-/Volumes/CaseSensitive/carrick/target/release/carrick}"
-KILL="${KILL:-/Volumes/CaseSensitive/carrick/scripts/sudo/kill.sh}"
+# Resolve paths relative to THIS worktree (the script may run from any worktree),
+# not a hardcoded main checkout — otherwise a second worktree silently tests the
+# main worktree's binary and mis-attributes the verdict.
+HERE="$(cd "$(dirname "$0")" && pwd)"
+REPO="$(cd "$HERE/../../../.." && pwd)"
+CARRICK="${CARRICK:-$REPO/target/release/carrick}"
+KILL="${KILL:-$REPO/scripts/sudo/kill.sh}"
 IMAGE="${IMAGE:-localhost:5050/ltp:arm64}"
 export CARRICK_INSECURE_REGISTRIES="${CARRICK_INSECURE_REGISTRIES:-localhost:5050}"
+[ -x "$CARRICK" ] || { echo "carrick not built/signed: $CARRICK — run ./scripts/build-signed.sh" >&2; exit 2; }
 
 # Per-run id stamped into carrick guest titles + run-local scratch, so two
 # ltp-check lanes (or a concurrent sweep) don't reap each other or clobber

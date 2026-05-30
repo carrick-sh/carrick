@@ -18,6 +18,7 @@ image="${2:-ubuntu:24.04}"
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 bin="$repo/conformance-probes/target/aarch64-unknown-linux-musl/release/$name"
 carrick="$repo/target/release/carrick"
+[ -x "$carrick" ] || { echo "carrick not built/signed: $carrick — run ./scripts/build-signed.sh"; exit 2; }
 snippet='base64 -d > /tmp/p && chmod +x /tmp/p && /tmp/p'
 [ -x "$bin" ] || { echo "probe not built: $bin — run scripts/build-probes.sh"; exit 2; }
 export CARRICK_INSECURE_REGISTRIES="${CARRICK_INSECURE_REGISTRIES:-localhost:5050}"

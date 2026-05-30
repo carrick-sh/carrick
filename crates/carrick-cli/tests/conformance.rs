@@ -165,17 +165,54 @@ fn carrick_bin() -> Option<PathBuf> {
     p.exists().then_some(p)
 }
 
-/// Re-sign the carrick binary with the hypervisor entitlement. `cargo build`
+/// True if `bin` already carries the hypervisor entitlement.
+fn is_signed_with_hypervisor(bin: &PathBuf) -> bool {
+    Command::new("codesign")
+        .args(["-d", "--entitlements", "-"])
+        .arg(bin)
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout).contains("com.apple.security.hypervisor")
+                || String::from_utf8_lossy(&o.stderr).contains("com.apple.security.hypervisor")
+        })
+        .unwrap_or(false)
+}
+
+/// Ensure the carrick binary carries the hypervisor entitlement. `cargo build`
 /// strips the codesignature on macOS, which makes EVERY guest run fail with
 /// HV_DENIED (0xfae94007) — the dominant source of conformance "flakiness".
-/// Signing in setup guarantees the harness never tests an unsigned build.
+/// Idempotent: skip if already signed, so we don't re-sign in place on every
+/// run (wasted work, and a window that could race a concurrent test process in
+/// the same worktree). build-signed.sh normally signs it; this is the belt for
+/// a plain `cargo build`. The binary is per-worktree (build-signed materialises
+/// ./target/release/carrick even under a shared CARGO_TARGET_DIR), so signing
+/// it never disturbs another worktree's binary.
 fn ensure_signed(bin: &PathBuf) {
+    if is_signed_with_hypervisor(bin) {
+        return;
+    }
+    // No concurrent-signer race: all three conformance #[test] fns acquire
+    // CONFORMANCE_LOCK before calling this, and each worktree signs its OWN
+    // ./target/release/carrick (build-signed materialises a per-worktree binary),
+    // so two cargo-test processes never `codesign --force` the same file.
     let plist = repo_path("scripts/entitlements.plist");
-    let _ = Command::new("codesign")
+    let out = Command::new("codesign")
         .args(["--force", "--sign", "-", "--entitlements"])
         .arg(&plist)
         .arg(bin)
         .output();
+    // Surface a signing failure instead of swallowing it — an unsigned binary
+    // degrades into a silent HV_DENIED (0xfae94007) on every guest run, the
+    // exact "flakiness" this function exists to prevent.
+    match out {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => panic!(
+            "codesign of {} failed: {}",
+            bin.display(),
+            String::from_utf8_lossy(&o.stderr)
+        ),
+        Err(e) => panic!("codesign of {} could not run: {e}", bin.display()),
+    }
 }
 
 /// Drop carrick's scratch warning so output lines up with Docker's.
