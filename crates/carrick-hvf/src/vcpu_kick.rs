@@ -326,10 +326,7 @@ pub fn spawn_signal_pump(
                             // owns its own EVFILT_PROC + 50ms re-poll), so
                             // suppressing it is hang-free and more faithful.
                             if exit_signal != 0 {
-                                crate::host_signal::publish_pending_for(
-                                    parent_tid,
-                                    exit_signal,
-                                );
+                                crate::host_signal::publish_pending_for(parent_tid, exit_signal);
                             }
                         }
                         continue;

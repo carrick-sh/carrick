@@ -143,7 +143,7 @@ pub(super) fn deliver_fault_signal(
         altstack,
         saved_sigmask,
         Some((si_code, si_addr)),
-        None, // a synchronous fault never carries a queued (rt_sigqueueinfo) siginfo
+        None,  // a synchronous fault never carries a queued (rt_sigqueueinfo) siginfo
         false, // a synchronous fault re-runs the faulting instruction, never a syscall restart
     );
     match injected {
