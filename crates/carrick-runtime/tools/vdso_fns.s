@@ -112,3 +112,30 @@ __kernel_rt_sigreturn:
 	mov	x8, #139			// __NR_rt_sigreturn
 	svc	#0
 	// never returns; the kernel restores the interrupted context.
+
+	// __kernel_getrandom (Linux 6.11+). P1: implement the QUERY protocol and
+	// fall back to the getrandom(2) syscall for the generate path (no userspace
+	// ChaCha yet — that is P2). Fully position-independent (movz immediates only).
+	// x0=buffer x1=len w2=flags x3=opaque_state x4=opaque_len -> x0 (ssize_t).
+	.global __kernel_getrandom
+__kernel_getrandom:
+	cmn	x4, #1				// opaque_len == ~0UL  => QUERY mode
+	b.ne	1f
+	// QUERY: fill struct vgetrandom_opaque_params at x3, return 0.
+	mov	w9, #0x90
+	str	w9, [x3]			// size_of_opaque_state = 144
+	mov	w9, #0x3
+	str	w9, [x3, #4]			// mmap_prot = PROT_READ|PROT_WRITE
+	mov	w9, #0x28
+	str	w9, [x3, #8]			// mmap_flags = MAP_ANONYMOUS|MAP_DROPPABLE
+	add	x10, x3, #12
+	mov	w11, #13			// zero reserved[13]
+2:	str	wzr, [x10], #4
+	subs	w11, w11, #1
+	b.ne	2b
+	mov	x0, #0
+	ret
+1:	// GENERATE: fall back to the real getrandom(2) syscall.
+	mov	x8, #278			// __NR_getrandom (aarch64)
+	svc	#0
+	ret

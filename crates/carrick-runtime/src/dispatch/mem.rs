@@ -252,7 +252,18 @@ impl SyscallDispatcher {
                 return Ok(LINUX_EBADF.into());
             }
 
-            let map_type = flags & (LINUX_MAP_SHARED | LINUX_MAP_PRIVATE);
+            // glibc's vDSO getrandom state page is mapped MAP_ANONYMOUS|
+            // MAP_DROPPABLE (0x28) with NO MAP_PRIVATE/MAP_SHARED bit; the kernel
+            // treats MAP_DROPPABLE as a private anon mapping, so default the type
+            // to PRIVATE rather than rejecting it with EINVAL.
+            let map_type = {
+                let t = flags & (LINUX_MAP_SHARED | LINUX_MAP_PRIVATE);
+                if t == 0 && flags & LINUX_MAP_DROPPABLE != 0 {
+                    LINUX_MAP_PRIVATE
+                } else {
+                    t
+                }
+            };
             if length == 0
                 || prot & !(LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC) != 0
                 || flags & !LinuxMmapFlags::SUPPORTED_MASK != 0
