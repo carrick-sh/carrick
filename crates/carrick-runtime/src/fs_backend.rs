@@ -318,7 +318,25 @@ pub enum OverlayEntryKind {
 /// produce. Returns `None` for paths that would escape the rootfs
 /// (`/../something`).
 pub fn normalize(path: &str) -> Option<PathBuf> {
-    let raw = Path::new(path);
+    // `path` arrives in the VFS layer's reversible escape form (see
+    // `crate::pathcodec`): undecodable guest path bytes are carried as PUA
+    // scalars so the `&str`-based layer can hold them. We KEEP that encoded form
+    // as the on-disk host name — macOS APFS rejects a raw non-UTF-8 filename
+    // with EILSEQ (errno 92), so a guest's opaque `b"\xff"` cannot be stored
+    // byte-for-byte. The PUA escape is valid UTF-8 (APFS-storable) AND
+    // reversible, so it's our durable host representation of an undecodable
+    // name. The escape is decoded back to the raw guest bytes only at the
+    // GUEST-facing read-back boundaries (getdents/readlink/getcwd), so the
+    // guest still sees `b"\xff"` and a re-open by those bytes round-trips.
+    // Valid-UTF-8 paths encode to themselves (fast path, allocation-free).
+    normalize_raw(Path::new(path))
+}
+
+/// Component-normalize a path whose components are already in the host's
+/// canonical on-disk form (the VFS escape encoding, or plain UTF-8). Used for a
+/// path that must NOT be re-encoded (e.g. a symlink target read back from the
+/// host, which is already in the encoded form).
+pub fn normalize_raw(raw: &Path) -> Option<PathBuf> {
     let mut out = PathBuf::new();
     for component in raw.components() {
         match component {
@@ -336,6 +354,17 @@ pub fn normalize(path: &str) -> Option<PathBuf> {
     Some(out)
 }
 
+/// Build a NUL-terminated C path from a raw host `OsStr` *by its bytes* —
+/// unlike `CString::new(os.to_str()?)`, this does not reject a legitimate
+/// non-UTF-8 (undecodable) filename that Linux lets the guest create. Returns
+/// `None` only if the bytes contain an interior NUL (impossible for a real
+/// path component).
+#[cfg(unix)]
+fn cstring_from_osstr(os: &std::ffi::OsStr) -> Option<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+    std::ffi::CString::new(os.as_bytes()).ok()
+}
+
 fn child_name(prefix: &Path, candidate: &Path) -> Option<String> {
     let stripped = candidate.strip_prefix(prefix).ok()?;
     let mut components = stripped.components();
@@ -346,6 +375,9 @@ fn child_name(prefix: &Path, candidate: &Path) -> Option<String> {
     let Component::Normal(name) = first else {
         return None;
     };
+    // The on-disk name is already in the host's canonical form (the VFS escape
+    // encoding for an undecodable name, else plain UTF-8) — both are valid
+    // UTF-8. Carry it through unchanged; the guest-facing getdents decodes it.
     Some(name.to_string_lossy().into_owned())
 }
 
@@ -747,11 +779,13 @@ impl HostFsBackend {
             }
             hops += 1;
             let target = self.dir.read_link_contents(rel).ok()?;
+            // `target` is raw host bytes; normalize it WITHOUT a String round-
+            // trip so an undecodable symlink target isn't corrupted.
             normalized = if target.is_absolute() {
-                normalize(&target.to_string_lossy())?
+                normalize_raw(&target)?
             } else {
                 let parent = normalized.parent().unwrap_or_else(|| Path::new(""));
-                normalize(&parent.join(&target).to_string_lossy())?
+                normalize_raw(&parent.join(&target))?
             };
         }
     }
@@ -965,6 +999,9 @@ impl FsBackend for HostFsBackend {
         // `metadata`/`real_stat` carry the true `Symlink` kind for stat.
         if meta.is_symlink() {
             let target = self.dir.read_link_contents(rel).ok()?;
+            // The stored target is already in the host's canonical (escape-
+            // encoded or plain-UTF-8) form; hand back those bytes. readlink
+            // goes through `read_link` (above) + a guest-facing decode.
             return Some(OverlayEntry::File(
                 target.to_string_lossy().into_owned().into_bytes(),
             ));
@@ -1161,8 +1198,10 @@ impl FsBackend for HostFsBackend {
         // opens the FIFO node), preserving the no-open property below.
         let parent_rel = rel.parent();
         let file_name = rel.file_name().ok_or(BackendError::Invalid)?;
-        let c_name = std::ffi::CString::new(file_name.to_str().ok_or(BackendError::Invalid)?)
-            .map_err(|_| BackendError::Invalid)?;
+        // Build the C name from the raw OsStr bytes — `to_str()` would reject a
+        // legitimate non-UTF-8 (undecodable) filename that the guest is allowed
+        // to create on Linux.
+        let c_name = cstring_from_osstr(file_name).ok_or(BackendError::Invalid)?;
         // For a non-empty parent, open it through cap-std (confined); for a
         // top-level FIFO (empty parent), the sandbox root self.dir is the parent.
         let parent_dir = match parent_rel {
@@ -1258,6 +1297,9 @@ impl FsBackend for HostFsBackend {
         };
         let mut out = Vec::new();
         for entry in read.flatten() {
+            // The on-disk name is already the host's canonical (escape-encoded
+            // or plain-UTF-8) form; carry it through unchanged. The guest-facing
+            // getdents decodes the escape back to the raw opaque bytes.
             let name = entry.file_name().to_string_lossy().into_owned();
             let kind = match entry.file_type() {
                 Ok(ft) if ft.is_dir() => RootFsEntryKind::Directory,
@@ -1368,7 +1410,7 @@ impl FsBackend for HostFsBackend {
         // resolve_following won't open the node; it just resolves the path.
         let normalized = self.resolve_following(path)?;
         let rel = Self::rel_path(&normalized)?;
-        let c_rel = std::ffi::CString::new(rel.to_str()?).ok()?;
+        let c_rel = cstring_from_osstr(rel.as_os_str())?;
         let host_access = match access {
             0 => libc::O_RDONLY,
             1 => libc::O_WRONLY,
@@ -1445,7 +1487,7 @@ impl FsBackend for HostFsBackend {
         if let Ok(m) = &meta
             && m.mode() & (libc::S_IFMT as u32) == libc::S_IFIFO as u32
             && let Some(file_name) = rel.file_name()
-            && let Ok(c_name) = std::ffi::CString::new(file_name.to_str().unwrap_or(""))
+            && let Some(c_name) = cstring_from_osstr(file_name)
         {
             let parent_dir = match rel.parent() {
                 Some(p) if !p.as_os_str().is_empty() => self.dir.open_dir(p).ok(),
@@ -1576,6 +1618,9 @@ impl FsBackend for HostFsBackend {
         let normalized = normalize(path)?;
         let rel = Self::rel_path(&normalized)?;
         let target = self.dir.read_link_contents(rel).ok()?;
+        // The stored target is already in the host's canonical (escape-encoded
+        // or plain-UTF-8) form — both valid UTF-8. Return it unchanged; the
+        // guest-facing readlinkat decodes the escape back to the raw bytes.
         Some(target.to_string_lossy().into_owned())
     }
 
@@ -1759,13 +1804,15 @@ impl FsBackend for HostFsBackend {
                 }
                 hops += 1;
                 let target = self.dir.read_link_contents(rel).ok()?;
+                // `target` is raw host bytes; normalize WITHOUT a String round-
+                // trip so an undecodable symlink target isn't corrupted.
                 normalized = if target.is_absolute() {
                     // Absolute target → relative to the guest root.
-                    normalize(&target.to_string_lossy())?
+                    normalize_raw(&target)?
                 } else {
                     // Relative target → relative to the link's parent dir.
                     let parent = normalized.parent().unwrap_or_else(|| Path::new(""));
-                    normalize(&parent.join(&target).to_string_lossy())?
+                    normalize_raw(&parent.join(&target))?
                 };
             }
         } else {

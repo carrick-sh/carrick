@@ -1619,7 +1619,10 @@ impl SyscallDispatcher {
             let address = address.0;
             let size =
                 usize::try_from(size).map_err(|_| DispatchError::LengthTooLarge(size))?;
-            let mut bytes = this.io.cwd.read().as_bytes().to_vec();
+            // The cwd is stored in the VFS layer's reversible escape form;
+            // decode to the opaque path BYTES so getcwd is byte-exact for a
+            // cwd that contains undecodable (non-UTF-8) components.
+            let mut bytes = crate::pathcodec::decode_to_bytes(&this.io.cwd.read());
             bytes.push(0);
             if bytes.len() > size {
                 return Ok(LINUX_ERANGE.into());
@@ -4915,9 +4918,12 @@ impl SyscallDispatcher {
                 }
             };
 
-            let bytes = target.as_bytes();
-            let written = bytes.len().min(buffer_size);
-            if cx.memory.write_bytes(buffer, &bytes[..written]).is_err() {
+            // `target` is in the VFS layer's reversible escape form; decode it
+            // back to the opaque link-target BYTES so readlink hands the guest
+            // exactly what was stored (an undecodable target round-trips).
+            let decoded = crate::pathcodec::decode_to_bytes(&target);
+            let written = decoded.len().min(buffer_size);
+            if cx.memory.write_bytes(buffer, &decoded[..written]).is_err() {
                 return Ok(LINUX_EFAULT.into());
             }
             Ok(DispatchOutcome::Returned {

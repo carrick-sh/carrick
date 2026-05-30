@@ -6,9 +6,9 @@
 
 #[cfg(target_os = "macos")]
 pub mod apfs;
+pub mod cred_ipc;
 #[cfg(target_os = "macos")]
 pub(crate) mod darwin_fs;
-pub mod cred_ipc;
 pub mod dispatch;
 #[cfg(target_os = "macos")]
 pub mod dtrace_consumer;
@@ -49,6 +49,7 @@ pub use carrick_hvf::{
     shared_aperture, syscall, thread, trap, vcpu_kick,
 };
 pub mod overlay;
+pub mod pathcodec;
 
 pub mod execute;
 pub mod pty_relay;
