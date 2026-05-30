@@ -2074,10 +2074,19 @@ pub(super) fn rosetta_handshake_ioctl(
 /// returns ETIMEDOUT immediately.
 fn relative_from_absolute_timespec(tv_sec: i64, tv_nsec: i64, realtime: bool) -> Duration {
     let abs_ns = (tv_sec as i128) * 1_000_000_000 + tv_nsec as i128;
+    // The guest built `abs_ns` on ITS clock. For a non-FUTEX_CLOCK_REALTIME
+    // futex that clock is Linux CLOCK_MONOTONIC, which carrick reports to the
+    // guest as macOS CLOCK_UPTIME_RAW (see monotonic_duration: neither counts
+    // suspend). "now" here MUST read the SAME base — macOS CLOCK_MONOTONIC is
+    // mach_continuous_time (uptime + suspend), so using it makes abs_ns - now
+    // off by the accumulated suspend time (hours on a laptop) → every absolute
+    // deadline computes as already-past → instant spurious ETIMEDOUT (broke
+    // CPython lock.acquire(timeout) / sem_timedwait / condvar timeouts; the
+    // futexextra→deadline probe pins it).
     let clock = if realtime {
         libc::CLOCK_REALTIME
     } else {
-        libc::CLOCK_MONOTONIC
+        libc::CLOCK_UPTIME_RAW
     };
     let mut now: libc::timespec = unsafe { std::mem::zeroed() };
     // SAFETY: clock_gettime writes a timespec for a valid clock id.
