@@ -1256,7 +1256,12 @@ impl HvfTrapEngine {
         // Device-nGnRnE memory whenever stage-1 is disabled, and
         // `ldaxr`/`stlxr` on Device memory abort externally — which is
         // exactly the wall musl's pthread_mutex_lock hits otherwise.
-        let mut sctlr_el1: u64 = (1 << 2) | (1 << 12); // C=1, I=1
+        // C=1, I=1 (caches); UCI=1 (bit 26: EL0 cache-maintenance ops DC CVAU/
+        // CIVAC/CVAC, IC IVAU — glibc __clear_cache), UCT=1 (bit 15: EL0 read of
+        // CTR_EL0 — glibc 2.41 reads cache line sizes at startup; without this
+        // the MRS traps to EL1 and crashed CPython), DZE=1 (bit 14: EL0 DC ZVA +
+        // DCZID_EL0 read — glibc memset). Matches Linux's SCTLR_EL1 for EL0.
+        let mut sctlr_el1: u64 = (1 << 2) | (1 << 12) | (1 << 26) | (1 << 15) | (1 << 14);
         // Stage-1 MMU is on by default. The identity tables use AP=00 for
         // kernel pages (trampoline/vectors/PT) and AP=01+PXN=1 for user
         // pages, which is required on Apple Silicon because HVF starts
@@ -1943,6 +1948,11 @@ impl HvfInner {
         let value = match reg {
             El0SysRegRead::CntfrqEl0 => AARCH64_GUEST_COUNTER_HZ,
             El0SysRegRead::CntvctEl0 => guest_counter_ticks(),
+            // Fallback if a guest's CTR_EL0/DCZID_EL0 read still traps despite
+            // SCTLR_EL1.UCT/DZE (e.g. a forked child before its sysregs are
+            // re-applied). Return the real host cache geometry.
+            El0SysRegRead::CtrEl0 => host_ctr_dczid().0,
+            El0SysRegRead::DczidEl0 => host_ctr_dczid().1,
         };
         if let Some(target) = GPR_TABLE.get(rt as usize) {
             self.vcpu.set_reg(*target, value).map_err(hvf_error)?;
@@ -3142,7 +3152,11 @@ impl HvfInner {
                 .set_sys_reg(SysReg::ELR_EL1, plan.entry)
                 .map_err(hvf_error)?;
         }
-        let mut sctlr_el1: u64 = (1 << 2) | (1 << 12);
+        // C=1, I=1, UCI=1 (bit 26), UCT=1 (bit 15), DZE=1 (bit 14) — EL0 cache-
+        // maintenance ops + CTR_EL0/DCZID_EL0 reads + DC ZVA, matching Linux.
+        // See the matching comment at the initial-bringup site; glibc 2.41 reads
+        // CTR_EL0 at startup, which traps to EL1 (fatal) without UCT.
+        let mut sctlr_el1: u64 = (1 << 2) | (1 << 12) | (1 << 26) | (1 << 15) | (1 << 14);
         if let Some(pt_base) = plan.stage1_page_tables_base {
             self.vcpu
                 .set_sys_reg(SysReg::MAIR_EL1, 0xFF)
@@ -3740,6 +3754,20 @@ mod thread_sibling_tests {
         assert_eq!(
             decode_el0_sys64_read(cntvct),
             Some((2, El0SysRegRead::CntvctEl0))
+        );
+        // CTR_EL0 / DCZID_EL0 — the cache-geometry reads glibc 2.41 does at
+        // startup. The faulting `mrs x1, ctr_el0` observed from python:3.12-slim
+        // was ESR_EL1=0x6232c021 (EC=0x18, Rt=1): decode it directly.
+        assert_eq!(
+            decode_el0_sys64_read(0x6232c021),
+            Some((1, El0SysRegRead::CtrEl0))
+        );
+        let dczid = (AARCH64_SYS64_EXCEPTION_CLASS << AARCH64_EXCEPTION_CLASS_SHIFT)
+            | AARCH64_SYS64_ISS_SYS_DCZID
+            | (3 << AARCH64_SYS64_ISS_RT_SHIFT);
+        assert_eq!(
+            decode_el0_sys64_read(dczid),
+            Some((3, El0SysRegRead::DczidEl0))
         );
         assert_eq!(decode_el0_sys64_read(0), None);
     }
