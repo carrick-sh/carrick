@@ -98,7 +98,10 @@ pub fn create(clock_id: i32, signum: i32) -> i32 {
     let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
     let mut guard = registry();
     let map = ensure_registry(&mut guard);
-    map.insert(id, std::sync::Arc::new(PosixTimerSlot::new(clock_id, signum)));
+    map.insert(
+        id,
+        std::sync::Arc::new(PosixTimerSlot::new(clock_id, signum)),
+    );
     id
 }
 

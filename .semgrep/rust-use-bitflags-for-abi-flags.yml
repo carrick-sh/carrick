@@ -1,0 +1,28 @@
+rules:
+  - id: rust-use-bitflags-for-abi-flags
+    languages: [rust]
+    severity: WARNING
+    message: |
+      Raw bitwise operation on Linux ABI flags detected.
+      Instead of raw operations (e.g. `$X & crate::linux_abi::$FLAG != 0`),
+      prefer using a typed `bitflags!` representation (e.g. `LinuxCloneFlags`,
+      `LinuxOpenFlags`, etc.) defined in the ABI layer.
+      Using typed bitflags guarantees type safety, enables easy compiler-enforced
+      flag validation, and avoids type-width mismatch errors.
+    patterns:
+      - pattern-either:
+          - pattern: $X & crate::linux_abi::$FLAG != 0
+          - pattern: $X & crate::linux_abi::$FLAG == 0
+          - pattern: ($X & crate::linux_abi::$FLAG) != 0
+          - pattern: ($X & crate::linux_abi::$FLAG) == 0
+          - pattern: $X & linux_abi::$FLAG != 0
+          - pattern: $X & linux_abi::$FLAG == 0
+          - pattern: ($X & linux_abi::$FLAG) != 0
+          - pattern: ($X & linux_abi::$FLAG) == 0
+    paths:
+      include:
+        - "/crates/**/*.rs"
+      exclude:
+        - "**/tests/**"
+        - "**/*_test.rs"
+        - "**/test_*.rs"

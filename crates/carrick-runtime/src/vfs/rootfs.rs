@@ -236,9 +236,7 @@ impl RootFsVfs {
                 // mounts or the overlay, where guest FIFOs are intercepted
                 // before open_for_dispatch); treat like a regular file for the
                 // unreachable case.
-                RootFsEntryKind::File
-                | RootFsEntryKind::CharDevice
-                | RootFsEntryKind::Fifo => {
+                RootFsEntryKind::File | RootFsEntryKind::CharDevice | RootFsEntryKind::Fifo => {
                     if want_create && want_excl {
                         return Err(LINUX_EEXIST);
                     }
@@ -632,7 +630,7 @@ impl Vfs for RootFsVfs {
                         RootFsEntryKind::Directory => EntryKind::Directory,
                         RootFsEntryKind::Symlink => EntryKind::Symlink,
                         RootFsEntryKind::CharDevice => EntryKind::CharDevice,
-                RootFsEntryKind::Fifo => EntryKind::Fifo,
+                        RootFsEntryKind::Fifo => EntryKind::Fifo,
                     },
                 })
                 .collect()),

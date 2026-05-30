@@ -1,0 +1,25 @@
+rules:
+  - id: enforce-bitflags-bitwise-or
+    message: |
+      Found bitwise OR of uppercase identifiers. This often indicates raw integer constants used as bitmasks. Define a `bitflags!` struct instead.
+    languages:
+      - rust
+    severity: WARNING
+    patterns:
+      - pattern: $X | $Y
+      - metavariable-regex:
+          metavariable: $X
+          regex: '^[A-Z][A-Z0-9_]*$'
+      - metavariable-regex:
+          metavariable: $Y
+          regex: '^[A-Z][A-Z0-9_]*$'
+  - id: enforce-bitflags-shift
+    message: |
+      Integer constant defined with bitshift. Use `bitflags!` macro for bitmasks.
+    languages:
+      - rust
+    severity: WARNING
+    patterns:
+      - pattern-either:
+          - pattern: "const $X: $TY = $Z << $W;"
+          - pattern: "pub const $X: $TY = $Z << $W;"
