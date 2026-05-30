@@ -3685,6 +3685,19 @@ impl SyscallDispatcher {
                         | OpenDescription::SyntheticFile {
                             offset: current, ..
                         } => *current = offset,
+                        // HostFile reads via `pread` (sendfile_bytes), which does
+                        // NOT advance the kernel offset; advance it explicitly so a
+                        // follow-up sendfile/read with no explicit offset continues
+                        // past what we just sent. Without this, busybox `cat` —
+                        // which copies a file with `sendfile(out, file, NULL, n)` in
+                        // a `while (n > 0)` loop — re-sends offset 0 forever.
+                        OpenDescription::HostFile { host_fd, .. } => {
+                            // SAFETY: host_fd is a live regular-file fd owned by
+                            // this guest fd; lseek to an absolute position is benign.
+                            unsafe {
+                                libc::lseek(*host_fd, offset as libc::off_t, libc::SEEK_SET);
+                            }
+                        }
                         _ => {}
                     }
                 }
