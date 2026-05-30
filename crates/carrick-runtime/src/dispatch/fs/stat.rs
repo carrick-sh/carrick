@@ -72,6 +72,21 @@ impl SyscallDispatcher {
         drop(open);
         match source {
             OpenStatSource::Record(record) => Ok(record),
+            // An open Directory or in-memory File: its fd-stat must report the
+            // SAME st_ino/st_dev as a path-stat of the same path. Under
+            // `--fs host` the path-stat (newfstatat/statx) uses the REAL host
+            // inode via `overlay.real_stat`; mirror it here so
+            // `os.path.samestat(lstat(dir), fstat(open(dir)))` is True (the
+            // synthetic `fallback` hashes the path to a DIFFERENT inode). When
+            // no host stat exists (MemoryBackend), the path-stat is ALSO the
+            // synthetic record, so the `fallback` already matches.
+            OpenStatSource::PathRecord { path, fallback } => {
+                if let Some(real) = self.fs.rootfs_vfs.overlay.real_stat(&path, true) {
+                    Ok(StatRecord::from_real(&path, &real))
+                } else {
+                    Ok(fallback)
+                }
+            }
             OpenStatSource::HostFile { host_fd, metadata } => {
                 let path = metadata.path.to_string_lossy().into_owned();
                 let mut st: libc::stat = unsafe { std::mem::zeroed() };

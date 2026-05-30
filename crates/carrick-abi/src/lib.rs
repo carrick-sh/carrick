@@ -1511,11 +1511,15 @@ pub const LINUX_F_OFD_SETLK: u64 = 37;
 pub const LINUX_F_OFD_SETLKW: u64 = 38;
 pub const LINUX_F_SETLEASE: u64 = 1024;
 pub const LINUX_F_GETLEASE: u64 = 1025;
+/// Directory-change notification (dnotify). macOS has no dnotify equivalent;
+/// carrick accepts the call as a no-op (see the fcntl handler comment).
+pub const LINUX_F_NOTIFY: u64 = 1026;
 /// fcntl lock/lease type args (also l_type in struct flock).
 pub const LINUX_F_RDLCK: i32 = 0;
 pub const LINUX_F_WRLCK: i32 = 1;
 pub const LINUX_F_UNLCK: i32 = 2;
 pub const LINUX_F_DUPFD_CLOEXEC: u64 = 1030;
+pub const LINUX_F_SETPIPE_SZ: u64 = 1031;
 pub const LINUX_F_GETPIPE_SZ: u64 = 1032;
 pub const LINUX_F_ADD_SEALS: u64 = 1033;
 pub const LINUX_F_GET_SEALS: u64 = 1034;
