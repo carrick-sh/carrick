@@ -9,14 +9,22 @@ impl SyscallDispatcher {
         table: &HashMap<i32, OpenFile>,
         min_fd: i32,
         reserved: Option<i32>,
+        closed_stdio: &[bool; 3],
     ) -> Option<i32> {
         // Cap at the soft RLIMIT_NOFILE (1024, matching getrlimit/prlimit and
         // /proc/self/limits): descriptors run 0..1024, so the first free slot
         // at or above the limit means the table is full. `None` => the caller
         // returns EMFILE, matching Linux fd exhaustion.
         const RLIMIT_NOFILE_CUR: i32 = 1024;
-        let mut fd = min_fd.max(3);
-        while Some(fd) == reserved || table.contains_key(&fd) {
+        let mut fd = min_fd.max(0);
+        loop {
+            // A bare stdio number (0/1/2) is reserved (not allocatable) UNLESS the
+            // guest explicitly closed it — then POSIX lets the lowest-free open/dup
+            // land there. A caller wanting "anything but stdio" passes min_fd = 3.
+            let reserved_stdio = (0..3).contains(&fd) && !closed_stdio[fd as usize];
+            if Some(fd) != reserved && !table.contains_key(&fd) && !reserved_stdio {
+                break;
+            }
             fd = fd.checked_add(1)?;
         }
         if fd >= RLIMIT_NOFILE_CUR {
@@ -26,17 +34,30 @@ impl SyscallDispatcher {
         }
     }
 
+    /// Clear the "closed" flag for a reused stdio fd (it is open again).
+    fn clear_closed_stdio(&self, fd: i32) {
+        if (0..3).contains(&fd) {
+            self.io.closed_stdio.lock()[fd as usize] = false;
+        }
+    }
+
     pub(in crate::dispatch) fn install_fd_at_or_above(
         &self,
         min_fd: i32,
         open_file: OpenFile,
     ) -> Result<i32, OpenFile> {
         let mut table = self.io.open_files.write();
-        let Some(fd) = Self::first_free_fd(&table, min_fd, None) else {
-            return Err(open_file);
+        // Lock order: open_files → closed_stdio (the close path never holds both).
+        let fd = {
+            let closed = self.io.closed_stdio.lock();
+            match Self::first_free_fd(&table, min_fd, None, &closed) {
+                Some(fd) => fd,
+                None => return Err(open_file),
+            }
         };
         retain_open_file(&open_file.description);
         table.insert(fd, open_file);
+        self.clear_closed_stdio(fd);
         let mut next_fd = self.io.next_fd.lock();
         *next_fd = (*next_fd).max(fd.saturating_add(1));
         Ok(fd)
@@ -49,18 +70,24 @@ impl SyscallDispatcher {
         second: OpenFile,
     ) -> Result<(i32, i32), (OpenFile, OpenFile)> {
         let mut table = self.io.open_files.write();
-        let Some(first_fd) = Self::first_free_fd(&table, min_fd, None) else {
-            return Err((first, second));
-        };
-        let Some(second_fd) =
-            Self::first_free_fd(&table, first_fd.saturating_add(1), Some(first_fd))
-        else {
-            return Err((first, second));
+        let (first_fd, second_fd) = {
+            let closed = self.io.closed_stdio.lock();
+            let Some(first_fd) = Self::first_free_fd(&table, min_fd, None, &closed) else {
+                return Err((first, second));
+            };
+            let Some(second_fd) =
+                Self::first_free_fd(&table, first_fd.saturating_add(1), Some(first_fd), &closed)
+            else {
+                return Err((first, second));
+            };
+            (first_fd, second_fd)
         };
         retain_open_file(&first.description);
         retain_open_file(&second.description);
         table.insert(first_fd, first);
         table.insert(second_fd, second);
+        self.clear_closed_stdio(first_fd);
+        self.clear_closed_stdio(second_fd);
         let mut next_fd = self.io.next_fd.lock();
         *next_fd = (*next_fd).max(second_fd.saturating_add(1));
         Ok((first_fd, second_fd))
@@ -72,10 +99,14 @@ impl SyscallDispatcher {
         fd_flags: u64,
     ) -> DispatchOutcome {
         let open_file = OpenFile::new(Arc::new(RwLock::new(description)), fd_flags);
-        let Ok(fd) = self.install_fd_at_or_above(3, open_file) else {
-            return DispatchOutcome::errno(linux_errno::EMFILE);
-        };
-        DispatchOutcome::Returned { value: fd as i64 }
+        // POSIX lowest-free-descriptor (min_fd = 0): reuses a stdio number the
+        // guest explicitly closed — busybox ash's background-job forkchild does
+        // `close(0); open("/dev/null")` and treats anything but fd 0 as an error
+        // ("can't open /dev/null") — else the lowest fd >= 3.
+        match self.install_fd_at_or_above(0, open_file) {
+            Ok(fd) => DispatchOutcome::Returned { value: fd as i64 },
+            Err(_) => DispatchOutcome::errno(linux_errno::EMFILE),
+        }
     }
 
     pub(in crate::dispatch) fn open_file(&self, fd: i32) -> Option<OpenFile> {
