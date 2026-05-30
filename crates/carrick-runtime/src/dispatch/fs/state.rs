@@ -47,6 +47,13 @@ pub(in crate::dispatch) struct IoState {
     /// without persisting it here, F_GETFD always read back 0 (diverging
     /// from real Linux on the fcntlstdio conformance probe).
     pub stdio_cloexec: Mutex<[bool; 3]>,
+    /// Which bare stdio fds (0/1/2) the guest has explicitly `close`d. A closed
+    /// stdio number becomes free for reuse by the lowest-free-descriptor
+    /// allocator (POSIX): busybox ash's background-job `forkchild` does
+    /// `close(0); open("/dev/null")` and treats a non-zero return as an error.
+    /// Without honoring this, the open got fd 3 and ash printed "can't open
+    /// /dev/null". Cleared when a fd is installed at that number again.
+    pub closed_stdio: Mutex<[bool; 3]>,
     /// Guest path each open fd was opened at, regardless of backend (host-fd
     /// backed `OpenDescription`s carry no path of their own). Serves
     /// `readlink(/proc/self/fd/N)` — Apple Rosetta readlinks its main-binary fd
@@ -69,6 +76,7 @@ impl IoState {
             next_fd: Mutex::new(3),
             cwd: RwLock::new("/".to_owned()),
             stdio_cloexec: Mutex::new([false; 3]),
+            closed_stdio: Mutex::new([false; 3]),
             fd_open_paths: RwLock::new(HashMap::new()),
             io_uring_instances: RwLock::new(HashMap::new()),
         }

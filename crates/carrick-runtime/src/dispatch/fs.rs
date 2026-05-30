@@ -490,7 +490,7 @@ impl SyscallDispatcher {
                         fd_flags: linux_fd_flags_from_open_flags(flags),
                         host_fd_owner: Some(HostFdRef::new(host_fd)),
                     };
-                    let Ok(fd) = self.install_fd_at_or_above(3, open_file) else {
+                    let Ok(fd) = self.install_fd_at_or_above(0, open_file) else {
                         return Ok(linux_errno::EMFILE.into());
                     };
                     self.io.fd_open_paths.write().insert(fd, path.clone());
@@ -707,7 +707,7 @@ impl SyscallDispatcher {
             fd_flags: linux_fd_flags_from_open_flags(flags),
             host_fd_owner,
         };
-        let Ok(fd) = self.install_fd_at_or_above(3, open_file) else {
+        let Ok(fd) = self.install_fd_at_or_above(0, open_file) else {
             return Ok(linux_errno::EMFILE.into());
         };
         self.io.fd_open_paths.write().insert(fd, record_path);
@@ -854,7 +854,7 @@ impl SyscallDispatcher {
                     linux_fd_flags_from_open_flags(flags),
                     host_fd,
                 );
-                let new_fd = match self.install_fd_at_or_above(3, open_file) {
+                let new_fd = match self.install_fd_at_or_above(0, open_file) {
                     Ok(fd) => fd,
                     Err(_) => return VfsOpenAttempt::Errno(linux_errno::EMFILE),
                 };
@@ -876,7 +876,7 @@ impl SyscallDispatcher {
                     })),
                     linux_fd_flags_from_open_flags(flags),
                 );
-                let new_fd = match self.install_fd_at_or_above(3, open_file) {
+                let new_fd = match self.install_fd_at_or_above(0, open_file) {
                     Ok(fd) => fd,
                     Err(_) => return VfsOpenAttempt::Errno(linux_errno::EMFILE),
                 };
@@ -905,7 +905,7 @@ impl SyscallDispatcher {
                     linux_fd_flags_from_open_flags(flags),
                     host_fd,
                 );
-                let new_fd = match self.install_fd_at_or_above(3, open_file) {
+                let new_fd = match self.install_fd_at_or_above(0, open_file) {
                     Ok(fd) => fd,
                     Err(_) => return VfsOpenAttempt::Errno(linux_errno::EMFILE),
                 };
@@ -955,7 +955,7 @@ impl SyscallDispatcher {
                     })),
                     linux_fd_flags_from_open_flags(flags),
                 );
-                let new_fd = match self.install_fd_at_or_above(3, open_file) {
+                let new_fd = match self.install_fd_at_or_above(0, open_file) {
                     Ok(fd) => fd,
                     Err(_) => return VfsOpenAttempt::Errno(linux_errno::EMFILE),
                 };
@@ -2852,6 +2852,11 @@ impl SyscallDispatcher {
         fn close(this, cx, fd: Fd) {
 
             let fd: Fd = fd;
+            // Closing a stdio number (0/1/2) frees it for reuse by the
+            // lowest-free-descriptor allocator (a later open()/dup can land there).
+            if fd.0 >= 0 && fd.0 < 3 {
+                this.io.closed_stdio.lock()[fd.0 as usize] = true;
+            }
             Ok(
                 if let Some(open_file) = this.io.open_files.write().remove(&fd.0) {
                     // Centralised close: frees the host fd and, for pty masters,
