@@ -1008,6 +1008,60 @@ impl SyscallDispatcher {
         })
     }
 
+    /// Write ALL of `bytes` to an inherited stdio host fd (the user's tty/pipe),
+    /// looping until the whole buffer is queued. The dup2'd stdio pty slave can
+    /// be O_NONBLOCK — a line editor that sets stdin non-blocking flips the
+    /// SHARED slave description, so stdout/stderr go non-blocking too — and then
+    /// a single `write` can short-write or EAGAIN and silently DROP the tail.
+    /// That lost busybox ash's post-Enter newline (output ran onto the prompt
+    /// line) and the tail of wide `ls` output. Polling for writability on EAGAIN
+    /// restores Linux blocking-tty semantics (a tty write completes fully) without
+    /// mutating the shared O_NONBLOCK flag the guest may rely on for reads.
+    fn write_all_stdio(fd: i32, bytes: &[u8]) -> DispatchOutcome {
+        let mut off = 0usize;
+        while off < bytes.len() {
+            // BLOCKING-IO-OK: a write to the inherited controlling tty/pipe
+            // (stdout/stderr); blocking on backpressure is correct, and callers
+            // release the stream_stdio lock before getting here (no dispatcher
+            // lock is held across this write).
+            // SAFETY: fd is a live inherited stdio fd; we write a sub-slice of `bytes`.
+            let n = unsafe {
+                libc::write(
+                    fd,
+                    bytes[off..].as_ptr() as *const libc::c_void,
+                    bytes.len() - off,
+                )
+            };
+            if n > 0 {
+                off += n as usize;
+                continue;
+            }
+            // SAFETY: reading the thread-local errno after a failed libc call.
+            let e = unsafe { *libc::__error() };
+            if e == libc::EINTR {
+                continue;
+            }
+            if e == libc::EAGAIN || e == libc::EWOULDBLOCK {
+                // Wait for the slave to drain, then retry — never drop the tail.
+                let mut pfd = libc::pollfd {
+                    fd,
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                // SAFETY: single valid pollfd; blocking wait for writability.
+                unsafe { libc::poll(&mut pfd, 1, -1) };
+                continue;
+            }
+            // Hard error: report it if nothing was written, else the partial
+            // count (matching write(2)).
+            if off == 0 {
+                return DispatchOutcome::errno(crate::dispatch::macos_to_linux_errno(e));
+            }
+            break;
+        }
+        DispatchOutcome::Returned { value: off as i64 }
+    }
+
     fn write_output_fd(&self, fd: i32, bytes: &[u8]) -> DispatchOutcome {
         let nonblocking = self.io_is_nonblocking(fd, 0);
         // Mirror `write`/`writev`: any fd present in `open_files` (e.g.
@@ -1037,6 +1091,14 @@ impl SyscallDispatcher {
                     } => {
                         // pty ends and O_RDWR FIFOs are bidirectional; only real
                         // one-way pipe ends are gated by is_read_end.
+                        if std::env::var_os("CARRICK_TTY_DBG").is_some() && bytes.contains(&0x0a) {
+                            let hf = *host_fd;
+                            let tt = unsafe { libc::isatty(hf) };
+                            eprintln!(
+                                "[PTYWR2DBG-streamed] guest_fd={fd} desc_host_fd={hf} isatty={tt} pty={:?} is_read_end={is_read_end}",
+                                pty.as_ref().map(|r| r.is_master)
+                            );
+                        }
                         return if *is_read_end && pty.is_none() && !*bidirectional {
                             DispatchOutcome::errno(LINUX_EBADF)
                         } else {
@@ -1096,13 +1158,14 @@ impl SyscallDispatcher {
             // BLOCKING-IO-OK: streamed write to the inherited stdout/stderr
             // (the user's tty/pipe). Blocking here is the correct backpressure
             // and isn't a guest socket on the server path.
-            let n = unsafe { libc::write(fd, bytes.as_ptr() as *const _, bytes.len()) };
-            return match n.host_syscall_errno() {
-                Ok(value) => DispatchOutcome::Returned {
-                    value: value as i64,
-                },
-                Err(errno) => DispatchOutcome::errno(errno),
-            };
+            if std::env::var_os("CARRICK_IO_DBG").is_some() && !bytes.is_empty() {
+                eprintln!(
+                    "[IODBG] STREAMWRITE fd={fd} n={} bytes={:02x?}",
+                    bytes.len(),
+                    &bytes[..bytes.len().min(64)]
+                );
+            }
+            return Self::write_all_stdio(fd, bytes);
         }
         match fd {
             1 => self.io.stdout.lock().extend_from_slice(bytes),
@@ -4288,6 +4351,15 @@ impl SyscallDispatcher {
 
             let nonblocking = this.io_is_nonblocking(fd as i32, 0);
 
+            if std::env::var_os("CARRICK_IO_DBG").is_some() && !bytes.is_empty() {
+                let has = this.open_file(fd as i32).is_some();
+                eprintln!(
+                    "[WRDBG] guest_fd={fd} in_table={has} n={} bytes={:02x?}",
+                    bytes.len(),
+                    &bytes[..bytes.len().min(48)]
+                );
+            }
+
             // Check open_files FIRST: dup3 may have redirected fd 1/2 to
             // a pipe, an eventfd, or some other resource. Only after we've
             // confirmed there's no open description do we fall back to the
@@ -4320,6 +4392,16 @@ impl SyscallDispatcher {
                         } => {
                             // pty ends and O_RDWR FIFOs are bidirectional; only
                             // real one-way pipe ends are gated by is_read_end.
+                            if std::env::var_os("CARRICK_TTY_DBG").is_some()
+                                && bytes.contains(&0x0a)
+                            {
+                                let hf = *host_fd;
+                                let tt = unsafe { libc::isatty(hf) };
+                                eprintln!(
+                                    "[PTYWRDBG] guest_fd={fd} desc_host_fd={hf} isatty={tt} pty={:?} is_read_end={is_read_end} bidir={bidirectional}",
+                                    pty.as_ref().map(|r| r.is_master)
+                                );
+                            }
                             if *is_read_end && pty.is_none() && !*bidirectional {
                                 return Ok(LINUX_EBADF.into());
                             }
@@ -4389,6 +4471,14 @@ impl SyscallDispatcher {
                         .set_file_contents(&path, contents);
                 }
                 return Ok(outcome);
+            }
+            if *this.io.stream_stdio.lock() && (fd == 1 || fd == 2) {
+                // Stream bare stdio to the inherited stdout/stderr (the user's
+                // tty/pipe) exactly like writev does — do NOT buffer it. Buffering
+                // delays interactive output until process exit: busybox ash writes
+                // its post-Enter newline to fd 2 via write(2), so buffering left the
+                // newline stuck and the next command's output ran onto the prompt.
+                return Ok(Self::write_all_stdio(fd as i32, &bytes));
             }
             match fd {
                 1 => this.io.stdout.lock().extend_from_slice(&bytes),
@@ -4522,7 +4612,12 @@ impl SyscallDispatcher {
                             .set_file_contents(&path, contents);
                     }
                     let DispatchOutcome::Returned { value } = outcome else {
-                        return Ok(outcome);
+                        // A broken pipe/socket (read end closed) → EPIPE AND a
+                        // SIGPIPE on the writer, same as `write(2)`. busybox
+                        // `yes` writes via writev, so without this it got EPIPE
+                        // but no SIGPIPE and exited 1 instead of 141 (write05;
+                        // `yes | head` divergence vs docker).
+                        return Ok(this.raise_sigpipe_on_epipe(cx, outcome));
                     };
                     total = total
                         .checked_add(value as usize)
@@ -4532,15 +4627,16 @@ impl SyscallDispatcher {
                 if *this.io.stream_stdio.lock() && (fd == 1 || fd == 2) {
                     // BLOCKING-IO-OK: streamed writev to the inherited stdout/
                     // stderr (the user's tty/pipe); blocking is correct backpressure.
-                    let n = unsafe { libc::write(fd as i32, bytes.as_ptr() as *const _, bytes.len()) };
-                    let n = match n.host_syscall_errno() {
-                        Ok(value) => value as usize,
-                        Err(errno) => return Ok(errno.into()),
-                    };
-                    total = total
-                        .checked_add(n)
-                        .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
-                    continue;
+                    // Full write loop — never drop the tail on an O_NONBLOCK slave.
+                    match Self::write_all_stdio(fd as i32, &bytes) {
+                        DispatchOutcome::Returned { value } => {
+                            total = total
+                                .checked_add(value as usize)
+                                .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
+                            continue;
+                        }
+                        other => return Ok(other),
+                    }
                 }
                 match fd {
                     1 => this.io.stdout.lock().extend_from_slice(&bytes),
