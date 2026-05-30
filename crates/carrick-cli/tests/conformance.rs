@@ -19,15 +19,15 @@
 
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// Serializes the two conformance test functions. They both spawn carrick
-/// guests AND call `sweep_wedged_guests()` (a global `kill.sh` that SIGKILLs
-/// every `carrick:` process on the box). If the two `#[test]` fns run on
-/// parallel threads (cargo's default), each one's per-case sweep kills the
-/// OTHER's in-flight guest, producing spurious empty-output failures. A
-/// shared lock makes them run one-at-a-time regardless of `--test-threads`.
+/// Serializes the conformance test FUNCTIONS against each other so the total
+/// HVF/Docker concurrency stays bounded (each function internally fans its
+/// cases out; we don't want three functions' fan-outs stacking). Per-CASE
+/// cleanup is now scoped by run id (see `case_run_id`/`scoped_kill_guests`), so
+/// cases within a function — and other lanes/worktrees — no longer reap each
+/// other; this lock is only the cross-function bound.
 static CONFORMANCE_LOCK: Mutex<()> = Mutex::new(());
 
 /// Probes that currently diverge from Linux due to a KNOWN, tracked gap.
@@ -189,22 +189,39 @@ fn normalize(s: &str) -> String {
         .to_string()
 }
 
-/// Sweep leftover wedged `carrick:` guest procs (an HVF vCPU can wedge a
-/// forked child past its parent's exit). Done before each case so one
-/// case's leak can't make the next flaky. Best-effort (needs the project's
-/// NOPASSWD sudo path); ignored if unavailable.
-fn sweep_wedged_guests() {
+/// Per-case run id, stamped into the carrick guest's title via CARRICK_RUN_ID
+/// (inherited across guest forks). Lets each case reap ONLY its own guests, so
+/// cases run concurrently — and alongside other lanes/worktrees — without the
+/// old global sweep killing each other's in-flight guests.
+static CASE_SEQ: AtomicU64 = AtomicU64::new(0);
+fn case_run_id() -> String {
+    format!(
+        "cr-gate-{}-{}",
+        std::process::id(),
+        CASE_SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Reap only run `run_id`'s wedged guests (kill.sh's scoped mode) — the belt to
+/// the per-pgid `kill(-pid)` suspenders, catching a guest that escaped its
+/// process group via setpgid/setsid. Best-effort (needs NOPASSWD sudo).
+fn scoped_kill_guests(run_id: &str) {
     let kill_script = repo_path("scripts/sudo/kill.sh");
-    let _ = Command::new("sudo").args(["-n"]).arg(kill_script).output();
+    let _ = Command::new("sudo")
+        .args(["-n"])
+        .arg(kill_script)
+        .arg(run_id)
+        .output();
 }
 
 fn run_carrick(bin: &PathBuf, snippet: &str) -> String {
     use std::os::unix::process::CommandExt;
-    sweep_wedged_guests();
+    let run_id = case_run_id();
     let child = Command::new(bin)
         .args([
             "run", IMAGE, "--raw", "--fs", "host", "/bin/sh", "-c", snippet,
         ])
+        .env("CARRICK_RUN_ID", &run_id)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         // New process group so we can signal the whole guest tree on timeout.
@@ -215,15 +232,15 @@ fn run_carrick(bin: &PathBuf, snippet: &str) -> String {
     let done = Arc::new(AtomicBool::new(false));
     let watcher = {
         let done = Arc::clone(&done);
+        let run_id = run_id.clone();
         std::thread::spawn(move || {
             let start = Instant::now();
             while !done.load(Ordering::Relaxed) {
                 if start.elapsed() > CASE_DEADLINE {
-                    // Kill the process group, then sweep any reparented wedged
-                    // guest procs so the next case starts clean.
+                    // Kill the process group, then scoped-reap only this case's
+                    // guests if one escaped it — never another concurrent case's.
                     unsafe { libc::kill(-pid, libc::SIGKILL) };
-                    let kill_script = repo_path("scripts/sudo/kill.sh");
-                    let _ = Command::new("sudo").args(["-n"]).arg(kill_script).output();
+                    scoped_kill_guests(&run_id);
                     return true;
                 }
                 std::thread::sleep(Duration::from_millis(200));
@@ -434,7 +451,7 @@ fn probe_binaries() -> Vec<PathBuf> {
 fn run_carrick_probe(bin: &PathBuf, stdin_bytes: &[u8]) -> String {
     use std::io::Write;
     use std::os::unix::process::CommandExt;
-    sweep_wedged_guests();
+    let run_id = case_run_id();
     let mut child = Command::new(bin)
         .args([
             "run",
@@ -446,6 +463,7 @@ fn run_carrick_probe(bin: &PathBuf, stdin_bytes: &[u8]) -> String {
             "-c",
             PROBE_SNIPPET,
         ])
+        .env("CARRICK_RUN_ID", &run_id)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -466,13 +484,13 @@ fn run_carrick_probe(bin: &PathBuf, stdin_bytes: &[u8]) -> String {
     let done = Arc::new(AtomicBool::new(false));
     let watcher = {
         let done = Arc::clone(&done);
+        let run_id = run_id.clone();
         std::thread::spawn(move || {
             let start = Instant::now();
             while !done.load(Ordering::Relaxed) {
                 if start.elapsed() > CASE_DEADLINE {
                     unsafe { libc::kill(-pid, libc::SIGKILL) };
-                    let kill_script = repo_path("scripts/sudo/kill.sh");
-                    let _ = Command::new("sudo").args(["-n"]).arg(kill_script).output();
+                    scoped_kill_guests(&run_id);
                     return true;
                 }
                 std::thread::sleep(Duration::from_millis(200));
@@ -555,10 +573,84 @@ fn diff_lines(carrick: &str, linux: &str) -> Option<String> {
     Some(buf)
 }
 
+/// Timing/async-sensitive probes that flake under concurrent CPU contention
+/// (deadlines, sleeps, io_uring readiness). Run these SERIALLY after the
+/// parallel batch — far cheaper than hardening every probe's waits, and the
+/// ltp-conformance skill's standing warning about jitter-under-load applies.
+const TIMING_SENSITIVE_PROBES: &[&str] = &[
+    "iouring",
+    "iouringenterflag",
+    "posixtimers",
+    "itimer",
+    "timersettimeabs",
+    "selecttimeout",
+    "pauseeintr",
+    "ppollsig",
+    "pselecteintr",
+    "timeclock",
+    "timeextra",
+    "clockgetres",
+    "netpoll",
+    // futex wake-COUNT probes: macOS __ulock can report zombie wake successes
+    // for ~µs after a wake under contention (see project_macos_ulock_zombie),
+    // so exact counts flake under the parallel CPU load — quarantine them.
+    "futexwakecount",
+    "futexrequeue",
+    "futexshare",
+    "futexghost",
+    "futexextra",
+];
+
+fn is_timing_sensitive(probe: &std::path::Path) -> bool {
+    probe
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| TIMING_SENSITIVE_PROBES.contains(&n))
+        .unwrap_or(false)
+}
+
+enum ProbeOutcome {
+    Pass,
+    UnexpectedPass,
+    Fail(String),
+    Xfail(String),
+    Error(String),
+}
+
+/// Run one probe under carrick + Docker and classify the result. Self-contained
+/// (its own per-case run id via `run_carrick_probe`), so it is safe to call from
+/// multiple worker threads concurrently.
+fn run_one_probe(bin: &PathBuf, probe: &std::path::Path) -> (String, ProbeOutcome) {
+    use base64::Engine as _;
+    let engine = base64::engine::general_purpose::STANDARD;
+    let name = probe
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("<unknown>")
+        .to_string();
+    let raw = match std::fs::read(probe) {
+        Ok(b) => b,
+        Err(e) => return (name, ProbeOutcome::Error(format!("read probe: {e}"))),
+    };
+    let encoded = engine.encode(&raw).into_bytes();
+    let carrick_out = run_carrick_probe(bin, &encoded);
+    let docker_out = match run_docker_probe(&encoded) {
+        Ok(o) => o,
+        Err(e) => return (name, ProbeOutcome::Error(format!("docker error: {e}"))),
+    };
+    let known_gap = KNOWN_PROBE_GAPS.contains(&name.as_str());
+    let outcome = match (diff_lines(&carrick_out, &docker_out), known_gap) {
+        (None, false) => ProbeOutcome::Pass,
+        (None, true) => ProbeOutcome::UnexpectedPass,
+        (Some(diff), false) => ProbeOutcome::Fail(diff),
+        (Some(diff), true) => ProbeOutcome::Xfail(diff),
+    };
+    (name, outcome)
+}
+
 #[test]
 fn conformance_probes() {
     let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    use base64::Engine as _;
 
     let Some(bin) = carrick_bin() else {
         eprintln!("SKIP conformance_probes: target/release/carrick not built");
@@ -597,50 +689,67 @@ fn conformance_probes() {
         return;
     }
 
-    let engine = base64::engine::general_purpose::STANDARD;
+    // Fan the probes out across a bounded worker pool — each case is now
+    // hermetic (own run id + own host-fs scratch), so the only shared resources
+    // are the Docker daemon and the host CPUs. Cap at min(cores-2, 8) to avoid
+    // saturating the Docker LinuxKit VM. Timing-sensitive probes are quarantined
+    // to a serial tail to keep them off the contended path.
+    let (quarantine, parallel): (Vec<PathBuf>, Vec<PathBuf>) =
+        probes.into_iter().partition(|p| is_timing_sensitive(p));
+
+    let n_workers = std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(2).clamp(1, 8))
+        .unwrap_or(4);
+
+    let parallel = Arc::new(parallel);
+    let next = Arc::new(AtomicUsize::new(0));
+    let results: Arc<Mutex<Vec<(String, ProbeOutcome)>>> = Arc::new(Mutex::new(Vec::new()));
+    std::thread::scope(|scope| {
+        for _ in 0..n_workers {
+            let parallel = Arc::clone(&parallel);
+            let next = Arc::clone(&next);
+            let results = Arc::clone(&results);
+            let bin = bin.clone();
+            scope.spawn(move || {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(probe) = parallel.get(i) else { break };
+                    let r = run_one_probe(&bin, probe);
+                    results.lock().unwrap_or_else(|e| e.into_inner()).push(r);
+                }
+            });
+        }
+    });
+    // Quarantined probes: serial, after the fan-out drains.
+    for probe in &quarantine {
+        let r = run_one_probe(&bin, probe);
+        results.lock().unwrap_or_else(|e| e.into_inner()).push(r);
+    }
+
+    let mut results = Arc::try_unwrap(results)
+        .map(|m| m.into_inner().unwrap_or_else(|e| e.into_inner()))
+        .unwrap_or_default();
+    results.sort_by(|a, b| a.0.cmp(&b.0)); // deterministic report order
+
     let mut failures = Vec::new();
     let mut fixed_gaps = Vec::new();
-    for probe in &probes {
-        let name = probe
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("<unknown>")
-            .to_string();
-        let raw = match std::fs::read(probe) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("FAIL {name} (read probe: {e})");
-                failures.push(name);
-                continue;
-            }
-        };
-        let encoded = engine.encode(&raw).into_bytes();
-
-        let carrick_out = run_carrick_probe(&bin, &encoded);
-        let docker_out = match run_docker_probe(&encoded) {
-            Ok(o) => o,
-            Err(e) => {
-                eprintln!("FAIL {name} (docker error: {e})");
-                failures.push(name);
-                continue;
-            }
-        };
-
-        let known_gap = KNOWN_PROBE_GAPS.contains(&name.as_str());
-        match (diff_lines(&carrick_out, &docker_out), known_gap) {
-            (None, false) => eprintln!("PASS {name}"),
-            (None, true) => {
-                // A known-gap probe started passing → the gap is fixed.
-                // Fail loudly so the entry gets removed from KNOWN_PROBE_GAPS.
+    for (name, outcome) in &results {
+        match outcome {
+            ProbeOutcome::Pass => eprintln!("PASS {name}"),
+            ProbeOutcome::UnexpectedPass => {
+                // A known-gap probe started passing → the gap is fixed. Fail
+                // loudly so the entry gets removed from KNOWN_PROBE_GAPS.
                 eprintln!("UNEXPECTED PASS {name} (remove from KNOWN_PROBE_GAPS)");
-                fixed_gaps.push(name);
+                fixed_gaps.push(name.clone());
             }
-            (Some(diff), false) => {
+            ProbeOutcome::Fail(diff) => {
                 eprintln!("FAIL {name}\n{diff}");
-                failures.push(name);
+                failures.push(name.clone());
             }
-            (Some(diff), true) => {
-                eprintln!("XFAIL {name} (known gap)\n{diff}");
+            ProbeOutcome::Xfail(diff) => eprintln!("XFAIL {name} (known gap)\n{diff}"),
+            ProbeOutcome::Error(e) => {
+                eprintln!("FAIL {name} ({e})");
+                failures.push(name.clone());
             }
         }
     }
