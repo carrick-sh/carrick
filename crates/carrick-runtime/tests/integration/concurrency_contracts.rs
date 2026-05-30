@@ -384,7 +384,7 @@ fn shared_dispatcher_services_execve_request_without_serialized_fallback() {
         exec,
         DispatchOutcome::Execve {
             path: "/bin/echo".to_owned(),
-            argv: vec!["/bin/echo".to_owned()],
+            argv: vec![b"/bin/echo".to_vec()],
             env: Vec::new(),
         }
     );

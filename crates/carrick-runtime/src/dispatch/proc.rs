@@ -1396,11 +1396,14 @@ impl SyscallDispatcher {
                 Ok(p) => p,
                 Err(errno) => return Ok(errno.into()),
             };
-            let argv = match read_guest_string_array(memory, argv_addr.0) {
+            // argv/env are opaque BYTE strings (Linux ABI), not UTF-8 — read
+            // them byte-preserving so a non-UTF-8 arg/env (e.g. CPython
+            // regrtest's PYTHONREGRTEST_UNICODE_GUARD) doesn't EINVAL the execve.
+            let argv = match read_guest_string_array_bytes(memory, argv_addr.0) {
                 Ok(v) => v,
                 Err(errno) => return Ok(errno.into()),
             };
-            let env = match read_guest_string_array(memory, envp_addr.0) {
+            let env = match read_guest_string_array_bytes(memory, envp_addr.0) {
                 Ok(v) => v,
                 Err(errno) => return Ok(errno.into()),
             };

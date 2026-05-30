@@ -267,7 +267,14 @@ pub fn futex_route(addr: u64, op: i32, shared: i32, host_addr: u64) {
 }
 
 pub fn ulock_wait(host_addr: u64, value: u32, timeout_us: u32, phase: i32, rc: i64) {
-    carrick_usdt::ulock__wait!(|| (libc::getpid() as u32, host_addr, value, timeout_us, phase, rc));
+    carrick_usdt::ulock__wait!(|| (
+        libc::getpid() as u32,
+        host_addr,
+        value,
+        timeout_us,
+        phase,
+        rc
+    ));
 }
 
 pub fn ulock_wake(host_addr: u64, iter: i32, rc: i64) {
@@ -295,13 +302,17 @@ pub fn lifecycle(phase: u32) {
     carrick_usdt::lifecycle!(|| phase);
 }
 
-pub fn execve_argv(path: &str, argv: &[String]) {
-    // `argv.join` allocates, so it can't move inside the closure (the
-    // returned `&str` would dangle once the closure's local String
-    // drops, before usdt serialises it). execve is rare, so the
-    // unconditional join is acceptable; the hot paths above are the
-    // ones that matter for zero-cost-when-disabled.
-    let joined = argv.join(" ");
+pub fn execve_argv(path: &str, argv: &[Vec<u8>]) {
+    // argv items are opaque bytes (Linux ABI); lossily decode + join for the
+    // trace (display only). `argv.join` allocates, so it can't move inside the
+    // closure (the returned `&str` would dangle once the closure's local String
+    // drops, before usdt serialises it). execve is rare, so the unconditional
+    // join is acceptable; the hot paths above are zero-cost-when-disabled.
+    let joined = argv
+        .iter()
+        .map(|a| String::from_utf8_lossy(a))
+        .collect::<Vec<_>>()
+        .join(" ");
     carrick_usdt::execve__argv!(|| (libc::getpid() as u32, path, joined.as_str()));
 }
 
