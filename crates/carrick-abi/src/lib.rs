@@ -1495,6 +1495,17 @@ pub const LINUX_F_SETFL: u64 = 4;
 pub const LINUX_F_GETLK: u64 = 5;
 pub const LINUX_F_SETLK: u64 = 6;
 pub const LINUX_F_SETLKW: u64 = 7;
+/// Async-I/O owner (SIGIO/SIGURG target) and signal commands.
+pub const LINUX_F_SETOWN: u64 = 8;
+pub const LINUX_F_GETOWN: u64 = 9;
+pub const LINUX_F_SETSIG: u64 = 10;
+pub const LINUX_F_GETSIG: u64 = 11;
+pub const LINUX_F_SETOWN_EX: u64 = 15;
+pub const LINUX_F_GETOWN_EX: u64 = 16;
+/// `f_owner_ex.type` values for F_{SET,GET}OWN_EX.
+pub const LINUX_F_OWNER_TID: i32 = 0;
+pub const LINUX_F_OWNER_PID: i32 = 1;
+pub const LINUX_F_OWNER_PGRP: i32 = 2;
 pub const LINUX_F_OFD_GETLK: u64 = 36;
 pub const LINUX_F_OFD_SETLK: u64 = 37;
 pub const LINUX_F_OFD_SETLKW: u64 = 38;

@@ -106,3 +106,17 @@ Gap to 75% is +85 MATCH (prompt framing 587->672). NOTE the deduped results.json
   is not a regular file or dir and name starts with `user.`, return EPERM. Then
   re-enable the symlink assertions in conformance-probes/src/bin/lxattr.rs.
 - semtimedop (192): VERIFIED conformant (probe MATCHes Docker) — no fix needed.
+
+### fcntl async-I/O SIGIO delivery  [DIFF, effort L] — fcntl31/32 root cause
+- OBSERVED (clean-room, from fcntl31's own TINFO/TBROK output, not source):
+  fcntl31 sets F_SETOWN+F_SETSIG, makes an fd ready, then sigtimedwait()s for the
+  async-I/O signal — carrick delivers nothing → EAGAIN → TBROK. fcntl32 similar.
+- The F_SETOWN/F_GETOWN(_EX)/F_SETSIG/F_GETSIG ROUND-TRIP is now implemented
+  (commit: per-description owner/sig state, probe conformance-probes/bin/fcntlowner
+  MATCHes). What remains for fcntl31/32 is the DELIVERY path: when an O_ASYNC fd
+  (F_SETFL O_ASYNC) becomes ready, send the F_SETSIG signal (default SIGIO, with
+  si_fd/si_band when SA_SIGINFO) to the stored owner (pid/pgrp/tid). carrick has
+  no async-I/O readiness→signal mechanism yet — substantial (ties into the fd
+  readiness/poll path + cross-process signal delivery). Owner/sig state is the
+  foundation already in place.
+- F_SETPIPE_SZ (separate): pipe-buffer resize, not yet implemented.
