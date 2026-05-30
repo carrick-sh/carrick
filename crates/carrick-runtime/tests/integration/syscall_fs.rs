@@ -3176,21 +3176,37 @@ fn getdents64_lists_rootfs_directory_entries() {
     let DispatchOutcome::Returned { value } = outcome else {
         panic!("expected getdents64 success, got {outcome:?}");
     };
+    // A real Linux directory lists `.` and `..` first, then its entries, so the
+    // listing is the three records ., .., motd.
     assert!(value as usize > LINUX_DIRENT64_HEADER_SIZE + "motd".len());
 
     let dirent = memory.read_bytes(0x4100, value as usize).unwrap();
-    let (header, _) = LinuxDirent64Header::read_from_prefix(&dirent).unwrap();
-    let reclen = header.d_reclen;
-    let dtype = header.d_type;
-    assert_eq!(reclen as usize, value as usize);
-    assert_eq!(dtype, LINUX_DT_REG);
-    let name_start = LINUX_DIRENT64_HEADER_SIZE;
-    let name_end = dirent[name_start..]
-        .iter()
-        .position(|byte| *byte == 0)
-        .map(|offset| name_start + offset)
-        .unwrap();
-    assert_eq!(&dirent[name_start..name_end], b"motd");
+    // Parse every dirent64 record and collect (name, d_type).
+    let mut entries: Vec<(String, u8)> = Vec::new();
+    let mut off = 0usize;
+    while off < dirent.len() {
+        let (header, _) = LinuxDirent64Header::read_from_prefix(&dirent[off..]).unwrap();
+        let reclen = header.d_reclen as usize;
+        assert!(reclen > 0 && off + reclen <= dirent.len());
+        let name_start = off + LINUX_DIRENT64_HEADER_SIZE;
+        let name_end = dirent[name_start..]
+            .iter()
+            .position(|byte| *byte == 0)
+            .map(|offset| name_start + offset)
+            .unwrap();
+        entries.push((
+            String::from_utf8_lossy(&dirent[name_start..name_end]).into_owned(),
+            header.d_type,
+        ));
+        off += reclen;
+    }
+    assert!(entries.iter().any(|(n, t)| n == "." && *t == 4u8 /* DT_DIR */));
+    assert!(entries.iter().any(|(n, t)| n == ".." && *t == 4u8 /* DT_DIR */));
+    assert!(
+        entries
+            .iter()
+            .any(|(n, t)| n == "motd" && *t == LINUX_DT_REG)
+    );
 
     assert_eq!(
         dispatcher

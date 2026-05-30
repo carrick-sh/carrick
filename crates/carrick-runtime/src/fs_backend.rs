@@ -1178,8 +1178,7 @@ impl FsBackend for HostFsBackend {
         // Real named pipe on the cap-std scratch (fork-shareable, stats as
         // S_IFIFO). mkfifoat applies the host process umask; override it below
         // with the exact guest-requested mode so stat reports it faithfully.
-        let rc =
-            unsafe { libc::mkfifoat(dirfd, c_name.as_ptr(), (mode & 0o7777) as libc::mode_t) };
+        let rc = unsafe { libc::mkfifoat(dirfd, c_name.as_ptr(), (mode & 0o7777) as libc::mode_t) };
         if rc != 0 {
             return Err(BackendError::Io);
         }
@@ -1800,17 +1799,17 @@ impl FsBackend for HostFsBackend {
             if matches!(kind, RootFsEntryKind::Symlink | RootFsEntryKind::Fifo) {
                 (None, (None, None))
             } else {
-            match Self::rel_path(&normalized) {
-                Some(rel) => {
-                    let is_dir = matches!(kind, RootFsEntryKind::Directory);
-                    (
-                        read_mode_xattr(&self.dir, rel, is_dir),
-                        read_owner_xattr(&self.dir, rel, is_dir),
-                    )
+                match Self::rel_path(&normalized) {
+                    Some(rel) => {
+                        let is_dir = matches!(kind, RootFsEntryKind::Directory);
+                        (
+                            read_mode_xattr(&self.dir, rel, is_dir),
+                            read_owner_xattr(&self.dir, rel, is_dir),
+                        )
+                    }
+                    None => (None, (None, None)),
                 }
-                None => (None, (None, None)),
-            }
-        };
+            };
         Some(RealStat {
             kind,
             ino: meta.ino(),
@@ -1992,7 +1991,42 @@ pub fn layered_directory_entries(
         seen.insert(name.clone());
         out.push(RootFsDirEntry { name, metadata });
     }
+
+    // Every real Linux directory returns the `.` (self) and `..` (parent)
+    // entries from getdents64; synthesize them at the front (Linux lists them
+    // first) so `ls -a` matches Docker. Skip any a backend already produced.
+    let dot_meta = |p: &str| RootFsMetadata {
+        path: normalize(p).unwrap_or_else(|| std::path::PathBuf::from(p)),
+        kind: RootFsEntryKind::Directory,
+        mode: 0o755,
+        size: 0,
+    };
+    let mut dots: Vec<RootFsDirEntry> = Vec::new();
+    if !seen.contains("..") {
+        dots.push(RootFsDirEntry {
+            name: "..".to_string(),
+            metadata: dot_meta(&parent_dir(dir)),
+        });
+    }
+    if !seen.contains(".") {
+        dots.push(RootFsDirEntry {
+            name: ".".to_string(),
+            metadata: dot_meta(dir),
+        });
+    }
+    // Prepend ".", then ".." (so the final order is ".", "..", <entries>).
+    for d in dots {
+        out.insert(0, d);
+    }
     Ok(out)
+}
+
+/// The parent directory path of `dir` (for the synthetic `..` entry).
+fn parent_dir(dir: &str) -> String {
+    match normalize(dir).and_then(|p| p.parent().map(|q| q.to_path_buf())) {
+        Some(p) => p.to_string_lossy().into_owned(),
+        None => "/".to_string(),
+    }
 }
 
 fn joined(base: &str, name: &str) -> String {
