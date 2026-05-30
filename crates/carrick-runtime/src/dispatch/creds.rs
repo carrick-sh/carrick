@@ -165,6 +165,46 @@ impl SyscallDispatcher {
             value: std::process::id() as i64,
         }
     }
+
+    /// The supplementary group list `getgroups(2)` reports: the primary egid
+    /// plus every group in the guest's `/etc/group` that lists the current user
+    /// (resolved from `/etc/passwd` by euid) as a member — the same set runc
+    /// derives, so `id` matches Docker. Falls back to just the egid when the
+    /// files are absent/unreadable.
+    pub(super) fn supplementary_groups(&self) -> Vec<u32> {
+        let (euid, egid) = {
+            let c = self.creds.lock();
+            (c.euid, c.egid)
+        };
+        let mut gids: Vec<u32> = vec![egid];
+        // uid -> username via /etc/passwd (name:passwd:uid:gid:...).
+        let username = self.read_exec_file("/etc/passwd").and_then(|b| {
+            String::from_utf8_lossy(&b).lines().find_map(|line| {
+                let f: Vec<&str> = line.split(':').collect();
+                if f.len() >= 3 && f[2].parse::<u32>().ok() == Some(euid) {
+                    Some(f[0].to_string())
+                } else {
+                    None
+                }
+            })
+        });
+        // Groups that name the user as a member (name:passwd:gid:m1,m2,...).
+        if let (Some(user), Some(group)) = (username, self.read_exec_file("/etc/group")) {
+            for line in String::from_utf8_lossy(&group).lines() {
+                let f: Vec<&str> = line.split(':').collect();
+                if f.len() < 4 {
+                    continue;
+                }
+                let Ok(gid) = f[2].parse::<u32>() else {
+                    continue;
+                };
+                if !gids.contains(&gid) && f[3].split(',').any(|m| !m.is_empty() && m == user) {
+                    gids.push(gid);
+                }
+            }
+        }
+        gids
+    }
 }
 
 impl SyscallDispatcher {
@@ -413,16 +453,27 @@ impl SyscallDispatcher {
             if size < 0 {
                 return Ok(LINUX_EINVAL.into());
             }
+            let groups = this.supplementary_groups();
+            // size == 0 is a pure query: return the count without writing.
             if size == 0 {
-                return Ok(DispatchOutcome::Returned { value: 1 });
+                return Ok(DispatchOutcome::Returned {
+                    value: groups.len() as i64,
+                });
             }
-            if size < 1 {
+            if (size as usize) < groups.len() {
+                // Buffer too small to hold the whole set (Linux EINVAL).
                 return Ok(LINUX_EINVAL.into());
             }
-            if cx.memory.write_bytes(list.0, &0u32.to_le_bytes()).is_err() {
+            let mut bytes = Vec::with_capacity(groups.len() * 4);
+            for g in &groups {
+                bytes.extend_from_slice(&g.to_le_bytes());
+            }
+            if cx.memory.write_bytes(list.0, &bytes).is_err() {
                 return Ok(LINUX_EFAULT.into());
             }
-            Ok(DispatchOutcome::Returned { value: 1 })
+            Ok(DispatchOutcome::Returned {
+                value: groups.len() as i64,
+            })
         }
 
         fn sys_setfsuid(this, cx, uid: u64) {
