@@ -555,6 +555,40 @@ pub fn host_tty_tcgetsid(fd: i32) -> Result<i32, i32> {
     }
 }
 
+/// Run `f` with host SIGTTOU blocked on the calling thread when `block` is true
+/// (otherwise a plain passthrough), restoring the previous mask afterward.
+///
+/// carrick runs the guest and its job-control children as real macOS processes
+/// on a real host pty, so the host kernel's tty layer is live. A tty *control*
+/// op (`tcsetpgrp`/`tcsetattr`) issued from a background process group raises
+/// SIGTTOU regardless of TOSTOP, and would STOP the real carrick process. On
+/// Linux the same op completes silently because a job-control shell installs
+/// `SIG_IGN` for SIGTTOU — a disposition carrick only records in its *emulated*
+/// table, so the host process is unprotected. Blocking host SIGTTOU around the
+/// passthrough reproduces the POSIX "ignored/blocked SIGTTOU ⇒ the call just
+/// succeeds" rule. Callers gate `block` on the guest's SIGTTOU disposition so a
+/// genuinely-default background caller still stops (matching Linux). Mirrors the
+/// guard the pty relay already uses for its own TIOCSWINSZ writes.
+pub fn with_sigttou_blocked<R>(block: bool, f: impl FnOnce() -> R) -> R {
+    if !block {
+        return f();
+    }
+    // SAFETY: standard sigset_t manipulation + pthread_sigmask on the current
+    // thread; the closure runs between block and restore.
+    unsafe {
+        let mut set: libc::sigset_t = core::mem::zeroed();
+        let mut old: libc::sigset_t = core::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGTTOU);
+        let masked = libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old) == 0;
+        let r = f();
+        if masked {
+            libc::pthread_sigmask(libc::SIG_SETMASK, &old, core::ptr::null_mut());
+        }
+        r
+    }
+}
+
 /// Set the foreground process-group of terminal `fd` to `pgrp`.  Returns `Ok(())`
 /// on success or `Err(errno)` on failure (raw macOS errno, not translated).
 ///
@@ -776,5 +810,40 @@ mod tests {
             libc::close(fds[0]);
             libc::close(fds[1]);
         }
+    }
+
+    fn sigttou_blocked_now() -> bool {
+        // SAFETY: query-only pthread_sigmask with a null `set`.
+        unsafe {
+            let mut cur: libc::sigset_t = std::mem::zeroed();
+            libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut cur);
+            libc::sigismember(&cur, libc::SIGTTOU) == 1
+        }
+    }
+
+    #[test]
+    fn with_sigttou_blocked_masks_during_closure_and_restores() {
+        let _guard = TTY_TEST_LOCK.lock();
+        // Start from a known state: SIGTTOU unblocked.
+        // SAFETY: standard sigset/pthread_sigmask use.
+        unsafe {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            libc::sigaddset(&mut set, libc::SIGTTOU);
+            libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+        }
+        assert!(!sigttou_blocked_now(), "precondition: SIGTTOU unblocked");
+
+        let inside = with_sigttou_blocked(true, sigttou_blocked_now);
+        assert!(inside, "SIGTTOU must be blocked inside the closure");
+        assert!(
+            !sigttou_blocked_now(),
+            "SIGTTOU must be restored (unblocked) after the closure"
+        );
+
+        // block = false is a transparent passthrough that touches no mask.
+        let passthrough = with_sigttou_blocked(false, sigttou_blocked_now);
+        assert!(!passthrough, "block=false must not change the mask");
+        assert_eq!(with_sigttou_blocked(false, || 7), 7, "returns the value");
     }
 }

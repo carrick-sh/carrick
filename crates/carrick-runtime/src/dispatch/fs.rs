@@ -88,7 +88,10 @@ fn forward_record_lock<M: GuestMemory>(
             // caller passed (LTP fcntl05 pre-sets l_pid = getpid() and checks it
             // survives). carrick previously rewrote the whole struct from the
             // macOS flock result, which zeroes l_pid. Touch only l_type@0.
-            if memory.write_bytes(arg, &LINUX_F_UNLCK.to_le_bytes()).is_err() {
+            if memory
+                .write_bytes(arg, &LINUX_F_UNLCK.to_le_bytes())
+                .is_err()
+            {
                 return DispatchOutcome::errno(LINUX_EFAULT);
             }
         } else {
@@ -1381,12 +1384,10 @@ impl SyscallDispatcher {
                     // cap-std follow can't (it treats absolute as a sandbox
                     // escape). A symlink to a non-directory (or a dangling one)
                     // is ENOTDIR, matching Linux.
-                    RootFsEntryKind::Symlink => {
-                        match self.canonicalize_following(&prefix) {
-                            Ok(target) if self.path_is_directory(&target) => {}
-                            _ => return Err(LINUX_ENOTDIR),
-                        }
-                    }
+                    RootFsEntryKind::Symlink => match self.canonicalize_following(&prefix) {
+                        Ok(target) if self.path_is_directory(&target) => {}
+                        _ => return Err(LINUX_ENOTDIR),
+                    },
                     // A regular file / char device can't be a path component.
                     _ => return Err(LINUX_ENOTDIR),
                 },
@@ -1475,7 +1476,6 @@ impl SyscallDispatcher {
         cx: &SyscallCtx<M>,
         outcome: DispatchOutcome,
     ) -> DispatchOutcome {
-        const LINUX_SIGPIPE: i32 = 13;
         if matches!(&outcome, DispatchOutcome::Errno { errno } if *errno == LINUX_EPIPE)
             && !self.signal_is_ignored(LINUX_SIGPIPE)
         {
@@ -2112,6 +2112,19 @@ impl SyscallDispatcher {
             let fd: Fd = fd;
             let ioctl_request = request;
             let arg = arg;
+            // A tty *control* ioctl (tcsetpgrp/tcsetattr/winsize) issued on the
+            // host pty from a background process group raises SIGTTOU regardless
+            // of TOSTOP and would STOP the real carrick process. Linux suppresses
+            // that when the calling guest has SIGTTOU ignored or blocked (a
+            // job-control shell always does, e.g. busybox ash's forkchild does
+            // setpgid()+tcsetpgrp() while still background). Mirror it: block host
+            // SIGTTOU around those passthroughs in exactly that case, so the host
+            // op completes instead of stopping. A genuinely-default background
+            // caller is NOT gated and still stops, matching Linux.
+            let block_ttou = {
+                let tid = Self::ctx_tid(cx);
+                this.signal_is_ignored(LINUX_SIGTTOU) || this.signal_blocked(tid, LINUX_SIGTTOU)
+            };
             if !this.fd_is_valid(fd.0) {
                 return Ok(LINUX_EBADF.into());
             }
@@ -2163,7 +2176,10 @@ impl SyscallDispatcher {
                                 padded[..LINUX_TERMIOS_KERNEL_SIZE].copy_from_slice(&bytes);
                                 match LinuxTermios::read_from_bytes(&padded) {
                                     Ok(t) => {
-                                        let _ = crate::host_tty::set_host_termios(host_fd, &t);
+                                        let _ = crate::host_tty::with_sigttou_blocked(
+                                            block_ttou,
+                                            || crate::host_tty::set_host_termios(host_fd, &t),
+                                        );
                                         DispatchOutcome::Returned { value: 0 }
                                     }
                                     Err(_) => DispatchOutcome::errno(LINUX_EINVAL),
@@ -2186,9 +2202,9 @@ impl SyscallDispatcher {
                                 ws.ws_xpixel = u16::from_le_bytes([b[4], b[5]]);
                                 ws.ws_ypixel = u16::from_le_bytes([b[6], b[7]]);
                                 // SAFETY: host_fd is our live pty fd; &ws is valid.
-                                let r = unsafe {
+                                let r = crate::host_tty::with_sigttou_blocked(block_ttou, || unsafe {
                                     libc::ioctl(host_fd, libc::TIOCSWINSZ as libc::c_ulong, &ws)
-                                };
+                                });
                                 if r < 0 {
                                     DispatchOutcome::errno(crate::dispatch::macos_to_linux_errno(
                                         unsafe { *libc::__error() },
@@ -2221,7 +2237,9 @@ impl SyscallDispatcher {
                         }
                         let pgrp = i32::from_le_bytes(buf);
                         // SAFETY: host_fd is our live pty fd.
-                        let r = unsafe { libc::tcsetpgrp(host_fd, pgrp) };
+                        let r = crate::host_tty::with_sigttou_blocked(block_ttou, || unsafe {
+                            libc::tcsetpgrp(host_fd, pgrp)
+                        });
                         if r < 0 {
                             DispatchOutcome::errno(crate::dispatch::macos_to_linux_errno(unsafe {
                                 *libc::__error()
@@ -2305,7 +2323,9 @@ impl SyscallDispatcher {
                                 let mut padded = [0u8; core::mem::size_of::<LinuxTermios>()];
                                 padded[..LINUX_TERMIOS_KERNEL_SIZE].copy_from_slice(&bytes);
                                 if let Ok(t) = LinuxTermios::read_from_bytes(&padded) {
-                                    let _ = crate::host_tty::set_host_termios_tracking(fd.0, &t);
+                                    let _ = crate::host_tty::with_sigttou_blocked(block_ttou, || {
+                                        crate::host_tty::set_host_termios_tracking(fd.0, &t)
+                                    });
                                 }
                             }
                             DispatchOutcome::Returned { value: 0 }
@@ -2353,7 +2373,9 @@ impl SyscallDispatcher {
                         // the host line discipline tracks the foreground pgrp, enabling
                         // Ctrl-C → SIGINT delivery to the correct guest pgrp.
                         if crate::host_tty::host_isatty(fd.0) {
-                            match crate::host_tty::host_tty_tcsetpgrp(fd.0, pgid) {
+                            match crate::host_tty::with_sigttou_blocked(block_ttou, || {
+                                crate::host_tty::host_tty_tcsetpgrp(fd.0, pgid)
+                            }) {
                                 Ok(()) => DispatchOutcome::Returned { value: 0 },
                                 Err(raw_errno) => DispatchOutcome::errno(
                                     crate::dispatch::macos_to_linux_errno(raw_errno),
