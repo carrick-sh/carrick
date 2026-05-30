@@ -13,6 +13,30 @@ use anyhow::{Context, Result};
 use carrick_spec::{FsBackendKind, Platform, RunSpec};
 use std::path::PathBuf;
 
+/// True when a runtime error means the ENTRYPOINT executable (or its loader)
+/// could not be found/read. The runc/shell convention is to exit 127 for that —
+/// `docker run img /nope` and `sh -c nope` both yield 127 — not the generic 1 a
+/// propagated error would produce.
+fn is_entrypoint_not_found(e: &RuntimeError) -> bool {
+    matches!(
+        e,
+        RuntimeError::AddressSpace(crate::memory::AddressSpaceError::Io(io))
+            if io.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
+/// A 127 ("command not found") result for a failed entrypoint load.
+fn entrypoint_not_found_result() -> RunResult {
+    RunResult {
+        exit_code: 127,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+        traps: 0,
+        report: crate::compat::CompatReport::default(),
+        trap_limit_hit: false,
+    }
+}
+
 /// For an `amd64` (Rosetta-translated) container, expose the host's Rosetta
 /// runtime files inside the guest VFS at the same paths. Rosetta opens these at
 /// startup to load its support libraries and (optionally) its AOT translation
@@ -166,12 +190,18 @@ impl Runtime {
                     spec.max_traps,
                     debug_path.as_ref(),
                 );
-                run_result.map_err(|e| {
-                    RuntimeError::FsBackend(anyhow::anyhow!(
-                        "failed to run ELF from dispatcher: {}",
-                        e
-                    ))
-                })?
+                match run_result {
+                    Ok(r) => r,
+                    Err(e) if is_entrypoint_not_found(&e) => {
+                        return Ok(entrypoint_not_found_result());
+                    }
+                    Err(e) => {
+                        return Err(RuntimeError::FsBackend(anyhow::anyhow!(
+                            "failed to run ELF from dispatcher: {}",
+                            e
+                        )));
+                    }
+                }
             }
             FsBackendKind::Memory => {
                 let layer_paths: Vec<PathBuf> = spec
@@ -245,9 +275,18 @@ impl Runtime {
                     spec.max_traps,
                     debug_path.as_ref(),
                 );
-                run_result.map_err(|e| {
-                    RuntimeError::FsBackend(anyhow::anyhow!("failed to run rootfs ELF: {}", e))
-                })?
+                match run_result {
+                    Ok(r) => r,
+                    Err(e) if is_entrypoint_not_found(&e) => {
+                        return Ok(entrypoint_not_found_result());
+                    }
+                    Err(e) => {
+                        return Err(RuntimeError::FsBackend(anyhow::anyhow!(
+                            "failed to run rootfs ELF: {}",
+                            e
+                        )));
+                    }
+                }
             }
         };
 
