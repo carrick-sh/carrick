@@ -5,7 +5,8 @@ use super::*;
 /// Process I/O priority stored by `ioprio_set` and echoed by `ioprio_get`.
 /// carrick has no real I/O scheduler; default is IOPRIO_CLASS_BE(2) level 4 =
 /// (2<<13)|4, what the kernel reports for a process that never set one.
-static IOPRIO_VALUE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new((2 << 13) | 4);
+static IOPRIO_VALUE: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new((2 << 13) | 4);
 
 /// `sizeof(struct robust_list_head)` on 64-bit Linux: three 8-byte fields
 /// (list.next, futex_offset, list_op_pending). set_robust_list requires the
@@ -33,9 +34,7 @@ fn sched_priority_for(policy: i32, max: bool) -> DispatchOutcome {
 /// `LINUX_BOOTSTRAP_PID` (the stable guest-init alias used elsewhere). Any
 /// other value is ESRCH.
 fn sched_pid_is_self(pid: u64) -> bool {
-    pid == 0
-        || pid == std::process::id() as u64
-        || pid == LINUX_BOOTSTRAP_PID as u64
+    pid == 0 || pid == std::process::id() as u64 || pid == LINUX_BOOTSTRAP_PID as u64
 }
 
 /// True when `pid` names a live process accessible to the guest: either
@@ -1639,7 +1638,7 @@ fn build_sigchld_siginfo(
     si_code: i32,
     si_status: i32,
 ) -> [u8; crate::linux_abi::LINUX_SIGINFO_SIZE] {
-    const LINUX_SIGCHLD: i32 = 17;
+    use crate::linux_abi::LINUX_SIGCHLD;
     const CLD_EXITED: i32 = 1;
     let linux_status = if si_code == CLD_EXITED {
         si_status

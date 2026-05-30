@@ -62,12 +62,43 @@ pub const LINUX_UTSNAME_FIELD_SIZE: usize = 65;
 pub const LINUX_SIGSET_WORDS: usize = 1;
 pub const LINUX_KERNEL_SIGSET_SIZE: u64 = 8;
 
-// Linux SIGxxx numbers (POSIX). Only the handful we actively translate to
-// from host signals or accept from kill(2) are listed here.
+// Linux SIGxxx numbers (aarch64/generic, POSIX) — the authoritative table.
+// The trailing comment is the macOS host number ONLY when it differs (the
+// translation lives in host_signal.rs `SIGNUM_XLATE`); no comment means the
+// number is identical on both kernels. Two Linux signals have NO macOS
+// equivalent and cannot be faithfully delivered to a host process: SIGSTKFLT
+// (16, macOS 16 is SIGURG) and SIGPWR (30, macOS 30 is SIGUSR1).
 pub const LINUX_SIGHUP: i32 = 1;
 pub const LINUX_SIGINT: i32 = 2;
 pub const LINUX_SIGQUIT: i32 = 3;
+pub const LINUX_SIGILL: i32 = 4;
+pub const LINUX_SIGTRAP: i32 = 5;
+pub const LINUX_SIGABRT: i32 = 6;
+pub const LINUX_SIGBUS: i32 = 7; // macOS 10
+pub const LINUX_SIGFPE: i32 = 8;
+pub const LINUX_SIGKILL: i32 = 9;
+pub const LINUX_SIGUSR1: i32 = 10; // macOS 30
+pub const LINUX_SIGSEGV: i32 = 11;
+pub const LINUX_SIGUSR2: i32 = 12; // macOS 31
+pub const LINUX_SIGPIPE: i32 = 13;
+pub const LINUX_SIGALRM: i32 = 14;
 pub const LINUX_SIGTERM: i32 = 15;
+pub const LINUX_SIGSTKFLT: i32 = 16; // no macOS equivalent
+pub const LINUX_SIGCHLD: i32 = 17; // macOS 20; default action = Ignore
+pub const LINUX_SIGCONT: i32 = 18; // macOS 19
+pub const LINUX_SIGSTOP: i32 = 19; // macOS 17
+pub const LINUX_SIGTSTP: i32 = 20; // macOS 18
+pub const LINUX_SIGTTIN: i32 = 21; // background tty read → stop
+pub const LINUX_SIGTTOU: i32 = 22; // background tty write/ctl → stop
+pub const LINUX_SIGURG: i32 = 23; // macOS 16; default action = Ignore
+pub const LINUX_SIGXCPU: i32 = 24;
+pub const LINUX_SIGXFSZ: i32 = 25;
+pub const LINUX_SIGVTALRM: i32 = 26;
+pub const LINUX_SIGPROF: i32 = 27;
+pub const LINUX_SIGWINCH: i32 = 28; // default action = Ignore
+pub const LINUX_SIGIO: i32 = 29; // macOS 23 (a.k.a. SIGPOLL)
+pub const LINUX_SIGPWR: i32 = 30; // no macOS equivalent
+pub const LINUX_SIGSYS: i32 = 31; // macOS 12
 
 /// `SIG_DFL` / `SIG_IGN` handler sentinel values stored in `sa_handler`.
 pub const LINUX_SIG_DFL: u64 = 0;
@@ -1644,19 +1675,12 @@ pub const LINUX_BOOTSTRAP_SID: i32 = 1;
 pub const LINUX_PIPE_BUF_SIZE: i64 = 65_536;
 pub const LINUX_RT_SIGSET_SIZE: u64 = 8;
 pub const LINUX_MAX_SIGNUM: u64 = 64;
-pub const LINUX_SIGKILL: i32 = 9;
-pub const LINUX_SIGSTOP: i32 = 19;
-/// Signals whose DEFAULT disposition is "ignore" (Linux `man 7 signal`: the
-/// `Ign` action) — SIGCHLD, SIGURG, SIGWINCH. A no-handler instance of these is
-/// silently dropped, NOT a terminating default action. (aarch64/generic nums.)
-pub const LINUX_SIGCHLD: i32 = 17;
-pub const LINUX_SIGURG: i32 = 23;
-pub const LINUX_SIGWINCH: i32 = 28;
-/// Timer-expiry signals: ITIMER_REAL→SIGALRM, ITIMER_VIRTUAL→SIGVTALRM,
-/// ITIMER_PROF→SIGPROF (aarch64/generic numbering).
-pub const LINUX_SIGALRM: i32 = 14;
-pub const LINUX_SIGVTALRM: i32 = 26;
-pub const LINUX_SIGPROF: i32 = 27;
+// Signal numbers are defined once in the authoritative SIGxxx table above.
+// Semantic groupings that other modules rely on:
+//   - DEFAULT-ignore set (man 7 signal `Ign`): SIGCHLD, SIGURG, SIGWINCH — a
+//     no-handler instance is silently dropped, NOT a terminating default.
+//   - Timer-expiry: ITIMER_REAL→SIGALRM, ITIMER_VIRTUAL→SIGVTALRM,
+//     ITIMER_PROF→SIGPROF.
 /// `how` argument values for `rt_sigprocmask`.
 pub const LINUX_SIG_BLOCK: u64 = 0;
 pub const LINUX_SIG_UNBLOCK: u64 = 1;
