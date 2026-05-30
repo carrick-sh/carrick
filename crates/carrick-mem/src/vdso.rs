@@ -31,7 +31,8 @@ pub const VVAR_OFF_REALTIME_OFF_NS: usize = 16; // wall_ns - monotonic_ns
 
 /// The assembled clock functions (aarch64). Offsets within this blob:
 /// `__kernel_clock_gettime` @ 0x00, `__kernel_gettimeofday` @ 0x84,
-/// `__kernel_clock_getres` @ 0xdc, `__kernel_rt_sigreturn` @ 0x104.
+/// `__kernel_clock_getres` @ 0xdc, `__kernel_rt_sigreturn` @ 0x104,
+/// `__kernel_getrandom` @ 0x10c.
 /// See `tools/vdso_fns.s`.
 const VDSO_CODE: &[u8] = &[
     0x1f, 0x1c, 0x00, 0x71, 0x28, 0x01, 0x00, 0x54, 0x1f, 0x10, 0x00, 0x71, 0x40, 0x01, 0x00, 0x54,
@@ -51,20 +52,34 @@ const VDSO_CODE: &[u8] = &[
     0xe8, 0x00, 0x00, 0x54, 0x81, 0x00, 0x00, 0xb4, 0x3f, 0x00, 0x00, 0xf9, 0x22, 0x00, 0x80, 0xd2,
     0x22, 0x04, 0x00, 0xf9, 0x00, 0x00, 0x80, 0x52, 0xc0, 0x03, 0x5f, 0xd6, 0x48, 0x0e, 0x80, 0xd2,
     0x01, 0x00, 0x00, 0xd4, 0xc0, 0x03, 0x5f, 0xd6,
-    // __kernel_rt_sigreturn: `mov x8, #139 (__NR_rt_sigreturn); svc #0`. The
-    // canonical aarch64 sigreturn trampoline body — unwinders (libgcc, gdb,
+    // __kernel_rt_sigreturn (8 bytes): `mov x8, #139 (__NR_rt_sigreturn); svc #0`.
+    // The canonical aarch64 sigreturn trampoline body — unwinders (libgcc, gdb,
     // Go traceback) recognise a signal frame by matching this exact instruction
-    // pair at the PC. MUST stay the last 8 bytes (see SYM_RT_SIGRETURN).
+    // pair at the PC. (See SYM_RT_SIGRETURN; it precedes getrandom below.)
     0x68, 0x11, 0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4,
+    // __kernel_getrandom (72 bytes, assembled from tools/vdso_fns.s; P1). QUERY
+    // mode (opaque_len == ~0UL) fills vgetrandom_opaque_params{size_of_opaque_
+    // state=144, mmap_prot=3, mmap_flags=0x28 (MAP_ANON|MAP_DROPPABLE)} and
+    // returns 0; otherwise falls back to the getrandom(2) syscall (x8=278). Fully
+    // position-independent (movz immediates only, no literal pool).
+    0x9f, 0x04, 0x00, 0xb1, 0xc1, 0x01, 0x00, 0x54, 0x09, 0x12, 0x80, 0x52, 0x69, 0x00, 0x00, 0xb9,
+    0x69, 0x00, 0x80, 0x52, 0x69, 0x04, 0x00, 0xb9, 0x09, 0x05, 0x80, 0x52, 0x69, 0x08, 0x00, 0xb9,
+    0x6a, 0x30, 0x00, 0x91, 0xab, 0x01, 0x80, 0x52, 0x5f, 0x45, 0x00, 0xb8, 0x6b, 0x05, 0x00, 0x71,
+    0xc1, 0xff, 0xff, 0x54, 0x00, 0x00, 0x80, 0xd2, 0xc0, 0x03, 0x5f, 0xd6, 0xc8, 0x22, 0x80, 0xd2,
+    0x01, 0x00, 0x00, 0xd4, 0xc0, 0x03, 0x5f, 0xd6,
 ];
 
 // Symbol offsets within VDSO_CODE.
 const SYM_CLOCK_GETTIME: u64 = 0x00;
 const SYM_GETTIMEOFDAY: u64 = 0x84;
 const SYM_CLOCK_GETRES: u64 = 0xdc;
-// rt_sigreturn is the trailing 8 bytes of VDSO_CODE; derive its offset from the
-// blob length so it stays correct regardless of the clock functions' size.
-const SYM_RT_SIGRETURN: u64 = (VDSO_CODE.len() - 8) as u64;
+// rt_sigreturn (8 B) then getrandom (72 B) are the trailing functions of
+// VDSO_CODE; derive their offsets from the blob length so they stay correct
+// regardless of the clock functions' size.
+const GETRANDOM_LEN: u64 = 72;
+const RT_SIGRETURN_LEN: u64 = 8;
+const SYM_GETRANDOM: u64 = VDSO_CODE.len() as u64 - GETRANDOM_LEN;
+const SYM_RT_SIGRETURN: u64 = SYM_GETRANDOM - RT_SIGRETURN_LEN;
 
 const EM_AARCH64: u16 = 183;
 const ET_DYN: u16 = 3;
@@ -104,6 +119,8 @@ pub fn vdso_image_bytes() -> Vec<u8> {
     dynstr.extend_from_slice(b"__kernel_clock_getres\0");
     let name_rt_sigreturn = dynstr.len() as u32;
     dynstr.extend_from_slice(b"__kernel_rt_sigreturn\0");
+    let name_getrandom = dynstr.len() as u32;
+    dynstr.extend_from_slice(b"__kernel_getrandom\0");
     let name_version = dynstr.len() as u32;
     dynstr.extend_from_slice(b"LINUX_2.6.39\0");
 
@@ -112,18 +129,18 @@ pub fn vdso_image_bytes() -> Vec<u8> {
     const PHENT: usize = 56;
     const NPH: usize = 2;
     const SYMENT: usize = 24;
-    const NSYM: usize = 5; // undef + 4 funcs (3 clock + rt_sigreturn)
+    const NSYM: usize = 6; // undef + 5 funcs (3 clock + rt_sigreturn + getrandom)
 
     let off_phdr = EHDR;
     let off_dynsym = off_phdr + NPH * PHENT;
     let off_dynstr = off_dynsym + NSYM * SYMENT;
     let off_hash = align_up(off_dynstr + dynstr.len(), 4);
-    // SysV hash: nbucket=1, nchain=5; bucket=[1]; chain=[0,2,3,4,0]. nbucket=1
-    // funnels every name to bucket 0, so lookup walks the chain 1->2->3->4->end.
-    let hash: [u32; 8] = [1, 5, 1, 0, 2, 3, 4, 0];
+    // SysV hash: nbucket=1, nchain=6; bucket=[1]; chain=[0,2,3,4,5,0]. nbucket=1
+    // funnels every name to bucket 0, so lookup walks the chain 1->2->3->4->5->end.
+    let hash: [u32; 9] = [1, 6, 1, 0, 2, 3, 4, 5, 0];
     let off_versym = off_hash + hash.len() * 4;
     // versym: one u16 per dynsym entry; funcs use version index 1.
-    let versym: [u16; 5] = [0, 1, 1, 1, 1];
+    let versym: [u16; 6] = [0, 1, 1, 1, 1, 1];
     let off_verdef = align_up(off_versym + versym.len() * 2, 4);
     const VERDEF_SZ: usize = 20 + 8; // elfVerdef + elfVerdaux
     let off_dyn = align_up(off_verdef + VERDEF_SZ, 8);
@@ -254,8 +271,18 @@ pub fn vdso_image_bytes() -> Vec<u8> {
         4,
         name_rt_sigreturn,
         off_code as u64 + SYM_RT_SIGRETURN,
-        (VDSO_CODE.len() as u64) - SYM_RT_SIGRETURN,
+        RT_SIGRETURN_LEN,
         STB_GLOBAL_NOTYPE,
+        1,
+    );
+    // __kernel_getrandom — a real STT_FUNC like the clock symbols.
+    sym(
+        &mut buf,
+        5,
+        name_getrandom,
+        off_code as u64 + SYM_GETRANDOM,
+        GETRANDOM_LEN,
+        STB_GLOBAL_FUNC,
         1,
     );
 
@@ -403,24 +430,24 @@ mod tests {
         assert!(found, "__kernel_clock_gettime not exported");
     }
 
-    /// The canonical aarch64 vDSO (`arch/arm64/kernel/vdso/vdso.lds.S`,
-    /// `LINUX_2.6.39`) exports exactly these four `__kernel_*` symbols. carrick
-    /// must export all four so that unwinders/debuggers (libgcc, libunwind,
-    /// gdb, Go traceback) can resolve `__kernel_rt_sigreturn` by name when
-    /// recognising a signal frame, and so the vDSO ABI contract is complete.
+    /// The aarch64 vDSO symbol set carrick exports, matching the LinuxKit 6.x
+    /// oracle: the 4 classic `LINUX_2.6.39` symbols plus `__kernel_getrandom`
+    /// (6.11+). All must resolve so unwinders/debuggers find rt_sigreturn by
+    /// name and glibc finds the clock + getrandom fast paths.
     #[test]
-    fn vdso_exports_all_four_canonical_symbols() {
+    fn vdso_exports_all_canonical_symbols() {
         let img = vdso_image_bytes();
         let elf = goblin::elf::Elf::parse(&img).expect("vDSO must be a valid ELF");
         let code_lo = 64u64; // every defined func must point past the ELF header
         let code_hi = img.len() as u64;
-        // The 3 clock fns are STT_FUNC; rt_sigreturn is STT_NOTYPE on real
-        // Linux, so we only require it be defined (not its type).
+        // The clock fns + getrandom are STT_FUNC; rt_sigreturn is STT_NOTYPE on
+        // real Linux, so we only require it be defined (not its type).
         for (want, must_be_func) in [
             ("__kernel_clock_gettime", true),
             ("__kernel_gettimeofday", true),
             ("__kernel_clock_getres", true),
             ("__kernel_rt_sigreturn", false),
+            ("__kernel_getrandom", true),
         ] {
             let sym = elf
                 .dynsyms
@@ -457,6 +484,34 @@ mod tests {
         let svc_0 = u32::from_le_bytes(img[off + 4..off + 8].try_into().unwrap());
         assert_eq!(mov_x8_139, 0xd280_1168, "expected `mov x8, #139`");
         assert_eq!(svc_0, 0xd400_0001, "expected `svc #0`");
+    }
+
+    /// __kernel_getrandom (P1) must start with the query-mode discriminator
+    /// (`cmn x4, #1` — is opaque_len == ~0UL?) and contain the getrandom(2)
+    /// syscall fallback (`mov x8, #278 ; svc #0`).
+    #[test]
+    fn vdso_getrandom_has_query_check_and_syscall_fallback() {
+        let img = vdso_image_bytes();
+        let elf = goblin::elf::Elf::parse(&img).unwrap();
+        let sym = elf
+            .dynsyms
+            .iter()
+            .find(|s| elf.dynstrtab.get_at(s.st_name) == Some("__kernel_getrandom"))
+            .expect("__kernel_getrandom must exist");
+        assert!(sym.is_function(), "__kernel_getrandom must be STT_FUNC");
+        let off = sym.st_value as usize;
+        let first = u32::from_le_bytes(img[off..off + 4].try_into().unwrap());
+        assert_eq!(first, 0xb100_049f, "expected `cmn x4, #1` (query check)");
+        // The body must contain `mov x8, #278` (0xd28022c8) then `svc #0`.
+        let words: Vec<u32> = img[off..off + super::GETRANDOM_LEN as usize]
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let i = words
+            .iter()
+            .position(|&w| w == 0xd280_22c8)
+            .expect("expected `mov x8, #278` (getrandom syscall fallback)");
+        assert_eq!(words[i + 1], 0xd400_0001, "expected `svc #0` after x8=278");
     }
 }
 
