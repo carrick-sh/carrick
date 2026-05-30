@@ -2043,7 +2043,23 @@ impl HvfInner {
     /// counter we calibrate against (CNTKCTL_EL1.EL0VCTEN), so the rate is exact;
     /// monotonic durations depend only on the frequency. Best-effort: silently
     /// skips if the vvar page isn't mapped.
+    /// Stamp this process's host PID into the vvar RNG generation (P2). It is
+    /// unique per process; re-stamped for a forked child in
+    /// `rebuild_vcpu_after_fork` so the child's generation never matches the
+    /// snapshot it COW-inherited from its parent — forcing the userspace
+    /// getrandom blob to reseed instead of reusing the parent's keystream.
+    fn stamp_rng_generation(&mut self) {
+        let pid = unsafe { libc::getpid() } as u64;
+        let _ = self.write_guest_bytes(
+            crate::vdso::LINUX_VVAR_BASE + crate::vdso::VVAR_OFF_RNG_GENERATION as u64,
+            &pid.to_le_bytes(),
+        );
+    }
+
     fn populate_vdso_data_page(&mut self) {
+        // Independent of the clock data (getrandom needs no calibrated counter),
+        // so stamp it first and unconditionally.
+        self.stamp_rng_generation();
         let (host_cntvct, freq) = host_counter();
         if freq == 0 {
             return;
@@ -2303,6 +2319,12 @@ impl HvfInner {
         std::mem::forget(std::mem::replace(&mut self.vcpu, new_vcpu));
         std::mem::forget(std::mem::replace(&mut self._vm, new_vm));
         self.restore_vcpu(&snap)?;
+        // SECURITY (P2 getrandom): re-stamp the vvar RNG generation with this
+        // child's (new) host PID. The opaque getrandom state page is COW-copied
+        // from the parent with the parent's generation snapshot; stamping the
+        // child's distinct PID guarantees a mismatch, so the child reseeds
+        // instead of reproducing the parent's keystream.
+        self.stamp_rng_generation();
         Ok(())
     }
 
