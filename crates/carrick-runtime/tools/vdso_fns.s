@@ -101,3 +101,14 @@ __kernel_clock_getres:
 6:	mov	x8, #114			// __NR_clock_getres
 	svc	#0
 	ret
+
+	// The canonical aarch64 sigreturn trampoline. carrick normally returns from
+	// a signal handler via its own injected EL0 trampoline page, but the vDSO
+	// must still EXPORT this symbol so unwinders/debuggers (libgcc, libunwind,
+	// gdb, Go traceback) can recognise a signal frame by name and by matching
+	// this exact `mov x8,#139 ; svc #0` instruction pair at the PC.
+	.global __kernel_rt_sigreturn
+__kernel_rt_sigreturn:
+	mov	x8, #139			// __NR_rt_sigreturn
+	svc	#0
+	// never returns; the kernel restores the interrupted context.
