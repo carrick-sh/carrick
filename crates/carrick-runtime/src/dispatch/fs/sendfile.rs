@@ -134,7 +134,7 @@ impl SyscallDispatcher {
             | OpenDescription::HostPipe { .. }
             | OpenDescription::HostSocket { .. }
             | OpenDescription::SignalFd { .. }
-            | OpenDescription::Netlink { .. } =>Ok(Err(LINUX_EINVAL)),
+            | OpenDescription::Netlink { .. } => Ok(Err(LINUX_EINVAL)),
         }
     }
 
@@ -184,7 +184,7 @@ impl SyscallDispatcher {
             | OpenDescription::HostPipe { .. }
             | OpenDescription::HostSocket { .. }
             | OpenDescription::SignalFd { .. }
-            | OpenDescription::Netlink { .. } =>return Err(LINUX_EINVAL),
+            | OpenDescription::Netlink { .. } => return Err(LINUX_EINVAL),
         };
         let available = contents.get(offset..).unwrap_or_default();
         let write_len = available.len().min(count);

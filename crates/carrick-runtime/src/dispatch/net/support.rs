@@ -117,7 +117,10 @@ pub(super) fn drain_pending_epoll_ready(
     max_events: usize,
 ) -> Vec<LinuxEpollEvent> {
     let take = pending_ready.len().min(max_events);
-    pending_ready.drain(..take).map(|(_fd, event)| event).collect()
+    pending_ready
+        .drain(..take)
+        .map(|(_fd, event)| event)
+        .collect()
 }
 
 pub(super) fn write_epoll_events<M: GuestMemory>(
