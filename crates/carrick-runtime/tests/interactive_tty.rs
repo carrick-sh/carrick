@@ -78,14 +78,17 @@ fn set_winsize(master: i32, rows: u16, cols: u16) {
 
 /// Spawn `carrick run -t … <guest-args>` with `slave` as the child's stdio.
 fn spawn_run_t(bin: &str, slave: i32, guest_args: &[&str]) -> std::process::Child {
+    spawn_run_t_image(bin, slave, "docker.io/library/debian:stable", guest_args)
+}
+
+fn spawn_run_t_image(
+    bin: &str,
+    slave: i32,
+    image: &str,
+    guest_args: &[&str],
+) -> std::process::Child {
     let dup_out = unsafe { libc::dup(slave) };
-    let mut args = vec![
-        "run",
-        "-t",
-        "--fs",
-        "host",
-        "docker.io/library/debian:stable",
-    ];
+    let mut args = vec!["run", "-t", "--fs", "host", image];
     args.extend_from_slice(guest_args);
     Command::new(bin)
         .args(&args)
@@ -277,6 +280,64 @@ fn interactive_forked_foreground_job_keeps_stdout_alive() {
             && !text.contains("GUEST ABORT")
             && !text.contains("panicked"),
         "forked foreground command should not hit pipe/signal failure. Output:\n{text}"
+    );
+}
+
+/// Regression: an interactive job-control shell launching a foreground command
+/// that writes to the tty must NOT have that command stopped by SIGTTOU.
+///
+/// busybox `ash` (alpine) enables job control under `-t`; its `forkchild` does
+/// `setpgid(0, childpgrp)` then `tcsetpgrp(tty, childpgrp)` while the child is
+/// still in a background process group. That `tcsetpgrp` raises SIGTTOU
+/// regardless of TOSTOP. carrick runs the child as a real macOS process, so the
+/// HOST kernel stopped it ("Stopped (tty output)") because the guest's
+/// `SIG_IGN(SIGTTOU)` lived only in carrick's emulated table — the fix blocks
+/// host SIGTTOU around the tty-control passthrough when the guest ignores it, so
+/// `ls` actually runs and lists `/` instead of stopping before its first write.
+#[test]
+#[ignore]
+fn interactive_jobcontrol_foreground_command_not_stopped_by_sigttou() {
+    let Some(bin) = signed_bin() else { return };
+    let (master, slave) = open_pty();
+    // No command → the image's default interactive shell (busybox ash on alpine),
+    // which turns on job control under a pty.
+    let mut child = spawn_run_t_image(bin, slave, "docker.io/library/alpine", &[]);
+    set_nonblocking(master);
+
+    std::thread::sleep(Duration::from_secs(20)); // boot
+    let w = |b: &[u8]| unsafe {
+        libc::write(master, b.as_ptr().cast(), b.len());
+    };
+    // Run a foreground external command that PRODUCES output (so the buggy path —
+    // stopped before its first tty write — is observable), then a computed marker
+    // the shell only prints if it stayed usable.
+    w(b"ls /\n");
+    std::thread::sleep(Duration::from_secs(1));
+    w(b"echo R$((40+2))\n");
+
+    let mut out = Vec::new();
+    read_until(master, &mut out, 12, |o| o.windows(3).any(|x| x == b"R42"));
+
+    let _ = child.kill();
+    let _ = child.wait();
+    unsafe { libc::close(master) };
+
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        !text.contains("GUEST ABORT") && !text.contains("panicked"),
+        "job-control command must not crash the guest. Output:\n{text}"
+    );
+    assert!(
+        !text.contains("Stopped"),
+        "foreground command must NOT be stopped by a spurious host SIGTTOU \
+         (job-control tcsetpgrp from a background pgrp). Output:\n{text}"
+    );
+    // `ls /` on alpine lists `usr` (and `bin`); its presence proves `ls` actually
+    // ran and wrote, i.e. it was foreground rather than stopped before its write.
+    assert!(
+        text.contains("usr"),
+        "expected `ls /` output (e.g. `usr`), proving the command ran to its \
+         first write instead of being stopped. Output:\n{text}"
     );
 }
 
