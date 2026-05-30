@@ -2466,6 +2466,43 @@ impl SyscallDispatcher {
                             write_packed(&mut *cx.memory, arg, &(n as i32).to_le_bytes())
                         }
                     }
+                    LINUX_FIONBIO => {
+                        // os.set_blocking(master, False) issues FIONBIO on a pty
+                        // master. Linux returns 0 and toggles O_NONBLOCK on the open
+                        // description; without this arm the pty fd hit the catch-all
+                        // below and returned ENOTTY. Mirror the generic FIONBIO
+                        // handler: toggle O_NONBLOCK on the live host pty fd and keep
+                        // the open description's status flags coherent so a later
+                        // F_GETFL reflects the change.
+                        let Ok(bytes) = cx.memory.read_bytes(arg, 4) else {
+                            return Ok(LINUX_EFAULT.into());
+                        };
+                        let enable =
+                            i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) != 0;
+                        if let Some(open_file) = this.open_file(fd.0) {
+                            let mut open = open_file.description.write();
+                            let mut status_flags = open.status_flags();
+                            if enable {
+                                status_flags |= LINUX_O_NONBLOCK;
+                            } else {
+                                status_flags &= !LINUX_O_NONBLOCK;
+                            }
+                            open.set_status_flags(status_flags);
+                        }
+                        // SAFETY: host_fd is our live pty fd.
+                        unsafe {
+                            let cur = libc::fcntl(host_fd, libc::F_GETFL, 0);
+                            if cur >= 0 {
+                                let next = if enable {
+                                    cur | libc::O_NONBLOCK
+                                } else {
+                                    cur & !libc::O_NONBLOCK
+                                };
+                                libc::fcntl(host_fd, libc::F_SETFL, next);
+                            }
+                        }
+                        DispatchOutcome::Returned { value: 0 }
+                    }
                     _ => {
                         cx.reporter
                             .record(CompatEvent::unhandled_ioctl(fd.0, ioctl_request, arg));

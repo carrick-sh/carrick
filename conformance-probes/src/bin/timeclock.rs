@@ -24,7 +24,12 @@ fn main() {
             println!("clock_gettime_{}=ERR:{}", name, errno());
         } else {
             let ts = unsafe { ts.assume_init() };
-            println!("clock_gettime_{} rc={} sec_positive={}", name, rc, ts.tv_sec > 0);
+            println!(
+                "clock_gettime_{} rc={} sec_positive={}",
+                name,
+                rc,
+                ts.tv_sec > 0
+            );
         }
     }
 
@@ -86,7 +91,10 @@ fn main() {
 
     // nanosleep 1ms: rc==0 and returned without EINTR (boolean). No elapsed.
     {
-        let req = libc::timespec { tv_sec: 0, tv_nsec: 1_000_000 };
+        let req = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 1_000_000,
+        };
         let mut rem = MaybeUninit::<libc::timespec>::uninit();
         let rc = unsafe { libc::nanosleep(&req, rem.as_mut_ptr()) };
         if rc != 0 {
@@ -99,10 +107,12 @@ fn main() {
 
     // clock_nanosleep(CLOCK_MONOTONIC, 0, 1ms): print rc.
     {
-        let req = libc::timespec { tv_sec: 0, tv_nsec: 1_000_000 };
-        let rc = unsafe {
-            libc::clock_nanosleep(libc::CLOCK_MONOTONIC, 0, &req, std::ptr::null_mut())
+        let req = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 1_000_000,
         };
+        let rc =
+            unsafe { libc::clock_nanosleep(libc::CLOCK_MONOTONIC, 0, &req, std::ptr::null_mut()) };
         // clock_nanosleep returns the error number directly (0 on success).
         println!("clock_nanosleep rc={}", rc);
     }
@@ -151,6 +161,52 @@ fn main() {
             println!("time_after_2023={}", t > 1_700_000_000);
         }
     }
+
+    // DYNAMIC posix CPU-clock ids. clock_getcpuclockid(0,&id) returns a dynamic
+    // (negative) per-PROCESS clock id; pthread_getcpuclockid(self,&id) returns a
+    // dynamic per-THREAD id. clock_gettime() on either must succeed (rc==0) —
+    // carrick previously only matched the STATIC CLOCK_* constants and rejected
+    // these with EINVAL (CPython test_time.test_pthread_getcpuclockid). We print
+    // only booleans: the getcpuclockid rc, that the id is dynamic (negative),
+    // and that clock_gettime on it succeeds. (The actual time value is omitted —
+    // it is not deterministic.)
+    {
+        let mut id: libc::clockid_t = 0;
+        let rc = unsafe { libc::clock_getcpuclockid(0, &mut id) };
+        if rc != 0 {
+            println!("getcpuclockid_process=ERR:{}", rc);
+        } else {
+            let mut ts = MaybeUninit::<libc::timespec>::uninit();
+            let g = unsafe { libc::clock_gettime(id, ts.as_mut_ptr()) };
+            println!(
+                "getcpuclockid_process rc=0 dynamic={} gettime_ok={}",
+                (id as i64) < 0,
+                g == 0
+            );
+        }
+    }
+    {
+        let mut id: libc::clockid_t = 0;
+        let rc = unsafe { pthread_getcpuclockid(libc::pthread_self(), &mut id) };
+        if rc != 0 {
+            println!("pthread_getcpuclockid_thread=ERR:{}", rc);
+        } else {
+            let mut ts = MaybeUninit::<libc::timespec>::uninit();
+            let g = unsafe { libc::clock_gettime(id, ts.as_mut_ptr()) };
+            println!(
+                "pthread_getcpuclockid_thread rc=0 dynamic={} gettime_ok={}",
+                (id as i64) < 0,
+                g == 0
+            );
+        }
+    }
+}
+
+// pthread_getcpuclockid is not bound by the libc crate for linux targets, so
+// declare just this symbol (resolved by musl at link time). It fills *clk_id
+// with the calling thread's dynamic per-thread CPU-clock id.
+unsafe extern "C" {
+    fn pthread_getcpuclockid(thread: libc::pthread_t, clk_id: *mut libc::clockid_t) -> libc::c_int;
 }
 
 /// Current errno value.

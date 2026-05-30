@@ -2469,6 +2469,38 @@ fn linux_min_fd(value: u64) -> Result<i32, i32> {
     i32::try_from(value).map_err(|_| LINUX_EINVAL)
 }
 
+/// A dynamic posix CPU-clock id (per-thread or per-process). These are NEGATIVE
+/// (viewed as a signed 32-bit int) and encode a tid/pid; glibc/musl return them
+/// from `clock_getcpuclockid`/`pthread_getcpuclockid`. CPython's
+/// test_pthread_getcpuclockid does clock_gettime() on one — carrick rejected it.
+enum DynamicCpuClock {
+    /// Per-thread CPU clock → host CLOCK_THREAD_CPUTIME_ID (current thread).
+    PerThread,
+    /// Per-process CPU clock → host CLOCK_PROCESS_CPUTIME_ID (current process).
+    PerProcess,
+}
+
+fn dynamic_cpu_clock(clock_id: u64) -> Option<DynamicCpuClock> {
+    // clockid_t is a 32-bit `int`; the guest may zero- OR sign-extend it into
+    // x0 (the vDSO __kernel_clock_gettime fast-path loads only w0, so a dynamic
+    // id arrives as a LARGE positive u64, not sign-extended). Interpret as i32:
+    // static CLOCK_* ids are small non-negative; dynamic per-task ids are
+    // negative. Bit layout (clean-room from clock_getcpuclockid(3) + observed
+    // Docker encodings): low 2 bits = clock type (SCHED=2), low 3 bits == 3 is
+    // CPUCLOCK_FD (not a CPU clock), bit 2 (mask 4) = CPUCLOCK_PERTHREAD.
+    if (clock_id as i32) >= 0 {
+        return None;
+    }
+    if (clock_id & 0b11) as u8 == 3 {
+        return None;
+    }
+    if clock_id & 0b100 != 0 {
+        Some(DynamicCpuClock::PerThread)
+    } else {
+        Some(DynamicCpuClock::PerProcess)
+    }
+}
+
 fn linux_clock_duration(clock_id: u64) -> Option<Duration> {
     match clock_id {
         LINUX_CLOCK_REALTIME
@@ -2484,7 +2516,14 @@ fn linux_clock_duration(clock_id: u64) -> Option<Duration> {
         // the host's symbolic libc constants rather than passing through.
         LINUX_CLOCK_PROCESS_CPUTIME_ID => host_clock_duration(libc::CLOCK_PROCESS_CPUTIME_ID),
         LINUX_CLOCK_THREAD_CPUTIME_ID => host_clock_duration(libc::CLOCK_THREAD_CPUTIME_ID),
-        _ => None,
+        // A dynamic per-task CPU-clock id (negative) → best-effort current
+        // thread/process CPU time (CLOCK_PROCESS_CPUTIME_ID may be unimplemented
+        // on some hosts, so fall back to the thread clock).
+        _ => match dynamic_cpu_clock(clock_id)? {
+            DynamicCpuClock::PerThread => host_clock_duration(libc::CLOCK_THREAD_CPUTIME_ID),
+            DynamicCpuClock::PerProcess => host_clock_duration(libc::CLOCK_PROCESS_CPUTIME_ID)
+                .or_else(|| host_clock_duration(libc::CLOCK_THREAD_CPUTIME_ID)),
+        },
     }
 }
 
