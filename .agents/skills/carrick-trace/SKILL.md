@@ -67,9 +67,16 @@ carrick trace [--script <file.d>] [--trace-out <file>] [--flowindent] -- <run-ar
    the script, `tick-1s { secs++ } tick-1s /secs >= N/ { exit(0); }`. A guest
    that hangs will otherwise stream forever.
 
-4. **Kill stale carrick processes before each run:** `pkill -9 -f carrick`.
-   Leftover hung guests from a prior run get caught by `progenyof` and pollute
-   counts/events badly — this is the #1 source of confusing traces.
+4. **Kill stale carrick processes before each run — SCOPED to YOUR run-id:**
+   set `export CARRICK_RUN_ID=<unique>` (e.g. `trace-$$`) so carrick stamps it
+   into each guest's `carrick:<run-id>` title, then reap only yours with
+   `scripts/sudo/kill.sh "$CARRICK_RUN_ID"` (or `pkill -9 -f "carrick:$CARRICK_RUN_ID"`).
+   NEVER a bare `pkill -9 -f carrick` / `kill.sh` with no run-id: that reaps
+   EVERY lane's guests (concurrent gate lanes, worktrees, workflow sub-agents),
+   silently wedging their runs — it looks like an unrelated flake. (`kill.sh`
+   now REQUIRES a run-id; `kill.sh --all` is the explicit manual-recovery
+   sledgehammer, never for per-run cleanup.) Leftover hung guests from a prior
+   run get caught by `progenyof` and pollute counts/events — reap yours first.
 
 5. **Reduce to a fast Rust fixture before tracing anything big.** Tracing apt or
    a shell is millions of events. The `fixtures/linux-aarch64-hello` crate holds
