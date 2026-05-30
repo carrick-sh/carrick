@@ -2935,11 +2935,39 @@ impl SyscallDispatcher {
             };
             let mut open = open_file.description.write();
             let OpenDescription::Directory {
-                entries, offset, ..
+                entries,
+                offset,
+                path,
+                ..
             } = &mut *open
             else {
                 return Ok(LINUX_EBADF.into());
             };
+
+            // Real Linux getdents64 always returns `.` (self) and `..` (parent)
+            // first. Synthesize them on the READ path only — NOT in
+            // layered_directory_entries, which also backs the rmdir/unlinkat
+            // emptiness check (two synthetic dot entries there made every empty
+            // dir look non-empty → ENOTEMPTY broke `rm -rf`). Idempotent: prepend
+            // once if absent.
+            if entries.first().map(|e| e.name.as_str()) != Some(".") {
+                let parent = std::path::Path::new(path.as_str())
+                    .parent()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "/".to_string());
+                let dir_path = path.clone();
+                let dot_entry = |name: &str, p: String| RootFsDirEntry {
+                    name: name.to_string(),
+                    metadata: RootFsMetadata {
+                        path: std::path::PathBuf::from(p),
+                        kind: RootFsEntryKind::Directory,
+                        mode: 0o755,
+                        size: 0,
+                    },
+                };
+                entries.insert(0, dot_entry("..", parent));
+                entries.insert(0, dot_entry(".", dir_path));
+            }
 
             let mut out = Vec::new();
             while *offset < entries.len() {

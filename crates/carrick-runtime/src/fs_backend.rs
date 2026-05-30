@@ -1991,42 +1991,12 @@ pub fn layered_directory_entries(
         seen.insert(name.clone());
         out.push(RootFsDirEntry { name, metadata });
     }
-
-    // Every real Linux directory returns the `.` (self) and `..` (parent)
-    // entries from getdents64; synthesize them at the front (Linux lists them
-    // first) so `ls -a` matches Docker. Skip any a backend already produced.
-    let dot_meta = |p: &str| RootFsMetadata {
-        path: normalize(p).unwrap_or_else(|| std::path::PathBuf::from(p)),
-        kind: RootFsEntryKind::Directory,
-        mode: 0o755,
-        size: 0,
-    };
-    let mut dots: Vec<RootFsDirEntry> = Vec::new();
-    if !seen.contains("..") {
-        dots.push(RootFsDirEntry {
-            name: "..".to_string(),
-            metadata: dot_meta(&parent_dir(dir)),
-        });
-    }
-    if !seen.contains(".") {
-        dots.push(RootFsDirEntry {
-            name: ".".to_string(),
-            metadata: dot_meta(dir),
-        });
-    }
-    // Prepend ".", then ".." (so the final order is ".", "..", <entries>).
-    for d in dots {
-        out.insert(0, d);
-    }
+    // NOTE: `.`/`..` are intentionally NOT added here — this helper also backs
+    // the directory-EMPTINESS check (rmdir/unlinkat AT_REMOVEDIR), where two
+    // synthetic dot entries would make every empty dir look non-empty
+    // (ENOTEMPTY → broke `rm -rf`). The dot entries are synthesized only on the
+    // getdents64 read path (see the getdents64 handler).
     Ok(out)
-}
-
-/// The parent directory path of `dir` (for the synthetic `..` entry).
-fn parent_dir(dir: &str) -> String {
-    match normalize(dir).and_then(|p| p.parent().map(|q| q.to_path_buf())) {
-        Some(p) => p.to_string_lossy().into_owned(),
-        None => "/".to_string(),
-    }
 }
 
 fn joined(base: &str, name: &str) -> String {
