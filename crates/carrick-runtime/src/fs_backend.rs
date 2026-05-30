@@ -789,6 +789,60 @@ impl HostFsBackend {
             };
         }
     }
+
+    /// Byte-exact existence guard against macOS's normalizing VFS.
+    ///
+    /// macOS APFS/HFS+ normalize filenames at the syscall boundary: a
+    /// `stat`/`open` of an NFD byte sequence resolves the NFC-named inode
+    /// (and vice-versa), and compatibility forms (NFKC/NFKD) collapse too.
+    /// Linux does NOT — a filename is an opaque byte string, so two
+    /// differently-normalized names are two DIFFERENT files. carrick must
+    /// present the Linux view: a guest `open("Grü̈ß")` (NFD) where only the
+    /// NFC file exists has to fail with ENOENT, exactly as on Linux.
+    ///
+    /// cap-std's `symlink_metadata(rel)` goes through the normalizing host
+    /// VFS, so it cannot see the difference. We re-check the FINAL component
+    /// against the parent directory's `read_dir` listing, which returns each
+    /// entry's true on-disk bytes; if the guest's requested bytes are not
+    /// present verbatim, the host merely aliased a differently-normalized
+    /// name and we report "not present" (`false`).
+    ///
+    /// Hot-path cheap: ASCII-only names can never be Unicode-normalized, so
+    /// we skip the readdir entirely unless the final component carries a
+    /// non-ASCII byte. (Intermediate path components are not re-checked: a
+    /// normalized directory in the middle of the path is already an
+    /// established on-disk entry, and re-walking every ancestor on every
+    /// stat would be quadratic; the leaf is where guest-supplied freshly-
+    /// normalized names actually bite — the unicode-filename tests.)
+    fn name_matches_on_disk(&self, rel: &Path) -> bool {
+        use std::os::unix::ffi::OsStrExt;
+        let Some(file_name) = rel.file_name() else {
+            // No final component (the scratch root) — nothing to alias.
+            return true;
+        };
+        let want = file_name.as_bytes();
+        if want.is_ascii() {
+            // ASCII bytes are never altered by Unicode normalization, so the
+            // host VFS could not have aliased; trust the metadata lookup.
+            return true;
+        }
+        let parent = rel.parent().unwrap_or_else(|| Path::new(""));
+        let read = if parent.as_os_str().is_empty() {
+            self.dir.entries()
+        } else {
+            self.dir.read_dir(parent)
+        };
+        let Ok(read) = read else {
+            // Parent unreadable: don't manufacture a phantom mismatch.
+            return true;
+        };
+        for entry in read.flatten() {
+            if entry.file_name().as_bytes() == want {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 /// Extended attribute that carries the guest-intended file mode. carrick runs
@@ -980,6 +1034,12 @@ impl FsBackend for HostFsBackend {
         }
         let rel = Self::rel_path(&normalized)?;
         let meta = self.dir.symlink_metadata(rel).ok()?;
+        // Reject a host-aliased (Unicode-normalized) name: present the Linux
+        // byte-exact view, where a differently-normalized name is a different
+        // (non-existent) file. See `name_matches_on_disk`.
+        if !self.name_matches_on_disk(rel) {
+            return None;
+        }
         // After seed_from_rootfs the whole rootfs lives on disk under
         // the cap-std root. Every file/dir present in the sandbox is
         // authoritative — that's the "rootfs on host APFS" architecture.
@@ -1026,6 +1086,10 @@ impl FsBackend for HostFsBackend {
         }
         let rel = Self::rel_path(&normalized)?;
         let meta = self.dir.symlink_metadata(rel).ok()?;
+        // Reject a host-aliased (Unicode-normalized) name (see `lookup`).
+        if !self.name_matches_on_disk(rel) {
+            return None;
+        }
         if meta.is_dir() {
             return Some(OverlayEntryKind::Dir);
         }
@@ -1064,6 +1128,10 @@ impl FsBackend for HostFsBackend {
         }
         let rel = Self::rel_path(&normalized)?;
         let meta = self.dir.symlink_metadata(rel).ok()?;
+        // Reject a host-aliased (Unicode-normalized) name (see `lookup`).
+        if !self.name_matches_on_disk(rel) {
+            return None;
+        }
         // FIFO (named pipe): symlink_metadata reports neither dir/file/symlink.
         // Detect it from the raw type bits and report S_IFIFO. The mode lives on
         // the real node (create_fifo set it exactly), NOT in an xattr — reading
@@ -1782,6 +1850,16 @@ impl FsBackend for HostFsBackend {
     fn real_stat(&self, path: &str, follow: bool) -> Option<RealStat> {
         use cap_std::fs::MetadataExt;
         let mut normalized = normalize(path)?;
+        // Reject a host-aliased (Unicode-normalized) leaf: stat/lstat of a
+        // differently-normalized name must report ENOENT, exactly as on Linux
+        // (see `name_matches_on_disk`). Checked on the guest-typed leaf BEFORE
+        // any symlink following — that final component is where a freshly
+        // normalized guest name aliases an on-disk entry.
+        if let Some(rel) = Self::rel_path(&normalized)
+            && !self.name_matches_on_disk(rel)
+        {
+            return None;
+        }
         // lstat (`follow == false`) reports the link itself; stat
         // (`follow == true`) reports the target. We follow symlinks
         // MANUALLY rather than via cap-std's `metadata`, because cap-std

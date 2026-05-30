@@ -68,6 +68,26 @@ impl SyscallDispatcher {
             return Err(LINUX_EBADF);
         };
         let open = open_file.description.read();
+        // A named FIFO opened by path is modelled as a `HostPipe` (no pty),
+        // whose `stat_source` hands back a SYNTHETIC record (hashed inode,
+        // mode 0o600). But a path-stat (lstat) of the same FIFO reports the
+        // REAL on-disk inode/mode, so `os.path.samestat(lstat(fifo),
+        // fstat(open(fifo)))` was False — shutil.rmtree's safe-fd walk then
+        // mis-classified the pipe as a symlink ("Cannot call rmtree on a
+        // symbolic link") instead of raising NotADirectoryError
+        // (test_rmtree_on_named_pipe). Anonymous pipe2() ends are also
+        // `HostPipe` but carry no recorded path, so they keep the synthetic
+        // record. Recover the real FIFO stat from the fd's recorded path.
+        let is_named_pipe = matches!(&*open, OpenDescription::HostPipe { pty: None, .. });
+        drop(open);
+        if is_named_pipe
+            && let Some(path) = self.io.fd_open_paths.read().get(&fd).cloned()
+            && let Some(real) = self.fs.rootfs_vfs.overlay.real_stat(&path, false)
+            && real.kind == RootFsEntryKind::Fifo
+        {
+            return Ok(StatRecord::from_real(&path, &real));
+        }
+        let open = open_file.description.read();
         let source = open.stat_source();
         drop(open);
         match source {

@@ -381,10 +381,24 @@ impl SyscallDispatcher {
             Ok(path) => path,
             Err(errno) => return Ok(errno.into()),
         };
+        // A trailing slash forces directory semantics on the final component.
+        // Linux's open(2): `O_CREAT` of a path that ends in `/` can NEVER
+        // create a regular file there (a directory name is implied) and fails
+        // EISDIR — whether the path exists as a dir, exists as a file, or
+        // doesn't exist at all (verified against the Docker oracle). carrick's
+        // path normalization strips the trailing slash, so a guest
+        // `open(".../does_not_exist/", O_WRONLY|O_CREAT)` wrongly SUCCEEDED in
+        // creating a file. shutil.copyfile relies on that EISDIR
+        // (test_copyfile_nonexistent_dir). Note the raw guest bytes, before
+        // resolution collapses the slash.
+        let had_trailing_slash = path.len() > 1 && path.ends_with('/');
         let path = match self.resolve_at_path(dirfd, &path) {
             Ok(path) => path,
             Err(errno) => return Ok(errno.into()),
         };
+        if want_create && had_trailing_slash {
+            return Ok(LINUX_EISDIR.into());
+        }
 
         // Trace every open attempt. The per-backend `path_open` calls further
         // down only fire for the legacy synthetic/overlay/rootfs chain, so
@@ -5773,6 +5787,20 @@ impl SyscallDispatcher {
             if let Some(real) = this.fs.rootfs_vfs.overlay.real_stat(&path, follow) {
                 return Ok(write_stat_real(memory, statbuf, &path, &real));
             }
+            // DANGLING SYMLINK: a following stat() whose `real_stat` came back
+            // empty, while the no-follow stat shows the path itself IS a
+            // symlink, means the link's target does not exist. Linux returns
+            // ENOENT here; carrick must NOT fall through to the layered lookup,
+            // which reports the dead symlink as a present (regular) file —
+            // os.path.exists(dangling) then wrongly returned True and
+            // shutil.copytree silently copied a dead link instead of raising
+            // shutil.Error (test_copytree_dangling_symlinks).
+            if follow
+                && let Some(link) = this.fs.rootfs_vfs.overlay.real_stat(&path, false)
+                && link.kind == RootFsEntryKind::Symlink
+            {
+                return Ok(LINUX_ENOENT.into());
+            }
             // real_stat couldn't answer. If following and `path` is a symlink
             // whose target lands in ANOTHER mount, resolve it through the full
             // VFS and stat the target — so its dev/ino matches a direct stat of
@@ -5873,6 +5901,14 @@ impl SyscallDispatcher {
             let follow = flags & LINUX_AT_SYMLINK_NOFOLLOW == 0;
             if let Some(real) = this.fs.rootfs_vfs.overlay.real_stat(&path, follow) {
                 return Ok(write_statx_real(memory, statxbuf, &path, &real));
+            }
+            // DANGLING SYMLINK: following statx of a symlink whose target does
+            // not exist is ENOENT on Linux (mirrors the newfstatat path above).
+            if follow
+                && let Some(link) = this.fs.rootfs_vfs.overlay.real_stat(&path, false)
+                && link.kind == RootFsEntryKind::Symlink
+            {
+                return Ok(LINUX_ENOENT.into());
             }
             use crate::vfs::Vfs as _;
             // VFS mounts (/dev, /dev/pts, /proc, /sys): stat their nodes so e.g.
