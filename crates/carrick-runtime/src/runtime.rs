@@ -304,6 +304,37 @@ where
     finish_and_run_image(image, dispatcher, max_traps, debug_state_path)
 }
 
+/// Docker/runc entrypoint semantics: when the program name contains no `/`,
+/// resolve it against `$PATH` (like `execvp`) using the guest rootfs, returning
+/// the first directory whose `dir/name` is a readable executable. A name that
+/// already contains `/` (absolute or relative) is returned unchanged — matching
+/// Linux `execve(2)`, which does NOT search `$PATH`. This applies ONLY to the
+/// initial entrypoint; the guest's own `execve(2)` syscall keeps full-path
+/// semantics via `resolve_exec_path`. Without this, `carrick run alpine ls`
+/// (a bare command, as Docker accepts) failed with "failed to read ELF bytes: ls".
+fn resolve_entrypoint_path(path: &str, env: &[String], dispatcher: &SyscallDispatcher) -> String {
+    if path.contains('/') {
+        return path.to_owned();
+    }
+    const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+    let search = env
+        .iter()
+        .find_map(|e| e.strip_prefix("PATH="))
+        .filter(|p| !p.is_empty())
+        .unwrap_or(DEFAULT_PATH);
+    for dir in search.split(':') {
+        if dir.is_empty() {
+            continue;
+        }
+        let candidate = format!("{}/{}", dir.trim_end_matches('/'), path);
+        if dispatcher.read_exec_file(&candidate).is_some() {
+            return candidate;
+        }
+    }
+    // No match: keep the bare name so the existing NotFound error names it.
+    path.to_owned()
+}
+
 /// Run an ELF whose filesystem is entirely in the dispatcher's overlay
 /// (i.e. `--fs host` after `extract_layers`). The initial binary AND its
 /// PT_INTERP are loaded via `dispatcher.read_exec_file` — the same
@@ -323,6 +354,11 @@ where
 {
     let argv: Vec<String> = argv.into_iter().collect();
     let env: Vec<String> = env.into_iter().collect();
+    // Docker accepts a bare entrypoint command (`carrick run alpine ls`); resolve
+    // it against $PATH like runc/execvp before loading. A name with '/' is left
+    // as-is. Guest execve(2) is unaffected (it keeps full-path semantics).
+    let resolved = resolve_entrypoint_path(path, &env, &dispatcher);
+    let path: &str = &resolved;
     dispatcher.set_executable_identity(path.to_owned(), argv.clone());
     let bytes = dispatcher.read_exec_file(path).ok_or_else(|| {
         RuntimeError::AddressSpace(AddressSpaceError::Io(std::io::Error::new(
@@ -600,8 +636,7 @@ where
                         crate::host_signal::register_child_exit_watch(
                             child_pid,
                             this_tid as i32,
-                            i32::try_from(exit_signal)
-                                .unwrap_or(crate::linux_abi::LINUX_SIGCHLD),
+                            i32::try_from(exit_signal).unwrap_or(crate::linux_abi::LINUX_SIGCHLD),
                         );
                         // CLONE_PIDFD: hand the parent a pidfd for the new child.
                         if let Some(addr) = pidfd_out {
@@ -1101,9 +1136,15 @@ impl ThreadRuntimeState {
         if (-4095..0).contains(&ret) {
             let e = (-ret) as u32;
             let ename = crate::linux_abi::errno_name(e).unwrap_or("?");
-            eprintln!("tid#{} trap#{traps}:   -> errno={e} ({ename})", self.this_tid);
+            eprintln!(
+                "tid#{} trap#{traps}:   -> errno={e} ({ename})",
+                self.this_tid
+            );
         } else {
-            eprintln!("tid#{} trap#{traps}:   -> ret={ret:#x} ({ret})", self.this_tid);
+            eprintln!(
+                "tid#{} trap#{traps}:   -> ret={ret:#x} ({ret})",
+                self.this_tid
+            );
         }
     }
 
@@ -2620,6 +2661,49 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rootfs_with(files: &[(&str, &[u8])]) -> crate::rootfs::RootFs {
+        let mut b = tar::Builder::new(Vec::new());
+        for (path, data) in files {
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(tar::EntryType::Regular);
+            h.set_mode(0o755);
+            h.set_size(data.len() as u64);
+            b.append_data(&mut h, path, *data).unwrap();
+        }
+        let bytes = b.into_inner().unwrap();
+        crate::rootfs::RootFs::from_layers(std::iter::once(crate::rootfs::LayerSource::Tar(bytes)))
+            .unwrap()
+    }
+
+    #[test]
+    fn entrypoint_path_search_resolves_bare_command_like_execvp() {
+        // Docker accepts a bare entrypoint command and PATH-resolves it; `env`
+        // lives ONLY in /usr/bin, so finding it proves a real $PATH walk.
+        let rootfs = rootfs_with(&[("bin/ls", b"\x7fELFx"), ("usr/bin/env", b"\x7fELFx")]);
+        let dispatcher = SyscallDispatcher::with_rootfs(rootfs);
+        let env = vec!["PATH=/usr/local/bin:/usr/bin:/bin".to_string()];
+
+        // Bare names resolve to the first PATH dir that has them.
+        assert_eq!(resolve_entrypoint_path("ls", &env, &dispatcher), "/bin/ls");
+        assert_eq!(
+            resolve_entrypoint_path("env", &env, &dispatcher),
+            "/usr/bin/env"
+        );
+        // A path containing '/' is returned unchanged (execve, not execvp).
+        assert_eq!(
+            resolve_entrypoint_path("/sbin/foo", &env, &dispatcher),
+            "/sbin/foo"
+        );
+        assert_eq!(resolve_entrypoint_path("./x", &env, &dispatcher), "./x");
+        // Not found anywhere on PATH → keep the bare name (so the load error names it).
+        assert_eq!(resolve_entrypoint_path("nope", &env, &dispatcher), "nope");
+        // No PATH in env → fall back to the standard default set (covers /usr/bin).
+        assert_eq!(
+            resolve_entrypoint_path("env", &[], &dispatcher),
+            "/usr/bin/env"
+        );
+    }
 
     #[test]
     fn default_ignore_signals_are_not_terminating() {
