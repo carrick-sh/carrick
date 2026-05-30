@@ -635,7 +635,15 @@ impl SyscallDispatcher {
                 LINUX_RLIMIT_NOFILE => LinuxRlimit::new(1024, 1024 * 1024),
                 LINUX_RLIMIT_NPROC => LinuxRlimit::new(8192, 8192),
                 LINUX_RLIMIT_STACK => {
-                    LinuxRlimit::new(crate::memory::LINUX_STACK_SIZE, LINUX_RLIM_INFINITY)
+                    // Linux's default 8 MiB soft RLIMIT_STACK, unlimited hard limit.
+                    // CPython (and other runtimes) calibrate their main-thread
+                    // C-recursion guard to this value, so it must match the size of
+                    // the guest stack carrick actually backs (LINUX_STACK_SIZE) or
+                    // deep C recursion overflows the real stack before the guard
+                    // fires. Kept as its own constant (rather than reusing
+                    // LINUX_STACK_SIZE directly) so the reported limit and the
+                    // backed region can diverge if we ever add guard-page slack.
+                    LinuxRlimit::new(crate::memory::LINUX_RLIMIT_STACK_SOFT, LINUX_RLIM_INFINITY)
                 }
                 LINUX_RLIMIT_AS | LINUX_RLIMIT_DATA => {
                     LinuxRlimit::new(LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY)

@@ -227,7 +227,20 @@ pub fn va_in_shared_aperture(va: u64, len: u64) -> bool {
     }
 }
 pub const LINUX_STACK_TOP: u64 = 0xff_ffff_0000; // just under 1 TiB
-pub const LINUX_STACK_SIZE: u64 = 2 * 1024 * 1024; // 2 MiB
+
+// Linux's default main-thread stack soft RLIMIT_STACK is 8 MiB; the kernel grows
+// the initial stack mapping down to that limit ON DEMAND. Runtimes that size
+// their C-recursion guard from getrlimit(RLIMIT_STACK) (or from the main-thread
+// stack bounds glibc derives via pthread_getattr_np) — CPython is the worked
+// example — calibrate the guard to fire at `stacktop - RLIMIT_STACK`. carrick
+// previously gave the guest a 2 MiB stack and reported a 2 MiB RLIMIT_STACK, so
+// a deeply-branching *C* recursion (e.g. issubclass walking a cyclic `__bases__`,
+// or the PEG/AST builder on deeply nested source) overflowed the mapped stack
+// and took a stage-2 translation fault BEFORE the recursion guard fired —
+// carrick crashed where Linux raises RecursionError. Match Linux: 8 MiB stack,
+// reported as 8 MiB via getrlimit(RLIMIT_STACK).
+pub const LINUX_RLIMIT_STACK_SOFT: u64 = 8 * 1024 * 1024; // 8 MiB (Linux default, REPORTED)
+pub const LINUX_STACK_SIZE: u64 = 8 * 1024 * 1024; // 8 MiB (Linux default RLIMIT_STACK)
 
 // ── Rosetta 2 high-VA alias ──────────────────────────────────────────────────
 // Apple's Rosetta Linux interpreter is a non-relocatable ET_EXEC fixed-linked at

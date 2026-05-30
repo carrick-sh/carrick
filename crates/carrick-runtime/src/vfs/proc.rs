@@ -10,8 +10,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::linux_abi::{LINUX_EACCES, LINUX_ENOENT, LINUX_ENOTDIR};
 use crate::memory::{
     LINUX_EL0_TRAMPOLINE_BASE, LINUX_EL1_VECTORS_BASE, LINUX_HEAP_BASE, LINUX_HEAP_SIZE,
-    LINUX_MMAP_BASE, LINUX_PAGE_TABLES_BASE, LINUX_SIGRETURN_TRAMPOLINE_BASE, LINUX_STACK_SIZE,
-    LINUX_STACK_TOP,
+    LINUX_MMAP_BASE, LINUX_PAGE_TABLES_BASE, LINUX_RLIMIT_STACK_SOFT,
+    LINUX_SIGRETURN_TRAMPOLINE_BASE, LINUX_STACK_SIZE, LINUX_STACK_TOP,
 };
 
 use super::{DirEnt, EntryKind, Metadata, OpenContext, OpenFlags, Vfs, VfsError, VfsHandle};
@@ -468,13 +468,21 @@ fn render_proc_maps_from_regions(
 }
 
 fn label_for_region(region: &ProcMapsEntry, executable_path: &str) -> (u64, u64, String) {
-    let start = region.start;
+    let mut start = region.start;
     let end = region.end;
     let label = if start == LINUX_HEAP_BASE {
         "[heap]".to_owned()
     } else if start == LINUX_MMAP_BASE {
         "[carrick-mmap]".to_owned()
     } else if start == LINUX_STACK_TOP.saturating_sub(LINUX_STACK_SIZE) {
+        // Report the [stack] VMA as the RLIMIT_STACK extent (8 MiB below the top).
+        // glibc's pthread_getattr_np derives the main-thread C-stack bounds from
+        // this line and runtimes (CPython) calibrate their recursion guard to it,
+        // so it must equal the reported RLIMIT_STACK. Today LINUX_STACK_SIZE ==
+        // LINUX_RLIMIT_STACK_SOFT so this is a no-op, but it keeps the [stack] VMA
+        // pinned to the reported limit should we ever back extra guard-page slack
+        // (LINUX_STACK_SIZE > LINUX_RLIMIT_STACK_SOFT) below it.
+        start = LINUX_STACK_TOP.saturating_sub(LINUX_RLIMIT_STACK_SOFT);
         "[stack]".to_owned()
     } else if start == LINUX_EL0_TRAMPOLINE_BASE {
         "[carrick-trampoline]".to_owned()
