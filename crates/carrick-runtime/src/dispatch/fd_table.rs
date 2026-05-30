@@ -159,6 +159,16 @@ pub(super) struct OpenDescriptionBase {
     owner_pid: i32,
     /// F_SETSIG: the signal delivered on async I/O (0 = the default SIGIO).
     async_sig: i32,
+    /// Pipe capacity reported by F_GETPIPE_SZ and (re)set by F_SETPIPE_SZ.
+    /// Lives on the open-file-description so a dup'd fd shares it (matching the
+    /// kernel). Only meaningful for pipe ends; default = the Linux pipe buffer
+    /// size. Note: this is per-description, so each end of a `pipe(2)` tracks
+    /// its own value — Linux shares one buffer across both ends, but CPython's
+    /// `test_fcntl_f_pipesize` only set/get on a single end, so the observable
+    /// behaviour matches. macOS pipes have no portable buffer-resize API, so
+    /// the stored value is bookkeeping only (it does not change the real host
+    /// pipe's capacity).
+    pipe_capacity: i64,
 }
 
 impl OpenDescriptionBase {
@@ -171,7 +181,16 @@ impl OpenDescriptionBase {
             owner_type: 0,
             owner_pid: 0,
             async_sig: 0,
+            pipe_capacity: crate::linux_abi::LINUX_PIPE_BUF_SIZE,
         }
+    }
+
+    pub(super) fn pipe_capacity(&self) -> i64 {
+        self.pipe_capacity
+    }
+
+    pub(super) fn set_pipe_capacity(&mut self, capacity: i64) {
+        self.pipe_capacity = capacity;
     }
 
     pub(super) fn status_flags(&self) -> u64 {
@@ -559,6 +578,21 @@ pub(super) enum OpenStatSource {
         host_fd: i32,
         metadata: RootFsMetadata,
     },
+    /// A path-backed entry (an open Directory, or an in-memory File) whose
+    /// fd-stat must agree with a path-based stat of the SAME path. Under
+    /// `--fs host` the path-stat (newfstatat/statx) reports the REAL host
+    /// inode via `overlay.real_stat`, while a synthetic [`StatRecord`] derives
+    /// `st_ino` from a hash of the path — so `fstat(open(dir))` and
+    /// `lstat(dir)` disagreed and Python's `os.path.samestat` was False
+    /// (shutil.rmtree then refused to clean the tempdir; test_glob cascaded
+    /// to 15 ERRORs). `fd_stat_record` re-runs `real_stat(path)` here so the
+    /// directory fd produces the IDENTICAL `StatRecord` the path-stat does;
+    /// `fallback` is the synthetic record used when no host stat is available
+    /// (the in-memory MemoryBackend, where the path-stat is ALSO synthetic).
+    PathRecord {
+        path: String,
+        fallback: StatRecord,
+    },
 }
 
 impl OpenDescription {
@@ -634,6 +668,14 @@ impl OpenDescription {
         self.base_mut().set_async_sig(sig);
     }
 
+    pub(super) fn pipe_capacity(&self) -> i64 {
+        self.base().pipe_capacity()
+    }
+
+    pub(super) fn set_pipe_capacity(&mut self, capacity: i64) {
+        self.base_mut().set_pipe_capacity(capacity);
+    }
+
     /// SO_RCVTIMEO for this description. Only HostSocket carries one; every
     /// other variant has no socket timeout, so returns None.
     pub(super) fn recv_timeout(&self) -> Option<Duration> {
@@ -654,10 +696,11 @@ impl OpenDescription {
 
     pub(super) fn stat_source(&self) -> OpenStatSource {
         match self {
-            OpenDescription::File { metadata, .. }
-            | OpenDescription::Directory { metadata, .. } => {
-                OpenStatSource::Record(StatRecord::from_metadata(metadata))
-            }
+            OpenDescription::File { path, metadata, .. }
+            | OpenDescription::Directory { path, metadata, .. } => OpenStatSource::PathRecord {
+                path: path.clone(),
+                fallback: StatRecord::from_metadata(metadata),
+            },
             OpenDescription::HostFile {
                 host_fd, metadata, ..
             } => OpenStatSource::HostFile {
