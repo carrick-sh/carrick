@@ -560,8 +560,12 @@ pub enum DispatchOutcome {
     /// loop with the new entry point.
     Execve {
         path: String,
-        argv: Vec<String>,
-        env: Vec<String>,
+        // argv/env are opaque BYTE strings (Linux ABI), not UTF-8 — a guest may
+        // legitimately pass non-UTF-8 args/env (e.g. CPython regrtest's
+        // PYTHONREGRTEST_UNICODE_GUARD). The executable `path` stays a String
+        // (resolved against the String/Path fs layer).
+        argv: Vec<Vec<u8>>,
+        env: Vec<Vec<u8>>,
     },
     /// Guest requested a change to the vCPU memory-ordering model via
     /// `prctl(PR_SET_MEM_MODEL, …)`. Apple Rosetta 2 issues this at startup to
@@ -3554,11 +3558,13 @@ fn now_realtime_timespec() -> (i64, i64) {
     (ts.tv_sec as i64, ts.tv_nsec as i64)
 }
 
-/// Read a NULL-terminated array of guest VA pointers, dereferencing
-/// each to a C string. Used for `argv` / `envp` in `execve(2)`.
-fn read_guest_string_array(memory: &impl GuestMemory, array_addr: u64) -> Result<Vec<String>, i32> {
-    // execve(NULL, ...) is allowed by Linux for argv but treated as
-    // "no argv". Same for envp. Return empty Vec.
+/// Read a NULL-terminated array of guest VA pointers, dereferencing each to a
+/// C string as RAW BYTES — for `argv` / `envp` in `execve(2)`, which Linux
+/// treats as opaque byte strings (NOT UTF-8). See [`read_guest_c_string_bytes`].
+fn read_guest_string_array_bytes(
+    memory: &impl GuestMemory,
+    array_addr: u64,
+) -> Result<Vec<Vec<u8>>, i32> {
     if array_addr == 0 {
         return Ok(Vec::new());
     }
@@ -3573,7 +3579,7 @@ fn read_guest_string_array(memory: &impl GuestMemory, array_addr: u64) -> Result
         if ptr == 0 {
             return Ok(out);
         }
-        out.push(read_guest_c_string(memory, ptr)?);
+        out.push(read_guest_c_string_bytes(memory, ptr)?);
     }
     Err(LINUX_E2BIG)
 }
@@ -3922,7 +3928,12 @@ fn would_block_outcome(host_fd: i32, events: i16, nonblocking: bool) -> Dispatch
     }
 }
 
-fn read_guest_c_string(memory: &impl GuestMemory, address: u64) -> Result<String, i32> {
+/// Read a NUL-terminated C string from guest memory as RAW BYTES. Linux paths/
+/// argv/env are OPAQUE byte strings, not UTF-8 — e.g. CPython's regrtest sets a
+/// non-UTF-8 `PYTHONREGRTEST_UNICODE_GUARD` env var, which made an execve EINVAL
+/// when carrick required UTF-8. The execve argv/env path keeps these bytes
+/// verbatim; callers needing a Rust `String` (fs path lookup) use the wrapper.
+fn read_guest_c_string_bytes(memory: &impl GuestMemory, address: u64) -> Result<Vec<u8>, i32> {
     const CHUNK: usize = 256;
     let mut bytes = Vec::new();
     let mut offset = 0usize;
@@ -3938,12 +3949,19 @@ fn read_guest_c_string(memory: &impl GuestMemory, address: u64) -> Result<String
         };
         if let Some(nul) = chunk.iter().position(|&byte| byte == 0) {
             bytes.extend_from_slice(&chunk[..nul]);
-            return String::from_utf8(bytes).map_err(|_| LINUX_EINVAL);
+            return Ok(bytes);
         }
         offset += chunk.len();
         bytes.extend_from_slice(&chunk);
     }
     Err(LINUX_ENAMETOOLONG)
+}
+
+/// As [`read_guest_c_string_bytes`], decoded to a Rust `String` for the paths
+/// carrick resolves against its String/Path-based fs layer. A genuinely
+/// non-UTF-8 PATH is rare; argv/env use the bytes form and never reach here.
+fn read_guest_c_string(memory: &impl GuestMemory, address: u64) -> Result<String, i32> {
+    String::from_utf8(read_guest_c_string_bytes(memory, address)?).map_err(|_| LINUX_EINVAL)
 }
 
 #[cfg(test)]

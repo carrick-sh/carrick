@@ -7,12 +7,15 @@ use super::*;
 pub(super) fn load_execve_image(
     dispatcher: &SyscallDispatcher,
     path: &str,
-    argv: Vec<String>,
-    env: Vec<String>,
+    // argv/env are opaque BYTE strings (Linux ABI), not UTF-8. `path` is a
+    // String (resolved against the String/Path fs layer); argv[0] / shebang
+    // interpreters are pushed as their UTF-8 bytes.
+    argv: Vec<Vec<u8>>,
+    env: Vec<Vec<u8>>,
 ) -> Result<AddressSpace, i32> {
     use crate::linux_abi::LINUX_ENOENT;
     let mut argv = if argv.is_empty() {
-        vec![path.to_string()]
+        vec![path.as_bytes().to_vec()]
     } else {
         argv
     };
@@ -39,12 +42,14 @@ pub(super) fn load_execve_image(
         // execve("/i", ["/i", "x", "/script", a, b]). The script path
         // takes argv[1] (or [2] with an interpreter arg); the original
         // argv[1..] follow.
-        let mut new_argv = Vec::with_capacity(argv.len() + 3);
-        new_argv.push(interp.clone());
+        // argv is bytes; the interp/optarg/script-path are UTF-8 (parsed from
+        // the shebang / resolved as a path) → push their bytes.
+        let mut new_argv: Vec<Vec<u8>> = Vec::with_capacity(argv.len() + 3);
+        new_argv.push(interp.clone().into_bytes());
         if let Some(arg) = optarg {
-            new_argv.push(arg);
+            new_argv.push(arg.into_bytes());
         }
-        new_argv.push(path.clone());
+        new_argv.push(path.clone().into_bytes());
         new_argv.extend(argv.into_iter().skip(1));
         argv = new_argv;
         path = interp;

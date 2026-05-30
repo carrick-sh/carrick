@@ -220,7 +220,9 @@ pub const LINUX_PRIVATE_OVERLAY_SIZE: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB, mi
 /// shared region (which must get genuinely-private backing, not write through).
 pub fn va_in_shared_aperture(va: u64, len: u64) -> bool {
     match va.checked_add(len) {
-        Some(end) => va >= LINUX_SHARED_FILE_BASE && end <= LINUX_SHARED_FILE_BASE + LINUX_SHARED_FILE_SIZE,
+        Some(end) => {
+            va >= LINUX_SHARED_FILE_BASE && end <= LINUX_SHARED_FILE_BASE + LINUX_SHARED_FILE_SIZE
+        }
         None => false,
     }
 }
@@ -733,12 +735,18 @@ impl AddressSpace {
 
     pub fn with_linux_initial_stack<A, E>(self, argv: A, env: E) -> Result<Self, AddressSpaceError>
     where
-        A: IntoIterator<Item = String>,
-        E: IntoIterator<Item = String>,
+        A: IntoIterator,
+        A::Item: AsRef<[u8]>,
+        E: IntoIterator,
+        E::Item: AsRef<[u8]>,
     {
         self.with_linux_initial_stack_at(argv, env, LINUX_STACK_TOP, LINUX_STACK_SIZE)
     }
 
+    // argv/env items are AsRef<[u8]> (not String): Linux argv/env are OPAQUE
+    // byte strings, not UTF-8 (e.g. CPython's regrtest sets a non-UTF-8
+    // PYTHONREGRTEST_UNICODE_GUARD env var). The execve path passes Vec<u8>; the
+    // container-entrypoint path passes String — both satisfy AsRef<[u8]>.
     pub fn with_linux_initial_stack_at<A, E>(
         self,
         argv: A,
@@ -747,8 +755,10 @@ impl AddressSpace {
         stack_size: u64,
     ) -> Result<Self, AddressSpaceError>
     where
-        A: IntoIterator<Item = String>,
-        E: IntoIterator<Item = String>,
+        A: IntoIterator,
+        A::Item: AsRef<[u8]>,
+        E: IntoIterator,
+        E::Item: AsRef<[u8]>,
     {
         let AddressSpace {
             entry,
@@ -759,8 +769,14 @@ impl AddressSpace {
             stage1_page_tables_base,
             ..
         } = self;
-        let argv = argv.into_iter().collect::<Vec<_>>();
-        let env = env.into_iter().collect::<Vec<_>>();
+        let argv = argv
+            .into_iter()
+            .map(|s| s.as_ref().to_vec())
+            .collect::<Vec<Vec<u8>>>();
+        let env = env
+            .into_iter()
+            .map(|s| s.as_ref().to_vec())
+            .collect::<Vec<Vec<u8>>>();
         let (region, stack_pointer) =
             build_linux_initial_stack(argv, env, &linux_auxv, stack_top, stack_size)?;
         let mut image = Self::from_regions(entry, regions.into_iter().chain([region]).collect())?;
@@ -788,8 +804,8 @@ impl AddressSpace {
 }
 
 fn build_linux_initial_stack(
-    argv: Vec<String>,
-    env: Vec<String>,
+    argv: Vec<Vec<u8>>,
+    env: Vec<Vec<u8>>,
     auxv: &[LinuxAuxvEntry],
     stack_top: u64,
     stack_size: u64,
@@ -811,7 +827,7 @@ fn build_linux_initial_stack(
 
     // AT_EXECFN, AT_PLATFORM bytes (NUL-terminated strings on the stack).
     let execfn_addr = if let Some(first) = argv.first() {
-        let s = first.as_bytes();
+        let s = first.as_slice();
         if cursor < s.len() + 1 {
             return Err(AddressSpaceError::InitialStackTooLarge { stack_size });
         }
@@ -911,15 +927,15 @@ fn write_stack_strings(
     stack: &mut [u8],
     stack_start: u64,
     cursor: &mut usize,
-    strings: &[String],
+    strings: &[Vec<u8>],
     stack_size: u64,
 ) -> Result<Vec<u64>, AddressSpaceError> {
     let mut addrs = Vec::with_capacity(strings.len());
     for value in strings.iter().rev() {
-        let string = value.as_bytes();
+        let string = value.as_slice();
         if string.contains(&0) {
             return Err(AddressSpaceError::InitialStackStringContainsNul(
-                value.clone(),
+                String::from_utf8_lossy(value).into_owned(),
             ));
         }
         let len = string
