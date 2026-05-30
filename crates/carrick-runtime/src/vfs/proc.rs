@@ -364,6 +364,19 @@ impl Vfs for ProcVfs {
         flags: OpenFlags,
         ctx: &OpenContext<'_>,
     ) -> Result<VfsHandle, VfsError> {
+        // Opening the /proc directory itself: serve our synthetic listing
+        // (`.`/`..`, `self`, the representative top-level files, and every
+        // guest process pid) so `getdents64` / `ls /proc` and `ps` enumerate.
+        // Without this branch the open falls through to the (empty) rootfs
+        // `/proc` directory and `readdir` is never reached. Mirrors `DevVfs`.
+        if path == "/proc" {
+            let entries = self.readdir("/proc").unwrap_or_default();
+            return Ok(VfsHandle::Directory {
+                path: "/proc".to_string(),
+                entries,
+                status_flags: 0,
+            });
+        }
         if let Some(entries) = proc_task_dir_entries(path).or_else(|| proc_pid_dir_entries(path)) {
             return Ok(VfsHandle::Directory {
                 path: path.to_string(),
