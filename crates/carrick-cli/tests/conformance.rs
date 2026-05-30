@@ -59,6 +59,14 @@ const KNOWN_PROBE_GAPS: &[&str] = &[
     // iouringenterflag FIXED in M4 (flag/arg validation + to_submit bound) — now PASSES.
     // sotimeo FIXED in M3 (SO_RCVTIMEO/SO_SNDTIMEO stored per-OFD + threaded into blocking_io) — now PASSES.
     // epollstaledel FIXED in M3 (pending_ready keyed by fd) — now PASSES.
+    // forksleepfork: a multithreaded fork with a sleeping sibling. The first
+    // deadlock (fork-quiesce spinning because a sibling stuck in a synchronous
+    // host nanosleep never parked) is FIXED by DispatchOutcome::WaitOnSleep, but
+    // a SECOND, pre-existing deadlock remains in the HVF VM rebuild
+    // (engine.fork()/hv_vm_destroy with a parked native sibling — the known
+    // HV_BUSY/leaked-vCPU area). Until that lands, the fork still wedges and the
+    // probe DIFFs. See docs/cpython-baseline/TRIAGE.md cluster 1.
+    "forksleepfork",
 ];
 use std::time::{Duration, Instant};
 

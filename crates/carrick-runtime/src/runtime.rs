@@ -593,7 +593,8 @@ where
             | DispatchOutcome::WaitOnFdsSelect { .. }
             | DispatchOutcome::WaitOnPollFds { .. }
             | DispatchOutcome::WaitOnProcExit { .. }
-            | DispatchOutcome::WaitOnSignals { .. } => {
+            | DispatchOutcome::WaitOnSignals { .. }
+            | DispatchOutcome::WaitOnSleep { .. } => {
                 let value = -(crate::linux_abi::LINUX_EINTR as i64);
                 runtime.complete_syscall(value)?;
                 last_syscall_retval = Some(value);
@@ -809,6 +810,7 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
     // readiness. This is the common single-threaded path for the combined and
     // split runtimes; the threaded runtime keeps its own fork-quiesce handling.
     let mut signal_wait_deadline = None;
+    let mut sleep_deadline: Option<Instant> = None;
     loop {
         let outcome = dispatcher.dispatch(request, memory, reporter)?;
         match outcome {
@@ -919,6 +921,31 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
                     WaitResult::Errno(errno) => {
                         return Ok(DispatchOutcome::Errno { errno });
                     }
+                }
+            }
+            DispatchOutcome::WaitOnSleep { duration } => {
+                // Single-vCPU path: no fork-quiesce, but still wait via the
+                // waiter so a guest signal interrupts the sleep (EINTR). The
+                // deadline is preserved across re-dispatch (signal re-wait).
+                let deadline = *sleep_deadline.get_or_insert_with(|| Instant::now() + duration);
+                let now = Instant::now();
+                if now >= deadline {
+                    return Ok(DispatchOutcome::Returned { value: 0 });
+                }
+                match waiter.wait(&[], Some(deadline - now), 0) {
+                    WaitResult::Ready => continue,
+                    WaitResult::TimedOut => {
+                        if Instant::now() >= deadline {
+                            return Ok(DispatchOutcome::Returned { value: 0 });
+                        }
+                        continue;
+                    }
+                    WaitResult::Interrupted => {
+                        return Ok(DispatchOutcome::Errno {
+                            errno: crate::linux_abi::LINUX_EINTR,
+                        });
+                    }
+                    WaitResult::Errno(errno) => return Ok(DispatchOutcome::Errno { errno }),
                 }
             }
             other => return Ok(other),
@@ -1165,6 +1192,9 @@ impl ThreadRuntimeState {
             _ => None,
         };
         let mut signal_wait_deadline = None;
+        // Monotonic deadline for a WaitOnSleep, established on first dispatch and
+        // preserved across quiesce-park re-dispatch so the sleep isn't restarted.
+        let mut sleep_deadline: Option<Instant> = None;
         loop {
             let request = SyscallRequest::from_aarch64_frame(frame);
             let outcome = kernel.dispatcher.dispatch_threaded(
@@ -1306,6 +1336,39 @@ impl ThreadRuntimeState {
                         // WaitOnSignals waits over an EMPTY fd slice, so new()
                         // never dups and this is unreachable; present for
                         // exhaustiveness.
+                        crate::io_wait::WaitResult::Errno(errno) => {
+                            break Ok(DispatchOutcome::Errno { errno });
+                        }
+                    }
+                }
+                DispatchOutcome::WaitOnSleep { duration } => {
+                    // The fix for the multithreaded-fork deadlock: sleep via the
+                    // waiter (NOT a blocking host nanosleep in the dispatcher) so
+                    // a sleeping sibling reaches here, observes the fork-quiesce,
+                    // and PARKS — letting a sibling's fork complete. The deadline
+                    // is preserved across the park so the sleep is not restarted.
+                    let deadline = *sleep_deadline.get_or_insert_with(|| Instant::now() + duration);
+                    let now = Instant::now();
+                    if now >= deadline {
+                        break Ok(DispatchOutcome::Returned { value: 0 });
+                    }
+                    match self.waiter.wait(&[], Some(deadline - now), 0) {
+                        crate::io_wait::WaitResult::Ready => continue,
+                        crate::io_wait::WaitResult::TimedOut => {
+                            if Instant::now() >= deadline {
+                                break Ok(DispatchOutcome::Returned { value: 0 });
+                            }
+                            continue;
+                        }
+                        crate::io_wait::WaitResult::Interrupted => {
+                            if crate::fork_quiesce::is_quiescing() {
+                                self.release_and_park_vcpu_for_fork(engine)?;
+                                continue;
+                            }
+                            break Ok(DispatchOutcome::Errno {
+                                errno: crate::linux_abi::LINUX_EINTR,
+                            });
+                        }
                         crate::io_wait::WaitResult::Errno(errno) => {
                             break Ok(DispatchOutcome::Errno { errno });
                         }
@@ -1982,7 +2045,8 @@ fn run_vcpu_until_exit(
                 | DispatchOutcome::WaitOnFdsSelect { .. }
                 | DispatchOutcome::WaitOnPollFds { .. }
                 | DispatchOutcome::WaitOnProcExit { .. }
-                | DispatchOutcome::WaitOnSignals { .. } => {
+                | DispatchOutcome::WaitOnSignals { .. }
+                | DispatchOutcome::WaitOnSleep { .. } => {
                     last_syscall_retval =
                         Some(state.complete_errno(&mut engine, crate::linux_abi::LINUX_EINTR)?);
                 }
