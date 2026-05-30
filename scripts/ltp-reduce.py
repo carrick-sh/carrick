@@ -45,6 +45,10 @@ CARRICK_IMAGE = os.environ.get("LTP_CARRICK_IMAGE", "localhost:5050/ltp:arm64")
 CARRICK_TIMEOUT = int(os.environ.get("LTP_CARRICK_TIMEOUT", "45"))
 DOCKER_TIMEOUT = int(os.environ.get("LTP_DOCKER_TIMEOUT", "60"))
 os.environ.setdefault("CARRICK_INSECURE_REGISTRIES", "localhost:5050")
+# Unique run-id stamped into guest titles (inherited by carrick subprocesses) so
+# sweep_guests reaps ONLY this run's guests — kill.sh now REQUIRES a run-id.
+RUN_ID = os.environ.get("CARRICK_RUN_ID") or f"ltpreduce-{os.getpid()}"
+os.environ["CARRICK_RUN_ID"] = RUN_ID
 
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 VERDICT = re.compile(r"\b(TPASS|TFAIL|TCONF|TBROK|TWARN)\b\s*:?\s*(.*)")
@@ -64,7 +68,7 @@ TRAP_RET = re.compile(
 
 def sweep_guests():
     try:
-        subprocess.run(["sudo", "-n", KILL], stdout=subprocess.DEVNULL,
+        subprocess.run(["sudo", "-n", KILL, RUN_ID], stdout=subprocess.DEVNULL,
                        stderr=subprocess.DEVNULL, timeout=20)
     except Exception:
         pass

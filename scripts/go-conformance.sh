@@ -14,6 +14,10 @@ repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cache="/tmp/go-conformance"; mkdir -p "$cache/bin" "$cache/logs" "$cache/run" "$cache/etc"
 carrick="$repo/target/release/carrick"
 [ -x "$carrick" ] || { echo "carrick not built/signed: $carrick — run ./scripts/build-signed.sh" >&2; exit 2; }
+# Stamp a unique run-id into every guest's "carrick:<run-id>" title so the
+# between-package reap below is SCOPED to this run — never reaping a concurrent
+# lane/worktree/workflow agent's guests (see scripts/sudo/kill.sh).
+export CARRICK_RUN_ID="${CARRICK_RUN_ID:-go-conf-$$}"
 RUN_TIMEOUT="${RUN_TIMEOUT:-120}"
 # Packages that must run inside a COHERENT debian rootfs (via `carrick run
 # <image>`) rather than the bare `--fs host` scratch, because they exercise the
@@ -182,7 +186,7 @@ for p in "${pkgs[@]}"; do
     "/b/$n.test" -test.run 'Test' -test.skip "$SKIP" -test.short -test.v \
     -test.timeout "${TEST_TIMEOUT}s" > "$cache/logs/$n.docker" 2>&1
 
-  pkill -9 -f "carrick run" 2>/dev/null
+  pkill -9 -f "carrick:$CARRICK_RUN_ID" 2>/dev/null
   # Build the carrick subcommand. ROOTFS_PKGS run inside a coherent debian
   # rootfs (same image + bind mounts as the Docker oracle), with the test binary
   # referenced by its in-rootfs mount path (/b/$n.test) so argv[0] has real
@@ -212,7 +216,7 @@ for p in "${pkgs[@]}"; do
   else
     timeout -s KILL "$RUN_TIMEOUT" "$carrick" "${carrick_args[@]}" > "$cache/logs/$n.carrick" 2>&1
   fi
-  pkill -9 -f "carrick run" 2>/dev/null
+  pkill -9 -f "carrick:$CARRICK_RUN_ID" 2>/dev/null
 
   gap=$(comm -23 <(verdicts "$cache/logs/$n.docker"  | grep '^PASS ' | awk '{print $2}' | sort -u) \
                  <(verdicts "$cache/logs/$n.carrick" | grep '^PASS ' | awk '{print $2}' | sort -u))
