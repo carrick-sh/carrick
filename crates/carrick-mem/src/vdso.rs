@@ -31,7 +31,8 @@ pub const VVAR_OFF_REALTIME_OFF_NS: usize = 16; // wall_ns - monotonic_ns
 
 /// The assembled clock functions (aarch64). Offsets within this blob:
 /// `__kernel_clock_gettime` @ 0x00, `__kernel_gettimeofday` @ 0x84,
-/// `__kernel_clock_getres` @ 0xdc. See `tools/vdso_fns.s`.
+/// `__kernel_clock_getres` @ 0xdc, `__kernel_rt_sigreturn` @ 0x104.
+/// See `tools/vdso_fns.s`.
 const VDSO_CODE: &[u8] = &[
     0x1f, 0x1c, 0x00, 0x71, 0x28, 0x01, 0x00, 0x54, 0x1f, 0x10, 0x00, 0x71, 0x40, 0x01, 0x00, 0x54,
     0x1f, 0x04, 0x00, 0x71, 0x00, 0x01, 0x00, 0x54, 0x1f, 0x1c, 0x00, 0x71, 0xc0, 0x00, 0x00, 0x54,
@@ -50,18 +51,28 @@ const VDSO_CODE: &[u8] = &[
     0xe8, 0x00, 0x00, 0x54, 0x81, 0x00, 0x00, 0xb4, 0x3f, 0x00, 0x00, 0xf9, 0x22, 0x00, 0x80, 0xd2,
     0x22, 0x04, 0x00, 0xf9, 0x00, 0x00, 0x80, 0x52, 0xc0, 0x03, 0x5f, 0xd6, 0x48, 0x0e, 0x80, 0xd2,
     0x01, 0x00, 0x00, 0xd4, 0xc0, 0x03, 0x5f, 0xd6,
+    // __kernel_rt_sigreturn: `mov x8, #139 (__NR_rt_sigreturn); svc #0`. The
+    // canonical aarch64 sigreturn trampoline body — unwinders (libgcc, gdb,
+    // Go traceback) recognise a signal frame by matching this exact instruction
+    // pair at the PC. MUST stay the last 8 bytes (see SYM_RT_SIGRETURN).
+    0x68, 0x11, 0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4,
 ];
 
 // Symbol offsets within VDSO_CODE.
 const SYM_CLOCK_GETTIME: u64 = 0x00;
 const SYM_GETTIMEOFDAY: u64 = 0x84;
 const SYM_CLOCK_GETRES: u64 = 0xdc;
+// rt_sigreturn is the trailing 8 bytes of VDSO_CODE; derive its offset from the
+// blob length so it stays correct regardless of the clock functions' size.
+const SYM_RT_SIGRETURN: u64 = (VDSO_CODE.len() - 8) as u64;
 
 const EM_AARCH64: u16 = 183;
 const ET_DYN: u16 = 3;
 const PT_LOAD: u32 = 1;
 const PT_DYNAMIC: u32 = 2;
 const STB_GLOBAL_FUNC: u8 = 0x12; // (STB_GLOBAL<<4)|STT_FUNC
+const STB_GLOBAL_NOTYPE: u8 = 0x10; // (STB_GLOBAL<<4)|STT_NOTYPE — Linux marks
+// __kernel_rt_sigreturn this way; match it.
 const DT_NULL: i64 = 0;
 const DT_HASH: i64 = 4;
 const DT_STRTAB: i64 = 5;
@@ -91,6 +102,8 @@ pub fn vdso_image_bytes() -> Vec<u8> {
     dynstr.extend_from_slice(b"__kernel_gettimeofday\0");
     let name_getres = dynstr.len() as u32;
     dynstr.extend_from_slice(b"__kernel_clock_getres\0");
+    let name_rt_sigreturn = dynstr.len() as u32;
+    dynstr.extend_from_slice(b"__kernel_rt_sigreturn\0");
     let name_version = dynstr.len() as u32;
     dynstr.extend_from_slice(b"LINUX_2.6.39\0");
 
@@ -99,17 +112,18 @@ pub fn vdso_image_bytes() -> Vec<u8> {
     const PHENT: usize = 56;
     const NPH: usize = 2;
     const SYMENT: usize = 24;
-    const NSYM: usize = 4; // undef + 3 funcs
+    const NSYM: usize = 5; // undef + 4 funcs (3 clock + rt_sigreturn)
 
     let off_phdr = EHDR;
     let off_dynsym = off_phdr + NPH * PHENT;
     let off_dynstr = off_dynsym + NSYM * SYMENT;
     let off_hash = align_up(off_dynstr + dynstr.len(), 4);
-    // SysV hash: nbucket=1, nchain=4; bucket=[1]; chain=[0,2,3,0]
-    let hash: [u32; 7] = [1, 4, 1, 0, 2, 3, 0];
+    // SysV hash: nbucket=1, nchain=5; bucket=[1]; chain=[0,2,3,4,0]. nbucket=1
+    // funnels every name to bucket 0, so lookup walks the chain 1->2->3->4->end.
+    let hash: [u32; 8] = [1, 5, 1, 0, 2, 3, 4, 0];
     let off_versym = off_hash + hash.len() * 4;
     // versym: one u16 per dynsym entry; funcs use version index 1.
-    let versym: [u16; 4] = [0, 1, 1, 1];
+    let versym: [u16; 5] = [0, 1, 1, 1, 1];
     let off_verdef = align_up(off_versym + versym.len() * 2, 4);
     const VERDEF_SZ: usize = 20 + 8; // elfVerdef + elfVerdaux
     let off_dyn = align_up(off_verdef + VERDEF_SZ, 8);
@@ -193,23 +207,28 @@ pub fn vdso_image_bytes() -> Vec<u8> {
     w64(&mut buf, p1 + 48, 8); // p_align
 
     // ---- .dynsym ----
-    let sym = |buf: &mut [u8], idx: usize, name: u32, value: u64, size: u64, func: bool| {
-        let o = off_dynsym + idx * SYMENT;
-        w32(buf, o, name); // st_name
-        buf[o + 4] = if func { STB_GLOBAL_FUNC } else { 0 }; // st_info
-        buf[o + 5] = 0; // st_other
-        w16(buf, o + 6, if func { 1 } else { 0 }); // st_shndx (nonzero = defined)
-        w64(buf, o + 8, value); // st_value
-        w64(buf, o + 16, size); // st_size
-    };
-    sym(&mut buf, 0, 0, 0, 0, false);
+    // `info` is st_info (STB_GLOBAL_FUNC for the clock fns, STB_GLOBAL_NOTYPE
+    // for rt_sigreturn to mirror Linux), `shndx` is st_shndx (0 = undefined,
+    // nonzero = defined; carrick uses 1 for every defined symbol).
+    let sym =
+        |buf: &mut [u8], idx: usize, name: u32, value: u64, size: u64, info: u8, shndx: u16| {
+            let o = off_dynsym + idx * SYMENT;
+            w32(buf, o, name); // st_name
+            buf[o + 4] = info; // st_info
+            buf[o + 5] = 0; // st_other
+            w16(buf, o + 6, shndx); // st_shndx
+            w64(buf, o + 8, value); // st_value
+            w64(buf, o + 16, size); // st_size
+        };
+    sym(&mut buf, 0, 0, 0, 0, 0, 0); // STN_UNDEF
     sym(
         &mut buf,
         1,
         name_gettime,
         off_code as u64 + SYM_CLOCK_GETTIME,
         SYM_GETTIMEOFDAY - SYM_CLOCK_GETTIME,
-        true,
+        STB_GLOBAL_FUNC,
+        1,
     );
     sym(
         &mut buf,
@@ -217,15 +236,27 @@ pub fn vdso_image_bytes() -> Vec<u8> {
         name_gtod,
         off_code as u64 + SYM_GETTIMEOFDAY,
         SYM_CLOCK_GETRES - SYM_GETTIMEOFDAY,
-        true,
+        STB_GLOBAL_FUNC,
+        1,
     );
     sym(
         &mut buf,
         3,
         name_getres,
         off_code as u64 + SYM_CLOCK_GETRES,
-        (VDSO_CODE.len() as u64) - SYM_CLOCK_GETRES,
-        true,
+        SYM_RT_SIGRETURN - SYM_CLOCK_GETRES,
+        STB_GLOBAL_FUNC,
+        1,
+    );
+    // Linux marks __kernel_rt_sigreturn STT_NOTYPE; match it exactly.
+    sym(
+        &mut buf,
+        4,
+        name_rt_sigreturn,
+        off_code as u64 + SYM_RT_SIGRETURN,
+        (VDSO_CODE.len() as u64) - SYM_RT_SIGRETURN,
+        STB_GLOBAL_NOTYPE,
+        1,
     );
 
     // ---- .dynstr ----
@@ -370,6 +401,62 @@ mod tests {
             }
         }
         assert!(found, "__kernel_clock_gettime not exported");
+    }
+
+    /// The canonical aarch64 vDSO (`arch/arm64/kernel/vdso/vdso.lds.S`,
+    /// `LINUX_2.6.39`) exports exactly these four `__kernel_*` symbols. carrick
+    /// must export all four so that unwinders/debuggers (libgcc, libunwind,
+    /// gdb, Go traceback) can resolve `__kernel_rt_sigreturn` by name when
+    /// recognising a signal frame, and so the vDSO ABI contract is complete.
+    #[test]
+    fn vdso_exports_all_four_canonical_symbols() {
+        let img = vdso_image_bytes();
+        let elf = goblin::elf::Elf::parse(&img).expect("vDSO must be a valid ELF");
+        let code_lo = 64u64; // every defined func must point past the ELF header
+        let code_hi = img.len() as u64;
+        // The 3 clock fns are STT_FUNC; rt_sigreturn is STT_NOTYPE on real
+        // Linux, so we only require it be defined (not its type).
+        for (want, must_be_func) in [
+            ("__kernel_clock_gettime", true),
+            ("__kernel_gettimeofday", true),
+            ("__kernel_clock_getres", true),
+            ("__kernel_rt_sigreturn", false),
+        ] {
+            let sym = elf
+                .dynsyms
+                .iter()
+                .find(|s| elf.dynstrtab.get_at(s.st_name) == Some(want))
+                .unwrap_or_else(|| panic!("{want} not exported from vDSO"));
+            if must_be_func {
+                assert!(sym.is_function(), "{want} must be STT_FUNC");
+            }
+            assert_ne!(sym.st_shndx, 0, "{want} must be defined (st_shndx != 0)");
+            assert!(
+                sym.st_value >= code_lo && sym.st_value < code_hi,
+                "{want} st_value {:#x} must point into the code blob",
+                sym.st_value
+            );
+        }
+    }
+
+    /// `__kernel_rt_sigreturn` must be the canonical trampoline body
+    /// `mov x8, #139 ; svc #0` — every unwinder recognises a signal frame by
+    /// matching this exact instruction pair at the PC, not by symbol name.
+    #[test]
+    fn vdso_rt_sigreturn_is_the_canonical_trampoline_sequence() {
+        let img = vdso_image_bytes();
+        let elf = goblin::elf::Elf::parse(&img).unwrap();
+        let sym = elf
+            .dynsyms
+            .iter()
+            .find(|s| elf.dynstrtab.get_at(s.st_name) == Some("__kernel_rt_sigreturn"))
+            .expect("__kernel_rt_sigreturn must exist");
+        // st_value is a file offset (PT_LOAD vaddr==offset==0).
+        let off = sym.st_value as usize;
+        let mov_x8_139 = u32::from_le_bytes(img[off..off + 4].try_into().unwrap());
+        let svc_0 = u32::from_le_bytes(img[off + 4..off + 8].try_into().unwrap());
+        assert_eq!(mov_x8_139, 0xd280_1168, "expected `mov x8, #139`");
+        assert_eq!(svc_0, 0xd400_0001, "expected `svc #0`");
     }
 }
 
