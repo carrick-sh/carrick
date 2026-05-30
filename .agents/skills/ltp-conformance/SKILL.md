@@ -1,21 +1,12 @@
 ---
 name: ltp-conformance
 description: >-
-  Bring up and verify carrick's Linux syscall emulation against the Linux Test
-  Project (LTP), used as a differential oracle vs real Linux in Docker. Reach
-  for this whenever you're deciding WHAT to fix next in carrick, checking
-  whether a syscall/feature is emulated CORRECTLY, triaging an LTP test that
-  fails/TBROKs/TCONFs/TIMEOUTs, measuring conformance for an area (signals,
-  epoll, timers, futex, /proc, fs, mm…), comparing carrick to Docker, writing a
-  conformance probe, or "reducing" a big/flaky/framework-heavy failing test to a
-  tiny focused repro. Consult it BEFORE eyeballing a single test or hand-rolling
-  a verdict — the differential method has subtle traps (count-vs-assertion
-  verdicts, Docker-VM timing-jitter inversions, TBROK/TCONF that verify nothing,
-  guest-pid-as-host-pid mirroring) that quietly produce FALSE passes, and the
-  reduce-to-a-deterministic-probe move is what turns a noisy LTP failure into a
-  focused, durable goal. Also use it when you ask "is carrick doing this the way
-  real Linux does?", "what's the next conformance gap?", or "did this fix
-  actually land end-to-end?".
+  Use when bringing up or verifying carrick's Linux syscall emulation against
+  the Linux Test Project (LTP), comparing carrick with Docker Linux, triaging
+  LTP failures, TIMEOUTs, TBROKs, TCONFs, false MATCHes, timing-jitter
+  inversions, or reducing noisy LTP cases into deterministic conformance
+  probes. Also use when choosing the next conformance gap, checking whether
+  Linux behavior is emulated correctly, or proving a fix landed end-to-end.
 ---
 
 # LTP conformance bring-up for carrick
@@ -74,8 +65,8 @@ export CARRICK_INSECURE_REGISTRIES=localhost:5050
 Use the bundled scripts (durable; the verdict logic is the subtle part):
 
 ```sh
-.claude/skills/ltp-conformance/scripts/ltp-check.sh pause01 futex_wake03 ...
-.claude/skills/ltp-conformance/scripts/ltp-sweep.sh   # the full curated 4-area sweep
+.agents/skills/ltp-conformance/scripts/ltp-check.sh pause01 futex_wake03 ...
+.agents/skills/ltp-conformance/scripts/ltp-sweep.sh   # the full curated 4-area sweep
 ```
 
 Each test runs under Docker (the oracle) and under
