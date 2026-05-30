@@ -12,3 +12,4 @@ pub mod elf;
 pub mod memory;
 pub mod page_table;
 pub mod vdso;
+mod vdso_getrandom_chacha;
