@@ -24,6 +24,34 @@
 
 use std::sync::OnceLock;
 
+/// Per-run id (from `CARRICK_RUN_ID`, inherited across guest forks via the
+/// environment), cached once. Lets cleanup scope to a single run instead of
+/// reaping every `carrick:` host process — the hazard that forces the
+/// conformance gate and the LTP sweeps to run serially.
+static RUN_ID: OnceLock<Option<String>> = OnceLock::new();
+
+fn run_id() -> Option<&'static str> {
+    RUN_ID
+        .get_or_init(|| {
+            std::env::var("CARRICK_RUN_ID")
+                .ok()
+                .filter(|s| !s.is_empty())
+        })
+        .as_deref()
+}
+
+/// Build the host process title. With a run id this is `carrick:<id>: <name>`,
+/// which is greppable per-run (a scoped `pkill -f "carrick:<id>"` reaps only
+/// this run's guests, surviving `setpgid`/`setsid` escapes). Without one it is
+/// the legacy `carrick: <name>`. Both keep the literal `carrick:` so the global
+/// recovery reaper still matches for manual cleanup.
+pub(crate) fn proc_label(name: &str, run_id: Option<&str>) -> String {
+    match run_id {
+        Some(id) if !id.is_empty() => format!("carrick:{id}: {}", name.trim()),
+        _ => format!("carrick: {}", name.trim()),
+    }
+}
+
 #[cfg(target_os = "macos")]
 struct Buffer {
     start: *mut u8,
@@ -64,7 +92,7 @@ pub fn init() {}
 pub fn set_host_process_name(comm: &[u8]) {
     let end = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
     let name = String::from_utf8_lossy(&comm[..end]);
-    let label = format!("carrick: {}", name.trim());
+    let label = proc_label(&name, run_id());
 
     // (1) Thread name — shows in lldb / Instruments / sample / crash
     // reports. Capped at MAXTHREADNAMESIZE (64).
@@ -244,5 +272,34 @@ unsafe fn discover_and_relocate() -> Option<Buffer> {
         *environ_pp = leaked.as_mut_ptr();
 
         Some(Buffer { start, len })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::proc_label;
+
+    #[test]
+    fn label_with_run_id_is_scoped_per_run() {
+        // A scoped reaper greps "carrick:<id>" — this must contain exactly that
+        // token (colon then id, no space) so it can't match another run's title.
+        assert_eq!(proc_label("ls", Some("cr-42")), "carrick:cr-42: ls");
+    }
+
+    #[test]
+    fn label_without_run_id_is_legacy() {
+        assert_eq!(proc_label("ls", None), "carrick: ls");
+        assert_eq!(proc_label("ls", Some("")), "carrick: ls");
+    }
+
+    #[test]
+    fn scoped_label_is_not_matched_by_another_runs_grep() {
+        // The whole point: run A's reaper (grep "carrick:cr-A") must NOT match
+        // run B's title, nor the legacy title.
+        assert!(!proc_label("ls", Some("cr-B")).contains("carrick:cr-A"));
+        assert!(!proc_label("ls", None).contains("carrick:cr-A"));
+        // ...but the global recovery reaper (grep "carrick:") still matches both.
+        assert!(proc_label("ls", Some("cr-B")).contains("carrick:"));
+        assert!(proc_label("ls", None).contains("carrick:"));
     }
 }

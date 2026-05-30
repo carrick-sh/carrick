@@ -30,6 +30,10 @@ export CARRICK_INSECURE_REGISTRIES="${CARRICK_INSECURE_REGISTRIES:-localhost:505
 TC="${TC:-15}"   # carrick per-test timeout (s)
 TD="${TD:-15}"   # docker per-test timeout (s)
 OUT="${OUT:-/tmp/ltp-full-$(date +%Y%m%d)}"; mkdir -p "$OUT"
+# Per-run id: scoped cleanup reaps only THIS sweep's wedged guests, so a second
+# sweep / conformance lane / worktree can run concurrently without being reaped.
+RUN_ID="${CARRICK_RUN_ID:-cr-sweep-$$-${RANDOM}}"
+export CARRICK_RUN_ID="$RUN_ID"
 
 verdict() {  # $1 = file
   local f="$1" s p fa b c
@@ -72,11 +76,11 @@ i=0
 while read t; do
   i=$((i+1))
   cut -f1 "$OUT/carrick.tsv" | grep -qx "$t" && continue   # resume
-  sudo -n "$KILL" >/dev/null 2>&1
+  sudo -n "$KILL" "$RUN_ID" >/dev/null 2>&1
   : > "$OUT/c.out"
   timeout -s KILL "$TC" "$CARRICK" run "$IMAGE" --raw --fs host /bin/sh -c "/opt/ltp/testcases/bin/$t" > "$OUT/c.out" 2>&1
   rc=$?
-  sudo -n "$KILL" >/dev/null 2>&1
+  sudo -n "$KILL" "$RUN_ID" >/dev/null 2>&1
   grep -vE "case-insensitive|Pass .--fs" "$OUT/c.out" > "$OUT/c.clean"
   v=$(verdict "$OUT/c.clean")
   { [ $rc -eq 124 ] || [ $rc -eq 137 ]; } && v="TIMEOUT/$v"

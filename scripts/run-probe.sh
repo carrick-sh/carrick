@@ -22,7 +22,15 @@ snippet='base64 -d > /tmp/p && chmod +x /tmp/p && /tmp/p'
 [ -x "$bin" ] || { echo "probe not built: $bin — run scripts/build-probes.sh"; exit 2; }
 export CARRICK_INSECURE_REGISTRIES="${CARRICK_INSECURE_REGISTRIES:-localhost:5050}"
 
-kill_guests() { sudo -n "$repo/scripts/sudo/kill.sh" >/dev/null 2>&1 || pkill -9 -f 'carrick:' 2>/dev/null; }
+# Per-run id stamped into every carrick guest's title (inherited across forks),
+# so cleanup reaps ONLY this invocation's guests — run-probe is now safe to run
+# concurrently (parallel probe iteration) without lanes killing each other.
+RUN_ID="cr-$$-${RANDOM}"
+export CARRICK_RUN_ID="$RUN_ID"
+kill_guests() {
+    sudo -n "$repo/scripts/sudo/kill.sh" "$RUN_ID" >/dev/null 2>&1 \
+        || pkill -9 -f "carrick:$RUN_ID" 2>/dev/null
+}
 
 kill_guests; sleep 0.3
 c=$(base64 -i "$bin" | timeout 60 "$carrick" run "$image" --raw --fs host /bin/sh -c "$snippet" 2>/dev/null \

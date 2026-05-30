@@ -19,6 +19,16 @@ KILL="${KILL:-/Volumes/CaseSensitive/carrick/scripts/sudo/kill.sh}"
 IMAGE="${IMAGE:-localhost:5050/ltp:arm64}"
 export CARRICK_INSECURE_REGISTRIES="${CARRICK_INSECURE_REGISTRIES:-localhost:5050}"
 
+# Per-run id stamped into carrick guest titles + run-local scratch, so two
+# ltp-check lanes (or a concurrent sweep) don't reap each other or clobber
+# each other's /tmp output.
+RUN_ID="cr-$$-${RANDOM}"
+export CARRICK_RUN_ID="$RUN_ID"
+D_OUT="/tmp/ltpck_${RUN_ID}_d.out"
+C_OUT="/tmp/ltpck_${RUN_ID}_c.out"
+C_CLEAN="/tmp/ltpck_${RUN_ID}_c.clean"
+trap 'rm -f "$D_OUT" "$C_OUT" "$C_CLEAN"' EXIT
+
 verdict() {
   local f="$1"
   local s
@@ -34,15 +44,15 @@ verdict() {
 m=0; d=0
 for t in "$@"; do
   docker run --rm --platform linux/arm64 ltp:arm64 \
-    sh -c "/opt/ltp/testcases/bin/$t 2>&1" 2>/dev/null > /tmp/ltpck_d.out
-  D=$(verdict /tmp/ltpck_d.out)
-  sudo -n "$KILL" >/dev/null 2>&1
-  : > /tmp/ltpck_c.out
-  timeout 40 "$CARRICK" run "$IMAGE" --raw --fs host /bin/sh -c "/opt/ltp/testcases/bin/$t" > /tmp/ltpck_c.out 2>&1
+    sh -c "/opt/ltp/testcases/bin/$t 2>&1" 2>/dev/null > "$D_OUT"
+  D=$(verdict "$D_OUT")
+  sudo -n "$KILL" "$RUN_ID" >/dev/null 2>&1
+  : > "$C_OUT"
+  timeout 40 "$CARRICK" run "$IMAGE" --raw --fs host /bin/sh -c "/opt/ltp/testcases/bin/$t" > "$C_OUT" 2>&1
   rc=$?
-  sudo -n "$KILL" >/dev/null 2>&1
-  grep -vE "case-insensitive|Pass .--fs" /tmp/ltpck_c.out > /tmp/ltpck_c.clean
-  C=$(verdict /tmp/ltpck_c.clean)
+  sudo -n "$KILL" "$RUN_ID" >/dev/null 2>&1
+  grep -vE "case-insensitive|Pass .--fs" "$C_OUT" > "$C_CLEAN"
+  C=$(verdict "$C_CLEAN")
   [ $rc -eq 124 ] && C="TIMEOUT/$C"
   if [ "$D" = "$C" ]; then m=$((m+1)); tag="MATCH"; else d=$((d+1)); tag="DIFF "; fi
   printf "%s %-22s docker[%s] carrick[%s]\n" "$tag" "$t" "$D" "$C"
