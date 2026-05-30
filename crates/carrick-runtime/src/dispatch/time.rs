@@ -98,17 +98,18 @@ impl SyscallDispatcher {
                 Ok(duration) => duration,
                 Err(errno) => return Ok(errno.into()),
             };
-            if let Some(duration) = duration {
-                if let Some(remaining) = host_sleep_interruptible(duration) {
-                    if rem_ptr.0 != 0 {
-                        let memory = &mut *cx.memory;
-                        let ts = linux_timespec_from_duration(remaining);
-                        let _ = write_kernel_struct(memory, rem_ptr.0, &ts);
-                    }
-                    return Ok(LINUX_EINTR.into());
-                }
+            // Hand the sleep to the run loop (DispatchOutcome::WaitOnSleep) so it
+            // waits via the per-thread waiter instead of a blocking host
+            // nanosleep inside the dispatcher: a synchronous host sleep never
+            // reaches the run-loop top, so a sleeping sibling would deadlock a
+            // multithreaded fork-quiesce. `rem` is not written on EINTR (the run
+            // loop owns the wait); callers that need it recompute from a deadline
+            // (glibc/CPython do). The `_ = rem_ptr` keeps the binding live.
+            let _ = rem_ptr;
+            match duration {
+                Some(duration) => Ok(DispatchOutcome::WaitOnSleep { duration }),
+                None => Ok(DispatchOutcome::Returned { value: 0 }),
             }
-            Ok(DispatchOutcome::Returned { value: 0 })
         }
 
         fn clock_nanosleep(this, cx, clock_id: u64, flags: u64, request_address: GuestPtr, rem_ptr: GuestPtr) {
@@ -132,19 +133,17 @@ impl SyscallDispatcher {
             } else {
                 requested
             };
-            if !sleep_duration.is_zero() {
-                if let Some(remaining) = host_sleep_interruptible(sleep_duration) {
-                    if flags & LINUX_TIMER_ABSTIME == 0 {
-                        if rem_ptr.0 != 0 {
-                            let memory = &mut *cx.memory;
-                            let ts = linux_timespec_from_duration(remaining);
-                            let _ = write_kernel_struct(memory, rem_ptr.0, &ts);
-                        }
-                    }
-                    return Ok(LINUX_EINTR.into());
-                }
+            // See nanosleep: the run loop performs the timed wait (WaitOnSleep)
+            // so it is fork-quiesce-parkable. ABSTIME is pre-converted to the
+            // relative `sleep_duration` here; on a quiesce re-dispatch the run
+            // loop keeps the original deadline, so it stays absolute-correct.
+            let _ = rem_ptr;
+            if sleep_duration.is_zero() {
+                return Ok(DispatchOutcome::Returned { value: 0 });
             }
-            Ok(DispatchOutcome::Returned { value: 0 })
+            Ok(DispatchOutcome::WaitOnSleep {
+                duration: sleep_duration,
+            })
         }
 
         fn clock_gettime(this, cx, clock_id: u64, address: GuestPtr) {
@@ -718,43 +717,8 @@ fn itimerval_from_state(
     }
 }
 
-/// Sleep on the host for `duration`, interruptible by a pending guest signal.
-///
-/// Unlike `std::thread::sleep` — whose internal `assert_eq!(errno, EINTR)`
-/// panics the whole process when carrick's signal machinery leaves a different
-/// errno on the thread (observed crashing forked guest children on Ctrl-C) —
-/// this issues `nanosleep(2)` directly. On a genuine interruption (a
-/// process-directed guest signal such as SIGINT is pending) it returns the
-/// unslept `Some(remaining)` so the caller can return `EINTR` and let the trap
-/// loop deliver the signal. Spurious wakeups (internal vCPU kicks, SIGCHLD…)
-/// resume sleeping for the remaining time, matching Linux's restart behaviour.
-fn host_sleep_interruptible(duration: Duration) -> Option<Duration> {
-    let mut req = libc::timespec {
-        tv_sec: duration.as_secs().min(libc::time_t::MAX as u64) as libc::time_t,
-        tv_nsec: duration.subsec_nanos() as libc::c_long,
-    };
-    loop {
-        let mut rem = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        // SAFETY: `req` and `rem` are valid, distinct, fully-initialised
-        // timespecs for the duration of the call.
-        let r = unsafe { libc::nanosleep(&req, &mut rem) };
-        if r == 0 {
-            return None;
-        }
-        // Interrupted. Surface EINTR only if the guest has a signal it can
-        // actually take; otherwise resume sleeping for the remaining time.
-        if crate::host_signal::has_process_pending() {
-            return Some(Duration::new(
-                rem.tv_sec.max(0) as u64,
-                rem.tv_nsec.max(0) as u32,
-            ));
-        }
-        if rem.tv_sec <= 0 && rem.tv_nsec <= 0 {
-            return None;
-        }
-        req = rem;
-    }
-}
+// `nanosleep`/`clock_nanosleep` now return `DispatchOutcome::WaitOnSleep` and
+// the run loop performs the timed wait via the per-thread waiter (so it is
+// fork-quiesce-parkable). The former in-dispatcher `host_sleep_interruptible`
+// blocking host nanosleep was removed: a sibling stuck in it never reached the
+// run-loop top and deadlocked multithreaded fork.

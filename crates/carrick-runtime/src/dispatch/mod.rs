@@ -732,6 +732,18 @@ pub enum DispatchOutcome {
         wait_set: u64,
         timeout: Option<Duration>,
     },
+    /// A relative sleep (`nanosleep`/`clock_nanosleep`). The run loop performs
+    /// the timed wait via the per-thread waiter — NOT a blocking host nanosleep
+    /// inside the dispatcher — so the sleep is interruptible by a guest signal
+    /// (EINTR) AND, critically, can PARK for a fork-quiesce: a sibling stuck in
+    /// a synchronous host nanosleep never reaches the run-loop top, so a
+    /// multithreaded fork would otherwise deadlock waiting for it to quiesce.
+    /// The run loop preserves the deadline across re-dispatch (quiesce-park),
+    /// so the sleep is not restarted. `duration` is the (relative) remaining
+    /// time; an ABSTIME clock_nanosleep is pre-converted by the handler.
+    WaitOnSleep {
+        duration: Duration,
+    },
 }
 
 impl DispatchOutcome {
@@ -764,6 +776,7 @@ impl DispatchOutcome {
             DispatchOutcome::WaitOnPollFds { .. } => (0, None),
             DispatchOutcome::WaitOnProcExit { .. } => (0, None),
             DispatchOutcome::WaitOnSignals { .. } => (0, None),
+            DispatchOutcome::WaitOnSleep { .. } => (0, None),
         }
     }
 }
