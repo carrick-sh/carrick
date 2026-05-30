@@ -289,14 +289,17 @@ where
     // is read from the host (not the rootfs); it is statically linked, so the
     // rootfs reader below is never asked for a Rosetta PT_INTERP.
     let path_str = path.to_string_lossy();
-    let (file, argv) = match maybe_redirect_to_rosetta(&path_str, &file, &argv) {
-        None => (file, argv),
-        Some(Ok((rosetta_bytes, new_argv))) => {
-            dispatcher.set_executable_path(ROSETTA_INTERPRETER);
-            (rosetta_bytes, new_argv)
-        }
-        Some(Err(errno)) => return Err(rosetta_unavailable(errno, &path_str)),
-    };
+    // argv normalises to opaque bytes (Linux ABI) past this point so the rosetta
+    // and non-rosetta arms share a type; with_linux_initial_stack accepts bytes.
+    let (file, argv): (Vec<u8>, Vec<Vec<u8>>) =
+        match maybe_redirect_to_rosetta(&path_str, &file, &argv) {
+            None => (file, argv.into_iter().map(String::into_bytes).collect()),
+            Some(Ok((rosetta_bytes, new_argv))) => {
+                dispatcher.set_executable_path(ROSETTA_INTERPRETER);
+                (rosetta_bytes, new_argv)
+            }
+            Some(Err(errno)) => return Err(rosetta_unavailable(errno, &path_str)),
+        };
     let image = AddressSpace::load_elf_bytes_with_reader(&file, &|p| {
         rootfs.read(p).ok().or_else(|| std::fs::read(p).ok())
     })?
@@ -366,17 +369,19 @@ where
             path.to_owned(),
         )))
     })?;
-    // Redirect x86_64 binaries through Rosetta 2 (binfmt_misc-style).
-    let (bytes, argv) = match maybe_redirect_to_rosetta(path, &bytes, &argv) {
-        None => (bytes, argv),
-        Some(Ok((rosetta_bytes, new_argv))) => {
-            // /proc/self/exe should resolve to the interpreter that's actually
-            // loaded (Rosetta opens it during its startup handshake).
-            dispatcher.set_executable_path(ROSETTA_INTERPRETER);
-            (rosetta_bytes, new_argv)
-        }
-        Some(Err(errno)) => return Err(rosetta_unavailable(errno, path)),
-    };
+    // Redirect x86_64 binaries through Rosetta 2 (binfmt_misc-style). argv
+    // normalises to opaque bytes (Linux ABI) here so both arms share a type.
+    let (bytes, argv): (Vec<u8>, Vec<Vec<u8>>) =
+        match maybe_redirect_to_rosetta(path, &bytes, &argv) {
+            None => (bytes, argv.into_iter().map(String::into_bytes).collect()),
+            Some(Ok((rosetta_bytes, new_argv))) => {
+                // /proc/self/exe should resolve to the interpreter that's actually
+                // loaded (Rosetta opens it during its startup handshake).
+                dispatcher.set_executable_path(ROSETTA_INTERPRETER);
+                (rosetta_bytes, new_argv)
+            }
+            Some(Err(errno)) => return Err(rosetta_unavailable(errno, path)),
+        };
     let image =
         AddressSpace::load_elf_bytes_with_reader(&bytes, &|p| dispatcher.read_exec_file(p))?
             .with_linux_initial_stack(argv, env)?;
@@ -663,7 +668,11 @@ where
             }
             DispatchOutcome::Execve { path, argv, env } => {
                 crate::probes::execve_argv(&path, &argv);
-                let proc_argv = argv.clone();
+                // proctitle / cmdline identity is display text (lossy decode).
+                let proc_argv: Vec<String> = argv
+                    .iter()
+                    .map(|a| String::from_utf8_lossy(a).into_owned())
+                    .collect();
                 // Reflect the new program into the host process name
                 // (`carrick: <basename>`), so a hung forked-exec'd
                 // child is identifiable in `ps -M` / Activity Monitor.
@@ -1613,11 +1622,16 @@ impl ThreadRuntimeState {
         kernel: &Kernel,
         engine: &mut HvfTrapEngine,
         path: String,
-        argv: Vec<String>,
-        env: Vec<String>,
+        argv: Vec<Vec<u8>>,
+        env: Vec<Vec<u8>>,
     ) -> Result<(), RuntimeError> {
         crate::probes::execve_argv(&path, &argv);
-        let proc_argv = argv.clone();
+        // The proctitle / /proc/self/cmdline identity is display text; lossily
+        // decode the byte argv (a genuinely non-UTF-8 argv is rare).
+        let proc_argv: Vec<String> = argv
+            .iter()
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect();
         let base = path.rsplit('/').next().unwrap_or(&path).to_owned();
         crate::dispatch::set_host_process_name(base.as_bytes());
         match load_execve_image(&kernel.dispatcher, &path, argv, env) {
@@ -2561,11 +2575,13 @@ pub(crate) fn rosetta_license_blob() -> Option<&'static [u8]> {
 ///
 /// Rosetta itself is statically linked, so the AddressSpace loader never needs
 /// to resolve a PT_INTERP for it from the guest VFS.
-pub(crate) fn maybe_redirect_to_rosetta(
+pub(crate) fn maybe_redirect_to_rosetta<A: AsRef<[u8]>>(
     target_path: &str,
     target_bytes: &[u8],
-    argv: &[String],
-) -> Option<Result<(Vec<u8>, Vec<String>), i32>> {
+    // argv items are opaque bytes (Linux ABI); accept String (initial entry)
+    // or Vec<u8> (execve) and always return the byte form.
+    argv: &[A],
+) -> Option<Result<(Vec<u8>, Vec<Vec<u8>>), i32>> {
     use crate::elf::{Machine, inspect_elf_bytes};
     use crate::linux_abi::LINUX_ENOENT;
 
@@ -2574,7 +2590,7 @@ pub(crate) fn maybe_redirect_to_rosetta(
         return None;
     }
 
-    crate::probes::execve_argv("rosetta-redirect", &[target_path.to_owned()]);
+    crate::probes::execve_argv("rosetta-redirect", &[target_path.as_bytes().to_vec()]);
 
     let rosetta_bytes = match rosetta_binary_bytes() {
         Some(b) => b.to_vec(),
@@ -2584,10 +2600,10 @@ pub(crate) fn maybe_redirect_to_rosetta(
     // binfmt_misc interpreter calling convention: argv[0] = interpreter path,
     // argv[1] = the foreign binary, argv[2..] = the original arguments (the
     // original argv[0] is dropped).
-    let mut new_argv = Vec::with_capacity(argv.len() + 1);
-    new_argv.push(ROSETTA_INTERPRETER.to_string());
-    new_argv.push(target_path.to_string());
-    new_argv.extend(argv.iter().skip(1).cloned());
+    let mut new_argv: Vec<Vec<u8>> = Vec::with_capacity(argv.len() + 1);
+    new_argv.push(ROSETTA_INTERPRETER.as_bytes().to_vec());
+    new_argv.push(target_path.as_bytes().to_vec());
+    new_argv.extend(argv.iter().skip(1).map(|a| a.as_ref().to_vec()));
 
     Some(Ok((rosetta_bytes, new_argv)))
 }
@@ -2874,9 +2890,9 @@ mod rosetta_tests {
                 assert_eq!(
                     new_argv,
                     vec![
-                        ROSETTA_INTERPRETER.to_string(),
-                        "/usr/bin/uname".to_string(),
-                        "-m".to_string(),
+                        ROSETTA_INTERPRETER.as_bytes().to_vec(),
+                        b"/usr/bin/uname".to_vec(),
+                        b"-m".to_vec(),
                     ]
                 );
             }
