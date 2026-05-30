@@ -1572,6 +1572,12 @@ pub const LINUX_MAP_HUGETLB: u64 = 0x4_0000;
 /// pre-existing mapping or an on-access fault), so it is normalised to
 /// `MAP_FIXED` at dispatch.
 pub const LINUX_MAP_FIXED_NOREPLACE: u64 = 0x10_0000;
+/// `MAP_DROPPABLE` (Linux 6.11): the kernel may silently drop (zero-fill) the
+/// page under memory pressure. glibc's vDSO getrandom maps its per-thread state
+/// with `MAP_ANONYMOUS|MAP_DROPPABLE` (flags 0x28); carrick accepts it and
+/// treats it as a normal private-anon mapping — the drop-under-pressure
+/// semantics are not needed for correctness (docs/vdso-getrandom-design.md).
+pub const LINUX_MAP_DROPPABLE: u64 = 0x8;
 /// Advisory hint flags carrick accepts and ignores (no observable effect on
 /// the mapping's contents): stack/grows-down placement, swap reservation,
 /// prefault, page-locking and huge-page hints. Rust std's stack-overflow
@@ -1586,7 +1592,8 @@ pub const LINUX_MAP_HINT_MASK: u64 = LINUX_MAP_GROWSDOWN
     | LINUX_MAP_POPULATE
     | LINUX_MAP_NONBLOCK
     | LINUX_MAP_STACK
-    | LINUX_MAP_HUGETLB;
+    | LINUX_MAP_HUGETLB
+    | LINUX_MAP_DROPPABLE;
 pub const LINUX_MADV_NORMAL: u64 = 0;
 pub const LINUX_MADV_RANDOM: u64 = 1;
 pub const LINUX_MADV_SEQUENTIAL: u64 = 2;
