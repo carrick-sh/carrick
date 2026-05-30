@@ -65,30 +65,41 @@ subprocess, os/io) + pure-compute sanity modules.
 
 ## Root-caused clusters (ranked by leverage)
 
-### 1. Fork→execve **EINVAL** in forked children (THE dominant cluster)
-A child created by `fork`/`vfork` (CPython `subprocess`/`_posixsubprocess`)
-intermittently gets **errno 22 (EINVAL) from `execve`**. Trace (test_subprocess
-setUpModule): parent clones two children for the SAME target — child A execve's
-ret=0, child B execve's ret=-22. Single-threaded at that point (setUpModule), so
-it is NOT multithreading per se; it is a race/state bug in carrick's
-fork→execve path. `load_execve_image` only ever returns ENOENT, so the EINVAL
-originates elsewhere in the fork/execve machinery — under investigation.
-Reliable repro: `python -m test test_subprocess` (fails in setUpModule:
-`subprocess.run(['/usr/bin/true'])` → `OSError [Errno 22]: '/usr/bin/true'`).
-Standalone `subprocess.run([...])` works; only fails under the regrtest context.
-- Modules: **test_subprocess** (crashes after setUpModule → 321 diffs),
-  **test_base64** TestMain (5), **test_struct** (1), **test_itertools** (1),
-  **test_posixpath** test_import (1), and the lockf children in **test_fcntl**.
-- Leverage: enormous — `script_helper`/`subprocess` underpins a large fraction
-  of the whole suite. **Top priority.**
+### 1. Multithreaded fork (THE dominant cluster) — two distinct bugs
+CPython's `subprocess`/`script_helper` forks while the regrtest faulthandler
+**watchdog thread** (a native thread, not a Python `threading.Thread`) is alive,
+so every spawn is a **multithreaded fork** + execve. Two separate carrick bugs:
 
-### 2. Multithreaded thread-start / fork hang
-With a background thread present (e.g. regrtest's faulthandler timeout thread),
-`Thread.start()` can hang in `_started.wait()` (a newly cloned thread never
-schedules), and subprocess spawns can deadlock. Aligns with the known carrick
-multithreaded-fork issues (Go os/exec). Likely related to cluster 1.
-- Modules: **test_os** (CARRICK_TIMEOUT/hang), **test_io** (crash partway),
-  **test_hashlib** (crash partway), **test_json** (crash on deep recursion path).
+**Bug A — fork-quiesce deadlock on a sleeping sibling. FIXED (commit b682d67).**
+A sibling blocked in `nanosleep` never reached the run-loop top to park, so the
+fork-quiesce spun forever (carrick-trace: fork-quiesce phase-1 ~18/s). Fixed by
+routing sleeps through the run loop (`DispatchOutcome::WaitOnSleep`) so they park
+for the quiesce. Verified: trace shows phase-1 spin gone; sleeper parks/resumes.
+
+**Bug B — racy HVF VM-rebuild fork wedge in a NESTED process. OPEN, #1 blocker.**
+After Bug A, a multithreaded fork from a guest process that was itself
+`fork+exec`'d (a "grandchild": carrick → `/bin/sh -c` → probe) still wedges in
+`engine.fork()` / `hv_vm_destroy` (the known **HV_BUSY / leaked-vCPU** area — see
+project_go_osexec_mtfork). Key facts:
+- **Path-dependent, reliable per path**: `run-elf` (probe = MAIN guest process)
+  passes 12/12; `carrick run … /bin/sh -c <probe>` (probe = grandchild) DIFFs
+  5/5. So it's a fork from a previously-execve'd (nested) process that breaks.
+- **Heisenbug**: under `carrick trace` (sudo, perturbed timing) the same fork
+  SUCCEEDS — it can't be observed by tracing. Verify a fix by run-probe
+  flake-rate (forksleepfork via run-probe → MATCH 10/10), not by trace.
+- The block is signal-interruptible (the probe's `alarm(8)` fires, rc=142), so
+  it's a stuck-wait, not a total wedge; it does NOT hit the 5s VCPU_LIVE abort.
+- Manifests as a **hang** (forksleepfork; faulthandler+spawn → `_close_pipe_fds`)
+  OR an **EINVAL** from the child's execve (test_subprocess setUpModule:
+  `subprocess.run(['/usr/bin/true'])` → `OSError [Errno 22]`) — same race, two
+  symptoms. test_subprocess forks hundreds of times, so even a low flake rate
+  breaks it (n=1).
+- Reducer: `conformance-probes/src/bin/forksleepfork.rs` (in KNOWN_PROBE_GAPS;
+  reliably DIFFs in the gate's grandchild path).
+- Modules: **test_subprocess** (321), **test_base64** TestMain (5),
+  **test_struct** (1), **test_itertools** (1), **test_posixpath** test_import,
+  **test_os**/**test_io**/**test_hashlib**/**test_json** (hang/crash partway),
+  test_fcntl lockf. Leverage: enormous — `subprocess` underpins much of the suite.
 
 ### 3. lstat/fstat inode-identity → shutil.rmtree refuses
 `shutil.rmtree(dir)` raises "Cannot call rmtree on a symbolic link" because
