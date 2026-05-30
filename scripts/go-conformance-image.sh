@@ -16,6 +16,7 @@
 set -uo pipefail
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 carrick="$repo/target/release/carrick"
+[ -x "$carrick" ] || { echo "carrick not built/signed: $carrick — run ./scripts/build-signed.sh" >&2; exit 2; }
 IMG="${IMG:-localhost:5005/carrick-go-conformance:1.24}"
 RUN_TIMEOUT="${RUN_TIMEOUT:-120}"
 EXPOSED_CPUS="${EXPOSED_CPUS:-8}"
