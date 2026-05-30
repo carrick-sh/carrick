@@ -3429,7 +3429,12 @@ fn blocks_512(size: usize) -> i64 {
 }
 
 fn dirent64_record(entry: &RootFsDirEntry, next_offset: usize) -> Vec<u8> {
-    let name = entry.name.as_bytes();
+    // `entry.name` is in the VFS layer's reversible escape form; decode back to
+    // the opaque directory-entry BYTES so an undecodable filename round-trips
+    // through getdents (Linux d_name is raw bytes, not UTF-8). Valid-UTF-8
+    // names decode to themselves.
+    let name_bytes = crate::pathcodec::decode_to_bytes(&entry.name);
+    let name = name_bytes.as_slice();
     let record_len = align_to(LINUX_DIRENT64_HEADER_SIZE + name.len() + 1, 8);
     let header = LinuxDirent64Header {
         d_ino: inode_for_path(&entry.metadata.path),
@@ -3467,13 +3472,30 @@ fn inode_for_path(path: &Path) -> u64 {
     // (collapse ".", "..", and "//") before hashing so every spelling of one
     // path maps to one inode. `normalize` returns None for paths that escape
     // the root ("/.."); fall back to the raw bytes there so we never panic.
-    let normalized = crate::fs_backend::normalize(&path.to_string_lossy());
-    let key = normalized
+    // Hash the RAW path bytes so an undecodable filename gets a stable,
+    // distinct inode — to_string_lossy would collapse different undecodable
+    // spellings to the same U+FFFD soup. The path may arrive in EITHER form:
+    // the VFS layer's reversible escape (`&str`-derived, e.g. a synthetic
+    // stat) OR already-raw bytes (a `normalize`-decoded PathBuf from getdents).
+    // Canonicalise to raw bytes first so both spellings of one file agree.
+    use std::os::unix::ffi::OsStrExt;
+    let os_bytes = path.as_os_str().as_bytes();
+    let decoded_owned;
+    let canon_bytes: &[u8] = match std::str::from_utf8(os_bytes) {
+        Ok(s) if crate::pathcodec::has_escaped_bytes(s) => {
+            decoded_owned = crate::pathcodec::decode_to_bytes(s);
+            &decoded_owned
+        }
+        _ => os_bytes,
+    };
+    let normalized =
+        crate::fs_backend::normalize_raw(Path::new(std::ffi::OsStr::from_bytes(canon_bytes)));
+    let key_os = normalized
         .as_ref()
-        .map(|p| p.to_string_lossy())
-        .unwrap_or_else(|| path.to_string_lossy());
+        .map(|p| p.as_os_str().as_bytes())
+        .unwrap_or(canon_bytes);
     let mut hash = 0xcbf29ce484222325_u64;
-    for byte in key.as_bytes() {
+    for byte in key_os {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
@@ -3957,11 +3979,19 @@ fn read_guest_c_string_bytes(memory: &impl GuestMemory, address: u64) -> Result<
     Err(LINUX_ENAMETOOLONG)
 }
 
-/// As [`read_guest_c_string_bytes`], decoded to a Rust `String` for the paths
-/// carrick resolves against its String/Path-based fs layer. A genuinely
-/// non-UTF-8 PATH is rare; argv/env use the bytes form and never reach here.
+/// As [`read_guest_c_string_bytes`], carried into a Rust `String` for the paths
+/// carrick resolves against its String/Path-based fs layer. Linux paths are
+/// opaque BYTES; rather than reject a non-UTF-8 path with EINVAL, undecodable
+/// bytes are carried through the `&str` layer with a reversible escape
+/// (`crate::pathcodec`) — valid UTF-8 is byte-for-byte unchanged (fast path),
+/// and the escape is decoded back to the raw bytes at the guest-facing read-back
+/// boundaries (getdents/readlink/getcwd). The encoded form also doubles as the
+/// durable host representation, since APFS rejects a raw non-UTF-8 name (EILSEQ).
+/// argv/env use the bytes form and never reach here.
 fn read_guest_c_string(memory: &impl GuestMemory, address: u64) -> Result<String, i32> {
-    String::from_utf8(read_guest_c_string_bytes(memory, address)?).map_err(|_| LINUX_EINVAL)
+    Ok(crate::pathcodec::encode_bytes(&read_guest_c_string_bytes(
+        memory, address,
+    )?))
 }
 
 #[cfg(test)]
