@@ -152,6 +152,13 @@ pub(super) struct OpenDescriptionBase {
     recv_timeout: Option<Duration>,
     /// SO_SNDTIMEO: bounds a blocking send on this socket. None = block forever.
     send_timeout: Option<Duration>,
+    /// F_SETOWN/F_SETOWN_EX async-I/O owner (the SIGIO/SIGURG target). `owner_type`
+    /// is F_OWNER_TID/PID/PGRP; `owner_pid` is the positive id. (0, 0) = no owner.
+    /// Stored on the description so a dup'd fd shares it, matching the kernel.
+    owner_type: i32,
+    owner_pid: i32,
+    /// F_SETSIG: the signal delivered on async I/O (0 = the default SIGIO).
+    async_sig: i32,
 }
 
 impl OpenDescriptionBase {
@@ -161,11 +168,33 @@ impl OpenDescriptionBase {
             lease: crate::linux_abi::LINUX_F_UNLCK,
             recv_timeout: None,
             send_timeout: None,
+            owner_type: 0,
+            owner_pid: 0,
+            async_sig: 0,
         }
     }
 
     pub(super) fn status_flags(&self) -> u64 {
         self.status_flags
+    }
+
+    /// F_GETOWN_EX returns the (type, pid); (0, 0) means no owner set.
+    pub(super) fn owner(&self) -> (i32, i32) {
+        (self.owner_type, self.owner_pid)
+    }
+
+    pub(super) fn set_owner(&mut self, owner_type: i32, owner_pid: i32) {
+        self.owner_type = owner_type;
+        self.owner_pid = owner_pid;
+    }
+
+    /// F_GETSIG: 0 = the default SIGIO.
+    pub(super) fn async_sig(&self) -> i32 {
+        self.async_sig
+    }
+
+    pub(super) fn set_async_sig(&mut self, sig: i32) {
+        self.async_sig = sig;
     }
 
     pub(super) fn set_status_flags(&mut self, next: u64) {
@@ -587,6 +616,22 @@ impl OpenDescription {
 
     pub(super) fn set_lease(&mut self, lease: i32) {
         self.base_mut().set_lease(lease);
+    }
+
+    pub(super) fn owner(&self) -> (i32, i32) {
+        self.base().owner()
+    }
+
+    pub(super) fn set_owner(&mut self, owner_type: i32, owner_pid: i32) {
+        self.base_mut().set_owner(owner_type, owner_pid);
+    }
+
+    pub(super) fn async_sig(&self) -> i32 {
+        self.base().async_sig()
+    }
+
+    pub(super) fn set_async_sig(&mut self, sig: i32) {
+        self.base_mut().set_async_sig(sig);
     }
 
     /// SO_RCVTIMEO for this description. Only HostSocket carries one; every

@@ -2165,6 +2165,91 @@ impl SyscallDispatcher {
                     let lease = open_file.description.read().lease();
                     DispatchOutcome::Returned { value: lease as i64 }
                 }
+                // Async-I/O owner + signal (F_SETOWN/F_GETOWN, F_SETOWN_EX/
+                // F_GETOWN_EX, F_SETSIG/F_GETSIG). The owner (SIGIO/SIGURG target)
+                // and signal are recorded on the open-file description (shared
+                // across dup), giving the exact round-trip LTP fcntl31/32 read
+                // back. Actual SIGIO delivery on fd readiness is a tracked
+                // follow-up (carrick has no async-I/O readiness signal path yet).
+                LINUX_F_SETOWN => {
+                    let Some(open_file) = this.open_file(fd.0) else {
+                        return Ok(LINUX_EBADF.into());
+                    };
+                    // fcntl(2): a positive arg is a process id, a negative arg is
+                    // a process GROUP (-pgid).
+                    let a = arg as i32;
+                    let (owner_type, owner_pid) = if a < 0 {
+                        (LINUX_F_OWNER_PGRP, a.wrapping_neg())
+                    } else {
+                        (LINUX_F_OWNER_PID, a)
+                    };
+                    open_file.description.write().set_owner(owner_type, owner_pid);
+                    DispatchOutcome::Returned { value: 0 }
+                }
+                LINUX_F_GETOWN => {
+                    let Some(open_file) = this.open_file(fd.0) else {
+                        return Ok(LINUX_EBADF.into());
+                    };
+                    let (owner_type, owner_pid) = open_file.description.read().owner();
+                    // A process-group owner reads back as a negative id.
+                    let val = if owner_type == LINUX_F_OWNER_PGRP {
+                        -owner_pid
+                    } else {
+                        owner_pid
+                    };
+                    DispatchOutcome::Returned { value: val as i64 }
+                }
+                LINUX_F_SETOWN_EX => {
+                    let Some(open_file) = this.open_file(fd.0) else {
+                        return Ok(LINUX_EBADF.into());
+                    };
+                    let bytes = match cx.memory.read_bytes(arg, 8) {
+                        Ok(b) => b,
+                        Err(_) => return Ok(LINUX_EFAULT.into()),
+                    };
+                    let owner_type = i32::from_le_bytes(bytes[0..4].try_into().unwrap());
+                    let owner_pid = i32::from_le_bytes(bytes[4..8].try_into().unwrap());
+                    if owner_type != LINUX_F_OWNER_TID
+                        && owner_type != LINUX_F_OWNER_PID
+                        && owner_type != LINUX_F_OWNER_PGRP
+                    {
+                        return Ok(LINUX_EINVAL.into());
+                    }
+                    open_file.description.write().set_owner(owner_type, owner_pid);
+                    DispatchOutcome::Returned { value: 0 }
+                }
+                LINUX_F_GETOWN_EX => {
+                    let Some(open_file) = this.open_file(fd.0) else {
+                        return Ok(LINUX_EBADF.into());
+                    };
+                    let (owner_type, owner_pid) = open_file.description.read().owner();
+                    let mut buf = [0u8; 8];
+                    buf[0..4].copy_from_slice(&owner_type.to_le_bytes());
+                    buf[4..8].copy_from_slice(&owner_pid.to_le_bytes());
+                    if cx.memory.write_bytes(arg, &buf).is_err() {
+                        return Ok(LINUX_EFAULT.into());
+                    }
+                    DispatchOutcome::Returned { value: 0 }
+                }
+                LINUX_F_SETSIG => {
+                    let Some(open_file) = this.open_file(fd.0) else {
+                        return Ok(LINUX_EBADF.into());
+                    };
+                    // 0 = the default (SIGIO); otherwise a valid signal number.
+                    let sig = arg as i32;
+                    if !(0..=64).contains(&sig) {
+                        return Ok(LINUX_EINVAL.into());
+                    }
+                    open_file.description.write().set_async_sig(sig);
+                    DispatchOutcome::Returned { value: 0 }
+                }
+                LINUX_F_GETSIG => {
+                    let Some(open_file) = this.open_file(fd.0) else {
+                        return Ok(LINUX_EBADF.into());
+                    };
+                    let sig = open_file.description.read().async_sig();
+                    DispatchOutcome::Returned { value: sig as i64 }
+                }
                 _ => DispatchOutcome::errno(LINUX_EINVAL),
             })
 
