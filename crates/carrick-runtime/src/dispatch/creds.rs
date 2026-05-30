@@ -569,15 +569,24 @@ mod setid_tests {
     #[test]
     fn setres_unprivileged_restricts_to_current_ids() {
         // cur = (100, 100, 100). Unprivileged set to 200 → EPERM.
-        assert_eq!(setid::setres(false, (100, 100, 100), Some(200), None, None), Err(()));
+        assert_eq!(
+            setid::setres(false, (100, 100, 100), Some(200), None, None),
+            Err(())
+        );
         // To an id already held (100) → ok, no change.
-        assert_eq!(setid::setres(false, (100, 100, 100), Some(100), None, None), Ok((100, 100, 100)));
+        assert_eq!(
+            setid::setres(false, (100, 100, 100), Some(100), None, None),
+            Ok((100, 100, 100))
+        );
     }
 
     #[test]
     fn setres_privileged_sets_anything_and_keeps_minus_one() {
         // -1 (None) leaves a field unchanged; others set.
-        assert_eq!(setid::setres(true, (0, 0, 0), Some(5), None, Some(7)), Ok((5, 0, 7)));
+        assert_eq!(
+            setid::setres(true, (0, 0, 0), Some(5), None, Some(7)),
+            Ok((5, 0, 7))
+        );
     }
 
     // setreuid saved-id rule (the subtle part LTP setreuid02 pins down).
@@ -585,29 +594,44 @@ mod setid_tests {
     fn setre_saved_id_follows_when_real_changes() {
         // Privileged, cur (0,0,0). setreuid(ruid=5, euid=6): real changes →
         // saved becomes the new euid (6).
-        assert_eq!(setid::setre(true, (0, 0, 0), Some(5), Some(6)), Ok((5, 6, 6)));
+        assert_eq!(
+            setid::setre(true, (0, 0, 0), Some(5), Some(6)),
+            Ok((5, 6, 6))
+        );
     }
 
     #[test]
     fn setre_saved_id_follows_when_euid_differs_from_old_real() {
         // cur (10, 10, 10). setreuid(-1, euid=20): real unchanged but new euid
         // (20) != old real (10) → saved follows → (10, 20, 20).
-        assert_eq!(setid::setre(true, (10, 10, 10), None, Some(20)), Ok((10, 20, 20)));
+        assert_eq!(
+            setid::setre(true, (10, 10, 10), None, Some(20)),
+            Ok((10, 20, 20))
+        );
     }
 
     #[test]
     fn setre_saved_id_unchanged_when_euid_equals_old_real() {
         // cur (10, 99, 88). setreuid(-1, euid=10): euid set to OLD REAL (10),
         // real not given → saved stays 88.
-        assert_eq!(setid::setre(true, (10, 99, 88), None, Some(10)), Ok((10, 10, 88)));
+        assert_eq!(
+            setid::setre(true, (10, 99, 88), None, Some(10)),
+            Ok((10, 10, 88))
+        );
     }
 
     #[test]
     fn setre_unprivileged_rejects_foreign_real() {
         // cur (100, 100, 100). new real 200 ∉ {100,100} → EPERM.
-        assert_eq!(setid::setre(false, (100, 100, 100), Some(200), None), Err(()));
+        assert_eq!(
+            setid::setre(false, (100, 100, 100), Some(200), None),
+            Err(())
+        );
         // new euid may be the saved id even if unprivileged.
-        assert_eq!(setid::setre(false, (100, 100, 50), None, Some(50)), Ok((100, 50, 50)));
+        assert_eq!(
+            setid::setre(false, (100, 100, 50), None, Some(50)),
+            Ok((100, 50, 50))
+        );
     }
 
     // setuid: privileged sets all three; unprivileged only the effective id,

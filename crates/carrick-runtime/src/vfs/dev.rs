@@ -181,9 +181,16 @@ impl Vfs for DevVfs {
             if flags.nonblock {
                 oflag |= libc::O_NONBLOCK;
             }
-            let cpath = CString::new(slave_name).map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
+            let cpath =
+                CString::new(slave_name.clone()).map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
             // SAFETY: cpath is a valid NUL-terminated path to the host slave pty.
             let host_fd = unsafe { libc::open(cpath.as_ptr(), oflag) };
+            if std::env::var_os("CARRICK_TTY_DBG").is_some() {
+                let tt = unsafe { libc::isatty(host_fd) };
+                eprintln!(
+                    "[DEVTTYDBG] open(/dev/tty -> {slave_name}) host_fd={host_fd} isatty={tt} oflag=0x{oflag:x}"
+                );
+            }
             if host_fd < 0 {
                 return Err(host_open_errno());
             }

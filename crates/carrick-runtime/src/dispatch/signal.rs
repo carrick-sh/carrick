@@ -155,9 +155,7 @@ impl SyscallDispatcher {
                 // action is ignore (SIGCHLD/SIGURG/SIGWINCH). Every other
                 // SIG_DFL signal (terminate/core/stop) still interrupts.
                 None => is_default_ignore_signum(signum),
-                Some(h) if h == crate::linux_abi::LINUX_SIG_DFL => {
-                    is_default_ignore_signum(signum)
-                }
+                Some(h) if h == crate::linux_abi::LINUX_SIG_DFL => is_default_ignore_signum(signum),
                 // A real handler is installed → the signal interrupts (then
                 // SA_RESTART decides whether the syscall restarts).
                 Some(_) => false,
@@ -293,9 +291,7 @@ impl SyscallDispatcher {
     /// returns `mask` as the sigframe's saved mask and clears the arm.
     pub fn arm_restore_mask(&self, tid: crate::thread::ThreadId, mask: u64) {
         let mut signal = self.signal.lock();
-        signal
-            .restore_masks
-            .insert(tid, sanitize_signal_mask(mask));
+        signal.restore_masks.insert(tid, sanitize_signal_mask(mask));
     }
 
     /// Queue a caller-supplied `siginfo_t` for the next delivery of
@@ -309,10 +305,7 @@ impl SyscallDispatcher {
         info: LinuxSiginfo,
     ) {
         let mut signal = self.signal.lock();
-        let entry = signal
-            .pending_siginfos
-            .entry((tid, signum))
-            .or_default();
+        let entry = signal.pending_siginfos.entry((tid, signum)).or_default();
         if !is_rt_signal(signum) {
             entry.clear();
         }
@@ -1107,10 +1100,11 @@ pub(crate) fn bootstrap_signal_send_as(
     // return EPERM. If we can't read either cred (peer is non-carrick or
     // hasn't published yet) we fall through to allow — matching today's
     // behaviour for processes outside the published set.
-    if let (Some(caller), Some(target_euid)) = (
-        caller_euid,
-        crate::cred_ipc::read_target(target as i32),
-    ) && caller != 0 && caller != target_euid {
+    if let (Some(caller), Some(target_euid)) =
+        (caller_euid, crate::cred_ipc::read_target(target as i32))
+        && caller != 0
+        && caller != target_euid
+    {
         return DispatchOutcome::errno(LINUX_EPERM);
     }
     // Cross-process kill: target is some other host pid. After clone(),

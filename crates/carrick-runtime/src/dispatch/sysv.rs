@@ -88,15 +88,15 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 #[repr(C, packed)]
 #[derive(Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned, Default)]
 pub(super) struct LinuxIpcPerm {
-    pub key: i32,      // @0
-    pub uid: u32,      // @4
-    pub gid: u32,      // @8
-    pub cuid: u32,     // @12
-    pub cgid: u32,     // @16
-    pub mode: u32,     // @20
-    pub seq: u16,      // @24
-    pub __pad2: u16,   // @26
-    pub __pad3: u32,   // @28 — aligns __unused1 to 8
+    pub key: i32,       // @0
+    pub uid: u32,       // @4
+    pub gid: u32,       // @8
+    pub cuid: u32,      // @12
+    pub cgid: u32,      // @16
+    pub mode: u32,      // @20
+    pub seq: u16,       // @24
+    pub __pad2: u16,    // @26
+    pub __pad3: u32,    // @28 — aligns __unused1 to 8
     pub __unused1: u64, // @32
     pub __unused2: u64, // @40 → end @48
 }
@@ -848,7 +848,8 @@ fn sysv_semop<M: GuestMemory>(
         return Ok(DispatchOutcome::errno(LINUX_EINVAL));
     };
     let total_ns = (ts.tv_sec.max(0) as u128) * 1_000_000_000 + ts.tv_nsec.max(0) as u128;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_nanos(total_ns.min(u64::MAX as u128) as u64);
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_nanos(total_ns.min(u64::MAX as u128) as u64);
     let mut nowait = sops.clone();
     for s in &mut nowait {
         s.sem_flg |= LINUX_SEM_IPC_NOWAIT;
