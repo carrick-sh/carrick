@@ -1911,15 +1911,64 @@ impl SyscallDispatcher {
                     let Some(open_file) = this.open_file(fd.0) else {
                         return Ok(LINUX_EBADF.into());
                     };
-                    match &*open_file.description.read() {
+                    let open = open_file.description.read();
+                    match &*open {
                         OpenDescription::PipeReader { .. }
                         | OpenDescription::PipeWriter { .. }
                         | OpenDescription::HostPipe { .. } => DispatchOutcome::Returned {
-                            value: LINUX_PIPE_BUF_SIZE,
+                            // The per-description capacity, set by a prior
+                            // F_SETPIPE_SZ or the default pipe buffer size.
+                            value: open.pipe_capacity(),
                         },
                         OpenDescription::HostSocket { .. } => DispatchOutcome::errno(LINUX_EBADF),
                         _ => DispatchOutcome::errno(LINUX_EBADF),
                     }
+                }
+                LINUX_F_SETPIPE_SZ => {
+                    let Some(open_file) = this.open_file(fd.0) else {
+                        return Ok(LINUX_EBADF.into());
+                    };
+                    // Only pipe ends have a capacity; everything else is EBADF
+                    // (Linux: F_SETPIPE_SZ on a non-pipe fd is EBADF, mirroring
+                    // F_GETPIPE_SZ above).
+                    let is_pipe = matches!(
+                        &*open_file.description.read(),
+                        OpenDescription::PipeReader { .. }
+                            | OpenDescription::PipeWriter { .. }
+                            | OpenDescription::HostPipe { .. }
+                    );
+                    if !is_pipe {
+                        return Ok(LINUX_EBADF.into());
+                    }
+                    // Linux rounds the requested size up to a whole number of
+                    // pages, enforces a one-page minimum, and clamps to the
+                    // /proc/sys/fs/pipe-max-size ceiling (default 1 MiB). The
+                    // rounded value is what a subsequent F_GETPIPE_SZ returns.
+                    // (arg as i64 then to u64 for the rounding math; a negative
+                    // request is huge-unsigned and clamps to the max.)
+                    const PIPE_MAX_SIZE: u64 = 1 << 20; // 1 MiB, Linux default
+                    let page = LINUX_PAGE_SIZE;
+                    let requested = arg.max(1);
+                    let rounded = requested.div_ceil(page).saturating_mul(page);
+                    let capacity = rounded.clamp(page, PIPE_MAX_SIZE) as i64;
+                    open_file.description.write().set_pipe_capacity(capacity);
+                    // macOS pipes expose no portable buffer-resize API, so this
+                    // is bookkeeping only — but F_GETPIPE_SZ now reports it back
+                    // exactly, which is the observable contract the guest checks.
+                    DispatchOutcome::Returned { value: capacity }
+                }
+                // Directory-change notification (dnotify). macOS has no dnotify
+                // equivalent (and modern Linux apps prefer inotify, which carrick
+                // backs with kqueue EVFILT_VNODE). The guest contract a caller
+                // relies on here is only that the fcntl does not fail: on aarch64
+                // Linux this SUCCEEDS (the EINVAL skip is 32-bit-arm-only). Accept
+                // it as a no-op returning 0 — we don't actually arm an SIGIO
+                // notification, but no observable behaviour depends on that today.
+                LINUX_F_NOTIFY => {
+                    if !this.fd_is_valid(fd.0) {
+                        return Ok(LINUX_EBADF.into());
+                    }
+                    DispatchOutcome::Returned { value: 0 }
                 }
                 LINUX_F_GETFD => {
                     if let Some(open_file) = this.open_file(fd.0) {
