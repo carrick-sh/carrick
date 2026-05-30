@@ -1444,6 +1444,105 @@ fn sendfile_without_offset_pointer_advances_file_offset_and_writes_pipe() {
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
+/// Regression: `sendfile(out, in, NULL, n)` on a HOST-backed (`HostFile`) input
+/// must advance the file's offset across calls. `sendfile_bytes` reads a
+/// HostFile via `pread`, which does NOT move the kernel offset, so without the
+/// explicit `lseek` advance every call re-sent byte 0 — busybox `cat`, which
+/// copies a file with exactly this loop, spun forever re-printing the first
+/// chunk. The in-memory `File` variant (covered above) was unaffected; this
+/// pins the `HostFile` arm specifically.
+#[test]
+fn sendfile_null_offset_advances_host_backed_file_across_calls() {
+    let scratch = tempfile::TempDir::new().unwrap();
+    std::fs::write(scratch.path().join("data"), b"ABCDEFGH").unwrap();
+    let dir =
+        cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority()).unwrap();
+    let backend = HostFsBackend::from_existing_dir(dir);
+
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.set_fs_backend(Box::new(backend));
+    let reporter = CompatReporter::default();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x600]);
+    memory.write_bytes(0x4000, b"/data\0").unwrap();
+
+    // openat(AT_FDCWD, "/data", O_RDONLY) → first free fd (3); a HostFile.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    56,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0])
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 3 }
+    );
+    // pipe2(O_NONBLOCK) so the reader never blocks between sendfiles.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    59,
+                    SyscallArgs::from([0x4100, LINUX_O_NONBLOCK, 0, 0, 0, 0])
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let pair = read_fd_pair(&memory, 0x4100);
+
+    // Two NULL-offset sendfiles of 4 bytes each must yield the FIRST then the
+    // SECOND half — proving the offset advanced rather than re-reading "ABCD".
+    let mut sendfile_then_read = |expect: &[u8]| {
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    SyscallRequest::new(
+                        71,
+                        SyscallArgs::from([pair.write_fd as u64, 3, 0, 4, 0, 0]),
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: 4 }
+        );
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    SyscallRequest::new(
+                        63,
+                        SyscallArgs::from([pair.read_fd as u64, 0x4200, 4, 0, 0, 0])
+                    ),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::Returned { value: 4 }
+        );
+        assert_eq!(memory.read_bytes(0x4200, 4).unwrap(), expect);
+    };
+    sendfile_then_read(b"ABCD");
+    sendfile_then_read(b"EFGH"); // pre-fix this re-read "ABCD" (offset stuck at 0)
+
+    // A third sendfile is at EOF → 0 bytes (terminates the copy loop).
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(71, SyscallArgs::from([pair.write_fd as u64, 3, 0, 4, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
 #[test]
 fn splice_moves_bytes_between_rootfs_files_pipes_and_stdout() {
     let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
