@@ -125,16 +125,13 @@ pub unsafe extern "C" fn __kernel_getrandom(
         return sys_getrandom(buffer, len, flags);
     }
 
-    // SECURITY GATE — the userspace ChaCha fast path (getrandom_fill) is fully
-    // implemented and KAT/property-verified (incl. fork-no-reuse) IN ISOLATION,
-    // but is kept OFF until carrick's post-fork vvar generation write becomes
-    // coherent. The gendbg diagnostic proved a forked child currently reads the
-    // PARENT's generation (the child's host-side re-stamp doesn't reach the
-    // child's guest read — arm64 HVF has no stage-2 TLB shootdown), so a child
-    // would reuse the parent's keystream. Until that's fixed, GENERATE always
-    // syscalls — always-fresh, fork-safe (same guarantee as P1, via the blob).
-    // conformance-probes/getrandomvdsofork gates flipping this on.
-    const FAST_PATH: bool = false;
+    // Userspace ChaCha fast path. carrick stamps a per-process generation (host
+    // PID) into the vvar — in populate_vdso_data_page AND, critically, in the
+    // fork-child branch of HvfTrapEngine::fork (so a forked child reads its OWN
+    // generation, not the parent's COW-inherited one) — which makes getrandom_fill
+    // reseed on fork instead of reusing the parent's keystream. Verified
+    // fork-safe by conformance-probes/getrandomvdsofork (child_reused=false).
+    const FAST_PATH: bool = true;
     if FAST_PATH {
         let state = &mut *(opaque_state as *mut [u8; 144]);
         let buf = core::slice::from_raw_parts_mut(buffer, len);

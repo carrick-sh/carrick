@@ -2319,12 +2319,6 @@ impl HvfInner {
         std::mem::forget(std::mem::replace(&mut self.vcpu, new_vcpu));
         std::mem::forget(std::mem::replace(&mut self._vm, new_vm));
         self.restore_vcpu(&snap)?;
-        // SECURITY (P2 getrandom): re-stamp the vvar RNG generation with this
-        // child's (new) host PID. The opaque getrandom state page is COW-copied
-        // from the parent with the parent's generation snapshot; stamping the
-        // child's distinct PID guarantees a mismatch, so the child reseeds
-        // instead of reproducing the parent's keystream.
-        self.stamp_rng_generation();
         Ok(())
     }
 
@@ -2907,6 +2901,14 @@ impl HvfInner {
         self.restore_vcpu(&snapshot)?;
         crate::probes::fork_post(pid, snapshot.pc, snapshot.elr_el1);
         if pid == 0 {
+            // P2 getrandom fork-safety: re-stamp the vvar RNG generation with the
+            // child's new PID. `self` is now the child's rebuilt engine — its vvar
+            // mapping points at the child's freshly re-mapped snapshot buffer, and
+            // the vCPU was just recreated (clean stage-2 TLB) — so this write IS
+            // visible to the child's guest reads. The child's distinct generation
+            // forces the userspace getrandom blob to reseed instead of reusing the
+            // parent's keystream (gated by conformance-probes/getrandomvdsofork).
+            self.stamp_rng_generation();
             Ok(ForkOutcome::Child)
         } else {
             Ok(ForkOutcome::Parent { child_pid: pid })

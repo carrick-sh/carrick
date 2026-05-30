@@ -68,7 +68,7 @@ query mode to work — garbage here → wrong-sized/flagged state page.
 
 Full research (per-agent ABI/embed/synthesis): workflow run `wf_c485321a-1cb`.
 
-## P2 status (2026-05-30): implemented + verified, fast path GATED OFF
+## P2 status (2026-05-30): COMPLETE — fast path LIVE + fork-safe
 
 P2 is built end-to-end and the Rust-ecosystem embed works:
 - `vdso_getrandom_chacha.rs` — ChaCha20 (RFC 8439 KAT) + getrandom_fill reseed/
@@ -79,18 +79,23 @@ P2 is built end-to-end and the Rust-ecosystem embed works:
 - `MAP_DROPPABLE` (0x8) accepted in mem.rs (default PRIVATE); getrandomvdso probe
   MATCHes the oracle (query 144/3/0x28, generate 32).
 
-**BLOCKER — the userspace fast path (`FAST_PATH` in the blob) is OFF.** It needs
-a per-process generation in the vvar that a forked child re-reads; carrick stamps
-the host PID (populate_vdso_data_page + the re-stamp in rebuild_vcpu_after_fork),
-BUT the `gendbg` diagnostic proved a forked child still reads the PARENT's
-generation: the child's host-side write to its (COW) vvar is invisible to the
-child's guest read — arm64 HVF has no stage-2 TLB shootdown (see
-[[project_shared_file_coherence]]). So a child would REUSE the parent's keystream.
-Until that coherence is fixed, GENERATE always syscalls (always-fresh, fork-safe);
-`conformance-probes/getrandomvdsofork` (child_reused must be false on both sides)
-gates flipping FAST_PATH on.
+**RESOLVED — the userspace fast path (`FAST_PATH=true`) is LIVE, correct, fast,
+and fork-safe.** Fork-safety = a per-process generation (host PID) in the vvar
+that a forked child re-reads; getrandom_fill reseeds when it changes.
 
-Fix direction: make the child's vvar generation write reach its guest read — e.g.
-stamp during the child's region re-map in `fork()` (where child_descs hold the
-host buffer the guest actually reads), or recreate-the-vCPU-for-fresh-TLB after
-the stamp (the only coherence approach not ruled out in shared_file_coherence).
+The fix was a code-path bug, NOT the deep coherence issue first feared. The stamp
+originally lived in `rebuild_vcpu_after_fork`, only reached from
+`release_and_park_vcpu_for_fork` — the multi-threaded sibling-PARKING path (in
+the parent), NOT the fork-child path. A single-threaded `carrick run` fork goes
+`handle_fork → HvfTrapEngine::fork`, which forks + recreates the child vCPU +
+re-maps the child's snapshot buffers + restore_vcpu inline, so the stamp never
+ran for the child (gendbg proved it read the boot generation). FIX: stamp in
+`HvfTrapEngine::fork`'s `pid == 0` branch, after the child re-maps its snapshot
+buffers and the fresh vCPU is restored — the write lands in the exact buffer the
+child's clean-TLB vCPU reads. (No stage-2 shootdown needed: the child vCPU is
+freshly created with a clean TLB and the stamp precedes its first run.)
+
+Verification (all pass): getrandomvdso MATCHes the oracle; getrandomvdsofork →
+child_reused=false both sides with FAST_PATH on (security gate); 5 fork probes
+regression-clean; `carrick trace` shows **1** getrandom(2) syscall for a 200-call
+getrandom() loop (getrandomvdsoloop) — the userspace ChaCha serves the other 199.
