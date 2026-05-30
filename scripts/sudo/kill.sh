@@ -3,24 +3,33 @@
 # "carrick:[<run-id>] <name>" (proctitle.rs), so `pkill -f "carrick run"` misses
 # them and wedged HVF vCPUs can need a couple of SIGKILL passes.
 #
-# SCOPED reap (preferred): pass a run id as $1 and ONLY processes whose title
-# contains "carrick:<run-id>" are killed. This lets concurrent carrick lanes /
-# worktrees clean up without reaping each other (the hazard that forced the
-# conformance gate and the LTP sweeps to run serially). carrick stamps the run
-# id into the title from $CARRICK_RUN_ID, inherited across guest forks.
+# A RUN-ID IS REQUIRED ($1). Only processes whose title contains
+# "carrick:<run-id>" are killed, so concurrent carrick lanes / worktrees /
+# workflow sub-agents clean up WITHOUT reaping each other (the hazard that
+# forced the conformance gate and the LTP sweeps to run serially, and that
+# silently breaks parallel runs — an unscoped reap mid-run looks like an
+# unrelated flake). carrick stamps the run id into the title from
+# $CARRICK_RUN_ID, inherited across guest forks. ALWAYS pass a run id.
 #
-# GLOBAL reap (no arg): the legacy sledgehammer — every renamed guest
-# ("carrick:") AND wedged `carrick trace` front-ends (comm stays "carrick").
-# Reserve this for manual recovery, NOT for per-run cleanup.
+#   kill.sh <run-id>   scoped reap (the ONLY per-run cleanup form)
+#   kill.sh --all      explicit GLOBAL sledgehammer (every renamed guest +
+#                      wedged `carrick trace` front-ends). MANUAL RECOVERY ONLY
+#                      — never in per-run cleanup or while sibling lanes run.
 #
 # `!/awk/` keeps the pipeline from matching its own argv (which embeds the
 # pattern); the carrick-binary path in this script's argv lacks the ":" token.
 
 run_id="${1:-}"
-if [ -n "$run_id" ]; then
-    pat="carrick:$run_id"
-else
+if [ -z "$run_id" ]; then
+    echo "kill.sh: a run-id is REQUIRED (kills must not spread across concurrent" >&2
+    echo "  lanes/worktrees/agents). Usage: kill.sh <run-id>   |   kill.sh --all (manual only)." >&2
+    echo "  The run-id is \$CARRICK_RUN_ID, stamped into the 'carrick:<run-id>' guest title." >&2
+    exit 2
+fi
+if [ "$run_id" = "--all" ]; then
     pat="carrick:|release/carrick trace"
+else
+    pat="carrick:$run_id"
 fi
 
 for pass in 1 2 3; do

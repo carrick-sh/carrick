@@ -52,6 +52,12 @@ CARRICK_TIMEOUT = int(os.environ.get("LTP_CARRICK_TIMEOUT", "45"))
 DOCKER_TIMEOUT = int(os.environ.get("LTP_DOCKER_TIMEOUT", "60"))
 
 os.environ.setdefault("CARRICK_INSECURE_REGISTRIES", "localhost:5050")
+# Stamp a unique run-id into every guest's "carrick:<run-id>" title (inherited by
+# all carrick subprocesses via the environment) so sweep_guests reaps ONLY this
+# run's guests — never a concurrent lane/worktree/agent's (kill.sh now REQUIRES
+# a run-id; an unscoped reap silently wedges sibling runs).
+RUN_ID = os.environ.get("CARRICK_RUN_ID") or f"ltpbase-{os.getpid()}"
+os.environ["CARRICK_RUN_ID"] = RUN_ID
 
 
 def parse_verdict(text):
@@ -72,7 +78,7 @@ def parse_verdict(text):
 
 def sweep_guests():
     try:
-        subprocess.run(["sudo", "-n", KILL], stdout=subprocess.DEVNULL,
+        subprocess.run(["sudo", "-n", KILL, RUN_ID], stdout=subprocess.DEVNULL,
                        stderr=subprocess.DEVNULL, timeout=20)
     except Exception:
         pass

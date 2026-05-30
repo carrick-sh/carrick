@@ -71,10 +71,14 @@ Use the bundled scripts (durable; the verdict logic is the subtle part):
 
 Each test runs under Docker (the oracle) and under
 `carrick run … --raw --fs host /bin/sh -c /opt/ltp/testcases/bin/<t>`, with a
-`timeout` and a `scripts/sudo/kill.sh` between runs (carrick guests rename argv0
-to `carrick:` so a plain `pkill` misses wedged vCPUs — a hung guest holding the
-stdout pipe will otherwise hang the whole sweep; capture carrick stdout to a
-FILE, never a pipe, and force-kill guests before+after each run).
+`timeout` and a `scripts/sudo/kill.sh "$CARRICK_RUN_ID"` between runs — ALWAYS
+SCOPED to this run's id (the bundled scripts export a unique `CARRICK_RUN_ID`;
+`kill.sh` now REQUIRES a run-id and refuses the global reap, so concurrent
+lanes/worktrees/agents never reap each other — an unscoped kill mid-run looks
+like an unrelated flake). carrick guests rename argv0 to `carrick:<run-id>` so a
+plain `pkill` misses wedged vCPUs; a hung guest holding the stdout pipe will
+otherwise hang the whole sweep — capture carrick stdout to a FILE, never a pipe,
+and scoped-force-kill guests before+after each run.
 
 ## Reading results honestly (this is where false wins hide)
 
