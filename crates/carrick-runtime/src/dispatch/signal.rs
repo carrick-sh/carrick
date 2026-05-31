@@ -279,7 +279,17 @@ impl SyscallDispatcher {
             .restore_masks
             .remove(&tid)
             .unwrap_or_else(|| signal.mask_for(tid));
-        let delivered = sigmask_bit(signum).unwrap_or(0);
+        // SA_NODEFER: leave the signal being delivered UNblocked during its own
+        // handler (the kernel default is to block it, preventing re-entry). With
+        // it unblocked, a signal re-raised from inside the handler is delivered
+        // synchronously to whatever handler is installed AT THAT MOMENT — which
+        // is exactly how CPython faulthandler's `chain=True` re-raise reaches the
+        // restored previous handler instead of re-entering faulthandler forever.
+        let delivered = if action.sa_flags & crate::linux_abi::LINUX_SA_NODEFER != 0 {
+            0
+        } else {
+            sigmask_bit(signum).unwrap_or(0)
+        };
         let current = signal.mask_for(tid);
         let handler_mask = sanitize_signal_mask(current | delivered | action.sa_mask[0]);
         signal.masks.insert(tid, handler_mask);

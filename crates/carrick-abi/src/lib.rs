@@ -123,6 +123,18 @@ pub const LINUX_SA_ONSTACK: u64 = 0x0800_0000;
 /// nearly the whole suite.
 pub const LINUX_SA_RESTART: u64 = 0x1000_0000;
 
+/// `SA_NODEFER`: do NOT automatically block the signal being delivered while its
+/// own handler runs (the default is to block it, so a handler can't re-enter
+/// itself). With this set the handler can be re-entered by the same signal.
+/// CPython's `faulthandler` registers its user-signal handler with SA_NODEFER
+/// and, on `chain=True`, restores the previously-installed handler and re-raises
+/// the signal so that handler runs too — that re-raise must reach the restored
+/// handler synchronously, which only works if the signal is left unblocked.
+pub const LINUX_SA_NODEFER: u64 = 0x4000_0000;
+
+/// `SA_RESETHAND`: reset the handler to `SIG_DFL` on entry (one-shot handler).
+pub const LINUX_SA_RESETHAND: u64 = 0x8000_0000;
+
 pub const LINUX_DIRENT64_HEADER_SIZE: usize = core::mem::size_of::<LinuxDirent64Header>();
 
 #[repr(C, packed)]

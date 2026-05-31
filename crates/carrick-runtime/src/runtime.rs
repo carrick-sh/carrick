@@ -2036,7 +2036,11 @@ fn run_vcpu_until_exit(
                     continue;
                 }
                 Err(TrapError::EL0Fault {
-                    syndrome, elr, far, ..
+                    syndrome,
+                    elr,
+                    far,
+                    from_el0_direct,
+                    ..
                 }) => {
                     // A synchronous guest EL0 fault (nil deref, bad access). Deliver
                     // it to the guest as SIGSEGV/SIGBUS (Linux semantics) so its
@@ -2048,6 +2052,7 @@ fn run_vcpu_until_exit(
                         syndrome,
                         elr,
                         far,
+                        from_el0_direct,
                         traps,
                     )? {
                         return Ok(outcome);
