@@ -68,7 +68,116 @@ fn open_watch_fd(host: &Path) -> Result<i32, VfsError> {
     Ok(host_fd)
 }
 
-fn metadata_from_host(meta: std::fs::Metadata) -> Metadata {
+fn read_u32_xattr(host: &Path, name: &str, nofollow: bool) -> Option<u32> {
+    let cpath = CString::new(host.as_os_str().as_bytes()).ok()?;
+    let cname = CString::new(name).ok()?;
+    let mut value = [0u8; 4];
+    #[cfg(target_os = "macos")]
+    let n = unsafe {
+        libc::getxattr(
+            cpath.as_ptr(),
+            cname.as_ptr(),
+            value.as_mut_ptr() as *mut libc::c_void,
+            value.len(),
+            0,
+            if nofollow { libc::XATTR_NOFOLLOW } else { 0 },
+        )
+    };
+    #[cfg(not(target_os = "macos"))]
+    let n = unsafe {
+        if nofollow {
+            libc::lgetxattr(
+                cpath.as_ptr(),
+                cname.as_ptr(),
+                value.as_mut_ptr() as *mut libc::c_void,
+                value.len(),
+            )
+        } else {
+            libc::getxattr(
+                cpath.as_ptr(),
+                cname.as_ptr(),
+                value.as_mut_ptr() as *mut libc::c_void,
+                value.len(),
+            )
+        }
+    };
+    (n == 4).then(|| u32::from_le_bytes(value))
+}
+
+fn write_u32_xattr(host: &Path, name: &str, value: u32, nofollow: bool) -> Result<(), VfsError> {
+    let cpath = CString::new(host.as_os_str().as_bytes()).map_err(|_| LINUX_EINVAL)?;
+    let cname = CString::new(name).map_err(|_| LINUX_EINVAL)?;
+    let value = value.to_le_bytes();
+    #[cfg(target_os = "macos")]
+    let rc = unsafe {
+        libc::setxattr(
+            cpath.as_ptr(),
+            cname.as_ptr(),
+            value.as_ptr() as *const libc::c_void,
+            value.len(),
+            0,
+            if nofollow { libc::XATTR_NOFOLLOW } else { 0 },
+        )
+    };
+    #[cfg(not(target_os = "macos"))]
+    let rc = unsafe {
+        if nofollow {
+            libc::lsetxattr(
+                cpath.as_ptr(),
+                cname.as_ptr(),
+                value.as_ptr() as *const libc::c_void,
+                value.len(),
+                0,
+            )
+        } else {
+            libc::setxattr(
+                cpath.as_ptr(),
+                cname.as_ptr(),
+                value.as_ptr() as *const libc::c_void,
+                value.len(),
+                0,
+            )
+        }
+    };
+    if rc < 0 {
+        return Err(host_open_errno());
+    }
+    Ok(())
+}
+
+fn owner_from_host_xattrs(host: &Path, nofollow: bool) -> (Option<u32>, Option<u32>) {
+    (
+        read_u32_xattr(host, crate::fs_backend::CARRICK_UID_XATTR_NAME, nofollow),
+        read_u32_xattr(host, crate::fs_backend::CARRICK_GID_XATTR_NAME, nofollow),
+    )
+}
+
+fn write_owner_xattrs(
+    host: &Path,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    nofollow: bool,
+) -> Result<(), VfsError> {
+    if let Some(uid) = uid {
+        write_u32_xattr(
+            host,
+            crate::fs_backend::CARRICK_UID_XATTR_NAME,
+            uid,
+            nofollow,
+        )?;
+    }
+    if let Some(gid) = gid {
+        write_u32_xattr(
+            host,
+            crate::fs_backend::CARRICK_GID_XATTR_NAME,
+            gid,
+            nofollow,
+        )?;
+    }
+    Ok(())
+}
+
+fn metadata_from_host(host: &Path, meta: std::fs::Metadata, nofollow: bool) -> Metadata {
     let kind = if meta.is_dir() {
         EntryKind::Directory
     } else if meta.is_symlink() {
@@ -76,30 +185,36 @@ fn metadata_from_host(meta: std::fs::Metadata) -> Metadata {
     } else {
         EntryKind::File
     };
+    let (uid, gid) = owner_from_host_xattrs(host, nofollow);
     Metadata {
         kind,
         mode: meta.mode() & 0o7777,
         size: meta.len(),
-        uid: meta.uid(),
-        gid: meta.gid(),
+        uid: uid.unwrap_or(meta.uid()),
+        gid: gid.unwrap_or(meta.gid()),
         mtime_secs: meta.mtime(),
         mtime_nanos: meta.mtime_nsec() as u32,
     }
 }
 
-fn real_stat_from_host(st: &libc::stat) -> crate::fs_backend::RealStat {
+fn real_stat_from_host(
+    host: &Path,
+    st: &libc::stat,
+    nofollow: bool,
+) -> crate::fs_backend::RealStat {
     let kind = match st.st_mode & libc::S_IFMT {
         mode if mode == libc::S_IFDIR => crate::rootfs::RootFsEntryKind::Directory,
         mode if mode == libc::S_IFLNK => crate::rootfs::RootFsEntryKind::Symlink,
         _ => crate::rootfs::RootFsEntryKind::File,
     };
+    let (uid, gid) = owner_from_host_xattrs(host, nofollow);
     crate::fs_backend::RealStat {
         kind,
         ino: st.st_ino,
         nlink: st.st_nlink as u32,
         mode: st.st_mode as u32 & 0o7777,
-        uid: st.st_uid,
-        gid: st.st_gid,
+        uid: uid.unwrap_or(st.st_uid),
+        gid: gid.unwrap_or(st.st_gid),
         size: st.st_size.max(0) as u64,
         atime: (st.st_atime, st.st_atime_nsec),
         mtime: (st.st_mtime, st.st_mtime_nsec),
@@ -111,14 +226,14 @@ impl Vfs for BindVfs {
     fn lookup(&self, path: &str) -> Result<Metadata, VfsError> {
         let host = self.to_host(path)?;
         std::fs::metadata(&host)
-            .map(metadata_from_host)
+            .map(|meta| metadata_from_host(&host, meta, false))
             .map_err(map_io_error)
     }
 
     fn lookup_nofollow(&self, path: &str) -> Result<Metadata, VfsError> {
         let host = self.to_host(path)?;
         std::fs::symlink_metadata(&host)
-            .map(metadata_from_host)
+            .map(|meta| metadata_from_host(&host, meta, true))
             .map_err(map_io_error)
     }
 
@@ -133,7 +248,7 @@ impl Vfs for BindVfs {
                 libc::lstat(cpath.as_ptr(), &mut st)
             }
         };
-        (rc == 0).then(|| real_stat_from_host(&st))
+        (rc == 0).then(|| real_stat_from_host(&host, &st, !follow))
     }
 
     fn readlink(&self, path: &str) -> Result<PathBuf, VfsError> {
@@ -337,24 +452,15 @@ impl Vfs for BindVfs {
             return Err(LINUX_EROFS);
         }
         let host = self.to_host(path)?;
-        let cpath = CString::new(host.as_os_str().as_bytes()).map_err(|_| LINUX_EINVAL)?;
-        let uid = uid
-            .map(|uid| uid as libc::uid_t)
-            .unwrap_or(u32::MAX as libc::uid_t);
-        let gid = gid
-            .map(|gid| gid as libc::gid_t)
-            .unwrap_or(u32::MAX as libc::gid_t);
-        let rc = unsafe {
-            if nofollow {
-                libc::lchown(cpath.as_ptr(), uid, gid)
-            } else {
-                libc::chown(cpath.as_ptr(), uid, gid)
-            }
+        let exists = if nofollow {
+            std::fs::symlink_metadata(&host)
+        } else {
+            std::fs::metadata(&host)
         };
-        if rc < 0 {
-            return Err(host_open_errno());
+        if let Err(err) = exists {
+            return Err(map_io_error(err));
         }
-        Ok(())
+        write_owner_xattrs(&host, uid, gid, nofollow)
     }
 
     fn set_times(
