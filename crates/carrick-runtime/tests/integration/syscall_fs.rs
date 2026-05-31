@@ -4543,6 +4543,193 @@ fn linkat_and_unlinkat_under_bind_mount_use_host_tree() {
 }
 
 #[test]
+fn chmod_and_fchmod_under_bind_mount_update_host_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let scratch = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(scratch.path().join("nodejs-bindchmod")).unwrap();
+    let host_file = scratch.path().join("nodejs-bindchmod/file.txt");
+    std::fs::write(&host_file, b"chmod payload").unwrap();
+    std::fs::set_permissions(&host_file, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
+    memory
+        .write_bytes(0x4000, b"/tmp/nodejs-bindchmod/file.txt\0")
+        .unwrap();
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.register_mount(
+        std::path::PathBuf::from("/tmp"),
+        Box::new(BindVfs::new("/tmp", scratch.path().to_path_buf(), false)),
+    );
+    let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
+        d.dispatch(
+            SyscallRequest::new(nr, SyscallArgs::from(args)),
+            m,
+            &reporter,
+        )
+        .unwrap()
+    };
+
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            53,
+            [LINUX_AT_FDCWD, 0x4000, 0o600, 0, 0, 0],
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        std::fs::metadata(&host_file).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            79,
+            [LINUX_AT_FDCWD, 0x4000, 0x4100, 0, 0, 0],
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let stat = read_stat(&memory, 0x4100);
+    assert_eq!(stat.st_mode & 0o777, 0o600);
+
+    let fd = match run(
+        &mut dispatcher,
+        &mut memory,
+        56,
+        [LINUX_AT_FDCWD, 0x4000, LINUX_O_RDWR, 0, 0, 0],
+    ) {
+        DispatchOutcome::Returned { value } => value as u64,
+        other => panic!("openat bind file: {other:?}"),
+    };
+    assert_eq!(
+        run(&mut dispatcher, &mut memory, 52, [fd, 0o640, 0, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        std::fs::metadata(&host_file).unwrap().permissions().mode() & 0o777,
+        0o640
+    );
+    assert_eq!(
+        run(&mut dispatcher, &mut memory, 80, [fd, 0x4200, 0, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let stat = read_stat(&memory, 0x4200);
+    assert_eq!(stat.st_mode & 0o777, 0o640);
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn utimensat_under_bind_mount_updates_host_times() {
+    use std::os::unix::fs::MetadataExt;
+
+    let scratch = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(scratch.path().join("nodejs-bindutime")).unwrap();
+    let host_file = scratch.path().join("nodejs-bindutime/file.txt");
+    std::fs::write(&host_file, b"utime payload").unwrap();
+
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x600]);
+    memory
+        .write_bytes(0x4000, b"/tmp/nodejs-bindutime/file.txt\0")
+        .unwrap();
+    let times = 0x4100;
+    write_linux_timespec(&mut memory, times, 123, 456);
+    write_linux_timespec(&mut memory, times + 16, 789, 12);
+
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.register_mount(
+        std::path::PathBuf::from("/tmp"),
+        Box::new(BindVfs::new("/tmp", scratch.path().to_path_buf(), false)),
+    );
+    let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
+        d.dispatch(
+            SyscallRequest::new(nr, SyscallArgs::from(args)),
+            m,
+            &reporter,
+        )
+        .unwrap()
+    };
+
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            88,
+            [LINUX_AT_FDCWD, 0x4000, times, 0, 0, 0],
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let host_meta = std::fs::metadata(&host_file).unwrap();
+    assert_eq!(host_meta.atime(), 123);
+    assert_eq!(host_meta.mtime(), 789);
+
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            79,
+            [LINUX_AT_FDCWD, 0x4000, 0x4200, 0, 0, 0],
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let stat = read_stat(&memory, 0x4200);
+    let st_atime = stat.st_atime;
+    let st_mtime = stat.st_mtime;
+    assert_eq!(st_atime, 123);
+    assert_eq!(st_mtime, 789);
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn non_root_chown_under_bind_mount_to_root_returns_eperm() {
+    let scratch = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(scratch.path().join("nodejs-bindchown")).unwrap();
+    std::fs::write(
+        scratch.path().join("nodejs-bindchown/file.txt"),
+        b"chown payload",
+    )
+    .unwrap();
+
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
+    memory
+        .write_bytes(0x4000, b"/tmp/nodejs-bindchown/file.txt\0")
+        .unwrap();
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.register_mount(
+        std::path::PathBuf::from("/tmp"),
+        Box::new(BindVfs::new("/tmp", scratch.path().to_path_buf(), false)),
+    );
+    let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
+        d.dispatch(
+            SyscallRequest::new(nr, SyscallArgs::from(args)),
+            m,
+            &reporter,
+        )
+        .unwrap()
+    };
+
+    assert_eq!(
+        run(&mut dispatcher, &mut memory, 146, [1000, 0, 0, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            54,
+            [LINUX_AT_FDCWD, 0x4000, 0, 0, 0, 0],
+        ),
+        DispatchOutcome::Errno { errno: 1 }
+    );
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
 fn utimensat_sets_times_on_writable_overlay_and_validates_timestamps() {
     const UTIME_NOW: i64 = (1 << 30) - 1;
     const UTIME_OMIT: i64 = (1 << 30) - 2;

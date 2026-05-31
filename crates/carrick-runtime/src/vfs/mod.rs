@@ -226,6 +226,14 @@ pub struct OpenContext<'a> {
 pub trait Vfs: Send + Sync {
     fn lookup(&self, path: &str) -> Result<Metadata, VfsError>;
 
+    fn lookup_nofollow(&self, path: &str) -> Result<Metadata, VfsError> {
+        self.lookup(path)
+    }
+
+    fn real_stat(&self, _path: &str, _follow: bool) -> Option<crate::fs_backend::RealStat> {
+        None
+    }
+
     fn readlink(&self, _path: &str) -> Result<PathBuf, VfsError> {
         Err(crate::linux_abi::LINUX_EINVAL)
     }
@@ -280,7 +288,27 @@ pub trait Vfs: Send + Sync {
         Err(crate::linux_abi::LINUX_EROFS)
     }
 
-    fn chmod(&mut self, _path: &str, _mode: u32) -> Result<(), VfsError> {
+    fn chmod(&self, _path: &str, _mode: u32) -> Result<(), VfsError> {
+        Err(crate::linux_abi::LINUX_EROFS)
+    }
+
+    fn chown(
+        &self,
+        _path: &str,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+        _nofollow: bool,
+    ) -> Result<(), VfsError> {
+        Err(crate::linux_abi::LINUX_EROFS)
+    }
+
+    fn set_times(
+        &self,
+        _path: &str,
+        _atime: Option<(i64, i64)>,
+        _mtime: Option<(i64, i64)>,
+        _nofollow: bool,
+    ) -> Result<(), VfsError> {
         Err(crate::linux_abi::LINUX_EROFS)
     }
 
