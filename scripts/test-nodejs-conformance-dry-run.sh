@@ -20,6 +20,12 @@ contains() {
   [[ "$haystack" == *"$needle"* ]] || fail "expected output to contain: $needle"
 }
 
+not_contains() {
+  local haystack="$1"
+  local needle="$2"
+  [[ "$haystack" != *"$needle"* ]] || fail "expected output not to contain: $needle"
+}
+
 out="$("$entry" --dry-run --runner both --suite app-smoke --line 26 --timeout 9 --jsonl /tmp/node.jsonl)"
 contains "$out" "runner=both"
 contains "$out" "suite=app-smoke"
@@ -61,6 +67,7 @@ PATH="$fakebin:$PATH" FAKE_DOCKER_ARGS="$fake_args" "$entry" \
 fake_out="$(cat "$fake_args")"
 abs_jsonl="$repo/$rel_jsonl"
 contains "$fake_out" "<$(dirname "$abs_jsonl"):$(dirname "$abs_jsonl")>"
+not_contains "$fake_out" "</usr/local/bin/nodejs-conformance>"
 contains "$fake_out" "<--jsonl>"
 contains "$fake_out" "<$abs_jsonl>"
 
@@ -81,6 +88,7 @@ carrick_out="$(cat "$fake_carrick_args")"
 contains "$carrick_out" "<run>"
 contains "$carrick_out" "<--raw>"
 contains "$carrick_out" "<NODEJS_CONFORMANCE_EFFECTIVE_RUNNER=carrick>"
+not_contains "$carrick_out" "</usr/local/bin/nodejs-conformance>"
 contains "$carrick_out" "<--jsonl>"
 contains "$carrick_out" "<$abs_jsonl>"
 
