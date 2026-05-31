@@ -1,0 +1,9 @@
+{
+  "name": "carrick-nodejs-npm-smoke",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local npm smoke fixture for Carrick Node.js bring-up",
+  "scripts": {
+    "smoke": "node index.js"
+  }
+}

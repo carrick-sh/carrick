@@ -1,0 +1,1 @@
+{"kind":"baseline-placeholder","line":"24","node_ref":"v24.16.0","status":"not-run","note":"Populate with nodejs-conformance --runner both --suite node-core --line 24 after building the conformance image."}
