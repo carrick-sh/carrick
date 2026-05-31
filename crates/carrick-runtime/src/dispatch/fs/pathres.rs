@@ -88,7 +88,7 @@ impl SyscallDispatcher {
     /// `lookup_nofollow` does.
     pub(super) fn layered_lstat(&self, path: &str) -> Result<RootFsMetadata, i32> {
         if let Some(m) = self.fs.vfs_mounts.resolve(path)
-            && let Ok(md) = m.vfs.lookup(&m.full_path)
+            && let Ok(md) = m.vfs.lookup_nofollow(&m.full_path)
         {
             return Ok(vfs_md_to_rootfs_md(path, &md));
         }

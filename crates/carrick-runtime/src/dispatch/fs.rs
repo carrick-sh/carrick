@@ -1410,9 +1410,16 @@ impl SyscallDispatcher {
                 }
                 DispatchOutcome::Returned { value: 0 }
             }
-            OpenDescription::File { metadata, .. } => {
+            OpenDescription::File { metadata, .. }
+            | OpenDescription::Directory { metadata, .. } => {
                 let path = metadata.path.to_string_lossy().into_owned();
                 drop(open);
+                if let Some(m) = self.fs.vfs_mounts.resolve(&path) {
+                    return match m.vfs.set_times(&m.full_path, atime, mtime, false) {
+                        Ok(()) => DispatchOutcome::Returned { value: 0 },
+                        Err(errno) => DispatchOutcome::errno(errno),
+                    };
+                }
                 match self.fs.rootfs_vfs.overlay.set_times(&path, atime, mtime) {
                     Ok(()) | Err(crate::fs_backend::BackendError::Unsupported) => {
                         DispatchOutcome::Returned { value: 0 }
@@ -1597,6 +1604,12 @@ impl SyscallDispatcher {
             return Ok(errno.into());
         }
         let mode = self.maybe_clear_setgid(&resolved, (mode & 0o7777) as u32);
+        if let Some(m) = self.fs.vfs_mounts.resolve(&resolved) {
+            return match m.vfs.chmod(&m.full_path, mode) {
+                Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
+                Err(errno) => Ok(errno.into()),
+            };
+        }
         match self.fs.rootfs_vfs.overlay.set_mode(&resolved, mode) {
             Ok(()) | Err(crate::fs_backend::BackendError::Unsupported) => {
                 Ok(DispatchOutcome::Returned { value: 0 })
@@ -1631,6 +1644,25 @@ impl SyscallDispatcher {
             return mode & !S_ISGID;
         }
         mode
+    }
+
+    fn chown_arg(arg: u64) -> Option<u32> {
+        let value = arg as u32;
+        (value != u32::MAX).then_some(value)
+    }
+
+    fn chown_permission_errno(&self, uid: Option<u32>, gid: Option<u32>) -> Option<i32> {
+        let creds = self.cred_snapshot();
+        if creds.euid == 0 {
+            return None;
+        }
+        if uid.is_some() {
+            return Some(LINUX_EPERM);
+        }
+        if gid.is_some_and(|gid| gid != creds.egid) {
+            return Some(LINUX_EPERM);
+        }
+        None
     }
 
     /// Linux raises SIGPIPE on the writing thread when a write hits a broken
@@ -5380,7 +5412,13 @@ impl SyscallDispatcher {
                 });
             if let Some(path) = path {
                 let mode = this.maybe_clear_setgid(&path, mode);
-                let _ = this.fs.rootfs_vfs.overlay.set_mode(&path, mode);
+                if let Some(m) = this.fs.vfs_mounts.resolve(&path) {
+                    if let Err(errno) = m.vfs.chmod(&m.full_path, mode) {
+                        return Ok(errno.into());
+                    }
+                } else {
+                    let _ = this.fs.rootfs_vfs.overlay.set_mode(&path, mode);
+                }
                 // Refresh THIS fd's cached metadata so a subsequent fstat on it
                 // sees the new mode. A Directory/File fstat reads the cached
                 // metadata (only HostFile re-reads the live xattr), so without
@@ -5408,8 +5446,8 @@ impl SyscallDispatcher {
             if !this.fd_is_valid(fd.0) {
                 return Ok(LINUX_EBADF.into());
             }
-            let uid = owner as u32;
-            let gid = group as u32;
+            let uid = Self::chown_arg(owner);
+            let gid = Self::chown_arg(group);
             // Resolve the fd's path so we can record the guest-visible owner on the
             // backend (durably via xattr on --fs host), mirroring fchownat.
             let path = this
@@ -5423,7 +5461,20 @@ impl SyscallDispatcher {
                     _ => None,
                 });
             if let Some(path) = path {
-                let _ = this.fs.rootfs_vfs.overlay.set_owner(&path, uid, gid);
+                if let Some(errno) = this.chown_permission_errno(uid, gid) {
+                    return Ok(errno.into());
+                }
+                if let Some(m) = this.fs.vfs_mounts.resolve(&path) {
+                    if let Err(errno) = m.vfs.chown(&m.full_path, uid, gid, false) {
+                        return Ok(errno.into());
+                    }
+                } else {
+                    let _ = this.fs.rootfs_vfs.overlay.set_owner(
+                        &path,
+                        uid.unwrap_or(u32::MAX),
+                        gid.unwrap_or(u32::MAX),
+                    );
+                }
                 this.clear_setid_on_chown(&path);
             }
             Ok(DispatchOutcome::Returned { value: 0 })
@@ -5454,19 +5505,60 @@ impl SyscallDispatcher {
                 }
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
-            let uid = owner as u32;
-            let gid = group as u32;
+            let uid = Self::chown_arg(owner);
+            let gid = Self::chown_arg(group);
             let resolved = match this.resolve_at_path(dirfd, &path) {
                 Ok(resolved) => resolved,
                 Err(errno) => return Ok(errno.into()),
             };
+            let nofollow = flags & LINUX_AT_SYMLINK_NOFOLLOW != 0;
+            if this.fs.vfs_mounts.resolve(&resolved).is_some() {
+                let lookup = {
+                    if let Some(m) = this.fs.vfs_mounts.resolve(&resolved) {
+                        if nofollow {
+                            m.vfs.lookup_nofollow(&m.full_path)
+                        } else {
+                            m.vfs.lookup(&m.full_path)
+                        }
+                    } else {
+                        Err(LINUX_ENOENT)
+                    }
+                };
+                if let Err(errno) = lookup {
+                    return Ok(errno.into());
+                }
+                if let Some(errno) = this.chown_permission_errno(uid, gid) {
+                    return Ok(errno.into());
+                }
+                let result = {
+                    if let Some(m) = this.fs.vfs_mounts.resolve(&resolved) {
+                        m.vfs.chown(&m.full_path, uid, gid, nofollow)
+                    } else {
+                        Err(LINUX_ENOENT)
+                    }
+                };
+                return match result {
+                    Ok(()) => {
+                        this.clear_setid_on_chown(&resolved);
+                        Ok(DispatchOutcome::Returned { value: 0 })
+                    }
+                    Err(errno) => Ok(errno.into()),
+                };
+            }
             // Layered presence check: overlay first (tombstones become ENOENT),
             // synthetic /proc and /sys are no-op success, rootfs is no-op
             // success (tmpfs semantics). Record the guest-visible owner on the
             // backend (durably, via xattr on --fs host) so a later stat reports it.
             match this.layered_metadata(&resolved) {
                 Ok(_) => {
-                    let _ = this.fs.rootfs_vfs.overlay.set_owner(&resolved, uid, gid);
+                    if let Some(errno) = this.chown_permission_errno(uid, gid) {
+                        return Ok(errno.into());
+                    }
+                    let _ = this.fs.rootfs_vfs.overlay.set_owner(
+                        &resolved,
+                        uid.unwrap_or(u32::MAX),
+                        gid.unwrap_or(u32::MAX),
+                    );
                     this.clear_setid_on_chown(&resolved);
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
@@ -5935,6 +6027,17 @@ impl SyscallDispatcher {
                 // Both UTIME_OMIT: nothing to persist.
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
+            if let Some(m) = this.fs.vfs_mounts.resolve(&path) {
+                return match m.vfs.set_times(
+                    &m.full_path,
+                    atime_set,
+                    mtime_set,
+                    flags & LINUX_AT_SYMLINK_NOFOLLOW != 0,
+                ) {
+                    Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
+                    Err(errno) => Ok(errno.into()),
+                };
+            }
             // Persist atime/mtime to the materialised host file (disk-backed
             // overlay). A subsequent stat reads real disk metadata via
             // real_stat and will report the set mtime. MemoryBackend returns
@@ -6047,16 +6150,23 @@ impl SyscallDispatcher {
             use crate::vfs::Vfs as _;
             // VFS mounts (/dev, /dev/pts, /proc, /sys): stat their nodes so e.g.
             // /dev/ptmx, /dev/pts/N, /dev/tty resolve (mirrors the open path).
-            if let Some(m) = this.fs.vfs_mounts.resolve(&path)
-                && let Ok(md) = m.vfs.lookup(&m.full_path)
-            {
-                // RootFsEntryKind::CharDevice → S_IFCHR via linux_mode, so e.g.
-                // /dev/pts/N reports a char device (ttyname(3)'s chardev check).
-                return Ok(write_stat(
-                    memory,
-                    statbuf,
-                    &vfs_md_to_rootfs_md(&path, &md),
-                ));
+            if let Some(m) = this.fs.vfs_mounts.resolve(&path) {
+                if let Some(real) = m.vfs.real_stat(&m.full_path, follow) {
+                    return Ok(write_stat_real(memory, statbuf, &path, &real));
+                }
+                if let Ok(md) = if follow {
+                    m.vfs.lookup(&m.full_path)
+                } else {
+                    m.vfs.lookup_nofollow(&m.full_path)
+                } {
+                    // RootFsEntryKind::CharDevice → S_IFCHR via linux_mode, so e.g.
+                    // /dev/pts/N reports a char device (ttyname(3)'s chardev check).
+                    return Ok(write_stat(
+                        memory,
+                        statbuf,
+                        &vfs_md_to_rootfs_md(&path, &md),
+                    ));
+                }
             }
             // Layered overlay+rootfs lookup via RootFsVfs. Honour
             // AT_SYMLINK_NOFOLLOW (lstat) on backends without real_stat.
@@ -6141,14 +6251,21 @@ impl SyscallDispatcher {
             use crate::vfs::Vfs as _;
             // VFS mounts (/dev, /dev/pts, /proc, /sys): stat their nodes so e.g.
             // /dev/ptmx, /dev/pts/N, /dev/tty resolve (mirrors the open path).
-            if let Some(m) = this.fs.vfs_mounts.resolve(&path)
-                && let Ok(md) = m.vfs.lookup(&m.full_path)
-            {
-                return Ok(write_statx(
-                    memory,
-                    statxbuf,
-                    &vfs_md_to_rootfs_md(&path, &md),
-                ));
+            if let Some(m) = this.fs.vfs_mounts.resolve(&path) {
+                if let Some(real) = m.vfs.real_stat(&m.full_path, follow) {
+                    return Ok(write_statx_real(memory, statxbuf, &path, &real));
+                }
+                if let Ok(md) = if follow {
+                    m.vfs.lookup(&m.full_path)
+                } else {
+                    m.vfs.lookup_nofollow(&m.full_path)
+                } {
+                    return Ok(write_statx(
+                        memory,
+                        statxbuf,
+                        &vfs_md_to_rootfs_md(&path, &md),
+                    ));
+                }
             }
             // Fallback for backends without real_stat (e.g. the in-memory
             // overlay): honour AT_SYMLINK_NOFOLLOW by reporting the link itself
