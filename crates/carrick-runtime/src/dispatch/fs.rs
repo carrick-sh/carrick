@@ -1154,6 +1154,35 @@ impl SyscallDispatcher {
         DispatchOutcome::Returned { value: off as i64 }
     }
 
+    fn read_host_pipe_iovecs<M: GuestMemory>(
+        memory: &mut M,
+        iovecs: &[LinuxIovec],
+        host_fd: i32,
+        nonblocking: bool,
+    ) -> DispatchOutcome {
+        let mut total = 0i64;
+        for iov in iovecs {
+            let len = match usize::try_from(iov.iov_len) {
+                Ok(len) => len,
+                Err(_) => return DispatchOutcome::errno(LINUX_EINVAL),
+            };
+            if len == 0 {
+                continue;
+            }
+            match read_host_pipe(memory, iov.iov_base, len, host_fd, nonblocking) {
+                DispatchOutcome::Returned { value } => {
+                    total += value;
+                    if value == 0 || (value as usize) < len {
+                        break;
+                    }
+                }
+                _ if total > 0 => return DispatchOutcome::Returned { value: total },
+                other => return other,
+            }
+        }
+        DispatchOutcome::Returned { value: total }
+    }
+
     fn write_output_fd(&self, fd: i32, bytes: &[u8]) -> DispatchOutcome {
         let nonblocking = self.io_is_nonblocking(fd, 0);
         // Mirror `write`/`writev`: any fd present in `open_files` (e.g.
@@ -3678,6 +3707,7 @@ impl SyscallDispatcher {
             let Some(open_file) = this.open_file(fd.0) else {
                 return Ok(LINUX_EBADF.into());
             };
+            let nonblocking = this.io_is_nonblocking(fd.0, 0);
             let mut open = open_file.description.write();
             // Real host file: readv via the kernel fd (advances the shared
             // offset). Fill each iovec sequentially.
@@ -3701,6 +3731,38 @@ impl SyscallDispatcher {
                     }
                 }
                 return Ok(DispatchOutcome::Returned { value: total });
+            }
+            match &*open {
+                OpenDescription::HostPipe {
+                    host_fd,
+                    is_read_end,
+                    pty,
+                    bidirectional,
+                    ..
+                } => {
+                    if !*is_read_end && pty.is_none() && !*bidirectional {
+                        return Ok(LINUX_EBADF.into());
+                    }
+                    let hfd = *host_fd;
+                    drop(open);
+                    return Ok(Self::read_host_pipe_iovecs(
+                        memory,
+                        &iovecs,
+                        hfd,
+                        nonblocking,
+                    ));
+                }
+                OpenDescription::HostSocket { host_fd, .. } => {
+                    let hfd = *host_fd;
+                    drop(open);
+                    return Ok(Self::read_host_pipe_iovecs(
+                        memory,
+                        &iovecs,
+                        hfd,
+                        nonblocking,
+                    ));
+                }
+                _ => {}
             }
             let (contents, offset) = match &mut *open {
                 OpenDescription::File {
