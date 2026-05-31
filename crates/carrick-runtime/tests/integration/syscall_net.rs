@@ -302,6 +302,82 @@ fn unix_connect_checks_guest_path_before_host_hash_path() {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn unix_pathname_stream_listener_accepts_local_client() {
+    const LINUX_AF_UNIX: u16 = 1;
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x800]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
+        d.dispatch(
+            SyscallRequest::new(nr, SyscallArgs::from(args)),
+            m,
+            &reporter,
+        )
+        .unwrap()
+    };
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let guest_path = format!("/carrick-loopback-{nanos}.sock");
+    let gpb = guest_path.as_bytes();
+    let mut sa = vec![0u8; 2 + gpb.len() + 1];
+    sa[0..2].copy_from_slice(&LINUX_AF_UNIX.to_ne_bytes());
+    sa[2..2 + gpb.len()].copy_from_slice(gpb);
+    memory.write_bytes(0x4200, &sa).unwrap();
+
+    let listener = match run(
+        &mut dispatcher,
+        &mut memory,
+        198,
+        [LINUX_AF_UNIX as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
+    ) {
+        DispatchOutcome::Returned { value } => value as u64,
+        other => panic!("listener socket failed: {other:?}"),
+    };
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            200,
+            [listener, 0x4200, sa.len() as u64, 0, 0, 0],
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        run(&mut dispatcher, &mut memory, 201, [listener, 1, 0, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    let client = match run(
+        &mut dispatcher,
+        &mut memory,
+        198,
+        [LINUX_AF_UNIX as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
+    ) {
+        DispatchOutcome::Returned { value } => value as u64,
+        other => panic!("client socket failed: {other:?}"),
+    };
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            203,
+            [client, 0x4200, sa.len() as u64, 0, 0, 0],
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    match run(&mut dispatcher, &mut memory, 202, [listener, 0, 0, 0, 0, 0]) {
+        DispatchOutcome::Returned { value } => assert!(value >= 0, "accept returned {value}"),
+        other => panic!("accept failed: {other:?}"),
+    }
+
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn unix_relative_socket_getsockname_can_be_chmodded() {
     const LINUX_AF_UNIX: u16 = 1;
     let mut memory = LinearMemory::new(0x4000, vec![0; 0xa00]);
