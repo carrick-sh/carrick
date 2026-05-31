@@ -1,1 +1,2 @@
-{"kind":"baseline-placeholder","line":"24","libuv_ref":"v1.52.1","status":"not-run","note":"Populate with nodejs-conformance --runner both --suite libuv --line 24 after building the conformance image."}
+{"duration_sec": 46, "filter": "", "libuv_ref": "v1.52.1", "line": "24", "node_ref": "v24.16.0", "returncode": 0, "runner": "docker", "signature": "1..507", "status": "PASS", "suite": "libuv"}
+{"duration_sec": 120, "filter": "", "libuv_ref": "v1.52.1", "line": "24", "node_ref": "v24.16.0", "returncode": 137, "runner": "carrick", "signature": "not ok 1 - platform_output", "status": "TIMEOUT", "suite": "libuv"}

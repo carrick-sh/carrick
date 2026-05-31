@@ -1,1 +1,2 @@
-{"kind":"baseline-placeholder","line":"24","node_ref":"v24.16.0","status":"not-run","note":"Populate with nodejs-conformance --runner both --suite node-core --line 24 after building the conformance image."}
+{"duration_sec": 0, "filter": "test/parallel/test-process-argv-0.js", "libuv_ref": "v1.52.1", "line": "24", "node_ref": "v24.16.0", "returncode": 0, "runner": "docker", "signature": "TAP version 13", "status": "PASS", "suite": "node-core"}
+{"duration_sec": 120, "filter": "test/parallel/test-process-argv-0.js", "libuv_ref": "v1.52.1", "line": "24", "node_ref": "v24.16.0", "returncode": 137, "runner": "carrick", "signature": "timeout killed child; SignalInspector remained until scoped cleanup", "status": "TIMEOUT", "suite": "node-core"}
