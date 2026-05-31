@@ -1,1 +1,6 @@
-{"kind":"baseline-placeholder","line":"26","node_ref":"v26.2.0","status":"not-run","note":"Populate with nodejs-conformance --runner both --suite all --line 26 --smoke after building the conformance image."}
+{"duration_sec": 1, "filter": "", "libuv_ref": "v1.52.1", "line": "26", "node_ref": "v26.2.0", "returncode": 0, "runner": "docker", "signature": "v8-smoke ok", "status": "PASS", "suite": "v8-smoke"}
+{"duration_sec": 0, "filter": "", "libuv_ref": "v1.52.1", "line": "26", "node_ref": "v26.2.0", "returncode": 0, "runner": "docker", "signature": "", "status": "PASS", "suite": "npm-smoke"}
+{"duration_sec": 0, "filter": "", "libuv_ref": "v1.52.1", "line": "26", "node_ref": "v26.2.0", "returncode": 0, "runner": "docker", "signature": "app-smoke ok", "status": "PASS", "suite": "app-smoke"}
+{"duration_sec": 120, "filter": "", "libuv_ref": "v1.52.1", "line": "26", "node_ref": "v26.2.0", "returncode": 137, "runner": "carrick", "signature": "", "status": "TIMEOUT", "suite": "v8-smoke"}
+{"duration_sec": 120, "filter": "", "libuv_ref": "v1.52.1", "line": "26", "node_ref": "v26.2.0", "returncode": 137, "runner": "carrick", "signature": "# Fatal error in , line 0", "status": "TIMEOUT", "suite": "npm-smoke"}
+{"duration_sec": 1, "filter": "", "libuv_ref": "v1.52.1", "line": "26", "node_ref": "v26.2.0", "returncode": 1, "runner": "carrick", "signature": "Error: write EPIPE", "status": "FAIL", "suite": "app-smoke"}
