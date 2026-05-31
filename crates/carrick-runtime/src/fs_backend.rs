@@ -207,6 +207,14 @@ pub trait FsBackend: Send + Sync {
     /// the dispatcher keeps its in-memory File model there.
     fn open_raw_fd(&self, path: &str, write: bool, create: bool, trunc: bool) -> Option<i32>;
 
+    /// Open host vnode descriptors for inotify-style watches. Directory
+    /// watches may include a host path so the inotify shim can snapshot/diff
+    /// child names after a kqueue directory-write wakeup. Default:
+    /// unsupported for backends with no real host namespace.
+    fn watch_fds(&self, _path: &str) -> Result<Vec<crate::vfs::WatchFd>, i32> {
+        Err(crate::linux_abi::LINUX_ENOSYS)
+    }
+
     /// Open a REAL host fd for an UNNAMED file (`O_TMPFILE` semantics): a
     /// regular file that exists nowhere in any namespace, so it's never
     /// linked, never visible to `lookup`/getdents, and is reaped when the
@@ -393,6 +401,27 @@ pub fn normalize_raw(raw: &Path) -> Option<PathBuf> {
 fn cstring_from_osstr(os: &std::ffi::OsStr) -> Option<std::ffi::CString> {
     use std::os::unix::ffi::OsStrExt;
     std::ffi::CString::new(os.as_bytes()).ok()
+}
+
+fn io_error_to_linux_errno(error: std::io::Error) -> i32 {
+    crate::dispatch::macos_to_linux_errno(error.raw_os_error().unwrap_or(libc::EIO))
+}
+
+fn open_host_watch_fd(path: &Path) -> Result<i32, i32> {
+    let cpath = cstring_from_osstr(path.as_os_str()).ok_or(crate::linux_abi::LINUX_EINVAL)?;
+    #[cfg(target_os = "macos")]
+    let host_flags = libc::O_EVTONLY;
+    #[cfg(not(target_os = "macos"))]
+    let host_flags = libc::O_RDONLY;
+    // SAFETY: `cpath` is NUL-terminated and points at a real host path.
+    let fd = unsafe { libc::open(cpath.as_ptr(), host_flags) };
+    if fd < 0 {
+        let raw = std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO);
+        return Err(crate::dispatch::macos_to_linux_errno(raw));
+    }
+    Ok(fd)
 }
 
 fn child_name(prefix: &Path, candidate: &Path) -> Option<String> {
@@ -1635,6 +1664,45 @@ impl FsBackend for HostFsBackend {
         // cap-std File without closing it, so the dispatcher owns the
         // fd lifetime (it closes it on guest close()).
         Some(file.into_std().into_raw_fd())
+    }
+
+    fn watch_fds(&self, path: &str) -> Result<Vec<crate::vfs::WatchFd>, i32> {
+        use std::os::unix::ffi::OsStrExt;
+
+        let scratch = self
+            ._scratch
+            .as_ref()
+            .ok_or(crate::linux_abi::LINUX_ENOSYS)?;
+        let kind = self
+            .lookup_kind(path)
+            .ok_or(crate::linux_abi::LINUX_ENOENT)?;
+        if matches!(kind, OverlayEntryKind::Deleted) {
+            return Err(crate::linux_abi::LINUX_ENOENT);
+        }
+        let normalized = self
+            .resolve_following(path)
+            .ok_or(crate::linux_abi::LINUX_EINVAL)?;
+        let host_path = scratch.path().join(&normalized);
+        let root_fd = open_host_watch_fd(&host_path)?;
+        let metadata = std::fs::symlink_metadata(&host_path).map_err(io_error_to_linux_errno)?;
+        if !metadata.is_dir() {
+            return Ok(vec![crate::vfs::WatchFd::unnamed(root_fd)]);
+        }
+
+        let mut fds = vec![crate::vfs::WatchFd::scanning_directory(
+            root_fd,
+            host_path.clone(),
+        )];
+        for entry in std::fs::read_dir(&host_path).map_err(io_error_to_linux_errno)? {
+            let entry = entry.map_err(io_error_to_linux_errno)?;
+            if let Ok(host_fd) = open_host_watch_fd(&entry.path()) {
+                fds.push(crate::vfs::WatchFd::named(
+                    host_fd,
+                    entry.file_name().as_bytes().to_vec(),
+                ));
+            }
+        }
+        Ok(fds)
     }
 
     fn open_anon_fd(&self, mode: u32) -> Option<i32> {

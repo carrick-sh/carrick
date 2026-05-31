@@ -4557,11 +4557,19 @@ impl SyscallDispatcher {
                     Err(errno) => Ok(errno.into()),
                 };
             }
-            // A watchable host vnode comes from the host fs backend; the
-            // in-memory backend and directory targets have no host fd to
-            // register, so inotify watches require `--fs host` (ENOSPC
-            // otherwise — a documented limitation; dir-entry-name events are a
-            // separate kqueue-fidelity follow-up).
+            match this.fs.rootfs_vfs.watch_fds(&path) {
+                Ok(watch_fds) => {
+                    return Ok(match state.add_watch_fds(watch_fds, mask as u32) {
+                        Ok(wd) => DispatchOutcome::Returned { value: wd as i64 },
+                        Err(errno) => errno.into(),
+                    });
+                }
+                Err(errno) if errno == LINUX_ENOSYS => {}
+                Err(errno) => return Ok(errno.into()),
+            }
+            // A watchable host vnode can still come from the legacy host-file
+            // open path when the writable backend has no host path to hand to
+            // the directory snapshot/diff implementation.
             match this
                 .fs
                 .rootfs_vfs
