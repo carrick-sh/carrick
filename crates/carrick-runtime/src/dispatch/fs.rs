@@ -191,6 +191,17 @@ impl SyscallDispatcher {
                 | OpenDescription::HostPipe { .. }
                 | OpenDescription::HostSocket { .. }
                 | OpenDescription::HostFile { .. }
+                // In-memory regular files (incl. the unnamed O_TMPFILE inode and
+                // overlay-backed `SyntheticFile`s) carry their `contents`/`offset`
+                // behind the description's own `RwLock`, and the overlay backend
+                // is interior-mutable (`set_file_contents(&self, …)`). The `write`
+                // handler's File arm is therefore safe on the multi-threaded shared
+                // path. Without this, a write(2) to such an fd from a *threaded*
+                // guest (e.g. CPython) fell through `dispatch_threaded_shared` →
+                // ENOSYS — `tempfile.TemporaryFile()` (O_TMPFILE) writes failed
+                // only under multithreading, surfacing as 58 ERRORs in test_csv.
+                | OpenDescription::File { .. }
+                | OpenDescription::SyntheticFile { .. }
         )
     }
 
