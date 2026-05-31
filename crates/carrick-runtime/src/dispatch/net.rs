@@ -463,7 +463,7 @@ impl SyscallDispatcher {
         if base_type != LINUX_SOCK_RAW && base_type != LINUX_SOCK_DGRAM {
             return DispatchOutcome::errno(LINUX_ESOCKTNOSUPPORT);
         }
-        let status_flags = if nonblock { LINUX_O_NONBLOCK } else { 0 };
+        let status_flags = LINUX_O_RDWR | if nonblock { LINUX_O_NONBLOCK } else { 0 };
         let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };
         self.install_fd(
             OpenDescription::Netlink {
@@ -497,7 +497,7 @@ impl SyscallDispatcher {
         // blocking mode in Linux-visible status_flags and waits outside the
         // dispatcher lock when a blocking operation would block.
         set_host_nonblocking(host_fd);
-        let status_flags = if nonblock { LINUX_O_NONBLOCK } else { 0 };
+        let status_flags = LINUX_O_RDWR | if nonblock { LINUX_O_NONBLOCK } else { 0 };
         let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };
         let open_file = OpenFile::with_host_fd(
             Arc::new(RwLock::new(OpenDescription::HostSocket {
@@ -572,7 +572,7 @@ impl SyscallDispatcher {
                 host_fd,
                 family: libc::AF_UNIX,
                 type_: so_type,
-                base: OpenDescriptionBase::new(0),
+                base: OpenDescriptionBase::new(LINUX_O_RDWR),
             }
         } else if kind == libc::S_IFIFO {
             // A pipe end. Probe its direction so reads/writes route correctly;
@@ -777,7 +777,7 @@ impl SyscallDispatcher {
                 libc::fcntl(new_host, libc::F_SETFL, next);
             }
         }
-        let status_flags = if nonblock { LINUX_O_NONBLOCK } else { 0 };
+        let status_flags = LINUX_O_RDWR | if nonblock { LINUX_O_NONBLOCK } else { 0 };
         let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };
         let open_file = OpenFile::with_host_fd(
             Arc::new(RwLock::new(OpenDescription::HostSocket {
@@ -2075,7 +2075,7 @@ impl SyscallDispatcher {
             }
             set_host_nonblocking(host_fds[0]);
             set_host_nonblocking(host_fds[1]);
-            let status_flags = if nonblock { LINUX_O_NONBLOCK } else { 0 };
+            let status_flags = LINUX_O_RDWR | if nonblock { LINUX_O_NONBLOCK } else { 0 };
             let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };
             let first = OpenFile::with_host_fd(
                 Arc::new(RwLock::new(OpenDescription::HostSocket {
