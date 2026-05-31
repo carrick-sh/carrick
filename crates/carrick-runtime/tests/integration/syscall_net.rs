@@ -16,8 +16,8 @@ use support::*;
 use carrick_runtime::io_wait::{ThreadWaiter, WaitResult};
 use carrick_runtime::linux_abi::{
     LINUX_AF_INET, LINUX_AT_FDCWD, LINUX_EADDRINUSE, LINUX_ECONNREFUSED, LINUX_EINTR, LINUX_ENOENT,
-    LINUX_ENXIO, LINUX_EPOLLOUT, LINUX_O_CREAT, LINUX_O_RDWR, LINUX_SOCK_CLOEXEC,
-    LINUX_SOCK_NONBLOCK, LINUX_SOCK_STREAM, LINUX_SOL_TCP,
+    LINUX_ENXIO, LINUX_EPOLLOUT, LINUX_O_CREAT, LINUX_O_RDWR, LINUX_SIOCGIFINDEX,
+    LINUX_SIOCGIFNAME, LINUX_SOCK_CLOEXEC, LINUX_SOCK_NONBLOCK, LINUX_SOCK_STREAM, LINUX_SOL_TCP,
 };
 #[cfg(target_os = "macos")]
 use carrick_runtime::thread::{FutexTable, ThreadRegistry};
@@ -770,6 +770,78 @@ fn fionread_and_fionbio_bootstrap_succeed_for_valid_fds() {
             .unwrap(),
         DispatchOutcome::Errno { errno: 9 }
     );
+
+    assert!(reporter.finish().unhandled_ioctls.is_empty());
+}
+
+#[test]
+fn siocgifname_on_socket_maps_interface_index_to_name() {
+    let (ifindex, ifname) = ["lo0", "lo"]
+        .iter()
+        .find_map(|name| {
+            let c_name = std::ffi::CString::new(*name).unwrap();
+            let index = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
+            (index != 0).then_some((index, *name))
+        })
+        .expect("host loopback interface");
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    let fd = match dispatcher
+        .dispatch(
+            SyscallRequest::new(
+                198,
+                SyscallArgs::from([LINUX_AF_INET as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap()
+    {
+        DispatchOutcome::Returned { value } => value as u64,
+        other => panic!("socket(AF_INET): {other:?}"),
+    };
+
+    let mut ifreq = [0u8; 40];
+    ifreq[16..20].copy_from_slice(&(ifindex as i32).to_le_bytes());
+    memory.write_bytes(0x4000, &ifreq).unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    29,
+                    SyscallArgs::from([fd, LINUX_SIOCGIFNAME, 0x4000, 0, 0, 0])
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let out = memory.read_bytes(0x4000, 16).unwrap();
+    let end = out.iter().position(|b| *b == 0).unwrap_or(out.len());
+    assert_eq!(&out[..end], ifname.as_bytes());
+
+    let mut ifreq = [0u8; 40];
+    ifreq[..ifname.len()].copy_from_slice(ifname.as_bytes());
+    memory.write_bytes(0x4040, &ifreq).unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    29,
+                    SyscallArgs::from([fd, LINUX_SIOCGIFINDEX, 0x4040, 0, 0, 0])
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let out = memory.read_bytes(0x4050, 4).unwrap();
+    let got_index = i32::from_le_bytes(out.try_into().unwrap());
+    assert_eq!(got_index, ifindex as i32);
 
     assert!(reporter.finish().unhandled_ioctls.is_empty());
 }

@@ -2940,6 +2940,68 @@ impl SyscallDispatcher {
                     Ok(TtyFdKind::Other) => DispatchOutcome::errno(LINUX_ENOTTY),
                     Err(errno) => DispatchOutcome::errno(errno),
                 },
+                LINUX_SIOCGIFNAME => match this.open_file(fd.0).as_ref() {
+                    Some(open_file) => match &*open_file.description.read() {
+                        OpenDescription::HostSocket { .. } => {
+                            let Ok(bytes) = cx.memory.read_bytes(arg + 16, 4) else {
+                                return Ok(LINUX_EFAULT.into());
+                            };
+                            let ifindex =
+                                i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                            if ifindex <= 0 {
+                                DispatchOutcome::errno(LINUX_ENODEV)
+                            } else {
+                                let mut name_buf = [0 as libc::c_char; 16];
+                                // SAFETY: `name_buf` is writable storage with Linux IFNAMSIZ bytes.
+                                let ptr = unsafe {
+                                    libc::if_indextoname(ifindex as u32, name_buf.as_mut_ptr())
+                                };
+                                if ptr.is_null() {
+                                    DispatchOutcome::errno(LINUX_ENODEV)
+                                } else {
+                                    let mut ifreq_name = [0u8; 16];
+                                    // SAFETY: successful if_indextoname returns a NUL-terminated name.
+                                    let name = unsafe { std::ffi::CStr::from_ptr(ptr) }.to_bytes();
+                                    let len = name.len().min(ifreq_name.len().saturating_sub(1));
+                                    ifreq_name[..len].copy_from_slice(&name[..len]);
+                                    write_packed(&mut *cx.memory, arg, &ifreq_name)
+                                }
+                            }
+                        }
+                        _ => DispatchOutcome::errno(LINUX_ENOTTY),
+                    },
+                    None => DispatchOutcome::errno(LINUX_ENOTTY),
+                },
+                LINUX_SIOCGIFINDEX => match this.open_file(fd.0).as_ref() {
+                    Some(open_file) => match &*open_file.description.read() {
+                        OpenDescription::HostSocket { .. } => {
+                            let Ok(bytes) = cx.memory.read_bytes(arg, 16) else {
+                                return Ok(LINUX_EFAULT.into());
+                            };
+                            let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+                            if end == 0 {
+                                DispatchOutcome::errno(LINUX_ENODEV)
+                            } else {
+                                let Ok(name) = std::ffi::CString::new(&bytes[..end]) else {
+                                    return Ok(LINUX_EINVAL.into());
+                                };
+                                // SAFETY: `name` is a NUL-terminated interface name.
+                                let ifindex = unsafe { libc::if_nametoindex(name.as_ptr()) };
+                                if ifindex == 0 {
+                                    DispatchOutcome::errno(LINUX_ENODEV)
+                                } else {
+                                    write_packed(
+                                        &mut *cx.memory,
+                                        arg + 16,
+                                        &(ifindex as i32).to_le_bytes(),
+                                    )
+                                }
+                            }
+                        }
+                        _ => DispatchOutcome::errno(LINUX_ENOTTY),
+                    },
+                    None => DispatchOutcome::errno(LINUX_ENOTTY),
+                },
                 LINUX_TIOCGSID => match this.tty_ioctl_fd_kind(fd.0) {
                     Ok(TtyFdKind::Stdio) => {
                         // Under `-t` stdio is a real pty slave. Ask Darwin for
