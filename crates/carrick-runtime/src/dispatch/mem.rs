@@ -732,11 +732,32 @@ impl SyscallDispatcher {
             }
 
             if old_address.0.checked_add(old_size) == Some(this.mem.lock().mmap_next) {
+                let Some(old_end) = old_address.0.checked_add(old_size) else {
+                    return Ok(LINUX_ENOMEM.into());
+                };
                 let Some(new_end) = old_address.0.checked_add(new_size) else {
                     return Ok(LINUX_ENOMEM.into());
                 };
                 if range_within(old_address.0, new_size, LINUX_MMAP_BASE, crate::memory::mmap_arena_size()) {
                     this.mem.lock().mmap_next = new_end;
+                    // Re-validate the freshly-grown tail [old_end, new_end). Those
+                    // pages can be a range reclaimed from a prior munmap (which
+                    // invalidated their stage-1 leaves and rolled mmap_next back),
+                    // so without restoring RW validity here the guest FAULTS on
+                    // first access to the grown region — exactly as the move path
+                    // below and the regular mmap path do. (CPython's obmalloc/
+                    // realloc grows an arena buffer in place; the tail landed on
+                    // invalidated pages → a level-3 translation fault.)
+                    let grow_len_u64 = new_size - old_size;
+                    if let Ok(grow_len) = usize::try_from(grow_len_u64) {
+                        memory.set_no_access(old_end, grow_len, false);
+                        if memory
+                            .protect_range(old_end, grow_len, LINUX_PROT_READ | LINUX_PROT_WRITE)
+                            .is_err()
+                        {
+                            return Ok(LINUX_ENOMEM.into());
+                        }
+                    }
                     return Ok(DispatchOutcome::Returned {
                         value: old_address.0 as i64,
                     });
