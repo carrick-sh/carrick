@@ -296,7 +296,7 @@ impl Vfs for BindVfs {
         &self,
         path: &str,
         flags: OpenFlags,
-        _ctx: &OpenContext<'_>,
+        ctx: &OpenContext<'_>,
     ) -> Result<VfsHandle, VfsError> {
         let host = self.to_host(path)?;
         if is_socket_marker(&host, flags.nofollow) {
@@ -338,6 +338,7 @@ impl Vfs for BindVfs {
             host_flags |= libc::O_TRUNC;
         }
 
+        let existed_before_create = flags.create && std::fs::symlink_metadata(&host).is_ok();
         let cpath = CString::new(host.to_string_lossy().as_ref()).map_err(|_| LINUX_EINVAL)?;
         // SAFETY: host path as NUL-terminated string
         let host_fd = unsafe { libc::open(cpath.as_ptr(), host_flags, flags.mode as libc::c_int) };
@@ -354,6 +355,9 @@ impl Vfs for BindVfs {
             unsafe {
                 libc::fchmod(host_fd, (flags.mode & 0o7777) as libc::mode_t);
             }
+        }
+        if flags.create && !existed_before_create {
+            let _ = write_owner_xattrs(&host, Some(ctx.euid), Some(ctx.egid), false);
         }
 
         let status_flags = if flags.nonblock {

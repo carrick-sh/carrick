@@ -868,12 +868,15 @@ impl SyscallDispatcher {
         let argv = proc.argv.clone();
         drop(proc);
         let mem = self.mem_snapshot();
+        let creds = self.cred_snapshot();
         let ctx = crate::vfs::OpenContext {
             executable_path: Some(exec_path.as_str()),
             argv: Some(argv.as_slice()),
             address_space_regions: mem.address_space_regions.as_deref(),
             brk_current: mem.brk_current,
             mmap_next: mem.mmap_next,
+            euid: creds.euid,
+            egid: creds.egid,
         };
         let vfs_flags = crate::vfs::OpenFlags {
             read: matches!(access, LINUX_O_RDONLY | LINUX_O_RDWR),
@@ -5324,7 +5327,15 @@ impl SyscallDispatcher {
                 let creds = this.cred_snapshot();
                 let create_mode = (mode as u32 & 0o7777) & !(creds.umask & 0o777);
                 return match m.vfs.mkdir(&m.full_path, create_mode) {
-                    Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
+                    Ok(()) => {
+                        let _ = m.vfs.chown(
+                            &m.full_path,
+                            Some(creds.euid),
+                            Some(creds.egid),
+                            false,
+                        );
+                        Ok(DispatchOutcome::Returned { value: 0 })
+                    }
                     Err(errno) => Ok(errno.into()),
                 };
             }
