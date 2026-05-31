@@ -15,7 +15,8 @@ use support::*;
 #[cfg(target_os = "macos")]
 use carrick_runtime::io_wait::{ThreadWaiter, WaitResult};
 use carrick_runtime::linux_abi::{
-    LINUX_AF_INET, LINUX_EINTR, LINUX_EPOLLOUT, LINUX_SOCK_CLOEXEC, LINUX_SOCK_NONBLOCK,
+    LINUX_AF_INET, LINUX_AT_FDCWD, LINUX_EADDRINUSE, LINUX_ECONNREFUSED, LINUX_EINTR, LINUX_ENOENT,
+    LINUX_EPOLLOUT, LINUX_O_CREAT, LINUX_O_RDWR, LINUX_SOCK_CLOEXEC, LINUX_SOCK_NONBLOCK,
     LINUX_SOCK_STREAM, LINUX_SOL_TCP,
 };
 #[cfg(target_os = "macos")]
@@ -60,7 +61,7 @@ fn getsockname_returns_the_guest_unix_path_not_the_host_translation() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let guest_path = format!("/tmp/carrick-ut-{nanos}.sock");
+    let guest_path = format!("/carrick-ut-{nanos}.sock");
     let gpb = guest_path.as_bytes();
 
     // socket(AF_UNIX, SOCK_STREAM)
@@ -112,6 +113,190 @@ fn getsockname_returns_the_guest_unix_path_not_the_host_translation() {
         path, gpb,
         "getsockname returned the carrick-unix-sockets host path, not the guest path"
     );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn unix_bind_existing_guest_socket_path_returns_eaddrinuse() {
+    const LINUX_AF_UNIX: u16 = 1;
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x600]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
+        d.dispatch(
+            SyscallRequest::new(nr, SyscallArgs::from(args)),
+            m,
+            &reporter,
+        )
+        .unwrap()
+    };
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let guest_path = format!("/carrick-bind-inuse-{nanos}.sock");
+    let gpb = guest_path.as_bytes();
+    let mut sa = vec![0u8; 2 + gpb.len() + 1];
+    sa[0..2].copy_from_slice(&LINUX_AF_UNIX.to_ne_bytes());
+    sa[2..2 + gpb.len()].copy_from_slice(gpb);
+    memory.write_bytes(0x4200, &sa).unwrap();
+
+    let fd1 = match run(
+        &mut dispatcher,
+        &mut memory,
+        198,
+        [LINUX_AF_UNIX as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
+    ) {
+        DispatchOutcome::Returned { value } => value as u64,
+        other => panic!("socket 1 failed: {other:?}"),
+    };
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            200,
+            [fd1, 0x4200, sa.len() as u64, 0, 0, 0],
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    let fd2 = match run(
+        &mut dispatcher,
+        &mut memory,
+        198,
+        [LINUX_AF_UNIX as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
+    ) {
+        DispatchOutcome::Returned { value } => value as u64,
+        other => panic!("socket 2 failed: {other:?}"),
+    };
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            200,
+            [fd2, 0x4200, sa.len() as u64, 0, 0, 0],
+        ),
+        DispatchOutcome::Errno {
+            errno: LINUX_EADDRINUSE
+        }
+    );
+
+    let missing_path = b"/path/to/unix/socket/that/really/should/not/be/there";
+    let mut missing_sa = vec![0u8; 2 + missing_path.len() + 1];
+    missing_sa[0..2].copy_from_slice(&LINUX_AF_UNIX.to_ne_bytes());
+    missing_sa[2..2 + missing_path.len()].copy_from_slice(missing_path);
+    memory.write_bytes(0x4400, &missing_sa).unwrap();
+    let fd3 = match run(
+        &mut dispatcher,
+        &mut memory,
+        198,
+        [LINUX_AF_UNIX as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
+    ) {
+        DispatchOutcome::Returned { value } => value as u64,
+        other => panic!("socket 3 failed: {other:?}"),
+    };
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            200,
+            [fd3, 0x4400, missing_sa.len() as u64, 0, 0, 0],
+        ),
+        DispatchOutcome::Errno {
+            errno: LINUX_ENOENT
+        }
+    );
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn unix_connect_checks_guest_path_before_host_hash_path() {
+    const LINUX_AF_UNIX: u16 = 1;
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x800]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
+        d.dispatch(
+            SyscallRequest::new(nr, SyscallArgs::from(args)),
+            m,
+            &reporter,
+        )
+        .unwrap()
+    };
+
+    let missing_path = b"/path/to/unix/socket/that/really/should/not/be/there";
+    let mut missing_sa = vec![0u8; 2 + missing_path.len() + 1];
+    missing_sa[0..2].copy_from_slice(&LINUX_AF_UNIX.to_ne_bytes());
+    missing_sa[2..2 + missing_path.len()].copy_from_slice(missing_path);
+    memory.write_bytes(0x4200, &missing_sa).unwrap();
+    let missing_fd = match run(
+        &mut dispatcher,
+        &mut memory,
+        198,
+        [LINUX_AF_UNIX as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
+    ) {
+        DispatchOutcome::Returned { value } => value as u64,
+        other => panic!("missing socket failed: {other:?}"),
+    };
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            203,
+            [missing_fd, 0x4200, missing_sa.len() as u64, 0, 0, 0],
+        ),
+        DispatchOutcome::Errno {
+            errno: LINUX_ENOENT
+        }
+    );
+
+    let file_path = b"/plain-unix-connect-file";
+    let mut file_path_cstr = file_path.to_vec();
+    file_path_cstr.push(0);
+    memory.write_bytes(0x4400, &file_path_cstr).unwrap();
+    match run(
+        &mut dispatcher,
+        &mut memory,
+        56,
+        [
+            LINUX_AT_FDCWD,
+            0x4400,
+            LINUX_O_CREAT | LINUX_O_RDWR,
+            0o644,
+            0,
+            0,
+        ],
+    ) {
+        DispatchOutcome::Returned { .. } => {}
+        other => panic!("openat regular file failed: {other:?}"),
+    }
+    let mut file_sa = vec![0u8; 2 + file_path.len() + 1];
+    file_sa[0..2].copy_from_slice(&LINUX_AF_UNIX.to_ne_bytes());
+    file_sa[2..2 + file_path.len()].copy_from_slice(file_path);
+    memory.write_bytes(0x4600, &file_sa).unwrap();
+    let file_fd = match run(
+        &mut dispatcher,
+        &mut memory,
+        198,
+        [LINUX_AF_UNIX as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
+    ) {
+        DispatchOutcome::Returned { value } => value as u64,
+        other => panic!("file socket failed: {other:?}"),
+    };
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            203,
+            [file_fd, 0x4600, file_sa.len() as u64, 0, 0, 0],
+        ),
+        DispatchOutcome::Errno {
+            errno: LINUX_ECONNREFUSED
+        }
+    );
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
 /// Regression for the Go `net` `TestFileListener` hang (docs/go-conformance-punchlist.md

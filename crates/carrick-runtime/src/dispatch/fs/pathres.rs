@@ -30,7 +30,7 @@ impl SyscallDispatcher {
     /// Layered metadata probe. Mirrors the rootfs-or-synthetic chain
     /// used by stat / faccessat sites, but consults the overlay first
     /// and respects deletions.
-    pub(super) fn layered_metadata(&self, path: &str) -> Result<RootFsMetadata, i32> {
+    pub(crate) fn layered_metadata(&self, path: &str) -> Result<RootFsMetadata, i32> {
         use crate::vfs::Vfs as _;
         // Consult the VFS mounts (/dev, /dev/pts, /proc, /sys) FIRST so stat of
         // /dev/ptmx, /dev/pts/N, /dev/tty, and synthetic /proc /sys paths
@@ -86,7 +86,7 @@ impl SyscallDispatcher {
     /// cross-mount symlink they can't follow gets misclassified as a plain
     /// File.) Mounts answer for their subtree; otherwise the overlay-aware
     /// `lookup_nofollow` does.
-    pub(super) fn layered_lstat(&self, path: &str) -> Result<RootFsMetadata, i32> {
+    pub(crate) fn layered_lstat(&self, path: &str) -> Result<RootFsMetadata, i32> {
         if let Some(m) = self.fs.vfs_mounts.resolve(path)
             && let Ok(md) = m.vfs.lookup_nofollow(&m.full_path)
         {
