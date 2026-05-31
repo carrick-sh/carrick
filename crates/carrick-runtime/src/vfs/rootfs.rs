@@ -493,14 +493,19 @@ impl Vfs for RootFsVfs {
             // 0o111). Fall back to defaults only if the backend can't
             // produce metadata for an entry it just reported.
             let backend_md = self.overlay.metadata(path);
-            // A FIFO is reported by the backend as a (present, empty) File
-            // entry — opening it to read bytes would block — but its true kind
-            // lives in `metadata`. Surface S_IFIFO before the generic File arm.
+            // FIFOs and AF_UNIX socket nodes are reported by the backend as
+            // (present, empty) File entries, but their true kind lives in
+            // `metadata`. Surface the special kind before the generic File arm.
             if let Some(md) = &backend_md
-                && md.kind == RootFsEntryKind::Fifo
+                && (md.kind == RootFsEntryKind::Fifo || md.kind == RootFsEntryKind::Socket)
             {
+                let kind = if md.kind == RootFsEntryKind::Fifo {
+                    EntryKind::Fifo
+                } else {
+                    EntryKind::Socket
+                };
                 return Ok(Metadata {
-                    kind: EntryKind::Fifo,
+                    kind,
                     mode: md.mode,
                     size: 0,
                     uid: 0,
