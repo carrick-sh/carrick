@@ -41,6 +41,31 @@ impl SyscallDispatcher {
         }
     }
 
+    /// True iff `fd` is a stdio number (0/1/2) the guest explicitly closed and
+    /// has not reopened (no `open_files` entry landed there). Such an fd must
+    /// behave like any other closed fd — EBADF from fstat/ioctl etc. — NOT like
+    /// our still-open host stdio stream. CPython's startup fstat()s 0/1/2 and
+    /// sets `sys.stdin/stdout/stderr = None` precisely when it sees EBADF
+    /// (test_cmd_line.test_no_std*).
+    ///
+    /// The `open_files` check is load-bearing: NOT every reinstall path clears
+    /// the `closed_stdio` flag (e.g. `dup3(saved, 1)` to RESTORE stdout after a
+    /// shell `> file` redirect inserts into the table directly). An fd present
+    /// in `open_files` is genuinely open regardless of a stale closed flag, so
+    /// consulting the table here keeps the "closed" verdict precise.
+    pub(in crate::dispatch) fn stdio_is_closed(&self, fd: i32) -> bool {
+        if !(0..3).contains(&fd) {
+            return false;
+        }
+        // Lock order is `open_files → closed_stdio` everywhere; preserve it by
+        // checking the table FIRST (and releasing that lock) before taking the
+        // closed_stdio lock, so the two locks are never held simultaneously.
+        if self.fd_table_contains(fd) {
+            return false;
+        }
+        self.io.closed_stdio.lock()[fd as usize]
+    }
+
     pub(in crate::dispatch) fn install_fd_at_or_above(
         &self,
         min_fd: i32,

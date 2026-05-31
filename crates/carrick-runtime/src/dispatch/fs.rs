@@ -226,7 +226,7 @@ impl SyscallDispatcher {
     }
 
     fn tty_ioctl_fd_kind(&self, fd: i32) -> Result<TtyFdKind, i32> {
-        if is_stdio_fd(fd) {
+        if is_stdio_fd(fd) && !self.stdio_is_closed(fd) {
             Ok(TtyFdKind::Stdio)
         } else if self.fd_table_contains(fd) {
             Ok(TtyFdKind::Other)
@@ -250,7 +250,7 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn fd_is_valid(&self, fd: i32) -> bool {
-        is_stdio_fd(fd) || self.fd_table_contains(fd)
+        (is_stdio_fd(fd) && !self.stdio_is_closed(fd)) || self.fd_table_contains(fd)
     }
 
     fn statfs(
@@ -751,6 +751,12 @@ impl SyscallDispatcher {
                 Arc::clone(&open_file.description),
                 open_file.host_fd_owner.clone(),
             ),
+            // A closed-and-not-reopened stdio fd is genuinely closed: dup is
+            // EBADF, not a host-fd grab. (The closed check must precede the
+            // is_stdio_fd grab below.)
+            None if is_stdio_fd(old_fd) && self.stdio_is_closed(old_fd) => {
+                return DispatchOutcome::errno(LINUX_EBADF);
+            }
             None if is_stdio_fd(old_fd) => {
                 // dup/fcntl(F_DUPFD) of the process's bare stdio fds:
                 // mirror what dup3 does and grab the host fd into a
@@ -1876,6 +1882,11 @@ impl SyscallDispatcher {
                     Arc::clone(&open_file.description),
                     open_file.host_fd_owner.clone(),
                 ),
+                None if is_stdio_fd(old_fd.0) && this.stdio_is_closed(old_fd.0) => {
+                    // The source stdio fd was explicitly closed and not
+                    // reopened: dup3 from a closed fd is EBADF.
+                    return Ok(LINUX_EBADF.into());
+                }
                 None if is_stdio_fd(old_fd.0) => {
                     // Shell `2>&1` style redirects: the source fd is the
                     // process's real host fd 0/1/2 (no OpenDescription was
@@ -1926,6 +1937,15 @@ impl SyscallDispatcher {
             let fd: Fd = fd;
             let command = cmd;
             let arg = arg;
+            // A stdio fd the guest explicitly closed (and did not reopen) is a
+            // genuinely closed descriptor: every fcntl on it is EBADF, NOT the
+            // implicit-stdio fallbacks below (F_GETFL/F_GETFD/F_SETFL on bare
+            // stdio). CPython's init_sys_streams uses fcntl(F_GETFL) to size up
+            // each std fd at startup and treats EBADF as "stream is closed →
+            // sys.stdin/out/err = None" (test_cmd_line.test_no_std*).
+            if this.stdio_is_closed(fd.0) {
+                return Ok(LINUX_EBADF.into());
+            }
             Ok(match command {
                 LINUX_F_DUPFD => match linux_min_fd(arg) {
                     Ok(min_fd) => this.duplicate_fd(fd.0, min_fd, 0),
@@ -3262,8 +3282,10 @@ impl SyscallDispatcher {
                 // valid call on an unseekable pipe/tty — kernel returns
                 // ESPIPE, not EBADF. Returning EBADF confuses glibc's
                 // ftell/fclose path into reporting "write error: Bad
-                // file descriptor" after every successful write.
-                if is_stdio_fd(fd.0) {
+                // file descriptor" after every successful write. BUT a
+                // stdio fd the guest explicitly closed is genuinely closed:
+                // lseek on it is EBADF, not ESPIPE.
+                if is_stdio_fd(fd.0) && !this.stdio_is_closed(fd.0) {
                     return Ok(LINUX_ESPIPE.into());
                 }
                 return Ok(LINUX_EBADF.into());
@@ -3373,6 +3395,11 @@ impl SyscallDispatcher {
             // wait on EAGAIN instead of blocking under the dispatcher lock. (read has no
             // per-call non-blocking flag.) Computed before the open_files borrow.
             let nonblocking = this.io_is_nonblocking(fd.0, 0);
+            // A stdio fd the guest explicitly closed (and did not reopen) is a
+            // genuinely closed descriptor: read is EBADF, not a host-stdin read.
+            if this.stdio_is_closed(fd.0) {
+                return Ok(LINUX_EBADF.into());
+            }
             // fd 0 with no explicit OpenDescription: read from host stdin.
             // This is what makes `read` against the guest's stdin pick up
             // input from the user's terminal (or whatever the carrick host
@@ -4765,6 +4792,11 @@ impl SyscallDispatcher {
                 }
                 return Ok(outcome);
             }
+            // A stdio fd the guest explicitly closed (and did not reopen) is
+            // genuinely closed: write is EBADF, not a host-stream/buffer write.
+            if this.stdio_is_closed(fd as i32) {
+                return Ok(LINUX_EBADF.into());
+            }
             if *this.io.stream_stdio.lock() && (fd == 1 || fd == 2) {
                 // Stream bare stdio to the inherited stdout/stderr (the user's
                 // tty/pipe) exactly like writev does — do NOT buffer it. Buffering
@@ -4796,6 +4828,11 @@ impl SyscallDispatcher {
                 Ok(iovecs) => iovecs,
                 Err(errno) => return Ok(errno.into()),
             };
+            // A stdio fd the guest explicitly closed (and did not reopen) is
+            // genuinely closed: writev is EBADF, not a host-stream/buffer write.
+            if this.stdio_is_closed(fd as i32) {
+                return Ok(LINUX_EBADF.into());
+            }
             let nonblocking = this.io_is_nonblocking(fd as i32, 0);
 
             let mut total = 0usize;

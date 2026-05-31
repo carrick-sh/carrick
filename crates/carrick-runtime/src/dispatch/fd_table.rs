@@ -593,6 +593,20 @@ pub(super) enum OpenStatSource {
         path: String,
         fallback: StatRecord,
     },
+    /// A stream backed by a real host fd whose Linux file-TYPE must reflect what
+    /// the host fd actually is, decided by `fstat(host_fd)`. A `HostPipe` covers
+    /// BOTH an anonymous pipe end (host `pipe()` fd → `S_IFIFO`) AND a host
+    /// character device like `/dev/null`/`/dev/zero`/`/dev/urandom` (host
+    /// chardev → `S_IFCHR`). Hard-coding `S_IFIFO` made CPython mis-detect
+    /// `/dev/null` (reopened over a closed fd 0/1/2 at startup) as a pipe and
+    /// abort `init_sys_streams` (test_cmd_line.test_no_std*). fstat the real
+    /// host fd: a chardev reports `S_IFCHR`, a pipe `S_IFIFO`. `fallback_mode`
+    /// is used if the host fstat fails.
+    HostStream {
+        host_fd: i32,
+        label: String,
+        fallback_mode: u32,
+    },
 }
 
 impl OpenDescription {
@@ -735,13 +749,23 @@ impl OpenDescription {
                     LINUX_S_IFIFO | 0o600,
                 ))
             }
-            OpenDescription::HostPipe { pty, .. } => {
-                let (label, type_bits) = if pty.is_some() {
-                    ("char:[carrick-pty]", LINUX_S_IFCHR)
+            OpenDescription::HostPipe { pty, host_fd, .. } => {
+                if pty.is_some() {
+                    OpenStatSource::Record(StatRecord::synthetic(
+                        "char:[carrick-pty]",
+                        0,
+                        LINUX_S_IFCHR | 0o600,
+                    ))
                 } else {
-                    ("pipe:[carrick]", LINUX_S_IFIFO)
-                };
-                OpenStatSource::Record(StatRecord::synthetic(label, 0, type_bits | 0o600))
+                    // Anonymous pipe end OR a host character device (/dev/null,
+                    // /dev/zero, …). fstat the real host fd to recover the true
+                    // Linux file type instead of always claiming S_IFIFO.
+                    OpenStatSource::HostStream {
+                        host_fd: *host_fd,
+                        label: "pipe:[carrick]".to_string(),
+                        fallback_mode: LINUX_S_IFIFO | 0o600,
+                    }
+                }
             }
             OpenDescription::HostSocket { .. } | OpenDescription::Netlink { .. } => {
                 OpenStatSource::Record(StatRecord::synthetic(
