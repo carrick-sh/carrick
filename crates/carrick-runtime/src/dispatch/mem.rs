@@ -798,7 +798,20 @@ impl SyscallDispatcher {
                     return Ok(LINUX_ENOMEM.into());
                 };
                 if range_within(old_address.0, new_size, LINUX_MMAP_BASE, crate::memory::mmap_arena_size()) {
-                    this.mem.lock().mmap_next = new_end;
+                    {
+                        let mut mem = this.mem.lock();
+                        mem.mmap_next = new_end;
+                        // Advance the dirty high-water to cover the grown tail.
+                        // The guest dirties [old_end, new_end); without this, a
+                        // later munmap+rebump into that range sees addr >=
+                        // mmap_dirty_high, assumes it pristine, SKIPS the
+                        // zero-fill, and hands back STALE bytes — read as a
+                        // pointer (far=0x5858…='X'*8) → SIGSEGV in multiprocessing
+                        // Pool (test_async_timeout). Same stale-memory class as
+                        // the mmap-bump zero-fill fix; the in-place-grow path was
+                        // the missed sibling.
+                        mem.mmap_dirty_high = mem.mmap_dirty_high.max(new_end);
+                    }
                     // Re-validate the freshly-grown tail [old_end, new_end). Those
                     // pages can be a range reclaimed from a prior munmap (which
                     // invalidated their stage-1 leaves and rolled mmap_next back),
