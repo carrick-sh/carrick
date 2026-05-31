@@ -3456,14 +3456,14 @@ pub fn is_aarch64_hvc_exception(syndrome: u64) -> bool {
 
 /// True for the EL1 stage-1 maintenance trampoline's `hvc #1` completion
 /// marker. The HVC immediate is the low 16 bits of the syndrome ISS. Distinct
-/// from the `hvc #0` syscall forward so the maintenance run loop and the
+/// from the `hvc #2` syscall forward so the maintenance run loop and the
 /// syscall trap path never confuse the two.
 pub fn is_aarch64_hvc_maintenance(syndrome: u64) -> bool {
     is_aarch64_hvc_exception(syndrome) && (syndrome & 0xffff) == 1
 }
 
 /// True for syscall-shaped traps that the host can dispatch identically:
-/// EL0 `svc #0` (`EC = 0x15`) and our EL1 vector's `hvc #0` re-trap
+/// EL0 `svc #0` (`EC = 0x15`) and our EL1 vector's `hvc #2` re-trap
 /// (`EC = 0x16`). Both deliver the syscall ABI registers unchanged.
 pub fn is_aarch64_syscall_exception(syndrome: u64) -> bool {
     is_aarch64_svc_exception(syndrome) || is_aarch64_hvc_exception(syndrome)
