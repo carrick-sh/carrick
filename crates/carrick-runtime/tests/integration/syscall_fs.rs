@@ -4542,6 +4542,202 @@ fn bind_mount_create_stamps_guest_owner_on_files_and_directories() {
 }
 
 #[test]
+fn bind_mount_directory_inotify_reports_created_child_name() {
+    const IN_NONBLOCK: u64 = 0o4000;
+    const IN_MODIFY: u64 = 0x2;
+    const IN_CREATE: u64 = 0x100;
+    let scratch = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(scratch.path().join("nodejs-bindcreate")).unwrap();
+    std::fs::create_dir(scratch.path().join("nodejs-bindcreate/watch_dir")).unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x800]);
+    memory
+        .write_bytes(0x4000, b"/tmp/nodejs-bindcreate/watch_dir\0")
+        .unwrap();
+    memory
+        .write_bytes(0x4040, b"/tmp/nodejs-bindcreate/watch_dir/fsevent-0\0")
+        .unwrap();
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.register_mount(
+        std::path::PathBuf::from("/tmp"),
+        Box::new(BindVfs::new("/tmp", scratch.path().to_path_buf(), false)),
+    );
+    let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
+        d.dispatch(
+            SyscallRequest::new(nr, SyscallArgs::from(args)),
+            m,
+            &reporter,
+        )
+        .unwrap()
+    };
+
+    let ifd = match run(
+        &mut dispatcher,
+        &mut memory,
+        26,
+        [IN_NONBLOCK, 0, 0, 0, 0, 0],
+    ) {
+        DispatchOutcome::Returned { value } => value as u64,
+        other => panic!("inotify_init1: {other:?}"),
+    };
+    let wd = match run(
+        &mut dispatcher,
+        &mut memory,
+        27,
+        [ifd, 0x4000, IN_MODIFY | IN_CREATE, 0, 0, 0],
+    ) {
+        DispatchOutcome::Returned { value } => value as i32,
+        other => panic!("directory inotify_add_watch: {other:?}"),
+    };
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            56,
+            [
+                LINUX_AT_FDCWD,
+                0x4040,
+                LINUX_O_CREAT | LINUX_O_RDWR,
+                0o644,
+                0,
+                0,
+            ],
+        ),
+        DispatchOutcome::Returned { value: 4 }
+    );
+    assert_eq!(
+        run(&mut dispatcher, &mut memory, 57, [4, 0, 0, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    let n = match run(
+        &mut dispatcher,
+        &mut memory,
+        63,
+        [ifd, 0x4200, 128, 0, 0, 0],
+    ) {
+        DispatchOutcome::Returned { value } => value as usize,
+        other => panic!("directory inotify read after child create: {other:?}"),
+    };
+    assert!(n >= 28, "inotify bytes {n}");
+    let event = memory.read_bytes(0x4200, n).unwrap();
+    let got_wd = i32::from_ne_bytes(event[0..4].try_into().unwrap());
+    assert_eq!(got_wd, wd);
+    let name_len = u32::from_ne_bytes(event[12..16].try_into().unwrap()) as usize;
+    assert!(name_len >= "fsevent-0\0".len(), "name len {name_len}");
+    let name = &event[16..16 + "fsevent-0".len()];
+    assert_eq!(name, b"fsevent-0");
+
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn host_overlay_directory_inotify_reports_created_child_name() {
+    const IN_NONBLOCK: u64 = 0o4000;
+    const IN_MODIFY: u64 = 0x2;
+    const IN_CREATE: u64 = 0x100;
+    let scratch_root = tempfile::TempDir::new().unwrap();
+    let backend = HostFsBackend::new_in(scratch_root.path()).unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x800]);
+    memory.write_bytes(0x4000, b"/nodejs-hostcreate\0").unwrap();
+    memory
+        .write_bytes(0x4040, b"/nodejs-hostcreate/watch_dir\0")
+        .unwrap();
+    memory
+        .write_bytes(0x4080, b"/nodejs-hostcreate/watch_dir/fsevent-0\0")
+        .unwrap();
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.set_fs_backend(Box::new(backend));
+    let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
+        d.dispatch(
+            SyscallRequest::new(nr, SyscallArgs::from(args)),
+            m,
+            &reporter,
+        )
+        .unwrap()
+    };
+
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            34,
+            [LINUX_AT_FDCWD, 0x4000, 0o755, 0, 0, 0],
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            34,
+            [LINUX_AT_FDCWD, 0x4040, 0o755, 0, 0, 0],
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    let ifd = match run(
+        &mut dispatcher,
+        &mut memory,
+        26,
+        [IN_NONBLOCK, 0, 0, 0, 0, 0],
+    ) {
+        DispatchOutcome::Returned { value } => value as u64,
+        other => panic!("inotify_init1: {other:?}"),
+    };
+    let wd = match run(
+        &mut dispatcher,
+        &mut memory,
+        27,
+        [ifd, 0x4040, IN_MODIFY | IN_CREATE, 0, 0, 0],
+    ) {
+        DispatchOutcome::Returned { value } => value as i32,
+        other => panic!("directory inotify_add_watch: {other:?}"),
+    };
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            56,
+            [
+                LINUX_AT_FDCWD,
+                0x4080,
+                LINUX_O_CREAT | LINUX_O_RDWR,
+                0o644,
+                0,
+                0,
+            ],
+        ),
+        DispatchOutcome::Returned { value: 4 }
+    );
+    assert_eq!(
+        run(&mut dispatcher, &mut memory, 57, [4, 0, 0, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    let n = match run(
+        &mut dispatcher,
+        &mut memory,
+        63,
+        [ifd, 0x4200, 128, 0, 0, 0],
+    ) {
+        DispatchOutcome::Returned { value } => value as usize,
+        other => panic!("directory inotify read after child create: {other:?}"),
+    };
+    assert!(n >= 28, "inotify bytes {n}");
+    let event = memory.read_bytes(0x4200, n).unwrap();
+    let got_wd = i32::from_ne_bytes(event[0..4].try_into().unwrap());
+    assert_eq!(got_wd, wd);
+    let name_len = u32::from_ne_bytes(event[12..16].try_into().unwrap()) as usize;
+    assert!(name_len >= "fsevent-0\0".len(), "name len {name_len}");
+    let name = &event[16..16 + "fsevent-0".len()];
+    assert_eq!(name, b"fsevent-0");
+
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
 fn bind_mount_repeated_relative_stat_after_guest_mkdir_uses_host_tree() {
     let scratch = tempfile::TempDir::new().unwrap();
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x800]);

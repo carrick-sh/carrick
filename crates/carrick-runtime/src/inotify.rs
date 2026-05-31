@@ -7,15 +7,15 @@
 //! inotify fd drains the kqueue and formats Linux `struct inotify_event`
 //! records.
 //!
-//! Scope: this watches target vnodes plus, for bind-mounted directories, the
-//! child vnodes that exist when the watch is registered. That covers file and
-//! directory fs-event smoke paths that modify existing children by name.
-//! Creation/deletion discovery for children added after registration is still a
-//! documented follow-up — kqueue reports directory writes but not which entry
-//! changed.
+//! Scope: this watches target vnodes plus, for host-backed directories, the
+//! child vnodes that exist when the watch is registered. Directory vnode writes
+//! are paired with a host directory snapshot/diff so children created or removed
+//! after registration still surface Linux-style basename events.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::os::fd::RawFd;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 
 use parking_lot::Mutex;
 
@@ -28,9 +28,7 @@ pub(crate) const IN_ATTRIB: u32 = 0x0000_0004;
 pub(crate) const IN_CLOSE_WRITE: u32 = 0x0000_0008;
 pub(crate) const IN_MOVED_FROM: u32 = 0x0000_0040;
 pub(crate) const IN_MOVED_TO: u32 = 0x0000_0080;
-// IN_CREATE (0x100) is intentionally omitted: kqueue's EVFILT_VNODE reports a
-// directory was written but not *which* entry changed, so file-creation events
-// for children added after watch registration are a follow-up.
+pub(crate) const IN_CREATE: u32 = 0x0000_0100;
 pub(crate) const IN_DELETE: u32 = 0x0000_0200;
 pub(crate) const IN_DELETE_SELF: u32 = 0x0000_0400;
 pub(crate) const IN_MOVE_SELF: u32 = 0x0000_0800;
@@ -52,7 +50,7 @@ const LINUX_ENOSPC: i32 = 28;
 /// common set so a broad `IN_ALL_EVENTS` watch behaves sensibly.
 fn linux_mask_to_note(mask: u32) -> u32 {
     let mut note = 0;
-    if mask & (IN_MODIFY | IN_CLOSE_WRITE | IN_ACCESS) != 0 {
+    if mask & (IN_MODIFY | IN_CLOSE_WRITE | IN_ACCESS | IN_CREATE | IN_DELETE) != 0 {
         note |= libc::NOTE_WRITE | libc::NOTE_EXTEND;
     }
     if mask & IN_ATTRIB != 0 {
@@ -98,9 +96,16 @@ struct Watch {
 }
 
 #[derive(Clone, Debug)]
+struct ScannedDir {
+    path: PathBuf,
+    entries: HashSet<Vec<u8>>,
+}
+
+#[derive(Clone, Debug)]
 struct WatchedFd {
     wd: i32,
     name: Option<Vec<u8>>,
+    scan_dir: Option<ScannedDir>,
 }
 
 #[derive(Debug)]
@@ -185,11 +190,18 @@ impl InotifyState {
         let wd = inner.next_wd;
         inner.next_wd += 1;
         for watch_fd in &watch_fds {
+            let scan_dir = watch_fd.scan_dir.as_ref().and_then(|path| {
+                scan_dir_entries(path).ok().map(|entries| ScannedDir {
+                    path: path.clone(),
+                    entries,
+                })
+            });
             inner.wd_by_fd.insert(
                 watch_fd.host_fd,
                 WatchedFd {
                     wd,
                     name: watch_fd.name.clone(),
+                    scan_dir,
                 },
             );
         }
@@ -236,6 +248,15 @@ impl InotifyState {
             };
             let wd = watched.wd;
             let requested = inner.watches.get(&wd).map(|w| w.mask).unwrap_or(0);
+            if let Some(scan_dir) = watched.scan_dir {
+                if let Some(records) =
+                    Self::scan_directory_records(&mut inner, fd, wd, requested, scan_dir)
+                    && !records.is_empty()
+                {
+                    inner.pending.extend(records);
+                    continue;
+                }
+            }
             let mask = note_to_linux_mask(ev.fflags(), requested);
             if mask == 0 {
                 continue;
@@ -266,6 +287,51 @@ impl InotifyState {
         }
         Ok(out)
     }
+
+    fn scan_directory_records(
+        inner: &mut Inner,
+        fd: RawFd,
+        wd: i32,
+        requested: u32,
+        mut scan_dir: ScannedDir,
+    ) -> Option<Vec<Vec<u8>>> {
+        let current = scan_dir_entries(&scan_dir.path).ok()?;
+        let mut records = Vec::new();
+        let mut added: Vec<Vec<u8>> = current.difference(&scan_dir.entries).cloned().collect();
+        let mut removed: Vec<Vec<u8>> = scan_dir.entries.difference(&current).cloned().collect();
+        added.sort();
+        removed.sort();
+
+        let create_mask = requested & IN_CREATE;
+        let delete_mask = requested & IN_DELETE;
+        let fallback_mask = requested & IN_MODIFY;
+        for name in added {
+            let mask = if create_mask != 0 {
+                create_mask
+            } else {
+                fallback_mask
+            };
+            if mask != 0 {
+                records.push(encode_event(wd, mask, Some(&name)));
+            }
+        }
+        for name in removed {
+            let mask = if delete_mask != 0 {
+                delete_mask
+            } else {
+                fallback_mask
+            };
+            if mask != 0 {
+                records.push(encode_event(wd, mask, Some(&name)));
+            }
+        }
+
+        scan_dir.entries = current;
+        if let Some(watched) = inner.wd_by_fd.get_mut(&fd) {
+            watched.scan_dir = Some(scan_dir);
+        }
+        Some(records)
+    }
 }
 
 fn encode_event(wd: i32, mask: u32, name: Option<&[u8]>) -> Vec<u8> {
@@ -284,6 +350,15 @@ fn encode_event(wd: i32, mask: u32, name: Option<&[u8]>) -> Vec<u8> {
 
 fn align4(len: usize) -> usize {
     (len + 3) & !3
+}
+
+fn scan_dir_entries(path: &Path) -> std::io::Result<HashSet<Vec<u8>>> {
+    let mut entries = HashSet::new();
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        entries.insert(entry.file_name().as_bytes().to_vec());
+    }
+    Ok(entries)
 }
 
 impl Drop for InotifyState {

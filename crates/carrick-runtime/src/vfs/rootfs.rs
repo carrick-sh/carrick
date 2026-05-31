@@ -26,7 +26,7 @@ use crate::rootfs::{RootFs, RootFsDirEntry, RootFsEntryKind, RootFsError, RootFs
 
 use super::{
     DirEnt, EntryKind, MAX_IN_MEMORY_FILE_SIZE, Metadata, OpenContext, OpenFlags, Vfs, VfsError,
-    VfsHandle,
+    VfsHandle, WatchFd,
 };
 
 /// The `/` mount. Owns the immutable OCI rootfs (`rootfs`) and the
@@ -317,6 +317,10 @@ impl RootFsVfs {
                 }
             }
         }
+    }
+
+    pub fn watch_fds(&self, path: &str) -> Result<Vec<WatchFd>, VfsError> {
+        self.overlay.watch_fds(path)
     }
 
     /// Layered rename with optional `RENAME_NOREPLACE` semantics.

@@ -72,6 +72,7 @@ pub type VfsError = i32;
 pub struct WatchFd {
     pub host_fd: i32,
     pub name: Option<Vec<u8>>,
+    pub scan_dir: Option<PathBuf>,
 }
 
 impl WatchFd {
@@ -79,6 +80,7 @@ impl WatchFd {
         Self {
             host_fd,
             name: None,
+            scan_dir: None,
         }
     }
 
@@ -86,6 +88,15 @@ impl WatchFd {
         Self {
             host_fd,
             name: Some(name),
+            scan_dir: None,
+        }
+    }
+
+    pub(crate) fn scanning_directory(host_fd: i32, host_path: PathBuf) -> Self {
+        Self {
+            host_fd,
+            name: None,
+            scan_dir: Some(host_path),
         }
     }
 }

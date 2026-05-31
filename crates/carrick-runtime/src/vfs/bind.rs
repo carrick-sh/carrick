@@ -380,7 +380,12 @@ impl Vfs for BindVfs {
 
     fn watch_fds(&self, path: &str) -> Result<Vec<WatchFd>, VfsError> {
         let host = self.to_host(path)?;
-        let mut fds = vec![WatchFd::unnamed(open_watch_fd(&host)?)];
+        let root_fd = open_watch_fd(&host)?;
+        let mut fds = if host.is_dir() {
+            vec![WatchFd::scanning_directory(root_fd, host.clone())]
+        } else {
+            vec![WatchFd::unnamed(root_fd)]
+        };
         if host.is_dir() {
             for entry in std::fs::read_dir(&host).map_err(map_io_error)? {
                 let entry = entry.map_err(map_io_error)?;
