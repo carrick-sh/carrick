@@ -2273,7 +2273,11 @@ impl SyscallDispatcher {
             if let Some(resolved) = resolved_guest_unix_path {
                 let umask = this.cred_snapshot().umask & 0o777;
                 let mode = 0o777 & !umask;
-                let _ = this.fs.rootfs_vfs.overlay.create_socket(&resolved, mode);
+                if let Some(m) = this.fs.vfs_mounts.resolve(&resolved) {
+                    let _ = m.vfs.create_socket(&m.full_path, mode);
+                } else {
+                    let _ = this.fs.rootfs_vfs.overlay.create_socket(&resolved, mode);
+                }
             }
             Ok(DispatchOutcome::Returned { value: 0 })
 

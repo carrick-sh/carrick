@@ -964,6 +964,8 @@ const CARRICK_GID_XATTR: &[u8] = b"user.carrick.gid\0";
 /// on-disk file) and hidden from the guest's get/set/listxattr like the others.
 const CARRICK_SOCKET_XATTR: &[u8] = b"user.carrick.socket\0";
 #[allow(dead_code)]
+pub(crate) const CARRICK_SOCKET_XATTR_NAME: &str = "user.carrick.socket";
+#[allow(dead_code)]
 pub(crate) const CARRICK_UID_XATTR_NAME: &str = "user.carrick.uid";
 #[allow(dead_code)]
 pub(crate) const CARRICK_GID_XATTR_NAME: &str = "user.carrick.gid";

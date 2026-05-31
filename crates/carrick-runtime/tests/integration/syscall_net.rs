@@ -16,11 +16,13 @@ use support::*;
 use carrick_runtime::io_wait::{ThreadWaiter, WaitResult};
 use carrick_runtime::linux_abi::{
     LINUX_AF_INET, LINUX_AT_FDCWD, LINUX_EADDRINUSE, LINUX_ECONNREFUSED, LINUX_EINTR, LINUX_ENOENT,
-    LINUX_EPOLLOUT, LINUX_O_CREAT, LINUX_O_RDWR, LINUX_SOCK_CLOEXEC, LINUX_SOCK_NONBLOCK,
-    LINUX_SOCK_STREAM, LINUX_SOL_TCP,
+    LINUX_ENXIO, LINUX_EPOLLOUT, LINUX_O_CREAT, LINUX_O_RDWR, LINUX_SOCK_CLOEXEC,
+    LINUX_SOCK_NONBLOCK, LINUX_SOCK_STREAM, LINUX_SOL_TCP,
 };
 #[cfg(target_os = "macos")]
 use carrick_runtime::thread::{FutexTable, ThreadRegistry};
+#[cfg(target_os = "macos")]
+use carrick_runtime::vfs::BindVfs;
 #[cfg(target_os = "macos")]
 use std::sync::{Arc, Mutex, mpsc};
 #[cfg(target_os = "macos")]
@@ -390,6 +392,118 @@ fn unix_relative_socket_getsockname_can_be_chmodded() {
     let stat = read_stat(&memory, 0x4700);
     let mode = stat.st_mode;
     assert_eq!(mode & 0o777, 0o444);
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn unix_relative_socket_under_bind_mount_can_be_chmodded() {
+    const LINUX_AF_UNIX: u16 = 1;
+    let scratch = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(scratch.path().join("nodejs-bindsock")).unwrap();
+
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0xa00]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.register_mount(
+        std::path::PathBuf::from("/tmp"),
+        Box::new(BindVfs::new("/tmp", scratch.path().to_path_buf(), false)),
+    );
+    dispatcher.set_cwd("/tmp/nodejs-bindsock");
+    let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
+        d.dispatch(
+            SyscallRequest::new(nr, SyscallArgs::from(args)),
+            m,
+            &reporter,
+        )
+        .unwrap()
+    };
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let guest_path = format!("uv-test-sock-{nanos}");
+    let gpb = guest_path.as_bytes();
+    let mut sa = vec![0u8; 2 + gpb.len() + 1];
+    sa[0..2].copy_from_slice(&LINUX_AF_UNIX.to_ne_bytes());
+    sa[2..2 + gpb.len()].copy_from_slice(gpb);
+    memory.write_bytes(0x4200, &sa).unwrap();
+
+    let fd = match run(
+        &mut dispatcher,
+        &mut memory,
+        198,
+        [LINUX_AF_UNIX as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
+    ) {
+        DispatchOutcome::Returned { value } => value as u64,
+        other => panic!("socket failed: {other:?}"),
+    };
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            200,
+            [fd, 0x4200, sa.len() as u64, 0, 0, 0],
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    memory.write_bytes(0x4500, &128u32.to_ne_bytes()).unwrap();
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            204,
+            [fd, 0x4400, 0x4500, 0, 0, 0],
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let out_len = {
+        let b = memory.read_bytes(0x4500, 4).unwrap();
+        u32::from_ne_bytes([b[0], b[1], b[2], b[3]]) as usize
+    };
+    let out = memory.read_bytes(0x4400, out_len).unwrap();
+    let returned_path = &out[2..];
+    let returned_path = &returned_path[..returned_path
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(returned_path.len())];
+    assert_eq!(returned_path, gpb);
+
+    let mut chmod_path = returned_path.to_vec();
+    chmod_path.push(0);
+    memory.write_bytes(0x4600, &chmod_path).unwrap();
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            53,
+            [LINUX_AT_FDCWD, 0x4600, 0o444, 0, 0, 0],
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            79,
+            [LINUX_AT_FDCWD, 0x4600, 0x4700, 0, 0, 0],
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let stat = read_stat(&memory, 0x4700);
+    assert_eq!(stat.st_mode & LINUX_S_IFMT, LINUX_S_IFSOCK);
+    assert_eq!(stat.st_mode & 0o777, 0o444);
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            56,
+            [LINUX_AT_FDCWD, 0x4600, LINUX_O_RDWR, 0, 0, 0],
+        ),
+        DispatchOutcome::Errno { errno: LINUX_ENXIO }
+    );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
