@@ -1,14 +1,16 @@
 //! OCI image resolution and layer-fetching support used by the CLI and
 //! engine crates.
 
+use std::collections::HashMap;
 use std::env;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use oci_client::Client;
-use oci_client::client::ClientConfig;
+use oci_client::client::{ClientConfig, ImageLayer};
 use oci_client::manifest::{
     IMAGE_DOCKER_LAYER_GZIP_MEDIA_TYPE, IMAGE_DOCKER_LAYER_TAR_MEDIA_TYPE,
-    IMAGE_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_MEDIA_TYPE, ImageIndexEntry,
+    IMAGE_LAYER_GZIP_MEDIA_TYPE, IMAGE_LAYER_MEDIA_TYPE, ImageIndexEntry, OciImageManifest,
 };
 use oci_client::secrets::RegistryAuth;
 use serde::{Deserialize, Serialize};
@@ -261,7 +263,7 @@ pub async fn pull_image_with_platform(
     target: &PlatformTarget,
 ) -> Result<PullSummary, OciBootstrapError> {
     let client = build_oci_client_for(target);
-    let data = client
+    let mut data = client
         .pull(
             image.as_oci_reference(),
             &RegistryAuth::Anonymous,
@@ -277,8 +279,10 @@ pub async fn pull_image_with_platform(
     fs::create_dir_all(store.root.join("blobs").join("sha256")).await?;
     let config_size = data.config.data.len();
 
-    let mut layers = Vec::with_capacity(data.layers.len());
-    for layer in data.layers {
+    let ordered_layers =
+        layers_in_manifest_order(data.manifest.as_ref(), std::mem::take(&mut data.layers))?;
+    let mut layers = Vec::with_capacity(ordered_layers.len());
+    for layer in ordered_layers {
         let digest = layer.sha256_digest();
         let path = store.blob_path(&digest)?;
         if let Some(parent) = path.parent() {
@@ -317,6 +321,82 @@ pub async fn pull_image_with_platform(
     )
     .await?;
     Ok(summary)
+}
+
+fn layers_in_manifest_order(
+    manifest: Option<&OciImageManifest>,
+    layers: Vec<ImageLayer>,
+) -> Result<Vec<ImageLayer>, OciBootstrapError> {
+    let Some(manifest) = manifest else {
+        return Ok(layers);
+    };
+
+    let mut by_digest: HashMap<String, Vec<ImageLayer>> = HashMap::with_capacity(layers.len());
+    for layer in layers {
+        by_digest
+            .entry(layer.sha256_digest())
+            .or_default()
+            .push(layer);
+    }
+
+    let mut ordered = Vec::with_capacity(manifest.layers.len());
+    for descriptor in &manifest.layers {
+        let Some(mut bucket) = by_digest.remove(&descriptor.digest) else {
+            return Err(OciBootstrapError::InvalidDigest(format!(
+                "manifest referenced missing layer {}",
+                descriptor.digest
+            )));
+        };
+        let layer = bucket.pop().expect("non-empty layer bucket");
+        if !bucket.is_empty() {
+            by_digest.insert(descriptor.digest.clone(), bucket);
+        }
+        ordered.push(layer);
+    }
+
+    if let Some(extra) = by_digest.keys().next() {
+        return Err(OciBootstrapError::InvalidDigest(format!(
+            "downloaded unreferenced layer {extra}"
+        )));
+    }
+
+    Ok(ordered)
+}
+
+fn layer_summaries_in_manifest_order(
+    manifest: &OciImageManifest,
+    layers: Vec<LayerSummary>,
+) -> Result<Vec<LayerSummary>, OciBootstrapError> {
+    let mut by_digest: HashMap<String, Vec<LayerSummary>> = HashMap::with_capacity(layers.len());
+    for layer in layers {
+        by_digest
+            .entry(layer.digest.clone())
+            .or_default()
+            .push(layer);
+    }
+
+    let mut ordered = Vec::with_capacity(manifest.layers.len());
+    for descriptor in &manifest.layers {
+        let Some(mut bucket) = by_digest.remove(&descriptor.digest) else {
+            return Err(OciBootstrapError::InvalidDigest(format!(
+                "manifest referenced missing layer {}",
+                descriptor.digest
+            )));
+        };
+        let layer = bucket.pop().expect("non-empty layer summary bucket");
+        if !bucket.is_empty() {
+            by_digest.insert(descriptor.digest.clone(), bucket);
+        }
+        ordered.push(layer);
+    }
+
+    if let Some(extra) = by_digest.keys().next() {
+        return Err(OciBootstrapError::InvalidDigest(format!(
+            "cached unreferenced layer {extra}"
+        )));
+    }
+
+    Ok(ordered)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -392,13 +472,22 @@ impl ImageStore {
             }
         };
 
-        let layers: Vec<camino::Utf8PathBuf> = summary
-            .layers
+        let image_dir = summary.image_dir.clone();
+        let layer_summaries = match fs::read(image_dir.join("manifest.json")).await {
+            Ok(manifest_bytes) => {
+                let manifest = serde_json::from_slice::<OciImageManifest>(&manifest_bytes)?;
+                layer_summaries_in_manifest_order(&manifest, summary.layers)?
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => summary.layers,
+            Err(err) => return Err(err.into()),
+        };
+
+        let layers: Vec<camino::Utf8PathBuf> = layer_summaries
             .iter()
             .map(|l| camino::Utf8PathBuf::from(l.path.to_string_lossy().into_owned()))
             .collect();
 
-        let config_path = summary.image_dir.join("config.json");
+        let config_path = image_dir.join("config.json");
         let config = match fs::read(&config_path).await {
             Ok(config_bytes) => serde_json::from_slice::<OciImageConfigContainer>(&config_bytes)
                 .map(|c| c.into_image_config())
@@ -528,6 +617,101 @@ mod tests {
             select_manifest_digest(&entries, &target),
             Some("sha256:arm64".to_string())
         );
+    }
+
+    #[test]
+    fn layers_are_reordered_to_manifest_order() {
+        use oci_client::client::ImageLayer;
+        use oci_client::manifest::{OciDescriptor, OciImageManifest};
+
+        let first = ImageLayer::oci_v1_gzip(b"first".to_vec(), None);
+        let second = ImageLayer::oci_v1_gzip(b"second".to_vec(), None);
+        let third = ImageLayer::oci_v1_gzip(b"third".to_vec(), None);
+        let first_digest = first.sha256_digest();
+        let second_digest = second.sha256_digest();
+        let third_digest = third.sha256_digest();
+
+        let mut manifest = OciImageManifest::default();
+        manifest.layers = vec![
+            OciDescriptor {
+                digest: first_digest,
+                size: first.data.len() as i64,
+                media_type: first.media_type.clone(),
+                ..OciDescriptor::default()
+            },
+            OciDescriptor {
+                digest: second_digest,
+                size: second.data.len() as i64,
+                media_type: second.media_type.clone(),
+                ..OciDescriptor::default()
+            },
+            OciDescriptor {
+                digest: third_digest,
+                size: third.data.len() as i64,
+                media_type: third.media_type.clone(),
+                ..OciDescriptor::default()
+            },
+        ];
+
+        let reordered = layers_in_manifest_order(Some(&manifest), vec![third, first, second])
+            .expect("layers should reorder");
+
+        assert_eq!(reordered[0].data, b"first");
+        assert_eq!(reordered[1].data, b"second");
+        assert_eq!(reordered[2].data, b"third");
+    }
+
+    #[test]
+    fn layer_summaries_are_reordered_to_manifest_order() {
+        use oci_client::manifest::{OciDescriptor, OciImageManifest};
+
+        let first = LayerSummary {
+            digest: "sha256:first".to_string(),
+            media_type: IMAGE_LAYER_GZIP_MEDIA_TYPE.to_string(),
+            size: 1,
+            path: PathBuf::from("/layers/first"),
+        };
+        let second = LayerSummary {
+            digest: "sha256:second".to_string(),
+            media_type: IMAGE_LAYER_GZIP_MEDIA_TYPE.to_string(),
+            size: 1,
+            path: PathBuf::from("/layers/second"),
+        };
+        let third = LayerSummary {
+            digest: "sha256:third".to_string(),
+            media_type: IMAGE_LAYER_GZIP_MEDIA_TYPE.to_string(),
+            size: 1,
+            path: PathBuf::from("/layers/third"),
+        };
+
+        let mut manifest = OciImageManifest::default();
+        manifest.layers = vec![
+            OciDescriptor {
+                digest: first.digest.clone(),
+                size: first.size as i64,
+                media_type: first.media_type.clone(),
+                ..OciDescriptor::default()
+            },
+            OciDescriptor {
+                digest: second.digest.clone(),
+                size: second.size as i64,
+                media_type: second.media_type.clone(),
+                ..OciDescriptor::default()
+            },
+            OciDescriptor {
+                digest: third.digest.clone(),
+                size: third.size as i64,
+                media_type: third.media_type.clone(),
+                ..OciDescriptor::default()
+            },
+        ];
+
+        let reordered = layer_summaries_in_manifest_order(&manifest, vec![third, first, second])
+            .expect("summaries should reorder");
+
+        assert_eq!(reordered[0].digest, "sha256:first");
+        assert_eq!(reordered[1].digest, "sha256:second");
+        assert_eq!(reordered[2].digest, "sha256:third");
     }
 
     #[test]
