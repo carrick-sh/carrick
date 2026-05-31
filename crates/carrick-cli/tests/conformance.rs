@@ -680,6 +680,11 @@ const TIMING_SENSITIVE_PROBES: &[&str] = &[
     // within 10s. The serial lane removes the 8-way carrick contention so the
     // probe still validates delivery without the host-saturation false flake.
     "sigchld",
+    // waitsiblingsigchld: same root cause as sigchld (cross-process SIGCHLD
+    // delivery is timing-sensitive). MATCHes standalone; flaked once under the
+    // 8-way gate load while a DIFFERENT probe flaked the next run — the
+    // signature of host-saturation jitter, not a code regression. Serial lane.
+    "waitsiblingsigchld",
 ];
 
 fn is_timing_sensitive(probe: &std::path::Path) -> bool {
