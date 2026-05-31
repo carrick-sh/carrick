@@ -1406,6 +1406,7 @@ impl SyscallDispatcher {
                     let _ = kq.apply(&[
                         crate::darwin_kqueue::Kevent::read(host_fd, libc::EV_DELETE),
                         crate::darwin_kqueue::Kevent::write(host_fd, libc::EV_DELETE),
+                        crate::darwin_kqueue::Kevent::oob(host_fd, libc::EV_DELETE),
                     ]);
                 }
             }

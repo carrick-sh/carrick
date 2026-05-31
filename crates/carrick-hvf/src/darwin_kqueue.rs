@@ -3,6 +3,12 @@
 
 use std::os::fd::RawFd;
 
+/// Darwin's exceptional-condition filter. The `libc` crate version used here
+/// does not expose this SDK constant.
+pub const EVFILT_EXCEPT: i16 = -15;
+/// `EVFILT_EXCEPT` hint for socket out-of-band data.
+pub const NOTE_OOB: u32 = 0x0000_0002;
+
 /// RAII owner for a Darwin kqueue fd.
 #[derive(Debug)]
 pub struct Kqueue {
@@ -104,6 +110,10 @@ impl Kevent {
 
     pub fn write(fd: RawFd, flags: u16) -> Self {
         Self::new(fd as usize, libc::EVFILT_WRITE, flags, 0)
+    }
+
+    pub fn oob(fd: RawFd, flags: u16) -> Self {
+        Self::new(fd as usize, EVFILT_EXCEPT, flags, NOTE_OOB)
     }
 
     /// Watch process `pid` for exit. The kqueue becomes read-ready (and a

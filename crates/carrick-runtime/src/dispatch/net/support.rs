@@ -23,20 +23,24 @@ pub(super) fn read_epoll_event(
 struct EpollKqFilters {
     read: bool,
     write: bool,
+    priority: bool,
 }
 
 fn epoll_kq_filters(events: u32) -> EpollKqFilters {
     let read = events & (LINUX_EPOLLIN | LINUX_EPOLLRDHUP | LINUX_EPOLLPRI) != 0;
     let write = events & LINUX_EPOLLOUT != 0;
+    let priority = events & LINUX_EPOLLPRI != 0;
     EpollKqFilters {
         read: read || !write,
         write,
+        priority,
     }
 }
 
 /// Build the kqueue change list to register a host-backed fd's epoll interest
-/// on the epoll instance's persistent kqueue. EPOLLIN/RDHUP/PRI ride the read
-/// filter (EV_EOF on read -> EPOLLRDHUP); EPOLLOUT rides the write filter.
+/// on the epoll instance's persistent kqueue. EPOLLIN/RDHUP ride the read
+/// filter (EV_EOF on read -> EPOLLRDHUP); EPOLLOUT rides the write filter;
+/// EPOLLPRI rides Darwin's exceptional-condition filter with NOTE_OOB.
 /// EPOLLET -> `EV_CLEAR` (edge); otherwise the filter is level-triggered,
 /// exactly matching Linux. `udata` carries the guest fd so a returned event
 /// maps straight back. A mask with neither IN nor OUT still arms a read filter
@@ -54,12 +58,15 @@ pub(super) fn epoll_kq_add_changes(
     };
     let base = libc::EV_ADD | libc::EV_ENABLE | edge;
     let filters = epoll_kq_filters(events);
-    let mut changes = Vec::with_capacity(2);
+    let mut changes = Vec::with_capacity(3);
     if filters.read {
         changes.push(Kevent::read(host_fd, base).with_udata(guest_fd));
     }
     if filters.write {
         changes.push(Kevent::write(host_fd, base).with_udata(guest_fd));
+    }
+    if filters.priority {
+        changes.push(Kevent::oob(host_fd, base).with_udata(guest_fd));
     }
     changes
 }
@@ -72,12 +79,15 @@ fn epoll_kq_removed_filter_changes(
     use crate::darwin_kqueue::Kevent;
     let old = epoll_kq_filters(old_events);
     let new = epoll_kq_filters(new_events);
-    let mut changes = Vec::with_capacity(2);
+    let mut changes = Vec::with_capacity(3);
     if old.read && !new.read {
         changes.push(Kevent::read(host_fd, libc::EV_DELETE));
     }
     if old.write && !new.write {
         changes.push(Kevent::write(host_fd, libc::EV_DELETE));
+    }
+    if old.priority && !new.priority {
+        changes.push(Kevent::oob(host_fd, libc::EV_DELETE));
     }
     changes
 }
@@ -101,6 +111,7 @@ pub(super) fn epoll_kq_delete(kqueue: &crate::darwin_kqueue::Kqueue, host_fd: i3
     use crate::darwin_kqueue::Kevent;
     let _ = kqueue.apply(&[Kevent::read(host_fd, libc::EV_DELETE)]);
     let _ = kqueue.apply(&[Kevent::write(host_fd, libc::EV_DELETE)]);
+    let _ = kqueue.apply(&[Kevent::oob(host_fd, libc::EV_DELETE)]);
 }
 
 pub(super) fn clear_pending_epoll_ready(
@@ -176,6 +187,12 @@ pub(super) fn kevent_to_epoll(ev: crate::darwin_kqueue::Kevent) -> u32 {
                     events |= LINUX_EPOLLERR;
                 }
             }
+        }
+        filter
+            if filter == crate::darwin_kqueue::EVFILT_EXCEPT
+                && ev.fflags() & crate::darwin_kqueue::NOTE_OOB != 0 =>
+        {
+            events |= LINUX_EPOLLPRI;
         }
         _ => {}
     }
@@ -1495,6 +1512,7 @@ mod tests {
             EpollKqFilters {
                 read: true,
                 write: false,
+                priority: false,
             }
         );
         assert_eq!(
@@ -1502,6 +1520,7 @@ mod tests {
             EpollKqFilters {
                 read: true,
                 write: false,
+                priority: false,
             }
         );
         assert_eq!(
@@ -1509,6 +1528,7 @@ mod tests {
             EpollKqFilters {
                 read: false,
                 write: true,
+                priority: false,
             }
         );
         assert_eq!(
@@ -1516,8 +1536,32 @@ mod tests {
             EpollKqFilters {
                 read: true,
                 write: true,
+                priority: false,
             }
         );
+        assert_eq!(
+            epoll_kq_filters(LINUX_EPOLLPRI),
+            EpollKqFilters {
+                read: true,
+                write: false,
+                priority: true,
+            }
+        );
+    }
+
+    #[test]
+    fn epoll_kqueue_changes_include_oob_filter_for_priority_events() {
+        let changes = epoll_kq_add_changes(42, 7, LINUX_EPOLLPRI);
+        assert!(changes.iter().any(|ev| ev.filter() == libc::EVFILT_READ));
+        assert!(
+            changes
+                .iter()
+                .any(|ev| ev.filter() == crate::darwin_kqueue::EVFILT_EXCEPT
+                    && ev.fflags() == crate::darwin_kqueue::NOTE_OOB)
+        );
+
+        let pri = crate::darwin_kqueue::Kevent::oob(42, 0);
+        assert_eq!(kevent_to_epoll(pri), LINUX_EPOLLPRI);
     }
 
     #[test]
@@ -1531,6 +1575,11 @@ mod tests {
             epoll_kq_removed_filter_changes(42, LINUX_EPOLLIN | LINUX_EPOLLOUT, LINUX_EPOLLIN);
         assert_eq!(removed.len(), 1);
         assert_eq!(removed[0].filter(), libc::EVFILT_WRITE);
+
+        let removed = epoll_kq_removed_filter_changes(42, LINUX_EPOLLPRI, LINUX_EPOLLIN);
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].filter(), crate::darwin_kqueue::EVFILT_EXCEPT);
+        assert_eq!(removed[0].fflags(), crate::darwin_kqueue::NOTE_OOB);
 
         assert!(epoll_kq_removed_filter_changes(42, LINUX_EPOLLIN, LINUX_EPOLLIN).is_empty());
     }
