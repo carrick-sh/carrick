@@ -296,7 +296,35 @@ impl SyscallDispatcher {
                     ready |= LINUX_POLLIN;
                 }
             }
-            OpenDescription::Epoll { .. } => {}
+            OpenDescription::Epoll {
+                interest,
+                pending_ready,
+                kqueue,
+                ..
+            } => {
+                if requested_events & LINUX_POLLIN != 0 {
+                    if !pending_ready.is_empty() {
+                        ready |= LINUX_POLLIN;
+                    } else {
+                        let mut pfd = libc::pollfd {
+                            fd: kqueue.raw_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        };
+                        let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+                        if rc > 0
+                            && pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
+                        {
+                            ready |= LINUX_POLLIN;
+                        } else if interest.iter().any(|(fd, interest)| {
+                            self.host_fd_for_poll(*fd).is_none()
+                                && self.epoll_ready_events(*fd, interest.event.events) != 0
+                        }) {
+                            ready |= LINUX_POLLIN;
+                        }
+                    }
+                }
+            }
             // Pidfd readiness is the kqueue's job (host_fd_for_poll returns the
             // EVFILT_PROC kqueue fd), so there's no in-memory readiness here.
             OpenDescription::Pidfd { .. } => {}
