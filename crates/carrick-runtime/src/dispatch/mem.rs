@@ -9,6 +9,19 @@ pub(super) struct MemState {
     pub brk_current: u64,
     /// Bump cursor for the anonymous mmap arena.
     pub mmap_next: u64,
+    /// MONOTONIC high-water of the arena: the highest address ever handed out by
+    /// the bump allocator, which `munmap` NEVER lowers (unlike `mmap_next`).
+    ///
+    /// The bump path assumes `[mmap_next, ...)` is pristine (lazily zero-filled
+    /// guest RAM), so it skips the zero-fill that reused `free_regions` get. That
+    /// invariant breaks when `munmap` frees the TOP region and LOWERS `mmap_next`
+    /// back over pages the guest already dirtied: a later bump allocation at the
+    /// lowered cursor would return that STALE data instead of the zeroed anon
+    /// memory Linux guarantees. Tracking the true dirty high-water lets the mmap
+    /// handler zero exactly the re-handed-out (below-high-water) ranges and keep
+    /// the genuinely-fresh tail lazily zero. (CPython test_subprocess SEGV:
+    /// pymalloc got 'x'-filled stderr-buffer pages back from a post-munmap mmap.)
+    pub mmap_dirty_high: u64,
     /// Sub-allocator for the boot-mapped shared aperture. Guest `MAP_SHARED`
     /// mmaps carve sub-ranges here; the aperture itself is `hv_vm_map`'d once
     /// at boot, so no stage-2 mutation happens at mmap time.
@@ -39,6 +52,7 @@ impl MemState {
         Self {
             brk_current: LINUX_HEAP_BASE,
             mmap_next: LINUX_MMAP_BASE,
+            mmap_dirty_high: LINUX_MMAP_BASE,
             shared: crate::shared_aperture::SharedAperture::new(),
             overlay: crate::shared_aperture::SharedAperture::with_window(
                 crate::memory::LINUX_PRIVATE_OVERLAY_BASE,
@@ -107,7 +121,13 @@ impl SyscallDispatcher {
                 let end = requested.checked_add(length)?;
                 if requested >= mem.mmap_next {
                     mem.mmap_next = end;
-                    return Some((requested, false));
+                    // `reused` (forces a zero-fill) iff this bump landed on memory
+                    // the guest already dirtied below the monotonic dirty high-
+                    // water (mmap_next was lowered by a prior munmap). Above the
+                    // high-water it's pristine guest RAM — keep it lazily zero.
+                    let stale = requested < mem.mmap_dirty_high;
+                    mem.mmap_dirty_high = mem.mmap_dirty_high.max(end);
+                    return Some((requested, stale));
                 }
             }
         }
@@ -131,8 +151,14 @@ impl SyscallDispatcher {
         ) {
             return None;
         }
-        mem.mmap_next = address.checked_add(length)?;
-        Some((address, false))
+        let end = address.checked_add(length)?;
+        mem.mmap_next = end;
+        // Same dirty-high-water discipline as the hint path: a bump allocation
+        // that dips below the high-water (because munmap lowered mmap_next over
+        // already-touched pages) must be zeroed, not returned with stale bytes.
+        let stale = address < mem.mmap_dirty_high;
+        mem.mmap_dirty_high = mem.mmap_dirty_high.max(end);
+        Some((address, stale))
     }
 
     /// Write a freed `SharedFile` allocation's bytes back to its host fd and

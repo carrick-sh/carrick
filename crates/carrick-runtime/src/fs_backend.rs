@@ -194,6 +194,23 @@ pub trait FsBackend: Send + Sync {
     /// the dispatcher keeps its in-memory File model there.
     fn open_raw_fd(&self, path: &str, write: bool, create: bool, trunc: bool) -> Option<i32>;
 
+    /// Open a REAL host fd for an UNNAMED file (`O_TMPFILE` semantics): a
+    /// regular file that exists nowhere in any namespace, so it's never
+    /// linked, never visible to `lookup`/getdents, and is reaped when the
+    /// last fd closes. A disk-backed backend creates a uniquely-named file in
+    /// its scratch dir, opens it `O_RDWR`, immediately `unlink(2)`s it (the
+    /// open fd keeps the unnamed inode alive), and `fchmod`s it to the guest
+    /// `mode` (low 0o7777). Because the result is a real kernel fd, it is
+    /// shared across `libc::fork(2)` AND inherited across `exec(2)` — so a
+    /// forked+exec'd child's writes are visible to the parent's reads, which
+    /// is what `tempfile.TemporaryFile()` + a faulthandler subprocess rely on.
+    /// Returns the raw fd (caller owns it, must close it). `MemoryBackend`
+    /// returns `None` (no kernel fd → the dispatcher keeps the in-memory
+    /// anonymous `File` model). Default: unsupported.
+    fn open_anon_fd(&self, _mode: u32) -> Option<i32> {
+        None
+    }
+
     /// Open a real host fd on the FIFO at `path` in NON-BLOCKING mode for the
     /// given guest access (`0`=RDONLY, `1`=WRONLY, `2`=RDWR). Always
     /// `O_NONBLOCK` so a writer-less `O_RDONLY` open returns immediately instead
@@ -591,6 +608,11 @@ impl FsBackend for MemoryBackend {
 // ---------------------------------------------------------------------
 // HostFsBackend: sandboxed real-filesystem upper layer.
 // ---------------------------------------------------------------------
+
+/// Monotonic counter feeding the transient (pre-unlink) name of an
+/// `open_anon_fd` O_TMPFILE inode, so concurrent guest threads/processes
+/// never collide on the scratch name between create and unlink.
+static ANON_FD_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Real-filesystem FsBackend rooted at a scratch directory on disk.
 ///
@@ -1490,6 +1512,56 @@ impl FsBackend for HostFsBackend {
         // cap-std File without closing it, so the dispatcher owns the
         // fd lifetime (it closes it on guest close()).
         Some(file.into_std().into_raw_fd())
+    }
+
+    fn open_anon_fd(&self, mode: u32) -> Option<i32> {
+        use std::os::fd::IntoRawFd;
+        // O_TMPFILE = an unnamed regular file. macOS has no O_TMPFILE flag, so
+        // synthesize the same semantics: create a uniquely-named file in the
+        // scratch root, open it O_RDWR, then unlink the name immediately. The
+        // open fd keeps the now-nameless inode alive (POSIX), and because it is
+        // a real kernel fd it is inherited across fork(2) AND exec(2) — exactly
+        // what makes a forked+exec'd child's write visible to the parent's read
+        // (tempfile.TemporaryFile + faulthandler subprocess). The transient
+        // name is never visible to the guest: it lives only between create and
+        // unlink, and the guest namespace lookup never sees it.
+        //
+        // Build a per-(pid, counter, nanos) unique name so concurrent guest
+        // threads/processes don't collide. O_RDWR (not the guest access mode)
+        // so HVF can mmap the result with write max-protection if needed; the
+        // dispatcher records the guest-visible writability separately in
+        // OpenDescription::HostFile.
+        let pid = unsafe { libc::getpid() } as u64;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let seq = ANON_FD_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let name = format!(".carrick_o_tmpfile.{pid}.{seq}.{nanos}");
+        let rel = Path::new(&name);
+
+        let mut opts = cap_std::fs::OpenOptions::new();
+        opts.read(true).write(true).create_new(true);
+        let file = self.dir.open_with(rel, &opts).ok()?;
+        let raw_fd = file.into_std().into_raw_fd();
+
+        // Force the guest-requested mode (the create above used the host umask)
+        // via fchmod on the now-open fd. Best-effort: O_TMPFILE files are
+        // unnamed, so the mode only matters for a later linkat(AT_EMPTY_PATH)
+        // materialization and for fstat. fchmod operates on the inode directly,
+        // so it still works after the unlink below.
+        unsafe {
+            libc::fchmod(raw_fd, (mode & 0o7777) as libc::mode_t);
+        }
+
+        // Unlink the name NOW so the file is anonymous; the open fd keeps the
+        // inode alive. If the unlink fails we still proceed — the file would
+        // just leak a name in scratch (cleaned on run teardown), not a
+        // correctness bug, but it should not normally fail (we just created the
+        // name with O_EXCL).
+        let _ = self.dir.remove_file(rel);
+
+        Some(raw_fd)
     }
 
     fn open_fifo_nonblock(&self, path: &str, access: u32) -> Option<i32> {

@@ -1657,8 +1657,15 @@ impl SyscallDispatcher {
                     fd_set_set(set, fd_usize);
                     ready += 1;
                 }
+                // select(2) marks an fd write-ready when it is writable OR has a
+                // pending error/hangup (so the app can collect the error via a
+                // write/getsockopt). Linux reports POLLOUT|POLLERR|POLLHUP on a
+                // failed async connect; macOS poll() reports ONLY POLLHUP for the
+                // same socket (verified). Treat POLLERR/POLLHUP as write-ready so
+                // asyncio's sock_connect surfaces ConnectionRefusedError instead
+                // of hanging until the wait_for timeout.
                 if (req_mask & 0x02) != 0
-                    && (revs & libc::POLLOUT) != 0
+                    && (revs & (libc::POLLOUT | libc::POLLERR | libc::POLLHUP)) != 0
                     && let Some(ref mut set) = new_write
                 {
                     fd_set_set(set, fd_usize);
@@ -2688,6 +2695,55 @@ impl SyscallDispatcher {
                 Ok(t) => t,
                 Err(errno) => return Ok(errno.into()),
             };
+            // SO_ERROR: the option VALUE is itself an errno (the pending socket
+            // error, e.g. from an async connect). The host returns a Darwin
+            // errno; the guest reads it as a Linux errno. Without translation a
+            // refused connect surfaces as Darwin ECONNREFUSED=61, which Linux
+            // reads as ENODATA — so asyncio's sock_connect never raises
+            // ConnectionRefusedError. Translate the i32 value through the same
+            // table the rest of the ABI uses. (getsockopt itself still
+            // succeeds; only the value is mapped.)
+            if level == LINUX_SOL_SOCKET && optname == LINUX_SO_ERROR {
+                let mut host_err: i32 = 0;
+                let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
+                let rc = unsafe {
+                    libc::getsockopt(
+                        host_fd,
+                        libc::SOL_SOCKET,
+                        libc::SO_ERROR,
+                        (&mut host_err as *mut i32).cast(),
+                        &mut len,
+                    )
+                };
+                if let Err(errno) = rc.host_syscall_errno() {
+                    return Ok(errno.into());
+                }
+                let linux_err = if host_err == 0 {
+                    0
+                } else {
+                    crate::dispatch::macos_to_linux_errno(host_err)
+                };
+                // Honor the guest's optlen (it may pass <4); clamp like Linux.
+                let guest_optlen = match memory.read_bytes(optlen_addr, 4) {
+                    Ok(b) => u32::from_ne_bytes([b[0], b[1], b[2], b[3]]),
+                    Err(_) => return Ok(LINUX_EFAULT.into()),
+                };
+                let n = (guest_optlen as usize).min(4);
+                let bytes = linux_err.to_ne_bytes();
+                if optval_addr != 0
+                    && n > 0
+                    && memory.write_bytes(optval_addr, &bytes[..n]).is_err()
+                {
+                    return Ok(LINUX_EFAULT.into());
+                }
+                if memory
+                    .write_bytes(optlen_addr, &(n as u32).to_ne_bytes())
+                    .is_err()
+                {
+                    return Ok(LINUX_EFAULT.into());
+                }
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            }
             let (host_level, host_opt) = match linux_to_host_sockopt(level, optname) {
                 Some(t) => t,
                 None => {
