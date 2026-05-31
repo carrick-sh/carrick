@@ -28,6 +28,7 @@ pub const LINUX_DT_CHR: u8 = 2;
 pub const LINUX_DT_DIR: u8 = 4;
 pub const LINUX_DT_REG: u8 = 8;
 pub const LINUX_DT_LNK: u8 = 10;
+pub const LINUX_DT_SOCK: u8 = 12;
 
 pub const LINUX_AT_NULL: u64 = 0;
 pub const LINUX_AT_PHDR: u64 = 3;
@@ -1964,6 +1965,16 @@ pub const LINUX_MSG_CMSG_CLOEXEC: i32 = 0x4000_0000_u32 as i32;
 // options the guest will throw at us. Anything we don't recognise
 // returns `None` and the caller surfaces ENOPROTOOPT.
 pub const LINUX_SOL_SOCKET: i32 = 1;
+/// `SCM_RIGHTS` ancillary-data type (pass open file descriptors over an AF_UNIX
+/// socket). Same numeric value on Linux and macOS, but the surrounding
+/// `cmsghdr` layout differs (Linux `cmsg_len` is `size_t`/8B, macOS is u32/4B),
+/// so carrick translates the control buffer in sendmsg/recvmsg.
+pub const LINUX_SCM_RIGHTS: i32 = 1;
+/// Linux `struct cmsghdr` header bytes: `__kernel_size_t cmsg_len` (8) + `int
+/// cmsg_level` (4) + `int cmsg_type` (4). CMSG data is then `CMSG_ALIGN`ed to 8.
+pub const LINUX_CMSGHDR_LEN: usize = 16;
+/// Linux `CMSG_ALIGN` boundary (sizeof(size_t) = 8 on aarch64).
+pub const LINUX_CMSG_ALIGN: usize = 8;
 pub const LINUX_SOL_IP: i32 = 0; // IPPROTO_IP
 pub const LINUX_SOL_TCP: i32 = 6; // IPPROTO_TCP
 pub const LINUX_SOL_UDP: i32 = 17; // IPPROTO_UDP
@@ -2022,6 +2033,14 @@ pub const LINUX_SO_PEERCRED: i32 = 17;
 pub const LINUX_SO_RCVTIMEO: i32 = 20;
 pub const LINUX_SO_SNDTIMEO: i32 = 21;
 pub const LINUX_SO_ACCEPTCONN: i32 = 30;
+/// Linux-only getsockopt options: SO_PROTOCOL reports the socket's protocol
+/// number, SO_DOMAIN its address family. macOS has no equivalent, so carrick
+/// answers them from its own per-fd socket bookkeeping. CPython's
+/// `socket.socket(fileno=fd)` queries SO_PROTOCOL (and getsockname for the
+/// family) to reconstruct a socket from an inherited fd — the multiprocessing
+/// forkserver path. Values from include/uapi/asm-generic/socket.h.
+pub const LINUX_SO_PROTOCOL: i32 = 38;
+pub const LINUX_SO_DOMAIN: i32 = 39;
 
 /// Wire size of Linux `struct ucred { pid_t pid; uid_t uid; gid_t gid; }`
 /// (three u32s). What `getsockopt(SOL_SOCKET, SO_PEERCRED)` returns.

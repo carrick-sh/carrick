@@ -57,6 +57,8 @@ use crate::linux_abi::{
     LINUX_CLOCK_RESOLUTION_NSEC,
     LINUX_CLOCK_TAI,
     LINUX_CLOCK_THREAD_CPUTIME_ID,
+    LINUX_CMSG_ALIGN,
+    LINUX_CMSGHDR_LEN,
     LINUX_DEFAULT_UMASK,
     LINUX_DIRENT64_HEADER_SIZE,
     LINUX_DT_CHR,
@@ -64,6 +66,7 @@ use crate::linux_abi::{
     LINUX_DT_FIFO,
     LINUX_DT_LNK,
     LINUX_DT_REG,
+    LINUX_DT_SOCK,
     LINUX_E2BIG,
     LINUX_EACCES,
     LINUX_EAFNOSUPPORT,
@@ -267,6 +270,7 @@ use crate::linux_abi::{
     LINUX_SCHED_IDLE,
     LINUX_SCHED_OTHER,
     LINUX_SCHED_RR,
+    LINUX_SCM_RIGHTS,
     LINUX_SEEK_CUR,
     LINUX_SEEK_END,
     LINUX_SEEK_SET,
@@ -3347,6 +3351,7 @@ fn linux_mode(metadata: &RootFsMetadata) -> u32 {
         RootFsEntryKind::Symlink => LINUX_S_IFLNK,
         RootFsEntryKind::CharDevice => LINUX_S_IFCHR,
         RootFsEntryKind::Fifo => LINUX_S_IFIFO,
+        RootFsEntryKind::Socket => LINUX_S_IFSOCK,
     };
     kind | (metadata.mode & 0o7777)
 }
@@ -3475,6 +3480,7 @@ fn linux_dirent_type(kind: RootFsEntryKind) -> u8 {
         RootFsEntryKind::Symlink => LINUX_DT_LNK,
         RootFsEntryKind::CharDevice => LINUX_DT_CHR,
         RootFsEntryKind::Fifo => LINUX_DT_FIFO,
+        RootFsEntryKind::Socket => LINUX_DT_SOCK,
     }
 }
 
@@ -3639,6 +3645,7 @@ fn vfs_md_to_rootfs_md(path: &str, md: &crate::vfs::Metadata) -> RootFsMetadata 
             crate::vfs::EntryKind::Symlink => RootFsEntryKind::Symlink,
             crate::vfs::EntryKind::CharDevice => RootFsEntryKind::CharDevice,
             crate::vfs::EntryKind::Fifo => RootFsEntryKind::Fifo,
+            crate::vfs::EntryKind::Socket => RootFsEntryKind::Socket,
         },
         mode: md.mode,
         size: md.size as usize,

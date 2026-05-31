@@ -502,7 +502,18 @@ impl SyscallDispatcher {
         // falls back to the legacy synthetic-then-overlay-then-rootfs
         // chain for any path no mount claims (or that the mount
         // returns ENOSYS for).
-        let vfs_outcome = self.try_vfs_open(&path, access, flags);
+        // O_CREAT mode for a mount-served file: the requested bits masked by the
+        // guest umask (the kernel applies `mode & ~umask`). Threaded into the
+        // mount's open so e.g. glibc sem_open's `open(/dev/shm/sem.X, O_CREAT,
+        // 0600)` materialises a 0600 node — without it the bind mount created
+        // the file with mode 0, and a later O_RDWR reopen (multiprocessing
+        // SemLock._rebuild in a forkserver child) hit EACCES.
+        let vfs_create_mode = if want_create {
+            (mode as u32 & 0o7777) & !(self.cred_snapshot().umask & 0o777)
+        } else {
+            0
+        };
+        let vfs_outcome = self.try_vfs_open(&path, access, flags, vfs_create_mode);
         match vfs_outcome {
             VfsOpenAttempt::Installed(fd) => {
                 return Ok(DispatchOutcome::Returned { value: fd as i64 });
@@ -842,7 +853,13 @@ impl SyscallDispatcher {
     /// mount explicitly failed, and `FallThrough` when no mount
     /// claimed the path (or the claiming mount returned ENOSYS). The
     /// caller wraps the legacy lookup chain inside `FallThrough`.
-    fn try_vfs_open(&self, path: &str, access: u64, flags: u64) -> VfsOpenAttempt {
+    fn try_vfs_open(
+        &self,
+        path: &str,
+        access: u64,
+        flags: u64,
+        create_mode: u32,
+    ) -> VfsOpenAttempt {
         // Build the OpenContext from owned/copy data so the mut
         // borrow of `vfs_mounts` doesn't conflict with reads from
         // sibling fields.
@@ -869,7 +886,7 @@ impl SyscallDispatcher {
             excl: flags & LINUX_O_EXCL != 0,
             directory: flags & LINUX_O_DIRECTORY != 0,
             nofollow: flags & crate::linux_abi::LINUX_O_NOFOLLOW != 0,
-            mode: 0,
+            mode: create_mode,
         };
         let handle = {
             let Some(m) = self.fs.vfs_mounts.resolve(path) else {
@@ -997,6 +1014,7 @@ impl SyscallDispatcher {
                             crate::vfs::EntryKind::Symlink => RootFsEntryKind::Symlink,
                             crate::vfs::EntryKind::CharDevice => RootFsEntryKind::CharDevice,
                             crate::vfs::EntryKind::Fifo => RootFsEntryKind::Fifo,
+                            crate::vfs::EntryKind::Socket => RootFsEntryKind::Socket,
                             crate::vfs::EntryKind::File => RootFsEntryKind::File,
                         };
                         RootFsDirEntry {
@@ -1394,7 +1412,7 @@ impl SyscallDispatcher {
         }
     }
 
-    fn resolve_at_path(&self, dirfd: u64, path: &str) -> Result<String, i32> {
+    pub(super) fn resolve_at_path(&self, dirfd: u64, path: &str) -> Result<String, i32> {
         // dirfd is an `int` in the kernel ABI: only the low 32 bits are
         // meaningful, and AT_FDCWD (-100) may arrive zero-extended (0xFFFFFF9C)
         // or sign-extended (0xFFFF..FF9C) depending on how the guest libc

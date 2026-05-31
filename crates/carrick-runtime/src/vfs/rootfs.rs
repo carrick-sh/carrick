@@ -303,6 +303,11 @@ impl RootFsVfs {
                     Ok(OpenDispatchResult::Directory { metadata, entries })
                 }
                 RootFsEntryKind::Symlink => Err(LINUX_EINVAL),
+                // open(2) of an AF_UNIX socket node → ENXIO on Linux (no device
+                // to open). A socket node only ever lives in the writable
+                // overlay (created by bind), not the immutable rootfs, so this
+                // is reached only via a guest open of a bound socket path.
+                RootFsEntryKind::Socket => Err(crate::linux_abi::LINUX_ENXIO),
             },
             None => {
                 if want_create {
@@ -335,10 +340,14 @@ impl RootFsVfs {
                 .and_then(|r| r.symlink_metadata(from).ok())
             {
                 Some(md) => match md.kind {
+                    // Socket never lives in the immutable rootfs (bind only
+                    // creates it in the writable overlay, handled above), but
+                    // the match must be exhaustive — treat it like a file.
                     RootFsEntryKind::File
                     | RootFsEntryKind::Symlink
                     | RootFsEntryKind::CharDevice
-                    | RootFsEntryKind::Fifo => {
+                    | RootFsEntryKind::Fifo
+                    | RootFsEntryKind::Socket => {
                         // INVARIANT: this arm is reached only via the
                         // `self.rootfs.as_ref().and_then(..symlink_metadata..)`
                         // match above, which already proved rootfs is Some.
@@ -405,7 +414,8 @@ impl RootFsVfs {
             RootFsEntryKind::File
             | RootFsEntryKind::Symlink
             | RootFsEntryKind::CharDevice
-            | RootFsEntryKind::Fifo => {
+            | RootFsEntryKind::Fifo
+            | RootFsEntryKind::Socket => {
                 self.overlay
                     .set_file_contents(to, src_contents.unwrap_or_default())
                     .map_err(|_| LINUX_EINVAL)?;
@@ -530,6 +540,7 @@ impl Vfs for RootFsVfs {
                 RootFsEntryKind::Symlink => EntryKind::Symlink,
                 RootFsEntryKind::CharDevice => EntryKind::CharDevice,
                 RootFsEntryKind::Fifo => EntryKind::Fifo,
+                RootFsEntryKind::Socket => EntryKind::Socket,
             },
             mode: md.mode,
             size: md.size as u64,
@@ -631,6 +642,7 @@ impl Vfs for RootFsVfs {
                         RootFsEntryKind::Symlink => EntryKind::Symlink,
                         RootFsEntryKind::CharDevice => EntryKind::CharDevice,
                         RootFsEntryKind::Fifo => EntryKind::Fifo,
+                        RootFsEntryKind::Socket => EntryKind::Socket,
                     },
                 })
                 .collect()),

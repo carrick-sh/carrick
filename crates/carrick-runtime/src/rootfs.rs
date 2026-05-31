@@ -70,6 +70,15 @@ pub enum RootFsEntryKind {
     /// open/read/write of a writer-less FIFO parks on kqueue instead of wedging
     /// the dispatcher (see `open_at_path`).
     Fifo,
+    /// AF_UNIX socket node, materialised at the guest path by a successful
+    /// `bind(2)` of a pathname `AF_UNIX` socket. macOS can't `mknod(S_IFSOCK)`
+    /// as non-root and the real host socket lives at a hashed scratch path, so
+    /// the guest-facing node is a marker entry (host backend: a regular file
+    /// flagged via the `user.carrick.socket` xattr → fork-coherent; in-memory
+    /// backend: a `sockets` map). Reports `S_IFSOCK` from stat and `DT_SOCK`
+    /// from getdents so `os.path.exists`/`stat.S_ISSOCK`/`chmod`/`unlink` on the
+    /// bound path match Linux (multiprocessing forkserver).
+    Socket,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
