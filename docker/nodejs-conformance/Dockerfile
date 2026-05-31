@@ -11,16 +11,20 @@
 #
 # Push for carrick's OCI pull path:
 #   docker push localhost:5005/carrick-nodejs-conformance:24.16.0-26.2.0
-FROM debian:bookworm
+# Node 26.2.0's embedded V8 needs a newer C++ toolchain than bookworm's GCC 12
+# for its Turboshaft static_assert-in-discarded-if-constexpr pattern.
+FROM debian:trixie
 
 ARG NODE24_REF=v24.16.0
 ARG NODE26_REF=v26.2.0
 ARG LIBUV_REF=v1.52.1
+ARG NODE_BUILD_JOBS=
 
 ENV DEBIAN_FRONTEND=noninteractive \
     NODE24_REF=${NODE24_REF} \
     NODE26_REF=${NODE26_REF} \
     LIBUV_REF=${LIBUV_REF} \
+    NODE_BUILD_JOBS=${NODE_BUILD_JOBS} \
     NODEJS_CONFORMANCE_IN_IMAGE=1 \
     PATH=/opt/nodejs-conformance/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
@@ -37,14 +41,18 @@ RUN set -eux; \
     git clone --depth 1 --branch "${NODE24_REF}" https://github.com/nodejs/node.git /opt/node-src/v24; \
     cd /opt/node-src/v24; \
     ./configure --prefix=/opt/nodejs-conformance/node-v24; \
-    make -j"$(nproc)"; \
+    build_jobs="${NODE_BUILD_JOBS:-$(nproc)}"; \
+    make -j"${build_jobs}"; \
     make install; \
     ln -sf /opt/node-src/v24/out/Release/node /opt/nodejs-conformance/bin/node24; \
-    test -d /opt/node-src/v24/deps/v8; \
+    test -d /opt/node-src/v24/deps/v8
+
+RUN set -eux; \
     git clone --depth 1 --branch "${NODE26_REF}" https://github.com/nodejs/node.git /opt/node-src/v26; \
     cd /opt/node-src/v26; \
     ./configure --prefix=/opt/nodejs-conformance/node-v26; \
-    make -j"$(nproc)"; \
+    build_jobs="${NODE_BUILD_JOBS:-$(nproc)}"; \
+    make -j"${build_jobs}"; \
     make install; \
     ln -sf /opt/node-src/v26/out/Release/node /opt/nodejs-conformance/bin/node26; \
     test -d /opt/node-src/v26/deps/v8
