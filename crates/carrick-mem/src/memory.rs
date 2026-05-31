@@ -120,12 +120,17 @@ pub fn is_carrick_el1_vector_va(va: u64) -> bool {
 const AARCH64_ERET_OPCODE: u32 = 0xd69f_03e0;
 // AArch64 `clrex` opcode (clears the local Exclusives monitor).
 const AARCH64_CLREX_OPCODE: u32 = 0xd5033f5f;
-// AArch64 `hvc #0` opcode, used to re-trap from EL1 to HVF.
+// AArch64 `hvc #0` opcode. SMCCC calls use `hvc #0` with a function ID in x0,
+// so Carrick's syscall-forwarding vector deliberately avoids immediate 0.
 const AARCH64_HVC0_OPCODE: u32 = 0xd400_0002;
 // AArch64 `hvc #1` — the EL1 stage-1 maintenance trampoline's completion
 // marker. The HVC immediate sits in bits[20:5], so `hvc #1` = `hvc #0` | (1<<5).
-// `run_el1_maintenance` distinguishes this from the `hvc #0` syscall-forward.
+// `run_el1_maintenance` distinguishes this from the syscall-forward HVC.
 const AARCH64_HVC1_OPCODE: u32 = AARCH64_HVC0_OPCODE | (1 << 5);
+// AArch64 `hvc #2`, used by the EL1 vector to forward EL0 syscalls to HVF.
+// `hvc #0` can be consumed as an SMCCC hypercall before HVF reports an exit
+// when x0 looks like a function ID (V8 mmap hints can have low32=0xc1000000).
+const AARCH64_HVC_SYSCALL_OPCODE: u32 = AARCH64_HVC0_OPCODE | (2 << 5);
 // AArch64 `mov x8, #139`, the Linux aarch64 rt_sigreturn syscall number.
 const AARCH64_MOV_X8_RT_SIGRETURN_OPCODE: u32 = 0xd280_1168;
 // AArch64 `svc #0`, used by the user-mode sigreturn trampoline.
@@ -592,7 +597,7 @@ impl AddressSpace {
 
     /// Append the EL1 exception vector page. Each 0x80-byte slot is either:
     /// * the "Lower EL using AArch64, synchronous" slot at offset 0x400,
-    ///   which executes `hvc #0; eret` so the EL0 `svc #0` is forwarded to
+    ///   which executes `hvc #2; eret` so the EL0 `svc #0` is forwarded to
     ///   HVF as an HVC trap (`EC = 0x16`) that the host dispatches like a
     ///   normal syscall; or
     /// * any other slot, which executes a bare `eret` so a spurious
@@ -1398,7 +1403,7 @@ pub fn el0_trampoline_bytes() -> Vec<u8> {
 /// runs this on its own vCPU (PC = `LINUX_EL1_MAINT_BASE`, PSTATE = EL1h) after
 /// editing page descriptors, to flush the stale stage-1 TLB so the guest
 /// observes the new mapping. The closing `hvc #1` traps back to the host (a
-/// completion marker distinct from the `hvc #0` syscall forward); the rest is
+/// completion marker distinct from the `hvc #2` syscall forward); the rest is
 /// `nop` padding so an over-run is harmless.
 pub fn el1_maintenance_bytes() -> Vec<u8> {
     let size = LINUX_EL1_MAINT_SIZE as usize;
@@ -1447,12 +1452,12 @@ pub fn sigreturn_trampoline_bytes() -> Vec<u8> {
 /// Build the byte image of the EL1 exception vector page. The first 2 KiB
 /// is the AArch64 vector table (16 slots of 0x80 bytes each); the rest of
 /// the page is filled with `nop`. Slot 0x400 ("Lower EL using AArch64,
-/// synchronous") catches EL0 `svc #0` and re-traps to HVF via `hvc #0`;
+/// synchronous") catches EL0 `svc #0` and re-traps to HVF via `hvc #2`;
 /// every other slot is a bare `eret` so spurious exceptions just return.
 pub fn el1_vectors_bytes() -> Vec<u8> {
     let size = LINUX_EL1_VECTORS_SIZE as usize;
     let mut bytes = vec![0_u8; size];
-    let hvc = AARCH64_HVC0_OPCODE.to_le_bytes();
+    let hvc = AARCH64_HVC_SYSCALL_OPCODE.to_le_bytes();
     let eret = AARCH64_ERET_OPCODE.to_le_bytes();
     let nop = AARCH64_NOP_OPCODE.to_le_bytes();
 
