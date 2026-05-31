@@ -2438,11 +2438,20 @@ fn is_stdio_fd(fd: i32) -> bool {
 /// them (no `open_files` entry); the moment a pipe / file / eventfd
 /// occupies that slot we owe the guest `ENOTTY` so callers like
 /// `busybox ls` don't emit ANSI colour escapes into the pipe.
+///
+/// A bare stdio fd is the host's INHERITED fd 0/1/2, so its tty-ness is
+/// exactly the host fd's tty-ness: `isatty(host_fd)`. Previously every bare
+/// stdio fd was reported as a tty unconditionally, so `isatty(0)` returned
+/// true even when carrick's stdin was a pipe or `/dev/null` — diverging from
+/// Linux and making test_file.testStdin RUN (CPython skips it unless stdin is
+/// a real TTY) instead of skip. Consulting the real host fd is the
+/// Darwin-native ground truth and also fixes the interactive `-t` pty case
+/// (the slave IS a tty) and the redirected case (a pipe/file is NOT).
 fn fd_is_tty(open_files: &HashMap<i32, OpenFile>, fd: i32) -> bool {
     if !is_stdio_fd(fd) {
         return false;
     }
-    !open_files.contains_key(&fd)
+    !open_files.contains_key(&fd) && crate::host_tty::host_isatty(fd)
 }
 
 fn retain_open_file(description: &OpenDescriptionRef) {

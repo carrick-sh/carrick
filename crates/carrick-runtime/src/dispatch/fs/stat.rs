@@ -61,7 +61,9 @@ impl SyscallDispatcher {
 
     pub(super) fn fd_stat_record(&self, fd: i32) -> Result<StatRecord, i32> {
         let Some(open_file) = self.open_file(fd) else {
-            if is_stdio_fd(fd) {
+            // A stdio fd the guest explicitly closed (and did not reopen) is
+            // genuinely closed: report EBADF, not our still-open host stream.
+            if is_stdio_fd(fd) && !self.stdio_is_closed(fd) {
                 let (label, mode) = self.stdio_synthetic_label_mode(fd);
                 return Ok(StatRecord::synthetic(&label, 0, mode));
             }
@@ -92,6 +94,31 @@ impl SyscallDispatcher {
         drop(open);
         match source {
             OpenStatSource::Record(record) => Ok(record),
+            OpenStatSource::HostStream {
+                host_fd,
+                label,
+                fallback_mode,
+            } => {
+                // fstat the real host fd to recover the Linux file type: a host
+                // character device (/dev/null, /dev/zero, …) reports S_IFCHR
+                // (mode 0o666, like Linux), a host pipe end reports S_IFIFO
+                // (mode 0o600). The S_IF* type bits match between macOS and
+                // Linux. Falls back to `fallback_mode` if the host fstat fails.
+                let mut host_st: libc::stat = unsafe { std::mem::zeroed() };
+                // SAFETY: host_fd is a live host fd; &host_st is a valid out-param.
+                let mode = if unsafe { libc::fstat(host_fd, &mut host_st) } == 0 {
+                    let type_bits = host_st.st_mode as u32 & LINUX_S_IFMT;
+                    let perms = if type_bits == LINUX_S_IFCHR {
+                        0o666
+                    } else {
+                        0o600
+                    };
+                    type_bits | perms
+                } else {
+                    fallback_mode
+                };
+                Ok(StatRecord::synthetic(&label, 0, mode))
+            }
             // An open Directory or in-memory File: its fd-stat must report the
             // SAME st_ino/st_dev as a path-stat of the same path. Under
             // `--fs host` the path-stat (newfstatat/statx) uses the REAL host

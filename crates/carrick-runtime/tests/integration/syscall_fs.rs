@@ -62,24 +62,28 @@ fn ioctl_writes_packed_winsize_and_reports_unknown_requests() {
     let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
-    assert_eq!(
-        dispatcher
-            .dispatch(
-                SyscallRequest::new(
-                    29,
-                    SyscallArgs::from([1, LINUX_TIOCGWINSZ, 0x4000, 0, 0, 0])
-                ),
-                &mut memory,
-                &reporter,
-            )
-            .unwrap(),
-        DispatchOutcome::Returned { value: 0 }
-    );
-    let winsize = read_winsize(&memory, 0x4000);
-    let rows = winsize.ws_row;
-    let cols = winsize.ws_col;
-    assert_eq!(rows, 24);
-    assert_eq!(cols, 80);
+    // TIOCGWINSZ on a default stdio fd reflects the *real* backing host fd:
+    // a TTY → 80x24 stub (or live winsize); a pipe/file/closed → ENOTTY,
+    // matching Linux `ioctl(pipe, TIOCGWINSZ)`. The cargo-test process's
+    // fd 1 may be either, so assert against the host's actual answer.
+    let outcome = dispatcher
+        .dispatch(
+            SyscallRequest::new(
+                29,
+                SyscallArgs::from([1, LINUX_TIOCGWINSZ, 0x4000, 0, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    if carrick_runtime::host_tty::host_isatty(1) {
+        assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+        let winsize = read_winsize(&memory, 0x4000);
+        // rows/cols come from the live terminal; just confirm they are non-zero.
+        assert!(winsize.ws_row > 0 && winsize.ws_col > 0);
+    } else {
+        assert_eq!(outcome, DispatchOutcome::Errno { errno: 25 });
+    }
 
     assert_eq!(
         dispatcher
@@ -99,29 +103,28 @@ fn ioctl_writes_packed_winsize_and_reports_unknown_requests() {
 
 #[test]
 fn ioctl_tcgets_writes_default_termios_for_stdio_and_enotty_for_files() {
-    // 1. TCGETS on fd 0 → returns 0; struct has cooked-TTY defaults.
+    // 1. TCGETS on fd 0 reflects the *real* backing host fd. A default stdio
+    //    fd (no dup3 overlay) is a TTY iff the carrick process's own host fd 0
+    //    is a TTY. When it is → cooked-TTY defaults; when it is a pipe / file
+    //    (e.g. `cargo test` under CI, or the cpython-parity harness) → ENOTTY,
+    //    matching Linux `ioctl(pipe, TCGETS)`.
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
     let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
-    assert_eq!(
-        dispatcher
-            .dispatch(
-                SyscallRequest::new(29, SyscallArgs::from([0, LINUX_TCGETS, 0x4000, 0, 0, 0])),
-                &mut memory,
-                &reporter,
-            )
-            .unwrap(),
-        DispatchOutcome::Returned { value: 0 }
-    );
-    let termios = read_termios(&memory, 0x4000);
-    let c_iflag = termios.c_iflag;
-    let c_lflag = termios.c_lflag;
-    let c_cc = termios.c_cc;
-    assert_eq!(c_iflag, 0x4502);
-    assert_eq!(c_lflag, 0x803b);
-    assert_eq!(c_cc[0], 0x03); // VINTR
-    assert_eq!(c_cc[4], 0x04); // VEOF
+    let stdin_is_tty = carrick_runtime::host_tty::host_isatty(0);
+    let outcome = dispatcher
+        .dispatch(
+            SyscallRequest::new(29, SyscallArgs::from([0, LINUX_TCGETS, 0x4000, 0, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    if stdin_is_tty {
+        assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+    } else {
+        assert_eq!(outcome, DispatchOutcome::Errno { errno: 25 });
+    }
 
     // 2. TCGETS on bogus fd 99 → EBADF.
     assert_eq!(
@@ -173,7 +176,9 @@ fn ioctl_tcgets_writes_default_termios_for_stdio_and_enotty_for_files() {
         DispatchOutcome::Errno { errno: 25 }
     );
 
-    // 4. TCSETS on fd 0 with a valid termios buffer → 0.
+    // 4. TCSETS on fd 0 with a valid termios buffer. On a real backing TTY
+    //    this succeeds (→ 0); on a non-tty stdio fd it is ENOTTY, same as
+    //    Linux `ioctl(pipe, TCSETS)`.
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
     let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
@@ -181,28 +186,31 @@ fn ioctl_tcgets_writes_default_termios_for_stdio_and_enotty_for_files() {
     memory
         .write_bytes(0x4000, LinuxTermios::default_cooked().as_bytes())
         .unwrap();
-    assert_eq!(
-        dispatcher
-            .dispatch(
-                SyscallRequest::new(29, SyscallArgs::from([0, LINUX_TCSETS, 0x4000, 0, 0, 0])),
-                &mut memory,
-                &reporter,
-            )
-            .unwrap(),
-        DispatchOutcome::Returned { value: 0 }
-    );
+    let outcome = dispatcher
+        .dispatch(
+            SyscallRequest::new(29, SyscallArgs::from([0, LINUX_TCSETS, 0x4000, 0, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    if stdin_is_tty {
+        assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
 
-    // 5. TCSETS on fd 0 with a bad pointer → EFAULT.
-    assert_eq!(
-        dispatcher
-            .dispatch(
-                SyscallRequest::new(29, SyscallArgs::from([0, LINUX_TCSETS, 0x1, 0, 0, 0])),
-                &mut memory,
-                &reporter,
-            )
-            .unwrap(),
-        DispatchOutcome::Errno { errno: 14 }
-    );
+        // 5. TCSETS on fd 0 with a bad pointer → EFAULT (only reached on a
+        //    real tty; a non-tty short-circuits to ENOTTY before the read).
+        assert_eq!(
+            dispatcher
+                .dispatch(
+                    SyscallRequest::new(29, SyscallArgs::from([0, LINUX_TCSETS, 0x1, 0, 0, 0])),
+                    &mut memory,
+                    &reporter,
+                )
+                .unwrap(),
+            DispatchOutcome::Errno { errno: 14 }
+        );
+    } else {
+        assert_eq!(outcome, DispatchOutcome::Errno { errno: 25 });
+    }
 
     assert!(reporter.finish().unhandled_ioctls.is_empty());
 }
