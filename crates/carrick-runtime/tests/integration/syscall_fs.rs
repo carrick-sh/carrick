@@ -2236,6 +2236,56 @@ fn readv_reads_file_across_packed_iovecs() {
 }
 
 #[test]
+fn readv_reads_host_pipe_across_packed_iovecs() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x600]);
+    memory.write_bytes(0x4400, b"abcdefg").unwrap();
+    write_iovecs(
+        &mut memory,
+        0x4100,
+        [LinuxIovec::new(0x4200, 3), LinuxIovec::new(0x4300, 4)],
+    );
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
+        d.dispatch(
+            SyscallRequest::new(nr, SyscallArgs::from(args)),
+            m,
+            &reporter,
+        )
+        .unwrap()
+    };
+
+    assert_eq!(
+        run(&mut dispatcher, &mut memory, 59, [0x4000, 0, 0, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let pair = read_fd_pair(&memory, 0x4000);
+    let read_fd = pair.read_fd as u64;
+    let write_fd = pair.write_fd as u64;
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            64,
+            [write_fd, 0x4400, 7, 0, 0, 0],
+        ),
+        DispatchOutcome::Returned { value: 7 }
+    );
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            65,
+            [read_fd, 0x4100, 2, 0, 0, 0],
+        ),
+        DispatchOutcome::Returned { value: 7 }
+    );
+    assert_eq!(memory.read_bytes(0x4200, 3).unwrap(), b"abc");
+    assert_eq!(memory.read_bytes(0x4300, 4).unwrap(), b"defg");
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
 fn dup_shares_rootfs_file_offset_with_original_fd() {
     let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
         "etc/motd",
