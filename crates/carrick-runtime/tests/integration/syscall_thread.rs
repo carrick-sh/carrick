@@ -81,6 +81,9 @@ use carrick_runtime::thread::{FutexTable, ThreadRegistry};
 use std::sync::Arc;
 
 const LINUX_EAGAIN: i32 = 11;
+const LINUX_SCHED_OTHER: i64 = 0;
+const SYS_SCHED_GETSCHEDULER: u64 = 120;
+const SYS_SCHED_GETPARAM: u64 = 121;
 
 fn write_u32_le(memory: &mut LinearMemory, addr: u64, value: u32) {
     memory.write_bytes(addr, &value.to_le_bytes()).unwrap();
@@ -129,6 +132,94 @@ fn set_tid_address_records_clear_child_tid_and_returns_tid() {
         .unwrap();
     assert_eq!(outcome, DispatchOutcome::Returned { value: tid as i64 });
     assert_eq!(registry.clear_child_tid(tid), Some(0x10500));
+}
+
+#[test]
+fn sched_getscheduler_accepts_live_sibling_tid() {
+    let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
+    let reporter = CompatReporter::default();
+    let dispatcher = SyscallDispatcher::new();
+    let registry = Arc::new(ThreadRegistry::new(1000));
+    let futex = Arc::new(FutexTable::new());
+    let sibling = registry.register_child(0);
+
+    let outcome = dispatcher
+        .dispatch_threaded(
+            SyscallRequest::new(
+                SYS_SCHED_GETSCHEDULER,
+                SyscallArgs::from([sibling as u64, 0, 0, 0, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+            1000,
+            &registry,
+            &futex,
+        )
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        DispatchOutcome::Returned {
+            value: LINUX_SCHED_OTHER
+        }
+    );
+}
+
+#[test]
+fn sched_getparam_accepts_live_sibling_tid() {
+    let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
+    let reporter = CompatReporter::default();
+    let dispatcher = SyscallDispatcher::new();
+    let registry = Arc::new(ThreadRegistry::new(1000));
+    let futex = Arc::new(FutexTable::new());
+    let sibling = registry.register_child(0);
+
+    let outcome = dispatcher
+        .dispatch_threaded(
+            SyscallRequest::new(
+                SYS_SCHED_GETPARAM,
+                SyscallArgs::from([sibling as u64, 0x10800, 0, 0, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+            1000,
+            &registry,
+            &futex,
+        )
+        .unwrap();
+
+    assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+    assert_eq!(read_i32_le(&memory, 0x10800), 0);
+}
+
+#[test]
+fn sched_getscheduler_unknown_sibling_tid_is_esrch() {
+    let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
+    let reporter = CompatReporter::default();
+    let dispatcher = SyscallDispatcher::new();
+    let registry = Arc::new(ThreadRegistry::new(1000));
+    let futex = Arc::new(FutexTable::new());
+
+    let outcome = dispatcher
+        .dispatch_threaded(
+            SyscallRequest::new(
+                SYS_SCHED_GETSCHEDULER,
+                SyscallArgs::from([424242, 0, 0, 0, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+            1000,
+            &registry,
+            &futex,
+        )
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        DispatchOutcome::Errno {
+            errno: LINUX_ESRCH
+        }
+    );
 }
 
 #[test]

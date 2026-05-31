@@ -28,29 +28,46 @@ fn sched_priority_for(policy: i32, max: bool) -> DispatchOutcome {
     }
 }
 
-/// True when `pid` names "this guest process" for the purposes of a sched_*
-/// query. Linux accepts both `0` (the calling task) and the calling task's
-/// own pid. Carrick presents the host pid as the guest pid, plus
-/// `LINUX_BOOTSTRAP_PID` (the stable guest-init alias used elsewhere). Any
-/// other value is ESRCH.
-fn sched_pid_is_self(pid: u64) -> bool {
-    pid == 0 || pid == std::process::id() as u64 || pid == LINUX_BOOTSTRAP_PID as u64
+/// True when `pid` names the calling task for the purposes of a sched_* query.
+/// Linux accepts `0`, the process pid, and a thread's own tid. Carrick presents
+/// the host pid as the guest process pid, plus `LINUX_BOOTSTRAP_PID` (the stable
+/// guest-init alias used elsewhere); threaded dispatch also carries the current
+/// guest tid.
+fn sched_pid_is_self<M: GuestMemory>(cx: &SyscallCtx<'_, M>, pid: u64) -> bool {
+    pid == 0
+        || pid == std::process::id() as u64
+        || pid == LINUX_BOOTSTRAP_PID as u64
+        || cx
+            .thread
+            .is_some_and(|thread| pid == thread.tid as u64)
+}
+
+/// True when `pid` names a live sibling thread in this Carrick guest process.
+fn sched_pid_is_live_guest_thread<M: GuestMemory>(cx: &SyscallCtx<'_, M>, pid: u64) -> bool {
+    if pid == 0 || pid > i32::MAX as u64 {
+        return false;
+    }
+    cx.thread
+        .is_some_and(|thread| thread.registry.is_live(pid as crate::thread::ThreadId))
 }
 
 /// True when `pid` names a live process accessible to the guest: either
-/// the calling process / its alias, or a peer host pid the kernel
-/// confirms via `kill(pid, 0)`. Used by sched_get* queries so they can
-/// answer for any task in the system the way Linux does (with our
-/// uniform SCHED_OTHER + prio 0 model, the actual answer is the same for
-/// every valid pid; only the "does it exist?" check varies).
-fn sched_pid_exists(pid: u64) -> bool {
-    if sched_pid_is_self(pid) {
+/// the calling process / its alias, a live Carrick guest thread tid, or a peer
+/// host pid the kernel confirms via `kill(pid, 0)`. Used by sched_get* queries
+/// so they can answer for any task in the system the way Linux does (with our
+/// uniform SCHED_OTHER + prio 0 model, the actual answer is the same for every
+/// valid pid; only the "does it exist?" check varies).
+fn sched_pid_exists<M: GuestMemory>(cx: &SyscallCtx<'_, M>, pid: u64) -> bool {
+    if sched_pid_is_self(cx, pid) || sched_pid_is_live_guest_thread(cx, pid) {
         return true;
     }
     if pid == 0 || pid > i32::MAX as u64 {
         return false;
     }
-    unsafe { libc::kill(pid as i32, 0) == 0 }
+    unsafe {
+        libc::kill(pid as i32, 0) == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
 }
 
 /// True when `policy` is one of the kernel's known scheduling policies.
@@ -780,14 +797,14 @@ impl SyscallDispatcher {
 
         /// `sched_getscheduler(pid)`: return the per-process policy. Carrick
         /// doesn't track guest-set policy yet, so a normal (unprivileged)
-        /// process is SCHED_OTHER (0). pid=0 / self / our own host pid all
-        /// resolve to self; any other pid is ESRCH.
+        /// process is SCHED_OTHER (0). pid=0 / self / guest thread tids / live
+        /// host pids all resolve to a task; unknown pids are ESRCH.
         fn sched_getscheduler(this, cx, pid: u64) {
             // Linux rejects a negative pid with EINVAL before the ESRCH path.
             if (pid as i32) < 0 {
                 return Ok(LINUX_EINVAL.into());
             }
-            if !sched_pid_is_self(pid) {
+            if !sched_pid_exists(cx, pid) {
                 return Ok(LINUX_ESRCH.into());
             }
             Ok(DispatchOutcome::Returned { value: LINUX_SCHED_OTHER as i64 })
@@ -804,7 +821,7 @@ impl SyscallDispatcher {
             if (pid as i32) < 0 {
                 return Ok(LINUX_EINVAL.into());
             }
-            if !sched_pid_exists(pid) {
+            if !sched_pid_exists(cx, pid) {
                 return Ok(LINUX_ESRCH.into());
             }
             if address.0 == 0 {
@@ -841,7 +858,7 @@ impl SyscallDispatcher {
             if (pid as i32) < 0 {
                 return Ok(LINUX_EINVAL.into());
             }
-            if !sched_pid_exists(pid) {
+            if !sched_pid_exists(cx, pid) {
                 return Ok(LINUX_ESRCH.into());
             }
             // SCHED_OTHER, nice 0, priority 0 — a zeroed sched_attr with only
@@ -865,7 +882,7 @@ impl SyscallDispatcher {
             if (pid as i32) < 0 {
                 return Ok(LINUX_EINVAL.into());
             }
-            if !sched_pid_is_self(pid) {
+            if !sched_pid_exists(cx, pid) {
                 return Ok(LINUX_ESRCH.into());
             }
             let policy_i = policy as i32;
@@ -894,7 +911,7 @@ impl SyscallDispatcher {
             if (pid as i32) < 0 {
                 return Ok(LINUX_EINVAL.into());
             }
-            if !sched_pid_exists(pid) {
+            if !sched_pid_exists(cx, pid) {
                 return Ok(LINUX_ESRCH.into());
             }
             let prio = match sched_read_param_priority(cx, address) {
@@ -911,7 +928,7 @@ impl SyscallDispatcher {
         /// quantum into `*timespec`. SCHED_OTHER tasks aren't on a RR
         /// schedule; Linux returns {0, 0} (and 0). We mirror that.
         fn sched_rr_get_interval(this, cx, pid: u64, address: GuestPtr) {
-            if !sched_pid_exists(pid) {
+            if !sched_pid_exists(cx, pid) {
                 return Ok(LINUX_ESRCH.into());
             }
             if address.0 == 0 {
