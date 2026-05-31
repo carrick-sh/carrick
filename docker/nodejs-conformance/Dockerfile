@@ -34,7 +34,8 @@ RUN set -eux; \
       ca-certificates git curl xz-utils \
       python3 python-is-python3 make gcc g++ pkg-config perl \
       cmake ninja-build autoconf automake libtool; \
-    rm -rf /var/lib/apt/lists/*
+    rm -rf /var/lib/apt/lists/*; \
+    useradd --create-home --uid 1000 --user-group --shell /usr/sbin/nologin nodeconf
 
 RUN set -eux; \
     mkdir -p /opt/node-src /opt/nodejs-conformance/bin; \

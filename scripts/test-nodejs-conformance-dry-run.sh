@@ -9,6 +9,8 @@ repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 entry="$repo/docker/nodejs-conformance/nodejs-conformance"
 wrapper="$repo/scripts/nodejs-conformance-image.sh"
 
+bash -n "$entry"
+
 fail() {
   echo "FAIL: $*" >&2
   exit 1
@@ -87,8 +89,10 @@ PATH="$fakebin:$PATH" FAKE_DOCKER_ARGS="$fake_args" FAKE_CARRICK_ARGS="$fake_car
 carrick_out="$(cat "$fake_carrick_args")"
 contains "$carrick_out" "<run>"
 contains "$carrick_out" "<--raw>"
+contains "$carrick_out" "<--entrypoint>"
+contains "$carrick_out" "</bin/bash>"
 contains "$carrick_out" "<NODEJS_CONFORMANCE_EFFECTIVE_RUNNER=carrick>"
-not_contains "$carrick_out" "</usr/local/bin/nodejs-conformance>"
+contains "$carrick_out" "</usr/local/bin/nodejs-conformance>"
 contains "$carrick_out" "<--jsonl>"
 contains "$carrick_out" "<$abs_jsonl>"
 
