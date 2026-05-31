@@ -1276,6 +1276,16 @@ impl SyscallDispatcher {
                 };
                 if let Ok(n) = kq.wait(&[], &mut out, Some(&zero)) {
                     let acc_before = acc.len();
+                    // Count only REAL host-fd events (EVFILT_READ/WRITE/EXCEPT →
+                    // nonzero epoll bits). A consumed EVFILT_USER(0) in-memory wake
+                    // (bits == 0, registered EV_CLEAR so it auto-resets on this
+                    // drain) must NOT count toward `kq_drained_all_filtered`: it is
+                    // gone now, so polling kq_fd will not spin, whereas the
+                    // all-filtered path parks on the signal pipe only — which
+                    // strands an indefinite epoll_pwait that can no longer be
+                    // reached by the next notify_inmem_epoll / host-fd readiness
+                    // edge (the Node worker-teardown loop-thread hang).
+                    let mut translatable_events = 0usize;
                     for ev in &out[..n] {
                         let bits = kevent_to_epoll(*ev);
                         if bits == 0 {
@@ -1283,6 +1293,7 @@ impl SyscallDispatcher {
                             // translatable bits — recompute below covers in-memory.
                             continue;
                         }
+                        translatable_events += 1;
                         let guest_fd = ev.udata_i32();
                         // The kqueue filter is keyed by HOST fd, but several guest
                         // fds can be dups of one socket/pipe sharing that host fd,
@@ -1329,10 +1340,14 @@ impl SyscallDispatcher {
                             }
                         }
                     }
-                    // The kqueue had events but our interest masks let none of
-                    // them through (the events=0-with-data case). Polling kq_fd
-                    // would just see the same readiness and spin.
-                    kq_drained_all_filtered = n > 0 && acc.len() == acc_before;
+                    // A REAL host-fd readiness event fired but our interest masks
+                    // let none of them through (the events=0-with-data case).
+                    // Polling kq_fd would just see the same (level-triggered)
+                    // readiness and spin, so park on the signal pipe instead. A
+                    // pure EVFILT_USER drain is excluded (translatable_events == 0):
+                    // it auto-resets, so the kqueue-poll path is correct and keeps
+                    // the waiter reachable by later wakes.
+                    kq_drained_all_filtered = translatable_events > 0 && acc.len() == acc_before;
                 }
             }
 
