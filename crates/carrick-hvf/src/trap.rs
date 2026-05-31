@@ -2193,16 +2193,35 @@ impl HvfInner {
         // Independent of the clock data (getrandom needs no calibrated counter),
         // so stamp it first and unconditionally.
         self.stamp_rng_generation();
-        let (host_cntvct, freq) = host_counter();
+        let (_, freq) = host_counter();
         if freq == 0 {
             return;
         }
-        // HVF leaves the guest virtual-counter offset (CNTVOFF_EL2) at 0, so the
-        // guest's CNTVCT_EL0 reads the same virtual count carrick reads here. The
-        // absolute base is immaterial for CLOCK_MONOTONIC (durations cancel it);
-        // it only shifts the realtime offset by a constant if HVF ever changed it.
-        let guest_cntvct = host_cntvct;
-        let mono_ns = ((guest_cntvct as u128).saturating_mul(1_000_000_000) / freq as u128) as u64;
+        // The vDSO computes the guest's CLOCK_REALTIME as
+        //   realtime_ns = guest_CNTVCT/freq + realtime_off.
+        // So `realtime_off` MUST be `unix_ns - guest_CNTVCT/freq` measured on
+        // the SAME clock the guest's CNTVCT_EL0 actually exposes.
+        //
+        // Crucially, the guest's CNTVCT does NOT equal the raw `cntvct_el0` MRS
+        // that carrick reads in `host_counter()`: the bare hardware counter
+        // keeps ticking across system SUSPEND (it is BOOTTIME-like), whereas
+        // HVF gives the guest a virtual counter aligned to macOS
+        // CLOCK_UPTIME_RAW (which EXCLUDES suspend) — empirically the guest's
+        // CNTVCT/freq matches CLOCK_UPTIME_RAW to the millisecond, while the
+        // raw MRS runs HOURS ahead after a laptop has slept (hv_vcpu's
+        // vtimer_offset reports 0, so the gap is invisible through that API).
+        // Calibrating `mono_ns` off the raw MRS therefore skewed guest
+        // CLOCK_REALTIME by the accumulated suspend time → every absolute
+        // FUTEX_WAIT_BITSET|FUTEX_CLOCK_REALTIME deadline (glibc sem_timedwait /
+        // pthread condvar timeouts, i.e. multiprocessing SemLock/Condition)
+        // computed as already-past → instant spurious ETIMEDOUT.
+        //
+        // Reading CLOCK_UPTIME_RAW here matches the guest's counter base, so
+        // realtime_off is exact. CLOCK_MONOTONIC is unaffected (durations
+        // cancel any constant base), but its absolute value now also agrees
+        // with carrick's syscall-path monotonic (`monotonic_duration`, also
+        // CLOCK_UPTIME_RAW) — the vDSO and syscall fast/slow paths are coherent.
+        let mono_ns = host_clock_uptime_ns();
         let unix_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
