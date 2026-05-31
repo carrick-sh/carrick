@@ -861,6 +861,34 @@ pub fn ensure_host_handler(linux_signum: i32) {
     }
 }
 
+/// Reset host signal dispositions that were installed only to route guest
+/// caught-signal handlers. Guest `execve(2)` resets caught dispositions to
+/// default while preserving `SIG_IGN`; because Carrick does not host-exec, the
+/// host process would otherwise keep catching those signals after the emulated
+/// disposition was gone.
+pub fn reset_routed_handlers_after_execve(ignored_mask: u64) {
+    for linux_signum in 1..=63 {
+        if matches!(linux_signum, LINUX_SIGINT | 9 | 13 | 17 | 19) {
+            continue;
+        }
+        let bit = 1u64 << linux_signum;
+        if INSTALLED_MASK.fetch_and(!bit, Ordering::SeqCst) & bit == 0 {
+            continue;
+        }
+        let host = linux_to_host_signum(linux_signum);
+        unsafe {
+            let mut action: libc::sigaction = core::mem::zeroed();
+            action.sa_sigaction = if ignored_mask & bit != 0 {
+                libc::SIG_IGN
+            } else {
+                libc::SIG_DFL
+            };
+            libc::sigemptyset(&mut action.sa_mask);
+            libc::sigaction(host, &action, std::ptr::null_mut());
+        }
+    }
+}
+
 /// Install the host SIGINT handler. Subsequent calls are no-ops. Safe
 /// to call from anywhere; the runtime calls it once per `run_*`
 /// invocation.
