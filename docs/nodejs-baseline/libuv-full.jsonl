@@ -1,0 +1,1 @@
+{"kind":"baseline-placeholder","line":"24","libuv_ref":"v1.52.1","status":"not-run","note":"Populate with nodejs-conformance --runner both --suite libuv --line 24 after building the conformance image."}

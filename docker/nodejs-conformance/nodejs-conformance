@@ -1,0 +1,292 @@
+#!/usr/bin/env bash
+# Shared Node.js/V8/libuv conformance entrypoint.
+#
+# The same file is copied into the Docker image and kept in the repo so the host
+# wrapper can use it to orchestrate Docker and carrick runs.
+set -euo pipefail
+
+NODE24_REF="${NODE24_REF:-v24.16.0}"
+NODE26_REF="${NODE26_REF:-v26.2.0}"
+LIBUV_REF="${LIBUV_REF:-v1.52.1}"
+DEFAULT_IMAGE="localhost:5005/carrick-nodejs-conformance:24.16.0-26.2.0"
+
+runner="both"
+suite="all"
+line="24"
+filter=""
+timeout_s="120"
+jsonl=""
+dry_run=0
+metadata=0
+smoke=0
+image="${NODEJS_CONFORMANCE_IMAGE:-$DEFAULT_IMAGE}"
+
+usage() {
+  cat <<'USAGE'
+usage: nodejs-conformance [options]
+
+Options:
+  --runner docker|carrick|both
+  --suite node-core|libuv|v8-smoke|npm-smoke|app-smoke|all
+  --line 24|26
+  --filter PATTERN
+  --timeout SECONDS
+  --jsonl PATH
+  --smoke
+  --metadata
+  --dry-run
+  --help
+USAGE
+}
+
+die() {
+  echo "nodejs-conformance: $*" >&2
+  exit 2
+}
+
+need_value() {
+  local opt="$1"
+  [[ $# -ge 2 && -n "${2:-}" ]] || die "$opt requires a value"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --runner) need_value "$@"; runner="$2"; shift 2 ;;
+    --suite) need_value "$@"; suite="$2"; shift 2 ;;
+    --line) need_value "$@"; line="$2"; shift 2 ;;
+    --filter) need_value "$@"; filter="$2"; shift 2 ;;
+    --timeout) need_value "$@"; timeout_s="$2"; shift 2 ;;
+    --jsonl) need_value "$@"; jsonl="$2"; shift 2 ;;
+    --smoke) smoke=1; shift ;;
+    --metadata) metadata=1; shift ;;
+    --dry-run) dry_run=1; shift ;;
+    --help|-h) usage; exit 0 ;;
+    *) die "unknown option: $1" ;;
+  esac
+done
+
+case "$runner" in docker|carrick|both) ;; *) die "invalid --runner: $runner" ;; esac
+case "$suite" in node-core|libuv|v8-smoke|npm-smoke|app-smoke|all) ;; *) die "invalid --suite: $suite" ;; esac
+case "$line" in 24|26) ;; *) die "invalid --line: $line" ;; esac
+[[ "$timeout_s" =~ ^[0-9]+$ && "$timeout_s" -gt 0 ]] || die "invalid --timeout: $timeout_s"
+
+node_ref_for_line() {
+  case "$1" in
+    24) printf '%s\n' "$NODE24_REF" ;;
+    26) printf '%s\n' "$NODE26_REF" ;;
+    *) return 1 ;;
+  esac
+}
+
+if [[ "$metadata" -eq 1 ]]; then
+  printf '{"node24_ref":"%s","node26_ref":"%s","libuv_ref":"%s","image":"%s"}\n' \
+    "$NODE24_REF" "$NODE26_REF" "$LIBUV_REF" "$image"
+  exit 0
+fi
+
+if [[ "$dry_run" -eq 1 ]]; then
+  printf 'nodejs-conformance dry-run: runner=%s suite=%s line=%s timeout=%s jsonl=%s filter=%s smoke=%s image=%s node_ref=%s libuv_ref=%s\n' \
+    "$runner" "$suite" "$line" "$timeout_s" "${jsonl:-}" "${filter:-}" "$smoke" "$image" "$(node_ref_for_line "$line")" "$LIBUV_REF"
+  exit 0
+fi
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root=""
+if [[ -d "$script_dir/../.." && -d "$script_dir/../../.git" ]]; then
+  repo_root="$(cd "$script_dir/../.." && pwd)"
+fi
+
+in_image() {
+  [[ "${NODEJS_CONFORMANCE_IN_IMAGE:-}" == "1" || -d /opt/nodejs-conformance ]]
+}
+
+jsonl_abs() {
+  [[ -n "$jsonl" ]] || return 1
+  case "$jsonl" in
+    /*) printf '%s\n' "$jsonl" ;;
+    *) printf '%s/%s\n' "$(pwd)" "$jsonl" ;;
+  esac
+}
+
+run_docker_host() {
+  local args=(docker run --rm --platform linux/arm64)
+  local inner_jsonl="$jsonl"
+  if path="$(jsonl_abs)"; then
+    mkdir -p "$(dirname "$path")"
+    args+=(-v "$(dirname "$path"):$(dirname "$path")")
+    inner_jsonl="$path"
+  fi
+  args+=(-e NODEJS_CONFORMANCE_IN_IMAGE=1 -e NODEJS_CONFORMANCE_EFFECTIVE_RUNNER=docker)
+  args+=("$image" /usr/local/bin/nodejs-conformance --runner docker --suite "$suite" --line "$line" --timeout "$timeout_s")
+  [[ -z "$filter" ]] || args+=(--filter "$filter")
+  [[ -z "$inner_jsonl" ]] || args+=(--jsonl "$inner_jsonl")
+  [[ "$smoke" -eq 0 ]] || args+=(--smoke)
+  "${args[@]}"
+}
+
+run_carrick_host() {
+  local carrick_bin="${CARRICK_BIN:-}"
+  if [[ -z "$carrick_bin" && -n "$repo_root" && -x "$repo_root/target/release/carrick" ]]; then
+    carrick_bin="$repo_root/target/release/carrick"
+  fi
+  if [[ -z "$carrick_bin" ]]; then
+    carrick_bin="$(command -v carrick || true)"
+  fi
+  [[ -n "$carrick_bin" && -x "$carrick_bin" ]] || die "carrick binary not found; set CARRICK_BIN or build target/release/carrick"
+
+  local run_id="${CARRICK_RUN_ID:-nodejs-conf-$$}"
+  local args=(run --raw -e NODEJS_CONFORMANCE_IN_IMAGE=1 -e NODEJS_CONFORMANCE_EFFECTIVE_RUNNER=carrick)
+  local inner_jsonl="$jsonl"
+  if path="$(jsonl_abs)"; then
+    mkdir -p "$(dirname "$path")"
+    args+=(-v "$(dirname "$path"):$(dirname "$path")")
+    inner_jsonl="$path"
+  fi
+  args+=("$image" /usr/local/bin/nodejs-conformance --runner docker --suite "$suite" --line "$line" --timeout "$timeout_s")
+  [[ -z "$filter" ]] || args+=(--filter "$filter")
+  [[ -z "$inner_jsonl" ]] || args+=(--jsonl "$inner_jsonl")
+  [[ "$smoke" -eq 0 ]] || args+=(--smoke)
+  CARRICK_RUN_ID="$run_id" CARRICK_INSECURE_REGISTRIES="${CARRICK_INSECURE_REGISTRIES:-localhost:5005}" "$carrick_bin" "${args[@]}"
+}
+
+if ! in_image; then
+  case "$runner" in
+    docker) run_docker_host ;;
+    carrick) run_carrick_host ;;
+    both)
+      run_docker_host
+      run_carrick_host
+      ;;
+  esac
+  exit 0
+fi
+
+if [[ "$runner" == "both" ]]; then
+  die "--runner both must be used from the host wrapper, not from inside the image"
+fi
+
+effective_runner="${NODEJS_CONFORMANCE_EFFECTIVE_RUNNER:-$runner}"
+node_src="/opt/node-src/v${line}"
+node_bin="/opt/nodejs-conformance/bin/node${line}"
+fixtures="/opt/nodejs-conformance/fixtures"
+
+[[ -x "$node_bin" ]] || die "missing node binary for line $line: $node_bin"
+[[ -d "$node_src" ]] || die "missing node source for line $line: $node_src"
+
+append_jsonl() {
+  [[ -n "$jsonl" ]] || return 0
+  mkdir -p "$(dirname "$jsonl")"
+  REC_SUITE="$1" REC_RUNNER="$2" REC_LINE="$3" REC_STATUS="$4" REC_RC="$5" REC_DURATION="$6" REC_SIGNATURE="$7" \
+  REC_NODE_REF="$(node_ref_for_line "$3")" REC_LIBUV_REF="$LIBUV_REF" REC_FILTER="$filter" \
+    python3 - "$jsonl" <<'PY'
+import json
+import os
+import sys
+
+path = sys.argv[1]
+record = {
+    "suite": os.environ["REC_SUITE"],
+    "runner": os.environ["REC_RUNNER"],
+    "line": os.environ["REC_LINE"],
+    "node_ref": os.environ["REC_NODE_REF"],
+    "libuv_ref": os.environ["REC_LIBUV_REF"],
+    "filter": os.environ["REC_FILTER"],
+    "status": os.environ["REC_STATUS"],
+    "returncode": int(os.environ["REC_RC"]),
+    "duration_sec": int(os.environ["REC_DURATION"]),
+    "signature": os.environ["REC_SIGNATURE"],
+}
+with open(path, "a", encoding="utf-8") as f:
+    f.write(json.dumps(record, sort_keys=True) + "\n")
+PY
+}
+
+run_logged() {
+  local name="$1"
+  shift
+  local tmp rc status start end signature
+  tmp="$(mktemp "/tmp/nodejs-${name}.XXXXXX.log")"
+  start="$(date +%s)"
+  set +e
+  timeout -s KILL "$timeout_s" "$@" >"$tmp" 2>&1
+  rc=$?
+  set -e
+  end="$(date +%s)"
+  if [[ "$rc" -eq 0 ]]; then
+    status="PASS"
+  elif [[ "$rc" -eq 124 || "$rc" -eq 137 ]]; then
+    status="TIMEOUT"
+  else
+    status="FAIL"
+  fi
+  signature="$(grep -aE '^(not ok|FAIL|# Fatal|FATAL ERROR|AssertionError|Error:|fatal error:|panic:)' "$tmp" | head -1 || true)"
+  if [[ -z "$signature" ]]; then
+    signature="$(head -1 "$tmp" || true)"
+  fi
+  printf '%-12s %-8s rc=%s log=%s\n' "$name" "$status" "$rc" "$tmp"
+  append_jsonl "$name" "$effective_runner" "$line" "$status" "$rc" "$((end - start))" "$signature"
+  return "$rc"
+}
+
+libuv_test_bin() {
+  find /opt/libuv-src -type f \( -name 'uv_run_tests_a' -o -name 'run-tests' \) -perm -111 -print -quit
+}
+
+run_node_core() {
+  local args=(python3 tools/test.py --shell "$node_bin" --progress tap)
+  [[ -z "$filter" ]] || args+=("$filter")
+  (cd "$node_src" && run_logged node-core "${args[@]}")
+}
+
+run_libuv() {
+  local uv_bin
+  uv_bin="$(libuv_test_bin)"
+  [[ -n "$uv_bin" ]] || die "libuv test binary not found"
+  local args=("$uv_bin")
+  [[ -z "$filter" ]] || args+=("$filter")
+  run_logged libuv "${args[@]}"
+}
+
+run_v8_smoke() {
+  run_logged v8-smoke "$node_bin" "$fixtures/v8-smoke.js"
+}
+
+run_npm_smoke() {
+  local npm_cli="$node_src/deps/npm/bin/npm-cli.js"
+  [[ -f "$npm_cli" ]] || die "missing npm CLI at $npm_cli"
+  local tmp
+  tmp="$(mktemp -d /tmp/nodejs-npm-smoke.XXXXXX)"
+  cp -R "$fixtures/npm-smoke" "$tmp/pkg"
+  run_logged npm-smoke env HOME="$tmp/home" npm_config_cache="$tmp/cache" "$node_bin" "$npm_cli" --prefix "$tmp/pkg" run smoke
+}
+
+run_app_smoke() {
+  run_logged app-smoke "$node_bin" "$fixtures/app-smoke.js"
+}
+
+suite_list() {
+  case "$suite" in
+    all)
+      if [[ "$smoke" -eq 1 ]]; then
+        printf '%s\n' v8-smoke npm-smoke app-smoke
+      else
+        printf '%s\n' node-core libuv v8-smoke npm-smoke app-smoke
+      fi
+      ;;
+    *) printf '%s\n' "$suite" ;;
+  esac
+}
+
+overall=0
+while IFS= read -r selected; do
+  case "$selected" in
+    node-core) run_node_core || overall=1 ;;
+    libuv) run_libuv || overall=1 ;;
+    v8-smoke) run_v8_smoke || overall=1 ;;
+    npm-smoke) run_npm_smoke || overall=1 ;;
+    app-smoke) run_app_smoke || overall=1 ;;
+    *) die "internal suite dispatch error: $selected" ;;
+  esac
+done < <(suite_list)
+
+exit "$overall"
