@@ -8,6 +8,8 @@ mod support;
 
 use support::*;
 
+use carrick_runtime::linux_abi::LINUX_EACCES;
+
 #[test]
 fn process_identity_syscalls_return_bootstrap_ids() {
     let mut memory = LinearMemory::new(0x4000, Vec::new());
@@ -827,6 +829,55 @@ fn umask_setpriority_getpriority_sysinfo_bootstrap_stubs() {
             )
             .unwrap(),
         DispatchOutcome::Returned { value: 15 }
+    );
+    let current_pid = std::process::id() as u64;
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(141, SyscallArgs::from([0, current_pid, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 15 }
+    );
+
+    // setpriority returns EACCES, not EPERM, when the target exists but an
+    // unprivileged caller tries to lower its nice value (raise priority).
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(140, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(146, SyscallArgs::from([1000, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    140,
+                    SyscallArgs::from([0, 0, 20_u64.wrapping_neg(), 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno {
+            errno: LINUX_EACCES
+        }
     );
 
     // sysinfo populates a 64-bit-aligned struct at the provided address.

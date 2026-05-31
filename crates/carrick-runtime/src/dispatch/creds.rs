@@ -9,6 +9,10 @@ use super::*;
 /// per-process attribute and carrick's fork creates a fresh address space.
 static NICE_VALUE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
+fn is_self_priority_target(who: i32) -> bool {
+    who == 0 || who == LINUX_BOOTSTRAP_PID as i32 || who == std::process::id() as i32
+}
+
 /// Owned credentials-subsystem state. Split out of `SyscallDispatcher`.
 ///
 /// Tracked (real, effective, saved) uid and gid plus the umask. Carrick
@@ -293,7 +297,7 @@ impl SyscallDispatcher {
             if who.0 < 0 {
                 return Ok(LINUX_ESRCH.into());
             }
-            if which == LINUX_PRIO_PROCESS && who.0 != 0 && who.0 != LINUX_BOOTSTRAP_PID as i32 {
+            if which == LINUX_PRIO_PROCESS && !is_self_priority_target(who.0) {
                 return Ok(LINUX_ESRCH.into());
             }
             // Linux CLAMPS the nice value to [-20,19] (it does NOT reject an
@@ -303,12 +307,12 @@ impl SyscallDispatcher {
             let clamped = prio.clamp(-20, 19);
             // For the calling process, enforce the unprivileged nice-lowering
             // rule (raising priority needs CAP_SYS_NICE): a non-root euid can't
-            // set a nice BELOW the current one (LTP nice04 nice(-10) → EPERM),
-            // and persist the value so getpriority reflects it (nice03).
+            // set a nice BELOW the current one. setpriority(2) reports EACCES
+            // for that case; EPERM is for a target-ownership mismatch.
             if which == LINUX_PRIO_PROCESS {
                 let current = NICE_VALUE.load(Ordering::Relaxed);
                 if clamped < current && this.cred_snapshot().euid != 0 {
-                    return Ok(LINUX_EPERM.into());
+                    return Ok(LINUX_EACCES.into());
                 }
                 NICE_VALUE.store(clamped, Ordering::Relaxed);
             }
@@ -325,7 +329,7 @@ impl SyscallDispatcher {
             if who.0 < 0 {
                 return Ok(LINUX_ESRCH.into());
             }
-            if which == LINUX_PRIO_PROCESS && who.0 != 0 && who.0 != LINUX_BOOTSTRAP_PID as i32 {
+            if which == LINUX_PRIO_PROCESS && !is_self_priority_target(who.0) {
                 return Ok(LINUX_ESRCH.into());
             }
             // Kernel ABI: getpriority returns `20 - nice` (so the value is never
