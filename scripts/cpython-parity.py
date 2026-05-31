@@ -69,18 +69,19 @@ def parse(text):
                                or "Traceback (most recent call last)" in text and not outcomes)
     return outcomes, reasons, summary
 
-def run_docker(module, image, testroot, timeout):
-    cmd = ["docker", "run", "--rm", "--platform", "linux/arm64",
-           "-v", f"{testroot}:{MOUNT_DEST}:ro", "-e", f"PYTHONPATH={MOUNT_DEST}", image,
+def run_docker(module, image, testroot, timeout, bundled=False):
+    mount = [] if bundled else ["-v", f"{testroot}:{MOUNT_DEST}:ro", "-e", f"PYTHONPATH={MOUNT_DEST}"]
+    cmd = ["docker", "run", "--rm", "--platform", "linux/arm64", *mount, image,
            "python3", "-m", "test", "-v", "--randseed", "0", module]
     return _run(cmd, timeout)
 
-def run_carrick(module, carrick, image, testroot, timeout, run_id):
+def run_carrick(module, carrick, image, testroot, timeout, run_id, bundled=False):
     env = dict(os.environ)
     env["CARRICK_INSECURE_REGISTRIES"] = env.get("CARRICK_INSECURE_REGISTRIES", "localhost:5050")
     env["CARRICK_RUN_ID"] = run_id
     _kill(run_id)
-    cmd = [carrick, "run", "-v", f"{testroot}:{MOUNT_DEST}:ro", "-e", f"PYTHONPATH={MOUNT_DEST}",
+    mount = [] if bundled else ["-v", f"{testroot}:{MOUNT_DEST}:ro", "-e", f"PYTHONPATH={MOUNT_DEST}"]
+    cmd = [carrick, "run", *mount,
            image, "--raw", "--fs", "host",
            "/usr/local/bin/python3", "-m", "test", "-v", "--randseed", "0", module]
     out, rc, dur, timed = _run(cmd, timeout, env=env)
@@ -132,6 +133,9 @@ def main():
     ap.add_argument("--image", default="python:3.12")
     ap.add_argument("--testroot", default="/tmp/cpy",
                     help="host dir CONTAINING the `test` package (mounted on PYTHONPATH)")
+    ap.add_argument("--bundled", action="store_true",
+                    help="the `test` suite is baked into --image at the stdlib path "
+                         "(e.g. localhost:5050/cpython-test:3.12.13); skip the bind-mount")
     ap.add_argument("--timeout", type=int, default=180)
     ap.add_argument("--jsonl", default=None)
     args = ap.parse_args()
@@ -145,9 +149,11 @@ def main():
     jf = open(args.jsonl, "a") if args.jsonl else None
     for module in modules:
         rid = f"cpy-{os.getpid()}-{random.randint(0, 1<<30)}"
-        d_out, d_rc, d_dur, d_to = run_docker(module, args.image, args.testroot, args.timeout)
+        d_out, d_rc, d_dur, d_to = run_docker(module, args.image, args.testroot, args.timeout,
+                                              bundled=args.bundled)
         c_out, c_rc, c_dur, c_to = run_carrick(module, args.carrick, args.image,
-                                               args.testroot, args.timeout, rid)
+                                               args.testroot, args.timeout, rid,
+                                               bundled=args.bundled)
         dk, ck = parse(d_out), parse(c_out)
         diffs, d_sum, c_sum = compare(module, dk, ck)
 
