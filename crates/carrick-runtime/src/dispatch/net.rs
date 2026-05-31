@@ -5,6 +5,26 @@ mod support;
 use support::*;
 pub(super) use support::{drain_netlink_queue, set_host_nonblocking};
 
+fn guest_unix_pathname(memory: &impl GuestMemory, addr: u64, addrlen: u32) -> Option<String> {
+    memory
+        .read_bytes(addr, addrlen as usize)
+        .ok()
+        .and_then(|raw| {
+            if raw.len() > 2 && raw[2] != 0 {
+                let nul = raw[2..]
+                    .iter()
+                    .position(|&b| b == 0)
+                    .map(|p| 2 + p)
+                    .unwrap_or(raw.len());
+                std::str::from_utf8(&raw[2..nul])
+                    .ok()
+                    .map(|s| s.to_string())
+            } else {
+                None
+            }
+        })
+}
+
 impl SyscallDispatcher {
     /// Whether `fd` is a pollable target for `epoll_ctl(ADD)`. The kernel
     /// returns EPERM when adding an fd whose file has no `->poll` op — regular
@@ -2173,10 +2193,6 @@ impl SyscallDispatcher {
                     return Ok(linux_errno::EADDRINUSE.into());
                 }
             }
-            let host_addr = match read_linux_sockaddr(memory, addr_addr, addrlen, family) {
-                Ok(bytes) => bytes,
-                Err(errno) => return Ok(errno.into()),
-            };
             // For an AF_UNIX PATHNAME socket, capture the GUEST sun_path now
             // (while we still hold the memory borrow) so that — after a
             // successful host bind — we can materialise a stat-able S_IFSOCK
@@ -2187,20 +2203,35 @@ impl SyscallDispatcher {
             // listener → crash). Abstract-namespace (leading NUL) and autobind
             // sockets have no fs node, so are excluded.
             let guest_unix_path: Option<String> = if family == libc::AF_UNIX {
-                memory.read_bytes(addr_addr, addrlen as usize).ok().and_then(|raw| {
-                    if raw.len() > 2 && raw[2] != 0 {
-                        let nul = raw[2..]
-                            .iter()
-                            .position(|&b| b == 0)
-                            .map(|p| 2 + p)
-                            .unwrap_or(raw.len());
-                        std::str::from_utf8(&raw[2..nul]).ok().map(|s| s.to_string())
-                    } else {
-                        None
-                    }
-                })
+                guest_unix_pathname(memory, addr_addr, addrlen)
             } else {
                 None
+            };
+            let resolved_guest_unix_path = if let Some(gp) = &guest_unix_path {
+                let resolved = match this.resolve_at_path(LINUX_AT_FDCWD, gp) {
+                    Ok(resolved) => resolved,
+                    Err(errno) => return Ok(errno.into()),
+                };
+                let parent = std::path::Path::new(&resolved)
+                    .parent()
+                    .and_then(|p| p.to_str())
+                    .filter(|p| !p.is_empty())
+                    .unwrap_or("/");
+                match this.layered_metadata(parent) {
+                    Ok(md) if md.kind == RootFsEntryKind::Directory => {}
+                    Ok(_) => return Ok(LINUX_ENOTDIR.into()),
+                    Err(errno) => return Ok(errno.into()),
+                }
+                if this.layered_lstat(&resolved).is_ok() {
+                    return Ok(linux_errno::EADDRINUSE.into());
+                }
+                Some(resolved)
+            } else {
+                None
+            };
+            let host_addr = match read_linux_sockaddr(memory, addr_addr, addrlen, family) {
+                Ok(bytes) => bytes,
+                Err(errno) => return Ok(errno.into()),
             };
             // AF_UNIX pathname sockets are bound at a stable host path (see
             // unix_socket_host_path). The guest's unlink only tombstones a VFS
@@ -2239,9 +2270,7 @@ impl SyscallDispatcher {
             // socket node's permission bits (verified vs Docker: umask 022 →
             // 0o755). Best-effort: a failure here doesn't undo the host bind
             // (the socket still works), it only means stat won't see the node.
-            if let Some(gp) = guest_unix_path
-                && let Ok(resolved) = this.resolve_at_path(LINUX_AT_FDCWD, &gp)
-            {
+            if let Some(resolved) = resolved_guest_unix_path {
                 let umask = this.cred_snapshot().umask & 0o777;
                 let mode = 0o777 & !umask;
                 let _ = this.fs.rootfs_vfs.overlay.create_socket(&resolved, mode);
@@ -2299,6 +2328,29 @@ impl SyscallDispatcher {
                 Ok(bytes) => bytes,
                 Err(errno) => return Ok(errno.into()),
             };
+            if family == libc::AF_UNIX
+                && let Some(gp) = guest_unix_pathname(memory, addr_addr, addrlen)
+            {
+                let resolved = match this.resolve_at_path(LINUX_AT_FDCWD, &gp) {
+                    Ok(resolved) => resolved,
+                    Err(errno) => return Ok(errno.into()),
+                };
+                let parent = std::path::Path::new(&resolved)
+                    .parent()
+                    .and_then(|p| p.to_str())
+                    .filter(|p| !p.is_empty())
+                    .unwrap_or("/");
+                match this.layered_metadata(parent) {
+                    Ok(md) if md.kind == RootFsEntryKind::Directory => {}
+                    Ok(_) => return Ok(LINUX_ENOTDIR.into()),
+                    Err(errno) => return Ok(errno.into()),
+                }
+                match this.layered_metadata(&resolved) {
+                    Ok(md) if md.kind == RootFsEntryKind::Socket => {}
+                    Ok(_) => return Ok(linux_errno::ECONNREFUSED.into()),
+                    Err(errno) => return Ok(errno.into()),
+                }
+            }
             // connect(2) has no per-call non-blocking flag, so put the host socket
             // non-blocking — it then returns EINPROGRESS instead of blocking under
             // the dispatcher lock. recv/send use MSG_DONTWAIT + the guest's intended
