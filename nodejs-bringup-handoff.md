@@ -2,7 +2,8 @@
 
 ## Latest
 
-The reproducible harness is being introduced before any Node baseline is run.
+Harness surface checks pass. The first full image build attempt reached the
+Node 26 source build and failed before producing an image.
 
 - Node 24 LTS full baseline target: `v24.16.0`.
 - Node 26 smoke target: `v26.2.0`.
@@ -10,6 +11,22 @@ The reproducible harness is being introduced before any Node baseline is run.
 - Docker context: `docker/nodejs-conformance`.
 - Shared entrypoint: `/usr/local/bin/nodejs-conformance`.
 - Host wrapper: `scripts/nodejs-conformance-image.sh`.
+
+Build attempt 1:
+
+```sh
+scripts/nodejs-conformance-image.sh --build --push --image localhost:5005/carrick-nodejs-conformance:24.16.0-26.2.0 --runner docker --suite app-smoke --line 24 --timeout 120
+```
+
+Result: failed in the Docker build at `make -j$(nproc)` for Node `v26.2.0`.
+Node `v24.16.0` had already built and installed. The failure was V8
+Turboshaft static assertions in `deps/v8/src/compiler/turboshaft/assembler.h`:
+`kTaggedSize == kInt32Size` reduced to `(8 == 4)` and
+`SmiValuesAre31Bits()` was false. A minimal Debian bookworm arm64 C++20
+reproducer shows GCC 12 and Clang reject the same non-dependent
+`static_assert` in a discarded `if constexpr` branch, while Debian trixie GCC
+14 accepts it. The Dockerfile now uses `debian:trixie` and splits the Node 24
+and Node 26 builds into separate layers before retrying.
 
 ## Intended workflow
 
