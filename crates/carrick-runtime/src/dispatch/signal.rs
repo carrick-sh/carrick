@@ -252,11 +252,21 @@ impl SyscallDispatcher {
     /// exited). Handlers are process-global, so this resets for the process.
     pub fn reset_signal_handlers_on_execve(&self) {
         let mut s = self.signal.lock();
+        let ignored_mask = s
+            .handlers
+            .iter()
+            .filter_map(|(&signum, action)| {
+                (action.sa_handler == crate::linux_abi::LINUX_SIG_IGN && (1..=63).contains(&signum))
+                    .then_some(1u64 << signum)
+            })
+            .fold(0u64, |mask, bit| mask | bit);
         // Keep only SIG_IGN dispositions; a caught handler → default (absent).
         s.handlers
             .retain(|_, a| a.sa_handler == crate::linux_abi::LINUX_SIG_IGN);
         // execve disestablishes any alternate signal stack for the process.
         s.altstack.clear();
+        drop(s);
+        crate::host_signal::reset_routed_handlers_after_execve(ignored_mask);
     }
 
     /// Apply Linux handler-time masking for `signum`, returning the mask that
