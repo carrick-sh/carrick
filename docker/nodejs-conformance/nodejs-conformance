@@ -117,7 +117,7 @@ run_docker_host() {
     inner_jsonl="$path"
   fi
   args+=(-e NODEJS_CONFORMANCE_IN_IMAGE=1 -e NODEJS_CONFORMANCE_EFFECTIVE_RUNNER=docker)
-  args+=("$image" /usr/local/bin/nodejs-conformance --runner docker --suite "$suite" --line "$line" --timeout "$timeout_s")
+  args+=("$image" --runner docker --suite "$suite" --line "$line" --timeout "$timeout_s")
   [[ -z "$filter" ]] || args+=(--filter "$filter")
   [[ -z "$inner_jsonl" ]] || args+=(--jsonl "$inner_jsonl")
   [[ "$smoke" -eq 0 ]] || args+=(--smoke)
@@ -142,7 +142,7 @@ run_carrick_host() {
     args+=(-v "$(dirname "$path"):$(dirname "$path")")
     inner_jsonl="$path"
   fi
-  args+=("$image" /usr/local/bin/nodejs-conformance --runner docker --suite "$suite" --line "$line" --timeout "$timeout_s")
+  args+=("$image" --runner docker --suite "$suite" --line "$line" --timeout "$timeout_s")
   [[ -z "$filter" ]] || args+=(--filter "$filter")
   [[ -z "$inner_jsonl" ]] || args+=(--jsonl "$inner_jsonl")
   [[ "$smoke" -eq 0 ]] || args+=(--smoke)
