@@ -768,6 +768,11 @@ impl SyscallDispatcher {
                 {
                     let tail_len = tail_end - tail_start;
                     if let Ok(tl) = usize::try_from(tail_len) {
+                        // Mark no-access so the SYSCALL path (mincore/read_bytes)
+                        // also reports the tail unmapped (mincore → ENOMEM),
+                        // matching Linux — not just a stage-1 fault on EL0 access.
+                        // A reusing mmap clears no-access in its seed.
+                        memory.set_no_access(tail_start, tl, true);
                         let _ = memory.unmap_range(tail_start, tl);
                     }
                     let mut mem = this.mem.lock();
@@ -881,6 +886,47 @@ impl SyscallDispatcher {
                 .is_err()
             {
                 return Ok(LINUX_ENOMEM.into());
+            }
+            // mremap MOVE on Linux UNMAPS the source [old, old+old_size) (unless
+            // MREMAP_DONTUNMAP). carrick previously LEAKED it: the source VA
+            // stayed mapped with its stale bytes and was never returned to the
+            // allocator, so `mmap_next` ran away and glibc's view of which VAs
+            // are mapped diverged from carrick's (glibc considers the source
+            // freed). Reclaim the source exactly like munmap, so a later access
+            // faults and the VA is reusable — matching Linux and keeping the
+            // mmapped-chunk bookkeeping coherent across the BytesIO/recv_bytes
+            // realloc-grow cascade (test_multiprocessing test_connection's 16 MiB
+            // round-trip). MREMAP_DONTUNMAP keeps the source mapped.
+            // Guard: the destination must not overlap the source (it never does —
+            // `new_addr` is freshly bump-allocated or a disjoint free region —
+            // but reclaiming an overlapping source would unmap the live copy).
+            let dst_overlaps_src = new_addr < old_address.0.wrapping_add(old_size)
+                && old_address.0 < new_addr.wrapping_add(new_size);
+            if flags & LINUX_MREMAP_DONTUNMAP == 0 && !dst_overlaps_src {
+                if let Some(old_size_a) = align_up_u64(old_size, LINUX_PAGE_SIZE)
+                    && let Ok(old_len) = usize::try_from(old_size_a)
+                    && old_len > 0
+                {
+                    let mut mem = this.mem.lock();
+                    // No-access so the syscall path also reports the source
+                    // unmapped (mincore → ENOMEM), matching Linux; a reusing
+                    // mmap clears it in its seed.
+                    memory.set_no_access(old_address.0, old_len, true);
+                    let _ = memory.unmap_range(old_address.0, old_len);
+                    if old_address.0.checked_add(old_size_a) == Some(mem.mmap_next) {
+                        mem.mmap_next = old_address.0;
+                        while let Some(pos) = mem
+                            .free_regions
+                            .iter()
+                            .position(|&(s, l)| s.checked_add(l) == Some(mem.mmap_next))
+                        {
+                            let (s, _l) = mem.free_regions.remove(pos);
+                            mem.mmap_next = s;
+                        }
+                    } else {
+                        free_regions_insert(&mut mem.free_regions, old_address.0, old_size_a);
+                    }
+                }
             }
             Ok(DispatchOutcome::Returned {
                 value: new_addr as i64,
