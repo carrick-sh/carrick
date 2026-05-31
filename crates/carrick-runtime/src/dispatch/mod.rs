@@ -2091,6 +2091,12 @@ fn relative_from_absolute_timespec(tv_sec: i64, tv_nsec: i64, realtime: bool) ->
     // deadline computes as already-past → instant spurious ETIMEDOUT (broke
     // CPython lock.acquire(timeout) / sem_timedwait / condvar timeouts; the
     // futexextra→deadline probe pins it).
+    //
+    // The FUTEX_CLOCK_REALTIME case reads the host wall clock here, which is
+    // correct ONLY because the guest's vDSO CLOCK_REALTIME is calibrated to the
+    // same wall clock (see HvfInner::populate_vdso_data_page, which derives the
+    // vvar realtime offset from CLOCK_UPTIME_RAW — the guest's CNTVCT base — not
+    // the suspend-counting raw cntvct MRS). Probe: futexrealtime.
     let clock = if realtime {
         libc::CLOCK_REALTIME
     } else {

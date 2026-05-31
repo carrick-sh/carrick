@@ -361,17 +361,48 @@ impl SyscallDispatcher {
         let want_trunc = flags & LINUX_O_TRUNC != 0;
 
         // O_TMPFILE: `pathname` names a directory; the result is an unnamed,
-        // writable regular file. Model it as an anonymous in-memory File with no
-        // overlay/namespace entry — it's never linked anywhere, exactly the
-        // "unlinked temp file" semantics tmpfile(3)/build tools rely on. Requires
-        // write access (the kernel rejects O_RDONLY|O_TMPFILE with EINVAL).
-        // (linkat(AT_EMPTY_PATH) to later materialize it is a separate follow-up.)
+        // writable regular file. It's never linked anywhere — exactly the
+        // "unlinked temp file" semantics tmpfile(3)/build tools rely on.
+        // Requires write access (the kernel rejects O_RDONLY|O_TMPFILE with
+        // EINVAL). (linkat(AT_EMPTY_PATH) to later materialize it is a separate
+        // follow-up.)
+        //
+        // Back it with a REAL anonymous host fd when the backend can give us one
+        // (--fs host: mkstemp + immediate unlink). A real kernel fd is shared by
+        // fork(2) AND inherited across exec(2), so a forked+exec'd child's write
+        // reaches the PARENT's read — which is what test_faulthandler's
+        // tempfile.TemporaryFile()-to-a-subprocess pattern needs. An in-memory
+        // File is PER-PROCESS (copied, not shared, across fork) so the child's
+        // write never reached the parent → FAIL. MemoryBackend has no kernel fd
+        // (open_anon_fd → None) and keeps the in-memory File fallback.
         if flags & crate::linux_abi::LINUX_O_TMPFILE != 0 {
             if !writable_request {
                 return Ok(LINUX_EINVAL.into());
             }
             let creds = self.cred_snapshot();
             let create_mode = (mode as u32 & 0o7777) & !(creds.umask & 0o777);
+            if let Some(host_fd) = self.fs.rootfs_vfs.overlay.open_anon_fd(create_mode) {
+                let description = OpenDescription::HostFile {
+                    host_fd,
+                    metadata: RootFsMetadata {
+                        path: Path::new("/__carrick_o_tmpfile").to_path_buf(),
+                        kind: RootFsEntryKind::File,
+                        mode: create_mode,
+                        size: 0,
+                    },
+                    base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
+                    writable: true,
+                };
+                let open_file = OpenFile::with_host_fd(
+                    Arc::new(RwLock::new(description)),
+                    linux_fd_flags_from_open_flags(flags),
+                    host_fd,
+                );
+                return match self.install_fd_at_or_above(0, open_file) {
+                    Ok(fd) => Ok(DispatchOutcome::Returned { value: fd as i64 }),
+                    Err(_) => Ok(linux_errno::EMFILE.into()),
+                };
+            }
             let description = OpenDescription::File {
                 path: "/__carrick_o_tmpfile".to_string(),
                 metadata: RootFsMetadata {
