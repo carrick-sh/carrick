@@ -960,6 +960,7 @@ fn with_entry_fd<R>(
     writable: bool,
     f: impl FnOnce(std::os::fd::RawFd) -> R,
 ) -> Option<R> {
+    use cap_std::fs::OpenOptionsExt;
     use std::os::fd::AsRawFd;
     if is_dir {
         let d = dir.open_dir(rel).ok()?;
@@ -970,7 +971,25 @@ fn with_entry_fd<R>(
             .ok()?;
         Some(f(file.as_raw_fd()))
     } else {
-        let file = dir.open(rel).ok()?;
+        // Read-only xattr peek (mode/owner). A plain read open() would bump
+        // the file's access time to "now" on a strict-atime APFS volume —
+        // and the mode xattr is read on EVERY stat of a regular file, so a
+        // guest's `os.utime(path, (past_atime, ...))` was silently undone by
+        // the very next stat. macOS `O_EVTONLY` opens the file "for event
+        // monitoring only": fgetxattr still works, but the kernel does NOT
+        // record an access, so atime is preserved exactly as the guest set
+        // it (mailbox.Maildir.clean's getatime-cutoff sweep then matches
+        // Linux). fall back to a plain open if O_EVTONLY isn't honored.
+        const O_EVTONLY: i32 = 0x8000;
+        let file = dir
+            .open_with(
+                rel,
+                cap_std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(O_EVTONLY),
+            )
+            .or_else(|_| dir.open(rel))
+            .ok()?;
         Some(f(file.as_raw_fd()))
     }
 }
@@ -2092,7 +2111,16 @@ pub fn layered_directory_entries(
             // CharDevice never appears in the writable overlay (it only comes
             // from the /dev VFS mounts), but the match must be exhaustive.
             RootFsEntryKind::File | RootFsEntryKind::CharDevice => {
-                let size = overlay.file_contents(&path).map(|b| b.len()).unwrap_or(0);
+                // Use the backend's `metadata` (fstatat / HashMap len) for the
+                // size — NOT `file_contents`, which open()s and reads the whole
+                // file. On a strict-atime APFS scratch that read bumped the
+                // file's access time to "now", so a guest's
+                // `os.utime(path, (past_atime, ...))` was silently undone by the
+                // very next directory enumeration (os.listdir → getdents). That
+                // broke mailbox.Maildir.clean()'s getatime-cutoff sweep. A pure
+                // stat preserves atime and avoids slurping every file just to
+                // learn its length.
+                let size = overlay.metadata(&path).map(|m| m.size).unwrap_or(0);
                 RootFsMetadata {
                     path: normalized,
                     kind,
