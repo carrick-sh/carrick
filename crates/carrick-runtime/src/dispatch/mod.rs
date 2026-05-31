@@ -3909,6 +3909,7 @@ fn read_host_pipe(
 
 /// write(2) on a host-backed fd. Same lockless discipline as `read_host_pipe`.
 fn write_host_pipe(bytes: &[u8], host_fd: i32, nonblocking: bool) -> DispatchOutcome {
+    const LINUX_PIPE_BUF: usize = 4096;
     if std::env::var_os("CARRICK_IO_DBG").is_some() && !bytes.is_empty() {
         eprintln!(
             "[IODBG] WRITE host_fd={host_fd} n={} bytes={:02x?}",
@@ -3917,45 +3918,77 @@ fn write_host_pipe(bytes: &[u8], host_fd: i32, nonblocking: bool) -> DispatchOut
         );
     }
     crate::dispatch::net::set_host_nonblocking(host_fd);
-    if std::env::var_os("CARRICK_TTY_DBG").is_some() && bytes.contains(&0x0a) {
-        unsafe {
-            let isatty = libc::isatty(host_fd);
-            let mut t: libc::termios = core::mem::zeroed();
-            let tg = libc::tcgetattr(host_fd, &mut t);
-            let mut outq: libc::c_int = -1;
-            libc::ioctl(host_fd, libc::TIOCOUTQ, &mut outq);
-            let fl = libc::fcntl(host_fd, libc::F_GETFL);
-            let mut st: libc::stat = core::mem::zeroed();
-            libc::fstat(host_fd, &mut st);
-            let oflag = t.c_oflag;
-            let lflag = t.c_lflag;
-            let rdev = st.st_rdev;
-            let blen = bytes.len();
-            eprintln!(
-                "[TTYDBG-PRE] host_fd={host_fd} isatty={isatty} tg={tg} oflag=0x{oflag:x} lflag=0x{lflag:x} outq={outq} flags=0x{fl:x} rdev={rdev} n={blen}"
-            );
+    let complete_atomic_pipe_write = !nonblocking && bytes.len() <= LINUX_PIPE_BUF && {
+        let mut st: libc::stat = unsafe { core::mem::zeroed() };
+        (unsafe { libc::fstat(host_fd, &mut st) }) == 0
+            && (st.st_mode & libc::S_IFMT) == libc::S_IFIFO
+    };
+    let mut offset = 0usize;
+    loop {
+        if std::env::var_os("CARRICK_TTY_DBG").is_some() && bytes.contains(&0x0a) {
+            unsafe {
+                let isatty = libc::isatty(host_fd);
+                let mut t: libc::termios = core::mem::zeroed();
+                let tg = libc::tcgetattr(host_fd, &mut t);
+                let mut outq: libc::c_int = -1;
+                libc::ioctl(host_fd, libc::TIOCOUTQ, &mut outq);
+                let fl = libc::fcntl(host_fd, libc::F_GETFL);
+                let mut st: libc::stat = core::mem::zeroed();
+                libc::fstat(host_fd, &mut st);
+                let oflag = t.c_oflag;
+                let lflag = t.c_lflag;
+                let rdev = st.st_rdev;
+                let blen = bytes.len();
+                eprintln!(
+                    "[TTYDBG-PRE] host_fd={host_fd} isatty={isatty} tg={tg} oflag=0x{oflag:x} lflag=0x{lflag:x} outq={outq} flags=0x{fl:x} rdev={rdev} n={blen}"
+                );
+            }
         }
-    }
-    let n = unsafe { libc::write(host_fd, bytes.as_ptr() as *const _, bytes.len()) };
-    if std::env::var_os("CARRICK_TTY_DBG").is_some() && bytes.contains(&0x0a) {
-        unsafe {
-            let mut outq: libc::c_int = -1;
-            libc::ioctl(host_fd, libc::TIOCOUTQ, &mut outq);
-            eprintln!("[TTYDBG-POST] host_fd={host_fd} wrote={n} outq_after={outq}");
+        let n = unsafe {
+            libc::write(
+                host_fd,
+                bytes[offset..].as_ptr() as *const _,
+                bytes.len() - offset,
+            )
+        };
+        if std::env::var_os("CARRICK_TTY_DBG").is_some() && bytes.contains(&0x0a) {
+            unsafe {
+                let mut outq: libc::c_int = -1;
+                libc::ioctl(host_fd, libc::TIOCOUTQ, &mut outq);
+                eprintln!("[TTYDBG-POST] host_fd={host_fd} wrote={n} outq_after={outq}");
+            }
         }
-    }
-    #[cfg(target_os = "macos")]
-    crate::probes::host_pipe_io(host_fd, 1, n as i64);
-    if let Err(e) = n.host_syscall_errno() {
-        // EINTR: interrupted by an internal host signal (e.g. SIGURG vCPU kick).
-        // Route through the readiness wait rather than leaking it to the guest
-        // (see read_host_pipe).
-        if e == LINUX_EAGAIN || e == LINUX_EINTR {
-            return would_block_outcome(host_fd, libc::POLLOUT, nonblocking);
+        #[cfg(target_os = "macos")]
+        crate::probes::host_pipe_io(host_fd, 1, n as i64);
+        if let Err(e) = n.host_syscall_errno() {
+            // EINTR: interrupted by an internal host signal (e.g. SIGURG vCPU kick).
+            // Route through the readiness wait rather than leaking it to the guest
+            // (see read_host_pipe).
+            if e == LINUX_EAGAIN || e == LINUX_EINTR {
+                if complete_atomic_pipe_write && offset > 0 {
+                    let mut pfd = libc::pollfd {
+                        fd: host_fd,
+                        events: libc::POLLOUT,
+                        revents: 0,
+                    };
+                    unsafe { libc::poll(&mut pfd, 1, -1) };
+                    continue;
+                }
+                return would_block_outcome(host_fd, libc::POLLOUT, nonblocking);
+            }
+            return DispatchOutcome::Errno { errno: e };
         }
-        return DispatchOutcome::Errno { errno: e };
+        if complete_atomic_pipe_write {
+            offset += n as usize;
+            if offset < bytes.len() {
+                continue;
+            }
+            return DispatchOutcome::Returned {
+                value: bytes.len() as i64,
+            };
+        }
+        return DispatchOutcome::Returned { value: n as i64 };
     }
-    DispatchOutcome::Returned { value: n as i64 }
 }
 
 /// A host op returned EAGAIN: a non-blocking guest fd gets EAGAIN; a blocking
