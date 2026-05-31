@@ -7,14 +7,14 @@
 //! inotify fd drains the kqueue and formats Linux `struct inotify_event`
 //! records.
 //!
-//! Scope: this watches a single vnode per watch (files and "self" events:
-//! IN_MODIFY/IN_ATTRIB/IN_DELETE_SELF/IN_MOVE_SELF). kqueue reports vnode
-//! changes but not the *names* of directory entries that changed, so
-//! directory-entry-level events (IN_CREATE/IN_DELETE with a filename) are a
-//! documented follow-up — the same fidelity gap every kqueue-backed inotify
-//! shim has.
+//! Scope: this watches target vnodes plus, for bind-mounted directories, the
+//! child vnodes that exist when the watch is registered. That covers file and
+//! directory fs-event smoke paths that modify existing children by name.
+//! Creation/deletion discovery for children added after registration is still a
+//! documented follow-up — kqueue reports directory writes but not which entry
+//! changed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::os::fd::RawFd;
 
 use parking_lot::Mutex;
@@ -30,7 +30,7 @@ pub(crate) const IN_MOVED_FROM: u32 = 0x0000_0040;
 pub(crate) const IN_MOVED_TO: u32 = 0x0000_0080;
 // IN_CREATE (0x100) is intentionally omitted: kqueue's EVFILT_VNODE reports a
 // directory was written but not *which* entry changed, so file-creation events
-// with a name are a follow-up (see module docs); we never synthesize IN_CREATE.
+// for children added after watch registration are a follow-up.
 pub(crate) const IN_DELETE: u32 = 0x0000_0200;
 pub(crate) const IN_DELETE_SELF: u32 = 0x0000_0400;
 pub(crate) const IN_MOVE_SELF: u32 = 0x0000_0800;
@@ -93,19 +93,25 @@ fn note_to_linux_mask(fflags: u32, requested: u32) -> u32 {
 
 #[derive(Debug)]
 struct Watch {
-    host_fd: RawFd,
+    host_fds: Vec<RawFd>,
     mask: u32,
+}
+
+#[derive(Clone, Debug)]
+struct WatchedFd {
+    wd: i32,
+    name: Option<Vec<u8>>,
 }
 
 #[derive(Debug)]
 struct Inner {
     next_wd: i32,
     watches: HashMap<i32, Watch>,
-    wd_by_fd: HashMap<RawFd, i32>,
+    wd_by_fd: HashMap<RawFd, WatchedFd>,
     /// Encoded `inotify_event` records observed from the kqueue but not yet
     /// handed to the guest (a `read(2)` whose buffer was smaller than the
     /// available events keeps the rest here, like the kernel's event queue).
-    pending: Vec<u8>,
+    pending: VecDeque<Vec<u8>>,
 }
 
 /// One inotify instance: a kqueue plus its watch-descriptor table. Owns every
@@ -124,7 +130,7 @@ impl InotifyState {
                 next_wd: 1,
                 watches: HashMap::new(),
                 wd_by_fd: HashMap::new(),
-                pending: Vec::new(),
+                pending: VecDeque::new(),
             }),
         })
     }
@@ -139,25 +145,55 @@ impl InotifyState {
     /// If `host_fd`'s vnode is already watched, updates the mask and returns the
     /// existing wd (matching inotify, which returns the same wd for a re-add).
     pub(crate) fn add_watch(&self, host_fd: RawFd, mask: u32) -> Result<i32, i32> {
+        self.add_watch_fds(vec![crate::vfs::WatchFd::unnamed(host_fd)], mask)
+    }
+
+    pub(crate) fn add_watch_fds(
+        &self,
+        watch_fds: Vec<crate::vfs::WatchFd>,
+        mask: u32,
+    ) -> Result<i32, i32> {
+        if watch_fds.is_empty() {
+            return Err(LINUX_EINVAL);
+        }
         let note = linux_mask_to_note(mask);
-        if self.kqueue.apply(&[Kevent::vnode(host_fd, note)]).is_err() {
-            // Registration failed: we own the fd, so don't leak it.
-            unsafe { libc::close(host_fd) };
+        let host_fds: Vec<RawFd> = watch_fds.iter().map(|watch_fd| watch_fd.host_fd).collect();
+        let events: Vec<Kevent> = host_fds
+            .iter()
+            .map(|host_fd| Kevent::vnode(*host_fd, note))
+            .collect();
+        if self.kqueue.apply(&events).is_err() {
+            // Registration failed: we own the fds, so don't leak them.
+            for host_fd in host_fds {
+                unsafe { libc::close(host_fd) };
+            }
             return Err(LINUX_ENOSPC);
         }
         let mut inner = self.inner.lock();
-        if let Some(&wd) = inner.wd_by_fd.get(&host_fd) {
+        if watch_fds.len() == 1
+            && watch_fds[0].name.is_none()
+            && let Some(existing) = inner.wd_by_fd.get(&watch_fds[0].host_fd).cloned()
+        {
+            let wd = existing.wd;
             if let Some(w) = inner.watches.get_mut(&wd) {
                 w.mask = mask;
             }
             // The caller's duplicate fd is redundant; drop it.
-            unsafe { libc::close(host_fd) };
+            unsafe { libc::close(watch_fds[0].host_fd) };
             return Ok(wd);
         }
         let wd = inner.next_wd;
         inner.next_wd += 1;
-        inner.watches.insert(wd, Watch { host_fd, mask });
-        inner.wd_by_fd.insert(host_fd, wd);
+        for watch_fd in &watch_fds {
+            inner.wd_by_fd.insert(
+                watch_fd.host_fd,
+                WatchedFd {
+                    wd,
+                    name: watch_fd.name.clone(),
+                },
+            );
+        }
+        inner.watches.insert(wd, Watch { host_fds, mask });
         Ok(wd)
     }
 
@@ -167,16 +203,18 @@ impl InotifyState {
         let Some(watch) = inner.watches.remove(&wd) else {
             return Err(LINUX_EINVAL);
         };
-        inner.wd_by_fd.remove(&watch.host_fd);
-        let _ = self.kqueue.apply(&[Kevent::vnode_delete(watch.host_fd)]);
-        unsafe { libc::close(watch.host_fd) };
+        for host_fd in watch.host_fds {
+            inner.wd_by_fd.remove(&host_fd);
+            let _ = self.kqueue.apply(&[Kevent::vnode_delete(host_fd)]);
+            unsafe { libc::close(host_fd) };
+        }
         Ok(())
     }
 
-    /// Read up to `max_bytes` of encoded Linux `inotify_event` records (header
-    /// only — self-watches carry no name). First drains any newly-ready vnode
-    /// changes from the kqueue, then returns whole records up to the caller's
-    /// buffer size, keeping the remainder queued (`pending`) for the next read.
+    /// Read up to `max_bytes` of encoded Linux `inotify_event` records. First
+    /// drains any newly-ready vnode changes from the kqueue, then returns whole
+    /// records up to the caller's buffer size, keeping the remainder queued
+    /// (`pending`) for the next read.
     /// An empty return means no events are ready (caller maps to EAGAIN / a
     /// wait on [`poll_fd`]). A non-empty queue with `max_bytes` too small for a
     /// single record is signalled by `Err(EINVAL)`, matching Linux.
@@ -193,37 +231,68 @@ impl InotifyState {
         let mut inner = self.inner.lock();
         for ev in &events[..n] {
             let fd = ev.vnode_ident();
-            let Some(&wd) = inner.wd_by_fd.get(&fd) else {
+            let Some(watched) = inner.wd_by_fd.get(&fd).cloned() else {
                 continue;
             };
+            let wd = watched.wd;
             let requested = inner.watches.get(&wd).map(|w| w.mask).unwrap_or(0);
             let mask = note_to_linux_mask(ev.fflags(), requested);
             if mask == 0 {
                 continue;
             }
-            inner.pending.extend_from_slice(&wd.to_ne_bytes());
-            inner.pending.extend_from_slice(&mask.to_ne_bytes());
-            inner.pending.extend_from_slice(&0u32.to_ne_bytes()); // cookie
-            inner.pending.extend_from_slice(&0u32.to_ne_bytes()); // len (no name)
+            inner
+                .pending
+                .push_back(encode_event(wd, mask, watched.name.as_deref()));
         }
         if inner.pending.is_empty() {
             return Ok(Vec::new());
         }
-        if max_bytes < INOTIFY_EVENT_HEADER_SIZE {
+        let first_len = inner
+            .pending
+            .front()
+            .map(|record| record.len())
+            .unwrap_or(INOTIFY_EVENT_HEADER_SIZE);
+        if max_bytes < first_len {
             return Err(LINUX_EINVAL);
         }
         // Return whole records only, up to the buffer size.
-        let take = (max_bytes.min(inner.pending.len()) / INOTIFY_EVENT_HEADER_SIZE)
-            * INOTIFY_EVENT_HEADER_SIZE;
-        Ok(inner.pending.drain(..take).collect())
+        let mut out = Vec::new();
+        while let Some(record) = inner.pending.front() {
+            if out.len() + record.len() > max_bytes {
+                break;
+            }
+            let record = inner.pending.pop_front().expect("pending front exists");
+            out.extend_from_slice(&record);
+        }
+        Ok(out)
     }
+}
+
+fn encode_event(wd: i32, mask: u32, name: Option<&[u8]>) -> Vec<u8> {
+    let name_len = name.map(|name| align4(name.len() + 1)).unwrap_or(0);
+    let mut record = Vec::with_capacity(INOTIFY_EVENT_HEADER_SIZE + name_len);
+    record.extend_from_slice(&wd.to_ne_bytes());
+    record.extend_from_slice(&mask.to_ne_bytes());
+    record.extend_from_slice(&0u32.to_ne_bytes()); // cookie
+    record.extend_from_slice(&(name_len as u32).to_ne_bytes());
+    if let Some(name) = name {
+        record.extend_from_slice(name);
+        record.resize(INOTIFY_EVENT_HEADER_SIZE + name_len, 0);
+    }
+    record
+}
+
+fn align4(len: usize) -> usize {
+    (len + 3) & !3
 }
 
 impl Drop for InotifyState {
     fn drop(&mut self) {
         let inner = self.inner.lock();
         for watch in inner.watches.values() {
-            unsafe { libc::close(watch.host_fd) };
+            for host_fd in &watch.host_fds {
+                unsafe { libc::close(*host_fd) };
+            }
         }
     }
 }

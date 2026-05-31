@@ -2,9 +2,12 @@
 //! translation.
 
 use std::ffi::CString;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use super::{DirEnt, EntryKind, Metadata, OpenContext, OpenFlags, Vfs, VfsError, VfsHandle};
+use super::{
+    DirEnt, EntryKind, Metadata, OpenContext, OpenFlags, Vfs, VfsError, VfsHandle, WatchFd,
+};
 use crate::dispatch::macos_to_linux_errno;
 use crate::linux_abi::{LINUX_EINVAL, LINUX_ENOENT, LINUX_EROFS};
 
@@ -48,6 +51,20 @@ fn map_io_error(e: std::io::Error) -> VfsError {
 fn host_open_errno() -> i32 {
     let raw = unsafe { *libc::__error() };
     macos_to_linux_errno(raw)
+}
+
+fn open_watch_fd(host: &Path) -> Result<i32, VfsError> {
+    let cpath = CString::new(host.to_string_lossy().as_ref()).map_err(|_| LINUX_EINVAL)?;
+    #[cfg(target_os = "macos")]
+    let host_flags = libc::O_EVTONLY;
+    #[cfg(not(target_os = "macos"))]
+    let host_flags = libc::O_RDONLY;
+    // SAFETY: host path as NUL-terminated string
+    let host_fd = unsafe { libc::open(cpath.as_ptr(), host_flags) };
+    if host_fd < 0 {
+        return Err(host_open_errno());
+    }
+    Ok(host_fd)
 }
 
 impl Vfs for BindVfs {
@@ -176,6 +193,28 @@ impl Vfs for BindVfs {
             is_read_end: !flags.write,
             status_flags,
         })
+    }
+
+    fn watch_fd(&self, path: &str) -> Result<i32, VfsError> {
+        let host = self.to_host(path)?;
+        open_watch_fd(&host)
+    }
+
+    fn watch_fds(&self, path: &str) -> Result<Vec<WatchFd>, VfsError> {
+        let host = self.to_host(path)?;
+        let mut fds = vec![WatchFd::unnamed(open_watch_fd(&host)?)];
+        if host.is_dir() {
+            for entry in std::fs::read_dir(&host).map_err(map_io_error)? {
+                let entry = entry.map_err(map_io_error)?;
+                if let Ok(host_fd) = open_watch_fd(&entry.path()) {
+                    fds.push(WatchFd::named(
+                        host_fd,
+                        entry.file_name().as_bytes().to_vec(),
+                    ));
+                }
+            }
+        }
+        Ok(fds)
     }
 
     fn mkdir(&self, path: &str, mode: u32) -> Result<(), VfsError> {
