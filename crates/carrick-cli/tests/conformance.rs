@@ -668,6 +668,18 @@ const TIMING_SENSITIVE_PROBES: &[&str] = &[
     "futexshare",
     "futexghost",
     "futexextra",
+    // sigchld: ROOT-CAUSED to host-scheduling tail-latency, NOT a carrick bug.
+    // The probe busy-spins (no syscall) ≤10s for an async SIGCHLD; carrick's
+    // delivery path is correct + fully event-driven (signal pump's kqueue
+    // NOTE_EXIT → publish_pending_for → kicker.kick(parent_tid)=hv_vcpus_exit
+    // forces the spinning vCPU out → run loop injects). EVIDENCE it's env, not a
+    // gap: run-elf passes 72/72 incl. 12/12 under 2× CPU oversubscription (20
+    // busy loops on 10 cores); it only flakes in the FULL gate, where 8 carrick
+    // guests + the CPU-hungry Docker-oracle VM oversubscribe the host and the
+    // pump/vCPU threads for one guest occasionally aren't scheduled to deliver
+    // within 10s. The serial lane removes the 8-way carrick contention so the
+    // probe still validates delivery without the host-saturation false flake.
+    "sigchld",
 ];
 
 fn is_timing_sensitive(probe: &std::path::Path) -> bool {
