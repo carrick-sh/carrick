@@ -292,6 +292,10 @@ pub trait Vfs: Send + Sync {
         Err(crate::linux_abi::LINUX_EROFS)
     }
 
+    fn create_socket(&self, _path: &str, _mode: u32) -> Result<(), VfsError> {
+        Err(crate::linux_abi::LINUX_EROFS)
+    }
+
     fn chown(
         &self,
         _path: &str,

@@ -3,14 +3,14 @@
 
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
 use super::{
     DirEnt, EntryKind, Metadata, OpenContext, OpenFlags, Vfs, VfsError, VfsHandle, WatchFd,
 };
 use crate::dispatch::macos_to_linux_errno;
-use crate::linux_abi::{LINUX_EINVAL, LINUX_ENOENT, LINUX_EROFS};
+use crate::linux_abi::{LINUX_EINVAL, LINUX_ENOENT, LINUX_ENXIO, LINUX_EROFS};
 
 pub struct BindVfs {
     mount_point: String,
@@ -152,6 +152,10 @@ fn owner_from_host_xattrs(host: &Path, nofollow: bool) -> (Option<u32>, Option<u
     )
 }
 
+fn is_socket_marker(host: &Path, nofollow: bool) -> bool {
+    read_u32_xattr(host, crate::fs_backend::CARRICK_SOCKET_XATTR_NAME, nofollow) == Some(1)
+}
+
 fn write_owner_xattrs(
     host: &Path,
     uid: Option<u32>,
@@ -182,6 +186,8 @@ fn metadata_from_host(host: &Path, meta: std::fs::Metadata, nofollow: bool) -> M
         EntryKind::Directory
     } else if meta.is_symlink() {
         EntryKind::Symlink
+    } else if meta.file_type().is_socket() || is_socket_marker(host, nofollow) {
+        EntryKind::Socket
     } else {
         EntryKind::File
     };
@@ -205,6 +211,8 @@ fn real_stat_from_host(
     let kind = match st.st_mode & libc::S_IFMT {
         mode if mode == libc::S_IFDIR => crate::rootfs::RootFsEntryKind::Directory,
         mode if mode == libc::S_IFLNK => crate::rootfs::RootFsEntryKind::Symlink,
+        mode if mode == libc::S_IFSOCK => crate::rootfs::RootFsEntryKind::Socket,
+        _ if is_socket_marker(host, nofollow) => crate::rootfs::RootFsEntryKind::Socket,
         _ => crate::rootfs::RootFsEntryKind::File,
     };
     let (uid, gid) = owner_from_host_xattrs(host, nofollow);
@@ -271,6 +279,8 @@ impl Vfs for BindVfs {
                 EntryKind::Directory
             } else if file_type.is_symlink() {
                 EntryKind::Symlink
+            } else if file_type.is_socket() || is_socket_marker(&entry.path(), true) {
+                EntryKind::Socket
             } else {
                 EntryKind::File
             };
@@ -289,6 +299,9 @@ impl Vfs for BindVfs {
         _ctx: &OpenContext<'_>,
     ) -> Result<VfsHandle, VfsError> {
         let host = self.to_host(path)?;
+        if is_socket_marker(&host, flags.nofollow) {
+            return Err(LINUX_ENXIO);
+        }
         if host.is_dir() {
             let entries = self.readdir(path)?;
             return Ok(VfsHandle::Directory {
@@ -439,6 +452,29 @@ impl Vfs for BindVfs {
         let host = self.to_host(path)?;
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&host, std::fs::Permissions::from_mode(mode)).map_err(map_io_error)
+    }
+
+    fn create_socket(&self, path: &str, mode: u32) -> Result<(), VfsError> {
+        if self.readonly {
+            return Err(LINUX_EROFS);
+        }
+        let host = self.to_host(path)?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&host)
+            .map_err(map_io_error)?;
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(mode & 0o7777))
+            .map_err(map_io_error)?;
+        write_u32_xattr(
+            &host,
+            crate::fs_backend::CARRICK_SOCKET_XATTR_NAME,
+            1,
+            false,
+        )?;
+        Ok(())
     }
 
     fn chown(
