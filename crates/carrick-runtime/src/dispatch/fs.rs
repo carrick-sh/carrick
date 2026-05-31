@@ -392,6 +392,15 @@ impl SyscallDispatcher {
             Ok(path) => path,
             Err(errno) => return Ok(errno.into()),
         };
+        // An empty pathname is never valid for open()/openat(): the kernel's
+        // path walk requires at least one component and returns ENOENT for ""
+        // (openat has no AT_EMPTY_PATH — that flag is only for the *at() metadata
+        // syscalls). carrick's resolver would otherwise treat "" as the dirfd's
+        // directory and wrongly succeed — test_ctypes' libc.open(b"", 0) and
+        // glibc's own open("") both expect -1/ENOENT.
+        if path.is_empty() {
+            return Ok(LINUX_ENOENT.into());
+        }
         // A trailing slash forces directory semantics on the final component.
         // Linux's open(2): `O_CREAT` of a path that ends in `/` can NEVER
         // create a regular file there (a directory name is implied) and fails
