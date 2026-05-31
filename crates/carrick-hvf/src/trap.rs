@@ -413,6 +413,80 @@ fn vcpu_created() {
     VCPU_LIVE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// vCPU admission gate for sibling guest threads.
+///
+/// Hypervisor.framework caps the number of vCPUs that may exist CONCURRENTLY in
+/// a VM (`hv_vm_get_max_vcpu_count`, 64 on this class of host). carrick gives
+/// every guest thread its own vCPU for its whole lifetime, so a guest that runs
+/// more concurrent threads than the cap (CPython's `test_queue.test_many_threads`
+/// spawns 50 producers + 50 consumers = 100) makes `hv_vcpu_create` return
+/// HV_NO_RESOURCES (0xfae94005). Before this gate the clone() syscall had ALREADY
+/// reported the new tid as success to the guest, so the thread that failed to get
+/// a vCPU silently never ran — and any join on it deadlocked (→ 150s TIMEOUT).
+///
+/// Linux has no such cap: those 100 threads just run. To preserve that observable
+/// behavior we DON'T fail clone; instead the sibling host-thread BLOCKS here until
+/// a vCPU slot frees (another guest thread exits and destroys its vCPU). The guest
+/// thread is created eagerly (clone succeeds, matching Linux); it simply may not
+/// get scheduled onto a real vCPU until the live count drops below budget. Threads
+/// that decouple through a queue (producers exit → free slots → queued consumers
+/// admitted) therefore complete instead of deadlocking.
+///
+/// Only SIBLING-thread creation goes through the gate. The initial boot vCPU and
+/// fork/execve REBUILDs must never block: a fork releases its vCPUs (count drops)
+/// before rebuilding, and blocking a rebuild behind the gate it just emptied would
+/// be a self-deadlock — those paths call `vcpu_create` directly.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod vcpu_gate {
+    use std::sync::atomic::Ordering;
+    use std::sync::{Condvar, Mutex, OnceLock};
+
+    /// Slots we keep in reserve below the raw HVF cap so a multithreaded fork can
+    /// always rebuild its quiesced siblings' vCPUs (each sibling releases then
+    /// recreates one) and the forker has headroom, even while the gate is full.
+    const RESERVE: i64 = 4;
+
+    static BUDGET: OnceLock<i64> = OnceLock::new();
+    static GATE_LOCK: Mutex<()> = Mutex::new(());
+    static GATE_CV: Condvar = Condvar::new();
+
+    /// HVF concurrent-vCPU budget for SIBLING threads (cap − reserve). Queried
+    /// once; if the query fails we fall back to a conservative 60.
+    fn budget() -> i64 {
+        *BUDGET.get_or_init(|| {
+            let mut max: u32 = 0;
+            let rc = unsafe { applevisor_sys::hv_vm_get_max_vcpu_count(&mut max) };
+            let cap = if rc == 0 && max > 0 { max as i64 } else { 64 };
+            (cap - RESERVE).max(1)
+        })
+    }
+
+    /// Block until the live vCPU count is below budget, so the caller can create
+    /// one more without tripping HV_NO_RESOURCES. Returns immediately if there is
+    /// headroom. Uses a 50ms timed wait as a backstop (the condvar is also poked
+    /// on every vCPU destroy) so we can't miss a wakeup and wedge forever.
+    pub fn acquire() {
+        let b = budget();
+        loop {
+            if super::VCPU_LIVE.load(Ordering::SeqCst) < b {
+                return;
+            }
+            let guard = GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            // Re-check under the lock to avoid sleeping past a destroy that raced
+            // between the load above and taking the lock.
+            if super::VCPU_LIVE.load(Ordering::SeqCst) < b {
+                return;
+            }
+            let _ = GATE_CV.wait_timeout(guard, std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// A vCPU was destroyed; wake any sibling thread waiting for a slot.
+    pub fn notify() {
+        GATE_CV.notify_all();
+    }
+}
+
 /// Enable EL0 direct reads of `CNTVCT_EL0`/`CNTFRQ_EL0` (`CNTKCTL_EL1.EL0VCTEN |
 /// EL0PCTEN`) on a freshly-created vCPU. Must run on EVERY vCPU — initial,
 /// per-thread, fork/execve rebuild. If only some vCPUs have it, the others trap
@@ -432,6 +506,8 @@ fn enable_el0_counter_access(vcpu_id: applevisor_sys::hv_vcpu_t) {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn vcpu_destroyed() {
     VCPU_LIVE.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    // A slot freed: wake a sibling thread blocked in the admission gate.
+    vcpu_gate::notify();
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -997,6 +1073,18 @@ impl HvfTrapEngine {
     pub fn from_thread_spec(_spec: ThreadSpec) -> Result<Self, TrapError> {
         Err(TrapError::UnsupportedPlatform)
     }
+
+    /// Block until there is room under the HVF concurrent-vCPU cap to create one
+    /// more sibling vCPU (see [`vcpu_gate`]). MUST be called by the new sibling's
+    /// own host thread BEFORE it takes the fork topology lock — blocking while
+    /// holding that lock would stall forks and serialise sibling starts.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub fn wait_for_vcpu_slot() {
+        vcpu_gate::acquire();
+    }
+
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    pub fn wait_for_vcpu_slot() {}
 
     /// True iff this engine was produced by a successful `fork(2)`
     /// returning into the child. The runtime uses this to short-circuit

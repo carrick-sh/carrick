@@ -1496,6 +1496,19 @@ impl ThreadRuntimeState {
                 if trace {
                     eprintln!("[sibling tid#{tid}] thread started, building vCPU");
                 }
+                // Wait (if necessary) for room under the HVF concurrent-vCPU cap
+                // BEFORE taking the topology lock. carrick binds one vCPU per
+                // guest thread for its whole lifetime; HVF caps concurrent vCPUs
+                // (64 on this host), so a guest with more live threads than the
+                // cap (CPython test_queue.test_many_threads spawns 100) would
+                // otherwise hit HV_NO_RESOURCES here — and since clone() already
+                // reported this tid as a success to the guest, the thread that
+                // failed to get a vCPU silently never ran, deadlocking any join
+                // on it. Blocking here (clone still succeeds, matching Linux,
+                // which has no such cap) lets the thread start as soon as another
+                // guest thread exits and frees a slot. Done OUTSIDE the topology
+                // lock so a fork in flight isn't stalled behind a full gate.
+                HvfTrapEngine::wait_for_vcpu_slot();
                 // Build the vCPU + register it in the kicker UNDER the topology
                 // lock, so this is atomic w.r.t. a fork's VM teardown: a fork
                 // either sees this vCPU in the kicker (and waits for it to park)
