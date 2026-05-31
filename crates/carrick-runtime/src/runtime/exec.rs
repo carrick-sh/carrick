@@ -14,7 +14,7 @@ pub(super) fn load_execve_image(
     env: Vec<Vec<u8>>,
 ) -> Result<AddressSpace, i32> {
     use crate::linux_abi::LINUX_ENOENT;
-    let mut argv = if argv.is_empty() {
+    let argv = if argv.is_empty() {
         vec![path.as_bytes().to_vec()]
     } else {
         argv
@@ -23,37 +23,9 @@ pub(super) fn load_execve_image(
     // Absolutize a RELATIVE execve target against the guest cwd before any
     // layer lookup (Linux resolves `execve("b/foo")` against the caller's cwd;
     // carrick's layers key on absolute guest paths). See `resolve_exec_path`.
-    // Resolve `#!` shebang scripts the way the Linux kernel does: read
-    // the file, and if it begins with `#!`, re-target exec at the
-    // interpreter with the script path spliced into argv. Bounded to 4
-    // levels (Linux's BINPRM_MAX_RECURSION) to stop interpreter loops.
-    let mut path = dispatcher.resolve_exec_path(path);
-    for _ in 0..4 {
-        let Some(head) = dispatcher.read_exec_file(&path) else {
-            break;
-        };
-        if !head.starts_with(b"#!") {
-            break;
-        }
-        let Some((interp, optarg)) = parse_shebang(&head) else {
-            return Err(LINUX_ENOENT);
-        };
-        // Linux: execve("/script", ["script", a, b]) on `#!/i x` ->
-        // execve("/i", ["/i", "x", "/script", a, b]). The script path
-        // takes argv[1] (or [2] with an interpreter arg); the original
-        // argv[1..] follow.
-        // argv is bytes; the interp/optarg/script-path are UTF-8 (parsed from
-        // the shebang / resolved as a path) → push their bytes.
-        let mut new_argv: Vec<Vec<u8>> = Vec::with_capacity(argv.len() + 3);
-        new_argv.push(interp.clone().into_bytes());
-        if let Some(arg) = optarg {
-            new_argv.push(arg.into_bytes());
-        }
-        new_argv.push(path.clone().into_bytes());
-        new_argv.extend(argv.into_iter().skip(1));
-        argv = new_argv;
-        path = interp;
-    }
+    // Then resolve any `#!` shebang script to its interpreter (shared with the
+    // initial entrypoint load via `resolve_shebang`).
+    let (path, argv) = resolve_shebang(dispatcher, dispatcher.resolve_exec_path(path), argv)?;
 
     // Read the main binary AND resolve its interpreter OVERLAY-FIRST via
     // `read_exec_file`, so execve works for guest-created/overlay binaries
@@ -91,6 +63,46 @@ pub(super) fn load_execve_image(
     // the old image's handler addresses (SIG_IGN/mask/pending are preserved).
     dispatcher.reset_signal_handlers_on_execve();
     Ok(image)
+}
+
+/// Resolve `#!` shebang scripts the way the Linux kernel does: if `path` names a
+/// file starting with `#!`, re-target at the interpreter with the script path
+/// spliced into argv, repeating up to BINPRM_MAX_RECURSION (4) levels. A
+/// non-script passes through unchanged. Shared by the guest `execve(2)` path and
+/// the initial `carrick run` entrypoint load, so a script entrypoint runs its
+/// interpreter (Docker / `execve(2)` semantics) instead of failing "not an ELF
+/// binary".
+///
+/// `argv` items are opaque bytes (Linux ABI); the interpreter / optional arg /
+/// script path are UTF-8 (from the shebang line and the resolved path) and are
+/// pushed as bytes. `#!/i x` on argv `[script, a, b]` becomes path `/i`, argv
+/// `[/i, x, /script, a, b]`.
+pub(super) fn resolve_shebang(
+    dispatcher: &SyscallDispatcher,
+    mut path: String,
+    mut argv: Vec<Vec<u8>>,
+) -> Result<(String, Vec<Vec<u8>>), i32> {
+    for _ in 0..4 {
+        let Some(head) = dispatcher.read_exec_file(&path) else {
+            break;
+        };
+        if !head.starts_with(b"#!") {
+            break;
+        }
+        let Some((interp, optarg)) = parse_shebang(&head) else {
+            return Err(crate::linux_abi::LINUX_ENOENT);
+        };
+        let mut new_argv: Vec<Vec<u8>> = Vec::with_capacity(argv.len() + 3);
+        new_argv.push(interp.clone().into_bytes());
+        if let Some(arg) = optarg {
+            new_argv.push(arg.into_bytes());
+        }
+        new_argv.push(path.clone().into_bytes());
+        new_argv.extend(argv.into_iter().skip(1));
+        argv = new_argv;
+        path = interp;
+    }
+    Ok((path, argv))
 }
 
 /// Parse a `#!` shebang line into (interpreter, optional single arg),
