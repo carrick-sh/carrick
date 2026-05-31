@@ -338,6 +338,21 @@ fn resolve_entrypoint_path(path: &str, env: &[String], dispatcher: &SyscallDispa
     path.to_owned()
 }
 
+/// Resolve the initial entrypoint program for `carrick run`: PATH-resolve a bare
+/// command (`resolve_entrypoint_path`, Docker `execvp` semantics) and then
+/// resolve any `#!` shebang script to its interpreter, so a script entrypoint
+/// runs like Docker / `execve(2)` instead of failing "not an ELF binary".
+/// Returns the final (program path, argv as opaque Linux-ABI bytes).
+fn resolve_entrypoint_program(
+    path: &str,
+    env: &[String],
+    argv: Vec<Vec<u8>>,
+    dispatcher: &SyscallDispatcher,
+) -> Result<(String, Vec<Vec<u8>>), i32> {
+    let resolved = resolve_entrypoint_path(path, env, dispatcher);
+    exec::resolve_shebang(dispatcher, resolved, argv)
+}
+
 /// Run an ELF whose filesystem is entirely in the dispatcher's overlay
 /// (i.e. `--fs host` after `extract_layers`). The initial binary AND its
 /// PT_INTERP are loaded via `dispatcher.read_exec_file` — the same
@@ -360,20 +375,32 @@ where
     // Docker accepts a bare entrypoint command (`carrick run alpine ls`); resolve
     // it against $PATH like runc/execvp before loading. A name with '/' is left
     // as-is. Guest execve(2) is unaffected (it keeps full-path semantics).
-    let resolved = resolve_entrypoint_path(path, &env, &dispatcher);
-    let path: &str = &resolved;
+    // Identity for /proc/self/{exe,cmdline} reflects the entrypoint the user
+    // asked for (before shebang/Rosetta rewriting).
     dispatcher.set_executable_identity(path.to_owned(), argv.clone());
+    // PATH-resolve a bare command AND resolve `#!` shebang scripts to their
+    // interpreter (Docker / execve(2) semantics) before loading, so a script
+    // entrypoint runs instead of failing "not an ELF binary".
+    let argv_bytes: Vec<Vec<u8>> = argv.into_iter().map(String::into_bytes).collect();
+    let (resolved, argv) = resolve_entrypoint_program(path, &env, argv_bytes, &dispatcher)
+        .map_err(|_| {
+            RuntimeError::AddressSpace(AddressSpaceError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                path.to_owned(),
+            )))
+        })?;
+    let path: &str = &resolved;
     let bytes = dispatcher.read_exec_file(path).ok_or_else(|| {
         RuntimeError::AddressSpace(AddressSpaceError::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             path.to_owned(),
         )))
     })?;
-    // Redirect x86_64 binaries through Rosetta 2 (binfmt_misc-style). argv
-    // normalises to opaque bytes (Linux ABI) here so both arms share a type.
+    // Redirect x86_64 binaries through Rosetta 2 (binfmt_misc-style). argv is
+    // already opaque bytes (Linux ABI).
     let (bytes, argv): (Vec<u8>, Vec<Vec<u8>>) =
         match maybe_redirect_to_rosetta(path, &bytes, &argv) {
-            None => (bytes, argv.into_iter().map(String::into_bytes).collect()),
+            None => (bytes, argv),
             Some(Ok((rosetta_bytes, new_argv))) => {
                 // /proc/self/exe should resolve to the interpreter that's actually
                 // loaded (Rosetta opens it during its startup handshake).
@@ -2804,6 +2831,45 @@ mod tests {
             resolve_entrypoint_path("env", &[], &dispatcher),
             "/usr/bin/env"
         );
+    }
+
+    #[test]
+    fn entrypoint_program_resolves_shebang_to_interpreter() {
+        // A script entrypoint (`#!/bin/sh`) must load its INTERPRETER with the
+        // script spliced into argv — Docker / execve(2) semantics — instead of
+        // being handed to the ELF loader as "not an ELF binary".
+        // (`carrick run --entrypoint <script>`.)
+        let rootfs = rootfs_with(&[
+            ("entry.sh", b"#!/bin/sh\necho hi\n"),
+            ("bin/sh", b"\x7fELFx"),
+        ]);
+        let dispatcher = SyscallDispatcher::with_rootfs(rootfs);
+
+        let (path, argv) = resolve_entrypoint_program(
+            "/entry.sh",
+            &[],
+            vec![b"/entry.sh".to_vec(), b"arg1".to_vec()],
+            &dispatcher,
+        )
+        .expect("entrypoint program resolves");
+
+        assert_eq!(path, "/bin/sh");
+        assert_eq!(
+            argv,
+            vec![b"/bin/sh".to_vec(), b"/entry.sh".to_vec(), b"arg1".to_vec(),]
+        );
+    }
+
+    #[test]
+    fn entrypoint_program_passes_through_plain_elf() {
+        // A normal ELF entrypoint is unchanged (no shebang, no argv splice).
+        let rootfs = rootfs_with(&[("bin/true", b"\x7fELFx")]);
+        let dispatcher = SyscallDispatcher::with_rootfs(rootfs);
+        let (path, argv) =
+            resolve_entrypoint_program("/bin/true", &[], vec![b"/bin/true".to_vec()], &dispatcher)
+                .expect("resolve");
+        assert_eq!(path, "/bin/true");
+        assert_eq!(argv, vec![b"/bin/true".to_vec()]);
     }
 
     #[test]
