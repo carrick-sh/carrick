@@ -4730,6 +4730,89 @@ fn non_root_chown_under_bind_mount_to_root_returns_eperm() {
 }
 
 #[test]
+fn root_chown_under_bind_mount_records_guest_owner_without_host_chown() {
+    use std::os::unix::fs::MetadataExt;
+
+    let scratch = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(scratch.path().join("nodejs-bindrootchown")).unwrap();
+    let host_file = scratch.path().join("nodejs-bindrootchown/file.txt");
+    std::fs::write(&host_file, b"root chown payload").unwrap();
+    let host_before = std::fs::metadata(&host_file).unwrap();
+
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x300]);
+    memory
+        .write_bytes(0x4000, b"/tmp/nodejs-bindrootchown/file.txt\0")
+        .unwrap();
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.register_mount(
+        std::path::PathBuf::from("/tmp"),
+        Box::new(BindVfs::new("/tmp", scratch.path().to_path_buf(), false)),
+    );
+    let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
+        d.dispatch(
+            SyscallRequest::new(nr, SyscallArgs::from(args)),
+            m,
+            &reporter,
+        )
+        .unwrap()
+    };
+
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            54,
+            [LINUX_AT_FDCWD, 0x4000, 1000, 1001, 0, 0],
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    let host_after = std::fs::metadata(&host_file).unwrap();
+    assert_eq!(host_after.uid(), host_before.uid());
+    assert_eq!(host_after.gid(), host_before.gid());
+
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            79,
+            [LINUX_AT_FDCWD, 0x4000, 0x4100, 0, 0, 0],
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let stat = read_stat(&memory, 0x4100);
+    let stat_uid = stat.st_uid;
+    let stat_gid = stat.st_gid;
+    assert_eq!(stat_uid, 1000);
+    assert_eq!(stat_gid, 1001);
+
+    let fd = match run(
+        &mut dispatcher,
+        &mut memory,
+        56,
+        [LINUX_AT_FDCWD, 0x4000, LINUX_O_RDWR, 0, 0, 0],
+    ) {
+        DispatchOutcome::Returned { value } => value as u64,
+        other => panic!("openat bind file: {other:?}"),
+    };
+    assert_eq!(
+        run(&mut dispatcher, &mut memory, 55, [fd, 1002, 1003, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        run(&mut dispatcher, &mut memory, 80, [fd, 0x4200, 0, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let stat = read_stat(&memory, 0x4200);
+    let stat_uid = stat.st_uid;
+    let stat_gid = stat.st_gid;
+    assert_eq!(stat_uid, 1002);
+    assert_eq!(stat_gid, 1003);
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
 fn utimensat_sets_times_on_writable_overlay_and_validates_timestamps() {
     const UTIME_NOW: i64 = (1 << 30) - 1;
     const UTIME_OMIT: i64 = (1 << 30) - 2;
