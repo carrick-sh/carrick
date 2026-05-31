@@ -611,6 +611,76 @@ pub fn host_tty_tcsetpgrp(fd: i32, pgrp: i32) -> Result<(), i32> {
     }
 }
 
+/// Drain `fd`'s output queue (block until all written output is transmitted).
+/// Maps the Linux `tcdrain`/`TCSBRK(arg!=0)` semantics onto Darwin `tcdrain(2)`.
+/// Returns `Ok(())` or `Err(macos_errno)`.
+pub fn host_tty_tcdrain(fd: i32) -> Result<(), i32> {
+    // SAFETY: fd is a raw descriptor; tcdrain validates it (ENOTTY for non-tty).
+    let r = unsafe { libc::tcdrain(fd) };
+    if r < 0 {
+        Err(unsafe { *libc::__error() })
+    } else {
+        Ok(())
+    }
+}
+
+/// Send a break (stream of zero bits) on `fd`. Maps Linux `tcsendbreak`/`TCSBRK`/
+/// `TCSBRKP` onto Darwin `tcsendbreak(2)`. `duration` is passed through; Darwin
+/// (like Linux) treats the exact non-zero value loosely. Returns `Ok(())` or
+/// `Err(macos_errno)`.
+pub fn host_tty_tcsendbreak(fd: i32, duration: i32) -> Result<(), i32> {
+    // SAFETY: fd is a raw descriptor; tcsendbreak validates it.
+    let r = unsafe { libc::tcsendbreak(fd, duration) };
+    if r < 0 {
+        Err(unsafe { *libc::__error() })
+    } else {
+        Ok(())
+    }
+}
+
+/// Discard buffered tty data for `fd`. `linux_queue` is the *Linux* TCFLSH
+/// selector (TCIFLUSH=0, TCOFLUSH=1, TCIOFLUSH=2) which is translated to the
+/// corresponding Darwin selector (Darwin uses 1/2/3) before calling
+/// `tcflush(2)`. An unknown selector returns `Err(EINVAL)` to mirror Linux,
+/// which rejects out-of-range queue values in the TCFLSH path.
+pub fn host_tty_tcflush(fd: i32, linux_queue: i64) -> Result<(), i32> {
+    // Linux value → Darwin value. Darwin's selectors are Linux+1.
+    let darwin_queue = match linux_queue {
+        0 => libc::TCIFLUSH,  // Linux TCIFLUSH (0)  → Darwin 1
+        1 => libc::TCOFLUSH,  // Linux TCOFLUSH (1)  → Darwin 2
+        2 => libc::TCIOFLUSH, // Linux TCIOFLUSH (2) → Darwin 3
+        _ => return Err(libc::EINVAL),
+    };
+    // SAFETY: fd is a raw descriptor; darwin_queue is a validated selector.
+    let r = unsafe { libc::tcflush(fd, darwin_queue) };
+    if r < 0 {
+        Err(unsafe { *libc::__error() })
+    } else {
+        Ok(())
+    }
+}
+
+/// Suspend/resume tty input or output for `fd`. `linux_action` is the *Linux*
+/// TCXONC action (TCOOFF=0, TCOON=1, TCIOFF=2, TCION=3) translated to the
+/// Darwin action (Darwin uses 1/2/3/4) before calling `tcflow(2)`. An unknown
+/// action returns `Err(EINVAL)` to mirror Linux's TCXONC validation.
+pub fn host_tty_tcflow(fd: i32, linux_action: i64) -> Result<(), i32> {
+    let darwin_action = match linux_action {
+        0 => libc::TCOOFF, // Linux TCOOFF (0) → Darwin 1
+        1 => libc::TCOON,  // Linux TCOON  (1) → Darwin 2
+        2 => libc::TCIOFF, // Linux TCIOFF (2) → Darwin 3
+        3 => libc::TCION,  // Linux TCION  (3) → Darwin 4
+        _ => return Err(libc::EINVAL),
+    };
+    // SAFETY: fd is a raw descriptor; darwin_action is a validated selector.
+    let r = unsafe { libc::tcflow(fd, darwin_action) };
+    if r < 0 {
+        Err(unsafe { *libc::__error() })
+    } else {
+        Ok(())
+    }
+}
+
 /// Put `fd` into raw mode (cfmakeraw semantics) after recording its current
 /// termios for restoration via the existing dirty-tracking guard.  Errors if
 /// `fd` is not a tty.
