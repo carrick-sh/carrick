@@ -752,6 +752,39 @@ impl SyscallDispatcher {
                 return Ok(LINUX_ENOMEM.into());
             };
             if new_size <= old_size {
+                // Linux mremap shrink unmaps the freed tail [old+new_size,
+                // old+old_size); carrick used to leave it mapped (a leak, and
+                // the stale bytes there could later be misread). Reclaim the
+                // whole-page tail exactly as munmap does — invalidate stage-1,
+                // then lower mmap_next (if it's the high-water) or return it to
+                // free_regions (a future mmap reuse zero-fills it).
+                let tail_start = old_address.0 + new_size; // new_size is page-aligned ≤ old_size
+                let tail_end = old_address
+                    .0
+                    .checked_add(old_size)
+                    .map(|e| e & !(LINUX_PAGE_SIZE - 1));
+                if let Some(tail_end) = tail_end
+                    && tail_end > tail_start
+                {
+                    let tail_len = tail_end - tail_start;
+                    if let Ok(tl) = usize::try_from(tail_len) {
+                        let _ = memory.unmap_range(tail_start, tl);
+                    }
+                    let mut mem = this.mem.lock();
+                    if tail_end == mem.mmap_next {
+                        mem.mmap_next = tail_start;
+                        while let Some(pos) = mem
+                            .free_regions
+                            .iter()
+                            .position(|&(s, l)| s.checked_add(l) == Some(mem.mmap_next))
+                        {
+                            let (s, _l) = mem.free_regions.remove(pos);
+                            mem.mmap_next = s;
+                        }
+                    } else {
+                        free_regions_insert(&mut mem.free_regions, tail_start, tail_len);
+                    }
+                }
                 return Ok(DispatchOutcome::Returned {
                     value: old_address.0 as i64,
                 });
