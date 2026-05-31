@@ -4542,6 +4542,110 @@ fn bind_mount_create_stamps_guest_owner_on_files_and_directories() {
 }
 
 #[test]
+fn bind_mount_repeated_relative_stat_after_guest_mkdir_uses_host_tree() {
+    let scratch = tempfile::TempDir::new().unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x800]);
+    memory
+        .write_bytes(0x4000, b"/tmp/nodejs-bindstat\0")
+        .unwrap();
+    memory.write_bytes(0x4040, b"test_dir\0").unwrap();
+
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.register_mount(
+        std::path::PathBuf::from("/tmp"),
+        Box::new(BindVfs::new("/tmp", scratch.path().to_path_buf(), false)),
+    );
+    let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
+        d.dispatch(
+            SyscallRequest::new(nr, SyscallArgs::from(args)),
+            m,
+            &reporter,
+        )
+        .unwrap()
+    };
+
+    assert_eq!(
+        run(&mut dispatcher, &mut memory, 144, [1001, 0, 0, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        run(&mut dispatcher, &mut memory, 146, [1000, 0, 0, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            34,
+            [LINUX_AT_FDCWD, 0x4000, 0o755, 0, 0, 0],
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        run(&mut dispatcher, &mut memory, 49, [0x4000, 0, 0, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            34,
+            [LINUX_AT_FDCWD, 0x4040, 0o755, 0, 0, 0],
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert!(scratch.path().join("nodejs-bindstat/test_dir").is_dir());
+
+    for _ in 0..300 {
+        assert_eq!(
+            run(
+                &mut dispatcher,
+                &mut memory,
+                79,
+                [LINUX_AT_FDCWD, 0x4040, 0x4200, 0, 0, 0],
+            ),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        let stat = read_stat(&memory, 0x4200);
+        let mode = stat.st_mode;
+        let uid = stat.st_uid;
+        let gid = stat.st_gid;
+        assert_eq!(mode & LINUX_S_IFMT, LINUX_S_IFDIR);
+        assert_eq!(uid, 1000);
+        assert_eq!(gid, 1001);
+    }
+
+    for _ in 0..300 {
+        assert_eq!(
+            run(
+                &mut dispatcher,
+                &mut memory,
+                291,
+                [
+                    LINUX_AT_FDCWD,
+                    0x4040,
+                    0,
+                    LINUX_STATX_BASIC_STATS as u64,
+                    0x4380,
+                    0,
+                ],
+            ),
+            DispatchOutcome::Returned { value: 0 }
+        );
+        let statx = read_statx(&memory, 0x4380);
+        let mode = statx.stx_mode;
+        let uid = statx.stx_uid;
+        let gid = statx.stx_gid;
+        assert_eq!(mode as u32 & LINUX_S_IFMT, LINUX_S_IFDIR);
+        assert_eq!(uid, 1000);
+        assert_eq!(gid, 1001);
+    }
+
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
 fn renameat_under_bind_mount_moves_host_entries() {
     let scratch = tempfile::TempDir::new().unwrap();
     std::fs::create_dir(scratch.path().join("nodejs-bindmv")).unwrap();
