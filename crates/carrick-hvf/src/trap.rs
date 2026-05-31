@@ -206,6 +206,11 @@ pub enum TrapError {
         x29: u64,
         x30: u64,
         sp: u64,
+        /// True when the abort surfaced DIRECTLY as an HVF EXCEPTION exit from
+        /// EL0 (no EL1 vector/HVC re-trap, so NO pending eret) — the runtime
+        /// must inject the signal by redirecting PC, not ELR_EL1. False for the
+        /// usual HVC-trampoline path (a pending eret to EL0).
+        from_el0_direct: bool,
     },
 }
 
@@ -1843,6 +1848,35 @@ impl HvfInner {
         }
 
         let exception = exit.exception;
+        // A guest EL0 memory abort HVF couldn't satisfy (e.g. a stack overflow
+        // that ran SP off the mapped stack) surfaces DIRECTLY as an EXCEPTION
+        // exit with EC=0x20/0x24, NOT through our EL1 vector's HVC. Deliver it to
+        // the guest as the right Linux signal (SIGSEGV) so its handler runs —
+        // CPython faulthandler._stack_overflow expects exactly this — instead of
+        // fataling with "unexpected exception".
+        if is_aarch64_el0_abort_exception(exception.syndrome) {
+            let elr = self.vcpu.get_sys_reg(SysReg::ELR_EL1).unwrap_or(0);
+            let far = self.vcpu.get_sys_reg(SysReg::FAR_EL1).unwrap_or(0);
+            let x16 = self.vcpu.get_reg(Reg::X16).unwrap_or(0);
+            let x17 = self.vcpu.get_reg(Reg::X17).unwrap_or(0);
+            let x29 = self.vcpu.get_reg(Reg::X29).unwrap_or(0);
+            let x30 = self.vcpu.get_reg(Reg::LR).unwrap_or(0);
+            let sp = self.vcpu.get_sys_reg(SysReg::SP_EL0).unwrap_or(0);
+            crate::probes::vcpu_fault(exception.syndrome, elr, far, x30, sp, unsafe {
+                libc::getpid()
+            });
+            return Err(TrapError::EL0Fault {
+                syndrome: exception.syndrome,
+                elr,
+                far,
+                x16,
+                x17,
+                x29,
+                x30,
+                sp,
+                from_el0_direct: true,
+            });
+        }
         if !is_aarch64_syscall_exception(exception.syndrome) {
             return Err(TrapError::UnexpectedException {
                 syndrome: exception.syndrome,
@@ -1923,6 +1957,7 @@ impl HvfInner {
                     x29,
                     x30,
                     sp,
+                    from_el0_direct: false,
                 });
             }
         }
@@ -3415,6 +3450,17 @@ pub fn is_aarch64_syscall_exception(syndrome: u64) -> bool {
     is_aarch64_svc_exception(syndrome) || is_aarch64_hvc_exception(syndrome)
 }
 
+/// True for a memory abort taken from a LOWER exception level (EL0 guest code):
+/// instruction abort (`EC = 0x20`) or data abort (`EC = 0x24`). HVF normally
+/// funnels guest EL0 faults through our EL1 vector trampoline (an HVC), but a
+/// fault HVF itself can't satisfy (e.g. a stack overflow whose SP ran off the
+/// mapped guest stack) surfaces DIRECTLY as an EXCEPTION exit with this EC. It
+/// must be delivered to the guest as SIGSEGV (faulthandler._stack_overflow,
+/// Go's sigpanic), not treated as a fatal "unexpected exception".
+pub fn is_aarch64_el0_abort_exception(syndrome: u64) -> bool {
+    matches!(aarch64_exception_class(syndrome), 0x20 | 0x24)
+}
+
 fn align_down(value: u64, alignment: u64) -> u64 {
     value / alignment * alignment
 }
@@ -3686,9 +3732,24 @@ fn signal_frame_stack_pointer(
         .map(|len| len & !15u64)
         .ok_or_else(|| TrapError::Hypervisor("sigframe length overflowed".to_string()))?;
     let stack_base = match altstack {
-        Some((ss_sp, ss_size)) => ss_sp
-            .checked_add(ss_size)
-            .ok_or_else(|| TrapError::Hypervisor("signal alt stack top overflowed".to_string()))?,
+        Some((ss_sp, ss_size)) => {
+            let top = ss_sp.checked_add(ss_size).ok_or_else(|| {
+                TrapError::Hypervisor("signal alt stack top overflowed".to_string())
+            })?;
+            // If the interrupted code is ALREADY running on the alternate
+            // signal stack, a nested SA_ONSTACK delivery must continue DOWN
+            // from the current SP — not reset to the top, which would push the
+            // new frame on top of the live parent handler's frame and clobber
+            // it (glibc's `*** stack smashing detected ***`). This is exactly
+            // the kernel's `on_sig_stack()` check. CPython faulthandler's
+            // SA_NODEFER|SA_ONSTACK handler re-enters itself via chain=True, so
+            // the second frame lands here.
+            if saved_sp > ss_sp && saved_sp <= top {
+                saved_sp
+            } else {
+                top
+            }
+        }
         None => saved_sp,
     };
     stack_base
@@ -3764,6 +3825,36 @@ mod memory_protection_tests {
             err.to_string().contains("alt stack top overflowed"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn nested_altstack_frame_continues_down_from_current_sp() {
+        // alt stack [0x4000, 0x6000). A first (outer) delivery while NOT on the
+        // alt stack (saved_sp outside the range) pushes from the TOP.
+        let outer = signal_frame_stack_pointer(0x8000, Some((0x4000, 0x2000)), 0x100).unwrap();
+        assert!((0x4000..0x6000).contains(&outer));
+
+        // A NESTED delivery while ALREADY on the alt stack (saved_sp inside the
+        // range, simulating the outer handler's live SP) must push BELOW that
+        // SP — not reset to the top, which would clobber the outer frame
+        // (glibc "stack smashing detected"). This is the SA_NODEFER re-entry
+        // / faulthandler chain=True case.
+        let nested = signal_frame_stack_pointer(outer, Some((0x4000, 0x2000)), 0x100).unwrap();
+        assert!(
+            nested < outer,
+            "nested {nested:#x} must be below outer {outer:#x}"
+        );
+        assert!(
+            nested >= 0x4000,
+            "nested {nested:#x} underflowed the alt stack"
+        );
+        assert_eq!(nested & 15, 0);
+
+        // saved_sp exactly at the alt-stack base is treated as NOT on the stack
+        // (the kernel's on_sig_stack uses sp > base), so it resets to the top.
+        let at_base = signal_frame_stack_pointer(0x4000, Some((0x4000, 0x2000)), 0x100).unwrap();
+        assert!((0x4000..0x6000).contains(&at_base));
+        assert_eq!(at_base, outer);
     }
 }
 

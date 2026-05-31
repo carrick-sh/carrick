@@ -72,6 +72,7 @@ pub(super) fn deliver_fault_signal(
     esr: u64,
     elr: u64,
     far: u64,
+    from_el0_direct: bool,
     traps: usize,
 ) -> Result<Option<VcpuLoopOutcome>, RuntimeError> {
     let dispatcher = &kernel.dispatcher;
@@ -133,14 +134,21 @@ pub(super) fn deliver_fault_signal(
         None
     };
     let saved_sigmask = dispatcher.enter_signal_handler(this_tid, signum, action);
-    // The fault trapped via the EL1 HVC trampoline (like a syscall): ELR_EL1
-    // already holds the faulting EL0 instruction (neither aborts nor BRK advance
-    // it), and there's a pending eret to EL0. So use the syscall-boundary form
-    // (`interrupted_pc=None`): inject sets the handler via ELR_EL1 and snapshots
-    // saved_pc=ELR_EL1=the faulting instruction (re-run on return unless the
-    // handler advances it — e.g. Go's sigpanic, or its debug-call handler doing
-    // `set_pc(pc+4)` to step past the BRK). For a BRK this makes `sigpc` point at
-    // the BRK so Go reads `*(*uint32)(sigpc) == 0xd4200000`.
+    // How to inject depends on HOW the fault reached the host:
+    //   * HVC-trampoline path (`from_el0_direct == false`): the fault trapped
+    //     via the EL1 vector like a syscall, so ELR_EL1 holds the faulting EL0
+    //     instruction AND there is a pending eret to EL0. Use the syscall-
+    //     boundary form (`interrupted_pc = None`): inject sets the handler via
+    //     ELR_EL1 and snapshots saved_pc = ELR_EL1 = the faulting instruction
+    //     (re-run on return unless the handler advances it — Go's sigpanic, or
+    //     its debug-call `set_pc(pc+4)` to step past a BRK).
+    //   * Direct EL0 EXCEPTION exit (`from_el0_direct == true`, e.g. a stack
+    //     overflow HVF couldn't satisfy): the vCPU is parked AT EL0 with PC =
+    //     the faulting instruction and NO pending eret. Setting ELR_EL1 would do
+    //     nothing — the vCPU would resume at PC and re-fault forever. Use the
+    //     kick form (`interrupted_pc = Some(elr)`) so inject redirects PC to the
+    //     handler directly and saves PC = elr for rt_sigreturn.
+    let interrupted_pc = if from_el0_direct { Some(elr) } else { None };
     // Bind the result to release the &mut engine borrow before calling the
     // `terminate` closure (which borrows engine immutably).
     let injected = engine.inject_signal(
@@ -148,7 +156,7 @@ pub(super) fn deliver_fault_signal(
         action.sa_handler,
         restorer,
         None,
-        None,
+        interrupted_pc,
         altstack,
         saved_sigmask,
         Some((si_code, si_addr)),
