@@ -12,8 +12,10 @@ mod support;
 
 #[cfg(target_os = "macos")]
 use carrick_runtime::fs_backend::{FsBackend, HostFsBackend};
-use carrick_runtime::linux_abi::{LINUX_EFBIG, LINUX_O_CREAT, LINUX_O_RDWR};
-use carrick_runtime::vfs::MAX_IN_MEMORY_FILE_SIZE;
+use carrick_runtime::linux_abi::{
+    LINUX_AT_FDCWD, LINUX_AT_REMOVEDIR, LINUX_EFBIG, LINUX_O_CREAT, LINUX_O_RDWR,
+};
+use carrick_runtime::vfs::{BindVfs, MAX_IN_MEMORY_FILE_SIZE};
 use support::*;
 
 #[test]
@@ -1837,6 +1839,286 @@ fn inotify_init_add_watch_read_dispatch_plumbing() {
         run(&mut dispatcher, &mut memory, 28, [0, 1, 0, 0, 0, 0]),
         DispatchOutcome::Errno { errno: 22 }
     );
+}
+
+#[test]
+fn inotify_add_watch_under_bind_mount_uses_host_vnode() {
+    const IN_NONBLOCK: u64 = 0o4000;
+    const IN_MODIFY: u64 = 0x2;
+    let scratch = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(scratch.path().join("nodejs-bindwatch")).unwrap();
+    std::fs::write(
+        scratch.path().join("nodejs-bindwatch/watch_file"),
+        b"watch payload",
+    )
+    .unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
+    memory
+        .write_bytes(0x4000, b"/tmp/nodejs-bindwatch/watch_file\0")
+        .unwrap();
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.register_mount(
+        std::path::PathBuf::from("/tmp"),
+        Box::new(BindVfs::new("/tmp", scratch.path().to_path_buf(), false)),
+    );
+    let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
+        d.dispatch(
+            SyscallRequest::new(nr, SyscallArgs::from(args)),
+            m,
+            &reporter,
+        )
+        .unwrap()
+    };
+
+    let ifd = match run(
+        &mut dispatcher,
+        &mut memory,
+        26,
+        [IN_NONBLOCK, 0, 0, 0, 0, 0],
+    ) {
+        DispatchOutcome::Returned { value } => value as u64,
+        other => panic!("inotify_init1: {other:?}"),
+    };
+    match run(
+        &mut dispatcher,
+        &mut memory,
+        27,
+        [ifd, 0x4000, IN_MODIFY, 0, 0, 0],
+    ) {
+        DispatchOutcome::Returned { value } => assert!(value >= 1, "watch descriptor {value}"),
+        other => panic!("inotify_add_watch: {other:?}"),
+    }
+    std::fs::write(
+        scratch.path().join("nodejs-bindwatch/watch_file"),
+        b"changed payload",
+    )
+    .unwrap();
+    match run(&mut dispatcher, &mut memory, 63, [ifd, 0x4100, 64, 0, 0, 0]) {
+        DispatchOutcome::Returned { value } => assert!(value >= 16, "inotify bytes {value}"),
+        other => panic!("inotify read after bind write: {other:?}"),
+    }
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn bind_mount_cwd_relative_stat_open_mkdir_and_inotify_use_host_tree() {
+    const IN_NONBLOCK: u64 = 0o4000;
+    const IN_MODIFY: u64 = 0x2;
+    let scratch = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(scratch.path().join("nodejs-bindcwd")).unwrap();
+    std::fs::write(
+        scratch.path().join("nodejs-bindcwd/watch_file"),
+        b"watch payload",
+    )
+    .unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x800]);
+    memory
+        .write_bytes(0x4000, b"/tmp/nodejs-bindcwd\0")
+        .unwrap();
+    memory.write_bytes(0x4040, b"child\0").unwrap();
+    memory.write_bytes(0x4060, b"child/file.txt\0").unwrap();
+    memory.write_bytes(0x4080, b".\0").unwrap();
+    memory.write_bytes(0x40a0, b"watch_file\0").unwrap();
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.register_mount(
+        std::path::PathBuf::from("/tmp"),
+        Box::new(BindVfs::new("/tmp", scratch.path().to_path_buf(), false)),
+    );
+    let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
+        d.dispatch(
+            SyscallRequest::new(nr, SyscallArgs::from(args)),
+            m,
+            &reporter,
+        )
+        .unwrap()
+    };
+
+    assert_eq!(
+        run(&mut dispatcher, &mut memory, 49, [0x4000, 0, 0, 0, 0, 0],),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            34,
+            [LINUX_AT_FDCWD, 0x4040, 0o755, 0, 0, 0],
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert!(scratch.path().join("nodejs-bindcwd/child").is_dir());
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            56,
+            [
+                LINUX_AT_FDCWD,
+                0x4060,
+                LINUX_O_CREAT | LINUX_O_RDWR,
+                0o644,
+                0,
+                0,
+            ],
+        ),
+        DispatchOutcome::Returned { value: 3 }
+    );
+    assert_eq!(
+        run(&mut dispatcher, &mut memory, 57, [3, 0, 0, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert!(
+        scratch
+            .path()
+            .join("nodejs-bindcwd/child/file.txt")
+            .is_file()
+    );
+
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            79,
+            [LINUX_AT_FDCWD, 0x4060, 0x4200, 0, 0, 0],
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let stat = read_stat(&memory, 0x4200);
+    assert_eq!(stat.st_mode & LINUX_S_IFMT, LINUX_S_IFREG);
+
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            291,
+            [
+                LINUX_AT_FDCWD,
+                0x4080,
+                0,
+                LINUX_STATX_BASIC_STATS as u64,
+                0x4300,
+                0,
+            ],
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let statx = read_statx(&memory, 0x4300);
+    assert_eq!(statx.stx_mode as u32 & LINUX_S_IFMT, LINUX_S_IFDIR);
+
+    let ifd = match run(
+        &mut dispatcher,
+        &mut memory,
+        26,
+        [IN_NONBLOCK, 0, 0, 0, 0, 0],
+    ) {
+        DispatchOutcome::Returned { value } => value as u64,
+        other => panic!("inotify_init1: {other:?}"),
+    };
+    match run(
+        &mut dispatcher,
+        &mut memory,
+        27,
+        [ifd, 0x40a0, IN_MODIFY, 0, 0, 0],
+    ) {
+        DispatchOutcome::Returned { value } => assert!(value >= 1, "file wd {value}"),
+        other => panic!("relative inotify_add_watch file: {other:?}"),
+    }
+    match run(
+        &mut dispatcher,
+        &mut memory,
+        27,
+        [ifd, 0x4080, IN_MODIFY, 0, 0, 0],
+    ) {
+        DispatchOutcome::Returned { value } => assert!(value >= 1, "dir wd {value}"),
+        other => panic!("relative inotify_add_watch cwd: {other:?}"),
+    }
+    std::fs::write(
+        scratch.path().join("nodejs-bindcwd/watch_file"),
+        b"changed payload",
+    )
+    .unwrap();
+    match run(&mut dispatcher, &mut memory, 63, [ifd, 0x4400, 64, 0, 0, 0]) {
+        DispatchOutcome::Returned { value } => assert!(value >= 16, "inotify bytes {value}"),
+        other => panic!("relative inotify read after bind write: {other:?}"),
+    }
+
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn bind_mount_directory_inotify_reports_child_file_write_name() {
+    const IN_NONBLOCK: u64 = 0o4000;
+    const IN_MODIFY: u64 = 0x2;
+    let scratch = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(scratch.path().join("nodejs-binddirwatch")).unwrap();
+    std::fs::write(
+        scratch.path().join("nodejs-binddirwatch/watch_file"),
+        b"watch payload",
+    )
+    .unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
+    memory
+        .write_bytes(0x4000, b"/tmp/nodejs-binddirwatch\0")
+        .unwrap();
+    memory.write_bytes(0x4040, b".\0").unwrap();
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.register_mount(
+        std::path::PathBuf::from("/tmp"),
+        Box::new(BindVfs::new("/tmp", scratch.path().to_path_buf(), false)),
+    );
+    let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
+        d.dispatch(
+            SyscallRequest::new(nr, SyscallArgs::from(args)),
+            m,
+            &reporter,
+        )
+        .unwrap()
+    };
+
+    assert_eq!(
+        run(&mut dispatcher, &mut memory, 49, [0x4000, 0, 0, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let ifd = match run(
+        &mut dispatcher,
+        &mut memory,
+        26,
+        [IN_NONBLOCK, 0, 0, 0, 0, 0],
+    ) {
+        DispatchOutcome::Returned { value } => value as u64,
+        other => panic!("inotify_init1: {other:?}"),
+    };
+    match run(
+        &mut dispatcher,
+        &mut memory,
+        27,
+        [ifd, 0x4040, IN_MODIFY, 0, 0, 0],
+    ) {
+        DispatchOutcome::Returned { value } => assert!(value >= 1, "dir wd {value}"),
+        other => panic!("directory inotify_add_watch: {other:?}"),
+    }
+    std::fs::write(
+        scratch.path().join("nodejs-binddirwatch/watch_file"),
+        b"changed payload",
+    )
+    .unwrap();
+    match run(
+        &mut dispatcher,
+        &mut memory,
+        63,
+        [ifd, 0x4100, 128, 0, 0, 0],
+    ) {
+        DispatchOutcome::Returned { value } => assert!(value >= 28, "inotify bytes {value}"),
+        other => panic!("directory inotify read after child write: {other:?}"),
+    }
+    let event = memory.read_bytes(0x4100, 32).unwrap();
+    let name_len = u32::from_ne_bytes(event[12..16].try_into().unwrap()) as usize;
+    assert!(name_len >= "watch_file\0".len(), "name len {name_len}");
+    assert_eq!(&event[16..16 + "watch_file".len()], b"watch_file");
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
 #[test]
@@ -3990,6 +4272,273 @@ fn mkdirat_returns_eexist_for_known_paths_and_creates_in_overlay_otherwise() {
         DispatchOutcome::Errno { errno: 9 }
     );
 
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn mkdirat_under_bind_mount_creates_host_directory_for_openat_children() {
+    let scratch = tempfile::TempDir::new().unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
+    memory.write_bytes(0x4000, b"/tmp/nodejs-bindcp\0").unwrap();
+    memory
+        .write_bytes(0x4020, b"/tmp/nodejs-bindcp/test\0")
+        .unwrap();
+    memory
+        .write_bytes(0x4060, b"/tmp/nodejs-bindcp/test/file.txt\0")
+        .unwrap();
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.register_mount(
+        std::path::PathBuf::from("/tmp"),
+        Box::new(BindVfs::new("/tmp", scratch.path().to_path_buf(), false)),
+    );
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    34,
+                    SyscallArgs::from([LINUX_AT_FDCWD, 0x4000, 0o700, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    34,
+                    SyscallArgs::from([LINUX_AT_FDCWD, 0x4020, 0o755, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert!(scratch.path().join("nodejs-bindcp/test").is_dir());
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    56,
+                    SyscallArgs::from([
+                        LINUX_AT_FDCWD,
+                        0x4060,
+                        LINUX_O_CREAT | LINUX_O_RDWR,
+                        0o644,
+                        0,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 3 }
+    );
+    assert!(scratch.path().join("nodejs-bindcp/test/file.txt").is_file());
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(57, SyscallArgs::from([3, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(35, SyscallArgs::from([LINUX_AT_FDCWD, 0x4060, 0, 0, 0, 0]),),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert!(!scratch.path().join("nodejs-bindcp/test/file.txt").exists());
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    35,
+                    SyscallArgs::from([LINUX_AT_FDCWD, 0x4020, LINUX_AT_REMOVEDIR, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert!(!scratch.path().join("nodejs-bindcp/test").exists());
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn renameat_under_bind_mount_moves_host_entries() {
+    let scratch = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(scratch.path().join("nodejs-bindmv")).unwrap();
+    std::fs::write(
+        scratch.path().join("nodejs-bindmv/old.txt"),
+        b"rename payload",
+    )
+    .unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
+    memory
+        .write_bytes(0x4000, b"/tmp/nodejs-bindmv/old.txt\0")
+        .unwrap();
+    memory
+        .write_bytes(0x4040, b"/tmp/nodejs-bindmv/new.txt\0")
+        .unwrap();
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.register_mount(
+        std::path::PathBuf::from("/tmp"),
+        Box::new(BindVfs::new("/tmp", scratch.path().to_path_buf(), false)),
+    );
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    38,
+                    SyscallArgs::from([LINUX_AT_FDCWD, 0x4000, LINUX_AT_FDCWD, 0x4040, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert!(!scratch.path().join("nodejs-bindmv/old.txt").exists());
+    assert_eq!(
+        std::fs::read(scratch.path().join("nodejs-bindmv/new.txt")).unwrap(),
+        b"rename payload"
+    );
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn symlinkat_and_readlinkat_under_bind_mount_use_host_tree() {
+    let scratch = tempfile::TempDir::new().unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
+    memory.write_bytes(0x4000, b"target-name\0").unwrap();
+    memory.write_bytes(0x4020, b"/tmp/nodejs-bindln\0").unwrap();
+    memory
+        .write_bytes(0x4060, b"/tmp/nodejs-bindln/link\0")
+        .unwrap();
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.register_mount(
+        std::path::PathBuf::from("/tmp"),
+        Box::new(BindVfs::new("/tmp", scratch.path().to_path_buf(), false)),
+    );
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    34,
+                    SyscallArgs::from([LINUX_AT_FDCWD, 0x4020, 0o755, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    36,
+                    SyscallArgs::from([0x4000, LINUX_AT_FDCWD, 0x4060, 0, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        std::fs::read_link(scratch.path().join("nodejs-bindln/link")).unwrap(),
+        std::path::PathBuf::from("target-name")
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    78,
+                    SyscallArgs::from([LINUX_AT_FDCWD, 0x4060, 0x4100, 64, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 11 }
+    );
+    assert_eq!(memory.read_bytes(0x4100, 11).unwrap(), b"target-name");
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
+fn linkat_and_unlinkat_under_bind_mount_use_host_tree() {
+    let scratch = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(scratch.path().join("nodejs-bindhard")).unwrap();
+    std::fs::write(
+        scratch.path().join("nodejs-bindhard/source.txt"),
+        b"hard payload",
+    )
+    .unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
+    memory
+        .write_bytes(0x4000, b"/tmp/nodejs-bindhard/source.txt\0")
+        .unwrap();
+    memory
+        .write_bytes(0x4040, b"/tmp/nodejs-bindhard/linked.txt\0")
+        .unwrap();
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.register_mount(
+        std::path::PathBuf::from("/tmp"),
+        Box::new(BindVfs::new("/tmp", scratch.path().to_path_buf(), false)),
+    );
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    37,
+                    SyscallArgs::from([LINUX_AT_FDCWD, 0x4000, LINUX_AT_FDCWD, 0x4040, 0, 0]),
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        std::fs::read(scratch.path().join("nodejs-bindhard/linked.txt")).unwrap(),
+        b"hard payload"
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(35, SyscallArgs::from([LINUX_AT_FDCWD, 0x4040, 0, 0, 0, 0]),),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert!(!scratch.path().join("nodejs-bindhard/linked.txt").exists());
+    assert!(scratch.path().join("nodejs-bindhard/source.txt").exists());
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 

@@ -58,6 +58,11 @@ impl SyscallDispatcher {
             return Some(target);
         }
         use crate::vfs::Vfs as _;
+        if let Some(m) = self.fs.vfs_mounts.resolve(path)
+            && let Ok(target) = m.vfs.readlink(&m.full_path)
+        {
+            return Some(target.to_string_lossy().into_owned());
+        }
         self.fs
             .rootfs_vfs
             .readlink(path)
