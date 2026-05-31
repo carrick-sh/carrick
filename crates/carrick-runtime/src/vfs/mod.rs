@@ -211,6 +211,8 @@ pub struct OpenContext<'a> {
     pub address_space_regions: Option<&'a [ProcMapsEntry]>,
     pub brk_current: u64,
     pub mmap_next: u64,
+    pub euid: u32,
+    pub egid: u32,
 }
 
 /// The path-and-metadata surface of a single mount point. Open-side
