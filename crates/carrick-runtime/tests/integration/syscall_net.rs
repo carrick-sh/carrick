@@ -130,7 +130,6 @@ fn unix_bind_existing_guest_socket_path_returns_eaddrinuse() {
         )
         .unwrap()
     };
-
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -296,6 +295,101 @@ fn unix_connect_checks_guest_path_before_host_hash_path() {
             errno: LINUX_ECONNREFUSED
         }
     );
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn unix_relative_socket_getsockname_can_be_chmodded() {
+    const LINUX_AF_UNIX: u16 = 1;
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0xa00]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
+        d.dispatch(
+            SyscallRequest::new(nr, SyscallArgs::from(args)),
+            m,
+            &reporter,
+        )
+        .unwrap()
+    };
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let guest_path = format!("uv-test-sock-{nanos}");
+    let gpb = guest_path.as_bytes();
+    let mut sa = vec![0u8; 2 + gpb.len() + 1];
+    sa[0..2].copy_from_slice(&LINUX_AF_UNIX.to_ne_bytes());
+    sa[2..2 + gpb.len()].copy_from_slice(gpb);
+    memory.write_bytes(0x4200, &sa).unwrap();
+
+    let fd = match run(
+        &mut dispatcher,
+        &mut memory,
+        198,
+        [LINUX_AF_UNIX as u64, LINUX_SOCK_STREAM as u64, 0, 0, 0, 0],
+    ) {
+        DispatchOutcome::Returned { value } => value as u64,
+        other => panic!("socket failed: {other:?}"),
+    };
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            200,
+            [fd, 0x4200, sa.len() as u64, 0, 0, 0],
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    memory.write_bytes(0x4500, &128u32.to_ne_bytes()).unwrap();
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            204,
+            [fd, 0x4400, 0x4500, 0, 0, 0],
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let out_len = {
+        let b = memory.read_bytes(0x4500, 4).unwrap();
+        u32::from_ne_bytes([b[0], b[1], b[2], b[3]]) as usize
+    };
+    let out = memory.read_bytes(0x4400, out_len).unwrap();
+    let returned_path = &out[2..];
+    let returned_path = &returned_path[..returned_path
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(returned_path.len())];
+    assert_eq!(returned_path, gpb);
+
+    let mut chmod_path = returned_path.to_vec();
+    chmod_path.push(0);
+    memory.write_bytes(0x4600, &chmod_path).unwrap();
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            53,
+            [LINUX_AT_FDCWD, 0x4600, 0o444, 0, 0, 0],
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            79,
+            [LINUX_AT_FDCWD, 0x4600, 0x4700, 0, 0, 0],
+        ),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let stat = read_stat(&memory, 0x4700);
+    let mode = stat.st_mode;
+    assert_eq!(mode & 0o777, 0o444);
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
