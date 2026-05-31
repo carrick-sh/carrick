@@ -5473,6 +5473,22 @@ impl SyscallDispatcher {
             let Some(src) = resolved_old else {
                 return Ok(LINUX_EROFS.into());
             };
+            // Route a hard link whose NEW path is under a VFS mount (e.g.
+            // /dev/shm, a BindVfs) to that mount's link() — the rootfs overlay
+            // can't hard-link mount-backed paths and would wrongly return EROFS.
+            // glibc sem_open does openat(temp) -> linkat(temp,final) ->
+            // unlink(temp), so without this the whole multiprocessing SemLock
+            // path fails EROFS and every multiprocessing/concurrent_futures
+            // module SKIPS ("broken multiprocessing SemLock"). open already
+            // routes through the mounts (try_mount_open); linkat must mirror it.
+            // BindVfs::to_host rejects a `src` outside the mount, so a cross-fs
+            // link returns ENOENT (not a corrupt link).
+            if let Some(mnew) = this.fs.vfs_mounts.resolve(&resolved_new) {
+                return Ok(match mnew.vfs.link(&src, &resolved_new) {
+                    Ok(()) => DispatchOutcome::Returned { value: 0 },
+                    Err(errno) => errno.into(),
+                });
+            }
             match this.fs.rootfs_vfs.overlay.hard_link(&src, &resolved_new) {
                 Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
                 Err(crate::fs_backend::BackendError::Unsupported) => {
