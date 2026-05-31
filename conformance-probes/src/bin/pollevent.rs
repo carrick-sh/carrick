@@ -10,6 +10,7 @@
 fn main() {
     eventfd_probe();
     epoll_probe();
+    poll_epoll_fd_probe();
     poll_probe();
     select_probe();
     timerfd_probe();
@@ -101,6 +102,62 @@ fn epoll_probe() {
     }
 
     unsafe { libc::close(ep); libc::close(rd); libc::close(wr) };
+}
+
+/// poll on an epoll fd: registering a readable pipe in the epoll instance makes
+/// the epoll fd itself POLLIN-readable. libuv's embedded-loop test waits on
+/// `poll(uv_backend_fd(loop))`, so this must wake without consuming the event.
+fn poll_epoll_fd_probe() {
+    let ep = unsafe { libc::epoll_create1(0) };
+    if ep < 0 {
+        println!("poll_epoll_create1=ERR:{}", errno());
+        return;
+    }
+    let mut fds = [0i32; 2];
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), 0) } != 0 {
+        println!("poll_epoll_pipe=ERR:{}", errno());
+        unsafe { libc::close(ep) };
+        return;
+    }
+    let (rd, wr) = (fds[0], fds[1]);
+
+    let mut ev = libc::epoll_event {
+        events: libc::EPOLLIN as u32,
+        u64: rd as u64,
+    };
+    let add = unsafe { libc::epoll_ctl(ep, libc::EPOLL_CTL_ADD, rd, &mut ev) };
+    if add != 0 {
+        println!("poll_epoll_ctl_add=ERR:{}", errno());
+        unsafe {
+            libc::close(ep);
+            libc::close(rd);
+            libc::close(wr);
+        }
+        return;
+    }
+
+    unsafe { libc::write(wr, b"e".as_ptr().cast(), 1) };
+    let mut pfd = libc::pollfd {
+        fd: ep,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let rc = unsafe { libc::poll(&mut pfd as *mut _, 1, 50) };
+    if rc < 0 {
+        println!("poll_epoll_fd=ERR:{}", errno());
+    } else {
+        println!("poll_epoll_fd_ready_rc={}", rc);
+        println!(
+            "poll_epoll_fd_revents_in={}",
+            (pfd.revents & libc::POLLIN) != 0
+        );
+    }
+
+    unsafe {
+        libc::close(ep);
+        libc::close(rd);
+        libc::close(wr);
+    }
 }
 
 /// poll: a pipe read-end with POLLIN. Nothing written and a 10ms timeout → rc 0

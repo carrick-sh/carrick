@@ -2454,6 +2454,97 @@ fn ppoll_reports_eventfd_pipe_and_invalid_fd_readiness() {
 }
 
 #[test]
+fn ppoll_reports_epoll_fd_readiness_when_registered_fd_is_ready() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(20, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 3 }
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(59, SyscallArgs::from([0x4000, 0, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let pair = read_fd_pair(&memory, 0x4000);
+
+    let event = LinuxEpollEvent {
+        events: LINUX_EPOLLIN,
+        _pad: 0,
+        data: pair.read_fd as u64,
+    };
+    memory.write_bytes(0x4100, event.as_bytes()).unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    21,
+                    SyscallArgs::from([3, LINUX_EPOLL_CTL_ADD, pair.read_fd as u64, 0x4100, 0, 0])
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    memory.write_bytes(0x4200, b"x").unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    64,
+                    SyscallArgs::from([pair.write_fd as u64, 0x4200, 1, 0, 0, 0])
+                ),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 1 }
+    );
+
+    write_pollfds(
+        &mut memory,
+        0x4300,
+        [LinuxPollFd {
+            fd: 3,
+            events: LINUX_POLLIN,
+            revents: 0,
+        }],
+    );
+    memory
+        .write_bytes(0x4400, LinuxTimespec::new(0, 0).as_bytes())
+        .unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(73, SyscallArgs::from([0x4300, 1, 0x4400, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 1 }
+    );
+
+    let pollfds = read_pollfds(&memory, 0x4300, 1);
+    assert_eq!(pollfds[0].2 & LINUX_POLLIN, LINUX_POLLIN);
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+#[test]
 fn pselect6_reports_eventfd_pipe_and_write_readiness() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
     let reporter = CompatReporter::default();
