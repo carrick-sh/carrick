@@ -153,6 +153,17 @@ impl Vfs for BindVfs {
         if host_fd < 0 {
             return Err(host_open_errno());
         }
+        // The macOS open(2) applied the HOST process umask to the create mode,
+        // so the on-disk bits can be narrower than the guest asked for. When we
+        // just created the file, force the exact guest-requested mode via fchmod
+        // — otherwise a 0-mode node (the dispatcher passes the guest's
+        // umask-adjusted bits) would deny a later O_RDWR reopen (glibc sem_open's
+        // SemLock._rebuild → EACCES under the multiprocessing forkserver).
+        if flags.create && flags.mode != 0 {
+            unsafe {
+                libc::fchmod(host_fd, (flags.mode & 0o7777) as libc::mode_t);
+            }
+        }
 
         let status_flags = if flags.nonblock {
             crate::linux_abi::LINUX_O_NONBLOCK as u32

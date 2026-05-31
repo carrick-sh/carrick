@@ -1168,9 +1168,184 @@ pub(in crate::dispatch) fn set_host_nonblocking(fd: i32) {
     }
 }
 
+fn linux_cmsg_align(n: usize) -> usize {
+    n.div_ceil(LINUX_CMSG_ALIGN) * LINUX_CMSG_ALIGN
+}
+
+/// Parse a GUEST (Linux-layout) `msg_control` buffer and return the i32 file
+/// descriptors carried by every `SCM_RIGHTS` (SOL_SOCKET) ancillary record.
+/// The Linux `cmsghdr` is `{ u64 cmsg_len; i32 cmsg_level; i32 cmsg_type; }`
+/// followed by `CMSG_ALIGN(16)`-padded data; `cmsg_len` counts the header +
+/// data (excluding trailing alignment). Non-SCM_RIGHTS records are ignored.
+pub(in crate::dispatch) fn parse_linux_scm_rights_fds(control: &[u8]) -> Vec<i32> {
+    let mut fds = Vec::new();
+    let mut off = 0usize;
+    while off + LINUX_CMSGHDR_LEN <= control.len() {
+        let cmsg_len =
+            u64::from_ne_bytes(control[off..off + 8].try_into().unwrap_or([0; 8])) as usize;
+        let level = i32::from_ne_bytes(control[off + 8..off + 12].try_into().unwrap_or([0; 4]));
+        let ctype = i32::from_ne_bytes(control[off + 12..off + 16].try_into().unwrap_or([0; 4]));
+        // A malformed/zero cmsg_len would loop forever; bail.
+        if cmsg_len < LINUX_CMSGHDR_LEN || off + cmsg_len > control.len() {
+            break;
+        }
+        if level == LINUX_SOL_SOCKET && ctype == LINUX_SCM_RIGHTS {
+            let data = &control[off + LINUX_CMSGHDR_LEN..off + cmsg_len];
+            for chunk in data.chunks_exact(4) {
+                fds.push(i32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            }
+        }
+        off += linux_cmsg_align(cmsg_len);
+    }
+    fds
+}
+
+/// Build a GUEST (Linux-layout) `msg_control` buffer carrying a single
+/// `SCM_RIGHTS` record with `fds`, clamped to `cap` bytes (the guest's
+/// `msg_controllen`). Returns `(buffer, truncated)`; `truncated` is true iff
+/// `cap` couldn't hold the whole record (the caller sets `MSG_CTRUNC`). Only as
+/// many whole fds as fit are emitted (Linux drops the rest and sets MSG_CTRUNC).
+pub(in crate::dispatch) fn build_linux_scm_rights(fds: &[i32], cap: usize) -> (Vec<u8>, bool) {
+    if fds.is_empty() {
+        return (Vec::new(), false);
+    }
+    // How many fds fit after the 16-byte header within `cap`.
+    let max_fds = cap.saturating_sub(LINUX_CMSGHDR_LEN) / 4;
+    let n = fds.len().min(max_fds);
+    let truncated = n < fds.len() || cap < LINUX_CMSGHDR_LEN;
+    if n == 0 {
+        return (Vec::new(), truncated);
+    }
+    let data_len = n * 4;
+    let cmsg_len = LINUX_CMSGHDR_LEN + data_len;
+    let total = linux_cmsg_align(cmsg_len);
+    let mut buf = vec![0u8; total];
+    buf[0..8].copy_from_slice(&(cmsg_len as u64).to_ne_bytes());
+    buf[8..12].copy_from_slice(&LINUX_SOL_SOCKET.to_ne_bytes());
+    buf[12..16].copy_from_slice(&LINUX_SCM_RIGHTS.to_ne_bytes());
+    for (i, &fd) in fds[..n].iter().enumerate() {
+        let p = LINUX_CMSGHDR_LEN + i * 4;
+        buf[p..p + 4].copy_from_slice(&fd.to_ne_bytes());
+    }
+    (buf, truncated)
+}
+
+/// Build a HOST (macOS-layout) `msg_control` buffer carrying a single
+/// `SCM_RIGHTS` record with `host_fds`, for handing to the real `sendmsg(2)`.
+/// macOS `cmsghdr` is `{ u32 cmsg_len; i32 cmsg_level; i32 cmsg_type; }` and
+/// uses `CMSG_SPACE`/`CMSG_LEN`. Uses the libc CMSG macros so the layout matches
+/// what the host kernel expects exactly.
+pub(in crate::dispatch) fn build_host_scm_rights(host_fds: &[i32]) -> Vec<u8> {
+    if host_fds.is_empty() {
+        return Vec::new();
+    }
+    let data_len = (host_fds.len() * std::mem::size_of::<i32>()) as u32;
+    let space = unsafe { libc::CMSG_SPACE(data_len) } as usize;
+    let mut buf = vec![0u8; space];
+    unsafe {
+        // Lay down one cmsghdr at the buffer head via the libc accessor so the
+        // macOS-specific alignment/len fields are exactly right.
+        let cmsg = buf.as_mut_ptr() as *mut libc::cmsghdr;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(data_len);
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        let data = libc::CMSG_DATA(cmsg) as *mut i32;
+        for (i, &fd) in host_fds.iter().enumerate() {
+            std::ptr::write(data.add(i), fd);
+        }
+    }
+    buf
+}
+
+/// Parse a HOST (macOS-layout) `msg_control` buffer (filled by `recvmsg(2)`) and
+/// return the host file descriptors carried by every `SCM_RIGHTS` record. Uses
+/// the libc CMSG iteration macros. `controllen` is the kernel-reported
+/// `msg_controllen` after recvmsg.
+pub(in crate::dispatch) fn parse_host_scm_rights_fds(
+    control: &[u8],
+    controllen: usize,
+) -> Vec<i32> {
+    let mut fds = Vec::new();
+    if controllen == 0 || control.is_empty() {
+        return fds;
+    }
+    unsafe {
+        let mut hmsg: libc::msghdr = std::mem::zeroed();
+        hmsg.msg_control = control.as_ptr() as *mut libc::c_void;
+        hmsg.msg_controllen = controllen as _;
+        let mut cmsg = libc::CMSG_FIRSTHDR(&hmsg);
+        while !cmsg.is_null() {
+            if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
+                let hdr_len = libc::CMSG_LEN(0) as usize;
+                let total = (*cmsg).cmsg_len as usize;
+                let data_len = total.saturating_sub(hdr_len);
+                let count = data_len / std::mem::size_of::<i32>();
+                let data = libc::CMSG_DATA(cmsg) as *const i32;
+                for i in 0..count {
+                    fds.push(std::ptr::read(data.add(i)));
+                }
+            }
+            cmsg = libc::CMSG_NXTHDR(&hmsg, cmsg);
+        }
+    }
+    fds
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scm_rights_guest_buffer_roundtrips() {
+        // build_linux_scm_rights → parse_linux_scm_rights_fds is the identity on
+        // the fd list (the guest cmsg layout carrick writes back must be exactly
+        // what a guest reads). 3 fds fit in a generous cap.
+        let fds = [10i32, 11, 12];
+        let (buf, truncated) = build_linux_scm_rights(&fds, 256);
+        assert!(!truncated);
+        // cmsg_len = 16-byte header + 3*4 = 28; CMSG_ALIGN(28)=32.
+        assert_eq!(buf.len(), 32);
+        let cmsg_len = u64::from_ne_bytes(buf[0..8].try_into().unwrap());
+        assert_eq!(cmsg_len, (LINUX_CMSGHDR_LEN + 12) as u64);
+        let level = i32::from_ne_bytes(buf[8..12].try_into().unwrap());
+        let ctype = i32::from_ne_bytes(buf[12..16].try_into().unwrap());
+        assert_eq!(level, LINUX_SOL_SOCKET);
+        assert_eq!(ctype, LINUX_SCM_RIGHTS);
+        assert_eq!(parse_linux_scm_rights_fds(&buf), fds.to_vec());
+    }
+
+    #[test]
+    fn scm_rights_truncates_when_cap_too_small() {
+        // Cap that holds the header + only 1 fd (16 + 4 = 20 bytes).
+        let fds = [1i32, 2, 3];
+        let (buf, truncated) = build_linux_scm_rights(&fds, 20);
+        assert!(truncated, "only 1 of 3 fds fit → MSG_CTRUNC");
+        assert_eq!(parse_linux_scm_rights_fds(&buf), vec![1]);
+        // A cap smaller than the header emits nothing but flags truncation.
+        let (empty, trunc2) = build_linux_scm_rights(&fds, 8);
+        assert!(empty.is_empty());
+        assert!(trunc2);
+    }
+
+    #[test]
+    fn scm_rights_parse_ignores_non_scm_records() {
+        // A non-SCM_RIGHTS cmsg (e.g. a SO_TIMESTAMP-ish record) must be skipped.
+        let mut buf = vec![0u8; 16];
+        buf[0..8].copy_from_slice(&16u64.to_ne_bytes()); // cmsg_len, header only
+        buf[8..12].copy_from_slice(&LINUX_SOL_SOCKET.to_ne_bytes());
+        buf[12..16].copy_from_slice(&29i32.to_ne_bytes()); // SO_TIMESTAMP, not SCM_RIGHTS
+        assert!(parse_linux_scm_rights_fds(&buf).is_empty());
+    }
+
+    #[test]
+    fn scm_rights_host_buffer_roundtrips() {
+        // build_host_scm_rights (macOS cmsg layout) → parse_host_scm_rights_fds
+        // is the identity. Exercises the libc CMSG macros end to end.
+        let fds = [3i32, 7, 42];
+        let buf = build_host_scm_rights(&fds);
+        let got = parse_host_scm_rights_fds(&buf, buf.len());
+        assert_eq!(got, fds.to_vec());
+    }
 
     #[test]
     fn netlink_rtm_getroute_synthesizes_terminated_route_dump() {

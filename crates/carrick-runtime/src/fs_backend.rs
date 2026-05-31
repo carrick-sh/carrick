@@ -150,6 +150,19 @@ pub trait FsBackend: Send + Sync {
         Err(BackendError::Unsupported)
     }
 
+    /// Materialise an `AF_UNIX` socket node at the guest `path` with permission
+    /// bits `mode` (low 0o7777). Called by `bind(2)` for a pathname socket so a
+    /// subsequent `stat`/`os.path.exists`/`chmod`/`unlink` of the bound path
+    /// matches Linux (a real `S_IFSOCK` node). macOS can't `mknod(S_IFSOCK)` as
+    /// non-root and the real host socket lives at a hashed scratch path, so the
+    /// node is a *marker*: the host backend writes a regular file tagged with
+    /// the `user.carrick.socket` xattr (fork-coherent, recognised by
+    /// `real_stat`/`metadata`); the in-memory backend records it in a `sockets`
+    /// map. Reports `RootFsEntryKind::Socket` → `S_IFSOCK`. Default: unsupported.
+    fn create_socket(&self, _path: &str, _mode: u32) -> Result<(), BackendError> {
+        Err(BackendError::Unsupported)
+    }
+
     /// Replace the contents of `path`. Used by write/writev/pwrite/
     /// ftruncate writeback and by rename-into-overlay.
     fn set_file_contents(&self, path: &str, contents: Vec<u8>) -> Result<(), BackendError>;
@@ -410,6 +423,11 @@ struct MemoryBackendState {
     dirs: HashSet<PathBuf>,
     files: HashMap<PathBuf, Vec<u8>>,
     deletions: HashSet<PathBuf>,
+    /// AF_UNIX socket nodes materialised by `bind(2)` (path → permission bits).
+    /// Reported as `RootFsEntryKind::Socket` (S_IFSOCK) by `metadata`; present
+    /// (existing, empty) to `lookup`/`lookup_kind`. Bind + chmod + unlink all
+    /// happen in the same process, so no cross-fork coherence is required here.
+    sockets: HashMap<PathBuf, u32>,
 }
 
 /// In-memory FsBackend: directories and file contents live in maps,
@@ -455,6 +473,12 @@ impl FsBackend for MemoryBackend {
         if let Some(bytes) = inner.files.get(&normalized) {
             return Some(OverlayEntry::File(bytes.clone()));
         }
+        // An AF_UNIX socket node: present, but has no readable bytes. Report it
+        // as an empty File-shaped entry so the layered lookup treats the path as
+        // existing (the true Socket kind is carried by `metadata`).
+        if inner.sockets.contains_key(&normalized) {
+            return Some(OverlayEntry::File(Vec::new()));
+        }
         None
     }
 
@@ -467,7 +491,7 @@ impl FsBackend for MemoryBackend {
         if inner.dirs.contains(&normalized) {
             return Some(OverlayEntryKind::Dir);
         }
-        if inner.files.contains_key(&normalized) {
+        if inner.files.contains_key(&normalized) || inner.sockets.contains_key(&normalized) {
             return Some(OverlayEntryKind::File);
         }
         None
@@ -476,6 +500,14 @@ impl FsBackend for MemoryBackend {
     fn metadata(&self, path: &str) -> Option<RootFsMetadata> {
         let normalized = normalize(path)?;
         let inner = self.inner.read();
+        if let Some(&mode) = inner.sockets.get(&normalized) {
+            return Some(RootFsMetadata {
+                path: normalized,
+                kind: RootFsEntryKind::Socket,
+                mode: mode & 0o7777,
+                size: 0,
+            });
+        }
         if let Some(contents) = inner.files.get(&normalized) {
             return Some(RootFsMetadata {
                 path: normalized,
@@ -516,6 +548,30 @@ impl FsBackend for MemoryBackend {
         Ok(())
     }
 
+    fn create_socket(&self, path: &str, mode: u32) -> Result<(), BackendError> {
+        let normalized = normalize(path).ok_or(BackendError::Invalid)?;
+        let mut inner = self.inner.write();
+        inner.deletions.remove(&normalized);
+        // A bind to an existing path normally fails (EADDRINUSE) — the caller
+        // (net.rs bind) only reaches create_socket after a successful host
+        // bind, so just record/overwrite the node.
+        inner.files.remove(&normalized);
+        inner.sockets.insert(normalized, mode & 0o7777);
+        Ok(())
+    }
+
+    fn set_mode(&self, path: &str, mode: u32) -> Result<(), BackendError> {
+        let normalized = normalize(path).ok_or(BackendError::Invalid)?;
+        let mut inner = self.inner.write();
+        // Only socket nodes track a mode in-memory (regular files/dirs report a
+        // fixed mode); chmod on those stays tmpfs-no-op success (default trait).
+        if let Some(slot) = inner.sockets.get_mut(&normalized) {
+            *slot = mode & 0o7777;
+            return Ok(());
+        }
+        Err(BackendError::Unsupported)
+    }
+
     fn set_file_contents(&self, path: &str, contents: Vec<u8>) -> Result<(), BackendError> {
         let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         let mut inner = self.inner.write();
@@ -531,7 +587,8 @@ impl FsBackend for MemoryBackend {
         let mut inner = self.inner.write();
         let had_file = inner.files.remove(&normalized).is_some();
         let had_dir = inner.dirs.remove(&normalized);
-        had_file || had_dir
+        let had_socket = inner.sockets.remove(&normalized).is_some();
+        had_file || had_dir || had_socket
     }
 
     fn mark_deleted(&self, path: &str) -> Result<(), BackendError> {
@@ -539,6 +596,7 @@ impl FsBackend for MemoryBackend {
         let mut inner = self.inner.write();
         inner.files.remove(&normalized);
         inner.dirs.remove(&normalized);
+        inner.sockets.remove(&normalized);
         inner.deletions.insert(normalized);
         Ok(())
     }
@@ -552,6 +610,11 @@ impl FsBackend for MemoryBackend {
         for path in inner.files.keys() {
             if let Some(name) = child_name(&prefix, path) {
                 out.push((name, RootFsEntryKind::File));
+            }
+        }
+        for path in inner.sockets.keys() {
+            if let Some(name) = child_name(&prefix, path) {
+                out.push((name, RootFsEntryKind::Socket));
             }
         }
         for path in inner.dirs.iter() {
@@ -892,6 +955,14 @@ pub(crate) const CARRICK_MODE_XATTR_NAME: &str = "user.carrick.mode";
 /// mode (they live in `user.*` for Linux validity).
 const CARRICK_UID_XATTR: &[u8] = b"user.carrick.uid\0";
 const CARRICK_GID_XATTR: &[u8] = b"user.carrick.gid\0";
+
+/// Marker xattr that flags a regular scratch file as an `AF_UNIX` socket node
+/// materialised by `bind(2)` (see `FsBackend::create_socket`). macOS can't
+/// `mknod(S_IFSOCK)` as non-root, so the guest-facing node is a regular file;
+/// this xattr makes `real_stat`/`metadata` report `S_IFSOCK` instead of
+/// `S_IFREG`. Value is the marker byte `1`. Fork-coherent (lives on the real
+/// on-disk file) and hidden from the guest's get/set/listxattr like the others.
+const CARRICK_SOCKET_XATTR: &[u8] = b"user.carrick.socket\0";
 #[allow(dead_code)]
 pub(crate) const CARRICK_UID_XATTR_NAME: &str = "user.carrick.uid";
 #[allow(dead_code)]
@@ -1030,6 +1101,16 @@ pub(crate) fn write_mode_xattr(dir: &cap_std::fs::Dir, rel: &Path, is_dir: bool,
     let _ = with_entry_fd(dir, rel, is_dir, true, |fd| {
         fset_u32_xattr(fd, CARRICK_MODE_XATTR, mode)
     });
+}
+
+/// `true` iff `rel` carries the `AF_UNIX`-socket marker xattr (see
+/// `CARRICK_SOCKET_XATTR`). A read-only `O_EVTONLY` peek that preserves atime,
+/// just like `read_mode_xattr`.
+fn read_socket_xattr(dir: &cap_std::fs::Dir, rel: &Path) -> bool {
+    with_entry_fd(dir, rel, false, false, |fd| {
+        fget_u32_xattr(fd, CARRICK_SOCKET_XATTR).is_some()
+    })
+    .unwrap_or(false)
 }
 
 /// Read the guest owner (uid, gid) xattrs for `rel`. Either may be `None`.
@@ -1216,9 +1297,17 @@ impl FsBackend for HostFsBackend {
             });
         }
         if meta.is_file() {
+            // An AF_UNIX socket node materialised by `create_socket` is a
+            // regular file flagged with the socket-marker xattr → report
+            // S_IFSOCK so getdents/stat see DT_SOCK/S_IFSOCK, not a plain file.
+            let kind = if read_socket_xattr(&self.dir, rel) {
+                RootFsEntryKind::Socket
+            } else {
+                RootFsEntryKind::File
+            };
             return Some(RootFsMetadata {
                 path: normalized,
-                kind: RootFsEntryKind::File,
+                kind,
                 mode: if override_mode.is_none() && mode == 0 {
                     0o644
                 } else {
@@ -1339,6 +1428,38 @@ impl FsBackend for HostFsBackend {
         unsafe {
             libc::fchmodat(dirfd, c_name.as_ptr(), (mode & 0o7777) as libc::mode_t, 0);
         }
+        Ok(())
+    }
+
+    fn create_socket(&self, path: &str, mode: u32) -> Result<(), BackendError> {
+        // macOS can't `mknod(S_IFSOCK)` as a non-root process, and the real
+        // host socket the guest bound lives at a HASHED scratch path (so its
+        // sun_path fits macOS's 104-byte limit, see net::support). To give the
+        // guest a stat-able node at its OWN path, materialise a regular file on
+        // the scratch and flag it with the socket-marker xattr — `real_stat`/
+        // `metadata` then report `S_IFSOCK` (not `S_IFREG`). The real file is
+        // fork-coherent (lives on the cap-std scratch shared across fork), so a
+        // forkserver child that re-stats the path sees the same node.
+        let normalized = normalize(path).ok_or(BackendError::Invalid)?;
+        let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
+        if let Some(parent) = rel.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            self.dir
+                .create_dir_all(parent)
+                .map_err(|_| BackendError::Io)?;
+        }
+        let mut opts = cap_std::fs::OpenOptions::new();
+        opts.create(true).write(true).truncate(true);
+        self.dir
+            .open_with(rel, &opts)
+            .map_err(|_| BackendError::Io)?;
+        // Mark it as a socket and stamp the guest-visible mode (bind applied the
+        // umask; net.rs passes the resulting bits) so stat reports it faithfully.
+        let _ = with_entry_fd(&self.dir, rel, false, true, |fd| {
+            fset_u32_xattr(fd, CARRICK_SOCKET_XATTR, 1);
+            fset_u32_xattr(fd, CARRICK_MODE_XATTR, mode & 0o7777);
+        });
         Ok(())
     }
 
@@ -1996,6 +2117,11 @@ impl FsBackend for HostFsBackend {
             RootFsEntryKind::Symlink
         } else if meta.mode() & (libc::S_IFMT as u32) == libc::S_IFIFO as u32 {
             RootFsEntryKind::Fifo
+        } else if matches!(Self::rel_path(&normalized), Some(rel) if read_socket_xattr(&self.dir, rel))
+        {
+            // A regular scratch file flagged as an AF_UNIX socket node by
+            // `create_socket` (see CARRICK_SOCKET_XATTR) → report S_IFSOCK.
+            RootFsEntryKind::Socket
         } else {
             RootFsEntryKind::File
         };
@@ -2003,7 +2129,10 @@ impl FsBackend for HostFsBackend {
         let default_mode = match kind {
             RootFsEntryKind::Directory => 0o755,
             RootFsEntryKind::Symlink => 0o777,
-            RootFsEntryKind::File | RootFsEntryKind::CharDevice | RootFsEntryKind::Fifo => 0o644,
+            RootFsEntryKind::File
+            | RootFsEntryKind::CharDevice
+            | RootFsEntryKind::Fifo
+            | RootFsEntryKind::Socket => 0o644,
         };
         // The real file's mode was forced owner-accessible; the guest-visible
         // mode lives in an xattr on the (symlink-resolved) target. Symlinks
@@ -2212,6 +2341,18 @@ pub fn layered_directory_entries(
                 mode: 0o777,
                 size: 0,
             },
+            // AF_UNIX socket node (bind). Pull the stored permission bits from
+            // the backend's `metadata` (the in-memory map / host marker xattr);
+            // size is 0 like Linux. Never reads contents.
+            RootFsEntryKind::Socket => {
+                let mode = overlay.metadata(&path).map(|m| m.mode).unwrap_or(0o755);
+                RootFsMetadata {
+                    path: normalized,
+                    kind,
+                    mode,
+                    size: 0,
+                }
+            }
         };
         seen.insert(name.clone());
         out.push(RootFsDirEntry { name, metadata });

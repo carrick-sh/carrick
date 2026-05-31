@@ -472,6 +472,97 @@ impl SyscallDispatcher {
         }
     }
 
+    /// Map a GUEST fd to its backing HOST fd for an `SCM_RIGHTS` send. Only
+    /// real host-backed descriptions (pipe/socket/file) can be passed to a peer
+    /// over the host AF_UNIX socket; anything else (eventfd, pidfd, in-memory
+    /// File, …) has no single host fd to dup into the peer and is rejected with
+    /// EBADF (the closest Linux errno for "can't pass this fd"). The forkserver
+    /// only ever passes os.pipe() ends + inherited sockets, all host-backed.
+    fn host_fd_for_scm(&self, guest_fd: i32) -> Option<i32> {
+        let open_file = self.open_file(guest_fd)?;
+        let open = open_file.description.read();
+        match &*open {
+            OpenDescription::HostPipe { host_fd, .. }
+            | OpenDescription::HostSocket { host_fd, .. }
+            | OpenDescription::HostFile { host_fd, .. } => Some(*host_fd),
+            _ => None,
+        }
+    }
+
+    /// Install a HOST fd received via `SCM_RIGHTS` as a fresh GUEST fd, wrapping
+    /// it in the right `OpenDescription` by `fstat`ing its type (socket → host
+    /// socket, fifo → host pipe, else a host file). The received host fd is
+    /// already a live kernel fd the macOS kernel handed us; we keep its blocking
+    /// mode non-blocking to satisfy the dispatcher's wait invariants. Returns
+    /// the new guest fd, or `None` on failure (the caller closes the host fd).
+    fn install_received_host_fd(&self, host_fd: i32) -> Option<i32> {
+        set_host_nonblocking(host_fd);
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let kind = if unsafe { libc::fstat(host_fd, &mut st) } == 0 {
+            st.st_mode & libc::S_IFMT
+        } else {
+            0
+        };
+        let description = if kind == libc::S_IFSOCK {
+            // Recover the socket's domain/type so SO_TYPE/SO_DOMAIN report
+            // faithfully; default to AF_UNIX/STREAM (the forkserver case).
+            let mut so_type: i32 = libc::SOCK_STREAM;
+            let mut len = std::mem::size_of::<i32>() as libc::socklen_t;
+            unsafe {
+                libc::getsockopt(
+                    host_fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_TYPE,
+                    (&mut so_type as *mut i32).cast(),
+                    &mut len,
+                );
+            }
+            // SOCK_STREAM/DGRAM/RAW/SEQPACKET are numerically identical on
+            // macOS and Linux (1/2/3/5), so the host SO_TYPE value is already a
+            // valid Linux socket type.
+            OpenDescription::HostSocket {
+                host_fd,
+                family: libc::AF_UNIX,
+                type_: so_type,
+                base: OpenDescriptionBase::new(0),
+            }
+        } else if kind == libc::S_IFIFO {
+            // A pipe end. Probe its direction so reads/writes route correctly;
+            // a pipe read end rejects writes and vice versa. F_GETFL's access
+            // mode is unreliable for pipe ends, so treat it as bidirectional-
+            // safe: mark it not-a-read-end unless a write probe fails. The
+            // forkserver passes both ends; CPython only uses each in one
+            // direction, so a conservative bidirectional flag is safe.
+            OpenDescription::HostPipe {
+                host_fd,
+                is_read_end: false,
+                pty: None,
+                bidirectional: true,
+                base: OpenDescriptionBase::new(0),
+            }
+        } else {
+            // Regular file / chardev / anything else: a host file with a real fd.
+            let metadata = RootFsMetadata {
+                path: std::path::PathBuf::from("scm:[received]"),
+                kind: if kind == libc::S_IFDIR {
+                    RootFsEntryKind::Directory
+                } else {
+                    RootFsEntryKind::File
+                },
+                mode: (st.st_mode & 0o7777) as u32,
+                size: st.st_size.max(0) as usize,
+            };
+            OpenDescription::HostFile {
+                host_fd,
+                metadata,
+                writable: true,
+                base: OpenDescriptionBase::new(0),
+            }
+        };
+        let open_file = OpenFile::with_host_fd(Arc::new(RwLock::new(description)), 0, host_fd);
+        self.install_fd_at_or_above(3, open_file).ok()
+    }
+
     /// Pull a (host_fd, family) pair out of the dispatcher's fd table.
     fn host_socket_lookup(&self, fd: i32) -> Result<(i32, i32), i32> {
         let Some(open_file) = self.open_file(fd) else {
@@ -2058,6 +2149,31 @@ impl SyscallDispatcher {
                 Ok(bytes) => bytes,
                 Err(errno) => return Ok(errno.into()),
             };
+            // For an AF_UNIX PATHNAME socket, capture the GUEST sun_path now
+            // (while we still hold the memory borrow) so that — after a
+            // successful host bind — we can materialise a stat-able S_IFSOCK
+            // node at that guest path in the overlay. Linux creates a real
+            // socket node on bind; carrick binds the host socket at a HASHED
+            // host path, so without this a stat/os.path.exists/chmod/unlink of
+            // the guest path is ENOENT (multiprocessing forkserver chmods its
+            // listener → crash). Abstract-namespace (leading NUL) and autobind
+            // sockets have no fs node, so are excluded.
+            let guest_unix_path: Option<String> = if family == libc::AF_UNIX {
+                memory.read_bytes(addr_addr, addrlen as usize).ok().and_then(|raw| {
+                    if raw.len() > 2 && raw[2] != 0 {
+                        let nul = raw[2..]
+                            .iter()
+                            .position(|&b| b == 0)
+                            .map(|p| 2 + p)
+                            .unwrap_or(raw.len());
+                        std::str::from_utf8(&raw[2..nul]).ok().map(|s| s.to_string())
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                None
+            };
             // AF_UNIX pathname sockets are bound at a stable host path (see
             // unix_socket_host_path). The guest's unlink only tombstones a VFS
             // overlay entry, so it can't clear a real host socket left by a
@@ -2087,11 +2203,22 @@ impl SyscallDispatcher {
                     host_addr.len() as u32,
                 )
             };
-            Ok(if let Err(errno) = rc.host_syscall_errno() {
-                DispatchOutcome::errno(errno)
-            } else {
-                DispatchOutcome::Returned { value: 0 }
-            })
+            if let Err(errno) = rc.host_syscall_errno() {
+                return Ok(DispatchOutcome::errno(errno));
+            }
+            // Bind succeeded. Materialise the guest-facing S_IFSOCK node at the
+            // resolved guest path. Linux applies the umask to 0o777 for the
+            // socket node's permission bits (verified vs Docker: umask 022 →
+            // 0o755). Best-effort: a failure here doesn't undo the host bind
+            // (the socket still works), it only means stat won't see the node.
+            if let Some(gp) = guest_unix_path
+                && let Ok(resolved) = this.resolve_at_path(LINUX_AT_FDCWD, &gp)
+            {
+                let umask = this.cred_snapshot().umask & 0o777;
+                let mode = 0o777 & !umask;
+                let _ = this.fs.rootfs_vfs.overlay.create_socket(&resolved, mode);
+            }
+            Ok(DispatchOutcome::Returned { value: 0 })
 
         }
 
@@ -2578,6 +2705,50 @@ impl SyscallDispatcher {
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 }
             }
+            // SO_DOMAIN / SO_PROTOCOL are Linux-only getsockopt options with no
+            // macOS equivalent (the generic host path would ENOPROTOOPT). Answer
+            // from carrick's per-fd bookkeeping. CPython's
+            // `socket.socket(fileno=fd)` queries SO_PROTOCOL to reconstruct an
+            // inherited socket (the multiprocessing forkserver path); without
+            // this it raised OSError(ENOPROTOOPT) and the forkserver child died.
+            // SO_DOMAIN → the guest address family (stored as the Linux value at
+            // socket() time). SO_PROTOCOL → 0 (the default/unspecified protocol,
+            // exactly what Linux reports for AF_UNIX and a default AF_INET TCP/UDP
+            // socket, which is what the forkserver reconstruct expects).
+            if level == LINUX_SOL_SOCKET
+                && (optname == crate::linux_abi::LINUX_SO_DOMAIN
+                    || optname == crate::linux_abi::LINUX_SO_PROTOCOL)
+            {
+                let (_host_fd, family) = match this.host_socket_lookup(fd) {
+                    Ok(t) => t,
+                    Err(errno) => return Ok(errno.into()),
+                };
+                let val: i32 = if optname == crate::linux_abi::LINUX_SO_DOMAIN {
+                    family
+                } else {
+                    0
+                };
+                // Honor the guest's optlen (it offers 4; clamp defensively).
+                let guest_optlen = match memory.read_bytes(optlen_addr, 4) {
+                    Ok(b) => u32::from_ne_bytes([b[0], b[1], b[2], b[3]]),
+                    Err(_) => return Ok(LINUX_EFAULT.into()),
+                };
+                let bytes = val.to_ne_bytes();
+                let n = (guest_optlen as usize).min(bytes.len());
+                if optval_addr != 0
+                    && n > 0
+                    && memory.write_bytes(optval_addr, &bytes[..n]).is_err()
+                {
+                    return Ok(LINUX_EFAULT.into());
+                }
+                if memory
+                    .write_bytes(optlen_addr, &(n as u32).to_ne_bytes())
+                    .is_err()
+                {
+                    return Ok(LINUX_EFAULT.into());
+                }
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            }
             // SO_RCVTIMEO/SO_SNDTIMEO readback: the set side stores these per
             // open-file-description and bypasses the (dead) host fd, so the
             // generic path below would read back {0,0}. Answer from the stored
@@ -2881,34 +3052,56 @@ impl SyscallDispatcher {
                 Err(errno) => return Ok(errno.into()),
             }
         };
+        // SCM_RIGHTS ancillary data (passing fds over AF_UNIX). Read the guest's
+        // Linux-layout control buffer, extract the guest fds, map each to its
+        // backing host fd, and build a host-layout control buffer for the real
+        // sendmsg. This is the multiprocessing forkserver's fd-handoff path.
+        let mut host_control: Vec<u8> = Vec::new();
+        if msg.control != 0 && msg.controllen > 0 {
+            let raw = match memory.read_bytes(msg.control, msg.controllen as usize) {
+                Ok(b) => b,
+                Err(_) => return Ok(LINUX_EFAULT.into()),
+            };
+            let guest_fds = parse_linux_scm_rights_fds(&raw);
+            if !guest_fds.is_empty() {
+                let mut host_fds = Vec::with_capacity(guest_fds.len());
+                for gfd in &guest_fds {
+                    match self.host_fd_for_scm(*gfd) {
+                        Some(h) => host_fds.push(h),
+                        // A passed fd with no backing host fd can't cross the
+                        // socket → EBADF, matching Linux's rejection of an
+                        // invalid fd in an SCM_RIGHTS array.
+                        None => return Ok(LINUX_EBADF.into()),
+                    }
+                }
+                host_control = build_host_scm_rights(&host_fds);
+            }
+        }
         let nonblocking = self.io_is_nonblocking(fd, flags);
         let host_flags = linux_to_host_msg_flags(flags) | libc::MSG_DONTWAIT;
         let send_to = self
             .open_file(fd)
             .and_then(|f| f.description.read().send_timeout());
         let outcome = self.blocking_io(host_fd, IoDir::Write, nonblocking, send_to, || {
-            let n = match &host_addr {
-                None => unsafe {
-                    libc::sendto(
-                        host_fd,
-                        data.as_ptr() as *const _,
-                        data.len(),
-                        host_flags,
-                        std::ptr::null(),
-                        0,
-                    )
-                },
-                Some(a) => unsafe {
-                    libc::sendto(
-                        host_fd,
-                        data.as_ptr() as *const _,
-                        data.len(),
-                        host_flags,
-                        a.as_ptr() as *const _,
-                        a.len() as u32,
-                    )
-                },
+            // Use a real sendmsg so the host control buffer (SCM_RIGHTS) is
+            // delivered. A single iovec over the assembled `data` is fine —
+            // the byte stream is identical to the guest's scattered iovecs.
+            let mut hiov = libc::iovec {
+                iov_base: data.as_ptr() as *mut libc::c_void,
+                iov_len: data.len(),
             };
+            let mut hmsg: libc::msghdr = unsafe { std::mem::zeroed() };
+            if let Some(a) = &host_addr {
+                hmsg.msg_name = a.as_ptr() as *mut libc::c_void;
+                hmsg.msg_namelen = a.len() as libc::socklen_t;
+            }
+            hmsg.msg_iov = &mut hiov as *mut _;
+            hmsg.msg_iovlen = 1;
+            if !host_control.is_empty() {
+                hmsg.msg_control = host_control.as_ptr() as *mut libc::c_void;
+                hmsg.msg_controllen = host_control.len() as _;
+            }
+            let n = unsafe { libc::sendmsg(host_fd, &hmsg as *const _, host_flags) };
             n.host_syscall_errno().map(|value| value as i64)
         });
         Ok(outcome)
@@ -2984,9 +3177,28 @@ impl SyscallDispatcher {
         let recv_to = self
             .open_file(fd)
             .and_then(|f| f.description.read().recv_timeout());
+        let want_control = msg.control != 0 && msg.controllen > 0;
+        // SCM_RIGHTS host fds received this call, ferried out of the I/O closure
+        // (which may run on a retry) so they're installed/written-back exactly
+        // once after a successful recvmsg. Same for the guest msg_flags.
+        let received_host_fds = std::cell::RefCell::new(Vec::<i32>::new());
+        let guest_msg_flags = std::cell::Cell::new(0i32);
         let outcome = self.blocking_io(host_fd, IoDir::Read, nonblocking, recv_to, || {
+            // A retry must not leak fds from a prior partial attempt.
+            for stale in received_host_fds.borrow_mut().drain(..) {
+                unsafe { libc::close(stale) };
+            }
             let mut buf = vec![0u8; total];
             let mut sa = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
+            // A host control buffer sized to hold the guest's requested
+            // controllen (SCM_RIGHTS fd array). CMSG_SPACE for that many fds is
+            // >= the Linux size, so this never under-provisions.
+            let mut hcontrol: Vec<u8> = if want_control {
+                let max_fds = (msg.controllen as usize / 4).max(1);
+                vec![0u8; unsafe { libc::CMSG_SPACE((max_fds * 4) as u32) } as usize]
+            } else {
+                Vec::new()
+            };
             // Use the host recvmsg (not recvfrom) so the kernel can report
             // MSG_TRUNC/MSG_CTRUNC/MSG_EOR in the returned msg_flags. macOS/XNU
             // sets MSG_TRUNC on truncated atomic (PR_ATOMIC) records exactly
@@ -3002,9 +3214,18 @@ impl SyscallDispatcher {
             }
             hmsg.msg_iov = &mut hiov as *mut _;
             hmsg.msg_iovlen = 1; // c_int on macOS
-            // msg_control stays null / controllen 0 (we model no ancillary data).
+            if !hcontrol.is_empty() {
+                hmsg.msg_control = hcontrol.as_mut_ptr() as *mut libc::c_void;
+                hmsg.msg_controllen = hcontrol.len() as _;
+            }
             let n = unsafe { libc::recvmsg(host_fd, &mut hmsg as *mut _, host_flags) };
             let n = n.host_syscall_errno()?;
+            // Stash any received fds (host-layout cmsg) for installation after
+            // the closure returns; the guest-facing rewrite happens below.
+            if want_control && hmsg.msg_controllen as usize > 0 {
+                let got = parse_host_scm_rights_fds(&hcontrol, hmsg.msg_controllen as usize);
+                *received_host_fds.borrow_mut() = got;
+            }
             // Scatter the received bytes back into the guest's iovecs.
             let mut remaining = n as usize;
             let mut cursor = 0usize;
@@ -3043,23 +3264,47 @@ impl SyscallDispatcher {
                     return Err(LINUX_EFAULT);
                 }
             }
-            // No ancillary-data translation; controllen stays 0. But the host
-            // recvmsg's msg_flags (MSG_TRUNC etc.) must propagate to the guest.
-            if memory
-                .write_bytes(msg_addr + 40, &0u64.to_ne_bytes())
-                .is_err()
-            {
-                return Err(LINUX_EFAULT);
-            }
-            let linux_flags = host_to_linux_msg_flags(hmsg.msg_flags);
-            if memory
-                .write_bytes(msg_addr + 48, &linux_flags.to_ne_bytes())
-                .is_err()
-            {
-                return Err(LINUX_EFAULT);
-            }
+            // Remember the host msg_flags; the guest controllen + final flags
+            // (incl. a possible MSG_CTRUNC) are written after fd install below.
+            guest_msg_flags.set(host_to_linux_msg_flags(hmsg.msg_flags));
             Ok(n as i64)
         });
+        // Install any received fds as fresh guest fds, then write the guest
+        // (Linux-layout) control buffer + the controllen/flags fields. Done
+        // OUTSIDE the I/O closure so it happens exactly once on success.
+        let host_fds: Vec<i32> = received_host_fds.borrow_mut().drain(..).collect();
+        if matches!(outcome, DispatchOutcome::Returned { value } if value >= 0) {
+            let mut guest_fds = Vec::with_capacity(host_fds.len());
+            for hfd in host_fds {
+                match self.install_received_host_fd(hfd) {
+                    Some(gfd) => guest_fds.push(gfd),
+                    None => unsafe {
+                        libc::close(hfd);
+                    },
+                }
+            }
+            let mut linux_flags = guest_msg_flags.get();
+            let mut written_controllen = 0u64;
+            if want_control {
+                let (ctrl, truncated) = build_linux_scm_rights(&guest_fds, msg.controllen as usize);
+                if !ctrl.is_empty() && memory.write_bytes(msg.control, &ctrl).is_err() {
+                    return Ok(LINUX_EFAULT.into());
+                }
+                written_controllen = ctrl.len() as u64;
+                if truncated {
+                    linux_flags |= crate::linux_abi::LINUX_MSG_CTRUNC as i32;
+                }
+            }
+            // controllen at offset 40, flags at offset 48 in LinuxMsghdr.
+            let _ = memory.write_bytes(msg_addr + 40, &written_controllen.to_ne_bytes());
+            let _ = memory.write_bytes(msg_addr + 48, &linux_flags.to_ne_bytes());
+        } else {
+            // Error/would-block: nothing received, so close any stray fds and
+            // leave the guest msghdr's controllen/flags zeroed.
+            for hfd in host_fds {
+                unsafe { libc::close(hfd) };
+            }
+        }
         Ok(outcome)
     }
 }

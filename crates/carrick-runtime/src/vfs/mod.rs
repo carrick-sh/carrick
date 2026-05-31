@@ -77,6 +77,9 @@ pub enum EntryKind {
     CharDevice,
     /// Named pipe (FIFO). Maps to/from [`crate::rootfs::RootFsEntryKind::Fifo`].
     Fifo,
+    /// AF_UNIX socket node materialised by `bind(2)`. Maps to/from
+    /// [`crate::rootfs::RootFsEntryKind::Socket`].
+    Socket,
 }
 
 /// Per-entry metadata. Mode is the permission bits only (the
