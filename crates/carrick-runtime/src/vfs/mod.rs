@@ -68,6 +68,28 @@ use std::path::PathBuf;
 /// errno values without going through a translation layer.
 pub type VfsError = i32;
 
+#[derive(Debug)]
+pub struct WatchFd {
+    pub host_fd: i32,
+    pub name: Option<Vec<u8>>,
+}
+
+impl WatchFd {
+    pub(crate) fn unnamed(host_fd: i32) -> Self {
+        Self {
+            host_fd,
+            name: None,
+        }
+    }
+
+    pub(crate) fn named(host_fd: i32, name: Vec<u8>) -> Self {
+        Self {
+            host_fd,
+            name: Some(name),
+        }
+    }
+}
+
 /// Kind of an entry at a path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryKind {
@@ -223,6 +245,15 @@ pub trait Vfs: Send + Sync {
         _ctx: &OpenContext<'_>,
     ) -> Result<VfsHandle, VfsError> {
         Err(crate::linux_abi::LINUX_ENOSYS)
+    }
+
+    fn watch_fd(&self, _path: &str) -> Result<i32, VfsError> {
+        Err(crate::linux_abi::LINUX_ENOSYS)
+    }
+
+    fn watch_fds(&self, path: &str) -> Result<Vec<WatchFd>, VfsError> {
+        self.watch_fd(path)
+            .map(|host_fd| vec![WatchFd::unnamed(host_fd)])
     }
 
     fn mkdir(&self, _path: &str, _mode: u32) -> Result<(), VfsError> {

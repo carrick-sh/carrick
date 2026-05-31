@@ -1343,6 +1343,22 @@ impl SyscallDispatcher {
             return Ok(LINUX_EROFS.into());
         }
         let no_replace = flags & RENAME_NOREPLACE != 0;
+        let old_is_vfs_mount = self.fs.vfs_mounts.resolve(&resolved_old).is_some();
+        if let Some(mnew) = self.fs.vfs_mounts.resolve(&resolved_new) {
+            if !old_is_vfs_mount {
+                return Ok(crate::linux_abi::LINUX_EXDEV.into());
+            }
+            if no_replace && mnew.vfs.lookup(&mnew.full_path).is_ok() {
+                return Ok(LINUX_EEXIST.into());
+            }
+            return match mnew.vfs.rename(&resolved_old, &mnew.full_path) {
+                Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
+                Err(errno) => Ok(errno.into()),
+            };
+        }
+        if old_is_vfs_mount {
+            return Ok(crate::linux_abi::LINUX_EXDEV.into());
+        }
         match self
             .fs
             .rootfs_vfs
@@ -4434,6 +4450,16 @@ impl SyscallDispatcher {
                 Ok(path) => path,
                 Err(errno) => return Ok(errno.into()),
             };
+            if let Some(m) = this.fs.vfs_mounts.resolve(&path) {
+                return match m.vfs.watch_fds(&m.full_path) {
+                    Ok(watch_fds) => Ok(match state.add_watch_fds(watch_fds, mask as u32) {
+                        Ok(wd) => DispatchOutcome::Returned { value: wd as i64 },
+                        Err(errno) => errno.into(),
+                    }),
+                    Err(errno) if errno == LINUX_ENOSYS => Ok(crate::linux_abi::LINUX_ENOSPC.into()),
+                    Err(errno) => Ok(errno.into()),
+                };
+            }
             // A watchable host vnode comes from the host fs backend; the
             // in-memory backend and directory targets have no host fd to
             // register, so inotify watches require `--fs host` (ENOSPC
@@ -5088,6 +5114,11 @@ impl SyscallDispatcher {
                 // /proc/self/fd/N → the path fd N was opened at. Rosetta readlinks
                 // its main-binary fd this way to recover the binary's path.
                 t
+            } else if let Some(m) = this.fs.vfs_mounts.resolve(&path) {
+                match m.vfs.readlink(&m.full_path) {
+                    Ok(p) => p.to_string_lossy().into_owned(),
+                    Err(errno) => return Ok(errno.into()),
+                }
             } else if let Some(t) = this.fs.rootfs_vfs.overlay.read_link(&path) {
                 // Symlink created in the writable backend (cap-std on --fs host).
                 t
@@ -5256,6 +5287,14 @@ impl SyscallDispatcher {
             };
             if crate::vfs::is_synthetic_virtual_file(&resolved, &this.synthetic_proc_context()) {
                 return Ok(LINUX_EEXIST.into());
+            }
+            if let Some(m) = this.fs.vfs_mounts.resolve(&resolved) {
+                let creds = this.cred_snapshot();
+                let create_mode = (mode as u32 & 0o7777) & !(creds.umask & 0o777);
+                return match m.vfs.mkdir(&m.full_path, create_mode) {
+                    Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
+                    Err(errno) => Ok(errno.into()),
+                };
             }
             // DAC: creating a new entry needs write+search on the parent dir
             // (mkdir04). Only when the target doesn't already exist — an
@@ -5611,6 +5650,12 @@ impl SyscallDispatcher {
             // symlinks today, so we return EROFS.
             if this.layered_metadata(&resolved_link).is_ok() {
                 return Ok(LINUX_EEXIST.into());
+            }
+            if let Some(m) = this.fs.vfs_mounts.resolve(&resolved_link) {
+                return match m.vfs.symlink(&target_path, &m.full_path) {
+                    Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
+                    Err(errno) => Ok(errno.into()),
+                };
             }
             // DAC: creating the symlink entry needs write+search on the parent
             // directory (symlink03 case 1 → EACCES). Root bypasses.
