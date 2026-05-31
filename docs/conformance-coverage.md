@@ -267,6 +267,7 @@ underlying gap got fixed):
 | Invariant | Owned by | Stands in for (LTP) |
 |---|---|---|
 | Raw io_uring_setup → mmap rings → submit (NOP + WRITE + READ + READV) → io_uring_enter → reap CQEs end-to-end | ✅ `iouring` | (io_uring data path; WS-H4-B1) |
+| `io_uring_setup(IORING_SETUP_SQPOLL)` is rejected/unavailable unless a real SQ polling worker exists; a successful setup without SQPOLL servicing can wedge libuv's `_iouring` tests | ✅ `iouringsqpoll` | (io_uring SQPOLL fallback contract; libuv fs `_iouring` path) |
 
 ## LTP framework primitives
 

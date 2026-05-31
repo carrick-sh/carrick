@@ -34,6 +34,7 @@ use zerocopy::{FromBytes, IntoBytes};
 
 const EINVAL: i32 = 22;
 const U32: u32 = 4;
+const SUPPORTED_SETUP_FLAGS: u32 = 0;
 
 /// The byte layout carrick uses for a ring's mmapped regions. The SQ ring and
 /// CQ ring share one mapping (IORING_FEAT_SINGLE_MMAP); the SQE array is a
@@ -251,6 +252,20 @@ impl SyscallDispatcher {
         params_ptr: u64,
     ) -> DispatchOutcome {
         if entries == 0 || entries > 4096 {
+            return DispatchOutcome::errno(LINUX_EINVAL);
+        }
+        let Some(user_params) = memory
+            .read_bytes(params_ptr, core::mem::size_of::<LinuxIoUringParams>())
+            .ok()
+            .and_then(|b| {
+                LinuxIoUringParams::read_from_prefix(&b)
+                    .ok()
+                    .map(|(params, _)| params)
+            })
+        else {
+            return DispatchOutcome::errno(LINUX_EFAULT);
+        };
+        if user_params.flags & !SUPPORTED_SETUP_FLAGS != 0 {
             return DispatchOutcome::errno(LINUX_EINVAL);
         }
         let layout = RingLayout::new(entries);
