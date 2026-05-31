@@ -2520,6 +2520,67 @@ impl SyscallDispatcher {
                         }
                         DispatchOutcome::Returned { value: 0 }
                     }
+                    // ── Line-discipline control (tcdrain/tcflush/tcflow/tcsendbreak) ──
+                    // glibc maps the POSIX tc* helpers onto these ioctls. `arg` here
+                    // is a small integer selector (NOT a guest pointer), so it is
+                    // consumed directly. Darwin has native tcdrain/tcflush/tcflow/
+                    // tcsendbreak; we translate the Linux queue/action selectors to
+                    // the Darwin ones (they differ numerically) inside host_tty.
+                    LINUX_TCSBRK => {
+                        // tcdrain → TCSBRK(arg!=0); tcsendbreak(dur==0) → TCSBRK(0).
+                        // arg==0 sends a break; arg!=0 drains the output queue.
+                        let res = if arg == 0 {
+                            crate::host_tty::with_sigttou_blocked(block_ttou, || {
+                                crate::host_tty::host_tty_tcsendbreak(host_fd, 0)
+                            })
+                        } else {
+                            crate::host_tty::with_sigttou_blocked(block_ttou, || {
+                                crate::host_tty::host_tty_tcdrain(host_fd)
+                            })
+                        };
+                        match res {
+                            Ok(()) => DispatchOutcome::Returned { value: 0 },
+                            Err(e) => DispatchOutcome::errno(
+                                crate::dispatch::macos_to_linux_errno(e),
+                            ),
+                        }
+                    }
+                    LINUX_TCSBRKP => {
+                        // tcsendbreak(duration!=0) → TCSBRKP(duration). arg is the
+                        // duration in deciseconds (Linux semantics); pass through.
+                        match crate::host_tty::with_sigttou_blocked(block_ttou, || {
+                            crate::host_tty::host_tty_tcsendbreak(host_fd, arg as i32)
+                        }) {
+                            Ok(()) => DispatchOutcome::Returned { value: 0 },
+                            Err(e) => DispatchOutcome::errno(
+                                crate::dispatch::macos_to_linux_errno(e),
+                            ),
+                        }
+                    }
+                    LINUX_TCFLSH => {
+                        // tcflush → TCFLSH(queue). host_tty_tcflush validates the
+                        // Linux selector and returns EINVAL for out-of-range values
+                        // (mirroring Linux's TCFLSH validation).
+                        match crate::host_tty::host_tty_tcflush(host_fd, arg as i64) {
+                            Ok(()) => DispatchOutcome::Returned { value: 0 },
+                            Err(e) => DispatchOutcome::errno(
+                                crate::dispatch::macos_to_linux_errno(e),
+                            ),
+                        }
+                    }
+                    LINUX_TCXONC => {
+                        // tcflow → TCXONC(action). host_tty_tcflow validates the
+                        // Linux action selector and returns EINVAL for out-of-range
+                        // values (mirroring Linux's TCXONC validation).
+                        match crate::host_tty::with_sigttou_blocked(block_ttou, || {
+                            crate::host_tty::host_tty_tcflow(host_fd, arg as i64)
+                        }) {
+                            Ok(()) => DispatchOutcome::Returned { value: 0 },
+                            Err(e) => DispatchOutcome::errno(
+                                crate::dispatch::macos_to_linux_errno(e),
+                            ),
+                        }
+                    }
                     _ => {
                         cx.reporter
                             .record(CompatEvent::unhandled_ioctl(fd.0, ioctl_request, arg));

@@ -1681,6 +1681,22 @@ pub const LINUX_TCGETS: u64 = 0x5401;
 pub const LINUX_TCSETS: u64 = 0x5402;
 pub const LINUX_TCSETSW: u64 = 0x5403;
 pub const LINUX_TCSETSF: u64 = 0x5404;
+// Line-discipline control ioctls (tty_ioctl(4)). glibc maps the tc* helpers
+// onto these: tcdrain → TCSBRK(arg=1), tcsendbreak(dur!=0) → TCSBRKP,
+// tcflush → TCFLSH(queue), tcflow → TCXONC(action).
+pub const LINUX_TCSBRK: u64 = 0x5409;
+pub const LINUX_TCXONC: u64 = 0x540A;
+pub const LINUX_TCFLSH: u64 = 0x540B;
+pub const LINUX_TCSBRKP: u64 = 0x5425;
+// TCXONC actions (tcflow): suspend/resume output/input.
+pub const LINUX_TCOOFF: u64 = 0;
+pub const LINUX_TCOON: u64 = 1;
+pub const LINUX_TCIOFF: u64 = 2;
+pub const LINUX_TCION: u64 = 3;
+// TCFLSH queue selectors (tcflush): discard input/output/both.
+pub const LINUX_TCIFLUSH: u64 = 0;
+pub const LINUX_TCOFLUSH: u64 = 1;
+pub const LINUX_TCIOFLUSH: u64 = 2;
 pub const LINUX_TIOCSCTTY: u64 = 0x540E;
 pub const LINUX_TIOCGPGRP: u64 = 0x540F;
 pub const LINUX_TIOCSPGRP: u64 = 0x5410;
