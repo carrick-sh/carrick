@@ -1028,6 +1028,8 @@ fn linux_madvise_advice_is_supported(advice: u64) -> bool {
             | LINUX_MADV_WILLNEED
             | LINUX_MADV_DONTNEED
             | LINUX_MADV_FREE
+            | LINUX_MADV_DONTFORK
+            | LINUX_MADV_DOFORK
             // THP hints: advisory, accepted as a success no-op (see the abi
             // constants). carrick can't promote to huge pages, but neither must
             // it reject the hint — real Linux with THP built in returns 0.

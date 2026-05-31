@@ -129,12 +129,12 @@ fn with_el1_vectors_installs_hvc_then_eret_at_lower_el_sync_slot() {
         .find(|r| r.start == LINUX_EL1_VECTORS_BASE)
         .expect("EL1 vector region must be present");
     // Lower-EL/AArch64 synchronous slot is at offset 0x400. We expect
-    // `hvc #0` (0xd4000002) followed by `eret` (0xd69f03e0), both stored
+    // `hvc #2` (0xd4000042) followed by `eret` (0xd69f03e0), both stored
     // little-endian.
     let bytes = region.bytes();
     assert_eq!(
         &bytes[0x400..0x408],
-        &[0x02, 0x00, 0x00, 0xd4, 0xe0, 0x03, 0x9f, 0xd6],
+        &[0x42, 0x00, 0x00, 0xd4, 0xe0, 0x03, 0x9f, 0xd6],
     );
     // Slot 0x000 ("Current EL with SP0, sync") is a bare eret — first
     // four bytes are the eret opcode.

@@ -1617,6 +1617,11 @@ pub const LINUX_MADV_SEQUENTIAL: u64 = 2;
 pub const LINUX_MADV_WILLNEED: u64 = 3;
 pub const LINUX_MADV_DONTNEED: u64 = 4;
 pub const LINUX_MADV_FREE: u64 = 8;
+// Fork-inheritance hints. Carrick does not currently clone by inheriting host
+// VM mappings directly, so the host-side VMA flag has no implementation work to
+// do here; Linux still accepts these advisory hints as successful madvise calls.
+pub const LINUX_MADV_DONTFORK: u64 = 10;
+pub const LINUX_MADV_DOFORK: u64 = 11;
 // Transparent-huge-page advisory hints. carrick presents 4 KiB guest pages and
 // cannot promote a range to a huge page, but these advices are purely advisory:
 // real Linux returns 0 for them whenever THP is built in (the common
