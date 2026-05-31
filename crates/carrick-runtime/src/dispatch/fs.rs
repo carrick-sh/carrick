@@ -4543,6 +4543,9 @@ impl SyscallDispatcher {
                 Ok(path) => path,
                 Err(errno) => return Ok(errno.into()),
             };
+            if path.is_empty() {
+                return Ok(LINUX_ENOENT.into());
+            }
             let path = match this.resolve_at_path(LINUX_AT_FDCWD, &path) {
                 Ok(path) => path,
                 Err(errno) => return Ok(errno.into()),

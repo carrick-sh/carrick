@@ -1828,6 +1828,19 @@ fn inotify_init_add_watch_read_dispatch_plumbing() {
         DispatchOutcome::Errno { errno: 2 }
     );
 
+    // add_watch on an empty path -> ENOENT (2); unlike fstatat-style metadata
+    // syscalls, inotify_add_watch has no AT_EMPTY_PATH form.
+    memory.write_bytes(0x4300, b"\0").unwrap();
+    assert_eq!(
+        run(
+            &mut dispatcher,
+            &mut memory,
+            27,
+            [ifd, 0x4300, IN_MODIFY, 0, 0, 0]
+        ),
+        DispatchOutcome::Errno { errno: 2 }
+    );
+
     // rm_watch of an unknown wd -> EINVAL (22).
     assert_eq!(
         run(&mut dispatcher, &mut memory, 28, [ifd, 99, 0, 0, 0, 0]),
