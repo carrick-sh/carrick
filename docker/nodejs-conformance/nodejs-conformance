@@ -247,7 +247,18 @@ run_libuv() {
   mkdir -p "$tmp/home" "$tmp/tmp"
   cp -R /opt/libuv-src/test "$tmp/test"
   chown -R 1000:1000 "$tmp"
-  local args=(setpriv --reuid=1000 --regid=1000 --init-groups env HOME="$tmp/home" TMPDIR="$tmp/tmp" LIBUV_TEST_ROOT="$tmp" LIBUV_TEST_BIN="$uv_bin" /bin/bash -lc 'cd "$LIBUV_TEST_ROOT" && exec "$LIBUV_TEST_BIN" "$@"' libuv-run)
+  local args=(python3 -c '
+import os
+import sys
+
+root, binary = sys.argv[1], sys.argv[2]
+os.environ["HOME"] = os.path.join(root, "home")
+os.environ["TMPDIR"] = os.path.join(root, "tmp")
+os.chdir(root)
+os.setgid(1000)
+os.setuid(1000)
+os.execv(binary, [binary] + sys.argv[3:])
+' "$tmp" "$uv_bin")
   [[ -z "$filter" ]] || args+=("$filter")
   run_logged libuv "${args[@]}"
 }
