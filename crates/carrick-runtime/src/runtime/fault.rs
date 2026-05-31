@@ -102,6 +102,15 @@ pub(super) fn deliver_fault_signal(
     } else {
         return terminate(11);
     };
+    // TEMP fault-trace (gated): fires AFTER the fault on the delivery path, so it
+    // captures faults the auto-sudo dtrace path masks (e.g. the non-root,
+    // under-load manythreads SEGV). Remove once the concurrency SEGV is rooted.
+    if std::env::var_os("CARRICK_FAULT_DEBUG").is_some() {
+        eprintln!(
+            "[FAULTDBG tid={this_tid:?}] esr={esr:#x} ec={:#x} elr={elr:#x} far={far:#x} signum={signum} si_addr={si_addr:#x}",
+            (esr >> 26) & 0x3f
+        );
+    }
     crate::probes::signal_deliver(this_tid, signum);
 
     // A synchronous fault with the signal blocked, or no handler installed,
