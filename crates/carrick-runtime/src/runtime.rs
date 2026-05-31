@@ -2096,12 +2096,15 @@ fn run_vcpu_until_exit(
                         );
                     }
                     // exit_group, or exit(2) as the last live thread. Tear the
-                    // whole process down. For the main thread we return a
-                    // RunResult; siblings just terminate the process.
+                    // whole process down. A plain exit(2) with live siblings is
+                    // routed as ThreadExit before this branch, so Exit + !last
+                    // means process-wide termination even when the caller is
+                    // the main guest thread.
                     let last = state.registry.exit(state.this_tid);
-                    if !last && state.this_tid != (std::process::id() as ThreadId) {
-                        // A sibling ran exit_group(94): flush shared buffers and
-                        // terminate the entire process (other threads share it).
+                    if !last {
+                        // exit_group(94) or fatal process termination: flush
+                        // shared buffers and terminate the entire host process
+                        // because other guest threads share the address space.
                         let _ = std::io::Write::flush(&mut std::io::stdout());
                         let _ = std::io::Write::flush(&mut std::io::stderr());
                         let out = kernel.dispatcher.stdout();
