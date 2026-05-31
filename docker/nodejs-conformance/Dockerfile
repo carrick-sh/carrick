@@ -34,8 +34,7 @@ RUN set -eux; \
       ca-certificates git curl xz-utils \
       python3 python-is-python3 make gcc g++ pkg-config perl \
       cmake ninja-build autoconf automake libtool; \
-    rm -rf /var/lib/apt/lists/*; \
-    useradd --create-home --uid 1000 --user-group --shell /usr/sbin/nologin nodeconf
+    rm -rf /var/lib/apt/lists/*
 
 RUN set -eux; \
     mkdir -p /opt/node-src /opt/nodejs-conformance/bin; \
@@ -72,6 +71,7 @@ COPY nodejs-conformance /usr/local/bin/nodejs-conformance
 COPY fixtures /opt/nodejs-conformance/fixtures
 
 RUN set -eux; \
+    useradd --create-home --uid 1000 --user-group --shell /usr/sbin/nologin nodeconf; \
     chmod +x /usr/local/bin/nodejs-conformance; \
     /opt/nodejs-conformance/bin/node24 --version; \
     /opt/nodejs-conformance/bin/node26 --version; \
