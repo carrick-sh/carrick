@@ -135,14 +135,14 @@ run_carrick_host() {
   [[ -n "$carrick_bin" && -x "$carrick_bin" ]] || die "carrick binary not found; set CARRICK_BIN or build target/release/carrick"
 
   local run_id="${CARRICK_RUN_ID:-nodejs-conf-$$}"
-  local args=(run --raw -e NODEJS_CONFORMANCE_IN_IMAGE=1 -e NODEJS_CONFORMANCE_EFFECTIVE_RUNNER=carrick)
+  local args=(run --raw --entrypoint /bin/bash -e NODEJS_CONFORMANCE_IN_IMAGE=1 -e NODEJS_CONFORMANCE_EFFECTIVE_RUNNER=carrick)
   local inner_jsonl="$jsonl"
   if path="$(jsonl_abs)"; then
     mkdir -p "$(dirname "$path")"
     args+=(-v "$(dirname "$path"):$(dirname "$path")")
     inner_jsonl="$path"
   fi
-  args+=("$image" --runner docker --suite "$suite" --line "$line" --timeout "$timeout_s")
+  args+=("$image" /usr/local/bin/nodejs-conformance --runner docker --suite "$suite" --line "$line" --timeout "$timeout_s")
   [[ -z "$filter" ]] || args+=(--filter "$filter")
   [[ -z "$inner_jsonl" ]] || args+=(--jsonl "$inner_jsonl")
   [[ "$smoke" -eq 0 ]] || args+=(--smoke)
@@ -242,7 +242,10 @@ run_libuv() {
   local uv_bin
   uv_bin="$(libuv_test_bin)"
   [[ -n "$uv_bin" ]] || die "libuv test binary not found"
-  local args=("$uv_bin")
+  local tmp
+  tmp="$(mktemp -d /tmp/nodejs-libuv.XXXXXX)"
+  chown 1000:1000 "$tmp"
+  local args=(setpriv --reuid=1000 --regid=1000 --init-groups env HOME="$tmp" TMPDIR="$tmp" "$uv_bin")
   [[ -z "$filter" ]] || args+=("$filter")
   run_logged libuv "${args[@]}"
 }
@@ -257,7 +260,9 @@ run_npm_smoke() {
   local tmp
   tmp="$(mktemp -d /tmp/nodejs-npm-smoke.XXXXXX)"
   cp -R "$fixtures/npm-smoke" "$tmp/pkg"
-  run_logged npm-smoke env HOME="$tmp/home" npm_config_cache="$tmp/cache" "$node_bin" "$npm_cli" --prefix "$tmp/pkg" run smoke
+  mkdir -p "$tmp/bin" "$tmp/home" "$tmp/cache"
+  ln -sf "$node_bin" "$tmp/bin/node"
+  run_logged npm-smoke env HOME="$tmp/home" npm_config_cache="$tmp/cache" PATH="$tmp/bin:$PATH" "$node_bin" "$npm_cli" --prefix "$tmp/pkg" run smoke
 }
 
 run_app_smoke() {
@@ -278,7 +283,7 @@ suite_list() {
 }
 
 overall=0
-while IFS= read -r selected; do
+for selected in $(suite_list); do
   case "$selected" in
     node-core) run_node_core || overall=1 ;;
     libuv) run_libuv || overall=1 ;;
@@ -287,6 +292,6 @@ while IFS= read -r selected; do
     app-smoke) run_app_smoke || overall=1 ;;
     *) die "internal suite dispatch error: $selected" ;;
   esac
-done < <(suite_list)
+done
 
 exit "$overall"
