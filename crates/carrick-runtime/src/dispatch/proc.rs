@@ -37,9 +37,7 @@ fn sched_pid_is_self<M: GuestMemory>(cx: &SyscallCtx<'_, M>, pid: u64) -> bool {
     pid == 0
         || pid == std::process::id() as u64
         || pid == LINUX_BOOTSTRAP_PID as u64
-        || cx
-            .thread
-            .is_some_and(|thread| pid == thread.tid as u64)
+        || cx.thread.is_some_and(|thread| pid == thread.tid as u64)
 }
 
 /// True when `pid` names a live sibling thread in this Carrick guest process.
@@ -272,11 +270,24 @@ impl SyscallDispatcher {
         std::process::id() != self.proc.lock().bootstrap_host_pid
     }
 
-    /// Resolve an affinity pid argument. 0 or our own pid is `SelfProc`; any
-    /// other thread/process in the guest tree is `OtherGuest`; anything else
-    /// is `NotFound` (ESRCH).
-    fn resolve_affinity_target(&self, pid: u64) -> AffinityTarget {
+    /// Resolve an affinity pid argument. 0 or our own pid is `SelfProc`; a live
+    /// sibling guest thread is also `SelfProc` (carrick keeps a single
+    /// per-process affinity mask, so a sibling's affinity IS the process
+    /// affinity — and `sched_getaffinity`/`setaffinity` accept a thread tid,
+    /// like sched_getscheduler/getparam already do); any other thread/process
+    /// in the guest tree is `OtherGuest`; anything else is `NotFound` (ESRCH).
+    fn resolve_affinity_target<M: GuestMemory>(
+        &self,
+        cx: &SyscallCtx<M>,
+        pid: u64,
+    ) -> AffinityTarget {
         if pid == 0 || pid == std::process::id() as u64 {
+            AffinityTarget::SelfProc
+        } else if cx
+            .thread
+            .as_ref()
+            .is_some_and(|t| t.registry.is_live(pid as crate::thread::ThreadId))
+        {
             AffinityTarget::SelfProc
         } else if crate::host_proc::is_guest_process(pid as u32) {
             AffinityTarget::OtherGuest
@@ -729,11 +740,13 @@ impl SyscallDispatcher {
 
         fn sched_getaffinity(this, cx, pid: u64, size: u64, address: GuestPtr) {
             let size = size as usize;
-            let memory = &mut *cx.memory;
 
-            if matches!(this.resolve_affinity_target(pid), AffinityTarget::NotFound) {
+            // Resolve the target BEFORE borrowing cx.memory (resolve reads
+            // cx.thread; the mutable memory borrow below would otherwise alias).
+            if matches!(this.resolve_affinity_target(cx, pid), AffinityTarget::NotFound) {
                 return Ok(LINUX_ESRCH.into());
             }
+            let memory = &mut *cx.memory;
             let kernel_bytes = crate::host_facts::logical_cpu_count().div_ceil(64) * 8;
             if size < kernel_bytes {
                 return Ok(LINUX_EINVAL.into());
@@ -757,7 +770,7 @@ impl SyscallDispatcher {
                 Ok(bytes) => bytes,
                 Err(_) => return Ok(LINUX_EFAULT.into()),
             };
-            let target = this.resolve_affinity_target(pid);
+            let target = this.resolve_affinity_target(cx, pid);
             if matches!(target, AffinityTarget::NotFound) {
                 return Ok(LINUX_ESRCH.into());
             }
