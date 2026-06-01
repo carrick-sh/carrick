@@ -99,7 +99,18 @@ impl Runtime {
         // pids, and an ns-filtered /proc — the headline docker-run behavior
         // (docs/namespaces-design.md §1.0, §5.2). `run-elf` bypasses
         // Runtime::execute entirely, so it stays in the identity namespace.
-        crate::namespace::pid::request();
+        //
+        // The forking NsSupervisor (orphan reaping + teardown) is enabled only
+        // for STREAMING output paths (raw / tty), where the guest writes to
+        // inherited fds: the supervisor becomes the fork parent and returns the
+        // run result, which carries no buffered stdout/stderr. The default
+        // buffered JSON-envelope path keeps the guest in-process (translation
+        // still works) so its captured output is returned as before.
+        if spec.raw || spec.tty {
+            crate::namespace::pid::request_supervisor();
+        } else {
+            crate::namespace::pid::request();
+        }
         // Name the host process `carrick: <basename>` up front so
         // it's identifiable in ps/Activity Monitor even before the
         // guest sets its own comm via prctl.
