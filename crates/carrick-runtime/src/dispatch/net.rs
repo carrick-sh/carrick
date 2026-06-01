@@ -3274,6 +3274,14 @@ impl SyscallDispatcher {
                 }
                 host_control = build_host_scm_rights(&host_fds);
             }
+            // IPv6 ancillary cmsgs set on send (IPV6_HOPLIMIT/TCLASS): translate
+            // the guest's Linux cmsg types → macOS and append a host-layout
+            // record so the kernel applies them (CPython testSetHopLimit /
+            // testSetTrafficClassAndHopLimit). recvmsg translates them back.
+            let ipv6 = parse_guest_ipv6_cmsgs(&raw);
+            if !ipv6.is_empty() {
+                host_control.extend_from_slice(&build_host_ipv6_cmsgs(&ipv6));
+            }
         }
         let nonblocking = self.io_is_nonblocking(fd, flags);
         let host_flags = linux_to_host_msg_flags(flags) | libc::MSG_DONTWAIT;
