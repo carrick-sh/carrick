@@ -1,6 +1,7 @@
 //! Filesystem and I/O state owned by the syscall dispatcher.
 
 use super::super::*;
+use std::sync::atomic::AtomicU64;
 
 /// Owned filesystem-subsystem state. Split out of `SyscallDispatcher` so
 /// the fs handlers borrow only the VFS state they touch instead of the
@@ -64,7 +65,18 @@ pub(in crate::dispatch) struct IoState {
     /// than an `OpenDescription` variant so io_uring needs no new arm across the
     /// ~24 fd match sites; `mmap`/`io_uring_enter` look the ring up here.
     pub io_uring_instances: RwLock<HashMap<i32, crate::dispatch::ioring::IoUringState>>,
+    /// Guest soft RLIMIT_NOFILE: the highest fd the allocator hands out
+    /// (`fd < nofile_soft`). Linux default 1024; a guest may raise it via
+    /// setrlimit/prlimit64 (libuv's TEST_FILE_LIMIT does). Lock-free so the fd
+    /// allocator can read it while holding open_files (never the proc lock).
+    pub nofile_soft: AtomicU64,
 }
+
+/// Linux default soft RLIMIT_NOFILE.
+pub(in crate::dispatch) const DEFAULT_NOFILE_SOFT: u64 = 1024;
+/// Hard RLIMIT_NOFILE we expose to the guest (its setrlimit may raise the soft
+/// limit up to this). Matches the value getrlimit has always reported.
+pub(in crate::dispatch) const NOFILE_HARD: u64 = 1024 * 1024;
 
 impl IoState {
     pub(in crate::dispatch) fn new() -> Self {
@@ -79,6 +91,7 @@ impl IoState {
             closed_stdio: Mutex::new([false; 3]),
             fd_open_paths: RwLock::new(HashMap::new()),
             io_uring_instances: RwLock::new(HashMap::new()),
+            nofile_soft: AtomicU64::new(DEFAULT_NOFILE_SOFT),
         }
     }
 }

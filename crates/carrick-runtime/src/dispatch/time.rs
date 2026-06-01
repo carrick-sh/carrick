@@ -632,7 +632,10 @@ impl SyscallDispatcher {
             const LINUX_RLIMIT_AS: u64 = 9;
             const LINUX_RLIMIT_DATA: u64 = 2;
             let limit = match resource {
-                LINUX_RLIMIT_NOFILE => LinuxRlimit::new(1024, 1024 * 1024),
+                LINUX_RLIMIT_NOFILE => LinuxRlimit::new(
+                    this.io.nofile_soft.load(std::sync::atomic::Ordering::Relaxed),
+                    1024 * 1024,
+                ),
                 LINUX_RLIMIT_NPROC => LinuxRlimit::new(8192, 8192),
                 LINUX_RLIMIT_STACK => {
                     // Linux's default 8 MiB soft RLIMIT_STACK, unlimited hard limit.
@@ -664,6 +667,16 @@ impl SyscallDispatcher {
                 let rlim_max = u64::from_le_bytes(bytes[8..16].try_into().unwrap_or([0; 8]));
                 if rlim_cur > rlim_max {
                     return Ok(LINUX_EINVAL.into());
+                }
+                if resource == LINUX_RLIMIT_NOFILE {
+                    // Honor the guest raising (or lowering) its fd soft limit,
+                    // clamped to the hard limit we expose. The fd allocator
+                    // (first_free_fd) and dup3's range check read this. RLIM_
+                    // INFINITY soft is clamped to the hard cap.
+                    let soft = rlim_cur.min(1024 * 1024);
+                    this.io
+                        .nofile_soft
+                        .store(soft, std::sync::atomic::Ordering::Relaxed);
                 }
             }
             Ok(DispatchOutcome::Returned { value: 0 })
