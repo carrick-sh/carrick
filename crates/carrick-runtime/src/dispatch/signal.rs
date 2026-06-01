@@ -621,10 +621,12 @@ impl SyscallDispatcher {
             if let Some(routed) = this.route_thread_signal(cx, tid, signum) {
                 return Ok(routed);
             }
-            let host_pid = std::process::id() as i64;
-            let bootstrap_pid = LINUX_BOOTSTRAP_PID as i64;
-            let valid_self = (tgid == host_pid || tgid == bootstrap_pid)
-                && (tid == host_pid || tid == bootstrap_pid);
+            // raise()/pthread_kill name the caller as tgkill(getpid(), gettid()).
+            // Under a PID namespace getpid()/gettid() report the ns-pid, so a
+            // self-target here is the caller's ns-pid — not just host-pid/
+            // bootstrap. (Sibling threads were already handled by
+            // route_thread_signal above.)
+            let valid_self = names_self_pid(tgid) && names_self_pid(tid);
             if !valid_self {
                 return Ok(LINUX_ESRCH.into());
             }
@@ -1179,6 +1181,27 @@ fn signal_is_self_target(target: i64, tid_required: bool) -> bool {
     } else {
         target == host_pid || target == bootstrap_pid || target == 0
     }
+}
+
+/// True iff `x` names THIS process (or thread) — host pid, bootstrap pid, or,
+/// under a PID namespace, the caller's own ns-pid (what getpid()/gettid()
+/// report there). Used by tgkill/tkill to recognize `raise()`/`pthread_kill`
+/// (which target getpid()/gettid()) as a self-signal even when the guest is
+/// PID-namespaced.
+fn names_self_pid(x: i64) -> bool {
+    let host_pid = std::process::id() as i64;
+    if x == host_pid || x == LINUX_BOOTSTRAP_PID as i64 {
+        return true;
+    }
+    if crate::namespace::pid::enabled() && x > 0 {
+        let w = x as u32;
+        if w == crate::namespace::pid::self_ns_pid()
+            || crate::namespace::pid::ns_to_host_or_self(w) == Some(std::process::id())
+        {
+            return true;
+        }
+    }
+    false
 }
 
 pub(crate) fn bootstrap_signal_send(
