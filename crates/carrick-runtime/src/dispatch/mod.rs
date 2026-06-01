@@ -1216,6 +1216,14 @@ impl SyscallDispatcher {
         427 => io_uring_register,
         434 => pidfd_open,
         285 => copy_file_range,
+        // preadv2/pwritev2: positional vectored I/O plus a RWF_* flags arg. The
+        // flags are advisory for our backing — RWF_HIPRI (high-priority hint),
+        // RWF_{D,}SYNC (durability; we don't buffer), RWF_NOWAIT (a regular file
+        // never blocks) — so we route to preadv/pwritev, whose 5-arg handlers
+        // ignore the trailing flags. (A future RWF_APPEND need would want its own
+        // pwritev2 handler that writes at EOF.)
+        286 => preadv,
+        287 => pwritev,
         291 => statx,
         436 => close_range,
         437 => openat2,
