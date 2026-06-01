@@ -742,21 +742,23 @@ fn synthetic_proc_pid_file(pid: u32, rest: &str, self_comm: &str) -> Option<Vec<
     if let Some(&(tid, state)) = own_threads.iter().find(|(t, _)| *t as u32 == pid) {
         let ppid = unsafe { libc::getppid() } as u32;
         let me = std::process::id();
-        let _ = tid;
+        // Per-thread name (prctl PR_SET_NAME / pthread_setname_np), falling back
+        // to the process comm for a thread that never named itself.
+        let name = per_thread_comm(tid, self_comm);
         match rest {
             "stat" => {
-                return Some(proc_stat_line(pid, self_comm, state, ppid, me, me).into_bytes());
+                return Some(proc_stat_line(pid, &name, state, ppid, me, me).into_bytes());
             }
-            "comm" => return Some(format!("{self_comm}\n").into_bytes()),
+            "comm" => return Some(format!("{name}\n").into_bytes()),
             "cmdline" => {
-                let mut b = self_comm.as_bytes().to_vec();
+                let mut b = name.into_bytes();
                 b.push(0);
                 return Some(b);
             }
             "status" => {
                 return Some(
                     format!(
-                        "Name:\t{self_comm}\nState:\t{state} ({long})\nTgid:\t{me}\n\
+                        "Name:\t{name}\nState:\t{state} ({long})\nTgid:\t{me}\n\
 Pid:\t{pid}\nPPid:\t{ppid}\nThreads:\t{n}\n",
                         long = proc_state_long(state),
                         n = own_threads.len(),
@@ -822,7 +824,13 @@ fn proc_state_long(state: char) -> &'static str {
 fn parse_proc_pid_path(path: &str) -> Option<(u32, &str)> {
     let tail = path.strip_prefix("/proc/")?;
     let (pid_str, rest) = tail.split_once('/')?;
-    let pid: u32 = pid_str.parse().ok()?;
+    // `self` (and `thread-self`) resolve to this process; the `task/<tid>/`
+    // recursion in synthetic_proc_pid_file then picks the specific thread.
+    // glibc's pthread_getname_np opens /proc/self/task/<tid>/comm.
+    let pid: u32 = match pid_str {
+        "self" | "thread-self" => std::process::id(),
+        _ => pid_str.parse().ok()?,
+    };
     Some((pid, rest))
 }
 
@@ -940,6 +948,18 @@ fn process_short_name(executable_path: &str) -> String {
         .and_then(|name| name.to_str())
         .map(|name| name.chars().take(15).collect())
         .unwrap_or_else(|| "carrick".to_string())
+}
+
+/// The name to report in /proc/<pid>/task/<tid>/comm: the thread's own
+/// prctl/pthread-set name if it has one, else the process comm (`fallback`).
+fn per_thread_comm(tid: crate::thread::ThreadId, fallback: &str) -> String {
+    crate::thread::current_thread_name(tid)
+        .map(|n| {
+            let len = n.iter().position(|&b| b == 0).unwrap_or(n.len());
+            String::from_utf8_lossy(&n[..len]).into_owned()
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| fallback.to_string())
 }
 
 #[cfg(test)]
