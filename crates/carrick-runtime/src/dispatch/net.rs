@@ -2348,6 +2348,15 @@ impl SyscallDispatcher {
                 Ok(bytes) => bytes,
                 Err(errno) => return Ok(errno.into()),
             };
+            // connect(AF_UNSPEC) is the UDP "disconnect" (dissolve the peer
+            // association); Linux returns 0. macOS disconnects too but may then
+            // report EAFNOSUPPORT/EINVAL — treat those as success below.
+            let is_unspec_disconnect = addrlen >= 2
+                && memory
+                    .read_bytes(addr_addr, 2)
+                    .ok()
+                    .map(|b| u16::from_ne_bytes([b[0], b[1]]) as i32 == LINUX_AF_UNSPEC)
+                    .unwrap_or(false);
             if family == libc::AF_UNIX
                 && let Some(gp) = guest_unix_pathname(memory, addr_addr, addrlen)
             {
@@ -2407,6 +2416,11 @@ impl SyscallDispatcher {
                     on_timeout: -(LINUX_EINPROGRESS as i64),
                     block_signals: 0,
                 });
+            }
+            if is_unspec_disconnect && (e == LINUX_EAFNOSUPPORT || e == LINUX_EINVAL) {
+                // macOS already disassociated the UDP socket; Linux returns 0
+                // for the AF_UNSPEC disconnect, so report success.
+                return Ok(DispatchOutcome::Returned { value: 0 });
             }
             Ok(e.into())
 

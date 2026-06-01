@@ -1039,6 +1039,17 @@ pub(in crate::dispatch) fn read_linux_sockaddr(
                 }
             }
         }
+        LINUX_AF_UNSPEC => {
+            // connect(AF_UNSPEC) dissolves a connected UDP socket's association
+            // (disconnect); Linux returns 0. Hand the host a 16-byte AF_UNSPEC
+            // sockaddr — macOS connect() disconnects on AF_UNSPEC too (it may
+            // then report EAFNOSUPPORT/EINVAL after disassociating, which the
+            // connect() handler maps to success).
+            let mut out = vec![0u8; 16];
+            out[0] = 16; // sa_len
+            out[1] = libc::AF_UNSPEC as u8; // 0
+            Ok(out)
+        }
         _ => Err(LINUX_EAFNOSUPPORT),
     }
 }
