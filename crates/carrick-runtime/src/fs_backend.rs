@@ -283,6 +283,9 @@ pub trait FsBackend: Send + Sync {
         _path: &str,
         _atime: Option<(i64, i64)>,
         _mtime: Option<(i64, i64)>,
+        // AT_SYMLINK_NOFOLLOW: set the SYMLINK's own times rather than its
+        // target's (lutimes). Backends that follow by default must honour it.
+        _nofollow: bool,
     ) -> Result<(), BackendError> {
         Err(BackendError::Unsupported)
     }
@@ -1897,20 +1900,9 @@ impl FsBackend for HostFsBackend {
         path: &str,
         atime: Option<(i64, i64)>,
         mtime: Option<(i64, i64)>,
+        nofollow: bool,
     ) -> Result<(), BackendError> {
-        let _normalized = normalize(path).ok_or(BackendError::Invalid)?;
-        // Open a real kernel fd for the materialised file and drive
-        // `futimens(2)` directly. cap-std has no set-times API, but the
-        // whole rootfs lives on the cap-std scratch, so a raw fd lets us
-        // persist atime/mtime where a later stat (which reads real disk
-        // metadata via real_stat) will see them.
-        let host_fd = match self.open_raw_fd(path, true, false, false) {
-            Some(fd) => fd,
-            None => {
-                crate::probes::fs_op("set_times:open_none", path, 30);
-                return Err(BackendError::Io);
-            }
-        };
+        let normalized = normalize(path).ok_or(BackendError::Invalid)?;
         // `None` (UTIME_OMIT) leaves the component untouched.
         let to_ts = |t: Option<(i64, i64)>| match t {
             Some((sec, nsec)) => libc::timespec {
@@ -1923,6 +1915,43 @@ impl FsBackend for HostFsBackend {
             },
         };
         let times = [to_ts(atime), to_ts(mtime)];
+        if nofollow {
+            // AT_SYMLINK_NOFOLLOW (lutimes): set the SYMLINK's OWN times, not
+            // the target's. open()+futimens follows the link, so issue a
+            // path-based utimensat RELATIVE to the scratch dir fd — the kernel
+            // leaves the final component unfollowed and the dirfd keeps us
+            // sandboxed within the cap-std root. (libuv fs_lutime.)
+            use std::os::fd::AsRawFd;
+            use std::os::unix::ffi::OsStrExt;
+            let rel = Self::rel_path(&normalized).ok_or(BackendError::Invalid)?;
+            let c = std::ffi::CString::new(rel.as_os_str().as_bytes())
+                .map_err(|_| BackendError::Invalid)?;
+            let rc = unsafe {
+                libc::utimensat(
+                    self.dir.as_raw_fd(),
+                    c.as_ptr(),
+                    times.as_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            return if rc < 0 {
+                crate::probes::fs_op("set_times:lutimensat_err", path, 30);
+                Err(BackendError::Io)
+            } else {
+                Ok(())
+            };
+        }
+        // Follow path: open a real kernel fd for the materialised file and
+        // drive `futimens(2)`. cap-std has no set-times API, but the whole
+        // rootfs lives on the cap-std scratch, so a raw fd lets us persist
+        // atime/mtime where a later stat (real_stat) will see them.
+        let host_fd = match self.open_raw_fd(path, true, false, false) {
+            Some(fd) => fd,
+            None => {
+                crate::probes::fs_op("set_times:open_none", path, 30);
+                return Err(BackendError::Io);
+            }
+        };
         let rc = unsafe { libc::futimens(host_fd, times.as_ptr()) };
         let err = if rc < 0 {
             crate::probes::fs_op("set_times:futimens_err", path, 30);

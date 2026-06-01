@@ -1462,7 +1462,14 @@ impl SyscallDispatcher {
                         Err(errno) => DispatchOutcome::errno(errno),
                     };
                 }
-                match self.fs.rootfs_vfs.overlay.set_times(&path, atime, mtime) {
+                // fd-based futimens: the descriptor already refers to the
+                // resolved inode, so never re-follow (nofollow = false).
+                match self
+                    .fs
+                    .rootfs_vfs
+                    .overlay
+                    .set_times(&path, atime, mtime, false)
+                {
                     Ok(()) | Err(crate::fs_backend::BackendError::Unsupported) => {
                         DispatchOutcome::Returned { value: 0 }
                     }
@@ -6202,7 +6209,12 @@ impl SyscallDispatcher {
                 .fs
                 .rootfs_vfs
                 .overlay
-                .set_times(&path, atime_set, mtime_set)
+                .set_times(
+                    &path,
+                    atime_set,
+                    mtime_set,
+                    flags & LINUX_AT_SYMLINK_NOFOLLOW != 0,
+                )
             {
                 Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
                 Err(crate::fs_backend::BackendError::Unsupported) => {
