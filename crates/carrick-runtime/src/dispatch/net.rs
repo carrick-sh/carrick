@@ -2734,6 +2734,37 @@ impl SyscallDispatcher {
                 }
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
+            // macOS BSD SO_REUSEADDR does NOT let two UDP sockets share a
+            // wildcard addr/port the way Linux does — that needs SO_REUSEPORT on
+            // macOS. libuv's UV_UDP_REUSEADDR sets ONLY SO_REUSEADDR (before
+            // bind) and expects two 0.0.0.0:PORT UDP binds to both succeed
+            // (udp_bind_reuseaddr, watcher_cross_stop). Widen REUSEADDR ->
+            // REUSEPORT for datagram sockets so the macOS kernel matches Linux;
+            // the existing passthrough below still sets host SO_REUSEADDR so a
+            // later getsockopt reports the value the guest set.
+            if level == LINUX_SOL_SOCKET
+                && optname == LINUX_SO_REUSEADDR
+                && this.socket_guest_type(fd) == Some(LINUX_SOCK_DGRAM)
+            {
+                let enable = optlen >= 4
+                    && memory
+                        .read_bytes(optval_addr, 4)
+                        .ok()
+                        .map(|b| i32::from_ne_bytes([b[0], b[1], b[2], b[3]]) != 0)
+                        .unwrap_or(false);
+                if enable {
+                    let one: i32 = 1;
+                    unsafe {
+                        libc::setsockopt(
+                            host_fd,
+                            libc::SOL_SOCKET,
+                            libc::SO_REUSEPORT,
+                            &one as *const i32 as *const libc::c_void,
+                            std::mem::size_of::<i32>() as u32,
+                        );
+                    }
+                }
+            }
             let (host_level, host_opt) = match linux_to_host_sockopt(level, optname) {
                 Some(t) => t,
                 None => {
