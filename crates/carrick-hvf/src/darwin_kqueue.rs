@@ -182,6 +182,15 @@ impl Kevent {
         }
     }
 
+    /// For a returned `EVFILT_PROC`/`NOTE_EXIT` event, the exited process's
+    /// status in `waitpid(2)` out-parameter format (macOS carries it in the
+    /// `data` field, NOTE_EXITSTATUS). Used by the NsSupervisor to harvest a
+    /// namespace member's exit status at death — before launchd reaps the
+    /// host zombie, after which `waitpid` from any other process is ECHILD.
+    pub fn proc_exit_status(self) -> i32 {
+        self.0.data as i32
+    }
+
     /// One-shot or periodic timer. `interval_ns` is the period in nanoseconds
     /// (`NOTE_NSECONDS`); pass `EV_ADD | EV_ONESHOT` for a single fire or
     /// `EV_ADD` for a repeating timer, and `EV_DELETE` (with `interval_ns` 0)

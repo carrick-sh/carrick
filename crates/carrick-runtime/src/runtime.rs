@@ -456,11 +456,96 @@ where
     )
 }
 
+/// Fork the per-container NsSupervisor before any HVF VM exists, if PID-ns
+/// placement was requested. Returns:
+/// - `Ok(None)` in the CHILD (guest-init): the region's init slot is filled and
+///   the caller continues into `HvfTrapEngine::new()` + the guest loop.
+/// - `Ok(Some(result))` in the PARENT (supervisor): it ran the kqueue loop
+///   until the init exited; `result` carries the init's exit code to propagate.
+/// - `Ok(None)` with no fork when placement was not requested OR setup failed
+///   (degraded to identity / no supervisor — the run still proceeds).
+fn maybe_fork_ns_supervisor() -> Result<Option<RunResult>, RuntimeError> {
+    if !crate::namespace::pid::supervisor_requested() {
+        return Ok(None);
+    }
+    // Allocate the shared member table + the registration pipe BEFORE the fork
+    // so both processes inherit them. On any setup failure, degrade to running
+    // the guest in-process without a supervisor (identity-ish placement still
+    // works for the common single-process case via the region if it allocated).
+    if crate::namespace::pid::alloc_region().is_err() {
+        return Ok(None);
+    }
+    let mut pipe_fds = [0i32; 2];
+    // SAFETY: standard pipe(2) into a 2-element array.
+    if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
+        return Ok(None);
+    }
+    let (pipe_read, pipe_write) = (pipe_fds[0], pipe_fds[1]);
+    // Make the write end non-blocking so a guest's registration notify never
+    // blocks if the pipe is full (the supervisor rescans on a timeout anyway).
+    // SAFETY: fcntl on our own pipe fd.
+    unsafe {
+        let fl = libc::fcntl(pipe_write, libc::F_GETFL);
+        libc::fcntl(pipe_write, libc::F_SETFL, fl | libc::O_NONBLOCK);
+    }
+    crate::namespace::pid::set_reg_pipe_write(pipe_write);
+
+    // SAFETY: fork(2). We are single-threaded at this point in the run path
+    // (the HVF VM + sibling vCPU threads do not exist yet — that is the whole
+    // reason the supervisor fork happens HERE), so fork is safe.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        // Fork failed: close the pipe and run without a supervisor.
+        unsafe {
+            libc::close(pipe_read);
+            libc::close(pipe_write);
+        }
+        crate::namespace::pid::set_reg_pipe_write(-1);
+        return Ok(None);
+    }
+    if pid == 0 {
+        // CHILD: the guest-init (ns-pid 1). Close the supervisor's read end,
+        // fill the region's init slot with our pid, and continue into HVF.
+        unsafe {
+            libc::close(pipe_read);
+        }
+        crate::namespace::pid::set_init(std::process::id());
+        return Ok(None);
+    }
+    // PARENT: the NsSupervisor. Close the write end (only members write), run
+    // the kqueue loop until the init exits, then propagate its status.
+    unsafe {
+        libc::close(pipe_write);
+    }
+    crate::namespace::pid::set_reg_pipe_write(-1);
+    let exit = crate::namespace::supervisor::run(pid, pipe_read);
+    let code = crate::namespace::supervisor::status_to_exit_code(exit.init_status);
+    Ok(Some(RunResult {
+        exit_code: code,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+        traps: 0,
+        report: Default::default(),
+        trap_limit_hit: false,
+    }))
+}
+
 fn run_address_space_with_hvf_and_dispatcher(
     image: AddressSpace,
     mut dispatcher: SyscallDispatcher,
     max_traps: usize,
 ) -> Result<RunResult, RuntimeError> {
+    // PID-namespace placement (container runs only): fork the NsSupervisor
+    // BEFORE creating the HVF VM. macOS HVF state is not fork-safe — a VM live
+    // in the parent at fork(2) makes the child's hv_vm_create return HV_BUSY
+    // (see HvfTrapEngine::fork). So the supervisor (the parent) must never
+    // create a VM: it forks here, the CHILD goes on to HvfTrapEngine::new() and
+    // runs the guest as ns-pid 1, and the PARENT runs the kqueue supervisor
+    // loop and exits with the init's status (docs/namespaces-design.md §3.2).
+    // `run-elf` never requests placement, so this is a no-op there.
+    if let Some(result) = maybe_fork_ns_supervisor()? {
+        return Ok(result);
+    }
     let mut trap = HvfTrapEngine::new()?;
     trap.map_address_space(&image)?;
     // Hand the dispatcher the real region list so `/proc/self/maps`
@@ -1960,12 +2045,13 @@ fn run_threaded_hvf_loop(
     // cutime/cstime + RUSAGE_CHILDREN).
     crate::guest_cpu::init_child_table();
     // PID-namespace launch placement (container runs only — `run-elf` never
-    // requests it). Allocate the MAP_SHARED ns table before the first fork so
-    // every descendant inherits it, and pre-assign the root guest as ns-pid 1.
-    // From here getpid()==1, getppid()==0, and forked children get ns-local
-    // pids (docs/namespaces-design.md §5.2). On mmap failure we silently fall
-    // back to identity behavior — the run proceeds, just without ns numbering.
-    if crate::namespace::pid::requested() {
+    // requests it). The MAP_SHARED ns table is allocated and the init slot
+    // filled in `maybe_fork_ns_supervisor` (the guest-init child branch), which
+    // runs BEFORE this on the container path. As a fallback for any path that
+    // reaches here with placement requested but no region yet (e.g. the
+    // supervisor fork was skipped on setup failure), initialize identity-style
+    // here so getpid()==1 still holds (docs/namespaces-design.md §5.2).
+    if crate::namespace::pid::requested() && !crate::namespace::pid::enabled() {
         let _ = crate::namespace::pid::init(std::process::id());
     }
     let futex = Arc::new(FutexTable::new());
