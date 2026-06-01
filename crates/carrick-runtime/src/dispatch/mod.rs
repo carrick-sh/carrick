@@ -3515,7 +3515,13 @@ fn dirent64_record(entry: &RootFsDirEntry, next_offset: usize) -> Vec<u8> {
     let name = name_bytes.as_slice();
     let record_len = align_to(LINUX_DIRENT64_HEADER_SIZE + name.len() + 1, 8);
     let header = LinuxDirent64Header {
-        d_ino: inode_for_path(&entry.metadata.path),
+        // Real host inode when known, so scandir's DirEntry.inode() matches a
+        // later stat()'s st_ino; else a stable path-hash (in-memory/synthetic).
+        d_ino: if entry.ino != 0 {
+            entry.ino
+        } else {
+            inode_for_path(&entry.metadata.path)
+        },
         d_off: next_offset as i64,
         d_reclen: record_len as u16,
         d_type: linux_dirent_type(entry.metadata.kind),
