@@ -3566,6 +3566,36 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::Returned { value: r as i64 });
             }
 
+            // A CHARACTER device (/dev/null, /dev/zero, /dev/full, /dev/random,
+            // /dev/urandom) is backed by a host fd but lands here as a HostPipe
+            // (the open path keeps devices as streams). Such devices ARE
+            // seekable on Linux — lseek returns 0/the offset, never ESPIPE — and
+            // Python's io.open("/dev/null","r+") requires seekable(). Delegate to
+            // the host lseek when the backing fd is a char device; genuine
+            // pipes/fifos (S_IFIFO) fall through to the ESPIPE branch below.
+            if let OpenDescription::HostPipe { host_fd, .. } = &*open {
+                let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                if unsafe { libc::fstat(*host_fd, &mut st) } == 0
+                    && (st.st_mode & libc::S_IFMT) == libc::S_IFCHR
+                {
+                    let host_whence = match whence {
+                        LINUX_SEEK_SET => libc::SEEK_SET,
+                        LINUX_SEEK_CUR => libc::SEEK_CUR,
+                        LINUX_SEEK_END => libc::SEEK_END,
+                        _ => return Ok(LINUX_EINVAL.into()),
+                    };
+                    let r = match (unsafe {
+                        libc::lseek(*host_fd, offset as libc::off_t, host_whence)
+                    })
+                    .host_syscall_errno()
+                    {
+                        Ok(value) => value,
+                        Err(errno) => return Ok(errno.into()),
+                    };
+                    return Ok(DispatchOutcome::Returned { value: r as i64 });
+                }
+            }
+
             let (current, end) = match &*open {
                 OpenDescription::File {
                     contents, offset, ..
