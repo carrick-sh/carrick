@@ -153,3 +153,18 @@ workloads. The fast path is also a **near-deterministic reproducer of the #1
 fork-wedge** — the highest-value next step is to fix that HVF wedge (which would
 let fast-fs go default-on AND unblock the broader multithreaded-fork conformance),
 using this as the repro.
+
+## UPDATE 2 (2026-06-01) — fork-wedge FIXED, fast-fs back to default ON
+
+The fast path was a near-deterministic reproducer for the #1 fork-wedge, and that
+cracked it. Root cause (commit cf5f6e0, runtime.rs fork-quiesce loop): the forking
+thread captured `others = kicker.count()-1` ONCE; vCPUs that EXIT mid-quiesce drop
+the kicker count, so `others` went stale-HIGH and `while !wait_quiesced(others)`
+spun forever (gated diag: `others=4 paused=2 kicker=3`). Fix = recompute `others`
+live each iteration; the post-loop `VCPU_LIVE>1` 5s-abort still gates the real
+teardown (no HV_BUSY risk).
+
+With the wedge fixed, **fast-fs is back to default ON**. Verified: test_fork1
+14/14 no-hang (8 fast-on + 6 baseline), test_glob MATCH by default (48s),
+fsescapeguard MATCH, 251 lib tests. The remaining read_dir/open_raw_fd cap-std
+walk is still a future increment (not needed for test_glob).
