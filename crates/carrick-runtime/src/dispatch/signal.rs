@@ -523,6 +523,16 @@ impl SyscallDispatcher {
                 }
                 return Ok(this.raise_process_directed(cx, tid, signum));
             }
+            // pid-1 protection (§5.4, pid_namespaces(7)): a default-lethal
+            // signal sent to the ns-init by another ns member is DROPPED unless
+            // the init installed a handler (SIGKILL/SIGSTOP always act). The
+            // call still returns success — Linux delivers nothing but does not
+            // error. `pid` is the translated host pid here.
+            if pid > 0
+                && crate::namespace::pid::should_drop_signal_to_init(pid as u32, signum as i32)
+            {
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            }
             let caller_euid = Some(this.cred_snapshot().euid);
             Ok(bootstrap_signal_send_as(
                 pid, /*tid_required=*/ false, signum, caller_euid,
@@ -795,8 +805,17 @@ impl SyscallDispatcher {
             if let Some(sa) = new_sa {
                 this.signal.lock().handlers.insert(signum, sa);
                 let h = sa.sa_handler;
-                if h != crate::linux_abi::LINUX_SIG_DFL && h != crate::linux_abi::LINUX_SIG_IGN {
+                let real_handler =
+                    h != crate::linux_abi::LINUX_SIG_DFL && h != crate::linux_abi::LINUX_SIG_IGN;
+                if real_handler {
                     crate::host_signal::ensure_host_handler(signum);
+                }
+                // pid-1 protection (§5.4): if WE are the ns-init, publish whether
+                // we now handle this signal so the kill path knows not to drop a
+                // handled signal (and to drop an unhandled default-lethal one).
+                // A non-init member's handler table is irrelevant to this.
+                if crate::namespace::pid::self_ns_pid() == crate::namespace::pid::NS_INIT_PID {
+                    crate::namespace::pid::set_init_handler(signum, real_handler);
                 }
             }
             Ok(DispatchOutcome::Returned { value: 0 })

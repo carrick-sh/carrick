@@ -472,7 +472,7 @@ fn maybe_fork_ns_supervisor() -> Result<Option<RunResult>, RuntimeError> {
     // so both processes inherit them. On any setup failure, degrade to running
     // the guest in-process without a supervisor (identity-ish placement still
     // works for the common single-process case via the region if it allocated).
-    if crate::namespace::pid::alloc_region().is_err() {
+    if !crate::namespace::pid::alloc_region() {
         return Ok(None);
     }
     let mut pipe_fds = [0i32; 2];
@@ -481,12 +481,16 @@ fn maybe_fork_ns_supervisor() -> Result<Option<RunResult>, RuntimeError> {
         return Ok(None);
     }
     let (pipe_read, pipe_write) = (pipe_fds[0], pipe_fds[1]);
-    // Make the write end non-blocking so a guest's registration notify never
-    // blocks if the pipe is full (the supervisor rescans on a timeout anyway).
-    // SAFETY: fcntl on our own pipe fd.
+    // Make BOTH ends non-blocking: the write end so a guest's registration
+    // notify never blocks on a full pipe; the READ end so the supervisor's
+    // drain loop terminates on EAGAIN instead of blocking forever once the
+    // pending bytes are consumed (the supervisor rescans on a timeout anyway).
+    // SAFETY: fcntl on our own pipe fds.
     unsafe {
-        let fl = libc::fcntl(pipe_write, libc::F_GETFL);
-        libc::fcntl(pipe_write, libc::F_SETFL, fl | libc::O_NONBLOCK);
+        let fl_w = libc::fcntl(pipe_write, libc::F_GETFL);
+        libc::fcntl(pipe_write, libc::F_SETFL, fl_w | libc::O_NONBLOCK);
+        let fl_r = libc::fcntl(pipe_read, libc::F_GETFL);
+        libc::fcntl(pipe_read, libc::F_SETFL, fl_r | libc::O_NONBLOCK);
     }
     crate::namespace::pid::set_reg_pipe_write(pipe_write);
 
@@ -518,8 +522,25 @@ fn maybe_fork_ns_supervisor() -> Result<Option<RunResult>, RuntimeError> {
         libc::close(pipe_write);
     }
     crate::namespace::pid::set_reg_pipe_write(-1);
+    // Detached runs (`carrick run -d`) set CARRICK_CONTAINER_ID before launch.
+    // The supervisor owns the container's lifetime, so it records the live
+    // init/supervisor pids (status → Running) here and marks the registry entry
+    // Exited (or removes it, for --rm) when the init exits. A foreground run has
+    // no id set, so this is a no-op (the CLI handles foreground status itself).
+    let container_id = std::env::var("CARRICK_CONTAINER_ID").ok();
+    if let Some(id) = container_id.as_deref()
+        && let Ok(mut state) = crate::container::ContainerState::load(id)
+    {
+        state.status = crate::container::ContainerStatus::Running;
+        state.supervisor_pid = std::process::id() as i32;
+        state.init_pid = pid;
+        let _ = state.persist();
+    }
     let exit = crate::namespace::supervisor::run(pid, pipe_read);
     let code = crate::namespace::supervisor::status_to_exit_code(exit.init_status);
+    if let Some(id) = container_id.as_deref() {
+        crate::container::mark_exited(id, code);
+    }
     Ok(Some(RunResult {
         exit_code: code,
         stdout: Vec::new(),

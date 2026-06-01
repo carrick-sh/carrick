@@ -101,6 +101,12 @@ pub(crate) enum Commands {
         /// Keep STDIN open even if not attached (like `docker run -it`).
         #[arg(short = 'i', long = "interactive")]
         interactive: bool,
+        /// Run the container detached (like `docker run -d`): start it in the
+        /// background, print its id, and return immediately. The container runs
+        /// under its own NsSupervisor with stdout/stderr captured to a log;
+        /// manage it with `carrick ps|stop|kill|rm`.
+        #[arg(short = 'd', long = "detach", conflicts_with_all = ["tty", "interactive"])]
+        detach: bool,
         /// Which writable-layer backend to use. Defaults to `host` on
         /// case-sensitive volumes and `memory` elsewhere.
         #[arg(long, value_enum)]
@@ -159,6 +165,43 @@ pub(crate) enum Commands {
     Shell {
         #[arg(default_value = "alpine:latest")]
         image: String,
+    },
+    /// List containers (like `docker ps`). Shows running containers; `--all`
+    /// includes exited ones.
+    Ps {
+        /// Show all containers (default shows just running).
+        #[arg(short = 'a', long = "all")]
+        all: bool,
+        /// Only display container ids.
+        #[arg(short = 'q', long = "quiet")]
+        quiet: bool,
+    },
+    /// Stop one or more running containers (SIGTERM, then SIGKILL after the
+    /// grace period), like `docker stop`.
+    Stop {
+        /// Seconds to wait for graceful stop before SIGKILL.
+        #[arg(short = 't', long = "time", default_value_t = 10)]
+        time: u64,
+        /// Container ids or names.
+        #[arg(required = true)]
+        containers: Vec<String>,
+    },
+    /// Send a signal to one or more running containers (like `docker kill`).
+    Kill {
+        /// Signal to send (name like `TERM`/`KILL` or number).
+        #[arg(short = 's', long = "signal", default_value = "KILL")]
+        signal: String,
+        #[arg(required = true)]
+        containers: Vec<String>,
+    },
+    /// Remove one or more containers (like `docker rm`). Refuses a running
+    /// container unless `--force`.
+    Rm {
+        /// Force removal of a running container (SIGKILL it first).
+        #[arg(short = 'f', long = "force")]
+        force: bool,
+        #[arg(required = true)]
+        containers: Vec<String>,
     },
     Exec {
         context: String,
