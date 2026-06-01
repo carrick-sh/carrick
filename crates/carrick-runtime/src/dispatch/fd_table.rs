@@ -491,6 +491,11 @@ impl OpenDescription {
             OpenDescription::File { path, .. }
             | OpenDescription::Directory { path, .. }
             | OpenDescription::SyntheticFile { path, .. } => Some(path.as_str()),
+            // A host-fd-backed regular file (e.g. `--fs host`) carries the guest
+            // path it was opened at in its metadata — surface it so
+            // readlink(/proc/self/fd/N) and fexecve (execveat AT_EMPTY_PATH)
+            // recover the executable's path.
+            OpenDescription::HostFile { metadata, .. } => metadata.path.to_str(),
             _ => None,
         }
     }
