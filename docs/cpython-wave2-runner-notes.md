@@ -130,3 +130,28 @@ TAKEAWAY (runner theme): test_socket's gap is carrick not translating Linux
 socket semantics onto the macOS stack — same class as the SO_REUSEADDR→REUSEPORT
 and multicast→ENODEV fixes already landed. Both fixes are real net.rs work; do
 the cmsg translation first (principled, uses macOS's real RFC 3542).
+
+## test_posix progress (2026-06-01) — 4 fails → 1
+
+Landed this session (each red-first + verified, no regressions):
+- **chmod follows a final symlink** (chmod_at → canonicalize_following) — test_chmod_dir_symlink. probe chmodfollowsymlink.
+- **execveat(2)** (was unregistered → ENOSYS) for fexecve/os.execve(fd); AT_EMPTY_PATH recovers the dir fd's path (open_path extended to HostFile). probe fexecveprobe.
+- **ns-init process group = ns-pgid 1** — getpgrp returned the host pgid (shell's group) so posix_spawn(setpgroup=getpgrp()) → child setpgid failed → 127. Recorded init_host_pgid; host_to_ns_pgid maps it→1, new ns_to_host_pgid maps 1→the real host group; setpgid translates its pgid arg as a GROUP. probe setpgidparentgroup.
+
+### REMAINING: test_lchown (lchown a symlink → the LINK's own owner)
+carrick stores guest owners in xattrs (not root on macOS). For a symlink the
+xattr must live on the LINK. MECHANISM CONFIRMED (raw C): path-based
+`setxattr/getxattr(path, "user.carrick.uid", ..., XATTR_NOFOLLOW=1)` sets/reads
+the link's own xattr (target untouched). cap-std CANNOT do it via `O_SYMLINK`
+(its per-component O_NOFOLLOW conflicts → open fails). Get the abs path with
+`fcntl(dir.as_raw_fd(), F_GETPATH)` + join(rel).
+ATTEMPT REVERTED (didn't flip the test): added symlink_get/set_u32_xattr +
+threaded a `symlink: bool` through read/write_owner_xattr + set_owner/get_owner.
+The probe (lchown /tmp/link → lstat) still showed link_owner=0. UNRESOLVED GAP to
+trace next: (a) the chown'd path's VFS ROUTING — fchownat (fs.rs:5786) routes via
+vfs_mounts.resolve; confirm whether the path hits HostFsBackend.set_owner or a
+BindVfs (/tmp may be a bind mount whose set_owner ignores the symlink case), and
+(b) the lstat READ side — does the lstat stat-struct build call get_owner (→
+read_owner_xattr with symlink=true) for a symlink, or read owner elsewhere?
+Trace write-vs-read-vs-routing with a gated eprintln in symlink_set_u32_xattr +
+get_owner before re-implementing.
