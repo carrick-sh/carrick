@@ -1,8 +1,9 @@
 # `--fs host` open amplification: cap-std re-resolution (~291× host opens/guest open)
 
-**Status:** root-caused + adversarially-reviewed design (2026-06-01). NOT yet implemented.
-Owner-facing: the user asked "is this pathological / should we drop cap-std?" — yes, and a
-feature-flagged macOS-native bypass is the fix. Implement incrementally per the phased plan.
+**Status:** Phases 1+2 IMPLEMENTED + verified (2026-06-01) — test_glob TIMEOUT→MATCH
+(140s→48s; host opens 999,646→405,926). See "IMPLEMENTED" section at the bottom. The
+feature-flagged (`CARRICK_FAST_FS`, default on) macOS-native bypass replaced cap-std's
+per-component walk for non-creating stat/lookup; writes/creates stay on cap-std.
 
 ## The pathology (empirical, via `carrick trace`)
 
@@ -101,3 +102,28 @@ path.** This still captures the entire glob win (the 3,335 guest opens are opend
    MATCH), `test_stat`, `test_posix`, `test_os`, `test_subprocess` parity unchanged; the atime probe
    for Phase 2.
 4. test_glob is the success metric: timeout → MATCH.
+
+## IMPLEMENTED (2026-06-01) — Phases 1+2 landed, test_glob TIMEOUT→MATCH
+
+- **Phase 1** (commit c086d77): path-based `getxattr` for the mode/socket/owner
+  xattr peeks (`path_get_u32_xattr`), eliminating the `with_entry_fd` opens.
+  999,646 → 622,909 host opens; test_glob 140s → 103s. No atime regression
+  (getxattr is metadata, like O_EVTONLY).
+- **Phase 2** (commit 43c396d): `fast_lstat_contained` — one `fstatat` +
+  `openat`+`F_GETPATH` containment — wired into `lookup`/`metadata`/`real_stat`
+  (the calls `open_dispatch` makes ~3× per guest open). 622,909 → **405,926**
+  host opens; **test_glob 140s → 48s → MATCH** (under the 90s sweep timeout).
+  Reads/opendirs only; writes/creates stay on cap-std (the O_CREAT escape).
+  Feature-gated `CARRICK_FAST_FS` (default on). Falls back to cap-std for
+  symlink leaves / FIFOs / escapes / errors.
+
+Verified no regression: 251 lib tests; test_stat/io/fileio/tempfile/glob MATCH;
+test_posix unchanged (1 unrelated feature-skip); test_subprocess DIFF=2
+(unchanged, benign) and faster (75s→56s); 9 fs probes MATCH; fsescapeguard
+(security) MATCH with the flag on.
+
+Remaining (lower priority): the `read_dir`/`layered_directory_entries` walk and
+`open_raw_fd` (file opens) still use cap-std; the remaining ~405k opens are
+mostly there. Not needed for test_glob (now MATCH); a future increment for
+file-read-heavy workloads. The xattr peeks during directory listing already use
+the Phase-1 fast getxattr.
