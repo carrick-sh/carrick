@@ -1657,6 +1657,12 @@ impl SyscallDispatcher {
             Ok(resolved) => resolved,
             Err(errno) => return Ok(errno.into()),
         };
+        // chmod(2) FOLLOWS a final symlink — it changes the TARGET's mode, not
+        // the link's (test_posix.test_chmod_dir_symlink). resolve_at_path stops
+        // at the link itself, so dereference it here. (fchmodat2's advisory
+        // AT_SYMLINK_NOFOLLOW stays unmodeled on the disk-authoritative backend;
+        // a dangling/failed follow falls back to the link path unchanged.)
+        let resolved = self.canonicalize_following(&resolved).unwrap_or(resolved);
         if crate::vfs::is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context()) {
             return Ok(DispatchOutcome::Returned { value: 0 });
         }
