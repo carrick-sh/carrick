@@ -750,12 +750,24 @@ impl OpenDescription {
                 ))
             }
             OpenDescription::HostPipe { pty, host_fd, .. } => {
-                if pty.is_some() {
-                    OpenStatSource::Record(StatRecord::synthetic(
-                        "char:[carrick-pty]",
-                        0,
-                        LINUX_S_IFCHR | 0o600,
-                    ))
+                if let Some(role) = pty {
+                    // A pty SLAVE reports its /dev/pts/N path so its st_ino
+                    // matches stat("/dev/pts/N"): glibc's ttyname_r readlinks
+                    // /proc/self/fd/<fd> then stat-compares the two. The master
+                    // keeps a constant synthetic label.
+                    if role.is_master {
+                        OpenStatSource::Record(StatRecord::synthetic(
+                            "char:[carrick-pty]",
+                            0,
+                            LINUX_S_IFCHR | 0o600,
+                        ))
+                    } else {
+                        OpenStatSource::Record(StatRecord::synthetic(
+                            &format!("/dev/pts/{}", role.index),
+                            0,
+                            LINUX_S_IFCHR | 0o620,
+                        ))
+                    }
                 } else {
                     // Anonymous pipe end OR a host character device (/dev/null,
                     // /dev/zero, …). fstat the real host fd to recover the true
