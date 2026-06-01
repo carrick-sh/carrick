@@ -1282,6 +1282,73 @@ fn ipv6_cmsg_host_to_linux(host: i32) -> Option<i32> {
         .map(|(l, _)| *l)
 }
 
+/// Translate a guest (Linux) IPPROTO_IPV6 cmsg-type to the macOS value (send).
+fn ipv6_cmsg_linux_to_host(linux: i32) -> Option<i32> {
+    IPV6_CMSG_MAP
+        .iter()
+        .find(|(l, _)| *l == linux)
+        .map(|(_, m)| *m)
+}
+
+/// Parse a GUEST (Linux-layout) `msg_control` buffer and return its IPPROTO_IPV6
+/// ancillary records as `(macos_cmsg_type, data)`, cmsg_type translated
+/// Linux→macOS, for a host `sendmsg` (e.g. setting IPV6_HOPLIMIT/TCLASS on send).
+pub(in crate::dispatch) fn parse_guest_ipv6_cmsgs(control: &[u8]) -> Vec<(i32, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut off = 0usize;
+    while off + LINUX_CMSGHDR_LEN <= control.len() {
+        let cmsg_len =
+            u64::from_ne_bytes(control[off..off + 8].try_into().unwrap_or([0; 8])) as usize;
+        let level = i32::from_ne_bytes(control[off + 8..off + 12].try_into().unwrap_or([0; 4]));
+        let ctype = i32::from_ne_bytes(control[off + 12..off + 16].try_into().unwrap_or([0; 4]));
+        if cmsg_len < LINUX_CMSGHDR_LEN || off + cmsg_len > control.len() {
+            break;
+        }
+        if level == LINUX_IPPROTO_IPV6
+            && let Some(host_type) = ipv6_cmsg_linux_to_host(ctype)
+        {
+            out.push((
+                host_type,
+                control[off + LINUX_CMSGHDR_LEN..off + cmsg_len].to_vec(),
+            ));
+        }
+        off += linux_cmsg_align(cmsg_len);
+    }
+    out
+}
+
+/// Build a HOST (macOS-layout) `msg_control` buffer for the given IPPROTO_IPV6
+/// ancillary records (cmsg_type already in macOS values), via the libc CMSG
+/// macros so the macOS alignment/len fields are exact. Concatenable after a
+/// `build_host_scm_rights` buffer.
+pub(in crate::dispatch) fn build_host_ipv6_cmsgs(cmsgs: &[(i32, Vec<u8>)]) -> Vec<u8> {
+    if cmsgs.is_empty() {
+        return Vec::new();
+    }
+    let total: usize = cmsgs
+        .iter()
+        .map(|(_, d)| unsafe { libc::CMSG_SPACE(d.len() as u32) } as usize)
+        .sum();
+    let mut buf = vec![0u8; total];
+    unsafe {
+        let mut hmsg: libc::msghdr = std::mem::zeroed();
+        hmsg.msg_control = buf.as_mut_ptr() as *mut libc::c_void;
+        hmsg.msg_controllen = buf.len() as _;
+        let mut cmsg = libc::CMSG_FIRSTHDR(&hmsg);
+        for (ctype, data) in cmsgs {
+            if cmsg.is_null() {
+                break;
+            }
+            (*cmsg).cmsg_len = libc::CMSG_LEN(data.len() as u32);
+            (*cmsg).cmsg_level = LINUX_IPPROTO_IPV6; // 41 on both
+            (*cmsg).cmsg_type = *ctype;
+            std::ptr::copy_nonoverlapping(data.as_ptr(), libc::CMSG_DATA(cmsg), data.len());
+            cmsg = libc::CMSG_NXTHDR(&hmsg, cmsg);
+        }
+    }
+    buf
+}
+
 /// Parse a HOST (macOS-layout) `msg_control` buffer and return every
 /// IPPROTO_IPV6 ancillary record as `(linux_cmsg_type, data_bytes)`, with the
 /// cmsg_type translated macOS→Linux. (SCM_RIGHTS is handled separately because
