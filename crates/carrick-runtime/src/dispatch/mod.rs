@@ -2943,6 +2943,7 @@ impl SyscallDispatcher {
     }
 
     fn synthetic_proc_context(&self) -> crate::vfs::SyntheticProcContext {
+        let (sig_ignored, sig_caught, sig_shdpnd) = self.proc_status_signal_masks();
         let proc = self.proc.lock();
         let mem = self.mem_snapshot();
         crate::vfs::SyntheticProcContext {
@@ -2951,6 +2952,9 @@ impl SyscallDispatcher {
             address_space_regions: mem.address_space_regions,
             brk_current: mem.brk_current,
             mmap_next: mem.mmap_next,
+            sig_ignored,
+            sig_caught,
+            sig_shdpnd,
         }
     }
 }
