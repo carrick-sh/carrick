@@ -1221,29 +1221,85 @@ impl SyscallDispatcher {
         }
 
         fn setpgid(this, cx, pid: Pid, pgid: Pid) {
-            if let Err(errno) = (unsafe { libc::setpgid(pid.0, pgid.0) }).host_syscall_errno() {
+            // PID namespace (§6.6): pgids stay host-level in Phase 2, but the
+            // ns-pid ARGS must be translated to host pids before the host call.
+            // pid 0 = "the calling process", pgid 0 = "same as pid" — both pass
+            // through (0 means self to the host too). A non-zero ns-pid that
+            // isn't a member is ESRCH. Identity when ns is off.
+            let (hpid, hpgid) = if crate::namespace::pid::enabled() {
+                let hp = if pid.0 == 0 {
+                    0
+                } else {
+                    match crate::namespace::pid::ns_to_host_or_self(pid.0 as u32) {
+                        Some(h) => h as i32,
+                        None => return Ok(LINUX_ESRCH.into()),
+                    }
+                };
+                let hg = if pgid.0 == 0 {
+                    0
+                } else {
+                    match crate::namespace::pid::ns_to_host_or_self(pgid.0 as u32) {
+                        Some(h) => h as i32,
+                        None => return Ok(LINUX_ESRCH.into()),
+                    }
+                };
+                (hp, hg)
+            } else {
+                (pid.0, pgid.0)
+            };
+            if let Err(errno) = (unsafe { libc::setpgid(hpid, hpgid) }).host_syscall_errno() {
                 return Ok(errno.into());
             }
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
         fn getpgid(this, cx, pid: Pid) {
-            let r = match (unsafe { libc::getpgid(pid.0) }).host_syscall_errno() {
+            // Translate the ns-pid arg (0 = self) to a host pid, then translate
+            // the returned host pgid back to its ns-pid so a self-led group
+            // reads as the caller's own ns-pid — getpgid(0)==getpid() holds
+            // inside the namespace (§5.3, §6.6).
+            let hpid = if crate::namespace::pid::enabled() && pid.0 != 0 {
+                match crate::namespace::pid::ns_to_host_or_self(pid.0 as u32) {
+                    Some(h) => h as i32,
+                    None => return Ok(LINUX_ESRCH.into()),
+                }
+            } else {
+                pid.0
+            };
+            let r = match (unsafe { libc::getpgid(hpid) }).host_syscall_errno() {
                 Ok(value) => value,
                 Err(errno) => return Ok(errno.into()),
             };
+            let ns_r = if crate::namespace::pid::enabled() {
+                crate::namespace::pid::host_to_ns_pgid(r as u32) as i32
+            } else {
+                r
+            };
             Ok(DispatchOutcome::Returned {
-                value: i64::from(r),
+                value: i64::from(ns_r),
             })
         }
 
         fn getsid(this, cx, pid: Pid) {
-            let r = match (unsafe { libc::getsid(pid.0) }).host_syscall_errno() {
+            let hpid = if crate::namespace::pid::enabled() && pid.0 != 0 {
+                match crate::namespace::pid::ns_to_host_or_self(pid.0 as u32) {
+                    Some(h) => h as i32,
+                    None => return Ok(LINUX_ESRCH.into()),
+                }
+            } else {
+                pid.0
+            };
+            let r = match (unsafe { libc::getsid(hpid) }).host_syscall_errno() {
                 Ok(value) => value,
                 Err(errno) => return Ok(errno.into()),
             };
+            let ns_r = if crate::namespace::pid::enabled() {
+                crate::namespace::pid::host_to_ns_pgid(r as u32) as i32
+            } else {
+                r
+            };
             Ok(DispatchOutcome::Returned {
-                value: i64::from(r),
+                value: i64::from(ns_r),
             })
         }
 
@@ -1252,8 +1308,15 @@ impl SyscallDispatcher {
                 Ok(value) => value,
                 Err(errno) => return Ok(errno.into()),
             };
+            // setsid returns the new session id (== the caller's pid); report it
+            // as the caller's ns-pid (§5.3, §6.6). Identity when ns is off.
+            let ns_r = if crate::namespace::pid::enabled() {
+                crate::namespace::pid::host_to_ns_pgid(r as u32) as i32
+            } else {
+                r
+            };
             Ok(DispatchOutcome::Returned {
-                value: i64::from(r),
+                value: i64::from(ns_r),
             })
         }
 
@@ -1609,7 +1672,18 @@ impl SyscallDispatcher {
             if flags & !PIDFD_NONBLOCK != 0 {
                 return Ok(LINUX_EINVAL.into());
             }
-            Ok(this.open_pidfd(pid.0, flags))
+            // PID namespace (§5.3): the guest names the target by its ns-pid;
+            // the pidfd must watch the underlying host pid. A foreign ns-pid is
+            // ESRCH. Identity when namespaces are off.
+            let host_pid = if crate::namespace::pid::enabled() {
+                match crate::namespace::pid::ns_to_host_or_self(pid.0 as u32) {
+                    Some(h) => h as i32,
+                    None => return Ok(LINUX_ESRCH.into()),
+                }
+            } else {
+                pid.0
+            };
+            Ok(this.open_pidfd(host_pid, flags))
         }
 
         fn pidfd_send_signal(this, cx, fd: Fd, signum: u64, _info: GuestPtr, _flags: u64) {
