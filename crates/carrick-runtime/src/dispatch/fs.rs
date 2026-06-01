@@ -879,6 +879,7 @@ impl SyscallDispatcher {
         drop(proc);
         let mem = self.mem_snapshot();
         let creds = self.cred_snapshot();
+        let (sig_ignored, sig_caught, sig_shdpnd) = self.proc_status_signal_masks();
         let ctx = crate::vfs::OpenContext {
             executable_path: Some(exec_path.as_str()),
             argv: Some(argv.as_slice()),
@@ -887,6 +888,9 @@ impl SyscallDispatcher {
             mmap_next: mem.mmap_next,
             euid: creds.euid,
             egid: creds.egid,
+            sig_ignored,
+            sig_caught,
+            sig_shdpnd,
         };
         let vfs_flags = crate::vfs::OpenFlags {
             read: matches!(access, LINUX_O_RDONLY | LINUX_O_RDWR),
