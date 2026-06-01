@@ -6,6 +6,7 @@
 
 #[cfg(target_os = "macos")]
 pub mod apfs;
+pub mod container;
 pub mod cred_ipc;
 #[cfg(target_os = "macos")]
 pub(crate) mod darwin_fs;
