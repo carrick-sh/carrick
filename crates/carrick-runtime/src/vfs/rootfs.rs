@@ -178,6 +178,19 @@ impl RootFsVfs {
                         writable: writable_request,
                     });
                 }
+                // open_raw_fd failed. `lookup` reports a symlink as a File whose
+                // "contents" are the link target (for readlink/content reads). A
+                // following open(2) must NOT see that — it follows the link, so a
+                // BROKEN symlink (target gone) is ENOENT, exactly like stat (and
+                // not the lookup hack's target-string). Detect: this path is a
+                // symlink AND following it finds no target.
+                if matches!(
+                    self.overlay.metadata(path).map(|m| m.kind),
+                    Some(RootFsEntryKind::Symlink)
+                ) && self.overlay.real_stat(path, true).is_none()
+                {
+                    return Err(LINUX_ENOENT);
+                }
                 // In-memory overlay (MemoryBackend): cached-bytes File.
                 if want_trunc {
                     contents.clear();
