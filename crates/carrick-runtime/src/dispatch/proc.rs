@@ -590,6 +590,24 @@ impl SyscallDispatcher {
                     }
                     _ => DispatchOutcome::errno(LINUX_EINVAL),
                 },
+                // Capability bounding-set query/drop, modeled against the
+                // per-process capability set (accept-and-record; §4.4). cap > 63
+                // is EINVAL (the cap number must be a valid bit index).
+                LINUX_PR_CAPBSET_READ => {
+                    if arg2 > 63 {
+                        return Ok(LINUX_EINVAL.into());
+                    }
+                    DispatchOutcome::Returned {
+                        value: i64::from(crate::namespace::process::capbset_read(arg2 as u32)),
+                    }
+                }
+                LINUX_PR_CAPBSET_DROP => {
+                    if arg2 > 63 {
+                        return Ok(LINUX_EINVAL.into());
+                    }
+                    crate::namespace::process::capbset_drop(arg2 as u32);
+                    DispatchOutcome::Returned { value: 0 }
+                }
                 _ => DispatchOutcome::errno(LINUX_EINVAL),
             })
         }
@@ -628,6 +646,31 @@ impl SyscallDispatcher {
                 });
             }
             Ok(this.getpid())
+        }
+
+        /// unshare(2) — disassociate parts of the caller's execution context.
+        /// carrick honors CLONE_NEWUSER (move the caller into a fresh user
+        /// namespace with full modeled caps + empty maps) and CLONE_NEWPID
+        /// (arm "the next fork becomes the init of a new pid ns" — the caller
+        /// itself does NOT move, per unshare(2)/§5.5). All other namespace
+        /// flags are accept-and-ignore (the guest is treated as already in a
+        /// private instance) rather than EINVAL, so container inits that pass
+        /// CLONE_NEWNS/UTS/IPC/CGROUP/NET don't break (§1.1, §6).
+        fn unshare(this, cx, flags: u64) {
+            let _ = (this, cx);
+            let parsed = LinuxCloneFlags::from_bits_truncate(flags);
+            if parsed.contains(LinuxCloneFlags::NEWUSER) {
+                // Allocate a fresh user ns for the caller; grant full caps in it.
+                let _id = crate::namespace::process::unshare_user_ns();
+            }
+            if parsed.contains(LinuxCloneFlags::NEWPID) {
+                // Does not move the caller; the caller's next fork creates the
+                // new pid ns (consumed in the fork path — Phase 4 wiring).
+                crate::namespace::process::arm_pending_newpid();
+            }
+            // CLONE_NEWNS / NEWUTS / NEWIPC / NEWCGROUP / NEWNET: accepted and
+            // ignored. Unknown bits are likewise tolerated (truncated above).
+            Ok(DispatchOutcome::Returned { value: 0 })
         }
 
         fn set_robust_list(this, cx, head: GuestPtr, len: u64) {

@@ -5058,6 +5058,18 @@ impl SyscallDispatcher {
                                 contents: contents.clone(),
                             };
                         }
+                        OpenDescription::SyntheticFile { path, .. }
+                            if crate::vfs::proc::is_userns_map_path(path) =>
+                        {
+                            // Writing /proc/self/{uid_map,gid_map,setgroups}:
+                            // the user-namespace map writers enforce the
+                            // write-once / setgroups-gate / ≤5-line rules
+                            // (docs/namespaces-design.md §4.3).
+                            return Ok(match crate::vfs::proc::write_userns_map(path, &bytes) {
+                                Ok(n) => DispatchOutcome::Returned { value: n as i64 },
+                                Err(errno) => DispatchOutcome::errno(errno as i32),
+                            });
+                        }
                         _ => return Ok(LINUX_EBADF.into()),
                     }
                 }

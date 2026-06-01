@@ -241,7 +241,7 @@ const AARCH64_SYSCALLS: &[Syscall] = &[
     syscall(94, "exit_group", "process", SupportLevel::BringUp),
     syscall(95, "waitid", "process", SupportLevel::BringUp),
     syscall(96, "set_tid_address", "process", SupportLevel::BringUp),
-    syscall(97, "unshare", "process", SupportLevel::Deferred),
+    syscall(97, "unshare", "process", SupportLevel::BringUp),
     syscall(98, "futex", "process", SupportLevel::BringUp),
     syscall(99, "set_robust_list", "process", SupportLevel::BringUp),
     syscall(100, "get_robust_list", "process", SupportLevel::Deferred),

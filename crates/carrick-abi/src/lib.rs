@@ -1773,6 +1773,12 @@ pub const LINUX_PR_GET_DUMPABLE: u64 = 3;
 pub const LINUX_PR_SET_DUMPABLE: u64 = 4;
 pub const LINUX_PR_SET_NAME: u64 = 15;
 pub const LINUX_PR_GET_NAME: u64 = 16;
+/// `prctl(PR_CAPBSET_READ, cap)` — is `cap` in the calling thread's capability
+/// bounding set? Returns 1/0. `PR_CAPBSET_DROP` removes a cap from the set.
+/// carrick models these against the per-process capability set
+/// (docs/namespaces-design.md §4.4); not enforced, but libcap tools query them.
+pub const LINUX_PR_CAPBSET_READ: u64 = 23;
+pub const LINUX_PR_CAPBSET_DROP: u64 = 24;
 /// `prctl(PR_GET_MEM_MODEL, …)` / `prctl(PR_SET_MEM_MODEL, …)` — query or set
 /// the CPU memory-ordering model. Apple Rosetta 2 issues
 /// `PR_SET_MEM_MODEL(PR_SET_MEM_MODEL_TSO)` at startup to request hardware
@@ -1834,6 +1840,17 @@ pub const LINUX_CLONE_SETTLS: u64 = 0x0008_0000;
 pub const LINUX_CLONE_PARENT_SETTID: u64 = 0x0010_0000;
 pub const LINUX_CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
 pub const LINUX_CLONE_CHILD_SETTID: u64 = 0x0100_0000;
+// Namespace-creation flags (clone(2) / unshare(2)). carrick uses these to
+// place a container in a uid/pid namespace and to honor a guest that creates
+// its own (docs/namespaces-design.md §2.3). Values are man-page-documented.
+// NEWNET is parsed only to reject/ignore — network namespaces are out of scope.
+pub const LINUX_CLONE_NEWNS: u64 = 0x0002_0000;
+pub const LINUX_CLONE_NEWCGROUP: u64 = 0x0200_0000;
+pub const LINUX_CLONE_NEWUTS: u64 = 0x0400_0000;
+pub const LINUX_CLONE_NEWIPC: u64 = 0x0800_0000;
+pub const LINUX_CLONE_NEWUSER: u64 = 0x1000_0000;
+pub const LINUX_CLONE_NEWPID: u64 = 0x2000_0000;
+pub const LINUX_CLONE_NEWNET: u64 = 0x4000_0000;
 
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1896,6 +1913,17 @@ bitflags! {
         const PARENT_SETTID = LINUX_CLONE_PARENT_SETTID;
         const CHILD_CLEARTID = LINUX_CLONE_CHILD_CLEARTID;
         const CHILD_SETTID = LINUX_CLONE_CHILD_SETTID;
+        // Namespace flags (clone(2)/unshare(2)). NEWUSER/NEWPID are the
+        // Docker-relevant pair; the rest are accept-and-ignore (the guest is
+        // treated as already in a private instance) except NEWNET which is
+        // out of scope (docs/namespaces-design.md §1.1, §2.3, §6).
+        const NEWNS = LINUX_CLONE_NEWNS;
+        const NEWCGROUP = LINUX_CLONE_NEWCGROUP;
+        const NEWUTS = LINUX_CLONE_NEWUTS;
+        const NEWIPC = LINUX_CLONE_NEWIPC;
+        const NEWUSER = LINUX_CLONE_NEWUSER;
+        const NEWPID = LINUX_CLONE_NEWPID;
+        const NEWNET = LINUX_CLONE_NEWNET;
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
