@@ -1175,6 +1175,7 @@ impl SyscallDispatcher {
         216 => mremap,
         220 => clone,
         221 => execve,
+        281 => execveat,
         222 => mmap,
         223 => fadvise64,
         226 => mprotect,

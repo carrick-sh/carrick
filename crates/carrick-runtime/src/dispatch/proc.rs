@@ -1610,6 +1610,45 @@ impl SyscallDispatcher {
             Ok(DispatchOutcome::Execve { path, argv, env })
         }
 
+        /// execveat(dirfd, path, argv, envp, flags): execve relative to a dir fd,
+        /// or — with AT_EMPTY_PATH and an empty path — execute the fd itself
+        /// (this is how glibc/musl `fexecve` and CPython `os.execve(fd, …)` work;
+        /// the guest issues execveat, not execve, so without this it was ENOSYS).
+        fn execveat(this, cx, dirfd: u64, pathname_addr: GuestPtr, argv_addr: GuestPtr, envp_addr: GuestPtr, flags: u64) {
+            let memory = &*cx.memory;
+            let path_str = match read_guest_c_string(memory, pathname_addr.0) {
+                Ok(p) => p,
+                Err(errno) => return Ok(errno.into()),
+            };
+            let path = if flags & LINUX_AT_EMPTY_PATH != 0 && path_str.is_empty() {
+                // fexecve: dirfd IS the executable's open fd. Recover the guest
+                // path it was opened at (HostFile/File/etc.) and execve that.
+                let fd = dirfd as i32;
+                let p = this.open_file(fd).and_then(|f| {
+                    let d = f.description.read();
+                    d.open_path().map(|s| s.to_string())
+                });
+                match p {
+                    Some(p) => p,
+                    None => return Ok(LINUX_EBADF.into()),
+                }
+            } else {
+                match this.resolve_at_path(dirfd, &path_str) {
+                    Ok(p) => p,
+                    Err(errno) => return Ok(errno.into()),
+                }
+            };
+            let argv = match read_guest_string_array_bytes(memory, argv_addr.0) {
+                Ok(v) => v,
+                Err(errno) => return Ok(errno.into()),
+            };
+            let env = match read_guest_string_array_bytes(memory, envp_addr.0) {
+                Ok(v) => v,
+                Err(errno) => return Ok(errno.into()),
+            };
+            Ok(DispatchOutcome::Execve { path, argv, env })
+        }
+
         fn clone(this, cx, flags: u64, stack: u64, parent_tid: GuestPtr, tls: u64, child_tid: GuestPtr) {
             // Kernel flag-consistency rules (linux/kernel/fork.c copy_process):
             // CLONE_THREAD requires CLONE_SIGHAND, and CLONE_SIGHAND requires
