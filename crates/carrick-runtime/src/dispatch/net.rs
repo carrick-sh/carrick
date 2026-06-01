@@ -3176,6 +3176,12 @@ impl SyscallDispatcher {
         // having to keep guest pointers alive across the FFI call.
         let mut data = Vec::new();
         for iov in iovecs {
+            // An empty iovec contributes nothing — and its base is allowed to be
+            // NULL (libuv sends a zero-length datagram as uv_buf_init(NULL, 0)).
+            // read_bytes(NULL, 0) would otherwise fault, so skip it.
+            if iov.iov_len == 0 {
+                continue;
+            }
             let chunk = match memory.read_bytes(iov.iov_base, iov.iov_len as usize) {
                 Ok(b) => b,
                 Err(_) => {
