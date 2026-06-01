@@ -912,6 +912,13 @@ pub struct SyscallDispatcher {
     /// SysV shared-memory registry (per-process; host-file-backed so forked
     /// guests share segments by inode through `/tmp/carrick-shm/`).
     sysv: Mutex<sysv::SysvShmState>,
+    /// The supplementary group set installed by `setgroups(2)`, or `None` if the
+    /// guest never called it (then `getgroups` falls back to the /etc/group-
+    /// derived membership for `id(1)` compatibility). `setgroups` replaces this
+    /// whole set; `getgroups` returns it verbatim. Process-wide; a `libc::fork`
+    /// child inherits it via the memory copy and it survives `execve`
+    /// (matching Linux — CPython subprocess `extra_groups=` sets it pre-exec).
+    setgroups_override: Mutex<Option<Vec<u32>>>,
 }
 
 /// Owns an epoll instance's kqueue and keeps it in the in-memory-wake registry
@@ -1241,6 +1248,7 @@ impl SyscallDispatcher {
             fs: fs::FsState::new(),
             seccomp: crate::seccomp::SeccompState::default(),
             sysv: Mutex::new(sysv::SysvShmState::new()),
+            setgroups_override: Mutex::new(None),
         }
     }
 
