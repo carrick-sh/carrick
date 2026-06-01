@@ -57,6 +57,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 name: None,
                 rm: false,
                 publish: vec![],
+                pid: carrick_spec::PidMode::Private,
                 forward_env: vec![],
                 command: vec!["/bin/sh".to_owned()],
             }
@@ -232,6 +233,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             name,
             rm,
             publish: _,
+            pid,
             forward_env,
             command,
         } => {
@@ -276,6 +278,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 max_traps,
                 debug_state_path: debug_state_path.map(|p| p.to_string_lossy().into_owned()),
                 fs,
+                pid,
             };
 
             let engine = carrick_engine::Engine::new(store.clone());
