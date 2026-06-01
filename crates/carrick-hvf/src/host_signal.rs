@@ -906,6 +906,48 @@ pub fn ensure_host_handler(linux_signum: i32) {
     }
 }
 
+/// Mirror a guest `SIG_IGN` disposition to the HOST disposition, so a
+/// CROSS-PROCESS `kill` from a sibling guest process is DROPPED at the host
+/// level (matching the guest's ignore) instead of taking macOS's default
+/// action — which for most signals is to TERMINATE this carrick process. The
+/// guest set `linux_signum` to `SIG_IGN`; without this, another guest process's
+/// `kill(us, sig)` killed us (CPython test_interprocess_signal: the parent set
+/// SIGUSR2=SIG_IGN, a child `kill`ed it, and the parent died with -12).
+///
+/// Excludes signals carrick must keep its own host disposition for:
+///   * SIGKILL(9)/SIGSTOP(19): can't be caught or ignored.
+///   * SIGPIPE(13)/SIGCHLD(17): carrick-managed (internal EPIPE / wait4).
+///   * SIGINT(2): carrick keeps its own Ctrl-C handler; a guest-ignored SIGINT
+///     is dropped at the dispatch layer (the routed handler marks it pending,
+///     the delivery cycle sees SIG_IGN and discards it) — so the process still
+///     survives a cross-process SIGINT without host-ignoring it.
+///   * Synchronous faults SIGILL(4)/SIGTRAP(5)/SIGABRT(6)/SIGBUS(7)/SIGFPE(8)/
+///     SIGSEGV(11): the host disposition is shared between a real synchronous
+///     fault and an async kill; host-SIG_IGN'ing one would make a genuine fault
+///     re-execute forever. carrick keeps catching these (handle_routed); a
+///     cross-process instance is dropped at the dispatch layer instead.
+pub fn set_host_ignore(linux_signum: i32) {
+    if !(1..=63).contains(&linux_signum)
+        || matches!(linux_signum, 2 | 4 | 5 | 6 | 7 | 8 | 9 | 11 | 13 | 17 | 19)
+    {
+        return;
+    }
+    let host = linux_to_host_signum(linux_signum);
+    // SAFETY: zero-initialised sigaction with SIG_IGN is the documented
+    // "ignore, no flags, empty mask" form.
+    unsafe {
+        let mut action: libc::sigaction = core::mem::zeroed();
+        action.sa_sigaction = libc::SIG_IGN;
+        libc::sigemptyset(&mut action.sa_mask);
+        action.sa_flags = 0;
+        libc::sigaction(host, &action, std::ptr::null_mut());
+    }
+    // The host no longer routes this signal (it's ignored), so drop the
+    // routed-handler bookkeeping: a later ensure_host_handler (guest installs a
+    // real handler) must re-install handle_routed rather than skip as a no-op.
+    INSTALLED_MASK.fetch_and(!(1u64 << linux_signum), Ordering::SeqCst);
+}
+
 /// Reset host signal dispositions that were installed only to route guest
 /// caught-signal handlers. Guest `execve(2)` resets caught dispositions to
 /// default while preserving `SIG_IGN`; because Carrick does not host-exec, the
