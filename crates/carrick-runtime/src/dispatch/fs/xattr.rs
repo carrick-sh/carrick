@@ -38,9 +38,16 @@ impl SyscallDispatcher {
                 match &*open {
                     OpenDescription::File { path, .. }
                     | OpenDescription::Directory { path, .. } => Ok(path.clone()),
-                    // HostFile caches no path; xattr on a raw host fd that has
-                    // no recoverable rootfs path is unsupported. The probe and
-                    // the common case use the path variants.
+                    // A disk-backed HostFile (the `--fs host` common case, e.g.
+                    // tempfile.mkstemp's fd) carries its guest rootfs path in
+                    // metadata; recover it so f-variant xattr syscalls work
+                    // (CPython's xattr-support probe does os.setxattr(fd, ...)).
+                    OpenDescription::HostFile { metadata, .. } => metadata
+                        .path
+                        .to_str()
+                        .map(str::to_owned)
+                        .ok_or(LINUX_ENOTSUP),
+                    // Pipes/sockets/etc. have no backing file → unsupported.
                     _ => Err(LINUX_ENOTSUP),
                 }
             }
