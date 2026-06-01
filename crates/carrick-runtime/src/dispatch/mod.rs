@@ -503,6 +503,17 @@ impl<M: GuestMemory> SyscallCtx<'_, M> {
     pub fn raw_args(&self) -> SyscallArgs {
         self.request.args
     }
+
+    /// The current guest thread's Linux tid, as keyed by the signal/IO-wait
+    /// machinery (`host_signal`, `io_wait`). Falls back to the process pid (the
+    /// main thread's tid) on the single-threaded path where no thread ctx is
+    /// present — matching how the run loop derives `this_tid`.
+    #[inline]
+    pub fn tid(&self) -> crate::thread::ThreadId {
+        self.thread
+            .map(|t| t.tid)
+            .unwrap_or(std::process::id() as crate::thread::ThreadId)
+    }
 }
 
 /// Per-thread coordination handles handed to tid-aware syscall handlers
@@ -3942,9 +3953,47 @@ fn read_host_pipe(
     DispatchOutcome::Returned { value: n as i64 }
 }
 
+/// Result of parking a blocking pipe write that has made partial progress.
+enum PipeWriteWait {
+    /// The fd is writable (or errored) — retry the write.
+    Ready,
+    /// A guest signal is pending (or a fork quiesce began) — stop and surface
+    /// the partial count already written.
+    Interrupted,
+}
+
+/// Park the calling guest thread until `host_fd` is writable, a guest signal
+/// becomes pending for `tid`, or a fork quiesce begins. The bounded poll timeout
+/// backstops the case where the interrupting host signal was consumed before we
+/// parked, so the pending flag is always re-checked.
+fn wait_pipe_writable(host_fd: i32, tid: crate::thread::ThreadId) -> PipeWriteWait {
+    loop {
+        if crate::host_signal::has_unblocked_pending_for(tid, 0)
+            || crate::fork_quiesce::is_quiescing()
+        {
+            return PipeWriteWait::Interrupted;
+        }
+        let mut pfd = libc::pollfd {
+            fd: host_fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        // 50ms backstop: poll is normally woken immediately either by POLLOUT
+        // (the reader drained the pipe) or by the host signal interrupting it.
+        let r = unsafe { libc::poll(&mut pfd, 1, 50) };
+        if r > 0 && (pfd.revents & (libc::POLLOUT | libc::POLLERR | libc::POLLHUP)) != 0 {
+            return PipeWriteWait::Ready;
+        }
+    }
+}
+
 /// write(2) on a host-backed fd. Same lockless discipline as `read_host_pipe`.
-fn write_host_pipe(bytes: &[u8], host_fd: i32, nonblocking: bool) -> DispatchOutcome {
-    const LINUX_PIPE_BUF: usize = 4096;
+fn write_host_pipe(
+    bytes: &[u8],
+    host_fd: i32,
+    nonblocking: bool,
+    tid: crate::thread::ThreadId,
+) -> DispatchOutcome {
     if std::env::var_os("CARRICK_IO_DBG").is_some() && !bytes.is_empty() {
         eprintln!(
             "[IODBG] WRITE host_fd={host_fd} n={} bytes={:02x?}",
@@ -3953,7 +4002,13 @@ fn write_host_pipe(bytes: &[u8], host_fd: i32, nonblocking: bool) -> DispatchOut
         );
     }
     crate::dispatch::net::set_host_nonblocking(host_fd);
-    let complete_atomic_pipe_write = !nonblocking && bytes.len() <= LINUX_PIPE_BUF && {
+    // A blocking write to a pipe must not return a short count: Linux blocks
+    // until every byte is written, or returns the partial count when a signal
+    // interrupts it after partial progress (EINTR if zero progress). Loop until
+    // complete, parking on POLLOUT in a signal-aware wait. (Small <=PIPE_BUF
+    // writes were already looped for atomicity; this generalizes it to any size
+    // so e.g. a >capacity unbuffered write blocks as it would on Linux.)
+    let block_until_complete = !nonblocking && {
         let mut st: libc::stat = unsafe { core::mem::zeroed() };
         (unsafe { libc::fstat(host_fd, &mut st) }) == 0
             && (st.st_mode & libc::S_IFMT) == libc::S_IFIFO
@@ -4000,22 +4055,37 @@ fn write_host_pipe(bytes: &[u8], host_fd: i32, nonblocking: bool) -> DispatchOut
             // Route through the readiness wait rather than leaking it to the guest
             // (see read_host_pipe).
             if e == LINUX_EAGAIN || e == LINUX_EINTR {
-                if complete_atomic_pipe_write && offset > 0 {
-                    let mut pfd = libc::pollfd {
-                        fd: host_fd,
-                        events: libc::POLLOUT,
-                        revents: 0,
-                    };
-                    unsafe { libc::poll(&mut pfd, 1, -1) };
-                    continue;
+                if block_until_complete && offset > 0 {
+                    // Partial progress already made: we cannot re-dispatch the
+                    // whole syscall (it would re-send the written prefix), so
+                    // block here until the pipe is writable or a signal lands,
+                    // surfacing the partial count on interrupt.
+                    match wait_pipe_writable(host_fd, tid) {
+                        PipeWriteWait::Ready => continue,
+                        PipeWriteWait::Interrupted => {
+                            return DispatchOutcome::Returned {
+                                value: offset as i64,
+                            };
+                        }
+                    }
                 }
                 return would_block_outcome(host_fd, libc::POLLOUT, nonblocking);
             }
             return DispatchOutcome::Errno { errno: e };
         }
-        if complete_atomic_pipe_write {
+        if block_until_complete {
             offset += n as usize;
             if offset < bytes.len() {
+                // A signal that arrives mid-write interrupts it on Linux,
+                // returning the partial count; check between chunks so a long
+                // write doesn't ignore an armed alarm (or a pending quiesce).
+                if crate::host_signal::has_unblocked_pending_for(tid, 0)
+                    || crate::fork_quiesce::is_quiescing()
+                {
+                    return DispatchOutcome::Returned {
+                        value: offset as i64,
+                    };
+                }
                 continue;
             }
             return DispatchOutcome::Returned {
