@@ -3380,6 +3380,9 @@ impl SyscallDispatcher {
         // (which may run on a retry) so they're installed/written-back exactly
         // once after a successful recvmsg. Same for the guest msg_flags.
         let received_host_fds = std::cell::RefCell::new(Vec::<i32>::new());
+        // IPv6 RFC 3542 ancillary cmsgs (hop-limit/tclass/pktinfo) the host
+        // returned, as (linux_cmsg_type, data) — forwarded to the guest below.
+        let received_ipv6_cmsgs = std::cell::RefCell::new(Vec::<(i32, Vec<u8>)>::new());
         let guest_msg_flags = std::cell::Cell::new(0i32);
         let outcome = self.blocking_io(host_fd, IoDir::Read, nonblocking, recv_to, || {
             // A retry must not leak fds from a prior partial attempt.
@@ -3423,6 +3426,8 @@ impl SyscallDispatcher {
             if want_control && hmsg.msg_controllen as usize > 0 {
                 let got = parse_host_scm_rights_fds(&hcontrol, hmsg.msg_controllen as usize);
                 *received_host_fds.borrow_mut() = got;
+                *received_ipv6_cmsgs.borrow_mut() =
+                    parse_host_ipv6_cmsgs(&hcontrol, hmsg.msg_controllen as usize);
             }
             // Scatter the received bytes back into the guest's iovecs.
             let mut remaining = n as usize;
@@ -3484,12 +3489,17 @@ impl SyscallDispatcher {
             let mut linux_flags = guest_msg_flags.get();
             let mut written_controllen = 0u64;
             if want_control {
-                let (ctrl, truncated) = build_linux_scm_rights(&guest_fds, msg.controllen as usize);
+                let (scm, scm_trunc) = build_linux_scm_rights(&guest_fds, msg.controllen as usize);
+                // Append the translated IPv6 ancillary cmsgs after any SCM_RIGHTS
+                // record, honoring the guest's controllen (overflow → MSG_CTRUNC).
+                let ipv6 = received_ipv6_cmsgs.borrow();
+                let (ctrl, ipv6_trunc) =
+                    build_linux_ipv6_cmsgs(&scm, &ipv6, msg.controllen as usize);
                 if !ctrl.is_empty() && memory.write_bytes(msg.control, &ctrl).is_err() {
                     return Ok(LINUX_EFAULT.into());
                 }
                 written_controllen = ctrl.len() as u64;
-                if truncated {
+                if scm_trunc || ipv6_trunc {
                     linux_flags |= crate::linux_abi::LINUX_MSG_CTRUNC as i32;
                 }
             }
