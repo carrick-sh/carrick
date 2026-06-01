@@ -1974,11 +1974,21 @@ impl SyscallDispatcher {
                 }
             }
             let fd_flags = linux_fd_flags_from_open_flags(flags);
+            // Both ends share ONE capacity cell so F_SETPIPE_SZ on either end is
+            // observed by F_GETPIPE_SZ on the other (Linux: one buffer per pipe;
+            // CPython test_subprocess.test_pipesizes sets on write, reads on read).
+            let cap_cell = Arc::new(std::sync::atomic::AtomicI64::new(
+                crate::linux_abi::LINUX_PIPE_BUF_SIZE,
+            ));
+            let mut read_base = OpenDescriptionBase::new(LINUX_O_RDONLY | nonblock);
+            read_base.set_pipe_capacity_cell(Arc::clone(&cap_cell));
+            let mut write_base = OpenDescriptionBase::new(LINUX_O_WRONLY | nonblock);
+            write_base.set_pipe_capacity_cell(cap_cell);
             let read_open = OpenFile::with_host_fd(
                 Arc::new(RwLock::new(OpenDescription::HostPipe {
                     host_fd: host_read,
                     is_read_end: true,
-                    base: OpenDescriptionBase::new(LINUX_O_RDONLY | nonblock),
+                    base: read_base,
                     pty: None,
                     bidirectional: false,
                 })),
@@ -1989,7 +1999,7 @@ impl SyscallDispatcher {
                 Arc::new(RwLock::new(OpenDescription::HostPipe {
                     host_fd: host_write,
                     is_read_end: false,
-                    base: OpenDescriptionBase::new(LINUX_O_WRONLY | nonblock),
+                    base: write_base,
                     pty: None,
                     bidirectional: false,
                 })),
