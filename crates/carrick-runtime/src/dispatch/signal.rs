@@ -889,6 +889,13 @@ impl SyscallDispatcher {
                     h != crate::linux_abi::LINUX_SIG_DFL && h != crate::linux_abi::LINUX_SIG_IGN;
                 if real_handler {
                     crate::host_signal::ensure_host_handler(signum);
+                } else if h == crate::linux_abi::LINUX_SIG_IGN {
+                    // Mirror SIG_IGN to the host disposition so a CROSS-PROCESS
+                    // kill from a sibling guest process is dropped instead of
+                    // host-default-terminating us (test_interprocess_signal:
+                    // SIGUSR2=SIG_IGN + child kill → parent died -12; probe
+                    // xprocsigign). Excludes faults/carrick-managed signals.
+                    crate::host_signal::set_host_ignore(signum);
                 }
                 // pid-1 protection (§5.4): if WE are the ns-init, publish whether
                 // we now handle this signal so the kill path knows not to drop a
