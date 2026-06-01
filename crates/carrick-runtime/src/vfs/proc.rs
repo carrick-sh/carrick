@@ -699,11 +699,23 @@ fn synthetic_proc_self_status(executable_path: &str) -> String {
     let rss_kb = host.resident_bytes / 1024;
     let peak_kb = (host.virtual_bytes.max(host.maxrss_bytes)) / 1024;
     let hwm_kb = host.maxrss_bytes / 1024;
-    // Pid/Tgid must match what getpid()/gettid() return (std::process::id()),
-    // not a hardcoded 1 — LTP gettid01 reads /proc/self/status "Pid:" and
-    // asserts it equals gettid()/getpid(). A single-threaded process has
-    // Pid == Tgid.
-    let pid = std::process::id();
+    // Pid/Tgid must match what getpid()/gettid() return — in a PID namespace
+    // that is the ns-local pid (1 for the container init), not the host pid;
+    // identity otherwise. LTP gettid01 reads "Pid:" and asserts it equals
+    // getpid(). A single-threaded process has Pid == Tgid.
+    let pid = crate::namespace::pid::self_ns_pid();
+    // PPid is the ns-translated parent: 0 for the init, the parent's ns-pid for
+    // others (was hardcoded 0, which diverged from Docker for non-init members).
+    // Preserve the historical `PPid: 0` for non-namespaced runs (run-elf) so
+    // that path is unchanged. The kernel's NStgid/NSpid/NSpgid/NSsid quartet is
+    // intentionally omitted — NSpgid/NSsid need pgid/sid translation that stays
+    // host-level in Phase 2, so a partial quartet would diverge worse than its
+    // absence (§5.3, §6.6).
+    let ppid = if crate::namespace::pid::enabled() {
+        crate::namespace::pid::self_ns_ppid()
+    } else {
+        0
+    };
     // Capabilities: report the modeled set (Docker default 00000000a80425fb,
     // or a full set inside a freshly-created user namespace), NOT the all-zero
     // set — capability-probing tools (apt/dpkg/setpriv) refuse to proceed if
@@ -716,7 +728,7 @@ State:\tR (running)\n\
 Tgid:\t{pid}\n\
 Ngid:\t0\n\
 Pid:\t{pid}\n\
-PPid:\t0\n\
+PPid:\t{ppid}\n\
 TracerPid:\t0\n\
 Uid:\t0\t0\t0\t0\n\
 Gid:\t0\t0\t0\t0\n\

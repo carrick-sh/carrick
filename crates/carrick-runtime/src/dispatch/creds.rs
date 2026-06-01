@@ -165,8 +165,10 @@ impl SyscallDispatcher {
     }
 
     pub(super) fn getpid(&self) -> DispatchOutcome {
+        // In a PID namespace the container init is pid 1 and every member sees
+        // its ns-local pid; identity (the host pid) otherwise (§5.3).
         DispatchOutcome::Returned {
-            value: std::process::id() as i64,
+            value: i64::from(crate::namespace::pid::self_ns_pid()),
         }
     }
 
@@ -543,6 +545,15 @@ impl SyscallDispatcher {
         }
 
         fn sys_getppid(this, cx) {
+            // PID-namespace translation (§5.3, §5.4): the ns-init (ns-pid 1) has
+            // no parent inside the namespace, so getppid()==0; other members map
+            // their host ppid to its ns-pid (0 if the parent is outside the ns);
+            // a reparented orphan reports ns-pid 1.
+            if crate::namespace::pid::enabled() {
+                return Ok(DispatchOutcome::Returned {
+                    value: i64::from(crate::namespace::pid::self_ns_ppid()),
+                });
+            }
             let bootstrap_host_pid = this.proc.lock().bootstrap_host_pid;
             let value = if std::process::id() == bootstrap_host_pid {
                 LINUX_BOOTSTRAP_PID as i64

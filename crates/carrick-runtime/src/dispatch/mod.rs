@@ -1779,11 +1779,25 @@ impl SyscallDispatcher {
                 dispatch_threaded_signal_route(tid, registry, target, signum)?
             }
             178 => {
+                // gettid: the MAIN thread's tid equals the process host pid, so
+                // in a PID namespace it must read as the process's ns-pid; a
+                // single-threaded process reports its ns getpid. Worker tids
+                // (> main_tid) are per-process and not ns-translated (§5.3).
+                // Mirrors the `gettid` macro handler (proc.rs). Identity when
+                // namespaces are off.
                 if registry.live_count() > 1 {
-                    DispatchOutcome::Returned { value: tid as i64 }
+                    let t = tid as u32;
+                    let ns = if t == std::process::id() {
+                        crate::namespace::pid::host_to_ns_or_self(t)
+                    } else {
+                        t
+                    };
+                    DispatchOutcome::Returned {
+                        value: i64::from(ns),
+                    }
                 } else {
                     DispatchOutcome::Returned {
-                        value: std::process::id() as i64,
+                        value: i64::from(crate::namespace::pid::self_ns_pid()),
                     }
                 }
             }
