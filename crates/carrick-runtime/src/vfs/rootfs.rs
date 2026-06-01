@@ -198,6 +198,12 @@ impl RootFsVfs {
                 });
             }
             Some(OverlayEntry::Dir) => {
+                // O_EXCL "fail if it already exists" takes priority over EISDIR
+                // (Linux open(2)): tempfile.mkstemp relies on EEXIST to retry the
+                // next candidate name when it collides with an existing dir.
+                if want_create && want_excl {
+                    return Err(LINUX_EEXIST);
+                }
                 if writable_request {
                     return Err(LINUX_EISDIR);
                 }
@@ -294,6 +300,10 @@ impl RootFsVfs {
                     })
                 }
                 RootFsEntryKind::Directory => {
+                    // O_EXCL takes priority over EISDIR (see the overlay Dir arm).
+                    if want_create && want_excl {
+                        return Err(LINUX_EEXIST);
+                    }
                     let entries = crate::overlay::layered_directory_entries(
                         self.overlay.as_ref(),
                         self.rootfs.as_ref(),
