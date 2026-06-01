@@ -2029,11 +2029,11 @@ impl SyscallDispatcher {
             // >= RLIMIT_NOFILE soft limit) is EBADF, NOT EINVAL. old_fd == new_fd
             // is EINVAL (dup2 handles that case in glibc without reaching here).
             // new_fd 0/1/2 is allowed — that's how shells redirect std streams.
-            const RLIMIT_NOFILE_CUR: i32 = 1024;
+            let nofile_cur = this.nofile_limit();
             if flags & !LINUX_O_CLOEXEC != 0 {
                 return Ok(LINUX_EINVAL.into());
             }
-            if !(0..RLIMIT_NOFILE_CUR).contains(&new_fd.0) {
+            if !(0..nofile_cur).contains(&new_fd.0) {
                 return Ok(LINUX_EBADF.into());
             }
             if old_fd.0 == new_fd.0 {

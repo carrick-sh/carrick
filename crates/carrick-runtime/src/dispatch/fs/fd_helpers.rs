@@ -10,12 +10,12 @@ impl SyscallDispatcher {
         min_fd: i32,
         reserved: Option<i32>,
         closed_stdio: &[bool; 3],
+        limit: i32,
     ) -> Option<i32> {
-        // Cap at the soft RLIMIT_NOFILE (1024, matching getrlimit/prlimit and
-        // /proc/self/limits): descriptors run 0..1024, so the first free slot
-        // at or above the limit means the table is full. `None` => the caller
-        // returns EMFILE, matching Linux fd exhaustion.
-        const RLIMIT_NOFILE_CUR: i32 = 1024;
+        // Cap at the guest's soft RLIMIT_NOFILE (`limit`, from io.nofile_soft;
+        // default 1024, raisable via setrlimit): descriptors run 0..limit, so
+        // the first free slot at or above it means the table is full. `None` =>
+        // the caller returns EMFILE, matching Linux fd exhaustion.
         let mut fd = min_fd.max(0);
         loop {
             // A bare stdio number (0/1/2) is reserved (not allocatable) UNLESS the
@@ -27,11 +27,15 @@ impl SyscallDispatcher {
             }
             fd = fd.checked_add(1)?;
         }
-        if fd >= RLIMIT_NOFILE_CUR {
-            None
-        } else {
-            Some(fd)
-        }
+        if fd >= limit { None } else { Some(fd) }
+    }
+
+    /// The guest's current soft RLIMIT_NOFILE as an i32 fd ceiling.
+    pub(in crate::dispatch) fn nofile_limit(&self) -> i32 {
+        self.io
+            .nofile_soft
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .min(i32::MAX as u64) as i32
     }
 
     /// Clear the "closed" flag for a reused stdio fd (it is open again).
@@ -71,11 +75,12 @@ impl SyscallDispatcher {
         min_fd: i32,
         open_file: OpenFile,
     ) -> Result<i32, OpenFile> {
+        let limit = self.nofile_limit();
         let mut table = self.io.open_files.write();
         // Lock order: open_files → closed_stdio (the close path never holds both).
         let fd = {
             let closed = self.io.closed_stdio.lock();
-            match Self::first_free_fd(&table, min_fd, None, &closed) {
+            match Self::first_free_fd(&table, min_fd, None, &closed, limit) {
                 Some(fd) => fd,
                 None => return Err(open_file),
             }
@@ -94,15 +99,20 @@ impl SyscallDispatcher {
         first: OpenFile,
         second: OpenFile,
     ) -> Result<(i32, i32), (OpenFile, OpenFile)> {
+        let limit = self.nofile_limit();
         let mut table = self.io.open_files.write();
         let (first_fd, second_fd) = {
             let closed = self.io.closed_stdio.lock();
-            let Some(first_fd) = Self::first_free_fd(&table, min_fd, None, &closed) else {
+            let Some(first_fd) = Self::first_free_fd(&table, min_fd, None, &closed, limit) else {
                 return Err((first, second));
             };
-            let Some(second_fd) =
-                Self::first_free_fd(&table, first_fd.saturating_add(1), Some(first_fd), &closed)
-            else {
+            let Some(second_fd) = Self::first_free_fd(
+                &table,
+                first_fd.saturating_add(1),
+                Some(first_fd),
+                &closed,
+                limit,
+            ) else {
                 return Err((first, second));
             };
             (first_fd, second_fd)
