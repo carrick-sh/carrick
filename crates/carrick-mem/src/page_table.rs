@@ -641,17 +641,36 @@ impl PageTableManager {
         } else {
             (USER_PAGE_FLAGS & !AP_MASK) | AP_RO
         };
-        if va % TWO_MIB == 0 && ipa % TWO_MIB == 0 && len % TWO_MIB == 0 {
-            let n = len / TWO_MIB;
-            for i in 0..n {
+        if va % TWO_MIB == 0 && ipa % TWO_MIB == 0 {
+            // Map the 2 MiB-aligned BULK as L2 block leaves (one descriptor per
+            // 2 MiB, no per-2-MiB L3 table), then the sub-2-MiB TAIL as 4 KiB
+            // pages (a single L3 table). A multi-GiB alias whose length is not a
+            // multiple of 2 MiB — e.g. CPython's `mmap` of a 2 GiB sparse file →
+            // 2 GiB + 16 KiB — otherwise fell to the page-granular loop below for
+            // the WHOLE region, allocating ~1 L3 table per 2 MiB (~1024 tables for
+            // 2 GiB). That exhausts the spare pool (OutOfTables) and leaves a
+            // half-built mapping the guest re-faults on forever (an apparent hang).
+            let blocks = len / TWO_MIB;
+            for i in 0..blocks {
                 let v = va + i * TWO_MIB;
                 let p = ipa + i * TWO_MIB;
                 let l2_off = self.descend_creating(v, 2)?;
                 let idx = indices(v);
                 self.write_desc(l2_off + idx[2] * 8, (p & PA_MASK_2MIB) | block_flags);
             }
+            let tail_off = blocks * TWO_MIB;
+            let tail_pages = (len - tail_off).div_ceil(FOUR_KIB);
+            for j in 0..tail_pages {
+                let v = va + tail_off + j * FOUR_KIB;
+                let p = ipa + tail_off + j * FOUR_KIB;
+                let l3_off = self.descend_creating(v, 3)?;
+                let idx = indices(v);
+                self.write_desc(l3_off + idx[3] * 8, (p & PA_MASK_4KIB) | page_flags);
+            }
             return Ok(true);
         }
+        // va/ipa not 2 MiB-aligned (no caller does this for aliases today, but
+        // keep a correct fallback): page-granular throughout.
         let pages = len.div_ceil(FOUR_KIB);
         for i in 0..pages {
             let v = va + i * FOUR_KIB;
@@ -720,7 +739,10 @@ impl PageTableManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::{LINUX_MMAP_BASE, LINUX_PAGE_TABLES_BASE, stage1_identity_page_tables};
+    use crate::memory::{
+        LINUX_ALIAS_IPA_BASE, LINUX_HIGH_VA_THRESHOLD, LINUX_MMAP_BASE, LINUX_PAGE_TABLES_BASE,
+        stage1_identity_page_tables,
+    };
 
     fn manager() -> PageTableManager {
         // Pad with spare table pages so split has room (mirrors Phase C1).
@@ -782,6 +804,42 @@ mod tests {
         mgr.set_rw(va, 0x2000, true).expect("rw");
         assert!(mgr.is_valid(va));
         assert!(mgr.is_valid(va + 0x1000));
+    }
+
+    #[test]
+    fn map_aliased_large_unaligned_len_does_not_exhaust_table_pool() {
+        // A large file-backed alias whose length is NOT a multiple of 2 MiB (e.g.
+        // CPython's `mmap(2GB-sparse-file)` → 2 GiB + 16 KiB) must map its
+        // 2 MiB-aligned bulk as BLOCKS (L2 leaves, no L3 table per 2 MiB) and only
+        // the sub-2 MiB tail as 4 KiB pages. The old code fell to a fully
+        // page-granular loop for the WHOLE region, allocating one L3 table per
+        // 2 MiB — ~1024 tables for 2 GiB — which exhausts the spare pool, returns
+        // OutOfTables, and (in the runtime) leaves a half-built mapping the guest
+        // re-faults on forever. 128 MiB + 16 KiB needs ~66 L3 tables page-granular
+        // (> the 56-page test pool) but only ~3 tables block+tail.
+        let mut mgr = manager();
+        let va = LINUX_HIGH_VA_THRESHOLD; // 1 TiB, 2 MiB-aligned (alias VA base)
+        let ipa = LINUX_ALIAS_IPA_BASE; // 96 GiB, 2 MiB-aligned
+        let bulk = 128 * (1u64 << 20); // 128 MiB (64 blocks)
+        let len = bulk + 0x4000; // + 16 KiB tail → not 2 MiB-aligned
+        let ok = mgr
+            .map_aliased(va, ipa, len, true)
+            .expect("large unaligned alias must not exhaust the table pool");
+        assert!(ok);
+        assert!(mgr.is_valid(va), "first block of the bulk is mapped");
+        assert!(
+            mgr.is_valid(va + bulk - 0x1000),
+            "last page of the bulk is mapped"
+        );
+        assert!(
+            mgr.is_valid(va + bulk),
+            "first tail page (past the 2 MiB-aligned bulk) is mapped"
+        );
+        assert!(mgr.is_valid(va + len - 0x1000), "last tail page is mapped");
+        assert!(
+            !mgr.is_valid(va + len),
+            "one page past the mapping is NOT mapped"
+        );
     }
 
     #[test]
