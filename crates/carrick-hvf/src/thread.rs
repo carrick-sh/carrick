@@ -20,6 +20,11 @@ struct ThreadEntry {
     /// the kernel already knows whether the thread is WAITING, and it covers
     /// every blocking path). 0 = not yet recorded.
     mach_port: crate::host_proc::ThreadPort,
+    /// Per-thread name (prctl PR_SET_NAME / pthread_setname_np), exposed via
+    /// /proc/<pid>/task/<tid>/comm. `None` until the thread names itself; the
+    /// /proc handler then falls back to the executable basename. TASK_COMM_LEN
+    /// is 16 (15 chars + NUL).
+    name: Option<[u8; 16]>,
 }
 
 pub struct ThreadRegistry {
@@ -49,6 +54,16 @@ pub fn current_thread_states() -> Vec<(ThreadId, char)> {
         .unwrap_or_default()
 }
 
+/// `tid`'s prctl/pthread-set name from the current process's registry, if set.
+/// Used by the /proc/<pid>/task/<tid>/comm handler (which has no direct
+/// registry handle) to report per-thread names.
+pub fn current_thread_name(tid: ThreadId) -> Option<[u8; 16]> {
+    CURRENT_REGISTRY
+        .lock()
+        .as_ref()
+        .and_then(|r| r.thread_name(tid))
+}
+
 impl ThreadRegistry {
     pub fn new(main_tid: ThreadId) -> Self {
         let mut map = HashMap::new();
@@ -57,6 +72,7 @@ impl ThreadRegistry {
             ThreadEntry {
                 clear_child_tid: 0,
                 mach_port: 0,
+                name: None,
             },
         );
         Self {
@@ -72,6 +88,7 @@ impl ThreadRegistry {
             ThreadEntry {
                 clear_child_tid,
                 mach_port: 0,
+                name: None,
             },
         );
         tid
@@ -110,6 +127,23 @@ impl ThreadRegistry {
     /// doesn't block `sig`.
     pub fn live_tids(&self) -> Vec<ThreadId> {
         self.inner.lock().keys().copied().collect()
+    }
+
+    /// Set `tid`'s name (prctl PR_SET_NAME / pthread_setname_np). `name` is the
+    /// raw bytes; truncated to 15 + a NUL terminator (TASK_COMM_LEN = 16).
+    pub fn set_thread_name(&self, tid: ThreadId, name: &[u8]) {
+        let mut buf = [0u8; 16];
+        let n = name.iter().take_while(|&&b| b != 0).count().min(15);
+        buf[..n].copy_from_slice(&name[..n]);
+        if let Some(e) = self.inner.lock().get_mut(&tid) {
+            e.name = Some(buf);
+        }
+    }
+
+    /// `tid`'s name, if it has named itself; `None` falls back to the exe
+    /// basename at the /proc/comm layer.
+    pub fn thread_name(&self, tid: ThreadId) -> Option<[u8; 16]> {
+        self.inner.lock().get(&tid).and_then(|e| e.name)
     }
 
     /// Record the mach port of the host thread backing `tid`. Called ONCE by
