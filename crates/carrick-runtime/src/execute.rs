@@ -94,6 +94,12 @@ impl Runtime {
         if spec.platform == Platform::Amd64 {
             rosetta_license_notice();
         }
+        // Container launch (`carrick run <image>`) places the root guest in a
+        // fresh PID namespace so its init sees getpid()==1, ns-local child
+        // pids, and an ns-filtered /proc — the headline docker-run behavior
+        // (docs/namespaces-design.md §1.0, §5.2). `run-elf` bypasses
+        // Runtime::execute entirely, so it stays in the identity namespace.
+        crate::namespace::pid::request();
         // Name the host process `carrick: <basename>` up front so
         // it's identifiable in ps/Activity Monitor even before the
         // guest sets its own comm via prctl.

@@ -470,11 +470,23 @@ impl SyscallDispatcher {
     define_syscall! {
         /// kill(pid, sig): send `sig` to process `pid`.
         fn kill(this, cx, pid: Pid, sig: Signal) {
-            let pid = i64::from(pid.0);
             let signum = sig.0 as u64;
             if !is_valid_signum(signum) {
                 return Ok(LINUX_EINVAL.into());
             }
+            // PID namespace (§5.3): a positive `pid` names a target by its
+            // ns-pid; translate to the host pid (ESRCH for a non-member). So
+            // kill(1, sig) from inside the container hits the ns-init. pid <= 0
+            // (self / pgrp / -1) stays host-level — process groups are host-level
+            // in Phase 2 (§6.6). Identity when namespaces are off.
+            let pid = if crate::namespace::pid::enabled() && pid.0 > 0 {
+                match crate::namespace::pid::ns_to_host_or_self(pid.0 as u32) {
+                    Some(h) => i64::from(h as i32),
+                    None => return Ok(LINUX_ESRCH.into()),
+                }
+            } else {
+                i64::from(pid.0)
+            };
             if signal_is_self_target(pid, /*tid_required=*/ false) {
                 let tid = Self::ctx_tid(cx);
                 // Linux populates si_pid/si_uid with the sender's identity for a

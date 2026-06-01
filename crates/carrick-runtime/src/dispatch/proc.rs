@@ -630,8 +630,20 @@ impl SyscallDispatcher {
         fn gettid(this, cx) {
             if let Some(t) = cx.thread {
                 if t.registry.live_count() > 1 {
+                    // Multi-threaded: report the per-thread tid. The MAIN
+                    // thread's tid equals the process's host pid, so in a PID
+                    // namespace it must read as the process's ns-pid (a thread
+                    // whose tid == its tgid). Worker tids (> main_tid) are
+                    // per-process and not ns-translated (§5.3). Identity when
+                    // namespaces are off.
+                    let tid = t.tid as u32;
+                    let ns_tid = if tid == std::process::id() {
+                        crate::namespace::pid::host_to_ns_or_self(tid)
+                    } else {
+                        tid
+                    };
                     return Ok(DispatchOutcome::Returned {
-                        value: t.tid as i64,
+                        value: i64::from(ns_tid),
                     });
                 }
             }
@@ -1257,7 +1269,16 @@ impl SyscallDispatcher {
             }
             let (host_idtype, host_id): (libc::idtype_t, libc::id_t) = match idtype {
                 LINUX_P_ALL => (libc::P_ALL, 0),
-                LINUX_P_PID => (libc::P_PID, id as libc::id_t),
+                LINUX_P_PID => {
+                    // Translate the ns-pid arg to the host pid the kernel knows
+                    // (§5.3); an ns-pid that names no member is ECHILD.
+                    match crate::namespace::pid::ns_to_host_or_self(id as u32) {
+                        Some(h) => (libc::P_PID, h as libc::id_t),
+                        None => return Ok(crate::linux_abi::LINUX_ECHILD.into()),
+                    }
+                }
+                // P_PGID stays host-level in Phase 2 (process groups are not yet
+                // ns-translated — §6.6).
                 LINUX_P_PGID => (libc::P_PGID, id as libc::id_t),
                 LINUX_P_PIDFD => match this.pidfd_host_pid(id as i32) {
                     Some(host_pid) => (libc::P_PID, host_pid as libc::id_t),
@@ -1311,10 +1332,12 @@ impl SyscallDispatcher {
                 if idtype == LINUX_P_PID {
                     // Same no-interrupt mask as wait4: a blocked or
                     // delivered-and-dropped signal must not EINTR the park.
+                    // Park on the HOST pid (host_id), not the guest ns-pid —
+                    // WaitOnProcExit watches the real host process (§5.3).
                     let tid = Self::ctx_tid(cx);
                     let block_signals = this.non_interrupting_signal_mask(tid);
                     return Ok(DispatchOutcome::WaitOnProcExit {
-                        pid: id as i32,
+                        pid: host_id as i32,
                         block_signals,
                     });
                 }
@@ -1357,7 +1380,11 @@ impl SyscallDispatcher {
                 let bytes = if info.si_pid == 0 {
                     [0u8; crate::linux_abi::LINUX_SIGINFO_SIZE]
                 } else {
-                    build_sigchld_siginfo(info.si_pid, info.si_uid, info.si_code, info.si_status)
+                    // The reaped child's si_pid is a host pid; the guest must see
+                    // its ns-local pid (§5.3). Identity when namespaces are off.
+                    let ns_si_pid =
+                        crate::namespace::pid::host_to_ns_or_self(info.si_pid as u32) as i32;
+                    build_sigchld_siginfo(ns_si_pid, info.si_uid, info.si_code, info.si_status)
                 };
                 let memory = &mut *cx.memory;
                 if memory.write_bytes(infop_addr.0, &bytes).is_err() {
@@ -1372,6 +1399,19 @@ impl SyscallDispatcher {
             if options & !LINUX_WAIT4_SUPPORTED_FLAGS != 0 {
                 return Ok(LINUX_EINVAL.into());
             }
+            // PID namespace (§5.3): a positive `pid` arg names a child by its
+            // ns-pid; translate it to the host pid the kernel knows. An ns-pid
+            // that names no member is ESRCH. pid <= 0 (any-child / pgrp) stays
+            // host-level; only the RESULT is translated back (below). Identity
+            // when namespaces are off.
+            let pid = if crate::namespace::pid::enabled() && pid.0 > 0 {
+                match crate::namespace::pid::ns_to_host_or_self(pid.0 as u32) {
+                    Some(h) => Pid(h as i32),
+                    None => return Ok(crate::linux_abi::LINUX_ECHILD.into()),
+                }
+            } else {
+                pid
+            };
             let mut host_options: i32 = 0;
             if options & crate::linux_abi::LINUX_WNOHANG != 0 {
                 host_options |= libc::WNOHANG;
@@ -1469,8 +1509,12 @@ impl SyscallDispatcher {
                     return Ok(LINUX_EFAULT.into());
                 }
             }
+            // PID namespace (§5.3): the guest must see the reaped child's
+            // ns-local pid, not its host pid — critical for `wait4(-1)` where
+            // the arg was never translated. Identity when namespaces are off.
+            let ns_result = crate::namespace::pid::host_to_ns_or_self(result as u32);
             Ok(DispatchOutcome::Returned {
-                value: i64::from(result),
+                value: i64::from(ns_result),
             })
         }
 

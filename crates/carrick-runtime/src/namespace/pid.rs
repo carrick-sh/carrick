@@ -79,6 +79,22 @@ pub struct NsSharedRegion {
 /// static still points at the same physical pages). Null until [`init`].
 static REGION: AtomicPtr<NsSharedRegion> = AtomicPtr::new(std::ptr::null_mut());
 
+/// Set by the container launch path (`Runtime::execute`) to request that the
+/// root guest be placed in a fresh PID namespace. `run-elf` never sets it, so
+/// the single-ELF path stays in the identity ns (design §3.2, §5.2). Read by
+/// `run_threaded_hvf_loop` to decide whether to allocate the shared region.
+static REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Request launch-time PID-namespace placement for this run (container path).
+pub fn request() {
+    REQUESTED.store(true, Ordering::Relaxed);
+}
+
+/// Whether launch-time PID-namespace placement was requested.
+pub fn requested() -> bool {
+    REQUESTED.load(Ordering::Relaxed)
+}
+
 /// Allocate the shared region with `mmap(MAP_SHARED|MAP_ANON)` and publish it.
 /// Must be called **once, before the first guest fork** (design §3.3). Returns
 /// `Err` (never panics — the no-panic lint forbids it) if the mapping fails;
@@ -137,6 +153,121 @@ pub fn region() -> Option<&'static NsSharedRegion> {
         // SAFETY: once published the region lives for the whole process; the
         // mapping is never unmapped while the process runs.
         Some(unsafe { &*ptr })
+    }
+}
+
+/// `true` if a PID namespace is active for this run (a container launched by
+/// `carrick run`). When false, every translation below is the identity (the
+/// guest pid IS the host pid) so `run-elf` and non-namespaced runs are
+/// unchanged.
+pub fn enabled() -> bool {
+    !REGION.load(Ordering::Acquire).is_null()
+}
+
+/// Translate a host pid to the pid the current ns sees. Identity when
+/// namespaces are off. A host pid that is not a registered member translates
+/// to `0` — matching `getppid()` of a process whose parent is outside the ns
+/// (`pid_namespaces(7)`).
+pub fn host_to_ns_or_self(host_pid: u32) -> u32 {
+    match region() {
+        Some(r) => r.host_to_ns(host_pid).unwrap_or(0),
+        None => host_pid,
+    }
+}
+
+/// Translate an ns-pid the guest supplied back to the host pid to operate on.
+/// Identity when namespaces are off. Returns `None` (→ `ESRCH`) for an ns-pid
+/// that names no member.
+pub fn ns_to_host_or_self(ns_pid: u32) -> Option<u32> {
+    match region() {
+        Some(r) => r.ns_to_host(ns_pid),
+        None => Some(ns_pid),
+    }
+}
+
+/// The current process's own ns-pid. The container init is ns-pid 1. Identity
+/// (the host pid) when namespaces are off.
+pub fn self_ns_pid() -> u32 {
+    host_to_ns_or_self(std::process::id())
+}
+
+/// The current process's parent pid as its ns sees it — the value `getppid()`
+/// returns and `/proc/self/status` shows as `PPid:`. The ns-init (ns-pid 1) has
+/// no parent inside the namespace, so 0; a reparented orphan reports 1; others
+/// translate their host ppid (0 if the parent is outside the ns). Identity
+/// (the real host ppid) when namespaces are off (§5.3, §5.4).
+pub fn self_ns_ppid() -> u32 {
+    if !enabled() {
+        // SAFETY: getppid is always safe.
+        return unsafe { libc::getppid() } as u32;
+    }
+    if self_ns_pid() == NS_INIT_PID {
+        return 0;
+    }
+    if is_orphaned(std::process::id()) {
+        return NS_INIT_PID;
+    }
+    let host_ppid = unsafe { libc::getppid() } as u32;
+    host_to_ns_or_self(host_ppid)
+}
+
+/// Whether the NsSupervisor has flagged `host_pid`'s ns-parent as dead, so its
+/// `getppid()` should report ns-pid 1 (the ns-init) per `pid_namespaces(7)`
+/// reparent-to-init semantics (§3.6). Always false until the NsSupervisor
+/// (Phase 3) sets orphan flags.
+pub fn is_orphaned(host_pid: u32) -> bool {
+    region()
+        .and_then(|r| r.flags_of(host_pid))
+        .map(|f| f == MEMBER_ORPHANED)
+        .unwrap_or(false)
+}
+
+/// Called by a freshly-forked CHILD before it runs any guest code: wait until
+/// the parent has registered this process in the shared table (the parent
+/// allocates the ns-pid in its fork branch — §5.3). This closes the race where
+/// the child's first `getpid()`/`getppid()` would otherwise see no mapping
+/// (translating to 0) before the parent's `register_child` lands. The parent
+/// registers within microseconds; the bounded spin (with `sched_yield`) caps
+/// the wait so a never-registering parent can't hang the child. No-op when
+/// namespaces are off.
+pub fn await_self_registration() {
+    let Some(r) = region() else { return };
+    let self_host = std::process::id();
+    // ~50ms worst case (5000 * ~10us yield) — orders of magnitude beyond the
+    // real parent-register latency, but bounded so a crashed parent can't wedge.
+    for _ in 0..5000 {
+        if r.host_to_ns(self_host).is_some() {
+            return;
+        }
+        // SAFETY: sched_yield is always safe; hands the CPU to the parent so it
+        // can complete register_child.
+        unsafe {
+            libc::sched_yield();
+        }
+    }
+}
+
+/// Register a freshly-forked child in the active ns: allocate its ns-pid and
+/// record the host↔ns mapping + its ns-parent. Returns the child's ns-pid (to
+/// be handed back to the guest as the `fork`/`clone` return value). When
+/// namespaces are off, returns the host pid unchanged. Called by the parent in
+/// the runtime fork path, which knows both pids (§5.3).
+pub fn register_child(child_host_pid: u32, parent_host_pid: u32) -> u32 {
+    match region() {
+        Some(r) => {
+            // If the parent forks the same child twice (can't happen) or the
+            // child already self-registered, reuse the existing ns-pid.
+            if let Some(existing) = r.host_to_ns(child_host_pid) {
+                return existing;
+            }
+            let ns_pid = r.alloc_ns_pid();
+            // A full table degrades to "no mapping": the child is still a guest
+            // process (visible via the host tree), it just lacks a stable ns-pid
+            // entry; report the allocated number anyway (monotonic, unique).
+            let _ = r.register(child_host_pid, ns_pid, parent_host_pid);
+            ns_pid
+        }
+        None => child_host_pid,
     }
 }
 
