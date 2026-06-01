@@ -528,13 +528,25 @@ impl SyscallDispatcher {
                         return Ok(LINUX_EFAULT.into());
                     };
                     let task_name = linux_task_name_from_bytes(&bytes);
+                    // PR_SET_NAME names the CALLING thread (Linux): record it
+                    // per-tid so /proc/<pid>/task/<tid>/comm reports it. Keep
+                    // task_name as the process-wide fallback + host proctitle.
+                    if let Some(t) = cx.thread.as_ref() {
+                        t.registry.set_thread_name(t.tid, &bytes);
+                    }
                     this.proc.lock().task_name = task_name;
                     set_host_process_name(&task_name);
                     DispatchOutcome::Returned { value: 0 }
                 }
                 LINUX_PR_GET_NAME => {
-                    let task_name = this.proc.lock().task_name;
-                    if memory.write_bytes(arg2, &task_name).is_err() {
+                    // PR_GET_NAME reads the CALLING thread's name; fall back to
+                    // the process name for a thread that never named itself.
+                    let name = cx
+                        .thread
+                        .as_ref()
+                        .and_then(|t| t.registry.thread_name(t.tid))
+                        .unwrap_or_else(|| this.proc.lock().task_name);
+                    if memory.write_bytes(arg2, &name).is_err() {
                         return Ok(LINUX_EFAULT.into());
                     }
                     DispatchOutcome::Returned { value: 0 }
