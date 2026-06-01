@@ -19,7 +19,7 @@
 //! lands.
 #![allow(dead_code)]
 
-use std::sync::atomic::{AtomicI32, AtomicPtr, AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use super::NsId;
 
@@ -72,6 +72,12 @@ pub struct NsSharedRegion {
     pub next_pid: AtomicU32,
     /// The init's host pid (ns-pid 1). 0 until launch placement sets it.
     pub init_host_pid: AtomicU32,
+    /// Bitmask of signals the ns-init has installed a handler for (bit N =
+    /// signal N). Published by the init's rt_sigaction; read by the kill path
+    /// to enforce pid-1 protection: a signal sent to the init by another ns
+    /// member is delivered only if the init handles it (`pid_namespaces(7)`,
+    /// §5.4). Signals 1..=64 fit in the low 64 bits (bit 0 unused).
+    pub init_sig_handlers: AtomicU64,
     pub members: [MemberSlot; MEMBER_SLOTS],
 }
 
@@ -146,11 +152,12 @@ pub fn notify_registration() {
 /// WITHOUT yet knowing the init's host pid. Must be called **once, before the
 /// NsSupervisor fork** (design §3.3) so both the supervisor parent and the
 /// guest-init child inherit the same physical pages. The child then calls
-/// [`set_init`] with its own pid. Returns `Err` (never panics) on mmap failure;
-/// the caller falls back to identity (non-namespaced) behavior. Idempotent.
-pub fn alloc_region() -> Result<(), ()> {
+/// [`set_init`] with its own pid. Returns `false` (never panics) on mmap
+/// failure; the caller falls back to identity (non-namespaced) behavior.
+/// Idempotent — returns `true` if the region already exists.
+pub fn alloc_region() -> bool {
     if !REGION.load(Ordering::Acquire).is_null() {
-        return Ok(());
+        return true;
     }
     let size = std::mem::size_of::<NsSharedRegion>();
     // SAFETY: a standard anonymous shared mapping; size is the exact struct
@@ -166,7 +173,7 @@ pub fn alloc_region() -> Result<(), ()> {
         )
     };
     if ptr == libc::MAP_FAILED {
-        return Err(());
+        return false;
     }
     let region = ptr.cast::<NsSharedRegion>();
     // SAFETY: valid writable mapping of exactly this struct; seed the allocator.
@@ -174,7 +181,7 @@ pub fn alloc_region() -> Result<(), ()> {
         (*region).next_pid.store(2, Ordering::Relaxed);
     }
     REGION.store(region, Ordering::Release);
-    Ok(())
+    true
 }
 
 /// Record the init's host pid (ns-pid 1) in an already-allocated region and
@@ -194,11 +201,14 @@ pub fn set_init(init_host_pid: u32) {
 
 /// Allocate the region AND register the init in one process (no supervisor
 /// fork) — used by the degraded path / tests where translation is wanted but
-/// the supervisor process is not forked. Idempotent.
-pub fn init(init_host_pid: u32) -> Result<(), ()> {
-    alloc_region()?;
+/// the supervisor process is not forked. Idempotent. Returns `false` if the
+/// shared-region mmap failed (caller stays in identity mode).
+pub fn init(init_host_pid: u32) -> bool {
+    if !alloc_region() {
+        return false;
+    }
     set_init(init_host_pid);
-    Ok(())
+    true
 }
 
 /// Borrow the shared region, or `None` if namespaces are not enabled for this
@@ -293,6 +303,92 @@ pub fn self_ns_ppid() -> u32 {
         // reparenting correct even before the supervisor's orphan flag lands.
         None => NS_INIT_PID,
     }
+}
+
+/// Publish that the ns-init has installed (or cleared) a handler for `signum`.
+/// Called from rt_sigaction when the caller is the ns-init (ns-pid 1). Lets the
+/// kill path enforce pid-1 protection without cross-process handler-table
+/// visibility (§5.4). No-op when ns is off or signum out of range.
+pub fn set_init_handler(signum: i32, installed: bool) {
+    let Some(r) = region() else { return };
+    if !(1..=63).contains(&signum) {
+        return;
+    }
+    let bit = 1u64 << signum;
+    if installed {
+        r.init_sig_handlers.fetch_or(bit, Ordering::Release);
+    } else {
+        r.init_sig_handlers.fetch_and(!bit, Ordering::Release);
+    }
+}
+
+/// Whether the ns-init has a handler installed for `signum`.
+pub fn init_handles(signum: i32) -> bool {
+    match region() {
+        Some(r) if (1..=63).contains(&signum) => {
+            r.init_sig_handlers.load(Ordering::Acquire) & (1u64 << signum) != 0
+        }
+        _ => false,
+    }
+}
+
+/// The signals whose default action terminates the process and which pid-1 is
+/// protected from when unhandled (`pid_namespaces(7)`: pid 1 only gets signals
+/// it has a handler for, plus the always-unblockable SIGKILL/SIGSTOP which are
+/// NOT in this set). Linux signal numbers.
+fn is_default_lethal(signum: i32) -> bool {
+    // SIGHUP(1) SIGINT(2) SIGQUIT(3) SIGILL(4) SIGABRT(6) SIGFPE(8) SIGUSR1(10)
+    // SIGSEGV(11) SIGUSR2(12) SIGPIPE(13) SIGALRM(14) SIGTERM(15) SIGBUS(7)
+    // SIGTRAP(5) SIGSYS(31) SIGVTALRM(26) SIGPROF(27) SIGXCPU(24) SIGXFSZ(25)
+    // SIGSTKFLT(16) SIGIO(29) SIGPWR(30). SIGCHLD/SIGURG/SIGWINCH/SIGCONT have a
+    // non-lethal default (ignore/continue) and are not "lethal". SIGKILL(9) and
+    // SIGSTOP(19) are handled by the caller (never dropped for pid 1).
+    matches!(
+        signum,
+        1 | 2
+            | 3
+            | 4
+            | 5
+            | 6
+            | 7
+            | 8
+            | 10
+            | 11
+            | 12
+            | 13
+            | 14
+            | 15
+            | 16
+            | 24
+            | 25
+            | 26
+            | 27
+            | 29
+            | 30
+            | 31
+    )
+}
+
+/// Whether a signal `signum` sent (by an in-ns member) to host pid `target`
+/// must be DROPPED because `target` is the ns-init and the init has no handler
+/// for a default-lethal signal (`pid_namespaces(7)`, §5.4). SIGKILL/SIGSTOP are
+/// never dropped. Returns false when ns is off, the target isn't the init, or
+/// the init handles the signal. The signal is dropped silently (the kill still
+/// returns success — Linux behavior).
+pub fn should_drop_signal_to_init(target_host_pid: u32, signum: i32) -> bool {
+    let Some(r) = region() else { return false };
+    if r.init_host_pid() != target_host_pid {
+        return false;
+    }
+    // SIGKILL(9)/SIGSTOP(19) always act on pid 1 from within the ns (Linux
+    // delivers these regardless of handler — they can't be caught/ignored).
+    if signum == 9 || signum == 19 {
+        return false;
+    }
+    // Only default-lethal signals are dropped; a non-lethal-default signal
+    // (SIGCHLD etc.) is harmless to deliver. Drop iff lethal-default AND the
+    // init installed no handler.
+    is_default_lethal(signum) && !init_handles(signum)
 }
 
 /// Whether the NsSupervisor has flagged `host_pid`'s ns-parent as dead, so its

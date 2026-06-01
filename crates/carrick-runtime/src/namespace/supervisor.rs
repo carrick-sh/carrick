@@ -56,7 +56,7 @@ pub fn run(init_host_pid: i32, reg_pipe_read: i32) -> SupervisorExit {
     // Watch the registration pipe for new members, and arm an exit watch on the
     // init itself (so its death wakes the loop just like any other member).
     let _ = kq.apply(&[
-        Kevent::read(reg_pipe_read, libc::EV_ADD as u16),
+        Kevent::read(reg_pipe_read, libc::EV_ADD),
         Kevent::proc_exit(init_host_pid),
     ]);
 

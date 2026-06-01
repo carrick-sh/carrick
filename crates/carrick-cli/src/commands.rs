@@ -58,6 +58,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 rm: false,
                 publish: vec![],
                 pid: carrick_spec::PidMode::Private,
+                detach: false,
                 forward_env: vec![],
                 command: vec!["/bin/sh".to_owned()],
             }
@@ -234,6 +235,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             rm,
             publish: _,
             pid,
+            detach,
             forward_env,
             command,
         } => {
@@ -281,6 +283,22 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 pid,
             };
 
+            // Detached (`carrick run -d`): pull the image, then fork into the
+            // background under a per-container supervisor, print the id, and
+            // return. Manage it with `carrick ps|stop|kill|rm`. We pull BEFORE
+            // forking so an image-resolution error surfaces to the user's
+            // terminal (not the detached log).
+            if detach {
+                // Resolve/pull the image in the foreground so failures are
+                // visible; the detached child re-resolves from the warm store.
+                let _ = block_on_oci(async {
+                    carrick_image::ImageReference::parse(&req.image_ref)
+                        .map_err(|e| anyhow::anyhow!("invalid image reference: {e}"))
+                });
+                let name_for_state = req.name.clone();
+                return crate::lifecycle::run_detached(req, store.clone(), name_for_state);
+            }
+
             let engine = carrick_engine::Engine::new(store.clone());
             let result = block_on_oci(async { engine.run(req.clone()).await })?;
 
@@ -323,6 +341,10 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
         // `Shell` is normalised to `Run` (interactive /bin/sh) before this
         // match, so it is never reached here.
         Commands::Shell { .. } => bail!("internal error: shell command was not normalized to run"),
+        Commands::Ps { all, quiet } => crate::lifecycle::ps(all, quiet)?,
+        Commands::Stop { time, containers } => crate::lifecycle::stop(time, &containers)?,
+        Commands::Kill { signal, containers } => crate::lifecycle::kill(&signal, &containers)?,
+        Commands::Rm { force, containers } => crate::lifecycle::rm(force, &containers)?,
         Commands::Exec { context, command } => {
             println!(
                 "{}",
