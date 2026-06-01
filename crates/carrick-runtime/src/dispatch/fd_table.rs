@@ -169,6 +169,13 @@ pub(super) struct OpenDescriptionBase {
     /// the stored value is bookkeeping only (it does not change the real host
     /// pipe's capacity).
     pipe_capacity: i64,
+    /// When set, pipe capacity is read/written through this SHARED cell instead
+    /// of the inline `pipe_capacity` field, so BOTH ends of a `pipe(2)` observe
+    /// one value — Linux keeps a single buffer per pipe, so F_SETPIPE_SZ on one
+    /// end is visible to F_GETPIPE_SZ on the other (CPython
+    /// test_subprocess.test_pipesizes sets on the write end, reads on the read
+    /// ends). `pipe2` hands the same `Arc` to both ends; `None` everywhere else.
+    pipe_capacity_shared: Option<std::sync::Arc<std::sync::atomic::AtomicI64>>,
 }
 
 impl OpenDescriptionBase {
@@ -182,15 +189,30 @@ impl OpenDescriptionBase {
             owner_pid: 0,
             async_sig: 0,
             pipe_capacity: crate::linux_abi::LINUX_PIPE_BUF_SIZE,
+            pipe_capacity_shared: None,
         }
     }
 
+    /// Route pipe capacity through a cell shared with the pipe's other end.
+    pub(super) fn set_pipe_capacity_cell(
+        &mut self,
+        cell: std::sync::Arc<std::sync::atomic::AtomicI64>,
+    ) {
+        self.pipe_capacity_shared = Some(cell);
+    }
+
     pub(super) fn pipe_capacity(&self) -> i64 {
-        self.pipe_capacity
+        match &self.pipe_capacity_shared {
+            Some(cell) => cell.load(std::sync::atomic::Ordering::Relaxed),
+            None => self.pipe_capacity,
+        }
     }
 
     pub(super) fn set_pipe_capacity(&mut self, capacity: i64) {
-        self.pipe_capacity = capacity;
+        match &self.pipe_capacity_shared {
+            Some(cell) => cell.store(capacity, std::sync::atomic::Ordering::Relaxed),
+            None => self.pipe_capacity = capacity,
+        }
     }
 
     pub(super) fn status_flags(&self) -> u64 {
