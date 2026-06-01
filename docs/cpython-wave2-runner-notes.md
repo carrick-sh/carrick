@@ -157,3 +157,15 @@ lchownsymlink now uses CWD-relative paths. test_posix behavioral fails 4→0.
 Remaining ndiff=3 are SKIPS (feature availability, not bugs): RWF_HIPRI
 (preadv2 hint), SEEK_HOLE/SEEK_DATA (test_fs_holes), /proc/self/ns/uts
 (test_unshare_setns — procfs ns-symlink gap).
+
+## test_posix: BEHAVIORALLY COMPLETE (2026-06-01) — 4 fails → 0; ndiff 8→2
+All behavioral failures fixed: chmod-follow-symlink, execveat/fexecve,
+setpgroup/ns-pgid, lchown/symlink-owner, SEEK_HOLE/SEEK_DATA (test_fs_holes).
+Remaining ndiff=2 are feature-availability SKIPS (carrick skips, docker runs),
+NOT bugs — both feature additions for a future session:
+- **test_preadv_flags**: preadv2/pwritev2 (syscalls 286/287) are UNREGISTERED →
+  the RWF_HIPRI support-probe fails → skip. preadv/pwritev (69/70) exist; impl =
+  extract preadv/pwritev body to a shared method (like chmod_at) + 2 new handlers
+  that accept the RWF_* flag set (RWF_HIPRI as a no-op hint) and delegate.
+- **test_unshare_setns**: needs /proc/self/ns/uts (and the other ns symlinks) —
+  the procfs roadmap's "ns namespace symlinks" item (docs/procfs-conformance-roadmap.md).
