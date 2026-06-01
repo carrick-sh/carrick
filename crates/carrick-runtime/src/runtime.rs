@@ -676,7 +676,14 @@ where
                             let fd = dispatcher.install_child_pidfd(child_pid).unwrap_or(-1);
                             let _ = runtime.write_bytes(addr, &fd.to_le_bytes());
                         }
-                        i64::from(child_pid)
+                        // PID namespace: allocate the child's ns-pid and record
+                        // the mapping (we are its ns-parent), then return the
+                        // ns-pid — not the host pid — as the fork retval (§5.3).
+                        // Identity when namespaces are off.
+                        i64::from(crate::namespace::pid::register_child(
+                            child_pid as u32,
+                            std::process::id(),
+                        ))
                     }
                     crate::trap::ForkOutcome::Child => {
                         dispatcher.clear_output_buffers();
@@ -684,6 +691,10 @@ where
                         // self-pipe is shared with the parent — give the child
                         // fresh ones so its parked-thread wakes are its own.
                         crate::host_signal::reinit_after_fork();
+                        // PID namespace: block until the parent has registered
+                        // our ns-pid, so our first getpid()/getppid() see the
+                        // mapping (§5.3). No-op when namespaces are off.
+                        crate::namespace::pid::await_self_registration();
                         // The child's pid changed; its waiter watches for
                         // signals targeted at the new tid (or process-directed).
                         waiter = crate::io_wait::ThreadWaiter::new(std::process::id() as ThreadId);
@@ -1868,7 +1879,13 @@ impl ThreadRuntimeState {
                         .unwrap_or(-1);
                     let _ = engine.write_bytes(addr, &fd.to_le_bytes());
                 }
-                i64::from(child_pid)
+                // PID namespace: allocate the child's ns-pid + record the
+                // mapping (we are its ns-parent), and return the ns-pid as the
+                // fork retval (§5.3). Identity when namespaces are off.
+                i64::from(crate::namespace::pid::register_child(
+                    child_pid as u32,
+                    std::process::id(),
+                ))
             }
             crate::trap::ForkOutcome::Child => {
                 kernel.dispatcher.clear_output_buffers();
@@ -1901,6 +1918,9 @@ impl ThreadRuntimeState {
                 fork_barrier().end_quiesce();
                 fork_barrier().end_fork();
                 crate::host_signal::reinit_after_fork();
+                // PID namespace: block until the parent registered our ns-pid
+                // before any guest code runs (§5.3). No-op when ns off.
+                crate::namespace::pid::await_self_registration();
                 self.waiter = crate::io_wait::ThreadWaiter::new(self.this_tid);
                 self.kicker
                     .register(self.this_tid, engine.vcpu_kick_handle());
@@ -1939,6 +1959,15 @@ fn run_threaded_hvf_loop(
     // descendant inherits the same MAP_SHARED region (child CPU → parent
     // cutime/cstime + RUSAGE_CHILDREN).
     crate::guest_cpu::init_child_table();
+    // PID-namespace launch placement (container runs only — `run-elf` never
+    // requests it). Allocate the MAP_SHARED ns table before the first fork so
+    // every descendant inherits it, and pre-assign the root guest as ns-pid 1.
+    // From here getpid()==1, getppid()==0, and forked children get ns-local
+    // pids (docs/namespaces-design.md §5.2). On mmap failure we silently fall
+    // back to identity behavior — the run proceeds, just without ns numbering.
+    if crate::namespace::pid::requested() {
+        let _ = crate::namespace::pid::init(std::process::id());
+    }
     let futex = Arc::new(FutexTable::new());
     let kernel = Arc::new(KernelState::new(dispatcher));
     // Track spawned sibling threads so the process doesn't tear down while a
