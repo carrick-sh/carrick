@@ -127,3 +127,26 @@ Remaining (lower priority): the `read_dir`/`layered_directory_entries` walk and
 mostly there. Not needed for test_glob (now MATCH); a future increment for
 file-read-heavy workloads. The xattr peeks during directory listing already use
 the Phase-1 fast getxattr.
+
+## UPDATE (2026-06-01) — default flipped to OFF (fork-wedge aggravation)
+
+The full 41-module sweep flagged test_fork1 → CARRICK_TIMEOUT. Isolation
+(commit 2a3e43a):
+- fast-fs ON: test_fork1.test_threaded_import_lock_fork hangs ~2/3 of runs.
+- fast-fs OFF (cap-std): hangs ~1/4 — i.e. the multithreaded-fork-from-nested HVF
+  wedge (the campaign's #1 Heisenbug, see project_cpython_conformance_campaign)
+  is INTERMITTENT IN THE BASELINE; fast-fs's extra openat/close-per-stat churn
+  just perturbs syscall timing in the fork window and roughly doubles the rate.
+
+Decision: `fast_lstat_contained` (Phase 2) is now **default OFF**, opt-in
+`CARRICK_FAST_FS=1`. When off it returns immediately → cap-std path, byte-identical
+to pre-Phase-2. **Phase 1 (path-based getxattr) stays unconditional** — it REMOVES
+opens (less churn), so it can only reduce wedge probability, and kept every fs
+parity/probe green.
+
+Net: default is fork-safe (baseline) but test_glob is TIMEOUT again by default;
+`CARRICK_FAST_FS=1` gets test_glob 140s→48s MATCH for fork-light fs-heavy
+workloads. The fast path is also a **near-deterministic reproducer of the #1
+fork-wedge** — the highest-value next step is to fix that HVF wedge (which would
+let fast-fs go default-on AND unblock the broader multithreaded-fork conformance),
+using this as the repro.
