@@ -671,6 +671,13 @@ impl SyscallDispatcher {
             if flags & LINUX_MS_ASYNC != 0 && flags & LINUX_MS_SYNC != 0 {
                 return Ok(LINUX_EINVAL.into());
             }
+            // msync requires a page-aligned start address (Linux checks this
+            // before anything else). CPython's mmap.flush(offset, size) calls
+            // msync(data + offset, size, ...), so flush(1, n) must EINVAL —
+            // test_mmap.test_flush_return_value asserts it on Linux.
+            if !address.0.is_multiple_of(LINUX_PAGE_SIZE) {
+                return Ok(LINUX_EINVAL.into());
+            }
             if length == 0 {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
