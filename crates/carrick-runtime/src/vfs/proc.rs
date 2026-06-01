@@ -809,7 +809,19 @@ fn synthetic_proc_pid_file(pid: u32, rest: &str, self_comm: &str) -> Option<Vec<
     }
 
     let own_threads = crate::thread::current_thread_states();
-    if let Some(&(tid, state)) = own_threads.iter().find(|(t, _)| *t as u32 == pid) {
+    // Worker threads are addressed by their (untranslated) registry tid, but the
+    // MAIN thread is addressed by its ns-pid (== tgid) under a PID namespace,
+    // which the registry keys by the host id instead. Match either so a
+    // /proc/self/task/<tgid>/comm read of the main thread still resolves.
+    let host_pid = if crate::namespace::pid::enabled() {
+        crate::namespace::pid::ns_to_host_or_self(pid).unwrap_or(pid)
+    } else {
+        pid
+    };
+    if let Some(&(tid, state)) = own_threads
+        .iter()
+        .find(|(t, _)| *t as u32 == pid || *t as u32 == host_pid)
+    {
         let ppid = unsafe { libc::getppid() } as u32;
         let me = std::process::id();
         // Per-thread name (prctl PR_SET_NAME / pthread_setname_np), falling back

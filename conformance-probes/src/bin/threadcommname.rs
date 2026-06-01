@@ -42,7 +42,6 @@ fn read_comm(tid: i32) -> Option<String> {
 }
 
 fn main() {
-    let main_tid = unsafe { libc::syscall(SYS_GETTID) as i32 };
     set_name("mainthread");
 
     let wtid = Arc::new(AtomicI32::new(0));
@@ -67,6 +66,10 @@ fn main() {
     }
     let wt = wtid.load(Ordering::Acquire);
 
+    // Capture the main tid only now that the process is multi-threaded: a
+    // PID-namespaced single-threaded gettid() reports the ns-pid (tgid), which
+    // differs from the per-thread id the registry / pthread_getname_np use.
+    let main_tid = unsafe { libc::syscall(SYS_GETTID) as i32 };
     let worker_comm = read_comm(wt);
     let main_comm = read_comm(main_tid);
     eprintln!("main_tid={main_tid} wt={wt} main_comm={main_comm:?} worker_comm={worker_comm:?}");
