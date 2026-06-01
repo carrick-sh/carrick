@@ -260,7 +260,14 @@ pub(crate) fn proc_pid_dir_host_pid(path: &str) -> Option<u32> {
     if comp.contains('/') {
         return None; // a sub-path (/proc/<pid>/task, …), not the pid dir itself
     }
-    let host_pid = ns_pid_to_host(comp.parse().ok()?)?;
+    // `self`/`thread-self` resolve to the calling process (the same mapping
+    // parse_proc_pid_path uses for sub-path file reads), so the bare /proc/self
+    // directory is openable/stat-able/scandir-able — not just /proc/self/<file>.
+    let host_pid = if comp == "self" || comp == "thread-self" {
+        std::process::id()
+    } else {
+        ns_pid_to_host(comp.parse().ok()?)?
+    };
     synthetic_task_dir(host_pid)?; // gate: a live process (own thread or guest)
     Some(host_pid)
 }
