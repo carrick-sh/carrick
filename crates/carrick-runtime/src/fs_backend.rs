@@ -2298,8 +2298,11 @@ impl FsBackend for HostFsBackend {
         // Follow path: open a real kernel fd for the materialised file and
         // drive `futimens(2)`. cap-std has no set-times API, but the whole
         // rootfs lives on the cap-std scratch, so a raw fd lets us persist
-        // atime/mtime where a later stat (real_stat) will see them.
-        let host_fd = match self.open_raw_fd(path, true, false, false) {
+        // atime/mtime where a later stat (real_stat) will see them. Open
+        // O_RDONLY (write=false): futimens needs only the fd + ownership, not
+        // write mode, and O_RDWR would EISDIR on a DIRECTORY (test_os
+        // test_utime_directory) and EACCES on a read-only file the guest owns.
+        let host_fd = match self.open_raw_fd(path, false, false, false) {
             Some(fd) => fd,
             None => {
                 crate::probes::fs_op("set_times:open_none", path, 30);
