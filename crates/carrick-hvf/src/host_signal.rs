@@ -94,9 +94,15 @@ static PENDING: AtomicI32 = AtomicI32::new(NO_PENDING_SIGNAL);
 /// `tgkill(tid, sig)` / `tkill`) targets exactly one guest thread and is parked
 /// here so only that thread delivers it. Set ONLY from guest-dispatch context
 /// (never a host async handler — a host signal can't name a guest tid), so a
-/// plain `Mutex` is safe; it is never locked from a signal handler. One slot
-/// per tid mirrors the single-slot global model (last delivered wins).
-static THREAD_PENDING: LazyLock<Mutex<HashMap<i32, i32>>> =
+/// plain `Mutex` is safe; it is never locked from a signal handler. The value
+/// is a per-tid BITMASK of pending signums (bit `signum-1`): distinct signals
+/// targeting one thread must ALL be delivered, so a second must not overwrite a
+/// first. A single i32 slot coalesced them — when libuv's signal_multiple_loops
+/// routed SIGUSR1 then SIGUSR2 to the same thread, SIGUSR1 was overwritten and
+/// its waiters hung. Same-signal repeats still coalesce (standard-signal
+/// semantics); RT-signal queue depth lives in the dispatcher's
+/// `rt_pending_counts`, not here.
+static THREAD_PENDING: LazyLock<Mutex<HashMap<i32, u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static THREAD_WAITERS: LazyLock<Mutex<HashMap<i32, ThreadWakeRegistration>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -170,6 +176,20 @@ impl Drop for ThreadWakePipe {
     }
 }
 
+/// `THREAD_PENDING` bit for `signum` (bit `signum-1`), or 0 if out of range.
+fn thread_pending_bit(signum: i32) -> u64 {
+    if (1..=64).contains(&signum) {
+        1u64 << (signum - 1)
+    } else {
+        0
+    }
+}
+
+/// Lowest pending signum in a `THREAD_PENDING` bitmask (caller ensures `mask != 0`).
+fn lowest_pending_signum(mask: u64) -> i32 {
+    (mask.trailing_zeros() as i32) + 1
+}
+
 /// Publish a signal targeted at a specific guest `tid` and wake parked waiters.
 /// The waking thread (and only it, via `take_pending_for`) will deliver it.
 /// Unlike `publish_pending`, this is NOT async-signal-safe (takes a `Mutex`) —
@@ -177,11 +197,15 @@ impl Drop for ThreadWakePipe {
 /// tid is known.
 pub fn publish_pending_for(tid: i32, signum: i32) {
     crate::probes::signal_publish(tid, signum, 1);
+    let bit = thread_pending_bit(signum);
     #[allow(clippy::expect_used)]
-    THREAD_PENDING
-        .lock()
-        .expect("THREAD_PENDING poisoned")
-        .insert(tid, signum);
+    if bit != 0 {
+        *THREAD_PENDING
+            .lock()
+            .expect("THREAD_PENDING poisoned")
+            .entry(tid)
+            .or_insert(0) |= bit;
+    }
     if !wake_thread_waiter(tid) {
         notify_waiters_fallback();
     }
@@ -284,12 +308,18 @@ pub fn is_tracked_child(child_pid: i32) -> bool {
 /// consumption (called under the dispatcher lock in `deliver_pending_signal`).
 pub fn take_pending_for(tid: i32) -> i32 {
     #[allow(clippy::expect_used)]
-    if let Some(s) = THREAD_PENDING
-        .lock()
-        .expect("THREAD_PENDING poisoned")
-        .remove(&tid)
     {
-        return s;
+        let mut guard = THREAD_PENDING.lock().expect("THREAD_PENDING poisoned");
+        if let Some(mask) = guard.get_mut(&tid)
+            && *mask != 0
+        {
+            let signum = lowest_pending_signum(*mask);
+            *mask &= *mask - 1; // clear the lowest set bit
+            if *mask == 0 {
+                guard.remove(&tid);
+            }
+            return signum;
+        }
     }
     PENDING.swap(NO_PENDING_SIGNAL, Ordering::SeqCst)
 }
@@ -303,12 +333,20 @@ pub fn take_pending_in_for(tid: i32, wait_set: u64) -> i32 {
     };
     #[allow(clippy::expect_used)]
     {
+        // `wait_set` uses the same bit `signum-1` convention as the mask, so a
+        // bitwise AND yields the pending signums that are in the waited set;
+        // drain only the lowest, leaving the rest pending for normal delivery.
         let mut guard = THREAD_PENDING.lock().expect("THREAD_PENDING poisoned");
-        if let Some(&signum) = guard.get(&tid)
-            && in_set(signum)
-        {
-            guard.remove(&tid);
-            return signum;
+        if let Some(mask) = guard.get_mut(&tid) {
+            let in_set_bits = *mask & wait_set;
+            if in_set_bits != 0 {
+                let signum = lowest_pending_signum(in_set_bits);
+                *mask &= !thread_pending_bit(signum);
+                if *mask == 0 {
+                    guard.remove(&tid);
+                }
+                return signum;
+            }
         }
     }
     let pending = PENDING.load(Ordering::SeqCst);
@@ -340,7 +378,8 @@ pub fn has_pending_for(tid: i32) -> bool {
     THREAD_PENDING
         .lock()
         .expect("THREAD_PENDING poisoned")
-        .contains_key(&tid)
+        .get(&tid)
+        .is_some_and(|&mask| mask != 0)
 }
 
 /// Like [`has_pending_for`], but a signal blocked by `block_mask` (bit
@@ -362,7 +401,13 @@ pub fn has_unblocked_pending_for(tid: i32, block_mask: u64) -> bool {
     }
     #[allow(clippy::expect_used)]
     let guard = THREAD_PENDING.lock().expect("THREAD_PENDING poisoned");
-    guard.get(&tid).is_some_and(|&s| !blocked(s))
+    // Any pending bit that isn't blocked is deliverable. SIGKILL/SIGSTOP can
+    // never be blocked, so they always count even if their bit is in block_mask.
+    let always_deliverable = thread_pending_bit(crate::linux_abi::LINUX_SIGKILL)
+        | thread_pending_bit(crate::linux_abi::LINUX_SIGSTOP);
+    guard
+        .get(&tid)
+        .is_some_and(|&mask| mask & (!block_mask | always_deliverable) != 0)
 }
 
 pub fn has_process_pending() -> bool {
@@ -1076,6 +1121,25 @@ mod tests {
         assert_eq!(take_pending_for(tid), LINUX_SIGINT);
         // Consumed exactly once.
         assert_eq!(take_pending_for(tid), NO_PENDING_SIGNAL);
+        drain_pending_pipe();
+        drain_pump_pipe();
+    }
+
+    #[test]
+    fn distinct_thread_directed_signals_do_not_coalesce() {
+        let _g = TEST_LOCK.lock().unwrap();
+        PENDING.store(NO_PENDING_SIGNAL, Ordering::SeqCst);
+        let tid = 900_021;
+        // Two DISTINCT signals routed to one tid must BOTH survive — a single
+        // last-write-wins slot dropped the first (the signal_multiple_loops
+        // hang). Drained lowest-first, one per take, both present.
+        publish_pending_for(tid, 10); // SIGUSR1
+        publish_pending_for(tid, 12); // SIGUSR2
+        assert!(has_pending_for(tid));
+        assert_eq!(take_pending_for(tid), 10);
+        assert_eq!(take_pending_for(tid), 12);
+        assert_eq!(take_pending_for(tid), NO_PENDING_SIGNAL);
+        assert!(!has_pending_for(tid));
         drain_pending_pipe();
         drain_pump_pipe();
     }
