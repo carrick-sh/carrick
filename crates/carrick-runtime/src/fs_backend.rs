@@ -1124,10 +1124,18 @@ fn with_entry_fd<R>(
 /// Read the guest-mode xattr for `rel` under `dir`. `None` => fall back to the
 /// real mode.
 fn read_mode_xattr(dir: &cap_std::fs::Dir, rel: &Path, is_dir: bool) -> Option<u32> {
-    with_entry_fd(dir, rel, is_dir, false, |fd| {
-        fget_u32_xattr(fd, CARRICK_MODE_XATTR)
-    })
-    .flatten()
+    #[cfg(target_os = "macos")]
+    {
+        let _ = is_dir;
+        path_get_u32_xattr(dir, rel, CARRICK_MODE_XATTR, false)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        with_entry_fd(dir, rel, is_dir, false, |fd| {
+            fget_u32_xattr(fd, CARRICK_MODE_XATTR)
+        })
+        .flatten()
+    }
 }
 
 /// Write the guest-mode xattr for `rel` under `dir`. Best-effort.
@@ -1141,10 +1149,17 @@ pub(crate) fn write_mode_xattr(dir: &cap_std::fs::Dir, rel: &Path, is_dir: bool,
 /// `CARRICK_SOCKET_XATTR`). A read-only `O_EVTONLY` peek that preserves atime,
 /// just like `read_mode_xattr`.
 fn read_socket_xattr(dir: &cap_std::fs::Dir, rel: &Path) -> bool {
-    with_entry_fd(dir, rel, false, false, |fd| {
-        fget_u32_xattr(fd, CARRICK_SOCKET_XATTR).is_some()
-    })
-    .unwrap_or(false)
+    #[cfg(target_os = "macos")]
+    {
+        path_get_u32_xattr(dir, rel, CARRICK_SOCKET_XATTR, false).is_some()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        with_entry_fd(dir, rel, false, false, |fd| {
+            fget_u32_xattr(fd, CARRICK_SOCKET_XATTR).is_some()
+        })
+        .unwrap_or(false)
+    }
 }
 
 /// Read the guest owner (uid, gid) xattrs for `rel`. Either may be `None`.
@@ -1173,8 +1188,20 @@ fn sandbox_abs_path(dir: &cap_std::fs::Dir, rel: &Path) -> Option<std::path::Pat
 #[cfg(target_os = "macos")]
 const XATTR_NOFOLLOW: i32 = 0x0001;
 
+/// Path-based u32 xattr read (macOS). Unlike `with_entry_fd` + `fget_u32_xattr`,
+/// this issues NO open() — so it avoids cap-std's per-component path walk (the
+/// dominant cost of every stat on `--fs host`; ~291 host opens per guest open,
+/// see docs/fs-host-capstd-amplification.md) and never bumps atime (getxattr is
+/// a metadata op, like the O_EVTONLY open it replaces). `nofollow` reads a
+/// symlink's OWN xattr (XATTR_NOFOLLOW); callers resolve real files first, so for
+/// those the leaf is not a symlink and the flag is moot.
 #[cfg(target_os = "macos")]
-fn symlink_get_u32_xattr(dir: &cap_std::fs::Dir, rel: &Path, name: &[u8]) -> Option<u32> {
+fn path_get_u32_xattr(
+    dir: &cap_std::fs::Dir,
+    rel: &Path,
+    name: &[u8],
+    nofollow: bool,
+) -> Option<u32> {
     use std::os::unix::ffi::OsStrExt;
     let abs = sandbox_abs_path(dir, rel)?;
     let cpath = std::ffi::CString::new(abs.as_os_str().as_bytes()).ok()?;
@@ -1186,10 +1213,15 @@ fn symlink_get_u32_xattr(dir: &cap_std::fs::Dir, rel: &Path, name: &[u8]) -> Opt
             v.as_mut_ptr() as *mut libc::c_void,
             v.len(),
             0,
-            XATTR_NOFOLLOW,
+            if nofollow { XATTR_NOFOLLOW } else { 0 },
         )
     };
     (n == 4).then(|| u32::from_le_bytes(v))
+}
+
+#[cfg(target_os = "macos")]
+fn symlink_get_u32_xattr(dir: &cap_std::fs::Dir, rel: &Path, name: &[u8]) -> Option<u32> {
+    path_get_u32_xattr(dir, rel, name, true)
 }
 
 #[cfg(target_os = "macos")]
@@ -1233,13 +1265,24 @@ fn read_owner_xattr(
             symlink_get_u32_xattr(dir, rel, CARRICK_GID_XATTR),
         );
     }
-    with_entry_fd(dir, rel, is_dir, false, |fd| {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = is_dir;
         (
-            fget_u32_xattr(fd, CARRICK_UID_XATTR),
-            fget_u32_xattr(fd, CARRICK_GID_XATTR),
+            path_get_u32_xattr(dir, rel, CARRICK_UID_XATTR, false),
+            path_get_u32_xattr(dir, rel, CARRICK_GID_XATTR, false),
         )
-    })
-    .unwrap_or((None, None))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        with_entry_fd(dir, rel, is_dir, false, |fd| {
+            (
+                fget_u32_xattr(fd, CARRICK_UID_XATTR),
+                fget_u32_xattr(fd, CARRICK_GID_XATTR),
+            )
+        })
+        .unwrap_or((None, None))
+    }
 }
 
 /// Write the guest owner uid/gid xattrs for `rel`. A value of `u32::MAX`
