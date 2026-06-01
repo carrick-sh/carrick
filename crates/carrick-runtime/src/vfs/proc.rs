@@ -840,18 +840,45 @@ Pid:\t{pid}\nPPid:\t{ppid}\nThreads:\t{n}\n",
         }
     }
 
-    if !crate::host_proc::is_guest_process(pid) {
+    // PID namespace (§5.3): the guest addresses `/proc/<ns_pid>/…` by ns-pid.
+    // Translate it to the host pid for the host-backed lookups, but keep the
+    // ns-pid for the displayed `Pid:` field; translate the host ppid/pgid back
+    // to ns-pids for display. Identity when namespaces are off (host pid == the
+    // value the guest passed).
+    let ns_enabled = crate::namespace::pid::enabled();
+    let host_pid = if ns_enabled {
+        match crate::namespace::pid::ns_to_host_or_self(pid) {
+            Some(h) => h,
+            None => return None,
+        }
+    } else {
+        pid
+    };
+    if !crate::host_proc::is_guest_process(host_pid) {
         return None;
     }
-    let info = crate::host_proc::pid_info(pid)?;
+    let info = crate::host_proc::pid_info(host_pid)?;
     let comm = if info.comm.is_empty() {
         "carrick".to_owned()
     } else {
         info.comm.clone()
     };
+    // Display pids are ns-local: the requested ns-pid for self, and the
+    // ns-translation of the host ppid/pgid (0 / reparent handled by the
+    // translation). When ns is off these are the raw host values.
+    let disp_ppid = if ns_enabled {
+        crate::namespace::pid::host_to_ns_or_self(info.ppid)
+    } else {
+        info.ppid
+    };
+    let disp_pgid = if ns_enabled {
+        crate::namespace::pid::host_to_ns_pgid(info.pgid)
+    } else {
+        info.pgid
+    };
     match rest {
         "stat" => Some(
-            proc_stat_line(pid, &comm, info.state, info.ppid, info.pgid, info.pgid).into_bytes(),
+            proc_stat_line(pid, &comm, info.state, disp_ppid, disp_pgid, disp_pgid).into_bytes(),
         ),
         "comm" => Some(format!("{comm}\n").into_bytes()),
         "cmdline" => {
@@ -872,7 +899,7 @@ Gid:\t{gid}\t{gid}\t{gid}\t{gid}\n\
 Threads:\t1\n",
                 state = info.state,
                 state_long = proc_state_long(info.state),
-                ppid = info.ppid,
+                ppid = disp_ppid,
                 uid = info.uid,
                 gid = info.gid,
             )

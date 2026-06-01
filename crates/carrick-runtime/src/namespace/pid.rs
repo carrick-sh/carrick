@@ -233,6 +233,18 @@ pub fn host_to_ns_or_self(host_pid: u32) -> u32 {
     }
 }
 
+/// Translate a host pgid/sid to the value the ns should report. If the group/
+/// session leader is a namespace member, report its ns-pid; otherwise keep the
+/// host value (a pgid/sid is always positive, so unlike a parent pid it must
+/// NOT collapse to 0 — Phase 2 keeps non-member groups host-level, §6.6).
+/// Identity when namespaces are off.
+pub fn host_to_ns_pgid(host_pgid: u32) -> u32 {
+    match region() {
+        Some(r) => r.host_to_ns(host_pgid).unwrap_or(host_pgid),
+        None => host_pgid,
+    }
+}
+
 /// Translate an ns-pid the guest supplied back to the host pid to operate on.
 /// Identity when namespaces are off. Returns `None` (→ `ESRCH`) for an ns-pid
 /// that names no member.
