@@ -17,6 +17,7 @@ pub mod host_tty;
 pub(crate) mod inotify;
 pub mod interactive_supervisor;
 pub mod layer_cache;
+pub mod namespace;
 // `linux_abi` was lifted into the leaf crate `carrick-abi` (build-graph split,
 // docs/build-decomposition-design.md §3.A-A1). Re-exported under the original
 // path so every `crate::linux_abi::…` / `carrick_runtime::linux_abi::…` site is
