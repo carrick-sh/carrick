@@ -1,9 +1,12 @@
 # `--fs host` open amplification: cap-std re-resolution (~291× host opens/guest open)
 
-**Status:** Phases 1+2 IMPLEMENTED + verified (2026-06-01) — test_glob TIMEOUT→MATCH
-(140s→48s; host opens 999,646→405,926). See "IMPLEMENTED" section at the bottom. The
-feature-flagged (`CARRICK_FAST_FS`, default on) macOS-native bypass replaced cap-std's
-per-component walk for non-creating stat/lookup; writes/creates stay on cap-std.
+**Status:** Phases 1+2 IMPLEMENTED + verified (2026-06-01). Phase 1 (path-based getxattr)
+is unconditional; Phase 2 (`fast_lstat_contained` openat+F_GETPATH) is **opt-in
+`CARRICK_FAST_FS=1`, default OFF** — it aggravates the multithreaded-fork HVF wedge
+(see the "UPDATE" section at the bottom — that is the authoritative current state; the
+"default on" mentions in the mid-sections below are superseded). With `CARRICK_FAST_FS=1`:
+test_glob TIMEOUT→MATCH (140s→48s; host opens 999,646→405,926). Non-creating stat/lookup
+only; writes/creates stay on cap-std.
 
 ## The pathology (empirical, via `carrick trace`)
 
