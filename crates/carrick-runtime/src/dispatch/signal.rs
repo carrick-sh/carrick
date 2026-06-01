@@ -33,6 +33,19 @@ pub(super) struct SignalState {
     /// while blocked must yield N deliveries on unblock. `take_pending_in`
     /// decrements this and only clears the pending bit when it hits 0.
     pub rt_pending_counts: HashMap<(crate::thread::ThreadId, i32), u32>,
+    /// SHARED (process-level) pending set (bit `signum-1`) for PROCESS-directed
+    /// signals (`kill(getpid(), sig)`) that no thread can take immediately
+    /// because EVERY thread blocks `sig`. Linux holds such a signal in the
+    /// thread group's shared pending set, deliverable to whichever thread next
+    /// unblocks it (`rt_sigprocmask` -> `take_deliverable_pending`) OR dequeues
+    /// it synchronously (`rt_sigtimedwait`/sigwait). Pinning it to the SENDER's
+    /// per-thread set instead stranded a SIBLING's `sigwait` forever (CPython
+    /// test_sigwait_thread). `take_pending_in` considers this alongside the
+    /// per-thread set so any thread can consume it.
+    pub process_pending: u64,
+    /// Queue depth for SHARED pending REAL-TIME signals, keyed by `signum`
+    /// (the process-level analogue of `rt_pending_counts`).
+    pub process_rt_pending_counts: HashMap<i32, u32>,
     /// Installed alternate signal stack (`sigaltstack`), PER GUEST THREAD.
     /// `sigaltstack` is per-thread in Linux (each thread/M registers its own
     /// signal stack), so this MUST be keyed by tid: a process-global slot made
@@ -67,6 +80,8 @@ impl SignalState {
             masks: HashMap::new(),
             pendings: HashMap::new(),
             rt_pending_counts: HashMap::new(),
+            process_pending: 0,
+            process_rt_pending_counts: HashMap::new(),
             altstack: HashMap::new(),
             restore_masks: HashMap::new(),
             pending_siginfos: HashMap::new(),
@@ -237,6 +252,12 @@ impl SyscallDispatcher {
         // under the new tid so the child starts clean.
         s.pendings.remove(&new);
         s.rt_pending_counts.retain(|(t, _), _| *t != new);
+        // fork ALSO clears the inherited (copied) shared process pending set —
+        // a process-directed signal pending in the parent is not pending in the
+        // new child (POSIX). This runs only in the post-fork child (a separate
+        // host process), so it never affects the parent's shared set.
+        s.process_pending = 0;
+        s.process_rt_pending_counts.clear();
     }
 
     /// Reset signal dispositions across `execve(2)`, matching the kernel: every
@@ -376,33 +397,75 @@ impl SyscallDispatcher {
     }
 
     /// Lowest-numbered pending signal for `tid` that intersects `set`, cleared
-    /// from that thread's pending set. Used by `rt_sigtimedwait`.
+    /// from that thread's pending set OR the shared process pending set. Used by
+    /// `rt_sigtimedwait`/sigwait and `take_deliverable_pending`. The union lets
+    /// any thread consume a process-directed signal held in the shared set
+    /// (`process_pending`), matching Linux's thread-group shared pending.
     fn take_pending_in(&self, tid: crate::thread::ThreadId, set: u64) -> Option<i32> {
         let mut signal = self.signal.lock();
-        let cur = signal.pendings.get(&tid).copied().unwrap_or(0);
-        let candidates = cur & set;
+        let per_thread = signal.pendings.get(&tid).copied().unwrap_or(0);
+        let shared = signal.process_pending;
+        let candidates = (per_thread | shared) & set;
         if candidates == 0 {
             return None;
         }
         let signum = candidates.trailing_zeros() as i32 + 1;
+        let bit = 1u64 << (signum - 1);
+        // A signal pending on THIS thread is taken from its per-thread queue;
+        // otherwise it's a process-directed signal from the shared set.
+        let from_thread = per_thread & bit != 0;
         // RT signals queue: take one instance, and only clear the pending bit
         // once the last queued instance is drained (so N sends → N deliveries).
         if is_rt_signal(signum) {
-            let key = (tid, signum);
-            let remaining = signal
-                .rt_pending_counts
-                .get(&key)
-                .copied()
-                .unwrap_or(0)
-                .saturating_sub(1);
-            if remaining > 0 {
-                signal.rt_pending_counts.insert(key, remaining);
-                return Some(signum); // more queued — leave the bit set
+            if from_thread {
+                let key = (tid, signum);
+                let remaining = signal
+                    .rt_pending_counts
+                    .get(&key)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_sub(1);
+                if remaining > 0 {
+                    signal.rt_pending_counts.insert(key, remaining);
+                    return Some(signum); // more queued — leave the bit set
+                }
+                signal.rt_pending_counts.remove(&key);
+                signal.pendings.insert(tid, per_thread & !bit);
+            } else {
+                let remaining = signal
+                    .process_rt_pending_counts
+                    .get(&signum)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_sub(1);
+                if remaining > 0 {
+                    signal.process_rt_pending_counts.insert(signum, remaining);
+                    return Some(signum); // more queued — leave the bit set
+                }
+                signal.process_rt_pending_counts.remove(&signum);
+                signal.process_pending &= !bit;
             }
-            signal.rt_pending_counts.remove(&key);
+            return Some(signum);
         }
-        signal.pendings.insert(tid, cur & !(1u64 << (signum - 1)));
+        if from_thread {
+            signal.pendings.insert(tid, per_thread & !bit);
+        } else {
+            signal.process_pending &= !bit;
+        }
         Some(signum)
+    }
+
+    /// Record a PROCESS-directed signal in the SHARED pending set (no thread
+    /// could take it because every thread blocks it). Deliverable to whichever
+    /// thread next unblocks or `sigwait`s it. RT signals queue per POSIX.
+    fn mark_process_signal_pending(&self, signum: i32) {
+        if let Some(bit) = sigmask_bit(signum) {
+            let mut s = self.signal.lock();
+            s.process_pending |= bit;
+            if is_rt_signal(signum) {
+                *s.process_rt_pending_counts.entry(signum).or_insert(0) += 1;
+            }
+        }
     }
 
     /// Raise `signum` against the guest itself (kill/tkill/tgkill self
@@ -468,8 +531,12 @@ impl SyscallDispatcher {
                 }
             }
         }
-        // Every thread blocks it: hold pending on the caller.
-        self.mark_signal_pending(caller_tid, s);
+        // Every thread blocks it: hold it in the SHARED process pending set so
+        // whichever thread next unblocks it (rt_sigprocmask) OR dequeues it
+        // synchronously (sigwait/rt_sigtimedwait) consumes it. Pinning it to
+        // the (blocked) caller stranded a SIBLING thread's sigwait forever
+        // (CPython test_sigwait_thread; probe sigwaitthread).
+        self.mark_process_signal_pending(s);
         DispatchOutcome::Returned { value: 0 }
     }
 
@@ -724,7 +791,12 @@ impl SyscallDispatcher {
             this.restore_signal_mask(tid, suspend_mask);
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
-                let pending = this.signal.lock().pendings.get(&tid).copied().unwrap_or(0);
+                let signal = this.signal.lock();
+                // A queued per-thread signal OR a shared process-directed signal
+                // now deliverable under suspend_mask wakes sigsuspend.
+                let pending =
+                    signal.pendings.get(&tid).copied().unwrap_or(0) | signal.process_pending;
+                drop(signal);
                 if pending & !suspend_mask != 0 {
                     break; // a queued signal is now deliverable
                 }
@@ -876,7 +948,12 @@ impl SyscallDispatcher {
             if sigset_size != LINUX_RT_SIGSET_SIZE {
                 return Ok(LINUX_EINVAL.into());
             }
-            let pending = this.signal.lock().pendings.get(&tid).copied().unwrap_or(0);
+            let signal = this.signal.lock();
+            // Pending = this thread's per-thread set UNION the shared process
+            // pending set (Linux sigpending reports both).
+            let pending =
+                signal.pendings.get(&tid).copied().unwrap_or(0) | signal.process_pending;
+            drop(signal);
             if set_ptr != 0 && memory.write_bytes(set_ptr, &pending.to_le_bytes()).is_err() {
                 return Ok(LINUX_EFAULT.into());
             }
@@ -1331,6 +1408,46 @@ mod tests {
         d.mark_signal_pending(tid, 34);
         d.forget_thread_signal_state(tid);
         assert_eq!(d.take_deliverable_pending(tid), None);
+    }
+
+    #[test]
+    fn process_directed_pending_is_consumable_by_any_thread() {
+        // A process-directed signal that EVERY thread blocks lands in the shared
+        // pending set (raise_process_directed's all-blocked branch). It must be
+        // dequeuable by a thread OTHER than the sender — the CPython
+        // test_sigwait_thread case where the killer thread sends and a SIBLING
+        // (the main thread) is parked in sigwait. Pinning to the sender's tid
+        // stranded that sibling forever (probe sigwaitthread).
+        let d = SyscallDispatcher::new();
+        let sender: crate::thread::ThreadId = 7;
+        let waiter: crate::thread::ThreadId = 42;
+        let usr1 = 10u64;
+        let set = 1u64 << (usr1 - 1);
+
+        d.mark_process_signal_pending(usr1 as i32);
+        // A sigwait whose set does NOT include SIGUSR1 must not dequeue it.
+        let other = 1u64 << (12 - 1); // SIGUSR2 (12), not SIGUSR1
+        assert_eq!(d.take_pending_in(waiter, other), None);
+        // The SIBLING (a thread other than the sender) parked in sigwait
+        // selecting SIGUSR1 dequeues the shared signal — the core fix.
+        assert_eq!(d.take_pending_in(waiter, set), Some(usr1 as i32));
+        // Consumed exactly once — no second thread can also take it.
+        assert_eq!(d.take_pending_in(sender, set), None);
+        assert_eq!(d.take_pending_in(waiter, set), None);
+
+        // The deliver-on-unblock path (take_deliverable_pending) also drains the
+        // shared set, for a thread that unblocks the signal without sigwait.
+        d.mark_process_signal_pending(usr1 as i32);
+        assert_eq!(d.take_deliverable_pending(waiter), Some(usr1 as i32));
+        assert_eq!(d.take_deliverable_pending(sender), None);
+
+        // Shared RT signals queue per POSIX (N sends → N deliveries), independent
+        // of which thread drains them.
+        d.mark_process_signal_pending(34);
+        d.mark_process_signal_pending(34);
+        assert_eq!(d.take_deliverable_pending(waiter), Some(34));
+        assert_eq!(d.take_deliverable_pending(sender), Some(34));
+        assert_eq!(d.take_deliverable_pending(waiter), None);
     }
 
     #[test]
