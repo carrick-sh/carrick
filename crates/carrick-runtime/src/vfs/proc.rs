@@ -36,6 +36,44 @@ pub struct SyntheticProcContext {
     pub mmap_next: u64,
 }
 
+/// The three writable user-namespace map files (only the `self/` forms; writing
+/// another live process's map needs a parent relationship carrick does not yet
+/// model — design §4.3). Phase 1 supports the self-map case, which is what
+/// `unshare -Ur`, apt's sandbox, and bubblewrap exercise.
+pub(crate) fn is_userns_map_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/proc/self/uid_map" | "/proc/self/gid_map" | "/proc/self/setgroups"
+    )
+}
+
+/// Apply a write(2) to one of the user-namespace map files. Returns the
+/// `write(2)` result: `Ok(bytes_written)` on success (the whole buffer is
+/// "consumed" per kernel behavior), or `Err(positive_errno)` (EPERM / EINVAL)
+/// to be returned as a negative errno. The write-once, setgroups-gate, ≤5-line
+/// and unprivileged-single-id rules are enforced by [`crate::namespace::user`].
+pub(crate) fn write_userns_map(path: &str, data: &[u8]) -> Result<usize, i64> {
+    let text = std::str::from_utf8(data).map_err(|_| crate::namespace::user::EINVAL)?;
+    let privileged = crate::namespace::process::is_map_write_privileged();
+    // The writer's outside id for the unprivileged single-id rule. carrick runs
+    // the guest as a single host identity; the parent-ns euid/egid is the host
+    // identity, which for the default container is 0. We use the modeled creds
+    // via cred_ipc's published self euid is not reachable here cheaply, so use
+    // the namespace store's notion (identity ns → 0). The unprivileged path is
+    // only reached after the guest unshared a userns, where the parent-ns id is
+    // the pre-unshare euid; for the common rootful case `privileged` is true and
+    // this value is unused.
+    let euid_outside = 0;
+    let egid_outside = 0;
+    crate::namespace::process::with_user_mut(|ns| match path {
+        "/proc/self/uid_map" => ns.write_uid_map(text, privileged, euid_outside),
+        "/proc/self/gid_map" => ns.write_gid_map(text, privileged, egid_outside),
+        "/proc/self/setgroups" => ns.write_setgroups(text),
+        _ => Err(crate::namespace::user::EINVAL),
+    })
+    .map(|()| data.len())
+}
+
 pub(crate) fn synthetic_file(path: &str, ctx: &SyntheticProcContext) -> Option<Vec<u8>> {
     match path {
         "/proc/cmdline" => Some(synthetic_proc_cmdline().to_vec()),
@@ -58,6 +96,21 @@ pub(crate) fn synthetic_file(path: &str, ctx: &SyntheticProcContext) -> Option<V
         "/proc/self/stat" => Some(synthetic_proc_self_stat(&ctx.executable_path).into_bytes()),
         "/proc/self/statm" => Some(synthetic_proc_self_statm()),
         "/proc/self/status" => Some(synthetic_proc_self_status(&ctx.executable_path).into_bytes()),
+        // User-namespace map files (user_namespaces(7)). For the initial
+        // identity namespace these read as `0 0 4294967295` / `allow`, matching
+        // observed `docker run` (docs/namespaces-design.md §1.2, §4.3). Writable
+        // — see ProcVfs::open + the write(2) handler.
+        "/proc/self/uid_map" => {
+            Some(crate::namespace::process::with_user(|ns| ns.uid_map_text()).into_bytes())
+        }
+        "/proc/self/gid_map" => {
+            Some(crate::namespace::process::with_user(|ns| ns.gid_map_text()).into_bytes())
+        }
+        "/proc/self/setgroups" => Some(
+            crate::namespace::process::with_user(|ns| ns.setgroups_text())
+                .as_bytes()
+                .to_vec(),
+        ),
         "/proc/sys/kernel/osrelease" => Some(synthetic_proc_osrelease().to_vec()),
         "/proc/sys/kernel/hostname" => Some(synthetic_proc_hostname().to_vec()),
         // The default 64-bit Linux pid ceiling. LTP (e.g. setpgid02) reads
@@ -394,7 +447,11 @@ impl Vfs for ProcVfs {
         let Some(contents) = synthetic_file(path, &synth_ctx) else {
             return Err(crate::linux_abi::LINUX_ENOSYS);
         };
-        if flags.write {
+        // The user-namespace map files are writable; the dispatcher routes
+        // write(2) on their SyntheticFile to the UserNs writers (the write-once
+        // / setgroups-gate rules live there, §4.3). All other /proc files stay
+        // read-only.
+        if flags.write && !is_userns_map_path(path) {
             return Err(LINUX_EACCES);
         }
         Ok(VfsHandle::Bytes {
@@ -647,6 +704,11 @@ fn synthetic_proc_self_status(executable_path: &str) -> String {
     // asserts it equals gettid()/getpid(). A single-threaded process has
     // Pid == Tgid.
     let pid = std::process::id();
+    // Capabilities: report the modeled set (Docker default 00000000a80425fb,
+    // or a full set inside a freshly-created user namespace), NOT the all-zero
+    // set — capability-probing tools (apt/dpkg/setpriv) refuse to proceed if
+    // they think they hold nothing (docs/namespaces-design.md §4.4).
+    let cap_lines = crate::namespace::process::cap_status_lines();
     format!(
         "Name:\t{comm}\n\
 Umask:\t0022\n\
@@ -679,11 +741,7 @@ ShdPnd:\t0000000000000000\n\
 SigBlk:\t0000000000000000\n\
 SigIgn:\t0000000000000000\n\
 SigCgt:\t0000000000000000\n\
-CapInh:\t0000000000000000\n\
-CapPrm:\t0000000000000000\n\
-CapEff:\t0000000000000000\n\
-CapBnd:\t0000000000000000\n\
-CapAmb:\t0000000000000000\n\
+{cap_lines}\
 Cpus_allowed:\t{cpus_hex}\n\
 Cpus_allowed_list:\t{cpus_list}\n\
 Mems_allowed:\t1\n\

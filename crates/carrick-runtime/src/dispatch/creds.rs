@@ -242,10 +242,16 @@ impl SyscallDispatcher {
             if data_address.0 == 0 {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
+            // Report the modeled capability set (Docker default, or a full set
+            // inside a fresh user namespace) rather than an empty set, so
+            // libcap-based tools see a coherent story (docs/namespaces-design.md
+            // §4.4). capget data words are 32-bit halves of each 64-bit set:
+            // word 0 = low 32 bits, word 1 = high 32 bits (capability_words).
+            let caps = crate::namespace::process::caps();
             let words = linux_capability_data_words(header.version);
-            let empty = vec![LinuxCapabilityData::empty(); words];
+            let data = capability_words(&caps, words);
             if memory
-                .write_bytes(data_address.0, capability_data_bytes(&empty).as_slice())
+                .write_bytes(data_address.0, capability_data_bytes(&data).as_slice())
                 .is_err()
             {
                 return Ok(LINUX_EFAULT.into());
@@ -270,9 +276,18 @@ impl SyscallDispatcher {
                 Ok(data) => data,
                 Err(errno) => return Ok(errno.into()),
             };
-            if data.iter().any(|word| !word.is_empty()) {
-                return Ok(LINUX_EPERM.into());
-            }
+            // Accept-and-record: store the requested effective/permitted/
+            // inheritable set rather than rejecting non-empty sets, so
+            // libcap-based tools (dpkg, setpriv) that capset() to drop/raise
+            // caps don't abort (docs/namespaces-design.md §4.4). Not enforced —
+            // carrick is the kernel and does not modulate DAC by caps. The
+            // bounding/ambient sets are preserved (capset cannot raise them).
+            let mut caps = crate::namespace::process::caps();
+            let (eff, prm, inh) = capability_set_from_words(&data);
+            caps.effective = eff;
+            caps.permitted = prm;
+            caps.inheritable = inh;
+            crate::namespace::process::set_caps(caps);
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
@@ -599,6 +614,41 @@ fn capability_data_bytes(data: &[LinuxCapabilityData]) -> Vec<u8> {
         bytes.extend_from_slice(word.as_bytes());
     }
     bytes
+}
+
+/// Split a modeled [`crate::namespace::process::CapabilitySet`] into the
+/// `count` 32-bit `LinuxCapabilityData` words the capget(2) ABI expects: word 0
+/// carries the low 32 bits of each set, word 1 (v2/v3) the high 32 bits.
+fn capability_words(
+    caps: &crate::namespace::process::CapabilitySet,
+    count: usize,
+) -> Vec<LinuxCapabilityData> {
+    (0..count)
+        .map(|i| {
+            let shift = (i as u32) * 32;
+            let half = |v: u64| -> u32 { (v >> shift) as u32 };
+            LinuxCapabilityData {
+                effective: half(caps.effective),
+                permitted: half(caps.permitted),
+                inheritable: half(caps.inheritable),
+            }
+        })
+        .collect()
+}
+
+/// Reassemble the (effective, permitted, inheritable) u64 sets from the capset(2)
+/// data words (inverse of [`capability_words`]).
+fn capability_set_from_words(data: &[LinuxCapabilityData]) -> (u64, u64, u64) {
+    let mut eff = 0u64;
+    let mut prm = 0u64;
+    let mut inh = 0u64;
+    for (i, word) in data.iter().enumerate() {
+        let shift = (i as u32) * 32;
+        eff |= u64::from(word.effective) << shift;
+        prm |= u64::from(word.permitted) << shift;
+        inh |= u64::from(word.inheritable) << shift;
+    }
+    (eff, prm, inh)
 }
 
 fn linux_capability_version_is_supported(version: u32) -> bool {
