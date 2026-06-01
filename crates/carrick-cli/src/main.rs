@@ -42,6 +42,28 @@ fn configure_process_environment() {
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
 
+    // Raise our own RLIMIT_NOFILE soft limit so we can back a guest that opens
+    // many fds (e.g. libuv's watcher_cross_stop opens ~2500 UDP sockets, each a
+    // host fd). macOS's default soft limit (often 256) would EMFILE the host
+    // long before the guest's emulated limit. macOS rejects RLIM_INFINITY and
+    // values above kern.maxfilesperproc (~122k), so aim for a generous fixed
+    // ceiling well under that. Best-effort: leave the limit alone on failure.
+    unsafe {
+        let mut rl = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        const WANT: u64 = 65536;
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) == 0 && rl.rlim_cur < WANT {
+            rl.rlim_cur = if rl.rlim_max != libc::RLIM_INFINITY && rl.rlim_max < WANT {
+                rl.rlim_max
+            } else {
+                WANT
+            };
+            let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &rl);
+        }
+    }
+
     // Relocate `environ` onto the heap so the contiguous argv/env stack
     // bytes become a wider writable buffer for `set_host_process_name`.
     // MUST run BEFORE any setenv: the first setenv on the pristine env
