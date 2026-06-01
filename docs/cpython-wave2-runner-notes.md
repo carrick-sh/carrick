@@ -83,3 +83,50 @@ Keep the normalization of paths but move xattr-driven mode/socket-check to the s
 - **mmap eager-alloc**: file-backed mmap >~fast-path falls to `vec![0; length]` (dispatch/mem.rs ~490) — a 2-4GB mmap allocates 2-4GB host RAM → hang/OOM (test_mmap). Route large file mmaps through MapHostAlias (dup fd + hv_vm_map), don't buffer.
 - **UDPLITE**: macOS has no IPPROTO_UDPLITE — a fundamental platform limit (224 test_socket errors). Either back with UDP (lossy) or accept as unsupportable; not a carrick bug.
 - **Workflow isolation lesson**: root-cause subagents must be read-only (Explore) or `isolation:'worktree'` — an edit-capable general-purpose agent corrupted the shared tree this session.
+## CORRECTED test_socket analysis (empirical, 2026-06-01) — "what is the macOS version?"
+
+The earlier "188 = mostly UDPLITE platform limit" was wrong/dismissive. A clean
+standalone run (randseed 0) gives **2 systemic, FIXABLE causes** (145 consistent
+fails; the ~43 extra in the parallel sweep — testHostnameRes/testSockName/SCTP —
+were flaky-under-load: SCTP actually SKIPS on both sides, hostname/sockname pass
+standalone):
+
+### 1. IPv6 RFC 3542 ancillary cmsg — 32 FAIL (`RecvmsgRFC3542AncillaryUDP6Test` etc.)
+`assertEqual(len(ancdata), 1)` → `0 != 1`: recvmsg returns ZERO cmsg.
+**macOS HAS this feature** (RFC 3542) — gated behind `#define __APPLE_USE_RFC_3542`,
+with DIFFERENT constant values than Linux:
+| option | macOS | Linux |
+|---|---|---|
+| IPV6_RECVHOPLIMIT | 37 | 51 |
+| IPV6_HOPLIMIT (cmsg) | 47 | 52 |
+| IPV6_RECVTCLASS | 35 | 66 |
+| IPV6_TCLASS (cmsg) | 36 | 67 |
+| IPV6_PKTINFO | 46 | 50 |
+| IPV6_RECVPKTINFO | 61 | 49 |
+**Fix (darwin-native, principled):** (a) in `setsockopt` (net.rs ~2687), when
+level==IPPROTO_IPV6 translate the guest's Linux IPV6_RECV* optname → the macOS
+value before the host setsockopt (mirror the existing SO_REUSEADDR→REUSEPORT
+special-case). (b) in `recvmsg_inner` (net.rs ~3355), stop forwarding ONLY
+SCM_RIGHTS — enumerate ALL host cmsg headers, translate cmsg_type macOS→Linux
+(47→52, 36→67, 46→50) and rebuild the guest control buffer with proper
+CMSG_ALIGN + MSG_CTRUNC. Why native-macOS-Python passes but linux-python-under-
+carrick fails: native uses macOS values (37/47); carrick passes Linux 51 → macOS
+treats it as a different/invalid option so the cmsg is never enabled, AND drops
+it on the way out.
+
+### 2. UDPLITE — 113 ERROR (`Basic/Recvmsg/Sendmsg*UDPLITE*Test`)
+`socket(AF_INET, SOCK_DGRAM, IPPROTO_UDPLITE=136)` fails at setUp.
+**macOS has NO UDPLITE** (no constant, no protocol). Native-macOS-Python SKIPS
+these (its socket module never defines IPPROTO_UDPLITE); only the LINUX guest
+tries them. The only macOS backing is a plain UDP socket.
+**Fix (substitute):** in `host_socket_install` (net.rs ~480), map
+protocol==IPPROTO_UDPLITE(136)→UDP (proto 0/IPPROTO_UDP), store the original
+proto on the HostSocket, and accept the SOL_UDPLITE(136) cscov setsockopts
+(UDPLITE_SEND_CSCOV=10/RECV_CSCOV=11) as no-ops. Flips the send/recv/recvmsg
+UDPLITE tests (they're the UDP tests re-run with IPPROTO_UDPLITE); the few that
+assert partial-checksum-coverage *behavior* won't pass (macOS can't do it).
+
+TAKEAWAY (runner theme): test_socket's gap is carrick not translating Linux
+socket semantics onto the macOS stack — same class as the SO_REUSEADDR→REUSEPORT
+and multicast→ENODEV fixes already landed. Both fixes are real net.rs work; do
+the cmsg translation first (principled, uses macOS's real RFC 3542).
