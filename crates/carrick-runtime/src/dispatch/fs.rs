@@ -5220,16 +5220,39 @@ impl SyscallDispatcher {
                             .set_file_contents(&path, contents);
                     }
                     let DispatchOutcome::Returned { value } = outcome else {
-                        // A broken pipe/socket (read end closed) → EPIPE AND a
-                        // SIGPIPE on the writer, same as `write(2)`. busybox
-                        // `yes` writes via writev, so without this it got EPIPE
-                        // but no SIGPIPE and exited 1 instead of 141 (write05;
-                        // `yes | head` divergence vs docker).
+                        // EAGAIN/EPIPE on this iovec. writev(2) is atomic across
+                        // iovecs: if EARLIER iovecs were already written (total >
+                        // 0), return that short count — NOT the error, which
+                        // would discard bytes already sent and make the caller
+                        // re-send from offset 0 (libuv's stream flow control then
+                        // never completes a write: ipc_heavy_traffic_deadlock_bug,
+                        // bw stuck at 0). Only surface the error when nothing has
+                        // been written yet.
+                        //
+                        // For EPIPE specifically with nothing written: a broken
+                        // pipe/socket (read end closed) → EPIPE AND a SIGPIPE on
+                        // the writer, same as write(2) (busybox `yes | head`
+                        // wants exit 141, write05).
+                        if total > 0 {
+                            return Ok(DispatchOutcome::Returned {
+                                value: total as i64,
+                            });
+                        }
                         return Ok(this.raise_sigpipe_on_epipe(cx, outcome));
                     };
                     total = total
                         .checked_add(value as usize)
                         .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
+                    // A SHORT write on this iovec (host send buffer full) ends the
+                    // writev: the rest of this iovec and all later iovecs are
+                    // unsent. Returning the partial `total` is correct writev(2)
+                    // semantics; continuing would write a later iovec AFTER an
+                    // unfilled earlier one — a gap/reorder in the byte stream.
+                    if (value as usize) < iov_len {
+                        return Ok(DispatchOutcome::Returned {
+                            value: total as i64,
+                        });
+                    }
                     continue;
                 }
                 if *this.io.stream_stdio.lock() && (fd == 1 || fd == 2) {
