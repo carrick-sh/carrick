@@ -250,6 +250,18 @@ impl SyscallDispatcher {
         self.fd_status_flags(fd) & LINUX_O_NONBLOCK != 0 || (msg_flags & LINUX_MSG_DONTWAIT) != 0
     }
 
+    /// True iff `fd` is an eventfd. An eventfd is always POLLOUT-ready (its
+    /// counter isn't at max), but its host readiness pipe's READ end is never
+    /// writable — so select/poll's all-host `libc::poll` fast path drops the
+    /// requested POLLOUT (and worse, blocks waiting for it). When POLLOUT is
+    /// requested we route the eventfd through `poll_ready_events` instead, which
+    /// reports it writable. POLLIN-only stays on the native read_fd path so Go's
+    /// epoll netpollBreak (EVFILT_READ on the readiness pipe) is unaffected.
+    pub(super) fn fd_is_eventfd(&self, fd: i32) -> bool {
+        self.open_file(fd)
+            .is_some_and(|f| matches!(&*f.description.read(), OpenDescription::EventFd { .. }))
+    }
+
     fn poll_ready_events(&self, fd: i32, requested_events: i16) -> i16 {
         if fd < 0 {
             return 0;
@@ -304,10 +316,14 @@ impl SyscallDispatcher {
             }
             OpenDescription::Directory { .. } => {}
             OpenDescription::EventFd { state, .. } => {
-                if requested_events & LINUX_POLLIN != 0 && *state.counter.lock() > 0 {
+                let counter = *state.counter.lock();
+                if requested_events & LINUX_POLLIN != 0 && counter > 0 {
                     ready |= LINUX_POLLIN;
                 }
-                if requested_events & LINUX_POLLOUT != 0 {
+                // POLLOUT iff a write of 1 wouldn't overflow the counter — Linux
+                // reports an eventfd unwritable once it reaches 0xFFFF…FFFE
+                // (test_os EventfdTests.test_eventfd_select checks both states).
+                if requested_events & LINUX_POLLOUT != 0 && counter < u64::MAX - 1 {
                     ready |= LINUX_POLLOUT;
                 }
             }
@@ -1651,7 +1667,14 @@ impl SyscallDispatcher {
                 }
                 owners.push((fd_i32, req_mask));
                 events_list.push(events);
-                host_map.push(this.host_fd_for_poll(fd_i32));
+                // An eventfd with POLLOUT requested must go the poll_ready_events
+                // path (always-writable); its host read_fd would never report
+                // POLLOUT and the all-host libc::poll would block forever.
+                host_map.push(if w && this.fd_is_eventfd(fd_i32) {
+                    None
+                } else {
+                    this.host_fd_for_poll(fd_i32)
+                });
             }
 
             // revents per entry, filled by whichever path runs.
@@ -1959,7 +1982,18 @@ impl SyscallDispatcher {
             }
             // Map guest fds → host fds where possible. Fast path requires
             // every fd be host-backed (stdio bare, HostPipe, HostSocket).
-            let host_fds: Option<Vec<i32>> = fds.iter().map(|p| this.host_fd_for_poll(p.fd)).collect();
+            // An eventfd with POLLOUT requested goes the poll_ready_events path
+            // (always-writable); its host read_fd never reports POLLOUT.
+            let host_fds: Option<Vec<i32>> = fds
+                .iter()
+                .map(|p| {
+                    if (p.events & LINUX_POLLOUT) != 0 && this.fd_is_eventfd(p.fd) {
+                        None
+                    } else {
+                        this.host_fd_for_poll(p.fd)
+                    }
+                })
+                .collect();
             if let Some(host_fds) = host_fds {
                 let mut sys_pollfds: Vec<libc::pollfd> = fds
                     .iter()
