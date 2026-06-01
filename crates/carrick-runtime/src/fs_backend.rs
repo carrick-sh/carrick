@@ -752,6 +752,49 @@ pub struct HostFsBackend {
     /// `TempDir` in any process other than the creator, so only the
     /// original `carrick run` process reaps the scratch.
     owner_pid: u32,
+    /// F_GETPATH of the sandbox root dir fd, cached for the fast-stat
+    /// containment check (an opened entry's F_GETPATH must live under this).
+    /// `None` disables the fast path (treated as not-enabled).
+    root_prefix: Option<String>,
+    /// `--fs host` fast stat path (openat+F_GETPATH instead of cap-std's
+    /// per-component walk; see docs/fs-host-capstd-amplification.md) enabled.
+    /// Default on; `CARRICK_FAST_FS=0` forces the safe cap-std path.
+    fast_fs: bool,
+}
+
+/// F_GETPATH of a cap-std dir fd → its absolute host path (macOS), used as the
+/// containment prefix for the fast-stat path. `None` on failure/non-macOS.
+fn host_root_prefix(dir: &cap_std::fs::Dir) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        let mut buf = [0u8; libc::PATH_MAX as usize];
+        let rc = unsafe {
+            libc::fcntl(
+                dir.as_raw_fd(),
+                libc::F_GETPATH,
+                buf.as_mut_ptr() as *mut libc::c_char,
+            )
+        };
+        if rc < 0 {
+            return None;
+        }
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        std::str::from_utf8(&buf[..end]).ok().map(|s| s.to_owned())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = dir;
+        None
+    }
+}
+
+/// `--fs host` fast stat path enabled (default on; `CARRICK_FAST_FS=0` opts out).
+fn fast_fs_enabled() -> bool {
+    !matches!(
+        std::env::var("CARRICK_FAST_FS").as_deref(),
+        Ok("0") | Ok("false")
+    )
 }
 
 impl Drop for HostFsBackend {
@@ -791,11 +834,15 @@ impl HostFsBackend {
         let scratch = tempfile::TempDir::new_in(scratch_root)?;
         let lock = acquire_lockfile(scratch.path())?;
         let dir = cap_std::fs::Dir::open_ambient_dir(scratch.path(), cap_std::ambient_authority())?;
+        let root_prefix = host_root_prefix(&dir);
+        let fast_fs = fast_fs_enabled();
         Ok(Self {
             dir,
             _scratch: Some(scratch),
             _lock: Some(lock),
             owner_pid: unsafe { libc::getpid() as u32 },
+            root_prefix,
+            fast_fs,
         })
     }
 
@@ -822,12 +869,141 @@ impl HostFsBackend {
     /// Construct against an already-allocated scratch dir without
     /// taking ownership of its lifetime. Used by tests.
     pub fn from_existing_dir(dir: cap_std::fs::Dir) -> Self {
+        let root_prefix = host_root_prefix(&dir);
+        let fast_fs = fast_fs_enabled();
         Self {
             dir,
             _scratch: None,
             _lock: None,
             owner_pid: unsafe { libc::getpid() as u32 },
+            root_prefix,
+            fast_fs,
         }
+    }
+
+    /// Fast `real_stat` for the common regular-file / directory case on
+    /// `--fs host`: one `fstatat` (kernel resolves the whole path) instead of
+    /// cap-std's per-component walk, with an `openat`+`F_GETPATH` containment
+    /// check that an intermediate symlink didn't escape the sandbox root. Returns
+    /// `None` (→ the cap-std path handles it) for symlink leaves (owner on the
+    /// link), FIFOs/sockets/devices (open would block or differ), escapes (cap-std
+    /// re-roots absolute-symlink targets), or any error. See
+    /// docs/fs-host-capstd-amplification.md.
+    /// Core of the fast path: `fstatat` (one syscall, kernel-resolved) + an
+    /// `openat`+`F_GETPATH` containment check, returning the raw `stat` and the
+    /// carrick entry kind for the common regular-file / directory case. `None`
+    /// (→ cap-std handles it) for symlink leaves, FIFOs/sockets/devices, escapes
+    /// (an intermediate symlink the kernel followed out of the sandbox root), or
+    /// any error. See docs/fs-host-capstd-amplification.md.
+    #[cfg(target_os = "macos")]
+    fn fast_lstat_contained(
+        &self,
+        rel: &Path,
+        follow: bool,
+    ) -> Option<(libc::stat, RootFsEntryKind)> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        if !self.fast_fs {
+            return None;
+        }
+        let root_prefix = self.root_prefix.as_deref()?;
+        let rel_c = std::ffi::CString::new(rel.as_os_str().as_bytes()).ok()?;
+        let dir_fd = self.dir.as_raw_fd();
+
+        // 1. lstat/stat in ONE syscall (kernel resolves the whole path).
+        let mut st: libc::stat = unsafe { core::mem::zeroed() };
+        let at_flags = if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
+        if unsafe { libc::fstatat(dir_fd, rel_c.as_ptr(), &mut st, at_flags) } != 0 {
+            return None;
+        }
+        let typ = st.st_mode as u32 & libc::S_IFMT as u32;
+        let kind = if typ == libc::S_IFDIR as u32 {
+            RootFsEntryKind::Directory
+        } else if typ == libc::S_IFREG as u32 {
+            if read_socket_xattr(&self.dir, rel) {
+                RootFsEntryKind::Socket
+            } else {
+                RootFsEntryKind::File
+            }
+        } else {
+            return None; // symlink/FIFO/socket-node/device → cap-std path
+        };
+
+        // 2. Containment: open the entry and verify its real host path (F_GETPATH)
+        //    is under the sandbox root. O_NONBLOCK so a (racing) FIFO can't block
+        //    us; O_NOFOLLOW on lstat so a leaf-symlink swap can't redirect. An
+        //    intermediate symlink the kernel followed out of the root is caught.
+        let mut oflags = libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC;
+        if kind == RootFsEntryKind::Directory {
+            oflags |= libc::O_DIRECTORY;
+        }
+        if !follow {
+            oflags |= libc::O_NOFOLLOW;
+        }
+        let fd = unsafe { libc::openat(dir_fd, rel_c.as_ptr(), oflags, 0) };
+        if fd < 0 {
+            return None;
+        }
+        let mut buf = [0u8; libc::PATH_MAX as usize];
+        let getpath_ok =
+            unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr() as *mut libc::c_char) } >= 0;
+        unsafe { libc::close(fd) };
+        if !getpath_ok {
+            return None;
+        }
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        let got = std::str::from_utf8(&buf[..end]).ok()?;
+        let contained = got == root_prefix
+            || (got.len() > root_prefix.len()
+                && got.starts_with(root_prefix)
+                && got.as_bytes()[root_prefix.len()] == b'/');
+        if !contained {
+            return None;
+        }
+        Some((st, kind))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn fast_real_stat(&self, normalized: &Path, follow: bool) -> Option<RealStat> {
+        let rel = Self::rel_path(normalized)?; // None == root dir: let cap-std handle
+        let (st, kind) = self.fast_lstat_contained(rel, follow)?;
+
+        // Build RealStat (mode/owner via the fast path-based xattr helpers).
+        let is_dir = kind == RootFsEntryKind::Directory;
+        let override_mode = read_mode_xattr(&self.dir, rel, is_dir);
+        let owner = read_owner_xattr(&self.dir, rel, is_dir, false);
+        let on_disk_mode = st.st_mode as u32 & 0o7777;
+        let default_mode = if is_dir { 0o755 } else { 0o644 };
+        Some(RealStat {
+            kind,
+            ino: st.st_ino,
+            nlink: st.st_nlink as u32,
+            mode: override_mode.unwrap_or(if on_disk_mode == 0 {
+                default_mode
+            } else {
+                on_disk_mode
+            }),
+            uid: owner.0.unwrap_or(0),
+            gid: owner.1.unwrap_or(0),
+            size: st.st_size as u64,
+            atime: (st.st_atime, st.st_atime_nsec),
+            mtime: (st.st_mtime, st.st_mtime_nsec),
+            ctime: (st.st_ctime, st.st_ctime_nsec),
+        })
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn fast_real_stat(&self, _normalized: &Path, _follow: bool) -> Option<RealStat> {
+        None
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn fast_lstat_contained(
+        &self,
+        _rel: &Path,
+        _follow: bool,
+    ) -> Option<(libc::stat, RootFsEntryKind)> {
+        None
     }
 
     /// Stream OCI layer blobs directly into the scratch Dir (the on-demand
@@ -1323,6 +1499,15 @@ impl FsBackend for HostFsBackend {
             return Some(OverlayEntry::Dir);
         }
         let rel = Self::rel_path(&normalized)?;
+        // Fast contained dir stat (no cap-std per-component walk) — the glob
+        // hot path. Non-dirs fall through to the cap-std logic below.
+        if let Some((_, RootFsEntryKind::Directory)) = self.fast_lstat_contained(rel, false) {
+            return if self.name_matches_on_disk(rel) {
+                Some(OverlayEntry::Dir)
+            } else {
+                None
+            };
+        }
         let meta = self.dir.symlink_metadata(rel).ok()?;
         // Reject a host-aliased (Unicode-normalized) name: present the Linux
         // byte-exact view, where a differently-normalized name is a different
@@ -1417,6 +1602,23 @@ impl FsBackend for HostFsBackend {
             });
         }
         let rel = Self::rel_path(&normalized)?;
+        // Fast contained dir/file stat (no cap-std per-component walk) — the
+        // bulk of glob/stat cost. Symlinks/FIFOs fall through to cap-std below.
+        if let Some((st, kind)) = self.fast_lstat_contained(rel, false) {
+            if !self.name_matches_on_disk(rel) {
+                return None;
+            }
+            let is_dir = kind == RootFsEntryKind::Directory;
+            let override_mode = read_mode_xattr(&self.dir, rel, is_dir);
+            let on_disk = st.st_mode as u32 & 0o7777;
+            let default = if is_dir { 0o755 } else { 0o644 };
+            return Some(RootFsMetadata {
+                path: normalized,
+                kind,
+                mode: override_mode.unwrap_or(if on_disk == 0 { default } else { on_disk }),
+                size: if is_dir { 0 } else { st.st_size as usize },
+            });
+        }
         let meta = self.dir.symlink_metadata(rel).ok()?;
         // Reject a host-aliased (Unicode-normalized) name (see `lookup`).
         if !self.name_matches_on_disk(rel) {
@@ -2302,6 +2504,12 @@ impl FsBackend for HostFsBackend {
             && !self.name_matches_on_disk(rel)
         {
             return None;
+        }
+        // Fast path (--fs host): a single fstatat + openat/F_GETPATH containment
+        // for the common regular-file/dir case, skipping cap-std's per-component
+        // walk. Falls through to cap-std for symlinks/FIFOs/escapes/errors.
+        if let Some(rs) = self.fast_real_stat(&normalized, follow) {
+            return Some(rs);
         }
         // lstat (`follow == false`) reports the link itself; stat
         // (`follow == true`) reports the target. We follow symlinks
