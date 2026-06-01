@@ -66,7 +66,11 @@ fn main() {
         } else {
             0
         };
-        eprintln!("tid={t} getr={getr} get_errno={get_errno} setr={setr} set_errno={set_errno}");
+        // Do NOT print the raw tid/errnos — `t` is a non-deterministic thread
+        // id (carrick host pid vs Docker ns-tid) and the gate compares stderr
+        // too, so a raw-tid diagnostic DIFFs under concurrent load. The boolean
+        // verdict is the deterministic contract.
+        let _ = (get_errno, set_errno);
         report!(sibling_affinity_ok = getr > 0 && setr == 0);
     }
     stop.store(true, Ordering::Release);
