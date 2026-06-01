@@ -1,12 +1,11 @@
 # `--fs host` open amplification: cap-std re-resolution (~291× host opens/guest open)
 
-**Status:** Phases 1+2 IMPLEMENTED + verified (2026-06-01). Phase 1 (path-based getxattr)
-is unconditional; Phase 2 (`fast_lstat_contained` openat+F_GETPATH) is **opt-in
-`CARRICK_FAST_FS=1`, default OFF** — it aggravates the multithreaded-fork HVF wedge
-(see the "UPDATE" section at the bottom — that is the authoritative current state; the
-"default on" mentions in the mid-sections below are superseded). With `CARRICK_FAST_FS=1`:
-test_glob TIMEOUT→MATCH (140s→48s; host opens 999,646→405,926). Non-creating stat/lookup
-only; writes/creates stay on cap-std.
+**Status (authoritative — see "UPDATE 2" at the bottom):** Phases 1+2 IMPLEMENTED + verified
+(2026-06-01), **fast-fs DEFAULT ON** (`CARRICK_FAST_FS=0` opts out). The fork-wedge that briefly
+forced it off is FIXED (commit cf5f6e0 — stale sibling count in the fork quiesce; the fast path was
+its reproducer). test_glob TIMEOUT→MATCH (140s→48s; host opens 999,646→405,926). Non-creating
+stat/lookup only; writes/creates stay on cap-std. (Mid-section "default OFF" mentions below are
+historical/superseded.)
 
 ## The pathology (empirical, via `carrick trace`)
 
