@@ -1204,7 +1204,12 @@ impl SyscallDispatcher {
         DispatchOutcome::Returned { value: total }
     }
 
-    fn write_output_fd(&self, fd: i32, bytes: &[u8]) -> DispatchOutcome {
+    fn write_output_fd(
+        &self,
+        fd: i32,
+        bytes: &[u8],
+        tid: crate::thread::ThreadId,
+    ) -> DispatchOutcome {
         let nonblocking = self.io_is_nonblocking(fd, 0);
         // Mirror `write`/`writev`: any fd present in `open_files` (e.g.
         // after a dup3 over stdio) takes precedence over the built-in
@@ -1244,11 +1249,11 @@ impl SyscallDispatcher {
                         return if *is_read_end && pty.is_none() && !*bidirectional {
                             DispatchOutcome::errno(LINUX_EBADF)
                         } else {
-                            write_host_pipe(bytes, *host_fd, nonblocking)
+                            write_host_pipe(bytes, *host_fd, nonblocking, tid)
                         };
                     }
                     OpenDescription::HostSocket { host_fd, .. } => {
-                        return write_host_pipe(bytes, *host_fd, nonblocking);
+                        return write_host_pipe(bytes, *host_fd, nonblocking, tid);
                     }
                     OpenDescription::HostFile {
                         base,
@@ -1262,7 +1267,7 @@ impl SyscallDispatcher {
                         if base.status_flags() & LINUX_O_APPEND != 0 {
                             unsafe { libc::lseek(*host_fd, 0, libc::SEEK_END) };
                         }
-                        return write_host_pipe(bytes, *host_fd, nonblocking);
+                        return write_host_pipe(bytes, *host_fd, nonblocking, tid);
                     }
                     OpenDescription::File {
                         path,
@@ -4285,6 +4290,7 @@ impl SyscallDispatcher {
         }
 
         fn sendfile(this, cx, out_fd: Fd, in_fd: Fd, offset: GuestPtr, count: u64) {
+            let tid = cx.tid();
 
             let out_fd: Fd = out_fd;
             let in_fd: Fd = in_fd;
@@ -4380,7 +4386,7 @@ impl SyscallDispatcher {
                 Ok(bytes) => bytes,
                 Err(errno) => return Ok(errno.into()),
             };
-            let outcome = this.write_output_fd(out_fd.0, &bytes);
+            let outcome = this.write_output_fd(out_fd.0, &bytes, tid);
             let DispatchOutcome::Returned { value } = outcome else {
                 return Ok(outcome);
             };
@@ -4425,6 +4431,7 @@ impl SyscallDispatcher {
 
         fn copy_file_range(this, cx, fd_in: Fd, off_in: GuestPtr, fd_out: Fd, off_out: GuestPtr, len: u64, flags: u64) {
 
+            let tid = cx.tid();
             let in_fd: Fd = fd_in;
             let off_in_addr = off_in.0;
             let out_fd: Fd = fd_out;
@@ -4466,7 +4473,7 @@ impl SyscallDispatcher {
             // (the common case: cat to a pipe/stdout). Non-NULL → pwrite at the
             // given offset on a real host fd and advance *off_out.
             let written = if off_out_addr == 0 {
-                let outcome = this.write_output_fd(out_fd.0, &bytes);
+                let outcome = this.write_output_fd(out_fd.0, &bytes, tid);
                 let DispatchOutcome::Returned { value } = outcome else {
                     return Ok(outcome);
                 };
@@ -4542,6 +4549,7 @@ impl SyscallDispatcher {
 
         fn splice(this, cx, fd_in: Fd, off_in: GuestPtr, fd_out: Fd, off_out: GuestPtr, len: u64, flags: u64) {
 
+            let tid = cx.tid();
             let in_fd: Fd = fd_in;
             let off_in_address = off_in.0;
             let out_fd: Fd = fd_out;
@@ -4568,7 +4576,7 @@ impl SyscallDispatcher {
                     Ok(bytes) => bytes,
                     Err(errno) => return Ok(errno.into()),
                 };
-                let outcome = this.write_output_fd(out_fd.0, &bytes);
+                let outcome = this.write_output_fd(out_fd.0, &bytes, tid);
                 return Ok(outcome);
             }
 
@@ -4593,7 +4601,7 @@ impl SyscallDispatcher {
                     Err(errno) => return Ok(errno.into()),
                 };
                 buf.truncate(n as usize);
-                let outcome = this.write_output_fd(out_fd.0, &buf);
+                let outcome = this.write_output_fd(out_fd.0, &buf, tid);
                 return Ok(outcome);
             }
 
@@ -4624,7 +4632,7 @@ impl SyscallDispatcher {
                     Err(errno) => return Ok(errno.into()),
                 };
                 buf.truncate(n as usize);
-                let outcome = this.write_output_fd(out_fd.0, &buf);
+                let outcome = this.write_output_fd(out_fd.0, &buf, tid);
                 return Ok(outcome);
             }
 
@@ -4647,7 +4655,7 @@ impl SyscallDispatcher {
                 Ok(bytes) => bytes,
                 Err(errno) => return Ok(errno.into()),
             };
-            let outcome = this.write_output_fd(out_fd.0, &bytes);
+            let outcome = this.write_output_fd(out_fd.0, &bytes, tid);
             let DispatchOutcome::Returned { value } = outcome else {
                 return Ok(outcome);
             };
@@ -5076,14 +5084,14 @@ impl SyscallDispatcher {
                             }
                             // A broken pipe (read end closed) → EPIPE AND a
                             // SIGPIPE on the writer (write05).
-                            let out = write_host_pipe(&bytes, *host_fd, nonblocking);
+                            let out = write_host_pipe(&bytes, *host_fd, nonblocking, cx.tid());
                             return Ok(this.raise_sigpipe_on_epipe(cx, out));
                         }
                         OpenDescription::HostSocket { host_fd, .. } => {
                             // write(2) on a connected socket maps directly to a
                             // host write(2). Unconnected sockets will surface
                             // their own ENOTCONN via the host.
-                            return Ok(write_host_pipe(&bytes, *host_fd, nonblocking));
+                            return Ok(write_host_pipe(&bytes, *host_fd, nonblocking, cx.tid()));
                         }
                         OpenDescription::HostFile {
                             base,
@@ -5104,7 +5112,7 @@ impl SyscallDispatcher {
                             }
                             // libc::write to the real fd: advances the
                             // kernel offset and is visible across fork.
-                            return Ok(write_host_pipe(&bytes, *host_fd, nonblocking));
+                            return Ok(write_host_pipe(&bytes, *host_fd, nonblocking, cx.tid()));
                         }
                         OpenDescription::File {
                             path,
@@ -5243,11 +5251,11 @@ impl SyscallDispatcher {
                                 if *is_read_end && pty.is_none() && !*bidirectional {
                                     return Ok(LINUX_EBADF.into());
                                 }
-                                outcome = write_host_pipe(&bytes, *host_fd, nonblocking);
+                                outcome = write_host_pipe(&bytes, *host_fd, nonblocking, cx.tid());
                                 writeback = FileWriteback::None;
                             }
                             OpenDescription::HostSocket { host_fd, .. } => {
-                                outcome = write_host_pipe(&bytes, *host_fd, nonblocking);
+                                outcome = write_host_pipe(&bytes, *host_fd, nonblocking, cx.tid());
                                 writeback = FileWriteback::None;
                             }
                             OpenDescription::HostFile {
@@ -5266,7 +5274,7 @@ impl SyscallDispatcher {
                                 if base.status_flags() & LINUX_O_APPEND != 0 {
                                     unsafe { libc::lseek(*host_fd, 0, libc::SEEK_END) };
                                 }
-                                outcome = write_host_pipe(&bytes, *host_fd, nonblocking);
+                                outcome = write_host_pipe(&bytes, *host_fd, nonblocking, cx.tid());
                                 writeback = FileWriteback::None;
                             }
                             OpenDescription::File {
