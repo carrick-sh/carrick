@@ -474,15 +474,28 @@ impl SyscallDispatcher {
             if !is_valid_signum(signum) {
                 return Ok(LINUX_EINVAL.into());
             }
-            // PID namespace (§5.3): a positive `pid` names a target by its
-            // ns-pid; translate to the host pid (ESRCH for a non-member). So
-            // kill(1, sig) from inside the container hits the ns-init. pid <= 0
-            // (self / pgrp / -1) stays host-level — process groups are host-level
-            // in Phase 2 (§6.6). Identity when namespaces are off.
-            let pid = if crate::namespace::pid::enabled() && pid.0 > 0 {
-                match crate::namespace::pid::ns_to_host_or_self(pid.0 as u32) {
-                    Some(h) => i64::from(h as i32),
-                    None => return Ok(LINUX_ESRCH.into()),
+            // PID namespace (§5.3, §6.6): translate the guest target.
+            //  - pid > 0: an ns-pid → its host pid (kill(1) hits the ns-init);
+            //    a non-member → ESRCH.
+            //  - pid < -1: a process group `-ns_pgid` → `-host_pgid` (getpgrp/
+            //    getpgid now report ns-pgids, so the guest negates an ns-pgid).
+            //  - pid == 0 (caller's group) and pid == -1 (every process) pass
+            //    through to the host unchanged.
+            // Identity when namespaces are off.
+            let pid = if crate::namespace::pid::enabled() {
+                if pid.0 > 0 {
+                    match crate::namespace::pid::ns_to_host_or_self(pid.0 as u32) {
+                        Some(h) => i64::from(h as i32),
+                        None => return Ok(LINUX_ESRCH.into()),
+                    }
+                } else if pid.0 < -1 {
+                    let ns_pgid = (-(pid.0 as i64)) as u32;
+                    match crate::namespace::pid::ns_to_host_or_self(ns_pgid) {
+                        Some(h) => -(i64::from(h as i32)),
+                        None => return Ok(LINUX_ESRCH.into()),
+                    }
+                } else {
+                    i64::from(pid.0)
                 }
             } else {
                 i64::from(pid.0)
@@ -500,7 +513,10 @@ impl SyscallDispatcher {
                     let info = crate::linux_abi::LinuxSiginfo::kill(
                         signum as i32,
                         crate::linux_abi::LINUX_SI_USER,
-                        std::process::id() as i32,
+                        // The sender's identity the handler sees is its ns-pid
+                        // (1 for the init), not its host pid (§5.3). Identity
+                        // when namespaces are off.
+                        crate::namespace::pid::self_ns_pid() as i32,
                         this.cred_snapshot().ruid,
                     );
                     this.record_pending_siginfo(tid, signum as i32, info);
@@ -899,9 +915,6 @@ impl SyscallDispatcher {
             if !is_valid_signum(signum) {
                 return Ok(LINUX_EINVAL.into());
             }
-            let host_pid = std::process::id() as i64;
-            let bootstrap_pid = LINUX_BOOTSTRAP_PID as i64;
-            let is_self = tgid == host_pid || tgid == bootstrap_pid;
             let s = signum as i32;
 
             // Read the caller's siginfo once up front — same source of truth
@@ -936,6 +949,21 @@ impl SyscallDispatcher {
                 }
                 return Ok(routed);
             }
+
+            // PID namespace (§5.3): not a sibling thread → translate the ns-pid
+            // target to its host pid for the self/cross-process decision and the
+            // host route. A foreign ns-pid is ESRCH. Identity when ns is off.
+            let tgid = if crate::namespace::pid::enabled() && tgid > 0 {
+                match crate::namespace::pid::ns_to_host_or_self(tgid as u32) {
+                    Some(h) => i64::from(h as i32),
+                    None => return Ok(LINUX_ESRCH.into()),
+                }
+            } else {
+                tgid
+            };
+            let host_pid = std::process::id() as i64;
+            let bootstrap_pid = LINUX_BOOTSTRAP_PID as i64;
+            let is_self = tgid == host_pid || tgid == bootstrap_pid;
 
             if !is_self {
                 // Cross-process (target is some other host pid, not a sibling
@@ -1000,6 +1028,16 @@ impl SyscallDispatcher {
                 return Ok(routed);
             }
 
+            // PID namespace (§5.3): translate the ns-pid thread-group to its
+            // host pid for the self/cross-process decision. Foreign → ESRCH.
+            let tgid = if crate::namespace::pid::enabled() && tgid > 0 {
+                match crate::namespace::pid::ns_to_host_or_self(tgid as u32) {
+                    Some(h) => i64::from(h as i32),
+                    None => return Ok(LINUX_ESRCH.into()),
+                }
+            } else {
+                tgid
+            };
             // Cross-process: the target thread-group is some other host pid.
             let host_pid = std::process::id() as i64;
             let is_self = tgid == host_pid || tgid == LINUX_BOOTSTRAP_PID as i64;
