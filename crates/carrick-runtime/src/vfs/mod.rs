@@ -224,6 +224,11 @@ pub struct OpenContext<'a> {
     pub mmap_next: u64,
     pub euid: u32,
     pub egid: u32,
+    /// Signal-disposition masks for `/proc/<pid>/status` (bit `signum-1`):
+    /// ignored (SigIgn), caught/handled (SigCgt), shared-pending (ShdPnd).
+    pub sig_ignored: u64,
+    pub sig_caught: u64,
+    pub sig_shdpnd: u64,
 }
 
 /// The path-and-metadata surface of a single mount point. Open-side

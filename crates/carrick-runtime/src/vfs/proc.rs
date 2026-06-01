@@ -34,6 +34,10 @@ pub struct SyntheticProcContext {
     pub address_space_regions: Option<Vec<ProcMapsEntry>>,
     pub brk_current: u64,
     pub mmap_next: u64,
+    /// Signal-disposition masks for `/proc/<pid>/status` (bit `signum-1`).
+    pub sig_ignored: u64,
+    pub sig_caught: u64,
+    pub sig_shdpnd: u64,
 }
 
 /// The three writable user-namespace map files (only the `self/` forms; writing
@@ -95,7 +99,7 @@ pub(crate) fn synthetic_file(path: &str, ctx: &SyntheticProcContext) -> Option<V
         "/proc/self/maps" => Some(synthetic_proc_maps(ctx).into_bytes()),
         "/proc/self/stat" => Some(synthetic_proc_self_stat(&ctx.executable_path).into_bytes()),
         "/proc/self/statm" => Some(synthetic_proc_self_statm()),
-        "/proc/self/status" => Some(synthetic_proc_self_status(&ctx.executable_path).into_bytes()),
+        "/proc/self/status" => Some(synthetic_proc_self_status(ctx).into_bytes()),
         // User-namespace map files (user_namespaces(7)). For the initial
         // identity namespace these read as `0 0 4294967295` / `allow`, matching
         // observed `docker run` (docs/namespaces-design.md §1.2, §4.3). Writable
@@ -470,6 +474,9 @@ impl Vfs for ProcVfs {
             address_space_regions: ctx.address_space_regions.map(|regions| regions.to_vec()),
             brk_current: ctx.brk_current,
             mmap_next: ctx.mmap_next,
+            sig_ignored: ctx.sig_ignored,
+            sig_caught: ctx.sig_caught,
+            sig_shdpnd: ctx.sig_shdpnd,
         };
         let Some(contents) = synthetic_file(path, &synth_ctx) else {
             return Err(crate::linux_abi::LINUX_ENOSYS);
@@ -716,8 +723,11 @@ fn cpus_allowed_list(ncpu: usize) -> String {
     }
 }
 
-fn synthetic_proc_self_status(executable_path: &str) -> String {
-    let comm = process_short_name(executable_path);
+fn synthetic_proc_self_status(ctx: &SyntheticProcContext) -> String {
+    let comm = process_short_name(&ctx.executable_path);
+    let sigign_hex = ctx.sig_ignored;
+    let sigcgt_hex = ctx.sig_caught;
+    let shdpnd_hex = ctx.sig_shdpnd;
     let ncpu = crate::host_facts::logical_cpu_count();
     let cpus_hex = cpus_allowed_hex(ncpu);
     let cpus_list = cpus_allowed_list(ncpu);
@@ -776,10 +786,10 @@ VmSwap:\t       0 kB\n\
 Threads:\t1\n\
 SigQ:\t0/0\n\
 SigPnd:\t0000000000000000\n\
-ShdPnd:\t0000000000000000\n\
+ShdPnd:\t{shdpnd_hex:016x}\n\
 SigBlk:\t0000000000000000\n\
-SigIgn:\t0000000000000000\n\
-SigCgt:\t0000000000000000\n\
+SigIgn:\t{sigign_hex:016x}\n\
+SigCgt:\t{sigcgt_hex:016x}\n\
 {cap_lines}\
 Cpus_allowed:\t{cpus_hex}\n\
 Cpus_allowed_list:\t{cpus_list}\n\
@@ -1238,6 +1248,9 @@ mod tests {
             }]),
             brk_current: LINUX_HEAP_BASE + 0x1234,
             mmap_next: LINUX_MMAP_BASE,
+            sig_ignored: 0,
+            sig_caught: 0,
+            sig_shdpnd: 0,
         };
         let maps = String::from_utf8(synthetic_file("/proc/self/maps", &ctx).unwrap()).unwrap();
         assert!(maps.contains("[heap]"));

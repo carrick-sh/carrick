@@ -145,6 +145,30 @@ impl SyscallDispatcher {
             .unwrap_or(false)
     }
 
+    /// `(SigIgn, SigCgt, ShdPnd)` masks (bit `signum-1`) for a
+    /// `/proc/<pid>/status` render: the process-global ignored set, the caught
+    /// (real-handler) set, and the shared process pending set. SigBlk/SigPnd are
+    /// per-thread and rendered separately (currently 0 — not yet wired to a
+    /// target tid). CPython test_subprocess.test_restore_signals compares the
+    /// SigIgn line across two children, so it must reflect real dispositions.
+    pub fn proc_status_signal_masks(&self) -> (u64, u64, u64) {
+        let signal = self.signal.lock();
+        let mut ignored = 0u64;
+        let mut caught = 0u64;
+        for (&signum, action) in signal.handlers.iter() {
+            let Some(bit) = sigmask_bit(signum) else {
+                continue;
+            };
+            let h = action.sa_handler;
+            if h == crate::linux_abi::LINUX_SIG_IGN {
+                ignored |= bit;
+            } else if h != crate::linux_abi::LINUX_SIG_DFL {
+                caught |= bit;
+            }
+        }
+        (ignored, caught, signal.process_pending)
+    }
+
     /// Bitmask (bit `signum-1`) of signals that must NOT interrupt a blocking,
     /// restartable syscall (wait4/waitid) for `tid`. On Linux a syscall is
     /// interrupted only by a signal that is both unblocked AND has an effect:
