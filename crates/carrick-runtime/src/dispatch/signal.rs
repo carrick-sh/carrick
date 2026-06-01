@@ -256,8 +256,14 @@ impl SyscallDispatcher {
             .handlers
             .iter()
             .filter_map(|(&signum, action)| {
+                // `then(|| ...)` is LAZY: `then_some(1u64 << signum)` eagerly
+                // evaluates the shift for EVERY handler, so a handler on signum
+                // >= 64 (Go installs SIGRT handlers up to 64) overflowed the
+                // shift and panicked carrick on execve — which hung a Go
+                // subprocess mid-crash (sync TestMutexMisuse). The guard keeps
+                // signum <= 63 so `1u64 << signum` is in range.
                 (action.sa_handler == crate::linux_abi::LINUX_SIG_IGN && (1..=63).contains(&signum))
-                    .then_some(1u64 << signum)
+                    .then(|| 1u64 << signum)
             })
             .fold(0u64, |mask, bit| mask | bit);
         // Keep only SIG_IGN dispositions; a caught handler → default (absent).
