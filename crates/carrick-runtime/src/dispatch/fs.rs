@@ -3559,6 +3559,11 @@ impl SyscallDispatcher {
                     LINUX_SEEK_SET => libc::SEEK_SET,
                     LINUX_SEEK_CUR => libc::SEEK_CUR,
                     LINUX_SEEK_END => libc::SEEK_END,
+                    // SEEK_DATA/SEEK_HOLE: macOS supports them but SWAPS the
+                    // numbers (Linux DATA=3/HOLE=4, macOS DATA=4/HOLE=3), so
+                    // translate for sparse-file hole queries (test_fs_holes).
+                    3 => 4, // LINUX_SEEK_DATA -> macOS SEEK_DATA
+                    4 => 3, // LINUX_SEEK_HOLE -> macOS SEEK_HOLE
                     _ => {
                         return Ok(LINUX_EINVAL.into());
                     }
