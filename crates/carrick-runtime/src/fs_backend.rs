@@ -2830,7 +2830,15 @@ pub fn layered_directory_entries(
             }
         };
         seen.insert(name.clone());
-        out.push(RootFsDirEntry { name, metadata });
+        // Real host inode so getdents64 d_ino == a later stat's st_ino (scandir
+        // DirEntry.inode()). lstat (follow=false) names the entry itself. 0 if
+        // unavailable (in-memory backend) → getdents64 hashes the path instead.
+        let ino = overlay.real_stat(&path, false).map(|s| s.ino).unwrap_or(0);
+        out.push(RootFsDirEntry {
+            name,
+            metadata,
+            ino,
+        });
     }
     // NOTE: `.`/`..` are intentionally NOT added here — this helper also backs
     // the directory-EMPTINESS check (rmdir/unlinkat AT_REMOVEDIR), where two

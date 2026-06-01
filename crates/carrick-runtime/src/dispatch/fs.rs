@@ -1049,6 +1049,7 @@ impl SyscallDispatcher {
                                 mode: 0o666,
                                 size: 0,
                             },
+                            ino: 0,
                         }
                     })
                     .collect();
@@ -3509,6 +3510,8 @@ impl SyscallDispatcher {
                         mode: 0o755,
                         size: 0,
                     },
+                    // "."/".." are skipped by scandir; ino unused → hash fallback.
+                    ino: 0,
                 };
                 entries.insert(0, dot_entry("..", parent));
                 entries.insert(0, dot_entry(".", dir_path));
