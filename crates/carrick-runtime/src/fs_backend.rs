@@ -1189,6 +1189,19 @@ fn is_internal_carrick_xattr(name: &str) -> bool {
     name.starts_with("user.carrick.")
 }
 
+/// Linux VFS xattr namespaces a guest may use. macOS xattrs are namespace-
+/// agnostic, so we store the Linux name verbatim as a host xattr (carrick's own
+/// `user.carrick.*` are still hidden via `is_internal_carrick_xattr`). The guest
+/// runs as root by default, so it may use `trusted.*` (CAP_SYS_ADMIN) just like
+/// the Docker-as-root oracle (CPython test_os's xattr-support probe sets
+/// `trusted.foo`). `system.*`/`security.*` are likewise accepted and round-trip.
+fn is_guest_xattr_namespace(name: &str) -> bool {
+    name.starts_with("user.")
+        || name.starts_with("trusted.")
+        || name.starts_with("security.")
+        || name.starts_with("system.")
+}
+
 #[cfg(target_os = "macos")]
 fn fset_u32_xattr(fd: std::os::fd::RawFd, name: &[u8], val: u32) {
     let v = val.to_le_bytes();
@@ -2345,11 +2358,10 @@ impl FsBackend for HostFsBackend {
     }
 
     fn set_xattr(&self, path: &str, name: &str, value: &[u8], flags: i32) -> Result<(), i32> {
-        // Only the Linux `user.*` namespace is modelled. Anything else
-        // (security.*, trusted.*, system.*) reports unsupported, matching
-        // what an unprivileged guest typically sees and keeping the host's
-        // own attribute namespaces out of the picture.
-        if !name.starts_with("user.") {
+        // Accept the Linux VFS xattr namespaces (user./trusted./security./
+        // system.); the guest is root so trusted.* is allowed, matching the
+        // Docker-as-root oracle. Other prefixes report unsupported.
+        if !is_guest_xattr_namespace(name) {
             return Err(crate::linux_abi::LINUX_ENOTSUP);
         }
         // Hide carrick's internal metadata xattrs: a guest must not be able to
@@ -2396,7 +2408,7 @@ impl FsBackend for HostFsBackend {
     }
 
     fn get_xattr(&self, path: &str, name: &str) -> Result<Vec<u8>, i32> {
-        if !name.starts_with("user.") || is_internal_carrick_xattr(name) {
+        if !is_guest_xattr_namespace(name) || is_internal_carrick_xattr(name) {
             return Err(crate::linux_abi::LINUX_ENODATA);
         }
         let host_fd = self
@@ -2469,7 +2481,7 @@ impl FsBackend for HostFsBackend {
             .split(|&b| b == 0)
             .filter(|s| !s.is_empty())
             .filter_map(|s| std::str::from_utf8(s).ok())
-            .filter(|s| s.starts_with("user.") && !is_internal_carrick_xattr(s))
+            .filter(|s| is_guest_xattr_namespace(s) && !is_internal_carrick_xattr(s))
             .map(|s| s.to_owned())
             .collect();
         Ok(names)
@@ -2478,7 +2490,7 @@ impl FsBackend for HostFsBackend {
     fn remove_xattr(&self, path: &str, name: &str) -> Result<(), i32> {
         // Mirror get_xattr: a non-`user.*` or carrick-internal name has no
         // guest-visible attribute to remove → ENODATA.
-        if !name.starts_with("user.") || is_internal_carrick_xattr(name) {
+        if !is_guest_xattr_namespace(name) || is_internal_carrick_xattr(name) {
             return Err(crate::linux_abi::LINUX_ENODATA);
         }
         let host_fd = self
