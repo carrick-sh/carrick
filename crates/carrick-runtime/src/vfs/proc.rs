@@ -728,6 +728,11 @@ fn synthetic_proc_self_status(ctx: &SyntheticProcContext) -> String {
     let sigign_hex = ctx.sig_ignored;
     let sigcgt_hex = ctx.sig_caught;
     let shdpnd_hex = ctx.sig_shdpnd;
+    // Live thread count for the `Threads:` line — CPython reads this to decide
+    // whether os.fork() must emit the multi-threaded-fork DeprecationWarning
+    // (test_threading.test_*_after_fork). Was hardcoded 1, so a guest with live
+    // worker threads looked single-threaded and the warning never fired.
+    let nthreads = crate::thread::current_thread_states().len().max(1);
     let ncpu = crate::host_facts::logical_cpu_count();
     let cpus_hex = cpus_allowed_hex(ncpu);
     let cpus_list = cpus_allowed_list(ncpu);
@@ -783,7 +788,7 @@ VmExe:\t       0 kB\n\
 VmLib:\t       0 kB\n\
 VmPTE:\t       0 kB\n\
 VmSwap:\t       0 kB\n\
-Threads:\t1\n\
+Threads:\t{nthreads}\n\
 SigQ:\t0/0\n\
 SigPnd:\t0000000000000000\n\
 ShdPnd:\t{shdpnd_hex:016x}\n\
@@ -824,13 +829,25 @@ fn synthetic_proc_self_stat(executable_path: &str) -> String {
     let comm = process_short_name(executable_path);
     let pid = std::process::id();
     let ppid = unsafe { libc::getppid() } as u32;
-    proc_stat_line(pid, &comm, 'R', ppid, pid, pid)
+    let nthreads = crate::thread::current_thread_states().len().max(1);
+    proc_stat_line(pid, &comm, 'R', ppid, pid, pid, nthreads)
 }
 
-fn proc_stat_line(pid: u32, comm: &str, state: char, ppid: u32, pgrp: u32, session: u32) -> String {
+fn proc_stat_line(
+    pid: u32,
+    comm: &str,
+    state: char,
+    ppid: u32,
+    pgrp: u32,
+    session: u32,
+    num_threads: usize,
+) -> String {
+    // Field 20 is num_threads: CPython's os.fork() reads it from /proc/self/stat
+    // to decide whether to emit the multi-threaded-fork DeprecationWarning
+    // (test_threading.test_*_after_fork). Was a hardcoded 1.
     format!(
         "{pid} ({comm}) {state} {ppid} {pgrp} {session} 0 -1 4194560 0 0 0 0 0 0 0 0 \
-20 0 1 0 1 10485760 256 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 0 \
+20 0 {num_threads} 0 1 10485760 256 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 0 \
 17 0 0 0 0 0 0 0 0 0 0 0 0\n"
     )
 }
@@ -866,7 +883,10 @@ fn synthetic_proc_pid_file(pid: u32, rest: &str, self_comm: &str) -> Option<Vec<
         let name = per_thread_comm(tid, self_comm);
         match rest {
             "stat" => {
-                return Some(proc_stat_line(pid, &name, state, ppid, me, me).into_bytes());
+                return Some(
+                    proc_stat_line(pid, &name, state, ppid, me, me, own_threads.len().max(1))
+                        .into_bytes(),
+                );
             }
             "comm" => return Some(format!("{name}\n").into_bytes()),
             "cmdline" => {
@@ -926,8 +946,11 @@ Pid:\t{pid}\nPPid:\t{ppid}\nThreads:\t{n}\n",
         info.pgid
     };
     match rest {
+        // Another guest process: we don't track its thread registry, so report
+        // a single thread (num_threads=1). The multi-threaded-fork warning only
+        // reads the caller's OWN /proc/self/stat, which uses the live count.
         "stat" => Some(
-            proc_stat_line(pid, &comm, info.state, disp_ppid, disp_pgid, disp_pgid).into_bytes(),
+            proc_stat_line(pid, &comm, info.state, disp_ppid, disp_pgid, disp_pgid, 1).into_bytes(),
         ),
         "comm" => Some(format!("{comm}\n").into_bytes()),
         "cmdline" => {
