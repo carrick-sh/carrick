@@ -2008,7 +2008,14 @@ impl SyscallDispatcher {
         fn dup(this, cx, fd: Fd) {
 
             let old_fd: Fd = fd;
-            Ok(this.duplicate_fd(old_fd.0, 3, 0))
+            // dup(2) returns the LOWEST-numbered unused descriptor, with no
+            // floor — including 0/1/2 when the caller has closed them. min_fd=0
+            // (not 3) lets first_free_fd hand back a CLOSED stdio number while
+            // still skipping an OPEN one. Flooring at 3 made `close(0); dup(fd)`
+            // return a freed fd >= 3 instead of 0, so libuv's
+            // uv_pipe_open(loop, 0) wrapped a dead fd 0 and uv_run crashed
+            // (test pipe_close_stdout_read_stdin). dup3/F_DUPFD already use 0.
+            Ok(this.duplicate_fd(old_fd.0, 0, 0))
 
         }
 
