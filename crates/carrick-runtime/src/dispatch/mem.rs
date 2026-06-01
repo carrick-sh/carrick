@@ -412,17 +412,27 @@ impl SyscallDispatcher {
                     let va = crate::memory::LINUX_HIGH_VA_THRESHOLD
                         + (ipa - crate::memory::LINUX_ALIAS_IPA_BASE);
                     // Host mmap prot MUST match the guest's request (and thus the
-                    // fd's access mode): MAP_SHARED|PROT_WRITE of a read-only fd
-                    // is EACCES. Translate the guest PROT_* bits to host PROT_*.
+                    // fd's access mode) for READ/WRITE: MAP_SHARED|PROT_WRITE of a
+                    // read-only fd is EACCES. Translate the guest PROT_* bits to
+                    // host PROT_*. NOTE: deliberately DROP PROT_EXEC. The guest
+                    // executes through HVF's stage-2 (mapped RWX) and its own
+                    // stage-1 page tables (UXN clear), never through carrick's host
+                    // pointer (which we only ever read for syscall emulation), so
+                    // the host backing needs no exec right. macOS's hardened
+                    // runtime REJECTS MAP_SHARED|PROT_EXEC of an ordinary file with
+                    // EPERM — forwarding the guest's PROT_EXEC here failed the host
+                    // mmap and wedged the guest. Linux maps such files fine (the
+                    // dynamic loader; CPython test_mmap test_access_parameter's
+                    // `mmap(fd, n, prot=PROT_READ|PROT_EXEC)`), and so must we.
                     let mut host_prot = 0;
-                    if prot & LINUX_PROT_READ != 0 {
+                    if prot & (LINUX_PROT_READ | LINUX_PROT_EXEC) != 0 {
+                        // PROT_EXEC implies a host-readable backing (carrick reads
+                        // it to service the guest's reads; the exec right itself
+                        // lives in the guest's stage-1/stage-2, not the host map).
                         host_prot |= libc::PROT_READ;
                     }
                     if prot & LINUX_PROT_WRITE != 0 {
                         host_prot |= libc::PROT_WRITE;
-                    }
-                    if prot & LINUX_PROT_EXEC != 0 {
-                        host_prot |= libc::PROT_EXEC;
                     }
                     return Ok(DispatchOutcome::MapHostAlias {
                         va,
