@@ -72,6 +72,14 @@ pub struct NsSharedRegion {
     pub next_pid: AtomicU32,
     /// The init's host pid (ns-pid 1). 0 until launch placement sets it.
     pub init_host_pid: AtomicU32,
+    /// The init's host PROCESS-GROUP id, captured at launch. The container init
+    /// is ns-pgid 1 (like Docker's pid-1=pgid-1), but on the host the carrick
+    /// init usually inherited the launching shell's group — a non-member pgid.
+    /// This records that real host group so the init's group maps to ns-pgid 1
+    /// (`getpgrp`→1) AND `setpgid(child, 1)` resolves back to the EXISTING host
+    /// group (join succeeds) instead of the init's host pid (not a group leader
+    /// → EPERM → glibc posix_spawn setpgroup aborts the child with 127).
+    pub init_host_pgid: AtomicU32,
     /// Bitmask of signals the ns-init has installed a handler for (bit N =
     /// signal N). Published by the init's rt_sigaction; read by the kill path
     /// to enforce pid-1 protection: a signal sent to the init by another ns
@@ -190,6 +198,13 @@ pub fn alloc_region() -> bool {
 pub fn set_init(init_host_pid: u32) {
     let Some(region) = region() else { return };
     region.init_host_pid.store(init_host_pid, Ordering::Relaxed);
+    // Capture the init's real host process-group so ns-pgid 1 ↔ this group.
+    let init_host_pgid = unsafe { libc::getpgrp() };
+    if init_host_pgid > 0 {
+        region
+            .init_host_pgid
+            .store(init_host_pgid as u32, Ordering::Relaxed);
+    }
     let init_slot = &region.members[0];
     init_slot.ns_pid.store(NS_INIT_PID, Ordering::Relaxed);
     init_slot.parent_host_pid.store(0, Ordering::Relaxed);
@@ -250,8 +265,36 @@ pub fn host_to_ns_or_self(host_pid: u32) -> u32 {
 /// Identity when namespaces are off.
 pub fn host_to_ns_pgid(host_pgid: u32) -> u32 {
     match region() {
-        Some(r) => r.host_to_ns(host_pgid).unwrap_or(host_pgid),
+        Some(r) => {
+            // The init's host group is ns-pgid 1 (Docker-style pid-1=pgid-1),
+            // even though its host pgid is the launching shell's (a non-member).
+            let init_pgid = r.init_host_pgid.load(Ordering::Acquire);
+            if init_pgid != 0 && host_pgid == init_pgid {
+                return NS_INIT_PID;
+            }
+            r.host_to_ns(host_pgid).unwrap_or(host_pgid)
+        }
         None => host_pgid,
+    }
+}
+
+/// Translate an ns-pgid the guest supplied (e.g. `setpgid`/`kill(-pgid)`) to the
+/// host pgid to operate on. ns-pgid 1 is the init's group → its real host pgid
+/// (the existing group the init is in, so a child can JOIN it). Other ns-pgids
+/// name a guest group leader, whose ns-pid == ns-pgid → its host pid (== its
+/// host pgid, since it's a leader). Identity when namespaces are off.
+pub fn ns_to_host_pgid(ns_pgid: u32) -> Option<u32> {
+    match region() {
+        Some(r) => {
+            if ns_pgid == NS_INIT_PID {
+                let init_pgid = r.init_host_pgid.load(Ordering::Acquire);
+                if init_pgid != 0 {
+                    return Some(init_pgid);
+                }
+            }
+            r.ns_to_host(ns_pgid)
+        }
+        None => Some(ns_pgid),
     }
 }
 

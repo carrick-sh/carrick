@@ -1245,7 +1245,11 @@ impl SyscallDispatcher {
                 let hg = if pgid.0 == 0 {
                     0
                 } else {
-                    match crate::namespace::pid::ns_to_host_or_self(pgid.0 as u32) {
+                    // A pgid is translated as a GROUP (ns-pgid 1 = the init's
+                    // existing host group), NOT as a pid — using ns_to_host_or_self
+                    // here mapped ns-pgid 1 to the init's host PID (not a group
+                    // leader) → setpgid EPERM → posix_spawn setpgroup child 127.
+                    match crate::namespace::pid::ns_to_host_pgid(pgid.0 as u32) {
                         Some(h) => h as i32,
                         None => return Ok(LINUX_ESRCH.into()),
                     }
