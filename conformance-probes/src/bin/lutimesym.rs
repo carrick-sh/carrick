@@ -59,7 +59,11 @@ unsafe fn run() {
     let target_untouched = tgt_mtime != PAST;
 
     println!("utimensat_rc={r}");
-    println!("link_mtime={link_mtime} target_mtime={tgt_mtime}");
+    // Do NOT print the raw mtimes — target_mtime is the current wall-clock time
+    // (non-deterministic): the carrick and Docker runs can straddle a 1-second
+    // boundary under the gate's concurrent load and DIFF. The booleans below
+    // (link set to the fixed PAST epoch; target left untouched) are the
+    // deterministic contract.
     println!("link_time_set={link_time_set}");
     println!("target_untouched={target_untouched}");
 

@@ -72,7 +72,10 @@ fn main() {
     let main_tid = unsafe { libc::syscall(SYS_GETTID) as i32 };
     let worker_comm = read_comm(wt);
     let main_comm = read_comm(main_tid);
-    eprintln!("main_tid={main_tid} wt={wt} main_comm={main_comm:?} worker_comm={worker_comm:?}");
+    // Do NOT print the raw tids — main_tid/wt are non-deterministic (carrick
+    // host pids vs Docker ns-tids) and the gate compares stderr too, so a
+    // raw-tid diagnostic DIFFs under concurrent load. The comm strings (the
+    // actual contract) are checked in the deterministic boolean verdict.
 
     report!(
         per_thread_comm_ok = worker_comm.as_deref() == Some("worker-thread")
