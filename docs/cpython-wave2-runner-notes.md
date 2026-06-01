@@ -169,3 +169,76 @@ NOT bugs — both feature additions for a future session:
   that accept the RWF_* flag set (RWF_HIPRI as a no-op hint) and delegate.
 - **test_unshare_setns**: needs /proc/self/ns/uts (and the other ns symlinks) —
   the procfs roadmap's "ns namespace symlinks" item (docs/procfs-conformance-roadmap.md).
+
+## Full-suite sweep + frontier triage (2026-06-01) — 34/41 MATCH
+
+Authoritative re-sweep of all 41 modules (scripts/cpython-parity.py --bundled,
+--timeout 90, oracle = docker linux/arm64). The stale baseline (16/41) was wildly
+out of date — most baseline DIFFs were already cleared by prior-session work that
+was never re-baselined (test_fcntl, test_hashlib, test_json[ndiff 68], test_base64,
+test_itertools, ... all already MATCH).
+
+**Result: 34 MATCH / 3 CARRICK_TIMEOUT / 3 DIFF / 1 BOTH_EMPTY.**
+
+Landed this session (each red-first + verified, no regressions):
+- **test_io DIFF→MATCH** (commit): blocking pipe write must BLOCK-until-complete
+  and be signal-interruptible, returning the partial count on signal (EINTR if
+  zero progress). write_host_pipe returned the first partial count IMMEDIATELY for
+  a >PIPE_BUF write → unbuffered write never blocked → alarm(1) never interrupted
+  it → test_interrupted_write_* failed. Fix generalizes the <=PIPE_BUF
+  loop-until-complete to any blocking pipe + a signal-aware POLLOUT wait
+  (wait_pipe_writable, has_unblocked_pending_for(tid)). Probe blockingpipewrite.
+- **test_posix ndiff 2→1** (commit): preadv2/pwritev2 (286/287) routed to
+  preadv/pwritev (RWF_* are advisory hints for our backing). Probe preadv2flags.
+
+### The remaining 7 non-MATCH — precise triage (NONE are behavioral regressions)
+- **test_subprocess** DIFF ndiff=2: `test_no_leaking` ×2 — docker=skipped,
+  carrick=ok. BENIGN skip-vs-run: the test opens 1026 fds and SKIPS iff it never
+  hits EMFILE; docker's huge ulimit makes it skip, carrick RUNS it and PASSES.
+  carrick is arguably more capable here. ACCEPT.
+- **test_posix** DIFF ndiff=1: `test_unshare_setns` — feature gap. Needs
+  /proc/self/ns/uts AND unshare(CLONE_NEWUTS) to actually change the ns/uts
+  readlink (else the test raises 'os.unshare failed'). carrick deliberately
+  accept-and-IGNOREs CLONE_NEWUTS (returns 0) so container inits don't break —
+  making it fail/change-ns would regress that. Real UTS-ns bookkeeping required.
+  ACCEPT (don't pursue without full namespace support).
+- **test_socket** DIFF ndiff=42: all carrick=skipped — 40 SCTP tests (macOS has
+  no IPPROTO_SCTP; emulating over TCP loses message boundaries — risky) + 2
+  DNS/hostname (environmental). Feature-availability, NOT a regression. The
+  earlier "ndiff=0" was a run where docker's container also lacked the sctp
+  kernel module. ACCEPT/defer SCTP.
+- **test_pipe** BOTH_EMPTY ndiff=0: docker=FAILURE/0 AND carrick=FAILURE/0 — the
+  module produces no parseable tests on EITHER side (not a standalone regrtest
+  module). Harness artifact, not a carrick issue.
+- **test_glob / test_mmap / test_os** CARRICK_TIMEOUT: the real frontier — PERF,
+  not correctness. See below.
+
+### REJECTED experiment: raising default RLIMIT_NOFILE to docker's 1048576
+Tried DEFAULT_NOFILE_SOFT 1024 → 1048576 (to match docker's soft==hard and make
+test_no_leaking skip like docker). REVERTED — net regression. CPython's test
+helper `subprocessdata/fd_status.py` scans `range(0, sysconf(SC_OPEN_MAX))`
+calling fstat on each fd; SC_OPEN_MAX == the soft limit. At 1048576 that's ~1M
+fstats PER spawn, and every carrick fstat is an HVF trap+dispatch (~µs) — so
+test_subprocess.test_close_fds (spawns fd_status.py repeatedly) went from fast to
+TIMEOUT (ndiff 2→299). Native it's fine (~100ns/fstat). LESSON for "docker-style
+hermeticity": matching docker's huge ulimit defaults is INCOMPATIBLE with
+carrick's per-syscall cost for any SC_OPEN_MAX-bounded fd scan. Keep 1024 (now
+documented in fs/state.rs DEFAULT_NOFILE_SOFT). This was caught by verify-
+empirically (the per-module parity re-run), not by the probe — the probe MATCHed.
+
+### PERF frontier (the only path to higher %): glob / mmap stat+alloc cost
+- **test_glob** timeout: glob is stat-dominated. HostFsBackend::real_stat does,
+  per REGULAR FILE: symlink_metadata (1 fstatat) + read_socket_xattr +
+  read_mode_xattr + read_owner_xattr — each via `with_entry_fd` = an openat +
+  fgetxattr + close. So ~3 openat + 3 close + 4 fgetxattr + 1 fstatat ≈ 11 host
+  syscalls/stat where Linux does 1; on a read-only rootfs none of the carrick
+  xattrs are even present (wasted ENOATTR probes). Proposed fix (MEASURE first —
+  a prior glob fix was reverted for guessing): one open per stat + a single
+  flistxattr to learn which carrick xattrs exist, then fgetxattr only those.
+  4→1 syscall when no carrick xattrs (the common case). Gated on S_IFREG.
+- **test_mmap** timeout: LargeMmapTests (test_around_2GB/4GB/large_filesize/
+  large_offset) create 2-4 GiB file-backed maps; dispatch/mem.rs does an eager
+  `vec![0; length]` → multi-GiB alloc+copy → timeout. Fix = route large
+  file-backed maps through a host mmap alias (MapHostAlias) instead of a Vec.
+- **test_os** timeout (ndiff 317): heavy; recursion-limit × framework-stack hang,
+  doesn't reproduce in isolation. Hardest; defer.

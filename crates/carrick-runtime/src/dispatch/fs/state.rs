@@ -72,7 +72,16 @@ pub(in crate::dispatch) struct IoState {
     pub nofile_soft: AtomicU64,
 }
 
-/// Linux default soft RLIMIT_NOFILE.
+/// Default soft RLIMIT_NOFILE. We keep the bare-Linux 1024 rather than the
+/// Docker daemon default (1048576) ON PURPOSE: `sysconf(SC_OPEN_MAX)` returns
+/// this, and CPython's test helper `fd_status.py` scans `range(0, SC_OPEN_MAX)`
+/// calling fstat on each fd. Under carrick every fstat is an HVF trap+dispatch
+/// (~µs), so a 1048576-wide scan costs seconds and test_subprocess.test_close_fds
+/// (which spawns fd_status.py repeatedly) times out. The cost is fine natively
+/// (~100ns/fstat) but fatal here; 1024 keeps such scans cheap. The tradeoff is a
+/// benign skip-vs-run divergence on test_no_leaking (it opens 1026 fds; Docker's
+/// huge limit makes it skip, carrick runs it and PASSES). See
+/// docs/cpython-wave2-runner-notes.md.
 pub(in crate::dispatch) const DEFAULT_NOFILE_SOFT: u64 = 1024;
 /// Hard RLIMIT_NOFILE we expose to the guest (its setrlimit may raise the soft
 /// limit up to this). Matches the value getrlimit has always reported.
