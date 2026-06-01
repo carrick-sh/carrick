@@ -1010,6 +1010,13 @@ impl SyscallDispatcher {
                     Ok(fd) => fd,
                     Err(_) => return VfsOpenAttempt::Errno(linux_errno::EMFILE),
                 };
+                // Record the open path (/dev/ptmx or /dev/pts/N) so
+                // readlink(/proc/self/fd/<fd>) resolves it — glibc's ttyname_r
+                // needs this to reopen a pty slave.
+                self.io
+                    .fd_open_paths
+                    .write()
+                    .insert(new_fd, path.to_string());
                 VfsOpenAttempt::Installed(new_fd)
             }
             crate::vfs::VfsHandle::Directory {
@@ -2558,7 +2565,16 @@ impl SyscallDispatcher {
             // stdio-gated arms below never run for pty fds.
             if let Some((role, host_fd)) = this.pty_info(fd.0) {
                 return Ok(match ioctl_request {
-                    LINUX_TIOCGPTN => write_packed(&mut *cx.memory, arg, &role.index.to_le_bytes()),
+                    // TIOCGPTN is a MASTER-only ioctl: it returns the pts index
+                    // of the master's slave. On a slave it is ENOTTY — which is
+                    // exactly how libuv's uv__tty_is_slave detects a slave fd
+                    // (and then reopens it non-blocking). Answering it for the
+                    // slave too made libuv treat the slave as a master and leave
+                    // UV_HANDLE_BLOCKING_WRITES set (tty_pty / tty_pty_partial).
+                    LINUX_TIOCGPTN if role.is_master => {
+                        write_packed(&mut *cx.memory, arg, &role.index.to_le_bytes())
+                    }
+                    LINUX_TIOCGPTN => DispatchOutcome::errno(LINUX_ENOTTY),
                     LINUX_TIOCSPTLCK => {
                         let mut buf = [0u8; 4];
                         match cx.memory.read_bytes(arg, 4) {
