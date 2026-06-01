@@ -7,6 +7,7 @@ mod args;
 mod commands;
 mod debug;
 mod fs_setup;
+mod lifecycle;
 mod runtime_util;
 mod trace_cli;
 

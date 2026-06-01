@@ -13,7 +13,7 @@
 //! This mirrors the podman model (per-container conmon + on-disk state), not
 //! the docker model (one always-on daemon owning every container).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
@@ -170,15 +170,28 @@ impl ContainerState {
     }
 }
 
-/// `kill(pid, 0) == 0` — the process exists and we may signal it. A pid <= 0 is
-/// never alive.
+/// Whether `pid` is a *live* process (not a zombie). A pid <= 0 is never alive.
+/// `kill(pid, 0)` alone is insufficient: a terminated-but-unreaped process is a
+/// zombie that still answers `kill(0)` with success, which would make a stopped
+/// container's exited init look "running" until launchd reaps it. So we also
+/// check the host process state and treat `Z` (zombie) as dead.
 pub fn pid_alive(pid: i32) -> bool {
     if pid <= 0 {
         return false;
     }
     // SAFETY: kill with signal 0 only probes existence/permission; it delivers
     // nothing.
-    unsafe { libc::kill(pid, 0) == 0 }
+    if unsafe { libc::kill(pid, 0) } != 0 {
+        return false;
+    }
+    // Exists in the process table — but a zombie is not running. If we can read
+    // its state and it is a zombie, report dead; if state is unreadable, fall
+    // back to the kill(0) result (better to over-report alive than miss a
+    // genuinely-running process).
+    match crate::host_proc::pid_info(pid as u32) {
+        Some(info) => info.state != 'Z',
+        None => true,
+    }
 }
 
 /// List all container states in the registry (best-effort; unreadable or

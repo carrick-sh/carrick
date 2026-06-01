@@ -118,7 +118,7 @@ impl IdMap {
     /// overlapping inside/outside ranges, no arithmetic overflow).
     pub fn parse(input: &str) -> Result<Self, IdMapError> {
         let tokens: Vec<&str> = input.split_whitespace().collect();
-        if tokens.is_empty() || tokens.len() % 3 != 0 {
+        if tokens.is_empty() || !tokens.len().is_multiple_of(3) {
             return Err(IdMapError::Malformed);
         }
         let line_count = tokens.len() / 3;
