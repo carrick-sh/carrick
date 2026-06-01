@@ -491,8 +491,18 @@ impl SyscallDispatcher {
         // Best-effort: a non-symlink or not-yet-existent (O_CREAT) path is left
         // unchanged.
         if flags & crate::linux_abi::LINUX_O_NOFOLLOW == 0 && !(want_create && want_excl) {
-            if let Ok(resolved) = self.canonicalize_following(&path) {
-                path = resolved;
+            // Follow the trailing symlink. A genuine symlink CYCLE surfaces here
+            // as ELOOP (canonicalize_following caps at 40 hops); Linux open(2)
+            // returns ELOOP for it, so propagate that rather than swallowing the
+            // error and opening the cyclic path (libuv fs_file_loop). Other
+            // errors (e.g. a not-yet-existent O_CREAT target, or a cross-mount
+            // symlink we can't follow) are still ignored so open proceeds.
+            match self.canonicalize_following(&path) {
+                Ok(resolved) => path = resolved,
+                Err(e) if e == crate::linux_abi::LINUX_ELOOP => {
+                    return Ok(e.into());
+                }
+                Err(_) => {}
             }
         }
 
