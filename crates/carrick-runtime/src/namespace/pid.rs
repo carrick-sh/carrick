@@ -85,7 +85,8 @@ static REGION: AtomicPtr<NsSharedRegion> = AtomicPtr::new(std::ptr::null_mut());
 /// `run_threaded_hvf_loop` to decide whether to allocate the shared region.
 static REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Request launch-time PID-namespace placement for this run (container path).
+/// Request launch-time PID-namespace placement for this run (container path):
+/// the in-process translation layer (getpid()==1 etc.). Always safe — no fork.
 pub fn request() {
     REQUESTED.store(true, Ordering::Relaxed);
 }
@@ -95,14 +96,59 @@ pub fn requested() -> bool {
     REQUESTED.load(Ordering::Relaxed)
 }
 
-/// Allocate the shared region with `mmap(MAP_SHARED|MAP_ANON)` and publish it.
-/// Must be called **once, before the first guest fork** (design §3.3). Returns
-/// `Err` (never panics — the no-panic lint forbids it) if the mapping fails;
-/// the caller should fall back to identity (non-namespaced) behavior.
-///
-/// `init_host_pid` is the root guest's host pid (ns-pid 1). Idempotent: a second
-/// call returns the existing region.
-pub fn init(init_host_pid: u32) -> Result<(), ()> {
+/// Whether to fork the NsSupervisor PROCESS (orphan reaping + teardown). This
+/// is gated separately from [`request`] because the supervisor becomes the
+/// fork PARENT and returns the run's result — which carries NO buffered
+/// stdout/stderr. So it is only enabled for streaming output paths (raw / tty /
+/// detached), where the guest writes straight to inherited fds; the buffered
+/// JSON-envelope path keeps running the guest in-process (translation still
+/// works via the region) and gets its output back as before.
+static SUPERVISOR_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Request the forking NsSupervisor (streaming-output container runs only).
+pub fn request_supervisor() {
+    REQUESTED.store(true, Ordering::Relaxed);
+    SUPERVISOR_REQUESTED.store(true, Ordering::Relaxed);
+}
+
+/// Whether the forking NsSupervisor was requested.
+pub fn supervisor_requested() -> bool {
+    SUPERVISOR_REQUESTED.load(Ordering::Relaxed)
+}
+
+/// The write end of the member-registration pipe, inherited across fork. A
+/// freshly-forked guest writes one byte here after registering, waking the
+/// NsSupervisor to arm an exit watch on it (design §3.5). −1 until set up.
+static REG_PIPE_WRITE: AtomicI32 = AtomicI32::new(-1);
+
+/// Publish the registration pipe's write fd (called pre-fork in the supervisor
+/// setup so every descendant inherits it).
+pub fn set_reg_pipe_write(fd: i32) {
+    REG_PIPE_WRITE.store(fd, Ordering::Relaxed);
+}
+
+/// Notify the NsSupervisor that a new member registered: write one byte to the
+/// registration pipe (non-blocking; a full pipe is fine — the supervisor also
+/// rescans on a periodic timeout). No-op if the pipe is not set up.
+pub fn notify_registration() {
+    let fd = REG_PIPE_WRITE.load(Ordering::Relaxed);
+    if fd >= 0 {
+        let byte = [1u8];
+        // SAFETY: writing one byte to a pipe fd; ignore EAGAIN/short write.
+        unsafe {
+            libc::write(fd, byte.as_ptr().cast(), 1);
+        }
+    }
+}
+
+/// Allocate the shared region with `mmap(MAP_SHARED|MAP_ANON)` and publish it,
+/// WITHOUT yet knowing the init's host pid. Must be called **once, before the
+/// NsSupervisor fork** (design §3.3) so both the supervisor parent and the
+/// guest-init child inherit the same physical pages. The child then calls
+/// [`set_init`] with its own pid. Returns `Err` (never panics) on mmap failure;
+/// the caller falls back to identity (non-namespaced) behavior. Idempotent.
+pub fn alloc_region() -> Result<(), ()> {
     if !REGION.load(Ordering::Acquire).is_null() {
         return Ok(());
     }
@@ -123,23 +169,35 @@ pub fn init(init_host_pid: u32) -> Result<(), ()> {
         return Err(());
     }
     let region = ptr.cast::<NsSharedRegion>();
-    // The pages are zeroed; set the two fields with non-zero initial values.
-    // SAFETY: `region` is a valid, writable mapping of exactly this struct.
+    // SAFETY: valid writable mapping of exactly this struct; seed the allocator.
     unsafe {
         (*region).next_pid.store(2, Ordering::Relaxed);
-        (*region)
-            .init_host_pid
-            .store(init_host_pid, Ordering::Relaxed);
-        // Pre-register the init as ns-pid 1 in slot 0.
-        let init_slot = &(*region).members[0];
-        init_slot.ns_pid.store(NS_INIT_PID, Ordering::Relaxed);
-        init_slot.parent_host_pid.store(0, Ordering::Relaxed);
-        init_slot.flags.store(MEMBER_ALIVE, Ordering::Relaxed);
-        // Publish host_pid last so a concurrent reader never sees a half-filled
-        // slot (Release pairs with the Acquire scan in `host_to_ns`).
-        init_slot.host_pid.store(init_host_pid, Ordering::Release);
     }
     REGION.store(region, Ordering::Release);
+    Ok(())
+}
+
+/// Record the init's host pid (ns-pid 1) in an already-allocated region and
+/// pre-register it as the first member. Called by the guest-init child after
+/// the supervisor fork, where `std::process::id()` is its own host pid (§3.7).
+pub fn set_init(init_host_pid: u32) {
+    let Some(region) = region() else { return };
+    region.init_host_pid.store(init_host_pid, Ordering::Relaxed);
+    let init_slot = &region.members[0];
+    init_slot.ns_pid.store(NS_INIT_PID, Ordering::Relaxed);
+    init_slot.parent_host_pid.store(0, Ordering::Relaxed);
+    init_slot.flags.store(MEMBER_ALIVE, Ordering::Relaxed);
+    // Publish host_pid last so a concurrent reader never sees a half-filled slot
+    // (Release pairs with the Acquire scan in `host_to_ns`).
+    init_slot.host_pid.store(init_host_pid, Ordering::Release);
+}
+
+/// Allocate the region AND register the init in one process (no supervisor
+/// fork) — used by the degraded path / tests where translation is wanted but
+/// the supervisor process is not forked. Idempotent.
+pub fn init(init_host_pid: u32) -> Result<(), ()> {
+    alloc_region()?;
+    set_init(init_host_pid);
     Ok(())
 }
 
@@ -204,11 +262,25 @@ pub fn self_ns_ppid() -> u32 {
     if self_ns_pid() == NS_INIT_PID {
         return 0;
     }
+    // Explicit orphan flag (set by the NsSupervisor the instant it sees the
+    // parent die) — fast, race-free reparent-to-init.
     if is_orphaned(std::process::id()) {
         return NS_INIT_PID;
     }
     let host_ppid = unsafe { libc::getppid() } as u32;
-    host_to_ns_or_self(host_ppid)
+    match region().and_then(|r| r.host_to_ns(host_ppid)) {
+        // Parent is a live namespace member: report its ns-pid.
+        Some(ns) => ns,
+        // Parent is NOT a member of this namespace. Two cases collapse here and
+        // both match Linux (pid_namespaces(7)): the macOS kernel reparented us
+        // to launchd because our ns-parent died — so we are an orphan and
+        // reparent to the ns-init (ns-pid 1). (A process whose parent is
+        // genuinely outside the ns would read 0, but carrick's container tree
+        // has no such case below the init: every member descends from pid 1,
+        // so a non-member host ppid always means "parent died" → 1.) This makes
+        // reparenting correct even before the supervisor's orphan flag lands.
+        None => NS_INIT_PID,
+    }
 }
 
 /// Whether the NsSupervisor has flagged `host_pid`'s ns-parent as dead, so its
@@ -265,6 +337,8 @@ pub fn register_child(child_host_pid: u32, parent_host_pid: u32) -> u32 {
             // process (visible via the host tree), it just lacks a stable ns-pid
             // entry; report the allocated number anyway (monotonic, unique).
             let _ = r.register(child_host_pid, ns_pid, parent_host_pid);
+            // Wake the NsSupervisor to arm an exit watch on the new member.
+            notify_registration();
             ns_pid
         }
         None => child_host_pid,
@@ -328,6 +402,12 @@ impl NsSharedRegion {
             }
         }
         None
+    }
+
+    /// All member slots — the NsSupervisor scans these to arm exit watches,
+    /// flag orphans, and sweep on teardown.
+    pub fn members(&self) -> &[MemberSlot] {
+        &self.members
     }
 
     /// Find the slot index for a host pid, if registered.
