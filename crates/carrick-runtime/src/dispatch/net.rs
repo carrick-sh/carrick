@@ -478,6 +478,9 @@ impl SyscallDispatcher {
     }
 
     fn host_socket_install(&self, family: i32, type_: i32, protocol: i32) -> DispatchOutcome {
+        // Linux protocol number for UDP-Lite (RFC 3828); macOS has no such
+        // protocol, so it's backed by a plain UDP socket below.
+        const LINUX_IPPROTO_UDPLITE: i32 = 136;
         // Strip the Linux-only SOCK_NONBLOCK / SOCK_CLOEXEC bits before
         // we hand the type to macOS, then set them on the resulting fd
         // by hand.
@@ -487,7 +490,19 @@ impl SyscallDispatcher {
         let base_type = type_ & !LinuxSocketTypeFlags::SUPPORTED_MASK;
         let host_family = linux_to_host_af(family);
         let host_type = host_socktype_backing(family, base_type);
-        let host_fd = match (unsafe { libc::socket(host_family, host_type, protocol) })
+        // macOS has no UDPLITE protocol, so back IPPROTO_UDPLITE with a plain UDP
+        // socket (proto 0 → UDP for SOCK_DGRAM). UDPLITE's datagram send/recv is
+        // UDP-identical; only the checksum-coverage sockopts differ, accepted as
+        // no-ops below. The guest is LINUX python, whose test_socket runs the
+        // whole UDPLITE suite (native-macOS python skips it — IPPROTO_UDPLITE
+        // undefined there); pass-through socket() returned EPROTONOSUPPORT and
+        // ERRORed every UDPLITE test at setUp.
+        let host_protocol = if protocol == LINUX_IPPROTO_UDPLITE {
+            0
+        } else {
+            protocol
+        };
+        let host_fd = match (unsafe { libc::socket(host_family, host_type, host_protocol) })
             .host_syscall_errno()
         {
             Ok(value) => value,
@@ -2703,6 +2718,15 @@ impl SyscallDispatcher {
                 Ok(t) => t,
                 Err(errno) => return Ok(errno.into()),
             };
+            // SOL_UDPLITE (136): the checksum-coverage options on a UDPLITE
+            // socket we back with plain UDP. macOS has neither the level nor the
+            // options; accept UDPLITE_SEND_CSCOV(10)/RECV_CSCOV(11) as no-ops so
+            // the Linux guest's UDPLITE tests proceed (partial-checksum BEHAVIOR
+            // isn't emulated — macOS can't — but the option calls must succeed).
+            if level == 136 {
+                let _ = (optname, optval_addr, optlen);
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            }
             // SO_RCVTIMEO/SO_SNDTIMEO: the host fd is ALWAYS O_NONBLOCK (the
             // blocking_io invariant), so a host-side timeval is dead. Store the
             // timeout per open-file-description and let blocking_io thread it
