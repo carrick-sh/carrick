@@ -1027,6 +1027,21 @@ kernel source.
 
 ## 7. Phased implementation plan
 
+> **Implementation status (2026-05-31).** Phases 1–3 are **implemented and
+> verified** against the Docker oracle (full conformance suite green): the
+> userns map files + capability surface (Phase 1), launch-time pid-ns placement
+> + host↔ns pid translation across every pid-bearing syscall (Phase 2a), the
+> per-container NsSupervisor with orphan reparenting + teardown (Phase 2b/3),
+> and pid-1 signal-default protection (Phase 3). Probes added: `usernsmap`,
+> `usernswrite`, `pidnsroot`, `pidnswait`, `pidnsinitreap`, `pidnsinitsig`,
+> `pidnsorphanreap`. Beyond the original plan, `carrick run` gained
+> `--pid host|private` (docker parity), `-d` (detached, under a per-container
+> supervisor), and the `ps`/`stop`/`kill`/`rm` lifecycle — all **daemonless**
+> (per-container supervisor + on-disk registry, no `carrickd`). **Phase 4
+> (guest-facing `setns`/`unshare(CLONE_NEWPID)` + `/proc/[pid]/ns/` symlinks)
+> remains the open long-haul item.** `unshare(CLONE_NEWUSER)` and the
+> `CLONE_NEW*` constants already exist.
+
 Each phase lists critical files, the conformance probe(s) to add under
 `conformance-probes/src/bin/` (run against Docker via the existing harness — see
 `credtransition.rs` / `clone3args.rs` as templates), and a
