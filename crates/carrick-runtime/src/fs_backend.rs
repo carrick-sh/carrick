@@ -758,7 +758,13 @@ pub struct HostFsBackend {
     root_prefix: Option<String>,
     /// `--fs host` fast stat path (openat+F_GETPATH instead of cap-std's
     /// per-component walk; see docs/fs-host-capstd-amplification.md) enabled.
-    /// Default on; `CARRICK_FAST_FS=0` forces the safe cap-std path.
+    /// Default OFF (opt-in `CARRICK_FAST_FS=1`): the extra openat/close churn it
+    /// adds to every stat perturbs syscall timing enough to make the pre-existing
+    /// multithreaded-fork-from-nested-process HVF wedge (the campaign's #1
+    /// Heisenbug) fire far more often — test_fork1.test_threaded_import_lock_fork
+    /// hangs ~2/3 of runs with it on, 0/2 off. Until that wedge is fixed the safe
+    /// cap-std path is the default; the fast path stays available for fork-light
+    /// fs-heavy workloads and as a near-deterministic reproducer of the wedge.
     fast_fs: bool,
 }
 
@@ -789,11 +795,13 @@ fn host_root_prefix(dir: &cap_std::fs::Dir) -> Option<String> {
     }
 }
 
-/// `--fs host` fast stat path enabled (default on; `CARRICK_FAST_FS=0` opts out).
+/// `--fs host` fast stat path enabled. Default OFF — opt in with
+/// `CARRICK_FAST_FS=1` (it aggravates the multithreaded-fork wedge; see the
+/// `fast_fs` field doc and docs/fs-host-capstd-amplification.md).
 fn fast_fs_enabled() -> bool {
-    !matches!(
+    matches!(
         std::env::var("CARRICK_FAST_FS").as_deref(),
-        Ok("0") | Ok("false")
+        Ok("1") | Ok("true")
     )
 }
 
