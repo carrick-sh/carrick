@@ -131,6 +131,22 @@ pub enum FsBackendKind {
     Host,
 }
 
+/// `carrick run --pid <mode>` — which PID namespace the container runs in,
+/// mirroring `docker run --pid`. `Private` (the default) places the container
+/// in a fresh PID namespace (its init is pid 1, ns-local child pids, ns-filtered
+/// /proc — docs/namespaces-design.md §5.2). `Host` shares the host PID namespace
+/// (no remap; getpid returns the real host pid), like `docker run --pid=host`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+pub enum PidMode {
+    /// A fresh PID namespace (default; `docker run` default).
+    #[default]
+    Private,
+    /// Share the host PID namespace (`docker run --pid=host`).
+    Host,
+}
+
 /// The instruction-set architecture of the Linux container to run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -185,6 +201,10 @@ pub struct RunSpec {
     /// the host Rosetta runtime into the guest VFS. Defaults to `Aarch64`.
     #[serde(default)]
     pub platform: Platform,
+    /// PID namespace mode (`docker run --pid`). `Private` (default) gives the
+    /// container its own pid ns (init == pid 1); `Host` shares the host pid ns.
+    #[serde(default)]
+    pub pid: PidMode,
 }
 
 #[cfg(test)]

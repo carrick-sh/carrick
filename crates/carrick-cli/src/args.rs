@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use carrick_runtime::compat::CompatReportFormat;
 use carrick_runtime::runtime::DEFAULT_MAX_TRAPS;
-use carrick_spec::FsBackendKind;
+use carrick_spec::{FsBackendKind, PidMode};
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
@@ -105,6 +105,11 @@ pub(crate) enum Commands {
         /// case-sensitive volumes and `memory` elsewhere.
         #[arg(long, value_enum)]
         fs: Option<FsBackendKind>,
+        /// PID namespace mode (like `docker run --pid`). `private` (default)
+        /// runs the container in its own PID namespace (init is pid 1); `host`
+        /// shares the host PID namespace (no remap).
+        #[arg(long, value_enum, default_value_t = PidMode::Private)]
+        pid: PidMode,
         /// Set environment variables
         #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
         env: Vec<String>,

@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 pub use carrick_image::{ImageStore, ResolvedImage};
 pub use carrick_runtime::runtime::RunResult;
-pub use carrick_spec::{FsBackendKind, ImageConfig, Mount, Platform, RunSpec};
+pub use carrick_spec::{FsBackendKind, ImageConfig, Mount, PidMode, Platform, RunSpec};
 
 #[derive(Debug, Clone)]
 pub struct CliRunRequest {
@@ -29,6 +29,8 @@ pub struct CliRunRequest {
     pub max_traps: usize,
     pub debug_state_path: Option<String>,
     pub fs: Option<FsBackendKind>,
+    /// PID namespace mode (`docker run --pid`). Defaults to `Private`.
+    pub pid: PidMode,
 }
 
 /// Parse the request's `--platform` into the canonical [`Platform`], falling
@@ -146,6 +148,7 @@ pub fn resolve_run_spec(req: CliRunRequest, image: ResolvedImage) -> Result<RunS
         max_traps: req.max_traps,
         debug_state_path,
         platform,
+        pid: req.pid,
     })
 }
 
@@ -232,6 +235,7 @@ mod tests {
             max_traps: 100,
             debug_state_path: None,
             fs: Some(FsBackendKind::Memory),
+            pid: PidMode::default(),
         };
         let spec = resolve_run_spec(req, image).unwrap();
         assert_eq!(spec.executable, "/bin/sh");
@@ -262,6 +266,7 @@ mod tests {
             max_traps: 100,
             debug_state_path: None,
             fs: Some(FsBackendKind::Memory),
+            pid: PidMode::default(),
         };
         let spec = resolve_run_spec(req, image).unwrap();
         assert_eq!(spec.argv, vec!["/bin/sh", "/bin/ls"]);
@@ -291,6 +296,7 @@ mod tests {
             max_traps: 100,
             debug_state_path: None,
             fs: Some(FsBackendKind::Memory),
+            pid: PidMode::default(),
         };
         let spec = resolve_run_spec(req, image).unwrap();
         assert_eq!(spec.argv, vec!["/bin/bash", "-c", "echo hi"]);
@@ -320,6 +326,7 @@ mod tests {
             max_traps: 100,
             debug_state_path: None,
             fs: Some(FsBackendKind::Memory),
+            pid: PidMode::default(),
         };
         let spec = resolve_run_spec(req, image).unwrap();
 
@@ -358,6 +365,7 @@ mod tests {
             max_traps: 100,
             debug_state_path: None,
             fs: Some(FsBackendKind::Memory),
+            pid: PidMode::default(),
         };
         let spec = resolve_run_spec(req, image).unwrap();
         assert_eq!(spec.cwd.unwrap().as_str(), "/user/app");
