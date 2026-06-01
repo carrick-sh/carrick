@@ -104,6 +104,14 @@ impl ThreadRegistry {
         self.inner.lock().contains_key(&tid)
     }
 
+    /// Every live thread id of this process. Unlike `thread_states`, this does
+    /// NOT query the kernel for run state — it's the cheap enumeration used to
+    /// route a process-directed signal (`kill(getpid(), sig)`) to a thread that
+    /// doesn't block `sig`.
+    pub fn live_tids(&self) -> Vec<ThreadId> {
+        self.inner.lock().keys().copied().collect()
+    }
+
     /// Record the mach port of the host thread backing `tid`. Called ONCE by
     /// the vCPU thread itself when it starts (it knows its own pthread). This
     /// is the only per-thread state we keep for `/proc` — the run/sleep state

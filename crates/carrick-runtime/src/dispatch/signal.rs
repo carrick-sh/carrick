@@ -421,6 +421,52 @@ impl SyscallDispatcher {
         ctx.thread.as_ref().map(|t| t.tid).unwrap_or(0)
     }
 
+    /// Deliver a PROCESS-directed signal (`kill(getpid(), sig)`), honoring the
+    /// per-thread signal mask. Linux delivers a process-directed signal to ANY
+    /// thread that does not block it. We prefer the calling thread when it has
+    /// the signal unblocked (the common case + cheapest); otherwise we route to
+    /// the lowest-tid sibling that leaves it unblocked. Only when EVERY thread
+    /// blocks the signal is it held pending (on the caller, delivered when it
+    /// next unblocks).
+    ///
+    /// Routing to an unblocked sibling matters for multi-threaded signal
+    /// handling: e.g. libuv's signal_multiple_loops blocks all signals in the
+    /// main thread and then `kill(getpid(), SIGUSR1)`, expecting a worker thread
+    /// to run the (process-wide) handler. Always delivering to the blocked
+    /// caller stranded the signal pending and hung the process.
+    fn raise_process_directed<M: GuestMemory>(
+        &self,
+        ctx: &SyscallCtx<M>,
+        caller_tid: crate::thread::ThreadId,
+        signum: u64,
+    ) -> DispatchOutcome {
+        if signum == 0 {
+            return DispatchOutcome::Returned { value: 0 };
+        }
+        let s = signum as i32;
+        // Fast path: the calling thread can take it.
+        if !self.signal_blocked(caller_tid, s) {
+            return self.raise_self(caller_tid, signum);
+        }
+        // Caller blocks it — find a sibling that doesn't. Lowest tid for
+        // determinism.
+        if let Some(t) = ctx.thread.as_ref() {
+            let mut tids = t.registry.live_tids();
+            tids.sort_unstable();
+            for tid in tids {
+                if tid == caller_tid {
+                    continue;
+                }
+                if !self.signal_blocked(tid, s) {
+                    return DispatchOutcome::SignalThread { tid, signum: s };
+                }
+            }
+        }
+        // Every thread blocks it: hold pending on the caller.
+        self.mark_signal_pending(caller_tid, s);
+        DispatchOutcome::Returned { value: 0 }
+    }
+
     define_syscall! {
         /// kill(pid, sig): send `sig` to process `pid`.
         fn kill(this, cx, pid: Pid, sig: Signal) {
@@ -447,7 +493,7 @@ impl SyscallDispatcher {
                     );
                     this.record_pending_siginfo(tid, signum as i32, info);
                 }
-                return Ok(this.raise_self(tid, signum));
+                return Ok(this.raise_process_directed(cx, tid, signum));
             }
             let caller_euid = Some(this.cred_snapshot().euid);
             Ok(bootstrap_signal_send_as(
