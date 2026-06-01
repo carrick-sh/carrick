@@ -231,15 +231,45 @@ pub(crate) fn synthetic_task_dir(pid: u32) -> Option<Vec<String>> {
     None
 }
 
+/// Translate a guest-supplied (namespace) pid to a HOST pid; identity when no
+/// PID namespace is active. `None` for an ns-pid that maps to no live process.
+/// The synthetic `/proc/<pid>` machinery validates against HOST tids/pids
+/// (`current_thread_states`/`is_guest_process`), so a numeric `/proc/<ns-pid>`
+/// must be translated before it can be matched (without this, every
+/// `/proc/<pid>` under a PID namespace missed → ENOSYS).
+fn ns_pid_to_host(ns_pid: u32) -> Option<u32> {
+    if crate::namespace::pid::enabled() {
+        crate::namespace::pid::ns_to_host_or_self(ns_pid)
+    } else {
+        Some(ns_pid)
+    }
+}
+
+/// The backing HOST pid for a `/proc/<pid>` DIRECTORY path (the pid component
+/// only, no sub-path), or `None` if the path isn't a numeric process directory
+/// or the pid isn't a live process we expose. Used both to gate the directory
+/// open and to let `pidfd_send_signal` treat a `/proc/<pid>` directory fd as a
+/// pidfd (Linux allows a `/proc/<pid>` dir fd anywhere a pidfd is expected).
+pub(crate) fn proc_pid_dir_host_pid(path: &str) -> Option<u32> {
+    let p = path.strip_suffix('/').unwrap_or(path);
+    let comp = p.strip_prefix("/proc/")?;
+    if comp.contains('/') {
+        return None; // a sub-path (/proc/<pid>/task, …), not the pid dir itself
+    }
+    let host_pid = ns_pid_to_host(comp.parse().ok()?)?;
+    synthetic_task_dir(host_pid)?; // gate: a live process (own thread or guest)
+    Some(host_pid)
+}
+
 /// `(., .., <tid>...)` entries for a `/proc/<pid>/task/` path.
 fn proc_task_dir_entries(path: &str) -> Option<Vec<DirEnt>> {
     let p = path.strip_suffix('/').unwrap_or(path);
-    let pid: u32 = p
+    let ns_pid: u32 = p
         .strip_prefix("/proc/")?
         .strip_suffix("/task")?
         .parse()
         .ok()?;
-    let tids = synthetic_task_dir(pid)?;
+    let tids = synthetic_task_dir(ns_pid_to_host(ns_pid)?)?;
     let mut entries = vec![
         DirEnt {
             name: ".".to_string(),
@@ -264,11 +294,8 @@ const PROC_PID_FILES: &[&str] = &["cmdline", "comm", "stat", "status"];
 /// Directory listing for `/proc/<pid>` when `pid` is a known process (an own
 /// guest thread or a guest process), else `None`.
 fn proc_pid_dir_entries(path: &str) -> Option<Vec<DirEnt>> {
-    let p = path.strip_suffix('/').unwrap_or(path);
-    let pid: u32 = p.strip_prefix("/proc/")?.parse().ok()?;
-    // `synthetic_task_dir` is `Some` only for a known process (own thread or a
-    // guest process) — reuse it as the "is this a real pid" gate.
-    synthetic_task_dir(pid)?;
+    // Gate on a numeric /proc/<pid> for a live process (ns-pid → host pid).
+    proc_pid_dir_host_pid(path)?;
     let mut entries = vec![
         DirEnt {
             name: ".".to_string(),
