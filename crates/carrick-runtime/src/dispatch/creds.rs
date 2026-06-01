@@ -498,7 +498,12 @@ impl SyscallDispatcher {
             if size < 0 {
                 return Ok(LINUX_EINVAL.into());
             }
-            let groups = this.supplementary_groups();
+            // A prior setgroups(2) replaced the set verbatim; otherwise fall
+            // back to the /etc/group-derived membership (id(1) compatibility).
+            let groups = match this.setgroups_override.lock().clone() {
+                Some(g) => g,
+                None => this.supplementary_groups(),
+            };
             // size == 0 is a pure query: return the count without writing.
             if size == 0 {
                 return Ok(DispatchOutcome::Returned {
@@ -560,7 +565,27 @@ impl SyscallDispatcher {
             })
         }
 
-        fn sys_setgroups(this, cx, _size: u64, _list: GuestPtr) {
+        fn sys_setgroups(this, cx, size: u64, list: GuestPtr) {
+            // Linux caps the supplementary set at NGROUPS_MAX (65536).
+            const NGROUPS_MAX: u64 = 65536;
+            if size > NGROUPS_MAX {
+                return Ok(LINUX_EINVAL.into());
+            }
+            let n = size as usize;
+            let mut groups = Vec::with_capacity(n);
+            if n > 0 {
+                let bytes = match cx.memory.read_bytes(list.0, n * 4) {
+                    Ok(b) => b,
+                    Err(_) => return Ok(LINUX_EFAULT.into()),
+                };
+                for chunk in bytes.chunks_exact(4) {
+                    groups.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+                }
+            }
+            // Replace the whole supplementary set (Linux semantics): getgroups
+            // now returns exactly this. CPython subprocess `extra_groups=` sets
+            // it in the pre-exec child and reads it back via os.getgroups().
+            *this.setgroups_override.lock() = Some(groups);
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
