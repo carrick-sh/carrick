@@ -1860,7 +1860,7 @@ impl ThreadRuntimeState {
         // hasn't built its vCPU yet (it holds the topology lock we now own, so
         // it's blocked before vcpu_create and has nothing to quiesce). Counting
         // it would make wait_quiesced wait for a thread that can't park.
-        let others = self.kicker.count().saturating_sub(1);
+        let mut others = self.kicker.count().saturating_sub(1);
         crate::probes::fork_quiesce(0, others as i64, self.kicker.count() as i64, self.this_tid);
         let mut quiesced = false;
         if others > 0 {
@@ -1873,7 +1873,20 @@ impl ThreadRuntimeState {
             self.kicker.kick_all_except(self.this_tid);
             self.futex.notify_signal_pending();
             crate::host_signal::wake_all_waiters();
-            while !barrier.wait_quiesced(others, Duration::from_millis(50)) {
+            loop {
+                // Re-read the LIVE sibling count each iteration. A vCPU that EXITS
+                // mid-quiesce (the importer thread finishing, a joined ForkWait
+                // worker) drops out of the kicker, so an `others` captured ONCE
+                // goes stale-HIGH and wait_quiesced waits for a parker that no
+                // longer exists → spins forever. THIS is the multithreaded-fork
+                // wedge: observed `others=4` while the kicker had already fallen
+                // to 3 (only 2 siblings could ever park). Tracking the live count
+                // lets the wait complete as siblings leave; it reaches 0 (→
+                // wait_quiesced returns true immediately) if they all exit.
+                others = self.kicker.count().saturating_sub(1);
+                if barrier.wait_quiesced(others, Duration::from_millis(50)) {
+                    break;
+                }
                 crate::probes::fork_quiesce(
                     1,
                     others as i64,

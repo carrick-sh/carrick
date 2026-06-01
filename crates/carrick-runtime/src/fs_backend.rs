@@ -758,13 +758,11 @@ pub struct HostFsBackend {
     root_prefix: Option<String>,
     /// `--fs host` fast stat path (openat+F_GETPATH instead of cap-std's
     /// per-component walk; see docs/fs-host-capstd-amplification.md) enabled.
-    /// Default OFF (opt-in `CARRICK_FAST_FS=1`): the extra openat/close churn it
-    /// adds to every stat perturbs syscall timing enough to make the pre-existing
-    /// multithreaded-fork-from-nested-process HVF wedge (the campaign's #1
-    /// Heisenbug) fire far more often — test_fork1.test_threaded_import_lock_fork
-    /// hangs ~2/3 of runs with it on, 0/2 off. Until that wedge is fixed the safe
-    /// cap-std path is the default; the fast path stays available for fork-light
-    /// fs-heavy workloads and as a near-deterministic reproducer of the wedge.
+    /// Default ON. It was briefly default-off because its extra openat/close
+    /// churn per stat AGGRAVATED a fork-quiesce wedge (test_fork1 hung); that
+    /// wedge — the forking thread's `others` sibling count going stale-high as
+    /// vCPUs exited mid-quiesce — is fixed (runtime.rs recomputes it live), so
+    /// the win (test_glob 140s→48s) is on by default.
     fast_fs: bool,
 }
 
@@ -795,13 +793,14 @@ fn host_root_prefix(dir: &cap_std::fs::Dir) -> Option<String> {
     }
 }
 
-/// `--fs host` fast stat path enabled. Default OFF — opt in with
-/// `CARRICK_FAST_FS=1` (it aggravates the multithreaded-fork wedge; see the
-/// `fast_fs` field doc and docs/fs-host-capstd-amplification.md).
+/// `--fs host` fast stat path enabled. Default ON (`CARRICK_FAST_FS=0` opts out).
+/// It was briefly default-off because it aggravated a fork-quiesce wedge; that
+/// wedge (stale `others` count — see runtime.rs fork loop) is now fixed, so the
+/// perf win is on by default. See docs/fs-host-capstd-amplification.md.
 fn fast_fs_enabled() -> bool {
-    matches!(
+    !matches!(
         std::env::var("CARRICK_FAST_FS").as_deref(),
-        Ok("1") | Ok("true")
+        Ok("0") | Ok("false")
     )
 }
 
