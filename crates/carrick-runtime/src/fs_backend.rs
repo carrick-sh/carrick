@@ -1148,11 +1148,91 @@ fn read_socket_xattr(dir: &cap_std::fs::Dir, rel: &Path) -> bool {
 }
 
 /// Read the guest owner (uid, gid) xattrs for `rel`. Either may be `None`.
+/// Absolute host path of `rel` under the cap-std sandbox `dir` (macOS F_GETPATH
+/// on the dir fd). Symlink xattr ops need it: cap-std can't open a symlink (its
+/// O_NOFOLLOW conflicts with O_SYMLINK), so the link's own xattrs are reached by
+/// a path-based setxattr/getxattr with XATTR_NOFOLLOW. `rel` is sandbox-validated.
+#[cfg(target_os = "macos")]
+fn sandbox_abs_path(dir: &cap_std::fs::Dir, rel: &Path) -> Option<std::path::PathBuf> {
+    use std::os::fd::AsRawFd;
+    let mut buf = [0u8; libc::PATH_MAX as usize];
+    let rc = unsafe {
+        libc::fcntl(
+            dir.as_raw_fd(),
+            libc::F_GETPATH,
+            buf.as_mut_ptr() as *mut libc::c_char,
+        )
+    };
+    if rc < 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    Some(std::path::Path::new(std::str::from_utf8(&buf[..end]).ok()?).join(rel))
+}
+
+#[cfg(target_os = "macos")]
+const XATTR_NOFOLLOW: i32 = 0x0001;
+
+#[cfg(target_os = "macos")]
+fn symlink_get_u32_xattr(dir: &cap_std::fs::Dir, rel: &Path, name: &[u8]) -> Option<u32> {
+    use std::os::unix::ffi::OsStrExt;
+    let abs = sandbox_abs_path(dir, rel)?;
+    let cpath = std::ffi::CString::new(abs.as_os_str().as_bytes()).ok()?;
+    let mut v = [0u8; 4];
+    let n = unsafe {
+        libc::getxattr(
+            cpath.as_ptr(),
+            name.as_ptr() as *const libc::c_char,
+            v.as_mut_ptr() as *mut libc::c_void,
+            v.len(),
+            0,
+            XATTR_NOFOLLOW,
+        )
+    };
+    (n == 4).then(|| u32::from_le_bytes(v))
+}
+
+#[cfg(target_os = "macos")]
+fn symlink_set_u32_xattr(dir: &cap_std::fs::Dir, rel: &Path, name: &[u8], val: u32) {
+    use std::os::unix::ffi::OsStrExt;
+    let Some(abs) = sandbox_abs_path(dir, rel) else {
+        return;
+    };
+    let Ok(cpath) = std::ffi::CString::new(abs.as_os_str().as_bytes()) else {
+        return;
+    };
+    let v = val.to_le_bytes();
+    unsafe {
+        libc::setxattr(
+            cpath.as_ptr(),
+            name.as_ptr() as *const libc::c_char,
+            v.as_ptr() as *const libc::c_void,
+            v.len(),
+            0,
+            XATTR_NOFOLLOW,
+        );
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn symlink_get_u32_xattr(_d: &cap_std::fs::Dir, _r: &Path, _n: &[u8]) -> Option<u32> {
+    None
+}
+#[cfg(not(target_os = "macos"))]
+fn symlink_set_u32_xattr(_d: &cap_std::fs::Dir, _r: &Path, _n: &[u8], _v: u32) {}
+
 fn read_owner_xattr(
     dir: &cap_std::fs::Dir,
     rel: &Path,
     is_dir: bool,
+    symlink: bool,
 ) -> (Option<u32>, Option<u32>) {
+    if symlink {
+        return (
+            symlink_get_u32_xattr(dir, rel, CARRICK_UID_XATTR),
+            symlink_get_u32_xattr(dir, rel, CARRICK_GID_XATTR),
+        );
+    }
     with_entry_fd(dir, rel, is_dir, false, |fd| {
         (
             fget_u32_xattr(fd, CARRICK_UID_XATTR),
@@ -1168,9 +1248,20 @@ pub(crate) fn write_owner_xattr(
     dir: &cap_std::fs::Dir,
     rel: &Path,
     is_dir: bool,
+    symlink: bool,
     uid: u32,
     gid: u32,
 ) {
+    if symlink {
+        // lchown: the owner lives on the LINK itself (XATTR_NOFOLLOW).
+        if uid != u32::MAX {
+            symlink_set_u32_xattr(dir, rel, CARRICK_UID_XATTR, uid);
+        }
+        if gid != u32::MAX {
+            symlink_set_u32_xattr(dir, rel, CARRICK_GID_XATTR, gid);
+        }
+        return;
+    }
     let _ = with_entry_fd(dir, rel, is_dir, !is_dir, |fd| {
         if uid != u32::MAX {
             fset_u32_xattr(fd, CARRICK_UID_XATTR, uid);
@@ -1872,12 +1963,10 @@ impl FsBackend for HostFsBackend {
         // carrick is not root on macOS, so it can't chown(2) the scratch file
         // to an arbitrary uid — record the guest-visible owner in xattrs ON the
         // file (durable, fork-coherent) and report it from stat.
-        let is_dir = self
-            .dir
-            .symlink_metadata(rel)
-            .map(|m| m.is_dir())
-            .unwrap_or(false);
-        write_owner_xattr(&self.dir, rel, is_dir, uid, gid);
+        let m = self.dir.symlink_metadata(rel).ok();
+        let is_dir = m.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+        let symlink = m.as_ref().map(|m| m.is_symlink()).unwrap_or(false);
+        write_owner_xattr(&self.dir, rel, is_dir, symlink, uid, gid);
         Ok(())
     }
 
@@ -1891,7 +1980,7 @@ impl FsBackend for HostFsBackend {
         if meta.mode() & (libc::S_IFMT as u32) == libc::S_IFIFO as u32 {
             return Some((0, 0));
         }
-        let (uid, gid) = read_owner_xattr(&self.dir, rel, meta.is_dir());
+        let (uid, gid) = read_owner_xattr(&self.dir, rel, meta.is_dir(), meta.is_symlink());
         Some((uid.unwrap_or(0), gid.unwrap_or(0)))
     }
 
@@ -2239,21 +2328,35 @@ impl FsBackend for HostFsBackend {
         // (O_RDONLY blocks a writer-less FIFO and wedges the dispatcher) — its
         // mode lives on the real node (set by create_fifo). Skip the xattr for
         // both; use the real on-disk mode.
-        let (override_mode, owner) =
-            if matches!(kind, RootFsEntryKind::Symlink | RootFsEntryKind::Fifo) {
-                (None, (None, None))
-            } else {
-                match Self::rel_path(&normalized) {
-                    Some(rel) => {
-                        let is_dir = matches!(kind, RootFsEntryKind::Directory);
-                        (
-                            read_mode_xattr(&self.dir, rel, is_dir),
-                            read_owner_xattr(&self.dir, rel, is_dir),
-                        )
-                    }
-                    None => (None, (None, None)),
+        let (override_mode, owner) = if kind == RootFsEntryKind::Fifo {
+            // A FIFO's owner xattr can't be read (open() of a writer-less
+            // FIFO blocks); report none.
+            (None, (None, None))
+        } else if kind == RootFsEntryKind::Symlink {
+            // A symlink's mode is always 0o777; its owner lives on the link
+            // itself (XATTR_NOFOLLOW), so lchown round-trips through lstat.
+            match Self::rel_path(&normalized) {
+                Some(rel) => (
+                    None,
+                    (
+                        symlink_get_u32_xattr(&self.dir, rel, CARRICK_UID_XATTR),
+                        symlink_get_u32_xattr(&self.dir, rel, CARRICK_GID_XATTR),
+                    ),
+                ),
+                None => (None, (None, None)),
+            }
+        } else {
+            match Self::rel_path(&normalized) {
+                Some(rel) => {
+                    let is_dir = matches!(kind, RootFsEntryKind::Directory);
+                    (
+                        read_mode_xattr(&self.dir, rel, is_dir),
+                        read_owner_xattr(&self.dir, rel, is_dir, false),
+                    )
                 }
-            };
+                None => (None, (None, None)),
+            }
+        };
         Some(RealStat {
             kind,
             ino: meta.ino(),
