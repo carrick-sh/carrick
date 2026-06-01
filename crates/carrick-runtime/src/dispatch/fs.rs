@@ -1205,6 +1205,59 @@ impl SyscallDispatcher {
         DispatchOutcome::Returned { value: total }
     }
 
+    /// Write `bytes` to a splice/sendfile destination, honoring `off_out`: NULL
+    /// (addr 0) writes at the fd's current position; non-NULL pwrites at the
+    /// given offset on a regular HostFile and advances `*off_out` (Linux allows
+    /// off_out when fd_out is a regular file even though fd_in is a pipe —
+    /// test_os.test_splice_offset_out). off_out on a non-regular target → EINVAL.
+    fn splice_write_out<M: GuestMemory>(
+        &self,
+        out_fd: i32,
+        off_out_addr: u64,
+        bytes: &[u8],
+        memory: &mut M,
+        tid: crate::thread::ThreadId,
+    ) -> DispatchOutcome {
+        if off_out_addr == 0 {
+            return self.write_output_fd(out_fd, bytes, tid);
+        }
+        let out_off = match read_u64(memory, off_out_addr) {
+            Ok(v) => v,
+            Err(errno) => return errno.into(),
+        };
+        let host_fd = match self.open_file(out_fd).as_ref() {
+            Some(of) => match &*of.description.read() {
+                OpenDescription::HostFile {
+                    host_fd,
+                    writable: true,
+                    ..
+                } => *host_fd,
+                OpenDescription::HostFile { .. } => return LINUX_EBADF.into(),
+                _ => return LINUX_EINVAL.into(),
+            },
+            None => return LINUX_EBADF.into(),
+        };
+        let n = unsafe {
+            libc::pwrite(
+                host_fd,
+                bytes.as_ptr() as *const _,
+                bytes.len(),
+                out_off as libc::off_t,
+            )
+        };
+        let n = match n.host_syscall_errno() {
+            Ok(value) => value as usize,
+            Err(errno) => return errno.into(),
+        };
+        if memory
+            .write_bytes(off_out_addr, &(out_off + n as u64).to_ne_bytes())
+            .is_err()
+        {
+            return LINUX_EFAULT.into();
+        }
+        DispatchOutcome::Returned { value: n as i64 }
+    }
+
     fn write_output_fd(
         &self,
         fd: i32,
@@ -4569,7 +4622,10 @@ impl SyscallDispatcher {
             }
 
             if let Some((pipe, status_flags)) = this.pipe_reader(in_fd.0) {
-                if off_in_address != 0 || off_out_address != 0 {
+                // A pipe/socket source has no seekable offset → off_in must be
+                // NULL. off_out IS allowed (honored below) when fd_out is a
+                // regular file (test_os.test_splice_offset_out).
+                if off_in_address != 0 {
                     return Ok(LINUX_EINVAL.into());
                 }
                 if let Some(errno) = this.splice_output_errno(out_fd.0) {
@@ -4579,7 +4635,7 @@ impl SyscallDispatcher {
                     Ok(bytes) => bytes,
                     Err(errno) => return Ok(errno.into()),
                 };
-                let outcome = this.write_output_fd(out_fd.0, &bytes, tid);
+                let outcome = this.splice_write_out(out_fd.0, off_out_address, &bytes, cx.memory, tid);
                 return Ok(outcome);
             }
 
@@ -4587,7 +4643,10 @@ impl SyscallDispatcher {
             // `pipe2`/`fcntl` now hand back HostPipe descriptions, so splice must
             // recognise them just like the legacy in-memory PipeReader above).
             if let Some(host_fd) = this.host_pipe_read_fd(in_fd.0) {
-                if off_in_address != 0 || off_out_address != 0 {
+                // A pipe/socket source has no seekable offset → off_in must be
+                // NULL. off_out IS allowed (honored below) when fd_out is a
+                // regular file (test_os.test_splice_offset_out).
+                if off_in_address != 0 {
                     return Ok(LINUX_EINVAL.into());
                 }
                 if let Some(errno) = this.splice_output_errno(out_fd.0) {
@@ -4604,7 +4663,7 @@ impl SyscallDispatcher {
                     Err(errno) => return Ok(errno.into()),
                 };
                 buf.truncate(n as usize);
-                let outcome = this.write_output_fd(out_fd.0, &buf, tid);
+                let outcome = this.splice_write_out(out_fd.0, off_out_address, &buf, cx.memory, tid);
                 return Ok(outcome);
             }
 
@@ -4617,7 +4676,10 @@ impl SyscallDispatcher {
             // blocking-wait for an empty socket is the same tracked follow-up as
             // the host-pipe branch above.
             if let Some(host_fd) = this.host_socket_fd(in_fd.0) {
-                if off_in_address != 0 || off_out_address != 0 {
+                // A pipe/socket source has no seekable offset → off_in must be
+                // NULL. off_out IS allowed (honored below) when fd_out is a
+                // regular file (test_os.test_splice_offset_out).
+                if off_in_address != 0 {
                     return Ok(LINUX_EINVAL.into());
                 }
                 if let Some(errno) = this.splice_output_errno(out_fd.0) {
@@ -4635,7 +4697,7 @@ impl SyscallDispatcher {
                     Err(errno) => return Ok(errno.into()),
                 };
                 buf.truncate(n as usize);
-                let outcome = this.write_output_fd(out_fd.0, &buf, tid);
+                let outcome = this.splice_write_out(out_fd.0, off_out_address, &buf, cx.memory, tid);
                 return Ok(outcome);
             }
 
