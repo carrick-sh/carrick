@@ -10,7 +10,21 @@ use super::*;
 static NICE_VALUE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
 fn is_self_priority_target(who: i32) -> bool {
-    who == 0 || who == LINUX_BOOTSTRAP_PID as i32 || who == std::process::id() as i32
+    if who == 0 || who == LINUX_BOOTSTRAP_PID as i32 || who == std::process::id() as i32 {
+        return true;
+    }
+    // Under a PID namespace the guest names itself (PRIO_PROCESS with its own
+    // pid/tid) by its NS-pid, not the host pid. Accept the caller's ns-pid and
+    // any ns-pid that maps back to our host pid.
+    if crate::namespace::pid::enabled() && who > 0 {
+        let w = who as u32;
+        if w == crate::namespace::pid::self_ns_pid()
+            || crate::namespace::pid::ns_to_host_or_self(w) == Some(std::process::id())
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Owned credentials-subsystem state. Split out of `SyscallDispatcher`.
@@ -314,7 +328,13 @@ impl SyscallDispatcher {
             if who.0 < 0 {
                 return Ok(LINUX_ESRCH.into());
             }
-            if which == LINUX_PRIO_PROCESS && !is_self_priority_target(who.0) {
+            // PRIO_PROCESS names a process OR a thread (Linux nice is per-thread);
+            // a live sibling guest thread tid is a valid self-process target.
+            let sibling = cx
+                .thread
+                .as_ref()
+                .is_some_and(|t| t.registry.is_live(who.0 as crate::thread::ThreadId));
+            if which == LINUX_PRIO_PROCESS && !is_self_priority_target(who.0) && !sibling {
                 return Ok(LINUX_ESRCH.into());
             }
             // Linux CLAMPS the nice value to [-20,19] (it does NOT reject an
@@ -346,7 +366,11 @@ impl SyscallDispatcher {
             if who.0 < 0 {
                 return Ok(LINUX_ESRCH.into());
             }
-            if which == LINUX_PRIO_PROCESS && !is_self_priority_target(who.0) {
+            let sibling = cx
+                .thread
+                .as_ref()
+                .is_some_and(|t| t.registry.is_live(who.0 as crate::thread::ThreadId));
+            if which == LINUX_PRIO_PROCESS && !is_self_priority_target(who.0) && !sibling {
                 return Ok(LINUX_ESRCH.into());
             }
             // Kernel ABI: getpriority returns `20 - nice` (so the value is never
