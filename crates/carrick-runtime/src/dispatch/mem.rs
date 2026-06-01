@@ -763,6 +763,32 @@ impl SyscallDispatcher {
                 return Ok(LINUX_EINVAL.into());
             }
             if !range_within(old_address.0, old_size, LINUX_MMAP_BASE, crate::memory::mmap_arena_size()) {
+                // The mapping is not in the mmap arena: it's a MAP_SHARED file
+                // alias (high VA) or a MAP_SHARED anonymous shared-aperture
+                // region. CPython's mmap.resize() shrinks both of these
+                // (test_mmap test_basic on a file mapping, test_resize_past_pos
+                // on an anonymous one), tolerating only success or SystemError —
+                // never the OSError we raised by rejecting them here.
+                //
+                // Support resize-DOWN: the backing stays at the same VA with a
+                // smaller logical size. CPython already ftruncate'd a file
+                // backing to the new size; the freed tail is not accessed (Python
+                // tracks the new size/position), so we return the unchanged base.
+                // (Unlike the arena shrink below we do NOT eagerly unmap the tail
+                // here — invalidating a high-VA alias tail needs trap-engine
+                // coordination; no caller reads it. A grow would mean relocating
+                // a file/shared backing, which we don't do → EINVAL as before.)
+                let Some(new_size) = align_up_u64(new_size_req, LINUX_PAGE_SIZE) else {
+                    return Ok(LINUX_ENOMEM.into());
+                };
+                if memory.read_bytes(old_address.0, 1).is_err() {
+                    return Ok(LINUX_EINVAL.into());
+                }
+                if new_size <= old_size {
+                    return Ok(DispatchOutcome::Returned {
+                        value: old_address.0 as i64,
+                    });
+                }
                 return Ok(LINUX_EINVAL.into());
             }
             let Some(new_size) = align_up_u64(new_size_req, LINUX_PAGE_SIZE) else {
