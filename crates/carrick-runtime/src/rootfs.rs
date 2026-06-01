@@ -93,6 +93,11 @@ pub struct RootFsMetadata {
 pub struct RootFsDirEntry {
     pub name: String,
     pub metadata: RootFsMetadata,
+    /// Real host inode for this entry, so getdents64's `d_ino` matches a later
+    /// `stat()` (CPython scandir DirEntry.inode() == os.stat().st_ino). 0 means
+    /// unknown (in-memory/synthetic entries) → getdents64 falls back to a
+    /// path-derived synthetic ino.
+    pub ino: u64,
 }
 
 #[derive(Debug, Error)]
@@ -439,7 +444,12 @@ impl RootFs {
             .into_iter()
             .map(|name| {
                 let metadata = self.metadata_for_normalized(&dir.join(&name))?;
-                Ok(RootFsDirEntry { name, metadata })
+                // In-memory rootfs has no host inode; getdents64 will hash the path.
+                Ok(RootFsDirEntry {
+                    name,
+                    metadata,
+                    ino: 0,
+                })
             })
             .collect()
     }
