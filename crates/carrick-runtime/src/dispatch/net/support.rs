@@ -1258,6 +1258,94 @@ pub(in crate::dispatch) fn build_linux_scm_rights(fds: &[i32], cap: usize) -> (V
     (buf, truncated)
 }
 
+/// IPPROTO_IPV6 socket level — 41 on BOTH macOS and Linux (only the per-option
+/// TYPE numbers below differ between the two).
+pub(in crate::dispatch) const LINUX_IPPROTO_IPV6: i32 = 41;
+
+/// IPv6 RFC 3542 ancillary cmsg-type number translation, macOS→Linux. macOS and
+/// Linux assign DIFFERENT values to the same IPV6_* cmsg types (macOS gates them
+/// behind `__APPLE_USE_RFC_3542`). The `setsockopt` optname direction is already
+/// translated by `linux_to_host_sockopt`; this covers the returned `recvmsg`
+/// cmsg_type, which carrick must translate back so the guest (Linux) sees the
+/// expected type. `(linux, macos)`:
+const IPV6_CMSG_MAP: &[(i32, i32)] = &[
+    (52, 47), // IPV6_HOPLIMIT
+    (67, 36), // IPV6_TCLASS
+    (50, 46), // IPV6_PKTINFO
+];
+
+/// Translate a macOS IPPROTO_IPV6 cmsg-type back to the guest (Linux) value.
+fn ipv6_cmsg_host_to_linux(host: i32) -> Option<i32> {
+    IPV6_CMSG_MAP
+        .iter()
+        .find(|(_, m)| *m == host)
+        .map(|(l, _)| *l)
+}
+
+/// Parse a HOST (macOS-layout) `msg_control` buffer and return every
+/// IPPROTO_IPV6 ancillary record as `(linux_cmsg_type, data_bytes)`, with the
+/// cmsg_type translated macOS→Linux. (SCM_RIGHTS is handled separately because
+/// its data — host fds — needs install+remap.) Used by recvmsg to forward IPv6
+/// hop-limit / traffic-class / pktinfo ancillary data the guest asked for.
+pub(in crate::dispatch) fn parse_host_ipv6_cmsgs(
+    control: &[u8],
+    controllen: usize,
+) -> Vec<(i32, Vec<u8>)> {
+    let mut out = Vec::new();
+    if controllen == 0 || control.is_empty() {
+        return out;
+    }
+    unsafe {
+        let mut hmsg: libc::msghdr = std::mem::zeroed();
+        hmsg.msg_control = control.as_ptr() as *mut libc::c_void;
+        hmsg.msg_controllen = controllen as _;
+        let mut cmsg = libc::CMSG_FIRSTHDR(&hmsg);
+        while !cmsg.is_null() {
+            if (*cmsg).cmsg_level == LINUX_IPPROTO_IPV6
+                && let Some(linux_type) = ipv6_cmsg_host_to_linux((*cmsg).cmsg_type)
+            {
+                let hdr_len = libc::CMSG_LEN(0) as usize;
+                let total = (*cmsg).cmsg_len as usize;
+                let data_len = total.saturating_sub(hdr_len);
+                let data = libc::CMSG_DATA(cmsg);
+                let mut v = vec![0u8; data_len];
+                std::ptr::copy_nonoverlapping(data, v.as_mut_ptr(), data_len);
+                out.push((linux_type, v));
+            }
+            cmsg = libc::CMSG_NXTHDR(&hmsg, cmsg);
+        }
+    }
+    out
+}
+
+/// Append IPPROTO_IPV6 ancillary records (`(linux_cmsg_type, data)`) to a
+/// GUEST (Linux-layout) `msg_control` buffer that already holds `prefix` bytes
+/// (e.g. an SCM_RIGHTS record), honoring the total `cap`. Returns the combined
+/// buffer + whether any record was dropped for lack of space (→ MSG_CTRUNC).
+pub(in crate::dispatch) fn build_linux_ipv6_cmsgs(
+    prefix: &[u8],
+    cmsgs: &[(i32, Vec<u8>)],
+    cap: usize,
+) -> (Vec<u8>, bool) {
+    let mut buf = prefix.to_vec();
+    let mut truncated = false;
+    for (ctype, data) in cmsgs {
+        let cmsg_len = LINUX_CMSGHDR_LEN + data.len();
+        let aligned = linux_cmsg_align(cmsg_len);
+        if buf.len() + aligned > cap {
+            truncated = true;
+            break; // Linux drops this record (and the rest) + sets MSG_CTRUNC.
+        }
+        let start = buf.len();
+        buf.resize(start + aligned, 0);
+        buf[start..start + 8].copy_from_slice(&(cmsg_len as u64).to_ne_bytes());
+        buf[start + 8..start + 12].copy_from_slice(&LINUX_IPPROTO_IPV6.to_ne_bytes());
+        buf[start + 12..start + 16].copy_from_slice(&ctype.to_ne_bytes());
+        buf[start + 16..start + 16 + data.len()].copy_from_slice(data);
+    }
+    (buf, truncated)
+}
+
 /// Build a HOST (macOS-layout) `msg_control` buffer carrying a single
 /// `SCM_RIGHTS` record with `host_fds`, for handing to the real `sendmsg(2)`.
 /// macOS `cmsghdr` is `{ u32 cmsg_len; i32 cmsg_level; i32 cmsg_type; }` and
