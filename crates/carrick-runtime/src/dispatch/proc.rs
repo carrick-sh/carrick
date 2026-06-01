@@ -338,6 +338,13 @@ impl SyscallDispatcher {
         let desc = open.description.read();
         match &*desc {
             OpenDescription::Pidfd { host_pid, .. } => Some(*host_pid),
+            // A `/proc/<pid>` directory fd is a valid pidfd on Linux (e.g.
+            // `pidfd_send_signal`/`waitid(P_PIDFD)` accept one). Resolve its
+            // backing host pid; any other directory (or non-numeric /proc path)
+            // yields None → EBADF. (CPython test_pidfd_send_signal.)
+            OpenDescription::Directory { path, .. } => {
+                crate::vfs::proc::proc_pid_dir_host_pid(path).map(|p| p as i32)
+            }
             _ => None,
         }
     }
