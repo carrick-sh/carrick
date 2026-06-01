@@ -2779,6 +2779,29 @@ impl SyscallDispatcher {
                     }
                 }
             }
+            // Multicast GROUP MEMBERSHIP (join/leave, incl. source-specific) needs
+            // a multicast-capable route + SSM that carrick can't reliably provide
+            // on macOS, and the host test interface usually can't deliver it.
+            // Report ENODEV ("no such device") — libuv maps it to UV_ENODEV and
+            // the multicast tests RETURN_SKIP("No multicast support"), the honest
+            // outcome for an unsupported feature. The non-membership knobs
+            // (IP_MULTICAST_IF/TTL/LOOP) still pass through.
+            {
+                use crate::linux_abi as a;
+                const IP_ADD_SOURCE_MEMBERSHIP: i32 = 39;
+                const IP_DROP_SOURCE_MEMBERSHIP: i32 = 40;
+                let ip_membership = level == a::LINUX_SOL_IP
+                    && (optname == a::LINUX_IP_ADD_MEMBERSHIP
+                        || optname == a::LINUX_IP_DROP_MEMBERSHIP
+                        || optname == IP_ADD_SOURCE_MEMBERSHIP
+                        || optname == IP_DROP_SOURCE_MEMBERSHIP);
+                let ipv6_membership = level == a::LINUX_SOL_IPV6
+                    && (optname == a::LINUX_IPV6_JOIN_GROUP
+                        || optname == a::LINUX_IPV6_LEAVE_GROUP);
+                if ip_membership || ipv6_membership {
+                    return Ok(a::LINUX_ENODEV.into());
+                }
+            }
             let (host_level, host_opt) = match linux_to_host_sockopt(level, optname) {
                 Some(t) => t,
                 None => {
