@@ -5,14 +5,16 @@ edition = "2021"
 publish = false
 autobins = true
 
-# Standalone syscall-probe binaries, one per file in src/bin/. Built as
-# static aarch64-musl ELFs inside an arm64 rust:alpine container
-# (scripts/build-probes.sh). Each prints deterministic, one-line-per-
-# observation output; the conformance harness runs the SAME binary under
-# carrick and real Linux and diffs line-by-line, so a divergence pinpoints
-# the exact syscall (the "reducer"). Bins are auto-discovered — add a new
-# probe by dropping a file in src/bin/ (no Cargo.toml edit, conflict-free
-# for parallel authoring).
+# Standalone syscall-probe binaries, one per file in src/bin/. The normal gate
+# builds the full static aarch64-musl set inside an arm64 rust:alpine container
+# (scripts/build-probes.sh). The script may also build explicit arch-neutral
+# x86_64-musl smoke probes, but most existing probes are aarch64-specific and
+# are not part of Rosetta's current static-musl scope. Each probe prints
+# deterministic, one-line-per-observation output; the conformance harness runs
+# the SAME binary under carrick and real Linux and diffs line-by-line, so a
+# divergence pinpoints the exact syscall (the "reducer"). Bins are
+# auto-discovered — add a new probe by dropping a file in src/bin/ (no
+# Cargo.toml edit, conflict-free for parallel authoring).
 #
 # src/lib.rs is the shared `conformance_probes` crate exposing helper
 # functions for signal/fd/process boilerplate that previously got copy-pasted

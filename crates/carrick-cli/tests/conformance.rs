@@ -2,7 +2,7 @@
 //!
 //! Each case is a `/bin/sh -c` snippet exercising syscall-observable
 //! behaviour. We run the IDENTICAL snippet under carrick (`--fs host`) and
-//! inside a real arm64 Linux container (via the `bollard` Docker client) and
+//! inside a real Linux container (via the `bollard` Docker client) and
 //! diff the output. A difference is a candidate gap in carrick's syscall
 //! layer — surfaced by name immediately instead of via downstream
 //! archaeology ("dpkg returned 100").
@@ -106,8 +106,34 @@ use bollard::container::{
 use bollard::image::CreateImageOptions;
 use futures_util::StreamExt;
 
-const IMAGE: &str = "docker.io/library/ubuntu:24.04";
-const PLATFORM: &str = "linux/arm64";
+#[derive(Clone, Copy)]
+struct Lane {
+    label: &'static str,
+    platform: &'static str,
+    image: &'static str,
+    probe_target: &'static str,
+    run_static_musl_probes: bool,
+}
+
+const ARM64: Lane = Lane {
+    label: "arm64",
+    platform: "linux/arm64",
+    image: "docker.io/library/ubuntu:24.04",
+    probe_target: "aarch64-unknown-linux-musl",
+    run_static_musl_probes: true,
+};
+
+const AMD64: Lane = Lane {
+    label: "amd64-rosetta",
+    platform: "linux/amd64",
+    image: "docker.io/library/ubuntu:24.04",
+    probe_target: "x86_64-unknown-linux-musl",
+    // Apple's Linux Rosetta path does not run the static-musl probe binaries
+    // yet; the amd64 shell lane is glibc-dynamic and exercises supported scope.
+    run_static_musl_probes: false,
+};
+
+const LANES: &[Lane] = &[ARM64, AMD64];
 
 struct Case {
     name: &'static str,
@@ -116,6 +142,14 @@ struct Case {
 
 /// Snippets must be deterministic: no timestamps, pids, or hashes.
 const CASES: &[Case] = &[
+    Case {
+        name: "uname_m",
+        snippet: "uname -m",
+    },
+    Case {
+        name: "dpkg_arch",
+        snippet: "dpkg --print-architecture",
+    },
     Case {
         name: "getcwd",
         snippet: "cd /tmp && mkdir -p a/b && cd a/b && pwd",
@@ -197,6 +231,14 @@ fn repo_path(path: &str) -> PathBuf {
 fn carrick_bin() -> Option<PathBuf> {
     let p = repo_path("target/release/carrick");
     p.exists().then_some(p)
+}
+
+fn rosetta_available() -> bool {
+    std::path::Path::new("/Library/Apple/usr/libexec/oah/RosettaLinux/rosetta").exists()
+}
+
+fn lane_available(lane: Lane) -> bool {
+    lane.platform != "linux/amd64" || rosetta_available()
 }
 
 /// True if `bin` already carries the hypervisor entitlement.
@@ -285,20 +327,32 @@ fn scoped_kill_guests(run_id: &str) {
         .output();
 }
 
-fn run_carrick(bin: &PathBuf, snippet: &str) -> String {
+fn run_carrick(bin: &PathBuf, lane: Lane, snippet: &str) -> String {
     use std::os::unix::process::CommandExt;
     let run_id = case_run_id();
-    let child = Command::new(bin)
+    let mut command = Command::new(bin);
+    command
         .args([
-            "run", IMAGE, "--raw", "--fs", "host", "/bin/sh", "-c", snippet,
+            "run",
+            "--platform",
+            lane.platform,
+            "--raw",
+            "--fs",
+            "host",
+            lane.image,
+            "/bin/sh",
+            "-c",
+            snippet,
         ])
         .env("CARRICK_RUN_ID", &run_id)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         // New process group so we can signal the whole guest tree on timeout.
-        .process_group(0)
-        .spawn()
-        .expect("spawn carrick");
+        .process_group(0);
+    if lane.platform == "linux/amd64" {
+        command.env("CARRICK_ACCEPT_ROSETTA_TERMS", "1");
+    }
+    let child = command.spawn().expect("spawn carrick");
     let pid = child.id() as i32;
     let done = Arc::new(AtomicBool::new(false));
     let watcher = {
@@ -330,14 +384,11 @@ fn run_carrick(bin: &PathBuf, snippet: &str) -> String {
     normalize(&combined)
 }
 
-async fn ensure_image(docker: &Docker) -> anyhow::Result<()> {
-    if docker.inspect_image(IMAGE).await.is_ok() {
-        return Ok(());
-    }
+async fn ensure_image(docker: &Docker, lane: Lane) -> anyhow::Result<()> {
     let mut stream = docker.create_image(
         Some(CreateImageOptions {
-            from_image: IMAGE,
-            platform: PLATFORM,
+            from_image: lane.image,
+            platform: lane.platform,
             ..Default::default()
         }),
         None,
@@ -349,17 +400,22 @@ async fn ensure_image(docker: &Docker) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_docker(docker: &Docker, snippet: &str) -> anyhow::Result<String> {
+async fn run_docker(docker: &Docker, lane: Lane, snippet: &str) -> anyhow::Result<String> {
     let config = Config {
-        image: Some(IMAGE.to_string()),
+        image: Some(lane.image.to_string()),
         cmd: Some(vec!["/bin/sh".into(), "-c".into(), snippet.to_string()]),
         ..Default::default()
     };
     let created = docker
         .create_container(
             Some(CreateContainerOptions {
-                name: format!("carrick-conf-{}", std::process::id()),
-                platform: Some(PLATFORM.to_string()),
+                name: format!(
+                    "carrick-conf-{}-{}-{}",
+                    lane.label,
+                    std::process::id(),
+                    CASE_SEQ.fetch_add(1, Ordering::Relaxed)
+                ),
+                platform: Some(lane.platform.to_string()),
             }),
             config,
         )
@@ -428,38 +484,50 @@ fn conformance() {
                 return;
             }
         };
-        if let Err(e) = ensure_image(&docker).await {
-            eprintln!("SKIP conformance: cannot pull {IMAGE}: {e}");
-            return;
-        }
-
         let mut failures = Vec::new();
-        for case in CASES {
-            let carrick_out = run_carrick(&bin, case.snippet);
-            let docker_fut = run_docker(&docker, case.snippet);
-            let docker_out = match tokio::time::timeout(CASE_DEADLINE, docker_fut).await {
-                Ok(Ok(o)) => o,
-                Ok(Err(e)) => {
-                    eprintln!("FAIL  {} (docker error: {e})", case.name);
-                    failures.push(case.name);
-                    continue;
-                }
-                Err(_) => {
-                    eprintln!("FAIL  {} (docker timeout)", case.name);
-                    failures.push(case.name);
-                    continue;
-                }
-            };
-            if carrick_out == docker_out {
-                eprintln!("PASS  {}", case.name);
-            } else {
+        for lane in LANES {
+            if !lane_available(*lane) {
                 eprintln!(
-                    "FAIL  {}\n  --- carrick ---\n{}\n  --- linux ---\n{}",
-                    case.name,
-                    indent(&carrick_out),
-                    indent(&docker_out)
+                    "SKIP conformance[{}]: Rosetta for Linux not installed",
+                    lane.label
                 );
-                failures.push(case.name);
+                continue;
+            }
+            if let Err(e) = ensure_image(&docker, *lane).await {
+                eprintln!(
+                    "SKIP conformance[{}]: cannot pull {} for {}: {e}",
+                    lane.label, lane.image, lane.platform
+                );
+                continue;
+            }
+            for case in CASES {
+                let carrick_out = run_carrick(&bin, *lane, case.snippet);
+                let docker_fut = run_docker(&docker, *lane, case.snippet);
+                let docker_out = match tokio::time::timeout(CASE_DEADLINE, docker_fut).await {
+                    Ok(Ok(o)) => o,
+                    Ok(Err(e)) => {
+                        eprintln!("FAIL  {}:{} (docker error: {e})", lane.label, case.name);
+                        failures.push(format!("{}:{}", lane.label, case.name));
+                        continue;
+                    }
+                    Err(_) => {
+                        eprintln!("FAIL  {}:{} (docker timeout)", lane.label, case.name);
+                        failures.push(format!("{}:{}", lane.label, case.name));
+                        continue;
+                    }
+                };
+                if carrick_out == docker_out {
+                    eprintln!("PASS  {}:{}", lane.label, case.name);
+                } else {
+                    eprintln!(
+                        "FAIL  {}:{}\n  --- carrick ---\n{}\n  --- linux ---\n{}",
+                        lane.label,
+                        case.name,
+                        indent(&carrick_out),
+                        indent(&docker_out)
+                    );
+                    failures.push(format!("{}:{}", lane.label, case.name));
+                }
             }
         }
         assert!(failures.is_empty(), "conformance gaps: {failures:?}");
@@ -518,7 +586,7 @@ fn run_carrick_default(bin: &PathBuf, snippet: &str) -> (i32, String, String) {
     use std::os::unix::process::CommandExt;
     let run_id = case_run_id();
     let child = Command::new(bin)
-        .args(["run", IMAGE, "--fs", "host", "/bin/sh", "-c", snippet])
+        .args(["run", ARM64.image, "--fs", "host", "/bin/sh", "-c", snippet])
         .env("CARRICK_RUN_ID", &run_id)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -569,7 +637,7 @@ async fn run_docker_contract(
     seq: usize,
 ) -> anyhow::Result<(i64, String, String)> {
     let config = Config {
-        image: Some(IMAGE.to_string()),
+        image: Some(ARM64.image.to_string()),
         cmd: Some(vec!["/bin/sh".into(), "-c".into(), snippet.to_string()]),
         ..Default::default()
     };
@@ -578,7 +646,7 @@ async fn run_docker_contract(
         .create_container(
             Some(CreateContainerOptions {
                 name,
-                platform: Some(PLATFORM.to_string()),
+                platform: Some(ARM64.platform.to_string()),
             }),
             config,
         )
@@ -605,8 +673,12 @@ async fn run_docker_contract(
         let (mut so, mut se) = (String::new(), String::new());
         while let Some(item) = logs.next().await {
             match item {
-                Ok(LogOutput::StdOut { message }) => so.push_str(&String::from_utf8_lossy(&message)),
-                Ok(LogOutput::StdErr { message }) => se.push_str(&String::from_utf8_lossy(&message)),
+                Ok(LogOutput::StdOut { message }) => {
+                    so.push_str(&String::from_utf8_lossy(&message))
+                }
+                Ok(LogOutput::StdErr { message }) => {
+                    se.push_str(&String::from_utf8_lossy(&message))
+                }
                 _ => {}
             }
         }
@@ -651,30 +723,35 @@ fn conformance_default_run_contract() {
                 return;
             }
         };
-        if let Err(e) = ensure_image(&docker).await {
-            eprintln!("SKIP conformance_default_run_contract: cannot pull {IMAGE}: {e}");
+        if let Err(e) = ensure_image(&docker, ARM64).await {
+            eprintln!(
+                "SKIP conformance_default_run_contract: cannot pull {}: {e}",
+                ARM64.image
+            );
             return;
         }
 
         let mut failures = Vec::new();
         for (seq, case) in EXIT_CASES.iter().enumerate() {
             let (c_code, c_out, c_err) = run_carrick_default(&bin, case.snippet);
-            let (d_code, d_out, d_err) =
-                match tokio::time::timeout(CASE_DEADLINE, run_docker_contract(&docker, case.snippet, seq))
-                    .await
-                {
-                    Ok(Ok(d)) => d,
-                    Ok(Err(e)) => {
-                        eprintln!("FAIL  {} (docker error: {e})", case.name);
-                        failures.push(case.name);
-                        continue;
-                    }
-                    Err(_) => {
-                        eprintln!("FAIL  {} (docker timeout)", case.name);
-                        failures.push(case.name);
-                        continue;
-                    }
-                };
+            let (d_code, d_out, d_err) = match tokio::time::timeout(
+                CASE_DEADLINE,
+                run_docker_contract(&docker, case.snippet, seq),
+            )
+            .await
+            {
+                Ok(Ok(d)) => d,
+                Ok(Err(e)) => {
+                    eprintln!("FAIL  {} (docker error: {e})", case.name);
+                    failures.push(case.name);
+                    continue;
+                }
+                Err(_) => {
+                    eprintln!("FAIL  {} (docker timeout)", case.name);
+                    failures.push(case.name);
+                    continue;
+                }
+            };
 
             let mut problems = Vec::new();
             // Exit-code parity — the core P1 guarantee, and the regression guard
@@ -695,7 +772,9 @@ fn conformance_default_run_contract() {
             // stderr: docker's stderr must be present in carrick's (lenient —
             // carrick may add host-side notices that `normalize` doesn't strip).
             if !d_err.is_empty() && !c_err.contains(&d_err) {
-                problems.push(format!("stderr: carrick={c_err:?} missing docker={d_err:?}"));
+                problems.push(format!(
+                    "stderr: carrick={c_err:?} missing docker={d_err:?}"
+                ));
             }
 
             if problems.is_empty() {
@@ -725,14 +804,17 @@ fn conformance_default_run_contract() {
 const PROBE_SNIPPET: &str = "base64 -d > /tmp/p && chmod +x /tmp/p && /tmp/p";
 
 /// Directory holding the compiled probe executables, if built.
-fn probes_dir() -> PathBuf {
-    repo_path("conformance-probes/target/aarch64-unknown-linux-musl/release")
+fn probes_dir(lane: Lane) -> PathBuf {
+    repo_path(&format!(
+        "conformance-probes/target/{}/release",
+        lane.probe_target
+    ))
 }
 
 /// Enumerate probe executables in `probes_dir()`: top-level files only, no
 /// extensions (skip anything with a '.'), skipping cargo's bookkeeping dirs.
-fn probe_binaries() -> Vec<PathBuf> {
-    let dir = probes_dir();
+fn probe_binaries(lane: Lane) -> Vec<PathBuf> {
+    let dir = probes_dir(lane);
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return out;
@@ -758,22 +840,32 @@ fn probe_binaries() -> Vec<PathBuf> {
 /// Run the probe-injection snippet under carrick, feeding `stdin_bytes` (the
 /// base64 of the probe) to the child's STDIN. Mirrors `run_carrick`'s
 /// deadline + process-group-kill + sweep pattern, but pipes stdin.
-fn run_carrick_probe(bin: &PathBuf, stdin_bytes: &[u8]) -> String {
+fn run_carrick_probe(bin: &PathBuf, lane: Lane, stdin_bytes: &[u8]) -> String {
     use std::io::Write;
     use std::os::unix::process::CommandExt;
     let run_id = case_run_id();
     let mut child = Command::new(bin)
         .args([
             "run",
-            IMAGE,
+            "--platform",
+            lane.platform,
             "--raw",
             "--fs",
             "host",
+            lane.image,
             "/bin/sh",
             "-c",
             PROBE_SNIPPET,
         ])
         .env("CARRICK_RUN_ID", &run_id)
+        .env(
+            "CARRICK_ACCEPT_ROSETTA_TERMS",
+            if lane.platform == "linux/amd64" {
+                "1"
+            } else {
+                "0"
+            },
+        )
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -823,7 +915,7 @@ fn run_carrick_probe(bin: &PathBuf, stdin_bytes: &[u8]) -> String {
 /// feeding `stdin_bytes` to the container's STDIN. Uses std::process rather
 /// than bollard because bollard stdin-attach is awkward; the shell-case path
 /// keeps using `run_docker` (bollard) unchanged.
-fn run_docker_probe(stdin_bytes: &[u8]) -> std::io::Result<String> {
+fn run_docker_probe(lane: Lane, stdin_bytes: &[u8]) -> std::io::Result<String> {
     use std::io::Write;
     let mut child = Command::new("docker")
         .args([
@@ -831,8 +923,8 @@ fn run_docker_probe(stdin_bytes: &[u8]) -> std::io::Result<String> {
             "-i",
             "--rm",
             "--platform",
-            PLATFORM,
-            IMAGE,
+            lane.platform,
+            lane.image,
             "/bin/sh",
             "-c",
             PROBE_SNIPPET,
@@ -901,6 +993,11 @@ const TIMING_SENSITIVE_PROBES: &[&str] = &[
     "timeextra",
     "clockgetres",
     "netpoll",
+    // mmaprecl churns 800 x 64 MiB anonymous map/unmap cycles. It validates
+    // arena reuse and zero-on-reuse, but under the full parallel gate the host
+    // can spend enough time in unrelated guests/Docker that the probe exceeds
+    // the per-case deadline. Standalone Carrick and Docker runs match.
+    "mmaprecl",
     // futex wake-COUNT probes: macOS __ulock can report zombie wake successes
     // for ~µs after a wake under contention (see project_macos_ulock_zombie),
     // so exact counts flake under the parallel CPU load — quarantine them.
@@ -947,7 +1044,7 @@ enum ProbeOutcome {
 /// Run one probe under carrick + Docker and classify the result. Self-contained
 /// (its own per-case run id via `run_carrick_probe`), so it is safe to call from
 /// multiple worker threads concurrently.
-fn run_one_probe(bin: &PathBuf, probe: &std::path::Path) -> (String, ProbeOutcome) {
+fn run_one_probe(bin: &PathBuf, lane: Lane, probe: &std::path::Path) -> (String, ProbeOutcome) {
     use base64::Engine as _;
     let engine = base64::engine::general_purpose::STANDARD;
     let name = probe
@@ -960,8 +1057,8 @@ fn run_one_probe(bin: &PathBuf, probe: &std::path::Path) -> (String, ProbeOutcom
         Err(e) => return (name, ProbeOutcome::Error(format!("read probe: {e}"))),
     };
     let encoded = engine.encode(&raw).into_bytes();
-    let carrick_out = run_carrick_probe(bin, &encoded);
-    let docker_out = match run_docker_probe(&encoded) {
+    let carrick_out = run_carrick_probe(bin, lane, &encoded);
+    let docker_out = match run_docker_probe(lane, &encoded) {
         Ok(o) => o,
         Err(e) => return (name, ProbeOutcome::Error(format!("docker error: {e}"))),
     };
@@ -983,14 +1080,6 @@ fn conformance_probes() {
         eprintln!("SKIP conformance_probes: target/release/carrick not built");
         return;
     };
-    let dir = probes_dir();
-    if !dir.exists() {
-        eprintln!(
-            "SKIP conformance_probes: probes not built ({})",
-            dir.display()
-        );
-        return;
-    }
     // Docker reachability check (std::process side, so no bollard ping here):
     // a trivial `docker version` must succeed.
     let docker_ok = Command::new("docker")
@@ -1007,84 +1096,114 @@ fn conformance_probes() {
 
     ensure_signed(&bin);
 
-    let probes: Vec<PathBuf> = probe_binaries()
-        .into_iter()
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| !GATE_SKIP_PROBES.contains(&n))
-                .unwrap_or(true)
-        })
-        .collect();
-    if probes.is_empty() {
-        eprintln!(
-            "SKIP conformance_probes: no probe binaries in {}",
-            dir.display()
-        );
-        return;
-    }
-
-    // Fan the probes out across a bounded worker pool — each case is now
-    // hermetic (own run id + own host-fs scratch), so the only shared resources
-    // are the Docker daemon and the host CPUs. Cap at min(cores-2, 8) to avoid
-    // saturating the Docker LinuxKit VM. Timing-sensitive probes are quarantined
-    // to a serial tail to keep them off the contended path.
-    let (quarantine, parallel): (Vec<PathBuf>, Vec<PathBuf>) =
-        probes.into_iter().partition(|p| is_timing_sensitive(p));
-
-    let n_workers = std::thread::available_parallelism()
-        .map(|n| n.get().saturating_sub(2).clamp(1, 8))
-        .unwrap_or(4);
-
-    let parallel = Arc::new(parallel);
-    let next = Arc::new(AtomicUsize::new(0));
-    let results: Arc<Mutex<Vec<(String, ProbeOutcome)>>> = Arc::new(Mutex::new(Vec::new()));
-    std::thread::scope(|scope| {
-        for _ in 0..n_workers {
-            let parallel = Arc::clone(&parallel);
-            let next = Arc::clone(&next);
-            let results = Arc::clone(&results);
-            let bin = bin.clone();
-            scope.spawn(move || {
-                loop {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(probe) = parallel.get(i) else { break };
-                    let r = run_one_probe(&bin, probe);
-                    results.lock().unwrap_or_else(|e| e.into_inner()).push(r);
-                }
-            });
-        }
-    });
-    // Quarantined probes: serial, after the fan-out drains.
-    for probe in &quarantine {
-        let r = run_one_probe(&bin, probe);
-        results.lock().unwrap_or_else(|e| e.into_inner()).push(r);
-    }
-
-    let mut results = Arc::try_unwrap(results)
-        .map(|m| m.into_inner().unwrap_or_else(|e| e.into_inner()))
-        .unwrap_or_default();
-    results.sort_by(|a, b| a.0.cmp(&b.0)); // deterministic report order
-
     let mut failures = Vec::new();
     let mut fixed_gaps = Vec::new();
-    for (name, outcome) in &results {
-        match outcome {
-            ProbeOutcome::Pass => eprintln!("PASS {name}"),
-            ProbeOutcome::UnexpectedPass => {
-                // A known-gap probe started passing → the gap is fixed. Fail
-                // loudly so the entry gets removed from KNOWN_PROBE_GAPS.
-                eprintln!("UNEXPECTED PASS {name} (remove from KNOWN_PROBE_GAPS)");
-                fixed_gaps.push(name.clone());
+
+    for lane in LANES {
+        if !lane.run_static_musl_probes {
+            eprintln!(
+                "SKIP conformance_probes[{}]: static-musl x86_64 probes are outside current Rosetta scope",
+                lane.label
+            );
+            continue;
+        }
+        if !lane_available(*lane) {
+            eprintln!(
+                "SKIP conformance_probes[{}]: Rosetta for Linux not installed",
+                lane.label
+            );
+            continue;
+        }
+        let dir = probes_dir(*lane);
+        if !dir.exists() {
+            eprintln!(
+                "SKIP conformance_probes[{}]: probes not built ({})",
+                lane.label,
+                dir.display()
+            );
+            continue;
+        }
+
+        let probes: Vec<PathBuf> = probe_binaries(*lane)
+            .into_iter()
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| !GATE_SKIP_PROBES.contains(&n))
+                    .unwrap_or(true)
+            })
+            .collect();
+        if probes.is_empty() {
+            eprintln!(
+                "SKIP conformance_probes[{}]: no probe binaries in {}",
+                lane.label,
+                dir.display()
+            );
+            continue;
+        }
+
+        // Fan the probes out across a bounded worker pool — each case is now
+        // hermetic (own run id + own host-fs scratch), so the only shared resources
+        // are the Docker daemon and the host CPUs. Cap at min(cores-2, 8) to avoid
+        // saturating the Docker LinuxKit VM. Timing-sensitive probes are quarantined
+        // to a serial tail to keep them off the contended path.
+        let (quarantine, parallel): (Vec<PathBuf>, Vec<PathBuf>) =
+            probes.into_iter().partition(|p| is_timing_sensitive(p));
+
+        let n_workers = std::thread::available_parallelism()
+            .map(|n| n.get().saturating_sub(2).clamp(1, 8))
+            .unwrap_or(4);
+
+        let parallel = Arc::new(parallel);
+        let next = Arc::new(AtomicUsize::new(0));
+        let results: Arc<Mutex<Vec<(String, ProbeOutcome)>>> = Arc::new(Mutex::new(Vec::new()));
+        std::thread::scope(|scope| {
+            for _ in 0..n_workers {
+                let parallel = Arc::clone(&parallel);
+                let next = Arc::clone(&next);
+                let results = Arc::clone(&results);
+                let bin = bin.clone();
+                let lane = *lane;
+                scope.spawn(move || {
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(probe) = parallel.get(i) else { break };
+                        let r = run_one_probe(&bin, lane, probe);
+                        results.lock().unwrap_or_else(|e| e.into_inner()).push(r);
+                    }
+                });
             }
-            ProbeOutcome::Fail(diff) => {
-                eprintln!("FAIL {name}\n{diff}");
-                failures.push(name.clone());
-            }
-            ProbeOutcome::Xfail(diff) => eprintln!("XFAIL {name} (known gap)\n{diff}"),
-            ProbeOutcome::Error(e) => {
-                eprintln!("FAIL {name} ({e})");
-                failures.push(name.clone());
+        });
+        // Quarantined probes: serial, after the fan-out drains.
+        for probe in &quarantine {
+            let r = run_one_probe(&bin, *lane, probe);
+            results.lock().unwrap_or_else(|e| e.into_inner()).push(r);
+        }
+
+        let mut results = Arc::try_unwrap(results)
+            .map(|m| m.into_inner().unwrap_or_else(|e| e.into_inner()))
+            .unwrap_or_default();
+        results.sort_by(|a, b| a.0.cmp(&b.0)); // deterministic report order
+
+        for (name, outcome) in &results {
+            let qualified = format!("{}:{name}", lane.label);
+            match outcome {
+                ProbeOutcome::Pass => eprintln!("PASS {qualified}"),
+                ProbeOutcome::UnexpectedPass => {
+                    // A known-gap probe started passing → the gap is fixed. Fail
+                    // loudly so the entry gets removed from KNOWN_PROBE_GAPS.
+                    eprintln!("UNEXPECTED PASS {qualified} (remove from KNOWN_PROBE_GAPS)");
+                    fixed_gaps.push(qualified);
+                }
+                ProbeOutcome::Fail(diff) => {
+                    eprintln!("FAIL {qualified}\n{diff}");
+                    failures.push(qualified);
+                }
+                ProbeOutcome::Xfail(diff) => eprintln!("XFAIL {qualified} (known gap)\n{diff}"),
+                ProbeOutcome::Error(e) => {
+                    eprintln!("FAIL {qualified} ({e})");
+                    failures.push(qualified);
+                }
             }
         }
     }
@@ -1132,8 +1251,8 @@ fn conformance_go_fixture() {
     let engine = base64::engine::general_purpose::STANDARD;
     let encoded = engine.encode(&raw).into_bytes();
 
-    let carrick_out = run_carrick_probe(&bin, &encoded);
-    let docker_out = match run_docker_probe(&encoded) {
+    let carrick_out = run_carrick_probe(&bin, ARM64, &encoded);
+    let docker_out = match run_docker_probe(ARM64, &encoded) {
         Ok(o) => o,
         Err(e) => {
             panic!("Docker run failed: {e}");
