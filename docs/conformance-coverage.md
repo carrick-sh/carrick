@@ -80,6 +80,22 @@ zero. The list is intentionally kept around for future gaps._
 | `prctldumpable` | `PR_SET_DUMPABLE`/`PR_GET_DUMPABLE` round-trip: initial=1, set 0→get 0, set 1→get 1, set 2 returns OBSERVED rc/errno (newer kernels reject with EINVAL — probe records the tuple), set 99→EINVAL. Stands in for LTP `prctl04`/`prctl08`. |
 | `waitidspec` | `waitid(2)` siginfo encoding: CLD_EXITED+si_status, CLD_KILLED+si_status==SIGKILL, WNOWAIT peek-then-reap leaves the zombie, P_ALL+WNOHANG→ECHILD with no children. Distinct ABI from wait4 (covered by `proclife`/`waitrestart`). Stands in for LTP `waitid01`/`waitid02`/`waitid03`. |
 
+**Asymmetric-behavior audit** (2026-06-02; gate the fixes from
+`docs/asymmetric-behavior-audit.md` — set-without-get / write-without-read /
+save-without-restore. Type-check on `aarch64-unknown-linux-musl`; run under
+carrick-vs-Docker to confirm MATCH):
+
+| Probe | Gates |
+|---|---|
+| `prctlnnp` | prctl set/get round-trips for PR_SET_NO_NEW_PRIVS (one-way latch + bad-arg EINVAL), PR_SET_KEEPCAPS (+ arg2>1 EINVAL), PR_SET_CHILD_SUBREAPER (GET writes *arg2), PR_SET_TIMERSLACK (default 50000, set/reset). Was: all EINVAL (audit H1). |
+| `rlimitroundtrip` | `setrlimit`/`getrlimit` round-trip for RLIMIT_CORE + RLIMIT_STACK (non-NOFILE resources); resource independence; rlim_cur>rlim_max→EINVAL. Was: set silently ignored, get returned a hardcoded default (audit H2). |
+| `saresethand` | SA_RESETHAND one-shot: handler runs once, disposition resets to SIG_DFL, a second raise takes the default (SIGURG ignore). Was: never reset → re-entered forever (audit H6). |
+| `signalfdread` | signalfd `read()` drains a pending masked signal into a 128-byte `signalfd_siginfo` (ssi_signo correct); short buffer → EINVAL. Was: read→EINVAL, API unusable (audit H4). |
+| `epollclosenodel` | `close()` of an EPOLL_CTL_ADDed fd auto-removes it; re-ADD of the reused fd number → 0, not spurious EEXIST. Was: stale interest leaked (audit H5). |
+| `sockbufreuseport` | getsockopt reports GUEST-set values: SO_RCVBUF/SNDBUF doubled (≥2× set); SO_REUSEPORT 0 after a UDP SO_REUSEADDR widening, 1 after an explicit set. Was: host-widened values leaked (audit M4/M5; **oracle-sensitive** — validate the doubling against Docker). |
+| `rtsigtimedwaitsiginfo` | `rt_sigtimedwait` of a `sigqueue`'d signal fills si_signo + si_code(SI_QUEUE) + si_pid, not just si_signo. Was: only si_signo written (audit M9; **oracle-sensitive** — siginfo_t offsets). |
+| `fgetflcreate` | `fcntl(F_GETFL)` after open(O_CREAT\|O_TRUNC\|O_RDWR\|O_NONBLOCK) reports neither O_CREAT nor O_TRUNC, keeps the access mode + O_NONBLOCK. Was: creation flags leaked (audit M8). |
+
 **Fixed this session** (probes that flipped from gap → MATCH because the
 underlying gap got fixed):
 
