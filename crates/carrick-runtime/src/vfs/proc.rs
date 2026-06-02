@@ -56,6 +56,21 @@ pub(crate) fn is_userns_map_path(path: &str) -> bool {
     )
 }
 
+/// The per-process tunables Linux exposes read-WRITE that carrick accepts but
+/// does not act on (it has no live OOM/audit/timer-slack state). Making them
+/// writable means systemd/container managers that write them at startup get a
+/// successful write instead of EACCES/EBADF (and the warning that follows);
+/// the read keeps returning the documented default.
+pub(crate) fn is_writable_tunable_path(path: &str) -> bool {
+    matches!(
+        normalize_self_pid_path(path).as_ref(),
+        "/proc/self/oom_score_adj"
+            | "/proc/self/oom_adj"
+            | "/proc/self/loginuid"
+            | "/proc/self/timerslack_ns"
+    )
+}
+
 /// Apply a write(2) to one of the user-namespace map files. Returns the
 /// `write(2)` result: `Ok(bytes_written)` on success (the whole buffer is
 /// "consumed" per kernel behavior), or `Err(positive_errno)` (EPERM / EINVAL)
@@ -1245,11 +1260,10 @@ impl Vfs for ProcVfs {
         let Some(contents) = synthetic_file(path, &synth_ctx) else {
             return Err(crate::linux_abi::LINUX_ENOSYS);
         };
-        // The user-namespace map files are writable; the dispatcher routes
-        // write(2) on their SyntheticFile to the UserNs writers (the write-once
-        // / setgroups-gate rules live there, §4.3). All other /proc files stay
-        // read-only.
-        if flags.write && !is_userns_map_path(path) {
+        // The user-namespace map files and the rw tunables (oom_score_adj/…)
+        // are writable; the dispatcher routes write(2) on their SyntheticFile to
+        // the appropriate handler. All other /proc files stay read-only.
+        if flags.write && !is_userns_map_path(path) && !is_writable_tunable_path(path) {
             return Err(LINUX_EACCES);
         }
         Ok(VfsHandle::Bytes {
@@ -2245,6 +2259,39 @@ mod tests {
             }
             _ => panic!("expected Bytes variant, got {:?}", h),
         }
+    }
+
+    #[test]
+    fn writable_tunables_open_for_write_others_eacces() {
+        let v = ProcVfs::new();
+        for p in [
+            "/proc/self/oom_score_adj",
+            "/proc/self/oom_adj",
+            "/proc/self/loginuid",
+            "/proc/self/timerslack_ns",
+        ] {
+            let h = v.open(
+                p,
+                OpenFlags {
+                    write: true,
+                    ..Default::default()
+                },
+                &OpenContext::default(),
+            );
+            assert!(h.is_ok(), "{p} should open for write, got {h:?}");
+        }
+        // A read-only tunable (oom_score) still rejects a write-open.
+        assert_eq!(
+            v.open(
+                "/proc/self/oom_score",
+                OpenFlags {
+                    write: true,
+                    ..Default::default()
+                },
+                &OpenContext::default()
+            ),
+            Err(LINUX_EACCES)
+        );
     }
 
     #[test]
