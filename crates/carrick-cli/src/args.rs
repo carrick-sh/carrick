@@ -107,6 +107,25 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         command: SystemCommand,
     },
+    /// Log in to a container registry (like `docker login`). Stores the
+    /// credential in carrick's own config; `~/.docker/config.json` is read
+    /// read-only as a fallback and never modified.
+    Login {
+        /// Registry server (default: Docker Hub).
+        registry: Option<String>,
+        #[arg(short = 'u', long = "username")]
+        username: Option<String>,
+        #[arg(short = 'p', long = "password")]
+        password: Option<String>,
+        /// Read the password from stdin.
+        #[arg(long = "password-stdin")]
+        password_stdin: bool,
+    },
+    /// Log out of a registry (like `docker logout`) — remove its stored credential.
+    Logout {
+        /// Registry server (default: Docker Hub).
+        registry: Option<String>,
+    },
     Run {
         image: String,
         /// Target platform, e.g. `linux/amd64` or `linux/arm64`. Selects the
