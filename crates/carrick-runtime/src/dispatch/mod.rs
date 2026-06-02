@@ -1278,7 +1278,7 @@ impl SyscallDispatcher {
     /// trampoline, EL1 vectors, page tables) instead of a fixed
     /// summary. Called once after `HvfTrapEngine::map_address_space`
     /// succeeds.
-    pub fn set_address_space_regions(&mut self, regions: Vec<ProcMapsEntry>) {
+    pub fn set_address_space_regions(&self, regions: Vec<ProcMapsEntry>) {
         self.mem.lock().address_space_regions = Some(regions);
     }
 

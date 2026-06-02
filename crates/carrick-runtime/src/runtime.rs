@@ -569,7 +569,7 @@ fn maybe_fork_ns_supervisor() -> Result<Option<RunResult>, RuntimeError> {
 
 fn run_address_space_with_hvf_and_dispatcher(
     image: AddressSpace,
-    mut dispatcher: SyscallDispatcher,
+    dispatcher: SyscallDispatcher,
     max_traps: usize,
 ) -> Result<RunResult, RuntimeError> {
     // PID-namespace placement (container runs only): fork the NsSupervisor
@@ -585,13 +585,11 @@ fn run_address_space_with_hvf_and_dispatcher(
     }
     let mut trap = HvfTrapEngine::new()?;
     trap.map_address_space(&image)?;
-    // Hand the dispatcher the real region list so `/proc/self/maps`
-    // reflects the loaded ELF, runtime regions, bootstrap pages, and
-    // stack instead of the legacy hard-coded summary. Language runtimes,
-    // malloc implementations, and debuggers all parse this file.
-    dispatcher.set_address_space_regions(proc_maps_from_address_space(&image));
-    // Mirror the guest's stack auxv into /proc/self/auxv (byte-exact).
-    dispatcher.set_auxv_image(image.linux_auxv_image().to_vec());
+    // Hand the dispatcher the real region list + auxv so /proc/self/maps
+    // (regions, bootstrap pages, stack) and /proc/self/auxv reflect the loaded
+    // ELF instead of the legacy summary. Language runtimes, malloc
+    // implementations, and debuggers parse these; refreshed again on each execve.
+    apply_image_proc_state(&dispatcher, &image);
     run_threaded_hvf_loop(trap, dispatcher, max_traps)
 }
 
@@ -624,6 +622,16 @@ fn finish_and_run_image(
 /// `/proc/self/maps` renderer applies labels based on each region's
 /// start address (matching the well-known runtime bases in
 /// `crate::memory`).
+/// Refresh the dispatcher's per-image `/proc` state — `/proc/self/maps` regions
+/// and the `/proc/self/auxv` image — from a freshly loaded `AddressSpace`.
+/// Called at boot and on each `execve` so both files track the CURRENT image
+/// (previously only the boot image was reflected, leaving maps/auxv stale after
+/// a guest `execve`d a new binary). Kept as one call so the two can't drift.
+fn apply_image_proc_state(dispatcher: &SyscallDispatcher, image: &AddressSpace) {
+    dispatcher.set_address_space_regions(proc_maps_from_address_space(image));
+    dispatcher.set_auxv_image(image.linux_auxv_image().to_vec());
+}
+
 fn proc_maps_from_address_space(image: &AddressSpace) -> Vec<ProcMapsEntry> {
     image
         .regions()
@@ -850,7 +858,8 @@ where
                             new_image.regions().len() as u64,
                         );
                         dispatcher.set_executable_identity(path.clone(), proc_argv, proc_env);
-                        dispatcher.set_auxv_image(new_image.linux_auxv_image().to_vec());
+                        // Refresh /proc/self/maps + /proc/self/auxv for the new image.
+                        apply_image_proc_state(&dispatcher, &new_image);
                         dispatcher.close_cloexec_fds();
                         runtime.execve_into(&new_image)?;
                     }
@@ -1823,9 +1832,8 @@ impl ThreadRuntimeState {
                 kernel
                     .dispatcher
                     .set_executable_identity(path.clone(), proc_argv, proc_env);
-                kernel
-                    .dispatcher
-                    .set_auxv_image(img.linux_auxv_image().to_vec());
+                // Refresh /proc/self/maps + /proc/self/auxv for the new image.
+                apply_image_proc_state(&kernel.dispatcher, &img);
                 kernel.dispatcher.close_cloexec_fds();
                 engine.execve_into(&img)?;
                 Ok(())
