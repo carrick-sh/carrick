@@ -42,14 +42,41 @@ munmap only stage-1-invalidates). Files:
 **Verified:** `test_async_timeout ... ok` (was SIGSEGV). This is a broad memory-safety
 fix — ANY guest mmap'ing over a freed/dirtied no-access region was at risk.
 
-## OPEN — the next multiprocessing blocker (after the SIGSEGV fix)
+## OPEN — the next multiprocessing blocker: stage-1 PT-pool exhaustion (ROOT-CAUSED 2026-06-02b)
 
-`test_processes` now progresses past the SIGSEGV but hits:
-`carrick: trap engine failed: ... alias page-table build failed: stage-1 page-table
-pool exhausted`. The 128 MiB+ anon arena reservations exhaust the stage-1 PT pool —
-sibling of the test_mmap fix `82911cb` (map large aliases as L2 BLOCKs, not per-2 MiB
-page tables), but for the ANON large-mmap path. This is the next thing to chase for the
-multiprocessing cluster (8 of the 18 CPython DIFFs).
+`test_processes` now progresses past the SIGSEGV but dies (deterministic, reproduces on
+current main post-rosetta) with:
+`alias page-table build failed: stage-1 page-table pool exhausted`.
+
+**Root cause (CARRICK_PTPOOL gated probe at the alias build in trap.rs).** NOT the large-mmap
+path — it's an **L3-table LEAK on alias munmap**. Each guest `mmap(MAP_SHARED, fd)` of a file
+gets its OWN 2 MiB-aligned high-VA/IPA alias block (mem.rs ~405, "so no two file mappings
+share a block" — the Rosetta JIT-undef-instruction safety), so each 4 KiB MAP_SHARED file
+mapping costs **one L3 table** from the 440-entry spare pool. The multiprocessing test churns
+440+ such mappings (SemLock `/dev/shm`, Pool/Connection shared memory). The probe showed
+`in_use` climbing monotonically 413→440 with **`free=0` the whole time** (each alias 2 MiB
+apart: `va=0x10032600000`, +0x200000), until `in_use=440=cap` → `OutOfTables`. The reason
+`free` never rises: `munmap` → `unmap_range` → `PageTableManager::invalidate` → `set_prot_none`
+(page_table.rs:629) marks the leaf PTEs no-access but **does not free the now-empty L3 table**
+back to the pool (correct for the low-VA arena's use-after-munmap-faults design, WRONG for a
+high-VA alias which should be fully torn down).
+
+**Fix direction (focused, careful — this is rosetta's freshly-merged area: `6f88583`
+high-VA-anon munmap, `c205b59` newest-first overlap; verify against the Rosetta lane +
+`rosetta-demo` + the gate).** Options, best first:
+1. On alias munmap, FREE the emptied L3 table (and clear the parent L2 entry) back to the
+   pool — bounds the pool under churn. Requires distinguishing alias-munmap (true teardown +
+   free table + drop the `HvfMappedRegion` + `hv_vm_unmap` + ideally reclaim the IPA via a free
+   list, since `alias_ipa_next` is a bump cursor) from arena-munmap (keep PROT_NONE). Check
+   what `6f88583`'s high-VA munmap already does first.
+2. Pack small (<2 MiB) file aliases into a shared 2 MiB L3 table — contradicts the JIT-undef
+   safety unless gated to non-Rosetta guests; riskier.
+3. Grow the 440-page spare pool — band-aid; fails if 440+ aliases are ever LIVE at once.
+
+**Open question to resolve first:** are the 440 aliases CHURNED (created+munmap'd → leak → fix
+#1) or LIVE simultaneously (→ #2/#3)? The monotonic climb + `free=0` + the code (invalidate
+doesn't free tables) strongly imply churned+leaked; confirm by logging `unmap_range` for the
+alias VA range (does it fire, and does `free` stay 0 after?).
 
 ## WIP — regression probe (untracked, NOT committed)
 
