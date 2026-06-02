@@ -1737,6 +1737,15 @@ fn run_command_loads_static_elf_from_pulled_image_rootfs() {
             "--store",
             store.root().to_str().unwrap(),
             "run",
+            // --pid host: this test exercises image→ELF loading, not pid
+            // namespaces. The default (--pid private) forks an NsSupervisor, and
+            // on the unsigned `cargo test` binary HVF init fails *inside* the
+            // forked guest-init, whose post-fork error unwind trips a pre-existing
+            // fd double-close abort instead of the clean "Hypervisor.framework"
+            // error this test's HVF-unavailable branch expects. --pid host runs
+            // without the fork, so the error surfaces cleanly.
+            "--pid",
+            "host",
             image.canonical().as_str(),
             "/bin/cat-motd",
         ])
@@ -1809,6 +1818,11 @@ fn run_command_passes_guest_argv_stack_to_image_executable() {
             "--store",
             store.root().to_str().unwrap(),
             "run",
+            // --pid host: see run_command_loads_static_elf_from_pulled_image_rootfs
+            // — avoids the forked guest-init's HVF-init abort on the unsigned
+            // test binary so the HVF-unavailable error surfaces cleanly.
+            "--pid",
+            "host",
             image.canonical().as_str(),
             "/bin/argv-echo",
             "from-image-argv",
