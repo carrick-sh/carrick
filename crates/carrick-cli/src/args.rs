@@ -238,9 +238,28 @@ pub(crate) enum Commands {
         #[arg(required = true)]
         containers: Vec<String>,
     },
+    /// Run a command in a running container (like `docker exec`). The command
+    /// shares the container's filesystem and PID namespace. Requires the
+    /// container to have been started with `--fs host`.
     Exec {
-        context: String,
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        /// Keep STDIN open even if not attached.
+        #[arg(short = 'i', long = "interactive")]
+        interactive: bool,
+        /// Allocate a pseudo-terminal.
+        #[arg(short = 't', long = "tty")]
+        tty: bool,
+        /// Username or UID (`uid[:gid]`) to run the command as.
+        #[arg(short = 'u', long = "user", value_name = "USER")]
+        user: Option<String>,
+        /// Working directory inside the container for the command.
+        #[arg(short = 'w', long = "workdir", value_name = "DIR")]
+        workdir: Option<String>,
+        /// Set environment variables for the command (`KEY=VALUE`).
+        #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
+        env: Vec<String>,
+        /// Container id or name.
+        container: String,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
     },
     CompatReport {
