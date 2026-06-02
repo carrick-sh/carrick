@@ -912,6 +912,7 @@ impl SyscallDispatcher {
         let argv = proc.argv.clone();
         let env = proc.env.clone();
         drop(proc);
+        let open_fds = self.open_fd_numbers();
         let mem = self.mem_snapshot();
         let creds = self.cred_snapshot();
         let (sig_ignored, sig_caught, sig_shdpnd) = self.proc_status_signal_masks();
@@ -919,6 +920,7 @@ impl SyscallDispatcher {
             executable_path: Some(exec_path.as_str()),
             argv: Some(argv.as_slice()),
             environ: Some(env.as_slice()),
+            open_fds: Some(open_fds.as_slice()),
             address_space_regions: mem.address_space_regions.as_deref(),
             brk_current: mem.brk_current,
             mmap_next: mem.mmap_next,

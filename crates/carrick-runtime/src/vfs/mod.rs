@@ -221,6 +221,9 @@ pub struct OpenContext<'a> {
     pub argv: Option<&'a [String]>,
     /// Guest environment (`KEY=VALUE`, opaque bytes) for `/proc/self/environ`.
     pub environ: Option<&'a [Vec<u8>]>,
+    /// The guest's currently-open fd numbers, for the `/proc/self/fd` directory
+    /// listing. A snapshot — the listing only needs the numbers, not live state.
+    pub open_fds: Option<&'a [i32]>,
     pub address_space_regions: Option<&'a [ProcMapsEntry]>,
     pub brk_current: u64,
     pub mmap_next: u64,
