@@ -260,6 +260,17 @@ impl SyscallDispatcher {
             let mut flags = flags;
             let memory = &mut *cx.memory;
 
+            // Apple Rosetta tags pointers in bits 63:48 (a 16-bit value space)
+            // and maps its translated ELF into the x86-64 high half. Strip the
+            // tag so the request resolves into the 48-bit VA space the stage-1
+            // tables address; with TCR_EL1.TBI the guest's own accesses ignore
+            // the top byte, and TTBR1 (shared root) translates the canonical
+            // high half (bits[47:0] index the same slot as the stripped VA). The
+            // un-stripped value is kept to reject a non-canonical hint below.
+            // No-op for native (top-16-zero) guests.
+            let requested_raw = requested.0;
+            let requested = GuestPtr(requested.0 & 0x0000_FFFF_FFFF_FFFF);
+
             // io_uring ring mapping: the SQ/CQ rings and SQE array already live
             // in the guest arena (allocated by io_uring_setup); the guest maps
             // them off the ring fd with offset = IORING_OFF_*. Hand back the
@@ -550,18 +561,23 @@ impl SyscallDispatcher {
             // maps both its anon translation arena (240 TiB) and the x86 binary
             // this way.
             if crate::memory::is_high_va(address) {
-                // Addresses with bits >= 48 set are non-canonical for the 48-bit
-                // TTBR0 and can't be translated. MAP_FIXED_NOREPLACE is a hint the
-                // caller will retry without if it can't have exactly this address,
-                // so return EEXIST (Rosetta then maps into the normal arena).
-                const VA_48: u64 = 1 << 48;
-                if address >= VA_48 {
+                // Reject a genuinely non-canonical hint (bits 55:48 of the
+                // ORIGINAL address neither all-0 nor all-1). With TCR_EL1.TBI on,
+                // canonicality is decided by bits 55:48, not 63:48. A canonical
+                // high-half address is translatable via TTBR1 and is aliased
+                // below; MAP_FIXED_NOREPLACE is a hint the caller retries without.
+                let bits_55_48 = (requested_raw >> 48) & 0xff;
+                if bits_55_48 != 0x00 && bits_55_48 != 0xff {
                     if flags & LINUX_MAP_FIXED_NOREPLACE != 0 {
                         return Ok(linux_errno::EEXIST.into());
                     }
                     return Ok(LINUX_ENOMEM.into());
                 }
+                // hv_vm_map needs a 16 KiB-granular VA length; reserve the IPA in
+                // 2 MiB blocks so no two aliases share a stage-1 block (the
+                // file-backed high-VA path does the same).
                 const TWO_MIB: u64 = 1 << 21;
+                let map_len = align_up_u64(length, hvf_page).unwrap_or(length);
                 let alias_len = align_up_u64(length, TWO_MIB).unwrap_or(length);
                 let ipa = {
                     let mut mem = this.mem.lock();
@@ -576,10 +592,18 @@ impl SyscallDispatcher {
                         None => return Ok(LINUX_ENOMEM.into()),
                     }
                 };
+                // A high-VA mmap frequently overlays an earlier PROT_NONE
+                // reservation (Rosetta reserves the x86 stack/binary span anon
+                // PROT_NONE, then MAP_FIXEDs RW/file segments in). The guest's own
+                // accesses translate via the page tables map_aliased installs, but
+                // carrick's syscall-path EFAULT check consults `no_access` — clear
+                // it here, or reads/writes of guest buffers in this range (e.g.
+                // getrandom's output on the x86 stack) wrongly EFAULT.
+                memory.set_no_access(address, length_usize, prot_none);
                 return Ok(DispatchOutcome::MapHostAlias {
                     va: address,
                     ipa,
-                    len: alias_len,
+                    len: map_len,
                     payload: bytes,
                     file: None,
                 });
