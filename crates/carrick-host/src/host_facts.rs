@@ -18,6 +18,97 @@
 use std::sync::OnceLock;
 
 static LOGICAL_CPUS: OnceLock<usize> = OnceLock::new();
+static HOST_HOSTNAME: OnceLock<Option<String>> = OnceLock::new();
+
+/// The host's short hostname, sanitized to a valid Linux nodename label
+/// (RFC 1123: `[A-Za-z0-9-]`, no leading/trailing `-`, ≤63 chars), or `None`
+/// when the host name is unavailable, empty, or has no valid characters.
+/// Cached — the host hostname is stable for a run.
+///
+/// Under carrick's `--net=host` contract the guest shares the host's network
+/// identity, so this is the guest's DEFAULT hostname (the caller pairs it with a
+/// fallback for the no-host-name case): `uname(2)` nodename,
+/// `/proc/sys/kernel/hostname`, and the `/etc/hosts` self-mapping. macOS
+/// `gethostname()` returns the primary name FQDN-style (e.g. `Mac.localdomain`);
+/// we take the first label (`Mac`) as the nodename, matching how a Linux box
+/// reports its short hostname.
+pub fn host_short_hostname() -> Option<&'static str> {
+    HOST_HOSTNAME
+        .get_or_init(compute_host_short_hostname)
+        .as_deref()
+}
+
+fn compute_host_short_hostname() -> Option<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: gethostname writes at most `len` bytes; we pass len-1 to reserve a
+    // trailing NUL slot and bound the scan below.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len() - 1) };
+    if rc != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let raw = std::str::from_utf8(&buf[..end]).ok()?;
+    sanitize_short_hostname(raw)
+}
+
+/// Reduce a possibly-FQDN, possibly-decorated host name to a valid Linux
+/// nodename label: take the first DNS label (drop any `.domain` suffix), keep
+/// only `[A-Za-z0-9-]` (dropping spaces/apostrophes a macOS ComputerName may
+/// carry), trim leading/trailing hyphens, and cap at the 63-char label limit.
+/// Returns `None` if nothing valid remains (caller falls back to `carrick`).
+fn sanitize_short_hostname(raw: &str) -> Option<String> {
+    let label = raw.split('.').next().unwrap_or(raw);
+    let kept: String = label
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .collect();
+    let capped: String = kept.trim_matches('-').chars().take(63).collect();
+    let capped = capped.trim_matches('-').to_string();
+    if capped.is_empty() {
+        None
+    } else {
+        Some(capped)
+    }
+}
+
+#[cfg(test)]
+mod hostname_tests {
+    use super::sanitize_short_hostname;
+
+    #[test]
+    fn takes_short_label_and_keeps_valid_chars() {
+        assert_eq!(
+            sanitize_short_hostname("Mac.localdomain").as_deref(),
+            Some("Mac")
+        );
+        assert_eq!(
+            sanitize_short_hostname("build-box-7").as_deref(),
+            Some("build-box-7")
+        );
+    }
+
+    #[test]
+    fn drops_spaces_and_punctuation_a_computername_may_carry() {
+        // macOS ComputerName style (gethostname rarely returns this, but be safe).
+        assert_eq!(
+            sanitize_short_hostname("Tim's MacBook").as_deref(),
+            Some("TimsMacBook")
+        );
+    }
+
+    #[test]
+    fn empty_or_all_invalid_yields_none_so_caller_falls_back() {
+        assert_eq!(sanitize_short_hostname(""), None);
+        assert_eq!(sanitize_short_hostname("---"), None);
+        assert_eq!(sanitize_short_hostname(".localdomain"), None);
+    }
+
+    #[test]
+    fn caps_at_the_63_char_label_limit() {
+        let long = "a".repeat(100);
+        assert_eq!(sanitize_short_hostname(&long).unwrap().len(), 63);
+    }
+}
 
 /// Number of logical CPUs Carrick exposes to Linux guests, clamped to `[1, 1024]`.
 ///

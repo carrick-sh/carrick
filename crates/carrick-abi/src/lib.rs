@@ -731,6 +731,17 @@ impl LinuxTimezone {
     }
 }
 
+/// The guest's default UTS hostname and NIS domainname. SINGLE SOURCE OF TRUTH:
+/// `uname(2)` nodename/domainname, `/proc/sys/kernel/hostname`, and the
+/// synthesized `/etc/hosts` self-mapping all read from here, so the guest's own
+/// name resolves consistently (`gethostbyname(gethostname())` works) and there
+/// is no drift between subsystems. Under the current `--net=host` contract there
+/// is exactly one global hostname; when UTS namespaces land, a per-namespace
+/// hostname store replaces these constants at a single accessor instead of
+/// scattered string literals.
+pub const CARRICK_HOSTNAME: &str = "carrick";
+pub const CARRICK_DOMAINNAME: &str = "localdomain";
+
 #[repr(C, packed)]
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
@@ -755,11 +766,28 @@ impl LinuxUtsname {
             domainname: [0; LINUX_UTSNAME_FIELD_SIZE],
         };
         write_linux_c_field(&mut utsname.sysname, b"Linux");
-        write_linux_c_field(&mut utsname.nodename, b"carrick");
+        write_linux_c_field(&mut utsname.nodename, CARRICK_HOSTNAME.as_bytes());
         write_linux_c_field(&mut utsname.release, b"6.12.0-carrick");
         write_linux_c_field(&mut utsname.version, b"#1 Carrick");
         write_linux_c_field(&mut utsname.machine, b"aarch64");
-        write_linux_c_field(&mut utsname.domainname, b"localdomain");
+        write_linux_c_field(&mut utsname.domainname, CARRICK_DOMAINNAME.as_bytes());
+        utsname
+    }
+
+    /// Like [`carrick_aarch64`](Self::carrick_aarch64) but with a runtime-resolved
+    /// `nodename` (the guest's hostname — the macOS host's short name under
+    /// `--net=host`, or the `carrick` fallback). `uname(2)` uses this so the
+    /// reported nodename stays in lockstep with `/proc/sys/kernel/hostname` and
+    /// the `/etc/hosts` self-mapping. A nodename longer than the UTS field is
+    /// truncated to fit (NUL-terminated within the fixed buffer).
+    pub fn carrick_aarch64_with_nodename(nodename: &str) -> Self {
+        let mut utsname = Self::carrick_aarch64();
+        // Re-zero before writing: `write_linux_c_field` only copies the value
+        // bytes (it does not clear the tail), so overwriting the longer default
+        // nodename in place would leave a stale suffix (e.g. "Mac" over "carrick"
+        // → "Macrick").
+        utsname.nodename = [0; LINUX_UTSNAME_FIELD_SIZE];
+        write_linux_c_field(&mut utsname.nodename, nodename.as_bytes());
         utsname
     }
 }
