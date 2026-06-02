@@ -148,6 +148,14 @@ fn sysctl_boot_id() -> Vec<u8> {
     BOOT_ID.get_or_init(|| format_uuid_v4(random_16())).clone()
 }
 
+/// `/proc/sys/kernel/hostname`: the guest's hostname. Under carrick's
+/// `--net=host` contract this is the macOS host's short name (`carrick`
+/// fallback), kept in lockstep with uname(2) nodename and the /etc/hosts
+/// self-mapping via the single source of truth crate::execute::guest_hostname.
+fn sysctl_hostname() -> Vec<u8> {
+    format!("{}\n", crate::execute::guest_hostname()).into_bytes()
+}
+
 /// A sysctl leaf value: a fixed byte string or a per-read generator.
 enum Sysctl {
     Static(&'static [u8]),
@@ -162,9 +170,21 @@ enum Sysctl {
 const SYSCTL_TABLE: &[(&str, Sysctl)] = &[
     // kernel.*
     ("/proc/sys/kernel/ostype", Sysctl::Static(b"Linux\n")),
-    ("/proc/sys/kernel/osrelease", Sysctl::Static(b"6.6.0-carrick\n")),
-    ("/proc/sys/kernel/version", Sysctl::Static(b"#1 SMP PREEMPT_DYNAMIC\n")),
-    ("/proc/sys/kernel/hostname", Sysctl::Static(b"carrick\n")),
+    (
+        "/proc/sys/kernel/osrelease",
+        Sysctl::Static(b"6.6.0-carrick\n"),
+    ),
+    (
+        "/proc/sys/kernel/version",
+        Sysctl::Static(b"#1 SMP PREEMPT_DYNAMIC\n"),
+    ),
+    // Dynamic: the macOS host's short name under --net=host (`carrick` fallback),
+    // kept in lockstep with uname(2) nodename and the /etc/hosts self-mapping via
+    // crate::execute::guest_hostname — the single source of truth.
+    (
+        "/proc/sys/kernel/hostname",
+        Sysctl::Dynamic(sysctl_hostname),
+    ),
     // Default 64-bit Linux pid ceiling. LTP (setpgid02) reads this to bound pid
     // scans; without it tst_test aborts with ENOENT.
     ("/proc/sys/kernel/pid_max", Sysctl::Static(b"4194304\n")),
@@ -239,7 +259,10 @@ const SYSCTL_TABLE: &[(&str, Sysctl)] = &[
         "/proc/sys/net/ipv4/tcp_wmem",
         Sysctl::Static(b"4096\t16384\t4194304\n"),
     ),
-    ("/proc/sys/net/ipv4/tcp_fin_timeout", Sysctl::Static(b"60\n")),
+    (
+        "/proc/sys/net/ipv4/tcp_fin_timeout",
+        Sysctl::Static(b"60\n"),
+    ),
     (
         "/proc/sys/net/ipv4/tcp_keepalive_time",
         Sysctl::Static(b"7200\n"),
@@ -827,7 +850,8 @@ Ip6OutNoRoutes\t0\n\
 Icmp6InMsgs\t0\n\
 Icmp6OutMsgs\t0\n\
 Udp6InDatagrams\t0\n\
-Udp6OutDatagrams\t0\n".to_vec()
+Udp6OutDatagrams\t0\n"
+        .to_vec()
 }
 
 /// `/proc/net/netstat`: the `TcpExt:`/`IpExt:` label line + matching zero-value
@@ -1673,7 +1697,9 @@ fn guest_committed_vm_kb(ctx: &SyntheticProcContext, host_virtual_bytes: u64) ->
             let mut end = r.end;
             if r.start == LINUX_HEAP_BASE && ctx.brk_current > r.start && ctx.brk_current <= r.end {
                 end = ctx.brk_current;
-            } else if r.start == LINUX_MMAP_BASE && ctx.mmap_next > r.start && ctx.mmap_next <= r.end
+            } else if r.start == LINUX_MMAP_BASE
+                && ctx.mmap_next > r.start
+                && ctx.mmap_next <= r.end
             {
                 end = ctx.mmap_next;
             }
@@ -2330,8 +2356,7 @@ mod tests {
             .map(|d| (d.name, d.kind))
             .collect();
         for want in [
-            "stat", "comm", "cmdline", "status", "maps", "limits", "auxv", "io", "cgroup",
-            "statm",
+            "stat", "comm", "cmdline", "status", "maps", "limits", "auxv", "io", "cgroup", "statm",
         ] {
             assert_eq!(by_name.get(want), Some(&EntryKind::File), "file {want}");
         }
@@ -2601,7 +2626,10 @@ mod tests {
             .unwrap();
         assert_eq!(a.trim_end().len(), 36, "uuid is 36 chars: {a:?}");
         assert_eq!(a.as_bytes()[14], b'4', "version-4 nibble");
-        assert!(matches!(a.as_bytes()[19], b'8' | b'9' | b'a' | b'b'), "variant");
+        assert!(
+            matches!(a.as_bytes()[19], b'8' | b'9' | b'a' | b'b'),
+            "variant"
+        );
         assert_ne!(a, b, "uuid must differ each read");
     }
 
@@ -2623,15 +2651,16 @@ mod tests {
         let first: f64 = up.split_whitespace().next().unwrap().parse().unwrap();
         // A freshly-booted guest's uptime is small — certainly not ~1.78e9
         // (the old epoch-seconds bug).
-        assert!(first < 1_000_000.0, "uptime field 1 should be small: {up:?}");
+        assert!(
+            first < 1_000_000.0,
+            "uptime field 1 should be small: {up:?}"
+        );
     }
 
     #[test]
     fn self_stat_has_exactly_52_fields() {
-        let line = String::from_utf8(
-            synthetic_file("/proc/self/stat", &demo_ctx()).unwrap(),
-        )
-        .unwrap();
+        let line =
+            String::from_utf8(synthetic_file("/proc/self/stat", &demo_ctx()).unwrap()).unwrap();
         let n = line.trim_end().split(' ').count();
         assert_eq!(n, 52, "stat must have 52 fields: {line:?}");
     }
@@ -2744,7 +2773,8 @@ mod tests {
 
     #[test]
     fn smaps_pairs_maps_lines_with_fields() {
-        let s = String::from_utf8(synthetic_file("/proc/self/smaps", &demo_ctx()).unwrap()).unwrap();
+        let s =
+            String::from_utf8(synthetic_file("/proc/self/smaps", &demo_ctx()).unwrap()).unwrap();
         assert!(s.contains("[heap]"), "smaps includes the maps lines");
         assert!(s.contains("Rss:"), "smaps includes per-region fields");
         assert!(s.contains("VmFlags:"));
@@ -2771,7 +2801,10 @@ mod tests {
             ("/proc/swaps", "Filename"),
         ] {
             let got = String::from_utf8(synthetic_file(path, &ctx()).unwrap_or_default()).unwrap();
-            assert!(got.contains(needle), "{path} should contain {needle:?}, got {got:?}");
+            assert!(
+                got.contains(needle),
+                "{path} should contain {needle:?}, got {got:?}"
+            );
         }
     }
 
@@ -2821,7 +2854,10 @@ mod tests {
             v.lookup_nofollow("/proc/net").unwrap().kind,
             EntryKind::Directory
         );
-        assert_eq!(v.readlink("/proc/net").unwrap().to_string_lossy(), "self/net");
+        assert_eq!(
+            v.readlink("/proc/net").unwrap().to_string_lossy(),
+            "self/net"
+        );
     }
 
     #[test]
@@ -2860,7 +2896,10 @@ mod tests {
     fn self_fd_dir_lists_open_fds_as_symlinks() {
         let v = ProcVfs::new();
         // /proc/self/fd is a directory; /proc/self/fd/N lstat as a symlink.
-        assert_eq!(v.lookup("/proc/self/fd").unwrap().kind, EntryKind::Directory);
+        assert_eq!(
+            v.lookup("/proc/self/fd").unwrap().kind,
+            EntryKind::Directory
+        );
         assert_eq!(
             v.lookup_nofollow("/proc/self/fd/1").unwrap().kind,
             EntryKind::Symlink
@@ -2995,8 +3034,12 @@ mod tests {
                 EntryKind::Directory,
                 "{dir} should be a directory"
             );
-            let names: Vec<String> =
-                v.readdir(dir).unwrap().into_iter().map(|d| d.name).collect();
+            let names: Vec<String> = v
+                .readdir(dir)
+                .unwrap()
+                .into_iter()
+                .map(|d| d.name)
+                .collect();
             for want in ["dev", "tcp", "unix", "route"] {
                 assert!(names.iter().any(|n| n == want), "{dir} missing {want}");
             }
@@ -3008,10 +3051,21 @@ mod tests {
     #[test]
     fn proc_top_level_readdir_breadth() {
         let v = ProcVfs::new();
-        let names: Vec<String> =
-            v.readdir("/proc").unwrap().into_iter().map(|d| d.name).collect();
+        let names: Vec<String> = v
+            .readdir("/proc")
+            .unwrap()
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
         for want in [
-            "sys", "net", "devices", "vmstat", "swaps", "modules", "locks", "config.gz",
+            "sys",
+            "net",
+            "devices",
+            "vmstat",
+            "swaps",
+            "modules",
+            "locks",
+            "config.gz",
         ] {
             assert!(names.iter().any(|n| n == want), "/proc missing {want}");
         }
@@ -3058,6 +3112,9 @@ mod tests {
         let btime_line = stat.lines().find(|l| l.starts_with("btime ")).unwrap();
         let btime: u64 = btime_line.trim_start_matches("btime ").parse().unwrap();
         // After ~2020 and before far-future — a real epoch boot time.
-        assert!(btime > 1_600_000_000, "btime should be a recent epoch: {btime}");
+        assert!(
+            btime > 1_600_000_000,
+            "btime should be a recent epoch: {btime}"
+        );
     }
 }

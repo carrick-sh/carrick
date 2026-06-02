@@ -347,6 +347,16 @@ fn install_fs_backend(
     Ok(())
 }
 
+/// The guest's hostname under the current `--net=host` contract: the macOS
+/// host's short hostname (so the guest shares the host's network identity), or
+/// the `carrick` fallback when the host name is unavailable/empty. SINGLE
+/// accessor for `uname(2)` nodename, `/proc/sys/kernel/hostname`, and the
+/// `/etc/hosts` self-mapping — keeping them in lockstep and giving a future UTS
+/// namespace one place to override per-namespace instead of scattered literals.
+pub fn guest_hostname() -> &'static str {
+    carrick_host::host_facts::host_short_hostname().unwrap_or(crate::linux_abi::CARRICK_HOSTNAME)
+}
+
 fn seed_guest_baseline(backend: &mut dyn FsBackend, rootfs: Option<&RootFs>) {
     use std::net::ToSocketAddrs;
     for dir in [
@@ -401,6 +411,14 @@ fn seed_guest_baseline(backend: &mut dyn FsBackend, rootfs: Option<&RootFs>) {
              ff02::1\tip6-allnodes\n\
              ff02::2\tip6-allrouters\n",
         );
+        // Self-mapping so the guest's own hostname resolves
+        // (`gethostbyname(gethostname())`) — every Linux host and Docker
+        // container has this, and apps routinely look up their own name to find
+        // their IP. Debian convention: the configured hostname on a dedicated
+        // 127.0.1.1, distinct from 127.0.0.1 localhost. The name is the canonical
+        // UTS nodename so it stays in lockstep with uname(2) and
+        // /proc/sys/kernel/hostname. --net=host: one global hostname on loopback.
+        hosts_content.push_str(&format!("127.0.1.1\t{}\n", guest_hostname()));
         // Pre-resolving the Debian/Ubuntu apt mirrors here was ~8 blocking
         // getaddrinfo() calls (~80 ms via mDNSResponder) on EVERY startup — a
         // profile showed it was the #2 cost after diskutil. It predates carrick
