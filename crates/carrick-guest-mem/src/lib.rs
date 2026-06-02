@@ -72,6 +72,15 @@ pub trait GuestMemory {
         Ok(())
     }
 
+    /// `munmap` of a high-VA alias mapping: like `unmap_range`, but the HVF
+    /// backend ALSO reclaims the now-empty per-alias stage-1 sub-table back to
+    /// the spare pool (a high-VA alias is torn down completely, vs the low-VA
+    /// arena whose pages are reused in place). Default: same as `unmap_range`
+    /// (the in-memory backend has no sub-table pool to leak).
+    fn unmap_alias_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+        self.unmap_range(address, len)
+    }
+
     /// Repoint guest VA `[va, va+len)` to a slot in the boot-mapped PRIVATE
     /// overlay aperture (`overlay_ipa`, identity IPA==VA), seeding the slot with
     /// `content` first. Used for `MAP_FIXED|MAP_PRIVATE` over a shared-aperture

@@ -2972,6 +2972,9 @@ impl<M: GuestMemory, T: SyscallTrap> GuestMemory for SplitView<'_, M, T> {
     fn unmap_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
         self.mem.unmap_range(address, len)
     }
+    fn unmap_alias_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+        self.mem.unmap_alias_range(address, len)
+    }
     fn shared_futex_host_addr(&self, guest_addr: u64) -> Option<usize> {
         self.mem.shared_futex_host_addr(guest_addr)
     }
