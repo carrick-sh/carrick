@@ -790,6 +790,29 @@ impl LinuxUtsname {
         write_linux_c_field(&mut utsname.nodename, nodename.as_bytes());
         utsname
     }
+
+    /// Same as [`Self::carrick_aarch64`] but reports `machine = x86_64`. Used
+    /// for amd64 containers running under Rosetta translation, so the x86_64
+    /// guest — and Rosetta itself — sees its real emulated architecture.
+    pub fn carrick_x86_64() -> Self {
+        let mut utsname = Self::carrick_aarch64();
+        utsname.machine = [0; LINUX_UTSNAME_FIELD_SIZE];
+        write_linux_c_field(&mut utsname.machine, b"x86_64");
+        utsname
+    }
+
+    /// [`carrick_x86_64`](Self::carrick_x86_64) with a runtime-resolved
+    /// `nodename` — the Rosetta (amd64) counterpart of
+    /// [`carrick_aarch64_with_nodename`](Self::carrick_aarch64_with_nodename),
+    /// so an x86_64 guest's `uname(2)` reports both its emulated machine and the
+    /// resolved guest hostname (kept in lockstep with
+    /// `/proc/sys/kernel/hostname`).
+    pub fn carrick_x86_64_with_nodename(nodename: &str) -> Self {
+        let mut utsname = Self::carrick_x86_64();
+        utsname.nodename = [0; LINUX_UTSNAME_FIELD_SIZE];
+        write_linux_c_field(&mut utsname.nodename, nodename.as_bytes());
+        utsname
+    }
 }
 
 #[repr(C, packed)]
@@ -2416,5 +2439,15 @@ mod kernel_abi_tests {
         // Must fit at the start of sigcontext.__reserved with room for the
         // null terminator record the guest expects after it.
         assert!(LINUX_AARCH64_SIGCONTEXT_RESERVED_BYTES >= 528 + 8);
+    }
+
+    #[test]
+    fn carrick_x86_64_reports_x86_64_machine() {
+        let u = LinuxUtsname::carrick_x86_64();
+        assert!(u.machine.starts_with(b"x86_64\0"));
+        // Everything else matches the aarch64 utsname.
+        let a = LinuxUtsname::carrick_aarch64();
+        assert_eq!(u.sysname, a.sysname);
+        assert_eq!(u.release, a.release);
     }
 }
