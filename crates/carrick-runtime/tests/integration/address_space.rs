@@ -118,6 +118,24 @@ fn loaded_elf_initial_stack_includes_linux_auxv() {
     );
     assert!(auxv.contains(&(LINUX_AT_PAGESZ, 4096)));
     assert_eq!(auxv.last(), Some(&(LINUX_AT_NULL, 0)));
+
+    // The captured `/proc/self/auxv` image must be byte-identical to the auxv
+    // the guest sees on its stack (AT_RANDOM/PLATFORM/EXECFN patched to their
+    // real stack addresses, terminated by AT_NULL).
+    let image_pairs: Vec<(u64, u64)> = image
+        .linux_auxv_image()
+        .chunks_exact(16)
+        .map(|c| {
+            (
+                u64::from_le_bytes(c[0..8].try_into().unwrap()),
+                u64::from_le_bytes(c[8..16].try_into().unwrap()),
+            )
+        })
+        .collect();
+    assert_eq!(
+        image_pairs, auxv,
+        "linux_auxv_image must match the stack auxv byte-for-byte"
+    );
 }
 
 #[test]
