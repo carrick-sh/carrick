@@ -794,6 +794,15 @@ struct VcpuSnapshot {
     sctlr_el1: u64,
     tcr_el1: u64,
     ttbr0_el1: u64,
+    /// TTBR1_EL1 (upper-half root). The captured `tcr_el1` enables TTBR1
+    /// (EPD1=0) for the x86-64 high-half under Rosetta, so a fork/clone that
+    /// rebuilds the vCPU MUST also restore TTBR1_EL1 — otherwise it walks from
+    /// base 0 and every high-VA access (incl. the signal frame on a post-fork
+    /// rt_sigreturn) faults/reads garbage.
+    ttbr1_el1: u64,
+    /// ACTLR_EL1 (incl. EnTSO, set by Rosetta's prctl(PR_SET_MEM_MODEL,TSO)).
+    /// Restored across fork/clone so the rebuilt vCPU keeps hardware x86 TSO.
+    actlr_el1: u64,
     mair_el1: u64,
     vbar_el1: u64,
     cpacr_el1: u64,
@@ -2467,6 +2476,14 @@ impl HvfInner {
                 .vcpu
                 .get_sys_reg(SysReg::TTBR0_EL1)
                 .map_err(hvf_error)?,
+            ttbr1_el1: self
+                .vcpu
+                .get_sys_reg(SysReg::TTBR1_EL1)
+                .map_err(hvf_error)?,
+            actlr_el1: self
+                .vcpu
+                .get_sys_reg(SysReg::ACTLR_EL1)
+                .map_err(hvf_error)?,
             mair_el1: self.vcpu.get_sys_reg(SysReg::MAIR_EL1).map_err(hvf_error)?,
             vbar_el1: self.vcpu.get_sys_reg(SysReg::VBAR_EL1).map_err(hvf_error)?,
             cpacr_el1: self
@@ -2505,6 +2522,16 @@ impl HvfInner {
             .map_err(hvf_error)?;
         self.vcpu
             .set_sys_reg(SysReg::TTBR0_EL1, snap.ttbr0_el1)
+            .map_err(hvf_error)?;
+        // TTBR1 (upper-half, x86-64 high half under Rosetta) and ACTLR (EnTSO)
+        // are part of the guest's live state; the captured TCR enables TTBR1, so
+        // restoring TTBR0 alone would leave TTBR1 walking from base 0 and lose
+        // hardware TSO — both required for the post-fork/clone guest to run.
+        self.vcpu
+            .set_sys_reg(SysReg::TTBR1_EL1, snap.ttbr1_el1)
+            .map_err(hvf_error)?;
+        self.vcpu
+            .set_sys_reg(SysReg::ACTLR_EL1, snap.actlr_el1)
             .map_err(hvf_error)?;
         self.vcpu
             .set_sys_reg(SysReg::CPACR_EL1, snap.cpacr_el1)
@@ -3328,6 +3355,16 @@ impl HvfInner {
         self.vcpu
             .set_sys_reg(SysReg::TTBR0_EL1, snap.ttbr0_el1)
             .map_err(hvf_error)?;
+        // TTBR1 (upper-half, x86-64 high half under Rosetta) and ACTLR (EnTSO)
+        // are part of the guest's live state; the captured TCR enables TTBR1, so
+        // restoring TTBR0 alone would leave TTBR1 walking from base 0 and lose
+        // hardware TSO — both required for the post-fork/clone guest to run.
+        self.vcpu
+            .set_sys_reg(SysReg::TTBR1_EL1, snap.ttbr1_el1)
+            .map_err(hvf_error)?;
+        self.vcpu
+            .set_sys_reg(SysReg::ACTLR_EL1, snap.actlr_el1)
+            .map_err(hvf_error)?;
         self.vcpu
             .set_sys_reg(SysReg::CPACR_EL1, snap.cpacr_el1)
             .map_err(hvf_error)?;
@@ -4059,6 +4096,8 @@ mod thread_sibling_tests {
             sctlr_el1: 0x1005,
             tcr_el1: 0x2,
             ttbr0_el1: 0x40000,
+            ttbr1_el1: 0x40000,
+            actlr_el1: 0,
             mair_el1: 0xff,
             vbar_el1: 0x80000,
             cpacr_el1: 0x300000,
