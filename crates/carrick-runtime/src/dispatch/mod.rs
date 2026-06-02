@@ -153,6 +153,7 @@ use crate::linux_abi::{
     LINUX_FUTEX_CMP_REQUEUE,
     LINUX_FUTEX_LOCK_PI,
     LINUX_FUTEX_REQUEUE,
+    LINUX_FUTEX_TID_MASK,
     LINUX_FUTEX_TRYLOCK_PI,
     LINUX_FUTEX_UNLOCK_PI,
     LINUX_FUTEX_WAIT,
@@ -2209,8 +2210,6 @@ fn relative_from_absolute_timespec(tv_sec: i64, tv_nsec: i64, realtime: bool) ->
     let rel_ns = (abs_ns - now_ns).max(0);
     Duration::from_nanos(rel_ns.min(u64::MAX as i128) as u64)
 }
-
-const LINUX_FUTEX_TID_MASK: u32 = 0x3fff_ffff;
 
 fn dispatch_futex_pi(
     memory: &mut impl GuestMemory,
