@@ -921,6 +921,7 @@ impl SyscallDispatcher {
             argv: Some(argv.as_slice()),
             environ: Some(env.as_slice()),
             open_fds: Some(open_fds.as_slice()),
+            auxv: Some(mem.linux_auxv_image.as_slice()),
             address_space_regions: mem.address_space_regions.as_deref(),
             brk_current: mem.brk_current,
             mmap_next: mem.mmap_next,

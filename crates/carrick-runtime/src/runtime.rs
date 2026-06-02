@@ -590,6 +590,8 @@ fn run_address_space_with_hvf_and_dispatcher(
     // stack instead of the legacy hard-coded summary. Language runtimes,
     // malloc implementations, and debuggers all parse this file.
     dispatcher.set_address_space_regions(proc_maps_from_address_space(&image));
+    // Mirror the guest's stack auxv into /proc/self/auxv (byte-exact).
+    dispatcher.set_auxv_image(image.linux_auxv_image().to_vec());
     run_threaded_hvf_loop(trap, dispatcher, max_traps)
 }
 
@@ -848,6 +850,7 @@ where
                             new_image.regions().len() as u64,
                         );
                         dispatcher.set_executable_identity(path.clone(), proc_argv, proc_env);
+                        dispatcher.set_auxv_image(new_image.linux_auxv_image().to_vec());
                         dispatcher.close_cloexec_fds();
                         runtime.execve_into(&new_image)?;
                     }
@@ -1820,6 +1823,9 @@ impl ThreadRuntimeState {
                 kernel
                     .dispatcher
                     .set_executable_identity(path.clone(), proc_argv, proc_env);
+                kernel
+                    .dispatcher
+                    .set_auxv_image(img.linux_auxv_image().to_vec());
                 kernel.dispatcher.close_cloexec_fds();
                 engine.execve_into(&img)?;
                 Ok(())

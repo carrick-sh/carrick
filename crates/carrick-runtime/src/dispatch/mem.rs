@@ -42,6 +42,11 @@ pub(super) struct MemState {
     /// tracking `brk_current` and the mmap arena end tracking `mmap_next`)
     /// instead of the hard-coded four-line summary.
     pub address_space_regions: Option<Vec<ProcMapsEntry>>,
+    /// The exact serialized ELF auxiliary vector written to the guest stack at
+    /// exec, captured from the `AddressSpace` via
+    /// [`SyscallDispatcher::set_auxv_image`]. Mirrored to `/proc/self/auxv`.
+    /// Empty until an image with an initial stack is loaded.
+    pub linux_auxv_image: Vec<u8>,
     /// Bump cursor for the low-IPA arena backing dynamic high-VA aliases
     /// (`crate::memory::LINUX_ALIAS_IPA_BASE`). See `is_high_va`.
     pub alias_ipa_next: u64,
@@ -60,6 +65,7 @@ impl MemState {
             ),
             free_regions: Vec::new(),
             address_space_regions: None,
+            linux_auxv_image: Vec::new(),
             alias_ipa_next: crate::memory::LINUX_ALIAS_IPA_BASE,
         }
     }
