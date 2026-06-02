@@ -73,6 +73,7 @@ use crate::linux_abi::{
     LINUX_EAGAIN,
     LINUX_EALREADY,
     LINUX_EBADF,
+    LINUX_EDEADLK,
     LINUX_EEXIST,
     LINUX_EFAULT,
     LINUX_EFBIG,
@@ -150,7 +151,10 @@ use crate::linux_abi::{
     LINUX_FIONREAD,
     LINUX_FUTEX_CMD_MASK,
     LINUX_FUTEX_CMP_REQUEUE,
+    LINUX_FUTEX_LOCK_PI,
     LINUX_FUTEX_REQUEUE,
+    LINUX_FUTEX_TRYLOCK_PI,
+    LINUX_FUTEX_UNLOCK_PI,
     LINUX_FUTEX_WAIT,
     LINUX_FUTEX_WAKE,
     LINUX_IFA_ADDRESS,
@@ -524,6 +528,22 @@ pub struct ThreadCtx<'a> {
     pub tid: crate::thread::ThreadId,
     pub registry: &'a crate::thread::ThreadRegistry,
     pub futex: &'a crate::thread::FutexTable,
+}
+
+pub(super) fn guest_visible_tid(
+    tid: crate::thread::ThreadId,
+    registry: &crate::thread::ThreadRegistry,
+) -> Option<u32> {
+    let tid = u32::try_from(tid).ok()?;
+    if registry.live_count() > 1 {
+        if tid == std::process::id() {
+            Some(crate::namespace::pid::host_to_ns_or_self(tid))
+        } else {
+            Some(tid)
+        }
+    } else {
+        Some(crate::namespace::pid::self_ns_pid())
+    }
 }
 
 // `Aarch64SyscallFrame`, `GuestMemory`, and `MemoryError` were lifted into the
@@ -1813,7 +1833,7 @@ impl SyscallDispatcher {
                 registry.set_clear_child_tid(tid, addr);
                 DispatchOutcome::Returned { value: tid as i64 }
             }
-            98 => dispatch_threaded_futex(request, memory, reporter, futex),
+            98 => dispatch_threaded_futex(request, memory, reporter, futex, tid, registry),
             99 => {
                 // set_robust_list: len must equal sizeof(struct
                 // robust_list_head) (24); anything else → EINVAL (matches the
@@ -1848,20 +1868,11 @@ impl SyscallDispatcher {
                 // (> main_tid) are per-process and not ns-translated (§5.3).
                 // Mirrors the `gettid` macro handler (proc.rs). Identity when
                 // namespaces are off.
-                if registry.live_count() > 1 {
-                    let t = tid as u32;
-                    let ns = if t == std::process::id() {
-                        crate::namespace::pid::host_to_ns_or_self(t)
-                    } else {
-                        t
-                    };
-                    DispatchOutcome::Returned {
-                        value: i64::from(ns),
-                    }
-                } else {
-                    DispatchOutcome::Returned {
-                        value: i64::from(crate::namespace::pid::self_ns_pid()),
-                    }
+                let Some(tid) = guest_visible_tid(tid, registry) else {
+                    return Some(Ok(LINUX_EINVAL.into()));
+                };
+                DispatchOutcome::Returned {
+                    value: i64::from(tid),
                 }
             }
             _ => DispatchOutcome::Errno {
@@ -2199,11 +2210,65 @@ fn relative_from_absolute_timespec(tv_sec: i64, tv_nsec: i64, realtime: bool) ->
     Duration::from_nanos(rel_ns.min(u64::MAX as i128) as u64)
 }
 
+const LINUX_FUTEX_TID_MASK: u32 = 0x3fff_ffff;
+
+fn dispatch_futex_pi(
+    memory: &mut impl GuestMemory,
+    address: u64,
+    command: u64,
+    word: u32,
+    tid: u32,
+    futex: Option<&crate::thread::FutexTable>,
+) -> DispatchOutcome {
+    if tid == 0 || tid > LINUX_FUTEX_TID_MASK {
+        return DispatchOutcome::Errno {
+            errno: LINUX_EINVAL,
+        };
+    }
+
+    let owner = word & LINUX_FUTEX_TID_MASK;
+    match command {
+        LINUX_FUTEX_LOCK_PI | LINUX_FUTEX_TRYLOCK_PI => {
+            if owner == 0 {
+                if let Err(errno) = write_u32(memory, address, tid) {
+                    return DispatchOutcome::Errno { errno };
+                }
+                return DispatchOutcome::Returned { value: 0 };
+            }
+            if owner == tid {
+                return DispatchOutcome::Errno {
+                    errno: LINUX_EDEADLK,
+                };
+            }
+            DispatchOutcome::Errno {
+                errno: LINUX_EAGAIN,
+            }
+        }
+        LINUX_FUTEX_UNLOCK_PI => {
+            if owner != tid {
+                return DispatchOutcome::Errno { errno: LINUX_EPERM };
+            }
+            if let Err(errno) = write_u32(memory, address, 0) {
+                return DispatchOutcome::Errno { errno };
+            }
+            if let Some(futex) = futex {
+                let _ = futex.wake(address, 1);
+            }
+            DispatchOutcome::Returned { value: 0 }
+        }
+        _ => DispatchOutcome::Errno {
+            errno: LINUX_ENOSYS,
+        },
+    }
+}
+
 fn dispatch_threaded_futex(
     request: SyscallRequest,
-    memory: &impl GuestMemory,
+    memory: &mut impl GuestMemory,
     reporter: &CompatReporter,
     futex: &crate::thread::FutexTable,
+    tid: crate::thread::ThreadId,
+    registry: &crate::thread::ThreadRegistry,
 ) -> DispatchOutcome {
     let address = request.arg(0);
     let operation = request.arg(1);
@@ -2230,6 +2295,18 @@ fn dispatch_threaded_futex(
         Ok(word) => word,
         Err(errno) => return DispatchOutcome::Errno { errno },
     };
+
+    if matches!(
+        command,
+        LINUX_FUTEX_LOCK_PI | LINUX_FUTEX_TRYLOCK_PI | LINUX_FUTEX_UNLOCK_PI
+    ) {
+        let Some(guest_tid) = guest_visible_tid(tid, registry) else {
+            return DispatchOutcome::Errno {
+                errno: LINUX_EINVAL,
+            };
+        };
+        return dispatch_futex_pi(memory, address, command, word, guest_tid, Some(futex));
+    }
 
     if !futex_flags.contains(LinuxFutexFlags::PRIVATE) {
         reporter.record(crate::compat::CompatEvent::partial_syscall(
@@ -3346,6 +3423,16 @@ pub(super) fn read_u32(memory: &impl GuestMemory, address: u64) -> Result<u32, i
     Ok(u32::from_ne_bytes(
         bytes.as_slice().try_into().map_err(|_| LINUX_EFAULT)?,
     ))
+}
+
+pub(super) fn write_u32(
+    memory: &mut impl GuestMemory,
+    address: u64,
+    value: u32,
+) -> Result<(), i32> {
+    memory
+        .write_bytes(address, &value.to_ne_bytes())
+        .map_err(|_| LINUX_EFAULT)
 }
 
 fn read_itimerspec(memory: &impl GuestMemory, address: u64) -> Result<LinuxItimerspec, i32> {
