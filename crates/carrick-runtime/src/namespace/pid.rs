@@ -167,29 +167,107 @@ pub fn alloc_region() -> bool {
     if !REGION.load(Ordering::Acquire).is_null() {
         return true;
     }
+    // A DETACHED container backs its region with a FILE under its registry dir
+    // so an outside process (`carrick exec`) can `mmap` the same region and join
+    // the namespace. Foreground / non-detached runs use an anonymous mapping —
+    // fork-coherent, but not externally attachable.
+    map_region(detached_region_path().as_deref(), true)
+}
+
+/// Attach an EXISTING file-backed region (for `carrick exec`): `mmap` the
+/// container's region file as a new member. Does NOT seed the pid allocator —
+/// the region already holds the container's live state. Returns `false` on any
+/// failure (the caller must not run outside the namespace).
+pub fn attach_region(path: &std::path::Path) -> bool {
+    map_region(Some(path), false)
+}
+
+/// Core region mapper: map the region (file-backed for a detached container,
+/// else anonymous) and publish it to the process-global [`REGION`]. `seed`
+/// seeds the pid allocator for a freshly-created region; `seed = false` attaches
+/// an existing one. Idempotent.
+fn map_region(path: Option<&std::path::Path>, seed: bool) -> bool {
+    if !REGION.load(Ordering::Acquire).is_null() {
+        return true;
+    }
+    match map_region_ptr(path, seed) {
+        Some(region) => {
+            REGION.store(region, Ordering::Release);
+            true
+        }
+        None => false,
+    }
+}
+
+/// `mmap` the region — file-backed (`MAP_SHARED` over the file, created and
+/// `set_len`-sized when `seed`) when `path` is `Some`, else `MAP_ANON` — and
+/// return the pointer WITHOUT publishing it to the global. The seam the unit
+/// test maps two independent views through to prove file-backed coherence.
+fn map_region_ptr(path: Option<&std::path::Path>, seed: bool) -> Option<*mut NsSharedRegion> {
+    use std::os::fd::IntoRawFd;
     let size = std::mem::size_of::<NsSharedRegion>();
-    // SAFETY: a standard anonymous shared mapping; size is the exact struct
-    // size; the kernel zero-initializes the pages (so every AtomicU32 starts 0).
+    let (flags, fd) = match path {
+        Some(p) => {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.read(true).write(true);
+            if seed {
+                opts.create(true);
+            }
+            let file = opts.open(p).ok()?;
+            // Size the backing file for a fresh region (set_len zero-fills).
+            if seed && file.set_len(size as u64).is_err() {
+                return None;
+            }
+            (libc::MAP_SHARED, file.into_raw_fd())
+        }
+        None => (libc::MAP_SHARED | libc::MAP_ANON, -1),
+    };
+    // SAFETY: `mmap` of exactly the struct size. File-backed (fd ≥ 0, zero-filled
+    // by set_len for a fresh region) or anonymous (kernel zero-fills). The
+    // mapping keeps the file alive, so the fd is closed immediately after.
     let ptr = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
             size,
             libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_SHARED | libc::MAP_ANON,
-            -1,
+            flags,
+            fd,
             0,
         )
     };
+    if fd >= 0 {
+        // SAFETY: the mapping holds the file; the fd is no longer needed.
+        unsafe {
+            libc::close(fd);
+        }
+    }
     if ptr == libc::MAP_FAILED {
-        return false;
+        return None;
     }
     let region = ptr.cast::<NsSharedRegion>();
-    // SAFETY: valid writable mapping of exactly this struct; seed the allocator.
-    unsafe {
-        (*region).next_pid.store(2, Ordering::Relaxed);
+    if seed {
+        // SAFETY: valid writable mapping of exactly this struct.
+        unsafe {
+            (*region).next_pid.store(2, Ordering::Relaxed);
+        }
     }
-    REGION.store(region, Ordering::Release);
-    true
+    Some(region)
+}
+
+/// For a detached container (`CARRICK_CONTAINER_ID` set), the region file path
+/// `<registry>/<id>/region`, recording it into the registry so `carrick exec`
+/// can `attach_region` to it. `None` for a foreground / non-detached run.
+fn detached_region_path() -> Option<std::path::PathBuf> {
+    let id = std::env::var("CARRICK_CONTAINER_ID").ok()?;
+    if !crate::container::is_safe_id(&id) {
+        return None;
+    }
+    let path = crate::container::container_dir(&id).join("region");
+    if let Ok(mut state) = crate::container::ContainerState::load(&id) {
+        state.config.region_path = Some(path.to_string_lossy().into_owned());
+        let _ = state.persist();
+    }
+    Some(path)
 }
 
 /// Record the init's host pid (ns-pid 1) in an already-allocated region and
@@ -643,6 +721,29 @@ mod tests {
     // the signed build. They are gated to run serially via a fresh region per
     // test would be ideal, but the region is a process-global; so each test
     // uses the global region after init and asserts on its own pids.
+
+    #[test]
+    fn file_backed_region_is_shared_across_independent_mappings() {
+        // exec relies on this: a fresh `mmap` of the container's region FILE
+        // (by an outside process) sees the same state as the container's
+        // mapping. Two independent file-backed `MAP_SHARED` views of one file
+        // are coherent; two anonymous mappings would not be. Uses the
+        // pointer-returning seam so it never touches the process-global REGION.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("region");
+        let size = std::mem::size_of::<NsSharedRegion>();
+        let a = map_region_ptr(Some(&path), true).expect("alloc file-backed region");
+        // SAFETY: `a` is a valid mapping of exactly one NsSharedRegion.
+        unsafe { (*a).next_pid.store(4242, Ordering::Relaxed) };
+        let b = map_region_ptr(Some(&path), false).expect("attach the region file");
+        // SAFETY: `b` is an independent valid mapping of the same file.
+        assert_eq!(unsafe { (*b).next_pid.load(Ordering::Relaxed) }, 4242);
+        // SAFETY: unmap both mappings we created.
+        unsafe {
+            libc::munmap(a.cast(), size);
+            libc::munmap(b.cast(), size);
+        }
+    }
 
     #[test]
     fn pidns_descriptors() {
