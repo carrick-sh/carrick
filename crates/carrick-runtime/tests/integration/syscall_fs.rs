@@ -2682,7 +2682,7 @@ fn openat_reads_synthetic_proc_maps_and_cpuinfo() {
     let cpuinfo =
         String::from_utf8(memory.read_bytes(0x4500, cpuinfo_len as usize).unwrap()).unwrap();
     assert!(cpuinfo.contains("processor\t: 0"));
-    assert!(cpuinfo.contains("CPU architecture\t: 8"));
+    assert!(cpuinfo.contains("CPU architecture: 8"));
     assert!(cpuinfo.contains("Features\t:"));
 
     let report = reporter.finish();
@@ -2711,7 +2711,9 @@ fn synthetic_proc_surface_serves_common_process_and_system_files() {
         ("/proc/self/status", b"Name:\texe"),
         ("/proc/sys/kernel/osrelease", b"carrick"),
         ("/proc/sys/kernel/hostname", b"carrick"),
-        ("/proc/sys/kernel/random/boot_id", b"-4000-8000-"),
+        // boot_id is now a random v4 UUID (was an all-zero sentinel); the only
+        // value-stable marker is the version-4 nibble at the 3rd group.
+        ("/proc/sys/kernel/random/boot_id", b"-4"),
     ];
 
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
@@ -2838,7 +2840,10 @@ fn synthetic_proc_files_write_regular_packed_stat_records() {
 
 #[test]
 fn missing_proc_file_records_compat_report_entry() {
-    let mut memory = LinearMemory::new(0x4000, b"/proc/self/io\0".to_vec());
+    // /proc/self/sched is unserved by carrick (and ENOENT in the Docker oracle
+    // too), so it stands in as a still-unimplemented proc path for the
+    // compat-report wiring.
+    let mut memory = LinearMemory::new(0x4000, b"/proc/self/sched\0".to_vec());
     let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
@@ -2856,7 +2861,7 @@ fn missing_proc_file_records_compat_report_entry() {
     assert_eq!(outcome, DispatchOutcome::Errno { errno: 2 });
     let report = reporter.finish();
     assert!(report.unhandled_syscalls.is_empty());
-    assert_eq!(report.proc_read_unimplemented[0].path, "/proc/self/io");
+    assert_eq!(report.proc_read_unimplemented[0].path, "/proc/self/sched");
     assert_eq!(report.proc_read_unimplemented[0].count, 1);
 }
 
