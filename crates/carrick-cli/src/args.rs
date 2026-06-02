@@ -125,9 +125,9 @@ pub(crate) enum Commands {
         /// Set environment variables
         #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
         env: Vec<String>,
-        /// Read in a file of environment variables
+        /// Read in a file of environment variables (may be repeated)
         #[arg(long = "env-file", value_name = "FILE")]
-        env_file: Option<PathBuf>,
+        env_file: Vec<PathBuf>,
         /// Working directory inside the container
         #[arg(short = 'w', long = "workdir", value_name = "DIR")]
         workdir: Option<String>,

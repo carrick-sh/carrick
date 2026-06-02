@@ -96,10 +96,19 @@ pub fn resolve_run_spec(req: CliRunRequest, image: ResolvedImage) -> Result<RunS
             .or_insert_with(|| v.to_string());
     }
 
-    // Add env overrides (last-wins)
+    // Add env overrides (last-wins). A bare `KEY` (no `=`) imports the value
+    // from the HOST environment, matching docker's `-e KEY` / env-file semantics;
+    // an unset host var contributes nothing (docker drops it too).
     for entry in &req.env_overrides {
-        if let Some((k, v)) = entry.split_once('=') {
-            env_map.insert(k.to_string(), v.to_string());
+        match entry.split_once('=') {
+            Some((k, v)) => {
+                env_map.insert(k.to_string(), v.to_string());
+            }
+            None => {
+                if let Ok(v) = std::env::var(entry) {
+                    env_map.insert(entry.to_string(), v);
+                }
+            }
         }
     }
 
@@ -286,6 +295,41 @@ mod tests {
         let image = make_test_image(None, Some(vec!["/bin/ls".into()]), vec![], None);
         let spec = resolve_run_spec(base_req(None), image).unwrap();
         assert_eq!((spec.uid, spec.gid), (0, 0));
+    }
+
+    #[test]
+    fn bare_env_key_imports_host_value() {
+        // SAFETY: test setup; the unique key avoids racing other tests' env.
+        unsafe { std::env::set_var("CARRICK_TEST_IMPORT_XYZ", "from-host") };
+        let image = make_test_image(None, Some(vec!["/bin/ls".into()]), vec![], None);
+        let mut req = base_req(None);
+        req.env_overrides = vec!["CARRICK_TEST_IMPORT_XYZ".to_string()];
+        let spec = resolve_run_spec(req, image).unwrap();
+        unsafe { std::env::remove_var("CARRICK_TEST_IMPORT_XYZ") };
+        assert!(
+            spec.envp
+                .iter()
+                .any(|e| e == "CARRICK_TEST_IMPORT_XYZ=from-host"),
+            "bare `-e KEY` should import the host value; envp={:?}",
+            spec.envp
+        );
+    }
+
+    #[test]
+    fn cleared_entrypoint_runs_cmd_only() {
+        // `--entrypoint ""` (lowered to Some(vec![]) by the CLI) clears the image
+        // entrypoint, leaving only the command.
+        let image = make_test_image(
+            Some(vec!["/bin/sh".into()]),
+            Some(vec!["echo".into(), "hi".into()]),
+            vec![],
+            None,
+        );
+        let mut req = base_req(None);
+        req.entrypoint_override = Some(vec![]);
+        req.args = vec![];
+        let spec = resolve_run_spec(req, image).unwrap();
+        assert_eq!(spec.argv, vec!["echo", "hi"]);
     }
 
     #[test]
