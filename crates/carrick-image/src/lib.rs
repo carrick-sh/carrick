@@ -18,6 +18,8 @@ use tokio::fs;
 
 pub use carrick_spec::{ImageConfig, ImageReference, OciBootstrapError};
 
+pub mod auth;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageStore {
     root: PathBuf,
@@ -246,6 +248,27 @@ fn build_oci_client_for(target: &PlatformTarget) -> Client {
     Client::new(config)
 }
 
+/// Verify a Basic credential against `registry` via the OCI auth handshake (for
+/// `carrick login`). Lives here because the OCI `Client` builder is crate-private.
+/// A 404 on the probe repo AFTER a successful auth still counts as success.
+pub async fn verify_login(
+    registry: &str,
+    username: &str,
+    password: &str,
+) -> Result<(), OciBootstrapError> {
+    let client = build_oci_client_for(&PlatformTarget::default_target());
+    let probe = format!("{}/library/hello-world", registry.trim_end_matches('/'));
+    let reference: oci_client::Reference = probe
+        .parse()
+        .map_err(|e| OciBootstrapError::Auth(format!("invalid registry {registry:?}: {e}")))?;
+    let auth = RegistryAuth::Basic(username.to_string(), password.to_string());
+    client
+        .auth(&reference, &auth, oci_client::RegistryOperation::Pull)
+        .await
+        .map(|_| ())
+        .map_err(|e| OciBootstrapError::Auth(format!("login to {registry} failed: {e}")))
+}
+
 pub async fn pull_image(
     image: &ImageReference,
     store: &ImageStore,
@@ -263,10 +286,13 @@ pub async fn pull_image_with_platform(
     target: &PlatformTarget,
 ) -> Result<PullSummary, OciBootstrapError> {
     let client = build_oci_client_for(target);
+    // Resolve per-registry credentials (carrick config, then ~/.docker), keyed on
+    // the image's registry; Anonymous when none. Same store the CLI writes to.
+    let auth = auth::resolve_auth(store.root(), image.registry())?;
     let mut data = client
         .pull(
             image.as_oci_reference(),
-            &RegistryAuth::Anonymous,
+            &auth,
             vec![
                 IMAGE_LAYER_MEDIA_TYPE,
                 IMAGE_LAYER_GZIP_MEDIA_TYPE,

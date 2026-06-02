@@ -299,6 +299,36 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             SystemCommand::Df => crate::lifecycle::system_df(&store)?,
             SystemCommand::Prune { force: _ } => crate::lifecycle::system_prune(&store)?,
         },
+        Commands::Login {
+            registry,
+            username,
+            password,
+            password_stdin,
+        } => {
+            let registry = registry.unwrap_or_else(|| "docker.io".to_string());
+            let username =
+                username.context("a username is required (-u/--username)")?;
+            let password = if password_stdin {
+                use std::io::Read;
+                let mut s = String::new();
+                std::io::stdin().read_to_string(&mut s)?;
+                s.trim_end_matches(['\n', '\r']).to_string()
+            } else {
+                password.context("a password is required (-p/--password or --password-stdin)")?
+            };
+            // Verify against the registry (like docker login), then persist.
+            block_on_oci(carrick_image::verify_login(&registry, &username, &password))?;
+            carrick_image::auth::write_login(store.root(), &registry, &username, &password)?;
+            println!("Login Succeeded");
+        }
+        Commands::Logout { registry } => {
+            let registry = registry.unwrap_or_else(|| "docker.io".to_string());
+            if carrick_image::auth::remove_login(store.root(), &registry)? {
+                println!("Removing login credentials for {registry}");
+            } else {
+                println!("Not logged in to {registry}");
+            }
+        }
         Commands::Tag { source, target } => {
             let src = ImageReference::parse(&source)
                 .with_context(|| format!("invalid source image {source:?}"))?;

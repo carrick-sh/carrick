@@ -371,6 +371,7 @@ dependencies = [
 name = "carrick-image"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "camino",
  "carrick-spec",
  "oci-client",
