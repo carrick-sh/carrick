@@ -1337,7 +1337,12 @@ impl SyscallDispatcher {
         proc.argv = vec![path];
     }
 
-    pub fn set_executable_identity(&self, path: impl Into<String>, argv: Vec<String>) {
+    pub fn set_executable_identity(
+        &self,
+        path: impl Into<String>,
+        argv: Vec<String>,
+        env: Vec<Vec<u8>>,
+    ) {
         let path = path.into();
         // `/proc/self/exe` MUST resolve to an absolute path: the Linux kernel
         // always stores the absolute, resolved executable path regardless of how
@@ -1356,6 +1361,7 @@ impl SyscallDispatcher {
         let mut proc = self.proc.lock();
         proc.executable_path = abs.clone();
         proc.argv = if argv.is_empty() { vec![abs] } else { argv };
+        proc.env = env;
     }
 
     /// Name of the currently-installed backend (for logging / debug).
@@ -2977,6 +2983,7 @@ impl SyscallDispatcher {
         crate::vfs::SyntheticProcContext {
             executable_path: proc.executable_path.clone(),
             argv: proc.argv.clone(),
+            environ: proc.env.clone(),
             address_space_regions: mem.address_space_regions,
             brk_current: mem.brk_current,
             mmap_next: mem.mmap_next,

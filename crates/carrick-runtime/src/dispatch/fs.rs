@@ -897,6 +897,7 @@ impl SyscallDispatcher {
         let proc = self.proc.lock();
         let exec_path = proc.executable_path.clone();
         let argv = proc.argv.clone();
+        let env = proc.env.clone();
         drop(proc);
         let mem = self.mem_snapshot();
         let creds = self.cred_snapshot();
@@ -904,6 +905,7 @@ impl SyscallDispatcher {
         let ctx = crate::vfs::OpenContext {
             executable_path: Some(exec_path.as_str()),
             argv: Some(argv.as_slice()),
+            environ: Some(env.as_slice()),
             address_space_regions: mem.address_space_regions.as_deref(),
             brk_current: mem.brk_current,
             mmap_next: mem.mmap_next,
