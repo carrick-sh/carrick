@@ -86,16 +86,32 @@ numeric sort, **fork+exec ×200** (exercises the fork fix), **SIGUSR1 trap+handl
 base64 round-trip, `wc -c`/`wc -l`. The translation core is sound.
 
 ### Open items
-- **(R, Rosetta-specific, OPEN) `cat -n` mistranslates.** Deterministic: `cat -n`
-  of even a 3-line file emits the line number then spaces instead of the line
-  body (and dash misparses `/usr/bin/gunzip` → "line 33: unterminated quoted
-  string"), while plain `cat`/`wc -l`/`od`/`md5sum`/`sed` read the SAME bytes
-  correctly (md5 identical to arm64) and synthetic multi-line-quote scripts parse
-  fine. So it's not fs/read corruption and not `memchr` (wc -l is correct) — it's
-  the coreutils `-n` formatting / dash tokenizer code path producing wrong output
-  under translation. Suspects to pursue with the trace skill: pointer-tag handling
-  on the content pointer, or carrick's EL0 ID-register values steering a bad
-  Rosetta JIT path. Needs dtrace on the translated execution to localize.
+- **(R, carrick high-VA alias bug, OPEN — needs robust fix) syscall writes to an
+  mmap'd buffer land at the wrong backing.** Symptom: `cat -n` (any `cat` option)
+  emits the line number then NUL bytes instead of the line body; dash misparses
+  `/usr/bin/gunzip`. **Confirmed carrick's, not Apple's:** the SAME ubuntu `cat`
+  under Docker's Rosetta is correct — only carrick corrupts it. **Localized:**
+  forcing glibc to brk (`MALLOC_MMAP_THRESHOLD_=big`) FIXES `cat -n`; the bug only
+  hits buffers glibc serves via `mmap` (high-VA alias under Rosetta x86_64). It's
+  the same class as the `uname`-NUL bug: carrick's `read()` writes the file bytes
+  via `mapping_for_range_mut` (VA→region, linear `host_addr + (va - start)`,
+  newest-first), but the guest reads via its stage-1 page tables (VA→IPA→host).
+  When those disagree the guest reads zeros. **Direct measurement** (CARRICK_ALIAS_DEBUG
+  diag, now reverted): cat's inbuf `0x7fffff525000` is in alias region B
+  (`start=0x7fffff524000 ipa=0x1821000000`), but region A
+  (`start=0x7fffff482000 len=0xa2000`) had `end = va + hostsize` where hostsize is
+  the 16 KiB-rounded `0xa4000` — so A's `end` over-claimed 8 KiB into B's VA span,
+  and newest-first picked A. The guest's stage-1 (leaf IPA `0x1821001000`) pointed
+  to B. **A one-line fix** (`end: va + len`, exact stage-1 coverage) FIXES `cat -n`
+  but REGRESSES `tac` (`seq 1 100000 | tac | head -1` → 8635 not 100000), so it is
+  NOT safe — `tac` exposes a second facet of the same VA→host-vs-stage-1 mismatch.
+  **The robust fix** is to resolve syscall memory access through the guest's actual
+  stage-1 walk (VA→IPA, then IPA→host by the region owning that IPA), instead of
+  the linear `region.start..end` heuristic — guaranteeing carrick reads/writes
+  exactly where the guest does, for overlaps, 16 KiB rounding, and the non-linear
+  static Rosetta window alike. That is a meaty, hot-path change deferred for its
+  own careful cycle. (The trivial `end: va + len` change is captured here but was
+  reverted because of the `tac` regression.)
 - **(syscall workstream, not Rosetta layer) `FUTEX_LOCK_PI_PRIVATE` → ENOSYS.**
   `grep` aborts with `rosetta error: futex(FUTEX_LOCK_PI_PRIVATE) failure: 38`;
   the Rosetta runtime needs priority-inheritance futexes. carrick returns ENOSYS.
