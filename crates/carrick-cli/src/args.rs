@@ -92,9 +92,15 @@ pub(crate) enum Commands {
         /// See `run-elf --debug-state-path`.
         #[arg(long = "debug-state-path")]
         debug_state_path: Option<PathBuf>,
-        /// Suppress the JSON compat-report envelope.
+        /// Deprecated/no-op: the default `run` output is now docker-shaped
+        /// (streamed stdio + the container's exit code). Kept so existing
+        /// `--raw` invocations keep working; use `--json` for the old envelope.
         #[arg(long)]
         raw: bool,
+        /// Emit the JSON compat-report envelope (exit code, traps, report) on
+        /// stdout instead of behaving like `docker run`. Opt-in; off by default.
+        #[arg(long)]
+        json: bool,
         /// Allocate a pseudo-terminal and run interactively (like `docker run -it`).
         #[arg(short = 't', long = "tty")]
         tty: bool,

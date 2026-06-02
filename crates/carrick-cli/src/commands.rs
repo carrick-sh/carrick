@@ -44,6 +44,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 max_traps: DEFAULT_MAX_TRAPS,
                 debug_state_path: None,
                 raw: !interactive,
+                json: false,
                 tty: interactive,
                 interactive,
                 fs: None,
@@ -238,6 +239,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             max_traps,
             debug_state_path,
             raw,
+            json,
             tty,
             interactive,
             fs,
@@ -319,41 +321,58 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             let engine = carrick_engine::Engine::new(store.clone());
             let result = block_on_oci(async { engine.run(req.clone()).await })?;
 
+            // The container's host exit status: its real exit code, or 1 when
+            // the guest hit the trap limit without exiting. Docker propagates
+            // the container's exit code as its own; carrick now does the same on
+            // every non-interactive path (previously the default path returned
+            // Ok and exited 0 regardless — the inverse of docker for `false`).
+            let status = if result.trap_limit_hit {
+                1
+            } else {
+                result.exit_code
+            };
+
+            // Interactive / tty: the guest's stdio already went straight to the
+            // terminal; nothing to emit, just take the exit code.
             if tty || interactive {
-                std::process::exit(if result.trap_limit_hit {
-                    1
-                } else {
-                    result.exit_code
-                });
-            } else if raw {
-                emit_raw(&result);
-                std::process::exit(if result.trap_limit_hit {
-                    1
-                } else {
-                    result.exit_code
-                });
+                std::process::exit(status);
             }
 
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "image": req.image_ref,
-                    "command": req.args,
-                    "store": store.root(),
-                    "exit_code": result.exit_code,
-                    "stdout": String::from_utf8_lossy(&result.stdout),
-                    "stderr": String::from_utf8_lossy(&result.stderr),
-                    "traps": result.traps,
-                    "trap_limit_hit": result.trap_limit_hit,
-                    "report": result.report,
-                }))?
-            );
+            // `--json`: opt into the legacy compat-report envelope on stdout.
+            // Output already streamed live during the run (the engine runs every
+            // container with raw/streaming stdio), so the envelope's stdout/
+            // stderr fields are informational only.
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "image": req.image_ref,
+                        "command": req.args,
+                        "store": store.root(),
+                        "exit_code": result.exit_code,
+                        "stdout": String::from_utf8_lossy(&result.stdout),
+                        "stderr": String::from_utf8_lossy(&result.stderr),
+                        "traps": result.traps,
+                        "trap_limit_hit": result.trap_limit_hit,
+                        "report": result.report,
+                    }))?
+                );
+                std::process::exit(status);
+            }
+
+            // Default (and the back-compat `--raw`): behave like `docker run`.
+            // The guest's stdout/stderr already streamed byte-exact; flush any
+            // residual buffered bytes, surface a trap-limit failure on stderr
+            // (never polluting stdout), and exit with the container's code.
+            let _ = raw; // `--raw` is now the default behavior; accepted for compat.
+            emit_raw(&result);
             if result.trap_limit_hit {
-                bail!(
-                    "guest did not exit after {} traps (compat report above)",
+                eprintln!(
+                    "carrick: guest did not exit after {} traps (re-run with --json for the compat report)",
                     result.traps
                 );
             }
+            std::process::exit(status);
         }
         // `Shell` is normalised to `Run` (interactive /bin/sh) before this
         // match, so it is never reached here.
