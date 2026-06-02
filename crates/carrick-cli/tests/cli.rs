@@ -1745,7 +1745,11 @@ fn run_command_loads_static_elf_from_pulled_image_rootfs() {
 
     if output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("\"exit_code\": 0"));
+        // Default `run` is now docker-shaped: streamed stdout, no JSON envelope.
+        assert!(
+            !stdout.contains("\"exit_code\""),
+            "default run must not emit the JSON envelope:\n{stdout}"
+        );
         assert!(stdout.contains("rootfs says hello"));
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1814,8 +1818,13 @@ fn run_command_passes_guest_argv_stack_to_image_executable() {
 
     if output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("\"exit_code\": 0"));
-        assert!(stdout.contains("from-image-argv\\n"));
+        // Default `run` is now docker-shaped: streamed stdout (a real newline,
+        // not the JSON-escaped envelope), and no envelope keys.
+        assert!(
+            !stdout.contains("\"exit_code\""),
+            "default run must not emit the JSON envelope:\n{stdout}"
+        );
+        assert!(stdout.contains("from-image-argv"));
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
