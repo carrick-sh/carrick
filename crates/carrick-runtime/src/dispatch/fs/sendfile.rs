@@ -70,6 +70,36 @@ impl SyscallDispatcher {
     }
 
     #[cfg(target_os = "macos")]
+    /// True iff `a` and `b` refer to the SAME underlying file — the same fd, or
+    /// two host fds on the same `(st_dev, st_ino)`. Used by `copy_file_range` to
+    /// reject an overlapping copy onto the same file (Linux returns EINVAL). A
+    /// non-host description, or a host `fstat` failure, is treated as "cannot
+    /// prove same file" (false) so a legitimate distinct-file copy is never
+    /// rejected.
+    pub(super) fn copy_same_file(&self, a: i32, b: i32) -> bool {
+        if a == b {
+            return true;
+        }
+        match (self.host_fd_dev_ino(a), self.host_fd_dev_ino(b)) {
+            (Some(x), Some(y)) => x == y,
+            _ => false,
+        }
+    }
+
+    fn host_fd_dev_ino(&self, fd: i32) -> Option<(i64, u64)> {
+        let open_file = self.open_file(fd)?;
+        let open = open_file.description.read();
+        let OpenDescription::HostFile { host_fd, .. } = &*open else {
+            return None;
+        };
+        let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe { libc::fstat(*host_fd, st.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        let st = unsafe { st.assume_init() };
+        Some((st.st_dev as i64, st.st_ino as u64))
+    }
+
     fn host_file_copy_info(&self, fd: i32) -> Option<HostFileCopyInfo> {
         let open_file = self.open_file(fd)?;
         let open = open_file.description.read();
