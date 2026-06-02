@@ -4843,20 +4843,70 @@ impl SyscallDispatcher {
                 if let Some(errno) = this.splice_output_errno(out_fd.0) {
                     return Ok(errno.into());
                 }
-                let mut buf = vec![0u8; count];
-                // MSG_DONTWAIT keeps this off the kernel-lock path: the host
-                // socket is already non-blocking, and a non-blocking guest (the
-                // Go netpoller) wants the EAGAIN rather than a blocked vCPU.
+                // PEEK first, then consume EXACTLY what the destination accepts.
+                // The destination is typically Go's O_NONBLOCK splice pipe (64 KiB
+                // on macOS — F_SETPIPE_SZ is bookkeeping-only here). A plain
+                // consuming recv() pulls up to `count` (~RCVBUF) off the socket,
+                // but splice_write_out does a single non-blocking write to the
+                // pipe; when recv > the pipe's free space the un-written tail —
+                // ALREADY removed from the socket — is silently DROPPED and
+                // unrecoverable (TestLargeCopyViaNetwork: server saw ~1.9MB of a
+                // 10MB sendfile). MSG_PEEK leaves the bytes in the socket; we
+                // remove only the prefix that actually reached the destination, so
+                // the guest's Go splice loop just makes another pass for the rest.
+                let want = count.min(1 << 20);
+                let mut buf = vec![0u8; want];
                 let n = unsafe {
-                    libc::recv(host_fd, buf.as_mut_ptr() as *mut _, count, libc::MSG_DONTWAIT)
+                    libc::recv(
+                        host_fd,
+                        buf.as_mut_ptr() as *mut _,
+                        want,
+                        libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                    )
                 };
                 let n = match n.host_syscall_errno() {
                     Ok(value) => value,
                     Err(errno) => return Ok(errno.into()),
                 };
+                if n == 0 {
+                    // EOF: the writer closed; splice reports 0 (Go stops the loop).
+                    return Ok(DispatchOutcome::Returned { value: 0 });
+                }
                 buf.truncate(n as usize);
                 let outcome = this.splice_write_out(out_fd.0, off_out_address, &buf, cx.memory, tid);
-                return Ok(outcome);
+                let DispatchOutcome::Returned { value } = outcome else {
+                    // EAGAIN / WaitOnFds / Errno on the destination — propagate
+                    // WITHOUT consuming any socket bytes (the peek left them).
+                    return Ok(outcome);
+                };
+                let written = usize::try_from(value).unwrap_or(0);
+                // Now drain EXACTLY `written` bytes from the socket — they are safely
+                // in the destination. recv on a stream socket may return short, so
+                // loop until `written` are consumed (a single recv could leave a
+                // remainder that the next PEEK re-delivers → duplicated bytes).
+                let mut consumed = 0usize;
+                while consumed < written {
+                    let cn = unsafe {
+                        libc::recv(
+                            host_fd,
+                            buf.as_mut_ptr().add(consumed) as *mut _,
+                            written - consumed,
+                            libc::MSG_DONTWAIT,
+                        )
+                    };
+                    match cn.host_syscall_errno() {
+                        Ok(c) if c > 0 => consumed += c as usize,
+                        // 0 (peer gone) or EAGAIN: the peeked bytes should be
+                        // present, but never spin — stop draining to avoid a hang.
+                        _ => break,
+                    }
+                }
+                // `consumed == written` in every normal case (the peeked bytes are
+                // present). Report the bytes moved into the destination; the drain
+                // above keeps the socket position in lockstep so nothing is lost.
+                return Ok(DispatchOutcome::Returned {
+                    value: written as i64,
+                });
             }
 
             if off_out_address != 0 {
