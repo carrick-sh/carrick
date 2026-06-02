@@ -2973,17 +2973,22 @@ impl HvfInner {
 
         let sp = self.vcpu.get_sys_reg(SysReg::SP_EL0).map_err(hvf_error)?;
         let frame_size = core::mem::size_of::<crate::linux_abi::CarrickSigframe>();
+        // rt_sigreturn restores from the rt_sigframe the handler is returning
+        // through, which the AArch64 kernel ABI places at SP (siginfo@0,
+        // ucontext next). For a native guest this is carrick's own frame, with
+        // the private magic intact. Apple Rosetta runs the x86 handler out of
+        // carrick's frame, then rebuilds a FRESH, standard rt_sigframe at a new
+        // SP and rt_sigreturns through THAT — it carries a valid AArch64
+        // ucontext but NOT carrick's private magic (and the original frame is
+        // overwritten). Either way the authoritative resume state is
+        // ucontext.uc_mcontext at SP, exactly as the Linux kernel restores it;
+        // we no longer require the private magic, which cannot survive Rosetta.
         let bytes = self
             .read_guest_bytes(sp, frame_size)
             .map_err(|e| TrapError::Hypervisor(format!("sigframe read failed: {e}")))?;
         let frame = crate::linux_abi::CarrickSigframe::read_from_bytes(&bytes)
             .map_err(|_| TrapError::Hypervisor("sigframe decode failed".to_string()))?;
         let magic = frame.magic;
-        if magic != crate::linux_abi::CARRICK_SIGFRAME_MAGIC {
-            return Err(TrapError::Hypervisor(format!(
-                "rt_sigreturn: bad sigframe magic at SP_EL0=0x{sp:x}: 0x{magic:x}"
-            )));
-        }
 
         // `frame` is `#[repr(C, packed)]` so we cannot borrow individual
         // fields. Copy out the Linux ucontext first; SA_SIGINFO handlers may
@@ -2991,6 +2996,18 @@ impl HvfInner {
         let ucontext = frame.ucontext;
         let restored_sigmask = ucontext.uc_sigmask;
         let mcontext = ucontext.uc_mcontext;
+        // Linux validates the regs before applying them (`valid_user_regs`); the
+        // load-bearing invariant is that the resume PSTATE targets EL0. A bogus
+        // SP (rt_sigreturn called outside a handler, or a corrupt frame) would
+        // yield a non-EL0 / garbage PSTATE — refuse rather than wedge the vCPU.
+        // This replaces the private-magic gate, which Rosetta's reconstructed
+        // frame legitimately lacks.
+        let resume_pstate = mcontext.pstate;
+        if resume_pstate & 0b1111 != 0 {
+            return Err(TrapError::Hypervisor(format!(
+                "rt_sigreturn: frame at SP_EL0=0x{sp:x} has non-EL0 PSTATE 0x{resume_pstate:x} (magic 0x{magic:x})"
+            )));
+        }
         let saved_x = mcontext.regs;
         for (reg, value) in GPR_TABLE.iter().zip(saved_x.iter()) {
             self.vcpu.set_reg(*reg, *value).map_err(hvf_error)?;
