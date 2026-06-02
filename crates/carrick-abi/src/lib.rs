@@ -1092,15 +1092,22 @@ impl LinuxFpsimdContext {
 /// detect a misaligned / corrupt frame and refuse to restore garbage.
 pub const CARRICK_SIGFRAME_MAGIC: u64 = 0x4361_7272_6963_6b53; // 'CarrickS'
 
-/// Carrick's signal frame layout. The leading fields are private so
-/// `rt_sigreturn` can authenticate and restore the frame. The embedded
-/// `siginfo_t` and AArch64 `ucontext_t` are Linux-shaped because SA_SIGINFO
-/// handlers can inspect or mutate the saved register context.
+/// Carrick's signal frame layout. `siginfo` and `ucontext` are placed FIRST
+/// (matching Linux's `struct rt_sigframe` order) because Rosetta's signal
+/// trampoline reconstructs the `siginfo` pointer with `mov x1, sp` — i.e. it
+/// assumes `siginfo` sits at `SP+0`. `inject_signal` sets x1/x2 via
+/// `offset_of!`, so glibc and Go are unaffected by the field ordering here.
+/// The private authentication fields (`magic`, `saved_x`, …) follow after and
+/// are consumed only by Carrick's own `rt_sigreturn` handler.
 #[repr(C, packed)]
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
 )]
 pub struct CarrickSigframe {
+    // siginfo / ucontext MUST be first — Rosetta trampoline: `mov x1, sp`.
+    pub siginfo: LinuxSiginfo,
+    pub ucontext: LinuxUcontext,
+    // Private authentication / restoration state follows.
     pub magic: u64,
     pub signum: u32,
     pub _pad0: u32,
@@ -1108,14 +1115,14 @@ pub struct CarrickSigframe {
     pub saved_pc: u64,
     pub saved_sp: u64,
     pub saved_spsr: u64,
-    pub siginfo: LinuxSiginfo,
-    pub ucontext: LinuxUcontext,
     pub _reserved: [u64; 6],
 }
 
 impl CarrickSigframe {
     pub const fn empty() -> Self {
         Self {
+            siginfo: LinuxSiginfo::empty(),
+            ucontext: LinuxUcontext::empty(),
             magic: CARRICK_SIGFRAME_MAGIC,
             signum: 0,
             _pad0: 0,
@@ -1123,8 +1130,6 @@ impl CarrickSigframe {
             saved_pc: 0,
             saved_sp: 0,
             saved_spsr: 0,
-            siginfo: LinuxSiginfo::empty(),
-            ucontext: LinuxUcontext::empty(),
             _reserved: [0; 6],
         }
     }
@@ -2383,6 +2388,17 @@ mod kernel_abi_tests {
         assert_eq!(core::mem::offset_of!(LinuxUcontext, _pad), 48);
         assert_eq!(core::mem::offset_of!(LinuxUcontext, _pad2), 168);
         assert_eq!(core::mem::offset_of!(LinuxUcontext, uc_mcontext), 176);
+    }
+
+    #[test]
+    fn carrick_sigframe_has_siginfo_at_offset_zero() {
+        // Rosetta's trampoline does `mov x1, sp`, so SP_EL0 must point at siginfo.
+        assert_eq!(core::mem::offset_of!(CarrickSigframe, siginfo), 0);
+        // ucontext immediately follows siginfo (Linux struct rt_sigframe order).
+        assert_eq!(
+            core::mem::offset_of!(CarrickSigframe, ucontext),
+            core::mem::size_of::<LinuxSiginfo>()
+        );
     }
 
     #[test]
