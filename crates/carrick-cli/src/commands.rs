@@ -19,7 +19,8 @@ use crate::args::{Cli, Commands, RootfsCommand};
 use crate::debug::run_debug;
 use crate::fs_setup::install_fs_backend;
 use crate::runtime_util::{
-    block_on_oci, emit_raw, parse_env_file, parse_mount_flag, parse_volume_mount, validate_publish,
+    block_on_oci, emit_raw, human_age, human_size, parse_env_file, parse_mount_flag,
+    parse_volume_mount, truncate_str, validate_publish,
 };
 #[cfg(target_os = "macos")]
 use crate::trace_cli::{current_supplementary_groups, trace_drop_credentials};
@@ -492,7 +493,12 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             format,
             containers,
         } => crate::lifecycle::inspect(format.as_deref(), &containers)?,
-        Commands::Ps { all, quiet } => crate::lifecycle::ps(all, quiet)?,
+        Commands::Ps {
+            all,
+            quiet,
+            no_trunc,
+            format,
+        } => crate::lifecycle::ps(all, quiet, no_trunc, format.as_deref())?,
         Commands::Stop { time, containers } => crate::lifecycle::stop(time, &containers)?,
         Commands::Kill { signal, containers } => crate::lifecycle::kill(&signal, &containers)?,
         Commands::Rm { force, containers } => crate::lifecycle::rm(force, &containers)?,
@@ -776,53 +782,3 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Truncate `s` to `max` chars (with an ellipsis) for table columns.
-fn truncate_str(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let cut: String = s.chars().take(max.saturating_sub(1)).collect();
-        format!("{cut}…")
-    }
-}
-
-/// Format a byte count docker-style with decimal (1000) units, e.g. `78.1MB`.
-fn human_size(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "kB", "MB", "GB", "TB"];
-    if bytes < 1000 {
-        return format!("{bytes}B");
-    }
-    let mut size = bytes as f64;
-    let mut unit = 0;
-    while size >= 1000.0 && unit < UNITS.len() - 1 {
-        size /= 1000.0;
-        unit += 1;
-    }
-    format!("{size:.1}{}", UNITS[unit])
-}
-
-/// Format an epoch-seconds creation time as a docker-style relative age, e.g.
-/// `2 hours ago`.
-fn human_age(created_secs: u64) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(created_secs);
-    let age = now.saturating_sub(created_secs);
-    let (n, unit) = if age < 60 {
-        return "Less than a minute ago".to_string();
-    } else if age < 3600 {
-        (age / 60, "minute")
-    } else if age < 86_400 {
-        (age / 3600, "hour")
-    } else if age < 86_400 * 7 {
-        (age / 86_400, "day")
-    } else if age < 86_400 * 30 {
-        (age / (86_400 * 7), "week")
-    } else if age < 86_400 * 365 {
-        (age / (86_400 * 30), "month")
-    } else {
-        (age / (86_400 * 365), "year")
-    };
-    format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" })
-}

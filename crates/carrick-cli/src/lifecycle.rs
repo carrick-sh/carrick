@@ -10,6 +10,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, bail};
 use carrick_runtime::container::{self, ContainerState, ContainerStatus, RunConfig};
 
+use crate::runtime_util::{human_age, truncate_str};
+
 /// Detach into the background and run the container under its own supervisor,
 /// printing the container id and returning. Mirrors `docker run -d`.
 ///
@@ -34,6 +36,10 @@ pub(crate) fn run_detached(
     // Seed the id from this (pre-fork) pid + the creation time so it is unique
     // per launch; container::make_id formats it as a 64-hex docker-like id.
     let id = container::make_id(std::process::id() as u64, created_secs);
+
+    // docker always assigns a name; generate an `adjective_surname` one when the
+    // user didn't pass `--name`, so `ps`/`stop`/`logs` always have a handle.
+    let name = name.or_else(|| Some(gen_name(&id)));
 
     let state = ContainerState {
         id: id.clone(),
@@ -142,9 +148,15 @@ fn redirect_detached_stdio(log: &std::path::Path) {
     }
 }
 
-/// `carrick ps` — list containers. Running only by default; `--all` includes
-/// exited. `--quiet` prints just ids.
-pub(crate) fn ps(all: bool, quiet: bool) -> anyhow::Result<()> {
+/// `carrick ps` — list containers, docker-shaped. Running only by default;
+/// `--all` includes exited. `--quiet` prints just ids; `--format` renders a
+/// Go-template-style expression per row; `--no-trunc` keeps full ids/commands.
+pub(crate) fn ps(
+    all: bool,
+    quiet: bool,
+    no_trunc: bool,
+    format: Option<&str>,
+) -> anyhow::Result<()> {
     let mut containers = container::list();
     // Stable, newest-first by creation time.
     containers.sort_by(|a, b| b.created_secs.cmp(&a.created_secs));
@@ -155,48 +167,114 @@ pub(crate) fn ps(all: bool, quiet: bool) -> anyhow::Result<()> {
         .filter(|(_, st)| all || *st == ContainerStatus::Running)
         .collect();
 
+    if let Some(fmt) = format {
+        for (c, st) in &rows {
+            println!("{}", render_format(fmt, &ps_row_json(c, *st, no_trunc)));
+        }
+        return Ok(());
+    }
     if quiet {
         for (c, _) in &rows {
-            println!("{}", container::short_id(&c.id));
+            println!("{}", ps_id(&c.id, no_trunc));
         }
         return Ok(());
     }
 
     println!(
-        "{:<14}{:<24}{:<12}{:<10}{}",
-        "CONTAINER ID", "IMAGE", "STATUS", "PID", "NAMES"
+        "{:<14}{:<22}{:<26}{:<22}{:<20}{:<8}{}",
+        "CONTAINER ID", "IMAGE", "COMMAND", "CREATED", "STATUS", "PORTS", "NAMES"
     );
     for (c, st) in &rows {
-        let status = match st {
-            ContainerStatus::Created => "created".to_string(),
-            ContainerStatus::Running => "running".to_string(),
-            ContainerStatus::Exited => {
-                format!("exited ({})", c.exit_code.unwrap_or(0))
-            }
-        };
-        let pid = if *st == ContainerStatus::Running {
-            c.init_pid.to_string()
-        } else {
-            "-".to_string()
-        };
         println!(
-            "{:<14}{:<24}{:<12}{:<10}{}",
-            container::short_id(&c.id),
-            truncate(&c.image, 22),
-            status,
-            pid,
+            "{:<14}{:<22}{:<26}{:<22}{:<20}{:<8}{}",
+            ps_id(&c.id, no_trunc),
+            truncate_str(&c.image, 20),
+            ps_command(&c.command, no_trunc),
+            human_age(c.created_secs),
+            ps_status(c, *st),
+            "", // PORTS — carrick is host-networked; no published ports.
             c.name.as_deref().unwrap_or("")
         );
     }
     Ok(())
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
+/// Generate a docker-style `adjective_surname` container name seeded by the id,
+/// appending a short id suffix if it collides with an existing container (so
+/// by-name `stop`/`kill`/`rm`/`logs` stay unambiguous).
+fn gen_name(id: &str) -> String {
+    const ADJ: &[&str] = &[
+        "bold", "calm", "eager", "brave", "clever", "gentle", "jolly", "keen", "lucid", "merry",
+        "nifty", "proud", "quirky", "serene", "witty", "amber", "cosmic", "mellow", "vivid",
+        "stoic",
+    ];
+    const SUR: &[&str] = &[
+        "turing", "hopper", "lovelace", "ritchie", "torvalds", "knuth", "dijkstra", "hamilton",
+        "babbage", "liskov", "carmack", "thompson", "kernighan", "shannon", "noether", "euler",
+        "gauss", "tesla", "curie", "bohr",
+    ];
+    let b = id.as_bytes();
+    let a = ADJ[b.first().copied().unwrap_or(0) as usize % ADJ.len()];
+    let s = SUR[b.get(1).copied().unwrap_or(0) as usize % SUR.len()];
+    let base = format!("{a}_{s}");
+    if container::resolve(&base).is_ok() {
+        format!("{base}_{}", id.get(..4).unwrap_or("0000"))
     } else {
-        format!("{}…", &s[..max.saturating_sub(1)])
+        base
     }
+}
+
+fn ps_id(id: &str, no_trunc: bool) -> String {
+    if no_trunc {
+        id.to_string()
+    } else {
+        container::short_id(id).to_string()
+    }
+}
+
+/// docker COMMAND column: the argv joined + quoted, truncated unless `no_trunc`.
+fn ps_command(command: &[String], no_trunc: bool) -> String {
+    let quoted = format!("\"{}\"", command.join(" "));
+    if no_trunc {
+        quoted
+    } else {
+        truncate_str(&quoted, 22)
+    }
+}
+
+/// docker STATUS column: `Created` / `Up <age>` / `Exited (N) <age>`.
+fn ps_status(c: &ContainerState, st: ContainerStatus) -> String {
+    match st {
+        ContainerStatus::Created => "Created".to_string(),
+        ContainerStatus::Running => {
+            format!("Up {}", human_age(c.created_secs).trim_end_matches(" ago"))
+        }
+        ContainerStatus::Exited => format!(
+            "Exited ({}) {}",
+            c.exit_code.unwrap_or(0),
+            human_age(c.created_secs)
+        ),
+    }
+}
+
+/// A docker-ps-shaped JSON row for `--format` (`.ID`, `.Image`, `.Command`,
+/// `.CreatedAt`, `.Status`, `.State`, `.Ports`, `.Names`).
+fn ps_row_json(c: &ContainerState, st: ContainerStatus, no_trunc: bool) -> serde_json::Value {
+    serde_json::json!({
+        "ID": ps_id(&c.id, no_trunc),
+        "Image": c.image,
+        "Command": ps_command(&c.command, no_trunc),
+        "CreatedAt": human_age(c.created_secs),
+        "RunningFor": human_age(c.created_secs),
+        "Status": ps_status(c, st),
+        "Ports": "",
+        "Names": c.name.as_deref().unwrap_or(""),
+        "State": match st {
+            ContainerStatus::Created => "created",
+            ContainerStatus::Running => "running",
+            ContainerStatus::Exited => "exited",
+        },
+    })
 }
 
 /// `carrick stop` — SIGTERM the container's init, wait up to `secs`, then
