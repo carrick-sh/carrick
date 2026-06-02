@@ -268,16 +268,9 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
         Commands::Rmi { images } => {
             let mut had_err = false;
             for spec in &images {
-                match ImageReference::parse(spec).and_then(|image| {
-                    store
-                        .remove_image(&image)
-                        .map(|removed| (image, removed))
-                        .map_err(|e| {
-                            carrick_image::OciBootstrapError::Io(std::io::Error::other(e))
-                        })
-                }) {
-                    Ok((image, true)) => println!("Untagged: {}", image.canonical()),
-                    Ok((_, false)) => {
+                match store.remove_image_by_spec(spec) {
+                    Ok(Some(name)) => println!("Untagged: {name}"),
+                    Ok(None) => {
                         eprintln!("Error: no such image: {spec}");
                         had_err = true;
                     }
