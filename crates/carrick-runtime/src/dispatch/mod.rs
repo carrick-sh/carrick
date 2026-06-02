@@ -2236,9 +2236,8 @@ fn dispatch_futex_pi(
     tid: u32,
     futex: Option<&crate::thread::FutexTable>,
 ) -> DispatchOutcome {
-    // The low 30 bits of a PI-futex word hold the owner TID (FUTEX_TID_MASK);
-    // the upper two are FUTEX_WAITERS / FUTEX_OWNER_DIED.
-    const LINUX_FUTEX_TID_MASK: u32 = 0x3fff_ffff;
+    // The low 30 bits of a PI-futex word hold the owner TID (FUTEX_TID_MASK,
+    // imported from carrick-abi); the upper two are FUTEX_WAITERS/OWNER_DIED.
     if tid == 0 || tid > LINUX_FUTEX_TID_MASK {
         return DispatchOutcome::Errno {
             errno: LINUX_EINVAL,
