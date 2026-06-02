@@ -122,6 +122,26 @@ pub struct ThreadWaiter {
     tid: crate::thread::ThreadId,
 }
 
+/// kqueue registration for a WAKE pipe (the process-directed self-pipe and the
+/// per-thread wake channel). These MUST be edge-triggered (`EV_CLEAR`): a wake
+/// byte produces exactly one event, and after it is retrieved the filter is
+/// quiet until the next write.
+///
+/// This is a CORRECTNESS requirement, not an optimisation. If such a wake pipe
+/// ever reaches EOF — its write end closed, e.g. in a forked child whose pump /
+/// pending-pipe was torn down or not reinstalled — a level-triggered
+/// (`EV_ADD`-only) read filter reports it readable on EVERY `kevent`, and the
+/// drain (`drain_pending_pipe` / `ThreadWakePipe::drain`) cannot clear an EOF.
+/// `wait_kqueue`/`wait_proc_exit_kqueue` would then loop kevent→drain→kevent
+/// forever, pinning a vCPU thread at 100% CPU (the CPython
+/// multiprocessing-forkserver `test_parent_process` hang). `EV_CLEAR` delivers
+/// the EOF edge once, then the loop parks normally on its timeout slice and is
+/// still woken by a real wake byte (a fresh edge).
+#[cfg(target_os = "macos")]
+fn wake_pipe_read_kevent(fd: RawFd) -> Kevent {
+    Kevent::read(fd, libc::EV_ADD | libc::EV_CLEAR)
+}
+
 impl ThreadWaiter {
     #[cfg(target_os = "macos")]
     pub fn new(tid: crate::thread::ThreadId) -> Self {
@@ -132,13 +152,15 @@ impl ThreadWaiter {
             let mut changes = Vec::with_capacity(2);
             if process_pipe_read >= 0 {
                 // Persistent EVFILT_READ on the process self-pipe: any byte the
-                // async signal handler writes wakes waiters immediately.
-                changes.push(Kevent::read(process_pipe_read, libc::EV_ADD));
+                // async signal handler writes wakes waiters immediately. Edge-
+                // triggered (see wake_pipe_read_kevent) so a closed-write-end
+                // (EOF) pipe can't busy-spin the wait loop.
+                changes.push(wake_pipe_read_kevent(process_pipe_read));
             }
             if let Some(thread_wake) = thread_wake.as_ref() {
                 // Thread-directed signals use a private pipe so siblings cannot
                 // drain the target's wake before its kqueue observes it.
-                changes.push(Kevent::read(thread_wake.read_fd(), libc::EV_ADD));
+                changes.push(wake_pipe_read_kevent(thread_wake.read_fd()));
             }
             if !changes.is_empty() {
                 let _ = kq.apply(&changes);
@@ -769,5 +791,44 @@ mod tests {
             super::PinnedWaitFds::new(&[(bad, libc::POLLIN)]),
             Err(_)
         ));
+    }
+
+    /// A wake pipe whose write end is closed (EOF) must NOT re-fire its
+    /// EVFILT_READ on every `kevent`. A level-triggered (`EV_ADD`-only)
+    /// registration does — and the wait loop's drain cannot clear an EOF — so
+    /// `wait_kqueue` would loop kevent→drain→kevent forever, pinning a vCPU
+    /// thread at 100% CPU (the CPython multiprocessing-forkserver
+    /// `test_parent_process` hang, where a forked child's process signal-wake
+    /// pipe sat at EOF). Edge-triggered (`EV_CLEAR`, via `wake_pipe_read_kevent`)
+    /// delivers the EOF edge once, then is quiet. RED with `EV_ADD`; GREEN with
+    /// `EV_ADD | EV_CLEAR`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn wake_pipe_at_eof_does_not_refire() {
+        use crate::darwin_kqueue::{Kevent, Kqueue};
+        let kq = Kqueue::new_internal().expect("kqueue");
+        let mut fds = [-1, -1];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (r, w) = (fds[0], fds[1]);
+        // Close the write end: the read end is now at permanent EOF (data == 0).
+        assert_eq!(unsafe { libc::close(w) }, 0);
+        kq.apply(&[super::wake_pipe_read_kevent(r)]).expect("apply");
+
+        let zero = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let mut out = [Kevent::empty(); 4];
+        // The EOF edge is delivered once (a watcher must still learn of it).
+        let n1 = kq.wait(&[], &mut out, Some(&zero)).expect("wait1");
+        assert!(n1 >= 1, "EOF should be delivered at least once; n1={n1}");
+        // No new write occurred: a SECOND drain must be quiet. A level-triggered
+        // filter re-fires the EOF forever (the busy-spin); edge-triggered is 0.
+        let n2 = kq.wait(&[], &mut out, Some(&zero)).expect("wait2");
+        assert_eq!(unsafe { libc::close(r) }, 0);
+        assert_eq!(
+            n2, 0,
+            "wake pipe at EOF re-fired EVFILT_READ -> wait_kqueue busy-spins (n1={n1} n2={n2})"
+        );
     }
 }
