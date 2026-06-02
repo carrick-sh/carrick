@@ -19,6 +19,10 @@ pub enum OciBootstrapError {
     Io(#[from] std::io::Error),
     #[error("failed to serialize OCI metadata: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("registry authentication failed: {0}")]
+    Auth(String),
+    #[error("invalid registry config: {0}")]
+    Config(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +91,9 @@ pub struct ImageConfig {
     pub user: Option<String>,
     pub exposed_ports: Option<HashSet<String>>,
     pub labels: Option<HashMap<String, String>>,
+    /// Raw OCI `StopSignal` (e.g. `SIGQUIT`), flowed into the container's stop
+    /// signal at `run -d` if `--stop-signal` is not given.
+    pub stop_signal: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -261,5 +268,18 @@ mod tests {
         assert!(config.entrypoint.is_none());
         assert!(config.cmd.is_none());
         assert!(config.env.is_empty());
+        assert!(config.stop_signal.is_none());
+    }
+
+    #[test]
+    fn image_config_stop_signal_round_trips_and_defaults() {
+        // Additive: a config JSON without stop_signal still loads.
+        let legacy: ImageConfig = serde_json::from_str("{}").expect("legacy loads");
+        assert!(legacy.stop_signal.is_none());
+        let mut c = ImageConfig::default();
+        c.stop_signal = Some("SIGQUIT".to_string());
+        let round: ImageConfig =
+            serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!(round.stop_signal.as_deref(), Some("SIGQUIT"));
     }
 }

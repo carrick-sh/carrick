@@ -420,6 +420,8 @@ struct OciImageConfigInner {
     cmd: Option<Vec<String>>,
     working_dir: Option<camino::Utf8PathBuf>,
     labels: Option<std::collections::HashMap<String, String>>,
+    /// OCI `StopSignal` (e.g. `SIGQUIT`) — the signal `docker stop` sends.
+    stop_signal: Option<String>,
 }
 
 impl OciImageConfigContainer {
@@ -434,6 +436,7 @@ impl OciImageConfigContainer {
                 user: inner.user,
                 exposed_ports: exposed,
                 labels: inner.labels,
+                stop_signal: inner.stop_signal,
             }
         } else {
             ImageConfig::default()

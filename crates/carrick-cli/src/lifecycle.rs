@@ -63,6 +63,14 @@ pub(crate) fn run_detached(
             pid: req.pid,
             scratch_path: None,
             region_path: None,
+            entrypoint: req.entrypoint_override.clone(),
+            mounts: req.mounts.clone(),
+            fs: req.fs,
+            tty: req.tty,
+            interactive: req.interactive,
+            max_traps: req.max_traps,
+            stop_signal: None,
+            stop_timeout: None,
         },
     };
     state

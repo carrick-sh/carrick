@@ -67,7 +67,7 @@ pub struct ContainerState {
 /// `start`/`restart`) can reconstruct a compatible run. `exec` re-resolves the
 /// image layers from the store via [`ContainerState::image`] and re-applies
 /// these, overriding with its own flags.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RunConfig {
     /// Raw `--platform` string (`None` = host default).
@@ -86,6 +86,60 @@ pub struct RunConfig {
     pub scratch_path: Option<String>,
     /// File-backed PID region path, `mmap`'d by `exec` to join the namespace.
     pub region_path: Option<String>,
+    /// `--entrypoint` override (`None` = the image ENTRYPOINT). Persisted as the
+    /// SPLIT inputs — `command` holds only the cmd args — so `start` re-merges
+    /// entrypoint+cmd through the engine instead of double-applying the image
+    /// entrypoint.
+    pub entrypoint: Option<Vec<String>>,
+    /// Bind/volume mounts (`-v`/`--mount`), re-applied at `start`.
+    pub mounts: Vec<carrick_spec::Mount>,
+    /// Resolved fs backend; only `Host` is startable (a memory overlay can't be
+    /// relaunched). `None` for legacy entries.
+    pub fs: Option<carrick_spec::FsBackendKind>,
+    /// `-t`: allocate a pty (for `start --attach` fidelity).
+    pub tty: bool,
+    /// `-i`: keep stdin open.
+    pub interactive: bool,
+    /// Max guest traps before the run aborts. A NAMED default is required: a bare
+    /// default would deserialize legacy entries to 0 and trip the trap limit
+    /// immediately.
+    #[serde(default = "default_max_traps")]
+    pub max_traps: usize,
+    /// HOST (macOS) stop signum (`docker run --stop-signal` / image `STOPSIGNAL`).
+    /// `None` falls back to `SIGTERM` at stop time.
+    pub stop_signal: Option<i32>,
+    /// Grace seconds before `SIGKILL` (`--stop-timeout`). `None` falls back to
+    /// `stop -t`, else 10.
+    pub stop_timeout: Option<u64>,
+}
+
+fn default_max_traps() -> usize {
+    crate::runtime::DEFAULT_MAX_TRAPS
+}
+
+impl Default for RunConfig {
+    fn default() -> Self {
+        Self {
+            platform: None,
+            env: Vec::new(),
+            workdir: None,
+            user: None,
+            pid: carrick_spec::PidMode::default(),
+            scratch_path: None,
+            region_path: None,
+            entrypoint: None,
+            mounts: Vec::new(),
+            fs: None,
+            tty: false,
+            interactive: false,
+            // Both the struct Default (legacy entries with NO config object) and
+            // the field serde default (config present, max_traps missing) must
+            // yield the real default — 0 would trip the trap limit immediately.
+            max_traps: default_max_traps(),
+            stop_signal: None,
+            stop_timeout: None,
+        }
+    }
 }
 
 /// The registry root: `<scratch>/containers` (per-user, case-sensitive). Each
@@ -381,16 +435,46 @@ mod tests {
         let s: ContainerState = serde_json::from_str(legacy).expect("legacy state loads");
         assert!(s.config.scratch_path.is_none());
         assert!(s.config.region_path.is_none());
+        // Load-bearing: a legacy entry with NO config object must default
+        // max_traps to DEFAULT_MAX_TRAPS, not 0 (0 trips the trap limit at once).
+        assert_eq!(s.config.max_traps, crate::runtime::DEFAULT_MAX_TRAPS);
 
-        // A populated config round-trips.
+        // A config object present but WITHOUT max_traps also defaults correctly
+        // (the named field serde default).
+        let no_traps = r#"{"id":"y","name":null,"image":"img","command":[],
+            "status":"created","supervisor_pid":0,"init_pid":0,"created_secs":0,
+            "exit_code":null,"auto_remove":false,"config":{"env":["A=1"]}}"#;
+        let s_nt: ContainerState = serde_json::from_str(no_traps).expect("loads");
+        assert_eq!(s_nt.config.max_traps, crate::runtime::DEFAULT_MAX_TRAPS);
+
+        // A fully-populated config round-trips (all P5 relaunch fields).
         let mut s2 = s.clone();
         s2.config.scratch_path = Some("/p/scratch".into());
         s2.config.region_path = Some("/p/region".into());
         s2.config.env = vec!["A=1".into()];
+        s2.config.entrypoint = Some(vec!["/bin/sh".into()]);
+        s2.config.mounts = vec![carrick_spec::Mount {
+            source: "/h".into(),
+            target: "/g".into(),
+            readonly: true,
+        }];
+        s2.config.fs = Some(carrick_spec::FsBackendKind::Host);
+        s2.config.tty = true;
+        s2.config.max_traps = 4242;
+        s2.config.stop_signal = Some(3);
+        s2.config.stop_timeout = Some(7);
         let json = serde_json::to_string(&s2).expect("serialize");
         let round: ContainerState = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(round.config.scratch_path.as_deref(), Some("/p/scratch"));
         assert_eq!(round.config.region_path.as_deref(), Some("/p/region"));
         assert_eq!(round.config.env, vec!["A=1".to_string()]);
+        assert_eq!(round.config.entrypoint, Some(vec!["/bin/sh".to_string()]));
+        assert_eq!(round.config.mounts.len(), 1);
+        assert!(round.config.mounts[0].readonly);
+        assert_eq!(round.config.fs, Some(carrick_spec::FsBackendKind::Host));
+        assert!(round.config.tty);
+        assert_eq!(round.config.max_traps, 4242);
+        assert_eq!(round.config.stop_signal, Some(3));
+        assert_eq!(round.config.stop_timeout, Some(7));
     }
 }
