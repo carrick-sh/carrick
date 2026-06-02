@@ -285,3 +285,52 @@ underlying gap got fixed):
 | **`msgctl(IPC_STAT)` fills the ipc64_perm (key @0, mode @20) in the returned msqid64_ds — was leaving them zero (only the msg_* fields were translated); owner ids from the guest creds, key/mode/seq from the host stat** | ✅ `msgctlstat` | msgctl01 |
 | **`semget(key, nsems, flg)` with nsems > Linux SEMMSL (32000) → EINVAL (was forwarding to macOS semget, which returns ENOSPC for its far-smaller limit)** | ✅ `semgetnsems` | semget02 (nsems-too-large leg; semget02's nsems>existing-set→EINVAL-before-EACCES ordering + semget05 deferred — an errno-order vs macOS perm-gate mismatch) |
 | **`kill(2)` permission model across peer guest processes: root → any allowed; non-root cross-uid → EPERM; non-root same-uid → allowed. Cred propagation via per-process `/tmp/carrick-cred-<host_pid>` updated on every setuid/setreuid/setresuid** | ✅ `killuidperm` | kill05 (MATCH 1/1) |
+
+---
+
+## Language-runtime conformance snapshot — 2026-06-02
+
+A *different* axis from the probe map above: end-to-end differential runs of real
+language test suites under `carrick run` vs the **Docker linux/arm64 oracle**
+(same image, same args; outcome-category diff). These are discovery runs, not the
+owned-probe gate — every confirmed gap below should eventually graduate to a probe
+row. Method notes that cost time (don't repeat): run each suite **solo** (concurrent
+heavy suites starve each other and produce false TIMEOUT/n=0); cpython-parity.py
+`--jsonl` *appends* (dedupe last-wins per module); carrick needs the **registry**
+image ref `localhost:5050/cpython-test:3.12.13` (a bare docker-daemon ref → carrick
+can't pull → every module `n=0`, looks like a mass regression but isn't).
+
+| Ecosystem (suite) | Result vs oracle |
+|---|---|
+| Go (std test bins: sync, atomic, context, time, os/signal, os/exec, runtime, net, cgo) | ~876/880 pass; 4 carrick-only, all known/env-gated |
+| Node.js (node-core, full plan) | 5301/5304 pass (99.9%); 3 cosmetic stderr-snapshot only |
+| libuv (full suite, solo, as uid 65534) | 498/507 pass (98.2%); 9 carrick-only gaps |
+| CPython 3.12.13 (regrtest, 492 modules) | 425 MATCH / 18 DIFF (86.4%) |
+
+**Go — at parity.** sync/atomic/context/time/os-signal/runtime/cgo 100%. Carrick-only:
+`os/exec` TestExplicitPWD (cross-mount symlink/$PWD); `net` TestInterfaceMulticastAddrs,
+TestIPConnRemoteName, TestIPConnSpecificMethods (raw-IP sockets / multicast iface —
+need CAP_NET_RAW/sudo).
+
+**Node.js node-core — at parity.** Only `test-node-output-{v8-warning,eval,errors}`
+fail — exact-stderr snapshot comparisons (cosmetic); the Docker oracle also fails
+`v8-warning` and in fact hung mid-suite, so carrick was the side that completed.
+
+**libuv — 9 carrick-only gaps.** Carrick *passes* all 14 tests the LinuxKit/root
+Docker oracle fails (`fs_*`, `pipe_*` EOPNOTSUPP, iouring). The 9: `kill`,
+`spawn_exercise_sigchld_issue` (signal), `tcp_reuseport`/`udp_reuseport` (SO_REUSEPORT),
+`udp_multicast_interface6`, `udp_recvmsg_unreachable_error`(+`6`) (UDP/ICMP),
+`tty_pty_partial`, `platform_output` (uv_cpu_info cosmetic). (`eintr_handling` is a
+contention false-positive — passes solo.)
+
+**CPython — 425/492 MATCH.** DIFF clusters: multiprocessing (8 modules — a
+DETERMINISTIC guest SIGSEGV at `test_async_timeout`'s `Pool(3)` creation; the
+campaign's #1 deep blocker, NOT a syscall gap); asyncio (events/subprocess);
+`test_socket` (40 SCTP skips — macOS lacks SCTP, out of scope); + small punch-list
+gaps (test_posix/test_shutil/test_zipfile/test_subprocess/test_cmd_line_script/test_ssl).
+Per-module verdicts in `docs/cpython-baseline/`.
+
+**Incidental carrick gaps found during the runs:** `/dev/fd/N` process substitution
+(FIXED, commit 8b7b5c4); `diff <(...)` aborts on the `/proc/self/fd/N` magic-symlink
+`st_size=0`; `--user <name>` resolution (numeric uid only); `setpriv` capability-prctl
+EINVAL.
