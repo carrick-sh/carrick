@@ -452,7 +452,8 @@ const PROC_NET_FILES: &[&str] = &[
 ];
 
 /// True iff `path` is a `/proc/net` directory: the bare `/proc/net` or the
-/// namespace-correct `/proc/self/net`, `/proc/thread-self/net`, `/proc/<pid>/net`.
+/// namespace-correct `/proc/<pid>/net` of a LIVE process (self alias or a live
+/// guest pid).
 fn proc_net_is_dir(path: &str) -> bool {
     if path == "/proc/net" {
         return true;
@@ -463,7 +464,7 @@ fn proc_net_is_dir(path: &str) -> bool {
     let Some(pid) = rest.strip_suffix("/net") else {
         return false;
     };
-    pid == "self" || pid == "thread-self" || (!pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
+    proc_live_pid(pid).is_some()
 }
 
 /// Directory listing for a `/proc/net` directory, else `None`.
@@ -488,15 +489,34 @@ fn proc_net_dir_entries(path: &str) -> Option<Vec<DirEnt>> {
     Some(entries)
 }
 
-/// For a `/proc/{self,thread-self,curproc,this,<pid>}/<rest>` path, the `<rest>`
-/// after the process component. The magic process aliases and any numeric pid
-/// all resolve here so `exe`/`cwd`/`root`/`ns/*` work uniformly.
-fn proc_pid_subpath(path: &str) -> Option<&str> {
+/// Classify the process component of a `/proc/<pid>/…` path: `Some((is_self,
+/// host_pid))` ONLY when it names a LIVE process — a self alias
+/// (self/thread-self/curproc/this), or a numeric pid that resolves (ns→host) to
+/// a live guest or to this process. `None` for a syntactically-numeric but
+/// non-existent pid, so per-pid magic links / ns / net only materialize for
+/// processes that actually exist (no `/proc/999999/exe` reported present) and a
+/// foreign pid is distinguishable from self (no leaking self's identity).
+pub(crate) fn proc_live_pid(pid: &str) -> Option<(bool, u32)> {
+    if matches!(pid, "self" | "thread-self" | "curproc" | "this") {
+        return Some((true, std::process::id()));
+    }
+    if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // proc_pid_dir_host_pid does the ns→host translation AND the liveness gate
+    // (synthetic_task_dir), returning the host pid only for a live process.
+    let host = proc_pid_dir_host_pid(&format!("/proc/{pid}"))?;
+    Some((host == std::process::id(), host))
+}
+
+/// For a `/proc/{self,…,<pid>}/<rest>` path of a LIVE process, the `<rest>`
+/// after the process component plus whether the pid is THIS process. `None` for
+/// a non-existent pid (gating per-pid magic links/ns/net on liveness).
+fn proc_pid_subpath(path: &str) -> Option<(bool, &str)> {
     let rest = path.strip_prefix("/proc/")?;
     let (pid, sub) = rest.split_once('/')?;
-    let ok = matches!(pid, "self" | "thread-self" | "curproc" | "this")
-        || (!pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()));
-    ok.then_some(sub)
+    let (is_self, _host) = proc_live_pid(pid)?;
+    Some((is_self, sub))
 }
 
 /// `/proc/<pid>/ns/<type>` namespace symlinks. Each readlinks to `<type>:[<inode>]`
@@ -517,9 +537,9 @@ const PROC_NS_TYPES: &[(&str, u64)] = &[
     ("uts", 4026531838),
 ];
 
-/// True iff `path` is a `/proc/<pid>/ns` directory (self/thread-self/… aliases).
+/// True iff `path` is a `/proc/<pid>/ns` directory of a live process.
 fn proc_ns_is_dir(path: &str) -> bool {
-    proc_pid_subpath(path) == Some("ns")
+    matches!(proc_pid_subpath(path), Some((_, "ns")))
 }
 
 /// Directory listing for a `/proc/<pid>/ns` directory (one symlink per ns type).
@@ -544,9 +564,10 @@ fn proc_ns_dir_entries(path: &str) -> Option<Vec<DirEnt>> {
     Some(entries)
 }
 
-/// The `<type>:[<inode>]` readlink target for a `/proc/<pid>/ns/<type>` path.
+/// The `<type>:[<inode>]` readlink target for a live `/proc/<pid>/ns/<type>` path.
 fn proc_ns_link_target(path: &str) -> Option<String> {
-    let t = proc_pid_subpath(path)?.strip_prefix("ns/")?;
+    let (_is_self, rest) = proc_pid_subpath(path)?;
+    let t = rest.strip_prefix("ns/")?;
     PROC_NS_TYPES
         .iter()
         .find(|(name, _)| *name == t)
@@ -566,9 +587,14 @@ fn proc_ns_link_target(path: &str) -> Option<String> {
 /// them (a readlink doesn't require the target to lstat as a symlink), so
 /// `readlink /proc/self` → the pid and `readlink /proc/net` → self/net work.
 fn proc_magic_symlink_size(path: &str) -> Option<u64> {
-    let rest = proc_pid_subpath(path)?;
+    let (is_self, rest) = proc_pid_subpath(path)?;
     if matches!(rest, "exe" | "cwd" | "root") {
-        return Some(0);
+        // exe/cwd/root are self-specific (carrick can't derive a foreign
+        // process's executable/cwd), so only the self process resolves them;
+        // a foreign live pid's exe/cwd/root is ENOENT rather than a leak of
+        // self's identity. size = target length is reported by the dispatcher
+        // on lstat where the live target is known.
+        return is_self.then_some(0);
     }
     proc_ns_link_target(path).map(|t| t.len() as u64)
 }
@@ -902,15 +928,14 @@ pub(crate) fn proc_pid_dir_host_pid(path: &str) -> Option<u32> {
     Some(host_pid)
 }
 
-/// `(., .., <tid>...)` entries for a `/proc/<pid>/task/` path.
+/// `(., .., <tid>...)` entries for a `/proc/<pid>/task/` path. Accepts the
+/// `self`/`thread-self`/… aliases as well as a numeric pid (so `/proc/self/task`
+/// resolves — it is listed in the self dir's readdir, and must not ENOENT).
 fn proc_task_dir_entries(path: &str) -> Option<Vec<DirEnt>> {
     let p = path.strip_suffix('/').unwrap_or(path);
-    let ns_pid: u32 = p
-        .strip_prefix("/proc/")?
-        .strip_suffix("/task")?
-        .parse()
-        .ok()?;
-    let tids = synthetic_task_dir(ns_pid_to_host(ns_pid)?)?;
+    let pid_comp = p.strip_prefix("/proc/")?.strip_suffix("/task")?;
+    let (_is_self, host_pid) = proc_live_pid(pid_comp)?;
+    let tids = synthetic_task_dir(host_pid)?;
     let mut entries = vec![
         DirEnt {
             name: ".".to_string(),
@@ -2131,7 +2156,7 @@ Max open files            1024                 4096                 files\n\
 Max locked memory         65536                65536                bytes\n\
 Max address space         unlimited            unlimited            bytes\n\
 Max file locks            unlimited            unlimited            locks\n\
-Max pending signals       unlimited            unlimited            signals\n\
+Max pending signals       63880                63880                signals\n\
 Max msgqueue size         819200               819200               bytes\n\
 Max nice priority         0                    0                    \n\
 Max realtime priority     0                    0                    \n\
@@ -2218,6 +2243,19 @@ mod tests {
         assert!(
             root.iter().any(|d| d.name == me.to_string()),
             "/proc should list the guest pid {me}"
+        );
+
+        // /proc/self/task is LISTED in the self dir, so it must also resolve and
+        // readdir (the readdir⇄lookup consistency the review flagged). It used to
+        // ENOENT because the task helper only parsed a numeric pid.
+        assert_eq!(
+            v.lookup("/proc/self/task").unwrap().kind,
+            EntryKind::Directory
+        );
+        assert!(v.readdir("/proc/self/task").is_ok());
+        assert_eq!(
+            v.lookup(&format!("/proc/{me}/task")).unwrap().kind,
+            EntryKind::Directory
         );
 
         crate::host_proc::set_root_guest_pid(0);
@@ -2512,6 +2550,20 @@ mod tests {
     }
 
     #[test]
+    fn sigq_denominator_matches_limits_max_pending_signals() {
+        // The SigQ second field IS RLIMIT_SIGPENDING, which is also what
+        // /proc/self/limits prints — the two files must agree (review finding).
+        let limits = String::from_utf8(synthetic_proc_self_limits().to_vec()).unwrap();
+        let status =
+            String::from_utf8(synthetic_file("/proc/self/status", &demo_ctx()).unwrap()).unwrap();
+        assert!(
+            limits.contains("Max pending signals       63880                63880"),
+            "limits Max pending signals must be 63880: {limits}"
+        );
+        assert!(status.contains("SigQ:\t0/63880"), "status SigQ: {status}");
+    }
+
+    #[test]
     fn self_environ_is_nul_separated_and_byte_exact() {
         // Includes a non-UTF-8 value to prove env is served as opaque bytes,
         // not lossily round-tripped through String.
@@ -2649,11 +2701,11 @@ mod tests {
     #[test]
     fn exe_cwd_root_lstat_as_symlinks() {
         let v = ProcVfs::new();
+        // Only the SELF aliases resolve exe/cwd/root (they're self-specific).
         for link in [
             "/proc/self/exe",
             "/proc/self/cwd",
             "/proc/self/root",
-            "/proc/1/exe",
             "/proc/thread-self/exe",
         ] {
             assert_eq!(
@@ -2664,6 +2716,10 @@ mod tests {
             // faccessat(F_OK)/`test -e` path goes through follow-lookup too.
             assert_eq!(v.lookup(link).unwrap().kind, EntryKind::Symlink, "{link}");
         }
+        // A non-existent / non-guest numeric pid must NOT report exe as present
+        // (no liveness leak), and a foreign pid must not masquerade as self.
+        assert_eq!(v.lookup_nofollow("/proc/999999/exe"), Err(LINUX_ENOENT));
+        assert_eq!(v.lookup("/proc/999999/exe"), Err(LINUX_ENOENT));
     }
 
     #[test]
@@ -2688,11 +2744,14 @@ mod tests {
         );
         let t = v.readlink("/proc/self/ns/net").unwrap();
         assert_eq!(t.to_string_lossy(), "net:[4026531992]");
-        // Same-namespace equality: self and a pid resolve to the same inode.
+        // Same-namespace equality across the self aliases (both live): the ns
+        // inode is shared, so a same-namespace check holds.
         assert_eq!(
-            v.readlink("/proc/1/ns/pid").unwrap(),
+            v.readlink("/proc/thread-self/ns/pid").unwrap(),
             v.readlink("/proc/self/ns/pid").unwrap()
         );
+        // A non-live numeric pid does not materialize an ns dir/link.
+        assert!(v.lookup_nofollow("/proc/999999/ns/pid").is_err());
     }
 
     #[test]
@@ -2713,7 +2772,7 @@ mod tests {
     #[test]
     fn proc_net_resolves_as_directory_with_self_alias() {
         let v = ProcVfs::new();
-        for dir in ["/proc/net", "/proc/self/net", "/proc/1/net"] {
+        for dir in ["/proc/net", "/proc/self/net", "/proc/thread-self/net"] {
             assert_eq!(
                 v.lookup(dir).unwrap().kind,
                 EntryKind::Directory,
@@ -2725,6 +2784,8 @@ mod tests {
                 assert!(names.iter().any(|n| n == want), "{dir} missing {want}");
             }
         }
+        // A non-live numeric pid's net dir does not resolve.
+        assert!(v.lookup("/proc/999999/net").is_err());
     }
 
     #[test]

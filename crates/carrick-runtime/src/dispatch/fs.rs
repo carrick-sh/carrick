@@ -178,8 +178,14 @@ fn proc_self_fd_number(path: &str) -> Option<i32> {
 fn proc_self_magic_link(path: &str) -> Option<&'static str> {
     let rest = path.strip_prefix("/proc/")?;
     let (pid, leaf) = rest.split_once('/')?;
+    // ONLY this process resolves exe/cwd/root from the live dispatcher state.
+    // A foreign guest pid must NOT masquerade as self (that would readlink
+    // /proc/<other>/exe to OUR executable_path); for those, fall through so the
+    // path resolves to ENOENT rather than leaking the inspector's identity.
     let is_self = matches!(pid, "self" | "thread-self" | "curproc" | "this")
-        || (!pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()));
+        || pid
+            .parse::<u32>()
+            .is_ok_and(|n| n == std::process::id() || n == crate::namespace::pid::self_ns_pid());
     if !is_self {
         return None;
     }
@@ -494,13 +500,20 @@ impl SyscallDispatcher {
         // (and runs its licensing ioctl on the resulting fd); under translation
         // the executable path points at the bind-mounted Rosetta interpreter.
 
-        let mut path = match path.as_str() {
-            "/proc/self/exe" | "/proc/thread-self/exe" | "/proc/this/exe" | "/proc/curproc/exe" => {
+        // The self exe/cwd/root magic symlinks resolve to live dispatcher state
+        // so an open() follows them to the real backing object (the executable
+        // for exe, the working dir for cwd, the root for root) — `cat`/`ls`/
+        // `realpath` of /proc/self/{cwd,root} were failing because only exe was
+        // mapped here (the VFS readlink can't see the cwd).
+        let mut path = match proc_self_magic_link(&path) {
+            Some("exe") => {
                 let exe = self.proc.lock().executable_path.clone();
                 // Avoid the circular default (`executable_path` is itself
                 // "/proc/self/exe" until an image is loaded).
                 if exe.starts_with("/proc/") { path } else { exe }
             }
+            Some("cwd") => self.cwd(),
+            Some("root") => "/".to_string(),
             _ => path,
         };
 
