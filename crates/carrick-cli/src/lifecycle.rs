@@ -29,21 +29,63 @@ pub(crate) fn run_detached(
     store: carrick_image::ImageStore,
     name: Option<String>,
 ) -> anyhow::Result<()> {
-    let created_secs = SystemTime::now()
+    let created_secs = now_secs();
+    let id = container::make_id(std::process::id() as u64, created_secs);
+    let name = resolve_name(name, &id)?;
+    build_created_state(&req, &id, name, created_secs)
+        .create()
+        .with_context(|| format!("failed to create container registry entry for {id}"))?;
+
+    let log = container::log_path(&id)?;
+    // SAFETY: fork(2). The CLI is single-threaded here (no tokio runtime is live
+    // — block_on_oci builds its own per-call runtime and we have not entered it).
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        let _ = ContainerState::remove(&id);
+        bail!("fork failed for detached run");
+    }
+    if pid > 0 {
+        // PARENT: print the id and return; the child lives on under launchd.
+        println!("{id}");
+        return Ok(());
+    }
+    // CHILD: first launch — extract the rootfs (attach_overlay = None).
+    run_supervised_child(req, store, &id, &log, None);
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0);
-    // Seed the id from this (pre-fork) pid + the creation time so it is unique
-    // per launch; container::make_id formats it as a 64-hex docker-like id.
-    let id = container::make_id(std::process::id() as u64, created_secs);
+        .unwrap_or(0)
+}
 
-    // docker always assigns a name; generate an `adjective_surname` one when the
-    // user didn't pass `--name`, so `ps`/`stop`/`logs` always have a handle.
-    let name = name.or_else(|| Some(gen_name(&id)));
+/// Resolve the container's name: reject a user-supplied `--name` that collides
+/// with an existing container (docker `Conflict`); auto-generate one otherwise.
+fn resolve_name(name: Option<String>, id: &str) -> anyhow::Result<Option<String>> {
+    match name {
+        Some(n) => {
+            if container::resolve(&n).is_ok() {
+                bail!("Conflict. The container name {n:?} is already in use");
+            }
+            Ok(Some(n))
+        }
+        None => Ok(Some(gen_name(id))),
+    }
+}
 
-    let state = ContainerState {
-        id: id.clone(),
-        name: name.clone(),
+/// Build the `Created` registry entry for a detached run, persisting the full
+/// relaunch inputs into RunConfig. scratch_path/region_path are filled in by the
+/// runtime once the launched child sets up its overlay + region.
+fn build_created_state(
+    req: &carrick_engine::CliRunRequest,
+    id: &str,
+    name: Option<String>,
+    created_secs: u64,
+) -> ContainerState {
+    ContainerState {
+        id: id.to_string(),
+        name,
         image: req.image_ref.clone(),
         command: req.args.clone(),
         status: ContainerStatus::Created,
@@ -52,9 +94,6 @@ pub(crate) fn run_detached(
         created_secs,
         exit_code: None,
         auto_remove: req.rm,
-        // Persist the run inputs `exec` needs to reconstruct a compatible run.
-        // scratch_path/region_path are filled in by the runtime once the
-        // detached child sets up its overlay + region (Phases C/B).
         config: RunConfig {
             platform: req.platform.clone(),
             env: req.env_overrides.clone(),
@@ -72,61 +111,195 @@ pub(crate) fn run_detached(
             stop_signal: None,
             stop_timeout: None,
         },
-    };
-    state
-        .create()
-        .with_context(|| format!("failed to create container registry entry for {id}"))?;
-
-    let log = container::log_path(&id)?;
-
-    // SAFETY: fork(2). The CLI is single-threaded here (no tokio runtime is
-    // live at this point — block_on_oci builds its own per-call runtime, and we
-    // have not entered it yet), so fork is safe.
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
-        let _ = ContainerState::remove(&id);
-        bail!("fork failed for detached run");
     }
-    if pid > 0 {
-        // PARENT: print the container id (docker prints the full id) and return.
-        // The detached child is reparented to launchd and lives on.
-        println!("{id}");
-        return Ok(());
-    }
+}
 
-    // CHILD: become a session leader so we are not killed when the invoking
-    // shell exits, and detach from the controlling terminal.
+/// The post-fork CHILD body shared by `run -d` and `start`: become a session
+/// leader, redirect stdio to the container log, point the runtime at this
+/// container (`CARRICK_CONTAINER_ID`), optionally attach an already-extracted
+/// overlay (`attach_overlay` — set on `start`/`restart` to skip re-extraction),
+/// run the engine, and exit with the container's code. Never returns.
+fn run_supervised_child(
+    req: carrick_engine::CliRunRequest,
+    store: carrick_image::ImageStore,
+    id: &str,
+    log: &std::path::Path,
+    attach_overlay: Option<&str>,
+) -> ! {
     // SAFETY: setsid on a fresh fork child that is not a process-group leader.
     unsafe {
         libc::setsid();
     }
-    // Redirect stdio: stdin from /dev/null, stdout+stderr to the container log,
-    // so the guest's streamed output is captured for `carrick logs` and nothing
-    // touches the user's terminal.
-    redirect_detached_stdio(&log);
-
-    // Tell the runtime which container this is, so its supervisor records the
-    // live pids + final status into the registry (see runtime::
-    // maybe_fork_ns_supervisor).
+    redirect_detached_stdio(log);
     // SAFETY: single-threaded child, pre-runtime.
     unsafe {
-        std::env::set_var("CARRICK_CONTAINER_ID", &id);
-    }
-
-    let engine = carrick_engine::Engine::new(store);
-    let result = crate::runtime_util::block_on_oci(async { engine.run(req).await });
-    // The supervisor already marked the registry entry Exited; just exit with
-    // the container's code. (If the run errored before the supervisor took
-    // over, reflect that as a non-zero exit + Exited state.)
-    match result {
-        Ok(r) => {
-            std::process::exit(r.exit_code);
+        std::env::set_var("CARRICK_CONTAINER_ID", id);
+        if let Some(scratch) = attach_overlay {
+            // Reuse the existing overlay (already holds the rootfs + prior
+            // writes); the runtime attaches it and skips layer extraction.
+            std::env::set_var("CARRICK_EXEC_OVERLAY", scratch);
         }
+    }
+    let engine = carrick_engine::Engine::new(store);
+    match crate::runtime_util::block_on_oci(async { engine.run(req).await }) {
+        Ok(r) => std::process::exit(r.exit_code),
         Err(_) => {
-            container::mark_exited(&id, 1);
+            container::mark_exited(id, 1);
             std::process::exit(1);
         }
     }
+}
+
+/// `carrick create` — build a container (and warm/pull its image so image errors
+/// surface now, like `docker create`) WITHOUT starting it; print its id. The
+/// rootfs overlay is extracted lazily on the first `start`.
+pub(crate) fn create(
+    req: carrick_engine::CliRunRequest,
+    store: carrick_image::ImageStore,
+    name: Option<String>,
+) -> anyhow::Result<()> {
+    let created_secs = now_secs();
+    let id = container::make_id(std::process::id() as u64, created_secs);
+    let name = resolve_name(name, &id)?;
+    // Warm the image cache + surface image errors at create time.
+    let image_ref = carrick_image::ImageReference::parse(&req.image_ref)?;
+    let target = req
+        .platform
+        .as_deref()
+        .and_then(carrick_image::PlatformTarget::parse)
+        .unwrap_or_else(carrick_image::PlatformTarget::default_target);
+    crate::runtime_util::block_on_oci(store.resolve_with_platform(&image_ref, &target))?;
+    build_created_state(&req, &id, name, created_secs)
+        .create()
+        .with_context(|| format!("failed to create container registry entry for {id}"))?;
+    println!("{id}");
+    Ok(())
+}
+
+/// Reconstruct a `CliRunRequest` from a persisted container so `start` can
+/// relaunch it. The command is persisted SPLIT (state.command = cmd args,
+/// config.entrypoint = the override) so the engine re-merges entrypoint+cmd
+/// instead of double-applying the image entrypoint.
+fn rebuild_request_from_state(state: &ContainerState) -> carrick_engine::CliRunRequest {
+    let c = &state.config;
+    carrick_engine::CliRunRequest {
+        image_ref: state.image.clone(),
+        platform: c.platform.clone(),
+        args: state.command.clone(),
+        env_overrides: c.env.clone(),
+        mounts: c.mounts.clone(),
+        workdir: c.workdir.clone(),
+        user: c.user.clone(),
+        entrypoint_override: c.entrypoint.clone(),
+        tty: c.tty,
+        interactive: c.interactive,
+        rm: state.auto_remove,
+        name: None,
+        max_traps: c.max_traps,
+        debug_state_path: None,
+        fs: c.fs,
+        pid: c.pid,
+    }
+}
+
+/// `carrick start` — (re)launch one or more created/stopped containers, reusing
+/// their persisted config + overlay. Daemonless restart = a fresh fork +
+/// supervisor + region over the SAME overlay.
+pub(crate) fn start(
+    store: &carrick_image::ImageStore,
+    _attach: bool,
+    specs: &[String],
+) -> anyhow::Result<()> {
+    let mut had_err = false;
+    for spec in specs {
+        match start_one(store, spec) {
+            Ok(id) => println!("{id}"),
+            Err(e) => {
+                eprintln!("Error: {e}");
+                had_err = true;
+            }
+        }
+    }
+    if had_err {
+        bail!("one or more containers failed to start");
+    }
+    Ok(())
+}
+
+fn start_one(store: &carrick_image::ImageStore, spec: &str) -> anyhow::Result<String> {
+    let id = container::resolve(spec).map_err(anyhow::Error::msg)?;
+    let mut state = ContainerState::load(&id)?;
+    if container::reconciled_status(&state) == ContainerStatus::Running {
+        // docker: starting an already-running container is a no-op success.
+        return Ok(id);
+    }
+    if state.auto_remove {
+        bail!(
+            "container {} was created with --rm and cannot be started/restarted",
+            container::short_id(&id)
+        );
+    }
+    if matches!(state.config.fs, Some(carrick_spec::FsBackendKind::Memory)) {
+        bail!("start requires a container created with --fs host");
+    }
+    // If a prior run populated the overlay (scratch_path set), attach it (skip
+    // re-extraction, preserving the container's writes); otherwise this is the
+    // first start and the runtime extracts the rootfs.
+    let attach_overlay = state.config.scratch_path.clone();
+    // A relaunch forks a FRESH supervisor + region; unlink the stale region file
+    // so alloc_region maps a clean, seeded one (a reused file keeps dead members).
+    if let Some(region) = &state.config.region_path {
+        let _ = std::fs::remove_file(region);
+    }
+    reset_for_relaunch(&mut state);
+    state.persist()?;
+
+    let req = rebuild_request_from_state(&state);
+    let log = container::log_path(&id)?;
+    // SAFETY: fork(2); single-threaded (no live tokio runtime).
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        bail!("fork failed for start");
+    }
+    if pid > 0 {
+        return Ok(id);
+    }
+    run_supervised_child(req, store.clone(), &id, &log, attach_overlay.as_deref());
+}
+
+/// Reset a container's volatile state for a relaunch. The supervisor overwrites
+/// status/supervisor_pid/init_pid on takeover but NOT exit_code, so a stale
+/// `Some(code)` would otherwise persist into the new Running entry; region_path
+/// is cleared because the relaunch maps a fresh region.
+fn reset_for_relaunch(state: &mut ContainerState) {
+    state.status = ContainerStatus::Created;
+    state.exit_code = None;
+    state.init_pid = 0;
+    state.supervisor_pid = 0;
+    state.config.region_path = None;
+}
+
+/// `carrick restart` — stop (if running) then start, reusing the overlay.
+pub(crate) fn restart(
+    store: &carrick_image::ImageStore,
+    secs: u64,
+    specs: &[String],
+) -> anyhow::Result<()> {
+    let mut had_err = false;
+    for spec in specs {
+        let result = stop_one(spec, secs).and_then(|_| start_one(store, spec));
+        match result {
+            Ok(id) => println!("{id}"),
+            Err(e) => {
+                eprintln!("Error: {e}");
+                had_err = true;
+            }
+        }
+    }
+    if had_err {
+        bail!("one or more containers failed to restart");
+    }
+    Ok(())
 }
 
 /// Point fd 0 at /dev/null and fds 1/2 at the container log file (append).
@@ -567,7 +740,8 @@ pub(crate) fn exec(
         platform: state.config.platform.clone(),
         args: command,
         env_overrides,
-        mounts: vec![],
+        // Reapply the container's bind mounts so exec sees the same mounted dirs.
+        mounts: state.config.mounts.clone(),
         workdir: workdir.or_else(|| state.config.workdir.clone()),
         user: user.or_else(|| state.config.user.clone()),
         // exec runs the command directly — no image ENTRYPOINT prepended.
@@ -871,7 +1045,83 @@ fn select_tail(data: &[u8], tail: Option<usize>) -> &[u8] {
 
 #[cfg(test)]
 mod tests {
-    use super::{render_format, select_tail};
+    use super::{
+        ContainerState, ContainerStatus, RunConfig, rebuild_request_from_state, render_format,
+        reset_for_relaunch, select_tail,
+    };
+
+    fn sample_state() -> ContainerState {
+        ContainerState {
+            id: "a".repeat(64),
+            name: Some("c".into()),
+            image: "ubuntu:24.04".into(),
+            command: vec!["echo".into(), "hi".into()],
+            status: ContainerStatus::Exited,
+            supervisor_pid: 5,
+            init_pid: 6,
+            created_secs: 1,
+            exit_code: Some(3),
+            auto_remove: false,
+            config: RunConfig {
+                platform: Some("linux/arm64".into()),
+                env: vec!["A=1".into()],
+                workdir: Some("/w".into()),
+                user: Some("1000".into()),
+                pid: carrick_spec::PidMode::Private,
+                scratch_path: Some("/s".into()),
+                region_path: Some("/r".into()),
+                entrypoint: Some(vec!["/bin/sh".into(), "-c".into()]),
+                mounts: vec![carrick_spec::Mount {
+                    source: "/h".into(),
+                    target: "/g".into(),
+                    readonly: true,
+                }],
+                fs: Some(carrick_spec::FsBackendKind::Host),
+                tty: true,
+                interactive: false,
+                max_traps: 4242,
+                stop_signal: None,
+                stop_timeout: None,
+            },
+        }
+    }
+
+    #[test]
+    fn rebuild_request_reproduces_run_inputs_split_not_merged() {
+        let req = rebuild_request_from_state(&sample_state());
+        assert_eq!(req.image_ref, "ubuntu:24.04");
+        assert_eq!(req.platform.as_deref(), Some("linux/arm64"));
+        // D1: persisted SPLIT — args is the cmd, entrypoint is the override; the
+        // engine re-merges (storing the merged argv would double-apply the image
+        // entrypoint).
+        assert_eq!(req.args, vec!["echo".to_string(), "hi".to_string()]);
+        assert_eq!(
+            req.entrypoint_override,
+            Some(vec!["/bin/sh".to_string(), "-c".to_string()])
+        );
+        assert_eq!(req.env_overrides, vec!["A=1".to_string()]);
+        assert_eq!(req.workdir.as_deref(), Some("/w"));
+        assert_eq!(req.user.as_deref(), Some("1000"));
+        assert_eq!(req.mounts.len(), 1);
+        assert_eq!(req.fs, Some(carrick_spec::FsBackendKind::Host));
+        assert!(req.tty);
+        assert_eq!(req.max_traps, 4242);
+        assert_eq!(req.pid, carrick_spec::PidMode::Private);
+        assert!(!req.rm);
+    }
+
+    #[test]
+    fn reset_for_relaunch_clears_volatile_state() {
+        let mut s = sample_state();
+        reset_for_relaunch(&mut s);
+        assert_eq!(s.status, ContainerStatus::Created);
+        assert_eq!(s.exit_code, None); // D5: stale exit code MUST be cleared
+        assert_eq!(s.init_pid, 0);
+        assert_eq!(s.supervisor_pid, 0);
+        assert_eq!(s.config.region_path, None);
+        // The overlay path is preserved (the relaunch reuses it).
+        assert_eq!(s.config.scratch_path.as_deref(), Some("/s"));
+    }
 
     #[test]
     fn render_format_field_access() {
