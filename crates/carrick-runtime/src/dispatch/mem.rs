@@ -646,20 +646,23 @@ impl SyscallDispatcher {
                 this.writeback_shared(cx, &alloc, true);
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
-            // A guest VA inside the high-VA alias window is a dynamic alias
-            // mapping — a MAP_SHARED file region (backed LIVE by the host page
-            // cache, so no writeback is owed). It is a valid mapping, so munmap
-            // must succeed (LTP munmap01/02 unmapped a MAP_SHARED file region
-            // and carrick wrongly returned EINVAL because the alias VA is in
-            // neither the shared aperture nor the mmap arena). Best-effort
-            // stage-1 invalidate so use-after-munmap faults; arm64 HVF has no
-            // stage-2 unmap, so the alias IPA + dup fd are reclaimed at process
-            // teardown. Addresses BEYOND the window (e.g. RLIM_INFINITY, which
-            // LTP munmap03 passes to assert EINVAL, or the Rosetta arena) fall
-            // through to the range check below and stay EINVAL.
-            let alias_end =
-                crate::memory::LINUX_HIGH_VA_THRESHOLD + crate::memory::LINUX_ALIAS_IPA_SIZE;
-            if address.0 >= crate::memory::LINUX_HIGH_VA_THRESHOLD && address.0 < alias_end {
+            // A canonical high guest VA (>= 1 TiB, < 2^48) is a dynamic alias
+            // mapping: either a MAP_SHARED file region (carrick-chosen VA in the
+            // narrow alias window, backed LIVE by the host page cache, so no
+            // writeback is owed) OR a MAP_FIXED mapping at a guest-chosen high VA
+            // (Apple Rosetta maps its translated ELF + arenas in the x86-64 high
+            // half; the 16-bit pointer tag was stripped at mmap time, so the VA
+            // carrick mapped — and the guest munmaps — is a canonical 48-bit
+            // address). Both are valid mappings, so munmap must succeed (LTP
+            // munmap01/02 also unmapped a MAP_SHARED file region and carrick
+            // wrongly returned EINVAL when the alias VA was in neither the shared
+            // aperture nor the mmap arena). Best-effort stage-1 invalidate so
+            // use-after-munmap faults; arm64 HVF has no stage-2 unmap, so the
+            // alias IPA + any dup fd are reclaimed at process teardown.
+            // Misaligned addresses (e.g. RLIM_INFINITY, which LTP munmap03 passes
+            // to assert EINVAL) are already rejected by the alignment gate above;
+            // addresses >= 2^48 stay EINVAL via the range check below.
+            if crate::memory::is_high_va(address.0) && address.0 < (1u64 << 48) {
                 if let Some(len) = align_up_u64(length, LINUX_PAGE_SIZE)
                     && let Ok(len_usize) = usize::try_from(len)
                 {
