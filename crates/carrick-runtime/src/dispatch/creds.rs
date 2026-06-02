@@ -307,14 +307,23 @@ impl SyscallDispatcher {
                 Ok(data) => data,
                 Err(errno) => return Ok(errno.into()),
             };
-            // Accept-and-record: store the requested effective/permitted/
-            // inheritable set rather than rejecting non-empty sets, so
-            // libcap-based tools (dpkg, setpriv) that capset() to drop/raise
-            // caps don't abort (docs/namespaces-design.md §4.4). Not enforced —
-            // carrick is the kernel and does not modulate DAC by caps. The
-            // bounding/ambient sets are preserved (capset cannot raise them).
+            // Accept-and-record so libcap tools (dpkg, setpriv) that capset() to
+            // DROP caps don't abort — carrick is the kernel and does not modulate
+            // DAC by capabilities (docs/namespaces-design.md §4.4). The bounding/
+            // ambient sets are preserved (capset cannot raise them). But the
+            // STRUCTURAL well-formedness invariants Linux enforces for EVERY
+            // caller (root included) are not privilege checks, and libcap relies
+            // on the errno, so they ARE enforced here:
+            //   * a capability may be effective only if it is also permitted, and
+            //   * capset can never RAISE permitted (only drop/keep it).
+            // Violations are EPERM even for a fully-privileged caller (oracle:
+            // debian:stable root, capset{eff=1,prm=0} -> EPERM). Valid drops
+            // satisfy both rules, so dpkg/setpriv still succeed.
             let mut caps = crate::namespace::process::caps();
             let (eff, prm, inh) = capability_set_from_words(&data);
+            if (eff & !prm) != 0 || (prm & !caps.permitted) != 0 {
+                return Ok(LINUX_EPERM.into());
+            }
             caps.effective = eff;
             caps.permitted = prm;
             caps.inheritable = inh;

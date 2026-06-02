@@ -10,6 +10,20 @@ use support::*;
 
 use carrick_runtime::linux_abi::LINUX_EACCES;
 
+/// Serializes the capability tests. `capget`/`capset` both read/mutate the
+/// process-global modeled capability set (`namespace::process::caps()`), which
+/// is shared across the whole test binary and is NOT reset between tests.
+/// Holding this lock for each test's body keeps them from interleaving (capset's
+/// record would otherwise race capget's read in the parallel harness).
+static CAPS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Establish a deterministic baseline: the Docker-default modeled cap set a
+/// fresh carrick process starts with. Call under `CAPS_TEST_LOCK`.
+fn reset_modeled_caps_to_docker_default() {
+    use carrick_runtime::namespace::process::{CapabilitySet, set_caps};
+    set_caps(CapabilitySet::docker_default());
+}
+
 #[test]
 fn process_identity_syscalls_return_bootstrap_ids() {
     let mut memory = LinearMemory::new(0x4000, Vec::new());
@@ -41,7 +55,10 @@ fn process_identity_syscalls_return_bootstrap_ids() {
 }
 
 #[test]
-fn capget_writes_empty_bootstrap_capability_sets() {
+fn capget_writes_docker_default_capability_sets() {
+    let _guard = CAPS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    reset_modeled_caps_to_docker_default();
+
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
     write_capability_header(&mut memory, 0x4000, LINUX_CAPABILITY_VERSION_3, 0);
     let reporter = CompatReporter::default();
@@ -57,15 +74,21 @@ fn capget_writes_empty_bootstrap_capability_sets() {
             .unwrap(),
         DispatchOutcome::Returned { value: 0 }
     );
+    // A default container root reports the Docker-default capability set
+    // (effective=permitted=0xa80425fb, inheritable=0), NOT an empty set —
+    // matching `docker run debian` /proc/self/status and capget(2) on arm64.
     assert_eq!(
         read_capability_data(&memory, 0x4080, 2),
-        vec![(0, 0, 0), (0, 0, 0)]
+        vec![(0xa804_25fb, 0xa804_25fb, 0), (0, 0, 0)]
     );
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
 
 #[test]
 fn capset_accepts_empty_sets_and_rejects_nonempty_sets() {
+    let _guard = CAPS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    reset_modeled_caps_to_docker_default();
+
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
     write_capability_header(&mut memory, 0x4000, LINUX_CAPABILITY_VERSION_3, 0);
     write_capability_data(&mut memory, 0x4080, [(0, 0, 0), (0, 0, 0)]);

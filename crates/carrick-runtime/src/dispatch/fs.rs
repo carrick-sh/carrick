@@ -4934,6 +4934,8 @@ impl SyscallDispatcher {
                 // the guest's Go splice loop just makes another pass for the rest.
                 let want = count.min(1 << 20);
                 let mut buf = vec![0u8; want];
+                // Non-blocking peek (MSG_PEEK | MSG_DONTWAIT below): never blocks
+                // under the dispatcher lock; EAGAIN is surfaced, not awaited here.
                 let n = unsafe {
                     libc::recv(
                         host_fd,
@@ -4964,6 +4966,9 @@ impl SyscallDispatcher {
                 // remainder that the next PEEK re-delivers → duplicated bytes).
                 let mut consumed = 0usize;
                 while consumed < written {
+                    // Non-blocking drain (MSG_DONTWAIT below): the bytes are known
+                    // to be present (we just peeked them), so this never blocks
+                    // under the dispatcher lock.
                     let cn = unsafe {
                         libc::recv(
                             host_fd,

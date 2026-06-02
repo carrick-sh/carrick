@@ -2679,7 +2679,11 @@ fn proc_self_magic_links_readlink_and_lstat() {
             &reporter,
         )
         .unwrap();
-    assert_eq!(out, DispatchOutcome::Returned { value: 0 }, "lstat exe: {out:?}");
+    assert_eq!(
+        out,
+        DispatchOutcome::Returned { value: 0 },
+        "lstat exe: {out:?}"
+    );
     let st = read_stat(&memory, 0x4300);
     assert_eq!(
         st.st_mode & LINUX_S_IFMT,
@@ -2766,7 +2770,10 @@ fn proc_self_fd_directory_lists_open_fds() {
     // getdents64(dirfd, buf, count) = syscall 61.
     let outcome = dispatcher
         .dispatch(
-            SyscallRequest::new(61, SyscallArgs::from([dirfd as u64, 0x4400, 0x1000, 0, 0, 0])),
+            SyscallRequest::new(
+                61,
+                SyscallArgs::from([dirfd as u64, 0x4400, 0x1000, 0, 0, 0]),
+            ),
             &mut memory,
             &reporter,
         )
@@ -2845,7 +2852,10 @@ fn proc_self_auxv_refreshes_when_image_state_is_updated() {
     let mut dispatcher = SyscallDispatcher::new();
 
     dispatcher.set_auxv_image(vec![1, 2, 3, 4, 5, 6, 7, 8]);
-    assert_eq!(read_auxv(&mut dispatcher, &mut memory), vec![1, 2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(
+        read_auxv(&mut dispatcher, &mut memory),
+        vec![1, 2, 3, 4, 5, 6, 7, 8]
+    );
 
     // A subsequent image (the execve refresh) replaces it.
     dispatcher.set_auxv_image(vec![9, 10, 11, 12]);
@@ -2898,11 +2908,16 @@ fn proc_self_fdinfo_renders_pos_flags_ino() {
     };
     let content = String::from_utf8(memory.read_bytes(0x4400, nbytes as usize).unwrap()).unwrap();
     for label in ["pos:\t", "flags:\t0", "mnt_id:\t", "ino:\t"] {
-        assert!(content.contains(label), "fdinfo missing {label:?}: {content:?}");
+        assert!(
+            content.contains(label),
+            "fdinfo missing {label:?}: {content:?}"
+        );
     }
 
     // A closed/unopened fd's fdinfo is ENOENT.
-    memory.write_bytes(0x4000, b"/proc/self/fdinfo/4242\0").unwrap();
+    memory
+        .write_bytes(0x4000, b"/proc/self/fdinfo/4242\0")
+        .unwrap();
     let missing = dispatcher
         .dispatch(
             SyscallRequest::new(
@@ -3007,7 +3022,14 @@ fn synthetic_proc_surface_serves_common_process_and_system_files() {
         ("/proc/self/statm", b"0 0"),
         ("/proc/self/status", b"Name:\texe"),
         ("/proc/sys/kernel/osrelease", b"carrick"),
-        ("/proc/sys/kernel/hostname", b"carrick"),
+        // --net=host contract: /proc/sys/kernel/hostname is the live host short
+        // name (guest_hostname(), in lockstep with uname nodename), NOT a fixed
+        // string. Derive from the single source of truth so any host name passes;
+        // it falls back to "carrick" when the host has no usable name.
+        (
+            "/proc/sys/kernel/hostname",
+            carrick_runtime::execute::guest_hostname().as_bytes(),
+        ),
         // boot_id is now a random v4 UUID (was an all-zero sentinel); the only
         // value-stable marker is the version-4 nibble at the 3rd group.
         ("/proc/sys/kernel/random/boot_id", b"-4"),
@@ -3140,7 +3162,9 @@ fn proc_self_oom_score_adj_is_writable() {
     // systemd/runc write oom_score_adj at startup; carrick accepts-and-ignores
     // the write (no EACCES on open, no EBADF on write) so they don't warn.
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
-    memory.write_bytes(0x4000, b"/proc/self/oom_score_adj\0").unwrap();
+    memory
+        .write_bytes(0x4000, b"/proc/self/oom_score_adj\0")
+        .unwrap();
     memory.write_bytes(0x4200, b"-1000\n").unwrap();
     let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
