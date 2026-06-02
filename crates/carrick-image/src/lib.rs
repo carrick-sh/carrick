@@ -632,6 +632,28 @@ impl ImageStore {
         (count, bytes)
     }
 
+    /// Total bytes of all blobs on disk, and the bytes reclaimable by
+    /// [`gc_blobs`] (blobs not referenced by any image). Drives `system df`.
+    pub fn blob_disk_usage(&self) -> (u64, u64) {
+        let referenced = self.referenced_blobs();
+        let blobs_dir = self.root.join("blobs").join("sha256");
+        let Ok(entries) = std::fs::read_dir(&blobs_dir) else {
+            return (0, 0);
+        };
+        let (mut total, mut reclaimable) = (0u64, 0u64);
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let sz = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            total += sz;
+            if let Some(enc) = path.file_name().and_then(|n| n.to_str())
+                && !referenced.contains(&format!("sha256:{enc}"))
+            {
+                reclaimable += sz;
+            }
+        }
+        (total, reclaimable)
+    }
+
     /// Tag a stored image under a new reference (`docker tag`): copy the
     /// default-platform metadata to the new ref's directory, rewriting the
     /// summary. Blobs are content-addressed and shared, so nothing is copied.

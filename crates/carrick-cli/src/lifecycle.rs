@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, bail};
 use carrick_runtime::container::{self, ContainerState, ContainerStatus, RunConfig};
 
-use crate::runtime_util::{human_age, truncate_str};
+use crate::runtime_util::{human_age, human_size, truncate_str};
 
 /// Detach into the background and run the container under its own supervisor,
 /// printing the container id and returning. Mirrors `docker run -d`.
@@ -197,6 +197,93 @@ pub(crate) fn ps(
         );
     }
     Ok(())
+}
+
+/// `carrick system df` — disk-usage summary for images and containers.
+pub(crate) fn system_df(store: &carrick_image::ImageStore) -> anyhow::Result<()> {
+    let images = store.list_images();
+    let (blob_total, blob_reclaimable) = store.blob_disk_usage();
+    let containers = container::list();
+    let running = containers
+        .iter()
+        .filter(|c| container::reconciled_status(c) == ContainerStatus::Running)
+        .count();
+    let (mut cont_total, mut cont_reclaimable) = (0u64, 0u64);
+    for c in &containers {
+        let sz = c
+            .config
+            .scratch_path
+            .as_deref()
+            .map(|p| dir_size(std::path::Path::new(p)))
+            .unwrap_or(0);
+        cont_total += sz;
+        if container::reconciled_status(c) != ContainerStatus::Running {
+            cont_reclaimable += sz;
+        }
+    }
+    println!(
+        "{:<16}{:<8}{:<8}{:<12}{}",
+        "TYPE", "TOTAL", "ACTIVE", "SIZE", "RECLAIMABLE"
+    );
+    println!(
+        "{:<16}{:<8}{:<8}{:<12}{}",
+        "Images",
+        images.len(),
+        images.len(),
+        human_size(blob_total),
+        human_size(blob_reclaimable)
+    );
+    println!(
+        "{:<16}{:<8}{:<8}{:<12}{}",
+        "Containers",
+        containers.len(),
+        running,
+        human_size(cont_total),
+        human_size(cont_reclaimable)
+    );
+    Ok(())
+}
+
+/// `carrick system prune` — remove stopped containers and unreferenced image
+/// layers, reporting reclaimed space.
+pub(crate) fn system_prune(store: &carrick_image::ImageStore) -> anyhow::Result<()> {
+    let (mut removed, mut cont_bytes) = (0usize, 0u64);
+    for c in container::list() {
+        if container::reconciled_status(&c) != ContainerStatus::Running {
+            if let Some(p) = c.config.scratch_path.as_deref() {
+                cont_bytes += dir_size(std::path::Path::new(p));
+            }
+            if ContainerState::remove(&c.id).is_ok() {
+                removed += 1;
+            }
+        }
+    }
+    let (blob_count, blob_bytes) = store.gc_blobs();
+    println!("Deleted {removed} stopped container(s)");
+    println!(
+        "Total reclaimed space: {} ({blob_count} unreferenced layer(s))",
+        human_size(cont_bytes + blob_bytes)
+    );
+    Ok(())
+}
+
+/// Recursively sum the byte sizes of regular files under `path`.
+fn dir_size(path: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            match entry.metadata() {
+                Ok(m) if m.is_dir() => stack.push(entry.path()),
+                Ok(m) => total += m.len(),
+                Err(_) => {}
+            }
+        }
+    }
+    total
 }
 
 /// Generate a docker-style `adjective_surname` container name seeded by the id,

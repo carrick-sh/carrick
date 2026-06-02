@@ -15,7 +15,7 @@ use carrick_runtime::runtime::{
 use carrick_runtime::syscall::{aarch64_table, lookup_aarch64};
 use carrick_runtime::trap::hvf_capabilities;
 
-use crate::args::{Cli, Commands, RootfsCommand};
+use crate::args::{Cli, Commands, RootfsCommand, SystemCommand};
 use crate::debug::run_debug;
 use crate::fs_setup::install_fs_backend;
 use crate::runtime_util::{
@@ -302,6 +302,10 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 human_size(bytes)
             );
         }
+        Commands::System { command } => match command {
+            SystemCommand::Df => crate::lifecycle::system_df(&store)?,
+            SystemCommand::Prune { force: _ } => crate::lifecycle::system_prune(&store)?,
+        },
         Commands::Tag { source, target } => {
             let src = ImageReference::parse(&source)
                 .with_context(|| format!("invalid source image {source:?}"))?;
