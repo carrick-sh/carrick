@@ -358,6 +358,11 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
         // `Shell` is normalised to `Run` (interactive /bin/sh) before this
         // match, so it is never reached here.
         Commands::Shell { .. } => bail!("internal error: shell command was not normalized to run"),
+        Commands::Logs {
+            follow,
+            tail,
+            container,
+        } => crate::lifecycle::logs(&container, follow, tail)?,
         Commands::Ps { all, quiet } => crate::lifecycle::ps(all, quiet)?,
         Commands::Stop { time, containers } => crate::lifecycle::stop(time, &containers)?,
         Commands::Kill { signal, containers } => crate::lifecycle::kill(&signal, &containers)?,

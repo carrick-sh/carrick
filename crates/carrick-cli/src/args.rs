@@ -166,6 +166,18 @@ pub(crate) enum Commands {
         #[arg(default_value = "alpine:latest")]
         image: String,
     },
+    /// Fetch a container's logs (like `docker logs`). Replays the stdout/stderr
+    /// captured from a detached (`run -d`) container.
+    Logs {
+        /// Follow log output (stream appended bytes until the container exits).
+        #[arg(short = 'f', long = "follow")]
+        follow: bool,
+        /// Show only the last N lines.
+        #[arg(short = 'n', long = "tail", value_name = "N")]
+        tail: Option<usize>,
+        /// Container id or name.
+        container: String,
+    },
     /// List containers (like `docker ps`). Shows running containers; `--all`
     /// includes exited ones.
     Ps {

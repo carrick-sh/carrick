@@ -1874,6 +1874,61 @@ fn run_accepts_tty_flag() {
     );
 }
 
+#[test]
+fn logs_replays_captured_output_for_a_container() {
+    // The registry root prefers the shared /Volumes/carrick volume when it
+    // exists; only when it's absent does CARRICK_HOME redirect it. Self-skip on
+    // a host with the shared volume so we never pollute (or depend on) it.
+    if std::path::Path::new("/Volumes/carrick").is_dir() {
+        eprintln!("SKIP logs_replays: shared /Volumes/carrick volume present");
+        return;
+    }
+    let home = tempfile::tempdir().unwrap();
+    // registry_root == <CARRICK_HOME>/scratch/containers/<id>/
+    let id = "a".repeat(64);
+    let cdir = home.path().join("scratch/containers").join(&id);
+    std::fs::create_dir_all(&cdir).unwrap();
+    let state = serde_json::json!({
+        "id": id, "name": serde_json::Value::Null, "image": "img", "command": [],
+        "status": "exited", "supervisor_pid": 0, "init_pid": 0,
+        "created_secs": 0, "exit_code": 0, "auto_remove": false,
+    });
+    std::fs::write(cdir.join("state.json"), serde_json::to_vec(&state).unwrap()).unwrap();
+    std::fs::write(cdir.join("output.log"), b"hello from logs\nsecond line\n").unwrap();
+
+    // Full replay.
+    Command::cargo_bin("carrick")
+        .unwrap()
+        .env("CARRICK_HOME", home.path())
+        .args(["logs", &id])
+        .assert()
+        .success()
+        .stdout(contains("hello from logs"))
+        .stdout(contains("second line"));
+
+    // `--tail 1` shows only the last line.
+    Command::cargo_bin("carrick")
+        .unwrap()
+        .env("CARRICK_HOME", home.path())
+        .args(["logs", "--tail", "1", &id])
+        .assert()
+        .success()
+        .stdout(contains("second line"))
+        .stdout(contains("hello from logs").not());
+}
+
+#[test]
+fn logs_unknown_container_errors() {
+    // A random id matches nothing in any registry → docker-style "no such
+    // container". Hermetic regardless of registry location.
+    Command::cargo_bin("carrick")
+        .unwrap()
+        .args(["logs", "definitely-not-a-real-container-id"])
+        .assert()
+        .failure()
+        .stderr(contains("no such container"));
+}
+
 fn minimal_aarch64_elf() -> Vec<u8> {
     let mut elf = vec![0_u8; 64];
     elf[0..4].copy_from_slice(b"\x7fELF");
