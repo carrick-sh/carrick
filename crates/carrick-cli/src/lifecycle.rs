@@ -8,7 +8,7 @@ use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
-use carrick_runtime::container::{self, ContainerState, ContainerStatus};
+use carrick_runtime::container::{self, ContainerState, ContainerStatus, RunConfig};
 
 /// Detach into the background and run the container under its own supervisor,
 /// printing the container id and returning. Mirrors `docker run -d`.
@@ -46,6 +46,18 @@ pub(crate) fn run_detached(
         created_secs,
         exit_code: None,
         auto_remove: req.rm,
+        // Persist the run inputs `exec` needs to reconstruct a compatible run.
+        // scratch_path/region_path are filled in by the runtime once the
+        // detached child sets up its overlay + region (Phases C/B).
+        config: RunConfig {
+            platform: req.platform.clone(),
+            env: req.env_overrides.clone(),
+            workdir: req.workdir.clone(),
+            user: req.user.clone(),
+            pid: req.pid,
+            scratch_path: None,
+            region_path: None,
+        },
     };
     state
         .create()
@@ -450,7 +462,12 @@ fn container_to_json(c: &ContainerState, status: ContainerStatus) -> serde_json:
             "Pid": if running { c.init_pid } else { 0 },
             "ExitCode": c.exit_code.unwrap_or(0),
         },
-        "Config": { "Cmd": c.command },
+        "Config": {
+            "Cmd": c.command,
+            "Env": c.config.env,
+            "WorkingDir": c.config.workdir,
+            "User": c.config.user,
+        },
     })
 }
 
