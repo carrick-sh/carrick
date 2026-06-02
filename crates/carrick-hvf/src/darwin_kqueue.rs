@@ -120,12 +120,19 @@ impl Kevent {
     /// `kevent` returns this event) when the process terminates — the macOS
     /// kernel's native process-lifecycle tracking that backs a guest pidfd.
     /// One-shot: fires once on exit.
+    ///
+    /// Armed with `NOTE_EXITSTATUS` as well as `NOTE_EXIT` so the returned
+    /// event's `data` field carries the exit status ([`proc_exit_status`]). Under
+    /// plain `NOTE_EXIT` macOS leaves `data` at 0; the NsSupervisor needs the
+    /// real status to harvest a namespace member's exit code before launchd
+    /// reaps the host zombie (after which `waitpid` is ECHILD). Detection-only
+    /// callers ([`proc_exit_ident`]) are unaffected by the extra fflag.
     pub fn proc_exit(pid: i32) -> Self {
         Self::new(
             pid as usize,
             libc::EVFILT_PROC,
             (libc::EV_ADD | libc::EV_ONESHOT) as u16,
-            libc::NOTE_EXIT,
+            libc::NOTE_EXIT | libc::NOTE_EXITSTATUS,
         )
     }
 
