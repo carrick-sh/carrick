@@ -4,7 +4,7 @@
 //! dispatcher supplies live process/memory context, but adding a new synthetic
 //! `/proc` file should require touching this module and its tests.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -447,6 +447,113 @@ fn proc_net_dir_entries(path: &str) -> Option<Vec<DirEnt>> {
     Some(entries)
 }
 
+/// For a `/proc/{self,thread-self,curproc,this,<pid>}/<rest>` path, the `<rest>`
+/// after the process component. The magic process aliases and any numeric pid
+/// all resolve here so `exe`/`cwd`/`root`/`ns/*` work uniformly.
+fn proc_pid_subpath(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix("/proc/")?;
+    let (pid, sub) = rest.split_once('/')?;
+    let ok = matches!(pid, "self" | "thread-self" | "curproc" | "this")
+        || (!pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()));
+    ok.then_some(sub)
+}
+
+/// `/proc/<pid>/ns/<type>` namespace symlinks. Each readlinks to `<type>:[<inode>]`
+/// (namespaces(7)); the inodes are the standard initial-namespace numbers so a
+/// same-namespace equality check (readlink ns/pid == another proc's ns/pid)
+/// holds across the single guest carrick models. `*_for_children` mirror their
+/// base type's inode.
+const PROC_NS_TYPES: &[(&str, u64)] = &[
+    ("cgroup", 4026531835),
+    ("ipc", 4026531839),
+    ("mnt", 4026531840),
+    ("net", 4026531992),
+    ("pid", 4026531836),
+    ("pid_for_children", 4026531836),
+    ("time", 4026531834),
+    ("time_for_children", 4026531834),
+    ("user", 4026531837),
+    ("uts", 4026531838),
+];
+
+/// True iff `path` is a `/proc/<pid>/ns` directory (self/thread-self/… aliases).
+fn proc_ns_is_dir(path: &str) -> bool {
+    proc_pid_subpath(path) == Some("ns")
+}
+
+/// Directory listing for a `/proc/<pid>/ns` directory (one symlink per ns type).
+fn proc_ns_dir_entries(path: &str) -> Option<Vec<DirEnt>> {
+    if !proc_ns_is_dir(path) {
+        return None;
+    }
+    let mut entries = vec![
+        DirEnt {
+            name: ".".to_string(),
+            kind: EntryKind::Directory,
+        },
+        DirEnt {
+            name: "..".to_string(),
+            kind: EntryKind::Directory,
+        },
+    ];
+    entries.extend(PROC_NS_TYPES.iter().map(|(name, _)| DirEnt {
+        name: (*name).to_string(),
+        kind: EntryKind::Symlink,
+    }));
+    Some(entries)
+}
+
+/// The `<type>:[<inode>]` readlink target for a `/proc/<pid>/ns/<type>` path.
+fn proc_ns_link_target(path: &str) -> Option<String> {
+    let t = proc_pid_subpath(path)?.strip_prefix("ns/")?;
+    PROC_NS_TYPES
+        .iter()
+        .find(|(name, _)| *name == t)
+        .map(|(name, ino)| format!("{name}:[{ino}]"))
+}
+
+/// If `path` is a *leaf* `/proc` magic symlink, its readlink-target length (for
+/// the `st_size` an lstat reports). Drives `lookup_nofollow` reporting
+/// `S_IFLNK` for the per-pid `exe`/`cwd`/`root` and `ns/<type>` links.
+///
+/// Deliberately does NOT include the bare `/proc/self`, `/proc/thread-self` or
+/// `/proc/net` links: those must stay *traversable directories* so a path walk
+/// into `/proc/self/<file>` descends rather than trying to follow a symlink to
+/// a per-pid directory carrick doesn't fully serve (which would ENOTDIR every
+/// `/proc/self/*` open — the intermediate-component check at
+/// `dispatch/fs.rs` `validate_intermediate_dirs`). `readlink` still resolves
+/// them (a readlink doesn't require the target to lstat as a symlink), so
+/// `readlink /proc/self` → the pid and `readlink /proc/net` → self/net work.
+fn proc_magic_symlink_size(path: &str) -> Option<u64> {
+    let rest = proc_pid_subpath(path)?;
+    if matches!(rest, "exe" | "cwd" | "root") {
+        return Some(0);
+    }
+    proc_ns_link_target(path).map(|t| t.len() as u64)
+}
+
+/// The `<tgid>/task/<tid>` readlink target for `/proc/thread-self`. ProcVfs has
+/// no per-thread context, so this is the single-threaded approximation
+/// (tid == tgid); the dispatcher overrides it with the live tid when threaded.
+fn proc_thread_self_target() -> String {
+    let p = crate::namespace::pid::self_ns_pid();
+    format!("{p}/task/{p}")
+}
+
+/// Metadata for a `/proc` magic symlink: `S_IFLNK` mode 0o777, `size` = target
+/// length (what an lstat reports as `st_size`).
+fn proc_symlink_metadata(size: u64) -> Metadata {
+    Metadata {
+        kind: EntryKind::Symlink,
+        mode: 0o777,
+        size,
+        uid: 0,
+        gid: 0,
+        mtime_secs: 0,
+        mtime_nanos: 0,
+    }
+}
+
 /// Host interfaces mapped to Linux-plausible names: `lo0`→`lo` (always present),
 /// the first ethernet-like uplink (`enN`)→`eth0`; Darwin-only pseudo-interfaces
 /// (awdl/llw/utun/bridge/gif/stf/…) are dropped so a guest never sees macOS-isms
@@ -855,6 +962,7 @@ impl Vfs for ProcVfs {
         if path == "/proc"
             || sysctl_is_dir(path)
             || proc_net_is_dir(path)
+            || proc_ns_is_dir(path)
             || proc_task_dir_entries(path).is_some()
             || proc_pid_dir_entries(path).is_some()
         {
@@ -867,6 +975,12 @@ impl Vfs for ProcVfs {
                 mtime_secs: 0,
                 mtime_nanos: 0,
             });
+        }
+        // Magic symlinks (exe/cwd/root/ns/<type>, and the bare process aliases
+        // when not caught as directories above). A follow-stat lands here too,
+        // so faccessat(F_OK)/`test -e` see the link exist.
+        if let Some(size) = proc_magic_symlink_size(path) {
+            return Ok(proc_symlink_metadata(size));
         }
         if synthetic_file(path, &SyntheticProcContext::default()).is_some() {
             return Ok(Metadata {
@@ -882,10 +996,40 @@ impl Vfs for ProcVfs {
         Err(LINUX_ENOENT)
     }
 
+    fn lookup_nofollow(&self, path: &str) -> Result<Metadata, VfsError> {
+        // lstat must report the magic symlinks as `S_IFLNK` BEFORE the
+        // directory interpretation (e.g. `/proc/self` and `/proc/net` are
+        // symlinks to lstat, directories only when followed).
+        if let Some(size) = proc_magic_symlink_size(path) {
+            return Ok(proc_symlink_metadata(size));
+        }
+        self.lookup(path)
+    }
+
+    fn readlink(&self, path: &str) -> Result<PathBuf, VfsError> {
+        // Context-free magic links (the dispatcher handles exe/cwd/root, which
+        // need live state). `/proc/self` → the caller's ns-pid; `/proc/net` →
+        // the namespace-correct self/net; `/proc/<pid>/ns/<t>` → `<t>:[<ino>]`.
+        match path {
+            "/proc/self" | "/proc/curproc" | "/proc/this" => Ok(PathBuf::from(
+                crate::namespace::pid::self_ns_pid().to_string(),
+            )),
+            "/proc/thread-self" => Ok(PathBuf::from(proc_thread_self_target())),
+            "/proc/net" => Ok(PathBuf::from("self/net")),
+            _ => proc_ns_link_target(path)
+                .map(PathBuf::from)
+                .ok_or(crate::linux_abi::LINUX_EINVAL),
+        }
+    }
+
     fn readdir(&self, path: &str) -> Result<Vec<super::DirEnt>, VfsError> {
         if path == "/proc" {
             // Top-level: `.`/`..`, `self`, a representative set of synthetic
             // files, and every guest process pid (so `ps`/`ls /proc` enumerate).
+            // `self`/`thread-self` readlink to the caller's pid dir, but carrick
+            // models them as traversable directories (so `/proc/self/<file>`
+            // resolves without following into an unserved per-pid tree); report
+            // them as directories for getdents consistency with lstat.
             let mut entries = vec![
                 DirEnt {
                     name: ".".to_string(),
@@ -897,6 +1041,10 @@ impl Vfs for ProcVfs {
                 },
                 DirEnt {
                     name: "self".to_string(),
+                    kind: EntryKind::Directory,
+                },
+                DirEnt {
+                    name: "thread-self".to_string(),
                     kind: EntryKind::Directory,
                 },
             ];
@@ -926,7 +1074,8 @@ impl Vfs for ProcVfs {
                     kind: EntryKind::File,
                 });
             }
-            // The `/proc/sys` and `/proc/net` pseudo-directories.
+            // `/proc/sys` and `/proc/net` are both directories here (net readlinks
+            // to self/net but is served as a traversable dir).
             entries.push(DirEnt {
                 name: "sys".to_string(),
                 kind: EntryKind::Directory,
@@ -947,6 +1096,9 @@ impl Vfs for ProcVfs {
             return Ok(entries);
         }
         if let Some(entries) = proc_net_dir_entries(path) {
+            return Ok(entries);
+        }
+        if let Some(entries) = proc_ns_dir_entries(path) {
             return Ok(entries);
         }
         if let Some(entries) = proc_task_dir_entries(path) {
@@ -979,6 +1131,7 @@ impl Vfs for ProcVfs {
         }
         if let Some(entries) = sysctl_dir_entries(path)
             .or_else(|| proc_net_dir_entries(path))
+            .or_else(|| proc_ns_dir_entries(path))
             .or_else(|| proc_task_dir_entries(path))
             .or_else(|| proc_pid_dir_entries(path))
         {
@@ -2254,6 +2407,104 @@ mod tests {
         ] {
             let got = String::from_utf8(synthetic_file(path, &ctx()).unwrap_or_default()).unwrap();
             assert!(got.contains(needle), "{path} should contain {needle:?}");
+        }
+    }
+
+    #[test]
+    fn self_is_traversable_dir_that_readlinks_to_pid() {
+        let v = ProcVfs::new();
+        // Modeled as a traversable directory (so /proc/self/<file> descends),
+        // but readlink still yields the pid for tools that resolve it.
+        assert_eq!(
+            v.lookup_nofollow("/proc/self").unwrap().kind,
+            EntryKind::Directory
+        );
+        assert_eq!(v.lookup("/proc/self").unwrap().kind, EntryKind::Directory);
+        assert_eq!(
+            v.readlink("/proc/self").unwrap().to_string_lossy(),
+            crate::namespace::pid::self_ns_pid().to_string()
+        );
+    }
+
+    #[test]
+    fn net_dir_readlinks_to_self_net() {
+        let v = ProcVfs::new();
+        assert_eq!(
+            v.lookup_nofollow("/proc/net").unwrap().kind,
+            EntryKind::Directory
+        );
+        assert_eq!(v.readlink("/proc/net").unwrap().to_string_lossy(), "self/net");
+    }
+
+    #[test]
+    fn thread_self_readlinks_to_task_tid() {
+        let v = ProcVfs::new();
+        let t = v.readlink("/proc/thread-self").unwrap();
+        let p = crate::namespace::pid::self_ns_pid();
+        assert_eq!(t.to_string_lossy(), format!("{p}/task/{p}"));
+    }
+
+    #[test]
+    fn exe_cwd_root_lstat_as_symlinks() {
+        let v = ProcVfs::new();
+        for link in [
+            "/proc/self/exe",
+            "/proc/self/cwd",
+            "/proc/self/root",
+            "/proc/1/exe",
+            "/proc/thread-self/exe",
+        ] {
+            assert_eq!(
+                v.lookup_nofollow(link).unwrap().kind,
+                EntryKind::Symlink,
+                "{link} should lstat as a symlink"
+            );
+            // faccessat(F_OK)/`test -e` path goes through follow-lookup too.
+            assert_eq!(v.lookup(link).unwrap().kind, EntryKind::Symlink, "{link}");
+        }
+    }
+
+    #[test]
+    fn ns_dir_and_links() {
+        let v = ProcVfs::new();
+        assert_eq!(
+            v.lookup("/proc/self/ns").unwrap().kind,
+            EntryKind::Directory
+        );
+        let names: Vec<String> = v
+            .readdir("/proc/self/ns")
+            .unwrap()
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        for want in ["net", "pid", "user", "mnt", "uts", "ipc", "cgroup"] {
+            assert!(names.iter().any(|n| n == want), "ns/ missing {want}");
+        }
+        assert_eq!(
+            v.lookup_nofollow("/proc/self/ns/net").unwrap().kind,
+            EntryKind::Symlink
+        );
+        let t = v.readlink("/proc/self/ns/net").unwrap();
+        assert_eq!(t.to_string_lossy(), "net:[4026531992]");
+        // Same-namespace equality: self and a pid resolve to the same inode.
+        assert_eq!(
+            v.readlink("/proc/1/ns/pid").unwrap(),
+            v.readlink("/proc/self/ns/pid").unwrap()
+        );
+    }
+
+    #[test]
+    fn top_level_readdir_has_self_threadself_net_sys() {
+        let v = ProcVfs::new();
+        let by_name: std::collections::HashMap<String, EntryKind> = v
+            .readdir("/proc")
+            .unwrap()
+            .into_iter()
+            .map(|d| (d.name, d.kind))
+            .collect();
+        // Traversable directories (carrick model); readlink still resolves them.
+        for dir in ["self", "thread-self", "net", "sys"] {
+            assert_eq!(by_name.get(dir), Some(&EntryKind::Directory), "{dir}");
         }
     }
 

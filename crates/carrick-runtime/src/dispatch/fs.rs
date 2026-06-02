@@ -170,6 +170,27 @@ fn proc_self_fd_number(path: &str) -> Option<i32> {
     rest.parse::<i32>().ok()
 }
 
+/// If `path` is a `/proc/{self,thread-self,curproc,this,<pid>}/{exe,cwd,root}`
+/// magic symlink, which one it is. These readlink to live dispatcher state
+/// (the executable path, the cwd, the root), so they are resolved here rather
+/// than in the pure `ProcVfs`. carrick is one guest process, so any numeric pid
+/// component refers to "self".
+fn proc_self_magic_link(path: &str) -> Option<&'static str> {
+    let rest = path.strip_prefix("/proc/")?;
+    let (pid, leaf) = rest.split_once('/')?;
+    let is_self = matches!(pid, "self" | "thread-self" | "curproc" | "this")
+        || (!pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()));
+    if !is_self {
+        return None;
+    }
+    match leaf {
+        "exe" => Some("exe"),
+        "cwd" => Some("cwd"),
+        "root" => Some("root"),
+        _ => None,
+    }
+}
+
 impl SyscallDispatcher {
     pub fn register_mount(
         &mut self,
@@ -5461,13 +5482,21 @@ impl SyscallDispatcher {
                 Err(errno) => return Ok(errno.into()),
             };
 
-            let target = if path == "/proc/self/exe" || path == "/proc/this/exe" || path == "/proc/curproc/exe" {
-                // /proc/self/exe is the REAL running binary. If the entrypoint was
-                // a symlink (e.g. /usr/bin/readlink -> /bin/busybox), resolve the
-                // chain like Docker/Linux do; a non-symlink path is returned
-                // unchanged, and a resolution failure falls back to the raw path.
-                let exe = this.proc.lock().executable_path.clone();
-                this.canonicalize_following(&exe).unwrap_or(exe)
+            let target = if let Some(kind) = proc_self_magic_link(&path) {
+                match kind {
+                    // /proc/self/exe is the REAL running binary. If the entrypoint
+                    // was a symlink (e.g. /usr/bin/readlink -> /bin/busybox), resolve
+                    // the chain like Docker/Linux do; a non-symlink path is returned
+                    // unchanged, and a resolution failure falls back to the raw path.
+                    "exe" => {
+                        let exe = this.proc.lock().executable_path.clone();
+                        this.canonicalize_following(&exe).unwrap_or(exe)
+                    }
+                    // /proc/self/cwd → the guest working dir; /proc/self/root → the
+                    // guest root. Both tracked dispatcher-side (io.cwd / "/").
+                    "cwd" => this.cwd(),
+                    _ => "/".to_string(),
+                }
             } else if let Some(t) = this.proc_self_fd_tty_link(&path) {
                 // /proc/this/fd/{0,1,2} → /dev/pts/N when the guest's stdio is the
                 // `carrick run -t` controlling pty. This is what glibc `ttyname(3)`
