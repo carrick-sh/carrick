@@ -672,7 +672,11 @@ impl SyscallDispatcher {
                 if let Some(len) = align_up_u64(length, LINUX_PAGE_SIZE)
                     && let Ok(len_usize) = usize::try_from(len)
                 {
-                    let _ = cx.memory.unmap_range(address.0, len_usize);
+                    // Alias teardown: invalidate AND reclaim the now-empty per-
+                    // alias stage-1 sub-table (each MAP_SHARED file mapping took
+                    // its own 2 MiB block + L3 table) — else the spare pool leaks
+                    // one table per alias and a churning guest hits OutOfTables.
+                    let _ = cx.memory.unmap_alias_range(address.0, len_usize);
                 }
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
