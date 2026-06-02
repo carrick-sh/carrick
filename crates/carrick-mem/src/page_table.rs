@@ -759,6 +759,28 @@ mod tests {
     }
 
     #[test]
+    fn rosetta_alias_vas_avoid_boot_identity_l0_slots() {
+        // The boot identity map covers 0..1 TiB, occupying L0 slots [0, 1].
+        // TTBR1 shares the TTBR0 root, so an aliased upper-half VA is correct
+        // only if it indexes a DISJOINT L0 slot. Every is_high_va VA (>= the
+        // 1 TiB threshold) does by construction; spot-check the VAs Rosetta
+        // actually uses — the stripped translated-ELF mmap and the 240 TiB arena.
+        assert_eq!(indices(LINUX_HIGH_VA_THRESHOLD - 1)[0], 1); // last identity slot
+        // Stripped x86-64 high-half ELF mmap (0xffff_ffff_ffff_4000 & 48-bit mask).
+        let elf_va = 0xffff_ffff_ffff_4000u64 & 0x0000_FFFF_FFFF_FFFF;
+        assert!(
+            indices(elf_va)[0] >= 2,
+            "ELF alias collides with identity L0[0..1]"
+        );
+        // Rosetta's ~240 TiB translation arena.
+        let arena_va = 240u64 * (1 << 40);
+        assert!(
+            indices(arena_va)[0] >= 2,
+            "arena alias collides with identity L0[0..1]"
+        );
+    }
+
+    #[test]
     fn user_block_flags_match_boot_image() {
         // Drift guard: L1B[0] (offset 0x2000) maps 512 GiB as a USER block.
         let bytes = stage1_identity_page_tables();
