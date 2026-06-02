@@ -101,20 +101,32 @@ base64 round-trip, `wc -c`/`wc -l`. The translation core is sound.
   (`PageTableManager::translate`), fallback to the VA scan when stage-1 has no
   entry (early boot). Low-VA fast path untouched. The full amd64-vs-arm64 battery
   is 11/12 (cat/tac/grep/compute all match); unit tests added.
-- **(G, carrick bug, OPEN — separate from R) dash misparses a >~1 KiB multi-line
-  quoted string → "unterminated quoted string".** Breaks `gunzip` (its `usage=`
-  here-string) and any `#!/bin/sh` wrapper with a long quoted block. **Confirmed
-  carrick's, not Apple's** (Docker's Rosetta parses both fine). **NOT the (R) alias
-  class:** forcing brk does NOT fix it; file reads are byte-correct (md5 + reads at
-  offset 0/1024/2048 all match arm64; `dd bs=1024/512/100` return the full file);
-  fails identically via file-arg, stdin, and `cat | sh`. The break lands right at
-  dash's `IBUFSIZ` (~1 KiB) input refill — i.e. while accumulating a long quoted
-  string across a buffer boundary. Short quoted strings parse fine. So it is a
-  carrick-specific corruption of dash's parse state at the refill / string-buffer
-  growth, independent of read content and buffer placement. Next: get a working
-  `carrick trace` (the `-o` file came back empty on first try — recheck probe
-  names in `scripts/trace-syscalls-perpid.d`) on the dash child, watching for a
-  fault/signal or an off-nominal syscall (mremap/brk/sigaltstack) at the refill.
+- **(G, carrick bug, OPEN — separate from R) dash misparses a long parser TOKEN
+  (>~1340 bytes) under carrick.** A long quoted string → "unterminated quoted
+  string" (so `gunzip` and any `#!/bin/sh` wrapper with a long quoted block break);
+  a long UNQUOTED token → dash silently misparses (swallows the rest of the input,
+  runs a corrupted assignment, exits 0 with no `echo` output). **Precisely
+  characterized:**
+  - Confirmed carrick's, not Apple's (Docker's Rosetta parses both fine).
+  - NOT the (R) alias class: forcing brk (`MALLOC_MMAP_THRESHOLD_`) does NOT fix it.
+  - NOT a read bug: file content is byte-correct (md5 + reads at offset
+    0/1024/2048 match arm64; `dd bs=8192/4096/1024/512/100` all return the full
+    file — a single large `read()` does not truncate).
+  - NOT a crash/fault: `CARRICK_FAULT_DEBUG` shows no guest fault; dash exits 0.
+  - NOT quote- or newline-specific: a long SINGLE-LINE quote fails; an unquoted
+    token fails; the failure tracks TOKEN LENGTH, not lines or input refills.
+  - Threshold (single-line quoted, all `a`): N≤1320 OK and intact (`${#q}`==N);
+    N≈1340 silently empty; N≥1350 "unterminated". dash's accumulation is correct
+    up to 1300, so the corruption is at the parser-buffer GROW around ~1340 B.
+  So it is a carrick-specific correctness defect in dash's token/string
+  accumulation as its parse buffer grows past ~1340 bytes — no fault, no bad read,
+  guest-internal (dash writes the buffer and reads it back), Docker-correct.
+  Suspects: dash's `growstackblock` realloc-move interacting with how carrick
+  faults in / maps the grown pages, or a Rosetta JIT path for the accumulation
+  loop steered by carrick's emulated EL0 CPU-ID/cache regs (Task 7). Pinning it
+  needs a WORKING `carrick trace` (the `-o` file came back empty here — a tooling/
+  env issue to resolve) or a dash built with instrumentation, watching the
+  parser-buffer grow at the ~1340 B boundary.
 - **(syscall workstream, not Rosetta layer) `FUTEX_LOCK_PI_PRIVATE` → ENOSYS.**
   `grep` aborts with `rosetta error: futex(FUTEX_LOCK_PI_PRIVATE) failure: 38`;
   the Rosetta runtime needs priority-inheritance futexes. carrick returns ENOSYS.
