@@ -120,4 +120,41 @@ impl SyscallDispatcher {
         }
         Err(crate::linux_abi::LINUX_ELOOP)
     }
+
+    /// Like `canonicalize_following`, but a final component that resolves to a
+    /// MISSING path returns that resolved path (Ok) instead of ENOENT — for the
+    /// `open(O_CREAT)` case. Linux follows a trailing (even DANGLING) symlink and
+    /// creates the TARGET: `open(broken_symlink, O_CREAT|O_WRONLY)` makes the
+    /// link's target file, leaving the link resolving to it (zipfile/tarfile
+    /// overwrite of a broken symlink as a file). Only the O_CREAT path uses this;
+    /// a plain open still gets ENOENT for a broken symlink via
+    /// `canonicalize_following`.
+    pub(super) fn canonicalize_following_allow_missing(&self, path: &str) -> Result<String, i32> {
+        let mut cur = path.to_string();
+        for _ in 0..40 {
+            let md = match self.layered_lstat(&cur) {
+                Ok(md) => md,
+                // Resolved to a not-yet-existent path (the link's missing target,
+                // or a brand-new file): O_CREAT will create it HERE.
+                Err(e) if e == crate::linux_abi::LINUX_ENOENT => return Ok(cur),
+                Err(e) => return Err(e),
+            };
+            if md.kind != RootFsEntryKind::Symlink {
+                return Ok(cur);
+            }
+            let target = self
+                .readlink_layered(&cur)
+                .ok_or(crate::linux_abi::LINUX_ENOENT)?;
+            cur = if target.starts_with('/') {
+                join_rootfs_path("/", &target)
+            } else {
+                let parent = Path::new(&cur)
+                    .parent()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "/".to_string());
+                join_rootfs_path(&parent, &target)
+            };
+        }
+        Err(crate::linux_abi::LINUX_ELOOP)
+    }
 }
