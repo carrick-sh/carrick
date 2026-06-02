@@ -42,7 +42,27 @@ munmap only stage-1-invalidates). Files:
 **Verified:** `test_async_timeout ... ok` (was SIGSEGV). This is a broad memory-safety
 fix — ANY guest mmap'ing over a freed/dirtied no-access region was at risk.
 
-## OPEN — the next multiprocessing blocker: stage-1 PT-pool exhaustion (ROOT-CAUSED 2026-06-02b)
+## FIXED 2026-06-02c — stage-1 PT-pool exhaustion (alias L3-table leak), commit ddbd535
+
+`PageTableManager::unmap_aliased` (= invalidate + `reclaim_invalid_tables`, the dual of
+`try_coalesce`: frees an ALL-INVALID spare L3/L2 table + clears the parent entry, gated
+single-vCPU/PMR) is threaded through a new `GuestMemory::unmap_alias_range` (default =
+`unmap_range`; HVF reclaims), used only by the high-VA alias munmap branch — the low-VA
+arena keeps its in-place-reuse behavior. **`test_multiprocessing_fork.test_processes` and
+`test_multiprocessing_spawn.test_processes` now MATCH** (run=150/152 SUCCESS; were SIGSEGV
+then OutOfTables). Unit test `unmap_aliased_reclaims_only_the_freed_l3_table`. Gate 4/4 incl
+the amd64-rosetta lane; rosetta e2e (uname x86_64 — alias munmap is its path) intact.
+
+Remaining multiprocessing-cluster follow-ons (smaller, separate — NOT the crash/pool bugs):
+- `test_multiprocessing_forkserver.test_processes`: CARRICK_TIMEOUT (n=96/152, still
+  progressing at the 240s harness cap — a PERF issue under carrick, not a correctness bug).
+- `test_multiprocessing_{fork,spawn}.test_misc` and the `test_manager` modules: had clean
+  FAILUREs (per-test gaps), not the crash/pool bugs — re-triage individually.
+- `test_asyncio.test_events`/`test_subprocess`, `test_concurrent_futures.test_deadlock`:
+  re-run to see which the SIGSEGV fix already flipped.
+- Re-run the full 492-module CPython parity to get the new MATCH total (was 425/492).
+
+## (historical) the PT-pool root cause (ROOT-CAUSED 2026-06-02b)
 
 `test_processes` now progresses past the SIGSEGV but dies (deterministic, reproduces on
 current main post-rosetta) with:
