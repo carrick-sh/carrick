@@ -130,6 +130,21 @@ impl SyscallDispatcher {
             OpenStatSource::PathRecord { path, fallback } => {
                 if let Some(real) = self.fs.rootfs_vfs.overlay.real_stat(&path, true) {
                     Ok(StatRecord::from_real(&path, &real))
+                } else if let Some(real) = self
+                    .fs
+                    .vfs_mounts
+                    .resolve(&path)
+                    .and_then(|m| m.vfs.real_stat(&m.full_path, true))
+                {
+                    // The path-stat (newfstatat) falls through to the VFS mount
+                    // table when the overlay misses — a bind mount (`-v`), /proc,
+                    // /dev. Mirror it so a bind-mounted DIRECTORY's fstat reports
+                    // the SAME (real host) inode as its path-stat; otherwise
+                    // SameFile(fstat(open(dir)), stat(dir)) is false (Go os
+                    // TestFileChdir; Python os.path.samestat). Without this the
+                    // fd fell back to the path-HASH inode while the path-stat
+                    // returned the real host inode.
+                    Ok(StatRecord::from_real(&path, &real))
                 } else {
                     Ok(fallback)
                 }
