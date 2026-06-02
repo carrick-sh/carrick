@@ -2808,6 +2808,70 @@ fn proc_self_fd_directory_lists_open_fds() {
 }
 
 #[test]
+fn proc_self_fdinfo_renders_pos_flags_ino() {
+    // proc_pid_fdinfo(5): pos/flags/mnt_id/ino for an fd. libuv/Node read the
+    // octal flags to recover an inherited fd's O_NONBLOCK/append/access mode.
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    let DispatchOutcome::Returned { value: efd } = dispatcher
+        .dispatch(
+            SyscallRequest::new(19, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap()
+    else {
+        panic!("eventfd2 should succeed");
+    };
+
+    let path = format!("/proc/self/fdinfo/{efd}\0");
+    memory.write_bytes(0x4000, path.as_bytes()).unwrap();
+    let open = dispatcher
+        .dispatch(
+            SyscallRequest::new(
+                56,
+                SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    let DispatchOutcome::Returned { value: fd } = open else {
+        panic!("open /proc/self/fdinfo/{efd}: {open:?}");
+    };
+    let read = dispatcher
+        .dispatch(
+            SyscallRequest::new(63, SyscallArgs::from([fd as u64, 0x4400, 0x400, 0, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    let DispatchOutcome::Returned { value: nbytes } = read else {
+        panic!("read fdinfo: {read:?}");
+    };
+    let content = String::from_utf8(memory.read_bytes(0x4400, nbytes as usize).unwrap()).unwrap();
+    for label in ["pos:\t", "flags:\t0", "mnt_id:\t", "ino:\t"] {
+        assert!(content.contains(label), "fdinfo missing {label:?}: {content:?}");
+    }
+
+    // A closed/unopened fd's fdinfo is ENOENT.
+    memory.write_bytes(0x4000, b"/proc/self/fdinfo/4242\0").unwrap();
+    let missing = dispatcher
+        .dispatch(
+            SyscallRequest::new(
+                56,
+                SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    assert_eq!(missing, DispatchOutcome::Errno { errno: 2 });
+}
+
+#[test]
 fn openat_reads_synthetic_proc_maps_and_cpuinfo() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
     memory.write_bytes(0x4000, b"/proc/self/maps\0").unwrap();

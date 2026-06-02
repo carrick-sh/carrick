@@ -197,6 +197,21 @@ fn proc_self_magic_link(path: &str) -> Option<&'static str> {
     }
 }
 
+/// The fd number `N` of a `/proc/<self>/fdinfo/N` path, if it is one. Self only
+/// (the contents are this process's live fd state); a foreign pid falls through.
+fn proc_self_fdinfo_number(path: &str) -> Option<i32> {
+    let rest = path.strip_prefix("/proc/")?;
+    let (pid, tail) = rest.split_once('/')?;
+    let is_self = matches!(pid, "self" | "thread-self" | "curproc" | "this")
+        || pid
+            .parse::<u32>()
+            .is_ok_and(|n| n == std::process::id() || n == crate::namespace::pid::self_ns_pid());
+    if !is_self {
+        return None;
+    }
+    tail.strip_prefix("fdinfo/")?.parse::<i32>().ok()
+}
+
 impl SyscallDispatcher {
     pub fn register_mount(
         &mut self,
@@ -491,6 +506,17 @@ impl SyscallDispatcher {
         // backed files, which carry no guest path to re-resolve).
         if let Some(n) = proc_self_fd_number(&path) {
             return Ok(self.duplicate_fd(n, 0, flags & LINUX_O_CLOEXEC));
+        }
+
+        // `/proc/self/fdinfo/N` renders the fd's pos/flags/mnt_id/ino from the
+        // live fd table — built here (it needs the fd table + a host lseek for
+        // overlay files) and installed as a synthetic read-only file. ENOENT if
+        // fd N isn't open.
+        if let Some(n) = proc_self_fdinfo_number(&path) {
+            return Ok(match self.fdinfo_bytes(n) {
+                Some(bytes) => self.install_proc_synthetic_bytes(&path, bytes, flags),
+                None => LINUX_ENOENT.into(),
+            });
         }
 
         // `/proc/self/exe` (and the thread-self/curproc/this aliases) are
@@ -834,12 +860,57 @@ impl SyscallDispatcher {
         Ok(DispatchOutcome::Returned { value: fd as i64 })
     }
 
+    /// Render `/proc/self/fdinfo/N` (proc_pid_fdinfo(5)): pos, the open flags
+    /// (octal), a synthetic mnt_id, and the fd's inode. Pulls the live position
+    /// (the in-memory cursor, or a host `lseek` for an overlay-backed file) and
+    /// the status flags from the live fd table. `None` if fd N is not open.
+    fn fdinfo_bytes(&self, n: i32) -> Option<Vec<u8>> {
+        let of = self.open_file(n)?;
+        let desc = of.description.read();
+        let cloexec = of.fd_flags & LINUX_FD_CLOEXEC != 0;
+        // The open status flags (access mode + O_NONBLOCK/O_APPEND/…) with
+        // O_CLOEXEC folded in — the bits callers parse to recover an inherited
+        // fd's mode. (O_LARGEFILE is elided: arch-specific and not load-bearing.)
+        let flags = desc.status_flags() | if cloexec { LINUX_O_CLOEXEC } else { 0 };
+        let pos = match &*desc {
+            OpenDescription::File { offset, .. }
+            | OpenDescription::SyntheticFile { offset, .. }
+            | OpenDescription::Directory { offset, .. } => *offset as u64,
+            OpenDescription::HostFile { host_fd, .. } => host_fd_offset(*host_fd).unwrap_or(0),
+            _ => 0,
+        };
+        drop(desc);
+        let ino = self.fd_stat_record(n).map(|r| r.ino).unwrap_or(0);
+        Some(format!("pos:\t{pos}\nflags:\t0{flags:o}\nmnt_id:\t24\nino:\t{ino}\n").into_bytes())
+    }
+
+    /// Install a read-only synthetic-bytes fd (e.g. a rendered fdinfo file).
+    fn install_proc_synthetic_bytes(
+        &self,
+        path: &str,
+        contents: Vec<u8>,
+        flags: u64,
+    ) -> DispatchOutcome {
+        let open_file = OpenFile::new(
+            Arc::new(RwLock::new(OpenDescription::SyntheticFile {
+                path: path.to_string(),
+                contents,
+                offset: 0,
+                base: OpenDescriptionBase::new(flags & !LINUX_O_CLOEXEC),
+            })),
+            linux_fd_flags_from_open_flags(flags),
+        );
+        match self.install_fd_at_or_above(0, open_file) {
+            Ok(fd) => DispatchOutcome::Returned { value: fd as i64 },
+            Err(_) => DispatchOutcome::errno(linux_errno::EMFILE),
+        }
+    }
+
     /// `close_range(first, last, flags)` — close every fd in `[first, last]`
     /// (inclusive). Used by glibc's posix_spawn / apt's pre-fork cleanup
     /// to drop inherited fds in O(1) syscalls instead of an O(N) fcntl
     /// or close loop. Without this, apt walks fd 3..NR_OPEN issuing a
     /// fcntl per fd and burns 100k+ traps before exec.
-
     fn duplicate_fd(&self, old_fd: i32, min_fd: i32, fd_flags: u64) -> DispatchOutcome {
         let (description, host_fd_owner) = match self.open_file(old_fd).as_ref() {
             Some(open_file) => (
