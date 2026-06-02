@@ -335,6 +335,172 @@ fn parse_signal(s: &str) -> Option<i32> {
     Some(n)
 }
 
+/// `carrick wait <container>...` — block until each container stops, then print
+/// its exit code (like `docker wait`). An already-exited container returns
+/// immediately; a `--rm` container that was auto-removed reports 0.
+pub(crate) fn wait(containers: &[String]) -> anyhow::Result<()> {
+    let mut had_err = false;
+    for spec in containers {
+        match wait_one(spec) {
+            Ok(code) => println!("{code}"),
+            Err(e) => {
+                eprintln!("Error: {e}");
+                had_err = true;
+            }
+        }
+    }
+    if had_err {
+        bail!("one or more containers failed to wait");
+    }
+    Ok(())
+}
+
+fn wait_one(spec: &str) -> anyhow::Result<i32> {
+    let id = container::resolve(spec).map_err(anyhow::Error::msg)?;
+    loop {
+        let Ok(state) = ContainerState::load(&id) else {
+            // Gone (e.g. a `--rm` container removed on exit): nothing to wait on.
+            return Ok(0);
+        };
+        if state.status == ContainerStatus::Exited {
+            return Ok(state.exit_code.unwrap_or(0));
+        }
+        if container::reconciled_status(&state) == ContainerStatus::Exited {
+            // The init died but the supervisor hasn't recorded the code yet;
+            // give it a brief window, then fall back to whatever is on disk.
+            for _ in 0..50 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                if let Ok(s) = ContainerState::load(&id)
+                    && s.status == ContainerStatus::Exited
+                {
+                    return Ok(s.exit_code.unwrap_or(0));
+                }
+            }
+            return Ok(state.exit_code.unwrap_or(0));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// `carrick inspect <container>... [-f FORMAT]` — render the persisted container
+/// state, docker-shaped. Without `--format`, prints a JSON array; with it,
+/// renders the Go-template-style expression per container (one line each).
+pub(crate) fn inspect(format: Option<&str>, containers: &[String]) -> anyhow::Result<()> {
+    let mut objs = Vec::new();
+    let mut had_err = false;
+    for spec in containers {
+        let loaded = container::resolve(spec)
+            .map_err(anyhow::Error::msg)
+            .and_then(|id| ContainerState::load(&id).map_err(Into::into));
+        match loaded {
+            Ok(state) => {
+                let status = container::reconciled_status(&state);
+                objs.push(container_to_json(&state, status));
+            }
+            Err(e) => {
+                eprintln!("Error: {e}");
+                had_err = true;
+            }
+        }
+    }
+    match format {
+        Some(fmt) => {
+            for obj in &objs {
+                println!("{}", render_format(fmt, obj));
+            }
+        }
+        None => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::Value::Array(objs))?
+            );
+        }
+    }
+    if had_err {
+        bail!("one or more containers not found");
+    }
+    Ok(())
+}
+
+/// Build the docker-shaped inspect object for a container. A subset of docker's
+/// schema covering the commonly-scripted fields (`.Id`, `.Name`, `.Image`,
+/// `.State.{Status,Running,Pid,ExitCode}`, `.Path`, `.Args`, `.Config.Cmd`).
+fn container_to_json(c: &ContainerState, status: ContainerStatus) -> serde_json::Value {
+    let running = status == ContainerStatus::Running;
+    let status_str = match status {
+        ContainerStatus::Created => "created",
+        ContainerStatus::Running => "running",
+        ContainerStatus::Exited => "exited",
+    };
+    let (path, args) = c
+        .command
+        .split_first()
+        .map(|(p, a)| (p.clone(), a.to_vec()))
+        .unwrap_or_default();
+    serde_json::json!({
+        "Id": c.id,
+        "Name": format!("/{}", c.name.as_deref().unwrap_or("")),
+        "Image": c.image,
+        "Created": c.created_secs,
+        "Path": path,
+        "Args": args,
+        "State": {
+            "Status": status_str,
+            "Running": running,
+            "Pid": if running { c.init_pid } else { 0 },
+            "ExitCode": c.exit_code.unwrap_or(0),
+        },
+        "Config": { "Cmd": c.command },
+    })
+}
+
+/// Render a docker `--format` expression against `value`: literal text is kept,
+/// `{{ .Path.To.Field }}` is replaced by the JSON value at that dotted path
+/// (`<no value>` if absent), and `{{json .}}` dumps the whole object. A minimal
+/// subset of Go's text/template — enough for the common `-f '{{.State.X}}'`.
+fn render_format(fmt: &str, value: &serde_json::Value) -> String {
+    let mut out = String::new();
+    let mut rest = fmt;
+    while let Some(start) = rest.find("{{") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("}}") else {
+            out.push_str("{{");
+            rest = after;
+            continue;
+        };
+        let expr = after[..end].trim();
+        rest = &after[end + 2..];
+        if expr == "json ." || expr == "json." {
+            out.push_str(&serde_json::to_string(value).unwrap_or_default());
+        } else if let Some(path) = expr.strip_prefix('.') {
+            match lookup_path(value, path) {
+                Some(s) => out.push_str(&s),
+                None => out.push_str("<no value>"),
+            }
+        }
+        // Other expressions are unsupported and render to nothing.
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Follow a dotted `A.B.C` path into a JSON value, returning the leaf rendered
+/// as a plain string (`None` if any segment is missing). An empty path is the
+/// value itself.
+fn lookup_path(value: &serde_json::Value, path: &str) -> Option<String> {
+    let mut cur = value;
+    if !path.is_empty() {
+        for key in path.split('.') {
+            cur = cur.get(key)?;
+        }
+    }
+    Some(match cur {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    })
+}
+
 /// `carrick logs <container> [-f] [--tail N]` — replay (and optionally follow)
 /// the captured stdout/stderr of a container. Detached runs redirect the
 /// guest's inherited stdio to `output.log` (see [`redirect_detached_stdio`]);
@@ -432,7 +598,35 @@ fn select_tail(data: &[u8], tail: Option<usize>) -> &[u8] {
 
 #[cfg(test)]
 mod tests {
-    use super::select_tail;
+    use super::{render_format, select_tail};
+
+    #[test]
+    fn render_format_field_access() {
+        let v = serde_json::json!({
+            "Id": "abc",
+            "State": { "Status": "exited", "ExitCode": 7, "Running": false },
+        });
+        assert_eq!(render_format("{{.State.ExitCode}}", &v), "7");
+        assert_eq!(render_format("{{.State.Status}}", &v), "exited");
+        assert_eq!(render_format("{{.Id}}", &v), "abc");
+        assert_eq!(
+            render_format("s={{.State.Status}} c={{.State.ExitCode}}", &v),
+            "s=exited c=7"
+        );
+        assert_eq!(render_format("{{.State.Running}}", &v), "false");
+    }
+
+    #[test]
+    fn render_format_missing_field_is_no_value() {
+        let v = serde_json::json!({ "Id": "abc" });
+        assert_eq!(render_format("{{.Nope.Here}}", &v), "<no value>");
+    }
+
+    #[test]
+    fn render_format_json_dot_dumps_object() {
+        let v = serde_json::json!({ "Id": "abc" });
+        assert_eq!(render_format("{{json .}}", &v), "{\"Id\":\"abc\"}");
+    }
 
     #[test]
     fn select_tail_none_returns_all() {
