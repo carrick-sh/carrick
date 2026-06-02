@@ -6676,6 +6676,14 @@ impl SyscallDispatcher {
                 return Ok(this.write_fd_stat(dirfd as i32, statbuf, memory));
             }
 
+            // A trailing "/" or "/." forces directory semantics on the FINAL
+            // component: the symlink is FOLLOWED even under AT_SYMLINK_NOFOLLOW
+            // (lstat("link/") of a symlink-to-dir reports the directory, not the
+            // link — Go os TestSymlinkWithTrailingSlash; TestRootConsistency*
+            // symlink_slash), and a non-directory final → ENOTDIR. Captured from
+            // the raw path before resolve_at_path normalizes the slash away.
+            let requires_dir = path.ends_with('/') || path.ends_with("/.");
+
             let path = match this.resolve_at_path(dirfd, &path) {
                 Ok(path) => path,
                 Err(errno) => return Ok(errno.into()),
@@ -6706,8 +6714,11 @@ impl SyscallDispatcher {
             // hard link reports >1) reflect what the kernel would report.
             // `AT_SYMLINK_NOFOLLOW` selects lstat (report the link) vs stat
             // (report the target) semantics.
-            let follow = flags & LINUX_AT_SYMLINK_NOFOLLOW == 0;
+            let follow = flags & LINUX_AT_SYMLINK_NOFOLLOW == 0 || requires_dir;
             if let Some(real) = this.fs.rootfs_vfs.overlay.real_stat(&path, follow) {
+                if requires_dir && real.kind != RootFsEntryKind::Directory {
+                    return Ok(LINUX_ENOTDIR.into());
+                }
                 return Ok(write_stat_real(memory, statbuf, &path, &real));
             }
             // DANGLING SYMLINK: a following stat() whose `real_stat` came back
@@ -6803,6 +6814,11 @@ impl SyscallDispatcher {
                 return Ok(this.write_fd_statx(dirfd as i32, statxbuf, memory));
             }
 
+            // A trailing "/" or "/." forces directory semantics: follow the final
+            // symlink even under AT_SYMLINK_NOFOLLOW, and a non-directory final →
+            // ENOTDIR (matches newfstatat; man path_resolution(7)).
+            let requires_dir = path.ends_with('/') || path.ends_with("/.");
+
             let path = match this.resolve_at_path(dirfd, &path) {
                 Ok(path) => path,
                 Err(errno) => return Ok(errno.into()),
@@ -6828,8 +6844,11 @@ impl SyscallDispatcher {
             // Disk-backed overlay (--fs host): prefer the REAL on-disk stat
             // (S_IFLNK + true st_nlink). `AT_SYMLINK_NOFOLLOW` selects lstat
             // (the link) vs stat (the target).
-            let follow = flags & LINUX_AT_SYMLINK_NOFOLLOW == 0;
+            let follow = flags & LINUX_AT_SYMLINK_NOFOLLOW == 0 || requires_dir;
             if let Some(real) = this.fs.rootfs_vfs.overlay.real_stat(&path, follow) {
+                if requires_dir && real.kind != RootFsEntryKind::Directory {
+                    return Ok(LINUX_ENOTDIR.into());
+                }
                 return Ok(write_statx_real(memory, statxbuf, &path, &real));
             }
             // DANGLING SYMLINK: following statx of a symlink whose target does
