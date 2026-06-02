@@ -233,6 +233,75 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             ))?;
             println!("{}", serde_json::to_string_pretty(&summary)?);
         }
+        Commands::Images { quiet } => {
+            let images = store.list_images();
+            if quiet {
+                for img in &images {
+                    println!("{}", img.id);
+                }
+            } else {
+                println!(
+                    "{:<28}{:<14}{:<16}{:<24}{}",
+                    "REPOSITORY", "TAG", "IMAGE ID", "CREATED", "SIZE"
+                );
+                for img in &images {
+                    println!(
+                        "{:<28}{:<14}{:<16}{:<24}{}",
+                        truncate_str(&img.repository, 26),
+                        truncate_str(&img.tag, 12),
+                        img.id,
+                        human_age(img.created_secs),
+                        human_size(img.size),
+                    );
+                }
+            }
+        }
+        Commands::Rmi { images } => {
+            let mut had_err = false;
+            for spec in &images {
+                match ImageReference::parse(spec).and_then(|image| {
+                    store
+                        .remove_image(&image)
+                        .map(|removed| (image, removed))
+                        .map_err(|e| {
+                            carrick_image::OciBootstrapError::Io(std::io::Error::other(e))
+                        })
+                }) {
+                    Ok((image, true)) => println!("Untagged: {}", image.canonical()),
+                    Ok((_, false)) => {
+                        eprintln!("Error: no such image: {spec}");
+                        had_err = true;
+                    }
+                    Err(e) => {
+                        eprintln!("Error: {spec}: {e}");
+                        had_err = true;
+                    }
+                }
+            }
+            let (count, bytes) = store.gc_blobs();
+            if count > 0 {
+                println!("Deleted {count} layer(s), reclaimed {}", human_size(bytes));
+            }
+            if had_err {
+                bail!("one or more images failed to be removed");
+            }
+        }
+        Commands::Prune => {
+            let (count, bytes) = store.gc_blobs();
+            println!(
+                "Total reclaimed space: {} ({count} unreferenced layer(s))",
+                human_size(bytes)
+            );
+        }
+        Commands::Tag { source, target } => {
+            let src = ImageReference::parse(&source)
+                .with_context(|| format!("invalid source image {source:?}"))?;
+            let dst = ImageReference::parse(&target)
+                .with_context(|| format!("invalid target image {target:?}"))?;
+            store
+                .tag_image(&src, &dst)
+                .with_context(|| format!("failed to tag {source} as {target}"))?;
+        }
         Commands::Run {
             image,
             platform,
@@ -697,4 +766,55 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Truncate `s` to `max` chars (with an ellipsis) for table columns.
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let cut: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{cut}…")
+    }
+}
+
+/// Format a byte count docker-style with decimal (1000) units, e.g. `78.1MB`.
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "kB", "MB", "GB", "TB"];
+    if bytes < 1000 {
+        return format!("{bytes}B");
+    }
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1000.0 && unit < UNITS.len() - 1 {
+        size /= 1000.0;
+        unit += 1;
+    }
+    format!("{size:.1}{}", UNITS[unit])
+}
+
+/// Format an epoch-seconds creation time as a docker-style relative age, e.g.
+/// `2 hours ago`.
+fn human_age(created_secs: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(created_secs);
+    let age = now.saturating_sub(created_secs);
+    let (n, unit) = if age < 60 {
+        return "Less than a minute ago".to_string();
+    } else if age < 3600 {
+        (age / 60, "minute")
+    } else if age < 86_400 {
+        (age / 3600, "hour")
+    } else if age < 86_400 * 7 {
+        (age / 86_400, "day")
+    } else if age < 86_400 * 30 {
+        (age / (86_400 * 7), "week")
+    } else if age < 86_400 * 365 {
+        (age / (86_400 * 30), "month")
+    } else {
+        (age / (86_400 * 365), "year")
+    };
+    format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" })
 }

@@ -79,6 +79,29 @@ pub(crate) enum Commands {
         #[arg(long, value_name = "OS/ARCH")]
         platform: Option<String>,
     },
+    /// List images in the local store (like `docker images`).
+    Images {
+        /// Only show numeric image ids.
+        #[arg(short = 'q', long = "quiet")]
+        quiet: bool,
+    },
+    /// Remove one or more images from the local store (like `docker rmi`).
+    /// Unreferenced layers are garbage-collected afterward.
+    Rmi {
+        #[arg(required = true)]
+        images: Vec<String>,
+    },
+    /// Remove image layers no longer referenced by any image (like
+    /// `docker image prune`), reclaiming disk space.
+    Prune,
+    /// Create a new reference to an existing stored image (like `docker tag`).
+    /// Layers are shared, not copied.
+    Tag {
+        /// Existing image (id or name).
+        source: String,
+        /// New reference, e.g. `myapp:dev`.
+        target: String,
+    },
     Run {
         image: String,
         /// Target platform, e.g. `linux/amd64` or `linux/arm64`. Selects the
