@@ -410,6 +410,11 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             tail,
             container,
         } => crate::lifecycle::logs(&container, follow, tail)?,
+        Commands::Wait { containers } => crate::lifecycle::wait(&containers)?,
+        Commands::Inspect {
+            format,
+            containers,
+        } => crate::lifecycle::inspect(format.as_deref(), &containers)?,
         Commands::Ps { all, quiet } => crate::lifecycle::ps(all, quiet)?,
         Commands::Stop { time, containers } => crate::lifecycle::stop(time, &containers)?,
         Commands::Kill { signal, containers } => crate::lifecycle::kill(&signal, &containers)?,

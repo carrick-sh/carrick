@@ -184,6 +184,23 @@ pub(crate) enum Commands {
         /// Container id or name.
         container: String,
     },
+    /// Block until one or more containers stop, then print each exit code
+    /// (like `docker wait`).
+    Wait {
+        #[arg(required = true)]
+        containers: Vec<String>,
+    },
+    /// Display detailed information on one or more containers (like
+    /// `docker inspect`). Without `--format`, prints a JSON array.
+    Inspect {
+        /// Format the output with a Go-template-style expression, e.g.
+        /// `{{.State.ExitCode}}` or `{{.State.Status}}` (`{{json .}}` for the
+        /// whole object).
+        #[arg(short = 'f', long = "format")]
+        format: Option<String>,
+        #[arg(required = true)]
+        containers: Vec<String>,
+    },
     /// List containers (like `docker ps`). Shows running containers; `--all`
     /// includes exited ones.
     Ps {
