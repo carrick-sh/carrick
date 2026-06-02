@@ -116,8 +116,22 @@ pub fn resolve_run_spec(req: CliRunRequest, image: ResolvedImage) -> Result<RunS
     }
     .or_else(|| Some(Utf8PathBuf::from("/")));
 
-    // 4. Resolve user
-    let _user = req.user.clone().or_else(|| image.config.user.clone());
+    // 4. Resolve user (`--user` overrides image USER). Numeric `uid[:gid]` only;
+    // a user/group NAME needs in-image /etc/passwd resolution (not yet
+    // supported), so warn and run as root rather than silently mis-mapping.
+    let (uid, gid) = match req.user.clone().or_else(|| image.config.user.clone()) {
+        None => (0, 0),
+        Some(s) if s.is_empty() => (0, 0),
+        Some(s) => match parse_numeric_user(&s) {
+            Some((u, g)) => (u, g),
+            None => {
+                eprintln!(
+                    "carrick: --user {s:?}: name resolution is not yet supported; running as root (use a numeric uid[:gid])"
+                );
+                (0, 0)
+            }
+        },
+    };
 
     // 5. Select fs backend (fall back to case sensitivity probe)
     let fs_backend = req.fs.unwrap_or_else(|| {
@@ -149,7 +163,26 @@ pub fn resolve_run_spec(req: CliRunRequest, image: ResolvedImage) -> Result<RunS
         debug_state_path,
         platform,
         pid: req.pid,
+        uid,
+        gid,
     })
+}
+
+/// Parse a `docker run --user` value as numeric `uid[:gid]`. `gid` defaults to 0
+/// when only a uid is given (docker's behavior for a numeric user with no passwd
+/// lookup). Returns `None` for a non-numeric user/group name — carrick has no
+/// in-image `/etc/passwd` resolution yet, so the caller warns and runs as root.
+fn parse_numeric_user(spec: &str) -> Option<(u32, u32)> {
+    let (u, g) = match spec.split_once(':') {
+        Some((u, g)) => (u, Some(g)),
+        None => (spec, None),
+    };
+    let uid: u32 = u.parse().ok()?;
+    let gid: u32 = match g {
+        Some(g) => g.parse().ok()?,
+        None => 0,
+    };
+    Some((uid, gid))
 }
 
 pub struct Engine {
@@ -209,6 +242,50 @@ mod tests {
                 labels: None,
             },
         }
+    }
+
+    fn base_req(user: Option<&str>) -> CliRunRequest {
+        CliRunRequest {
+            image_ref: "alpine".to_string(),
+            platform: None,
+            args: vec!["/bin/ls".to_string()],
+            env_overrides: vec![],
+            mounts: vec![],
+            workdir: None,
+            user: user.map(|s| s.to_string()),
+            entrypoint_override: None,
+            tty: false,
+            interactive: false,
+            rm: false,
+            name: None,
+            max_traps: 100,
+            debug_state_path: None,
+            fs: Some(FsBackendKind::Memory),
+            pid: PidMode::default(),
+        }
+    }
+
+    #[test]
+    fn user_numeric_uid_and_gid() {
+        let image = make_test_image(None, Some(vec!["/bin/ls".into()]), vec![], None);
+        let spec = resolve_run_spec(base_req(Some("1000:2000")), image).unwrap();
+        assert_eq!((spec.uid, spec.gid), (1000, 2000));
+    }
+
+    #[test]
+    fn user_numeric_uid_defaults_gid_zero() {
+        // docker: `--user 1000` with no group → gid 0.
+        let image = make_test_image(None, Some(vec!["/bin/ls".into()]), vec![], None);
+        let spec = resolve_run_spec(base_req(Some("1000")), image).unwrap();
+        assert_eq!((spec.uid, spec.gid), (1000, 0));
+    }
+
+    #[test]
+    fn user_absent_defaults_root() {
+        // No --user; the test image's USER is the name "root" (unresolved) → root.
+        let image = make_test_image(None, Some(vec!["/bin/ls".into()]), vec![], None);
+        let spec = resolve_run_spec(base_req(None), image).unwrap();
+        assert_eq!((spec.uid, spec.gid), (0, 0));
     }
 
     #[test]

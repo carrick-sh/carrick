@@ -192,6 +192,7 @@ impl Runtime {
                 if let Some(cwd) = &spec.cwd {
                     dispatcher.set_cwd(cwd.as_str());
                 }
+                dispatcher.set_credentials(spec.uid, spec.gid);
 
                 seed_guest_baseline(&mut host, None);
 
@@ -279,6 +280,7 @@ impl Runtime {
                 if let Some(cwd) = &spec.cwd {
                     dispatcher.set_cwd(cwd.as_str());
                 }
+                dispatcher.set_credentials(spec.uid, spec.gid);
 
                 install_fs_backend(&mut dispatcher, FsBackendKind::Memory).map_err(|e| {
                     RuntimeError::FsBackend(anyhow::anyhow!("failed to install fs backend: {}", e))
