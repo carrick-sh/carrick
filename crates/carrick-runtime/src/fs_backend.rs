@@ -2473,40 +2473,58 @@ impl FsBackend for HostFsBackend {
     }
 
     fn list_xattr(&self, path: &str) -> Result<Vec<String>, i32> {
-        let host_fd = self
-            .open_raw_fd(path, false, false, false)
+        fn list_xattr_fd(host_fd: std::os::fd::RawFd) -> Result<Vec<String>, i32> {
+            // macOS may surface its own attribute names (e.g. resource forks);
+            // we read the full NUL-separated list then filter to `user.*` so the
+            // result is exactly the Linux-conformant namespace the guest set.
+            let needed = unsafe { libc::flistxattr(host_fd, std::ptr::null_mut(), 0, 0) };
+            let needed = match needed.host_syscall_errno() {
+                Ok(needed) => needed,
+                Err(crate::linux_abi::LINUX_ENODATA) => return Ok(Vec::new()),
+                Err(err) => return Err(err),
+            };
+            let mut buf = vec![0u8; needed as usize];
+            let n = unsafe {
+                libc::flistxattr(
+                    host_fd,
+                    buf.as_mut_ptr() as *mut libc::c_char,
+                    buf.len() as libc::size_t,
+                    0,
+                )
+            };
+            let n = match n.host_syscall_errno() {
+                Ok(n) => n,
+                Err(crate::linux_abi::LINUX_ENODATA) => return Ok(Vec::new()),
+                Err(err) => return Err(err),
+            };
+            buf.truncate(n as usize);
+            let names = buf
+                .split(|&b| b == 0)
+                .filter(|s| !s.is_empty())
+                .filter_map(|s| std::str::from_utf8(s).ok())
+                .filter(|s| is_guest_xattr_namespace(s) && !is_internal_carrick_xattr(s))
+                .map(|s| s.to_owned())
+                .collect();
+            Ok(names)
+        }
+
+        let normalized = self
+            .resolve_following(path)
             .ok_or(crate::linux_abi::LINUX_ENODATA)?;
-        // macOS may surface its own attribute names (e.g. resource forks);
-        // we read the full NUL-separated list then filter to `user.*` so the
-        // result is exactly the Linux-conformant namespace the guest set.
-        let needed = unsafe { libc::flistxattr(host_fd, std::ptr::null_mut(), 0, 0) };
-        let needed = match needed.host_syscall_errno() {
-            Ok(needed) => needed,
-            Err(err) => {
-                unsafe { libc::close(host_fd) };
-                return Err(err);
-            }
+        let Some(rel) = Self::rel_path(&normalized) else {
+            use std::os::fd::AsRawFd;
+            let root = self
+                .dir
+                .open_dir(".")
+                .map_err(|_| crate::linux_abi::LINUX_ENODATA)?;
+            return list_xattr_fd(root.as_raw_fd());
         };
-        let mut buf = vec![0u8; needed as usize];
-        let n = unsafe {
-            libc::flistxattr(
-                host_fd,
-                buf.as_mut_ptr() as *mut libc::c_char,
-                buf.len() as libc::size_t,
-                0,
-            )
-        };
-        unsafe { libc::close(host_fd) };
-        let n = n.host_syscall_errno()?;
-        buf.truncate(n as usize);
-        let names = buf
-            .split(|&b| b == 0)
-            .filter(|s| !s.is_empty())
-            .filter_map(|s| std::str::from_utf8(s).ok())
-            .filter(|s| is_guest_xattr_namespace(s) && !is_internal_carrick_xattr(s))
-            .map(|s| s.to_owned())
-            .collect();
-        Ok(names)
+        let meta = self
+            .dir
+            .symlink_metadata(rel)
+            .map_err(|_| crate::linux_abi::LINUX_ENODATA)?;
+        with_entry_fd(&self.dir, rel, meta.is_dir(), false, list_xattr_fd)
+            .ok_or(crate::linux_abi::LINUX_ENODATA)?
     }
 
     fn remove_xattr(&self, path: &str, name: &str) -> Result<(), i32> {
@@ -3128,6 +3146,10 @@ mod tests {
     #[test]
     fn host_guest_xattr_api_hides_all_internal_carrick_names() {
         let (b, _scratch) = host_backend();
+        assert_eq!(b.list_xattr("/").unwrap(), Vec::<String>::new());
+        b.set_file_contents("/plain", b"x".to_vec()).unwrap();
+        assert_eq!(b.list_xattr("/plain").unwrap(), Vec::<String>::new());
+
         b.set_file_contents("/f", b"x".to_vec()).unwrap();
         b.set_mode("/f", 0o600).unwrap();
         b.set_owner("/f", 123, 456).unwrap();
