@@ -96,6 +96,17 @@ impl PinnedWaitFds {
     }
 }
 
+/// Outcome of `wait_proc_exit`'s kqueue fast path.
+#[cfg(target_os = "macos")]
+enum ProcExitWait {
+    /// The wait resolved (child exited, signal pending, or fork quiesce began).
+    Done(WaitResult),
+    /// `kevent` reported the kqueue fd itself is invalid (EBADF) — it was closed
+    /// out from under us by the fork-storm internal-fd churn. Retrying the same
+    /// kqueue can only EBADF forever, so the caller polls the child directly.
+    KqueueDead,
+}
+
 /// A per-thread kqueue + its registration of the self-pipe wake channel.
 pub struct ThreadWaiter {
     #[cfg(target_os = "macos")]
@@ -148,6 +159,18 @@ impl ThreadWaiter {
             thread_wake: None,
             tid,
         }
+    }
+
+    /// Test/diagnostic hook: close the per-thread kqueue's fd and invalidate the
+    /// wrapper, so the next `kevent` returns EBADF. Models the fork-storm race in
+    /// which an internal fd is closed out from under a blocked `wait_proc_exit`.
+    /// Returns the fd that was closed (or -1). Not for production use.
+    #[doc(hidden)]
+    #[cfg(target_os = "macos")]
+    pub fn debug_close_kqueue(&mut self) -> RawFd {
+        self.kq
+            .as_mut()
+            .map_or(-1, |kq| kq.debug_close_and_invalidate())
     }
 
     /// Block until one of `fds` (host fds, with `libc::POLL*` event masks) is
@@ -304,15 +327,30 @@ impl ThreadWaiter {
     /// `libc::waitid`. The runtime re-dispatches the waitid on `Ready` to reap.
     #[cfg(target_os = "macos")]
     pub fn wait_proc_exit(&self, pid: i32, block_mask: u64) -> WaitResult {
-        let Some(kq) = self.kq.as_ref() else {
-            // No per-thread kqueue: let the caller fall back to a bounded poll.
-            return WaitResult::Interrupted;
-        };
         if crate::host_signal::has_unblocked_pending_for(self.tid, block_mask)
             || crate::fork_quiesce::is_quiescing()
         {
             return WaitResult::Interrupted;
         }
+        // Fast path: park in kevent() on the per-thread kqueue's EVFILT_PROC.
+        if let Some(kq) = self.kq.as_ref() {
+            match self.wait_proc_exit_kqueue(kq, pid, block_mask) {
+                ProcExitWait::Done(result) => return result,
+                // The kqueue fd was closed out from under us; abandon it and poll
+                // the child directly so the guest's wait4 still completes instead
+                // of busy-spinning on EBADF forever (the apt fork-storm hang).
+                ProcExitWait::KqueueDead => {}
+            }
+        }
+        self.wait_proc_exit_fallback(pid, block_mask)
+    }
+
+    /// Park in `kevent()` on the long-lived per-thread kqueue until `pid` exits,
+    /// a signal becomes pending, or a fork quiesce begins. Returns `KqueueDead`
+    /// (without touching the kqueue further) if `kevent` reports the kqueue fd
+    /// itself is invalid — the caller then falls back to a direct poll.
+    #[cfg(target_os = "macos")]
+    fn wait_proc_exit_kqueue(&self, kq: &Kqueue, pid: i32, block_mask: u64) -> ProcExitWait {
         let mut changes = vec![Kevent::proc_exit(pid)];
         let cap = (1 + self.signal_pipe_count()).max(1);
         let mut events_out: Vec<Kevent> = vec![Kevent::empty(); cap];
@@ -325,19 +363,26 @@ impl ThreadWaiter {
                 tv_sec: 0,
                 tv_nsec: 50_000_000,
             });
-            let n = kq.wait(&changes, &mut events_out, ts.as_ref());
-            changes.clear(); // registration persists; only add once.
-            let n = match n {
+            let n = match kq.wait(&changes, &mut events_out, ts.as_ref()) {
                 Ok(n) => n,
-                Err(_) => {
+                Err(e) => {
                     if crate::host_signal::has_unblocked_pending_for(self.tid, block_mask)
                         || crate::fork_quiesce::is_quiescing()
                     {
                         break WaitResult::Interrupted;
                     }
-                    continue;
+                    // EINTR: a signal raced into kevent — retry. Any other error
+                    // (EBADF: the kqueue fd was closed; EINVAL/EFAULT: unusable)
+                    // cannot be cured by retrying the same kqueue, so report it
+                    // dead and let the caller poll rather than spin.
+                    if e == libc::EINTR {
+                        changes.clear();
+                        continue;
+                    }
+                    return ProcExitWait::KqueueDead;
                 }
             };
+            changes.clear(); // registration persists; only add once.
             let mut proc_woke = false;
             let mut process_pipe_woke = false;
             let mut thread_pipe_woke = false;
@@ -379,7 +424,54 @@ impl ThreadWaiter {
             tv_nsec: 0,
         };
         let _ = kq.wait(&[Kevent::proc_exit_delete(pid)], &mut [], Some(&zero));
-        result
+        ProcExitWait::Done(result)
+    }
+
+    /// Bounded fallback for `wait_proc_exit` when the per-thread kqueue is
+    /// unusable (its fd was closed out from under us, or it never existed). Polls
+    /// the child's exit with `waitid(WNOHANG | WNOWAIT)` — `WNOWAIT` leaves the
+    /// child reapable, so the caller's re-dispatched `waitid` still reaps it —
+    /// between 50 ms signal-recheck slices parked on the signal pipes. Returns
+    /// `Ready` when the child is reapable, `Interrupted` on a pending signal or
+    /// fork quiesce. Not a busy spin: each idle slice sleeps in `poll()`.
+    #[cfg(target_os = "macos")]
+    fn wait_proc_exit_fallback(&self, pid: i32, block_mask: u64) -> WaitResult {
+        loop {
+            if crate::host_signal::has_unblocked_pending_for(self.tid, block_mask)
+                || crate::fork_quiesce::is_quiescing()
+            {
+                return WaitResult::Interrupted;
+            }
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let rc = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+                )
+            };
+            if rc == 0 {
+                // si_pid != 0 ⇒ the child has exited (left reapable by WNOWAIT).
+                // si_pid == 0 ⇒ still running (WNOHANG found nothing yet).
+                if info.si_pid != 0 {
+                    return WaitResult::Ready;
+                }
+            } else if std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD) {
+                // Not (or no longer) our child: already reaped, or never ours.
+                // Report Ready so the caller's waitid surfaces the real status
+                // (or ECHILD) exactly as it would have without this fallback.
+                return WaitResult::Ready;
+            }
+            // Still running: park briefly on the signal pipes (interruptible),
+            // then re-poll. The empty fd list means poll_with_signal returns only
+            // Interrupted (pending signal) or TimedOut (slice elapsed).
+            if let WaitResult::Interrupted =
+                self.poll_with_signal(&[], Some(Duration::from_millis(50)), block_mask)
+            {
+                return WaitResult::Interrupted;
+            }
+        }
     }
 
     /// Non-macOS stub: no kqueue, so report interrupted and let the caller
@@ -436,14 +528,21 @@ impl ThreadWaiter {
 
             let n = match n {
                 Ok(n) => n,
-                Err(_) => {
-                    // EINTR (a signal raced in) — re-check the pending flag.
+                Err(e) => {
                     if crate::host_signal::has_unblocked_pending_for(self.tid, block_mask)
                         || crate::fork_quiesce::is_quiescing()
                     {
                         break WaitResult::Interrupted;
                     }
-                    continue;
+                    // EINTR (a signal raced in) — re-check the pending flag and
+                    // retry. Any other error means the kqueue fd is unusable
+                    // (EBADF: closed out from under us by the fork-storm
+                    // internal-fd churn), which retrying can only repeat forever;
+                    // abandon it and poll(2) the watched fds directly instead.
+                    if e == libc::EINTR {
+                        continue;
+                    }
+                    return self.fallback_poll(fds, timeout, block_mask);
                 }
             };
             let mut fd_ready = false;

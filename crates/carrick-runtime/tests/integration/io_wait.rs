@@ -85,3 +85,9 @@ fn kqueue_wait_wakes_when_peer_writes_after_registration() {
     let result = waiter_thread.join().expect("waiter thread panicked");
     assert!(matches!(result, WaitResult::Ready));
 }
+
+// NOTE: the EBADF-recovery regression test lives in its own top-level test
+// binary (tests/wait_proc_exit_recovery.rs) so it runs in an isolated process.
+// `wait_proc_exit` consults process-global signal/quiesce state, which the HVF
+// and fork tests in *this* binary mutate concurrently — running it here makes it
+// flaky for reasons unrelated to the fix.
