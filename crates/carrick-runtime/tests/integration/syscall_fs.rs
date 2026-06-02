@@ -2908,6 +2908,41 @@ fn synthetic_proc_files_write_regular_packed_stat_records() {
 }
 
 #[test]
+fn proc_self_oom_score_adj_is_writable() {
+    // systemd/runc write oom_score_adj at startup; carrick accepts-and-ignores
+    // the write (no EACCES on open, no EBADF on write) so they don't warn.
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
+    memory.write_bytes(0x4000, b"/proc/self/oom_score_adj\0").unwrap();
+    memory.write_bytes(0x4200, b"-1000\n").unwrap();
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    // openat(AT_FDCWD, path, O_WRONLY) — must NOT EACCES.
+    let open = dispatcher
+        .dispatch(
+            SyscallRequest::new(
+                56,
+                SyscallArgs::from([(-100_i64) as u64, 0x4000, 1, 0, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    let DispatchOutcome::Returned { value: fd } = open else {
+        panic!("oom_score_adj should open O_WRONLY, got {open:?}");
+    };
+    // write(fd, "-1000\n", 6) — accepted, returns the byte count.
+    let write = dispatcher
+        .dispatch(
+            SyscallRequest::new(64, SyscallArgs::from([fd as u64, 0x4200, 6, 0, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    assert_eq!(write, DispatchOutcome::Returned { value: 6 });
+}
+
+#[test]
 fn missing_proc_file_records_compat_report_entry() {
     // /proc/self/sched is unserved by carrick (and ENOENT in the Docker oracle
     // too), so it stands in as a still-unimplemented proc path for the

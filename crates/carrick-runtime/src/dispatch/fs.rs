@@ -5237,6 +5237,19 @@ impl SyscallDispatcher {
                                 Err(errno) => DispatchOutcome::errno(errno as i32),
                             });
                         }
+                        OpenDescription::SyntheticFile { path, .. }
+                            if crate::vfs::proc::is_writable_tunable_path(path) =>
+                        {
+                            // oom_score_adj/oom_adj/loginuid/timerslack_ns are rw
+                            // in Linux; carrick has no live OOM/audit/timer-slack
+                            // state, so accept-and-ignore the write (the whole
+                            // buffer is "consumed") rather than EBADF — this is
+                            // what systemd/runc expect when lowering their OOM
+                            // priority at startup.
+                            return Ok(DispatchOutcome::Returned {
+                                value: bytes.len() as i64,
+                            });
+                        }
                         _ => return Ok(LINUX_EBADF.into()),
                     }
                 }
