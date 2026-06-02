@@ -33,7 +33,12 @@ impl BindVfs {
 
     fn to_host(&self, guest_path: &str) -> Result<PathBuf, VfsError> {
         let relative = if guest_path == self.mount_point {
-            Path::new("")
+            // The mount point itself maps to host_path verbatim. Do NOT
+            // `join("")` — Path::join with an empty component appends a trailing
+            // separator (`…/os.test` → `…/os.test/`), which open(2) rejects with
+            // ENOTDIR on a regular file (a single-file bind, e.g. the run-elf
+            // /proc/self/exe binary, mounts one file at the mount point).
+            return Ok(self.host_path.clone());
         } else if let Some(stripped) = guest_path.strip_prefix(&self.mount_point) {
             let stripped = stripped.strip_prefix('/').unwrap_or(stripped);
             Path::new(stripped)
