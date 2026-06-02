@@ -2728,6 +2728,86 @@ fn proc_self_fd_readlink_synthesizes_anon_inode_target() {
 }
 
 #[test]
+fn proc_self_fd_directory_lists_open_fds() {
+    // `ls /proc/self/fd` / `for fd in /proc/self/fd/*`: opendir + getdents must
+    // enumerate the guest's open fds as symlink entries.
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x4000]);
+    memory.write_bytes(0x4000, b"/proc/self/fd\0").unwrap();
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    // eventfd2(0, 0) = syscall 19 → a non-stdio fd that must appear in the list.
+    let DispatchOutcome::Returned { value: efd } = dispatcher
+        .dispatch(
+            SyscallRequest::new(19, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap()
+    else {
+        panic!("eventfd2 should succeed");
+    };
+
+    // openat(AT_FDCWD, "/proc/self/fd", O_RDONLY) — a directory open.
+    let open = dispatcher
+        .dispatch(
+            SyscallRequest::new(
+                56,
+                SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    let DispatchOutcome::Returned { value: dirfd } = open else {
+        panic!("opendir /proc/self/fd: {open:?}");
+    };
+
+    // getdents64(dirfd, buf, count) = syscall 61.
+    let outcome = dispatcher
+        .dispatch(
+            SyscallRequest::new(61, SyscallArgs::from([dirfd as u64, 0x4400, 0x1000, 0, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    let DispatchOutcome::Returned { value } = outcome else {
+        panic!("getdents64 /proc/self/fd: {outcome:?}");
+    };
+    assert!(value > 0, "getdents should return entries");
+
+    let dirent = memory.read_bytes(0x4400, value as usize).unwrap();
+    let mut names: Vec<String> = Vec::new();
+    let mut off = 0usize;
+    while off < dirent.len() {
+        let (header, _) = LinuxDirent64Header::read_from_prefix(&dirent[off..]).unwrap();
+        let reclen = header.d_reclen as usize;
+        if reclen == 0 {
+            break;
+        }
+        let name_start = off + LINUX_DIRENT64_HEADER_SIZE;
+        let name_end = dirent[name_start..]
+            .iter()
+            .position(|b| *b == 0)
+            .map(|p| name_start + p)
+            .unwrap();
+        names.push(String::from_utf8_lossy(&dirent[name_start..name_end]).into_owned());
+        off += reclen;
+    }
+    // The eventfd and the stdio fds must be listed.
+    assert!(
+        names.contains(&efd.to_string()),
+        "/proc/self/fd should list the eventfd {efd}: {names:?}"
+    );
+    for stdio in ["0", "1", "2"] {
+        assert!(
+            names.iter().any(|n| n == stdio),
+            "/proc/self/fd should list stdio {stdio}: {names:?}"
+        );
+    }
+}
+
+#[test]
 fn openat_reads_synthetic_proc_maps_and_cpuinfo() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
     memory.write_bytes(0x4000, b"/proc/self/maps\0").unwrap();

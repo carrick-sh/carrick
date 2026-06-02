@@ -2984,6 +2984,7 @@ impl SyscallDispatcher {
             executable_path: proc.executable_path.clone(),
             argv: proc.argv.clone(),
             environ: proc.env.clone(),
+            open_fds: self.open_fd_numbers(),
             address_space_regions: mem.address_space_regions,
             brk_current: mem.brk_current,
             mmap_next: mem.mmap_next,
