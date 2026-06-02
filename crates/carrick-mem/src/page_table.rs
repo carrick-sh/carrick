@@ -630,6 +630,86 @@ impl PageTableManager {
         self.set_prot_none(va, len)
     }
 
+    /// `munmap` of a HIGH-VA alias: invalidate the range AND reclaim any spare
+    /// L3/L2 sub-table the invalidation left entirely empty, returning it to the
+    /// pool and clearing the parent entry. Unlike `invalidate` (which only faults
+    /// the leaves and KEEPS the sub-table — correct for the low-VA arena, whose
+    /// pages are reused in place), a high-VA alias is torn down completely, so
+    /// its dedicated per-2-MiB L3 table (one per `mmap(MAP_SHARED, fd)`, which
+    /// each takes its own 2 MiB alias block) must be freed — otherwise the
+    /// 440-entry spare pool leaks one table per alias and a churning guest
+    /// (CPython multiprocessing maps+unmaps 400+ SemLock/Pool shm files) hits
+    /// OutOfTables. Caller must hold the alias region exclusively here (this is
+    /// the munmap path, PMR-gated under multi-vCPU); reclaim is additionally
+    /// gated single-vCPU/PMR inside (see `reclaim_invalid_tables`).
+    pub fn unmap_aliased(&mut self, va: u64, len: usize) -> Result<bool, PageTableError> {
+        let changed = self.set_prot_none(va, len)?;
+        let reclaimed = self.reclaim_invalid_tables(va, len);
+        Ok(changed || reclaimed)
+    }
+
+    /// Free spare L3/L2 sub-tables in `[va, va+len)` that the caller just left
+    /// ALL-INVALID, clearing the parent entry. The dual of `try_coalesce` (which
+    /// flips a uniform-VALID table to a block): this reclaims an empty table.
+    /// Single-vCPU/PMR only — a freed table must not be reused under a sibling's
+    /// stale walk-cache (same break-before-make rule as coalesce). Returns
+    /// whether anything was freed.
+    fn reclaim_invalid_tables(&mut self, va: u64, len: usize) -> bool {
+        if self.multi_vcpu {
+            return false;
+        }
+        let end = va + (len as u64).div_ceil(PT_PAGE) * PT_PAGE;
+        let mut block = va & !((1 << 21) - 1);
+        let mut freed = false;
+        while block < end {
+            freed |= self.reclaim_invalid_block(block);
+            block += 1 << 21;
+        }
+        freed
+    }
+
+    fn reclaim_invalid_block(&mut self, va: u64) -> bool {
+        let idx = indices(va);
+        let Some(l1_pa) = self.child_table_pa(idx[0] * 8) else {
+            return false;
+        };
+        let Ok(l1_off) = self.pa_to_off(l1_pa) else {
+            return false;
+        };
+        let l1_entry = l1_off + idx[1] * 8;
+        let mut freed = false;
+        // L3 all-invalid -> free it, invalidate the L2 entry that pointed at it.
+        if let Some(l2_pa) = self.child_table_pa(l1_entry)
+            && let Ok(l2_off) = self.pa_to_off(l2_pa)
+        {
+            let l2_entry = l2_off + idx[2] * 8;
+            if let Some(l3_pa) = self.child_table_pa(l2_entry)
+                && self.is_spare_table(l3_pa)
+                && let Ok(l3_off) = self.pa_to_off(l3_pa)
+                && self.table_all_invalid(l3_off)
+            {
+                self.write_desc(l2_entry, 0);
+                self.free_table(l3_pa);
+                freed = true;
+            }
+        }
+        // L2 now all-invalid (the last alias in this 1 GiB went away) -> free it.
+        if let Some(l2_pa) = self.child_table_pa(l1_entry)
+            && self.is_spare_table(l2_pa)
+            && let Ok(l2_off) = self.pa_to_off(l2_pa)
+            && self.table_all_invalid(l2_off)
+        {
+            self.write_desc(l1_entry, 0);
+            self.free_table(l2_pa);
+            freed = true;
+        }
+        freed
+    }
+
+    fn table_all_invalid(&self, table_off: usize) -> bool {
+        (0..512usize).all(|i| self.read_desc(table_off + i * 8) & VALID == 0)
+    }
+
     /// Mark `[va, va+len)` valid read-only (AP=RO). `exec` clears UXN
     /// (executable, PROT_EXEC); otherwise UXN is set (non-executable / NX).
     pub fn set_readonly(
@@ -866,6 +946,40 @@ mod tests {
         mgr.set_rw(va, 0x2000, true).expect("rw");
         assert!(mgr.is_valid(va));
         assert!(mgr.is_valid(va + 0x1000));
+    }
+
+    #[test]
+    fn unmap_aliased_reclaims_only_the_freed_l3_table() {
+        // Two 4 KiB MAP_SHARED-style aliases 2 MiB apart in the high alias
+        // window: they share the L1+L2 but each gets its OWN L3 table (the
+        // per-2-MiB-block design — "no two file mappings share a block").
+        // munmap of one must reclaim exactly its L3 table back to the spare pool
+        // and leave the sibling intact. Without reclaim, a churning guest leaks
+        // one table per alias and exhausts the 440-entry pool (CPython
+        // multiprocessing maps+unmaps 400+ SemLock/Pool shm files -> OutOfTables).
+        let mut mgr = manager();
+        let va1 = 0x100_0020_0000u64; // > 1 TiB, 2 MiB aligned, never identity-mapped
+        let va2 = va1 + (1 << 21); // next 2 MiB block — same L2 table
+        mgr.map_aliased(va1, 0x80_0000, 0x1000, true)
+            .expect("alias 1");
+        mgr.map_aliased(va2, 0xA0_0000, 0x1000, true)
+            .expect("alias 2");
+        assert!(
+            mgr.is_valid(va1) && mgr.is_valid(va2),
+            "both aliases mapped"
+        );
+        let (two, _, _) = mgr.pool_stats();
+
+        let changed = mgr.unmap_aliased(va1, 0x1000).expect("unmap alias 1");
+        assert!(changed, "unmap edited the tables");
+        let (one, _, _) = mgr.pool_stats();
+        assert_eq!(
+            one,
+            two - 1,
+            "freed exactly the va1 L3 table; the shared L2/L1 + va2's L3 stay"
+        );
+        assert!(!mgr.is_valid(va1), "va1 faults after unmap");
+        assert!(mgr.is_valid(va2), "sibling alias va2 still mapped");
     }
 
     #[test]

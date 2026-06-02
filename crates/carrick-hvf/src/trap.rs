@@ -1729,6 +1729,13 @@ impl HvfInner {
         self.pt_edit_and_flush(|mgr| mgr.invalidate(address, len))
     }
 
+    /// `munmap` of a high-VA alias: invalidate AND reclaim the now-empty alias
+    /// sub-table(s) back to the spare pool (vs `unmap_range`, which keeps the
+    /// table for the low-VA arena's in-place reuse). See `unmap_aliased`.
+    fn unmap_alias_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+        self.pt_edit_and_flush(|mgr| mgr.unmap_aliased(address, len))
+    }
+
     /// Back a dynamic high-VA `mmap`: `hv_vm_map` host-anon memory at the
     /// reserved low IPA, build the VA→IPA stage-1 path, and register the region
     /// for syscall-path access (keyed by the VA). RWX so a JIT (Rosetta) can
@@ -3847,6 +3854,10 @@ impl GuestMemory for HvfTrapEngine {
 
     fn unmap_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
         self.inner.unmap_range(address, len)
+    }
+
+    fn unmap_alias_range(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+        self.inner.unmap_alias_range(address, len)
     }
 
     fn repoint_private(
