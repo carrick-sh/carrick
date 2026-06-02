@@ -215,6 +215,55 @@ pub(crate) enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
+    /// Create a container without starting it (like `docker create`). Pulls the
+    /// image and persists the config; launch it later with `carrick start`.
+    Create {
+        image: String,
+        #[arg(long, value_name = "OS/ARCH")]
+        platform: Option<String>,
+        #[arg(long, value_enum)]
+        fs: Option<FsBackendKind>,
+        #[arg(long, value_enum, default_value_t = PidMode::Private)]
+        pid: PidMode,
+        #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
+        env: Vec<String>,
+        #[arg(long = "env-file", value_name = "FILE")]
+        env_file: Vec<PathBuf>,
+        #[arg(short = 'w', long = "workdir", value_name = "DIR")]
+        workdir: Option<String>,
+        #[arg(short = 'u', long = "user", value_name = "USER")]
+        user: Option<String>,
+        #[arg(long = "entrypoint", value_name = "COMMAND")]
+        entrypoint: Option<String>,
+        #[arg(short = 'v', long = "volume", value_name = "host-src:container-dest[:ro|rw]")]
+        volume: Vec<String>,
+        #[arg(long = "mount", value_name = "type=bind,source=...,target=...")]
+        mount: Vec<String>,
+        #[arg(long = "name", value_name = "NAME")]
+        name: Option<String>,
+        #[arg(short = 't', long = "tty")]
+        tty: bool,
+        #[arg(short = 'i', long = "interactive")]
+        interactive: bool,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+    /// Start one or more created or stopped containers (like `docker start`).
+    Start {
+        /// Attach STDOUT/STDERR (not yet implemented; prints the id).
+        #[arg(short = 'a', long = "attach")]
+        attach: bool,
+        #[arg(required = true)]
+        containers: Vec<String>,
+    },
+    /// Restart one or more containers (like `docker restart`).
+    Restart {
+        /// Seconds to wait for graceful stop before SIGKILL.
+        #[arg(short = 't', long = "time", default_value_t = 10)]
+        time: u64,
+        #[arg(required = true)]
+        containers: Vec<String>,
+    },
     Shell {
         #[arg(default_value = "alpine:latest")]
         image: String,
