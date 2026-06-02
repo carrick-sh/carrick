@@ -2808,6 +2808,51 @@ fn proc_self_fd_directory_lists_open_fds() {
 }
 
 #[test]
+fn proc_self_auxv_refreshes_when_image_state_is_updated() {
+    // execve now re-applies the new image's /proc state via the same setters; a
+    // second set_auxv_image (as a fresh image would trigger) must be reflected,
+    // not stuck on the first image's auxv.
+    let read_auxv = |dispatcher: &mut SyscallDispatcher, memory: &mut LinearMemory| -> Vec<u8> {
+        let reporter = CompatReporter::default();
+        memory.write_bytes(0x4000, b"/proc/self/auxv\0").unwrap();
+        let DispatchOutcome::Returned { value: fd } = dispatcher
+            .dispatch(
+                SyscallRequest::new(
+                    56,
+                    SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
+                ),
+                memory,
+                &reporter,
+            )
+            .unwrap()
+        else {
+            panic!("open /proc/self/auxv");
+        };
+        let DispatchOutcome::Returned { value: n } = dispatcher
+            .dispatch(
+                SyscallRequest::new(63, SyscallArgs::from([fd as u64, 0x4400, 0x400, 0, 0, 0])),
+                memory,
+                &reporter,
+            )
+            .unwrap()
+        else {
+            panic!("read /proc/self/auxv");
+        };
+        memory.read_bytes(0x4400, n as usize).unwrap().to_vec()
+    };
+
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
+    let mut dispatcher = SyscallDispatcher::new();
+
+    dispatcher.set_auxv_image(vec![1, 2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(read_auxv(&mut dispatcher, &mut memory), vec![1, 2, 3, 4, 5, 6, 7, 8]);
+
+    // A subsequent image (the execve refresh) replaces it.
+    dispatcher.set_auxv_image(vec![9, 10, 11, 12]);
+    assert_eq!(read_auxv(&mut dispatcher, &mut memory), vec![9, 10, 11, 12]);
+}
+
+#[test]
 fn proc_self_fdinfo_renders_pos_flags_ino() {
     // proc_pid_fdinfo(5): pos/flags/mnt_id/ino for an fd. libuv/Node read the
     // octal flags to recover an inherited fd's O_NONBLOCK/append/access mode.
