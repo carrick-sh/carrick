@@ -228,10 +228,18 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 .as_deref()
                 .and_then(carrick_image::PlatformTarget::parse)
                 .unwrap_or_else(carrick_image::PlatformTarget::default_target);
-            let summary = block_on_oci(carrick_image::pull_image_with_platform(
-                &image, &store, &target,
-            ))?;
-            println!("{}", serde_json::to_string_pretty(&summary)?);
+            // Cache short-circuit: if the image is already in the store for this
+            // platform, don't re-download (docker prints "Image is up to date").
+            // Note: this trusts the local cache and does not re-check the registry
+            // for a newer digest on a moving tag — a force/`--pull` follow-up.
+            if block_on_oci(store.load_pull_summary_for(&image, &target)).is_ok() {
+                println!("Status: Image is up to date for {}", image.canonical());
+            } else {
+                block_on_oci(carrick_image::pull_image_with_platform(
+                    &image, &store, &target,
+                ))?;
+                println!("Status: Downloaded newer image for {}", image.canonical());
+            }
         }
         Commands::Images { quiet } => {
             let images = store.list_images();
