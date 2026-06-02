@@ -37,6 +37,37 @@ fn entrypoint_not_found_result() -> RunResult {
     }
 }
 
+/// True when the entrypoint EXISTS but cannot be executed as a program: a
+/// non-ELF / malformed image (goblin parse failure → "exec format error") or a
+/// permission denial (EACCES). The runc/shell convention is to exit 126 for
+/// that — `docker run img /etc/hostname` yields 126 — distinct from 127 (not
+/// found) and the generic 1 a propagated error would produce.
+fn is_entrypoint_not_executable(e: &RuntimeError) -> bool {
+    match e {
+        // A file that isn't a loadable AArch64 ELF (wrong magic, truncated,
+        // wrong machine, parse error): docker's "exec format error".
+        RuntimeError::AddressSpace(crate::memory::AddressSpaceError::Elf(_)) => true,
+        // The file exists but we lack execute/read permission: "permission denied".
+        RuntimeError::AddressSpace(crate::memory::AddressSpaceError::Io(io)) => {
+            io.kind() == std::io::ErrorKind::PermissionDenied
+        }
+        _ => false,
+    }
+}
+
+/// A 126 ("command found but not executable") result for an entrypoint that
+/// exists but cannot be loaded/exec'd.
+fn entrypoint_not_executable_result() -> RunResult {
+    RunResult {
+        exit_code: 126,
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+        traps: 0,
+        report: crate::compat::CompatReport::default(),
+        trap_limit_hit: false,
+    }
+}
+
 /// For an `amd64` (Rosetta-translated) container, expose the host's Rosetta
 /// runtime files inside the guest VFS at the same paths. Rosetta opens these at
 /// startup to load its support libraries and (optionally) its AOT translation
@@ -219,6 +250,9 @@ impl Runtime {
                     Err(e) if is_entrypoint_not_found(&e) => {
                         return Ok(entrypoint_not_found_result());
                     }
+                    Err(e) if is_entrypoint_not_executable(&e) => {
+                        return Ok(entrypoint_not_executable_result());
+                    }
                     Err(e) => {
                         return Err(RuntimeError::FsBackend(anyhow::anyhow!(
                             "failed to run ELF from dispatcher: {}",
@@ -303,6 +337,9 @@ impl Runtime {
                     Ok(r) => r,
                     Err(e) if is_entrypoint_not_found(&e) => {
                         return Ok(entrypoint_not_found_result());
+                    }
+                    Err(e) if is_entrypoint_not_executable(&e) => {
+                        return Ok(entrypoint_not_executable_result());
                     }
                     Err(e) => {
                         return Err(RuntimeError::FsBackend(anyhow::anyhow!(
@@ -512,5 +549,39 @@ fn setup_interactive_stdio(
                 .context("failed to adopt interactive pty in runtime child")?;
             Ok(None)
         }
+    }
+}
+
+#[cfg(test)]
+mod exit_code_tests {
+    use super::{is_entrypoint_not_executable, is_entrypoint_not_found};
+    use crate::elf::ElfInspectError;
+    use crate::memory::AddressSpaceError;
+    use crate::runtime::RuntimeError;
+    use std::io::{Error as IoError, ErrorKind};
+
+    fn rt_io(kind: ErrorKind) -> RuntimeError {
+        RuntimeError::AddressSpace(AddressSpaceError::Io(IoError::from(kind)))
+    }
+    fn rt_not_elf() -> RuntimeError {
+        RuntimeError::AddressSpace(AddressSpaceError::Elf(ElfInspectError::NotElf))
+    }
+
+    #[test]
+    fn not_found_maps_to_127_class_only() {
+        // docker/runc/shell: a missing entrypoint is 127.
+        assert!(is_entrypoint_not_found(&rt_io(ErrorKind::NotFound)));
+        assert!(!is_entrypoint_not_found(&rt_io(ErrorKind::PermissionDenied)));
+        assert!(!is_entrypoint_not_found(&rt_not_elf()));
+    }
+
+    #[test]
+    fn not_executable_maps_to_126_class_only() {
+        // docker/runc: an entrypoint that exists but cannot exec (non-ELF
+        // "exec format error", or EACCES "permission denied") is 126 — not 127,
+        // not the generic 1.
+        assert!(is_entrypoint_not_executable(&rt_not_elf()));
+        assert!(is_entrypoint_not_executable(&rt_io(ErrorKind::PermissionDenied)));
+        assert!(!is_entrypoint_not_executable(&rt_io(ErrorKind::NotFound)));
     }
 }
