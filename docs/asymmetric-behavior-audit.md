@@ -26,12 +26,13 @@ MED = real divergence, narrower blast radius · LOW = cosmetic / documented-inte
 
 ## Status (2026-06-02 — implementation pass)
 
-**Closed and verified (18 of 19):** all 6 HIGH except H3 (H1, H2, H4, H5, H6) and
-all 13 MED (M1–M13). Each shipped a RED→GREEN host test (named inline below).
-Gate: `cargo test -p carrick-runtime --test integration` = **258 passed**,
-`--lib` = **294 passed**. (Also cleared a latent pre-existing failure:
-`dispatch_declares_no_abi_constants` was red on `main` because `LINUX_FUTEX_TID_MASK`
-was a column-0 const; moved it function-local.)
+**All 19 closed.** This branch lands H1, H2, H4, H5, H6 and all 13 MED (M1–M13),
+each with a RED→GREEN host test (named inline below). **H3 was fixed independently
+on `origin/main`** (`ddbd535 mem: reclaim the per-alias L3 table on high-VA
+munmap`, via `PageTableManager::unmap_aliased`) — when this branch rebased onto it,
+my parallel duplicate (a `free_aliased`/`free_alias_range` of the same design) was
+dropped in favor of the canonical version; only my M11 (overlay-slot free on
+munmap) was re-applied on top. Gate after rebase: see the test sweep below.
 
 > **Verification caveat:** these are **host-harness** tests (the in-process
 > `SyscallDispatcher` over `LinearMemory`, plus lib unit tests) — they prove the
@@ -45,29 +46,23 @@ was a column-0 const; moved it function-local.)
 M10 and M12 are **documented-intentional** resolutions (the underlying mechanism
 is already satisfied by the host — see their entries), not new code paths.
 
-**H3 — partially landed (leak #1 single-vCPU), remainder HVF-blocked:**
-- **Leak #1 (L3-table-pool exhaustion — the actual `OutOfTables` crash):** FIXED
-  for the single-vCPU case and wired end-to-end. `PageTableManager::free_aliased`
-  (`crates/carrick-mem/src/page_table.rs`) invalidates the alias range AND
-  cascades the now-empty L3→L2→L1 spare tables back to the pool; reached via a new
-  `GuestMemory::free_alias_range` (carrick-guest-mem trait → carrick-hvf `trap.rs`
-  override → runtime `SplitView` → `dispatch/mem.rs` high-VA munmap branch).
-  Unit-tested at the carrick-mem level: single map/free returns the pool to
-  baseline, **200 map/free cycles leak zero tables** (the exhaustion repro), and
-  multi-vCPU safely **defers** the free. Like `try_coalesce` (`page_table.rs:468`),
-  the table free runs ONLY single-vCPU: freeing a sub-table a sibling vCPU could
-  be mid-walk needs an all-vCPU TLB shootdown that one vCPU's `tlbi vmalle1is`
-  does not provide under HVF. So under the **multi-vCPU multiprocessing** workload
-  the free is still deferred until the process is back to one vCPU — the
-  remaining piece needs a carrick-managed cross-vCPU TLB-shootdown design +
-  Rosetta-lane verification under **HVF + Docker** (this environment cannot run
-  it). NOT landing the multi-vCPU free blind is deliberate (it would reintroduce
-  the corruption `try_coalesce` guards against).
+**H3 — fixed on `main` (`ddbd535`); my duplicate dropped on rebase:**
+- **Leak #1 (L3-table-pool exhaustion — the `OutOfTables` crash):** FIXED on
+  `origin/main` by `PageTableManager::unmap_aliased` (invalidate +
+  `reclaim_invalid_tables`, the dual of `try_coalesce`), threaded through
+  `GuestMemory::unmap_alias_range` and called from `dispatch/mem.rs`'s high-VA
+  munmap branch. Reclaim is gated single-vCPU/PMR for the same break-before-make
+  reason `try_coalesce` is (no reliable cross-vCPU `tlbi vmalle1is` broadcast
+  under HVF). I had independently built the identical design (`free_aliased` /
+  `free_alias_range`); on rebasing onto `main` I dropped mine and kept the
+  canonical one. Net: leak #1 is closed; the multi-vCPU TLB-shootdown for full
+  multiprocessing-concurrency reclaim remains a tracked follow-on (per `ddbd535`
+  / `d8c3879`).
 - **Leak #2 (HvfMappedRegion: host mmap + fd) and #3 (alias IPA cursor):** still
-  reclaimed only at process teardown. Both are blocked on the SAME HVF limitation
-  — arm64 HVF has no stage-2 unmap (`dispatch/mem.rs` ~667), so the host backing
-  can't be freed nor the IPA reused while the stage-2 mapping persists. Bounded
-  per-process; needs a stage-2-teardown path + HVF verification. Deferred.
+  reclaimed only at process teardown — both blocked on arm64 HVF having no
+  stage-2 unmap (`dispatch/mem.rs` ~667): the host backing can't be freed nor the
+  IPA reused while the stage-2 mapping persists. Bounded per-process; needs a
+  stage-2-teardown path + HVF verification. Tracked follow-on.
 
 Test names for the closed items are appended to each entry below as `→ test:`.
 
