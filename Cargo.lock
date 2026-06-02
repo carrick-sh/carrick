@@ -376,6 +376,7 @@ dependencies = [
  "oci-client",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
 ]
