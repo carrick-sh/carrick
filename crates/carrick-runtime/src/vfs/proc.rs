@@ -38,6 +38,9 @@ pub struct SyntheticProcContext {
     pub environ: Vec<Vec<u8>>,
     /// The guest's currently-open fd numbers, for the `/proc/self/fd` listing.
     pub open_fds: Vec<i32>,
+    /// The serialized ELF auxv byte image (type/value pairs through AT_NULL) the
+    /// guest received on its stack, surfaced verbatim via `/proc/self/auxv`.
+    pub auxv: Vec<u8>,
     pub address_space_regions: Option<Vec<ProcMapsEntry>>,
     pub brk_current: u64,
     pub mmap_next: u64,
@@ -349,7 +352,7 @@ pub(crate) fn synthetic_file(path: &str, ctx: &SyntheticProcContext) -> Option<V
         "/proc/uptime" => Some(synthetic_proc_uptime().into_bytes()),
         "/proc/version" => Some(synthetic_proc_version().to_vec()),
         "/proc/vmstat" => Some(synthetic_proc_vmstat().to_vec()),
-        "/proc/self/auxv" => Some(synthetic_proc_self_auxv().to_vec()),
+        "/proc/self/auxv" => Some(synthetic_proc_self_auxv(&ctx.auxv)),
         "/proc/self/autogroup" => Some(b"/autogroup-0 nice 0\n".to_vec()),
         "/proc/self/cgroup" => Some(b"0::/\n".to_vec()),
         "/proc/self/cmdline" => Some(synthetic_proc_self_cmdline(&ctx.argv, &ctx.executable_path)),
@@ -1326,6 +1329,7 @@ impl Vfs for ProcVfs {
             argv: ctx.argv.unwrap_or(&[]).to_vec(),
             environ: ctx.environ.unwrap_or(&[]).to_vec(),
             open_fds: ctx.open_fds.unwrap_or(&[]).to_vec(),
+            auxv: ctx.auxv.unwrap_or(&[]).to_vec(),
             address_space_regions: ctx.address_space_regions.map(|regions| regions.to_vec()),
             brk_current: ctx.brk_current,
             mmap_next: ctx.mmap_next,
@@ -2190,8 +2194,15 @@ Locked:                0 kB\n",
     )
 }
 
-fn synthetic_proc_self_auxv() -> &'static [u8] {
-    &[0u8; 16]
+/// `/proc/self/auxv`: the byte-exact ELF auxiliary vector the guest received on
+/// its stack (proc(5)), captured at exec — AT_HWCAP/AT_PAGESZ/AT_PHDR/AT_RANDOM/
+/// AT_EXECFN/… through AT_NULL. Falls back to a single AT_NULL pair (16 zero
+/// bytes) when no image is loaded (e.g. unit tests), never an empty file.
+fn synthetic_proc_self_auxv(auxv: &[u8]) -> Vec<u8> {
+    if auxv.is_empty() {
+        return vec![0u8; 16];
+    }
+    auxv.to_vec()
 }
 
 fn synthetic_proc_self_limits() -> &'static [u8] {
@@ -2438,6 +2449,7 @@ mod tests {
             argv: vec!["/bin/demo".to_owned()],
             environ: vec![b"PATH=/usr/bin".to_vec(), b"HOME=/root".to_vec()],
             open_fds: vec![0, 1, 2],
+            auxv: Vec::new(),
             address_space_regions: Some(vec![ProcMapsEntry {
                 start: LINUX_HEAP_BASE,
                 end: LINUX_HEAP_BASE + 0x10000,
@@ -2613,6 +2625,24 @@ mod tests {
             "limits Max pending signals must be 63880: {limits}"
         );
         assert!(status.contains("SigQ:\t0/63880"), "status SigQ: {status}");
+    }
+
+    #[test]
+    fn self_auxv_serves_captured_image_else_at_null() {
+        // With a captured image, /proc/self/auxv is byte-exact.
+        let image: Vec<u8> = (0..48).collect();
+        let ctx = SyntheticProcContext {
+            auxv: image.clone(),
+            ..SyntheticProcContext::default()
+        };
+        assert_eq!(synthetic_file("/proc/self/auxv", &ctx).unwrap(), image);
+        // Without one (no image loaded / unit tests), a single AT_NULL pair —
+        // never an empty file.
+        let empty = SyntheticProcContext::default();
+        assert_eq!(
+            synthetic_file("/proc/self/auxv", &empty).unwrap(),
+            vec![0u8; 16]
+        );
     }
 
     #[test]
@@ -2911,6 +2941,7 @@ mod tests {
             argv: vec!["/bin/demo".to_owned()],
             environ: vec![b"PATH=/usr/bin".to_vec(), b"HOME=/root".to_vec()],
             open_fds: vec![0, 1, 2],
+            auxv: Vec::new(),
             address_space_regions: Some(vec![ProcMapsEntry {
                 start: LINUX_HEAP_BASE,
                 end: LINUX_HEAP_BASE + 0x10000,

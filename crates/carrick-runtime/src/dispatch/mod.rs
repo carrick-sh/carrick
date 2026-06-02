@@ -1282,6 +1282,14 @@ impl SyscallDispatcher {
         self.mem.lock().address_space_regions = Some(regions);
     }
 
+    /// Capture the guest's serialized ELF auxv image (from the loaded
+    /// `AddressSpace`) so `/proc/self/auxv` can serve the byte-exact vector the
+    /// guest received on its stack. Called alongside `set_address_space_regions`
+    /// at boot and on each successful `execve`.
+    pub fn set_auxv_image(&self, auxv: Vec<u8>) {
+        self.mem.lock().linux_auxv_image = auxv;
+    }
+
     /// High-water mark (bump cursor) of the anonymous mmap arena: the guest has
     /// only ever touched `[LINUX_MMAP_BASE, this)` of the 32 GiB arena window.
     /// `HvfInner::fork` uses it to bound the per-fork resident-page `mincore`
@@ -2985,6 +2993,7 @@ impl SyscallDispatcher {
             argv: proc.argv.clone(),
             environ: proc.env.clone(),
             open_fds: self.open_fd_numbers(),
+            auxv: mem.linux_auxv_image,
             address_space_regions: mem.address_space_regions,
             brk_current: mem.brk_current,
             mmap_next: mem.mmap_next,

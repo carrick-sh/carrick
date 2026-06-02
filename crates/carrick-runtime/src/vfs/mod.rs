@@ -224,6 +224,8 @@ pub struct OpenContext<'a> {
     /// The guest's currently-open fd numbers, for the `/proc/self/fd` directory
     /// listing. A snapshot — the listing only needs the numbers, not live state.
     pub open_fds: Option<&'a [i32]>,
+    /// The serialized ELF auxv byte image, for `/proc/self/auxv`.
+    pub auxv: Option<&'a [u8]>,
     pub address_space_regions: Option<&'a [ProcMapsEntry]>,
     pub brk_current: u64,
     pub mmap_next: u64,

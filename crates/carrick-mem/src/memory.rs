@@ -315,6 +315,12 @@ pub struct AddressSpace {
     stage1_page_tables_base: Option<u64>,
     #[serde(skip)]
     linux_auxv: Vec<LinuxAuxvEntry>,
+    /// The exact serialized auxv byte image written to the guest stack at exec
+    /// (type/value pairs through AT_NULL, with AT_RANDOM/PLATFORM/EXECFN patched
+    /// to their real stack addresses). Mirrored to `/proc/self/auxv`. Empty
+    /// until an initial stack is built.
+    #[serde(skip)]
+    linux_auxv_image: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -515,7 +521,14 @@ impl AddressSpace {
             el1_vectors_base: None,
             stage1_page_tables_base: None,
             linux_auxv: Vec::new(),
+            linux_auxv_image: Vec::new(),
         })
+    }
+
+    /// The exact serialized auxv byte image written to the guest stack, for
+    /// `/proc/self/auxv`. Empty until an initial stack has been built.
+    pub fn linux_auxv_image(&self) -> &[u8] {
+        &self.linux_auxv_image
     }
 
     pub fn entry(&self) -> u64 {
@@ -737,6 +750,7 @@ impl AddressSpace {
             regions,
             initial_stack_pointer,
             linux_auxv,
+            linux_auxv_image,
             el0_trampoline_entry,
             el1_vectors_base,
             stage1_page_tables_base,
@@ -745,6 +759,7 @@ impl AddressSpace {
             Self::from_regions(entry, regions.into_iter().chain([vvar, vdso]).collect())?;
         image.initial_stack_pointer = initial_stack_pointer;
         image.linux_auxv = linux_auxv;
+        image.linux_auxv_image = linux_auxv_image;
         image.el0_trampoline_entry = el0_trampoline_entry;
         image.el1_vectors_base = el1_vectors_base;
         image.stage1_page_tables_base = stage1_page_tables_base;
@@ -795,11 +810,12 @@ impl AddressSpace {
             .into_iter()
             .map(|s| s.as_ref().to_vec())
             .collect::<Vec<Vec<u8>>>();
-        let (region, stack_pointer) =
+        let (region, stack_pointer, auxv_image) =
             build_linux_initial_stack(argv, env, &linux_auxv, stack_top, stack_size)?;
         let mut image = Self::from_regions(entry, regions.into_iter().chain([region]).collect())?;
         image.initial_stack_pointer = Some(stack_pointer);
         image.linux_auxv = linux_auxv;
+        image.linux_auxv_image = auxv_image;
         image.el0_trampoline_entry = el0_trampoline_entry;
         image.el1_vectors_base = el1_vectors_base;
         image.stage1_page_tables_base = stage1_page_tables_base;
@@ -827,7 +843,7 @@ fn build_linux_initial_stack(
     auxv: &[LinuxAuxvEntry],
     stack_top: u64,
     stack_size: u64,
-) -> Result<(MemoryRegion, u64), AddressSpaceError> {
+) -> Result<(MemoryRegion, u64, Vec<u8>), AddressSpaceError> {
     let stack_start =
         stack_top
             .checked_sub(stack_size)
@@ -908,6 +924,11 @@ fn build_linux_initial_stack(
         bytes[offset..offset + 8].copy_from_slice(&entry.to_le_bytes());
     }
     let mut auxv_offset = stack_pointer_offset + entries_words * 8;
+    // Mirror the exact patched auxv array (the same byte image the guest sees on
+    // its stack) so `/proc/self/auxv` can serve it verbatim — AT_RANDOM/PLATFORM/
+    // EXECFN carry their real stack addresses, not the pre-patch 0 sentinels.
+    let mut auxv_image =
+        Vec::with_capacity((auxv.len() + 1) * core::mem::size_of::<LinuxAuxvEntry>());
     for entry in auxv.iter().copied() {
         let patched = match entry.a_type {
             LINUX_AT_RANDOM => LinuxAuxvEntry::new(LINUX_AT_RANDOM, random_addr),
@@ -920,10 +941,13 @@ fn build_linux_initial_stack(
         };
         bytes[auxv_offset..auxv_offset + core::mem::size_of::<LinuxAuxvEntry>()]
             .copy_from_slice(patched.as_bytes());
+        auxv_image.extend_from_slice(patched.as_bytes());
         auxv_offset += core::mem::size_of::<LinuxAuxvEntry>();
     }
+    let at_null = LinuxAuxvEntry::new(LINUX_AT_NULL, 0);
     bytes[auxv_offset..auxv_offset + core::mem::size_of::<LinuxAuxvEntry>()]
-        .copy_from_slice(LinuxAuxvEntry::new(LINUX_AT_NULL, 0).as_bytes());
+        .copy_from_slice(at_null.as_bytes());
+    auxv_image.extend_from_slice(at_null.as_bytes());
 
     Ok((
         MemoryRegion {
@@ -938,6 +962,7 @@ fn build_linux_initial_stack(
             bytes,
         },
         stack_start + stack_pointer_offset as u64,
+        auxv_image,
     ))
 }
 
