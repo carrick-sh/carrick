@@ -606,6 +606,32 @@ impl ImageStore {
         Ok(true)
     }
 
+    /// Remove an image identified by a reference (`name:tag`) OR a short image
+    /// id (the `IMAGE ID` from `carrick images`, full or prefix). Returns the
+    /// removed image's display id/ref, or `None` if nothing matched.
+    pub fn remove_image_by_spec(&self, spec: &str) -> std::io::Result<Option<String>> {
+        // 1. As a reference.
+        if let Ok(image) = ImageReference::parse(spec)
+            && self.remove_image(&image)?
+        {
+            return Ok(Some(image.canonical()));
+        }
+        // 2. As an image id (prefix of the short manifest digest).
+        let matches: Vec<ImageInfo> = self
+            .list_images()
+            .into_iter()
+            .filter(|i| !spec.is_empty() && i.id.starts_with(spec))
+            .collect();
+        if matches.is_empty() {
+            return Ok(None);
+        }
+        let id = matches[0].id.clone();
+        for info in matches {
+            std::fs::remove_dir_all(&info.image_dir)?;
+        }
+        Ok(Some(id))
+    }
+
     /// Garbage-collect blobs no longer referenced by any stored image. Returns
     /// `(count, bytes)` removed.
     pub fn gc_blobs(&self) -> (usize, u64) {
@@ -1025,5 +1051,29 @@ mod tests {
         assert!(imgs.iter().all(|i| i.id == "abcdef012345"));
         let (count, _) = store.gc_blobs();
         assert_eq!(count, 0, "the shared blob is still referenced by both refs");
+    }
+
+    #[test]
+    fn remove_image_by_spec_accepts_ref_or_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = ImageStore::new(tmp.path());
+        fake_image(&store, "docker.io/library/ubuntu:24.04", "sha256:abcdef012345", &[("sha256:1111", 100)]);
+        // By short image id (prefix of the 12-hex digest).
+        assert_eq!(
+            store.remove_image_by_spec("abcdef").unwrap().as_deref(),
+            Some("abcdef012345")
+        );
+        assert!(store.list_images().is_empty());
+
+        // By reference.
+        fake_image(&store, "docker.io/library/alpine:3", "sha256:99887766", &[("sha256:2222", 50)]);
+        assert_eq!(
+            store.remove_image_by_spec("alpine:3").unwrap().as_deref(),
+            Some("docker.io/library/alpine:3")
+        );
+        assert!(store.list_images().is_empty());
+
+        // Unknown.
+        assert_eq!(store.remove_image_by_spec("nope:latest").unwrap(), None);
     }
 }
