@@ -240,3 +240,53 @@ pub fn status_to_exit_code(status: i32) -> i32 {
         1
     }
 }
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::status_to_exit_code;
+    use crate::darwin_kqueue::{Kevent, Kqueue};
+
+    /// A namespace member (a process the supervisor CANNOT waitpid — it's
+    /// reparented to launchd) exits 42. The supervisor recovers the status from
+    /// the kqueue event's `data` field. This guards that `proc_exit` is armed
+    /// with `NOTE_EXITSTATUS`: under plain `NOTE_EXIT` `data` is 0, which would
+    /// make every reaped orphan report exit code 0.
+    #[test]
+    fn member_exit_status_harvested_from_kqueue_data() {
+        // SAFETY: fork in a test; the child only calls nanosleep + `_exit`, both
+        // async-signal-safe. The short sleep lets the parent arm the EVFILT_PROC
+        // watch while the child is still alive (arming on an already-dead zombie
+        // races to ESRCH and never fires).
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            let ts = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 200_000_000,
+            };
+            unsafe {
+                libc::nanosleep(&ts, std::ptr::null_mut());
+                libc::_exit(42);
+            }
+        }
+        let kq = Kqueue::new_internal().expect("kqueue");
+        let _ = kq.apply(&[Kevent::proc_exit(child)]);
+        let mut events = [Kevent::empty(); 4];
+        let timeout = libc::timespec {
+            tv_sec: 5,
+            tv_nsec: 0,
+        };
+        let n = kq.wait(&[], &mut events, Some(&timeout)).expect("kqueue wait");
+        let mut harvested = None;
+        for ev in events.iter().take(n) {
+            if ev.proc_exit_ident() == Some(child) {
+                harvested = Some(ev.proc_exit_status());
+            }
+        }
+        // Reap our zombie (in the real supervisor flow launchd does this).
+        let mut st = 0;
+        unsafe { libc::waitpid(child, &mut st, 0) };
+        let data = harvested.expect("no NOTE_EXIT event for the child");
+        assert_eq!(status_to_exit_code(data), 42, "kqueue data was {data:#x}");
+    }
+}
