@@ -153,6 +153,23 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 .unwrap_or_else(|_| path.clone())
                 .to_string_lossy()
                 .into_owned();
+            // Make the guest's own executable openable at its /proc/self/exe path.
+            // run-elf loads the ELF directly from a host path, so the guest fs (the
+            // --fs host scratch / rootfs) doesn't contain it; without this a guest
+            // that does os.Executable()+open, or re-execs /proc/self/exe (Go os
+            // TestOpenFileNonBlocking, TestPidfdLeak; glibc's _dl_get_origin), hits
+            // ENOENT on its own binary. Bind the host ELF read-only at the
+            // executable path so the readlink target resolves to real, openable
+            // bytes — matching `carrick run <image>` and Docker, where the binary
+            // is a real file in the guest fs.
+            {
+                let exe_bind =
+                    carrick_runtime::vfs::BindVfs::new(executable_path.clone(), path.clone(), true);
+                dispatcher.register_mount(
+                    std::path::PathBuf::from(&executable_path),
+                    Box::new(exe_bind),
+                );
+            }
             let mut argv = vec![executable_path];
             argv.extend(args);
             let mut elf_env: Vec<String> = Vec::new();
