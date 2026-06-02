@@ -545,6 +545,11 @@ impl SyscallDispatcher {
         // blocking mode in Linux-visible status_flags and waits outside the
         // dispatcher lock when a blocking operation would block.
         set_host_nonblocking(host_fd);
+        // Give AF_UNIX stream sockets the Linux-sized buffer (macOS defaults to
+        // 8 KiB vs Linux's 212992) so a guest write expecting to complete up to the
+        // socket buffer without a draining reader doesn't block forever (Go
+        // splice/sendfile "Limited" copy hang). No-op for AF_INET / DGRAM.
+        widen_unix_stream_buffers(host_fd, family, base_type);
         let status_flags = LINUX_O_RDWR | if nonblock { LINUX_O_NONBLOCK } else { 0 };
         let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };
         let open_file = OpenFile::with_host_fd(
