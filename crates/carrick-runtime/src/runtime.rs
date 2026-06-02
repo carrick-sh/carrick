@@ -472,29 +472,38 @@ where
     )
 }
 
+/// The caller's role after [`maybe_fork_ns_supervisor`].
+enum SupervisorRole {
+    /// PARENT (NsSupervisor): it ran the kqueue loop until the guest-init exited;
+    /// the result carries the init's exit code to propagate up.
+    Parent(RunResult),
+    /// CHILD (guest-init, ns-pid 1): continue into HVF and run the guest. A
+    /// post-fork error here must `_exit`, NOT unwind — unwinding through
+    /// fd-bearing `Drop`s in the forked child double-closes an inherited fd and
+    /// trips std's IO-safety abort (SIGABRT).
+    ForkedInit,
+    /// No fork happened — placement was not requested, or region/pipe/fork setup
+    /// failed (degraded to running the guest in-process). Errors propagate normally.
+    InProcess,
+}
+
 /// Fork the per-container NsSupervisor before any HVF VM exists, if PID-ns
-/// placement was requested. Returns:
-/// - `Ok(None)` in the CHILD (guest-init): the region's init slot is filled and
-///   the caller continues into `HvfTrapEngine::new()` + the guest loop.
-/// - `Ok(Some(result))` in the PARENT (supervisor): it ran the kqueue loop
-///   until the init exited; `result` carries the init's exit code to propagate.
-/// - `Ok(None)` with no fork when placement was not requested OR setup failed
-///   (degraded to identity / no supervisor — the run still proceeds).
-fn maybe_fork_ns_supervisor() -> Result<Option<RunResult>, RuntimeError> {
+/// placement was requested. See [`SupervisorRole`] for the three outcomes.
+fn maybe_fork_ns_supervisor() -> Result<SupervisorRole, RuntimeError> {
     if !crate::namespace::pid::supervisor_requested() {
-        return Ok(None);
+        return Ok(SupervisorRole::InProcess);
     }
     // Allocate the shared member table + the registration pipe BEFORE the fork
     // so both processes inherit them. On any setup failure, degrade to running
     // the guest in-process without a supervisor (identity-ish placement still
     // works for the common single-process case via the region if it allocated).
     if !crate::namespace::pid::alloc_region() {
-        return Ok(None);
+        return Ok(SupervisorRole::InProcess);
     }
     let mut pipe_fds = [0i32; 2];
     // SAFETY: standard pipe(2) into a 2-element array.
     if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
-        return Ok(None);
+        return Ok(SupervisorRole::InProcess);
     }
     let (pipe_read, pipe_write) = (pipe_fds[0], pipe_fds[1]);
     // Make BOTH ends non-blocking: the write end so a guest's registration
@@ -521,7 +530,7 @@ fn maybe_fork_ns_supervisor() -> Result<Option<RunResult>, RuntimeError> {
             libc::close(pipe_write);
         }
         crate::namespace::pid::set_reg_pipe_write(-1);
-        return Ok(None);
+        return Ok(SupervisorRole::InProcess);
     }
     if pid == 0 {
         // CHILD: the guest-init (ns-pid 1). Close the supervisor's read end,
@@ -530,7 +539,7 @@ fn maybe_fork_ns_supervisor() -> Result<Option<RunResult>, RuntimeError> {
             libc::close(pipe_read);
         }
         crate::namespace::pid::set_init(std::process::id());
-        return Ok(None);
+        return Ok(SupervisorRole::ForkedInit);
     }
     // PARENT: the NsSupervisor. Close the write end (only members write), run
     // the kqueue loop until the init exits, then propagate its status.
@@ -557,7 +566,7 @@ fn maybe_fork_ns_supervisor() -> Result<Option<RunResult>, RuntimeError> {
     if let Some(id) = container_id.as_deref() {
         crate::container::mark_exited(id, code);
     }
-    Ok(Some(RunResult {
+    Ok(SupervisorRole::Parent(RunResult {
         exit_code: code,
         stdout: Vec::new(),
         stderr: Vec::new(),
@@ -580,17 +589,41 @@ fn run_address_space_with_hvf_and_dispatcher(
     // runs the guest as ns-pid 1, and the PARENT runs the kqueue supervisor
     // loop and exits with the init's status (docs/namespaces-design.md §3.2).
     // `run-elf` never requests placement, so this is a no-op there.
-    if let Some(result) = maybe_fork_ns_supervisor()? {
+    let role = maybe_fork_ns_supervisor()?;
+    if let SupervisorRole::Parent(result) = role {
         return Ok(result);
     }
-    let mut trap = HvfTrapEngine::new()?;
-    trap.map_address_space(&image)?;
-    // Hand the dispatcher the real region list + auxv so /proc/self/maps
-    // (regions, bootstrap pages, stack) and /proc/self/auxv reflect the loaded
-    // ELF instead of the legacy summary. Language runtimes, malloc
-    // implementations, and debuggers parse these; refreshed again on each execve.
-    apply_image_proc_state(&dispatcher, &image);
-    run_threaded_hvf_loop(trap, dispatcher, max_traps)
+    let forked_init = matches!(role, SupervisorRole::ForkedInit);
+    // Run the guest. In the forked guest-init, errors must NOT unwind (see below),
+    // so capture the fallible tail in a closure and branch on the role.
+    let run = (move || -> Result<RunResult, RuntimeError> {
+        let mut trap = HvfTrapEngine::new()?;
+        trap.map_address_space(&image)?;
+        // Hand the dispatcher the real region list + auxv so /proc/self/maps
+        // (regions, bootstrap pages, stack) and /proc/self/auxv reflect the loaded
+        // ELF instead of the legacy summary. Language runtimes, malloc
+        // implementations, and debuggers parse these; refreshed again on each execve.
+        apply_image_proc_state(&dispatcher, &image);
+        run_threaded_hvf_loop(trap, dispatcher, max_traps)
+    })();
+    match run {
+        Ok(r) => Ok(r),
+        Err(e) if forked_init => {
+            // Forked guest-init: a post-fork failure (HVF VM creation / mapping)
+            // must terminate WITHOUT unwinding. The forked child shares the
+            // parent's fd table; dropping fd-owning state on the way out
+            // double-closes an inherited fd and aborts via std's IO-safety check
+            // (SIGABRT). Print the error (stderr is inherited + unbuffered) and
+            // `_exit` with docker's "couldn't start the container" code (125) —
+            // the NsSupervisor parent harvests this and propagates it.
+            eprintln!("carrick: {e}");
+            // SAFETY: `_exit` is async-signal-safe and skips atexit/Drop cleanup,
+            // which is exactly what a forked child must do. Nothing is buffered
+            // (stderr written above; the guest never started).
+            unsafe { libc::_exit(125) };
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Finish a freshly-loaded image (its initial stack already set, if any) and
