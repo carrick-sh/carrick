@@ -113,6 +113,12 @@ pub(super) struct ProcState {
     /// Current guest argv, surfaced as NUL-separated bytes through
     /// `/proc/self/cmdline`.
     pub argv: Vec<String>,
+    /// Current guest environment (`KEY=VALUE` entries) as OPAQUE BYTES, surfaced
+    /// as NUL-separated bytes through `/proc/self/environ`. Kept as raw bytes —
+    /// env values are not required to be UTF-8, and a lossy String round-trip
+    /// would corrupt them (a class of bug carrick has hit before). Captured at
+    /// exec; empty until then.
+    pub env: Vec<Vec<u8>>,
     /// `personality(2)` execution-domain flags, recorded and echoed back.
     pub personality: u64,
     /// `prctl(PR_SET_DUMPABLE)` flag (default 1).
@@ -249,6 +255,7 @@ impl ProcState {
         Self {
             executable_path: "/proc/self/exe".to_owned(),
             argv: vec!["/proc/self/exe".to_owned()],
+            env: Vec::new(),
             personality: 0,
             dumpable: 1,
             task_name: linux_task_name_from_bytes(b"carrick"),

@@ -33,6 +33,9 @@ pub struct ProcMapsEntry {
 pub struct SyntheticProcContext {
     pub executable_path: String,
     pub argv: Vec<String>,
+    /// Guest environment (`KEY=VALUE`) as opaque bytes, surfaced via
+    /// `/proc/self/environ` (env values need not be UTF-8).
+    pub environ: Vec<Vec<u8>>,
     pub address_space_regions: Option<Vec<ProcMapsEntry>>,
     pub brk_current: u64,
     pub mmap_next: u64,
@@ -334,6 +337,7 @@ pub(crate) fn synthetic_file(path: &str, ctx: &SyntheticProcContext) -> Option<V
         "/proc/self/cgroup" => Some(b"0::/\n".to_vec()),
         "/proc/self/cmdline" => Some(synthetic_proc_self_cmdline(&ctx.argv, &ctx.executable_path)),
         "/proc/self/comm" => Some(synthetic_proc_self_comm(&ctx.executable_path).into_bytes()),
+        "/proc/self/environ" => Some(synthetic_proc_self_environ(&ctx.environ)),
         "/proc/self/io" => Some(synthetic_proc_self_io().to_vec()),
         "/proc/self/limits" => Some(synthetic_proc_self_limits().to_vec()),
         // The audit loginuid/sessionid "unset" sentinel ((uint32)-1), no newline.
@@ -922,6 +926,7 @@ const PROC_SELF_FILES: &[&str] = &[
     "cgroup",
     "cmdline",
     "comm",
+    "environ",
     "gid_map",
     "io",
     "limits",
@@ -1229,6 +1234,7 @@ impl Vfs for ProcVfs {
         let synth_ctx = SyntheticProcContext {
             executable_path: ctx.executable_path.unwrap_or("").to_owned(),
             argv: ctx.argv.unwrap_or(&[]).to_vec(),
+            environ: ctx.environ.unwrap_or(&[]).to_vec(),
             address_space_regions: ctx.address_space_regions.map(|regions| regions.to_vec()),
             brk_current: ctx.brk_current,
             mmap_next: ctx.mmap_next,
@@ -1640,6 +1646,19 @@ fn synthetic_proc_self_cmdline(argv: &[String], executable_path: &str) -> Vec<u8
     };
     for arg in args {
         bytes.extend_from_slice(arg.as_bytes());
+        bytes.push(0);
+    }
+    bytes
+}
+
+/// `/proc/self/environ`: the guest environment as NUL-separated `KEY=VALUE`
+/// entries (proc_pid_environ(5)), reflecting the actual launched env. The
+/// entries are opaque bytes (not necessarily UTF-8). mode r-------- in Linux;
+/// carrick serves it read-only like the other self files.
+fn synthetic_proc_self_environ(environ: &[Vec<u8>]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for entry in environ {
+        bytes.extend_from_slice(entry);
         bytes.push(0);
     }
     bytes
@@ -2281,6 +2300,7 @@ mod tests {
         let ctx = SyntheticProcContext {
             executable_path: "/bin/demo".to_owned(),
             argv: vec!["/bin/demo".to_owned()],
+            environ: vec![b"PATH=/usr/bin".to_vec(), b"HOME=/root".to_vec()],
             address_space_regions: Some(vec![ProcMapsEntry {
                 start: LINUX_HEAP_BASE,
                 end: LINUX_HEAP_BASE + 0x10000,
@@ -2442,6 +2462,26 @@ mod tests {
             .parse()
             .unwrap();
         assert!(kb < 64 * 1024 * 1024, "VmSize should be sane, got {kb} kB");
+    }
+
+    #[test]
+    fn self_environ_is_nul_separated_and_byte_exact() {
+        // Includes a non-UTF-8 value to prove env is served as opaque bytes,
+        // not lossily round-tripped through String.
+        let ctx = SyntheticProcContext {
+            environ: vec![
+                b"PATH=/usr/bin".to_vec(),
+                vec![b'X', b'=', 0xff, 0xfe],
+                b"HOME=/root".to_vec(),
+            ],
+            ..SyntheticProcContext::default()
+        };
+        let out = synthetic_file("/proc/self/environ", &ctx).unwrap();
+        assert_eq!(
+            out,
+            b"PATH=/usr/bin\0X=\xff\xfe\0HOME=/root\0".to_vec(),
+            "environ must be NUL-separated and byte-exact"
+        );
     }
 
     #[test]
@@ -2668,6 +2708,7 @@ mod tests {
         SyntheticProcContext {
             executable_path: "/bin/demo".to_owned(),
             argv: vec!["/bin/demo".to_owned()],
+            environ: vec![b"PATH=/usr/bin".to_vec(), b"HOME=/root".to_vec()],
             address_space_regions: Some(vec![ProcMapsEntry {
                 start: LINUX_HEAP_BASE,
                 end: LINUX_HEAP_BASE + 0x10000,
