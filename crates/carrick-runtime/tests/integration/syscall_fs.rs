@@ -2689,6 +2689,45 @@ fn proc_self_magic_links_readlink_and_lstat() {
 }
 
 #[test]
+fn proc_self_fd_readlink_synthesizes_anon_inode_target() {
+    // An fd with no backing path (here an eventfd) must readlink to the
+    // anon_inode:[…] target Linux shows, not an empty string.
+    let mut memory = LinearMemory::new(0x4000, vec![0xff; 0x400]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    // eventfd2(0, 0) = syscall 19.
+    let DispatchOutcome::Returned { value: fd } = dispatcher
+        .dispatch(
+            SyscallRequest::new(19, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap()
+    else {
+        panic!("eventfd2 should succeed");
+    };
+
+    let path = format!("/proc/self/fd/{fd}\0");
+    memory.write_bytes(0x4000, path.as_bytes()).unwrap();
+    let out = dispatcher
+        .dispatch(
+            SyscallRequest::new(
+                78,
+                SyscallArgs::from([(-100_i64) as u64, 0x4000, 0x4100, 64, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    let DispatchOutcome::Returned { value: n } = out else {
+        panic!("readlink /proc/self/fd/{fd}: {out:?}");
+    };
+    let target = String::from_utf8(memory.read_bytes(0x4100, n as usize).unwrap()).unwrap();
+    assert_eq!(target, "anon_inode:[eventfd]");
+}
+
+#[test]
 fn openat_reads_synthetic_proc_maps_and_cpuinfo() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
     memory.write_bytes(0x4000, b"/proc/self/maps\0").unwrap();
