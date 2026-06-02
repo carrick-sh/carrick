@@ -481,8 +481,14 @@ impl SyscallDispatcher {
             };
 
             if reused && !crate::memory::is_high_va(address) {
-                let zeros = vec![0u8; length_usize];
-                let _ = memory.write_bytes(address, &zeros);
+                // Scrub the reused region's PHYSICAL backing. MUST bypass the
+                // guest-visible permission: a region just reclaimed from munmap
+                // is stage-1-invalidated (no-access) and a PROT_NONE mmap is not
+                // writable, so the permission-checked write_bytes silently faults
+                // and leaves the prior mapping's bytes — which then surface after
+                // the guest mprotects the region to RW (CPython multiprocessing
+                // Pool built on a freed 16 MiB b'X' buffer → 0x58.. ptr → SIGSEGV).
+                let _ = memory.zero_backing(address, length_usize);
             }
 
             // Restore guest-visible stage-1 validity for arena allocations: a

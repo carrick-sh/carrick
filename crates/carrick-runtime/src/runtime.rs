@@ -2897,6 +2897,9 @@ impl<M: GuestMemory, T: SyscallTrap> GuestMemory for SplitView<'_, M, T> {
     fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
         self.mem.write_bytes(address, bytes)
     }
+    fn zero_backing(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+        self.mem.zero_backing(address, len)
+    }
     fn set_no_access(&mut self, address: u64, len: usize, no_access: bool) {
         self.mem.set_no_access(address, len, no_access);
     }
