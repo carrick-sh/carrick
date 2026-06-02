@@ -1708,15 +1708,17 @@ impl SyscallDispatcher {
         if let Err(errno) = check_path_length(path) {
             return Err(errno);
         }
-        let abs = if Path::new(path).is_absolute() {
-            join_rootfs_path("/", path)
+        // The anchor directory a relative path resolves against (already a real,
+        // symlink-free path): "/" for an absolute path, the cwd for AT_FDCWD, else
+        // the dirfd's directory.
+        let anchor = if Path::new(path).is_absolute() {
+            "/".to_string()
         } else if dirfd == LINUX_AT_FDCWD {
-            let cwd = self.io.cwd.read().clone();
-            join_rootfs_path(&cwd, path)
+            self.io.cwd.read().clone()
         } else {
             match self.open_file(dirfd as i32).as_ref() {
                 Some(open_file) => match &*open_file.description.read() {
-                    OpenDescription::Directory { path: dir, .. } => join_rootfs_path(dir, path),
+                    OpenDescription::Directory { path: dir, .. } => dir.clone(),
                     _ => return Err(LINUX_ENOTDIR),
                 },
                 // A valid fd that isn't in the table (e.g. a stdio fd) is still a
@@ -1727,6 +1729,17 @@ impl SyscallDispatcher {
                 None => return Err(LINUX_EBADF),
             }
         };
+        // A ".." component must be applied AFTER following any preceding symlink
+        // (Linux: "a/.." with a -> b/c lands in b, not lexically at the parent of
+        // a). join_rootfs_path collapses ".." LEXICALLY, before symlink
+        // resolution, so it gets this wrong. Take a symlink-aware walk only when a
+        // ".." is present; the (overwhelmingly common) no-".." path keeps the
+        // cheap lexical join + the existing intermediate-symlink rewrite, so the
+        // hot path is unchanged. (Go os TestRootConsistency*/dotdot_in_path_after_symlink.)
+        if path.split('/').any(|c| c == "..") || anchor.split('/').any(|c| c == "..") {
+            return self.resolve_dotdot_symlink_aware(&anchor, path);
+        }
+        let abs = join_rootfs_path(&anchor, path);
         // ENOTDIR: an existing intermediate component that is not a directory
         // can't be traversed. carrick previously let the final lookup return
         // ENOENT (or leniently resolved through it). Synthesize ENOTDIR here so
@@ -1742,6 +1755,71 @@ impl SyscallDispatcher {
         // resolution. The final component is intentionally NOT followed here —
         // each caller decides lstat-vs-stat semantics (AT_SYMLINK_NOFOLLOW).
         Ok(self.resolve_intermediate_symlinks(&abs))
+    }
+
+    /// Resolve a path containing ".." components symlink-AWARE: walk left to
+    /// right, FOLLOWING each intermediate symlink before applying "..", so
+    /// "a/../c" with `a -> b/c` lands in `b` (then `b/c`), matching Linux — not
+    /// the lexical `/c` that `join_rootfs_path` would produce. The FINAL component
+    /// is NOT followed (the caller decides lstat-vs-stat). A non-directory
+    /// intermediate is ENOTDIR; a symlink cycle propagates ELOOP; a not-yet-
+    /// existent intermediate is appended verbatim so the final lookup surfaces
+    /// ENOENT. Only invoked when a ".." is actually present.
+    fn resolve_dotdot_symlink_aware(&self, anchor: &str, path: &str) -> Result<String, i32> {
+        let mut all: Vec<&str> = Vec::new();
+        if !Path::new(path).is_absolute() {
+            all.extend(anchor.split('/').filter(|c| !c.is_empty() && *c != "."));
+        }
+        all.extend(path.split('/').filter(|c| !c.is_empty() && *c != "."));
+
+        // `base` is the resolved, symlink-free prefix so far (no trailing slash;
+        // empty string == root).
+        let mut base = String::new();
+        let last = all.len().saturating_sub(1);
+        for (i, comp) in all.iter().enumerate() {
+            if *comp == ".." {
+                // Climb one resolved component (never above root).
+                match base.rfind('/') {
+                    Some(pos) => base.truncate(pos),
+                    None => base.clear(),
+                }
+                continue;
+            }
+            let mut candidate = base.clone();
+            candidate.push('/');
+            candidate.push_str(comp);
+            if i == last {
+                // Final component: leave it unfollowed for the caller.
+                base = candidate;
+                break;
+            }
+            match self.layered_lstat(&candidate) {
+                Ok(md) if md.kind == RootFsEntryKind::Symlink => {
+                    match self.canonicalize_following(&candidate) {
+                        Ok(target) if self.path_is_directory(&target) => {
+                            base = target.trim_end_matches('/').to_owned();
+                        }
+                        // Symlink to a non-directory can't be traversed as an
+                        // intermediate; ELOOP/other errors propagate.
+                        Ok(_) => return Err(LINUX_ENOTDIR),
+                        Err(e) => return Err(e),
+                    }
+                }
+                // A real directory intermediate: descend.
+                Ok(md) if md.kind == RootFsEntryKind::Directory => base = candidate,
+                // An existing non-directory intermediate (regular file, device,
+                // FIFO) can't be traversed → ENOTDIR.
+                Ok(_) => return Err(LINUX_ENOTDIR),
+                // Not-yet-existent intermediate: append verbatim; the downstream
+                // lookup yields the correct ENOENT.
+                Err(_) => base = candidate,
+            }
+        }
+        Ok(if base.is_empty() {
+            "/".to_owned()
+        } else {
+            base
+        })
     }
 
     /// Rewrite `abs` so every intermediate (non-final) directory-symlink
