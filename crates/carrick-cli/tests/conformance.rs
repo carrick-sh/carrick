@@ -100,7 +100,9 @@ use std::time::{Duration, Instant};
 const CASE_DEADLINE: Duration = Duration::from_secs(45);
 
 use bollard::Docker;
-use bollard::container::{Config, CreateContainerOptions, LogsOptions, RemoveContainerOptions};
+use bollard::container::{
+    Config, CreateContainerOptions, LogOutput, LogsOptions, RemoveContainerOptions,
+};
 use bollard::image::CreateImageOptions;
 use futures_util::StreamExt;
 
@@ -469,6 +471,245 @@ fn indent(s: &str) -> String {
         .map(|l| format!("    {l}"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+// ---------------------------------------------------------------------------
+// Default-run contract: unlike `conformance` (which runs `--raw` and merges
+// streams), this asserts the DEFAULT `carrick run` path is docker-shaped —
+// exit-code parity, no JSON envelope on stdout, and stdout/stderr separation —
+// against the real-docker oracle. This is the guard that the default path (the
+// one a user types most) behaves like `docker run`. It also exercises the
+// `--pid private` default, so it regression-guards the NsSupervisor exit-code
+// harvest.
+// ---------------------------------------------------------------------------
+
+struct ExitCase {
+    name: &'static str,
+    snippet: &'static str,
+}
+
+const EXIT_CASES: &[ExitCase] = &[
+    ExitCase {
+        name: "exit_zero",
+        snippet: "true",
+    },
+    ExitCase {
+        name: "exit_one",
+        snippet: "exit 1",
+    },
+    ExitCase {
+        name: "exit_42",
+        snippet: "exit 42",
+    },
+    ExitCase {
+        name: "stdout_only",
+        snippet: "echo OUT",
+    },
+    ExitCase {
+        name: "stream_separation",
+        snippet: "echo OUT; echo ERR 1>&2; exit 3",
+    },
+];
+
+/// Run a snippet under carrick on the DEFAULT path (no `--raw`): returns
+/// `(host_exit_code, stdout, stderr)` with the streams captured separately.
+/// Mirrors `run_carrick`'s deadline + process-group-kill guard.
+fn run_carrick_default(bin: &PathBuf, snippet: &str) -> (i32, String, String) {
+    use std::os::unix::process::CommandExt;
+    let run_id = case_run_id();
+    let child = Command::new(bin)
+        .args(["run", IMAGE, "--fs", "host", "/bin/sh", "-c", snippet])
+        .env("CARRICK_RUN_ID", &run_id)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .expect("spawn carrick");
+    let pid = child.id() as i32;
+    let done = Arc::new(AtomicBool::new(false));
+    let watcher = {
+        let done = Arc::clone(&done);
+        let run_id = run_id.clone();
+        std::thread::spawn(move || {
+            let start = Instant::now();
+            while !done.load(Ordering::Relaxed) {
+                if start.elapsed() > CASE_DEADLINE {
+                    unsafe { libc::kill(-pid, libc::SIGKILL) };
+                    scoped_kill_guests(&run_id);
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            false
+        })
+    };
+    let out = child.wait_with_output().expect("wait carrick");
+    done.store(true, Ordering::Relaxed);
+    let timed_out = watcher.join().unwrap_or(false);
+    if timed_out {
+        return (
+            -1,
+            format!("<TIMEOUT after {}s>", CASE_DEADLINE.as_secs()),
+            String::new(),
+        );
+    }
+    (
+        out.status.code().unwrap_or(-1),
+        normalize(&String::from_utf8_lossy(&out.stdout)),
+        normalize(&String::from_utf8_lossy(&out.stderr)),
+    )
+}
+
+/// Run a snippet under Docker, returning `(exit_code, stdout, stderr)`. The exit
+/// code comes from `inspect` (robust for non-zero exits, which `wait_container`
+/// surfaces as a stream error); the streams are partitioned by `LogOutput`.
+async fn run_docker_contract(
+    docker: &Docker,
+    snippet: &str,
+    seq: usize,
+) -> anyhow::Result<(i64, String, String)> {
+    let config = Config {
+        image: Some(IMAGE.to_string()),
+        cmd: Some(vec!["/bin/sh".into(), "-c".into(), snippet.to_string()]),
+        ..Default::default()
+    };
+    let name = format!("carrick-exit-{}-{}", std::process::id(), seq);
+    let created = docker
+        .create_container(
+            Some(CreateContainerOptions {
+                name,
+                platform: Some(PLATFORM.to_string()),
+            }),
+            config,
+        )
+        .await?;
+    let id = created.id;
+    let result = async {
+        docker.start_container::<String>(&id, None).await?;
+        let mut wait = docker.wait_container::<String>(&id, None);
+        // Drain the wait stream (a non-zero exit arrives as an Err we ignore;
+        // the authoritative code comes from inspect below).
+        while let Some(w) = wait.next().await {
+            let _ = w;
+        }
+        let inspect = docker.inspect_container(&id, None).await?;
+        let code = inspect.state.and_then(|s| s.exit_code).unwrap_or(-1);
+        let mut logs = docker.logs::<String>(
+            &id,
+            Some(LogsOptions {
+                stdout: true,
+                stderr: true,
+                ..Default::default()
+            }),
+        );
+        let (mut so, mut se) = (String::new(), String::new());
+        while let Some(item) = logs.next().await {
+            match item {
+                Ok(LogOutput::StdOut { message }) => so.push_str(&String::from_utf8_lossy(&message)),
+                Ok(LogOutput::StdErr { message }) => se.push_str(&String::from_utf8_lossy(&message)),
+                _ => {}
+            }
+        }
+        Ok::<_, anyhow::Error>((code, normalize(&so), normalize(&se)))
+    }
+    .await;
+    let _ = docker
+        .remove_container(
+            &id,
+            Some(RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+    result
+}
+
+#[test]
+fn conformance_default_run_contract() {
+    let _serial = CONFORMANCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(bin) = carrick_bin() else {
+        eprintln!("SKIP conformance_default_run_contract: target/release/carrick not built");
+        return;
+    };
+    ensure_signed(&bin);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    rt.block_on(async {
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(d) => match d.ping().await {
+                Ok(_) => d,
+                Err(e) => {
+                    eprintln!("SKIP conformance_default_run_contract: Docker not reachable: {e}");
+                    return;
+                }
+            },
+            Err(e) => {
+                eprintln!("SKIP conformance_default_run_contract: Docker connect failed: {e}");
+                return;
+            }
+        };
+        if let Err(e) = ensure_image(&docker).await {
+            eprintln!("SKIP conformance_default_run_contract: cannot pull {IMAGE}: {e}");
+            return;
+        }
+
+        let mut failures = Vec::new();
+        for (seq, case) in EXIT_CASES.iter().enumerate() {
+            let (c_code, c_out, c_err) = run_carrick_default(&bin, case.snippet);
+            let (d_code, d_out, d_err) =
+                match tokio::time::timeout(CASE_DEADLINE, run_docker_contract(&docker, case.snippet, seq))
+                    .await
+                {
+                    Ok(Ok(d)) => d,
+                    Ok(Err(e)) => {
+                        eprintln!("FAIL  {} (docker error: {e})", case.name);
+                        failures.push(case.name);
+                        continue;
+                    }
+                    Err(_) => {
+                        eprintln!("FAIL  {} (docker timeout)", case.name);
+                        failures.push(case.name);
+                        continue;
+                    }
+                };
+
+            let mut problems = Vec::new();
+            // Exit-code parity — the core P1 guarantee, and the regression guard
+            // for the NsSupervisor exit-code harvest race.
+            if i64::from(c_code) != d_code {
+                problems.push(format!("exit: carrick={c_code} docker={d_code}"));
+            }
+            // stdout must match docker exactly: catches both the JSON envelope
+            // and any stderr bleeding into stdout.
+            if c_out != d_out {
+                problems.push(format!("stdout: carrick={c_out:?} docker={d_out:?}"));
+            }
+            // Explicit envelope check (redundant with the stdout match, but names
+            // the failure clearly).
+            if c_out.contains("\"exit_code\"") || c_out.contains("\"report\"") {
+                problems.push("stdout carries the JSON envelope".to_string());
+            }
+            // stderr: docker's stderr must be present in carrick's (lenient —
+            // carrick may add host-side notices that `normalize` doesn't strip).
+            if !d_err.is_empty() && !c_err.contains(&d_err) {
+                problems.push(format!("stderr: carrick={c_err:?} missing docker={d_err:?}"));
+            }
+
+            if problems.is_empty() {
+                eprintln!("PASS  {} (exit={c_code})", case.name);
+            } else {
+                eprintln!("FAIL  {}\n    {}", case.name, problems.join("\n    "));
+                failures.push(case.name);
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "default-run contract gaps: {failures:?}"
+        );
+    });
 }
 
 // ---------------------------------------------------------------------------
