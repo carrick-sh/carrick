@@ -963,71 +963,176 @@ fn prctl_no_new_privs_keepcaps_subreaper_timerslack_round_trip() {
 
     // NO_NEW_PRIVS: starts 0, set→1, reads back 1 (one-way latch).
     assert_eq!(
-        prctl(&mut dispatcher, &mut memory, &reporter, PR_GET_NO_NEW_PRIVS, 0, 0),
+        prctl(
+            &mut dispatcher,
+            &mut memory,
+            &reporter,
+            PR_GET_NO_NEW_PRIVS,
+            0,
+            0
+        ),
         returned(0)
     );
     assert_eq!(
-        prctl(&mut dispatcher, &mut memory, &reporter, PR_SET_NO_NEW_PRIVS, 1, 0),
+        prctl(
+            &mut dispatcher,
+            &mut memory,
+            &reporter,
+            PR_SET_NO_NEW_PRIVS,
+            1,
+            0
+        ),
         returned(0)
     );
     assert_eq!(
-        prctl(&mut dispatcher, &mut memory, &reporter, PR_GET_NO_NEW_PRIVS, 0, 0),
+        prctl(
+            &mut dispatcher,
+            &mut memory,
+            &reporter,
+            PR_GET_NO_NEW_PRIVS,
+            0,
+            0
+        ),
         returned(1)
     );
     // Bad args → EINVAL (arg2 != 1, or arg3..arg5 nonzero).
     assert_eq!(
-        prctl(&mut dispatcher, &mut memory, &reporter, PR_SET_NO_NEW_PRIVS, 1, 7),
+        prctl(
+            &mut dispatcher,
+            &mut memory,
+            &reporter,
+            PR_SET_NO_NEW_PRIVS,
+            1,
+            7
+        ),
         DispatchOutcome::Errno { errno: 22 }
     );
 
     // KEEPCAPS: 0 → set 1 → 1; arg2 > 1 → EINVAL.
     assert_eq!(
-        prctl(&mut dispatcher, &mut memory, &reporter, PR_GET_KEEPCAPS, 0, 0),
+        prctl(
+            &mut dispatcher,
+            &mut memory,
+            &reporter,
+            PR_GET_KEEPCAPS,
+            0,
+            0
+        ),
         returned(0)
     );
     assert_eq!(
-        prctl(&mut dispatcher, &mut memory, &reporter, PR_SET_KEEPCAPS, 1, 0),
+        prctl(
+            &mut dispatcher,
+            &mut memory,
+            &reporter,
+            PR_SET_KEEPCAPS,
+            1,
+            0
+        ),
         returned(0)
     );
     assert_eq!(
-        prctl(&mut dispatcher, &mut memory, &reporter, PR_GET_KEEPCAPS, 0, 0),
+        prctl(
+            &mut dispatcher,
+            &mut memory,
+            &reporter,
+            PR_GET_KEEPCAPS,
+            0,
+            0
+        ),
         returned(1)
     );
     assert_eq!(
-        prctl(&mut dispatcher, &mut memory, &reporter, PR_SET_KEEPCAPS, 2, 0),
+        prctl(
+            &mut dispatcher,
+            &mut memory,
+            &reporter,
+            PR_SET_KEEPCAPS,
+            2,
+            0
+        ),
         DispatchOutcome::Errno { errno: 22 }
     );
 
     // TIMERSLACK: default 50000 ns → set 120000 → reads back 120000;
     // set 0 resets to the default.
     assert_eq!(
-        prctl(&mut dispatcher, &mut memory, &reporter, PR_GET_TIMERSLACK, 0, 0),
+        prctl(
+            &mut dispatcher,
+            &mut memory,
+            &reporter,
+            PR_GET_TIMERSLACK,
+            0,
+            0
+        ),
         returned(50_000)
     );
     assert_eq!(
-        prctl(&mut dispatcher, &mut memory, &reporter, PR_SET_TIMERSLACK, 120_000, 0),
+        prctl(
+            &mut dispatcher,
+            &mut memory,
+            &reporter,
+            PR_SET_TIMERSLACK,
+            120_000,
+            0
+        ),
         returned(0)
     );
     assert_eq!(
-        prctl(&mut dispatcher, &mut memory, &reporter, PR_GET_TIMERSLACK, 0, 0),
+        prctl(
+            &mut dispatcher,
+            &mut memory,
+            &reporter,
+            PR_GET_TIMERSLACK,
+            0,
+            0
+        ),
         returned(120_000)
     );
     assert_eq!(
-        prctl(&mut dispatcher, &mut memory, &reporter, PR_SET_TIMERSLACK, 0, 0),
+        prctl(
+            &mut dispatcher,
+            &mut memory,
+            &reporter,
+            PR_SET_TIMERSLACK,
+            0,
+            0
+        ),
         returned(0)
     );
     assert_eq!(
-        prctl(&mut dispatcher, &mut memory, &reporter, PR_GET_TIMERSLACK, 0, 0),
+        prctl(
+            &mut dispatcher,
+            &mut memory,
+            &reporter,
+            PR_GET_TIMERSLACK,
+            0,
+            0
+        ),
         returned(50_000)
     );
 
     // CHILD_SUBREAPER: set 1 (return-value form), GET writes the value to *arg2.
     assert_eq!(
-        prctl(&mut dispatcher, &mut memory, &reporter, PR_SET_CHILD_SUBREAPER, 1, 0),
+        prctl(
+            &mut dispatcher,
+            &mut memory,
+            &reporter,
+            PR_SET_CHILD_SUBREAPER,
+            1,
+            0
+        ),
         returned(0)
     );
     assert_eq!(
-        prctl(&mut dispatcher, &mut memory, &reporter, PR_GET_CHILD_SUBREAPER, 0x4000, 0),
+        prctl(
+            &mut dispatcher,
+            &mut memory,
+            &reporter,
+            PR_GET_CHILD_SUBREAPER,
+            0x4000,
+            0
+        ),
         returned(0)
     );
     let got = i32::from_le_bytes(memory.read_bytes(0x4000, 4).unwrap().try_into().unwrap());
@@ -1035,7 +1140,14 @@ fn prctl_no_new_privs_keepcaps_subreaper_timerslack_round_trip() {
 
     // SECCOMP: no filter installed → mode 0.
     assert_eq!(
-        prctl(&mut dispatcher, &mut memory, &reporter, PR_GET_SECCOMP, 0, 0),
+        prctl(
+            &mut dispatcher,
+            &mut memory,
+            &reporter,
+            PR_GET_SECCOMP,
+            0,
+            0
+        ),
         returned(0)
     );
 
@@ -1074,7 +1186,10 @@ fn prlimit64_and_getrlimit_round_trip_per_resource() {
     assert_eq!(
         dispatcher
             .dispatch(
-                SyscallRequest::new(PRLIMIT64, SyscallArgs::from([0, RLIMIT_STACK, new, 0, 0, 0])),
+                SyscallRequest::new(
+                    PRLIMIT64,
+                    SyscallArgs::from([0, RLIMIT_STACK, new, 0, 0, 0])
+                ),
                 &mut memory,
                 &reporter,
             )
@@ -1085,7 +1200,10 @@ fn prlimit64_and_getrlimit_round_trip_per_resource() {
     assert_eq!(
         dispatcher
             .dispatch(
-                SyscallRequest::new(PRLIMIT64, SyscallArgs::from([0, RLIMIT_STACK, 0, old, 0, 0])),
+                SyscallRequest::new(
+                    PRLIMIT64,
+                    SyscallArgs::from([0, RLIMIT_STACK, 0, old, 0, 0])
+                ),
                 &mut memory,
                 &reporter,
             )
@@ -1098,7 +1216,10 @@ fn prlimit64_and_getrlimit_round_trip_per_resource() {
     assert_eq!(
         dispatcher
             .dispatch(
-                SyscallRequest::new(GETRLIMIT, SyscallArgs::from([RLIMIT_STACK, old, 0, 0, 0, 0])),
+                SyscallRequest::new(
+                    GETRLIMIT,
+                    SyscallArgs::from([RLIMIT_STACK, old, 0, 0, 0, 0])
+                ),
                 &mut memory,
                 &reporter,
             )
@@ -1133,7 +1254,10 @@ fn prlimit64_and_getrlimit_round_trip_per_resource() {
     // STACK is unaffected by the AS set.
     dispatcher
         .dispatch(
-            SyscallRequest::new(GETRLIMIT, SyscallArgs::from([RLIMIT_STACK, old, 0, 0, 0, 0])),
+            SyscallRequest::new(
+                GETRLIMIT,
+                SyscallArgs::from([RLIMIT_STACK, old, 0, 0, 0, 0]),
+            ),
             &mut memory,
             &reporter,
         )

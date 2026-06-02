@@ -5715,19 +5715,33 @@ fn fchownat_at_empty_path_records_owner_like_fchown() {
         Box::new(BindVfs::new("/tmp", scratch.path().to_path_buf(), false)),
     );
     let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
-        d.dispatch(SyscallRequest::new(nr, SyscallArgs::from(args)), m, &reporter)
-            .unwrap()
+        d.dispatch(
+            SyscallRequest::new(nr, SyscallArgs::from(args)),
+            m,
+            &reporter,
+        )
+        .unwrap()
     };
 
     // openat the bind file -> fd.
-    let fd = match run(&mut dispatcher, &mut memory, 56, [LINUX_AT_FDCWD, 0x4000, LINUX_O_RDWR, 0, 0, 0]) {
+    let fd = match run(
+        &mut dispatcher,
+        &mut memory,
+        56,
+        [LINUX_AT_FDCWD, 0x4000, LINUX_O_RDWR, 0, 0, 0],
+    ) {
         DispatchOutcome::Returned { value } => value as u64,
         other => panic!("openat: {other:?}"),
     };
 
     // fchownat(fd, ""@0x4300, 1500, 1501, AT_EMPTY_PATH).
     assert_eq!(
-        run(&mut dispatcher, &mut memory, 54, [fd, 0x4300, 1500, 1501, LINUX_AT_EMPTY_PATH, 0]),
+        run(
+            &mut dispatcher,
+            &mut memory,
+            54,
+            [fd, 0x4300, 1500, 1501, LINUX_AT_EMPTY_PATH, 0]
+        ),
         DispatchOutcome::Returned { value: 0 }
     );
 
@@ -5743,8 +5757,14 @@ fn fchownat_at_empty_path_records_owner_like_fchown() {
     );
     let stat = read_stat(&memory, 0x4200);
     let (uid, gid) = (stat.st_uid, stat.st_gid);
-    assert_eq!(uid, 1500, "fchownat(AT_EMPTY_PATH) must record the owner uid");
-    assert_eq!(gid, 1501, "fchownat(AT_EMPTY_PATH) must record the owner gid");
+    assert_eq!(
+        uid, 1500,
+        "fchownat(AT_EMPTY_PATH) must record the owner uid"
+    );
+    assert_eq!(
+        gid, 1501,
+        "fchownat(AT_EMPTY_PATH) must record the owner gid"
+    );
 }
 
 #[test]
@@ -7234,13 +7254,22 @@ fn f_getfl_strips_creation_only_open_flags() {
     let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
     let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
-        d.dispatch(SyscallRequest::new(nr, SyscallArgs::from(args)), m, &reporter)
-            .unwrap()
+        d.dispatch(
+            SyscallRequest::new(nr, SyscallArgs::from(args)),
+            m,
+            &reporter,
+        )
+        .unwrap()
     };
 
     // openat(AT_FDCWD, "/etc/motd", O_NONBLOCK|O_CREAT) — O_CREAT is a no-op on
     // an existing file but is recorded in status_flags (the leak).
-    let fd = match run(&mut dispatcher, &mut memory, 56, [LINUX_AT_FDCWD, 0x4000, O_NONBLOCK | O_CREAT, 0o644, 0, 0]) {
+    let fd = match run(
+        &mut dispatcher,
+        &mut memory,
+        56,
+        [LINUX_AT_FDCWD, 0x4000, O_NONBLOCK | O_CREAT, 0o644, 0, 0],
+    ) {
         DispatchOutcome::Returned { value } => value as u64,
         other => panic!("openat: {other:?}"),
     };
@@ -7250,5 +7279,9 @@ fn f_getfl_strips_creation_only_open_flags() {
         other => panic!("F_GETFL: {other:?}"),
     };
     assert_eq!(flags & O_CREAT, 0, "F_GETFL must not report O_CREAT");
-    assert_eq!(flags & O_NONBLOCK, O_NONBLOCK, "F_GETFL must keep O_NONBLOCK");
+    assert_eq!(
+        flags & O_NONBLOCK,
+        O_NONBLOCK,
+        "F_GETFL must keep O_NONBLOCK"
+    );
 }

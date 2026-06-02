@@ -738,7 +738,10 @@ impl SyscallDispatcher {
             )
         } == 0
         {
-            (xucred.cr_uid, xucred.cr_groups.first().copied().unwrap_or(0))
+            (
+                xucred.cr_uid,
+                xucred.cr_groups.first().copied().unwrap_or(0),
+            )
         } else {
             (0, 0)
         };
