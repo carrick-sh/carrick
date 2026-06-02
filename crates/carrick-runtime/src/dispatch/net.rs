@@ -96,24 +96,32 @@ impl SyscallDispatcher {
                     revents: 0,
                 };
                 let rc = unsafe { libc::poll(&mut pfd as *mut _, 1, 0) };
-                if rc <= 0 {
-                    return 0;
-                }
                 let mut ready = 0u32;
-                if pfd.revents & libc::POLLIN != 0 {
-                    ready |= LINUX_EPOLLIN;
+                if rc > 0 {
+                    if pfd.revents & libc::POLLIN != 0 {
+                        ready |= LINUX_EPOLLIN;
+                    }
+                    if pfd.revents & libc::POLLOUT != 0 {
+                        ready |= LINUX_EPOLLOUT;
+                    }
+                    if pfd.revents & libc::POLLPRI != 0 {
+                        ready |= LINUX_EPOLLPRI;
+                    }
+                    if pfd.revents & libc::POLLHUP != 0 {
+                        ready |= LINUX_EPOLLHUP;
+                    }
+                    if pfd.revents & libc::POLLERR != 0 {
+                        ready |= LINUX_EPOLLERR;
+                    }
                 }
-                if pfd.revents & libc::POLLOUT != 0 {
-                    ready |= LINUX_EPOLLOUT;
-                }
-                if pfd.revents & libc::POLLPRI != 0 {
-                    ready |= LINUX_EPOLLPRI;
-                }
-                if pfd.revents & libc::POLLHUP != 0 {
-                    ready |= LINUX_EPOLLHUP;
-                }
-                if pfd.revents & libc::POLLERR != 0 {
-                    ready |= LINUX_EPOLLERR;
+                // macOS doesn't report a named-FIFO read-end ready when its last
+                // writer closed — the kernel-decided beacon does (dispatch::
+                // fifo_beacon). Check it REGARDLESS of the host poll result: a
+                // read-end registered for EPOLLOUT (Go's netpoller watches both
+                // directions) makes the host poll return rc>0 with a spurious
+                // POLLOUT, which must NOT mask the EOF (POLLIN|HUP) Linux delivers.
+                if crate::dispatch::fifo_beacon::read_end_at_eof(host_fd) {
+                    ready |= LINUX_EPOLLIN | LINUX_EPOLLHUP;
                 }
                 // Only report events the caller is watching, plus the
                 // always-reported HUP/ERR conditions Linux delivers regardless.
@@ -421,6 +429,15 @@ impl SyscallDispatcher {
                     if pfd.revents & libc::POLLHUP != 0 {
                         ready |= LINUX_POLLHUP;
                     }
+                }
+                // macOS won't report a named-FIFO read-end ready when its last
+                // writer closed; the kernel-decided beacon does (dispatch::
+                // fifo_beacon). Surface the POLLIN|POLLHUP (read→EOF) Linux gives.
+                if requested_events & LINUX_POLLIN != 0
+                    && ready & LINUX_POLLIN == 0
+                    && crate::dispatch::fifo_beacon::read_end_at_eof(*host_fd)
+                {
+                    ready |= LINUX_POLLIN | LINUX_POLLHUP;
                 }
             }
             OpenDescription::HostSocket { host_fd, .. } => {
@@ -1387,8 +1404,15 @@ impl SyscallDispatcher {
             // host fds natively, so they need no latch).
             let mut ready_updates: Vec<(i32, u32)> = Vec::new();
             for (fd, interest) in &interests {
-                if this.host_fd_for_poll(*fd).is_some() {
-                    continue;
+                // Host-fd fds are handled by the kqueue drain above — EXCEPT a
+                // named-FIFO read-end whose writer has closed: macOS kqueue won't
+                // report that (dispatch::fifo_beacon decides it via a kernel
+                // beacon pipe), so recompute it here so the notify_inmem_epoll
+                // wake on writer-close surfaces EOF instead of blocking forever.
+                if let Some(hfd) = this.host_fd_for_poll(*fd) {
+                    if !crate::dispatch::fifo_beacon::read_end_at_eof(hfd) {
+                        continue;
+                    }
                 }
                 let requested = interest.event.events;
                 let raw_ready = this.epoll_ready_events(*fd, requested);
