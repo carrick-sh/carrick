@@ -761,6 +761,17 @@ impl SyscallDispatcher {
         /// sem_op:i16@2, sem_flg:i16@4 = 6 bytes), so the array forwards
         /// without translation. Blocking ops (no IPC_NOWAIT) block the host
         /// thread in `semop` — acceptable for the single-guest model.
+        ///
+        /// SEM_UNDO (audit M10): the flag is carried verbatim in `sem_flg` to
+        /// the host `semop`, and carrick runs each guest process as a real host
+        /// child, so the macOS kernel tracks the per-process undo adjustments and
+        /// applies them when the guest process exits — the undo-on-exit contract
+        /// is satisfied by the host for the common case. carrick keeps no
+        /// separate undo list. The residual divergence is the narrow case where
+        /// a guest `exit_group`/thread teardown does NOT coincide with host
+        /// process death; a carrick-managed undo replay for that case is a
+        /// tracked follow-up (it needs the multiprocess LTP semaphore harness to
+        /// verify), not an accepted limitation of the primitive.
         fn semop(this, cx, semid: u64, sops: GuestPtr, nsops: u64) {
             sysv_semop(cx, semid as i32, sops.0, nsops as usize, None)
         }

@@ -5692,6 +5692,62 @@ fn root_chown_under_bind_mount_records_guest_owner_without_host_chown() {
 }
 
 #[test]
+fn fchownat_at_empty_path_records_owner_like_fchown() {
+    // M7: fchownat(fd, "", uid, gid, AT_EMPTY_PATH) must record the owner of the
+    // fd's file (was: a no-op success that never called set_owner). Verified via
+    // fstat through a bind mount, like the fchown test above.
+    use std::os::unix::fs::MetadataExt;
+    let scratch = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir(scratch.path().join("emptypathchown")).unwrap();
+    let host_file = scratch.path().join("emptypathchown/file.txt");
+    std::fs::write(&host_file, b"empty-path chown payload").unwrap();
+    let host_before = std::fs::metadata(&host_file).unwrap();
+
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x500]);
+    memory
+        .write_bytes(0x4000, b"/tmp/emptypathchown/file.txt\0")
+        .unwrap();
+    memory.write_bytes(0x4300, b"\0").unwrap(); // the empty pathname
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    dispatcher.register_mount(
+        std::path::PathBuf::from("/tmp"),
+        Box::new(BindVfs::new("/tmp", scratch.path().to_path_buf(), false)),
+    );
+    let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
+        d.dispatch(SyscallRequest::new(nr, SyscallArgs::from(args)), m, &reporter)
+            .unwrap()
+    };
+
+    // openat the bind file -> fd.
+    let fd = match run(&mut dispatcher, &mut memory, 56, [LINUX_AT_FDCWD, 0x4000, LINUX_O_RDWR, 0, 0, 0]) {
+        DispatchOutcome::Returned { value } => value as u64,
+        other => panic!("openat: {other:?}"),
+    };
+
+    // fchownat(fd, ""@0x4300, 1500, 1501, AT_EMPTY_PATH).
+    assert_eq!(
+        run(&mut dispatcher, &mut memory, 54, [fd, 0x4300, 1500, 1501, LINUX_AT_EMPTY_PATH, 0]),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    // The host file's real owner is untouched (carrick records a guest-visible
+    // owner via xattr, not a host chown).
+    let host_after = std::fs::metadata(&host_file).unwrap();
+    assert_eq!(host_after.uid(), host_before.uid());
+
+    // fstat(fd) reports the guest-visible owner we just set.
+    assert_eq!(
+        run(&mut dispatcher, &mut memory, 80, [fd, 0x4200, 0, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let stat = read_stat(&memory, 0x4200);
+    let (uid, gid) = (stat.st_uid, stat.st_gid);
+    assert_eq!(uid, 1500, "fchownat(AT_EMPTY_PATH) must record the owner uid");
+    assert_eq!(gid, 1501, "fchownat(AT_EMPTY_PATH) must record the owner gid");
+}
+
+#[test]
 fn utimensat_sets_times_on_writable_overlay_and_validates_timestamps() {
     const UTIME_NOW: i64 = (1 << 30) - 1;
     const UTIME_OMIT: i64 = (1 << 30) - 2;
@@ -7156,4 +7212,43 @@ fn fstat_pty_reports_char_device() {
         "fstat on pty master must report S_IFCHR, got mode {:o}",
         mode
     );
+}
+
+#[test]
+fn f_getfl_strips_creation_only_open_flags() {
+    // M8: fcntl(F_GETFL) reports only file STATUS flags. Creation-only flags
+    // (O_CREAT/O_EXCL/O_TRUNC/O_DIRECTORY/…) are consumed by open() and must not
+    // be reported back (Linux clears them from f_flags). O_NONBLOCK is a status
+    // flag and must remain.
+    const O_NONBLOCK: u64 = 0o4000;
+    const O_CREAT: u64 = 0o100;
+    const F_GETFL: u64 = 3;
+
+    let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
+        "etc/motd",
+        b"motd\n".as_slice(),
+    )]))])
+    .unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
+    memory.write_bytes(0x4000, b"/etc/motd\0").unwrap();
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::with_rootfs(rootfs);
+    let run = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
+        d.dispatch(SyscallRequest::new(nr, SyscallArgs::from(args)), m, &reporter)
+            .unwrap()
+    };
+
+    // openat(AT_FDCWD, "/etc/motd", O_NONBLOCK|O_CREAT) — O_CREAT is a no-op on
+    // an existing file but is recorded in status_flags (the leak).
+    let fd = match run(&mut dispatcher, &mut memory, 56, [LINUX_AT_FDCWD, 0x4000, O_NONBLOCK | O_CREAT, 0o644, 0, 0]) {
+        DispatchOutcome::Returned { value } => value as u64,
+        other => panic!("openat: {other:?}"),
+    };
+
+    let flags = match run(&mut dispatcher, &mut memory, 25, [fd, F_GETFL, 0, 0, 0, 0]) {
+        DispatchOutcome::Returned { value } => value as u64,
+        other => panic!("F_GETFL: {other:?}"),
+    };
+    assert_eq!(flags & O_CREAT, 0, "F_GETFL must not report O_CREAT");
+    assert_eq!(flags & O_NONBLOCK, O_NONBLOCK, "F_GETFL must keep O_NONBLOCK");
 }

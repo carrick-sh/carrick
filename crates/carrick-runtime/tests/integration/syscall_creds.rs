@@ -920,3 +920,238 @@ fn umask_setpriority_getpriority_sysinfo_bootstrap_stubs() {
 
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
+
+/// `prctl(167)` syscall number; shared by the prctl option tests below.
+const PRCTL: u64 = 167;
+
+/// Issue a `prctl(option, arg2, arg3)` and unwrap the outcome.
+fn prctl(
+    d: &mut SyscallDispatcher,
+    m: &mut LinearMemory,
+    r: &CompatReporter,
+    option: u64,
+    arg2: u64,
+    arg3: u64,
+) -> DispatchOutcome {
+    d.dispatch(
+        SyscallRequest::new(PRCTL, SyscallArgs::from([option, arg2, arg3, 0, 0, 0])),
+        m,
+        r,
+    )
+    .unwrap()
+}
+
+/// H1: the common sandboxing/init prctl options must round-trip (set→get),
+/// not return EINVAL. PR_SET_NO_NEW_PRIVS in particular is the precondition
+/// for unprivileged seccomp (Docker/systemd/Go/Chrome sandboxes).
+#[test]
+fn prctl_no_new_privs_keepcaps_subreaper_timerslack_round_trip() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    const PR_GET_KEEPCAPS: u64 = 7;
+    const PR_SET_KEEPCAPS: u64 = 8;
+    const PR_GET_SECCOMP: u64 = 21;
+    const PR_SET_TIMERSLACK: u64 = 29;
+    const PR_GET_TIMERSLACK: u64 = 30;
+    const PR_SET_CHILD_SUBREAPER: u64 = 36;
+    const PR_GET_CHILD_SUBREAPER: u64 = 37;
+    const PR_SET_NO_NEW_PRIVS: u64 = 38;
+    const PR_GET_NO_NEW_PRIVS: u64 = 39;
+    let returned = |v: i64| DispatchOutcome::Returned { value: v };
+
+    // NO_NEW_PRIVS: starts 0, set→1, reads back 1 (one-way latch).
+    assert_eq!(
+        prctl(&mut dispatcher, &mut memory, &reporter, PR_GET_NO_NEW_PRIVS, 0, 0),
+        returned(0)
+    );
+    assert_eq!(
+        prctl(&mut dispatcher, &mut memory, &reporter, PR_SET_NO_NEW_PRIVS, 1, 0),
+        returned(0)
+    );
+    assert_eq!(
+        prctl(&mut dispatcher, &mut memory, &reporter, PR_GET_NO_NEW_PRIVS, 0, 0),
+        returned(1)
+    );
+    // Bad args → EINVAL (arg2 != 1, or arg3..arg5 nonzero).
+    assert_eq!(
+        prctl(&mut dispatcher, &mut memory, &reporter, PR_SET_NO_NEW_PRIVS, 1, 7),
+        DispatchOutcome::Errno { errno: 22 }
+    );
+
+    // KEEPCAPS: 0 → set 1 → 1; arg2 > 1 → EINVAL.
+    assert_eq!(
+        prctl(&mut dispatcher, &mut memory, &reporter, PR_GET_KEEPCAPS, 0, 0),
+        returned(0)
+    );
+    assert_eq!(
+        prctl(&mut dispatcher, &mut memory, &reporter, PR_SET_KEEPCAPS, 1, 0),
+        returned(0)
+    );
+    assert_eq!(
+        prctl(&mut dispatcher, &mut memory, &reporter, PR_GET_KEEPCAPS, 0, 0),
+        returned(1)
+    );
+    assert_eq!(
+        prctl(&mut dispatcher, &mut memory, &reporter, PR_SET_KEEPCAPS, 2, 0),
+        DispatchOutcome::Errno { errno: 22 }
+    );
+
+    // TIMERSLACK: default 50000 ns → set 120000 → reads back 120000;
+    // set 0 resets to the default.
+    assert_eq!(
+        prctl(&mut dispatcher, &mut memory, &reporter, PR_GET_TIMERSLACK, 0, 0),
+        returned(50_000)
+    );
+    assert_eq!(
+        prctl(&mut dispatcher, &mut memory, &reporter, PR_SET_TIMERSLACK, 120_000, 0),
+        returned(0)
+    );
+    assert_eq!(
+        prctl(&mut dispatcher, &mut memory, &reporter, PR_GET_TIMERSLACK, 0, 0),
+        returned(120_000)
+    );
+    assert_eq!(
+        prctl(&mut dispatcher, &mut memory, &reporter, PR_SET_TIMERSLACK, 0, 0),
+        returned(0)
+    );
+    assert_eq!(
+        prctl(&mut dispatcher, &mut memory, &reporter, PR_GET_TIMERSLACK, 0, 0),
+        returned(50_000)
+    );
+
+    // CHILD_SUBREAPER: set 1 (return-value form), GET writes the value to *arg2.
+    assert_eq!(
+        prctl(&mut dispatcher, &mut memory, &reporter, PR_SET_CHILD_SUBREAPER, 1, 0),
+        returned(0)
+    );
+    assert_eq!(
+        prctl(&mut dispatcher, &mut memory, &reporter, PR_GET_CHILD_SUBREAPER, 0x4000, 0),
+        returned(0)
+    );
+    let got = i32::from_le_bytes(memory.read_bytes(0x4000, 4).unwrap().try_into().unwrap());
+    assert_eq!(got, 1);
+
+    // SECCOMP: no filter installed → mode 0.
+    assert_eq!(
+        prctl(&mut dispatcher, &mut memory, &reporter, PR_GET_SECCOMP, 0, 0),
+        returned(0)
+    );
+
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}
+
+/// H2: `setrlimit`/`prlimit64`/`getrlimit` must round-trip per resource —
+/// a value set for RLIMIT_STACK/AS/NPROC must read back (not a hardcoded
+/// default), and resources must be independent of each other.
+#[test]
+fn prlimit64_and_getrlimit_round_trip_per_resource() {
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    const PRLIMIT64: u64 = 261;
+    const GETRLIMIT: u64 = 163;
+    const RLIMIT_STACK: u64 = 3;
+    const RLIMIT_AS: u64 = 9;
+    let new = 0x4000u64;
+    let old = 0x4040u64;
+    let returned0 = DispatchOutcome::Returned { value: 0 };
+
+    let write_rlim = |m: &mut LinearMemory, addr: u64, cur: u64, max: u64| {
+        m.write_bytes(addr, &cur.to_le_bytes()).unwrap();
+        m.write_bytes(addr + 8, &max.to_le_bytes()).unwrap();
+    };
+    let read_rlim = |m: &LinearMemory, addr: u64| -> (u64, u64) {
+        let cur = u64::from_le_bytes(m.read_bytes(addr, 8).unwrap().try_into().unwrap());
+        let max = u64::from_le_bytes(m.read_bytes(addr + 8, 8).unwrap().try_into().unwrap());
+        (cur, max)
+    };
+
+    // setrlimit(RLIMIT_STACK, {64 MiB, INFINITY}) via prlimit64.
+    write_rlim(&mut memory, new, 64 * 1024 * 1024, u64::MAX);
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(PRLIMIT64, SyscallArgs::from([0, RLIMIT_STACK, new, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        returned0
+    );
+    // prlimit64 read-back (new=0) writes the CURRENT limit to *old.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(PRLIMIT64, SyscallArgs::from([0, RLIMIT_STACK, 0, old, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        returned0
+    );
+    assert_eq!(read_rlim(&memory, old), (64 * 1024 * 1024, u64::MAX));
+
+    // 2-arg getrlimit(163) must agree.
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(GETRLIMIT, SyscallArgs::from([RLIMIT_STACK, old, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        returned0
+    );
+    assert_eq!(read_rlim(&memory, old), (64 * 1024 * 1024, u64::MAX));
+
+    // A different resource is independent: RLIMIT_AS set to a distinct value.
+    write_rlim(&mut memory, new, 0x1234_0000, 0x5678_0000);
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(PRLIMIT64, SyscallArgs::from([0, RLIMIT_AS, new, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        returned0
+    );
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(PRLIMIT64, SyscallArgs::from([0, RLIMIT_AS, 0, old, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        returned0
+    );
+    assert_eq!(read_rlim(&memory, old), (0x1234_0000, 0x5678_0000));
+    // STACK is unaffected by the AS set.
+    dispatcher
+        .dispatch(
+            SyscallRequest::new(GETRLIMIT, SyscallArgs::from([RLIMIT_STACK, old, 0, 0, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    assert_eq!(read_rlim(&memory, old), (64 * 1024 * 1024, u64::MAX));
+
+    // rlim_cur > rlim_max is still rejected.
+    write_rlim(&mut memory, new, 100, 50);
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(PRLIMIT64, SyscallArgs::from([0, RLIMIT_AS, new, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 22 }
+    );
+
+    assert!(reporter.finish().unhandled_syscalls.is_empty());
+}

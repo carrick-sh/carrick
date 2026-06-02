@@ -1302,6 +1302,32 @@ pub(in crate::dispatch) fn build_linux_scm_rights(fds: &[i32], cap: usize) -> (V
     (buf, truncated)
 }
 
+/// Build a Linux `SCM_CREDENTIALS` control message carrying `struct ucred {
+/// pid, uid, gid }` (12 bytes), bounded by `cap` remaining control bytes.
+/// Returns `(bytes, truncated)`; if a full record doesn't fit, emits nothing
+/// and reports truncated. (audit M2)
+pub(in crate::dispatch) fn build_linux_scm_creds(
+    pid: u32,
+    uid: u32,
+    gid: u32,
+    cap: usize,
+) -> (Vec<u8>, bool) {
+    const UCRED_LEN: usize = 12;
+    let cmsg_len = LINUX_CMSGHDR_LEN + UCRED_LEN; // 28
+    if cap < cmsg_len {
+        return (Vec::new(), true);
+    }
+    let total = linux_cmsg_align(cmsg_len).min(cap); // 32, clamped to cap
+    let mut buf = vec![0u8; total];
+    buf[0..8].copy_from_slice(&(cmsg_len as u64).to_ne_bytes());
+    buf[8..12].copy_from_slice(&LINUX_SOL_SOCKET.to_ne_bytes());
+    buf[12..16].copy_from_slice(&LINUX_SCM_CREDENTIALS.to_ne_bytes());
+    buf[16..20].copy_from_slice(&pid.to_ne_bytes());
+    buf[20..24].copy_from_slice(&uid.to_ne_bytes());
+    buf[24..28].copy_from_slice(&gid.to_ne_bytes());
+    (buf, false)
+}
+
 /// IPPROTO_IPV6 socket level — 41 on BOTH macOS and Linux (only the per-option
 /// TYPE numbers below differ between the two).
 pub(in crate::dispatch) const LINUX_IPPROTO_IPV6: i32 = 41;
@@ -1562,6 +1588,25 @@ mod tests {
         buf[8..12].copy_from_slice(&LINUX_SOL_SOCKET.to_ne_bytes());
         buf[12..16].copy_from_slice(&29i32.to_ne_bytes()); // SO_TIMESTAMP, not SCM_RIGHTS
         assert!(parse_linux_scm_rights_fds(&buf).is_empty());
+    }
+
+    #[test]
+    fn scm_credentials_record_has_linux_cmsg_layout() {
+        // M2: build_linux_scm_creds emits a well-formed SCM_CREDENTIALS cmsg:
+        // 16-byte header { cmsg_len=28, SOL_SOCKET, SCM_CREDENTIALS } + ucred
+        // { pid, uid, gid }, 8-aligned to 32 bytes.
+        let (buf, trunc) = build_linux_scm_creds(1234, 1000, 1001, 64);
+        assert!(!trunc);
+        assert_eq!(buf.len(), 32);
+        assert_eq!(u64::from_ne_bytes(buf[0..8].try_into().unwrap()), 28); // cmsg_len
+        assert_eq!(i32::from_ne_bytes(buf[8..12].try_into().unwrap()), LINUX_SOL_SOCKET);
+        assert_eq!(i32::from_ne_bytes(buf[12..16].try_into().unwrap()), LINUX_SCM_CREDENTIALS);
+        assert_eq!(u32::from_ne_bytes(buf[16..20].try_into().unwrap()), 1234); // pid
+        assert_eq!(u32::from_ne_bytes(buf[20..24].try_into().unwrap()), 1000); // uid
+        assert_eq!(u32::from_ne_bytes(buf[24..28].try_into().unwrap()), 1001); // gid
+        // Too small a budget → truncated, nothing emitted.
+        let (small, trunc2) = build_linux_scm_creds(1, 2, 3, 16);
+        assert!(small.is_empty() && trunc2);
     }
 
     #[test]

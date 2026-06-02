@@ -128,6 +128,26 @@ pub(super) struct ProcState {
     /// `prctl(PR_SET_PDEATHSIG)` parent-death signal (0 = none). Recorded and
     /// echoed back via PR_GET_PDEATHSIG; not yet delivered on parent exit.
     pub pdeathsig: i64,
+    /// `prctl(PR_SET_KEEPCAPS)` flag (0/1, default 0). Recorded and echoed back
+    /// via PR_GET_KEEPCAPS; the uid-transition cap-clear it modulates is a
+    /// follow-up — the flag round-trips so libcap/init feature checks pass.
+    pub keepcaps: i64,
+    /// `prctl(PR_SET_CHILD_SUBREAPER)` flag (0 = not a subreaper, default).
+    /// Recorded and echoed back via PR_GET_CHILD_SUBREAPER; reparent-to-subreaper
+    /// semantics are a follow-up.
+    pub child_subreaper: i64,
+    /// `prctl(PR_SET_NO_NEW_PRIVS)` bit. Once set it cannot be cleared (one-way
+    /// latch). The precondition for an unprivileged seccomp filter install.
+    pub no_new_privs: bool,
+    /// `prctl(PR_SET_TIMERSLACK)` per-process timer slack in nanoseconds
+    /// (default 50000). Recorded and echoed back; carrick does not coarsen waits.
+    pub timerslack: u64,
+    /// Per-resource `setrlimit`/`prlimit64` overrides, indexed by the Linux
+    /// resource number (0..16). `None` = use the carrick default from
+    /// `rlimit_for_resource`. RLIMIT_NOFILE is NOT stored here — its soft cap is
+    /// authoritative in `io.nofile_soft` (the fd allocator reads it); every other
+    /// resource round-trips through this table so a set is read back by get.
+    pub rlimit_overrides: [Option<crate::linux_abi::LinuxRlimit>; 16],
     /// Host pid of the ROOT guest process, captured at construction — before
     /// any guest `fork(2)`. Carrick forks each guest process as a real host
     /// child, so the host process tree mirrors the guest tree. A forked child
@@ -260,6 +280,11 @@ impl ProcState {
             dumpable: 1,
             task_name: linux_task_name_from_bytes(b"carrick"),
             pdeathsig: 0,
+            keepcaps: 0,
+            child_subreaper: 0,
+            no_new_privs: false,
+            timerslack: LINUX_DEFAULT_TIMERSLACK_NS,
+            rlimit_overrides: [None; 16],
             bootstrap_host_pid: std::process::id(),
             itimers: [None, None, None],
             affinity: default_affinity(crate::host_facts::logical_cpu_count()),
@@ -275,6 +300,37 @@ impl SyscallDispatcher {
     /// returning through normal Rust/Tokio cleanup.
     pub(crate) fn is_forked_guest_process(&self) -> bool {
         std::process::id() != self.proc.lock().bootstrap_host_pid
+    }
+
+    /// Parse a `struct sock_fprog *` at `fprog_ptr` and install its cBPF program
+    /// as a seccomp filter. Shared by `seccomp(SECCOMP_SET_MODE_FILTER)` and the
+    /// legacy `prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, prog)` entry point.
+    /// Returns 0 on success, EFAULT/EINVAL on a bad program.
+    fn install_seccomp_filter<M: GuestMemory>(&self, memory: &M, fprog_ptr: u64) -> DispatchOutcome {
+        // struct sock_fprog { unsigned short len; <pad>; sock_filter *filter; }
+        // — `filter` is 8-byte aligned, so it sits at offset 8.
+        let Ok(len_bytes) = memory.read_bytes(fprog_ptr, 2) else {
+            return LINUX_EFAULT.into();
+        };
+        let len = u16::from_ne_bytes([len_bytes[0], len_bytes[1]]) as usize;
+        if len == 0 || len > 4096 {
+            return LINUX_EINVAL.into();
+        }
+        let Ok(ptr_bytes) = memory.read_bytes(fprog_ptr.wrapping_add(8), 8) else {
+            return LINUX_EFAULT.into();
+        };
+        let filter_ptr = u64::from_ne_bytes([
+            ptr_bytes[0], ptr_bytes[1], ptr_bytes[2], ptr_bytes[3], ptr_bytes[4], ptr_bytes[5],
+            ptr_bytes[6], ptr_bytes[7],
+        ]);
+        let Ok(prog_bytes) = memory.read_bytes(filter_ptr, len * 8) else {
+            return LINUX_EFAULT.into();
+        };
+        let Some(prog) = crate::seccomp::SockFilter::parse_program(&prog_bytes) else {
+            return LINUX_EINVAL.into();
+        };
+        self.seccomp.install(prog);
+        DispatchOutcome::Returned { value: 0 }
     }
 
     /// Resolve an affinity pid argument. 0 or our own pid is `SelfProc`; a live
@@ -491,31 +547,7 @@ impl SyscallDispatcher {
             // are not differentiated in v1.
             match operation as u32 {
                 crate::seccomp::SECCOMP_SET_MODE_FILTER => {
-                    let memory = &*cx.memory;
-                    // struct sock_fprog { unsigned short len; <pad>; sock_filter *filter; }
-                    // — `filter` is 8-byte aligned, so it sits at offset 8.
-                    let Ok(len_bytes) = memory.read_bytes(args.0, 2) else {
-                        return Ok(LINUX_EFAULT.into());
-                    };
-                    let len = u16::from_ne_bytes([len_bytes[0], len_bytes[1]]) as usize;
-                    if len == 0 || len > 4096 {
-                        return Ok(LINUX_EINVAL.into());
-                    }
-                    let Ok(ptr_bytes) = memory.read_bytes(args.0 + 8, 8) else {
-                        return Ok(LINUX_EFAULT.into());
-                    };
-                    let filter_ptr = u64::from_ne_bytes([
-                        ptr_bytes[0], ptr_bytes[1], ptr_bytes[2], ptr_bytes[3],
-                        ptr_bytes[4], ptr_bytes[5], ptr_bytes[6], ptr_bytes[7],
-                    ]);
-                    let Ok(prog_bytes) = memory.read_bytes(filter_ptr, len * 8) else {
-                        return Ok(LINUX_EFAULT.into());
-                    };
-                    let Some(prog) = crate::seccomp::SockFilter::parse_program(&prog_bytes) else {
-                        return Ok(LINUX_EINVAL.into());
-                    };
-                    this.seccomp.install(prog);
-                    Ok(DispatchOutcome::Returned { value: 0 })
+                    Ok(this.install_seccomp_filter(&*cx.memory, args.0))
                 }
                 // STRICT mode (allow only read/write/exit/sigreturn) is not
                 // emulated yet; unknown operations are EINVAL.
@@ -622,6 +654,80 @@ impl SyscallDispatcher {
                     crate::namespace::process::capbset_drop(arg2 as u32);
                     DispatchOutcome::Returned { value: 0 }
                 }
+                // PR_SET_NO_NEW_PRIVS: arg2 must be 1, arg3..arg5 must be 0
+                // (Linux). Once set the bit cannot be cleared (one-way latch).
+                // Precondition for an unprivileged seccomp filter install.
+                LINUX_PR_SET_NO_NEW_PRIVS => {
+                    if arg2 != 1 || arg3 != 0 || arg4 != 0 || arg5 != 0 {
+                        return Ok(LINUX_EINVAL.into());
+                    }
+                    this.proc.lock().no_new_privs = true;
+                    DispatchOutcome::Returned { value: 0 }
+                }
+                LINUX_PR_GET_NO_NEW_PRIVS => {
+                    if arg2 != 0 || arg3 != 0 || arg4 != 0 || arg5 != 0 {
+                        return Ok(LINUX_EINVAL.into());
+                    }
+                    DispatchOutcome::Returned {
+                        value: i64::from(this.proc.lock().no_new_privs),
+                    }
+                }
+                // PR_SET_KEEPCAPS: arg2 ∈ {0,1}. Recorded; echoed by GET.
+                LINUX_PR_SET_KEEPCAPS => {
+                    if arg2 > 1 {
+                        return Ok(LINUX_EINVAL.into());
+                    }
+                    this.proc.lock().keepcaps = arg2 as i64;
+                    DispatchOutcome::Returned { value: 0 }
+                }
+                LINUX_PR_GET_KEEPCAPS => DispatchOutcome::Returned {
+                    value: this.proc.lock().keepcaps,
+                },
+                // PR_SET_CHILD_SUBREAPER: any nonzero arg2 marks this process a
+                // subreaper. PR_GET_CHILD_SUBREAPER writes the value to *arg2.
+                LINUX_PR_SET_CHILD_SUBREAPER => {
+                    this.proc.lock().child_subreaper = i64::from(arg2 != 0);
+                    DispatchOutcome::Returned { value: 0 }
+                }
+                LINUX_PR_GET_CHILD_SUBREAPER => {
+                    let value = this.proc.lock().child_subreaper as i32;
+                    if memory.write_bytes(arg2, &value.to_ne_bytes()).is_err() {
+                        return Ok(LINUX_EFAULT.into());
+                    }
+                    DispatchOutcome::Returned { value: 0 }
+                }
+                // PR_SET_TIMERSLACK: arg2 = new slack in ns (0 → reset to the
+                // default). PR_GET_TIMERSLACK returns the current slack.
+                LINUX_PR_SET_TIMERSLACK => {
+                    let slack = if arg2 == 0 {
+                        LINUX_DEFAULT_TIMERSLACK_NS
+                    } else {
+                        arg2
+                    };
+                    this.proc.lock().timerslack = slack;
+                    DispatchOutcome::Returned { value: 0 }
+                }
+                LINUX_PR_GET_TIMERSLACK => DispatchOutcome::Returned {
+                    value: this.proc.lock().timerslack as i64,
+                },
+                // PR_SET_SECCOMP(SECCOMP_MODE_FILTER, prog) is the legacy entry
+                // point for the same cBPF install as seccomp(2). STRICT mode is
+                // accepted as a no-op record (not differentiated). arg2 is the
+                // mode; arg3 is the `struct sock_fprog *` for FILTER mode.
+                LINUX_PR_SET_SECCOMP => match arg2 {
+                    LINUX_SECCOMP_MODE_FILTER => this.install_seccomp_filter(&*memory, arg3),
+                    LINUX_SECCOMP_MODE_STRICT => DispatchOutcome::Returned { value: 0 },
+                    _ => DispatchOutcome::errno(LINUX_EINVAL),
+                },
+                // PR_GET_SECCOMP: 2 if a filter is installed, else 0 (Linux
+                // reports the filter mode; strict mode would kill on this call).
+                LINUX_PR_GET_SECCOMP => DispatchOutcome::Returned {
+                    value: if this.seccomp.is_active() {
+                        LINUX_SECCOMP_MODE_FILTER as i64
+                    } else {
+                        0
+                    },
+                },
                 _ => DispatchOutcome::errno(LINUX_EINVAL),
             })
         }

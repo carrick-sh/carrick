@@ -59,6 +59,7 @@ use crate::linux_abi::{
     LINUX_CLOCK_THREAD_CPUTIME_ID,
     LINUX_CMSG_ALIGN,
     LINUX_CMSGHDR_LEN,
+    LINUX_DEFAULT_TIMERSLACK_NS,
     LINUX_DEFAULT_UMASK,
     LINUX_DIRENT64_HEADER_SIZE,
     LINUX_DT_CHR,
@@ -241,16 +242,26 @@ use crate::linux_abi::{
     LINUX_POLLOUT,
     LINUX_PR_CAPBSET_DROP,
     LINUX_PR_CAPBSET_READ,
+    LINUX_PR_GET_CHILD_SUBREAPER,
     LINUX_PR_GET_DUMPABLE,
+    LINUX_PR_GET_KEEPCAPS,
     LINUX_PR_GET_MEM_MODEL,
     LINUX_PR_GET_NAME,
+    LINUX_PR_GET_NO_NEW_PRIVS,
     LINUX_PR_GET_PDEATHSIG,
+    LINUX_PR_GET_SECCOMP,
+    LINUX_PR_GET_TIMERSLACK,
+    LINUX_PR_SET_CHILD_SUBREAPER,
     LINUX_PR_SET_DUMPABLE,
+    LINUX_PR_SET_KEEPCAPS,
     LINUX_PR_SET_MEM_MODEL,
     LINUX_PR_SET_MEM_MODEL_DEFAULT,
     LINUX_PR_SET_MEM_MODEL_TSO,
     LINUX_PR_SET_NAME,
+    LINUX_PR_SET_NO_NEW_PRIVS,
     LINUX_PR_SET_PDEATHSIG,
+    LINUX_PR_SET_SECCOMP,
+    LINUX_PR_SET_TIMERSLACK,
     LINUX_PRIO_PROCESS,
     LINUX_PRIO_USER,
     LINUX_PROT_EXEC,
@@ -280,7 +291,10 @@ use crate::linux_abi::{
     LINUX_SCHED_IDLE,
     LINUX_SCHED_OTHER,
     LINUX_SCHED_RR,
+    LINUX_SCM_CREDENTIALS,
     LINUX_SCM_RIGHTS,
+    LINUX_SECCOMP_MODE_FILTER,
+    LINUX_SECCOMP_MODE_STRICT,
     LINUX_SEEK_CUR,
     LINUX_SEEK_END,
     LINUX_SEEK_SET,
@@ -321,6 +335,7 @@ use crate::linux_abi::{
     LINUX_SOL_UDP,
     LINUX_SPLICE_SUPPORTED_FLAGS,
     LINUX_SS_DISABLE,
+    LINUX_SS_ONSTACK,
     LINUX_STATX_BASIC_STATS,
     LINUX_STATX_RESERVED,
     LINUX_TASK_COMM_LEN,
@@ -1486,7 +1501,7 @@ impl SyscallDispatcher {
     /// remove it and run close_open_file (which honours the Rc-count
     /// guard, so we don't close a host fd a sibling fd still aliases).
     pub fn close_cloexec_fds(&self) {
-        let removed: Vec<OpenFile> = {
+        let removed: Vec<(i32, OpenFile)> = {
             let mut table = self.io.open_files.write();
             let cloexec_fds: Vec<i32> = table
                 .iter()
@@ -1501,12 +1516,14 @@ impl SyscallDispatcher {
 
             cloexec_fds
                 .into_iter()
-                .filter_map(|fd| table.remove(&fd))
+                .filter_map(|fd| table.remove(&fd).map(|of| (fd, of)))
                 .collect()
         };
 
-        for open_file in removed {
+        for (fd, open_file) in removed {
             self.close_open_file_and_free_pty(&open_file);
+            // Linux auto-removes a closed fd from every epoll interest set.
+            self.detach_fd_from_epolls(fd);
         }
     }
 
@@ -2219,6 +2236,9 @@ fn dispatch_futex_pi(
     tid: u32,
     futex: Option<&crate::thread::FutexTable>,
 ) -> DispatchOutcome {
+    // The low 30 bits of a PI-futex word hold the owner TID (FUTEX_TID_MASK);
+    // the upper two are FUTEX_WAITERS / FUTEX_OWNER_DIED.
+    const LINUX_FUTEX_TID_MASK: u32 = 0x3fff_ffff;
     if tid == 0 || tid > LINUX_FUTEX_TID_MASK {
         return DispatchOutcome::Errno {
             errno: LINUX_EINVAL,

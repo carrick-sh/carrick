@@ -587,3 +587,130 @@ fn rt_sigsuspend_applies_mask_then_returns_eintr_on_pending_signal() {
     // The pre-suspend mask (0) is restored, not left as the suspend mask.
     assert_eq!(dispatcher.signal_mask_for(0), 0);
 }
+
+#[test]
+fn rt_sigsuspend_restores_nondefault_mask_when_no_handler_runs() {
+    // M1: when rt_sigsuspend wakes on a signal that does NOT run a caught
+    // handler (here: no handler installed → default action), there is no
+    // rt_sigreturn to pop the saved mask, so rt_sigsuspend must restore the
+    // ORIGINAL mask itself. Otherwise the thread is stranded under the
+    // temporary suspend mask. The pre-existing test can't catch this because
+    // its original mask and suspend mask are both 0 (indistinguishable).
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    // Original mask: block SIGRTMIN+... say signal 12 (bit 1<<11). Non-default.
+    let original = 1u64 << (12 - 1);
+    dispatcher.restore_signal_mask(0, original);
+
+    // Signal 10 pending for tid 0, NO handler installed (default disposition).
+    dispatcher.mark_signal_pending(0, 10);
+    // suspend_mask = 0 (unblock everything) so signal 10 wakes it immediately.
+    memory.write_bytes(0x4000, &0u64.to_le_bytes()).unwrap();
+
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(133, SyscallArgs::from([0x4000, 8, 0, 0, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Errno { errno: 4 }
+    );
+    // No handler ran → rt_sigsuspend restored the original mask itself, NOT the
+    // suspend mask (0). The bug left it at the suspend mask.
+    assert_eq!(
+        dispatcher.signal_mask_for(0),
+        original,
+        "rt_sigsuspend must restore the original mask when no handler runs"
+    );
+}
+
+#[test]
+fn signalfd_read_drains_pending_masked_signals() {
+    // H4: read() on a signalfd must drain pending signals that match the fd's
+    // mask into signalfd_siginfo records (was: EINVAL — the API was unusable).
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    // signalfd mask = {SIGUSR1 (10)} = bit 1<<9, written at 0x4000.
+    let mask = 1u64 << (10 - 1);
+    memory.write_bytes(0x4000, &mask.to_le_bytes()).unwrap();
+    // signalfd4(-1, mask@0x4000, 8, 0) -> sfd.
+    let sfd = match dispatcher
+        .dispatch(
+            SyscallRequest::new(74, SyscallArgs::from([u64::MAX, 0x4000, 8, 0, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap()
+    {
+        DispatchOutcome::Returned { value } => value as u64,
+        o => panic!("signalfd4: {o:?}"),
+    };
+    assert!(sfd >= 3);
+
+    let read = |d: &mut SyscallDispatcher, m: &mut LinearMemory, count: u64| {
+        d.dispatch(
+            SyscallRequest::new(63, SyscallArgs::from([sfd, 0x4100, count, 0, 0, 0])),
+            m,
+            &reporter,
+        )
+        .unwrap()
+    };
+
+    // No signal pending -> EAGAIN (not the old EINVAL).
+    assert_eq!(read(&mut dispatcher, &mut memory, 128), DispatchOutcome::Errno { errno: 11 });
+
+    // Mark SIGUSR1 pending for tid 0 (the harness ctx_tid).
+    dispatcher.mark_signal_pending(0, 10);
+
+    // read drains one 128-byte signalfd_siginfo; ssi_signo == 10.
+    assert_eq!(read(&mut dispatcher, &mut memory, 128), DispatchOutcome::Returned { value: 128 });
+    let ssi_signo = u32::from_le_bytes(memory.read_bytes(0x4100, 4).unwrap().try_into().unwrap());
+    assert_eq!(ssi_signo, 10);
+
+    // Drained: a second read is EAGAIN again.
+    assert_eq!(read(&mut dispatcher, &mut memory, 128), DispatchOutcome::Errno { errno: 11 });
+
+    // A buffer smaller than one signalfd_siginfo is EINVAL.
+    assert_eq!(read(&mut dispatcher, &mut memory, 64), DispatchOutcome::Errno { errno: 22 });
+}
+
+#[test]
+fn rt_sigtimedwait_writes_full_siginfo_from_queued_payload() {
+    // M9: a successful rt_sigtimedwait must fill the caller's siginfo with the
+    // queued payload (si_code/si_pid/si_uid), not just si_signo.
+    use carrick_runtime::linux_abi::LinuxSiginfo;
+    const SI_QUEUE: i32 = -1;
+
+    let mut memory = LinearMemory::new(0x4000, vec![0xee; 0x300]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    // Queue a payload for SIGUSR1 (10) on tid 0 and mark it pending.
+    dispatcher.mark_signal_pending(0, 10);
+    dispatcher.record_pending_siginfo(0, 10, LinuxSiginfo::kill(10, SI_QUEUE, 1234, 5678));
+
+    // rt_sigtimedwait(set={10}@0x4000, info=0x4100, timeout=NULL, size=8).
+    memory.write_bytes(0x4000, &(1u64 << 9).to_le_bytes()).unwrap();
+    assert_eq!(
+        dispatcher
+            .dispatch(
+                SyscallRequest::new(137, SyscallArgs::from([0x4000, 0x4100, 0, 8, 0, 0])),
+                &mut memory,
+                &reporter,
+            )
+            .unwrap(),
+        DispatchOutcome::Returned { value: 10 }
+    );
+    // si_signo @0, si_code @8, si_pid @16 (low word of si_addr), si_uid @20.
+    let rd = |off: u64| i32::from_le_bytes(memory.read_bytes(0x4100 + off, 4).unwrap().try_into().unwrap());
+    assert_eq!(rd(0), 10, "si_signo");
+    assert_eq!(rd(8), SI_QUEUE, "si_code from the queued payload");
+    assert_eq!(rd(16), 1234, "si_pid from the queued payload");
+    assert_eq!(rd(20), 5678, "si_uid from the queued payload");
+}

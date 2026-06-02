@@ -185,6 +185,39 @@ impl SyscallDispatcher {
         None
     }
 
+    /// Remove `fd` from every epoll instance's interest set (and purge any
+    /// readiness already queued for it). Linux auto-removes a closed fd from all
+    /// epoll interest lists; carrick keys interest by guest fd NUMBER, so a
+    /// `close(2)` that skips `EPOLL_CTL_DEL` would otherwise leak a stale entry —
+    /// yielding a spurious `EEXIST` when the fd number is reused, and recompute
+    /// against a dead epoll_data token. The kqueue knote keyed on the closing
+    /// host fd is reclaimed by the kernel when that host fd closes; a dup that
+    /// keeps the host fd alive within the SAME epoll is the rarer
+    /// `EPOLL_CTL_DEL`-covered survivor-rebind case. MUST be called with NO
+    /// `open_files` lock held — it takes a read lock to snapshot the instances.
+    pub(in crate::dispatch) fn detach_fd_from_epolls(&self, fd: i32) {
+        let descriptions: Vec<OpenDescriptionRef> = self
+            .io
+            .open_files
+            .read()
+            .values()
+            .map(|of| of.description.clone())
+            .collect();
+        for description in descriptions {
+            let mut guard = description.write();
+            if let OpenDescription::Epoll {
+                interest,
+                pending_ready,
+                ..
+            } = &mut *guard
+            {
+                if interest.remove(&fd).is_some() {
+                    clear_pending_epoll_ready(pending_ready, fd);
+                }
+            }
+        }
+    }
+
     /// The guest's status flags (O_NONBLOCK etc.) for `fd`. carrick keeps the
     /// HOST fd non-blocking always and tracks the guest's intended blocking
     /// mode here; `blocking_io` consults this to decide EAGAIN vs a lockless
@@ -501,6 +534,7 @@ impl SyscallDispatcher {
         self.install_fd(
             OpenDescription::Netlink {
                 protocol,
+                sock_type: base_type,
                 pid: 0,
                 groups: 0,
                 recv_queue: VecDeque::new(),
@@ -596,7 +630,7 @@ impl SyscallDispatcher {
     /// already a live kernel fd the macOS kernel handed us; we keep its blocking
     /// mode non-blocking to satisfy the dispatcher's wait invariants. Returns
     /// the new guest fd, or `None` on failure (the caller closes the host fd).
-    fn install_received_host_fd(&self, host_fd: i32) -> Option<i32> {
+    fn install_received_host_fd(&self, host_fd: i32, cloexec: bool) -> Option<i32> {
         set_host_nonblocking(host_fd);
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         let kind = if unsafe { libc::fstat(host_fd, &mut st) } == 0 {
@@ -660,7 +694,10 @@ impl SyscallDispatcher {
                 base: OpenDescriptionBase::new(0),
             }
         };
-        let open_file = OpenFile::with_host_fd(Arc::new(RwLock::new(description)), 0, host_fd);
+        // MSG_CMSG_CLOEXEC: install the received fd close-on-exec. (audit M3)
+        let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };
+        let open_file =
+            OpenFile::with_host_fd(Arc::new(RwLock::new(description)), fd_flags, host_fd);
         self.install_fd_at_or_above(3, open_file).ok()
     }
 
@@ -678,6 +715,52 @@ impl SyscallDispatcher {
         }
     }
 
+    /// True iff `fd` is a HostSocket with SO_PASSCRED enabled (audit M2).
+    fn socket_so_passcred(&self, fd: i32) -> bool {
+        self.open_file(fd).is_some_and(|of| {
+            matches!(&*of.description.read(), OpenDescription::HostSocket { base, .. } if base.so_passcred())
+        })
+    }
+
+    /// Peer `(pid, uid, gid)` for an AF_UNIX `host_fd`, from LOCAL_PEERCRED +
+    /// LOCAL_PEERPID (best-effort; 0 where unavailable). Used to synthesize the
+    /// SCM_CREDENTIALS ancillary message for SO_PASSCRED. (audit M2)
+    fn peer_ucred(&self, host_fd: i32) -> (u32, u32, u32) {
+        let mut xucred: libc::xucred = unsafe { std::mem::zeroed() };
+        let mut xlen = std::mem::size_of::<libc::xucred>() as libc::socklen_t;
+        let (uid, gid) = if unsafe {
+            libc::getsockopt(
+                host_fd,
+                libc::SOL_LOCAL,
+                libc::LOCAL_PEERCRED,
+                (&mut xucred as *mut libc::xucred).cast(),
+                &mut xlen,
+            )
+        } == 0
+        {
+            (xucred.cr_uid, xucred.cr_groups.first().copied().unwrap_or(0))
+        } else {
+            (0, 0)
+        };
+        let mut peer_pid: libc::pid_t = 0;
+        let mut plen = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+        let pid = if unsafe {
+            libc::getsockopt(
+                host_fd,
+                libc::SOL_LOCAL,
+                libc::LOCAL_PEERPID,
+                (&mut peer_pid as *mut libc::pid_t).cast(),
+                &mut plen,
+            )
+        } == 0
+        {
+            peer_pid as u32
+        } else {
+            0
+        };
+        (pid, uid, gid)
+    }
+
     /// The GUEST-requested socket type for `fd` (e.g. SOCK_SEQPACKET), which can
     /// differ from the host backing — carrick backs a guest AF_UNIX SEQPACKET
     /// with a host SOCK_STREAM, so the host's SO_TYPE would mis-report it.
@@ -686,6 +769,7 @@ impl SyscallDispatcher {
         let open = open_file.description.read();
         match &*open {
             OpenDescription::HostSocket { type_, .. } => Some(*type_),
+            OpenDescription::Netlink { sock_type, .. } => Some(*sock_type),
             _ => None,
         }
     }
@@ -2822,6 +2906,49 @@ impl SyscallDispatcher {
                 Ok(t) => t,
                 Err(errno) => return Ok(errno.into()),
             };
+            // Record the GUEST-intended SO_REUSEPORT / SO_RCVBUF / SO_SNDBUF so
+            // getsockopt reports what the guest set rather than carrick's
+            // host-side widening (SO_REUSEADDR→SO_REUSEPORT for UDP; AF_UNIX
+            // buffer widening). The value still passes through to the host
+            // below. (audit M4, M5)
+            if level == LINUX_SOL_SOCKET
+                && (optname == LINUX_SO_REUSEPORT
+                    || optname == LINUX_SO_RCVBUF
+                    || optname == LINUX_SO_SNDBUF)
+                && optlen >= 4
+                && let Ok(b) = memory.read_bytes(optval_addr, 4)
+            {
+                let v = i32::from_ne_bytes([b[0], b[1], b[2], b[3]]);
+                if let Some(open_file) = this.open_file(fd)
+                    && let OpenDescription::HostSocket { base, .. } =
+                        &mut *open_file.description.write()
+                {
+                    if optname == LINUX_SO_REUSEPORT {
+                        base.set_so_reuseport(v != 0);
+                    } else if optname == LINUX_SO_RCVBUF {
+                        base.set_so_rcvbuf(v);
+                    } else {
+                        base.set_so_sndbuf(v);
+                    }
+                }
+            }
+            // SO_PASSCRED: store + accept. macOS has no equivalent (it would
+            // ENOPROTOOPT through the host), and recvmsg synthesizes the
+            // SCM_CREDENTIALS ancillary message from LOCAL_PEERCRED when it's
+            // set, so handle it entirely carrick-side. (audit M2)
+            if level == LINUX_SOL_SOCKET && optname == crate::linux_abi::LINUX_SO_PASSCRED {
+                let on = optlen >= 4
+                    && memory.read_bytes(optval_addr, 4).is_ok_and(|b| {
+                        i32::from_ne_bytes([b[0], b[1], b[2], b[3]]) != 0
+                    });
+                if let Some(open_file) = this.open_file(fd)
+                    && let OpenDescription::HostSocket { base, .. } =
+                        &mut *open_file.description.write()
+                {
+                    base.set_so_passcred(on);
+                }
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            }
             // SOL_UDPLITE (136): the checksum-coverage options on a UDPLITE
             // socket we back with plain UDP. macOS has neither the level nor the
             // options; accept UDPLITE_SEND_CSCOV(10)/RECV_CSCOV(11) as no-ops so
@@ -2978,11 +3105,12 @@ impl SyscallDispatcher {
             let optname = optname as i32;
             let optval_addr = optval.0;
             let optlen_addr = optlen.0;
-            // AF_NETLINK getsockopt: answer the common SO_TYPE query (callers
-            // verify the socket is SOCK_RAW); everything else returns 0.
+            // AF_NETLINK getsockopt: answer SO_TYPE with the GUEST-requested type
+            // (SOCK_RAW or SOCK_DGRAM — a SOCK_DGRAM netlink socket must not be
+            // mislabeled SOCK_RAW); everything else returns 0. (audit M6)
             if this.fd_is_netlink(fd) {
                 let val: i32 = if level == LINUX_SOL_SOCKET && optname == LINUX_SO_TYPE {
-                    LINUX_SOCK_RAW
+                    this.socket_guest_type(fd).unwrap_or(LINUX_SOCK_RAW)
                 } else {
                     0
                 };
@@ -3025,6 +3153,60 @@ impl SyscallDispatcher {
                     0
                 };
                 // Honor the guest's optlen (it offers 4; clamp defensively).
+                let guest_optlen = match memory.read_bytes(optlen_addr, 4) {
+                    Ok(b) => u32::from_ne_bytes([b[0], b[1], b[2], b[3]]),
+                    Err(_) => return Ok(LINUX_EFAULT.into()),
+                };
+                let bytes = val.to_ne_bytes();
+                let n = (guest_optlen as usize).min(bytes.len());
+                if optval_addr != 0
+                    && n > 0
+                    && memory.write_bytes(optval_addr, &bytes[..n]).is_err()
+                {
+                    return Ok(LINUX_EFAULT.into());
+                }
+                if memory
+                    .write_bytes(optlen_addr, &(n as u32).to_ne_bytes())
+                    .is_err()
+                {
+                    return Ok(LINUX_EFAULT.into());
+                }
+                return Ok(DispatchOutcome::Returned { value: 0 });
+            }
+            // SO_REUSEPORT / SO_RCVBUF / SO_SNDBUF: report the GUEST-intended
+            // value, not carrick's host-side widening. REUSEPORT defaults to 0
+            // unless the guest set it (so a SO_REUSEADDR→REUSEPORT widening on a
+            // UDP socket is invisible here); RCVBUF/SNDBUF report Linux's doubled
+            // (2×) value of what was set, or the default when never set.
+            // (audit M4, M5)
+            if level == LINUX_SOL_SOCKET
+                && (optname == LINUX_SO_REUSEPORT
+                    || optname == LINUX_SO_RCVBUF
+                    || optname == LINUX_SO_SNDBUF
+                    || optname == crate::linux_abi::LINUX_SO_PASSCRED)
+            {
+                const LINUX_DEFAULT_SOCKBUF: i32 = 212_992;
+                let Some(open_file) = this.open_file(fd) else {
+                    return Ok(LINUX_EBADF.into());
+                };
+                let val: i32 = {
+                    let open = open_file.description.read();
+                    if let OpenDescription::HostSocket { base, .. } = &*open {
+                        if optname == LINUX_SO_REUSEPORT {
+                            i32::from(base.so_reuseport())
+                        } else if optname == crate::linux_abi::LINUX_SO_PASSCRED {
+                            i32::from(base.so_passcred())
+                        } else if optname == LINUX_SO_RCVBUF {
+                            base.so_rcvbuf()
+                                .map_or(LINUX_DEFAULT_SOCKBUF, |v| v.saturating_mul(2))
+                        } else {
+                            base.so_sndbuf()
+                                .map_or(LINUX_DEFAULT_SOCKBUF, |v| v.saturating_mul(2))
+                        }
+                    } else {
+                        0
+                    }
+                };
                 let guest_optlen = match memory.read_bytes(optlen_addr, 4) {
                     Ok(b) => u32::from_ne_bytes([b[0], b[1], b[2], b[3]]),
                     Err(_) => return Ok(LINUX_EFAULT.into()),
@@ -3592,9 +3774,10 @@ impl SyscallDispatcher {
         // OUTSIDE the I/O closure so it happens exactly once on success.
         let host_fds: Vec<i32> = received_host_fds.borrow_mut().drain(..).collect();
         if matches!(outcome, DispatchOutcome::Returned { value } if value >= 0) {
+            let cloexec = flags & LINUX_MSG_CMSG_CLOEXEC != 0;
             let mut guest_fds = Vec::with_capacity(host_fds.len());
             for hfd in host_fds {
-                match self.install_received_host_fd(hfd) {
+                match self.install_received_host_fd(hfd, cloexec) {
                     Some(gfd) => guest_fds.push(gfd),
                     None => unsafe {
                         libc::close(hfd);
@@ -3604,9 +3787,21 @@ impl SyscallDispatcher {
             let mut linux_flags = guest_msg_flags.get();
             let mut written_controllen = 0u64;
             if want_control {
-                let (scm, scm_trunc) = build_linux_scm_rights(&guest_fds, msg.controllen as usize);
-                // Append the translated IPv6 ancillary cmsgs after any SCM_RIGHTS
-                // record, honoring the guest's controllen (overflow → MSG_CTRUNC).
+                let (mut scm, scm_trunc) =
+                    build_linux_scm_rights(&guest_fds, msg.controllen as usize);
+                // SO_PASSCRED: append an SCM_CREDENTIALS record with the peer's
+                // ucred after any SCM_RIGHTS, bounded by the remaining control
+                // budget. (audit M2)
+                let mut cred_trunc = false;
+                if !is_netlink && self.socket_so_passcred(fd) {
+                    let (pid, uid, gid) = self.peer_ucred(host_fd);
+                    let remaining = (msg.controllen as usize).saturating_sub(scm.len());
+                    let (creds, t) = build_linux_scm_creds(pid, uid, gid, remaining);
+                    scm.extend_from_slice(&creds);
+                    cred_trunc = t;
+                }
+                // Append the translated IPv6 ancillary cmsgs after the SCM
+                // records, honoring the guest's controllen (overflow → MSG_CTRUNC).
                 let ipv6 = received_ipv6_cmsgs.borrow();
                 let (ctrl, ipv6_trunc) =
                     build_linux_ipv6_cmsgs(&scm, &ipv6, msg.controllen as usize);
@@ -3614,7 +3809,7 @@ impl SyscallDispatcher {
                     return Ok(LINUX_EFAULT.into());
                 }
                 written_controllen = ctrl.len() as u64;
-                if scm_trunc || ipv6_trunc {
+                if scm_trunc || ipv6_trunc || cred_trunc {
                     linux_flags |= crate::linux_abi::LINUX_MSG_CTRUNC as i32;
                 }
             }

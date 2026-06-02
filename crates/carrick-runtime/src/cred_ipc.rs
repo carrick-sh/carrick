@@ -10,6 +10,15 @@
 //! file is missing (peer not yet published, peer is a non-carrick process,
 //! /tmp not writable), the caller falls back to the conservative ALLOW
 //! decision (matching today's pre-fix behaviour).
+//!
+//! Scope (audit M12): this mechanism publishes the effective **uid** only,
+//! because Linux's `kill(2)` permission model is uid-based (a caller may signal
+//! a target if its real/effective uid matches the target's real/saved uid).
+//! The gid setters (`setgid`/`setregid`/`setresgid`/`setfsgid`) deliberately do
+//! NOT publish — no cross-process check consults a peer's gid, so a per-process
+//! gid view would be dead state. In-process `getgid`/`getegid`/`getresgid`
+//! still round-trip the gid triple faithfully; only the (unused) cross-process
+//! gid view is intentionally absent.
 
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt as _;

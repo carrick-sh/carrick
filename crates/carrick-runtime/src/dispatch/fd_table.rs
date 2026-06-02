@@ -176,12 +176,29 @@ pub(super) struct OpenDescriptionBase {
     /// test_subprocess.test_pipesizes sets on the write end, reads on the read
     /// ends). `pipe2` hands the same `Arc` to both ends; `None` everywhere else.
     pipe_capacity_shared: Option<std::sync::Arc<std::sync::atomic::AtomicI64>>,
+    /// Guest-intended SO_REUSEPORT, tracked so getsockopt reports what the guest
+    /// set — NOT the host SO_REUSEPORT carrick silently turns on to emulate
+    /// Linux UDP wildcard-rebind from SO_REUSEADDR. (audit M4)
+    so_reuseport: bool,
+    /// Guest-set SO_RCVBUF / SO_SNDBUF (the raw value passed to setsockopt).
+    /// `None` = never set. getsockopt reports Linux's doubled value (2×) of what
+    /// was set, rather than the host's actual buffer size (which carrick widens
+    /// for AF_UNIX). (audit M5)
+    so_rcvbuf: Option<i32>,
+    so_sndbuf: Option<i32>,
+    /// SO_PASSCRED: when set, recvmsg attaches an SCM_CREDENTIALS ancillary
+    /// message with the peer's `struct ucred`. (audit M2)
+    so_passcred: bool,
 }
 
 impl OpenDescriptionBase {
     pub(super) fn new(status_flags: u64) -> Self {
         Self {
             status_flags,
+            so_reuseport: false,
+            so_rcvbuf: None,
+            so_sndbuf: None,
+            so_passcred: false,
             lease: crate::linux_abi::LINUX_F_UNLCK,
             recv_timeout: None,
             send_timeout: None,
@@ -264,6 +281,36 @@ impl OpenDescriptionBase {
 
     pub(super) fn set_send_timeout(&mut self, t: Option<Duration>) {
         self.send_timeout = t;
+    }
+
+    /// Guest-intended SO_REUSEPORT (audit M4).
+    pub(super) fn so_reuseport(&self) -> bool {
+        self.so_reuseport
+    }
+    pub(super) fn set_so_reuseport(&mut self, on: bool) {
+        self.so_reuseport = on;
+    }
+
+    /// Guest-set SO_RCVBUF / SO_SNDBUF, or `None` if never set (audit M5).
+    pub(super) fn so_rcvbuf(&self) -> Option<i32> {
+        self.so_rcvbuf
+    }
+    pub(super) fn set_so_rcvbuf(&mut self, v: i32) {
+        self.so_rcvbuf = Some(v);
+    }
+    pub(super) fn so_sndbuf(&self) -> Option<i32> {
+        self.so_sndbuf
+    }
+    pub(super) fn set_so_sndbuf(&mut self, v: i32) {
+        self.so_sndbuf = Some(v);
+    }
+
+    /// SO_PASSCRED (audit M2).
+    pub(super) fn so_passcred(&self) -> bool {
+        self.so_passcred
+    }
+    pub(super) fn set_so_passcred(&mut self, on: bool) {
+        self.so_passcred = on;
     }
 }
 
@@ -422,6 +469,9 @@ pub(super) enum OpenDescription {
         base: OpenDescriptionBase,
         #[allow(dead_code)]
         protocol: i32,
+        /// The guest socket type (SOCK_RAW or SOCK_DGRAM) this netlink socket was
+        /// created with; reported by getsockopt(SO_TYPE). (audit M6)
+        sock_type: i32,
         /// Netlink "port id" the socket is bound to (0 until bind picks one).
         pid: u32,
         /// Multicast group mask from bind (nl_groups).

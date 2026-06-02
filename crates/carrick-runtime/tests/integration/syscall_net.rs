@@ -3245,3 +3245,185 @@ fn signalfd4_vmsplice_tee_bootstrap_return_enosys() {
     }
     assert!(reporter.finish().unhandled_syscalls.is_empty());
 }
+
+#[test]
+fn close_of_added_fd_auto_removes_it_from_epoll_interest() {
+    // H5: Linux auto-removes a closed fd from every epoll interest set. Without
+    // it, the leaked interest entry makes a later EPOLL_CTL_ADD of the reused fd
+    // number return spurious EEXIST (and epoll_pwait recomputes against a stale
+    // token). Uses an in-memory eventfd (host_fd = None) so no host socket.
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x200]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    let call = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
+        d.dispatch(SyscallRequest::new(nr, SyscallArgs::from(args)), m, &reporter)
+            .unwrap()
+    };
+    let returned = |o: DispatchOutcome| match o {
+        DispatchOutcome::Returned { value } => value as u64,
+        other => panic!("unexpected outcome: {other:?}"),
+    };
+
+    // epoll_create1 -> epfd; eventfd2(0,0) -> efd.
+    let epfd = returned(call(&mut dispatcher, &mut memory, 20, [0, 0, 0, 0, 0, 0]));
+    let efd = returned(call(&mut dispatcher, &mut memory, 19, [0, 0, 0, 0, 0, 0]));
+
+    // EPOLL_CTL_ADD(epfd, efd).
+    let ev = LinuxEpollEvent {
+        events: LINUX_EPOLLIN,
+        _pad: 0,
+        data: 0xC0FFEE,
+    };
+    memory.write_bytes(0x4040, ev.as_bytes()).unwrap();
+    assert_eq!(
+        call(&mut dispatcher, &mut memory, 21, [epfd, LINUX_EPOLL_CTL_ADD, efd, 0x4040, 0, 0]),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    // close(efd) WITHOUT EPOLL_CTL_DEL.
+    assert_eq!(
+        call(&mut dispatcher, &mut memory, 57, [efd, 0, 0, 0, 0, 0]),
+        DispatchOutcome::Returned { value: 0 }
+    );
+
+    // A fresh eventfd reuses the lowest free fd number = efd.
+    let efd2 = returned(call(&mut dispatcher, &mut memory, 19, [0, 0, 0, 0, 0, 0]));
+    assert_eq!(efd2, efd, "closed fd number should be reused by the allocator");
+
+    // Re-ADD the reused fd: must be 0 (Linux auto-removed the stale interest),
+    // not spurious EEXIST from a leaked interest entry.
+    memory.write_bytes(0x4040, ev.as_bytes()).unwrap();
+    assert_eq!(
+        call(&mut dispatcher, &mut memory, 21, [epfd, LINUX_EPOLL_CTL_ADD, efd2, 0x4040, 0, 0]),
+        DispatchOutcome::Returned { value: 0 },
+        "close() must auto-remove the fd from epoll interest (no spurious EEXIST on reuse)"
+    );
+}
+
+#[test]
+fn netlink_getsockopt_so_type_reports_guest_type_not_hardcoded_raw() {
+    // M6: a SOCK_DGRAM netlink socket must report SOCK_DGRAM via getsockopt(
+    // SO_TYPE), not a hardcoded SOCK_RAW.
+    const AF_NETLINK: u64 = 16;
+    const SOCK_DGRAM: u64 = 2;
+    const SOCK_RAW: u64 = 3;
+    const SOL_SOCKET: u64 = 1;
+    const SO_TYPE: u64 = 3;
+    const NETLINK_ROUTE: u64 = 0;
+
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    let call = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
+        d.dispatch(SyscallRequest::new(nr, SyscallArgs::from(args)), m, &reporter)
+            .unwrap()
+    };
+
+    // socket(AF_NETLINK, SOCK_DGRAM, NETLINK_ROUTE) -> fd.
+    let fd = match call(&mut dispatcher, &mut memory, 198, [AF_NETLINK, SOCK_DGRAM, NETLINK_ROUTE, 0, 0, 0]) {
+        DispatchOutcome::Returned { value } => value as u64,
+        o => panic!("socket(AF_NETLINK): {o:?}"),
+    };
+    // optlen = 4 at 0x4008.
+    memory.write_bytes(0x4008, &4u32.to_ne_bytes()).unwrap();
+    // getsockopt(fd, SOL_SOCKET, SO_TYPE, 0x4000, 0x4008).
+    assert_eq!(
+        call(&mut dispatcher, &mut memory, 209, [fd, SOL_SOCKET, SO_TYPE, 0x4000, 0x4008, 0]),
+        DispatchOutcome::Returned { value: 0 }
+    );
+    let ty = u32::from_ne_bytes(memory.read_bytes(0x4000, 4).unwrap().try_into().unwrap());
+    assert_eq!(ty as u64, SOCK_DGRAM, "netlink SO_TYPE must report the guest type");
+    assert_ne!(ty as u64, SOCK_RAW);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn so_reuseport_and_bufsize_report_guest_values_not_host_widening() {
+    // M4: getsockopt(SO_REUSEPORT) must report what the guest set (default 0),
+    // NOT the host SO_REUSEPORT carrick turns on to emulate UDP wildcard-rebind
+    // from SO_REUSEADDR. M5: getsockopt(SO_RCVBUF/SNDBUF) must report Linux's
+    // doubled (2x) value of what was set, not the host's actual buffer.
+    const AF_INET: u64 = 2;
+    const SOCK_DGRAM: u64 = 2;
+    const SOL_SOCKET: u64 = 1;
+    const SO_REUSEADDR: u64 = 2;
+    const SO_REUSEPORT: u64 = 15;
+    const SO_RCVBUF: u64 = 8;
+
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    let call = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
+        d.dispatch(SyscallRequest::new(nr, SyscallArgs::from(args)), m, &reporter)
+            .unwrap()
+    };
+    let geti32 = |m: &LinearMemory, at: u64| {
+        i32::from_ne_bytes(m.read_bytes(at, 4).unwrap().try_into().unwrap())
+    };
+
+    let fd = match call(&mut dispatcher, &mut memory, 198, [AF_INET, SOCK_DGRAM, 0, 0, 0, 0]) {
+        DispatchOutcome::Returned { value } => value as u64,
+        o => panic!("socket(AF_INET,SOCK_DGRAM): {o:?}"),
+    };
+
+    // setsockopt(SO_REUSEADDR, 1) — carrick widens host SO_REUSEPORT for UDP.
+    memory.write_bytes(0x4000, &1i32.to_ne_bytes()).unwrap();
+    assert_eq!(call(&mut dispatcher, &mut memory, 208, [fd, SOL_SOCKET, SO_REUSEADDR, 0x4000, 4, 0]), DispatchOutcome::Returned { value: 0 });
+    // getsockopt(SO_REUSEPORT) — guest never set it, so 0 (not the host's 1).
+    memory.write_bytes(0x4010, &4u32.to_ne_bytes()).unwrap();
+    assert_eq!(call(&mut dispatcher, &mut memory, 209, [fd, SOL_SOCKET, SO_REUSEPORT, 0x4020, 0x4010, 0]), DispatchOutcome::Returned { value: 0 });
+    assert_eq!(geti32(&memory, 0x4020), 0, "SO_REUSEPORT must report guest value (0), not host widening");
+
+    // setsockopt(SO_RCVBUF, 8192); getsockopt -> 16384 (Linux doubles).
+    memory.write_bytes(0x4000, &8192i32.to_ne_bytes()).unwrap();
+    assert_eq!(call(&mut dispatcher, &mut memory, 208, [fd, SOL_SOCKET, SO_RCVBUF, 0x4000, 4, 0]), DispatchOutcome::Returned { value: 0 });
+    memory.write_bytes(0x4010, &4u32.to_ne_bytes()).unwrap();
+    assert_eq!(call(&mut dispatcher, &mut memory, 209, [fd, SOL_SOCKET, SO_RCVBUF, 0x4020, 0x4010, 0]), DispatchOutcome::Returned { value: 0 });
+    assert_eq!(geti32(&memory, 0x4020), 16384, "SO_RCVBUF must report 2x the set value");
+
+    // An explicit setsockopt(SO_REUSEPORT, 1) IS reflected.
+    memory.write_bytes(0x4000, &1i32.to_ne_bytes()).unwrap();
+    assert_eq!(call(&mut dispatcher, &mut memory, 208, [fd, SOL_SOCKET, SO_REUSEPORT, 0x4000, 4, 0]), DispatchOutcome::Returned { value: 0 });
+    memory.write_bytes(0x4010, &4u32.to_ne_bytes()).unwrap();
+    assert_eq!(call(&mut dispatcher, &mut memory, 209, [fd, SOL_SOCKET, SO_REUSEPORT, 0x4020, 0x4010, 0]), DispatchOutcome::Returned { value: 0 });
+    assert_eq!(geti32(&memory, 0x4020), 1, "explicit SO_REUSEPORT must read back");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn so_passcred_set_get_round_trips() {
+    // M2: setsockopt(SO_PASSCRED) must be accepted + round-trip (was ENOPROTOOPT),
+    // enabling the SCM_CREDENTIALS receive path.
+    const AF_UNIX: u64 = 1;
+    const SOCK_STREAM: u64 = 1;
+    const SOL_SOCKET: u64 = 1;
+    const SO_PASSCRED: u64 = 16;
+
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x100]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+    let call = |d: &mut SyscallDispatcher, m: &mut LinearMemory, nr: u64, args: [u64; 6]| {
+        d.dispatch(SyscallRequest::new(nr, SyscallArgs::from(args)), m, &reporter)
+            .unwrap()
+    };
+
+    // socketpair(AF_UNIX, SOCK_STREAM) -> fds @0x4000.
+    assert_eq!(call(&mut dispatcher, &mut memory, 199, [AF_UNIX, SOCK_STREAM, 0, 0x4000, 0, 0]), DispatchOutcome::Returned { value: 0 });
+    let pair = memory.read_bytes(0x4000, 8).unwrap();
+    let fd = i32::from_le_bytes([pair[0], pair[1], pair[2], pair[3]]) as u64;
+
+    // getsockopt(SO_PASSCRED) initially 0.
+    memory.write_bytes(0x4010, &4u32.to_ne_bytes()).unwrap();
+    assert_eq!(call(&mut dispatcher, &mut memory, 209, [fd, SOL_SOCKET, SO_PASSCRED, 0x4020, 0x4010, 0]), DispatchOutcome::Returned { value: 0 });
+    assert_eq!(i32::from_ne_bytes(memory.read_bytes(0x4020, 4).unwrap().try_into().unwrap()), 0);
+
+    // setsockopt(SO_PASSCRED, 1) -> 0 (NOT ENOPROTOOPT).
+    memory.write_bytes(0x4000, &1i32.to_ne_bytes()).unwrap();
+    assert_eq!(call(&mut dispatcher, &mut memory, 208, [fd, SOL_SOCKET, SO_PASSCRED, 0x4000, 4, 0]), DispatchOutcome::Returned { value: 0 });
+
+    // getsockopt(SO_PASSCRED) -> 1.
+    memory.write_bytes(0x4010, &4u32.to_ne_bytes()).unwrap();
+    assert_eq!(call(&mut dispatcher, &mut memory, 209, [fd, SOL_SOCKET, SO_PASSCRED, 0x4020, 0x4010, 0]), DispatchOutcome::Returned { value: 0 });
+    assert_eq!(i32::from_ne_bytes(memory.read_bytes(0x4020, 4).unwrap().try_into().unwrap()), 1, "SO_PASSCRED must round-trip");
+}

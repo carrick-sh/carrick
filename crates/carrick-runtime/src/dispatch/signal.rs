@@ -55,6 +55,14 @@ pub(super) struct SignalState {
     /// probe: identical `new_sp` across threads). Signal HANDLERS stay global
     /// (Linux shares them across threads); only the alt stack is per-thread.
     pub altstack: HashMap<crate::thread::ThreadId, LinuxSigaltstack>,
+    /// Per-thread stack of currently-active signal-handler frames; each `bool`
+    /// records whether THAT frame is executing on the alternate signal stack
+    /// (SA_ONSTACK + an alt stack was configured). `enter_signal_handler` pushes
+    /// on delivery, `rt_sigreturn` pops on return. A thread "is on the alt
+    /// stack" iff any active frame's bool is true — used so `sigaltstack(NULL,
+    /// &old)` reports SS_ONSTACK and a `sigaltstack(SET)` while on it returns
+    /// EPERM (Linux semantics). (audit M13)
+    pub handler_frames: HashMap<crate::thread::ThreadId, Vec<bool>>,
     /// Linux's `set_restore_sigmask()` shadow: when a syscall (sigsuspend,
     /// pselect, ppoll with a sigmask) temporarily replaced the thread's
     /// signal mask, this records the mask to restore AFTER the next signal
@@ -83,6 +91,7 @@ impl SignalState {
             process_pending: 0,
             process_rt_pending_counts: HashMap::new(),
             altstack: HashMap::new(),
+            handler_frames: HashMap::new(),
             restore_masks: HashMap::new(),
             pending_siginfos: HashMap::new(),
         }
@@ -245,6 +254,7 @@ impl SyscallDispatcher {
         s.pendings.remove(&tid);
         s.rt_pending_counts.retain(|(t, _), _| *t != tid);
         s.altstack.remove(&tid);
+        s.handler_frames.remove(&tid);
     }
 
     /// Re-key a thread's per-thread signal state from `old` to `new` across
@@ -354,7 +364,43 @@ impl SyscallDispatcher {
         let current = signal.mask_for(tid);
         let handler_mask = sanitize_signal_mask(current | delivered | action.sa_mask[0]);
         signal.masks.insert(tid, handler_mask);
+        // SA_RESETHAND (one-shot): the disposition is reset to SIG_DFL *before*
+        // the handler runs, so a second occurrence of the signal takes the
+        // default action. Mirrors the execve reset's "caught → absent = SIG_DFL"
+        // convention. (`signal()`-via-`SA_RESETHAND|SA_NODEFER` and raw one-shot
+        // handlers depend on this; without it the handler re-enters forever.)
+        if action.sa_flags & crate::linux_abi::LINUX_SA_RESETHAND != 0 {
+            signal.handlers.remove(&signum);
+        }
+        // Record whether this handler runs on the alt stack (SA_ONSTACK + an
+        // alt stack is configured), so sigaltstack queries report SS_ONSTACK and
+        // a reconfigure-while-active returns EPERM. Popped by rt_sigreturn.
+        // (audit M13)
+        let on_alt = action.sa_flags & crate::linux_abi::LINUX_SA_ONSTACK != 0
+            && signal.altstack.contains_key(&tid);
+        signal.handler_frames.entry(tid).or_default().push(on_alt);
         saved
+    }
+
+    /// True iff `tid` is currently executing a signal handler ON its alternate
+    /// signal stack (any active SA_ONSTACK frame). (audit M13)
+    fn is_on_altstack(&self, tid: crate::thread::ThreadId) -> bool {
+        self.signal
+            .lock()
+            .handler_frames
+            .get(&tid)
+            .is_some_and(|frames| frames.iter().any(|&on_alt| on_alt))
+    }
+
+    /// Pop the returning handler frame's alt-stack record (rt_sigreturn).
+    fn pop_handler_frame(&self, tid: crate::thread::ThreadId) {
+        let mut signal = self.signal.lock();
+        if let Some(frames) = signal.handler_frames.get_mut(&tid) {
+            frames.pop();
+            if frames.is_empty() {
+                signal.handler_frames.remove(&tid);
+            }
+        }
     }
 
     /// Arm a "restore this mask after the next handler runs" override (Linux's
@@ -363,6 +409,34 @@ impl SyscallDispatcher {
     pub fn arm_restore_mask(&self, tid: crate::thread::ThreadId, mask: u64) {
         let mut signal = self.signal.lock();
         signal.restore_masks.insert(tid, sanitize_signal_mask(mask));
+    }
+
+    /// True if a signal deliverable under `suspend_mask` (per-thread pending or
+    /// shared process-directed) has a CAUGHT handler installed for `tid`. This
+    /// is the only `rt_sigsuspend`-wake case where the temporary mask is kept
+    /// and the post-handler restore is armed: the handler runs under
+    /// `suspend_mask` and its `rt_sigreturn` pops the saved mask. On every other
+    /// wake (spurious/timeout, or a signal whose disposition is ignore /
+    /// default-ignore — no handler, so no `rt_sigreturn`) the saved mask must be
+    /// restored by `rt_sigsuspend` itself, or the thread is stranded under the
+    /// temporary mask. (audit M1)
+    fn sigsuspend_caught_handler_deliverable(
+        &self,
+        tid: crate::thread::ThreadId,
+        suspend_mask: u64,
+    ) -> bool {
+        let deliverable = {
+            let signal = self.signal.lock();
+            (signal.pendings.get(&tid).copied().unwrap_or(0) | signal.process_pending)
+                & !suspend_mask
+        };
+        if deliverable == 0 {
+            return false;
+        }
+        (1..=64i32).any(|sig| {
+            sigmask_bit(sig).is_some_and(|bit| deliverable & bit != 0)
+                && self.registered_signal_handler(sig).is_some()
+        })
     }
 
     /// Queue a caller-supplied `siginfo_t` for the next delivery of
@@ -477,6 +551,58 @@ impl SyscallDispatcher {
             signal.process_pending &= !bit;
         }
         Some(signum)
+    }
+
+    /// `read(2)` on a signalfd: drain pending signals matching the fd's `mask`
+    /// for `tid` into `struct signalfd_siginfo` (128-byte) records, consuming
+    /// them. Each record fills `ssi_signo`, and — when a queued
+    /// `rt_sigqueueinfo` payload exists — `ssi_code`/`ssi_pid`/`ssi_uid`.
+    /// Mirrors the inotify read path: a buffer smaller than one record → EINVAL;
+    /// an empty queue → EAGAIN (signalfd is overwhelmingly used non-blocking +
+    /// epoll; a true blocking wait on the backing readiness is a tracked
+    /// follow-up). (audit H4)
+    pub fn read_signalfd<M: GuestMemory>(
+        &self,
+        memory: &mut M,
+        address: u64,
+        length: usize,
+        mask: u64,
+        tid: crate::thread::ThreadId,
+    ) -> DispatchOutcome {
+        const SIGINFO_LEN: usize = 128;
+        if length < SIGINFO_LEN {
+            return LINUX_EINVAL.into();
+        }
+        let max = length / SIGINFO_LEN;
+        let mut out: Vec<u8> = Vec::new();
+        for _ in 0..max {
+            let Some(signum) = self.take_pending_in(tid, mask) else {
+                break;
+            };
+            let mut rec = [0u8; SIGINFO_LEN];
+            // ssi_signo @0.
+            rec[0..4].copy_from_slice(&(signum as u32).to_le_bytes());
+            // Carry a queued rt_sigqueueinfo payload's code/pid/uid if present.
+            // LinuxSiginfo packs si_pid (low 32) and si_uid (high 32) into
+            // si_addr (see LinuxSiginfo::kill).
+            if let Some(info) = self.take_pending_siginfo(tid, signum) {
+                rec[8..12].copy_from_slice(&info.si_code.to_le_bytes()); // ssi_code @8
+                let pid = (info.si_addr & 0xffff_ffff) as u32;
+                let uid = (info.si_addr >> 32) as u32;
+                rec[12..16].copy_from_slice(&pid.to_le_bytes()); // ssi_pid @12
+                rec[16..20].copy_from_slice(&uid.to_le_bytes()); // ssi_uid @16
+            }
+            out.extend_from_slice(&rec);
+        }
+        if out.is_empty() {
+            return LINUX_EAGAIN.into();
+        }
+        if memory.write_bytes(address, &out).is_err() {
+            return LINUX_EFAULT.into();
+        }
+        DispatchOutcome::Returned {
+            value: out.len() as i64,
+        }
     }
 
     /// Record a PROCESS-directed signal in the SHARED pending set (no thread
@@ -738,20 +864,31 @@ impl SyscallDispatcher {
             let tid = cx.thread.as_ref().map(|t| t.tid).unwrap_or(0);
             let memory = &mut *cx.memory;
 
+            let on_altstack = this.is_on_altstack(tid);
             if old_ss != 0 {
-                let current = this
+                let mut current = this
                     .signal
                     .lock()
                     .altstack
                     .get(&tid)
                     .copied()
                     .unwrap_or_else(LinuxSigaltstack::disabled);
+                // Report SS_ONSTACK while a handler is executing on the alt stack
+                // (Linux: the query reflects the current execution state). (M13)
+                if on_altstack {
+                    current.ss_flags |= LINUX_SS_ONSTACK as i32;
+                }
                 if memory.write_bytes(old_ss, current.abi_bytes()).is_err() {
                     return Ok(LINUX_EFAULT.into());
                 }
             }
 
             if ss != 0 {
+                // Linux forbids changing the alt stack while executing ON it
+                // (the running handler would have the rug pulled out). (M13)
+                if on_altstack {
+                    return Ok(LINUX_EPERM.into());
+                }
                 let bytes = match memory.read_bytes(ss, core::mem::size_of::<LinuxSigaltstack>()) {
                     Ok(bytes) => bytes,
                     Err(_) => {
@@ -845,10 +982,21 @@ impl SyscallDispatcher {
                 }
                 std::thread::sleep(Duration::from_millis(1));
             }
-            // Leave the mask as `suspend_mask` so the runtime can deliver the
-            // newly-deliverable signal; arm_restore_mask makes that handler's
-            // rt_sigreturn restore `original` instead of `suspend_mask`.
-            this.arm_restore_mask(tid, original);
+            // Keep the temporary mask + arm the post-handler restore ONLY when a
+            // caught handler is actually going to run: it runs under
+            // `suspend_mask`, and its `rt_sigreturn` pops `original` via the
+            // armed mask. On a spurious/timeout wake, or a wake by a signal whose
+            // disposition is ignore / default-ignore (no handler runs, so no
+            // `rt_sigreturn`), restore `original` HERE — otherwise the thread is
+            // stranded running under `suspend_mask`. A cross-thread host-pending
+            // wake re-raised above, so a handler will run there too. (audit M1)
+            if this.sigsuspend_caught_handler_deliverable(tid, suspend_mask)
+                || crate::host_signal::has_unblocked_pending_for(tid, suspend_mask)
+            {
+                this.arm_restore_mask(tid, original);
+            } else {
+                this.restore_signal_mask(tid, original);
+            }
             Ok(LINUX_EINTR.into())
         }
 
@@ -1024,11 +1172,16 @@ impl SyscallDispatcher {
 
             let memory = &mut *cx.memory;
             if let Some(signum) = this.take_pending_in(tid, wait_set) {
-                return Ok(rt_sigtimedwait_deliver(memory, info_ptr, signum));
+                // Carry any queued rt_sigqueueinfo payload (si_code/pid/uid/value)
+                // into the caller's siginfo, not just si_signo. (audit M9)
+                let queued = this.take_pending_siginfo(tid, signum);
+                return Ok(rt_sigtimedwait_deliver(memory, info_ptr, signum, queued));
             }
             let signum = crate::host_signal::take_pending_in_for(tid, wait_set);
             if signum != crate::host_signal::NO_PENDING_SIGNAL {
-                return Ok(rt_sigtimedwait_deliver(memory, info_ptr, signum));
+                // A host-delivered signal carries no carrick-queued payload.
+                let queued = this.take_pending_siginfo(tid, signum);
+                return Ok(rt_sigtimedwait_deliver(memory, info_ptr, signum, queued));
             }
             install_host_handlers_for_wait_set(wait_set);
             match timeout {
@@ -1192,6 +1345,8 @@ impl SyscallDispatcher {
 
         /// rt_sigreturn(): pop signal frame and restore registers.
         fn rt_sigreturn(this, cx) {
+            // Pop this handler frame's alt-stack record (audit M13).
+            this.pop_handler_frame(Self::ctx_tid(cx));
             Ok(DispatchOutcome::SigReturn)
         }
     }
@@ -1267,16 +1422,20 @@ fn install_host_handlers_for_wait_set(wait_set: u64) {
     }
 }
 
-/// Complete a successful `rt_sigtimedwait`: write a minimal `siginfo_t`
-/// (just `si_signo`) to `info_ptr` if non-NULL and return the signal
-/// number, matching the kernel's success contract.
+/// Complete a successful `rt_sigtimedwait`: write the FULL `siginfo_t` to
+/// `info_ptr` if non-NULL and return the signal number. A `queued`
+/// rt_sigqueueinfo payload supplies si_code/si_pid/si_uid/si_value; otherwise a
+/// zeroed siginfo carrying just si_signo. The kernel re-stamps si_signo. (M9)
 fn rt_sigtimedwait_deliver(
     memory: &mut impl GuestMemory,
     info_ptr: u64,
     signum: i32,
+    queued: Option<LinuxSiginfo>,
 ) -> DispatchOutcome {
     if info_ptr != 0 {
-        let _ = memory.write_bytes(info_ptr, &signum.to_le_bytes());
+        let mut si = queued.unwrap_or_else(LinuxSiginfo::empty);
+        si.si_signo = signum;
+        let _ = memory.write_bytes(info_ptr, si.as_bytes());
     }
     DispatchOutcome::Returned {
         value: signum as i64,
@@ -1524,5 +1683,100 @@ mod tests {
         assert!(d.signal_is_ignored(10));
         // The alternate signal stack is cleared.
         assert!(d.signal_altstack(tid).is_none());
+    }
+
+    #[test]
+    fn sa_resethand_resets_disposition_to_default_on_handler_entry() {
+        let d = SyscallDispatcher::new();
+        let tid: crate::thread::ThreadId = 1;
+
+        // A one-shot (SA_RESETHAND) handler for SIGUSR1 (10).
+        let mut oneshot = LinuxSigaction::empty();
+        oneshot.sa_handler = 0x4000;
+        oneshot.sa_flags = crate::linux_abi::LINUX_SA_RESETHAND;
+        d.signal.lock().handlers.insert(10, oneshot);
+        assert!(d.registered_signal_handler(10).is_some());
+
+        // Entering the handler resets the disposition to SIG_DFL (Linux's
+        // one-shot semantics): a second occurrence takes the default action.
+        d.enter_signal_handler(tid, 10, oneshot);
+        assert!(
+            d.registered_signal_handler(10).is_none(),
+            "SA_RESETHAND handler must reset to SIG_DFL on entry"
+        );
+
+        // Control: a handler WITHOUT SA_RESETHAND persists across entry.
+        let mut sticky = LinuxSigaction::empty();
+        sticky.sa_handler = 0x5000;
+        d.signal.lock().handlers.insert(11, sticky);
+        d.enter_signal_handler(tid, 11, sticky);
+        assert!(
+            d.registered_signal_handler(11).is_some(),
+            "a non-RESETHAND handler must persist across entry"
+        );
+    }
+
+    #[test]
+    fn sigaltstack_reports_ss_onstack_and_rejects_reconfigure_while_on_stack() {
+        let d = SyscallDispatcher::new();
+        let tid: crate::thread::ThreadId = 1;
+
+        // Configure an alt stack for the thread.
+        d.signal.lock().altstack.insert(
+            tid,
+            LinuxSigaltstack {
+                ss_sp: 0x4000,
+                ss_flags: 0,
+                __pad: 0,
+                ss_size: 0x4000,
+            },
+        );
+        // Not in a handler yet → not on the alt stack.
+        assert!(!d.is_on_altstack(tid));
+
+        // Enter an SA_ONSTACK handler → now executing on the alt stack.
+        let mut on = LinuxSigaction::empty();
+        on.sa_handler = 0x9000;
+        on.sa_flags = crate::linux_abi::LINUX_SA_ONSTACK;
+        d.enter_signal_handler(tid, 10, on);
+        assert!(d.is_on_altstack(tid), "SA_ONSTACK handler marks the thread on-stack");
+
+        // rt_sigreturn pops the frame → back off the alt stack.
+        d.pop_handler_frame(tid);
+        assert!(!d.is_on_altstack(tid));
+
+        // A handler WITHOUT SA_ONSTACK does not mark the thread on-stack.
+        let mut off = LinuxSigaction::empty();
+        off.sa_handler = 0x9000;
+        d.enter_signal_handler(tid, 11, off);
+        assert!(!d.is_on_altstack(tid), "a non-SA_ONSTACK handler is not on the alt stack");
+        d.pop_handler_frame(tid);
+    }
+
+    #[test]
+    fn rt_sigsuspend_keeps_temp_mask_only_when_a_caught_handler_will_run() {
+        let d = SyscallDispatcher::new();
+        let tid: crate::thread::ThreadId = 1;
+        let unblock_all = 0u64;
+
+        // Spurious / timeout wake: nothing pending → DON'T keep the temp mask
+        // (rt_sigsuspend must restore the saved mask, not strand the thread).
+        assert!(!d.sigsuspend_caught_handler_deliverable(tid, unblock_all));
+
+        // A deliverable signal with NO caught handler (default disposition):
+        // no handler runs, so still restore.
+        d.mark_signal_pending(tid, 10);
+        assert!(!d.sigsuspend_caught_handler_deliverable(tid, unblock_all));
+
+        // Install a caught handler for SIGUSR1 (10): now a handler WILL run, so
+        // the temp mask is kept and the post-handler restore is armed.
+        let mut h = LinuxSigaction::empty();
+        h.sa_handler = 0x4000;
+        d.signal.lock().handlers.insert(10, h);
+        assert!(d.sigsuspend_caught_handler_deliverable(tid, unblock_all));
+
+        // The same signal BLOCKED by suspend_mask is not deliverable → restore.
+        let block_10 = 1u64 << (10 - 1);
+        assert!(!d.sigsuspend_caught_handler_deliverable(tid, block_10));
     }
 }

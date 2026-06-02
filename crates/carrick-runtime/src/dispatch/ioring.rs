@@ -578,6 +578,8 @@ impl SyscallDispatcher {
                 match removed {
                     Some(open_file) => {
                         self.close_open_file_and_free_pty(&open_file);
+                        // Linux auto-removes a closed fd from every epoll interest set.
+                        self.detach_fd_from_epolls(sqe.fd);
                         self.io.io_uring_instances.write().remove(&sqe.fd);
                         0
                     }
