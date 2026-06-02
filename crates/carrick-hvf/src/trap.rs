@@ -2415,6 +2415,28 @@ impl HvfInner {
 
     fn mapping_for_range(&self, address: u64, length: usize) -> Option<&HvfMappedRegion> {
         let address = strip_pointer_tag(address);
+        // For a high-VA Rosetta alias, prefer the region whose `hv_vm_map`'d IPA
+        // window owns the guest's OWN stage-1 translation of `address`. Alias
+        // regions can overlap by VA — a 16 KiB host-rounded `end` over-claims its
+        // neighbour, and a MAP_FIXED overlay leaves its predecessor in place — so
+        // a pure VA-range match (even newest-first) can pick a region the guest's
+        // page tables do NOT use, sending a syscall buffer copy to the wrong
+        // backing (the amd64 `cat -n`/mmap-buffer reads-zeros bug). Matching on
+        // the stage-1 IPA picks exactly the region the guest reads/writes; the
+        // copy offset stays `va - start` because alias regions map VA→IPA
+        // linearly. Falls back to the VA-range scan when stage-1 has no entry yet.
+        if crate::memory::is_high_va(address) {
+            if let Some(ipa) = self.translate_va(address) {
+                if let Some(m) = self
+                    .mappings
+                    .iter()
+                    .rev()
+                    .find(|m| Self::region_owns_ipa(m, ipa) && m.contains_range(address, length))
+                {
+                    return Some(m);
+                }
+            }
+        }
         // Search NEWEST-first: a MAP_FIXED mmap overlaying an earlier mapping
         // pushes a new region without removing the old one, and the guest's
         // stage-1 points to the LAST mapping (the overlay wins). Returning the
@@ -2432,11 +2454,42 @@ impl HvfInner {
         length: usize,
     ) -> Option<&mut HvfMappedRegion> {
         let address = strip_pointer_tag(address);
+        // Mirror `mapping_for_range`: prefer the stage-1-IPA-matching region for
+        // high-VA aliases so syscall WRITES land where the guest reads. The
+        // `any`-then-`find` split keeps the borrow checker happy (we can't return
+        // a conditional `&mut` borrowed inside the IPA branch and still fall back).
+        if crate::memory::is_high_va(address) {
+            if let Some(ipa) = self.translate_va(address) {
+                if self
+                    .mappings
+                    .iter()
+                    .any(|m| Self::region_owns_ipa(m, ipa) && m.contains_range(address, length))
+                {
+                    return self
+                        .mappings
+                        .iter_mut()
+                        .rev()
+                        .find(|m| Self::region_owns_ipa(m, ipa) && m.contains_range(address, length));
+                }
+            }
+        }
         // Newest-first (see mapping_for_range): the overlay wins.
         self.mappings
             .iter_mut()
             .rev()
             .find(|mapping| mapping.contains_range(address, length))
+    }
+
+    /// True if `ipa` falls in `region`'s `hv_vm_map`'d IPA window.
+    fn region_owns_ipa(region: &HvfMappedRegion, ipa: u64) -> bool {
+        ipa >= region.ipa && ipa < region.ipa + region.size as u64
+    }
+
+    /// Walk the guest's live stage-1 page tables to resolve `va`→IPA (the output
+    /// address carrick `hv_vm_map`'d). `None` if unmapped. Used to disambiguate
+    /// overlapping high-VA alias regions in `mapping_for_range[_mut]`.
+    fn translate_va(&self, va: u64) -> Option<u64> {
+        self.page_tables.lock().as_ref()?.translate(va)
     }
 
     fn guest_range_is_writable(&self, address: u64, length: usize) -> bool {
