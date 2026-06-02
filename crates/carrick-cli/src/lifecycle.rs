@@ -335,9 +335,129 @@ fn parse_signal(s: &str) -> Option<i32> {
     Some(n)
 }
 
-/// `carrick logs` would replay `container::log_path(id)`; wired separately. The
-/// import keeps the surface explicit for that follow-up.
-#[allow(dead_code)]
-fn _logs_marker() {
-    let _ = std::io::stdout().flush();
+/// `carrick logs <container> [-f] [--tail N]` — replay (and optionally follow)
+/// the captured stdout/stderr of a container. Detached runs redirect the
+/// guest's inherited stdio to `output.log` (see [`redirect_detached_stdio`]);
+/// this reads it back, mirroring `docker logs`.
+pub(crate) fn logs(spec: &str, follow: bool, tail: Option<usize>) -> anyhow::Result<()> {
+    let id = container::resolve(spec).map_err(anyhow::Error::msg)?;
+    // `id` is a real registered id (resolve only returns existing ids), and
+    // log_path runs it through the is_safe_id guard (container_dir_checked), so
+    // `path` is under the registry root by construction — not traversable.
+    let path = container::log_path(&id)?;
+
+    // Dump what's already on disk (the last `tail` lines, or everything).
+    let data = std::fs::read(&path).unwrap_or_default(); // nosemgrep
+    let mut out = std::io::stdout();
+    out.write_all(select_tail(&data, tail))?;
+    out.flush()?;
+
+    if !follow {
+        return Ok(());
+    }
+
+    // `-f`/--follow: stream appended bytes until the container's init exits,
+    // then drain whatever was written after the last poll. Best-effort polling
+    // (no inotify on macOS); 100ms cadence matches `stop`'s grace ticks.
+    let mut offset = data.len() as u64;
+    let state = ContainerState::load(&id).ok();
+    loop {
+        offset = emit_appended(&path, offset, &mut out)?;
+        let alive = state.as_ref().is_some_and(|s| s.init_alive());
+        if !alive {
+            // Final drain: catch bytes written between the last read and exit.
+            emit_appended(&path, offset, &mut out)?;
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// Write any bytes in `path` past `offset` to `out`; return the new offset.
+fn emit_appended(
+    path: &std::path::Path,
+    offset: u64,
+    out: &mut impl Write,
+) -> anyhow::Result<u64> {
+    use std::io::{Read, Seek};
+    // `path` is the registry log_path built from an allowlisted id (see `logs`);
+    // it is under the registry root by construction, not user-traversable.
+    let opened = std::fs::File::open(path); // nosemgrep
+    let Ok(mut f) = opened else {
+        return Ok(offset);
+    };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(offset);
+    if len <= offset {
+        return Ok(offset);
+    }
+    f.seek(std::io::SeekFrom::Start(offset))?;
+    let mut buf = Vec::with_capacity((len - offset) as usize);
+    f.read_to_end(&mut buf)?;
+    out.write_all(&buf)?;
+    out.flush()?;
+    Ok(len)
+}
+
+/// Return the suffix of `data` covering its last `tail` newline-delimited lines
+/// (`None` ⇒ all of it, `Some(0)` ⇒ empty). A final line without a trailing
+/// newline still counts. Mirrors `docker logs --tail N`.
+fn select_tail(data: &[u8], tail: Option<usize>) -> &[u8] {
+    let Some(n) = tail else {
+        return data;
+    };
+    if n == 0 {
+        return &data[data.len()..];
+    }
+    // Ignore a single trailing newline so it doesn't introduce a phantom empty
+    // last line when counting boundaries from the end.
+    let search_end = if data.last() == Some(&b'\n') {
+        data.len() - 1
+    } else {
+        data.len()
+    };
+    let mut count = 0;
+    let mut i = search_end;
+    while i > 0 {
+        i -= 1;
+        if data[i] == b'\n' {
+            count += 1;
+            if count == n {
+                return &data[i + 1..];
+            }
+        }
+    }
+    // Fewer than `n` lines present → return everything.
+    data
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_tail;
+
+    #[test]
+    fn select_tail_none_returns_all() {
+        assert_eq!(select_tail(b"a\nb\nc\n", None), b"a\nb\nc\n");
+    }
+
+    #[test]
+    fn select_tail_returns_last_n_lines_with_trailing_newline() {
+        // tail=2 over three trailing-newline-terminated lines → last two.
+        assert_eq!(select_tail(b"line1\nline2\nline3\n", Some(2)), b"line2\nline3\n");
+    }
+
+    #[test]
+    fn select_tail_returns_last_line_without_trailing_newline() {
+        // A final partial line (no trailing \n) still counts as one line.
+        assert_eq!(select_tail(b"a\nb", Some(1)), b"b");
+    }
+
+    #[test]
+    fn select_tail_zero_is_empty() {
+        assert_eq!(select_tail(b"a\nb\n", Some(0)), b"");
+    }
+
+    #[test]
+    fn select_tail_more_than_available_returns_all() {
+        assert_eq!(select_tail(b"only\n", Some(10)), b"only\n");
+    }
 }
