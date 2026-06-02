@@ -564,6 +564,29 @@ impl SyscallDispatcher {
                 }
                 Err(_) => {}
             }
+        } else if !(want_create && want_excl) {
+            // O_NOFOLLOW is set (the `== 0` branch above did not match). A symlink
+            // LEAF must NOT be followed: Linux open(2) returns ELOOP for a final
+            // symlink component (ENOTDIR when O_DIRECTORY is also set, since a link
+            // is not a directory). You cannot obtain a descriptor on the link
+            // itself via open(2) without O_PATH, which carrick does not model.
+            // Without this, carrick fell through and FOLLOWED the link, so Go's
+            // os.Root walker — which opens each component O_NOFOLLOW and keys on
+            // ELOOP to detect a symlink, readlinkat it, then re-walk with escape
+            // checks — never saw the link, so containment/escape detection silently
+            // broke (TestRootOpen_File/Directory/OpenRoot/Create, TestOpenInRoot,
+            // TestRootSymlinkToRoot). Decide on the leaf KIND alone via a
+            // non-following lstat (a DANGLING symlink is still ELOOP/ENOTDIR) — do
+            // NOT probe the target. Placed before the FIFO/VFS/rootfs routing so a
+            // symlink-to-FIFO leaf can't be followed either.
+            if let Ok(md) = self.layered_lstat(&path)
+                && md.kind == RootFsEntryKind::Symlink
+            {
+                if flags & crate::linux_abi::LINUX_O_DIRECTORY != 0 {
+                    return Ok(LINUX_ENOTDIR.into());
+                }
+                return Ok(crate::linux_abi::LINUX_ELOOP.into());
+            }
         }
 
         // VFS-mount routing. DevVfs serves /dev/*, ProcVfs serves
