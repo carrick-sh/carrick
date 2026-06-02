@@ -71,6 +71,21 @@ impl CredState {
         }
     }
 
+    /// Seed every uid/gid view (real/effective/saved/fs) to `(uid, gid)` — the
+    /// container's initial identity from `docker run --user` / image `USER`,
+    /// applied once before the guest starts (so a later set*id still follows the
+    /// Linux transition rules from this baseline).
+    pub(super) fn seed_identity(&mut self, uid: u32, gid: u32) {
+        self.ruid = uid;
+        self.euid = uid;
+        self.suid = uid;
+        self.fsuid = uid;
+        self.rgid = gid;
+        self.egid = gid;
+        self.sgid = gid;
+        self.fsgid = gid;
+    }
+
     /// We model the CAP_SETUID/CAP_SETGID capability as "running as root"
     /// (euid 0) — carrick has no finer capability model, and LTP's set*id
     /// tests gate their privileged/unprivileged expectations on euid==0.

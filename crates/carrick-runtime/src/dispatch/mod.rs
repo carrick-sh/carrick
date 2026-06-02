@@ -1346,6 +1346,12 @@ impl SyscallDispatcher {
         proc.argv = vec![path];
     }
 
+    /// Seed the guest's initial credentials (`docker run --user` / image `USER`).
+    /// Applied once before the guest starts; defaults to (0, 0) = root.
+    pub fn set_credentials(&self, uid: u32, gid: u32) {
+        self.creds.lock().seed_identity(uid, gid);
+    }
+
     pub fn set_executable_identity(
         &self,
         path: impl Into<String>,
