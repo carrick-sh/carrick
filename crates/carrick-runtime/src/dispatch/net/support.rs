@@ -985,6 +985,18 @@ pub(in crate::dispatch) fn read_linux_sockaddr(
             out[1] = libc::AF_INET as u8; // sin_family
             out[2..4].copy_from_slice(&bytes[2..4]); // sin_port (network)
             out[4..8].copy_from_slice(&bytes[4..8]); // sin_addr
+            // Linux treats the entire 127.0.0.0/8 as loopback (any 127.x.y.z
+            // binds/connects on `lo`), but macOS only assigns 127.0.0.1 to lo0,
+            // so a host bind/connect to e.g. 127.0.1.1 — the Debian-convention
+            // hostname address we seed in /etc/hosts — fails EADDRNOTAVAIL. Fold
+            // the whole 127/8 range onto 127.0.0.1 so loopback behaves as Linux
+            // apps expect, including `bind((gethostname(), port))`. Applied here
+            // (the shared guest→host sockaddr converter) so bind, connect, sendto
+            // and sendmsg all translate consistently. Non-loopback addresses pass
+            // through untouched.
+            if out[4] == 127 && out[4..8] != [127, 0, 0, 1] {
+                out[4..8].copy_from_slice(&[127, 0, 0, 1]);
+            }
             Ok(out)
         }
         LINUX_AF_INET6 => {
