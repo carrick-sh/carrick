@@ -2620,6 +2620,75 @@ fn readlinkat_reports_synthetic_proc_self_exe() {
 }
 
 #[test]
+fn proc_self_magic_links_readlink_and_lstat() {
+    let rootfs = RootFs::from_layers([LayerSource::TarGz(gzip_tar([(
+        "bin/app",
+        b"app".as_slice(),
+    )]))])
+    .unwrap();
+    let mut memory = LinearMemory::new(0x4000, vec![0xff; 0x600]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::with_rootfs_and_executable(rootfs, "/bin/app");
+
+    // readlink /proc/self/cwd → the working dir ("/" by default).
+    memory.write_bytes(0x4000, b"/proc/self/cwd\0").unwrap();
+    let out = dispatcher
+        .dispatch(
+            SyscallRequest::new(
+                78,
+                SyscallArgs::from([(-100_i64) as u64, 0x4000, 0x4100, 64, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    assert_eq!(out, DispatchOutcome::Returned { value: 1 });
+    assert_eq!(memory.read_bytes(0x4100, 1).unwrap(), b"/");
+
+    // readlink /proc/self → the caller's (numeric) pid, even though it is
+    // modeled as a traversable directory.
+    memory.write_bytes(0x4000, b"/proc/self\0").unwrap();
+    let out = dispatcher
+        .dispatch(
+            SyscallRequest::new(
+                78,
+                SyscallArgs::from([(-100_i64) as u64, 0x4000, 0x4200, 64, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    let DispatchOutcome::Returned { value: n } = out else {
+        panic!("readlink /proc/self: {out:?}");
+    };
+    let pid = String::from_utf8(memory.read_bytes(0x4200, n as usize).unwrap()).unwrap();
+    assert!(
+        !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()),
+        "/proc/self should readlink to a pid, got {pid:?}"
+    );
+
+    // lstat /proc/self/exe → an existing S_IFLNK (was ENOENT before).
+    memory.write_bytes(0x4000, b"/proc/self/exe\0").unwrap();
+    let out = dispatcher
+        .dispatch(
+            SyscallRequest::new(
+                79,
+                SyscallArgs::from([(-100_i64) as u64, 0x4000, 0x4300, 0x100, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    assert_eq!(out, DispatchOutcome::Returned { value: 0 }, "lstat exe: {out:?}");
+    let st = read_stat(&memory, 0x4300);
+    assert_eq!(
+        st.st_mode & LINUX_S_IFMT,
+        LINUX_S_IFLNK,
+        "/proc/self/exe should lstat as a symlink"
+    );
+}
+
+#[test]
 fn openat_reads_synthetic_proc_maps_and_cpuinfo() {
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
     memory.write_bytes(0x4000, b"/proc/self/maps\0").unwrap();
