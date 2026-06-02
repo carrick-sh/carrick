@@ -19,7 +19,7 @@ use crate::args::{Cli, Commands, RootfsCommand};
 use crate::debug::run_debug;
 use crate::fs_setup::install_fs_backend;
 use crate::runtime_util::{
-    block_on_oci, emit_raw, parse_env_file, parse_mount_flag, parse_volume_mount,
+    block_on_oci, emit_raw, parse_env_file, parse_mount_flag, parse_volume_mount, validate_publish,
 };
 #[cfg(target_os = "macos")]
 use crate::trace_cli::{current_supplementary_groups, trace_drop_credentials};
@@ -252,7 +252,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             mount,
             name,
             rm,
-            publish: _,
+            publish,
             pid,
             detach,
             forward_env,
@@ -267,6 +267,10 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     unsafe { std::env::set_var(k, v) };
                 }
             }
+            // Reject `-p` maps that can't work under host-only networking
+            // (port remap / random host port) before doing any work — hybrid policy.
+            validate_publish(&publish)?;
+
             let mut env_overrides = env.clone();
             // `--env-file` may repeat (docker allows it); later files win.
             for file_path in &env_file {
