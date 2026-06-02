@@ -565,6 +565,21 @@ fn proc_self_fd_link(path: &str) -> Option<i32> {
         .flatten()
 }
 
+/// True iff `path` is `/proc/<self>/fdinfo` — the self process's fdinfo dir.
+fn proc_fdinfo_is_dir(path: &str) -> bool {
+    matches!(proc_pid_subpath(path), Some((true, "fdinfo")))
+}
+
+/// True iff `path` is `/proc/<self>/fdinfo/N` — a per-fd info FILE (its contents
+/// are rendered dispatcher-side from the live fd table).
+fn proc_is_self_fdinfo_file(path: &str) -> bool {
+    let Some((true, rest)) = proc_pid_subpath(path) else {
+        return false;
+    };
+    rest.strip_prefix("fdinfo/")
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// Directory listing for a `/proc/<pid>/ns` directory (one symlink per ns type).
 fn proc_ns_dir_entries(path: &str) -> Option<Vec<DirEnt>> {
     if !proc_ns_is_dir(path) {
@@ -1044,7 +1059,7 @@ fn proc_pid_dir_entries(path: &str) -> Option<Vec<DirEnt>> {
     ];
     let files = if is_self {
         // Sub-directories and magic symlinks only the self dir fully serves.
-        for dir in ["fd", "ns", "net"] {
+        for dir in ["fd", "fdinfo", "ns", "net"] {
             entries.push(DirEnt {
                 name: dir.to_string(),
                 kind: EntryKind::Directory,
@@ -1114,6 +1129,7 @@ impl Vfs for ProcVfs {
             || proc_net_is_dir(path)
             || proc_ns_is_dir(path)
             || proc_fd_is_dir(path)
+            || proc_fdinfo_is_dir(path)
             || proc_task_dir_entries(path).is_some()
             || proc_pid_dir_entries(path).is_some()
         {
@@ -1132,6 +1148,19 @@ impl Vfs for ProcVfs {
         // so faccessat(F_OK)/`test -e` see the link exist.
         if let Some(size) = proc_magic_symlink_size(path) {
             return Ok(proc_symlink_metadata(size));
+        }
+        // /proc/self/fdinfo/N is a regular file (its contents are rendered
+        // dispatcher-side); report it so stat/`test -e`/opendir-then-stat work.
+        if proc_is_self_fdinfo_file(path) {
+            return Ok(Metadata {
+                kind: EntryKind::File,
+                mode: 0o400,
+                size: 0,
+                uid: 0,
+                gid: 0,
+                mtime_secs: 0,
+                mtime_nanos: 0,
+            });
         }
         if synthetic_file(path, &SyntheticProcContext::default()).is_some() {
             return Ok(Metadata {
@@ -1305,6 +1334,29 @@ impl Vfs for ProcVfs {
             entries.extend(ctx.open_fds.unwrap_or(&[]).iter().map(|fd| DirEnt {
                 name: fd.to_string(),
                 kind: EntryKind::Symlink,
+            }));
+            return Ok(VfsHandle::Directory {
+                path: path.to_string(),
+                entries,
+                status_flags: 0,
+            });
+        }
+        // `/proc/self/fdinfo`: one regular-FILE entry per open fd (the per-fd
+        // contents are rendered dispatcher-side at open of fdinfo/N).
+        if proc_fdinfo_is_dir(path) {
+            let mut entries = vec![
+                DirEnt {
+                    name: ".".to_string(),
+                    kind: EntryKind::Directory,
+                },
+                DirEnt {
+                    name: "..".to_string(),
+                    kind: EntryKind::Directory,
+                },
+            ];
+            entries.extend(ctx.open_fds.unwrap_or(&[]).iter().map(|fd| DirEnt {
+                name: fd.to_string(),
+                kind: EntryKind::File,
             }));
             return Ok(VfsHandle::Directory {
                 path: path.to_string(),
@@ -2843,6 +2895,48 @@ mod tests {
         }
         // A foreign / non-existent pid's fd dir is not reachable.
         assert!(v.lookup("/proc/999999/fd").is_err());
+    }
+
+    #[test]
+    fn self_fdinfo_dir_lists_open_fds_as_files() {
+        let v = ProcVfs::new();
+        assert_eq!(
+            v.lookup("/proc/self/fdinfo").unwrap().kind,
+            EntryKind::Directory
+        );
+        // fdinfo/N is a regular FILE (contents rendered dispatcher-side).
+        assert_eq!(
+            v.lookup("/proc/self/fdinfo/2").unwrap().kind,
+            EntryKind::File
+        );
+        let fds = [0i32, 1, 2, 9];
+        let ctx = OpenContext {
+            open_fds: Some(&fds),
+            ..Default::default()
+        };
+        let h = v
+            .open(
+                "/proc/self/fdinfo",
+                OpenFlags {
+                    read: true,
+                    directory: true,
+                    ..Default::default()
+                },
+                &ctx,
+            )
+            .unwrap();
+        match h {
+            VfsHandle::Directory { entries, .. } => {
+                let files: Vec<String> = entries
+                    .into_iter()
+                    .filter(|e| e.kind == EntryKind::File)
+                    .map(|e| e.name)
+                    .collect();
+                assert_eq!(files, vec!["0", "1", "2", "9"]);
+            }
+            _ => panic!("expected a Directory handle"),
+        }
+        assert!(v.lookup("/proc/999999/fdinfo").is_err());
     }
 
     #[test]
