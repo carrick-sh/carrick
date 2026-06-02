@@ -4085,6 +4085,10 @@ fn write_host_pipe(
                 );
             }
         }
+        // host_fd was forced O_NONBLOCK by set_host_nonblocking above; an EAGAIN
+        // here routes through would_block_outcome / wait_pipe_writable, which park
+        // with the dispatcher lock released. BLOCKING-IO-OK: non-blocking by
+        // construction, the lock is never held across a blocking write.
         let n = unsafe {
             libc::write(
                 host_fd,

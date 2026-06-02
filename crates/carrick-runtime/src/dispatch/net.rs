@@ -3490,6 +3490,9 @@ impl SyscallDispatcher {
                 hmsg.msg_control = hcontrol.as_mut_ptr() as *mut libc::c_void;
                 hmsg.msg_controllen = hcontrol.len() as _;
             }
+            // host_flags carries MSG_DONTWAIT and this runs inside blocking_io
+            // (host_fd is O_NONBLOCK; EAGAIN -> WaitOnFds with the dispatcher lock
+            // released), so this recvmsg never blocks under the lock.
             let n = unsafe { libc::recvmsg(host_fd, &mut hmsg as *mut _, host_flags) };
             let n = n.host_syscall_errno()?;
             // Stash any received fds (host-layout cmsg) for installation after
