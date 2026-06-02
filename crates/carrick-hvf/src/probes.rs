@@ -244,6 +244,37 @@ mod carrick_usdt {
     /// proves the PTE is wrong IN MEMORY (logic bug); a valid RW leaf proves the
     /// memory is fine and the faulting vCPU's TLB was stale (coherence bug).
     fn pt__fault__walk(_: u64, _: u64, _: u64, _: u64, _: u64) {}
+    /// Guest-memory copy mapping decision. `dir`: 0=guest->host read,
+    /// 1=host->guest internal write, 2=host->guest syscall checked write.
+    /// `addr`/`len` are the guest VA range. `stage1_ipa` is the live stage-1
+    /// output for `addr`, or `u64::MAX` if unmapped/non-high-VA. `mapping_start`
+    /// is the host mapping Carrick actually selected.
+    fn guest__mem__copy(_: u32, _: u64, _: u64, _: u64, _: u64) {}
+    /// Companion for `guest-mem-copy`: `mapping_start`, `mapping_end`, and
+    /// `mapping_ipa` for the selected region. Kept below five args because
+    /// macOS DTrace silently reports the sixth USDT argument as zero here.
+    fn guest__mem__region(_: u32, _: u64, _: u64, _: u64, _: u64) {}
+    /// Guest-memory copy content fingerprint. Same `dir`/`addr`/`len` as
+    /// `guest-mem-copy`; then a wrapping byte-sum plus little-endian first
+    /// eight bytes of the copied payload. This avoids DTrace reading guest VAs.
+    fn guest__mem__bytes(_: u32, _: u64, _: u64, _: u64, _: u64) {}
+    /// Companion for `guest-mem-bytes`: little-endian last eight bytes.
+    fn guest__mem__tail(_: u32, _: u64, _: u64, _: u64) {}
+    /// Stage-1 sample point inside a guest-memory copy range. Args are:
+    /// `dir`, sample guest VA, `sample_va - mapping_start`,
+    /// `stage1_ipa - mapping_ipa` or `u64::MAX`, and live stage-1 IPA.
+    fn guest__mem__point(_: u32, _: u64, _: u64, _: u64, _: u64) {}
+    /// Opt-in content fingerprint for a configured subrange inside a
+    /// guest-memory copy. Args are `dir`, base guest VA, subrange offset,
+    /// subrange length, and wrapping byte sum.
+    fn guest__mem__subrange(_: u32, _: u64, _: u64, _: u64, _: u64) {}
+    /// Companion for `guest-mem-subrange`: little-endian first and last eight
+    /// bytes of the configured subrange.
+    fn guest__mem__subedge(_: u32, _: u64, _: u64, _: u64, _: u64) {}
+    /// Companion for `guest-mem-subrange`: nonzero byte count for the
+    /// configured subrange. Kept separate because macOS DTrace drops a sixth
+    /// USDT argument at some probe sites.
+    fn guest__mem__subcount(_: u32, _: u64, _: u64, _: u64) {}
 }
 
 pub fn fork_pre(pc: u64, elr: u64, cpsr: u64) {
@@ -427,6 +458,194 @@ pub fn pt_fault_walk(far: u64, l0: u64, l1: u64, l2: u64, l3: u64) {
     carrick_usdt::pt__fault__walk!(|| (far, l0, l1, l2, l3));
 }
 
+pub mod guest_mem_dir {
+    pub const READ_GUEST: u32 = 0;
+    pub const WRITE_GUEST: u32 = 1;
+    pub const WRITE_GUEST_CHECKED: u32 = 2;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GuestMemProbeDigest {
+    checksum: u64,
+    nonzero: u64,
+    head: u64,
+    tail: u64,
+}
+
+fn guest_mem_probe_digest(bytes: &[u8]) -> GuestMemProbeDigest {
+    let checksum = bytes
+        .iter()
+        .fold(0u64, |sum, byte| sum.wrapping_add(u64::from(*byte)));
+    GuestMemProbeDigest {
+        checksum,
+        nonzero: bytes.iter().filter(|byte| **byte != 0).count() as u64,
+        head: guest_mem_probe_edge(bytes.iter().copied()),
+        tail: if bytes.len() <= 8 {
+            guest_mem_probe_edge(bytes.iter().copied())
+        } else {
+            guest_mem_probe_edge(bytes[bytes.len() - 8..].iter().copied())
+        },
+    }
+}
+
+fn guest_mem_probe_edge(bytes: impl IntoIterator<Item = u8>) -> u64 {
+    bytes
+        .into_iter()
+        .take(8)
+        .enumerate()
+        .fold(0u64, |word, (idx, byte)| {
+            word | (u64::from(byte) << (idx * 8))
+        })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GuestMemSubrangeConfig {
+    offset: usize,
+    length: usize,
+}
+
+fn guest_mem_subrange_config() -> Option<GuestMemSubrangeConfig> {
+    static CONFIG: std::sync::OnceLock<Option<GuestMemSubrangeConfig>> = std::sync::OnceLock::new();
+
+    *CONFIG.get_or_init(|| {
+        let offset = parse_guest_mem_probe_usize_env("CARRICK_GUEST_MEM_SUB_OFFSET")?;
+        let length = parse_guest_mem_probe_usize_env("CARRICK_GUEST_MEM_SUB_LEN")?;
+        (length != 0).then_some(GuestMemSubrangeConfig { offset, length })
+    })
+}
+
+fn parse_guest_mem_probe_usize_env(name: &str) -> Option<usize> {
+    let value = std::env::var(name).ok()?;
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if let Some(hex) = value.strip_prefix("0x") {
+        usize::from_str_radix(hex, 16).ok()
+    } else {
+        value.parse::<usize>().ok()
+    }
+}
+
+fn guest_mem_probe_subrange(
+    bytes: &[u8],
+    config: GuestMemSubrangeConfig,
+) -> Option<(u64, GuestMemProbeDigest)> {
+    let end = config.offset.checked_add(config.length)?;
+    let subrange = bytes.get(config.offset..end)?;
+    Some((config.offset as u64, guest_mem_probe_digest(subrange)))
+}
+
+pub fn guest_mem_probe_points(address: u64, length: usize) -> [Option<u64>; 5] {
+    if length == 0 {
+        return [None, None, None, None, None];
+    }
+
+    let length = length as u64;
+    let three_quarter_offset = (length / 4) * 3 + ((length % 4) * 3) / 4;
+    let candidates = [
+        Some(address),
+        address.checked_add(length / 4),
+        address.checked_add(length / 2),
+        address.checked_add(three_quarter_offset),
+        address.checked_add(length - 1),
+    ];
+    let mut points = [None, None, None, None, None];
+    let mut next = 0usize;
+    for candidate in candidates.into_iter().flatten() {
+        if points[..next].contains(&Some(candidate)) {
+            continue;
+        }
+        points[next] = Some(candidate);
+        next += 1;
+    }
+    points
+}
+
+pub fn guest_mem_copy(
+    direction: u32,
+    address: u64,
+    length: usize,
+    stage1_ipa: Option<u64>,
+    mapping_start: u64,
+    mapping_end: u64,
+    mapping_ipa: u64,
+) {
+    let stage1_ipa = stage1_ipa.unwrap_or(u64::MAX);
+    carrick_usdt::guest__mem__copy!(|| (
+        direction,
+        address,
+        length as u64,
+        stage1_ipa,
+        mapping_start
+    ));
+    carrick_usdt::guest__mem__region!(|| (
+        direction,
+        address,
+        mapping_start,
+        mapping_end,
+        mapping_ipa
+    ));
+}
+
+pub fn guest_mem_bytes(direction: u32, address: u64, bytes: &[u8]) {
+    carrick_usdt::guest__mem__bytes!(|| {
+        let digest = guest_mem_probe_digest(bytes);
+        (
+            direction,
+            address,
+            bytes.len() as u64,
+            digest.checksum,
+            digest.head,
+        )
+    });
+    carrick_usdt::guest__mem__tail!(|| (
+        direction,
+        address,
+        bytes.len() as u64,
+        guest_mem_probe_digest(bytes).tail
+    ));
+    if let Some(config) = guest_mem_subrange_config()
+        && let Some((offset, digest)) = guest_mem_probe_subrange(bytes, config)
+    {
+        carrick_usdt::guest__mem__subrange!(|| (
+            direction,
+            address,
+            offset,
+            config.length as u64,
+            digest.checksum,
+        ));
+        carrick_usdt::guest__mem__subedge!(|| (
+            direction,
+            address,
+            offset,
+            digest.head,
+            digest.tail,
+        ));
+        carrick_usdt::guest__mem__subcount!(|| (direction, address, offset, digest.nonzero));
+    }
+}
+
+pub fn guest_mem_point(
+    direction: u32,
+    address: u64,
+    stage1_ipa: Option<u64>,
+    mapping_start: u64,
+    mapping_ipa: u64,
+) {
+    let va_offset = address.wrapping_sub(mapping_start);
+    let ipa_offset = stage1_ipa
+        .map(|ipa| ipa.wrapping_sub(mapping_ipa))
+        .unwrap_or(u64::MAX);
+    carrick_usdt::guest__mem__point!(|| (
+        direction,
+        address,
+        va_offset,
+        ipa_offset,
+        stage1_ipa.unwrap_or(u64::MAX)
+    ));
+}
+
 // `#[inline(never)]`: usdt embeds the probe site (an asm! anchor) in
 // the function body. If this gets inlined into multiple callers, each
 // copy becomes a SEPARATE DTrace probe site that fires independently
@@ -555,4 +774,87 @@ fn fire_usdt(event: &CompatEvent) {
 #[allow(dead_code)]
 fn _assert_args_are_serializable(args: &SyscallArgs) -> &SyscallArgs {
     args
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn guest_mem_probe_digest_reports_wrapping_sum_and_edges() {
+        let bytes = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0xf0, 0xe0, 0xd0, 0xc0, 0xb0, 0xa0,
+            0x90, 0x80,
+        ];
+
+        let digest = super::guest_mem_probe_digest(&bytes);
+
+        assert_eq!(digest.checksum, 0x5e4);
+        assert_eq!(digest.nonzero, 16);
+        assert_eq!(digest.head, 0x0807_0605_0403_0201);
+        assert_eq!(digest.tail, 0x8090_a0b0_c0d0_e0f0);
+    }
+
+    #[test]
+    fn guest_mem_probe_digest_zero_pads_short_edges() {
+        let digest = super::guest_mem_probe_digest(&[0xaa, 0xbb, 0xcc]);
+
+        assert_eq!(digest.checksum, 0x231);
+        assert_eq!(digest.nonzero, 3);
+        assert_eq!(digest.head, 0x00cc_bbaa);
+        assert_eq!(digest.tail, 0x00cc_bbaa);
+    }
+
+    #[test]
+    fn guest_mem_probe_subrange_reports_exact_window_digest() {
+        let bytes = [0xaa, 0x00, 0xbb, 0xcc, 0x00, 0xdd];
+
+        let (_, digest) = super::guest_mem_probe_subrange(
+            &bytes,
+            super::GuestMemSubrangeConfig {
+                offset: 1,
+                length: 4,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(digest.checksum, 0x187);
+        assert_eq!(digest.nonzero, 2);
+        assert_eq!(digest.head, 0x00cc_bb00);
+        assert_eq!(digest.tail, 0x00cc_bb00);
+    }
+
+    #[test]
+    fn guest_mem_probe_points_cover_quarters_and_last_byte_without_duplicates() {
+        assert_eq!(
+            super::guest_mem_probe_points(0x1000, 0),
+            [None, None, None, None, None]
+        );
+        assert_eq!(
+            super::guest_mem_probe_points(0x1000, 1),
+            [Some(0x1000), None, None, None, None]
+        );
+        assert_eq!(
+            super::guest_mem_probe_points(0x1000, 2),
+            [Some(0x1000), Some(0x1001), None, None, None]
+        );
+        assert_eq!(
+            super::guest_mem_probe_points(0x4590, 8192),
+            [
+                Some(0x4590),
+                Some(0x4d90),
+                Some(0x5590),
+                Some(0x5d90),
+                Some(0x658f)
+            ]
+        );
+    }
+
+    #[test]
+    fn guest_mem_probe_points_sample_inside_large_range_quarters() {
+        let points = super::guest_mem_probe_points(0x4590, 8192);
+
+        assert!(
+            points.contains(&Some(0x5d90)),
+            "expected 75% sample point in {points:?}"
+        );
+    }
 }

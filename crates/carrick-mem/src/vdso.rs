@@ -76,12 +76,18 @@ const GETRANDOM_BLOB: &[u8] = include_bytes!("vdso_getrandom_blob.bin");
 const SYM_CLOCK_GETTIME: u64 = 0x00;
 const SYM_GETTIMEOFDAY: u64 = 0x84;
 const SYM_CLOCK_GETRES: u64 = 0xdc;
+const SYM_CLOCK_GETTIME_SYSCALL: u64 = 0x28;
+const SYM_CLOCK_GETRES_SYSCALL: u64 = 0xfc;
 // rt_sigreturn is the trailing 8 bytes of VDSO_CODE; getrandom is the blob
 // appended right after. Derive offsets from the lengths so they stay correct.
 const RT_SIGRETURN_LEN: u64 = 8;
 const SYM_RT_SIGRETURN: u64 = VDSO_CODE.len() as u64 - RT_SIGRETURN_LEN;
-const SYM_GETRANDOM: u64 = VDSO_CODE.len() as u64;
 const GETRANDOM_LEN: u64 = GETRANDOM_BLOB.len() as u64;
+const GETTIMEOFDAY_SYSCALL_STUB: &[u8] = &[
+    0x28, 0x15, 0x80, 0xd2, // mov x8, #169 (__NR_gettimeofday)
+    0x01, 0x00, 0x00, 0xd4, // svc #0
+    0xc0, 0x03, 0x5f, 0xd6, // ret
+];
 
 const EM_AARCH64: u16 = 183;
 const ET_DYN: u16 = 3;
@@ -110,19 +116,49 @@ fn align_up(n: usize, a: usize) -> usize {
 /// `d_val`/`st_value` are file offsets, valid because the single PT_LOAD has
 /// `p_vaddr == p_offset == 0`, so Go's `loadOffset` is exactly the load base.
 pub fn vdso_image_bytes() -> Vec<u8> {
+    vdso_image_bytes_with_symbols(true, true, false)
+}
+
+pub fn vdso_image_bytes_without_getrandom() -> Vec<u8> {
+    vdso_image_bytes_with_symbols(true, false, false)
+}
+
+pub fn vdso_image_bytes_without_fastpaths() -> Vec<u8> {
+    vdso_image_bytes_with_symbols(false, false, false)
+}
+
+pub fn vdso_image_bytes_with_clock_syscalls() -> Vec<u8> {
+    vdso_image_bytes_with_symbols(true, true, true)
+}
+
+fn vdso_image_bytes_with_symbols(
+    include_clock: bool,
+    include_getrandom: bool,
+    clock_syscall_only: bool,
+) -> Vec<u8> {
     // ---- string table ----
     let mut dynstr = Vec::new();
     dynstr.push(0u8);
-    let name_gettime = dynstr.len() as u32;
-    dynstr.extend_from_slice(b"__kernel_clock_gettime\0");
-    let name_gtod = dynstr.len() as u32;
-    dynstr.extend_from_slice(b"__kernel_gettimeofday\0");
-    let name_getres = dynstr.len() as u32;
-    dynstr.extend_from_slice(b"__kernel_clock_getres\0");
+    let (name_gettime, name_gtod, name_getres) = if include_clock {
+        let name_gettime = dynstr.len() as u32;
+        dynstr.extend_from_slice(b"__kernel_clock_gettime\0");
+        let name_gtod = dynstr.len() as u32;
+        dynstr.extend_from_slice(b"__kernel_gettimeofday\0");
+        let name_getres = dynstr.len() as u32;
+        dynstr.extend_from_slice(b"__kernel_clock_getres\0");
+        (Some(name_gettime), Some(name_gtod), Some(name_getres))
+    } else {
+        (None, None, None)
+    };
     let name_rt_sigreturn = dynstr.len() as u32;
     dynstr.extend_from_slice(b"__kernel_rt_sigreturn\0");
-    let name_getrandom = dynstr.len() as u32;
-    dynstr.extend_from_slice(b"__kernel_getrandom\0");
+    let name_getrandom = if include_getrandom {
+        let offset = dynstr.len() as u32;
+        dynstr.extend_from_slice(b"__kernel_getrandom\0");
+        Some(offset)
+    } else {
+        None
+    };
     let name_version = dynstr.len() as u32;
     dynstr.extend_from_slice(b"LINUX_2.6.39\0");
 
@@ -131,18 +167,25 @@ pub fn vdso_image_bytes() -> Vec<u8> {
     const PHENT: usize = 56;
     const NPH: usize = 2;
     const SYMENT: usize = 24;
-    const NSYM: usize = 6; // undef + 5 funcs (3 clock + rt_sigreturn + getrandom)
+    let nsym: usize =
+        1 + if include_clock { 3 } else { 0 } + 1 + if include_getrandom { 1 } else { 0 };
 
     let off_phdr = EHDR;
     let off_dynsym = off_phdr + NPH * PHENT;
-    let off_dynstr = off_dynsym + NSYM * SYMENT;
+    let off_dynstr = off_dynsym + nsym * SYMENT;
     let off_hash = align_up(off_dynstr + dynstr.len(), 4);
-    // SysV hash: nbucket=1, nchain=6; bucket=[1]; chain=[0,2,3,4,5,0]. nbucket=1
-    // funnels every name to bucket 0, so lookup walks the chain 1->2->3->4->5->end.
-    let hash: [u32; 9] = [1, 6, 1, 0, 2, 3, 4, 5, 0];
+    // SysV hash: nbucket=1 funnels every name to bucket 0, so lookup walks the
+    // chain 1->2->...->end.
+    let mut hash = Vec::with_capacity(nsym + 3);
+    hash.extend_from_slice(&[1, nsym as u32, 1, 0]);
+    for idx in 2..nsym {
+        hash.push(idx as u32);
+    }
+    hash.push(0);
     let off_versym = off_hash + hash.len() * 4;
     // versym: one u16 per dynsym entry; funcs use version index 1.
-    let versym: [u16; 6] = [0, 1, 1, 1, 1, 1];
+    let mut versym = vec![1u16; nsym];
+    versym[0] = 0;
     let off_verdef = align_up(off_versym + versym.len() * 2, 4);
     const VERDEF_SZ: usize = 20 + 8; // elfVerdef + elfVerdaux
     let off_dyn = align_up(off_verdef + VERDEF_SZ, 8);
@@ -160,7 +203,18 @@ pub fn vdso_image_bytes() -> Vec<u8> {
     ];
     let off_dyn_end = off_dyn + dyn_entries.len() * 16;
     let off_code = align_up(off_dyn_end, 16);
-    let off_code_end = off_code + VDSO_CODE.len() + GETRANDOM_BLOB.len();
+    let extra_code = if clock_syscall_only {
+        GETTIMEOFDAY_SYSCALL_STUB
+    } else {
+        &[]
+    };
+    let getrandom_len = if include_getrandom {
+        GETRANDOM_BLOB.len()
+    } else {
+        0
+    };
+    let getrandom_code_offset = VDSO_CODE.len() + extra_code.len();
+    let off_code_end = off_code + getrandom_code_offset + getrandom_len;
 
     // ---- section-header string table + section headers ----
     // glibc/Go resolve vDSO symbols from PT_DYNAMIC and never need sections, so
@@ -240,53 +294,91 @@ pub fn vdso_image_bytes() -> Vec<u8> {
             w64(buf, o + 16, size); // st_size
         };
     sym(&mut buf, 0, 0, 0, 0, 0, 0); // STN_UNDEF
-    sym(
-        &mut buf,
-        1,
-        name_gettime,
-        off_code as u64 + SYM_CLOCK_GETTIME,
-        SYM_GETTIMEOFDAY - SYM_CLOCK_GETTIME,
-        STB_GLOBAL_FUNC,
-        1,
-    );
-    sym(
-        &mut buf,
-        2,
-        name_gtod,
-        off_code as u64 + SYM_GETTIMEOFDAY,
-        SYM_CLOCK_GETRES - SYM_GETTIMEOFDAY,
-        STB_GLOBAL_FUNC,
-        1,
-    );
-    sym(
-        &mut buf,
-        3,
-        name_getres,
-        off_code as u64 + SYM_CLOCK_GETRES,
-        SYM_RT_SIGRETURN - SYM_CLOCK_GETRES,
-        STB_GLOBAL_FUNC,
-        1,
-    );
+    let mut sym_idx = 1usize;
+    if let (Some(name_gettime), Some(name_gtod), Some(name_getres)) =
+        (name_gettime, name_gtod, name_getres)
+    {
+        sym(
+            &mut buf,
+            sym_idx,
+            name_gettime,
+            off_code as u64
+                + if clock_syscall_only {
+                    SYM_CLOCK_GETTIME_SYSCALL
+                } else {
+                    SYM_CLOCK_GETTIME
+                },
+            if clock_syscall_only {
+                12
+            } else {
+                SYM_GETTIMEOFDAY - SYM_CLOCK_GETTIME
+            },
+            STB_GLOBAL_FUNC,
+            1,
+        );
+        sym_idx += 1;
+        sym(
+            &mut buf,
+            sym_idx,
+            name_gtod,
+            off_code as u64
+                + if clock_syscall_only {
+                    VDSO_CODE.len() as u64
+                } else {
+                    SYM_GETTIMEOFDAY
+                },
+            if clock_syscall_only {
+                GETTIMEOFDAY_SYSCALL_STUB.len() as u64
+            } else {
+                SYM_CLOCK_GETRES - SYM_GETTIMEOFDAY
+            },
+            STB_GLOBAL_FUNC,
+            1,
+        );
+        sym_idx += 1;
+        sym(
+            &mut buf,
+            sym_idx,
+            name_getres,
+            off_code as u64
+                + if clock_syscall_only {
+                    SYM_CLOCK_GETRES_SYSCALL
+                } else {
+                    SYM_CLOCK_GETRES
+                },
+            if clock_syscall_only {
+                12
+            } else {
+                SYM_RT_SIGRETURN - SYM_CLOCK_GETRES
+            },
+            STB_GLOBAL_FUNC,
+            1,
+        );
+        sym_idx += 1;
+    }
     // Linux marks __kernel_rt_sigreturn STT_NOTYPE; match it exactly.
     sym(
         &mut buf,
-        4,
+        sym_idx,
         name_rt_sigreturn,
         off_code as u64 + SYM_RT_SIGRETURN,
         RT_SIGRETURN_LEN,
         STB_GLOBAL_NOTYPE,
         1,
     );
-    // __kernel_getrandom — a real STT_FUNC like the clock symbols.
-    sym(
-        &mut buf,
-        5,
-        name_getrandom,
-        off_code as u64 + SYM_GETRANDOM,
-        GETRANDOM_LEN,
-        STB_GLOBAL_FUNC,
-        1,
-    );
+    sym_idx += 1;
+    if let Some(name_getrandom) = name_getrandom {
+        // __kernel_getrandom — a real STT_FUNC like the clock symbols.
+        sym(
+            &mut buf,
+            sym_idx,
+            name_getrandom,
+            off_code as u64 + getrandom_code_offset as u64,
+            GETRANDOM_LEN,
+            STB_GLOBAL_FUNC,
+            1,
+        );
+    }
 
     // ---- .dynstr ----
     buf[off_dynstr..off_dynstr + dynstr.len()].copy_from_slice(&dynstr);
@@ -322,9 +414,14 @@ pub fn vdso_image_bytes() -> Vec<u8> {
 
     // ---- code ----
     buf[off_code..off_code + VDSO_CODE.len()].copy_from_slice(VDSO_CODE);
-    // __kernel_getrandom blob, immediately after the hand-asm code (SYM_GETRANDOM).
-    let off_blob = off_code + VDSO_CODE.len();
-    buf[off_blob..off_blob + GETRANDOM_BLOB.len()].copy_from_slice(GETRANDOM_BLOB);
+    let off_extra = off_code + VDSO_CODE.len();
+    buf[off_extra..off_extra + extra_code.len()].copy_from_slice(extra_code);
+    if include_getrandom {
+        // __kernel_getrandom blob, immediately after the hand-asm code
+        // (SYM_GETRANDOM).
+        let off_blob = off_code + getrandom_code_offset;
+        buf[off_blob..off_blob + GETRANDOM_BLOB.len()].copy_from_slice(GETRANDOM_BLOB);
+    }
 
     // ---- .shstrtab ----
     buf[off_shstrtab..off_shstrtab + shstr.len()].copy_from_slice(&shstr);
@@ -366,7 +463,7 @@ pub fn vdso_image_bytes() -> Vec<u8> {
         SHT_DYNSYM,
         SHF_ALLOC,
         off_dynsym as u64,
-        (NSYM * SYMENT) as u64,
+        (nsym * SYMENT) as u64,
         2,
         1,
         8,
@@ -524,6 +621,94 @@ mod tests {
         assert!(
             has_svc,
             "blob must contain `svc #0` (reseed/fallback syscall)"
+        );
+    }
+
+    #[test]
+    fn vdso_image_can_omit_getrandom_export_for_rosetta_debugging() {
+        let img = vdso_image_bytes_without_getrandom();
+        let elf = goblin::elf::Elf::parse(&img).expect("vDSO must remain valid");
+
+        assert!(
+            elf.dynsyms
+                .iter()
+                .all(|s| elf.dynstrtab.get_at(s.st_name) != Some("__kernel_getrandom")),
+            "__kernel_getrandom should not be exported"
+        );
+        for want in [
+            "__kernel_clock_gettime",
+            "__kernel_gettimeofday",
+            "__kernel_clock_getres",
+            "__kernel_rt_sigreturn",
+        ] {
+            assert!(
+                elf.dynsyms
+                    .iter()
+                    .any(|s| elf.dynstrtab.get_at(s.st_name) == Some(want)),
+                "{want} should remain exported"
+            );
+        }
+    }
+
+    #[test]
+    fn vdso_image_can_omit_fastpath_exports_for_rosetta_debugging() {
+        let img = vdso_image_bytes_without_fastpaths();
+        let elf = goblin::elf::Elf::parse(&img).expect("vDSO must remain valid");
+
+        for dropped in [
+            "__kernel_clock_gettime",
+            "__kernel_gettimeofday",
+            "__kernel_clock_getres",
+            "__kernel_getrandom",
+        ] {
+            assert!(
+                elf.dynsyms
+                    .iter()
+                    .all(|s| elf.dynstrtab.get_at(s.st_name) != Some(dropped)),
+                "{dropped} should not be exported"
+            );
+        }
+        assert!(
+            elf.dynsyms
+                .iter()
+                .any(|s| elf.dynstrtab.get_at(s.st_name) == Some("__kernel_rt_sigreturn")),
+            "__kernel_rt_sigreturn should remain exported"
+        );
+    }
+
+    #[test]
+    fn vdso_image_can_route_clock_exports_to_syscalls_for_rosetta_debugging() {
+        let img = vdso_image_bytes_with_clock_syscalls();
+        let elf = goblin::elf::Elf::parse(&img).expect("vDSO must remain valid");
+
+        for (name, expected) in [
+            (
+                "__kernel_clock_gettime",
+                [0x28, 0x0e, 0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4],
+            ),
+            (
+                "__kernel_gettimeofday",
+                [0x28, 0x15, 0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4],
+            ),
+            (
+                "__kernel_clock_getres",
+                [0x48, 0x0e, 0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4],
+            ),
+        ] {
+            let sym = elf
+                .dynsyms
+                .iter()
+                .find(|s| elf.dynstrtab.get_at(s.st_name) == Some(name))
+                .unwrap_or_else(|| panic!("{name} should remain exported"));
+            let off = sym.st_value as usize;
+            assert_eq!(&img[off..off + expected.len()], &expected, "{name}");
+        }
+
+        assert!(
+            elf.dynsyms
+                .iter()
+                .any(|s| elf.dynstrtab.get_at(s.st_name) == Some("__kernel_getrandom")),
+            "__kernel_getrandom should remain exported in clock-syscalls mode"
         );
     }
 }

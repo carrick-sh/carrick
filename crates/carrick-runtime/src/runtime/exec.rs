@@ -52,10 +52,11 @@ pub(super) fn load_execve_image(
     })
     .map_err(|_| LINUX_ENOENT)?;
     let image = raw
+        .with_vdso_auxv(vdso_enabled_for_debug())
         .with_el0_trampoline()
         .and_then(|a| a.with_el1_vectors())
         .and_then(|a| a.with_stage1_page_tables())
-        .and_then(|a| a.with_vdso())
+        .and_then(with_optional_vdso)
         .and_then(|a| a.with_linux_initial_stack(argv, env))
         .map_err(|_| LINUX_ENOENT)?;
     // execve point of no return (image fully built): reset CAUGHT signal

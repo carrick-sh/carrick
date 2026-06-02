@@ -137,12 +137,12 @@ const AARCH64_MOV_X8_RT_SIGRETURN_OPCODE: u32 = 0xd280_1168;
 const AARCH64_SVC0_OPCODE: u32 = 0xd400_0001;
 // AArch64 `nop` opcode, used as trampoline page padding.
 const AARCH64_NOP_OPCODE: u32 = 0xd503_201f;
-// AArch64 `tlbi vmalle1` — invalidate all stage-1 TLB entries for the
-// current EL & inner-shareable domain. Required after the host flips
+// AArch64 `tlbi vmalle1is` — invalidate all stage-1 TLB entries for the
+// current EL in the inner-shareable domain. Required after the host flips
 // SCTLR_EL1.M from 0 to 1 via `set_sys_reg` because the guest never
 // executed the MSR itself, so the TLB may contain stale identity
 // translations from the pre-MMU bootstrap.
-const AARCH64_TLBI_VMALLE1_OPCODE: u32 = 0xd508_871f;
+const AARCH64_TLBI_VMALLE1IS_OPCODE: u32 = 0xd508_831f;
 // AArch64 `ic ialluis` — invalidate instruction cache, all entries,
 // inner-shareable. Same reason: instruction fetches after enabling
 // stage-1 must see fresh translations, not pre-MMU cached lines.
@@ -531,6 +531,15 @@ impl AddressSpace {
         &self.linux_auxv_image
     }
 
+    pub fn with_vdso_auxv(mut self, enabled: bool) -> Self {
+        if !enabled {
+            self.linux_auxv
+                .retain(|entry| entry.a_type != crate::linux_abi::LINUX_AT_SYSINFO_EHDR);
+            self.linux_auxv_image.clear();
+        }
+        self
+    }
+
     pub fn entry(&self) -> u64 {
         self.entry
     }
@@ -720,6 +729,22 @@ impl AddressSpace {
     /// guest's libc/Go resolve `__kernel_clock_gettime` from. `AT_SYSINFO_EHDR`
     /// (added in `linux_auxv_from_load_plan`) points the guest at the ELF.
     pub fn with_vdso(self) -> Result<Self, AddressSpaceError> {
+        self.with_vdso_bytes(crate::vdso::vdso_image_bytes())
+    }
+
+    pub fn with_vdso_without_getrandom(self) -> Result<Self, AddressSpaceError> {
+        self.with_vdso_bytes(crate::vdso::vdso_image_bytes_without_getrandom())
+    }
+
+    pub fn with_vdso_without_fastpaths(self) -> Result<Self, AddressSpaceError> {
+        self.with_vdso_bytes(crate::vdso::vdso_image_bytes_without_fastpaths())
+    }
+
+    pub fn with_vdso_clock_syscalls(self) -> Result<Self, AddressSpaceError> {
+        self.with_vdso_bytes(crate::vdso::vdso_image_bytes_with_clock_syscalls())
+    }
+
+    fn with_vdso_bytes(self, mut vdso_bytes: Vec<u8>) -> Result<Self, AddressSpaceError> {
         let vvar = MemoryRegion {
             start: crate::vdso::LINUX_VVAR_BASE,
             end: crate::vdso::LINUX_VVAR_BASE + crate::vdso::LINUX_VVAR_SIZE,
@@ -731,7 +756,6 @@ impl AddressSpace {
             shared: false,
             bytes: vec![0u8; crate::vdso::LINUX_VVAR_SIZE as usize],
         };
-        let mut vdso_bytes = crate::vdso::vdso_image_bytes();
         vdso_bytes.resize(crate::vdso::LINUX_VDSO_SIZE as usize, 0);
         let vdso = MemoryRegion {
             start: crate::vdso::LINUX_VDSO_BASE,
@@ -1404,7 +1428,7 @@ pub fn el0_trampoline_bytes() -> Vec<u8> {
     //   eret            — drop to EL0 at the user entry
     let mut offset = 0;
     for opcode in [
-        AARCH64_TLBI_VMALLE1_OPCODE,
+        AARCH64_TLBI_VMALLE1IS_OPCODE,
         AARCH64_DSB_SY_OPCODE,
         AARCH64_IC_IALLUIS_OPCODE,
         AARCH64_DSB_SY_OPCODE,
@@ -1435,11 +1459,11 @@ pub fn el1_maintenance_bytes() -> Vec<u8> {
     let mut bytes = vec![0_u8; size];
     let mut offset = 0;
     for opcode in [
-        AARCH64_DSB_SY_OPCODE,       // make prior descriptor stores observable
-        AARCH64_TLBI_VMALLE1_OPCODE, // drop all stage-1 TLB entries (IS)
-        AARCH64_DSB_SY_OPCODE,       // make the invalidation observable
-        AARCH64_ISB_OPCODE,          // resynchronise translation
-        AARCH64_HVC1_OPCODE,         // trap back to host: maintenance complete
+        AARCH64_DSB_SY_OPCODE,         // make prior descriptor stores observable
+        AARCH64_TLBI_VMALLE1IS_OPCODE, // drop all stage-1 TLB entries (IS)
+        AARCH64_DSB_SY_OPCODE,         // make the invalidation observable
+        AARCH64_ISB_OPCODE,            // resynchronise translation
+        AARCH64_HVC1_OPCODE,           // trap back to host: maintenance complete
     ] {
         let bytes_le = opcode.to_le_bytes();
         bytes[offset..offset + bytes_le.len()].copy_from_slice(&bytes_le);
@@ -1620,6 +1644,14 @@ fn linux_auxv_from_load_plan(
     plan: &LoadPlan,
     interpreter_base: Option<u64>,
 ) -> Vec<LinuxAuxvEntry> {
+    linux_auxv_from_load_plan_with_vdso(plan, interpreter_base, true)
+}
+
+fn linux_auxv_from_load_plan_with_vdso(
+    plan: &LoadPlan,
+    interpreter_base: Option<u64>,
+    include_vdso: bool,
+) -> Vec<LinuxAuxvEntry> {
     let mut auxv = Vec::new();
     if let Some(phdr) = plan.program_header_address {
         auxv.push(LinuxAuxvEntry::new(LINUX_AT_PHDR, phdr));
@@ -1653,13 +1685,16 @@ fn linux_auxv_from_load_plan(
     // (FP, ASIMD, AES, PMULL, SHA1, SHA2, CRC32, ATOMICS).
     auxv.push(LinuxAuxvEntry::new(LINUX_AT_HWCAP, 0x1fb));
     auxv.push(LinuxAuxvEntry::new(LINUX_AT_HWCAP2, 0));
-    // Point the guest at carrick's vDSO so libc/Go resolve __kernel_clock_gettime
-    // and read the clock in userspace (CNTVCT_EL0) instead of trapping out per
-    // call. The vvar+vdso pages are appended by `with_vdso`.
-    auxv.push(LinuxAuxvEntry::new(
-        crate::linux_abi::LINUX_AT_SYSINFO_EHDR,
-        crate::vdso::LINUX_VDSO_BASE,
-    ));
+    if include_vdso {
+        // Point the guest at carrick's vDSO so libc/Go resolve
+        // __kernel_clock_gettime and read the clock in userspace (CNTVCT_EL0)
+        // instead of trapping out per call. The vvar+vdso pages are appended by
+        // `with_vdso`.
+        auxv.push(LinuxAuxvEntry::new(
+            crate::linux_abi::LINUX_AT_SYSINFO_EHDR,
+            crate::vdso::LINUX_VDSO_BASE,
+        ));
+    }
     // Sentinel addresses for AT_RANDOM, AT_PLATFORM, AT_EXECFN — the
     // actual stack offsets get patched in by `build_linux_initial_stack`
     // once it has placed the backing bytes on the stack. Using 0 here
@@ -1852,6 +1887,29 @@ mod loader_tests {
         fill_random_bytes(&mut bytes).unwrap();
 
         assert_ne!(bytes, [0u8; 16]);
+    }
+
+    #[test]
+    fn linux_auxv_can_omit_sysinfo_ehdr_for_vdso_debug_control() {
+        let plan = LoadPlan {
+            entry: 0x400000,
+            interpreter: None,
+            program_header_address: None,
+            program_header_entry_size: 56,
+            program_header_count: 0,
+            load_bias: 0,
+            e_type: ElfType::Exec,
+            segments: Vec::new(),
+        };
+
+        let auxv = linux_auxv_from_load_plan_with_vdso(&plan, None, false);
+
+        assert!(
+            !auxv
+                .iter()
+                .any(|entry| entry.a_type == crate::linux_abi::LINUX_AT_SYSINFO_EHDR),
+            "AT_SYSINFO_EHDR should be absent when vDSO is disabled"
+        );
     }
 
     #[test]
@@ -2105,7 +2163,8 @@ mod stage1_tests {
             u32::from_le_bytes(a)
         };
         assert_eq!(op(0), AARCH64_DSB_SY_OPCODE);
-        assert_eq!(op(1), AARCH64_TLBI_VMALLE1_OPCODE);
+        assert_eq!(op(1), AARCH64_TLBI_VMALLE1IS_OPCODE);
+        assert_eq!(AARCH64_TLBI_VMALLE1IS_OPCODE, 0xd508_831f); // tlbi vmalle1is
         assert_eq!(op(2), AARCH64_DSB_SY_OPCODE);
         assert_eq!(op(3), AARCH64_ISB_OPCODE);
         assert_eq!(op(4), AARCH64_HVC1_OPCODE);
