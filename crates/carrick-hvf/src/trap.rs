@@ -2406,8 +2406,14 @@ impl HvfInner {
 
     fn mapping_for_range(&self, address: u64, length: usize) -> Option<&HvfMappedRegion> {
         let address = strip_pointer_tag(address);
+        // Search NEWEST-first: a MAP_FIXED mmap overlaying an earlier mapping
+        // pushes a new region without removing the old one, and the guest's
+        // stage-1 points to the LAST mapping (the overlay wins). Returning the
+        // first match would read a stale/zeroed older backing while the guest
+        // wrote to the new one (the Rosetta amd64 heap-read-zeros bug).
         self.mappings
             .iter()
+            .rev()
             .find(|mapping| mapping.contains_range(address, length))
     }
 
@@ -2417,8 +2423,10 @@ impl HvfInner {
         length: usize,
     ) -> Option<&mut HvfMappedRegion> {
         let address = strip_pointer_tag(address);
+        // Newest-first (see mapping_for_range): the overlay wins.
         self.mappings
             .iter_mut()
+            .rev()
             .find(|mapping| mapping.contains_range(address, length))
     }
 
