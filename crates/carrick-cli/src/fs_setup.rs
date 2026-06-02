@@ -147,6 +147,13 @@ fn seed_guest_baseline(backend: &mut dyn FsBackend) {
         }
     }
     let _ = backend.set_file_contents("/etc/hosts", hosts_content.into_bytes());
+    // /etc/hostname must agree with uname(2)/gethostname()/proc — overwrite the
+    // image's build-time value (e.g. `debuerreotype`) with the runtime guest
+    // hostname, like Docker writes the container hostname at create.
+    let _ = backend.set_file_contents(
+        "/etc/hostname",
+        format!("{}\n", carrick_runtime::execute::guest_hostname()).into_bytes(),
+    );
 }
 
 /// Default backend choice: prefer `host` because that's the secure-
