@@ -402,11 +402,13 @@ impl SyscallDispatcher {
                     }
                 };
                 if let Some(dup_fd) = dup_fd {
-                    // hv_vm_map needs 16 KiB-granular size/IPA; reserve the IPA
-                    // in 2 MiB blocks so no two file mappings share a stage-1
-                    // block (the existing high-VA anon path does the same).
+                    // Reserve the IPA in 2 MiB blocks so no two file mappings
+                    // share a stage-1 block. The stage-1 mapping covers EXACTLY
+                    // the guest's page-aligned `length`; map_host_alias rounds
+                    // the host/hv_vm_map size up to the 16 KiB HVF granule, so a
+                    // sub-16 KiB mapping never spills extra guest pages into a
+                    // neighbouring region (the high-VA anon path does the same).
                     const TWO_MIB: u64 = 1 << 21;
-                    let map_len = align_up_u64(length, hvf_page).unwrap_or(length);
                     let alias_len = align_up_u64(length, TWO_MIB).unwrap_or(length);
                     let ipa = {
                         let mut mem = this.mem.lock();
@@ -454,7 +456,7 @@ impl SyscallDispatcher {
                     return Ok(DispatchOutcome::MapHostAlias {
                         va,
                         ipa,
-                        len: map_len,
+                        len: length,
                         payload: Vec::new(),
                         file: Some((dup_fd, offset as libc::off_t, host_prot)),
                     });
@@ -573,11 +575,15 @@ impl SyscallDispatcher {
                     }
                     return Ok(LINUX_ENOMEM.into());
                 }
-                // hv_vm_map needs a 16 KiB-granular VA length; reserve the IPA in
-                // 2 MiB blocks so no two aliases share a stage-1 block (the
-                // file-backed high-VA path does the same).
+                // Reserve the IPA in 2 MiB blocks so no two aliases share a
+                // stage-1 block. NOTE: the stage-1 mapping must cover EXACTLY the
+                // guest's page-aligned `length`, NOT a 16 KiB-rounded length — a
+                // sub-16 KiB mmap rounded up to the HVF granule would map extra
+                // 4 KiB guest pages and clobber the next region's page-table
+                // entries (redirecting its fetches to the wrong IPA). hv_vm_map's
+                // own 16 KiB IPA-size requirement is satisfied separately inside
+                // map_host_alias via the (page-rounded) host mapping length.
                 const TWO_MIB: u64 = 1 << 21;
-                let map_len = align_up_u64(length, hvf_page).unwrap_or(length);
                 let alias_len = align_up_u64(length, TWO_MIB).unwrap_or(length);
                 let ipa = {
                     let mut mem = this.mem.lock();
@@ -603,7 +609,7 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::MapHostAlias {
                     va: address,
                     ipa,
-                    len: map_len,
+                    len: length,
                     payload: bytes,
                     file: None,
                 });
