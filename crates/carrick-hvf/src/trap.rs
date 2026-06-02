@@ -2139,6 +2139,26 @@ impl HvfInner {
         Ok(())
     }
 
+    /// Zero the PHYSICAL backing of `[address, address+length)`, bypassing BOTH
+    /// the `range_no_access` and the writability checks (see
+    /// `GuestMemory::zero_backing`). Used to scrub a reused anon region whose
+    /// stale content must never reach the guest: a region just reclaimed from
+    /// `munmap` (stage-1-invalidated → `range_no_access`) or mapped `PROT_NONE`
+    /// has no write permission, so `write_guest_bytes`/`_checked` deliberately
+    /// fault and cannot scrub it. The arena backing is always mapped (munmap only
+    /// stage-1-invalidates; arm64 HVF has no stage-2 flush), so the lookup
+    /// succeeds for the reclaimed region.
+    fn zero_guest_backing(&mut self, address: u64, length: usize) -> Result<(), MemoryError> {
+        let Some(mapping) = self.mapping_for_range_mut(address, length) else {
+            return Err(MemoryError::OutOfBounds { address, length });
+        };
+        let offset = (address - mapping.start) as usize;
+        unsafe {
+            core::ptr::write_bytes(mapping.host_addr.add(offset), 0u8, length);
+        }
+        Ok(())
+    }
+
     /// Permission-respecting write used by the SYSCALL path
     /// (`GuestMemory::write_bytes`): a write into a non-writable mapping returns
     /// EFAULT (`MemoryError::OutOfBounds`) instead of either faulting the host
@@ -3413,6 +3433,12 @@ impl GuestMemory for HvfTrapEngine {
         // Syscall path: enforce the guest-visible mapping permission so a write
         // into a read-only / carrick-owned mapping returns EFAULT (audit M1).
         self.inner.write_guest_bytes_checked(address, bytes)
+    }
+
+    fn zero_backing(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+        // Scrub the host backing raw — the reused region may be no-access /
+        // PROT_NONE, which the permission-checked writes refuse (see the trait).
+        self.inner.zero_guest_backing(address, len)
     }
 
     fn set_no_access(&mut self, address: u64, len: usize, no_access: bool) {
