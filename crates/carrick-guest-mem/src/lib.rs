@@ -32,6 +32,19 @@ pub trait GuestMemory {
     fn read_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError>;
     fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError>;
 
+    /// Zero `[address, address+len)` in the PHYSICAL backing, bypassing the
+    /// guest-visible protection (`set_no_access` / a non-writable mapping).
+    /// Used to scrub a reused anon region whose stale content must never reach
+    /// the guest: a region just reclaimed from `munmap` (stage-1-invalidated) or
+    /// mapped `PROT_NONE` has no write permission, so the permission-checked
+    /// `write_bytes` deliberately faults and CANNOT scrub it — leaving the prior
+    /// mapping's bytes to surface after a later `mprotect`. Default: the checked
+    /// `write_bytes` (the in-memory backend models no protection, so it always
+    /// writes); the HVF backend overrides this to write the host backing raw.
+    fn zero_backing(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+        self.write_bytes(address, &vec![0u8; len])
+    }
+
     /// Mark a guest range `PROT_NONE` (`no_access=true`) or accessible again
     /// (`false`). carrick backs the whole mmap arena with one accessible host
     /// region, so a `PROT_NONE` mmap is otherwise readable/writable on the
