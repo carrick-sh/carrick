@@ -448,6 +448,14 @@ fn seed_guest_baseline(backend: &mut dyn FsBackend, rootfs: Option<&RootFs>) {
         }
         let _ = backend.set_file_contents("/etc/hosts", hosts_content.into_bytes());
     }
+    // /etc/hostname must agree with uname(2)/gethostname()/proc — overwrite any
+    // build-time value from the image with the runtime guest hostname (Docker
+    // likewise writes the container hostname here at create). Unconditional: a
+    // stale image hostname is exactly the bug.
+    let _ = backend.set_file_contents(
+        "/etc/hostname",
+        format!("{}\n", guest_hostname()).into_bytes(),
+    );
 }
 
 fn set_baseline_file_if_missing(
