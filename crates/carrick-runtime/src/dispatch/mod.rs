@@ -1147,6 +1147,7 @@ impl SyscallDispatcher {
         160 => uname,
         161 => sethostname,
         162 => setdomainname,
+        163 => getrlimit,
         165 => getrusage,
         166 => umask,
         167 => prctl,
