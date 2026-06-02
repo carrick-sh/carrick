@@ -26,7 +26,11 @@ const HUB_KEY: &str = "https://index.docker.io/v1/";
 struct DockerConfig {
     #[serde(default)]
     auths: HashMap<String, AuthEntry>,
-    #[serde(rename = "credsStore", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "credsStore",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     creds_store: Option<String>,
     #[serde(
         rename = "credHelpers",
@@ -111,7 +115,8 @@ fn auth_for(config: &DockerConfig, key: &str) -> Option<RegistryAuth> {
 /// `Anonymous`.
 pub fn resolve_auth(store_root: &Path, registry: &str) -> Result<RegistryAuth, OciBootstrapError> {
     let key = canonical_registry_key(registry);
-    if let Some(auth) = load_config(&carrick_config_path(store_root)).and_then(|c| auth_for(&c, &key))
+    if let Some(auth) =
+        load_config(&carrick_config_path(store_root)).and_then(|c| auth_for(&c, &key))
     {
         return Ok(auth);
     }
@@ -211,7 +216,10 @@ mod tests {
             assert_eq!(canonical_registry_key(spelling), HUB_KEY, "{spelling}");
         }
         assert_eq!(canonical_registry_key("ghcr.io"), "ghcr.io");
-        assert_eq!(canonical_registry_key("https://reg.example.com/"), "reg.example.com");
+        assert_eq!(
+            canonical_registry_key("https://reg.example.com/"),
+            "reg.example.com"
+        );
     }
 
     #[test]
@@ -219,9 +227,13 @@ mod tests {
         let mut config = DockerConfig::default();
         // user "alice", password "p:ss:word" (contains colons).
         let encoded = base64::engine::general_purpose::STANDARD.encode("alice:p:ss:word");
-        config
-            .auths
-            .insert(HUB_KEY.to_string(), AuthEntry { auth: Some(encoded), ..Default::default() });
+        config.auths.insert(
+            HUB_KEY.to_string(),
+            AuthEntry {
+                auth: Some(encoded),
+                ..Default::default()
+            },
+        );
         match auth_for(&config, HUB_KEY) {
             Some(RegistryAuth::Basic(u, p)) => {
                 assert_eq!(u, "alice");
@@ -242,7 +254,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(matches!(auth_for(&config, "ghcr.io"), Some(RegistryAuth::Basic(_, _))));
+        assert!(matches!(
+            auth_for(&config, "ghcr.io"),
+            Some(RegistryAuth::Basic(_, _))
+        ));
     }
 
     #[test]
@@ -261,7 +276,10 @@ mod tests {
         let root = tmp.path();
         write_login(root, "ghcr.io", "bob", "secret").unwrap();
         // 0600 perms.
-        let mode = std::fs::metadata(carrick_config_path(root)).unwrap().permissions().mode();
+        let mode = std::fs::metadata(carrick_config_path(root))
+            .unwrap()
+            .permissions()
+            .mode();
         assert_eq!(mode & 0o777, 0o600);
         // resolve_auth reads it back (DOCKER_CONFIG/HOME fallbacks won't match ghcr).
         match resolve_auth(root, "ghcr.io").unwrap() {
@@ -273,7 +291,10 @@ mod tests {
         }
         // logout removes it.
         assert!(remove_login(root, "ghcr.io").unwrap());
-        assert!(matches!(resolve_auth(root, "ghcr.io").unwrap(), RegistryAuth::Anonymous));
+        assert!(matches!(
+            resolve_auth(root, "ghcr.io").unwrap(),
+            RegistryAuth::Anonymous
+        ));
     }
 
     #[test]
@@ -283,7 +304,13 @@ mod tests {
         write_login(root, "ghcr.io", "a", "1").unwrap();
         write_login(root, "quay.io", "b", "2").unwrap();
         // Both survive.
-        assert!(matches!(resolve_auth(root, "ghcr.io").unwrap(), RegistryAuth::Basic(..)));
-        assert!(matches!(resolve_auth(root, "quay.io").unwrap(), RegistryAuth::Basic(..)));
+        assert!(matches!(
+            resolve_auth(root, "ghcr.io").unwrap(),
+            RegistryAuth::Basic(..)
+        ));
+        assert!(matches!(
+            resolve_auth(root, "quay.io").unwrap(),
+            RegistryAuth::Basic(..)
+        ));
     }
 }

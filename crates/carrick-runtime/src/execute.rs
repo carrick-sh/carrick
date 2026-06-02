@@ -628,7 +628,9 @@ mod exit_code_tests {
     fn not_found_maps_to_127_class_only() {
         // docker/runc/shell: a missing entrypoint is 127.
         assert!(is_entrypoint_not_found(&rt_io(ErrorKind::NotFound)));
-        assert!(!is_entrypoint_not_found(&rt_io(ErrorKind::PermissionDenied)));
+        assert!(!is_entrypoint_not_found(&rt_io(
+            ErrorKind::PermissionDenied
+        )));
         assert!(!is_entrypoint_not_found(&rt_not_elf()));
     }
 
@@ -638,7 +640,9 @@ mod exit_code_tests {
         // "exec format error", or EACCES "permission denied") is 126 — not 127,
         // not the generic 1.
         assert!(is_entrypoint_not_executable(&rt_not_elf()));
-        assert!(is_entrypoint_not_executable(&rt_io(ErrorKind::PermissionDenied)));
+        assert!(is_entrypoint_not_executable(&rt_io(
+            ErrorKind::PermissionDenied
+        )));
         assert!(!is_entrypoint_not_executable(&rt_io(ErrorKind::NotFound)));
     }
 }

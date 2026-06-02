@@ -308,8 +308,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             password_stdin,
         } => {
             let registry = registry.unwrap_or_else(|| "docker.io".to_string());
-            let username =
-                username.context("a username is required (-u/--username)")?;
+            let username = username.context("a username is required (-u/--username)")?;
             let password = if password_stdin {
                 use std::io::Read;
                 let mut s = String::new();
@@ -517,10 +516,9 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             container,
         } => crate::lifecycle::logs(&container, follow, tail)?,
         Commands::Wait { containers } => crate::lifecycle::wait(&containers)?,
-        Commands::Inspect {
-            format,
-            containers,
-        } => crate::lifecycle::inspect(format.as_deref(), &containers)?,
+        Commands::Inspect { format, containers } => {
+            crate::lifecycle::inspect(format.as_deref(), &containers)?
+        }
         Commands::Ps {
             all,
             quiet,
@@ -869,4 +867,3 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
 
     Ok(())
 }
-

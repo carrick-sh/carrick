@@ -36,8 +36,10 @@ pub(crate) fn run_detached(
     // the user's terminal — and so the effective stop signal (flag > image
     // STOPSIGNAL) is baked into the persisted RunConfig for a later `stop`.
     let resolved = resolve_request_image(&req, &store)?;
-    let stop_signal =
-        resolve_stop_signal(req.stop_signal.as_deref(), resolved.config.stop_signal.as_deref())?;
+    let stop_signal = resolve_stop_signal(
+        req.stop_signal.as_deref(),
+        resolved.config.stop_signal.as_deref(),
+    )?;
     build_created_state(&req, &id, name, created_secs, stop_signal)
         .create()
         .with_context(|| format!("failed to create container registry entry for {id}"))?;
@@ -189,8 +191,10 @@ pub(crate) fn create(
     // Warm the image cache + surface image errors at create time, and capture
     // the image's STOPSIGNAL so a later `stop` honors it (flag > image > TERM).
     let resolved = resolve_request_image(&req, &store)?;
-    let stop_signal =
-        resolve_stop_signal(req.stop_signal.as_deref(), resolved.config.stop_signal.as_deref())?;
+    let stop_signal = resolve_stop_signal(
+        req.stop_signal.as_deref(),
+        resolved.config.stop_signal.as_deref(),
+    )?;
     build_created_state(&req, &id, name, created_secs, stop_signal)
         .create()
         .with_context(|| format!("failed to create container registry entry for {id}"))?;
@@ -505,9 +509,26 @@ fn gen_name(id: &str) -> String {
         "stoic",
     ];
     const SUR: &[&str] = &[
-        "turing", "hopper", "lovelace", "ritchie", "torvalds", "knuth", "dijkstra", "hamilton",
-        "babbage", "liskov", "carmack", "thompson", "kernighan", "shannon", "noether", "euler",
-        "gauss", "tesla", "curie", "bohr",
+        "turing",
+        "hopper",
+        "lovelace",
+        "ritchie",
+        "torvalds",
+        "knuth",
+        "dijkstra",
+        "hamilton",
+        "babbage",
+        "liskov",
+        "carmack",
+        "thompson",
+        "kernighan",
+        "shannon",
+        "noether",
+        "euler",
+        "gauss",
+        "tesla",
+        "curie",
+        "bohr",
     ];
     let b = id.as_bytes();
     let a = ADJ[b.first().copied().unwrap_or(0) as usize % ADJ.len()];
@@ -743,8 +764,7 @@ pub(crate) fn resolve_stop_signal(
     image_stop_signal: Option<&str>,
 ) -> anyhow::Result<Option<i32>> {
     if let Some(f) = flag {
-        let n =
-            parse_signal(f).with_context(|| format!("invalid stop signal: {f}"))?;
+        let n = parse_signal(f).with_context(|| format!("invalid stop signal: {f}"))?;
         return Ok(Some(n));
     }
     if let Some(img) = image_stop_signal {
@@ -1061,11 +1081,7 @@ pub(crate) fn logs(spec: &str, follow: bool, tail: Option<usize>) -> anyhow::Res
 }
 
 /// Write any bytes in `path` past `offset` to `out`; return the new offset.
-fn emit_appended(
-    path: &std::path::Path,
-    offset: u64,
-    out: &mut impl Write,
-) -> anyhow::Result<u64> {
+fn emit_appended(path: &std::path::Path, offset: u64, out: &mut impl Write) -> anyhow::Result<u64> {
     use std::io::{Read, Seek};
     // `path` is the registry log_path built from an allowlisted id (see `logs`);
     // it is under the registry root by construction, not user-traversable.
@@ -1228,7 +1244,10 @@ mod tests {
             Some(libc::SIGUSR1)
         );
         // No flag → the image's STOPSIGNAL.
-        assert_eq!(resolve_stop_signal(None, Some("SIGQUIT")).unwrap(), Some(libc::SIGQUIT));
+        assert_eq!(
+            resolve_stop_signal(None, Some("SIGQUIT")).unwrap(),
+            Some(libc::SIGQUIT)
+        );
         // Neither → None (stop falls back to SIGTERM at stop time).
         assert_eq!(resolve_stop_signal(None, None).unwrap(), None);
         // An invalid EXPLICIT flag is a hard error (docker rejects it at run).
@@ -1286,7 +1305,10 @@ mod tests {
     #[test]
     fn select_tail_returns_last_n_lines_with_trailing_newline() {
         // tail=2 over three trailing-newline-terminated lines → last two.
-        assert_eq!(select_tail(b"line1\nline2\nline3\n", Some(2)), b"line2\nline3\n");
+        assert_eq!(
+            select_tail(b"line1\nline2\nline3\n", Some(2)),
+            b"line2\nline3\n"
+        );
     }
 
     #[test]
