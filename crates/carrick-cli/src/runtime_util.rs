@@ -65,9 +65,7 @@ pub(crate) fn validate_publish(specs: &[String]) -> anyhow::Result<()> {
             [c] => (None, *c),
             [h, c] => (Some(*h), *c),
             [_ip, h, c] => (Some(*h), *c),
-            _ => anyhow::bail!(
-                "invalid -p {spec:?}: expected [ip:]hostPort:containerPort[/proto]"
-            ),
+            _ => anyhow::bail!("invalid -p {spec:?}: expected [ip:]hostPort:containerPort[/proto]"),
         };
         let cport: u16 = container.parse().map_err(|_| {
             anyhow::anyhow!("invalid -p {spec:?}: bad container port {container:?}")

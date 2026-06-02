@@ -276,7 +276,9 @@ mod tests {
             tv_sec: 5,
             tv_nsec: 0,
         };
-        let n = kq.wait(&[], &mut events, Some(&timeout)).expect("kqueue wait");
+        let n = kq
+            .wait(&[], &mut events, Some(&timeout))
+            .expect("kqueue wait");
         let mut harvested = None;
         for ev in events.iter().take(n) {
             if ev.proc_exit_ident() == Some(child) {

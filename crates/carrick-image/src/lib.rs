@@ -580,7 +580,8 @@ impl ImageStore {
     }
 
     fn image_info_from_summary(&self, summary_path: &Path) -> Option<ImageInfo> {
-        let summary: PullSummary = serde_json::from_slice(&std::fs::read(summary_path).ok()?).ok()?;
+        let summary: PullSummary =
+            serde_json::from_slice(&std::fs::read(summary_path).ok()?).ok()?;
         let image = ImageReference::parse(&summary.image).ok()?;
         let id = summary
             .digest
@@ -588,8 +589,8 @@ impl ImageStore {
             .and_then(|d| d.strip_prefix("sha256:"))
             .map(|h| h.get(..12).unwrap_or(h).to_string())
             .unwrap_or_else(|| "<none>".to_string());
-        let size = summary.layers.iter().map(|l| l.size as u64).sum::<u64>()
-            + summary.config_size as u64;
+        let size =
+            summary.layers.iter().map(|l| l.size as u64).sum::<u64>() + summary.config_size as u64;
         let created_secs = std::fs::metadata(summary_path)
             .and_then(|m| m.modified())
             .ok()
@@ -1062,8 +1063,18 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = ImageStore::new(tmp.path());
         // Two images sharing one blob (l_shared) and each with a private blob.
-        fake_image(&store, "docker.io/library/a:1", "sha256:a", &[("sha256:5ed", 50), ("sha256:0a", 10)]);
-        fake_image(&store, "docker.io/library/b:1", "sha256:b", &[("sha256:5ed", 50), ("sha256:0b", 20)]);
+        fake_image(
+            &store,
+            "docker.io/library/a:1",
+            "sha256:a",
+            &[("sha256:5ed", 50), ("sha256:0a", 10)],
+        );
+        fake_image(
+            &store,
+            "docker.io/library/b:1",
+            "sha256:b",
+            &[("sha256:5ed", 50), ("sha256:0b", 20)],
+        );
         assert_eq!(store.list_images().len(), 2);
 
         // Remove image a: its private blob `la` becomes unreferenced; `lshared`
@@ -1083,14 +1094,22 @@ mod tests {
     fn tag_image_creates_a_new_ref_sharing_blobs() {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = ImageStore::new(tmp.path());
-        fake_image(&store, "docker.io/library/ubuntu:24.04", "sha256:abcdef012345", &[("sha256:1111", 100)]);
+        fake_image(
+            &store,
+            "docker.io/library/ubuntu:24.04",
+            "sha256:abcdef012345",
+            &[("sha256:1111", 100)],
+        );
         let src = ImageReference::parse("docker.io/library/ubuntu:24.04").unwrap();
         let dst = ImageReference::parse("myubuntu:dev").unwrap();
         store.tag_image(&src, &dst).unwrap();
         // Both refs now list; the tag points at the same image id; blobs not duplicated.
         let imgs = store.list_images();
         assert_eq!(imgs.len(), 2);
-        assert!(imgs.iter().any(|i| i.repository == "myubuntu" && i.tag == "dev"));
+        assert!(
+            imgs.iter()
+                .any(|i| i.repository == "myubuntu" && i.tag == "dev")
+        );
         assert!(imgs.iter().all(|i| i.id == "abcdef012345"));
         let (count, _) = store.gc_blobs();
         assert_eq!(count, 0, "the shared blob is still referenced by both refs");
@@ -1100,7 +1119,12 @@ mod tests {
     fn remove_image_by_spec_accepts_ref_or_id() {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = ImageStore::new(tmp.path());
-        fake_image(&store, "docker.io/library/ubuntu:24.04", "sha256:abcdef012345", &[("sha256:1111", 100)]);
+        fake_image(
+            &store,
+            "docker.io/library/ubuntu:24.04",
+            "sha256:abcdef012345",
+            &[("sha256:1111", 100)],
+        );
         // By short image id (prefix of the 12-hex digest).
         assert_eq!(
             store.remove_image_by_spec("abcdef").unwrap().as_deref(),
@@ -1109,7 +1133,12 @@ mod tests {
         assert!(store.list_images().is_empty());
 
         // By reference.
-        fake_image(&store, "docker.io/library/alpine:3", "sha256:99887766", &[("sha256:2222", 50)]);
+        fake_image(
+            &store,
+            "docker.io/library/alpine:3",
+            "sha256:99887766",
+            &[("sha256:2222", 50)],
+        );
         assert_eq!(
             store.remove_image_by_spec("alpine:3").unwrap().as_deref(),
             Some("docker.io/library/alpine:3")

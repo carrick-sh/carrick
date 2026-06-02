@@ -243,7 +243,11 @@ pub(crate) enum Commands {
         user: Option<String>,
         #[arg(long = "entrypoint", value_name = "COMMAND")]
         entrypoint: Option<String>,
-        #[arg(short = 'v', long = "volume", value_name = "host-src:container-dest[:ro|rw]")]
+        #[arg(
+            short = 'v',
+            long = "volume",
+            value_name = "host-src:container-dest[:ro|rw]"
+        )]
         volume: Vec<String>,
         #[arg(long = "mount", value_name = "type=bind,source=...,target=...")]
         mount: Vec<String>,
