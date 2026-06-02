@@ -2732,6 +2732,50 @@ fn proc_self_fd_readlink_synthesizes_anon_inode_target() {
 }
 
 #[test]
+fn dev_fd_opens_descriptor_like_proc_self_fd() {
+    // /dev/fd is a symlink to /proc/self/fd on Linux; bash process substitution
+    // (`cat <(...)`) passes /dev/fd/N to the spawned command, which open()s it to
+    // dup the pipe. carrick had no /dev/fd at all → ENOENT, breaking process
+    // substitution and the libuv conformance harness. open(/dev/fd/N) must dup
+    // fd N (works for an anon/pipe fd with no backing path), exactly like
+    // open(/proc/self/fd/N).
+    let mut memory = LinearMemory::new(0x4000, vec![0; 0x400]);
+    let reporter = CompatReporter::default();
+    let mut dispatcher = SyscallDispatcher::new();
+
+    // eventfd2(0,0) → a non-stdio fd with no backing path (the process-sub case).
+    let DispatchOutcome::Returned { value: efd } = dispatcher
+        .dispatch(
+            SyscallRequest::new(19, SyscallArgs::from([0, 0, 0, 0, 0, 0])),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap()
+    else {
+        panic!("eventfd2 should succeed");
+    };
+
+    let path = format!("/dev/fd/{efd}\0");
+    memory.write_bytes(0x4000, path.as_bytes()).unwrap();
+    // openat(AT_FDCWD, "/dev/fd/{efd}", O_RDONLY)
+    let out = dispatcher
+        .dispatch(
+            SyscallRequest::new(
+                56,
+                SyscallArgs::from([(-100_i64) as u64, 0x4000, 0, 0, 0, 0]),
+            ),
+            &mut memory,
+            &reporter,
+        )
+        .unwrap();
+    let DispatchOutcome::Returned { value: dup_fd } = out else {
+        panic!("open(/dev/fd/{efd}) should dup the descriptor, got {out:?}");
+    };
+    assert!(dup_fd >= 3, "expected a fresh fd, got {dup_fd}");
+    assert_ne!(dup_fd, efd, "open(/dev/fd/N) must return a NEW fd");
+}
+
+#[test]
 fn proc_self_fd_directory_lists_open_fds() {
     // `ls /proc/self/fd` / `for fd in /proc/self/fd/*`: opendir + getdents must
     // enumerate the guest's open fds as symlink entries.

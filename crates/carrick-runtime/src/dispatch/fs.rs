@@ -150,6 +150,25 @@ fn check_path_length(path: &str) -> Result<(), i32> {
     Ok(())
 }
 
+/// `/dev/fd` and `/dev/std{in,out,err}` are symlinks into `/proc/self/fd` on
+/// Linux — bash process substitution (`cat <(...)`) passes `/dev/fd/N` to the
+/// spawned command, which `open()`s it to dup the pipe. Rewrite an ABSOLUTE
+/// such path to its `/proc/self/fd` equivalent so the existing magic-fd
+/// machinery serves it (open → dup N; lstat/readlink as a per-fd symlink).
+/// Returns `None` for anything else. Only EXACT matches map: `/dev/fd0` (a
+/// floppy) must not become `/proc/self/fd0`.
+fn rewrite_dev_fd_alias(path: &str) -> Option<String> {
+    match path {
+        "/dev/fd" => Some("/proc/self/fd".to_string()),
+        "/dev/stdin" => Some("/proc/self/fd/0".to_string()),
+        "/dev/stdout" => Some("/proc/self/fd/1".to_string()),
+        "/dev/stderr" => Some("/proc/self/fd/2".to_string()),
+        _ => path
+            .strip_prefix("/dev/fd/")
+            .map(|rest| format!("/proc/self/fd/{rest}")),
+    }
+}
+
 fn proc_self_fd_number(path: &str) -> Option<i32> {
     let rest = path
         .strip_prefix("/proc/self/fd/")
@@ -1700,6 +1719,13 @@ impl SyscallDispatcher {
         let dirfd = (dirfd as i32) as i64 as u64;
         if path.is_empty() {
             return Ok(path.to_owned());
+        }
+        // `/dev/fd/N` and `/dev/std{in,out,err}` are Linux symlinks into
+        // `/proc/self/fd`; rewrite to that so the magic-fd machinery (open → dup
+        // N) serves them. The rewritten path is absolute, so it re-resolves
+        // independently of `dirfd`. (Fixes bash process substitution `<(...)`.)
+        if let Some(rewritten) = rewrite_dev_fd_alias(path) {
+            return self.resolve_at_path(dirfd, &rewritten);
         }
         // ENAMETOOLONG: Linux rejects any single component > NAME_MAX (255) and
         // any total path > PATH_MAX (4096) at resolution time. carrick lacked
