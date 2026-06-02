@@ -102,6 +102,11 @@ pub(crate) enum Commands {
         /// New reference, e.g. `myapp:dev`.
         target: String,
     },
+    /// Show carrick disk usage / clean it up (like `docker system`).
+    System {
+        #[command(subcommand)]
+        command: SystemCommand,
+    },
     Run {
         image: String,
         /// Target platform, e.g. `linux/amd64` or `linux/arm64`. Selects the
@@ -435,4 +440,18 @@ pub(crate) enum RootfsCommand {
     Summary,
     Ls { path: PathBuf },
     Cat { path: PathBuf },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum SystemCommand {
+    /// Show carrick disk usage (images, containers), like `docker system df`.
+    Df,
+    /// Remove stopped containers and unreferenced image layers, like
+    /// `docker system prune`.
+    Prune {
+        /// Do not prompt for confirmation (accepted for compatibility; carrick
+        /// does not prompt).
+        #[arg(short = 'f', long = "force")]
+        force: bool,
+    },
 }
