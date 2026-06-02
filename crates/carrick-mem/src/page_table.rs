@@ -940,7 +940,42 @@ mod tests {
         // The first page of B resolves to B's IPA (the bug resolved it via A).
         assert_eq!(mgr.translate(b_va + 0x1000), Some(b_ipa + 0x1000));
         // The last page of A still resolves to A.
-        assert_eq!(mgr.translate(a_va + a_len - 0x1000), Some(a_ipa + a_len - 0x1000));
+        assert_eq!(
+            mgr.translate(a_va + a_len - 0x1000),
+            Some(a_ipa + a_len - 0x1000)
+        );
+    }
+
+    #[test]
+    fn sub_16k_high_va_alias_does_not_perturb_neighbor_l3_entry() {
+        // HVF needs the host mapping length rounded up to 16 KiB, but stage-1
+        // must map only the guest-requested length. If the rounded length leaks
+        // into stage-1, a 12 KiB alias clobbers the adjacent page's L3 entry.
+        let mut mgr = manager();
+        let a_va = LINUX_HIGH_VA_THRESHOLD;
+        let a_ipa = LINUX_ALIAS_IPA_BASE;
+        let a_len = 0x3000;
+        let b_va = a_va + a_len;
+        let b_ipa = LINUX_ALIAS_IPA_BASE + 0x20_0000;
+
+        mgr.map_aliased(b_va, b_ipa, 0x1000, true)
+            .expect("map neighbor B first");
+        let b_before = mgr.debug_walk(b_va)[3];
+        assert_eq!(mgr.translate(b_va), Some(b_ipa));
+
+        mgr.map_aliased(a_va, a_ipa, a_len, true)
+            .expect("map sub-16 KiB A");
+
+        assert_eq!(
+            mgr.translate(a_va + a_len - 0x1000),
+            Some(a_ipa + a_len - 0x1000)
+        );
+        assert_eq!(mgr.translate(b_va), Some(b_ipa));
+        assert_eq!(
+            mgr.debug_walk(b_va)[3],
+            b_before,
+            "neighbor B's L3 descriptor must not be overwritten by A's HVF-rounded length"
+        );
     }
 
     #[test]

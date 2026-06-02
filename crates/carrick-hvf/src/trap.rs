@@ -133,6 +133,9 @@ pub trait SyscallTrap {
 }
 
 pub const HVF_PAGE_SIZE: u64 = 0x4000;
+// Guest stage-1 uses a 4 KiB granule even though HVF maps stage-2 in 16 KiB
+// chunks. Syscall memory copies must reselect the backing at this boundary.
+const GUEST_STAGE1_PAGE_SIZE: u64 = 0x1000;
 pub const AARCH64_SVC_EXCEPTION_CLASS: u64 = 0x15;
 pub const AARCH64_HVC_EXCEPTION_CLASS: u64 = 0x16;
 const AARCH64_EXCEPTION_CLASS_SHIFT: u64 = 26;
@@ -1412,7 +1415,7 @@ impl HvfTrapEngine {
                 | (0b11 << 24) | (0b11 << 26) | (0b11 << 28)  // IRGN1/ORGN1/SH1
                 | (0b10 << 30)                                 // TG1 = 4 KiB
                 | (0b010 << 32)                                // IPS = 40-bit
-                | (1 << 37) | (1 << 38);                       // TBI0/TBI1
+                | (1 << 37) | (1 << 38); // TBI0/TBI1
             self.inner
                 .vcpu
                 .set_sys_reg(SysReg::TCR_EL1, TCR_EL1_BOOTSTRAP)
@@ -2201,17 +2204,42 @@ impl HvfInner {
         if self.range_no_access(address, length) {
             return Err(MemoryError::OutOfBounds { address, length });
         }
-        let Some(mapping) = self.mapping_for_range(address, length) else {
-            return Err(MemoryError::OutOfBounds { address, length });
-        };
-        // Read directly out of the host buffer. Works for both
-        // applevisor-owned mappings (the parent case) and raw mappings
-        // we re-created in a forked child via hv_vm_map.
-        let offset = (address - mapping.start) as usize;
         let mut bytes = vec![0u8; length];
-        unsafe {
-            volatile_copy_from_guest(mapping.host_addr.add(offset), bytes.as_mut_ptr(), length);
+        let mut copied = 0usize;
+        while copied < length {
+            let (chunk_address, chunk_len) = Self::guest_copy_chunk(address, copied, length)?;
+            let (mapping_start, mapping_end, mapping_ipa, host_addr) = {
+                let Some(mapping) = self.mapping_for_range(chunk_address, chunk_len) else {
+                    return Err(MemoryError::OutOfBounds { address, length });
+                };
+                (mapping.start, mapping.end, mapping.ipa, mapping.host_addr)
+            };
+            self.emit_guest_mem_copy_decision(
+                crate::probes::guest_mem_dir::READ_GUEST,
+                chunk_address,
+                chunk_len,
+                mapping_start,
+                mapping_end,
+                mapping_ipa,
+            );
+            // Read directly out of the host buffer. Works for both
+            // applevisor-owned mappings (the parent case) and raw mappings
+            // we re-created in a forked child via hv_vm_map.
+            let chunk_offset = (chunk_address - mapping_start) as usize;
+            unsafe {
+                volatile_copy_from_guest(
+                    host_addr.add(chunk_offset),
+                    bytes.as_mut_ptr().add(copied),
+                    chunk_len,
+                );
+            }
+            copied += chunk_len;
         }
+        crate::probes::guest_mem_bytes(
+            crate::probes::guest_mem_dir::READ_GUEST,
+            strip_pointer_tag(address),
+            &bytes,
+        );
         Ok(bytes)
     }
 
@@ -2233,13 +2261,39 @@ impl HvfInner {
         if self.range_no_access(address, length) {
             return Err(MemoryError::OutOfBounds { address, length });
         }
-        let Some(mapping) = self.mapping_for_range_mut(address, length) else {
-            return Err(MemoryError::OutOfBounds { address, length });
-        };
-        let offset = (address - mapping.start) as usize;
-        unsafe {
-            volatile_copy_to_guest(bytes.as_ptr(), mapping.host_addr.add(offset), length);
+        self.validate_guest_write_range(address, length, false)?;
+        let mut copied = 0usize;
+        while copied < length {
+            let (chunk_address, chunk_len) = Self::guest_copy_chunk(address, copied, length)?;
+            let (mapping_start, mapping_end, mapping_ipa, host_addr) = {
+                let Some(mapping) = self.mapping_for_range_mut(chunk_address, chunk_len) else {
+                    return Err(MemoryError::OutOfBounds { address, length });
+                };
+                (mapping.start, mapping.end, mapping.ipa, mapping.host_addr)
+            };
+            self.emit_guest_mem_copy_decision(
+                crate::probes::guest_mem_dir::WRITE_GUEST,
+                chunk_address,
+                chunk_len,
+                mapping_start,
+                mapping_end,
+                mapping_ipa,
+            );
+            let chunk_offset = (chunk_address - mapping_start) as usize;
+            unsafe {
+                volatile_copy_to_guest(
+                    bytes.as_ptr().add(copied),
+                    host_addr.add(chunk_offset),
+                    chunk_len,
+                );
+            }
+            copied += chunk_len;
         }
+        crate::probes::guest_mem_bytes(
+            crate::probes::guest_mem_dir::WRITE_GUEST,
+            strip_pointer_tag(address),
+            bytes,
+        );
         Ok(())
     }
 
@@ -2276,22 +2330,132 @@ impl HvfInner {
         if self.range_no_access(address, length) {
             return Err(MemoryError::OutOfBounds { address, length });
         }
-        let Some(mapping) = self.mapping_for_range_mut(address, length) else {
-            return Err(MemoryError::OutOfBounds { address, length });
-        };
-        // A write into a non-writable mapping (a PROT_READ MAP_SHARED file
-        // alias, or a carrick-owned write:false region) returns EFAULT to the
-        // guest instead of faulting the host (SIGBUS) or corrupting carrick
-        // state. `guest_writable` is the guest's intended PROT_WRITE, tracked
-        // separately from the (escalated) stage-2 `perms`.
-        if !mapping.guest_writable {
-            return Err(MemoryError::OutOfBounds { address, length });
+        self.validate_guest_write_range(address, length, true)?;
+        let mut copied = 0usize;
+        while copied < length {
+            let (chunk_address, chunk_len) = Self::guest_copy_chunk(address, copied, length)?;
+            let (mapping_start, mapping_end, mapping_ipa, host_addr) = {
+                let Some(mapping) = self.mapping_for_range_mut(chunk_address, chunk_len) else {
+                    return Err(MemoryError::OutOfBounds { address, length });
+                };
+                (mapping.start, mapping.end, mapping.ipa, mapping.host_addr)
+            };
+            self.emit_guest_mem_copy_decision(
+                crate::probes::guest_mem_dir::WRITE_GUEST_CHECKED,
+                chunk_address,
+                chunk_len,
+                mapping_start,
+                mapping_end,
+                mapping_ipa,
+            );
+            let chunk_offset = (chunk_address - mapping_start) as usize;
+            unsafe {
+                volatile_copy_to_guest(
+                    bytes.as_ptr().add(copied),
+                    host_addr.add(chunk_offset),
+                    chunk_len,
+                );
+            }
+            copied += chunk_len;
         }
-        let offset = (address - mapping.start) as usize;
-        unsafe {
-            volatile_copy_to_guest(bytes.as_ptr(), mapping.host_addr.add(offset), length);
+        crate::probes::guest_mem_bytes(
+            crate::probes::guest_mem_dir::WRITE_GUEST_CHECKED,
+            strip_pointer_tag(address),
+            bytes,
+        );
+        Ok(())
+    }
+
+    fn validate_guest_write_range(
+        &self,
+        address: u64,
+        length: usize,
+        require_guest_writable: bool,
+    ) -> Result<(), MemoryError> {
+        let mut checked = 0usize;
+        while checked < length {
+            let (chunk_address, chunk_len) = Self::guest_copy_chunk(address, checked, length)?;
+            let Some(mapping) = self.mapping_for_range(chunk_address, chunk_len) else {
+                return Err(MemoryError::OutOfBounds { address, length });
+            };
+            if require_guest_writable && !mapping.guest_writable {
+                return Err(MemoryError::OutOfBounds { address, length });
+            }
+            checked += chunk_len;
         }
         Ok(())
+    }
+
+    fn guest_copy_chunk(
+        address: u64,
+        offset: usize,
+        total_length: usize,
+    ) -> Result<(u64, usize), MemoryError> {
+        let offset_u64 = u64::try_from(offset).map_err(|_| MemoryError::OutOfBounds {
+            address,
+            length: total_length,
+        })?;
+        let raw_chunk_address =
+            address
+                .checked_add(offset_u64)
+                .ok_or(MemoryError::OutOfBounds {
+                    address,
+                    length: total_length,
+                })?;
+        let chunk_address = strip_pointer_tag(raw_chunk_address);
+        let remaining = total_length - offset;
+        let page_remaining =
+            (GUEST_STAGE1_PAGE_SIZE - (chunk_address & (GUEST_STAGE1_PAGE_SIZE - 1))) as usize;
+        Ok((chunk_address, remaining.min(page_remaining)))
+    }
+
+    fn emit_guest_mem_copy_decision(
+        &self,
+        direction: u32,
+        address: u64,
+        length: usize,
+        mapping_start: u64,
+        mapping_end: u64,
+        mapping_ipa: u64,
+    ) {
+        let stage1_ipa = crate::memory::is_high_va(address)
+            .then(|| self.translate_va(address))
+            .flatten();
+        crate::probes::guest_mem_copy(
+            direction,
+            address,
+            length,
+            stage1_ipa,
+            mapping_start,
+            mapping_end,
+            mapping_ipa,
+        );
+        self.emit_guest_mem_points(direction, address, length, mapping_start, mapping_ipa);
+    }
+
+    fn emit_guest_mem_points(
+        &self,
+        direction: u32,
+        address: u64,
+        length: usize,
+        mapping_start: u64,
+        mapping_ipa: u64,
+    ) {
+        for point in crate::probes::guest_mem_probe_points(address, length)
+            .into_iter()
+            .flatten()
+        {
+            let stage1_ipa = crate::memory::is_high_va(point)
+                .then(|| self.translate_va(point))
+                .flatten();
+            crate::probes::guest_mem_point(
+                direction,
+                point,
+                stage1_ipa,
+                mapping_start,
+                mapping_ipa,
+            );
+        }
     }
 
     /// Write the vDSO vvar data page: the counter frequency and the
@@ -2415,37 +2579,11 @@ impl HvfInner {
 
     fn mapping_for_range(&self, address: u64, length: usize) -> Option<&HvfMappedRegion> {
         let address = strip_pointer_tag(address);
-        // For a high-VA Rosetta alias, prefer the region whose `hv_vm_map`'d IPA
-        // window owns the guest's OWN stage-1 translation of `address`. Alias
-        // regions can overlap by VA — a 16 KiB host-rounded `end` over-claims its
-        // neighbour, and a MAP_FIXED overlay leaves its predecessor in place — so
-        // a pure VA-range match (even newest-first) can pick a region the guest's
-        // page tables do NOT use, sending a syscall buffer copy to the wrong
-        // backing (the amd64 `cat -n`/mmap-buffer reads-zeros bug). Matching on
-        // the stage-1 IPA picks exactly the region the guest reads/writes; the
-        // copy offset stays `va - start` because alias regions map VA→IPA
-        // linearly. Falls back to the VA-range scan when stage-1 has no entry yet.
-        if crate::memory::is_high_va(address) {
-            if let Some(ipa) = self.translate_va(address) {
-                if let Some(m) = self
-                    .mappings
-                    .iter()
-                    .rev()
-                    .find(|m| Self::region_owns_ipa(m, ipa) && m.contains_range(address, length))
-                {
-                    return Some(m);
-                }
-            }
-        }
-        // Search NEWEST-first: a MAP_FIXED mmap overlaying an earlier mapping
-        // pushes a new region without removing the old one, and the guest's
-        // stage-1 points to the LAST mapping (the overlay wins). Returning the
-        // first match would read a stale/zeroed older backing while the guest
-        // wrote to the new one (the Rosetta amd64 heap-read-zeros bug).
-        self.mappings
-            .iter()
-            .rev()
-            .find(|mapping| mapping.contains_range(address, length))
+        let stage1_ipa = crate::memory::is_high_va(address)
+            .then(|| self.translate_va(address))
+            .flatten();
+        Self::mapping_index_for_range(&self.mappings, address, length, stage1_ipa)
+            .map(|idx| &self.mappings[idx])
     }
 
     fn mapping_for_range_mut(
@@ -2454,35 +2592,49 @@ impl HvfInner {
         length: usize,
     ) -> Option<&mut HvfMappedRegion> {
         let address = strip_pointer_tag(address);
-        // Mirror `mapping_for_range`: prefer the stage-1-IPA-matching region for
-        // high-VA aliases so syscall WRITES land where the guest reads. The
-        // `any`-then-`find` split keeps the borrow checker happy (we can't return
-        // a conditional `&mut` borrowed inside the IPA branch and still fall back).
-        if crate::memory::is_high_va(address) {
-            if let Some(ipa) = self.translate_va(address) {
-                if self
-                    .mappings
-                    .iter()
-                    .any(|m| Self::region_owns_ipa(m, ipa) && m.contains_range(address, length))
-                {
-                    return self
-                        .mappings
-                        .iter_mut()
-                        .rev()
-                        .find(|m| Self::region_owns_ipa(m, ipa) && m.contains_range(address, length));
-                }
-            }
-        }
-        // Newest-first (see mapping_for_range): the overlay wins.
-        self.mappings
-            .iter_mut()
-            .rev()
-            .find(|mapping| mapping.contains_range(address, length))
+        let stage1_ipa = crate::memory::is_high_va(address)
+            .then(|| self.translate_va(address))
+            .flatten();
+        let idx = Self::mapping_index_for_range(&self.mappings, address, length, stage1_ipa)?;
+        self.mappings.get_mut(idx)
     }
 
     /// True if `ipa` falls in `region`'s `hv_vm_map`'d IPA window.
     fn region_owns_ipa(region: &HvfMappedRegion, ipa: u64) -> bool {
         ipa >= region.ipa && ipa < region.ipa + region.size as u64
+    }
+
+    fn mapping_index_for_range(
+        mappings: &[HvfMappedRegion],
+        address: u64,
+        length: usize,
+        stage1_ipa: Option<u64>,
+    ) -> Option<usize> {
+        // For a high-VA Rosetta alias, prefer the region whose `hv_vm_map`'d IPA
+        // window owns the guest's OWN stage-1 translation of `address`. Alias
+        // regions can overlap by VA -- a 16 KiB host-rounded `end` over-claims its
+        // neighbour, and a MAP_FIXED overlay leaves its predecessor in place -- so
+        // a pure VA-range match (even newest-first) can pick a region the guest's
+        // page tables do NOT use, sending a syscall buffer copy to the wrong
+        // backing. Matching on stage-1 IPA picks exactly what the guest sees.
+        if let Some(ipa) = stage1_ipa {
+            if let Some((idx, _)) =
+                mappings.iter().enumerate().rev().find(|(_, m)| {
+                    Self::region_owns_ipa(m, ipa) && m.contains_range(address, length)
+                })
+            {
+                return Some(idx);
+            }
+        }
+        // Search NEWEST-first: a MAP_FIXED mmap overlaying an earlier mapping
+        // pushes a new region without removing the old one, and the guest's
+        // stage-1 points to the last mapping.
+        mappings
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, mapping)| mapping.contains_range(address, length))
+            .map(|(idx, _)| idx)
     }
 
     /// Walk the guest's live stage-1 page tables to resolve `va`→IPA (the output
@@ -3566,7 +3718,7 @@ impl HvfInner {
                 | (0b11 << 24) | (0b11 << 26) | (0b11 << 28)  // IRGN1/ORGN1/SH1
                 | (0b10 << 30)                                 // TG1 = 4 KiB
                 | (0b010 << 32)                                // IPS = 40-bit
-                | (1 << 37) | (1 << 38);                       // TBI0/TBI1
+                | (1 << 37) | (1 << 38); // TBI0/TBI1
             self.vcpu
                 .set_sys_reg(SysReg::TCR_EL1, TCR_EL1_BOOTSTRAP)
                 .map_err(hvf_error)?;
@@ -4252,6 +4404,8 @@ mod thread_sibling_tests {
         }
         assert_eq!(child.sctlr_el1, parent.sctlr_el1);
         assert_eq!(child.ttbr0_el1, parent.ttbr0_el1);
+        assert_eq!(child.ttbr1_el1, parent.ttbr1_el1);
+        assert_eq!(child.actlr_el1, parent.actlr_el1);
         assert_eq!(child.tcr_el1, parent.tcr_el1);
         assert_eq!(child.mair_el1, parent.mair_el1);
         assert_eq!(child.vbar_el1, parent.vbar_el1);
@@ -4288,6 +4442,303 @@ mod thread_sibling_tests {
         assert!(copied.memory.is_none());
         assert!(copied.host_mapping.is_none());
         assert!(copied.guest_shared);
+    }
+
+    fn mapped_region(start: u64, end: u64, ipa: u64) -> HvfMappedRegion {
+        HvfMappedRegion {
+            start,
+            ipa,
+            end,
+            host_addr: std::ptr::null_mut(),
+            size: usize::try_from(end - start).unwrap(),
+            perms: applevisor::memory::MemPerms::ReadWrite,
+            memory: None,
+            host_mapping: None,
+            guest_shared: false,
+            guest_writable: true,
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct FakeStageSegment {
+        va_start: u64,
+        va_end: u64,
+        ipa_start: u64,
+    }
+
+    impl FakeStageSegment {
+        fn new(va_start: u64, va_end: u64, ipa_start: u64) -> Self {
+            Self {
+                va_start,
+                va_end,
+                ipa_start,
+            }
+        }
+
+        fn translate(self, va: u64) -> Option<u64> {
+            (va >= self.va_start && va < self.va_end)
+                .then_some(self.ipa_start + (va - self.va_start))
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct FakeCopyChunk {
+        mapping_idx: usize,
+        len: usize,
+        mapping_offset: usize,
+    }
+
+    struct FakeStageCopyHarness {
+        mappings: Vec<HvfMappedRegion>,
+        backing: Vec<Vec<u8>>,
+        stage: Vec<FakeStageSegment>,
+    }
+
+    impl FakeStageCopyHarness {
+        fn new(mappings: Vec<HvfMappedRegion>, stage: Vec<FakeStageSegment>) -> Self {
+            let backing = mappings
+                .iter()
+                .map(|mapping| vec![0; mapping.size])
+                .collect();
+            Self {
+                mappings,
+                backing,
+                stage,
+            }
+        }
+
+        fn read(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            let plan = self.plan(address, length)?;
+            let mut bytes = vec![0; length];
+            let mut copied = 0usize;
+            for chunk in plan {
+                let src = &self.backing[chunk.mapping_idx]
+                    [chunk.mapping_offset..chunk.mapping_offset + chunk.len];
+                bytes[copied..copied + chunk.len].copy_from_slice(src);
+                copied += chunk.len;
+            }
+            Ok(bytes)
+        }
+
+        fn write(
+            &mut self,
+            address: u64,
+            bytes: &[u8],
+            require_guest_writable: bool,
+        ) -> Result<(), MemoryError> {
+            let plan = self.plan(address, bytes.len())?;
+            if require_guest_writable
+                && plan
+                    .iter()
+                    .any(|chunk| !self.mappings[chunk.mapping_idx].guest_writable)
+            {
+                return Err(MemoryError::OutOfBounds {
+                    address,
+                    length: bytes.len(),
+                });
+            }
+
+            let mut copied = 0usize;
+            for chunk in plan {
+                let dst = &mut self.backing[chunk.mapping_idx]
+                    [chunk.mapping_offset..chunk.mapping_offset + chunk.len];
+                dst.copy_from_slice(&bytes[copied..copied + chunk.len]);
+                copied += chunk.len;
+            }
+            Ok(())
+        }
+
+        fn mapping_bytes(&self, idx: usize) -> &[u8] {
+            &self.backing[idx]
+        }
+
+        fn plan(&self, address: u64, length: usize) -> Result<Vec<FakeCopyChunk>, MemoryError> {
+            let mut copied = 0usize;
+            let mut plan = Vec::new();
+            while copied < length {
+                let (chunk_address, chunk_len) =
+                    HvfInner::guest_copy_chunk(address, copied, length)?;
+                let stage1_ipa = crate::memory::is_high_va(chunk_address)
+                    .then(|| self.translate(chunk_address))
+                    .flatten();
+                let mapping_idx = HvfInner::mapping_index_for_range(
+                    &self.mappings,
+                    chunk_address,
+                    chunk_len,
+                    stage1_ipa,
+                )
+                .ok_or(MemoryError::OutOfBounds { address, length })?;
+                let mapping_offset =
+                    usize::try_from(chunk_address - self.mappings[mapping_idx].start).unwrap();
+                plan.push(FakeCopyChunk {
+                    mapping_idx,
+                    len: chunk_len,
+                    mapping_offset,
+                });
+                copied += chunk_len;
+            }
+            Ok(plan)
+        }
+
+        fn translate(&self, va: u64) -> Option<u64> {
+            let va = strip_pointer_tag(va);
+            self.stage.iter().find_map(|segment| segment.translate(va))
+        }
+    }
+
+    #[test]
+    fn high_va_mapping_lookup_prefers_stage1_ipa_owner_over_newer_va_overlap() {
+        let b_start = crate::memory::LINUX_HIGH_VA_THRESHOLD + 0x3000;
+        let b_ipa = crate::memory::LINUX_ALIAS_IPA_BASE + 0x20_0000;
+        let mappings = vec![
+            mapped_region(b_start, b_start + 0x4000, b_ipa),
+            // Newer region A over-claims into B's VA range because the host
+            // mapping size was rounded to 16 KiB. The guest stage-1 walk still
+            // says B owns b_start+0x1000, so B must win.
+            mapped_region(
+                crate::memory::LINUX_HIGH_VA_THRESHOLD,
+                crate::memory::LINUX_HIGH_VA_THRESHOLD + 0x4000,
+                crate::memory::LINUX_ALIAS_IPA_BASE,
+            ),
+        ];
+
+        let idx =
+            HvfInner::mapping_index_for_range(&mappings, b_start + 0x1000, 8, Some(b_ipa + 0x1000));
+
+        assert_eq!(idx, Some(0));
+    }
+
+    #[test]
+    fn guest_copy_chunks_reselect_stage1_owner_across_alias_boundary() {
+        let old_start = crate::memory::LINUX_HIGH_VA_THRESHOLD;
+        let old_ipa = crate::memory::LINUX_ALIAS_IPA_BASE;
+        let new_start = old_start + 0x3000;
+        let new_ipa = old_ipa + 0x20_0000;
+        let mappings = vec![
+            mapped_region(old_start, old_start + 0x9000, old_ipa),
+            mapped_region(new_start, new_start + 0x6000, new_ipa),
+        ];
+        let address = old_start + 0x2f50;
+        let length = 0x5000usize;
+
+        // The old single-region path would select the owner for the range's
+        // start and use it for bytes after new_start, even though stage-1 has
+        // already repointed that tail to the newer alias.
+        assert_eq!(
+            HvfInner::mapping_index_for_range(
+                &mappings,
+                address,
+                length,
+                Some(old_ipa + (address - old_start)),
+            ),
+            Some(0),
+        );
+
+        let mut offset = 0usize;
+        let mut owners = Vec::new();
+        while offset < length {
+            let (chunk_address, chunk_len) =
+                HvfInner::guest_copy_chunk(address, offset, length).unwrap();
+            let stage1_ipa = if chunk_address < new_start {
+                old_ipa + (chunk_address - old_start)
+            } else {
+                new_ipa + (chunk_address - new_start)
+            };
+            let idx = HvfInner::mapping_index_for_range(
+                &mappings,
+                chunk_address,
+                chunk_len,
+                Some(stage1_ipa),
+            )
+            .unwrap();
+            if owners.last() != Some(&idx) {
+                owners.push(idx);
+            }
+            offset += chunk_len;
+        }
+
+        assert_eq!(owners, vec![0, 1]);
+    }
+
+    #[test]
+    fn fake_stage1_copy_writes_tail_to_live_owner_backing() {
+        let old_start = crate::memory::LINUX_HIGH_VA_THRESHOLD;
+        let old_ipa = crate::memory::LINUX_ALIAS_IPA_BASE;
+        let new_start = old_start + 0x3000;
+        let new_ipa = old_ipa + 0x20_0000;
+        let mut harness = FakeStageCopyHarness::new(
+            vec![
+                mapped_region(old_start, old_start + 0x9000, old_ipa),
+                mapped_region(new_start, new_start + 0x6000, new_ipa),
+            ],
+            vec![
+                FakeStageSegment::new(old_start, new_start, old_ipa),
+                FakeStageSegment::new(new_start, new_start + 0x6000, new_ipa),
+            ],
+        );
+        let address = old_start + 0x2f50;
+        let length = 0x2400usize;
+        let boundary_prefix = usize::try_from(new_start - address).unwrap();
+        let source: Vec<u8> = (0..length).map(|idx| (idx % 251) as u8).collect();
+
+        harness.write(address, &source, false).unwrap();
+
+        assert_eq!(harness.read(address, length).unwrap(), source);
+        assert_eq!(
+            &harness.mapping_bytes(0)[0x2f50..0x3000],
+            &source[..boundary_prefix]
+        );
+        assert!(
+            harness.mapping_bytes(0)[0x3000..0x5350]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+        assert_eq!(
+            &harness.mapping_bytes(1)[..length - boundary_prefix],
+            &source[boundary_prefix..]
+        );
+    }
+
+    #[test]
+    fn fake_stage1_checked_write_rejects_readonly_tail_without_partial_write() {
+        let old_start = crate::memory::LINUX_HIGH_VA_THRESHOLD;
+        let old_ipa = crate::memory::LINUX_ALIAS_IPA_BASE;
+        let new_start = old_start + 0x3000;
+        let new_ipa = old_ipa + 0x20_0000;
+        let mut new_region = mapped_region(new_start, new_start + 0x6000, new_ipa);
+        new_region.guest_writable = false;
+        let mut harness = FakeStageCopyHarness::new(
+            vec![
+                mapped_region(old_start, old_start + 0x9000, old_ipa),
+                new_region,
+            ],
+            vec![
+                FakeStageSegment::new(old_start, new_start, old_ipa),
+                FakeStageSegment::new(new_start, new_start + 0x6000, new_ipa),
+            ],
+        );
+        let address = old_start + 0x2f50;
+        let source = vec![0xa5; 0x2400];
+
+        assert!(harness.write(address, &source, true).is_err());
+        assert!(harness.mapping_bytes(0).iter().all(|byte| *byte == 0));
+        assert!(harness.mapping_bytes(1).iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn mapping_lookup_falls_back_to_newest_overlap_without_stage1_ipa() {
+        let start = crate::memory::LINUX_HIGH_VA_THRESHOLD;
+        let old = mapped_region(start, start + 0x4000, crate::memory::LINUX_ALIAS_IPA_BASE);
+        let new = mapped_region(
+            start,
+            start + 0x4000,
+            crate::memory::LINUX_ALIAS_IPA_BASE + 0x20_0000,
+        );
+        let mappings = vec![old, new];
+
+        let idx = HvfInner::mapping_index_for_range(&mappings, start + 0x1000, 8, None);
+
+        assert_eq!(idx, Some(1));
     }
 }
 

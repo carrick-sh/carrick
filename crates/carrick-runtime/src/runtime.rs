@@ -40,6 +40,64 @@ use thiserror::Error;
 
 const SIGNAL_WAIT_SLICE: Duration = Duration::from_millis(50);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VdsoDebugMode {
+    Full,
+    Disabled,
+    NoGetrandom,
+    NoFastpaths,
+    ClockSyscalls,
+}
+
+fn vdso_enabled_for_debug() -> bool {
+    vdso_debug_mode() != VdsoDebugMode::Disabled
+}
+
+fn vdso_debug_mode() -> VdsoDebugMode {
+    vdso_debug_mode_from_env(
+        std::env::var("CARRICK_DISABLE_VDSO").ok().as_deref(),
+        std::env::var("CARRICK_VDSO_MODE").ok().as_deref(),
+    )
+}
+
+fn vdso_debug_mode_from_env(disable: Option<&str>, mode: Option<&str>) -> VdsoDebugMode {
+    if debug_env_flag_enabled(disable) {
+        return VdsoDebugMode::Disabled;
+    }
+    match mode {
+        Some("no-getrandom" | "nogetrandom" | "without-getrandom") => VdsoDebugMode::NoGetrandom,
+        Some("no-fastpaths" | "nofastpaths" | "minimal") => VdsoDebugMode::NoFastpaths,
+        Some("clock-syscalls" | "clocksyscalls" | "clock-syscall") => VdsoDebugMode::ClockSyscalls,
+        _ => VdsoDebugMode::Full,
+    }
+}
+
+fn debug_env_flag_enabled(value: Option<&str>) -> bool {
+    matches!(
+        value,
+        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+    )
+}
+
+fn hardware_tso_for_debug(requested: bool) -> bool {
+    requested && !debug_env_flag_enabled(std::env::var("CARRICK_DISABLE_TSO").ok().as_deref())
+}
+
+#[cfg(test)]
+fn hardware_tso_for_debug_from_env(requested: bool, disable: Option<&str>) -> bool {
+    requested && !debug_env_flag_enabled(disable)
+}
+
+fn with_optional_vdso(image: AddressSpace) -> Result<AddressSpace, AddressSpaceError> {
+    match vdso_debug_mode() {
+        VdsoDebugMode::Full => image.with_vdso(),
+        VdsoDebugMode::Disabled => Ok(image),
+        VdsoDebugMode::NoGetrandom => image.with_vdso_without_getrandom(),
+        VdsoDebugMode::NoFastpaths => image.with_vdso_without_fastpaths(),
+        VdsoDebugMode::ClockSyscalls => image.with_vdso_clock_syscalls(),
+    }
+}
+
 /// JSON-serialisable snapshot of the guest layout the trap engine is about
 /// to run. Written by `run-elf --debug-state-path` / `run --debug-state-path`
 /// before vCPU launch so the lldb plugin can resolve guest addresses back
@@ -211,6 +269,7 @@ where
             .read_exec_file(p)
             .or_else(|| std::fs::read(p).ok())
     })?
+    .with_vdso_auxv(vdso_enabled_for_debug())
     .with_linux_initial_stack(argv, env)?;
     finish_and_run_image(image, dispatcher, max_traps, debug_state_path)
 }
@@ -251,7 +310,9 @@ where
             env.iter().map(|s| s.as_bytes().to_vec()).collect(),
         );
     }
-    let image = AddressSpace::load_elf_bytes(bytes)?.with_linux_initial_stack(argv, env)?;
+    let image = AddressSpace::load_elf_bytes(bytes)?
+        .with_vdso_auxv(vdso_enabled_for_debug())
+        .with_linux_initial_stack(argv, env)?;
     finish_and_run_image(image, dispatcher, max_traps, None)
 }
 
@@ -315,6 +376,7 @@ where
     let image = AddressSpace::load_elf_bytes_with_reader(&file, &|p| {
         rootfs.read(p).ok().or_else(|| std::fs::read(p).ok())
     })?
+    .with_vdso_auxv(vdso_enabled_for_debug())
     .with_linux_initial_stack(argv, env)?;
     finish_and_run_image(image, dispatcher, max_traps, debug_state_path)
 }
@@ -427,6 +489,7 @@ where
         };
     let image =
         AddressSpace::load_elf_bytes_with_reader(&bytes, &|p| dispatcher.read_exec_file(p))?
+            .with_vdso_auxv(vdso_enabled_for_debug())
             .with_linux_initial_stack(argv, env)?;
     finish_and_run_image(image, dispatcher, max_traps, debug_state_path)
 }
@@ -642,8 +705,8 @@ fn finish_and_run_image(
     let image = image
         .with_el0_trampoline()?
         .with_el1_vectors()?
-        .with_stage1_page_tables()?
-        .with_vdso()?;
+        .with_stage1_page_tables()?;
+    let image = with_optional_vdso(image)?;
     if let Some(p) = maybe_dump_debug_state(&image, debug_state_path) {
         eprintln!("debug state written: {}", p.display());
     }
@@ -921,7 +984,7 @@ where
             DispatchOutcome::SetMemoryModel { tso } => {
                 // Rosetta requested hardware x86_64 TSO on this vCPU. Toggle
                 // ACTLR_EL1.EnTSO, then complete prctl with 0.
-                runtime.set_memory_model(tso)?;
+                runtime.set_memory_model(hardware_tso_for_debug(tso))?;
                 runtime.complete_syscall(0)?;
                 last_syscall_retval = Some(0);
             }
@@ -2439,7 +2502,7 @@ fn run_vcpu_until_exit(
                 }
                 DispatchOutcome::SetMemoryModel { tso } => {
                     // Rosetta requested hardware x86_64 TSO on this vCPU.
-                    engine.set_memory_model(tso)?;
+                    engine.set_memory_model(hardware_tso_for_debug(tso))?;
                     last_syscall_retval = Some(state.complete_returned(&mut engine, 0)?);
                 }
                 DispatchOutcome::MapHostAlias {
@@ -3087,6 +3150,60 @@ mod tests {
                 .expect("resolve");
         assert_eq!(path, "/bin/true");
         assert_eq!(argv, vec![b"/bin/true".to_vec()]);
+    }
+
+    #[test]
+    fn vdso_debug_control_is_opt_out() {
+        assert_eq!(vdso_debug_mode_from_env(None, None), VdsoDebugMode::Full);
+        assert_eq!(
+            vdso_debug_mode_from_env(Some("0"), None),
+            VdsoDebugMode::Full
+        );
+        assert_eq!(
+            vdso_debug_mode_from_env(Some("false"), None),
+            VdsoDebugMode::Full
+        );
+        assert_eq!(
+            vdso_debug_mode_from_env(None, Some("no-getrandom")),
+            VdsoDebugMode::NoGetrandom
+        );
+        assert_eq!(
+            vdso_debug_mode_from_env(None, Some("no-fastpaths")),
+            VdsoDebugMode::NoFastpaths
+        );
+        assert_eq!(
+            vdso_debug_mode_from_env(None, Some("clock-syscalls")),
+            VdsoDebugMode::ClockSyscalls
+        );
+        assert_eq!(
+            vdso_debug_mode_from_env(Some("1"), Some("no-getrandom")),
+            VdsoDebugMode::Disabled
+        );
+        assert_eq!(
+            vdso_debug_mode_from_env(Some("true"), None),
+            VdsoDebugMode::Disabled
+        );
+        assert_eq!(
+            vdso_debug_mode_from_env(Some("yes"), None),
+            VdsoDebugMode::Disabled
+        );
+        assert_eq!(
+            vdso_debug_mode_from_env(Some("on"), None),
+            VdsoDebugMode::Disabled
+        );
+    }
+
+    #[test]
+    fn hardware_tso_debug_control_only_suppresses_requested_tso() {
+        assert!(hardware_tso_for_debug_from_env(true, None));
+        assert!(hardware_tso_for_debug_from_env(true, Some("0")));
+        assert!(hardware_tso_for_debug_from_env(true, Some("false")));
+        assert!(!hardware_tso_for_debug_from_env(true, Some("1")));
+        assert!(!hardware_tso_for_debug_from_env(true, Some("true")));
+        assert!(!hardware_tso_for_debug_from_env(true, Some("yes")));
+        assert!(!hardware_tso_for_debug_from_env(true, Some("on")));
+        assert!(!hardware_tso_for_debug_from_env(false, None));
+        assert!(!hardware_tso_for_debug_from_env(false, Some("1")));
     }
 
     #[test]
