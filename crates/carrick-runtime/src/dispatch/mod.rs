@@ -439,6 +439,7 @@ mod creds;
 mod epoll_shim;
 pub(crate) use epoll_shim::{notify_inmem_epoll, register_epoll_kqueue, unregister_epoll_kqueue};
 mod fd_table;
+mod fifo_beacon;
 mod ioring;
 #[macro_use]
 mod fs;
@@ -1486,21 +1487,34 @@ impl SyscallDispatcher {
     /// on every fd-close path (close, close_range, exec CLOEXEC sweep) so the
     /// PtyTable never desyncs from the real fd lifetime.
     pub(in crate::dispatch) fn close_open_file_and_free_pty(&self, open_file: &OpenFile) {
-        let pty_master_index = if Arc::strong_count(&open_file.description) == 1 {
-            match &*open_file.description.read() {
-                OpenDescription::HostPipe {
-                    pty: Some(role), ..
-                } if role.is_master => Some(role.index),
-                _ => None,
+        // Only act when THIS is the last reference (the host fd is actually
+        // closing) — a dup'd fd sharing the Arc keeps the writer/pty alive.
+        let last_ref = Arc::strong_count(&open_file.description) == 1;
+        let mut pty_master_index = None;
+        let mut fifo_host_fd = None;
+        if last_ref {
+            if let OpenDescription::HostPipe { pty, host_fd, .. } = &*open_file.description.read() {
+                fifo_host_fd = Some(*host_fd);
+                if let Some(role) = pty {
+                    if role.is_master {
+                        pty_master_index = Some(role.index);
+                    }
+                }
             }
-        } else {
-            None
-        };
+        }
         close_open_file(open_file);
         if let Some(index) = pty_master_index {
             self.pty_table()
                 .lock()
                 .free_if_owner(index, std::process::id());
+        }
+        // A FIFO write-end close drops a beacon writer — wake epoll/poll so FIFO
+        // read-ends re-check the (kernel-decided) EOF (see dispatch::fifo_beacon).
+        // No-op for non-FIFO host pipes.
+        if let Some(host_fd) = fifo_host_fd {
+            if crate::dispatch::fifo_beacon::register_close(host_fd) {
+                crate::dispatch::notify_inmem_epoll();
+            }
         }
     }
 

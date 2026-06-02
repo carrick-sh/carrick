@@ -624,6 +624,9 @@ impl SyscallDispatcher {
                 .open_fifo_nonblock(&path, access_idx)
             {
                 Some(host_fd) => {
+                    // Track this FIFO end for kernel-backed writer-close EOF
+                    // readiness (macOS won't report it — see dispatch::fifo_beacon).
+                    crate::dispatch::fifo_beacon::register_open(host_fd, access_idx);
                     let description = OpenDescription::HostPipe {
                         host_fd,
                         is_read_end: access != LINUX_O_WRONLY,
