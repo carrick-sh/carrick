@@ -1841,6 +1841,37 @@ pub const LINUX_PR_GET_NAME: u64 = 16;
 /// (docs/namespaces-design.md §4.4); not enforced, but libcap tools query them.
 pub const LINUX_PR_CAPBSET_READ: u64 = 23;
 pub const LINUX_PR_CAPBSET_DROP: u64 = 24;
+/// `prctl(PR_GET_KEEPCAPS)` / `PR_SET_KEEPCAPS` — preserve capabilities across a
+/// uid transition that would otherwise clear them. Recorded and echoed back.
+pub const LINUX_PR_GET_KEEPCAPS: u64 = 7;
+pub const LINUX_PR_SET_KEEPCAPS: u64 = 8;
+/// `prctl(PR_GET_SECCOMP)` / `PR_SET_SECCOMP` — query/install the seccomp mode.
+/// `PR_SET_SECCOMP(SECCOMP_MODE_FILTER=2, prog)` is the legacy entry point for
+/// the same cBPF install as `seccomp(2)`'s `SECCOMP_SET_MODE_FILTER`.
+pub const LINUX_PR_GET_SECCOMP: u64 = 21;
+pub const LINUX_PR_SET_SECCOMP: u64 = 22;
+pub const LINUX_SECCOMP_MODE_STRICT: u64 = 1;
+pub const LINUX_SECCOMP_MODE_FILTER: u64 = 2;
+/// `prctl(PR_SET_TIMERSLACK)` / `PR_GET_TIMERSLACK` — per-process timer-slack in
+/// nanoseconds (the rounding window the kernel may apply to select/poll/futex
+/// timeouts). Recorded and echoed back; default 50µs (50000 ns). `SET` with 0
+/// resets to the default. carrick does not actually coarsen its waits.
+pub const LINUX_PR_SET_TIMERSLACK: u64 = 29;
+pub const LINUX_PR_GET_TIMERSLACK: u64 = 30;
+pub const LINUX_DEFAULT_TIMERSLACK_NS: u64 = 50_000;
+/// `prctl(PR_SET_CHILD_SUBREAPER)` / `PR_GET_CHILD_SUBREAPER` — mark this process
+/// as a subreaper so orphaned descendants reparent to it. Recorded and echoed
+/// back (GET writes the value to `*(int *)arg2`); reparent semantics are a
+/// follow-up — the value round-trips so init systems' feature checks pass.
+pub const LINUX_PR_SET_CHILD_SUBREAPER: u64 = 36;
+pub const LINUX_PR_GET_CHILD_SUBREAPER: u64 = 37;
+/// `prctl(PR_SET_NO_NEW_PRIVS)` / `PR_GET_NO_NEW_PRIVS` — the no-new-privileges
+/// bit. Once set to 1 it cannot be cleared (one-way latch), and it is the
+/// precondition for an unprivileged `seccomp(2)`/`PR_SET_SECCOMP` filter install
+/// (Docker, systemd, Go `os/exec`, Chrome's sandbox all set it). `SET` requires
+/// `arg2 == 1` and `arg3..arg5 == 0`; `GET` returns the bit as the return value.
+pub const LINUX_PR_SET_NO_NEW_PRIVS: u64 = 38;
+pub const LINUX_PR_GET_NO_NEW_PRIVS: u64 = 39;
 /// `prctl(PR_GET_MEM_MODEL, …)` / `prctl(PR_SET_MEM_MODEL, …)` — query or set
 /// the CPU memory-ordering model. Apple Rosetta 2 issues
 /// `PR_SET_MEM_MODEL(PR_SET_MEM_MODEL_TSO)` at startup to request hardware
@@ -2067,6 +2098,13 @@ pub const LINUX_SOL_SOCKET: i32 = 1;
 /// `cmsghdr` layout differs (Linux `cmsg_len` is `size_t`/8B, macOS is u32/4B),
 /// so carrick translates the control buffer in sendmsg/recvmsg.
 pub const LINUX_SCM_RIGHTS: i32 = 1;
+/// `SCM_CREDENTIALS` ancillary type — carries `struct ucred { pid, uid, gid }`
+/// (12 bytes). Synthesized on recvmsg when the receiving AF_UNIX socket has
+/// `SO_PASSCRED` enabled (D-Bus/systemd/polkit peer auth). (audit M2)
+pub const LINUX_SCM_CREDENTIALS: i32 = 2;
+/// `SO_PASSCRED` socket option (Linux number 16) — enable receiving the peer's
+/// credentials as an `SCM_CREDENTIALS` ancillary message. (audit M2)
+pub const LINUX_SO_PASSCRED: i32 = 16;
 /// Linux `struct cmsghdr` header bytes: `__kernel_size_t cmsg_len` (8) + `int
 /// cmsg_level` (4) + `int cmsg_type` (4). CMSG data is then `CMSG_ALIGN`ed to 8.
 pub const LINUX_CMSGHDR_LEN: usize = 16;
