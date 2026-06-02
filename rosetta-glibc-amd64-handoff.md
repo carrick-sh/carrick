@@ -4,7 +4,7 @@ Branch: `feat/rosetta-glibc-amd64` (off `main`). Design/plan:
 `docs/superpowers/specs/2026-06-01-rosetta-glibc-amd64-design.md`,
 `docs/superpowers/plans/2026-06-01-rosetta-glibc-amd64.md`.
 
-## Status: Phase 1 COMPLETE ✅ · Phase 2 fork+signal blockers RESOLVED ✅
+## Status: Phase 1 COMPLETE ✅ · fork+signal + high-VA alias bugs RESOLVED ✅
 
 `carrick run --platform linux/amd64 --fs host {debian:stable,ubuntu:24.04} /bin/uname -m`
 → **`x86_64`**, exit 0. arm64 → `aarch64`. amd64 `/bin/sh` pipelines that fork
@@ -86,32 +86,35 @@ numeric sort, **fork+exec ×200** (exercises the fork fix), **SIGUSR1 trap+handl
 base64 round-trip, `wc -c`/`wc -l`. The translation core is sound.
 
 ### Open items
-- **(R, carrick high-VA alias bug, OPEN — needs robust fix) syscall writes to an
-  mmap'd buffer land at the wrong backing.** Symptom: `cat -n` (any `cat` option)
-  emits the line number then NUL bytes instead of the line body; dash misparses
-  `/usr/bin/gunzip`. **Confirmed carrick's, not Apple's:** the SAME ubuntu `cat`
-  under Docker's Rosetta is correct — only carrick corrupts it. **Localized:**
-  forcing glibc to brk (`MALLOC_MMAP_THRESHOLD_=big`) FIXES `cat -n`; the bug only
-  hits buffers glibc serves via `mmap` (high-VA alias under Rosetta x86_64). It's
-  the same class as the `uname`-NUL bug: carrick's `read()` writes the file bytes
-  via `mapping_for_range_mut` (VA→region, linear `host_addr + (va - start)`,
-  newest-first), but the guest reads via its stage-1 page tables (VA→IPA→host).
-  When those disagree the guest reads zeros. **Direct measurement** (CARRICK_ALIAS_DEBUG
-  diag, now reverted): cat's inbuf `0x7fffff525000` is in alias region B
-  (`start=0x7fffff524000 ipa=0x1821000000`), but region A
-  (`start=0x7fffff482000 len=0xa2000`) had `end = va + hostsize` where hostsize is
-  the 16 KiB-rounded `0xa4000` — so A's `end` over-claimed 8 KiB into B's VA span,
-  and newest-first picked A. The guest's stage-1 (leaf IPA `0x1821001000`) pointed
-  to B. **A one-line fix** (`end: va + len`, exact stage-1 coverage) FIXES `cat -n`
-  but REGRESSES `tac` (`seq 1 100000 | tac | head -1` → 8635 not 100000), so it is
-  NOT safe — `tac` exposes a second facet of the same VA→host-vs-stage-1 mismatch.
-  **The robust fix** is to resolve syscall memory access through the guest's actual
-  stage-1 walk (VA→IPA, then IPA→host by the region owning that IPA), instead of
-  the linear `region.start..end` heuristic — guaranteeing carrick reads/writes
-  exactly where the guest does, for overlaps, 16 KiB rounding, and the non-linear
-  static Rosetta window alike. That is a meaty, hot-path change deferred for its
-  own careful cycle. (The trivial `end: va + len` change is captured here but was
-  reverted because of the `tac` regression.)
+- **(R, FIXED — commit `fix(rosetta/mem): resolve high-VA alias syscall buffers by
+  stage-1 IPA`) syscall writes to an mmap'd buffer landed at the wrong backing.**
+  `cat -n` (any `cat` option) emitted the line number then NUL bytes; `tr`/`cut`/
+  `nl`/plain `cat` were fine. Confirmed carrick's (Docker's Rosetta is correct) and
+  localized to glibc-`mmap`'d (high-VA alias) buffers (forcing brk worked). Root
+  cause: alias regions overlap by VA because `HvfMappedRegion.end = va + host_size`
+  and the host size is rounded up to the 16 KiB HVF granule while stage-1 maps only
+  the exact `len` — so `mapping_for_range`'s newest-first VA scan could pick a
+  region the guest's stage-1 does NOT use (measured: cat's inbuf `0x7fffff525000`
+  resolved to region A whose rounded `end` over-claimed region B, whose stage-1
+  leaf IPA `0x1821001000` the guest actually used). Fix: for high-VA, prefer the
+  region whose `hv_vm_map`'d IPA window owns the guest's OWN stage-1 translation
+  (`PageTableManager::translate`), fallback to the VA scan when stage-1 has no
+  entry (early boot). Low-VA fast path untouched. The full amd64-vs-arm64 battery
+  is 11/12 (cat/tac/grep/compute all match); unit tests added.
+- **(G, carrick bug, OPEN — separate from R) dash misparses a >~1 KiB multi-line
+  quoted string → "unterminated quoted string".** Breaks `gunzip` (its `usage=`
+  here-string) and any `#!/bin/sh` wrapper with a long quoted block. **Confirmed
+  carrick's, not Apple's** (Docker's Rosetta parses both fine). **NOT the (R) alias
+  class:** forcing brk does NOT fix it; file reads are byte-correct (md5 + reads at
+  offset 0/1024/2048 all match arm64; `dd bs=1024/512/100` return the full file);
+  fails identically via file-arg, stdin, and `cat | sh`. The break lands right at
+  dash's `IBUFSIZ` (~1 KiB) input refill — i.e. while accumulating a long quoted
+  string across a buffer boundary. Short quoted strings parse fine. So it is a
+  carrick-specific corruption of dash's parse state at the refill / string-buffer
+  growth, independent of read content and buffer placement. Next: get a working
+  `carrick trace` (the `-o` file came back empty on first try — recheck probe
+  names in `scripts/trace-syscalls-perpid.d`) on the dash child, watching for a
+  fault/signal or an off-nominal syscall (mremap/brk/sigaltstack) at the refill.
 - **(syscall workstream, not Rosetta layer) `FUTEX_LOCK_PI_PRIVATE` → ENOSYS.**
   `grep` aborts with `rosetta error: futex(FUTEX_LOCK_PI_PRIVATE) failure: 38`;
   the Rosetta runtime needs priority-inheritance futexes. carrick returns ENOSYS.
@@ -122,7 +125,7 @@ base64 round-trip, `wc -c`/`wc -l`. The translation core is sound.
   path matter, not the Rosetta translation layer.
 
 ## Remaining plan (Rosetta layer)
-- Localize and fix (R) `cat -n`/dash divergence (trace skill).
+- Localize and fix (G) the dash long-quoted-string parse bug (trace skill).
 - Lock-in tests: the fork-restore + rt_sigreturn fixes, plus the high-VA over-map
   and overlap fixes (assert `mapping_for_range` returns the newest overlapping
   region; a sub-16 KiB high-VA mmap doesn't perturb a neighbour's L3 entries).
