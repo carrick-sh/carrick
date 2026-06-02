@@ -1209,10 +1209,11 @@ impl SyscallDispatcher {
 
         fn uname(this, cx, address: GuestPtr) {
             let memory = &mut *cx.memory;
-            if memory
-                .write_bytes(address.0, LinuxUtsname::carrick_aarch64().abi_bytes())
-                .is_err()
-            {
+            // nodename is the runtime-resolved guest hostname (the macOS host's
+            // short name under --net=host; `carrick` fallback) so uname(2) agrees
+            // with /proc/sys/kernel/hostname and the /etc/hosts self-mapping.
+            let uts = LinuxUtsname::carrick_aarch64_with_nodename(crate::execute::guest_hostname());
+            if memory.write_bytes(address.0, uts.abi_bytes()).is_err() {
                 return Ok(LINUX_EFAULT.into());
             }
             Ok(DispatchOutcome::Returned { value: 0 })

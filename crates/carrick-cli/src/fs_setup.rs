@@ -123,6 +123,16 @@ fn seed_guest_baseline(backend: &mut dyn FsBackend) {
          ff02::1\tip6-allnodes\n\
          ff02::2\tip6-allrouters\n",
     );
+    // Self-mapping so the guest's own hostname resolves
+    // (`gethostbyname(gethostname())`), as every Linux host and Docker container
+    // has. Debian convention: the configured hostname on a dedicated 127.0.1.1,
+    // distinct from 127.0.0.1 localhost. The name is the canonical UTS nodename
+    // (single source of truth) so /etc/hosts stays in lockstep with uname(2) and
+    // /proc/sys/kernel/hostname. --net=host: one global hostname on loopback.
+    hosts_content.push_str(&format!(
+        "127.0.1.1\t{}\n",
+        carrick_runtime::execute::guest_hostname()
+    ));
     for hostname in HOSTNAMES {
         if let Ok(addrs) = (*hostname, 80u16).to_socket_addrs() {
             for addr in addrs {
