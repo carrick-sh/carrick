@@ -319,7 +319,27 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             }
 
             let engine = carrick_engine::Engine::new(store.clone());
-            let result = block_on_oci(async { engine.run(req.clone()).await })?;
+            // Docker exits 125 when `run` itself fails *before/at* container
+            // start — image resolve/pull, an invalid reference, no command, or
+            // VM setup. (The container's OWN exit code is the Ok path below;
+            // 126/127 for a bad entrypoint are produced inside the runtime.)
+            let result = match block_on_oci(async { engine.run(req.clone()).await }) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("carrick: {e:#}");
+                    // This arm can run in the forked guest-init child (under
+                    // `--pid private` the supervisor fork happens inside
+                    // engine.run, and an HVF/setup failure surfaces here in the
+                    // child). `std::process::exit` runs atexit/Drop cleanup,
+                    // which is unsafe after fork and double-closes an inherited
+                    // fd (IO-safety abort → SIGABRT). `_exit` terminates without
+                    // that cleanup, like the runtime's other forked-child exits.
+                    // stderr is already flushed (eprintln is unbuffered).
+                    // SAFETY: _exit is async-signal-safe; no cleanup to skip on
+                    // this error path (no buffered stdout; the report isn't emitted).
+                    unsafe { libc::_exit(125) };
+                }
+            };
 
             // The container's host exit status: its real exit code, or 1 when
             // the guest hit the trap limit without exiting. Docker propagates
