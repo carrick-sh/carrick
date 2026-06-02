@@ -56,6 +56,36 @@ pub struct ContainerState {
     pub exit_code: Option<i32>,
     /// `--rm`: remove the registry entry when the container exits.
     pub auto_remove: bool,
+    /// Run configuration needed to `exec` into (and later restart) this
+    /// container. Additive: `#[serde(default)]` so registry entries written
+    /// before this field existed still load.
+    #[serde(default)]
+    pub config: RunConfig,
+}
+
+/// The subset of a container's run inputs persisted so `exec` (and later
+/// `start`/`restart`) can reconstruct a compatible run. `exec` re-resolves the
+/// image layers from the store via [`ContainerState::image`] and re-applies
+/// these, overriding with its own flags.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RunConfig {
+    /// Raw `--platform` string (`None` = host default).
+    pub platform: Option<String>,
+    /// Container env overrides (`-e`/`--env-file`), re-applied over the image env.
+    pub env: Vec<String>,
+    /// `-w/--workdir`.
+    pub workdir: Option<String>,
+    /// `-u/--user` (numeric `uid[:gid]` or a name).
+    pub user: Option<String>,
+    /// PID namespace mode — `exec` joins the same region.
+    pub pid: carrick_spec::PidMode,
+    /// On-disk writable overlay path (`--fs host`), shared with `exec`. `None`
+    /// means the container used the in-process memory fs, so `exec` (which needs
+    /// a shareable overlay) is unsupported for it.
+    pub scratch_path: Option<String>,
+    /// File-backed PID region path, `mmap`'d by `exec` to join the namespace.
+    pub region_path: Option<String>,
 }
 
 /// The registry root: `<scratch>/containers` (per-user, case-sensitive). Each
@@ -334,9 +364,33 @@ mod tests {
             created_secs: 0,
             exit_code: None,
             auto_remove: false,
+            config: RunConfig::default(),
         };
         assert_eq!(reconciled_status(&s), ContainerStatus::Exited);
         s.status = ContainerStatus::Created;
         assert_eq!(reconciled_status(&s), ContainerStatus::Created);
+    }
+
+    #[test]
+    fn run_config_round_trips_and_defaults_when_missing() {
+        // A registry entry written before `config` existed must still load
+        // (additive #[serde(default)]).
+        let legacy = r#"{"id":"x","name":null,"image":"img","command":[],
+            "status":"created","supervisor_pid":0,"init_pid":0,"created_secs":0,
+            "exit_code":null,"auto_remove":false}"#;
+        let s: ContainerState = serde_json::from_str(legacy).expect("legacy state loads");
+        assert!(s.config.scratch_path.is_none());
+        assert!(s.config.region_path.is_none());
+
+        // A populated config round-trips.
+        let mut s2 = s.clone();
+        s2.config.scratch_path = Some("/p/scratch".into());
+        s2.config.region_path = Some("/p/region".into());
+        s2.config.env = vec!["A=1".into()];
+        let json = serde_json::to_string(&s2).expect("serialize");
+        let round: ContainerState = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(round.config.scratch_path.as_deref(), Some("/p/scratch"));
+        assert_eq!(round.config.region_path.as_deref(), Some("/p/region"));
+        assert_eq!(round.config.env, vec!["A=1".to_string()]);
     }
 }
