@@ -82,6 +82,47 @@ forkserver worker's unpickle pulls a heavy import; and the exact regrtest
 process/scheduling. The reliable repro above remains the `-m test_parent_process`
 invocation.
 
+## Update (2026-06-02): topology pinned to nested server B; Heisenberg observability
+
+Regression-checked the EV_CLEAR fix: **0 regressions** (469 workspace lib + 247
+carrick-runtime integration + cli/nested_pipe/runtime_loop/trap_hvf/
+thread_stress/wait_proc_exit_recovery + the 4-test gate all green; the 3
+`syscall_process.rs` failures are pre-existing — identical at parent `ff638a0`).
+
+Deadlock topology (clean `sample` of a hung run — all processes at **0.0 % CPU**,
+i.e. a quiet deadlock, no spin):
+- The **first** forkserver server A works: binds its listener, registers it on
+  its epoll, sees the worker's connect (`epoll-result ready=1`), processes it,
+  blocks for the next.
+- The **nested** forkserver server **B fails to function** after the worker
+  fork+execs it. The clean sample shows a process parked in
+  `io_wait::wait_poll` (B's `epoll_pwait` on its kqueue) whose listener never
+  becomes readable on the worker's connect.
+
+**Heisenberg:** in-code gated `eprintln`s (`CARRICK_EPOLL_SPIN`) at bind/connect/
+epoll_ctl/epoll_pwait perturb the timing enough that the manifestation CHANGES —
+under instrumentation B doesn't even reach its select loop (its listener is
+bound by the worker, but B does no `epoll_ctl(ADD)` / `epoll_pwait`), i.e. B
+wedges earlier in startup. So both `dtrace` AND `eprintln` perturb this race;
+the clean manifestation (B in epoll, listener never wakes) is only visible by
+`sample`, which doesn't show the guest-level cause.
+
+This is the documented **#1 HVF nested-fork Heisenbug** (a server forked+exec'd
+from a forkserver-spawned worker fails to function) — same family as
+`[[project_shared_file_coherence]]` (post-spawn coherence on a nested fork).
+Note: B's listener + epoll are HOST objects (kqueue, host fds), so if the cause
+is host-fd/kqueue state being wrong across the nested fork+exec rather than
+guest-memory stage-2 TLB coherence, that's a distinct (and possibly more
+tractable) bug — to be determined with non-perturbing observability.
+
+**Next-step tooling:** the eprintln/dtrace perturbation must be eliminated to
+observe the clean manifestation. Use a **lock-free in-memory event ring**
+(an atomic index + fixed array, ~ns/event, no syscall/lock) that the
+bind/connect/epoll_ctl/epoll_pwait/accept handlers append to, dumped
+post-mortem (sample the ring memory of the hung B, or dump on a signal). Then
+determine whether B's epoll registers the correct listener host fd and whether
+the worker's connect makes that host fd readable on B's kqueue.
+
 ## Next steps for the real fix
 
 Pin **why B's epoll never wakes on the worker's connect**:
