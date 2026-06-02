@@ -68,6 +68,24 @@ fn entrypoint_not_executable_result() -> RunResult {
     }
 }
 
+/// For a detached container (`CARRICK_CONTAINER_ID` set), the stable on-disk
+/// overlay path `<registry>/<id>/scratch`, recording it into the registry so
+/// `carrick exec` can attach the same filesystem. `None` for a foreground run
+/// (which uses an ephemeral per-run scratch). Best-effort registry write — a
+/// failure just means `exec` can't find the overlay later, not a run failure.
+fn detached_stable_scratch() -> Option<PathBuf> {
+    let id = std::env::var("CARRICK_CONTAINER_ID").ok()?;
+    if !crate::container::is_safe_id(&id) {
+        return None;
+    }
+    let scratch = crate::container::container_dir(&id).join("scratch");
+    if let Ok(mut state) = crate::container::ContainerState::load(&id) {
+        state.config.scratch_path = Some(scratch.to_string_lossy().into_owned());
+        let _ = state.persist();
+    }
+    Some(scratch)
+}
+
 /// For an `amd64` (Rosetta-translated) container, expose the host's Rosetta
 /// runtime files inside the guest VFS at the same paths. Rosetta opens these at
 /// startup to load its support libraries and (optionally) its AOT translation
@@ -169,12 +187,23 @@ impl Runtime {
         let result = match spec.fs_backend {
             FsBackendKind::Host => {
                 // Stream every OCI layer straight onto the cap-std scratch Dir.
-                let mut host = HostFsBackend::new().map_err(|e| {
-                    RuntimeError::FsBackend(anyhow::anyhow!(
-                        "failed to create scratch directory: {}",
-                        e
-                    ))
-                })?;
+                // A DETACHED container gets a STABLE overlay under its registry
+                // dir (persisted + shared with `exec`, cleaned up by `rm`); a
+                // foreground run gets an ephemeral per-run TempDir.
+                let mut host = match detached_stable_scratch() {
+                    Some(scratch) => HostFsBackend::attach_or_create(&scratch).map_err(|e| {
+                        RuntimeError::FsBackend(anyhow::anyhow!(
+                            "failed to create container overlay: {}",
+                            e
+                        ))
+                    })?,
+                    None => HostFsBackend::new().map_err(|e| {
+                        RuntimeError::FsBackend(anyhow::anyhow!(
+                            "failed to create scratch directory: {}",
+                            e
+                        ))
+                    })?,
+                };
 
                 // Convert layers to Vec<PathBuf>
                 let layer_paths: Vec<PathBuf> = spec

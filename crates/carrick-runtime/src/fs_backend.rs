@@ -888,6 +888,25 @@ impl HostFsBackend {
         }
     }
 
+    /// Open an EXISTING scratch directory as the writable overlay WITHOUT owning
+    /// its lifetime (no `TempDir` auto-delete, no lockfile). Because the
+    /// `--fs host` path extracts the whole rootfs onto the scratch, that
+    /// directory IS the container's full filesystem — so this backs a detached
+    /// container's stable overlay at `<registry>/<id>/scratch` (cleaned up by
+    /// `carrick rm`) and lets `exec` share the exact same filesystem.
+    pub fn attach(path: &Path) -> std::io::Result<Self> {
+        let dir = cap_std::fs::Dir::open_ambient_dir(path, cap_std::ambient_authority())?;
+        Ok(Self::from_existing_dir(dir))
+    }
+
+    /// Like [`HostFsBackend::attach`], but creates `path` first if it is absent.
+    /// Used to lay down a detached container's stable overlay before extracting
+    /// the image layers into it.
+    pub fn attach_or_create(path: &Path) -> std::io::Result<Self> {
+        std::fs::create_dir_all(path)?;
+        Self::attach(path)
+    }
+
     /// Fast `real_stat` for the common regular-file / directory case on
     /// `--fs host`: one `fstatat` (kernel resolves the whole path) instead of
     /// cap-std's per-component walk, with an `openat`+`F_GETPATH` containment
@@ -2984,6 +3003,18 @@ mod tests {
     fn host_open_create_write_read() {
         let (mut b, _scratch) = host_backend();
         scenario_open_create_write_read(&mut b);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn attach_shares_an_existing_scratch_across_handles() {
+        // exec relies on this: a second backend attached to the same on-disk
+        // scratch sees the first's writes (the shared container overlay).
+        let scratch = tempfile::TempDir::new().unwrap();
+        let a = HostFsBackend::attach(scratch.path()).unwrap();
+        a.set_file_contents("/hello", b"world".to_vec()).unwrap();
+        let b = HostFsBackend::attach(scratch.path()).unwrap();
+        assert_eq!(b.file_contents("/hello").as_deref(), Some(&b"world"[..]));
     }
 
     #[cfg(target_os = "macos")]
