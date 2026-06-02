@@ -89,8 +89,12 @@ base64 round-trip, `wc -c`/`wc -l`. The translation core is sound.
 - **(R, FIXED — commit `fix(rosetta/mem): resolve high-VA alias syscall buffers by
   stage-1 IPA`) syscall writes to an mmap'd buffer landed at the wrong backing.**
   `cat -n` (any `cat` option) emitted the line number then NUL bytes; `tr`/`cut`/
-  `nl`/plain `cat` were fine. Confirmed carrick's (Docker's Rosetta is correct) and
-  localized to glibc-`mmap`'d (high-VA alias) buffers (forcing brk worked). Root
+  `nl`/plain `cat` were fine. **Definitively carrick's** — root-caused directly in
+  carrick code (the `mapping_for_range` over-claim, proven with carrick-internal
+  ALIAS-WRITE + stage-1-walk diagnostics) and fixed; the fix is validated
+  end-to-end. (Docker — which uses QEMU here, not Rosetta — was correct, but that
+  was only corroboration; the carrick-internal root-cause is what settles blame.)
+  Localized to glibc-`mmap`'d (high-VA alias) buffers (forcing brk worked). Root
   cause: alias regions overlap by VA because `HvfMappedRegion.end = va + host_size`
   and the host size is rounded up to the 16 KiB HVF granule while stage-1 maps only
   the exact `len` — so `mapping_for_range`'s newest-first VA scan could pick a
@@ -107,8 +111,16 @@ base64 round-trip, `wc -c`/`wc -l`. The translation core is sound.
   a long UNQUOTED token → dash silently misparses (swallows the rest of the input,
   runs a corrupted assignment, exits 0 with no `echo` output). **Precisely
   characterized:**
-  - Confirmed carrick's, not Apple's (Docker's Rosetta parses both fine).
-  - NOT the (R) alias class: forcing brk (`MALLOC_MMAP_THRESHOLD_`) does NOT fix it.
+  - BLAME UNDETERMINED. The Docker baseline parses all sizes fine — BUT Docker on
+    this host uses **QEMU, not Rosetta** (confirmed: no Rosetta in `docker info`,
+    no rosetta binfmt, and `rust:slim` crashed with a `qemu:` signature). So
+    "Docker correct" only means QEMU translates dash correctly; it does NOT
+    distinguish a carrick environment bug from an **Apple Rosetta** mistranslation
+    of dash that carrick inherits (and could not fix). Settling this needs a REAL
+    Apple-Rosetta-on-Linux baseline (Docker Desktop with "Use Rosetta" enabled, or
+    another Linux-Rosetta path) — not available in this session.
+  - NOT the (R) alias class: forcing brk (`MALLOC_MMAP_THRESHOLD_`) does NOT fix it
+    (nor does forcing mmap, `MALLOC_MMAP_THRESHOLD_=0`).
   - NOT a read bug: file content is byte-correct (md5 + reads at offset
     0/1024/2048 match arm64; `dd bs=8192/4096/1024/512/100` all return the full
     file — a single large `read()` does not truncate).
@@ -118,15 +130,25 @@ base64 round-trip, `wc -c`/`wc -l`. The translation core is sound.
   - Threshold (single-line quoted, all `a`): N≤1320 OK and intact (`${#q}`==N);
     N≈1340 silently empty; N≥1350 "unterminated". dash's accumulation is correct
     up to 1300, so the corruption is at the parser-buffer GROW around ~1340 B.
-  So it is a carrick-specific correctness defect in dash's token/string
-  accumulation as its parse buffer grows past ~1340 bytes — no fault, no bad read,
-  guest-internal (dash writes the buffer and reads it back), Docker-correct.
-  Suspects: dash's `growstackblock` realloc-move interacting with how carrick
-  faults in / maps the grown pages, or a Rosetta JIT path for the accumulation
-  loop steered by carrick's emulated EL0 CPU-ID/cache regs (Task 7). Pinning it
-  needs a WORKING `carrick trace` (the `-o` file came back empty here — a tooling/
-  env issue to resolve) or a dash built with instrumentation, watching the
-  parser-buffer grow at the ~1340 B boundary.
+  - dash-SPECIFIC, not a general carrick memory bug: perl built+read a 2M-element
+    array fine, so guest write-then-read of large buffers works in general. Only
+    dash's parser accumulation past ~1340 B corrupts.
+  So it is a correctness defect in dash's token/string accumulation as its parse
+  buffer grows past ~1340 bytes — no fault, no bad read, guest-internal (dash
+  writes the buffer and reads it back), QEMU-correct, brk- and mmap-independent.
+  Suspects: dash's `growstackblock` realloc-move interacting with carrick's
+  page-fault/mapping, or (given Docker=QEMU) an Apple Rosetta JIT mistranslation
+  of dash's accumulation loop that QEMU lacks. **A Rust repro was attempted** but
+  static-musl x86_64 does NOT run under carrick (the documented static-PIE/musl
+  limitation — even a trivial hello SEGVs), and a glibc-DYNAMIC x86_64 build needs
+  a cross-toolchain (none installed; Docker's rustc crashes under QEMU). Next:
+  build a glibc-dynamic x86_64 repro (zig cc / messense gcc cross, or in a
+  Rosetta-enabled container) that mimics dash's `growstackblock` and run it under
+  carrick — if a SIMPLE realloc-grow corrupts, it's carrick; if only dash's exact
+  code does, suspect Apple Rosetta. Plus get a real-Rosetta baseline to settle
+  blame. `carrick trace` DOES work to stdout (the `-o` flag was the empty-file
+  cause); the failing parse shows no fault and no anomalous syscall, confirming
+  the corruption is below the syscall layer.
 - **(syscall workstream, not Rosetta layer) `FUTEX_LOCK_PI_PRIVATE` → ENOSYS.**
   `grep` aborts with `rosetta error: futex(FUTEX_LOCK_PI_PRIVATE) failure: 38`;
   the Rosetta runtime needs priority-inheritance futexes. carrick returns ENOSYS.
