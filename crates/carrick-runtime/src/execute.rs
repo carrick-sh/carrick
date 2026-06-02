@@ -398,56 +398,73 @@ fn seed_guest_baseline(backend: &mut dyn FsBackend, rootfs: Option<&RootFs>) {
         b"passwd: files\ngroup: files\nhosts: files dns\n".to_vec(),
     );
 
-    // /etc/hosts. Check existence FIRST so we never resolve (below) only to
-    // discard the result when the guest already has a hosts file.
-    let have_hosts = backend.metadata("/etc/hosts").is_some()
-        || rootfs
-            .and_then(|rootfs| rootfs.metadata("/etc/hosts").ok())
-            .is_some();
-    if !have_hosts {
-        let mut hosts_content = String::from(
-            "127.0.0.1\tlocalhost\n\
-             ::1\tlocalhost ip6-localhost ip6-loopback\n\
-             ff02::1\tip6-allnodes\n\
-             ff02::2\tip6-allrouters\n",
-        );
-        // Self-mapping so the guest's own hostname resolves
-        // (`gethostbyname(gethostname())`) — every Linux host and Docker
-        // container has this, and apps routinely look up their own name to find
-        // their IP. Debian convention: the configured hostname on a dedicated
-        // 127.0.1.1, distinct from 127.0.0.1 localhost. The name is the canonical
-        // UTS nodename so it stays in lockstep with uname(2) and
-        // /proc/sys/kernel/hostname. --net=host: one global hostname on loopback.
-        hosts_content.push_str(&format!("127.0.1.1\t{}\n", guest_hostname()));
-        // Pre-resolving the Debian/Ubuntu apt mirrors here was ~8 blocking
-        // getaddrinfo() calls (~80 ms via mDNSResponder) on EVERY startup — a
-        // profile showed it was the #2 cost after diskutil. It predates carrick
-        // synthesizing /etc/resolv.conf from the host resolver, so the guest now
-        // resolves these mirrors itself; the static seed is redundant. Keep it
-        // available behind an opt-in env for offline/locked-down apt runs, but
-        // off the default hot path.
-        if std::env::var_os("CARRICK_SEED_APT_MIRRORS").is_some() {
-            const HOSTNAMES: &[&str] = &[
-                "deb.debian.org",
-                "security.debian.org",
-                "ftp.debian.org",
-                "archive.ubuntu.com",
-                "security.ubuntu.com",
-                "ports.ubuntu.com",
-            ];
-            for hostname in HOSTNAMES {
-                if let Ok(addrs) = (*hostname, 80u16).to_socket_addrs() {
-                    for addr in addrs {
-                        if let std::net::IpAddr::V4(v4) = addr.ip() {
-                            hosts_content.push_str(&format!("{}\t{}\n", v4, hostname));
-                            break;
-                        }
+    // /etc/hosts is RUNTIME-managed under the --net=host contract: like Docker,
+    // carrick regenerates it on every start (NOT an if-missing seed) so the guest
+    // always resolves `localhost` AND its own hostname
+    // (`gethostbyname(gethostname())`) — apps routinely look up their own name to
+    // find their IP. Docker images typically ship an EMPTY /etc/hosts and rely on
+    // the runtime to populate it, so an existence guard here would (wrongly) leave
+    // the guest unable to resolve itself (Go os Test...; CPython test_socket).
+    let mut hosts_content = String::from(
+        "127.0.0.1\tlocalhost\n\
+         ::1\tlocalhost ip6-localhost ip6-loopback\n\
+         ff02::1\tip6-allnodes\n\
+         ff02::2\tip6-allrouters\n",
+    );
+    // Self-mapping: Debian convention puts the configured hostname on a dedicated
+    // 127.0.1.1, distinct from 127.0.0.1 localhost. The name is the canonical UTS
+    // nodename so it stays in lockstep with uname(2), /etc/hostname, and
+    // /proc/sys/kernel/hostname. --net=host: one global hostname on loopback.
+    hosts_content.push_str(&format!("127.0.1.1\t{}\n", guest_hostname()));
+    // Pre-resolving the Debian/Ubuntu apt mirrors here was ~8 blocking
+    // getaddrinfo() calls (~80 ms via mDNSResponder) on EVERY startup — a profile
+    // showed it was the #2 cost after diskutil. It predates carrick synthesizing
+    // /etc/resolv.conf from the host resolver, so the guest now resolves these
+    // mirrors itself; the static seed is redundant. Keep it available behind an
+    // opt-in env for offline/locked-down apt runs, but off the default hot path.
+    if std::env::var_os("CARRICK_SEED_APT_MIRRORS").is_some() {
+        const HOSTNAMES: &[&str] = &[
+            "deb.debian.org",
+            "security.debian.org",
+            "ftp.debian.org",
+            "archive.ubuntu.com",
+            "security.ubuntu.com",
+            "ports.ubuntu.com",
+        ];
+        for hostname in HOSTNAMES {
+            if let Ok(addrs) = (*hostname, 80u16).to_socket_addrs() {
+                for addr in addrs {
+                    if let std::net::IpAddr::V4(v4) = addr.ip() {
+                        hosts_content.push_str(&format!("{}\t{}\n", v4, hostname));
+                        break;
                     }
                 }
             }
         }
-        let _ = backend.set_file_contents("/etc/hosts", hosts_content.into_bytes());
     }
+    // Preserve any NON-loopback entries the image baked into /etc/hosts (rare —
+    // most ship it empty — but a custom alias shouldn't silently vanish). carrick
+    // owns the loopback + self lines above, so skip those to avoid duplicates.
+    let existing = backend
+        .file_contents("/etc/hosts")
+        .or_else(|| rootfs.and_then(|r| r.read("/etc/hosts").ok()))
+        .unwrap_or_default();
+    for line in String::from_utf8_lossy(&existing).lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let first = trimmed.split_whitespace().next().unwrap_or("");
+        let carrick_managed = matches!(
+            first,
+            "127.0.0.1" | "127.0.1.1" | "::1" | "ff02::1" | "ff02::2"
+        );
+        if !carrick_managed {
+            hosts_content.push_str(trimmed);
+            hosts_content.push('\n');
+        }
+    }
+    let _ = backend.set_file_contents("/etc/hosts", hosts_content.into_bytes());
     // /etc/hostname must agree with uname(2)/gethostname()/proc — overwrite any
     // build-time value from the image with the runtime guest hostname (Docker
     // likewise writes the container hostname here at create). Unconditional: a
