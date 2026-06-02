@@ -4642,6 +4642,28 @@ impl SyscallDispatcher {
                 Ok(o) => o,
                 Err(errno) => return Ok(errno.into()),
             };
+            // copy_file_range onto the SAME file with OVERLAPPING ranges must fail
+            // EINVAL (Linux). Go's io.Copy(f, f) self-copy hits exactly this: fd_in
+            // == fd_out, NULL/NULL offsets → identical (thus overlapping) ranges.
+            // Without this carrick copied the bytes and returned a success count, so
+            // Go's zero-copy hook recorded handled=true and skipped its generic
+            // doubling fallback (TestCopyFile/CopyFileItself). Reject ONLY when the
+            // fds are the same file AND the per-round ranges overlap — distinct
+            // files and non-overlapping self-copies are untouched. Resolve the out
+            // offset only in this branch to avoid touching the out fd on the common
+            // cross-file path. Sits above the Darwin clone fast path so it can't
+            // mis-handle an overlapping self-copy either.
+            if this.copy_same_file(in_fd.0, out_fd.0) {
+                let out_offset = match this.sendfile_offset(out_fd.0, off_out_addr, memory)? {
+                    Ok(o) => o,
+                    Err(errno) => return Ok(errno.into()),
+                };
+                let in_end = in_offset.saturating_add(count);
+                let out_end = out_offset.saturating_add(count);
+                if in_offset < out_end && out_offset < in_end {
+                    return Ok(LINUX_EINVAL.into());
+                }
+            }
             #[cfg(target_os = "macos")]
             if let Some(outcome) = this.try_darwin_copyfile_range_fast_path(
                 in_fd.0,
