@@ -529,6 +529,62 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
         Commands::Stop { time, containers } => crate::lifecycle::stop(time, &containers)?,
         Commands::Kill { signal, containers } => crate::lifecycle::kill(&signal, &containers)?,
         Commands::Rm { force, containers } => crate::lifecycle::rm(force, &containers)?,
+        Commands::Create {
+            image,
+            platform,
+            fs,
+            pid,
+            env,
+            env_file,
+            workdir,
+            user,
+            entrypoint,
+            volume,
+            mount,
+            name,
+            tty,
+            interactive,
+            command,
+        } => {
+            let mut env_overrides = env;
+            for file_path in &env_file {
+                env_overrides.extend(parse_env_file(file_path)?);
+            }
+            let mut mounts = Vec::new();
+            for v in &volume {
+                mounts.push(parse_volume_mount(v)?);
+            }
+            for m in &mount {
+                mounts.push(parse_mount_flag(m)?);
+            }
+            let entrypoint_override =
+                entrypoint.map(|ep| if ep.is_empty() { Vec::new() } else { vec![ep] });
+            let req = carrick_engine::CliRunRequest {
+                image_ref: image,
+                platform,
+                args: command,
+                env_overrides,
+                mounts,
+                workdir,
+                user,
+                entrypoint_override,
+                tty,
+                interactive,
+                rm: false,
+                name: None,
+                max_traps: DEFAULT_MAX_TRAPS,
+                debug_state_path: None,
+                fs,
+                pid,
+            };
+            crate::lifecycle::create(req, store.clone(), name)?;
+        }
+        Commands::Start { attach, containers } => {
+            crate::lifecycle::start(&store, attach, &containers)?
+        }
+        Commands::Restart { time, containers } => {
+            crate::lifecycle::restart(&store, time, &containers)?
+        }
         Commands::Exec {
             interactive,
             tty,
