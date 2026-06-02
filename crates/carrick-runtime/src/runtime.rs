@@ -200,7 +200,7 @@ where
         .first()
         .cloned()
         .unwrap_or_else(|| canonical_host_executable_path(path));
-    dispatcher.set_executable_identity(identity, argv.clone());
+    dispatcher.set_executable_identity(identity, argv.clone(), env.iter().map(|s| s.as_bytes().to_vec()).collect());
     let file = std::fs::read(path).map_err(AddressSpaceError::Io)?;
     let image = AddressSpace::load_elf_bytes_with_reader(&file, &|p| {
         dispatcher
@@ -241,7 +241,7 @@ where
     let argv: Vec<String> = argv.into_iter().collect();
     let env: Vec<String> = env.into_iter().collect();
     if let Some(first) = argv.first() {
-        dispatcher.set_executable_identity(first.clone(), argv.clone());
+        dispatcher.set_executable_identity(first.clone(), argv.clone(), env.iter().map(|s| s.as_bytes().to_vec()).collect());
     }
     let image = AddressSpace::load_elf_bytes(bytes)?.with_linux_initial_stack(argv, env)?;
     finish_and_run_image(image, dispatcher, max_traps, None)
@@ -280,7 +280,7 @@ where
     let path = path.as_ref();
     let argv: Vec<String> = argv.into_iter().collect();
     let env: Vec<String> = env.into_iter().collect();
-    dispatcher.set_executable_identity(path.to_string_lossy().into_owned(), argv.clone());
+    dispatcher.set_executable_identity(path.to_string_lossy().into_owned(), argv.clone(), env.iter().map(|s| s.as_bytes().to_vec()).collect());
     // Read the main binary from the rootfs here (runtime layer); AddressSpace
     // resolves any PT_INTERP through the rootfs read-closure, staying
     // rootfs-agnostic so `memory` doesn't depend on `rootfs`.
@@ -377,7 +377,7 @@ where
     // as-is. Guest execve(2) is unaffected (it keeps full-path semantics).
     // Identity for /proc/self/{exe,cmdline} reflects the entrypoint the user
     // asked for (before shebang/Rosetta rewriting).
-    dispatcher.set_executable_identity(path.to_owned(), argv.clone());
+    dispatcher.set_executable_identity(path.to_owned(), argv.clone(), env.iter().map(|s| s.as_bytes().to_vec()).collect());
     // PATH-resolve a bare command AND resolve `#!` shebang scripts to their
     // interpreter (Docker / execve(2) semantics) before loading, so a script
     // entrypoint runs instead of failing "not an ELF binary".
@@ -822,6 +822,7 @@ where
                 // child is identifiable in `ps -M` / Activity Monitor.
                 let base = path.rsplit('/').next().unwrap_or(&path);
                 crate::dispatch::set_host_process_name(base.as_bytes());
+                let proc_env = env.clone();
                 match load_execve_image(&dispatcher, &path, argv, env) {
                     Ok(new_image) => {
                         crate::probes::execve_loaded(
@@ -830,7 +831,7 @@ where
                             new_image.initial_stack_pointer().unwrap_or(0),
                             new_image.regions().len() as u64,
                         );
-                        dispatcher.set_executable_identity(path.clone(), proc_argv);
+                        dispatcher.set_executable_identity(path.clone(), proc_argv, proc_env);
                         dispatcher.close_cloexec_fds();
                         runtime.execve_into(&new_image)?;
                     }
@@ -1791,6 +1792,7 @@ impl ThreadRuntimeState {
             .collect();
         let base = path.rsplit('/').next().unwrap_or(&path).to_owned();
         crate::dispatch::set_host_process_name(base.as_bytes());
+        let proc_env = env.clone();
         match load_execve_image(&kernel.dispatcher, &path, argv, env) {
             Ok(img) => {
                 crate::probes::execve_loaded(
@@ -1801,7 +1803,7 @@ impl ThreadRuntimeState {
                 );
                 kernel
                     .dispatcher
-                    .set_executable_identity(path.clone(), proc_argv);
+                    .set_executable_identity(path.clone(), proc_argv, proc_env);
                 kernel.dispatcher.close_cloexec_fds();
                 engine.execve_into(&img)?;
                 Ok(())

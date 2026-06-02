@@ -219,6 +219,8 @@ pub enum VfsHandle {
 pub struct OpenContext<'a> {
     pub executable_path: Option<&'a str>,
     pub argv: Option<&'a [String]>,
+    /// Guest environment (`KEY=VALUE`, opaque bytes) for `/proc/self/environ`.
+    pub environ: Option<&'a [Vec<u8>]>,
     pub address_space_regions: Option<&'a [ProcMapsEntry]>,
     pub brk_current: u64,
     pub mmap_next: u64,
