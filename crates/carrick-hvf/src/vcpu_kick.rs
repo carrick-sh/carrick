@@ -238,13 +238,6 @@ pub fn spawn_signal_pump(
     kicker: std::sync::Arc<VcpuKicker>,
     futex: std::sync::Arc<crate::thread::FutexTable>,
 ) -> SignalPump {
-    let pipe = crate::host_signal::pump_pipe_read_fd();
-    if pipe < 0 {
-        return SignalPump {
-            running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            handle: None,
-        };
-    }
     let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
     let thread_running = std::sync::Arc::clone(&running);
     let handle = std::thread::Builder::new()
@@ -254,6 +247,14 @@ pub fn spawn_signal_pump(
                 return;
             };
             let kq_fd = kq.raw_fd();
+            // Create the wake pipe HERE, after the kqueue is allocated, so the
+            // pipe's read fd can never be the kqueue fd (the bug that wedged
+            // pump.stop(): the pump armed EVFILT_READ on its own kqueue, so wake
+            // bytes were lost). pump_install_pipe also closes any stale/inherited
+            // pump pipe via replace_pipe.
+            let Some(pipe) = crate::host_signal::pump_install_pipe() else {
+                return;
+            };
             // Two wake sources, both edge-triggered (EV_CLEAR), and we block
             // with NO timeout so the process genuinely sleeps when idle (a
             // poll would keep it SRUN and confound /proc/<pid>/stat):

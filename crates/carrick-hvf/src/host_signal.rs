@@ -535,10 +535,22 @@ fn open_pending_pipe() {
         return;
     };
     replace_pipe(&PENDING_PIPE_READ, &PENDING_PIPE_WRITE, read_fd, write_fd);
+    // The PUMP pipe is NOT created here: it is created+owned by the signal-pump
+    // thread itself (see `pump_install_pipe`), AFTER it allocates its kqueue.
+    // Creating it here (before the kqueue) left a window in which the pump pipe's
+    // read fd could be closed and the kqueue allocated the same fd number — the
+    // pump then armed EVFILT_READ on its own kqueue fd, so wake bytes never woke
+    // it and `pump.stop()`'s join hung the whole process (apt fork storm).
+}
 
-    if let Some((pump_read, pump_write)) = open_internal_pipe() {
-        replace_pipe(&PUMP_PIPE_READ, &PUMP_PIPE_WRITE, pump_read, pump_write);
-    }
+/// Create a fresh signal-pump wake pipe and publish both ends, closing any prior
+/// (stale or fork-inherited) pump pipe via `replace_pipe`. Called by the pump
+/// thread AFTER it has allocated its kqueue, so the new read fd can never collide
+/// with the kqueue fd. Returns the read end for the pump to arm on its kqueue.
+pub fn pump_install_pipe() -> Option<i32> {
+    let (read_fd, write_fd) = open_internal_pipe()?;
+    replace_pipe(&PUMP_PIPE_READ, &PUMP_PIPE_WRITE, read_fd, write_fd);
+    Some(read_fd)
 }
 
 fn open_internal_pipe() -> Option<(i32, i32)> {
