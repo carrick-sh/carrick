@@ -419,16 +419,24 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
         Commands::Stop { time, containers } => crate::lifecycle::stop(time, &containers)?,
         Commands::Kill { signal, containers } => crate::lifecycle::kill(&signal, &containers)?,
         Commands::Rm { force, containers } => crate::lifecycle::rm(force, &containers)?,
-        Commands::Exec { context, command } => {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "context": context,
-                    "command": command,
-                })
-            );
-            bail!("existing Carrick execution contexts are not implemented in this bootstrap yet");
-        }
+        Commands::Exec {
+            interactive,
+            tty,
+            user,
+            workdir,
+            env,
+            container,
+            command,
+        } => crate::lifecycle::exec(
+            store.clone(),
+            &container,
+            command,
+            interactive,
+            tty,
+            user,
+            workdir,
+            env,
+        )?,
         Commands::CompatReport { format, command } => {
             if command.is_empty() {
                 bail!("compat-report needs a command after --");

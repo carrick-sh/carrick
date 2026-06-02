@@ -574,6 +574,22 @@ pub fn register_child(child_host_pid: u32, parent_host_pid: u32) -> u32 {
     }
 }
 
+/// `carrick exec`: attach the running container's file-backed region and join it
+/// as a new member — a fresh ns-pid, parented OUTSIDE the namespace (the
+/// `carrick exec` CLI, so the exec'd guest's ns-ppid is 0, matching docker exec).
+/// Enables pid translation but does NOT fork a supervisor (the container already
+/// has one; its 1 s rescan arms an exit watch on this member). Returns `false`
+/// if the region cannot be mapped — the caller must then refuse to run, rather
+/// than silently execute outside the namespace.
+pub fn join_existing(path: &std::path::Path) -> bool {
+    if !attach_region(path) {
+        return false;
+    }
+    REQUESTED.store(true, Ordering::Relaxed);
+    register_child(std::process::id(), 0);
+    true
+}
+
 impl NsSharedRegion {
     /// Allocate the next ns-pid (lock-free, monotonic, never recycled — gaps are
     /// harmless, design §8).

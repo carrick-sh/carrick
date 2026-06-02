@@ -347,6 +347,89 @@ fn parse_signal(s: &str) -> Option<i32> {
     Some(n)
 }
 
+/// `carrick exec [-i] [-t] [-u] [-w] [-e] <container> <cmd>...` — run a command
+/// in a running container, sharing its filesystem (the persisted overlay) and
+/// PID namespace (the file-backed region). Requires the container to have been
+/// started with `--fs host`. Runs in this process (no supervisor fork — the
+/// container already has one) and exits with the command's code.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn exec(
+    store: carrick_image::ImageStore,
+    spec: &str,
+    command: Vec<String>,
+    interactive: bool,
+    tty: bool,
+    user: Option<String>,
+    workdir: Option<String>,
+    env: Vec<String>,
+) -> anyhow::Result<()> {
+    let id = container::resolve(spec).map_err(anyhow::Error::msg)?;
+    let state = ContainerState::load(&id)?;
+    if !state.init_alive() {
+        bail!("container {} is not running", container::short_id(&id));
+    }
+    let Some(scratch) = state.config.scratch_path.clone() else {
+        bail!("exec requires a container started with --fs host");
+    };
+    let Some(region) = state.config.region_path.clone() else {
+        bail!(
+            "container {} has no joinable namespace (it was started with --pid host)",
+            container::short_id(&id)
+        );
+    };
+    // Tell the runtime to ATTACH this container's overlay + JOIN its pid region
+    // (instead of creating a new overlay / forking a supervisor).
+    // SAFETY: single-threaded CLI, before any runtime/fork.
+    unsafe {
+        std::env::set_var("CARRICK_EXEC_OVERLAY", &scratch);
+        std::env::set_var("CARRICK_JOIN_REGION", &region);
+    }
+
+    // exec inherits the container's env (image ENV + its `-e`) plus exec's `-e`.
+    let mut env_overrides = state.config.env.clone();
+    env_overrides.extend(env);
+
+    let req = carrick_engine::CliRunRequest {
+        image_ref: state.image.clone(),
+        platform: state.config.platform.clone(),
+        args: command,
+        env_overrides,
+        mounts: vec![],
+        workdir: workdir.or_else(|| state.config.workdir.clone()),
+        user: user.or_else(|| state.config.user.clone()),
+        // exec runs the command directly — no image ENTRYPOINT prepended.
+        entrypoint_override: Some(vec![]),
+        tty,
+        interactive,
+        rm: false,
+        name: None,
+        max_traps: carrick_runtime::runtime::DEFAULT_MAX_TRAPS,
+        debug_state_path: None,
+        fs: Some(carrick_spec::FsBackendKind::Host),
+        pid: state.config.pid,
+    };
+
+    let engine = carrick_engine::Engine::new(store);
+    let result = match crate::runtime_util::block_on_oci(async { engine.run(req).await }) {
+        Ok(r) => r,
+        Err(e) => {
+            // The command couldn't be started (e.g. not found / not executable
+            // surfaces inside as 126/127; this is the engine/setup-failure case).
+            eprintln!("carrick: exec failed: {e:#}");
+            std::process::exit(126);
+        }
+    };
+    let status = if result.trap_limit_hit {
+        1
+    } else {
+        result.exit_code
+    };
+    if !(tty || interactive) {
+        crate::runtime_util::emit_raw(&result);
+    }
+    std::process::exit(status);
+}
+
 /// `carrick wait <container>...` — block until each container stops, then print
 /// its exit code (like `docker wait`). An already-exited container returns
 /// immediately; a `--rm` container that was auto-removed reports 0.

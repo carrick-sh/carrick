@@ -160,7 +160,15 @@ impl Runtime {
         match spec.pid {
             PidMode::Host => {} // share the host pid ns — no placement.
             PidMode::Private => {
-                if spec.raw || spec.tty {
+                if let Ok(region) = std::env::var("CARRICK_JOIN_REGION") {
+                    // `carrick exec`: join the running container's namespace as a
+                    // member — do NOT fork our own supervisor (it already has one).
+                    if !crate::namespace::pid::join_existing(std::path::Path::new(&region)) {
+                        return Err(RuntimeError::FsBackend(anyhow::anyhow!(
+                            "failed to join container namespace at {region}"
+                        )));
+                    }
+                } else if spec.raw || spec.tty {
                     crate::namespace::pid::request_supervisor();
                 } else {
                     crate::namespace::pid::request();
@@ -187,22 +195,32 @@ impl Runtime {
         let result = match spec.fs_backend {
             FsBackendKind::Host => {
                 // Stream every OCI layer straight onto the cap-std scratch Dir.
-                // A DETACHED container gets a STABLE overlay under its registry
-                // dir (persisted + shared with `exec`, cleaned up by `rm`); a
-                // foreground run gets an ephemeral per-run TempDir.
-                let mut host = match detached_stable_scratch() {
-                    Some(scratch) => HostFsBackend::attach_or_create(&scratch).map_err(|e| {
+                // `carrick exec` ATTACHES the running container's existing overlay
+                // (already holds the full rootfs + the container's writes) and
+                // skips extraction. A DETACHED container gets a STABLE overlay
+                // under its registry dir (persisted + shared with `exec`, cleaned
+                // up by `rm`); a foreground run gets an ephemeral per-run TempDir.
+                let exec_overlay = std::env::var("CARRICK_EXEC_OVERLAY").ok();
+                let mut host = if let Some(scratch) = &exec_overlay {
+                    HostFsBackend::attach(std::path::Path::new(scratch)).map_err(|e| {
+                        RuntimeError::FsBackend(anyhow::anyhow!(
+                            "failed to attach container overlay {scratch}: {e}"
+                        ))
+                    })?
+                } else if let Some(scratch) = detached_stable_scratch() {
+                    HostFsBackend::attach_or_create(&scratch).map_err(|e| {
                         RuntimeError::FsBackend(anyhow::anyhow!(
                             "failed to create container overlay: {}",
                             e
                         ))
-                    })?,
-                    None => HostFsBackend::new().map_err(|e| {
+                    })?
+                } else {
+                    HostFsBackend::new().map_err(|e| {
                         RuntimeError::FsBackend(anyhow::anyhow!(
                             "failed to create scratch directory: {}",
                             e
                         ))
-                    })?,
+                    })?
                 };
 
                 // Convert layers to Vec<PathBuf>
@@ -212,9 +230,17 @@ impl Runtime {
                     .map(|p| PathBuf::from(p.as_std_path()))
                     .collect();
 
-                host.extract_layers(&layer_paths).map_err(|e| {
-                    RuntimeError::FsBackend(anyhow::anyhow!("failed to stream OCI layers: {}", e))
-                })?;
+                // `exec` reuses the container's overlay, which already holds the
+                // extracted rootfs — re-extracting would clobber the container's
+                // runtime writes. Only a fresh run extracts.
+                if exec_overlay.is_none() {
+                    host.extract_layers(&layer_paths).map_err(|e| {
+                        RuntimeError::FsBackend(anyhow::anyhow!(
+                            "failed to stream OCI layers: {}",
+                            e
+                        ))
+                    })?;
+                }
 
                 let mut dispatcher = SyscallDispatcher::new();
                 dispatcher.set_executable_path(spec.executable.clone());
