@@ -231,6 +231,22 @@ fn proc_self_fdinfo_number(path: &str) -> Option<i32> {
     tail.strip_prefix("fdinfo/")?.parse::<i32>().ok()
 }
 
+/// The file STATUS flags reportable via `fcntl(F_GETFL)` and `/proc/<pid>/fdinfo`.
+/// Linux consumes creation-only flags at `open()` and clears them from
+/// `f_flags`, so they must not be reported back; only the access mode and the
+/// file status flags (O_APPEND/O_NONBLOCK/O_DIRECT/O_SYNC/…) remain. (audit M8)
+fn reportable_status_flags(raw: u64) -> u64 {
+    const CREATION_ONLY: u64 = LINUX_O_CREAT
+        | LINUX_O_EXCL
+        | LINUX_O_TRUNC
+        | LINUX_O_DIRECTORY
+        | LINUX_O_CLOEXEC
+        | 0o400 // O_NOCTTY
+        | 0o100000 // O_NOFOLLOW
+        | 0o20000000; // O_TMPFILE
+    raw & !CREATION_ONLY
+}
+
 impl SyscallDispatcher {
     pub fn register_mount(
         &mut self,
@@ -925,7 +941,10 @@ impl SyscallDispatcher {
         // The open status flags (access mode + O_NONBLOCK/O_APPEND/…) with
         // O_CLOEXEC folded in — the bits callers parse to recover an inherited
         // fd's mode. (O_LARGEFILE is elided: arch-specific and not load-bearing.)
-        let flags = desc.status_flags() | if cloexec { LINUX_O_CLOEXEC } else { 0 };
+        // Like F_GETFL, fdinfo's `flags:` reports status flags only; creation
+        // flags are consumed by open(). (audit M8)
+        let flags = reportable_status_flags(desc.status_flags())
+            | if cloexec { LINUX_O_CLOEXEC } else { 0 };
         let pos = match &*desc {
             OpenDescription::File { offset, .. }
             | OpenDescription::SyntheticFile { offset, .. }
@@ -2039,6 +2058,41 @@ impl SyscallDispatcher {
         None
     }
 
+    /// Apply chown to the file backing an fd, recording the guest-visible owner
+    /// on the backend (durable via xattr on `--fs host`). Shared by `fchown` and
+    /// `fchownat(..., AT_EMPTY_PATH)` so both record the owner identically.
+    /// `fd` must already be validated by the caller.
+    fn fchown_by_fd(&self, fd: i32, uid: Option<u32>, gid: Option<u32>) -> DispatchOutcome {
+        let path = self
+            .open_file(fd)
+            .and_then(|of| match &*of.description.read() {
+                OpenDescription::HostFile { metadata, .. }
+                | OpenDescription::File { metadata, .. }
+                | OpenDescription::Directory { metadata, .. } => {
+                    Some(metadata.path.to_string_lossy().into_owned())
+                }
+                _ => None,
+            });
+        if let Some(path) = path {
+            if let Some(errno) = self.chown_permission_errno(uid, gid) {
+                return errno.into();
+            }
+            if let Some(m) = self.fs.vfs_mounts.resolve(&path) {
+                if let Err(errno) = m.vfs.chown(&m.full_path, uid, gid, false) {
+                    return errno.into();
+                }
+            } else {
+                let _ = self.fs.rootfs_vfs.overlay.set_owner(
+                    &path,
+                    uid.unwrap_or(u32::MAX),
+                    gid.unwrap_or(u32::MAX),
+                );
+            }
+            self.clear_setid_on_chown(&path);
+        }
+        DispatchOutcome::Returned { value: 0 }
+    }
+
     /// Linux raises SIGPIPE on the writing thread when a write hits a broken
     /// pipe (the read end is closed → EPIPE), in addition to returning EPIPE
     /// (LTP write05). Mark it pending so the runtime delivers it per the
@@ -2410,19 +2464,32 @@ impl SyscallDispatcher {
                 }
                 None => return Ok(LINUX_EBADF.into()),
             };
-            let mut table = this.io.open_files.write();
-            if let Some(replaced) = table.remove(&new_fd.0) {
-                this.close_open_file_and_free_pty(&replaced);
+            let replaced_existing;
+            {
+                let mut table = this.io.open_files.write();
+                replaced_existing = if let Some(replaced) = table.remove(&new_fd.0) {
+                    this.close_open_file_and_free_pty(&replaced);
+                    true
+                } else {
+                    false
+                };
+                retain_open_file(&description);
+                table.insert(
+                    new_fd.0,
+                    OpenFile {
+                        description,
+                        fd_flags: linux_fd_flags_from_open_flags(flags),
+                        host_fd_owner,
+                    },
+                );
             }
-            retain_open_file(&description);
-            table.insert(
-                new_fd.0,
-                OpenFile {
-                    description,
-                    fd_flags: linux_fd_flags_from_open_flags(flags),
-                    host_fd_owner,
-                },
-            );
+            if replaced_existing {
+                // dup2/dup3 over an open fd closes its old occupant; Linux
+                // auto-removes that (now-closed) fd from epoll interest sets.
+                // Done after dropping the open_files lock (detach takes a read
+                // lock); the freshly-installed dup at new_fd is not in any epoll.
+                this.detach_fd_from_epolls(new_fd.0);
+            }
             Ok(DispatchOutcome::Returned {
                 value: new_fd.0 as i64,
             })
@@ -2559,7 +2626,9 @@ impl SyscallDispatcher {
                 LINUX_F_GETFL => {
                     if let Some(open_file) = this.open_file(fd.0) {
                         let open = open_file.description.read();
-                        let mut flags = open.status_flags();
+                        // Report only file STATUS flags; creation-only flags are
+                        // consumed by open() and must not be reported. (audit M8)
+                        let mut flags = reportable_status_flags(open.status_flags());
                         // A pty end is bidirectional (opened O_RDWR); report the
                         // O_RDWR access mode rather than the default O_RDONLY (0),
                         // so libc/readline see a read-write terminal.
@@ -3705,14 +3774,20 @@ impl SyscallDispatcher {
             if fd.0 >= 0 && fd.0 < 3 {
                 this.io.closed_stdio.lock()[fd.0 as usize] = true;
             }
+            // Bind `removed` in a `let` so the open_files write lock is released
+            // before close_open_file_and_free_pty / detach_fd_from_epolls run
+            // (detach takes a read lock; holding write here would deadlock).
+            let removed = this.io.open_files.write().remove(&fd.0);
             Ok(
-                if let Some(open_file) = this.io.open_files.write().remove(&fd.0) {
+                if let Some(open_file) = removed {
                     // Centralised close: frees the host fd and, for pty masters,
                     // removes the /dev/pts/N entry from the PtyTable so it becomes
                     // ENOENT — mirroring Linux devpts semantics. The same helper is
                     // used by close_range and close_cloexec_fds so every close path
                     // stays in sync.
                     this.close_open_file_and_free_pty(&open_file);
+                    // Linux auto-removes a closed fd from every epoll interest set.
+                    this.detach_fd_from_epolls(fd.0);
                     DispatchOutcome::Returned { value: 0 }
                 } else if is_stdio_fd(fd.0) {
                     // Guest closing its own stdio at exit: there's nothing for
@@ -3752,20 +3827,29 @@ impl SyscallDispatcher {
                 .copied()
                 .filter(|fd| (*fd as u64) >= first && (*fd as u64) <= last)
                 .collect();
-            let mut table = this.io.open_files.write();
-            for fd in fds {
-                if cloexec_only {
-                    if let Some(open_file) = table.get_mut(&fd) {
-                        open_file.fd_flags |= LINUX_FD_CLOEXEC;
+            let mut detached: Vec<i32> = Vec::new();
+            {
+                let mut table = this.io.open_files.write();
+                for fd in fds {
+                    if cloexec_only {
+                        if let Some(open_file) = table.get_mut(&fd) {
+                            open_file.fd_flags |= LINUX_FD_CLOEXEC;
+                        }
+                    } else if let Some(open_file) = table.remove(&fd) {
+                        // Use the centralised helper so pty masters freed via
+                        // close_range also drop their /dev/pts/N table entry.
+                        // open_files write lock and pty_table Mutex are independent
+                        // locks; nothing acquires pty_table while holding open_files,
+                        // so the nesting order is deadlock-free.
+                        this.close_open_file_and_free_pty(&open_file);
+                        detached.push(fd);
                     }
-                } else if let Some(open_file) = table.remove(&fd) {
-                    // Use the centralised helper so pty masters freed via
-                    // close_range also drop their /dev/pts/N table entry.
-                    // open_files write lock and pty_table Mutex are independent
-                    // locks; nothing acquires pty_table while holding open_files,
-                    // so the nesting order is deadlock-free.
-                    this.close_open_file_and_free_pty(&open_file);
                 }
+            }
+            // Auto-remove each closed fd from epoll interest sets (after dropping
+            // the open_files lock — detach_fd_from_epolls takes a read lock).
+            for fd in detached {
+                this.detach_fd_from_epolls(fd);
             }
             Ok(DispatchOutcome::Returned { value: 0 })
 
@@ -3994,6 +4078,9 @@ impl SyscallDispatcher {
             let address = buf.0;
             let length =
                 usize::try_from(count).map_err(|_| DispatchError::LengthTooLarge(count))?;
+            // Calling thread id (for signalfd drain). Taken before borrowing
+            // cx.memory mutably below.
+            let tid = Self::ctx_tid(cx);
             let memory = &mut *cx.memory;
             // Guest's intended blocking mode for this fd; passed to the host-fd
             // read helper so a blocking-mode fd hands off to the lockless kqueue
@@ -4107,9 +4194,15 @@ impl SyscallDispatcher {
                 OpenDescription::Directory { .. } => {
                     return Ok(LINUX_EISDIR.into());
                 }
+                OpenDescription::SignalFd { mask, .. } => {
+                    let mask = *mask;
+                    drop(open);
+                    // Drain pending signals matching the fd's mask into
+                    // signalfd_siginfo records (empty → EAGAIN, like inotify).
+                    return Ok(this.read_signalfd(memory, address, length, mask, tid));
+                }
                 OpenDescription::Epoll { .. }
                 | OpenDescription::Pidfd { .. }
-                | OpenDescription::SignalFd { .. }
                 | OpenDescription::PipeWriter { .. } => {
                     return Ok(LINUX_EINVAL.into());
                 }
@@ -6153,36 +6246,7 @@ impl SyscallDispatcher {
             }
             let uid = Self::chown_arg(owner);
             let gid = Self::chown_arg(group);
-            // Resolve the fd's path so we can record the guest-visible owner on the
-            // backend (durably via xattr on --fs host), mirroring fchownat.
-            let path = this
-                .open_file(fd.0)
-                .and_then(|of| match &*of.description.read() {
-                    OpenDescription::HostFile { metadata, .. }
-                    | OpenDescription::File { metadata, .. }
-                    | OpenDescription::Directory { metadata, .. } => {
-                        Some(metadata.path.to_string_lossy().into_owned())
-                    }
-                    _ => None,
-                });
-            if let Some(path) = path {
-                if let Some(errno) = this.chown_permission_errno(uid, gid) {
-                    return Ok(errno.into());
-                }
-                if let Some(m) = this.fs.vfs_mounts.resolve(&path) {
-                    if let Err(errno) = m.vfs.chown(&m.full_path, uid, gid, false) {
-                        return Ok(errno.into());
-                    }
-                } else {
-                    let _ = this.fs.rootfs_vfs.overlay.set_owner(
-                        &path,
-                        uid.unwrap_or(u32::MAX),
-                        gid.unwrap_or(u32::MAX),
-                    );
-                }
-                this.clear_setid_on_chown(&path);
-            }
-            Ok(DispatchOutcome::Returned { value: 0 })
+            Ok(this.fchown_by_fd(fd.0, uid, gid))
 
         }
 
@@ -6208,7 +6272,11 @@ impl SyscallDispatcher {
                 if !this.fd_is_valid(dirfd as i32) {
                     return Ok(LINUX_EBADF.into());
                 }
-                return Ok(DispatchOutcome::Returned { value: 0 });
+                // AT_EMPTY_PATH operates on the fd ITSELF — record the owner like
+                // fchown (was a silent no-op success that never set_owner'd).
+                let uid = Self::chown_arg(owner);
+                let gid = Self::chown_arg(group);
+                return Ok(this.fchown_by_fd(dirfd as i32, uid, gid));
             }
             let uid = Self::chown_arg(owner);
             let gid = Self::chown_arg(group);
