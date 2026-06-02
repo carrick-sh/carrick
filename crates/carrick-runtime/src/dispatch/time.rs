@@ -590,6 +590,24 @@ impl SyscallDispatcher {
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
+        // getrlimit(2) (syscall 163) — the older 2-arg form glibc and Apple
+        // Rosetta still use. Equivalent to prlimit64 reading the current limit.
+        fn getrlimit(this, cx, resource: u64, rlimit: GuestPtr) {
+            const LINUX_RLIM_NLIMITS: u64 = 16;
+            if resource >= LINUX_RLIM_NLIMITS {
+                return Ok(LINUX_EINVAL.into());
+            }
+            let memory = &mut *cx.memory;
+            let limit = rlimit_for_resource(
+                resource,
+                this.io.nofile_soft.load(std::sync::atomic::Ordering::Relaxed),
+            );
+            if rlimit.0 != 0 && write_kernel_struct_raw(memory, rlimit.0, &limit).is_err() {
+                return Ok(LINUX_EFAULT.into());
+            }
+            Ok(DispatchOutcome::Returned { value: 0 })
+        }
+
         fn prlimit64(this, cx, pid: Pid, resource: u64, new_limit: GuestPtr, old_limit: GuestPtr) {
             let memory = &mut *cx.memory;
             // The pid arg selects the target process: 0 names the caller, any
@@ -627,32 +645,10 @@ impl SyscallDispatcher {
                 return Ok(LINUX_EINVAL.into());
             }
             const LINUX_RLIMIT_NOFILE: u64 = 7;
-            const LINUX_RLIMIT_NPROC: u64 = 6;
-            const LINUX_RLIMIT_STACK: u64 = 3;
-            const LINUX_RLIMIT_AS: u64 = 9;
-            const LINUX_RLIMIT_DATA: u64 = 2;
-            let limit = match resource {
-                LINUX_RLIMIT_NOFILE => LinuxRlimit::new(
-                    this.io.nofile_soft.load(std::sync::atomic::Ordering::Relaxed),
-                    1024 * 1024,
-                ),
-                LINUX_RLIMIT_NPROC => LinuxRlimit::new(8192, 8192),
-                LINUX_RLIMIT_STACK => {
-                    // Linux's default 8 MiB soft RLIMIT_STACK, unlimited hard limit.
-                    // CPython (and other runtimes) calibrate their main-thread
-                    // C-recursion guard to this value, so it must match the size of
-                    // the guest stack carrick actually backs (LINUX_STACK_SIZE) or
-                    // deep C recursion overflows the real stack before the guard
-                    // fires. Kept as its own constant (rather than reusing
-                    // LINUX_STACK_SIZE directly) so the reported limit and the
-                    // backed region can diverge if we ever add guard-page slack.
-                    LinuxRlimit::new(crate::memory::LINUX_RLIMIT_STACK_SOFT, LINUX_RLIM_INFINITY)
-                }
-                LINUX_RLIMIT_AS | LINUX_RLIMIT_DATA => {
-                    LinuxRlimit::new(LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY)
-                }
-                _ => LinuxRlimit::new(LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY),
-            };
+            let limit = rlimit_for_resource(
+                resource,
+                this.io.nofile_soft.load(std::sync::atomic::Ordering::Relaxed),
+            );
             if old_limit.0 != 0 && write_kernel_struct_raw(memory, old_limit.0, &limit).is_err() {
                 return Ok(LINUX_EFAULT.into());
             }
@@ -681,6 +677,36 @@ impl SyscallDispatcher {
             }
             Ok(DispatchOutcome::Returned { value: 0 })
         }
+    }
+}
+
+/// The resource limit carrick reports for `getrlimit`/`prlimit64`. Shared so
+/// the old 2-arg and new 4-arg forms agree. `nofile_soft` is threaded in
+/// because RLIMIT_NOFILE's soft cap is dynamic (set via setrlimit).
+fn rlimit_for_resource(resource: u64, nofile_soft: u64) -> LinuxRlimit {
+    const LINUX_RLIMIT_DATA: u64 = 2;
+    const LINUX_RLIMIT_STACK: u64 = 3;
+    const LINUX_RLIMIT_NPROC: u64 = 6;
+    const LINUX_RLIMIT_NOFILE: u64 = 7;
+    const LINUX_RLIMIT_AS: u64 = 9;
+    match resource {
+        LINUX_RLIMIT_NOFILE => LinuxRlimit::new(nofile_soft, 1024 * 1024),
+        LINUX_RLIMIT_NPROC => LinuxRlimit::new(8192, 8192),
+        LINUX_RLIMIT_STACK => {
+            // Linux's default 8 MiB soft RLIMIT_STACK, unlimited hard limit.
+            // CPython (and other runtimes) calibrate their main-thread
+            // C-recursion guard to this value, so it must match the size of
+            // the guest stack carrick actually backs (LINUX_STACK_SIZE) or
+            // deep C recursion overflows the real stack before the guard
+            // fires. Kept as its own constant (rather than reusing
+            // LINUX_STACK_SIZE directly) so the reported limit and the
+            // backed region can diverge if we ever add guard-page slack.
+            LinuxRlimit::new(crate::memory::LINUX_RLIMIT_STACK_SOFT, LINUX_RLIM_INFINITY)
+        }
+        LINUX_RLIMIT_AS | LINUX_RLIMIT_DATA => {
+            LinuxRlimit::new(LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY)
+        }
+        _ => LinuxRlimit::new(LINUX_RLIM_INFINITY, LINUX_RLIM_INFINITY),
     }
 }
 
@@ -768,3 +794,23 @@ fn itimerval_from_state(
 // fork-quiesce-parkable). The former in-dispatcher `host_sleep_interruptible`
 // blocking host nanosleep was removed: a sibling stuck in it never reached the
 // run-loop top and deadlocked multithreaded fork.
+
+#[cfg(test)]
+mod rlimit_tests {
+    use super::*;
+    #[test]
+    fn nofile_uses_dynamic_soft_cap() {
+        let r = rlimit_for_resource(7, 2048); // RLIMIT_NOFILE
+        // `LinuxRlimit` is `#[repr(C, packed)]`, so copy the fields to locals
+        // before asserting to avoid taking references to unaligned fields.
+        let (cur, max) = (r.rlim_cur, r.rlim_max);
+        assert_eq!(cur, 2048);
+        assert_eq!(max, 1024 * 1024);
+    }
+    #[test]
+    fn unknown_resource_is_infinity() {
+        let r = rlimit_for_resource(99, 1024);
+        let cur = r.rlim_cur;
+        assert_eq!(cur, LINUX_RLIM_INFINITY);
+    }
+}
