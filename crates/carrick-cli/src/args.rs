@@ -233,6 +233,13 @@ pub(crate) enum Commands {
         /// Only display container ids.
         #[arg(short = 'q', long = "quiet")]
         quiet: bool,
+        /// Don't truncate the container id / command.
+        #[arg(long = "no-trunc")]
+        no_trunc: bool,
+        /// Format each row with a Go-template-style expression, e.g.
+        /// `{{.ID}} {{.Names}} {{.Status}}`.
+        #[arg(long = "format")]
+        format: Option<String>,
     },
     /// Stop one or more running containers (SIGTERM, then SIGKILL after the
     /// grace period), like `docker stop`.
