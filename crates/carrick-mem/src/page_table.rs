@@ -287,6 +287,46 @@ impl PageTableManager {
         out
     }
 
+    /// Translate a guest VA to its stage-1 output address (the IPA carrick handed
+    /// `hv_vm_map`), walking this manager's live descriptors exactly as the MMU
+    /// would. Returns `None` if any level is invalid/out-of-range. Handles L3
+    /// pages and L1 (1 GiB) / L2 (2 MiB) block descriptors. The syscall memory
+    /// path uses this to find where the GUEST actually reads/writes a high-VA
+    /// alias — which the linear `start..end` region heuristic can mis-resolve
+    /// when alias regions overlap (16 KiB host rounding) or are non-linearly
+    /// aliased.
+    pub fn translate(&self, va: u64) -> Option<u64> {
+        let idx = indices(va);
+        let mut table_off = 0usize;
+        for level in 0..4usize {
+            let off = table_off + idx[level] * 8;
+            if off + 8 > self.bytes.len() {
+                return None;
+            }
+            let desc = self.read_desc(off);
+            if desc & VALID == 0 {
+                return None;
+            }
+            let is_table_or_page = desc & TYPE_BITS == TYPE_TABLE_OR_PAGE;
+            if level == 3 {
+                // L3 leaf must be a page (TYPE_TABLE_OR_PAGE); 0b01 is invalid here.
+                return is_table_or_page.then(|| (desc & PA_MASK_4KIB) | (va & 0xFFF));
+            }
+            if is_table_or_page {
+                // Table descriptor: descend to the next level.
+                table_off = self.pa_to_off(desc & PA_MASK_TABLE).ok()?;
+            } else {
+                // Block descriptor (TYPE_BLOCK) terminates the walk at L1/L2.
+                return match level {
+                    1 => Some((desc & PA_MASK_1GIB) | (va & ((1u64 << 30) - 1))),
+                    2 => Some((desc & PA_MASK_2MIB) | (va & ((1u64 << 21) - 1))),
+                    _ => None, // L0 block is not architecturally valid here
+                };
+            }
+        }
+        None
+    }
+
     /// Carve a zeroed table page: reuse a coalesced one if available, else bump
     /// the spare tail. Freed pages were zeroed on free, the tail is zero from
     /// boot, so the returned page is always all-invalid descriptors.
@@ -862,6 +902,45 @@ mod tests {
             !mgr.is_valid(va + len),
             "one page past the mapping is NOT mapped"
         );
+    }
+
+    #[test]
+    fn translate_resolves_aliased_va_to_ipa_with_page_offset() {
+        let mut mgr = manager();
+        let va = LINUX_HIGH_VA_THRESHOLD; // 1 TiB, 2 MiB-aligned
+        let ipa = LINUX_ALIAS_IPA_BASE; // 96 GiB, 2 MiB-aligned
+        let len = 0x1_0000; // 64 KiB (16 pages)
+        mgr.map_aliased(va, ipa, len, true).expect("map");
+        // Base, mid-page offset, and a later page all keep the VA→IPA delta.
+        assert_eq!(mgr.translate(va), Some(ipa));
+        assert_eq!(mgr.translate(va + 0xabc), Some(ipa + 0xabc));
+        assert_eq!(mgr.translate(va + 0x3000 + 0x10), Some(ipa + 0x3000 + 0x10));
+        // One page past the mapping is unmapped.
+        assert_eq!(mgr.translate(va + len), None);
+    }
+
+    #[test]
+    fn translate_picks_the_live_region_for_adjacent_aliases() {
+        // Mirrors the amd64 `cat -n` bug: region A is mapped, then the adjacent
+        // region B. In the runtime, A's 16 KiB-rounded HOST size made A's
+        // `HvfMappedRegion.end` over-claim into B's VA span, so the newest-first
+        // VA-range scan mis-picked A for a buffer that actually lives in B —
+        // sending a `read()` write to A's backing while the guest read B's
+        // (→ zeros). `translate` walks the REAL stage-1, so an address inside B
+        // resolves to B's IPA; the runtime then selects B by IPA, not A.
+        let mut mgr = manager();
+        let a_va = LINUX_HIGH_VA_THRESHOLD;
+        let a_ipa = LINUX_ALIAS_IPA_BASE;
+        let a_len = 0xa2000; // page-aligned but NOT 16 KiB-aligned at the top
+        let b_va = a_va + a_len;
+        let b_ipa = LINUX_ALIAS_IPA_BASE + 0x20_0000; // a distinct 2 MiB IPA block
+        let b_len = 0x2_2000;
+        mgr.map_aliased(a_va, a_ipa, a_len, true).expect("map A");
+        mgr.map_aliased(b_va, b_ipa, b_len, true).expect("map B");
+        // The first page of B resolves to B's IPA (the bug resolved it via A).
+        assert_eq!(mgr.translate(b_va + 0x1000), Some(b_ipa + 0x1000));
+        // The last page of A still resolves to A.
+        assert_eq!(mgr.translate(a_va + a_len - 0x1000), Some(a_ipa + a_len - 0x1000));
     }
 
     #[test]
