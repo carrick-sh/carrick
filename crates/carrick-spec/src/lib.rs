@@ -205,6 +205,14 @@ pub struct RunSpec {
     /// container its own pid ns (init == pid 1); `Host` shares the host pid ns.
     #[serde(default)]
     pub pid: PidMode,
+    /// Initial guest user id (`docker run --user` / image `USER`). The guest's
+    /// real/effective/saved/fs uid are all seeded to this. Defaults to 0 (root).
+    #[serde(default)]
+    pub uid: u32,
+    /// Initial guest group id. Defaults to 0 (root); for a numeric `--user UID`
+    /// with no group, docker uses gid 0.
+    #[serde(default)]
+    pub gid: u32,
 }
 
 #[cfg(test)]
