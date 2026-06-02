@@ -105,8 +105,8 @@ base64 round-trip, `wc -c`/`wc -l`. The translation core is sound.
   (`PageTableManager::translate`), fallback to the VA scan when stage-1 has no
   entry (early boot). Low-VA fast path untouched. The full amd64-vs-arm64 battery
   is 11/12 (cat/tac/grep/compute all match); unit tests added.
-- **(G, carrick bug, OPEN — separate from R) dash misparses a long parser TOKEN
-  (>~1340 bytes) under carrick.** A long quoted string → "unterminated quoted
+- **(G, LIKELY UPSTREAM Apple Rosetta — not carrick, OPEN) dash misparses a long
+  parser TOKEN (>~1340 bytes) when reading from an fd, under carrick's Rosetta.** A long quoted string → "unterminated quoted
   string" (so `gunzip` and any `#!/bin/sh` wrapper with a long quoted block break);
   a long UNQUOTED token → dash silently misparses (swallows the rest of the input,
   runs a corrupted assignment, exits 0 with no `echo` output). **Precisely
@@ -131,24 +131,29 @@ base64 round-trip, `wc -c`/`wc -l`. The translation core is sound.
     N≈1340 silently empty; N≥1350 "unterminated". dash's accumulation is correct
     up to 1300, so the corruption is at the parser-buffer GROW around ~1340 B.
   - dash-SPECIFIC, not a general carrick memory bug: perl built+read a 2M-element
-    array fine, so guest write-then-read of large buffers works in general. Only
-    dash's parser accumulation past ~1340 B corrupts.
-  So it is a correctness defect in dash's token/string accumulation as its parse
-  buffer grows past ~1340 bytes — no fault, no bad read, guest-internal (dash
-  writes the buffer and reads it back), QEMU-correct, brk- and mmap-independent.
-  Suspects: dash's `growstackblock` realloc-move interacting with carrick's
-  page-fault/mapping, or (given Docker=QEMU) an Apple Rosetta JIT mistranslation
-  of dash's accumulation loop that QEMU lacks. **A Rust repro was attempted** but
-  static-musl x86_64 does NOT run under carrick (the documented static-PIE/musl
-  limitation — even a trivial hello SEGVs), and a glibc-DYNAMIC x86_64 build needs
-  a cross-toolchain (none installed; Docker's rustc crashes under QEMU). Next:
-  build a glibc-dynamic x86_64 repro (zig cc / messense gcc cross, or in a
-  Rosetta-enabled container) that mimics dash's `growstackblock` and run it under
-  carrick — if a SIMPLE realloc-grow corrupts, it's carrick; if only dash's exact
-  code does, suspect Apple Rosetta. Plus get a real-Rosetta baseline to settle
-  blame. `carrick trace` DOES work to stdout (the `-o` flag was the empty-file
-  cause); the failing parse shows no fault and no anomalous syscall, confirming
-  the corruption is below the syscall layer.
+    array fine; a cross-compiled glibc-dynamic Rust repro (realloc-grow / copy-grow
+    / single-malloc / Vec) is intact at every size under carrick; **bash reads the
+    EXACT same failing script file correctly**; dash `-c` (same tokenizer, input
+    from argv) works. Only dash reading the token from an fd (file/stdin) corrupts.
+  - The read itself is fine: the trace shows the failing dash reads the whole
+    2013-byte script in ONE `read()` returning 2013 (no chunking, no lseek, no
+    re-read), and bash parsing the same file proves carrick writes correct content
+    to the read buffer. So the defect is in dash's translated fd-input PARSE path
+    (preadbuffer/pgetc-from-fd), not the read or the buffer content.
+  CONCLUSION: this is almost certainly an **Apple Rosetta JIT mistranslation of
+  dash's specific fd-input parsing code** — QEMU lacks it, bash (different code)
+  is fine, carrick's general translation/memory is sound — inherited by carrick
+  and NOT carrick's to fix. (A real Apple-Rosetta-on-Linux baseline would confirm;
+  unavailable here. If it ever reproduces under real Rosetta too, it's an upstream
+  Rosetta/dash-interaction bug to report to Apple, not a carrick defect.)
+  Tooling notes for a follow-up: the Rust repro must be glibc-DYNAMIC (static-musl
+  x86_64 does NOT run under carrick — the static-PIE/musl limitation; even a
+  trivial hello SEGVs). Cross-compile it in a NATIVE arm64 container with the
+  `gcc-x86-64-linux-gnu` cross-linker (Docker's amd64 `rustc` crashes under QEMU),
+  then run under carrick via base64-stdin into `ubuntu:24.04`. `carrick trace`
+  works to STDOUT (the `-o` flag was the empty-file cause). To definitively close
+  blame, run the failing dash script under a real Apple-Rosetta-on-Linux (Docker
+  Desktop "Use Rosetta"); if it fails there too, file upstream with Apple.
 - **(syscall workstream, not Rosetta layer) `FUTEX_LOCK_PI_PRIVATE` → ENOSYS.**
   `grep` aborts with `rosetta error: futex(FUTEX_LOCK_PI_PRIVATE) failure: 38`;
   the Rosetta runtime needs priority-inheritance futexes. carrick returns ENOSYS.
