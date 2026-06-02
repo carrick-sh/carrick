@@ -4,6 +4,7 @@
 //! dispatcher supplies live process/memory context, but adding a new synthetic
 //! `/proc` file should require touching this module and its tests.
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -288,7 +289,28 @@ fn sysctl_dir_entries(path: &str) -> Option<Vec<DirEnt>> {
     Some(entries)
 }
 
+/// A numeric `/proc/<self-pid>/<rest>` is the same object as `/proc/self/<rest>`
+/// (carrick is one guest process), whether the pid is the host pid or the
+/// guest's ns-pid. Rewrite it so the literal `/proc/self/*` renderers (which
+/// hold the live `SyntheticProcContext`) serve it too — keeping `ls /proc/<pid>`
+/// consistent with what `open()` resolves for the self process.
+fn normalize_self_pid_path(path: &str) -> Cow<'_, str> {
+    if let Some(rest) = path.strip_prefix("/proc/")
+        && let Some((pid, sub)) = rest.split_once('/')
+        && !pid.is_empty()
+        && pid.bytes().all(|b| b.is_ascii_digit())
+    {
+        let n: u32 = pid.parse().unwrap_or(0);
+        if n != 0 && (n == std::process::id() || n == crate::namespace::pid::self_ns_pid()) {
+            return Cow::Owned(format!("/proc/self/{sub}"));
+        }
+    }
+    Cow::Borrowed(path)
+}
+
 pub(crate) fn synthetic_file(path: &str, ctx: &SyntheticProcContext) -> Option<Vec<u8>> {
+    let normalized = normalize_self_pid_path(path);
+    let path = normalized.as_ref();
     match path {
         "/proc/cmdline" => Some(synthetic_proc_cmdline().to_vec()),
         "/proc/config.gz" => Some(synthetic_proc_config_gz()),
@@ -887,15 +909,52 @@ fn proc_task_dir_entries(path: &str) -> Option<Vec<DirEnt>> {
     Some(entries)
 }
 
-/// Per-process files Carrick exposes under `/proc/<pid>/` (matching
-/// `synthetic_proc_pid_file`). Listed by `readdir` so `ps`/`ls` can enumerate.
+/// Per-process files Carrick exposes under a FOREIGN `/proc/<pid>/` (matching
+/// what `synthetic_proc_pid_file` serves for another guest process).
 const PROC_PID_FILES: &[&str] = &["cmdline", "comm", "stat", "status"];
 
+/// The richer file set under the SELF process dir — every `/proc/self/<f>`
+/// flat file `synthetic_file` actually serves — so `ls /proc/self` enumerates
+/// what `open()` can resolve (proc(5)), not just the foreign 4-file subset.
+const PROC_SELF_FILES: &[&str] = &[
+    "auxv",
+    "autogroup",
+    "cgroup",
+    "cmdline",
+    "comm",
+    "gid_map",
+    "io",
+    "limits",
+    "loginuid",
+    "maps",
+    "mountinfo",
+    "mountstats",
+    "oom_adj",
+    "oom_score",
+    "oom_score_adj",
+    "personality",
+    "schedstat",
+    "sessionid",
+    "setgroups",
+    "smaps",
+    "smaps_rollup",
+    "stat",
+    "statm",
+    "status",
+    "syscall",
+    "timerslack_ns",
+    "uid_map",
+    "wchan",
+];
+
 /// Directory listing for `/proc/<pid>` when `pid` is a known process (an own
-/// guest thread or a guest process), else `None`.
+/// guest thread or a guest process), else `None`. The SELF dir is populated
+/// with the full set of files/symlinks/sub-dirs carrick serves; a foreign pid
+/// gets the subset its synthetic renderer can actually answer.
 fn proc_pid_dir_entries(path: &str) -> Option<Vec<DirEnt>> {
     // Gate on a numeric /proc/<pid> for a live process (ns-pid → host pid).
-    proc_pid_dir_host_pid(path)?;
+    let host_pid = proc_pid_dir_host_pid(path)?;
+    let is_self = host_pid == std::process::id();
     let mut entries = vec![
         DirEnt {
             name: ".".to_string(),
@@ -910,7 +969,25 @@ fn proc_pid_dir_entries(path: &str) -> Option<Vec<DirEnt>> {
             kind: EntryKind::Directory,
         },
     ];
-    entries.extend(PROC_PID_FILES.iter().map(|f| DirEnt {
+    let files = if is_self {
+        // Sub-directories and magic symlinks only the self dir fully serves.
+        for dir in ["ns", "net"] {
+            entries.push(DirEnt {
+                name: dir.to_string(),
+                kind: EntryKind::Directory,
+            });
+        }
+        for link in ["exe", "cwd", "root"] {
+            entries.push(DirEnt {
+                name: link.to_string(),
+                kind: EntryKind::Symlink,
+            });
+        }
+        PROC_SELF_FILES
+    } else {
+        PROC_PID_FILES
+    };
+    entries.extend(files.iter().map(|f| DirEnt {
         name: (*f).to_string(),
         kind: EntryKind::File,
     }));
@@ -1084,9 +1161,17 @@ impl Vfs for ProcVfs {
                 name: "net".to_string(),
                 kind: EntryKind::Directory,
             });
-            for pid in enumerate_guest_pids() {
+            // Enumerated host pids must be shown as the NAMESPACE pids the guest
+            // sees (what getpid()/$!/status report), or a guest can't correlate
+            // `ls /proc` with its own pids. Identity when no PID namespace is
+            // active; drop host pids that map to no ns-pid (host_to_ns → 0).
+            for host_pid in enumerate_guest_pids() {
+                let ns_pid = crate::namespace::pid::host_to_ns_or_self(host_pid);
+                if ns_pid == 0 {
+                    continue;
+                }
                 entries.push(DirEnt {
-                    name: pid.to_string(),
+                    name: ns_pid.to_string(),
                     kind: EntryKind::Directory,
                 });
             }
@@ -1718,8 +1803,12 @@ Threads:\t1\n",
                 state = info.state,
                 state_long = proc_state_long(info.state),
                 ppid = disp_ppid,
-                uid = info.uid,
-                gid = info.gid,
+                // Report the modeled container credentials, NOT the macOS host
+                // uid/gid (501/20) `host_proc` reads — a sibling guest process
+                // is root:0 in the default rootful container, consistent with
+                // its own getuid()==0 and with /proc/self/status.
+                uid = crate::cred_ipc::read_target(host_pid as i32).unwrap_or(0),
+                gid = 0,
             )
             .into_bytes(),
         ),
@@ -2058,14 +2147,40 @@ mod tests {
         crate::host_proc::set_root_guest_pid(me);
         let v = ProcVfs::new();
 
-        // /proc/<self> is a directory listing the per-process files.
+        // /proc/<self> is a directory listing the RICH per-process surface
+        // (files + magic symlinks + sub-dirs) since it is the self pid.
         let pid_path = format!("/proc/{me}");
         assert_eq!(v.lookup(&pid_path).unwrap().kind, EntryKind::Directory);
-        let files = v.readdir(&pid_path).unwrap();
-        for want in ["stat", "comm", "cmdline", "status", "task"] {
-            assert!(files.iter().any(|d| d.name == want), "missing {want}");
+        let by_name: std::collections::HashMap<String, EntryKind> = v
+            .readdir(&pid_path)
+            .unwrap()
+            .into_iter()
+            .map(|d| (d.name, d.kind))
+            .collect();
+        for want in [
+            "stat", "comm", "cmdline", "status", "maps", "limits", "auxv", "io", "cgroup",
+            "statm",
+        ] {
+            assert_eq!(by_name.get(want), Some(&EntryKind::File), "file {want}");
         }
-        // /proc enumerates this guest process.
+        for dir in ["task", "ns", "net"] {
+            assert_eq!(by_name.get(dir), Some(&EntryKind::Directory), "dir {dir}");
+        }
+        for link in ["exe", "cwd", "root"] {
+            assert_eq!(by_name.get(link), Some(&EntryKind::Symlink), "link {link}");
+        }
+        // Every listed flat file must actually open (readdir ⇄ open in sync).
+        for (name, kind) in &by_name {
+            if *kind == EntryKind::File {
+                let p = format!("{pid_path}/{name}");
+                assert!(
+                    synthetic_file(&p, &demo_ctx()).is_some()
+                        || synthetic_file(&format!("/proc/self/{name}"), &demo_ctx()).is_some(),
+                    "listed file {name} does not open"
+                );
+            }
+        }
+        // /proc enumerates this guest process (as its ns-pid; identity here).
         let root = v.readdir("/proc").unwrap();
         assert!(
             root.iter().any(|d| d.name == me.to_string()),
