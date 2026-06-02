@@ -499,6 +499,51 @@ impl OpenDescription {
             _ => None,
         }
     }
+
+    /// The `readlink(/proc/self/fd/N)` target for an fd with NO backing guest
+    /// path — pipes, sockets, and the anonymous-inode fds (eventfd/epoll/…).
+    /// Path-backed descriptions return `None` so the caller resolves them via
+    /// `open_path`/`fd_open_paths` instead. The `pipe:[ino]`/`socket:[ino]`
+    /// inode is `inode_for_path` of the same label `stat_source`/fstat uses, so a
+    /// tool comparing the readlink's `[ino]` against `fstat(fd).st_ino` agrees.
+    /// Without this, `readlink /proc/self/fd/{1,2}` on a pipe/socket returned an
+    /// empty string, breaking 'are we piped?' and fd-introspection heuristics.
+    pub(super) fn readlink_target(&self) -> Option<String> {
+        let label = match self {
+            OpenDescription::File { .. }
+            | OpenDescription::Directory { .. }
+            | OpenDescription::SyntheticFile { .. }
+            | OpenDescription::HostFile { .. } => return None,
+            OpenDescription::EventFd { .. } => "anon_inode:[eventfd]".to_owned(),
+            OpenDescription::TimerFd { .. } => "anon_inode:[timerfd]".to_owned(),
+            OpenDescription::Epoll { .. } => "anon_inode:[eventpoll]".to_owned(),
+            OpenDescription::Pidfd { .. } => "anon_inode:[pidfd]".to_owned(),
+            OpenDescription::Inotify { .. } => "anon_inode:[inotify]".to_owned(),
+            OpenDescription::SignalFd { .. } => "anon_inode:[signalfd]".to_owned(),
+            // A pty slave readlinks to its /dev/pts/N node (ttyname(3)); the
+            // master has no /dev path, so report a stable anon label.
+            OpenDescription::HostPipe {
+                pty: Some(role), ..
+            } => {
+                if role.is_master {
+                    "anon_inode:[carrick-pty]".to_owned()
+                } else {
+                    format!("/dev/pts/{}", role.index)
+                }
+            }
+            // An anonymous pipe end (no recorded /dev path); a chardev like
+            // /dev/null carries its path in fd_open_paths and is resolved earlier.
+            OpenDescription::HostPipe { .. }
+            | OpenDescription::PipeReader { .. }
+            | OpenDescription::PipeWriter { .. } => {
+                format!("pipe:[{}]", inode_for_path(Path::new("pipe:[carrick]")))
+            }
+            OpenDescription::HostSocket { .. } | OpenDescription::Netlink { .. } => {
+                format!("socket:[{}]", inode_for_path(Path::new("socket:[carrick]")))
+            }
+        };
+        Some(label)
+    }
 }
 
 pub(super) type OpenDescriptionRef = Arc<RwLock<OpenDescription>>;

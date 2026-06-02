@@ -5544,6 +5544,15 @@ impl SyscallDispatcher {
                 // /proc/self/fd/N → the path fd N was opened at. Rosetta readlinks
                 // its main-binary fd this way to recover the binary's path.
                 t
+            } else if let Some(t) = proc_self_fd_number(&path).and_then(|n| {
+                this.open_file(n)
+                    .and_then(|f| f.description.read().readlink_target())
+            }) {
+                // /proc/self/fd/N for an fd with NO backing path (pipe/socket/
+                // eventfd/…) → the synthetic pipe:[ino]/socket:[ino]/anon_inode:[…]
+                // target Linux shows, so fd-introspection and 'are we piped?'
+                // checks see a real target instead of an empty string.
+                t
             } else if let Some(m) = this.fs.vfs_mounts.resolve(&path) {
                 match m.vfs.readlink(&m.full_path) {
                     Ok(p) => p.to_string_lossy().into_owned(),
