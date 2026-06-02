@@ -21,13 +21,27 @@ impl Kqueue {
         if raw < 0 {
             return None;
         }
-        Some(Self {
-            fd: crate::host_signal::relocate_internal_fd(raw),
-        })
+        let fd = crate::host_signal::relocate_internal_fd(raw);
+        Some(Self { fd })
     }
 
     pub fn raw_fd(&self) -> RawFd {
         self.fd
+    }
+
+    /// Test/diagnostic hook: close the kqueue fd now and forget it, so a later
+    /// `kevent` on this wrapper returns EBADF (modelling the fork-storm race in
+    /// which an internal fd is closed out from under a blocked waiter) without a
+    /// double-close of a possibly-reused fd number when the wrapper is dropped.
+    /// Returns the fd that was closed (or -1). Not for production use.
+    #[doc(hidden)]
+    pub fn debug_close_and_invalidate(&mut self) -> RawFd {
+        let fd = self.fd;
+        if fd >= 0 {
+            unsafe { libc::close(fd) };
+        }
+        self.fd = -1;
+        fd
     }
 
     pub fn apply(&self, changes: &[Kevent]) -> Result<(), i32> {
@@ -80,8 +94,10 @@ impl Kqueue {
 
 impl Drop for Kqueue {
     fn drop(&mut self) {
-        unsafe {
-            libc::close(self.fd);
+        if self.fd >= 0 {
+            unsafe {
+                libc::close(self.fd);
+            }
         }
     }
 }
