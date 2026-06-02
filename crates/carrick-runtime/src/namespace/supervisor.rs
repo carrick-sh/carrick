@@ -97,11 +97,17 @@ pub fn run(init_host_pid: i32, reg_pipe_read: i32) -> SupervisorExit {
             if let Some(dead) = ev.proc_exit_ident() {
                 let status = ev.proc_exit_status();
                 if dead == init_host_pid {
-                    // The ns-init exited: tear down the whole namespace.
+                    // The ns-init exited. Do NOT trust the kqueue `data` field as
+                    // the exit status: the watch is armed with `NOTE_EXIT` (not
+                    // `NOTE_EXITSTATUS`), so on macOS `data` reads back 0, not the
+                    // wait-status. The init is our direct child, so harvest the
+                    // authoritative status with `waitpid` (which also reaps it).
+                    // Using the kqueue `data` here silently reported exit code 0
+                    // for every container caught on this path (~half of runs).
+                    let init_status = try_reap_init(init_host_pid)
+                        .unwrap_or_else(|| wait_init_blocking(init_host_pid));
                     teardown(&kq, init_host_pid);
-                    return SupervisorExit {
-                        init_status: status,
-                    };
+                    return SupervisorExit { init_status };
                 }
                 handle_member_death(dead as u32, status);
             } else {
