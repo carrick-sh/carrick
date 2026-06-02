@@ -306,7 +306,11 @@ impl SyscallDispatcher {
     /// as a seccomp filter. Shared by `seccomp(SECCOMP_SET_MODE_FILTER)` and the
     /// legacy `prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, prog)` entry point.
     /// Returns 0 on success, EFAULT/EINVAL on a bad program.
-    fn install_seccomp_filter<M: GuestMemory>(&self, memory: &M, fprog_ptr: u64) -> DispatchOutcome {
+    fn install_seccomp_filter<M: GuestMemory>(
+        &self,
+        memory: &M,
+        fprog_ptr: u64,
+    ) -> DispatchOutcome {
         // struct sock_fprog { unsigned short len; <pad>; sock_filter *filter; }
         // — `filter` is 8-byte aligned, so it sits at offset 8.
         let Ok(len_bytes) = memory.read_bytes(fprog_ptr, 2) else {
@@ -320,8 +324,14 @@ impl SyscallDispatcher {
             return LINUX_EFAULT.into();
         };
         let filter_ptr = u64::from_ne_bytes([
-            ptr_bytes[0], ptr_bytes[1], ptr_bytes[2], ptr_bytes[3], ptr_bytes[4], ptr_bytes[5],
-            ptr_bytes[6], ptr_bytes[7],
+            ptr_bytes[0],
+            ptr_bytes[1],
+            ptr_bytes[2],
+            ptr_bytes[3],
+            ptr_bytes[4],
+            ptr_bytes[5],
+            ptr_bytes[6],
+            ptr_bytes[7],
         ]);
         let Ok(prog_bytes) = memory.read_bytes(filter_ptr, len * 8) else {
             return LINUX_EFAULT.into();

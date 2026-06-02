@@ -1739,7 +1739,10 @@ mod tests {
         on.sa_handler = 0x9000;
         on.sa_flags = crate::linux_abi::LINUX_SA_ONSTACK;
         d.enter_signal_handler(tid, 10, on);
-        assert!(d.is_on_altstack(tid), "SA_ONSTACK handler marks the thread on-stack");
+        assert!(
+            d.is_on_altstack(tid),
+            "SA_ONSTACK handler marks the thread on-stack"
+        );
 
         // rt_sigreturn pops the frame → back off the alt stack.
         d.pop_handler_frame(tid);
@@ -1749,7 +1752,10 @@ mod tests {
         let mut off = LinuxSigaction::empty();
         off.sa_handler = 0x9000;
         d.enter_signal_handler(tid, 11, off);
-        assert!(!d.is_on_altstack(tid), "a non-SA_ONSTACK handler is not on the alt stack");
+        assert!(
+            !d.is_on_altstack(tid),
+            "a non-SA_ONSTACK handler is not on the alt stack"
+        );
         d.pop_handler_frame(tid);
     }
 

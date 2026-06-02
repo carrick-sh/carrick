@@ -1599,8 +1599,14 @@ mod tests {
         assert!(!trunc);
         assert_eq!(buf.len(), 32);
         assert_eq!(u64::from_ne_bytes(buf[0..8].try_into().unwrap()), 28); // cmsg_len
-        assert_eq!(i32::from_ne_bytes(buf[8..12].try_into().unwrap()), LINUX_SOL_SOCKET);
-        assert_eq!(i32::from_ne_bytes(buf[12..16].try_into().unwrap()), LINUX_SCM_CREDENTIALS);
+        assert_eq!(
+            i32::from_ne_bytes(buf[8..12].try_into().unwrap()),
+            LINUX_SOL_SOCKET
+        );
+        assert_eq!(
+            i32::from_ne_bytes(buf[12..16].try_into().unwrap()),
+            LINUX_SCM_CREDENTIALS
+        );
         assert_eq!(u32::from_ne_bytes(buf[16..20].try_into().unwrap()), 1234); // pid
         assert_eq!(u32::from_ne_bytes(buf[20..24].try_into().unwrap()), 1000); // uid
         assert_eq!(u32::from_ne_bytes(buf[24..28].try_into().unwrap()), 1001); // gid

@@ -663,21 +663,33 @@ fn signalfd_read_drains_pending_masked_signals() {
     };
 
     // No signal pending -> EAGAIN (not the old EINVAL).
-    assert_eq!(read(&mut dispatcher, &mut memory, 128), DispatchOutcome::Errno { errno: 11 });
+    assert_eq!(
+        read(&mut dispatcher, &mut memory, 128),
+        DispatchOutcome::Errno { errno: 11 }
+    );
 
     // Mark SIGUSR1 pending for tid 0 (the harness ctx_tid).
     dispatcher.mark_signal_pending(0, 10);
 
     // read drains one 128-byte signalfd_siginfo; ssi_signo == 10.
-    assert_eq!(read(&mut dispatcher, &mut memory, 128), DispatchOutcome::Returned { value: 128 });
+    assert_eq!(
+        read(&mut dispatcher, &mut memory, 128),
+        DispatchOutcome::Returned { value: 128 }
+    );
     let ssi_signo = u32::from_le_bytes(memory.read_bytes(0x4100, 4).unwrap().try_into().unwrap());
     assert_eq!(ssi_signo, 10);
 
     // Drained: a second read is EAGAIN again.
-    assert_eq!(read(&mut dispatcher, &mut memory, 128), DispatchOutcome::Errno { errno: 11 });
+    assert_eq!(
+        read(&mut dispatcher, &mut memory, 128),
+        DispatchOutcome::Errno { errno: 11 }
+    );
 
     // A buffer smaller than one signalfd_siginfo is EINVAL.
-    assert_eq!(read(&mut dispatcher, &mut memory, 64), DispatchOutcome::Errno { errno: 22 });
+    assert_eq!(
+        read(&mut dispatcher, &mut memory, 64),
+        DispatchOutcome::Errno { errno: 22 }
+    );
 }
 
 #[test]
@@ -696,7 +708,9 @@ fn rt_sigtimedwait_writes_full_siginfo_from_queued_payload() {
     dispatcher.record_pending_siginfo(0, 10, LinuxSiginfo::kill(10, SI_QUEUE, 1234, 5678));
 
     // rt_sigtimedwait(set={10}@0x4000, info=0x4100, timeout=NULL, size=8).
-    memory.write_bytes(0x4000, &(1u64 << 9).to_le_bytes()).unwrap();
+    memory
+        .write_bytes(0x4000, &(1u64 << 9).to_le_bytes())
+        .unwrap();
     assert_eq!(
         dispatcher
             .dispatch(
@@ -708,7 +722,15 @@ fn rt_sigtimedwait_writes_full_siginfo_from_queued_payload() {
         DispatchOutcome::Returned { value: 10 }
     );
     // si_signo @0, si_code @8, si_pid @16 (low word of si_addr), si_uid @20.
-    let rd = |off: u64| i32::from_le_bytes(memory.read_bytes(0x4100 + off, 4).unwrap().try_into().unwrap());
+    let rd = |off: u64| {
+        i32::from_le_bytes(
+            memory
+                .read_bytes(0x4100 + off, 4)
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        )
+    };
     assert_eq!(rd(0), 10, "si_signo");
     assert_eq!(rd(8), SI_QUEUE, "si_code from the queued payload");
     assert_eq!(rd(16), 1234, "si_pid from the queued payload");
