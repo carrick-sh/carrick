@@ -31,6 +31,14 @@ pub struct CliRunRequest {
     pub fs: Option<FsBackendKind>,
     /// PID namespace mode (`docker run --pid`). Defaults to `Private`.
     pub pid: PidMode,
+    /// Raw `--stop-signal` value (e.g. `SIGQUIT`/`9`), or `None` to fall back to
+    /// the image's OCI `STOPSIGNAL`. Resolved to a host signum at create time
+    /// and persisted in the container's `RunConfig`; the engine itself does not
+    /// consume it (stop/restart read it from the registry).
+    pub stop_signal: Option<String>,
+    /// `--stop-timeout` in seconds (graceful-stop window before SIGKILL), or
+    /// `None` for the default. Persisted in the container's `RunConfig`.
+    pub stop_timeout: Option<u64>,
 }
 
 /// Parse the request's `--platform` into the canonical [`Platform`], falling
@@ -249,6 +257,7 @@ mod tests {
                 user: Some("root".to_string()),
                 exposed_ports: None,
                 labels: None,
+                stop_signal: None,
             },
         }
     }
@@ -271,6 +280,8 @@ mod tests {
             debug_state_path: None,
             fs: Some(FsBackendKind::Memory),
             pid: PidMode::default(),
+            stop_signal: None,
+            stop_timeout: None,
         }
     }
 
@@ -357,6 +368,8 @@ mod tests {
             debug_state_path: None,
             fs: Some(FsBackendKind::Memory),
             pid: PidMode::default(),
+            stop_signal: None,
+            stop_timeout: None,
         };
         let spec = resolve_run_spec(req, image).unwrap();
         assert_eq!(spec.executable, "/bin/sh");
@@ -388,6 +401,8 @@ mod tests {
             debug_state_path: None,
             fs: Some(FsBackendKind::Memory),
             pid: PidMode::default(),
+            stop_signal: None,
+            stop_timeout: None,
         };
         let spec = resolve_run_spec(req, image).unwrap();
         assert_eq!(spec.argv, vec!["/bin/sh", "/bin/ls"]);
@@ -418,6 +433,8 @@ mod tests {
             debug_state_path: None,
             fs: Some(FsBackendKind::Memory),
             pid: PidMode::default(),
+            stop_signal: None,
+            stop_timeout: None,
         };
         let spec = resolve_run_spec(req, image).unwrap();
         assert_eq!(spec.argv, vec!["/bin/bash", "-c", "echo hi"]);
@@ -448,6 +465,8 @@ mod tests {
             debug_state_path: None,
             fs: Some(FsBackendKind::Memory),
             pid: PidMode::default(),
+            stop_signal: None,
+            stop_timeout: None,
         };
         let spec = resolve_run_spec(req, image).unwrap();
 
@@ -487,6 +506,8 @@ mod tests {
             debug_state_path: None,
             fs: Some(FsBackendKind::Memory),
             pid: PidMode::default(),
+            stop_signal: None,
+            stop_timeout: None,
         };
         let spec = resolve_run_spec(req, image).unwrap();
         assert_eq!(spec.cwd.unwrap().as_str(), "/user/app");

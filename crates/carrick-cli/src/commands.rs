@@ -58,6 +58,8 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 mount: vec![],
                 name: None,
                 rm: false,
+                stop_signal: None,
+                stop_timeout: None,
                 publish: vec![],
                 pid: carrick_spec::PidMode::Private,
                 detach: false,
@@ -357,6 +359,8 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             mount,
             name,
             rm,
+            stop_signal,
+            stop_timeout,
             publish,
             pid,
             detach,
@@ -413,20 +417,17 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 debug_state_path: debug_state_path.map(|p| p.to_string_lossy().into_owned()),
                 fs,
                 pid,
+                stop_signal,
+                stop_timeout,
             };
 
-            // Detached (`carrick run -d`): pull the image, then fork into the
-            // background under a per-container supervisor, print the id, and
-            // return. Manage it with `carrick ps|stop|kill|rm`. We pull BEFORE
-            // forking so an image-resolution error surfaces to the user's
-            // terminal (not the detached log).
+            // Detached (`carrick run -d`): fork into the background under a
+            // per-container supervisor, print the id, and return. Manage it with
+            // `carrick ps|stop|kill|rm`. `run_detached` resolves/pulls the image
+            // in the foreground first, so a resolution error surfaces to the
+            // user's terminal (not the detached log) and the effective stop
+            // signal is baked into the persisted config.
             if detach {
-                // Resolve/pull the image in the foreground so failures are
-                // visible; the detached child re-resolves from the warm store.
-                let _ = block_on_oci(async {
-                    carrick_image::ImageReference::parse(&req.image_ref)
-                        .map_err(|e| anyhow::anyhow!("invalid image reference: {e}"))
-                });
                 let name_for_state = req.name.clone();
                 return crate::lifecycle::run_detached(req, store.clone(), name_for_state);
             }
@@ -544,6 +545,8 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             name,
             tty,
             interactive,
+            stop_signal,
+            stop_timeout,
             command,
         } => {
             let mut env_overrides = env;
@@ -576,6 +579,8 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 debug_state_path: None,
                 fs,
                 pid,
+                stop_signal,
+                stop_timeout,
             };
             crate::lifecycle::create(req, store.clone(), name)?;
         }
