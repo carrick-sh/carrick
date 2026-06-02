@@ -1043,7 +1043,8 @@ impl SyscallDispatcher {
             let value = value as u32;
             let args = cx.raw_args();
             let thread = cx.thread;
-            let memory = &*cx.memory;
+            let tid = cx.tid();
+            let memory = &mut *cx.memory;
             const LINUX_FUTEX_WAIT_BITSET: u64 = 9;
             const LINUX_FUTEX_WAKE_BITSET: u64 = 10;
             let raw_command = operation & LINUX_FUTEX_CMD_MASK;
@@ -1061,6 +1062,23 @@ impl SyscallDispatcher {
                 Ok(word) => word,
                 Err(errno) => return Ok(errno.into()),
             };
+
+            if matches!(
+                command,
+                LINUX_FUTEX_LOCK_PI | LINUX_FUTEX_TRYLOCK_PI | LINUX_FUTEX_UNLOCK_PI
+            ) {
+                let guest_tid = thread
+                    .and_then(|t| guest_visible_tid(tid, t.registry))
+                    .unwrap_or_else(crate::namespace::pid::self_ns_pid);
+                return Ok(dispatch_futex_pi(
+                    memory,
+                    address.0,
+                    command,
+                    word,
+                    guest_tid,
+                    thread.map(|t| t.futex),
+                ));
+            }
 
             let Some(thread) = thread else {
                 return Ok(match command {

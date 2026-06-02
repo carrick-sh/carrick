@@ -95,6 +95,7 @@ fn gettid_returns_per_thread_tid_not_pid() {
     let reporter = CompatReporter::default();
     let dispatcher = SyscallDispatcher::new();
     let registry = Arc::new(ThreadRegistry::new(1000));
+    assert_eq!(registry.register_child(0), 1001);
     let futex = Arc::new(FutexTable::new());
     let tid = registry.register_child(0);
     // gettid is syscall 178.
@@ -117,6 +118,7 @@ fn set_tid_address_records_clear_child_tid_and_returns_tid() {
     let reporter = CompatReporter::default();
     let dispatcher = SyscallDispatcher::new();
     let registry = Arc::new(ThreadRegistry::new(1000));
+    assert_eq!(registry.register_child(0), 1001);
     let futex = Arc::new(FutexTable::new());
     let tid = registry.register_child(0);
     // set_tid_address(addr) is syscall 96.
@@ -140,6 +142,7 @@ fn sched_getscheduler_accepts_live_sibling_tid() {
     let reporter = CompatReporter::default();
     let dispatcher = SyscallDispatcher::new();
     let registry = Arc::new(ThreadRegistry::new(1000));
+    assert_eq!(registry.register_child(0), 1001);
     let futex = Arc::new(FutexTable::new());
     let sibling = registry.register_child(0);
 
@@ -171,6 +174,7 @@ fn sched_getparam_accepts_live_sibling_tid() {
     let reporter = CompatReporter::default();
     let dispatcher = SyscallDispatcher::new();
     let registry = Arc::new(ThreadRegistry::new(1000));
+    assert_eq!(registry.register_child(0), 1001);
     let futex = Arc::new(FutexTable::new());
     let sibling = registry.register_child(0);
 
@@ -198,6 +202,7 @@ fn sched_getscheduler_unknown_sibling_tid_is_esrch() {
     let reporter = CompatReporter::default();
     let dispatcher = SyscallDispatcher::new();
     let registry = Arc::new(ThreadRegistry::new(1000));
+    assert_eq!(registry.register_child(0), 1001);
     let futex = Arc::new(FutexTable::new());
 
     let outcome = dispatcher
@@ -214,12 +219,7 @@ fn sched_getscheduler_unknown_sibling_tid_is_esrch() {
         )
         .unwrap();
 
-    assert_eq!(
-        outcome,
-        DispatchOutcome::Errno {
-            errno: LINUX_ESRCH
-        }
-    );
+    assert_eq!(outcome, DispatchOutcome::Errno { errno: LINUX_ESRCH });
 }
 
 #[test]
@@ -228,6 +228,7 @@ fn futex_wait_value_mismatch_returns_eagain() {
     let reporter = CompatReporter::default();
     let dispatcher = SyscallDispatcher::new();
     let registry = Arc::new(ThreadRegistry::new(1000));
+    assert_eq!(registry.register_child(0), 1001);
     let futex = Arc::new(FutexTable::new());
     // *uaddr = 5, but FUTEX_WAIT expects 7 -> EAGAIN immediately.
     write_u32_le(&mut memory, 0x10800, 5);
@@ -367,6 +368,89 @@ fn futex_cmp_requeue_matching_val3_no_waiters_returns_zero() {
     let report = reporter.finish();
     assert_eq!(report.summary.distinct_partial_syscalls, 0);
     assert_eq!(report.summary.partial_syscall_invocations, 0);
+}
+
+#[test]
+fn futex_lock_pi_private_uncontended_records_owner_tid() {
+    let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
+    let reporter = CompatReporter::default();
+    let dispatcher = SyscallDispatcher::new();
+    let registry = Arc::new(ThreadRegistry::new(1000));
+    assert_eq!(registry.register_child(0), 1001);
+    let futex = Arc::new(FutexTable::new());
+    write_u32_le(&mut memory, 0x10800, 0);
+
+    let op = LINUX_FUTEX_LOCK_PI | LINUX_FUTEX_PRIVATE_FLAG;
+    let outcome = dispatcher
+        .dispatch_threaded(
+            SyscallRequest::new(98, SyscallArgs::from([0x10800, op, 0, 0, 0, 0])),
+            &mut memory,
+            &reporter,
+            1001,
+            &registry,
+            &futex,
+        )
+        .unwrap();
+
+    assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+    assert_eq!(read_i32_le(&memory, 0x10800), 1001);
+}
+
+#[test]
+fn futex_trylock_pi_private_owned_by_self_is_deadlock() {
+    let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
+    let reporter = CompatReporter::default();
+    let dispatcher = SyscallDispatcher::new();
+    let registry = Arc::new(ThreadRegistry::new(1000));
+    assert_eq!(registry.register_child(0), 1001);
+    let futex = Arc::new(FutexTable::new());
+    write_u32_le(&mut memory, 0x10800, 1001);
+
+    let op = LINUX_FUTEX_TRYLOCK_PI | LINUX_FUTEX_PRIVATE_FLAG;
+    let outcome = dispatcher
+        .dispatch_threaded(
+            SyscallRequest::new(98, SyscallArgs::from([0x10800, op, 0, 0, 0, 0])),
+            &mut memory,
+            &reporter,
+            1001,
+            &registry,
+            &futex,
+        )
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        DispatchOutcome::Errno {
+            errno: LINUX_EDEADLK
+        }
+    );
+    assert_eq!(read_i32_le(&memory, 0x10800), 1001);
+}
+
+#[test]
+fn futex_unlock_pi_private_owned_by_self_clears_word() {
+    let mut memory = LinearMemory::new(0x10000, vec![0u8; 0x1000]);
+    let reporter = CompatReporter::default();
+    let dispatcher = SyscallDispatcher::new();
+    let registry = Arc::new(ThreadRegistry::new(1000));
+    assert_eq!(registry.register_child(0), 1001);
+    let futex = Arc::new(FutexTable::new());
+    write_u32_le(&mut memory, 0x10800, 1001);
+
+    let op = LINUX_FUTEX_UNLOCK_PI | LINUX_FUTEX_PRIVATE_FLAG;
+    let outcome = dispatcher
+        .dispatch_threaded(
+            SyscallRequest::new(98, SyscallArgs::from([0x10800, op, 0, 0, 0, 0])),
+            &mut memory,
+            &reporter,
+            1001,
+            &registry,
+            &futex,
+        )
+        .unwrap();
+
+    assert_eq!(outcome, DispatchOutcome::Returned { value: 0 });
+    assert_eq!(read_i32_le(&memory, 0x10800), 0);
 }
 
 // --- Sub-task B (P3): tgkill/tkill cross-thread routing ---
