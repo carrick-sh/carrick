@@ -1212,7 +1212,16 @@ impl SyscallDispatcher {
             // nodename is the runtime-resolved guest hostname (the macOS host's
             // short name under --net=host; `carrick` fallback) so uname(2) agrees
             // with /proc/sys/kernel/hostname and the /etc/hosts self-mapping.
-            let uts = LinuxUtsname::carrick_aarch64_with_nodename(crate::execute::guest_hostname());
+            // Under Rosetta translation the guest is x86_64 — report that machine
+            // (we know it's Rosetta because the loaded executable is the
+            // interpreter); otherwise report native aarch64. Both carry the
+            // resolved nodename.
+            let nodename = crate::execute::guest_hostname();
+            let uts = if this.proc.lock().executable_path == crate::runtime::ROSETTA_INTERPRETER {
+                LinuxUtsname::carrick_x86_64_with_nodename(nodename)
+            } else {
+                LinuxUtsname::carrick_aarch64_with_nodename(nodename)
+            };
             if memory.write_bytes(address.0, uts.abi_bytes()).is_err() {
                 return Ok(LINUX_EFAULT.into());
             }
