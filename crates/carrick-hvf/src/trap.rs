@@ -1729,7 +1729,14 @@ impl HvfInner {
         payload: &[u8],
         file: Option<(libc::c_int, libc::off_t, libc::c_int)>,
     ) -> Result<(), TrapError> {
-        let size = usize::try_from(len).map_err(|_| TrapError::MappingTooLarge(len))?;
+        // hv_vm_map requires a 16 KiB-granular size; round the HOST mapping up
+        // to the HVF granule. The stage-1 `map_aliased` below still maps only the
+        // exact `len` (the guest's page-aligned request), so a sub-16 KiB mmap
+        // never maps extra 4 KiB guest pages into a neighbouring region's
+        // page-table entries (which would redirect that region's fetches/reads
+        // to the wrong IPA — the amd64 Rosetta JIT undefined-instruction bug).
+        let hvf_len = align_up(len, HVF_PAGE_SIZE)?;
+        let size = usize::try_from(hvf_len).map_err(|_| TrapError::MappingTooLarge(len))?;
         // The host page is mapped at the guest's actual prot (map_shared_file),
         // so a PROT_READ file alias has a read-only host backing. Track the
         // guest-intended writability so the syscall write-path returns EFAULT
