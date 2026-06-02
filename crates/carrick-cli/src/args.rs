@@ -203,6 +203,14 @@ pub(crate) enum Commands {
         /// Automatically remove the container when it exits
         #[arg(long = "rm")]
         rm: bool,
+        /// Signal to stop the container (name like `SIGQUIT`/`TERM` or number).
+        /// Overrides the image's `STOPSIGNAL`; defaults to `SIGTERM`.
+        #[arg(long = "stop-signal", value_name = "SIGNAL")]
+        stop_signal: Option<String>,
+        /// Seconds to wait for the container to stop before SIGKILL (used by
+        /// `stop`/`restart` when `-t` is not given). Defaults to 10.
+        #[arg(long = "stop-timeout", value_name = "SECONDS")]
+        stop_timeout: Option<u64>,
         /// Publish a container's port(s) to the host (no-op under host networking)
         #[arg(short = 'p', long = "publish", value_name = "hostPort:containerPort")]
         publish: Vec<String>,
@@ -245,6 +253,12 @@ pub(crate) enum Commands {
         tty: bool,
         #[arg(short = 'i', long = "interactive")]
         interactive: bool,
+        /// Signal to stop the container (overrides the image `STOPSIGNAL`).
+        #[arg(long = "stop-signal", value_name = "SIGNAL")]
+        stop_signal: Option<String>,
+        /// Seconds to wait before SIGKILL when stopping. Defaults to 10.
+        #[arg(long = "stop-timeout", value_name = "SECONDS")]
+        stop_timeout: Option<u64>,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
@@ -258,9 +272,10 @@ pub(crate) enum Commands {
     },
     /// Restart one or more containers (like `docker restart`).
     Restart {
-        /// Seconds to wait for graceful stop before SIGKILL.
-        #[arg(short = 't', long = "time", default_value_t = 10)]
-        time: u64,
+        /// Seconds to wait for graceful stop before SIGKILL. When omitted, the
+        /// container's `--stop-timeout` (else 10s) applies.
+        #[arg(short = 't', long = "time")]
+        time: Option<u64>,
         #[arg(required = true)]
         containers: Vec<String>,
     },
@@ -317,9 +332,10 @@ pub(crate) enum Commands {
     /// Stop one or more running containers (SIGTERM, then SIGKILL after the
     /// grace period), like `docker stop`.
     Stop {
-        /// Seconds to wait for graceful stop before SIGKILL.
-        #[arg(short = 't', long = "time", default_value_t = 10)]
-        time: u64,
+        /// Seconds to wait for graceful stop before SIGKILL. When omitted, the
+        /// container's `--stop-timeout` (else 10s) applies.
+        #[arg(short = 't', long = "time")]
+        time: Option<u64>,
         /// Container ids or names.
         #[arg(required = true)]
         containers: Vec<String>,

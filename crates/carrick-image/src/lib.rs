@@ -977,7 +977,8 @@ mod tests {
                 "WorkingDir": "/opt/app",
                 "Labels": {
                     "maintainer": "test@example.com"
-                }
+                },
+                "StopSignal": "SIGQUIT"
             }
         }"#;
 
@@ -989,6 +990,19 @@ mod tests {
         assert_eq!(config.cmd, Some(vec!["--arg".to_string()]));
         assert_eq!(config.working_dir.unwrap().as_str(), "/opt/app");
         assert!(config.exposed_ports.unwrap().contains("80/tcp"));
+        // OCI `StopSignal` flows through to the resolved config so `carrick stop`
+        // can honor the image's preferred stop signal.
+        assert_eq!(config.stop_signal.as_deref(), Some("SIGQUIT"));
+    }
+
+    #[test]
+    fn oci_config_without_stop_signal_is_none() {
+        // Absent StopSignal must parse to None (additive field), not error.
+        let raw_json = r#"{"config":{"Cmd":["sh"]}}"#;
+        let config = serde_json::from_str::<OciImageConfigContainer>(raw_json)
+            .unwrap()
+            .into_image_config();
+        assert!(config.stop_signal.is_none());
     }
 
     /// Lay down a fake stored image: a `carrick-image.json` summary plus a blob

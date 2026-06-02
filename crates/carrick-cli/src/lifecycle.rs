@@ -32,7 +32,13 @@ pub(crate) fn run_detached(
     let created_secs = now_secs();
     let id = container::make_id(std::process::id() as u64, created_secs);
     let name = resolve_name(name, &id)?;
-    build_created_state(&req, &id, name, created_secs)
+    // Resolve the image in the FOREGROUND (before forking) so pull errors reach
+    // the user's terminal — and so the effective stop signal (flag > image
+    // STOPSIGNAL) is baked into the persisted RunConfig for a later `stop`.
+    let resolved = resolve_request_image(&req, &store)?;
+    let stop_signal =
+        resolve_stop_signal(req.stop_signal.as_deref(), resolved.config.stop_signal.as_deref())?;
+    build_created_state(&req, &id, name, created_secs, stop_signal)
         .create()
         .with_context(|| format!("failed to create container registry entry for {id}"))?;
 
@@ -82,6 +88,7 @@ fn build_created_state(
     id: &str,
     name: Option<String>,
     created_secs: u64,
+    stop_signal: Option<i32>,
 ) -> ContainerState {
     ContainerState {
         id: id.to_string(),
@@ -108,10 +115,28 @@ fn build_created_state(
             tty: req.tty,
             interactive: req.interactive,
             max_traps: req.max_traps,
-            stop_signal: None,
-            stop_timeout: None,
+            stop_signal,
+            stop_timeout: req.stop_timeout,
         },
     }
+}
+
+/// Pull/warm the request's image and return the resolved config (so image errors
+/// surface eagerly, like `docker create`/`run -d`). Shared by `create` and
+/// `run_detached`, which both need the image's `STOPSIGNAL` before forking.
+fn resolve_request_image(
+    req: &carrick_engine::CliRunRequest,
+    store: &carrick_image::ImageStore,
+) -> anyhow::Result<carrick_image::ResolvedImage> {
+    let image_ref = carrick_image::ImageReference::parse(&req.image_ref)?;
+    let target = req
+        .platform
+        .as_deref()
+        .and_then(carrick_image::PlatformTarget::parse)
+        .unwrap_or_else(carrick_image::PlatformTarget::default_target);
+    Ok(crate::runtime_util::block_on_oci(
+        store.resolve_with_platform(&image_ref, &target),
+    )?)
 }
 
 /// The post-fork CHILD body shared by `run -d` and `start`: become a session
@@ -161,15 +186,12 @@ pub(crate) fn create(
     let created_secs = now_secs();
     let id = container::make_id(std::process::id() as u64, created_secs);
     let name = resolve_name(name, &id)?;
-    // Warm the image cache + surface image errors at create time.
-    let image_ref = carrick_image::ImageReference::parse(&req.image_ref)?;
-    let target = req
-        .platform
-        .as_deref()
-        .and_then(carrick_image::PlatformTarget::parse)
-        .unwrap_or_else(carrick_image::PlatformTarget::default_target);
-    crate::runtime_util::block_on_oci(store.resolve_with_platform(&image_ref, &target))?;
-    build_created_state(&req, &id, name, created_secs)
+    // Warm the image cache + surface image errors at create time, and capture
+    // the image's STOPSIGNAL so a later `stop` honors it (flag > image > TERM).
+    let resolved = resolve_request_image(&req, &store)?;
+    let stop_signal =
+        resolve_stop_signal(req.stop_signal.as_deref(), resolved.config.stop_signal.as_deref())?;
+    build_created_state(&req, &id, name, created_secs, stop_signal)
         .create()
         .with_context(|| format!("failed to create container registry entry for {id}"))?;
     println!("{id}");
@@ -199,6 +221,10 @@ fn rebuild_request_from_state(state: &ContainerState) -> carrick_engine::CliRunR
         debug_state_path: None,
         fs: c.fs,
         pid: c.pid,
+        // The effective host stop signum is already persisted in RunConfig and
+        // preserved across relaunch; engine.run ignores these, so leave unset.
+        stop_signal: None,
+        stop_timeout: None,
     }
 }
 
@@ -280,14 +306,16 @@ fn reset_for_relaunch(state: &mut ContainerState) {
 }
 
 /// `carrick restart` — stop (if running) then start, reusing the overlay.
+/// `time` is `None` when `-t` is not given (the container's `--stop-timeout`,
+/// else 10s, applies).
 pub(crate) fn restart(
     store: &carrick_image::ImageStore,
-    secs: u64,
+    time: Option<u64>,
     specs: &[String],
 ) -> anyhow::Result<()> {
     let mut had_err = false;
     for spec in specs {
-        let result = stop_one(spec, secs).and_then(|_| start_one(store, spec));
+        let result = stop_one(spec, time).and_then(|_| start_one(store, spec));
         match result {
             Ok(id) => println!("{id}"),
             Err(e) => {
@@ -545,12 +573,15 @@ fn ps_row_json(c: &ContainerState, st: ContainerStatus, no_trunc: bool) -> serde
     })
 }
 
-/// `carrick stop` — SIGTERM the container's init, wait up to `secs`, then
-/// SIGKILL. Prints the id of each stopped container (docker behavior).
-pub(crate) fn stop(secs: u64, containers: &[String]) -> anyhow::Result<()> {
+/// `carrick stop` — send the container's stop signal (its `--stop-signal` /
+/// image `STOPSIGNAL`, else SIGTERM) to init, wait out the grace window (`-t`
+/// flag > the container's `--stop-timeout` > 10s), then SIGKILL. Prints the id
+/// of each stopped container (docker behavior). `time` is `None` when `-t` is
+/// not given.
+pub(crate) fn stop(time: Option<u64>, containers: &[String]) -> anyhow::Result<()> {
     let mut had_err = false;
     for spec in containers {
-        match stop_one(spec, secs) {
+        match stop_one(spec, time) {
             Ok(id) => println!("{id}"),
             Err(e) => {
                 eprintln!("Error: {e}");
@@ -564,7 +595,7 @@ pub(crate) fn stop(secs: u64, containers: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn stop_one(spec: &str, secs: u64) -> anyhow::Result<String> {
+fn stop_one(spec: &str, time: Option<u64>) -> anyhow::Result<String> {
     let id = container::resolve(spec).map_err(anyhow::Error::msg)?;
     let state = ContainerState::load(&id)?;
     if !state.init_alive() {
@@ -573,10 +604,14 @@ fn stop_one(spec: &str, secs: u64) -> anyhow::Result<String> {
         return Ok(id);
     }
     let init = state.init_pid;
-    // SIGTERM, then poll for exit up to `secs`, then SIGKILL.
+    // The container's configured stop signal (image STOPSIGNAL / --stop-signal),
+    // else SIGTERM; then the grace window (flag > config --stop-timeout > 10s).
+    let signum = state.config.stop_signal.unwrap_or(libc::SIGTERM);
+    let secs = stop_grace_secs(time, state.config.stop_timeout);
+    // Configured stop signal, then poll for exit up to `secs`, then SIGKILL.
     // SAFETY: kill on the recorded host init pid.
     unsafe {
-        libc::kill(init, libc::SIGTERM);
+        libc::kill(init, signum);
     }
     let deadline_ticks = secs.saturating_mul(10); // 100ms ticks
     for _ in 0..deadline_ticks {
@@ -671,8 +706,11 @@ fn rm_one(spec: &str, force: bool) -> anyhow::Result<String> {
     Ok(id)
 }
 
-/// Parse a signal name (`TERM`, `SIGTERM`, `9`, `KILL`, …) to a number.
-fn parse_signal(s: &str) -> Option<i32> {
+/// Parse a signal name (`TERM`, `SIGTERM`, `9`, `KILL`, …) to its HOST (macOS)
+/// signal number. The result is sent via host `kill(2)` (and persisted as the
+/// container's stop signum), so names MUST resolve to the host's numbering, not
+/// the guest's Linux ABI.
+pub(crate) fn parse_signal(s: &str) -> Option<i32> {
     let t = s.trim();
     if let Ok(n) = t.parse::<i32>() {
         return (n > 0 && n <= 64).then_some(n);
@@ -682,15 +720,47 @@ fn parse_signal(s: &str) -> Option<i32> {
         "HUP" => libc::SIGHUP,
         "INT" => libc::SIGINT,
         "QUIT" => libc::SIGQUIT,
+        "ABRT" => libc::SIGABRT,
         "KILL" => libc::SIGKILL,
         "USR1" => libc::SIGUSR1,
         "USR2" => libc::SIGUSR2,
         "TERM" => libc::SIGTERM,
         "STOP" => libc::SIGSTOP,
         "CONT" => libc::SIGCONT,
+        "WINCH" => libc::SIGWINCH,
         _ => return None,
     };
     Some(n)
+}
+
+/// Resolve a container's effective HOST stop signum from the `--stop-signal`
+/// flag and the image's OCI `STOPSIGNAL`: an explicit flag wins; else the image
+/// value; else `None` (stop falls back to `SIGTERM`). An invalid *explicit*
+/// flag is a hard error (docker rejects it at run time); an unparseable *image*
+/// value is ignored with a warning rather than failing the run.
+pub(crate) fn resolve_stop_signal(
+    flag: Option<&str>,
+    image_stop_signal: Option<&str>,
+) -> anyhow::Result<Option<i32>> {
+    if let Some(f) = flag {
+        let n =
+            parse_signal(f).with_context(|| format!("invalid stop signal: {f}"))?;
+        return Ok(Some(n));
+    }
+    if let Some(img) = image_stop_signal {
+        match parse_signal(img) {
+            Some(n) => return Ok(Some(n)),
+            None => eprintln!("carrick: ignoring unrecognized image STOPSIGNAL {img:?}"),
+        }
+    }
+    Ok(None)
+}
+
+/// The graceful-stop window in seconds: an explicit `stop -t` flag wins, then
+/// the container's configured `--stop-timeout`, else docker's 10s default.
+/// `Some(0)` (immediate SIGKILL) is honored — only an *absent* value defaults.
+pub(crate) fn stop_grace_secs(flag: Option<u64>, config_timeout: Option<u64>) -> u64 {
+    flag.or(config_timeout).unwrap_or(10)
 }
 
 /// `carrick exec [-i] [-t] [-u] [-w] [-e] <container> <cmd>...` — run a command
@@ -754,6 +824,10 @@ pub(crate) fn exec(
         debug_state_path: None,
         fs: Some(carrick_spec::FsBackendKind::Host),
         pid: state.config.pid,
+        // exec is a transient command, not a managed container — it is never
+        // `stop`ped, so it carries no stop config.
+        stop_signal: None,
+        stop_timeout: None,
     };
 
     let engine = carrick_engine::Engine::new(store);
@@ -1046,8 +1120,8 @@ fn select_tail(data: &[u8], tail: Option<usize>) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::{
-        ContainerState, ContainerStatus, RunConfig, rebuild_request_from_state, render_format,
-        reset_for_relaunch, select_tail,
+        ContainerState, ContainerStatus, RunConfig, parse_signal, rebuild_request_from_state,
+        render_format, reset_for_relaunch, resolve_stop_signal, select_tail, stop_grace_secs,
     };
 
     fn sample_state() -> ContainerState {
@@ -1080,8 +1154,8 @@ mod tests {
                 tty: true,
                 interactive: false,
                 max_traps: 4242,
-                stop_signal: None,
-                stop_timeout: None,
+                stop_signal: Some(libc::SIGQUIT),
+                stop_timeout: Some(15),
             },
         }
     }
@@ -1121,6 +1195,59 @@ mod tests {
         assert_eq!(s.config.region_path, None);
         // The overlay path is preserved (the relaunch reuses it).
         assert_eq!(s.config.scratch_path.as_deref(), Some("/s"));
+        // The container's stop config survives a relaunch (docker keeps the
+        // configured --stop-signal / --stop-timeout across `restart`/`start`).
+        assert_eq!(s.config.stop_signal, Some(libc::SIGQUIT));
+        assert_eq!(s.config.stop_timeout, Some(15));
+    }
+
+    #[test]
+    fn parse_signal_pins_host_numbers_and_new_aliases() {
+        // Signal NAMES resolve to the HOST (macOS) signal numbers — the stop
+        // signum is persisted and later passed to host kill(2), so it must be a
+        // host number, not Linux's (e.g. SIGUSR1 is 10 on macOS, 30 on Linux).
+        assert_eq!(parse_signal("SIGUSR1"), Some(libc::SIGUSR1));
+        assert_eq!(parse_signal("USR1"), Some(libc::SIGUSR1));
+        assert_eq!(parse_signal("SIGSTOP"), Some(libc::SIGSTOP));
+        assert_eq!(parse_signal("term"), Some(libc::SIGTERM));
+        // Aliases added for stop-signal coverage.
+        assert_eq!(parse_signal("SIGABRT"), Some(libc::SIGABRT));
+        assert_eq!(parse_signal("WINCH"), Some(libc::SIGWINCH));
+        // Numeric form + bounds (1..=64).
+        assert_eq!(parse_signal("9"), Some(9));
+        assert_eq!(parse_signal("0"), None);
+        assert_eq!(parse_signal("65"), None);
+        assert_eq!(parse_signal("NOPE"), None);
+    }
+
+    #[test]
+    fn resolve_stop_signal_precedence_flag_over_image_over_none() {
+        // An explicit --stop-signal wins over the image's STOPSIGNAL.
+        assert_eq!(
+            resolve_stop_signal(Some("SIGUSR1"), Some("SIGQUIT")).unwrap(),
+            Some(libc::SIGUSR1)
+        );
+        // No flag → the image's STOPSIGNAL.
+        assert_eq!(resolve_stop_signal(None, Some("SIGQUIT")).unwrap(), Some(libc::SIGQUIT));
+        // Neither → None (stop falls back to SIGTERM at stop time).
+        assert_eq!(resolve_stop_signal(None, None).unwrap(), None);
+        // An invalid EXPLICIT flag is a hard error (docker rejects it at run).
+        assert!(resolve_stop_signal(Some("BOGUS"), None).is_err());
+        // An unparseable IMAGE STOPSIGNAL is ignored (→ None), never an error —
+        // we don't fail a run over a weird value baked into someone's image.
+        assert_eq!(resolve_stop_signal(None, Some("BOGUS")).unwrap(), None);
+    }
+
+    #[test]
+    fn stop_grace_uses_flag_then_config_then_default() {
+        // An explicit `-t` wins over the container's configured timeout.
+        assert_eq!(stop_grace_secs(Some(3), Some(20)), 3);
+        // No `-t` → the container's --stop-timeout.
+        assert_eq!(stop_grace_secs(None, Some(20)), 20);
+        // Neither → docker's 10s default.
+        assert_eq!(stop_grace_secs(None, None), 10);
+        // `-t 0` is honored (immediate SIGKILL), not treated as "unset".
+        assert_eq!(stop_grace_secs(Some(0), Some(20)), 0);
     }
 
     #[test]
