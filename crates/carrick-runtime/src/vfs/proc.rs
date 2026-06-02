@@ -36,6 +36,8 @@ pub struct SyntheticProcContext {
     /// Guest environment (`KEY=VALUE`) as opaque bytes, surfaced via
     /// `/proc/self/environ` (env values need not be UTF-8).
     pub environ: Vec<Vec<u8>>,
+    /// The guest's currently-open fd numbers, for the `/proc/self/fd` listing.
+    pub open_fds: Vec<i32>,
     pub address_space_regions: Option<Vec<ProcMapsEntry>>,
     pub brk_current: u64,
     pub mmap_next: u64,
@@ -542,6 +544,24 @@ fn proc_ns_is_dir(path: &str) -> bool {
     matches!(proc_pid_subpath(path), Some((_, "ns")))
 }
 
+/// True iff `path` is `/proc/<self>/fd` — the self process's open-fd directory.
+/// Only self: a foreign process's fd table isn't reachable from carrick.
+fn proc_fd_is_dir(path: &str) -> bool {
+    matches!(proc_pid_subpath(path), Some((true, "fd")))
+}
+
+/// The fd number `N` of a `/proc/<self>/fd/N` magic symlink, if `path` is one.
+fn proc_self_fd_link(path: &str) -> Option<i32> {
+    let (is_self, rest) = proc_pid_subpath(path)?;
+    if !is_self {
+        return None;
+    }
+    let n = rest.strip_prefix("fd/")?;
+    (!n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| n.parse().ok())
+        .flatten()
+}
+
 /// Directory listing for a `/proc/<pid>/ns` directory (one symlink per ns type).
 fn proc_ns_dir_entries(path: &str) -> Option<Vec<DirEnt>> {
     if !proc_ns_is_dir(path) {
@@ -587,6 +607,11 @@ fn proc_ns_link_target(path: &str) -> Option<String> {
 /// them (a readlink doesn't require the target to lstat as a symlink), so
 /// `readlink /proc/self` → the pid and `readlink /proc/net` → self/net work.
 fn proc_magic_symlink_size(path: &str) -> Option<u64> {
+    // /proc/self/fd/N is a per-fd symlink (its target is synthesized by the
+    // dispatcher's readlinkat, which can see the fd table).
+    if proc_self_fd_link(path).is_some() {
+        return Some(0);
+    }
     let (is_self, rest) = proc_pid_subpath(path)?;
     if matches!(rest, "exe" | "cwd" | "root") {
         // exe/cwd/root are self-specific (carrick can't derive a foreign
@@ -1016,7 +1041,7 @@ fn proc_pid_dir_entries(path: &str) -> Option<Vec<DirEnt>> {
     ];
     let files = if is_self {
         // Sub-directories and magic symlinks only the self dir fully serves.
-        for dir in ["ns", "net"] {
+        for dir in ["fd", "ns", "net"] {
             entries.push(DirEnt {
                 name: dir.to_string(),
                 kind: EntryKind::Directory,
@@ -1085,6 +1110,7 @@ impl Vfs for ProcVfs {
             || sysctl_is_dir(path)
             || proc_net_is_dir(path)
             || proc_ns_is_dir(path)
+            || proc_fd_is_dir(path)
             || proc_task_dir_entries(path).is_some()
             || proc_pid_dir_entries(path).is_some()
         {
@@ -1259,6 +1285,30 @@ impl Vfs for ProcVfs {
                 status_flags: 0,
             });
         }
+        // `/proc/self/fd`: one symlink entry per currently-open fd. Built from
+        // the OpenContext snapshot (the only dir whose listing is live fd state),
+        // so `ls /proc/self/fd` and `for fd in /proc/self/fd/*` enumerate.
+        if proc_fd_is_dir(path) {
+            let mut entries = vec![
+                DirEnt {
+                    name: ".".to_string(),
+                    kind: EntryKind::Directory,
+                },
+                DirEnt {
+                    name: "..".to_string(),
+                    kind: EntryKind::Directory,
+                },
+            ];
+            entries.extend(ctx.open_fds.unwrap_or(&[]).iter().map(|fd| DirEnt {
+                name: fd.to_string(),
+                kind: EntryKind::Symlink,
+            }));
+            return Ok(VfsHandle::Directory {
+                path: path.to_string(),
+                entries,
+                status_flags: 0,
+            });
+        }
         if let Some(entries) = sysctl_dir_entries(path)
             .or_else(|| proc_net_dir_entries(path))
             .or_else(|| proc_ns_dir_entries(path))
@@ -1275,6 +1325,7 @@ impl Vfs for ProcVfs {
             executable_path: ctx.executable_path.unwrap_or("").to_owned(),
             argv: ctx.argv.unwrap_or(&[]).to_vec(),
             environ: ctx.environ.unwrap_or(&[]).to_vec(),
+            open_fds: ctx.open_fds.unwrap_or(&[]).to_vec(),
             address_space_regions: ctx.address_space_regions.map(|regions| regions.to_vec()),
             brk_current: ctx.brk_current,
             mmap_next: ctx.mmap_next,
@@ -2386,6 +2437,7 @@ mod tests {
             executable_path: "/bin/demo".to_owned(),
             argv: vec!["/bin/demo".to_owned()],
             environ: vec![b"PATH=/usr/bin".to_vec(), b"HOME=/root".to_vec()],
+            open_fds: vec![0, 1, 2],
             address_space_regions: Some(vec![ProcMapsEntry {
                 start: LINUX_HEAP_BASE,
                 end: LINUX_HEAP_BASE + 0x10000,
@@ -2723,6 +2775,47 @@ mod tests {
     }
 
     #[test]
+    fn self_fd_dir_lists_open_fds_as_symlinks() {
+        let v = ProcVfs::new();
+        // /proc/self/fd is a directory; /proc/self/fd/N lstat as a symlink.
+        assert_eq!(v.lookup("/proc/self/fd").unwrap().kind, EntryKind::Directory);
+        assert_eq!(
+            v.lookup_nofollow("/proc/self/fd/1").unwrap().kind,
+            EntryKind::Symlink
+        );
+        // open() lists one symlink per fd from the context snapshot.
+        let fds = [0i32, 1, 2, 7];
+        let ctx = OpenContext {
+            open_fds: Some(&fds),
+            ..Default::default()
+        };
+        let h = v
+            .open(
+                "/proc/self/fd",
+                OpenFlags {
+                    read: true,
+                    directory: true,
+                    ..Default::default()
+                },
+                &ctx,
+            )
+            .unwrap();
+        match h {
+            VfsHandle::Directory { entries, .. } => {
+                let names: Vec<String> = entries
+                    .into_iter()
+                    .filter(|e| e.kind == EntryKind::Symlink)
+                    .map(|e| e.name)
+                    .collect();
+                assert_eq!(names, vec!["0", "1", "2", "7"]);
+            }
+            _ => panic!("expected a Directory handle"),
+        }
+        // A foreign / non-existent pid's fd dir is not reachable.
+        assert!(v.lookup("/proc/999999/fd").is_err());
+    }
+
+    #[test]
     fn ns_dir_and_links() {
         let v = ProcVfs::new();
         assert_eq!(
@@ -2817,6 +2910,7 @@ mod tests {
             executable_path: "/bin/demo".to_owned(),
             argv: vec!["/bin/demo".to_owned()],
             environ: vec![b"PATH=/usr/bin".to_vec(), b"HOME=/root".to_vec()],
+            open_fds: vec![0, 1, 2],
             address_space_regions: Some(vec![ProcMapsEntry {
                 start: LINUX_HEAP_BASE,
                 end: LINUX_HEAP_BASE + 0x10000,

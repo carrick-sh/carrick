@@ -152,6 +152,21 @@ impl SyscallDispatcher {
         self.io.open_files.read().contains_key(&fd)
     }
 
+    /// The guest's currently-open fd numbers, sorted — for `/proc/self/fd` (and
+    /// `/proc/self/fdinfo`) directory enumeration. The bare stdio fds 0/1/2 have
+    /// no `open_files` entry unless the guest reopened them, so they are unioned
+    /// in (unless explicitly closed) to match what Linux lists.
+    pub(in crate::dispatch) fn open_fd_numbers(&self) -> Vec<i32> {
+        let mut fds: std::collections::BTreeSet<i32> =
+            self.io.open_files.read().keys().copied().collect();
+        for stdio in 0..3 {
+            if !self.stdio_is_closed(stdio) {
+                fds.insert(stdio);
+            }
+        }
+        fds.into_iter().collect()
+    }
+
     /// Host fd of `fd` iff it is a real regular file (HostFile) — the source
     /// macOS `sendfile(2)` can stream.
     pub(in crate::dispatch) fn regular_host_file_fd(&self, fd: i32) -> Option<i32> {
