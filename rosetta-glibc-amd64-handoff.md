@@ -4,11 +4,13 @@ Branch: `feat/rosetta-glibc-amd64` (off `main`). Design/plan:
 `docs/superpowers/specs/2026-06-01-rosetta-glibc-amd64-design.md`,
 `docs/superpowers/plans/2026-06-01-rosetta-glibc-amd64.md`.
 
-## Status: Phase 1 COMPLETE ✅
+## Status: Phase 1 COMPLETE ✅ · Phase 2 fork+signal blockers RESOLVED ✅
 
 `carrick run --platform linux/amd64 --fs host {debian:stable,ubuntu:24.04} /bin/uname -m`
-→ **`x86_64`**, exit 0. arm64 → `aarch64`. All host unit tests green (363/0).
-Clippy: no new no-panic-gate violations (carrick-runtime stays at its 4 pre-existing).
+→ **`x86_64`**, exit 0. arm64 → `aarch64`. amd64 `/bin/sh` pipelines that fork
+(SIGCHLD) and trap signals now run cleanly. Rebased onto current `origin/main`.
+carrick-hvf/abi/mem unit tests green; no new no-panic-gate clippy violations.
+See the "Phase 2 — session 2 update" section below for details and open items.
 
 12 commits on the branch (2 docs + 10 code). The unmerged `feat/rosetta-ttbr1`
 layer is re-ported onto current `main` (trap.rs→carrick-hvf, PageTableManager→
@@ -50,41 +52,67 @@ set for the binary path + `/usr/sbin/dtrace`). `CARRICK_TRACE_TRAPS=1` and
 `CARRICK_TRACE_REGS=1`/`CARRICK_FAULT_DEBUG=1` are useful env gates. Always set
 a unique `CARRICK_RUN_ID` and reap only your own guests.
 
-## Phase 2 (workload ladder) — IN PROGRESS
+## Phase 2 (workload ladder) — session 2 update
 
-Rung 0 (`uname`) ✅. Rung 1 (`/bin/sh` pipeline) partially works:
-`sh -c 'ls -la / | wc -l'` forks/execs/pipes correctly (`wc` counts 23) and
-`echo`/`id -u` produce correct output — but two issues:
+Rebased onto current `origin/main` (post-procfs; was force-updated). One conflict
+(`uname` in `dispatch/proc.rs`): merged main's runtime-resolved nodename with the
+Rosetta x86_64 machine string — added `LinuxUtsname::carrick_x86_64_with_nodename`
+so amd64 `uname -a` now reports both (`… x86_64 …`, nodename = host short name).
+Branch builds + signs clean; carrick-hvf/abi/mem tests green. (5 carrick-runtime
+integration failures are all pre-existing on `origin/main` — io_blocking_guard,
+capget/capset, syscall_table manifest, and main's new procfs surface test — none
+in the Rosetta layer.)
 
-- **(A) `ls` `ENODATA` on `/` entries.** `ls -la /` prints `/: No data available`
-  (errno 61) for some directory entries — a getdents/`statx`/listxattr gap on the
-  host-fs backend under the amd64 path. Non-fatal (the pipeline still produced a
-  count). Trace `newfstatat`/`statx`/`getdents64`/`listxattr` returns on `/`.
-- **(B) `rt_sigreturn: bad sigframe magic` (BLOCKER).** A fork→`SIGCHLD` (or the
-  shell's exit-path signal) triggers signal delivery; on `rt_sigreturn` (139)
-  `restore_from_sigframe` reads `frame.magic` = `0x7ff` ≠ `CARRICK_SIGFRAME_MAGIC`
-  at `SP_EL0`. The program's OUTPUT is correct before this; the failure is in
-  signal cleanup. `inject_signal` writes the full `CarrickSigframe` at `new_sp`,
-  sets `SP_EL0=new_sp`, and `x1`/`x2` via `offset_of!` — so the reorder is
-  offset_of-consistent and `restore` decodes the same struct. The magic mismatch
-  therefore means the frame at `rt_sigreturn`'s SP is NOT carrick's frame:
-  suspect Rosetta's own signal-frame emulation (it runs the x86 handler from
-  carrick's AArch64 frame, then `rt_sigreturn`s) — SP or the carrick-private tail
-  may differ. **Next step:** trace `signal-inject`'s `new_sp` vs the SP at the
-  `139` trap (and dump the frame bytes at both) to see whether Rosetta moved SP
-  or rebuilt the frame; then make carrick's frame identification survive Rosetta's
-  signal path (e.g. validate/locate the frame independent of a fixed magic-at-SP,
-  or anchor on the saved-PC/ucontext Rosetta preserves). uname doesn't fork → no
-  signal → it never hit this; the pipeline does.
+### Both rung-1 blockers RESOLVED (committed)
+- **fork TTBR1/ACTLR restore** (`fix(rosetta/fork)`): `VcpuSnapshot` captured
+  `TTBR0_EL1` but not `TTBR1_EL1`/`ACTLR_EL1`. A fork/clone rebuilds the vCPU from
+  the snapshot, so the post-fork guest lost the x86-64 upper-half root (TTBR1
+  walked from base 0 → high-VA faults/garbage) and hardware TSO (EnTSO). Capture +
+  restore both after TTBR0 in `restore_vcpu` and `restore_vcpu_thread_start`.
+- **rt_sigreturn from `uc_mcontext` at SP** (`fix(rosetta/signal)`): the old
+  private-magic gate rejected every Rosetta signal return. Measured root cause:
+  carrick injects (e.g. SIGCHLD), Rosetta runs the x86 handler out of carrick's
+  frame, then rebuilds a FRESH standard AArch64 `rt_sigframe` at a new SP
+  (observed SP = inject base + 0x140, valid siginfo at SP+0) and rt_sigreturns
+  through THAT — carrick's private magic is absent (and the original frame
+  overwritten). Fix: restore from `ucontext.uc_mcontext` at SP exactly as the
+  kernel does, validating the resume PSTATE targets EL0 (the load-bearing half of
+  `valid_user_regs`) instead of the magic. Native AArch64 unaffected.
 
-## Remaining plan
-- Phase 2 rungs: fix (A)+(B); then `python3` (use a glibc python image, e.g.
-  `python:3.12-slim`), `python3 -m http.server`, `apt-get install`.
-- Phase 3: Rosetta unit tests (redirect-argv, ioctl-handshake, platform
-  round-trip); the high-VA over-map + overlap fixes deserve unit tests too
-  (e.g. assert `mapping_for_range` returns the newest overlapping region, and a
-  sub-16 KiB high-VA mmap doesn't perturb a neighbour's L3 entries); the
-  self-skipping `linux/amd64` conformance lane in
-  `crates/carrick-cli/tests/conformance.rs`; the `x86_64-unknown-linux-musl`
-  probe build path in `scripts/build-probes.sh`.
-- Phase 4: rewrite `docs/rosetta.md` ("TTBR1/upper-half is the next step" → done).
+### Correctness battery (amd64 Rosetta vs arm64 native, ubuntu:24.04, no network)
+11 of 12 byte-identical to native arm64: 64-bit arith, awk/perl sums, sha256,
+numeric sort, **fork+exec ×200** (exercises the fork fix), **SIGUSR1 trap+handler**
+(exercises rt_sigreturn), 2M-element perl alloc (high-VA mmap), deep pipes,
+base64 round-trip, `wc -c`/`wc -l`. The translation core is sound.
+
+### Open items
+- **(R, Rosetta-specific, OPEN) `cat -n` mistranslates.** Deterministic: `cat -n`
+  of even a 3-line file emits the line number then spaces instead of the line
+  body (and dash misparses `/usr/bin/gunzip` → "line 33: unterminated quoted
+  string"), while plain `cat`/`wc -l`/`od`/`md5sum`/`sed` read the SAME bytes
+  correctly (md5 identical to arm64) and synthetic multi-line-quote scripts parse
+  fine. So it's not fs/read corruption and not `memchr` (wc -l is correct) — it's
+  the coreutils `-n` formatting / dash tokenizer code path producing wrong output
+  under translation. Suspects to pursue with the trace skill: pointer-tag handling
+  on the content pointer, or carrick's EL0 ID-register values steering a bad
+  Rosetta JIT path. Needs dtrace on the translated execution to localize.
+- **(syscall workstream, not Rosetta layer) `FUTEX_LOCK_PI_PRIVATE` → ENOSYS.**
+  `grep` aborts with `rosetta error: futex(FUTEX_LOCK_PI_PRIVATE) failure: 38`;
+  the Rosetta runtime needs priority-inheritance futexes. carrick returns ENOSYS.
+- **(network, deferred) apt secure verify.** `apt-get update` reaches the archive
+  and downloads InRelease, but gpgv-under-Rosetta yields `GOODSIG` with no
+  `VALIDSIG` line → apt "Good signature, but could not determine key fingerprint".
+  Native arm64 verifies fine. `ls -la /` ENODATA is likewise a host-fs/getdents
+  path matter, not the Rosetta translation layer.
+
+## Remaining plan (Rosetta layer)
+- Localize and fix (R) `cat -n`/dash divergence (trace skill).
+- Lock-in tests: the fork-restore + rt_sigreturn fixes, plus the high-VA over-map
+  and overlap fixes (assert `mapping_for_range` returns the newest overlapping
+  region; a sub-16 KiB high-VA mmap doesn't perturb a neighbour's L3 entries).
+- Self-skipping `linux/amd64` conformance lane in
+  `crates/carrick-cli/tests/conformance.rs`; `x86_64-unknown-linux-musl` probe
+  build path in `scripts/build-probes.sh`.
+- Rewrite `docs/rosetta.md` ("TTBR1/upper-half is the next step" → done).
+
+Safety: pre-rebase branch state preserved at `feat/rosetta-glibc-amd64-prerebase`.
