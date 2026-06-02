@@ -49,7 +49,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 interactive,
                 fs: None,
                 env: vec![],
-                env_file: None,
+                env_file: vec![],
                 workdir: None,
                 user: None,
                 entrypoint: None,
@@ -268,9 +268,9 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 }
             }
             let mut env_overrides = env.clone();
-            if let Some(file_path) = &env_file {
-                let file_envs = parse_env_file(file_path)?;
-                env_overrides.extend(file_envs);
+            // `--env-file` may repeat (docker allows it); later files win.
+            for file_path in &env_file {
+                env_overrides.extend(parse_env_file(file_path)?);
             }
 
             let mut mounts = Vec::new();
@@ -281,7 +281,11 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 mounts.push(parse_mount_flag(m_str)?);
             }
 
-            let entrypoint_override = entrypoint.map(|ep| vec![ep]);
+            // `--entrypoint ""` clears the image ENTRYPOINT (run the command
+            // alone), like docker — an empty value maps to an empty vec, not a
+            // one-element [""] that would become an empty argv[0].
+            let entrypoint_override =
+                entrypoint.map(|ep| if ep.is_empty() { Vec::new() } else { vec![ep] });
 
             let req = carrick_engine::CliRunRequest {
                 image_ref: image,
