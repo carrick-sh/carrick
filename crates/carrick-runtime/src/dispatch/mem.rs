@@ -643,6 +643,14 @@ impl SyscallDispatcher {
             }
             let freed = {
                 let mut mem = this.mem.lock();
+                // Release any private-overlay slot repointed at this VA (a
+                // MAP_FIXED|MAP_PRIVATE over a shared-aperture VA carved one via
+                // alloc_sourced + repoint_private); without this it leaks a slot
+                // in the bounded overlay window. Mirrors the re-MAP_FIXED path.
+                // (audit M11)
+                if let Some(slot) = mem.overlay.find_by_source(address.0) {
+                    mem.overlay.free(slot);
+                }
                 mem.shared.free(address.0)
             };
             if let Some(alloc) = freed {
