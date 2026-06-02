@@ -680,6 +680,13 @@ struct HvfInner {
     /// stub's `hvc` (`EC = 0x16`) so `complete_syscall` knows whether to
     /// advance PC past the HVC before resuming.
     last_exit_class: u64,
+    /// ESR_EL1 of the most recent EL0 synchronous fault. The arm64 kernel puts
+    /// it in the signal frame's `esr_context`; Apple Rosetta's signal handler
+    /// requires that record. Captured at fault detection, consumed by
+    /// `inject_signal` when building a fault signal's ucontext. Only meaningful
+    /// between fault-detect and the immediately following delivery, so it is
+    /// reset to 0 across fork/clone/execve.
+    last_fault_esr: u64,
     /// True iff this engine was produced by a `fork(2)` returning into a
     /// child. The runtime checks this when the guest exits and calls
     /// `_exit(2)` instead of running normal Rust drops — applevisor's
@@ -1253,6 +1260,7 @@ impl HvfTrapEngine {
                 vcpu,
                 mappings: Vec::new(),
                 last_exit_class: 0,
+                last_fault_esr: 0,
                 is_forked_child: false,
                 protections: std::sync::Arc::new(MemoryProtections::default()),
                 page_tables: std::sync::Arc::new(parking_lot::Mutex::new(None)),
@@ -1369,20 +1377,33 @@ impl HvfTrapEngine {
                 .vcpu
                 .set_sys_reg(SysReg::MAIR_EL1, 0xFF)
                 .map_err(hvf_error)?;
-            // TCR_EL1:
-            //   T0SZ = 16  (48-bit VA, start at L0) — wide enough to address
-            //              Rosetta's fixed ET_EXEC load base at 2^47; existing
-            //              low identity mappings are unaffected (same L0[0..1]).
-            //   IRGN0 = 0b11 (Inner WB Cacheable)
-            //   ORGN0 = 0b11 (Outer WB Cacheable)
-            //   SH0   = 0b11 (Inner Shareable)
-            //   TG0   = 0b00 (4K granule)
-            //   EPD1  = 1    (disable TTBR1 walks)
-            //   IPS   = 0b010 (40-bit IPA, max for M-series HVF — output stays
-            //              ≤40 bits; high VAs are mapped down to a low IPA)
+            // TCR_EL1: TTBR0 (lower half) and TTBR1 (upper half) BOTH active.
+            //   T0SZ = T1SZ = 16 (48-bit VA each half) — wide enough for
+            //              Rosetta's fixed ET_EXEC load base at 2^47 AND the
+            //              x86-64 high-half (negative) addresses it maps into.
+            //   IRGN0/1 = 0b11, ORGN0/1 = 0b11, SH0/1 = 0b11 (Inner WB, Inner
+            //              Shareable) for both halves; TG0 = 0b00 (4K),
+            //              TG1 = 0b10 (4K — note TG1's encoding differs!).
+            //   EPD1 = 0 (TTBR1 walks ENABLED). TTBR1 shares the TTBR0 page-
+            //              table root: a walk indexes VA[47:0] regardless of
+            //              which TTBR selected it, and carrick's lower-half
+            //              mappings + the upper-half alias projections occupy
+            //              disjoint L0 slots.
+            //   IPS = 0b010 (40-bit IPA, max for M-series HVF — output stays
+            //              <=40 bits; high VAs are mapped down to a low IPA).
+            //   TBI0/TBI1 = 1: the MMU ignores the top byte on translation —
+            //              Rosetta tags pointers in the top byte and asserts
+            //              unless hardware ignores it (pairs with the 16-bit
+            //              software tag strip in mapping_for_range / mmap).
             const T0SZ: u64 = 16;
-            const TCR_EL1_BOOTSTRAP: u64 =
-                T0SZ | (0b11 << 8) | (0b11 << 10) | (0b11 << 12) | (1 << 23) | (0b010 << 32);
+            const T1SZ: u64 = 16;
+            const TCR_EL1_BOOTSTRAP: u64 = T0SZ
+                | (0b11 << 8) | (0b11 << 10) | (0b11 << 12)   // IRGN0/ORGN0/SH0
+                | (T1SZ << 16)
+                | (0b11 << 24) | (0b11 << 26) | (0b11 << 28)  // IRGN1/ORGN1/SH1
+                | (0b10 << 30)                                 // TG1 = 4 KiB
+                | (0b010 << 32)                                // IPS = 40-bit
+                | (1 << 37) | (1 << 38);                       // TBI0/TBI1
             self.inner
                 .vcpu
                 .set_sys_reg(SysReg::TCR_EL1, TCR_EL1_BOOTSTRAP)
@@ -1390,6 +1411,11 @@ impl HvfTrapEngine {
             self.inner
                 .vcpu
                 .set_sys_reg(SysReg::TTBR0_EL1, pt_base)
+                .map_err(hvf_error)?;
+            // TTBR1 shares the same root (see the TCR comment above).
+            self.inner
+                .vcpu
+                .set_sys_reg(SysReg::TTBR1_EL1, pt_base)
                 .map_err(hvf_error)?;
             // Enable stage-1 MMU (M=1) on top of the C=1, I=1 flags above.
             sctlr_el1 |= 1;
@@ -1484,6 +1510,19 @@ unsafe fn volatile_copy_to_guest(src: *const u8, dst: *mut u8, len: usize) {
     for i in 0..len {
         unsafe { dst.add(i).write_volatile(src.add(i).read()) };
     }
+}
+
+/// Strip a 16-bit pointer tag (bits 63:48) from a guest virtual address.
+/// Apple Rosetta tags pointers in the top 16 bits (a 48-bit `TaggedPointer`
+/// value space, broader than the 8-bit hardware TBI), so syscall-path region
+/// lookups must mask the tag to resolve a tagged pointer to its 48-bit backing
+/// mapping. Pairs with TCR_EL1.TBI0/TBI1 (hardware ignores the top byte for the
+/// guest's own accesses) and the mmap-hint strip in dispatch/mem.rs. A no-op
+/// for native (top-byte-zero) guests.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[inline]
+fn strip_pointer_tag(address: u64) -> u64 {
+    address & 0x0000_FFFF_FFFF_FFFF
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1865,6 +1904,10 @@ impl HvfInner {
             crate::probes::vcpu_fault(exception.syndrome, elr, far, x30, sp, unsafe {
                 libc::getpid()
             });
+            // Stash the fault ESR for the signal frame's esr_context (Rosetta's
+            // handler requires it). This direct-EL0-abort path is post-rewrite;
+            // the HVC-underlying path below stashes it too.
+            self.last_fault_esr = exception.syndrome;
             return Err(TrapError::EL0Fault {
                 syndrome: exception.syndrome,
                 elr,
@@ -1948,6 +1991,8 @@ impl HvfInner {
                     );
                     crate::probes::pt_fault_walk(far, d[0], d[1], d[2], d[3]);
                 }
+                // Stash the fault ESR for the signal frame's esr_context.
+                self.last_fault_esr = underlying;
                 return Err(TrapError::EL0Fault {
                     syndrome: underlying,
                     elr,
@@ -2064,6 +2109,49 @@ impl HvfInner {
 
     fn emulate_el0_sys64_read(&mut self, esr: u64) -> Result<bool, TrapError> {
         use applevisor::prelude::*;
+
+        // EL0 read of a feature-ID register (the CRn==0, Op0==3, Op1==0 space).
+        // The Linux kernel emulates these for userspace; Apple Rosetta reads
+        // ID_AA64MMFR1_EL1 (and friends) at startup, and without this the MRS
+        // takes a fatal undef. Return the real vCPU value. (The Op1==3 timer /
+        // CTR_EL0 / DCZID_EL0 reads handled below are a separate space.)
+        let op0 = (esr >> 20) & 0x3;
+        let op1 = (esr >> 14) & 0x7;
+        let crn = (esr >> 10) & 0xf;
+        let crm = (esr >> 1) & 0xf;
+        let op2 = (esr >> 17) & 0x7;
+        let direction_read = esr & 1 == 1;
+        if direction_read && op0 == 3 && op1 == 0 && crn == 0 {
+            let rt_id = ((esr >> 5) & 0x1f) as usize;
+            let enc = (op0 << 14) | (op1 << 11) | (crn << 7) | (crm << 3) | op2;
+            let id_reg = match enc {
+                0xc000 => Some(SysReg::MIDR_EL1),
+                0xc020 => Some(SysReg::ID_AA64PFR0_EL1),
+                0xc021 => Some(SysReg::ID_AA64PFR1_EL1),
+                0xc028 => Some(SysReg::ID_AA64DFR0_EL1),
+                0xc029 => Some(SysReg::ID_AA64DFR1_EL1),
+                0xc030 => Some(SysReg::ID_AA64ISAR0_EL1),
+                0xc031 => Some(SysReg::ID_AA64ISAR1_EL1),
+                0xc038 => Some(SysReg::ID_AA64MMFR0_EL1),
+                0xc039 => Some(SysReg::ID_AA64MMFR1_EL1),
+                0xc03a => Some(SysReg::ID_AA64MMFR2_EL1),
+                // Any other CRn==0/Op0==3/Op1==0 slot reads-as-zero (RES0),
+                // matching the architectural default for unallocated ID regs.
+                _ => None,
+            };
+            let value = match id_reg {
+                Some(reg) => self.vcpu.get_sys_reg(reg).map_err(hvf_error)?,
+                None => 0,
+            };
+            if let Some(target) = GPR_TABLE.get(rt_id) {
+                self.vcpu.set_reg(*target, value).map_err(hvf_error)?;
+            }
+            let elr = self.vcpu.get_sys_reg(SysReg::ELR_EL1).map_err(hvf_error)?;
+            self.vcpu
+                .set_sys_reg(SysReg::ELR_EL1, elr.wrapping_add(4))
+                .map_err(hvf_error)?;
+            return Ok(true);
+        }
 
         let Some((rt, reg)) = decode_el0_sys64_read(esr) else {
             return Ok(false);
@@ -2310,6 +2398,7 @@ impl HvfInner {
     }
 
     fn mapping_for_range(&self, address: u64, length: usize) -> Option<&HvfMappedRegion> {
+        let address = strip_pointer_tag(address);
         self.mappings
             .iter()
             .find(|mapping| mapping.contains_range(address, length))
@@ -2320,6 +2409,7 @@ impl HvfInner {
         address: u64,
         length: usize,
     ) -> Option<&mut HvfMappedRegion> {
+        let address = strip_pointer_tag(address);
         self.mappings
             .iter_mut()
             .find(|mapping| mapping.contains_range(address, length))
@@ -2629,6 +2719,24 @@ impl HvfInner {
         // interrupted thread (aarch64 memcpy/memset use V registers) and so a
         // handler inspecting the ucontext sees real FP state.
         self.save_fpsimd_into(&mut mcontext)?;
+        // For a synchronous fault, the arm64 kernel also records an esr_context
+        // (the fault ESR) in __reserved after the fpsimd record. Apple Rosetta's
+        // signal handler requires it. The zero-filled tail is the terminating
+        // null record.
+        if fault_siginfo.is_some() {
+            const ESR_MAGIC: u32 = 0x4553_5201; // 'ESR\x01'
+            let off = if fpsimd_save_enabled() {
+                core::mem::size_of::<crate::linux_abi::LinuxFpsimdContext>()
+            } else {
+                0
+            };
+            if off + 16 <= mcontext.__reserved.len() {
+                mcontext.__reserved[off..off + 4].copy_from_slice(&ESR_MAGIC.to_le_bytes());
+                mcontext.__reserved[off + 4..off + 8].copy_from_slice(&16u32.to_le_bytes());
+                mcontext.__reserved[off + 8..off + 16]
+                    .copy_from_slice(&self.last_fault_esr.to_le_bytes());
+            }
+        }
         let mut ucontext = crate::linux_abi::LinuxUcontext::empty();
         ucontext.uc_sigmask = saved_sigmask;
         ucontext.uc_mcontext = mcontext;
@@ -3014,6 +3122,7 @@ impl HvfInner {
             vcpu: new_vcpu,
             mappings: Vec::with_capacity(mapping_descs.len()),
             last_exit_class: snapshot.last_exit_class,
+            last_fault_esr: 0,
             is_forked_child: pid == 0,
             protections: inherited_protections,
             page_tables: inherited_page_tables,
@@ -3139,6 +3248,7 @@ impl HvfInner {
             vcpu,
             mappings: Vec::with_capacity(mappings.len()),
             last_exit_class: snapshot.last_exit_class,
+            last_fault_esr: 0,
             is_forked_child: false,
             protections,
             page_tables,
@@ -3271,6 +3381,7 @@ impl HvfInner {
             vcpu: new_vcpu,
             mappings: Vec::new(),
             last_exit_class: 0,
+            last_fault_esr: 0,
             is_forked_child: was_forked_child,
             // execve replaces the address space; any prior PROT_NONE ranges are
             // gone. The new image starts with none until it mmaps them.
@@ -3323,15 +3434,26 @@ impl HvfInner {
             self.vcpu
                 .set_sys_reg(SysReg::MAIR_EL1, 0xFF)
                 .map_err(hvf_error)?;
-            // 48-bit VA (see the matching comment in map_address_space).
+            // 48-bit VA, TTBR0 + TTBR1 both active sharing one root. MUST stay
+            // identical to the canonical TCR comment/value in map_address_space.
             const T0SZ: u64 = 16;
-            const TCR_EL1_BOOTSTRAP: u64 =
-                T0SZ | (0b11 << 8) | (0b11 << 10) | (0b11 << 12) | (1 << 23) | (0b010 << 32);
+            const T1SZ: u64 = 16;
+            const TCR_EL1_BOOTSTRAP: u64 = T0SZ
+                | (0b11 << 8) | (0b11 << 10) | (0b11 << 12)   // IRGN0/ORGN0/SH0
+                | (T1SZ << 16)
+                | (0b11 << 24) | (0b11 << 26) | (0b11 << 28)  // IRGN1/ORGN1/SH1
+                | (0b10 << 30)                                 // TG1 = 4 KiB
+                | (0b010 << 32)                                // IPS = 40-bit
+                | (1 << 37) | (1 << 38);                       // TBI0/TBI1
             self.vcpu
                 .set_sys_reg(SysReg::TCR_EL1, TCR_EL1_BOOTSTRAP)
                 .map_err(hvf_error)?;
             self.vcpu
                 .set_sys_reg(SysReg::TTBR0_EL1, pt_base)
+                .map_err(hvf_error)?;
+            // TTBR1 shares the same root (see the TCR comment above).
+            self.vcpu
+                .set_sys_reg(SysReg::TTBR1_EL1, pt_base)
                 .map_err(hvf_error)?;
             sctlr_el1 |= 1;
         }
@@ -4119,5 +4241,28 @@ impl SyscallTrap for HvfTrapEngine {
 
     fn restore_from_sigframe(&mut self) -> Result<u64, TrapError> {
         HvfTrapEngine::restore_from_sigframe(self)
+    }
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+mod tag_strip_tests {
+    use super::strip_pointer_tag;
+
+    #[test]
+    fn strips_top_16_bits() {
+        // Rosetta's RWX ExecutableHeap hint, and an x86-64 high-half address.
+        assert_eq!(
+            strip_pointer_tag(0xffff_fff7_ff70_0000),
+            0x0000_fff7_ff70_0000
+        );
+        assert_eq!(
+            strip_pointer_tag(0xffff_ffff_fff3_a000),
+            0x0000_ffff_fff3_a000
+        );
+        // Native (top-byte-zero) pointers are untouched.
+        assert_eq!(
+            strip_pointer_tag(0x0000_0001_2345_6000),
+            0x0000_0001_2345_6000
+        );
     }
 }
