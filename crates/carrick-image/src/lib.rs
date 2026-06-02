@@ -499,6 +499,170 @@ impl ImageStore {
     }
 }
 
+/// One stored image (one entry per pulled platform variant), for `carrick
+/// images`. Sizes are summed layer bytes + config; `id` is the short manifest
+/// digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageInfo {
+    pub repository: String,
+    pub tag: String,
+    pub id: String,
+    pub size: u64,
+    pub created_secs: u64,
+    pub image_dir: PathBuf,
+}
+
+/// Display form of an image's repository: strip the implicit `docker.io/library/`
+/// prefix for the common case (docker shows `ubuntu`, not
+/// `docker.io/library/ubuntu`); otherwise `registry/repository`.
+fn display_repository(image: &ImageReference) -> String {
+    let (reg, repo) = (image.registry(), image.repository());
+    if reg == "docker.io" {
+        repo.strip_prefix("library/").unwrap_or(repo).to_string()
+    } else {
+        format!("{reg}/{repo}")
+    }
+}
+
+impl ImageStore {
+    /// List every pulled image — one entry per stored `carrick-image.json`
+    /// summary (so per platform). Unreadable/partial entries are skipped;
+    /// sorted newest-first by the summary's mtime.
+    pub fn list_images(&self) -> Vec<ImageInfo> {
+        let mut out = Vec::new();
+        let mut stack = vec![self.root.join("images")];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.file_name().and_then(|n| n.to_str()) == Some("carrick-image.json") {
+                    if let Some(info) = self.image_info_from_summary(&path) {
+                        out.push(info);
+                    }
+                }
+            }
+        }
+        out.sort_by(|a, b| b.created_secs.cmp(&a.created_secs));
+        out
+    }
+
+    fn image_info_from_summary(&self, summary_path: &Path) -> Option<ImageInfo> {
+        let summary: PullSummary = serde_json::from_slice(&std::fs::read(summary_path).ok()?).ok()?;
+        let image = ImageReference::parse(&summary.image).ok()?;
+        let id = summary
+            .digest
+            .as_deref()
+            .and_then(|d| d.strip_prefix("sha256:"))
+            .map(|h| h.get(..12).unwrap_or(h).to_string())
+            .unwrap_or_else(|| "<none>".to_string());
+        let size = summary.layers.iter().map(|l| l.size as u64).sum::<u64>()
+            + summary.config_size as u64;
+        let created_secs = std::fs::metadata(summary_path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        Some(ImageInfo {
+            repository: display_repository(&image),
+            tag: image.tag().unwrap_or("<none>").to_string(),
+            id,
+            size,
+            created_secs,
+            image_dir: summary_path.parent()?.to_path_buf(),
+        })
+    }
+
+    /// The set of blob digests referenced by every stored image (the union of
+    /// all summaries' layer digests). Drives [`gc_blobs`].
+    fn referenced_blobs(&self) -> std::collections::HashSet<String> {
+        let mut refs = std::collections::HashSet::new();
+        for info in self.list_images() {
+            let summary_path = info.image_dir.join("carrick-image.json");
+            if let Ok(bytes) = std::fs::read(&summary_path)
+                && let Ok(summary) = serde_json::from_slice::<PullSummary>(&bytes)
+            {
+                for layer in summary.layers {
+                    refs.insert(layer.digest);
+                }
+            }
+        }
+        refs
+    }
+
+    /// Remove a pulled image: delete its metadata directory (all platform
+    /// variants of the tag). Returns `true` if it existed. Blobs are left for
+    /// [`gc_blobs`] (they may be shared).
+    pub fn remove_image(&self, image: &ImageReference) -> std::io::Result<bool> {
+        let dir = self.image_dir(image);
+        if !dir.exists() {
+            return Ok(false);
+        }
+        std::fs::remove_dir_all(&dir)?;
+        Ok(true)
+    }
+
+    /// Garbage-collect blobs no longer referenced by any stored image. Returns
+    /// `(count, bytes)` removed.
+    pub fn gc_blobs(&self) -> (usize, u64) {
+        let referenced = self.referenced_blobs();
+        let blobs_dir = self.root.join("blobs").join("sha256");
+        let Ok(entries) = std::fs::read_dir(&blobs_dir) else {
+            return (0, 0);
+        };
+        let (mut count, mut bytes) = (0usize, 0u64);
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(encoded) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if referenced.contains(&format!("sha256:{encoded}")) {
+                continue;
+            }
+            let sz = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            if std::fs::remove_file(&path).is_ok() {
+                count += 1;
+                bytes += sz;
+            }
+        }
+        (count, bytes)
+    }
+
+    /// Tag a stored image under a new reference (`docker tag`): copy the
+    /// default-platform metadata to the new ref's directory, rewriting the
+    /// summary. Blobs are content-addressed and shared, so nothing is copied.
+    /// Errors if `src` is not in the store.
+    pub fn tag_image(
+        &self,
+        src: &ImageReference,
+        dst: &ImageReference,
+    ) -> Result<(), OciBootstrapError> {
+        let src_dir = self.image_dir(src);
+        let summary_bytes = std::fs::read(src_dir.join("carrick-image.json"))?;
+        let mut summary: PullSummary = serde_json::from_slice(&summary_bytes)?;
+        let dst_dir = self.image_dir(dst);
+        std::fs::create_dir_all(&dst_dir)?;
+        // Copy the OCI metadata (config + manifest) when present.
+        for name in ["config.json", "manifest.json"] {
+            let from = src_dir.join(name);
+            if from.exists() {
+                std::fs::copy(&from, dst_dir.join(name))?;
+            }
+        }
+        summary.image = dst.canonical();
+        summary.image_dir = dst_dir.clone();
+        std::fs::write(
+            dst_dir.join("carrick-image.json"),
+            serde_json::to_vec_pretty(&summary)?,
+        )?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -748,5 +912,96 @@ mod tests {
         assert_eq!(config.cmd, Some(vec!["--arg".to_string()]));
         assert_eq!(config.working_dir.unwrap().as_str(), "/opt/app");
         assert!(config.exposed_ports.unwrap().contains("80/tcp"));
+    }
+
+    /// Lay down a fake stored image: a `carrick-image.json` summary plus a blob
+    /// file of the given size for each layer.
+    fn fake_image(store: &ImageStore, ref_str: &str, digest: &str, layers: &[(&str, usize)]) {
+        let image = ImageReference::parse(ref_str).unwrap();
+        let dir = store.image_dir(&image);
+        std::fs::create_dir_all(&dir).unwrap();
+        let layer_summaries: Vec<LayerSummary> = layers
+            .iter()
+            .map(|(d, sz)| {
+                let path = store.blob_path(d).unwrap();
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, vec![0u8; *sz]).unwrap();
+                LayerSummary {
+                    digest: d.to_string(),
+                    media_type: "application/vnd.oci.image.layer.v1.tar+gzip".into(),
+                    size: *sz,
+                    path,
+                }
+            })
+            .collect();
+        let summary = PullSummary {
+            image: image.canonical(),
+            digest: Some(digest.to_string()),
+            image_dir: dir.clone(),
+            config_size: 10,
+            layers: layer_summaries,
+        };
+        std::fs::write(
+            store.image_summary_path(&image),
+            serde_json::to_vec(&summary).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn list_images_reports_repo_tag_id_and_size() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = ImageStore::new(tmp.path());
+        fake_image(
+            &store,
+            "docker.io/library/ubuntu:24.04",
+            "sha256:aabbccddeeff00112233",
+            &[("sha256:11", 100), ("sha256:22", 200)],
+        );
+        let imgs = store.list_images();
+        assert_eq!(imgs.len(), 1);
+        assert_eq!(imgs[0].repository, "ubuntu"); // docker.io/library/ stripped
+        assert_eq!(imgs[0].tag, "24.04");
+        assert_eq!(imgs[0].id, "aabbccddeeff"); // 12-hex short digest
+        assert_eq!(imgs[0].size, 100 + 200 + 10); // layers + config
+    }
+
+    #[test]
+    fn remove_image_then_gc_reclaims_unreferenced_blobs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = ImageStore::new(tmp.path());
+        // Two images sharing one blob (l_shared) and each with a private blob.
+        fake_image(&store, "docker.io/library/a:1", "sha256:a", &[("sha256:5ed", 50), ("sha256:0a", 10)]);
+        fake_image(&store, "docker.io/library/b:1", "sha256:b", &[("sha256:5ed", 50), ("sha256:0b", 20)]);
+        assert_eq!(store.list_images().len(), 2);
+
+        // Remove image a: its private blob `la` becomes unreferenced; `lshared`
+        // is still held by b.
+        let a = ImageReference::parse("docker.io/library/a:1").unwrap();
+        assert!(store.remove_image(&a).unwrap());
+        assert_eq!(store.list_images().len(), 1);
+        let (count, _bytes) = store.gc_blobs();
+        assert_eq!(count, 1, "only a's private blob should be collected");
+        // lshared + lb remain (referenced by b); la is gone.
+        assert!(store.blob_path("sha256:5ed").unwrap().exists());
+        assert!(store.blob_path("sha256:0b").unwrap().exists());
+        assert!(!store.blob_path("sha256:0a").unwrap().exists());
+    }
+
+    #[test]
+    fn tag_image_creates_a_new_ref_sharing_blobs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = ImageStore::new(tmp.path());
+        fake_image(&store, "docker.io/library/ubuntu:24.04", "sha256:abcdef012345", &[("sha256:1111", 100)]);
+        let src = ImageReference::parse("docker.io/library/ubuntu:24.04").unwrap();
+        let dst = ImageReference::parse("myubuntu:dev").unwrap();
+        store.tag_image(&src, &dst).unwrap();
+        // Both refs now list; the tag points at the same image id; blobs not duplicated.
+        let imgs = store.list_images();
+        assert_eq!(imgs.len(), 2);
+        assert!(imgs.iter().any(|i| i.repository == "myubuntu" && i.tag == "dev"));
+        assert!(imgs.iter().all(|i| i.id == "abcdef012345"));
+        let (count, _) = store.gc_blobs();
+        assert_eq!(count, 0, "the shared blob is still referenced by both refs");
     }
 }

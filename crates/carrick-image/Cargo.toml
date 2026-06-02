@@ -19,3 +19,6 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt"] }
 carrick-spec = { path = "../carrick-spec" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
