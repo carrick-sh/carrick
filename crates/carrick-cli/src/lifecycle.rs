@@ -310,6 +310,32 @@ fn rebuild_request_from_state(state: &ContainerState) -> carrick_engine::CliRunR
     }
 }
 
+/// Run `action` over each container spec, printing the returned id/code on
+/// success and the error on failure (docker's per-item semantics), then bail
+/// with `fail_message` if any item failed. Shared by
+/// start/restart/stop/kill/rm/wait; `inspect` renders after its loop and keeps
+/// its own copy.
+fn for_each_container<T: std::fmt::Display>(
+    specs: &[String],
+    fail_message: &str,
+    mut action: impl FnMut(&str) -> anyhow::Result<T>,
+) -> anyhow::Result<()> {
+    let mut had_err = false;
+    for spec in specs {
+        match action(spec) {
+            Ok(out) => println!("{out}"),
+            Err(e) => {
+                eprintln!("Error: {e}");
+                had_err = true;
+            }
+        }
+    }
+    if had_err {
+        bail!("{fail_message}");
+    }
+    Ok(())
+}
+
 /// `carrick start` — (re)launch one or more created/stopped containers, reusing
 /// their persisted config + overlay. Daemonless restart = a fresh fork +
 /// supervisor + region over the SAME overlay.
@@ -318,20 +344,9 @@ pub(crate) fn start(
     _attach: bool,
     specs: &[String],
 ) -> anyhow::Result<()> {
-    let mut had_err = false;
-    for spec in specs {
-        match start_one(store, spec) {
-            Ok(id) => println!("{id}"),
-            Err(e) => {
-                eprintln!("Error: {e}");
-                had_err = true;
-            }
-        }
-    }
-    if had_err {
-        bail!("one or more containers failed to start");
-    }
-    Ok(())
+    for_each_container(specs, "one or more containers failed to start", |spec| {
+        start_one(store, spec)
+    })
 }
 
 fn start_one(store: &carrick_image::ImageStore, spec: &str) -> anyhow::Result<String> {
@@ -395,21 +410,9 @@ pub(crate) fn restart(
     time: Option<u64>,
     specs: &[String],
 ) -> anyhow::Result<()> {
-    let mut had_err = false;
-    for spec in specs {
-        let result = stop_one(spec, time).and_then(|_| start_one(store, spec));
-        match result {
-            Ok(id) => println!("{id}"),
-            Err(e) => {
-                eprintln!("Error: {e}");
-                had_err = true;
-            }
-        }
-    }
-    if had_err {
-        bail!("one or more containers failed to restart");
-    }
-    Ok(())
+    for_each_container(specs, "one or more containers failed to restart", |spec| {
+        stop_one(spec, time).and_then(|_| start_one(store, spec))
+    })
 }
 
 /// Point fd 0 at /dev/null and fds 1/2 at the container log file (append).
@@ -678,20 +681,11 @@ fn ps_row_json(c: &ContainerState, st: ContainerStatus, no_trunc: bool) -> serde
 /// of each stopped container (docker behavior). `time` is `None` when `-t` is
 /// not given.
 pub(crate) fn stop(time: Option<u64>, containers: &[String]) -> anyhow::Result<()> {
-    let mut had_err = false;
-    for spec in containers {
-        match stop_one(spec, time) {
-            Ok(id) => println!("{id}"),
-            Err(e) => {
-                eprintln!("Error: {e}");
-                had_err = true;
-            }
-        }
-    }
-    if had_err {
-        bail!("one or more containers failed to stop");
-    }
-    Ok(())
+    for_each_container(
+        containers,
+        "one or more containers failed to stop",
+        |spec| stop_one(spec, time),
+    )
 }
 
 fn stop_one(spec: &str, time: Option<u64>) -> anyhow::Result<String> {
@@ -730,20 +724,11 @@ fn stop_one(spec: &str, time: Option<u64>) -> anyhow::Result<String> {
 /// `carrick kill` — send `signal` to the container's init.
 pub(crate) fn kill(signal: &str, containers: &[String]) -> anyhow::Result<()> {
     let signum = parse_signal(signal).with_context(|| format!("invalid signal: {signal}"))?;
-    let mut had_err = false;
-    for spec in containers {
-        match kill_one(spec, signum) {
-            Ok(id) => println!("{id}"),
-            Err(e) => {
-                eprintln!("Error: {e}");
-                had_err = true;
-            }
-        }
-    }
-    if had_err {
-        bail!("one or more containers failed to receive the signal");
-    }
-    Ok(())
+    for_each_container(
+        containers,
+        "one or more containers failed to receive the signal",
+        |spec| kill_one(spec, signum),
+    )
 }
 
 fn kill_one(spec: &str, signum: i32) -> anyhow::Result<String> {
@@ -763,20 +748,11 @@ fn kill_one(spec: &str, signum: i32) -> anyhow::Result<String> {
 /// `carrick rm` — remove a container's registry entry. Refuses a running
 /// container unless `force` (which SIGKILLs it first).
 pub(crate) fn rm(force: bool, containers: &[String]) -> anyhow::Result<()> {
-    let mut had_err = false;
-    for spec in containers {
-        match rm_one(spec, force) {
-            Ok(id) => println!("{id}"),
-            Err(e) => {
-                eprintln!("Error: {e}");
-                had_err = true;
-            }
-        }
-    }
-    if had_err {
-        bail!("one or more containers failed to be removed");
-    }
-    Ok(())
+    for_each_container(
+        containers,
+        "one or more containers failed to be removed",
+        |spec| rm_one(spec, force),
+    )
 }
 
 fn rm_one(spec: &str, force: bool) -> anyhow::Result<String> {
@@ -953,20 +929,11 @@ pub(crate) fn exec(
 /// its exit code (like `docker wait`). An already-exited container returns
 /// immediately; a `--rm` container that was auto-removed reports 0.
 pub(crate) fn wait(containers: &[String]) -> anyhow::Result<()> {
-    let mut had_err = false;
-    for spec in containers {
-        match wait_one(spec) {
-            Ok(code) => println!("{code}"),
-            Err(e) => {
-                eprintln!("Error: {e}");
-                had_err = true;
-            }
-        }
-    }
-    if had_err {
-        bail!("one or more containers failed to wait");
-    }
-    Ok(())
+    for_each_container(
+        containers,
+        "one or more containers failed to wait",
+        wait_one,
+    )
 }
 
 fn wait_one(spec: &str) -> anyhow::Result<i32> {
