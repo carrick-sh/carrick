@@ -73,6 +73,43 @@ static IOPRIO_VALUE: std::sync::atomic::AtomicU32 =
 const ROBUST_LIST_HEAD_SIZE: u64 = 24;
 
 /// Per-Linux-policy priority window for `sched_get_priority_{max,min}`. RT
+/// Build the [`DispatchOutcome::CloneThread`] for a thread-creating clone/clone3.
+/// Applies the SETTLS / PARENT_SETTID / (CHILD_SETTID|CHILD_CLEARTID) gates to
+/// the raw arg values (gated-off slots become 0). Params follow the `clone(2)`
+/// ABI order — flags, child stack pointer, parent-tid ptr, tls, child-tid ptr —
+/// so both callers pass them in the same memorable order (clone3 pre-adds
+/// stack_size to get the child SP).
+fn clone_thread_outcome(
+    flags: u64,
+    child_sp: u64,
+    parent_tid_ptr: u64,
+    tls_val: u64,
+    child_tid_ptr: u64,
+) -> DispatchOutcome {
+    DispatchOutcome::CloneThread {
+        stack: child_sp,
+        tls: if flags & LinuxCloneFlags::SETTLS.bits() != 0 {
+            tls_val
+        } else {
+            0
+        },
+        flags,
+        parent_tid_addr: if flags & LinuxCloneFlags::PARENT_SETTID.bits() != 0 {
+            parent_tid_ptr
+        } else {
+            0
+        },
+        child_tid_addr: if flags
+            & (LinuxCloneFlags::CHILD_SETTID | LinuxCloneFlags::CHILD_CLEARTID).bits()
+            != 0
+        {
+            child_tid_ptr
+        } else {
+            0
+        },
+    }
+}
+
 /// policies expose MAX_USER_RT_PRIO-1 / 1; time-sharing policies expose 0/0;
 /// unknown policy is EINVAL.
 fn sched_priority_for(policy: i32, max: bool) -> DispatchOutcome {
@@ -549,32 +586,7 @@ impl SyscallDispatcher {
             let tls_val = args.tls;
 
             let child_sp = stack + stack_size;
-            let tls = if flags & LinuxCloneFlags::SETTLS.bits() != 0 {
-                tls_val
-            } else {
-                0
-            };
-            let parent_tid_addr = if flags & LinuxCloneFlags::PARENT_SETTID.bits() != 0 {
-                parent_tid_ptr
-            } else {
-                0
-            };
-            let child_tid_addr = if flags
-                & (LinuxCloneFlags::CHILD_SETTID | LinuxCloneFlags::CHILD_CLEARTID).bits()
-                != 0
-            {
-                child_tid_ptr
-            } else {
-                0
-            };
-
-            return DispatchOutcome::CloneThread {
-                stack: child_sp,
-                tls,
-                flags,
-                parent_tid_addr,
-                child_tid_addr,
-            };
+            return clone_thread_outcome(flags, child_sp, parent_tid_ptr, tls_val, child_tid_ptr);
         }
 
         let pidfd_out = if flags & LinuxCloneFlags::PIDFD.bits() != 0 {
@@ -1829,31 +1841,7 @@ impl SyscallDispatcher {
 
             let thread_mask = LinuxCloneFlags::THREAD_MASK;
             if (flags & thread_mask) == thread_mask {
-                let parent_tid_addr = if flags & LinuxCloneFlags::PARENT_SETTID.bits() != 0 {
-                    parent_tid.0
-                } else {
-                    0
-                };
-                let tls = if flags & LinuxCloneFlags::SETTLS.bits() != 0 {
-                    tls
-                } else {
-                    0
-                };
-                let child_tid_addr = if flags
-                    & (LinuxCloneFlags::CHILD_SETTID | LinuxCloneFlags::CHILD_CLEARTID).bits()
-                    != 0
-                {
-                    child_tid.0
-                } else {
-                    0
-                };
-                return Ok(DispatchOutcome::CloneThread {
-                    stack,
-                    tls,
-                    flags,
-                    parent_tid_addr,
-                    child_tid_addr,
-                });
+                return Ok(clone_thread_outcome(flags, stack, parent_tid.0, tls, child_tid.0));
             }
 
             let pidfd_out = if flags & LinuxCloneFlags::PIDFD.bits() != 0 {
