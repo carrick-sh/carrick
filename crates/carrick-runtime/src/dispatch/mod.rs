@@ -536,6 +536,7 @@ use crate::linux_abi::{
     LinuxTms,
     LinuxUtsname,
     LinuxWinsize,
+    align_up_u64,
 };
 use crate::memory::{LINUX_HEAP_BASE, LINUX_HEAP_SIZE, LINUX_MMAP_BASE};
 use crate::overlay::OverlayEntry;

@@ -363,11 +363,6 @@ pub(super) fn shmid_ds_bytes(segment: &ShmSegment) -> [u8; 112] {
     out
 }
 
-/// Local copy of mem.rs's helper — kept private to mem.rs upstream.
-fn align_up(value: u64, alignment: u64) -> Option<u64> {
-    value.div_ceil(alignment).checked_mul(alignment)
-}
-
 fn translate_host_errno() -> i32 {
     let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
     // macOS and Linux share most low errno numbers — but a handful differ
@@ -415,9 +410,9 @@ impl SyscallDispatcher {
             // runtime hv_vm_maps the host file into the guest's address
             // space — same path mmap(MAP_SHARED, fd) uses for file mappings.
             let hvf_page = crate::trap::HVF_PAGE_SIZE;
-            let map_len = align_up(size as u64, hvf_page).unwrap_or(size as u64);
+            let map_len = align_up_u64(size as u64, hvf_page).unwrap_or(size as u64);
             const TWO_MIB: u64 = 1 << 21;
-            let alias_len = align_up(map_len, TWO_MIB).unwrap_or(map_len);
+            let alias_len = align_up_u64(map_len, TWO_MIB).unwrap_or(map_len);
             let ipa = {
                 let mut mem = this.mem.lock();
                 let base = mem.alias_ipa_next;

@@ -150,6 +150,40 @@ pub const LINUX_AT_EXECFN: u64 = 31;
 /// Base address of the kernel-provided vDSO ELF (carrick's fast clock page).
 pub const LINUX_AT_SYSINFO_EHDR: u64 = 33;
 pub const LINUX_PAGE_SIZE: u64 = 4096;
+
+/// Round `value` up to the next multiple of `alignment`, returning `None` on
+/// overflow. `alignment` must be non-zero. Replaces the ~half-dozen private
+/// `align_up` copies that were scattered across the memory/IPC subsystems.
+#[must_use]
+pub const fn align_up_u64(value: u64, alignment: u64) -> Option<u64> {
+    match value % alignment {
+        0 => Some(value),
+        rem => value.checked_add(alignment - rem),
+    }
+}
+
+/// Round `value` down to the previous multiple of `alignment`. `alignment`
+/// must be non-zero.
+#[must_use]
+pub const fn align_down_u64(value: u64, alignment: u64) -> u64 {
+    value / alignment * alignment
+}
+
+/// `usize` analogue of [`align_up_u64`].
+#[must_use]
+pub const fn align_up_usize(value: usize, alignment: usize) -> Option<usize> {
+    match value % alignment {
+        0 => Some(value),
+        rem => value.checked_add(alignment - rem),
+    }
+}
+
+/// `usize` analogue of [`align_down_u64`].
+#[must_use]
+pub const fn align_down_usize(value: usize, alignment: usize) -> usize {
+    value / alignment * alignment
+}
+
 pub const LINUX_UTSNAME_FIELD_SIZE: usize = 65;
 /// Number of u64s in the kernel ABI sigset_t. Linux uapi defines
 /// `_NSIG=64` and `_NSIG_WORDS = _NSIG / _NSIG_BPW = 1`, so the
