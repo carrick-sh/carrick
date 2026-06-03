@@ -1,8 +1,59 @@
-//! `/proc` mount.
+//! `/proc` mount: a synthetic procfs rendered on demand.
 //!
-//! This module owns Carrick's synthetic procfs registry and renderers. The
-//! dispatcher supplies live process/memory context, but adding a new synthetic
-//! `/proc` file should require touching this module and its tests.
+//! # Theory of operation
+//!
+//! Linux's `/proc` is a window into kernel data structures. carrick has no
+//! Linux kernel, so it *fabricates* `/proc` from the state it does have: the
+//! loaded ELF address space, the guest's argv/environ/auxv, signal-disposition
+//! masks, the modeled credentials and namespaces, and — because each guest
+//! process is a real macOS process — the host's own process/thread tables.
+//!
+//! Every `/proc` file is generated when read, not stored. `synthetic_file`
+//! is the central registry: it maps a path to the bytes a fresh read would
+//! return, calling a `synthetic_proc_*` renderer that formats live state into
+//! the exact text layout glibc, the Go runtime, systemd, apt, and the LTP
+//! `tst_test` framework parse. Adding a new `/proc` file is a new arm here plus
+//! its renderer and a test — and *only* here, which is the point of routing
+//! `/proc` through one mount.
+//!
+//! ## `self`, numeric pids, and the namespace model
+//!
+//! `/proc/self/<x>`, `/proc/thread-self/<x>`, and `/proc/<pid>/<x>` for the
+//! caller's own pid all name the same object. Guest pids are *namespace* pids
+//! ([`crate::namespace::pid`]); the renderers are written against the literal
+//! `/proc/self/*` form, so `normalize_self_pid_path` rewrites a numeric
+//! self-pid (host pid *or* ns-pid) back to `/proc/self/*` before the match.
+//! Enumerating or reading another process's `/proc/<pid>` works only for a
+//! *live* guest process: the path is translated ns-pid → host-pid and gated on
+//! liveness (`proc_pid_dir_host_pid` / `synthetic_task_dir`, which consult
+//! [`crate::host_proc::is_guest_process`] and the thread tables). A `/proc/<pid>`
+//! for a dead or non-guest pid returns `ENOENT`, matching Linux.
+//!
+//! ## Live context is threaded in, not captured
+//!
+//! Several files reflect mutable dispatcher state — `/proc/self/maps` and
+//! `smaps` need the current address-space regions, `cmdline`/`environ`/`auxv`
+//! need the stack image, `status` needs the live signal masks and creds. The
+//! dispatcher passes that snapshot in via [`SyntheticProcContext`] (for the
+//! whole-file generators) and [`OpenContext`] (at `open`
+//! time), so this module stays decoupled from the dispatcher struct. The
+//! writable tunables (`oom_score_adj`, `loginuid`, …; see
+//! `is_writable_tunable_path`) and the user-namespace map files
+//! (`uid_map`/`gid_map`/`setgroups`; see `write_userns_map`) are the few
+//! `/proc` paths that *accept* writes — the tunables are accepted-and-ignored
+//! (carrick has no live OOM/audit state to mutate) so container managers that
+//! poke them at startup succeed instead of getting EACCES, and the map files
+//! drive real user-namespace id mapping.
+//!
+//! ## Honest limitations
+//!
+//! These files are faithful in *shape* and in the fields real software reads,
+//! not in every value. Counters that carrick does not track (`io`, `schedstat`,
+//! parts of `stat`/`statm`) report plausible constants rather than live
+//! accounting; cross-process map writes (another process's `uid_map`) are not
+//! modeled (only the `self/` forms). The bar is "the programs we run parse it
+//! and behave like they do under Docker", verified against a Linux oracle —
+//! not bit-exact procfs emulation.
 
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
@@ -2308,7 +2359,7 @@ fn process_short_name(executable_path: &str) -> String {
         .unwrap_or_else(|| "carrick".to_string())
 }
 
-/// The name to report in /proc/<pid>/task/<tid>/comm: the thread's own
+/// The name to report in `/proc/<pid>/task/<tid>/comm`: the thread's own
 /// prctl/pthread-set name if it has one, else the process comm (`fallback`).
 fn per_thread_comm(tid: crate::thread::ThreadId, fallback: &str) -> String {
     crate::thread::current_thread_name(tid)

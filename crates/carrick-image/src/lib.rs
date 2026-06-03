@@ -1,5 +1,93 @@
-//! OCI image resolution and layer-fetching support used by the CLI and
-//! engine crates.
+//! OCI image acquisition and on-disk content store for the carrick runtime.
+//!
+//! # Theory of operation
+//!
+//! Carrick runs unmodified Linux ELF binaries, and those binaries come from
+//! ordinary OCI/Docker images. This crate is the *supply* side: it turns an
+//! image reference (`ubuntu:24.04`, `ghcr.io/x/y@sha256:…`) into a set of
+//! on-disk layer tarball paths plus the image's run configuration, which the
+//! engine then lowers into a [`carrick_spec::RunSpec`]. It deliberately does
+//! **not** unpack layers, build a rootfs, or know anything about the guest;
+//! layer extraction and overlay composition happen later, in the runtime's VFS.
+//!
+//! ## The store: a content-addressed blob pool plus per-tag metadata
+//!
+//! Everything lives under one root (`$CARRICK_HOME`, else `~/.carrick`,
+//! see [`ImageStore::default_for_user`]) in two distinct namespaces:
+//!
+//! * `blobs/sha256/<hex>` — every layer tarball, named by its digest. Because
+//!   the name *is* the content hash, identical layers shared by many images are
+//!   stored exactly once. [`ImageStore::blob_path`] is the only constructor of
+//!   these paths and it *validates* the digest (must be `sha256:` + lowercase
+//!   hex) before touching the filesystem — a guard against a malicious manifest
+//!   smuggling `../` or an alternate algorithm into a path.
+//! * `images/<registry>/<repo…>/<tag>/` — per-reference metadata: the OCI
+//!   `config.json`, the `manifest.json`, and carrick's own `carrick-image.json`
+//!   ([`PullSummary`]). The summary is the index that ties a reference to its
+//!   ordered list of blob paths, sizes, and the image digest.
+//!
+//! The split is the load-bearing design choice. Metadata is cheap and
+//! per-reference; blobs are large and shared. `carrick rmi` deletes only the
+//! metadata directory (fast, always safe); blobs outlive it and are reclaimed
+//! separately by [`ImageStore::gc_blobs`], which deletes any `blobs/` file not
+//! in the union of all surviving summaries' layer digests (the private
+//! `referenced_blobs` helper). `docker tag` ([`ImageStore::tag_image`])
+//! is therefore just a metadata copy — no blob is ever duplicated.
+//!
+//! ## Layer order is an invariant, not an incidental
+//!
+//! An overlay filesystem is order-sensitive: a later layer's whiteouts and file
+//! replacements must apply *on top of* earlier layers. The OCI `manifest.json`
+//! `layers` array is the authoritative bottom-to-top order. The registry client
+//! ([`oci_client`]), however, returns downloaded layers in completion/arbitrary
+//! order, and the store deduplicates by digest — so neither the download order
+//! nor the on-disk blob set preserves it. Both `layers_in_manifest_order` (on
+//! pull) and `layer_summaries_in_manifest_order` (on resolve, re-derived from
+//! the persisted `manifest.json`) re-sort against the manifest and treat any
+//! mismatch — a manifest layer with no downloaded blob, or a downloaded blob no
+//! manifest references — as a hard [`OciBootstrapError::InvalidDigest`] rather
+//! than silently producing a wrong rootfs. Duplicate digests in a manifest are
+//! handled by bucketing (a digest may legitimately appear twice), popping one
+//! blob per manifest slot. **If you add a code path that materialises layer
+//! paths, it must go through one of these; never iterate `summary.layers`
+//! raw.**
+//!
+//! ## Platform keying: one store, two architectures
+//!
+//! Apple Silicon runs `linux/arm64` natively and `linux/amd64` via Rosetta 2.
+//! Both can be cached side by side. [`PlatformTarget`] (parsed from
+//! `--platform` or `$CARRICK_PULL_PLATFORM`) drives manifest selection in
+//! [`select_manifest_digest`] (the matcher handed to the OCI client), and
+//! [`ImageStore::image_dir_for`] keys the *metadata* directory per platform: the
+//! host-native default keeps the legacy un-suffixed path (so pre-existing
+//! stores still resolve), and any non-default platform lands in a
+//! `__platform__<os>_<arch>` sibling so the two manifests never clobber each
+//! other. Blobs remain shared across platforms because they are content
+//! addressed; only the manifest/config/summary differ.
+//!
+//! ## Resolve is the read path; pull is the write path
+//!
+//! [`ImageStore::resolve`]/[`ImageStore::resolve_with_platform`] is what the
+//! engine calls. It loads the cached summary, re-orders the layers against the
+//! persisted manifest, and parses the OCI config — pulling on a cache miss as a
+//! side effect, then returning a [`ResolvedImage`] (ordered layer paths + an
+//! [`ImageConfig`]). The OCI config JSON is parsed *here* (the `Config` block —
+//! entrypoint/cmd/env/user/workdir/exposed-ports/labels/stop-signal) and
+//! flattened into the spec crate's [`ImageConfig`]; an absent or malformed
+//! config degrades to [`ImageConfig::default`] rather than failing the run.
+//!
+//! ## Boundaries and limits
+//!
+//! * Registry credentials and the `carrick login`/`logout` store live in the
+//!   [`auth`] submodule; see its own theory statement.
+//! * This crate is `async` only where it must do network/large file I/O
+//!   (`pull`/`resolve`/summary loads use `tokio::fs`); the store-management
+//!   surface (`list`/`rmi`/`gc`/`tag`/`df`) is synchronous `std::fs`, because it
+//!   is called from non-async CLI paths and only touches small metadata.
+//! * The arm64-`v8` variant equivalence in [`PlatformTarget::matches`] is a
+//!   pragmatic special case: registries spell the native Apple-Silicon arch as
+//!   plain `arm64`, `arm64/v8`, or unspecified, and all three are treated as a
+//!   match; `arm64/v7` is *not* (it is a different ISA level we cannot run).
 
 use std::collections::HashMap;
 use std::env;
@@ -618,7 +706,7 @@ impl ImageStore {
     }
 
     /// The set of blob digests referenced by every stored image (the union of
-    /// all summaries' layer digests). Drives [`gc_blobs`].
+    /// all summaries' layer digests). Drives [`ImageStore::gc_blobs`].
     fn referenced_blobs(&self) -> std::collections::HashSet<String> {
         let mut refs = std::collections::HashSet::new();
         for info in self.list_images() {
@@ -636,7 +724,7 @@ impl ImageStore {
 
     /// Remove a pulled image: delete its metadata directory (all platform
     /// variants of the tag). Returns `true` if it existed. Blobs are left for
-    /// [`gc_blobs`] (they may be shared).
+    /// [`ImageStore::gc_blobs`] (they may be shared).
     pub fn remove_image(&self, image: &ImageReference) -> std::io::Result<bool> {
         let dir = self.image_dir(image);
         if !dir.exists() {
@@ -699,7 +787,8 @@ impl ImageStore {
     }
 
     /// Total bytes of all blobs on disk, and the bytes reclaimable by
-    /// [`gc_blobs`] (blobs not referenced by any image). Drives `system df`.
+    /// [`ImageStore::gc_blobs`] (blobs not referenced by any image). Drives
+    /// `system df`.
     pub fn blob_disk_usage(&self) -> (u64, u64) {
         let referenced = self.referenced_blobs();
         let blobs_dir = self.root.join("blobs").join("sha256");

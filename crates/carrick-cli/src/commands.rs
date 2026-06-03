@@ -1,4 +1,69 @@
-//! Command dispatch implementation for the CLI.
+//! Command dispatch — the single `match` that turns a parsed [`Cli`] into an
+//! action against the lower crates.
+//!
+//! # Theory of operation
+//!
+//! [`run_cli`] is one big dispatch over [`Commands`]. There is no command-object
+//! indirection on purpose: every arm is short because the real work lives below
+//! the request boundary, and keeping the wiring flat makes the "what does this
+//! flag actually do" question answerable by reading one arm. Three structural
+//! patterns recur and are worth internalising before editing:
+//!
+//! 1. **`shell` is sugar for `run`.** Before the dispatch, `Commands::Shell` is
+//!    rewritten into an interactive `Commands::Run` of `/bin/sh` (with a pty iff
+//!    stdin is a tty). This reuses the *entire* run path — image pull, fs
+//!    backend, pty relay — with zero duplication; the `Shell` arm in the match
+//!    is therefore unreachable and only exists to satisfy exhaustiveness.
+//!
+//! 2. **The two run pipelines.** There are deliberately two entry points to a
+//!    guest, and they share almost nothing:
+//!    - `Run`/`Create`/`Exec` build a [`carrick_engine::CliRunRequest`] and go
+//!      through `carrick_engine::Engine::run` — i.e. resolve+pull an OCI image,
+//!      compose its rootfs, then `Runtime::execute`. This is the docker path.
+//!    - `RunElf`/`DispatchSyscall` bypass the engine and the image store
+//!      entirely, loading a *host* ELF (or a single synthetic syscall) straight
+//!      through `carrick-runtime`. This is the fixture path used by Go/CPython/
+//!      libuv conformance and unit tests, where there is no container image —
+//!      hence the manual rootfs-layer composition, `--fs` install,
+//!      `-v`/`--volume` bind-mounts, and the read-only self-bind of the host ELF
+//!      at its own `/proc/self/exe` path (so `os.Executable()` + re-exec
+//!      resolve), all of which the engine would otherwise do from the image.
+//!
+//! 3. **Exit-code parity with docker.** The CLI, not the runtime, owns the
+//!    *process* exit code. Docker's convention is encoded explicitly here: `125`
+//!    when `run` itself fails before/at container start (image resolve/pull, bad
+//!    reference, VM setup — the `Err` arm of `engine.run`); the container's own
+//!    code on success; `1` when the guest never exited and hit the trap limit.
+//!    `126`/`127` for a bad entrypoint are produced *inside* the runtime and
+//!    flow through as the container code. The default output is docker-shaped
+//!    (stdio already streamed live by the engine; the CLI just flushes residual
+//!    bytes and adopts the code); `--json` opts into the legacy compat-report
+//!    envelope; `--raw` is now a no-op alias for the default.
+//!
+//! ## Fork-safety on the engine error path
+//!
+//! Under `--pid private` the supervisor fork happens *inside* `engine.run`, so
+//! an HVF/setup failure can surface in the `Err` arm while already in a forked
+//! guest-init child. That arm therefore exits with `libc::_exit(125)`, never
+//! `std::process::exit`: the latter runs atexit/Drop cleanup, which after a fork
+//! double-closes an inherited fd and trips an IO-safety abort. This mirrors how
+//! the runtime exits all its other forked children.
+//!
+//! ## `trace`: the auto-sudo re-exec
+//!
+//! `Commands::Trace` is the one arm with real control-flow weight, because
+//! libdtrace needs root to open `/dev/dtrace` but the *traced guest* must run as
+//! the original user. When invoked non-root, the arm re-execs the whole
+//! `carrick trace …` invocation under `sudo` and returns. The non-obvious part
+//! is environment survival: plain `sudo` does `env_reset`, which would strip the
+//! `CARRICK_*` knobs (and `HOME`/`USER`/…) the traced run needs. Those are
+//! re-encoded as `--forward-env KEY=VAL` *CLI args* — which survive `sudo`
+//! where env vars don't, and need no `SETENV` in sudoers — and re-applied via
+//! `std::env::set_var` before the child runs. The original uid/gid/groups ride
+//! along as hidden `--trace-uid/--trace-gid/--trace-groups` args so the trace
+//! parent can keep root for libdtrace while the spawned child (see
+//! [`crate::trace_cli`]) drops back to the caller's identity. The same
+//! `--forward-env` idiom is reused by `run`/`run-elf` for sudo-launched runs.
 
 use anyhow::{Context, bail};
 use carrick_image::{ImageReference, ImageStore};

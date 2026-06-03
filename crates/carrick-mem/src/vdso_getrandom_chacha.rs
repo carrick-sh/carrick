@@ -74,7 +74,8 @@ pub fn chacha20_block(key: &[u32; 8], counter: u32, nonce: &[u32; 3]) -> [u32; 1
 // reuses a (key, block-counter) pair.
 // ---------------------------------------------------------------------------
 
-/// Offsets within the opaque state. key[32] @0, gen-snapshot u64 @32, init u8 @40.
+/// Offsets within the opaque state: a 32-byte `key` at 0, the gen-snapshot `u64`
+/// at 32, the `init` flag (`u8`) at 40.
 const ST_KEY: usize = 0;
 const ST_GEN: usize = 32;
 const ST_INIT: usize = 40;

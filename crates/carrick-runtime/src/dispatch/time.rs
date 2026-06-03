@@ -1,5 +1,48 @@
-//! time syscall handlers. Methods on `SyscallDispatcher`; see
-//! `super` for the dispatcher struct and the normalized dispatch table.
+//! Clocks, sleeps, interval timers, and POSIX per-process timers.
+//!
+//! # Theory of operation
+//!
+//! Time is one place where Linux and macOS genuinely differ at the ABI level,
+//! so this file is a translation layer over the host clocks rather than a
+//! reimplementation. The pivot is `linux_clock_duration` (in [`super`]): it maps
+//! a Linux `clock_id` to a host clock and returns a `Duration`, and every
+//! handler here funnels through it. Three things make that non-trivial:
+//!
+//!   - **The clock-id numbers differ.** Linux and macOS do NOT agree on the
+//!     numeric `CLOCK_*` constants, so the Linux ids are matched explicitly and
+//!     mapped to the host's symbolic `libc::CLOCK_*` — never passed through. An
+//!     unrecognised id is EINVAL, exactly when `linux_clock_duration` returns
+//!     `None`, which is why every handler checks it first.
+//!   - **Some Linux clocks have no host analogue.** CLOCK_BOOTTIME (which
+//!     includes suspend) is approximated by CLOCK_MONOTONIC; the REALTIME
+//!     variants (COARSE/ALARM/TAI) collapse onto realtime; the per-task
+//!     CPU-time clocks (the negative dynamic ids) map to the host
+//!     thread/process CPU clocks best-effort.
+//!   - **Resolution is not portable.** `clock_getres` reports a chosen
+//!     stand-in (carrick does not coarsen waits), documented at the call site.
+//!
+//! ## Two timer families
+//!
+//! Interval timers (`getitimer`/`setitimer`, and glibc's `alarm()` which is
+//! `setitimer(ITIMER_REAL, …)`) keep their state in the proc subsystem's
+//! `ProcState::itimers`; the POSIX per-process timers
+//! (`timer_create`/`timer_settime`/…) live in
+//! `crate::posix_timer`. Both share one delivery mechanism the dispatcher
+//! cannot perform itself: the expiry SIGNAL is raised by an `EVFILT_TIMER`
+//! event on the signal pump's kqueue (see `crate::itimer`), because firing a
+//! signal requires reaching the vCPU, which the syscall handler cannot. The
+//! handlers here therefore only ARM/DISARM and report time-remaining; the
+//! actual SIGALRM/SIGVTALRM/SIGPROF/`sigev_signo` delivery is the runtime's.
+//! `timerfd_create`/`timerfd_settime` are the fd-based variant — a readable
+//! `TimerFd` instead of a signal — and integrate with the epoll/poll readiness
+//! model (see [`super::net`]).
+//!
+//! `gettimeofday`/`settimeofday`/`times`/`adjtimex` round out the file. A guest
+//! is not allowed to reset the host wall clock: `settimeofday` returns EPERM
+//! and `adjtimex`/`clock_adjtime` report timex state without changing it.
+//!
+//! Methods are `impl` blocks on [`SyscallDispatcher`]; see [`super`] for the
+//! dispatcher struct and the normalized dispatch table.
 use super::*;
 
 /// Pack a `(value_ns, interval_ns)` pair into a `LinuxItimerspec` (the Linux

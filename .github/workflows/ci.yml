@@ -43,6 +43,16 @@ jobs:
       - name: Build
         run: cargo build --workspace
 
+      # Rustdoc gate: broken intra-doc links, unclosed-HTML-tag false positives,
+      # and other rustdoc lints fail the build, mirroring the clippy gate.
+      # --document-private-items because carrick is internal (not a published
+      # library) — most of its substance, and most of its Big Theory Statements,
+      # live on private items.
+      - name: Docs (rustdoc gate)
+        run: cargo doc --workspace --no-deps --document-private-items
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
       # `--lib` runs the crate unit tests only; the HVF-dependent integration
       # binaries (trap_hvf, runtime_loop, interactive_tty, …) need an entitled
       # vCPU and run in the self-hosted job below. The pure-logic integration

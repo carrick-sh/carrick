@@ -1,5 +1,87 @@
-//! OCI layer and rootfs composition support, including whiteout handling and
-//! read-only lookup APIs.
+//! OCI rootfs composition: merging container image layers into a single
+//! filesystem view.
+//!
+//! # Theory of operation
+//!
+//! A container image is an *ordered stack* of tar layers. The bottom layer is
+//! the base; each layer above adds, replaces, or deletes entries from the
+//! layers below it. Composing them into one coherent tree is the same job an
+//! overlay filesystem does at mount time — except carrick has no Linux kernel
+//! and no `overlayfs`, so this module does the merge itself, in userspace,
+//! at guest setup. The output is the immutable lower layer the VFS serves `/`
+//! from (with a writable overlay stacked on top by `fs_backend`; see
+//! [`crate::vfs::RootFsVfs`]).
+//!
+//! ## The merge rules (OCI whiteout conventions)
+//!
+//! Layers are applied first-to-last. Within each layer:
+//!
+//! * A regular entry (file / dir / symlink / hardlink) is materialised at its
+//!   path, **replacing** whatever a lower layer put there.
+//! * A `.wh.<name>` entry is a *whiteout*: it deletes `<name>` (and, if it was
+//!   a directory, its whole subtree) from the accumulated lower layers. The
+//!   whiteout marker itself never appears in the result.
+//! * A `.wh..wh..opq` entry is an *opaque whiteout*: it hides *all* lower-layer
+//!   contents of its parent directory, so only entries from this layer and
+//!   above show through. Implemented by clearing the directory and recreating
+//!   it empty.
+//!
+//! `WHITEOUT_PREFIX` / `OPAQUE_WHITEOUT` name these markers. Both the in-memory
+//! and the on-disk paths apply the *same* rules; the on-disk path's whiteout
+//! handling is written to replicate `RootFs::apply_layer` exactly.
+//!
+//! ## Two materialisation strategies
+//!
+//! There are two ways carrick turns a layer stack into a usable rootfs, and
+//! they exist because the project moved between two backends:
+//!
+//! 1. **In-memory** ([`RootFs::from_layers`] / `apply_layer`). The merge result
+//!    lives in three maps — `files`, `directories`, `symlinks` — keyed by
+//!    *root-relative* normalised paths. File contents are buffered in
+//!    `Vec<u8>`. Nothing touches the host filesystem; lookups
+//!    ([`RootFs::read`], [`RootFs::metadata`], [`RootFs::list_dir`]) are served
+//!    straight out of the maps. This backs `--fs memory`.
+//! 2. **Streaming-to-disk** ([`extract_layer_paths_to_dir`] / `apply_tar_to_dir`,
+//!    plus [`RootFs::extract_to_dir`] for an
+//!    already-merged in-memory tree). Layer blobs are streamed
+//!    (`std::io::copy`, never the whole file buffered) into a real
+//!    capability-rooted [`cap_std::fs::Dir`] scratch, applying the same
+//!    overlay+whiteout semantics as they land. This backs `--fs host`, where
+//!    apt's downstream operations (`symlinkat`, atomic `rename`, the `gpgv`
+//!    subprocess, hardlink-heavy dpkg unpacks, …) need real kernel filesystem
+//!    semantics rather than bespoke overlay logic.
+//!
+//! ## Path safety is load-bearing
+//!
+//! Layer tarballs are untrusted input. Every path is run through
+//! `normalize_path`, which collapses `.`/`..`, rejects any `..` that would
+//! escape the root, and rejects Windows-style prefixes. Symlink *targets* are
+//! normalised relative to the link's own directory and likewise rejected if
+//! they escape root (`normalize_symlink_target`). Without this a malicious
+//! image could write outside the rootfs (`../../etc/...`) or point a symlink at
+//! the host's real `/etc/passwd`. The unit tests at the bottom of this file are
+//! the executable spec for these escape cases.
+//!
+//! ## Symlink resolution walks every component
+//!
+//! `RootFs::resolve_symlink` resolves symlinks along **every** path component,
+//! not just the leaf. Debian's usrmerge makes `/lib` itself a symlink
+//! (`/lib -> usr/lib`), so the dynamic linker's request for
+//! `/lib/ld-linux-aarch64.so.1` only succeeds if the *parent* component is
+//! followed before the final lookup. Recursion is capped at 40 (Linux's
+//! `SYMLOOP_MAX`) to bound pathological chains.
+//!
+//! ## Mode-preservation invariant (on-disk path)
+//!
+//! carrick is a non-root macOS process serving its own scratch. An image entry
+//! the *owner* cannot read/search (a file with no owner-read bit, a directory
+//! without owner `r-x`) would lock carrick out of serving it. So the on-disk
+//! materialiser stores the *true* image mode in the `user.carrick.mode` xattr
+//! (via `fs_backend`) and forces the minimum owner bits on the real node; the
+//! VFS's `real_stat` reports the xattr mode back to the guest, so the guest
+//! still sees the image's permissions. Special nodes the tar may carry
+//! (char/block/fifo) are skipped on the on-disk path and accounted in
+//! [`ExtractStats::skipped_special`].
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;

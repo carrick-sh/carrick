@@ -1,5 +1,87 @@
-//! net syscall handlers. Methods on `SyscallDispatcher`; see
-//! `super` for the dispatcher struct and the normalized dispatch table.
+//! Networking and readiness syscalls: BSD sockets, AF_NETLINK synthesis, the
+//! `epoll`→`kqueue` shim, and `select`/`poll`/`pselect`/`ppoll`.
+//!
+//! # Theory of operation
+//!
+//! Two very different Linux subsystems share this file because they share one
+//! fact: macOS already has a real, native implementation underneath, so the job
+//! is *translation*, not *emulation*.
+//!
+//! ## Sockets: native BSD, translated at the edges
+//!
+//! AF_INET / AF_INET6 / AF_UNIX sockets are backed by REAL host sockets — the
+//! guest's `socket(2)` becomes a host `socket(2)`, `connect`/`send`/`recv` flow
+//! to the Darwin kernel, and a Linux server under carrick is reachable from the
+//! macOS host (the web-server demo). Darwin and Linux agree on the numeric
+//! socket *types* (1=STREAM, 2=DGRAM, …) but NOT on much else, so the handlers
+//! translate at three boundaries:
+//!
+//!   - **Address families** (`linux_to_host_af` / `host_to_linux_af` in the
+//!     `support` submodule). The shapes that exist on both sides map 1:1; Linux-only
+//!     families (AF_PACKET) are passed through so the host `socket()` returns
+//!     EAFNOSUPPORT naturally rather than carrick faking an error.
+//!   - **`struct sockaddr`** (`read_linux_sockaddr` parses guest → host;
+//!     `host_to_linux_sockaddr` / `write_linux_sockaddr` go the other way).
+//!     AF_INET/INET6 differ only in the leading `sa_family` byte/halfword;
+//!     AF_UNIX is the hard case (below).
+//!   - **Buffer sizing and option semantics**: macOS gives an AF_UNIX stream
+//!     socket only an 8 KiB buffer where Linux gives 212992, which strands a
+//!     guest writer that fills its socket buffer expecting a non-blocking-style
+//!     completion (`widen_unix_stream_buffers`); SEQPACKET has no macOS AF_UNIX
+//!     backing and is framed on top of a STREAM socket
+//!     (`host_socktype_backing`).
+//!
+//! AF_UNIX carries its own emulation layer (path hashing + a process-global
+//! registry, abstract namespace, autobind, SEQPACKET framing) so that Linux
+//! AF_UNIX features macOS lacks still work; that machinery lives in the
+//! `support` submodule and is documented there.
+//!
+//! ## AF_NETLINK: there is no host netlink, so synthesise it
+//!
+//! macOS has no AF_NETLINK. Returning EAFNOSUPPORT is not acceptable: glibc's
+//! `__check_pf`/`getaddrinfo` opens an `NETLINK_ROUTE` socket on the way to
+//! every name resolution, and `ip`/`ss` are pure rtnetlink clients. So a netlink
+//! `socket()` returns a SYNTHETIC fd (`OpenDescription::Netlink`) with NO host
+//! backing — a userspace in-memory recv queue plus a remembered `(pid, groups)`
+//! binding. `sendto`/`write` of an rtnetlink dump request is parsed and answered
+//! by `support::build_netlink_reply`, which emits properly framed
+//! `NLM_F_MULTI` dumps terminated by `NLMSG_DONE`: RTM_GETLINK yields one
+//! `lo`, RTM_GETADDR yields `127.0.0.1/8`, RTM_GETROUTE yields the connected
+//! route, and everything unmodelled yields a bare `NLMSG_DONE` (an "empty"
+//! dump) so the client sees a well-formed end-of-dump rather than a hang. This
+//! is consistent with carrick presenting itself as a single-`lo`,
+//! loopback-only host (matching `docker run --net host`'s view from the guest's
+//! standpoint for the resolver's purposes).
+//!
+//! ## epoll → kqueue: the readiness model
+//!
+//! Linux `epoll` is emulated on Darwin `kqueue`. `epoll_create1` allocates a
+//! real kqueue; the returned epoll fd's readiness IS that kqueue's fd, so a
+//! thread blocks by waiting on the kqueue (see `io_wait`). Two readiness
+//! sources coexist on one kqueue:
+//!
+//!   - **Host-backed fds** (sockets, host files, ptys) register an
+//!     `EVFILT_READ`/`EVFILT_WRITE` knote — the kernel signals readiness.
+//!   - **In-memory fds** (eventfd, pipes, timerfd, netlink) have no host kernel
+//!     object the kqueue can watch, so their readiness is recomputed in
+//!     userspace (`epoll_ready_events`) and a writer pokes the kqueue's
+//!     `EVFILT_USER(0)` to force every blocked waiter to re-check
+//!     (see [`super::epoll_shim`]). This is the fix for Go's `netpollBreak`
+//!     lost-wakeup: an eventfd write must wake a poller blocked on the instance
+//!     kqueue even though the eventfd is not a host fd.
+//!
+//! `fd_is_epollable` mirrors the kernel rule that an fd whose file has no
+//! `->poll` op (a regular file, directory, or synthetic /proc node) is rejected
+//! from `epoll_ctl(ADD)` with EPERM.
+//!
+//! `select`/`poll`/`pselect6`/`ppoll` share the same readiness machinery; the
+//! `*p*` variants additionally swap the signal mask for the duration of the
+//! wait (atomically, the way the kernel does), which is why they reach into the
+//! signal subsystem.
+//!
+//! Methods are `impl` blocks on [`SyscallDispatcher`]; see [`super`] for the
+//! dispatcher struct and the normalized dispatch table. Socket/netlink/fd-set
+//! helper routines and the AF_UNIX registry live in the `support` submodule.
 use super::*;
 mod support;
 use support::*;

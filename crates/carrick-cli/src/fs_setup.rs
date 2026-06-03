@@ -1,4 +1,53 @@
-//! Filesystem backend setup for CLI runs.
+//! Filesystem-backend selection and guest-baseline seeding for `run-elf` runs.
+//!
+//! # Theory of operation
+//!
+//! A guest needs a writable root filesystem with Linux semantics. Two backends
+//! provide one (both in `carrick_runtime::fs_backend`), and this module is the
+//! policy layer that picks between them and pre-populates them — for the
+//! engine-less `run-elf` fixture path. (The docker `run` path makes the
+//! equivalent choice inside `carrick-engine`; this module is what the bare-ELF
+//! and conformance fixtures use.)
+//!
+//! - **`MemoryBackend`** — an in-memory tmpfs overlay layered on the OCI rootfs
+//!   tar. Works anywhere, but writes are RAM-only and gone at exit.
+//! - **`HostFsBackend`** — the "rootfs as APFS, throw away when done"
+//!   architecture. Instead of overlaying a writable layer on the in-memory tar,
+//!   it *materialises* every rootfs file/dir/symlink onto a cap-std-sandboxed
+//!   scratch directory on a real (case-sensitive) host volume. After that seed,
+//!   every fs syscall flows through *real* host syscalls (openat/renameat/
+//!   symlinkat/…) against a real filesystem. That is what gives apt/dpkg their
+//!   genuine Linux fs semantics (atomic rename, `symlinkat`, clear-signed-file
+//!   splitting) that the in-memory overlay could only approximate. Once the host
+//!   backend has materialised the COMPLETE rootfs, the redundant in-memory
+//!   rootfs layer is dropped (`drop_rootfs_layer`) so reads, `execve`, and the
+//!   ELF interpreter loader all resolve against the authoritative disk overlay.
+//!
+//! ## Default selection: case-sensitivity is the deciding fact
+//!
+//! Linux paths assume a case-sensitive filesystem; the stock macOS boot volume
+//! is case-INsensitive. `host` is the secure-by-default, real-semantics choice,
+//! so the default (`default_fs_backend_kind`) probes the *exact* scratch root
+//! the host backend will use — `apfs::preferred_scratch_root`, which prefers the
+//! dedicated case-sensitive `/Volumes/carrick` volume — and chooses `host` iff
+//! that root is case-sensitive, else falls back to `memory` with a warning.
+//! Probing the real root (not a hardcoded `~/.carrick`) matters: the dedicated
+//! volume can be case-sensitive while `$HOME` is not, and probing the wrong path
+//! would wrongly downgrade to memory.
+//!
+//! Both fall-back paths are non-fatal by design: a failed `--fs host` seed, or
+//! an unconstructable scratch dir, degrades to the in-memory backend with a
+//! warning rather than failing the run.
+//!
+//! ## Guest baseline seeding
+//!
+//! `seed_guest_baseline` pre-populates *either* backend with a minimal Linux
+//! skeleton (`/tmp` sticky, passwd/group/nsswitch, an `/etc/hosts` whose entries
+//! are resolved on the macOS host, and an `/etc/hostname`/`127.0.1.1` line in
+//! lockstep with `carrick_runtime::execute::guest_hostname` — the single UTS
+//! nodename source that also feeds `uname(2)` and `/proc`). Raw static binaries
+//! arrive with no OCI rootfs, yet enough real software assumes these paths exist
+//! that carrick seeds them unconditionally.
 
 use anyhow::Result;
 use carrick_runtime::dispatch::SyscallDispatcher;

@@ -1,5 +1,51 @@
-//! fs syscall handlers. Methods on `SyscallDispatcher`; see
-//! `super` for the dispatcher struct and the normalized dispatch table.
+//! Filesystem syscall handlers — VFS-routed file I/O.
+//!
+//! These are methods on [`SyscallDispatcher`] (see `super` for the dispatcher
+//! struct, the normalized dispatch table, and the [`DispatchOutcome`] protocol).
+//! This module and its `fs/` submodules implement every path- and fd-bearing
+//! syscall: `openat`/`read`/`write`/`close`, the `*stat*` family, directory
+//! ops, `rename`/`link`/`unlink`, `fcntl` (incl. POSIX record locks),
+//! `sendfile`/`copy_file_range`, xattrs, and the access checks.
+//!
+//! # Routing: VFS mount table first, rootfs+overlay fallthrough
+//!
+//! A path-bearing syscall is resolved against [`fs::FsState`] in two layers.
+//! First the unified VFS mount table ([`fs::FsState::vfs_mounts`]) — `DevVfs` at
+//! `/dev`, `ProcVfs` at `/proc`, `SysVfs` at `/sys`. If a mount claims the path
+//! and handles the operation, its answer wins. Otherwise the call *falls
+//! through* (`VfsOpenAttempt::FallThrough`) to the `/` mount
+//! ([`fs::FsState::rootfs_vfs`]): an immutable OCI rootfs layered under a
+//! writable overlay. Reads see the overlay shadowing the rootfs; writes,
+//! creates, and metadata changes land in the overlay (the base image is never
+//! mutated). The rootfs/overlay is held as a typed field rather than a regular
+//! mount because ~50 legacy call sites still reach into it directly.
+//!
+//! With `--fs host`, regular-file opens are backed by a real macOS fd
+//! (`OpenDescription::HostFile`) so the guest sees the host's APFS, mediated by
+//! cap-std; in the default in-memory mode an `openat` of a rootfs/overlay file
+//! materializes its bytes into an `OpenDescription::File`/`Directory`. Either
+//! way the descriptor lands in the fd table (see [`fd_table`]).
+//!
+//! # Linux↔Darwin translation lives here
+//!
+//! macOS does the heavy lifting (real `libc` calls under the hood for host
+//! backends), but the *shapes* differ and every divergence is reconciled in
+//! this module: the `struct flock` field order and `l_type` constants
+//! (`forward_record_lock`), the `struct stat`/`statx` wire layout
+//! (`fs/stat.rs`), `AT_*`/`O_*` flag bits, `S_IF*` type bits, the `dirent64`
+//! record format, and the magic `/proc/self/fd/N` re-open symlinks. The guiding
+//! rule is "be Linux, on Darwin": where a constant or layout collides, the Linux
+//! value is what the guest must observe.
+//!
+//! # Submodules (`fs/`)
+//!
+//! Pure `impl SyscallDispatcher` splits (WS-F3), type-transparent to callers:
+//! `state` (the [`fs::FsState`]/[`fs::IoState`] owned state), `fd_helpers`
+//! (the lowest-free-fd allocator + `install_fd*` + typed fd-kind accessors),
+//! `pathres` (layered path/symlink resolution across the rootfs layers),
+//! `stat` (fd stat/statx record assembly), `sendfile` (data-movement +
+//! the Darwin `copyfile`/`fclonefileat` fast path), `access` (DAC checks),
+//! and `xattr`.
 use super::*;
 mod access;
 mod fd_helpers;

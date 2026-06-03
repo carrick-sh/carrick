@@ -1,4 +1,25 @@
-//! CLI debug helpers.
+//! `carrick debug` — operator tooling that pairs with the lldb plugin.
+//!
+//! # Theory of operation
+//!
+//! These subcommands exist to make a wedged or crashed guest legible without
+//! re-running it. They pair with the Python lldb plugin at
+//! `scripts/carrick_lldb.py` (the carrick-lldb workflow), and the contract
+//! between the two is that *both decode the same way*:
+//!
+//! - `decode-esr` parses an AArch64 `ESR_EL1` syndrome into its exception class,
+//!   IL bit, and ISS (with the DFSC data-abort fault detail) so an operator
+//!   never hand-parses a syndrome mid-session. The field layout here
+//!   deliberately mirrors the table in the lldb plugin, so the CLI and an lldb
+//!   session give the *same* answer for a given syndrome — the test pins a real
+//!   Tier-B `ldaxr` external-abort syndrome (`0x92000035`) to keep them in sync.
+//! - `lldb-plugin` prints the on-disk path to `carrick_lldb.py` (resolved from
+//!   `CARGO_MANIFEST_DIR`) so the operator can `command script import` it.
+//! - `inspect-state` renders the `DebugStateSnapshot` JSON that
+//!   `run --debug-state-path` dumps *before* starting the vCPU — the same dump
+//!   the lldb plugin reads to translate guest addresses back to image / segment
+//!   / file context. This gives a one-shot, lldb-free inspection of the guest
+//!   address-space layout.
 
 use anyhow::Context;
 use carrick_runtime::runtime::DebugStateSnapshot;

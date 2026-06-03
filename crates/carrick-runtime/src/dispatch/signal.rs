@@ -1,5 +1,73 @@
-//! signal syscall handlers. Methods on `SyscallDispatcher`; see
-//! `super` for the dispatcher struct and the normalized dispatch table.
+//! Signal subsystem: the dispatcher-side state machine for POSIX/Linux signals.
+//!
+//! # Theory of operation
+//!
+//! Signal handling in carrick is split across three places, and this file owns
+//! the MIDDLE one — the bookkeeping. It is worth being precise about the seam:
+//!
+//!   - **carrick-hvf** (`host_signal`) owns the host↔guest signum translation
+//!     (`SIGNUM_XLATE` / `host_to_linux_signum`): a macOS host signal that the
+//!     runtime catches must be mapped to its Linux number before this layer
+//!     reasons about it, because the numbers differ above the POSIX core (e.g.
+//!     SIGCHLD, SIGUSR1/2, SIGURG sit at different values on the two kernels).
+//!   - **runtime.rs** owns the PHYSICAL frame build: when a signal is actually
+//!     delivered to a vCPU, `inject_signal` writes the Linux `rt_sigframe`
+//!     (saved GPRs/PC/PSTATE + `ucontext` + `siginfo`) onto the guest stack,
+//!     points the vCPU at the handler with the EL0 trampoline / `sa_restorer`
+//!     as the return address, and `restore_from_sigframe` reverses it on
+//!     `rt_sigreturn`. (The trampoline exists because glibc-aarch64 passes
+//!     `sa_restorer = 0` and expects the kernel's VDSO `__kernel_rt_sigreturn`.)
+//!   - **this file** owns everything BETWEEN: which signal is deliverable to
+//!     which thread right now, what the handler-entry mask is, and what
+//!     `rt_sigreturn` must restore. No vCPU registers are touched here; the
+//!     handlers return [`DispatchOutcome`] values (e.g. `SignalThread`,
+//!     `SigReturn`) that the runtime turns into frame builds and vCPU kicks.
+//!
+//! ## The state machine ([`SignalState`])
+//!
+//! The hard part of Linux signals is that masks, pending sets, and alternate
+//! stacks are **per-thread**, while handlers and one shared pending set are
+//! **per-process (thread-group)**. Getting this wrong is not a crash — it is a
+//! lost or misrouted signal, the worst kind of bug to chase. Several fields
+//! here exist specifically because a process-global shortcut once stranded a
+//! signal:
+//!
+//!   - `masks`, `pendings`, `altstack`, `handler_frames` are keyed by
+//!     [`crate::thread::ThreadId`]. A process-global mask let one thread's
+//!     `rt_sigprocmask` block a signal for a sibling; a process-global alt
+//!     stack made concurrent SIGURG frames overlap and corrupt goroutine
+//!     stacks. Both were real (the field docstrings cite the cases).
+//!   - `process_pending` / `process_rt_pending_counts` are the SHARED
+//!     thread-group pending set for a process-directed signal that no thread
+//!     can take immediately (every thread blocks it). `take_pending_in`
+//!     considers it alongside the per-thread set so ANY thread that next
+//!     unblocks — or that calls `rt_sigtimedwait`/`sigwait` — can consume it.
+//!   - `rt_pending_counts` gives real-time signals (SIGRTMIN..=SIGRTMAX) POSIX
+//!     queuing: N sends while blocked yield N deliveries on unblock, whereas a
+//!     standard signal coalesces to one. The pending BIT only clears when the
+//!     last queued instance drains.
+//!   - `restore_masks` implements Linux's `set_restore_sigmask`: a syscall that
+//!     temporarily swaps the mask for the duration of a wait (`sigsuspend`,
+//!     `pselect`/`ppoll` with a sigmask) arms the mask that the NEXT handler's
+//!     `rt_sigreturn` must restore — so the handler runs under the temporary
+//!     mask and the original returns afterward.
+//!
+//! ## Delivery cycle and EINTR
+//!
+//! The runtime drives delivery: after a syscall, it asks
+//! `take_deliverable_pending` for the lowest-numbered pending, unblocked signal
+//! and injects ONE per cycle, so each handler runs and returns via
+//! `rt_sigreturn` before the next is injected — matching the kernel's
+//! "deliver all pending before returning to userspace" rule. `enter_signal_handler`
+//! computes the handler-entry mask (current ∪ the delivered signal unless
+//! SA_NODEFER ∪ `sa_mask`), applies SA_RESETHAND/one-shot disposition resets,
+//! and records the alt-stack frame; the returned mask is what the frame saves
+//! for `rt_sigreturn`. `non_interrupting_signal_mask` encodes which pending
+//! signals must NOT cause a blocking host wait to return EINTR (a signal whose
+//! disposition is ignore or default-ignore should never interrupt a `waitpid`).
+//!
+//! Methods are `impl` blocks on [`SyscallDispatcher`]; see [`super`] for the
+//! dispatcher struct and the normalized dispatch table.
 use super::*;
 use crate::linux_abi::LinuxSiginfo;
 use std::collections::VecDeque;

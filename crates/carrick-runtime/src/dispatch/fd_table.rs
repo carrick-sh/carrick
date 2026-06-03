@@ -1,4 +1,46 @@
-//! File-descriptor table and open-description state shared by dispatch handlers.
+//! File-descriptor table and open-description model.
+//!
+//! Linux distinguishes two layers: the per-process *fd table* (numbers → open
+//! file descriptions) and the *open file descriptions* themselves (the seekable
+//! cursor, status flags, and backing object that `dup`/`fork`/`fork`+`exec`
+//! share). carrick mirrors that split. The fd table is
+//! `IoState::open_files: HashMap<i32, OpenFile>` (see `fs/state.rs`); each
+//! [`OpenFile`] holds its per-*fd* `FD_CLOEXEC` flag plus an
+//! `Arc<RwLock<OpenDescription>>` — the shared open-file-description. Because the
+//! description is behind an `Arc`, two fds produced by `dup(2)` see one cursor,
+//! one set of status flags, one lease, one async-I/O owner — exactly as the
+//! kernel keeps them on the description, not the fd. `OpenDescriptionBase`
+//! carries that shared per-description state.
+//!
+//! # `OpenDescription`: one union over every backing object
+//!
+//! The interesting variants split by how the object is realized on macOS:
+//!
+//! - **In-memory rootfs/overlay** — `File` / `Directory` / `SyntheticFile`:
+//!   the bytes (or directory entries) live in the Vec and a `usize` offset is
+//!   the seek cursor. This is the default (`--fs memory`) backing.
+//! - **Host-fd-backed** — `HostFile` / `HostSocket` / `HostPipe`: a real macOS
+//!   descriptor does the work (APFS file under `--fs host`, a BSD socket, a host
+//!   pipe / pty). Seek/read/write/poll forward to the host fd. `HostFdRef`
+//!   reference-counts the underlying host fd so the last `dup` to close it
+//!   actually closes the macOS descriptor.
+//! - **Anonymous-inode fds** — `EventFd` / `TimerFd` / `Epoll` / `SignalFd` /
+//!   `Inotify` / `Pidfd`: Linux objects macOS has no syscall for, emulated on
+//!   top of a kqueue and/or a host readiness pipe. They are pollable but not
+//!   seekable; their `readlink(/proc/self/fd/N)` reports the matching
+//!   `anon_inode:[…]` label so guest fd-introspection agrees with `fstat`.
+//!
+//! A handler that only needs "what kind of fd is this" uses the typed accessors
+//! in `fs/fd_helpers.rs` (`host_socket_fd`, `inotify_state`, …) rather than
+//! matching the whole enum.
+//!
+//! # Readiness emulation is the subtle part
+//!
+//! eventfd and the kqueue-backed fds keep a REAL host fd that an epoll instance's
+//! kqueue can watch with `EVFILT_READ` — see `EventFdState`, which mirrors
+//! "counter > 0" as "exactly one byte present in a host pipe" so a level-trigger
+//! cannot be lost (Go's `netpollBreak` depends on this). The in-memory state is
+//! the source of truth; the host pipe is the wakeup channel.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
@@ -382,7 +424,7 @@ pub(super) enum OpenDescription {
         host_pid: i32,
         kqueue: Arc<crate::darwin_kqueue::Kqueue>,
     },
-    /// A Linux inotify instance. Backed by an [`InotifyState`] (a kqueue +
+    /// A Linux inotify instance. Backed by an [`InotifyState`](crate::inotify::InotifyState) (a kqueue +
     /// `EVFILT_VNODE` watch table); like `Pidfd`/`TimerFd` it is a pollable,
     /// non-seekable, non-file fd whose readiness is the backing kqueue's fd.
     /// `read(2)` drains queued vnode changes as Linux `inotify_event` records.

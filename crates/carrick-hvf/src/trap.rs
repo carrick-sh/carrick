@@ -1,5 +1,169 @@
-//! Hypervisor.framework trap engine, guest register/memory access, signal
-//! frames, and fork/exec address-space management.
+//! # The HVF trap boundary
+//!
+//! This is the seam where a Linux guest's `svc #0` becomes a host Rust syscall
+//! dispatch. carrick runs unmodified Linux ELF code as guest EL0 inside a single
+//! Hypervisor.framework VM, with NO Linux kernel underneath it — when the guest
+//! issues a syscall, control must cross all the way out to host userspace, get
+//! serviced against Darwin primitives, and resume the guest as if a kernel had
+//! handled it. This module owns that crossing in both directions.
+//!
+//! ## Theory of operation: the round trip of one syscall
+//!
+//! 1. **Guest `svc #0` (EL0).** The guest executes a normal AArch64 supervisor
+//!    call. With `SCTLR_EL1.M=1` and our stage-1 identity tables installed, this
+//!    is a synchronous exception from the lowest EL.
+//! 2. **EL1 vector table (`VBAR_EL1`).** HVF does NOT exit to the host on a bare
+//!    EL0 `svc`; it routes the exception to EL1, which is *still inside the VM*.
+//!    `map_plan` programs `VBAR_EL1` to a guest-physical vector page (built by
+//!    `crate::memory`) whose lower-EL-synchronous entry is a tiny trampoline. The
+//!    trampoline runs at EL1 — this is carrick code executing in the guest, never
+//!    the guest's own code.
+//! 3. **`hvc #2` → EL2 VM-exit.** The vector trampoline issues a hypervisor call.
+//!    THAT is what HVF surfaces to the host as an `EXCEPTION` exit from
+//!    `hv_vcpu_run`. (Plain EL0 memory aborts HVF cannot satisfy — a stack
+//!    overflow running SP off the mapped stack — surface directly as an
+//!    `EXCEPTION` exit with `EC=0x20/0x24` instead; see
+//!    [`is_aarch64_el0_abort_exception`].) The reason we trampoline through EL1
+//!    rather than letting HVF trap the `svc` directly is that the EL1 stage
+//!    gives us a place to do stage-1 TLB maintenance (`hvc #1`, see
+//!    `HvfInner::run_el1_maintenance`) on a platform whose public HVF has no
+//!    stage-2 TLBI.
+//! 4. **Host decode.** `HvfInner::run_until_syscall` reads the exit info,
+//!    confirms `EC=0x16` (our HVC) *and* that the underlying `ESR_EL1` is an
+//!    `svc` (anything else — an ID-register read, a real fault — is handled or
+//!    surfaced as [`TrapError::EL0Fault`]), then reads x0..x5/x8 into an
+//!    [`Aarch64SyscallFrame`] and returns it to the runtime dispatcher.
+//! 5. **Host dispatch + resume.** The dispatcher services the syscall against
+//!    Darwin and calls `HvfInner::complete_syscall`, which writes the retval
+//!    into x0. The next `hv_vcpu_run` resumes the trampoline's `eret`, dropping
+//!    back to EL0 at the instruction after the `svc` (HVF latched that address in
+//!    `ELR_EL1` when it took the exception).
+//!
+//! ## The load-bearing EL0/EL1 invariant
+//!
+//! The single most important distinction in this module is *whose code is the
+//! vCPU running*. EL0 is genuine Linux guest userspace; EL1+ is always carrick's
+//! trap trampoline. A PC (or register snapshot) captured at EL1 is a *carrick*
+//! address and must NEVER be treated as a guest resume target — injecting a
+//! signal frame at an EL1 PC overwrites an in-flight syscall and wedges the
+//! thread. [`ExecLevel::from_pstate`] is the systematic classifier; every site
+//! that captures a live vCPU PC for guest use must consult it. The kick path in
+//! `HvfInner::run_until_syscall` is the sharp example: a cross-thread
+//! `hv_vcpus_exit` can land while the vCPU is mid-trampoline at EL1, so it resumes
+//! the vCPU to a clean EL0 boundary before reporting the kick (this fixed a real
+//! SIGURG storm corrupting a futex waiter at `vectors_base+0x404`).
+//!
+//! ## The [`SyscallTrap`] contract
+//!
+//! The runtime loop drives the engine through one trait, [`SyscallTrap`]:
+//! `next_syscall` (run until a trap; `Ok(None)` is a no-syscall kick exit),
+//! `complete_syscall` (write the retval), `fork` / `execve_into` (address-space
+//! lifecycle), and the signal pair `inject_signal` / `restore_from_sigframe`.
+//! [`HvfTrapEngine`] is the real implementation; the runtime also has a
+//! non-HVF `SplitView` adapter, which is why every method has a portable
+//! default and a `#[cfg(not(macos+aarch64))]` stub returning
+//! [`TrapError::UnsupportedPlatform`]. Errors are typed: most variants carry the
+//! syndrome/ELR/FAR so the runtime can translate a guest fault into the right
+//! Linux signal, and [`TrapError::SignalDeliveryFault`] specifically models
+//! Linux's `force_sigsegv` (an unwritable signal stack kills the thread-group by
+//! SIGSEGV rather than fatalling carrick).
+//!
+//! ## Address-space lifecycle: fork, clone, execve
+//!
+//! There is no guest kernel to copy a page table, so process/thread creation is
+//! done by *rebuilding HVF state around the host's own fork/threads*:
+//!
+//! - **`fork(2)`** (`HvfInner::fork`) is a real `libc::fork`. macOS HVF state is
+//!   not fork-safe, so the parent tears down its vCPU+VM via the *raw* API
+//!   BEFORE forking (a live VM at fork time leaves the child unable to
+//!   `hv_vm_create`); both sides then rebuild a fresh VM and re-`hv_vm_map` the
+//!   same host buffers. Guest RAM is host-`MAP_SHARED` (required for HVF
+//!   coherence), so `fork(2)` does NOT COW-isolate it — the parent therefore
+//!   takes an explicit private snapshot of each PRIVATE region pre-fork (while
+//!   the vCPU is suspended, hence race-free) via `clone_region_for_child`, and
+//!   the child maps those copies. Genuine guest `MAP_SHARED` file mappings are
+//!   deliberately *not* snapshotted (POSIX: they stay shared across fork).
+//! - **Thread clone** (`HvfInner::build_thread_spec` / `from_thread_spec`)
+//!   keeps ONE process VM and gives each guest thread its own vCPU in it. The
+//!   stage-2 mappings are VM-global, so a sibling only re-materialises local
+//!   syscall-path metadata (UNOWNED, `memory: None`) and never frees the main
+//!   engine's buffers. Because HVF caps concurrent vCPUs, sibling creation
+//!   passes through an admission gate (`wait_for_vcpu_slot`); see the
+//!   private `vcpu_gate` module for why a guest that out-threads the cap *blocks*
+//!   rather than failing `clone` (Linux has no such cap, so failing would
+//!   deadlock a join). A *multithreaded* fork additionally quiesces siblings,
+//!   destroys their vCPUs so the forker can `hv_vm_destroy`, then republishes the
+//!   rebuilt VM for them to recreate vCPUs in (`release_vcpu_for_fork` /
+//!   `publish_vm_for_siblings` / `rebuild_vcpu_after_fork`).
+//! - **`execve(2)`** (`HvfInner::execve_into`) tears down and rebuilds the VM
+//!   like fork, but installs a brand-new [`AddressSpace`] and resets the vCPU to
+//!   "initial process startup" (zeroed GPRs, entry trampoline) rather than
+//!   "resume mid-syscall". It has no successful return.
+//!
+//! All three paths bypass `applevisor`'s `Drop`: once a single `fork(2)` has run,
+//! applevisor's internal handle bookkeeping no longer matches HVF, and its
+//! destructors panic ("no VM or vCPU available"). `HvfInner` is held in a
+//! [`std::mem::ManuallyDrop`] and the host pages leak until process exit — which
+//! is fine, the process is exiting anyway, and the kernel reclaims the VM.
+//!
+//! ## Signals: synthesising kernel signal delivery in userspace
+//!
+//! `HvfInner::inject_signal` builds a Linux-shaped `CarrickSigframe` (siginfo +
+//! ucontext + a full GPR/PC/SP/PSTATE/FPSIMD snapshot), pushes it onto SP_EL0
+//! (or the SA_ONSTACK alt stack), points x30 at the restorer, sets x0..x2 to the
+//! handler arguments, and redirects the resumed PC to the handler. On
+//! `rt_sigreturn(2)`, `HvfInner::restore_from_sigframe` pops the frame and
+//! restores the pre-signal state. Two non-obvious subtleties:
+//!
+//! - The authoritative pre-signal PSTATE source DIFFERS by injection path. At a
+//!   syscall boundary the hardware latched EL0's PSTATE into `SPSR_EL1`; on a
+//!   kick exit no exception was taken, so `SPSR_EL1` is stale and `CPSR` holds
+//!   the live EL0 state. Reading the wrong one resumes the interrupted routine
+//!   with stale NZCV — conditional branches go the wrong way — which was exactly
+//!   Go's async-preemption (SIGURG) corruption.
+//! - V0–V31 / FPSR / FPCR must round-trip across both signals *and* fork/clone,
+//!   or a handler (or post-fork resume) that touches SIMD corrupts the
+//!   interrupted thread's vector file. This collides with an `applevisor-sys`
+//!   ABI bug: see `set_simd_fp_reg_v` — Apple's `hv_vcpu_set_simd_fp_reg` takes
+//!   a 16-byte vector BY VALUE in a V register, but the stable binding mistypes
+//!   it as `u128` (passed in a GP register pair), so the kernel reads garbage and
+//!   silently zeroes the target register while returning `HV_SUCCESS`. We route
+//!   every V-register *write* through a tiny C shim that gets the vector ABI
+//!   right on stable Rust; reads are pointer-based and unaffected.
+//!
+//! ## Guest memory access from the syscall path
+//!
+//! The dispatcher reads/writes guest buffers through this engine's
+//! [`GuestMemory`] impl. Because guest RAM is `MAP_SHARED` and another host
+//! thread's vCPU can mutate it concurrently, host-side copies go byte-wise
+//! `read_volatile`/`write_volatile` (`volatile_copy_from_guest`) to remove
+//! language-level UB (it does NOT make the data race "correct" — the guest owns
+//! its own synchronization). Writes from the syscall path are permission-checked
+//! (a write into a read-only / carrick-owned mapping returns EFAULT, not a host
+//! SIGBUS); carrick-internal writes (vdso, sigframe, bootstrap) use the unchecked
+//! path deliberately. High-VA Rosetta aliases can overlap by VA, so region
+//! lookup disambiguates by walking the guest's own stage-1 tables to the IPA the
+//! guest actually uses (`HvfInner::translate_va`).
+//!
+//! ## Sharp edges / known limitations
+//!
+//! - **No stage-2 TLBI on public arm64 HVF.** Guest-visible `mprotect`/`munmap`
+//!   semantics are implemented entirely in stage-1 (page-table edits + an EL1
+//!   `tlbi` trampoline); the stage-2 mapping is left in place. This is why
+//!   munmap'd arena backing is still physically mapped (only stage-1-invalidated)
+//!   and why `HvfInner::zero_guest_backing` can scrub a reclaimed region the
+//!   permission-checked writes would refuse.
+//! - **Stage-2 perm escalation.** `hvf_perms` escalates writable data regions
+//!   to `ReadWriteExec` to work around an HVF stage-2 quirk where RW-without-X
+//!   mappings fail to translate EL0 data accesses. Guest-visible W^X is enforced
+//!   in stage-1 instead.
+//! - **Drop is intentionally a no-op.** See above; touching applevisor
+//!   destructors post-fork panics.
+//! - **`ptr::write`-based in-place replacement.** Rebuilding the engine
+//!   (`replace_destroyed_hvf_inner`) and the post-fork/clone VM swaps use
+//!   `mem::forget`/`ptr::write` to avoid running Drop on already-raw-destroyed
+//!   handles. These are the single sanctioned no-drop replacement points; do not
+//!   assign an `HvfInner`/vCPU/VM field normally after a raw teardown.
 
 // The hub types live in the leaf crate carrick-guest-mem (A2); import them from
 // there, not via `crate::dispatch`, so trap.rs has NO dependency on the
@@ -602,7 +766,7 @@ pub enum ExecLevel {
 }
 
 impl ExecLevel {
-    /// Classify from PSTATE/SPSR. M[3:2] is the exception level (00 = EL0).
+    /// Classify from PSTATE/SPSR. `M[3:2]` is the exception level (00 = EL0).
     pub fn from_pstate(pstate: u64) -> Self {
         if (pstate >> 2) & 0b11 == 0 {
             ExecLevel::Guest
@@ -1100,9 +1264,10 @@ impl HvfTrapEngine {
     }
 
     /// Block until there is room under the HVF concurrent-vCPU cap to create one
-    /// more sibling vCPU (see [`vcpu_gate`]). MUST be called by the new sibling's
-    /// own host thread BEFORE it takes the fork topology lock — blocking while
-    /// holding that lock would stall forks and serialise sibling starts.
+    /// more sibling vCPU (see the private `vcpu_gate` module). MUST be called by
+    /// the new sibling's own host thread BEFORE it takes the fork topology lock —
+    /// blocking while holding that lock would stall forks and serialise sibling
+    /// starts.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub fn wait_for_vcpu_slot() {
         vcpu_gate::acquire();

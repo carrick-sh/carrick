@@ -1,4 +1,33 @@
-//! DTrace-specific CLI helpers.
+//! DTrace privilege-handoff helpers for `carrick trace`.
+//!
+//! # Theory of operation
+//!
+//! `carrick trace` has two irreconcilable privilege requirements: libdtrace must
+//! run as **root** to open `/dev/dtrace` and arm the carrick USDT providers, but
+//! the **traced guest** must run as the *original* user (root would taint file
+//! ownership, scratch permissions, and any uid-sensitive guest behaviour). The
+//! resolution is a split: the trace PARENT stays root and owns the dtrace
+//! consumer; the traced CHILD drops back to the caller's full identity before it
+//! ever dispatches a carrick subcommand.
+//!
+//! This module is the child-side of that split (the parent-side auto-sudo
+//! re-exec lives in [`crate::commands`], `Commands::Trace`). When the parent
+//! re-execs under `sudo`, it forwards the caller's original
+//! uid/gid/supplementary-groups as explicit CLI args (`--trace-uid`/`-gid`/
+//! `-groups`) — CLI args survive `sudo`'s `env_reset` where env vars don't, and
+//! need no `SETENV` in sudoers. `current_supplementary_groups` captures them on
+//! the way in; `trace_drop_credentials` reconstructs them (falling back to
+//! `SUDO_UID`/`SUDO_GID` when the explicit args are absent) into the
+//! `TraceDropCredentials` the dtrace consumer applies to the spawned child.
+//!
+//! `exec_trace_child` is the hidden `__trace-child` entry point: it drops
+//! privilege in the mandatory order — `setgroups` → `setgid` → `setuid` (groups
+//! and gid first, because once uid is dropped you can no longer change them) —
+//! then re-parses and dispatches the forwarded carrick command via
+//! [`crate::commands::run_cli`] as the unprivileged user.
+//!
+//! The whole module is `cfg(target_os = "macos")`: libdtrace is the only tracer,
+//! and it is macOS-only.
 
 use anyhow::{Context, bail};
 

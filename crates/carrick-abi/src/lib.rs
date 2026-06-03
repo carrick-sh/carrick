@@ -1,5 +1,103 @@
-//! Linux AArch64 ABI constants and wire-format structs used by the dispatcher
-//! and guest memory helpers.
+//! The Linux AArch64 kernel-ABI wire-format boundary.
+//!
+//! # The problem this crate exists to solve
+//!
+//! Carrick runs an unmodified Linux ELF binary as a native macOS process. There
+//! is no guest Linux kernel: when the guest executes an `svc #0` the trap lands
+//! in carrick's dispatcher, which must produce *exactly* the bytes the real
+//! Linux kernel would have produced. The guest's libc (glibc, musl), its
+//! language runtime (the Go scheduler, the CPython interpreter), and the guest
+//! program itself were all compiled against the Linux UAPI headers and will
+//! read carrick's output back with `#[repr(C)]`-equivalent struct definitions
+//! they baked in at *their* compile time. We do not control that read; we only
+//! control the write. So this crate's single job is to define, once and
+//! authoritatively, the Linux/aarch64 side of every value that crosses the
+//! syscall boundary — the constants the guest passes in (`O_*`, `AF_*`, `SIG*`,
+//! errno numbers, ioctl request codes, `CLONE_*` flags) and the structs the
+//! guest reads back (`struct stat`, `struct termios`, `siginfo_t`, the
+//! `rt_sigframe`, the io_uring rings).
+//!
+//! # The mental model: the byte count IS the ABI
+//!
+//! The load-bearing idea in this file is that **a UAPI struct's identity, for
+//! ABI purposes, is the exact number of bytes the Linux kernel reads from or
+//! writes to the guest's buffer — not the `size_of` of the Rust struct we use
+//! to model it.** Those two numbers are usually equal, and it is tempting to
+//! treat them as interchangeable. They are not, and conflating them is a memory
+//! corruption bug in the *guest*, which is the worst possible place for it.
+//!
+//! The canonical scar is `struct termios` (see [`LINUX_TERMIOS_KERNEL_SIZE`] and
+//! [`LinuxTermios`]). Our Rust model carries the `c_ispeed`/`c_ospeed` fields,
+//! making it 44 bytes — but those two fields belong to `struct termios2`
+//! (`TCGETS2`); the kernel's `TCGETS` writes exactly **36** bytes. glibc's
+//! `tcgetattr` (reached through `isatty`) passes a 36-byte on-stack buffer.
+//! Writing 44 bytes overflowed it by 8, trampling the stack canary; the program
+//! ran on, then aborted later inside `__stack_chk_fail` — so *every* glibc
+//! binary that touched a tty (`ls`, `dpkg`, …) crashed, far from the actual
+//! fault. The fix is not "make the struct smaller" (the extra fields are real,
+//! for `TCGETS2`); it is to record the wire size separately and copy only that
+//! many bytes. That is what [`KernelAbi`] encodes for the whole struct surface.
+//!
+//! # The two enforcement mechanisms
+//!
+//! Knowing the right byte count does no good if a future edit silently breaks
+//! it. This crate pushes every ABI invariant it can to the *compiler*, so a
+//! drift fails the build with a named message instead of corrupting guest
+//! memory at runtime. There are two layers, both detailed at their definitions:
+//!
+//! 1. **[`KernelAbi`] + `ABI_SIZE`** — every struct that the dispatcher copies
+//!    into guest memory implements [`KernelAbi`], whose associated const
+//!    `ABI_SIZE` is the kernel wire size. `abi_bytes()` returns a slice of
+//!    exactly that length, so a caller *cannot* pick the wrong count: the wire
+//!    size is baked into the type. The `kernel_abi!` macro pairs each impl with
+//!    a `const _` assert that `ABI_SIZE <= size_of::<Self>()` (so `abi_bytes()`
+//!    never over-reads) and that `ABI_SIZE` equals the documented kernel value.
+//!
+//! 2. **`assert_layout!` + the `const _: ()` invariant blocks** — for structs
+//!    whose Rust layout is *supposed* to be byte-identical to the kernel's
+//!    (`siginfo_t`, the `rt_sigframe`, the io_uring rings, `msghdr`, …),
+//!    `assert_layout!` pins `size_of` and individual field offsets via
+//!    `core::mem::offset_of!`. A separate set of `const _: ()` blocks pins the
+//!    *constant tables*: the `SIG*` numbers are unique and within 1..=31, the
+//!    `AF_*` / `SOCK_*` values are pairwise distinct, and the `SA_*` and
+//!    `CLONE_NEW*` flag bits are pairwise disjoint. A duplicate signal number or
+//!    two overlapping flag bits is otherwise an invisible logic bug; here it is
+//!    a compile error. (See the "Compile-time struct layout & constant
+//!    invariants" section near the end of the file.)
+//!
+//! Together these are the *compile-time half* of carrick's conformance
+//! strategy. The runtime half is the differential probe suite that runs the
+//! same code under carrick and under a real Linux Docker oracle and diffs the
+//! observable behavior (see `docs/conformance-testing.md`).
+//!
+//! # Provenance, and what these values are NOT derived from
+//!
+//! Every constant and layout here is the *Linux* value, named with a `LINUX_`
+//! prefix to keep it visibly distinct from the macOS host value it will be
+//! translated to (they collide for some families and diverge for others —
+//! `AF_INET6` is 10 on Linux, 30 on macOS; `SOL_SOCKET` is 1 on Linux,
+//! `0xffff` on macOS; several `SIG*` numbers are renumbered, see the
+//! authoritative `SIGxxx` table). The trailing comment on a `LINUX_*` line
+//! gives the macOS counterpart only when it differs.
+//!
+//! Per the project's clean-room rule, these are sourced from man-pages, the
+//! published UAPI numbers (`include/uapi/asm-generic/*.h` plus the aarch64 arch
+//! overrides), and observed-oracle behavior — cross-checked with `pahole`
+//! against a Debian kernel when a layout is in doubt — and never copied from
+//! Linux kernel / glibc source. The fixed-layout UAPI structs are the
+//! asm-generic layouts, which are identical on aarch64 and x86_64 (both
+//! little-endian LP64); arch-specific overrides are called out inline.
+//!
+//! # Why this is its own leaf crate
+//!
+//! `carrick-abi` has no dependency on the dispatcher, the VFS, or HVF — it is
+//! pure data: `const`s, `#[repr(C, packed)]` structs deriving zerocopy's
+//! `FromBytes`/`IntoBytes`, and the two const-assert macros. That keeps the ABI
+//! definitions a stable leaf that the runtime, the HVF engine, and the probe
+//! suite all share, and keeps an ABI edit from recompiling the ~40k-line
+//! runtime. The structs are `packed` because the kernel ABI is a packed byte
+//! stream with explicit padding fields; the zerocopy derives let the dispatcher
+//! reinterpret guest bytes as these types without an unaligned-read UB hazard.
 
 use bitflags::bitflags;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
@@ -1198,30 +1296,29 @@ fn write_linux_c_field<const N: usize>(field: &mut [u8; N], value: &[u8]) {
 //                            Kernel ABI boundary
 // =============================================================================
 //
-// Every UAPI struct that crosses the syscall boundary has an EXACT byte
-// count the Linux kernel writes/reads — and that count is what defines
-// "the ABI", not the size of our Rust struct. Conflating the two is what
-// gave us a 44-byte TCGETS write into glibc's 36-byte on-stack termios
-// buffer; the overflow trampled the stack canary and every glibc binary
-// that called isatty() aborted later inside __stack_chk_fail.
+// THEORY (full narrative in the crate-level docs above). Every UAPI struct that
+// crosses the syscall boundary has an EXACT byte count the Linux kernel
+// writes/reads — and that count, not `size_of` of our Rust model, is what
+// defines "the ABI". The 44-vs-36 TCGETS termios overflow (see `LinuxTermios`)
+// is the canonical scar this trait exists to make impossible to repeat.
 //
-// To prevent that class of bug ever happening again, ABI-touching structs
-// implement `KernelAbi`. The trait holds a const `ABI_SIZE` (the wire
-// size the Linux kernel uses), and provides `abi_bytes()` returning a
-// slice of exactly that length. All guest-memory writes from the
-// dispatcher go through `write_kernel_struct`, which CAN'T pick the
-// wrong length — the wire size is baked into the type.
+// `KernelAbi` separates the two numbers structurally: the associated const
+// `ABI_SIZE` is the kernel wire size, and `abi_bytes()` hands back a slice of
+// exactly that length — so a caller physically cannot copy the wrong count, the
+// wire size travels with the type. The dispatcher's guest-memory writers take
+// `&impl KernelAbi` and copy `abi_bytes()`, never `as_bytes()`.
 //
-// The trait's `const _` block asserts that ABI_SIZE never exceeds the
-// in-memory Rust layout (so `abi_bytes()` can't read past the struct).
-// For structs whose Rust layout naturally matches the kernel ABI,
-// `ABI_SIZE == size_of::<Self>()` and a corresponding `const _` assert
-// pins it to the documented kernel size — drift from spec fails the
-// build with a clear message rather than corrupting guest memory.
-//
-// Sizes are sourced from `include/uapi/asm-generic/*.h` and the
-// aarch64 arch overrides; cross-checked with `pahole` against a Debian
-// trixie kernel when in doubt.
+// The `kernel_abi!` macro is deliberately the ONLY way to add an impl, so the
+// two guard rails are always written together with it:
+//   * `ABI_SIZE <= size_of::<Self>()`  — so `abi_bytes()` can never over-read
+//     past the live struct (a slice out of bounds would itself be UB / a panic).
+//   * `ABI_SIZE == <the documented kernel size>` — drift from the spec'd value
+//     fails the *build* with the human-readable `$why` string, rather than
+//     silently shipping wrong-length writes to every guest.
+// For structs whose Rust layout is intentionally byte-identical to the kernel's,
+// `ABI_SIZE` is written as `size_of::<Self>()` and `assert_layout!` (below)
+// independently pins the offsets, so the equality check still bites if a field
+// reorders.
 
 pub trait KernelAbi: IntoBytes + Immutable {
     /// Wire size the Linux kernel uses when the kernel reads/writes
