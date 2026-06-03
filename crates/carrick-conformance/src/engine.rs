@@ -61,9 +61,14 @@ fn env_args(envs: &[&[EnvKv]]) -> Vec<String> {
     v
 }
 
-/// Build the carrick argv: `run <envelope flags> <image> <cmd...>`.
-fn carrick_argv(suite: &Suite, carrick_bin: &str) -> Vec<String> {
+/// Build the carrick argv: `run --name <run-id> <envelope flags> <image> <cmd...>`.
+/// `--name` gives carrick the SAME single handle docker gets — carrick derives
+/// the proctitle / scoped-kill id from it (precedence: CARRICK_RUN_ID -> --name
+/// -> auto), so the run-id, the container name, and the kill scope are one thing.
+fn carrick_argv(suite: &Suite, carrick_bin: &str, run_id: &str) -> Vec<String> {
     let mut a = vec![carrick_bin.to_string(), "run".to_string()];
+    a.push("--name".to_string());
+    a.push(run_id.to_string());
     a.extend(suite.carrick_flags.iter().cloned());
     if let Some(ep) = suite.entrypoint.as_ref().and_then(|e| e.for_carrick()) {
         a.push("--entrypoint".to_string());
@@ -112,21 +117,22 @@ fn docker_argv(suite: &Suite, run_id: &str) -> Vec<String> {
     a
 }
 
-pub fn carrick_dry_run(suite: &Suite, carrick_bin: &str) -> Vec<String> {
-    carrick_argv(suite, carrick_bin)
+pub fn carrick_dry_run(suite: &Suite, carrick_bin: &str, run_id: &str) -> Vec<String> {
+    carrick_argv(suite, carrick_bin, run_id)
 }
 pub fn docker_dry_run(suite: &Suite, run_id: &str) -> Vec<String> {
     docker_argv(suite, run_id)
 }
 
 pub fn run_carrick(suite: &Suite, carrick_bin: &str, run_id: &str) -> anyhow::Result<RunOutput> {
-    let argv = carrick_argv(suite, carrick_bin);
+    let argv = carrick_argv(suite, carrick_bin, run_id);
     // SAFE: argv comes from the version-controlled manifest (suites.toml), not external
     // input; `Command::args` passes each token literally (no shell), so there is no
     // metacharacter interpolation / injection surface.
     let mut cmd = Command::new(&argv[0]); // nosemgrep
     cmd.args(&argv[1..]);
-    cmd.env("CARRICK_RUN_ID", run_id);
+    // Scope comes from `--name <run_id>` in the argv now (carrick derives the
+    // proctitle/kill id from it) — no bespoke CARRICK_RUN_ID env needed.
     if let Some(host) = suite.registry_host() {
         cmd.env("CARRICK_INSECURE_REGISTRIES", host);
     }

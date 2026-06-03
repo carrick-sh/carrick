@@ -110,7 +110,11 @@ fn run() -> anyhow::Result<ExitCode> {
 
     if args.dry_run {
         for s in &selected {
-            let c = engine::carrick_dry_run(s, &args.carrick_bin.to_string_lossy());
+            let c = engine::carrick_dry_run(
+                s,
+                &args.carrick_bin.to_string_lossy(),
+                &format!("conf-{}-cN", std::process::id()),
+            );
             let d = engine::docker_dry_run(s, &format!("conf-{}-dN", std::process::id()));
             println!("# {} [{}, {:?}]", s.name, s.ecosystem.as_str(), s.tier);
             println!("  carrick: {}", c.join(" "));

@@ -496,6 +496,33 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 return crate::lifecycle::run_detached(req, store.clone(), name_for_state);
             }
 
+            // Sensible-default run identity. A foreground `carrick run` is not a
+            // registered container (like foreground `docker run`), but it should
+            // still carry a stable id used for the proctitle + the scoped reaper
+            // (`scripts/sudo/kill.sh`), drawn from the SAME id space as
+            // `carrick ps` / `run -d`. Precedence:
+            //   explicit CARRICK_RUN_ID (a caller's grouping override)
+            //     -> the container `--name`
+            //       -> an auto 12-hex short id (`make_id`/`short_id`, the ps scheme).
+            // So every run is scoped + reapable by default with no env var to
+            // remember, and the prefix-collision class of bug disappears (ids are
+            // random 12-hex, never a prefix of one another). `proctitle.rs` reads
+            // CARRICK_RUN_ID; we resolve the default here and stamp it.
+            if std::env::var_os("CARRICK_RUN_ID").is_none() {
+                let scope = req.name.clone().unwrap_or_else(|| {
+                    let entropy = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos() as u64)
+                        .unwrap_or(0);
+                    let id =
+                        carrick_runtime::container::make_id(std::process::id() as u64, entropy);
+                    carrick_runtime::container::short_id(&id).to_string()
+                });
+                // SAFETY: single-threaded here (pre-runtime), like the
+                // forward-env `set_var` later in this function.
+                unsafe { std::env::set_var("CARRICK_RUN_ID", scope) };
+            }
+
             let engine = carrick_engine::Engine::new(store.clone());
             // Docker exits 125 when `run` itself fails *before/at* container
             // start — image resolve/pull, an invalid reference, no command, or
