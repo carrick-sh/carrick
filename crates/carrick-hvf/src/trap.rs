@@ -1661,34 +1661,130 @@ impl HvfTrapEngine {
     }
 }
 
-/// Volatile byte copy out of guest-shared memory. Guest RAM is MAP_SHARED
-/// and the guest vCPU can mutate it concurrently on another host thread; a
-/// plain (non-volatile) read racing that write is UB in Rust's memory
-/// model (the optimizer may assume the bytes are stable and tear/hoist/
-/// elide the read). `read_volatile` per byte forbids that. This does NOT
-/// make the data race semantically correct — the guest owns its own
-/// synchronization — it only removes the language-level UB on the host side.
+/// Volatile copy out of guest-shared memory. Guest RAM is MAP_SHARED and the
+/// guest vCPU can mutate it concurrently on another host thread; a plain
+/// (non-volatile) read racing that write is UB in Rust's memory model (the
+/// optimizer may assume the bytes are stable and tear/hoist/elide the read).
+/// `read_volatile` forbids that. This does NOT make the data race semantically
+/// correct — the guest owns its own synchronization — it only removes the
+/// language-level UB on the host side.
+///
+/// Word-accelerated: the guest (`src`) side is read with aligned word-sized
+/// `read_volatile` (with byte-volatile head/tail around the unaligned edges),
+/// which preserves the UB guarantee while doing ~`size_of::<usize>()`× fewer
+/// guest accesses than a byte loop — this copy is on every guest→host transfer
+/// (sockets, pipes, file reads) and the byte loop was a measured hot spot
+/// (~33µs of a 59µs loopback `sendto`). The private host `dst` is not shared,
+/// so it uses plain unaligned writes.
 ///
 /// SAFETY: `src` must be valid for reads of `len` bytes and `dst` valid for
 /// writes of `len` bytes; the two regions must not overlap.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[inline]
 unsafe fn volatile_copy_from_guest(src: *const u8, dst: *mut u8, len: usize) {
-    for i in 0..len {
-        unsafe { dst.add(i).write(src.add(i).read_volatile()) };
+    const W: usize = core::mem::size_of::<usize>();
+    let mut i = 0usize;
+    unsafe {
+        // Head: byte-volatile until the guest pointer is word-aligned.
+        while i < len && (src.add(i) as usize) % W != 0 {
+            dst.add(i).write(src.add(i).read_volatile());
+            i += 1;
+        }
+        // Bulk: aligned word-volatile reads from guest, unaligned plain writes
+        // to the private host buffer.
+        while i + W <= len {
+            let word = (src.add(i) as *const usize).read_volatile();
+            (dst.add(i) as *mut usize).write_unaligned(word);
+            i += W;
+        }
+        // Tail.
+        while i < len {
+            dst.add(i).write(src.add(i).read_volatile());
+            i += 1;
+        }
     }
 }
 
-/// Volatile byte copy INTO guest-shared memory. See
-/// [`volatile_copy_from_guest`] for why volatile is required.
+/// Volatile copy INTO guest-shared memory. See [`volatile_copy_from_guest`] for
+/// why volatile is required and the word-acceleration rationale. Here the guest
+/// (`dst`) side takes aligned word-sized `write_volatile`; the private host
+/// `src` uses plain unaligned reads.
 ///
 /// SAFETY: `src` must be valid for reads of `len` bytes and `dst` valid for
 /// writes of `len` bytes; the two regions must not overlap.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[inline]
 unsafe fn volatile_copy_to_guest(src: *const u8, dst: *mut u8, len: usize) {
-    for i in 0..len {
-        unsafe { dst.add(i).write_volatile(src.add(i).read()) };
+    const W: usize = core::mem::size_of::<usize>();
+    let mut i = 0usize;
+    unsafe {
+        // Head: byte-volatile until the guest pointer is word-aligned.
+        while i < len && (dst.add(i) as usize) % W != 0 {
+            dst.add(i).write_volatile(src.add(i).read());
+            i += 1;
+        }
+        // Bulk: unaligned plain reads from the private host buffer, aligned
+        // word-volatile writes to guest.
+        while i + W <= len {
+            let word = (src.add(i) as *const usize).read_unaligned();
+            (dst.add(i) as *mut usize).write_volatile(word);
+            i += W;
+        }
+        // Tail.
+        while i < len {
+            dst.add(i).write_volatile(src.add(i).read());
+            i += 1;
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+mod volatile_copy_tests {
+    use super::{volatile_copy_from_guest, volatile_copy_to_guest};
+
+    // Exercise every src/dst alignment combo and a spread of lengths (crossing
+    // the word boundary and the head/bulk/tail seams), comparing against the
+    // obvious byte copy and asserting no overrun past `len`.
+    const LENS: &[usize] = &[0, 1, 7, 8, 9, 15, 16, 17, 31, 63, 64, 65, 255, 256];
+
+    #[test]
+    fn from_guest_matches_reference() {
+        let src: Vec<u8> = (0..512u32).map(|i| (i.wrapping_mul(31).wrapping_add(7)) as u8).collect();
+        for &len in LENS {
+            for s in 0..8usize {
+                for d in 0..8usize {
+                    if s + len > src.len() {
+                        continue;
+                    }
+                    let mut dst = vec![0xCDu8; d + len + 1];
+                    unsafe {
+                        volatile_copy_from_guest(src.as_ptr().add(s), dst.as_mut_ptr().add(d), len);
+                    }
+                    assert_eq!(&dst[d..d + len], &src[s..s + len], "len={len} s={s} d={d}");
+                    assert_eq!(dst[d + len], 0xCD, "overrun len={len} d={d}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn to_guest_matches_reference() {
+        let src: Vec<u8> = (0..512u32).map(|i| (i.wrapping_mul(17).wrapping_add(3)) as u8).collect();
+        for &len in LENS {
+            for s in 0..8usize {
+                for d in 0..8usize {
+                    if s + len > src.len() {
+                        continue;
+                    }
+                    let mut dst = vec![0xABu8; d + len + 1];
+                    unsafe {
+                        volatile_copy_to_guest(src.as_ptr().add(s), dst.as_mut_ptr().add(d), len);
+                    }
+                    assert_eq!(&dst[d..d + len], &src[s..s + len], "len={len} s={s} d={d}");
+                    assert_eq!(dst[d + len], 0xAB, "overrun len={len} d={d}");
+                }
+            }
+        }
     }
 }
 
