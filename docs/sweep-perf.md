@@ -7,7 +7,7 @@ native fork in a Linux VM; it was not) and how to speed up the LTP sweep.
 
 Instrumented with the new `carrick:::lifecycle(phase)` USDT probe (commit
 2b695b3) + the existing `fork-pre`/`fork-post`/`guest-exit` probes, traced via
-`scripts/trace-bootfork.d`. Anchor = first host syscall:
+`scripts/dtrace/trace-bootfork.d`. Anchor = first host syscall:
 
 | phase | cost | what |
 |---|---|---|
@@ -65,7 +65,7 @@ whole 1.9 GB rootfs into guest RAM each run — the sweep correctly uses
 - `carrick:::lifecycle(phase)` USDT — phase 4 = FIRST_VCPU_RUN (initial boot
   done; once-per-process, NOT re-fired across no-exec fork → cleanly "first
   boot"). Constants in `carrick_hvf::probes::phase`.
-- `scripts/trace-bootfork.d` — first-boot vs fork vs teardown.
-- `scripts/trace-lifecycle.d` — boot/guest/teardown + mmap accounting.
+- `scripts/dtrace/trace-bootfork.d` — first-boot vs fork vs teardown.
+- `scripts/dtrace/trace-lifecycle.d` — boot/guest/teardown + mmap accounting.
 - Note: `carrick trace --trace-out <file>` is broken (writes nothing) — use
   stdout + grep for non-interactive traces. See project_carrick_trace_traceout_bug.

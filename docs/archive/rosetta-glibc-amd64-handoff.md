@@ -176,7 +176,7 @@ commands, and known translated-code limitations.
 
 ### Syscall-copy alias tracing
 
-Added `guest-mem-*` USDT probes and `scripts/trace-guest-mem-copy.d` so Carrick
+Added `guest-mem-*` USDT probes and `scripts/dtrace/trace-guest-mem-copy.d` so Carrick
 can prove, at syscall-copy time, whether the mapping selected for a guest buffer
 matches the guest's live high-VA stage-1 translation. The trace reports:
 
@@ -189,7 +189,7 @@ matches the guest's live high-VA stage-1 translation. The trace reports:
 - checksum/head/tail fingerprints of the copied payload, avoiding DTrace reads
   from guest VAs
 
-`scripts/trace-write-buffers.d` adds a write-specific view: it pairs
+`scripts/dtrace/trace-write-buffers.d` adds a write-specific view: it pairs
 `syscall-entry`/`syscall-return` with the guest-memory probes, tracks a per-fd
 logical offset, and samples start/25%/50%/75%/last stage-1 offsets for each
 guest write-buffer range.
@@ -198,9 +198,9 @@ Validation:
 
 - `cargo test -p carrick-hvf --lib guest_mem_probe_digest -- --nocapture`
 - `cargo test -p carrick-hvf --lib guest_mem_probe_points -- --nocapture`
-- `carrick trace --script scripts/trace-guest-mem-copy.d ...` on the reduced
+- `carrick trace --script scripts/dtrace/trace-guest-mem-copy.d ...` on the reduced
   dash and gpgv workloads
-- `carrick trace --script scripts/trace-write-buffers.d ...` on reduced
+- `carrick trace --script scripts/dtrace/trace-write-buffers.d ...` on reduced
   `gpgv --output`
 
 ## Current known limitations
@@ -225,7 +225,7 @@ Current evidence:
   `read(fd=0, count=8192) -> 1366`, then EOF. The difference is after syscall
   delivery: Docker/Rosetta prints `1350`; Carrick/Rosetta reports the dash
   syntax error.
-- `scripts/trace-guest-mem-copy.d` on run id
+- `scripts/dtrace/trace-guest-mem-copy.d` on run id
   `trace-mem-dash-1780411328-76634` shows the fd-input `read(2)` checked write
   into `0x555555574ac0` was a high-VA `MATCH`:
   `va_off=0x2ac0`, `ipa_off=0x2ac0`. The payload fingerprint starts with the
@@ -264,7 +264,7 @@ Rosetta failed secure verification. Reduced evidence:
 - `carrick trace` shows `gpgv` reads both files through `read(2)`, not
   file-backed mmap, and there are no unhandled or partial syscalls.
 - `GCRYPT_DISABLE_HWF=all` does not change the failure.
-- `scripts/trace-guest-mem-copy.d` on run id
+- `scripts/dtrace/trace-guest-mem-copy.d` on run id
   `trace-mem-gpgv-1780411459-82811` reproduced `BADSIG` while reporting zero
   `MISMATCH` events, 2608 `MATCH` events, and 362 `NOSTAGE` events. The final
   `gpgv` process's checked-write buffers for the keyring and InRelease all
@@ -300,7 +300,7 @@ Rosetta failed secure verification. Reduced evidence:
   `26758a13cecfaff9ff274d31ea9a4633674a999bd130c09f6ecd66a4b8071184` for both.
   That removes gpgv's direct output-file open path and shell redirection as the
   differentiating branch.
-- `scripts/trace-write-buffers.d` on run id
+- `scripts/dtrace/trace-write-buffers.d` on run id
   `trace-write-point2-gpgv-1780413633-35877` shows the corrupted output write
   buffers are already wrong when Carrick copies them from guest memory. The bad
   8 KiB output chunks recur at cleartext offsets `57344`, `122880`, and

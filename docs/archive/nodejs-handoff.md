@@ -128,14 +128,14 @@ New probe files:
 Temporary diagnostics, likely do not commit as-is:
 
 - `scripts/node-worker-diagnose.js`
-- `scripts/trace-node-worker-events.d`
-- `scripts/trace-node-worker-profile.d`
+- `scripts/dtrace/trace-node-worker-events.d`
+- `scripts/dtrace/trace-node-worker-profile.d`
 
 Unrelated untracked files were already present and should be left alone:
 
 - `docs/cpython-baseline/*.jsonl`
-- `scripts/trace-mm-full.d`
-- `scripts/trace-node-stdio.d`
+- `scripts/dtrace/trace-mm-full.d`
+- `scripts/dtrace/trace-node-stdio.d`
 
 ## Scheduler gap
 
@@ -296,7 +296,7 @@ Log file from that run:
 /tmp/node-worker-sample-28714.log
 ```
 
-Trace evidence from `scripts/trace-node-worker-events.d`:
+Trace evidence from `scripts/dtrace/trace-node-worker-events.d`:
 
 - The root Node process does not reliably issue `exit_group(94)` on the leader
   path before the hang window.

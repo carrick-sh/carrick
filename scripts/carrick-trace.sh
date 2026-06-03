@@ -20,7 +20,7 @@ set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 carrick="$repo_root/target/release/carrick"
-script="$repo_root/scripts/syscalls.d"
+script="$repo_root/scripts/dtrace/syscalls.d"
 
 if [ ! -x "$carrick" ]; then
     echo "carrick-trace: $carrick not found; run 'cargo build --release' first" >&2

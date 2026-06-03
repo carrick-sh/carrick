@@ -13,16 +13,16 @@ use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_uint, c_void};
 use std::path::Path;
 
-/// Bundled D program. Mirrors `scripts/syscalls.d` so the build artifact
+/// Bundled D program. Mirrors `scripts/dtrace/syscalls.d` so the build artifact
 /// is self-contained.
-pub const BUNDLED_D_SCRIPT: &str = include_str!("../../../scripts/syscalls.d");
+pub const BUNDLED_D_SCRIPT: &str = include_str!("../../../scripts/dtrace/syscalls.d");
 
-/// Bundled guest stack-walker D program (`scripts/guest_stack.d`).
+/// Bundled guest stack-walker D program (`scripts/dtrace/guest_stack.d`).
 /// copyin-walks the guest aarch64 frame-pointer chain from the
 /// `vcpu-trap` probe's GuestRegs struct. Selected by `carrick trace
 /// --stack`. NOTE: uses `#define` macros, so it must be compiled with
 /// the C preprocessor enabled (DTRACE_C_CPP).
-pub const BUNDLED_GUEST_STACK_D: &str = include_str!("../../../scripts/guest_stack.d");
+pub const BUNDLED_GUEST_STACK_D: &str = include_str!("../../../scripts/dtrace/guest_stack.d");
 
 const DTRACE_VERSION: c_int = 3;
 const DTRACE_PROBESPEC_NAME: c_int = 3;
