@@ -104,6 +104,25 @@ pub fn run_carrick(bin: &PathBuf, repo_root: &Path, run_id: &str, probe_b64: &[u
     drain_with_deadline(child, repo_root, run_id)
 }
 
+/// Run the NATIVE macOS build of a probe directly — no carrick, no Docker, no
+/// VM (the host ceiling, the third "macos" engine). `native_bin` is the
+/// aarch64-apple-darwin binary from the bench-native crate; it self-times and
+/// prints the same key=value output as the guest probes. No base64/stdin
+/// injection, no run-id, no cleanup — it is just a host process.
+pub fn run_native(native_bin: &Path) -> String {
+    let out = match Command::new(native_bin)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => return format!("<native spawn failed: {e}>"),
+    };
+    let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
+    combined.push_str(&String::from_utf8_lossy(&out.stderr));
+    normalize(&combined)
+}
+
 /// Run `probe_b64` under Docker, pinned to 4 CPUs via --cpuset-cpus so `nproc`
 /// inside the container is 4 (CFS --cpus would NOT change nproc).
 pub fn run_docker(repo_root: &Path, run_id: &str, probe_b64: &[u8]) -> String {

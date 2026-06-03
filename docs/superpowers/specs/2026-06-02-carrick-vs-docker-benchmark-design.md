@@ -193,6 +193,18 @@ Net: the **"no-abstraction → IO wins" thesis holds for latency-bound small ops
 
 **2026-06-02 — zero-copy `sendto`/`recvfrom` (Fix B).** Removed the bounce buffer entirely on the socket hot path: a new `GuestMemory::host_ptr_for_read/write` returns the host VA of a guest buffer **iff the whole range is one contiguous mapped region** (`mapping_for_range`; for recv, `validate_guest_write_range(.., true)` so a read-only mapping falls back to the checked copy → EFAULT, not a kernel write through a raw ptr). The `sendto`/`recvfrom` handlers send straight out of / `recvfrom` straight into guest memory, falling back to the (word-fast) copy for multi-region or non-writable buffers. Safe because `blocking_io`'s op is `FnOnce` — an EAGAIN re-dispatches the whole handler, so the pointer never outlives a lock-releasing wait, and the issuing vCPU is quiesced during the op. **Result: `tcp_stream` carrick 8.9 → 16.4 GB/s; gap to Docker 2.4× → 1.32×** (full progression **4.3 → 8.9 → 16.4 GB/s, 3.8× total**, from 5.1× behind to near-parity). Controls held (`stat_storm` 1197 µs, `tcp_rr` ratio ~0.82 — both untouched). **Validated:** 6 differential socket/bulk probes MATCH, an exhaustive `volatile_copy` unit test, and the **full conformance suite green** (`4 passed; 0 failed`). Residual 1.32× is the architectural floor (HVF trap-per-syscall + the kernel's own socket-buffer copy). Harness note: `perf_*` probes are now excluded from the conformance gate (non-deterministic timing output), and the pre-existing host-saturation flake `pidnsinitreap` was quarantined to the serial lane.
 
+### Three-engine baseline: `macos` / `carrick` / `docker`
+
+A third engine was added: **`macos`** — the *native* host build of the same portable `perf_*` probes (a standalone `bench-native` crate referencing the identical source, `aarch64-apple-darwin`, run directly with no carrick/Docker/VM). It is the **ceiling** and the reference that **decomposes every gap into *emulation overhead* (engine vs its native ceiling) vs *stack difference* (native macOS vs Linux-in-VM)**. Caveat: macOS has no clean `cpuset`, so `macos` runs *unpinned* (all 10 cores; `cpu_pin=0`, real `nproc` recorded) while carrick/docker stay pinned to 4 — it is the host ceiling, not a 4-core-matched lane. The runner still samples strictly serially (macos → carrick → docker) and gates only carrick/docker on `nproc==4`.
+
+| workload | macos (ceiling) | carrick | docker | carrick/macos | docker/macos | reading |
+|---|---|---|---|---|---|---|
+| `tcp_rr` µs ↓ | 16.25 | 19.62 | 23.67 | **1.21×** | 1.46× | carrick adds only 21% over native and beats Docker; whole field above the Darwin-loopback floor |
+| `tcp_stream` GB/s ↑ | 18.99 | 16.46 | 21.85 | **0.87×** | 1.15× | carrick at 87% of its ceiling (≈13% emulation overhead post-zero-copy); Docker wins only because Linux loopback > Darwin loopback (1.15× native) — the residual is *stack*, not *emulator* |
+| `stat_storm` µs ↓ | 1.33 | 1200 | 0.46 | **~900×** | 0.34× | the 2615× splits into ~900× carrick cap-std amplification (fixable) × ~3× APFS-slower-than-ext4 (Docker is 0.34× native) — even a perfect carrick stat trails Docker ~3× from the FS stack alone |
+
+Takeaway: after the copy fixes, carrick's *emulation* overhead is small on network (≤21%); the disk-metadata gap is the remaining large, **fixable** emulation overhead (the cap-std re-walk), on top of an irreducible ~3× APFS-vs-ext4 stack penalty that no emulator can erase.
+
 ---
 
 ## 9. Threats to validity

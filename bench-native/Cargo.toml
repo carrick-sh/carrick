@@ -1,0 +1,31 @@
+# Native-macOS build of the portable perf probes, for the third benchmark
+# engine ("macos" = the host ceiling, no carrick, no Docker, no VM). These
+# bins reference the EXACT SAME source files as the static-musl conformance
+# probes (single source of truth) — they are pure std (no libc, no Linux
+# specifics), so they compile and run natively on aarch64-apple-darwin. The
+# conformance-probes crate's shared src/lib.rs is Linux-only and does NOT
+# compile on macOS, which is why this is a separate package that does not
+# depend on it. Standalone (excluded from the workspace), matching the
+# release profile of the musl probes so only the RUNTIME differs.
+[package]
+name = "bench-native"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "perf_net_tcp_rr"
+path = "../conformance-probes/src/bin/perf_net_tcp_rr.rs"
+
+[[bin]]
+name = "perf_net_tcp_stream"
+path = "../conformance-probes/src/bin/perf_net_tcp_stream.rs"
+
+[[bin]]
+name = "perf_disk_meta"
+path = "../conformance-probes/src/bin/perf_disk_meta.rs"
+
+[profile.release]
+opt-level = "z"
+strip = true
+panic = "abort"

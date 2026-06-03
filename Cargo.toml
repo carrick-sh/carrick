@@ -4,7 +4,7 @@ members = ["crates/*"]
 # conformance-probes is a STANDALONE crate (its own Cargo.lock) built as static
 # Linux/musl ELFs in a container by scripts/build-probes.sh, never as part of
 # the host workspace — exclude it so host `cargo` commands don't try to absorb it.
-exclude = ["fixtures/*", "crates/*/fixtures/*", "conformance-probes"]
+exclude = ["fixtures/*", "crates/*/fixtures/*", "conformance-probes", "bench-native"]
 
 [workspace.package]
 version = "0.1.0"
