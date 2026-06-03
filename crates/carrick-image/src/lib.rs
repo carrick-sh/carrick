@@ -437,6 +437,51 @@ pub async fn pull_image_with_platform(
     Ok(summary)
 }
 
+/// Reorder `items` to match the layer order in `manifest`, keyed by digest.
+/// `digest_of` extracts each item's digest (owned, since `ImageLayer` computes
+/// it on demand); `bucket_noun`/`extra_verb` thread the two call sites' distinct
+/// error wording ("layer" vs "layer summary", "downloaded" vs "cached").
+fn reorder_to_manifest_order<T>(
+    manifest: &OciImageManifest,
+    items: Vec<T>,
+    digest_of: impl Fn(&T) -> String,
+    bucket_noun: &str,
+    extra_verb: &str,
+) -> Result<Vec<T>, OciBootstrapError> {
+    let mut by_digest: HashMap<String, Vec<T>> = HashMap::with_capacity(items.len());
+    for item in items {
+        by_digest.entry(digest_of(&item)).or_default().push(item);
+    }
+
+    let mut ordered = Vec::with_capacity(manifest.layers.len());
+    for descriptor in &manifest.layers {
+        let Some(mut bucket) = by_digest.remove(&descriptor.digest) else {
+            return Err(OciBootstrapError::InvalidDigest(format!(
+                "manifest referenced missing layer {}",
+                descriptor.digest
+            )));
+        };
+        let Some(item) = bucket.pop() else {
+            return Err(OciBootstrapError::InvalidDigest(format!(
+                "manifest {bucket_noun} bucket unexpectedly empty for {}",
+                descriptor.digest
+            )));
+        };
+        if !bucket.is_empty() {
+            by_digest.insert(descriptor.digest.clone(), bucket);
+        }
+        ordered.push(item);
+    }
+
+    if let Some(extra) = by_digest.keys().next() {
+        return Err(OciBootstrapError::InvalidDigest(format!(
+            "{extra_verb} unreferenced layer {extra}"
+        )));
+    }
+
+    Ok(ordered)
+}
+
 fn layers_in_manifest_order(
     manifest: Option<&OciImageManifest>,
     layers: Vec<ImageLayer>,
@@ -444,83 +489,26 @@ fn layers_in_manifest_order(
     let Some(manifest) = manifest else {
         return Ok(layers);
     };
-
-    let mut by_digest: HashMap<String, Vec<ImageLayer>> = HashMap::with_capacity(layers.len());
-    for layer in layers {
-        by_digest
-            .entry(layer.sha256_digest())
-            .or_default()
-            .push(layer);
-    }
-
-    let mut ordered = Vec::with_capacity(manifest.layers.len());
-    for descriptor in &manifest.layers {
-        let Some(mut bucket) = by_digest.remove(&descriptor.digest) else {
-            return Err(OciBootstrapError::InvalidDigest(format!(
-                "manifest referenced missing layer {}",
-                descriptor.digest
-            )));
-        };
-        let Some(layer) = bucket.pop() else {
-            return Err(OciBootstrapError::InvalidDigest(format!(
-                "manifest layer bucket unexpectedly empty for {}",
-                descriptor.digest
-            )));
-        };
-        if !bucket.is_empty() {
-            by_digest.insert(descriptor.digest.clone(), bucket);
-        }
-        ordered.push(layer);
-    }
-
-    if let Some(extra) = by_digest.keys().next() {
-        return Err(OciBootstrapError::InvalidDigest(format!(
-            "downloaded unreferenced layer {extra}"
-        )));
-    }
-
-    Ok(ordered)
+    reorder_to_manifest_order(
+        manifest,
+        layers,
+        ImageLayer::sha256_digest,
+        "layer",
+        "downloaded",
+    )
 }
 
 fn layer_summaries_in_manifest_order(
     manifest: &OciImageManifest,
     layers: Vec<LayerSummary>,
 ) -> Result<Vec<LayerSummary>, OciBootstrapError> {
-    let mut by_digest: HashMap<String, Vec<LayerSummary>> = HashMap::with_capacity(layers.len());
-    for layer in layers {
-        by_digest
-            .entry(layer.digest.clone())
-            .or_default()
-            .push(layer);
-    }
-
-    let mut ordered = Vec::with_capacity(manifest.layers.len());
-    for descriptor in &manifest.layers {
-        let Some(mut bucket) = by_digest.remove(&descriptor.digest) else {
-            return Err(OciBootstrapError::InvalidDigest(format!(
-                "manifest referenced missing layer {}",
-                descriptor.digest
-            )));
-        };
-        let Some(layer) = bucket.pop() else {
-            return Err(OciBootstrapError::InvalidDigest(format!(
-                "manifest layer summary bucket unexpectedly empty for {}",
-                descriptor.digest
-            )));
-        };
-        if !bucket.is_empty() {
-            by_digest.insert(descriptor.digest.clone(), bucket);
-        }
-        ordered.push(layer);
-    }
-
-    if let Some(extra) = by_digest.keys().next() {
-        return Err(OciBootstrapError::InvalidDigest(format!(
-            "cached unreferenced layer {extra}"
-        )));
-    }
-
-    Ok(ordered)
+    reorder_to_manifest_order(
+        manifest,
+        layers,
+        |l| l.digest.clone(),
+        "layer summary",
+        "cached",
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
