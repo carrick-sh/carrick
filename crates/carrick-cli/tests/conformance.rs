@@ -1024,6 +1024,12 @@ const TIMING_SENSITIVE_PROBES: &[&str] = &[
     // 8-way gate load while a DIFFERENT probe flaked the next run — the
     // signature of host-saturation jitter, not a code regression. Serial lane.
     "waitsiblingsigchld",
+    // pidnsinitreap: the orphan polls getppid() for reparent-to-init within a
+    // bounded ~2.5s window; under the 8-way gate load the NsSupervisor reparent
+    // translation can miss the window and the orphan's pipe report is lost
+    // (grandchild_report_ok=false). MATCHes 6/6 standalone — same host-saturation
+    // jitter class as sigchld/waitsiblingsigchld, not a code regression.
+    "pidnsinitreap",
 ];
 
 fn is_timing_sensitive(probe: &std::path::Path) -> bool {
@@ -1178,7 +1184,12 @@ fn conformance_probes() {
             .filter(|p| {
                 p.file_name()
                     .and_then(|n| n.to_str())
-                    .map(|n| !GATE_SKIP_PROBES.contains(&n))
+                    // Exclude gate-skip probes AND the perf_* benchmark probes:
+                    // perf_* print non-deterministic timing (MB/s, us) consumed
+                    // by the perf gate (tests/perf_runner.rs); they live in
+                    // src/bin/ only to share build-probes.sh and have no place in
+                    // a differential CORRECTNESS diff (their output never matches).
+                    .map(|n| !GATE_SKIP_PROBES.contains(&n) && !n.starts_with("perf_"))
                     .unwrap_or(true)
             })
             .collect();
