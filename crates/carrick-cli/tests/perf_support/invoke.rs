@@ -1,0 +1,121 @@
+//! Run a base64-injected probe under carrick and under Docker, returning the
+//! guest's combined stdout+stderr. Mirrors conformance.rs's run_*_probe path
+//! (PROBE_SNIPPET stdin injection, per-sample CARRICK_RUN_ID, deadline watcher,
+//! scoped cleanup) with perf-specific CPU normalization. SERIAL ONLY: callers
+//! must run carrick and docker for the same sample non-concurrently.
+use std::io::Write;
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+const PROBE_SNIPPET: &str = "base64 -d > /tmp/p && chmod +x /tmp/p && /tmp/p";
+const SAMPLE_DEADLINE: Duration = Duration::from_secs(60);
+const PLATFORM: &str = "linux/arm64";
+pub const IMAGE: &str = "docker.io/library/ubuntu:24.04";
+/// `nproc` both engines must report for a normalized sample.
+pub const CPU_PIN: u32 = 4;
+
+static SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Per-sample run id, stamped into the carrick guest title for scoped cleanup.
+pub fn perf_run_id() -> String {
+    format!("cr-perf-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed))
+}
+
+fn scoped_kill_guests(repo_root: &Path, run_id: &str) {
+    let _ = Command::new("sudo")
+        .arg("-n")
+        .arg(repo_root.join("scripts/sudo/kill.sh"))
+        .arg(run_id)
+        .output();
+}
+
+fn normalize(s: &str) -> String {
+    s.lines()
+        .filter(|l| !l.contains("case-insensitive; defaulting") && !l.contains("Pass `--fs host`"))
+        .map(|l| l.trim_end())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Drain a child with a wall-clock deadline; on timeout SIGKILL the process
+/// group and scoped-reap any escaped carrick guests. Returns combined output.
+fn drain_with_deadline(mut child: std::process::Child, repo_root: &Path, run_id: &str) -> String {
+    let pid = child.id() as i32;
+    let done = Arc::new(AtomicBool::new(false));
+    let watcher = {
+        let done = Arc::clone(&done);
+        let repo_root = repo_root.to_path_buf();
+        let run_id = run_id.to_string();
+        std::thread::spawn(move || {
+            let start = Instant::now();
+            while !done.load(Ordering::Relaxed) {
+                if start.elapsed() > SAMPLE_DEADLINE {
+                    unsafe { libc::kill(-pid, libc::SIGKILL) };
+                    scoped_kill_guests(&repo_root, &run_id);
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            false
+        })
+    };
+    let out = child.wait_with_output().expect("wait child");
+    done.store(true, Ordering::Relaxed);
+    if watcher.join().unwrap_or(false) {
+        return format!("<TIMEOUT after {}s>", SAMPLE_DEADLINE.as_secs());
+    }
+    let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
+    combined.push_str(&String::from_utf8_lossy(&out.stderr));
+    normalize(&combined)
+}
+
+fn feed_stdin(child: &mut std::process::Child, bytes: &[u8]) {
+    let mut stdin = child.stdin.take().expect("stdin");
+    let bytes = bytes.to_vec();
+    std::thread::spawn(move || {
+        let _ = stdin.write_all(&bytes);
+    });
+}
+
+/// Run `probe_b64` under carrick (cold lane: a fresh `carrick run`), with
+/// CARRICK_EXPOSED_CPUS=CPU_PIN. `repo_root` is the workspace root; `run_id` is
+/// reaped on timeout. Returns combined guest output.
+pub fn run_carrick(bin: &PathBuf, repo_root: &Path, run_id: &str, probe_b64: &[u8]) -> String {
+    let mut child = Command::new(bin)
+        .args([
+            "run", "--platform", PLATFORM, "--raw", "--fs", "host",
+            IMAGE, "/bin/sh", "-c", PROBE_SNIPPET,
+        ])
+        .env("CARRICK_RUN_ID", run_id)
+        .env("CARRICK_EXPOSED_CPUS", CPU_PIN.to_string())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .expect("spawn carrick");
+    feed_stdin(&mut child, probe_b64);
+    drain_with_deadline(child, repo_root, run_id)
+}
+
+/// Run `probe_b64` under Docker, pinned to 4 CPUs via --cpuset-cpus so `nproc`
+/// inside the container is 4 (CFS --cpus would NOT change nproc).
+pub fn run_docker(repo_root: &Path, run_id: &str, probe_b64: &[u8]) -> String {
+    let mut child = Command::new("docker")
+        .args([
+            "run", "-i", "--rm", "--platform", PLATFORM, "--cpuset-cpus", "0-3",
+            IMAGE, "/bin/sh", "-c", PROBE_SNIPPET,
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn docker");
+    feed_stdin(&mut child, probe_b64);
+    // Docker side has no carrick guests to reap; run_id only labels the sample.
+    drain_with_deadline(child, repo_root, run_id)
+}
