@@ -29,6 +29,14 @@ path = "../conformance-probes/src/bin/perf_disk_meta.rs"
 name = "perf_disk_vol"
 path = "../conformance-probes/src/bin/perf_disk_vol.rs"
 
+[[bin]]
+name = "perf_net_xserver"
+path = "../conformance-probes/src/bin/perf_net_xserver.rs"
+
+[[bin]]
+name = "perf_net_xclient"
+path = "../conformance-probes/src/bin/perf_net_xclient.rs"
+
 [profile.release]
 opt-level = "z"
 strip = true
