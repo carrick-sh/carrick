@@ -674,15 +674,16 @@ mod tests {
     /// back into real_in; it appears at real_app instead.
     ///
     /// Fd ownership:
-    ///   - real_app  : owned by `app_file`; we mem::forget it after use to
-    ///                 avoid closing it while the relay might still reference
-    ///                 real_term (same underlying socket object).  We close it
-    ///                 manually at the end via a dup'd fd.
-    ///   - real_term : the relay holds it for the duration; we do NOT wrap it
-    ///                 in a File (no drop needed).
-    ///   - slave     : owned by `slave_file`; we mem::forget it before stop()
-    ///                 because stop() closes pair.slave_fd.
-    ///   - master    : owned by the relay (stop() closes it).
+    ///
+    /// - real_app  : owned by `app_file`; we mem::forget it after use to
+    ///   avoid closing it while the relay might still reference real_term
+    ///   (same underlying socket object).  We close it manually at the end
+    ///   via a dup'd fd.
+    /// - real_term : the relay holds it for the duration; we do NOT wrap it
+    ///   in a File (no drop needed).
+    /// - slave     : owned by `slave_file`; we mem::forget it before stop()
+    ///   because stop() closes pair.slave_fd.
+    /// - master    : owned by the relay (stop() closes it).
     #[test]
     fn relay_copies_both_directions_and_stops_on_eof() {
         use std::io::{Read, Write};

@@ -203,7 +203,7 @@ unsafe fn discover_and_relocate() -> Option<Buffer> {
             if p.is_null() {
                 return None;
             }
-            if (p as *const libc::c_char) != cursor {
+            if !std::ptr::eq(p, cursor) {
                 return None;
             }
             let l = libc::strlen(p);
@@ -228,7 +228,7 @@ unsafe fn discover_and_relocate() -> Option<Buffer> {
                     break;
                 }
                 if still_contiguous {
-                    if (p as *const libc::c_char) == cursor {
+                    if std::ptr::eq(p, cursor) {
                         let l = libc::strlen(p);
                         end = (p as *const u8).add(l) as *const libc::c_char;
                         cursor = end.add(1);

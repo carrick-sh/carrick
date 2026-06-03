@@ -261,7 +261,7 @@ pub const LINUX_ROSETTA_WINDOW_SIZE: u64 = 0x20_0000; // 2 MiB (one L2 block; Ro
 
 /// True if `va` falls in the Rosetta high-VA alias window.
 pub fn is_rosetta_va(va: u64) -> bool {
-    va >= LINUX_ROSETTA_VA_BASE && va < LINUX_ROSETTA_VA_BASE + LINUX_ROSETTA_WINDOW_SIZE
+    (LINUX_ROSETTA_VA_BASE..LINUX_ROSETTA_VA_BASE + LINUX_ROSETTA_WINDOW_SIZE).contains(&va)
 }
 
 // ── Dynamic high-VA mmap alias arena ─────────────────────────────────────────
@@ -1773,7 +1773,7 @@ mod arena_size_tests {
         assert_eq!(resolve_arena_size(Some(1000)), LINUX_MMAP_SIZE_MAX);
         assert_eq!(resolve_arena_size(Some(u64::MAX)), LINUX_MMAP_SIZE_MAX);
         // The arena never collides with the interpreter base.
-        assert!(LINUX_MMAP_BASE + LINUX_MMAP_SIZE_MAX <= LINUX_INTERPRETER_BASE);
+        const { assert!(LINUX_MMAP_BASE + LINUX_MMAP_SIZE_MAX <= LINUX_INTERPRETER_BASE) };
     }
 }
 
@@ -2173,7 +2173,7 @@ mod stage1_tests {
         let end_off = (LINUX_EL1_MAINT_BASE - LINUX_KERNEL_REGION_BASE) + LINUX_EL1_MAINT_SIZE;
         assert!(end_off <= 0x200000);
         // ...and does not overlap the page-table region just below it.
-        assert!(LINUX_EL1_MAINT_BASE >= LINUX_PAGE_TABLES_BASE + LINUX_PAGE_TABLES_SIZE);
+        const { assert!(LINUX_EL1_MAINT_BASE >= LINUX_PAGE_TABLES_BASE + LINUX_PAGE_TABLES_SIZE) };
     }
 
     #[test]

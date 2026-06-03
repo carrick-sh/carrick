@@ -19,6 +19,11 @@
 //! - `thread_stress_harness` — shells out to a script via a CWD-relative path,
 //!   sensitive to any sibling test that changes the process CWD.
 
+// Each integration submodule includes the shared `support` helper via
+// `#[path = "common/syscall_support.rs"] mod support;` so it stays self-
+// contained; that loads the same file once per submodule in this single binary.
+#![allow(clippy::duplicate_mod)]
+
 mod address_space;
 mod compat_report;
 mod concurrency_contracts;

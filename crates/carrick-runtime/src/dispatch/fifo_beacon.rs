@@ -61,7 +61,7 @@ pub(crate) fn register_open(host_fd: i32, access_idx: u32) {
     let Some(id) = fifo_identity(host_fd) else {
         return;
     };
-    let mut st = STATE.lock().unwrap();
+    let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
     let has_write = access_idx != 0;
     let has_read = access_idx != 1;
     if has_write {
@@ -117,7 +117,7 @@ pub(crate) fn register_open(host_fd: i32, access_idx: u32) {
 /// caller should then wake epoll/poll so read-ends re-check the beacon — the
 /// close may have dropped the writer count to zero).
 pub(crate) fn register_close(host_fd: i32) -> bool {
-    let mut st = STATE.lock().unwrap();
+    let mut st = STATE.lock().unwrap_or_else(|e| e.into_inner());
     st.read_ends.remove(&host_fd);
     // Find which FIFO (if any) this fd was a writer for.
     let mut writer_of = None;
@@ -128,10 +128,10 @@ pub(crate) fn register_close(host_fd: i32) -> bool {
         }
     }
     if let Some(id) = writer_of {
-        if let Some(b) = st.beacons.get_mut(&id) {
-            if let Some(bw) = b.writer_bw.remove(&host_fd) {
-                unsafe { libc::close(bw) };
-            }
+        if let Some(b) = st.beacons.get_mut(&id)
+            && let Some(bw) = b.writer_bw.remove(&host_fd)
+        {
+            unsafe { libc::close(bw) };
         }
         return true;
     }
@@ -144,7 +144,7 @@ pub(crate) fn register_close(host_fd: i32) -> bool {
 /// unlike FIFO HUP. A read on the real FIFO then returns 0 (EOF), which macOS
 /// also delivers correctly.
 pub(crate) fn read_end_at_eof(host_fd: i32) -> bool {
-    let st = STATE.lock().unwrap();
+    let st = STATE.lock().unwrap_or_else(|e| e.into_inner());
     let Some(id) = st.read_ends.get(&host_fd) else {
         return false;
     };

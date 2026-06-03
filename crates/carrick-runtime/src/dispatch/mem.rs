@@ -179,16 +179,16 @@ impl SyscallDispatcher {
         if let crate::shared_aperture::BackingObject::SharedFile { host_fd, offset } = alloc.backing
         {
             let len = usize::try_from(alloc.len).unwrap_or(0);
-            if len > 0 {
-                if let Ok(bytes) = cx.memory.read_bytes(alloc.guest_addr, len) {
-                    unsafe {
-                        libc::pwrite(
-                            host_fd,
-                            bytes.as_ptr() as *const _,
-                            bytes.len(),
-                            offset as libc::off_t,
-                        );
-                    }
+            if len > 0
+                && let Ok(bytes) = cx.memory.read_bytes(alloc.guest_addr, len)
+            {
+                unsafe {
+                    libc::pwrite(
+                        host_fd,
+                        bytes.as_ptr() as *const _,
+                        bytes.len(),
+                        offset as libc::off_t,
+                    );
                 }
             }
             if close_fd {
@@ -276,11 +276,10 @@ impl SyscallDispatcher {
             // them off the ring fd with offset = IORING_OFF_*. Hand back the
             // address carrick placed them at, so guest and runtime share the
             // same coherent ring memory.
-            if flags & LINUX_MAP_ANONYMOUS == 0 && fd.0 >= 0 {
-                if let Some(addr) = this.io_uring_mmap_addr(fd.0, offset) {
+            if flags & LINUX_MAP_ANONYMOUS == 0 && fd.0 >= 0
+                && let Some(addr) = this.io_uring_mmap_addr(fd.0, offset) {
                     return Ok(DispatchOutcome::Returned { value: addr as i64 });
                 }
-            }
 
             if flags & LINUX_MAP_FIXED_NOREPLACE != 0 {
                 flags |= LINUX_MAP_FIXED;
@@ -1002,8 +1001,8 @@ impl SyscallDispatcher {
             // but reclaiming an overlapping source would unmap the live copy).
             let dst_overlaps_src = new_addr < old_address.0.wrapping_add(old_size)
                 && old_address.0 < new_addr.wrapping_add(new_size);
-            if flags & LINUX_MREMAP_DONTUNMAP == 0 && !dst_overlaps_src {
-                if let Some(old_size_a) = align_up_u64(old_size, LINUX_PAGE_SIZE)
+            if flags & LINUX_MREMAP_DONTUNMAP == 0 && !dst_overlaps_src
+                && let Some(old_size_a) = align_up_u64(old_size, LINUX_PAGE_SIZE)
                     && let Ok(old_len) = usize::try_from(old_size_a)
                     && old_len > 0
                 {
@@ -1027,7 +1026,6 @@ impl SyscallDispatcher {
                         free_regions_insert(&mut mem.free_regions, old_address.0, old_size_a);
                     }
                 }
-            }
             Ok(DispatchOutcome::Returned {
                 value: new_addr as i64,
             })

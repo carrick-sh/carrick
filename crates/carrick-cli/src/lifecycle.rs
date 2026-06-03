@@ -372,7 +372,7 @@ pub(crate) fn ps(
 ) -> anyhow::Result<()> {
     let mut containers = container::list();
     // Stable, newest-first by creation time.
-    containers.sort_by(|a, b| b.created_secs.cmp(&a.created_secs));
+    containers.sort_by_key(|c| std::cmp::Reverse(c.created_secs));
 
     let rows: Vec<(&ContainerState, ContainerStatus)> = containers
         .iter()
@@ -394,8 +394,8 @@ pub(crate) fn ps(
     }
 
     println!(
-        "{:<14}{:<22}{:<26}{:<22}{:<20}{:<8}{}",
-        "CONTAINER ID", "IMAGE", "COMMAND", "CREATED", "STATUS", "PORTS", "NAMES"
+        "{:<14}{:<22}{:<26}{:<22}{:<20}{:<8}NAMES",
+        "CONTAINER ID", "IMAGE", "COMMAND", "CREATED", "STATUS", "PORTS"
     );
     for (c, st) in &rows {
         println!(
@@ -435,8 +435,8 @@ pub(crate) fn system_df(store: &carrick_image::ImageStore) -> anyhow::Result<()>
         }
     }
     println!(
-        "{:<16}{:<8}{:<8}{:<12}{}",
-        "TYPE", "TOTAL", "ACTIVE", "SIZE", "RECLAIMABLE"
+        "{:<16}{:<8}{:<8}{:<12}RECLAIMABLE",
+        "TYPE", "TOTAL", "ACTIVE", "SIZE"
     );
     println!(
         "{:<16}{:<8}{:<8}{:<12}{}",

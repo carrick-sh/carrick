@@ -746,11 +746,13 @@ pub enum DispatchOutcome {
     /// BOTH input and output (unlike `poll`'s separate `events`/`revents`).
     /// The handler therefore leaves the guest fd-sets UNMODIFIED across the
     /// wait, so:
-    ///   - a `Ready` re-dispatch re-reads the original input sets and reports
-    ///     the now-ready fds (a fd that becomes ready *during* the block — the
-    ///     primary use of select — is found correctly), and
-    ///   - an `Interrupted` (EINTR) return leaves the sets unmodified, exactly
-    ///     as Linux specifies on signal interruption.
+    ///
+    /// - a `Ready` re-dispatch re-reads the original input sets and reports
+    ///   the now-ready fds (a fd that becomes ready *during* the block — the
+    ///   primary use of select — is found correctly), and
+    /// - an `Interrupted` (EINTR) return leaves the sets unmodified, exactly
+    ///   as Linux specifies on signal interruption.
+    ///
     /// Only `TimedOut` must present zeroed sets (select returns 0 with empty
     /// sets), which the runtime does by zeroing each `clear_on_timeout`
     /// `(guest_addr, byte_len)` range before completing the syscall with 0.
@@ -1537,14 +1539,14 @@ impl SyscallDispatcher {
         let last_ref = Arc::strong_count(&open_file.description) == 1;
         let mut pty_master_index = None;
         let mut fifo_host_fd = None;
-        if last_ref {
-            if let OpenDescription::HostPipe { pty, host_fd, .. } = &*open_file.description.read() {
-                fifo_host_fd = Some(*host_fd);
-                if let Some(role) = pty {
-                    if role.is_master {
-                        pty_master_index = Some(role.index);
-                    }
-                }
+        if last_ref
+            && let OpenDescription::HostPipe { pty, host_fd, .. } = &*open_file.description.read()
+        {
+            fifo_host_fd = Some(*host_fd);
+            if let Some(role) = pty
+                && role.is_master
+            {
+                pty_master_index = Some(role.index);
             }
         }
         close_open_file(open_file);
@@ -1556,10 +1558,10 @@ impl SyscallDispatcher {
         // A FIFO write-end close drops a beacon writer — wake epoll/poll so FIFO
         // read-ends re-check the (kernel-decided) EOF (see dispatch::fifo_beacon).
         // No-op for non-FIFO host pipes.
-        if let Some(host_fd) = fifo_host_fd {
-            if crate::dispatch::fifo_beacon::register_close(host_fd) {
-                crate::dispatch::notify_inmem_epoll();
-            }
+        if let Some(host_fd) = fifo_host_fd
+            && crate::dispatch::fifo_beacon::register_close(host_fd)
+        {
+            crate::dispatch::notify_inmem_epoll();
         }
     }
 

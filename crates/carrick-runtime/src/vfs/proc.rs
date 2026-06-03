@@ -1938,10 +1938,7 @@ Pid:\t{pid}\nPPid:\t{ppid}\nThreads:\t{n}\n",
     // value the guest passed).
     let ns_enabled = crate::namespace::pid::enabled();
     let host_pid = if ns_enabled {
-        match crate::namespace::pid::ns_to_host_or_self(pid) {
-            Some(h) => h,
-            None => return None,
-        }
+        crate::namespace::pid::ns_to_host_or_self(pid)?
     } else {
         pid
     };

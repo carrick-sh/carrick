@@ -149,15 +149,18 @@ mod setid {
     ) -> Result<(u32, u32, u32), ()> {
         let (old_real, old_eff, old_saved) = cur;
         if !privileged {
-            if let Some(nr) = r {
-                if nr != old_real && nr != old_eff {
-                    return Err(());
-                }
+            if let Some(nr) = r
+                && nr != old_real
+                && nr != old_eff
+            {
+                return Err(());
             }
-            if let Some(ne) = e {
-                if ne != old_real && ne != old_eff && ne != old_saved {
-                    return Err(());
-                }
+            if let Some(ne) = e
+                && ne != old_real
+                && ne != old_eff
+                && ne != old_saved
+            {
+                return Err(());
             }
         }
         let real = r.unwrap_or(old_real);

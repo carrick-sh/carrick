@@ -263,6 +263,7 @@ fn is_signed_with_hypervisor(bin: &PathBuf) -> bool {
 /// a plain `cargo build`. The binary is per-worktree (build-signed materialises
 /// ./target/release/carrick even under a shared CARGO_TARGET_DIR), so signing
 /// it never disturbs another worktree's binary.
+#[allow(clippy::panic)]
 fn ensure_signed(bin: &PathBuf) {
     if is_signed_with_hypervisor(bin) {
         return;

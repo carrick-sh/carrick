@@ -915,10 +915,10 @@ fn sysv_semctl<M: GuestMemory>(
     match cmd {
         LINUX_IPC_RMID | LINUX_GETPID | LINUX_GETVAL | LINUX_GETNCNT | LINUX_GETZCNT => {
             let rc = unsafe { libc::semctl(semid, semnum, host_cmd) };
-            return match rc.host_syscall_errno() {
+            match rc.host_syscall_errno() {
                 Ok(v) => Ok(DispatchOutcome::Returned { value: v as i64 }),
                 Err(errno) => Ok(DispatchOutcome::errno(errno)),
-            };
+            }
         }
         LINUX_SETVAL => {
             // arg is `union semun { int val }`. Linux requires the value be in
@@ -930,10 +930,10 @@ fn sysv_semctl<M: GuestMemory>(
                 return Ok(DispatchOutcome::errno(crate::linux_abi::LINUX_ERANGE));
             }
             let rc = unsafe { libc::semctl(semid, semnum, host_cmd, val) };
-            return match rc.host_syscall_errno() {
+            match rc.host_syscall_errno() {
                 Ok(_) => Ok(DispatchOutcome::Returned { value: 0 }),
                 Err(errno) => Ok(DispatchOutcome::errno(errno)),
-            };
+            }
         }
         LINUX_GETALL | LINUX_SETALL => {
             // arg is `unsigned short *array`. Find nsems via IPC_STAT.

@@ -192,7 +192,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 &path,
                 dispatcher,
                 argv,
-                elf_env.into_iter(),
+                elf_env,
                 max_traps,
                 debug_state_path.as_ref(),
             )
@@ -252,8 +252,8 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 }
             } else {
                 println!(
-                    "{:<28}{:<14}{:<16}{:<24}{}",
-                    "REPOSITORY", "TAG", "IMAGE ID", "CREATED", "SIZE"
+                    "{:<28}{:<14}{:<16}{:<24}SIZE",
+                    "REPOSITORY", "TAG", "IMAGE ID", "CREATED"
                 );
                 for img in &images {
                     println!(
