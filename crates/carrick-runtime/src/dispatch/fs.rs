@@ -1838,6 +1838,16 @@ impl SyscallDispatcher {
             return self.resolve_dotdot_symlink_aware(&anchor, path);
         }
         let abs = join_rootfs_path(&anchor, path);
+        // Fast path: ONE kernel-walked openat+F_GETPATH of the PARENT chain
+        // replaces both per-component O(K²) passes below (validate_intermediate_
+        // dirs + resolve_intermediate_symlinks) for the common case — every
+        // intermediate exists, is a directory, and involves no symlink or
+        // Unicode-alias redirection. Anything non-trivial → the exact slow path.
+        match self.fs.rootfs_vfs.overlay.validate_parents_fast(&abs) {
+            crate::fs_backend::ParentResolve::AllDirsNoSymlink => return Ok(abs),
+            crate::fs_backend::ParentResolve::NotDir => return Err(LINUX_ENOTDIR),
+            crate::fs_backend::ParentResolve::Slow => {}
+        }
         // ENOTDIR: an existing intermediate component that is not a directory
         // can't be traversed. carrick previously let the final lookup return
         // ENOENT (or leniently resolved through it). Synthesize ENOTDIR here so
