@@ -1788,7 +1788,7 @@ pub const LINUX_MAP_FIXED_NOREPLACE: u64 = 0x10_0000;
 /// page under memory pressure. glibc's vDSO getrandom maps its per-thread state
 /// with `MAP_ANONYMOUS|MAP_DROPPABLE` (flags 0x28); carrick accepts it and
 /// treats it as a normal private-anon mapping — the drop-under-pressure
-/// semantics are not needed for correctness (docs/vdso-getrandom-design.md).
+/// semantics are not needed for correctness (docs/archive/vdso-getrandom-design.md).
 pub const LINUX_MAP_DROPPABLE: u64 = 0x8;
 /// Advisory hint flags carrick accepts and ignores (no observable effect on
 /// the mapping's contents): stack/grows-down placement, swap reservation,

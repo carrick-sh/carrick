@@ -168,7 +168,7 @@ NOT bugs — both feature additions for a future session:
   extract preadv/pwritev body to a shared method (like chmod_at) + 2 new handlers
   that accept the RWF_* flag set (RWF_HIPRI as a no-op hint) and delegate.
 - **test_unshare_setns**: needs /proc/self/ns/uts (and the other ns symlinks) —
-  the procfs roadmap's "ns namespace symlinks" item (docs/procfs-conformance-roadmap.md).
+  the procfs roadmap's "ns namespace symlinks" item (docs/archive/procfs-conformance-roadmap.md).
 
 ## Full-suite sweep + frontier triage (2026-06-01) — 34/41 MATCH
 

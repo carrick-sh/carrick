@@ -3,7 +3,7 @@
 # ⚠️  DO NOT set the linker to lld here (`-fuse-ld=lld`).
 #
 # It is tempting (lld links the 44k-line carrick-runtime rlib far faster — see
-# docs/build-decomposition-design.md), but it BREAKS `carrick trace`. Root cause:
+# docs/archive/build-decomposition-design.md), but it BREAKS `carrick trace`. Root cause:
 # the `usdt` 0.6 crate hardcodes the macOS "Linker" backend (usdt-impl build.rs:
 # `Some("macos") => Backend::Linker`), which depends on Apple ld64's proprietary
 # DTrace probe-processing pass to synthesize the `__dof_carrick` Mach-O section.

@@ -57,7 +57,7 @@
 //! `carrick-runtime` to stay one monolithic ~41k-line crate: `GuestMemory` and
 //! `MemoryError` were defined in `dispatch/mod.rs`, yet `memory.rs` depended on
 //! them, while `dispatch` depends back on `memory`. Lifting the hub types here
-//! cuts the cycle (docs/build-decomposition-design.md §3.A-A2) so `memory` and
+//! cuts the cycle (docs/archive/build-decomposition-design.md §3.A-A2) so `memory` and
 //! `dispatch` can later become independent crates and editing a syscall handler
 //! no longer recompiles the address-space code (and vice versa). The crate is
 //! kept deliberately tiny and dependency-light — only primitives,

@@ -685,7 +685,7 @@ pub(super) fn guest_visible_tid(
 
 // `Aarch64SyscallFrame`, `GuestMemory`, and `MemoryError` were lifted into the
 // leaf crate `carrick-guest-mem` to break the `memory ↔ dispatch` cycle (see
-// docs/build-decomposition-design.md §3.A-A2). Re-exported here so every
+// docs/archive/build-decomposition-design.md §3.A-A2). Re-exported here so every
 // `crate::dispatch::{…}` / `carrick_runtime::dispatch::{…}` site is unchanged.
 pub use carrick_guest_mem::{Aarch64SyscallFrame, GuestMemory, MemoryError};
 

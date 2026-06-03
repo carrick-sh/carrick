@@ -3,7 +3,7 @@
 //! `test_parent_process` hang where a server forked+exec'd from a forkserver
 //! worker fails to function, and ANY `eprintln`/dtrace instrumentation perturbs
 //! the race enough to change the manifestation (see
-//! `docs/forkserver-parent-process-deadlock.md`).
+//! `docs/archive/forkserver-parent-process-deadlock.md`).
 //!
 //! Recording is hot-path-cheap and ALWAYS ON: an atomic `fetch_add` index + two
 //! atomic `store`s into a fixed array — no lock, no syscall, no allocation, ~ns.
