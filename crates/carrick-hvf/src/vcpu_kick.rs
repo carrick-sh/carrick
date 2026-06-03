@@ -16,8 +16,8 @@
 //! and removes it on exit. A signalling thread (running a `tgkill` syscall, or
 //! the process-directed signal pump) looks the target up and kicks it.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::Mutex;
 
 use crate::thread::ThreadId;
 
@@ -73,7 +73,6 @@ impl VcpuKicker {
         #[allow(clippy::expect_used)]
         self.in_guest
             .lock()
-            .expect("VcpuKicker poisoned")
             .insert(tid, std::sync::Arc::clone(&flag));
         flag
     }
@@ -83,7 +82,6 @@ impl VcpuKicker {
         #[allow(clippy::expect_used)]
         self.in_guest
             .lock()
-            .expect("VcpuKicker poisoned")
             .iter()
             .any(|(tid, f)| *tid != except && f.load(std::sync::atomic::Ordering::SeqCst))
     }
@@ -92,10 +90,7 @@ impl VcpuKicker {
     /// when a vCPU thread begins running, on its owning thread.
     pub fn register(&self, tid: ThreadId, handle: VcpuKickHandle) {
         #[allow(clippy::expect_used)]
-        self.handles
-            .lock()
-            .expect("VcpuKicker poisoned")
-            .insert(tid, handle);
+        self.handles.lock().insert(tid, handle);
     }
 
     /// Number of threads with a registered (live) vCPU. The fork quiesce uses
@@ -105,22 +100,16 @@ impl VcpuKicker {
     /// must NOT be awaited (it would never reach the barrier).
     pub fn count(&self) -> usize {
         #[allow(clippy::expect_used)]
-        self.handles.lock().expect("VcpuKicker poisoned").len()
+        self.handles.lock().len()
     }
 
     /// Drop a thread's handle when it exits (so a kick can't target a dead vCPU
     /// and a recycled tid starts clean).
     pub fn unregister(&self, tid: ThreadId) {
         #[allow(clippy::expect_used)]
-        self.handles
-            .lock()
-            .expect("VcpuKicker poisoned")
-            .remove(&tid);
+        self.handles.lock().remove(&tid);
         #[allow(clippy::expect_used)]
-        self.in_guest
-            .lock()
-            .expect("VcpuKicker poisoned")
-            .remove(&tid);
+        self.in_guest.lock().remove(&tid);
     }
 
     /// Force `tid`'s vCPU out of `hv_vcpu_run` if it is currently in-guest.
@@ -128,7 +117,7 @@ impl VcpuKicker {
     pub fn kick(&self, tid: ThreadId) {
         #[allow(clippy::expect_used)]
         let ids: Vec<u64> = {
-            let map = self.handles.lock().expect("VcpuKicker poisoned");
+            let map = self.handles.lock();
             map.get(&tid).into_iter().filter_map(valid_id).collect()
         };
         kick_ids(&ids);
@@ -141,7 +130,7 @@ impl VcpuKicker {
     pub fn kick_all_except(&self, except: ThreadId) {
         #[allow(clippy::expect_used)]
         let ids: Vec<u64> = {
-            let map = self.handles.lock().expect("VcpuKicker poisoned");
+            let map = self.handles.lock();
             map.iter()
                 .filter(|(tid, _)| **tid != except)
                 .filter_map(|(_, h)| valid_id(h))
@@ -154,7 +143,7 @@ impl VcpuKicker {
     pub fn kick_all(&self) {
         #[allow(clippy::expect_used)]
         let ids: Vec<u64> = {
-            let map = self.handles.lock().expect("VcpuKicker poisoned");
+            let map = self.handles.lock();
             map.values().filter_map(valid_id).collect()
         };
         kick_ids(&ids);

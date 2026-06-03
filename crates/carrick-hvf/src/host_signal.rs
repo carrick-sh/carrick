@@ -70,10 +70,11 @@
 //! deliberately NOT round-tripping the host kernel's own pending mask (the
 //! pending model above is the authority).
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock};
 
 use crate::linux_abi::LINUX_SIGINT;
 
@@ -256,11 +257,7 @@ pub fn publish_pending_for(tid: i32, signum: i32) {
     let bit = thread_pending_bit(signum);
     #[allow(clippy::expect_used)]
     if bit != 0 {
-        *THREAD_PENDING
-            .lock()
-            .expect("THREAD_PENDING poisoned")
-            .entry(tid)
-            .or_insert(0) |= bit;
+        *THREAD_PENDING.lock().entry(tid).or_insert(0) |= bit;
     }
     if !wake_thread_waiter(tid) {
         notify_waiters_fallback();
@@ -294,7 +291,6 @@ pub fn register_child_exit_watch(child_pid: i32, parent_tid: i32, exit_signal: i
     #[allow(clippy::expect_used)]
     CHILD_WATCHES
         .lock()
-        .expect("CHILD_WATCHES poisoned")
         .insert(child_pid, (parent_tid, exit_signal));
     let kq = PUMP_KQUEUE.load(Ordering::SeqCst);
     if kq >= 0 {
@@ -319,12 +315,7 @@ pub fn rearm_child_watches(kq: i32) {
     }
     let pids: Vec<i32> = {
         #[allow(clippy::expect_used)]
-        CHILD_WATCHES
-            .lock()
-            .expect("CHILD_WATCHES poisoned")
-            .keys()
-            .copied()
-            .collect()
+        CHILD_WATCHES.lock().keys().copied().collect()
     };
     for pid in pids {
         let _ = crate::darwin_kqueue::apply_changes(
@@ -341,10 +332,7 @@ pub fn rearm_child_watches(kq: i32) {
 /// from the signal pump.
 pub fn take_child_exit_parent(child_pid: i32) -> Option<(i32, i32)> {
     #[allow(clippy::expect_used)]
-    CHILD_WATCHES
-        .lock()
-        .expect("CHILD_WATCHES poisoned")
-        .remove(&child_pid)
+    CHILD_WATCHES.lock().remove(&child_pid)
 }
 
 /// True iff `child_pid` is a tracked guest child (a fired `EVFILT_PROC` event's
@@ -352,10 +340,7 @@ pub fn take_child_exit_parent(child_pid: i32) -> Option<(i32, i32)> {
 /// sources without consuming the mapping.
 pub fn is_tracked_child(child_pid: i32) -> bool {
     #[allow(clippy::expect_used)]
-    CHILD_WATCHES
-        .lock()
-        .expect("CHILD_WATCHES poisoned")
-        .contains_key(&child_pid)
+    CHILD_WATCHES.lock().contains_key(&child_pid)
 }
 
 /// Drain the signal deliverable to `tid`: a thread-directed one for this tid
@@ -365,7 +350,7 @@ pub fn is_tracked_child(child_pid: i32) -> bool {
 pub fn take_pending_for(tid: i32) -> i32 {
     #[allow(clippy::expect_used)]
     {
-        let mut guard = THREAD_PENDING.lock().expect("THREAD_PENDING poisoned");
+        let mut guard = THREAD_PENDING.lock();
         if let Some(mask) = guard.get_mut(&tid)
             && *mask != 0
         {
@@ -392,7 +377,7 @@ pub fn take_pending_in_for(tid: i32, wait_set: u64) -> i32 {
         // `wait_set` uses the same bit `signum-1` convention as the mask, so a
         // bitwise AND yields the pending signums that are in the waited set;
         // drain only the lowest, leaving the rest pending for normal delivery.
-        let mut guard = THREAD_PENDING.lock().expect("THREAD_PENDING poisoned");
+        let mut guard = THREAD_PENDING.lock();
         if let Some(mask) = guard.get_mut(&tid) {
             let in_set_bits = *mask & wait_set;
             if in_set_bits != 0 {
@@ -433,7 +418,6 @@ pub fn has_pending_for(tid: i32) -> bool {
     #[allow(clippy::expect_used)]
     THREAD_PENDING
         .lock()
-        .expect("THREAD_PENDING poisoned")
         .get(&tid)
         .is_some_and(|&mask| mask != 0)
 }
@@ -456,7 +440,7 @@ pub fn has_unblocked_pending_for(tid: i32, block_mask: u64) -> bool {
         return true;
     }
     #[allow(clippy::expect_used)]
-    let guard = THREAD_PENDING.lock().expect("THREAD_PENDING poisoned");
+    let guard = THREAD_PENDING.lock();
     // Any pending bit that isn't blocked is deliverable. SIGKILL/SIGSTOP can
     // never be blocked, so they always count even if their bit is in block_mask.
     let always_deliverable = thread_pending_bit(crate::linux_abi::LINUX_SIGKILL)
@@ -472,12 +456,7 @@ pub fn has_process_pending() -> bool {
 
 pub fn pending_thread_tids() -> Vec<i32> {
     #[allow(clippy::expect_used)]
-    THREAD_PENDING
-        .lock()
-        .expect("THREAD_PENDING poisoned")
-        .keys()
-        .copied()
-        .collect()
+    THREAD_PENDING.lock().keys().copied().collect()
 }
 
 /// Drop any thread-directed pending entry for `tid` (called when a guest thread
@@ -485,10 +464,7 @@ pub fn pending_thread_tids() -> Vec<i32> {
 /// clears the whole table via `reinit_after_fork`.
 pub fn forget_thread(tid: i32) {
     #[allow(clippy::expect_used)]
-    THREAD_PENDING
-        .lock()
-        .expect("THREAD_PENDING poisoned")
-        .remove(&tid);
+    THREAD_PENDING.lock().remove(&tid);
 }
 
 /// Process-wide self-pipe used to wake threads parked in a blocking-I/O
@@ -560,10 +536,7 @@ pub fn register_thread_waiter(tid: i32) -> Option<ThreadWakePipe> {
     };
     {
         #[allow(clippy::expect_used)]
-        THREAD_WAITERS
-            .lock()
-            .expect("THREAD_WAITERS poisoned")
-            .insert(tid, registration);
+        THREAD_WAITERS.lock().insert(tid, registration);
     }
     Some(ThreadWakePipe { tid, fds })
 }
@@ -676,7 +649,7 @@ fn replace_pipe(read_slot: &AtomicI32, write_slot: &AtomicI32, read_fd: i32, wri
 fn unregister_thread_waiter(tid: i32, fds: &Arc<ThreadWakeFds>) {
     let removed = {
         #[allow(clippy::expect_used)]
-        let mut guard = THREAD_WAITERS.lock().expect("THREAD_WAITERS poisoned");
+        let mut guard = THREAD_WAITERS.lock();
         match guard.get(&tid) {
             Some(reg) if Arc::ptr_eq(&reg.fds, fds) => guard.remove(&tid),
             _ => None,
@@ -691,7 +664,6 @@ fn clear_thread_waiters() {
         #[allow(clippy::expect_used)]
         THREAD_WAITERS
             .lock()
-            .expect("THREAD_WAITERS poisoned")
             .drain()
             .map(|(_, registration)| registration.fds)
             .collect::<Vec<_>>()
@@ -776,15 +748,11 @@ pub fn reinit_after_fork() {
     crate::posix_timer::clear();
     // The child is single-threaded (fork copies only the calling thread); any
     // sibling-directed pending entries inherited from the parent are stale.
-    if let Ok(mut map) = THREAD_PENDING.lock() {
-        map.clear();
-    }
+    THREAD_PENDING.lock().clear();
     // The inherited child-exit watches belong to the PARENT's children (this
     // child's siblings); the freshly-forked child must not deliver SIGCHLD for
     // them. Its own children are registered on its own re-spawned pump.
-    if let Ok(mut map) = CHILD_WATCHES.lock() {
-        map.clear();
-    }
+    CHILD_WATCHES.lock().clear();
     clear_thread_waiters();
     PENDING.store(NO_PENDING_SIGNAL, Ordering::SeqCst);
 }
@@ -796,9 +764,7 @@ pub fn reinit_after_fork() {
 pub fn reset_after_supervisor_fork() {
     INSTALLED.store(0, Ordering::SeqCst);
     INSTALLED_MASK.store(0, Ordering::SeqCst);
-    if let Ok(mut map) = THREAD_PENDING.lock() {
-        map.clear();
-    }
+    THREAD_PENDING.lock().clear();
     clear_thread_waiters();
     PENDING.store(NO_PENDING_SIGNAL, Ordering::SeqCst);
     open_pending_pipe();
@@ -840,7 +806,6 @@ fn wake_thread_waiter(tid: i32) -> bool {
         #[allow(clippy::expect_used)]
         THREAD_WAITERS
             .lock()
-            .expect("THREAD_WAITERS poisoned")
             .get(&tid)
             .map(|registration| Arc::clone(&registration.fds))
     };
@@ -1142,7 +1107,7 @@ mod tests {
 
     #[test]
     fn waiter_and_pump_signal_pipes_are_distinct() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock();
         reset_after_supervisor_fork();
         let waiter_read = pending_pipe_read_fd();
         let pump_read = pump_pipe_read_fd();
@@ -1154,7 +1119,7 @@ mod tests {
 
     #[test]
     fn child_exit_watch_resolves_parent_tid_once() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock();
         // No pump kqueue published here, so register only records the mapping;
         // resolution is what the pump does on NOTE_EXIT.
         PUMP_KQUEUE.store(-1, Ordering::SeqCst);
@@ -1173,7 +1138,7 @@ mod tests {
 
     #[test]
     fn child_exit_watch_ignores_invalid_pid() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock();
         register_child_exit_watch(0, 1234, crate::linux_abi::LINUX_SIGCHLD);
         register_child_exit_watch(-1, 1234, crate::linux_abi::LINUX_SIGCHLD);
         assert!(!is_tracked_child(0));
@@ -1182,7 +1147,7 @@ mod tests {
 
     #[test]
     fn reinit_after_fork_clears_child_watches() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock();
         let child_pid = 0x7FFE_0001;
         register_child_exit_watch(child_pid, 0x7FFE_0002, crate::linux_abi::LINUX_SIGCHLD);
         assert!(is_tracked_child(child_pid));
@@ -1195,7 +1160,7 @@ mod tests {
 
     #[test]
     fn waiter_pipe_drain_does_not_consume_pump_wake() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock();
         reset_after_supervisor_fork();
         PENDING.store(NO_PENDING_SIGNAL, Ordering::SeqCst);
 
@@ -1214,7 +1179,7 @@ mod tests {
 
     #[test]
     fn thread_directed_wake_uses_target_private_pipe() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock();
         reset_after_supervisor_fork();
         PENDING.store(NO_PENDING_SIGNAL, Ordering::SeqCst);
 
@@ -1251,7 +1216,7 @@ mod tests {
 
     #[test]
     fn thread_directed_takes_priority_for_its_tid() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock();
         PENDING.store(NO_PENDING_SIGNAL, Ordering::SeqCst);
         let tid = 900_001;
         publish_pending_for(tid, LINUX_SIGINT);
@@ -1268,7 +1233,7 @@ mod tests {
 
     #[test]
     fn distinct_thread_directed_signals_do_not_coalesce() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock();
         PENDING.store(NO_PENDING_SIGNAL, Ordering::SeqCst);
         let tid = 900_021;
         // Two DISTINCT signals routed to one tid must BOTH survive — a single
@@ -1287,7 +1252,7 @@ mod tests {
 
     #[test]
     fn take_pending_in_for_leaves_non_matching_signals_queued() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock();
         PENDING.store(NO_PENDING_SIGNAL, Ordering::SeqCst);
         let tid = 900_012;
         publish_pending_for(tid, 12);
@@ -1307,7 +1272,7 @@ mod tests {
 
     #[test]
     fn forget_thread_drops_pending() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock();
         PENDING.store(NO_PENDING_SIGNAL, Ordering::SeqCst);
         let tid = 900_003;
         publish_pending_for(tid, 15);
@@ -1319,7 +1284,7 @@ mod tests {
 
     #[test]
     fn take_pending_for_falls_back_to_process_directed() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = TEST_LOCK.lock();
         let tid = 900_004;
         // No thread-directed entry; a process-directed signal is deliverable by
         // any tid.
