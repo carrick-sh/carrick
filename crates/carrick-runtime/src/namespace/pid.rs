@@ -389,7 +389,17 @@ pub fn ns_to_host_or_self(ns_pid: u32) -> Option<u32> {
 /// The current process's own ns-pid. The container init is ns-pid 1. Identity
 /// (the host pid) when namespaces are off.
 pub fn self_ns_pid() -> u32 {
-    host_to_ns_or_self(std::process::id())
+    let host = std::process::id();
+    // `host_to_ns_or_self` returns 0 for a host pid that isn't mapped in the
+    // namespace region — correct for a FOREIGN pid (invisible across the pid-ns
+    // boundary), but the current process ALWAYS has a real pid, so self falls
+    // back to it rather than the invalid 0. (This also keeps the unit suite
+    // order-independent: a sibling test may have seeded the process-global
+    // region without registering this test process's host pid.)
+    match region() {
+        Some(r) => r.host_to_ns(host).unwrap_or(host),
+        None => host,
+    }
 }
 
 /// The current process's parent pid as its ns sees it — the value `getppid()`
