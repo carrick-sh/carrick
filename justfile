@@ -59,3 +59,8 @@ conformance: build
 # Re-sign an already-built release binary (rarely needed on its own).
 sign:
     codesign --force --sign - --entitlements scripts/entitlements.plist target/release/carrick
+
+# Differential perf benchmark vs Docker (serial; needs Docker + signed binary).
+# `just bench` = quick profile; `just bench full` = full profile.
+bench PROFILE="quick":
+    ./scripts/measure-perf.sh {{PROFILE}}
