@@ -175,9 +175,10 @@ Each row in the final table states:
 
 | Date | Workload | carrick p50 (us) | docker p50 (us) | Ratio (carrick/docker) | n | Thesis held? |
 |------|----------|-----------------|-----------------|----------------------|---|--------------|
-| 2026-06-02 | tcp_rr (loopback) | 20.25 | 23.667 | 0.86 | 4 | YES — carrick wins loopback TCP_RR (ratio < 1) |
+| 2026-06-02 | tcp_rr (loopback, quick) | 20.25 | 23.667 | 0.86 | 4 | YES — carrick wins loopback TCP_RR (ratio < 1) |
+| 2026-06-02 | tcp_rr (loopback, full) | 20.875 | 23.708 | 0.88 | 8 | YES — p50 −12%, p95 −23% (both `noisy`, see note) |
 
-Notes: Host Mac16,12 (M4), macOS 26.6, Docker 29.5.2. nproc=4 confirmed both engines. noisy=false both engines. Warmup rep discarded (rep 0: carrick=32.667 docker=23.667). Post-warmup reps: carrick {19.75, 20.25, 20.375, 20.5} us, docker {24.333, 23.667, 23.459, 24.625} us. p95: carrick=20.500, docker=24.625. Carrick is ~14% faster than Docker on loopback TCP request/response latency — consistent with the thesis that carrick's direct Darwin-socket path incurs less overhead than Docker's in-VM loopback stack.
+Notes: Host Mac16,12 (M4), macOS 26.6, Docker 29.5.2. nproc=4 confirmed both engines. Both runs agree: carrick wins loopback TCP_RR by ~12–14% at the median. The full run (n=8) flagged `noisy=true` on both engines (carrick IQR/p50≈12%, docker≈26%) — the harness honestly reporting run-to-run spread; a tighter CI needs the deferred adaptive-N. Notably carrick is also ~2.5× tighter (IQR 2.5 vs 6.2) and wins the p95 tail by ~23% (24.08 vs 31.29 us) — docker's loopback has fatter tails. Mechanism: carrick folds 127/8 to host loopback and issues Darwin sendto/recvfrom directly; docker's loopback traverses the LinuxKit guest-kernel net stack with a hypervisor round-trip per syscall.
 
 ---
 
