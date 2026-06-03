@@ -1272,6 +1272,38 @@ pub(super) fn write_linux_sockaddr(
         .map_err(|_| ())
 }
 
+/// Clamp-and-write a scalar `getsockopt` value back to the guest: read the
+/// guest's `optlen`, write at most that many bytes of `value` to `optval`, and
+/// report the number actually written back in `optlen` (Linux truncation
+/// semantics). The option-value analogue of [`write_linux_sockaddr`] — but it
+/// reports the *clamped* count, not the full length. Returns `LINUX_EFAULT` on
+/// any guest-memory fault, else `Returned { value: 0 }`.
+///
+/// NOT for the generic host passthrough (which reports the host-updated optlen,
+/// not the clamped count) nor the netlink `SO_TYPE` path (which ignores faults).
+pub(super) fn write_sockopt_value<M: GuestMemory>(
+    memory: &mut M,
+    optval_addr: u64,
+    optlen_addr: u64,
+    value: &[u8],
+) -> Result<DispatchOutcome, DispatchError> {
+    let guest_optlen = match memory.read_bytes(optlen_addr, 4) {
+        Ok(b) => u32::from_ne_bytes([b[0], b[1], b[2], b[3]]),
+        Err(_) => return Ok(LINUX_EFAULT.into()),
+    };
+    let n = (guest_optlen as usize).min(value.len());
+    if optval_addr != 0 && n > 0 && memory.write_bytes(optval_addr, &value[..n]).is_err() {
+        return Ok(LINUX_EFAULT.into());
+    }
+    if memory
+        .write_bytes(optlen_addr, &(n as u32).to_ne_bytes())
+        .is_err()
+    {
+        return Ok(LINUX_EFAULT.into());
+    }
+    Ok(DispatchOutcome::Returned { value: 0 })
+}
+
 pub(super) fn read_linux_msghdr(memory: &impl GuestMemory, addr: u64) -> Result<LinuxMsghdr, i32> {
     read_kernel_struct(memory, addr)
 }
