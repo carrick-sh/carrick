@@ -178,6 +178,8 @@ Each row in the final table states:
 | network / tcp_rr (loopback) | p50 latency µs (lower=better) | 19.2–20.9 | 23.4–23.7 | **carrick ~1.2×** | 4–8 | THESIS-WIN |
 | network / tcp_stream (loopback bulk) | throughput MB/s (higher=better) | 4,338 | 22,156 | **docker ~5.1×** | 4 | DIAGNOSED-LOSS (bounce buffer) |
 | disk / stat_storm (8-deep path) | p50 stat µs (lower=better) | 1,188 | 0.46 | **docker ~2,589×** | 4 | DIAGNOSED-LOSS (cap-std re-walk) |
+| network / xboundary_rtt (host→guest) | p50 latency µs (lower=better) | 21.7 | 155.9 | **carrick 7.18×** | 6 | THESIS-WIN (reach) |
+| network / xboundary_stream (host↔guest) | throughput MB/s (higher=better) | 6,059 | 122.8 | **carrick 49.3×** | 6 | THESIS-WIN (reach) |
 
 Host: Mac16,12 (M4, 4P+6E), macOS 26.6, Docker 29.5.2, linux/arm64, `nproc=4` enforced both engines, image digest pinned. All ratios are carrick/docker; "Winner" is the fold-difference of the better engine.
 
@@ -217,6 +219,17 @@ The sharpest disk-thesis test — bulk IO over a **bind mount** (`perf_disk_vol`
 | vol_read | 18915 | 9610 | 3984 | **2.41×** |
 
 **carrick beats Docker 2.4–2.6× on bulk bind-mount IO** — the direct host FD vs virtiofs's VM-boundary round-trip, exactly the "no virtiofs abstraction → IO wins" thesis, and the mirror image of the `stat_storm` *metadata* loss (cap-std). \* **fsync confound on the WRITE-vs-native column only:** the same probe source builds to `F_FULLFSYNC` on the native (aarch64-apple-darwin) target but a plain Linux `fsync` in the guest (aarch64-linux-musl), so the native write ceiling is artificially slow and the *carrick-vs-docker* write number (both Linux `fsync`) is the fair one. The cache-served read column is clean (carrick 51% of native, docker 21%).
+
+### Cross-boundary network (host ↔ guest): carrick **wins big**
+
+The "reach" thesis — a **macOS-host** client (`perf_net_xclient`, native build) connecting to a **guest** echo server (`perf_net_xserver`) bound inside the engine under test. Under carrick the guest `bind()` *is* a real Darwin host socket, directly reachable at `127.0.0.1:PORT` with **no port-publish**; under Docker the identical bind is reachable only through `-p`/**vpnkit's userspace NAT proxy** across the VM boundary; native is a second host process over loopback (the ceiling). New harness module `xboundary.rs` drives it (host-client ↔ engine-server, still strictly serial one-server-at-a-time, per-engine port ranges so a TIME_WAIT never blocks the next bind); `n=6` (REPS=8, WARMUP=2).
+
+| metric (direction) | macos (ceiling) | carrick (host socket) | docker (`-p`/vpnkit NAT) | carrick/docker |
+|---|---|---|---|---|
+| host→guest RTT µs ↓ | 13.9† | 21.7 (iqr 1.5) | 155.9 (iqr 3.7) | **7.18×** |
+| host↔guest stream MB/s ↑ | 5,283 | 6,059 (iqr 164) | 122.8 (iqr 4.9) | **49.3×** |
+
+**carrick beats Docker 7.2× on cross-boundary latency and 49× on throughput** — the single sharpest result in the suite and the cleanest expression of "no extra bridge abstraction." carrick's guest socket *is* a host socket, so a host client reaches it with only ~8 µs over native loopback (21.7 vs 13.9 µs); Docker funnels every packet through the vpnkit userspace proxy, which collapses throughput to **123 MB/s** (a ~50× tax) and inflates RTT to 156 µs. carrick even **exceeds the native ceiling on stream** (6,059 > 5,283 MB/s): the "native" lane is two separate host processes bouncing through the loopback socket buffer, whereas carrick's zero-copy guest↔host path is the more direct route. † The *macos RTT* ceiling lane is flagged NOISY — the native server runs unpinned and jittered against concurrent macOS background indexing (`corespotlightd` ~133%) plus a transient foreign carrick guest on the box; the **carrick and docker lanes were stable** (carrick held 21.7 µs with a 1.5 µs IQR *even while the foreign guest was live*, which would only understate carrick), so the carrick-vs-docker headline is robust. Harness note: the native server initially deadlocked the runner — it was spawned without its own process group, so `stop_server`'s `kill(-pid)` (group-kill, correct for carrick/docker) missed it and `child.wait()` blocked forever on the unkilled accept loop; fixed by giving the native spawn `process_group(0)` like the other two engines, plus a defensive direct `kill(pid)` and a hard per-run `timeout` watchdog.
 
 ---
 
