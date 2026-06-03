@@ -32,7 +32,7 @@ pub const VVAR_OFF_REALTIME_OFF_NS: usize = 16; // wall_ns - monotonic_ns
 /// process's host PID here (unique per process), and re-stamps a forked child's
 /// PID in rebuild_vcpu_after_fork — so a child's generation never matches the
 /// snapshot it COW-inherited from its parent, forcing a reseed (no keystream
-/// reuse across fork). See docs/vdso-getrandom-design.md.
+/// reuse across fork). See docs/archive/vdso-getrandom-design.md.
 pub const VVAR_OFF_RNG_GENERATION: usize = 24;
 
 /// The assembled clock functions (aarch64). Offsets within this blob:

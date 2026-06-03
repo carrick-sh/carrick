@@ -34,7 +34,7 @@ It is what cracked the CPython forkserver-from-forkserver `test_parent_process`
 deadlock: the ring showed the worker `BIND`+`LISTEN` the nested server's listener
 then STOP with no `FORK` — wedged in `prepare_host_fork`'s pump stop — which
 neither dtrace nor eprintln could show without changing the outcome. See
-`docs/forkserver-parent-process-deadlock.md`.
+`docs/archive/forkserver-parent-process-deadlock.md`.
 
 ## What the event ring records (always on)
 

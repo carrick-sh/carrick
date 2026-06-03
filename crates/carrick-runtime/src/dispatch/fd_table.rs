@@ -410,7 +410,7 @@ pub(super) enum OpenDescription {
         /// fds (eventfd/pipe/timerfd) aren't registered here; their readiness is
         /// recomputed each `epoll_wait` and a blocked wait is woken by the
         /// process-wide in-memory broadcast (`notify_inmem_epoll`) firing this
-        /// kqueue's `EVFILT_USER(0)`. See `docs/epoll-kqueue-plan.md`.
+        /// kqueue's `EVFILT_USER(0)`. See `docs/archive/epoll-kqueue-plan.md`.
         kqueue: Arc<EpollKqueue>,
     },
     /// A Linux pidfd referring to a process. Backed by a host `kqueue` watching

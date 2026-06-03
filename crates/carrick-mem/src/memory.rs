@@ -85,7 +85,7 @@ use std::io::Read;
 use std::path::Path;
 
 // Imported from the leaf crate (not `crate::dispatch`) — this is the edge that
-// previously closed the `memory ↔ dispatch` cycle (docs/build-decomposition-design.md §3.A-A2).
+// previously closed the `memory ↔ dispatch` cycle (docs/archive/build-decomposition-design.md §3.A-A2).
 use crate::elf::{
     ElfInspectError, LoadPlan, LoadSegment, SegmentPerms, plan_elf_load, plan_elf_load_bytes,
 };

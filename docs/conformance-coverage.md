@@ -81,7 +81,7 @@ zero. The list is intentionally kept around for future gaps._
 | `waitidspec` | `waitid(2)` siginfo encoding: CLD_EXITED+si_status, CLD_KILLED+si_status==SIGKILL, WNOWAIT peek-then-reap leaves the zombie, P_ALL+WNOHANG→ECHILD with no children. Distinct ABI from wait4 (covered by `proclife`/`waitrestart`). Stands in for LTP `waitid01`/`waitid02`/`waitid03`. |
 
 **Asymmetric-behavior audit** (2026-06-02; gate the fixes from
-`docs/asymmetric-behavior-audit.md` — set-without-get / write-without-read /
+`docs/archive/asymmetric-behavior-audit.md` — set-without-get / write-without-read /
 save-without-restore. Type-check on `aarch64-unknown-linux-musl`; run under
 carrick-vs-Docker to confirm MATCH):
 

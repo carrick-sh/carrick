@@ -2,7 +2,7 @@
 //! a successful wait must report si_code/si_pid (and si_value) from the
 //! `sigqueue`'d signal, not just si_signo. carrick previously wrote only
 //! si_signo, leaving the rest uninitialized. Flagged oracle-sensitive in
-//! docs/asymmetric-behavior-audit.md (siginfo_t field offsets) — this probe is
+//! docs/archive/asymmetric-behavior-audit.md (siginfo_t field offsets) — this probe is
 //! what validates the layout against the Docker linux/arm64 oracle.
 //!
 //! Invariants encoded (carrick must match Linux line-for-line):

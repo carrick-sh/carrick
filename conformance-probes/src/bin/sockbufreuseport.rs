@@ -1,6 +1,6 @@
 //! Socket-option read-back conformance (audit M4, M5): the values getsockopt
 //! reports must reflect what the guest SET, not carrick's host-side widening.
-//! Flagged oracle-sensitive in docs/asymmetric-behavior-audit.md — this probe
+//! Flagged oracle-sensitive in docs/archive/asymmetric-behavior-audit.md — this probe
 //! is what validates carrick's SO_RCVBUF/SNDBUF doubling and SO_REUSEPORT
 //! defaulting against the Docker linux/arm64 oracle.
 //!

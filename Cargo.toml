@@ -19,7 +19,7 @@ todo = "deny"
 unimplemented = "deny"
 
 # Build-speed tuning that does NOT touch the linker or DTrace (see
-# docs/build-decomposition-design.md and .cargo/config.toml for why lld is off).
+# docs/archive/build-decomposition-design.md and .cargo/config.toml for why lld is off).
 # macOS defaults to bundling debuginfo into a .dSYM via dsymutil on every link;
 # `unpacked` skips that packaging step (lldb/`carrick trace` still resolve line
 # info from the .o), cutting the link-dominated test-binary rebuild waves.
