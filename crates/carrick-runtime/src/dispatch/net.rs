@@ -2392,10 +2392,7 @@ impl SyscallDispatcher {
                 *nl_groups = req_groups;
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
-            let (host_fd, family) = match this.host_socket_lookup(fd) {
-                Ok(t) => t,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let (host_fd, family) = this.host_socket_lookup(fd)?;
             // AF_UNIX autobind: a bind with only the family (addrlen == 2, empty
             // path) asks the kernel to assign a unique abstract name. macOS has
             // no autobind, so generate the name + a host node and bind there; a
@@ -2544,10 +2541,7 @@ impl SyscallDispatcher {
 
             let fd: Fd = fd;
             let backlog = backlog as i32;
-            let (host_fd, _family) = match this.host_socket_lookup(fd.0) {
-                Ok(t) => t,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let (host_fd, _family) = this.host_socket_lookup(fd.0)?;
             let rc = unsafe { libc::listen(host_fd, backlog) };
             if let Err(errno) = rc.host_syscall_errno() {
                 return Ok(errno.into());
@@ -2582,10 +2576,7 @@ impl SyscallDispatcher {
             let fd = fd.0;
             let addr_addr = addr.0;
             let addrlen = addrlen as u32;
-            let (host_fd, family) = match this.host_socket_lookup(fd) {
-                Ok(t) => t,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let (host_fd, family) = this.host_socket_lookup(fd)?;
             let host_addr = read_linux_sockaddr(memory, addr_addr, addrlen, family)?;
             // connect(AF_UNSPEC) is the UDP "disconnect" (dissolve the peer
             // association); Linux returns 0. macOS disconnects too but may then
@@ -2692,10 +2683,7 @@ impl SyscallDispatcher {
                 }
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
-            let (host_fd, family) = match this.host_socket_lookup(fd) {
-                Ok(t) => t,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let (host_fd, family) = this.host_socket_lookup(fd)?;
             // getsockname needs both output pointers; a NULL addr or addrlen →
             // EFAULT (getsockname01), checked after the fd validation so a
             // bad/non-socket fd still surfaces EBADF/ENOTSOCK first.
@@ -2732,10 +2720,7 @@ impl SyscallDispatcher {
             let fd = fd.0;
             let addr_addr = addr.0;
             let addrlen_addr = addrlen.0;
-            let (host_fd, family) = match this.host_socket_lookup(fd) {
-                Ok(t) => t,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let (host_fd, family) = this.host_socket_lookup(fd)?;
             let mut sa = [0u8; LINUX_SOCKADDR_STORAGE_SIZE];
             let mut sa_len: libc::socklen_t = sa.len() as libc::socklen_t;
             let rc =
@@ -2784,10 +2769,7 @@ impl SyscallDispatcher {
                 };
                 return Ok(this.netlink_send(fd, &bytes));
             }
-            let (host_fd, family) = match this.host_socket_lookup(fd) {
-                Ok(t) => t,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let (host_fd, family) = this.host_socket_lookup(fd)?;
             // Zero-copy when the whole buffer is one contiguous mapped region
             // (send straight out of guest memory); otherwise snapshot it. The
             // pointer is resolved per dispatch — blocking_io's op is FnOnce and an
@@ -2874,10 +2856,7 @@ impl SyscallDispatcher {
                 }
                 return Ok(drained);
             }
-            let (host_fd, family) = match this.host_socket_lookup(fd) {
-                Ok(t) => t,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let (host_fd, family) = this.host_socket_lookup(fd)?;
             // MSG_ERRQUEUE reads the socket's error queue. carrick keeps no
             // error queue, so it's always empty → EAGAIN (recv01/recvfrom01),
             // matching Linux when no error is queued. Checked after the socket
@@ -2978,10 +2957,7 @@ impl SyscallDispatcher {
                 let _ = (level, optname, optval_addr, optlen);
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
-            let (host_fd, _family) = match this.host_socket_lookup(fd) {
-                Ok(t) => t,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let (host_fd, _family) = this.host_socket_lookup(fd)?;
             // Record the GUEST-intended SO_REUSEPORT / SO_RCVBUF / SO_SNDBUF so
             // getsockopt reports what the guest set rather than carrick's
             // host-side widening (SO_REUSEADDR→SO_REUSEPORT for UDP; AF_UNIX
@@ -3218,10 +3194,7 @@ impl SyscallDispatcher {
                 && (optname == crate::linux_abi::LINUX_SO_DOMAIN
                     || optname == crate::linux_abi::LINUX_SO_PROTOCOL)
             {
-                let (_host_fd, family) = match this.host_socket_lookup(fd) {
-                    Ok(t) => t,
-                    Err(errno) => return Ok(errno.into()),
-                };
+                let (_host_fd, family) = this.host_socket_lookup(fd)?;
                 let val: i32 = if optname == crate::linux_abi::LINUX_SO_DOMAIN {
                     family
                 } else {
@@ -3300,10 +3273,7 @@ impl SyscallDispatcher {
             // Used by D-Bus / systemd peer authentication over AF_UNIX. Done here
             // because `linux_to_host_sockopt` has no Darwin opt to map it to.
             if level == LINUX_SOL_SOCKET && optname == crate::linux_abi::LINUX_SO_PEERCRED {
-                let (host_fd, _family) = match this.host_socket_lookup(fd) {
-                    Ok(t) => t,
-                    Err(errno) => return Ok(errno.into()),
-                };
+                let (host_fd, _family) = this.host_socket_lookup(fd)?;
                 let mut xucred: libc::xucred = unsafe { std::mem::zeroed() };
                 let mut xlen = std::mem::size_of::<libc::xucred>() as libc::socklen_t;
                 let cred_rc = unsafe {
@@ -3344,10 +3314,7 @@ impl SyscallDispatcher {
                 // report the bytes actually written (Linux clamps to the buffer).
                 return write_sockopt_value(memory, optval_addr, optlen_addr, &ucred);
             }
-            let (host_fd, _family) = match this.host_socket_lookup(fd) {
-                Ok(t) => t,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let (host_fd, _family) = this.host_socket_lookup(fd)?;
             // SO_ERROR: the option VALUE is itself an errno (the pending socket
             // error, e.g. from an async connect). The host returns a Darwin
             // errno; the guest reads it as a Linux errno. Without translation a
@@ -3435,10 +3402,7 @@ impl SyscallDispatcher {
 
             let fd: Fd = fd;
             let how = how as i32;
-            let (host_fd, _family) = match this.host_socket_lookup(fd.0) {
-                Ok(t) => t,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let (host_fd, _family) = this.host_socket_lookup(fd.0)?;
             let rc = unsafe { libc::shutdown(host_fd, how) };
             Ok(if let Err(errno) = rc.host_syscall_errno() {
                 DispatchOutcome::errno(errno)
@@ -3483,10 +3447,7 @@ impl SyscallDispatcher {
         let (host_fd, family) = if is_netlink {
             (-1, LINUX_AF_NETLINK)
         } else {
-            match self.host_socket_lookup(fd) {
-                Ok(t) => t,
-                Err(errno) => return Ok(errno.into()),
-            }
+            self.host_socket_lookup(fd)?
         };
         let msg = read_linux_msghdr(memory, msg_addr)?;
         let iovecs = read_iovecs(memory, msg.iov, msg.iovlen as usize)?;
@@ -3595,10 +3556,7 @@ impl SyscallDispatcher {
         let (host_fd, family) = if is_netlink {
             (-1, LINUX_AF_NETLINK)
         } else {
-            match self.host_socket_lookup(fd) {
-                Ok(t) => t,
-                Err(errno) => return Ok(errno.into()),
-            }
+            self.host_socket_lookup(fd)?
         };
         let msg = read_linux_msghdr(memory, msg_addr)?;
         let iovecs = read_iovecs(memory, msg.iov, msg.iovlen as usize)?;
