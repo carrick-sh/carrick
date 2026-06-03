@@ -39,11 +39,13 @@ fn normalize(s: &str) -> String {
         .map(|l| l.trim_end())
         .collect::<Vec<_>>()
         .join("\n")
+        .trim_end()
+        .to_string()
 }
 
 /// Drain a child with a wall-clock deadline; on timeout SIGKILL the process
 /// group and scoped-reap any escaped carrick guests. Returns combined output.
-fn drain_with_deadline(mut child: std::process::Child, repo_root: &Path, run_id: &str) -> String {
+fn drain_with_deadline(child: std::process::Child, repo_root: &Path, run_id: &str) -> String {
     let pid = child.id() as i32;
     let done = Arc::new(AtomicBool::new(false));
     let watcher = {
@@ -113,6 +115,10 @@ pub fn run_docker(repo_root: &Path, run_id: &str, probe_b64: &[u8]) -> String {
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
+        // Own process group so the deadline watcher's kill(-pid) can reach the
+        // docker CLI on timeout (without this, kill(-pid) hits a nonexistent
+        // pgid and wait_with_output() blocks forever). --rm reaps the container.
+        .process_group(0)
         .spawn()
         .expect("spawn docker");
     feed_stdin(&mut child, probe_b64);
