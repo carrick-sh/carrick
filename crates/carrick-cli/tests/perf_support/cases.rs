@@ -12,16 +12,46 @@ pub struct PerfCase {
     /// Key the probe prints whose value is the per-rep metric.
     pub metric_key: &'static str,
     pub unit: &'static str,
+    /// true = a HIGHER metric is better (throughput, MB/s); false = LOWER is
+    /// better (latency, us). Controls the win/lose direction of the reported
+    /// carrick/docker ratio.
+    pub higher_is_better: bool,
 }
 
-/// Phase 0: the marquee network case. Later phases append disk/fork/thread cases.
-pub const CASES: &[PerfCase] = &[PerfCase {
-    probe: "perf_net_tcp_rr",
-    dimension: "network",
-    workload: "tcp_rr",
-    metric_key: "tcp_rr_p50_us",
-    unit: "us",
-}];
+/// Registered workloads. Adding one = an entry here + a probe in
+/// conformance-probes/src/bin/. Network = thesis-core; disk metadata is the
+/// honest exception (carrick's documented cap-std amplification).
+pub const CASES: &[PerfCase] = &[
+    // Latency (lower better): loopback request/response round-trip.
+    PerfCase {
+        probe: "perf_net_tcp_rr",
+        dimension: "network",
+        workload: "tcp_rr",
+        metric_key: "tcp_rr_p50_us",
+        unit: "us",
+        higher_is_better: false,
+    },
+    // Throughput (higher better): loopback bulk stream — exercises carrick's
+    // per-call bounce-buffer memcpy vs docker's in-kernel loopback.
+    PerfCase {
+        probe: "perf_net_tcp_stream",
+        dimension: "network",
+        workload: "tcp_stream",
+        metric_key: "tcp_stream_mbps",
+        unit: "MB/s",
+        higher_is_better: true,
+    },
+    // Latency (lower better): deep-path stat storm — carrick's cap-std
+    // per-component openat re-walk vs docker's single in-kernel VFS walk.
+    PerfCase {
+        probe: "perf_disk_meta",
+        dimension: "disk",
+        workload: "stat_storm",
+        metric_key: "stat_p50_us",
+        unit: "us",
+        higher_is_better: false,
+    },
+];
 
 #[cfg(test)]
 mod tests {

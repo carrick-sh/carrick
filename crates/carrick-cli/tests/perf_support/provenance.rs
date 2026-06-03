@@ -67,6 +67,8 @@ pub struct ResultRow {
     pub lane: String,
     pub metric: String,
     pub unit: String,
+    /// true = higher metric is better (throughput); false = lower (latency).
+    pub higher_is_better: bool,
     pub summary: Summary,
     pub samples: Vec<f64>,
     pub noisy: bool,
@@ -105,6 +107,7 @@ mod tests {
             lane: "cold".into(),
             metric: "tcp_rr_p50_us".into(),
             unit: "us".into(),
+            higher_is_better: false,
             summary: Summary { p50: 8.4, p95: 14.0, min: 6.1, iqr: 1.2, n: 8 },
             samples: vec![8.4, 8.5, 8.3],
             noisy: false,
