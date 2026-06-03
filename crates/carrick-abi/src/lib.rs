@@ -2157,6 +2157,8 @@ bitflags! {
         const PRIVATE = LINUX_MAP_PRIVATE;
         const FIXED = LINUX_MAP_FIXED;
         const ANONYMOUS = LINUX_MAP_ANONYMOUS;
+        const FIXED_NOREPLACE = LINUX_MAP_FIXED_NOREPLACE;
+        const DROPPABLE = LINUX_MAP_DROPPABLE;
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
