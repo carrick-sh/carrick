@@ -240,6 +240,42 @@ fn read_iovecs(memory: &impl GuestMemory, addr: u64, count: usize) -> Option<Vec
     Some(out)
 }
 
+/// Read each iovec's `[iov_base, iov_len)` from guest memory and concatenate
+/// into one host buffer (the gather half of WRITEV/SENDMSG). `Err(())` on a
+/// guest-memory fault; the caller maps it to its own error encoding.
+fn gather_iovecs(memory: &impl GuestMemory, iovs: &[LinuxIovec]) -> Result<Vec<u8>, ()> {
+    let mut buf = Vec::new();
+    for v in iovs {
+        let chunk = memory
+            .read_bytes(v.iov_base, v.iov_len as usize)
+            .map_err(|_| ())?;
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
+/// Scatter `data` across the iovecs in order, writing at most `iov_len` bytes
+/// per iovec and stopping once `data` is exhausted (the scatter half of
+/// READV/RECVMSG). `Err(())` on a guest-memory fault.
+fn scatter_to_iovecs(
+    memory: &mut impl GuestMemory,
+    iovs: &[LinuxIovec],
+    data: &[u8],
+) -> Result<(), ()> {
+    let mut done = 0usize;
+    for v in iovs {
+        if done >= data.len() {
+            break;
+        }
+        let chunk = (v.iov_len as usize).min(data.len() - done);
+        memory
+            .write_bytes(v.iov_base, &data[done..done + chunk])
+            .map_err(|_| ())?;
+        done += chunk;
+    }
+    Ok(())
+}
+
 impl SyscallDispatcher {
     /// `io_uring_setup(entries, params)`: allocate the SQ/CQ rings and the SQE
     /// array in the guest mmap arena, initialise the control words the guest
@@ -510,19 +546,8 @@ impl SyscallDispatcher {
                     Ok(got) => {
                         let got = got as usize;
                         // Scatter the bytes read across the iovecs in order.
-                        let mut done = 0usize;
-                        for v in &iovs {
-                            if done >= got {
-                                break;
-                            }
-                            let chunk = (v.iov_len as usize).min(got - done);
-                            if memory
-                                .write_bytes(v.iov_base, &buf[done..done + chunk])
-                                .is_err()
-                            {
-                                return -LINUX_EFAULT;
-                            }
-                            done += chunk;
+                        if scatter_to_iovecs(memory, &iovs, &buf[..got]).is_err() {
+                            return -LINUX_EFAULT;
                         }
                         got as i32
                     }
@@ -541,13 +566,9 @@ impl SyscallDispatcher {
                     return -LINUX_EFAULT;
                 };
                 // Gather the iovecs into one buffer, then a single pwrite.
-                let mut buf = Vec::new();
-                for v in &iovs {
-                    let Ok(chunk) = memory.read_bytes(v.iov_base, v.iov_len as usize) else {
-                        return -LINUX_EFAULT;
-                    };
-                    buf.extend_from_slice(&chunk);
-                }
+                let Ok(buf) = gather_iovecs(memory, &iovs) else {
+                    return -LINUX_EFAULT;
+                };
                 let n = unsafe {
                     libc::pwrite(
                         hfd,
@@ -647,19 +668,8 @@ impl SyscallDispatcher {
                 match n.host_syscall_errno() {
                     Ok(got) => {
                         let got = got as usize;
-                        let mut done = 0usize;
-                        for v in &iovs {
-                            if done >= got {
-                                break;
-                            }
-                            let chunk = (v.iov_len as usize).min(got - done);
-                            if memory
-                                .write_bytes(v.iov_base, &buf[done..done + chunk])
-                                .is_err()
-                            {
-                                return AsyncOutcome::Ready(-LINUX_EFAULT);
-                            }
-                            done += chunk;
+                        if scatter_to_iovecs(memory, &iovs, &buf[..got]).is_err() {
+                            return AsyncOutcome::Ready(-LINUX_EFAULT);
                         }
                         AsyncOutcome::Ready(got as i32)
                     }
@@ -674,13 +684,9 @@ impl SyscallDispatcher {
                 let Some(iovs) = read_msghdr_iovecs(memory, sqe.addr) else {
                     return AsyncOutcome::Ready(-LINUX_EFAULT);
                 };
-                let mut buf = Vec::new();
-                for v in &iovs {
-                    let Ok(chunk) = memory.read_bytes(v.iov_base, v.iov_len as usize) else {
-                        return AsyncOutcome::Ready(-LINUX_EFAULT);
-                    };
-                    buf.extend_from_slice(&chunk);
-                }
+                let Ok(buf) = gather_iovecs(memory, &iovs) else {
+                    return AsyncOutcome::Ready(-LINUX_EFAULT);
+                };
                 let n = unsafe {
                     libc::send(hfd, buf.as_ptr() as *const _, buf.len(), libc::MSG_DONTWAIT)
                 };
