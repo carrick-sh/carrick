@@ -925,6 +925,7 @@ fn umask_setpriority_getpriority_sysinfo_bootstrap_stubs() {
 const PRCTL: u64 = 167;
 
 /// Issue a `prctl(option, arg2, arg3)` and unwrap the outcome.
+#[allow(clippy::unwrap_used)]
 fn prctl(
     d: &mut SyscallDispatcher,
     m: &mut LinearMemory,

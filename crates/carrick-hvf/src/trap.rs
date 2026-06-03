@@ -71,6 +71,7 @@ pub trait SyscallTrap {
     /// `SA_ONSTACK` and an alternate signal stack is installed — the frame is
     /// pushed onto that stack instead of the interrupted SP_EL0. `None` keeps
     /// the frame on the current stack.
+    #[allow(clippy::too_many_arguments)]
     fn inject_signal(
         &mut self,
         signum: i32,
@@ -1152,6 +1153,7 @@ impl HvfTrapEngine {
     /// frame so a future debugger can correlate. See
     /// `SyscallTrap::inject_signal` for the semantics.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[allow(clippy::too_many_arguments)]
     pub fn inject_signal(
         &mut self,
         signum: i32,
@@ -1180,6 +1182,7 @@ impl HvfTrapEngine {
     }
 
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    #[allow(clippy::too_many_arguments)]
     pub fn inject_signal(
         &mut self,
         _signum: i32,
@@ -2624,14 +2627,13 @@ impl HvfInner {
         // a pure VA-range match (even newest-first) can pick a region the guest's
         // page tables do NOT use, sending a syscall buffer copy to the wrong
         // backing. Matching on stage-1 IPA picks exactly what the guest sees.
-        if let Some(ipa) = stage1_ipa {
-            if let Some((idx, _)) =
+        if let Some(ipa) = stage1_ipa
+            && let Some((idx, _)) =
                 mappings.iter().enumerate().rev().find(|(_, m)| {
                     Self::region_owns_ipa(m, ipa) && m.contains_range(address, length)
                 })
-            {
-                return Some(idx);
-            }
+        {
+            return Some(idx);
         }
         // Search NEWEST-first: a MAP_FIXED mmap overlaying an earlier mapping
         // pushes a new region without removing the old one, and the guest's
@@ -2851,6 +2853,7 @@ impl HvfInner {
     /// normally; if it's `None`, the current x0 is preserved (used for
     /// the rare case where a signal is delivered before the first
     /// syscall has run).
+    #[allow(clippy::too_many_arguments)]
     fn inject_signal(
         &mut self,
         signum: i32,
@@ -4793,6 +4796,7 @@ impl SyscallTrap for HvfTrapEngine {
         HvfTrapEngine::map_host_alias(self, va, ipa, len, payload, file)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn inject_signal(
         &mut self,
         signum: i32,

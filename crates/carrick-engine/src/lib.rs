@@ -230,7 +230,7 @@ impl Engine {
             .await
             .map_err(|e| anyhow::anyhow!("failed to resolve image: {}", e))?;
 
-        let run_spec = resolve_run_spec(req, resolved).map_err(|e| anyhow::Error::msg(e))?;
+        let run_spec = resolve_run_spec(req, resolved).map_err(anyhow::Error::msg)?;
 
         let result = carrick_runtime::Runtime::execute(&run_spec)?;
         Ok(result)

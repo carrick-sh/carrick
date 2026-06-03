@@ -147,7 +147,7 @@ impl Kevent {
         Self::new(
             pid as usize,
             libc::EVFILT_PROC,
-            (libc::EV_ADD | libc::EV_ONESHOT) as u16,
+            libc::EV_ADD | libc::EV_ONESHOT,
             libc::NOTE_EXIT | libc::NOTE_EXITSTATUS,
         )
     }
@@ -156,7 +156,7 @@ impl Kevent {
     /// `proc_exit` is `EV_ONESHOT` (auto-removed once it fires), so this is only
     /// needed to drop a watch whose wait was interrupted before the exit fired.
     pub fn proc_exit_delete(pid: i32) -> Self {
-        Self::new(pid as usize, libc::EVFILT_PROC, libc::EV_DELETE as u16, 0)
+        Self::new(pid as usize, libc::EVFILT_PROC, libc::EV_DELETE, 0)
     }
 
     /// Stash a small integer (a guest fd) in `udata` so a returned event maps
@@ -236,14 +236,14 @@ impl Kevent {
         Self::new(
             fd as usize,
             libc::EVFILT_VNODE,
-            (libc::EV_ADD | libc::EV_CLEAR) as u16,
+            libc::EV_ADD | libc::EV_CLEAR,
             note,
         )
     }
 
     /// Remove a previously-added `EVFILT_VNODE` watch for `fd`.
     pub fn vnode_delete(fd: RawFd) -> Self {
-        Self::new(fd as usize, libc::EVFILT_VNODE, libc::EV_DELETE as u16, 0)
+        Self::new(fd as usize, libc::EVFILT_VNODE, libc::EV_DELETE, 0)
     }
 
     /// The fd a returned `EVFILT_VNODE` event refers to (its `ident`).

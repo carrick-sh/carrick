@@ -136,7 +136,7 @@ fn decode(kind: u8, a: i32, b: i32, c: i32) -> String {
         EPWAIT => format!("EPWAIT   kq={a} ready={b} timeout={c}"),
         FORK => format!("FORK     child_pid={a}"),
         EXEC => format!("EXEC     path_present={a}"),
-        _ => return String::new(),
+        _ => String::new(),
     }
 }
 

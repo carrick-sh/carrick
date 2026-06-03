@@ -696,10 +696,10 @@ fn effective_rlimit(
 ) -> LinuxRlimit {
     // RLIMIT_NOFILE = 7; its soft cap is authoritative in io.nofile_soft.
     const LINUX_RLIMIT_NOFILE: u64 = 7;
-    if resource != LINUX_RLIMIT_NOFILE {
-        if let Some(Some(limit)) = overrides.get(resource as usize) {
-            return *limit;
-        }
+    if resource != LINUX_RLIMIT_NOFILE
+        && let Some(Some(limit)) = overrides.get(resource as usize)
+    {
+        return *limit;
     }
     rlimit_for_resource(resource, nofile_soft)
 }

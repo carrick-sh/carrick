@@ -210,10 +210,9 @@ impl SyscallDispatcher {
                 pending_ready,
                 ..
             } = &mut *guard
+                && interest.remove(&fd).is_some()
             {
-                if interest.remove(&fd).is_some() {
-                    clear_pending_epoll_ready(pending_ready, fd);
-                }
+                clear_pending_epoll_ready(pending_ready, fd);
             }
         }
     }
@@ -389,14 +388,13 @@ impl SyscallDispatcher {
                             revents: 0,
                         };
                         let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
-                        if rc > 0
-                            && pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
+                        if (rc > 0
+                            && pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0)
+                            || interest.iter().any(|(fd, interest)| {
+                                self.host_fd_for_poll(*fd).is_none()
+                                    && self.epoll_ready_events(*fd, interest.event.events) != 0
+                            })
                         {
-                            ready |= LINUX_POLLIN;
-                        } else if interest.iter().any(|(fd, interest)| {
-                            self.host_fd_for_poll(*fd).is_none()
-                                && self.epoll_ready_events(*fd, interest.event.events) != 0
-                        }) {
                             ready |= LINUX_POLLIN;
                         }
                     }
@@ -1121,8 +1119,6 @@ impl SyscallDispatcher {
 
         fn eventfd2(this, cx, initial_value: u64, flags: u64) {
 
-            let initial_value = initial_value;
-            let flags = flags;
             if flags & !(LINUX_EFD_SEMAPHORE | LINUX_EFD_NONBLOCK | LINUX_EFD_CLOEXEC) != 0 {
                 return Ok(LINUX_EINVAL.into());
             }
@@ -1137,7 +1133,6 @@ impl SyscallDispatcher {
 
         fn epoll_create1(this, cx, flags: u64) {
 
-            let flags = flags;
             if flags & !LINUX_EPOLL_CLOEXEC != 0 {
                 return Ok(LINUX_EINVAL.into());
             }
@@ -1164,9 +1159,9 @@ impl SyscallDispatcher {
         fn epoll_ctl(this, cx, epfd: Fd, op: u64, fd: Fd, event: GuestPtr) {
 
             let memory = &*cx.memory;
-            let epfd = epfd.0 as i32;
+            let epfd = epfd.0;
             let operation = op;
-            let fd = fd.0 as i32;
+            let fd = fd.0;
             let event_address = event.0;
             // A bad target fd is EBADF; a target equal to the epoll fd itself is
             // EINVAL (an epoll instance can't monitor itself). (LTP epoll_ctl02.)
@@ -1249,14 +1244,13 @@ impl SyscallDispatcher {
                     // longer present in the new mask. That avoids a no-interest
                     // gap where a readiness edge can be lost; the transient overlap
                     // can only produce an extra wake.
-                    if let Some(host_fd) = host_fd {
-                        if kqueue
+                    if let Some(host_fd) = host_fd
+                        && kqueue
                             .apply(&epoll_kq_add_changes(host_fd, fd, event.events))
                             .is_ok()
                         {
                             epoll_kq_delete_removed_filters(kqueue, host_fd, old_events, event.events);
                         }
-                    }
                     clear_pending_epoll_ready(pending_ready, fd);
                     *slot = EpollInterest {
                         event,
@@ -1314,7 +1308,7 @@ impl SyscallDispatcher {
 
         fn epoll_pwait(this, cx, epfd: Fd, events: GuestPtr, maxevents: u64, timeout: u64, sigmask: GuestPtr, sigsetsize: u64) {
 
-            let epfd = epfd.0 as i32;
+            let epfd = epfd.0;
             let events_address = events.0;
             // maxevents is a signed int; the kernel rejects <= 0 with EINVAL. A
             // negative value arrives as a huge u64, so check the signed form.
@@ -1325,7 +1319,6 @@ impl SyscallDispatcher {
             // passes a NULL mask. A non-NULL mask must have the right size and a
             // readable pointer, else EINVAL/EFAULT. (LTP epoll_pwait04.)
             let sigmask_ptr = sigmask.0;
-            let sigsetsize = sigsetsize;
             let memory = &mut *cx.memory;
             if max_events_signed <= 0 {
                 return Ok(LINUX_EINVAL.into());
@@ -1509,11 +1502,10 @@ impl SyscallDispatcher {
                 // report that (dispatch::fifo_beacon decides it via a kernel
                 // beacon pipe), so recompute it here so the notify_inmem_epoll
                 // wake on writer-close surfaces EOF instead of blocking forever.
-                if let Some(hfd) = this.host_fd_for_poll(*fd) {
-                    if !crate::dispatch::fifo_beacon::read_end_at_eof(hfd) {
+                if let Some(hfd) = this.host_fd_for_poll(*fd)
+                    && !crate::dispatch::fifo_beacon::read_end_at_eof(hfd) {
                         continue;
                     }
-                }
                 let requested = interest.event.events;
                 let raw_ready = this.epoll_ready_events(*fd, requested);
                 ready_updates.push((*fd, raw_ready));
@@ -1719,7 +1711,7 @@ impl SyscallDispatcher {
                         // seconds/nanoseconds or nsec out of [0, 1e9)) — LTP
                         // pselect02 case 3. carrick previously clamped it to 0
                         // (returned "timed out" instead of erroring).
-                        if sec < 0 || nsec < 0 || nsec >= 1_000_000_000 {
+                        if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
                             return Ok(LINUX_EINVAL.into());
                         }
                         let ms = sec.saturating_mul(1000).saturating_add(nsec / 1_000_000);
@@ -2030,7 +2022,6 @@ impl SyscallDispatcher {
             // sigmask args read here (before the `memory` mutable borrow); the mask
             // VALUE is read from guest memory below once `memory` is bound.
             let sigmask_addr = sigmask.0;
-            let sigsetsize = sigsetsize;
             let request_number = cx.number();
             let request_args = cx.raw_args();
             let memory = &mut *cx.memory;
@@ -2315,7 +2306,7 @@ impl SyscallDispatcher {
         fn bind(this, cx, fd: Fd, addr: GuestPtr, addrlen: u64) {
 
             let memory = &*cx.memory;
-            let fd = fd.0 as i32;
+            let fd = fd.0;
             let addr_addr = addr.0;
             let addrlen = addrlen as u32;
             // AF_NETLINK bind: read the (optional) sockaddr_nl to pick up the
@@ -2530,7 +2521,7 @@ impl SyscallDispatcher {
         fn connect(this, cx, fd: Fd, addr: GuestPtr, addrlen: u64) {
 
             let memory = &*cx.memory;
-            let fd = fd.0 as i32;
+            let fd = fd.0;
             let addr_addr = addr.0;
             let addrlen = addrlen as u32;
             let (host_fd, family) = match this.host_socket_lookup(fd) {
@@ -2635,7 +2626,7 @@ impl SyscallDispatcher {
         fn getsockname(this, cx, fd: Fd, addr: GuestPtr, addrlen: GuestPtr) {
 
             let memory = &mut *cx.memory;
-            let fd = fd.0 as i32;
+            let fd = fd.0;
             let addr_addr = addr.0;
             let addrlen_addr = addrlen.0;
             // AF_NETLINK getsockname: hand back a sockaddr_nl carrying the
@@ -2686,7 +2677,7 @@ impl SyscallDispatcher {
         fn getpeername(this, cx, fd: Fd, addr: GuestPtr, addrlen: GuestPtr) {
 
             let memory = &mut *cx.memory;
-            let fd = fd.0 as i32;
+            let fd = fd.0;
             let addr_addr = addr.0;
             let addrlen_addr = addrlen.0;
             let (host_fd, family) = match this.host_socket_lookup(fd) {
@@ -2724,7 +2715,7 @@ impl SyscallDispatcher {
         fn sendto(this, cx, fd: Fd, buf: GuestPtr, len: u64, flags: u64, dest_addr: GuestPtr, addrlen: u64) {
 
             let memory = &*cx.memory;
-            let fd = fd.0 as i32;
+            let fd = fd.0;
             let buf_addr = buf.0;
             let len = len as usize;
             let flags = flags as i32;
@@ -2799,7 +2790,7 @@ impl SyscallDispatcher {
         fn recvfrom(this, cx, fd: Fd, buf: GuestPtr, len: u64, flags: u64, src_addr: GuestPtr, addrlen: GuestPtr) {
 
             let memory = &mut *cx.memory;
-            let fd = fd.0 as i32;
+            let fd = fd.0;
             let buf_addr = buf.0;
             let len = len as usize;
             let flags = flags as i32;
@@ -2893,7 +2884,7 @@ impl SyscallDispatcher {
         fn setsockopt(this, cx, fd: Fd, level: u64, optname: u64, optval: GuestPtr, optlen: u64) {
 
             let memory = &*cx.memory;
-            let fd = fd.0 as i32;
+            let fd = fd.0;
             let level = level as i32;
             let optname = optname as i32;
             let optval_addr = optval.0;
@@ -3103,7 +3094,7 @@ impl SyscallDispatcher {
         fn getsockopt(this, cx, fd: Fd, level: u64, optname: u64, optval: GuestPtr, optlen: GuestPtr) {
 
             let memory = &mut *cx.memory;
-            let fd = fd.0 as i32;
+            let fd = fd.0;
             let level = level as i32;
             let optname = optname as i32;
             let optval_addr = optval.0;
@@ -3125,13 +3116,12 @@ impl SyscallDispatcher {
             // a guest AF_UNIX SOCK_SEQPACKET is backed by a host SOCK_STREAM, but
             // Go derives the network ("unixpacket") from SO_TYPE, so the host's
             // STREAM answer would mislabel the socket.
-            if level == LINUX_SOL_SOCKET && optname == LINUX_SO_TYPE {
-                if let Some(t) = this.socket_guest_type(fd) {
+            if level == LINUX_SOL_SOCKET && optname == LINUX_SO_TYPE
+                && let Some(t) = this.socket_guest_type(fd) {
                     let _ = memory.write_bytes(optval_addr, &t.to_ne_bytes());
                     let _ = memory.write_bytes(optlen_addr, &4u32.to_ne_bytes());
                     return Ok(DispatchOutcome::Returned { value: 0 });
                 }
-            }
             // SO_DOMAIN / SO_PROTOCOL are Linux-only getsockopt options with no
             // macOS equivalent (the generic host path would ENOPROTOOPT). Answer
             // from carrick's per-fd bookkeeping. CPython's
@@ -3240,8 +3230,8 @@ impl SyscallDispatcher {
             {
                 let mut handled = false;
                 let mut dur: Option<std::time::Duration> = None;
-                if let Some(open_file) = this.open_file(fd) {
-                    if let OpenDescription::HostSocket { base, .. } = &*open_file.description.read() {
+                if let Some(open_file) = this.open_file(fd)
+                    && let OpenDescription::HostSocket { base, .. } = &*open_file.description.read() {
                         handled = true;
                         dur = if optname == LINUX_SO_RCVTIMEO {
                             base.recv_timeout()
@@ -3249,7 +3239,6 @@ impl SyscallDispatcher {
                             base.send_timeout()
                         };
                     }
-                }
                 if handled {
                     let tv_sec = dur.map(|d| d.as_secs() as i64).unwrap_or(0);
                     let tv_usec = dur.map(|d| d.subsec_micros() as i64).unwrap_or(0);
@@ -3813,7 +3802,7 @@ impl SyscallDispatcher {
                 }
                 written_controllen = ctrl.len() as u64;
                 if scm_trunc || ipv6_trunc || cred_trunc {
-                    linux_flags |= crate::linux_abi::LINUX_MSG_CTRUNC as i32;
+                    linux_flags |= crate::linux_abi::LINUX_MSG_CTRUNC;
                 }
             }
             // controllen at offset 40, flags at offset 48 in LinuxMsghdr.

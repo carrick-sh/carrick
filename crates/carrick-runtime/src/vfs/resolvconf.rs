@@ -160,12 +160,11 @@ fn scutil_primary_nameservers() -> Vec<String> {
             in_first_resolver = t == "resolver #1";
             continue;
         }
-        if in_first_resolver {
-            if let Some(rest) = t.strip_prefix("nameserver[") {
-                if let Some((_, addr)) = rest.split_once(" : ") {
-                    servers.push(addr.trim().to_string());
-                }
-            }
+        if in_first_resolver
+            && let Some(rest) = t.strip_prefix("nameserver[")
+            && let Some((_, addr)) = rest.split_once(" : ")
+        {
+            servers.push(addr.trim().to_string());
         }
     }
     servers

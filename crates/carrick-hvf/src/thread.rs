@@ -231,6 +231,7 @@ const FUTEX_SHARDS: usize = 64;
 /// feeding raw guest addresses to `parking_lot_core`. The address→bucket map is
 /// sharded so the lookup lock is not a global serialization point.
 pub struct FutexTable {
+    #[allow(clippy::type_complexity)]
     shards: Box<[ParkingMutex<HashMap<u64, Arc<FutexBucket>>>; FUTEX_SHARDS]>,
 }
 
