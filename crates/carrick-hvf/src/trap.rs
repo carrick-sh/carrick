@@ -1686,7 +1686,7 @@ unsafe fn volatile_copy_from_guest(src: *const u8, dst: *mut u8, len: usize) {
     let mut i = 0usize;
     unsafe {
         // Head: byte-volatile until the guest pointer is word-aligned.
-        while i < len && (src.add(i) as usize) % W != 0 {
+        while i < len && !(src.add(i) as usize).is_multiple_of(W) {
             dst.add(i).write(src.add(i).read_volatile());
             i += 1;
         }
@@ -1719,7 +1719,7 @@ unsafe fn volatile_copy_to_guest(src: *const u8, dst: *mut u8, len: usize) {
     let mut i = 0usize;
     unsafe {
         // Head: byte-volatile until the guest pointer is word-aligned.
-        while i < len && (dst.add(i) as usize) % W != 0 {
+        while i < len && !(dst.add(i) as usize).is_multiple_of(W) {
             dst.add(i).write_volatile(src.add(i).read());
             i += 1;
         }
@@ -1749,7 +1749,9 @@ mod volatile_copy_tests {
 
     #[test]
     fn from_guest_matches_reference() {
-        let src: Vec<u8> = (0..512u32).map(|i| (i.wrapping_mul(31).wrapping_add(7)) as u8).collect();
+        let src: Vec<u8> = (0..512u32)
+            .map(|i| (i.wrapping_mul(31).wrapping_add(7)) as u8)
+            .collect();
         for &len in LENS {
             for s in 0..8usize {
                 for d in 0..8usize {
@@ -1769,7 +1771,9 @@ mod volatile_copy_tests {
 
     #[test]
     fn to_guest_matches_reference() {
-        let src: Vec<u8> = (0..512u32).map(|i| (i.wrapping_mul(17).wrapping_add(3)) as u8).collect();
+        let src: Vec<u8> = (0..512u32)
+            .map(|i| (i.wrapping_mul(17).wrapping_add(3)) as u8)
+            .collect();
         for &len in LENS {
             for s in 0..8usize {
                 for d in 0..8usize {
