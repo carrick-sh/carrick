@@ -1057,19 +1057,67 @@ fn run_one_probe(bin: &PathBuf, lane: Lane, probe: &std::path::Path) -> (String,
         Err(e) => return (name, ProbeOutcome::Error(format!("read probe: {e}"))),
     };
     let encoded = engine.encode(&raw).into_bytes();
+    // carrick THEN docker, sequentially — so a single `run_one_probe` call never
+    // overlaps the two. (The parallel gate path uses the two-phase split below so
+    // it doesn't either; this fn is the serial quarantine path.)
     let carrick_out = run_carrick_probe(bin, lane, &encoded);
-    let docker_out = match run_docker_probe(lane, &encoded) {
+    let docker_out = run_docker_probe(lane, &encoded);
+    classify_probe(name, &carrick_out, docker_out)
+}
+
+/// Classify a probe from its (already-collected) carrick + docker outputs — pure,
+/// runs no carrick/docker, so it is the safe "phase 3" after the two-phase split.
+fn classify_probe(
+    name: String,
+    carrick_out: &str,
+    docker_out: std::io::Result<String>,
+) -> (String, ProbeOutcome) {
+    let docker_out = match docker_out {
         Ok(o) => o,
         Err(e) => return (name, ProbeOutcome::Error(format!("docker error: {e}"))),
     };
     let known_gap = KNOWN_PROBE_GAPS.contains(&name.as_str());
-    let outcome = match (diff_lines(&carrick_out, &docker_out), known_gap) {
+    let outcome = match (diff_lines(carrick_out, &docker_out), known_gap) {
         (None, false) => ProbeOutcome::Pass,
         (None, true) => ProbeOutcome::UnexpectedPass,
         (Some(diff), false) => ProbeOutcome::Fail(diff),
         (Some(diff), true) => ProbeOutcome::Xfail(diff),
     };
     (name, outcome)
+}
+
+/// Run `f(0..n_items)` across `n_workers` threads, returning results in index
+/// order. Used to fan a single phase (all-carrick OR all-docker) out without
+/// the two phases ever overlapping.
+fn fan_out_indexed<T, F>(n_items: usize, n_workers: usize, f: F) -> Vec<T>
+where
+    T: Send,
+    F: Fn(usize) -> T + Sync,
+{
+    let slots: Vec<Mutex<Option<T>>> = (0..n_items).map(|_| Mutex::new(None)).collect();
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..n_workers.max(1) {
+            scope.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= n_items {
+                        break;
+                    }
+                    let v = f(i);
+                    *slots[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(v);
+                }
+            });
+        }
+    });
+    slots
+        .into_iter()
+        .map(|m| {
+            m.into_inner()
+                .unwrap_or_else(|e| e.into_inner())
+                .expect("every slot filled")
+        })
+        .collect()
 }
 
 #[test]
@@ -1154,35 +1202,68 @@ fn conformance_probes() {
             .map(|n| n.get().saturating_sub(2).clamp(1, 8))
             .unwrap_or(4);
 
-        let parallel = Arc::new(parallel);
-        let next = Arc::new(AtomicUsize::new(0));
-        let results: Arc<Mutex<Vec<(String, ProbeOutcome)>>> = Arc::new(Mutex::new(Vec::new()));
-        std::thread::scope(|scope| {
-            for _ in 0..n_workers {
-                let parallel = Arc::clone(&parallel);
-                let next = Arc::clone(&next);
-                let results = Arc::clone(&results);
-                let bin = bin.clone();
-                let lane = *lane;
-                scope.spawn(move || {
-                    loop {
-                        let i = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(probe) = parallel.get(i) else { break };
-                        let r = run_one_probe(&bin, lane, probe);
-                        results.lock().unwrap_or_else(|e| e.into_inner()).push(r);
-                    }
-                });
-            }
+        // TWO PHASES so the HVF runtime under test NEVER runs concurrently with
+        // the Docker LinuxKit VM (the oracle): mixing them starves both and skews
+        // timing-sensitive probe results. Phase 1 fans out ALL carrick runs
+        // (carrick||carrick is fine — that's the gate's speed win); phase 2 then
+        // fans out ALL Docker runs (docker||docker, same VM cap); phase 3 is pure
+        // classification. carrick and docker are thus disjoint in time.
+        use base64::Engine as _;
+        let engine = base64::engine::general_purpose::STANDARD;
+        let jobs: Vec<(String, std::io::Result<Vec<u8>>)> = parallel
+            .iter()
+            .map(|p| {
+                let name = p
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("<unknown>")
+                    .to_string();
+                (
+                    name,
+                    std::fs::read(p).map(|raw| engine.encode(&raw).into_bytes()),
+                )
+            })
+            .collect();
+
+        // Phase 1 — carrick only.
+        let carrick_outs: Vec<Option<String>> = fan_out_indexed(jobs.len(), n_workers, |i| {
+            jobs[i]
+                .1
+                .as_ref()
+                .ok()
+                .map(|enc| run_carrick_probe(&bin, *lane, enc))
         });
-        // Quarantined probes: serial, after the fan-out drains.
-        for probe in &quarantine {
-            let r = run_one_probe(&bin, *lane, probe);
-            results.lock().unwrap_or_else(|e| e.into_inner()).push(r);
+        // Phase 2 — Docker oracle only, strictly after phase 1.
+        let docker_outs: Vec<Option<std::io::Result<String>>> =
+            fan_out_indexed(jobs.len(), n_workers, |i| {
+                jobs[i]
+                    .1
+                    .as_ref()
+                    .ok()
+                    .map(|enc| run_docker_probe(*lane, enc))
+            });
+        // Phase 3 — classify (runs nothing).
+        let mut results: Vec<(String, ProbeOutcome)> = Vec::new();
+        for ((name, enc), (carrick_out, docker_out)) in jobs
+            .into_iter()
+            .zip(carrick_outs.into_iter().zip(docker_outs))
+        {
+            let outcome = match enc {
+                Err(e) => (name, ProbeOutcome::Error(format!("read probe: {e}"))),
+                Ok(_) => classify_probe(
+                    name,
+                    &carrick_out.unwrap_or_default(),
+                    docker_out.unwrap_or_else(|| Ok(String::new())),
+                ),
+            };
+            results.push(outcome);
         }
 
-        let mut results = Arc::try_unwrap(results)
-            .map(|m| m.into_inner().unwrap_or_else(|e| e.into_inner()))
-            .unwrap_or_default();
+        // Quarantined (timing-sensitive) probes: serial, after the fan-out — each
+        // is carrick THEN docker, one at a time, so already non-overlapping.
+        for probe in &quarantine {
+            results.push(run_one_probe(&bin, *lane, probe));
+        }
         results.sort_by(|a, b| a.0.cmp(&b.0)); // deterministic report order
 
         for (name, outcome) in &results {
