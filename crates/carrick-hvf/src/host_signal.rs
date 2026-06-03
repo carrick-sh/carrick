@@ -528,6 +528,27 @@ pub fn wake_signal_pump_pipe() {
     }
 }
 
+/// Wake the signal pump via BOTH channels — the dedicated pipe (EVFILT_READ)
+/// and the EVFILT_USER NOTE_TRIGGER. The two race-fail independently (a fork
+/// child still setting up its pipe vs. its kqueue), so `SignalPump::stop` pokes
+/// both to maximise the chance the pump observes its stop flag instead of
+/// parking in `kevent` and hanging the fork.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub fn wake_signal_pump_all() {
+    wake_signal_pump_pipe();
+    notify_pump();
+}
+
+/// Test/diagnostic hook: sever BOTH pump wake channels (used to prove
+/// `SignalPump::stop` still returns — by detaching — when the pump can no
+/// longer be woken). Not for production use.
+#[doc(hidden)]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub fn debug_break_pump_wake() {
+    PUMP_PIPE_WRITE.store(-1, Ordering::SeqCst);
+    PUMP_KQUEUE.store(-1, Ordering::SeqCst);
+}
+
 /// Create (or recreate) the self-pipe. If already open the old ends are closed
 /// first (used by `reinit_after_fork`). Both ends are non-blocking + CLOEXEC.
 fn open_pending_pipe() {
