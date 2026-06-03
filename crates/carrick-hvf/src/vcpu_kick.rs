@@ -196,6 +196,11 @@ fn kick_ids(_ids: &[u64]) {}
 pub struct SignalPump {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Set true by the pump thread (via an exit guard) when its loop ends, so
+    /// `stop_inner` can wait on the EXIT — not merely send one wake — and so it
+    /// can give up and detach rather than `join()` forever.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    exited: std::sync::Arc<std::sync::atomic::AtomicBool>,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     handle: Option<std::thread::JoinHandle<()>>,
 }
@@ -207,11 +212,36 @@ impl SignalPump {
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn stop_inner(&mut self) {
-        self.running
-            .store(false, std::sync::atomic::Ordering::SeqCst);
-        crate::host_signal::wake_signal_pump_pipe();
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+        use std::sync::atomic::Ordering;
+        self.running.store(false, Ordering::SeqCst);
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        // Wake the pump and wait for it to OBSERVE `running == false` and exit.
+        //
+        // A single wake is NOT enough: a freshly respawned pump (e.g. in a
+        // forkserver worker that immediately forks server B) can still be
+        // setting up its kqueue/pipe when stop runs, so one wake races and is
+        // lost, the pump parks in `kevent` forever, and a plain `join()` hangs —
+        // wedging the whole host fork (the CPython forkserver-from-forkserver
+        // `test_parent_process` deadlock). So: wake via BOTH the pipe and the
+        // EVFILT_USER NOTE_TRIGGER, retry on a short cadence until the pump's
+        // exit guard fires, and if it still hasn't exited within a generous
+        // bound (truly wedged), DETACH instead of joining forever. A leaked
+        // daemon blocked in `kevent` is harmless — the next pump's
+        // `pump_install_pipe` closes its pipe, which EOF-wakes it to exit.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            crate::host_signal::wake_signal_pump_all();
+            if self.exited.load(Ordering::SeqCst) {
+                let _ = handle.join();
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                drop(handle); // detach (does NOT join) — never hang the fork
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
 
@@ -239,10 +269,22 @@ pub fn spawn_signal_pump(
     futex: std::sync::Arc<crate::thread::FutexTable>,
 ) -> SignalPump {
     let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let exited = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let thread_running = std::sync::Arc::clone(&running);
+    let thread_exited = std::sync::Arc::clone(&exited);
     let handle = std::thread::Builder::new()
         .name("carrick-signal-pump".to_owned())
         .spawn(move || {
+            // Mark the pump EXITED on every return path (incl. the early
+            // kqueue/pipe-setup bail-outs below), so `stop_inner` waits on the
+            // real exit and never joins a thread that already left.
+            struct ExitGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+            impl Drop for ExitGuard {
+                fn drop(&mut self) {
+                    self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            let _exit_guard = ExitGuard(thread_exited);
             let Some(kq) = crate::darwin_kqueue::Kqueue::new_internal() else {
                 return;
             };
@@ -390,7 +432,11 @@ pub fn spawn_signal_pump(
             crate::host_signal::clear_pump_kqueue(kq_fd);
         })
         .ok();
-    SignalPump { running, handle }
+    SignalPump {
+        running,
+        exited,
+        handle,
+    }
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -427,5 +473,44 @@ mod tests {
             std::sync::Arc::new(crate::thread::FutexTable::new()),
         );
         pump.stop();
+    }
+
+    /// `SignalPump::stop` must be BOUNDED even when the pump can no longer be
+    /// woken. The CPython forkserver-from-forkserver `test_parent_process`
+    /// deadlock was exactly this: a worker forking server B called
+    /// `prepare_host_fork -> stop()`, whose single pipe-wake raced and was lost,
+    /// so `join()` blocked forever and wedged the whole host fork. With BOTH wake
+    /// channels severed, stop must still return (by detaching) rather than hang.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn signal_pump_stop_is_bounded_when_wake_is_lost() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        crate::host_signal::install_default_handlers();
+        let pump = spawn_signal_pump(
+            std::sync::Arc::new(VcpuKicker::new()),
+            std::sync::Arc::new(crate::thread::FutexTable::new()),
+        );
+        // Let the pump finish setting up and park in kevent().
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        // Sever BOTH wake channels so the pump can never observe the stop flag.
+        crate::host_signal::debug_break_pump_wake();
+        // Run stop() on a helper thread; the main thread enforces a deadline, so
+        // a hang fails the test cleanly instead of wedging the test binary.
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let done2 = std::sync::Arc::clone(&done);
+        let h = std::thread::spawn(move || {
+            pump.stop();
+            done2.store(true, Ordering::SeqCst);
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        while !done.load(Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "SignalPump::stop hung when the pump could not be woken \
+                 (the forkserver-from-forkserver deadlock)"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let _ = h.join();
     }
 }
