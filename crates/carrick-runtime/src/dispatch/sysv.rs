@@ -243,19 +243,15 @@ pub(super) fn shmget_open(
     let path_cstr = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
         .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
     let host_flags = libc::O_RDWR | libc::O_CREAT;
-    let fd = unsafe { libc::open(path_cstr.as_ptr(), host_flags, 0o600) };
-    if fd < 0 {
-        return Err(translate_host_errno());
-    }
+    let fd = unsafe { libc::open(path_cstr.as_ptr(), host_flags, 0o600) }.host_syscall_errno()?;
 
     // ftruncate sizing: only when we created OR when no pre-existing size
     // was set. SAFE_SHMGET in LTP passes a fixed size each time; growing a
     // shared segment is allowed by Linux only on create. Mirror that: only
     // ftruncate when we actually created the file.
     if must_create && size > 0 {
-        let rc = unsafe { libc::ftruncate(fd, size as libc::off_t) };
-        if rc != 0 {
-            let err = translate_host_errno();
+        let truncated = unsafe { libc::ftruncate(fd, size as libc::off_t) }.host_syscall_errno();
+        if let Err(err) = truncated {
             unsafe { libc::close(fd) };
             return Err(err);
         }
@@ -264,9 +260,7 @@ pub(super) fn shmget_open(
     // Stat to get the inode (= shmid). On the off chance another carrick
     // process recreated the file between open and stat, stat the open fd.
     let mut st: libc::stat = unsafe { core::mem::zeroed() };
-    let rc = unsafe { libc::fstat(fd, &mut st) };
-    if rc != 0 {
-        let err = translate_host_errno();
+    if let Err(err) = unsafe { libc::fstat(fd, &mut st) }.host_syscall_errno() {
         unsafe { libc::close(fd) };
         return Err(err);
     }
@@ -312,10 +306,7 @@ pub(super) fn shmat_open_fd(state: &mut SysvShmState, shmid: i32) -> Result<(i32
         .ok_or(crate::linux_abi::LINUX_EINVAL)?;
     let path_cstr = std::ffi::CString::new(segment.path.as_os_str().as_encoded_bytes())
         .map_err(|_| crate::linux_abi::LINUX_EINVAL)?;
-    let fd = unsafe { libc::open(path_cstr.as_ptr(), libc::O_RDWR) };
-    if fd < 0 {
-        return Err(translate_host_errno());
-    }
+    let fd = unsafe { libc::open(path_cstr.as_ptr(), libc::O_RDWR) }.host_syscall_errno()?;
     Ok((fd, segment.size))
 }
 
@@ -361,15 +352,6 @@ pub(super) fn shmid_ds_bytes(segment: &ShmSegment) -> [u8; 112] {
     let mut out = [0u8; 112];
     out.copy_from_slice(ds.as_bytes());
     out
-}
-
-fn translate_host_errno() -> i32 {
-    let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-    // macOS and Linux share most low errno numbers — but a handful differ
-    // (ENOTBLK, EWOULDBLOCK, etc.). For shmget's failure modes (EACCES,
-    // EEXIST, ENOENT, EINVAL, ENOMEM, ENOSPC) the numbers align between
-    // Darwin and Linux, so a direct mapping is correct.
-    e
 }
 
 // ===================================================================
