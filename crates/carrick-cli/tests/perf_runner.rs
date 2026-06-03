@@ -93,31 +93,46 @@ fn run_case(root: &Path, bin: &PathBuf, case: &PerfCase) -> Vec<ResultRow> {
     let raw = std::fs::read(&probe).expect("read probe");
     let b64 = base64::engine::general_purpose::STANDARD.encode(&raw).into_bytes();
 
+    // Native (macOS host ceiling) build, if present — optional third engine.
+    let native = native_probe_path(root, case.probe);
+    let has_native = native.exists();
+
     let n = reps();
     let warm = warmup_reps().min(n);
+    let mut native_vals: Vec<f64> = Vec::new();
     let mut carrick_vals: Vec<f64> = Vec::new();
     let mut docker_vals: Vec<f64> = Vec::new();
+    let mut native_nproc: Option<u64> = None;
     let mut carrick_nproc: Option<u64> = None;
     let mut docker_nproc: Option<u64> = None;
     let mut invalid = 0usize;
 
     for rep in 0..n {
+        // --- native (macos) sample: no carrick, no Docker, no VM (the ceiling) ---
+        let nat = if has_native {
+            let out = invoke::run_native(&native);
+            std::thread::sleep(cooldown());
+            parse_sample(&out, case.metric_key)
+        } else {
+            Sample { value: None, nproc: None }
+        };
         // --- carrick sample ---
         let c_id = invoke::perf_run_id();
         let c_out = invoke::run_carrick(bin, root, &c_id, &b64);
         std::thread::sleep(cooldown());
-        // --- docker sample (adjacent, never concurrent) ---
+        // --- docker sample (serial, never concurrent with carrick) ---
         let d_id = invoke::perf_run_id();
         let d_out = invoke::run_docker(root, &d_id, &b64);
         std::thread::sleep(cooldown());
 
         let c = parse_sample(&c_out, case.metric_key);
         let d = parse_sample(&d_out, case.metric_key);
+        native_nproc = nat.nproc.or(native_nproc);
         carrick_nproc = c.nproc.or(carrick_nproc);
         docker_nproc = d.nproc.or(docker_nproc);
 
-        // CPU-normalization gate: both engines must report nproc==CPU_PIN, else
-        // the rep is INVALID and excluded (per the design's fail-fast rule).
+        // CPU-normalization gates ONLY carrick+docker (native sees all host
+        // cores — macOS has no cpuset; it is the unpinned ceiling reference).
         let normalized = c.nproc == Some(CPU_PIN as u64) && d.nproc == Some(CPU_PIN as u64);
         let usable = rep >= warm && normalized && c.value.is_some() && d.value.is_some();
         if rep >= warm && !normalized {
@@ -128,9 +143,12 @@ fn run_case(root: &Path, bin: &PathBuf, case: &PerfCase) -> Vec<ResultRow> {
         if usable {
             carrick_vals.push(c.value.unwrap());
             docker_vals.push(d.value.unwrap());
+            if let Some(v) = nat.value {
+                native_vals.push(v);
+            }
         }
-        eprintln!("perf[{}] rep {rep}/{n}: carrick={:?} docker={:?}{}",
-                  case.workload, c.value, d.value,
+        eprintln!("perf[{}] rep {rep}/{n}: macos={:?} carrick={:?} docker={:?}{}",
+                  case.workload, nat.value, c.value, d.value,
                   if rep < warm { " (warmup, discarded)" } else { "" });
     }
 
@@ -144,6 +162,7 @@ fn run_case(root: &Path, bin: &PathBuf, case: &PerfCase) -> Vec<ResultRow> {
     let sha = provenance::git_sha();
     let mk = |engine: &str, lane: &str, vals: &[f64], nproc: Option<u64>| -> ResultRow {
         let s: Summary = stats::summarize(vals).expect("non-empty");
+        let native = engine == "macos";
         ResultRow {
             schema: 2,
             epoch_secs: provenance::epoch_secs(),
@@ -158,22 +177,29 @@ fn run_case(root: &Path, bin: &PathBuf, case: &PerfCase) -> Vec<ResultRow> {
             samples: vals.to_vec(),
             noisy: stats::is_noisy(&s),
             nproc,
-            cpu_pin: CPU_PIN,
-            fs_mode: "host".into(),
-            image: IMAGE.into(),
-            image_digest: digest.clone(),
+            // native is the unpinned host ceiling (macOS has no cpuset); cpu_pin=0
+            // records that, while `nproc` carries the real host core count.
+            cpu_pin: if native { 0 } else { CPU_PIN },
+            fs_mode: if native { "native".into() } else { "host".into() },
+            image: if native { "(native macos host)".into() } else { IMAGE.into() },
+            image_digest: if native { None } else { digest.clone() },
             git_sha: sha.clone(),
             run_id: format!("cr-perf-{}", std::process::id()),
             host: host.clone(),
         }
     };
-    let rows = vec![
-        mk("carrick", "cold", &carrick_vals, carrick_nproc),
-        mk("docker", "docker", &docker_vals, docker_nproc),
-    ];
-    // Direction-aware comparison. `ratio` is always carrick/docker on the raw
-    // metric; the winner and the fold-difference depend on the metric direction.
-    let (cp, dp) = (rows[0].summary.p50, rows[1].summary.p50);
+    let mut rows: Vec<ResultRow> = Vec::new();
+    if !native_vals.is_empty() {
+        rows.push(mk("macos", "native", &native_vals, native_nproc));
+    }
+    rows.push(mk("carrick", "cold", &carrick_vals, carrick_nproc));
+    rows.push(mk("docker", "docker", &docker_vals, docker_nproc));
+    // Direction-aware comparison. Locate engines by name (rows now lead with the
+    // optional macos row), so the carrick/docker ratio is order-independent.
+    let p50_of = |engine: &str| rows.iter().find(|r| r.engine == engine).map(|r| r.summary.p50);
+    let cp = p50_of("carrick").unwrap_or(f64::NAN);
+    let dp = p50_of("docker").unwrap_or(f64::NAN);
+    let np = p50_of("macos");
     let ratio = if dp > 0.0 { cp / dp } else { f64::NAN };
     let winner_is_carrick = if case.higher_is_better { cp >= dp } else { cp <= dp };
     let winner = if ratio.is_nan() {
@@ -205,7 +231,23 @@ fn run_case(root: &Path, bin: &PathBuf, case: &PerfCase) -> Vec<ResultRow> {
             r.summary.n, if r.noisy { " NOISY" } else { "" }, tail
         );
     }
+    // vs-native efficiency: engine/macos on the raw metric (macos = unpinned host
+    // ceiling). Throughput (higher better): <1 = below ceiling. Latency (lower
+    // better): >1 = above the ceiling (carrick/docker overhead over native).
+    if let Some(np) = np.filter(|v| *v > 0.0) {
+        eprintln!(
+            "perf[{}] vs-native: carrick={:.2}x docker={:.2}x (engine/macos; macos={:.3}{} ceiling, unpinned {} cores)",
+            case.workload, cp / np, dp / np, np, case.unit,
+            native_nproc.map(|n| n.to_string()).unwrap_or_else(|| "?".into())
+        );
+    }
     rows
+}
+
+/// Native (aarch64-apple-darwin) build of a probe, from the standalone
+/// `bench-native` crate. Optional third engine ("macos" = host ceiling).
+fn native_probe_path(root: &Path, name: &str) -> PathBuf {
+    root.join(format!("bench-native/target/release/{name}"))
 }
 
 /// YYYY-MM-DD from `date` (avoids a chrono dep).

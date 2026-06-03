@@ -23,6 +23,8 @@ echo "==> building signed carrick"
 ./scripts/build-signed.sh
 echo "==> building probes"
 ./scripts/build-probes.sh >/dev/null
+echo "==> building native (macos) probes"
+( cd bench-native && cargo build --release ) >/dev/null
 echo "==> running perf_gate (profile=$profile reps=$CARRICK_PERF_REPS)"
 cargo test -p carrick-cli --test perf_runner perf_gate -- --nocapture --include-ignored
 
