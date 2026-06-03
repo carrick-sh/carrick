@@ -2616,9 +2616,9 @@ impl FsBackend for HostFsBackend {
                 };
             }
             let mut buf = [0u8; libc::PATH_MAX as usize];
-            let getpath_ok = unsafe {
-                libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr() as *mut libc::c_char)
-            } >= 0;
+            let getpath_ok =
+                unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr() as *mut libc::c_char) }
+                    >= 0;
             unsafe { libc::close(fd) };
             if !getpath_ok {
                 return ParentResolve::Slow;
@@ -2629,8 +2629,7 @@ impl FsBackend for HostFsBackend {
             // parent. ANY difference (an intermediate symlink the kernel followed,
             // a Unicode-normalized alias, a sandbox escape) ⇒ the slow path, which
             // resolves symlinks and rejects aliases exactly.
-            let mut expected =
-                Vec::with_capacity(root_prefix.len() + 1 + parent.as_os_str().len());
+            let mut expected = Vec::with_capacity(root_prefix.len() + 1 + parent.as_os_str().len());
             expected.extend_from_slice(root_prefix.as_bytes());
             expected.push(b'/');
             expected.extend_from_slice(parent.as_os_str().as_bytes());

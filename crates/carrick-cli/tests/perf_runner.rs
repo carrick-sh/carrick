@@ -62,6 +62,7 @@ fn is_signed(bin: &Path) -> bool {
         .unwrap_or(false)
 }
 
+#[allow(clippy::panic)]
 fn ensure_signed(root: &Path, bin: &Path) {
     if is_signed(bin) {
         return;
@@ -387,10 +388,10 @@ fn perf_gate() {
     let filter = std::env::var("CARRICK_PERF_FILTER").ok();
     let date = today_string();
     for case in CASES {
-        if let Some(f) = &filter {
-            if !case.workload.contains(f.as_str()) {
-                continue;
-            }
+        if let Some(f) = &filter
+            && !case.workload.contains(f.as_str())
+        {
+            continue;
         }
         if case.cross_boundary {
             perf_support::xboundary::run_cross_boundary(

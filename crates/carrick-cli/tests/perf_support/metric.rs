@@ -47,7 +47,8 @@ mod tests {
 
     #[test]
     fn ignores_noise_lines() {
-        let m = Metrics::parse("carrick: --fs host warning\ntcp_rr_p50_us=9.0\n<TIMEOUT after 45s>\n");
+        let m =
+            Metrics::parse("carrick: --fs host warning\ntcp_rr_p50_us=9.0\n<TIMEOUT after 45s>\n");
         assert_eq!(m.get_f64("tcp_rr_p50_us"), Some(9.0));
         assert_eq!(m.0.len(), 1);
     }

@@ -257,10 +257,10 @@ pub fn run_cross_boundary(
             };
             if let Some(m) = &m {
                 nproc = m.get_u64("nproc").or(nproc);
-                if rep >= warm {
-                    if let Some(v) = m.get_f64(case.metric_key) {
-                        vals.push(v);
-                    }
+                if rep >= warm
+                    && let Some(v) = m.get_f64(case.metric_key)
+                {
+                    vals.push(v);
                 }
             }
             eprintln!(
