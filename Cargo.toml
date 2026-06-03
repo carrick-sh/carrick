@@ -40,9 +40,12 @@ split-debuginfo = "unpacked"
 
 # Carrick does arithmetic on guest-controlled integers throughout the syscall
 # emulation. overflow-checks turns a silent wrap (which can become a too-small
-# buffer / OOB — see the msgsnd 8+sz finding) into a contained panic that the
-# CLI's catch_unwind reports as a GUEST ABORT (host survives). Defense-in-depth
-# behind the explicit checked_* added at hot sites. (audit M0)
+# buffer / OOB — see the msgsnd 8+sz finding) into a panic, which the per-syscall
+# dispatch backstop (`dispatch_with_panic_backstop` in runtime.rs) catches and
+# turns into a deterministic guest ABORT (logged syscall + SIGABRT) rather than
+# letting it unwind a vCPU thread (silently killing a sibling vCPU → guest hang,
+# or tearing through half-edited lock-protected state). Defense-in-depth behind
+# the explicit checked_* added at hot sites. (audit M0)
 [profile.release]
 overflow-checks = true
 
