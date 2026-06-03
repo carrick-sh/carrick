@@ -854,9 +854,7 @@ impl SyscallDispatcher {
                 }
                 let pages = length.div_ceil(LINUX_PAGE_SIZE);
                 let bytes = vec![1u8; pages as usize];
-                if memory.write_bytes(vec.0, &bytes).is_err() {
-                    return Ok(LINUX_EFAULT.into());
-                }
+                memory.write_bytes(vec.0, &bytes)?;
                 Ok(DispatchOutcome::Returned { value: 0 })
             }
 
