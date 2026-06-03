@@ -88,6 +88,17 @@ pub trait GuestMemory {
     fn read_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError>;
     fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError>;
 
+    /// Read exactly `dst.len()` bytes at `address` into `dst`, without
+    /// allocating. Default: delegate to `read_bytes` + copy (the in-memory test
+    /// backend has nothing to gain). The HVF backend overrides this to
+    /// `volatile`-copy straight into `dst`, removing the per-call `Vec` on the
+    /// hot fixed-size-read path (`read_u32`/`read_u64`/struct-header reads).
+    fn read_into(&self, address: u64, dst: &mut [u8]) -> Result<(), MemoryError> {
+        let bytes = self.read_bytes(address, dst.len())?;
+        dst.copy_from_slice(&bytes);
+        Ok(())
+    }
+
     /// Zero `[address, address+len)` in the PHYSICAL backing, bypassing the
     /// guest-visible protection (`set_no_access` / a non-writable mapping).
     /// Used to scrub a reused anon region whose stale content must never reach

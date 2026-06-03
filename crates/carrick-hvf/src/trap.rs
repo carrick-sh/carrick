@@ -2468,10 +2468,19 @@ impl HvfInner {
     }
 
     fn read_guest_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+        let mut bytes = vec![0u8; length];
+        self.read_guest_bytes_into(address, &mut bytes)?;
+        Ok(bytes)
+    }
+
+    /// No-alloc core of [`read_guest_bytes`]: `volatile`-copy `dst.len()` bytes
+    /// of guest memory at `address` straight into `dst`. Same checks, chunked
+    /// mapping walk, and trace probes as the allocating form.
+    fn read_guest_bytes_into(&self, address: u64, dst: &mut [u8]) -> Result<(), MemoryError> {
+        let length = dst.len();
         if self.range_no_access(address, length) {
             return Err(MemoryError::OutOfBounds { address, length });
         }
-        let mut bytes = vec![0u8; length];
         let mut copied = 0usize;
         while copied < length {
             let (chunk_address, chunk_len) = Self::guest_copy_chunk(address, copied, length)?;
@@ -2496,7 +2505,7 @@ impl HvfInner {
             unsafe {
                 volatile_copy_from_guest(
                     host_addr.add(chunk_offset),
-                    bytes.as_mut_ptr().add(copied),
+                    dst.as_mut_ptr().add(copied),
                     chunk_len,
                 );
             }
@@ -2505,9 +2514,9 @@ impl HvfInner {
         crate::probes::guest_mem_bytes(
             crate::probes::guest_mem_dir::READ_GUEST,
             strip_pointer_tag(address),
-            &bytes,
+            dst,
         );
-        Ok(bytes)
+        Ok(())
     }
 
     /// Host VA of `address` iff it lives in a host-`MAP_SHARED` guest region
@@ -4130,6 +4139,10 @@ impl HvfInner {
 impl GuestMemory for HvfTrapEngine {
     fn read_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
         self.inner.read_guest_bytes(address, length)
+    }
+
+    fn read_into(&self, address: u64, dst: &mut [u8]) -> Result<(), MemoryError> {
+        self.inner.read_guest_bytes_into(address, dst)
     }
 
     fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {

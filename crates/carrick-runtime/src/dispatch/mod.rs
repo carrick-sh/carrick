@@ -3596,17 +3596,19 @@ fn write_pipe(bytes: &[u8], pipe: &PipeRef) -> DispatchOutcome {
 }
 
 pub(super) fn read_u64(memory: &impl GuestMemory, address: u64) -> Result<u64, i32> {
-    let bytes = memory.read_bytes(address, 8).map_err(|_| LINUX_EFAULT)?;
-    Ok(u64::from_ne_bytes(
-        bytes.as_slice().try_into().map_err(|_| LINUX_EFAULT)?,
-    ))
+    let mut buf = [0u8; 8];
+    memory
+        .read_into(address, &mut buf)
+        .map_err(|_| LINUX_EFAULT)?;
+    Ok(u64::from_ne_bytes(buf))
 }
 
 pub(super) fn read_u32(memory: &impl GuestMemory, address: u64) -> Result<u32, i32> {
-    let bytes = memory.read_bytes(address, 4).map_err(|_| LINUX_EFAULT)?;
-    Ok(u32::from_ne_bytes(
-        bytes.as_slice().try_into().map_err(|_| LINUX_EFAULT)?,
-    ))
+    let mut buf = [0u8; 4];
+    memory
+        .read_into(address, &mut buf)
+        .map_err(|_| LINUX_EFAULT)?;
+    Ok(u32::from_ne_bytes(buf))
 }
 
 pub(super) fn write_u32(
