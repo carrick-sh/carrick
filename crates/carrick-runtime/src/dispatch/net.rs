@@ -3678,10 +3678,19 @@ impl SyscallDispatcher {
                 {
                     return Ok(LINUX_EFAULT.into());
                 }
-                let _ = memory.write_bytes(msg_addr + 8, &(nl.len() as u32).to_ne_bytes());
+                let _ = memory.write_bytes(
+                    msg_addr + core::mem::offset_of!(LinuxMsghdr, namelen) as u64,
+                    &(nl.len() as u32).to_ne_bytes(),
+                );
             }
-            let _ = memory.write_bytes(msg_addr + 40, &0u64.to_ne_bytes());
-            let _ = memory.write_bytes(msg_addr + 48, &0i32.to_ne_bytes());
+            let _ = memory.write_bytes(
+                msg_addr + core::mem::offset_of!(LinuxMsghdr, controllen) as u64,
+                &0u64.to_ne_bytes(),
+            );
+            let _ = memory.write_bytes(
+                msg_addr + core::mem::offset_of!(LinuxMsghdr, flags) as u64,
+                &0i32.to_ne_bytes(),
+            );
             return Ok(DispatchOutcome::Returned { value: n as i64 });
         }
         let total: usize = iovecs.iter().map(|iov| iov.iov_len as usize).sum();
@@ -3779,7 +3788,10 @@ impl SyscallDispatcher {
                 }
                 // namelen lives at offset 8 (after the 8-byte name pointer).
                 if memory
-                    .write_bytes(msg_addr + 8, &(linux_bytes.len() as u32).to_ne_bytes())
+                    .write_bytes(
+                        msg_addr + core::mem::offset_of!(LinuxMsghdr, namelen) as u64,
+                        &(linux_bytes.len() as u32).to_ne_bytes(),
+                    )
                     .is_err()
                 {
                     return Err(LINUX_EFAULT);
@@ -3835,8 +3847,14 @@ impl SyscallDispatcher {
                 }
             }
             // controllen at offset 40, flags at offset 48 in LinuxMsghdr.
-            let _ = memory.write_bytes(msg_addr + 40, &written_controllen.to_ne_bytes());
-            let _ = memory.write_bytes(msg_addr + 48, &linux_flags.to_ne_bytes());
+            let _ = memory.write_bytes(
+                msg_addr + core::mem::offset_of!(LinuxMsghdr, controllen) as u64,
+                &written_controllen.to_ne_bytes(),
+            );
+            let _ = memory.write_bytes(
+                msg_addr + core::mem::offset_of!(LinuxMsghdr, flags) as u64,
+                &linux_flags.to_ne_bytes(),
+            );
         } else {
             // Error/would-block: nothing received, so close any stray fds and
             // leave the guest msghdr's controllen/flags zeroed.
