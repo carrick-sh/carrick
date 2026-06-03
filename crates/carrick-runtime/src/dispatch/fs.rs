@@ -3950,12 +3950,8 @@ impl SyscallDispatcher {
                         return Ok(LINUX_EINVAL.into());
                     }
                 };
-                let r = match (unsafe { libc::lseek(*host_fd, offset as libc::off_t, host_whence) })
-                    .host_syscall_errno()
-                {
-                    Ok(value) => value,
-                    Err(errno) => return Ok(errno.into()),
-                };
+                let r = (unsafe { libc::lseek(*host_fd, offset as libc::off_t, host_whence) })
+                    .host_syscall_errno()?;
                 return Ok(DispatchOutcome::Returned { value: r as i64 });
             }
 
@@ -3977,14 +3973,10 @@ impl SyscallDispatcher {
                         LINUX_SEEK_END => libc::SEEK_END,
                         _ => return Ok(LINUX_EINVAL.into()),
                     };
-                    let r = match (unsafe {
+                    let r = (unsafe {
                         libc::lseek(*host_fd, offset as libc::off_t, host_whence)
                     })
-                    .host_syscall_errno()
-                    {
-                        Ok(value) => value,
-                        Err(errno) => return Ok(errno.into()),
-                    };
+                    .host_syscall_errno()?;
                     return Ok(DispatchOutcome::Returned { value: r as i64 });
                 }
             }
@@ -4683,10 +4675,7 @@ impl SyscallDispatcher {
                 return Ok(LINUX_EBADF.into());
             }
 
-            let mut offset = match this.sendfile_offset(in_fd.0, offset_address, memory)? {
-                Ok(offset) => offset,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let mut offset = this.sendfile_offset(in_fd.0, offset_address, memory)??;
 
             // Darwin-native fast path: a regular file -> socket uses macOS
             // sendfile(2) (BSD-style, in-kernel, zero-copy). It honors socket
@@ -5079,10 +5068,7 @@ impl SyscallDispatcher {
                 Err(errno) => return Ok(errno.into()),
             }
 
-            let mut offset = match this.sendfile_offset(in_fd.0, off_in_address, memory)? {
-                Ok(offset) => offset,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let mut offset = this.sendfile_offset(in_fd.0, off_in_address, memory)??;
             let bytes = this.sendfile_bytes(in_fd.0, offset, count)?;
             let outcome = this.write_output_fd(out_fd.0, &bytes, tid);
             let DispatchOutcome::Returned { value } = outcome else {

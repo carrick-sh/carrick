@@ -77,10 +77,7 @@ impl SyscallDispatcher {
                 return Ok(LINUX_EINVAL.into());
             }
             let spec = read_itimerspec(memory, new_value)?;
-            let (next_interval, next_value) = match itimerspec_durations(spec) {
-                Ok(value) => value,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let (next_interval, next_value) = itimerspec_durations(spec)?;
             let Some(open_file) = this.open_file(fd.0) else {
                 return Ok(LINUX_EBADF.into());
             };
@@ -419,10 +416,7 @@ impl SyscallDispatcher {
             let spec = read_itimerspec(memory, new_ptr.0)?;
             // Validate the timespec (EINVAL on tv_nsec>=1e9 or negative) via the
             // shared helper, exactly like timerfd_settime. (audit M4)
-            let (interval_dur, value_dur) = match itimerspec_durations(spec) {
-                Ok(durations) => durations,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let (interval_dur, value_dur) = itimerspec_durations(spec)?;
             let interval_ns =
                 interval_dur.map_or(0, |d| u64::try_from(duration_to_nanos(d)).unwrap_or(u64::MAX));
             let value_ns = match value_dur {
