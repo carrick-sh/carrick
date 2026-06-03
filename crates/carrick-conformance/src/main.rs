@@ -138,7 +138,10 @@ fn run() -> anyhow::Result<ExitCode> {
         let s = &selected[i];
         let _g =
             (s.weight == Weight::Heavy).then(|| heavy.lock().unwrap_or_else(|e| e.into_inner()));
-        let run_id = format!("conf-{pid}-c{i}");
+        // Zero-pad the index so no run-id is a prefix of another (c01 vs c10);
+        // kill.sh anchors on the proctitle "carrick:<id>:" delimiter too, but a
+        // collision-free id is defense in depth against any unanchored grep.
+        let run_id = format!("conf-{pid}-c{i:02}");
         let out = engine::run_carrick(s, &carrick_bin, &run_id);
         eprintln!("  [carrick] {}", s.name);
         out
@@ -150,7 +153,7 @@ fn run() -> anyhow::Result<ExitCode> {
         let s = &selected[i];
         let _g =
             (s.weight == Weight::Heavy).then(|| heavy.lock().unwrap_or_else(|e| e.into_inner()));
-        let run_id = format!("conf-{pid}-d{i}");
+        let run_id = format!("conf-{pid}-d{i:02}");
         let out = engine::run_docker(s, &run_id);
         eprintln!("  [docker]  {}", s.name);
         out

@@ -96,7 +96,9 @@ def _kill(run_id):
     sh = os.path.join(REPO, "scripts/sudo/kill.sh")
     subprocess.run(["sudo", "-n", sh, run_id],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    subprocess.run(["pkill", "-9", "-f", f"carrick:{run_id}"],
+    # trailing ':' anchors the id on the proctitle "carrick:<id>: <name>" delimiter
+    # so a prefix run-id (e.g. ...-1 vs ...-10) does not over-match.
+    subprocess.run(["pkill", "-9", "-f", f"carrick:{run_id}:"],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 def _run(cmd, timeout, env=None):
