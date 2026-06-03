@@ -167,6 +167,27 @@ pub trait GuestMemory {
     fn shared_futex_host_addr(&self, _guest_addr: u64) -> Option<usize> {
         None
     }
+
+    /// Host pointer for a CONTIGUOUS guest range usable for zero-copy host I/O
+    /// (send straight out of / recv straight into guest memory), valid IFF the
+    /// whole `[address, address+len)` lives in one mapped region so the host
+    /// backing is contiguous. Returns `None` when zero-copy is not applicable
+    /// (multi-region, unmapped, or — for writes — not guest-writable); the
+    /// caller MUST then fall back to `read_bytes`/`write_bytes`. The pointer is
+    /// valid only for the current syscall dispatch (the issuing vCPU is in its
+    /// own trap handler and the op runs before any lock-releasing wait); an
+    /// EAGAIN-parked syscall re-dispatches and re-resolves. Default: `None`
+    /// (the in-memory backend has no contiguous host backing to expose).
+    ///
+    /// SAFETY (using the pointer): touch at most `len` bytes. A concurrent guest
+    /// write to those bytes is a guest bug (matches Linux) and tolerated; the
+    /// mapping itself stays put for the dispatch.
+    fn host_ptr_for_read(&self, _address: u64, _len: usize) -> Option<*const u8> {
+        None
+    }
+    fn host_ptr_for_write(&mut self, _address: u64, _len: usize) -> Option<*mut u8> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]

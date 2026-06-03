@@ -2818,11 +2818,24 @@ impl SyscallDispatcher {
                 Ok(t) => t,
                 Err(errno) => return Ok(errno.into()),
             };
-            let bytes = match memory.read_bytes(buf_addr, len) {
-                Ok(bytes) => bytes,
-                Err(_) => {
-                    return Ok(LINUX_EFAULT.into());
+            // Zero-copy when the whole buffer is one contiguous mapped region
+            // (send straight out of guest memory); otherwise snapshot it. The
+            // pointer is resolved per dispatch — blocking_io's op is FnOnce and an
+            // EAGAIN re-dispatches the whole handler, so it never outlives a
+            // lock-releasing wait.
+            let zc_ptr = memory.host_ptr_for_read(buf_addr, len);
+            let send_copy: Option<Vec<u8>> = if zc_ptr.is_some() {
+                None
+            } else {
+                match memory.read_bytes(buf_addr, len) {
+                    Ok(b) => Some(b),
+                    Err(_) => return Ok(LINUX_EFAULT.into()),
                 }
+            };
+            let data_ptr: *const u8 = match (zc_ptr, &send_copy) {
+                (Some(p), _) => p,
+                (None, Some(b)) => b.as_ptr(),
+                (None, None) => return Ok(LINUX_EFAULT.into()),
             };
             // Read the destination sockaddr (if any) from guest memory up front,
             // then send with MSG_DONTWAIT through blocking_io: a full socket buffer
@@ -2845,8 +2858,8 @@ impl SyscallDispatcher {
                     None => unsafe {
                         libc::sendto(
                             host_fd,
-                            bytes.as_ptr() as *const _,
-                            bytes.len(),
+                            data_ptr as *const _,
+                            len,
                             host_flags,
                             std::ptr::null(),
                             0,
@@ -2855,8 +2868,8 @@ impl SyscallDispatcher {
                     Some(a) => unsafe {
                         libc::sendto(
                             host_fd,
-                            bytes.as_ptr() as *const _,
-                            bytes.len(),
+                            data_ptr as *const _,
+                            len,
                             host_flags,
                             a.as_ptr() as *const _,
                             a.len() as u32,
@@ -2910,7 +2923,18 @@ impl SyscallDispatcher {
             let nonblocking = this.io_is_nonblocking(fd, flags);
             let host_flags = linux_to_host_msg_flags(flags) | libc::MSG_DONTWAIT;
             let len = len.min(crate::dispatch::MAX_RW_COUNT);
-            let mut buf = vec![0u8; len];
+            // Zero-copy recv straight INTO guest memory when the destination is
+            // one contiguous, guest-writable region; else recv into a bounce and
+            // copy. host_ptr_for_write enforces guest-writability (a read-only
+            // mapping returns None → checked write path → EFAULT).
+            let zc_dst = memory.host_ptr_for_write(buf_addr, len);
+            let zero_copy = zc_dst.is_some();
+            let mut recv_copy: Option<Vec<u8>> = if zero_copy { None } else { Some(vec![0u8; len]) };
+            let dst_ptr: *mut u8 = match (zc_dst, recv_copy.as_mut()) {
+                (Some(p), _) => p,
+                (None, Some(b)) => b.as_mut_ptr(),
+                (None, None) => return Ok(LINUX_EFAULT.into()),
+            };
             let recv_to = this
                 .open_file(fd)
                 .and_then(|f| f.description.read().recv_timeout());
@@ -2922,8 +2946,8 @@ impl SyscallDispatcher {
                         unsafe {
                             libc::recvfrom(
                                 host_fd,
-                                buf.as_mut_ptr() as *mut _,
-                                buf.len(),
+                                dst_ptr as *mut _,
+                                len,
                                 host_flags,
                                 std::ptr::null_mut(),
                                 std::ptr::null_mut(),
@@ -2936,8 +2960,8 @@ impl SyscallDispatcher {
                         unsafe {
                             libc::recvfrom(
                                 host_fd,
-                                buf.as_mut_ptr() as *mut _,
-                                buf.len(),
+                                dst_ptr as *mut _,
+                                len,
                                 host_flags,
                                 sa.as_mut_ptr() as *mut _,
                                 &mut sa_len as *mut _,
@@ -2947,8 +2971,14 @@ impl SyscallDispatcher {
                     )
                 };
                 let n = n.host_syscall_errno()?;
-                if n > 0 && memory.write_bytes(buf_addr, &buf[..n as usize]).is_err() {
-                    return Err(LINUX_EFAULT);
+                // Copy path: flush the bounce into guest. Zero-copy: the kernel
+                // already wrote straight into guest memory, nothing to copy.
+                if !zero_copy && n > 0 {
+                    if let Some(b) = recv_copy.as_ref() {
+                        if memory.write_bytes(buf_addr, &b[..n as usize]).is_err() {
+                            return Err(LINUX_EFAULT);
+                        }
+                    }
                 }
                 if used_addr && src_addr != 0 && src_len_addr != 0 {
                     let used = (sa_len as usize).min(sa.len());
