@@ -2568,6 +2568,43 @@ impl HvfInner {
         Ok(())
     }
 
+    /// Host pointer for a contiguous guest range (zero-copy send source), or
+    /// `None` if the whole range isn't within one mapped region. Mirrors
+    /// `read_guest_bytes`'s address handling (raw no-access guard, tag strip)
+    /// but returns the backing pointer instead of copying. See
+    /// `GuestMemory::host_ptr_for_read`.
+    fn host_ptr_for_read(&self, address: u64, length: usize) -> Option<*const u8> {
+        if length == 0 || self.range_no_access(address, length) {
+            return None;
+        }
+        let stripped = strip_pointer_tag(address);
+        let mapping = self.mapping_for_range(stripped, length)?;
+        let offset = (stripped - mapping.start) as usize;
+        Some(unsafe { mapping.host_addr.add(offset) } as *const u8)
+    }
+
+    /// Host pointer for a contiguous guest range as a zero-copy recv DESTINATION,
+    /// or `None` if the range isn't one mapped region OR isn't guest-writable.
+    /// The guest-writable requirement mirrors `write_guest_bytes_checked`: a
+    /// guest read-only mapping must EFAULT via the checked copy path, not be
+    /// written by the kernel through a raw host pointer. See
+    /// `GuestMemory::host_ptr_for_write`.
+    fn host_ptr_for_write(&self, address: u64, length: usize) -> Option<*mut u8> {
+        if length == 0 || self.range_no_access(address, length) {
+            return None;
+        }
+        let stripped = strip_pointer_tag(address);
+        if self
+            .validate_guest_write_range(stripped, length, true)
+            .is_err()
+        {
+            return None;
+        }
+        let mapping = self.mapping_for_range(stripped, length)?;
+        let offset = (stripped - mapping.start) as usize;
+        Some(unsafe { mapping.host_addr.add(offset) })
+    }
+
     /// Zero the PHYSICAL backing of `[address, address+length)`, bypassing BOTH
     /// the `range_no_access` and the writability checks (see
     /// `GuestMemory::zero_backing`). Used to scrub a reused anon region whose
@@ -4100,6 +4137,14 @@ impl GuestMemory for HvfTrapEngine {
         // Syscall path: enforce the guest-visible mapping permission so a write
         // into a read-only / carrick-owned mapping returns EFAULT (audit M1).
         self.inner.write_guest_bytes_checked(address, bytes)
+    }
+
+    fn host_ptr_for_read(&self, address: u64, len: usize) -> Option<*const u8> {
+        self.inner.host_ptr_for_read(address, len)
+    }
+
+    fn host_ptr_for_write(&mut self, address: u64, len: usize) -> Option<*mut u8> {
+        self.inner.host_ptr_for_write(address, len)
     }
 
     fn zero_backing(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
