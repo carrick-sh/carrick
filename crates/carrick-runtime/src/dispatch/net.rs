@@ -1281,10 +1281,7 @@ impl SyscallDispatcher {
 
             match operation {
                 LINUX_EPOLL_CTL_ADD => {
-                    let event = match read_epoll_event(memory, event_address) {
-                        Ok(event) => event,
-                        Err(errno) => return Ok(errno.into()),
-                    };
+                    let event = read_epoll_event(memory, event_address)?;
                     // The kernel rejects ADD of a target that has no ->poll support
                     // (regular files, directories) with EPERM. (LTP epoll_ctl02/05.)
                     if !this.fd_is_epollable(fd) {
@@ -1314,10 +1311,7 @@ impl SyscallDispatcher {
                     Ok(DispatchOutcome::Returned { value: 0 })
                 }
                 LINUX_EPOLL_CTL_MOD => {
-                    let event = match read_epoll_event(memory, event_address) {
-                        Ok(event) => event,
-                        Err(errno) => return Ok(errno.into()),
-                    };
+                    let event = read_epoll_event(memory, event_address)?;
                     let Some(slot) = interest.get_mut(&fd) else {
                         return Ok(LINUX_ENOENT.into());
                     };
@@ -1814,18 +1808,9 @@ impl SyscallDispatcher {
             };
 
             // Pull each fd_set into memory.
-            let read_set = match this.read_optional_fd_set(memory, readfds_addr, nfds)? {
-                Ok(s) => s,
-                Err(errno) => return Ok(errno.into()),
-            };
-            let write_set = match this.read_optional_fd_set(memory, writefds_addr, nfds)? {
-                Ok(s) => s,
-                Err(errno) => return Ok(errno.into()),
-            };
-            let except_set = match this.read_optional_fd_set(memory, exceptfds_addr, nfds)? {
-                Ok(s) => s,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let read_set = this.read_optional_fd_set(memory, readfds_addr, nfds)??;
+            let write_set = this.read_optional_fd_set(memory, writefds_addr, nfds)??;
+            let except_set = this.read_optional_fd_set(memory, exceptfds_addr, nfds)??;
 
             // Collect the union of the three sets into per-fd entries, and try to
             // map each guest fd to a real host fd. Then route exactly like ppoll:
@@ -2176,10 +2161,7 @@ impl SyscallDispatcher {
                         return Ok(LINUX_EFAULT.into());
                     }
                 };
-                let pollfd = match read_pollfd(memory, address) {
-                    Ok(p) => p,
-                    Err(errno) => return Ok(errno.into()),
-                };
+                let pollfd = read_pollfd(memory, address)?;
                 fds.push(pollfd);
                 addresses.push(address);
             }
@@ -2476,10 +2458,7 @@ impl SyscallDispatcher {
                 None
             };
             let resolved_guest_unix_path = if let Some(gp) = &guest_unix_path {
-                let resolved = match this.resolve_at_path(LINUX_AT_FDCWD, gp) {
-                    Ok(resolved) => resolved,
-                    Err(errno) => return Ok(errno.into()),
-                };
+                let resolved = this.resolve_at_path(LINUX_AT_FDCWD, gp)?;
                 let parent = std::path::Path::new(&resolved)
                     .parent()
                     .and_then(|p| p.to_str())
@@ -2497,10 +2476,7 @@ impl SyscallDispatcher {
             } else {
                 None
             };
-            let host_addr = match read_linux_sockaddr(memory, addr_addr, addrlen, family) {
-                Ok(bytes) => bytes,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let host_addr = read_linux_sockaddr(memory, addr_addr, addrlen, family)?;
             // AF_UNIX pathname sockets are bound at a stable host path (see
             // unix_socket_host_path). The guest's unlink only tombstones a VFS
             // overlay entry, so it can't clear a real host socket left by a
@@ -2610,10 +2586,7 @@ impl SyscallDispatcher {
                 Ok(t) => t,
                 Err(errno) => return Ok(errno.into()),
             };
-            let host_addr = match read_linux_sockaddr(memory, addr_addr, addrlen, family) {
-                Ok(bytes) => bytes,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let host_addr = read_linux_sockaddr(memory, addr_addr, addrlen, family)?;
             // connect(AF_UNSPEC) is the UDP "disconnect" (dissolve the peer
             // association); Linux returns 0. macOS disconnects too but may then
             // report EAFNOSUPPORT/EINVAL — treat those as success below.
@@ -2626,10 +2599,7 @@ impl SyscallDispatcher {
             if family == libc::AF_UNIX
                 && let Some(gp) = guest_unix_pathname(memory, addr_addr, addrlen)
             {
-                let resolved = match this.resolve_at_path(LINUX_AT_FDCWD, &gp) {
-                    Ok(resolved) => resolved,
-                    Err(errno) => return Ok(errno.into()),
-                };
+                let resolved = this.resolve_at_path(LINUX_AT_FDCWD, &gp)?;
                 let parent = std::path::Path::new(&resolved)
                     .parent()
                     .and_then(|p| p.to_str())
@@ -3518,14 +3488,8 @@ impl SyscallDispatcher {
                 Err(errno) => return Ok(errno.into()),
             }
         };
-        let msg = match read_linux_msghdr(memory, msg_addr) {
-            Ok(m) => m,
-            Err(errno) => return Ok(errno.into()),
-        };
-        let iovecs = match read_iovecs(memory, msg.iov, msg.iovlen as usize) {
-            Ok(v) => v,
-            Err(errno) => return Ok(errno.into()),
-        };
+        let msg = read_linux_msghdr(memory, msg_addr)?;
+        let iovecs = read_iovecs(memory, msg.iov, msg.iovlen as usize)?;
         // Pack iovecs into a single contiguous send. Simple and avoids
         // having to keep guest pointers alive across the FFI call.
         let mut data = Vec::new();
@@ -3636,14 +3600,8 @@ impl SyscallDispatcher {
                 Err(errno) => return Ok(errno.into()),
             }
         };
-        let msg = match read_linux_msghdr(memory, msg_addr) {
-            Ok(m) => m,
-            Err(errno) => return Ok(errno.into()),
-        };
-        let iovecs = match read_iovecs(memory, msg.iov, msg.iovlen as usize) {
-            Ok(v) => v,
-            Err(errno) => return Ok(errno.into()),
-        };
+        let msg = read_linux_msghdr(memory, msg_addr)?;
+        let iovecs = read_iovecs(memory, msg.iov, msg.iovlen as usize)?;
         // AF_NETLINK: drain the queued dump reply into the iovecs, fill in
         // the source sockaddr_nl (kernel; pid=0), and zero controllen/flags.
         if is_netlink {

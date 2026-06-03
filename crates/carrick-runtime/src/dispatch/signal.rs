@@ -1220,10 +1220,7 @@ impl SyscallDispatcher {
             let wait_set = u64::from_le_bytes(set_bytes.try_into().unwrap_or([0; 8]));
             let mut timeout: Option<Duration> = None;
             if timeout_ptr != 0 {
-                let ts = match read_timespec(memory, timeout_ptr) {
-                    Ok(ts) => ts,
-                    Err(errno) => return Ok(errno.into()),
-                };
+                let ts = read_timespec(memory, timeout_ptr)?;
                 let tv_sec = ts.tv_sec;
                 let tv_nsec = ts.tv_nsec;
                 if tv_sec < 0 || !(0..1_000_000_000).contains(&tv_nsec) {
