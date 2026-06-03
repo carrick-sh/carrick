@@ -52,8 +52,22 @@ test-integration:
 # Run the full host CI gate locally (fmt · clippy · build · docs · tests) — the source of truth CI calls.
 ci: fmt-check clippy (check "--workspace") doc test test-integration
 
-# Differential conformance suite vs Docker (needs Docker + signed binary; self-skips).
-conformance: build
+# Unified language/LTP conformance harness vs Docker (needs Docker + signed binary).
+# `just conformance` = full tier; `just conformance smoke` = fast gate; extra args pass
+# through (e.g. `just conformance full --bless`, `just conformance full --ecosystem go`).
+conformance TIER="full" *ARGS: build
+    cargo run -p carrick-conformance -- --tier {{TIER}} {{ARGS}}
+
+# Fast pre-merge regression gate: the smoke tier, non-zero exit on any regression.
+conformance-quick: build
+    cargo run -p carrick-conformance -- --tier smoke
+
+# Re-render docs/support-matrix.md from the latest results (no run).
+matrix:
+    cargo run -p carrick-conformance -- --render-matrix
+
+# Deterministic, line-exact ABI probe gate vs Docker (the precise gate; self-skips).
+conformance-probes: build
     cargo test -p carrick-cli --test conformance -- --nocapture
 
 # Re-sign an already-built release binary (rarely needed on its own).
