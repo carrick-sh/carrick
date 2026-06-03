@@ -20,6 +20,10 @@ pub struct PerfCase {
     /// / docker `-v`) at /mnt and set `BENCH_DIR=/mnt`; native gets
     /// `BENCH_DIR=<abs .bench-scratch>`. The direct-host-FD-vs-virtiofs disk test.
     pub mount_scratch: bool,
+    /// true = the macOS-HOST-client ↔ guest-server CROSS-BOUNDARY test (carrick's
+    /// native host socket vs docker's `-p`/vpnkit NAT). `probe` is the guest
+    /// server; the host client is fixed. Dispatched to the `xboundary` module.
+    pub cross_boundary: bool,
 }
 
 /// Registered workloads. Adding one = an entry here + a probe in
@@ -35,6 +39,7 @@ pub const CASES: &[PerfCase] = &[
         unit: "us",
         higher_is_better: false,
         mount_scratch: false,
+        cross_boundary: false,
     },
     // Throughput (higher better): loopback bulk stream — exercises carrick's
     // per-call bounce-buffer memcpy vs docker's in-kernel loopback.
@@ -46,6 +51,7 @@ pub const CASES: &[PerfCase] = &[
         unit: "MB/s",
         higher_is_better: true,
         mount_scratch: false,
+        cross_boundary: false,
     },
     // Latency (lower better): deep-path stat storm — carrick's cap-std
     // per-component openat re-walk vs docker's single in-kernel VFS walk.
@@ -57,6 +63,7 @@ pub const CASES: &[PerfCase] = &[
         unit: "us",
         higher_is_better: false,
         mount_scratch: false,
+        cross_boundary: false,
     },
     // Throughput (higher better): bulk WRITE over a bind mount — carrick's
     // direct host FD (--fs host -v) vs docker's virtiofs VM-boundary round-trip.
@@ -69,6 +76,7 @@ pub const CASES: &[PerfCase] = &[
         unit: "MB/s",
         higher_is_better: true,
         mount_scratch: true,
+        cross_boundary: false,
     },
     // Throughput (higher better): bulk READ over the same bind mount.
     PerfCase {
@@ -79,6 +87,31 @@ pub const CASES: &[PerfCase] = &[
         unit: "MB/s",
         higher_is_better: true,
         mount_scratch: true,
+        cross_boundary: false,
+    },
+    // CROSS-BOUNDARY latency (lower better): macOS-host client → guest echo
+    // server RTT. carrick's guest bind is a real Darwin host socket (directly
+    // reachable); docker reaches it only via -p/vpnkit NAT. The "reach" thesis.
+    PerfCase {
+        probe: "perf_net_xserver",
+        dimension: "network",
+        workload: "xboundary_rtt",
+        metric_key: "xrtt_p50_us",
+        unit: "us",
+        higher_is_better: false,
+        mount_scratch: false,
+        cross_boundary: true,
+    },
+    // CROSS-BOUNDARY throughput (higher better): host↔guest echo stream.
+    PerfCase {
+        probe: "perf_net_xserver",
+        dimension: "network",
+        workload: "xboundary_stream",
+        metric_key: "xstream_mbps",
+        unit: "MB/s",
+        higher_is_better: true,
+        mount_scratch: false,
+        cross_boundary: true,
     },
 ];
 

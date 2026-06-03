@@ -9,7 +9,7 @@
 
 mod perf_support;
 
-use perf_support::cases::{PerfCase, CASES};
+use perf_support::cases::{CASES, PerfCase};
 use perf_support::invoke::{self, CPU_PIN, IMAGE};
 use perf_support::metric::Metrics;
 use perf_support::provenance::{self, HostFacts, ResultRow};
@@ -23,7 +23,8 @@ static PERF_LOCK: Mutex<()> = Mutex::new(());
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent().and_then(|p| p.parent())
+        .parent()
+        .and_then(|p| p.parent())
         .expect("carrick-cli under crates/")
         .to_path_buf()
 }
@@ -40,23 +41,36 @@ fn probe_path(root: &Path, name: &str) -> PathBuf {
 }
 
 fn docker_ok() -> bool {
-    Command::new("docker").arg("version")
-        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
-        .status().map(|s| s.success()).unwrap_or(false)
+    Command::new("docker")
+        .arg("version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 fn is_signed(bin: &Path) -> bool {
-    Command::new("codesign").args(["-d", "--entitlements", "-"]).arg(bin).output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).contains("com.apple.security.hypervisor")
-              || String::from_utf8_lossy(&o.stderr).contains("com.apple.security.hypervisor"))
+    Command::new("codesign")
+        .args(["-d", "--entitlements", "-"])
+        .arg(bin)
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout).contains("com.apple.security.hypervisor")
+                || String::from_utf8_lossy(&o.stderr).contains("com.apple.security.hypervisor")
+        })
         .unwrap_or(false)
 }
 
 fn ensure_signed(root: &Path, bin: &Path) {
-    if is_signed(bin) { return; }
+    if is_signed(bin) {
+        return;
+    }
     let plist = root.join("scripts/entitlements.plist");
     let out = Command::new("codesign")
-        .args(["--force", "--sign", "-", "--entitlements"]).arg(&plist).arg(bin)
+        .args(["--force", "--sign", "-", "--entitlements"])
+        .arg(&plist)
+        .arg(bin)
         .output();
     match out {
         Ok(o) if o.status.success() => {}
@@ -68,30 +82,46 @@ fn ensure_signed(root: &Path, bin: &Path) {
 /// Profile knobs (env-overridable so `just bench` quick vs full can tune them
 /// without recompiling). Defaults = quick profile.
 fn reps() -> usize {
-    std::env::var("CARRICK_PERF_REPS").ok().and_then(|s| s.parse().ok()).unwrap_or(5)
+    std::env::var("CARRICK_PERF_REPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5)
 }
 fn warmup_reps() -> usize {
-    std::env::var("CARRICK_PERF_WARMUP").ok().and_then(|s| s.parse().ok()).unwrap_or(1)
+    std::env::var("CARRICK_PERF_WARMUP")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1)
 }
 fn cooldown() -> Duration {
-    let secs = std::env::var("CARRICK_PERF_COOLDOWN_SECS").ok()
-        .and_then(|s| s.parse().ok()).unwrap_or(15);
+    let secs = std::env::var("CARRICK_PERF_COOLDOWN_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(15);
     Duration::from_secs(secs)
 }
 
 /// One engine's per-rep value plus the nproc it reported (for the norm gate).
-struct Sample { value: Option<f64>, nproc: Option<u64> }
+struct Sample {
+    value: Option<f64>,
+    nproc: Option<u64>,
+}
 
 fn parse_sample(output: &str, metric_key: &str) -> Sample {
     let m = Metrics::parse(output);
-    Sample { value: m.get_f64(metric_key), nproc: m.get_u64("nproc") }
+    Sample {
+        value: m.get_f64(metric_key),
+        nproc: m.get_u64("nproc"),
+    }
 }
 
 fn run_case(root: &Path, bin: &PathBuf, case: &PerfCase) -> Vec<ResultRow> {
     use base64::Engine as _;
     let probe = probe_path(root, case.probe);
     let raw = std::fs::read(&probe).expect("read probe");
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&raw).into_bytes();
+    let b64 = base64::engine::general_purpose::STANDARD
+        .encode(&raw)
+        .into_bytes();
 
     // Native (macOS host ceiling) build, if present — optional third engine.
     let native = native_probe_path(root, case.probe);
@@ -121,7 +151,10 @@ fn run_case(root: &Path, bin: &PathBuf, case: &PerfCase) -> Vec<ResultRow> {
             std::thread::sleep(cooldown());
             parse_sample(&out, case.metric_key)
         } else {
-            Sample { value: None, nproc: None }
+            Sample {
+                value: None,
+                nproc: None,
+            }
         };
         // --- carrick sample ---
         let c_id = invoke::perf_run_id();
@@ -144,8 +177,10 @@ fn run_case(root: &Path, bin: &PathBuf, case: &PerfCase) -> Vec<ResultRow> {
         let usable = rep >= warm && normalized && c.value.is_some() && d.value.is_some();
         if rep >= warm && !normalized {
             invalid += 1;
-            eprintln!("perf[{}] rep {rep}: INVALID (carrick nproc={:?}, docker nproc={:?}, want {CPU_PIN})",
-                      case.workload, c.nproc, d.nproc);
+            eprintln!(
+                "perf[{}] rep {rep}: INVALID (carrick nproc={:?}, docker nproc={:?}, want {CPU_PIN})",
+                case.workload, c.nproc, d.nproc
+            );
         }
         if usable {
             carrick_vals.push(c.value.unwrap());
@@ -154,14 +189,27 @@ fn run_case(root: &Path, bin: &PathBuf, case: &PerfCase) -> Vec<ResultRow> {
                 native_vals.push(v);
             }
         }
-        eprintln!("perf[{}] rep {rep}/{n}: macos={:?} carrick={:?} docker={:?}{}",
-                  case.workload, nat.value, c.value, d.value,
-                  if rep < warm { " (warmup, discarded)" } else { "" });
+        eprintln!(
+            "perf[{}] rep {rep}/{n}: macos={:?} carrick={:?} docker={:?}{}",
+            case.workload,
+            nat.value,
+            c.value,
+            d.value,
+            if rep < warm {
+                " (warmup, discarded)"
+            } else {
+                ""
+            }
+        );
     }
 
-    assert!(!carrick_vals.is_empty() && !docker_vals.is_empty(),
+    assert!(
+        !carrick_vals.is_empty() && !docker_vals.is_empty(),
         "perf[{}]: no valid normalized samples ({} invalid of {} reps) — check nproc pinning",
-        case.workload, invalid, n);
+        case.workload,
+        invalid,
+        n
+    );
 
     let date = today_string();
     let host = HostFacts::capture();
@@ -187,8 +235,16 @@ fn run_case(root: &Path, bin: &PathBuf, case: &PerfCase) -> Vec<ResultRow> {
             // native is the unpinned host ceiling (macOS has no cpuset); cpu_pin=0
             // records that, while `nproc` carries the real host core count.
             cpu_pin: if native { 0 } else { CPU_PIN },
-            fs_mode: if native { "native".into() } else { "host".into() },
-            image: if native { "(native macos host)".into() } else { IMAGE.into() },
+            fs_mode: if native {
+                "native".into()
+            } else {
+                "host".into()
+            },
+            image: if native {
+                "(native macos host)".into()
+            } else {
+                IMAGE.into()
+            },
             image_digest: if native { None } else { digest.clone() },
             git_sha: sha.clone(),
             run_id: format!("cr-perf-{}", std::process::id()),
@@ -203,12 +259,20 @@ fn run_case(root: &Path, bin: &PathBuf, case: &PerfCase) -> Vec<ResultRow> {
     rows.push(mk("docker", "docker", &docker_vals, docker_nproc));
     // Direction-aware comparison. Locate engines by name (rows now lead with the
     // optional macos row), so the carrick/docker ratio is order-independent.
-    let p50_of = |engine: &str| rows.iter().find(|r| r.engine == engine).map(|r| r.summary.p50);
+    let p50_of = |engine: &str| {
+        rows.iter()
+            .find(|r| r.engine == engine)
+            .map(|r| r.summary.p50)
+    };
     let cp = p50_of("carrick").unwrap_or(f64::NAN);
     let dp = p50_of("docker").unwrap_or(f64::NAN);
     let np = p50_of("macos");
     let ratio = if dp > 0.0 { cp / dp } else { f64::NAN };
-    let winner_is_carrick = if case.higher_is_better { cp >= dp } else { cp <= dp };
+    let winner_is_carrick = if case.higher_is_better {
+        cp >= dp
+    } else {
+        cp <= dp
+    };
     let winner = if ratio.is_nan() {
         "?"
     } else if winner_is_carrick {
@@ -227,15 +291,26 @@ fn run_case(root: &Path, bin: &PathBuf, case: &PerfCase) -> Vec<ResultRow> {
         let tail = if r.engine == "docker" {
             format!(
                 "  ratio(c/d)={ratio:.3}  WINNER={winner} ({factor:.2}x {})",
-                if case.higher_is_better { "throughput" } else { "latency" }
+                if case.higher_is_better {
+                    "throughput"
+                } else {
+                    "latency"
+                }
             )
         } else {
             String::new()
         };
         eprintln!(
             "perf[{}] {} {}={:.3}{} p95={:.3} (n={}){}{}",
-            case.workload, r.engine, r.metric, r.summary.p50, r.unit, r.summary.p95,
-            r.summary.n, if r.noisy { " NOISY" } else { "" }, tail
+            case.workload,
+            r.engine,
+            r.metric,
+            r.summary.p50,
+            r.unit,
+            r.summary.p95,
+            r.summary.n,
+            if r.noisy { " NOISY" } else { "" },
+            tail
         );
     }
     // vs-native efficiency: engine/macos on the raw metric (macos = unpinned host
@@ -244,8 +319,14 @@ fn run_case(root: &Path, bin: &PathBuf, case: &PerfCase) -> Vec<ResultRow> {
     if let Some(np) = np.filter(|v| *v > 0.0) {
         eprintln!(
             "perf[{}] vs-native: carrick={:.2}x docker={:.2}x (engine/macos; macos={:.3}{} ceiling, unpinned {} cores)",
-            case.workload, cp / np, dp / np, np, case.unit,
-            native_nproc.map(|n| n.to_string()).unwrap_or_else(|| "?".into())
+            case.workload,
+            cp / np,
+            dp / np,
+            np,
+            case.unit,
+            native_nproc
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "?".into())
         );
     }
     rows
@@ -259,7 +340,10 @@ fn native_probe_path(root: &Path, name: &str) -> PathBuf {
 
 /// YYYY-MM-DD from `date` (avoids a chrono dep).
 fn today_string() -> String {
-    Command::new("date").args(["+%Y-%m-%d"]).output().ok()
+    Command::new("date")
+        .args(["+%Y-%m-%d"])
+        .output()
+        .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| "unknown-date".into())
@@ -290,7 +374,10 @@ fn perf_gate() {
     // All probes built?
     for case in CASES {
         if !probe_path(&root, case.probe).exists() {
-            eprintln!("SKIP perf_gate: probe {} not built (run scripts/build-probes.sh)", case.probe);
+            eprintln!(
+                "SKIP perf_gate: probe {} not built (run scripts/build-probes.sh)",
+                case.probe
+            );
             return;
         }
     }
@@ -298,12 +385,25 @@ fn perf_gate() {
 
     // Optional subset: CARRICK_PERF_FILTER=<substr> runs only matching workloads.
     let filter = std::env::var("CARRICK_PERF_FILTER").ok();
+    let date = today_string();
     for case in CASES {
         if let Some(f) = &filter {
             if !case.workload.contains(f.as_str()) {
                 continue;
             }
         }
-        run_case(&root, &bin, case);
+        if case.cross_boundary {
+            perf_support::xboundary::run_cross_boundary(
+                &root,
+                &bin,
+                case,
+                reps(),
+                warmup_reps().min(reps()),
+                cooldown(),
+                &date,
+            );
+        } else {
+            run_case(&root, &bin, case);
+        }
     }
 }
