@@ -12,7 +12,7 @@
 
 ## Background the engineer needs
 
-- **You cannot run carrick and Docker at the same time during a timed sample** (they fight for perf-cores; see `docs/superpowers/specs/2026-06-02-carrick-vs-docker-benchmark-design.md` §2). This plan's driver is strictly serial — it spawns one engine, waits for full exit, cools down, then the other. Never add a fan-out to a timed path.
+- **You cannot run carrick and Docker at the same time during a timed sample** (they fight for perf-cores; see `docs/archive/superpowers/specs/2026-06-02-carrick-vs-docker-benchmark-design.md` §2). This plan's driver is strictly serial — it spawns one engine, waits for full exit, cools down, then the other. Never add a fan-out to a timed path.
 - **carrick must be codesigned to run a guest.** `cargo build` strips the hypervisor entitlement → every run fails `HV_DENIED (0xfae94007)`. Build with `just build`; the test also calls `ensure_signed()` as a belt.
 - **Probe binaries are static aarch64-musl ELFs** auto-discovered from `conformance-probes/src/bin/*.rs` and built in a container by `scripts/build-probes.sh` to `conformance-probes/target/aarch64-unknown-linux-musl/release/`. Add a probe by dropping a file in `src/bin/` (no Cargo.toml edit).
 - **Probe injection path (reused verbatim):** the probe is base64-encoded onto the guest's stdin and decoded+exec'd via `PROBE_SNIPPET = "base64 -d > /tmp/p && chmod +x /tmp/p && /tmp/p"`, under `carrick run --platform linux/arm64 --raw --fs host ubuntu:24.04 /bin/sh -c <snippet>` and `docker run -i --rm --platform linux/arm64 ubuntu:24.04 /bin/sh -c <snippet>`.
@@ -1203,10 +1203,10 @@ git add docs/perf-results/
 git commit -m "$(printf 'chore(bench): first TCP_RR baseline (carrick vs docker)\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>')"
 ```
 
-- [ ] **Step 6: Record the headline in the design doc's results section (manual).** Append a short note to `docs/superpowers/specs/2026-06-02-carrick-vs-docker-benchmark-design.md` under a new `## Results (running log)` heading: the date, the carrick/docker p50 µs, the ratio, and whether the thesis prediction (carrick wins loopback RR) held. Commit:
+- [ ] **Step 6: Record the headline in the design doc's results section (manual).** Append a short note to `docs/archive/superpowers/specs/2026-06-02-carrick-vs-docker-benchmark-design.md` under a new `## Results (running log)` heading: the date, the carrick/docker p50 µs, the ratio, and whether the thesis prediction (carrick wins loopback RR) held. Commit:
 
 ```bash
-git add docs/superpowers/specs/2026-06-02-carrick-vs-docker-benchmark-design.md
+git add docs/archive/superpowers/specs/2026-06-02-carrick-vs-docker-benchmark-design.md
 git commit -m "$(printf 'docs(bench): log first TCP_RR result vs thesis prediction\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>')"
 ```
 
