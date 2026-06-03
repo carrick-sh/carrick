@@ -1006,6 +1006,13 @@ pub(crate) fn synthetic_task_dir(pid: u32) -> Option<Vec<String>> {
     if crate::host_proc::is_guest_process(pid) {
         return Some(vec![pid.to_string()]);
     }
+    // The calling process is always its own live task, so `/proc/self` (which
+    // resolves to `std::process::id()`) must stay openable even when no guest
+    // thread is registered (unit tests) or `is_guest_process` is gated by a
+    // namespace region this process was never registered in.
+    if pid == std::process::id() {
+        return Some(vec![pid.to_string()]);
+    }
     None
 }
 
