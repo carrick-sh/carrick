@@ -863,6 +863,11 @@ struct HvfInner {
     /// child got swapped in by `fork()`; ordering of `_vm` vs `vcpu`
     /// Drop trips a "no VM or vCPU available" assertion).
     is_forked_child: bool,
+    /// Like `is_forked_child`, but RESET on execve: true only for a LIVE forked
+    /// child that has not yet exec'd. Drives the `forked=` diagnostic probes
+    /// (stale-stage2 reasoning); distinct from the sticky shutdown flag above,
+    /// which must stay set across execve to keep the `_exit`-without-JSON path.
+    forked_no_exec: bool,
     /// Process-wide guest ranges currently mapped `PROT_NONE`.
     /// Thread siblings share this metadata so syscall-path memory access checks
     /// observe `mprotect(PROT_NONE)` changes made by any guest thread.
@@ -1442,6 +1447,7 @@ impl HvfTrapEngine {
                 last_exit_class: 0,
                 last_fault_esr: 0,
                 is_forked_child: false,
+                forked_no_exec: false,
                 protections: std::sync::Arc::new(MemoryProtections::default()),
                 page_tables: std::sync::Arc::new(parking_lot::Mutex::new(None)),
                 last_syscall_nr: None,
@@ -2072,7 +2078,7 @@ impl HvfInner {
             execute: true,
         });
         let r = unsafe { applevisor_sys::hv_vm_map(host.cast(), ipa, size, u64::from(perms)) };
-        crate::probes::hv_vm_map_alias(va, ipa, size as u64, r as i32, self.is_forked_child as i32);
+        crate::probes::hv_vm_map_alias(va, ipa, size as u64, r as i32, self.forked_no_exec as i32);
         if r != 0 {
             return Err(TrapError::Hypervisor(format!(
                 "hv_vm_map alias va=0x{va:x} ipa=0x{ipa:x} size={size} failed: 0x{r:x}"
@@ -2094,7 +2100,7 @@ impl HvfInner {
                 .as_ref()
                 .map(|m| m.debug_walk(va))
                 .unwrap_or([0u64; 4]);
-            let flag = (self.is_forked_child as i32) | ((pt_res.is_err() as i32) << 1);
+            let flag = (self.forked_no_exec as i32) | ((pt_res.is_err() as i32) << 1);
             crate::probes::pt_alias_walk(va, descs, flag);
         }
         pt_res.map_err(|e| TrapError::Hypervisor(format!("alias page-table build failed: {e}")))?;
@@ -3686,6 +3692,7 @@ impl HvfInner {
             last_exit_class: snapshot.last_exit_class,
             last_fault_esr: 0,
             is_forked_child: pid == 0,
+            forked_no_exec: pid == 0,
             protections: inherited_protections,
             page_tables: inherited_page_tables,
             last_syscall_nr: None,
@@ -3812,6 +3819,7 @@ impl HvfInner {
             last_exit_class: snapshot.last_exit_class,
             last_fault_esr: 0,
             is_forked_child: false,
+            forked_no_exec: false,
             protections,
             page_tables,
             last_syscall_nr: None,
@@ -3955,6 +3963,7 @@ impl HvfInner {
             last_exit_class: 0,
             last_fault_esr: 0,
             is_forked_child: was_forked_child,
+            forked_no_exec: false, // execve gives a fresh VM: no longer a live forked-no-exec child
             // execve replaces the address space; any prior PROT_NONE ranges are
             // gone. The new image starts with none until it mmaps them.
             protections: std::sync::Arc::new(MemoryProtections::default()),
