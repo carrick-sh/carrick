@@ -5,3 +5,4 @@
 /conformance-probes/target/
 .claude/
 /rust_out
+/.bench-scratch/
