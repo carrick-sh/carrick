@@ -575,6 +575,64 @@ fn rebuilt_vm_cell() -> &'static parking_lot::Mutex<Option<SharedVm>> {
     CELL.get_or_init(|| parking_lot::Mutex::new(None))
 }
 
+/// Process-global registry of dynamic MAP_SHARED-file alias mappings, so a vCPU
+/// can re-establish one in ITS shared VM after fork dropped it.
+///
+/// Threads share ONE hv_vm, but `fork()` tears that VM down and rebuilds it from
+/// ONLY the forking thread's per-thread `mappings` list (see `HvfInner::fork`).
+/// A `guest_shared` alias mapped by a SIBLING thread is therefore lost from the
+/// rebuilt VM, and any later access stage-2-faults (the go-build telemetry
+/// counter: a counter file `mmap(MAP_SHARED)`'d on one thread, read via LDAR on
+/// another after `go` forks `compile`). arm64 HVF has no stage-2 TLB shootdown,
+/// so we cannot push the map to siblings eagerly; instead each vCPU LAZILY
+/// re-maps on the fault, keyed off this registry.
+///
+/// Only `guest_shared` (MAP_SHARED-file) aliases are registered: their host
+/// backing is a `MAP_SHARED` mmap that stays valid across fork and threads, so
+/// re-`hv_vm_map`'ing the SAME host address is coherent. Private/anon aliases
+/// are per-thread-snapshotted by the fork path and must NOT be re-shared here.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Clone, Copy)]
+struct AliasBacking {
+    ipa: u64,
+    host_addr: usize,
+    size: usize,
+    perms: u64,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn alias_registry() -> &'static parking_lot::Mutex<Vec<AliasBacking>> {
+    static CELL: std::sync::OnceLock<parking_lot::Mutex<Vec<AliasBacking>>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(|| parking_lot::Mutex::new(Vec::new()))
+}
+
+/// Diagnostic: lazy-alias re-map count (CARRICK_REMAP_STATS logs every 256th).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub static ALIAS_REMAP_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Record a `guest_shared` alias so any vCPU whose VM lost it (post-fork) can
+/// re-establish it. Idempotent per IPA.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn register_shared_alias(b: AliasBacking) {
+    let mut reg = alias_registry().lock();
+    if let Some(e) = reg.iter_mut().find(|e| e.ipa == b.ipa) {
+        *e = b;
+    } else {
+        reg.push(b);
+    }
+}
+
+/// Find the registered alias whose `hv_vm_map`'d IPA window contains `ipa`.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn lookup_shared_alias(ipa: u64) -> Option<AliasBacking> {
+    alias_registry()
+        .lock()
+        .iter()
+        .find(|e| ipa >= e.ipa && ipa < e.ipa.saturating_add(e.size as u64))
+        .copied()
+}
+
 /// Process-global count of live HVF vCPUs (created minus destroyed). Pure
 /// diagnostic: reported in the fork__quiesce phase-2 probe so a `carrick trace`
 /// shows exactly how many vCPUs are alive when the forker calls hv_vm_destroy.
@@ -2105,6 +2163,19 @@ impl HvfInner {
         }
         pt_res.map_err(|e| TrapError::Hypervisor(format!("alias page-table build failed: {e}")))?;
         let guest_shared = host_mapping.guest_shared();
+        // Register guest_shared (MAP_SHARED-file) aliases process-globally so a
+        // sibling vCPU whose shared VM lost this mapping after a fork rebuild can
+        // re-establish it lazily on fault (see `alias_registry`). The host backing
+        // is a MAP_SHARED mmap valid across threads + fork, so re-`hv_vm_map`'ing
+        // the SAME host address into the rebuilt VM is coherent.
+        if guest_shared {
+            register_shared_alias(AliasBacking {
+                ipa,
+                host_addr: host as usize,
+                size,
+                perms: u64::from(perms),
+            });
+        }
         self.mappings.push(HvfMappedRegion {
             start: va,
             ipa,
@@ -2191,6 +2262,9 @@ impl HvfInner {
         // guest's user CPU time from this. (hv_vcpu_get_exec_time was measured
         // to under-report ~40× here, so it isn't used.) Accumulated lock-free
         // into this vCPU thread's slot; summed process-wide by `guest_cpu`.
+        // Bounds lazy re-mapping of a dropped guest_shared alias (below) so a
+        // genuinely-unmappable fault still terminates instead of spinning.
+        let mut alias_remap_attempts: u32 = 0;
         let exit = loop {
             let run_start = std::time::Instant::now();
             let run_result = self.vcpu.run();
@@ -2226,6 +2300,59 @@ impl HvfInner {
                 }
                 return Ok(None);
             }
+            // A direct EL0 abort on a high-VA alias address that THIS vCPU's
+            // shared VM is missing: a `fork()` rebuilt the shared VM from only the
+            // forking thread's mappings, dropping a `guest_shared` alias mapped by
+            // a sibling thread (the go-build telemetry counter). arm64 HVF has no
+            // stage-2 TLB shootdown, so re-running alone never fixes it — but the
+            // host backing is a MAP_SHARED mmap still live at the registered host
+            // address, so re-`hv_vm_map`'ing it into THIS (shared) VM restores the
+            // stage-2 entry for every thread, and the instruction re-executes
+            // cleanly. Only registered aliases are touched, so a genuine bad
+            // access to unregistered memory still faults. Bounded as a backstop.
+            if exit.reason == ExitReason::EXCEPTION
+                && is_aarch64_el0_abort_exception(exit.exception.syndrome)
+                && crate::memory::is_high_va(exit.exception.virtual_address)
+                && alias_remap_attempts < 8
+            {
+                let fault_ipa = if exit.exception.physical_address != 0 {
+                    exit.exception.physical_address
+                } else {
+                    // Aliases are placed at va = HIGH_VA_THRESHOLD + (ipa - BASE).
+                    exit.exception
+                        .virtual_address
+                        .wrapping_sub(crate::memory::LINUX_HIGH_VA_THRESHOLD)
+                        .wrapping_add(crate::memory::LINUX_ALIAS_IPA_BASE)
+                };
+                if let Some(b) = lookup_shared_alias(fault_ipa) {
+                    alias_remap_attempts += 1;
+                    // SAFETY: `host_addr` is a live MAP_SHARED mmap (the alias
+                    // backing) registered by map_host_alias; re-mapping the same
+                    // host range to the same IPA in this VM is idempotent. A
+                    // nonzero rc (e.g. already mapped by a racing sibling) is fine
+                    // — re-run and re-walk regardless.
+                    let _ = unsafe {
+                        applevisor_sys::hv_vm_map(
+                            b.host_addr as *mut std::ffi::c_void,
+                            b.ipa,
+                            b.size,
+                            b.perms,
+                        )
+                    };
+                    crate::probes::hv_vm_map_alias(
+                        exit.exception.virtual_address,
+                        b.ipa,
+                        b.size as u64,
+                        0,
+                        self.forked_no_exec as i32,
+                    );
+                    let n = ALIAS_REMAP_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if n % 256 == 0 && std::env::var_os("CARRICK_REMAP_STATS").is_some() {
+                        eprintln!("ALIAS_REMAP n={n} ipa=0x{:x}", b.ipa);
+                    }
+                    continue;
+                }
+            }
             break exit;
         };
         if exit.reason != ExitReason::EXCEPTION {
@@ -2258,8 +2385,15 @@ impl HvfInner {
                         *slot = self.vcpu.get_reg(*r).unwrap_or(0);
                     }
                 }
+                // Does THIS process/vCPU have the faulting alias in its OWN
+                // re-map list (so its hv_vm has the stage-2 mapping)? A fork
+                // child rebuilds a fresh hv_vm and replays only the mappings it
+                // inherited; an alias mapped by a sibling thread / after this
+                // process forked is absent here -> its hv_vm faults on it.
+                let va = exception.virtual_address;
+                let mapped_here = self.mappings.iter().any(|m| m.start <= va && va < m.end);
                 eprintln!(
-                    "FAULTDUMP pid={} esr=0x{:x} exit_va=0x{:x} exit_pa=0x{:x} pc=0x{:x} elr_stale=0x{:x} far_stale=0x{:x} sp=0x{:x}",
+                    "FAULTDUMP pid={} esr=0x{:x} exit_va=0x{:x} exit_pa=0x{:x} pc=0x{:x} elr_stale=0x{:x} far_stale=0x{:x} sp=0x{:x} forked_child={} forked_no_exec={} nmappings={} mapped_here={}",
                     unsafe { libc::getpid() },
                     exception.syndrome,
                     exception.virtual_address,
@@ -2268,6 +2402,10 @@ impl HvfInner {
                     elr,
                     far_reg,
                     sp,
+                    self.is_forked_child,
+                    self.forked_no_exec,
+                    self.mappings.len(),
+                    mapped_here,
                 );
                 eprintln!(
                     "FAULTGPR pid={} x0=0x{:x} x1=0x{:x} x2=0x{:x} x3=0x{:x} x4=0x{:x} x5=0x{:x} x6=0x{:x} x7=0x{:x} x8=0x{:x} x9=0x{:x} x10=0x{:x} x11=0x{:x} x12=0x{:x} x13=0x{:x} x14=0x{:x} x15=0x{:x}",
