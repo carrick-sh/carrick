@@ -1040,6 +1040,37 @@ impl GuestMemory for LinearMemory {
 pub enum DispatchError {
     #[error("guest memory read length does not fit this host: {0}")]
     LengthTooLarge(u64),
+    /// A guest-visible errno. Unlike [`DispatchError::LengthTooLarge`] (which is
+    /// a fatal, unrepresentable condition that aborts the run), this is lowered
+    /// to a [`DispatchOutcome::Errno`] at the dispatch boundary
+    /// ([`lower_handler_result`]). It lets a handler `?`-propagate an errno —
+    /// `let x = helper()?;` instead of `match helper() { Err(e) => return
+    /// Ok(e.into()), Ok(v) => v }` — collapsing the pervasive errno-forwarding
+    /// boilerplate. The guest observes exactly the same `-errno` either way.
+    #[error("guest-visible errno: {0}")]
+    Errno(i32),
+}
+
+impl From<i32> for DispatchError {
+    /// A raw Linux errno propagated via `?` becomes [`DispatchError::Errno`],
+    /// lowered back to a guest errno outcome at the dispatch boundary.
+    fn from(errno: i32) -> Self {
+        DispatchError::Errno(errno)
+    }
+}
+
+/// Lower a syscall handler's result for the run loop. A
+/// [`DispatchError::Errno`] is a guest-visible errno, so it becomes a normal
+/// [`DispatchOutcome::Errno`]; every other `DispatchError` variant is a fatal
+/// condition that stays `Err` and aborts the guest run. This is what lets
+/// handlers `?`-propagate an errno while `LengthTooLarge` still aborts.
+fn lower_handler_result(
+    result: Result<DispatchOutcome, DispatchError>,
+) -> Result<DispatchOutcome, DispatchError> {
+    match result {
+        Err(DispatchError::Errno(errno)) => Ok(DispatchOutcome::Errno { errno }),
+        other => other,
+    }
 }
 
 /// Outcome of [`SyscallDispatcher::try_vfs_open`].
@@ -1909,8 +1940,10 @@ impl SyscallDispatcher {
 
         let result = self.dispatch_normalized(request, memory, reporter, thread);
         let outcome = match result {
-            Some(Ok(outcome)) => outcome,
-            Some(Err(error)) => return Some(Err(error)),
+            Some(r) => match lower_handler_result(r) {
+                Ok(outcome) => outcome,
+                Err(fatal) => return Some(Err(fatal)),
+            },
             None => DispatchOutcome::Errno {
                 errno: LINUX_ENOSYS,
             },
@@ -2089,7 +2122,7 @@ impl SyscallDispatcher {
         // dispatched here first; the borrow of memory/reporter is scoped to
         // the call, so the legacy match below can still use them for the rest.
         if let Some(result) = self.dispatch_normalized(request, memory, reporter, thread) {
-            let outcome = result?;
+            let outcome = lower_handler_result(result)?;
             let (retval, errno) = outcome.retval_errno();
             reporter.record(CompatEvent::SyscallReturn {
                 number: request.number,

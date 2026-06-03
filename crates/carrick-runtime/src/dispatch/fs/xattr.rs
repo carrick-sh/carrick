@@ -64,31 +64,18 @@ impl SyscallDispatcher {
         flags: u64,
     ) -> Result<DispatchOutcome, DispatchError> {
         // setxattr(path/fd, name, value, size, flags)
-        let resolved = match self.xattr_target_path(memory, target) {
-            Ok(p) => p,
-            Err(errno) => return Ok(errno.into()),
-        };
-        let name = match read_guest_c_string(memory, name_ptr.0) {
-            Ok(name) => name,
-            Err(errno) => return Ok(errno.into()),
-        };
+        let resolved = self.xattr_target_path(memory, target)?;
+        let name = read_guest_c_string(memory, name_ptr.0)?;
         let size = size as usize;
         let flags = flags as i32;
-        let value = match memory.read_bytes(value_ptr.0, size) {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                return Ok(LINUX_EFAULT.into());
-            }
-        };
-        match self
-            .fs
+        let value = memory
+            .read_bytes(value_ptr.0, size)
+            .map_err(|_| DispatchError::Errno(LINUX_EFAULT))?;
+        self.fs
             .rootfs_vfs
             .overlay
-            .set_xattr(&resolved, &name, &value, flags)
-        {
-            Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
-            Err(errno) => Ok(errno.into()),
-        }
+            .set_xattr(&resolved, &name, &value, flags)?;
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 
     pub(super) fn getxattr(
@@ -100,20 +87,11 @@ impl SyscallDispatcher {
         size: u64,
     ) -> Result<DispatchOutcome, DispatchError> {
         // getxattr(path/fd, name, value, size)
-        let resolved = match self.xattr_target_path(memory, target) {
-            Ok(p) => p,
-            Err(errno) => return Ok(errno.into()),
-        };
-        let name = match read_guest_c_string(memory, name_ptr.0) {
-            Ok(name) => name,
-            Err(errno) => return Ok(errno.into()),
-        };
+        let resolved = self.xattr_target_path(memory, target)?;
+        let name = read_guest_c_string(memory, name_ptr.0)?;
         let buf_addr = value_ptr.0;
         let size = size as usize;
-        let value = match self.fs.rootfs_vfs.overlay.get_xattr(&resolved, &name) {
-            Ok(value) => value,
-            Err(errno) => return Ok(errno.into()),
-        };
+        let value = self.fs.rootfs_vfs.overlay.get_xattr(&resolved, &name)?;
         // size == 0 is the "tell me how big" probe: return the length without
         // copying anything.
         if size == 0 {
@@ -124,9 +102,9 @@ impl SyscallDispatcher {
         if value.len() > size {
             return Ok(LINUX_ERANGE.into());
         }
-        if memory.write_bytes(buf_addr, &value).is_err() {
-            return Ok(LINUX_EFAULT.into());
-        }
+        memory
+            .write_bytes(buf_addr, &value)
+            .map_err(|_| DispatchError::Errno(LINUX_EFAULT))?;
         Ok(DispatchOutcome::Returned {
             value: value.len() as i64,
         })
@@ -140,16 +118,10 @@ impl SyscallDispatcher {
         size: u64,
     ) -> Result<DispatchOutcome, DispatchError> {
         // listxattr(path/fd, list, size)
-        let resolved = match self.xattr_target_path(memory, target) {
-            Ok(p) => p,
-            Err(errno) => return Ok(errno.into()),
-        };
+        let resolved = self.xattr_target_path(memory, target)?;
         let buf_addr = list_ptr.0;
         let size = size as usize;
-        let names = match self.fs.rootfs_vfs.overlay.list_xattr(&resolved) {
-            Ok(names) => names,
-            Err(errno) => return Ok(errno.into()),
-        };
+        let names = self.fs.rootfs_vfs.overlay.list_xattr(&resolved)?;
         // Assemble the NUL-separated, NUL-terminated name list Linux returns.
         let mut list = Vec::new();
         for n in &names {
@@ -164,9 +136,9 @@ impl SyscallDispatcher {
         if list.len() > size {
             return Ok(LINUX_ERANGE.into());
         }
-        if memory.write_bytes(buf_addr, &list).is_err() {
-            return Ok(LINUX_EFAULT.into());
-        }
+        memory
+            .write_bytes(buf_addr, &list)
+            .map_err(|_| DispatchError::Errno(LINUX_EFAULT))?;
         Ok(DispatchOutcome::Returned {
             value: list.len() as i64,
         })
@@ -179,20 +151,12 @@ impl SyscallDispatcher {
         name_ptr: GuestPtr,
     ) -> Result<DispatchOutcome, DispatchError> {
         // removexattr(path/fd, name)
-        let resolved = match self.xattr_target_path(memory, target) {
-            Ok(p) => p,
-            Err(errno) => return Ok(errno.into()),
-        };
+        let resolved = self.xattr_target_path(memory, target)?;
         // Path existence (missing -> ENOENT, distinct from ENODATA for an
         // absent attribute on a file that DOES exist; removexattr02 checks
         // both) is now enforced centrally in xattr_target_path.
-        let name = match read_guest_c_string(memory, name_ptr.0) {
-            Ok(name) => name,
-            Err(errno) => return Ok(errno.into()),
-        };
-        match self.fs.rootfs_vfs.overlay.remove_xattr(&resolved, &name) {
-            Ok(()) => Ok(DispatchOutcome::Returned { value: 0 }),
-            Err(errno) => Ok(errno.into()),
-        }
+        let name = read_guest_c_string(memory, name_ptr.0)?;
+        self.fs.rootfs_vfs.overlay.remove_xattr(&resolved, &name)?;
+        Ok(DispatchOutcome::Returned { value: 0 })
     }
 }
