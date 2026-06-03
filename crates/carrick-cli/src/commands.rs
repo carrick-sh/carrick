@@ -183,6 +183,10 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                     unsafe { std::env::set_var(k, v) };
                 }
             }
+            // Fork-shared alias-IPA counter, before any guest fork (see the Run
+            // handler / alloc_alias_ipa — prevents cross-process alias-IPA reuse
+            // in the unflushable shared stage-2 TLB).
+            carrick_runtime::memory::init_alias_ipa_allocator();
             let mut dispatcher = if rootfs_layers.is_empty() {
                 SyscallDispatcher::new()
             } else {
@@ -484,6 +488,13 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 stop_signal,
                 stop_timeout,
             };
+
+            // Stand up the fork-shared alias-IPA counter NOW, in the root process,
+            // before any guest (or the --pid-private supervisor) forks — every
+            // host-forked descendant must inherit the one MAP_SHARED counter so no
+            // two guest processes ever reuse an alias IPA in the shared hv_vm
+            // (a latent cross-process stage-2 coherence hazard). See alloc_alias_ipa.
+            carrick_runtime::memory::init_alias_ipa_allocator();
 
             // Detached (`carrick run -d`): fork into the background under a
             // per-container supervisor, print the id, and return. Manage it with
