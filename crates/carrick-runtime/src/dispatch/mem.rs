@@ -94,9 +94,11 @@ pub(super) struct MemState {
     /// [`SyscallDispatcher::set_auxv_image`]. Mirrored to `/proc/self/auxv`.
     /// Empty until an image with an initial stack is loaded.
     pub linux_auxv_image: Vec<u8>,
-    /// Bump cursor for the low-IPA arena backing dynamic high-VA aliases
-    /// (`crate::memory::LINUX_ALIAS_IPA_BASE`). See `is_high_va`.
-    pub alias_ipa_next: u64,
+    // NOTE: the alias-IPA cursor used to live here, but a per-process field is
+    // COPIED on fork, so sibling guest processes reused the same IPAs into the
+    // shared `hv_vm` (whose stage-2 TLB can't be flushed) and read each other's
+    // stale pages — the go-build crash. It now lives in a fork-SHARED counter:
+    // `crate::memory::alloc_alias_ipa`.
 }
 
 impl MemState {
@@ -113,7 +115,6 @@ impl MemState {
             free_regions: Vec::new(),
             address_space_regions: None,
             linux_auxv_image: Vec::new(),
-            alias_ipa_next: crate::memory::LINUX_ALIAS_IPA_BASE,
         }
     }
 }
@@ -450,28 +451,17 @@ impl SyscallDispatcher {
                         }
                     };
                     if let Some(dup_fd) = dup_fd {
-                        // Reserve the IPA in 2 MiB blocks so no two file mappings
-                        // share a stage-1 block. The stage-1 mapping covers EXACTLY
-                        // the guest's page-aligned `length`; map_host_alias rounds
-                        // the host/hv_vm_map size up to the 16 KiB HVF granule, so a
-                        // sub-16 KiB mapping never spills extra guest pages into a
-                        // neighbouring region (the high-VA anon path does the same).
-                        const TWO_MIB: u64 = 1 << 21;
-                        let alias_len = align_up_u64(length, TWO_MIB).unwrap_or(length);
-                        let ipa = {
-                            let mut mem = this.mem.lock();
-                            let base = mem.alias_ipa_next;
-                            let limit = crate::memory::LINUX_ALIAS_IPA_BASE
-                                + crate::memory::LINUX_ALIAS_IPA_SIZE;
-                            match base.checked_add(alias_len).filter(|e| *e <= limit) {
-                                Some(end) => {
-                                    mem.alias_ipa_next = end;
-                                    Some(base)
-                                }
-                                None => None,
-                            }
-                        };
-                        let Some(ipa) = ipa else {
+                        // Reserve a FRESH alias IPA (2 MiB-block-aligned so no two
+                        // file mappings share a stage-1 block). The allocator is
+                        // PROCESS-TREE-GLOBAL and monotonic — never reused — because
+                        // the one shared `hv_vm`'s stage-2 TLB can't be flushed on
+                        // arm64, so reusing an IPA across host-forked guests reads a
+                        // stale page (a latent cross-process coherence hazard; NOT
+                        // the go-build crash, which is a separate trap-path bug).
+                        // The stage-1 mapping still covers EXACTLY the guest's
+                        // page-aligned `length`; map_host_alias rounds the
+                        // host/hv_vm_map size up to the 16 KiB HVF granule.
+                        let Some(ipa) = crate::memory::alloc_alias_ipa(length) else {
                             // Alias arena exhausted: drop the dup, surface ENOMEM.
                             unsafe { libc::close(dup_fd) };
                             return Ok(LINUX_ENOMEM.into());
@@ -624,28 +614,16 @@ impl SyscallDispatcher {
                         }
                         return Ok(LINUX_ENOMEM.into());
                     }
-                    // Reserve the IPA in 2 MiB blocks so no two aliases share a
-                    // stage-1 block. NOTE: the stage-1 mapping must cover EXACTLY the
-                    // guest's page-aligned `length`, NOT a 16 KiB-rounded length — a
-                    // sub-16 KiB mmap rounded up to the HVF granule would map extra
-                    // 4 KiB guest pages and clobber the next region's page-table
-                    // entries (redirecting its fetches to the wrong IPA). hv_vm_map's
-                    // own 16 KiB IPA-size requirement is satisfied separately inside
-                    // map_host_alias via the (page-rounded) host mapping length.
-                    const TWO_MIB: u64 = 1 << 21;
-                    let alias_len = align_up_u64(length, TWO_MIB).unwrap_or(length);
-                    let ipa = {
-                        let mut mem = this.mem.lock();
-                        let base = mem.alias_ipa_next;
-                        let limit =
-                            crate::memory::LINUX_ALIAS_IPA_BASE + crate::memory::LINUX_ALIAS_IPA_SIZE;
-                        match base.checked_add(alias_len).filter(|e| *e <= limit) {
-                            Some(end) => {
-                                mem.alias_ipa_next = end;
-                                base
-                            }
-                            None => return Ok(LINUX_ENOMEM.into()),
-                        }
+                    // Reserve a FRESH alias IPA (2 MiB-block-aligned). Process-tree-
+                    // global + monotonic, NEVER reused — the shared `hv_vm`'s stage-2
+                    // TLB can't be flushed on arm64, so a reused IPA reads a stale
+                    // page. NOTE: the stage-1 mapping must cover EXACTLY the guest's
+                    // page-aligned `length`, NOT the 2 MiB block — a sub-16 KiB mmap
+                    // rounded up would map extra 4 KiB guest pages and clobber the next
+                    // region's page-table entries. hv_vm_map's own 16 KiB IPA-size
+                    // requirement is satisfied separately inside map_host_alias.
+                    let Some(ipa) = crate::memory::alloc_alias_ipa(length) else {
+                        return Ok(LINUX_ENOMEM.into());
                     };
                     // A high-VA mmap frequently overlays an earlier PROT_NONE
                     // reservation (Rosetta reserves the x86 stack/binary span anon

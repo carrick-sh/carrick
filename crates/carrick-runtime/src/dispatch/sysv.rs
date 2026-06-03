@@ -393,22 +393,10 @@ impl SyscallDispatcher {
             // space — same path mmap(MAP_SHARED, fd) uses for file mappings.
             let hvf_page = crate::trap::HVF_PAGE_SIZE;
             let map_len = align_up_u64(size as u64, hvf_page).unwrap_or(size as u64);
-            const TWO_MIB: u64 = 1 << 21;
-            let alias_len = align_up_u64(map_len, TWO_MIB).unwrap_or(map_len);
-            let ipa = {
-                let mut mem = this.mem.lock();
-                let base = mem.alias_ipa_next;
-                let limit = crate::memory::LINUX_ALIAS_IPA_BASE
-                    + crate::memory::LINUX_ALIAS_IPA_SIZE;
-                match base.checked_add(alias_len).filter(|e| *e <= limit) {
-                    Some(end) => {
-                        mem.alias_ipa_next = end;
-                        Some(base)
-                    }
-                    None => None,
-                }
-            };
-            let Some(ipa) = ipa else {
+            // Fresh, process-tree-global, never-reused alias IPA (see
+            // crate::memory::alloc_alias_ipa — the shared hv_vm's stage-2 TLB can't
+            // be flushed on arm64, so an alias IPA must never be reused).
+            let Some(ipa) = crate::memory::alloc_alias_ipa(map_len) else {
                 unsafe { libc::close(host_fd) };
                 return Ok(LINUX_ENOMEM.into());
             };

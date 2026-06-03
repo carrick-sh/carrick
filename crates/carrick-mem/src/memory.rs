@@ -358,6 +358,114 @@ pub const LINUX_HIGH_VA_THRESHOLD: u64 = 0x100_0000_0000; // 1 TiB (2^40)
 pub const LINUX_ALIAS_IPA_BASE: u64 = 0x18_0000_0000; // 96 GiB
 pub const LINUX_ALIAS_IPA_SIZE: u64 = 0x10_0000_0000; // 64 GiB of alias space
 
+// ---- Fork-shared, monotonic alias-IPA allocator ----
+//
+// carrick shares ONE `hv_vm` across the whole guest process tree (`SharedVm`),
+// and arm64 HVF cannot flush the stage-2 TLB (`TLBI IPAS2E1` is EL2-only). So an
+// IPA, once `hv_vm_map`'d, can NEVER be safely re-mapped to different host memory
+// for the VM's lifetime — a reused IPA reads the PREVIOUS mapping's page through
+// the unflushed TLB. The old bump cursor lived in `MemState.alias_ipa_next`, a
+// per-process struct field COPIED on fork, so each host-forked guest restarted
+// it at `LINUX_ALIAS_IPA_BASE` and sibling processes could hand the SAME IPA
+// into the shared VM — a latent cross-process stage-2 coherence hazard.
+//
+// Fix: ONE monotonic counter, SHARED across every host-forked guest process,
+// never reused. A per-process `static`/struct field is copied on fork and so
+// cannot be shared — the counter lives in a `MAP_SHARED` page mmap'd before the
+// first guest fork, which every host descendant inherits. 64 GiB / 2 MiB = 32768
+// distinct alias mappings before exhaustion (→ ENOMEM); recreating the vCPU to
+// allow safe reuse is the documented follow-up for that pathological regime.
+//
+// SCOPE NOTE (verified empirically 2026-06-03): this closes a real latent bug,
+// but it is NOT the `go build` crash. That crash was MISDIAGNOSED as alias
+// reuse / post-fork coherence. With this allocator the alias IPAs are provably
+// distinct (0x1800000000, 0x1800200000, …, `forked=0`, `hv_vm_map rc=0`) and the
+// `go` parent maps its telemetry counter and reads/writes EVERY counter
+// coherently — yet `go build` still crashes, in the multithreaded toolchain, via
+// a genuine guest nil-deref surfaced at a syscall boundary (a carrick trap-path
+// bug, not file-mapping coherence). See docs/go-build-shared-file-coherence-gap.md.
+
+const ALIAS_IPA_BLOCK: u64 = 1 << 21; // 2 MiB — one stage-1 block per file mapping
+
+fn alias_ipa_counter() -> &'static std::sync::atomic::AtomicU64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let addr = *CELL.get_or_init(|| {
+        // SAFETY: a fresh anonymous shared page owned for the process lifetime.
+        let p = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANON | libc::MAP_SHARED,
+                -1,
+                0,
+            )
+        };
+        if p == libc::MAP_FAILED {
+            // OOM at boot: fall back to a leaked process-local atomic. Cross-fork
+            // sharing is lost, but the host is already failing if mmap fails here.
+            return Box::into_raw(Box::new(AtomicU64::new(LINUX_ALIAS_IPA_BASE))) as usize;
+        }
+        // SAFETY: `p` is a writable 4 KiB page; an AtomicU64 fits at its start.
+        unsafe { (*(p as *mut AtomicU64)).store(LINUX_ALIAS_IPA_BASE, Ordering::SeqCst) };
+        p as usize
+    });
+    // SAFETY: `addr` is a live AtomicU64 (the shared page or the leaked box),
+    // valid for the whole process; MAP_SHARED makes it the SAME physical word in
+    // every host-forked descendant, so `fetch_add` is atomic across them.
+    unsafe { &*(addr as *const AtomicU64) }
+}
+
+/// Force the shared alias-IPA counter into existence. Call once in the ROOT
+/// carrick process before the guest can `fork`, so every host-forked descendant
+/// inherits the one `MAP_SHARED` counter (a child that first touched it AFTER
+/// forking would map its own private page → the IPA collisions return).
+pub fn init_alias_ipa_allocator() {
+    let _ = alias_ipa_counter();
+}
+
+/// Reserve a FRESH alias-IPA range covering `len` bytes (rounded up to a 2 MiB
+/// block so no two file mappings share a stage-1 block). Monotonic across the
+/// whole process tree — never reused. Returns the base IPA, or `None` when the
+/// 64 GiB arena is exhausted (the caller surfaces `ENOMEM`).
+pub fn alloc_alias_ipa(len: u64) -> Option<u64> {
+    use std::sync::atomic::Ordering;
+    let block = len
+        .checked_add(ALIAS_IPA_BLOCK - 1)
+        .map(|v| v & !(ALIAS_IPA_BLOCK - 1))?
+        .max(ALIAS_IPA_BLOCK);
+    let base = alias_ipa_counter().fetch_add(block, Ordering::SeqCst);
+    let limit = LINUX_ALIAS_IPA_BASE.checked_add(LINUX_ALIAS_IPA_SIZE)?;
+    if base.checked_add(block)? > limit {
+        return None; // arena exhausted
+    }
+    Some(base)
+}
+
+#[cfg(test)]
+mod alias_ipa_tests {
+    use super::*;
+
+    #[test]
+    fn alloc_is_monotonic_block_aligned_never_reused() {
+        let a = alloc_alias_ipa(16384).expect("first");
+        let b = alloc_alias_ipa(16384).expect("second");
+        let c = alloc_alias_ipa(4 * 1024 * 1024).expect("3rd: 4 MiB spans two blocks");
+        // distinct, strictly increasing, 2 MiB-aligned
+        assert!(b > a && c > b);
+        for x in [a, b, c] {
+            assert_eq!(x % ALIAS_IPA_BLOCK, 0, "IPA {x:#x} not 2 MiB aligned");
+        }
+        // a 16 KiB map consumes one 2 MiB block; a 4 MiB map consumes two
+        assert_eq!(b - a, ALIAS_IPA_BLOCK);
+        assert_eq!(c - b, ALIAS_IPA_BLOCK); // b was a 16K map (one block)
+        // all within the arena
+        let top = LINUX_ALIAS_IPA_BASE + LINUX_ALIAS_IPA_SIZE;
+        assert!(a >= LINUX_ALIAS_IPA_BASE && c < top);
+    }
+}
+
 /// True if `va` must be served by the dynamic high-VA alias arena.
 pub fn is_high_va(va: u64) -> bool {
     va >= LINUX_HIGH_VA_THRESHOLD
