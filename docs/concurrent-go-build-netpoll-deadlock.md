@@ -1,8 +1,48 @@
-# Concurrent `go build` deadlock: lost-wakeup under load
+# Concurrent `go build` deadlock: a layered fork-path problem
 
-**Status:** characterized (clean reproducer), NOT fixed; one fix attempt
-(epoll-wait backstop) reverted as ineffective. Found 2026-06-03 following up the
+**Status:** core post-mortem cracked it into TWO layers. **Layer 1 (fork-quiesce
+vs futex park) FIXED** (`418d13e`). **Layer 2 (fork+exec child stuck pre-exec
+under concurrency) residual** — task #20. Found 2026-06-03 following up the
 go-build fix. Separate from the go-build crash (fixed) and from cgo support.
+
+## How it was cracked: CORE post-mortem
+
+`sample`/`SIGQUIT` mislabeled this as a lost-wakeup (threads in futex/netpoll
+waits). Taking an actual **core** of a stuck process (`lldb -p <pid> -o
+"process save-core"`, then `bt all`) showed the real shape: most cond-waiting
+threads were in `carrick_hvf::fork_quiesce::QuiesceBarrier::park_if_quiescing`
+(the fork barrier), one in `wait_quiesced` (the forker), and **one stuck in
+`FutexTable::wait_prepared_with_token`** — a vCPU that never reached the barrier.
+The futex/netpoll "lost wakes" were red herrings; the earlier epoll/futex
+backstop experiments failed because the quiesce livelock hung things regardless.
+
+## Layer 1 (FIXED 418d13e): fork-quiesce vs futex park race
+
+To fork, the forker raises `is_quiescing`, fires a ONE-SHOT wake of blocked
+waiters, then `wait_quiesced` (with timeout). A futex waiter's `interrupted()`
+ORs in `is_quiescing` and is checked at the wait loop top — BUT the `parking_lot`
+park-VALIDATE callback only re-checked the generation. A quiesce beginning
+between the loop-top check and the park (its one-shot wake fires before the
+thread parks → missed) left the thread parked forever while `is_quiescing()`,
+stalling `wait_quiesced` → the fork timed out → EAGAIN → the guest's `clone`
+retried → fork-retry livelock. Fix: the park-validate also bails on
+`interrupted()`. Confirmed via a follow-up core (barrier gone).
+
+## Layer 2 (RESIDUAL, task #20): fork+exec child stuck pre-exec
+
+With layer 1 fixed, a stuck process now has RUNNABLE goroutines (not "0
+runnable") — it's M-starvation, not a lost wake. `SIGQUIT` (GOTRACEBACK=all)
+shows the runnable goroutines are all in `syscall/exec_linux.go`
+`forkAndExecInChild` — `go` forking to exec `compile`/`link` — with one
+`[running]` goroutine stuck in the **post-fork child** at `runtime/os_linux.go`
+(a pre-exec syscall, e.g. rt_sigprocmask). So a forked child guest, after
+carrick's `libc::fork`, doesn't make progress through its pre-exec setup under
+concurrency, and the parent's `forkExec` hangs. N=12 still hangs; N=3 ~4/6.
+Next: core the forked CHILD (the `[running]` m) and find why its pre-exec
+syscall path stalls (stage-2 coherence of the just-forked child? a signal-mask
+syscall? vCPU not progressing?).
+
+(Older framing kept below for the reproducer + ruled-out vCPU-cap evidence.)
 
 ## Symptom
 
