@@ -27,6 +27,8 @@
 //! The `source` tag on an overlay slot ([`SharedAperture::find_by_source`]) lets
 //! a re-`MAP_FIXED` over the same VA find and free the slot it replaces.
 
+use carrick_abi::align_up_u64;
+
 use crate::memory::{LINUX_SHARED_FILE_BASE, LINUX_SHARED_FILE_SIZE};
 
 /// What backs a live shared-aperture allocation. This is the skeleton of the
@@ -78,15 +80,6 @@ pub struct SharedAperture {
 
 const GRANULE: u64 = 0x4000; // HVF_PAGE_SIZE; kept local to avoid a trap.rs dep.
 
-fn align_up(value: u64, align: u64) -> Option<u64> {
-    let rem = value % align;
-    if rem == 0 {
-        Some(value)
-    } else {
-        value.checked_add(align - rem)
-    }
-}
-
 impl Default for SharedAperture {
     fn default() -> Self {
         Self::new()
@@ -133,7 +126,7 @@ impl SharedAperture {
         if len == 0 {
             return None;
         }
-        let len = align_up(len, GRANULE)?;
+        let len = align_up_u64(len, GRANULE)?;
         // Reuse a freed range first.
         if let Some(pos) = self.free.iter().position(|&(_, l)| l >= len) {
             let (s, l) = self.free[pos];
@@ -150,7 +143,7 @@ impl SharedAperture {
             });
             return Some(s);
         }
-        let addr = align_up(self.next, GRANULE)?;
+        let addr = align_up_u64(self.next, GRANULE)?;
         let end = addr.checked_add(len)?;
         if end > self.window_end() {
             return None;
