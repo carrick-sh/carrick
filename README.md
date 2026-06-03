@@ -4,8 +4,8 @@ Carrick is a high-performance, fully concurrent Linux binary compatibility layer
 
 The name refers to a type of knot used to join two heavy ropes of different sizes.
 
-> [!IMPORTANT]
-> **Carrick is fully functional and production-ready.** The runtime has successfully retired the Big Kernel Lock (BKL), supports fully multi-threaded guest execution, implements a robust socket translation layer, serves pseudo-terminals (`/dev/pts`), and runs complex workloads like `apt-get install` and `python3 -m http.server` entirely end-to-end.
+> [!NOTE]
+> **Status — an ambitious work in progress, not production-ready.** Carrick already runs real, complex workloads end-to-end — `apt-get install`, `python3 -m http.server`, and the Go / Node.js / CPython conformance suites — on a BKL-free, fully multi-threaded runtime with native socket translation and interactive pseudo-terminals (`/dev/pts`). But it is **experimental**: syscall coverage is partial ([the emulation map](docs/syscalls-emulation-map.md) lists on the order of 210 syscalls emulated, ~130 still deferred, and several only partially implemented), guest behaviour is not complete, and the runtime has had **no adversarial security review** — a guest is not a hardened trust boundary, so don't run untrusted code under it. It's built for running and studying Linux binaries on macOS, not for production.
 
 ---
 
