@@ -41,7 +41,7 @@ carrick trace -- run ubuntu:24.04 /bin/echo hi
 carrick trace -F -- run-elf fixtures/linux-aarch64-hello/hello
 
 # A targeted custom probe, output to a file (keeps an interactive guest's tty clean)
-carrick trace -s scripts/trace-host-fds.d -o /tmp/ev.out -- run -t alpine /bin/sh
+carrick trace -s scripts/dtrace/trace-host-fds.d -o /tmp/ev.out -- run -t alpine /bin/sh
 ```
 
 **It auto-sudos.** libdtrace needs root (`/dev/dtrace`), so `carrick trace`
@@ -53,7 +53,7 @@ where `CARRICK_*` env vars would be stripped).
 
 ### Reading the output
 
-With no `-s`, the bundled [`scripts/syscalls.d`](../scripts/syscalls.d) runs:
+With no `-s`, the bundled [`scripts/dtrace/syscalls.d`](../scripts/dtrace/syscalls.d) runs:
 each event is a per-syscall line tagged with the firing pid, and `END {}` prints
 frequency-sorted aggregations (which syscalls, how often, top errnos). `-F`
 indents each `entry`/`return` by call depth like `dtrace -F`. `-o FILE` writes
@@ -135,10 +135,10 @@ crate (`crates/carrick-hvf/src/probes.rs`, `#[usdt::provider(provider =
 ### Bundled and custom scripts
 
 The repo ships ~46 `scripts/trace-*.d` programs plus the default
-[`scripts/syscalls.d`](../scripts/syscalls.d); run any with `-s`. Notable ones:
-[`trace-host-fds.d`](../scripts/trace-host-fds.d) (correlate guest pipe I/O with
+[`scripts/dtrace/syscalls.d`](../scripts/dtrace/syscalls.d); run any with `-s`. Notable ones:
+[`trace-host-fds.d`](../scripts/dtrace/trace-host-fds.d) (correlate guest pipe I/O with
 host `pipe`/`dup`/`close` — the go-to for fd bugs),
-[`trace-failing-child.d`](../scripts/trace-failing-child.d) (DTrace speculations:
+[`trace-failing-child.d`](../scripts/dtrace/trace-failing-child.d) (DTrace speculations:
 commit only for a child that exits non-zero without exec'ing), and the
 fork/futex/job-control families. Writing a focused script is almost always
 faster than reading the full stream.

@@ -23,7 +23,7 @@ Workload: `glob.glob('/usr/local/lib/python3.12/**', recursive=True)` (3,255 fil
 `test_glob` completes in **140 s** (SUCCESS — the *result* matches Docker; it just blows the 90 s
 sweep timeout). Docker runs it in seconds. The entire gap is this amplification.
 
-Trace scripts: `scripts/glob-syscall-profile.d` (per-syscall wall-time), `scripts/glob-openat-drill.d`
+Trace scripts: `scripts/dtrace/glob-syscall-profile.d` (per-syscall wall-time), `scripts/dtrace/glob-openat-drill.d`
 (host-open attribution by in-flight guest syscall + ustack).
 
 ## Mechanism (why 291×) — verified against cap-primitives-4.0.2 source

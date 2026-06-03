@@ -86,7 +86,7 @@ preemption (`SIGURG`) interrupting the generated large-array equality path.
 - `runtime.memequal` uses SIMD registers (`V8`-`V11` in the hot path) and also
   relies on condition flags across compare/branch pairs.
 - Go's `runtime.asyncPreempt.abi0` saves/restores `V0`-`V31`.
-- `carrick trace --script scripts/trace-go-signal.d` confirms SIGURG
+- `carrick trace --script scripts/dtrace/trace-go-signal.d` confirms SIGURG
   inject/restore and no guest faults, but tracing perturbs timing enough that
   the standalone repro often passes under trace. Use trace for signal shape, not
   for pass/fail rate.
@@ -148,7 +148,7 @@ Trace signal shape, not failure rate:
 
 ```sh
 CARRICK_EXPOSED_CPUS=10 timeout -s KILL 80 \
-  target/release/carrick trace --script scripts/trace-go-signal.d \
+  target/release/carrick trace --script scripts/dtrace/trace-go-signal.d \
   --trace-out /tmp/carrick-userarena-signal.trace -- \
   run-elf --rootfs-layer /tmp/carrick-pie-ld.tar --raw --fs memory \
   /tmp/go-conformance/bin/userarena-large-eq-pie
@@ -179,7 +179,7 @@ semantic mismatch: Darwin can report a SIGSTOPped child from
 `waitid(P_PID, child, WEXITED|WNOWAIT)`, while Linux reports only states selected
 by the caller's `W*` bits. Carrick now filters host `siginfo_t` states against
 the guest waitid options before deciding whether the child is waitable. Trace
-script: `scripts/trace-waitid-stop.d`.
+script: `scripts/dtrace/trace-waitid-stop.d`.
 
 The remaining `TestString` item is not a wait/signal/process bug: Go skips it in
 Carrick because `exec.LookPath("echo")` cannot find an executable in the raw
