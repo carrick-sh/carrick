@@ -813,6 +813,7 @@ impl SyscallDispatcher {
             // accept on readiness.
             other => return other,
         };
+        crate::event_ring::rec(crate::event_ring::ACCEPT, host_fd, new_host, 0);
         let socket_flags = LinuxSocketTypeFlags::from_bits_retain(accept4_flags);
         let nonblock = socket_flags.contains(LinuxSocketTypeFlags::NONBLOCK);
         let cloexec = socket_flags.contains(LinuxSocketTypeFlags::CLOEXEC);
@@ -1129,7 +1130,14 @@ impl SyscallDispatcher {
                         return Ok(LINUX_EEXIST.into());
                     }
                     if let Some(host_fd) = host_fd {
-                        let _ = kqueue.apply(&epoll_kq_add_changes(host_fd, fd, event.events));
+                        let ev_events = event.events;
+                        let _ = kqueue.apply(&epoll_kq_add_changes(host_fd, fd, ev_events));
+                        crate::event_ring::rec(
+                            crate::event_ring::EPADD,
+                            kqueue.raw_fd(),
+                            host_fd,
+                            ev_events as i32,
+                        );
                     }
                     interest.insert(
                         fd,
@@ -1513,6 +1521,12 @@ impl SyscallDispatcher {
             }
             ready = ready_tagged.into_iter().map(|(_fd, event)| event).collect();
 
+            crate::event_ring::rec(
+                crate::event_ring::EPWAIT,
+                kq_fd,
+                ready.len() as i32,
+                timeout_ms,
+            );
             if ready.is_empty() && timeout_ms != 0 {
                 let timeout = if timeout_ms < 0 {
                     None
@@ -2359,6 +2373,19 @@ impl SyscallDispatcher {
             if let Err(errno) = rc.host_syscall_errno() {
                 return Ok(DispatchOutcome::errno(errno));
             }
+            if family == libc::AF_UNIX && host_addr.len() > 2 {
+                let end = host_addr[2..]
+                    .iter()
+                    .position(|&b| b == 0)
+                    .map(|i| 2 + i)
+                    .unwrap_or(host_addr.len());
+                crate::event_ring::rec(
+                    crate::event_ring::BIND,
+                    fd,
+                    host_fd,
+                    crate::event_ring::path_hash(&host_addr[2..end]),
+                );
+            }
             // Bind succeeded. Materialise the guest-facing S_IFSOCK node at the
             // resolved guest path. Linux applies the umask to 0o777 for the
             // socket node's permission bits (verified vs Docker: umask 022 →
@@ -2389,6 +2416,7 @@ impl SyscallDispatcher {
             if let Err(errno) = rc.host_syscall_errno() {
                 return Ok(errno.into());
             }
+            crate::event_ring::rec(crate::event_ring::LISTEN, host_fd, 0, 0);
             // A listen socket exists only to accept(2); make the HOST socket
             // non-blocking so accept never blocks under the dispatcher lock — the
             // guest's blocking intent is emulated by blocking_io's WaitOnFds
@@ -2471,6 +2499,19 @@ impl SyscallDispatcher {
                     host_addr.len() as u32,
                 )
             };
+            if family == libc::AF_UNIX && host_addr.len() > 2 {
+                let end = host_addr[2..]
+                    .iter()
+                    .position(|&b| b == 0)
+                    .map(|i| 2 + i)
+                    .unwrap_or(host_addr.len());
+                crate::event_ring::rec(
+                    crate::event_ring::CONNECT,
+                    host_fd,
+                    rc,
+                    crate::event_ring::path_hash(&host_addr[2..end]),
+                );
+            }
             if rc == 0 {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }

@@ -889,6 +889,7 @@ where
                 let outcome = runtime.fork()?;
                 let retval: i64 = match outcome {
                     crate::trap::ForkOutcome::Parent { child_pid } => {
+                        crate::event_ring::rec(crate::event_ring::FORK, child_pid as i32, 0, 0);
                         waiter = crate::io_wait::ThreadWaiter::new(this_tid);
                         // Watch the child's exit (EVFILT_PROC/NOTE_EXIT) so the
                         // signal pump delivers the requested exit signal to this
@@ -915,6 +916,10 @@ where
                     }
                     crate::trap::ForkOutcome::Child => {
                         dispatcher.clear_output_buffers();
+                        // The forked child only keeps the forking thread, so its
+                        // inherited event-ring watchdog is dead — reset the ring +
+                        // re-arm it for the child (before any child rec()).
+                        crate::event_ring::reinit_after_fork();
                         // kqueue is NOT inherited across fork, and the inherited
                         // self-pipe is shared with the parent — give the child
                         // fresh ones so its parked-thread wakes are its own.
@@ -934,6 +939,7 @@ where
             }
             DispatchOutcome::Execve { path, argv, env } => {
                 crate::probes::execve_argv(&path, &argv);
+                crate::event_ring::rec(crate::event_ring::EXEC, 1, 0, 0);
                 // proctitle / cmdline identity is display text (lossy decode).
                 let proc_argv: Vec<String> = argv
                     .iter()
@@ -2116,6 +2122,7 @@ impl ThreadRuntimeState {
                     self.this_tid as i32,
                     i32::try_from(exit_signal).unwrap_or(crate::linux_abi::LINUX_SIGCHLD),
                 );
+                crate::event_ring::rec(crate::event_ring::FORK, child_pid as i32, 0, 0);
                 // CLONE_PIDFD: allocate a pidfd for the new child and write its
                 // fd to the guest pidfd-out pointer. The child's pid mirrors a
                 // real host pid, so the pidfd watches it via EVFILT_PROC.
@@ -2164,6 +2171,7 @@ impl ThreadRuntimeState {
                 // from the parent so the child's single-threaded run loop runs.
                 fork_barrier().end_quiesce();
                 fork_barrier().end_fork();
+                crate::event_ring::reinit_after_fork();
                 crate::host_signal::reinit_after_fork();
                 // PID namespace: block until the parent registered our ns-pid
                 // before any guest code runs (§5.3). No-op when ns off.
@@ -2478,6 +2486,7 @@ fn run_vcpu_until_exit(
                         Some(state.complete_signal_thread(&mut engine, target, signum)?);
                 }
                 DispatchOutcome::Execve { path, argv, env } => {
+                    crate::event_ring::rec(crate::event_ring::EXEC, 1, 0, 0);
                     state.handle_execve(&kernel, &mut engine, path, argv, env)?;
                 }
                 DispatchOutcome::SigReturn => {
