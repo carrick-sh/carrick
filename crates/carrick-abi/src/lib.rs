@@ -1254,6 +1254,48 @@ macro_rules! kernel_abi {
     };
 }
 
+/// Compile-time struct-layout assertion. Pins `size_of` (optional) and any
+/// number of field offsets to the EXACT Linux kernel-ABI values, so a drift in
+/// field order, type, or padding fails the *build* with a named message instead
+/// of silently corrupting guest memory at runtime.
+///
+/// Two forms — with a leading `size = N`, or offsets only:
+/// ```ignore
+/// assert_layout!(LinuxMsghdr, size = 56, name @ 0, namelen @ 8, iov @ 16);
+/// assert_layout!(CarrickSigframe, siginfo @ 0, ucontext @ 128);
+/// ```
+///
+/// Field offsets use the const-stable `core::mem::offset_of!`. Every check is a
+/// `const _: ()` item, evaluated by the compiler and never reachable at
+/// runtime, so the crate-wide no-panic clippy gate is unaffected (these are the
+/// same mechanism the [`kernel_abi!`] macro already uses for `ABI_SIZE`). Two
+/// arms instead of one optional `size` group avoid the `macro_rules!`
+/// leading-comma ambiguity (both `size` and a field start with `,`).
+macro_rules! assert_layout {
+    // size + zero-or-more field offsets
+    ($ty:ty, size = $size:expr $(, $field:ident @ $off:expr)*) => {
+        const _: () = assert!(
+            core::mem::size_of::<$ty>() == $size,
+            concat!(stringify!($ty), ": size_of mismatch vs Linux aarch64 ABI"),
+        );
+        $( assert_layout!(@offset $ty, $field, $off); )*
+    };
+    // offsets only (no size pin — e.g. carrick-internal frames)
+    ($ty:ty $(, $field:ident @ $off:expr)+) => {
+        $( assert_layout!(@offset $ty, $field, $off); )+
+    };
+    // internal: a single field-offset assertion
+    (@offset $ty:ty, $field:ident, $off:expr) => {
+        const _: () = assert!(
+            core::mem::offset_of!($ty, $field) == $off,
+            concat!(
+                stringify!($ty), ".", stringify!($field),
+                ": field offset mismatch vs Linux aarch64 ABI",
+            ),
+        );
+    };
+}
+
 kernel_abi!(LinuxStat, 128, "Linux struct stat for aarch64 is 128 bytes");
 kernel_abi!(LinuxStatfs, 120, "Linux struct statfs64 is 120 bytes");
 kernel_abi!(LinuxStatx, 256, "Linux struct statx is 256 bytes");
@@ -2313,21 +2355,222 @@ pub const LINUX_IORING_OFF_SQES: u64 = 0x1000_0000;
 pub const LINUX_IORING_FEAT_SINGLE_MMAP: u32 = 1 << 0;
 pub const LINUX_IORING_FEAT_NODROP: u32 = 1 << 1;
 
+// =============================================================================
+//            Compile-time struct layout & constant invariants
+// =============================================================================
+//
+// These `const _: ()` items are evaluated by the COMPILER. A struct whose field
+// order, type, or padding drifts from the Linux aarch64 kernel ABI — or a
+// constant table that loses its uniqueness / disjointness invariant — fails the
+// *build* with a named message, long before any guest can observe the
+// corruption. This is the compile-time half of carrick's conformance strategy;
+// the runtime half is the differential probe suite (see
+// docs/conformance-testing.md). None of these checks is reachable at runtime,
+// so the crate-wide no-panic clippy gate is unaffected.
+//
+// The fixed-layout UAPI structs below are the asm-generic layouts, which are
+// identical on aarch64 and x86_64 (both little-endian LP64); arch-specific
+// notes are inline where they apply.
+
+// ----- message / clone / scatter-gather / poll structs -----
+assert_layout!(LinuxMsghdr, size = 56,
+    name @ 0, namelen @ 8, iov @ 16, iovlen @ 24,
+    control @ 32, controllen @ 40, flags @ 48);
+assert_layout!(LinuxMmsghdr, size = 64, msg_hdr @ 0, msg_len @ 56);
+assert_layout!(LinuxCloneArgs, size = 88,
+    flags @ 0, child_tid @ 16, parent_tid @ 24,
+    stack @ 40, stack_size @ 48, tls @ 56);
+assert_layout!(LinuxIovec, size = 16, iov_base @ 0, iov_len @ 8);
+assert_layout!(LinuxEpollEvent, size = 16, events @ 0, data @ 8);
+assert_layout!(LinuxPollFd, size = 8, fd @ 0, events @ 4, revents @ 6);
+
+// ----- stat (the struct whose 44-vs-128-byte cousins crashed glibc) -----
+assert_layout!(LinuxStat, size = 128,
+    st_dev @ 0, st_ino @ 8, st_mode @ 16, st_size @ 48);
+
+// ----- signal delivery frame (Linux aarch64 `struct rt_sigframe`) -----
+assert_layout!(LinuxSiginfo, size = 128, si_addr @ 16);
+assert_layout!(LinuxSignalContext, size = 4384,
+    regs @ 8, sp @ 256, pc @ 264, pstate @ 272, __reserved @ 288);
+assert_layout!(LinuxUcontext, size = 4560,
+    uc_stack @ 16, uc_sigmask @ 40, _pad @ 48, _pad2 @ 168, uc_mcontext @ 176);
+// CarrickSigframe is carrick-internal, but `siginfo` MUST sit at SP+0 and
+// `ucontext` immediately after it (size_of::<LinuxSiginfo>() == 128) because
+// Rosetta's signal trampoline reconstructs the siginfo pointer with `mov x1,sp`.
+assert_layout!(CarrickSigframe, siginfo @ 0, ucontext @ 128);
+assert_layout!(LinuxFpsimdContext, size = 528,
+    magic @ 0, size @ 4, fpsr @ 8, fpcr @ 12, vregs @ 16);
+// The fpsimd_context record plus the 8-byte null-terminator record the guest
+// expects after it must fit at the start of sigcontext.__reserved.
+const _: () = assert!(
+    LINUX_AARCH64_SIGCONTEXT_RESERVED_BYTES >= 528 + 8,
+    "sigcontext.__reserved is too small for the fpsimd_context record + terminator",
+);
+
+// ----- io_uring shared-ring structs (a size drift silently corrupts the ring) -----
+assert_layout!(LinuxIoUringSqe, size = 64);
+assert_layout!(LinuxIoUringCqe, size = 16);
+assert_layout!(LinuxIoSqringOffsets, size = 40);
+assert_layout!(LinuxIoCqringOffsets, size = 40);
+assert_layout!(LinuxIoUringParams, size = 120);
+
+// ----- constant uniqueness / disjointness / boundary checks -----
+//
+// Each block is a self-contained const evaluation: a duplicate signal number, a
+// collision between two address families, or two `sa_flags` bits that overlap
+// would otherwise be an invisible logic bug. Pinning them here turns that class
+// of mistake into a build failure.
+
+// Linux SIGxxx numbers must be unique and within the kernel's 1..=31 range.
+const _: () = {
+    const SIGNALS: [i32; 31] = [
+        LINUX_SIGHUP,
+        LINUX_SIGINT,
+        LINUX_SIGQUIT,
+        LINUX_SIGILL,
+        LINUX_SIGTRAP,
+        LINUX_SIGABRT,
+        LINUX_SIGBUS,
+        LINUX_SIGFPE,
+        LINUX_SIGKILL,
+        LINUX_SIGUSR1,
+        LINUX_SIGSEGV,
+        LINUX_SIGUSR2,
+        LINUX_SIGPIPE,
+        LINUX_SIGALRM,
+        LINUX_SIGTERM,
+        LINUX_SIGSTKFLT,
+        LINUX_SIGCHLD,
+        LINUX_SIGCONT,
+        LINUX_SIGSTOP,
+        LINUX_SIGTSTP,
+        LINUX_SIGTTIN,
+        LINUX_SIGTTOU,
+        LINUX_SIGURG,
+        LINUX_SIGXCPU,
+        LINUX_SIGXFSZ,
+        LINUX_SIGVTALRM,
+        LINUX_SIGPROF,
+        LINUX_SIGWINCH,
+        LINUX_SIGIO,
+        LINUX_SIGPWR,
+        LINUX_SIGSYS,
+    ];
+    let mut i = 0;
+    while i < SIGNALS.len() {
+        assert!(
+            SIGNALS[i] >= 1 && SIGNALS[i] <= 31,
+            "Linux signal number outside the kernel's 1..=31 range",
+        );
+        let mut j = i + 1;
+        while j < SIGNALS.len() {
+            assert!(SIGNALS[i] != SIGNALS[j], "duplicate Linux signal number");
+            j += 1;
+        }
+        i += 1;
+    }
+};
+
+// Address families carrick translates must be pairwise distinct.
+const _: () = {
+    const FAMILIES: [i32; 6] = [
+        LINUX_AF_UNSPEC,
+        LINUX_AF_UNIX,
+        LINUX_AF_INET,
+        LINUX_AF_INET6,
+        LINUX_AF_NETLINK,
+        LINUX_AF_PACKET,
+    ];
+    let mut i = 0;
+    while i < FAMILIES.len() {
+        let mut j = i + 1;
+        while j < FAMILIES.len() {
+            assert!(FAMILIES[i] != FAMILIES[j], "duplicate Linux AF_* value");
+            j += 1;
+        }
+        i += 1;
+    }
+};
+
+// Socket types must be pairwise distinct.
+const _: () = {
+    const TYPES: [i32; 4] = [
+        LINUX_SOCK_STREAM,
+        LINUX_SOCK_DGRAM,
+        LINUX_SOCK_RAW,
+        LINUX_SOCK_SEQPACKET,
+    ];
+    let mut i = 0;
+    while i < TYPES.len() {
+        let mut j = i + 1;
+        while j < TYPES.len() {
+            assert!(TYPES[i] != TYPES[j], "duplicate Linux SOCK_* value");
+            j += 1;
+        }
+        i += 1;
+    }
+};
+
+// `sa_flags` bits carrick honors must occupy disjoint bit positions — an
+// overlap would make one flag silently imply another in rt_sigaction.
+const _: () = {
+    const SA_FLAGS: [u64; 5] = [
+        LINUX_SA_RESTORER,
+        LINUX_SA_ONSTACK,
+        LINUX_SA_RESTART,
+        LINUX_SA_NODEFER,
+        LINUX_SA_RESETHAND,
+    ];
+    let mut i = 0;
+    while i < SA_FLAGS.len() {
+        let mut j = i + 1;
+        while j < SA_FLAGS.len() {
+            assert!(
+                SA_FLAGS[i] & SA_FLAGS[j] == 0,
+                "Linux sa_flags bits overlap"
+            );
+            j += 1;
+        }
+        i += 1;
+    }
+};
+
+// Namespace-creation clone flags must occupy disjoint bit positions.
+const _: () = {
+    const NS_FLAGS: [u64; 7] = [
+        LINUX_CLONE_NEWNS,
+        LINUX_CLONE_NEWCGROUP,
+        LINUX_CLONE_NEWUTS,
+        LINUX_CLONE_NEWIPC,
+        LINUX_CLONE_NEWUSER,
+        LINUX_CLONE_NEWPID,
+        LINUX_CLONE_NEWNET,
+    ];
+    let mut i = 0;
+    while i < NS_FLAGS.len() {
+        let mut j = i + 1;
+        while j < NS_FLAGS.len() {
+            assert!(
+                NS_FLAGS[i] & NS_FLAGS[j] == 0,
+                "Linux CLONE_NEW* namespace flag bits overlap",
+            );
+            j += 1;
+        }
+        i += 1;
+    }
+};
+
 #[cfg(test)]
 mod kernel_abi_tests {
     use super::*;
 
-    #[test]
-    fn io_uring_struct_sizes_match_kernel_abi() {
-        // The guest fills SQEs and reads CQEs/params at these exact sizes; a
-        // mismatch silently corrupts the ring. (Linux: sqe 64, cqe 16,
-        // sqring/cqring offsets 40, params 120.)
-        assert_eq!(core::mem::size_of::<LinuxIoUringSqe>(), 64);
-        assert_eq!(core::mem::size_of::<LinuxIoUringCqe>(), 16);
-        assert_eq!(core::mem::size_of::<LinuxIoSqringOffsets>(), 40);
-        assert_eq!(core::mem::size_of::<LinuxIoCqringOffsets>(), 40);
-        assert_eq!(core::mem::size_of::<LinuxIoUringParams>(), 120);
-    }
+    // NOTE: the pure struct size / field-offset invariants and the constant
+    // uniqueness/disjointness checks are now enforced at COMPILE TIME — see the
+    // `assert_layout!(...)` and `const _: () = { ... }` blocks above this module
+    // (e.g. LinuxMsghdr, LinuxCloneArgs, the rt_sigframe structs, the io_uring
+    // ring structs, and the SIG*/AF_*/SOCK_*/SA_*/CLONE_NEW* tables). The tests
+    // below cover the *behavioral* ABI (helper output, flag masks) that a const
+    // assertion can't express.
 
     #[test]
     fn termios_kernel_abi_size_is_36_not_44() {
@@ -2355,33 +2598,6 @@ mod kernel_abi_tests {
             <LinuxSigaltstack as KernelAbi>::ABI_SIZE <= core::mem::size_of::<LinuxSigaltstack>()
         );
         assert!(<LinuxSigaction as KernelAbi>::ABI_SIZE <= core::mem::size_of::<LinuxSigaction>());
-    }
-
-    #[test]
-    fn message_and_clone_abi_structs_match_aarch64_layouts() {
-        assert_eq!(core::mem::size_of::<LinuxMsghdr>(), 56);
-        assert_eq!(<LinuxMsghdr as KernelAbi>::ABI_SIZE, 56);
-        assert_eq!(core::mem::offset_of!(LinuxMsghdr, name), 0);
-        assert_eq!(core::mem::offset_of!(LinuxMsghdr, namelen), 8);
-        assert_eq!(core::mem::offset_of!(LinuxMsghdr, iov), 16);
-        assert_eq!(core::mem::offset_of!(LinuxMsghdr, iovlen), 24);
-        assert_eq!(core::mem::offset_of!(LinuxMsghdr, control), 32);
-        assert_eq!(core::mem::offset_of!(LinuxMsghdr, controllen), 40);
-        assert_eq!(core::mem::offset_of!(LinuxMsghdr, flags), 48);
-
-        assert_eq!(core::mem::size_of::<LinuxMmsghdr>(), 64);
-        assert_eq!(<LinuxMmsghdr as KernelAbi>::ABI_SIZE, 64);
-        assert_eq!(core::mem::offset_of!(LinuxMmsghdr, msg_hdr), 0);
-        assert_eq!(core::mem::offset_of!(LinuxMmsghdr, msg_len), 56);
-
-        assert_eq!(core::mem::size_of::<LinuxCloneArgs>(), 88);
-        assert_eq!(<LinuxCloneArgs as KernelAbi>::ABI_SIZE, 88);
-        assert_eq!(core::mem::offset_of!(LinuxCloneArgs, flags), 0);
-        assert_eq!(core::mem::offset_of!(LinuxCloneArgs, child_tid), 16);
-        assert_eq!(core::mem::offset_of!(LinuxCloneArgs, parent_tid), 24);
-        assert_eq!(core::mem::offset_of!(LinuxCloneArgs, stack), 40);
-        assert_eq!(core::mem::offset_of!(LinuxCloneArgs, stack_size), 48);
-        assert_eq!(core::mem::offset_of!(LinuxCloneArgs, tls), 56);
     }
 
     #[test]
@@ -2439,50 +2655,16 @@ mod kernel_abi_tests {
     }
 
     #[test]
-    fn signal_frame_embeds_linux_aarch64_siginfo_and_ucontext_layout() {
-        assert_eq!(core::mem::size_of::<LinuxSiginfo>(), 128);
-        assert_eq!(core::mem::offset_of!(LinuxSiginfo, si_addr), 16);
-
-        assert_eq!(core::mem::offset_of!(LinuxSignalContext, regs), 8);
-        assert_eq!(core::mem::offset_of!(LinuxSignalContext, sp), 256);
-        assert_eq!(core::mem::offset_of!(LinuxSignalContext, pc), 264);
-        assert_eq!(core::mem::offset_of!(LinuxSignalContext, pstate), 272);
-        assert_eq!(core::mem::offset_of!(LinuxSignalContext, __reserved), 288);
-        assert_eq!(core::mem::size_of::<LinuxSignalContext>(), 4384);
-
-        assert_eq!(core::mem::offset_of!(LinuxUcontext, uc_stack), 16);
-        assert_eq!(core::mem::offset_of!(LinuxUcontext, uc_sigmask), 40);
-        assert_eq!(core::mem::offset_of!(LinuxUcontext, _pad), 48);
-        assert_eq!(core::mem::offset_of!(LinuxUcontext, _pad2), 168);
-        assert_eq!(core::mem::offset_of!(LinuxUcontext, uc_mcontext), 176);
-    }
-
-    #[test]
-    fn carrick_sigframe_has_siginfo_at_offset_zero() {
-        // Rosetta's trampoline does `mov x1, sp`, so SP_EL0 must point at siginfo.
-        assert_eq!(core::mem::offset_of!(CarrickSigframe, siginfo), 0);
-        // ucontext immediately follows siginfo (Linux struct rt_sigframe order).
-        assert_eq!(
-            core::mem::offset_of!(CarrickSigframe, ucontext),
-            core::mem::size_of::<LinuxSiginfo>()
-        );
-    }
-
-    #[test]
-    fn fpsimd_context_matches_linux_aarch64_layout() {
-        // struct fpsimd_context: head{magic,size}=8, fpsr=4, fpcr=4, vregs[32]
-        // of __uint128_t = 512; total 528, vregs at offset 16.
-        assert_eq!(core::mem::offset_of!(LinuxFpsimdContext, fpsr), 8);
-        assert_eq!(core::mem::offset_of!(LinuxFpsimdContext, fpcr), 12);
-        assert_eq!(core::mem::offset_of!(LinuxFpsimdContext, vregs), 16);
-        assert_eq!(core::mem::size_of::<LinuxFpsimdContext>(), 528);
+    fn fpsimd_context_empty_record_is_self_describing() {
+        // The struct's size/offset layout — and the assertion that it fits in
+        // sigcontext.__reserved — are pinned at compile time (above this
+        // module). Here we check the *behavioral* contract of `empty()`: it
+        // stamps the kernel magic and the self-size the guest's `rt_sigreturn`
+        // validates.
         let fp = LinuxFpsimdContext::empty();
         let (magic, size) = (fp.magic, fp.size);
         assert_eq!(magic, LINUX_FPSIMD_MAGIC);
         assert_eq!(size, 528);
-        // Must fit at the start of sigcontext.__reserved with room for the
-        // null terminator record the guest expects after it.
-        assert!(LINUX_AARCH64_SIGCONTEXT_RESERVED_BYTES >= 528 + 8);
     }
 
     #[test]

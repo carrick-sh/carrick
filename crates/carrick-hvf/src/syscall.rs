@@ -524,3 +524,23 @@ const AARCH64_SYSCALLS: &[Syscall] = &[
     syscall(461, "lsm_list_modules", "process", SupportLevel::Deferred),
     syscall(462, "mseal", "mm", SupportLevel::Deferred),
 ];
+
+// Compile-time guard: `lookup_aarch64` binary-searches this table, so it MUST
+// stay sorted by `number` with no duplicate numbers. A strictly-increasing
+// check proves BOTH invariants at once — sortedness (so the binary search is
+// valid) and uniqueness (so no syscall number is shadowed by an out-of-order
+// twin). A bad insert or a duplicate fails the BUILD with this message rather
+// than silently degrading `lookup_aarch64` to "unknown syscall" at runtime
+// (the very binary-search degradation the table exists to prevent). Evaluated
+// by the compiler; never reachable at runtime, so the no-panic gate is unaffected.
+const _: () = {
+    let mut i = 1;
+    while i < AARCH64_SYSCALLS.len() {
+        assert!(
+            AARCH64_SYSCALLS[i - 1].number < AARCH64_SYSCALLS[i].number,
+            "AARCH64_SYSCALLS must stay strictly sorted by syscall number \
+             (binary_search validity + number uniqueness)",
+        );
+        i += 1;
+    }
+};

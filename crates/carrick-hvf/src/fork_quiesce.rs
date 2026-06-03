@@ -2,7 +2,7 @@
 //! thread quiesces every other guest vCPU thread at the lock-safe run-loop top
 //! before `libc::fork`, so the child inherits no carrick lock held by a thread
 //! that won't exist in the child. See
-//! docs/superpowers/specs/2026-05-24-multithreaded-fork-design.md.
+//! docs/archive/superpowers/specs/2026-05-24-multithreaded-fork-design.md.
 // INVARIANT: every `.unwrap()` in this module is on a std::sync Mutex/Condvar
 // guard. `lock()`/`wait()` only return `Err` on poisoning — a thread panicking
 // while holding the guard — which cannot occur in this no-panic codebase. The
