@@ -171,6 +171,16 @@ Each row in the final table states:
 
 ---
 
+## Results (running log)
+
+| Date | Workload | carrick p50 (us) | docker p50 (us) | Ratio (carrick/docker) | n | Thesis held? |
+|------|----------|-----------------|-----------------|----------------------|---|--------------|
+| 2026-06-02 | tcp_rr (loopback) | 20.25 | 23.667 | 0.86 | 4 | YES — carrick wins loopback TCP_RR (ratio < 1) |
+
+Notes: Host Mac16,12 (M4), macOS 26.6, Docker 29.5.2. nproc=4 confirmed both engines. noisy=false both engines. Warmup rep discarded (rep 0: carrick=32.667 docker=23.667). Post-warmup reps: carrick {19.75, 20.25, 20.375, 20.5} us, docker {24.333, 23.667, 23.459, 24.625} us. p95: carrick=20.500, docker=24.625. Carrick is ~14% faster than Docker on loopback TCP request/response latency — consistent with the thesis that carrick's direct Darwin-socket path incurs less overhead than Docker's in-VM loopback stack.
+
+---
+
 ## 9. Threats to validity
 
 - **Docker Desktop host-networking on Mac** routes through the VM — verify Topology B actually exercises the boundary (§5.2).
