@@ -20,7 +20,7 @@ verdict = "regrtest"
 tier = "smoke"
 weight = "heavy"
 timeout_s = 240
-carrick_flags = ["--raw", "--fs", "memory"]
+carrick_flags = ["--raw", "--fs", "host"]
 known_gaps = [
   "test_subprocess", # cluster-1 nested-fork HVF wedge (deterministic at scale)
 ]
@@ -34,7 +34,7 @@ verdict = "regrtest"
 tier = "full"
 weight = "heavy"
 timeout_s = 180
-carrick_flags = ["--raw", "--fs", "memory"]
+carrick_flags = ["--raw", "--fs", "host"]
 
 [[suite]]
 name = "cpython-json"
@@ -45,7 +45,7 @@ verdict = "regrtest"
 tier = "full"
 weight = "heavy"
 timeout_s = 180
-carrick_flags = ["--raw", "--fs", "memory"]
+carrick_flags = ["--raw", "--fs", "host"]
 
 [[suite]]
 name = "cpython-glob"
@@ -56,7 +56,7 @@ verdict = "regrtest"
 tier = "full"
 weight = "heavy"
 timeout_s = 180
-carrick_flags = ["--raw", "--fs", "memory"]
+carrick_flags = ["--raw", "--fs", "host"]
 known_gaps = [
   "test_glob", # cluster-3 samestat inode-identity -> shutil.rmtree refuses
 ]
@@ -70,7 +70,7 @@ verdict = "regrtest"
 tier = "full"
 weight = "heavy"
 timeout_s = 180
-carrick_flags = ["--raw", "--fs", "memory"]
+carrick_flags = ["--raw", "--fs", "host"]
 known_gaps = [
   "F_SETPIPE_SZ", # cluster-4 fcntl: no macOS equivalent
   "F_NOTIFY",
@@ -84,49 +84,49 @@ known_gaps = [
 name = "go-runtime"
 ecosystem = "go"
 image = "localhost:5005/carrick-go-conformance:1.24"
-cmd = ["/conformance/runtime.test", "-test.run", "Test", "-test.short"]
+cmd = ["/conformance/runtime.test", "-test.v", "-test.run", "Test", "-test.short"]
 verdict = "gotest"
 tier = "smoke"
 weight = "heavy"
 timeout_s = 180
 workdir = "/usr/local/go/src/runtime"
-carrick_flags = ["--raw", "--fs", "memory"]
+carrick_flags = ["--raw", "--fs", "host"]
 
 [[suite]]
 name = "go-sync"
 ecosystem = "go"
 image = "localhost:5005/carrick-go-conformance:1.24"
-cmd = ["/conformance/sync.test", "-test.run", "Test", "-test.short"]
+cmd = ["/conformance/sync.test", "-test.v", "-test.run", "Test", "-test.short"]
 verdict = "gotest"
 tier = "full"
 weight = "heavy"
 timeout_s = 120
 workdir = "/usr/local/go/src/sync"
-carrick_flags = ["--raw", "--fs", "memory"]
+carrick_flags = ["--raw", "--fs", "host"]
 
 [[suite]]
 name = "go-context"
 ecosystem = "go"
 image = "localhost:5005/carrick-go-conformance:1.24"
-cmd = ["/conformance/context.test", "-test.run", "Test", "-test.short"]
+cmd = ["/conformance/context.test", "-test.v", "-test.run", "Test", "-test.short"]
 verdict = "gotest"
 tier = "full"
 weight = "heavy"
 timeout_s = 120
 workdir = "/usr/local/go/src/context"
-carrick_flags = ["--raw", "--fs", "memory"]
+carrick_flags = ["--raw", "--fs", "host"]
 
 [[suite]]
 name = "go-time"
 ecosystem = "go"
 image = "localhost:5005/carrick-go-conformance:1.24"
-cmd = ["/conformance/time.test", "-test.run", "Test", "-test.short"]
+cmd = ["/conformance/time.test", "-test.v", "-test.run", "Test", "-test.short"]
 verdict = "gotest"
 tier = "full"
 weight = "heavy"
 timeout_s = 120
 workdir = "/usr/local/go/src/time"
-carrick_flags = ["--raw", "--fs", "memory"]
+carrick_flags = ["--raw", "--fs", "host"]
 
 # ========================= Node.js / libuv (tap) ============================
 # Both engines run the image's native nodejs-conformance entrypoint; the
@@ -143,7 +143,7 @@ verdict = "tap"
 tier = "smoke"
 weight = "heavy"
 timeout_s = 180
-carrick_flags = ["--raw", "--fs", "memory"]
+carrick_flags = ["--raw", "--fs", "host"]
 env = [{ key = "NODEJS_CONFORMANCE_IN_IMAGE", val = "1" }]
 env_carrick = [{ key = "NODEJS_CONFORMANCE_EFFECTIVE_RUNNER", val = "carrick" }]
 env_docker = [{ key = "NODEJS_CONFORMANCE_EFFECTIVE_RUNNER", val = "docker" }]
@@ -158,7 +158,7 @@ verdict = "tap"
 tier = "smoke"
 weight = "heavy"
 timeout_s = 180
-carrick_flags = ["--raw", "--fs", "memory"]
+carrick_flags = ["--raw", "--fs", "host"]
 env = [{ key = "NODEJS_CONFORMANCE_IN_IMAGE", val = "1" }]
 env_carrick = [{ key = "NODEJS_CONFORMANCE_EFFECTIVE_RUNNER", val = "carrick" }]
 env_docker = [{ key = "NODEJS_CONFORMANCE_EFFECTIVE_RUNNER", val = "docker" }]
@@ -173,7 +173,7 @@ verdict = "tap"
 tier = "full"
 weight = "heavy"
 timeout_s = 300
-carrick_flags = ["--raw", "--fs", "memory"]
+carrick_flags = ["--raw", "--fs", "host"]
 docker_flags = ["--user", "65534"]
 env = [{ key = "NODEJS_CONFORMANCE_IN_IMAGE", val = "1" }]
 env_carrick = [{ key = "NODEJS_CONFORMANCE_EFFECTIVE_RUNNER", val = "carrick" }]
@@ -192,7 +192,7 @@ verdict = "ltp"
 tier = "smoke"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "memory"]
+carrick_flags = ["--raw", "--fs", "host"]
 
 [[suite]]
 name = "ltp-gettid01"
@@ -203,7 +203,7 @@ verdict = "ltp"
 tier = "smoke"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "memory"]
+carrick_flags = ["--raw", "--fs", "host"]
 
 [[suite]]
 name = "ltp-clock_gettime01"
@@ -214,7 +214,7 @@ verdict = "ltp"
 tier = "smoke"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "memory"]
+carrick_flags = ["--raw", "--fs", "host"]
 
 [[suite]]
 name = "ltp-epoll_create01"
@@ -225,7 +225,7 @@ verdict = "ltp"
 tier = "smoke"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "memory"]
+carrick_flags = ["--raw", "--fs", "host"]
 
 [[suite]]
 name = "ltp-getcpu01"
@@ -236,7 +236,7 @@ verdict = "ltp"
 tier = "smoke"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "memory"]
+carrick_flags = ["--raw", "--fs", "host"]
 
 [[suite]]
 name = "ltp-sched_yield01"
@@ -247,7 +247,7 @@ verdict = "ltp"
 tier = "smoke"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "memory"]
+carrick_flags = ["--raw", "--fs", "host"]
 
 [[suite]]
 name = "ltp-eventfd01"
@@ -258,7 +258,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "memory"]
+carrick_flags = ["--raw", "--fs", "host"]
 
 [[suite]]
 name = "ltp-pipe01"
@@ -269,7 +269,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "memory"]
+carrick_flags = ["--raw", "--fs", "host"]
 
 [[suite]]
 name = "ltp-gettimeofday01"
@@ -280,7 +280,7 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "memory"]
+carrick_flags = ["--raw", "--fs", "host"]
 
 [[suite]]
 name = "ltp-sched_getaffinity01"
@@ -291,4 +291,4 @@ verdict = "ltp"
 tier = "full"
 weight = "light"
 timeout_s = 40
-carrick_flags = ["--raw", "--fs", "memory"]
+carrick_flags = ["--raw", "--fs", "host"]
