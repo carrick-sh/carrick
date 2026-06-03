@@ -382,14 +382,8 @@ impl SyscallDispatcher {
         buffer: GuestPtr,
         memory: &mut impl GuestMemory,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let path = match read_guest_c_string(memory, pathname.0) {
-            Ok(path) => path,
-            Err(errno) => return Ok(errno.into()),
-        };
-        let path = match self.resolve_at_path(LINUX_AT_FDCWD, &path) {
-            Ok(path) => path,
-            Err(errno) => return Ok(errno.into()),
-        };
+        let path = read_guest_c_string(memory, pathname.0)?;
+        let path = self.resolve_at_path(LINUX_AT_FDCWD, &path)?;
         // Consult the layered view (overlay/disk first, then rootfs) so
         // that files the guest created in the overlay are visible here
         // too — a rootfs-direct lookup would miss them.
@@ -416,17 +410,11 @@ impl SyscallDispatcher {
         if length < 0 {
             return Ok(LINUX_EINVAL.into());
         }
-        let path = match read_guest_c_string(memory, pathname.0) {
-            Ok(path) => path,
-            Err(errno) => return Ok(errno.into()),
-        };
+        let path = read_guest_c_string(memory, pathname.0)?;
         if path.is_empty() {
             return Ok(LINUX_ENOENT.into());
         }
-        let resolved = match self.resolve_at_path(LINUX_AT_FDCWD, &path) {
-            Ok(resolved) => resolved,
-            Err(errno) => return Ok(errno.into()),
-        };
+        let resolved = self.resolve_at_path(LINUX_AT_FDCWD, &path)?;
         if crate::vfs::is_synthetic_virtual_file(&resolved, &self.synthetic_proc_context()) {
             return Ok(LINUX_EROFS.into());
         }
@@ -542,10 +530,7 @@ impl SyscallDispatcher {
             return Ok(self.install_fd(description, linux_fd_flags_from_open_flags(flags)));
         }
 
-        let path = match read_guest_c_string(memory, pathname) {
-            Ok(path) => path,
-            Err(errno) => return Ok(errno.into()),
-        };
+        let path = read_guest_c_string(memory, pathname)?;
         // An empty pathname is never valid for open()/openat(): the kernel's
         // path walk requires at least one component and returns ENOENT for ""
         // (openat has no AT_EMPTY_PATH — that flag is only for the *at() metadata
@@ -566,10 +551,7 @@ impl SyscallDispatcher {
         // (test_copyfile_nonexistent_dir). Note the raw guest bytes, before
         // resolution collapses the slash.
         let had_trailing_slash = path.len() > 1 && path.ends_with('/');
-        let path = match self.resolve_at_path(dirfd, &path) {
-            Ok(path) => path,
-            Err(errno) => return Ok(errno.into()),
-        };
+        let path = self.resolve_at_path(dirfd, &path)?;
         if want_create && had_trailing_slash {
             return Ok(LINUX_EISDIR.into());
         }
@@ -1659,25 +1641,13 @@ impl SyscallDispatcher {
         memory: &impl GuestMemory,
     ) -> Result<DispatchOutcome, DispatchError> {
         const RENAME_NOREPLACE: u64 = 1;
-        let old = match read_guest_c_string(memory, oldpath) {
-            Ok(path) => path,
-            Err(errno) => return Ok(errno.into()),
-        };
-        let new_path = match read_guest_c_string(memory, newpath) {
-            Ok(path) => path,
-            Err(errno) => return Ok(errno.into()),
-        };
+        let old = read_guest_c_string(memory, oldpath)?;
+        let new_path = read_guest_c_string(memory, newpath)?;
         if old.is_empty() || new_path.is_empty() {
             return Ok(LINUX_ENOENT.into());
         }
-        let resolved_old = match self.resolve_at_path(olddirfd, &old) {
-            Ok(path) => path,
-            Err(errno) => return Ok(errno.into()),
-        };
-        let resolved_new = match self.resolve_at_path(newdirfd, &new_path) {
-            Ok(path) => path,
-            Err(errno) => return Ok(errno.into()),
-        };
+        let resolved_old = self.resolve_at_path(olddirfd, &old)?;
+        let resolved_new = self.resolve_at_path(newdirfd, &new_path)?;
         if crate::vfs::is_synthetic_virtual_file(&resolved_old, &self.synthetic_proc_context())
             || crate::vfs::is_synthetic_virtual_file(&resolved_new, &self.synthetic_proc_context())
         {
@@ -2027,17 +1997,11 @@ impl SyscallDispatcher {
         mode: u64,
         memory: &impl GuestMemory,
     ) -> Result<DispatchOutcome, DispatchError> {
-        let path = match read_guest_c_string(memory, pathname) {
-            Ok(path) => path,
-            Err(errno) => return Ok(errno.into()),
-        };
+        let path = read_guest_c_string(memory, pathname)?;
         if path.is_empty() {
             return Ok(LINUX_ENOENT.into());
         }
-        let resolved = match self.resolve_at_path(dirfd, &path) {
-            Ok(resolved) => resolved,
-            Err(errno) => return Ok(errno.into()),
-        };
+        let resolved = self.resolve_at_path(dirfd, &path)?;
         // chmod(2) FOLLOWS a final symlink — it changes the TARGET's mode, not
         // the link's (test_posix.test_chmod_dir_symlink). resolve_at_path stops
         // at the link itself, so dereference it here. (fchmodat2's advisory
@@ -2279,14 +2243,8 @@ impl SyscallDispatcher {
         fn chdir(this, cx, pathname: GuestPtr) {
 
             let pathname = pathname.0;
-            let path = match read_guest_c_string(&*cx.memory, pathname) {
-                Ok(path) => path,
-                Err(errno) => return Ok(errno.into()),
-            };
-            let path = match this.resolve_at_path(LINUX_AT_FDCWD, &path) {
-                Ok(path) => path,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let path = read_guest_c_string(&*cx.memory, pathname)?;
+            let path = this.resolve_at_path(LINUX_AT_FDCWD, &path)?;
             // Follow a trailing directory symlink the way Linux chdir(2) does,
             // THROUGH the full VFS — so a symlink whose target lands in a
             // different mount (e.g. a /tmp scratch link → /run bind mount)
@@ -2294,14 +2252,8 @@ impl SyscallDispatcher {
             // only follows within one backend). getcwd then reports the resolved
             // target's canonical path, matching the kernel. Uses the LAYERED
             // lookup so a freshly mkdir'd dir is visible (dpkg-deb chdir).
-            let resolved = match this.canonicalize_following(&path) {
-                Ok(resolved) => resolved,
-                Err(errno) => return Ok(errno.into()),
-            };
-            let metadata = match this.layered_metadata(&resolved) {
-                Ok(metadata) => metadata,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let resolved = this.canonicalize_following(&path)?;
+            let metadata = this.layered_metadata(&resolved)?;
             if metadata.kind != RootFsEntryKind::Directory {
                 return Ok(LINUX_ENOTDIR.into());
             }
@@ -2499,10 +2451,7 @@ impl SyscallDispatcher {
                     // reach the same host endpoint. Duplicate the host fd
                     // and wrap it as a HostPipe so the write path picks it
                     // up before the bare-stdio fallback.
-                    let duped = match (unsafe { libc::dup(old_fd.0) }).host_syscall_errno() {
-                        Ok(duped) => duped,
-                        Err(errno) => return Ok(errno.into()),
-                    };
+                    let duped = (unsafe { libc::dup(old_fd.0) }).host_syscall_errno()?;
                     (
                         Arc::new(RwLock::new(OpenDescription::HostPipe {
                             host_fd: duped,
@@ -3776,10 +3725,7 @@ impl SyscallDispatcher {
                     Err(_) => return Ok(LINUX_EFAULT.into()),
                 }
             }
-            let how = match read_open_how(&*cx.memory, how_address) {
-                Ok(how) => how,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let how = read_open_how(&*cx.memory, how_address)?;
             // open_how validation, matching the kernel's build_open_how():
             //  - mode must be within 0o7777 (openat203 invalid-mode: mode=-1);
             //  - mode may be nonzero only when creating (openat203 invalid-flags:
@@ -4299,10 +4245,7 @@ impl SyscallDispatcher {
             let iovcnt =
                 usize::try_from(vlen).map_err(|_| DispatchError::LengthTooLarge(vlen))?;
             let memory = &mut *cx.memory;
-            let iovecs = match read_iovecs(memory, iov, iovcnt) {
-                Ok(iovecs) => iovecs,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let iovecs = read_iovecs(memory, iov, iovcnt)?;
             let Some(open_file) = this.open_file(fd.0) else {
                 return Ok(LINUX_EBADF.into());
             };
@@ -4486,10 +4429,7 @@ impl SyscallDispatcher {
             let offset =
                 usize::try_from(pos_l).map_err(|_| DispatchError::LengthTooLarge(pos_l))?;
             let memory = &mut *cx.memory;
-            let iovecs = match read_iovecs(memory, iov, iovcnt) {
-                Ok(iovecs) => iovecs,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let iovecs = read_iovecs(memory, iov, iovcnt)?;
             let Some(open_file) = this.open_file(fd.0) else {
                 return Ok(LINUX_EBADF.into());
             };
@@ -4610,10 +4550,7 @@ impl SyscallDispatcher {
                         offset as libc::off_t,
                     )
                 };
-                let n = match n.host_syscall_errno() {
-                    Ok(value) => value,
-                    Err(errno) => return Ok(errno.into()),
-                };
+                let n = n.host_syscall_errno()?;
                 return Ok(DispatchOutcome::Returned { value: n as i64 });
             }
             let errno = match &*open {
@@ -4644,10 +4581,7 @@ impl SyscallDispatcher {
                 usize::try_from(vlen).map_err(|_| DispatchError::LengthTooLarge(vlen))?;
             let offset = i64::from_ne_bytes(pos_l.to_ne_bytes());
             let memory = &*cx.memory;
-            let iovecs = match read_iovecs(memory, iov, iovcnt) {
-                Ok(iovecs) => iovecs,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let iovecs = read_iovecs(memory, iov, iovcnt)?;
             if offset < 0 {
                 return Ok(LINUX_EINVAL.into());
             }
@@ -4694,10 +4628,7 @@ impl SyscallDispatcher {
                     };
                     let n =
                         unsafe { libc::pwrite(hfd, buf.as_ptr() as *const _, len, cur as libc::off_t) };
-                    let n = match n.host_syscall_errno() {
-                        Ok(value) => value,
-                        Err(errno) => return Ok(errno.into()),
-                    };
+                    let n = n.host_syscall_errno()?;
                     total += n as i64;
                     cur += n as i64;
                     if (n as usize) < len {
@@ -4819,10 +4750,7 @@ impl SyscallDispatcher {
                 }
             }
 
-            let bytes = match this.sendfile_bytes(in_fd.0, offset, count) {
-                Ok(bytes) => bytes,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let bytes = this.sendfile_bytes(in_fd.0, offset, count)?;
             let outcome = this.write_output_fd(out_fd.0, &bytes, tid);
             let DispatchOutcome::Returned { value } = outcome else {
                 return Ok(outcome);
@@ -4883,10 +4811,7 @@ impl SyscallDispatcher {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
 
-            let in_offset = match this.sendfile_offset(in_fd.0, off_in_addr, memory)? {
-                Ok(o) => o,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let in_offset = this.sendfile_offset(in_fd.0, off_in_addr, memory)??;
             // copy_file_range onto the SAME file with OVERLAPPING ranges must fail
             // EINVAL (Linux). Go's io.Copy(f, f) self-copy hits exactly this: fd_in
             // == fd_out, NULL/NULL offsets → identical (thus overlapping) ranges.
@@ -4899,10 +4824,7 @@ impl SyscallDispatcher {
             // cross-file path. Sits above the Darwin clone fast path so it can't
             // mis-handle an overlapping self-copy either.
             if this.copy_same_file(in_fd.0, out_fd.0) {
-                let out_offset = match this.sendfile_offset(out_fd.0, off_out_addr, memory)? {
-                    Ok(o) => o,
-                    Err(errno) => return Ok(errno.into()),
-                };
+                let out_offset = this.sendfile_offset(out_fd.0, off_out_addr, memory)??;
                 let in_end = in_offset.saturating_add(count);
                 let out_end = out_offset.saturating_add(count);
                 if in_offset < out_end && out_offset < in_end {
@@ -4920,10 +4842,7 @@ impl SyscallDispatcher {
             )? {
                 return Ok(outcome);
             }
-            let bytes = match this.sendfile_bytes(in_fd.0, in_offset, count) {
-                Ok(b) => b,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let bytes = this.sendfile_bytes(in_fd.0, in_offset, count)?;
             if bytes.is_empty() {
                 return Ok(DispatchOutcome::Returned { value: 0 });
             }
@@ -4938,10 +4857,7 @@ impl SyscallDispatcher {
                 };
                 usize::try_from(value).unwrap_or(0)
             } else {
-                let out_off = match read_u64(memory, off_out_addr) {
-                    Ok(v) => v,
-                    Err(errno) => return Ok(errno.into()),
-                };
+                let out_off = read_u64(memory, off_out_addr)?;
                 let host_fd = match this.open_file(out_fd.0).as_ref() {
                     Some(of) => match &*of.description.read() {
                         OpenDescription::HostFile {
@@ -5033,10 +4949,7 @@ impl SyscallDispatcher {
                 if let Some(errno) = this.splice_output_errno(out_fd.0) {
                     return Ok(errno.into());
                 }
-                let bytes = match take_pipe_bytes(&pipe, count, status_flags) {
-                    Ok(bytes) => bytes,
-                    Err(errno) => return Ok(errno.into()),
-                };
+                let bytes = take_pipe_bytes(&pipe, count, status_flags)?;
                 let outcome = this.splice_write_out(out_fd.0, off_out_address, &bytes, cx.memory, tid);
                 return Ok(outcome);
             }
@@ -5060,10 +4973,7 @@ impl SyscallDispatcher {
                 // niche path to the lockless wait is a tracked follow-up, not a
                 // server hot path.
                 let n = unsafe { libc::read(host_fd, buf.as_mut_ptr() as *mut _, count) };
-                let n = match n.host_syscall_errno() {
-                    Ok(value) => value,
-                    Err(errno) => return Ok(errno.into()),
-                };
+                let n = n.host_syscall_errno()?;
                 buf.truncate(n as usize);
                 let outcome = this.splice_write_out(out_fd.0, off_out_address, &buf, cx.memory, tid);
                 return Ok(outcome);
@@ -5110,10 +5020,7 @@ impl SyscallDispatcher {
                         libc::MSG_PEEK | libc::MSG_DONTWAIT,
                     )
                 };
-                let n = match n.host_syscall_errno() {
-                    Ok(value) => value,
-                    Err(errno) => return Ok(errno.into()),
-                };
+                let n = n.host_syscall_errno()?;
                 if n == 0 {
                     // EOF: the writer closed; splice reports 0 (Go stops the loop).
                     return Ok(DispatchOutcome::Returned { value: 0 });
@@ -5173,10 +5080,7 @@ impl SyscallDispatcher {
                 Ok(offset) => offset,
                 Err(errno) => return Ok(errno.into()),
             };
-            let bytes = match this.sendfile_bytes(in_fd.0, offset, count) {
-                Ok(bytes) => bytes,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let bytes = this.sendfile_bytes(in_fd.0, offset, count)?;
             let outcome = this.write_output_fd(out_fd.0, &bytes, tid);
             let DispatchOutcome::Returned { value } = outcome else {
                 return Ok(outcome);
@@ -5226,17 +5130,11 @@ impl SyscallDispatcher {
             let Some(state) = this.inotify_state(fd.0) else {
                 return Ok(LINUX_EINVAL.into());
             };
-            let path = match read_guest_c_string(&*cx.memory, pathname.0) {
-                Ok(path) => path,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let path = read_guest_c_string(&*cx.memory, pathname.0)?;
             if path.is_empty() {
                 return Ok(LINUX_ENOENT.into());
             }
-            let path = match this.resolve_at_path(LINUX_AT_FDCWD, &path) {
-                Ok(path) => path,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let path = this.resolve_at_path(LINUX_AT_FDCWD, &path)?;
             if let Some(m) = this.fs.vfs_mounts.resolve(&path) {
                 return match m.vfs.watch_fds(&m.full_path) {
                     Ok(watch_fds) => Ok(match state.add_watch_fds(watch_fds, mask as u32) {
@@ -5301,10 +5199,7 @@ impl SyscallDispatcher {
             if !this.fd_is_valid(fd.0) {
                 return Ok(LINUX_EBADF.into());
             }
-            let host_fd = match this.host_file_fd_for_flush(fd.0) {
-                Ok(host_fd) => host_fd,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let host_fd = this.host_file_fd_for_flush(fd.0)?;
             if let Some(host_fd) = host_fd
                 && let Err(errno) = flush_host_fd(host_fd) {
                     return Ok(errno.into());
@@ -5727,10 +5622,7 @@ impl SyscallDispatcher {
             let iovcnt =
                 usize::try_from(vlen).map_err(|_| DispatchError::LengthTooLarge(vlen))?;
             let memory = &*cx.memory;
-            let iovecs = match read_iovecs(memory, iov, iovcnt) {
-                Ok(iovecs) => iovecs,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let iovecs = read_iovecs(memory, iov, iovcnt)?;
             // A stdio fd the guest explicitly closed (and did not reopen) is
             // genuinely closed: writev is EBADF, not a host-stream/buffer write.
             if this.stdio_is_closed(fd) {
@@ -5920,14 +5812,8 @@ impl SyscallDispatcher {
                 return Ok(LINUX_EINVAL.into());
             }
 
-            let path = match read_guest_c_string(&*cx.memory, pathname) {
-                Ok(path) => path,
-                Err(errno) => return Ok(errno.into()),
-            };
-            let path = match this.resolve_at_path(dirfd, &path) {
-                Ok(path) => path,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let path = read_guest_c_string(&*cx.memory, pathname)?;
+            let path = this.resolve_at_path(dirfd, &path)?;
 
             let target = if let Some(kind) = proc_self_magic_link(&path) {
                 match kind {
@@ -6006,17 +5892,11 @@ impl SyscallDispatcher {
 
             let pathname = pathname.0;
             let mode = mode as u32;
-            let path = match read_guest_c_string(&*cx.memory, pathname) {
-                Ok(path) => path,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let path = read_guest_c_string(&*cx.memory, pathname)?;
             if path.is_empty() {
                 return Ok(LINUX_ENOENT.into());
             }
-            let resolved = match this.resolve_at_path(dirfd, &path) {
-                Ok(resolved) => resolved,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let resolved = this.resolve_at_path(dirfd, &path)?;
             if crate::vfs::is_synthetic_virtual_file(&resolved, &this.synthetic_proc_context()) {
                 return Ok(LINUX_EEXIST.into());
             }
@@ -6129,17 +6009,11 @@ impl SyscallDispatcher {
         fn mkdirat(this, cx, dirfd: u64, pathname: GuestPtr, mode: u64) {
 
             let pathname = pathname.0;
-            let path = match read_guest_c_string(&*cx.memory, pathname) {
-                Ok(path) => path,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let path = read_guest_c_string(&*cx.memory, pathname)?;
             if path.is_empty() {
                 return Ok(LINUX_ENOENT.into());
             }
-            let resolved = match this.resolve_at_path(dirfd, &path) {
-                Ok(resolved) => resolved,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let resolved = this.resolve_at_path(dirfd, &path)?;
             if crate::vfs::is_synthetic_virtual_file(&resolved, &this.synthetic_proc_context()) {
                 return Ok(LINUX_EEXIST.into());
             }
@@ -6289,10 +6163,7 @@ impl SyscallDispatcher {
             if flags & !(LINUX_AT_SYMLINK_NOFOLLOW | LINUX_AT_EMPTY_PATH) != 0 {
                 return Ok(LINUX_EINVAL.into());
             }
-            let path = match read_guest_c_string(&*cx.memory, pathname) {
-                Ok(path) => path,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let path = read_guest_c_string(&*cx.memory, pathname)?;
             if path.is_empty() {
                 if flags & LINUX_AT_EMPTY_PATH == 0 {
                     return Ok(LINUX_ENOENT.into());
@@ -6311,10 +6182,7 @@ impl SyscallDispatcher {
             }
             let uid = Self::chown_arg(owner);
             let gid = Self::chown_arg(group);
-            let resolved = match this.resolve_at_path(dirfd, &path) {
-                Ok(resolved) => resolved,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let resolved = this.resolve_at_path(dirfd, &path)?;
             let nofollow = flags & LINUX_AT_SYMLINK_NOFOLLOW != 0;
             if this.fs.vfs_mounts.resolve(&resolved).is_some() {
                 let lookup = {
@@ -6415,14 +6283,8 @@ impl SyscallDispatcher {
             if flags & !(LINUX_AT_SYMLINK_FOLLOW | LINUX_AT_EMPTY_PATH) != 0 {
                 return Ok(LINUX_EINVAL.into());
             }
-            let old = match read_guest_c_string(&*cx.memory, oldpath) {
-                Ok(path) => path,
-                Err(errno) => return Ok(errno.into()),
-            };
-            let new_path = match read_guest_c_string(&*cx.memory, newpath) {
-                Ok(path) => path,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let old = read_guest_c_string(&*cx.memory, oldpath)?;
+            let new_path = read_guest_c_string(&*cx.memory, newpath)?;
             if new_path.is_empty() {
                 return Ok(LINUX_ENOENT.into());
             }
@@ -6435,10 +6297,7 @@ impl SyscallDispatcher {
                 }
                 None
             } else {
-                let resolved = match this.resolve_at_path(olddirfd, &old) {
-                    Ok(resolved) => resolved,
-                    Err(errno) => return Ok(errno.into()),
-                };
+                let resolved = this.resolve_at_path(olddirfd, &old)?;
                 let exists =
                     crate::vfs::is_synthetic_virtual_file(&resolved, &this.synthetic_proc_context())
                         || this.layered_metadata(&resolved).is_ok();
@@ -6447,10 +6306,7 @@ impl SyscallDispatcher {
                 }
                 Some(resolved)
             };
-            let resolved_new = match this.resolve_at_path(newdirfd, &new_path) {
-                Ok(resolved) => resolved,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let resolved_new = this.resolve_at_path(newdirfd, &new_path)?;
             if crate::vfs::is_synthetic_virtual_file(&resolved_new, &this.synthetic_proc_context())
                 || this.layered_metadata(&resolved_new).is_ok()
             {
@@ -6516,24 +6372,15 @@ impl SyscallDispatcher {
 
             let target = target.0;
             let linkpath = linkpath.0;
-            let target_path = match read_guest_c_string(&*cx.memory, target) {
-                Ok(target) => target,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let target_path = read_guest_c_string(&*cx.memory, target)?;
             if target_path.is_empty() {
                 return Ok(LINUX_ENOENT.into());
             }
-            let link = match read_guest_c_string(&*cx.memory, linkpath) {
-                Ok(link) => link,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let link = read_guest_c_string(&*cx.memory, linkpath)?;
             if link.is_empty() {
                 return Ok(LINUX_ENOENT.into());
             }
-            let resolved_link = match this.resolve_at_path(newdirfd, &link) {
-                Ok(resolved) => resolved,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let resolved_link = this.resolve_at_path(newdirfd, &link)?;
             if crate::vfs::is_synthetic_virtual_file(&resolved_link, &this.synthetic_proc_context()) {
                 return Ok(LINUX_EEXIST.into());
             }
@@ -6679,17 +6526,11 @@ impl SyscallDispatcher {
             if flags & !LINUX_AT_REMOVEDIR != 0 {
                 return Ok(LINUX_EINVAL.into());
             }
-            let path = match read_guest_c_string(&*cx.memory, pathname) {
-                Ok(path) => path,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let path = read_guest_c_string(&*cx.memory, pathname)?;
             if path.is_empty() {
                 return Ok(LINUX_ENOENT.into());
             }
-            let resolved = match this.resolve_at_path(dirfd, &path) {
-                Ok(resolved) => resolved,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let resolved = this.resolve_at_path(dirfd, &path)?;
             let remove_dir = flags & LINUX_AT_REMOVEDIR != 0;
             // Synthetic /proc /sys paths can't be unlinked.
             if crate::vfs::is_synthetic_virtual_file(&resolved, &this.synthetic_proc_context()) {
@@ -6748,17 +6589,11 @@ impl SyscallDispatcher {
             #[allow(clippy::type_complexity)]
             let (atime_set, mtime_set): (Option<(i64, i64)>, Option<(i64, i64)>);
             if times != 0 {
-                let atime = match read_timespec(memory, times) {
-                    Ok(timespec) => timespec,
-                    Err(errno) => return Ok(errno.into()),
-                };
+                let atime = read_timespec(memory, times)?;
                 let mtime_address = times
                     .checked_add(core::mem::size_of::<LinuxTimespec>() as u64)
                     .ok_or(DispatchError::LengthTooLarge(times))?;
-                let mtime = match read_timespec(memory, mtime_address) {
-                    Ok(timespec) => timespec,
-                    Err(errno) => return Ok(errno.into()),
-                };
+                let mtime = read_timespec(memory, mtime_address)?;
                 if !linux_utimensat_timespec_is_valid(atime)
                     || !linux_utimensat_timespec_is_valid(mtime)
                 {
@@ -6791,10 +6626,7 @@ impl SyscallDispatcher {
                 return Ok(this.set_fd_times(dirfd as i32, atime_set, mtime_set));
             }
 
-            let path = match read_guest_c_string(memory, pathname) {
-                Ok(path) => path,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let path = read_guest_c_string(memory, pathname)?;
             if path.is_empty() {
                 return Ok(LINUX_ENOENT.into());
             }
@@ -6873,10 +6705,7 @@ impl SyscallDispatcher {
             let pathname = pathname.0;
             let statbuf = statbuf.0;
             let memory = &mut *cx.memory;
-            let path = match read_guest_c_string(memory, pathname) {
-                Ok(path) => path,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let path = read_guest_c_string(memory, pathname)?;
 
             if path.is_empty() && flags & LINUX_AT_EMPTY_PATH != 0 {
                 return Ok(this.write_fd_stat(dirfd as i32, statbuf, memory));
@@ -6890,10 +6719,7 @@ impl SyscallDispatcher {
             // the raw path before resolve_at_path normalizes the slash away.
             let requires_dir = path.ends_with('/') || path.ends_with("/.");
 
-            let path = match this.resolve_at_path(dirfd, &path) {
-                Ok(path) => path,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let path = this.resolve_at_path(dirfd, &path)?;
             // Synthetic /proc /sys paths first.
             if let Some(contents) =
                 crate::vfs::proc::synthetic_file(&path, &this.synthetic_proc_context())
@@ -7005,10 +6831,7 @@ impl SyscallDispatcher {
                 return Ok(LINUX_EINVAL.into());
             }
 
-            let path = match read_guest_c_string(memory, pathname) {
-                Ok(path) => path,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let path = read_guest_c_string(memory, pathname)?;
 
             if path.is_empty() {
                 if flags & LINUX_AT_EMPTY_PATH == 0 {
@@ -7022,10 +6845,7 @@ impl SyscallDispatcher {
             // ENOTDIR (matches newfstatat; man path_resolution(7)).
             let requires_dir = path.ends_with('/') || path.ends_with("/.");
 
-            let path = match this.resolve_at_path(dirfd, &path) {
-                Ok(path) => path,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let path = this.resolve_at_path(dirfd, &path)?;
             if let Some(contents) =
                 crate::vfs::proc::synthetic_file(&path, &this.synthetic_proc_context())
             {
