@@ -340,6 +340,15 @@ pub trait FsBackend: Send + Sync {
         None
     }
 
+    /// Fast intermediate-path validation for the resolver's hot path: validate
+    /// the PARENT chain of a lexically-joined guest absolute `abs` with the
+    /// kernel in ~one syscall (openat the parent + F_GETPATH byte-exact),
+    /// replacing the per-component O(K²) slow walk for the common case. See
+    /// [`ParentResolve`]. Default: `Slow` (no kernel path to fast-walk).
+    fn validate_parents_fast(&self, _abs: &str) -> ParentResolve {
+        ParentResolve::Slow
+    }
+
     /// Human-readable backend name for `--fs` reporting. Default is
     /// the impl's `type_name`-style identifier.
     fn name(&self) -> &'static str {
@@ -352,6 +361,22 @@ pub enum OverlayEntryKind {
     Dir,
     File,
     Deleted,
+}
+
+/// Result of [`FsBackend::validate_parents_fast`] — a one-syscall kernel-walked
+/// check of a path's intermediate (parent) chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParentResolve {
+    /// Every intermediate exists, is a directory, has NO symlink/Unicode-alias
+    /// redirection, and stays in the sandbox — the resolver can skip BOTH the
+    /// intermediate-dir ENOTDIR validation and the intermediate-symlink rewrite.
+    AllDirsNoSymlink,
+    /// An intermediate component is a non-directory → ENOTDIR.
+    NotDir,
+    /// Anything else (a missing component, an intermediate symlink, a
+    /// Unicode-aliased name, a sandbox escape, or a non-host backend): the
+    /// caller must run the exact per-component slow path.
+    Slow,
 }
 
 /// Strip a leading `/` and collapse `.` / `..` so the backend's
@@ -2549,6 +2574,77 @@ impl FsBackend for HostFsBackend {
         let err = rc.host_syscall_errno().map(|_| ());
         unsafe { libc::close(host_fd) };
         err
+    }
+
+    fn validate_parents_fast(&self, abs: &str) -> ParentResolve {
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::ffi::OsStrExt;
+            if !self.fast_fs {
+                return ParentResolve::Slow;
+            }
+            let Some(root_prefix) = self.root_prefix.as_deref() else {
+                return ParentResolve::Slow;
+            };
+            let Some(normalized) = normalize(abs) else {
+                return ParentResolve::Slow;
+            };
+            // Parent = all but the final component; an empty parent is the
+            // sandbox root, which is always a directory (no intermediates).
+            let parent = match normalized.parent() {
+                Some(p) if !p.as_os_str().is_empty() => p,
+                _ => return ParentResolve::AllDirsNoSymlink,
+            };
+            let Ok(parent_c) = std::ffi::CString::new(parent.as_os_str().as_bytes()) else {
+                return ParentResolve::Slow;
+            };
+            let dir_fd = self.dir.as_raw_fd();
+            // ONE openat: the kernel walks every intermediate. O_DIRECTORY makes a
+            // non-directory parent (or any non-dir intermediate) fail ENOTDIR.
+            // Symlinks ARE followed; F_GETPATH below reveals any redirection.
+            let oflags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NONBLOCK;
+            let fd = unsafe { libc::openat(dir_fd, parent_c.as_ptr(), oflags, 0) };
+            if fd < 0 {
+                let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+                // ENOTDIR ⇒ an intermediate is a non-dir. Anything else (ENOENT
+                // missing, ELOOP, EACCES, …) ⇒ let the exact slow path decide.
+                return if e == libc::ENOTDIR {
+                    ParentResolve::NotDir
+                } else {
+                    ParentResolve::Slow
+                };
+            }
+            let mut buf = [0u8; libc::PATH_MAX as usize];
+            let getpath_ok = unsafe {
+                libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr() as *mut libc::c_char)
+            } >= 0;
+            unsafe { libc::close(fd) };
+            if !getpath_ok {
+                return ParentResolve::Slow;
+            }
+            let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            let got = &buf[..end];
+            // Byte-exact: the real on-disk path must equal sandbox_root + "/" +
+            // parent. ANY difference (an intermediate symlink the kernel followed,
+            // a Unicode-normalized alias, a sandbox escape) ⇒ the slow path, which
+            // resolves symlinks and rejects aliases exactly.
+            let mut expected =
+                Vec::with_capacity(root_prefix.len() + 1 + parent.as_os_str().len());
+            expected.extend_from_slice(root_prefix.as_bytes());
+            expected.push(b'/');
+            expected.extend_from_slice(parent.as_os_str().as_bytes());
+            if got == expected.as_slice() {
+                ParentResolve::AllDirsNoSymlink
+            } else {
+                ParentResolve::Slow
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = abs;
+            ParentResolve::Slow
+        }
     }
 
     fn real_stat(&self, path: &str, follow: bool) -> Option<RealStat> {
