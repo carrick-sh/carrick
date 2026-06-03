@@ -169,7 +169,7 @@ can match a `connect` to the `bind` of the same socket across processes.
 > *reproducible* live guest, `carrick trace` is still the richer tool (guest↔host
 > correlation, fork-post tree, sampling). The ring is what cracked the CPython
 > forkserver-from-forkserver `test_parent_process` deadlock
-> (`docs/forkserver-parent-process-deadlock.md`).
+> (`docs/archive/forkserver-parent-process-deadlock.md`).
 
 ### Loading the plugin and reading the ring
 

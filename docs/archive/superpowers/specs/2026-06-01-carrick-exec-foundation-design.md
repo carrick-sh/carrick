@@ -4,7 +4,7 @@
 **Goal:** implement `docker exec`-equivalent for carrick — run a command in a
 running container, sharing **both** its writable filesystem and its PID
 namespace — plus the persisted/shareable container state that makes it possible.
-**Roadmap:** P3 of `docs/docker-compat-audit.md` (the connective lifecycle verb
+**Roadmap:** P3 of `docs/archive/docker-compat-audit.md` (the connective lifecycle verb
 that makes `run -d` usable); also lays the groundwork P5 (`create`/`start`/
 `restart`) needs.
 
