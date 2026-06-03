@@ -32,53 +32,54 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Formatting
-        run: cargo fmt --all -- --check
+      # The gate commands live in the justfile (single source of truth). CI
+      # installs `just` and calls the matching recipe per step, so `just ci`
+      # locally runs exactly what this job runs — no drift between the two.
+      - name: Install just
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just
 
-      # The no-panic gate: unwrap/expect/panic/todo/unimplemented are denied via
-      # crate-level attributes, and `-D warnings` promotes every other lint too.
+      - name: Formatting
+        run: just fmt-check
+
+      # No-panic gate: unwrap/expect/panic/todo/unimplemented are denied via
+      # crate-level attributes; `-D warnings` promotes every other lint too.
       - name: Clippy (no-panic gate)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: just clippy
 
       - name: Build
-        run: cargo build --workspace
+        run: just check --workspace
 
-      # Rustdoc gate: broken intra-doc links, unclosed-HTML-tag false positives,
-      # and other rustdoc lints fail the build, mirroring the clippy gate.
-      # --document-private-items because carrick is internal (not a published
-      # library) — most of its substance, and most of its Big Theory Statements,
-      # live on private items.
+      # Rustdoc gate: broken intra-doc links / unclosed-HTML-tag lints fail the
+      # build, mirroring the clippy gate (--document-private-items because
+      # carrick is internal — most of its substance lives on private items).
       - name: Docs (rustdoc gate)
-        run: cargo doc --workspace --no-deps --document-private-items
-        env:
-          RUSTDOCFLAGS: "-D warnings"
+        run: just doc
 
-      # `--lib` runs the crate unit tests only; the HVF-dependent integration
-      # binaries (trap_hvf, runtime_loop, interactive_tty, …) need an entitled
-      # vCPU and run in the self-hosted job below. The pure-logic integration
-      # suites that do NOT touch HVF are listed explicitly so they still gate here.
+      # `just test` is `--lib` only; the HVF-dependent integration binaries
+      # (trap_hvf, runtime_loop, interactive_tty, …) need an entitled vCPU and
+      # run in the self-hosted job below. The pure-logic suites run via
+      # `just test-integration`.
+      #
       # GitHub-hosted macOS runners default RLIMIT_NOFILE to 256, but carrick
-      # relocates its internal fds (signal/pump/per-thread wake pipes, etc.)
-      # above 16384 to stay clear of the guest fd range — so it needs real-host
-      # fd headroom. `ulimit` doesn't persist across steps, so each test step
-      # raises the kernel cap (sysctl) and the soft limit (ulimit) in its own
-      # shell, with a fallback to the achievable hard limit and a diagnostic.
+      # relocates its internal fds above 16384 to stay clear of the guest fd
+      # range — so the test processes need real-host fd headroom. `ulimit`
+      # doesn't persist across steps, so each test step raises the kernel cap
+      # (sysctl) and the soft limit (ulimit) in its own shell before the recipe.
       - name: Unit tests
         run: |
           sudo sysctl -w kern.maxfiles=524288 kern.maxfilesperproc=524288 || true
           ulimit -n 65536 || ulimit -n "$(ulimit -Hn)" || true
           echo "RLIMIT_NOFILE: soft=$(ulimit -Sn) hard=$(ulimit -Hn)"
-          cargo test --workspace --lib
+          just test
 
       - name: Host integration tests (no HVF)
         run: |
           sudo sysctl -w kern.maxfiles=524288 kern.maxfilesperproc=524288 || true
           ulimit -n 65536 || ulimit -n "$(ulimit -Hn)" || true
           echo "RLIMIT_NOFILE: soft=$(ulimit -Sn) hard=$(ulimit -Hn)"
-          cargo test -p carrick-runtime --test integration
-          cargo test -p carrick-runtime --test syscall_process
-          cargo test -p carrick-engine
-          cargo test -p carrick-image
+          just test-integration
 
   # Full HVF runtime + differential conformance vs Docker. Requires a self-hosted
   # Apple-Silicon runner that (a) holds the com.apple.security.hypervisor

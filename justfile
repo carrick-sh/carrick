@@ -38,6 +38,20 @@ fmt:
 test *ARGS:
     cargo test --workspace --lib {{ARGS}}
 
+# Rustdoc gate: broken intra-doc links / unclosed-tag lints fail the build (matches CI).
+doc *ARGS:
+    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items {{ARGS}}
+
+# Host integration suites (no HVF/Docker); syscall_process is its own binary (matches CI).
+test-integration:
+    cargo test -p carrick-runtime --test integration
+    cargo test -p carrick-runtime --test syscall_process
+    cargo test -p carrick-engine
+    cargo test -p carrick-image
+
+# Run the full host CI gate locally (fmt · clippy · build · docs · tests) — the source of truth CI calls.
+ci: fmt-check clippy (check "--workspace") doc test test-integration
+
 # Differential conformance suite vs Docker (needs Docker + signed binary; self-skips).
 conformance: build
     cargo test -p carrick-cli --test conformance -- --nocapture
