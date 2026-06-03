@@ -1,7 +1,62 @@
 # `test_multiprocessing_forkserver.test_parent_process` deadlock
 
-Status: **OPEN** (deeper deadlock). A related CPU-spin symptom is fixed (commit
-`73cb279`); the hang itself remains.
+Status: **RESOLVED** (commit `12f5f65`). `test_parent_process` is 10/10 PASS
+(was 10/10 hang); the full module runs to completion (run=397, was blocked at
+n=96). A related CPU-spin symptom was fixed first (`73cb279`).
+
+## Root cause + fix (`12f5f65`)
+
+The wedged worker's stack (via the event-ring tool below + `sample`):
+`run_vcpu_until_exit -> ForkCoordinator::prepare_host_fork ->
+SignalPump::stop_inner -> thread::join -> __ulock_wait` (forever). When a
+forkserver WORKER forks the nested forkserver SERVER B, carrick stops the
+worker's signal pump (`prepare_host_fork`) by setting `running=false`, writing
+the pump's wake pipe ONCE, and `join()`ing. In the nested-fork timing the
+freshly-respawned pump can still be setting up its kqueue/pipe, so the single
+pipe-wake races and is LOST — the pump parks in `kevent()` forever, never sees
+the stop flag, and `join()` blocks the whole host fork. Server B is therefore
+never forked; the worker, `main`'s `rconn.poll` (line 422), and the grandchild
+all deadlock.
+
+Fix: `SignalPump::stop` now (a) wakes via BOTH channels (the pipe AND the
+EVFILT_USER NOTE_TRIGGER), retried on a short cadence; (b) waits on the pump's
+real EXIT (a new `exited` flag set by an exit guard on every return path); and
+(c) if the pump still hasn't exited within a bound, DETACHES rather than join
+forever (a leaked daemon parked in `kevent` is harmless — the next pump's
+`pump_install_pipe` EOF-wakes it). Red->green test
+`vcpu_kick::tests::signal_pump_stop_is_bounded_when_wake_is_lost`.
+
+## Durable debugging tooling (what cracked it)
+
+The race perturbs under `eprintln`/dtrace, so two low/zero-perturbation tools
+were added and are kept for future use:
+
+- **In-memory event ring** (`crates/carrick-runtime/src/event_ring.rs`,
+  `d1a2947`): always-on, hot-path-cheap (atomic index + 2 stores, ~ns) recording
+  of bind/connect/listen/accept/epoll_ctl/epoll_pwait/fork/exec. It pinpointed
+  the wedge — the worker `BIND`+`LISTEN`s B's listener then STOPS with no `FORK`
+  (stuck before forking B) — without perturbing the race away. Optional 1 Hz
+  file dump: `CARRICK_EVENTRING=<dir>` -> `<dir>/carrick-ring.<pid>`.
+- **lldb plugin** (`scripts/carrick_lldb.py`, `carrick eventring`): reads the
+  ring from a LIVE process or a CORE file. Repeatable workflow:
+
+  ```sh
+  # live: attach to the (guest) carrick process
+  lldb -o "command script import scripts/carrick_lldb.py" \
+       -o "attach <pid>" -o "carrick eventring"
+
+  # core: small modified-memory core (dirty pages incl. the ring, NOT the
+  # multi-GB guest memory), then read it with no live process
+  lldb -o "attach <pid>" -o "process save-core --style modified-memory /tmp/c.core" -o detach
+  lldb -c /tmp/c.core target/release/carrick \
+       -o "command script import scripts/carrick_lldb.py" -o "carrick eventring"
+  ```
+  Note: a `carrick run` is two host processes (orchestrator parent + the guest);
+  attach to the guest (the one with a non-empty ring).
+
+---
+
+## (Historical) investigation notes
 
 ## Reliable repro (the red test)
 
