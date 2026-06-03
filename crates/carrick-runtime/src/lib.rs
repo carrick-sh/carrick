@@ -13,6 +13,7 @@ pub(crate) mod darwin_fs;
 pub mod dispatch;
 #[cfg(target_os = "macos")]
 pub mod dtrace_consumer;
+pub mod event_ring;
 pub mod fs_backend;
 pub mod host_tty;
 pub(crate) mod inotify;
