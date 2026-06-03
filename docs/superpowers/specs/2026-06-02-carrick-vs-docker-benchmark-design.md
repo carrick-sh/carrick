@@ -1,7 +1,7 @@
 # Carrick vs Docker Benchmark — Strategy & Design
 
 **Date:** 2026-06-02
-**Status:** Design (approved decisions captured; pending spec review → implementation plan)
+**Status:** Phase 0 implemented (branch `bench/carrick-vs-docker`) — reusable harness + first marquee result (loopback TCP_RR). This doc is the strategy for all 4 dimensions / 5 phases; see the running results log at the end.
 **Author:** brainstorming session (Timothy J Fontaine + Claude)
 
 ---
@@ -47,10 +47,10 @@ Apple **M4 (Mac16,12)**, **4 performance + 6 efficiency cores** (10 total), **32
 
 All three independent design lenses (measurement-science, systems-attribution, pragmatic-MVP) chose to **extend `conformance.rs`** rather than build a parallel harness. Settled.
 
-New test entry point: **`crates/carrick-cli/tests/perf_runner.rs`** (+ `perf_cases.rs`), reusing **as-is**:
+New test entry point: **`crates/carrick-cli/tests/perf_runner.rs`** plus a **`crates/carrick-cli/tests/perf_support/`** module tree (`cases`, `stats`, `metric`, `provenance`, `invoke`), reusing the proven `conformance.rs` patterns:
 
-- `CONFORMANCE_LOCK` (serializes perf vs the correctness gate),
-- `case_run_id()` → `cr-perf-{pid}-{seq}` (monotonic, never reused),
+- a per-binary serialization lock — *as built*, its own `PERF_LOCK` rather than `CONFORMANCE_LOCK` (the two suites are separate test binaries, so they cannot share an in-process mutex; the cross-process `fd-lock` shared with conformance is the deferred hardening in §9),
+- a per-sample run id `cr-perf-{pid}-{seq}` (monotonic, never reused) stamped into `CARRICK_RUN_ID`,
 - `scoped_kill_guests(run_id)` via `scripts/sudo/kill.sh` (matches `carrick:<run_id>` proctitle),
 - the `CASE_DEADLINE` watchdog (pgid kill on timeout),
 - `scripts/build-probes.sh` (static-musl probe build),
@@ -60,7 +60,7 @@ New test entry point: **`crates/carrick-cli/tests/perf_runner.rs`** (+ `perf_cas
 
 ### Reusable-framework layer (decision 6)
 
-- **Declarative case registry** — `DiskCase` / `NetworkCase` / `ForkCase` / `ThreadCase` structs in `perf_cases.rs`. A workload = data (image, in-guest command, metric extractor, both-engine invocation, lane set). Adding a workload or dimension is a data edit, not a harness rewrite.
+- **Declarative case registry** — in `perf_support/cases.rs`. *Phase 0 ships a single `PerfCase` struct* (`probe`, `dimension`, `workload`, `metric_key`, `unit`); later phases may add per-dimension fields/structs as the disk/fork/thread workloads need them. A workload = data (probe binary, metric key, labels). Adding a workload or dimension is a data edit, not a harness rewrite.
 - **Append-only JSONL store with provenance** — `docs/perf-results/<date>-<dim>.jsonl`, one row per `(workload, engine, lane, rep-set)`, stamping: carrick git SHA, image **OCI digest** (pinned; run aborts on drift), host facts, fs mode, CPU pin, `nproc`-validated flag, thermal label, `run_quality`, and `run_id`. Same shape/spirit as the existing `docker-oracle.jsonl`. **Committed** (not gitignored) so baselines are durable and cross-machine comparable.
 - **Single entry point** — `just bench` → `scripts/measure-perf.sh` → `cargo test -p carrick-cli --test perf_runner`. Self-skips when Docker / HVF / signed binary absent (like `just conformance`). Supports `--quick` / `--full` / `--dimension <d>` / `--filter <glob>`.
 - **Regression mode** — `scripts/measure-perf.sh --baseline <file>` diffs a fresh run against a stored baseline row and flags deltas, reading the same store the advocacy report renders from.
