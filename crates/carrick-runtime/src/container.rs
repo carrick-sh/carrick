@@ -342,12 +342,22 @@ pub fn short_id(id: &str) -> &str {
 /// formats it. Collision probability across a single host's containers is
 /// negligible (pid+secs+counter is unique per launch).
 pub fn make_id(seed_hi: u64, seed_lo: u64) -> String {
-    // Two 64-bit words → 32 hex chars; pad to 64 with a mix so it LOOKS like a
-    // docker sha256 id without implying content addressing.
-    let a = seed_hi.rotate_left(17) ^ 0x9e37_79b9_7f4a_7c15;
-    let b = seed_lo.wrapping_mul(0xc2b2_ae3d_27d4_eb4f);
-    let c = (seed_hi ^ seed_lo).wrapping_add(0x1656_67b1_9e37_79f9);
-    let d = (seed_hi.wrapping_add(seed_lo)).rotate_right(23);
+    // Four 64-bit words → 64 hex chars, LOOKING like a docker sha256 id without
+    // implying content addressing. BOTH seeds avalanche into EVERY word — in
+    // particular the first word `a`, whose top 48 bits are the 12-hex SHORT id
+    // (`carrick ps` width / `short_id`). An earlier version set `a = seed_hi
+    // .rotate_left(17) ^ CONST`, so for a small `seed_hi` (a pid) the short id
+    // was constant-dominated (every id began `9e3779b9…`) with the real entropy
+    // buried in `b`, past the short-id cutoff — colliding short ids and an
+    // ugly default. Mixing both seeds first fixes the distribution.
+    let mix = seed_hi.rotate_left(17).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        ^ seed_lo.wrapping_mul(0xc2b2_ae3d_27d4_eb4f);
+    let a = mix ^ 0xff51_afd7_ed55_8ccd;
+    let b = (seed_lo ^ mix.rotate_right(29)).wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    let c = (seed_hi ^ seed_lo)
+        .wrapping_add(0x1656_67b1_9e37_79f9)
+        .rotate_left(31);
+    let d = mix.wrapping_add(seed_lo).rotate_right(23) ^ seed_hi;
     format!("{a:016x}{b:016x}{c:016x}{d:016x}")
 }
 
@@ -388,6 +398,28 @@ mod tests {
         assert_eq!(id, make_id(1234, 5678));
         // Different seeds → different ids.
         assert_ne!(id, make_id(1234, 5679));
+    }
+
+    #[test]
+    fn short_id_is_well_distributed() {
+        // The SHORT id (the proctitle/ps id space) must carry both seeds — the
+        // entropy must reach the first 12 hex, not be buried past the cutoff.
+        // lo-only change must move the short id:
+        assert_ne!(
+            short_id(&make_id(1234, 5678)),
+            short_id(&make_id(1234, 5679))
+        );
+        // small, close pids (seed_hi) must not collapse to the same short id:
+        let ids: Vec<String> = (1000u64..1010)
+            .map(|pid| short_id(&make_id(pid, 42)).to_string())
+            .collect();
+        let distinct: std::collections::BTreeSet<_> = ids.iter().collect();
+        assert_eq!(distinct.len(), ids.len(), "short ids collide: {ids:?}");
+        // and they must NOT all share the old constant prefix (the regression).
+        assert!(
+            !ids.iter().all(|s| s.starts_with("9e3779b9")),
+            "short ids still constant-dominated: {ids:?}"
+        );
     }
 
     #[test]
