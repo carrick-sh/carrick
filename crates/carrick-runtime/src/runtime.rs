@@ -1187,6 +1187,32 @@ where
     })
 }
 
+/// Defense-in-depth backstop around a syscall dispatch. A panic inside a
+/// handler would otherwise unwind a vCPU thread: on a SIBLING vCPU it silently
+/// kills only that thread (the guest then hangs waiting on it), and on any
+/// thread it tears through frames holding now-released-but-possibly-half-edited
+/// subsystem locks (`parking_lot` releases on unwind but the protected state
+/// may be torn), so NO guest thread can safely resume. We cannot recover, so
+/// log the offending syscall and abort deterministically — a clean SIGABRT
+/// (with a core for diagnosing the carrick bug) beats a hung or corrupted
+/// guest. The CLI panic hook has already printed the panic + backtrace.
+fn dispatch_with_panic_backstop(
+    syscall_nr: u64,
+    tid: ThreadId,
+    run: impl FnOnce() -> Result<DispatchOutcome, DispatchError>,
+) -> Result<DispatchOutcome, DispatchError> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+        Ok(result) => result,
+        Err(_) => {
+            eprintln!(
+                "carrick: FATAL — panic in syscall {syscall_nr} handler on vCPU tid {tid}; \
+                 aborting guest (subsystem state may be torn, cannot safely resume)"
+            );
+            std::process::abort();
+        }
+    }
+}
+
 fn dispatch_single_threaded_syscall<M: GuestMemory>(
     dispatcher: &mut SyscallDispatcher,
     request: SyscallRequest,
@@ -1203,7 +1229,10 @@ fn dispatch_single_threaded_syscall<M: GuestMemory>(
     let mut signal_wait_deadline = None;
     let mut sleep_deadline: Option<Instant> = None;
     loop {
-        let outcome = dispatcher.dispatch(request, memory, reporter)?;
+        let outcome =
+            dispatch_with_panic_backstop(request.number, std::process::id() as ThreadId, || {
+                dispatcher.dispatch(request, memory, reporter)
+            })?;
         match outcome {
             DispatchOutcome::WaitOnFds {
                 fds,
@@ -1588,14 +1617,16 @@ impl ThreadRuntimeState {
         let mut sleep_deadline: Option<Instant> = None;
         loop {
             let request = SyscallRequest::from_aarch64_frame(frame);
-            let outcome = kernel.dispatcher.dispatch_threaded(
-                request,
-                engine,
-                &kernel.reporter,
-                self.this_tid,
-                &self.registry,
-                &self.futex,
-            )?;
+            let outcome = dispatch_with_panic_backstop(request.number, self.this_tid, || {
+                kernel.dispatcher.dispatch_threaded(
+                    request,
+                    engine,
+                    &kernel.reporter,
+                    self.this_tid,
+                    &self.registry,
+                    &self.futex,
+                )
+            })?;
             match outcome {
                 DispatchOutcome::WaitOnFds {
                     fds,
