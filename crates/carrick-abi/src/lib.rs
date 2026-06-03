@@ -2202,6 +2202,22 @@ bitflags! {
     pub struct LinuxFdFlags: u64 {
         const CLOEXEC = LINUX_FD_CLOEXEC;
     }
+
+    /// `mmap`/`mprotect` memory-protection bits. Previously tested as raw
+    /// `prot & LINUX_PROT_* != 0`; the typed form makes the supported-bit check
+    /// and the PROT_NONE predicate self-describing and drift-resistant.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LinuxProtFlags: u64 {
+        const READ = LINUX_PROT_READ;
+        const WRITE = LINUX_PROT_WRITE;
+        const EXEC = LINUX_PROT_EXEC;
+    }
+}
+
+impl LinuxProtFlags {
+    /// The PROT_* bits carrick understands (READ | WRITE | EXEC). A guest
+    /// `prot` with any other bit set is `EINVAL`.
+    pub const SUPPORTED_MASK: u64 = Self::all().bits();
 }
 
 impl LinuxOpenFlags {

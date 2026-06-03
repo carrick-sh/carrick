@@ -354,7 +354,7 @@ impl SyscallDispatcher {
                 }
             };
             if length == 0
-                || prot & !(LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC) != 0
+                || prot & !LinuxProtFlags::SUPPORTED_MASK != 0
                 || flags & !LinuxMmapFlags::SUPPORTED_MASK != 0
                 || (map_type != LINUX_MAP_SHARED && map_type != LINUX_MAP_PRIVATE)
                 || (flags & LINUX_MAP_ANONYMOUS == 0 && !offset.is_multiple_of(LINUX_PAGE_SIZE))
@@ -489,14 +489,15 @@ impl SyscallDispatcher {
                     // mmap and wedged the guest. Linux maps such files fine (the
                     // dynamic loader; CPython test_mmap test_access_parameter's
                     // `mmap(fd, n, prot=PROT_READ|PROT_EXEC)`), and so must we.
+                    let pf = LinuxProtFlags::from_bits_truncate(prot);
                     let mut host_prot = 0;
-                    if prot & (LINUX_PROT_READ | LINUX_PROT_EXEC) != 0 {
+                    if pf.intersects(LinuxProtFlags::READ | LinuxProtFlags::EXEC) {
                         // PROT_EXEC implies a host-readable backing (carrick reads
                         // it to service the guest's reads; the exec right itself
                         // lives in the guest's stage-1/stage-2, not the host map).
                         host_prot |= libc::PROT_READ;
                     }
-                    if prot & LINUX_PROT_WRITE != 0 {
+                    if pf.contains(LinuxProtFlags::WRITE) {
                         host_prot |= libc::PROT_WRITE;
                     }
                     return Ok(DispatchOutcome::MapHostAlias {
@@ -556,7 +557,7 @@ impl SyscallDispatcher {
             // (no TLBI) when the page is already at the target protection.
             let in_arena = range_within(address, length, LINUX_MMAP_BASE, crate::memory::mmap_arena_size());
 
-            let prot_none = prot & (LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC) == 0;
+            let prot_none = LinuxProtFlags::from_bits_truncate(prot).is_empty();
             if prot_none && flags & LINUX_MAP_ANONYMOUS != 0 {
                 memory.set_no_access(address, length_usize, false);
                 memory.set_no_access(address, length_usize, true);
@@ -1079,7 +1080,7 @@ impl SyscallDispatcher {
         }
 
         fn mprotect(this, cx, address: GuestPtr, length: u64, prot: u64) {
-            if prot & !(LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC) != 0 {
+            if prot & !LinuxProtFlags::SUPPORTED_MASK != 0 {
                 return Ok(LINUX_EINVAL.into());
             }
             if length == 0 {
@@ -1089,7 +1090,7 @@ impl SyscallDispatcher {
                 return Ok(LINUX_EINVAL.into());
             }
             if let Ok(len) = usize::try_from(length) {
-                let prot_none = prot & (LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC) == 0;
+                let prot_none = LinuxProtFlags::from_bits_truncate(prot).is_empty();
                 cx.memory.set_no_access(address.0, len, prot_none);
                 // Make the new protection guest-VISIBLE (a violating access
                 // faults during EL0 execution) by editing the stage-1 page
