@@ -254,915 +254,917 @@ impl SyscallDispatcher {
 
 impl SyscallDispatcher {
     define_syscall! {
-        fn fadvise64(this, cx, fd: Fd, _offset: u64, _len: u64, advice: u64) {
-            if !this.fd_is_valid(fd.0) && !is_stdio_fd(fd.0) {
-                return Ok(LINUX_EBADF.into());
-            }
-            // Linux's generic_fadvise rejects a pipe/FIFO with ESPIPE (checked
-            // before the advice value), so posix_fadvise04 (a real pipe) → ESPIPE.
-            // A /dev chardev is also a HostPipe in carrick but is NOT a FIFO, so
-            // ask the host kernel (fstat S_IFIFO) rather than keying on the
-            // variant alone.
-            if let Some(open_file) = this.open_file(fd.0) {
-                let is_fifo = match &*open_file.description.read() {
-                    OpenDescription::PipeReader { .. } | OpenDescription::PipeWriter { .. } => true,
-                    OpenDescription::HostPipe { host_fd, .. } => {
-                        let mut st: libc::stat = unsafe { core::mem::zeroed() };
-                        let fstat_ok = unsafe { libc::fstat(*host_fd, &mut st) } == 0;
-                        fstat_ok
-                            && (st.st_mode as u32 & libc::S_IFMT as u32)
-                                == libc::S_IFIFO as u32
-                    }
-                    _ => false,
-                };
-                if is_fifo {
-                    return Ok(LINUX_ESPIPE.into());
+            fn fadvise64(this, cx, fd: Fd, _offset: u64, _len: u64, advice: u64) {
+                if !this.fd_is_valid(fd.0) && !is_stdio_fd(fd.0) {
+                    return Ok(LINUX_EBADF.into());
                 }
+                // Linux's generic_fadvise rejects a pipe/FIFO with ESPIPE (checked
+                // before the advice value), so posix_fadvise04 (a real pipe) → ESPIPE.
+                // A /dev chardev is also a HostPipe in carrick but is NOT a FIFO, so
+                // ask the host kernel (fstat S_IFIFO) rather than keying on the
+                // variant alone.
+                if let Some(open_file) = this.open_file(fd.0) {
+                    let is_fifo = match &*open_file.description.read() {
+                        OpenDescription::PipeReader { .. } | OpenDescription::PipeWriter { .. } => true,
+                        OpenDescription::HostPipe { host_fd, .. } => {
+                            let mut st: libc::stat = unsafe { core::mem::zeroed() };
+                            let fstat_ok = unsafe { libc::fstat(*host_fd, &mut st) } == 0;
+                            fstat_ok
+                                && (st.st_mode as u32 & libc::S_IFMT as u32)
+                                    == libc::S_IFIFO as u32
+                        }
+                        _ => false,
+                    };
+                    if is_fifo {
+                        return Ok(LINUX_ESPIPE.into());
+                    }
+                }
+                // POSIX_FADV_{NORMAL,RANDOM,SEQUENTIAL,WILLNEED,DONTNEED,NOREUSE} =
+                // 0..=5 on aarch64 (asm-generic values); anything else is EINVAL
+                // (posix_fadvise03). advice is u64, so a negative arg is huge → caught.
+                if advice > 5 {
+                    return Ok(LINUX_EINVAL.into());
+                }
+                Ok(DispatchOutcome::Returned { value: 0 })
             }
-            // POSIX_FADV_{NORMAL,RANDOM,SEQUENTIAL,WILLNEED,DONTNEED,NOREUSE} =
-            // 0..=5 on aarch64 (asm-generic values); anything else is EINVAL
-            // (posix_fadvise03). advice is u64, so a negative arg is huge → caught.
-            if advice > 5 {
-                return Ok(LINUX_EINVAL.into());
-            }
-            Ok(DispatchOutcome::Returned { value: 0 })
-        }
 
-        fn brk(this, cx, requested: u64) {
-            let mut mem = this.mem.lock();
-            if requested == 0 {
-                return Ok(DispatchOutcome::Returned {
+            fn brk(this, cx, requested: u64) {
+                let mut mem = this.mem.lock();
+                if requested == 0 {
+                    return Ok(DispatchOutcome::Returned {
+                        value: mem.brk_current as i64,
+                    });
+                }
+                if range_within(requested, 0, LINUX_HEAP_BASE, LINUX_HEAP_SIZE) {
+                    mem.brk_current = requested;
+                }
+                Ok(DispatchOutcome::Returned {
                     value: mem.brk_current as i64,
-                });
-            }
-            if range_within(requested, 0, LINUX_HEAP_BASE, LINUX_HEAP_SIZE) {
-                mem.brk_current = requested;
-            }
-            Ok(DispatchOutcome::Returned {
-                value: mem.brk_current as i64,
-            })
-        }
-
-        fn mmap(this, cx, requested: GuestPtr, length: u64, prot: u64, flags: u64, fd: Fd, offset: u64) {
-            let mut flags = flags;
-            let memory = &mut *cx.memory;
-
-            // Apple Rosetta tags pointers in bits 63:48 (a 16-bit value space)
-            // and maps its translated ELF into the x86-64 high half. Strip the
-            // tag so the request resolves into the 48-bit VA space the stage-1
-            // tables address; with TCR_EL1.TBI the guest's own accesses ignore
-            // the top byte, and TTBR1 (shared root) translates the canonical
-            // high half (bits[47:0] index the same slot as the stripped VA). The
-            // un-stripped value is kept to reject a non-canonical hint below.
-            // No-op for native (top-16-zero) guests.
-            let requested_raw = requested.0;
-            let requested = GuestPtr(requested.0 & 0x0000_FFFF_FFFF_FFFF);
-
-            // io_uring ring mapping: the SQ/CQ rings and SQE array already live
-            // in the guest arena (allocated by io_uring_setup); the guest maps
-            // them off the ring fd with offset = IORING_OFF_*. Hand back the
-            // address carrick placed them at, so guest and runtime share the
-            // same coherent ring memory.
-            if flags & LINUX_MAP_ANONYMOUS == 0 && fd.0 >= 0
-                && let Some(addr) = this.io_uring_mmap_addr(fd.0, offset) {
-                    return Ok(DispatchOutcome::Returned { value: addr as i64 });
-                }
-
-            if flags & LINUX_MAP_FIXED_NOREPLACE != 0 {
-                flags |= LINUX_MAP_FIXED;
+                })
             }
 
-            // Linux validates the fd FIRST for a file mapping: ksys_mmap_pgoff
-            // does fget(fd) and returns EBADF before do_mmap ever checks the
-            // length/prot/flags (which would yield EINVAL). So a bad fd beats a
-            // bad length — LTP mmap08 maps length 0 on a closed fd and expects
-            // EBADF, not EINVAL. (Anonymous mappings take no fd → skip.)
-            if flags & LINUX_MAP_ANONYMOUS == 0 && this.open_file(fd.0).is_none() {
-                return Ok(LINUX_EBADF.into());
-            }
+            fn mmap(this, cx, requested: GuestPtr, length: u64, prot: u64, flags: u64, fd: Fd, offset: u64) {
+                let mut flags = flags;
+                let memory = &mut *cx.memory;
 
-            // glibc's vDSO getrandom state page is mapped MAP_ANONYMOUS|
-            // MAP_DROPPABLE (0x28) with NO MAP_PRIVATE/MAP_SHARED bit; the kernel
-            // treats MAP_DROPPABLE as a private anon mapping, so default the type
-            // to PRIVATE rather than rejecting it with EINVAL.
-            let map_type = {
-                let t = flags & (LINUX_MAP_SHARED | LINUX_MAP_PRIVATE);
-                if t == 0 && flags & LINUX_MAP_DROPPABLE != 0 {
-                    LINUX_MAP_PRIVATE
-                } else {
-                    t
-                }
-            };
-            if length == 0
-                || prot & !LinuxProtFlags::SUPPORTED_MASK != 0
-                || flags & !LinuxMmapFlags::SUPPORTED_MASK != 0
-                || (map_type != LINUX_MAP_SHARED && map_type != LINUX_MAP_PRIVATE)
-                || (flags & LINUX_MAP_ANONYMOUS == 0 && !offset.is_multiple_of(LINUX_PAGE_SIZE))
-                || (flags & LINUX_MAP_FIXED != 0 && !requested.0.is_multiple_of(LINUX_PAGE_SIZE))
-            {
-                return Ok(LINUX_EINVAL.into());
-            }
-            let length = match align_up_u64(length, LINUX_PAGE_SIZE) {
-                Some(length) => length,
-                None => {
-                    return Ok(LINUX_ENOMEM.into());
-                }
-            };
-            let length_usize =
-                usize::try_from(length).map_err(|_| DispatchError::LengthTooLarge(length))?;
+                // Apple Rosetta tags pointers in bits 63:48 (a 16-bit value space)
+                // and maps its translated ELF into the x86-64 high half. Strip the
+                // tag so the request resolves into the 48-bit VA space the stage-1
+                // tables address; with TCR_EL1.TBI the guest's own accesses ignore
+                // the top byte, and TTBR1 (shared root) translates the canonical
+                // high half (bits[47:0] index the same slot as the stripped VA). The
+                // un-stripped value is kept to reject a non-canonical hint below.
+                // No-op for native (top-16-zero) guests.
+                let requested_raw = requested.0;
+                let requested = GuestPtr(requested.0 & 0x0000_FFFF_FFFF_FFFF);
 
-            // MAP_FIXED|MAP_PRIVATE|ANON landing on a shared-aperture VA: the
-            // guest wants a genuinely PRIVATE page at exactly this (currently
-            // shared) address. Writing through to the shared backing would leak
-            // the guest's "private" stores to every other mapper and across
-            // fork (the mapfixed privacy bug). Instead carve a slot in the
-            // per-process private overlay aperture and repoint this VA's stage-1
-            // leaf to it — stage-1 ONLY, since the overlay window is boot-mapped
-            // (no post-vCPU hv_vm_map, per the durable-memory rule). requested.0
-            // and length are already validated page-aligned/non-zero above.
-            // (MAP_FIXED|MAP_PRIVATE of a FILE over a shared-aperture VA is a
-            // tracked remainder — the probe and common case are anon.)
-            if flags & LINUX_MAP_FIXED != 0
-                && map_type == LINUX_MAP_PRIVATE
-                && flags & LINUX_MAP_ANONYMOUS != 0
-                && crate::memory::va_in_shared_aperture(requested.0, length)
-            {
-                let overlay_va = {
-                    let mut mem = this.mem.lock();
-                    // Re-MAP_FIXED over the same VA: free the prior overlay slot.
-                    if let Some(old) = mem.overlay.find_by_source(requested.0) {
-                        mem.overlay.free(old);
+                // io_uring ring mapping: the SQ/CQ rings and SQE array already live
+                // in the guest arena (allocated by io_uring_setup); the guest maps
+                // them off the ring fd with offset = IORING_OFF_*. Hand back the
+                // address carrick placed them at, so guest and runtime share the
+                // same coherent ring memory.
+                if flags & LINUX_MAP_ANONYMOUS == 0 && fd.0 >= 0
+                    && let Some(addr) = this.io_uring_mmap_addr(fd.0, offset) {
+                        return Ok(DispatchOutcome::Returned { value: addr as i64 });
                     }
-                    mem.overlay.alloc_sourced(
-                        length,
-                        crate::shared_aperture::BackingObject::PrivateAnon,
-                        Some(requested.0),
-                    )
+
+                if flags & LINUX_MAP_FIXED_NOREPLACE != 0 {
+                    flags |= LINUX_MAP_FIXED;
+                }
+    // Parse the map flags once (post FIXED_NOREPLACE→FIXED normalization);
+    let map_flags = LinuxMmapFlags::from_bits_retain(flags);
+
+                // Linux validates the fd FIRST for a file mapping: ksys_mmap_pgoff
+                // does fget(fd) and returns EBADF before do_mmap ever checks the
+                // length/prot/flags (which would yield EINVAL). So a bad fd beats a
+                // bad length — LTP mmap08 maps length 0 on a closed fd and expects
+                // EBADF, not EINVAL. (Anonymous mappings take no fd → skip.)
+                if !map_flags.contains(LinuxMmapFlags::ANONYMOUS) && this.open_file(fd.0).is_none() {
+                    return Ok(LINUX_EBADF.into());
+                }
+
+                // glibc's vDSO getrandom state page is mapped MAP_ANONYMOUS|
+                // MAP_DROPPABLE (0x28) with NO MAP_PRIVATE/MAP_SHARED bit; the kernel
+                // treats MAP_DROPPABLE as a private anon mapping, so default the type
+                // to PRIVATE rather than rejecting it with EINVAL.
+                let map_type = {
+                    let t = flags & (LINUX_MAP_SHARED | LINUX_MAP_PRIVATE);
+                    if t == 0 && map_flags.contains(LinuxMmapFlags::DROPPABLE) {
+                        LINUX_MAP_PRIVATE
+                    } else {
+                        t
+                    }
                 };
-                let Some(overlay_va) = overlay_va else {
-                    return Ok(LINUX_ENOMEM.into());
-                };
-                // Anonymous => fresh zero page. Seed + stage-1 repoint atomically
-                // on the engine; on failure roll the slot back so it's reusable.
-                let zeros = vec![0u8; length_usize];
-                if memory
-                    .repoint_private(requested.0, overlay_va, length_usize, &zeros)
-                    .is_err()
+                if length == 0
+                    || prot & !LinuxProtFlags::SUPPORTED_MASK != 0
+                    || flags & !LinuxMmapFlags::SUPPORTED_MASK != 0
+                    || (map_type != LINUX_MAP_SHARED && map_type != LINUX_MAP_PRIVATE)
+                    || (!map_flags.contains(LinuxMmapFlags::ANONYMOUS) && !offset.is_multiple_of(LINUX_PAGE_SIZE))
+                    || (map_flags.contains(LinuxMmapFlags::FIXED) && !requested.0.is_multiple_of(LINUX_PAGE_SIZE))
                 {
-                    this.mem.lock().overlay.free(overlay_va);
+                    return Ok(LINUX_EINVAL.into());
+                }
+                let length = match align_up_u64(length, LINUX_PAGE_SIZE) {
+                    Some(length) => length,
+                    None => {
+                        return Ok(LINUX_ENOMEM.into());
+                    }
+                };
+                let length_usize =
+                    usize::try_from(length).map_err(|_| DispatchError::LengthTooLarge(length))?;
+
+                // MAP_FIXED|MAP_PRIVATE|ANON landing on a shared-aperture VA: the
+                // guest wants a genuinely PRIVATE page at exactly this (currently
+                // shared) address. Writing through to the shared backing would leak
+                // the guest's "private" stores to every other mapper and across
+                // fork (the mapfixed privacy bug). Instead carve a slot in the
+                // per-process private overlay aperture and repoint this VA's stage-1
+                // leaf to it — stage-1 ONLY, since the overlay window is boot-mapped
+                // (no post-vCPU hv_vm_map, per the durable-memory rule). requested.0
+                // and length are already validated page-aligned/non-zero above.
+                // (MAP_FIXED|MAP_PRIVATE of a FILE over a shared-aperture VA is a
+                // tracked remainder — the probe and common case are anon.)
+                if map_flags.contains(LinuxMmapFlags::FIXED)
+                    && map_type == LINUX_MAP_PRIVATE
+                    && map_flags.contains(LinuxMmapFlags::ANONYMOUS)
+                    && crate::memory::va_in_shared_aperture(requested.0, length)
+                {
+                    let overlay_va = {
+                        let mut mem = this.mem.lock();
+                        // Re-MAP_FIXED over the same VA: free the prior overlay slot.
+                        if let Some(old) = mem.overlay.find_by_source(requested.0) {
+                            mem.overlay.free(old);
+                        }
+                        mem.overlay.alloc_sourced(
+                            length,
+                            crate::shared_aperture::BackingObject::PrivateAnon,
+                            Some(requested.0),
+                        )
+                    };
+                    let Some(overlay_va) = overlay_va else {
+                        return Ok(LINUX_ENOMEM.into());
+                    };
+                    // Anonymous => fresh zero page. Seed + stage-1 repoint atomically
+                    // on the engine; on failure roll the slot back so it's reusable.
+                    let zeros = vec![0u8; length_usize];
+                    if memory
+                        .repoint_private(requested.0, overlay_va, length_usize, &zeros)
+                        .is_err()
+                    {
+                        this.mem.lock().overlay.free(overlay_va);
+                        return Ok(LINUX_ENOMEM.into());
+                    }
+                    return Ok(DispatchOutcome::Returned {
+                        value: requested.0 as i64,
+                    });
+                }
+
+                let hvf_page = crate::trap::HVF_PAGE_SIZE;
+                // Guest MAP_SHARED of a file: back the guest region with the host
+                // file's page cache LIVE, via an aliased stage-2 mapping at a fresh
+                // high VA. `mmap(MAP_SHARED, fd)` on the host means guest writes hit
+                // the page cache directly — coherent with any other opener (and with
+                // a sibling mapping of the same file) and inherited across fork,
+                // because the backing kernel object is the file, not a snapshot.
+                // This replaces the old aperture-snapshot+msync-writeback model,
+                // which was only coherent at msync/munmap time (the memmap b_*
+                // invariant). The dispatcher reserves the alias IPA and hands the
+                // runtime a MapHostAlias carrying a dup'd fd; the runtime mmaps it
+                // and builds the VA->IPA stage-1 path.
+                if !map_flags.contains(LinuxMmapFlags::ANONYMOUS)
+                    && map_type == LINUX_MAP_SHARED
+                    && !map_flags.contains(LinuxMmapFlags::FIXED)
+                    && offset.is_multiple_of(hvf_page)
+                {
+                    let dup_fd = {
+                        let Some(open_file) = this.open_file(fd.0) else {
+                            return Ok(LINUX_EBADF.into());
+                        };
+                        let open = open_file.description.read();
+                        match &*open {
+                            OpenDescription::HostFile { host_fd, .. } => {
+                                let d = unsafe { libc::dup(*host_fd) };
+                                if d < 0 { None } else { Some(d) }
+                            }
+                            _ => None,
+                        }
+                    };
+                    if let Some(dup_fd) = dup_fd {
+                        // Reserve the IPA in 2 MiB blocks so no two file mappings
+                        // share a stage-1 block. The stage-1 mapping covers EXACTLY
+                        // the guest's page-aligned `length`; map_host_alias rounds
+                        // the host/hv_vm_map size up to the 16 KiB HVF granule, so a
+                        // sub-16 KiB mapping never spills extra guest pages into a
+                        // neighbouring region (the high-VA anon path does the same).
+                        const TWO_MIB: u64 = 1 << 21;
+                        let alias_len = align_up_u64(length, TWO_MIB).unwrap_or(length);
+                        let ipa = {
+                            let mut mem = this.mem.lock();
+                            let base = mem.alias_ipa_next;
+                            let limit = crate::memory::LINUX_ALIAS_IPA_BASE
+                                + crate::memory::LINUX_ALIAS_IPA_SIZE;
+                            match base.checked_add(alias_len).filter(|e| *e <= limit) {
+                                Some(end) => {
+                                    mem.alias_ipa_next = end;
+                                    Some(base)
+                                }
+                                None => None,
+                            }
+                        };
+                        let Some(ipa) = ipa else {
+                            // Alias arena exhausted: drop the dup, surface ENOMEM.
+                            unsafe { libc::close(dup_fd) };
+                            return Ok(LINUX_ENOMEM.into());
+                        };
+                        let va = crate::memory::LINUX_HIGH_VA_THRESHOLD
+                            + (ipa - crate::memory::LINUX_ALIAS_IPA_BASE);
+                        // Host mmap prot MUST match the guest's request (and thus the
+                        // fd's access mode) for READ/WRITE: MAP_SHARED|PROT_WRITE of a
+                        // read-only fd is EACCES. Translate the guest PROT_* bits to
+                        // host PROT_*. NOTE: deliberately DROP PROT_EXEC. The guest
+                        // executes through HVF's stage-2 (mapped RWX) and its own
+                        // stage-1 page tables (UXN clear), never through carrick's host
+                        // pointer (which we only ever read for syscall emulation), so
+                        // the host backing needs no exec right. macOS's hardened
+                        // runtime REJECTS MAP_SHARED|PROT_EXEC of an ordinary file with
+                        // EPERM — forwarding the guest's PROT_EXEC here failed the host
+                        // mmap and wedged the guest. Linux maps such files fine (the
+                        // dynamic loader; CPython test_mmap test_access_parameter's
+                        // `mmap(fd, n, prot=PROT_READ|PROT_EXEC)`), and so must we.
+                        let pf = LinuxProtFlags::from_bits_truncate(prot);
+                        let mut host_prot = 0;
+                        if pf.intersects(LinuxProtFlags::READ | LinuxProtFlags::EXEC) {
+                            // PROT_EXEC implies a host-readable backing (carrick reads
+                            // it to service the guest's reads; the exec right itself
+                            // lives in the guest's stage-1/stage-2, not the host map).
+                            host_prot |= libc::PROT_READ;
+                        }
+                        if pf.contains(LinuxProtFlags::WRITE) {
+                            host_prot |= libc::PROT_WRITE;
+                        }
+                        return Ok(DispatchOutcome::MapHostAlias {
+                            va,
+                            ipa,
+                            len: length,
+                            payload: Vec::new(),
+                            file: Some((dup_fd, offset as libc::off_t, host_prot)),
+                        });
+                    }
+                }
+
+                // Guest MAP_SHARED|MAP_ANON: a sub-range of the shared aperture.
+                // The bytes already live in the boot-mapped shared region, so we
+                // only allocate, zero (recycled memory), and return.
+                if map_flags.contains(LinuxMmapFlags::ANONYMOUS)
+                    && map_type == LINUX_MAP_SHARED
+                    && !map_flags.contains(LinuxMmapFlags::FIXED)
+                {
+                    let map_len = align_up_u64(length, hvf_page).unwrap_or(length);
+                    let addr = {
+                        let mut mem = this.mem.lock();
+                        mem.shared
+                            .alloc(map_len, crate::shared_aperture::BackingObject::SharedAnon)
+                    };
+                    if let Some(addr) = addr {
+                        let map_len_usize = usize::try_from(map_len)
+                            .map_err(|_| DispatchError::LengthTooLarge(map_len))?;
+                        let zeros = vec![0u8; map_len_usize];
+                        let _ = memory.write_bytes(addr, &zeros);
+                        return Ok(DispatchOutcome::Returned { value: addr as i64 });
+                    }
                     return Ok(LINUX_ENOMEM.into());
                 }
-                return Ok(DispatchOutcome::Returned {
-                    value: requested.0 as i64,
-                });
-            }
 
-            let hvf_page = crate::trap::HVF_PAGE_SIZE;
-            // Guest MAP_SHARED of a file: back the guest region with the host
-            // file's page cache LIVE, via an aliased stage-2 mapping at a fresh
-            // high VA. `mmap(MAP_SHARED, fd)` on the host means guest writes hit
-            // the page cache directly — coherent with any other opener (and with
-            // a sibling mapping of the same file) and inherited across fork,
-            // because the backing kernel object is the file, not a snapshot.
-            // This replaces the old aperture-snapshot+msync-writeback model,
-            // which was only coherent at msync/munmap time (the memmap b_*
-            // invariant). The dispatcher reserves the alias IPA and hands the
-            // runtime a MapHostAlias carrying a dup'd fd; the runtime mmaps it
-            // and builds the VA->IPA stage-1 path.
-            if flags & LINUX_MAP_ANONYMOUS == 0
-                && map_type == LINUX_MAP_SHARED
-                && flags & LINUX_MAP_FIXED == 0
-                && offset.is_multiple_of(hvf_page)
-            {
-                let dup_fd = {
+                let (address, reused) = match this.next_mmap_address(requested.0, length, prot, flags) {
+                    Some(pair) => pair,
+                    None => {
+                        return Ok(LINUX_ENOMEM.into());
+                    }
+                };
+
+                if reused && !crate::memory::is_high_va(address) {
+                    // Scrub the reused region's PHYSICAL backing. MUST bypass the
+                    // guest-visible permission: a region just reclaimed from munmap
+                    // is stage-1-invalidated (no-access) and a PROT_NONE mmap is not
+                    // writable, so the permission-checked write_bytes silently faults
+                    // and leaves the prior mapping's bytes — which then surface after
+                    // the guest mprotects the region to RW (CPython multiprocessing
+                    // Pool built on a freed 16 MiB b'X' buffer → 0x58.. ptr → SIGSEGV).
+                    let _ = memory.zero_backing(address, length_usize);
+                }
+
+                // Restore guest-visible stage-1 validity for arena allocations: a
+                // page reclaimed from a prior munmap (which invalidated it) must be
+                // valid+RW again, and a PROT_NONE mmap must actually fault. No-op
+                // (no TLBI) when the page is already at the target protection.
+                let in_arena = range_within(address, length, LINUX_MMAP_BASE, crate::memory::mmap_arena_size());
+
+                let prot_none = LinuxProtFlags::from_bits_truncate(prot).is_empty();
+                if prot_none && map_flags.contains(LinuxMmapFlags::ANONYMOUS) {
+                    memory.set_no_access(address, length_usize, false);
+                    memory.set_no_access(address, length_usize, true);
+                    if in_arena && memory.protect_range(address, length_usize, 0).is_err() {
+                        return Ok(LINUX_ENOMEM.into());
+                    }
+                    return Ok(DispatchOutcome::Returned {
+                        value: address as i64,
+                    });
+                }
+
+                let mut bytes = vec![0; length_usize];
+                if !map_flags.contains(LinuxMmapFlags::ANONYMOUS) {
                     let Some(open_file) = this.open_file(fd.0) else {
                         return Ok(LINUX_EBADF.into());
                     };
                     let open = open_file.description.read();
+                    let offset_usize =
+                        usize::try_from(offset).map_err(|_| DispatchError::LengthTooLarge(offset))?;
                     match &*open {
-                        OpenDescription::HostFile { host_fd, .. } => {
-                            let d = unsafe { libc::dup(*host_fd) };
-                            if d < 0 { None } else { Some(d) }
+                        OpenDescription::File { contents, .. }
+                        | OpenDescription::SyntheticFile { contents, .. } => {
+                            if offset_usize < contents.len() {
+                                let available = &contents[offset_usize..];
+                                let copy_len = available.len().min(length_usize);
+                                bytes[..copy_len].copy_from_slice(&available[..copy_len]);
+                            }
                         }
-                        _ => None,
+                        OpenDescription::HostFile { host_fd, .. } => {
+                            let n = unsafe {
+                                libc::pread(
+                                    *host_fd,
+                                    bytes.as_mut_ptr() as *mut _,
+                                    length_usize,
+                                    offset as libc::off_t,
+                                )
+                            };
+                            let _ = n;
+                        }
+                        _ => {
+                            return Ok(LINUX_EBADF.into());
+                        }
                     }
-                };
-                if let Some(dup_fd) = dup_fd {
-                    // Reserve the IPA in 2 MiB blocks so no two file mappings
-                    // share a stage-1 block. The stage-1 mapping covers EXACTLY
-                    // the guest's page-aligned `length`; map_host_alias rounds
-                    // the host/hv_vm_map size up to the 16 KiB HVF granule, so a
-                    // sub-16 KiB mapping never spills extra guest pages into a
-                    // neighbouring region (the high-VA anon path does the same).
+                }
+
+                // A high guest VA (>= 1 TiB) can't be identity-mapped (HVF IPA is 40
+                // bits). Reserve a low alias IPA and hand the runtime a MapHostAlias
+                // outcome that hv_vm_maps it, builds the VA->IPA page-table path, and
+                // copies `bytes` (file content, or zeros for anon) in. Apple Rosetta
+                // maps both its anon translation arena (240 TiB) and the x86 binary
+                // this way.
+                if crate::memory::is_high_va(address) {
+                    // Reject a genuinely non-canonical hint (bits 55:48 of the
+                    // ORIGINAL address neither all-0 nor all-1). With TCR_EL1.TBI on,
+                    // canonicality is decided by bits 55:48, not 63:48. A canonical
+                    // high-half address is translatable via TTBR1 and is aliased
+                    // below; MAP_FIXED_NOREPLACE is a hint the caller retries without.
+                    let bits_55_48 = (requested_raw >> 48) & 0xff;
+                    if bits_55_48 != 0x00 && bits_55_48 != 0xff {
+                        if map_flags.contains(LinuxMmapFlags::FIXED_NOREPLACE) {
+                            return Ok(linux_errno::EEXIST.into());
+                        }
+                        return Ok(LINUX_ENOMEM.into());
+                    }
+                    // Reserve the IPA in 2 MiB blocks so no two aliases share a
+                    // stage-1 block. NOTE: the stage-1 mapping must cover EXACTLY the
+                    // guest's page-aligned `length`, NOT a 16 KiB-rounded length — a
+                    // sub-16 KiB mmap rounded up to the HVF granule would map extra
+                    // 4 KiB guest pages and clobber the next region's page-table
+                    // entries (redirecting its fetches to the wrong IPA). hv_vm_map's
+                    // own 16 KiB IPA-size requirement is satisfied separately inside
+                    // map_host_alias via the (page-rounded) host mapping length.
                     const TWO_MIB: u64 = 1 << 21;
                     let alias_len = align_up_u64(length, TWO_MIB).unwrap_or(length);
                     let ipa = {
                         let mut mem = this.mem.lock();
                         let base = mem.alias_ipa_next;
-                        let limit = crate::memory::LINUX_ALIAS_IPA_BASE
-                            + crate::memory::LINUX_ALIAS_IPA_SIZE;
+                        let limit =
+                            crate::memory::LINUX_ALIAS_IPA_BASE + crate::memory::LINUX_ALIAS_IPA_SIZE;
                         match base.checked_add(alias_len).filter(|e| *e <= limit) {
                             Some(end) => {
                                 mem.alias_ipa_next = end;
-                                Some(base)
+                                base
                             }
-                            None => None,
+                            None => return Ok(LINUX_ENOMEM.into()),
                         }
                     };
-                    let Some(ipa) = ipa else {
-                        // Alias arena exhausted: drop the dup, surface ENOMEM.
-                        unsafe { libc::close(dup_fd) };
-                        return Ok(LINUX_ENOMEM.into());
-                    };
-                    let va = crate::memory::LINUX_HIGH_VA_THRESHOLD
-                        + (ipa - crate::memory::LINUX_ALIAS_IPA_BASE);
-                    // Host mmap prot MUST match the guest's request (and thus the
-                    // fd's access mode) for READ/WRITE: MAP_SHARED|PROT_WRITE of a
-                    // read-only fd is EACCES. Translate the guest PROT_* bits to
-                    // host PROT_*. NOTE: deliberately DROP PROT_EXEC. The guest
-                    // executes through HVF's stage-2 (mapped RWX) and its own
-                    // stage-1 page tables (UXN clear), never through carrick's host
-                    // pointer (which we only ever read for syscall emulation), so
-                    // the host backing needs no exec right. macOS's hardened
-                    // runtime REJECTS MAP_SHARED|PROT_EXEC of an ordinary file with
-                    // EPERM — forwarding the guest's PROT_EXEC here failed the host
-                    // mmap and wedged the guest. Linux maps such files fine (the
-                    // dynamic loader; CPython test_mmap test_access_parameter's
-                    // `mmap(fd, n, prot=PROT_READ|PROT_EXEC)`), and so must we.
-                    let pf = LinuxProtFlags::from_bits_truncate(prot);
-                    let mut host_prot = 0;
-                    if pf.intersects(LinuxProtFlags::READ | LinuxProtFlags::EXEC) {
-                        // PROT_EXEC implies a host-readable backing (carrick reads
-                        // it to service the guest's reads; the exec right itself
-                        // lives in the guest's stage-1/stage-2, not the host map).
-                        host_prot |= libc::PROT_READ;
-                    }
-                    if pf.contains(LinuxProtFlags::WRITE) {
-                        host_prot |= libc::PROT_WRITE;
-                    }
+                    // A high-VA mmap frequently overlays an earlier PROT_NONE
+                    // reservation (Rosetta reserves the x86 stack/binary span anon
+                    // PROT_NONE, then MAP_FIXEDs RW/file segments in). The guest's own
+                    // accesses translate via the page tables map_aliased installs, but
+                    // carrick's syscall-path EFAULT check consults `no_access` — clear
+                    // it here, or reads/writes of guest buffers in this range (e.g.
+                    // getrandom's output on the x86 stack) wrongly EFAULT.
+                    memory.set_no_access(address, length_usize, prot_none);
                     return Ok(DispatchOutcome::MapHostAlias {
-                        va,
+                        va: address,
                         ipa,
                         len: length,
-                        payload: Vec::new(),
-                        file: Some((dup_fd, offset as libc::off_t, host_prot)),
+                        payload: bytes,
+                        file: None,
                     });
                 }
-            }
 
-            // Guest MAP_SHARED|MAP_ANON: a sub-range of the shared aperture.
-            // The bytes already live in the boot-mapped shared region, so we
-            // only allocate, zero (recycled memory), and return.
-            if flags & LINUX_MAP_ANONYMOUS != 0
-                && map_type == LINUX_MAP_SHARED
-                && flags & LINUX_MAP_FIXED == 0
-            {
-                let map_len = align_up_u64(length, hvf_page).unwrap_or(length);
-                let addr = {
-                    let mut mem = this.mem.lock();
-                    mem.shared
-                        .alloc(map_len, crate::shared_aperture::BackingObject::SharedAnon)
-                };
-                if let Some(addr) = addr {
-                    let map_len_usize = usize::try_from(map_len)
-                        .map_err(|_| DispatchError::LengthTooLarge(map_len))?;
-                    let zeros = vec![0u8; map_len_usize];
-                    let _ = memory.write_bytes(addr, &zeros);
-                    return Ok(DispatchOutcome::Returned { value: addr as i64 });
-                }
-                return Ok(LINUX_ENOMEM.into());
-            }
-
-            let (address, reused) = match this.next_mmap_address(requested.0, length, prot, flags) {
-                Some(pair) => pair,
-                None => {
-                    return Ok(LINUX_ENOMEM.into());
-                }
-            };
-
-            if reused && !crate::memory::is_high_va(address) {
-                // Scrub the reused region's PHYSICAL backing. MUST bypass the
-                // guest-visible permission: a region just reclaimed from munmap
-                // is stage-1-invalidated (no-access) and a PROT_NONE mmap is not
-                // writable, so the permission-checked write_bytes silently faults
-                // and leaves the prior mapping's bytes — which then surface after
-                // the guest mprotects the region to RW (CPython multiprocessing
-                // Pool built on a freed 16 MiB b'X' buffer → 0x58.. ptr → SIGSEGV).
-                let _ = memory.zero_backing(address, length_usize);
-            }
-
-            // Restore guest-visible stage-1 validity for arena allocations: a
-            // page reclaimed from a prior munmap (which invalidated it) must be
-            // valid+RW again, and a PROT_NONE mmap must actually fault. No-op
-            // (no TLBI) when the page is already at the target protection.
-            let in_arena = range_within(address, length, LINUX_MMAP_BASE, crate::memory::mmap_arena_size());
-
-            let prot_none = LinuxProtFlags::from_bits_truncate(prot).is_empty();
-            if prot_none && flags & LINUX_MAP_ANONYMOUS != 0 {
                 memory.set_no_access(address, length_usize, false);
-                memory.set_no_access(address, length_usize, true);
-                if in_arena && memory.protect_range(address, length_usize, 0).is_err() {
+                let _ = memory.write_bytes(address, &bytes);
+                if prot_none {
+                    memory.set_no_access(address, length_usize, true);
+                }
+                // Make the requested protection guest-visible (also restores RW for
+                // a reused range). prot==0 here means file-backed PROT_NONE.
+                if in_arena && memory.protect_range(address, length_usize, prot).is_err() {
                     return Ok(LINUX_ENOMEM.into());
                 }
-                return Ok(DispatchOutcome::Returned {
+                Ok(DispatchOutcome::Returned {
                     value: address as i64,
-                });
+                })
             }
 
-            let mut bytes = vec![0; length_usize];
-            if flags & LINUX_MAP_ANONYMOUS == 0 {
-                let Some(open_file) = this.open_file(fd.0) else {
-                    return Ok(LINUX_EBADF.into());
+            fn munmap(this, cx, address: GuestPtr, length: u64) {
+                // Linux munmap EINVAL edges (__vm_munmap): the address must be
+                // page-aligned and the length non-zero. LTP munmap03 munmaps the
+                // address of a BSS global (8-aligned, not page-aligned) and that
+                // address + 8, expecting EINVAL — carrick lacked the alignment gate.
+                if !address.0.is_multiple_of(LINUX_PAGE_SIZE) {
+                    return Ok(LINUX_EINVAL.into());
+                }
+                if length == 0 {
+                    return Ok(LINUX_EINVAL.into());
+                }
+                let freed = {
+                    let mut mem = this.mem.lock();
+                    // Release any private-overlay slot repointed at this VA (a
+                    // MAP_FIXED|MAP_PRIVATE over a shared-aperture VA carved one via
+                    // alloc_sourced + repoint_private); without this it leaks a slot
+                    // in the bounded overlay window. Mirrors the re-MAP_FIXED path.
+                    // (audit M11)
+                    if let Some(slot) = mem.overlay.find_by_source(address.0) {
+                        mem.overlay.free(slot);
+                    }
+                    mem.shared.free(address.0)
                 };
-                let open = open_file.description.read();
-                let offset_usize =
-                    usize::try_from(offset).map_err(|_| DispatchError::LengthTooLarge(offset))?;
-                match &*open {
-                    OpenDescription::File { contents, .. }
-                    | OpenDescription::SyntheticFile { contents, .. } => {
-                        if offset_usize < contents.len() {
-                            let available = &contents[offset_usize..];
-                            let copy_len = available.len().min(length_usize);
-                            bytes[..copy_len].copy_from_slice(&available[..copy_len]);
+                if let Some(alloc) = freed {
+                    // SharedFile backings write dirty bytes back and close the dup;
+                    // SharedAnon frees are pure bookkeeping. The aperture stays
+                    // stage-2 mapped — no hv_vm_unmap.
+                    this.writeback_shared(cx, &alloc, true);
+                    return Ok(DispatchOutcome::Returned { value: 0 });
+                }
+                // A canonical high guest VA (>= 1 TiB, < 2^48) is a dynamic alias
+                // mapping: either a MAP_SHARED file region (carrick-chosen VA in the
+                // narrow alias window, backed LIVE by the host page cache, so no
+                // writeback is owed) OR a MAP_FIXED mapping at a guest-chosen high VA
+                // (Apple Rosetta maps its translated ELF + arenas in the x86-64 high
+                // half; the 16-bit pointer tag was stripped at mmap time, so the VA
+                // carrick mapped — and the guest munmaps — is a canonical 48-bit
+                // address). Both are valid mappings, so munmap must succeed (LTP
+                // munmap01/02 also unmapped a MAP_SHARED file region and carrick
+                // wrongly returned EINVAL when the alias VA was in neither the shared
+                // aperture nor the mmap arena). Best-effort stage-1 invalidate so
+                // use-after-munmap faults; arm64 HVF has no stage-2 unmap, so the
+                // alias IPA + any dup fd are reclaimed at process teardown.
+                // Misaligned addresses (e.g. RLIM_INFINITY, which LTP munmap03 passes
+                // to assert EINVAL) are already rejected by the alignment gate above;
+                // addresses >= 2^48 stay EINVAL via the range check below.
+                if crate::memory::is_high_va(address.0) && address.0 < (1u64 << 48) {
+                    if let Some(len) = align_up_u64(length, LINUX_PAGE_SIZE)
+                        && let Ok(len_usize) = usize::try_from(len)
+                    {
+                        // Alias teardown: invalidate AND reclaim the now-empty per-
+                        // alias stage-1 sub-table (each MAP_SHARED file mapping took
+                        // its own 2 MiB block + L3 table) — else the spare pool leaks
+                        // one table per alias and a churning guest hits OutOfTables.
+                        let _ = cx.memory.unmap_alias_range(address.0, len_usize);
+                    }
+                    return Ok(DispatchOutcome::Returned { value: 0 });
+                }
+                if !range_within(address.0, length, LINUX_MMAP_BASE, crate::memory::mmap_arena_size()) {
+                    return Ok(LINUX_EINVAL.into());
+                }
+                if let Some(len) = align_up_u64(length, LINUX_PAGE_SIZE) {
+                    let mut mem = this.mem.lock();
+                    // Invalidate the freed range in stage-1 (use-after-munmap faults
+                    // in-guest) BEFORE returning it to the allocator, holding `mem`
+                    // across the edit. A concurrent mmap that reuses this address
+                    // must re-acquire `mem` to allocate it, so its validity-restore
+                    // is strictly ordered AFTER this invalidate — otherwise a late
+                    // invalidate could clobber the new owner's mapping and fault it.
+                    // Best-effort: a failure leaves it accessible (pre-existing
+                    // behavior).
+                    if let Ok(len_usize) = usize::try_from(len) {
+                        let _ = cx.memory.unmap_range(address.0, len_usize);
+                    }
+                    if address.0.checked_add(len) == Some(mem.mmap_next) {
+                        mem.mmap_next = address.0;
+                        while let Some(pos) = mem
+                            .free_regions
+                            .iter()
+                            .position(|&(s, l)| s.checked_add(l) == Some(mem.mmap_next))
+                        {
+                            let (s, _l) = mem.free_regions.remove(pos);
+                            mem.mmap_next = s;
                         }
-                    }
-                    OpenDescription::HostFile { host_fd, .. } => {
-                        let n = unsafe {
-                            libc::pread(
-                                *host_fd,
-                                bytes.as_mut_ptr() as *mut _,
-                                length_usize,
-                                offset as libc::off_t,
-                            )
-                        };
-                        let _ = n;
-                    }
-                    _ => {
-                        return Ok(LINUX_EBADF.into());
+                    } else {
+                        free_regions_insert(&mut mem.free_regions, address.0, len);
                     }
                 }
+                Ok(DispatchOutcome::Returned { value: 0 })
             }
 
-            // A high guest VA (>= 1 TiB) can't be identity-mapped (HVF IPA is 40
-            // bits). Reserve a low alias IPA and hand the runtime a MapHostAlias
-            // outcome that hv_vm_maps it, builds the VA->IPA page-table path, and
-            // copies `bytes` (file content, or zeros for anon) in. Apple Rosetta
-            // maps both its anon translation arena (240 TiB) and the x86 binary
-            // this way.
-            if crate::memory::is_high_va(address) {
-                // Reject a genuinely non-canonical hint (bits 55:48 of the
-                // ORIGINAL address neither all-0 nor all-1). With TCR_EL1.TBI on,
-                // canonicality is decided by bits 55:48, not 63:48. A canonical
-                // high-half address is translatable via TTBR1 and is aliased
-                // below; MAP_FIXED_NOREPLACE is a hint the caller retries without.
-                let bits_55_48 = (requested_raw >> 48) & 0xff;
-                if bits_55_48 != 0x00 && bits_55_48 != 0xff {
-                    if flags & LINUX_MAP_FIXED_NOREPLACE != 0 {
-                        return Ok(linux_errno::EEXIST.into());
-                    }
+            fn msync(this, cx, address: GuestPtr, length: u64, flags: u64) {
+                if flags & !(LINUX_MS_ASYNC | LINUX_MS_INVALIDATE | LINUX_MS_SYNC) != 0 {
+                    return Ok(LINUX_EINVAL.into());
+                }
+                if flags & LINUX_MS_ASYNC != 0 && flags & LINUX_MS_SYNC != 0 {
+                    return Ok(LINUX_EINVAL.into());
+                }
+                // msync requires a page-aligned start address (Linux checks this
+                // before anything else). CPython's mmap.flush(offset, size) calls
+                // msync(data + offset, size, ...), so flush(1, n) must EINVAL —
+                // test_mmap.test_flush_return_value asserts it on Linux.
+                if !address.0.is_multiple_of(LINUX_PAGE_SIZE) {
+                    return Ok(LINUX_EINVAL.into());
+                }
+                if length == 0 {
+                    return Ok(DispatchOutcome::Returned { value: 0 });
+                }
+                let alloc = {
+                    let mem = this.mem.lock();
+                    mem.shared
+                        .live()
+                        .iter()
+                        .find(|a| a.guest_addr == address.0)
+                        .copied()
+                };
+                if let Some(alloc) = alloc {
+                    // Write a SharedFile backing's dirty bytes back without freeing.
+                    this.writeback_shared(cx, &alloc, false);
+                    return Ok(DispatchOutcome::Returned { value: 0 });
+                }
+                if cx.memory.read_bytes(address.0, 1).is_err() {
                     return Ok(LINUX_ENOMEM.into());
                 }
-                // Reserve the IPA in 2 MiB blocks so no two aliases share a
-                // stage-1 block. NOTE: the stage-1 mapping must cover EXACTLY the
-                // guest's page-aligned `length`, NOT a 16 KiB-rounded length — a
-                // sub-16 KiB mmap rounded up to the HVF granule would map extra
-                // 4 KiB guest pages and clobber the next region's page-table
-                // entries (redirecting its fetches to the wrong IPA). hv_vm_map's
-                // own 16 KiB IPA-size requirement is satisfied separately inside
-                // map_host_alias via the (page-rounded) host mapping length.
-                const TWO_MIB: u64 = 1 << 21;
-                let alias_len = align_up_u64(length, TWO_MIB).unwrap_or(length);
-                let ipa = {
-                    let mut mem = this.mem.lock();
-                    let base = mem.alias_ipa_next;
-                    let limit =
-                        crate::memory::LINUX_ALIAS_IPA_BASE + crate::memory::LINUX_ALIAS_IPA_SIZE;
-                    match base.checked_add(alias_len).filter(|e| *e <= limit) {
-                        Some(end) => {
-                            mem.alias_ipa_next = end;
-                            base
-                        }
-                        None => return Ok(LINUX_ENOMEM.into()),
+                Ok(DispatchOutcome::Returned { value: 0 })
+            }
+
+            fn mlock(this, cx, address: GuestPtr, length: u64) {
+                let memory = &mut *cx.memory;
+                if length == 0 {
+                    return Ok(DispatchOutcome::Returned { value: 0 });
+                }
+                if memory.read_bytes(address.0, 1).is_err() {
+                    return Ok(LINUX_ENOMEM.into());
+                }
+                Ok(DispatchOutcome::Returned { value: 0 })
+            }
+
+            fn munlock(this, cx, address: GuestPtr, length: u64) {
+                let memory = &mut *cx.memory;
+                if length == 0 {
+                    return Ok(DispatchOutcome::Returned { value: 0 });
+                }
+                if memory.read_bytes(address.0, 1).is_err() {
+                    return Ok(LINUX_ENOMEM.into());
+                }
+                Ok(DispatchOutcome::Returned { value: 0 })
+            }
+
+            fn mlockall(this, cx, flags: u64) {
+                if flags == 0 || flags & !(LINUX_MCL_CURRENT | LINUX_MCL_FUTURE | LINUX_MCL_ONFAULT) != 0 {
+                    return Ok(LINUX_EINVAL.into());
+                }
+                Ok(DispatchOutcome::Returned { value: 0 })
+            }
+
+            fn munlockall(this, cx) {
+                Ok(DispatchOutcome::Returned { value: 0 })
+            }
+
+            fn mincore(this, cx, address: GuestPtr, length: u64, vec: GuestPtr) {
+                let memory = &mut *cx.memory;
+                // Linux requires a page-aligned start address, else EINVAL (this is
+                // what Go's TestMincoreErrorSign checks — the errno must be -EINVAL).
+                if !address.0.is_multiple_of(LINUX_PAGE_SIZE) {
+                    return Ok(LINUX_EINVAL.into());
+                }
+                if length == 0 {
+                    return Ok(DispatchOutcome::Returned { value: 0 });
+                }
+                if memory.read_bytes(address.0, 1).is_err() {
+                    return Ok(LINUX_ENOMEM.into());
+                }
+                let pages = length.div_ceil(LINUX_PAGE_SIZE);
+                let bytes = vec![1u8; pages as usize];
+                if memory.write_bytes(vec.0, &bytes).is_err() {
+                    return Ok(LINUX_EFAULT.into());
+                }
+                Ok(DispatchOutcome::Returned { value: 0 })
+            }
+
+            fn mremap(this, cx, old_address: GuestPtr, old_size: u64, new_size_req: u64, flags: u64, _new_address: GuestPtr) {
+                let memory = &mut *cx.memory;
+                if new_size_req == 0 {
+                    return Ok(LINUX_EINVAL.into());
+                }
+                if flags & !(LINUX_MREMAP_MAYMOVE | LINUX_MREMAP_FIXED | LINUX_MREMAP_DONTUNMAP) != 0 {
+                    return Ok(LINUX_EINVAL.into());
+                }
+                if !range_within(old_address.0, old_size, LINUX_MMAP_BASE, crate::memory::mmap_arena_size()) {
+                    // The mapping is not in the mmap arena: it's a MAP_SHARED file
+                    // alias (high VA) or a MAP_SHARED anonymous shared-aperture
+                    // region. CPython's mmap.resize() shrinks both of these
+                    // (test_mmap test_basic on a file mapping, test_resize_past_pos
+                    // on an anonymous one), tolerating only success or SystemError —
+                    // never the OSError we raised by rejecting them here.
+                    //
+                    // Support resize-DOWN: the backing stays at the same VA with a
+                    // smaller logical size. CPython already ftruncate'd a file
+                    // backing to the new size; the freed tail is not accessed (Python
+                    // tracks the new size/position), so we return the unchanged base.
+                    // (Unlike the arena shrink below we do NOT eagerly unmap the tail
+                    // here — invalidating a high-VA alias tail needs trap-engine
+                    // coordination; no caller reads it. A grow would mean relocating
+                    // a file/shared backing, which we don't do → EINVAL as before.)
+                    let Some(new_size) = align_up_u64(new_size_req, LINUX_PAGE_SIZE) else {
+                        return Ok(LINUX_ENOMEM.into());
+                    };
+                    if memory.read_bytes(old_address.0, 1).is_err() {
+                        return Ok(LINUX_EINVAL.into());
                     }
-                };
-                // A high-VA mmap frequently overlays an earlier PROT_NONE
-                // reservation (Rosetta reserves the x86 stack/binary span anon
-                // PROT_NONE, then MAP_FIXEDs RW/file segments in). The guest's own
-                // accesses translate via the page tables map_aliased installs, but
-                // carrick's syscall-path EFAULT check consults `no_access` — clear
-                // it here, or reads/writes of guest buffers in this range (e.g.
-                // getrandom's output on the x86 stack) wrongly EFAULT.
-                memory.set_no_access(address, length_usize, prot_none);
-                return Ok(DispatchOutcome::MapHostAlias {
-                    va: address,
-                    ipa,
-                    len: length,
-                    payload: bytes,
-                    file: None,
-                });
-            }
-
-            memory.set_no_access(address, length_usize, false);
-            let _ = memory.write_bytes(address, &bytes);
-            if prot_none {
-                memory.set_no_access(address, length_usize, true);
-            }
-            // Make the requested protection guest-visible (also restores RW for
-            // a reused range). prot==0 here means file-backed PROT_NONE.
-            if in_arena && memory.protect_range(address, length_usize, prot).is_err() {
-                return Ok(LINUX_ENOMEM.into());
-            }
-            Ok(DispatchOutcome::Returned {
-                value: address as i64,
-            })
-        }
-
-        fn munmap(this, cx, address: GuestPtr, length: u64) {
-            // Linux munmap EINVAL edges (__vm_munmap): the address must be
-            // page-aligned and the length non-zero. LTP munmap03 munmaps the
-            // address of a BSS global (8-aligned, not page-aligned) and that
-            // address + 8, expecting EINVAL — carrick lacked the alignment gate.
-            if !address.0.is_multiple_of(LINUX_PAGE_SIZE) {
-                return Ok(LINUX_EINVAL.into());
-            }
-            if length == 0 {
-                return Ok(LINUX_EINVAL.into());
-            }
-            let freed = {
-                let mut mem = this.mem.lock();
-                // Release any private-overlay slot repointed at this VA (a
-                // MAP_FIXED|MAP_PRIVATE over a shared-aperture VA carved one via
-                // alloc_sourced + repoint_private); without this it leaks a slot
-                // in the bounded overlay window. Mirrors the re-MAP_FIXED path.
-                // (audit M11)
-                if let Some(slot) = mem.overlay.find_by_source(address.0) {
-                    mem.overlay.free(slot);
-                }
-                mem.shared.free(address.0)
-            };
-            if let Some(alloc) = freed {
-                // SharedFile backings write dirty bytes back and close the dup;
-                // SharedAnon frees are pure bookkeeping. The aperture stays
-                // stage-2 mapped — no hv_vm_unmap.
-                this.writeback_shared(cx, &alloc, true);
-                return Ok(DispatchOutcome::Returned { value: 0 });
-            }
-            // A canonical high guest VA (>= 1 TiB, < 2^48) is a dynamic alias
-            // mapping: either a MAP_SHARED file region (carrick-chosen VA in the
-            // narrow alias window, backed LIVE by the host page cache, so no
-            // writeback is owed) OR a MAP_FIXED mapping at a guest-chosen high VA
-            // (Apple Rosetta maps its translated ELF + arenas in the x86-64 high
-            // half; the 16-bit pointer tag was stripped at mmap time, so the VA
-            // carrick mapped — and the guest munmaps — is a canonical 48-bit
-            // address). Both are valid mappings, so munmap must succeed (LTP
-            // munmap01/02 also unmapped a MAP_SHARED file region and carrick
-            // wrongly returned EINVAL when the alias VA was in neither the shared
-            // aperture nor the mmap arena). Best-effort stage-1 invalidate so
-            // use-after-munmap faults; arm64 HVF has no stage-2 unmap, so the
-            // alias IPA + any dup fd are reclaimed at process teardown.
-            // Misaligned addresses (e.g. RLIM_INFINITY, which LTP munmap03 passes
-            // to assert EINVAL) are already rejected by the alignment gate above;
-            // addresses >= 2^48 stay EINVAL via the range check below.
-            if crate::memory::is_high_va(address.0) && address.0 < (1u64 << 48) {
-                if let Some(len) = align_up_u64(length, LINUX_PAGE_SIZE)
-                    && let Ok(len_usize) = usize::try_from(len)
-                {
-                    // Alias teardown: invalidate AND reclaim the now-empty per-
-                    // alias stage-1 sub-table (each MAP_SHARED file mapping took
-                    // its own 2 MiB block + L3 table) — else the spare pool leaks
-                    // one table per alias and a churning guest hits OutOfTables.
-                    let _ = cx.memory.unmap_alias_range(address.0, len_usize);
-                }
-                return Ok(DispatchOutcome::Returned { value: 0 });
-            }
-            if !range_within(address.0, length, LINUX_MMAP_BASE, crate::memory::mmap_arena_size()) {
-                return Ok(LINUX_EINVAL.into());
-            }
-            if let Some(len) = align_up_u64(length, LINUX_PAGE_SIZE) {
-                let mut mem = this.mem.lock();
-                // Invalidate the freed range in stage-1 (use-after-munmap faults
-                // in-guest) BEFORE returning it to the allocator, holding `mem`
-                // across the edit. A concurrent mmap that reuses this address
-                // must re-acquire `mem` to allocate it, so its validity-restore
-                // is strictly ordered AFTER this invalidate — otherwise a late
-                // invalidate could clobber the new owner's mapping and fault it.
-                // Best-effort: a failure leaves it accessible (pre-existing
-                // behavior).
-                if let Ok(len_usize) = usize::try_from(len) {
-                    let _ = cx.memory.unmap_range(address.0, len_usize);
-                }
-                if address.0.checked_add(len) == Some(mem.mmap_next) {
-                    mem.mmap_next = address.0;
-                    while let Some(pos) = mem
-                        .free_regions
-                        .iter()
-                        .position(|&(s, l)| s.checked_add(l) == Some(mem.mmap_next))
-                    {
-                        let (s, _l) = mem.free_regions.remove(pos);
-                        mem.mmap_next = s;
+                    if new_size <= old_size {
+                        return Ok(DispatchOutcome::Returned {
+                            value: old_address.0 as i64,
+                        });
                     }
-                } else {
-                    free_regions_insert(&mut mem.free_regions, address.0, len);
+                    return Ok(LINUX_EINVAL.into());
                 }
-            }
-            Ok(DispatchOutcome::Returned { value: 0 })
-        }
-
-        fn msync(this, cx, address: GuestPtr, length: u64, flags: u64) {
-            if flags & !(LINUX_MS_ASYNC | LINUX_MS_INVALIDATE | LINUX_MS_SYNC) != 0 {
-                return Ok(LINUX_EINVAL.into());
-            }
-            if flags & LINUX_MS_ASYNC != 0 && flags & LINUX_MS_SYNC != 0 {
-                return Ok(LINUX_EINVAL.into());
-            }
-            // msync requires a page-aligned start address (Linux checks this
-            // before anything else). CPython's mmap.flush(offset, size) calls
-            // msync(data + offset, size, ...), so flush(1, n) must EINVAL —
-            // test_mmap.test_flush_return_value asserts it on Linux.
-            if !address.0.is_multiple_of(LINUX_PAGE_SIZE) {
-                return Ok(LINUX_EINVAL.into());
-            }
-            if length == 0 {
-                return Ok(DispatchOutcome::Returned { value: 0 });
-            }
-            let alloc = {
-                let mem = this.mem.lock();
-                mem.shared
-                    .live()
-                    .iter()
-                    .find(|a| a.guest_addr == address.0)
-                    .copied()
-            };
-            if let Some(alloc) = alloc {
-                // Write a SharedFile backing's dirty bytes back without freeing.
-                this.writeback_shared(cx, &alloc, false);
-                return Ok(DispatchOutcome::Returned { value: 0 });
-            }
-            if cx.memory.read_bytes(address.0, 1).is_err() {
-                return Ok(LINUX_ENOMEM.into());
-            }
-            Ok(DispatchOutcome::Returned { value: 0 })
-        }
-
-        fn mlock(this, cx, address: GuestPtr, length: u64) {
-            let memory = &mut *cx.memory;
-            if length == 0 {
-                return Ok(DispatchOutcome::Returned { value: 0 });
-            }
-            if memory.read_bytes(address.0, 1).is_err() {
-                return Ok(LINUX_ENOMEM.into());
-            }
-            Ok(DispatchOutcome::Returned { value: 0 })
-        }
-
-        fn munlock(this, cx, address: GuestPtr, length: u64) {
-            let memory = &mut *cx.memory;
-            if length == 0 {
-                return Ok(DispatchOutcome::Returned { value: 0 });
-            }
-            if memory.read_bytes(address.0, 1).is_err() {
-                return Ok(LINUX_ENOMEM.into());
-            }
-            Ok(DispatchOutcome::Returned { value: 0 })
-        }
-
-        fn mlockall(this, cx, flags: u64) {
-            if flags == 0 || flags & !(LINUX_MCL_CURRENT | LINUX_MCL_FUTURE | LINUX_MCL_ONFAULT) != 0 {
-                return Ok(LINUX_EINVAL.into());
-            }
-            Ok(DispatchOutcome::Returned { value: 0 })
-        }
-
-        fn munlockall(this, cx) {
-            Ok(DispatchOutcome::Returned { value: 0 })
-        }
-
-        fn mincore(this, cx, address: GuestPtr, length: u64, vec: GuestPtr) {
-            let memory = &mut *cx.memory;
-            // Linux requires a page-aligned start address, else EINVAL (this is
-            // what Go's TestMincoreErrorSign checks — the errno must be -EINVAL).
-            if !address.0.is_multiple_of(LINUX_PAGE_SIZE) {
-                return Ok(LINUX_EINVAL.into());
-            }
-            if length == 0 {
-                return Ok(DispatchOutcome::Returned { value: 0 });
-            }
-            if memory.read_bytes(address.0, 1).is_err() {
-                return Ok(LINUX_ENOMEM.into());
-            }
-            let pages = length.div_ceil(LINUX_PAGE_SIZE);
-            let bytes = vec![1u8; pages as usize];
-            if memory.write_bytes(vec.0, &bytes).is_err() {
-                return Ok(LINUX_EFAULT.into());
-            }
-            Ok(DispatchOutcome::Returned { value: 0 })
-        }
-
-        fn mremap(this, cx, old_address: GuestPtr, old_size: u64, new_size_req: u64, flags: u64, _new_address: GuestPtr) {
-            let memory = &mut *cx.memory;
-            if new_size_req == 0 {
-                return Ok(LINUX_EINVAL.into());
-            }
-            if flags & !(LINUX_MREMAP_MAYMOVE | LINUX_MREMAP_FIXED | LINUX_MREMAP_DONTUNMAP) != 0 {
-                return Ok(LINUX_EINVAL.into());
-            }
-            if !range_within(old_address.0, old_size, LINUX_MMAP_BASE, crate::memory::mmap_arena_size()) {
-                // The mapping is not in the mmap arena: it's a MAP_SHARED file
-                // alias (high VA) or a MAP_SHARED anonymous shared-aperture
-                // region. CPython's mmap.resize() shrinks both of these
-                // (test_mmap test_basic on a file mapping, test_resize_past_pos
-                // on an anonymous one), tolerating only success or SystemError —
-                // never the OSError we raised by rejecting them here.
-                //
-                // Support resize-DOWN: the backing stays at the same VA with a
-                // smaller logical size. CPython already ftruncate'd a file
-                // backing to the new size; the freed tail is not accessed (Python
-                // tracks the new size/position), so we return the unchanged base.
-                // (Unlike the arena shrink below we do NOT eagerly unmap the tail
-                // here — invalidating a high-VA alias tail needs trap-engine
-                // coordination; no caller reads it. A grow would mean relocating
-                // a file/shared backing, which we don't do → EINVAL as before.)
                 let Some(new_size) = align_up_u64(new_size_req, LINUX_PAGE_SIZE) else {
                     return Ok(LINUX_ENOMEM.into());
                 };
-                if memory.read_bytes(old_address.0, 1).is_err() {
-                    return Ok(LINUX_EINVAL.into());
-                }
                 if new_size <= old_size {
-                    return Ok(DispatchOutcome::Returned {
-                        value: old_address.0 as i64,
-                    });
-                }
-                return Ok(LINUX_EINVAL.into());
-            }
-            let Some(new_size) = align_up_u64(new_size_req, LINUX_PAGE_SIZE) else {
-                return Ok(LINUX_ENOMEM.into());
-            };
-            if new_size <= old_size {
-                // Linux mremap shrink unmaps the freed tail [old+new_size,
-                // old+old_size); carrick used to leave it mapped (a leak, and
-                // the stale bytes there could later be misread). Reclaim the
-                // whole-page tail exactly as munmap does — invalidate stage-1,
-                // then lower mmap_next (if it's the high-water) or return it to
-                // free_regions (a future mmap reuse zero-fills it).
-                let tail_start = old_address.0 + new_size; // new_size is page-aligned ≤ old_size
-                let tail_end = old_address
-                    .0
-                    .checked_add(old_size)
-                    .map(|e| e & !(LINUX_PAGE_SIZE - 1));
-                if let Some(tail_end) = tail_end
-                    && tail_end > tail_start
-                {
-                    let tail_len = tail_end - tail_start;
-                    if let Ok(tl) = usize::try_from(tail_len) {
-                        // Mark no-access so the SYSCALL path (mincore/read_bytes)
-                        // also reports the tail unmapped (mincore → ENOMEM),
-                        // matching Linux — not just a stage-1 fault on EL0 access.
-                        // A reusing mmap clears no-access in its seed.
-                        memory.set_no_access(tail_start, tl, true);
-                        let _ = memory.unmap_range(tail_start, tl);
-                    }
-                    let mut mem = this.mem.lock();
-                    if tail_end == mem.mmap_next {
-                        mem.mmap_next = tail_start;
-                        while let Some(pos) = mem
-                            .free_regions
-                            .iter()
-                            .position(|&(s, l)| s.checked_add(l) == Some(mem.mmap_next))
-                        {
-                            let (s, _l) = mem.free_regions.remove(pos);
-                            mem.mmap_next = s;
-                        }
-                    } else {
-                        free_regions_insert(&mut mem.free_regions, tail_start, tail_len);
-                    }
-                }
-                return Ok(DispatchOutcome::Returned {
-                    value: old_address.0 as i64,
-                });
-            }
-
-            if old_address.0.checked_add(old_size) == Some(this.mem.lock().mmap_next) {
-                let Some(old_end) = old_address.0.checked_add(old_size) else {
-                    return Ok(LINUX_ENOMEM.into());
-                };
-                let Some(new_end) = old_address.0.checked_add(new_size) else {
-                    return Ok(LINUX_ENOMEM.into());
-                };
-                if range_within(old_address.0, new_size, LINUX_MMAP_BASE, crate::memory::mmap_arena_size()) {
+                    // Linux mremap shrink unmaps the freed tail [old+new_size,
+                    // old+old_size); carrick used to leave it mapped (a leak, and
+                    // the stale bytes there could later be misread). Reclaim the
+                    // whole-page tail exactly as munmap does — invalidate stage-1,
+                    // then lower mmap_next (if it's the high-water) or return it to
+                    // free_regions (a future mmap reuse zero-fills it).
+                    let tail_start = old_address.0 + new_size; // new_size is page-aligned ≤ old_size
+                    let tail_end = old_address
+                        .0
+                        .checked_add(old_size)
+                        .map(|e| e & !(LINUX_PAGE_SIZE - 1));
+                    if let Some(tail_end) = tail_end
+                        && tail_end > tail_start
                     {
+                        let tail_len = tail_end - tail_start;
+                        if let Ok(tl) = usize::try_from(tail_len) {
+                            // Mark no-access so the SYSCALL path (mincore/read_bytes)
+                            // also reports the tail unmapped (mincore → ENOMEM),
+                            // matching Linux — not just a stage-1 fault on EL0 access.
+                            // A reusing mmap clears no-access in its seed.
+                            memory.set_no_access(tail_start, tl, true);
+                            let _ = memory.unmap_range(tail_start, tl);
+                        }
                         let mut mem = this.mem.lock();
-                        mem.mmap_next = new_end;
-                        // Advance the dirty high-water to cover the grown tail.
-                        // The guest dirties [old_end, new_end); without this, a
-                        // later munmap+rebump into that range sees addr >=
-                        // mmap_dirty_high, assumes it pristine, SKIPS the
-                        // zero-fill, and hands back STALE bytes — read as a
-                        // pointer (far=0x5858…='X'*8) → SIGSEGV in multiprocessing
-                        // Pool (test_async_timeout). Same stale-memory class as
-                        // the mmap-bump zero-fill fix; the in-place-grow path was
-                        // the missed sibling.
-                        mem.mmap_dirty_high = mem.mmap_dirty_high.max(new_end);
-                    }
-                    // Re-validate the freshly-grown tail [old_end, new_end). Those
-                    // pages can be a range reclaimed from a prior munmap (which
-                    // invalidated their stage-1 leaves and rolled mmap_next back),
-                    // so without restoring RW validity here the guest FAULTS on
-                    // first access to the grown region — exactly as the move path
-                    // below and the regular mmap path do. (CPython's obmalloc/
-                    // realloc grows an arena buffer in place; the tail landed on
-                    // invalidated pages → a level-3 translation fault.)
-                    let grow_len_u64 = new_size - old_size;
-                    if let Ok(grow_len) = usize::try_from(grow_len_u64) {
-                        memory.set_no_access(old_end, grow_len, false);
-                        if memory
-                            .protect_range(old_end, grow_len, LINUX_PROT_READ | LINUX_PROT_WRITE)
-                            .is_err()
-                        {
-                            return Ok(LINUX_ENOMEM.into());
+                        if tail_end == mem.mmap_next {
+                            mem.mmap_next = tail_start;
+                            while let Some(pos) = mem
+                                .free_regions
+                                .iter()
+                                .position(|&(s, l)| s.checked_add(l) == Some(mem.mmap_next))
+                            {
+                                let (s, _l) = mem.free_regions.remove(pos);
+                                mem.mmap_next = s;
+                            }
+                        } else {
+                            free_regions_insert(&mut mem.free_regions, tail_start, tail_len);
                         }
                     }
                     return Ok(DispatchOutcome::Returned {
                         value: old_address.0 as i64,
                     });
                 }
-            }
 
-            if flags & LINUX_MREMAP_MAYMOVE == 0 {
-                return Ok(LINUX_ENOMEM.into());
-            }
-            let Some((new_addr, reused)) =
-                this.next_mmap_address(0, new_size, LINUX_PROT_READ | LINUX_PROT_WRITE, 0)
-            else {
-                return Ok(LINUX_ENOMEM.into());
-            };
-            let new_len = match usize::try_from(new_size) {
-                Ok(n) => n,
-                Err(_) => return Ok(LINUX_ENOMEM.into()),
-            };
-            // Clear stale no-access tracking on the destination — it may be a
-            // range reclaimed from a prior munmap (which marked it no-access).
-            memory.set_no_access(new_addr, new_len, false);
-            if reused {
-                let zeros = vec![0u8; new_len];
-                let _ = memory.write_bytes(new_addr, &zeros);
-            }
-            let copy_len = match usize::try_from(old_size) {
-                Ok(len) => len,
-                Err(_) => {
-                    return Ok(LINUX_ENOMEM.into());
-                }
-            };
-            if copy_len > 0 {
-                match memory.read_bytes(old_address.0, copy_len) {
-                    Ok(bytes) => {
-                        let _ = memory.write_bytes(new_addr, &bytes);
-                    }
-                    Err(_) => {
-                        return Ok(LINUX_EFAULT.into());
-                    }
-                }
-            }
-            // Re-validate the destination's guest stage-1 entries, exactly as
-            // mmap does. A range reused from a munmap'd region was invalidated;
-            // without this the guest FAULTS reading the freshly-mremap'd memory
-            // (carrick wrote the copy host-side, so no guest write-fault ever
-            // re-established the page). new_addr is always in the arena here.
-            if memory
-                .protect_range(new_addr, new_len, LINUX_PROT_READ | LINUX_PROT_WRITE)
-                .is_err()
-            {
-                return Ok(LINUX_ENOMEM.into());
-            }
-            // mremap MOVE on Linux UNMAPS the source [old, old+old_size) (unless
-            // MREMAP_DONTUNMAP). carrick previously LEAKED it: the source VA
-            // stayed mapped with its stale bytes and was never returned to the
-            // allocator, so `mmap_next` ran away and glibc's view of which VAs
-            // are mapped diverged from carrick's (glibc considers the source
-            // freed). Reclaim the source exactly like munmap, so a later access
-            // faults and the VA is reusable — matching Linux and keeping the
-            // mmapped-chunk bookkeeping coherent across the BytesIO/recv_bytes
-            // realloc-grow cascade (test_multiprocessing test_connection's 16 MiB
-            // round-trip). MREMAP_DONTUNMAP keeps the source mapped.
-            // Guard: the destination must not overlap the source (it never does —
-            // `new_addr` is freshly bump-allocated or a disjoint free region —
-            // but reclaiming an overlapping source would unmap the live copy).
-            let dst_overlaps_src = new_addr < old_address.0.wrapping_add(old_size)
-                && old_address.0 < new_addr.wrapping_add(new_size);
-            if flags & LINUX_MREMAP_DONTUNMAP == 0 && !dst_overlaps_src
-                && let Some(old_size_a) = align_up_u64(old_size, LINUX_PAGE_SIZE)
-                    && let Ok(old_len) = usize::try_from(old_size_a)
-                    && old_len > 0
-                {
-                    let mut mem = this.mem.lock();
-                    // No-access so the syscall path also reports the source
-                    // unmapped (mincore → ENOMEM), matching Linux; a reusing
-                    // mmap clears it in its seed.
-                    memory.set_no_access(old_address.0, old_len, true);
-                    let _ = memory.unmap_range(old_address.0, old_len);
-                    if old_address.0.checked_add(old_size_a) == Some(mem.mmap_next) {
-                        mem.mmap_next = old_address.0;
-                        while let Some(pos) = mem
-                            .free_regions
-                            .iter()
-                            .position(|&(s, l)| s.checked_add(l) == Some(mem.mmap_next))
+                if old_address.0.checked_add(old_size) == Some(this.mem.lock().mmap_next) {
+                    let Some(old_end) = old_address.0.checked_add(old_size) else {
+                        return Ok(LINUX_ENOMEM.into());
+                    };
+                    let Some(new_end) = old_address.0.checked_add(new_size) else {
+                        return Ok(LINUX_ENOMEM.into());
+                    };
+                    if range_within(old_address.0, new_size, LINUX_MMAP_BASE, crate::memory::mmap_arena_size()) {
                         {
-                            let (s, _l) = mem.free_regions.remove(pos);
-                            mem.mmap_next = s;
+                            let mut mem = this.mem.lock();
+                            mem.mmap_next = new_end;
+                            // Advance the dirty high-water to cover the grown tail.
+                            // The guest dirties [old_end, new_end); without this, a
+                            // later munmap+rebump into that range sees addr >=
+                            // mmap_dirty_high, assumes it pristine, SKIPS the
+                            // zero-fill, and hands back STALE bytes — read as a
+                            // pointer (far=0x5858…='X'*8) → SIGSEGV in multiprocessing
+                            // Pool (test_async_timeout). Same stale-memory class as
+                            // the mmap-bump zero-fill fix; the in-place-grow path was
+                            // the missed sibling.
+                            mem.mmap_dirty_high = mem.mmap_dirty_high.max(new_end);
                         }
-                    } else {
-                        free_regions_insert(&mut mem.free_regions, old_address.0, old_size_a);
+                        // Re-validate the freshly-grown tail [old_end, new_end). Those
+                        // pages can be a range reclaimed from a prior munmap (which
+                        // invalidated their stage-1 leaves and rolled mmap_next back),
+                        // so without restoring RW validity here the guest FAULTS on
+                        // first access to the grown region — exactly as the move path
+                        // below and the regular mmap path do. (CPython's obmalloc/
+                        // realloc grows an arena buffer in place; the tail landed on
+                        // invalidated pages → a level-3 translation fault.)
+                        let grow_len_u64 = new_size - old_size;
+                        if let Ok(grow_len) = usize::try_from(grow_len_u64) {
+                            memory.set_no_access(old_end, grow_len, false);
+                            if memory
+                                .protect_range(old_end, grow_len, LINUX_PROT_READ | LINUX_PROT_WRITE)
+                                .is_err()
+                            {
+                                return Ok(LINUX_ENOMEM.into());
+                            }
+                        }
+                        return Ok(DispatchOutcome::Returned {
+                            value: old_address.0 as i64,
+                        });
                     }
                 }
-            Ok(DispatchOutcome::Returned {
-                value: new_addr as i64,
-            })
-        }
 
-        fn mprotect(this, cx, address: GuestPtr, length: u64, prot: u64) {
-            if prot & !LinuxProtFlags::SUPPORTED_MASK != 0 {
-                return Ok(LINUX_EINVAL.into());
-            }
-            if length == 0 {
-                return Ok(DispatchOutcome::Returned { value: 0 });
-            }
-            if !address.0.is_multiple_of(LINUX_PAGE_SIZE) {
-                return Ok(LINUX_EINVAL.into());
-            }
-            if let Ok(len) = usize::try_from(length) {
-                let prot_none = LinuxProtFlags::from_bits_truncate(prot).is_empty();
-                cx.memory.set_no_access(address.0, len, prot_none);
-                // Make the new protection guest-VISIBLE (a violating access
-                // faults during EL0 execution) by editing the stage-1 page
-                // tables. Scoped to the private mmap arena for now — the shared
-                // aperture and image/heap regions keep host-side checks only.
-                if range_within(address.0, length, LINUX_MMAP_BASE, crate::memory::mmap_arena_size())
-                    && cx.memory.protect_range(address.0, len, prot).is_err()
-                {
+                if flags & LINUX_MREMAP_MAYMOVE == 0 {
                     return Ok(LINUX_ENOMEM.into());
                 }
-            }
-            Ok(DispatchOutcome::Returned { value: 0 })
-        }
-
-        fn madvise(this, cx, address: GuestPtr, length: u64, advice: u64) {
-            let memory = &mut *cx.memory;
-
-            if !address.0.is_multiple_of(LINUX_PAGE_SIZE) || !linux_madvise_advice_is_supported(advice) {
-                return Ok(LINUX_EINVAL.into());
-            }
-            if length == 0 {
-                return Ok(DispatchOutcome::Returned { value: 0 });
-            }
-
-            let Ok(length) = usize::try_from(length) else {
-                return Ok(LINUX_ENOMEM.into());
-            };
-            let Some(last_address) = address.0.checked_add(length as u64 - 1) else {
-                return Ok(LINUX_ENOMEM.into());
-            };
-            if memory.read_bytes(address.0, 1).is_err() || memory.read_bytes(last_address, 1).is_err() {
-                return Ok(LINUX_ENOMEM.into());
-            }
-            if advice == LINUX_MADV_DONTNEED {
-                const ZERO_CHUNK: [u8; 4096] = [0; 4096];
-                let mut remaining = length;
-                let mut cursor = address.0;
-                while remaining > 0 {
-                    let chunk = remaining.min(ZERO_CHUNK.len());
-                    if memory.write_bytes(cursor, &ZERO_CHUNK[..chunk]).is_err() {
+                let Some((new_addr, reused)) =
+                    this.next_mmap_address(0, new_size, LINUX_PROT_READ | LINUX_PROT_WRITE, 0)
+                else {
+                    return Ok(LINUX_ENOMEM.into());
+                };
+                let new_len = match usize::try_from(new_size) {
+                    Ok(n) => n,
+                    Err(_) => return Ok(LINUX_ENOMEM.into()),
+                };
+                // Clear stale no-access tracking on the destination — it may be a
+                // range reclaimed from a prior munmap (which marked it no-access).
+                memory.set_no_access(new_addr, new_len, false);
+                if reused {
+                    let zeros = vec![0u8; new_len];
+                    let _ = memory.write_bytes(new_addr, &zeros);
+                }
+                let copy_len = match usize::try_from(old_size) {
+                    Ok(len) => len,
+                    Err(_) => {
                         return Ok(LINUX_ENOMEM.into());
                     }
-                    remaining -= chunk;
-                    cursor += chunk as u64;
+                };
+                if copy_len > 0 {
+                    match memory.read_bytes(old_address.0, copy_len) {
+                        Ok(bytes) => {
+                            let _ = memory.write_bytes(new_addr, &bytes);
+                        }
+                        Err(_) => {
+                            return Ok(LINUX_EFAULT.into());
+                        }
+                    }
                 }
+                // Re-validate the destination's guest stage-1 entries, exactly as
+                // mmap does. A range reused from a munmap'd region was invalidated;
+                // without this the guest FAULTS reading the freshly-mremap'd memory
+                // (carrick wrote the copy host-side, so no guest write-fault ever
+                // re-established the page). new_addr is always in the arena here.
+                if memory
+                    .protect_range(new_addr, new_len, LINUX_PROT_READ | LINUX_PROT_WRITE)
+                    .is_err()
+                {
+                    return Ok(LINUX_ENOMEM.into());
+                }
+                // mremap MOVE on Linux UNMAPS the source [old, old+old_size) (unless
+                // MREMAP_DONTUNMAP). carrick previously LEAKED it: the source VA
+                // stayed mapped with its stale bytes and was never returned to the
+                // allocator, so `mmap_next` ran away and glibc's view of which VAs
+                // are mapped diverged from carrick's (glibc considers the source
+                // freed). Reclaim the source exactly like munmap, so a later access
+                // faults and the VA is reusable — matching Linux and keeping the
+                // mmapped-chunk bookkeeping coherent across the BytesIO/recv_bytes
+                // realloc-grow cascade (test_multiprocessing test_connection's 16 MiB
+                // round-trip). MREMAP_DONTUNMAP keeps the source mapped.
+                // Guard: the destination must not overlap the source (it never does —
+                // `new_addr` is freshly bump-allocated or a disjoint free region —
+                // but reclaiming an overlapping source would unmap the live copy).
+                let dst_overlaps_src = new_addr < old_address.0.wrapping_add(old_size)
+                    && old_address.0 < new_addr.wrapping_add(new_size);
+                if flags & LINUX_MREMAP_DONTUNMAP == 0 && !dst_overlaps_src
+                    && let Some(old_size_a) = align_up_u64(old_size, LINUX_PAGE_SIZE)
+                        && let Ok(old_len) = usize::try_from(old_size_a)
+                        && old_len > 0
+                    {
+                        let mut mem = this.mem.lock();
+                        // No-access so the syscall path also reports the source
+                        // unmapped (mincore → ENOMEM), matching Linux; a reusing
+                        // mmap clears it in its seed.
+                        memory.set_no_access(old_address.0, old_len, true);
+                        let _ = memory.unmap_range(old_address.0, old_len);
+                        if old_address.0.checked_add(old_size_a) == Some(mem.mmap_next) {
+                            mem.mmap_next = old_address.0;
+                            while let Some(pos) = mem
+                                .free_regions
+                                .iter()
+                                .position(|&(s, l)| s.checked_add(l) == Some(mem.mmap_next))
+                            {
+                                let (s, _l) = mem.free_regions.remove(pos);
+                                mem.mmap_next = s;
+                            }
+                        } else {
+                            free_regions_insert(&mut mem.free_regions, old_address.0, old_size_a);
+                        }
+                    }
+                Ok(DispatchOutcome::Returned {
+                    value: new_addr as i64,
+                })
             }
-            Ok(DispatchOutcome::Returned { value: 0 })
-        }
 
-        fn sys_membarrier(this, cx, command: u64, flags: u64) {
-            Ok(this.membarrier(command, flags))
-        }
+            fn mprotect(this, cx, address: GuestPtr, length: u64, prot: u64) {
+                if prot & !LinuxProtFlags::SUPPORTED_MASK != 0 {
+                    return Ok(LINUX_EINVAL.into());
+                }
+                if length == 0 {
+                    return Ok(DispatchOutcome::Returned { value: 0 });
+                }
+                if !address.0.is_multiple_of(LINUX_PAGE_SIZE) {
+                    return Ok(LINUX_EINVAL.into());
+                }
+                if let Ok(len) = usize::try_from(length) {
+                    let prot_none = LinuxProtFlags::from_bits_truncate(prot).is_empty();
+                    cx.memory.set_no_access(address.0, len, prot_none);
+                    // Make the new protection guest-VISIBLE (a violating access
+                    // faults during EL0 execution) by editing the stage-1 page
+                    // tables. Scoped to the private mmap arena for now — the shared
+                    // aperture and image/heap regions keep host-side checks only.
+                    if range_within(address.0, length, LINUX_MMAP_BASE, crate::memory::mmap_arena_size())
+                        && cx.memory.protect_range(address.0, len, prot).is_err()
+                    {
+                        return Ok(LINUX_ENOMEM.into());
+                    }
+                }
+                Ok(DispatchOutcome::Returned { value: 0 })
+            }
 
-        // io_uring (WS-H4-B1). setup allocates the rings in the guest arena and
-        // returns a ring fd; the guest mmaps the rings off it (handled in the
-        // mmap path); enter drains the SQ ring. register is ENOSYS for now (the
-        // fixed-file/buffer optimization, not needed for correctness).
-        fn io_uring_setup(this, cx, entries: u64, params_ptr: GuestPtr) {
-            Ok(this.io_uring_setup_impl(cx.memory, entries as u32, params_ptr.0))
-        }
+            fn madvise(this, cx, address: GuestPtr, length: u64, advice: u64) {
+                let memory = &mut *cx.memory;
 
-        // `_min_complete` stays unused: carrick's enter is synchronous, so every
-        // CQE the guest waited for is posted by the time enter returns. flags/
-        // argp/argsz are now validated by the impl. (audit M4)
-        fn io_uring_enter(this, cx, fd: Fd, to_submit: u64, _min_complete: u64, flags: u64, argp: GuestPtr, argsz: u64) {
-            Ok(this.io_uring_enter_impl(cx.memory, fd.0, to_submit as u32, flags as u32, argp.0, argsz))
-        }
+                if !address.0.is_multiple_of(LINUX_PAGE_SIZE) || !linux_madvise_advice_is_supported(advice) {
+                    return Ok(LINUX_EINVAL.into());
+                }
+                if length == 0 {
+                    return Ok(DispatchOutcome::Returned { value: 0 });
+                }
 
-        fn io_uring_register(this, cx, _fd: Fd, _opcode: u64, _arg: GuestPtr, _nr_args: u64) {
-            Ok(LINUX_ENOSYS.into())
+                let Ok(length) = usize::try_from(length) else {
+                    return Ok(LINUX_ENOMEM.into());
+                };
+                let Some(last_address) = address.0.checked_add(length as u64 - 1) else {
+                    return Ok(LINUX_ENOMEM.into());
+                };
+                if memory.read_bytes(address.0, 1).is_err() || memory.read_bytes(last_address, 1).is_err() {
+                    return Ok(LINUX_ENOMEM.into());
+                }
+                if advice == LINUX_MADV_DONTNEED {
+                    const ZERO_CHUNK: [u8; 4096] = [0; 4096];
+                    let mut remaining = length;
+                    let mut cursor = address.0;
+                    while remaining > 0 {
+                        let chunk = remaining.min(ZERO_CHUNK.len());
+                        if memory.write_bytes(cursor, &ZERO_CHUNK[..chunk]).is_err() {
+                            return Ok(LINUX_ENOMEM.into());
+                        }
+                        remaining -= chunk;
+                        cursor += chunk as u64;
+                    }
+                }
+                Ok(DispatchOutcome::Returned { value: 0 })
+            }
+
+            fn sys_membarrier(this, cx, command: u64, flags: u64) {
+                Ok(this.membarrier(command, flags))
+            }
+
+            // io_uring (WS-H4-B1). setup allocates the rings in the guest arena and
+            // returns a ring fd; the guest mmaps the rings off it (handled in the
+            // mmap path); enter drains the SQ ring. register is ENOSYS for now (the
+            // fixed-file/buffer optimization, not needed for correctness).
+            fn io_uring_setup(this, cx, entries: u64, params_ptr: GuestPtr) {
+                Ok(this.io_uring_setup_impl(cx.memory, entries as u32, params_ptr.0))
+            }
+
+            // `_min_complete` stays unused: carrick's enter is synchronous, so every
+            // CQE the guest waited for is posted by the time enter returns. flags/
+            // argp/argsz are now validated by the impl. (audit M4)
+            fn io_uring_enter(this, cx, fd: Fd, to_submit: u64, _min_complete: u64, flags: u64, argp: GuestPtr, argsz: u64) {
+                Ok(this.io_uring_enter_impl(cx.memory, fd.0, to_submit as u32, flags as u32, argp.0, argsz))
+            }
+
+            fn io_uring_register(this, cx, _fd: Fd, _opcode: u64, _arg: GuestPtr, _nr_args: u64) {
+                Ok(LINUX_ENOSYS.into())
+            }
         }
-    }
 }
 
 fn linux_madvise_advice_is_supported(advice: u64) -> bool {
