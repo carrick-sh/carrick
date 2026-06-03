@@ -57,11 +57,24 @@ jobs:
       # binaries (trap_hvf, runtime_loop, interactive_tty, …) need an entitled
       # vCPU and run in the self-hosted job below. The pure-logic integration
       # suites that do NOT touch HVF are listed explicitly so they still gate here.
+      # GitHub-hosted macOS runners default RLIMIT_NOFILE to 256, but carrick
+      # relocates its internal fds (signal/pump/per-thread wake pipes, etc.)
+      # above 16384 to stay clear of the guest fd range — so it needs real-host
+      # fd headroom. `ulimit` doesn't persist across steps, so each test step
+      # raises the kernel cap (sysctl) and the soft limit (ulimit) in its own
+      # shell, with a fallback to the achievable hard limit and a diagnostic.
       - name: Unit tests
-        run: cargo test --workspace --lib
+        run: |
+          sudo sysctl -w kern.maxfiles=524288 kern.maxfilesperproc=524288 || true
+          ulimit -n 65536 || ulimit -n "$(ulimit -Hn)" || true
+          echo "RLIMIT_NOFILE: soft=$(ulimit -Sn) hard=$(ulimit -Hn)"
+          cargo test --workspace --lib
 
       - name: Host integration tests (no HVF)
         run: |
+          sudo sysctl -w kern.maxfiles=524288 kern.maxfilesperproc=524288 || true
+          ulimit -n 65536 || ulimit -n "$(ulimit -Hn)" || true
+          echo "RLIMIT_NOFILE: soft=$(ulimit -Sn) hard=$(ulimit -Hn)"
           cargo test -p carrick-runtime --test integration
           cargo test -p carrick-runtime --test syscall_process
           cargo test -p carrick-engine
