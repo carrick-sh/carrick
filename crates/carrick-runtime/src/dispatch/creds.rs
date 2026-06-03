@@ -286,10 +286,7 @@ impl SyscallDispatcher {
     define_syscall! {
         fn capget(this, cx, header_address: GuestPtr, data_address: GuestPtr) {
             let memory = &mut *cx.memory;
-            let header = match read_capability_header(memory, header_address.0) {
-                Ok(header) => header,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let header = read_capability_header(memory, header_address.0)?;
             if !linux_capability_version_is_supported(header.version) {
                 // Linux writes the kernel's PREFERRED version back into the
                 // header and returns EINVAL, so a probing caller can retry with
@@ -332,10 +329,7 @@ impl SyscallDispatcher {
 
         fn capset(this, cx, header_address: GuestPtr, data_address: GuestPtr) {
             let memory = &*cx.memory;
-            let header = match read_capability_header(memory, header_address.0) {
-                Ok(header) => header,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let header = read_capability_header(memory, header_address.0)?;
             if !linux_capability_version_is_supported(header.version) {
                 return Ok(LINUX_EINVAL.into());
             }
@@ -343,10 +337,7 @@ impl SyscallDispatcher {
                 return Ok(LINUX_ESRCH.into());
             }
             let words = linux_capability_data_words(header.version);
-            let data = match read_capability_data(memory, data_address.0, words) {
-                Ok(data) => data,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let data = read_capability_data(memory, data_address.0, words)?;
             // Accept-and-record so libcap tools (dpkg, setpriv) that capset() to
             // DROP caps don't abort — carrick is the kernel and does not modulate
             // DAC by capabilities (docs/namespaces-design.md §4.4). The bounding/

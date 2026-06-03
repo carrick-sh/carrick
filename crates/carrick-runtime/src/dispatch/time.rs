@@ -76,10 +76,7 @@ impl SyscallDispatcher {
             if flags & !LINUX_TIMER_ABSTIME != 0 {
                 return Ok(LINUX_EINVAL.into());
             }
-            let spec = match read_itimerspec(memory, new_value) {
-                Ok(spec) => spec,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let spec = read_itimerspec(memory, new_value)?;
             let (next_interval, next_value) = match itimerspec_durations(spec) {
                 Ok(value) => value,
                 Err(errno) => return Ok(errno.into()),
@@ -133,14 +130,8 @@ impl SyscallDispatcher {
 
         fn nanosleep(this, cx, request_address: GuestPtr, rem_ptr: GuestPtr) {
             let memory = &*cx.memory;
-            let timespec = match read_timespec(memory, request_address.0) {
-                Ok(timespec) => timespec,
-                Err(errno) => return Ok(errno.into()),
-            };
-            let duration = match duration_from_linux_timespec(timespec) {
-                Ok(duration) => duration,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let timespec = read_timespec(memory, request_address.0)?;
+            let duration = duration_from_linux_timespec(timespec)?;
             // Hand the sleep to the run loop (DispatchOutcome::WaitOnSleep) so it
             // waits via the per-thread waiter instead of a blocking host
             // nanosleep inside the dispatcher: a synchronous host sleep never
@@ -163,10 +154,7 @@ impl SyscallDispatcher {
             let Some(now) = linux_clock_duration(clock_id) else {
                 return Ok(LINUX_EINVAL.into());
             };
-            let timespec = match read_timespec(memory, request_address.0) {
-                Ok(timespec) => timespec,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let timespec = read_timespec(memory, request_address.0)?;
             let requested = match duration_from_linux_timespec(timespec) {
                 Ok(duration) => duration.unwrap_or(Duration::ZERO),
                 Err(errno) => return Ok(errno.into()),
@@ -225,10 +213,7 @@ impl SyscallDispatcher {
             if !linux_clock_is_known(clock_id) {
                 return Ok(LINUX_EINVAL.into());
             }
-            let timespec = match read_timespec(memory, address.0) {
-                Ok(timespec) => timespec,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let timespec = read_timespec(memory, address.0)?;
             let tv_nsec = timespec.tv_nsec;
             if !(0..1_000_000_000).contains(&tv_nsec) {
                 return Ok(LINUX_EINVAL.into());
@@ -257,10 +242,7 @@ impl SyscallDispatcher {
                 return Ok(LINUX_EINVAL.into());
             }
             let new_value = if new_address.0 != 0 {
-                let v = match read_itimerval(memory, new_address.0) {
-                    Ok(value) => value,
-                    Err(errno) => return Ok(errno.into()),
-                };
+                let v = read_itimerval(memory, new_address.0)?;
                 if !linux_timeval_usec_is_valid(v.it_interval)
                     || !linux_timeval_usec_is_valid(v.it_value)
                 {
@@ -434,10 +416,7 @@ impl SyscallDispatcher {
             if new_ptr.0 == 0 {
                 return Ok(LINUX_EFAULT.into());
             }
-            let spec = match read_itimerspec(memory, new_ptr.0) {
-                Ok(spec) => spec,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let spec = read_itimerspec(memory, new_ptr.0)?;
             // Validate the timespec (EINVAL on tv_nsec>=1e9 or negative) via the
             // shared helper, exactly like timerfd_settime. (audit M4)
             let (interval_dur, value_dur) = match itimerspec_durations(spec) {

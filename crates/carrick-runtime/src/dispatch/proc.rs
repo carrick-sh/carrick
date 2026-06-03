@@ -1157,10 +1157,7 @@ impl SyscallDispatcher {
             if !sched_policy_is_known(policy_i) {
                 return Ok(LINUX_EINVAL.into());
             }
-            let prio = match sched_read_param_priority(cx, address) {
-                Ok(prio) => prio,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let prio = sched_read_param_priority(cx, address)?;
             if policy_i == LINUX_SCHED_FIFO || policy_i == LINUX_SCHED_RR {
                 // No CAP_SYS_NICE in carrick guest → mirror Linux's EPERM.
                 return Ok(LINUX_EPERM.into());
@@ -1182,10 +1179,7 @@ impl SyscallDispatcher {
             if !sched_pid_exists(cx, pid) {
                 return Ok(LINUX_ESRCH.into());
             }
-            let prio = match sched_read_param_priority(cx, address) {
-                Ok(prio) => prio,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let prio = sched_read_param_priority(cx, address)?;
             if prio != 0 {
                 return Ok(LINUX_EINVAL.into());
             }
@@ -1232,10 +1226,7 @@ impl SyscallDispatcher {
             if flags & !LinuxFutexFlags::SUPPORTED_MASK != 0 {
                 return Ok(LINUX_EINVAL.into());
             }
-            let word = match read_u32(memory, address.0) {
-                Ok(word) => word,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let word = read_u32(memory, address.0)?;
 
             if matches!(
                 command,
@@ -1261,14 +1252,8 @@ impl SyscallDispatcher {
                         if word != value || timeout_address.0 == 0 {
                             return Ok(LINUX_EAGAIN.into());
                         }
-                        let timespec = match read_timespec(memory, timeout_address.0) {
-                            Ok(t) => t,
-                            Err(errno) => return Ok(errno.into()),
-                        };
-                        let timeout = match duration_from_linux_timespec(timespec) {
-                            Ok(t) => t,
-                            Err(errno) => return Ok(errno.into()),
-                        };
+                        let timespec = read_timespec(memory, timeout_address.0)?;
+                        let timeout = duration_from_linux_timespec(timespec)?;
                         if let Some(timeout) = timeout {
                             std::thread::sleep(timeout);
                         }
@@ -1327,10 +1312,7 @@ impl SyscallDispatcher {
                     let timeout = if timeout_address.0 == 0 {
                         None
                     } else {
-                        let timespec = match read_timespec(memory, timeout_address.0) {
-                            Ok(t) => t,
-                            Err(errno) => return Ok(errno.into()),
-                        };
+                        let timespec = read_timespec(memory, timeout_address.0)?;
                         match duration_from_linux_timespec(timespec) {
                             Ok(t) => t,
                             Err(errno) => return Ok(errno.into()),
@@ -1486,10 +1468,7 @@ impl SyscallDispatcher {
             } else {
                 pid.0
             };
-            let r = match (unsafe { libc::getpgid(hpid) }).host_syscall_errno() {
-                Ok(value) => value,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let r = (unsafe { libc::getpgid(hpid) }).host_syscall_errno()?;
             let ns_r = if crate::namespace::pid::enabled() {
                 crate::namespace::pid::host_to_ns_pgid(r as u32) as i32
             } else {
@@ -1509,10 +1488,7 @@ impl SyscallDispatcher {
             } else {
                 pid.0
             };
-            let r = match (unsafe { libc::getsid(hpid) }).host_syscall_errno() {
-                Ok(value) => value,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let r = (unsafe { libc::getsid(hpid) }).host_syscall_errno()?;
             let ns_r = if crate::namespace::pid::enabled() {
                 crate::namespace::pid::host_to_ns_pgid(r as u32) as i32
             } else {
@@ -1524,10 +1500,7 @@ impl SyscallDispatcher {
         }
 
         fn setsid(this, cx) {
-            let r = match (unsafe { libc::setsid() }).host_syscall_errno() {
-                Ok(value) => value,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let r = (unsafe { libc::setsid() }).host_syscall_errno()?;
             // setsid returns the new session id (== the caller's pid); report it
             // as the caller's ns-pid (§5.3, §6.6). Identity when ns is off.
             let ns_r = if crate::namespace::pid::enabled() {
@@ -1803,21 +1776,12 @@ impl SyscallDispatcher {
         fn execve(this, cx, pathname_addr: GuestPtr, argv_addr: GuestPtr, envp_addr: GuestPtr) {
             let memory = &*cx.memory;
 
-            let path = match read_guest_c_string(memory, pathname_addr.0) {
-                Ok(p) => p,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let path = read_guest_c_string(memory, pathname_addr.0)?;
             // argv/env are opaque BYTE strings (Linux ABI), not UTF-8 — read
             // them byte-preserving so a non-UTF-8 arg/env (e.g. CPython
             // regrtest's PYTHONREGRTEST_UNICODE_GUARD) doesn't EINVAL the execve.
-            let argv = match read_guest_string_array_bytes(memory, argv_addr.0) {
-                Ok(v) => v,
-                Err(errno) => return Ok(errno.into()),
-            };
-            let env = match read_guest_string_array_bytes(memory, envp_addr.0) {
-                Ok(v) => v,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let argv = read_guest_string_array_bytes(memory, argv_addr.0)?;
+            let env = read_guest_string_array_bytes(memory, envp_addr.0)?;
 
             Ok(DispatchOutcome::Execve { path, argv, env })
         }
@@ -1828,10 +1792,7 @@ impl SyscallDispatcher {
         /// the guest issues execveat, not execve, so without this it was ENOSYS).
         fn execveat(this, cx, dirfd: u64, pathname_addr: GuestPtr, argv_addr: GuestPtr, envp_addr: GuestPtr, flags: u64) {
             let memory = &*cx.memory;
-            let path_str = match read_guest_c_string(memory, pathname_addr.0) {
-                Ok(p) => p,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let path_str = read_guest_c_string(memory, pathname_addr.0)?;
             let path = if flags & LINUX_AT_EMPTY_PATH != 0 && path_str.is_empty() {
                 // fexecve: dirfd IS the executable's open fd. Recover the guest
                 // path it was opened at (HostFile/File/etc.) and execve that.
@@ -1850,14 +1811,8 @@ impl SyscallDispatcher {
                     Err(errno) => return Ok(errno.into()),
                 }
             };
-            let argv = match read_guest_string_array_bytes(memory, argv_addr.0) {
-                Ok(v) => v,
-                Err(errno) => return Ok(errno.into()),
-            };
-            let env = match read_guest_string_array_bytes(memory, envp_addr.0) {
-                Ok(v) => v,
-                Err(errno) => return Ok(errno.into()),
-            };
+            let argv = read_guest_string_array_bytes(memory, argv_addr.0)?;
+            let env = read_guest_string_array_bytes(memory, envp_addr.0)?;
             Ok(DispatchOutcome::Execve { path, argv, env })
         }
 
