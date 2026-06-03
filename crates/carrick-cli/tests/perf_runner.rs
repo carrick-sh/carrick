@@ -96,6 +96,13 @@ fn run_case(root: &Path, bin: &PathBuf, case: &PerfCase) -> Vec<ResultRow> {
     // Native (macOS host ceiling) build, if present — optional third engine.
     let native = native_probe_path(root, case.probe);
     let has_native = native.exists();
+    // For bind-mount cases the native engine writes directly to the host scratch
+    // dir (no /mnt); carrick/docker get the dir mounted at /mnt by invoke.
+    let native_bench_dir: Option<String> = if case.mount_scratch {
+        Some(root.join(".bench-scratch").to_string_lossy().into_owned())
+    } else {
+        None
+    };
 
     let n = reps();
     let warm = warmup_reps().min(n);
@@ -110,7 +117,7 @@ fn run_case(root: &Path, bin: &PathBuf, case: &PerfCase) -> Vec<ResultRow> {
     for rep in 0..n {
         // --- native (macos) sample: no carrick, no Docker, no VM (the ceiling) ---
         let nat = if has_native {
-            let out = invoke::run_native(&native);
+            let out = invoke::run_native(&native, native_bench_dir.as_deref());
             std::thread::sleep(cooldown());
             parse_sample(&out, case.metric_key)
         } else {
@@ -118,11 +125,11 @@ fn run_case(root: &Path, bin: &PathBuf, case: &PerfCase) -> Vec<ResultRow> {
         };
         // --- carrick sample ---
         let c_id = invoke::perf_run_id();
-        let c_out = invoke::run_carrick(bin, root, &c_id, &b64);
+        let c_out = invoke::run_carrick(bin, root, &c_id, &b64, case.mount_scratch);
         std::thread::sleep(cooldown());
         // --- docker sample (serial, never concurrent with carrick) ---
         let d_id = invoke::perf_run_id();
-        let d_out = invoke::run_docker(root, &d_id, &b64);
+        let d_out = invoke::run_docker(root, &d_id, &b64, case.mount_scratch);
         std::thread::sleep(cooldown());
 
         let c = parse_sample(&c_out, case.metric_key);
@@ -289,7 +296,14 @@ fn perf_gate() {
     }
     ensure_signed(&root, &bin);
 
+    // Optional subset: CARRICK_PERF_FILTER=<substr> runs only matching workloads.
+    let filter = std::env::var("CARRICK_PERF_FILTER").ok();
     for case in CASES {
+        if let Some(f) = &filter {
+            if !case.workload.contains(f.as_str()) {
+                continue;
+            }
+        }
         run_case(&root, &bin, case);
     }
 }

@@ -25,6 +25,10 @@ path = "../conformance-probes/src/bin/perf_net_tcp_stream.rs"
 name = "perf_disk_meta"
 path = "../conformance-probes/src/bin/perf_disk_meta.rs"
 
+[[bin]]
+name = "perf_disk_vol"
+path = "../conformance-probes/src/bin/perf_disk_vol.rs"
+
 [profile.release]
 opt-level = "z"
 strip = true
