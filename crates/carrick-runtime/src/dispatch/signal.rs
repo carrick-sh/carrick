@@ -940,9 +940,7 @@ impl SyscallDispatcher {
                 if on_altstack {
                     current.ss_flags |= LINUX_SS_ONSTACK as i32;
                 }
-                if memory.write_bytes(old_ss, current.abi_bytes()).is_err() {
-                    return Ok(LINUX_EFAULT.into());
-                }
+                memory.write_bytes(old_ss, current.abi_bytes())?;
             }
 
             if ss != 0 {
@@ -989,10 +987,7 @@ impl SyscallDispatcher {
             if sigset_size != LINUX_RT_SIGSET_SIZE {
                 return Ok(LINUX_EINVAL.into());
             }
-            let mask_bytes = match memory.read_bytes(mask_ptr, LINUX_RT_SIGSET_SIZE as usize) {
-                Ok(bytes) => bytes,
-                Err(_) => return Ok(LINUX_EFAULT.into()),
-            };
+            let mask_bytes = memory.read_bytes(mask_ptr, LINUX_RT_SIGSET_SIZE as usize)?;
             let suspend_mask = sanitize_signal_mask(u64::from_le_bytes(
                 mask_bytes.try_into().unwrap_or([0; 8]),
             ));

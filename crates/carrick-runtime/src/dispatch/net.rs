@@ -3488,10 +3488,7 @@ impl SyscallDispatcher {
         // sendmsg. This is the multiprocessing forkserver's fd-handoff path.
         let mut host_control: Vec<u8> = Vec::new();
         if msg.control != 0 && msg.controllen > 0 {
-            let raw = match memory.read_bytes(msg.control, msg.controllen as usize) {
-                Ok(b) => b,
-                Err(_) => return Ok(LINUX_EFAULT.into()),
-            };
+            let raw = memory.read_bytes(msg.control, msg.controllen as usize)?;
             let guest_fds = parse_linux_scm_rights_fds(&raw);
             if !guest_fds.is_empty() {
                 let mut host_fds = Vec::with_capacity(guest_fds.len());
