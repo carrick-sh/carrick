@@ -104,5 +104,6 @@ fn headline(rows: &[&SuiteReport]) -> String {
                 .map(|n| format!("{n} {}", v.as_str()))
         })
         .collect();
-    format!("{} suites — {}", rows.len(), parts.join(" · "))
+    let noun = if rows.len() == 1 { "suite" } else { "suites" };
+    format!("{} {noun} — {}", rows.len(), parts.join(" · "))
 }
