@@ -19,7 +19,7 @@
 //!   - the scratch dir lives on the same APFS volume as the unpacked
 //!     rootfs, so a future clonefile(2)-based seed could be O(1) (NOT
 //!     yet implemented — current seeding byte-copies via write_all; see
-//!     docs/superpowers/plans/2026-05-23-code-quality-darwin-ecosystem.md),
+//!     docs/archive/superpowers/plans/2026-05-23-code-quality-darwin-ecosystem.md),
 //!   - throw-away on `carrick volume delete` is a single subvolume
 //!     destroy instead of an `rm -rf` of millions of inodes.
 

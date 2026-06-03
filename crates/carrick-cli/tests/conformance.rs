@@ -36,7 +36,7 @@ static CONFORMANCE_LOCK: Mutex<()> = Mutex::new(());
 /// FAILS so we remove it from this list — that's the signal the gap was
 /// fixed. Each entry must cite the gap.
 const KNOWN_PROBE_GAPS: &[&str] = &[
-    // Audit remediation program (docs/superpowers/plans/2026-05-29-audit-remediation-program.md).
+    // Audit remediation program (docs/archive/superpowers/plans/2026-05-29-audit-remediation-program.md).
     // Each probe encodes a confirmed, dynamically-validated finding whose fix is
     // scheduled for the cited milestone; removed from this list when the fix lands
     // (the "UNEXPECTED PASS" guard fails the suite if we forget).

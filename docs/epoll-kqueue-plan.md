@@ -7,7 +7,7 @@ fd `epoll_ctl(ADD)`-ed by another thread while a netpoller thread is already
 blocked in `epoll_wait` is never monitored by that in-flight wait → lost
 wakeup. Confirmed root cause of the Go HTTP fixture's ~5/6 hang (server's
 accepted conn fd7 added while the netpoller blocks on fd3/fd6; fd7's readiness
-has no observer). See `project_go_bringup` memory + `golang-bringup-handoff.md`.
+has no observer). See `project_go_bringup` memory + `archive/golang-bringup-handoff.md`.
 
 ## Prior art
 FreeBSD `sys/compat/linux/linux_event.c`: the epoll fd **is** a kqueue.
