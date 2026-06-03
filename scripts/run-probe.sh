@@ -30,7 +30,7 @@ RUN_ID="cr-$$-${RANDOM}"
 export CARRICK_RUN_ID="$RUN_ID"
 kill_guests() {
     sudo -n "$repo/scripts/sudo/kill.sh" "$RUN_ID" >/dev/null 2>&1 \
-        || pkill -9 -f "carrick:$RUN_ID" 2>/dev/null
+        || pkill -9 -f "carrick:$RUN_ID:" 2>/dev/null  # trailing ':' anchors the id
 }
 
 kill_guests; sleep 0.3

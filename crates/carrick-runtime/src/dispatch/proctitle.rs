@@ -41,10 +41,15 @@ fn run_id() -> Option<&'static str> {
 }
 
 /// Build the host process title. With a run id this is `carrick:<id>: <name>`,
-/// which is greppable per-run (a scoped `pkill -f "carrick:<id>"` reaps only
-/// this run's guests, surviving `setpgid`/`setsid` escapes). Without one it is
-/// the legacy `carrick: <name>`. Both keep the literal `carrick:` so the global
-/// recovery reaper still matches for manual cleanup.
+/// which is greppable per-run — but the id MUST be matched with its trailing
+/// delimiter: `pkill -f "carrick:<id>:"` (note the final `:`), NOT a bare
+/// `carrick:<id>`. The `:` separates the id from the name, so a run id that is a
+/// PREFIX of another (e.g. `…-c1` vs `…-c10`) would over-match without it — the
+/// scoped reaper (`scripts/sudo/kill.sh`) anchors on `carrick:<id>:` as a literal
+/// for exactly this reason. The match survives `setpgid`/`setsid` escapes.
+/// Without a run id the title is the legacy `carrick: <name>`. Both keep the
+/// literal `carrick:` so the global recovery reaper still matches for manual
+/// cleanup.
 pub(crate) fn proc_label(name: &str, run_id: Option<&str>) -> String {
     match run_id {
         Some(id) if !id.is_empty() => format!("carrick:{id}: {}", name.trim()),

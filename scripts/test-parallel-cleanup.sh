@@ -20,12 +20,12 @@ a0=$(alive cr-AAA); b0=$(alive cr-BBB)
 echo "before: AAA=$a0 BBB=$b0"
 
 echo "=== scoped kill cr-AAA ==="
-"$repo/scripts/sudo/kill.sh" cr-AAA || pkill -9 -f 'carrick:cr-AAA'
+"$repo/scripts/sudo/kill.sh" cr-AAA || pkill -9 -f 'carrick:cr-AAA:'
 sleep 1
 
 a1=$(alive cr-AAA); b1=$(alive cr-BBB)
 echo "after:  AAA=$a1 BBB=$b1"
-pkill -9 -f 'carrick:cr-BBB' 2>/dev/null  # cleanup
+pkill -9 -f 'carrick:cr-BBB:' 2>/dev/null  # cleanup
 
 if [ "$a0" -ge 1 ] && [ "$b0" -ge 1 ] && [ "$a1" -eq 0 ] && [ "$b1" -ge 1 ]; then
     echo "PASS: scoped kill reaped only cr-AAA; cr-BBB survived"
