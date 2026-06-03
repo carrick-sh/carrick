@@ -1,0 +1,294 @@
+# Unified conformance suite manifest — the single declarative source the
+# carrick-conformance harness reads. Each [[suite]] runs the SAME image + trailing
+# `cmd` under `carrick run` and `docker run` (the Linux oracle); the harness diffs
+# the outcome categories. See docs/superpowers/specs/2026-06-03-conformance-harness-design.md.
+#
+# Invariants enforced by the validator (manifest.rs):
+#   - coherent suites pin `--fs memory` in carrick_flags (never the volume default).
+#   - images carry a registry host (localhost:5050 / :5005), never a bare daemon tag.
+# `tier = "smoke"` is the fast pre-merge gate; `full` adds the rest.
+
+# ============================ CPython (regrtest) ============================
+# Image bakes Lib/test (the --bundled form); python3 is the absolute path.
+
+[[suite]]
+name = "cpython-smoke"
+ecosystem = "cpython"
+image = "localhost:5050/cpython-test:3.12.13"
+cmd = ["/usr/local/bin/python3", "-m", "test", "-v", "--randseed", "0", "test_subprocess", "test_threading"]
+verdict = "regrtest"
+tier = "smoke"
+weight = "heavy"
+timeout_s = 240
+carrick_flags = ["--raw", "--fs", "memory"]
+known_gaps = [
+  "test_subprocess", # cluster-1 nested-fork HVF wedge (deterministic at scale)
+]
+
+[[suite]]
+name = "cpython-math"
+ecosystem = "cpython"
+image = "localhost:5050/cpython-test:3.12.13"
+cmd = ["/usr/local/bin/python3", "-m", "test", "-v", "--randseed", "0", "test_math"]
+verdict = "regrtest"
+tier = "full"
+weight = "heavy"
+timeout_s = 180
+carrick_flags = ["--raw", "--fs", "memory"]
+
+[[suite]]
+name = "cpython-json"
+ecosystem = "cpython"
+image = "localhost:5050/cpython-test:3.12.13"
+cmd = ["/usr/local/bin/python3", "-m", "test", "-v", "--randseed", "0", "test_json"]
+verdict = "regrtest"
+tier = "full"
+weight = "heavy"
+timeout_s = 180
+carrick_flags = ["--raw", "--fs", "memory"]
+
+[[suite]]
+name = "cpython-glob"
+ecosystem = "cpython"
+image = "localhost:5050/cpython-test:3.12.13"
+cmd = ["/usr/local/bin/python3", "-m", "test", "-v", "--randseed", "0", "test_glob"]
+verdict = "regrtest"
+tier = "full"
+weight = "heavy"
+timeout_s = 180
+carrick_flags = ["--raw", "--fs", "memory"]
+known_gaps = [
+  "test_glob", # cluster-3 samestat inode-identity -> shutil.rmtree refuses
+]
+
+[[suite]]
+name = "cpython-fcntl"
+ecosystem = "cpython"
+image = "localhost:5050/cpython-test:3.12.13"
+cmd = ["/usr/local/bin/python3", "-m", "test", "-v", "--randseed", "0", "test_fcntl"]
+verdict = "regrtest"
+tier = "full"
+weight = "heavy"
+timeout_s = 180
+carrick_flags = ["--raw", "--fs", "memory"]
+known_gaps = [
+  "F_SETPIPE_SZ", # cluster-4 fcntl: no macOS equivalent
+  "F_NOTIFY",
+]
+
+# ============================== Go (gotest) =================================
+# Prebaked image driver: the test binary lives at /conformance/<pkg>.test and
+# runs with -w at the package's GOROOT src dir (mirrors go-conformance-image.sh).
+
+[[suite]]
+name = "go-runtime"
+ecosystem = "go"
+image = "localhost:5005/carrick-go-conformance:1.24"
+cmd = ["/conformance/runtime.test", "-test.run", "Test", "-test.short"]
+verdict = "gotest"
+tier = "smoke"
+weight = "heavy"
+timeout_s = 180
+workdir = "/usr/local/go/src/runtime"
+carrick_flags = ["--raw", "--fs", "memory"]
+
+[[suite]]
+name = "go-sync"
+ecosystem = "go"
+image = "localhost:5005/carrick-go-conformance:1.24"
+cmd = ["/conformance/sync.test", "-test.run", "Test", "-test.short"]
+verdict = "gotest"
+tier = "full"
+weight = "heavy"
+timeout_s = 120
+workdir = "/usr/local/go/src/sync"
+carrick_flags = ["--raw", "--fs", "memory"]
+
+[[suite]]
+name = "go-context"
+ecosystem = "go"
+image = "localhost:5005/carrick-go-conformance:1.24"
+cmd = ["/conformance/context.test", "-test.run", "Test", "-test.short"]
+verdict = "gotest"
+tier = "full"
+weight = "heavy"
+timeout_s = 120
+workdir = "/usr/local/go/src/context"
+carrick_flags = ["--raw", "--fs", "memory"]
+
+[[suite]]
+name = "go-time"
+ecosystem = "go"
+image = "localhost:5005/carrick-go-conformance:1.24"
+cmd = ["/conformance/time.test", "-test.run", "Test", "-test.short"]
+verdict = "gotest"
+tier = "full"
+weight = "heavy"
+timeout_s = 120
+workdir = "/usr/local/go/src/time"
+carrick_flags = ["--raw", "--fs", "memory"]
+
+# ========================= Node.js / libuv (tap) ============================
+# Both engines run the image's native nodejs-conformance entrypoint; the
+# carrick/docker distinction is carried only by EFFECTIVE_RUNNER. Stage-1 TAP
+# parser (coarse pass/fail) per the phased plan.
+
+[[suite]]
+name = "node-app-smoke"
+ecosystem = "node"
+image = "localhost:5005/carrick-nodejs-conformance:24.16.0-26.2.0"
+entrypoint = { both = "/usr/local/bin/nodejs-conformance" }
+cmd = ["--runner", "docker", "--suite", "app-smoke", "--line", "24", "--timeout", "120"]
+verdict = "tap"
+tier = "smoke"
+weight = "heavy"
+timeout_s = 180
+carrick_flags = ["--raw", "--fs", "memory"]
+env = [{ key = "NODEJS_CONFORMANCE_IN_IMAGE", val = "1" }]
+env_carrick = [{ key = "NODEJS_CONFORMANCE_EFFECTIVE_RUNNER", val = "carrick" }]
+env_docker = [{ key = "NODEJS_CONFORMANCE_EFFECTIVE_RUNNER", val = "docker" }]
+
+[[suite]]
+name = "node-v8-smoke"
+ecosystem = "node"
+image = "localhost:5005/carrick-nodejs-conformance:24.16.0-26.2.0"
+entrypoint = { both = "/usr/local/bin/nodejs-conformance" }
+cmd = ["--runner", "docker", "--suite", "v8-smoke", "--line", "24", "--timeout", "120"]
+verdict = "tap"
+tier = "smoke"
+weight = "heavy"
+timeout_s = 180
+carrick_flags = ["--raw", "--fs", "memory"]
+env = [{ key = "NODEJS_CONFORMANCE_IN_IMAGE", val = "1" }]
+env_carrick = [{ key = "NODEJS_CONFORMANCE_EFFECTIVE_RUNNER", val = "carrick" }]
+env_docker = [{ key = "NODEJS_CONFORMANCE_EFFECTIVE_RUNNER", val = "docker" }]
+
+[[suite]]
+name = "node-libuv"
+ecosystem = "node"
+image = "localhost:5005/carrick-nodejs-conformance:24.16.0-26.2.0"
+entrypoint = { both = "/usr/local/bin/nodejs-conformance" }
+cmd = ["--runner", "docker", "--suite", "libuv", "--line", "24", "--timeout", "180"]
+verdict = "tap"
+tier = "full"
+weight = "heavy"
+timeout_s = 300
+carrick_flags = ["--raw", "--fs", "memory"]
+docker_flags = ["--user", "65534"]
+env = [{ key = "NODEJS_CONFORMANCE_IN_IMAGE", val = "1" }]
+env_carrick = [{ key = "NODEJS_CONFORMANCE_EFFECTIVE_RUNNER", val = "carrick" }]
+env_docker = [{ key = "NODEJS_CONFORMANCE_EFFECTIVE_RUNNER", val = "docker" }]
+
+# ============================== LTP (ltp) ===================================
+# One [[suite]] per binary, run DIRECTLY as argv (no /bin/sh -c) in the full ltp
+# image; --fs memory (fast overlay), light weight (pool freely). Curated handful.
+
+[[suite]]
+name = "ltp-rt_sigaction01"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/rt_sigaction01"]
+verdict = "ltp"
+tier = "smoke"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "memory"]
+
+[[suite]]
+name = "ltp-gettid01"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/gettid01"]
+verdict = "ltp"
+tier = "smoke"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "memory"]
+
+[[suite]]
+name = "ltp-clock_gettime01"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/clock_gettime01"]
+verdict = "ltp"
+tier = "smoke"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "memory"]
+
+[[suite]]
+name = "ltp-epoll_create01"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/epoll_create01"]
+verdict = "ltp"
+tier = "smoke"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "memory"]
+
+[[suite]]
+name = "ltp-getcpu01"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/getcpu01"]
+verdict = "ltp"
+tier = "smoke"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "memory"]
+
+[[suite]]
+name = "ltp-sched_yield01"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/sched_yield01"]
+verdict = "ltp"
+tier = "smoke"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "memory"]
+
+[[suite]]
+name = "ltp-eventfd01"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/eventfd01"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "memory"]
+
+[[suite]]
+name = "ltp-pipe01"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/pipe01"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "memory"]
+
+[[suite]]
+name = "ltp-gettimeofday01"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/gettimeofday01"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "memory"]
+
+[[suite]]
+name = "ltp-sched_getaffinity01"
+ecosystem = "ltp"
+image = "localhost:5050/ltp:arm64"
+cmd = ["/opt/ltp/testcases/bin/sched_getaffinity01"]
+verdict = "ltp"
+tier = "full"
+weight = "light"
+timeout_s = 40
+carrick_flags = ["--raw", "--fs", "memory"]
