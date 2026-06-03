@@ -1,5 +1,72 @@
-//! Shared Carrick data model for OCI references, image config, mounts,
-//! namespaces, and run specs.
+//! The carrick vocabulary crate: the plain-data nouns that every layer of the
+//! runtime agrees on — OCI references, resolved image config, mounts,
+//! namespaces, and the fully-resolved [`RunSpec`] that tells the runtime what
+//! Linux process to launch.
+//!
+//! # Why this crate exists
+//!
+//! carrick is a five-crate workspace whose dependency edges flow strictly
+//! downhill: `carrick-cli` → `carrick-engine` → {`carrick-image`,
+//! `carrick-runtime`} → `carrick-spec`. This crate sits at the very bottom.
+//! Every layer above it speaks in these types, so they are the *lingua franca*
+//! that crosses every layer boundary:
+//!
+//! - `carrick-image` parses an OCI image's `config.json` and produces an
+//!   [`ImageConfig`] (its entrypoint, cmd, env, working dir, exposed ports,
+//!   stop signal). It never decides *how* to run anything; it only reports what
+//!   the image declares.
+//! - `carrick-cli` parses the user's `carrick run …` flags. The clap-derived
+//!   enums ([`FsBackendKind`], [`PidMode`]) live here, gated behind the optional
+//!   `clap` feature, so the CLI gets `--fs host`/`--pid host` parsing for free
+//!   without forcing the clap dependency on `carrick-runtime` or
+//!   `carrick-image`.
+//! - `carrick-engine` is the only place that *merges*: it folds the CLI request
+//!   and the resolved [`ImageConfig`] into a single [`RunSpec`] (image
+//!   entrypoint vs. argv override, `--env` over image `ENV`, `--user` over image
+//!   `USER`, working dir, mounts, namespace modes). The merge precedence lives
+//!   in the engine; this crate only supplies the fields the merge writes into.
+//! - `carrick-runtime` consumes the finished [`RunSpec`] and nothing else from
+//!   the CLI side. It is handed a complete, self-describing launch request and
+//!   does not re-read flags or image metadata.
+//!
+//! Keeping the vocabulary in a leaf crate of its own means these types can be
+//! named in a function signature that crosses two layers without dragging in
+//! either layer's machinery: `carrick-image` does not depend on the runtime,
+//! the runtime does not depend on the image puller, yet both can speak
+//! [`ImageConfig`] because both depend *down* on this crate. It also keeps the
+//! types cheap to recompile — touching a runtime dispatch handler does not
+//! rebuild the vocabulary, and adding a field here does not rebuild the
+//! ~40k-line runtime until a consumer actually reads it.
+//!
+//! # What belongs here (and what does not)
+//!
+//! Strictly inert data: structs, enums, their `serde` derives, their `Default`
+//! impls, and trivially pure helpers ([`ImageReference::parse`],
+//! [`Platform::from_oci_str`]). There is no I/O, no syscall, no host or guest
+//! state, and no dependency on any other carrick crate — only general-purpose
+//! utility crates (`oci-client` for reference parsing, `camino` for
+//! UTF-8-guaranteed paths, `serde`/`serde_json`, `thiserror`). Anything that
+//! *acts* — pulling a layer, mapping a page, dispatching a syscall — lives in a
+//! crate above this one. If a type here grows a method that touches the
+//! filesystem or the network, it is in the wrong crate.
+//!
+//! # Invariants worth stating
+//!
+//! - Every type is `serde`-round-trippable: the engine serializes a [`RunSpec`]
+//!   and the runtime deserializes it, and `run -d` persists an [`ImageConfig`]
+//!   to disk. New fields therefore carry `#[serde(default)]` (or `Option`) so an
+//!   older persisted document still loads — see the `stop_signal` and
+//!   `image_config_stop_signal_round_trips_and_defaults` test for the pattern.
+//! - Paths are [`Utf8PathBuf`], not `PathBuf`: a guest path that cannot be
+//!   represented as UTF-8 cannot round-trip through JSON anyway, so the
+//!   constraint is enforced at the type level rather than discovered at
+//!   serialization time.
+//! - [`NamespaceMode`] currently has exactly one variant, `Host`. The
+//!   per-namespace [`NamespaceConfig`] is the seam for future private
+//!   namespaces; today it documents that carrick behaves like `docker run`
+//!   with every `--namespace=host`. (The one namespace that has actually grown a
+//!   private mode, the PID namespace, is modeled separately by [`PidMode`],
+//!   which the engine threads into the runtime.)
 
 use camino::Utf8PathBuf;
 use oci_client::Reference;
@@ -25,6 +92,23 @@ pub enum OciBootstrapError {
     Config(String),
 }
 
+/// A parsed, validated OCI image reference (registry / repository / tag or
+/// digest).
+///
+/// This is a newtype over `oci_client::Reference` rather than a re-export so
+/// the rest of carrick depends on a stable surface (`registry()`,
+/// `repository()`, `tag()`, `digest()`, `canonical()`) instead of the upstream
+/// crate's API, and so it can carry carrick's own `serde` representation.
+///
+/// The serde shape is deliberately a flat *string*, not a struct of its parts:
+/// `ImageReference` serializes to its canonical whole (`whole()`, e.g.
+/// `docker.io/library/ubuntu:latest`) and deserializes by re-parsing that
+/// string. The default-registry / default-tag normalization that
+/// `oci_client` applies on parse therefore happens exactly once, on the way in;
+/// a round-trip through JSON is idempotent (re-parsing an already-canonical
+/// string is a no-op), which the `test_image_reference_parsing_and_serialization`
+/// test pins. The constructor [`ImageReference::parse`] is the only way to make
+/// one, so an `ImageReference` is always well-formed by construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageReference {
     inner: Reference,
@@ -189,6 +273,31 @@ impl Platform {
     }
 }
 
+/// The fully-resolved launch request: everything `carrick-runtime` needs to
+/// start one Linux process, with every CLI-vs-image precedence decision already
+/// made.
+///
+/// A `RunSpec` is the hand-off point between the merge layer and the execution
+/// layer. `carrick-engine::resolve_run_spec` produces it by folding the user's
+/// CLI request over the resolved [`ImageConfig`]; `carrick-runtime` consumes it
+/// and re-reads neither the flags nor the image metadata. Read in that light,
+/// the fields split into three groups:
+///
+/// - *What to run*: `executable` / `argv` / `envp` / `cwd` — the resolved
+///   entrypoint+cmd, environment, and working directory after the image
+///   defaults and CLI overrides have been reconciled.
+/// - *What it sees*: `rootfs_layers` (the OCI layer dirs to stack into the
+///   guest root), `fs_backend` (in-memory overlay vs. host-APFS passthrough,
+///   see [`FsBackendKind`]), and `mounts` (host bind mounts).
+/// - *How it behaves*: `tty` / `raw` / `interactive` (terminal handling),
+///   `platform` (native aarch64 vs. Rosetta-translated amd64), `pid`
+///   (PID-namespace mode), `uid` / `gid` (initial guest credentials),
+///   `max_traps` (a syscall-count guard rail for tests/debugging), and
+///   `debug_state_path` (where to dump guest state).
+///
+/// The trailing fields carry `#[serde(default)]` so a `RunSpec` persisted by an
+/// older build still deserializes — see the crate-level note on additive
+/// evolution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunSpec {
     pub executable: String,

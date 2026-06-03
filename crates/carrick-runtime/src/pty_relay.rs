@@ -1,6 +1,57 @@
-//! Interactive pty bridge for `carrick run -t`. carrick allocates a host
-//! pty, hands the slave to the guest as fds 0/1/2, and relays bytes between
-//! the user's real terminal and the master while the guest runs.
+//! Interactive pty bridge for `carrick run -t`.
+//!
+//! # Theory of operation
+//!
+//! The guest has no Linux kernel and therefore no kernel pty/line-discipline of
+//! its own. To make an interactive guest shell behave, carrick borrows the
+//! **macOS** pty: [`PtyPair::allocate`] opens a host master/slave pair
+//! (posix_openpt → grantpt → unlockpt → ptsname), hands the **slave** to the
+//! guest as fds 0/1/2 (so the guest's `read`/`write`/`tcsetattr`/`TIOCGWINSZ`
+//! land on a real macOS terminal device, with the macOS kernel's line
+//! discipline doing cooking, echo, and signal-char generation), and runs a
+//! [`PtyRelay`] thread that shuttles bytes between the user's real terminal
+//! (`real_in`/`real_out`) and the **master**.
+//!
+//! The relay thread ([`relay_loop`]) is a single `poll(2)` over up to five fds:
+//! `real_in` → master, master → `real_out`, a shutdown self-pipe (so
+//! [`PtyRelay::stop`] terminates the thread without a signal or timeout), a
+//! SIGWINCH self-pipe, and an out-of-band winsize-message fd (used when a helper
+//! stayed behind in the original terminal session — see
+//! [`interactive_supervisor`](crate::interactive_supervisor)). The user's real
+//! terminal is put in raw mode while the relay runs so the guest's slave-side
+//! line discipline is the only one cooking input; a [`crate::host_tty`] guard
+//! restores it on teardown (even on a guest crash).
+//!
+//! # SIGWINCH and the resize poll
+//!
+//! Window-size changes propagate two ways, because neither alone is reliable in
+//! carrick's HVF context. The fast path is a classic async-signal-safe SIGWINCH
+//! self-pipe (handler writes one byte to a non-blocking pipe; the relay reads it
+//! and copies the new `winsize` to the master via `TIOCSWINSZ`). But
+//! applevisor/HVF often masks SIGWINCH on the vCPU threads, so the handler may
+//! never fire — the relay therefore **also** polls the terminal size on a
+//! timeout as a backstop. There is exactly one live `PtyRelay` per process, so
+//! the handler's write-end fd lives in a single process-global atomic.
+//!
+//! # Resource ownership and the rollback guard
+//!
+//! Install order matters: the SIGWINCH handler is installed and the self-pipe
+//! published *before* the relay thread spawns, but if any step between
+//! handler-install and a successful spawn fails, [`SigwinchInstallGuard`] (an
+//! RAII rollback) disarms the global write-end, restores the saved disposition,
+//! and closes both pipe fds — mirroring `stop()`'s teardown order so a late
+//! signal in the window is a no-op and no fd leaks. After a clean spawn the
+//! guard is `commit()`ed and the relay owns those resources.
+//!
+//! # Known sharp edge: the lone-LF staircase
+//!
+//! At wide terminals, guest output written with a bare `\n` can reach the raw
+//! host terminal without the `\r` that ONLCR/OPOST would add, producing a
+//! staircase ("ls /bin" rendered as one slanted block). This is a race on the
+//! shared macOS pty *slave* termios between the shell's host-proc (flipping the
+//! tty raw for next-prompt line editing) and a forked child's host-proc writing
+//! at the same time — not a width mis-detection. See the
+//! `interactive_onlcr_race` project note.
 
 use std::ffi::CString;
 use std::io;

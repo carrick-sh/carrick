@@ -1,6 +1,66 @@
 //! Thread + futex coordination shared across a guest process's host threads.
-//! No HVF, no syscalls — pure data structures behind their own locks so they
-//! can be held across vCPU runs without entangling the dispatcher lock.
+//!
+//! THEORY OF OPERATION
+//!
+//! Carrick runs each guest thread as a real macOS thread driving its own HVF
+//! vCPU; there is no guest Linux kernel to arbitrate between them. The two data
+//! structures here are what stands in for the kernel's per-process thread table
+//! and its futex hash bucket array. They are pure host-memory structures behind
+//! their own `parking_lot` locks — deliberately NO HVF calls and NO syscalls —
+//! so a lock here can be held across a vCPU run without entangling the
+//! dispatcher lock (which, post-BKL-retirement, must never be the single point
+//! that serializes every guest thread).
+//!
+//! [`ThreadRegistry`] is the per-process thread table. It allocates monotonic
+//! guest tids, tracks `CLONE_CHILD_CLEARTID` addresses (zeroed + woken on thread
+//! exit), per-thread `prctl`/`pthread_setname_np` names, and — crucially — it
+//! does NOT track run/sleep state itself. The `/proc/<tid>/stat` state char is
+//! read LIVE from the host kernel via `thread_info` on each thread's recorded
+//! mach port (see [`ThreadRegistry::thread_states`]); the kernel already knows
+//! whether a thread is WAITING in any blocking path, so a hand-maintained
+//! "sleeping" flag would only be a second source of truth to keep wrong. A
+//! process-global handle ([`set_current_registry`]) lets the fs/open `/proc`
+//! synthesis reach this process's registry without threading it through every
+//! syscall; a forked child re-publishes a fresh one.
+//!
+//! [`FutexTable`] is the futex implementation. The key design decision is that
+//! a PRIVATE futex (`FUTEX_PRIVATE_FLAG`) never touches `__ulock` or a real
+//! shared address at all: it parks on a Carrick-owned `parking_lot_core` key
+//! derived from an `Arc<FutexBucket>`, keyed by the guest address, with a
+//! per-bucket GENERATION counter. `FUTEX_WAKE` bumps the generation and unparks;
+//! a waiter that re-checks the generation and finds it advanced returns `Woken`
+//! without sleeping, which closes the classic lost-wake race between the
+//! dispatcher's `*uaddr == expected` check and the actual park (see
+//! [`FutexTable::prepare_wait`] — the generation is captured under the
+//! dispatcher's verification, then the park happens with syscall locks
+//! released). SHARED futexes (cross-process, on the shared aperture) are handled
+//! elsewhere via Darwin `os_sync_wait_on_address`/`__ulock`; this table owns the
+//! private case, which is the overwhelming majority.
+//!
+//! Three properties are non-obvious and load-bearing:
+//!
+//!   * SHARDING. The address→bucket lookup runs on EVERY futex syscall, wait and
+//!     wake. A single global map lock serialized all guest threads' futex ops
+//!     and throttled high-concurrency runtimes (Go with `GOMAXPROCS = ncpu`
+//!     spins up that many M's, each parking/waking on its own word). The address
+//!     map is sharded `FUTEX_SHARDS` (64) ways by a Fibonacci hash of the
+//!     address so aligned words — which share low bits — spread across shards.
+//!
+//!   * SIGNAL INTERRUPTIBILITY. A guest futex wait must abort with `-EINTR` when
+//!     a signal becomes pending so the trap loop can deliver it. The park's wake
+//!     predicate ORs in `interrupted()`, and the signal pump calls
+//!     [`FutexTable::notify_signal_pending`] (process-directed) or
+//!     [`FutexTable::notify_signal_pending_for`] (thread-directed `tgkill`) to
+//!     unpark waiters with a distinguishing token so only the right threads
+//!     re-evaluate their predicate rather than waiting out a timeout.
+//!
+//!   * REQUEUE. `FUTEX_REQUEUE`/`FUTEX_CMP_REQUEUE` is the one primitive Darwin's
+//!     `__ulock` lacks; `parking_lot_core::unpark_requeue` provides it by
+//!     atomically relinking parked records from one key to another. A requeued
+//!     thread stays blocked inside its original `park()` and only wakes on an
+//!     unpark of the destination key — see [`FutexTable::requeue`] for why this
+//!     composes with the generation model (token unparks bypass the per-bucket
+//!     generation check).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -21,7 +81,7 @@ struct ThreadEntry {
     /// every blocking path). 0 = not yet recorded.
     mach_port: crate::host_proc::ThreadPort,
     /// Per-thread name (prctl PR_SET_NAME / pthread_setname_np), exposed via
-    /// /proc/<pid>/task/<tid>/comm. `None` until the thread names itself; the
+    /// `/proc/<pid>/task/<tid>/comm`. `None` until the thread names itself; the
     /// /proc handler then falls back to the executable basename. TASK_COMM_LEN
     /// is 16 (15 chars + NUL).
     name: Option<[u8; 16]>,
@@ -55,7 +115,7 @@ pub fn current_thread_states() -> Vec<(ThreadId, char)> {
 }
 
 /// `tid`'s prctl/pthread-set name from the current process's registry, if set.
-/// Used by the /proc/<pid>/task/<tid>/comm handler (which has no direct
+/// Used by the `/proc/<pid>/task/<tid>/comm` handler (which has no direct
 /// registry handle) to report per-thread names.
 pub fn current_thread_name(tid: ThreadId) -> Option<[u8; 16]> {
     CURRENT_REGISTRY

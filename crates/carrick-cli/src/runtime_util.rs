@@ -1,4 +1,33 @@
-//! Shared CLI runtime utilities.
+//! Shared CLI utilities: the fork-safe async bridge, docker-flag parsers, and
+//! docker-shaped output formatters.
+//!
+//! # Theory of operation
+//!
+//! Two unrelated concerns share this module because both are pure leaf helpers
+//! used across the command arms.
+//!
+//! **The async/fork boundary.** [`block_on_oci`] is the *only* place the CLI
+//! runs async code, and that is a hard invariant, not a convenience. Image
+//! pulls and registry auth are async (tokio), but a guest `clone(2)` becomes a
+//! host `fork(2)` deep under the trap loop, and a multi-thread tokio runtime
+//! alive in the parent at fork time poisons the child (missing worker threads,
+//! stale I/O-driver kqueue state). So every OCI future is driven on a
+//! short-lived *current-thread* runtime that is built and dropped *per call* —
+//! guaranteeing no async runtime exists in the parent by the time a guest fork
+//! can fire. Building that runtime is treated as fatal-at-startup (it runs
+//! before any guest fork), so the helper `expect`s. See the crate-level docs for
+//! the matching `main` decision to avoid `#[tokio::main]`.
+//!
+//! **Docker-compat surface.** The rest is the parsing and presentation glue that
+//! makes carrick's CLI byte-shaped like docker's: `-v`/`--volume` and `--mount`
+//! parsers (accepting-and-warning on SELinux `z`/`Z` and macOS cache hints carry
+//! no meaning here — there is no SELinux and the host FS is already coherent),
+//! the `-p`/`--publish` validator (carrick is host-networked, so a port *remap*
+//! can never work and is a hard error per the unsupported-flag policy, while an
+//! identity map is a documented no-op), `--env-file` parsing, `emit_raw` (stream
+//! the guest's buffered stdio to fd 1/2 instead of a JSON envelope), and the
+//! `human_size`/`human_age`/`truncate_str` formatters that reproduce docker's
+//! decimal-unit sizes, relative ages, and truncated table columns.
 
 /// When `--raw` is set, emit the guest's buffered stdout/stderr to the
 /// carrick host process's fd 1 / fd 2 instead of wrapping them in JSON.

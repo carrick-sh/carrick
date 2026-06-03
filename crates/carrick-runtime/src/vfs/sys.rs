@@ -1,6 +1,27 @@
-//! `/sys` mount.
+//! `/sys` mount: a synthetic sysfs rendered on demand.
 //!
-//! Owns Carrick's synthetic sysfs registry and renderers.
+//! # Theory of operation
+//!
+//! Sibling to the `/proc` mount (see [`super::proc`]): carrick has no Linux
+//! kernel and so fabricates the slice of `/sys` that real software reads. Two
+//! kinds of content live here:
+//!
+//! * **Fixed attribute files** (`synthetic_file`) — a flat path→bytes table
+//!   for the kernel knobs programs probe at startup: CPU topology and online
+//!   masks under `/sys/devices/system/cpu/*` (the runtime reports a real CPU
+//!   count), cpufreq scaling values, transparent-hugepage policy, a per-boot
+//!   random UUID, and the cgroup-v2 controller list. Values are plausible
+//!   constants or host-derived facts, not live kernel state.
+//! * **The `/sys/class/net` tree** — a small synthetic directory hierarchy
+//!   (`class` → `net` → per-interface dirs → per-attribute files) rendered from
+//!   the host's live network interfaces, so a guest that enumerates interfaces
+//!   via sysfs (rather than netlink) sees loopback and the host NICs with
+//!   matching `ifindex`/`address`/`mtu`/`flags`.
+//!
+//! Like `/proc`, `/sys` is read-only here: the [`Vfs`] mutator defaults return
+//! their errors, and `open` for write is refused. The bar is the same — the
+//! programs we run parse it and behave as they do under Docker — not bit-exact
+//! sysfs emulation.
 
 use crate::linux_abi::{LINUX_EACCES, LINUX_ENOENT, LINUX_ENOTDIR};
 

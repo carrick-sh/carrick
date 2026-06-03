@@ -12,8 +12,8 @@
 //! effective resolver config — which configd renders into `/etc/resolv.conf`,
 //! falling back to `scutil --dns` for the primary scoped resolver — and serves
 //! a clean copy here. The guest's resolver then gets real nameservers; the DNS
-//! queries egress through the existing host-socket passthrough
-//! ([`crate::dispatch::net`]), exactly as `docker run --net host` would.
+//! queries egress through the existing host-socket passthrough (the
+//! `dispatch::net` syscall handlers), exactly as `docker run --net host` would.
 //!
 //! The config is snapshotted once at guest setup (like Docker, which writes the
 //! container's resolv.conf at create time); a host DNS change mid-run is not

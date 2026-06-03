@@ -1,7 +1,76 @@
-//! High-level orchestration layer for Carrick run requests.
+//! Container orchestration: lowering a docker-style run request into a
+//! [`carrick_spec::RunSpec`] the runtime can execute.
 //!
-//! The engine bridges CLI-facing run specs to image resolution, rootfs
-//! composition, filesystem backend selection, and runtime execution.
+//! # Theory of operation
+//!
+//! Three crates sit between the CLI and the HVF runtime, each owning one
+//! transform. `carrick-image` answers *what bytes make up this image*
+//! (ordered layer blobs + the OCI config). `carrick-runtime` answers *how do I
+//! run this exact process* (it consumes a fully resolved [`RunSpec`] and knows
+//! nothing about images, registries, or docker flags). This crate is the seam
+//! between them: it takes a [`CliRunRequest`] — the loosely-typed, docker-CLI-
+//! shaped bundle of flags and overrides the user typed — resolves the image,
+//! and *merges* the two into a single, fully-specified `RunSpec`. The runtime
+//! never sees a `CliRunRequest`; the CLI never builds a `RunSpec`. All
+//! docker-compatibility merge semantics — the rules for which of image-config
+//! vs. command-line wins — live in exactly one place: [`resolve_run_spec`].
+//!
+//! ## The merge is the whole job, and order matters
+//!
+//! [`resolve_run_spec`] is a deterministic, side-effect-light function (its only
+//! reads of ambient state are `std::env` for bare-`-e KEY` import and the APFS
+//! case-sensitivity probe). It reproduces docker's precedence rules:
+//!
+//! * **argv** = effective entrypoint ++ effective command. `--entrypoint`
+//!   overrides the image `Entrypoint` (and `--entrypoint ""`, lowered by the CLI
+//!   to `Some(vec![])`, *clears* it); positional `args` override the image
+//!   `Cmd`. An empty result is an error — there is nothing to exec. This is the
+//!   subtle docker rule that a cmd override does *not* clear the entrypoint, so
+//!   `run img /bin/ls` against an `ENTRYPOINT ["/bin/sh"]` image execs
+//!   `/bin/sh /bin/ls`, not `/bin/ls`.
+//! * **env** is layered lowest-to-highest: image `Env`, then carrick's baseline
+//!   defaults (`PATH`, `HOME`, `TERM`, `LANG`/`LC_ALL`, `DEBIAN_FRONTEND`,
+//!   `PAGER`) added only where the image left a key *unset*, then `--env`
+//!   overrides last-wins. A bare `-e KEY` (no `=`) imports `KEY` from the *host*
+//!   environment and contributes nothing if the host has it unset — matching
+//!   docker's `-e KEY` / env-file passthrough. The result is sorted for a
+//!   stable, reproducible `envp`.
+//! * **cwd** = `--workdir`, else image `WorkingDir`, else `/`.
+//! * **user** = `--user`, else image `User`. Only *numeric* `uid[:gid]` is
+//!   honored; a user/group **name** would require reading the in-image
+//!   `/etc/passwd` (which this layer cannot do — the rootfs is not mounted yet),
+//!   so a name resolves to root with a warning rather than a silent
+//!   mis-mapping. `gid` defaults to `0` when only a uid is given, per docker.
+//!
+//! ## Filesystem backend: explicit, else probed
+//!
+//! The runtime can back the guest rootfs either in host memory or on the host's
+//! APFS via cap-std. The host backend requires a **case-sensitive** volume
+//! (Linux rootfs paths collide otherwise), so when `--fs` is not given,
+//! [`resolve_run_spec`] probes the preferred scratch root for case sensitivity
+//! and picks [`FsBackendKind::Host`] only if the probe passes, falling back to
+//! [`FsBackendKind::Memory`]. This is the one place the function touches the
+//! filesystem.
+//!
+//! ## Platform and the image read-through
+//!
+//! [`request_platform`] canonicalises `--platform` (or the host default,
+//! arm64) into a [`Platform`]. [`Engine::run`] maps that to a
+//! [`carrick_image::PlatformTarget`] and calls `resolve_with_platform`, so an
+//! amd64 (Rosetta) run pulls and caches the amd64 manifest without disturbing
+//! the native arm64 cache (see the `carrick-image` BTS), then hands the merged
+//! spec to [`carrick_runtime::Runtime::execute`].
+//!
+//! ## What this layer does *not* own
+//!
+//! Several `CliRunRequest` fields are carried but not consumed here. `rm`,
+//! `name`, `stop_signal`, and `stop_timeout` are container-lifecycle concerns
+//! resolved and persisted by the CLI/registry at create time, not run-merge
+//! inputs — they are part of the request shape for a single source of truth, but
+//! [`resolve_run_spec`] ignores them. `interactive`/`tty`/`pid`/`mounts` flow
+//! straight through into the `RunSpec` unchanged. Keeping the merge function
+//! pure of lifecycle bookkeeping is what makes it exhaustively unit-testable
+//! (see the `tests` module: argv/env/workdir/user precedence are pinned there).
 
 use camino::Utf8PathBuf;
 use std::collections::HashMap;

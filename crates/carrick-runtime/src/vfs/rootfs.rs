@@ -1,21 +1,42 @@
-//! `/` mount: the OCI rootfs (immutable, read-only) plus a writable
-//! overlay (`FsBackend`) on top.
+//! The `/` mount: the OCI rootfs (immutable) plus a writable overlay.
 //!
-//! This is the deepest of the four migration steps because the
-//! dispatcher's existing fs syscalls (openat, stat, statx, unlinkat,
-//! mkdirat, renameat2, symlinkat, linkat, readlinkat, fchmodat,
-//! utimensat...) all touch the overlay+rootfs pair. Step 4 lands
-//! `RootFsVfs` as the canonical owner of that state and provides the
-//! full `Vfs` trait surface; routing every dispatcher fs syscall
-//! through the trait is the mechanical follow-up.
+//! # Theory of operation
 //!
-//! For now the dispatcher reaches into `self.rootfs_vfs.rootfs` and
-//! `self.rootfs_vfs.overlay` directly (preserving every existing
-//! lookup path). `RootFsVfs::open` etc. are exercised by their own
-//! unit tests, where they consult exactly the same overlay+rootfs
-//! data the dispatcher uses, so when the dispatcher does flip
-//! through the trait the result is byte-identical to what it
-//! produced via direct access.
+//! [`RootFsVfs`] is the home of the root filesystem, and it is the one mount
+//! that is *not* registered in [`crate::vfs::VfsMounts`]. It is a sibling field
+//! on the dispatcher (`fs.rootfs_vfs`) and serves every path the mount table
+//! declines — i.e. everything outside `/proc`, `/sys`, `/dev`, the bind mounts,
+//! and the synthetic single-file mounts. It is the *fallback* of the routing
+//! layer described in [`crate::vfs`].
+//!
+//! Structurally it is a two-layer stack, mirroring an overlayfs:
+//!
+//! * **`rootfs`** — the immutable lower layer: the merged OCI image
+//!   ([`crate::rootfs::RootFs`]), read-only. Reads of unmodified image files
+//!   come from here.
+//! * **`overlay`** — the writable upper layer, a [`crate::fs_backend::FsBackend`]
+//!   trait object. Two implementations exist: an in-memory `MemoryBackend`
+//!   (`--fs memory`) and a host-disk backend (`--fs host`, where the merged
+//!   rootfs is materialised onto a real cap-std scratch and the overlay *is*
+//!   that scratch). A guest write to an image file copies it up into the
+//!   overlay; subsequent reads see the overlay copy; whiteouts in the overlay
+//!   hide lower-layer entries — standard copy-up / whiteout overlay semantics.
+//!
+//! ## Why the dispatcher reaches into the fields directly
+//!
+//! Every fs syscall (`openat`, `stat`/`statx`, `unlinkat`, `mkdirat`,
+//! `renameat2`, `symlinkat`, `linkat`, `readlinkat`, `fchmodat`, `utimensat`, …)
+//! touches the overlay+rootfs pair, and on the hot path the dispatcher accesses
+//! `rootfs_vfs.rootfs` and `rootfs_vfs.overlay` directly (and through the
+//! richer [`RootFsVfs::open_for_dispatch`], which returns the rootfs-shaped
+//! [`OpenDispatchResult`] the dispatcher's `OpenDescription` variants consume —
+//! including a real host fd for `--fs host` regular files so reads/writes
+//! survive `libc::fork`). `RootFsVfs` *also* implements the [`Vfs`] trait, and
+//! those trait methods consult exactly the same `overlay`+`rootfs` state, so
+//! the two access paths are byte-identical. The direct-field access is a
+//! deliberate performance and incrementality choice for the busiest mount, not
+//! a correctness fork; the public fields and `open_for_dispatch` are the
+//! contract the dispatcher relies on.
 
 use crate::fs_backend::{FsBackend, MemoryBackend, OverlayEntry};
 use crate::linux_abi::{

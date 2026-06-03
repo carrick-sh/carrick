@@ -205,7 +205,7 @@ impl SyscallDispatcher {
         }
     }
 
-    /// The [`InotifyState`] behind `fd` iff it is an inotify instance.
+    /// The [`InotifyState`](crate::inotify::InotifyState) behind `fd` iff it is an inotify instance.
     pub(in crate::dispatch) fn inotify_state(
         &self,
         fd: i32,

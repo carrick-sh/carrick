@@ -1,8 +1,46 @@
-//! Stop-the-world barrier for forking a multithreaded guest. The forking
-//! thread quiesces every other guest vCPU thread at the lock-safe run-loop top
-//! before `libc::fork`, so the child inherits no carrick lock held by a thread
-//! that won't exist in the child. See
-//! docs/archive/superpowers/specs/2026-05-24-multithreaded-fork-design.md.
+//! Stop-the-world barriers for mutating shared guest/VM state while sibling
+//! vCPU threads run.
+//!
+//! THEORY OF OPERATION
+//!
+//! `fork(2)` and guest page-table edits share one hard problem: a single host
+//! thread must mutate state that every other guest vCPU thread can observe, and
+//! POSIX `fork` only carries the calling thread into the child. This module
+//! provides two distinct Pause-Modify-Resume barriers for the two cases. The
+//! shared mechanic: the acting thread raises a `quiescing` flag, every OTHER
+//! thread checks it at a LOCK-SAFE point at the top of its run loop and parks,
+//! the acting thread waits until the others have parked (or left guest), does
+//! its mutation, then lowers the flag and releases them. Blocking waits
+//! ([`crate::thread`] futex, [`crate::io_wait`]) OR [`is_quiescing`] into their
+//! wake predicate so a parked thread returns (a spurious EINTR) and reaches the
+//! run-loop-top barrier rather than re-parking and missing the quiesce.
+//!
+//! The two barriers differ in WHAT they do to siblings:
+//!
+//!   * [`QuiesceBarrier`] (fork): the child must inherit NO carrick lock held by
+//!     a thread that won't exist in it, and NO HVF VM topology mid-mutation. So
+//!     siblings fully quiesce (release their vCPUs) before `libc::fork`, and the
+//!     VM is torn down and rebuilt around the fork. The count it waits on comes
+//!     from the [`crate::vcpu_kick`] kicker's LIVE-vCPU count, NOT the thread
+//!     registry: a thread that has a tid but hasn't built its vCPU yet must not
+//!     be awaited (it would never reach the barrier). `try_begin_fork`
+//!     serializes forks via a CAS flag (not a held guard) so the flag survives
+//!     `libc::fork` cleanly and the child clears it. [`topology_lock`] separately
+//!     serializes a sibling building its vCPU against a fork destroying the VM,
+//!     so a vCPU is never created in the `hv_vm_destroy` window (which would be
+//!     HV_BUSY) — and a being-born thread holding it is NOT yet kicker-registered,
+//!     so the fork's quiesce never waits on it: no deadlock.
+//!
+//!   * [`PtQuiesce`] (page-table edits): carrick edits the guest's stage-1 tables
+//!     from the HOST while sibling vCPUs run (`mprotect`/`PROT_NONE`/`munmap`); a
+//!     sibling walking a block mid-structural-change can fault. Here siblings
+//!     KEEP their vCPUs and merely park out-of-guest. The editor waits until no
+//!     sibling is in-guest — tracked by the kicker's per-vCPU `in_guest` flags,
+//!     not a count — then edits, then resumes. [`PtQuiesce::pause_guard`] mints an
+//!     RAII guard so the resume fires on every exit path of the editing syscall,
+//!     including `?`-propagated errors.
+//!
+//! See docs/archive/superpowers/specs/2026-05-24-multithreaded-fork-design.md.
 // INVARIANT: every `.unwrap()` in this module is on a std::sync Mutex/Condvar
 // guard. `lock()`/`wait()` only return `Err` on poisoning — a thread panicking
 // while holding the guard — which cannot occur in this no-panic codebase. The

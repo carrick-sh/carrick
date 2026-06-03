@@ -1,5 +1,39 @@
 //! USDT probe definitions and safe wrapper functions for Carrick runtime
 //! observability.
+//!
+//! THEORY OF OPERATION
+//!
+//! These are the static DTrace USDT probes the `carrick trace` tracer (and any
+//! ad-hoc D script) hangs off. The guiding principle is ZERO PERTURBATION when
+//! no consumer is attached: every wrapper here calls a `usdt`-generated probe
+//! that is gated on `is_enabled` at the call site, so a probe with no listening
+//! D script costs a single predicted-not-taken branch. That is why debugging
+//! carrick is supposed to go through these probes rather than `eprintln!`, which
+//! both perturbs timing (and so hides Heisenbugs) and pays its cost
+//! unconditionally.
+//!
+//! Two encoding conventions, chosen per-probe by how hot it is:
+//!
+//!   * RAW POINTER (hot path). A probe that fires on EVERY syscall or trap —
+//!     `syscall__entry`, `vcpu__trap`, `unhandled__syscall` — passes the ADDRESS
+//!     of a `#[repr(C)]` struct ([`crate::compat::SyscallArgs`] /
+//!     [`crate::compat::GuestRegs`]) as a `u64`. The D script does
+//!     `copyin(addr, sizeof)` and reads fields by offset as native `u64`s. This
+//!     avoids building a string on every fire (what made an earlier JSON-encoding
+//!     `carrick trace` slow — the cost was ours, not DTrace's) and, unlike
+//!     `json()`+`strtoll` in D, round-trips a full unsigned 64-bit value exactly.
+//!     The matching struct layouts in the `.d` scripts mirror these `repr(C)`
+//!     definitions field-for-field, so field ORDER is load-bearing.
+//!
+//!   * SCALARS (cold path). A probe that fires only on a rare event —
+//!     `vcpu__fault`, `fork__quiesce`, `lifecycle`, the page-table probes —
+//!     passes its diagnostics as plain scalar args captured at fire time. This is
+//!     more robust when the event is fatal (a fault that kills the process
+//!     immediately would outrun a `copyin`-a-pointer action) and the per-fire
+//!     cost is irrelevant because the probe is off the happy path.
+//!
+//! The `usdt` provider caps a probe at 6 args, which is why composite payloads
+//! ride as a pointer-to-struct rather than expanding into argument lists.
 
 use crate::compat::{CompatEvent, SyscallArgs};
 

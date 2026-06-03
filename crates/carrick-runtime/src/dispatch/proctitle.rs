@@ -13,7 +13,7 @@
 //! If we `strdup` every `environ[i]` onto the heap and repoint `*_NSGetEnviron`
 //! at the heap copy, the original env strings on the stack become free real
 //! estate we can write the process title into — extending the writable
-//! window from `strlen(argv[0])` to (end of last env string) − (start of argv[0]).
+//! window from `strlen(argv[0])` to (end of last env string) − (start of `argv[0]`).
 //!
 //! We deliberately do **not** touch CoreFoundation / LaunchServices: Carrick
 //! runs guests by forking *without* exec, and CF/LS are not fork-safe — a
@@ -170,7 +170,7 @@ unsafe fn write_label_argv0_only(bytes: &[u8]) {
 /// - `len` is the byte count from `argv[0]` through the last byte (including
 ///   trailing NUL) of the last environment string.
 /// - All bytes in `[start, start + len)` are private process memory we now
-///   own — argv[1..] / argv[argc] / environ[*] strings live there and will
+///   own — `argv[1..]` / `argv[argc]` / `environ[*]` strings live there and will
 ///   be clobbered by the first title write; nothing in carrick reads them
 ///   after init.
 #[cfg(target_os = "macos")]

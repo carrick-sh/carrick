@@ -54,6 +54,14 @@ Start here, then follow the map:
 | [docs/conformance-coverage.md](docs/conformance-coverage.md) | The active probe-gate coverage map — which carrick-owned invariant each probe pins down. |
 | [docs/archive/](docs/archive/) | Historical session handoffs, code reviews, and superseded design/spec notes, kept out of the active tree. |
 
+For the per-crate and per-subsystem **Big Theory Statements** (the theory-of-operation `rustdoc`), build the API docs:
+
+```sh
+cargo doc --workspace --no-deps --document-private-items --open
+```
+
+`--document-private-items` is intentional — carrick is an internal workspace, so most of its substance (and most of its theory statements) live on private items. A CI gate keeps this rustdoc warning-free.
+
 ---
 
 ## Build Workflows

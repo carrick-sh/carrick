@@ -1,8 +1,86 @@
-//! `carrick run -d` (detached) and the container lifecycle subcommands
-//! (`ps`, `stop`, `kill`, `rm`). Daemonless: a detached container is its own
-//! process tree under a per-container NsSupervisor; these subcommands are pure
-//! reads/signals over the on-disk registry in `carrick_runtime::container`.
-//! There is no `carrickd`.
+//! `carrick run -d` (detached) plus the full container lifecycle surface
+//! (`create`, `start`, `restart`, `stop`, `kill`, `rm`, `ps`, `inspect`,
+//! `logs`, `wait`, `exec`).
+//!
+//! # Theory of operation: daemonless containers
+//!
+//! There is no `carrickd`. Docker keeps a long-lived daemon that owns every
+//! container's process and state; carrick has nothing of the kind. The model
+//! here is podman-style: **a detached container is its own process tree, and the
+//! source of truth is the on-disk registry**, not a running service. All the
+//! "control-plane" subcommands in this module are therefore pure reads and
+//! signals against that registry — they never talk to a daemon because there
+//! isn't one.
+//!
+//! The registry lives in `carrick_runtime::container`: a directory per
+//! container holding a serialized [`ContainerState`] (id, name, image, command,
+//! status, supervisor/init pids, exit code, and the full [`RunConfig`] needed to
+//! relaunch) and an `output.log`. The key consequence is that a container's
+//! *liveness* is not a field we trust blindly — a supervisor can die without
+//! updating its entry — so reads go through `container::reconciled_status`,
+//! which cross-checks the recorded init pid against the live host process table.
+//!
+//! ## The detach handshake (`run -d`, shared with `start`)
+//!
+//! `run -d` is a bare `fork(2)`, done here in the CLI while it is still
+//! single-threaded (no tokio runtime is live — `block_on_oci` builds and drops
+//! its own per-call runtime; see [`crate::runtime_util`]). The PARENT writes a
+//! `Created` registry entry, prints the container id, and returns, freeing the
+//! user's shell. The CHILD becomes the container's lifetime:
+//! `setsid()` → redirect stdio (stdin←`/dev/null`, stdout/stderr→`output.log`,
+//! so `carrick logs` can replay it) → export `CARRICK_CONTAINER_ID` → run the
+//! engine, which forks the real `NsSupervisor` + guest-init, records the live
+//! pids (status → `Running`), blocks until exit, and marks the entry `Exited`
+//! (or removes it for `--rm`). `run_supervised_child` is the shared post-fork
+//! body; `start`/`restart` reuse it, additionally setting `CARRICK_EXEC_OVERLAY`
+//! to re-attach an already-extracted rootfs overlay instead of re-extracting.
+//!
+//! Image resolution is deliberately done in the FOREGROUND before forking
+//! (`resolve_request_image`), so a pull error reaches the user's terminal rather
+//! than vanishing into the detached log, and so the effective `STOPSIGNAL` is
+//! baked into the persisted config before the child exists.
+//!
+//! ## Relaunch over a persisted config
+//!
+//! `create`/`start`/`restart` reconstruct a [`carrick_engine::CliRunRequest`]
+//! from the stored [`RunConfig`] via `rebuild_request_from_state`. The subtlety
+//! captured there: the command is persisted *split* (state.command = the cmd
+//! args, config.entrypoint = the override) so the engine re-merges
+//! entrypoint+cmd on relaunch rather than double-applying the image's
+//! entrypoint. `reset_for_relaunch` clears volatile state (status/pids and the
+//! stale `exit_code` and `region_path`) while preserving the overlay path and
+//! the stop config. A relaunch forks a *fresh* supervisor + region over the
+//! *same* overlay, which is why the stale region file is unlinked first (a
+//! reused region keeps dead members).
+//!
+//! ## `exec`: join, don't fork a supervisor
+//!
+//! `exec` is the one lifecycle command that does NOT fork a supervisor — the
+//! target container already has one. It runs the command in *this* process,
+//! pointing the runtime at the container's existing overlay
+//! (`CARRICK_EXEC_OVERLAY`) and pid region (`CARRICK_JOIN_REGION`) so the
+//! command shares the container's filesystem and PID namespace. This requires a
+//! container started with `--fs host` (a memory overlay isn't joinable) and,
+//! for namespace sharing, `--pid private` (host-pid containers have no region
+//! to join).
+//!
+//! ## Signals are HOST signals
+//!
+//! `stop`/`kill`/`rm` deliver signals with host `kill(2)` against the recorded
+//! init pid, so `parse_signal` resolves names to the *host* (macOS) numbering,
+//! not the guest Linux ABI — `SIGUSR1` is 10 on macOS but 30 on Linux, and we
+//! are signalling a host process. `stop` honours the configured stop signal and
+//! grace window (flag > image `STOPSIGNAL`/`--stop-timeout` > `SIGTERM`/10s),
+//! polling for exit on a 100 ms cadence before escalating to SIGKILL. Liveness
+//! polling everywhere is best-effort sleeping because macOS has no inotify on
+//! the registry and no daemon to push events.
+//!
+//! The remaining helpers reproduce docker's *presentation* — `ps`/`inspect`
+//! column layouts and JSON schema, the minimal Go-`text/template` subset in
+//! `render_format` (`{{.State.ExitCode}}`, `{{json .}}`), `docker logs --tail N`
+//! line counting in `select_tail`, and the `adjective_surname` name generator —
+//! so existing docker tooling and the conformance harness consume carrick's
+//! output unmodified.
 
 use std::io::Write;
 use std::time::{SystemTime, UNIX_EPOCH};

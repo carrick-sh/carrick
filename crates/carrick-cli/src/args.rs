@@ -1,4 +1,34 @@
-//! Command-line argument model.
+//! The clap command model — the docker-compatible surface plus the diagnostic
+//! verbs.
+//!
+//! # Theory of operation
+//!
+//! This is the declarative spec of *what* `carrick` accepts; [`crate::commands`]
+//! is *how* each one acts. The flag names, value shapes, and help text are
+//! chosen for parity with the docker CLI (`-e`/`--env`, `-v`/`--volume`,
+//! `--mount`, `-p`/`--publish`, `--entrypoint`, `--rm`, `--stop-signal`,
+//! `--pid`, `--format`, …) so docker tooling and the bollard conformance harness
+//! drive carrick unchanged. Where a flag has no faithful meaning under carrick's
+//! host-only networking / no-daemon model it is still *accepted* and documented
+//! as a no-op or a hard error (see `-p` in [`crate::runtime_util`]).
+//!
+//! A few argument conventions are load-bearing and easy to miss:
+//!
+//! - **`--forward-env KEY=VAL`** appears on `run`/`run-elf`/`trace` to carry
+//!   `CARRICK_*` tunables across a `sudo` re-exec. CLI args survive `sudo`'s
+//!   `env_reset` where bare env vars don't (and without needing `SETENV` in
+//!   sudoers); the receiving command applies them with `set_var` before the
+//!   guest starts.
+//! - **`__trace-child` and the `--trace-uid/-gid/-groups` flags** are `hide`den
+//!   internal plumbing for the trace privilege split (see [`crate::trace_cli`]),
+//!   never typed by a user.
+//! - **`--raw` vs `--json` on `run`** select the output envelope: `--raw` is now
+//!   a no-op alias for the default docker-shaped streaming output, `--json` opts
+//!   back into the legacy compat-report envelope.
+//! - The **diagnostic/ELF-fixture verbs** (`run-elf`, `dispatch-syscall`,
+//!   `inspect-elf`, `plan-elf-load`, `load-elf`, `rootfs`, `syscalls`,
+//!   `trap-capabilities`, `debug`, `volume`) have no docker analogue; they exist
+//!   for conformance fixtures and operator debugging.
 
 use std::path::PathBuf;
 

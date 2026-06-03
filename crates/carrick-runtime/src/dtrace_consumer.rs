@@ -1,11 +1,71 @@
-//! In-process libdtrace consumer.
+//! In-process libdtrace consumer — the engine behind `carrick trace`.
 //!
-//! Spawns a child carrick process under DTrace control, compiles the
-//! bundled D program, and lets dtrace_consume / dtrace_aggregate_print
-//! emit per-event lines and frequency-sorted aggregations directly to
-//! the caller's stdout.
+//! # Theory of operation
 //!
-//! The carrick parent must run as root (libdtrace opens /dev/dtrace).
+//! `dtrace(1)` the command-line tool is itself just a thin client of
+//! `libdtrace`: it opens a handle, compiles a D program, spawns/grabs a victim
+//! process, and pumps a consume loop. carrick links `libdtrace` directly and
+//! *is* that client, in-process. The motivation is fidelity over a subprocess:
+//! carrick needs to follow a guest across `fork`/`clone` into real macOS child
+//! processes (and sibling vCPU threads) that re-register their USDT probes, drop
+//! to the invoking user's credentials, and outlive their parent — control that
+//! is awkward-to-impossible to drive through a separate `dtrace(1)` you only talk
+//! to over a pipe. Owning the handle means carrick controls the exact spawn
+//! (`dtrace_proc_create` + `dtrace_proc_continue`), the buffer/aggregation
+//! options, the output sink, and the stop condition.
+//!
+//! ## The flow
+//!
+//! 1. `dtrace_open` a handle (requires root: libdtrace opens `/dev/dtrace`; a
+//!    non-root carrick parent cannot trace at all).
+//! 2. `dtrace_proc_create` spawns the victim — another `carrick` invocation (the
+//!    `child_path`/`child_argv`) — *suspended*, so its probes can be armed before
+//!    it runs a single instruction.
+//! 3. Compile the D program (the bundled syscall tracer, the guest stack-walker,
+//!    or a caller-supplied `-s` script), `dtrace_program_exec` to install it,
+//!    `dtrace_go` to enable the probes, then `dtrace_proc_continue` to release
+//!    the suspended child.
+//! 4. Pump: `dtrace_sleep` (wait for the aggregation/status rate), `dtrace_work`
+//!    (drain fired probes), `fflush`, repeat — until the stop condition.
+//!
+//! ## The chew/chewrec callback contract (a real bug, encoded here)
+//!
+//! `dtrace_work` takes a *probe* callback and a *record* callback. The crucial,
+//! non-obvious part: a callback returning `DTRACE_CONSUME_THIS` tells libdtrace
+//! to do the `printf`/`printa` formatting of that record to the `FILE*` itself —
+//! exactly as `dtrace(1)`'s `chew`/`chewrec` do. Passing NULL callbacks instead
+//! makes libdtrace skip *all* formatting, which is why an earlier version's live
+//! stream was silent. So `chew`/`chewrec` are deliberately near-trivial:
+//! they exist to return `CONSUME_THIS` (and, in `chewrec`, `CONSUME_NEXT` on the
+//! NULL record that marks a probe's end) so libdtrace prints. The D program's own
+//! `printf`/`printa`/`@agg` statements are what actually produce the output.
+//!
+//! ## Output sink + the sudo ownership trap
+//!
+//! Output defaults to the parent's `stdout` (`STDOUT_FP`, macOS's
+//! `__stdoutp`). `--trace-out` redirects it to a file so trace lines never
+//! intermix with an interactive (`-t`) guest's own stdio. Because the libdtrace
+//! parent runs as root but the human invoked `carrick trace` under `sudo`, a
+//! freshly-`fopen`'d trace file lands `root:wheel`; `TraceOutput::open`
+//! `fchown`s it back to the invoking `(uid, gid)` so the user can read/`rm` it
+//! without sudo (the file is 0644 regardless, so reads never needed sudo — the
+//! historical "`--trace-out` writes nothing" was a `sudo cat` perm artifact, not
+//! a write bug). Every pump cycle `fflush`es: `dtrace_work` writes into a
+//! block-buffered C stdio buffer when the sink is a pipe/file, so an unflushed
+//! stream looks dead precisely when you are watching a *hang* — the case the
+//! tracer exists to diagnose.
+//!
+//! ## Stop condition: linger-past-child
+//!
+//! With the bundled default tracer (no `-s`) we stop the instant the directly
+//! spawned child is gone, so a plain `carrick trace -- run …` returns promptly.
+//! With a caller-supplied script (`opts.script.is_some()`) we *linger*: the user
+//! is responsible for bounding their own program (the carrick-trace skill
+//! mandates a `tick-Ns { exit(0) }`), and we keep draining so that (a) a guest
+//! that forked real macOS children/sibling-vCPU threads is still traced after the
+//! first process exits, and (b) a fast-crashing guest still flushes its buffered
+//! events and the final `END` aggregation. The outer `timeout` the CLI wraps
+//! every run in is the backstop.
 
 #![cfg(target_os = "macos")]
 

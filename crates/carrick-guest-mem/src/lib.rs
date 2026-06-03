@@ -1,12 +1,68 @@
 //! Foundational guest-memory hub types shared across carrick.
 //!
-//! These three types were the cause of the `memory ↔ dispatch` dependency cycle
-//! that forced `carrick-runtime` to stay monolithic: `GuestMemory`/`MemoryError`
-//! were defined in `dispatch/mod.rs` yet `memory.rs` depended on them, while
-//! `dispatch` depends back on `memory`. Lifting them into this leaf crate breaks
-//! that cycle (docs/build-decomposition-design.md §3.A-A2) so `memory`/`dispatch`
-//! can later become independent crates. They are self-contained: only primitives,
-//! `serde::Serialize`, and `thiserror::Error`.
+//! THEORY OF OPERATION
+//!
+//! Every carrick syscall handler reads its arguments from, and writes its
+//! results back into, *guest* memory — the AArch64 Linux process's address
+//! space — and it does so through one narrow trait, [`GuestMemory`]. This crate
+//! owns that trait, the syscall-argument register frame ([`Aarch64SyscallFrame`])
+//! the trap engine hands the dispatcher, and the [`MemoryError`] those accesses
+//! fail with. Nothing else. It is the seam between "how the bytes are stored"
+//! and "what the syscall does with them".
+//!
+//! The single most important design fact here is that [`GuestMemory`] is
+//! polymorphic over TWO backends that look nothing alike:
+//!
+//!  - the real HVF-backed address space, where guest memory is a host `mmap`
+//!    region published into the VM via `hv_vm_map`, protections live in EL1
+//!    stage-1 page-table descriptors, and a bad guest pointer must surface as a
+//!    real fault; and
+//!  - an in-memory `LinearMemory` used by unit tests, which is a flat byte
+//!    buffer modelling NO protections, NO page tables, and NO host mapping.
+//!
+//! Keeping both behind one trait is what lets the ~hundreds of syscall handlers
+//! be exercised by fast, hermetic unit tests (no hypervisor, no guest binary)
+//! while running unmodified against the live VM. The trait is therefore written
+//! so the *default* method bodies are the correct behaviour for the modelless
+//! test backend, and the HVF backend OVERRIDES the methods that need real
+//! page-table or host-mapping machinery. A handler that only ever calls
+//! `read_bytes`/`write_bytes` is automatically testable; a handler that needs
+//! protection or unmap semantics gets a faithful default (usually a no-op that
+//! the test backend can't observe) and the real thing under HVF.
+//!
+//! INVARIANTS THE TRAIT ENCODES (read the per-method docs for the full story):
+//!
+//!  - `read_bytes`/`write_bytes` are the PERMISSION-CHECKED path: they honour
+//!    the guest-visible protection so that a guest handing a syscall a
+//!    `PROT_NONE` buffer gets EFAULT, exactly as Linux would. `zero_backing` is
+//!    the deliberate BYPASS — it scrubs the physical backing of a region the
+//!    guest can't currently write (a `munmap`'d or `PROT_NONE` page) so stale
+//!    bytes from a prior mapping never resurface after a later `mprotect`.
+//!  - `set_no_access` vs `protect_range`/`unmap_range` is a two-level model: the
+//!    former makes only the HOST-SIDE syscall-read path fault (cheap, no page
+//!    tables); the latter edits the real stage-1 descriptors so the GUEST faults
+//!    mid-EL0-execution. The test backend, having no tables, implements only the
+//!    former and no-ops the latter.
+//!  - `shared_futex_host_addr` is the hook that turns a guest `MAP_SHARED` futex
+//!    into a cross-PROCESS rendezvous: it yields a stable host VA only for the
+//!    shared aperture (the same physical page in every forked carrick process),
+//!    which `crate::ulock` keys an `os_sync_wait_on_address` SHARED wait on.
+//!    Private/anon memory returns `None` and stays in the in-process parking-lot
+//!    table. This is the one trait method whose return value crosses the
+//!    process boundary.
+//!
+//! WHY THIS IS ITS OWN LEAF CRATE
+//!
+//! These three types caused the `memory ↔ dispatch` dependency cycle that forced
+//! `carrick-runtime` to stay one monolithic ~41k-line crate: `GuestMemory` and
+//! `MemoryError` were defined in `dispatch/mod.rs`, yet `memory.rs` depended on
+//! them, while `dispatch` depends back on `memory`. Lifting the hub types here
+//! cuts the cycle (docs/build-decomposition-design.md §3.A-A2) so `memory` and
+//! `dispatch` can later become independent crates and editing a syscall handler
+//! no longer recompiles the address-space code (and vice versa). The crate is
+//! kept deliberately tiny and dependency-light — only primitives,
+//! `serde::Serialize`, and `thiserror::Error` — precisely so it sits at the
+//! bottom of the build graph and almost never has to be rebuilt.
 
 use serde::Serialize;
 use thiserror::Error;

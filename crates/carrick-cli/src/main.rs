@@ -1,7 +1,89 @@
-//! Carrick command-line interface.
+//! Carrick command-line interface — the `carrick` binary.
 //!
-//! This binary wires image pulling, rootfs setup, ELF execution, tracing,
-//! compatibility reports, and APFS volume management onto the runtime crates.
+//! # Theory of operation
+//!
+//! This crate is the *front-end*: a thin, presentation-only shell over the
+//! four substantive crates. It owns no emulation logic and no kernel ABI. Its
+//! whole job is to (1) parse a docker-shaped command line, (2) marshal it into
+//! the request types the lower crates already understand, and (3) translate the
+//! result back into the output a docker user expects (streamed stdio + the
+//! container's exit code, or a JSON envelope on demand). Everything below the
+//! request boundary — image pull, rootfs composition, ELF load, the HVF trap
+//! loop, syscall translation — lives in `carrick-engine` / `carrick-image` /
+//! `carrick-runtime`, and this crate deliberately does not reimplement any of
+//! it.
+//!
+//! The crate dependency graph encodes that division of labour:
+//!
+//! ```text
+//!   carrick-cli  ──▶  carrick-engine  ──▶  carrick-image   (pull / store / OCI)
+//!        │                  │         ──▶  carrick-runtime (Runtime::execute → HVF)
+//!        │                  └──────────────────────────────  resolve_run_spec
+//!        ├──▶  carrick-runtime  (container registry, dtrace consumer, apfs, vfs…)
+//!        └──▶  carrick-spec     (FsBackendKind, PidMode, Mount — shared request types)
+//! ```
+//!
+//! For a docker `run`, the CLI builds a [`carrick_engine::CliRunRequest`] and
+//! hands it to `Engine::run`, which resolves+pulls the image, merges
+//! entrypoint+cmd+env into a `RunSpec`, and calls `Runtime::execute` — the entry
+//! to the actual HVF guest. The CLI never touches the manifest, the rootfs tar,
+//! or the vCPU; it only chooses the output shape and the process exit code. The
+//! one place the CLI *does* reach below the engine is `run-elf` (and its
+//! `dispatch-syscall` sibling), which loads a host ELF directly through
+//! `carrick-runtime` for unit-test / conformance fixtures with no OCI image at
+//! all (see [`commands`]).
+//!
+//! ## Surface map
+//!
+//! - **Container surface** (docker-compatible): `run`, `create`, `start`,
+//!   `restart`, `stop`, `kill`, `rm`, `ps`, `inspect`, `logs`, `wait`, `exec`,
+//!   `shell`. Plus the image/registry verbs `pull`, `images`, `rmi`, `prune`,
+//!   `tag`, `login`, `logout`, `system`. These aim for byte-shaped parity with
+//!   the docker CLI (column layouts, `--format` Go-templates, exit codes 125/
+//!   126/127, `STOPSIGNAL` semantics) so existing tooling and the bollard-driven
+//!   conformance harness drive carrick unchanged. The lifecycle commands are
+//!   *daemonless*: see [`lifecycle`].
+//! - **Diagnostic surface** (carrick-specific, no docker analogue): `trace`
+//!   (in-process DTrace, auto-sudo — see [`trace_cli`] and [`commands`]),
+//!   `debug` (ESR decode, lldb-plugin path, debug-state inspect — see
+//!   [`debug`]), `syscalls` / `trap-capabilities` / `compat-report`
+//!   (introspection of the emulation tables), `inspect-elf` / `plan-elf-load` /
+//!   `load-elf` / `run-elf` / `dispatch-syscall` (ELF + syscall fixtures), and
+//!   `volume` (the APFS scratch subvolume — see [`args`]).
+//!
+//! ## The no-`#[tokio::main]` invariant
+//!
+//! The single most load-bearing decision in this crate is that `main` is a
+//! plain synchronous function. A guest `clone(2)`/`fork(2)` is serviced by a
+//! host `fork(2)` *inside a syscall handler*, deep under the trap loop. A
+//! multi-thread tokio runtime initialised before that point would poison every
+//! forked child: the worker threads don't exist post-fork, the I/O driver's
+//! kqueue fd state is stale, and the child panics on the first stdio flush. So
+//! all async work (image pulls, registry auth, summary reads) is confined to a
+//! short-lived *current-thread* runtime built and dropped per call inside
+//! [`runtime_util::block_on_oci`], guaranteeing no async machinery is alive in
+//! the parent by the time a guest fork can fire. `configure_process_environment`
+//! enforces the rest of the fork-safety contract (SIGPIPE→ignore so a guest
+//! `ls | head` gets EPIPE instead of killing carrick; `OS_ACTIVITY_MODE=disable`
+//! because HVF's internal os_log handle is not fork-safe; proctitle relocation
+//! before any `setenv`).
+//!
+//! ## Process model: one guest == one host process
+//!
+//! Carrick has no in-process VM-per-guest. A guest *process* is a host carrick
+//! process, and a guest `fork` is a real host `fork`. That is why this binary
+//! installs a loud [`install_guest_abort_banner`] panic hook: an unimplemented
+//! syscall in a forked grandchild (apt's http method, dpkg, gpgv) would
+//! otherwise scroll past buried in the guest's own output, leaving the user
+//! with only a downstream "dpkg returned 100". The banner makes the *root*
+//! panic attributed and greppable.
+//!
+//! Module-level theory statements: [`commands`] (dispatch + the run pipeline +
+//! the trace auto-sudo re-exec), [`lifecycle`] (daemonless container
+//! management), [`fs_setup`] (`--fs host|memory` backend selection + guest
+//! baseline seeding), [`trace_cli`] (privilege handoff for DTrace),
+//! [`runtime_util`] (the fork-safe async bridge + docker-format helpers), and
+//! [`debug`] (ESR / lldb tooling).
 
 mod args;
 mod commands;

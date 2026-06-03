@@ -1,26 +1,74 @@
-//! Host-side signal capture for guest delivery.
+//! Host-side signal capture and routing for guest delivery.
 //!
-//! The Carrick host process catches a small set of UNIX signals
-//! (currently just `SIGINT`) and translates them into pending guest
-//! signal numbers that the runtime drains between vCPU iterations.
-//! When the guest has a handler registered for the translated signum,
-//! the runtime synthesises a guest signal frame; otherwise the default
-//! action (terminate with `128 + signum`) is taken.
+//! THEORY OF OPERATION
 //!
-//! The shared state is intentionally minimal:
+//! There is no guest Linux kernel to maintain per-thread pending-signal masks,
+//! so this module is the bookkeeping that stands in for it. A guest signal can
+//! originate three ways, and all three converge on the same "publish a pending
+//! Linux signum, then wake whoever needs to deliver it" model that the runtime's
+//! delivery cycle drains between vCPU iterations:
 //!
-//! * A single `AtomicI32` (`PENDING`) carries the *most recent* host
-//!   signal we observed. `0` means "no signal pending"; any positive
-//!   value is the Linux signum the guest should see.
-//! * `install_default_handlers()` registers our handler once via
-//!   `libc::sigaction`. Re-installation is a no-op so test runners that
-//!   spin up multiple runtime instances inside the same process don't
-//!   stomp on each other.
+//!   1. A real host UNIX signal the Carrick process catches (e.g. host `SIGINT`,
+//!      or a cross-process `kill` from macOS). The async-signal-safe handler
+//!      records the translated Linux signum and pokes a self-pipe.
+//!   2. A guest-issued process-directed signal (`kill(getpid(), sig)`), which
+//!      any thread of the process may deliver.
+//!   3. A guest-issued thread-directed signal (`tgkill`/`tkill`), which targets
+//!      exactly one guest tid.
 //!
-//! We deliberately do NOT serialise signals through the host kernel's
-//! pending mask; the goal of v0 is "Ctrl-C breaks a long-running
-//! command", not "perfectly faithful POSIX signal queueing". One slot
-//! is enough for that.
+//! PENDING STATE. Process-directed signals land in a single `AtomicI32`
+//! (`PENDING`) — set from an async signal handler, so it must stay lock-free.
+//! Thread-directed signals land in `THREAD_PENDING`, a `tid -> u64 BITMASK` map:
+//! a per-tid bitmask, not a single slot, because distinct signals routed to one
+//! thread (libuv's `signal_multiple_loops` sends SIGUSR1 then SIGUSR2) must ALL
+//! survive — a single i32 coalesced them and hung the second's waiters. Standard
+//! signals still coalesce same-signal repeats; RT-signal queue depth lives in
+//! the dispatcher, not here. `THREAD_PENDING` is touched only from normal
+//! dispatch context (a host handler can't name a guest tid), so a plain `Mutex`
+//! is safe there.
+//!
+//! NUMBER TRANSLATION. Linux and macOS disagree on several signal numbers
+//! (SIGUSR1, SIGCHLD, SIGSTOP, SIGURG, …). `SIGNUM_XLATE` is the single source of
+//! truth, applied on the SEND side (`libc::kill` to a host pid), the RECEIVE
+//! side (host handler -> guest pending), and in `wait4` status decoding —
+//! omitting any one of those would, e.g., turn a guest SIGUSR1 (10) into a host
+//! signal 10 (SIGBUS). Signals that share a number translate as identity.
+//!
+//! PROMPT WAKEUP. Publishing a pending signal is useless if the target thread is
+//! asleep. Three wake channels cover the three places a guest thread can be:
+//!
+//!   * The process-wide SELF-PIPE (`PENDING_PIPE`): every blocking-I/O waiter
+//!     (`io_wait`) registers its read end on its kqueue, so a handler-written
+//!     byte wakes parked waiters promptly — no 50 ms poll, no reliance on
+//!     `SA_RESTART`/EINTR (it is a queue event, not a Unix signal).
+//!   * A PER-THREAD wake pipe (`THREAD_WAITERS`) for thread-directed signals, so
+//!     a sibling thread cannot drain the target's wake before the target's
+//!     kqueue observes it.
+//!   * The signal PUMP's own pipe + `EVFILT_USER` (`PUMP_PIPE`/`PUMP_KQUEUE`),
+//!     which wakes the [`crate::vcpu_kick`] pump so it can kick in-guest vCPUs
+//!     that are spinning in userspace (not parked in any host syscall, so the
+//!     self-pipe alone can't reach them). The pump is also where SIGCHLD comes
+//!     from: guest children are watched via `EVFILT_PROC`/`NOTE_EXIT`
+//!     (`CHILD_WATCHES`) so no host SIGCHLD handler is installed — installing one
+//!     would break `wait4`'s host-`waitpid` passthrough, since carrick reaps
+//!     guest children with real host `waitpid`. `NOTE_EXIT` is readiness-only; it
+//!     does NOT consume the child's status, leaving the reap to the guest.
+//!
+//! FORK COHERENCE. `fork(2)` does not inherit a kqueue, and the inherited
+//! self-pipe is shared with the parent. [`reinit_after_fork`] tears down the
+//! inherited channels and rebuilds private ones so a child's wakes are its own,
+//! and clears the inherited `CHILD_WATCHES`/`THREAD_*` tables. Carrick-internal
+//! fds (self-pipes, kqueues) are relocated to a high fd range
+//! (`HOST_INTERNAL_FD_MIN`) above the guest's 1024-fd cap so fork
+//! reinitialization can't close a low host fd the guest fd layer has reused (see
+//! [`relocate_internal_fd`]).
+//!
+//! Installation is idempotent (`INSTALLED`/`INSTALLED_MASK`) so multiple runtime
+//! instances in one host process — e.g. test runners — don't stomp each other's
+//! `sigaction`. This is no longer the "one slot, Ctrl-C only" v0: it is faithful
+//! enough to carry CPython, Go, Node, and libuv signal conformance, while still
+//! deliberately NOT round-tripping the host kernel's own pending mask (the
+//! pending model above is the authority).
 
 use std::collections::HashMap;
 use std::os::fd::RawFd;

@@ -1,8 +1,51 @@
 //! Session-leader supervisor for `carrick run -t` / `carrick shell`.
 //!
-//! The supervisor owns the controlling pty and byte relay. The Carrick runtime
-//! runs in a child process group under the same session, so guest shells can
-//! manage foreground jobs with normal `tcsetpgrp`/`wait4` semantics.
+//! # Why a separate process at all
+//!
+//! An interactive guest shell expects to do job control — `setsid`, become a
+//! session leader, own a controlling tty, and `tcsetpgrp` the foreground job.
+//! For that to work with **real** macOS `tcsetpgrp`/`wait4`/SIGTTOU semantics
+//! (rather than a carrick emulation), the guest runtime must run in its own
+//! process group under a session whose leader owns the controlling pty. carrick
+//! builds that boundary by forking, **before** the HVF VM exists, into a
+//! supervisor that owns the pty + the byte relay and a child that becomes the
+//! guest runtime in a fresh process group.
+//!
+//! # The three-process structure
+//!
+//! [`fork_interactive_session`] forks twice, yielding three processes:
+//!
+//! 1. **Launcher** — the original `carrick` process. It may already be a
+//!    process-group leader (when started from an interactive shell), in which
+//!    case `setsid()` would `EPERM`. So it forks a fresh non-leader and just
+//!    waits on it ([`InteractiveParentKind::Launcher`]), propagating its exit
+//!    code. It also holds the "life" pipe whose close tells the supervisor the
+//!    launcher is gone.
+//! 2. **Supervisor** — the forked non-leader. It `setsid()`s (becoming a session
+//!    leader), `TIOCSCTTY`s the pty slave as its controlling tty, forks the
+//!    runtime child, sets that child's pgrp as the tty foreground, and then runs
+//!    the byte relay ([`PtyRelay`]) until the child exits
+//!    ([`InteractiveParentKind::Supervisor`]). There is **one supervisor per
+//!    interactive run** — this is not a shared daemon (same no-daemon principle
+//!    as [`namespace::supervisor`](crate::namespace::supervisor)).
+//! 3. **Runtime child** — the carrick guest runtime
+//!    ([`InteractiveChild`]). It `setpgid`s into its own group and, after a
+//!    ready/ack handshake with the supervisor (so the supervisor has set the
+//!    foreground pgrp before any guest code runs), continues into the HVF loop
+//!    with the pty slave as fds 0/1/2.
+//!
+//! # Window-size relay across the session boundary
+//!
+//! The supervisor lives in a *new* session, so it no longer shares the original
+//! terminal's SIGWINCH. A small winsize-watcher helper ([`WinsizeWatcher`])
+//! stays in the launcher's session, catches resizes, and forwards the new
+//! `winsize` over a pipe that the [`PtyRelay`] watches as an out-of-band fd (see
+//! `start_with_pair_and_winsize` in [`pty_relay`](crate::pty_relay)).
+//!
+//! All fds shared across these forks are relocated above the guest's stdio range
+//! (`relocate_internal_fd` / `dup_relocated`) so the guest never collides with
+//! carrick's own controlling fds, and every error path here `_exit`s or returns
+//! before any guest `Drop` could double-close an inherited fd.
 
 use crate::dispatch::SyscallDispatcher;
 use crate::pty_relay::{PtyPair, PtyRelay};
